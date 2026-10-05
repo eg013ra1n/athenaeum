@@ -11,10 +11,11 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { NumericField } from '../NumericField';
-import { LN_SCALES, effectiveScaleMode, resolvedScaleLines } from './lnScale';
+import { LN_SCALES, apertureLabel, effectiveScaleMode, fluxEstimatorLabel, resolvedScaleLines } from './lnScale';
 import { Checkbox } from '../../settings/Checkbox';
+import { ParamPair } from '../ParamPair';
 import { outputNormLabel, psfModelLabel, rejectionNormLabel } from '../stageSummary';
-import type { OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
+import type { LnAperture, LnFluxEstimator, OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
 
 const OUTPUT_NORMS: OutputNormalization[] = [
   'none',
@@ -26,6 +27,10 @@ const OUTPUT_NORMS: OutputNormalization[] = [
 const REJECTION_NORMS: RejectionNormalization[] = ['none', 'scaleZeroOffset', 'equalizeFluxes', 'local'];
 const SCALE_ESTIMATORS: ScaleEstimator[] = ['bwmv', 'mad', 'avgDev'];
 const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
+const FLUX_ESTIMATORS: LnFluxEstimator[] = ['psfSignal', 'commonAperture'];
+const APERTURES: LnAperture[] = ['fwhm2', 'fwhm3', 'growthCurve'];
+const SELECT_CLASS =
+  'w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50';
 
 /** Msec the "rejection reset" notice stays up after the user turns LN off
  *  while rejection normalization was set to `'local'` — long enough to read,
@@ -204,6 +209,74 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
               step={1}
               disabled={disabled}
               help={`default ${defaults.normalization.local.referenceFrames}`}
+            />
+
+            <div>
+              <label className="block text-xs text-content-secondary mb-1">Star flux</label>
+              <select
+                value={n.local.fluxEstimator}
+                disabled={disabled}
+                onChange={(e) => patchLocal({ fluxEstimator: e.target.value as LnFluxEstimator })}
+                className={SELECT_CLASS}
+              >
+                {FLUX_ESTIMATORS.map((v) => (
+                  <option key={v} value={v}>{fluxEstimatorLabel(v)}</option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] text-content-muted">
+                default {fluxEstimatorLabel(defaults.normalization.local.fluxEstimator)} — PSF signal measures each
+                star inside its fitted profile; common aperture measures both frames in one circle sized to the
+                broader star, independent of seeing.
+              </p>
+            </div>
+
+            {n.local.fluxEstimator === 'commonAperture' && (
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Aperture</label>
+                <select
+                  value={n.local.aperture}
+                  disabled={disabled}
+                  onChange={(e) => patchLocal({ aperture: e.target.value as LnAperture })}
+                  className={SELECT_CLASS}
+                >
+                  {APERTURES.map((v) => (
+                    <option key={v} value={v}>{apertureLabel(v)}</option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[11px] text-content-muted">
+                  default {apertureLabel(defaults.normalization.local.aperture)} — The circle radius in units of the
+                  broader frame's FWHM; the growth curve adds the light beyond it from the brightest stars.
+                </p>
+              </div>
+            )}
+
+            <ParamPair
+              leftLabel="Minimum peak SNR"
+              leftValue={n.local.starSelection.minPeakSnr}
+              onLeftCommit={(v) => patchLocal({ starSelection: { ...n.local.starSelection, minPeakSnr: v } })}
+              leftMin={5}
+              leftMax={200}
+              leftStep={1}
+              rightLabel="Brightest stars"
+              rightValue={n.local.starSelection.maxStars}
+              onRightCommit={(v) =>
+                patchLocal({ starSelection: { ...n.local.starSelection, maxStars: Math.round(v) } })}
+              rightMin={20}
+              rightMax={5000}
+              rightStep={10}
+              disabled={disabled}
+              help={`Only stars this far above the local noise, and at most this many of the brightest, set the scale. default ${defaults.normalization.local.starSelection.minPeakSnr} / ${defaults.normalization.local.starSelection.maxStars}`}
+            />
+
+            <NumericField
+              label="Saturation limit (× plane maximum)"
+              value={n.local.starSelection.saturation}
+              onCommit={(v) => patchLocal({ starSelection: { ...n.local.starSelection, saturation: v } })}
+              min={0.5}
+              max={1}
+              step={0.05}
+              disabled={disabled}
+              help={`Stars with a pixel above this fraction of the brightest pixel in the frame are left out. default ${defaults.normalization.local.starSelection.saturation}`}
             />
 
             <div>

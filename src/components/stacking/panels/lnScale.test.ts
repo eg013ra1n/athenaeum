@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { effectiveScaleMode, resolvedScaleLines } from './lnScale';
+import { apertureLabel, effectiveScaleMode, fluxEstimatorLabel, resolvedScaleLines } from './lnScale';
 import type { PlanGroup, StackingPlan } from '../../../types/stacking';
 
 const group = (over: Partial<PlanGroup>): PlanGroup => ({
@@ -34,5 +34,17 @@ describe('resolvedScaleLines', () => {
     expect(
       resolvedScaleLines(planOf([group({}), group({ key: 'b', lnScalePx: 1024, lnWidth: 6248, lnHeight: 4176 })])),
     ).toEqual(['mono__L__bin1__180s: 1536 px (9576 × 6388)', 'b: 1024 px (6248 × 4176)']);
+  });
+});
+
+describe('labels', () => {
+  it('names the estimators', () => {
+    expect(fluxEstimatorLabel('psfSignal')).toBe('PSF signal');
+    expect(fluxEstimatorLabel('commonAperture')).toBe('Common aperture');
+  });
+  it('names the apertures', () => {
+    expect(apertureLabel('fwhm2')).toBe('2 × FWHM');
+    expect(apertureLabel('fwhm3')).toBe('3 × FWHM');
+    expect(apertureLabel('growthCurve')).toBe('2 × FWHM + growth curve');
   });
 });

@@ -4,7 +4,7 @@
 // no side effects — so the board and (later) the inspector headers never
 // disagree (plan Ruling 8).
 
-import { effectiveScaleMode } from './panels/lnScale';
+import { apertureShort, effectiveScaleMode } from './panels/lnScale';
 import type {
   Combination,
   DistortionChoice,
@@ -303,7 +303,9 @@ export function stageSummary(
         // of local BACKGROUND normalization, so it only shows once LN is on.
         const localScale = local.localScale ? ' · local scale' : '';
         const scale = effectiveScaleMode(local) === 'auto' ? `scale auto (÷${local.gridSize})` : `scale ${local.scale}`;
-        return `Local · ${scale} · ref ${local.referenceFrames}${localScale}`;
+        const flux =
+          local.fluxEstimator === 'commonAperture' ? ` · common aperture ${apertureShort(local.aperture)}` : '';
+        return `Local · ${scale} · ref ${local.referenceFrames}${flux}${localScale}`;
       }
       return `Global · ${outputNormLabel(config.normalization.output)} · ${config.normalization.scaleEstimator.toUpperCase()}`;
     }

@@ -695,7 +695,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       { id: 'measure', label: 'Measure & select' },
       { id: 'reference', label: 'Reference' },
       { id: 'register', label: 'Register' },
-      { id: 'normalize', label: 'Local normalization', keywords: ['normalization.local', 'scale', 'grid size'] },
+      { id: 'normalize', label: 'Local normalization', keywords: ['normalization.local', 'scale', 'grid size', 'star flux', 'common aperture', 'psf signal', 'peak snr', 'saturation'] },
       { id: 'integrate', label: 'Integrate' },
       { id: 'drizzle', label: 'Drizzle' },
       { id: 'output', label: 'Output' },
