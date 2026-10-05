@@ -5,6 +5,7 @@
 
 Prints {"setId": 182, "config": <run-8's config>, "excludedFrameIds": [<set 182 lights whose
 FILTER is R or B>]}. <run-8.json> is the run summary (its "config" object) or a bare config.
+Drops config.paths and sets output.format=fits, output.cleanup=keepAll (as prepare-catalog.sh does).
 --fixed-1024 sets normalization.local.scaleMode = "fixed", scale = 1024 (the optional fixed run).
 Reads only the given catalog COPY, read-only.
 """
@@ -25,6 +26,14 @@ def main():
     config = doc.get("config", doc) if isinstance(doc, dict) else doc
     if not isinstance(config, dict) or "normalization" not in config:
         sys.exit(f"{args[0]}: no stacking config (expected a 'config' object with 'normalization')")
+    # A per-set `paths` object would send the run back to the real folders: the copy's own
+    # stacking.working_dir / output_dir (set by prepare-catalog.sh) must apply.
+    if config.pop("paths", None) is not None:
+        print("note: dropped config.paths (the copy's global folders apply)", file=sys.stderr)
+    # Same shape prepare-catalog.sh gives the other acceptance copies.
+    config.setdefault("output", {})
+    config["output"]["format"] = "fits"
+    config["output"]["cleanup"] = "keepAll"
     if fixed:
         local = config["normalization"].setdefault("local", {})
         local["scaleMode"] = "fixed"

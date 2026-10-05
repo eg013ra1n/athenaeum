@@ -19,7 +19,18 @@ esac
 case "$ACC" in
   *..*) echo "refusing: $ACC contains '..'" >&2; exit 2 ;;
 esac
-"$HERE/../acceptance/prepare-catalog.sh" "$ACC"
+# Third argument = the set id: it redirects stacking.working_dir / output_dir into the copy,
+# seeds set 182's config row when absent (from set 109's, ids reset) and rewrites that row
+# in place (output.format fits, cleanup keepAll, per-set `paths` removed).
+"$HERE/../acceptance/prepare-catalog.sh" "$ACC" "" 182
+for KEY in stacking.working_dir stacking.output_dir; do
+  VAL=$(sqlite3 -readonly "$ACC/athenaeum.db" "SELECT value FROM settings WHERE key = '$KEY'")
+  echo "$KEY = $VAL"
+  case "$VAL" in
+    "$ACC"/?*) ;;
+    *) echo "refusing: $KEY ($VAL) is not under $ACC - a run would write outside the copy" >&2; exit 3 ;;
+  esac
+done
 # Lights reach a set through session_members -> sessions -> imaging_nights.
 CHANGES=$(sqlite3 "$ACC/athenaeum.db" <<'SQL'
 DELETE FROM calibration_set_to_frames
