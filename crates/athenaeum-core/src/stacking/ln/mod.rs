@@ -52,7 +52,9 @@ pub mod reference;
 pub mod scale;
 
 pub use background::{
-    background_grid, BackgroundGrid, BackgroundParams, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    background_grid, shared_refit, BackgroundGrid, BackgroundModel, BackgroundParams,
+    BackgroundRefusal, CleaningParams, PairSurfaces, Surface, TileStat, TileTable, CLEANING,
+    DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
 pub use calibration::{
     calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
