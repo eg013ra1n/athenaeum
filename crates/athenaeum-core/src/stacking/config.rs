@@ -514,7 +514,45 @@ pub fn resolve_config(
         );
         config.integration.large_scale.growth = MAX_GROWTH;
     }
+    resolve_ln_fields(&mut config);
     Ok(config)
+}
+
+/// L-9 and the spec §6 clamps for the LN fields, on any config that came from
+/// storage or from a caller (resolve_config, a plan override, a decoded user
+/// preset). Idempotent.
+pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
+    use crate::stacking::integrate::LnScaleMode;
+    use crate::stacking::ln::{effective_scale_mode, snap_ln_scale, MAX_GRID_SIZE, MIN_GRID_SIZE};
+    let local = &mut config.normalization.local;
+    if local.scale_mode.is_none() {
+        let mode = effective_scale_mode(local);
+        tracing::debug!(
+            scale = local.scale,
+            ln_scale_mode = mode.as_str(),
+            "stacking config: legacy LN scale resolved"
+        );
+        local.scale_mode = Some(mode);
+    }
+    if local.scale_mode == Some(LnScaleMode::Fixed) {
+        let snapped = snap_ln_scale(local.scale as f64);
+        if snapped != local.scale {
+            warn!(
+                value = local.scale,
+                clamped = snapped,
+                "stacking config: LN scale is not a supported size; snapped"
+            );
+            local.scale = snapped;
+        }
+    }
+    if !(MIN_GRID_SIZE..=MAX_GRID_SIZE).contains(&local.grid_size) {
+        let clamped = local.grid_size.clamp(MIN_GRID_SIZE, MAX_GRID_SIZE);
+        warn!(
+            value = local.grid_size,
+            clamped, "stacking config: LN gridSize out of range; clamped"
+        );
+        local.grid_size = clamped;
+    }
 }
 
 /// [`crate::stacking::integrate::LargeScaleRejection::protected_layers`]
@@ -821,7 +859,7 @@ fn normalization_subtree_with_fit_version(
     psf_fit_version: u32,
 ) -> serde_json::Value {
     serde_json::json!({
-        "normalization": cfg.normalization,
+        "normalization": canonical_normalization(cfg),
         "measurement": {
             "psfModel": cfg.measurement.psf_model,
             "maxStars": cfg.measurement.max_stars,
@@ -829,6 +867,20 @@ fn normalization_subtree_with_fit_version(
         "psfFitVersion": psf_fit_version,
         "lnModelVersion": crate::stacking::ln::LN_MODEL_VERSION,
     })
+}
+
+/// The normalization block as the LN hashes see it (L-19): `scale`,
+/// `scaleMode` and `gridSize` leave it - their effect reaches the hashes as
+/// the resolved-scale token - so auto <-> fixed at the same resolved value
+/// invalidates nothing.
+fn canonical_normalization(cfg: &StackingConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(&cfg.normalization).expect("NormalizationConfig serializes");
+    if let Some(local) = v.get_mut("local").and_then(|l| l.as_object_mut()) {
+        for key in ["scale", "scaleMode", "gridSize"] {
+            local.remove(key);
+        }
+    }
+    v
 }
 
 /// The document a project's first plan stores (spec §9.4): the global
@@ -843,6 +895,70 @@ pub fn project_seed_config(global: StackingConfig) -> StackingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_legacy_document_reads_scale_1024_as_auto_and_any_other_as_fixed() {
+        use crate::stacking::integrate::LnScaleMode;
+        let read = |local: &str| {
+            resolve_config(
+                Some(&format!(r#"{{"normalization":{{"local":{local}}}}}"#)),
+                None,
+            )
+            .unwrap()
+            .normalization
+            .local
+        };
+        let a = read(r#"{"enabled":true,"scale":1024}"#);
+        assert_eq!((a.scale_mode, a.scale), (Some(LnScaleMode::Auto), 1024));
+        let b = read(r#"{"enabled":true,"scale":2048}"#);
+        assert_eq!((b.scale_mode, b.scale), (Some(LnScaleMode::Fixed), 2048));
+        let c = read(r#"{"enabled":true,"scale":1300}"#);
+        assert_eq!(
+            (c.scale_mode, c.scale),
+            (Some(LnScaleMode::Fixed), 1536),
+            "fixed is snapped"
+        );
+        let d = read(r#"{"enabled":true,"scale":2048,"scaleMode":"auto"}"#);
+        assert_eq!(
+            d.scale_mode,
+            Some(LnScaleMode::Auto),
+            "a stored mode is never overridden"
+        );
+        assert_eq!(read(r#"{"gridSize":1}"#).grid_size, 2);
+        assert_eq!(read(r#"{"gridSize":9}"#).grid_size, 8);
+    }
+
+    #[test]
+    fn a_stored_document_without_scale_mode_decodes_to_none_before_resolution() {
+        let c: StackingConfig =
+            serde_json::from_str(r#"{"normalization":{"local":{"scale":2048}}}"#).unwrap();
+        assert_eq!(c.normalization.local.scale_mode, None);
+        assert_eq!(
+            StackingConfig::default().normalization.local.scale_mode,
+            Some(crate::stacking::integrate::LnScaleMode::Auto)
+        );
+    }
+
+    /// L-19: scale, scaleMode and gridSize leave the subtree; the resolved
+    /// scale reaches the hashes as a token instead.
+    #[test]
+    fn auto_and_fixed_at_the_same_resolved_scale_share_the_normalization_subtree() {
+        use crate::stacking::integrate::LnScaleMode;
+        let mut auto = StackingConfig::default();
+        auto.normalization.local.enabled = true;
+        let mut fixed = auto.clone();
+        fixed.normalization.local.scale_mode = Some(LnScaleMode::Fixed);
+        fixed.normalization.local.scale = 1536;
+        fixed.normalization.local.grid_size = 6;
+        assert_eq!(normalization_subtree(&auto), normalization_subtree(&fixed));
+        let local = &normalization_subtree(&auto)["normalization"]["local"];
+        for key in ["scale", "scaleMode", "gridSize"] {
+            assert!(
+                local.get(key).is_none(),
+                "{key} is still in the subtree: {local}"
+            );
+        }
+    }
 
     #[test]
     fn the_ln_model_version_rides_the_normalization_subtree_only() {
@@ -1152,7 +1268,7 @@ mod tests {
             "\"output\":\"additiveWithScaling\"",
             "\"rejection\":\"scaleZeroOffset\"",
             "\"scaleEstimator\":\"bwmv\"",
-            "\"local\":{\"enabled\":false,\"scale\":1024,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false}",
+            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false}",
             "\"rejection\":{\"method\":\"auto\"}",
             "\"writeRejectionMaps\":false",
             "\"dropShrink\":0.9",
@@ -1733,7 +1849,11 @@ mod tests {
         // field at a non-default value — so not one cached artifact goes
         // stale; only this whole-config fingerprint moves (and, once, the
         // plan gate's LN-exclusion memory, see `DRIZZLE_KERNEL_VERSION`).
-        assert_eq!(default_hash, "36fe3e28e9191643");
+        //
+        // And here (2026-10-05 LN model fixes Task 3): `normalization.local`
+        // gains `scaleMode` and `gridSize` in the serialized config (the
+        // fingerprint hashes the whole document).
+        assert_eq!(default_hash, "b10edef31aa31e3d");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part

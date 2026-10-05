@@ -448,7 +448,10 @@ fn decode_presets_entrywise(raw: &str) -> Option<Vec<NamedPreset>> {
     let mut presets = Vec::with_capacity(total);
     for entry in entries {
         match serde_json::from_value::<NamedPreset>(entry) {
-            Ok(p) => presets.push(p),
+            Ok(mut p) => {
+                crate::stacking::config::resolve_ln_fields(&mut p.config);
+                presets.push(p);
+            }
             Err(error) => tracing::debug!(
                 key = keys::STACKING_PRESETS,
                 %error,
@@ -1497,6 +1500,70 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, 64, 48);
         (fixture, light_ids)
+    }
+
+    /// Review Focus 2: every reader of a stored config resolves L-9.
+    #[test]
+    fn every_stored_config_reader_resolves_the_legacy_scale() {
+        use crate::stacking::integrate::LnScaleMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = ServiceContext::new_for_tests(db_path.clone());
+        let (fixture, _ids) = seed_ready_fixture(&db_path, "Legacy LN");
+        let legacy = r#"{"normalization":{"local":{"enabled":true,"scale":2048}}}"#;
+
+        // 1. A per-set document.
+        {
+            let db_handle = db(&ctx).unwrap();
+            set_set_config(&db_handle.conn(), fixture.set_id, legacy, &[]).unwrap();
+        }
+        let set_cfg = get_stacking_config(&ctx, fixture.set_id).unwrap();
+        let local = set_cfg.config.normalization.local;
+        assert_eq!(
+            (local.scale_mode, local.scale),
+            (Some(LnScaleMode::Fixed), 2048)
+        );
+
+        // 2. The global default row, written the way `read_global_config_json`
+        //    reads it (`set_stacking_defaults` would re-serialize).
+        {
+            let db_handle = db(&ctx).unwrap();
+            crate::db::set_setting(&db_handle.conn(), keys::STACKING_DEFAULTS, legacy).unwrap();
+        }
+        let defaults = get_stacking_defaults(&ctx).unwrap();
+        assert_eq!(
+            defaults.normalization.local.scale_mode,
+            Some(LnScaleMode::Fixed)
+        );
+        assert_eq!(defaults.normalization.local.scale, 2048);
+
+        // 3. One entry of the `stacking.presets` row.
+        {
+            let db_handle = db(&ctx).unwrap();
+            let row = format!(r#"[{{"name":"legacy","config":{legacy}}}]"#);
+            crate::db::set_setting(&db_handle.conn(), keys::STACKING_PRESETS, &row).unwrap();
+        }
+        let presets = list_stacking_presets(&ctx).unwrap();
+        assert_eq!(presets.len(), 1, "{presets:?}");
+        assert_eq!(
+            presets[0].config.normalization.local.scale_mode,
+            Some(LnScaleMode::Fixed)
+        );
+
+        // 4. A plan override decoded WITHOUT resolution.
+        let unresolved: StackingConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(unresolved.normalization.local.scale_mode, None);
+        let plan = get_stacking_plan(
+            &ctx,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(unresolved),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.config.normalization.local.scale_mode,
+            Some(LnScaleMode::Fixed)
+        );
     }
 
     /// Plan 5b Task 1, Step 1: `get_stacking_presets` must be a thin mirror

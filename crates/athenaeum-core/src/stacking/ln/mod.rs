@@ -50,7 +50,12 @@ pub mod calibration;
 pub mod grid;
 pub mod reference;
 pub mod scale;
+pub mod scale_rule;
 
+pub use scale_rule::{
+    effective_scale_mode, resolve_scale, snap_ln_scale, LEGACY_DEFAULT_LN_SCALE, LN_SCALES,
+    MAX_GRID_SIZE, MIN_GRID_SIZE,
+};
 pub use background::{
     shared_refit, BackgroundModel, BackgroundRefusal, CleaningParams, PairSurfaces, Surface,
     TileStat, TileTable, CLEANING,

@@ -368,6 +368,9 @@ pub(crate) struct RunContext {
     /// sidecars were written under. Absent for a group whose LN never ran,
     /// or one whose calibration could not be measured at all.
     pub(crate) group_seeds_calibration: HashMap<String, ln::SeedsCalibration>,
+    /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
+    /// P-14); a run whose own resolution differs warns once.
+    pub(crate) planned_ln_scales: HashMap<String, u32>,
     /// M3 Task 5, fix round 1 (Minor M6): incremented once per group that
     /// actually reaches an attempt at `drizzle_group` (i.e. drizzle is on
     /// AND the group's `RejBitmapSet` — when wanted — was created
@@ -895,6 +898,11 @@ pub(crate) fn start_stacking_with_solver(
     heal_interrupted_runs(&ctx, &conn)?;
 
     let plan = build_plan(&conn, &ctx.settings, policy, &subject, config)?;
+    let planned_ln_scales: HashMap<String, u32> = plan
+        .groups
+        .iter()
+        .filter_map(|g| g.ln_scale_px.map(|s| (g.key.clone(), s)))
+        .collect();
 
     if let Some(blocker) = plan.blockers.first() {
         return Err(ApiError::Invalid(blocker.message.clone()));
@@ -1125,6 +1133,7 @@ pub(crate) fn start_stacking_with_solver(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        planned_ln_scales,
         drizzle_attempted: 0,
         crop_items: Vec::new(),
         dry_pass_stars: HashMap::new(),
@@ -7727,6 +7736,7 @@ fn push_summary_group(
     drizzle: Option<DrizzleStats>,
     coverage_path: Option<String>,
     drizzle_coverage_path: Option<String>,
+    ln_scale_px: Option<u32>,
 ) {
     let frames = rc
         .measured
@@ -7795,6 +7805,7 @@ fn push_summary_group(
         drizzle,
         beta,
         seeds_calibration,
+        ln_scale_px,
         frames,
     });
 }
@@ -7841,7 +7852,7 @@ fn skip_group(
         None,
         None,
         None,
-        None,
+        None,        None,
     );
     Ok(GroupOutcome::Skipped)
 }
@@ -7897,7 +7908,7 @@ fn fail_group(
         None,
         None,
         None,
-        None,
+        None,        None,
     );
     Ok(GroupOutcome::Failed)
 }
@@ -8716,6 +8727,7 @@ fn process_group_output(
         || normalization_cfg.rejection == RejectionNormalization::Local;
     let normalize_start = Instant::now();
     let mut ln_reference_path: Option<String> = None;
+    let mut ln_scale_px: Option<u32> = None;
     // M2 Task 7 (fix round 1, item 3): every member `run_group_normalization`
     // itself confirmed a READABLE `ln` artifact for THIS run — verified at
     // the source (the cache-hit branch re-reads the artifact row's own file
@@ -8741,6 +8753,7 @@ fn process_group_output(
         ) {
             Ok(outcome) => {
                 ln_reference_path = outcome.reference_path.clone();
+                ln_scale_px = outcome.scale_px;
                 if outcome.reference_path.is_some() {
                     ln_sidecar_grids = Some(outcome.sidecar_grids);
                 }
@@ -10090,6 +10103,7 @@ fn process_group_output(
         drizzle_stats,
         coverage_path_str,
         drizzle_coverage_path,
+        ln_scale_px,
     );
 
     // B2 (M3 final fix wave, I2): `output_start` was taken BEFORE the
@@ -10142,6 +10156,9 @@ struct LnGroupOutcome {
     reference_path: Option<String>,
     excluded_frame_ids: Vec<i64>,
     sidecar_grids: HashMap<i64, LnFrameGrids>,
+    // The LN scale the group ran at (spec §8); `None` on every return before
+    // LN actually ran for the group.
+    scale_px: Option<u32>,
 }
 
 /// The scalar diagnostics [`crate::stacking::ln::LnFrameOutcome`] carries, persisted as the `ln`
@@ -10258,6 +10275,32 @@ fn run_group_normalization(
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
     };
+    // Spec §2.3 (L-10): the one scale rule, on this group's LN geometry.
+    let scale_px = ln::resolve_scale(&ln_cfg, ref_width, ref_height);
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        ln_scale_px = scale_px,
+        ln_scale_mode = ln::effective_scale_mode(&ln_cfg).as_str(),
+        width = ref_width,
+        height = ref_height,
+        "ln scale resolved"
+    );
+    if let Some(&planned) = rc.planned_ln_scales.get(&group.key) {
+        if planned != scale_px {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                ln_scale_px = scale_px,
+                expected = planned,
+                "ln scale differs from the plan's estimate"
+            );
+            rc.warnings.push(format!(
+                "group {}: local normalization scale resolved to {scale_px} px; the plan estimated {planned} px",
+                group.key
+            ));
+        }
+    }
     let coverage = member_coverages(ln_field, members, ref_width, ref_height);
     let coverage_mask: Vec<bool> = coverage
         .iter()
@@ -10303,6 +10346,7 @@ fn run_group_normalization(
             reference_path: None,
             excluded_frame_ids: Vec::new(),
             sidecar_grids: HashMap::new(),
+            scale_px: None,
         });
     }
     let reference_members: Vec<usize> = ranked[..n].to_vec();
@@ -10383,6 +10427,7 @@ fn run_group_normalization(
         "",
         None,
         group_beta_recorded,
+        None,
     );
 
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Normalize);
@@ -10439,6 +10484,7 @@ fn run_group_normalization(
                     io,
                     &reference_hash,
                     &reference_member_ids,
+                    scale_px,
                 )?
             }
         },
@@ -10451,10 +10497,10 @@ fn run_group_normalization(
             io,
             &reference_hash,
             &reference_member_ids,
+            scale_px,
         )?,
     };
 
-    let scale_px = ln_cfg.scale;
     // Perf tier A Task 12: the group's own pool, so the tile measurement
     // fans out across workers instead of running one tile at a time on this
     // thread — this reference model is built once per group (a handful of
@@ -10506,6 +10552,7 @@ fn run_group_normalization(
                     reference_path: None,
                     excluded_frame_ids: Vec::new(),
                     sidecar_grids: HashMap::new(),
+                    scale_px: None,
                 });
             }
         }
@@ -10692,6 +10739,7 @@ fn run_group_normalization(
         &reference_hash,
         &calibration_frames,
         group_beta_recorded,
+        scale_px,
     );
     let ln_channels = ln_reference.planes.len();
     let stored_calibration: Option<ln::SeedsCalibration> = if force_fresh {
@@ -10718,6 +10766,7 @@ fn run_group_normalization(
                     &reference_hash,
                     calibration,
                     group_beta_recorded,
+                    Some(scale_px),
                 )
             })
             .collect()
@@ -11219,6 +11268,7 @@ fn run_group_normalization(
         reference_path: Some(resolved_reference_path.display().to_string()),
         excluded_frame_ids,
         sidecar_grids,
+        scale_px: Some(scale_px),
     })
 }
 
@@ -11397,6 +11447,7 @@ fn build_and_write_ln_reference(
     io: IoPolicy,
     reference_hash: &str,
     reference_member_ids: &[i64],
+    scale_px: u32,
 ) -> Result<LnReference, RunError> {
     let build_start = Instant::now();
     let empty_as_nan = rc.grid.is_some();
@@ -11478,6 +11529,9 @@ fn build_and_write_ln_reference(
     let reference_payload = serde_json::to_string(&LnReferencePayload {
         reference_member_ids: reference_member_ids.to_vec(),
         reference_hash: reference_hash.to_string(),
+        width: built.width,
+        height: built.height,
+        scale_px,
     })
     .map_err(|e| RunError::Other(format!("failed to serialize ln_reference payload: {e}")))?;
     {
@@ -11502,6 +11556,7 @@ fn build_and_write_ln_reference(
         run_id = rc.run_id,
         group_key = %group.key,
         ln_reference_frames = built.frames_used.len(),
+        ln_scale_px = scale_px,
         duration_ms = build_start.elapsed().as_millis() as u64,
         "ln reference built"
     );
@@ -12309,6 +12364,7 @@ pub(crate) fn test_context(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        planned_ln_scales: HashMap::new(),
         drizzle_attempted: 0,
         crop_items: Vec::new(),
         dry_pass_stars: HashMap::new(),
@@ -17965,6 +18021,182 @@ mod tests {
             "{:?}",
             plan_after.groups[0]
         );
+    }
+
+    /// Spec §2.3 + Review Focus 3: the plan reports the scale it will use,
+    /// marked estimated before any run; the run resolves the same value; the
+    /// next plan reads it exactly from the reference payload and Normalize
+    /// is cached.
+    #[test]
+    fn the_plan_reads_normalize_cached_after_a_run_with_a_derived_scale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+        cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
+        let expected_scale =
+            ln::resolve_scale(&cfg.normalization.local, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+
+        // 1. The plan before any run: the scale of the anchor geometry, an
+        //    estimate.
+        let plan_before = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some(cfg.clone()),
+        )
+        .expect("the plan should build");
+        for g in &plan_before.groups {
+            assert_eq!(g.ln_scale_px, Some(expected_scale), "{g:?}");
+            assert!(g.ln_scale_estimated, "{g:?}");
+        }
+
+        // 2. The run.
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        // 3. The summary and the stored reference payload carry the scale
+        //    and the geometry.
+        let group_summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        assert_eq!(group_summary.ln_scale_px, Some(expected_scale));
+        let ref_rows = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln_reference"),
+        )
+        .unwrap();
+        assert_eq!(ref_rows.len(), 1, "{ref_rows:?}");
+        let payload: crate::stacking::plan::LnReferencePayload =
+            serde_json::from_str(ref_rows[0].payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (payload.width, payload.height, payload.scale_px),
+            (STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT, expected_scale)
+        );
+
+        // 4. The next plan reads the scale exactly and Normalize is cached.
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some(cfg),
+        )
+        .expect("the plan should build");
+        let g = &plan_after.groups[0];
+        assert!(!g.ln_scale_estimated, "{g:?}");
+        assert_eq!(g.ln_scale_px, Some(expected_scale), "{g:?}");
+        assert_eq!(
+            (g.ln_width, g.ln_height),
+            (Some(STAR_FIELD_WIDTH as u32), Some(STAR_FIELD_HEIGHT as u32))
+        );
+        assert!(
+            !plan_after.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan_after.stale_stages
+        );
+        assert_eq!(g.ln_cached, 4, "{g:?}");
+    }
+
+    /// Review Focus 3: a run whose scale differs from the plan's estimate
+    /// warns once.
+    #[test]
+    fn a_run_warns_once_when_its_ln_scale_differs_from_the_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        // A value the fixture geometry cannot resolve to.
+        rc.planned_ln_scales.insert(group_key, 8192);
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let hits: Vec<&String> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("the plan estimated 8192 px"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", rc.warnings);
     }
 
     /// Fix round 1, item 2: the per-frame `ln` hash must fold in the

@@ -180,6 +180,14 @@ pub struct PlanGroup {
     /// this field's computation in [`build_plan`] for why (the LN reference
     /// member list is a stage-3 weight quantity, unavailable at plan time).
     pub ln_cached: usize,
+    // The LN scale this group will run at (spec §2.3), `None` while LN is
+    // inactive; `ln_scale_estimated` when the geometry is not yet the one
+    // the sidecars were written in (no stored LN reference). `ln_width` /
+    // `ln_height` are that geometry (P-5).
+    pub ln_scale_px: Option<u32>,
+    pub ln_scale_estimated: bool,
+    pub ln_width: Option<u32>,
+    pub ln_height: Option<u32>,
     /// M3 Task 5: the group's reference-anchor member's own native
     /// `NAXIS1`/`NAXIS2` — the SAME member and the SAME convention
     /// `stacking::run::group_anchor_geometry` uses to stamp
@@ -625,6 +633,15 @@ pub(crate) fn registration_hash_for(
 pub(crate) struct LnReferencePayload {
     pub reference_member_ids: Vec<i64>,
     pub reference_hash: String,
+    // The LN geometry the reference (and every sidecar against it) lives in,
+    // and the scale of the run that built it. 0 on a payload written before
+    // 2026-10 (the plan then estimates, spec §2.3 case 3).
+    #[serde(default)]
+    pub width: usize,
+    #[serde(default)]
+    pub height: usize,
+    #[serde(default)]
+    pub scale_px: u32,
 }
 
 /// Stage 6 (local normalization, M2) config-hash: `normalization_subtree`
@@ -693,6 +710,10 @@ pub(crate) struct LnReferencePayload {
 /// This fold invalidates every `.athln` sidecar once, on the first run after
 /// it ships — no template on disk carries any, and the cost is one LN
 /// fan-out per group.
+///
+/// `ln_scale_px` is the resolved LN scale (spec 2026-10-04 §2, L-19): the
+/// reference hash passes `None` (the reference is scale-independent), every
+/// per-frame hash passes the scale the frame was normalized at.
 pub(crate) fn normalization_hash_for(
     cfg: &StackingConfig,
     registration_hash: &str,
@@ -701,6 +722,7 @@ pub(crate) fn normalization_hash_for(
     reference_hash: &str,
     calibration: Option<&SeedsCalibration>,
     beta: Option<f64>,
+    ln_scale_px: Option<u32>,
 ) -> String {
     let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
     // C-17: the frame's own MEASUREMENT hash (`measurement_hash_for`, the
@@ -743,6 +765,9 @@ pub(crate) fn normalization_hash_for(
     if let Some(b) = beta {
         upstream.push(format!("ln_beta:{:.6}", b));
     }
+    if let Some(s) = ln_scale_px {
+        upstream.push(format!("ln_scale_px:{s}"));
+    }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -775,6 +800,7 @@ pub(crate) fn seeds_calibration_hash_for(
     reference_hash: &str,
     calibration_frames: &[(i64, &str, &str)],
     beta: Option<f64>,
+    ln_scale_px: u32,
 ) -> String {
     let mut upstream: Vec<String> = vec![format!("ln_reference_hash:{reference_hash}")];
     upstream.extend(
@@ -786,6 +812,7 @@ pub(crate) fn seeds_calibration_hash_for(
     if let Some(b) = beta {
         upstream.push(format!("ln_beta:{:.6}", b));
     }
+    upstream.push(format!("ln_scale_px:{ln_scale_px}"));
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -1111,7 +1138,10 @@ fn resolve_config_and_exclusions(
         .unwrap_or_default();
 
     let config = match config_override {
-        Some(cfg) => cfg,
+        Some(mut cfg) => {
+            crate::stacking::config::resolve_ln_fields(&mut cfg);
+            cfg
+        }
         None => {
             let set_json = set_row.as_ref().map(|r| r.config_json.as_str());
             let global_json = read_global_config_json(conn, settings);
@@ -1179,7 +1209,10 @@ pub fn resolve_project_config_and_exclusions(
         }
     };
     let config = match config_override {
-        Some(cfg) => cfg,
+        Some(mut cfg) => {
+            crate::stacking::config::resolve_ln_fields(&mut cfg);
+            cfg
+        }
         None => resolve_config(Some(&row.config_json), None)
             .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?,
     };
@@ -1370,6 +1403,14 @@ fn group_display_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> (Option
 /// wording's "the reference's" number would differ from what a run later
 /// actually uses.
 fn largest_group_scale(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -> Option<f64> {
+    included_median_scale(largest_group(groups, excluded)?, excluded)
+}
+
+/// The group with the most included frames (ties to the smaller key).
+fn largest_group<'a>(
+    groups: &'a [IntegrationGroup],
+    excluded: &HashSet<i64>,
+) -> Option<&'a IntegrationGroup> {
     let mut best: Option<(&IntegrationGroup, usize)> = None;
     for g in groups {
         let included_count = g
@@ -1390,8 +1431,7 @@ fn largest_group_scale(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -> 
             best = Some((g, included_count));
         }
     }
-    let (g, _) = best?;
-    included_median_scale(g, excluded)
+    best.map(|(g, _)| g)
 }
 
 /// The `registration_results` reuse predicate itself (ruling 10): a row is
@@ -2444,6 +2484,54 @@ pub(crate) fn ln_upstream_on_field(registration_hash: &str, field_hash: &str) ->
     )
 }
 
+/// The LN geometry the plan expects for `g` and whether it is an estimate
+/// (spec §2.3, L-10): a project's grid (exact once confirmed); the stored
+/// LN reference's own dims (exact); otherwise the run's reference frame in
+/// co-registered mode (a manual pin, else the last run's reference), the
+/// group's per-group reference from the last run in native mode, else the
+/// group's anchor, else the largest group's anchor - all estimates.
+#[allow(clippy::too_many_arguments)]
+fn plan_ln_geometry(
+    g: &IntegrationGroup,
+    groups: &[IntegrationGroup],
+    excluded: &HashSet<i64>,
+    ln_grid_dims: Option<(u64, u64, bool)>,
+    stored_reference: Option<&LnReferencePayload>,
+    native: bool,
+    run_reference: Option<i64>,
+    native_references: &HashMap<String, i64>,
+) -> Option<(usize, usize, bool)> {
+    if let Some((w, h, confirmed)) = ln_grid_dims {
+        return Some((w as usize, h as usize, !confirmed));
+    }
+    if let Some(p) = stored_reference.filter(|p| p.width > 0 && p.height > 0) {
+        return Some((p.width, p.height, false));
+    }
+    let dims_of = |id: i64| {
+        find_group_frame(groups, id).and_then(|f| {
+            (f.width > 0 && f.height > 0).then_some((f.width as usize, f.height as usize, true))
+        })
+    };
+    let pick = if native {
+        native_references.get(&g.key).copied()
+    } else {
+        run_reference
+    };
+    if let Some(found) = pick.and_then(dims_of) {
+        return Some(found);
+    }
+    let anchor = |grp: &IntegrationGroup| match group_anchor_geometry(grp) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as usize, h as usize, true)),
+        _ => None,
+    };
+    if native {
+        if let Some(found) = anchor(g) {
+            return Some(found);
+        }
+    }
+    largest_group(groups, excluded).and_then(anchor)
+}
+
 /// Build the plan for a subject (a frame set or a project): its groups, the
 /// resolved config, every gate blocker (spec §2, checked in a fixed order so the first blocker a
 /// user sees is always the most fundamental one), and which of the three
@@ -2890,6 +2978,31 @@ pub fn build_plan(
     } else {
         HashMap::new()
     };
+    // Spec §2.3: the geometry the plan resolves the LN scale against. The
+    // run reference (co-registered), the per-group references (native) and
+    // a project's grid dims; `ln_grid_dims` is not `project_grid` (the
+    // canonical grid itself, bound above).
+    let ln_native = cfg.registration.geometry == RegistrationGeometry::Native;
+    let (run_reference, native_references): (Option<i64>, HashMap<String, i64>) =
+        if local_normalization_active {
+            let last_run = list_runs(conn, subject, 1)?.into_iter().next();
+            let native_refs = match (&last_run, ln_native) {
+                (Some(r), true) => summary_group_references(r.summary_json.as_deref()),
+                _ => HashMap::new(),
+            };
+            (
+                reference
+                    .frame_id
+                    .or(last_run.as_ref().and_then(|r| r.reference_frame_id)),
+                native_refs,
+            )
+        } else {
+            (None, HashMap::new())
+        };
+    let ln_grid_dims: Option<(u64, u64, bool)> = project.as_ref().and_then(|p| {
+        p.grid_dims
+            .map(|(w, h)| (w, h, p.grid.current.is_some()))
+    });
 
     for g in &groups {
         // Fix round 1, item 5: the group's LN reference artifact carries the
@@ -2955,6 +3068,22 @@ pub fn build_plan(
         } else {
             None
         };
+        let ln_geometry = if local_normalization_active {
+            plan_ln_geometry(
+                g,
+                &groups,
+                &excluded_set,
+                ln_grid_dims,
+                ln_reference_info.as_ref(),
+                ln_native,
+                run_reference,
+                &native_references,
+            )
+        } else {
+            None
+        };
+        let ln_scale_px = ln_geometry
+            .map(|(w, h, _)| crate::stacking::ln::resolve_scale(&cfg.normalization.local, w, h));
         let mut calibrated_cached = 0usize;
         let mut metrics_cached = 0usize;
         let mut fits_cached = 0usize;
@@ -3108,6 +3237,7 @@ pub fn build_plan(
                             // last run's recorded β for THIS group,
                             // `None` when it has none.
                             ln_beta_by_group.get(&g.key).copied(),
+                            ln_scale_px,
                         ))
                     }
                     _ => None,
@@ -3174,6 +3304,10 @@ pub fn build_plan(
             metrics_cached,
             fits_cached,
             ln_cached,
+            ln_scale_px,
+            ln_scale_estimated: ln_geometry.is_some_and(|g| g.2),
+            ln_width: ln_geometry.map(|g| g.0 as u32),
+            ln_height: ln_geometry.map(|g| g.1 as u32),
             anchor_width,
             anchor_height,
             // R-T6-7: included-only median, all-member fallback for a fully
@@ -5994,6 +6128,7 @@ mod tests {
                 reference_hash,
                 Some(&calibration),
                 beta,
+                Some(1024),
             )
         };
         let seeds = |cfg: &StackingConfig, measurement: &str| {
@@ -6002,6 +6137,7 @@ mod tests {
                 reference_hash,
                 &[(11, "registration-hash", measurement)],
                 beta,
+                1024,
             )
         };
 
@@ -6046,6 +6182,21 @@ mod tests {
         assert_ne!(ln(&cfg, ""), ln(&cfg, &measurement));
     }
 
+    #[test]
+    fn the_ln_reference_hash_ignores_the_scale_and_the_frame_hashes_follow_it() {
+        let cfg = StackingConfig::default();
+        let reference =
+            |s: Option<u32>| normalization_hash_for(&cfg, "r", "m", &[1, 2], "", None, Some(4.0), s);
+        // The run passes no token for the reference (L-19); a token would move it.
+        assert_ne!(reference(None), reference(Some(1024)));
+        let frame = |s: u32| {
+            normalization_hash_for(&cfg, "r", "m", &[1, 2], "ref", None, Some(4.0), Some(s))
+        };
+        assert_ne!(frame(1024), frame(1536));
+        let cal = |s: u32| seeds_calibration_hash_for(&cfg, "ref", &[(1, "r", "m")], Some(4.0), s);
+        assert_ne!(cal(1024), cal(1536));
+    }
+
     /// M1 (final fix wave, ruling C-30): the group β — the value
     /// `psf_signal::group_beta` resolves for a group and
     /// `stacking_run_groups.beta` records — is an LN INPUT, so both LN
@@ -6076,6 +6227,7 @@ mod tests {
                 reference_hash,
                 Some(&calibration),
                 beta,
+                Some(1024),
             )
         };
         let seeds = |beta: Option<f64>| {
@@ -6084,6 +6236,7 @@ mod tests {
                 reference_hash,
                 &[(11, "registration-hash", measurement.as_str())],
                 beta,
+                1024,
             )
         };
 
@@ -6324,10 +6477,13 @@ mod tests {
         // M1: `None` for β on both sides — these fixtures record no run
         // group with a β, so the gate resolves `None` too.
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None, None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
+            width: 0,
+            height: 0,
+            scale_px: 0,
         })
         .unwrap();
         let reference_path = f.dir.path().join("reference.fits");
@@ -6349,6 +6505,13 @@ mod tests {
         )
         .unwrap();
 
+        // The scale the plan resolves for this fixture's geometry (the
+        // stored payload carries no dims, so it estimates from the anchor).
+        let ln_scale = crate::stacking::ln::resolve_scale(
+            &cfg.normalization.local,
+            groups[0].frames[0].width as usize,
+            groups[0].frames[0].height as usize,
+        );
         for gf in &groups[0].frames {
             let frame_hash = normalization_hash_for(
                 &cfg,
@@ -6358,6 +6521,7 @@ mod tests {
                 &reference_hash,
                 None,
                 None,
+                Some(ln_scale),
             );
             let sidecar_path = f.dir.path().join(format!("f{}.athln", gf.frame_id));
             std::fs::write(&sidecar_path, [0u8]).unwrap();
@@ -6399,8 +6563,13 @@ mod tests {
         // stored `ln` row's hash (the subtree folds the WHOLE
         // `normalization` block in) without touching a single artifact on
         // disk.
+        // Under auto mode a `scale` edit no longer changes the resolved
+        // scale (spec 2026-10-04 §2), so the edit pins a fixed scale that
+        // differs from the auto one.
         let mut cfg2 = cfg.clone();
-        cfg2.normalization.local.scale += 256;
+        cfg2.normalization.local.scale_mode =
+            Some(crate::stacking::integrate::LnScaleMode::Fixed);
+        cfg2.normalization.local.scale = 2048;
         let plan2 = build_plan(
             &f.conn,
             &settings,
@@ -6635,10 +6804,13 @@ mod tests {
         // M1: `None` for β on both sides — these fixtures record no run
         // group with a β, so the gate resolves `None` too.
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None, None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
+            width: 0,
+            height: 0,
+            scale_px: 0,
         })
         .unwrap();
         let reference_path = f.dir.path().join("reference.fits");
@@ -6661,6 +6833,11 @@ mod tests {
         .unwrap();
 
         // `ln` artifacts for ids[0]/ids[1] only — none at all for ids[2].
+        let ln_scale = crate::stacking::ln::resolve_scale(
+            &cfg.normalization.local,
+            groups[0].frames[0].width as usize,
+            groups[0].frames[0].height as usize,
+        );
         for &frame_id in &ids[..2] {
             let frame_hash = normalization_hash_for(
                 &cfg,
@@ -6670,6 +6847,7 @@ mod tests {
                 &reference_hash,
                 None,
                 None,
+                Some(ln_scale),
             );
             let sidecar_path = f.dir.path().join(format!("f{frame_id}.athln"));
             std::fs::write(&sidecar_path, [0u8]).unwrap();
@@ -7556,7 +7734,7 @@ mod tests {
             let meas = measurement_hash_for(cfg, &calib);
             let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
             let ln_ref =
-                normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5));
+                normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5), None);
             let ln = normalization_hash_for(
                 cfg,
                 &reg,
@@ -7565,25 +7743,28 @@ mod tests {
                 &ln_ref,
                 Some(&calib_k),
                 Some(1.5),
+                Some(1024),
             );
             let ln_cal = seeds_calibration_hash_for(
                 cfg,
                 &ln_ref,
                 &[(11, "r1", "m1"), (22, "r2", "m2")],
                 Some(1.5),
+                1024,
             );
             format!("{name}: calib={calib} meas={meas} reg={reg} ln_ref={ln_ref} ln={ln} ln_cal={ln_cal}")
         };
         let got: Vec<String> = configs.iter().map(|(name, cfg)| line(name, cfg)).collect();
         // GOLDEN: recorded on main 17e2e96e before the Task 1 edit.
         // 2026-10-05 LN model fixes Task 2: lnModelVersion 2 joins the normalization subtree (spec §7, L-19); calib/meas/reg unchanged.
+        // 2026-10-05 LN model fixes Task 3: scale/scaleMode/gridSize leave the subtree, ln_scale_px token (L-19).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=f6a28984a2261a07 ln=012c7d96e575c88e ln_cal=ff2c8d017e4cbba2",
-                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=f6a28984a2261a07 ln=69f6f6605370d093 ln_cal=ff2c8d017e4cbba2",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=1d5996f1a4c3932e ln=631e482ef31a36dd ln_cal=ad79ed0457fc7d74",
-                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=1d5996f1a4c3932e ln=fee56afa4c391794 ln_cal=ad79ed0457fc7d74",
+                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=0b4b9ca6ac3d54c6 ln=a3527acba4f4f8ea ln_cal=7e46c7f8997bbe37",
+                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=0b4b9ca6ac3d54c6 ln=3cc86052bbbbcf07 ln_cal=7e46c7f8997bbe37",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=27ac1d9fe7542989 ln=13fcdaf871fc19cb ln_cal=f1cf8420768a4741",
+                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=27ac1d9fe7542989 ln=3656bc7ea1cd7755 ln_cal=f1cf8420768a4741",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8979,10 +9160,13 @@ mod tests {
             hs.sort_unstable();
             hs.join(",")
         };
-        let reference_hash = normalization_hash_for(&cfg, &combined, "", &ids, "", None, None);
+        let reference_hash = normalization_hash_for(&cfg, &combined, "", &ids, "", None, None, None);
         let ref_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: ids.clone(),
             reference_hash: reference_hash.clone(),
+            width: 0,
+            height: 0,
+            scale_px: 0,
         })
         .unwrap();
         let ref_path = f.dir.path().join("reference.fits");
@@ -9000,6 +9184,11 @@ mod tests {
         };
         let calibration_json = serde_json::to_string(&calibration).unwrap();
         up("ln_calibration", None, "x", None, Some(&calibration_json));
+        let ln_scale = crate::stacking::ln::resolve_scale(
+            &cfg.normalization.local,
+            groups[0].frames[0].width as usize,
+            groups[0].frames[0].height as usize,
+        );
         for gf in &groups[0].frames {
             let h = normalization_hash_for(
                 &cfg,
@@ -9009,6 +9198,7 @@ mod tests {
                 &reference_hash,
                 Some(&calibration),
                 None,
+                Some(ln_scale),
             );
             let p = f.dir.path().join(format!("f{}.athln", gf.frame_id));
             std::fs::write(&p, [0u8]).unwrap();

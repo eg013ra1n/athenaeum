@@ -215,6 +215,11 @@ pub struct SummaryGroup {
     /// the convention.
     #[serde(default)]
     pub seeds_calibration: Option<Vec<f64>>,
+    // The LN scale this group ran at (spec 2026-10-04 §8); `None` when
+    // local normalization did not resolve one and on a summary written
+    // before 2026-10.
+    #[serde(default)]
+    pub ln_scale_px: Option<u32>,
     pub frames: Vec<SummaryFrame>,
 }
 

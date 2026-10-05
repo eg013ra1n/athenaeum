@@ -97,11 +97,9 @@ export type RejectionNormalization = "none" | "scaleZeroOffset" | "equalizeFluxe
 
 export type ScaleEstimator = "bwmv" | "mad" | "avgDev";
 
-export type LocalNormalizationConfig = { enabled: boolean, 
-/**
- * Tile size in pixels for the local-normalization grid.
- */
-scale: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, };
+export type LnScaleMode = "auto" | "fixed";
+
+export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, };
 
 export type NormalizationConfig = { output: OutputNormalization, rejection: RejectionNormalization, 
 /**
@@ -333,7 +331,7 @@ fitsCached: number,
  * this field's computation in [`build_plan`] for why (the LN reference
  * member list is a stage-3 weight quantity, unavailable at plan time).
  */
-lnCached: number, 
+lnCached: number, lnScalePx: number | null, lnScaleEstimated: boolean, lnWidth: number | null, lnHeight: number | null, 
 /**
  * M3 Task 5: the group's reference-anchor member's own native
  * `NAXIS1`/`NAXIS2` — the SAME member and the SAME convention
@@ -522,7 +520,7 @@ beta: number | null,
  * `#[serde(default)]`, see [`SummaryFrame::ln_scale`]'s own doc for
  * the convention.
  */
-seedsCalibration: Array<number> | null, frames: Array<SummaryFrame>, };
+seedsCalibration: Array<number> | null, lnScalePx: number | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 

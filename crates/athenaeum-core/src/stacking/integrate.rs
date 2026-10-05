@@ -142,12 +142,38 @@ pub struct NormalizationConfig {
 /// `false` by default — it only means anything while `enabled` is on;
 /// every other field is carried so the block round-trips through a stored
 /// config unchanged.
+/// How the LN scale is chosen (spec 2026-10-04 §2): derived from the LN
+/// geometry (`auto`, the default) or the stored `scale` (`fixed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum LnScaleMode {
+    Auto,
+    Fixed,
+}
+
+impl LnScaleMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LnScaleMode::Auto => "auto",
+            LnScaleMode::Fixed => "fixed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {
     pub enabled: bool,
-    /// Tile size in pixels for the local-normalization grid.
+    // The LN scale in pixels when `scaleMode` is `fixed`; snapped to the
+    // supported list by `resolve_config`. Read only by `ln::resolve_scale`.
     pub scale: u32,
+    // `None` only on a document stored before 2026-10 (field-level default,
+    // so the struct's own default cannot fill it): `resolve_config` turns it
+    // into `Some` by the legacy rule L-9.
+    #[serde(default)]
+    pub scale_mode: Option<LnScaleMode>,
+    // Auto scale = the short side of the LN geometry / gridSize, snapped (2-8).
+    pub grid_size: u32,
     pub reference_frames: u32,
     pub psf_model: crate::stacking::psf_signal::PsfModel,
     pub local_scale: bool,
@@ -158,6 +184,8 @@ impl Default for LocalNormalizationConfig {
         LocalNormalizationConfig {
             enabled: false,
             scale: 1024,
+            scale_mode: Some(LnScaleMode::Auto),
+            grid_size: 4,
             reference_frames: 20,
             psf_model: crate::stacking::psf_signal::PsfModel::Auto,
             local_scale: false,
@@ -1824,6 +1852,8 @@ mod tests {
         let nv = serde_json::to_value(&n).unwrap();
         assert_eq!(nv["local"]["enabled"], false);
         assert_eq!(nv["local"]["scale"], 1024);
+        assert_eq!(nv["local"]["scaleMode"], "auto");
+        assert_eq!(nv["local"]["gridSize"], 4);
         assert_eq!(nv["local"]["referenceFrames"], 20);
         assert_eq!(nv["local"]["psfModel"], "auto");
         assert_eq!(nv["local"]["localScale"], false);
@@ -1836,6 +1866,10 @@ mod tests {
             LocalNormalizationConfig {
                 enabled: true,
                 scale: 512,
+                // A document stored without `scaleMode` decodes to `None`
+                // here; `resolve_config` fills it (L-9).
+                scale_mode: None,
+                grid_size: 4,
                 reference_frames: 8,
                 psf_model: crate::stacking::psf_signal::PsfModel::Moffat4,
                 local_scale: true,
