@@ -1,0 +1,32 @@
+{
+ "size": 100,
+ "nebula": [
+  [
+   6800,
+   200
+  ],
+  [
+   6400,
+   200
+  ],
+  [
+   6300,
+   800
+  ]
+ ],
+ "background": [
+  [
+   7300,
+   1600
+  ],
+  [
+   7300,
+   1300
+  ],
+  [
+   7200,
+   1100
+  ]
+ ],
+ "chosen_on": "the branch LN-off control's G master (hc11-noln), BEFORE any LN master was read. Nebula: the three brightest 100-px blocks of the IC 434 striations (x 6200-6900, y 200-1600) with no pixel above 3x the box median and no pixel above 20x sky within 300 px. Background: the three darkest such blocks of the plain star field east of it (x 7000-8000, y 800-2400), within 1500 px of the nebula boxes and over 600 px from the halo star at (7556, 3212). Corners are top-left (x, y) in master pixels."
+}
