@@ -13,7 +13,7 @@
 
 **Tech Stack:** Rust (`athenaeum-core`): serde, rayon, xxhash, rusqlite 0.40, ts-rs (`tests/ts_contract.rs`). React/TS (`NormalizePanel`, `stageSummary`, `registry.ts`, `ExportTab`), vitest. Python 3 + numpy for the acceptance scripts. No new crate dependency (the 1148×1148 Cholesky is written by hand in `background.rs`).
 
-**Spec:** `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` (owner-approved 2026-10-04, rulings L-1…L-22). Read it whole before Task 1. Every task cites the spec sections it implements. Where this plan refines the spec, it says so as a ruling **P-n** (next section); P-1 and P-20 need the owner's confirmation at plan review.
+**Spec:** `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` (owner-approved 2026-10-04, rulings L-1…L-22). Read it whole before Task 1. Every task cites the spec sections it implements. Where this plan refines the spec, it says so as a ruling **P-n** (next section); P-1 and P-20 were confirmed by the owner at plan review (2026-10-05, "с 1 пунктом согласен").
 
 **Review folded in:** `.superpowers/sdd/ln-model-fixes/plan-review-fable.md` (verdict "ready after fixes": 3 Critical, 6 Important, 10 Minor). Every fix names its finding (C-n, I-n, M-n) where it lands; C-1 became ruling P-21. The reviewer independently confirmed P-20 and P-1.
 
@@ -102,9 +102,9 @@ Five inputs the spec implies, which no task's original tests would exercise, and
 
 ## Plan rulings (refinements of the spec)
 
-Numbered P-1…P-21. Each says what it decides and why. **P-1 and P-20 need the owner's confirmation at plan review.** The rest are writer's decisions on points the spec leaves open.
+Numbered P-1…P-21. Each says what it decides and why. **P-1 and P-20 were confirmed by the owner at plan review (2026-10-05, "с 1 пунктом согласен").** The rest are writer's decisions on points the spec leaves open.
 
-- **P-1 — The linear-gradient pin (spec §1.6) as the model can meet it.** *(Owner to confirm, together with P-20.)*
+- **P-1 — The linear-gradient pin (spec §1.6) as the model can meet it.** *(Owner-confirmed 2026-10-05, with P-20.)*
   - The spec asks that "a linear gradient is reproduced at every node to 1e-5 of its amplitude". No first-difference (membrane) penalty can meet that at the edges.
   - The cause is the membrane itself. Its null space is the constants, so near an edge it pulls the surface toward the edge level. That is the documented property the spec relies on for gaps ("beyond the last data it continues at the edge level").
   - Prototype on 2048 × 1536 at scale 512, a 0.02 gradient on a 0.1 sky, error as a fraction of the gradient's amplitude:
@@ -190,7 +190,7 @@ Numbered P-1…P-21. Each says what it decides and why. **P-1 and P-20 need the 
     - ≤ 5 % of sky with the gradient;
     - ≤ 2 % flat;
     - the covered part within 0.3 % of sky.
-- **P-20 — The membrane penalty is λ = 1e-2 × the median non-zero diagonal of BᵀB, not 1e-4 (L-3's constant).** *(Owner to confirm.)*
+- **P-20 — The membrane penalty is λ = 1e-2 × the median non-zero diagonal of BᵀB, not 1e-4 (L-3's constant).** *(Owner-confirmed 2026-10-05.)*
   - **Found by the prototype after the spec was approved.** A coefficient whose support touches the data only through its B-spline tail is weakly determined. At λ = 1e-4 the penalty is too weak to hold it, so the sample noise is amplified there.
   - Analytic node noise for a single frame (σ/sky = 0.188, the set-204 geometry 6248 × 4176 at scale 1024), in % of sky. The old cell model's node noise is 0.37 % everywhere.
 
@@ -4066,6 +4066,6 @@ The full core suite (`cargo test -p athenaeum-core --all-targets`) runs once mor
 - `flat_only_lights(&Connection, &[i64]) -> Result<FlatOnlyTally, ApiError>`.
 
 **Decisions this plan takes that the owner should see:**
-- **P-1 and P-20** (the membrane penalty and the gradient pin) — confirmation requested.
+- **P-1 and P-20** (the membrane penalty and the gradient pin) — owner-confirmed 2026-10-05.
 - P-21 (a rounding-level residual MAD counts as σ_e ≤ 0; review C-1).
 - P-2 (how the halo/feature pins are read), P-5 (two extra `PlanGroup` fields), P-6 (the B move in `tier1-compare.py`), P-11 (where the pedestal `warn!` is emitted), P-13 (OFF for pre-selection synthetic tests), P-19 (the spec's gap sentence is loose) — writer's decisions, open to the reviewer.
