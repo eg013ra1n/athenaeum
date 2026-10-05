@@ -76,9 +76,11 @@ def main():
     print(f"control {os.path.basename(opts['--control'])}: {nh} x {nw} blocks of {size} px, "
           f"sky (reference median) {sky:.6g}, control median {ctl_med:.6g}")
 
-    blocks, resid = {}, {}
+    blocks, resid, med0 = {}, {}, None
     for label, path in arms:
         img = plane(path, pl)
+        if med0 is None:
+            med0 = float(np.nanmedian(img))
         if img.shape != ctl.shape:
             sys.exit(f"{label}: shape {img.shape} is not the control's {ctl.shape}")
         blocks[label] = block_reduce(img, size, np.nanmedian)
@@ -98,7 +100,7 @@ def main():
 
     if len(arms) >= 2:
         (l0, _), (l1, _) = arms[0], arms[1]
-        diff = 100.0 * (blocks[l0] - blocks[l1]) / float(np.nanmedian(plane(arms[0][1], pl)))
+        diff = 100.0 * (blocks[l0] - blocks[l1]) / med0
         order = np.argsort(-np.abs(np.where(np.isfinite(diff), diff, 0.0)), axis=None)[:12]
         print(f"\ntop 12 |{l0}-{l1}| {size}-px blocks (% of {l0}'s median); block centre; each arm's structure residual vs the control (% ); "
               "max pixel of the block in the control / the control's median")

@@ -71,6 +71,11 @@ if [ -n "${ATH_ACC_PROJECT_CONFIG:-}" ]; then
     echo "ATH_ACC_PROJECT_CONFIG=$ATH_ACC_PROJECT_CONFIG is not a readable file" >&2
     exit 1
   fi
+  CFG_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("projectId"))' "$ATH_ACC_PROJECT_CONFIG" 2>/dev/null)
+  if [ "$CFG_ID" != "$PID" ]; then
+    echo "ATH_ACC_PROJECT_CONFIG names projectId '$CFG_ID', not this run's project $PID" >&2
+    exit 1
+  fi
   CFG_RESP=$(zsh "$REPO/docs/superpowers/research/scripts/acceptance/api.sh" set_project_stacking_config "$(cat "$ATH_ACC_PROJECT_CONFIG")" "$PORT")
   echo "set_project_stacking_config ($ATH_ACC_PROJECT_CONFIG): $CFG_RESP"
   # Success answers the stored project config, a JSON object; an error answers with its text.

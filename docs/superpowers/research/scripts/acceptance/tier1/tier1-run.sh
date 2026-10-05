@@ -32,6 +32,13 @@ if [ -n "${ATH_ACC_SET_CONFIG:-}" ]; then
     pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
     exit 1
   fi
+  CFG_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("setId"))' "$ATH_ACC_SET_CONFIG" 2>/dev/null)
+  if [ "$CFG_ID" != "$SET_ID" ]; then
+    echo "ATH_ACC_SET_CONFIG names setId '$CFG_ID', not this run's set $SET_ID" >&2
+    kill $SSE_PID 2>/dev/null
+    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+    exit 1
+  fi
   CFG_RESP=$(zsh "$REPO/docs/superpowers/research/scripts/acceptance/api.sh" set_stacking_config "$(cat "$ATH_ACC_SET_CONFIG")" "$PORT")
   echo "set_stacking_config ($ATH_ACC_SET_CONFIG): $CFG_RESP"
   # Success is the command's `null`; an error answers with its text.

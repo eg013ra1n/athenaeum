@@ -77,6 +77,9 @@ def main():
     masters = args[2:]
     if ks and len(ks) != len(masters):
         sys.exit(f"--k given {len(ks)} times for {len(masters)} masters")
+    if ks and "--control-k" not in sys.argv:
+        sys.exit("--k given without --control-k: the control would be read at k = 1 (its raw read) "
+                 "against normalized masters; pass the control's own --control-k")
     ks = ks or [1.0] * len(masters)
     ctl = plane(control)
     bg0 = background(ctl, bg_box, size)
