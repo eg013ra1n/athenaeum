@@ -1,8 +1,18 @@
 """Master vs LN reference photometry with the acceptance harness's truth photometry, and the
-prediction from per-member gaps x weights (ln-scale-audit)."""
+prediction from per-member gaps x weights (ln-scale-audit).
+
+    master_phot.py <ref> <master> <plane> <x0> [<summary.json> <group-key> <decomp.csv>]
+                   [--y0 Y0] [--noise]
+
+The last three positionals are optional: the `predicted` block is printed only when all three
+are given (a set without a decomposition CSV has none). --y0 is the master's row offset in the
+reference canvas (default 0). --noise runs `measure_probe` on the master (the binary
+tier1-compare.py uses), reads the plane's `.noise` and adds `noise`, `k` (1 / ratio) and
+`snr` (k / noise) to the JSON line (P-17)."""
 import csv
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,10 +46,43 @@ def predicted(summary_json, group_key, decomp_csv, plane, handle_key="frameId"):
         num += w * e; den += w; n += 1
     return num / den, n, miss, float(np.mean(list(gaps.values())))
 
+MEASURE_PROBE = Path(__file__).resolve().parents[5] / ".superpowers" / "target-acc" / "release" / "examples" / "measure_probe"
+
+
+def plane_noise(master_path, plane):
+    """The plane's MRS `.noise` from `measure_probe <master>` (same read as tier1-compare.py)."""
+    if not MEASURE_PROBE.exists():
+        sys.exit(f"--noise needs measure_probe, not found at {MEASURE_PROBE} - build it first "
+                 "(cargo build --release -p athenaeum-core --example measure_probe, target-dir .superpowers/target-acc)")
+    proc = subprocess.run([str(MEASURE_PROBE), master_path], capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        sys.exit(f"measure_probe failed on {master_path}: {proc.stderr.strip()[-500:]}")
+    data = json.loads(proc.stdout)
+    channels = data if isinstance(data, list) else data["channels"]
+    return float(channels[plane]["noise"])
+
+
 if __name__ == "__main__":
-    ref, master, plane, x0, summ, key, dec = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7]
-    ph = measure(ref, master, plane, x0=x0)
-    eps_w, n, miss, eps_mean = predicted(summ, key, dec, plane)
-    print(json.dumps(dict(master=master.split('/')[-1], plane=plane, ratio_ref_over_master=ph["ratio"], se=ph["se"], n=ph["n"], mode=ph["mode"],
-        fwhm_ref=ph["fwhm_ref"], fwhm_master=ph["fwhm_mem"], unc=ph["unc"], eps_weighted=eps_w, eps_mean=eps_mean, members=n, members_missing=miss,
-        predicted_ratio=1 / (1 + eps_w))))
+    argv = sys.argv[1:]
+    want_noise = "--noise" in argv
+    argv = [a for a in argv if a != "--noise"]
+    y0 = 0
+    if "--y0" in argv:
+        i = argv.index("--y0")
+        y0 = int(argv[i + 1])
+        del argv[i:i + 2]
+    if len(argv) not in (4, 7):
+        sys.exit(__doc__)
+    ref, master, plane, x0 = argv[0], argv[1], int(argv[2]), int(argv[3])
+    ph = measure(ref, master, plane, x0=x0, y0=y0)
+    out = dict(master=master.split('/')[-1], plane=plane, ratio_ref_over_master=ph["ratio"], se=ph["se"], n=ph["n"], mode=ph["mode"],
+        fwhm_ref=ph["fwhm_ref"], fwhm_master=ph["fwhm_mem"], unc=ph["unc"])
+    if len(argv) == 7:
+        summ, key, dec = argv[4:7]
+        eps_w, n, miss, eps_mean = predicted(summ, key, dec, plane)
+        out.update(eps_weighted=eps_w, eps_mean=eps_mean, members=n, members_missing=miss, predicted_ratio=1 / (1 + eps_w))
+    if want_noise:
+        noise = plane_noise(master, plane)
+        k = 1 / ph["ratio"]
+        out.update(noise=noise, k=k, snr=k / noise)
+    print(json.dumps(out))

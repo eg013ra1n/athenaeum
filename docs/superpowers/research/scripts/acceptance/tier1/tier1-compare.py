@@ -14,6 +14,13 @@ compatibility with `checkpoint.sh`'s existing default call). `--set-id` defaults
 (`LDN1272-test`, the Tier A/Tier C reduced set); it selects which `stacking_runs` row (the latest
 `status='done'` for that `frames_set_id`) each side's DB numbers come from.
 
+--ln-grids mode (LN model fixes, P-6): the LN grids of two working trees.
+
+    tier1-compare.py --ln-grids <W_head> <W_base>
+
+Pairs every `.athln` under `<W>/stackwork/**` by relative path, counts `A`/`global_scale`
+bit-identity and prints the B move (|dB| / the base reference's sky) as median / p99 / max.
+
 --pairs mode (plan 6b-3 run A): the first four rows on explicit master pairs.
 
     tier1-compare.py --pairs <head_master>=<base_master> [...]
@@ -370,6 +377,32 @@ def read_athln_channel_means(path):
     return means
 
 
+def read_athln(path):
+    """-> (scale, [(gw, gh, global_scale, location_ref, a, b), ...]) — the same on-disk layout
+    `read_athln_channel_means` documents, with every channel's `A` and `B` arrays returned
+    (python floats widened from f32 LE; the f32 bytes are recovered exactly by `struct.pack`)."""
+    data = open(path, "rb").read()
+    if data[:8] != ATHLN_MAGIC:
+        raise ValueError("bad magic")
+    _version, _ref_w, _ref_h, scale, nchan = struct.unpack_from("<5I", data, 8)
+    off = 28
+    chans = []
+    for _ in range(nchan):
+        gw, gh = struct.unpack_from("<2I", data, off)
+        off += 8
+        global_scale, location_ref, _loc_tgt, _rel = struct.unpack_from("<4d", data, off)
+        off += 32
+        n = gw * gh
+        if n <= 0:
+            raise ValueError(f"bad grid dims {gw}x{gh}")
+        a = list(struct.unpack_from(f"<{n}f", data, off))
+        off += n * 4
+        b = list(struct.unpack_from(f"<{n}f", data, off))
+        off += n * 4
+        chans.append((gw, gh, global_scale, location_ref, a, b))
+    return scale, chans
+
+
 def collect_athln_scales(work_dir):
     """relative-path-under-stackwork -> mean-over-channels LN relative scale."""
     out = {}
@@ -717,6 +750,67 @@ def run_numeric(head_dir, base_dir, set_id):
     return 0 if overall_ok else 1
 
 
+def _f32_bytes(values):
+    return struct.pack(f"<{len(values)}f", *values)
+
+
+def run_ln_grids(head_dir, base_dir):
+    """P-6: pair every `.athln` under `<W>/stackwork/**` by relative path; report whether `A` and
+    `global_scale` are bit-identical and how far `B` moved, in units of the base reference's sky
+    (`location_ref`; `B` is in pixel units). Reported, never gated: exits 0."""
+
+    def walk(w):
+        root = os.path.join(w, "stackwork")
+        return {
+            os.path.relpath(p, root): p
+            for p in glob.glob(os.path.join(root, "**", "*.athln"), recursive=True)
+        }
+
+    head, base = walk(head_dir), walk(base_dir)
+    paired = missing = mesh_differs = a_ident = 0
+    moves = []
+    for rel in sorted(base):
+        if rel not in head:
+            missing += 1
+            continue
+        try:
+            hs, hc = read_athln(head[rel])
+            bs, bc = read_athln(base[rel])
+        except Exception as e:  # noqa: BLE001 - a corrupt/short sidecar is a skip, not a crash
+            print(f"  warn: could not read {rel}: {e}", file=sys.stderr)
+            missing += 1
+            continue
+        if hs != bs or len(hc) != len(bc) or any(
+            (h[0], h[1]) != (b[0], b[1]) for h, b in zip(hc, bc)
+        ):
+            mesh_differs += 1
+            continue
+        paired += 1
+        same = True
+        for h, b in zip(hc, bc):
+            if struct.pack("<d", h[2]) != struct.pack("<d", b[2]) or _f32_bytes(h[4]) != _f32_bytes(b[4]):
+                same = False
+            sky = b[3]
+            if sky:
+                moves.extend(abs(hb - bb) / sky for hb, bb in zip(h[5], b[5]))
+        a_ident += same
+    print("== LN grids: HEAD vs BASE ==")
+    print(f"sidecars paired={paired} missing_in_head={missing} mesh_differs={mesh_differs}")
+    print(f"A and global_scale bit-identical: {a_ident} / {paired}")
+    if moves:
+        moves.sort()
+        med = statistics.median(moves)
+        p99 = moves[min(len(moves) - 1, int(0.99 * len(moves)))]
+        over = sum(1 for m in moves if m > 0.01)
+        print(
+            f"B move (|dB| / sky): median={med:.3e} p99={p99:.3e} max={moves[-1]:.3e} "
+            f"nodes>1%={over} of {len(moves)}"
+        )
+    else:
+        print("B move (|dB| / sky): n/a (no paired nodes)")
+    return 0
+
+
 def plane_dims(path):
     """-> (width, height) of a master: NAXIS1/NAXIS2 of a FITS header, else the array shape."""
     if path.lower().endswith((".fits", ".fit")):
@@ -795,6 +889,12 @@ def main():
             print("usage: tier1-compare.py --pairs <head_master>=<base_master> [...]", file=sys.stderr)
             sys.exit(2)
         sys.exit(run_pairs([tuple(a.split("=", 1)) for a in rest]))
+    if "--ln-grids" in args:
+        rest = [a for a in args if a != "--ln-grids"]
+        if len(rest) != 2:
+            print("usage: tier1-compare.py --ln-grids <W_head> <W_base>", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(run_ln_grids(rest[0], rest[1]))
     numeric = "--numeric" in args
     args = [a for a in args if a != "--numeric"]
     set_id = 204
@@ -805,7 +905,8 @@ def main():
     if len(args) != 2:
         print(
             "usage: tier1-compare.py <W_base> <W_head>\n"
-            "       tier1-compare.py --numeric <W_head> <W_base> [--set-id N]",
+            "       tier1-compare.py --numeric <W_head> <W_base> [--set-id N]\n"
+            "       tier1-compare.py --ln-grids <W_head> <W_base>",
             file=sys.stderr,
         )
         sys.exit(2)

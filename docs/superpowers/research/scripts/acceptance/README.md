@@ -59,6 +59,24 @@ not rebuilt per cycle (owner request 2026-09-18).
    crowded field (too few isolated stars at its PSF width): that is a
    refusal, not a failure, and an empty column is reported as is. `grid-report.py --self-check` runs the
    synthetic check of the photometry and the log parser (no real data).
+10. LN model fixes, checkpoint A (spec `2026-10-04-ln-model-fixes-design.md` §11.2–§11.4):
+    - `tier1/tier1-compare.py --ln-grids <W_head> <W_base>` pairs every `.athln`
+      under `<W>/stackwork/**`, prints how many have `A` and `global_scale`
+      bit-identical and the B move (|dB| / the base reference's sky: median, p99,
+      max, nodes past 1 %). Reported, not gated; against itself every number is 0.
+    - `ln-math/halo_profile.py … [--search R] [--k K_LN,K_NOLN,K_EXT] [--bg0 BG]
+      [--labels A,B,C]` adds the centroid-refined star position and the
+      scale-normalized ring excess (L-21) after today's tables.
+    - `ln-scale-audit/master_phot.py <ref> <master> <plane> <x0> [<summary> <key> <csv>]
+      [--y0 Y] [--noise]`: the `predicted` block needs all three trailing
+      arguments; `--noise` adds `noise`, `k` and `snr` from `measure_probe`.
+    - `ln-model/nebula_boxes.py <boxes.json> <control> <master>… [--k K …] [--size 100]`:
+      per-box nebula excess, raw and scale-normalized against the control's
+      background; write and commit `boxes.json` before the LN master is read.
+    - `ln-model/horse-c11-prep.sh <acc-dir> <port>` builds the Horse C11 catalog
+      copy (set-182 lights lose the offset-50 dark links) and prints the next
+      steps; `ln-model/horse-c11-config.py <run-8.json> <acc-dir>/athenaeum.db
+      [--fixed-1024]` prints the `set_stacking_config` body (R and B lights excluded).
 
 A catalog copy is made with `sqlite3 -readonly <live db> ".backup <copy>"`,
 never by reading the live catalog any other way, and `prepare-catalog.sh` is
