@@ -807,7 +807,9 @@ fn registration_subtree_with_fit_version(
 /// its matched stars through the same `fit_stars` /
 /// `FitParams::default()` the measurement uses, so a change to what the
 /// fitter accepts silently changes every `.athln` — and no config field
-/// moves when it does (ruling R-M4a-15).
+/// moves when it does (ruling R-M4a-15). It also carries
+/// [`crate::stacking::ln::LN_MODEL_VERSION`] (`lnModelVersion`): a change in
+/// what an existing config's LN model produces moves the hashes the same way.
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
     normalization_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
 }
@@ -825,6 +827,7 @@ fn normalization_subtree_with_fit_version(
             "maxStars": cfg.measurement.max_stars,
         },
         "psfFitVersion": psf_fit_version,
+        "lnModelVersion": crate::stacking::ln::LN_MODEL_VERSION,
     })
 }
 
@@ -840,6 +843,18 @@ pub fn project_seed_config(global: StackingConfig) -> StackingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ln_model_version_rides_the_normalization_subtree_only() {
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            normalization_subtree(&cfg)["lnModelVersion"],
+            serde_json::json!(crate::stacking::ln::LN_MODEL_VERSION)
+        );
+        for other in [measurement_subtree(&cfg), registration_subtree(&cfg)] {
+            assert!(other.get("lnModelVersion").is_none(), "{other}");
+        }
+    }
 
     /// Plan 6b-2 C2: the four modes' wire names are the spec's.
     #[test]

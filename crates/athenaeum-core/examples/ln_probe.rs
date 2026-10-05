@@ -18,8 +18,9 @@
 //! to `1.0` (equal ranking) with a printed note.
 //!
 //! cargo run --release -p athenaeum-core --example ln_probe -- \
-//!   --db <catalog.db> --set <id> --group <key> [--frames N] [--scale 1024] \
-//!   [--frame <calibrated-file-stem>]
+//!   --db <catalog.db> --set <id> --group <key> \
+//!   [--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits] [--diag] \
+//!   [--seeds-calibration <k0[,k1,k2]>] [--measure-calibration]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -45,9 +46,9 @@ use athenaeum_core::stacking::integrate::{
 };
 use athenaeum_core::stacking::ln::calibration as ln_calibration;
 use athenaeum_core::stacking::ln::{
-    background_grid, build_reference, normalize_frame, relative_scale,
-    relative_scale_from_seeds_with_breakdown, BackgroundParams, LnFrameGrids, LnGrid,
-    LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    build_reference, normalize_frame, relative_scale, relative_scale_from_seeds_with_breakdown,
+    shared_refit, BackgroundModel, LnFrameGrids, LnGrid, LnReferenceForDetection, LnScaleSeeds,
+    TileTable, CLEANING,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -249,8 +250,8 @@ fn warp_channel(
     plane
 }
 
-/// Median absolute value of a per-cell residual over a `BackgroundGrid`
-/// pair (both `gw × gh`, row-major) — the "before"/"after" summary the
+/// Median absolute value of a per-node residual over a pair of background
+/// surfaces (both `gw × gh`, row-major) — the "before"/"after" summary the
 /// brief asks for, computed ON THE MESH (the same node positions the LN
 /// grid's own A/B live at), not over raw pixels.
 fn median_abs(values: &[f32]) -> f64 {
@@ -491,8 +492,7 @@ registration row for each — run stacking through Register first); found {}",
         enabled: true,
         scale: args.scale,
         reference_frames: args.frames,
-        psf_model: PsfModel::Auto,
-        local_scale: false,
+        ..LocalNormalizationConfig::default()
     };
     let measure_opts = cfg
         .measurement
@@ -573,26 +573,30 @@ registration row for each — run stacking through Register first); found {}",
     let ref_for_detection =
         LnReferenceForDetection::build(&reference, reference_psf, measure_opts.max_stars, None);
     let reference_build_ms = build_start.elapsed().as_millis() as u64;
-    let ref_params = BackgroundParams {
-        scale: args.scale,
-        ..DEFAULT_PARAMS
-    };
     // Perf tier A Task 12: pass the probe's own pool through so the probe
     // exercises the SAME parallel path production (`stacking::run`) does —
     // with `pool = None` throughout, this probe would only ever measure
     // the allocation-reduction half of the task, understating the real
     // improvement.
-    let ref_backgrounds: Vec<_> = reference
+    let ref_models: Vec<BackgroundModel> = reference
         .planes
         .iter()
-        .map(|p| {
-            background_grid(
-                p,
-                reference.width,
-                reference.height,
-                &ref_params,
-                Some(&pool),
+        .enumerate()
+        .map(|(p, plane)| {
+            BackgroundModel::fit(
+                TileTable::measure(
+                    plane,
+                    reference.width,
+                    reference.height,
+                    &CLEANING,
+                    Some(&pool),
+                ),
+                args.scale,
             )
+            .unwrap_or_else(|r| {
+                eprintln!("channel {p}: the LN reference's background model is refused: {r}");
+                std::process::exit(1);
+            })
         })
         .collect();
 
@@ -647,11 +651,12 @@ registration row for each — run stacking through Register first); found {}",
         let measured = ln_calibration::measure_seeds_calibration(
             &reference,
             &ref_for_detection,
-            &ref_backgrounds,
+            &ref_models,
             &stack_frames,
             &indices,
             &load_fits,
             &local_cfg,
+            args.scale,
             &measure_opts,
             interpolation,
             clamping,
@@ -760,17 +765,18 @@ catalog has no artifact for)",
     let outcome = normalize_frame(
         &reference,
         &ref_for_detection,
-        &ref_backgrounds,
+        &ref_models,
         target,
         seeds_arg,
         &local_cfg,
+        args.scale,
         &measure_opts,
         interpolation,
         clamping,
         &sidecar_path,
         seeds_calibration.as_ref(),
         // Perf tier A Task 12: the probe's own pool, not `None` — see the
-        // `ref_backgrounds` comment above for why.
+        // `ref_models` comment above for why.
         Some(&pool),
         &cancel,
     )
@@ -843,26 +849,28 @@ catalog has no artifact for)",
             None
         };
 
-        let target_params = BackgroundParams {
-            scale: args.scale,
-            deviation_sigma: TARGET_DEVIATION_SIGMA,
-            ..DEFAULT_PARAMS
-        };
-        let target_bg = background_grid(
-            &target_plane,
-            reference.width,
-            reference.height,
-            &target_params,
-            Some(&pool),
-        );
-        let ref_bg = &ref_backgrounds[p];
+        let target_model = BackgroundModel::fit(
+            TileTable::measure(
+                &target_plane,
+                reference.width,
+                reference.height,
+                &CLEANING,
+                Some(&pool),
+            ),
+            args.scale,
+        )
+        .unwrap_or_else(|r| {
+            eprintln!("channel {p}: the frame's background model is refused: {r}");
+            std::process::exit(1);
+        });
+        let pair = shared_refit(&ref_models[p], &target_model);
 
         // Before: raw per-cell background mismatch. After: the SAME cells,
         // corrected through the fitted grid the engine's own band loop
         // would apply — evaluated via `evaluate_row` (the bicubic B-spline
         // reconstruction of the coarse `A`/`B` grid), at the mesh's own
         // node positions (`(i·stride, j·stride)`, clamped into the plane —
-        // `background_grid`'s own convention, see its module doc), not the
+        // the background module's own convention), not the
         // grid's raw stored node values (which would trivially reproduce
         // `B_ref` by construction and prove nothing).
         let grid: &LnGrid = &grids.channels[p];
@@ -872,23 +880,25 @@ catalog has no artifact for)",
         // but reading it off the grid itself can never drift from what
         // `evaluate_row` actually uses internally.
         let stride = grid.stride();
-        let mut before = Vec::with_capacity(target_bg.gw * target_bg.gh);
-        let mut after = Vec::with_capacity(target_bg.gw * target_bg.gh);
+        let ref_nodes = pair.reference.nodes(stride);
+        let tgt_nodes = pair.target.nodes(stride);
+        let mut before = Vec::with_capacity(grid.gw * grid.gh);
+        let mut after = Vec::with_capacity(grid.gw * grid.gh);
         let mut a_row = vec![0f32; reference.width];
         let mut b_row = vec![0f32; reference.width];
         // The trailing node on each axis overshoots the plane by design,
         // so its address is clamped to the last pixel — the same rule
-        // `ln::background::background_grid` windows that node's cell with
-        // and `ln::a_grid` samples the local-scale spline at (review m7),
-        // so all three read the mesh at one and the same pixel.
-        for j in 0..target_bg.gh {
+        // `ln::background::Surface::nodes` evaluates that node at and
+        // `ln::a_grid` samples the local-scale spline at (review m7), so
+        // all three read the mesh at one and the same pixel.
+        for j in 0..grid.gh {
             let node_y = (j * stride).min(reference.height.saturating_sub(1));
             grid.evaluate_row(node_y, &mut a_row, &mut b_row);
-            for i in 0..target_bg.gw {
+            for i in 0..grid.gw {
                 let node_x = (i * stride).min(reference.width.saturating_sub(1));
-                let idx = j * target_bg.gw + i;
-                let raw = target_bg.cells[idx];
-                let refv = ref_bg.cells[idx];
+                let idx = j * grid.gw + i;
+                let raw = tgt_nodes[idx];
+                let refv = ref_nodes[idx];
                 before.push((raw - refv).abs());
                 let corrected = LnGrid::apply(a_row[node_x], b_row[node_x], raw);
                 after.push((corrected - refv).abs());
@@ -908,7 +918,10 @@ catalog has no artifact for)",
             "beta": scale_ok.map(|r| r.beta),
             "pass": scale_ok.map(|r| r.pass),
             "localNodes": scale_ok.map(|r| r.local.as_ref().map_or(0, |s| s.nodes.len())),
-            "cellsRejected": target_bg.invalid_cells,
+            "samples": target_model.samples,
+            "samplesRejected": target_model.samples_rejected,
+            "samplesShared": pair.shared,
+            "cellsUnsupported": target_model.cells_unsupported,
             "residualBefore": median_abs(&before),
             "residualAfter": median_abs(&after),
             // Ruling C-12 acceptance measurement: the size of Measure's own
@@ -942,7 +955,10 @@ catalog has no artifact for)",
         "sidecar": {
             "scale": outcome.scale,
             "matches": outcome.matches,
-            "cellsRejected": outcome.cells_rejected,
+            "samples": outcome.samples,
+            "samplesRejected": outcome.samples_rejected,
+            "samplesShared": outcome.samples_shared,
+            "cellsUnsupported": outcome.cells_unsupported,
             "path": outcome.sidecar.display().to_string(),
             "lnScaleSource": outcome.ln_scale_source,
         },

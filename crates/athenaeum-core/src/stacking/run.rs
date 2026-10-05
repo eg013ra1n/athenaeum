@@ -76,9 +76,9 @@ use crate::stacking::integrate::{
     GroupStats, StackFrame,
 };
 use crate::stacking::ln::{
-    self, background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
-    write_reference, BackgroundGrid, BackgroundParams, LnFrameGrids, LnReference,
-    LnError, LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS,
+    self, build_reference as build_ln_reference, normalize_frame, read_reference, write_reference,
+    BackgroundModel, LnError, LnFrameGrids, LnReference, LnReferenceForDetection, LnScaleSeeds,
+    TileTable, CLEANING,
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
@@ -3190,7 +3190,7 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 
 /// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
 /// masks (a byte per pixel each) and a masked copy of the reference plane
-/// (four bytes), the masked `background_grid` copy of the reference plane
+/// (four bytes), the masked copy of the reference plane
 /// and its row buffer (about one more plane): counted as three f32 planes,
 /// rounded up from about 2.5.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
@@ -10153,7 +10153,16 @@ struct LnGroupOutcome {
 struct LnArtifactPayload {
     scale: f64,
     matches: usize,
-    cells_rejected: usize,
+    // The background model's counters (spec 2026-10-04 §10), each summed over
+    // channels; a payload written before them reads as 0.
+    #[serde(default)]
+    samples: usize,
+    #[serde(default)]
+    samples_rejected: usize,
+    #[serde(default)]
+    samples_shared: usize,
+    #[serde(default)]
+    cells_unsupported: usize,
     /// Perf tier C Task 2 fix round 4 (ruling C-14 items 2/3): `"seeds"` or
     /// `"detected"` — this frame's OWN scale source, so a run pin (and a
     /// reader of the cached row) can tell which path produced the sidecar
@@ -10445,59 +10454,60 @@ fn run_group_normalization(
         )?,
     };
 
-    let ref_params = BackgroundParams {
-        scale: ln_cfg.scale,
-        ..DEFAULT_PARAMS
-    };
-    // Perf tier A Task 12: the group's own pool, so `background_grid`'s
-    // per-cell loop (and `clean_plane`'s two passes) fan out across
-    // workers instead of running one cell at a time on this thread — this
-    // reference-background computation happens once per group (a handful
-    // of channels), not once per frame.
+    let scale_px = ln_cfg.scale;
+    // Perf tier A Task 12: the group's own pool, so the tile measurement
+    // fans out across workers instead of running one tile at a time on this
+    // thread — this reference model is built once per group (a handful of
+    // channels), not once per frame.
     let bg_pool = Some(&rc.ctx.image_pool);
-    let ref_backgrounds: Vec<BackgroundGrid> = ln_reference
-        .planes
-        .iter()
-        .map(|plane| {
-            background_grid(
-                plane,
-                ln_reference.width,
-                ln_reference.height,
-                &ref_params,
-                bg_pool,
-            )
-        })
-        .collect();
-
-    // Fix round 1, item 3: `BackgroundGrid`'s own documented contract — a
-    // fully invalid grid (no measurable cell anywhere) is a fallback the
-    // caller "should refuse", never trust. A broken REFERENCE background
-    // makes no frame's sidecar trustworthy, so this is a group-level
-    // ruling-R3-shaped fallback (warn + global normalization), not a
-    // per-frame failure. Carry-over (a), Task 5's re-review:
-    // `reference_path` is `None` here, same as the `n < 3` fallback above —
-    // `Some` means "LN ran"; the reference FILE was still written to disk at
-    // `reference_path_buf` (harmless, just not reported as a usable one),
-    // but nothing below normalized against it, so there is nothing to read
-    // back.
-    for (p, bg) in ref_backgrounds.iter().enumerate() {
-        let total_cells = bg.gw * bg.gh;
-        if total_cells > 0 && bg.invalid_cells == total_cells {
-            tracing::warn!(
-                run_id = rc.run_id,
-                group_key = %group.key,
-                channel = p,
-                "local normalization off for this group: the LN reference's background model has no measurable cell"
-            );
-            rc.warnings.push(format!(
-                "group {}: local normalization off — the LN reference's background model has no measurable cell; using global normalization",
-                group.key
-            ));
-            return Ok(LnGroupOutcome {
-                reference_path: None,
-                excluded_frame_ids: Vec::new(),
-                sidecar_grids: HashMap::new(),
-            });
+    // A reference plane the model refuses makes no frame's sidecar
+    // trustworthy, so this is a group-level ruling-R3-shaped fallback (warn
+    // + global normalization), not a per-frame failure. Carry-over (a), Task
+    // 5's re-review: `reference_path` is `None` here, same as the `n < 3`
+    // fallback above — `Some` means "LN ran"; the reference FILE was still
+    // written to disk at `reference_path_buf` (harmless, just not reported
+    // as a usable one), but nothing below normalized against it, so there is
+    // nothing to read back.
+    let mut ref_models: Vec<BackgroundModel> = Vec::with_capacity(ln_reference.planes.len());
+    for (p, plane) in ln_reference.planes.iter().enumerate() {
+        let table = TileTable::measure(
+            plane,
+            ln_reference.width,
+            ln_reference.height,
+            &CLEANING,
+            bg_pool,
+        );
+        match BackgroundModel::fit(table, scale_px) {
+            Ok(m) => {
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    channel = p,
+                    ln_samples = m.samples,
+                    ln_samples_rejected = m.samples_rejected,
+                    ln_cells_unsupported = m.cells_unsupported,
+                    "ln reference background modelled"
+                );
+                ref_models.push(m);
+            }
+            Err(r) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    channel = p,
+                    error = %r,
+                    "local normalization off for this group: the LN reference's background model is refused"
+                );
+                rc.warnings.push(format!(
+                    "group {}: local normalization off — the LN reference's background model is refused ({r}); using global normalization",
+                    group.key
+                ));
+                return Ok(LnGroupOutcome {
+                    reference_path: None,
+                    excluded_frame_ids: Vec::new(),
+                    sidecar_grids: HashMap::new(),
+                });
+            }
         }
     }
 
@@ -10732,8 +10742,9 @@ fn run_group_normalization(
             input.frames,
             &ln_reference,
             &reference_for_detection,
-            &ref_backgrounds,
+            &ref_models,
             &ln_cfg,
+            scale_px,
             measure_opts,
             input.interpolation,
             input.clamping,
@@ -10903,7 +10914,7 @@ fn run_group_normalization(
     let cancel_ref: &AtomicBool = &rc.cancel;
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     let stack_frames_ref: &[StackFrame] = input.frames;
-    let ref_backgrounds_ref: &[BackgroundGrid] = &ref_backgrounds;
+    let ref_models_ref: &[BackgroundModel] = &ref_models;
     let ln_reference_ref: &LnReference = &ln_reference;
     let reference_for_detection_ref: &LnReferenceForDetection = &reference_for_detection;
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
@@ -10967,10 +10978,11 @@ fn run_group_normalization(
             let out = normalize_frame(
                 ln_reference_ref,
                 reference_for_detection_ref,
-                ref_backgrounds_ref,
+                ref_models_ref,
                 &stack_frames_ref[i],
                 LnScaleSeeds::Measured(&fits_by_plane),
                 &ln_cfg,
+                scale_px,
                 measure_opts,
                 interpolation,
                 clamping,
@@ -11060,7 +11072,10 @@ fn run_group_normalization(
                 let payload = serde_json::to_string(&LnArtifactPayload {
                     scale: outcome.scale,
                     matches: outcome.matches,
-                    cells_rejected: outcome.cells_rejected,
+                    samples: outcome.samples,
+                    samples_rejected: outcome.samples_rejected,
+                    samples_shared: outcome.samples_shared,
+                    cells_unsupported: outcome.cells_unsupported,
                     ln_scale_source: outcome.ln_scale_source.to_string(),
                     seeds_calibration: seeds_calibration.clone(),
                 })
@@ -11099,7 +11114,10 @@ fn run_group_normalization(
                             frame_id,
                             ln_scale = outcome.scale,
                             ln_matches = outcome.matches,
-                            ln_cells_rejected = outcome.cells_rejected,
+                            ln_samples = outcome.samples,
+                            ln_samples_rejected = outcome.samples_rejected,
+                            ln_samples_shared = outcome.samples_shared,
+                            ln_cells_unsupported = outcome.cells_unsupported,
                             warp_ms = outcome.warp_ms,
                             background_ms = outcome.background_ms,
                             scale_ms = outcome.scale_ms,
@@ -11229,8 +11247,9 @@ fn measure_ln_seeds_calibration(
     stack_frames: &[StackFrame],
     ln_reference: &LnReference,
     reference_for_detection: &LnReferenceForDetection<'_>,
-    ref_backgrounds: &[BackgroundGrid],
+    ref_models: &[BackgroundModel],
     ln_cfg: &crate::stacking::integrate::LocalNormalizationConfig,
+    scale_px: u32,
     measure_opts: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
@@ -11296,11 +11315,12 @@ fn measure_ln_seeds_calibration(
     let measurement = ln::measure_seeds_calibration(
         ln_reference,
         reference_for_detection,
-        ref_backgrounds,
+        ref_models,
         stack_frames,
         indices,
         &load_fits,
         ln_cfg,
+        scale_px,
         measure_opts,
         interpolation,
         clamping,
@@ -17584,6 +17604,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+    }
+
+    /// Spec 2026-10-04 §10: every `ln` row records the background model's
+    /// sample counters, and the retired `cells_rejected` is gone.
+    #[test]
+    fn the_ln_payload_records_the_background_sample_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout.clone(),
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let ln_rows = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln"),
+        )
+        .unwrap();
+        assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
+        for row in &ln_rows {
+            let json = row
+                .payload_json
+                .as_deref()
+                .expect("every ln row carries a payload");
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert!(value.get("cells_rejected").is_none(), "{json}");
+            let payload: LnArtifactPayload =
+                serde_json::from_str(json).expect("the ln payload decodes");
+            assert!(payload.samples > 0, "{json}");
+            assert!(payload.samples_shared > 0, "{json}");
+            assert!(payload.samples_shared <= payload.samples, "{json}");
+        }
     }
 
     /// Perf tier C Task 2 (spec §2.2.3): a frame's `fits.<plane>` artifact

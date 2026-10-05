@@ -7576,13 +7576,14 @@ mod tests {
         };
         let got: Vec<String> = configs.iter().map(|(name, cfg)| line(name, cfg)).collect();
         // GOLDEN: recorded on main 17e2e96e before the Task 1 edit.
+        // 2026-10-05 LN model fixes Task 2: lnModelVersion 2 joins the normalization subtree (spec §7, L-19); calib/meas/reg unchanged.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=004b8d8e1d474def ln=97b19ecf5b4bc774 ln_cal=0c2d2df3876ece32",
-                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=004b8d8e1d474def ln=5aa2e757a576257b ln_cal=0c2d2df3876ece32",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=75c6f0835d9d9cab ln=d8259ff416645417 ln_cal=60a1d2b69a0b80f9",
-                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=75c6f0835d9d9cab ln=3d958bff2ee0136e ln_cal=60a1d2b69a0b80f9",
+                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=f6a28984a2261a07 ln=012c7d96e575c88e ln_cal=ff2c8d017e4cbba2",
+                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=f6a28984a2261a07 ln=69f6f6605370d093 ln_cal=ff2c8d017e4cbba2",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=1d5996f1a4c3932e ln=631e482ef31a36dd ln_cal=ad79ed0457fc7d74",
+                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=1d5996f1a4c3932e ln=fee56afa4c391794 ln_cal=ad79ed0457fc7d74",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no

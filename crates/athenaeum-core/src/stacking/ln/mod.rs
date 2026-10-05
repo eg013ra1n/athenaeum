@@ -16,8 +16,8 @@
 //! calibrated frame into the reference geometry (a one-frame
 //! [`crate::integration::registered_source::RegisteredSource`], whole plane
 //! per channel), models the target's background the same way the reference's
-//! own was modelled (just a looser deviation threshold —
-//! [`background::TARGET_DEVIATION_SIGMA`]), takes the PSF relative scale
+//! own was modelled — by the same procedure and thresholds (L-1), then both
+//! surfaces are refitted on the samples both kept (L-6) — takes the PSF relative scale
 //! against the SAME channel of the reference, and folds the two into one
 //! [`LnGrid`] per channel (`A = s` — or, with `localScale` on, the local
 //! scale spline of ruling R-M4c-8 sampled node by node; `B = B_ref −
@@ -52,9 +52,8 @@ pub mod reference;
 pub mod scale;
 
 pub use background::{
-    background_grid, shared_refit, BackgroundGrid, BackgroundModel, BackgroundParams,
-    BackgroundRefusal, CleaningParams, PairSurfaces, Surface, TileStat, TileTable, CLEANING,
-    DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    shared_refit, BackgroundModel, BackgroundRefusal, CleaningParams, PairSurfaces, Surface,
+    TileStat, TileTable, CLEANING,
 };
 pub use calibration::{
     calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
@@ -70,6 +69,13 @@ pub use scale::{
     SeedFilterBreakdown, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
+
+/// The LN model's own version (spec 2026-10-04 §7, L-19), folded into the
+/// normalization subtree so a change in what an existing config produces
+/// moves the `ln`, `ln_reference` and `ln_calibration` hashes together.
+/// 1 = the cell model (implicit, never written); 2 = the background model
+/// at the scale; bump it again whenever an existing config's output moves.
+pub const LN_MODEL_VERSION: u32 = 2;
 
 /// What [`normalize_frame`] is given to seed the relative-scale step with
 /// (perf tier C Task 2 fix round 4, ruling C-14 item 3).
@@ -275,20 +281,27 @@ impl std::error::Error for LnError {
 }
 
 /// One frame's stage-6 outcome (M2 Task 5): where its sidecar landed, the
-/// frame-level scale/matches/rejected-cells the run logs and reports in its
+/// frame-level scale/matches/background-sample counts the run logs and reports in its
 /// provenance (spec §9.3/§9.5) — averaged/summed across channels when the
 /// frame carries more than one (a debayered OSC light): `scale` is the mean
 /// of every channel's own [`scale::ScaleResult::scale`] (a single number for
 /// `SummaryFrame.ln_scale`/the `FramesTable` UI column; each channel's own
 /// value is still exactly what its own [`LnGrid::global_scale`] carries),
-/// `matches`/`cells_rejected` are the SUM over channels (how much data
-/// backed the whole frame's normalization, not just one channel's).
+/// `matches` and the four background counters are the SUM over channels
+/// (how much data backed the whole frame's normalization, not just one
+/// channel's).
 #[derive(Debug, Clone, Default)]
 pub struct LnFrameOutcome {
     pub sidecar: std::path::PathBuf,
     pub scale: f64,
     pub matches: usize,
-    pub cells_rejected: usize,
+    // Background samples of the frame's own final fit, the samples its
+    // rejection rounds left out, the samples of the shared refit, and the
+    // knot cells under the floor — each summed over channels (spec §10).
+    pub samples: usize,
+    pub samples_rejected: usize,
+    pub samples_shared: usize,
+    pub cells_unsupported: usize,
     /// Wall time (ms) spent warping into the reference geometry, summed
     /// across every channel (perf tier 1 Task 0).
     pub warp_ms: u64,
@@ -336,20 +349,6 @@ pub struct LnFrameOutcome {
     /// compared detection against detection and has nothing to say about
     /// the seeds path's own bias.
     pub channel_from_seeds: Vec<bool>,
-}
-
-/// Per-channel target background parameters (spec §5.2/math §4.2): same
-/// scale/clip/hot-pixel settings as the reference's own
-/// [`background::DEFAULT_PARAMS`], just the looser
-/// [`background::TARGET_DEVIATION_SIGMA`] deviation threshold — a target
-/// frame carries its own noise/registration residual on top of the
-/// reference's.
-fn target_background_params(scale: u32) -> BackgroundParams {
-    BackgroundParams {
-        scale,
-        deviation_sigma: TARGET_DEVIATION_SIGMA,
-        ..DEFAULT_PARAMS
-    }
 }
 
 /// The median of ONLY the finite pixels of `plane` (fix round 1, item 7):
@@ -405,8 +404,7 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// (`LnGrid::node_count` makes the mesh REACH the last pixel, so its last
 /// address can sit up to `stride − 1` past it) and is **clamped into the
 /// plane before the spline is evaluated** — the identical rule
-/// [`background::background_grid`] applies to that same node's own cell
-/// window, and the one `examples/ln_probe.rs` reads the mesh back with
+/// [`background::Surface::nodes`] applies to that same node, and the one `examples/ln_probe.rs` reads the mesh back with
 /// (review m7). `A` and `B` are therefore measured at the same pixel at
 /// every node, including the trailing one, and the spline is never asked
 /// for a position its own node cloud could not have covered.
@@ -694,10 +692,11 @@ impl<'a> LnReferenceForDetection<'a> {
 pub fn normalize_frame(
     reference: &LnReference,
     reference_for_detection: &LnReferenceForDetection<'_>,
-    ref_backgrounds: &[BackgroundGrid],
+    ref_models: &[BackgroundModel],
     frame: &StackFrame,
     seeds: LnScaleSeeds<'_>,
     cfg: &LocalNormalizationConfig,
+    scale_px: u32,
     measure: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
@@ -713,10 +712,10 @@ pub fn normalize_frame(
             frame.measurement.channels.len()
         )));
     }
-    if ref_backgrounds.len() != channels {
+    if ref_models.len() != channels {
         return Err(LnError::Other(format!(
-            "{} reference background grids for a {channels}-channel LN reference",
-            ref_backgrounds.len()
+            "{} reference background models for a {channels}-channel LN reference",
+            ref_models.len()
         )));
     }
     if reference_for_detection.sanitized_planes.len() != channels
@@ -731,14 +730,15 @@ pub fn normalize_frame(
         )));
     }
 
-    let stride = (cfg.scale / 8).max(2) as usize;
-    let target_params = target_background_params(cfg.scale);
+    let stride = (scale_px / 8).max(2) as usize;
 
     let mut grids = Vec::with_capacity(channels);
     let mut scales = Vec::with_capacity(channels);
     let mut from_seeds_per_channel = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
-    let mut cells_rejected_total = 0usize;
+    let (mut samples_total, mut samples_rejected_total) = (0usize, 0usize);
+    let (mut samples_shared_total, mut cells_unsupported_total) = (0usize, 0usize);
+    let mut warned_no_shared = false;
     // Per-phase wall time, accumulated ACROSS channels — one number per
     // phase for the whole frame (perf tier 1 Task 0).
     let mut warp_ms = 0u64;
@@ -766,7 +766,7 @@ pub fn normalize_frame(
     // and `target` are likewise allocated once and reused across channels:
     // `target` is fully overwritten by `decode_frame_into` on every
     // iteration, so the in-place NaN sanitizing below (which mutates
-    // `target` for detection, after `background_grid`/`median_of_finite`
+    // `target` for detection, after the tile table/`median_of_finite`
     // have already read the NaN-preserving version) never leaks into the
     // next channel's warp.
     let t = Instant::now();
@@ -824,13 +824,13 @@ pub fn normalize_frame(
         // Plan 6b-3 D6 (spec §5.6 seam 2): on a grid, the member's models are
         // fitted on its overlap with the LN reference, never on sanitized NaN.
         // Nodes outside the overlap hold the flood-fill extension of both
-        // overlap backgrounds (`background_grid` fills masked cells from
-        // their neighbours) and ARE read: integration samples the grid
+        // overlap backgrounds (the surface continues over the masked tiles
+        // by its membrane) and ARE read: integration samples the grid
         // through its 4x4 cubic B-spline, so nodes up to two strides
         // outside the overlap reach pixels inside it, and it also
         // normalizes member pixels the reference does not cover.
         let masked = reference_for_detection.overlap == LnOverlap::Masked;
-        let mut member_ref_bg: Option<BackgroundGrid> = None;
+        let mut member_ref_model: Option<BackgroundModel> = None;
         let mut allowed: Option<Vec<bool>> = None;
         if masked {
             let ref_plane = &reference.planes[p];
@@ -857,21 +857,23 @@ pub fn normalize_frame(
                     *v = f32::NAN;
                 }
             }
-            let ref_masked: Vec<f32> = ref_plane
-                .iter()
-                .zip(&overlap)
-                .map(|(&v, &o)| if o { v } else { f32::NAN })
-                .collect();
-            member_ref_bg = Some(background_grid(
-                &ref_masked,
-                reference.width,
-                reference.height,
-                &BackgroundParams {
-                    scale: cfg.scale,
-                    ..DEFAULT_PARAMS
-                },
+            let restricted = ref_models[p].table.restricted(
+                &reference.planes[p],
+                &overlap,
+                &CLEANING,
                 pool,
-            ));
+            );
+            member_ref_model = Some(BackgroundModel::fit(restricted, scale_px).map_err(|r| {
+                tracing::warn!(
+                    frame_id = frame.frame_id,
+                    plane = p,
+                    error = %r,
+                    "ln: the LN reference's background model on this frame's overlap is refused"
+                );
+                LnError::Other(format!(
+                    "background model of the LN reference on the overlap: {r}"
+                ))
+            })?);
             allowed = Some(eroded_mask(
                 &overlap,
                 reference.width,
@@ -881,37 +883,40 @@ pub fn normalize_frame(
         }
 
         let t = Instant::now();
-        // Perf tier A Task 12: `pool` fans `background_grid`'s per-cell
-        // loop (and `clean_plane`'s two passes) out across workers instead
-        // of running one cell at a time on this fan-out thread.
-        let target_bg = background_grid(
-            &target,
-            reference.width,
-            reference.height,
-            &target_params,
-            pool,
-        );
+        // Perf tier A Task 12: `pool` fans the tile measurement out across
+        // workers instead of running one tile at a time on this fan-out
+        // thread.
+        let target_model = BackgroundModel::fit(
+            TileTable::measure(&target, reference.width, reference.height, &CLEANING, pool),
+            scale_px,
+        )
+        .map_err(|r| {
+            tracing::warn!(
+                frame_id = frame.frame_id,
+                plane = p,
+                error = %r,
+                "ln: the frame's background model is refused"
+            );
+            LnError::Other(format!("background model: {r}"))
+        })?;
+        let ref_model = member_ref_model.as_ref().unwrap_or(&ref_models[p]);
+        let pair = background::shared_refit(ref_model, &target_model);
+        if !pair.refit && !warned_no_shared {
+            tracing::warn!(
+                frame_id = frame.frame_id,
+                plane = p,
+                "no background sample in common with the LN reference; own-threshold backgrounds kept"
+            );
+            warned_no_shared = true;
+        }
         let (expected_gw, expected_gh) =
             LnGrid::grid_dims(reference.width, reference.height, stride);
-        debug_assert_eq!(
-            (target_bg.gw, target_bg.gh),
-            (expected_gw, expected_gh),
-            "target background grid must share the reference's own mesh"
-        );
-
-        // Fix round 1, item 3: `BackgroundGrid`'s own documented contract —
-        // `invalid_cells == gw * gh` means the WHOLE plane had no measurable
-        // cell, and the (all-zero) `cells` it still returns is a fallback
-        // the caller "should refuse", never trust. Silently continuing here
-        // used to yield `B = B_ref` everywhere and a written sidecar that
-        // looks like a normal, if noisy, result.
-        let target_cell_count = target_bg.gw * target_bg.gh;
-        if target_cell_count > 0 && target_bg.invalid_cells == target_cell_count {
-            return Err(LnError::Other(
-                "background model: no measurable cell".to_string(),
-            ));
-        }
-        cells_rejected_total += target_bg.invalid_cells;
+        let ref_nodes = pair.reference.nodes(stride);
+        let tgt_nodes = pair.target.nodes(stride);
+        samples_total += target_model.samples;
+        samples_rejected_total += target_model.samples_rejected;
+        samples_shared_total += pair.shared;
+        cells_unsupported_total += target_model.cells_unsupported;
 
         // Fix round 1, item 7: the median over FINITE pixels only — see
         // `median_of_finite`'s own doc for why a NaN-laden plane still needs
@@ -921,7 +926,7 @@ pub fn normalize_frame(
 
         // Fix round 1, item 6: sanitize `target` IN PLACE for detection —
         // everything that needed the NaN-preserving version
-        // (`background_grid`, `location_tgt`) has already read it, so
+        // (the tile table, `location_tgt`) has already read it, so
         // there is no separate copy to allocate. A frame's own footprint
         // rarely covers the WHOLE reference canvas once warped (a non-zero
         // registration shift leaves a strip outside the source frame's own
@@ -1073,12 +1078,8 @@ pub fn normalize_frame(
         scales.push(channel_scale);
         from_seeds_per_channel.push(plane_from_seeds);
 
-        let ref_bg = member_ref_bg.as_ref().unwrap_or(&ref_backgrounds[p]);
-        // Fix round 1, item 8: a real length check, not just the
-        // `debug_assert_eq!` above (which only pins `target_bg`'s OWN dims
-        // against what the stride geometry implies — it says nothing about
-        // `ref_bg` matching `target_bg`, e.g. a caller-supplied `ref_backgrounds`
-        // built at a different scale). `zip` would otherwise silently
+        // Fix round 1, item 8: a real length check, not just the mesh the
+        // two surfaces were evaluated on. `zip` would otherwise silently
         // truncate to the shorter of the two in release builds.
         // M4c: the mesh the `A` grid is built on is a third party to this
         // check now (`a_grid` sizes itself from `expected_gw`/`expected_gh`
@@ -1086,11 +1087,11 @@ pub fn normalize_frame(
         // all three lengths rather than just reference-vs-target — a short
         // `b` would otherwise be a silently corrupt grid.
         let expected_cells = expected_gw * expected_gh;
-        if ref_bg.cells.len() != target_bg.cells.len() || ref_bg.cells.len() != expected_cells {
+        if ref_nodes.len() != tgt_nodes.len() || ref_nodes.len() != expected_cells {
             return Err(LnError::Other(format!(
-                "background grid size mismatch: reference has {} cells, target has {}, the stride mesh has {expected_cells}",
-                ref_bg.cells.len(),
-                target_bg.cells.len()
+                "background grid size mismatch: reference has {} nodes, target has {}, the stride mesh has {expected_cells}",
+                ref_nodes.len(),
+                tgt_nodes.len()
             )));
         }
         // M4c ruling R-M4c-8: `A` is the global scale at every node unless
@@ -1124,10 +1125,9 @@ pub fn normalize_frame(
                 );
             }
         }
-        let b: Vec<f32> = ref_bg
-            .cells
+        let b: Vec<f32> = ref_nodes
             .iter()
-            .zip(target_bg.cells.iter())
+            .zip(tgt_nodes.iter())
             .zip(a.iter())
             .map(|((&br, &bt), &ak)| br - ak * bt)
             .collect();
@@ -1135,7 +1135,7 @@ pub fn normalize_frame(
         grids.push(LnGrid {
             ref_width: reference.width,
             ref_height: reference.height,
-            scale: cfg.scale,
+            scale: scale_px,
             gw: expected_gw,
             gh: expected_gh,
             a,
@@ -1163,7 +1163,10 @@ pub fn normalize_frame(
         sidecar: sidecar.to_path_buf(),
         scale,
         matches: matches_total,
-        cells_rejected: cells_rejected_total,
+        samples: samples_total,
+        samples_rejected: samples_rejected_total,
+        samples_shared: samples_shared_total,
+        cells_unsupported: cells_unsupported_total,
         warp_ms,
         background_ms,
         scale_ms,
@@ -1182,6 +1185,20 @@ pub fn normalize_frame(
 mod tests {
     use super::*;
     use crate::stacking::psf_signal::PsfModel;
+
+    fn ref_models(reference: &LnReference, scale: u32) -> Vec<BackgroundModel> {
+        reference
+            .planes
+            .iter()
+            .map(|p| {
+                BackgroundModel::fit(
+                    TileTable::measure(p, reference.width, reference.height, &CLEANING, None),
+                    scale,
+                )
+                .expect("the fixture reference has a background")
+            })
+            .collect()
+    }
 
     /// Small enough that `register::detect::detect_stars` short-circuits
     /// (`w < 8 || h < 8`) to an empty result deterministically, so
@@ -1425,7 +1442,7 @@ mod tests {
     /// `RegisteredSource` with `set_plane` must warp each channel
     /// bit-for-bit identically to the old per-channel shape (a fresh
     /// `RegisteredSource::open` per channel). Everything `normalize_frame`
-    /// does past the warp (`background_grid`, `relative_scale_against`, the
+    /// does past the warp (the background model, `relative_scale_against`, the
     /// `.athln` grid it writes) is a pure function of the warped `target`
     /// buffer, so comparing `target` directly — rather than the sidecar
     /// bytes `normalize_frame` itself produces, which would need a second
@@ -1640,16 +1657,7 @@ mod tests {
         };
         let for_detection =
             LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
-        let ref_bg = vec![background_grid(
-            &reference.planes[0],
-            W,
-            H,
-            &BackgroundParams {
-                scale: cfg.scale,
-                ..DEFAULT_PARAMS
-            },
-            None,
-        )];
+        let ref_bg = ref_models(&reference, cfg.scale);
         let frame = StackFrame {
             path: target_path,
             map: PixelMap::linear(Linear::identity()).unwrap(),
@@ -1688,6 +1696,7 @@ mod tests {
                 &frame,
                 LnScaleSeeds::Measured(&[Vec::new()]),
                 &cfg,
+                cfg.scale,
                 &measure,
                 Interpolation::BicubicBSpline,
                 0.3,
@@ -1714,6 +1723,7 @@ mod tests {
                 &[0],
                 &|_| vec![Vec::new()],
                 &cfg,
+                cfg.scale,
                 &measure,
                 Interpolation::BicubicBSpline,
                 0.3,
@@ -1795,16 +1805,7 @@ mod tests {
         };
         let for_detection =
             LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
-        let ref_bg = vec![background_grid(
-            &reference.planes[0],
-            W,
-            H,
-            &BackgroundParams {
-                scale: cfg.scale,
-                ..DEFAULT_PARAMS
-            },
-            None,
-        )];
+        let ref_bg = ref_models(&reference, cfg.scale);
 
         let frame = StackFrame {
             path: target_path.clone(),
@@ -1845,6 +1846,7 @@ mod tests {
                 // by the run pin; here the arithmetic is the subject).
                 LnScaleSeeds::Measured(&fits),
                 &cfg,
+                cfg.scale,
                 &measure,
                 Interpolation::BicubicBSpline,
                 0.3,
@@ -1893,6 +1895,7 @@ mod tests {
                 &frame,
                 LnScaleSeeds::Measured(&target_fits),
                 &cfg,
+                cfg.scale,
                 &measure,
                 Interpolation::BicubicBSpline,
                 0.3,
@@ -1938,7 +1941,8 @@ mod tests {
         assert!((ratio - K).abs() < 1e-6, "the A ratio is k: {ratio} vs {K}");
         let mut checked = 0usize;
         for (i, (&br, (&bp, &bk))) in ref_bg[0]
-            .cells
+            .surface
+            .nodes((cfg.scale / 8).max(2) as usize)
             .iter()
             .zip(b_plain.iter().zip(b_k.iter()))
             .enumerate()
@@ -1980,7 +1984,7 @@ mod tests {
     /// the relative scale within 1 % and the additive term within 0.002 on
     /// every grid node inside the overlap eroded by the 48 px seed margin
     /// (review I2: what a node outside the overlap holds is
-    /// `background_grid`'s extrapolation into masked cells, which the method
+    /// the surface's continuation over masked tiles, which the method
     /// does not define). Under a quarter of overlap the frame is refused
     /// `LowOverlap` before any fit.
     #[test]
@@ -2046,16 +2050,7 @@ mod tests {
             None,
         );
         assert_eq!(for_detection.overlap, LnOverlap::Masked);
-        let ref_bg = vec![background_grid(
-            &reference.planes[0],
-            W,
-            H,
-            &BackgroundParams {
-                scale: cfg.scale,
-                ..DEFAULT_PARAMS
-            },
-            None,
-        )];
+        let ref_bg = ref_models(&reference, cfg.scale);
         let cancel = AtomicBool::new(false);
         let run = |from: usize, name: &str| {
             let path = dir.path().join(format!("{name}.fits"));
@@ -2089,6 +2084,7 @@ mod tests {
                 &frame,
                 LnScaleSeeds::ForcedDetection,
                 &cfg,
+                cfg.scale,
                 &measure,
                 Interpolation::Bilinear,
                 0.3,
@@ -2207,16 +2203,7 @@ mod tests {
             measure.max_stars,
             None,
         );
-        let ref_bg = vec![background_grid(
-            &reference.planes[0],
-            W,
-            H,
-            &BackgroundParams {
-                scale: cfg.scale,
-                ..DEFAULT_PARAMS
-            },
-            None,
-        )];
+        let ref_bg = ref_models(&reference, cfg.scale);
         let path = dir.path().join("member.fits");
         write_fits_f32(&path, W, H, 1, &target, &[]).unwrap();
         let frame = StackFrame {
@@ -2248,6 +2235,7 @@ mod tests {
             &frame,
             LnScaleSeeds::ForcedDetection,
             &cfg,
+            cfg.scale,
             &measure,
             Interpolation::Bilinear,
             0.3,
@@ -2376,16 +2364,7 @@ mod tests {
                 LnReferenceForDetection::build(&reference, PsfModel::Moffat4, 200, None)
             }
         };
-        let ref_bg = vec![background_grid(
-            &reference.planes[0],
-            W,
-            H,
-            &BackgroundParams {
-                scale: cfg.scale,
-                ..DEFAULT_PARAMS
-            },
-            None,
-        )];
+        let ref_bg = ref_models(&reference, cfg.scale);
         let path = dir.path().join("member.fits");
         write_fits_f32(&path, W, H, 1, &target, &[]).unwrap();
         let cancel = AtomicBool::new(false);
@@ -2430,6 +2409,7 @@ mod tests {
                 None => LnScaleSeeds::ForcedDetection,
             },
             &cfg,
+            cfg.scale,
             &measure,
             interpolation,
             0.3,

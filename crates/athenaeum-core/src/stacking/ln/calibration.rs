@@ -43,7 +43,7 @@ use crate::stacking::integrate::{LocalNormalizationConfig, StackFrame};
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::psf_signal::StarFit;
 
-use super::background::BackgroundGrid;
+use super::background::BackgroundModel;
 use super::reference::LnReference;
 use super::{normalize_frame, LnReferenceForDetection, LnScaleSeeds};
 
@@ -325,11 +325,12 @@ impl CalibrationMeasurement {
 pub fn measure_seeds_calibration(
     reference: &LnReference,
     reference_for_detection: &LnReferenceForDetection<'_>,
-    ref_backgrounds: &[BackgroundGrid],
+    ref_models: &[BackgroundModel],
     frames: &[StackFrame],
     indices: &[usize],
     load_fits: &dyn Fn(usize) -> Vec<Vec<StarFit>>,
     cfg: &LocalNormalizationConfig,
+    scale_px: u32,
     measure: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
@@ -373,10 +374,11 @@ pub fn measure_seeds_calibration(
         let seeds_outcome = run_arm(
             reference,
             reference_for_detection,
-            ref_backgrounds,
+            ref_models,
             frame,
             LnScaleSeeds::Measured(&fits),
             cfg,
+            scale_px,
             measure,
             interpolation,
             clamping,
@@ -391,10 +393,11 @@ pub fn measure_seeds_calibration(
         let detected_outcome = run_arm(
             reference,
             reference_for_detection,
-            ref_backgrounds,
+            ref_models,
             frame,
             LnScaleSeeds::ForcedDetection,
             cfg,
+            scale_px,
             measure,
             interpolation,
             clamping,
@@ -468,10 +471,11 @@ impl Drop for ScratchDir<'_> {
 fn run_arm(
     reference: &LnReference,
     reference_for_detection: &LnReferenceForDetection<'_>,
-    ref_backgrounds: &[BackgroundGrid],
+    ref_models: &[BackgroundModel],
     frame: &StackFrame,
     seeds: LnScaleSeeds<'_>,
     cfg: &LocalNormalizationConfig,
+    scale_px: u32,
     measure: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
@@ -482,10 +486,11 @@ fn run_arm(
     let outcome = normalize_frame(
         reference,
         reference_for_detection,
-        ref_backgrounds,
+        ref_models,
         frame,
         seeds,
         cfg,
+        scale_px,
         measure,
         interpolation,
         clamping,
