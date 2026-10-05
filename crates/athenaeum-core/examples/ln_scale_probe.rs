@@ -58,12 +58,13 @@ use athenaeum_core::integration::registered_source::{RegisteredFrame, Registered
 use athenaeum_core::integration::source::FrameSource;
 use athenaeum_core::integration::stats::median_in_place;
 use athenaeum_core::resample::Interpolation;
-use athenaeum_core::stacking::integrate::LnStarSelection;
+use athenaeum_core::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
 use athenaeum_core::stacking::ln::scale::{
     relative_scale_against, relative_scale_against_masked, PreparedReferenceChannel,
 };
 use athenaeum_core::stacking::ln::{
-    eroded_mask, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING, LN_MASK_MARGIN_PX,
+    eroded_mask, FiniteMask, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
+    LN_MASK_MARGIN_PX,
 };
 use athenaeum_core::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
@@ -596,8 +597,16 @@ fn main() {
         // The production default selection (Task 15 adds the probe's arms).
         let ref_noise = TileNoise::from_table(&TileTable::measure(&ref_raw, w, h, &CLEANING, None));
         let tgt_noise = TileNoise::from_table(&TileTable::measure(&tgt_raw, w, h, &CLEANING, None));
+        // PSF signal reads no mask; the raw planes' finite pixels are what the
+        // common aperture would be given.
+        let ref_present = FiniteMask::from_plane(&ref_raw, w, h);
+        let tgt_present = FiniteMask::from_plane(&tgt_raw, w, h);
         let inputs = ScaleInputs {
             selection: LnStarSelection::default(),
+            estimator: LnFluxEstimator::PsfSignal,
+            aperture: LnAperture::default(),
+            reference_present: &ref_present,
+            target_present: &tgt_present,
             reference: SelectionSide {
                 plane: &ref_sane,
                 width: w,

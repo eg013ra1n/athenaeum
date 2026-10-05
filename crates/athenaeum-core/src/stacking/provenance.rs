@@ -220,6 +220,14 @@ pub struct SummaryGroup {
     // before 2026-10.
     #[serde(default)]
     pub ln_scale_px: Option<u32>,
+    // The LN scale's flux estimator for this group (spec 2026-10-04 §8);
+    // `None` when LN did not run and on a summary written before this field.
+    #[serde(default)]
+    pub ln_flux_estimator: Option<crate::stacking::integrate::LnFluxEstimator>,
+    // The common aperture's circle; `Some` only when `ln_flux_estimator` is
+    // `commonAperture`.
+    #[serde(default)]
+    pub ln_aperture: Option<crate::stacking::integrate::LnAperture>,
     pub frames: Vec<SummaryFrame>,
 }
 

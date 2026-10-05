@@ -905,6 +905,12 @@ fn canonical_normalization(cfg: &StackingConfig) -> serde_json::Value {
         for key in ["scale", "scaleMode", "gridSize"] {
             local.remove(key);
         }
+        // The aperture only matters under the common aperture (spec §7).
+        if cfg.normalization.local.flux_estimator
+            != crate::stacking::integrate::LnFluxEstimator::CommonAperture
+        {
+            local.remove("aperture");
+        }
     }
     v
 }
@@ -1296,6 +1302,29 @@ mod tests {
     }
 
     #[test]
+    fn the_aperture_is_in_the_subtree_only_under_the_common_aperture() {
+        use crate::stacking::integrate::{LnAperture, LnFluxEstimator};
+        let mut a = StackingConfig::default();
+        let mut b = a.clone();
+        b.normalization.local.aperture = LnAperture::Fwhm2;
+        assert_eq!(
+            normalization_subtree(&a),
+            normalization_subtree(&b),
+            "PSF signal ignores the aperture"
+        );
+        a.normalization.local.flux_estimator = LnFluxEstimator::CommonAperture;
+        b.normalization.local.flux_estimator = LnFluxEstimator::CommonAperture;
+        assert_ne!(normalization_subtree(&a), normalization_subtree(&b));
+        let mut c = StackingConfig::default();
+        c.normalization.local.flux_estimator = LnFluxEstimator::CommonAperture;
+        assert_ne!(
+            normalization_subtree(&StackingConfig::default()),
+            normalization_subtree(&c),
+            "the estimator is always in"
+        );
+    }
+
+    #[test]
     fn serde_names_follow_the_spec() {
         let s = serde_json::to_string(&StackingConfig::default()).unwrap();
         assert!(
@@ -1303,6 +1332,7 @@ mod tests {
             "the toggle is gone — exposure always splits: {s}"
         );
         // 2026-10-05 LN model fixes Task 11: starSelection + lnModelVersion 3.
+        // 2026-10-05 LN model fixes Task 13: fluxEstimator + aperture (aperture only under commonAperture)
         for needle in [
             "\"exposureToleranceSec\":2.0",
             "\"exposureMode\":\"seconds\"",
@@ -1322,7 +1352,7 @@ mod tests {
             "\"output\":\"additiveWithScaling\"",
             "\"rejection\":\"scaleZeroOffset\"",
             "\"scaleEstimator\":\"bwmv\"",
-            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75}}",
+            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75},\"fluxEstimator\":\"psfSignal\",\"aperture\":\"fwhm3\"}",
             "\"rejection\":{\"method\":\"auto\"}",
             "\"writeRejectionMaps\":false",
             "\"dropShrink\":0.9",
@@ -1910,7 +1940,10 @@ mod tests {
         //
         // And here (2026-10-05 LN model fixes Task 11): `normalization.local`
         // gains `starSelection` in the serialized config.
-        assert_eq!(default_hash, "f3615884e6f01084");
+        //
+        // And here (2026-10-05 LN model fixes Task 13): `normalization.local`
+        // gains `fluxEstimator` and `aperture` in the serialized config.
+        assert_eq!(default_hash, "58b1c56b5bff4184");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part

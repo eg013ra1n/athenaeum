@@ -4,7 +4,7 @@ import type { StackingConfig } from '../../types/stacking';
 
 const withLocal = (local: Partial<StackingConfig['normalization']['local']>) =>
   ({ normalization: { output: 'additiveWithScaling', rejection: 'scaleZeroOffset', scaleEstimator: 'mad',
-    local: { enabled: true, scale: 1024, scaleMode: 'auto', gridSize: 4, referenceFrames: 20, psfModel: 'auto', localScale: false, ...local } } } as unknown as StackingConfig);
+    local: { enabled: true, scale: 1024, scaleMode: 'auto', gridSize: 4, referenceFrames: 20, psfModel: 'auto', localScale: false, fluxEstimator: 'psfSignal', aperture: 'fwhm3', ...local } } } as unknown as StackingConfig);
 
 describe('stageSummary normalize', () => {
   it('auto', () => expect(stageSummary('normalize', withLocal({}))).toBe('Local · scale auto (÷4) · ref 20'));

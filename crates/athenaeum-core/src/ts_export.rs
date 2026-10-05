@@ -395,6 +395,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::integration::stats::ScaleEstimator,
             crate::stacking::integrate::LnScaleMode,
             crate::stacking::integrate::LnStarSelection,
+            crate::stacking::integrate::LnFluxEstimator,
+            crate::stacking::integrate::LnAperture,
             crate::stacking::integrate::LocalNormalizationConfig,
             crate::stacking::integrate::NormalizationConfig,
             crate::integration::combine::Combination,

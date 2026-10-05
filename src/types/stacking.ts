@@ -101,7 +101,11 @@ export type LnScaleMode = "auto" | "fixed";
 
 export type LnStarSelection = { minPeakSnr: number, maxStars: number, saturation: number, };
 
-export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, starSelection: LnStarSelection, };
+export type LnFluxEstimator = "psfSignal" | "commonAperture";
+
+export type LnAperture = "fwhm2" | "fwhm3" | "growthCurve";
+
+export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, starSelection: LnStarSelection, fluxEstimator: LnFluxEstimator, aperture: LnAperture, };
 
 export type NormalizationConfig = { output: OutputNormalization, rejection: RejectionNormalization, 
 /**
@@ -522,7 +526,7 @@ beta: number | null,
  * `#[serde(default)]`, see [`SummaryFrame::ln_scale`]'s own doc for
  * the convention.
  */
-seedsCalibration: Array<number> | null, lnScalePx: number | null, frames: Array<SummaryFrame>, };
+seedsCalibration: Array<number> | null, lnScalePx: number | null, lnFluxEstimator: LnFluxEstimator | null, lnAperture: LnAperture | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 

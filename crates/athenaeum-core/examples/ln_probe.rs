@@ -42,13 +42,14 @@ use athenaeum_core::resample::Interpolation;
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::groups::{group_frames, GroupFrame, IntegrationGroup};
 use athenaeum_core::stacking::integrate::{
-    GroupInput, LocalNormalizationConfig, NormalizationConfig, StackFrame,
+    GroupInput, LnAperture, LnFluxEstimator, LocalNormalizationConfig, NormalizationConfig,
+    StackFrame,
 };
 use athenaeum_core::stacking::ln::calibration as ln_calibration;
 use athenaeum_core::stacking::ln::{
     build_reference, normalize_frame, relative_scale, relative_scale_from_seeds_with_breakdown,
-    shared_refit, BackgroundModel, LnFrameGrids, LnGrid, LnReferenceForDetection, LnScaleSeeds,
-    ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
+    shared_refit, BackgroundModel, FiniteMask, LnFrameGrids, LnGrid, LnReferenceForDetection,
+    LnScaleSeeds, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -836,8 +837,17 @@ catalog has no artifact for)",
                 &CLEANING,
                 Some(&pool),
             ));
+            // PSF signal reads no mask; the raw target plane's finite pixels
+            // and the group reference's are what the common aperture gets.
+            let tgt_present =
+                FiniteMask::from_plane(&target_plane, reference.width, reference.height);
+            let ref_present = ref_for_detection.present.get(p).unwrap_or(&tgt_present);
             let inputs = ScaleInputs {
                 selection: local_cfg.star_selection,
+                estimator: LnFluxEstimator::PsfSignal,
+                aperture: LnAperture::default(),
+                reference_present: ref_present,
+                target_present: &tgt_present,
                 reference: SelectionSide {
                     plane: &ref_for_detection.sanitized_planes[p],
                     width: reference.width,

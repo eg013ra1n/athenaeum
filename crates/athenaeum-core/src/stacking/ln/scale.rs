@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
+use super::aperture::{self, ApertureSide, FiniteMask};
 use super::background::{TileNoise, TileTable, CLEANING};
 use super::selection::{self, SelectionRule, SelectionSide};
 use super::LnError;
@@ -44,7 +45,7 @@ use crate::geometry::kdtree::KdTree2;
 use crate::geometry::{
     select_nodes, Pair, PixelMap, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES,
 };
-use crate::stacking::integrate::LnStarSelection;
+use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
 use crate::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
 };
@@ -106,8 +107,19 @@ pub struct ScaleTimings {
 /// project member the restricted, background model — P-7).
 pub struct ScaleInputs<'a> {
     pub selection: LnStarSelection,
+    /// Which flux the ratios use (spec 2026-10-04 §4.1).
+    pub estimator: LnFluxEstimator,
+    /// The common aperture's circle; read only under `CommonAperture`.
+    pub aperture: LnAperture,
     pub reference: SelectionSide<'a>,
     pub target: SelectionSide<'a>,
+    /// Which reference pixels are data (P-8): the raw plane's finite pixels,
+    /// or on a project member the member's overlap. Read only under
+    /// `CommonAperture`.
+    pub reference_present: &'a FiniteMask,
+    /// Which target pixels are data (P-8): finite BEFORE sanitizing; in
+    /// masked mode that is exactly the overlap.
+    pub target_present: &'a FiniteMask,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +156,15 @@ pub struct ScaleResult {
     /// local.displacement(x, y).0` (the y channel is fitted on zeros and
     /// carries nothing — see [`fit_local_scale`]).
     pub local: Option<ThinPlateSpline>,
+    /// The common aperture's radius in pixels (`a · common_fwhm_px`); `None`
+    /// under PSF signal.
+    pub aperture_px: Option<f64>,
+    /// `F`, the larger of the two frames' median fitted FWHMs the aperture
+    /// and its sky annulus are sized by; `None` under PSF signal.
+    pub common_fwhm_px: Option<f64>,
+    /// The growth-curve correction `c` multiplied into every ratio; `Some`
+    /// only for `LnAperture::GrowthCurve` (1.0 when no pair qualified, P-10).
+    pub growth_factor: Option<f64>,
     /// Perf tier A Task 0: where this call's own wall time went — see
     /// [`ScaleTimings`]'s own doc.
     pub timings: ScaleTimings,
@@ -167,6 +188,9 @@ impl PartialEq for ScaleResult {
             && self.beta == other.beta
             && self.pass == other.pass
             && self.local == other.local
+            && self.aperture_px == other.aperture_px
+            && self.common_fwhm_px == other.common_fwhm_px
+            && self.growth_factor == other.growth_factor
     }
 }
 
@@ -371,8 +395,9 @@ fn choose_pairing(
     }
 }
 
-/// The flux-ratio sample one pairing produces: `z_k =
-/// signal_ref,k / signal_tgt,k` (math §4.3 step 3), the REFERENCE fit's
+/// The flux-ratio sample one pairing produces: `z_k` = the reference's flux
+/// over the target's (math §4.3 step 3; the PSF signals' ratio or the
+/// common-aperture fluxes' ratio, times the growth factor when asked), the REFERENCE fit's
 /// own centroid for each sample (where the local-scale spline is
 /// evaluated) and that fit's index (what the spline dedupes on). All three
 /// are index-aligned and in the pairing's own order, so the sample handed
@@ -395,12 +420,21 @@ struct RatioSample {
 /// Selection, then the flux ratios of the kept pairs (spec §3, L-11).
 /// `matches` keeps its meaning — valid PSF-signal pairs BEFORE selection
 /// (P-15); the sample is the selected pairs in rank order.
+struct MeasuredSample {
+    sample: RatioSample,
+    matches: usize,
+    rule: SelectionRule,
+    aperture_px: Option<f64>,
+    common_fwhm_px: Option<f64>,
+    growth_factor: Option<f64>,
+}
+
 fn measured_sample(
     ref_fits: &[StarFit],
     tgt_fits: &[StarFit],
     pairs: &[(usize, usize)],
     inputs: &ScaleInputs<'_>,
-) -> Result<(RatioSample, usize, SelectionRule), LnError> {
+) -> Result<MeasuredSample, LnError> {
     let valid = |r: usize, t: usize| ref_fits[r].signal > 0.0 && tgt_fits[t].signal > 0.0;
     let matches = pairs.iter().filter(|&&(r, t)| valid(r, t)).count();
     let c = selection::rank_candidates(
@@ -412,17 +446,122 @@ fn measured_sample(
         &inputs.selection,
     )?;
     let mut sample = RatioSample::default();
-    for &(r, t) in &c.ranked {
-        if sample.ratios.len() >= c.quota {
-            break;
+    let (mut aperture_px, mut common_fwhm_px, mut growth_factor) = (None, None, None);
+    match inputs.estimator {
+        LnFluxEstimator::PsfSignal => {
+            for &(r, t) in &c.ranked {
+                if sample.ratios.len() >= c.quota {
+                    break;
+                }
+                if valid(r, t) {
+                    let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
+                    sample.ratios.push(rf.signal / tf.signal);
+                    sample.positions.push((rf.x, rf.y));
+                    sample.ref_idx.push(r);
+                    sample.ref_signal.push(rf.signal);
+                    sample.tgt_fwhm.push(tf.fwhm());
+                }
+            }
         }
-        if valid(r, t) {
-            let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
-            sample.ratios.push(rf.signal / tf.signal);
-            sample.positions.push((rf.x, rf.y));
-            sample.ref_idx.push(r);
-            sample.ref_signal.push(rf.signal);
-            sample.tgt_fwhm.push(tf.fwhm());
+        LnFluxEstimator::CommonAperture => {
+            // F: the larger of the two frames' median fitted FWHMs over the
+            // pairs the selection ranked first (`fwhm_set`).
+            let fwhm_of = |fits: &[StarFit], pick: &dyn Fn(&(usize, usize)) -> usize| {
+                let mut v: Vec<f64> = c.ranked[..c.fwhm_set.min(c.ranked.len())]
+                    .iter()
+                    .map(|p| fits[pick(p)].fwhm())
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .collect();
+                v.sort_by(f64::total_cmp);
+                v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+            };
+            let f = fwhm_of(ref_fits, &|p| p.0).max(fwhm_of(tgt_fits, &|p| p.1));
+            if !f.is_finite() {
+                warn!("ln common aperture: no finite fitted FWHM among the ranked pairs");
+                return Err(LnError::TooFewMatches { matches: 0 });
+            }
+            let radius = aperture::aperture_multiple(inputs.aperture) * f;
+            let (sky_in, sky_out) = (aperture::SKY_INNER_FWHM * f, aperture::SKY_OUTER_FWHM * f);
+            let rs = ApertureSide {
+                plane: inputs.reference.plane,
+                present: inputs.reference_present,
+            };
+            let ts = ApertureSide {
+                plane: inputs.target.plane,
+                present: inputs.target_present,
+            };
+            let mut scratch = Vec::new();
+            let mut kept_pairs = Vec::new();
+            for &(r, t) in &c.ranked {
+                if sample.ratios.len() >= c.quota {
+                    break;
+                }
+                let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
+                let (Some(fr), Some(ft)) = (
+                    aperture::circle_flux(&rs, rf.x, rf.y, radius, sky_in, sky_out, &mut scratch),
+                    aperture::circle_flux(&ts, tf.x, tf.y, radius, sky_in, sky_out, &mut scratch),
+                ) else {
+                    continue;
+                };
+                sample.ratios.push(fr / ft);
+                sample.positions.push((rf.x, rf.y));
+                sample.ref_idx.push(r);
+                sample.ref_signal.push(rf.signal);
+                sample.tgt_fwhm.push(tf.fwhm());
+                kept_pairs.push((r, t, fr, ft));
+            }
+            if inputs.aperture == LnAperture::GrowthCurve {
+                // L-13, P-10: the light beyond 2F, from the first pairs whose
+                // 5F circle is valid on both frames; median of the ratio of
+                // the 5F-to-2F flux ratios. RCR is scale-equivariant, so
+                // multiplying every ratio by c equals c times its location.
+                let outer = aperture::GROWTH_OUTER_FWHM * f;
+                let mut cs: Vec<f64> = Vec::new();
+                for &(r, t, fr, ft) in &kept_pairs {
+                    if cs.len() >= aperture::GROWTH_PAIRS {
+                        break;
+                    }
+                    let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
+                    if let (Some(f5r), Some(f5t)) = (
+                        aperture::circle_flux(
+                            &rs,
+                            rf.x,
+                            rf.y,
+                            outer,
+                            sky_in,
+                            sky_out,
+                            &mut scratch,
+                        ),
+                        aperture::circle_flux(
+                            &ts,
+                            tf.x,
+                            tf.y,
+                            outer,
+                            sky_in,
+                            sky_out,
+                            &mut scratch,
+                        ),
+                    ) {
+                        cs.push((f5r / fr) / (f5t / ft));
+                    }
+                }
+                let growth = if cs.is_empty() {
+                    warn!(
+                        ln_common_fwhm_px = f,
+                        "ln growth curve: no pair has its outer circle on both frames; the 2 x FWHM ratio is kept"
+                    );
+                    1.0
+                } else {
+                    cs.sort_by(f64::total_cmp);
+                    cs[cs.len() / 2]
+                };
+                for z in sample.ratios.iter_mut() {
+                    *z *= growth;
+                }
+                growth_factor = Some(growth);
+            }
+            aperture_px = Some(radius);
+            common_fwhm_px = Some(f);
         }
     }
     if sample.ratios.len() < MIN_MATCHES {
@@ -430,7 +569,82 @@ fn measured_sample(
             matches: sample.ratios.len(),
         });
     }
-    Ok((sample, matches, c.rule))
+    Ok(MeasuredSample {
+        sample,
+        matches,
+        rule: c.rule,
+        aperture_px,
+        common_fwhm_px,
+        growth_factor,
+    })
+}
+
+/// The fields of the `"ln relative scale"` debug event.
+struct RelativeScaleLog {
+    scale: f64,
+    sigma: f64,
+    matches: usize,
+    selected: usize,
+    rule: SelectionRule,
+    rejected: usize,
+    pass: u8,
+    local_nodes: usize,
+    source: &'static str,
+    estimator: LnFluxEstimator,
+    aperture_px: Option<f64>,
+    common_fwhm_px: Option<f64>,
+    growth_factor: Option<f64>,
+}
+
+/// One event per scale; tracing has no optional field, so the common
+/// aperture and the growth curve each get their own call.
+fn log_relative_scale(e: &RelativeScaleLog) {
+    match (e.aperture_px, e.common_fwhm_px, e.growth_factor) {
+        (Some(aperture_px), Some(common_fwhm_px), Some(growth_factor)) => debug!(
+            ln_scale = e.scale,
+            sigma = e.sigma,
+            ln_matches = e.matches,
+            ln_selected = e.selected,
+            ln_selection = e.rule.as_str(),
+            rejected = e.rejected,
+            ln_pass = e.pass,
+            ln_local_nodes = e.local_nodes,
+            ln_scale_source = e.source,
+            ln_flux_estimator = e.estimator.as_str(),
+            ln_aperture_px = aperture_px,
+            ln_common_fwhm_px = common_fwhm_px,
+            ln_growth_factor = growth_factor,
+            "ln relative scale"
+        ),
+        (Some(aperture_px), Some(common_fwhm_px), None) => debug!(
+            ln_scale = e.scale,
+            sigma = e.sigma,
+            ln_matches = e.matches,
+            ln_selected = e.selected,
+            ln_selection = e.rule.as_str(),
+            rejected = e.rejected,
+            ln_pass = e.pass,
+            ln_local_nodes = e.local_nodes,
+            ln_scale_source = e.source,
+            ln_flux_estimator = e.estimator.as_str(),
+            ln_aperture_px = aperture_px,
+            ln_common_fwhm_px = common_fwhm_px,
+            "ln relative scale"
+        ),
+        _ => debug!(
+            ln_scale = e.scale,
+            sigma = e.sigma,
+            ln_matches = e.matches,
+            ln_selected = e.selected,
+            ln_selection = e.rule.as_str(),
+            rejected = e.rejected,
+            ln_pass = e.pass,
+            ln_local_nodes = e.local_nodes,
+            ln_scale_source = e.source,
+            ln_flux_estimator = e.estimator.as_str(),
+            "ln relative scale"
+        ),
+    }
 }
 
 /// Diagnostic-only match record (Tier C Task 2 diagnostics round, ruling
@@ -451,7 +665,8 @@ pub struct ScaleMatchDiag {
     /// The reference fit's own `signal` (background-subtracted flux) — a
     /// stand-in for the star's brightness, for flux-decile binning.
     pub ref_signal: f64,
-    /// `z_k = signal_ref / signal_target` — the exact ratio RCR sees.
+    /// The exact ratio RCR sees: the PSF signals' or the common-aperture
+    /// fluxes' ratio (times the growth factor under the growth curve).
     pub ratio: f64,
     /// Whether RCR kept this pair (index-aligned with `ratios` inside the
     /// ordinary call — the same `RcrResult.kept[k]`).
@@ -873,8 +1088,14 @@ fn relative_scale_against_core(
         match_radius_px,
     );
 
-    let (sample, matches, rule) =
-        measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
+    let MeasuredSample {
+        sample,
+        matches,
+        rule,
+        aperture_px,
+        common_fwhm_px,
+        growth_factor,
+    } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -884,17 +1105,22 @@ fn relative_scale_against_core(
     };
     let match_ms = t.elapsed().as_millis() as u64;
 
-    debug!(
-        ln_scale = r.location,
-        sigma = r.scale,
-        ln_matches = matches,
-        ln_selected = sample.ratios.len(),
-        ln_selection = rule.as_str(),
-        rejected = r.rejected,
-        ln_pass = pass,
-        ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
-        ln_scale_source = "detected",
-        "ln relative scale"
+    log_relative_scale(
+        &RelativeScaleLog {
+            scale: r.location,
+            sigma: r.scale,
+            matches,
+            selected: sample.ratios.len(),
+            rule,
+            rejected: r.rejected,
+            pass,
+            local_nodes: local.as_ref().map_or(0, |s| s.nodes.len()),
+            source: "detected",
+            estimator: inputs.estimator,
+            aperture_px,
+            common_fwhm_px,
+            growth_factor,
+        },
     );
     let diag = diag_from_sample(&sample, &r.kept);
     Ok((
@@ -908,6 +1134,9 @@ fn relative_scale_against_core(
             beta: prepared.beta,
             pass,
             local,
+            aperture_px,
+            common_fwhm_px,
+            growth_factor,
             timings: ScaleTimings {
                 detect_ms,
                 refine_ms: 0,
@@ -1340,8 +1569,14 @@ fn relative_scale_from_seeds_core(
         match_radius_px,
     );
 
-    let (sample, matches, rule) =
-        measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
+    let MeasuredSample {
+        sample,
+        matches,
+        rule,
+        aperture_px,
+        common_fwhm_px,
+        growth_factor,
+    } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
     // The pre-selection valid-pair count, as `measured_sample` defines it.
     breakdown.matched = matches;
 
@@ -1353,17 +1588,22 @@ fn relative_scale_from_seeds_core(
     };
     let match_ms = t.elapsed().as_millis() as u64;
 
-    debug!(
-        ln_scale = r.location,
-        sigma = r.scale,
-        ln_matches = matches,
-        ln_selected = sample.ratios.len(),
-        ln_selection = rule.as_str(),
-        rejected = r.rejected,
-        ln_pass = pass,
-        ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
-        ln_scale_source = "seeds",
-        "ln relative scale"
+    log_relative_scale(
+        &RelativeScaleLog {
+            scale: r.location,
+            sigma: r.scale,
+            matches,
+            selected: sample.ratios.len(),
+            rule,
+            rejected: r.rejected,
+            pass,
+            local_nodes: local.as_ref().map_or(0, |s| s.nodes.len()),
+            source: "seeds",
+            estimator: inputs.estimator,
+            aperture_px,
+            common_fwhm_px,
+            growth_factor,
+        },
     );
     let diag = diag_from_sample(&sample, &r.kept);
     Ok((
@@ -1377,6 +1617,9 @@ fn relative_scale_from_seeds_core(
             beta: prepared.beta,
             pass,
             local,
+            aperture_px,
+            common_fwhm_px,
+            growth_factor,
             timings: ScaleTimings {
                 detect_ms,
                 refine_ms: 0,
@@ -1414,8 +1657,16 @@ pub fn relative_scale(
         TileNoise::from_table(&TileTable::measure(reference, width, height, &CLEANING, None));
     let tgt_noise =
         TileNoise::from_table(&TileTable::measure(target, width, height, &CLEANING, None));
+    let (ref_present, tgt_present) = (
+        FiniteMask::from_plane(reference, width, height),
+        FiniteMask::from_plane(target, width, height),
+    );
     let inputs = ScaleInputs {
         selection,
+        estimator: LnFluxEstimator::PsfSignal,
+        aperture: LnAperture::default(),
+        reference_present: &ref_present,
+        target_present: &tgt_present,
         reference: SelectionSide {
             plane: reference,
             width,
@@ -1459,8 +1710,15 @@ mod tests {
         h: usize,
         noise: &'a TileNoise,
     ) -> ScaleInputs<'a> {
+        // Test-only: two small all-present masks per call, leaked to borrow
+        // for `'a` (the P-13 inputs are built inline in every pin).
+        let present: &'a FiniteMask = Box::leak(Box::new(FiniteMask::all(w, h)));
         ScaleInputs {
             selection: LnStarSelection::OFF,
+            estimator: LnFluxEstimator::PsfSignal,
+            aperture: LnAperture::Fwhm3,
+            reference_present: present,
+            target_present: present,
             reference: SelectionSide {
                 plane: r,
                 width: w,
@@ -2944,8 +3202,13 @@ mod tests {
         tgt_noise: &'a TileNoise,
         selection: LnStarSelection,
     ) -> ScaleInputs<'a> {
+        let present: &'a FiniteMask = Box::leak(Box::new(FiniteMask::all(WIDTH, HEIGHT)));
         ScaleInputs {
             selection,
+            estimator: LnFluxEstimator::PsfSignal,
+            aperture: LnAperture::Fwhm3,
+            reference_present: present,
+            target_present: present,
             reference: SelectionSide {
                 plane: reference,
                 width: WIDTH,
@@ -3047,5 +3310,129 @@ mod tests {
         });
         assert_eq!(capped.selected, 25);
         assert_eq!(capped.matches, off.matches);
+    }
+
+    /// The point of F1, end to end: a target with broader seeing, scaled by
+    /// 0.8, through `relative_scale_against` with the common aperture at 3F
+    /// recovers 1.25 within 0.5 %. PSF signal's value is printed beside it.
+    #[test]
+    fn the_common_aperture_scale_is_independent_of_seeing() {
+        const REF_FWHM: f64 = 3.0;
+        const TGT_FWHM: f64 = 4.5;
+        let stars: Vec<(f64, f64, f64)> = star_grid(5)
+            .into_iter()
+            .map(|(x, y, a)| (x, y, 0.2 + 2.0 * (a - 0.1)))
+            .collect();
+        // Flux x 0.8 at the broader FWHM: the peak scales by 0.8 (F_ref/F_tgt)^2.
+        let k = 0.8 * (REF_FWHM / TGT_FWHM).powi(2);
+        let anchor = (500.0, 368.0, 0.90);
+        let mut ref_stars = stars.clone();
+        ref_stars.push(anchor);
+        let mut tgt_stars = scale_stars(&stars, k);
+        tgt_stars.push(anchor);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &ref_stars, REF_FWHM, 0.001, 51);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &tgt_stars, TGT_FWHM, 0.001, 52);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let run = |estimator: LnFluxEstimator| {
+            let mut inputs =
+                measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+            inputs.estimator = estimator;
+            inputs.aperture = LnAperture::Fwhm3;
+            relative_scale_against(
+                &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+            )
+            .expect("the field must match")
+        };
+        let r = run(LnFluxEstimator::CommonAperture);
+        let psf = run(LnFluxEstimator::PsfSignal);
+        println!(
+            "F1 scale {:.5} (selected {}), PSF signal scale {:.5} (selected {})",
+            r.scale, r.selected, psf.scale, psf.selected
+        );
+        assert!(
+            (r.scale - 1.25).abs() / 1.25 < 0.005,
+            "F1 {} vs PSF signal {}",
+            r.scale,
+            psf.scale
+        );
+        let f = r.common_fwhm_px.expect("the common aperture reports F");
+        assert_eq!(r.aperture_px, Some(3.0 * f));
+        assert_eq!(r.growth_factor, None);
+        assert_eq!(psf.aperture_px, None);
+        assert_eq!(psf.common_fwhm_px, None);
+    }
+
+    /// P-10: no pair has its 5F circle on both frames -> c = 1, and the scale
+    /// is the plain 2F ratio.
+    #[test]
+    fn a_growth_curve_without_a_qualifying_pair_keeps_c_one() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        // The brief's "absent row every 12 px" would cut the 2F circles too
+        // (F ~ 4.2: 2F ~ 8.4 px, 5F ~ 21 px). Instead each star gets two
+        // absent row segments (+-20 px wide) 14 px above and below it:
+        // outside its own and every neighbour's 2F circle, inside its 5F
+        // circle, and (being inside 6F) out of the [6F, 8F] annulus.
+        let stars = star_grid(41);
+        let mut present = vec![true; WIDTH * HEIGHT];
+        for &(sx, sy, _) in &stars {
+            for dy in [-14isize, 14] {
+                let row = (sy.round() as isize + dy).clamp(0, HEIGHT as isize - 1) as usize;
+                let (x0, x1) = ((sx - 20.0).max(0.0) as usize, (sx + 20.0) as usize);
+                for x in x0..=x1.min(WIDTH - 1) {
+                    present[row * WIDTH + x] = false;
+                }
+            }
+        }
+        let tgt_mask = FiniteMask::from_bools(&present, WIDTH, HEIGHT);
+        let ref_mask = FiniteMask::all(WIDTH, HEIGHT);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let run = |aperture: LnAperture| {
+            let mut inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+            inputs.estimator = LnFluxEstimator::CommonAperture;
+            inputs.aperture = aperture;
+            inputs.reference_present = &ref_mask;
+            inputs.target_present = &tgt_mask;
+            relative_scale_against(
+                &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+            )
+            .expect("the 2F sample must form")
+        };
+        let growth = run(LnAperture::GrowthCurve);
+        let plain = run(LnAperture::Fwhm2);
+        assert_eq!(growth.growth_factor, Some(1.0));
+        assert_eq!(plain.growth_factor, None);
+        assert_eq!(growth.scale, plain.scale);
+        assert!(growth.selected >= MIN_MATCHES);
+        println!(
+            "P-10: growth {:?} scale {:.5} (2F {:.5}), selected {}",
+            growth.growth_factor, growth.scale, plain.scale, growth.selected
+        );
+        // Non-vacuous: with every pixel present the same call finds a
+        // qualifying pair and c is not 1.
+        let mut inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+        inputs.estimator = LnFluxEstimator::CommonAperture;
+        inputs.aperture = LnAperture::GrowthCurve;
+        let open = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        )
+        .expect("the open field must match");
+        assert_ne!(open.growth_factor, Some(1.0));
+        println!("P-10 open-field growth factor {:?}", open.growth_factor);
     }
 }

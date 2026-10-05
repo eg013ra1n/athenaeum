@@ -30,10 +30,12 @@ pub struct FiniteMask {
 
 impl FiniteMask {
     pub fn from_plane(plane: &[f32], width: usize, height: usize) -> FiniteMask {
+        debug_assert_eq!(plane.len(), width * height);
         Self::from_fn(width, height, |k| plane[k].is_finite())
     }
 
     pub fn from_bools(mask: &[bool], width: usize, height: usize) -> FiniteMask {
+        debug_assert_eq!(mask.len(), width * height);
         Self::from_fn(width, height, |k| mask[k])
     }
 
@@ -95,6 +97,7 @@ pub fn circle_flux(
     scratch: &mut Vec<f32>,
 ) -> Option<f64> {
     let w = side.present.width();
+    debug_assert_eq!(side.plane.len(), w * side.present.height());
     let reach = sky_outer.max(radius).ceil() as isize;
     let (ix, iy) = (cx.round() as isize, cy.round() as isize);
     let (r2, in2, out2) = (
@@ -265,6 +268,30 @@ mod tests {
         };
         assert_eq!(
             circle_flux(&side, 6.0, 64.0, r, 24.0, 32.0, &mut scratch),
+            None
+        );
+    }
+
+    /// A NaN pixel inside the circle, with the mask built from the plane
+    /// itself, makes the pair invalid; without it the same circle is valid.
+    #[test]
+    fn a_nan_pixel_inside_the_circle_is_invalid_through_a_plane_mask() {
+        let (mut plane, cx, cy, _) = star_plane();
+        let mut scratch = Vec::new();
+        let clean = FiniteMask::from_plane(&plane, 128, 128);
+        let side = ApertureSide {
+            plane: &plane,
+            present: &clean,
+        };
+        assert!(circle_flux(&side, cx, cy, 8.0, 24.0, 32.0, &mut scratch).is_some());
+        plane[64 * 128 + 66] = f32::NAN;
+        let holed = FiniteMask::from_plane(&plane, 128, 128);
+        let side = ApertureSide {
+            plane: &plane,
+            present: &holed,
+        };
+        assert_eq!(
+            circle_flux(&side, cx, cy, 8.0, 24.0, 32.0, &mut scratch),
             None
         );
     }

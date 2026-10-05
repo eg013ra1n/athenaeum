@@ -7929,6 +7929,14 @@ fn push_summary_group(
         .get(&group.key)
         .map(|c| c.k.clone());
 
+    // Spec 2026-10-04 §8: the estimator rides the summary whenever LN ran
+    // for the group; the aperture only under the common aperture.
+    let ln_local = rc.config.normalization.local;
+    let ln_flux_estimator = ln_scale_px.map(|_| ln_local.flux_estimator);
+    let ln_aperture = (ln_scale_px.is_some()
+        && ln_local.flux_estimator == crate::stacking::integrate::LnFluxEstimator::CommonAperture)
+        .then_some(ln_local.aperture);
+
     rc.summary.groups.push(SummaryGroup {
         key: group.key.clone(),
         frame_count: group.frames.len(),
@@ -7948,6 +7956,8 @@ fn push_summary_group(
         beta,
         seeds_calibration,
         ln_scale_px,
+        ln_flux_estimator,
+        ln_aperture,
         frames,
     });
 }
@@ -10424,6 +10434,7 @@ fn run_group_normalization(
         group_key = %group.key,
         ln_scale_px = scale_px,
         ln_scale_mode = ln::effective_scale_mode(&ln_cfg).as_str(),
+        ln_flux_estimator = ln_cfg.flux_estimator.as_str(),
         width = ref_width,
         height = ref_height,
         "ln scale resolved"

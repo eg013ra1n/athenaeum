@@ -252,6 +252,10 @@ pub struct LocalNormalizationConfig {
     pub local_scale: bool,
     // Which matched stars set the scale (spec §3).
     pub star_selection: LnStarSelection,
+    // Which flux the scale ratios use (spec 2026-10-04 §4.1).
+    pub flux_estimator: LnFluxEstimator,
+    // The common aperture's circle; read only under `commonAperture` (§4.1).
+    pub aperture: LnAperture,
 }
 
 impl Default for LocalNormalizationConfig {
@@ -265,6 +269,8 @@ impl Default for LocalNormalizationConfig {
             psf_model: crate::stacking::psf_signal::PsfModel::Auto,
             local_scale: false,
             star_selection: LnStarSelection::default(),
+            flux_estimator: LnFluxEstimator::PsfSignal,
+            aperture: LnAperture::Fwhm3,
         }
     }
 }
@@ -1950,6 +1956,8 @@ mod tests {
                 psf_model: crate::stacking::psf_signal::PsfModel::Moffat4,
                 local_scale: true,
                 star_selection: LnStarSelection::default(),
+                flux_estimator: LnFluxEstimator::PsfSignal,
+                aperture: LnAperture::Fwhm3,
             }
         );
     }

@@ -508,6 +508,11 @@ pub struct LnReferenceForDetection<'a> {
     pub locations: Vec<f64>,
     pub prepared: Vec<scale::PreparedReferenceChannel>,
     pub overlap: LnOverlap,
+    /// Per plane, the RAW reference plane's finite pixels (before any
+    /// sanitizing) for the common aperture's presence test (P-8). Legacy
+    /// only: `build_masked` leaves it empty because the member's overlap is
+    /// the reference side's presence there.
+    pub present: Vec<FiniteMask>,
 }
 
 impl<'a> LnReferenceForDetection<'a> {
@@ -531,7 +536,14 @@ impl<'a> LnReferenceForDetection<'a> {
     ) -> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
+        let mut present = Vec::with_capacity(reference.planes.len());
         for plane in &reference.planes {
+            // The raw plane, before the sanitizing copy below (P-8).
+            present.push(FiniteMask::from_plane(
+                plane,
+                reference.width,
+                reference.height,
+            ));
             let location = median_of_finite(plane);
             let sanitized: Cow<'a, [f32]> = if plane.iter().all(|v| v.is_finite()) {
                 Cow::Borrowed(plane.as_slice())
@@ -564,6 +576,7 @@ impl<'a> LnReferenceForDetection<'a> {
             locations,
             prepared,
             overlap: LnOverlap::Legacy,
+            present,
         }
     }
 
@@ -615,6 +628,7 @@ impl<'a> LnReferenceForDetection<'a> {
             locations,
             prepared,
             overlap: LnOverlap::Masked,
+            present: Vec::new(),
         }
     }
 }
@@ -731,15 +745,20 @@ pub fn normalize_frame(
             ref_models.len()
         )));
     }
+    // `present` is filled for Legacy only (P-8); Masked leaves it empty.
+    let present_ok = reference_for_detection.overlap == LnOverlap::Masked
+        || reference_for_detection.present.len() == channels;
     if reference_for_detection.sanitized_planes.len() != channels
         || reference_for_detection.locations.len() != channels
         || reference_for_detection.prepared.len() != channels
+        || !present_ok
     {
         return Err(LnError::Other(format!(
-            "reference-for-detection has {}/{}/{} channels, the LN reference has {channels}",
+            "reference-for-detection has {}/{}/{}/{} channels, the LN reference has {channels}",
             reference_for_detection.sanitized_planes.len(),
             reference_for_detection.locations.len(),
-            reference_for_detection.prepared.len()
+            reference_for_detection.prepared.len(),
+            reference_for_detection.present.len()
         )));
     }
 
@@ -937,6 +956,12 @@ pub fn normalize_frame(
         let location_tgt = median_of_finite(&target);
         background_ms += t.elapsed().as_millis() as u64;
 
+        // P-8: the target's presence is its finite pixels as they stand NOW
+        // - after the masked block NaN'd everything outside the overlap, and
+        // before the in-place sanitizing below overwrites every NaN with the
+        // fill value (after that the mask could not tell data from fill).
+        let tgt_present = FiniteMask::from_plane(&target, reference.width, reference.height);
+
         // Fix round 1, item 6: sanitize `target` IN PLACE for detection —
         // everything that needed the NaN-preserving version
         // (the tile table, `location_tgt`) has already read it, so
@@ -982,8 +1007,19 @@ pub fn normalize_frame(
             TileNoise::from_model(ref_model_for_scale),
             TileNoise::from_model(&target_model),
         );
+        // P-8: masked mode - the target is NaN outside the overlap, so its
+        // presence IS the overlap, the reference side's too.
+        let ref_present = if masked {
+            &tgt_present
+        } else {
+            &reference_for_detection.present[p]
+        };
         let inputs = scale::ScaleInputs {
             selection: cfg.star_selection,
+            estimator: cfg.flux_estimator,
+            aperture: cfg.aperture,
+            reference_present: ref_present,
+            target_present: &tgt_present,
             reference: SelectionSide {
                 plane: &reference_for_detection.sanitized_planes[p],
                 width: reference.width,
