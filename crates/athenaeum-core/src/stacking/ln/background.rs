@@ -653,6 +653,98 @@ fn mad_f64(values: impl Iterator<Item = f64>) -> f64 {
     median_f64_sorted(&mut dev)
 }
 
+/// What the star selection reads from one side's background model (spec
+/// §3 steps 1–2): each tile's σ where the final fit accepted it, the plane
+/// median of those, and the hot-pixel-corrected plane maximum (L-14).
+#[derive(Debug, Clone)]
+pub struct TileNoise {
+    tw: usize,
+    th: usize,
+    sigma: Vec<f32>,
+    plane_sigma: f64,
+    plane_max: f32,
+}
+
+impl TileNoise {
+    pub fn from_model(m: &BackgroundModel) -> TileNoise {
+        Self::build(&m.table, |k| m.accepted[k])
+    }
+
+    /// Every sample counts as accepted (probes and the test wrapper, which
+    /// fit no surface).
+    pub fn from_table(t: &TileTable) -> TileNoise {
+        Self::build(t, |k| t.tiles[k].is_sample())
+    }
+
+    pub fn uniform(sigma: f64, plane_max: f32) -> TileNoise {
+        TileNoise {
+            tw: 0,
+            th: 0,
+            sigma: Vec::new(),
+            plane_sigma: sigma,
+            plane_max,
+        }
+    }
+
+    fn build(t: &TileTable, accepted: impl Fn(usize) -> bool) -> TileNoise {
+        let sigma: Vec<f32> = (0..t.tiles.len())
+            .map(|k| {
+                if accepted(k) {
+                    t.tiles[k].sigma
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let mut finite: Vec<f64> = sigma
+            .iter()
+            .filter(|s| s.is_finite())
+            .map(|&s| s as f64)
+            .collect();
+        let plane_sigma = if finite.is_empty() {
+            f64::NAN
+        } else {
+            median_f64_sorted(&mut finite)
+        };
+        TileNoise {
+            tw: t.tw,
+            th: t.th,
+            sigma,
+            plane_sigma,
+            plane_max: t.plane_max(),
+        }
+    }
+
+    /// L-12: the median σ of the accepted samples in the 3 × 3 tile block
+    /// around the tile holding (x, y); the plane median when that block has
+    /// none.
+    pub fn sigma_local(&self, x: f64, y: f64) -> f64 {
+        if self.tw == 0 || self.th == 0 || !(x.is_finite() && y.is_finite()) {
+            return self.plane_sigma;
+        }
+        let u = ((x.max(0.0) as usize) / TILE_PX).min(self.tw - 1);
+        let v = ((y.max(0.0) as usize) / TILE_PX).min(self.th - 1);
+        let mut block = Vec::with_capacity(9);
+        for vv in v.saturating_sub(1)..=(v + 1).min(self.th - 1) {
+            for uu in u.saturating_sub(1)..=(u + 1).min(self.tw - 1) {
+                let s = self.sigma[vv * self.tw + uu];
+                if s.is_finite() {
+                    block.push(s as f64);
+                }
+            }
+        }
+        if block.is_empty() {
+            self.plane_sigma
+        } else {
+            median_f64_sorted(&mut block)
+        }
+    }
+
+    pub fn plane_max(&self) -> f32 {
+        self.plane_max
+    }
+}
+
 fn median_f64_sorted(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     let n = v.len();
@@ -904,6 +996,42 @@ mod tests {
     fn model(plane: &[f32], w: usize, h: usize, scale: u32) -> BackgroundModel {
         BackgroundModel::fit(TileTable::measure(plane, w, h, &CLEANING, None), scale)
             .expect("the fixture has samples")
+    }
+
+    /// Review Focus 4 / L-14: a lone hot pixel does not set the plane
+    /// maximum; a real saturated star does.
+    #[test]
+    fn a_hot_pixel_does_not_set_the_plane_maximum() {
+        let (w, h) = (256usize, 256usize);
+        let mut plane = noisy(w, h, |_, _| 0.1, 0.002, 9);
+        for y in 100..105 {
+            for x in 100..105 {
+                plane[y * w + x] = 0.98; // a saturated 5 × 5 core
+            }
+        }
+        plane[40 * w + 200] = 1.0; // a lone hot pixel
+        let t = TileTable::measure(&plane, w, h, &CLEANING, None);
+        assert_eq!(t.plane_max(), 0.98);
+    }
+
+    #[test]
+    fn sigma_local_reads_the_three_by_three_block_or_the_plane_median() {
+        let (w, h) = (512usize, 256usize);
+        // Left half σ = 0.001, right half σ = 0.01.
+        let mut plane = noisy(w, h, |_, _| 0.1, 0.001, 4);
+        let right = noisy(w, h, |_, _| 0.1, 0.01, 5);
+        for y in 0..h {
+            for x in w / 2..w {
+                plane[y * w + x] = right[y * w + x];
+            }
+        }
+        let m = model(&plane, w, h, 256);
+        let n = TileNoise::from_model(&m);
+        assert!((n.sigma_local(64.0, 128.0) / 0.001 - 1.0).abs() < 0.15);
+        assert!((n.sigma_local(448.0, 128.0) / 0.01 - 1.0).abs() < 0.15);
+        // No accepted sample nearby: the plane median.
+        let u = TileNoise::uniform(0.003, 0.9);
+        assert_eq!(u.sigma_local(10.0, 10.0), 0.003);
     }
 
     fn node_xy(i: usize, j: usize, stride: usize, w: usize, h: usize) -> (f64, f64) {

@@ -1926,6 +1926,7 @@ mod tests {
             residual: 0.01,
             signal: 100.0,
             area: 28.0,
+            peak5: f64::NAN,
         }
     }
 

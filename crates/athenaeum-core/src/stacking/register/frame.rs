@@ -926,6 +926,7 @@ mod tests {
                 residual: 0.01,
                 signal: 40000.0 + i as f64 * 1000.0,
                 area: 28.0,
+                peak5: f64::NAN,
             })
             .collect();
         let expected = stars_from_fits(&fits, &cfg.detection, cfg.max_stars);

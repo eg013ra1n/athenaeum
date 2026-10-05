@@ -160,6 +160,39 @@ impl LnScaleMode {
     }
 }
 
+/// The star selection for the LN scale (spec 2026-10-04 §3, L-11).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LnStarSelection {
+    // Both sides' (peak − background) / σ_local must reach this (5–200).
+    pub min_peak_snr: f64,
+    // At most this many matched PAIRS, brightest first (20–5000).
+    pub max_stars: u32,
+    // A pixel within max(2, FWHM) of either centroid above this fraction of
+    // that plane's maximum leaves the pair out (0.5–1.0).
+    pub saturation: f64,
+}
+
+impl Default for LnStarSelection {
+    fn default() -> Self {
+        LnStarSelection {
+            min_peak_snr: 40.0,
+            max_stars: 500,
+            saturation: 0.75,
+        }
+    }
+}
+
+impl LnStarSelection {
+    /// No selection at all: every matched pair, in rank order. Tests and the
+    /// probe's legacy arm only (P-13); never stored — it is not valid JSON.
+    pub const OFF: LnStarSelection = LnStarSelection {
+        min_peak_snr: f64::NEG_INFINITY,
+        max_stars: u32::MAX,
+        saturation: f64::INFINITY,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {

@@ -51,6 +51,7 @@ pub mod grid;
 pub mod reference;
 pub mod scale;
 pub mod scale_rule;
+pub mod selection;
 
 pub use scale_rule::{
     effective_scale_mode, resolve_scale, snap_ln_scale, LEGACY_DEFAULT_LN_SCALE, LN_SCALES,
@@ -58,8 +59,9 @@ pub use scale_rule::{
 };
 pub use background::{
     shared_refit, BackgroundModel, BackgroundRefusal, CleaningParams, PairSurfaces, Surface,
-    TileStat, TileTable, CLEANING,
+    TileNoise, TileStat, TileTable, CLEANING,
 };
+pub use selection::{rank_candidates, Candidates, SelectionRule, SelectionSide};
 pub use calibration::{
     calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
     ChannelCalibration, ChannelOutcome, SeedsCalibration, SEEDS_CALIBRATION_BAND,

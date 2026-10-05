@@ -126,6 +126,8 @@ fn decode_fit(record: &[u8]) -> StarFit {
         residual: field(10),
         signal: field(11),
         area: field(12),
+        // Not persisted (spec 2026-10-04 L-12).
+        peak5: f64::NAN,
     }
 }
 
@@ -246,6 +248,7 @@ mod tests {
             residual: rng.next_f64() * 0.5,
             signal: signed(rng, 1e6),
             area: rng.next_f64() * 1000.0,
+            peak5: f64::NAN,
         }
     }
 

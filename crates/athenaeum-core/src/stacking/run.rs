@@ -16191,6 +16191,7 @@ mod tests {
             residual: 0.02,
             signal: 40000.0,
             area: 28.0,
+            peak5: f64::NAN,
         };
 
         let seed_fits = |fits: &[psf_signal::StarFit]| {

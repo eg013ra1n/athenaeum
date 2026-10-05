@@ -128,6 +128,16 @@ pub struct StarFit {
     pub signal: f64,
     /// Analytic area of that ellipse, `π·(k/2)²·fwtm_x·fwtm_y`.
     pub area: f64,
+    /// Mean of the five brightest finite pixels in the fit's sampling
+    /// region (spec 2026-10-04 L-12) — the peak the LN star selection
+    /// judges SNR on. Not persisted: NaN on a fit decoded from the `fits`
+    /// artifact.
+    #[serde(skip, default = "not_measured")]
+    pub peak5: f64,
+}
+
+fn not_measured() -> f64 {
+    f64::NAN
 }
 
 impl StarFit {
@@ -386,13 +396,20 @@ fn fit_one(
     scratch.vals.clear();
     scratch.vals.reserve(cap);
     let mut peak = f64::NEG_INFINITY;
+    // The five largest values seen, ascending (L-12's `peak5`).
+    let mut top = [f64::NEG_INFINITY; 5];
     for y in cy - r..=cy + r {
         for x in cx - r..=cx + r {
             let v = data[y as usize * w + x as usize];
             if !v.is_finite() {
                 continue;
             }
-            peak = peak.max(v as f64);
+            let v64 = v as f64;
+            peak = peak.max(v64);
+            if v64 > top[0] {
+                top[0] = v64;
+                top.sort_by(f64::total_cmp);
+            }
             scratch.vals.push(v);
             scratch.px.push(PixelSample {
                 x: x as f64,
@@ -432,6 +449,8 @@ fn fit_one(
     )?;
     let mut f = accept(&fit, seed, cx as f64, cy as f64, r as f64, p)?;
     aperture(data, w, h, &mut f, p.growth);
+    // At least 10 finite pixels were gathered, so all five slots are filled.
+    f.peak5 = top.iter().sum::<f64>() / top.len() as f64;
     Some(f)
 }
 
@@ -501,6 +520,7 @@ fn accept(
         residual: m.fit_residual,
         signal: 0.0,
         area: 0.0,
+        peak5: f64::NAN,
     })
 }
 
@@ -1513,6 +1533,50 @@ mod tests {
 
     use crate::test_support::add_noise;
 
+    /// L-12: `peak5` is the mean of the five brightest finite pixels of the
+    /// square `fit_one` sampled — independent of the fitted model.
+    #[test]
+    fn peak5_is_the_mean_of_the_five_brightest_pixels_in_the_fit_region() {
+        // Nothing is planted: a rendered noise-free Gaussian star (FWHM 3 px)
+        // on a flat 0.1 plane. Every square `fit_one` can sample has r >= 3
+        // and the star's five brightest pixels lie within 1.5 px of its
+        // centre, so the expected set is the same whatever r the region grew to.
+        let (w, h) = (64usize, 64usize);
+        let sigma = 3.0 / 2.354_820_045;
+        let (sx, sy, amp) = (32.3, 31.7, 0.4);
+        let data = gaussian_field(w, h, &[(sx, sy, amp)], sigma, 0.1);
+        let seeds = vec![Seed {
+            x: sx,
+            y: sy,
+            peak: amp,
+            flux: 2.0 * std::f64::consts::PI * sigma * sigma * amp,
+        }];
+        let out = fit_stars(
+            &data,
+            w,
+            h,
+            &seeds,
+            PsfModel::Moffat4,
+            &FitParams::default(),
+            None,
+        );
+        assert_eq!(out.fits.len(), 1, "the star must fit");
+        let mut near: Vec<f64> = Vec::new();
+        for y in 29..=35usize {
+            for x in 29..=35usize {
+                near.push(data[y * w + x] as f64);
+            }
+        }
+        near.sort_by(|a, b| b.total_cmp(a));
+        let expected = near[..5].iter().sum::<f64>() / 5.0;
+        assert!(
+            (out.fits[0].peak5 - expected).abs() < 1e-9,
+            "peak5 {} vs {}",
+            out.fits[0].peak5,
+            expected
+        );
+    }
+
     fn fit_with(mean: f64) -> StarFit {
         StarFit {
             x: 0.0,
@@ -1528,6 +1592,7 @@ mod tests {
             residual: 0.01,
             signal: mean * 10.0,
             area: 10.0,
+            peak5: f64::NAN,
         }
     }
 
