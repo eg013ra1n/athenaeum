@@ -15,6 +15,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` (owner-approved 2026-10-04, rulings L-1…L-22). Read it whole before Task 1. Every task cites the spec sections it implements. Where this plan refines the spec, it says so as a ruling **P-n** (next section); P-1 and P-20 need the owner's confirmation at plan review.
 
+**Review folded in:** `.superpowers/sdd/ln-model-fixes/plan-review-fable.md` (verdict "ready after fixes": 3 Critical, 6 Important, 10 Minor). Every fix names its finding (C-n, I-n, M-n) where it lands; C-1 became ruling P-21. The reviewer independently confirmed P-20 and P-1.
+
 **Research behind the spec** (read the parts each task names):
 - `docs/superpowers/research/2026-10-04-ln-scale-psf-width-audit.md` (the scale bias; §5 `--stack-sim`, §7 validation at master level);
 - `docs/superpowers/research/2026-10-04-ln-math-review.md` (§5 the halo, §8 the ranked fixes).
@@ -100,7 +102,7 @@ Five inputs the spec implies, which no task's original tests would exercise, and
 
 ## Plan rulings (refinements of the spec)
 
-Numbered P-1…P-20. Each says what it decides and why. **P-1 and P-20 need the owner's confirmation at plan review.** The rest are writer's decisions on points the spec leaves open.
+Numbered P-1…P-21. Each says what it decides and why. **P-1 and P-20 need the owner's confirmation at plan review.** The rest are writer's decisions on points the spec leaves open.
 
 - **P-1 — The linear-gradient pin (spec §1.6) as the model can meet it.** *(Owner to confirm, together with P-20.)*
   - The spec asks that "a linear gradient is reproduced at every node to 1e-5 of its amplitude". No first-difference (membrane) penalty can meet that at the edges.
@@ -112,7 +114,7 @@ Numbered P-1…P-20. Each says what it decides and why. **P-1 and P-20 need the 
     | 1e-4 (L-3 as written) | 1.38e-3 | 6.1e-6 |
     | 3e-3 | 9.3e-3 | 8.0e-5 |
     | 1e-2 (P-20) | 1.34e-2 | 2.8e-4 |
-    | 0 | 7e-13 | 2e-13 |
+    | 0 | 6e-13 | 1e-13 |
 
   - On real data only the **difference** of the reference's and the target's gradients reaches `B` (each surface's flattening cancels where the two agree). With P-20, a 10 %-of-sky gradient difference gains at most 0.13 % of sky at a corner node, and 0.003 % one knot interval inside.
   - **Decision:**
@@ -146,7 +148,7 @@ Numbered P-1…P-20. Each says what it decides and why. **P-1 and P-20 need the 
   - Target: finite before sanitizing; in masked mode that is exactly the overlap, because the target is masked first.
   - Reference: the raw reference plane's finite pixels (legacy, built once per group in `LnReferenceForDetection`), or the member's overlap (masked).
 - **P-9 — A rejection round that would keep no sample rejects nothing** (spec §1.2 step 5 is silent). It only happens with residuals all far from their MAD; the round keeps every sample, as for `σ_e ≤ 0`.
-- **P-10 — The growth-curve correction with no qualifying pair is `c = 1`, with one `warn!` per plane** (spec §4.1 is silent). The ratio sample is unaffected, and the log says why the variant degraded to 2F.
+- **P-10 — The growth-curve correction with no qualifying pair is `c = 1`, with one `warn!` per plane** (spec §4.1 is silent). The ratio sample is unaffected, and the log says why the variant degraded to 2F. A pair qualifies when `circle_flux` at 5F is valid on both frames: entirely present, as the spec says, and also a half-present annulus and a positive flux. That is stricter than the spec and harmless (review M-8).
 - **P-11 — The pedestal `warn!` is emitted by the run (per group) and by `get_export_readiness` (per set), and by nothing else.**
   - `readiness_from_data` fills the field silently. It also serves the collab per-frame verdict (once per light), where a `warn!` per call would flood the log.
   - The plan carries the warning in its payload and does not log it (it is rebuilt on every debounced edit).
@@ -158,12 +160,19 @@ Numbered P-1…P-20. Each says what it decides and why. **P-1 and P-20 need the 
 - **P-13 — Pre-existing synthetic LN tests and the selection.**
   - Synthetic fixtures have no saturated star, so the plane maximum IS the brightest star. Relative saturation at 0.75 then removes the top quarter of stars, which no real frame would see.
   - A pre-existing test whose subject is not the selection (pairing, β, RCR, the local spline, the sidecar, masked coefficients) runs with `LnStarSelection::OFF` and a one-line comment naming this ruling.
+  - The same holds for the `run.rs` LN tests built on `seed_ln_star_group` (`run.rs:~17448` and its users — `local_normalization_writes_one_sidecar_per_included_frame_and_a_reference`, `…falls_back_to_detection…`, `…sidecars_are_cached_on_the_second_run`, the rejection-only tests ~18566/~18738 — and Tasks 2 and 3's new run tests). Their subject is the LN run, never the selection. Under the default selection a frame can drop below 20 matches once the top quarter is cut (review C-3). From Task 11 on they set `cfg.normalization.local.star_selection = LnStarSelection::OFF` with the P-13 comment when they fail for that reason.
   - Selection itself is pinned by Task 10's new tests. No tolerance changes.
 - **P-14 — The run learns the plan's per-group estimate from the plan `start_stacking` already builds** (`run.rs:~897`). It is stored as `RunContext.planned_ln_scales`, so the mismatch warning of spec §2.3 needs no second plan build.
 - **P-15 — `ScaleResult.matches` keeps its meaning (valid PSF-signal pairs before selection, `ln_matches`); `ScaleResult.selected` is new (`ln_selected`).** `diag` and RCR read the selected sample. Under `LnStarSelection::OFF` with PSF signal, `selected == matches`, which keeps every pre-existing count assertion's meaning.
 - **P-16 — `--stack-sim` stays plane 0** (its dumped warps are single-plane). Spec §4.3 runs it on set 204 mono only, and the arms of Task 15 are per-member scale maps.
 - **P-17 — The master SNR row reads σ from `measure_probe <master>` `.noise`** — the same MRS estimate `tier1-compare.py`'s masters section reads — and `k` from `master_phot.py`. One script prints both for every arm.
 - **P-18 — `σ_local ≤ 0` (a noise-free synthetic plane) makes the SNR test pass** when `peak − b > 0`. There is no noise information, so there is no SNR cut. Real frames always have tile σ > 0.
+- **P-21 — A residual MAD at the rounding level is σ_e ≤ 0** (spec §1.2 step 5; review C-1).
+  - Tile values are f32. On a constant or noise-free plane the penalized solve leaves residuals at the f64 rounding level, and their MAD is still > 0.
+  - The prototype rejected 158 of 3072 samples of a constant plane at σ_e = 4.9e-16. That makes the constant-plane pin fail and the 8-sample floor fixture machine-dependent.
+  - **Decision:** σ_e ≤ 1e-6 × |median of the accepted samples' values| (≈ 8 f32 ulps of the level) counts as σ_e ≤ 0: the round rejects nothing.
+  - Real tile σ is 1e-3–1e-1 of the level, four orders above the floor.
+  - Mirrored in `bg_prototype.py`. P-1's numbers are unchanged with it: the gradient fixture's residual MAD lies above the floor.
 - **P-19 — What the surface does over a gap, measured** (spec §1.3 states it loosely).
   - The spec says that beyond the last data the surface "continues at the edge level". That holds only where the coefficients have no data in their support, i.e. more than about two knot intervals from the data.
   - Closer than that, the coefficients are still fitted to the data, so the surface continues the data's local trend and carries more noise than over the data.
@@ -202,7 +211,7 @@ Numbered P-1…P-20. Each says what it decides and why. **P-1 and P-20 need the 
 
 ### Task 1: Background model core
 
-Spec §1.2 (steps 1–7), §1.3, §1.5, §1.6; rulings L-1…L-6, P-1, P-2, P-3, P-9, P-19, P-20.
+Spec §1.2 (steps 1–7), §1.3, §1.5, §1.6; rulings L-1…L-6, P-1, P-2, P-3, P-9, P-19, P-20, P-21.
 
 The new model lands **beside** the old one in the same file, with every pin of spec §1.6. Nothing calls it yet; Task 2 switches every caller and deletes the old model. This split lets a reviewer judge the numerics on their own.
 
@@ -305,6 +314,7 @@ The new model lands **beside** the old one in the same file, with every pin of s
         (shared, own)
     }
 
+    /// P-21: no sample is rejected on rounding-level residuals.
     #[test]
     fn a_constant_plane_gives_constant_nodes() {
         let (w, h) = (1024usize, 768usize);
@@ -1130,7 +1140,10 @@ impl BackgroundModel {
                 resid[k] = values[k] as f64 - surface.eval(x, y);
             }
             let sigma_e = MAD_TO_SIGMA_F64 * mad_f64(accepted_ids.iter().map(|&k| resid[k]));
-            let next: Vec<usize> = if sigma_e > 0.0 {
+            // P-21: tile values are f32, so a residual MAD below a few f32
+            // ulps of the level is rounding, not noise — it is σ_e ≤ 0 here.
+            let level = median_f64_sorted(&mut accepted_ids.iter().map(|&k| values[k] as f64).collect::<Vec<_>>()).abs();
+            let next: Vec<usize> = if sigma_e > 1e-6 * level {
                 all.iter()
                     .copied()
                     .filter(|&k| resid[k].abs() <= SAMPLE_CLIP_SIGMA * sigma_e)
@@ -1464,7 +1477,7 @@ In `config.rs` `normalization_subtree_with_fit_version`, add `"lnModelVersion": 
                 LnError::Other(format!("background model of the LN reference on the overlap: {r}"))
             })?);
      ```
-     Rename `member_ref_bg: Option<BackgroundGrid>` to `member_ref_model: Option<BackgroundModel>`. Keep `allowed` as is. Keep `overlap` alive for the rest of the iteration (Task 13 reads it).
+     Rename `member_ref_bg: Option<BackgroundGrid>` to `member_ref_model: Option<BackgroundModel>`. Keep `allowed` as is.
   7. Target model (replace 881–912's `background_grid` + refusal + `cells_rejected_total` lines):
      ```rust
         let t = Instant::now();
@@ -1514,7 +1527,7 @@ In `config.rs` `normalization_subtree_with_fit_version`, add `"lnModelVersion": 
       and rewrite the struct doc's "`matches`/`cells_rejected` are the SUM" sentence accordingly.
   13. Module doc (lines 15–29): replace the "(just a looser deviation threshold — `TARGET_DEVIATION_SIGMA`)" phrase with "by the same procedure and thresholds (L-1), then both surfaces are refitted on the samples both kept (L-6)".
 
-- [ ] **Step 5: Retire the cell model.** In `background.rs` delete `CELL_SUBSAMPLE_THRESHOLD`, `BackgroundParams`, `DEFAULT_PARAMS`, `TARGET_DEVIATION_SIGMA`, `BackgroundGrid`, `CellScratch`, `background_grid` (with its long doc, but KEEP the C-29 "measured out" paragraph: move it verbatim into the new module doc under a heading line "Measured out (do not re-propose)"), `high_clip_threshold`, `clean_plane`, `gather_cell`, `robust_cell_level`, `fill_invalid_cells`, and these tests: `flat_plane_with_stars_recovers_the_flat_level`, `vertical_gradient_is_tracked_per_cell`, `a_cell_that_is_mostly_star_is_invalid_and_filled_from_neighbours`, `trailing_node_overshoot_gets_a_real_window`, `robust_cell_level_over_rejected_by_the_iterative_clip_is_invalid`, `robust_cell_level_on_scratch_matches_a_fresh_allocation_every_round`, `a_plane_entirely_below_the_low_clip_is_fully_invalid`, `background_grid_is_bit_identical_with_and_without_a_pool`. Rewrite the module doc (lines 1–30) to describe the model at the scale (spec §1.2 in five sentences, the cleaning ruling of 2026-09-10 kept verbatim, then the C-29 paragraph). In `mod.rs` remove the old names from the `pub use background::{…}` list.
+- [ ] **Step 5: Retire the cell model.** In `background.rs` delete `CELL_SUBSAMPLE_THRESHOLD`, `BackgroundParams`, `DEFAULT_PARAMS`, `TARGET_DEVIATION_SIGMA`, `BackgroundGrid`, `CellScratch`, `background_grid` (with its long doc, but KEEP the C-29 "measured out" paragraph: move it verbatim into the new module doc under a heading line "Measured out (do not re-propose)"), `high_clip_threshold`, `clean_plane`, `gather_cell`, `robust_cell_level`, `fill_invalid_cells`, and these tests: `flat_plane_with_stars_recovers_the_flat_level`, `vertical_gradient_is_tracked_per_cell`, `a_cell_that_is_mostly_star_is_invalid_and_filled_from_neighbours`, `trailing_node_overshoot_gets_a_real_window`, `robust_cell_level_over_rejected_by_the_iterative_clip_is_invalid`, `robust_cell_level_on_scratch_matches_a_fresh_allocation_every_round`, `a_plane_entirely_below_the_low_clip_is_fully_invalid`, `background_grid_is_bit_identical_with_and_without_a_pool`. **Keep the `fn pool()` test helper**: Task 1's `the_model_is_bit_identical_with_and_without_a_pool_and_run_to_run` uses it (review I-6). Rewrite the module doc (lines 1–30) to describe the model at the scale (spec §1.2 in five sentences, the cleaning ruling of 2026-09-10 kept verbatim, then the C-29 paragraph). In `mod.rs` remove the old names from the `pub use background::{…}` list.
 
   Add one trailing-node pin to replace `trailing_node_overshoot_gets_a_real_window`:
   ```rust
@@ -1799,7 +1812,7 @@ Plus, in `run.rs`'s test module (copy the setup of `local_normalization_sidecars
         // "the plan estimated 8192 px".
     }
 ```
-Write the two bodies out fully, adapting the named test's setup verbatim. Do not invent a new fixture.
+Write the two bodies out fully, adapting the named test's setup verbatim. Do not invent a new fixture. (From Task 11 on, these two tests fall under P-13's `run.rs` clause, review C-3.)
 
 And in `api/stacking.rs`'s test module:
 ```rust
@@ -2023,7 +2036,7 @@ Fill the three test literals (`plan.rs` ~6328, ~6639, ~8982) with the fixture's 
      ```
      Delete Task 2's `let scale_px = ln_cfg.scale;` line. Every later `scale_px` use stays.
   3. The three hash calls take the token (Step 7).
-  4. `build_and_write_ln_reference` gains `scale_px: u32` (last parameter) and writes `LnReferencePayload { reference_member_ids, reference_hash, width: built.width, height: built.height, scale_px }`.
+  4. `build_and_write_ln_reference` gains `scale_px: u32` (last parameter) and writes `LnReferencePayload { reference_member_ids, reference_hash, width: built.width, height: built.height, scale_px }`. Its `"ln reference built"` `info!` (~11481) gains `ln_scale_px = scale_px,` (spec §10; review M-1).
   5. `LnGroupOutcome` gains `scale_px: Option<u32>` (`Some(scale_px)` on every return after it is resolved, `None` on the early returns before it); the caller at ~8742 passes it to `push_summary_group`, which gains `ln_scale_px: Option<u32>` and sets the new `SummaryGroup.ln_scale_px`. Every other `push_summary_group` call passes `None`.
 - [ ] **Step 10: `SummaryGroup`** (`provenance.rs`): add `#[serde(default)] pub ln_scale_px: Option<u32>,` with a `//` comment ("the LN scale this group ran at, spec §8"). Fix any `SummaryGroup { .. }` literal the compiler flags with `ln_scale_px: None`.
 
@@ -2052,13 +2065,13 @@ fn plan_ln_geometry(
     g: &IntegrationGroup,
     groups: &[IntegrationGroup],
     excluded: &HashSet<i64>,
-    project_grid: Option<(u64, u64, bool)>,
+    ln_grid_dims: Option<(u64, u64, bool)>,
     stored_reference: Option<&LnReferencePayload>,
     native: bool,
     run_reference: Option<i64>,
     native_references: &HashMap<String, i64>,
 ) -> Option<(usize, usize, bool)> {
-    if let Some((w, h, confirmed)) = project_grid {
+    if let Some((w, h, confirmed)) = ln_grid_dims {
         return Some((w as usize, h as usize, !confirmed));
     }
     if let Some(p) = stored_reference.filter(|p| p.width > 0 && p.height > 0) {
@@ -2089,10 +2102,10 @@ fn plan_ln_geometry(
   3. In `build_plan`, before the per-group loop, when `local_normalization_active`:
      - `run_reference = reference.frame_id.or(last_run_reference_id)` (read the last run once with `list_runs(conn, subject, 1)?`; reuse a value the function already holds if there is one);
      - `native_references = summary_group_references(last_run.summary_json.as_deref())` when `cfg.registration.geometry == RegistrationGeometry::Native`, else empty;
-     - `project_grid = project.as_ref().and_then(|p| p.grid_dims.map(|(w, h)| (w, h, p.grid.current.is_some())))` (check the field names in `ProjectInputs`).
+     - `ln_grid_dims = project.as_ref().and_then(|p| p.grid_dims.map(|(w, h)| (w, h, p.grid.current.is_some())))` — a new name: `build_plan` already binds `project_grid: Option<CanonicalGrid>` at ~2481 and reads it at ~2914/~3090/~3234 (review I-1). `ProjectInputs.grid_dims: Option<(u64, u64)>` (~1954) and `PlanGrid.current` (~242) are as written.
      Inside the per-group loop, after `ln_reference_info` is read (~2905–2911), compute
      ```rust
-            let ln_geometry = plan_ln_geometry(g, &groups, &excluded_set, project_grid, ln_reference_info.as_ref(), native, run_reference, &native_references);
+            let ln_geometry = plan_ln_geometry(g, &groups, &excluded_set, ln_grid_dims, ln_reference_info.as_ref(), native, run_reference, &native_references);
             let ln_scale_px = ln_geometry.map(|(w, h, _)| crate::stacking::ln::resolve_scale(&cfg.normalization.local, w, h));
      ```
      (adapt `ln_reference_info.as_ref()` to however that payload is held), and pass `ln_scale_px` into the per-frame `normalization_hash_for` call (~3100). Store `ln_scale_px`, `ln_geometry.map_or(false, |g| g.2)`, `ln_geometry.map(|g| g.0 as u32)`, `ln_geometry.map(|g| g.1 as u32)` into the `PlanGroup` literal (~3161); `None`/`false` while LN is inactive.
@@ -2539,6 +2552,7 @@ Spec §5.1 (the run evaluates per group at stage 1, so cache hits are covered), 
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/calibration_library/light_cal.rs` (new `flat_corner_ratio`; hand-format, never rustfmt)
+- Modify: `crates/athenaeum-core/src/export/calibrated_generator.rs` (one `pub(crate)` seam, `flat_norm_divisor_cached`, extracted from ~353–378 and used by `resolve_generation` itself — review I-2)
 - Modify: `crates/athenaeum-core/src/stacking/run.rs` (`stage_calibrate`, per group after the resolve loop, ~2803)
 - Test: `light_cal.rs` `mod tests`; `run.rs` test module
 
@@ -2563,11 +2577,17 @@ and in `run.rs` (reuse `add_master_dark_and_flat` and the stage-1 test helpers; 
 ```rust
     #[test]
     fn a_flat_only_group_gets_one_run_warning_with_the_corner_ratio() {
-        // Lights linked to the fixture's master flat only. Run. Exactly one
-        // `summary.warnings` entry starts with "group <key>: <n> lights were
-        // calibrated with a flat but no dark or bias" and contains "% of its centre".
+        // Fixture (review I-3): `add_master_dark_and_flat`, then on `fixture.conn`
+        // `DELETE FROM calibration_set_to_frames WHERE source_type = 'frame' AND calibration_type = 'Dark'`
+        // so the lights link the master flat only. The fixture flat is a constant
+        // plane, so its corners equal its centre: with flat normalization on, the
+        // sentence reads "100 % of its centre, so the offset pedestal is 1.0× larger"
+        // (with it off, the divisor is 1.0 and the ratio is the flat's own level —
+        // assert the exact text for whichever the fixture's config uses).
+        // Run. Exactly one `summary.warnings` entry starts with "group <key>: <n> lights were
+        // calibrated with a flat but no dark or bias" and contains that corner text.
         // Run again (stage 1 fully cached): the warning is still there (§5.1).
-        // A group with a dark too: no such warning.
+        // A second fixture with the dark links kept: no such warning.
     }
 ```
 Write both bodies fully from the named fixtures.
@@ -2624,7 +2644,26 @@ pub fn flat_corner_ratio(flat_path: &Path, scratch_dir: &Path, divisor: f64) -> 
 - [ ] **Step 4: The run** (`stage_calibrate`, inside `for group in &groups`, after the resolve loop and before `if jobs.is_empty() { continue; }` so a fully cached group is covered):
   1. `ids` = the group's frames this loop visited that were not excluded (the same iteration's `frame.frame_id`s minus the runtime exclusions pushed in this loop).
   2. `let tally = crate::api::lights::flat_only_lights(&conn, &ids)` — on `Err`, `warn!` with `error` and continue the stage (advisory; never fails the run).
-  3. When `!tally.frame_ids.is_empty()`: for each distinct flat master path among the affected lights (`crate::calibration_library::light_resolve::resolve_frame_inputs(&conn, id, cfg.calibration.flat_norm)` → `.flat`), resolve the divisor exactly as the generator does (`resolve_flat_norm_divisor(path, scratch, mode, &params, cfa)` through the run's shared `DivisorCache` in `rc.memo`, then `.global_value()`; read `calibrated_generator.rs:353-378` and reuse its `divisor_key` lookup) and call `flat_corner_ratio(path, scratch, divisor)`. Keep the smallest `V`. A flat whose ratio fails: `warn!(path, error, "flat corner ratio unreadable; the pedestal warning omits it")` and skip it.
+  3. When `!tally.frame_ids.is_empty()`: for each distinct flat master path among the affected lights (`crate::calibration_library::light_resolve::resolve_frame_inputs(&conn, id, cfg.calibration.flat_norm)` → `.flat`), resolve the divisor exactly as the generator does. `divisor_key` and `DivisorCache.entries` are private (`calibrated_generator.rs:~248/~278`), so first extract this seam from ~353–378 and make `resolve_generation_cached` call it (review I-2):
+     ```rust
+pub(crate) fn flat_norm_divisor_cached(
+    divisors: &mut DivisorCache,
+    flat_path: &str,
+    scratch_dir: &Path,
+    mode: FlatNormMode,
+    params: &LightCalParams,
+    cfa: Option<CfaGeometry>,
+) -> anyhow::Result<FlatNormDivisor> {
+    let key = divisor_key(flat_path, cfa);
+    if let Some(d) = divisors.entries.get(&key) {
+        return Ok(*d);
+    }
+    let d = resolve_flat_norm_divisor(Path::new(flat_path), scratch_dir, mode, params, cfa)?;
+    divisors.entries.insert(key, d);
+    Ok(d)
+}
+     ```
+     The generator's `(Some(m), true)` arm becomes `flat_norm_divisor_cached(divisors, &m.path, scratch_dir, opts.flat_norm_mode, &opts.params, resolved.cfa_geometry)?`; its output is byte-identical (the calibrated-export tests prove it). In the run: `let inputs = resolve_frame_inputs(&conn, id, cfg.calibration.flat_norm)?;` gives `inputs.flat` (`ResolvedMaster { path: String, .. }`) and `inputs.cfa_geometry`. The divisor is `flat_norm_divisor_cached(rc.memo.divisors_mut(), &m.path, &scratch, cfg.calibration.flat_norm_mode, &cfg.calibration.params, inputs.cfa_geometry)?.global_value()` when `cfg.calibration.flat_norm`, else `1.0` (the generator's `Global(1.0)` arm). Check the field names on `CalibratedLightOptions` (`export/models.rs:~320`). Then call `flat_corner_ratio(Path::new(&m.path), &scratch, divisor)`. Keep the smallest `V`. A flat whose ratio fails: `warn!(path, error, "flat corner ratio unreadable; the pedestal warning omits it")` and skip it.
   4. One `warn!`:
      ```rust
             tracing::warn!(
@@ -2639,13 +2678,13 @@ pub fn flat_corner_ratio(flat_path: &Path, scratch_dir: &Path, divisor: f64) -> 
             );
      ```
      and `rc.warnings.push(pedestal_run_sentence(&group.key, tally.frame_ids.len(), &offset_gain_text(&tally), corner))`.
-  Read the stage's real variable names (`cfg`, `scratch`, `conn`) at `run.rs:2672-2810` before editing. A project subject never reaches `stage_calibrate` (it goes to `stage_prepare`), and neither does an attested set; do not add a check for them.
+  Read the stage's real variable names (`cfg`, `scratch`) at `run.rs:2672-2810` before editing. Stage 1 has no `conn` binding: take one with `let db_handle = db(&rc.ctx)?; let conn = db_handle.conn();` as `resolve_calibrate_job` does (~1780), scoped so it is dropped before the stage's fan-out. A project subject never reaches `stage_calibrate` (it goes to `stage_prepare`), and neither does an attested set; do not add a check for them.
 
 - [ ] **Step 5: Run the tests and the gate.** `git diff --exit-code src/types`.
 
 - [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/calibration_library/light_cal.rs crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/api/lights.rs
+git add crates/athenaeum-core/src/calibration_library/light_cal.rs crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/api/lights.rs crates/athenaeum-core/src/export/calibrated_generator.rs
 git commit -m "feat(stacking): the run names flat-only groups and their flat's corner ratio (pedestal warning, advisory)"
 ```
 
@@ -2739,9 +2778,10 @@ Spec §11.2 (the harness rows checkpoint A needs), §11.3 (the scale-normalized 
 - [ ] **Step 2: `halo_profile.py`.**
   - `--search R` (default 0): before reading rings, refine `(x, y)` in each master by the centroid of the 7 × 7 box around the brightest pixel of a 5 × 5 box-smoothed copy within `R` px. Print the refined position per master.
   - `--k K_LN,K_NOLN,K_EXT` (default `1,1,1`) and `--bg0 BG` (default: the no-LN master's own background annulus median): print each ring excess both raw (today's definition) and scale-normalized, `(median(X/k) − background(X/k)) / BG` (L-21).
+  - `--labels A,B,C` (default `LN,noLN,external`) names the three slots in the output, so a table built from it can read `main` instead of "external" (review M-4).
   - Keep today's output lines and add the new ones after them, so the math review's numbers still reproduce.
 
-- [ ] **Step 3: `master_phot.py`.** Add `--y0` (default 0; today it is fixed at 0) and `--noise`. With `--noise` it runs `measure_probe` on the master (`.superpowers/target-acc/release/examples/measure_probe <master>`, the same binary `tier1-compare.py` uses), reads the plane's `.noise`, and adds `noise`, `k` (`1 / ratio_ref_over_master`) and `snr` (`k / noise`) to its JSON line (P-17).
+- [ ] **Step 3: `master_phot.py`.** Make its last three positionals (`summ key dec`: the run summary, group key and the audit's decomposition CSV) optional, and print the `predicted` block only when all three are given — Horse C11 has no decomposition CSV (review I-5). Add `--y0` (default 0; today it is fixed at 0) and `--noise`. With `--noise` it runs `measure_probe` on the master (`.superpowers/target-acc/release/examples/measure_probe <master>`, the same binary `tier1-compare.py` uses), reads the plane's `.noise`, and adds `noise`, `k` (`1 / ratio_ref_over_master`) and `snr` (`k / noise`) to its JSON line (P-17).
 
 - [ ] **Step 4: `nebula_boxes.py`** (new, numpy + `imgcmp.read`):
 ```
@@ -2757,14 +2797,23 @@ nebula_boxes.py <boxes.json> <control.fits> <master>... [--k K ...] [--size 100]
 - [ ] **Step 5: Horse C11 preparation** (spec §11.4). `horse-c11-prep.sh <acc-dir> <port>`:
   1. refuses unless `<acc-dir>` is under `~/.athenaeum-acc/`;
   2. builds the copy with `acceptance/prepare-catalog.sh <acc-dir>` (the dev catalog, read-only `.backup`);
-  3. on the COPY only: `sqlite3 <acc-dir>/athenaeum.db "DELETE FROM calibration_set_to_frames WHERE calibration_type = 'Dark' AND calibration_set_id IN (1242, 1315) AND source_type = 'frame' AND source_id IN (SELECT f.id FROM frames f JOIN frames_set_members m ON … WHERE m.frames_set_id = 182)"` — read the real membership table and column names from `db/schema.rs` first and print the deleted count;
+  3. on the COPY only (review M-2: lights reach a set through `session_members → sessions → imaging_nights`):
+     ```sql
+     DELETE FROM calibration_set_to_frames
+     WHERE source_type = 'frame' AND calibration_type = 'Dark' AND calibration_set_id IN (1242, 1315)
+       AND source_id IN (SELECT sm.frame_id FROM session_members sm
+                         JOIN sessions s ON s.id = sm.session_id
+                         JOIN imaging_nights n ON n.id = s.imaging_night_id
+                         WHERE n.frames_set_id = 182);
+     ```
+     Run it with `sqlite3 <acc-dir>/athenaeum.db`, then print `changes()`. Confirm the column names against `db/schema.rs` (~319–402, ~1067) first;
   4. prints the next steps.
 
   `horse-c11-config.py <run-8.json> <acc-dir/athenaeum.db>` prints the `set_stacking_config` JSON body: `{"setId": 182, "config": <run-8.json's config>, "excludedFrameIds": [<set 182 lights whose FILTER is R or B>]}`. The driver then sends it with `acceptance/api.sh set_stacking_config '<json>' <port>`. Pin the reference with the `set_frame_set_reference` command (read its arguments from `crates/athenaeum-web/src/routes/registration.rs`) to frame 10666. For the optional fixed-1024 run, the script takes `--fixed-1024` and sets `normalization.local.scaleMode = "fixed"`, `scale = 1024`.
 
   Never read or write the production catalog; never touch the dev catalog except through `prepare-catalog.sh`'s read-only backup.
 
-- [ ] **Step 6: Self-checks.** Run each script's `--help`/usage. Run `tier1-compare.py --ln-grids` on an existing tree against itself, and `nebula_boxes.py` on two copies of one master (every difference 0). Run `horse-c11-prep.sh` on a scratch `~/.athenaeum-acc/horse-c11-dry` with the server stopped, report the deleted-link count, then delete the scratch dir.
+- [ ] **Step 6: Self-checks.** Run each script's `--help`/usage. Run `tier1-compare.py --ln-grids` on an existing tree against itself, and `nebula_boxes.py` on two copies of one master (every difference 0). Run `master_phot.py` once with only its first four positionals plus `--noise` on an existing master (review I-5). Run `horse-c11-prep.sh` on a scratch `~/.athenaeum-acc/horse-c11-dry` with the server stopped, report the deleted-link count, then delete the scratch dir.
 
 - [ ] **Step 7: Commit**
 ```bash
@@ -2792,7 +2841,7 @@ Spec §11.1 (checkpoint A), §11.3 (the rows), §11.4, §11.5 (the warning on re
 - [ ] `tier1-compare.py --ln-grids ~/.athenaeum-acc/tierA-lnA ~/.athenaeum-acc/tierA-lnA-main` → **`A and global_scale bit-identical: N / N` is a gate** (spec §1.6: set 204 resolves to 1024 at this head). The B move is reported.
 
 **Run B** (the 6b-3 project on the 4480 × 5760 grid):
-- [ ] On the 6b-3 run-B tree (`~/.athenaeum-acc/acc6b3-runB`, its catalog copy and project id as recorded in `docs/stacking/README.md`'s 6b-3 acceptance paragraph): the branch's `project-run.sh`, then the same on a `main` worktree build, back to back.
+- [ ] On the 6b-3 run-B tree (`~/.athenaeum-acc/acc6b3-runB`; the tree name is in the audit `2026-10-04-ln-scale-psf-width-audit.md` §1 and the 6b-3 acceptance record; read the project id from the copy's own catalog, read-only — review M-3): the branch's `project-run.sh`, then the same on a `main` worktree build, back to back.
 - [ ] `grid-report.py <tree> <project> --ln-truth` on both; `tier1-compare.py --ln-grids` between the two trees (a bit-identical `A` gate, as for set 204).
 
 **Horse C11** (L + G, rows on G):
@@ -2808,7 +2857,7 @@ Spec §11.1 (checkpoint A), §11.3 (the rows), §11.4, §11.5 (the warning on re
 - [ ] Before reading ANY LN master: choose the three IC 434 rim boxes and three background boxes (100 × 100 px, background within 1500 px, off the nebula) on (b)'s G master, write `boxes.json`, and commit it under `docs/superpowers/research/ln-model-fixes/`.
 - [ ] Rows on the G masters:
   - `master_phot.py --noise` for each arm (gives `k`, σ, SNR);
-  - `halo_profile.py (a) (b) (c) 7556 3212 --search 40 --k k_a,k_b,k_c` → rings at 60–70 / 80–90 / 100–120 px;
+  - `halo_profile.py (a) (b) (c) 7556 3212 --search 40 --k k_a,k_b,k_c --labels branch-LN,branch-noLN,main-LN` → rings at 60–70 / 80–90 / 100–120 px;
   - `nebula_boxes.py boxes.json (b) (a) (c) --k …`;
   - the B-node row: every member sidecar of (a), the B nodes within 600 px of the star versus the mean of their 8 neighbours (a short numpy read of the `.athln` with Task 8's reader);
   - `scale_pairs.py <the external log> 28516 29100 <(a)'s run json> G` → the ERP-slope row.
@@ -2863,14 +2912,17 @@ Spec §3 steps 1–4, L-11, L-12, L-14; P-13, P-18. Pure functions and types; no
     /// square `fit_one` sampled — independent of the fitted model.
     #[test]
     fn peak5_is_the_mean_of_the_five_brightest_pixels_in_the_fit_region() {
-        // A 64 × 64 plane at 0.1, one Gaussian star (FWHM 3 px, amplitude 0.4)
-        // at (32.3, 31.7), plus five pixels set by hand inside the star's
-        // sampling square to 0.61, 0.62, 0.63, 0.64, 0.65 (any pixels within
-        // 3 px of the centre). Fit with `fit_stars` from one seed at the star.
-        // Assert fits.len() == 1 and (fits[0].peak5 - 0.63).abs() < 1e-6.
+        // Review I-4: plant nothing (hand-set outliers can make `accept` refuse the fit).
+        // A 64 × 64 plane at 0.1, one rendered Gaussian star (FWHM 3 px, amplitude 0.4,
+        // no noise) at (32.3, 31.7). Fit with `fit_stars` from one seed at the star.
+        // expected = the mean of the five largest pixels within ±3 px of (32, 32):
+        // every square `fit_one` can sample has r ≥ 3, and a FWHM-3 star's five
+        // brightest pixels lie within 1.5 px of its centre, so the set is the same
+        // whatever r it grew to.
+        // Assert fits.len() == 1 and (fits[0].peak5 - expected).abs() < 1e-9.
     }
 ```
-(Write it with the module's existing plane/seed helpers; keep the five hand-set pixels as the five brightest.)
+(Write it with the module's existing plane/seed helpers.)
 
 `background.rs` `mod tests`:
 ```rust
@@ -3153,10 +3205,13 @@ fn saturated(side: &SelectionSide<'_>, f: &StarFit, sel: &LnStarSelection) -> bo
 
 /// L-12 with P-18: no noise information (σ ≤ 0 or non-finite) is no cut.
 fn snr_passes(side: &SelectionSide<'_>, f: &StarFit, sel: &LnStarSelection) -> bool {
+    if sel.min_peak_snr == f64::NEG_INFINITY {
+        return true; // OFF means off, even for a fit with no peak (review M-6)
+    }
     let signal = f.peak5 - f.background;
     let sigma = side.noise.sigma_local(f.x, f.y);
     if !(sigma.is_finite() && sigma > 0.0) {
-        return signal > 0.0 || sel.min_peak_snr == f64::NEG_INFINITY;
+        return signal > 0.0;
     }
     signal / sigma >= sel.min_peak_snr
 }
@@ -3363,6 +3418,8 @@ and pass `&inputs` to all four scale calls (the two in `fall_back_to_detection` 
 
   P-13 for `ln/mod.rs`'s tests: run them. Set `star_selection: LnStarSelection::OFF` in a test's `cfg`, with the comment, only if it fails and its subject is not the selection: `the_scale_event_carries_…`, `the_written_sidecar_carries_…`, `masked_ln_coefficients_are_finite_…`, `masked_probe`. If `masked_ln_recovers_a_half_covered_members_scale` or `masked_ln_recovers_the_half_covered_scale_from_measured_seeds` fails, report it before changing it: their subject is the scale.
 
+  P-13 for `run.rs`'s LN tests (review C-3): every test built on `seed_ln_star_group` (and Tasks 2/3's run tests) that fails because a frame dropped under 20 matches sets `cfg.normalization.local.star_selection = LnStarSelection::OFF` with the P-13 comment. Name each one in the report. Never change a count or a tolerance instead.
+
 - [ ] **Step 6: Goldens, TS, probes.** Register `LnStarSelection` in `ts_export.rs` before `LocalNormalizationConfig`; regenerate; `tsc` (add `starSelection` to any TS literal it flags — the Task 4 test's `withLocal` helper). Update `stage_hashes_are_pinned_to_golden_literals` (`ln_*` only), `config_hash_is_canonical_and_pinned` and `serde_names_follow_the_spec` with `// 2026-10-05 LN model fixes Task 11: starSelection + lnModelVersion 3`. The probes: pass `LnStarSelection::default()` and sides built from `TileNoise::from_table` (Task 15 adds the arms).
 
 - [ ] **Step 7: Gate; commit.**
@@ -3423,16 +3480,21 @@ Spec §4.1, L-13, P-8, P-10. Pure functions and types; nothing is wired, no conf
     /// 4.5 px, target = 0.8 × reference: z = 1.25 on every star.
     #[test]
     fn a_common_circle_reads_the_same_ratio_whatever_the_seeing() {
-        // 30 isolated Gaussian stars on each plane (no noise). F = 4.5, r = 3F.
+        // 30 isolated Gaussian stars on each plane (no noise). F = 4.5, r = 3F, the
+        // annulus reaches 8F = 36 px: use a 768 × 512 plane, stars on a 6 × 5 lattice
+        // with 110-px spacing and a ≥ 60-px border (review M-7).
         // Median of flux_R / flux_T within 1e-3 of 1.25.
     }
 
-    /// The growth-curve correction recovers the light beyond 2F on broad
-    /// wings: Moffat β = 2.5, FWHM 3 px vs 4.5 px, scale 1.25.
+    /// The growth-curve correction recovers the light beyond 2F: Moffat
+    /// β = 4, FWHM 3 px vs 4.5 px, scale 1.25. Closed form (review C-2):
+    /// z(2F) misses by 1.34 %; c · z(2F) = 1.25 × 1.00011. (At β = 2.5 the
+    /// wings beyond 5F leave +0.37 %, so that profile cannot meet 0.3 %.)
     #[test]
     fn the_growth_correction_recovers_the_light_beyond_two_fwhm() {
-        // z at 2F alone misses 1.25 by more than 1 %; c · z(2F) is within 0.3 %,
-        // with c = median over stars of (f_R(5F)/f_R(2F)) / (f_T(5F)/f_T(2F)).
+        // Same lattice as above. z at 2F alone misses 1.25 by more than 1 %;
+        // c · z(2F) is within 0.3 %, with c = median over stars of
+        // (f_R(5F)/f_R(2F)) / (f_T(5F)/f_T(2F)).
     }
 ```
 Write each body fully.
@@ -3732,7 +3794,7 @@ Spec §4.1, §4.2, §6 (`fluxEstimator`, `aperture`), §7 (aperture in the subtr
 
 - [ ] **Step 6: The run and provenance.** `"ln scale resolved"` gains `ln_flux_estimator = ln_cfg.flux_estimator.as_str(),`. `SummaryGroup` gains `ln_flux_estimator` and `ln_aperture`; the push site fills `Some(ln_cfg.flux_estimator)` and `(ln_cfg.flux_estimator == CommonAperture).then_some(ln_cfg.aperture)` when LN ran for the group, `None` otherwise.
 
-- [ ] **Step 7: Goldens, TS, probes.** Register `LnFluxEstimator` and `LnAperture` in `ts_export.rs` before `LocalNormalizationConfig`. Regenerate; `tsc`. Goldens as in Task 11, with a dated comment naming Task 13. The probes compile with `estimator: PsfSignal`. Run the gate.
+- [ ] **Step 7: Goldens, TS, probes.** Register `LnFluxEstimator` and `LnAperture` in `ts_export.rs` before `LocalNormalizationConfig`. Regenerate; `tsc`. Add `fluxEstimator: 'psfSignal', aperture: 'fwhm3'` to `stageSummary.test.ts`'s `withLocal` helper (review M-10). Goldens as in Task 11, with a dated comment naming Task 13. The probes compile with `estimator: PsfSignal`. Run the gate.
 
 - [ ] **Step 8: Commit**
 ```bash
@@ -4005,4 +4067,5 @@ The full core suite (`cargo test -p athenaeum-core --all-targets`) runs once mor
 
 **Decisions this plan takes that the owner should see:**
 - **P-1 and P-20** (the membrane penalty and the gradient pin) — confirmation requested.
+- P-21 (a rounding-level residual MAD counts as σ_e ≤ 0; review C-1).
 - P-2 (how the halo/feature pins are read), P-5 (two extra `PlanGroup` fields), P-6 (the B move in `tier1-compare.py`), P-11 (where the pedestal `warn!` is emitted), P-13 (OFF for pre-selection synthetic tests), P-19 (the spec's gap sentence is loose) — writer's decisions, open to the reviewer.

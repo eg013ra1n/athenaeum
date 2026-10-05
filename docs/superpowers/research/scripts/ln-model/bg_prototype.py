@@ -114,7 +114,10 @@ def own(g, tt):
         e = v[allid] - evalc(g, c, x[allid], y[allid])
         ea = v[acc] - evalc(g, c, x[acc], y[acc])
         se = MADS * np.median(np.abs(ea - np.median(ea)))
-        acc = allid[np.abs(e) <= KS * se] if se > 0 else allid
+        # plan ruling P-21: a residual MAD at the f32 rounding level of the
+        # tile values is no noise at all — treated as σ_e ≤ 0.
+        floor = 1e-6 * abs(np.median(v[acc]))
+        acc = allid[np.abs(e) <= KS * se] if se > floor else allid
         (c,) = fit(g, x, y, [v], acc)
     cells = np.bincount(g.cell(x[acc], y[acc]), minlength=(g.nx - 3) * (g.ny - 3))
     assert (cells >= FLOOR).any()
