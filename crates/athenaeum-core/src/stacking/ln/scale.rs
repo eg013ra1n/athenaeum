@@ -169,6 +169,12 @@ pub struct ScaleResult {
     /// The growth-curve correction `c` multiplied into every ratio; `Some`
     /// only for `LnAperture::GrowthCurve` (1.0 when no pair qualified, P-10).
     pub growth_factor: Option<f64>,
+    /// Spec §10 / L-26, log-only: the median over the ratio's pairs of the
+    /// larger of the two sides' fractions of present sky-annulus pixels above
+    /// the annulus median + 3 sigma. `Some` exactly when `aperture_px` is;
+    /// `Some(NaN)` when no pair had a usable sigma on both sides. It moves
+    /// no scale and no hash.
+    pub annulus_crowding: Option<f64>,
     /// Perf tier A Task 0: where this call's own wall time went — see
     /// [`ScaleTimings`]'s own doc.
     pub timings: ScaleTimings,
@@ -196,6 +202,8 @@ impl PartialEq for ScaleResult {
             && self.aperture_px == other.aperture_px
             && self.common_fwhm_px == other.common_fwhm_px
             && self.growth_factor == other.growth_factor
+            // Bit-equal so a NaN ("no usable sigma") equals itself.
+            && self.annulus_crowding.map(f64::to_bits) == other.annulus_crowding.map(f64::to_bits)
     }
 }
 
@@ -431,6 +439,7 @@ struct MeasuredSample {
     aperture_px: Option<f64>,
     common_fwhm_px: Option<f64>,
     growth_factor: Option<f64>,
+    annulus_crowding: Option<f64>,
 }
 
 /// Selection, then the flux ratios of the kept pairs (spec §3, L-11).
@@ -455,6 +464,7 @@ fn measured_sample(
     )?;
     let mut sample = RatioSample::default();
     let (mut aperture_px, mut common_fwhm_px, mut growth_factor) = (None, None, None);
+    let mut annulus_crowding = None;
     match inputs.estimator {
         LnFluxEstimator::PsfSignal => {
             for &(r, t) in &c.ranked {
@@ -506,17 +516,40 @@ fn measured_sample(
             };
             let mut scratch = Vec::new();
             let mut kept_pairs = Vec::new();
+            let mut crowding: Vec<f64> = Vec::new();
             for &(r, t) in &c.ranked {
                 if sample.ratios.len() >= c.quota {
                     break;
                 }
                 let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
-                let (Some(fr), Some(ft)) = (
-                    aperture::circle_flux(&rs, rf.x, rf.y, radius, sky_in, sky_out, &mut scratch),
-                    aperture::circle_flux(&ts, tf.x, tf.y, radius, sky_in, sky_out, &mut scratch),
+                let (Some((fr, cr)), Some((ft, ct))) = (
+                    aperture::circle_flux_crowding(
+                        &rs,
+                        rf.x,
+                        rf.y,
+                        radius,
+                        sky_in,
+                        sky_out,
+                        inputs.reference.noise.sigma_local(rf.x, rf.y),
+                        &mut scratch,
+                    ),
+                    aperture::circle_flux_crowding(
+                        &ts,
+                        tf.x,
+                        tf.y,
+                        radius,
+                        sky_in,
+                        sky_out,
+                        inputs.target.noise.sigma_local(tf.x, tf.y),
+                        &mut scratch,
+                    ),
                 ) else {
                     continue;
                 };
+                // L-26: a side without a usable sigma leaves its pair out.
+                if cr.is_finite() && ct.is_finite() {
+                    crowding.push(cr.max(ct));
+                }
                 sample.ratios.push(fr / ft);
                 sample.positions.push((rf.x, rf.y));
                 sample.ref_idx.push(r);
@@ -575,6 +608,11 @@ fn measured_sample(
             }
             aperture_px = Some(radius);
             common_fwhm_px = Some(f);
+            annulus_crowding = Some(if crowding.is_empty() {
+                f64::NAN
+            } else {
+                median_f64(&mut crowding)
+            });
         }
     }
     if sample.ratios.len() < MIN_MATCHES {
@@ -590,6 +628,7 @@ fn measured_sample(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        annulus_crowding,
     })
 }
 
@@ -609,6 +648,7 @@ struct RelativeScaleLog {
     aperture_px: Option<f64>,
     common_fwhm_px: Option<f64>,
     growth_factor: Option<f64>,
+    annulus_crowding: Option<f64>,
 }
 
 /// One event per scale; tracing has no optional field, so the common
@@ -630,6 +670,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_aperture_px = aperture_px,
             ln_common_fwhm_px = common_fwhm_px,
             ln_growth_factor = growth_factor,
+            ln_annulus_crowding = e.annulus_crowding.unwrap_or(f64::NAN),
             "ln relative scale"
         ),
         (Some(aperture_px), Some(common_fwhm_px), None) => debug!(
@@ -646,6 +687,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_flux_estimator = e.estimator.as_str(),
             ln_aperture_px = aperture_px,
             ln_common_fwhm_px = common_fwhm_px,
+            ln_annulus_crowding = e.annulus_crowding.unwrap_or(f64::NAN),
             "ln relative scale"
         ),
         _ => debug!(
@@ -1147,6 +1189,7 @@ fn relative_scale_against_core(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        annulus_crowding,
     } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
@@ -1173,6 +1216,7 @@ fn relative_scale_against_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            annulus_crowding,
         },
     );
     let diag = diag_from_sample(&sample, &r.kept);
@@ -1191,6 +1235,7 @@ fn relative_scale_against_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,
                 refine_ms: 0,
@@ -1631,6 +1676,7 @@ fn relative_scale_from_seeds_core(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        annulus_crowding,
     } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
     // The pre-selection valid-pair count, as `measured_sample` defines it.
     breakdown.matched = matches;
@@ -1659,6 +1705,7 @@ fn relative_scale_from_seeds_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            annulus_crowding,
         },
     );
     let diag = diag_from_sample(&sample, &r.kept);
@@ -1677,6 +1724,7 @@ fn relative_scale_from_seeds_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,
                 refine_ms: 0,
@@ -3544,6 +3592,41 @@ mod tests {
         assert_eq!(r.growth_factor, None);
         assert_eq!(psf.aperture_px, None);
         assert_eq!(psf.common_fwhm_px, None);
+    }
+
+    /// L-26: the crowding diagnostic exists exactly when the common aperture
+    /// ran, is a fraction in [0, 1], and moves no scale (F1's pinned tests,
+    /// e.g. `the_common_aperture_scale_is_independent_of_seeing`, run
+    /// unchanged beside it).
+    #[test]
+    fn the_annulus_crowding_is_present_only_under_the_common_aperture() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let run = |estimator: LnFluxEstimator| {
+            let mut inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+            inputs.estimator = estimator;
+            inputs.aperture = LnAperture::Fwhm2;
+            relative_scale_against(
+                &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+            )
+            .expect("the field must match")
+        };
+        let psf = run(LnFluxEstimator::PsfSignal);
+        assert_eq!(psf.annulus_crowding, None);
+        let f1 = run(LnFluxEstimator::CommonAperture);
+        let c = f1.annulus_crowding.expect("the common aperture reports it");
+        assert!(f1.aperture_px.is_some());
+        assert!((0.0..=1.0).contains(&c), "crowding {c}");
+        // A second call is bit-identical, the diagnostic included.
+        assert_eq!(run(LnFluxEstimator::CommonAperture), f1);
     }
 
     /// P-10: no pair has its 5F circle on both frames -> c = 1, and the scale

@@ -35,7 +35,9 @@
 //! default selection, common aperture at 2F / 3F / growth curve). Each arm
 //! reports `s`, `sigma`, `matches`, `selected`, `rule`, `refFramesSaturated`
 //! (pairs only the reference-frames saturation mask dropped, L-23),
-//! `aperturePx`, `commonFwhmPx`, `growth` and `terciles` (the RCR location of
+//! `aperturePx`, `commonFwhmPx`, `growth`, `annulusCrowding` (the log-only L-26
+//! diagnostic; `null` under PSF signal, NaN-as-null when no pair had a usable
+//! sigma) and `terciles` (the RCR location of
 //! the ratios of the bright / middle / faint third by reference flux).
 //!
 //! `--ref-saturation <fits>` reads the reference-frames saturation map (L-23;
@@ -1250,6 +1252,7 @@ fn scale_arms(
                 "aperturePx": r.aperture_px,
                 "commonFwhmPx": r.common_fwhm_px,
                 "growth": r.growth_factor,
+                "annulusCrowding": r.annulus_crowding,
                 "terciles": terciles(&diag),
             }),
             Err(e) => {

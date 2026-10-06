@@ -98,6 +98,51 @@ pub fn circle_flux(
     sky_outer: f64,
     scratch: &mut Vec<f32>,
 ) -> Option<f64> {
+    circle_flux_body(
+        side,
+        cx,
+        cy,
+        radius,
+        sky_inner,
+        sky_outer,
+        f64::NAN,
+        scratch,
+    )
+    .map(|(flux, _)| flux)
+}
+
+/// [`circle_flux`] plus the annulus-crowding fraction (spec §10, L-26): the
+/// share of the PRESENT annulus pixels above the annulus median plus
+/// `3 · sigma`. The flux is bit-identical to `circle_flux`'s. The fraction is
+/// `NaN` when `sigma` is not finite or `<= 0` (no noise reading, no
+/// fraction); the caller leaves that side's pair out.
+#[allow(clippy::too_many_arguments)]
+pub fn circle_flux_crowding(
+    side: &ApertureSide<'_>,
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    sky_inner: f64,
+    sky_outer: f64,
+    sigma: f64,
+    scratch: &mut Vec<f32>,
+) -> Option<(f64, f64)> {
+    circle_flux_body(side, cx, cy, radius, sky_inner, sky_outer, sigma, scratch)
+}
+
+/// The one pixel loop behind both entry points. `sigma` is read only after
+/// the median, over the annulus values already in `scratch`.
+#[allow(clippy::too_many_arguments)]
+fn circle_flux_body(
+    side: &ApertureSide<'_>,
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    sky_inner: f64,
+    sky_outer: f64,
+    sigma: f64,
+    scratch: &mut Vec<f32>,
+) -> Option<(f64, f64)> {
     let w = side.present.width();
     debug_assert_eq!(side.plane.len(), w * side.present.height());
     let reach = sky_outer.max(radius).ceil() as isize;
@@ -134,7 +179,16 @@ pub fn circle_flux(
     }
     let sky = median_in_place(scratch) as f64;
     let flux = sum - n as f64 * sky;
-    (flux > 0.0).then_some(flux)
+    if flux <= 0.0 {
+        return None;
+    }
+    let crowding = if sigma.is_finite() && sigma > 0.0 {
+        let cut = sky + 3.0 * sigma;
+        scratch.iter().filter(|&&v| v as f64 > cut).count() as f64 / scratch.len() as f64
+    } else {
+        f64::NAN
+    };
+    Some((flux, crowding))
 }
 
 #[cfg(test)]
@@ -237,6 +291,116 @@ mod tests {
         let want = flux * (1.0 - (-r * r / (2.0 * sigma * sigma)).exp());
         let rel = (got - want).abs() / want;
         assert!(rel < 0.002, "got {got}, want {want}, rel {rel}");
+    }
+
+    /// The annulus pixels (`24 <= d <= 32` around the star) read straight off
+    /// the plane, for the independent expected counts below.
+    fn annulus_values(plane: &[f32], w: usize, cx: f64, cy: f64) -> Vec<f32> {
+        let mut v = Vec::new();
+        for y in 0..plane.len() / w {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+                let d2 = dx * dx + dy * dy;
+                if (24.0 * 24.0..=32.0 * 32.0).contains(&d2) {
+                    v.push(plane[y * w + x]);
+                }
+            }
+        }
+        v
+    }
+
+    /// L-26: sky plus noise only, the annulus reads (near) nothing above
+    /// median + 3 sigma; a noiseless flat sky reads exactly 0.
+    #[test]
+    fn an_empty_annulus_reads_a_crowding_near_zero() {
+        let (plane, cx, cy, _) = star_plane();
+        let mask = FiniteMask::all(128, 128);
+        let mut scratch = Vec::new();
+        let side = ApertureSide {
+            plane: &plane,
+            present: &mask,
+        };
+        let (flat_flux, flat) =
+            circle_flux_crowding(&side, cx, cy, 12.0, 24.0, 32.0, 0.01, &mut scratch)
+                .expect("valid circle");
+        assert_eq!(flat, 0.0, "a noiseless flat sky has nothing above 3 sigma");
+        // Deterministic ~Gaussian noise (sum of 12 uniforms), sigma 0.01.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut uniform = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let noisy: Vec<f32> = plane
+            .iter()
+            .map(|&v| v + (0.01 * ((0..12).map(|_| uniform()).sum::<f64>() - 6.0)) as f32)
+            .collect();
+        let side = ApertureSide {
+            plane: &noisy,
+            present: &mask,
+        };
+        let (flux, noisy_crowding) =
+            circle_flux_crowding(&side, cx, cy, 12.0, 24.0, 32.0, 0.01, &mut scratch)
+                .expect("valid circle");
+        assert!(noisy_crowding < 0.01, "crowding {noisy_crowding}");
+        // The flux is the plain circle_flux's, bit for bit.
+        assert_eq!(
+            flux.to_bits(),
+            circle_flux(&side, cx, cy, 12.0, 24.0, 32.0, &mut scratch)
+                .unwrap()
+                .to_bits()
+        );
+        let side = ApertureSide {
+            plane: &plane,
+            present: &mask,
+        };
+        assert_eq!(
+            flat_flux.to_bits(),
+            circle_flux(&side, cx, cy, 12.0, 24.0, 32.0, &mut scratch)
+                .unwrap()
+                .to_bits()
+        );
+    }
+
+    /// L-26: one neighbour inside the annulus; the fraction is the count of
+    /// its pixels above median + 3 sigma over the present annulus pixels,
+    /// counted here straight off the plane.
+    #[test]
+    fn a_neighbour_in_the_annulus_reads_its_pixel_fraction() {
+        let (cx, cy) = (64.3, 63.6);
+        let plane = render(
+            128,
+            128,
+            &[(cx, cy, 50.0), (cx + 28.0, cy + 3.0, 30.0)],
+            Profile::Gaussian { fwhm: 4.0 },
+        );
+        let mask = FiniteMask::all(128, 128);
+        let side = ApertureSide {
+            plane: &plane,
+            present: &mask,
+        };
+        let sigma = 0.005;
+        let mut scratch = Vec::new();
+        let (_, got) = circle_flux_crowding(&side, cx, cy, 12.0, 24.0, 32.0, sigma, &mut scratch)
+            .expect("valid circle");
+        let mut vals = annulus_values(&plane, 128, cx, cy);
+        let n = vals.len();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = vals[n / 2] as f64;
+        let above = vals
+            .iter()
+            .filter(|&&v| v as f64 > med + 3.0 * sigma)
+            .count();
+        assert!(above > 0, "the neighbour must put pixels above the cut");
+        assert_eq!(got, above as f64 / n as f64);
+        // No usable sigma: no fraction.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let (_, none) =
+                circle_flux_crowding(&side, cx, cy, 12.0, 24.0, 32.0, bad, &mut scratch)
+                    .expect("valid circle");
+            assert!(none.is_nan(), "sigma {bad}");
+        }
     }
 
     #[test]
