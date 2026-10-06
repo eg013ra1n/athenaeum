@@ -361,6 +361,12 @@ pub fn accumulate_reference_saturation(
     height: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> f32 {
+    debug_assert_eq!(map.len(), width * height, "the map is not {width}x{height}");
+    debug_assert_eq!(
+        plane.len(),
+        width * height,
+        "the plane is not {width}x{height}"
+    );
     let m = TileTable::measure(plane, width, height, &CLEANING, pool).plane_max();
     if !(m.is_finite() && m > 0.0) {
         return m;
@@ -397,6 +403,7 @@ pub fn reference_saturation_mask(
     height: usize,
     saturation: f64,
 ) -> SaturationMask {
+    debug_assert_eq!(map.len(), width * height, "the map is not {width}x{height}");
     if !saturation.is_finite() {
         return SaturationMask::empty(width, height);
     }

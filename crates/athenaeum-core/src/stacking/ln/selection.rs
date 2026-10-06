@@ -173,9 +173,14 @@ pub fn rank_candidates(
                 .then(ta.cmp(&tb))
         });
     };
-    // Step 1: a side is saturated when its own plane's test fails OR (L-23)
-    // its reference-frames mask does; the count is the pairs only the mask
-    // dropped (the target side never carries one).
+    // Step 1: a side is saturated when its own plane's test fails; the
+    // reference side also when (L-23) its reference-frames mask does. The
+    // count is the pairs only that mask dropped. A target never carries a
+    // mask, so none can be counted here.
+    debug_assert!(
+        target.frames_saturation.is_none(),
+        "a target side carries no reference-frames saturation mask"
+    );
     let mut ref_frames_saturated = 0usize;
     let mut unsaturated: Vec<(usize, usize)> = pairs
         .iter()
@@ -185,7 +190,7 @@ pub fn rank_candidates(
             if plane_saturated(reference, rf, sel) || plane_saturated(target, tf, sel) {
                 return false;
             }
-            if frames_saturated(reference, rf, sel) || frames_saturated(target, tf, sel) {
+            if frames_saturated(reference, rf, sel) {
                 ref_frames_saturated += 1;
                 return false;
             }

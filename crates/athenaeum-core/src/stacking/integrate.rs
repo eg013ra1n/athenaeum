@@ -671,6 +671,22 @@ pub(crate) struct CoverageOptions {
     pub empty_as_nan: bool,
 }
 
+/// How [`integrate_planes`] reads one frame: its materialized registered
+/// artifact when there is one, else the on-the-fly warp of `path` through
+/// `map`. Shared with the LN reference's saturation map
+/// (`ln::reference::build_reference_saturation`, L-23), which must read
+/// exactly the pixels the reference integrated.
+pub(crate) fn materialized_frame(frame: &StackFrame) -> MaterializedFrame {
+    MaterializedFrame {
+        registered_path: frame.registered_path.clone(),
+        frame_id: Some(frame.frame_id),
+        fallback: RegisteredFrame {
+            path: frame.path.clone(),
+            map: frame.map.clone(),
+        },
+    }
+}
+
 /// The per-plane engine loop shared by [`integrate_group`] and the LN
 /// reference builder (`stacking::ln::reference::build_reference`, M2 Task
 /// 4): for every plane, builds the rejection/output normalization pairs of
@@ -719,22 +735,6 @@ pub(crate) struct CoverageOptions {
 /// [`GroupOutput::output_pairs`] (Task 3's drizzle driver reads them back as
 /// its ruling-R-M3-5 fallback pair). No stats/accumulation/writing beyond
 /// that: the rest of the tail is the caller's job.
-/// How [`integrate_planes`] reads one frame: its materialized registered
-/// artifact when there is one, else the on-the-fly warp of `path` through
-/// `map`. Shared with the LN reference's saturation map
-/// (`ln::reference::build_reference_saturation`, L-23), which must read
-/// exactly the pixels the reference integrated.
-pub(crate) fn materialized_frame(frame: &StackFrame) -> MaterializedFrame {
-    MaterializedFrame {
-        registered_path: frame.registered_path.clone(),
-        frame_id: Some(frame.frame_id),
-        fallback: RegisteredFrame {
-            path: frame.path.clone(),
-            map: frame.map.clone(),
-        },
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate_planes<'g>(
     input: &GroupInput<'_>,

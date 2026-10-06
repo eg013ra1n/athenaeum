@@ -11709,7 +11709,29 @@ fn build_and_write_ln_reference(
 
     // L-23: the reference-frames saturation map, one frame and one channel
     // at a time, written beside the reference before the artifact row
-    // claims the pair.
+    // claims the pair. One tick first, so the Normalize row says what it is
+    // doing instead of keeping the reference's last plane message.
+    emit_event(
+        build_emitter.as_ref(),
+        STACKING_PROGRESS_EVENT,
+        &StackingProgressEvent {
+            run_id: build_run_id,
+            set_id: build_set_id,
+            project_id: build_project_id.clone(),
+            stage: Stage::Normalize,
+            group_key: Some(build_group_key.clone()),
+            current: 0,
+            total: build_total,
+            percent: 0.0,
+            bytes_done: 0,
+            bytes_total: 0,
+            frame_id: None,
+            message: Some(format!(
+                "building the LN reference saturation map from {} frames",
+                built.frames_used.len()
+            )),
+        },
+    );
     let map_start = Instant::now();
     let maps = build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
         if matches!(e, IntegrationError::Cancelled) {
