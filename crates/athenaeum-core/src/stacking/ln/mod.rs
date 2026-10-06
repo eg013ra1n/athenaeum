@@ -2891,13 +2891,17 @@ mod tests {
 
     /// Final review recommendation 2: the masked (project-grid) path at a wide
     /// field (FWHM 10 px, F ~ 10: 6F-8F annuli of 60-80 px) and 420/100
-    /// coverage. The eroded overlap is only ~224 px wide, so most stars'
-    /// annuli leave it and are refused by the presence mask; the scale must
-    /// still recover from the pairs that remain (a refused-nothing run would
-    /// read the NaN-filled strip and miss 1.25). `LnFrameOutcome` carries no
-    /// `selected`, so the refusal itself is read through that recovery.
+    /// coverage. Seeds sit at least `LN_MASK_MARGIN_PX` (48) inside the
+    /// overlap, so every circle is whole, while the 60-80 px annuli cross the
+    /// overlap edge. The aperture's presence mask is the plain overlap (the
+    /// strip outside it is 0.0-filled in masked mode and never read), and an
+    /// annulus cut by one edge keeps more than half its pixels and counts; the
+    /// scale must recover 1.25 from those pairs. A refusal by the half-annulus
+    /// rule needs both overlap edges inside one annulus; this geometry refuses
+    /// only the row at the image's top edge, so the test pins the reading of
+    /// edge-crossing annuli, not a refusal.
     #[test]
-    fn the_common_aperture_refuses_annuli_leaving_the_eroded_overlap_at_a_wide_fwhm() {
+    fn the_common_aperture_reads_annuli_crossing_the_overlap_edge_at_a_wide_fwhm() {
         use crate::resample::Interpolation;
         use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
         let r = masked_probe_fwhm(

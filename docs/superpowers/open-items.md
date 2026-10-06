@@ -289,7 +289,12 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
 - **The PSF fit's background setup** (clipped-median start, region growth).
 - **The β flips in the master FWHM measurement:** `measure_probe`'s `fwhmPx` jumps ±2.6 … 6.7 % when β flips (−6.3 … +6.7 % at checkpoint B); the second-moment read is flat (±0.02 %). A fit whose β differs between two masters is a harness flag, not a reading.
 - **The 2026-09-07 eccentricity audit** (branch `feature/star-detection-fix`, unpushed).
-- **F1 on small or edge-heavy frames.** F1 drops a pair whose circle is not fully present or whose `[6F, 8F]` annulus is under half present, and a member with fewer than 20 valid pairs (`MIN_MATCHES`) is excluded, with no fallback to PSF signal. On 6000 × 4000 frames this costs about 1 % of pairs and F1 still fills its 500-pair quota. On the run tests' 192 × 144 synthetic field it keeps 17 of 24 pairs, so every member is excluded there and those tests pin `psfSignal`. Not yet measured: small sensors, heavy binning, and large dither offsets that shrink the overlap. Measure it there before deciding on a fallback; a per-frame fallback would mix two estimators in one group.
+- **F1 on small or edge-heavy frames.** F1 drops a pair whose circle is not fully present or whose `[6F, 8F]` annulus is under half present, and a member with fewer than 20 valid pairs (`MIN_MATCHES`) is excluded, with no fallback to PSF signal. On 6000 × 4000 frames this costs about 1 % of pairs and F1 still fills its 500-pair quota. On the run tests' 192 × 144 synthetic field it keeps 17 of 24 pairs, so every member is excluded there and those tests pin `psfSignal`. Measured on centre crops of set 204 mono, 12 members, with `ln_scale_probe`:
+  - At 1500 × 1000, F1 keeps exactly as many pairs as PSF signal selects (117–244), and the growth curve reaches its 100 pairs.
+  - At 600 × 400, F1 keeps at most one pair fewer (20–45), with 18–42 growth pairs.
+  - The limiting factor on a small field is the shared star selection, not the aperture rule.
+  - A member excluded for this reason now reads "N of M matched stars fit the common aperture inside the frame (< 20); PSF signal may keep this frame", and the run adds one group warning.
+  - Still not measured: real small sensors, heavy binning, and large dither offsets. A per-frame fallback would mix two estimators in one group.
 
 ### Collab wave 6b-3 — project stacking on the grid (2026-10-03)
 

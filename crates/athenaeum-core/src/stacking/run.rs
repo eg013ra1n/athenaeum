@@ -3344,9 +3344,10 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 }
 
 /// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
-/// masks (a byte per pixel each, together half an f32 plane), a masked copy
-/// of the reference plane (one f32 plane) and its row buffer (about one more
-/// plane): about 2.5 f32 planes, counted as three.
+/// masks (a byte per pixel each, together half an f32 plane). The reference
+/// plane is read in place (`TileTable::restricted`); the masked copy and its
+/// row buffer the original 2.5-plane count included no longer exist, so the
+/// three planes counted here are half a plane of masks plus headroom.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
 /// The payload-only marker of a member that keeps global normalization

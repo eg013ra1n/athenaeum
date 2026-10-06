@@ -474,7 +474,7 @@ pub fn build_reference_saturation(
 
 /// Writes the saturation map beside the reference (L-23):
 /// `ln/<group>/reference-saturation.fits`, float32, the same planar layout
-/// and caller cards (`ATH_STKI`/`ATH_STKG`) [`write_reference_saturation`]
+/// and caller cards (`ATH_STKI`/`ATH_STKG`) [`write_reference`]
 /// gives `reference.fits`, plus the same scanner-skip pair.
 ///
 /// Final review M-1: each plane's mask ([`reference_saturation_mask`] at
