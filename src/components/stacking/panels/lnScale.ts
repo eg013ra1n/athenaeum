@@ -14,7 +14,7 @@ export function resolvedScaleLines(plan: StackingPlan | null | undefined): strin
   if (groups.length === 0) return [];
   const text = (g: (typeof groups)[number]) =>
     `${g.lnScalePx} px${g.lnWidth != null && g.lnHeight != null ? ` (${g.lnWidth} × ${g.lnHeight})` : ''}` +
-    (g.lnScaleEstimated ? ' — estimated, the run confirms it' : '');
+    (g.lnScaleEstimated ? ', estimated — the run confirms it' : '');
   const distinct = new Set(groups.map(text));
   return distinct.size === 1 ? [text(groups[0])] : groups.map((g) => `${g.key}: ${text(g)}`);
 }

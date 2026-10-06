@@ -321,6 +321,8 @@ impl CalibrationMeasurement {
 /// `Some`, including one where no channel could be calibrated at all —
 /// "measured, and `k` is 1" is a real answer, and the caller stores it so
 /// the next run does not pay for the measurement again.
+///
+/// `scale_px` is the RESOLVED LN scale (P-4); `cfg.scale` is not read here.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_seeds_calibration(
     reference: &LnReference,

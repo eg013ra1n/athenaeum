@@ -25,9 +25,12 @@ describe('resolvedScaleLines', () => {
   it('shows one line when every group agrees', () => {
     expect(resolvedScaleLines(planOf([group({}), group({ key: 'b' })]))).toEqual(['1536 px (9576 × 6388)']);
   });
+  it('has nothing to show before any group resolved a scale (the panel hides the block)', () => {
+    expect(resolvedScaleLines(planOf([group({ lnScalePx: null })]))).toEqual([]);
+  });
   it('marks an estimate', () => {
     expect(resolvedScaleLines(planOf([group({ lnScaleEstimated: true })]))).toEqual([
-      '1536 px (9576 × 6388) — estimated, the run confirms it',
+      '1536 px (9576 × 6388), estimated — the run confirms it',
     ]);
   });
   it('lists groups when they differ', () => {

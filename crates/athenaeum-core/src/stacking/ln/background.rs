@@ -57,6 +57,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rayon::prelude::*;
+use tracing::warn;
 
 use super::grid::LnGrid;
 use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
@@ -204,11 +205,21 @@ impl TileTable {
         pool: Option<&Arc<rayon::ThreadPool>>,
         mask: Option<&[bool]>,
     ) -> TileTable {
-        if width == 0
-            || height == 0
-            || plane.len() < width.saturating_mul(height)
-            || mask.is_some_and(|m| m.len() < width * height)
-        {
+        let need = width.saturating_mul(height);
+        let mask_short = mask.is_some_and(|m| m.len() < need);
+        // M-3: a length mismatch is a programming error, not an empty image.
+        if need > 0 && (plane.len() < need || mask_short) {
+            warn!(
+                plane_len = plane.len(),
+                mask_len = mask.map_or(0, <[bool]>::len),
+                expected = need,
+                width,
+                height,
+                "ln tile table: the plane or mask is shorter than width x height; returning an empty table"
+            );
+            debug_assert!(false, "tile table input shorter than {width}x{height}");
+        }
+        if need == 0 || plane.len() < need || mask_short {
             return TileTable {
                 width,
                 height,
@@ -255,6 +266,15 @@ impl TileTable {
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> TileTable {
         let (w, h) = (self.width, self.height);
+        if !self.tiles.is_empty() && (plane.len() < w * h || mask.len() < w * h) {
+            warn!(
+                plane_len = plane.len(),
+                mask_len = mask.len(),
+                expected = w * h,
+                "ln tile table: the plane or mask is shorter than the table's width x height; returning an empty table"
+            );
+            debug_assert!(false, "restricted tile table input shorter than {w}x{h}");
+        }
         if self.tiles.is_empty() || plane.len() < w * h || mask.len() < w * h {
             return TileTable {
                 width: w,

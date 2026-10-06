@@ -257,6 +257,18 @@ pub enum LnError {
     TooFewMatches {
         matches: usize,
     },
+    /// The common aperture (spec §4.1) could not measure [`scale::MIN_MATCHES`]
+    /// pairs: `valid` pairs had a whole circle and a half-present sky annulus
+    /// on both frames out of `matched` valid PSF-signal pairs
+    /// (`fwhm_known = false`: no finite fitted FWHM sized the aperture at
+    /// all). Treated exactly like [`Self::TooFewMatches`] everywhere (seeds
+    /// fall back to detection, the run excludes the frame); only the text
+    /// differs, so the cause is named.
+    CommonApertureShortfall {
+        valid: usize,
+        matched: usize,
+        fwhm_known: bool,
+    },
     Io(std::io::Error),
     Other(String),
     /// Plan 6b-3 D7 (spec §5.6): the member overlaps the LN reference on
@@ -265,6 +277,16 @@ pub enum LnError {
     LowOverlap {
         fraction: f64,
     },
+}
+
+/// Whether a measured-seeds scale failure falls back to detection (warning
+/// and counting once per frame): too few pairs, whether counted as matches or
+/// as whole common apertures. Every other error is the frame's own.
+fn seeds_failure_falls_back(e: &LnError) -> bool {
+    matches!(
+        e,
+        LnError::TooFewMatches { .. } | LnError::CommonApertureShortfall { .. }
+    )
 }
 
 impl std::fmt::Display for LnError {
@@ -277,6 +299,23 @@ impl std::fmt::Display for LnError {
                     scale::MIN_MATCHES
                 )
             }
+            LnError::CommonApertureShortfall {
+                valid,
+                matched,
+                fwhm_known: true,
+            } => write!(
+                f,
+                "local normalization: {valid} of {matched} matched stars fit the common aperture inside the frame (< {}); PSF signal may keep this frame",
+                scale::MIN_MATCHES
+            ),
+            LnError::CommonApertureShortfall {
+                matched,
+                fwhm_known: false,
+                ..
+            } => write!(
+                f,
+                "local normalization: no finite star FWHM among {matched} matched stars to size the common aperture; PSF signal may keep this frame"
+            ),
             LnError::Io(e) => write!(f, "local normalization: I/O error: {e}"),
             LnError::Other(msg) => write!(f, "local normalization: {msg}"),
             LnError::LowOverlap { fraction } => write!(
@@ -293,7 +332,10 @@ impl std::error::Error for LnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             LnError::Io(e) => Some(e),
-            LnError::TooFewMatches { .. } | LnError::Other(_) | LnError::LowOverlap { .. } => None,
+            LnError::TooFewMatches { .. }
+            | LnError::CommonApertureShortfall { .. }
+            | LnError::Other(_)
+            | LnError::LowOverlap { .. } => None,
         }
     }
 }
@@ -732,6 +774,9 @@ impl<'a> LnReferenceForDetection<'a> {
 /// planes, or `None` (the group's calibration was cancelled or could not be
 /// measured at all), reads as `k = 1` — every channel exactly as it was
 /// before this fix round.
+///
+/// `scale_px` is the RESOLVED LN scale (spec 2026-10-04 P-4, `resolve_scale`);
+/// `cfg.scale` and `cfg.scale_mode` are not read here.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
@@ -1158,7 +1203,7 @@ pub fn normalize_frame(
                 ),
             } {
                 Ok(r) => r,
-                Err(LnError::TooFewMatches { .. }) => {
+                Err(e) if seeds_failure_falls_back(&e) => {
                     plane_from_seeds = false;
                     frame_scale_source = "detected";
                     fall_back_to_detection(&mut warned_fallback)?
@@ -2496,6 +2541,39 @@ mod tests {
         star_selection: crate::stacking::integrate::LnStarSelection,
         ref_frames_saturation: Option<Vec<SaturationMask>>,
     ) -> Result<(LnFrameOutcome, LnFrameGrids), LnError> {
+        masked_probe_fwhm(
+            interpolation,
+            ref_cover,
+            from,
+            mode,
+            seeds,
+            estimator,
+            aperture,
+            ramp,
+            nan_cores,
+            star_selection,
+            ref_frames_saturation,
+            4.2,
+        )
+    }
+
+    /// [`masked_probe_try`] with the field's FWHM chosen (final review
+    /// recommendation 2: the common aperture's validity rule at `F > 6 px`).
+    #[allow(clippy::too_many_arguments)]
+    fn masked_probe_fwhm(
+        interpolation: crate::resample::Interpolation,
+        ref_cover: usize,
+        from: usize,
+        mode: LnOverlap,
+        seeds: bool,
+        estimator: crate::stacking::integrate::LnFluxEstimator,
+        aperture: crate::stacking::integrate::LnAperture,
+        ramp: f32,
+        nan_cores: bool,
+        star_selection: crate::stacking::integrate::LnStarSelection,
+        ref_frames_saturation: Option<Vec<SaturationMask>>,
+        fwhm: f64,
+    ) -> Result<(LnFrameOutcome, LnFrameGrids), LnError> {
         use crate::fits_writer::write_fits_f32;
         use crate::geometry::{Linear, PixelMap};
         use crate::stacking::measure::FrameMeasurement;
@@ -2512,7 +2590,7 @@ mod tests {
                 stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
             }
         }
-        let mut field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        let mut field = synthetic_star_field(W, H, &stars, fwhm, 0.002, 11);
         // A sky ramp along x (0.0 = none): the same on both frames, so the
         // truth R = 1.25 T + 0.03 holds, but a fill value taken from the
         // plane's global median no longer matches the local sky.
@@ -2678,7 +2756,10 @@ mod tests {
                     Some(vec![SaturationMask::from_fn(512, 384, |_| true)]),
                 );
                 assert!(
-                    matches!(full, Err(LnError::TooFewMatches { .. })),
+                    matches!(
+                        full,
+                        Err(LnError::TooFewMatches { .. } | LnError::CommonApertureShortfall { .. })
+                    ),
                     "{mode:?} seeds={seeds}: {:?}",
                     full.map(|(o, _)| o.scale)
                 );
@@ -2762,6 +2843,88 @@ mod tests {
             }
         }
         assert!(checked >= 40, "{checked} nodes");
+    }
+
+    /// Final review I-1: the common-aperture shortfall is treated exactly like
+    /// `TooFewMatches` by the seeds path (fall back to detection); nothing
+    /// else is.
+    #[test]
+    fn the_seeds_path_falls_back_for_both_too_few_variants_only() {
+        assert!(seeds_failure_falls_back(&LnError::TooFewMatches { matches: 3 }));
+        assert!(seeds_failure_falls_back(&LnError::CommonApertureShortfall {
+            valid: 3,
+            matched: 24,
+            fwhm_known: true
+        }));
+        assert!(seeds_failure_falls_back(&LnError::CommonApertureShortfall {
+            valid: 0,
+            matched: 24,
+            fwhm_known: false
+        }));
+        assert!(!seeds_failure_falls_back(&LnError::Other("x".into())));
+        assert!(!seeds_failure_falls_back(&LnError::LowOverlap { fraction: 0.1 }));
+    }
+
+    /// Final review I-1: the two shortfall texts name the real cause and stay
+    /// short.
+    #[test]
+    fn the_common_aperture_shortfall_text_names_the_aperture() {
+        let a = LnError::CommonApertureShortfall {
+            valid: 17,
+            matched: 24,
+            fwhm_known: true,
+        }
+        .to_string();
+        assert_eq!(
+            a,
+            "local normalization: 17 of 24 matched stars fit the common aperture inside the frame (< 20); PSF signal may keep this frame"
+        );
+        let b = LnError::CommonApertureShortfall {
+            valid: 0,
+            matched: 24,
+            fwhm_known: false,
+        }
+        .to_string();
+        assert!(b.contains("no finite star FWHM among 24 matched stars"), "{b}");
+        assert!(a.len() < 200 && b.len() < 200);
+    }
+
+    /// Final review recommendation 2: the masked (project-grid) path at a wide
+    /// field (FWHM 10 px, F ~ 10: 6F-8F annuli of 60-80 px) and 420/100
+    /// coverage. The eroded overlap is only ~224 px wide, so most stars'
+    /// annuli leave it and are refused by the presence mask; the scale must
+    /// still recover from the pairs that remain (a refused-nothing run would
+    /// read the NaN-filled strip and miss 1.25). `LnFrameOutcome` carries no
+    /// `selected`, so the refusal itself is read through that recovery.
+    #[test]
+    fn the_common_aperture_refuses_annuli_leaving_the_eroded_overlap_at_a_wide_fwhm() {
+        use crate::resample::Interpolation;
+        use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
+        let r = masked_probe_fwhm(
+            Interpolation::Bilinear,
+            420,
+            100,
+            LnOverlap::Masked,
+            false,
+            LnFluxEstimator::CommonAperture,
+            LnAperture::Fwhm3,
+            0.0,
+            false,
+            LnStarSelection::OFF,
+            None,
+            10.0,
+        );
+        let (outcome, _) = r.expect("a wide-FWHM masked member normalizes");
+        assert!(outcome.matches >= scale::MIN_MATCHES, "matches {}", outcome.matches);
+        println!(
+            "wide masked: scale {} matches {} samples {}",
+            outcome.scale, outcome.matches, outcome.samples
+        );
+        assert!(
+            (outcome.scale - 1.25).abs() < 0.0125,
+            "scale {} at FWHM 10",
+            outcome.scale
+        );
     }
 
     /// F1 through `normalize_frame` (P-8): the masked member (reference

@@ -57,6 +57,10 @@ use crate::stacking::register::DetectionConfig;
 /// local normalization (spec §5.2 ruling: `LnError::TooFewMatches`).
 pub const MIN_MATCHES: usize = 20;
 
+/// Final review I-2: a growth-curve correction formed from fewer pairs than
+/// this is logged with a `warn!` (the value itself is never changed).
+const GROWTH_PAIRS_WARN_BELOW: usize = 5;
+
 /// Ruling R-M4c-9: a pass-1 pairing covering less than this FRACTION of
 /// the TARGET plane's own accepted fits triggers the barycentre second
 /// pass. `0.8` is math §4.3 step 2's "a second pass using barycentres runs
@@ -169,6 +173,10 @@ pub struct ScaleResult {
     /// The growth-curve correction `c` multiplied into every ratio; `Some`
     /// only for `LnAperture::GrowthCurve` (1.0 when no pair qualified, P-10).
     pub growth_factor: Option<f64>,
+    /// Final review I-2, log-only: how many pairs the growth curve's median
+    /// `c` was taken over (up to `aperture::GROWTH_PAIRS`); `Some` exactly
+    /// when `growth_factor` is. It moves no scale and no hash.
+    pub growth_pairs: Option<usize>,
     /// Spec §10 / L-26, log-only: the median over the ratio's pairs of the
     /// larger of the two sides' fractions of present sky-annulus pixels above
     /// the annulus median + 3 sigma. `Some` exactly when `aperture_px` is;
@@ -202,6 +210,7 @@ impl PartialEq for ScaleResult {
             && self.aperture_px == other.aperture_px
             && self.common_fwhm_px == other.common_fwhm_px
             && self.growth_factor == other.growth_factor
+            && self.growth_pairs == other.growth_pairs
             // Bit-equal so a NaN ("no usable sigma") equals itself.
             && self.annulus_crowding.map(f64::to_bits) == other.annulus_crowding.map(f64::to_bits)
     }
@@ -439,6 +448,7 @@ struct MeasuredSample {
     aperture_px: Option<f64>,
     common_fwhm_px: Option<f64>,
     growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
     annulus_crowding: Option<f64>,
 }
 
@@ -464,6 +474,7 @@ fn measured_sample(
     )?;
     let mut sample = RatioSample::default();
     let (mut aperture_px, mut common_fwhm_px, mut growth_factor) = (None, None, None);
+    let mut growth_pairs = None;
     let mut annulus_crowding = None;
     match inputs.estimator {
         LnFluxEstimator::PsfSignal => {
@@ -500,9 +511,14 @@ fn measured_sample(
             if !f.is_finite() {
                 warn!(
                     ln_matches = matches,
+                    ln_selected = 0usize,
                     "ln common aperture: no finite fitted FWHM among the ranked pairs"
                 );
-                return Err(LnError::TooFewMatches { matches: 0 });
+                return Err(LnError::CommonApertureShortfall {
+                    valid: 0,
+                    matched: matches,
+                    fwhm_known: false,
+                });
             }
             let radius = aperture::aperture_multiple(inputs.aperture) * f;
             let (sky_in, sky_out) = (aperture::SKY_INNER_FWHM * f, aperture::SKY_OUTER_FWHM * f);
@@ -562,6 +578,11 @@ fn measured_sample(
                 // 5F circle is valid on both frames; median of the ratio of
                 // the 5F-to-2F flux ratios. RCR is scale-equivariant, so
                 // multiplying every ratio by c equals c times its location.
+                //
+                // M-7 (final review): "the first 100 valid pairs" is read as
+                // the first 100 QUALIFYING pairs — the walk goes past a pair
+                // whose 5F circle is invalid on either frame instead of
+                // counting it. That is the intended reading of spec §4.1.
                 let outer = aperture::GROWTH_OUTER_FWHM * f;
                 let mut cs: Vec<f64> = Vec::new();
                 for &(r, t, fr, ft) in &kept_pairs {
@@ -592,6 +613,18 @@ fn measured_sample(
                         cs.push((f5r / fr) / (f5t / ft));
                     }
                 }
+                // I-2: the sample size is logged; `c` is NOT changed below
+                // the floor (whether to fall back to 1 is the owner's call).
+                let n_growth = cs.len();
+                if n_growth > 0 && n_growth < GROWTH_PAIRS_WARN_BELOW {
+                    warn!(
+                        ln_growth_pairs = n_growth,
+                        ln_growth_factor = median_f64(&mut cs.clone()),
+                        ln_common_fwhm_px = f,
+                        "ln growth curve: few pairs have their outer circle on both frames; the correction rests on them"
+                    );
+                }
+                growth_pairs = Some(n_growth);
                 let growth = if cs.is_empty() {
                     warn!(
                         ln_common_fwhm_px = f,
@@ -616,6 +649,20 @@ fn measured_sample(
         }
     }
     if sample.ratios.len() < MIN_MATCHES {
+        if inputs.estimator == LnFluxEstimator::CommonAperture {
+            // I-1: the aperture's own validity rule dropped the pairs; say so.
+            warn!(
+                ln_matches = matches,
+                ln_selected = sample.ratios.len(),
+                ln_common_fwhm_px = common_fwhm_px.unwrap_or(f64::NAN),
+                "ln common aperture: too few pairs with a whole aperture"
+            );
+            return Err(LnError::CommonApertureShortfall {
+                valid: sample.ratios.len(),
+                matched: matches,
+                fwhm_known: true,
+            });
+        }
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
         });
@@ -628,6 +675,7 @@ fn measured_sample(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        growth_pairs,
         annulus_crowding,
     })
 }
@@ -648,6 +696,7 @@ struct RelativeScaleLog {
     aperture_px: Option<f64>,
     common_fwhm_px: Option<f64>,
     growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
     annulus_crowding: Option<f64>,
 }
 
@@ -670,6 +719,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_aperture_px = aperture_px,
             ln_common_fwhm_px = common_fwhm_px,
             ln_growth_factor = growth_factor,
+            ln_growth_pairs = e.growth_pairs.unwrap_or(0),
             ln_annulus_crowding = e.annulus_crowding.unwrap_or(f64::NAN),
             "ln relative scale"
         ),
@@ -1189,6 +1239,7 @@ fn relative_scale_against_core(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        growth_pairs,
         annulus_crowding,
     } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
 
@@ -1216,6 +1267,7 @@ fn relative_scale_against_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            growth_pairs,
             annulus_crowding,
         },
     );
@@ -1235,6 +1287,7 @@ fn relative_scale_against_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            growth_pairs,
             annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,
@@ -1676,6 +1729,7 @@ fn relative_scale_from_seeds_core(
         aperture_px,
         common_fwhm_px,
         growth_factor,
+        growth_pairs,
         annulus_crowding,
     } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
     // The pre-selection valid-pair count, as `measured_sample` defines it.
@@ -1705,6 +1759,7 @@ fn relative_scale_from_seeds_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            growth_pairs,
             annulus_crowding,
         },
     );
@@ -1724,6 +1779,7 @@ fn relative_scale_from_seeds_core(
             aperture_px,
             common_fwhm_px,
             growth_factor,
+            growth_pairs,
             annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,
@@ -1744,6 +1800,11 @@ fn relative_scale_from_seeds_core(
 /// [`relative_scale_against`] directly against the group's ONE prepared
 /// reference channel instead, so it never re-detects or re-fits the
 /// reference plane per frame (final fix wave, I2).
+///
+/// A PSF-signal TEST/FIXTURE helper (final review M-2): it hard-codes
+/// `LnFluxEstimator::PsfSignal`, and builds its own tile tables. Only this
+/// module's tests and `examples/ln_probe.rs` call it, so it stays `pub` under
+/// this name; production code goes through [`relative_scale_against`].
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale(
     reference: &[f32],
@@ -3693,5 +3754,130 @@ mod tests {
         .expect("the open field must match");
         assert_ne!(open.growth_factor, Some(1.0));
         println!("P-10 open-field growth factor {:?}", open.growth_factor);
+    }
+
+    /// I-1: a target whose presence mask leaves fewer than MIN_MATCHES whole
+    /// apertures reports the aperture shortfall (valid vs matched), not a
+    /// matched-star count.
+    #[test]
+    fn too_few_whole_apertures_report_the_aperture_shortfall() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        // Only a 100 x 100 corner of the target is present: a handful of
+        // whole circles, far under MIN_MATCHES.
+        let present: Vec<bool> = (0..WIDTH * HEIGHT)
+            .map(|k| k % WIDTH < 100 && k / WIDTH < 100)
+            .collect();
+        let tgt_mask = FiniteMask::from_bools(&present, WIDTH, HEIGHT);
+        let ref_mask = FiniteMask::all(WIDTH, HEIGHT);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let mut inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+        inputs.estimator = LnFluxEstimator::CommonAperture;
+        inputs.aperture = LnAperture::GrowthCurve;
+        inputs.reference_present = &ref_mask;
+        inputs.target_present = &tgt_mask;
+        let err = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        )
+        .expect_err("a 100 x 100 corner cannot hold 20 whole apertures");
+        match err {
+            LnError::CommonApertureShortfall {
+                valid,
+                matched,
+                fwhm_known: true,
+            } => {
+                assert!(valid < MIN_MATCHES, "valid {valid}");
+                assert!(matched > valid, "matched {matched} valid {valid}");
+                let text = LnError::CommonApertureShortfall {
+                    valid,
+                    matched,
+                    fwhm_known: true,
+                }
+                .to_string();
+                assert!(text.contains(&format!("{valid} of {matched} matched stars")), "{text}");
+            }
+            other => panic!("expected CommonApertureShortfall, got {other:?}"),
+        }
+        // The PSF-signal path keeps its own variant and text.
+        let mut psf = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+        psf.target_present = &tgt_mask;
+        assert!(relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &psf,
+        )
+        .is_ok());
+    }
+
+    /// I-2: a field where only a few pairs have their 5F circle on both
+    /// frames logs the count and keeps `c` as computed (no fallback to 1).
+    #[test]
+    fn a_growth_curve_over_a_few_pairs_reports_the_count_and_keeps_c() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let stars = star_grid(41);
+        // The P-10 cut on every star but three (rows 0, 3 and 5, column 0):
+        // only those stars keep a 5F circle on the target.
+        let keep = [0usize, 30, 50];
+        let mut present = vec![true; WIDTH * HEIGHT];
+        for (i, &(sx, sy, _)) in stars.iter().enumerate() {
+            if keep.contains(&i) {
+                continue;
+            }
+            for dy in [-14isize, 14] {
+                let row = (sy.round() as isize + dy).clamp(0, HEIGHT as isize - 1) as usize;
+                let (x0, x1) = ((sx - 20.0).max(0.0) as usize, (sx + 20.0) as usize);
+                for x in x0..=x1.min(WIDTH - 1) {
+                    present[row * WIDTH + x] = false;
+                }
+            }
+        }
+        let tgt_mask = FiniteMask::from_bools(&present, WIDTH, HEIGHT);
+        let ref_mask = FiniteMask::all(WIDTH, HEIGHT);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let mut inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+        inputs.estimator = LnFluxEstimator::CommonAperture;
+        inputs.aperture = LnAperture::GrowthCurve;
+        inputs.reference_present = &ref_mask;
+        inputs.target_present = &tgt_mask;
+        let r = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        )
+        .expect("the 2F sample must form");
+        let n = r.growth_pairs.expect("the growth arm reports its pair count");
+        println!("growth pairs {n}, c {:?}", r.growth_factor);
+        assert!((1..5).contains(&n), "growth pairs {n}");
+        assert_ne!(r.growth_factor, Some(1.0), "c is kept as computed");
+        // Not the growth arm: no count.
+        inputs.aperture = LnAperture::Fwhm2;
+        let plain = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        )
+        .unwrap();
+        assert_eq!(plain.growth_pairs, None);
+        // With every pixel present the count is the full sample of 100.
+        let open_inputs = {
+            let mut i = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
+            i.estimator = LnFluxEstimator::CommonAperture;
+            i.aperture = LnAperture::GrowthCurve;
+            i
+        };
+        let open = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &open_inputs,
+        )
+        .unwrap();
+        assert!(open.growth_pairs.unwrap() > 4, "{:?}", open.growth_pairs);
     }
 }

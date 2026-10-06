@@ -1044,7 +1044,7 @@ fn build_ref_saturation(out: &PathBuf, inputs: &[PathBuf], pool: &Arc<rayon::Thr
             serde_json::json!({"frame": path.display().to_string(), "planeMax": plane_max})
         );
     }
-    write_reference_saturation(&maps, w, h, out, &[])
+    write_reference_saturation(&mut maps, w, h, out, &[], f64::INFINITY)
         .unwrap_or_else(|e| die(format!("{}: {e:#}", out.display())));
     println!(
         "{}",
@@ -1252,6 +1252,7 @@ fn scale_arms(
                 "aperturePx": r.aperture_px,
                 "commonFwhmPx": r.common_fwhm_px,
                 "growth": r.growth_factor,
+                "growthPairs": r.growth_pairs,
                 "annulusCrowding": r.annulus_crowding,
                 "terciles": terciles(&diag),
             }),

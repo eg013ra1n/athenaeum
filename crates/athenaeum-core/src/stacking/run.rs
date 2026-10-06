@@ -77,7 +77,7 @@ use crate::stacking::integrate::{
 };
 use crate::stacking::ln::{
     self, build_reference as build_ln_reference, build_reference_saturation, normalize_frame,
-    read_reference, read_reference_saturation_masks, reference_saturation_mask, write_reference,
+    read_reference, read_reference_saturation_masks, write_reference,
     write_reference_saturation, BackgroundModel, LnError, LnFrameGrids, LnReference,
     LnReferenceForDetection, LnScaleSeeds, SaturationMask, TileTable, CLEANING,
 };
@@ -3308,26 +3308,27 @@ fn stage_forces_fresh(rerun_from: Option<Stage>, stage: Stage) -> bool {
 /// boundary (a materially bigger change than a bit-identical drop). No
 /// dead-at-peak buffer was found on the core side; the constant stays 8.
 pub(crate) const MEASURE_PLANES_RESIDENT: u64 = 8;
-/// Planes of one channel resident while `normalize_frame` runs: since Task
-/// 8 it keeps the `RegisteredSource` (its raw read scratch plus f32
-/// scratch) and the `BandPlanes` buffer alive across channels, plus
-/// `clean_plane`'s copy, the detector's ADU-scaled copy and rustafits' own
-/// internal maps during detection — the same shape
-/// `MEASURE_PLANES_RESIDENT` measured at 8 planes of one channel. Amended
-/// (perf tier 1 Task 3, amendment 2026-09-19) after the Task 10 acceptance
-/// run found the analytic 4 undercounted it: on the real OSC set (LDN
-/// 1272, 6248×4176, 16 GB / 10-core Mac) factor 4 admitted 10 Normalize
-/// workers for the OSC group (the pre-plan formula's own 6 did not swap),
-/// and the run swapped — `vm.swapusage` reported 10.4 GB of 11.3 GB used,
-/// per-frame `ln frame normalized` medians for that group rose from base
-/// warp 4.6 s / scale 9.6 s to 14.5 s / 19.3 s, and the whole Normalize
-/// stage took ≈ 19 min against the base's 12.5. Set to 8 to align with
-/// `MEASURE_PLANES_RESIDENT`'s measured value, so a 16 GB machine admits 4
-/// workers instead of 10. Still not directly measured with `/usr/bin/time
-/// -l` this cycle: `ln_probe` builds the group's LN reference through the
-/// banded integration engine before it ever calls `normalize_frame`, and
-/// that reference build dominates the probe's own peak RSS, so the probe
-/// cannot isolate one frame's normalize working set.
+/// Planes of one channel resident while `normalize_frame` runs: the
+/// `RegisteredSource` (its raw read scratch plus f32 scratch) and the
+/// `BandPlanes` buffer kept alive across channels, the detector's ADU-scaled
+/// copy and rustafits' own internal maps during detection, and the
+/// background model's tile tables and fit work — the same shape
+/// `MEASURE_PLANES_RESIDENT` measured at 8 planes of one channel. (The old
+/// `clean_plane` copy no longer exists: the tile-statistic background model
+/// reads the plane in place.)
+///
+/// History: amended to 8 (perf tier 1 Task 3, 2026-09-19) after the Task 10
+/// acceptance run found the analytic 4 undercounted it: on the real OSC set
+/// (LDN 1272, 6248×4176, 16 GB / 10-core Mac) factor 4 admitted 10
+/// Normalize workers for the OSC group and the run swapped (10.4 GB of
+/// 11.3 GB swap used; per-frame `ln frame normalized` medians rose from
+/// 4.6 s / 9.6 s to 14.5 s / 19.3 s; the stage took ≈ 19 min against
+/// 12.5). 8 aligns with `MEASURE_PLANES_RESIDENT`, so a 16 GB machine admits
+/// 4 workers instead of 10. Not directly measured with `/usr/bin/time -l`:
+/// `ln_probe` builds the LN reference before it calls `normalize_frame`, and
+/// that build dominates its peak RSS, so one frame's normalize working set
+/// cannot be isolated there; nor re-measured since the background model
+/// rewrite.
 pub(crate) const LN_PLANES_RESIDENT: u64 = 8;
 
 /// `MEASURE_PLANES_RESIDENT` planes of one w×h channel, in bytes — Measure's
@@ -3343,10 +3344,9 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 }
 
 /// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
-/// masks (a byte per pixel each) and a masked copy of the reference plane
-/// (four bytes), the masked copy of the reference plane
-/// and its row buffer (about one more plane): counted as three f32 planes,
-/// rounded up from about 2.5.
+/// masks (a byte per pixel each, together half an f32 plane), a masked copy
+/// of the reference plane (one f32 plane) and its row buffer (about one more
+/// plane): about 2.5 f32 planes, counted as three.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
 /// The payload-only marker of a member that keeps global normalization
@@ -11021,6 +11021,9 @@ fn run_group_normalization(
     let mut sidecar_grids: HashMap<i64, LnFrameGrids> = HashMap::with_capacity(members.len());
     // Plan 6b-3 D7: members that keep global normalization (cached or new).
     let mut low_overlap = 0usize;
+    // Final review I-1: members excluded because the common aperture could
+    // not measure enough stars (one group-level run warning below).
+    let mut aperture_shortfalls = 0usize;
 
     for (i, m) in members.iter().enumerate() {
         // Fix round 1, item 2: the hash folds in the group's OWN reference
@@ -11404,9 +11407,25 @@ fn run_group_normalization(
                 low_overlap += 1;
             }
             Some(Err(e)) => {
+                if ln_drives_output && matches!(e, LnError::CommonApertureShortfall { .. }) {
+                    aperture_shortfalls += 1;
+                }
                 fail_ln_frame(rc, &mut excluded_frame_ids, frame_id, e.to_string())?;
             }
         }
+    }
+
+    if aperture_shortfalls > 0 {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count = aperture_shortfalls,
+            "local normalization excluded frames the common aperture could not measure"
+        );
+        rc.warnings.push(format!(
+            "group {}: {aperture_shortfalls} frame(s) were left out of local normalization because the common aperture could not measure enough stars on them; Star flux: PSF signal may keep them",
+            group.key
+        ));
     }
 
     if low_overlap > 0 {
@@ -11733,7 +11752,7 @@ fn build_and_write_ln_reference(
         },
     );
     let map_start = Instant::now();
-    let maps = build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
+    let mut maps = build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
         if matches!(e, IntegrationError::Cancelled) {
             RunError::Cancelled
         } else {
@@ -11747,7 +11766,15 @@ fn build_and_write_ln_reference(
         }
     })?;
     let map_path = rc.layout.ln_reference_saturation_path(&group.key);
-    write_reference_saturation(&maps, built.width, built.height, &map_path, &cards).map_err(|e| {
+    let masks = write_reference_saturation(
+        &mut maps,
+        built.width,
+        built.height,
+        &map_path,
+        &cards,
+        saturation,
+    )
+    .map_err(|e| {
         tracing::error!(
             run_id = rc.run_id,
             group_key = %group.key,
@@ -11764,10 +11791,6 @@ fn build_and_write_ln_reference(
         duration_ms = map_start.elapsed().as_millis() as u64,
         "ln reference saturation map built"
     );
-    let masks: Vec<SaturationMask> = maps
-        .into_iter()
-        .map(|map| reference_saturation_mask(&map, built.width, built.height, saturation))
-        .collect();
 
     let (size, modified_at) =
         file_identity(&reference_path).map_err(|e| RunError::Other(format!("{e:#}")))?;
@@ -18816,6 +18839,81 @@ mod tests {
             plan_after.stale_stages
         );
         assert_eq!(g.ln_cached, 4, "{g:?}");
+    }
+
+    /// Final review I-1: on the 192x144 field the corner stars' annuli are
+    /// under half present, so the default F1 keeps 17 pairs (< 20). Each
+    /// member is excluded with a reason naming the common aperture (not
+    /// "N matched stars"), and the group carries ONE run warning counting
+    /// them.
+    #[test]
+    fn a_common_aperture_shortfall_names_its_cause_and_warns_once_per_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        // The estimator and the aperture stay at their defaults: the subject.
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        let _ = stage_output(&mut rc);
+
+        let aperture: Vec<&(i64, String)> = rc
+            .runtime_exclusions
+            .iter()
+            .filter(|(_, why)| why.contains("common aperture"))
+            .collect();
+        assert!(!aperture.is_empty(), "{:?}", rc.runtime_exclusions);
+        for (_, why) in &aperture {
+            assert!(why.chars().count() < 200, "{why}");
+            assert!(why.contains("(< 20)") && why.contains("matched stars fit"), "{why}");
+            assert!(!why.ends_with("matched stars (< 20)"), "{why}");
+        }
+        let hits: Vec<&String> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("common aperture could not measure enough stars"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", rc.warnings);
+        assert!(
+            hits[0].contains(&format!("{} frame(s)", aperture.len())),
+            "{hits:?} vs {} exclusions",
+            aperture.len()
+        );
     }
 
     /// Review Focus 3: a run whose scale differs from the plan's estimate

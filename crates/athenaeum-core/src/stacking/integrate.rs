@@ -135,13 +135,6 @@ pub struct NormalizationConfig {
     pub local: LocalNormalizationConfig,
 }
 
-/// spec §9.2 `normalization.local:` (M2). `enabled` turns LN into the
-/// OUTPUT normalization for a group; `local_scale` (a scale SPLINE over
-/// the stride grid, not just the frame-global `A`) went live in M4c
-/// (ruling R-M4c-8, `ln::scale::fit_local_scale` + `ln::a_grid`) and stays
-/// `false` by default — it only means anything while `enabled` is on;
-/// every other field is carried so the block round-trips through a stored
-/// config unchanged.
 /// How the LN scale is chosen (spec 2026-10-04 §2): derived from the LN
 /// geometry (`auto`, the default) or the stored `scale` (`fixed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -235,6 +228,13 @@ impl LnAperture {
     }
 }
 
+/// spec §9.2 `normalization.local:` (M2). `enabled` turns LN into the
+/// OUTPUT normalization for a group; `local_scale` (a scale SPLINE over
+/// the stride grid, not just the frame-global `A`) went live in M4c
+/// (ruling R-M4c-8, `ln::scale::fit_local_scale` + `ln::a_grid`) and stays
+/// `false` by default — it only means anything while `enabled` is on;
+/// every other field is carried so the block round-trips through a stored
+/// config unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {

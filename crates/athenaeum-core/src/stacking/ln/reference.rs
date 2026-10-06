@@ -474,15 +474,23 @@ pub fn build_reference_saturation(
 
 /// Writes the saturation map beside the reference (L-23):
 /// `ln/<group>/reference-saturation.fits`, float32, the same planar layout
-/// and caller cards (`ATH_STKI`/`ATH_STKG`) [`write_reference`] gives
-/// `reference.fits`, plus the same scanner-skip pair.
+/// and caller cards (`ATH_STKI`/`ATH_STKG`) [`write_reference_saturation`]
+/// gives `reference.fits`, plus the same scanner-skip pair.
+///
+/// Final review M-1: each plane's mask ([`reference_saturation_mask`] at
+/// `saturation`) is built FIRST, then the plane is handed to the streaming
+/// writer by `std::mem::take`, so no plane is ever cloned and the map's
+/// planes are freed one by one as they are written (the caller's `maps`
+/// planes are left empty). Returns the masks, one per plane — what the run
+/// keeps. The file's bytes are those of the planes as given.
 pub fn write_reference_saturation(
-    maps: &[Vec<f32>],
+    maps: &mut [Vec<f32>],
     width: usize,
     height: usize,
     path: &Path,
     cards: &[Card],
-) -> anyhow::Result<()> {
+    saturation: f64,
+) -> anyhow::Result<Vec<SaturationMask>> {
     anyhow::ensure!(
         maps.iter().all(|m| m.len() == width * height),
         "LN reference saturation map: a plane is not {width}x{height}"
@@ -492,18 +500,28 @@ pub fn write_reference_saturation(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    let channels = maps.len();
+    let mut masks = Vec::with_capacity(channels);
     // One plane at a time: never a second whole copy of the map.
     write_fits_f32_streaming_with(
         path,
         width,
         height,
-        maps.len(),
+        channels,
         &all_cards,
         Durability::Durable,
-        |p| Ok(maps[p].clone()),
+        |p| {
+            masks.push(reference_saturation_mask(&maps[p], width, height, saturation));
+            Ok(std::mem::take(&mut maps[p]))
+        },
     )
     .with_context(|| format!("writing LN reference saturation map {}", path.display()))?;
-    Ok(())
+    anyhow::ensure!(
+        masks.len() == channels,
+        "LN reference saturation map: {} of {channels} planes were written",
+        masks.len()
+    );
+    Ok(masks)
 }
 
 /// Opens a saturation map, refusing another shape than the reference's.
@@ -1310,7 +1328,10 @@ mod tests {
             Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap(),
             Card::new("ATH_STKG", CardValue::Str("g".into())).unwrap(),
         ];
-        write_reference_saturation(&maps, w, h, &path, &cards).unwrap();
+        let mut owned = maps.clone();
+        let masks = write_reference_saturation(&mut owned, w, h, &path, &cards, f64::INFINITY)
+            .unwrap();
+        assert_eq!(masks.len(), 3);
 
         let back = read_reference_saturation(&path, w, h, 3).unwrap();
         assert_eq!(back.len(), 3);

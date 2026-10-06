@@ -58,6 +58,7 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
   const patch = (p: Partial<StackingConfig['normalization']>) => {
     onChange({ ...config, normalization: { ...n, ...p } });
   };
+  const resolvedLines = resolvedScaleLines(plan);
   const patchLocal = (p: Partial<StackingConfig['normalization']['local']>) => {
     patch({ local: { ...n.local, ...p } });
   };
@@ -191,12 +192,14 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
                   disabled={disabled}
                   help={`Auto scale is the frames' short side divided by this, snapped to a supported size. default ${defaults.normalization.local.gridSize}`}
                 />
-                <div>
-                  <label className="block text-xs text-content-secondary mb-1">Resolved scale</label>
-                  {resolvedScaleLines(plan).map((line) => (
-                    <p key={line} className="text-xs text-content-muted">{line}</p>
-                  ))}
-                </div>
+                {resolvedLines.length > 0 && (
+                  <div>
+                    <label className="block text-xs text-content-secondary mb-1">Resolved scale</label>
+                    {resolvedLines.map((line) => (
+                      <p key={line} className="text-xs text-content-muted">{line}</p>
+                    ))}
+                  </div>
+                )}
               </>
             )}
 
