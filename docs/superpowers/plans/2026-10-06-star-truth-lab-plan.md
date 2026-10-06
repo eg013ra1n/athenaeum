@@ -131,8 +131,10 @@ Three of the plan's lab tests failed when the review ran them verbatim. Their fi
   image). `twins` reuse their base image's truth CSV verbatim, because only the noise differs. Measured cost:
   27–42 ms per star. Derivatives are central differences on the family's own renderer. B is dropped when the sky is 0. θ is
   dropped when e < 0.05, and then the bound of `q = 1 − minor/major` replaces the eccentricity bound.
-- **P-12.** Injection's real-star mask comes from `inject.py`'s own conservative detection: any local maximum more
-  than 3 σ_MAD above a 64-px median background, dilated by `6 × FWHM_frame`. The harness's candidate list keeps only
+- **P-12.** Injection's real stars come from `inject.py`'s own detection: local maxima of the 3 × 3 box-smoothed
+  residual more than 5 σ (of that smoothed residual) above a 64-px median background. Placement keeps `12 × FWHM_inj`
+  from each of them. A 3 σ rule on raw pixels took noise peaks for stars, and its exclusion swallowed a test frame
+  (checked when the plan's code was run). The harness's candidate list keeps only
   isolated bright stars and would miss faint real ones.
 - **P-13.** `star_probe` gets two more subcommands:
   - `debayer`, which writes the production VNG planes, for `ln_scale_probe`'s OSC pairs;
@@ -2444,8 +2446,8 @@ trailers:
 - Consumes: `render.*`, `shape.truth_widths`, `crlb.fisher_snr`, `crlb.star_bounds`, `fitsio.*`,
   `osc.site_channel`, `osc.channel_fluxes`, `osc.FWHM_FACTOR`, `field.flux_for_snr`, `families.COLS`.
 - Produces:
-  - `inject.real_stars(img, fwhm_frame, k=3.0) -> (peaks [(x, y)], sigma)` (P-12: the local maxima, not a dilated
-    mask);
+  - `inject.real_stars(img, fwhm_frame, k=5.0) -> (peaks [(x, y)], sigma)` (P-12: the local maxima of the 3 × 3
+    smoothed residual, not a dilated mask);
   - `inject.dilate(mask, r) -> bool array` (a separable box dilation by cumulative sums, O(N));
   - `inject.e_per_adu(header, cameras) -> (value or None, source)`;
   - `inject.gain_per_unit(header, e_adu, flat_value=None, channel=None) -> float`;
@@ -2491,7 +2493,7 @@ def frame(seed=1, n=256, sky=0.05, gain=12500.0, rn=0.0005, nan_border=0):
     rng = np.random.default_rng(seed)
     img = rng.poisson(np.full((n, n), sky) * gain) / gain + rng.standard_normal((n, n)) * rn
     for (x, y) in REAL:
-        render.render_star(img, x, y, 0.02, render.components("moffat", 3.0, 3.0), 0.0, 3.0, 3.0)
+        render.render_star(img, x, y, 0.5, render.components("moffat", 3.0, 3.0), 0.0, 3.0, 3.0)   # ~20 sigma peaks
     if nan_border:
         img[:nan_border, :] = np.nan
     return img
@@ -2583,11 +2585,17 @@ def _median_bg(img, cell=64):
     return bg
 
 
-def real_stars(img, fwhm_frame, k=3.0):
-    """Local maxima > k sigma_MAD above a 64-px median background (P-12). Returns ([(x, y)], sigma)."""
-    bg = _median_bg(img); r = img - bg; v = r[np.isfinite(r)]
+def real_stars(img, fwhm_frame, k=5.0):
+    """Local maxima of the 3 x 3 box-smoothed residual above k sigma of that smoothed residual, over a 64-px median
+    background (P-12). Smoothing first keeps noise peaks out: a 3-sigma rule on raw pixels takes ~0.1 % of the sky
+    for stars and its 12 F exclusion swallows the frame. Returns ([(x, y)], sigma)."""
+    fin = np.isfinite(img)
+    r = np.where(fin, img - _median_bg(img), 0.0)
+    sm = sum(r[1 + dy:r.shape[0] - 1 + dy, 1 + dx:r.shape[1] - 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)) / 9.0
+    v = sm[fin[1:-1, 1:-1]]
     sig = 1.4826 * float(np.median(np.abs(v - np.median(v))))
-    z = np.where(np.isfinite(r), r, -np.inf); c = z[1:-1, 1:-1]
+    z = np.full(img.shape, -np.inf); z[1:-1, 1:-1] = np.where(fin[1:-1, 1:-1], sm, -np.inf)
+    c = z[1:-1, 1:-1]
     peak = c > k * sig
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
@@ -2652,7 +2660,9 @@ def place(img, peaks, fwhm_inj, n, rng, edge_set=True):
     h, w = img.shape; R = 12.0 * fwhm_inj; ri = int(math.ceil(R))
     nonfinite = ~np.isfinite(img)
     bad = dilate(nonfinite, ri) if nonfinite.any() else np.zeros((h, w), bool)
-    bad |= np.nan_to_num(img, nan=-np.inf) > 0.5 * np.nanmax(img) if np.isfinite(img).any() else False
+    if np.isfinite(img).any():                     # bright structure: above half the frame's peak OVER the sky
+        r = np.nan_to_num(img - _median_bg(img), nan=-np.inf)
+        bad |= r > 0.5 * r.max()
     grid = {}
     for (px, py) in peaks:
         grid.setdefault((int(px // R), int(py // R)), []).append((px, py))
