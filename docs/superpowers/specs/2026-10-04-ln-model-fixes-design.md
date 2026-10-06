@@ -389,7 +389,8 @@ test on the integrated plane itself stays. A one-frame reference makes `R` that 
 
 - The map is written beside the reference as `ln/<group>/reference-saturation.fits` (float32, the
   reference's own plane layout). It belongs to the `ln_reference` artifact: a reference whose map
-  is missing is stale in the plan and rebuilt by the run (with a `warn!`).
+  is missing, unreadable or of another shape is rebuilt by the run (with a `warn!`). The plan reads
+  only the row's payload and stats neither file, exactly as for `reference.fits` itself.
 - In RAM the LN pass keeps only the thresholded mask (`R > saturation`, 1 bit per pixel, 7.6 MB at
   61 Mpx per channel); the float map stays on disk, so a `saturation` change never rebuilds it.
 - Cost: one read and one tile pass per integrated frame and channel at reference-build time (20
@@ -669,8 +670,9 @@ new fields, so every preset carries the defaults above.
 - `SummaryGroup` gains `lnScalePx`, `lnFluxEstimator` and `lnAperture` (`#[serde(default)]`), so
   provenance records what ran.
 - `LnReferencePayload` gains `width`, `height` and `scale_px` (`#[serde(default)]`).
-- The `ln_reference` artifact gains its sidecar `reference-saturation.fits` (§3 step 1, L-23); the
-  plan's Normalize freshness check requires it beside `reference.fits`.
+- The `ln_reference` artifact gains its sidecar `reference-saturation.fits` (§3 step 1, L-23),
+  written after `reference.fits` and before the row; the run rebuilds a reference whose sidecar is
+  missing or of another shape. The plan does not probe either file (unchanged).
 - The run's per-group LN line (`"ln scale resolved"`, §10) states scale, mode, geometry and
   estimator.
 - No schema change. No command change. Both hosts return the same structs, so the web mirror needs
