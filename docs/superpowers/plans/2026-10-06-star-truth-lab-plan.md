@@ -20,7 +20,17 @@ points, a scorecard against truth and the CRLB), and the baseline numbers of tod
 - `sqlite3` with `immutable=1` for reading the acceptance copies.
 
 **Spec:** `docs/superpowers/specs/2026-10-06-star-truth-lab-design.md` (with its 2026-10-06 review amendment). The
-independent review is in `.superpowers/sdd/star-truth-lab-spec-review/review-fable.md`.
+independent reviews are in `.superpowers/sdd/star-truth-lab-spec-review/`: `review-fable.md` for the spec,
+`plan-review-fable.md` for this plan.
+
+**Plan amendment (2026-10-06, after the plan review).** 3 critical, 11 important and 11 minor findings are folded
+in. The critical ones:
+- the `analysis` path takes a 16-bit sibling of every unit-domain image (P-20);
+- P-6 is reversed: the analyzer's coordinates are already in file rows;
+- injection's gain comes from `EGAIN`, then the owner's per-camera table, then the raw light's tiles (P-21), and
+  its placement measures distances to the real stars.
+
+Three of the plan's lab tests failed when the review ran them verbatim. Their fixes are in Tasks 1, 2 and 7.
 
 ## Global Constraints
 
@@ -72,6 +82,9 @@ independent review is in `.superpowers/sdd/star-truth-lab-spec-review/review-fab
    (`test_border_star_flux_img_is_the_clipped_sum`) and Task 8 (`test_edge_stars_skip_width_rows`).
 4. **A saturated flag on blurred and mixture stars.** The noiseless peak must be taken after the blur; the old
    generator re-searched a 5×5 box. Pinned in Task 4 (`test_saturated_flag_after_blur`).
+6. **A unit-domain float into the `analysis` path.** The production detector bins its background in integer ADU,
+   so a [0, 1] frame silently measures nothing. Pinned in Task 5 (`analysis_refuses_a_unit_domain_file`); every
+   synthetic and injected image gets a 16-bit sibling for this path (P-20).
 5. **OSC colour extremes:** a star bright in R and faint in B. Each plane's SNR bin uses that plane's own Fisher
    SNR. Pinned in Task 3 (`test_channel_snr_per_plane`).
 
@@ -96,8 +109,10 @@ independent review is in `.superpowers/sdd/star-truth-lab-spec-review/review-fab
 - **P-5.** Units. Production fits carry `background`, `amplitude`, `signal` and `peak5`, and seeds carry `peak` and
   `flux`, all in ADU-scaled units (×65535). The probe writes them divided by 65535, so every lab number is in image
   units [0, 1]. FWHM is in pixels.
-- **P-6.** When `analyze_frame` returns `flip_vertical`, the scorecard maps the `analysis` path's `y` to `H − 1 − y`
-  and `θ` to `−θ` (the convention documented on `StarMetricsResponse`).
+- **P-6 (reversed by the plan review).** `flipVertical` is recorded on the `analysis` frame line and never applied.
+  rustafits reads the pixel rows as stored, and the flag only tells the display overlay to flip (`annotate.rs`).
+  The analyzer's `x`, `y` and `θ` are therefore in file-row coordinates, like every other path's. `probe_io` asserts
+  that the flag is present and leaves the coordinates alone.
 - **P-7.** The optional pre-warp injection mode (spec §4, `warp --map`) is not in this plan. The baseline report
   records "not done", and the warp-parity gate does not apply.
 - **P-8.** All lab tests use stdlib `unittest`.
@@ -107,11 +122,14 @@ independent review is in `.superpowers/sdd/star-truth-lab-spec-review/review-fab
   - a Gaussian for Gaussian families;
   - a free-β elliptical Moffat for every other family (blur, wing, mixture, coma).
 
-  It is computed at sub-pixel phase (0.3, −0.2) once per distinct shape.
+  It is computed at sub-pixel phase (0.3, −0.2) once per distinct shape. For a round generator (FWHM minor ==
+  major), `fit_ecc = 0` and `fit_theta_deg = nan`. The LM's ≈ 0.02 there is optimizer wander on a flat direction,
+  not a property of the profile.
 - **P-10.** Truth widths are cached per distinct shape (profile, FWHMs, e, θ, blur). Position-dependent families
   (`fieldpsf`, `coma`, `trails`) are computed per star.
-- **P-11.** The CRLB is computed for every star in an image of at most 1000 stars, and for a seeded random 1000
-  otherwise. Derivatives are central differences on the family's own renderer. B is dropped when the sky is 0. θ is
+- **P-11.** The CRLB is computed for a seeded, stratified sample of 50 truth stars per SNR bin (at most 300 per
+  image). `twins` reuse their base image's truth CSV verbatim, because only the noise differs. Measured cost:
+  27–42 ms per star. Derivatives are central differences on the family's own renderer. B is dropped when the sky is 0. θ is
   dropped when e < 0.05, and then the bound of `q = 1 − minor/major` replaces the eccentricity bound.
 - **P-12.** Injection's real-star mask comes from `inject.py`'s own conservative detection: any local maximum more
   than 3 σ_MAD above a 64-px median background, dilated by `6 × FWHM_frame`. The harness's candidate list keeps only
@@ -120,15 +138,44 @@ independent review is in `.superpowers/sdd/star-truth-lab-spec-review/review-fab
   - `debayer`, which writes the production VNG planes, for `ln_scale_probe`'s OSC pairs;
   - `dump-fits`, the production decoder of a persisted `fits` artifact, for the parity gate.
 - **P-14.** The 14-bit saturation variant clips at 16383/65535 = 0.25 (a 14-bit ADC in a 16-bit container). The
-  review's "0.5 of full scale" was a slip.
+  review's "0.5 of full scale" was a slip. This is a correction of the spec's number, listed for the owner with
+  P-2.
 - **P-15.** `pairs` reuses the Task 16b `iso` and `main` grids in place (`~/.athenaeum-acc/star-lab/grid/`, their
   existing manifests). The new OSC and density pairs are rendered by v2.
 - **P-16.** Clipped-core mixture: at each pixel, member values above the 70th percentile across members are replaced
   by that percentile, then averaged (a winsorized mean, the model of a high-rejection master).
-- **P-18.** The model bound (spec §6) is the CRLB of an elliptical Moffat β 4, the product's `Moffat4` model, at the
-  star's point-fit-equivalent widths. It is computed per distinct shape for families whose generator is not an
-  elliptical Moffat (Gaussian, blur, wing, mixture, coma), and written as `mcrlb_*` columns. The fit's own best-fit β
-  is not known at truth time.
+- **P-18.** The model bound (spec §6) is computed by the scorecard, not stored in the truth. It is the CRLB of an
+  elliptical Moffat at the Auto β the `measure` path reported for that image and plane (its frame line's `beta`),
+  at the star's point-fit-equivalent widths, for families whose generator is not an elliptical Moffat (Gaussian,
+  blur, wing, mixture, coma). This is the spec's "the fit's own model at its best-fit parameters".
+- **P-19.** `StarMetric` carries no per-star saturation flag, and `possibly_trailed` is frame-level. The `analysis`
+  star line therefore dumps `fitMethod` only, and `possiblyTrailed` and `trailRSquared` come from the frame line's
+  `frame` object. This corrects spec §5.
+- **P-20.** The `analysis` path reads raw-domain files only, as the Analysis tab does. Its detector bins its
+  background in integer ADU, so a [0, 1] float measures nothing; an earlier probe saw 0/20 solves on unit-domain
+  files. Every synthetic image and every calibrated injection therefore also gets a 16-bit sibling
+  `<name>.u16.fits` (BITPIX 16, `BZERO 32768`, `round(clip(img, 0, 1) × 65535)`, the same cards). The probe
+  refuses `analysis` on a file whose maximum is ≤ 1.5.
+- **P-21.** Gain per unit of a calibrated frame (from `light_cal.rs`: `L_c = ((L − S)/(F/ATH_CFNM))/ATH_CSCL`):
+  `g(x, y) = e_adu × ATH_CSCL × F(x, y) / ATH_CFNM`.
+  - `F` is the master flat's own pixel (the file named in `ATH_CFLT`).
+  - On a mosaic with `ATH_CCFA = T`, the channel's `ATH_CFNR/G/B` replaces `ATH_CFNM`.
+  - `e_adu` (e⁻/ADU) comes from, in this order:
+    1. `EGAIN` on the frame;
+    2. the owner's per-camera table `star-lab/manifests/cameras.json` (`{INSTRUME: {GAIN: e_adu}}`);
+    3. the tile estimate on the RAW source light named by `ATH_CSRN`, whose vignetting gives the level span.
+
+    It never comes from the calibrated frame's own tiles: a flat-fielded sky does not span 20 %. A frame with none
+    of the three is refused and named.
+  - The gain gate checks the gain only. The read noise is reported, not gated, because on a dark-subtracted frame
+    the intercept is rn² plus the removed pedestal.
+- **P-22.** Real frames and the 4096² image run one path per `star_probe` invocation; a 61 Mpx frame reached
+  5.6 GB in one LN probe. 2048² synthetics run the stacking paths in one invocation and `analysis` in a second one
+  (on the `.u16.fits`). Row 9's peak RSS comes from the one-path invocations only.
+- **P-23.** Base gain is 50 000 e⁻/unit (Task 16b's value), not 12 500. The SNR-bin check exempts bins above an
+  image's saturation ceiling `snr_sat`, the Fisher SNR at 0.9 × the saturating flux (F 1.2: 293). Such a bin is
+  reported `n/a (ceiling snr_sat)`. At gain 12 500 the `> 300` bin was empty at every FWHM ≤ 2.6 whatever the
+  image count. Every other bin still needs at least 50 stars.
 - **P-17.** The `register` path is chosen by plane count, as production does:
   - one plane: `stars_from_fits` on that plane's Measure fits;
   - three planes: `detect_stars` on `luminance` of the three.
@@ -188,6 +235,7 @@ Run the lab tests from `star-lab/`: `python3 -m unittest discover -s tests -v`.
 **Interfaces:**
 - Produces:
   - `fitsio.write_fits(path, a, cards=None)` (a: 2-D `[h, w]` or 3-D `[n, h, w]`; cards: dict);
+  - `fitsio.write_fits_u16(path, a, cards=None)`, the raw-light container for the `analysis` path (P-20);
   - `fitsio.read_fits(path) -> (np.ndarray float64, dict)`;
   - `render.FWHM_PER_SIGMA`, `render.erf(a)`, `render.moffat_alpha(fwhm, beta)`, `render.os_for(fwhm_minor)`;
   - `render.Component(w, kind, a, b, beta)` and `render.components(profile, fwhm_minor, fwhm_major, beta=4.0,
@@ -309,6 +357,17 @@ class TestFits(unittest.TestCase):
             q = os.path.join(d, "c.fits"); fitsio.write_fits(q, c)
             e, _ = fitsio.read_fits(q)
             self.assertEqual(e.shape, (3, 5, 7)); np.testing.assert_array_equal(e, c.astype(np.float64))
+
+    def test_u16_sibling_round_trips_to_adu(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = np.array([[0.0, 0.5], [1.0, 0.25]])
+            p = os.path.join(d, "u.fits"); fitsio.write_fits_u16(p, a, {"BAYERPAT": "RGGB"})
+            b, h = fitsio.read_fits(p)
+            np.testing.assert_array_equal(b, np.round(a * 65535.0))
+            self.assertEqual(int(h["BITPIX"]), 16)
+
+    def test_float_cards_carry_a_decimal_point(self):
+        self.assertIn("2.0", fitsio._card("X", 2.0)); self.assertIn("1.0E-07", fitsio._card("X", 1e-7))
 ```
 
 - [ ] **Step 3: Run them and see them fail**
@@ -330,7 +389,12 @@ def _card(key, value):
     if isinstance(value, int):
         return f"{key:<8}= {value:>20d}"
     if isinstance(value, float):
-        return f"{key:<8}= {value:>20.12G}"
+        t = f"{value:.12G}"                      # FITS fixed-format reals need a decimal point
+        if "E" in t and "." not in t.split("E")[0]:
+            t = t.replace("E", ".0E")
+        elif "." not in t and "E" not in t and t not in ("NAN", "INF", "-INF"):
+            t += ".0"
+        return f"{key:<8}= {t:>20}"
     v = "'" + str(value).replace("'", "''") + "'"
     return f"{key:<8}= {v:<20}"
 
@@ -350,6 +414,23 @@ def write_fits(path, a, cards=None):
     blob = "".join(c[:80].ljust(80) for c in hdr)
     blob += " " * ((2880 - len(blob) % 2880) % 2880)
     body = a.tobytes()
+    with open(path, "wb") as f:
+        f.write(blob.encode("ascii")); f.write(body); f.write(b"\0" * ((2880 - len(body) % 2880) % 2880))
+
+
+def write_fits_u16(path, a, cards=None):
+    """The raw-light container (P-20): BITPIX 16, BZERO 32768, values round(clip(a, 0, 1) x 65535)."""
+    v = np.round(np.clip(np.nan_to_num(np.asarray(a, dtype=np.float64), nan=0.0), 0.0, 1.0) * 65535.0)
+    raw = (v - 32768.0).astype(">i2")
+    axes = [raw.shape[-1], raw.shape[-2]] + ([raw.shape[0]] if raw.ndim == 3 else [])
+    hdr = ["SIMPLE  =                    T", "BITPIX  =                   16", f"NAXIS   = {len(axes):20d}"]
+    hdr += [f"NAXIS{i + 1:<3}= {n:20d}" for i, n in enumerate(axes)]
+    hdr += ["BZERO   =              32768.0", "BSCALE  =                  1.0"]
+    hdr += [_card(k, v2) for k, v2 in (cards or {}).items()]
+    hdr.append("END")
+    blob = "".join(c[:80].ljust(80) for c in hdr)
+    blob += " " * ((2880 - len(blob) % 2880) % 2880)
+    body = np.ascontiguousarray(raw).tobytes()
     with open(path, "wb") as f:
         f.write(blob.encode("ascii")); f.write(body); f.write(b"\0" * ((2880 - len(body) % 2880) % 2880))
 
@@ -446,7 +527,7 @@ def cutout_radius(comps, fwhm_major, cap=150):
         if c.kind == "gauss":
             r = max(r, 6.0 * c.a)
         else:
-            eps = 1e-4 if c.w > 0.5 else 2e-3
+            eps = 5e-5 if c.w > 0.5 else 2e-3     # core 5e-5: the tail sub-grid below leaves the 1e-4 bar room
             r = max(r, c.a * math.sqrt(eps ** (1.0 / (1.0 - c.beta)) - 1.0))
     return int(min(math.ceil(r), cap))
 
@@ -470,7 +551,8 @@ def _exact_gauss(comps, theta):
 
 
 def _render_subgrid(img, x0, y0, flux, comps, theta, fwhm_major, os_, cap=150):
-    """Centre sampling over the cutout, an os x os midpoint sub-grid inside +-3 FWHM_major."""
+    """A 3 x 3 midpoint sub-grid over the whole cutout (a convex tail is under-counted by centre sampling,
+    plan review I-2), and an os x os midpoint sub-grid inside +-3 FWHM_major."""
     R = cutout_radius(comps, fwhm_major, cap)
     ya, yb, xa, xb = _box(img.shape, x0, y0, R)
     ct, st = math.cos(theta), math.sin(theta)
@@ -479,7 +561,12 @@ def _render_subgrid(img, x0, y0, flux, comps, theta, fwhm_major, os_, cap=150):
         return evaluate(comps, dx * ct + dy * st, -dx * st + dy * ct)
 
     X, Y = np.meshgrid(np.arange(xa, xb + 1, dtype=np.float64), np.arange(ya, yb + 1, dtype=np.float64))
-    val = ev(X - x0, Y - y0)
+    off3 = (np.arange(3) + 0.5) / 3 - 0.5
+    val = np.zeros_like(X)
+    for oy in off3:
+        for ox in off3:
+            val += ev(X + ox - x0, Y + oy - y0)
+    val /= 9.0
     core = int(math.ceil(3.0 * fwhm_major)); ix, iy = int(round(x0)), int(round(y0))
     cya, cyb, cxa, cxb = max(ya, iy - core), min(yb, iy + core), max(xa, ix - core), min(xb, ix + core)
     if cxb >= cxa and cyb >= cya:
@@ -685,7 +772,7 @@ from . import render
 
 
 def fine_profile(comps, theta, fwhm_minor, fwhm_major, pixel_box=False, blur_fwhms=()):
-    k = max(8, int(math.ceil(40.0 / fwhm_minor)))           # >= 20 samples across the minor half width
+    k = max(8, int(math.ceil(80.0 / fwhm_minor)))           # >= 40 samples per pixel of the minor FWHM (review I-3)
     R = 4.0 * max(fwhm_major, *(blur_fwhms or (0.0,)))
     n = 2 * int(math.ceil(R * k)) + 1
     c = (np.arange(n) - n // 2) / k
@@ -802,6 +889,8 @@ def truth_widths(comps, theta, fwhm_minor, fwhm_major, model, beta=None, blur_fw
     pimg, pstep = fine_profile(comps, theta, fwhm_minor, fwhm_major, pixel_box=True, blur_fwhms=tuple(blur_fwhms))
     b = halfmax_ellipse(pimg, pstep)
     c = point_fit_equivalent(comps, theta, fwhm_minor, fwhm_major, model, beta, tuple(blur_fwhms))
+    if abs(fwhm_major - fwhm_minor) <= 1e-12 * fwhm_major:   # round generator (P-9): no ellipse to report
+        c = (c[0], c[1], 0.0, float("nan"))
     keys = ("fwhm_minor", "fwhm_major", "ecc", "theta_deg")
     out = dict(zip(keys, a))
     out.update({"pix_" + k: v for k, v in zip(keys, b)})
@@ -941,6 +1030,8 @@ class TestField(unittest.TestCase):
             self.assertAlmostEqual(got / snr, 1.0, delta=0.15)
 
     def test_ladder_fills_every_snr_bin(self):
+        """approx_snr is the Gaussian n_eff estimate; Moffat 2.5 lands ~5 % lower. The per-family check in Task 4
+        uses the Fisher SNR and the saturation-ceiling exemption (P-23)."""
         rng = np.random.default_rng(3)
         fwhm, sky, gain, rn = 3.0, 0.05, 12500.0, 0.0005
         f = field.ladder_fluxes(600, fwhm, sky, gain, rn, sat_flux=field.flux_for_peak(0.9, render.components("moffat", 3, 3), 0.0, 3, 3), rng=rng)
@@ -1235,7 +1326,9 @@ git push origin main
 - Produces:
   - `families.FAMILIES: dict[str, dict]`: every family of spec §3.2 except `resampled` (Task 6) and `pairs` (P-15:
     referenced in place).
-  - `families.build(name, spec, out_dir, seed) -> list[dict]`. Each image record is
+  - `families.build(name, spec, out_dir, seed) -> list[dict]`.
+  - `families.snr_bin_report(records) -> list[dict(bin, count, status)]`, where status is `ok`, `short` or
+    `n/a (ceiling <snr_sat>)` (P-23). Each image record is
     `{"family", "name", "path", "truth", "extra": {...}, "seed", "sha256"}`.
   - The truth CSV columns, in this order:
     ```
@@ -1245,9 +1338,11 @@ git push origin main
     ```
     `kind` is `star | halo | double_a | double_b | track | track2`.
   - The `coma` and `trails` truth adds `mom_fwhm_minor, mom_fwhm_major, mom_ecc, mom_theta_deg, mom_x, mom_y`.
-  - Every truth CSV also carries the CRLB columns of Task 2's `crlb.star_bounds` for the sampled stars (P-11),
-    `crlb_x, crlb_y, crlb_flux, crlb_fwhm_minor, crlb_fwhm_major, crlb_ecc_or_q, crlb_theta`, empty for unsampled
-    stars; and `mcrlb_*` with the same suffixes where P-18 applies.
+  - Every truth CSV also carries the CRLB columns of Task 2's `crlb.star_bounds` for the sampled stars (P-11: 50 per
+    SNR bin, at most 300 per image), `crlb_x, crlb_y, crlb_flux, crlb_fwhm_minor, crlb_fwhm_major, crlb_ecc_or_q,
+    crlb_theta`, empty for unsampled stars. The model bound is the scorecard's (P-18), so there are no `mcrlb_*`
+    columns here.
+  - Every image also gets its 16-bit sibling `<name>.u16.fits` (P-20), carried as `extra.u16`.
   - **Names:** every FWHM in a family name is written with one decimal: `f2.0`, `f3.5`, `f8.0`.
   - **`pairs`:** `make_v2.py` writes a `pairs` entry whose images point at the Task 16b manifests in place
     (`~/.athenaeum-acc/star-lab/grid/main/manifest.json`, `…/grid/iso/manifest.json`; P-15). Check their real file
@@ -1255,7 +1350,7 @@ git push origin main
   - `artefacts.csv` per image: `type,x,y,value`.
   - `manifest.write(path, records)`, `manifest.load(path)`, `manifest.verify(record, regenerate_fn) -> (ok, detail)`.
 
-**The family table** (`FAMILIES`). Defaults: size 2048, sky 0.05, gain 12500, rn 0.0005, sat 0.95, margin 40.
+**The family table** (`FAMILIES`). Defaults: size 2048, sky 0.05, gain 50000 (P-23), rn 0.0005, sat 0.95, margin 40.
 
 | name | images | parameters |
 | ---- | ---- | ---- |
@@ -1282,7 +1377,9 @@ git push origin main
 **SNR-bin check.** After building each family image, compute every truth star's Fisher SNR (`crlb.fisher_snr` on its
 own noiseless stamp). For `sharp`, `shape`, `saturated`, `mixture` and `osc` (per plane), every bin of
 {< 10, 10–20, 20–40, 40–100, 100–300, > 300} must hold at least 50 stars across the family's images (for `shape`,
-per (F, e)). If a bin falls short, raise the family's image count (`images` key) and rebuild. Never change the bins.
+per (F, e)). A bin whose lower edge is above the image's saturation ceiling `snr_sat` (the Fisher SNR at 0.9 × the
+saturating flux) is reported `n/a (ceiling snr_sat)` and does not fail (P-23). If any other bin falls short, raise the
+family's image count (`images` key) and rebuild. Never change the bins.
 
 **Saturated flag (Review Focus 4).** `saturated` = 1 when any pixel of sky + noiseless star inside the star's cutout
 reaches `sat`. It is computed on the final noiseless image: after blur, mixture and background, before noise.
@@ -1327,6 +1424,8 @@ class TestFamilies(unittest.TestCase):
                                                   "saturated", "edge", "profile", "beta"])
         img, _ = fitsio.read_fits(recs[0]["path"])
         self.assertEqual(img.shape, (256, 256))
+        u16, _ = fitsio.read_fits(recs[0]["extra"]["u16"])
+        self.assertGreater(u16.max(), 1.5)
 
     def test_saturated_flag_after_blur(self):
         recs = self.build("sharp/blur2.5/f3.5", size=256, density=150)
@@ -1341,6 +1440,11 @@ class TestFamilies(unittest.TestCase):
         recs = self.build("saturated/f2.6/n20", size=512)
         r = sorted(rows(recs[0]["truth"]), key=lambda s: -float(s["flux"]))[:64]
         self.assertEqual(sum(int(s["saturated"]) for s in r), 20)
+
+    def test_saturation_ceiling_exempts_only_bins_above_it(self):
+        recs = self.build("sharp/m4/f1.2", size=512, density=600)
+        report = families.snr_bin_report(recs)
+        self.assertTrue(all(b["count"] >= 50 or b["status"].startswith("n/a (ceiling") for b in report))
 
     def test_twins_share_truth_and_differ_in_noise(self):
         recs = self.build("twins/sharp/m4/f2.6", size=256, density=150)
@@ -1401,7 +1505,7 @@ import csv, hashlib, math, os
 import numpy as np
 from . import render, shape, crlb, field, noise, background, artefacts, osc, fitsio
 
-BASE = dict(size=2048, sky=0.05, gain=12500.0, rn=0.0005, sat=0.95, margin=40, density=150, min_sep=25.0, images=1)
+BASE = dict(size=2048, sky=0.05, gain=50000.0, rn=0.0005, sat=0.95, margin=40, density=150, min_sep=25.0, images=1)
 COLS = ["id", "x", "y", "flux", "flux_img", "peak", "peak_snr", "fisher_snr", "saturated", "edge", "profile", "beta",
         "fwhm_minor", "fwhm_major", "ecc", "theta_deg", "pix_fwhm_minor", "pix_fwhm_major", "pix_ecc", "pix_theta_deg",
         "fit_fwhm_minor", "fit_fwhm_major", "fit_ecc", "fit_theta_deg", "sky_local", "sky_grad", "s_true", "plane",
@@ -1476,11 +1580,16 @@ It returns `(img, rows, star, bg)`. Each family builder composes it. A family th
 (trails: the track rendered with `render_track` into a 129² zero stamp, then measured with `shape.moment_ellipse`
 at step 1 and radius 4F + track length).
 
-Write `<out>/<family path>/<name>.fits` with cards `{"SYNFAM": name, "SYNSEED": seed, "SYNPROF": prof, "SYNFWHM":
-F}` (plus `BAYERPAT` for OSC), and `<name>.csv`. `build()` returns the records with `sha256` filled.
+Generate `background/neb3_4096` last: its blur FFT peaks near 0.5 GB.
 
-`twins` builds take the base family's spec and call its builder three times with the same field seed and noise
-seeds `seed + 1, + 2`, then `+ 3` with fluxes × 2. Implement this by passing `noise_seed` separately from
+Write `<out>/<family path>/<name>.fits` with cards `{"SYNFAM": name, "SYNSEED": seed, "SYNPROF": prof, "SYNFWHM":
+F}` (plus `BAYERPAT` for OSC), and `<name>.csv`, and the 16-bit sibling `<name>.u16.fits` through `fitsio.write_fits_u16` with the same cards (P-20).
+`build()` returns the records with `sha256` filled (of the float file) and `extra.u16`.
+
+`twins` builds take the base family's spec and render it three times with the same field seed and noise seeds
+`seed + 1, + 2`, then `+ 3` with fluxes × 2. **They reuse the base image's truth CSV verbatim** (one
+`shape`/`crlb` pass per base, P-11). The `deep` twin's truth is the base truth with `flux`, `flux_img`, `peak`,
+`peak_snr`, `fisher_snr` and `crlb_*` recomputed for the doubled flux. The widths are the same. Implement this by passing `noise_seed` separately from
 `field_seed` in every builder.
 
 - [ ] **Step 4: Implement `manifest.py`**
@@ -1609,6 +1718,9 @@ git push origin main
 - Modify: `crates/athenaeum-core/src/stacking/register/detect.rs`. `pub(crate) fn stars_from_fits` → `pub fn`, with a
   doc line.
 - Create: `crates/athenaeum-core/examples/star_probe.rs`
+- Modify: `crates/athenaeum-core/Cargo.toml`. Add
+  `[[example]] name = "star_probe" required-features = ["render", "solver"]` beside `measure_probe`'s entry:
+  `stacking` is `cfg(all(render, solver))`, and the headless check would otherwise fail on the example.
 
 **Interfaces:**
 - Produces:
@@ -1645,16 +1757,14 @@ Add to `stacking/measure.rs` tests:
         let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedSource::Fast);
         assert_eq!(seeds.len(), detailed.channel.stars_detected);
         assert_eq!(detailed.fits, plain.fits);
-        let mut a = detailed.channel.clone();
-        let mut b = plain.channel.clone();
-        a.timings = MeasureTimings::default();
-        b.timings = MeasureTimings::default();
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert_eq!(
+            format!("{:?}", without_timings(detailed.channel.clone())),
+            format!("{:?}", without_timings(plain.channel.clone()))
+        );
     }
 ```
 
-If `MeasureTimings` has no `Default`, zero its five fields explicitly in the test. Do not add a derive to production
-code for a test.
+`without_timings` is the existing test helper in the same module.
 
 Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib stacking::measure -- --test-threads=4`
 Expected: FAIL to compile (`measure_plane_detailed` not found).
@@ -1884,8 +1994,14 @@ fn load_config(path: &Option<PathBuf>) -> (MeasureOptions, DetectionConfig, usiz
     }
 }
 
+/// P-20: the Analysis tab reads raw lights; its detector bins the background in integer ADU.
+fn analysis_domain_ok(raw_max: f32) -> bool {
+    raw_max > 1.5
+}
+
 fn cmd_measure(a: MeasureArgs) {
     let (mut planes, mut w, mut h) = read_planes(&a.image);
+    let raw_max = planes.iter().flatten().filter(|v| v.is_finite()).fold(f32::MIN, |m, &v| m.max(v));
     let conversion = normalise(&mut planes);
     if let Some(p) = &a.debayer {
         if planes.len() != 1 { die("--debayer needs a one-plane mosaic") }
@@ -1909,7 +2025,7 @@ fn cmd_measure(a: MeasureArgs) {
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
     let want = |p: &str| a.paths.iter().any(|q| q == p);
     let options = json!({ "measure": opts, "detection": { "minSnr": det.min_snr, "maxEccentricity": det.max_eccentricity },
-                          "registerMaxStars": reg_max, "fromConfig": from_config });
+                          "registerMaxStars": reg_max, "fromConfig": from_config, "rawMax": raw_max });
 
     let mut fits0: Option<Vec<StarFit>> = None;
     for &p in &selected {
@@ -1971,6 +2087,10 @@ fn cmd_measure(a: MeasureArgs) {
         if a.rect.is_some() || a.debayer.is_some() {
             die("the analysis path takes the file as the Analysis tab does: no --rect, no --debayer")
         }
+        if !analysis_domain_ok(raw_max) {
+            die("the analysis path takes a raw-domain file (16-bit or ADU float), as the Analysis tab does; \
+                 this file is in [0, 1] (use its .u16.fits sibling)")
+        }
         let t = Instant::now();
         let analyzer = build_analyzer(&AnalysisConfig::default(), None);
         let img = a.image.to_str().unwrap_or_else(|| die("non-UTF-8 path"));
@@ -1980,13 +2100,14 @@ fn cmd_measure(a: MeasureArgs) {
                     emit(json!({"kind": "star", "path": "analysis", "plane": 0, "beta": s.beta,
                                 "x": s.x, "y": s.y, "peak": s.peak, "flux": s.flux, "fwhm": s.fwhm,
                                 "fwhmX": s.fwhm_x, "fwhmY": s.fwhm_y, "ecc": s.eccentricity,
-                                "thetaDeg": s.theta, "snr": s.snr, "hfr": s.hfr,
+                                "thetaDeg": s.theta.to_degrees(), "snr": s.snr, "hfr": s.hfr,
                                 "fitMethod": s.fit_method, "residual": s.fit_residual}));
                 }
                 emit(json!({"kind": "frame", "path": "analysis", "plane": 0, "beta": null, "seeds": null,
-                            "fits": stars.len(), "statistic": "the analyzer's frame medians",
-                            "frameFwhm": null, "frameEcc": null, "frame": fa, "flipVertical": flip,
-                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "file as is",
+                            "fits": stars.len(), "statistic": "clipped weighted median over e <= 0.8",
+                            "frameFwhm": fa.median_fwhm, "frameEcc": fa.median_eccentricity,
+                            "frame": fa, "flipVertical": flip,
+                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "file as is (raw domain)",
                             "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}));
             }
             Err(e) => die(format!("analysis: {e:#}")),
@@ -2040,14 +2161,18 @@ fn main() {
 ```
 
 Verify before compiling, by reading the source:
-- `StarFit::theta` is in radians. Check `psf_signal.rs` where `theta` is fitted. If it is in degrees, drop
-  `.to_degrees()`.
-- `StarMetric::theta` is in degrees.
+- `StarFit::theta` is in radians (the fitter's `u = (x − x0) cos θ + …`, rustafits `fitting.rs`).
+- `StarMetric::theta` is also in radians (rustafits `StarMetrics::theta`, copied in `analyzer.rs`), hence
+  `.to_degrees()` on both.
 - `FrameAnalysis`, `StarMetric`, `AnalysisConfig`, `ChannelMeasurement` and `MeasureOptions` implement `Serialize`.
 - The `astroimage::processing::vng` path is public.
 
 A mismatch is fixed in the probe, never by changing production code (the production diff is limited to P-2's two
 items).
+
+`--config` takes a run's `config_json` as is: it decodes directly as a `StackingConfig` through
+`#[serde(default)]`. The `v.get("config")` branch is the fallback for a per-set document (`{"setId", "config",
+…}`).
 
 - [ ] **Step 5: Example tests inside the example** (Review Focus 1 and 2)
 
@@ -2095,7 +2220,15 @@ mod tests {
         let frames: Vec<&Value> = lines.iter().filter(|v| v["kind"] == "frame").collect();
         assert_eq!(frames.len(), 3);
         assert!(frames.iter().all(|f| f["nonFinite"].as_u64().unwrap() > 0));
-        assert!(lines.iter().any(|v| v["kind"] == "star" && v["path"] == "measure"));
+        let measure = frames.iter().find(|f| f["path"] == "measure").unwrap();
+        assert!(measure["fits"].as_u64().unwrap() > 0, "{measure}");
+    }
+
+    #[test]
+    fn analysis_refuses_a_unit_domain_file() {
+        assert!(!analysis_domain_ok(1.0));
+        assert!(!analysis_domain_ok(f32::MIN));
+        assert!(analysis_domain_ok(40000.0));
     }
 
     #[test]
@@ -2229,9 +2362,13 @@ and `athenaeum_core::geometry::{Linear, LinearKind}`. The test:
             d[y * w + x] = (-r2 / (2.0 * 2.0f32.powi(2))).exp();
         }}
         let o = warp_affine(&[d.clone()], w, h, 0.5, 0.0, 0.0).remove(0);
-        let (s0, s1): (f64, f64) = (d.iter().map(|&v| v as f64).sum(), o.iter().map(|&v| v as f64).sum());
+        // the resampler writes NaN where the source is out of range: here the last column only
+        assert_eq!(o.iter().filter(|v| !v.is_finite()).count(), h);
+        let s0: f64 = d.iter().map(|&v| v as f64).sum();
+        let s1: f64 = o.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();
         assert!((s1 / s0 - 1.0).abs() < 1e-3, "flux {s1} vs {s0}");
-        let cx: f64 = o.iter().enumerate().map(|(i, &v)| (i % w) as f64 * v as f64).sum::<f64>() / s1;
+        let cx: f64 = o.iter().enumerate().filter(|(_, v)| v.is_finite())
+            .map(|(i, &v)| (i % w) as f64 * v as f64).sum::<f64>() / s1;
         assert!((cx - 47.5).abs() < 0.02, "centroid {cx}");
     }
 ```
@@ -2274,8 +2411,9 @@ Implementation in `families.py`:
 1. Build the `sharp/m4/f<F>` image (the noisy frame, noise before the warp) into a temp path.
 2. Run `subprocess.run([PROBE, "warp", src, "--shift", "0.5,0.5", "--rotate", "0.3", "--out", dst], check=True)`.
 3. Rewrite the truth CSV with the positions mapped by the inverse transform. `edge` = 1 for stars whose 6F square
-   reaches pixels the warp left at 0 or NaN.
+   reaches pixels the warp left NaN. Out of range, the resampler writes NaN, never 0.
 4. Add the column `kernel_var_px2` = 0.3333 (P-10's widths unchanged).
+5. Write the 16-bit sibling of the warped frame (P-20).
 
 The record's `extra` carries `{"shift": [0.5, 0.5], "rotate_deg": 0.3, "source": src}`.
 
@@ -2284,6 +2422,9 @@ The record's `extra` carries `{"shift": [0.5, 0.5], "rotate_deg": 0.3, "source":
 ```bash
 cd star-lab && python3 -m unittest tests.test_resampled -v && python3 bin/make_v2.py --families resampled/f2.0,resampled/f3.0
 ```
+
+`test_resampled` skips without the probe binary. **A SKIP is not a PASS:** build the binary first (Task 5 Step 6),
+run the test, and report it passing.
 
 Commit the athenaeum example change on `star-truth-lab` (no push), and the lab change with a push, each with the
 trailers:
@@ -2295,46 +2436,61 @@ trailers:
 ### Task 7: Injection into real frames
 
 **Files:**
-- Create: `star-lab/starlab/inject.py`, `star-lab/bin/inject.py`, `star-lab/manifests/inject.json` (committed after
-  the run)
+- Create: `star-lab/starlab/inject.py`, `star-lab/bin/inject.py`, and `star-lab/manifests/cameras.json` (the owner's
+  e⁻/ADU table, P-21). Commit `star-lab/manifests/inject.json` after the run.
 - Test: `star-lab/tests/test_inject.py`
 
 **Interfaces:**
-- Consumes: `render.*`, `shape.truth_widths`, `crlb.fisher_snr`, `fitsio.*`, `osc.site_channel`, `field.positions`.
+- Consumes: `render.*`, `shape.truth_widths`, `crlb.fisher_snr`, `crlb.star_bounds`, `fitsio.*`,
+  `osc.site_channel`, `osc.channel_fluxes`, `osc.FWHM_FACTOR`, `field.flux_for_snr`, `families.COLS`.
 - Produces:
-  - `inject.real_star_mask(img, fwhm_frame) -> bool array` (P-12);
-  - `inject.gain_per_unit(header, flat=None, flat_norm=None) -> (gain_map or scalar, source)`;
-  - `inject.tile_gain(img, mask) -> (gain, rn, span_ok)`;
-  - `inject.place(mask, nonfinite, fwhm_inj, n, rng, edge_set=True) -> list[(x, y, edge_dist_F)]`;
-  - `inject.inject_mono(img, header, stars, rng, gain) -> (out, truth_rows, stamp_mask)`;
-  - `inject.inject_mosaic(mosaic, pattern, stars, rng, gain) -> (out, truth_rows, stamp_mask)`;
-  - `inject.inject_pair(ref_img, tgt_img, stars, s_inj, rng, gain) -> (ref_out, tgt_out, truth_rows)`. Its truth sets
-    `psf_truth="unwarped"`.
-  - Per-star truth rows use Task 4's columns plus `psf_truth`, `gain`, `gain_source`.
+  - `inject.real_stars(img, fwhm_frame, k=3.0) -> (peaks [(x, y)], sigma)` (P-12: the local maxima, not a dilated
+    mask);
+  - `inject.dilate(mask, r) -> bool array` (a separable box dilation by cumulative sums, O(N));
+  - `inject.e_per_adu(header, cameras) -> (value or None, source)`;
+  - `inject.gain_per_unit(header, e_adu, flat_value=None, channel=None) -> float`;
+  - `inject.tile_gain(img, exclude) -> (gain, rn, span_ok)`;
+  - `inject.place(img, peaks, fwhm_inj, n, rng, edge_set=True) -> [(x, y, edge_F)]`;
+  - `inject.make_stars(img, fwhm_inj, n, rng, fwhm_frame, profiles=("m4",), snr=(10, 30, 100, 300)) -> [dict]`;
+  - `inject.inject_mono(img, stars, rng, gain_fn, rn) -> (out, rows, stamp_mask)`. `gain_fn(x, y) -> e⁻ per unit`.
+  - `inject.inject_mosaic(mosaic, pattern, stars, rng, gain_fn, rn, colours) -> (out, rows, stamp_mask)`. Here
+    `gain_fn(x, y, channel)`.
+  - `inject.inject_pair(ref_img, tgt_img, stars, s_inj, rng, gain_fn, rn) -> (ref_out, tgt_out, rows)`, with
+    `psf_truth = "unwarped"`.
+  - Every truth row carries every column of `families.COLS` plus `psf_truth`, `gain`, `gain_source`, `edge_F` and
+    `crlb_*` (Review Focus 3, review I-8).
 
-**Calibrated-frame unit (verify first).** Read `crates/athenaeum-core/src/calibration_library/light_cal.rs` and
-`export/calibrated_generator.rs` (read only, no edits) to confirm:
-- the calibrated light's domain;
-- the card names that carry the flat normalization (`ATH_FNRM`) and any scale divisor.
+**Gain per unit (P-21).** Write this formula into the module docstring:
+- `L_c = ((L − S)/(F/ATH_CFNM))/ATH_CSCL` (`calibration_library/light_cal.rs`), so one unit of `L_c` is
+  `ATH_CSCL × F(x, y)/ATH_CFNM` ADU of the raw light, and `g(x, y) = e_adu × ATH_CSCL × F(x, y)/ATH_CFNM`.
+- `F` is the master flat's pixel, from the file named in `ATH_CFLT`, read once per frame. Without it, `F/ATH_CFNM`
+  is taken as 1 and the source says `"no flat"`.
+- On a mosaic with `ATH_CCFA = T`, use `ATH_CFNR`, `ATH_CFNG` or `ATH_CFNB` for the channel of that CFA site.
 
-The gain per unit is then `EGAIN × 65535 × divisor × flat(x, y) / flat_norm`. Use the flat only when the frame's
-master flat path is known (the acceptance copy's `calibration_set` link, read with `immutable=1`). Write the formula
-you derived into the module docstring, and check it with the gain self-check below. If the self-check misses, stop
-and report; do not tune the formula toward it.
+Before writing code, verify every card name against `light_cal.rs` and one real calibrated header
+(`tierA-lnB-f1/…/calibrated/mono…/c_….fits`). Read only.
+
+**The owner's camera table.** `cameras.json` starts as
+`{"ATR2600M": {"100": null}, "QHY268M": {"56": null}}`. The two keys are the set 204 and m42 cameras, whose headers
+carry no `EGAIN`. The controller asks the owner for the values before Step 5. A `null` falls through to the raw-light
+tile estimate: the RAW light named by `ATH_CSRN`, in ADU, `tile_gain` → e⁻/ADU, with its vignetting giving the level
+span.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-"""Injection gates (spec §4, §9; review C-2, I-9, M-5)."""
-import unittest
+"""Injection gates (spec §4, §9; review C-2, I-9, M-5; plan review C-3, I-8, M-2)."""
+import math, time, unittest
 import numpy as np
-from starlab import inject, render
+from starlab import inject, render, families
+
+REAL = ((60, 60), (180, 90), (120, 200))
 
 
 def frame(seed=1, n=256, sky=0.05, gain=12500.0, rn=0.0005, nan_border=0):
     rng = np.random.default_rng(seed)
     img = rng.poisson(np.full((n, n), sky) * gain) / gain + rng.standard_normal((n, n)) * rn
-    for (x, y) in ((60, 60), (180, 90), (120, 200)):
+    for (x, y) in REAL:
         render.render_star(img, x, y, 0.02, render.components("moffat", 3.0, 3.0), 0.0, 3.0, 3.0)
     if nan_border:
         img[:nan_border, :] = np.nan
@@ -2343,20 +2499,25 @@ def frame(seed=1, n=256, sky=0.05, gain=12500.0, rn=0.0005, nan_border=0):
 
 class TestInject(unittest.TestCase):
     def test_outside_stamps_bit_identical(self):
-        src = frame(); rng = np.random.default_rng(3)
-        stars = inject.make_stars(src, fwhm_inj=3.0, n=10, rng=rng, fwhm_frame=3.0)
-        out, rows, stamp = inject.inject_mono(src, {}, stars, np.random.default_rng(4), gain=12500.0)
+        src = frame(); stars = inject.make_stars(src, 3.0, 10, np.random.default_rng(3), fwhm_frame=3.0)
+        out, rows, stamp = inject.inject_mono(src, stars, np.random.default_rng(4), lambda x, y: 12500.0, 0.0005)
         np.testing.assert_array_equal(out[~stamp], src[~stamp])
         self.assertTrue((out[stamp] != src[stamp]).any())
 
     def test_placement_keeps_12F_from_real_stars_and_nan(self):
         src = frame(nan_border=20)
-        mask = inject.real_star_mask(src, 3.0)
-        pts = inject.place(mask, ~np.isfinite(src), 3.0, 8, np.random.default_rng(5), edge_set=False)
+        peaks, _ = inject.real_stars(src, 3.0)
+        pts = inject.place(src, peaks, 3.0, 8, np.random.default_rng(5), edge_set=False)
+        self.assertGreater(len(pts), 0)
         for (x, y, _) in pts:
             self.assertGreaterEqual(y, 20 + 12 * 3.0 - 1)
-            for (sx, sy) in ((60, 60), (180, 90), (120, 200)):
-                self.assertGreaterEqual(np.hypot(x - sx, y - sy), 12 * 3.0)
+            for (sx, sy) in REAL:
+                self.assertGreaterEqual(math.hypot(x - sx, y - sy), 12 * 3.0)
+
+    def test_place_on_a_26mpx_nan_border_takes_seconds(self):
+        img = np.zeros((4168, 6224), np.float32); img[:300, :] = np.nan
+        t = time.time(); inject.place(img, [], 3.0, 20, np.random.default_rng(6), edge_set=True)
+        self.assertLess(time.time() - t, 20.0)
 
     def test_tile_gain_recovers_the_generating_gain(self):
         rng = np.random.default_rng(7); n = 512
@@ -2368,15 +2529,33 @@ class TestInject(unittest.TestCase):
     def test_tile_gain_refuses_a_flat_sky(self):
         rng = np.random.default_rng(8)
         img = rng.poisson(np.full((512, 512), 0.05) * 5000.0) / 5000.0
-        _, _, ok = inject.tile_gain(img, np.zeros_like(img, bool))
-        self.assertFalse(ok)
+        self.assertFalse(inject.tile_gain(img, np.zeros_like(img, bool))[2])
+
+    def test_e_per_adu_order(self):
+        cams = {"ATR2600M": {"100": 0.31}}
+        self.assertEqual(inject.e_per_adu({"EGAIN": "0.2467", "INSTRUME": "'ATR2600M'", "GAIN": "100"}, cams),
+                         (0.2467, "EGAIN"))
+        self.assertEqual(inject.e_per_adu({"INSTRUME": "'ATR2600M'", "GAIN": "100"}, cams), (0.31, "cameras.json"))
+        self.assertEqual(inject.e_per_adu({"INSTRUME": "'QHY268M'", "GAIN": "56"}, cams), (None, None))
+
+    def test_gain_per_unit_formula(self):
+        h = {"ATH_CSCL": "65535.0", "ATH_CFNM": "35000.0"}
+        self.assertAlmostEqual(inject.gain_per_unit(h, 0.25, flat_value=35000.0), 0.25 * 65535.0)
+        self.assertAlmostEqual(inject.gain_per_unit(h, 0.25, flat_value=17500.0), 0.25 * 65535.0 * 0.5)
 
     def test_pair_truth_is_marked_unwarped(self):
         a, b = frame(1), frame(2)
-        stars = inject.make_stars(a, fwhm_inj=3.0, n=6, rng=np.random.default_rng(9), fwhm_frame=3.0)
-        _, _, rows = inject.inject_pair(a, b, stars, 0.8, np.random.default_rng(10), gain=12500.0)
+        stars = inject.make_stars(a, 3.0, 6, np.random.default_rng(9), fwhm_frame=3.0)
+        _, _, rows = inject.inject_pair(a, b, stars, 0.8, np.random.default_rng(10), lambda x, y: 12500.0, 0.0005)
         self.assertTrue(all(r["psf_truth"] == "unwarped" for r in rows))
         self.assertTrue(all(abs(float(r["s_true"]) - 0.8) < 1e-12 for r in rows))
+
+    def test_injected_rows_have_every_scorecard_column(self):
+        src = frame(); stars = inject.make_stars(src, 3.0, 4, np.random.default_rng(11), fwhm_frame=3.0)
+        _, rows, _ = inject.inject_mono(src, stars, np.random.default_rng(12), lambda x, y: 12500.0, 0.0005)
+        for r in rows:
+            self.assertTrue(set(families.COLS) <= set(r.keys()), set(families.COLS) - set(r.keys()))
+            self.assertNotEqual(r["sky_local"], ""); self.assertNotEqual(r["peak_snr"], "")
 ```
 
 - [ ] **Step 2: Run them and see them fail** (`python3 -m unittest tests.test_inject -v`: ImportError).
@@ -2384,15 +2563,19 @@ class TestInject(unittest.TestCase):
 - [ ] **Step 3: Implement `inject.py`**
 
 ```python
-"""Injection of synthetic stars into real frames (spec §4; plan P-12). Calibrated frames serve every row;
-registered frames and the LN reference serve only the pair rows (psf_truth = 'unwarped')."""
+"""Injection of synthetic stars into real frames (spec §4; plan P-12, P-21). Calibrated frames serve every row;
+registered frames and the LN reference serve only the pair rows (psf_truth = 'unwarped').
+
+Gain per unit of a calibrated frame: L_c = ((L - S)/(F/ATH_CFNM))/ATH_CSCL, so one unit of L_c is
+ATH_CSCL * F(x, y)/ATH_CFNM ADU of the raw light and g(x, y) = e_adu * ATH_CSCL * F(x, y)/ATH_CFNM (F: the master
+flat's pixel; ATH_CFNR/G/B per channel on a CFA mosaic). e_adu: EGAIN, else cameras.json, else the raw light's tiles."""
 import math
 import numpy as np
-from . import render, crlb, shape, field
+from . import render, crlb, shape, field, families, osc
 
 
 def _median_bg(img, cell=64):
-    h, w = img.shape; bg = np.empty_like(img)
+    h, w = img.shape; bg = np.empty_like(img, dtype=np.float64)
     for y0 in range(0, h, cell):
         for x0 in range(0, w, cell):
             t = img[y0:y0 + cell, x0:x0 + cell]; v = t[np.isfinite(t)]
@@ -2400,162 +2583,235 @@ def _median_bg(img, cell=64):
     return bg
 
 
-def real_star_mask(img, fwhm_frame, k=3.0):
-    """Local maxima > k sigma_MAD above a 64-px median background, dilated by 6 x FWHM_frame (P-12)."""
+def real_stars(img, fwhm_frame, k=3.0):
+    """Local maxima > k sigma_MAD above a 64-px median background (P-12). Returns ([(x, y)], sigma)."""
     bg = _median_bg(img); r = img - bg; v = r[np.isfinite(r)]
-    sig = 1.4826 * np.median(np.abs(v - np.median(v)))
-    z = np.where(np.isfinite(r), r, -np.inf)
-    c = z[1:-1, 1:-1]
-    peak = np.ones_like(c, bool)
+    sig = 1.4826 * float(np.median(np.abs(v - np.median(v))))
+    z = np.where(np.isfinite(r), r, -np.inf); c = z[1:-1, 1:-1]
+    peak = c > k * sig
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if dy or dx:
                 peak &= c >= z[1 + dy:z.shape[0] - 1 + dy, 1 + dx:z.shape[1] - 1 + dx]
-    peak &= c > k * sig
-    ys, xs = np.nonzero(peak); ys += 1; xs += 1
-    R = 6.0 * fwhm_frame; mask = np.zeros(img.shape, bool); ri = int(math.ceil(R))
-    yy, xx = np.mgrid[-ri:ri + 1, -ri:ri + 1]; disc = xx * xx + yy * yy <= R * R
-    for y, x in zip(ys, xs):
-        ya, yb, xa, xb = max(0, y - ri), min(img.shape[0], y + ri + 1), max(0, x - ri), min(img.shape[1], x + ri + 1)
-        mask[ya:yb, xa:xb] |= disc[ya - (y - ri):yb - (y - ri), xa - (x - ri):xb - (x - ri)]
-    return mask
+    ys, xs = np.nonzero(peak)
+    return [(float(x + 1), float(y + 1)) for y, x in zip(ys, xs)], sig
 
 
-def tile_gain(img, mask, cell=64):
-    """Sky variance against level on star-free tiles: var = level / g + rn^2. Needs a level span >= 20 % of the sky."""
+def dilate(mask, r):
+    """Separable box dilation by r px (a (2r+1)^2 square) with cumulative sums: O(N) on a 26 Mpx map."""
+    m = mask.astype(np.int32)
+    for axis in (0, 1):
+        pad = [(r + 1, r) if a == axis else (0, 0) for a in (0, 1)]
+        c = np.cumsum(np.pad(m, pad), axis=axis, dtype=np.int64)
+        n = m.shape[axis]
+        hi = np.take(c, np.arange(2 * r + 1, 2 * r + 1 + n), axis=axis)
+        lo = np.take(c, np.arange(0, n), axis=axis)
+        m = ((hi - lo) > 0).astype(np.int32)
+    return m.astype(bool)
+
+
+def e_per_adu(header, cameras):
+    if "EGAIN" in header:
+        return float(header["EGAIN"]), "EGAIN"
+    cam = str(header.get("INSTRUME", "")).strip("' "); g = str(header.get("GAIN", "")).strip("' ")
+    v = (cameras or {}).get(cam, {}).get(g)
+    return (float(v), "cameras.json") if v is not None else (None, None)
+
+
+def gain_per_unit(header, e_adu, flat_value=None, channel=None):
+    cscl = float(header.get("ATH_CSCL", 65535.0))
+    key = {None: "ATH_CFNM", 0: "ATH_CFNR", 1: "ATH_CFNG", 2: "ATH_CFNB"}[channel]
+    norm = float(header.get(key, header.get("ATH_CFNM", "nan")))
+    if flat_value is None or not math.isfinite(norm):
+        return e_adu * cscl
+    return e_adu * cscl * float(flat_value) / norm
+
+
+def tile_gain(img, exclude, cell=64):
+    """Sky variance against level on clean tiles: var = level / g + c (c = rn^2 plus any removed pedestal, so only the
+    gain is trusted). Needs a level span >= 20 % of the median level."""
     lv, vr = [], []
     h, w = img.shape
     for y0 in range(0, h - cell + 1, cell):
         for x0 in range(0, w - cell + 1, cell):
             t = img[y0:y0 + cell, x0:x0 + cell]
-            if mask[y0:y0 + cell, x0:x0 + cell].any() or not np.isfinite(t).all():
+            if exclude[y0:y0 + cell, x0:x0 + cell].any() or not np.isfinite(t).all():
                 continue
-            d = np.diff(t, axis=1)   # removes slow structure; var(diff) = 2 var
+            d = np.diff(t, axis=1)
             lv.append(np.median(t)); vr.append(0.5 * (1.4826 * np.median(np.abs(d - np.median(d)))) ** 2)
     lv, vr = np.array(lv), np.array(vr)
     if lv.size < 8 or (np.percentile(lv, 95) - np.percentile(lv, 5)) < 0.2 * np.median(lv):
         return float("nan"), float("nan"), False
-    A = np.vstack([lv, np.ones_like(lv)]).T
-    slope, icpt = np.linalg.lstsq(A, vr, rcond=None)[0]
+    slope, icpt = np.linalg.lstsq(np.vstack([lv, np.ones_like(lv)]).T, vr, rcond=None)[0]
     return 1.0 / slope, math.sqrt(max(icpt, 0.0)), True
 
 
-def place(mask, nonfinite, fwhm_inj, n, rng, edge_set=True):
-    """Jittered grid, >= 12 F from real stars, non-finite pixels and each other; plus an edge set at 1, 2, 3 F."""
-    h, w = mask.shape; R = 12.0 * fwhm_inj; ri = int(math.ceil(R))
-    bad = mask.copy()
-    if nonfinite.any():
-        ys, xs = np.nonzero(nonfinite)
-        for y, x in zip(ys[::7], xs[::7]):
-            bad[max(0, y - ri):y + ri + 1, max(0, x - ri):x + ri + 1] = True
-    pts = []; pitch = int(math.ceil(R))
+def place(img, peaks, fwhm_inj, n, rng, edge_set=True):
+    """Jittered grid; >= 12 F from every real peak and every non-finite pixel, from each other, and not on a pixel above
+    0.5 x the frame maximum. The edge set sits 1, 2, 3 F inside the coverage edge (or the frame border)."""
+    h, w = img.shape; R = 12.0 * fwhm_inj; ri = int(math.ceil(R))
+    nonfinite = ~np.isfinite(img)
+    bad = dilate(nonfinite, ri) if nonfinite.any() else np.zeros((h, w), bool)
+    bad |= np.nan_to_num(img, nan=-np.inf) > 0.5 * np.nanmax(img) if np.isfinite(img).any() else False
+    grid = {}
+    for (px, py) in peaks:
+        grid.setdefault((int(px // R), int(py // R)), []).append((px, py))
+
+    def clear(x, y):
+        cx, cy = int(x // R), int(y // R)
+        return all(math.hypot(px - x, py - y) >= R for gx in (cx - 1, cx, cx + 1) for gy in (cy - 1, cy, cy + 1)
+                   for (px, py) in grid.get((gx, gy), ()))
+
+    pitch = ri; pts = []
     cand = [(x + rng.uniform(-0.25, 0.25) * pitch, y + rng.uniform(-0.25, 0.25) * pitch)
             for y in range(ri, h - ri, pitch) for x in range(ri, w - ri, pitch)]
     rng.shuffle(cand)
     for x, y in cand:
         if len(pts) >= n:
             break
-        if bad[int(round(y)), int(round(x))] or any(math.hypot(x - p[0], y - p[1]) < R for p in pts):
+        if bad[int(round(y)), int(round(x))] or not clear(x, y) or any(math.hypot(x - p[0], y - p[1]) < R for p in pts):
             continue
         pts.append((x, y, float("inf")))
     if edge_set:
-        for k in (1, 2, 3):
-            for (x, y) in ((k * fwhm_inj, h / 2 + 3 * R * k), (w - 1 - k * fwhm_inj, h / 2 - 3 * R * k)):
-                if 0 <= y < h and not mask[int(y), int(x)]:
-                    pts.append((x, y, float(k)))
+        fin_rows = np.nonzero(np.isfinite(img).any(axis=1))[0]; fin_cols = np.nonzero(np.isfinite(img).any(axis=0))[0]
+        if fin_rows.size and fin_cols.size:
+            y_top, x_left, x_right = fin_rows[0], fin_cols[0], fin_cols[-1]
+            ym = (fin_rows[0] + fin_rows[-1]) / 2.0
+            for k in (1, 2, 3):
+                for (x, y) in ((x_left + k * fwhm_inj, ym + 3 * R * k), (x_right - k * fwhm_inj, ym - 3 * R * k),
+                               (fin_cols[0] + w / 2.0, y_top + k * fwhm_inj)):
+                    if 0 <= y < h and 0 <= x < w and np.isfinite(img[int(y), int(x)]) and clear(x, y):
+                        pts.append((x, y, float(k)))
     return pts
 
 
 def make_stars(img, fwhm_inj, n, rng, fwhm_frame, profiles=("m4",), snr=(10.0, 30.0, 100.0, 300.0)):
-    mask = real_star_mask(img, fwhm_frame); pts = place(mask, ~np.isfinite(img), fwhm_inj, n, rng)
-    out = []
-    for i, (x, y, e) in enumerate(pts):
-        out.append({"x": x, "y": y, "edge_F": e, "prof": profiles[i % len(profiles)], "fwhm": fwhm_inj,
-                    "ecc": 0.0, "theta": 0.0, "snr": snr[i % len(snr)]})
-    return out
+    peaks, _ = real_stars(img, fwhm_frame)
+    pts = place(img, peaks, fwhm_inj, n, rng)
+    return [{"x": x, "y": y, "edge_F": e, "prof": profiles[i % len(profiles)], "fwhm": fwhm_inj, "ecc": 0.0,
+             "theta": 0.0, "snr": snr[i % len(snr)]} for i, (x, y, e) in enumerate(pts)]
 
 
-def _stamp(star, shape_hw, sky_level, gain, rn):
-    prof = star["prof"]; fm = star["fwhm"]; fM = fm / math.sqrt(1 - star["ecc"] ** 2)
+def _render(st, shape_hw, sky, g, rn, flux=None):
+    prof = st["prof"]; fm = st["fwhm"]; fM = fm / math.sqrt(1 - st["ecc"] ** 2)
     beta = float(prof[1:]) if prof.startswith("m") else None
     comps = render.components("moffat" if beta else "gauss", fm, fM, beta=beta or 4.0)
-    flux = field.flux_for_snr(star["snr"], fm, sky_level, gain, rn)
+    flux = flux if flux is not None else field.flux_for_snr(st["snr"], fm, sky, g, rn)
     s = np.zeros(shape_hw)
-    fimg, pk, box = render.render_star(s, star["x"], star["y"], flux, comps, math.radians(star["theta"]), fm, fM)
+    fimg, pk, box = render.render_star(s, st["x"], st["y"], flux, comps, math.radians(st["theta"]), fm, fM)
     return s, flux, fimg, pk, box, comps, fm, fM, beta
 
 
-def inject_mono(img, header, stars, rng, gain, rn=0.0):
+def _row(i, st, flux, fimg, pk, cut, sky, grad, g, rn, comps, fm, fM, beta, plane=0):
+    w = shape.truth_widths(comps, math.radians(st["theta"]), fm, fM, "moffat_fixed" if beta else "gauss", beta)
+    cb = crlb.star_bounds(lambda a, b: render.components("moffat" if beta else "gauss", a, b, beta=beta or 4.0),
+                          st["x"], st["y"], flux, sky, g, rn, fm, fM, math.radians(st["theta"]), st["ecc"])
+    r = {c: "" for c in families.COLS}
+    r.update(id=i, x=st["x"], y=st["y"], flux=flux, flux_img=fimg, peak=pk, peak_snr=pk / math.sqrt(sky / g + rn * rn),
+             fisher_snr=crlb.fisher_snr(cut, sky, g, rn), saturated=0, edge=int(math.isfinite(st["edge_F"])),
+             edge_F=st["edge_F"], profile=st["prof"], beta=beta or 0.0, sky_local=sky, sky_grad=grad, s_true=1.0,
+             plane=plane, pair_id="", kind="injected", psf_truth="calibrated", gain=g, **w)
+    r.update({"crlb_" + k: v for k, v in cb.items() if k != "fisher_snr"})
+    return r
+
+
+def inject_mono(img, stars, rng, gain_fn, rn):
     out = img.copy(); stamp_mask = np.zeros(img.shape, bool); rows = []
-    sky = float(np.nanmedian(img))
+    bg = _median_bg(img)
     for i, st in enumerate(stars):
-        s, flux, fimg, pk, (ya, yb, xa, xb), comps, fm, fM, beta = _stamp(st, img.shape, sky, gain, rn)
-        g = gain[ya:yb + 1, xa:xb + 1] if np.ndim(gain) == 2 else gain
+        sky, grad = _local(bg, st["x"], st["y"]); g = float(gain_fn(st["x"], st["y"]))
+        s, flux, fimg, pk, (ya, yb, xa, xb), comps, fm, fM, beta = _render(st, img.shape, sky, g, rn)
         cut = s[ya:yb + 1, xa:xb + 1]
         noisy = rng.poisson(np.clip(cut, 0, None) * g) / g          # the star's own Poisson noise
         region = out[ya:yb + 1, xa:xb + 1]; fin = np.isfinite(region)
         region[fin] += noisy[fin]
         stamp_mask[ya:yb + 1, xa:xb + 1] |= cut > 0
-        w = shape.truth_widths(comps, math.radians(st["theta"]), fm, fM, "moffat_fixed" if beta else "gauss", beta)
-        rows.append(dict(id=i, x=st["x"], y=st["y"], flux=flux, flux_img=fimg, peak=pk,
-                         fisher_snr=crlb.fisher_snr(cut, sky, float(np.mean(g)), rn), saturated=0,
-                         edge=int(np.isfinite(st["edge_F"])), profile=st["prof"], beta=beta or 0.0,
-                         s_true=1.0, plane=0, pair_id="", kind="injected", psf_truth="calibrated",
-                         gain=float(np.mean(g)), **w))
+        rows.append(_row(i, st, flux, fimg, pk, cut, sky, grad, g, rn, comps, fm, fM, beta))
     return out, rows, stamp_mask
 
 
-def inject_mosaic(mosaic, pattern, stars, rng, gain, colours=None):
-    """OSC: each channel's star at full resolution, sampled at that channel's CFA sites, noise per pixel."""
-    from . import osc
+def _local(bg, x, y):
+    ix, iy = int(round(x)), int(round(y)); h, w = bg.shape
+    ix = min(max(ix, 1), w - 2); iy = min(max(iy, 1), h - 2)
+    gx = 0.5 * (bg[iy, ix + 1] - bg[iy, ix - 1]); gy = 0.5 * (bg[iy + 1, ix] - bg[iy - 1, ix])
+    return float(bg[iy, ix]), float(math.hypot(gx, gy))
+
+
+def inject_mosaic(mosaic, pattern, stars, rng, gain_fn, rn, colours):
+    """OSC: each channel's star at full resolution, sampled at that channel's CFA sites, with per-site gain and the
+    per-channel sky (the median of that channel's sites)."""
     sc = osc.site_channel(pattern); out = mosaic.copy(); stamp = np.zeros(mosaic.shape, bool); rows = []
     yy, xx = np.mgrid[0:mosaic.shape[0], 0:mosaic.shape[1]]; site = sc[yy & 1, xx & 1]
-    sky = float(np.nanmedian(mosaic))
+    sky_k = [float(np.nanmedian(mosaic[site == k])) for k in range(3)]
     for i, st in enumerate(stars):
-        col = colours[i] if colours is not None else 0.5
-        fl = osc.channel_fluxes(1.0, col)
+        fl = osc.channel_fluxes(1.0, colours[i])
         for k in range(3):
-            stk = dict(st, fwhm=st["fwhm"] * osc.FWHM_FACTOR[k], snr=st["snr"] * fl[k])
-            s, flux, fimg, pk, (ya, yb, xa, xb), comps, fm, fM, beta = _stamp(stk, mosaic.shape, sky, gain, 0.0)
-            sel = (site[ya:yb + 1, xa:xb + 1] == k)
+            stk = dict(st, fwhm=st["fwhm"] * osc.FWHM_FACTOR[k])
+            g = float(gain_fn(st["x"], st["y"], k))
+            base = field.flux_for_snr(st["snr"], stk["fwhm"], sky_k[k], g, rn) * fl[k]
+            s, flux, fimg, pk, (ya, yb, xa, xb), comps, fm, fM, beta = _render(stk, mosaic.shape, sky_k[k], g, rn, base)
+            sel = site[ya:yb + 1, xa:xb + 1] == k
             cut = s[ya:yb + 1, xa:xb + 1] * sel
-            noisy = rng.poisson(np.clip(cut, 0, None) * gain) / gain
+            noisy = rng.poisson(np.clip(cut, 0, None) * g) / g
             region = out[ya:yb + 1, xa:xb + 1]; fin = np.isfinite(region)
             region[fin] += noisy[fin]; stamp[ya:yb + 1, xa:xb + 1] |= cut > 0
-            w = shape.truth_widths(comps, 0.0, fm, fM, "moffat_fixed" if beta else "gauss", beta)
-            rows.append(dict(id=i, x=st["x"], y=st["y"], flux=flux, flux_img=fimg, peak=pk, saturated=0,
-                             edge=int(np.isfinite(st["edge_F"])), profile=st["prof"], beta=beta or 0.0, s_true=1.0,
-                             plane=k, pair_id="", kind="injected", psf_truth="calibrated", gain=gain, **w))
+            rows.append(_row(i, stk, flux, fimg, pk, s[ya:yb + 1, xa:xb + 1], sky_k[k], 0.0, g, rn, comps, fm, fM, beta, plane=k))
     return out, rows, stamp
 
 
-def inject_pair(ref_img, tgt_img, stars, s_inj, rng, gain):
-    ref_out, rows, _ = inject_mono(ref_img, {}, stars, rng, gain)
-    tstars = [dict(s) for s in stars]
+def inject_pair(ref_img, tgt_img, stars, s_inj, rng, gain_fn, rn):
+    ref_out, rows, _ = inject_mono(ref_img, stars, rng, gain_fn, rn)
     t_out = tgt_img.copy()
-    for st, r in zip(tstars, rows):
-        s, flux, fimg, pk, (ya, yb, xa, xb), *_ = _stamp(st, tgt_img.shape, float(np.nanmedian(tgt_img)), gain, 0.0)
+    for st, r in zip(stars, rows):
+        g = float(gain_fn(st["x"], st["y"]))
+        s, *_rest = _render(st, tgt_img.shape, float(r["sky_local"]), g, rn, flux=float(r["flux"]))
+        (ya, yb, xa, xb) = _rest[3]
         cut = s[ya:yb + 1, xa:xb + 1] / s_inj
-        noisy = rng.poisson(np.clip(cut, 0, None) * gain) / gain
+        noisy = rng.poisson(np.clip(cut, 0, None) * g) / g
         reg = t_out[ya:yb + 1, xa:xb + 1]; fin = np.isfinite(reg); reg[fin] += noisy[fin]
         r.update(psf_truth="unwarped", s_true=s_inj, pair_id="pair")
     return ref_out, t_out, rows
 ```
 
-`gain_per_unit(header, flat, flat_norm)` follows the calibrated-frame unit derived above and returns
-`(value or map, source)`, where `source` is one of `"EGAIN+flat"`, `"EGAIN"`, `"tiles"` or `"refused"`.
+`inject_pair` renders the target star at the same flux as the reference star and divides it by `s_inj`, so the
+target holds `flux / s_inj`.
+
+`families.COLS` comes from Task 4. Truth CSVs are written with `families.write_truth(path, rows, extra_cols=("psf_truth",
+"gain", "gain_source", "edge_F", "crlb_x", …))`.
+
+**Hot pixels.** The calibrated frame's hot-pixel correction (`ATH_CHPX`: 104 078 replaced on the set 204 frame) is
+not persisted as a map. Record `"hot_pixel_map": "not available"` in the injection manifest. The noise of a replaced
+pixel is not Poisson, and the report says so.
 
 - [ ] **Step 4: Implement `bin/inject.py`**
 
 ```
-inject.py calibrated <frame.fits> --fwhm-frame F --out DIR [--egain G] [--flat path --flat-norm N] [--pattern RGGB]
-inject.py pair <ref.fits> <member.fits> --fwhm-frame F --s-inj S --out DIR
+inject.py calibrated <frame.fits> --fwhm-frame F --out DIR [--cameras manifests/cameras.json] [--pattern RGGB]
+inject.py pair <ref.fits> <member.fits> --source-calibrated <calibrated.fits> --fwhm-frame F --s-inj S --out DIR
 ```
 
-It writes `<stem>.inj.fits`, `<stem>.inj.csv` and `<stem>.stamps.npy` (the bool mask, uncommitted data). It records
-`{"source": path, "source_sha256": ..., "seed": ..., "gain": ..., "gain_source": ...}` in
-`star-lab/manifests/inject.json`. It runs the gain self-check (spec §9: the median ratio of measured to predicted
-tile variance in [0.9, 1.1]) and refuses the frame on a miss, naming it.
+**What it writes:**
+- `<stem>.inj.fits`;
+- for calibrated frames, its 16-bit sibling `<stem>.inj.u16.fits` (P-20);
+- `<stem>.inj.csv`;
+- `<stem>.stamps.npy` (uncommitted data).
+
+**Gain:**
+- It resolves `e_adu` (P-21 order) and reads the flat named in `ATH_CFLT` when it exists.
+- A pair takes its gain from `--source-calibrated`, the calibrated frame the registered member came from: a
+  registered frame's own tiles are smoothed by the warp.
+
+**Manifest record** in `star-lab/manifests/inject.json`:
+`{"source": path, "source_sha256": …, "seed": …, "e_adu": …, "gain_source": …, "flat": path|null, "hot_pixel_map":
+"not available", "u16": path|null, "kind": "calibrated"|"mosaic"|"pair"|"raw"}`. `run_probe.py` reads `u16` for the
+`analysis` path.
+
+OSC injection uses the `calibrated_mosaic` the run kept. Spec §4's alternative, the mosaic rebuilt from the raw
+through `light_cal`, is not planned, and the report says so.
+
+**Gain self-check (P-21).** On star-free 64-px tiles of the calibrated frame, the median ratio of the measured
+variance to `level/g + c` must lie in [0.9, 1.1], with the intercept `c` free. The read noise is reported, not gated.
+A miss refuses the frame and names it.
 
 - [ ] **Step 5: Run the tests, then inject the spec §4 frames**
 
@@ -2563,21 +2819,24 @@ tile variance in [0.9, 1.1]) and refuses the frame on a miss, naming it.
 cd star-lab && python3 -m unittest tests.test_inject -v
 ```
 
-Locate the frames read-only in the acceptance copies:
-- calibrated frames: `stacking_artifacts` kind `calibrated`;
-- OSC mosaics: kind `calibrated_mosaic`;
-- registered frames: kind `registered`;
-- the LN reference: kind `ln_reference`.
+Before injecting, the controller asks the owner for the two `cameras.json` values (P-21). A `null` uses the raw-light
+tile estimate.
 
-Use `sqlite3 "file:$D/athenaeum.db?immutable=1"` on `tierA-lnB-f1` (set 204), `hc11B-f1` (Horse C11), and
-`lnB-runB-f1` (run B; its frames are under `stackwork/_projects/…`). Use the star-test frames from
-`~/Pictures/star test/`.
+Locate the frames read-only (`sqlite3 "file:$D/athenaeum.db?immutable=1"`, `stacking_artifacts`):
+- **Calibrated:** `tierA-lnB-f1` (set 204 mono and OSC; OSC mosaics are `calibrated_mosaic`), `hc11B-f1`
+  (Horse C11 L and G, `EGAIN` 0.2467) and `lnB-runB-f1` (run B). Take 3 frames per dataset: the sharpest, the median
+  and the broadest by their `metrics` FWHM, 60 stars each.
+- **Star-test corpus:** the singles and m42 30 s frames named in spec §4, which are raw lights. Inject into the raw
+  ADU domain with gain `e_adu` per ADU, and write the 16-bit file directly.
+- **Pairs:**
+  - set 204 mono and set 204 OSC: the `ln_reference` under `…/ln/<group>/reference.fits` in `tierA-lnB-f1`, plus one
+    registered member each;
+  - run B: `lnB-runB-f1`, `ln_reference` ×2.
 
-Inject:
-- 3 calibrated frames per dataset (the brightest, the median and the broadest member by the run's `metrics` FWHM),
-  60 stars each;
-- one registered member + the LN reference per dataset as a pair with `s_inj` 0.8;
-- the singles and m42 30 s frames named in the spec.
+  `s_inj` is 0.8 for all of them.
+
+Horse C11 has no persisted LN reference in any acceptance copy, so it gets no injected pair (plan review I-7). Its §8
+LN row reuses checkpoint B's outputs. OSC mosaic injection covers set 204 only, and the report says so.
 
 Report every refused frame with its reason.
 
@@ -2606,6 +2865,10 @@ Report every refused frame with its reason.
   - `scorecard.rows_*()` functions, one per spec §7 row, each returning `list[dict]`;
   - `scorecard.render_markdown(rows) -> str`;
   - CLI `bin/scorecard.py <manifest> --probe-dir DIR [--erp-dir DIR] --out OUT.md --json OUT.json`.
+  - `probe_io.load_erp(path) -> list[dict]` in the schema `x,y,fwhm_x,fwhm_y,theta_deg,beta,flux,background,function`,
+    tested on `tests/data/erp_sample.csv`. That file is five rows copied in this task from
+    `~/.athenaeum-acc/star-lab/grid/iso/m4/erp-stars-e7t0.csv`, columns `cx, cy, sx, sy, theta, beta, flux, B,
+    fwhmX, fwhmY`, already at `c0 − 0.5`. Task 9 relies on this reader.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2627,6 +2890,20 @@ class TestMatch(unittest.TestCase):
         m = np.array([[100.8, 100.0]])
         idx = match.match(t, np.array([0, 1]), m, np.array([1.5, 1.5]))
         self.assertEqual(idx.tolist(), [0, -1])
+
+    def test_analysis_rows_are_not_flipped(self):
+        """P-6: flipVertical is recorded and never applied."""
+        import json, os, tempfile
+        from starlab import probe_io
+        d = tempfile.mkdtemp(); p = os.path.join(d, "a.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"kind": "star", "path": "analysis", "plane": 0, "x": 50.0, "y": 100.0, "thetaDeg": 20.0}) + "\n")
+            f.write(json.dumps({"kind": "frame", "path": "analysis", "plane": 0, "flipVertical": True,
+                                "frame": {"width": 2048, "height": 2048}}) + "\n")
+        got = probe_io.load(p)
+        self.assertEqual(got["stars"]["analysis"][0]["y"], 100.0)
+        self.assertEqual(got["stars"]["analysis"][0]["thetaDeg"], 20.0)
+        self.assertTrue(got["frames"]["analysis"][0]["flipVertical"])
 
     def test_one_to_one(self):
         t = np.array([[10.0, 10.0], [11.0, 10.0]]); m = np.array([[10.5, 10.0]])
@@ -2727,8 +3004,8 @@ def classify_unmatched(meas_xy, truth_rows, artefact_rows, nebula_map=None, cell
 
 - [ ] **Step 4: Implement `probe_io.py` and `scorecard.py`**
 
-`probe_io.load` reads the JSONL and splits it into seeds, stars and frames. It applies P-6: for path `analysis` with
-`flipVertical`, `y → H − 1 − y` and `thetaDeg → −thetaDeg`, with H from the frame line's `frame` (image height).
+`probe_io.load` reads the JSONL and splits it into seeds, stars and frames. It leaves the `analysis` coordinates as
+they are (P-6) and asserts that the `analysis` frame line carries `flipVertical`.
 
 `scorecard.py` has one function per spec §7 row:
 - `rows_detection(truth, meas, path, family, threshold_snr)`;
@@ -2762,6 +3039,9 @@ Row 6 reports two things:
   `measure` path (F1's own F). It is computed per distinct shape from `shape.fine_profile` with `pixel_box=True`.
   That is the share of light F1's circles hold for that profile.
 
+The model bound (P-18) is computed here, per image and plane, with `crlb.star_bounds` under an elliptical Moffat at
+the Auto β that the `measure` frame line reports, at the truth's point-fit widths. It is cached per (shape, β).
+
 Row 10 recomputes σ0 from the seed lines with the production formula. Read `initial_sigma` in `psf_signal.rs` and
 port it exactly; name it `sigma0_diagnostic`. Row 11 pairs twins by truth id.
 
@@ -2776,11 +3056,25 @@ run_probe.py <manifest.json> [--families a,b] [--out DIR]   # default DIR = DATA
 
 For every image:
 1. Check memory (as `make_v2.py`).
-2. Run `PROBE measure <img> --out DIR/<family>/<name>.jsonl`:
-   - add `--debayer RGGB` for OSC mosaics on the stacking paths;
-   - give OSC mosaics a second invocation with `--paths analysis` on the mosaic itself;
-   - add `--plane all` for `.ideal.fits`, with `--paths measure,betas`.
-3. Time each invocation with `/usr/bin/time -l -o <name>.time`.
+2. Run the stacking paths on the float file: `PROBE measure <img> --paths measure,betas,register --out
+   DIR/<family>/<name>.jsonl`. Add `--debayer RGGB` for OSC mosaics, and `--plane all` for `.ideal.fits` (with
+   `--paths measure,betas`).
+3. Run `analysis` on the 16-bit sibling in a second invocation: `PROBE measure <extra.u16> --paths analysis --out
+   DIR/<family>/<name>.analysis.jsonl` (P-20). For OSC this is the mosaic sibling, which the analyzer
+   green-interpolates as the tab does.
+4. Real frames and the 4096² image run one path per invocation (P-22).
+5. Time every invocation with `/usr/bin/time -l -o <name>.<paths>.time`.
+
+**Selection (row 10, plan review I-6).** For `saturated/*`, `artefacts`, `halo` and `sharp/m4/f3.5`, also run the
+product's LN selection on a self-pair:
+
+```
+LN_SCALE_PROBE --ref <img> --plane 0 --beta auto --stars-dir DIR/<family>/sel --member self=<img>
+```
+
+Selection and its per-star dump are the product's; the scale is 1 and ignored. `rows_selection` reads the kept list
+from that dump. Check the dump's columns in `examples/ln_scale_probe.rs` first: the reference dump is `x,y,fwhm,amp,
+b,sig` at `:630`, and the pair dump is near `:1705`.
 
 For pair families (`pairs`, `osc_pairs`, `density_pairs`, `truthcheck`, `truthcrowd`):
 1. For OSC, `PROBE debayer` first.
@@ -2824,9 +3118,12 @@ Read `erp/erp_stars.js`, `erp/run_ln.js`, `erp/run_job.sh` and `run_measurers.py
 - their output CSV columns;
 - the memory guard.
 
-Write `test_erp_v2.py` against a small CSV sample copied from an existing Task 16b output under
-`~/.athenaeum-acc/star-lab/grid/` (a header plus five rows, committed as `tests/data/erp_sample.csv`). It asserts
-that `erp_v2.normalise(path)` returns the schema above with the coordinate convention applied.
+Write `test_erp_v2.py` against `tests/data/erp_sample.csv` (shipped in Task 8). It asserts that
+`erp_v2.normalise(path)` equals `probe_io.load_erp(path)` row for row.
+
+`run_job.sh` copies each job to a FIXED path, `$HOME/.athenaeum-acc/star-lab/erp/{ln,stars}-job.json`, and writes its
+logs there, because the ERP script reads its job from that path. That fixed path is why only one instance can ever
+run. `erp_v2.py` keeps writing its jobs there; it never moves `L` or the `-r=` script paths separately.
 
 - [ ] **Step 2: Implement `erp_v2.py`**
 
@@ -2877,7 +3174,7 @@ The gates (spec §9 table, with this plan's rulings):
 | `pixel_integration` | re-run `tests.test_render` (the three integration tests) |
 | `mosaic` | re-run `tests.test_osc.test_every_cfa_pixel_equals_its_channel` |
 | `injection` | for every `manifests/inject.json` entry: reload the source and the injected frame, check bit-identity outside the stamps |
-| `gain` | the recorded gain self-check per injected calibrated frame: median measured/predicted tile variance in [0.9, 1.1] |
+| `gain` | the recorded gain self-check per injected calibrated frame: median measured/predicted tile variance in [0.9, 1.1], intercept free; the read noise is reported, not gated (P-21) |
 | `determinism` | `make_v2.py --check` |
 | `crlb` | re-run `tests.test_crlb` |
 | `matcher` | match every `sharp` image's truth against itself: 100 %, zero unmatched |
@@ -2886,19 +3183,22 @@ The gates (spec §9 table, with this plan's rulings):
 | `erp_emulation` | `erplib.py` against the ERP's own LN log on the `pairs` targets: within 0.1 % (skipped with a note when no ERP LN output exists yet) |
 | `probe_build` | `cargo check -p athenaeum-core --examples` (one compile, `CARGO_BUILD_JOBS=4`) |
 | `probe_parity` | see below |
-| `seed_parity` | a `sharp/m4/f3.5` image: the probe's seed lines equal a direct `ImageAnalyzer::detect_fast_data` list filtered as Measure filters it (`snr >= min_snr && peak > 0`), star for star. Use `examples/detection_audit.rs`'s output if it prints the list; otherwise run `star_probe measure` twice and compare to the seeds count in the `channel` (`starsDetected`), and say which was done. |
+| `seed_parity` | the in-crate pin `measure_plane_detailed_returns_the_seeds_it_fitted_and_the_same_measurement` (the returned `Vec` is the one the fitter consumed; `seeds.len() == stars_detected`) passes, and on a `sharp/m4/f3.5` image the probe's seed lines are brightest-first by `flux` (the detector's order). A star-for-star external comparison is not available without a product change, and the gate's line says so. |
 
-**`probe_parity`.** In `tierA-lnB-f1`, pick one calibrated mono frame of set 204:
+**`probe_parity`.** In `tierA-lnB-f1`, pick one calibrated mono frame of set 204 (6224 × 4168):
 - `stacking_artifacts` kind `calibrated` gives the frame;
-- its `fits.0` row gives the fits artifact;
-- its `metrics` row's `payload_json` gives the stored measurement;
-- the run's `stacking_runs.config_json` gives the run's config.
+- its `fits.0` row gives the fits artifact (`…/fits/<group>/<stem>.p0.athf`; check that it exists on disk);
+- its `metrics` row's `payload_json` is a **`FrameMeasurement`** (`{"width", "height", "channels": [...],
+  "durationMs"}`), so compare `channels[0]` and ignore `durationMs`;
+- the run's config comes through `config_hash`, because `stacking_artifacts` has no `run_id`:
+  `SELECT config_json FROM stacking_runs WHERE config_hash = <the artifact's config_hash>`. The run's `config_json`
+  decodes directly as a `StackingConfig`; the probe's `v.get("config")` fallback is for per-set documents.
 
 Then:
 1. Run `star_probe measure <calibrated> --config <run config> --paths measure --out a.jsonl`.
 2. Run `star_probe dump-fits <fits.0 path> --out b.jsonl`.
 3. Pass when every field of every fit is equal, except `peak5` (not persisted), and the `channel` equals the stored
-   metrics row apart from timings.
+   `channels[0]` (timings are `#[serde(skip)]`, so they are not in either).
 
 - [ ] **Step 1: Implement `gates.py`** (each gate is a function returning `(ok, detail)`; the CLI runs them in table
   order).
@@ -2942,7 +3242,8 @@ Run `run_probe.py` over `manifests/inject.json` (calibrated injections: every pa
 
 For the LN scale per member on set 204 mono and OSC, run B and Horse C11 G:
 - reuse the checkpoint-B probe outputs and harness truth already under `~/.athenaeum-acc/lnB/`, re-reading truth on
-  each run's own LN reference (as checkpoint B did);
+  each run's own LN reference (as checkpoint B did). Horse C11 G has no persisted LN reference in the acceptance
+  copies, so it has no injected pair (Task 7);
 - add the injected pairs' `s_inj` rows;
 - carry the `truth_crowded` gap as the error bar on members that took the crowded fallback.
 
