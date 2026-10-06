@@ -216,6 +216,7 @@ it. The pre-check's gaps on the old reference (−0.14 % / 0.26 % / −0.07) and
 | `--stack-sim` mono, no rejection (F1) | ±0.5 % of the truth-corrected arm | psfSel −4.16 % | −0.17 % **PASS**; arm / LN reference 1.0060 (truth 1.0078) |
 | Seeds `k` per channel | reported (≈ 1 under F1) | mono 0.9974; OSC 0.9998 / 1.0043 / 1.0022 | mono 1.0001; OSC 1.0000 / 1.0000 / 1.0002 (`lnA`: 0.9916; 0.9965 / 0.9969 / 0.9925) |
 | Drizzle level / coverage | as before | unchanged data facts (mono coverage 0.9935, OSC R level 0.9976) | same |
+| Pedestal warning (§11.5) | none on set 204 | none in the run's warnings | none |
 | Wall | reported | 901 s (Normalize 2.46 min) | 901 s (Normalize 2.46 min); `lnB-main` 851 s (1.89 min), `lnA` 870 s (2.21 min) |
 
 Planes are listed mono, then OSC R / G / B. `k` is the master's star flux over the LN reference's (`master_phot.py`).
