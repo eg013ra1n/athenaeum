@@ -223,6 +223,7 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 | `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
 | `ln_common_fwhm_px` | f64 | `F`, the larger of the two median FWHMs | same |
 | `ln_growth_factor` | f64 | the growth-curve correction `c` | same (growth curve) |
+| `ln_growth_pairs` | u64 | how many pairs the growth-curve median `c` was taken over (up to 100; a `warn!` under 5; log-only; 2026-10-06, final review) | same (growth curve) |
 | `ln_annulus_crowding` | f64 | the median, over the pairs the ratio uses, of the larger of the two frames' fractions of present annulus pixels above the annulus median + 3 σ (L-26; NaN when not measured, log-only) | `"ln relative scale"` (common aperture) |
 | `light_offset` | string | the distinct OFFSET values of the affected lights, formatted `OFFSET <v>`, `OFFSET <lo>–<hi>` (a name prefix plus an en-dash range, e.g. `OFFSET 1–5`) or `OFFSET not recorded`, with ` (not recorded on some)` appended when only some lights carry the card | pedestal warn |
 | `light_gain` | string | the same format for GAIN (`GAIN 100`, `GAIN 100–120`, `GAIN not recorded`) | pedestal warn |

@@ -753,6 +753,7 @@ prefix rule applies.
 | `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
 | `ln_common_fwhm_px` | f64 | `F`, the larger median FWHM | same |
 | `ln_growth_factor` | f64 | the growth-curve correction `c` | same (growth curve) |
+| `ln_growth_pairs` | u64 | how many pairs the growth-curve median `c` was taken over (up to 100; a `warn!` under 5; 2026-10-06, final review) | same (growth curve) |
 | `ln_annulus_crowding` | f64 | the median, over the pairs the ratio uses, of the larger of the two frames' fractions of present annulus pixels above the annulus median + 3 σ (L-26) | `"ln relative scale"` (common aperture) |
 | `light_offset` | string | distinct OFFSET values of the affected lights | pedestal warn |
 | `light_gain` | string | distinct GAIN values | pedestal warn |
