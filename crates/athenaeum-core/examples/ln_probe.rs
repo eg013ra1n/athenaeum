@@ -42,8 +42,7 @@ use athenaeum_core::resample::Interpolation;
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::groups::{group_frames, GroupFrame, IntegrationGroup};
 use athenaeum_core::stacking::integrate::{
-    GroupInput, LnAperture, LnFluxEstimator, LocalNormalizationConfig, NormalizationConfig,
-    StackFrame,
+    GroupInput, LocalNormalizationConfig, NormalizationConfig, StackFrame,
 };
 use athenaeum_core::stacking::ln::calibration as ln_calibration;
 use athenaeum_core::stacking::ln::{
@@ -843,15 +842,15 @@ catalog has no artifact for)",
                 &CLEANING,
                 Some(&pool),
             ));
-            // PSF signal reads no mask; the raw target plane's finite pixels
-            // and the group reference's are what the common aperture gets.
+            // The raw target plane's finite pixels and the group reference's
+            // are what the common aperture reads (PSF signal reads no mask).
             let tgt_present =
                 FiniteMask::from_plane(&target_plane, reference.width, reference.height);
             let ref_present = ref_for_detection.present.get(p).unwrap_or(&tgt_present);
             let inputs = ScaleInputs {
                 selection: local_cfg.star_selection,
-                estimator: LnFluxEstimator::PsfSignal,
-                aperture: LnAperture::default(),
+                estimator: local_cfg.flux_estimator,
+                aperture: local_cfg.aperture,
                 reference_present: ref_present,
                 target_present: &tgt_present,
                 reference: SelectionSide {

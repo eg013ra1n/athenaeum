@@ -198,8 +198,9 @@ impl LnStarSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum LnFluxEstimator {
-    #[default]
     PsfSignal,
+    // 2026-10-06: F1 growth curve is the default (L-24).
+    #[default]
     CommonAperture,
 }
 
@@ -218,8 +219,9 @@ impl LnFluxEstimator {
 #[serde(rename_all = "camelCase")]
 pub enum LnAperture {
     Fwhm2,
-    #[default]
     Fwhm3,
+    // 2026-10-06: F1 growth curve is the default (L-24).
+    #[default]
     GrowthCurve,
 }
 
@@ -269,8 +271,9 @@ impl Default for LocalNormalizationConfig {
             psf_model: crate::stacking::psf_signal::PsfModel::Auto,
             local_scale: false,
             star_selection: LnStarSelection::default(),
-            flux_estimator: LnFluxEstimator::PsfSignal,
-            aperture: LnAperture::Fwhm3,
+            // 2026-10-06: F1 growth curve is the default (L-24).
+            flux_estimator: LnFluxEstimator::CommonAperture,
+            aperture: LnAperture::GrowthCurve,
         }
     }
 }
@@ -1965,10 +1968,27 @@ mod tests {
                 psf_model: crate::stacking::psf_signal::PsfModel::Moffat4,
                 local_scale: true,
                 star_selection: LnStarSelection::default(),
-                flux_estimator: LnFluxEstimator::PsfSignal,
-                aperture: LnAperture::Fwhm3,
+                // 2026-10-06: F1 growth curve is the default (L-24).
+                flux_estimator: LnFluxEstimator::CommonAperture,
+                aperture: LnAperture::GrowthCurve,
             }
         );
+    }
+
+    /// 2026-10-06 (L-24): a stored `normalization.local` with neither
+    /// `fluxEstimator` nor `aperture` resolves to F1 at the growth curve; a
+    /// document that names `psfSignal` keeps it.
+    #[test]
+    fn a_stored_local_document_without_an_estimator_decodes_to_f1_growth_curve() {
+        let bare: NormalizationConfig =
+            serde_json::from_str(r#"{"local":{"enabled":true,"scale":512}}"#).unwrap();
+        assert_eq!(bare.local.flux_estimator, LnFluxEstimator::CommonAperture);
+        assert_eq!(bare.local.aperture, LnAperture::GrowthCurve);
+        let psf: NormalizationConfig = serde_json::from_str(
+            r#"{"local":{"enabled":true,"fluxEstimator":"psfSignal"}}"#,
+        )
+        .unwrap();
+        assert_eq!(psf.local.flux_estimator, LnFluxEstimator::PsfSignal);
     }
 
     /// M2 fix round 1, item 1(b): `integrate_group` no longer refuses

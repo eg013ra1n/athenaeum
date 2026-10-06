@@ -1304,7 +1304,9 @@ mod tests {
     #[test]
     fn the_aperture_is_in_the_subtree_only_under_the_common_aperture() {
         use crate::stacking::integrate::{LnAperture, LnFluxEstimator};
+        // 2026-10-06: F1 growth curve is the default (L-24); this test starts from PSF signal.
         let mut a = StackingConfig::default();
+        a.normalization.local.flux_estimator = LnFluxEstimator::PsfSignal;
         let mut b = a.clone();
         b.normalization.local.aperture = LnAperture::Fwhm2;
         assert_eq!(
@@ -1316,7 +1318,7 @@ mod tests {
         b.normalization.local.flux_estimator = LnFluxEstimator::CommonAperture;
         assert_ne!(normalization_subtree(&a), normalization_subtree(&b));
         let mut c = StackingConfig::default();
-        c.normalization.local.flux_estimator = LnFluxEstimator::CommonAperture;
+        c.normalization.local.flux_estimator = LnFluxEstimator::PsfSignal;
         assert_ne!(
             normalization_subtree(&StackingConfig::default()),
             normalization_subtree(&c),
@@ -1333,6 +1335,7 @@ mod tests {
         );
         // 2026-10-05 LN model fixes Task 11: starSelection + lnModelVersion 3.
         // 2026-10-05 LN model fixes Task 13: fluxEstimator + aperture (aperture only under commonAperture)
+        // 2026-10-06: F1 growth curve is the default (L-24).
         for needle in [
             "\"exposureToleranceSec\":2.0",
             "\"exposureMode\":\"seconds\"",
@@ -1352,7 +1355,7 @@ mod tests {
             "\"output\":\"additiveWithScaling\"",
             "\"rejection\":\"scaleZeroOffset\"",
             "\"scaleEstimator\":\"bwmv\"",
-            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75},\"fluxEstimator\":\"psfSignal\",\"aperture\":\"fwhm3\"}",
+            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75},\"fluxEstimator\":\"commonAperture\",\"aperture\":\"growthCurve\"}",
             "\"rejection\":{\"method\":\"auto\"}",
             "\"writeRejectionMaps\":false",
             "\"dropShrink\":0.9",
@@ -1943,7 +1946,10 @@ mod tests {
         //
         // And here (2026-10-05 LN model fixes Task 13): `normalization.local`
         // gains `fluxEstimator` and `aperture` in the serialized config.
-        assert_eq!(default_hash, "58b1c56b5bff4184");
+        //
+        // And here (2026-10-06): F1 growth curve is the default (L-24) -
+        // `fluxEstimator` and `aperture` take their new default values.
+        assert_eq!(default_hash, "03af478211b610de");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
