@@ -179,7 +179,7 @@ fn circle_flux_body(
     }
     let sky = median_in_place(scratch) as f64;
     let flux = sum - n as f64 * sky;
-    if flux <= 0.0 {
+    if !(flux > 0.0) {
         return None;
     }
     let crowding = if sigma.is_finite() && sigma > 0.0 {
@@ -293,15 +293,15 @@ mod tests {
         assert!(rel < 0.002, "got {got}, want {want}, rel {rel}");
     }
 
-    /// The annulus pixels (`24 <= d <= 32` around the star) read straight off
+    /// The PRESENT annulus pixels (`24 <= d <= 32` around the star) read straight off
     /// the plane, for the independent expected counts below.
-    fn annulus_values(plane: &[f32], w: usize, cx: f64, cy: f64) -> Vec<f32> {
+    fn annulus_values(plane: &[f32], present: &[bool], w: usize, cx: f64, cy: f64) -> Vec<f32> {
         let mut v = Vec::new();
         for y in 0..plane.len() / w {
             for x in 0..w {
                 let (dx, dy) = (x as f64 - cx, y as f64 - cy);
                 let d2 = dx * dx + dy * dy;
-                if (24.0 * 24.0..=32.0 * 32.0).contains(&d2) {
+                if present[y * w + x] && (24.0 * 24.0..=32.0 * 32.0).contains(&d2) {
                     v.push(plane[y * w + x]);
                 }
             }
@@ -375,7 +375,16 @@ mod tests {
             &[(cx, cy, 50.0), (cx + 28.0, cy + 3.0, 30.0)],
             Profile::Gaussian { fwhm: 4.0 },
         );
-        let mask = FiniteMask::all(128, 128);
+        // A block of absent pixels on the far side of the annulus (well under
+        // half of it), so present != total: the denominator is the present
+        // pixels the median was taken over.
+        let mut present = vec![true; 128 * 128];
+        for y in 0..128 {
+            for x in 30..38 {
+                present[y * 128 + x] = false;
+            }
+        }
+        let mask = FiniteMask::from_bools(&present, 128, 128);
         let side = ApertureSide {
             plane: &plane,
             present: &mask,
@@ -384,10 +393,17 @@ mod tests {
         let mut scratch = Vec::new();
         let (_, got) = circle_flux_crowding(&side, cx, cy, 12.0, 24.0, 32.0, sigma, &mut scratch)
             .expect("valid circle");
-        let mut vals = annulus_values(&plane, 128, cx, cy);
+        let mut vals = annulus_values(&plane, &present, 128, cx, cy);
+        let total = annulus_values(&plane, &vec![true; 128 * 128], 128, cx, cy).len();
         let n = vals.len();
+        assert!(n < total && 2 * n > total, "present {n} of {total}");
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let med = vals[n / 2] as f64;
+        // As production: the mean of the central two for an even count.
+        let med = if n % 2 == 0 {
+            (vals[n / 2 - 1] as f64 + vals[n / 2] as f64) / 2.0
+        } else {
+            vals[n / 2] as f64
+        };
         let above = vals
             .iter()
             .filter(|&&v| v as f64 > med + 3.0 * sigma)

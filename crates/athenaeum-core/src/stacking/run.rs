@@ -17869,6 +17869,13 @@ mod tests {
 
     // ── Stage 6 (Task 5): local normalization ───────────────────────────
 
+    /// 2026-10-06 (L-24): on this 192x144 field the corner stars' [6F, 8F]
+    /// annuli are under half present, so F1 keeps 17 pairs (< MIN_MATCHES 20)
+    /// and every member would be excluded; the run tests built on it pin
+    /// `PsfSignal` because they test estimator-agnostic run plumbing. The
+    /// default F1 path is covered by
+    /// `the_default_f1_path_runs_end_to_end_and_the_plan_reads_it_cached`.
+    ///
     /// Dense enough (24 stars, comfortably over `ln::scale::MIN_MATCHES`'s 20)
     /// for `relative_scale` to succeed — [`BASE_STARS`]' own 10-star field is
     /// too sparse for local normalization's own tests, which need a match
@@ -17975,7 +17982,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -18072,7 +18079,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -18163,7 +18170,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -18292,7 +18299,7 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: this test reads the plan against the stored config, so OFF (not storable:
         // it serializes as null) is replaced by the finite selection that cuts nothing.
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
@@ -18452,7 +18459,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the finite selection that cuts nothing (synthetic stars).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
@@ -18560,7 +18567,7 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: this test reads the plan against the stored config, so OFF (not storable:
         // it serializes as null) is replaced by the finite selection that cuts nothing.
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
@@ -18667,6 +18674,150 @@ mod tests {
         assert_eq!(g.ln_cached, 4, "{g:?}");
     }
 
+    /// 2026-10-06 (L-24): the DEFAULT path - no estimator pin. A 384x288 field
+    /// on which every star keeps its whole [6F, 8F] annulus present, so F1 at
+    /// the growth curve forms a sample on every member: a master is written,
+    /// the summary names the estimator and the aperture, every included
+    /// frame has its sidecar, and the plan reads Normalize as cached.
+    #[test]
+    fn the_default_f1_path_runs_end_to_end_and_the_plan_reads_it_cached() {
+        const W: usize = 384;
+        const H: usize = 288;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+
+        // 7 x 5 jittered grid, every star >= 40 px (8F ~ 30 + shift + margin)
+        // from every edge.
+        let mut rng = crate::geometry::ransac::SplitMix64(11);
+        let mut base = Vec::new();
+        for row in 0..5 {
+            for col in 0..7 {
+                let x = 44.0 + col as f64 * 49.0 + (rng.next_f64() - 0.5) * 12.0;
+                let y = 44.0 + row as f64 * 50.0 + (rng.next_f64() - 0.5) * 12.0;
+                let amp = if (row + col) % 2 == 0 { 9000.0 } else { 6500.0 };
+                base.push((x, y, amp));
+            }
+        }
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let stars: Vec<_> = base.iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = LightSpec {
+                width: W,
+                height: H,
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &stars,
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, W, H);
+
+        // No estimator or aperture line: the defaults are the subject. OFF is
+        // not storable (it serializes as null), so the finite no-cut selection.
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
+        cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups,
+            layout.clone(),
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let group_summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        assert_eq!(
+            group_summary.ln_flux_estimator,
+            Some(crate::stacking::integrate::LnFluxEstimator::CommonAperture)
+        );
+        assert_eq!(
+            group_summary.ln_aperture,
+            Some(crate::stacking::integrate::LnAperture::GrowthCurve)
+        );
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
+        for f in &included {
+            assert!(f.ln_scale.is_some(), "{f:?}");
+        }
+        for i in 0..4 {
+            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}"));
+            assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
+        }
+
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some(cfg),
+        )
+        .expect("the plan should build");
+        let g = &plan_after.groups[0];
+        assert!(!g.ln_scale_estimated, "{g:?}");
+        assert!(
+            !plan_after.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan_after.stale_stages
+        );
+        assert_eq!(g.ln_cached, 4, "{g:?}");
+    }
+
     /// Review Focus 3: a run whose scale differs from the plan's estimate
     /// warns once.
     #[test]
@@ -18688,7 +18839,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -18784,7 +18935,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
         cfg.reference.mode = ReferenceMode::Manual;
@@ -18899,7 +19050,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -19089,7 +19240,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -19177,7 +19328,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -19314,7 +19465,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
@@ -19628,7 +19779,7 @@ mod tests {
         cfg_rejection_only.normalization.rejection = RejectionNormalization::Local;
         cfg_rejection_only.normalization.local.enabled = false;
         // P-13: the subject is the one grid-less frame among normalized ones, not the selection (synthetic stars, none saturated).
-        // 2026-10-06: the synthetic star field is a PSF-signal fixture; the default is F1 now (L-24).
+        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg_rejection_only.normalization.local.flux_estimator =
             crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg_rejection_only.normalization.local.star_selection =

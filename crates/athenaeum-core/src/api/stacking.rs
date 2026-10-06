@@ -1505,7 +1505,7 @@ mod tests {
     /// Review Focus 2: every reader of a stored config resolves L-9.
     #[test]
     fn every_stored_config_reader_resolves_the_legacy_scale() {
-        use crate::stacking::integrate::LnScaleMode;
+        use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnScaleMode};
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = ServiceContext::new_for_tests(db_path.clone());
@@ -1523,6 +1523,11 @@ mod tests {
             (local.scale_mode, local.scale),
             (Some(LnScaleMode::Fixed), 2048)
         );
+        // 2026-10-06 (L-24): no stored estimator -> F1 at the growth curve, at every reader.
+        assert_eq!(
+            (local.flux_estimator, local.aperture),
+            (LnFluxEstimator::CommonAperture, LnAperture::GrowthCurve)
+        );
 
         // 2. The global default row, written the way `read_global_config_json`
         //    reads it (`set_stacking_defaults` would re-serialize).
@@ -1536,6 +1541,13 @@ mod tests {
             Some(LnScaleMode::Fixed)
         );
         assert_eq!(defaults.normalization.local.scale, 2048);
+        assert_eq!(
+            (
+                defaults.normalization.local.flux_estimator,
+                defaults.normalization.local.aperture
+            ),
+            (LnFluxEstimator::CommonAperture, LnAperture::GrowthCurve)
+        );
 
         // 3. One entry of the `stacking.presets` row.
         {
@@ -1548,6 +1560,13 @@ mod tests {
         assert_eq!(
             presets[0].config.normalization.local.scale_mode,
             Some(LnScaleMode::Fixed)
+        );
+        assert_eq!(
+            (
+                presets[0].config.normalization.local.flux_estimator,
+                presets[0].config.normalization.local.aperture
+            ),
+            (LnFluxEstimator::CommonAperture, LnAperture::GrowthCurve)
         );
 
         // 4. A plan override decoded WITHOUT resolution.
@@ -1563,6 +1582,13 @@ mod tests {
         assert_eq!(
             plan.config.normalization.local.scale_mode,
             Some(LnScaleMode::Fixed)
+        );
+        assert_eq!(
+            (
+                plan.config.normalization.local.flux_estimator,
+                plan.config.normalization.local.aperture
+            ),
+            (LnFluxEstimator::CommonAperture, LnAperture::GrowthCurve)
         );
     }
 
