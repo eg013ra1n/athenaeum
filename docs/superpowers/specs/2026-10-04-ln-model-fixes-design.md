@@ -9,6 +9,13 @@ Written spec APPROVED by the owner 2026-10-04 (fable review "ready after fixes",
 reference integrates. Bars, rows and L-16 are unchanged; the pre-check re-runs on the amended
 selection before checkpoint B.
 
+**Amendment 2026-10-06 (owner, checkpoint B, "да, согласен, погнали"):** F1 at the growth-curve
+aperture becomes the default (L-24). Three §11.3 rows are re-defined, not re-sized, after an
+independent review showed that, read as written, they cannot measure a change of the LN scale
+(L-25): the MAD row, the FWHM row and the OSC slope read. F1 gains a per-frame annulus-crowding
+diagnostic in the log (L-26). The numbers are in the acceptance doc
+`docs/superpowers/research/2026-10-05-ln-model-fixes-acceptance.md` §8.
+
 **No migration (owner, 2026-10-04).** Existing runs, run rows, provenance and `master_lights` are
 left exactly as they are. Nothing rewrites stored history. The new model reaches existing sets only
 through the normal cache invalidation of §7 (the version bump makes the Normalize stage stale; the
@@ -28,7 +35,7 @@ next run re-normalizes). The legacy config rule of L-9 is a read-time resolution
   `2026-09-20-stacking-compute-tierC-design.md` (§8 tolerance table, rulings C-1…C-30) and the math
   reference `2026-09-08-stacking-math-reference.md` §4.
 
-Rulings this spec makes are numbered **L-1 … L-23** and collected in §14. §15 lists the points put to
+Rulings this spec makes are numbered **L-1 … L-26** and collected in §14. §15 lists the points put to
 the owner; all were accepted on 2026-10-04.
 
 ## 0. Verdict and scope
@@ -538,6 +545,12 @@ If F1 becomes the default, math reference §4.3 step 3 (PSF flux) is overturned 
 path. The owner accepted (2026-10-04) that masters may then differ from the ERP by a few percent in
 level when F1 is measurably closer to the truth.
 
+**Outcome (checkpoint B, 2026-10-06).** Read as written, items 2 and 4 held and items 1 and 3 did
+not. Item 1 missed on run B OSC, where the slope pooled over the planes was +0.58 %/px². Item 3
+missed on the whole-frame MAD on mono: −2.4 % and −4.6 % scale-normalized. Under the rows
+re-defined by L-25, all four hold. The owner made F1 at `growthCurve` the default (L-24); PSF
+signal ships as the alternative.
+
 ## 5. Calibration pedestal warning (item 5)
 
 ### 5.1 The condition
@@ -619,8 +632,8 @@ New fields under `normalization.local` are `#[serde(default)]`. There is no
 | `scaleMode` | `"auto" \| "fixed"`, decoded as `Option` | `"auto"` (legacy rule §2.2) | — | always |
 | `gridSize` | u32 | 4 | 2–8 | `auto` |
 | `scale` | u32 | 1024 (unchanged) | snapped to §2.1's list | `fixed` |
-| `fluxEstimator` | `"psfSignal" \| "commonAperture"` | `"psfSignal"` until §4.4 rules | — | always |
-| `aperture` | `"fwhm2" \| "fwhm3" \| "growthCurve"` | the §4.3 winner (`"fwhm3"` until then) | — | `commonAperture` |
+| `fluxEstimator` | `"psfSignal" \| "commonAperture"` | `"commonAperture"` (L-24; `"psfSignal"` until 2026-10-06) | — | always |
+| `aperture` | `"fwhm2" \| "fwhm3" \| "growthCurve"` | `"growthCurve"` (L-24) | — | `commonAperture` |
 | `starSelection.minPeakSnr` | f64 | 40 | 5–200 | always |
 | `starSelection.maxStars` | u32 | 500 | 20–5000 | always |
 | `starSelection.saturation` | f64 | 0.75 | 0.5–1.0 | always |
@@ -628,6 +641,10 @@ New fields under `normalization.local` are `#[serde(default)]`. There is no
 `enabled`, `referenceFrames`, `psfModel` and `localScale` are unchanged. The global
 `normalization.scaleEstimator` (BWMV/MAD/avgDev) is a different thing and keeps its name; the new
 field is `fluxEstimator` to keep the two apart.
+
+A stored document that has no `fluxEstimator` or `aperture` reads the defaults above, so it runs F1
+at the growth curve. Such documents were written before this cycle. A document that names
+`psfSignal` keeps it.
 
 **Presets.** Default and Fast preview keep LN off. Maximum quality keeps LN on. None overrides the
 new fields, so every preset carries the defaults above.
@@ -654,6 +671,10 @@ new fields, so every preset carries the defaults above.
     nothing;
   - `aperture` is in the subtree only while `fluxEstimator = commonAperture`;
   - `fluxEstimator` and `starSelection` are always in it.
+- **The default change (L-24)** moves the default config's hash. It also moves every `ln*` hash of
+  a set whose stored document has no `fluxEstimator`; such a set re-normalizes once (§13).
+  `LN_MODEL_VERSION` stays 4: no existing explicit config produces anything different, and the
+  crowding field (L-26) is log-only.
 - **`PSF_FIT_VERSION` stays 3.** The fitter does not change.
 - **The one-time recompute.** On the first LN run after the merge, every set rebuilds its LN
   reference, re-measures its seeds calibration (7 frames × 2 arms per group) and rewrites every
@@ -732,6 +753,7 @@ prefix rule applies.
 | `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
 | `ln_common_fwhm_px` | f64 | `F`, the larger median FWHM | same |
 | `ln_growth_factor` | f64 | the growth-curve correction `c` | same (growth curve) |
+| `ln_annulus_crowding` | f64 | the median, over the pairs the ratio uses, of the larger of the two frames' fractions of present annulus pixels above the annulus median + 3 σ (L-26) | `"ln relative scale"` (common aperture) |
 | `light_offset` | string | distinct OFFSET values of the affected lights | pedestal warn |
 | `light_gain` | string | distinct GAIN values | pedestal warn |
 | `flat_set_ids` | string | comma-joined flat set ids | pedestal warn |
@@ -830,6 +852,29 @@ Each checkpoint tree needs about 135 GB free. Expect about 15–27 min per set-2
 | Drizzle level and coverage | as before (C-20, C-23 data facts) | same |
 | B move vs baseline (`ln_probe --diag`) | reported (C-29 read) | — |
 | Wall | reported, against the same-evening re-run | reported |
+
+**Re-defined 2026-10-06 (L-25, owner).** For a change of the LN scale `A`, three rows read as
+follows from checkpoint B on. No bar is re-sized.
+
+- **Master MAD (R1).**
+  - The block-median field at the LN scale (blocks of `scale` px), read raw, must lie within ±1 %
+    of the comparison arm. It is the LN reference's background, held through `B`, and must not
+    move.
+  - Noise per unit signal is the master-SNR row (one-sided).
+  - The whole-frame MAD is reported, raw and scale-normalized.
+- **FWHM (R2).**
+  - The yardstick is the no-rejection mixture of the run's own registered frames at the run's own
+    scales.
+  - The master's star width must not exceed it by more than 1 %, read on the same stars (second
+    moment, or the fit at equal β).
+  - The Gaussian variance-mixture formula is reported only. It over-predicts the change about
+    three-fold on real profiles.
+  - A fit whose β differs between the two masters is a harness flag, not a reading.
+- **Per-member slope on OSC (R3).**
+  - The slope is judged within each plane (per-plane centred), with its 90 % bootstrap interval.
+  - A plane whose half-max ΔS² lever arm is under 1 px² is recorded as "unresolved at this lever
+    arm", neither a pass nor a miss.
+  - Pooling the planes is dropped: it adds the colour offset × plane-width term.
 
 **Horse C11 rows** (the G master; branch LN on vs branch LN off, same registration):
 
@@ -947,11 +992,14 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 - **Stored configs:** `scale: 1024` becomes auto; any other value stays fixed, snapped to the list.
 - **The selection** raises PSF-signal scales on broad frames by about 1–2.5 %. Every LN master's
   signal level moves by the group's weighted share of that.
-- **If F1 becomes the default:**
-  - an LN master's signal level rises by the group's weighted-mean gap (about +5–7 % mono on a
-    mixed-seeing night; up to about 1.3 % per OSC plane, so colour balance moves);
-  - noise in reference units rises by about 4 % while SNR rises by about 1.7 %;
-  - FWHM moves by about +1 %.
+- **F1 is the default (L-24).** Measured at checkpoint B against PSF signal with selection:
+  - an LN master's star signal rises by the group's weighted-mean gap: +4.3 % on set 204 mono and
+    +6.9 % on run B mono; the OSC planes move by up to 0.6 %, so colour balance moves slightly;
+  - noise in reference units rises with the signal, by 3–5 % on mono, and master SNR rises by
+    +0.3 % (set 204) and +1.9 % (run B);
+  - FWHM moves by +0.6 % (set 204 mono) and 0.0 % (run B mono) on the fitted width;
+  - a stored document without `fluxEstimator` runs F1, and its sets re-normalize once; a document
+    that names `psfSignal` keeps it.
 - **Sets calibrated with a flat but no dark or bias** show the pedestal warning in the plan, the
   Export tab and the run summary. Nothing else changes for them.
 
@@ -1018,14 +1066,32 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
   read from the reference-frames saturation map `R` built with the reference and stored beside it.
   It is the saturation rule applied to the data that formed the reference, not a cap on the
   brightest: a bright star unsaturated in every integrated frame stays. `LN_MODEL_VERSION` 4.
+- **L-24** (checkpoint B, owner 2026-10-06) The default LN scale estimator is the common aperture
+  at the growth curve (`fluxEstimator: commonAperture`, `aperture: growthCurve`).
+  - Per member it reads the photometric truth to the truth's own resolution on all five datasets:
+    median |gap| 0.27–0.44 %, or 0.5–1.2 truth standard errors.
+  - PSF signal with selection reads −2.7…−7.5 % on mono, with a −3.3 %/px² width dependence.
+  - PSF signal stays a choice.
+- **L-25** (checkpoint B, owner 2026-10-06) For a change of the LN scale, three rows are
+  re-defined (§11.3): MAD (R1), FWHM (R2) and the per-member slope on OSC (R3). Read as written,
+  they mixed the reference-held background into the MAD, over-predicted the FWHM change about
+  three-fold, and pooled a colour offset into the OSC slope. No bar is re-sized.
+- **L-26** (checkpoint B, owner 2026-10-06) F1 logs `ln_annulus_crowding` on the `"ln relative
+  scale"` event. No behaviour changes.
+  - Definition: for each pair the ratio uses, and on each side, the fraction of the present annulus
+    pixels above the annulus median plus 3 σ, where σ is the side's local noise at the star. The
+    field is the median, over those pairs, of the larger of the two sides' fractions.
+  - Purpose: a dense field becomes visible in the log. There, F1's `[6F, 8F]` median sky reads
+    neighbour light: the lab measured +0.9 %/px² at about 600 stars/Mpx and +1.6…+2.2 %/px² on
+    crowded fields. This cycle's datasets hold 5–40 stars/Mpx and read at most +0.1 %/px².
+  - The masked far-annulus sky that would remove the effect belongs to the measurement cycle.
 
 **Overturned:**
 
 - Math reference §4.2 and stacking spec §5.2's background description ("deviation thresholds
   3.0σ / 3.2σ, rejection limit 0.3 per cell"): by item 1, owner decision 2026-10-04.
 - `normalization.local.scale` as a fixed 1024 default: by item 2.
-- Math reference §4.3 step 3 (the PSF-flux ratio) as the default: only if §4.4 makes F1 the
-  default.
+- Math reference §4.3 step 3 (the PSF-flux ratio) as the default: by L-24 (2026-10-06).
 
 **Kept, and how they interact:**
 
@@ -1086,3 +1152,10 @@ no migration of existing runs (see the header).
     corner ratio in the run only (L-17, L-18). Collab publish surfaces do not show it this cycle.
 17. Rebuilding the LN reference image once with the version bump, and never for a scale change
     (L-19).
+18. **Checkpoint B (2026-10-06).** After an independent review, the owner accepted three items
+    ("да, согласен, погнали"): F1 as the default (L-24), the re-defined rows (L-25) and the
+    crowding diagnostic (L-26). Four items move to the measurement/detector cycle:
+    - F1's masked far-annulus sky, for dense fields;
+    - the blue-plane offset: −0.6 % against the truth in both OSC sets;
+    - the PSF fit's background setup;
+    - the β flips in the master FWHM measurement.

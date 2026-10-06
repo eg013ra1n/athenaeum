@@ -4108,6 +4108,12 @@ Spec §3 (the brightness-tercile risk; owner ruling: raise `maxStars`, never cap
 
 Spec §4.4 (L-16, decided in advance); §3's tercile ruling (from Task 16).
 
+> **Outcome 2026-10-06 (owner, after checkpoint B and an independent review):** F1 at `growthCurve`
+> becomes the default (L-24) under the rows re-defined by L-25. `maxStars` stays 500. The change is
+> `LocalNormalizationConfig::default` plus the two enums' `#[default]` (so no path can disagree), the
+> moved golden literals, and the frontend test fixtures that assume the old default. It ships with
+> Task 17a in one dispatch.
+
 - [ ] **Apply §4.4 to Task 16's numbers**, item by item, in the acceptance doc:
   1. Truth, per member: F1 passes the step-1 bars on the four audited groups and Horse C11 G, and PSF signal with selection fails at least one of them on a mono group.
   2. Master level, scale only: F1's no-rejection master star flux is within ±0.5 % of the truth-corrected no-rejection arm (L-22); its ratio to the LN reference is reported.
@@ -4131,6 +4137,27 @@ git commit -m "feat(ln): <the estimator / maxStars> default per the checkpoint-B
   Record the ruling (L-16's outcome, with its numbers) in the acceptance doc and in `docs/stacking/README.md` (Task 18).
 
 ---
+
+### Task 17a: The annulus-crowding diagnostic (spec §10, L-26)
+
+> **Inserted 2026-10-06** after checkpoint B (owner, "да, согласен, погнали").
+
+**Files:** `crates/athenaeum-core/src/stacking/ln/aperture.rs` (the count inside the annulus pass),
+`ln/scale.rs` (`MeasuredSample`, `ScaleResult`, `RelativeScaleLog`, the two common-aperture
+`debug!` arms; **never rustfmt**), `examples/ln_scale_probe.rs` (per-arm `annulusCrowding`).
+
+- For each pair the ratio uses, and on each side, count the present annulus pixels above the
+  annulus median + 3 σ, where σ = `TileNoise::sigma_local` at the side's star. The fraction is that
+  count over the present annulus pixels.
+- `ln_annulus_crowding` = the median, over those pairs, of the larger of the two sides' fractions.
+  Only the main circle pass computes it; the growth curve's 5F pass does not.
+- Log-only: no scale, no hash and no `LN_MODEL_VERSION` changes. `circle_flux`'s existing signature
+  and results stay as they are.
+- Tests:
+  - an empty annulus reads 0;
+  - an annulus with a neighbour star reads that star's share of the annulus pixels;
+  - the field is `None` under PSF signal;
+  - the scale is bit-identical with and without the count.
 
 ### Task 18: Docs
 
