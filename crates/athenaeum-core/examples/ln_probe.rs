@@ -571,8 +571,14 @@ registration row for each — run stacking through Register first); found {}",
     // so there is nothing else worth preparing (ruling C-14 removed the
     // unused per-beta machinery outright).
     let build_start = Instant::now();
-    let ref_for_detection =
-        LnReferenceForDetection::build(&reference, reference_psf, measure_opts.max_stars, None);
+    // No saturation map here (L-23): the integrated plane's own test only.
+    let ref_for_detection = LnReferenceForDetection::build(
+        &reference,
+        reference_psf,
+        measure_opts.max_stars,
+        None,
+        None,
+    );
     let reference_build_ms = build_start.elapsed().as_millis() as u64;
     // Perf tier A Task 12: pass the probe's own pool through so the probe
     // exercises the SAME parallel path production (`stacking::run`) does —
@@ -853,12 +859,14 @@ catalog has no artifact for)",
                     width: reference.width,
                     height: reference.height,
                     noise: &ref_noise,
+                    frames_saturation: None,
                 },
                 target: SelectionSide {
                     plane: &sanitized_target,
                     width: reference.width,
                     height: reference.height,
                     noise: &tgt_noise,
+                    frames_saturation: None,
                 },
             };
             match relative_scale_from_seeds_with_breakdown(

@@ -19,21 +19,30 @@
 //! is what later frames measure *against*).
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
-use tracing::info;
+use rayon::prelude::*;
+use tracing::{debug, info};
 
-use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
+use super::background::{TileTable, CLEANING};
+use super::selection::SaturationMask;
+use crate::fits_writer::{
+    write_fits_f32, write_fits_f32_streaming_with, Card, CardValue, Durability, FitsWriteError,
+};
+use crate::integration::banded::BandPlanes;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
 use crate::integration::engine::EngineProgress;
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::plane_reader::PlaneReader;
+use crate::integration::registered_source::RegisteredSource;
+use crate::integration::source::FrameSource;
 use crate::integration::stats::{OutputNormalization, RejectionNormalization};
 use crate::integration::IntegrationError;
 use crate::stacking::integrate::{
-    integrate_planes, validate_group_input, CoverageOptions, GroupInput, GroupProgress,
+    integrate_planes, materialized_frame, validate_group_input, CoverageOptions, GroupInput,
+    GroupProgress,
 };
 use crate::stacking::master_cards::ATH_STK_VERSION;
 
@@ -272,8 +281,14 @@ fn reference_weights(channels: usize, n: usize) -> Vec<Vec<f32>> {
 /// id; `ATH_STKG`, the group key — Task 5/9 own what they stamp) are
 /// appended after these three.
 fn reference_cards(caller_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
+    stacking_cards("LN Reference", caller_cards)
+}
+
+/// [`reference_cards`] with another `IMAGETYP` — the saturation-map
+/// sidecar (L-23) carries the same scanner-skip pair and caller cards.
+fn stacking_cards(imagetyp: &str, caller_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
     let mut cards = vec![
-        Card::new("IMAGETYP", CardValue::Str("LN Reference".into()))?,
+        Card::new("IMAGETYP", CardValue::Str(imagetyp.into()))?,
         Card::new("ATH_STK", CardValue::Logical(true))?
             .with_comment("stacked by Athenaeum; never cataloged"),
         Card::new("ATH_STKV", CardValue::Integer(ATH_STK_VERSION))?
@@ -325,6 +340,222 @@ pub fn read_reference(path: &Path) -> anyhow::Result<LnReference> {
         planes,
         frames_used: Vec::new(),
     })
+}
+
+/// The sidecar's `IMAGETYP`.
+const SATURATION_IMAGETYP: &str = "LN Reference Saturation";
+
+/// One frame's contribution to the reference-frames saturation map (spec
+/// §3 step 1, L-23): `map[x] = max(map[x], plane[x] / M)`, where `M` is the
+/// frame's own hot-pixel-corrected plane maximum —
+/// `TileTable::measure(plane, .., &CLEANING, ..).plane_max()`, the same
+/// value the star selection compares a side with (`TileNoise::plane_max`).
+/// A non-finite pixel contributes nothing; a frame whose `M` is not finite
+/// or `<= 0` contributes nothing at all (the caller names it in a
+/// `debug!`). The map starts all NaN, so a pixel no frame contributes to
+/// stays NaN. Returns `M`.
+pub fn accumulate_reference_saturation(
+    map: &mut [f32],
+    plane: &[f32],
+    width: usize,
+    height: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> f32 {
+    let m = TileTable::measure(plane, width, height, &CLEANING, pool).plane_max();
+    if !(m.is_finite() && m > 0.0) {
+        return m;
+    }
+    let n = (width * height).min(map.len()).min(plane.len());
+    let fold = move |(r, &p): (&mut f32, &f32)| {
+        if p.is_finite() {
+            let v = p / m;
+            // `!(r >= v)`: a NaN `r` (no frame yet) takes `v` too.
+            if !(*r >= v) {
+                *r = v;
+            }
+        }
+    };
+    const CHUNK: usize = 1 << 16;
+    match pool {
+        Some(pl) => pl.install(|| {
+            map[..n]
+                .par_chunks_mut(CHUNK)
+                .zip(plane[..n].par_chunks(CHUNK))
+                .for_each(|(rc, pc)| rc.iter_mut().zip(pc).for_each(fold))
+        }),
+        None => map[..n].iter_mut().zip(&plane[..n]).for_each(fold),
+    }
+    m
+}
+
+/// The thresholded map the LN pass keeps in RAM (L-23): a bit where
+/// `R > saturation`. NaN never sets a bit, and neither does a non-finite
+/// threshold (`LnStarSelection::OFF`'s `+inf`).
+pub fn reference_saturation_mask(
+    map: &[f32],
+    width: usize,
+    height: usize,
+    saturation: f64,
+) -> SaturationMask {
+    if !saturation.is_finite() {
+        return SaturationMask::empty(width, height);
+    }
+    SaturationMask::from_fn(width, height, |k| {
+        map.get(k).is_some_and(|&r| r as f64 > saturation)
+    })
+}
+
+/// Builds the reference-frames saturation map over `frames_used` (the LN
+/// reference's own members, indices into `input.frames`), one plane per
+/// channel. Each frame is read through the SAME source
+/// [`integrate_planes`] reads it through
+/// ([`crate::stacking::integrate::materialized_frame`] +
+/// [`RegisteredSource::open_materialized`], the group's interpolation and
+/// clamping): its materialized registered artifact, or the on-the-fly warp
+/// — so the map and the reference can never disagree about a frame's
+/// pixels. One frame and one channel at a time: peak RAM is one frame
+/// plane (plus the reader's band) on top of the maps. `cancel` is checked
+/// before every frame and channel.
+pub fn build_reference_saturation(
+    input: &GroupInput<'_>,
+    frames_used: &[usize],
+    pool: &Arc<rayon::ThreadPool>,
+    cancel: &AtomicBool,
+) -> Result<Vec<Vec<f32>>, IntegrationError> {
+    let (w, h) = (input.width, input.height);
+    let mut maps = vec![vec![f32::NAN; w * h]; input.channels];
+    let mut plane = vec![0f32; w * h];
+    for &i in frames_used {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IntegrationError::Cancelled);
+        }
+        let frame = input.frames.get(i).ok_or_else(|| {
+            IntegrationError::BadInput(format!(
+                "frame index {i} of a {}-frame group",
+                input.frames.len()
+            ))
+        })?;
+        let mut src = RegisteredSource::open_materialized(
+            &[materialized_frame(frame)],
+            w,
+            h,
+            0,
+            input.interpolation,
+            input.clamping,
+        )?
+        .with_pool(Arc::clone(pool));
+        let mut band = BandPlanes::new(&src);
+        for (c, map) in maps.iter_mut().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(IntegrationError::Cancelled);
+            }
+            src.set_plane(c)?;
+            src.read_band_with_progress(0, h, &mut band, 1, &|_: u64| {}, cancel)?;
+            band.decode_frame_into(0, &mut plane);
+            let m = accumulate_reference_saturation(map, &plane, w, h, Some(pool));
+            if !(m.is_finite() && m > 0.0) {
+                debug!(
+                    frame_id = frame.frame_id,
+                    plane = c,
+                    "ln reference saturation map: the frame has no usable plane maximum"
+                );
+            }
+        }
+    }
+    Ok(maps)
+}
+
+/// Writes the saturation map beside the reference (L-23):
+/// `ln/<group>/reference-saturation.fits`, float32, the same planar layout
+/// and caller cards (`ATH_STKI`/`ATH_STKG`) [`write_reference`] gives
+/// `reference.fits`, plus the same scanner-skip pair.
+pub fn write_reference_saturation(
+    maps: &[Vec<f32>],
+    width: usize,
+    height: usize,
+    path: &Path,
+    cards: &[Card],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        maps.iter().all(|m| m.len() == width * height),
+        "LN reference saturation map: a plane is not {width}x{height}"
+    );
+    let all_cards = stacking_cards(SATURATION_IMAGETYP, cards)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // One plane at a time: never a second whole copy of the map.
+    write_fits_f32_streaming_with(
+        path,
+        width,
+        height,
+        maps.len(),
+        &all_cards,
+        Durability::Durable,
+        |p| Ok(maps[p].clone()),
+    )
+    .with_context(|| format!("writing LN reference saturation map {}", path.display()))?;
+    Ok(())
+}
+
+/// Opens a saturation map, refusing another shape than the reference's.
+fn open_reference_saturation(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> anyhow::Result<PlaneReader> {
+    let reader = PlaneReader::open(path)
+        .with_context(|| format!("opening LN reference saturation map {}", path.display()))?;
+    let (w, h, c) = (reader.width(), reader.height(), reader.channels());
+    if (w, h, c) != (width, height, channels) {
+        anyhow::bail!(
+            "LN reference saturation map {} is {w}x{h}x{c}, the reference is \
+             {width}x{height}x{channels}",
+            path.display()
+        );
+    }
+    Ok(reader)
+}
+
+/// Reads a map written by [`write_reference_saturation`], refusing one
+/// whose dimensions or channel count differ from the reference's.
+pub fn read_reference_saturation(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let reader = open_reference_saturation(path, width, height, channels)?;
+    (0..channels)
+        .map(|p| {
+            reader
+                .read_plane(p)
+                .with_context(|| format!("reading plane {p} of {}", path.display()))
+        })
+        .collect()
+}
+
+/// [`read_reference_saturation`] thresholded plane by plane
+/// ([`reference_saturation_mask`]), so the float map is never whole in RAM:
+/// what the run keeps for a cached reference.
+pub fn read_reference_saturation_masks(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    saturation: f64,
+) -> anyhow::Result<Vec<SaturationMask>> {
+    let reader = open_reference_saturation(path, width, height, channels)?;
+    (0..channels)
+        .map(|p| {
+            let map = reader
+                .read_plane(p)
+                .with_context(|| format!("reading plane {p} of {}", path.display()))?;
+            Ok(reference_saturation_mask(&map, width, height, saturation))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -754,5 +985,355 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- L-23: the reference-frames saturation map ----------------------
+
+    const SW: usize = 96;
+    const SH: usize = 64;
+
+    /// A noisy 0.1 plane with a 5 × 5 core of `v` centred on `(cx, cy)`.
+    fn plane_with_core(seed: u64, cx: usize, cy: usize, v: f32) -> Vec<f32> {
+        let mut p = vec![0.1f32; SW * SH];
+        add_noise(&mut p, 0.002, seed);
+        for y in cy - 2..=cy + 2 {
+            for x in cx - 2..=cx + 2 {
+                p[y * SW + x] = v;
+            }
+        }
+        p
+    }
+
+    fn bits(mask: &SaturationMask) -> Vec<bool> {
+        (0..SW * SH)
+            .map(|k| mask.get((k % SW) as isize, (k / SW) as isize))
+            .collect()
+    }
+
+    /// T2: each frame's ratio is taken to its OWN hot-pixel-corrected
+    /// maximum (a lone hot pixel does not set it), NaN pixels contribute
+    /// nothing, `R` is NaN where every frame is NaN, a frame with no usable
+    /// maximum contributes nothing, and at chosen pixels `R` is exactly the
+    /// max over frames of `p / M`.
+    #[test]
+    fn the_saturation_map_is_the_max_of_each_frames_own_relative_level() {
+        // Frame 0: a 0.8 core and a lone 1.0 hot pixel; NaN on x >= 80.
+        let mut f0 = plane_with_core(11, 20, 20, 0.8);
+        f0[30 * SW + 40] = 1.0;
+        // Frame 1: a 0.4 core on the same star, a 0.9 core elsewhere; NaN
+        // on x >= 64.
+        let mut f1 = plane_with_core(12, 20, 20, 0.4);
+        for y in 38..=42 {
+            for x in 8..=12 {
+                f1[y * SW + x] = 0.9;
+            }
+        }
+        for k in 0..SW * SH {
+            if k % SW >= 80 {
+                f0[k] = f32::NAN;
+            }
+            if k % SW >= 64 {
+                f1[k] = f32::NAN;
+            }
+        }
+        let mut map = vec![f32::NAN; SW * SH];
+        let m0 = accumulate_reference_saturation(&mut map, &f0, SW, SH, None);
+        let m1 = accumulate_reference_saturation(&mut map, &f1, SW, SH, Some(&pool()));
+        assert_eq!(m0, 0.8, "the hot pixel does not set frame 0's maximum");
+        assert_eq!(m1, 0.9);
+
+        // A frame with no usable maximum contributes nothing.
+        let before: Vec<u32> = map.iter().map(|v| v.to_bits()).collect();
+        let zeros = vec![0.0f32; SW * SH];
+        assert_eq!(
+            accumulate_reference_saturation(&mut map, &zeros, SW, SH, None),
+            0.0
+        );
+        let all_nan = vec![f32::NAN; SW * SH];
+        assert!(accumulate_reference_saturation(&mut map, &all_nan, SW, SH, None).is_nan());
+        let after: Vec<u32> = map.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(before, after, "an unusable frame leaves the map alone");
+
+        let at = |x: usize, y: usize| map[y * SW + x];
+        let ratio = |p: &[f32], m: f32, x: usize, y: usize| p[y * SW + x] / m;
+        // The star: frame 0 at its own maximum.
+        assert_eq!(at(20, 20), 1.0);
+        // The hot pixel itself still reads its raw value over M (1.0 / 0.8).
+        assert_eq!(
+            at(40, 30),
+            ratio(&f0, m0, 40, 30).max(ratio(&f1, m1, 40, 30))
+        );
+        assert_eq!(at(40, 30), 1.25);
+        // Frame 1's own star: 0.9 / 0.9.
+        assert_eq!(at(10, 40), 1.0);
+        // A background pixel: the larger of the two ratios, exactly.
+        for (x, y) in [(5, 5), (50, 50), (60, 3)] {
+            assert_eq!(at(x, y), ratio(&f0, m0, x, y).max(ratio(&f1, m1, x, y)));
+        }
+        // Only frame 0 covers 64 <= x < 80.
+        assert_eq!(at(70, 10), ratio(&f0, m0, 70, 10));
+        // No frame covers x >= 80.
+        for y in 0..SH {
+            for x in 80..SW {
+                assert!(at(x, y).is_nan(), "({x}, {y}) = {}", at(x, y));
+            }
+        }
+
+        // The mask: R > saturation, NaN never.
+        let mask = reference_saturation_mask(&map, SW, SH, 0.75);
+        assert!(mask.get(20, 20) && mask.get(40, 30) && mask.get(10, 40));
+        assert!(!mask.get(5, 5) && !mask.get(85, 10));
+        let inert = reference_saturation_mask(&map, SW, SH, f64::INFINITY);
+        assert!(
+            bits(&inert).iter().all(|&b| !b),
+            "a non-finite threshold sets nothing"
+        );
+    }
+
+    /// T6 (masked mode): a project reference's frames are NaN outside their
+    /// coverage, so `R` is NaN there and no bit is ever set — even at a
+    /// threshold every finite ratio clears.
+    #[test]
+    fn nan_outside_coverage_never_sets_a_bit() {
+        let mut map = vec![f32::NAN; SW * SH];
+        for (i, cover) in [40usize, 56].into_iter().enumerate() {
+            let mut p = plane_with_core(20 + i as u64, 20, 20, 0.7);
+            for (k, v) in p.iter_mut().enumerate() {
+                if k % SW >= cover {
+                    *v = f32::NAN;
+                }
+            }
+            accumulate_reference_saturation(&mut map, &p, SW, SH, None);
+        }
+        let mask = reference_saturation_mask(&map, SW, SH, 0.0);
+        for (k, b) in bits(&mask).into_iter().enumerate() {
+            let covered = k % SW < 56;
+            assert_eq!(b, covered, "pixel {k}: R = {}", map[k]);
+            assert_eq!(map[k].is_nan(), !covered, "pixel {k}");
+        }
+    }
+
+    /// T6 through the run's builder: the `empty_as_nan` fixture's members
+    /// are NaN past each plane's own cover, read through the same warp the
+    /// reference integrates; per channel the map is NaN exactly where no
+    /// member covers and the mask never sets a bit there.
+    #[test]
+    fn the_builder_leaves_each_planes_uncovered_pixels_nan_and_unmasked() {
+        const W: usize = 96;
+        const H: usize = 64;
+        const C: usize = 3;
+        const COVER: [usize; C] = [40, 60, 80];
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..4usize {
+            let mut data = Vec::with_capacity(W * H * C);
+            for (p, &cover) in COVER.iter().enumerate() {
+                let mut plane = vec![0.1f32 + 0.05 * p as f32; W * H];
+                add_noise(&mut plane, 0.003, 4000 + (i * C + p) as u64);
+                for (k, v) in plane.iter_mut().enumerate() {
+                    if k % W >= cover {
+                        *v = f32::NAN;
+                    }
+                }
+                data.extend_from_slice(&plane);
+            }
+            let path = dir.path().join(format!("cov{i}.fits"));
+            write_fits_f32(&path, W, H, C, &data, &[]).unwrap();
+            frames.push(StackFrame {
+                path,
+                map: identity_map(),
+                measurement: FrameMeasurement {
+                    width: W,
+                    height: H,
+                    channels: vec![ChannelMeasurement::default(); C],
+                    duration_ms: 0,
+                },
+                weight: weight(1.0),
+                exposure_s: 60.0,
+                date_obs: None,
+                frame_id: 900300 + i as i64,
+                registered_path: None,
+            });
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: W,
+            height: H,
+            channels: C,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+            stats_on_covered: false,
+        };
+        let maps =
+            build_reference_saturation(&input, &[0, 1, 2, 3], &pool(), &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(maps.len(), C);
+        for (p, map) in maps.iter().enumerate() {
+            let mask = reference_saturation_mask(map, W, H, 0.0);
+            for (k, &r) in map.iter().enumerate() {
+                // The bilinear edge column: see
+                // `empty_as_nan_marks_each_planes_own_uncovered_pixels`.
+                let covered = k % W + 1 < COVER[p];
+                let bit = mask.get((k % W) as isize, (k / W) as isize);
+                if covered {
+                    assert!(r.is_finite() && r > 0.0, "plane {p} pixel {k}: {r}");
+                    assert!(bit, "plane {p} pixel {k}");
+                } else {
+                    assert!(r.is_nan(), "plane {p} pixel {k}: {r}");
+                    assert!(!bit, "plane {p} pixel {k}");
+                }
+            }
+        }
+    }
+
+    /// The builder reads each member exactly as `integrate_planes` does: a
+    /// materialized registered artifact verbatim (its calibrated `path` is
+    /// never opened), so the map equals folding the artifacts' planes
+    /// directly; only `frames_used` contributes; a raised `cancel` stops it.
+    #[test]
+    fn the_builder_reads_the_members_registered_planes_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        let mut planes = Vec::new();
+        for i in 0..4usize {
+            // Frame i's star is brighter in its own frame than the others'.
+            let mut data = Vec::new();
+            let mut chan = Vec::new();
+            for c in 0..3usize {
+                let p = plane_with_core(
+                    500 + (i * 3 + c) as u64,
+                    30 + 10 * i,
+                    30,
+                    0.3 + 0.1 * i as f32,
+                );
+                data.extend_from_slice(&p);
+                chan.push(p);
+            }
+            let registered = dir.path().join(format!("reg{i}.fits"));
+            write_fits_f32(&registered, SW, SH, 3, &data, &[]).unwrap();
+            planes.push(chan);
+            frames.push(StackFrame {
+                path: dir.path().join("never-opened.fits"),
+                map: identity_map(),
+                measurement: FrameMeasurement {
+                    width: SW,
+                    height: SH,
+                    channels: vec![ChannelMeasurement::default(); 3],
+                    duration_ms: 0,
+                },
+                weight: weight(1.0),
+                exposure_s: 60.0,
+                date_obs: None,
+                frame_id: 900400 + i as i64,
+                registered_path: Some(registered),
+            });
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: SW,
+            height: SH,
+            channels: 3,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+            stats_on_covered: false,
+        };
+        let used = [3usize, 1, 2];
+        let maps =
+            build_reference_saturation(&input, &used, &pool(), &AtomicBool::new(false)).unwrap();
+        for c in 0..3 {
+            let mut expected = vec![f32::NAN; SW * SH];
+            for &i in &used {
+                accumulate_reference_saturation(&mut expected, &planes[i][c], SW, SH, None);
+            }
+            let (a, b): (Vec<u32>, Vec<u32>) = (
+                maps[c].iter().map(|v| v.to_bits()).collect(),
+                expected.iter().map(|v| v.to_bits()).collect(),
+            );
+            assert_eq!(a, b, "channel {c}");
+        }
+        // Frame 0 is not a member: its star is not in the map.
+        assert!(maps[0][30 * SW + 30] < 0.75, "{}", maps[0][30 * SW + 30]);
+
+        let err =
+            build_reference_saturation(&input, &used, &pool(), &AtomicBool::new(true)).unwrap_err();
+        assert!(matches!(err, IntegrationError::Cancelled), "{err:?}");
+    }
+
+    /// T4: the sidecar round-trips bit for bit (NaN included), carries the
+    /// scanner-skip and caller cards, and a reader expecting another width,
+    /// height or channel count refuses it naming both shapes; the masks the
+    /// run reads are the thresholded planes.
+    #[test]
+    fn the_saturation_sidecar_round_trips_and_refuses_another_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (12usize, 8usize);
+        let maps: Vec<Vec<f32>> = (0..3)
+            .map(|c| {
+                (0..w * h)
+                    .map(|i| {
+                        if i % 7 == c {
+                            f32::NAN
+                        } else {
+                            (i as f32 * 0.013 + c as f32 * 0.2).sin().abs() * 1.1
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let path = dir.path().join("reference-saturation.fits");
+        let cards = vec![
+            Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap(),
+            Card::new("ATH_STKG", CardValue::Str("g".into())).unwrap(),
+        ];
+        write_reference_saturation(&maps, w, h, &path, &cards).unwrap();
+
+        let back = read_reference_saturation(&path, w, h, 3).unwrap();
+        assert_eq!(back.len(), 3);
+        for (a, b) in maps.iter().zip(&back) {
+            let (a, b): (Vec<u32>, Vec<u32>) = (
+                a.iter().map(|v| v.to_bits()).collect(),
+                b.iter().map(|v| v.to_bits()).collect(),
+            );
+            assert_eq!(a, b);
+        }
+        let header = FitsHeader::from_path(&path).unwrap();
+        assert_eq!(header.get_str("ATH_STK").as_deref(), Some("T"));
+        assert_eq!(header.get_str("ATH_STKI").as_deref(), Some("run-7"));
+        assert_eq!(header.get_str("ATH_STKG").as_deref(), Some("g"));
+
+        for (ew, eh, ec) in [(w + 1, h, 3), (w, h - 1, 3), (w, h, 1)] {
+            let e = read_reference_saturation(&path, ew, eh, ec).unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains(&format!("{w}x{h}x3")) && msg.contains(&format!("{ew}x{eh}x{ec}")),
+                "{msg}"
+            );
+            assert!(read_reference_saturation_masks(&path, ew, eh, ec, 0.75).is_err());
+        }
+
+        let masks = read_reference_saturation_masks(&path, w, h, 3, 0.75).unwrap();
+        assert_eq!(masks.len(), 3);
+        for (m, map) in masks.iter().zip(&maps) {
+            assert_eq!(m, &reference_saturation_mask(map, w, h, 0.75));
+        }
+        assert!(read_reference_saturation(&dir.path().join("missing.fits"), w, h, 3).is_err());
     }
 }

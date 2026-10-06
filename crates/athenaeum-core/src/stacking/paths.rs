@@ -24,6 +24,11 @@ use crate::stacking::groups::{ColorMode, IntegrationGroup};
 /// (`sanitize_for_filename` trims it), so a frame set never lays out here.
 pub const PROJECTS_DIR: &str = "_projects";
 
+/// The LN reference's saturation-map sidecar (L-23), always in the same
+/// folder as its `reference.fits` — a cached reference finds it beside the
+/// path its artifact row stores.
+pub const LN_REFERENCE_SATURATION_FILE: &str = "reference-saturation.fits";
+
 /// The on-disk layout a stacking run stages its working-folder artifacts
 /// into: `<working_dir>/<set_slug>/{calibrated,registered,ln,runs}/…`. One
 /// `WorkingLayout` per frame set (the slug — [`crate::stacking::groups::set_slug`]
@@ -216,6 +221,13 @@ impl WorkingLayout {
     /// frame's `LnGrid` (M2 Task 1) is defined over.
     pub fn ln_reference_path(&self, group_key: &str) -> PathBuf {
         self.ln_dir(group_key).join("reference.fits")
+    }
+
+    /// `root/ln/<group_key>/reference-saturation.fits` — the LN reference's
+    /// reference-frames saturation map (spec 2026-10-04 §3 step 1, L-23),
+    /// beside [`Self::ln_reference_path`] and part of the same artifact.
+    pub fn ln_reference_saturation_path(&self, group_key: &str) -> PathBuf {
+        self.ln_dir(group_key).join(LN_REFERENCE_SATURATION_FILE)
     }
 
     /// `root/ln/<group_key>/<stem>.athln` — one frame's local-normalization
@@ -1225,6 +1237,12 @@ mod tests {
         assert_eq!(
             layout.ln_reference_path("cam__mono__Ha__bin1__100x100"),
             PathBuf::from("/work/LDN_1272/ln/cam__mono__Ha__bin1__100x100/reference.fits")
+        );
+        assert_eq!(
+            layout.ln_reference_saturation_path("cam__mono__Ha__bin1__100x100"),
+            PathBuf::from(
+                "/work/LDN_1272/ln/cam__mono__Ha__bin1__100x100/reference-saturation.fits"
+            )
         );
     }
 

@@ -43,7 +43,9 @@ impl FiniteMask {
         Self::from_fn(width, height, |_| true)
     }
 
-    fn from_fn(width: usize, height: usize, f: impl Fn(usize) -> bool) -> FiniteMask {
+    /// Bit `k` (row-major) set where `f(k)`. Shared with the selection's
+    /// reference-frames saturation mask (L-23), the same one-bit storage.
+    pub(crate) fn from_fn(width: usize, height: usize, f: impl Fn(usize) -> bool) -> FiniteMask {
         let n = width * height;
         let mut bits = vec![0u64; n.div_ceil(64)];
         for k in 0..n {

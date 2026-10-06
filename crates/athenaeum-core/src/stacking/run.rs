@@ -76,9 +76,10 @@ use crate::stacking::integrate::{
     GroupStats, StackFrame,
 };
 use crate::stacking::ln::{
-    self, build_reference as build_ln_reference, normalize_frame, read_reference, write_reference,
-    BackgroundModel, LnError, LnFrameGrids, LnReference, LnReferenceForDetection, LnScaleSeeds,
-    TileTable, CLEANING,
+    self, build_reference as build_ln_reference, build_reference_saturation, normalize_frame,
+    read_reference, read_reference_saturation_masks, reference_saturation_mask, write_reference,
+    write_reference_saturation, BackgroundModel, LnError, LnFrameGrids, LnReference,
+    LnReferenceForDetection, LnScaleSeeds, SaturationMask, TileTable, CLEANING,
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
@@ -88,7 +89,9 @@ use crate::stacking::master_cards::{
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
-use crate::stacking::paths::{cleanup_work, subject_layout, CleanupWhat, WorkingLayout};
+use crate::stacking::paths::{
+    cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
+};
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
     measurement_hash_for, normalization_hash_for, registration_hash_for, registration_row_is_fresh,
@@ -10615,11 +10618,35 @@ fn run_group_normalization(
     // always writes there). Defaults to `reference_path_buf` and is
     // overridden only by the cache-hit-success arm below.
     let mut resolved_reference_path: PathBuf = reference_path_buf.clone();
-    let ln_reference: LnReference = match cached_reference_path {
+    // L-23: the reference-frames saturation masks, thresholded with this
+    // run's `starSelection.saturation` (the float map stays on disk, so a
+    // `saturation` change never rebuilds it). A cached reference without a
+    // usable map beside it (missing, unreadable, another shape) is rebuilt
+    // exactly like one whose own file cannot be read.
+    let saturation = ln_cfg.star_selection.saturation;
+    let cached: Option<(PathBuf, LnReference, Vec<SaturationMask>)> = match cached_reference_path {
         Some(path) => match read_reference(&path) {
             Ok(r) => {
-                resolved_reference_path = path;
-                r
+                let map_path = path.with_file_name(LN_REFERENCE_SATURATION_FILE);
+                match read_reference_saturation_masks(
+                    &map_path,
+                    r.width,
+                    r.height,
+                    r.planes.len(),
+                    saturation,
+                ) {
+                    Ok(masks) => Some((path, r, masks)),
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            group_key = %group.key,
+                            path = %map_path.display(),
+                            error = %format!("{e:#}"),
+                            "the cached LN reference has no usable saturation map; rebuilding"
+                        );
+                        None
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -10628,19 +10655,16 @@ fn run_group_normalization(
                     error = %e,
                     "failed to read the cached LN reference; rebuilding"
                 );
-                build_and_write_ln_reference(
-                    rc,
-                    group,
-                    input,
-                    &reference_members,
-                    n,
-                    io,
-                    &reference_hash,
-                    &reference_member_ids,
-                    scale_px,
-                )?
+                None
             }
         },
+        None => None,
+    };
+    let (ln_reference, ref_frames_saturation): (LnReference, Vec<SaturationMask>) = match cached {
+        Some((path, r, masks)) => {
+            resolved_reference_path = path;
+            (r, masks)
+        }
         None => build_and_write_ln_reference(
             rc,
             group,
@@ -10651,6 +10675,7 @@ fn run_group_normalization(
             &reference_hash,
             &reference_member_ids,
             scale_px,
+            saturation,
         )?,
     };
 
@@ -10748,6 +10773,7 @@ fn run_group_normalization(
             reference_psf,
             measure_opts.max_stars,
             Some(&rc.ctx.image_pool),
+            Some(ref_frames_saturation),
         )
     } else {
         LnReferenceForDetection::build(
@@ -10755,6 +10781,7 @@ fn run_group_normalization(
             reference_psf,
             measure_opts.max_stars,
             Some(&rc.ctx.image_pool),
+            Some(ref_frames_saturation),
         )
     };
 
@@ -11583,6 +11610,15 @@ fn measure_ln_seeds_calibration(
 /// `ln/<group>/reference.fits` and upserts the `ln_reference` artifact row.
 /// `reference_hash` is the caller's already-computed config hash — this
 /// function only persists it, never recomputes it.
+///
+/// L-23: right after the reference it builds the reference-frames
+/// saturation map over the SAME members (`frames_used`, read through the
+/// same source `integrate_planes` used), writes it beside the reference
+/// (`reference-saturation.fits`, part of the `ln_reference` artifact),
+/// thresholds it with `saturation` and drops the float map: the returned
+/// masks are what the LN pass keeps. Built here rather than inside
+/// `build_reference`, which stays the plain integration its tests pin.
+#[allow(clippy::too_many_arguments)]
 fn build_and_write_ln_reference(
     rc: &mut RunContext,
     group: &IntegrationGroup,
@@ -11601,7 +11637,8 @@ fn build_and_write_ln_reference(
     reference_hash: &str,
     reference_member_ids: &[i64],
     scale_px: u32,
-) -> Result<LnReference, RunError> {
+    saturation: f64,
+) -> Result<(LnReference, Vec<SaturationMask>), RunError> {
     let build_start = Instant::now();
     let empty_as_nan = rc.grid.is_some();
     // v0.6.3: the reference build is an integration of the group's best
@@ -11670,6 +11707,46 @@ fn build_and_write_ln_reference(
     write_reference(&built, &reference_path, &cards)
         .map_err(|e| RunError::Other(format!("writing LN reference: {e:#}")))?;
 
+    // L-23: the reference-frames saturation map, one frame and one channel
+    // at a time, written beside the reference before the artifact row
+    // claims the pair.
+    let map_start = Instant::now();
+    let maps = build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
+        if matches!(e, IntegrationError::Cancelled) {
+            RunError::Cancelled
+        } else {
+            tracing::error!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                error = %e,
+                "ln reference saturation map failed"
+            );
+            RunError::Other(format!("LN reference saturation map failed: {e}"))
+        }
+    })?;
+    let map_path = rc.layout.ln_reference_saturation_path(&group.key);
+    write_reference_saturation(&maps, built.width, built.height, &map_path, &cards).map_err(|e| {
+        tracing::error!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            path = %map_path.display(),
+            error = %format!("{e:#}"),
+            "writing the ln reference saturation map failed"
+        );
+        RunError::Other(format!("writing the LN reference saturation map: {e:#}"))
+    })?;
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        ln_reference_frames = built.frames_used.len(),
+        duration_ms = map_start.elapsed().as_millis() as u64,
+        "ln reference saturation map built"
+    );
+    let masks: Vec<SaturationMask> = maps
+        .into_iter()
+        .map(|map| reference_saturation_mask(&map, built.width, built.height, saturation))
+        .collect();
+
     let (size, modified_at) =
         file_identity(&reference_path).map_err(|e| RunError::Other(format!("{e:#}")))?;
     // Fix round 1, item 5: `build_plan` verifies every `ln` row's freshness
@@ -11714,7 +11791,7 @@ fn build_and_write_ln_reference(
         "ln reference built"
     );
 
-    Ok(built)
+    Ok((built, masks))
 }
 
 /// Stages 6 (normalize), 7 (integrate) and 9 (output). Per group, in
@@ -18320,6 +18397,111 @@ mod tests {
             "{:?}",
             plan_after.groups[0]
         );
+    }
+
+    /// T5 (spec 2026-10-04 §3 step 1, L-23): the run writes the
+    /// reference-frames saturation map beside the LN reference and reads it
+    /// back on a cache hit; a cached reference whose map is missing is
+    /// rebuilt (map included) with a `warn!`, and its members' `.athln`
+    /// sidecars stay cached — the rebuilt reference is the same image.
+    #[test]
+    fn a_cached_ln_reference_without_its_saturation_map_is_rebuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+        // P-13: the finite selection that cuts nothing (synthetic stars).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let reference_path = layout.ln_reference_path(&group_key);
+        let map_path = layout.ln_reference_saturation_path(&group_key);
+        let run_card = |path: &Path| {
+            crate::fits_parser::FitsHeader::from_path(path)
+                .unwrap()
+                .get_str("ATH_STKI")
+                .unwrap_or_default()
+        };
+        let run = |stage_logs: bool| -> (i64, String, RunContext) {
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            let logs = if stage_logs {
+                crate::stacking::solve::tests::captured_logs(|| stage_output(&mut rc).unwrap())
+            } else {
+                stage_output(&mut rc).unwrap();
+                String::new()
+            };
+            (run_id, logs, rc)
+        };
+
+        // Run 1 builds the reference and its map, with the same cards.
+        let (run1, _, _) = run(false);
+        assert!(map_path.exists(), "the saturation map is written beside the reference");
+        assert_eq!(run_card(&reference_path), run1.to_string());
+        assert_eq!(run_card(&map_path), run1.to_string());
+
+        // Run 2: a cache hit reads the map; nothing is rebuilt.
+        let (_, logs2, _) = run(true);
+        assert!(!logs2.contains("no usable saturation map"), "{logs2}");
+        assert_eq!(run_card(&reference_path), run1.to_string(), "cache hit");
+
+        // Run 3: the map is gone, so the cached reference is rebuilt.
+        std::fs::remove_file(&map_path).unwrap();
+        let (run3, logs3, rc3) = run(true);
+        assert!(
+            logs3.contains("the cached LN reference has no usable saturation map; rebuilding"),
+            "{logs3}"
+        );
+        assert!(logs3.contains("ln reference saturation map built"), "{logs3}");
+        assert!(map_path.exists(), "the map is rebuilt");
+        assert_eq!(run_card(&reference_path), run3.to_string(), "the reference is rebuilt");
+        assert_eq!(run_card(&map_path), run3.to_string());
+        let group_summary = rc3
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
+        for f in included {
+            assert!(f.cached_ln, "the members' sidecars stay cached: {f:?}");
+        }
     }
 
     /// Spec §2.3 + Review Focus 3: the plan reports the scale it will use,

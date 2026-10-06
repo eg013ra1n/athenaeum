@@ -66,14 +66,18 @@ pub use background::{
     shared_refit, BackgroundModel, BackgroundRefusal, CleaningParams, PairSurfaces, Surface,
     TileNoise, TileStat, TileTable, CLEANING,
 };
-pub use selection::{rank_candidates, Candidates, SelectionRule, SelectionSide};
+pub use selection::{rank_candidates, Candidates, SaturationMask, SelectionRule, SelectionSide};
 pub use calibration::{
     calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
     ChannelCalibration, ChannelOutcome, SeedsCalibration, SEEDS_CALIBRATION_BAND,
     SEEDS_CALIBRATION_FRAMES, SEEDS_CALIBRATION_MIN_RATIOS,
 };
 pub use grid::{LnFrameGrids, LnGrid};
-pub use reference::{build_reference, read_reference, write_reference, LnReference};
+pub use reference::{
+    accumulate_reference_saturation, build_reference, build_reference_saturation, read_reference,
+    read_reference_saturation, read_reference_saturation_masks, reference_saturation_mask,
+    write_reference, write_reference_saturation, LnReference,
+};
 pub use scale::{
     relative_scale, relative_scale_against, relative_scale_against_with_diag,
     relative_scale_from_seeds, relative_scale_from_seeds_with_breakdown,
@@ -86,9 +90,10 @@ pub use scale::{
 /// normalization subtree so a change in what an existing config produces
 /// moves the `ln`, `ln_reference` and `ln_calibration` hashes together.
 /// 1 = the cell model (implicit, never written); 2 = the background model
-/// at the scale; 3 = the star selection (spec §3); bump it again whenever
-/// an existing config's output moves.
-pub const LN_MODEL_VERSION: u32 = 3;
+/// at the scale; 3 = the star selection (spec §3); 4 = the reference-frames
+/// saturation map (spec §3 step 1, L-23); bump it again whenever an
+/// existing config's output moves.
+pub const LN_MODEL_VERSION: u32 = 4;
 
 /// What [`normalize_frame`] is given to seed the relative-scale step with
 /// (perf tier C Task 2 fix round 4, ruling C-14 item 3).
@@ -513,6 +518,12 @@ pub struct LnReferenceForDetection<'a> {
     /// only: `build_masked` leaves it empty because the member's overlap is
     /// the reference side's presence there.
     pub present: Vec<FiniteMask>,
+    /// L-23: per plane, the reference-frames saturation mask (`R >
+    /// saturation`, the float map thresholded and dropped by the caller),
+    /// read by the reference side of the star selection in both modes.
+    /// `None` when no map exists (tests, probes): the test is then the
+    /// integrated plane's alone.
+    pub ref_frames_saturation: Option<Vec<SaturationMask>>,
 }
 
 impl<'a> LnReferenceForDetection<'a> {
@@ -533,6 +544,7 @@ impl<'a> LnReferenceForDetection<'a> {
         psf: crate::stacking::psf_signal::PsfModel,
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
+        ref_frames_saturation: Option<Vec<SaturationMask>>,
     ) -> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
@@ -577,18 +589,22 @@ impl<'a> LnReferenceForDetection<'a> {
             prepared,
             overlap: LnOverlap::Legacy,
             present,
+            ref_frames_saturation,
         }
     }
 
     /// The `Masked` preparation (plan 6b-3 D6): non-finite reference pixels
     /// — the grid no member covers — become 0.0 for detection, never the
     /// median, and the reference's own stars within [`LN_MASK_MARGIN_PX`]
-    /// of its coverage edge are dropped before they are fitted.
+    /// of its coverage edge are dropped before they are fitted. The
+    /// reference-frames saturation masks apply here too (their map is NaN,
+    /// never set, outside the grid's coverage).
     pub fn build_masked(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
+        ref_frames_saturation: Option<Vec<SaturationMask>>,
     ) -> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
@@ -629,6 +645,7 @@ impl<'a> LnReferenceForDetection<'a> {
             prepared,
             overlap: LnOverlap::Masked,
             present: Vec::new(),
+            ref_frames_saturation,
         }
     }
 }
@@ -760,6 +777,26 @@ pub fn normalize_frame(
             reference_for_detection.prepared.len(),
             reference_for_detection.present.len()
         )));
+    }
+    // L-23: the masks, when present, are one per plane at the reference's size.
+    if let Some(masks) = &reference_for_detection.ref_frames_saturation {
+        let shape_ok = masks.len() == channels
+            && masks
+                .iter()
+                .all(|m| (m.width(), m.height()) == (reference.width, reference.height));
+        if !shape_ok {
+            tracing::error!(
+                frame_id = frame.frame_id,
+                count = masks.len(),
+                "ln: the reference-frames saturation masks do not match the LN reference"
+            );
+            return Err(LnError::Other(format!(
+                "{} reference-frames saturation masks for a {channels}-channel {}x{} LN reference",
+                masks.len(),
+                reference.width,
+                reference.height
+            )));
+        }
     }
 
     let stride = (scale_px / 8).max(2) as usize;
@@ -1025,12 +1062,18 @@ pub fn normalize_frame(
                 width: reference.width,
                 height: reference.height,
                 noise: &ref_noise,
+                // L-23: the same mask in legacy and masked mode.
+                frames_saturation: reference_for_detection
+                    .ref_frames_saturation
+                    .as_ref()
+                    .map(|m| &m[p]),
             },
             target: SelectionSide {
                 plane: &target,
                 width: reference.width,
                 height: reference.height,
                 noise: &tgt_noise,
+                frames_saturation: None,
             },
         };
         let t = Instant::now();
@@ -1299,7 +1342,7 @@ mod tests {
         ];
         let reference = reference_with_planes(planes);
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None, None);
         assert_eq!(for_detection.sanitized_planes.len(), 2);
         for (p, plane) in for_detection.sanitized_planes.iter().enumerate() {
             assert!(
@@ -1319,7 +1362,7 @@ mod tests {
         let location = median_of_finite(&plane);
 
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None, None);
         assert_eq!(for_detection.sanitized_planes.len(), 1);
         match &for_detection.sanitized_planes[0] {
             Cow::Owned(v) => {
@@ -1730,8 +1773,13 @@ mod tests {
             max_stars: 200,
             ..Default::default()
         };
-        let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
+        let for_detection = LnReferenceForDetection::build(
+            &reference,
+            PsfModel::Moffat4,
+            measure.max_stars,
+            None,
+            None,
+        );
         let ref_bg = ref_models(&reference, cfg.scale);
         let frame = StackFrame {
             path: target_path,
@@ -1878,8 +1926,13 @@ mod tests {
             max_stars: 200,
             ..Default::default()
         };
-        let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
+        let for_detection = LnReferenceForDetection::build(
+            &reference,
+            PsfModel::Moffat4,
+            measure.max_stars,
+            None,
+            None,
+        );
         let ref_bg = ref_models(&reference, cfg.scale);
 
         let frame = StackFrame {
@@ -2125,6 +2178,7 @@ mod tests {
             PsfModel::Moffat4,
             measure.max_stars,
             None,
+            None,
         );
         assert_eq!(for_detection.overlap, LnOverlap::Masked);
         let ref_bg = ref_models(&reference, cfg.scale);
@@ -2279,6 +2333,7 @@ mod tests {
             PsfModel::Moffat4,
             measure.max_stars,
             None,
+            None,
         );
         let ref_bg = ref_models(&reference, cfg.scale);
         let path = dir.path().join("member.fits");
@@ -2408,6 +2463,39 @@ mod tests {
         ramp: f32,
         nan_cores: bool,
     ) -> (LnFrameOutcome, LnFrameGrids) {
+        masked_probe_try(
+            interpolation,
+            ref_cover,
+            from,
+            mode,
+            seeds,
+            estimator,
+            aperture,
+            ramp,
+            nan_cores,
+            // P-13: the probe pins coverage handling; its synthetic stars include no saturated one.
+            crate::stacking::integrate::LnStarSelection::OFF,
+            None,
+        )
+        .expect("the probe member normalizes")
+    }
+
+    /// [`masked_probe_with`] with the star selection and the reference-frames
+    /// saturation masks (L-23) chosen, returning `normalize_frame`'s result.
+    #[allow(clippy::too_many_arguments)]
+    fn masked_probe_try(
+        interpolation: crate::resample::Interpolation,
+        ref_cover: usize,
+        from: usize,
+        mode: LnOverlap,
+        seeds: bool,
+        estimator: crate::stacking::integrate::LnFluxEstimator,
+        aperture: crate::stacking::integrate::LnAperture,
+        ramp: f32,
+        nan_cores: bool,
+        star_selection: crate::stacking::integrate::LnStarSelection,
+        ref_frames_saturation: Option<Vec<SaturationMask>>,
+    ) -> Result<(LnFrameOutcome, LnFrameGrids), LnError> {
         use crate::fits_writer::write_fits_f32;
         use crate::geometry::{Linear, PixelMap};
         use crate::stacking::measure::FrameMeasurement;
@@ -2468,8 +2556,7 @@ mod tests {
         let cfg = LocalNormalizationConfig {
             enabled: true,
             scale: 256,
-            // P-13: the probe pins coverage handling; its synthetic stars include no saturated one.
-            star_selection: crate::stacking::integrate::LnStarSelection::OFF,
+            star_selection,
             flux_estimator: estimator,
             aperture,
             ..LocalNormalizationConfig::default()
@@ -2480,12 +2567,20 @@ mod tests {
             ..Default::default()
         };
         let for_detection = match mode {
-            LnOverlap::Masked => {
-                LnReferenceForDetection::build_masked(&reference, PsfModel::Moffat4, 200, None)
-            }
-            LnOverlap::Legacy => {
-                LnReferenceForDetection::build(&reference, PsfModel::Moffat4, 200, None)
-            }
+            LnOverlap::Masked => LnReferenceForDetection::build_masked(
+                &reference,
+                PsfModel::Moffat4,
+                200,
+                None,
+                ref_frames_saturation,
+            ),
+            LnOverlap::Legacy => LnReferenceForDetection::build(
+                &reference,
+                PsfModel::Moffat4,
+                200,
+                None,
+                ref_frames_saturation,
+            ),
         };
         let ref_bg = ref_models(&reference, cfg.scale);
         let path = dir.path().join("member.fits");
@@ -2540,9 +2635,69 @@ mod tests {
             None,
             None,
             &cancel,
-        )
-        .expect("the probe member normalizes");
-        (outcome, LnFrameGrids::read(&sidecar).unwrap())
+        )?;
+        Ok((outcome, LnFrameGrids::read(&sidecar).unwrap()))
+    }
+
+    /// L-23 through `normalize_frame`: the reference-frames masks reach the
+    /// reference side of the selection in legacy AND masked mode, on the
+    /// seeds path and the detection path. A mask with every bit set leaves
+    /// no pair (the seeds path falls back to detection, which has none
+    /// either); an empty mask changes nothing against no mask; a mask list
+    /// that does not match the reference's planes is refused.
+    #[test]
+    fn the_reference_frames_masks_reach_the_selection_in_both_modes() {
+        use crate::resample::Interpolation;
+        use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
+        // A finite selection that cuts nothing else on these synthetic stars.
+        let sel = LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
+        let run = |mode, seeds, masks| {
+            masked_probe_try(
+                Interpolation::Bilinear,
+                512,
+                0,
+                mode,
+                seeds,
+                LnFluxEstimator::PsfSignal,
+                LnAperture::Fwhm3,
+                0.0,
+                false,
+                sel,
+                masks,
+            )
+        };
+        for mode in [LnOverlap::Legacy, LnOverlap::Masked] {
+            for seeds in [true, false] {
+                let full = run(
+                    mode,
+                    seeds,
+                    Some(vec![SaturationMask::from_fn(512, 384, |_| true)]),
+                );
+                assert!(
+                    matches!(full, Err(LnError::TooFewMatches { .. })),
+                    "{mode:?} seeds={seeds}: {:?}",
+                    full.map(|(o, _)| o.scale)
+                );
+                let (none, _) = run(mode, seeds, None).expect("no mask normalizes");
+                let (empty, _) = run(mode, seeds, Some(vec![SaturationMask::empty(512, 384)]))
+                    .expect("an empty mask normalizes");
+                assert_eq!(empty.channel_scales, none.channel_scales, "{mode:?} seeds={seeds}");
+            }
+        }
+        let two = run(
+            LnOverlap::Legacy,
+            false,
+            Some(vec![SaturationMask::empty(512, 384), SaturationMask::empty(512, 384)]),
+        );
+        assert!(
+            matches!(&two, Err(LnError::Other(m)) if m.contains("saturation masks")),
+            "{:?}",
+            two.map(|(o, _)| o.scale)
+        );
     }
 
     /// Bias guard (a): at full coverage Masked is a bit-exact no-op against

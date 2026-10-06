@@ -7885,13 +7885,14 @@ mod tests {
         // 2026-10-05 LN model fixes Task 3: scale/scaleMode/gridSize leave the subtree, ln_scale_px token (L-19).
         // 2026-10-05 LN model fixes Task 11: starSelection + lnModelVersion 3 (ln_* only; calib/meas/reg unchanged).
         // 2026-10-05 LN model fixes Task 13: fluxEstimator + aperture (aperture only under commonAperture)
+        // 2026-10-06: LN_MODEL_VERSION 4 (L-23) - the reference-frames saturation map (ln_* only; calib/meas/reg unchanged).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=fb71171308f36322 ln=b8f1e0d25b03fe39 ln_cal=f772fc5665febe48",
-                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=fb71171308f36322 ln=0dfadbcec17fbc32 ln_cal=f772fc5665febe48",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=72f73e5cb7e0a93b ln=284b12a68d3588d1 ln_cal=8e38cf9aabd7b2cc",
-                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=72f73e5cb7e0a93b ln=4678ada7ff985705 ln_cal=8e38cf9aabd7b2cc",
+                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=7c622dcb8c4dcc0b ln=d8a4f98b4e2a8480 ln_cal=94f574f15b175ff1",
+                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=7c622dcb8c4dcc0b ln=390914ab3ce8fb4d ln_cal=94f574f15b175ff1",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=ace714f53daf4b63 ln=39fa216dfc9f56a6 ln_cal=c8ed0ae540e2e061",
+                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=ace714f53daf4b63 ln=e05e31295c19f60e ln_cal=c8ed0ae540e2e061",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no

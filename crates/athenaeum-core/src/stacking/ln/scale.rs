@@ -140,6 +140,9 @@ pub struct ScaleResult {
     pub selected: usize,
     /// Which selection rule produced the sample (`ln_selection`, P-15).
     pub selection: SelectionRule,
+    /// L-23: pairs only the reference-frames saturation mask dropped (they
+    /// passed both planes' own test) — `ln_ref_frames_saturated`.
+    pub ref_frames_saturated: usize,
     /// The Moffat β both planes were fitted with — whatever the reference
     /// resolved (`psf::PsfModel::Moffat4`'s fixed 4.0, or `Auto`'s own
     /// per-plane search run once, on the reference only).
@@ -186,6 +189,7 @@ impl PartialEq for ScaleResult {
             && self.rejected == other.rejected
             && self.selected == other.selected
             && self.selection == other.selection
+            && self.ref_frames_saturated == other.ref_frames_saturated
             && self.beta == other.beta
             && self.pass == other.pass
             && self.local == other.local
@@ -423,6 +427,7 @@ struct MeasuredSample {
     sample: RatioSample,
     matches: usize,
     rule: SelectionRule,
+    ref_frames_saturated: usize,
     aperture_px: Option<f64>,
     common_fwhm_px: Option<f64>,
     growth_factor: Option<f64>,
@@ -581,6 +586,7 @@ fn measured_sample(
         sample,
         matches,
         rule: c.rule,
+        ref_frames_saturated: c.ref_frames_saturated,
         aperture_px,
         common_fwhm_px,
         growth_factor,
@@ -594,6 +600,7 @@ struct RelativeScaleLog {
     matches: usize,
     selected: usize,
     rule: SelectionRule,
+    ref_frames_saturated: usize,
     rejected: usize,
     pass: u8,
     local_nodes: usize,
@@ -614,6 +621,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_matches = e.matches,
             ln_selected = e.selected,
             ln_selection = e.rule.as_str(),
+            ln_ref_frames_saturated = e.ref_frames_saturated,
             rejected = e.rejected,
             ln_pass = e.pass,
             ln_local_nodes = e.local_nodes,
@@ -630,6 +638,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_matches = e.matches,
             ln_selected = e.selected,
             ln_selection = e.rule.as_str(),
+            ln_ref_frames_saturated = e.ref_frames_saturated,
             rejected = e.rejected,
             ln_pass = e.pass,
             ln_local_nodes = e.local_nodes,
@@ -645,6 +654,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
             ln_matches = e.matches,
             ln_selected = e.selected,
             ln_selection = e.rule.as_str(),
+            ln_ref_frames_saturated = e.ref_frames_saturated,
             rejected = e.rejected,
             ln_pass = e.pass,
             ln_local_nodes = e.local_nodes,
@@ -1133,6 +1143,7 @@ fn relative_scale_against_core(
         sample,
         matches,
         rule,
+        ref_frames_saturated,
         aperture_px,
         common_fwhm_px,
         growth_factor,
@@ -1153,6 +1164,7 @@ fn relative_scale_against_core(
             matches,
             selected: sample.ratios.len(),
             rule,
+            ref_frames_saturated,
             rejected: r.rejected,
             pass,
             local_nodes: local.as_ref().map_or(0, |s| s.nodes.len()),
@@ -1172,6 +1184,7 @@ fn relative_scale_against_core(
             rejected: r.rejected,
             selected: sample.ratios.len(),
             selection: rule,
+            ref_frames_saturated,
             beta: prepared.beta,
             pass,
             local,
@@ -1614,6 +1627,7 @@ fn relative_scale_from_seeds_core(
         sample,
         matches,
         rule,
+        ref_frames_saturated,
         aperture_px,
         common_fwhm_px,
         growth_factor,
@@ -1636,6 +1650,7 @@ fn relative_scale_from_seeds_core(
             matches,
             selected: sample.ratios.len(),
             rule,
+            ref_frames_saturated,
             rejected: r.rejected,
             pass,
             local_nodes: local.as_ref().map_or(0, |s| s.nodes.len()),
@@ -1655,6 +1670,7 @@ fn relative_scale_from_seeds_core(
             rejected: r.rejected,
             selected: sample.ratios.len(),
             selection: rule,
+            ref_frames_saturated,
             beta: prepared.beta,
             pass,
             local,
@@ -1713,12 +1729,14 @@ pub fn relative_scale(
             width,
             height,
             noise: &ref_noise,
+            frames_saturation: None,
         },
         target: SelectionSide {
             plane: target,
             width,
             height,
             noise: &tgt_noise,
+            frames_saturation: None,
         },
     };
     relative_scale_against(
@@ -1764,12 +1782,14 @@ mod tests {
                 width: w,
                 height: h,
                 noise,
+                frames_saturation: None,
             },
             target: SelectionSide {
                 plane: t,
                 width: w,
                 height: h,
                 noise,
+                frames_saturation: None,
             },
         }
     }
@@ -3260,12 +3280,14 @@ mod tests {
                 width: WIDTH,
                 height: HEIGHT,
                 noise: ref_noise,
+                frames_saturation: None,
             },
             target: SelectionSide {
                 plane: target,
                 width: WIDTH,
                 height: HEIGHT,
                 noise: tgt_noise,
+                frames_saturation: None,
             },
         }
     }
@@ -3327,6 +3349,80 @@ mod tests {
             from_seeds.scale,
             det.scale
         );
+    }
+
+    /// T1 (L-23) through the production scale call: stars the
+    /// reference-frames mask flags (they passed the integrated plane's own
+    /// test) are left out on the detection and the seeds path alike, and
+    /// `ref_frames_saturated` counts exactly them.
+    #[test]
+    fn the_reference_frames_mask_drops_its_stars_on_both_scale_paths() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        // Six ordinary stars (not the bright ones `saturated_pair` makes).
+        let flagged: Vec<(f64, f64)> = star_grid(41)
+            .iter()
+            .skip(5)
+            .step_by(10)
+            .map(|&(x, y, _)| (x, y))
+            .collect();
+        let map: Vec<f32> = (0..WIDTH * HEIGHT)
+            .map(|k| {
+                let (x, y) = ((k % WIDTH) as f64, (k / WIDTH) as f64);
+                if flagged.iter().any(|&(fx, fy)| (x - fx).hypot(y - fy) <= 3.0) {
+                    1.0
+                } else {
+                    0.1
+                }
+            })
+            .collect();
+        let mask =
+            crate::stacking::ln::reference::reference_saturation_mask(&map, WIDTH, HEIGHT, 0.75);
+        let plain = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        let mut masked = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        masked.reference.frames_saturation = Some(&mask);
+        let in_flagged = |diag: &[ScaleMatchDiag]| {
+            diag.iter()
+                .filter(|d| {
+                    flagged
+                        .iter()
+                        .any(|&(x, y)| (d.ref_x - x).hypot(d.ref_y - y) < 3.0)
+                })
+                .count()
+        };
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let (det, det_diag) = relative_scale_against_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &plain,
+        )
+        .expect("the detection path must match");
+        assert_eq!(det.ref_frames_saturated, 0);
+        let selected_flagged = in_flagged(&det_diag);
+        assert!(selected_flagged >= 5, "the plain selection keeps them: {selected_flagged}");
+
+        let (det_m, det_m_diag) = relative_scale_against_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &masked,
+        )
+        .expect("the detection path must match with the mask");
+        assert_eq!(in_flagged(&det_m_diag), 0, "the mask drops them");
+        assert_eq!(det_m.ref_frames_saturated, selected_flagged);
+        assert_eq!(det_m.selected + det_m.ref_frames_saturated, det.selected);
+
+        let seeds = prepared.outcome.fits.clone();
+        let identity = identity_map();
+        let (from_seeds, seeds_diag) = relative_scale_from_seeds_with_diag(
+            &prepared, &seeds, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            &masked,
+        )
+        .expect("the seeds path must match with the mask");
+        assert_eq!(in_flagged(&seeds_diag), 0, "on the seeds path too");
+        assert_eq!(from_seeds.ref_frames_saturated, selected_flagged);
     }
 
     /// The masked diag wrapper is the masked call plus the diag: on the

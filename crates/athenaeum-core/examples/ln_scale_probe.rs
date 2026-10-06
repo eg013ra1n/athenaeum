@@ -33,14 +33,25 @@
 //! presence masks of P-8): `psfOff` (PSF signal, no star selection),
 //! `psfSel` (PSF signal, the default selection), `f1_2`/`f1_3`/`f1_gc` (the
 //! default selection, common aperture at 2F / 3F / growth curve). Each arm
-//! reports `s`, `sigma`, `matches`, `selected`, `rule`, `aperturePx`,
-//! `commonFwhmPx`, `growth` and `terciles` (the RCR location of the ratios of
-//! the bright / middle / faint third by reference flux). `--ln-scale N`
+//! reports `s`, `sigma`, `matches`, `selected`, `rule`, `refFramesSaturated`
+//! (pairs only the reference-frames saturation mask dropped, L-23),
+//! `aperturePx`, `commonFwhmPx`, `growth` and `terciles` (the RCR location of
+//! the ratios of the bright / middle / faint third by reference flux).
+//!
+//! `--ref-saturation <fits>` reads the reference-frames saturation map (L-23;
+//! the run's own `ln/<group>/reference-saturation.fits` works) and thresholds
+//! it with the default selection's `saturation`; the production call and
+//! every arm then read it on the reference side (`psfOff` runs under
+//! `LnStarSelection::OFF`, which ignores it). A one-channel map is used
+//! whatever `--plane` is; a multi-channel one gives its channel `--plane`
+//! (out of range is refused). Without the flag the probe behaves as before.
+//! The stderr header and every JSON line state `refSaturation` (the path, or
+//! `null`). `--ln-scale N`
 //! sets the LN scale of the models (default: `ln::resolve_scale` of the
 //! default config on the plane); `--max-stars-sel N` overrides the selection's
 //! own `maxStars` (the detection cap `--max-stars` is a different thing).
 //!
-//! Two modes need no reference/members:
+//! Three modes need no reference/members:
 //! - `--estimators <stars.csv>...` reads per-star CSVs written by
 //!   `--stars-dir` and prints the RCR location (limit 0.3, the production
 //!   call) of every candidate flux estimator, over all pairs and over the
@@ -49,16 +60,30 @@
 //!   pixel stacks in windows around stars with the production per-pixel
 //!   combiner, once as the run did (checked against the real master's
 //!   pixels), once with each member's scale corrected to the photometric
-//!   truth, and once per estimator arm a member carries (see `stack_sim`).
+//!   truth, and once per estimator arm a member carries (see `stack_sim`);
+//! - `--build-ref-saturation <out.fits> <registered.fits>...` builds a
+//!   reference-frames saturation map over every channel of the given
+//!   registered frames with the run's own library function
+//!   (`ln::accumulate_reference_saturation`), writes it and exits, printing
+//!   one JSON line per frame (`planeMax`, its `M_k` per channel) and a
+//!   summary line (frame count, shape, wall time). The inputs may be
+//!   one-plane files (`--dump-warped` output): the map has as many channels
+//!   as the inputs, and inputs whose dimensions or channel counts differ are
+//!   refused. For a reference built before the map existed, pass the
+//!   registered planes of its `ln_reference` payload's
+//!   `reference_member_ids`.
 //!
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- \
 //!   --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
 //!   [--max-stars 24576] [--stars-dir DIR] [--tgt-beta <b|auto>] \
 //!   [--ln-scale N] [--max-stars-sel N] \
 //!   [--interpolation bicubicBSpline] [--clamping 0.3] [--dump-warped DIR] \
+//!   [--ref-saturation <reference-saturation.fits>] \
 //!   (--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- --estimators <stars.csv>...
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- --stack-sim <config.json>
+//! cargo run --release -p athenaeum-core --example ln_scale_probe -- \
+//!   --build-ref-saturation <out.fits> <registered.fits>...
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -82,8 +107,9 @@ use athenaeum_core::stacking::ln::scale::{
     relative_scale_against_with_diag, PreparedReferenceChannel, ScaleMatchDiag,
 };
 use athenaeum_core::stacking::ln::{
-    eroded_mask, resolve_scale, BackgroundModel, FiniteMask, ScaleInputs, SelectionSide, TileNoise,
-    TileTable, CLEANING, LN_MASK_MARGIN_PX,
+    accumulate_reference_saturation, eroded_mask, reference_saturation_mask, resolve_scale,
+    write_reference_saturation, BackgroundModel, FiniteMask, SaturationMask, ScaleInputs,
+    SelectionSide, TileNoise, TileTable, CLEANING, LN_MASK_MARGIN_PX,
 };
 use athenaeum_core::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
@@ -107,10 +133,17 @@ fn usage() -> ! {
     eprintln!(
         "usage: ln_scale_probe --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
 [--max-stars N] [--stars-dir DIR] [--tgt-beta <b|auto>] [--ln-scale N] [--max-stars-sel N] \
-[--interpolation name] [--clamping c] [--dump-warped DIR] \
+[--interpolation name] [--clamping c] [--dump-warped DIR] [--ref-saturation <fits>] \
 (--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
        ln_scale_probe --estimators <stars.csv>...
-       ln_scale_probe --stack-sim <config.json>"
+       ln_scale_probe --stack-sim <config.json>
+       ln_scale_probe --build-ref-saturation <out.fits> <registered.fits>...
+
+--ref-saturation: a one-channel map is used whatever --plane is; a multi-channel map gives its
+  channel --plane (refused when out of range). Thresholded with the default selection's
+  saturation; every selected arm and the production call read it (psfOff ignores it).
+--build-ref-saturation: every channel of the inputs (one-plane files are fine); the map has as
+  many channels as the inputs; inputs of differing dimensions or channel counts are refused."
     );
     std::process::exit(2);
 }
@@ -146,6 +179,10 @@ struct Args {
     /// `--stack-sim <config.json>`: the master-window simulation (see
     /// [`stack_sim`]).
     stack_sim: Option<PathBuf>,
+    /// `--ref-saturation <fits>`: the reference-frames saturation map (L-23).
+    ref_saturation: Option<PathBuf>,
+    /// `--build-ref-saturation <out.fits> <registered.fits>...`.
+    build_ref_saturation: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 fn parse_model(s: &str) -> PsfModel {
@@ -173,6 +210,8 @@ fn parse_args() -> Args {
         estimators: Vec::new(),
         dump_warped: None,
         stack_sim: None,
+        ref_saturation: None,
+        build_ref_saturation: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -213,10 +252,19 @@ fn parse_args() -> Args {
             "--estimators" => a.estimators.push(PathBuf::from(val())),
             "--dump-warped" => a.dump_warped = Some(PathBuf::from(val())),
             "--stack-sim" => a.stack_sim = Some(PathBuf::from(val())),
+            "--ref-saturation" => a.ref_saturation = Some(PathBuf::from(val())),
+            "--build-ref-saturation" => {
+                let out = PathBuf::from(val());
+                let inputs: Vec<PathBuf> = it.by_ref().map(PathBuf::from).collect();
+                if inputs.is_empty() {
+                    usage();
+                }
+                a.build_ref_saturation = Some((out, inputs));
+            }
             _ => usage(),
         }
     }
-    if !a.estimators.is_empty() || a.stack_sim.is_some() {
+    if !a.estimators.is_empty() || a.stack_sim.is_some() || a.build_ref_saturation.is_some() {
         return a;
     }
     if a.reference.as_os_str().is_empty() || a.members.is_empty() {
@@ -488,6 +536,10 @@ fn main() {
             .build()
             .unwrap_or_else(|e| die(format!("thread pool: {e}"))),
     );
+    if let Some((out, inputs)) = &args.build_ref_saturation {
+        build_ref_saturation(out, inputs, &pool);
+        return;
+    }
     let fit_params = FitParams::default();
 
     // ---- the reference side, prepared once (ln::LnReferenceForDetection) ----
@@ -547,14 +599,23 @@ fn main() {
     }
     let ref_tree = KdTree2::build(&ref_out.fits.iter().map(|f| (f.x, f.y)).collect::<Vec<_>>());
     let ref_fwhm = fwhm_median(&ref_out.fits);
+    let ref_saturation_label = args
+        .ref_saturation
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |p| p.display().to_string());
     eprintln!(
-        "reference {}x{} plane {} beta {beta} fits {} median fit FWHM {ref_fwhm:.3} ({} ms)",
+        "reference {}x{} plane {} beta {beta} fits {} median fit FWHM {ref_fwhm:.3} refSaturation {} ({} ms)",
         w,
         h,
         args.plane,
         ref_out.fits.len(),
+        ref_saturation_label,
         t.elapsed().as_millis()
     );
+    let ref_saturation: Option<SaturationMask> = args
+        .ref_saturation
+        .as_ref()
+        .map(|p| load_ref_saturation(p, args.plane, w, h));
 
     if let Some(d) = &args.stars_dir {
         std::fs::create_dir_all(d).unwrap_or_else(|e| die(format!("{}: {e}", d.display())));
@@ -645,12 +706,14 @@ fn main() {
                 width: w,
                 height: h,
                 noise: &ref_noise,
+                frames_saturation: ref_saturation.as_ref(),
             },
             target: SelectionSide {
                 plane: &tgt_sane,
                 width: w,
                 height: h,
                 noise: &tgt_noise,
+                frames_saturation: None,
             },
         };
 
@@ -693,6 +756,7 @@ fn main() {
             (w, h),
             overlap_mask.as_deref(),
             allowed.as_deref(),
+            ref_saturation.as_ref(),
             &pool,
         );
 
@@ -881,6 +945,7 @@ fn main() {
         let line = serde_json::json!({
             "label": label,
             "plane": args.plane,
+            "refSaturation": args.ref_saturation.as_ref().map(|p| p.display().to_string()),
             "beta": beta,
             "refFwhmFit": ref_fwhm,
             "tgtFwhmFit": tgt_fwhm,
@@ -905,6 +970,92 @@ fn main() {
         println!("{line}");
         std::io::stdout().flush().ok();
     }
+}
+
+/// `--ref-saturation`: plane `plane` of the map (its only channel when it has
+/// one), thresholded with the default selection's `saturation` by the run's
+/// own function. Refuses another size than the reference's and a `--plane`
+/// out of range.
+fn load_ref_saturation(path: &PathBuf, plane: usize, w: usize, h: usize) -> SaturationMask {
+    let r = PlaneReader::open(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+    if (r.width(), r.height()) != (w, h) {
+        die(format!(
+            "{}: {}x{} is not the reference's {w}x{h}",
+            path.display(),
+            r.width(),
+            r.height()
+        ));
+    }
+    let channel = match r.channels() {
+        1 => 0,
+        n if plane < n => plane,
+        n => die(format!(
+            "{}: --plane {plane} is out of range for a {n}-channel map",
+            path.display()
+        )),
+    };
+    let map = r
+        .read_plane(channel)
+        .unwrap_or_else(|e| die(format!("{} plane {channel}: {e}", path.display())));
+    reference_saturation_mask(&map, w, h, LnStarSelection::default().saturation)
+}
+
+/// `--build-ref-saturation`: the reference-frames saturation map over every
+/// channel of `inputs` (registered frames, already in the reference
+/// geometry), folded with the run's own `accumulate_reference_saturation`
+/// one frame and one channel at a time, written with the run's own writer.
+fn build_ref_saturation(out: &PathBuf, inputs: &[PathBuf], pool: &Arc<rayon::ThreadPool>) {
+    let t = Instant::now();
+    let first = PlaneReader::open(&inputs[0])
+        .unwrap_or_else(|e| die(format!("{}: {e}", inputs[0].display())));
+    let (w, h, c) = (first.width(), first.height(), first.channels());
+    drop(first);
+    let mut maps = vec![vec![f32::NAN; w * h]; c];
+    for path in inputs {
+        let r = PlaneReader::open(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+        let shape = (r.width(), r.height(), r.channels());
+        if shape != (w, h, c) {
+            die(format!(
+                "{} is {}x{}x{}, {} is {w}x{h}x{c}",
+                path.display(),
+                shape.0,
+                shape.1,
+                shape.2,
+                inputs[0].display()
+            ));
+        }
+        let mut plane_max = Vec::with_capacity(c);
+        for (ch, map) in maps.iter_mut().enumerate() {
+            let plane = r
+                .read_plane(ch)
+                .unwrap_or_else(|e| die(format!("{} plane {ch}: {e}", path.display())));
+            plane_max.push(accumulate_reference_saturation(
+                map,
+                &plane,
+                w,
+                h,
+                Some(pool),
+            ));
+        }
+        println!(
+            "{}",
+            serde_json::json!({"frame": path.display().to_string(), "planeMax": plane_max})
+        );
+    }
+    write_reference_saturation(&maps, w, h, out, &[])
+        .unwrap_or_else(|e| die(format!("{}: {e:#}", out.display())));
+    println!(
+        "{}",
+        serde_json::json!({
+            "refSaturation": out.display().to_string(),
+            "frames": inputs.len(),
+            "width": w,
+            "height": h,
+            "channels": c,
+            "ms": t.elapsed().as_millis() as u64,
+        })
+    );
+    std::io::stdout().flush().ok();
 }
 
 /// One arm of the production scale call (see the module doc).
@@ -985,6 +1136,7 @@ fn scale_arms(
     (w, h): (usize, usize),
     overlap: Option<&[bool]>,
     allowed: Option<&[bool]>,
+    ref_saturation: Option<&SaturationMask>,
     pool: &Arc<rayon::ThreadPool>,
 ) -> serde_json::Value {
     let scale = args
@@ -1050,12 +1202,14 @@ fn scale_arms(
                 width: w,
                 height: h,
                 noise: &ref_noise,
+                frames_saturation: ref_saturation,
             },
             target: SelectionSide {
                 plane: tgt_sane,
                 width: w,
                 height: h,
                 noise: &tgt_noise,
+                frames_saturation: None,
             },
         };
         let res = match allowed {
@@ -1092,6 +1246,7 @@ fn scale_arms(
                 "matches": r.matches,
                 "selected": r.selected,
                 "rule": r.selection.as_str(),
+                "refFramesSaturated": r.ref_frames_saturated,
                 "aperturePx": r.aperture_px,
                 "commonFwhmPx": r.common_fwhm_px,
                 "growth": r.growth_factor,
