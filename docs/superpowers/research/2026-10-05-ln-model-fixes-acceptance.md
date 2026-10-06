@@ -1,4 +1,4 @@
-# LN model fixes — acceptance (checkpoint A, 2026-10-05)
+# LN model fixes — acceptance (checkpoint A 2026-10-05, checkpoint B 2026-10-06)
 
 Spec `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` §11; plan
 `docs/superpowers/plans/2026-10-05-ln-model-fixes-plan.md` Task 9. Branch head for the runs:
@@ -137,3 +137,151 @@ Rulings:
 - Continue to the star selection and F1.
 - The master-median row reads **branch vs base ±0.1 %** from checkpoint B on.
 - The uniform master-to-LN-reference median offset becomes an integration-side open item.
+
+## 8. Checkpoint B (2026-10-06)
+
+Branch head `d5f26b7e` (Tasks 10–16a: the star selection, F1, the reference-frames saturation map L-23). Two arms on
+every dataset: **PSF signal** with the selection and the map (the default config), and **F1** = common aperture,
+growth curve (`fluxEstimator: commonAperture`, `aperture: growthCurve`; the pre-check's step 2–3 pick, §8.5). The
+baseline is checkpoint A's tree (`lnA`), which isolates items 3–4. The pre-B full gate was green (core all-targets
+3737 passed / 0 failed, web 51, tauri, headless, `src/types`, tsc, vitest).
+
+### 8.0 Verdict
+
+**F1 measures the scale correctly on real data; the PSF signal does not.** Per member, against the photometric
+truth, on the runs' own LN references:
+
+| Dataset | F1 median gap / median \|gap\| / slope | PSF signal with selection |
+| ---- | ---- | ---- |
+| set 204 mono (91) | −0.10 % / 0.27 % / −0.11 %/px² | −5.98 % / 6.09 % / −3.29 %/px² |
+| set 204 OSC (13 × 3) | −0.19 % / 0.44 % / −0.49 %/px² | −0.49 % / 1.13 % / −4.41 %/px² |
+| run B mono (82) | +0.08 % / 0.33 % / −0.07 %/px² | −7.47 % / 7.47 % / −3.41 %/px² |
+| run B OSC (101 × 3) | −0.13 % / 0.39 % / **+0.58 %/px²** | +0.03 % / 0.96 % / −4.85 %/px² |
+| Horse C11 G (28) | −0.07 % / 0.32 % / −0.04 %/px² | −2.68 % / 2.68 % / −0.58 %/px² |
+
+The background-model rows hold on both arms (Horse C11 halo, B nodes, IC 434, on G and now on L). Master SNR is
+higher under F1 on every plane of every dataset.
+
+**Rows that miss as written** (nothing re-sized or tuned; they go to the owner):
+
+1. **Master MAD, F1 vs PSF, scale-normalized, ±1 %**: set 204 mono −2.37 %, run B mono −4.56 %; the raw read is
+   +1.22 % / +2.07 %. OSC passes. The whole-frame MAD mixes a small-scale part that scales with `k` and a large-scale
+   part held by the LN reference's background at the scale (§8.3); neither read can hold ±1 % for a +4…+7 % mono
+   signal change on this nebula field.
+2. **Per-member slope, run B OSC**: +0.58 %/px² against 0.5, pooled over the planes (known from the pre-check; the
+   run applies the probe's scales to 0.02 %). Within-plane it is +0.21 %/px² [90 % interval −0.10, +0.49].
+3. **FWHM vs the variance-mixture prediction, ±1 %**: run B mono, F1 vs `lnA`, −1.05 % (the master is *sharper* than
+   predicted; the independent second-moment read moves +0.03 %). On the OSC planes where the measurement's β flips
+   (set 204 R and B), the production `fwhmPx` jumps by −6.3…+6.7 % on either arm; the second-moment read is flat
+   (±0.02 %). This is checkpoint A's estimator artifact.
+
+### 8.1 Method
+
+| Dataset | PSF arm | F1 arm | Baseline | Reads |
+| ---- | ---- | ---- | ---- | ---- |
+| Set 204 | `checkpoint.sh lnB-psf lnA --numeric` | same with `ATH_ACC_SET_CONFIG` (set 204's stored config, two fields changed) | `lnA`; same-evening `main` `lnB-main` | `tier1-compare.py --numeric` (four pairs), `master_phot.py --noise`, run-log seeds lines, `.athln` scales vs truth |
+| Run B | `project-run.sh` on a `.backup` of the 6b-3 catalog | same with `ATH_ACC_PROJECT_CONFIG` | `lnA-runB` | `--pairs`, `master_phot.py --noise` (crop x0 73), catalog weights/rejection |
+| Horse C11 (L + G) | `horse-c11-prep.sh` + `hc11-run.sh` | same with the F1 config | `hc11-ln` (`lnA`); control `hc11-noln` | `master_phot.py --noise`, `halo_profile.py --search 60`, `nebula_boxes.py`, `star_blocks.py`, B-node read, ERP scale log |
+
+- Every run succeeded. The `checkpoint.sh` exit code 1 is the Tier C comparator's own §8 verdict, not a run failure.
+- The LN references are bit-identical across `lnA`, `lnB-psf`, `lnB-f1` and `lnB-main` (set 204), pixel-identical
+  to the pre-check's on run B, and md5-equal on Horse C11.
+- `lnB-main` reproduces `lnA-main` bit for bit (median, MAD, scale and rejection all 1.000000).
+- Controller scripts live outside the repo, under `~/.athenaeum-acc/lnB/`.
+
+**The run applies the probe's scales.** On the same reference and registered frames, the probe's per-member `s` equals
+the run's `.athln` relative scale:
+
+- set 204 mono: to 0.03–0.05 % on three members;
+- run B: to ≤ 0.02 % median on every plane;
+- Horse C11 G: +0.07 % median.
+
+The set-204 pre-check had measured against the September `tierA-baseline` LN reference (the same 20 members, a
+different build). There both the probe's scales and the truth sit 0.4 % higher (truth new/old 0.9961). The set-204
+truth was therefore re-measured against the run's own reference (`truth.py`; OSC per plane), and the §8.0 table uses
+it. The pre-check's gaps on the old reference (−0.14 % / 0.26 % / −0.07) and the run's on its own agree.
+
+### 8.2 Rows — set 204
+
+| Row | Bar | PSF arm (vs `lnA`) | F1 arm (vs `lnA`; vs PSF where the row says so) |
+| ---- | ---- | ---- | ---- |
+| Master median, branch vs base | ±0.1 % | −0.005 / −0.003 / −0.005 / −0.009 % **PASS** | −0.026 / −0.001 / −0.002 / −0.004 % **PASS** |
+| Master median vs same-evening `main` | reported | +0.077 / +0.074 / +0.061 / +0.057 % | +0.056 / +0.076 / +0.064 / +0.063 % |
+| Master MAD | ±1 % vs PSF, normalized (raw) | — | mono **−2.37 %** (raw +1.22) **MISS**; OSC −0.31 / +0.12 / +0.14 (raw +0.04 / −0.24 / −0.49) PASS |
+| Master SNR `k/σ` | ≥ baseline − 1 % | +0.07 / +0.09 / −0.01 / −0.22 % **PASS** | +0.39 / +0.57 / +0.20 / +0.09 % **PASS**; vs PSF +0.32 / +0.48 / +0.20 / +0.31 % |
+| FWHM vs variance-mixture prediction | ±1 % | mono pred +0.15 %, meas +0.18 % PASS; OSC G, B PASS; OSC R β 4→2.5: −6.32 % (estimator) | mono pred +0.98 %, meas +0.78 % (−0.20) PASS; OSC R, G PASS; OSC B β 6→4: −2.60 % (estimator); second-moment read: mono +0.32 %, OSC −0.02 / +0.01 / −0.01 % |
+| Rejected fraction | ±0.3 pp | −0.010 / +0.004 pp **PASS** | −0.047 / −0.021 pp **PASS** |
+| Weights | ρ ≥ 0.99, top-20 ≥ 18 | ρ 1.0, 20/20 **PASS** | ρ 1.0, 20/20 **PASS** |
+| Per-member scale vs truth (F1) | median \|gap\| ≤ 0.5 %, \|slope\| ≤ 0.5 %/px², offset ≤ 0.5 % | (reported, §8.0) | mono 0.27 / −0.11, OSC 0.44 / −0.49, offset +0.10 **PASS** |
+| `--stack-sim` mono, no rejection (F1) | ±0.5 % of the truth-corrected arm | psfSel −4.16 % | −0.17 % **PASS**; arm / LN reference 1.0060 (truth 1.0078) |
+| Seeds `k` per channel | reported (≈ 1 under F1) | mono 0.9974; OSC 0.9998 / 1.0043 / 1.0022 | mono 1.0001; OSC 1.0000 / 1.0000 / 1.0002 (`lnA`: 0.9916; 0.9965 / 0.9969 / 0.9925) |
+| Drizzle level / coverage | as before | unchanged data facts (mono coverage 0.9935, OSC R level 0.9976) | same |
+| Wall | reported | 901 s (Normalize 2.46 min) | 901 s (Normalize 2.46 min); `lnB-main` 851 s (1.89 min), `lnA` 870 s (2.21 min) |
+
+Planes are listed mono, then OSC R / G / B. `k` is the master's star flux over the LN reference's (`master_phot.py`).
+On mono that is 17–19 stars, SE 0.5–0.6 %. The direct F1/PSF master-to-master star ratio is 1.0429 ± 0.0012, against
+1.0367 through the reference. The FWHM prediction is
+`FWHM² = Σ w·(s/s_true)·F² / Σ w·(s/s_true)` with the run's weights and `.athln` scales. It holds within 0.03 points
+whether member `F` is the truth's half-max or the measurement's fit, and whether `s_true` is the truth or the F1
+scale. The harness half-max FWHM of the masters (3.742 / 3.826 / 3.909) counts pixels above half-max (`N` 11 → 12) and
+says nothing at the 1 % level.
+
+### 8.3 Why the MAD row misses
+
+The master is split into the median field of 128-px blocks (large scale) and the residual (small scale)
+(`mad_decomp.py`). Values are F1 vs PSF.
+
+| Part | set 204 mono, raw / normalized | run B mono, raw / normalized |
+| ---- | ---- | ---- |
+| Whole frame | +1.22 / −2.37 % | +2.07 / −4.56 % |
+| Small scale | +3.89 / +0.21 % | +5.73 / −1.14 % |
+| Block field | +0.15 / −3.39 % | +0.12 / −6.38 % |
+
+- **Small scale** (noise and structure under 128 px) follows the signal scale. Normalized, it is flat on set 204. On
+  run B it drops 1.1 %: the noise rises less than the signal, which is the master SNR's +1.9 %.
+- **Block field** does not move raw. Above the LN scale, the background comes from the LN reference through `B`,
+  whatever the arm's `A`. Dividing it by a larger `k` shrinks it.
+- **The whole-frame MAD** is a mix of the two. A +4 % (set 204) or +7 % (run B) mono scale change therefore cannot
+  hold ±1 % on either read.
+
+### 8.4 Rows — run B and Horse C11
+
+**Run B** (F1 vs PSF unless noted):
+
+| Row | Result |
+| ---- | ---- |
+| Master median | mono −0.04 %, OSC +0.001 / +0.003 / +0.004 %; both arms within 0.05 % of `lnA` — **PASS** |
+| Master MAD | mono normalized **−4.56 %** (raw +2.07) **MISS**; OSC −0.03 / +0.24 / +0.29 % (raw −0.04 / −0.34 / −0.72) PASS |
+| Master SNR | F1 vs `lnA` +2.21 / +0.42 / +0.09 / +0.08 %, PSF vs `lnA` +0.33 / +0.10 / +0.03 / −0.04 % — **PASS** |
+| FWHM vs prediction | mono: pred +0.89 % (vs `lnA` +1.03), `fwhmPx` −0.02 % (−0.03) → −0.90 (**−1.05**); second-moment +0.03 %. OSC: pred +0.28 / +0.09 / +0.09, meas +0.01 / +0.06 / +0.04 PASS |
+| Rejected fraction | identical to 6 decimals on both arms and `lnA` (rejection normalization is global here) — **PASS** |
+| Weights | bit-identical, 184/184 — **PASS** |
+| Wall | 811 s both arms (`lnA-runB` 781 s, a different evening) |
+
+**Horse C11** (`k`: control 0.88329 G / 0.79741 L; PSF 0.96110 / 0.98976; F1 0.98457 / 0.99294):
+
+| Row | Bar | PSF arm | F1 arm |
+| ---- | ---- | ---- | ---- |
+| G halo 60–70 / 80–90 / 100–120 px, normalized (control 28.33 / 13.55 / 7.41 %) | ±1 pt | +0.06 / −0.04 / −0.03 **PASS** | +0.03 / −0.03 / −0.03 **PASS** |
+| L halo, normalized (control 29.60 / 14.93 / 8.50 %; first read) | ±1 pt | +0.21 / +0.03 / +0.05 **PASS** | +0.22 / +0.03 / +0.04 **PASS** (`main`: 17.46 / 5.36 / 1.81 %) |
+| B nodes within 600 px, > 2 % of background | none | G 0 of 840 (worst 0.017 %), L 0 of 2 294 (0.047 %) **PASS** | G 0 of 840 (0.017 %), L 0 of 2 294 (0.038 %) **PASS** |
+| IC 434 boxes, `d_norm` | ±1 pt | +0.034 / −0.036 / +0.070 **PASS** | −0.048 / −0.113 / +0.015 **PASS** |
+| Star blocks, normalized rms (> 50 sky / > 200 sky / no star) | reported | G 0.40 / 0.40 / 0.38 %, L 0.42 / 0.47 / 0.43 % | G 0.42 / 0.47 / 0.37 %, L 0.42 / 0.48 / 0.44 % (`lnA` G 0.40 / 0.40 / 0.38; `main` 1.66 / 2.55 / 0.45) |
+| Master SNR vs `lnA` | ≥ −1 % | G −0.01 %, L +0.02 % **PASS** | G +0.28 %, L +0.08 % **PASS** |
+| ERP slope, per-frame scale / ERP (L-20: reported) | reported | −0.48 %/px² (r −0.85) | +0.07 %/px² (r +0.06); truth / ERP +0.11 |
+| Seeds `k` | reported | L 1.0009, G 1.0019 | L 0.9999, G 1.0034 |
+| Wall | reported | 631 s (Normalize 69.6 s) | 661 s (71.3 s); `hc11-ln` 631 s (59.1 s) |
+
+The raw `star_blocks.py` read shows F1's star blocks at 2.30 % rms on G against 1.48 % for PSF. Divided by each arm's
+`k` (`blocks_norm.py`), it is 0.42 % against 0.40 %. The difference is star signal level, not structure.
+
+### 8.5 L-16 (spec §4.4), applied to these numbers
+
+| Item | Result |
+| ---- | ---- |
+| 1. Truth per member: F1 passes step 1 on the four audited groups and Horse C11 G; PSF signal fails one on a mono group | **fails as written**: F1 passes four of five, run B OSC slope +0.58; PSF fails every mono group |
+| 2. F1's no-rejection master star flux within ±0.5 % of the truth-corrected arm | **holds**: −0.17 % (PSF −4.16 %) |
+| 3. Full runs: SNR ≥ PSF −1 %, rejection ±0.3 pp, MAD ±1 % normalized, ρ ≥ 0.99 | **fails on MAD** (mono, both datasets); SNR, rejection and ρ hold |
+| 4. Margin: ≥ 1 point of median \|gap\| on a mono group and ≥ 1 % closer at master level | **holds**: 0.27 vs 6.09 % (set 204 mono); 0.17 vs 4.16 % |
+
+By the pre-declared rule, the PSF signal stays the default unless the owner rules otherwise. The decision is Task 17's.
