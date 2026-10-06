@@ -344,18 +344,67 @@ dimensions divided by the normalization **scale** (minimum 16 px, typically
 geometry. The log's `.xnml` for a 6224×4168 frame at scale 1024 holds a
 49×33 grid, i.e. a stride of 128 px = scale/8.
 
-### 4.2 Background models [forum + §1.3]
+### 4.2 Background models [design; the model at the scale, 2026-10-04]
 
-"A multiscale local normalization algorithm based on the multiscale median
-transform." Background models of reference and target are large-scale MMT
-residuals (the §1.3 machinery: decimate → MMT residual → nearest-neighbour
-upsample) at the model scale. Pixels are rejected from the models by a low
-clipping level (4.5e-5), a high clipping level (0.85 relative to the
-maximum), and deviation thresholds from the local level (reference 3.0 σ,
-target 3.2 σ) with a hot-pixel median filter of radius 2 first [log parameter
-block; the meaning of the thresholds is our reading, unverified].
+**Replaced by the LN model fixes cycle** (`docs/superpowers/specs/
+2026-10-04-ln-model-fixes-design.md` §1, rulings L-1…L-6, plan rulings P-1,
+P-9, P-19…P-21). The earlier text (a per-cell robust level on the `scale/8`
+mesh with a 0.3 rejected-fraction gate, deviation thresholds 3.0σ for the
+reference and 3.2σ for a target, neighbour fill of invalid cells) is
+overturned. One procedure runs on the reference and on every target:
+
+1. **Cleaning.** Hot-pixel pass (radius 2: a pixel above 0.85 of full scale
+   and above median + 5σ of its 5×5 window becomes that median) and the clip
+   `[4.5e-5, 0.85 × full scale]`, applied tile by tile with a 2-px apron.
+2. **Tiles.** Non-overlapping 32-px tiles anchored at (0, 0). A tile with at
+   least 256 present pixels is a sample: iterate `median ± 3.0 · 1.4826 · MAD`
+   (at most 5 rounds), value = median of the kept pixels, σ = `1.4826 · MAD`
+   of the kept pixels, position = the tile's pixel-extent centre.
+3. **The surface.** A tensor-product uniform cubic B-spline, knot spacing
+   equal to the LN scale `h` (`n = ceil((W − 1)/h) + 3` basis functions per
+   axis). Coefficients `c` minimise `Σ_samples (y_s − S(x_s))² + λ ·
+   Σ_adjacent (c_a − c_b)²`, a first-difference (membrane) penalty over every
+   pair of coefficients adjacent along x or y, with `λ = 1e-2 ×` the median of
+   the non-zero diagonal entries of `BᵀB` (P-20; the spec's `1e-4` amplifies
+   gap noise to 6.8 % of sky and was replaced). Unweighted samples, `f64`
+   accumulation in tile order, dense Cholesky. The membrane's null space is
+   the constants, so the surface continues over uncovered areas at the edge
+   level and flattens a gradient near a plane edge (P-1).
+4. **Rejection rounds.** Fit on every sample, `σ_e = 1.4826 · MAD(e)` of the
+   residuals, reject `|e_s| > 3.0 σ_e` (two-sided), refit on the survivors,
+   repeat once; the third fit is final and every round re-judges every sample.
+   `σ_e` at the rounding level (`≤ 1e-6 × |median|`) rejects nothing (P-21).
+5. **The floor.** A knot cell (`h × h`) is supported at 8 accepted samples; a
+   plane is refused only when no cell is supported. There is no rejected-
+   fraction gate.
+6. **The shared refit.** Per reference–target pair, both surfaces are refitted
+   on the intersection of the two accepted sample sets (one design matrix, one
+   `λ`, one factorization, two right-hand sides, no rejection round), so a
+   faint extended feature rejected on one side only cannot make the two
+   surfaces differ under it. A pair with no supported cell on the intersection
+   keeps its own-threshold surfaces.
+7. **Nodes.** Each mesh node (stride `scale/8`) takes the refitted surface's
+   value at its own pixel; `B = B_R − A · B_T` is formed from the two refitted
+   surfaces.
+
+Thresholds are in each image's own noise units. A plain tile median without the
+in-tile clip is the recorded second lever, not built. C-29 (a binned
+background) stays measured out.
 
 ### 4.3 Relative scale — PSF method [code]
+
+**Default changed (L-24, owner 2026-10-06).** The shipped scale ratio is no
+longer the PSF-flux ratio of step 3 below. It is F1's **common-aperture flux
+ratio with the growth curve**: both frames are measured in one circle of radius
+`2F` (`F` = the larger of the two median fitted FWHMs, each frame about its own
+centroid), sky = the median of the present pixels in `[6F, 8F]`, `z = flux_R /
+flux_T`, then multiplied by the growth-curve correction `c` (the median over
+the first 100 valid pairs of `(flux_R(5F)/flux_R(2F)) / (flux_T(5F)/flux_T(2F))`),
+RCR location as in step 4. The PSF-flux method below is the `psfSignal`
+alternative (`normalization.local.fluxEstimator`); step 3 is overturned for the
+default path only. Both estimators read the same selected pairs (relative
+saturation, peak SNR, the brightest `maxStars`; spec §3). Rationale and
+measurements: spec §4 and §14 (L-13, L-24), acceptance doc §8.
 
 1. Detect and fit PSFs on reference and target (§1.4).
 2. Match stars by proximity: quad-tree search in a square of half-side

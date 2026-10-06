@@ -732,6 +732,8 @@ per-frame grids.
 
 ### 5.2 Local (M2)
 
+> **Superseded in part (2026-10-04):** the background model (cell levels, the 3.0σ/3.2σ thresholds, the 0.3 rejection limit), the LN scale (derived from the image size), the star selection for the relative scale and the default scale estimator are specified in `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` (rulings L-1…L-26).
+
 - **Reference** per group: integration of the best `referenceFrames` (20)
   included frames, linear-fit rejection, global normalization, resampled
   lazily, kept in RAM for the LN pass and written to
@@ -1233,6 +1235,8 @@ content: config, reference, groups, per-frame rows, stats) are the
 provenance, modelled on `master_provenance`.
 
 ### 9.2 Configuration
+
+> **`normalization.local` fields added 2026-10-04:** `scaleMode`, `gridSize`, `fluxEstimator`, `aperture` and `starSelection` (defaults, ranges and the legacy-document rule): `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` §6.
 
 One `StackingConfig` JSON (camelCase, `version: 1`, every field optional on
 the wire with the defaults below; the same struct is exported to TS):

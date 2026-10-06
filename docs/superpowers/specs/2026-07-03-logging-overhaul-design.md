@@ -206,6 +206,33 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 **Dictionary note (fix round 2, 2026-09-06):** the `MasterBuildProgressEvent` `master-build-progress` payload — a `ProgressEmitter` event, not a `tracing` field, so it carries no dictionary entry of its own — now ticks far more often than once per band: `EngineProgress::on_band` fires once per FRAME as `BandSource::read_band_with_progress` reads it (in addition to the existing end-of-band call), and for a FLAT also during pass 1 (`band_index_1based` pinned at `0`). See `EngineProgress::on_band`'s own doc comment in `engine.rs` for the exact contract — this is a UI-progress mechanism change, not a new log field, so it lives there rather than being duplicated into this dictionary.
 
+**Dictionary extension (LN model fixes, 2026-10-04):** (`stacking::ln`, `stacking::run`, `stacking::config`, `api::lights`; spec `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md` §10; the `ln_` prefix rule of the entries above applies). Names as emitted by the code, proof-read against `grep -rn 'ln_[a-z_]* =' crates/athenaeum-core/src/stacking`:
+
+| Field | Type | Meaning | Events |
+| ---- | ---- | ---- | ---- |
+| `ln_scale_px` | u32 | the resolved LN scale | `"ln scale resolved"` (info, per group), `"ln reference built"`, and the warn `"ln scale differs from the plan's estimate"` (with `expected`, the plan's estimate) |
+| `ln_scale_mode` | string `auto` \| `fixed` | how the scale was resolved | `"ln scale resolved"`, and the debug `"stacking config: legacy LN scale resolved"` (L-9) |
+| `ln_flux_estimator` | string `psfSignal` \| `commonAperture` | the scale estimator | `"ln scale resolved"`, `"ln relative scale"` |
+| `ln_samples` | usize | background samples in the own-threshold final fit, summed over channels | `"ln frame normalized"`, `"ln reference background modelled"` (debug, per channel) |
+| `ln_samples_rejected` | usize | samples the two rejection rounds left out | same |
+| `ln_samples_shared` | usize | samples in the shared-acceptance refit, summed over channels | `"ln frame normalized"` |
+| `ln_cells_unsupported` | usize | knot cells under the 8-sample floor | same as `ln_samples` |
+| `ln_selected` | usize | pairs after the star selection, before RCR (`ln_matches` keeps "pairs before selection") | `"ln relative scale"` |
+| `ln_selection` | string `snr` \| `brightQuarter` | which selection rule held | `"ln relative scale"` |
+| `ln_ref_frames_saturated` | usize | pairs the reference-frames saturation test (L-23) dropped that the integrated plane's own test kept | `"ln relative scale"` |
+| `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
+| `ln_common_fwhm_px` | f64 | `F`, the larger of the two median FWHMs | same |
+| `ln_growth_factor` | f64 | the growth-curve correction `c` | same (growth curve) |
+| `ln_annulus_crowding` | f64 | the median, over the pairs the ratio uses, of the larger of the two frames' fractions of present annulus pixels above the annulus median + 3 σ (L-26; NaN when not measured, log-only) | `"ln relative scale"` (common aperture) |
+| `light_offset` | string | the distinct OFFSET values of the affected lights, formatted `OFFSET <v>`, `OFFSET <lo>–<hi>` (a name prefix plus an en-dash range, e.g. `OFFSET 1–5`) or `OFFSET not recorded`, with ` (not recorded on some)` appended when only some lights carry the card | pedestal warn |
+| `light_gain` | string | the same format for GAIN (`GAIN 100`, `GAIN 100–120`, `GAIN not recorded`) | pedestal warn |
+| `flat_set_ids` | string | comma-joined flat set ids | pedestal warn |
+| `flat_corner_ratio` | f64 | `V`, the flat's darkest corner over its centre (NaN when it could not be read) | pedestal warn (run only) |
+
+- **`ln_cells_rejected` is RETIRED.** It was the target background model's invalid-cell count (M2 Task 5 entry above); the cell model it counted is gone. It is replaced by `ln_samples`, `ln_samples_rejected`, `ln_samples_shared` and `ln_cells_unsupported`.
+- The pedestal event is the warn `"flat without a dark or bias: the offset pedestal is amplified in vignetted corners"`, carrying `run_id` and `group_key` (run) or `set_id` (readiness, `get_export_readiness`), plus the canonical `count` (the affected lights). It is emitted by those two callers only; the stacking plan and the collab verdict fill the field silently.
+- Every background-model refusal (a plane with no supported cell, a pair with no shared supported cell) is logged before it returns.
+
 **Message style rule**: the message is a short, stable human phrase; all data lives in fields. `info!(root_id, new = 12, unchanged = 4219, "scan finished")` — never `info!("scan finished — 12 new of 4231")`. This is what makes events aggregatable and MCP-queryable.
 
 **Per-domain required fields** (the catalog; enforced by the sweep tables and code review). "Required" means: present wherever the value exists at that point in the operation — an event before a value is computed omits it; the sweep tables specify exact fields per event:

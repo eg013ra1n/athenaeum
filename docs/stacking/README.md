@@ -1547,11 +1547,288 @@ group onto the coordinator-confirmed grid and writes grid masters.
   threshold stays synthetic until a real partial-overlap project exists
   (open-items).
 
+**LN model fixes (2026-10-04 … 2026-10-06)** (spec
+`docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md`, plan
+`docs/superpowers/plans/2026-10-05-ln-model-fixes-plan.md`, acceptance
+`docs/superpowers/research/2026-10-05-ln-model-fixes-acceptance.md`, rulings
+L-1…L-26 and P-1…P-21). One cycle, five items: the background model at the
+scale, a scale derived from the image, a star selection for the scale, a
+common-aperture scale estimator (F1) and a calibration pedestal warning. No
+migration: stored runs, rows and `master_lights` are untouched; a set reaches
+the new model through the normal cache invalidation (below).
+
+- **The background model at the LN scale (item 1, L-1…L-6, P-1…P-3, P-9,
+  P-19…P-21).** `stacking/ln/background.rs` no longer holds a robust level per
+  128-px cell with a validity gate and a neighbour fill (retired, with
+  `rejection_limit`, the 3.0σ/3.2σ deviation thresholds and the full-plane
+  cleaned copy). One procedure, for the reference and every target alike:
+  - **Tiles (L-2).** Non-overlapping 32-px tiles, every pixel used, cleaned
+    tile by tile (hot-pixel pass and the `[4.5e-5, 0.85 × full scale]` clip
+    unchanged, a 2-px apron so the result equals the full-plane pass). A tile
+    with at least 256 present pixels is a sample: its value is the median of
+    the pixels kept by `median ± 3.0 · 1.4826 · MAD` (at most 5 rounds), with
+    its own σ.
+  - **The surface (L-3, P-20).** A tensor cubic B-spline with knot spacing
+    equal to the scale, penalized by a first-difference (membrane) penalty,
+    `MEMBRANE_PENALTY_REL = 1e-2` times the median non-zero diagonal of
+    `BᵀB`. The spec's `1e-4` was replaced at plan review (owner-confirmed
+    2026-10-05): at `1e-4` a weakly supported coefficient amplifies sample
+    noise to up to 6.8 % of sky in a gap, against 0.37 % for the old neighbour
+    fill, so a project member's pixels outside the reference would have
+    regressed. At `1e-2` every analytic node-noise column is at or below the
+    old model (gap anywhere 0.37 %). The price is corner flattening (P-1): a
+    10 %-of-sky gradient difference gains at most 0.13 % of sky at a corner
+    node, so the linear-gradient pin asserts what the model can meet (every
+    node within 2e-2 of the amplitude, nodes one knot interval inside within
+    5e-4) rather than the spec's 1e-5. Accumulated in `f64` in tile order and
+    solved by dense Cholesky, so it is bit-identical with and without a pool.
+  - **Rejection rounds and the floor (L-4, P-9, P-21).** Two rounds: fit,
+    reject samples beyond `3.0 · σ_e` of the residual MAD (two-sided, every
+    sample re-judged each round), refit; the third fit is final. A residual
+    MAD at the rounding level (`σ_e ≤ 1e-6 × |median|`) rejects nothing, and a
+    round that would keep no sample rejects nothing. A knot cell is supported
+    at 8 accepted samples; a plane is refused only when no cell is supported
+    (a refusal is logged, never swallowed). There is no rejected-fraction
+    gate.
+  - **The shared refit (L-6).** After both own-threshold fits, the reference
+    and target surfaces are refitted per pair on the intersection of their
+    accepted samples: one design matrix, one `λ`, one factorization, two
+    right-hand sides, no rejection round. It is symmetric, not the rejected
+    "one mask from the reference". A pair with no supported cell on the
+    intersection keeps its own-threshold surfaces with one `warn!`. Measured
+    on IC 434: the surface difference of one frame against the reference fell
+    from 1.66 % / 1.31 % of background (28- / 5-frame reference) to 0.23 % /
+    0.20 %.
+  - **Gaps and the project grid (L-5, P-3, P-19).** No fill step: the
+    membrane continues the surface over uncovered tiles (the data's local
+    trend for about one knot interval, then the edge level). A project
+    member's reference model reuses the group reference's tiles when the tile
+    and its apron lie inside the overlap, recomputes cut tiles and drops
+    outside ones; the result equals recomputing every tile.
+  - **Hashes.** `LN_MODEL_VERSION` (`ln/mod.rs`, folded into
+    `normalization_subtree`) is 2 after this item; see the selection and the
+    map for 3 and 4. The `.athln` format, `grid.rs` and `B = B_R − A·B_T` are
+    unchanged. `LnArtifactPayload.cells_rejected` became `samples`,
+    `samples_rejected`, `samples_shared`, `cells_unsupported`.
+  - **Checkpoint A (2026-10-05, accepted by the owner after an independent
+    review), Horse C11 G, scale 1536.** The halo rings at 60–70 / 80–90 /
+    100–120 px read +0.07 / −0.04 / −0.03 points against the no-LN control
+    (normalized read; `main` −11.4 / −9.1 / −6.2, and its raw 15.58 / 4.09 /
+    1.09 % reproduces run 8's 15.5 / 4.1 / 1.1). B nodes within 600 px of the
+    star: 0 of 840 out of line, worst 0.017 % (`main`: 252 of 1 932, worst
+    35 %). The three IC 434 boxes agree with the control to +0.040 / −0.028 /
+    +0.078 points. The scale path is bit-identical to `main` on set 204
+    (197/197 sidecars) and run B (184/184). Normalize grew 2.21 against 1.88
+    min on set 204 (+20 s; spec estimate +10 s). Three §11.3 rows missed as
+    written (master median ±0.1 % of the LN reference, whole-frame MAD,
+    FWHM on OSC blue) and the owner ruled them an effect of the item, a
+    harness artifact and a pre-existing offset (see the integration-side
+    open item in `open-items.md`); the median row reads branch against base
+    from checkpoint B on.
+- **The derived scale (item 2, L-7…L-10).** `scale = snap(min(W, H) /
+  gridSize)` on the geometry the LN models live in (the registration
+  reference, the group's own reference in native mode, the grid for a
+  project). `normalization.local` gains `scaleMode` (`auto` | `fixed`,
+  decoded as `Option`) and `gridSize` (default 4, 2–8); `scale` stays the
+  fixed value. The supported list is `256, 384, 512, 768, 1024, 1536, 2048,
+  3072, 4096, 6144, 8192`; `snap` takes the nearest, ties to the smaller.
+  Horse C11 (9576 × 6388) resolves to 1536; set 204 (6248 × 4176) and run B
+  (4480 × 5760) both stay at 1024.
+  - **Legacy rule (L-9).** A stored document without `scaleMode` reads as
+    **auto** when `scale == 1024` and **fixed** (snapped) otherwise, resolved
+    at read time in `resolve_config`; nothing is rewritten.
+  - **One function for plan and run (L-10).** `ln::resolve_scale` (`ln/
+    scale_rule.rs`). The plan's geometry is the grid, the stored
+    `ln_reference` artifact's own `width`/`height`, or a marked estimate
+    (`lnScaleEstimated`); a run whose scale differs from the plan's estimate
+    adds one run warning. The resolved scale is the hash token
+    `ln_scale_px:<n>` on the per-frame `ln` and `ln_calibration` hashes only;
+    the `ln_reference` hash carries none, and `scale`/`scaleMode`/`gridSize`
+    left the subtree, so a scale change never rebuilds the reference image.
+- **The star selection (item 3, L-11, L-12, L-14, L-23).** `ln/selection.rs`,
+  applied to pairs on both estimators, both scale paths, both arms of the
+  seeds calibration and the local-scale input:
+  - **Relative saturation.** A pair fails if the largest pixel within
+    `max(2, FWHM)` px of either centroid exceeds `saturation` (0.75) times the
+    hot-pixel-corrected plane maximum.
+  - **Peak SNR.** `(peak − b) / σ_local ≥ minPeakSnr` (40), `peak` the mean of
+    the five brightest pixels in the fit's sampling region.
+  - **The brightest.** Ranked by the reference fit's signal; the first
+    `maxStars` (500) valid pairs are kept. The cap counts matched pairs, a
+    deliberate deviation from the ERP's per-image cap.
+  - **Fallback.** Fewer than `MIN_MATCHES` (20) pairs passing both tests: the
+    brightest `max(⌈n/4⌉, 20)` of those passing saturation, logged
+    `brightQuarter`.
+  - **The reference-frames saturation map (L-23).** An integrated reference
+    averages a core clipped in some frames with unclipped ones, so its own
+    peak stays under the cut while its flux is short. The reference build
+    records, per channel, `R(x) = max_k (p_k(x) / M_k)` over the integrated
+    frames (`M_k` each frame's own hot-pixel-corrected maximum), and a pair
+    also fails when `R > saturation` within `max(2, FWHM)` px of the
+    reference centroid. It is written beside the reference as
+    `ln/<group>/reference-saturation.fits` (float32), belongs to the
+    `ln_reference` artifact, and the run rebuilds a reference whose map is
+    missing, unreadable or of another shape (with a `warn!`); the plan stats
+    neither file. In RAM only the 1-bit mask is kept, so a `saturation`
+    change never rebuilds the float map. Measured by the Task 16 pre-check
+    (set 204 mono): the integrated reference's plane maximum is 0.75 against
+    0.84–0.86 for its 20 frames; 243 stars fail on the reference itself and
+    374 in at least one frame; the median brightness-tercile trend of the
+    selected 500 moved from −1.70 % to −0.52 %. Raising `maxStars` to 1000 or
+    2000 left the trend at 1.05–1.60 %; the cause was the saturation, not the
+    cap.
+  - **`LN_MODEL_VERSION` is 4** (3 for the selection, 4 for the map); it moves
+    the `ln`, `ln_reference` and `ln_calibration` hashes together, so every
+    LN set re-normalizes once (reference, seeds calibration, every sidecar).
+    `PSF_FIT_VERSION` stays 3.
+- **F1 and the default (item 4, L-13, L-15, L-16, L-24).**
+  - **The estimator.** `fluxEstimator: commonAperture`: both frames are
+    measured in one circle of radius `a·F` (`F` the larger of the two median
+    fitted FWHMs, whole pixels, each frame's own centroid) with sky the median
+    of the present pixels in `[6F, 8F]`; a pair is valid when its circle is
+    entirely present, at least half of each annulus is present and both fluxes
+    are positive. The growth-curve aperture (`aperture: growthCurve`) takes the
+    ratio at `a = 2` and multiplies it by `c`, the median over the first 100
+    valid pairs of the 5F-to-2F growth ratio of the reference over the
+    target's (`c = 1` with a `warn!` when no pair qualifies, P-10). The Moffat
+    fit stays the finder and the centroider; β does not enter the flux.
+  - **Checkpoint B (2026-10-06), per member against the photometric truth,
+    on each run's own LN reference** (acceptance §8.0). Median gap / median
+    |gap| / slope, F1 at the growth curve against PSF signal with selection:
+
+    | Dataset | F1 | PSF signal with selection |
+    | ---- | ---- | ---- |
+    | set 204 mono (91) | −0.10 % / 0.27 % / −0.11 %/px² | −5.98 % / 6.09 % / −3.29 %/px² |
+    | set 204 OSC (13 × 3) | −0.19 % / 0.44 % / −0.49 %/px² | −0.49 % / 1.13 % / −4.41 %/px² |
+    | run B mono (82) | +0.08 % / 0.33 % / −0.07 %/px² | −7.47 % / 7.47 % / −3.41 %/px² |
+    | run B OSC (101 × 3) | −0.13 % / 0.39 % / +0.58 %/px² | +0.03 % / 0.96 % / −4.85 %/px² |
+    | Horse C11 G (28) | −0.07 % / 0.32 % / −0.04 %/px² | −2.68 % / 2.68 % / −0.58 %/px² |
+
+  - **At master level** (set 204 mono, `--stack-sim`, no rejection): F1's
+    master star flux is −0.17 % from the truth-corrected arm, PSF signal
+    −4.16 %. Master SNR is higher under F1 on every plane of every dataset
+    (set 204 +0.39 / +0.57 / +0.20 / +0.09 % against `lnA`; run B +2.21 /
+    +0.42 / +0.09 / +0.08 %); rejected fraction moves −0.047 / −0.021 pp and
+    the weights stay at ρ 1.0 (set 204) and bit-identical (run B). The seeds
+    calibration `k` is 1.0001 on set 204 mono and 1.0000 / 1.0000 / 1.0002 on
+    OSC (`lnA`: 0.9916; 0.9965 / 0.9969 / 0.9925).
+  - **L-16 as written** (spec §4.4) held on items 2 and 4 and missed on items
+    1 (run B OSC slope pooled over the planes, +0.58 %/px²) and 3 (the
+    whole-frame MAD on mono, −2.37 % and −4.56 % scale-normalized).
+  - **The ruling (owner, 2026-10-06, after an independent review, "да,
+    согласен, погнали"; L-24).** F1 at the growth curve is the **default**
+    (`LocalNormalizationConfig::default` and the two enums' `#[default]`);
+    PSF signal stays a choice. `maxStars` stays 500. Math reference §4.3 step 3
+    (the PSF-flux ratio) is overturned for the default path; the owner
+    accepted that masters may differ from the ERP by a few percent in level
+    where F1 is measurably closer to the truth.
+  - **Stored documents.** A document without `fluxEstimator` or `aperture`
+    reads the defaults and runs F1, so its sets re-normalize once (the default
+    config's hash moved); a document naming `psfSignal` keeps it.
+    `LN_MODEL_VERSION` stays 4. The subtree carries `aperture` only while
+    `fluxEstimator = commonAperture`.
+  - **What a user sees.** An LN master's star signal rises with the group's
+    weighted-mean gap: +4.3 % on set 204 mono and +6.9 % on run B mono
+    against PSF signal with selection; the OSC planes move by up to 0.6 %, so
+    colour balance moves slightly.
+- **The re-defined acceptance rows (L-25, owner 2026-10-06).** Read as
+  written, three §11.3 rows cannot measure a change of the LN scale. No bar
+  is re-sized.
+  - **R1, master MAD.** The block-median field at the LN scale (blocks of
+    `scale` px), read raw, must lie within ±1 % of the comparison arm: above
+    the LN scale the background comes from the LN reference through `B`
+    whatever the arm's `A`, so dividing it by a larger `k` shrinks it (block
+    field raw +0.15 % set 204 mono, +0.12 % run B mono; normalized −3.39 % /
+    −6.38 %). Noise per unit signal is the master-SNR row; the whole-frame MAD
+    is reported, raw and normalized.
+  - **R2, FWHM.** The yardstick is the no-rejection mixture of the run's own
+    registered frames at their own scales; the master's star width must not
+    exceed it by more than 1 % on the same stars. The Gaussian variance-mixture
+    formula over-predicts the change about three-fold on real profiles and is
+    reported only; a fit whose β differs between the two masters is a harness
+    flag, not a reading (production `fwhmPx` jumped −6.3…+6.7 % on OSC planes
+    where β flipped, the second-moment read was flat within ±0.02 %).
+  - **R3, OSC slope.** Judged within each plane, centred, with its 90 %
+    bootstrap interval; a plane whose half-max ΔS² lever arm is under 1 px² is
+    "unresolved at this lever arm". Pooling is dropped: it adds the colour
+    offset times the plane-width term (run B OSC pooled +0.58 %/px²,
+    within-plane +0.21 %/px² [−0.10, +0.49]).
+- **F1's known limitation (L-26).** Its `[6F, 8F]` median sky reads neighbour
+  light on a dense field: the lab measured +0.9 %/px² at about 600 stars/Mpx
+  and +1.6…+2.2 %/px² on crowded fields. This cycle's fields hold 5–40
+  stars/Mpx and read at most +0.1 %/px². `ln_annulus_crowding` (the median,
+  over the pairs the ratio uses, of the larger of the two frames' fractions of
+  annulus pixels above the annulus median + 3σ; log-only, no hash) makes a
+  dense field visible on the `"ln relative scale"` event. The masked far-annulus
+  sky that would remove the effect is the measurement cycle's (open-items).
+- **The pedestal warning (item 5, L-17, L-18, P-11, P-12).** A light of a
+  non-attested frame set whose links include a Flat and neither a Dark nor a
+  Bias gets `CALSTAT = F`; dividing `P + V·S` by a flat `V` yields `P/V + S`,
+  so the offset pedestal grows where the optics vignette. One core function
+  (`api::lights::flat_only_lights`) serves three callers: the stacking plan
+  (one warning per group in `StackingPlan.warnings`), export/send readiness
+  (`ExportReadiness.calibrationWarnings`, listed on the Export tab while the
+  mode is Calibrated lights) and the run (one `RunSummary.warnings` line per
+  group). Only the run measures the corner ratio `V`, once per distinct flat
+  master: the median of each `c × c` corner patch (`c = max(16,
+  round(0.05 · min(W, H)))`) over the flat's normalization divisor, the
+  smallest of the four. Real data: the Horse C11 copy shows it in the plan
+  ("OFFSET 1, GAIN 100"), the Export readiness (106 of 106 lights) and the run
+  summary (L 50 %, G 51 %, so 2.0×). It never blocks, never writes, never
+  changes an auto-link pick (pinned by a test that runs auto-link with the
+  warning path on and off), enters no hash and moves no pixel; attested sets
+  and project frames are out of its reach, and collab publish receives the
+  field without showing it.
+- **Not re-proposed / measured out.**
+  - C-29 (LN background on a 4×4-binned plane) still applies: the tiles take a
+    robust median of full-resolution pixels.
+  - The plain tile median, without the in-tile clip, is the recorded second
+    lever (it removes the noise-dependent bound from the tile statistic); not
+    built because the IC 434 rows passed.
+  - `λ = 1e-4`'s gap noise (P-20): do not return to the spec's constant.
+  - An exact copy of the ERP's PSF-signal estimator was considered and
+    declined by the owner (2026-10-06): the ERP is a comparison, never the
+    reference and never a label.
+  - Raising `maxStars` does not fix the brightness trend (L-23 does); the top
+    is never capped.
+- **The L-20 ruling.** The Horse C11 ERP-slope row (the per-frame scale over
+  the ERP's, against PSF variance) is reported, not gated: its premise was
+  ERP faithfulness, and F1 is not an imitation of the ERP. Measured: PSF
+  signal with selection −0.48 %/px² (r −0.85), F1 +0.07 %/px² (r +0.06; the
+  truth over the ERP +0.11).
+- **The harness additions** (`docs/superpowers/research/scripts/` and
+  `examples/`; reuse, never rebuild).
+  - **`ln_scale_probe`** calls the production selection and both production
+    estimators and writes per-member scales for five arms (`psfOff`,
+    `psfSel`, `f1_2`, `f1_3`, `f1_gc`) with the gap by brightness tercile and
+    `annulusCrowding`. `--ref-saturation <fits>` reads a reference's map;
+    `--build-ref-saturation <out.fits> <registered.fits>...` builds one with the
+    library function the run uses; `--stack-sim <config.json>` combines the
+    whole group's LN-normalized members, one arm per estimator and variant,
+    plus the truth-corrected arm and every arm without rejection.
+  - **Scripts:** `ln-model/aperture_choice.py` (probe bars, `--sim`),
+    `ln-model/nebula_boxes.py` (fixed boxes, chosen on the no-LN control
+    before any LN master is read), `ln-model/star_blocks.py`,
+    `ln-scale-audit/master_phot.py --noise` (star flux in LN-reference units
+    `k` and MRS σ, one script for the normalized read and the SNR row), and
+    `tier1-compare.py --ln-grids` (the B move and the `A` / `global_scale`
+    bit-identity), with a `beta` line beside the FWHM so a β flip is visible.
+  - **The probe's arms model only the detection path.** A run normally takes
+    the seeds path with the seeds-calibration `k`, so read `k` (≈ 1 under F1,
+    acceptance §8.2) as the probe-to-run link: on the same reference and
+    frames the probe's per-member scale equalled the run's `.athln` scale to
+    0.03–0.05 % (set 204 mono), ≤ 0.02 % median (run B) and +0.07 % median
+    (Horse C11 G).
+- **Tests.** The pre-checkpoint-B full gate at `d5f26b7e` was green: core
+  all targets 3737 passed / 0 failed, web 51, plus tauri, headless,
+  `src/types`, tsc and vitest (acceptance §8). The final full core run
+  (`cargo test -p athenaeum-core --all-targets`) is owed before any push.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,
 `stacking/register/{mod,detect,align,frame,wcs_seed,local_loop,writer}.rs`,
-`stacking/ln/{mod,grid,background,scale,reference}.rs`,
+`stacking/ln/{mod,grid,background,scale,reference,selection,aperture,scale_rule,calibration}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
 `stacking/{origin,project_source,prepare,solve,grid_map,crop}.rs`,
 `collab/{grid,grid_geometry,frame_meta}.rs`, `api/collab_grid.rs`,
