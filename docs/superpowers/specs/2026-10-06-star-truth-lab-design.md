@@ -2,6 +2,13 @@
 
 **Date:** 2026-10-06. **Branch:** `star-truth-lab` (athenaeum), `main` (athenaeum-lab).
 
+**Amendment 2026-10-06, the plan review (owner-approved corrections).**
+- The 14-bit saturation variant is 0.25 of full scale (16383/65535), not 0.5.
+- `StarMetric` has no per-star saturation flag; `possibly_trailed` is frame-level (`models.rs`).
+- Both were verified against the code and the arithmetic.
+- The `analysis` path reads raw-domain files only: its detector bins the background in integer ADU. The lab
+  writes a 16-bit sibling of every image for it (plan P-20).
+
 **Amendment 2026-10-06, the independent review.** The review (`.superpowers/sdd/star-truth-lab-spec-review/review-fable.md`)
 found 2 critical, 12 important and 12 minor points, and all of them are folded in here. The critical ones:
 - selection and seeds now have a row and families (§3.2 `saturated`, §7 row 10);
@@ -135,7 +142,7 @@ N(>F) ∝ F^−slope, with the slope and range chosen so every SNR bin of §6 ho
 | `density` | 5, 40, 200, 600, 1000 stars/Mpx at FWHM 3.0, Moffat 4 | crowding: fit background, F1's annulus, completeness; 5–40 brackets the real fields |
 | `background` | flat; linear gradient 10 % of sky across the frame; vignetting 20 % at the corners; fractal nebula (spectral slope −3) at 0.1, 0.5 and 3 × sky amplitude. One nebula image at 4096² for the `analysis` path, whose background mesh scales with the frame size | background under the star; seed centroid drag; false detections on nebula |
 | `halo` | one star of 2000 × the saturation flux with a Moffat β 2 halo to 250 px (the Horse C11 case) over the `sharp` FWHM 4 field | fits whose region sits on another star's wings: background, region growth, F1's annulus |
-| `saturated` | the `sharp` FWHM 2.6 and 4.0 fields with the flux tail set so that {0, 5, 20, 60} of the 64 brightest stars clip; plus a variant clipped at 0.5 of full scale (a 14-bit range) | Auto β picked on the 64 brightest seeds; σ0 from clipped peaks; the relative-saturation test; `peak5` |
+| `saturated` | the `sharp` FWHM 2.6 and 4.0 fields with the flux tail set so that {0, 5, 20, 60} of the 64 brightest stars clip; plus a variant clipped at 0.25 of full scale (a 14-bit ADC in a 16-bit container: 16383/65535) | Auto β picked on the 64 brightest seeds; σ0 from clipped peaks; the relative-saturation test; `peak5` |
 | `mixture` | equal-weight mixtures of the `sharp` profile at FWHM {2.6, 3.4, 4.5} and {3.0, 5.0, 7.0} (the set 204 spread); a clipped-core variant (the core above the mixture's 70th percentile replaced by it: a rejected master's profile) | the master FWHM on a master-like PSF; where the residual-vs-β curve is flat |
 | `twins` | every `sharp` and `mixture` field rendered twice with different noise seeds, and once at 2 × the flux (a deeper master); plus a `ladder` of eight frames of one field at FWHM 2.0 … 6.0, the profile drifting from Moffat 2.5 to blur, as a night does | stability: Auto β agreement, frame FWHM and eccentricity between twins, monotonicity along the ladder (the β flip) |
 | `resampled` | the `sharp` FWHM 2.0 and 3.0 fields, noise rendered before the warp, then warped by a half-pixel shift and a 0.3° rotation through the production resampler (`star_probe warp`, §5). Truth: the unwarped PSF, with the kernel's variance (+1/3 px² per axis at zero phase) stated beside it | what Measure, LN and the master measure see on a registered frame: FWHM, captured fraction and fitted background under correlated noise (audit H6: about 2.6 % on a sharp star) |
@@ -248,7 +255,8 @@ sub-rectangle the way the master measure does on a covered rectangle (`integrate
   - `fwhmX`, `fwhmY`, `fwhm`, `ecc`, `thetaDeg`;
   - `residual`, `snr`.
 
-  The `analysis` path adds its `fitMethod`, `saturated` and `possiblyTrailed`.
+  The `analysis` path adds its `fitMethod`. `StarMetric` carries no per-star saturation flag, and
+  `possiblyTrailed`/`trailRSquared` are frame-level (`FrameAnalysis`), so they are on the frame line.
 - **Frame lines.** One per path, with that path's frame aggregates:
   - its reported FWHM and eccentricity, and the statistic used (the `measure` path's residual-weighted mean over all
     fits, or the `analysis` path's clipped weighted median over e ≤ 0.8);
