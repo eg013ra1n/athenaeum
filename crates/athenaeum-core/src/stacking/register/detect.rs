@@ -225,7 +225,10 @@ const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
 /// skipped the division would carry a flux ~65535× too large — silently
 /// wrong for any caller that reads `Star.flux` absolutely rather than as a
 /// same-list ranking key (`ln::scale::to_seed` does exactly that).
-pub(crate) fn stars_from_fits(
+///
+/// `pub` for the star measurement lab's probe (`examples/star_probe.rs`); the
+/// run calls it from inside the crate.
+pub fn stars_from_fits(
     fits: &[StarFit],
     cfg: &DetectionConfig,
     max_stars: usize,

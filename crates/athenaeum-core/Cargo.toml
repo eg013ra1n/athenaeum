@@ -189,6 +189,10 @@ name = "measure_probe"
 required-features = ["render", "solver"]
 
 [[example]]
+name = "star_probe"
+required-features = ["render", "solver"]
+
+[[example]]
 name = "register_probe"
 required-features = ["render", "solver"]
 

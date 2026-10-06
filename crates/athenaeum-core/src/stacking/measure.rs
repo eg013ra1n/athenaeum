@@ -285,6 +285,20 @@ pub fn measure_plane_with_seeds(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedSource,
 ) -> PlaneMeasurement {
+    measure_plane_detailed(data, w, h, opts, pool, seed_source).0
+}
+
+/// [`measure_plane_with_seeds`], also returning the seeds the fits were made
+/// from (star measurement part 1: the lab's `star_probe` dumps them). Same
+/// call, same numbers; the run never reads the seeds.
+pub fn measure_plane_detailed(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedSource,
+) -> (PlaneMeasurement, Vec<Seed>) {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
     // The background model and the noise σ are measured FIRST, and on the
@@ -553,10 +567,13 @@ pub fn measure_plane_with_seeds(
             fit_ms,
         },
     };
-    PlaneMeasurement {
-        channel,
-        fits: outcome.fits,
-    }
+    (
+        PlaneMeasurement {
+            channel,
+            fits: outcome.fits,
+        },
+        seeds,
+    )
 }
 
 /// Measure every plane of a calibrated frame; checks `cancel` before each
@@ -701,6 +718,20 @@ mod tests {
     fn without_timings(mut c: ChannelMeasurement) -> ChannelMeasurement {
         c.timings = MeasureTimings::default();
         c
+    }
+
+    #[test]
+    fn measure_plane_detailed_returns_the_seeds_it_fitted_and_the_same_measurement() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let plain = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedSource::Fast);
+        assert_eq!(seeds.len(), detailed.channel.stars_detected);
+        assert_eq!(detailed.fits, plain.fits);
+        assert_eq!(
+            format!("{:?}", without_timings(detailed.channel.clone())),
+            format!("{:?}", without_timings(plain.channel.clone()))
+        );
     }
 
     #[test]
