@@ -23,7 +23,9 @@ use astroimage::BayerPattern;
 use athenaeum_core::analysis::analyzer::{analyze_frame, build_analyzer};
 use athenaeum_core::analysis::config::AnalysisConfig;
 use athenaeum_core::fits_writer::write_fits_f32;
+use athenaeum_core::geometry::{Linear, LinearKind};
 use athenaeum_core::integration::plane_reader::PlaneReader;
+use athenaeum_core::resample::{warp_rows, Plane};
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
@@ -254,6 +256,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         Some(p) => die(format!("plane {p} of {}", planes.len())),
         None => (0..planes.len()).collect(),
     };
+    if want("analysis") && a.image.to_str().is_none() {
+        die("non-UTF-8 path")
+    }
     let file =
         std::fs::File::create(&a.out).unwrap_or_else(|e| die(format!("{}: {e}", a.out.display())));
     let mut out = BufWriter::new(file);
@@ -353,7 +358,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     if want("analysis") {
         let t = Instant::now();
         let analyzer = build_analyzer(&AnalysisConfig::default(), None);
-        let img = a.image.to_str().unwrap_or_else(|| die("non-UTF-8 path"));
+        let img = a.image.to_str().expect("checked before File::create");
         match analyze_frame(img, &analyzer, "star_probe") {
             Ok((fa, stars, flip)) => {
                 for s in &stars {
@@ -426,6 +431,82 @@ fn cmd_dump_fits(mut it: impl Iterator<Item = String>) {
     w.flush().unwrap_or_else(|e| die(e));
 }
 
+fn cmd_warp(mut it: impl Iterator<Item = String>) {
+    let input = PathBuf::from(it.next().unwrap_or_else(|| die("warp: <image> missing")));
+    let (mut dx, mut dy, mut rot, mut out) = (0.0f64, 0.0f64, 0.0f64, PathBuf::new());
+    while let Some(k) = it.next() {
+        let v = it
+            .next()
+            .unwrap_or_else(|| die(format!("{k}: value missing")));
+        match k.as_str() {
+            "--shift" => {
+                let p: Vec<f64> = v
+                    .split(',')
+                    .map(|t| t.parse().unwrap_or_else(|_| die("--shift dx,dy")))
+                    .collect();
+                if p.len() != 2 {
+                    die("--shift dx,dy")
+                }
+                dx = p[0];
+                dy = p[1];
+            }
+            "--rotate" => rot = v.parse().unwrap_or_else(|_| die("--rotate deg")),
+            "--out" => out = PathBuf::from(v),
+            o => die(format!("unknown flag {o}")),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        die("warp: --out missing")
+    }
+    let (planes, w, h) = read_planes(&input);
+    let warped = warp_affine(&planes, w, h, dx, dy, rot);
+    write_fits_f32(&out, w, h, warped.len(), &warped.concat(), &[])
+        .unwrap_or_else(|e| die(format!("{}: {e}", out.display())));
+}
+
+/// Output pixel p reads the source at R(θ)(p − c) + c + (dx, dy), through the
+/// production resampler with the registration defaults (B-spline, clamping 0.30).
+/// A bare `Linear` is an inverse map applied as-is (`geometry::pixel_map`), pixel
+/// centres sit on integer coordinates (`resample::sample_at` covers `[0, w−1]`).
+fn warp_affine(
+    planes: &[Vec<f32>],
+    w: usize,
+    h: usize,
+    dx: f64,
+    dy: f64,
+    rot_deg: f64,
+) -> Vec<Vec<f32>> {
+    let (c, s) = (rot_deg.to_radians().cos(), rot_deg.to_radians().sin());
+    let (cx, cy) = ((w as f64 - 1.0) / 2.0, (h as f64 - 1.0) / 2.0);
+    let m = [
+        [c, -s, cx - c * cx + s * cy + dx],
+        [s, c, cy - s * cx - c * cy + dy],
+        [0.0, 0.0, 1.0],
+    ];
+    let map = Linear {
+        kind: LinearKind::Affine,
+        m,
+    };
+    let reg = RegistrationConfig::default();
+    planes
+        .iter()
+        .map(|p| {
+            let mut o = vec![0.0f32; w * h];
+            warp_rows(
+                &Plane::full(p, w, h),
+                &map,
+                w,
+                0,
+                h,
+                reg.interpolation,
+                reg.clamping_threshold,
+                &mut o,
+            );
+            o
+        })
+        .collect()
+}
+
 fn main() {
     if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -438,7 +519,7 @@ fn main() {
         Some("measure") => cmd_measure(parse_measure(it)).unwrap_or_else(|e| die(e)),
         Some("debayer") => cmd_debayer(it),
         Some("dump-fits") => cmd_dump_fits(it),
-        Some("warp") => die("warp: Task 6"),
+        Some("warp") => cmd_warp(it),
         _ => die("usage: star_probe measure|debayer|warp|dump-fits …"),
     }
 }
@@ -557,5 +638,31 @@ mod tests {
         assert_eq!(lines[0]["path"], "analysis");
         assert_eq!(lines[0]["fits"], 0);
         assert_eq!(lines[0]["conversion"], "none");
+    }
+
+    #[test]
+    fn a_half_pixel_shift_moves_a_star_and_keeps_its_flux() {
+        let (w, h) = (96usize, 96usize);
+        let mut d = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let r2 = (x as f32 - 48.0).powi(2) + (y as f32 - 48.0).powi(2);
+                d[y * w + x] = (-r2 / (2.0 * 2.0f32.powi(2))).exp();
+            }
+        }
+        let o = warp_affine(&[d.clone()], w, h, 0.5, 0.0, 0.0).remove(0);
+        // the resampler writes NaN where the source is out of range: here the last column only
+        assert_eq!(o.iter().filter(|v| !v.is_finite()).count(), h);
+        let s0: f64 = d.iter().map(|&v| v as f64).sum();
+        let s1: f64 = o.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();
+        assert!((s1 / s0 - 1.0).abs() < 1e-3, "flux {s1} vs {s0}");
+        let cx: f64 = o
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .map(|(i, &v)| (i % w) as f64 * v as f64)
+            .sum::<f64>()
+            / s1;
+        assert!((cx - 47.5).abs() < 0.02, "centroid {cx}");
     }
 }
