@@ -4,6 +4,11 @@
 Written spec APPROVED by the owner 2026-10-04 (fable review "ready after fixes", fix round 1 folded,
 §15 points 1–17 accepted — see §15). Push stays on the owner's word.
 
+**Amendment 2026-10-06 (owner, "Даю ок"):** §3 step 1 gains the reference-frames saturation map
+(L-23) after the Task 16 pre-check traced F1's step-1 miss to stars saturated in the frames the LN
+reference integrates. Bars, rows and L-16 are unchanged; the pre-check re-runs on the amended
+selection before checkpoint B.
+
 **No migration (owner, 2026-10-04).** Existing runs, run rows, provenance and `master_lights` are
 left exactly as they are. Nothing rewrites stored history. The new model reaches existing sets only
 through the normal cache invalidation of §7 (the version bump makes the Normalize stage stale; the
@@ -23,7 +28,7 @@ next run re-normalizes). The legacy config rule of L-9 is a read-time resolution
   `2026-09-20-stacking-compute-tierC-design.md` (§8 tolerance table, rulings C-1…C-30) and the math
   reference `2026-09-08-stacking-math-reference.md` §4.
 
-Rulings this spec makes are numbered **L-1 … L-22** and collected in §14. §15 lists the points put to
+Rulings this spec makes are numbered **L-1 … L-23** and collected in §14. §15 lists the points put to
 the owner; all were accepted on 2026-10-04.
 
 ## 0. Verdict and scope
@@ -371,6 +376,30 @@ absolute guard on the warped seed pixel (`SATURATION`, 0.95 native) stays. A war
 are lowered by the interpolation kernel, so a star saturated in its native frame can pass the
 relative test on the warped plane; the absolute guard covers that case.
 
+On the reference side the test also reads **the frames the LN reference integrates** (L-23,
+amendment 2026-10-06). An integrated reference averages a core clipped in some of its frames with
+unclipped ones, so its own peak stays under the cut while its flux is short. The reference build
+therefore records, per channel, the **reference-frames saturation map**
+`R(x) = max_k (p_k(x) / M_k)` over the integrated frames `k`, where `p_k` is frame `k`'s registered
+plane and `M_k` its own hot-pixel-corrected plane maximum (the same tile pass and rule as the
+selection's plane maximum, §1.2 step 3); `R` is NaN where no integrated frame has a finite pixel. A
+pair also fails when any pixel within `max(2, FWHM_fit)` px of the **reference** fit's centroid has
+`R > saturation`. That is exactly "the relative test fails in at least one integrated frame". The
+test on the integrated plane itself stays. A one-frame reference makes `R` that frame's own ratio.
+
+- The map is written beside the reference as `ln/<group>/reference-saturation.fits` (float32, the
+  reference's own plane layout). It belongs to the `ln_reference` artifact: a reference whose map
+  is missing is stale in the plan and rebuilt by the run (with a `warn!`).
+- In RAM the LN pass keeps only the thresholded mask (`R > saturation`, 1 bit per pixel, 7.6 MB at
+  61 Mpx per channel); the float map stays on disk, so a `saturation` change never rebuilds it.
+- Cost: one read and one tile pass per integrated frame and channel at reference-build time (20
+  frames by default), no extra work per member.
+- Measured (Task 16 pre-check, set 204 mono, controller emulation on the audit's dumps): the
+  integrated reference's plane maximum is 0.75 against 0.84–0.86 for its 20 frames; 243 stars fail
+  the test on the reference itself and 374 fail in at least one frame. The map drops about 125 more
+  pairs per typical member; the median brightness-tercile trend of the selected 500 moves from
+  −1.70 % to −0.52 % and the median |gap| to the truth from 0.72 % to 0.39 %.
+
 **Step 2 — peak SNR.** On each side, `(peak − b) / σ_local ≥ minPeakSnr` (default 40) (L-12):
 
 - `peak` is the mean of the five brightest finite pixels inside the fit's sampling region (the
@@ -407,6 +436,12 @@ the slope against the ERP's scales should fall from −0.49 to about −0.1 %/px
 "all SNR ≥ 40" with a common aperture (math review §4.2). One explanation is clipped cores in the
 sharp frames the reference integrates. §11 reports the truth gap by brightness tercile of the
 selected set; a trend above 1 % goes to the owner (§15).
+
+**Resolved 2026-10-06.** The Task 16 pre-check confirmed it: before the map, the bright third of
+the selected 500 read 1.7 % (set 204 mono) and 3.7 % (run B mono) below the faint third, and
+raising `maxStars` to 1000 or 2000 left the trend at 1.05–1.60 %. Per-pair dumps showed the cause:
+on a typical member, reference ranks 1–200 read 11–17 % low and ranks 201–333 3.4 % low, while
+ranks above 500 agree to 0.3 %. The fix is the reference-frames test of step 1 (L-23), not a cap.
 
 ## 4. F1: the common-aperture estimator (item 4)
 
@@ -604,7 +639,8 @@ new fields, so every preset carries the defaults above.
 
 - **`LN_MODEL_VERSION`** (L-19): a new constant folded into `normalization_subtree` as
   `"lnModelVersion"`. The background-model task sets it to 2; the star-selection task sets it to
-  3; any later task that changes what an existing config produces bumps it again. Through the
+  3; the reference-frames saturation map (L-23) sets it to 4; any later task that changes what an
+  existing config produces bumps it again. Through the
   subtree it moves the `ln`, `ln_reference` and `ln_calibration` hashes together.
 - **The resolved scale** is folded as the upstream token `ln_scale_px:<n>` into the per-frame `ln`
   hash (`normalization_hash_for`) and the `ln_calibration` hash (`seeds_calibration_hash_for`).
@@ -633,6 +669,8 @@ new fields, so every preset carries the defaults above.
 - `SummaryGroup` gains `lnScalePx`, `lnFluxEstimator` and `lnAperture` (`#[serde(default)]`), so
   provenance records what ran.
 - `LnReferencePayload` gains `width`, `height` and `scale_px` (`#[serde(default)]`).
+- The `ln_reference` artifact gains its sidecar `reference-saturation.fits` (§3 step 1, L-23); the
+  plan's Normalize freshness check requires it beside `reference.fits`.
 - The run's per-group LN line (`"ln scale resolved"`, §10) states scale, mode, geometry and
   estimator.
 - No schema change. No command change. Both hosts return the same structs, so the web mirror needs
@@ -688,6 +726,7 @@ prefix rule applies.
 | `ln_cells_unsupported` | usize | knot cells under the sample floor | same as `ln_samples` |
 | `ln_selected` | usize | pairs after the star selection, before RCR (`ln_matches` keeps "pairs before selection") | `"ln relative scale"` |
 | `ln_selection` | string `snr` \| `brightQuarter` | which selection rule held | `"ln relative scale"` |
+| `ln_ref_frames_saturated` | usize | pairs the reference-frames saturation test (L-23) dropped that the integrated plane's own test kept | `"ln relative scale"` |
 | `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
 | `ln_common_fwhm_px` | f64 | `F`, the larger median FWHM | same |
 | `ln_growth_factor` | f64 | the growth-curve correction `c` | same (growth curve) |
@@ -737,7 +776,10 @@ Each checkpoint tree needs about 135 GB free. Expect about 15–27 min per set-2
 
 - `examples/ln_scale_probe.rs` calls the production selection and both production estimators
   (library functions, not re-implementations). It writes per-member scales for each estimator and
-  aperture variant, and the gap by brightness tercile of the selected set.
+  aperture variant, and the gap by brightness tercile of the selected set. It reads a reference's
+  saturation map with `--ref-saturation <fits>` and builds one for an existing reference from the
+  registered planes of its `reference_member_ids` (the `ln_reference` row's payload) with the same
+  library function the run uses (L-23).
 - `--stack-sim` takes those per-member scales as one arm per estimator and variant. It keeps the
   truth-corrected arm (every member scaled by `truth / applied`) and the no-rejection variant of
   every arm.
@@ -969,6 +1011,11 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
   beside it.
 - **L-22** The `--stack-sim` bar for F1 is ±0.5 % of the same run's truth-corrected no-rejection
   arm. The ratio to the LN reference is reported, not gated.
+- **L-23** (amendment 2026-10-06, owner "Даю ок") The reference side of selection step 1 also
+  fails a pair when the relative saturation test fails in any frame the LN reference integrates,
+  read from the reference-frames saturation map `R` built with the reference and stored beside it.
+  It is the saturation rule applied to the data that formed the reference, not a cap on the
+  brightest: a bright star unsaturated in every integrated frame stays. `LN_MODEL_VERSION` 4.
 
 **Overturned:**
 
@@ -1025,7 +1072,9 @@ no migration of existing runs (see the header).
 10. The peak definition for peak SNR: the mean of the five brightest pixels in the fit region minus
     the fit background (L-12).
 11. The brightness trend of the 500 brightest (§3): if the acceptance shows more than 1 % across
-    terciles, whether to cap the top or raise `maxStars`.
+    terciles, whether to cap the top or raise `maxStars`. **Follow-up 2026-10-06:** raising
+    `maxStars` (1000, 2000) left the trend above 1 %; the cause was saturation in the frames the
+    reference integrates, and the owner approved the L-23 amendment ("Даю ок").
 12. F1's annulus `[6F, 8F]` and the growth-curve definition (L-13).
 13. Choosing the aperture on `--stack-sim` plus the probe rather than three full checkpoints (L-15).
 14. The F1 default rule's margins, with the `--stack-sim` bar against the truth-corrected arm and

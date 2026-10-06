@@ -3927,6 +3927,141 @@ git commit -m "test(acceptance): LN scale probe and stack-sim arms per estimator
 
 ---
 
+> **Inserted 2026-10-06** (spec amendment L-23, owner "Даю ок"): Task 16's pre-check found F1's step-1 miss came from stars saturated in the frames the LN reference integrates. Task 16a lands the fix; Task 16 then re-runs its pre-check (maps for the pre-existing references built with the probe's `--build-ref-saturation`) before checkpoint B.
+
+### Task 16a: The reference-frames saturation map (spec §3 step 1 amendment, L-23)
+
+Spec `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md`: §3 step 1 (amended 2026-10-06 — read
+it first, it is the requirement), §7 (`LN_MODEL_VERSION` 4), §8 (the sidecar), §10
+(`ln_ref_frames_saturated`), §11.2 (the probe), §14 L-23. Owner approval 2026-10-06.
+
+**Why.** The Task 16 pre-check traced F1's step-1 miss to stars saturated in the frames the LN reference
+integrates: the integrated reference averages a clipped core with unclipped ones, so its own peak stays
+under `0.75 × plane max` while its flux is short. On set 204 mono the reference's plane maximum is 0.75
+against 0.84–0.86 for its 20 frames; 243 stars fail the test on the reference itself, 374 fail in at
+least one frame. A controller emulation of exactly this rule moved the brightness-tercile trend from
+−1.70 % to −0.52 % and the median |gap| from 0.72 % to 0.39 %.
+
+**Files:**
+- Modify: `crates/athenaeum-core/src/stacking/ln/reference.rs` — the map builder (library functions) and
+  the sidecar I/O.
+- Modify: `crates/athenaeum-core/src/stacking/ln/selection.rs` — the reference side's saturation test
+  reads the mask; the bitset type (reuse `aperture.rs`'s `FiniteMask` storage, or a sibling type —
+  one bit per pixel).
+- Modify: `crates/athenaeum-core/src/stacking/ln/scale.rs`, `crates/athenaeum-core/src/stacking/ln/mod.rs`
+  — `LnReferenceForDetection` carries one mask per plane; every `SelectionSide` construction gains the
+  field; the count reaches the diag and the `"ln relative scale"` event. **Never rustfmt these two.**
+- Modify: `crates/athenaeum-core/src/stacking/run.rs` — write the sidecar right after `reference.fits`;
+  on a reference cache hit read it; missing, unreadable or wrong dimensions → `warn!` and rebuild through
+  `build_and_write_ln_reference` (the same arm a failed `read_reference` takes). **Never rustfmt.**
+- Modify: `crates/athenaeum-core/src/stacking/plan.rs` — only if `build_plan` probes the `ln_reference`
+  file on disk for Normalize freshness today: probe the sidecar the same way. If it does not probe the
+  file at all, add nothing and say so in the report. **Never rustfmt.**
+- Modify: `crates/athenaeum-core/src/stacking/paths.rs` — `ln_reference_saturation_path(group_key)` →
+  `ln/<group>/reference-saturation.fits`, beside `ln_reference_path`.
+- Modify: `crates/athenaeum-core/src/stacking/ln/mod.rs` — `LN_MODEL_VERSION` 3 → 4; the golden hash
+  literals it moves (`config.rs` / `plan.rs` tests: `config_hash_is_canonical_and_pinned`,
+  `stage_hashes_are_pinned_to_golden_literals`, whatever else pins an `ln*` hash) with a dated comment
+  `2026-10-06: LN_MODEL_VERSION 4 (L-23)`.
+- Modify: `crates/athenaeum-core/examples/ln_scale_probe.rs` — the two flags below.
+
+**Requirements (exact):**
+
+1. **The map.** Per channel `c`: `R_c(x) = max_k ( p_k(x) / M_k )` over the frames the reference
+   integrates (`frames_used`), where `p_k` is frame `k`'s registered plane `c` exactly as
+   `integrate_planes` reads it (the materialized registered artifact, or the fallback warp — use the
+   same source, so the two can never differ), before any normalization or scaling, and
+   `M_k = TileTable::measure(p_k, w, h, &CLEANING, pool).plane_max()` — the same hot-pixel-corrected
+   maximum the selection uses for a side (`TileNoise::plane_max`). A non-finite `p_k(x)` contributes
+   nothing. A frame whose `M_k` is not finite or `≤ 0` contributes nothing (a `debug!` naming the
+   frame). `R_c(x)` is NaN where no frame contributes. `f32`.
+2. **One implementation for run and probe** (names may differ):
+   - `accumulate_reference_saturation(map: &mut [f32], plane: &[f32], width, height, pool)` — one
+     frame's contribution (computes its `M_k`, folds `p/M_k` in with max; the map starts all NaN);
+   - `reference_saturation_mask(map: &[f32], saturation: f64) -> <bitset>` — bit set where
+     `R > saturation`; NaN never sets a bit.
+3. **Build.** Over `frames_used`, one frame and one channel at a time (peak RAM: one frame plane plus
+   the map per channel — never every frame at once), honouring `cancel`, in the reference build
+   (inside `build_reference` or right after it in `build_and_write_ln_reference` — your call, state
+   it). Log `info!` `"ln reference saturation map built"` with `ln_reference_frames` and
+   `duration_ms` (plus `run_id`/`group_key` where in scope).
+4. **The sidecar.** `ln/<group>/reference-saturation.fits`, float32, the same plane layout
+   `write_reference` uses for `reference.fits`, the same `ATH_STKI`/`ATH_STKG` cards. A write/read pair
+   in `reference.rs`; the reader refuses dimensions or a channel count that differ from the reference
+   (`anyhow` error with both shapes).
+5. **In RAM** the LN pass keeps only the thresholded masks (`reference_saturation_mask` with the run's
+   `starSelection.saturation`), one per plane, in `LnReferenceForDetection` (legacy and masked
+   builders). The float map is dropped after thresholding.
+6. **The selection.** `SelectionSide` gains an optional mask (`None` on every target side and wherever
+   no map exists, e.g. a test or a probe without `--ref-saturation`). On the reference side
+   `saturated()` = the existing integrated-plane test **OR** any set bit among the pixels whose centres
+   lie within `max(2, FWHM_fit)` of the reference fit's centroid (exactly the disc `local_peak` walks).
+   `LnStarSelection::OFF` must mean off: follow how OFF encodes `saturation` today and make the mask
+   test inert under it (an empty mask, or skipped when the threshold is not finite).
+7. **The count.** Pairs that fail ONLY the mask test (they passed the integrated plane's test and the
+   target's) → `ln_ref_frames_saturated` (usize) on the existing `"ln relative scale"` event, and in
+   the scale diag the probe prints (per arm `refFramesSaturated`).
+8. **Every path sees it.** Legacy (frame set) and masked (project grid: the map is built over the grid
+   frames, NaN outside coverage); the seeds path, the detection path, both seeds-calibration arms and
+   the local-scale input — they all go through `rank_candidates`, so threading the mask into the
+   reference `SelectionSide` covers them; verify each construction site (`ln/mod.rs` ~1023,
+   `scale.rs` ~1711, ~1762 and any other).
+9. **`LN_MODEL_VERSION` 4** and the moved golden literals (above).
+10. **The probe.**
+    - `--ref-saturation <fits>`: reads plane `--plane` of a sidecar (the run's own file works) and
+      thresholds it with the selection's `saturation`; every arm uses it. Without the flag the probe
+      behaves exactly as today. The probe's header/first output line states `refSaturation` (the
+      path or `null`).
+    - `--build-ref-saturation <out.fits> <registered.fits>...`: builds a sidecar over all channels of
+      the given registered frames with the same library function, writes it and exits; prints the
+      frame count, each frame's `M_k` per channel and the wall time. (The controller uses this to make
+      maps for references built before this task, from their `ln_reference` payload's
+      `reference_member_ids`.)
+    - Update the probe's `usage()` and doc comment.
+
+**Tests (write each failing first; each must fail on the pre-task code):**
+
+- **T1 — the defect.** A two-frame synthetic reference: one star clipped at the saturation level in
+  frame A only (frame B unclipped). The integrated plane's local peak is under `0.75 ×` its own plane
+  maximum, frame A's ratio over 0.75. Without the mask the pair is selected; with it the pair is
+  dropped and the count is 1. Drive it through `rank_candidates` (and, if a seam allows, one of the
+  `scale.rs` entry points).
+- **T2 — the map.** An isolated hot pixel does not set `M_k` (the background's hot-pixel property);
+  NaN pixels contribute nothing; `R` is NaN where every frame is NaN; at a few chosen pixels `R`
+  equals the max over frames of `p/M_k` exactly.
+- **T3 — OFF.** `LnStarSelection::OFF` ignores the mask.
+- **T4 — the sidecar.** Write/read round trip bit-exact; a wrong width/height/channel count is
+  refused.
+- **T5 — the run.** A cached reference whose sidecar is missing is rebuilt with the `warn!` (extend
+  the existing reference cache-hit test if there is one; otherwise a focused test at the cheapest
+  seam you can find, stated in the report).
+- **T6 — masked mode.** NaN outside coverage never sets a bit.
+- Goldens updated with the dated comment.
+
+**Gate (one compile at a time, `CARGO_BUILD_JOBS=4`):**
+
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib stacking:: -- --test-threads=4
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=.superpowers/target-acc cargo build -p athenaeum-core --release --example ln_scale_probe
+```
+
+The controller runs the full core suite (`--all-targets`) before any push; you do not need to.
+
+**Commit:**
+
+```bash
+git add crates/athenaeum-core/src/stacking/ln/reference.rs crates/athenaeum-core/src/stacking/ln/selection.rs \
+  crates/athenaeum-core/src/stacking/ln/aperture.rs crates/athenaeum-core/src/stacking/ln/scale.rs \
+  crates/athenaeum-core/src/stacking/ln/mod.rs crates/athenaeum-core/src/stacking/run.rs \
+  crates/athenaeum-core/src/stacking/plan.rs crates/athenaeum-core/src/stacking/paths.rs \
+  crates/athenaeum-core/src/stacking/config.rs crates/athenaeum-core/examples/ln_scale_probe.rs
+git commit -m "feat(ln): reference-frames saturation map for the star selection (spec §3 step 1, L-23)"
+```
+
+(Add or drop paths to match what you actually touched.)
+
+---
+
 ### Task 16: Pre-checks, the aperture choice, checkpoint B (controller)
 
 Spec §3 (the brightness-tercile risk; owner ruling: raise `maxStars`, never cap the top), §4.3, §11.1 (checkpoint B), §11.3 (checkpoint-B column); L-15, L-16, L-20, L-21, L-22. **The controller runs this itself**, with the same discipline as Task 9.
