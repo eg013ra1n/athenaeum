@@ -6,7 +6,7 @@
 //!
 //!   star_probe measure <image.fits> --out <file.jsonl> [--config <json>]
 //!       [--plane all|N] [--debayer RGGB|BGGR|GRBG|GBRG] [--rect x,y,w,h]
-//!       [--paths measure,betas,register,analysis] [--betas 2.5,4,6,10]
+//!       [--paths measure,betas,register,analysis]   (default: measure,betas,register) [--betas 2.5,4,6,10]
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -129,12 +129,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         plane: None,
         debayer: None,
         rect: None,
-        paths: vec![
-            "measure".into(),
-            "betas".into(),
-            "register".into(),
-            "analysis".into(),
-        ],
+        paths: vec!["measure".into(), "betas".into(), "register".into()],
         betas: vec![2.5, 4.0, 6.0, 10.0],
     };
     while let Some(k) = it.next() {
@@ -214,13 +209,29 @@ fn analysis_domain_ok(raw_max: f32) -> bool {
     raw_max > 1.5
 }
 
-fn cmd_measure(a: MeasureArgs) {
+/// Returns `Err` instead of exiting once the output file exists, so the
+/// `BufWriter` drops (and flushes) first: a failed run leaves complete lines.
+fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     let (mut planes, mut w, mut h) = read_planes(&a.image);
     let raw_max = planes
         .iter()
         .flatten()
         .filter(|v| v.is_finite())
         .fold(f32::MIN, |m, &v| m.max(v));
+    let want = |p: &str| a.paths.iter().any(|q| q == p);
+    // Every `analysis` precondition is checked before any output file exists.
+    if want("analysis") {
+        if a.rect.is_some() || a.debayer.is_some() {
+            die("the analysis path takes the file as the Analysis tab does: no --rect, no --debayer")
+        }
+        if !analysis_domain_ok(raw_max) {
+            die(format!(
+                "the analysis path takes a raw-domain file (16-bit or ADU float), as the Analysis tab does; \
+                 {} is in [0, 1] (use its .u16.fits sibling)",
+                a.image.display()
+            ))
+        }
+    }
     let conversion = normalise(&mut planes);
     if let Some(p) = &a.debayer {
         if planes.len() != 1 {
@@ -247,7 +258,6 @@ fn cmd_measure(a: MeasureArgs) {
         std::fs::File::create(&a.out).unwrap_or_else(|e| die(format!("{}: {e}", a.out.display())));
     let mut out = BufWriter::new(file);
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
-    let want = |p: &str| a.paths.iter().any(|q| q == p);
     let options = json!({ "measure": opts, "detection": { "minSnr": det.min_snr, "maxEccentricity": det.max_eccentricity },
                           "registerMaxStars": reg_max, "fromConfig": from_config, "rawMax": raw_max });
 
@@ -304,23 +314,22 @@ fn cmd_measure(a: MeasureArgs) {
 
     if want("register") {
         let t = Instant::now();
-        let (stars, how) = if planes.len() == 3 {
-            let lum = luminance(&[
-                planes[0].as_slice(),
-                planes[1].as_slice(),
-                planes[2].as_slice(),
-            ]);
-            (
-                detect_stars(&lum, w, h, &det, reg_max, None),
-                "detect_stars on the RGB luminance",
-            )
-        } else {
+        // P-17, as `register/frame.rs::reference_stars`: one plane reuses the
+        // Measure fits, any other count detects on the luminance of all planes.
+        let (stars, how) = if planes.len() == 1 {
             let fits = fits0
                 .clone()
-                .unwrap_or_else(|| die("register on a mono plane needs the measure fits"));
+                .ok_or_else(|| "register on a mono plane needs the measure fits".to_string())?;
             (
                 stars_from_fits(&fits, &det, reg_max),
                 "stars_from_fits on the Measure fits",
+            )
+        } else {
+            let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+            let lum = luminance(&refs);
+            (
+                detect_stars(&lum, w, h, &det, reg_max, None),
+                "detect_stars on the luminance of all planes",
             )
         };
         for s in &stars {
@@ -342,13 +351,6 @@ fn cmd_measure(a: MeasureArgs) {
     }
 
     if want("analysis") {
-        if a.rect.is_some() || a.debayer.is_some() {
-            die("the analysis path takes the file as the Analysis tab does: no --rect, no --debayer")
-        }
-        if !analysis_domain_ok(raw_max) {
-            die("the analysis path takes a raw-domain file (16-bit or ADU float), as the Analysis tab does; \
-                 this file is in [0, 1] (use its .u16.fits sibling)")
-        }
         let t = Instant::now();
         let analyzer = build_analyzer(&AnalysisConfig::default(), None);
         let img = a.image.to_str().unwrap_or_else(|| die("non-UTF-8 path"));
@@ -368,14 +370,14 @@ fn cmd_measure(a: MeasureArgs) {
                             "fits": stars.len(), "statistic": "clipped weighted median over e <= 0.8",
                             "frameFwhm": fa.median_fwhm, "frameEcc": fa.median_eccentricity,
                             "frame": fa, "flipVertical": flip,
-                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "file as is (raw domain)",
+                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "none",
                             "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );
             }
-            Err(e) => die(format!("analysis: {e:#}")),
+            Err(e) => return Err(format!("analysis: {e:#}")),
         }
     }
-    out.flush().unwrap_or_else(|e| die(format!("flush: {e}")));
+    out.flush().map_err(|e| format!("flush: {e}"))
 }
 
 fn cmd_debayer(mut it: impl Iterator<Item = String>) {
@@ -433,7 +435,7 @@ fn main() {
     }
     let mut it = std::env::args().skip(1);
     match it.next().as_deref() {
-        Some("measure") => cmd_measure(parse_measure(it)),
+        Some("measure") => cmd_measure(parse_measure(it)).unwrap_or_else(|e| die(e)),
         Some("debayer") => cmd_debayer(it),
         Some("dump-fits") => cmd_dump_fits(it),
         Some("warp") => die("warp: Task 6"),
@@ -472,25 +474,37 @@ mod tests {
         d
     }
 
-    fn run(dir: &Path, data: Vec<f32>, w: usize, h: usize) -> Vec<Value> {
-        let img = dir.join("p.fits");
-        write_fits_f32(&img, w, h, 1, &data, &[]).unwrap();
-        let out = dir.join("p.jsonl");
-        cmd_measure(MeasureArgs {
+    fn args(img: PathBuf, out: PathBuf, paths: &[&str]) -> MeasureArgs {
+        MeasureArgs {
             image: img,
-            out: out.clone(),
+            out,
             config: None,
             plane: None,
             debayer: None,
             rect: None,
-            paths: vec!["measure".into(), "betas".into(), "register".into()],
+            paths: paths.iter().map(|p| p.to_string()).collect(),
             betas: vec![4.0],
-        });
-        std::fs::read_to_string(&out)
+        }
+    }
+
+    fn read_lines(out: &Path) -> Vec<Value> {
+        std::fs::read_to_string(out)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    fn run_paths(dir: &Path, data: Vec<f32>, w: usize, h: usize, paths: &[&str]) -> Vec<Value> {
+        let img = dir.join("p.fits");
+        write_fits_f32(&img, w, h, 1, &data, &[]).unwrap();
+        let out = dir.join("p.jsonl");
+        cmd_measure(args(img, out.clone(), paths)).unwrap();
+        read_lines(&out)
+    }
+
+    fn run(dir: &Path, data: Vec<f32>, w: usize, h: usize) -> Vec<Value> {
+        run_paths(dir, data, w, h, &["measure", "betas", "register"])
     }
 
     #[test]
@@ -499,13 +513,25 @@ mod tests {
         let lines = run(d.path(), gaussian_field(240, 240, 6, true), 240, 240);
         let frames: Vec<&Value> = lines.iter().filter(|v| v["kind"] == "frame").collect();
         assert_eq!(frames.len(), 3);
-        assert!(frames.iter().all(|f| f["nonFinite"].as_u64().unwrap() > 0));
-        let measure = frames.iter().find(|f| f["path"] == "measure").unwrap();
-        assert!(measure["fits"].as_u64().unwrap() > 0, "{measure}");
+        // 6 full rows of 240 + 6 columns of the remaining 234 rows.
+        assert!(frames.iter().all(|f| f["nonFinite"] == 6 * 240 + 6 * 234));
+        for path in ["measure", "betas", "register"] {
+            let f = frames.iter().find(|f| f["path"] == path).unwrap();
+            assert!(f["fits"].as_u64().unwrap() > 0, "{f}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|v| v["kind"] == "star" && v["path"] == path),
+                "no star line for {path}"
+            );
+        }
     }
 
     #[test]
     fn analysis_refuses_a_unit_domain_file() {
+        // the 1.5 boundary, both sides
+        assert!(!analysis_domain_ok(1.5));
+        assert!(analysis_domain_ok(1.5001));
         assert!(!analysis_domain_ok(1.0));
         assert!(!analysis_domain_ok(f32::MIN));
         assert!(analysis_domain_ok(40000.0));
@@ -517,5 +543,19 @@ mod tests {
         let lines = run(d.path(), gaussian_field(128, 128, 0, false), 128, 128);
         assert!(lines.iter().all(|v| v["kind"] == "frame"));
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn starless_raw_domain_plane_writes_the_analysis_frame_line() {
+        let d = tempfile::tempdir().unwrap();
+        let data: Vec<f32> = gaussian_field(128, 128, 0, false)
+            .iter()
+            .map(|v| (v * 65535.0).round())
+            .collect();
+        let lines = run_paths(d.path(), data, 128, 128, &["analysis"]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["path"], "analysis");
+        assert_eq!(lines[0]["fits"], 0);
+        assert_eq!(lines[0]["conversion"], "none");
     }
 }

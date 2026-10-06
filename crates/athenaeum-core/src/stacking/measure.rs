@@ -727,6 +727,17 @@ mod tests {
         let plain = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
         let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedSource::Fast);
         assert_eq!(seeds.len(), detailed.channel.stars_detected);
+        assert!(!seeds.is_empty());
+        for f in &detailed.fits {
+            assert!(
+                seeds
+                    .iter()
+                    .any(|sd| (sd.x - f.x).hypot(sd.y - f.y) <= 2.0),
+                "fit at ({}, {}) has no seed within 2 px",
+                f.x,
+                f.y
+            );
+        }
         assert_eq!(detailed.fits, plain.fits);
         assert_eq!(
             format!("{:?}", without_timings(detailed.channel.clone())),
