@@ -178,6 +178,12 @@ Three of the plan's lab tests failed when the review ran them verbatim. Their fi
   image's saturation ceiling `snr_sat`, the Fisher SNR at 0.9 × the saturating flux (F 1.2: 293). Such a bin is
   reported `n/a (ceiling snr_sat)`. At gain 12 500 the `> 300` bin was empty at every FWHM ≤ 2.6 whatever the
   image count. Every other bin still needs at least 50 stars.
+- **P-24 (execution, Task 1–3 review).** The truth half-max ellipse comes from a sub-sample CONTOUR, not the
+  thresholded lattice region. Rays from the centre (720 angles) are bisected to the half-maximum, analytically for the
+  pre-pixel profile and bilinear on the fine grid for the pixel-box and blur columns. The ellipse is taken from the
+  exact second moments of the contour polygon. The lattice region read e 0.049 for a true 0.1 and 0 below 0.05,
+  which would have broken the `fieldpsf` truth. Round generators report nan for every θ column. A sweep test pins
+  the 5e-3 bar over e ∈ {0.02 … 0.3}.
 - **P-17.** The `register` path is chosen by plane count, as production does:
   - one plane: `stars_from_fits` on that plane's Measure fits;
   - three planes: `detect_stars` on `luminance` of the three.
