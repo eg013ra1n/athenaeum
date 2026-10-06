@@ -328,7 +328,7 @@ calibration rounds showed it depletes the star population (R-M4a-13/14);
 the residual OSC sharp-night excess is M4c Task 0 (a structure-map
 detector, R-M4c-11). Calibration on the external tool's 368 calibrated
 LDN 1272 frames (`examples/weight_audit.rs` +
-`docs/superpowers/research/scripts/weight_audit_compare.py`): mono
+athenaeum-lab `harness/weight_audit_compare.py`): mono
 per-night fit ratios 1.01/1.05/0.82, PSFSW Spearman 0.92, top-20 18/20;
 OSC 0.91/0.80/0.68, top-20 14/20 (baseline: mono 1.11–1.21 / 0.924 / 18;
 OSC 1.6–7.6× / 0.93/0.86/0.44 / 12); 10 PASS / 12 MISS of the R-M4a-2
@@ -979,7 +979,7 @@ INTERLEAVED before/after brackets are comparable, the product-build checkpoint
 is the arbiter (a probe under thin-LTO swung +21 % on an untouched function),
 and the acceptance total is read against a same-evening baseline re-run. The
 release probes carry `RUST_LOG`-gated subscribers (R-TA-1). **Harness**
-(`docs/superpowers/research/scripts/acceptance/`, reuse it — owner
+(athenaeum-lab `harness/acceptance/` since 2026-10-06, reuse it — owner
 2026-09-18): `prepare-catalog.sh <work> [fmt] [set-id]` (`ATH_ACC_DB`, copies
 set 109's config, forces FITS/keepAll, REMOVES `paths`), `server.sh`
 (`ATH_ACC_EXTRA_PATHS`), `tier1/tier1-run.sh … SET_ID` (exits non-zero on a
@@ -1796,8 +1796,8 @@ the new model through the normal cache invalidation (below).
   ERP faithfulness, and F1 is not an imitation of the ERP. Measured: PSF
   signal with selection −0.48 %/px² (r −0.85), F1 +0.07 %/px² (r +0.06; the
   truth over the ERP +0.11).
-- **The harness additions** (`docs/superpowers/research/scripts/` and
-  `examples/`; reuse, never rebuild).
+- **The harness additions** (athenaeum-lab `harness/` and `examples/`;
+  reuse, never rebuild).
   - **`ln_scale_probe`** calls the production selection and both production
     estimators and writes per-member scales for five arms (`psfOff`,
     `psfSel`, `f1_2`, `f1_3`, `f1_gc`) with the gap by brightness tercile and
@@ -1842,7 +1842,7 @@ integrate,master_cards}.rs`,
 (`master_lights` rows, M4d Task 3), `crates/athenaeum-core/src/
 fits_writer/{wcs,xisf_writer}.rs`; dev probes
 `examples/{measure,register,integrate,ln}_probe.rs` and the weight-audit
-harness `examples/weight_audit.rs` (+ `docs/superpowers/research/scripts/
+harness `examples/weight_audit.rs` (+ athenaeum-lab `harness/
 weight_audit_compare.py`).
 Frontend: `src/components/stacking/` (above),
 `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.

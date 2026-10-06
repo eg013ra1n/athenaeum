@@ -50,8 +50,8 @@ dist-ssr
 scripts/__pycache__/
 
 # Python bytecode, at any depth — `scripts/__pycache__/` above is anchored to
-# the repo root and so never matched the harness tools under
-# docs/superpowers/research/scripts/ (final fix wave, ruling C-30, review M6).
+# the repo root (final fix wave, ruling C-30, review M6). The measurement
+# harness itself moved to the athenaeum-lab repository on 2026-10-06.
 __pycache__/
 
 # Per-machine Claude Code permissions (paths bound to one machine)

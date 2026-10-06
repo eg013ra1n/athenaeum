@@ -3,7 +3,7 @@
 //! — through the production estimator and print one JSON line per file with
 //! every per-plane `ChannelMeasurement`, so per-frame quality terms can be
 //! compared against an external per-frame log by stem
-//! (`docs/superpowers/research/scripts/weight_audit_compare.py`).
+//! (athenaeum-lab `harness/weight_audit_compare.py`).
 //!
 //! rustafits returns a calibrated XISF light's Float32 samples in the
 //! u16-like ADU domain (`bounds`-normalized × 65535 — a production
