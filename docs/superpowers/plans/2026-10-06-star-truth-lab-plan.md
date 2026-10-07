@@ -151,8 +151,10 @@ Three of the plan's lab tests failed when the review ran them verbatim. Their fi
   at the star's point-fit-equivalent widths, for families whose generator is not an elliptical Moffat (Gaussian,
   blur, wing, mixture, coma). This is the spec's "the fit's own model at its best-fit parameters".
 - **P-19.** `StarMetric` carries no per-star saturation flag, and `possibly_trailed` is frame-level. The `analysis`
-  star line therefore dumps `fitMethod` only, and `possiblyTrailed` and `trailRSquared` come from the frame line's
-  `frame` object. This corrects spec §5.
+  star line therefore dumps `fitMethod` only, and the trail flags come from the frame line's `frame` object. That
+  object is production's `FrameAnalysis` serialized as is, so its keys are snake_case (`possibly_trailed`,
+  `trail_r_squared`, `median_eccentricity`, …); the rest of the JSONL is camelCase. This corrects spec §5 (Task 5
+  review, I-2).
 - **P-20.** The `analysis` path reads raw-domain files only, as the Analysis tab does. Its detector bins its
   background in integer ADU, so a [0, 1] float measures nothing; an earlier probe saw 0/20 solves on unit-domain
   files. Every synthetic image and every calibrated injection therefore also gets a 16-bit sibling
@@ -184,6 +186,21 @@ Three of the plan's lab tests failed when the review ran them verbatim. Their fi
   exact second moments of the contour polygon. The lattice region read e 0.049 for a true 0.1 and 0 below 0.05,
   which would have broken the `fieldpsf` truth. Round generators report nan for every θ column. A sweep test pins
   the 5e-3 bar over e ∈ {0.02 … 0.3}.
+- **P-25 (execution, Task 4).** Blur images and their truth use `render.render_star_blurred`: the core is sampled on
+  an os sub-grid (os = max(25 / total FWHM, 9 / core FWHM), clamped to [3, 21]), blurred there and summed per pixel.
+  The pixel-grid `blur_image` read the peak 14.5 % high at F 1.2 blur 2.5 (5.6 % at F 2.0), so it stays only for the
+  fine grid and must not render an image below F ≈ 3. This moved Task 2's blur fit-truth column by up to +1.7 %. A
+  generator fix under the doctrine, like P-24; no bar moved.
+- **P-26 (execution, Task 4 review I-1, I-2, M-1, M-2).** Every family's `crlb_*` bounds its own truth columns.
+  `crlb.star_bounds(..., jac=None)` takes J = ∂(truth minor, major)/∂(fitted width parameters) and transforms the
+  covariance, C_T = J C Jᵀ, before the width, ecc/q and the new `crlb_fwhm_gm` (the bound of √(minor·major), which
+  Task 8's `rows_fwhm` compares) are derived. J is computed per shape for blur and per star for coma; it is the
+  identity for Moffat, Gaussian and mixtures, pinned within 1 %. Doubles with separation ≤ 3 px carry no CRLB (n/a):
+  the isolated bound understates the blend 1.3–2.9×.
+- **P-27 (execution, Task 4 review I-3).** `saturated` = the star's own background plus stamp reaches `sat` anywhere
+  in the stamp, OR the full noiseless plane reaches `sat` on the star's own footprint (pixels where its own stamp is
+  ≥ 1 % of its own peak), never on the whole cutout box. A faint star on a saturated neighbour's clipped core is
+  therefore saturated: its own light is clipped on its footprint (d1000: 10 core-clipped + 24 such stars).
 - **P-17.** The `register` path is chosen by plane count, as production does:
   - one plane: `stars_from_fits` on that plane's Measure fits;
   - three planes: `detect_stars` on `luminance` of the three.
