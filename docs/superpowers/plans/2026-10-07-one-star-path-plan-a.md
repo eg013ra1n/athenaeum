@@ -98,8 +98,9 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
    (`beta_sample_below_eight_falls_back_to_four_and_says_so`) and Task 4 (a starless plane: zero seeds, zero
    outcomes, no panic — `starless_plane_has_no_outcomes_and_no_panic`).
 3. **An all-saturated core field** (`saturated/f2.6/n60`'s 64 brightest, a deep twin with 235 of 629 clipped, a
-   plane whose every bright star is flagged). The β sample, the width start, the aperture correction and the frame
-   statistic use the unsaturated subset; when it is empty the frame statistic is `None` → `fwhm_px = 0` with
+   plane whose every bright star is flagged). The β sample, the aperture correction and the frame statistic use the
+   unsaturated subset (the field width reads every candidate and no verdict — PA-17, ruling F25 as folded); when the
+   subset is empty the frame statistic is `None` → `fwhm_px = 0` with
    `stars_unsaturated = 0` reported, never a statistic over clipped cores. Pinned in Task 8
    (`all_saturated_sample_leaves_the_frame_statistic_empty_not_wrong`) and Task 10
    (`aperture_correction_without_an_unsaturated_isolated_star_is_one_and_flagged`).
@@ -149,8 +150,10 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
 - **PA-5 F-5's flux lands in `StarFit.signal`** (the same `.athf` slot, `FITS_ARTIFACT_VERSION` unchanged); `area`
   keeps its FWTM-ellipse meaning, so `mean_flux()` stays monotonic in the flux. Register's flux ordering and
   LN's seed ordering read `signal` as before.
-- **PA-6 `fit_stars_at`** returns the extended `FitOutcome { fits, beta, seeds, refused: RefusalCounts }`; LN keeps
-  calling `fit_stars`/`fit_stars_with_beta` through `psf_signal`'s re-exports, which are thin wrappers over it.
+- **PA-6 `fit_stars_at`** returns the extended `FitOutcome { fits, beta, seeds, refused: RefusalCounts }` (Task 6a
+  adds `field_width`, Task 6b `diagnostics`, Task 10 `aperture_correction` — each declared in its task's
+  Interfaces, ruling F14); LN keeps calling `fit_stars`/`fit_stars_with_beta` through `psf_signal`'s re-exports,
+  which are thin wrappers over it.
 - **PA-7 The rustafits change** is a NEW entry point `fit_moffat_2d_bounded(pixels, init…, beta_bounds: (f64, f64),
   max_iter, conv_tol, max_rejects) -> Option<Moffat2DBoundedResult>` whose eighth LM parameter is `ln β`, with the
   acceptance bound `beta_bounds` in place of the fixed `[1, 20]`. The solver takes `BetaParam::{Fixed(f64),
@@ -164,10 +167,13 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   holds ≥ 3 pixels AND the free-β wing fit (on the pixels outside the core, ≥ 12 of them) predicts, at the maximum's
   position, a value above the observed maximum by more than `max(3 σ_local, 0.01·observed maximum)`. The 3 is the
   bar's own `k`; the 1 % floor is half the generator's "within 2 % of the clip" gray zone. The verdict is computed
-  PER SEED on the seed's own region, before the β sample and before the frame fits — order: seeds → verdicts →
-  β sample → fits at β (ruling F9); it takes the seed, its region, its peak and its width start, never a
-  `StarFit`; the post-fit flag only copies it. One rule everywhere: the width-start candidates read the same
-  verdict (ruling F25). The wing fitter is `fit_moffat_2d` (free β, bound [1, 20]) at Task 8 and
+  PER SEED on the seed's own region, after the field width is known (the region's `F_start` reads `F_field`, PA-12)
+  and before the β sample and the frame fits — order: seeds → field width → verdicts → β sample → fits at β
+  (ruling F9); it takes the seed, its region, its peak and its width start, never a `StarFit`; the post-fit flag
+  only copies it. One rule, and only one: the field width (PA-17) runs no saturation test at all — it is the
+  median over every one of its candidates, saturated ones included — so no partial second rule exists (ruling F25
+  as folded; cost if wrong: a field width biased on frames dominated by saturated stars, which the lab's
+  `saturated/*` families show). The wing fitter is `fit_moffat_2d` (free β, bound [1, 20]) at Task 8 and
   `fit_moffat_2d_bounded` with `BETA_BOUNDS` from Task 9 on (I-3); a wing fit that returns `None` leaves the star
   UNFLAGGED with `SaturationVerdict.wing_fit = false` reported — never a flag from a missing fit. `σ_local` is
   `photometry::annulus_sigma` (Task 8, PA-11 radii).
@@ -231,7 +237,9 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   stamp (background = the median of the box rim), pixels are binned by distance from the brightest pixel in 0.5-px
   rings, the ring means form a radial profile, and the FWHM is twice the radius where the profile crosses half of
   the brightest pixel's value (linear interpolation between the bracketing rings); the field width is the median
-  over the ≤ 100 brightest seeds, clamped to [1.5, 24] px. The box is 15 px half-width on the first pass and
+  over the ≤ 100 brightest seeds, ALL of them — saturated ones included: the estimator runs no saturation test
+  (ruling F25 as folded; the per-seed verdict of PA-8 comes after it) — clamped to [1.5, 24] px. The box is 15 px
+  half-width on the first pass and
   `3·F` (≤ 48) when the first pass reads ≥ 7 px. Verified by computation (the lab's own renderer, noiseless,
   phase (0.3, −0.2), against the `pointfit` truth): Moffat-4 F 5 +1.8 %, F 8 +0.7 %, F 16 +0.2 %; Moffat-2.5 F 5
   +2.2 %; Moffat-10 F 5 +1.5 %; Gaussian F 5 +1.2 %; at F 2.6 every profile reads +4.6 … +7.7 %; at F 2.0 +6.7 …
@@ -247,12 +255,20 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   `0.5·FWTM = 0.5·12·2.028 = 12.2 > 10` → `RegionTooSmall`. The `OutsideImage` case is separate: a star 4 px from
   the border in the same field (box radius 6 > 4).
 - **PA-19 Design lists (ruling F20).** An entry is `{"row": int, "metric": str?, "family": glob?, "path": glob,
-  "kind": "set-aside" | "one-sided" | "reported"}`; `path` is required. Matching: the most specific entry wins —
-  specificity counts the matched keys (exact `family` > `family` glob; `metric` given > absent; `row` always
-  given), ties go to the later entry in the list. Kinds: `set-aside` (judged by the task's own bar, printed in the
-  design table), `one-sided` (`|bias_head| ≤ |bias_base| + SE_base` and `scatter_head ≤ scatter_base + SE_base`;
-  a row without `bias`/`scatter`, such as `beta sensitivity` or `auto beta pick`, cannot be one-sided and is
-  rejected by the tool at load time), `reported` (printed, never judged). The union file for the cumulative diff
+  "kind": "set-aside" | "one-sided" | "reported", "keys": [str]?}`; `path` is required. Matching: the most specific
+  entry wins — specificity counts the matched keys (exact `family` > `family` glob; `metric` given > absent; `row`
+  always given), ties go to the later entry in the list. Kinds: `set-aside` (judged by the task's own bar, printed
+  in the design table), `one-sided` (each field the entry's `keys` names is judged on its own: a `bias…` key passes
+  when `|head| ≤ |base| + SE_base`, a `scatter…` key when `head ≤ base + SE_base`, the SE that of the key's own
+  axis — `scatter/√n`, or `scatter_x/√n` for `bias_x`/`scatter_x`; `keys` defaults to `["bias", "scatter"]`; a
+  one-sided entry over a row that lacks any of its keys — `beta sensitivity`, `auto beta pick`, or a row-2 row
+  under the default keys — is rejected by the tool at load time), `reported` (printed, never judged). Row 2's
+  `centroid` rows carry `bias_x`, `bias_y`, `scatter_x`, `scatter_y` and no `bias`/`scatter`, so every row-2
+  one-sided entry names those four: `"keys":["bias_x","bias_y","scatter_x","scatter_y"]` (ruling F10 as folded);
+  row 3's `kernel growth` carries `scatter` alone and names `"keys":["scatter"]`. Paths: the betas arm's rows are
+  `betas@2.5|4|6|10` — only row 3's `beta sensitivity` is on `betas` — so a list names the arm `betas@*`, and every
+  `measure` entry on rows 3–7 and 11 is listed again on `betas@*` for the metrics that arm carries (the arm fits
+  the same seeds through the same `fit_one`; ruling F20 as folded). The union file for the cumulative diff
   (`design-cumulative.json`) keeps each step's entries tagged with their step; when two steps' entries match one
   row, `set-aside` from any step wins over `one-sided` (a later step moved the row by design), and `one-sided`
   wins over SE. So Task 5's one-sided rows 3/5 are judged one-sided only until Task 6a sets them aside by its
@@ -319,11 +335,12 @@ athenaeum-lab (`star-lab/`):
 | ---- | ---- |
 | `starlab/render.py` | `Component` kind `annulus` (PA-9) |
 | `starlab/families.py` | families `sharp/{m4,gauss}/f{12.0,16.0}`, `donut/r{6,10}` (`Psf.__init__` gains the `donut` branch); cards `EGAIN`, `ATH_CSCL`, `ATH_CFNM` in `_write` and in `_build_resampled`; truth columns `clipped_core_px`, `sat_neighbour_only`, `sat_gray`, `snr_ap` |
-| `bin/augment_v2.py` | the in-place card and truth-column augmentation of the existing families; skips the in-place `pairs` grid (Task 1a) |
+| `bin/augment_v2.py` | the in-place card and truth-column augmentation of the existing families; skips the in-place `pairs` grid, `alias` entries and every record whose header already holds `EGAIN` (idempotent) (Task 1a) |
+| `starlab/manifest.py` | `verify` reads the truth CSV even when the FITS hashes are equal (Task 1a, ruling F30) |
 | `starlab/probe_io.py`, `starlab/probe_plan.py`, `bin/run_probe.py` | `refused` lines, the `analysis-mode` and `legacy-analysis` arms, `STAR_PROBE_ARGS` (Task 1b) |
 | `starlab/scorecard.py`, `scorecard_build.py` | rows: fit outcomes, donut outcome, axis order, saturation flag vs truth, star SNR vs truth, budget coverage, analysis-mode cost; `_threshold` reads the frame line's effective seed source |
 | `bin/scorecard_diff.py` | the mechanical no-regression check, PA-19's design-list semantics (Task 1c) |
-| `harness/acceptance/clone-before.sh`, `tier1-run.sh`, `project-run.sh`, `hc11-run.sh`, `tier1-extract.py`, `tier1-compare.py` | the clone recipe (WAL checkpoint), `ATH_ACC_RERUN_FROM`, `ATH_ACC_SET_REFERENCE`, `--run-id`/`--project-id`, `immutable=1` reads, the fixed harness path (Task 13) |
+| `harness/acceptance/clone-before.sh`, `tier1-run.sh`, `project-run.sh`, `hc11-run.sh`, `tier1-extract.py`, `tier1-compare.py` | the clone recipe (WAL checkpoint), `ATH_ACC_RERUN_FROM`, `ATH_ACC_SET_REFERENCE`, `--run-id`/`--project-id`, `--base-db`/`--base-run-id`, `immutable=1` reads, the fixed harness path (Task 13) |
 | `bin/gates.py` | `STARLAB_ACC_COPY`, `STARLAB_ACC_RUN_ID`, `STARLAB_SCRATCH` for `probe_parity` |
 | `tests/test_*.py` | one test file per changed module |
 | `results/plan-a/<step>/` | committed summaries, `noreg.txt`, `noreg-cumulative.txt`, bar tables per step |
@@ -373,9 +390,12 @@ lines; Task 1c the no-regression tool and the first diff.
 - Modify: `star-lab/starlab/render.py` (`Component` kind `annulus`, `cutout_radius`, `evaluate`),
   `star-lab/starlab/families.py` (new families; `Psf.__init__` gains the `donut` branch, ruling F31; `_cards`,
   `_write`, `_build_resampled` (its own card dict gets the three cards too), `_stats`, `_truth_rows`,
-  `_build_twins`, `COLS`, a module flag `CARDS_V2 = True`)
+  `_build_twins`, `COLS`, a module flag `CARDS_V2 = True` — `False` writes what the pre-augment generator wrote:
+  neither the three cards NOR the four truth columns, ruling F30 as folded), `star-lab/starlab/manifest.py`
+  (`verify` compares the truth CSV even when the FITS sha256 is equal — today it returns "hash equal" without
+  reading the truth, `manifest.py:21-22`)
 - Create: `star-lab/bin/augment_v2.py`, `star-lab/tests/test_augment.py`, `star-lab/tests/test_donut.py`
-- Test: `star-lab/tests/test_families.py`, `test_render.py` (additions)
+- Test: `star-lab/tests/test_families.py`, `test_render.py`, `test_manifest.py` (additions)
 
 **Interfaces:**
 - Consumes: `manifests/v2.json` (164 families).
@@ -394,16 +414,22 @@ lines; Task 1c the no-regression tool and the first diff.
     within 2 % of `sat`), `snr_ap` (the noiseless stamp summed in the PA-11 aperture — radius
     `max(1.5·fit_fwhm_gm, 3)` — over `sqrt(S/g + N_ap·(sky/g + rn²)·(1 + N_ap/N_sky))`, `N_sky` the PA-11 annulus's
     pixel count on the truth grid — ruling F5); donut rows carry `snr_ap` empty (no `fit_fwhm_gm`);
-  - `bin/augment_v2.py manifests/v2.json` — for every pre-existing record EXCEPT the in-place `pairs` family
+  - `bin/augment_v2.py manifests/v2.json` — for every pre-existing record EXCEPT (a) the in-place `pairs` family
     (`spec.kind == "pairs_in_place"`: its files under `~/.athenaeum-acc/star-lab/grid` are never rewritten, ruling
-    F31; the record is listed as skipped and its LN-only rows need no card): rewrites the float file's header in
+    F31; the record is listed as skipped and its LN-only rows need no card), (b) an `alias` entry (`truthcrowd`
+    holds copies of `density_pairs/d600`'s records — the same files: never augmented itself, its records are
+    re-copied from the family it names once that family is done, so their `sha256` follows) and (c) any record
+    whose float header already holds `EGAIN` (the six families step 4 generates BEFORE the augment, and every
+    record of an earlier run: augment is idempotent, pinned — a second run changes no byte): rewrites the float
+    file's header in
     place with the three cards appended in the generator's order (data bytes untouched, verified by a sha256 of the
     data part before and after), rewrites `.ideal.fits` (three cards) and `.u16.fits` (`EGAIN`) the same way,
     appends the four truth columns (re-rendering the noiseless stars from the family's seeds without the CRLB —
     `_build_resampled` records go through their source family's renderer and the stored warp; refuses an image
     whose re-rendered `flux_img` or `peak` differ from the stored truth by more than 1e-9), updates `sha256` in the
     manifest, records `augmented` in each record's `extra`. A regeneration and the augmented file agree byte for
-    byte (`make_v2.py --check` proves it).
+    byte, truth CSV included (`make_v2.py --check` proves it: `manifest.verify` now compares the truth CSV even
+    when the FITS hashes are equal — ruling F30 as folded).
 
 - [ ] **Step 1: Write the failing lab tests** (`tests/test_donut.py`, `tests/test_augment.py`, additions)
 
@@ -416,13 +442,15 @@ from starlab import render, families
 
 class TestDonut(unittest.TestCase):
     def test_annulus_component_has_a_central_dip_after_blur(self):
+        # os_=21: the hard-edged annulus at the exact pixel centre sums to 1 − 5.7e-4 there; the default sub-grid
+        # (os 7 at total FWHM 3.68) reads 1 − 3.24e-3, outside the delta (computed, fold check)
         comps = [render.Component(1.0, "annulus", 6.0, 2.4)]           # outer R 6, obstruction 0.4 R
         img = np.zeros((81, 81))
-        s, pk, _ = render.render_star_blurred(img, 40.0, 40.0, 1.0, comps, 0.0, 2.6, 2.6, [2.6])
+        s, pk, _ = render.render_star_blurred(img, 40.0, 40.0, 1.0, comps, 0.0, 2.6, 2.6, [2.6], os_=21)
         self.assertAlmostEqual(s, 1.0, delta=2e-3)
         centre = img[40, 40]
-        ring = 0.25 * (img[40, 44] + img[40, 36] + img[44, 40] + img[36, 40])   # r = 4.2 ≈ 0.7 R
-        self.assertGreater(ring, 1.5 * centre)
+        ring = 0.25 * (img[40, 44] + img[40, 36] + img[44, 40] + img[36, 40])   # r = 4.0 (0.7 R = 4.2)
+        self.assertGreater(ring, 1.5 * centre)                         # ring/centre reads 8.1 (computed)
 
     def test_annulus_evaluate_is_zero_inside_the_obstruction_and_normalised(self):
         comps = [render.Component(1.0, "annulus", 6.0, 2.4)]
@@ -443,13 +471,16 @@ class TestDonut(unittest.TestCase):
 ```
 
 ```python
-"""augment_v2.py: cards appended, data bytes untouched, truth columns appended and reproducible (rulings F30, F31)."""
+"""augment_v2.py: cards appended, data bytes untouched, truth columns appended and reproducible (rulings F30, F31).
+Every old record is built with CARDS_V2 = False — no cards AND no truth columns, as the pre-augment generator wrote
+them — so an augment that leaves either half undone fails these tests."""
 import os, tempfile, unittest, csv, importlib.util
 import numpy as np
 from starlab import families, fitsio
 HERE = os.path.dirname(os.path.abspath(__file__))
 _s = importlib.util.spec_from_file_location("augment_v2", os.path.join(HERE, "..", "bin", "augment_v2.py"))
 aug = importlib.util.module_from_spec(_s); _s.loader.exec_module(aug)
+V2 = ("clipped_core_px", "sat_neighbour_only", "sat_gray", "snr_ap")
 
 
 class TestAugment(unittest.TestCase):
@@ -465,6 +496,7 @@ class TestAugment(unittest.TestCase):
         rec, spec = self._old("sharp/m4/f2.6", size=256, density=150)
         _, h0 = fitsio.read_fits(rec["path"])
         self.assertNotIn("EGAIN", h0)
+        self.assertFalse(set(V2) & set(next(csv.DictReader(open(rec["truth"])))), "the old truth has no v2 column")
         before = aug.data_sha256(rec["path"])
         families.CARDS_V2 = True
         aug.augment_record(rec, spec, seed=11)
@@ -475,7 +507,7 @@ class TestAugment(unittest.TestCase):
         _, hu = fitsio.read_fits(rec["extra"]["u16"])
         self.assertIn("EGAIN", hu); self.assertNotIn("ATH_CSCL", hu)
         rows = list(csv.DictReader(open(rec["truth"])))
-        for c in ("clipped_core_px", "sat_neighbour_only", "sat_gray", "snr_ap"):
+        for c in V2:
             self.assertIn(c, rows[0])
         self.assertTrue(all(float(r["snr_ap"]) > 0 for r in rows if r["saturated"] == "0"))
         self.assertTrue(rec["extra"]["augmented"])
@@ -500,6 +532,33 @@ class TestAugment(unittest.TestCase):
         rec = {"family": "pairs", "name": "iso/m4/ref", "path": "/nonexistent", "truth": "/nonexistent",
                "extra": {"role": "reference", "u16": None}}
         self.assertEqual(aug.augment_record(rec, {"kind": "pairs_in_place"}, seed=None), "skipped: pairs_in_place")
+
+    def test_augment_twice_changes_nothing_the_second_time(self):
+        # a record whose float header already holds EGAIN is skipped (the fresh v2 families, an alias's copies, a
+        # re-run): the cards are never appended twice
+        rec, spec = self._old("sharp/m4/f2.6", size=256, density=150)
+        families.CARDS_V2 = True
+        aug.augment_record(rec, spec, seed=11)
+        files = [open(p, "rb").read() for p in (rec["path"], rec["extra"]["u16"], rec["truth"])]
+        aug.augment_record(rec, spec, seed=11)
+        self.assertEqual([open(p, "rb").read() for p in (rec["path"], rec["extra"]["u16"], rec["truth"])], files)
+        self.assertEqual(fitsio.card_keys(rec["path"]).count("EGAIN"), 1)
+```
+
+Addition to `tests/test_manifest.py` (ruling F30 as folded):
+
+```python
+    def test_verify_reads_the_truth_even_when_the_fits_hash_is_equal(self):
+        d = tempfile.mkdtemp()
+        spec = dict(families.FAMILIES["sharp/m4/f2.6"]); spec.update(size=128, density=150)
+        rec = families.build("sharp/m4/f2.6", spec, os.path.join(d, "a"), seed=11, only_first=True)[0]
+        def regenerate():
+            new = families.build("sharp/m4/f2.6", spec, os.path.join(d, "b"), seed=11, only_first=True)[0]
+            with open(new["truth"], "a") as f:
+                f.write("\n")                                           # the same FITS bytes, a different truth
+            return new
+        ok, why = manifest.verify(rec, regenerate)
+        self.assertFalse(ok, why)
 ```
 
 Additions to `tests/test_families.py`:
@@ -532,12 +591,28 @@ Additions to `tests/test_families.py`:
         self.assertTrue(all(s["sat_gray"] in ("0", "1") for s in r))
 
     def test_snr_ap_includes_the_sky_estimate_term(self):
-        recs = self.build("sharp/m4/f2.6", size=256, density=150)
-        r = [s for s in rows(recs[0]["truth"]) if s["saturated"] == "0" and s["edge"] == "0"]
+        spec = dict(families.FAMILIES["sharp/m4/f2.6"]); spec.update(size=256, density=150)
+        recs = families.build("sharp/m4/f2.6", spec, tempfile.mkdtemp(), seed=11, only_first=True)
+        inside = lambda t: all(16.0 <= float(t[k]) <= 239.0 for k in ("x", "y"))   # its sky annulus wholly on the grid
+        r = [s for s in rows(recs[0]["truth"]) if s["saturated"] == "0" and s["edge"] == "0" and inside(s)]
         s = max(r, key=lambda t: float(t["flux"]))
         snr = float(s["snr_ap"]); fisher = float(s["fisher_snr"])
         self.assertLess(snr, fisher)                     # an aperture SNR is below the Fisher bound
         self.assertGreater(snr, 0.5 * fisher)
+        # ruling F5: this star's snr_ap recomputed from its own noiseless stamp summed in the PA-11 aperture, N_ap and
+        # N_sky counted on the frame grid; the column must equal it WITH the (1 + N_ap/N_sky) term and not without
+        img = families._make("sharp/m4/f2.6", spec, 11, 0)                # image 0 again, its stars drawn, no noise
+        st = next(t for t in families._all_stars(img) if t["id"] == int(s["id"]))
+        star = np.zeros((256, 256)); ya, yb, xa, xb = st["box"]; star[ya:yb + 1, xa:xb + 1] = st["flux"] * st["unit"]
+        F = math.sqrt(float(s["fit_fwhm_minor"]) * float(s["fit_fwhm_major"]))
+        yy, xx = np.mgrid[0:256, 0:256]; d = np.hypot(xx - float(s["x"]), yy - float(s["y"]))
+        r_ap = max(1.5 * F, 3.0); r_in = max(3.0 * F, 6.0); r_out = r_in + max(F, 3.0)
+        S = star[d <= r_ap].sum(); n_ap = int((d <= r_ap).sum()); n_sky = int(((d >= r_in) & (d <= r_out)).sum())
+        g, rn, sky = spec["gain"], spec["rn"], float(s["sky_local"])
+        want = S / math.sqrt(S / g + n_ap * (sky / g + rn * rn) * (1.0 + n_ap / n_sky))
+        no_term = S / math.sqrt(S / g + n_ap * (sky / g + rn * rn))
+        self.assertAlmostEqual(snr / want, 1.0, places=9)
+        self.assertGreater(abs(snr / no_term - 1.0), 1e-3)                # the term is in the column
 ```
 
 - [ ] **Step 2: Run them and see them fail**
@@ -547,12 +622,15 @@ Expected: `AttributeError`/`ValueError`/`ModuleNotFoundError` on `annulus`, `don
 `card_keys`.
 
 - [ ] **Step 3: Implement** render `annulus` (evaluate: `w/(π(a² − b²))` for `b ≤ r ≤ a`, else 0; `cutout_radius`:
-  `a + 1`, plus the blur padding `render_star_blurred` already adds), the `Psf` `donut` branch (`model = "donut"`,
+  an all-annulus component list returns `ceil(a) + 1`, ignoring the function's `3·FWHM_major` floor — the blur
+  padding is `render_star_blurred`'s own), the `Psf` `donut` branch (`model = "donut"`,
   `widths()` returns the twelve width keys as NaN, `bounds()` returns None), the family entries, the cards in
-  `_write` and `_build_resampled` (after `BAYERPAT`; the ideal and u16 dicts; behind `CARDS_V2`), `_stats`/`_write`
+  `_write` and `_build_resampled` (after `BAYERPAT`; the ideal and u16 dicts) and the four truth columns, BOTH behind
+  `CARDS_V2` (ruling F30 as folded), `_stats`/`_write`
   (the three saturation counts need the NOISY image: computed in `_write` after `noise.apply`, before the CSV is
   written; `_build_twins` recomputes them per twin), `snr_ap` with the `(1 + N_ap/N_sky)` term, `fitsio.card_keys`,
-  `augment_v2.py` (`data_sha256`, `augment_record(rec, spec, seed) -> str`, `TruthMismatch`, the `pairs` skip).
+  `manifest.verify` (the truth CSV compared even on equal hashes), `augment_v2.py` (`data_sha256`,
+  `augment_record(rec, spec, seed) -> str`, `TruthMismatch`, the `pairs`, `alias` and `EGAIN`-present skips).
 
 - [ ] **Step 4: Generate and augment** (heavy; one at a time; `memory_pressure` ≥ 30 % free; disk ≥ 100 GiB)
 
@@ -560,15 +638,15 @@ Expected: `AttributeError`/`ValueError`/`ModuleNotFoundError` on `annulus`, `don
 cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab
 mkdir -p results/plan-a/t01a-generator
 python3 bin/make_v2.py --families sharp/m4/f12.0,sharp/m4/f16.0,sharp/gauss/f12.0,sharp/gauss/f16.0,donut/r6,donut/r10
-python3 bin/augment_v2.py manifests/v2.json            # every pre-existing record but pairs; prints per family: cards, columns, sha
+python3 bin/augment_v2.py manifests/v2.json            # every pre-existing record but pairs, aliases and EGAIN-carrying records; prints per family: cards, columns, sha
 python3 bin/make_v2.py --check --families sharp/m4/f2.6,twins/sharp/m4/f2.6,background/neb3,osc/f2.6/m4,resampled/f2.0,sharp/m4/f16.0,donut/r6
 du -sk ~/.athenaeum-acc/star-lab-v2 | tee results/plan-a/t01a-generator/data-root-kib.txt
 ```
 
 Expected: six new families with their SNR-bin reports (the FWHM 12/16 families print `>300` bins as `n/a (ceiling)`
 where the lattice's 300 stars cannot fill them — reported, allowed by P-23); `--check` `ok` on every named family
-(the augmented record regenerates to the same bytes and the same truth, `resampled/f2.0` included); the data root
-≤ 10 485 760 KiB.
+(the augmented record regenerates to the same bytes AND the same truth CSV — compared by `manifest.verify` even
+when the FITS hashes are equal, ruling F30 as folded — `resampled/f2.0` included); the data root ≤ 10 485 760 KiB.
 
 - [ ] **Step 5: Commit and push** (athenaeum-lab)
 
@@ -577,8 +655,8 @@ lab: Plan A step 1a - FWHM 12/16 and annular donut families, EGAIN/ATH_CSCL/ATH_
 ```
 
 **Acceptance:** all lab tests pass; `make_v2.py --check` ok on the seven named families; data root ≤ 10 GB; the
-family count in the manifest is 170; every record's `extra.augmented`, a fresh generation, or the `pairs` skip. No
-bar is read.
+family count in the manifest is 170; every record's `extra.augmented`, a fresh generation, an alias copy, or the
+`pairs` skip; a second `augment_v2.py` run changes no byte. No bar is read.
 
 ---
 
@@ -754,8 +832,10 @@ feat(star_probe): legacy-analysis alias of the analysis path; an unknown --paths
 ```
 
 **Acceptance:** all lab tests pass; the probe test green; `python3 bin/run_probe.py manifests/v2.json --dry-run`
-lists the same 673 stack/LN jobs plus the u16 `legacy-analysis` jobs under their old output names (no stack output
-is invalidated: `complete()` reads the recorded `cmd`, which for the u16 jobs now differs — those re-run at Task 2).
+lists the baseline's 673 jobs of the 164 pre-existing families (the u16 ones now `--paths legacy-analysis` under
+their old output names) plus one `stack` and one `legacy-analysis` job per image of Task 1a's six new families — a
+total of 673 + 2 × (their image count), printed and checked (no stack output is invalidated: `complete()` reads the
+recorded `cmd`, which for the u16 jobs now differs — those re-run at Task 2, the new families' jobs first run there).
 
 ---
 
@@ -770,14 +850,17 @@ is invalidated: `complete()` reads the recorded `cmd`, which for the u16 jobs no
   (sha256 in the committed summary).
 - Produces `bin/scorecard_diff.py <base.json[.gz]> <head.json[.gz]> --out noreg.txt [--design design.json]`: pairs
   rows by `(row, metric, family, path, plane, bin, truth, egroup)`; per row kind the standard error of the BASE row:
-  `bias/scatter/n` rows → `SE = scatter/√n`; `median/scatter/n` rows → `SE = 1.2533·scatter/√n`; `share` or
+  `bias/scatter/n` rows → `SE = scatter/√n`; per-axis `bias_x/bias_y/scatter_x/scatter_y/n` rows (row 2
+  `centroid`, row 10 `seed centroid by gradient`) → each axis's `bias_<a>` and `scatter_<a>` judged with its own
+  `SE = scatter_<a>/√n` (ruling F10 as folded); `median/scatter/n` rows → `SE = 1.2533·scatter/√n`; `share` or
   `completeness`/`raw`/`coverage` over `n` → `SE = √(p(1−p)/n)` floored at `1/n`; `per_mpx` counts → `√count/area`;
   row 7 `value` rows → `SE = value × (row 3 pointfit all-bin scatter of the same family/path/plane)/√n`;
   `spearman` rows → `SE = (1−ρ²)/√(n−1)`; cost rows → reported only; LN rows (PA-14) → reported only; a row
   whose status is `n/a` on either side → reported, not judged. Verdict per judged row: `|head − base| ≤ SE_base`.
   `--design` takes PA-19's list (entries with `row`, optional `metric`/`family`, required `path`, `kind` ∈
-  `set-aside | one-sided | reported`; most-specific-wins matching; a `one-sided` entry over a row without
-  `bias`/`scatter` is a load-time error). `design-cumulative.json` is the same shape with a `step` tag per entry and
+  `set-aside | one-sided | reported`, optional `keys` — the fields a `one-sided` entry judges, default `["bias",
+  "scatter"]`, each judged on its own; most-specific-wins matching; a `one-sided` entry over a row that lacks any
+  of its keys is a load-time error). `design-cumulative.json` is the same shape with a `step` tag per entry and
   PA-19's kind precedence. Exit 1 when any judged row outside the design list moves beyond its SE (either direction:
   an unexplained improvement is still a change) or any `one-sided` row misses, with the row's base, head, SE and
   direction printed. A control section counts the `analysis` (legacy) rows that are not bit-identical (PA-15; must
@@ -843,6 +926,19 @@ class TestDiff(unittest.TestCase):
         with self.assertRaises(sd.DesignError):
             sd.compare([row(row=3, metric="beta sensitivity", bias=None, scatter=None)], head,
                        design=[{"row": 3, "metric": "beta sensitivity", "path": "betas", "kind": "one-sided"}])
+
+    def test_one_sided_on_row_2_names_the_axis_keys(self):
+        # ruling F10 as folded: row 2 carries bias_x/bias_y/scatter_x/scatter_y and no bias/scatter; SE per axis 0.05/20
+        c = dict(row=2, metric="centroid", bias=None, scatter=None, n=400)
+        base = [row(**c, bias_x=0.010, bias_y=-0.004, scatter_x=0.05, scatter_y=0.05)]
+        better = [row(**c, bias_x=0.002, bias_y=-0.005, scatter_x=0.049, scatter_y=0.051)]   # |−0.005| ≤ 0.004 + 0.0025
+        worse = [row(**c, bias_x=0.010, bias_y=-0.004, scatter_x=0.05, scatter_y=0.06)]      # 0.06 > 0.05 + 0.0025
+        d = [{"row": 2, "path": "measure", "kind": "one-sided", "keys": ["bias_x", "bias_y", "scatter_x", "scatter_y"]}]
+        self.assertEqual(sd.compare(base, better, design=d)["one_sided_missed"], [])
+        self.assertEqual(len(sd.compare(base, worse, design=d)["one_sided_missed"]), 1)
+        with self.assertRaises(sd.DesignError):                                   # the default keys are absent on row 2
+            sd.compare(base, better, design=[{"row": 2, "path": "measure", "kind": "one-sided"}])
+        self.assertEqual(len(sd.compare(base, worse, design=[])["moved"]), 1)      # unlisted: judged per axis by SE
 
     def test_cumulative_union_prefers_set_aside_over_one_sided(self):
         base = [row(bias=0.010, scatter=0.005, n=400)]; head = [row(bias=0.050, scatter=0.005, n=400)]
@@ -1542,20 +1638,25 @@ fn eccentricity_and_fwhm_are_unchanged_by_the_swap() {
   keeps the old axis order (it is stale by `MEASURE_VERSION` anyway). Earlier tests this task edits (ruling F14):
   none — the signatures are Task 2's.
 
-- [ ] **Step 3: Lab cycle** `t05-f2`, design list (PA-19 syntax):
-  `{"row":4,"metric":"angle","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"axis order","path":"measure","kind":"set-aside"}`,
-  `{"row":4,"metric":"ecc","family":"shape/*","path":"measure","kind":"set-aside"}`,
-  `{"row":3,"metric":"fwhm axis","path":"measure","kind":"set-aside"}`,
-  `{"row":2,"metric":"centroid","path":"measure","kind":"one-sided"}` (the conditioning may move centroids within their CRLB),
-  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas","kind":"set-aside"}`, `{"row":11,"path":"measure","kind":"set-aside"}`,
-  `{"row":3,"path":"measure","kind":"one-sided"}`, `{"row":3,"path":"betas","kind":"one-sided"}`, `{"row":5,"path":"measure","kind":"one-sided"}`,
-  `{"row":5,"path":"betas","kind":"one-sided"}` (I-5: widths and backgrounds move by more than a last bit; a row that
-  got worse is a miss that goes to the owner, one that got better is recorded; the `fwhm axis` set-aside above is the
-  more specific entry and wins on its rows),
+- [ ] **Step 3: Lab cycle** `t05-f2`, design list (PA-19 syntax; every `betas@*` entry is its `measure` twin, ruling F20 as folded):
+  `{"row":4,"metric":"angle","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"angle","path":"betas@*","kind":"set-aside"}`,
+  `{"row":4,"metric":"axis order","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"axis order","path":"betas@*","kind":"set-aside"}`,
+  `{"row":4,"metric":"ecc","family":"shape/*","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"ecc","family":"shape/*","path":"betas@*","kind":"set-aside"}`,
+  `{"row":3,"metric":"fwhm axis","path":"measure","kind":"set-aside"}`, `{"row":3,"metric":"fwhm axis","path":"betas@*","kind":"set-aside"}`,
+  `{"row":2,"metric":"centroid","path":"measure","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (the conditioning may move centroids within their CRLB),
+  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas@*","kind":"set-aside"}`, `{"row":11,"path":"measure","kind":"set-aside"}`,
+  `{"row":11,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":3,"path":"measure","kind":"one-sided"}`, `{"row":3,"path":"betas@*","kind":"one-sided"}`, `{"row":5,"path":"measure","kind":"one-sided"}`,
+  `{"row":5,"path":"betas@*","kind":"one-sided"}` (I-5: widths and backgrounds move by more than a last bit; a row that
+  got worse is a miss that goes to the owner, one that got better is recorded; the `fwhm axis` set-asides above are
+  the more specific entries and win on their rows),
+  `{"row":3,"metric":"kernel growth","path":"measure","kind":"one-sided","keys":["scatter"]}`,
+  `{"row":3,"metric":"kernel growth","path":"betas@*","kind":"one-sided","keys":["scatter"]}` (the row carries
+  `scatter` and no `bias`, PA-19),
   `{"row":3,"metric":"beta sensitivity","path":"betas","kind":"reported"}`, `{"row":3,"metric":"auto beta pick","path":"measure","kind":"reported"}`
   (no bias/scatter — reported, PA-19), and — ruling F10 — `{"row":1,"path":"register","kind":"reported"}`,
-  `{"row":2,"path":"register","kind":"one-sided"}` (the mono register rows derive from the Measure fits). Row 6
-  `captured fraction` is judged within SE.
+  `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (the mono
+  register rows derive from the Measure fits). Row 6 `captured fraction` (`measure` and `betas@*`) is judged within SE.
 
 - [ ] **Step 4: Read the bar.** Row 4 `axis order` = 100 % on every family × path `measure`; row 4 `angle` on the
   `shape/*` families at e ≥ 0.3, the `eff` cell (prepixel CRLB): ≤ 1.5 on each of the 24 families with e ∈ {0.3,
@@ -1623,7 +1724,8 @@ the threshold is chosen on the `seeds` rows before any fitted bar exists (PA-2 m
   task on; the frame line's `options.measure` gains `seedSource` and `seedThreshold` = the EFFECTIVE source and
   threshold the probe ran, override included — ruling F3), `crates/athenaeum-core/src/test_support.rs`
   (`nan_border_field(w, h, border, stars) -> Vec<f32>`, the probe's fixture moved so a lib test reaches it — ruling
-  F38), `docs/stacking/README.md` (R-OSP-2 the threshold choice)
+  F38), `docs/stacking/README.md` (R-OSP-2 the threshold choice); `star_measure/fit.rs` also gains
+  `FitOutcome.field_width` (Interfaces below, ruling F14)
 - Earlier tests this task edits (ruling F14): Task 2's `fit_stars_at_equals_fit_stars_with_beta` and Task 5's three
   `fit_stars_at` calls take `&FitStarsOptions::default()`.
 
@@ -1638,7 +1740,8 @@ pub struct MatchedFilter { pub fwhm_px: f64 }
 pub struct FieldWidth { pub fwhm_px: f64, pub from_stars: usize }
 pub const DEFAULT_THRESHOLD: f64 = <k chosen by PA-2 in step 4>;
 /// Two passes: a 3-px kernel finds the 100 brightest candidates, their half-maximum widths (`halfmax_width`,
-/// PA-17) give the field width (median, clamped to [1.5, 24] px); the second pass runs at that width. A field
+/// PA-17) give the field width (median over ALL of them, saturated ones included — no saturation test runs here,
+/// ruling F25 as folded; clamped to [1.5, 24] px); the second pass runs at that width. A field
 /// width ≥ 6 px runs the second pass on the 2×2 super-pixel plane (kernel halved; candidate positions ×2,
 /// refined on the full plane). Candidates: local maxima of the filtered plane above `threshold·σ_f` (σ_f =
 /// 1.4826·MAD of the filtered plane over the stratified sample) with ≥ 2 of 4 cross-neighbours above `background
@@ -1654,8 +1757,9 @@ pub fn detect(plane: &[f32], w: usize, h: usize, noise: &NoiseModel, threshold: 
 /// crosses half the brightest pixel (linear interpolation between the bracketing rings). `None` when the profile
 /// never crosses inside the box or the box leaves the image/mask.
 pub fn halfmax_width(plane: &[f32], w: usize, h: usize, x: f64, y: f64, box_r: usize, mask: Option<&[bool]>) -> Option<f64>;
-/// The field width of GIVEN seeds (I-4, PA-17): the median `halfmax_width` of the ≤ 100 brightest (box 15 px; a
-/// first read ≥ 7 px is re-measured in a `3·F` box, ≤ 48), clamped to [1.5, 24] px. `fit_stars_at` calls it when
+/// The field width of GIVEN seeds (I-4, PA-17): the median `halfmax_width` of the ≤ 100 brightest, all of them —
+/// no saturation test (ruling F25 as folded) — (box 15 px; a first read ≥ 7 px is re-measured in a `3·F` box,
+/// ≤ 48), clamped to [1.5, 24] px. `fit_stars_at` calls it when
 /// `FitStarsOptions.field_width` is `None` (LN refits, Peak/Structure seeds, Plan C's mosaic sites); Task 6b's
 /// width start reads it; this task's fit does not.
 pub fn field_width_of(plane: &[f32], w: usize, h: usize, seeds: &[Seed], mask: Option<&[bool]>) -> FieldWidth;
@@ -1663,6 +1767,9 @@ pub fn field_width_of(plane: &[f32], w: usize, h: usize, seeds: &[Seed], mask: O
 
 - The adapter: `SeedSource::MatchedFilter` (probe override) runs `seeds::detect` on the ADU-scaled plane with the
   module's `NoiseModel`; `Fast`/`Full`/`Structure` unchanged.
+- `FitOutcome` gains `pub field_width: FieldWidth` (ruling F14): the width `fit_stars_at` used —
+  `FieldWidth { fwhm_px: f, from_stars: 0 }` when `FitStarsOptions.field_width` is `Some(f)`, `field_width_of` of
+  the given seeds when it is `None`. `given_seeds_get_a_field_width_from_the_halfmax_profile` reads it.
 
 - [ ] **Step 1: Write the failing tests** (`seeds.rs` and `mod.rs` tests; `domain::to_working_units` and
   `domain::noise_model` are Task 2's helpers — ruling F38)
@@ -1759,13 +1866,18 @@ fn pixel_mask_excludes_masked_pixels_from_detection_and_fit() {
 - [ ] **Step 3: Lab cycle** `t06a-seeds` with `--seeds matched` at a PROVISIONAL `K = 4.0` (the sweep follows; this run
   exists so the `seeds` rows and the fitted rows at the new seeds are recorded before step 4 chooses). Design list:
   `{"row":1,"path":"seeds","kind":"set-aside"}`, `{"row":1,"path":"measure","kind":"set-aside"}`, `{"row":2,"path":"seeds","kind":"set-aside"}`,
-  `{"row":10,"metric":"seed flux rank","path":"measure","kind":"set-aside"}`, `{"row":10,"metric":"LN selection keeps (peak_snr >= 40)","path":"measure","kind":"set-aside"}`,
-  `{"row":3,"path":"measure","kind":"set-aside"}`, `{"row":3,"path":"betas","kind":"set-aside"}`, `{"row":5,"path":"measure","kind":"set-aside"}`,
-  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas","kind":"set-aside"}`, `{"row":11,"path":"measure","kind":"set-aside"}`,
-  `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`, `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`
-  (new seeds → a new fitted population; the fits themselves are unchanged), `{"row":1,"path":"register","kind":"reported"}`,
-  `{"row":2,"path":"register","kind":"one-sided"}` (ruling F10). Judged within SE: row 4 `ecc`/`angle`/`axis order` on
-  `shape/*`, row 2 `measure`, every `analysis` row.
+  `{"row":10,"metric":"seed flux rank","path":"seeds","kind":"set-aside"}`, `{"row":10,"metric":"LN selection keeps (peak_snr >= 40)","path":"ln self-pair","kind":"set-aside"}`
+  (each on its row's own path, ruling F20 as folded),
+  `{"row":3,"path":"measure","kind":"set-aside"}`, `{"row":3,"path":"betas@*","kind":"set-aside"}`, `{"row":3,"metric":"beta sensitivity","path":"betas","kind":"set-aside"}`,
+  `{"row":5,"path":"measure","kind":"set-aside"}`, `{"row":5,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas@*","kind":"set-aside"}`, `{"row":11,"path":"measure","kind":"set-aside"}`,
+  `{"row":11,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"floor","path":"betas@*","kind":"set-aside"}`,
+  `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`, `{"row":6,"metric":"captured fraction","path":"betas@*","kind":"set-aside"}`
+  (new seeds → a new fitted population on both arms; the fits themselves are unchanged), `{"row":1,"path":"register","kind":"reported"}`,
+  `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (ruling F10).
+  Judged within SE: row 4 `ecc`/`angle`/`axis order` on `shape/*` (`measure` and `betas@*`), row 2 `measure`, every
+  `analysis` row.
 
 - [ ] **Step 4: Choose the threshold (PA-2, ruling F37).** Build the probe once (it takes `--seed-threshold`); run the
   46 `twins/*` families WHOLE and `artefacts` at K ∈ {3.0, 3.5, 4.0, 4.5, 5.0, 6.0}:
@@ -1816,8 +1928,11 @@ feat(star_measure): F-1 seeds - a two-pass matched filter at the field width (th
   is the subtraction level; clamped [0.6, 40] px), the region grows from `r_start = max(3, ceil(1.5·F_start))` to
   `r_max = clamp(ceil(6·F_start), 6, 96)` while `(m_r − s_r) > 0.01·(max − s_r)`; `b0 = s_r` (the final rim median);
   `a0 = max − b0`; the start σ from `F_start` with the moment axis ratio as today. Refusals: `Donut` when the 3×3 core
-  mean about the moment centroid is below `0.8 ×` the mean of the 1-px ring at radius `F_start/2.3548` (both
-  background-subtracted) — a Gaussian reads a ratio ≈ 1.4; `NarrowerThanPixel` when the accepted `min(fwhm_x, fwhm_y)
+  mean about the moment centroid is below `0.8 ×` the mean of the 1-px ring at radius `max(1.5, F_start/2.3548)`
+  (both background-subtracted; the 1.5-px floor is the fold check's ruling: at the unfloored radius a real star of
+  FWHM ≤ 2.0 read 0.34–0.61 on the lab's renderer and would be refused — with the floor every real profile of FWHM
+  1.2–16 reads ≥ 1.08 and the two donut families 0.02 / 0.29, computed; cost if wrong: a donut at an unusual R slips
+  through, which the `donut outcome` row shows); `NarrowerThanPixel` when the accepted `min(fwhm_x, fwhm_y)
   < 0.8` px. Admission (`OutsideImage`) tests the width-start box (radius `2·F_field`), no longer a field-level
   nominal stamp.
 
@@ -1867,6 +1982,24 @@ fn donut_is_refused_with_its_reason() {
     let (out, diag) = fit_with(&data, w, h, &[Seed { x: 40.0, y: 40.0, peak: 0.1, flux: 1.0 }], 3.0);
     assert!(out.fits.is_empty(), "a donut must never fit: {:?}", out.fits);
     assert_eq!(diag[0].outcome, Outcome::Refused(RefusalReason::Donut));
+}
+
+/// A pin on the ring radius's 1.5-px floor (ruling F28: before this task no star is refused `Donut` at all, so it
+/// cannot fail by behaviour; it fails on a Donut rule without the floor): a sharp real star is never a donut.
+/// Computed on point-sampled Moffat-4 and Gaussian stars over 100 sub-pixel phases: core/ring ≥ 2.32 at FWHM 1.2,
+/// ≥ 1.61 at 1.6, ≥ 1.37 at 2.0 (the unfloored radius read 0.29–0.59 there).
+#[test]
+fn sharp_stars_are_never_refused_as_donuts() {
+    for (k, fwhm) in [1.2f64, 1.6, 2.0].into_iter().enumerate() {
+        let alpha = fwhm / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+        let stars: Vec<MoffatStar> = (0..25).map(|i| one(20.0 + (i % 5) as f64 * 30.1 - 0.2, 20.0 + (i / 5) as f64 * 30.1 - 0.2, 0.3, alpha)).collect();
+        let mut data = moffat_field(160, 160, &stars, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, k as u64);
+        let seeds: Vec<Seed> = stars.iter().map(seed).collect();
+        let (_, diag) = fit_with(&data, 160, 160, &seeds, fwhm);
+        assert_eq!(diag.len(), 25);
+        assert!(diag.iter().all(|d| d.outcome != Outcome::Refused(RefusalReason::Donut)), "FWHM {fwhm}: {diag:?}");
+    }
 }
 
 #[test]
@@ -1931,14 +2064,18 @@ fn nan_border_region_growth_skips_non_finite_pixels() {
 - [ ] **Step 3: Lab cycle** `t06b-f1` (v2 AND `manifests/inject.json` → `~/.athenaeum-acc/star-lab-a/t06b-f1/inject-probe`;
   the probe's default seeds are `matched` at `DEFAULT_THRESHOLD`). Design list: `{"row":1,"metric":"fit outcomes","path":"measure","kind":"set-aside"}`,
   `{"row":1,"metric":"completeness","path":"measure","kind":"set-aside"}`, `{"row":1,"metric":"donut outcome","path":"measure","kind":"set-aside"}`,
-  `{"row":3,"path":"measure","kind":"set-aside"}`, `{"row":3,"path":"betas","kind":"set-aside"}`, `{"row":5,"path":"measure","kind":"set-aside"}`,
-  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas","kind":"set-aside"}`, `{"row":10,"path":"measure","kind":"set-aside"}`,
-  `{"row":11,"path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`,
-  `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}` (the region and background move the
-  signal), `{"row":1,"path":"register","kind":"reported"}`, `{"row":2,"path":"register","kind":"one-sided"}` (F10),
-  `{"row":2,"path":"measure","kind":"one-sided"}` (the start moved; centroids within their CRLB). Judged within SE:
-  row 4 `ecc`/`angle`/`axis order` on `shape/*` (F-2's gains must hold), row 1 `false detections` and `bright
-  coverage` (the seeds are Task 6a's), every `analysis` row.
+  `{"row":3,"path":"measure","kind":"set-aside"}`, `{"row":3,"path":"betas@*","kind":"set-aside"}`, `{"row":3,"metric":"beta sensitivity","path":"betas","kind":"set-aside"}`,
+  `{"row":5,"path":"measure","kind":"set-aside"}`, `{"row":5,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas@*","kind":"set-aside"}`, `{"row":10,"path":"measure","kind":"set-aside"}`,
+  `{"row":11,"path":"measure","kind":"set-aside"}`, `{"row":11,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"floor","path":"betas@*","kind":"set-aside"}`,
+  `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`, `{"row":6,"metric":"captured fraction","path":"betas@*","kind":"set-aside"}`
+  (the region and background move the signal on both arms; F20 as folded), `{"row":1,"path":"register","kind":"reported"}`,
+  `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (F10),
+  `{"row":2,"path":"measure","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (the start
+  moved; centroids within their CRLB). Judged within SE: row 4 `ecc`/`angle`/`axis order` on `shape/*` (`measure`
+  and `betas@*`; F-2's gains must hold), row 1 `false detections` and `bright coverage` (the seeds are Task 6a's),
+  every `analysis` row.
 
 - [ ] **Step 4: Read the bars** (`results/plan-a/t06b-f1/bars.txt`, cells copied verbatim; PA-20):
   - fitted / seeded at FWHM 8: `sharp/m4/f8.0` — the `measure` completeness cell ÷ the `seeds` completeness cell
@@ -2115,12 +2252,14 @@ handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 - Create: `crates/athenaeum-core/src/star_measure/photometry.rs` (`annulus_sigma`, `region_verdict`)
 - Modify: `star_measure/fit.rs` (`fit_one` takes the seed's verdict and copies it into `StarFit.flags`; the
   verdict step runs before the fits — ruling F9), `star_measure/beta.rs` (the discrete search samples the 64
-  brightest seeds whose verdict is unsaturated), `star_measure/seeds.rs` (the field-width candidates use the same
-  verdict, ruling F25), `star_measure/frame.rs` (`frame_shape` over the unsaturated subset; `stars_unsaturated`),
-  `star_measure/mod.rs` (`MeasureOptions.saturation_fraction`, `PlaneMeasurement.wing_fit_missing`; the order
-  seeds → verdicts → β sample → fits at β), `stacking/measure.rs` (hand edit: `ChannelMeasurement.stars_unsaturated`),
+  brightest seeds whose verdict is unsaturated), `star_measure/frame.rs` (`frame_shape` over the unsaturated
+  subset; `stars_unsaturated`), `star_measure/mod.rs` (`MeasureOptions.saturation_fraction`,
+  `PlaneMeasurement.wing_fit_missing`; the order seeds → field width → verdicts → β sample → fits at β),
+  `stacking/measure.rs` (hand edit: `ChannelMeasurement.stars_unsaturated`),
   `examples/star_probe.rs` (`--clip`, `--saturation-fraction`; frame line `wingFitMissing`), `docs/stacking/README.md`
   (R-OSP-5)
+- Not modified: `star_measure/seeds.rs` — the field width runs no saturation test (PA-17, ruling F25 as folded), so
+  `detect` and `field_width_of` keep Task 6a's signatures (Plan C's `detect` included).
 - Earlier tests this task edits (ruling F14): none break — `FrameAggregates.fwhm_px` was `Option<f64>` from Task 2.
 
 **Interfaces:**
@@ -2142,8 +2281,9 @@ pub struct SaturationVerdict { pub saturated: bool, pub clip_hit: bool, pub core
 /// (≥ 12 of them, `fit_moffat_2d`, bound [1, 20] at this task; `fit_moffat_2d_bounded` with `BETA_BOUNDS` from
 /// Task 9 — I-3), started at the region's rim median, the maximum and `fwhm_start`. `clip`: `Some(level)` in the
 /// plane's units when the domain knows it (RawAdu: `saturation_fraction × clip`), `None` on a calibrated plane.
-/// `sigma_local` = `annulus_sigma` at the seed; `None` → only the clip clause can flag. A `None` wing fit leaves
-/// `saturated = false` with `wing_fit = false` — never a flag from a missing fit.
+/// `sigma_local` = `annulus_sigma` at the seed; `None` → only the clip clause can flag. A wing fit that returns
+/// `None`, or cannot run because fewer than 12 pixels lie outside the core, leaves `saturated = false` with
+/// `wing_fit = false` and is counted in `wing_fit_missing` — never a flag from a missing fit.
 pub fn region_verdict(region: &[PixelSample], max_x: f64, max_y: f64, fwhm_start: f64, clip: Option<f64>,
                       sigma_local: Option<f64>, scratch: &mut FitScratch) -> SaturationVerdict;
 ```
@@ -2153,10 +2293,12 @@ pub fn region_verdict(region: &[PixelSample], max_x: f64, max_y: f64, fwhm_start
   `frame_shape(fits.iter().filter(|f| !f.flags.saturated()))` with `None` when empty (Review Focus 3 — the adapter
   then reports `fwhm_px = 0.0`, which passes `select_frames`'s `max_fwhm_px` as the spec allows; the plan gate's
   and the UI's treatment of `stars_unsaturated = 0` is Plan C's, M-12); the β sample is the 64 brightest seeds whose
-  verdict is unsaturated; the matched filter's field-width candidates skip seeds whose verdict is saturated — the
-  SAME `region_verdict`, computed once per seed on its own region and reused by the fit (ruling F25; no second
-  rule). `PlaneMeasurement.wing_fit_missing: usize` counts the seeds whose wing fit returned `None` (the probe
-  prints it as `wingFitMissing`; the lab row reports it).
+  verdict is unsaturated. The verdict is computed once per seed on its own region AFTER the field width is known
+  (the region's `F_start` reads `F_field`, PA-12) and reused by the fit; the field width itself (PA-17) reads every
+  candidate and no verdict — no second, partial rule exists (ruling F25 as folded; cost if wrong: a field width
+  biased on frames dominated by saturated stars, which the lab's `saturated/*` families show).
+  `PlaneMeasurement.wing_fit_missing: usize` counts the seeds whose wing fit is missing (returned `None`, or fewer
+  than 12 pixels outside the core; the probe prints it as `wingFitMissing`; the lab row reports it).
 - `Domain::Calibrated` → `clip = None`; `Domain::RawAdu { clip }` → `Some(saturation_fraction × clip)`.
 
 - [ ] **Step 1: Write the failing tests** (`photometry.rs` and `mod.rs` tests)
@@ -2206,12 +2348,14 @@ fn raw_domain_clip_clause_flags_a_peak_above_the_fraction_times_clip() {
 
 #[test]
 fn annulus_sigma_is_the_mad_of_the_present_pixels() {
-    // a star 4 px from the border with a NaN wedge in its annulus: σ from the finite, in-image pixels only
+    // PA-11 at FWHM 2.6: inner max(7.8, 6) = 7.8, width max(2.6, 3) = 3 — the ring 7.8..10.8 (180 pixels about an
+    // interior pixel centre, counted). A star 4 px from the border: its ring is cut by the border to 119 in-image
+    // pixels (counted), and σ comes from those only; the NaN corner holds the whole in-image ring of a star at (60, 60)
     let (w, h) = (64usize, 64usize);
     let mut data = vec![0.05f32; w * h];
     add_noise(&mut data, 0.004, 3);
     for y in 0..h { for x in 0..w { if x > 40 && y > 40 { data[y * w + x] = f32::NAN; } } }
-    let (sigma, n) = annulus_sigma(&data, w, h, 4.0, 32.0, 2.6, None).unwrap();   // inner 6, width 3: a ring of radius 6..9
+    let (sigma, n) = annulus_sigma(&data, w, h, 4.0, 32.0, 2.6, None).unwrap();
     assert!(n > 0 && n < 150, "{n}");
     assert!((sigma / 0.004 - 1.0).abs() < 0.35, "{sigma}");
     assert!(annulus_sigma(&data, w, h, 60.0, 60.0, 2.6, None).is_none(), "the NaN corner: nothing present");
@@ -2219,15 +2363,40 @@ fn annulus_sigma_is_the_mad_of_the_present_pixels() {
     assert!(annulus_sigma(&data, w, h, 32.0, 32.0, 2.6, Some(&all)).is_none(), "a fully masked annulus");
 }
 
+/// The pocket (ruling F29): every pixel within Chebyshev distance 3 of the star is NaN except the 5-pixel plus
+/// about it and ten pixels of the r = 3 rim (the top rim row and the bottom row's middle three).
+fn pocket(dx: i64, dy: i64) -> bool { dx.abs() + dy.abs() <= 1 || dy == -3 || (dy == 3 && dx.abs() <= 1) }
+
 #[test]
 fn a_missing_wing_fit_never_flags() {
-    // a 5×5 region: ≤ 12 non-core pixels → no wing fit → unflagged and counted
-    let data = moffat_field(20, 20, &[MoffatStar { x: 10.0, y: 10.0, amp: 0.9, alpha_x: 2.0, alpha_y: 2.0, theta: 0.0 }], 4.0, 0.05);
+    // A clipped star whose own region holds fewer than 12 pixels outside its core, in the module's own geometry.
+    // Computed on this fixture (noise 0.0005): the plus is clipped flat at 0.95; F_start 1.5–1.7 (r_start 3); the
+    // region stops at r = 3 (m_r − s_r = 0.0005 against 0.01·(max − s_r) = 0.009) with 15 present pixels; the core
+    // holds 4 or 5 of them (by where the maximum sits among the equal clipped ones), so 10 or 11 lie outside it —
+    // no wing fit, and a core ≥ 3 means only the wing fit could have flagged it. Eight unclipped Moffat-4 stars
+    // (α 3) give the field width; their wing fits return. The ring 6..9 of PA-11 stays present (σ_local exists).
+    let (w, h, cx, cy) = (240usize, 160usize, 120i64, 80i64);
+    let stars: Vec<MoffatStar> = (0..8).map(|i| MoffatStar { x: [30.0, 80.0, 160.0, 210.0][i % 4], y: [40.0, 120.0][i / 4],
+        amp: 0.3, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }).collect();
+    let mut data = moffat_field(w, h, &stars, 4.0, 0.05);
+    let spot = crate::test_support::gaussian_field(w, h, &[(cx as f64, cy as f64, 4.0)], 0.8, 0.0);
+    for (v, s) in data.iter_mut().zip(&spot) { *v += s; }
+    add_noise(&mut data, 0.0005, 7);
+    clipped(&mut data, 0.95);
+    for dy in -3i64..=3 { for dx in -3i64..=3 {
+        if !pocket(dx, dy) { data[(cy + dy) as usize * w + (cx + dx) as usize] = f32::NAN; }
+    } }
+    let region = region_of(&data, w, cx, cy, 3);
+    assert_eq!(region.len(), 15);
     let mut scratch = FitScratch::default();
-    let v = region_verdict(&region_of(&data, 20, 10, 10, 2), 10.0, 10.0, 2.6, None, Some(0.002), &mut scratch);
-    assert!(!v.saturated && !v.wing_fit);
-    let m = measure_plane(&data, 20, 20, &MeasureOptions { seeds: SeedSpec::Given(vec![Seed { x: 10.0, y: 10.0, peak: 0.9, flux: 1.0 }]), ..Default::default() }, None);
-    assert_eq!(m.wing_fit_missing, 1);
+    let v = region_verdict(&region, cx as f64, cy as f64, 1.6, None, Some(0.0005), &mut scratch);
+    assert!(v.core_pixels >= 4, "the flat-top premise holds: {v:?}");
+    assert!(!v.wing_fit && !v.saturated, "fewer than 12 pixels outside the core: no wing fit, no flag: {v:?}");
+    let mut seeds: Vec<Seed> = stars.iter().map(|s| Seed { x: s.x, y: s.y, peak: s.amp, flux: 1.0 }).collect();
+    seeds.push(Seed { x: cx as f64, y: cy as f64, peak: 0.9, flux: 4.0 });
+    let m = measure_plane(&data, w, h, &MeasureOptions { seeds: SeedSpec::Given(seeds), ..Default::default() }, None);
+    assert_eq!(m.wing_fit_missing, 1, "the pocket star alone");
+    assert!(m.stars.iter().all(|f| !f.flags.saturated()));
 }
 
 #[test]
@@ -2259,11 +2428,12 @@ fn beta_sample_skips_saturated_stars() {
 - [ ] **Step 2: Run, fail, implement, run.** Re-pin the measure.rs literals (by design: the statistic's population).
 
 - [ ] **Step 3: Lab cycle** `t08-f3`. Design list: `{"row":7,"path":"measure","kind":"set-aside"}`,
-  `{"row":7,"path":"betas","kind":"set-aside"}` (the statistic's population), `{"row":11,"path":"measure","kind":"set-aside"}`
-  (the twins), `{"row":10,"metric":"auto beta vs saturated top-64 seeds","path":"measure","kind":"set-aside"}`,
+  `{"row":7,"path":"betas@*","kind":"set-aside"}` (the statistic's population), `{"row":11,"path":"measure","kind":"set-aside"}`,
+  `{"row":11,"path":"betas@*","kind":"set-aside"}` (the twins), `{"row":10,"metric":"auto beta vs saturated top-64 seeds","path":"measure","kind":"set-aside"}`,
   `{"row":10,"metric":"saturation flag vs truth","path":"measure","kind":"set-aside"}`,
-  `{"row":3,"family":"saturated/*","path":"measure","kind":"set-aside"}`, `{"row":3,"family":"twins/*","path":"measure","kind":"set-aside"}`,
-  `{"row":1,"path":"register","kind":"reported"}`, `{"row":2,"path":"register","kind":"one-sided"}` (F10). Row 1
+  `{"row":3,"family":"saturated/*","path":"measure","kind":"set-aside"}`, `{"row":3,"family":"saturated/*","path":"betas@*","kind":"set-aside"}`,
+  `{"row":3,"family":"twins/*","path":"measure","kind":"set-aside"}`, `{"row":3,"family":"twins/*","path":"betas@*","kind":"set-aside"}`,
+  `{"row":1,"path":"register","kind":"reported"}`, `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (F10). Row 1
   `bright coverage (300)` is JUDGED within SE (it counts saturated stars, N-5 — unchanged by design; ruling F20
   removed it from the list).
 
@@ -2278,10 +2448,11 @@ fn beta_sample_skips_saturated_stars() {
     0.0 % of 1 pair on five families) — the twin rows are judged AGAIN at Task 9 (N-6), where "void at the cap" may
     apply.
 
-- [ ] **Step 5: Record R-OSP-5 (PA-8's constants, the per-seed order and the row); commit.**
+- [ ] **Step 5: Record R-OSP-5 (PA-8's constants, the per-seed order seeds → field width → verdicts → β sample →
+  fits, the field width's absence of any saturation test with its cost, and the row); commit.**
 
 ```
-fix(star_measure): F-3 one saturation test per seed (raw clip clause + the flat-top wing test, ruling R-OSP-5); the beta sample, the width start and the frame statistic use unsaturated stars (twins: <cells>; flag FP/FN: <cells>)
+fix(star_measure): F-3 one saturation test per seed after the field width (raw clip clause + the flat-top wing test, ruling R-OSP-5); the beta sample and the frame statistic use unsaturated stars (twins: <cells>; flag FP/FN: <cells>)
 ```
 
 **Acceptance:** FP ≤ 1 %, FN 0 on ≥ 3-clipped-core stars; every twin family ≤ 1 % with zero flips; both diffs 0
@@ -2432,16 +2603,20 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
   Then in athenaeum: `git add rustafits` (the pointer), implement `beta.rs`, run the module tests.
 
 - [ ] **Step 3: Lab cycle** `t09-f4` (v2 and injections). Design list: `{"row":3,"path":"measure","kind":"set-aside"}`
-  (every width moves with β), `{"row":3,"path":"betas","kind":"set-aside"}`, `{"row":7,"path":"measure","kind":"set-aside"}`,
-  `{"row":7,"path":"betas","kind":"set-aside"}`, `{"row":11,"path":"measure","kind":"set-aside"}`,
+  (every width moves with β), `{"row":3,"path":"betas@*","kind":"set-aside"}`, `{"row":3,"metric":"beta sensitivity","path":"betas","kind":"set-aside"}`,
+  `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":11,"path":"measure","kind":"set-aside"}`, `{"row":11,"path":"betas@*","kind":"set-aside"}`,
   `{"row":10,"metric":"auto beta vs saturated top-64 seeds","path":"measure","kind":"set-aside"}`,
   `{"row":10,"metric":"saturation flag vs truth","path":"measure","kind":"set-aside"}` (the wing fitter changed, I-3;
   the F-3 bar is read again here and must still hold), `{"row":1,"metric":"fit outcomes","path":"measure","kind":"set-aside"}`
-  (a formerly `None` wing fit now flags or not), `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`
-  (the FWTM ellipse follows β), `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`,
-  `{"row":4,"metric":"ecc","path":"measure","kind":"set-aside"}`, `{"row":5,"path":"measure","kind":"set-aside"}`,
-  `{"row":2,"path":"measure","kind":"one-sided"}` (within CRLB), `{"row":1,"path":"register","kind":"reported"}`,
-  `{"row":2,"path":"register","kind":"one-sided"}` (F10). (The dead `auto beta agrees` row-10 entry is gone — it is a
+  (a formerly `None` wing fit now flags or not), `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`,
+  `{"row":6,"metric":"captured fraction","path":"betas@*","kind":"set-aside"}` (the FWTM ellipse follows β),
+  `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"floor","path":"betas@*","kind":"set-aside"}`,
+  `{"row":4,"metric":"ecc","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"ecc","path":"betas@*","kind":"set-aside"}`,
+  `{"row":5,"path":"measure","kind":"set-aside"}`, `{"row":5,"path":"betas@*","kind":"set-aside"}`,
+  `{"row":2,"path":"measure","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (within CRLB),
+  `{"row":1,"path":"register","kind":"reported"}`,
+  `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (F10). (The dead `auto beta agrees` row-10 entry is gone — it is a
   row-11 metric, covered by the row-11 entry; ruling F20.) LN's reference fit under `PsfModel::Auto`
   (`ln/scale.rs:993`) now runs the 64-fit bounded sample: the Normalize stage wall is not under the +20 % bar and is
   reported in Task 13's stage table.
@@ -2573,8 +2748,10 @@ fn ln_refit_takes_a_given_correction() {
 - [ ] **Step 2: Run, fail, implement, run.** The re-pins named under Files, each with its comment.
 
 - [ ] **Step 3: Lab cycle** `t10-f5` (v2 incl. the LN probe on the pairs families — reported, PA-14). Design list:
-  `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`, `{"row":1,"path":"register","kind":"reported"}`,
-  `{"row":2,"path":"register","kind":"one-sided"}` (F10: Register's flux ordering reads `signal`). Row 10 `seed flux
+  `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`, `{"row":6,"metric":"captured fraction","path":"betas@*","kind":"set-aside"}`
+  (every fit's `signal` is the new flux, F20 as folded), `{"row":1,"path":"register","kind":"reported"}`,
+  `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (F10:
+  Register's flux ordering reads `signal`). Row 10 `seed flux
   rank` is JUDGED within SE (unchanged seeds; ruling F20 removed it from the list). The weights have no scorecard row
   (the real-data checkpoint reads them).
 
@@ -2605,13 +2782,14 @@ fix(star_measure): F-5 star flux = the fitted model's FWTM flux times a per-fram
   — the same five hand-edited sites as Task 4, or `StarFit::test_at` where it was adopted), `star_measure/frame.rs`
   (`snr_median`, `hfr_median`: medians over the finite values only, so a `snr_missing` NaN never poisons the frame
   median — pinned), `star_measure/mod.rs` (`PlaneMeasurement.snr_gain`, `.snr_missing`), `star_measure/domain.rs`
-  (`Domain::gain_e_per_working_unit()`), `stacking/measure.rs` (hand edit: the adapter reads `EGAIN` and `ATH_CSCL`
-  from the FITS header through `crate::fits_parser` and passes `gain_e_per_unit = EGAIN × ATH_CSCL` — PA-22, ruling
-  F6; `None` when either is absent), `examples/star_probe.rs` (same header read; `snr`, `hfr` on star lines;
+  (`Domain::gain_e_per_working_adu()`: the domain's gain in e⁻ per ADU of the working-unit plane), `stacking/measure.rs`
+  (hand edit: the adapter reads `EGAIN` and `ATH_CSCL` from the FITS header through `crate::fits_parser` and builds
+  `Domain::Calibrated { gain_e_per_unit: Some(EGAIN × ATH_CSCL) }` — e⁻ per calibrated unit, PA-22, ruling F6;
+  `None` when either is absent), `examples/star_probe.rs` (same header read; `snr`, `hfr` on star lines;
   `snrGain` on the frame line), `docs/stacking/README.md` (R-OSP-8)
 
 **Interfaces:**
-- Produces: `star_snr(plane, w, h, fit, gain: Option<f64>, mask: Option<&[bool]>) -> (f64 /* snr */, SnrTerms { s,
+- Produces: `star_snr(plane, w, h, fit, gain: Option<f64> /* e⁻ per working ADU */, mask: Option<&[bool]>) -> (f64 /* snr */, SnrTerms { s,
   n_ap, sigma_sky, n_sky, shot_term: bool })` per PA-11 with `(σ_sky, N_sky)` from `photometry::annulus_sigma` (Task
   8, I-2; `None` → `snr = NaN`, counted in `PlaneMeasurement.snr_missing`): `σ_S² = S/g + N_ap·σ_sky²·(1 +
   N_ap/N_sky)`; without `g` the first term is omitted and `shot_term = false`. `hfr(plane, w, h, fit, mask:
@@ -2643,12 +2821,12 @@ fn snr_matches_the_analytic_value_on_a_white_noise_star() {
         let mut noisy = clean.clone();
         add_noise(&mut noisy, sigma_px as f32, k);
         let data: Vec<f32> = noisy.iter().map(|v| v * ADU_SCALE).collect();
-        let out = fit_stars_at(&data, 80, 80, &[seed], 4.0, &FitStarsOptions { gain_e_per_unit: Some(g / ADU_SCALE as f64), ..Default::default() }, None);
+        let out = fit_stars_at(&data, 80, 80, &[seed], 4.0, &FitStarsOptions { gain_e_per_working_adu: Some(g / ADU_SCALE as f64), ..Default::default() }, None);
         snrs.push(out.fits[0].snr);
     }
     let r_ap = (1.5 * 2.6f64).max(3.0); let n_ap = std::f64::consts::PI * r_ap * r_ap;
     let r_in = (3.0 * 2.6f64).max(6.0); let r_out = r_in + 2.6f64.max(3.0); let n_sky = std::f64::consts::PI * (r_out * r_out - r_in * r_in);
-    let s = total * 0.93;                                                 // the Moffat-4 fraction inside 1.5 FWHM (analytic)
+    let s = total * (1.0 - (1.0 + (r_ap / 2.99).powi(2)).powi(-3));     // 0.949: the Moffat-4 fraction inside r_ap (analytic)
     let analytic = s / (s / g + n_ap * sigma_px * sigma_px * (1.0 + n_ap / n_sky)).sqrt();
     let med = median(snrs.iter().cloned());
     assert!((med / analytic - 1.0).abs() < 0.05, "snr {med} vs analytic {analytic}");
@@ -2658,7 +2836,7 @@ fn snr_matches_the_analytic_value_on_a_white_noise_star() {
 fn snr_without_gain_omits_the_shot_term_and_says_so() {
     let (clean, seed) = one_star(0.2);
     let data: Vec<f32> = clean.iter().map(|v| v * ADU_SCALE).collect();
-    let with = fit_stars_at(&data, 80, 80, &[seed], 4.0, &FitStarsOptions { gain_e_per_unit: Some(1.0), ..Default::default() }, None);
+    let with = fit_stars_at(&data, 80, 80, &[seed], 4.0, &FitStarsOptions { gain_e_per_working_adu: Some(1.0), ..Default::default() }, None);
     let without = fit_stars_at(&data, 80, 80, &[seed], 4.0, &FitStarsOptions::default(), None);
     assert!(without.fits[0].snr > with.fits[0].snr);
     let (_, terms) = star_snr(&data, 80, 80, &without.fits[0], None, None);
@@ -2676,37 +2854,68 @@ fn edge_star_snr_uses_the_present_annulus_pixels() {
     let fit = StarFit { x: 4.0, y: 40.0, background: 0.05, amplitude: 0.3, fwhm_x: 2.6, fwhm_y: 2.6, ..StarFit::test_at(4.0, 40.0, 0.3) };
     let (snr, terms) = star_snr(&data, 80, 80, &fit, None, None);
     assert!(snr.is_finite() && snr > 0.0);
-    let full = (std::f64::consts::PI * (9.0f64.powi(2) - 6.0f64.powi(2))) as usize;
+    // PA-11 at FWHM 2.6: the ring 7.8..10.8 (π(10.8² − 7.8²) = 175; 180 pixels about an interior pixel centre);
+    // here the border and the NaN block leave 110 of it present (counted)
+    let (r_in, r_out) = ((3.0 * 2.6f64).max(6.0), (3.0 * 2.6f64).max(6.0) + 2.6f64.max(3.0));
+    let full = (std::f64::consts::PI * (r_out * r_out - r_in * r_in)) as usize;
     assert!(terms.n_sky < full && terms.n_sky > full / 4, "{}", terms.n_sky);
 }
 
 #[test]
 fn snr_is_nan_and_counted_when_no_annulus_pixel_is_present() {
-    let (clean, seed) = one_star(0.2);
-    let mask = vec![false; 80 * 80];
-    let m = measure_plane(&clean, 80, 80, &MeasureOptions { seeds: SeedSpec::Given(vec![seed]), mask: Some(mask), ..Default::default() }, None);
-    assert_eq!(m.snr_missing, m.stars.len());
-    assert!(m.stars.iter().all(|f| f.snr.is_nan()));
+    // ruling F29: only the star's own PA-11 annulus is masked (0.5 px wider on each side), so the star still fits and
+    // the SNR alone has nothing to read; the unmasked run reads a finite SNR, so the test cannot pass on zero fits
+    let (mut data, seed) = one_star(0.2);
+    add_noise(&mut data, 0.002, 9);
+    let opts = |mask: Option<Vec<bool>>| MeasureOptions { seeds: SeedSpec::Given(vec![seed]), mask, ..Default::default() };
+    let open = measure_plane(&data, 80, 80, &opts(None), None);
+    assert_eq!(open.stars.len(), 1);
+    assert!(open.stars[0].snr.is_finite() && open.snr_missing == 0);
+    let f = open.stars[0];
+    let r_in = (3.0 * f.fwhm()).max(6.0);
+    let (lo, hi) = (r_in - 0.5, r_in + f.fwhm().max(3.0) + 0.5);
+    let mask: Vec<bool> = (0..80 * 80).map(|i| {
+        let d = ((i % 80) as f64 - f.x).hypot((i / 80) as f64 - f.y);
+        d < lo || d > hi
+    }).collect();
+    let m = measure_plane(&data, 80, 80, &opts(Some(mask)), None);
+    assert_eq!(m.stars.len(), 1, "the star itself is unmasked and fits");
+    assert!(m.stars[0].snr.is_nan());
+    assert_eq!(m.snr_missing, 1);
     assert!(m.frame.snr_median.is_none());
 }
 
 #[test]
 fn hfr_of_a_gaussian_is_the_half_flux_radius() {
+    // ruling F29: six isolated stars, so the aperture correction is measured (≥ 5 qualify, Task 10) and `signal` is
+    // the total flux; one star would leave c = 1 and signal = 0.898·total, the HFR 9 % low (computed). The phase
+    // (0.3, 0.7) matters: this interpolated discrete HFR moves with the sub-pixel phase (σ 2: up to ±8 % over a
+    // 0.1-px phase grid, computed); at this phase it reads +0.2 % with c measured
     let sigma = 2.0;
-    let g = gaussian_field(80, 80, &[(40.0, 40.0, 0.3)], sigma, 0.0);
+    let stars: Vec<(f64, f64, f64)> = (0..6).map(|i| (60.3 + (i % 3) as f64 * 60.0, 59.7 + (i / 3) as f64 * 60.0, 0.3)).collect();
+    let g = gaussian_field(240, 180, &stars, sigma, 0.0);
     let data: Vec<f32> = g.iter().map(|v| v * ADU_SCALE).collect();
-    let out = fit_stars_at(&data, 80, 80, &[Seed { x: 40.0, y: 40.0, peak: 0.3, flux: 1.0 }], 100.0, &FitStarsOptions::default(), None);
+    let seeds: Vec<Seed> = stars.iter().map(|&(x, y, p)| Seed { x, y, peak: p, flux: 1.0 }).collect();
+    let out = fit_stars_at(&data, 240, 180, &seeds, 100.0, &FitStarsOptions::default(), None);
+    assert!(out.aperture_correction.is_some(), "c is measured on six isolated stars");
     let want = 1.177_41 * sigma;                                          // the Gaussian's half-flux radius √(2 ln 2) σ
-    assert!((out.fits[0].hfr / want - 1.0).abs() < 0.03, "hfr {} vs {want}", out.fits[0].hfr);
+    assert_eq!(out.fits.len(), 6);
+    for f in &out.fits {
+        assert!((f.hfr / want - 1.0).abs() < 0.03, "hfr {} vs {want}", f.hfr);
+    }
 }
 
 // stacking/measure.rs tests (hand-edited)
 #[test]
 fn the_adapter_reads_egain_and_cscl_into_the_gain() {
+    use crate::fits_writer::{write_fits_f32, Card, CardValue};
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("g.fits");
     let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
-    write_fits_f32(&p, w, h, 1, &data, &[("EGAIN", 50000.0 / 65535.0), ("ATH_CSCL", 65535.0), ("ATH_CFNM", 3000.0)]).unwrap();
+    let cards = [Card::new("EGAIN", CardValue::Real(50000.0 / 65535.0)).unwrap(),
+                 Card::new("ATH_CSCL", CardValue::Real(65535.0)).unwrap(),
+                 Card::new("ATH_CFNM", CardValue::Real(3000.0)).unwrap()];
+    write_fits_f32(&p, w, h, 1, &data, &cards).unwrap();
     assert!((gain_from_header(&p).unwrap() - 50000.0).abs() < 1e-6, "EGAIN × ATH_CSCL, CFNM ignored (PA-22)");
     let q = d.path().join("n.fits");
     write_fits_f32(&q, w, h, 1, &data, &[]).unwrap();
@@ -2714,8 +2923,11 @@ fn the_adapter_reads_egain_and_cscl_into_the_gain() {
 }
 ```
 
-  `FitStarsOptions.gain_e_per_unit: Option<f64>` (in working units: e⁻ per ADU of the scaled plane) joins the
-  options here; `measure.rs` gains `fn gain_from_header(path: &Path) -> Option<f64>` (the `fits_parser` read).
+  Two gain names, one per unit (fold check): `Domain::Calibrated { gain_e_per_unit }` is e⁻ per CALIBRATED unit
+  (= EGAIN × ATH_CSCL, 50000 in the adapter test); `FitStarsOptions.gain_e_per_working_adu: Option<f64>` — e⁻ per ADU
+  of the working-unit plane (`gain_e_per_unit / ADU_SCALE` for a calibrated plane, 0.763 in the SNR test) — joins
+  the options here, filled by `measure_plane` from `Domain::gain_e_per_working_adu()`; `measure.rs` gains
+  `fn gain_from_header(path: &Path) -> Option<f64>` (the `fits_parser` read).
 
 - [ ] **Step 2: Run, fail, implement, run.**
 
@@ -2780,10 +2992,19 @@ fn uniform(n: usize, w: usize, h: usize, seed: u64) -> Vec<MoffatStar> {
         amp: 0.05 + 0.3 * rng.next_f64(), alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }).collect()
 }
 
+/// The 1024² field with pseudo-noise, as the probe's own fixture adds it (ruling F29): the MRS noise estimate needs
+/// some, and a noiseless plane is a refused noise model that seeds nothing under `SeedSpec::MatchedFilter` (Review
+/// Focus 4).
+fn noisy_field(stars: &[MoffatStar], noise_seed: u64) -> Vec<f32> {
+    let mut data = moffat_field(1024, 1024, stars, 4.0, 0.05);
+    crate::test_support::add_noise(&mut data, 0.002, noise_seed);
+    data
+}
+
 #[test]
 fn budget_covers_every_cell_that_holds_a_star() {
     let stars = uniform(800, 1024, 1024, 11);
-    let data = moffat_field(1024, 1024, &stars, 4.0, 0.05);
+    let data = noisy_field(&stars, 11);
     let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 500 }, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
     let b = m.budget.unwrap();
     assert!(m.stars.len() <= 500 && m.stars.len() >= 480, "{}", m.stars.len());
@@ -2796,7 +3017,7 @@ fn budget_covers_every_cell_that_holds_a_star() {
 fn budget_keeps_the_brightest_per_cell_when_one_cell_dominates() {
     let mut stars = uniform(600, 256, 256, 3);                              // all inside the top-left cell of a 1024² plane
     stars.extend((0..15).map(|i| MoffatStar { x: 300.0 + (i % 5) as f64 * 150.0, y: 300.0 + (i / 5) as f64 * 200.0, amp: 0.2, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }));
-    let data = moffat_field(1024, 1024, &stars, 4.0, 0.05);
+    let data = noisy_field(&stars, 3);
     let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 200 }, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
     let b = m.budget.unwrap();
     assert_eq!(b.cells_covered, b.cells_with_stars, "every cell with a star keeps one");
@@ -2808,7 +3029,7 @@ fn budget_keeps_the_brightest_per_cell_when_one_cell_dominates() {
 #[test]
 fn budget_mode_accounts_for_every_seed() {
     let stars = uniform(900, 1024, 1024, 5);
-    let data = moffat_field(1024, 1024, &stars, 4.0, 0.05);
+    let data = noisy_field(&stars, 5);
     let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 500 }, diagnostics: true, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
     let b = m.budget.unwrap();
     assert!(b.not_selected > 0, "900 seeds, 1.25 × 500 / 16 per cell: many are never fitted");
@@ -2827,7 +3048,8 @@ fn budget_mode_accounts_for_every_seed() {
   only (the new path adds rows; the existing paths' rows are judged and must not move).
 
 - [ ] **Step 4: Read the bars** (`bars.txt`):
-  - budget: row 1 `budget coverage` ≥ 0.9 on every v2 image with ≥ 16 seeds (`cells_with_stars` printed); the
+  - budget: row 1 `budget coverage` ≥ 0.9 on every v2 image — the spec's ≥ 90 % of the 4 × 4 cells that hold
+    measurable stars, on every image whatever its seed count (`cells_with_stars` printed); the
     `analysis-mode` `fit outcomes` row `ok` on every image (the four-term identity, ruling F13);
   - Analysis cost: the corpus m42 `analysis-mode` invocation walls, mean over the 77 frames ≤ 0.6 s (baseline legacy
     analysis 25.2 s / 77 = 0.33 s), max printed; `background/neb3_4096` `analysis-mode` wall printed beside the
@@ -2888,8 +3110,11 @@ taken only on the owner's word, is `prepare-catalog.sh` from the template into a
   that holds more than one finished run — default the latest `done` run, as today; `--numeric` gains `--project-id
   <uuid>`, the project twin of `--set-id`, selecting that project's run the way `project-run.sh` records it, so run
   B gets the same `--numeric` rows as a set (ruling F41); `--numeric` gains the `starsRefused` line beside
-  `fwhmPx`/`beta` and `--base-db <path>` (read the base side's rows from this DB instead of `<W_base>/athenaeum.db`
-  — the Horse C11 clone's checkpointed DB, step 4); EVERY `sqlite3.connect` in both scripts — `tier1-compare.py:149,249,262,277,643,651` — becomes
+  `fwhmPx`/`beta`, `--base-db <path>` (read the base side's rows from this DB instead of `<W_base>/athenaeum.db`
+  — the Horse C11 clone's checkpointed DB, step 4) and `--base-run-id N` (the base side's run, the twin of
+  `--run-id`; default the base DB's latest `done` run, as today — which on a clone holding the before AND the after
+  run is the AFTER run, so every line that reads a clone's DB as its base names the before run, ruling F19 as
+  folded); EVERY `sqlite3.connect` in both scripts — `tier1-compare.py:149,249,262,277,643,651` — becomes
   `sqlite3.connect(f"file:{path}?immutable=1", uri=True)` (ruling F19: a plain connect can write a before tree's
   `-wal`/`-shm`)), `harness/acceptance/clone-before.sh` (new: the recipe's steps (1)–(4) below; refuses a target
   under anything but `~/.athenaeum-acc/` and a source that is not one of the three before trees; the ONE script that
@@ -2973,7 +3198,8 @@ zsh clone-before.sh ~/.athenaeum-acc/hc11B-f1 ~/.athenaeum-acc/starA-hc11
 sqlite3 "file:$HOME/.athenaeum-acc/starA-hc11/athenaeum.db?immutable=1" "SELECT id,status,reference_frame_id FROM stacking_runs WHERE frames_set_id=182 ORDER BY id" > ~/.athenaeum-acc/starA-hc11/before.txt   # run 5 done, 69845
 ATH_ACC_RERUN_FROM=measure ATH_ACC_EXPECT_REFERENCE=69845 zsh hc11-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-hc11 8971     # expected ≈ 661 s minus Calibrate
 python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-hc11 --run-id 6 > ~/.athenaeum-acc/starA-hc11/extract.txt
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-hc11 ~/.athenaeum-acc/hc11B-f1 --set-id 182 --run-id 6 > ~/.athenaeum-acc/starA-hc11/compare.txt
+python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-hc11 ~/.athenaeum-acc/hc11B-f1 --set-id 182 --run-id 6 \
+  --base-db ~/.athenaeum-acc/starA-hc11/athenaeum.db --base-run-id 5 > ~/.athenaeum-acc/starA-hc11/compare.txt   # the clone holds run 5 (before) AND run 6 (after)
 python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-hc11 ~/.athenaeum-acc/hc11B-f1 >> ~/.athenaeum-acc/starA-hc11/compare.txt
 cp ~/.athenaeum-acc/starA-hc11/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/hc11/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - Horse C11 before/after rows" && rm -rf ~/.athenaeum-acc/starA-hc11
 zsh clone-before.sh ~/.athenaeum-acc/lnB-runB-f1 ~/.athenaeum-acc/starA-runB
@@ -2981,7 +3207,7 @@ sqlite3 "file:$HOME/.athenaeum-acc/starA-runB/athenaeum.db?immutable=1" "SELECT 
 ATH_ACC_RERUN_FROM=measure ATH_ACC_PROJECT_CONFIG=~/.athenaeum-acc/starA/runB.json \
   zsh tier1/project-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-runB 8961 af136ec9-1885-4087-b684-9136ad655e9b   # expected ≈ 811 s minus Prepare
 python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-runB --run-id 7 > ~/.athenaeum-acc/starA-runB/extract.txt
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-runB ~/.athenaeum-acc/lnB-runB-f1 --project-id af136ec9-1885-4087-b684-9136ad655e9b --run-id 7 > ~/.athenaeum-acc/starA-runB/compare.txt
+python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-runB ~/.athenaeum-acc/lnB-runB-f1 --project-id af136ec9-1885-4087-b684-9136ad655e9b --run-id 7 --base-run-id 6 > ~/.athenaeum-acc/starA-runB/compare.txt
 python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-runB ~/.athenaeum-acc/lnB-runB-f1 >> ~/.athenaeum-acc/starA-runB/compare.txt
 cp ~/.athenaeum-acc/starA-runB/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/runB/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - run B before/after rows" && rm -rf ~/.athenaeum-acc/starA-runB
 zsh clone-before.sh ~/.athenaeum-acc/tierA-lnB-f1 ~/.athenaeum-acc/starA-s204
@@ -2989,18 +3215,21 @@ sqlite3 "file:$HOME/.athenaeum-acc/starA-s204/athenaeum.db?immutable=1" "SELECT 
 ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json ATH_ACC_EXPECT_REFERENCE=28934 \
   zsh tier1/tier1-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-s204 8950 204        # expected wall ≈ 901 − 134 s (no Calibrate); Measure 3.62 → ≤ 4.34 min
 python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-s204 --run-id 6 > ~/.athenaeum-acc/starA-s204/extract.txt     # run 6: the DB also holds run 5
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 --run-id 6 > ~/.athenaeum-acc/starA-s204/compare.txt
+python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 --run-id 6 --base-run-id 5 > ~/.athenaeum-acc/starA-s204/compare.txt
 python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 >> ~/.athenaeum-acc/starA-s204/compare.txt
 cp ~/.athenaeum-acc/starA-s204/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/s204/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - set 204 before/after rows"   # the clone STAYS for Task 14
 ```
 
   The run ids (`6`, `7`, `6`) are the expected next ids after each clone's last run (Horse C11 run 5, run B run 6,
-  set 204 run 5); the operator reads the actual id from `run.txt` and uses that. The `--numeric` base side on each
-  line is the ORIGINAL before tree, opened `immutable=1` by the Task 13 edit of `tier1-compare.py` — for Horse C11 the
-  stale-WAL rows are therefore read from the CLONE's checkpointed DB instead (`tier1-compare.py --numeric` takes
-  `--base-db <path>`: the clone's `athenaeum.db`, while the base masters stay the original tree's `stackout`); the
-  other two trees carry checkpointed DBs (verified in step 2 by comparing the clone's run row with an `immutable=1`
-  read of the original: equal, or `--base-db` is used there too). Every master (both sides) is measured by
+  set 204 run 5); the operator reads the actual id from `run.txt` and uses that. The before run ids (`5`, `6`, `5`)
+  are passed as `--base-run-id` on every `--numeric` line, read from `before.txt` (ruling F19 as folded). The
+  `--numeric` base side on each line is the ORIGINAL before tree, opened `immutable=1` by the Task 13 edit of
+  `tier1-compare.py` — for Horse C11 the stale-WAL rows are therefore read from the CLONE's checkpointed DB instead
+  (`--base-db <path>`: the clone's `athenaeum.db`, while the base masters stay the original tree's `stackout`); that
+  DB holds run 5 AND the after run 6, so without `--base-run-id 5` the base side's default "latest done run" would be
+  run 6 and the line would compare the after run with itself. The other two trees carry checkpointed DBs (verified in
+  step 2 by comparing the clone's run row with an `immutable=1` read of the original: equal, or `--base-db` is used
+  there too, always with `--base-run-id`). Every master (both sides) is measured by
   `measure_probe` from THIS build (the new path) inside `tier1-compare.py` — that is "both masters are measured by
   the new path".
 
@@ -3124,7 +3353,7 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | Spec item | Task |
 | ---- | ---- |
 | §2.1 module units `domain`, `fit`, `frame`, `robust` move; sample statistics (`SkyLevel`, ruling F4) | 2 |
-| §2.1 `seeds` (matched filter, default seed source, field width PA-17) | 6a, 7 |
+| §2.1 `seeds` (matched filter, default seed source, field width PA-17 with no saturation test F25) | 6a, 7 |
 | §2.1 `beta` | 9 (discrete moved in 2) |
 | §2.1 `photometry` (saturation test, annulus σ, flux, SNR, HFR) | 8, 10, 11 |
 | §2.1 `budget` | 12 |
@@ -3138,7 +3367,7 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | §2.2 `psf_model` Auto = continuous β, Moffat4 kept, `STACKING_CONFIG_VERSION` unchanged | 9, 7 |
 | §2.2 Analysis/Blink, not touched (plate-solve detector, rustafits analysis), the lab's two modes + `legacy-analysis` | 1b (the alias, F2), 12 (the arm), Plan C (the switch) |
 | §3 doctrine, F-0 | 4 |
-| §3 F-1 (region, cap, rim background, width start, seeds, new families, donut) | 1a (families, PA-9), 6a, 6b |
+| §3 F-1 (region, cap, rim background, width start, seeds, new families, donut and its ring-radius floor) | 1a (families, PA-9), 6a, 6b |
 | §3 F-2 (axes, conditioning, conditional convergence change as a new entry point F7) | 5 |
 | §3 F-3 (unsaturated sample/statistic, twin bars, re-judged after F-4) | 8, 9 |
 | §3 F-4 (continuous β, rustafits bound and ln β, Gaussian limit, every β a finite number, the linear arm kept F8) | 9 |
@@ -3148,7 +3377,7 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | §3 F-8, F-9 | Plan B (the LN rows are printed, PA-14) |
 | §3 raw-mode truth (injections: completeness, FWHM) | 6b, 9 |
 | §3 the budget (≥ 90 % of cells), the `NotSelected`/`Trimmed` identity F13 | 12 |
-| §3 no regressions (SE rule, mechanical, step and cumulative F21, design-list semantics F20) | 1c (tool), every fix task, 14 |
+| §3 no regressions (SE rule incl. per-axis, mechanical, step and cumulative F21, design-list semantics F20, `betas@*`, row-2 keys F10) | 1c (tool), every fix task, 14 |
 | §3 cost (Measure ≤ +20 %, Analysis ≤ 0.6 s incl. on-demand) | 12, 13 |
 | §3 out of scope (VNG, resampling) | 14 §7 (restated) |
 | §4.4 `MEASURE_VERSION` in the three stage hashes, the pinned tests, the bump policy | 3 |
