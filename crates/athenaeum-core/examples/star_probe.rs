@@ -7,6 +7,7 @@
 //!   star_probe measure <image.fits> --out <file.jsonl> [--config <json>]
 //!       [--plane all|N] [--debayer RGGB|BGGR|GRBG|GBRG] [--rect x,y,w,h]
 //!       [--paths measure,betas,register,analysis]   (default: measure,betas,register) [--betas 2.5,4,6,10]
+//!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -52,9 +53,43 @@ fn read_planes(path: &Path) -> (Vec<Vec<f32>>, usize, usize) {
     (planes, r.width(), r.height())
 }
 
-/// P-4: the harness rule — a plane above 1.5 is in the ADU domain.
-fn normalise(planes: &mut [Vec<f32>]) -> &'static str {
-    let adu = planes.iter().flatten().any(|v| v.is_finite() && *v > 1.5);
+/// P-28: the input's domain, declared by the caller. `Auto` is the P-4 rule; `Unit`
+/// never divides (a calibrated frame exceeds 1.5 legitimately where flat division
+/// lifts a saturated core); `Adu` always divides by 65535.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Domain {
+    Auto,
+    Unit,
+    Adu,
+}
+
+impl Domain {
+    fn parse(s: &str) -> Domain {
+        match s {
+            "auto" => Domain::Auto,
+            "unit" => Domain::Unit,
+            "adu" => Domain::Adu,
+            o => die(format!("--domain auto|unit|adu, not {o}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Domain::Auto => "auto",
+            Domain::Unit => "unit",
+            Domain::Adu => "adu",
+        }
+    }
+}
+
+/// P-4: the harness rule — a plane above 1.5 is in the ADU domain (`Domain::Auto`);
+/// P-28: `Unit` and `Adu` replace the guess with the caller's declaration.
+fn normalise(planes: &mut [Vec<f32>], domain: Domain) -> &'static str {
+    let adu = match domain {
+        Domain::Auto => planes.iter().flatten().any(|v| v.is_finite() && *v > 1.5),
+        Domain::Unit => false,
+        Domain::Adu => true,
+    };
     if adu {
         planes.iter_mut().flatten().for_each(|v| *v /= ADU_SCALE);
         "adu/65535"
@@ -120,6 +155,7 @@ struct MeasureArgs {
     rect: Option<(usize, usize, usize, usize)>,
     paths: Vec<String>,
     betas: Vec<f64>,
+    domain: Domain,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -133,6 +169,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         rect: None,
         paths: vec!["measure".into(), "betas".into(), "register".into()],
         betas: vec![2.5, 4.0, 6.0, 10.0],
+        domain: Domain::Auto,
     };
     while let Some(k) = it.next() {
         let mut v = || {
@@ -162,6 +199,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
                 a.rect = Some((p[0], p[1], p[2], p[3]));
             }
             "--paths" => a.paths = v().split(',').map(String::from).collect(),
+            "--domain" => a.domain = Domain::parse(&v()),
             "--betas" => {
                 a.betas = v()
                     .split(',')
@@ -234,7 +272,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             ))
         }
     }
-    let conversion = normalise(&mut planes);
+    let conversion = normalise(&mut planes, a.domain);
+    let domain = a.domain.as_str();
     if let Some(p) = &a.debayer {
         if planes.len() != 1 {
             die("--debayer needs a one-plane mosaic")
@@ -292,7 +331,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "statistic": "residual-weighted mean over all accepted fits",
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
                         "channel": pm.channel, "options": options, "conversion": conversion,
-                        "nonFinite": non_finite, "wallMs": wall}),
+                        "domain": domain, "nonFinite": non_finite, "wallMs": wall}),
             );
         }
         if want("betas") {
@@ -308,7 +347,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                     json!({"kind": "frame", "path": "betas", "plane": p, "beta": b, "seeds": seeds.len(),
                             "fits": o.fits.len(), "statistic": "residual-weighted mean over all accepted fits",
                             "frameFwhm": ff, "frameEcc": fe, "options": options, "conversion": conversion,
-                            "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
+                            "domain": domain, "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );
             }
         }
@@ -350,7 +389,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         emit(
             json!({"kind": "frame", "path": "register", "plane": selected[0], "beta": null, "seeds": null,
                     "fits": stars.len(), "statistic": how, "frameFwhm": null, "frameEcc": null,
-                    "options": options, "conversion": conversion, "nonFinite": non_finite,
+                    "options": options, "conversion": conversion, "domain": domain, "nonFinite": non_finite,
                     "wallMs": t.elapsed().as_millis() as u64}),
         );
     }
@@ -375,7 +414,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                             "fits": stars.len(), "statistic": "clipped weighted median over e <= 0.8",
                             "frameFwhm": fa.median_fwhm, "frameEcc": fa.median_eccentricity,
                             "frame": fa, "flipVertical": flip,
-                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "none",
+                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "none", "domain": domain,
                             "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );
             }
@@ -402,7 +441,7 @@ fn cmd_debayer(mut it: impl Iterator<Item = String>) {
         }
     }
     let (mut planes, w, h) = read_planes(&input);
-    normalise(&mut planes);
+    normalise(&mut planes, Domain::Auto);
     if planes.len() != 1 {
         die("debayer needs a one-plane mosaic")
     }
@@ -565,6 +604,7 @@ mod tests {
             rect: None,
             paths: paths.iter().map(|p| p.to_string()).collect(),
             betas: vec![4.0],
+            domain: Domain::Auto,
         }
     }
 
@@ -606,6 +646,56 @@ mod tests {
                 "no star line for {path}"
             );
         }
+    }
+
+    #[test]
+    fn domain_auto_is_the_p4_rule_on_both_sides_of_1_5() {
+        let mut p = vec![vec![0.2f32, 1.5]];
+        assert_eq!(normalise(&mut p, Domain::Auto), "none");
+        assert_eq!(p[0], vec![0.2f32, 1.5]);
+        let mut p = vec![vec![0.2f32, 1.5001]];
+        assert_eq!(normalise(&mut p, Domain::Auto), "adu/65535");
+        assert_eq!(p[0], vec![0.2f32 / ADU_SCALE, 1.5001f32 / ADU_SCALE]);
+    }
+
+    #[test]
+    fn domain_unit_keeps_a_calibrated_plane_above_1_5() {
+        let mut p = vec![vec![0.05f32, 1.645], vec![0.04f32, 0.9]];
+        assert_eq!(normalise(&mut p, Domain::Unit), "none");
+        assert_eq!(p, vec![vec![0.05f32, 1.645], vec![0.04f32, 0.9]]);
+    }
+
+    #[test]
+    fn domain_adu_always_divides() {
+        let mut p = vec![vec![0.5f32, 1.0]];
+        assert_eq!(normalise(&mut p, Domain::Adu), "adu/65535");
+        assert_eq!(p[0], vec![0.5f32 / ADU_SCALE, 1.0f32 / ADU_SCALE]);
+    }
+
+    #[test]
+    fn domain_parses_and_the_frame_lines_record_it() {
+        assert_eq!(Domain::parse("auto"), Domain::Auto);
+        assert_eq!(Domain::parse("unit"), Domain::Unit);
+        assert_eq!(Domain::parse("adu"), Domain::Adu);
+        let d = tempfile::tempdir().unwrap();
+        // a unit-domain field with one pixel at 1.645 (a flat-lifted saturated core)
+        let mut data = gaussian_field(240, 240, 0, true);
+        data[5 * 240 + 5] = 1.645;
+        let img = d.path().join("u.fits");
+        write_fits_f32(&img, 240, 240, 1, &data, &[]).unwrap();
+        let out = d.path().join("u.jsonl");
+        let mut a = args(img, out.clone(), &["measure", "betas", "register"]);
+        a.domain = Domain::Unit;
+        cmd_measure(a).unwrap();
+        let lines = read_lines(&out);
+        let frames: Vec<&Value> = lines.iter().filter(|v| v["kind"] == "frame").collect();
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!(f["domain"], "unit", "{f}");
+            assert_eq!(f["conversion"], "none", "{f}");
+        }
+        let m = frames.iter().find(|f| f["path"] == "measure").unwrap();
+        assert!(m["fits"].as_u64().unwrap() > 0, "{m}");
     }
 
     #[test]
