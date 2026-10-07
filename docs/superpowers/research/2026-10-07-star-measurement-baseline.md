@@ -181,7 +181,8 @@ The full scorecards live outside the repository, gzipped, with their sha256 in t
 - The probe-gap row "converted ... as ADU" is absent from both (P-28).
 - **The FWHM bound per truth column.** The CRLB bounds the pre-pixel width F. The `pixbox` and `pointfit` columns
   carry it through their own Jacobian, σ_g = (F / g)·σ_F (`scorecard._width_stats`), so their efficiency is the
-  scatter over that column's own floor.
+  scatter over that column's own floor. The Jacobian is the first-order Gaussian-quadrature form, an approximation
+  for Moffat profiles.
 - **OSC.** The Fisher SNR (the SNR bins) and the CRLB of an OSC row are the full-resolution channel's. The mosaic holds
   1/4 (R, B) or 1/2 (G) of those pixels, so a VNG-plane efficiency is conservative.
 - The per-row lists of families beyond 2 × their own scatter, or worse than the ERP, are in
@@ -819,7 +820,7 @@ The real groups reach the synthetic width ratios:
   - the synthetic `pairs/main/m4w10` targets: 0.0618 (t45) and 0.0707 (t60); the isolated `truthcheck`: 0.0016–0.0024
     (*derived* from their probe lines, not committed).
 
-  By that measure the real members' annuli are at least as contaminated as the synthetic grid's. Real annuli also
+  By that measure the real mono members' annuli are at least as contaminated as the synthetic grid's. Real annuli also
   hold nebulosity and other structure, so the two are comparable, not identical.
 
 At those conditions the referees disagree:
@@ -1013,7 +1014,8 @@ before any fix is measured.
      - the high-ratio members read low (*derived* −1.076 % and −1.836 %). All 20 carry the soft bar, 17 of 20 lie
        beyond the validated 3–5 px range, and run B's −1.836 % lies outside ±1.38 % (*derived* from
        `ln-real-members.csv`).
-   - `psfSel` disagrees the other way: synthetic slopes `-0.0416` to `+0.0454 %/px^2` and `+0.60 %` on t60; real
+   - `psfSel` disagrees the other way: synthetic slopes on the Moffat and Gaussian `pairs` families `-0.0416` to
+     `+0.0454 %/px^2` and `+0.60 %` on t60; real
      median gaps `-6.009 %` and `-7.467 %`, slopes `-0.6047` and `-0.6152 %/px2 of FWHM2`.
    - The disagreement is referee-wide: the lab's field realism against the harness truth on real frames. Part 2's
      first numeric task, after `FitDiagnostics`, tests that referee pair. No F1 change, and no decision to keep the
