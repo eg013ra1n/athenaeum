@@ -4,8 +4,8 @@ Status: draft for the owner's review, 2026-10-07; revised after the independent 
 Important 12, Minor 14 — all folded in). Program: star measurement (part 1 was the truth lab; this spec replaces
 the former parts 2 and 3). Baseline: `docs/superpowers/research/2026-10-07-star-measurement-baseline.md` (lab
 athenaeum-lab e65af49, probes from f5321979); the path comparison below is
-`star-lab/results/baseline-2026-10-07/path-compare.txt` (lab 8b58a90, computed from the committed summary and
-the existing probe outputs).
+`star-lab/results/baseline-2026-10-07/path-compare.txt` (lab 5fc780c, computed from the committed summary and
+the existing probe outputs). A second independent re-review (N-1…N-9) is folded in as well.
 
 ## 1. Goal and owner decisions
 
@@ -28,16 +28,18 @@ metric, measure vs analysis):
 | Metric | Rows | Measure | Analysis | Measure nearer the ideal |
 | ---- | ---- | ---- | ---- | ---- |
 | per-star FWHM abs(bias) vs pointfit | 137 | 0.1 % | 0.69 % | 108 of 137 |
-| per-star FWHM scatter | 137 | 0.56 % | 0.87 % | 79 of 137 |
+| per-star FWHM scatter (each path's own star sample) | 137 | 0.56 % | 0.87 % | 79 of 137 |
+| per-star FWHM efficiency vs its own CRLB (1 = ideal) | 136 | 1.165 | 1.245 | 80 of 136 |
 | frame FWHM abs(error) vs pointfit median | 137 | 0.5417 % | 0.6388 % | 77 of 137 |
 | frame ecc abs(error), all rows (round rows read the floor) | 137 | 0.0838 | 0.0955 | 90 of 137 |
 | frame ecc abs(error), elongated truth only | 27 | 0.0032 | 0.0015 | 9 of 27 |
-| completeness, % of expected | 121 | 99.7 | 33.3 | 121 of 121 |
-| bright coverage, % | 121 | 99.3 | 38.3 | 118 of 121 |
+| completeness, raw % of all truth stars (one denominator) | 137 | 64.5 | 29.1 | 137 of 137 |
+| bright coverage, % (saturated stars counted) | 121 | 99.3 | 38.3 | 118 of 121 |
 | angle rms | 26 | 26.35° | 17.63° | 5 of 26 |
 
-The analysis path is better on two rows (frame ecc of elongated frames, angle); both are defects of the measure path
-this spec fixes (F-2). Cost (`probe-runs-2026-10-07/batches.txt`, m42, 77 frames): measure 223.1 s, analysis 25.2 s
+Seventeen of the 137 rows are resampled replicas of five fields (correlated, not duplicated). The analysis path is
+better on two rows (frame ecc of elongated frames, angle); both are defects of the measure path this spec fixes
+(F-2). Cost (`probe-runs-2026-10-07/batches.txt`, m42, 77 frames): measure 223.1 s, analysis 25.2 s
 — about 2.9 s vs 0.33 s per frame (derived); at 5417 fits per frame the measure path spends about 0.53 ms per star
 (derived). The analysis path is faster per frame only through its 500-star cap.
 
@@ -54,7 +56,7 @@ moves or leaves: `stacking::robust` (`rcr`, `winsorize`, used by TMeanFlux) move
 | Unit | Responsibility |
 | ---- | ---- |
 | `domain` | input planes: calibrated float (unit domain) or raw ADU, CFA layout; the plane's noise (MRS) and background model |
-| `seeds` | star detection: a matched filter at the field width, threshold in units of the filtered plane's measured noise (selection by integrated signal) |
+| `seeds` | star detection: a matched filter at the field width, threshold in units of the filtered plane's measured noise (selection by integrated signal); the default seed source of both consumers |
 | `fit` | per-star region, background start, width start, the Moffat fit (rustafits `fit_moffat_2d` / `fit_moffat_2d_fixed_beta` as library functions), canonical axes, acceptance, the per-star outcome |
 | `beta` | the per-frame β (§3 F-4) on unsaturated stars |
 | `photometry` | the profile-independent star flux (F-5), the saturation test, the per-star SNR (F-6) |
@@ -66,17 +68,20 @@ Public surface: `measure_plane(plane, opts) -> PlaneMeasurement` (stars, frame a
 counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, opts)`. The module exports
 `MEASURE_VERSION` (§4.4).
 
-**The saturation test (one definition per domain, used by every module caller):**
-- raw ADU: the star's peak pixel ≥ `saturation_fraction` × the sensor clip (from BITPIX/BZERO, or DATAMAX when
-  present);
-- calibrated float: the relative rule today's LN uses (L-14: the largest pixel within max(2, FWHM) px of the star
-  above 0.75 × the hot-pixel-corrected plane maximum), because a calibrated plane's clip level varies per pixel
-  ("saturated cores above 1.0 are legal", `docs/stacking/README.md`). The lab's `twins` and `saturated` families are
-  unit-domain and are judged with this rule.
+**The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike):**
+- where the clip is known (raw ADU: from BITPIX/BZERO, or DATAMAX when present), the star's peak pixel ≥
+  `saturation_fraction` × the clip;
+- in every domain, a flat-top test on the star's own core: the core is flatter than the star's own fitted profile by
+  more than the local noise (the profile fitted on the wings overshoots the observed maximum, and several core pixels
+  sit within the noise of that maximum). A calibrated plane's clip level varies per pixel after the flat division
+  ("saturated cores above 1.0 are legal", `docs/stacking/README.md`), so no plane-relative threshold is used here.
+- Bars that say "unsaturated" mean the truth's `saturated` flag (the star reaches the generator's clip,
+  `families.py`); one self-consistency row checks the module's flag against it: false positives ≤ 1 % of the
+  truth-unsaturated stars, false negatives 0.
 
-**Exemptions (unchanged consumers of the numbers, not callers of the module's tests):** LN keeps its L-14 / L-23
-reference-frames mask and its peak-SNR cut on warped planes (`ln/selection.rs:129-157`; L-14 calls the module's
-function, L-23 and the peak-SNR cut stay LN's); registration keeps `passes_register_cuts` (0.95 × 65535 and
+**Exemptions (unchanged consumers of the numbers, not callers of the module's tests):** LN keeps its L-14 relative
+rule, its L-23 reference-frames mask and its peak-SNR cut on warped planes, where a core is interpolated
+(`ln/selection.rs:129-157`); registration keeps `passes_register_cuts` (0.95 × 65535 and
 1/residual ≥ 10, `register/detect.rs:182-195`). Routing them through the module is a later question, not this spec.
 
 ### 2.2 Consumers
@@ -90,10 +95,13 @@ function, L-23 and the peak-SNR cut stay LN's); registration keeps `passes_regis
   unsaturated subset (F-3) and `ChannelMeasurement` gains `stars_refused` with per-reason counts.
 - **The stacking Measure config** (`MeasurementConfig`, presets, `MeasurePanel.tsx`, the TS types, the measurement
   stage hash), changed together:
-  - `detection_sigma` (a peak threshold, default 20) is retired for a new `#[serde(default)]` field in the matched
-    filter's units; whole-config precedence means a stored 20 is never reinterpreted;
-  - `seed_prefilter` (None / Median3) and `seed_detector` (Peak / Structure) stay as adapter-side seed sources that
-    feed `fit_stars_at`; ruling R-M4c-11 in `docs/stacking/README.md` is updated;
+  - the seed source becomes one field, `seed_source`, whose default is the module's matched filter (F-1's seed
+    fixes reach every set that never chose otherwise); Peak (with its own `detection_sigma`, a peak threshold),
+    Median3 and Structure stay explicit choices that feed `fit_stars_at` from the adapter;
+  - a stored per-set document is read so that an explicit non-default choice survives (Structure, or the Median3
+    prefilter, or a `detection_sigma` other than 20) and the old default (Peak, σ 20, no prefilter) becomes the
+    matched filter — whole-config precedence is kept, a stored value is never reinterpreted in other units; ruling
+    R-M4c-11 in `docs/stacking/README.md` is updated;
   - `psf_model`: `Auto` becomes the continuous per-frame β (F-4), `Moffat4` stays a fixed choice;
   - `STACKING_CONFIG_VERSION` is unchanged (new fields are serde defaults).
 - **Analysis and Blink.** `analysis/analyzer.rs` (`map_result` is today's single writer of `FrameAnalysis` and
@@ -114,9 +122,9 @@ its numbers; a bar is never moved, a row never re-sized, a generator never tuned
 | ---- | ---- | ---- | ---- |
 | F-0 | No refusal reasons (`sharp/m4/f8.0`: 82.7 % fitted of 92.0 % seeded) | `FitDiagnostics` per seed; `stars_refused` + per-reason counts in `ChannelMeasurement` and `FrameAnalysis` (§4.2); the `.athf` flags byte carries per-accepted-fit flags (saturated, β at its cap), the file holds accepted fits only | accepted + refused-by-reason = seeds on every image; numbers unchanged against the extraction step |
 | F-1 | Broad / defocused stars collapse (M51 Hα 6.53 px vs analysis 13.39, ERP 14.02; m82 11.43 vs 16.31 / 17.76; `_DSC5767` zero seeds) | region growth judged on (median − sky), not the absolute median; the region cap scales with the star's own width start (≥ 6 FWHM, cap 96 px; today `min(2·nominal, 48)`); background start from the region's rim, not the plain median of a star-filled square; width start from the star's own moments, not one field σ0; matched-filter seeds (§2.1); new lab families FWHM 12 and 16 px and defocused annular ("donut") stars, isolated (`min_sep` ≥ 6 FWHM) | fitted / seeded at FWHM 8: 82.7 % → ≥ 99 %; frame FWHM error vs `pointfit` ≤ 1 % at every FWHM up to 16 px; a donut star is refused with its reason, never reported as a narrow fit |
-| F-2 | Angle: measure rms 44.564° / 32.339° on `shape/f2.6/e0.3|e0.5/t30` vs ERP 7.849° / 2.129° (summary row 4); 79–158 of 376–458 fits per `e0.3` family have fwhm_x < fwhm_y (θ on the minor axis; `path-compare.txt` part 2) | canonical axes (fwhm_x ≥ fwhm_y, θ on the major axis); the fitter sees stamp-centred coordinates and amplitude-normalised values so its relative convergence test acts on O(1) parameters (a rustafits change only if the lab shows it is needed) | structural: every accepted fit has fwhm_x ≥ fwhm_y and θ on fwhm_x's axis, pinned by a test; the row-4 angle `eff` cell (prepixel CRLB) ≤ 1.5 on the `shape` families with e ≥ 0.3 |
-| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample, the width start and the frame statistic use unsaturated stars only (§2.1's test) | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative |
-| F-4 | Model-dependent width (Gaussian / blur pointfit −2.07…−3.04 %; β alone 9.60 %; `mixture/b` +4.88 %) | β becomes continuous per frame: the free-β Moffat fit (`fit_moffat_2d`) on the unsaturated bright sample gives the frame's β (median), clamped to [1.5, 30]; every star is then fitted at it. The Gaussian is the large-β limit; there is no separate Gaussian model, so β stays a finite number everywhere (`.athf` f32, `metrics` JSON, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`, `star_metrics.beta`, `median_beta`; `fit_method` is `moffat`; `FITS_ARTIFACT_VERSION` unchanged) | frame FWHM error vs `pointfit` ≤ 1 % at FWHM ≥ 2 px, ≤ 3 % below, on every family whose stars share one profile (`gauss`, `m*`, `blur*`, `mix*`: the lab's pointfit truth there is a free-β fit, `families.py:113-134`) |
+| F-2 | Angle: measure rms 44.564° / 32.339° on `shape/f2.6/e0.3|e0.5/t30` vs ERP 7.849° / 2.129° (summary row 4); 71–145 of 346–427 unsaturated fits per `e0.3` family have fwhm_x < fwhm_y (θ on the minor axis; `path-compare.txt` part 2) | canonical axes (fwhm_x ≥ fwhm_y, θ on the major axis); the fitter sees stamp-centred coordinates and amplitude-normalised values so its relative convergence test acts on O(1) parameters (the convergence test itself changes in rustafits only if the lab shows it is needed) | structural: every accepted fit has fwhm_x ≥ fwhm_y and θ on fwhm_x's axis, pinned by a test; the row-4 angle `eff` cell (prepixel CRLB) ≤ 1.5 on the `shape` families with e ≥ 0.3 |
+| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample, the width start and the frame statistic use unsaturated stars only (§2.1's test) | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
+| F-4 | Model-dependent width (Gaussian / blur pointfit −2.07…−3.04 %; β alone 9.60 %; `mixture/b` +4.88 %) | β becomes continuous per frame: a free-β Moffat fit on the unsaturated bright sample gives the frame's β (median), clamped to [1.5, 100]; every star is then fitted at it. A named rustafits change: `fit_moffat_2d` refuses β > 20 today (`rf/analysis/fitting.rs:545-551`), so its bound is lifted to the cap and the sample fit runs in a conditioned parametrization (ln β), because the Gaussian limit is a flat ridge in (α, β). At β 100 a Gaussian star reads −0.32 % (β 30: −1.04 %; spec re-review N-1). The Gaussian is the large-β limit; there is no separate Gaussian model, so β stays a finite number everywhere (`.athf` f32, `metrics` JSON, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`, `star_metrics.beta`, `median_beta`; `fit_method` is `moffat`; `FITS_ARTIFACT_VERSION` unchanged) | frame FWHM error vs `pointfit` ≤ 1 % at FWHM ≥ 2 px, ≤ 3 % below, on every family whose stars share one profile (`gauss`, `m*`, `blur*`, `mix*`: the lab's pointfit truth there is a free-β fit, `families.py:113-134`) |
 | F-5 | Captured fraction depends on the profile (spread 18.73 % at F 2.6, 22.16 % at F 8.0) → PSFSW / PSFSNR / psfSel | star flux = fitted-model flux in the FWTM ellipse × a per-frame aperture correction from the growth curve (to 5F) of bright unsaturated isolated stars; psfSel reads this flux | spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel: `pairs/iso/blur25mix` t60 −13.03 % and `pairs/iso/blur4` t60 −7.28 % → within ±2 %, the Moffat and Gaussian pairs stay within ±1.2 % |
 | F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | one definition: S / σ_S in an aperture of radius max(1.5·FWHM, 3 px), σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky), σ_sky measured in the annulus; g from EGAIN (raw ADU) or EGAIN with the calibrated-frame cards (`ATH_CSCL`, `ATH_CFNM`); unknown gain → the shot term is omitted and the record says so. Lab: the generator writes EGAIN (and `ATH_CSCL` on unit-domain planes) from its own gain; the truth SNR is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky | median bias vs the truth SNR ≤ 3 % on the unsaturated isolated families (`sharp/*`, `background/*`) |
 | F-7 | Fit background under nebulosity +0.998σ (`background/neb3_4096`) | F-1's rim background | ≤ 0.3σ under nebulosity; within ±0.1σ on flat fields |
@@ -178,7 +186,8 @@ All NOT NULL columns of `frame_analysis` and the `star_metrics` row (`db/schema.
 - **Stored thresholds the switch invalidates** (named in the release note): `analysis.rejection_defaults` (fwhm,
   ecc, frameSnr, snrWeight); each frame set's stacking selection `max_fwhm_px` / `max_eccentricity`; collab project
   rules on `fwhm_arcsec`, `eccentricity`, `median_snr`, `snr_weight`, `frame_snr` (mirrored in the hub's
-  `collab_rules.rs`). The round-star ecc floor alone moves from 0.27 to 0.12 at F 2.6 (report row 4).
+  `collab_rules.rs`). The round-star ecc floor moves from 0.27 to 0.12 at F 2.6 (report row 4) — an F 2.6 figure; pooled over the 111
+  round rows the two floors are equal (0.1187 vs 0.1144), and the release note does not generalize it.
 
 ### 4.3 Trails and the plate-solve gate
 
@@ -233,8 +242,9 @@ clean; push only on the owner's word).
    artifact's f32 narrowing (`probe_parity`) and every scorecard summary cell equals the baseline's.
 3. `FitDiagnostics` and `stars_refused` (F-0). Numbers unchanged.
 4. One fix per step, each judged on its own bar plus the no-regression table: F-2 (axes, convergence) → F-1 with F-7
-   (region, background, width start, seeds) → F-3 (saturation) → F-4 (continuous β) → F-5 (flux, psfSel) → F-6
-   (SNR). The stacking Measure config changes (§2.2) land with F-1 and F-4.
+   (region, background, width start, seeds) → F-3 (the saturation test and its self-consistency row) → F-4
+   (continuous β, with the rustafits free-β bound and parametrization) → F-5 (flux, psfSel) → F-6 (SNR); the F-3
+   twin rows are judged again after F-4. The stacking Measure config changes (§2.2) land with F-1 and F-4.
 5. **Real-data checkpoint** under the owner's rule (a numeric change is judged on the whole group at master level),
    with the athenaeum-lab acceptance harness (`harness/acceptance/`, reused): set 204 mono and OSC, run B, Horse C11
    stacked before and after, with the reference frame pinned (`ReferenceMode::Manual`, the before run's pick) so a
