@@ -71,13 +71,17 @@ counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, op
 **The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike):**
 - where the clip is known (raw ADU: from BITPIX/BZERO, or DATAMAX when present), the star's peak pixel ≥
   `saturation_fraction` × the clip;
-- in every domain, a flat-top test on the star's own core: the core is flatter than the star's own fitted profile by
-  more than the local noise (the profile fitted on the wings overshoots the observed maximum, and several core pixels
-  sit within the noise of that maximum). A calibrated plane's clip level varies per pixel after the flat division
+- in every domain, a flat-top test on the star's own core: the core is flatter than the star's own profile by more
+  than the local noise — the profile is a free-β fit on the star's non-core pixels (not a fit at the frame's β, which
+  this flag helps choose), it overshoots the observed maximum, and several core pixels sit within the noise of that
+  maximum. A calibrated plane's clip level varies per pixel after the flat division
   ("saturated cores above 1.0 are legal", `docs/stacking/README.md`), so no plane-relative threshold is used here.
 - Bars that say "unsaturated" mean the truth's `saturated` flag (the star reaches the generator's clip,
   `families.py`); one self-consistency row checks the module's flag against it: false positives ≤ 1 % of the
-  truth-unsaturated stars, false negatives 0.
+  truth-unsaturated stars; false negatives 0 among the stars with at least 3 clipped core pixels in the noisy image.
+  The truth flag also marks stars a neighbour clips and stars that barely reach the clip (in the v2 i0 truth: 81 of
+  4105 saturated only through a neighbour, 25 within 2 % of the clip); no core test sees those, and they are
+  reported as counts, not judged.
 
 **Exemptions (unchanged consumers of the numbers, not callers of the module's tests):** LN keeps its L-14 relative
 rule, its L-23 reference-frames mask and its peak-SNR cut on warped planes, where a core is interpolated
@@ -98,10 +102,12 @@ rule, its L-23 reference-frames mask and its peak-SNR cut on warped planes, wher
   - the seed source becomes one field, `seed_source`, whose default is the module's matched filter (F-1's seed
     fixes reach every set that never chose otherwise); Peak (with its own `detection_sigma`, a peak threshold),
     Median3 and Structure stay explicit choices that feed `fit_stars_at` from the adapter;
-  - a stored per-set document is read so that an explicit non-default choice survives (Structure, or the Median3
-    prefilter, or a `detection_sigma` other than 20) and the old default (Peak, σ 20, no prefilter) becomes the
-    matched filter — whole-config precedence is kept, a stored value is never reinterpreted in other units; ruling
-    R-M4c-11 in `docs/stacking/README.md` is updated;
+  - every stored stacking document — a set's own config, the stored global config `resolve_config` falls back to,
+    and the user presets — is read so that an explicit non-default choice survives (Structure; Peak with the Median3
+    prefilter or a `detection_sigma` other than 20) and the old default (Peak, σ 20, no prefilter) becomes the
+    matched filter. Median3 is Peak's prefilter only, so a stored (Structure, Median3) becomes Structure.
+    Whole-config precedence is kept, and a stored value is never reinterpreted in other units; ruling R-M4c-11 in
+    `docs/stacking/README.md` is updated;
   - `psf_model`: `Auto` becomes the continuous per-frame β (F-4), `Moffat4` stays a fixed choice;
   - `STACKING_CONFIG_VERSION` is unchanged (new fields are serde defaults).
 - **Analysis and Blink.** `analysis/analyzer.rs` (`map_result` is today's single writer of `FrameAnalysis` and
@@ -220,8 +226,11 @@ All NOT NULL columns of `frame_analysis` and the `star_metrics` row (`db/schema.
 
 ### 4.5 Settings → Analysis
 
-- Kept: the star budget (`maxStars`, default 500; `measureCap` folds into it), the detection threshold, the
-  saturation fraction, the trail threshold, batch concurrency, and the frontend rejection defaults.
+- Kept: the star budget (`maxStars`, default 500; `measureCap` folds into it), the saturation fraction, the trail
+  threshold, batch concurrency, and the frontend rejection defaults.
+- The detection threshold becomes a new field in the matched filter's units (its default set from the lab); the
+  stored `detectionSigma` measured the retired detector's peak threshold and is ignored (named in the release
+  note).
 - Removed: `fitMaxIter`, `fitTolerance`, `fitMaxRejects`, `mrsLayers`, `minStarArea`, `maxStarArea`. The
   `analysis.psf` section is removed with them (`src/settings/registry.ts`, `docs/settings/README.md`). A stored
   document with those keys still decodes (serde ignores them). The TS types (`ts_export.rs`) and
