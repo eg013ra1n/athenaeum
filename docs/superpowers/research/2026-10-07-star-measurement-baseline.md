@@ -10,10 +10,12 @@ How to read the numbers:
 - **Where each number lives.** Every number in sections 1, 3 and 7 is in a committed athenaeum-lab file under
   `star-lab/results/`:
   - `baseline-2026-10-07/scorecard-summary.md` and `scorecard-inject-summary.md`;
-  - `baseline-2026-10-07/gates.txt`, `divergent-families.txt` and `erp-ln-estimates.txt`;
+  - `baseline-2026-10-07/gates.txt`, `divergent-families.txt`, `erp-ln-estimates.txt` and `twin-saturation.txt`;
   - the `probe-runs-2026-10-07/` tables.
 
   The full scorecards are kept gzipped outside the repository, with their sha256 in the summaries.
+- **Slopes.** Every LN slope, synthetic or real, is in %/px² of the FWHM² difference
+  (F_target² − F_reference²), the scorecard's basis. The real-data tables print it as `%/px2 of FWHM2`.
 - **The ERP.** "The ERP" is the external reference pipeline, run on the same inputs. It is a comparison column,
   never a referee (spec S-9).
 - **Referees.** The synthetic truth is the referee everywhere. On real frames the injected stars are the referee;
@@ -39,13 +41,15 @@ Five defects stand out, largest first.
      (`pairs/main/m4w10`) on all 19 `pairs` families.
    - The PSF-signal arm with the selection (`psfSel`) reads `s 1.1067 vs s_true 1.1: +0.60 %` on that same target,
      and the ERP reads `s 1.1616 (+5.60 %)`.
-   - The ERP's number on t60 rests on `63 valid PSF fits, 16 PSF signal estimates`. Its t45 number rests on `208
-     valid PSF fits, 145 PSF signal estimates` (`erp-ln-estimates.txt`).
+   - The ERP's number on t60 rests on `63 valid PSF fits, 16 PSF signal estimates`. On t45 the ERP reads `s 0.9834
+     (+3.52 %)`, on `208 valid PSF fits, 145 PSF signal estimates` (`erp-ln-estimates.txt`).
    - On the isolated `truthcheck` field F1's slope is `+0.0040 %/px^2`; on `density_pairs/d600` t3 it reads `+4.40
      %`. The defect grows with the width ratio and with crowding: neighbours inside F1's `[6F, 8F]` sky annulus
      (section 4.2).
-   - **Open.** On real data, against the harness truth, F1 shows no such over-read at comparable width ratios
-     (section 4.2). The two referees disagree on F1, and part 1 does not resolve it.
+   - **Open.** On real data, against the harness truth, F1 shows no such over-read at comparable width ratios:
+     slopes `-0.0193` and `-0.0128 %/px2 of FWHM2` on the two mono groups (section 4.2). The PSF-signal arm
+     disagrees the other way (synthetic near 0, real `-6.009 %` and `-7.467 %`). The disagreement is between the
+     referees, the lab's fields against the harness truth on real frames; part 1 does not resolve it.
    - It harms the LN normalisation of every member, so the master's photometry and its rejection.
 2. **The captured fraction `signal / flux_img` (measure path) depends on the profile.**
    - At F 2.6: `sharp/gauss` reads `median 0.9078 · scatter 0.0216` and `sharp/m2.5` reads `median 0.7646 · scatter
@@ -58,12 +62,24 @@ Five defects stand out, largest first.
      - set 204's mosaic: `bias -5.85 % · scatter 4.15 %`;
      - the ASI2600MC Pro raw lights: `bias -6.29 % · scatter 5.90 %`.
    - It harms the OSC FWHM filters, the per-plane weights, the master FWHM and F1's common F per plane.
-4. **The frame FWHM moves with signal level, and Auto β flips with it.**
-   - Between an image and its 2× flux twin (`base vs deep (2x flux)`):
-     - `twins/sharp/m4/f2.0` measure: `median 9.99 % · p90 9.99 %`, with Auto β agreeing `0.0 % of 1 pairs`;
-     - `twins/sharp/m2.5/f1.6`: `median 15.93 % · p90 15.93 %`;
-     - `twins/sharp/m4/f2.6`, where β agrees: still `median 2.93 % · p90 2.93 %`.
+4. **The frame FWHM and the Auto β pick move when the saturated set changes.**
+   - The 2× flux twin (`base vs deep (2x flux)`) doubles every star's flux, the saturating tail included. It changes
+     which stars are saturated, not only the depth (`twin-saturation.txt`, row 10's own counts):
+     - every base image holds `in the image: 31` saturated stars of 629, 31 of them among the 64 brightest;
+     - the deep twins hold 61 to 235 of 629, and 64 of the 64 brightest in every deep twin but
+       `twins/sharp/m2.5/f8.0` (61).
+   - Row 11 between the base and its deep twin:
+     - `twins/sharp/m4/f2.0` measure: `median 9.99 % · p90 9.99 %`, with Auto β agreeing `0.0 % of 1 pairs`. β goes
+       `beta 4.00` to `beta 10.00` as the Auto β sample (the first 64 seeds) goes from 19 to 64 saturated;
+     - `twins/sharp/m2.5/f1.6`: `median 15.93 % · p90 15.93 %`, β `beta 2.50` to `beta 6.00`, sample 16 to 64;
+     - `twins/sharp/m4/f2.6`, where β holds at `beta 4.00` (sample 0 to 8): still `median 2.93 % · p90 2.93 %`, with
+       31 to 167 saturated stars in the image.
+   - All five β flips are on twins whose Auto β sample became 63 or 64 saturated of 64. Another 18 deep twins reached
+     60 or more and kept their β, 17 of them at `beta 10.00` in base and deep alike (*derived* counts over the 48
+     base/deep pairs of `twin-saturation.txt`).
    - Pure noise twins of the same frames read `median 0.01 % · p90 0.01 %` (`twins/sharp/m4/f2.6`).
+   - Not separated: a deeper master at the same clip level (an `nframes` twin, the same saturated stars) was not
+     built. It would tell depth from saturation.
    - It harms the Formula weights, the FWHM filters and the master FWHM's stability.
 5. **The Analysis path discards the brightest stars of sharp frames, and its round-star floor is twice the measure
    path's.**
@@ -84,7 +100,9 @@ The gates: `13 PASS, 0 FAIL, 0 SKIP`. Every lab gate ran in one uniform run at l
 - athenaeum `star-truth-lab` at f5321979 (`f53219795654b810d70d24f6e6c09889d5d46faa`). Tracked files are clean.
   Submodules: rustafits `8321412`, solvemyastro `c1c633c`. Part 1's production diff is the two items the plan names:
   the `measure_plane_detailed` extraction (P-2) and `stars_from_fits` made `pub`. `star_probe` is a new example.
-- athenaeum-lab `main` at 29af8d2 for the results (the summaries regenerated from the same gzipped scorecards after the review); gates code at `2ce9f16`.
+- athenaeum-lab `main` at e65af49 for the results; gates code at `2ce9f16`. After the final review the scorecards
+  were rebuilt once from the same probe outputs (the per-column CRLB, I-3): only CRLB and efficiency cells changed,
+  plus the `resampled` detection ideal's wording (`star-lab/results/baseline-2026-10-07/run-log.txt`).
 - **The probe binaries, both release examples built from f5321979 under `.superpowers/target-acc`:**
   - `star_probe` sha256 `ef9be3c0715f030c7ee00c4a75d25ea60039f67523c3af3df668cd44a74e7d84`;
   - `ln_scale_probe` sha256 `f738d56ce50ff96d09032c1cfc29c7e19f657b2bf5790df714b6f580804be270`.
@@ -157,10 +175,15 @@ The full scorecards live outside the repository, gzipped, with their sha256 in t
 
 | Scorecard | Rows | Built in | Committed summary |
 | ---- | ---- | ---- | ---- |
-| v2 | 49529 | 437.5 s | `star-lab/results/baseline-2026-10-07/scorecard-summary.md` |
-| injections | 2660 | 15.8 s | `star-lab/results/baseline-2026-10-07/scorecard-inject-summary.md` |
+| v2 | 49529 | 427.8 s (the final rebuild) | `star-lab/results/baseline-2026-10-07/scorecard-summary.md` |
+| injections | 2660 | 15.6 s (the final rebuild) | `star-lab/results/baseline-2026-10-07/scorecard-inject-summary.md` |
 
 - The probe-gap row "converted ... as ADU" is absent from both (P-28).
+- **The FWHM bound per truth column.** The CRLB bounds the pre-pixel width F. The `pixbox` and `pointfit` columns
+  carry it through their own Jacobian, σ_g = (F / g)·σ_F (`scorecard._width_stats`), so their efficiency is the
+  scatter over that column's own floor.
+- **OSC.** The Fisher SNR (the SNR bins) and the CRLB of an OSC row are the full-resolution channel's. The mosaic holds
+  1/4 (R, B) or 1/2 (G) of those pixels, so a VNG-plane efficiency is conservative.
 - The per-row lists of families beyond 2 × their own scatter, or worse than the ERP, are in
   `star-lab/results/baseline-2026-10-07/divergent-families.txt` (`bin/baseline_flags.py`).
 
@@ -655,8 +678,10 @@ The real frames run one path per invocation. On the star-test corpus (`star-lab/
 - Noise twins are stable on the measure path. Over all noise twins the frame FWHM moves by `median 0.00 %`
   (`twins/sharp/m4/f8.0`, `twins/sharp/m10/f1.6`) to `median 0.09 %` (`twins/sharp/gauss/f1.2`). On the families in
   the table it moves by `0.01 %`–`0.05 %`.
-- A 2× flux change is not stable (verdict 4). Auto β flips between base and deep on `twins/sharp/m4/f1.2`, `f1.6`,
-  `f2.0`, `twins/sharp/m10/f1.2` and `twins/sharp/m2.5/f1.6`.
+- A 2× flux twin is not stable (verdict 4), and it changes the saturated set: 31 saturated of 629 in every base,
+  61 to 235 in the deep twins (`twin-saturation.txt`). Auto β flips between base and deep on `twins/sharp/m4/f1.2`,
+  `f1.6`, `f2.0`, `twins/sharp/m10/f1.2` and `twins/sharp/m2.5/f1.6`, each a twin whose Auto β sample became 63 or
+  64 saturated of 64.
 - The ladder ranks perfectly on the measure and analysis paths (`Spearman 1.0000 · largest inversion 0.0000 px`). The
   fixed-β arms print the same and are in the full scorecard.
 
@@ -685,13 +710,14 @@ The real frames run one path per invocation. On the star-test corpus (`star-lab/
 | raw/star-lab-mono2__osc__NoFilter__bin1__300s__raw | measure | 2 | bias -6.29 % · scatter 5.90 % | bias +0.2824 · scatter 0.1443 | median 0.8866 · scatter 0.0710 | 96.3 % of 107 expected · raw 70.6 % of 194 |
 | raw/star-lab-mono2__osc__NoFilter__bin1__300s__raw | analysis | 1 | n/a (no matched star) | n/a (no matched star) | n/a (no matched star) | 0.0 % of 194 expected · raw 0.0 % of 194 |
 
-The injected stars are Moffat-4 at a chosen width. The measure path fits them at the frame's Auto β, so a β
-mismatch shows as a width bias:
+The injected stars are round Moffat-4 at a chosen width, nothing else, so the injected ecc column is the round-star
+floor only. The measure path fits them at the frame's Auto β, so a β mismatch shows as a width bias:
 - Horse C11 G reads `bias -3.68 % · scatter 2.75 %`;
 - QHY268M set 107 reads `bias +5.33 % · scatter 1.43 %`.
 
-On the real frames the measure path's FWHM efficiency (pointfit; scatter over the CRLB) is 1.25–4.99. The `eff` cells are in
-the inject summary.
+On the real frames the measure path's FWHM efficiency (pointfit; scatter over the pointfit column's own CRLB) is
+1.33–5.09. The `eff` cells are in the inject summary. The CRLB there assumes white noise at the recorded gain,
+which real frames do not have, so a high value is not by itself the fitter's inefficiency.
 
 The analysis path keeps 500 stars per frame, so few injected stars are among them:
 - calibrated frames: `7.6 %`–`37.3 %` of expected;
@@ -718,7 +744,9 @@ Injected LN pairs (`s_inj` 0.8, the scorecard's own rows; median ratio over the 
 
 ### 4.2 The LN scale per member on real data (truth 1: the harness photometry on each run's own reference)
 
-- **Ours.** `ln_scale_probe` at the production default arm (F1, growth curve). It ran on each checkpoint-B run's own:
+- **Ours.** `ln_scale_probe` at the production default arm (F1, growth curve). Each dataset's run is pinned by its
+  run id and its LN reference's data md5 (`ln_real.DATASETS`; a later run or another reference is refused), and the
+  table's header line names both. It ran on that run's own:
   - LN reference;
   - reference-frames saturation map;
   - recorded group β;
@@ -733,19 +761,19 @@ Injected LN pairs (`s_inj` 0.8, the scorecard's own rows; median ratio over the 
   - Horse C11 G: the reference is data-identical; 27 of 28 members are bit-equal, and the 28th is at max |diff| /
     max of `1.173e-08`.
 
-| dataset | planes | n | F1 (production default): median gap · median \|gap\| · p90 \|gap\| · slope | PSF signal with selection | probe ÷ run `.athln` − 1 |
+| dataset | planes | n | F1 (production default): median gap · median \|gap\| · p90 \|gap\| · slope (%/px² of FWHM²) | PSF signal with selection (same columns) | probe ÷ run `.athln` − 1 |
 | ---- | ---- | ---- | ---- | ---- | ---- |
-| s204-mono | pooled | 91 | -0.108 % · 0.293 % · 1.076 % · -0.107 %/px2 | -6.009 % · 6.128 % · 10.622 % · -3.353 %/px2 | +0.0097 % (-0.0760 .. +0.1873 %) |
-| s204-osc | pooled | 39 | -0.168 % · 0.420 % · 1.058 % · -0.480 %/px2 | -0.430 % · 1.056 % · 4.162 % · -4.385 %/px2 | +0.0028 % (-0.0798 .. +0.1189 %) |
-| s204-osc | plane 0 | 13 | +0.029 % · 0.380 % · 0.671 % · -0.266 %/px2 | -0.546 % · 1.371 % · 4.278 % · -5.356 %/px2 | +0.0167 % (-0.0026 .. +0.1189 %) |
-| s204-osc | plane 1 | 13 | -0.152 % · 0.315 % · 0.546 % · -0.571 %/px2 | +0.068 % · 0.810 % · 2.343 % · -3.454 %/px2 | +0.0008 % (-0.0184 .. +0.0565 %) |
-| s204-osc | plane 2 | 13 | -0.571 % · 0.790 % · 1.315 % · -0.986 %/px2 | -0.430 % · 1.180 % · 2.450 % · -3.749 %/px2 | -0.0093 % (-0.0798 .. +0.0479 %) |
-| runB-mono | pooled | 82 | +0.084 % · 0.327 % · 0.905 % · -0.071 %/px2 | -7.467 % · 7.467 % · 10.290 % · -3.411 %/px2 | -0.0007 % (-0.0851 .. +0.2072 %) |
-| runB-osc | pooled | 303 | -0.129 % · 0.391 % · 1.217 % · +0.582 %/px2 | +0.028 % · 0.960 % · 3.694 % · -4.850 %/px2 | +0.0084 % (-0.0698 .. +0.1185 %) |
-| runB-osc | plane 0 | 101 | +0.057 % · 0.347 % · 0.759 % · +0.448 %/px2 | -0.370 % · 1.723 % · 4.122 % · -7.361 %/px2 | +0.0009 % (-0.0487 .. +0.0527 %) |
-| runB-osc | plane 1 | 101 | -0.129 % · 0.242 % · 0.571 % · -0.163 %/px2 | +0.189 % · 0.714 % · 2.073 % · -4.289 %/px2 | +0.0154 % (-0.0371 .. +0.0741 %) |
-| runB-osc | plane 2 | 101 | -0.647 % · 0.781 % · 1.586 % · +0.322 %/px2 | +0.087 % · 0.895 % · 2.178 % · -3.878 %/px2 | +0.0042 % (-0.0698 .. +0.1185 %) |
-| hc11-G | pooled | 28 | -0.137 % · 0.203 % · 2.149 % · -0.045 %/px2 | -2.758 % · 2.758 % · 6.139 % · -0.545 %/px2 | -0.0719 % (-0.3585 .. +0.6784 %) |
+| s204-mono | pooled | 91 | -0.108 % · 0.293 % · 1.076 % · -0.0193 %/px2 | -6.009 % · 6.128 % · 10.622 % · -0.6047 %/px2 | +0.0097 % (-0.0760 .. +0.1873 %) |
+| s204-osc | pooled | 39 | -0.168 % · 0.420 % · 1.058 % · -0.0866 %/px2 | -0.430 % · 1.056 % · 4.162 % · -0.7908 %/px2 | +0.0028 % (-0.0798 .. +0.1189 %) |
+| s204-osc | plane 0 | 13 | +0.029 % · 0.380 % · 0.671 % · -0.0480 %/px2 | -0.546 % · 1.371 % · 4.278 % · -0.9660 %/px2 | +0.0167 % (-0.0026 .. +0.1189 %) |
+| s204-osc | plane 1 | 13 | -0.152 % · 0.315 % · 0.546 % · -0.1030 %/px2 | +0.068 % · 0.810 % · 2.343 % · -0.6228 %/px2 | +0.0008 % (-0.0184 .. +0.0565 %) |
+| s204-osc | plane 2 | 13 | -0.571 % · 0.790 % · 1.315 % · -0.1778 %/px2 | -0.430 % · 1.180 % · 2.450 % · -0.6761 %/px2 | -0.0093 % (-0.0798 .. +0.0479 %) |
+| runB-mono | pooled | 82 | +0.084 % · 0.327 % · 0.905 % · -0.0128 %/px2 | -7.467 % · 7.467 % · 10.290 % · -0.6152 %/px2 | -0.0007 % (-0.0851 .. +0.2072 %) |
+| runB-osc | pooled | 303 | -0.129 % · 0.391 % · 1.217 % · +0.1050 %/px2 | +0.028 % · 0.960 % · 3.694 % · -0.8746 %/px2 | +0.0084 % (-0.0698 .. +0.1185 %) |
+| runB-osc | plane 0 | 101 | +0.057 % · 0.347 % · 0.759 % · +0.0807 %/px2 | -0.370 % · 1.723 % · 4.122 % · -1.3275 %/px2 | +0.0009 % (-0.0487 .. +0.0527 %) |
+| runB-osc | plane 1 | 101 | -0.129 % · 0.242 % · 0.571 % · -0.0295 %/px2 | +0.189 % · 0.714 % · 2.073 % · -0.7734 %/px2 | +0.0154 % (-0.0371 .. +0.0741 %) |
+| runB-osc | plane 2 | 101 | -0.647 % · 0.781 % · 1.586 % · +0.0580 %/px2 | +0.087 % · 0.895 % · 2.178 % · -0.6994 %/px2 | +0.0042 % (-0.0698 .. +0.1185 %) |
+| hc11-G | pooled | 28 | -0.137 % · 0.203 % · 2.149 % · -0.0081 %/px2 | -2.758 % · 2.758 % · 6.139 % · -0.0983 %/px2 | -0.0719 % (-0.3585 .. +0.6784 %) |
 
 Error bars come from the one full gates run, `star-lab/results/baseline-2026-10-07/gates.txt`. Its truth gates equal,
 target for target, the numbers the 11a LN rows carried, so no bar was re-carried. Each member carries the bar of the
@@ -776,14 +804,23 @@ Most mono members carry the soft crowded bar, 1.38 %. The normal-mode bars are g
 
 **The two referees disagree on F1, and the disagreement is open.**
 
-The real groups do reach the synthetic conditions:
+The real groups reach the synthetic width ratios:
 - Width ratio `fwhm_mem / fwhm_ref` (*derived* from `ln-real-members.csv`):
   - set 204 mono: up to 1.748 (FWHM² difference 23.6 px²) against a 3.385 px reference;
   - run B mono: up to 1.761 (24.1 px²) against 3.39 px.
 
   The synthetic t45 ratio is 1.5 and t60's is 2.0.
-- Crowding: 50 of 91 set 204 mono members and 49 of 82 run B mono members took the harness's crowded fallback
-  (`truth modes crowded 50, normal 41`; `crowded 49, normal 33`).
+- The harness's crowded fallback (its own criterion, not the annulus definition below): 50 of 91 set 204 mono
+  members and 49 of 82 run B mono members took it (`truth modes crowded 50, normal 41`; `crowded 49, normal 33`).
+- In the annulus sense there is one measure, the probe's own diagnostic `annulusCrowding` (L-26: per member, the
+  median over its pairs of the larger side's fraction of sky-annulus pixels above the annulus median + 3σ), read
+  from the existing probe lines:
+  - the real mono members: `median 0.0847` (set 204) and `median 0.0928` (run B), in `ln-real-summary.txt`;
+  - the synthetic `pairs/main/m4w10` targets: 0.0618 (t45) and 0.0707 (t60); the isolated `truthcheck`: 0.0016–0.0024
+    (*derived* from their probe lines, not committed).
+
+  By that measure the real members' annuli are at least as contaminated as the synthetic grid's. Real annuli also
+  hold nebulosity and other structure, so the two are comparable, not identical.
 
 At those conditions the referees disagree:
 - **Synthetic, exact truth.** F1 reads:
@@ -791,17 +828,36 @@ At those conditions the referees disagree:
   - `s 1.3050 vs s_true 1.25: +4.40 %` at ratio 1.67 (`density_pairs/d600` t3);
   - up to `+11.84 %` at ratio 2.0.
 - **Real, harness truth.** F1 reads:
-  - set 204 mono: median gap `-0.108 %`, slope `-0.107 %/px2`;
-  - run B mono: median gap `+0.084 %`, slope `-0.071 %/px2`.
+  - set 204 mono: median gap `-0.108 %`, slope `-0.0193 %/px2 of FWHM2`;
+  - run B mono: median gap `+0.084 %`, slope `-0.0128 %/px2 of FWHM2`.
 
-  Both sit inside the soft crowded bar of 1.38 % that most of these members carry.
+  Both sit inside the soft crowded bar of 1.38 % that most of these members carry. On the one basis (%/px² of
+  FWHM²), the synthetic slopes (`+0.1533` to `+0.4021 %/px^2`) are 8 to 31 times the real ones' size (*derived*),
+  and of the opposite sign.
 - **The high-ratio members alone** (ratio ≥ 1.5, *derived*): the real F1 median gap is −1.076 % on set 204 mono
-  (13 members) and −1.836 % on run B mono (7). These are low, where the synthetic rows read high.
+  (13 members) and −1.836 % on run B mono (7). These are low, where the synthetic rows read high. The real referee is
+  weakest exactly there:
+  - all 20 carry the soft crowded bar;
+  - 17 of the 20 (10 of 13, 7 of 7) lie more than 0.5 px beyond the crowded gate's validated 3–5 px range, flagged
+    on their rows, and all 20 are above 5 px;
+  - run B's −1.836 % lies outside ±1.38 % (5 of its 7 members do, and 3 of the 13 on set 204).
+
+**The PSF-signal arm disagrees in the opposite direction, so the disagreement is referee-wide.**
+- **Synthetic, exact truth.** `psfSel` holds on the Moffat and Gaussian `pairs` families: `s 1.1067 vs s_true 1.1:
+  +0.60 %` on the t60 target, slopes `-0.0416` to `+0.0454 %/px^2` (row 6).
+- **Real, harness truth.** `psfSel` reads low: set 204 mono median gap `-6.009 %`, slope `-0.6047 %/px2 of FWHM2`;
+  run B mono `-7.467 %`, `-0.6152 %/px2 of FWHM2`.
+- So F1 is biased against the synthetic truth and not against the harness truth, and `psfSel` the reverse. The
+  question is the referees on real frames: the lab's field realism against the harness truth. Part 2's first numeric
+  task, after `FitDiagnostics`, tests that referee pair, before any change to F1 is measured.
 
 Part 1 does not resolve this. The candidates, none of them tested here:
 - the lab's fields differ from the real ones (flux distribution, wings, the sky step);
 - the harness's crowded fallback shares F1's bias on real frames;
 - the real members' neighbour density inside F1's annulus differs from the lab's.
+
+The `psfSel` evidence points at the first two: they bear on both arms. The third bears on F1 alone, and the annulus
+diagnostic above does not support it.
 
 **Crowding, as this report uses the word.** It means neighbours inside F1's sky annulus `[6F, 8F]`, where F is the
 common FWHM of the pair (`SKY_INNER_FWHM 6.0`, `SKY_OUTER_FWHM 8.0` in `stacking/ln/aperture.rs`). At the t60
@@ -814,8 +870,8 @@ grids' separations:
 | `grid/main` | none, 6000 stars on 2048² | yes | crowded |
 | `truthcheck` | 120.0 px (`min_sep 120.0` in its v2 spec) | no | isolated: slope `+0.0040 %/px^2` |
 
-The real members' annulus crowding is not summarised here. The probe lines carry the L-26 `annulusCrowding`
-diagnostic per member.
+The real members' annulus crowding by this neighbour definition is not measured. The pixel diagnostic
+`annulusCrowding` above is the annulus measure part 1 has for them.
 
 ### 4.3 The star-test corpus (comparison only: there is no truth on these frames)
 
@@ -855,8 +911,8 @@ Findings from the real-data runs, as observed (Task 11a):
 - **`_DSC5767.fit`** (a 3-plane 16-bit DSLR file, BZERO 0, maximum 32767, plane MAD 0.11 of full scale) gives the
   measure path 0 seeds on every plane. The analysis path measures 500 stars at 3.69 px, ecc 0.602.
 - **The B plane is the weakest under F1 on both OSC datasets:**
-  - set 204: `median gap -0.571 %`, `median |gap| 0.790 %`, slope `-0.986 %/px2`;
-  - run B: `-0.647 %`, `0.781 %`, `+0.322 %/px2`.
+  - set 204: `median gap -0.571 %`, `median |gap| 0.790 %`, slope `-0.1778 %/px2 of FWHM2`;
+  - run B: `-0.647 %`, `0.781 %`, `+0.0580 %/px2 of FWHM2`.
 
   Row 8's VNG B-plane width bias is the synthetic counterpart.
 - **sLib duplicates psfSel.** `sLib`, the probe's direct `relative_scale_against` call, equals `psfSel` to the printed
@@ -918,7 +974,8 @@ Readings by consumer:
   pixel threshold inherits.
 - **The master FWHM.** On the master-like `mixture/b` the measure path's frame FWHM is +4.88 % above `pointfit`
   (derived), and the analysis path's is −1.26 %. Clipping the core (`b_clip`) brings the measure path to −1.03 %.
-  Row 11's base-vs-deep instability adds `median 2.62 %` (`twins/mixture/b`, measure).
+  Row 11's base-vs-deep instability adds `median 2.62 %` (`twins/mixture/b`, measure), with 31 to 109 saturated
+  stars in the image and β held.
 - **Weights.** The captured fraction depends on the profile (row 6).
 - **F1's common F.** The 2F circle encloses a profile-dependent fraction, 0.9393–1.0000, while 5F holds 0.9953–1.0000
   (row 6).
@@ -940,25 +997,37 @@ before any fix is measured.
    fitted background (row 5).
    - Rows: 1 (`sharp/m4/f8.0` measure `82.7 %` against seeds `92.0 %`), 5.
    - Consumer: every diagnosis that follows.
-2. **Reconcile F1's synthetic over-read with its real-data agreement (open). This is the first numeric item.**
-   - Synthetic, row 6:
+2. **Test the referee pair on F1's conditions before any F1 change (open). This is the first numeric item, after
+   `FitDiagnostics`.**
+   - Synthetic, row 6 (slopes in %/px² of FWHM²):
      - `+11.84 %` worst (`pairs/main/m4w10` t60);
      - `+6.33 %` at t45 (width ratio 1.5);
      - `+4.40 %` on `density_pairs/d600` t3;
      - slopes `+0.1533`–`+0.4021 %/px^2` on all 19 `pairs` families, every one crowded by the annulus definition
        (`grid/iso` 25 px separation, `grid/main` none);
      - `+0.0040 %/px^2` on the isolated `truthcheck` (120 px).
-   - Real data (section 4.2), at width ratios up to 1.748 and 1.761 with 50 of 91 and 49 of 82 members crowded:
-     - F1 median gaps `-0.108 %` and `+0.084 %` against the harness truth, inside the soft 1.38 % bar;
-     - the high-ratio members read low (*derived* −1.076 % and −1.836 %).
-   - Part 2 must establish which referee is right on these conditions before it changes, or keeps, the default.
+   - Real data (section 4.2), at width ratios up to 1.748 and 1.761 (*derived*), with 50 of 91 and 49 of 82 members
+     in the harness's crowded fallback (its own criterion, not the annulus one):
+     - F1 median gaps `-0.108 %` and `+0.084 %`, slopes `-0.0193` and `-0.0128 %/px2 of FWHM2`, against the harness
+       truth, inside the soft 1.38 % bar;
+     - the high-ratio members read low (*derived* −1.076 % and −1.836 %). All 20 carry the soft bar, 17 of 20 lie
+       beyond the validated 3–5 px range, and run B's −1.836 % lies outside ±1.38 % (*derived* from
+       `ln-real-members.csv`).
+   - `psfSel` disagrees the other way: synthetic slopes `-0.0416` to `+0.0454 %/px^2` and `+0.60 %` on t60; real
+     median gaps `-6.009 %` and `-7.467 %`, slopes `-0.6047` and `-0.6152 %/px2 of FWHM2`.
+   - The disagreement is referee-wide: the lab's field realism against the harness truth on real frames. Part 2's
+     first numeric task, after `FitDiagnostics`, tests that referee pair. No F1 change, and no decision to keep the
+     default, is measured before it.
    - Consumer: LN normalisation, so the master's photometry and its rejection.
 3. **The captured fraction depends on the profile.**
    - Row 6: 18.73 % derived spread at F 2.6, 22.16 % at F 8.0 (from the printed medians).
    - Consumer: `PsfSignalWeight`.
-4. **The frame FWHM moves with SNR, and Auto β flips.**
-   - Row 11: `median 9.99 %` (`twins/sharp/m4/f2.0`, β flipped), `median 15.93 %` (`twins/sharp/m2.5/f1.6`),
-     `median 2.93 %` with β stable (`twins/sharp/m4/f2.6`).
+4. **The frame FWHM and the Auto β pick move when the saturated set changes.**
+   - Row 11: `median 9.99 %` (`twins/sharp/m4/f2.0`, β flipped, Auto β sample 19 to 64 saturated of 64),
+     `median 15.93 %` (`twins/sharp/m2.5/f1.6`, 16 to 64), `median 2.93 %` with β stable (`twins/sharp/m4/f2.6`,
+     sample 0 to 8; 31 to 167 saturated of 629 in the image). Counts: `twin-saturation.txt`.
+   - The 2× flux twin doubles the saturating tail too: it is a saturation test, not a depth test. A same-clip deeper
+     twin (`nframes`) was not built; it would separate depth from saturation.
    - Consumer: Formula weights, the FWHM filters, the master FWHM.
 5. **VNG per-plane width distortion.**
    - Row 8: G `+12.63 %`, B `-6.71 %` against ideal-plane `+3.06 %` / `+0.08 %`.
