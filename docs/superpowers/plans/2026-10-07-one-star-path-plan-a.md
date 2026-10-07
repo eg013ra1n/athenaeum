@@ -1708,7 +1708,8 @@ fix(star_measure): F-5 star flux = the fitted model's FWTM flux times a per-fram
 
 **Files:**
 - Modify: `star_measure/photometry.rs` (`star_snr` over Task 8's `annulus_sigma`, `hfr`), `star_measure/fit.rs` (`StarFit.snr`, `.hfr`;
-  non-persisted like `peak5`), `star_measure/frame.rs` (`snr_median`, `hfr_median`), `star_measure/mod.rs`
+  non-persisted like `peak5`), `star_measure/frame.rs` (`snr_median`, `hfr_median`: medians over the finite values only, so a
+  `snr_missing` NaN never poisons the frame median — pinned by a test), `star_measure/mod.rs`
   (`PlaneMeasurement.snr_gain`), `star_measure/domain.rs` (`Domain::gain_e_per_working_unit()`),
   `stacking/measure.rs` (hand edit: the adapter reads `EGAIN`, `ATH_CSCL`, `ATH_CFNM` from the FITS header through
   `crate::fits_parser` and passes `gain_e_per_unit = EGAIN × ATH_CSCL / ATH_CFNM` — the P-21 rule without the
@@ -1866,7 +1867,10 @@ each after-copy's `stackwork` removed once its rows are recorded.
   files, the weight rank table, the stage table incl. the LN stage wall, M-6).
 
 - [ ] **Step 0: Disk arithmetic, written before anything runs.** `df -k /Volumes/BigMac` ≥ 100 GiB + the dataset's
-  peak (46 / 38 / 26 GB) + the throwaway `target-main` build of step 1 (≈ 6 GB, deleted after step 1, M-8). Time
+  peak (46 / 38 / 26 GB) + the throwaway `target-main` build of step 1 (≈ 6 GB, deleted after step 1, M-8). The
+  server's own `space` blocker compares free bytes with the FULL footprint estimate (`stacking/plan.rs:2851-2865`;
+  ≈ 99 GB for set 204, no discount for `rerunFrom` or fresh artifacts), so free space must also exceed that
+  estimate (165 GiB does today); the step writes both numbers down. Time
   Machine stays off during the runs (`tmutil status` `Running = 0`, the same refusal `checkpoint.sh` applies).
 
 - [ ] **Step 1: Measure-equivalence of the before trees (PA-13).** Build local main's `measure_probe` in a throwaway
@@ -1902,7 +1906,8 @@ each after-copy's `stackwork` removed once its rows are recorded.
 cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/harness/acceptance
 # clone-before.sh <before> <after>: (1) cp -Rc; (2) sqlite3 on the clone: UPDATE settings SET value = replace(value,'<before>','<after>')
 #   WHERE value LIKE '%<before>%'; UPDATE stacking_artifacts SET path = replace(path,'<before>','<after>') WHERE path LIKE '%<before>%';
-#   (3) rm -rf <after>/stackwork/*/{registered,ln,rej,runs} <after>/stackout/*  (stale by hash; the clone references cost nothing)
+#   (3) rm -rf <after>/stackwork/{*,_projects/*}/{registered,ln,rej,runs} <after>/stackout/*  (stale by hash; the clone
+#       references cost nothing; `_projects/<slug>/` is run B's project tree, one level deeper)
 zsh clone-before.sh ~/.athenaeum-acc/tierA-lnB-f1 ~/.athenaeum-acc/starA-s204
 ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json \
   zsh tier1/tier1-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-s204 8950 204        # expected wall ≈ 901 − 134 s (no Calibrate); Measure 3.62 → ≤ 4.34 min
