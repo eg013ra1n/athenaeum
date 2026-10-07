@@ -67,7 +67,8 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   provenance record) and `run_probe.py --verify` proves it before a scorecard is believed.
 - rustafits public remotes (`origin` GitHub, `gitlab`) are pushed only by the owner; the branch stays local until
   the owner pushes it. A rustafits change beyond Task 9's named one happens only when a lab number triggers it
-  (Task 5 step 7).
+  (Task 5 step 7). Push order (M-7): the owner pushes rustafits `one-star-path-beta` to both remotes BEFORE
+  athenaeum `main`, or the GitHub run (`submodules: recursive`) cannot fetch the gitlink.
 
 ## Review Focus
 
@@ -75,9 +76,11 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
    refits through `fit_stars_at`; `register/frame.rs` reads `.athf` of calibrated planes, LN of warped ones). The
    matched filter must treat a non-finite pixel as absent (no NaN propagation into the convolution, no seed on a
    border), the region growth skips non-finite pixels as today, the rim background start and the SNR annulus ignore
-   them, and a star whose aperture leaves the finite area is refused `OutsideImage`. Pinned in Task 6
-   (`nan_border_seeds_nothing_on_the_border_and_fits_every_interior_star`) and Task 11
-   (`snr_annulus_skips_non_finite_pixels`); the probe's `nan_border_runs_every_path` keeps passing at every task.
+   them, and a star whose aperture leaves the finite area is refused `OutsideImage`. Pinned in Task 6a
+   (`nan_border_seeds_nothing_on_the_border_and_fits_every_interior_star`), Task 6b
+   (`edge_region_is_clipped_by_the_border_and_still_refuses_when_too_small`) and Task 8
+   (`annulus_sigma_is_the_mad_of_the_present_pixels`, the one annulus both the flat-top test and the SNR read,
+   I-2); the probe's `nan_border_runs_every_path` keeps passing at every task.
 2. **Very sparse frames under the β sample's minimum** (fewer than 8 free-β fits on unsaturated stars: a 3-star
    frame, a flat field, a frame whose bright stars all saturate). β falls back to 4.0 with a `warn!`,
    `PlaneMeasurement.beta_source = BetaSource::Fallback`, and the frame still measures. Pinned in Task 9
@@ -92,12 +95,13 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
 4. **A plane whose noise estimate is refused** (MRS at its floor on a constant or near-constant plane; `N*` under
    100 residuals). The matched filter's threshold has no σ: the detector returns no seeds with one `warn!`, the
    flat-top test and the SNR take `σ_local` from the star's own annulus (never the plane σ), and `NoiseModel.source
-   = NoiseSource::None` is reported. Pinned in Task 6 (`refused_noise_estimate_seeds_nothing_and_warns`).
+   = NoiseSource::None` is reported. Pinned in Task 6a (`refused_noise_estimate_seeds_nothing_and_warns`).
 5. **A star at the image edge** (the nominal stamp partly outside; the region cap clipped by the border; an
    aperture or annulus crossing it). Admission refuses `OutsideImage` when the width-start box leaves the image;
    a region clipped by the border fits only when its radius still holds `0.5·growth·FWTM`; the SNR annulus uses the
-   pixels present and reports `n_sky`. Pinned in Task 4 (`edge_seed_is_refused_outside_image_with_its_reason`) and
-   Task 11 (`edge_star_snr_uses_the_present_annulus_pixels`).
+   pixels present and reports `n_sky`. Pinned in Task 4 (`edge_seed_is_refused_outside_image_with_its_reason`),
+   Task 8 (`annulus_sigma_is_the_mad_of_the_present_pixels`) and Task 11
+   (`edge_star_snr_uses_the_present_annulus_pixels`).
 6. **A stored stacking config from each older shape** (pre-M4a: no `detectionSigma`; M4a: `detectionSigma` +
    `seedPrefilter`; M4c: + `seedDetector`; a user preset; the stored global document; Structure with Median3). One
    decode maps each to `seedSource` per spec §2.2, whole-config precedence kept, no value reinterpreted. Pinned in
@@ -111,18 +115,21 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   probe all name it) and gains `flags`, `snr`, `hfr`; the spec's `StarRecord` is this type.
 - **PA-2 The matched filter's threshold** `k` (in units of the filtered plane's measured σ_f) is chosen BEFORE any
   completeness or fitted/seeded bar is read, by a false-positive criterion on data no bar names: over the 46
-  `twins/*` t1 noise replicas and the 7 `background/*` images, `k` is the smallest of {3.0, 3.5, 4.0, 4.5, 5.0, 6.0}
-  at which the scorecard's `false detections / Mpx` cause `nothing` (a seed that matches no truth star, artefact or
-  star wing) stays ≤ 0.5 per Mpx on every image. The chosen value is recorded in `docs/stacking/README.md` (ruling
-  R-OSP-2) and in `seeds::DEFAULT_THRESHOLD`'s doc comment with the table it came from; the bars are measured after.
+  `twins/*` t1 noise replicas and `artefacts` (its hot/cr rows exist), `k` is the smallest of {3.0, 3.5, 4.0, 4.5,
+  5.0, 6.0} at which the scorecard's `false detections / Mpx` cause `nothing` (a seed that matches no truth star,
+  artefact or star wing) stays ≤ 0.5 per Mpx on every image, read on the `seeds` path (Task 6a, before any fit
+  change). The 7 `background/*` images carry F-6's and F-7's bars, so they do not decide (M-9); they are printed
+  beside the sweep as a reported column, because nebula knots are the false-positive regime the threshold must
+  survive. The chosen value is recorded in `docs/stacking/README.md` (ruling R-OSP-2) and in
+  `seeds::DEFAULT_THRESHOLD`'s doc comment with the table it came from; the bars are measured after.
 - **PA-3 Data roots.** New families are generated into `~/.athenaeum-acc/star-lab-v2/` (one manifest, one
   determinism gate). Every Plan A probe run, scorecard and gates scratch goes to `~/.athenaeum-acc/star-lab-a/<step>/`
-  (`run_probe.py --out`, `scorecard.py --probe-dir`, `STARLAB_SCRATCH`), where `<step>` is the task's tag (`t02-extract`,
-  `t04-f0`, …). At most two `<step>` directories exist at a time: a step's probe directory is deleted once its full
+  (`run_probe.py --out`, `scorecard.py --probe-dir`, `STARLAB_SCRATCH`), where `<step>` is the task's tag (`t01c-baseline`, `t02-extract`,
+  `t04-f0`, `t06a-seeds`, `t06b-f1`, …). At most two `<step>` directories exist at a time: a step's probe directory is deleted once its full
   scorecard is gzipped under `star-lab-a/results/<step>/` and its summary is committed. `star-lab-a` is capped at 4 GB.
 - **PA-4 `MEASURE_VERSION = 4`** continues `PSF_FIT_VERSION`'s count (3 → 4) and is set once, in Task 3. Plan A bumps
-  it no second time: the branch merges as one unit, and every acceptance copy Plan A stacks is a fresh copy run
-  from Calibrate. Policy: bump once per merged plan whose code changes what a fit accepts or measures (spec §4.4);
+  it no second time: the branch merges as one unit, and every acceptance run Plan A makes starts from Measure on a
+  clone whose Calibrate artifacts carry no `MEASURE_VERSION` (Task 13). Policy: bump once per merged plan whose code changes what a fit accepts or measures (spec §4.4);
   Plan C sets 5; a plan that changes no fit leaves it.
 - **PA-5 F-5's flux lands in `StarFit.signal`** (the same `.athf` slot, `FITS_ARTIFACT_VERSION` unchanged); `area`
   keeps its FWTM-ellipse meaning, so `mean_flux()` stays monotonic in the flux. Register's flux ordering and
@@ -139,7 +146,10 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   observed maximum inside a radius of `max(1.5, 0.5·FWHM_start)` px; the star is flagged saturated when that core
   holds ≥ 3 pixels AND the free-β wing fit (on the pixels outside the core, ≥ 12 of them) predicts, at the maximum's
   position, a value above the observed maximum by more than `max(3 σ_local, 0.01·observed maximum)`. The 3 is the
-  bar's own `k`; the 1 % floor is half the generator's "within 2 % of the clip" gray zone.
+  bar's own `k`; the 1 % floor is half the generator's "within 2 % of the clip" gray zone. The wing fitter is
+  `fit_moffat_2d` (free β, bound [1, 20]) at Task 8 and `fit_moffat_2d_bounded` with `BETA_BOUNDS` from Task 9 on
+  (I-3); a wing fit that returns `None` leaves the star UNFLAGGED with `SaturationVerdict.wing_fit = false`
+  reported — never a flag from a missing fit. `σ_local` is `photometry::annulus_sigma` (Task 8, PA-11 radii).
 - **PA-9 Donut family.** Profile `donut<R>`: a uniform disc of radius R px convolved with a Gaussian of FWHM 2.6
   (a new `render.Component` kind `disc`, `a = R`, pixel-integrated through `render_star_blurred`). Truth kind
   `donut` (not a width kind; no `fit_*` widths, no CRLB). Its row is "donut outcome": the share of matched donut
@@ -152,16 +162,19 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   `cells_covered / cells_with_stars ≥ 0.9` (a cell "holds measurable stars" when any seed above threshold lies in it).
 - **PA-11 SNR geometry (F-6).** Aperture radius `max(1.5·FWHM, 3)` px about the fitted centre; sky annulus
   `[max(3·FWHM, 6), max(3·FWHM, 6) + max(FWHM, 3)]` px; σ_sky = 1.4826·MAD of the annulus; `N_sky` its pixel count.
-  The truth column `snr_ap` uses the same radii from the star's `fit_fwhm` geometric mean.
+  The truth column `snr_ap` uses the same radii from the star's `fit_fwhm` geometric mean — the same quantity the
+  module's fitted `fwhm()` estimates (D-2), so the F-6 bar's bias is a measurement, not a definition mismatch
+  (M-14).
 - **PA-12 Region growth (F-1).** `r_start = max(3, ceil(1.5·F_start))`, `r_max = clamp(ceil(6·F_start), 6, 96)`
   (and never past the border); `m_r` the square's median, `s_r` the median of its outer 1-px rim; grow while
   `(m_r − s_r) > 0.01·(max − s_r)`; the background start `b0 = s_r` of the final square; `F_start` from the star's
-  own background-subtracted second moments in a box of radius `2·F_field` (the matched filter's field width),
-  clamped to [0.6, 40] px.
+  own background-subtracted second moments in a box of radius `2·F_field` (the matched filter's field width, or
+  `seeds::field_width_of` for given seeds — I-4), clamped to [0.6, 40] px.
 - **PA-13 The real-data "before" trees** are `tierA-lnB-f1` (set 204, run 5), `lnB-runB-f1` (run B) and `hc11B-f1`
   (Horse C11, set 182, pinned frame 69845) — PROVIDED a Measure-equivalence check passes: on three calibrated frames
   of each tree, local main's `measure_probe` output equals the tree's stored `metrics` payload field for field. If it
-  does not, the before run is re-made with `tier1/rerun-build.sh <local main sha> starA-before` for that dataset.
+  does not, the before run is re-made with `tier1/rerun-build.sh <local main sha> starA-before-<ds>` on the same
+  clone recipe (Task 13), the disk it costs named first.
 - **PA-14 LN scale rows are not judged by no-regression in Plan A.** Row 6's `arm *`, `sLib`, their slopes, and the
   injected LN pairs read the fitted `fwhm()` (F1's common F) and `signal` (psfSel), both of which Plan A changes by
   design; spec F-8 re-baselines them in Plan B. `scorecard_diff.py` prints them in their own table, never counts
@@ -169,11 +182,14 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
 - **PA-15 The legacy analysis arm is the control.** The rustafits analysis path (`--paths legacy-analysis`, JSONL
   `path: "analysis"` unchanged through Plan A) is re-run at every step on the same u16 siblings; its rows must be
   bit-identical to the previous step's — a non-identical control row means the inputs or the tool moved, and the
-  step stops. The module's Analysis mode is the new arm `analysis-mode`; Plan C swaps the labels.
+  step stops. The control's own run-to-run determinism is proven once, at Task 2 step 5 (I-7): the same binary
+  twice on three u16 images, `cmp` equal; if it is not equal, the control compares with a tolerance of 0 on counts
+  and 1e-9 relative on floats, recorded in `results/plan-a/t02-extract/control-determinism.txt`. The module's
+  Analysis mode is the new arm `analysis-mode`; Plan C swaps the labels.
 - **PA-16 Each fix step's lab cycle** is: build the probe → `run_probe.py manifests/v2.json --out
   ~/.athenaeum-acc/star-lab-a/<step>/probe` → `--verify` → `scorecard.py` → `scorecard_summary.py` (committed) →
   `scorecard_diff.py` against the previous step's gzipped JSON (committed `noreg.txt`) → the task's own bar rows.
-  Injections (`manifests/inject.json`) run at Tasks 6, 9 and 14 (the raw-mode bars) and the corpus at Task 12 (cost).
+  Injections (`manifests/inject.json`) run at Tasks 6b, 9 and 14 (the raw-mode bars) and the corpus at Task 12 (cost).
 
 ## File structure
 
@@ -181,12 +197,12 @@ athenaeum (`crates/athenaeum-core/src/` unless noted):
 
 | File | Responsibility |
 | ---- | ---- |
-| `star_measure/mod.rs` | `MEASURE_VERSION`, `MeasureOptions`, `Mode`, `SeedSpec`, `PlaneMeasurement`, `measure_plane`, `fit_stars_at`, re-exports |
+| `star_measure/mod.rs` | `MEASURE_VERSION`, `MeasureOptions`, `Mode`, `SeedSpec`, `FitStarsOptions`, `PlaneMeasurement` (+ `PhaseTimings`, `SkyLevel`), `measure_plane`, `fit_stars_at`, re-exports |
 | `star_measure/domain.rs` | `Domain`, `ADU_SCALE`, `NoiseModel`/`NoiseSource`, `background_residual`, `noise_mrs` (moved) |
-| `star_measure/seeds.rs` | the matched filter (Task 6): `MatchedFilter`, `detect`, `DEFAULT_THRESHOLD`, `FieldWidth` |
-| `star_measure/fit.rs` | `Seed`, `FitParams`, `StarFit`, `StarFlags`, `FitOutcome`, `PsfModel`, `fit_one`, `accept`, `aperture`, `dedupe`, `fit_all`, `fit_stars`, `fit_stars_with_beta` (moved), canonical axes (Task 5), region/background/width start (Task 6) |
+| `star_measure/seeds.rs` | the matched filter (Task 6a): `MatchedFilter`, `detect`, `DEFAULT_THRESHOLD`, `FieldWidth`, `field_width_of` |
+| `star_measure/fit.rs` | `Seed`, `FitParams`, `StarFit`, `StarFlags`, `FitOutcome`, `PsfModel`, `fit_one`, `accept`, `aperture`, `dedupe`, `fit_all`, `fit_stars`, `fit_stars_with_beta` (moved), canonical axes (Task 5), region/background/width start (Task 6b) |
 | `star_measure/beta.rs` | the per-frame β: discrete `AUTO_BETAS` search (moved) → continuous free-β median (Task 9), `BetaSource` |
-| `star_measure/photometry.rs` | saturation test (Task 8), model flux + aperture correction (Task 10), SNR and HFR (Task 11) |
+| `star_measure/photometry.rs` | `annulus_sigma` and the saturation test (Task 8), model flux + aperture correction (Task 10), SNR and HFR (Task 11) |
 | `star_measure/frame.rs` | `frame_shape`, `signal_totals`, `FrameAggregates` (moved + the unsaturated statistic, Task 8) |
 | `star_measure/budget.rs` | the Analysis-mode selection (Task 12) |
 | `star_measure/diagnostics.rs` | `RefusalReason`, `Outcome`, `FitDiagnostics`, `RefusalCounts` (Task 4) |
@@ -209,10 +225,11 @@ athenaeum-lab (`star-lab/`):
 | ---- | ---- |
 | `starlab/render.py` | `Component` kind `disc` (PA-9) |
 | `starlab/families.py` | families `sharp/{m4,gauss}/f{12.0,16.0}`, `donut/r{6,10}`; cards `EGAIN`, `ATH_CSCL`, `ATH_CFNM`; truth columns `clipped_core_px`, `sat_neighbour_only`, `sat_gray`, `snr_ap` |
-| `bin/augment_v2.py` | the in-place card and truth-column augmentation of the existing families (Task 1) |
-| `starlab/probe_io.py`, `starlab/probe_plan.py` | `refused` lines, the `analysis-mode` and `legacy-analysis` arms |
+| `bin/augment_v2.py` | the in-place card and truth-column augmentation of the existing families (Task 1a) |
+| `starlab/probe_io.py`, `starlab/probe_plan.py`, `bin/run_probe.py` | `refused` lines, the `analysis-mode` and `legacy-analysis` arms, `STAR_PROBE_ARGS` (Task 1b) |
 | `starlab/scorecard.py`, `scorecard_build.py` | rows: fit outcomes, donut outcome, axis order, saturation flag vs truth, star SNR vs truth, budget coverage, analysis-mode cost; `_threshold` reads `seedSource` |
-| `bin/scorecard_diff.py` | the mechanical no-regression check (Task 1) |
+| `bin/scorecard_diff.py` | the mechanical no-regression check (Task 1c) |
+| `harness/acceptance/clone-before.sh`, `tier1-run.sh`, `project-run.sh`, `hc11-run.sh`, `tier1-extract.py`, `tier1-compare.py` | the clone recipe, `ATH_ACC_RERUN_FROM`, `ATH_ACC_SET_REFERENCE`, `--run-id`, the fixed harness path (Task 13) |
 | `bin/gates.py` | `STARLAB_ACC_COPY` for `probe_parity`; the two new families in `determinism` |
 | `tests/test_*.py` | one test file per changed module |
 | `results/plan-a/<step>/` | committed summaries, `noreg.txt`, bar tables per step |
@@ -234,90 +251,62 @@ Run the lab tests from `star-lab/`: `python3 -m unittest discover -s tests -v`.
   residual-weighted mean over accepted UNSATURATED fits is the one frame statistic, §4.2), `noise: NoiseModel { sigma,
   source, m_star, n_star }` (background and noise for `frame_snr`, `snr_weight`, `psf_signal`), `seeds` (stars
   detected), `refused: RefusalCounts` (`stars_refused` and per-reason counts), `budget: Option<BudgetReport>`,
-  `snr_gain: Option<f64>` (None = the shot term was omitted), `diagnostics`.
+  `snr_gain: Option<f64>` (None = the shot term was omitted), `diagnostics`, `timings: PhaseTimings`, and
+  `sky: SkyLevel { median, mad, … }` — the stratified-sample sky statistic (`stats::stratified_sample` + clip, the
+  adapter's own function moved into the module so one call serves both): `frame_snr = sky.median / noise.sigma`
+  and `snr_weight`'s denominator read `sky.median`, never `noise.m_star` (which is the median of the mesh
+  RESIDUALS, I-8).
+- `star_measure::seeds::detect(plane, w, h, noise, threshold, max_stars, mask, pool)` is public: Plan C calls it on
+  its own 2×2 super-pixel OSC plane and hands the native-coordinate sites to `fit_stars_at` with the CFA mask.
 - `star_measure::MEASURE_VERSION` for `AnalysisConfig::config_hash` and the `frame_analysis.measure_version` column.
-- The trail metric (§4.3) is Plan C's: `frame.rs` leaves a documented slot (`FrameAggregates` is `#[non_exhaustive]`
-  inside the crate, so Plan C adds `trail: Option<TrailMetric>` without touching callers).
+- The trail metric (§4.3) is Plan C's: Plan C adds `FrameAggregates.trail: Option<TrailMetric>` with
+  `#[serde(default)]` (M-10).
 - Mosaic input (§4.1 OSC): `measure_plane` takes a pixel list through `SeedSpec::Given` and a `Domain::RawAdu` plane;
   the green-site fitting is Plan C's own `fit_stars_at` call with a CFA pixel mask — the fitter already takes a
-  `&[PixelSample]`, so no Plan A change is needed; `fit_stars_at` accepts `FitStarsOptions.mask` from
-  Task 6 on (a pixel whose mask bit is false is treated as absent, like a non-finite one).
+  `&[PixelSample]`, so no Plan A change is needed; `fit_stars_at` accepts `FitStarsOptions.mask` and
+  `FitStarsOptions.field_width` from Task 6a on (a pixel whose mask bit is false is treated as absent, like a
+  non-finite one; a `None` field width is computed from the given seeds).
 
 ---
 
-### Task 1: Lab first — families, cards, truth columns, the no-regression tool, the new arms (spec §5 step 1)
+### Task 1a: Lab first — the generator: `disc`, the FWHM 12/16 and donut families, the cards, the truth columns (spec §5 step 1)
 
-No product change. Everything the later tasks measure against exists after this task; the bars are the spec's and
-are already fixed.
+No product change. Everything the later tasks measure against exists after Tasks 1a–1c; the bars are the spec's and
+are already fixed. Task 1a is the generator half (data on disk); Task 1b the lab tooling that reads the probe's new
+lines; Task 1c the no-regression tool and the first diff.
 
 **Files:**
 - Modify: `star-lab/starlab/render.py` (`Component` kind `disc`, `cutout_radius`, `evaluate`),
-  `star-lab/starlab/families.py` (new families, `_cards`, `_stats`, `_truth_rows`, `_build_twins`, `COLS`),
-  `star-lab/starlab/probe_io.py` (`refused` lines, `analysis-mode`), `star-lab/starlab/probe_plan.py`
-  (`legacy-analysis`, `analysis-mode` jobs, `STARLAB_SCRATCH`), `star-lab/starlab/scorecard.py` (new rows,
-  `_threshold`), `star-lab/starlab/scorecard_build.py` (wire the rows), `star-lab/bin/gates.py`
-  (`STARLAB_ACC_COPY`, `STARLAB_SCRATCH`), `star-lab/starlab/__init__.py` (`SCRATCH_ROOT`)
-- Create: `star-lab/bin/augment_v2.py`, `star-lab/bin/scorecard_diff.py`, `star-lab/tests/test_scorecard_diff.py`,
-  `star-lab/tests/test_augment.py`, `star-lab/tests/test_donut.py`
-- Test: `star-lab/tests/test_families.py`, `test_render.py`, `test_scorecard.py`, `test_run_probe.py` (additions)
+  `star-lab/starlab/families.py` (new families, `_cards`, `_write`, `_stats`, `_truth_rows`, `_build_twins`, `COLS`)
+- Create: `star-lab/bin/augment_v2.py`, `star-lab/tests/test_augment.py`, `star-lab/tests/test_donut.py`
+- Test: `star-lab/tests/test_families.py`, `test_render.py` (additions)
 
 **Interfaces:**
-- Consumes: `manifests/v2.json` (164 families), the baseline full scorecard
-  `~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz` (sha256 in the committed summary).
+- Consumes: `manifests/v2.json` (164 families).
 - Produces:
   - families `sharp/m4/f12.0`, `sharp/m4/f16.0`, `sharp/gauss/f12.0`, `sharp/gauss/f16.0` (`kind="field"`,
     `n_stars=300`, `lattice=True`, `min_sep=6·F` = 72 / 96 px, `bins="entry"`) and `donut/r6`, `donut/r10`
     (`kind="field"`, `prof="donut6"`/`"donut10"`, `fwhm=2.6` is the blur, `n_stars=200`, `lattice=True`,
     `min_sep=120`, `kind` of every star row `donut`);
-  - FITS cards on every v2 image: `EGAIN` (e⁻/ADU = `gain/65535`), `ATH_CSCL = 65535.0`, `ATH_CFNM = 1.0` on the
-    float file; `EGAIN` only on the `.u16.fits` sibling; the truth CSV columns `clipped_core_px` (the star's own
-    core pixels — within `max(1, 0.5·fit_fwhm_gm)` px of its noiseless peak — at or above `sat` in the NOISY image),
-    `sat_neighbour_only` (1 when `saturated = 1` and the star's own stamp + background never reaches `sat`),
-    `sat_gray` (1 when the own noiseless peak + background is within 2 % of `sat`), `snr_ap` (the noiseless stamp
-    summed in the PA-11 aperture over `sqrt(S/g + N_ap·(sky/g + rn²))`);
-  - `bin/augment_v2.py manifests/v2.json` — rewrites every existing image's header in place with the three cards
-    appended after the existing ones (data bytes untouched, verified by a sha256 of the data part before and
-    after), appends the four truth columns (re-rendering the noiseless stars from the family's seeds without the
-    CRLB; refuses an image whose re-rendered `flux_img` or `peak` differ from the stored truth by more than 1e-9),
-    updates `sha256` in the manifest, records `augmented` in each record's `extra`;
-  - `probe_io.load` → `{"seeds", "stars", "frames", "refused": {path: [...]}}`; a `refused` line is
-    `{"kind":"refused","path":…, "plane":p, "seed":i, "reason":"regionTooSmall", "regionRadius":r,
-    "backgroundStart":b, "widthStart":w, "growthSteps":g, "iterations":n|null}`;
-  - `probe_plan`: the stack invocation stays `--paths measure,betas,register`; the u16 invocation becomes `--paths
-    legacy-analysis` (JSONL path `analysis`); a NEW invocation per u16 sibling `--paths analysis-mode --domain adu
-    --clip 65535` → `<name>.amode.jsonl` (added to the plan from Task 12 on through `probe_plan.ANALYSIS_MODE =
-    True`; off until then so the diff tool's row sets stay comparable);
-  - scorecard rows (all `_row(...)` with numeric fields so `scorecard_diff.py` can judge them):
-    - row 1 `fit outcomes` per family × path: `accepted + refused = seeds` (`ok` boolean, per-reason counts);
-    - row 1 `donut outcome` (families with kind `donut`): `accepted %`, `refused %` by reason over matched donuts;
-    - row 4 `axis order`: the share of accepted fits with `fwhmX >= fwhmY` (n, share);
-    - row 10 `saturation flag vs truth`: FP = flagged ∧ truth-unsaturated over truth-unsaturated (share), FN = not
-      flagged ∧ `clipped_core_px >= 3` (count), plus the reported counts `neighbour_only`, `gray`, `under_3_core`;
-    - row 6 `star SNR vs truth`: `(snr / snr_ap − 1)` median and 1.4826·MAD over matched unsaturated stars (bias,
-      scatter, n), `n_no_gain` when the frame line says `snrGain: null`;
-    - row 1 `budget coverage` (path `analysis-mode`): `cellsCovered / cellsWithStars` (share);
-    - row 9 `invocation` for `analysis-mode` as for the other one-path tags;
-    - `_threshold(path, frames)`: reads the frame line's `options.measure.seedSource`; `matchedFilter` →
-      (`fisher_snr`, `seedThreshold`), `peak` → (`peak_snr`, `detectionSigma`), `structure` → (`fisher_snr`, 5.0);
-  - `bin/scorecard.py --rows 1,…` (score only the named row groups; Task 6's threshold table reads row 1 alone);
-    `run_probe.py` honours `STAR_PROBE_ARGS` (extra `star_probe` flags appended to every `measure` invocation,
-    recorded in each run record's `cmd` so `--verify` and `complete()` tell the runs apart); `bin/path_compare.py
-    --probe-dir` (part 2 reads a given probe directory instead of the v2 root's);
-  - `bin/scorecard_diff.py <base.json[.gz]> <head.json[.gz]> --out noreg.txt [--design design.json]`: pairs rows by
-    `(row, metric, family, path, plane, bin, truth, egroup)`; per row kind the standard error of the BASE row:
-    `bias/scatter/n` rows → `SE = scatter/√n`; `median/scatter/n` rows → `SE = 1.2533·scatter/√n`; `share` or
-    `completeness`/`raw`/`coverage` over `n` → `SE = √(p(1−p)/n)` floored at `1/n`; `per_mpx` counts → `√count/area`;
-    row 7 `value` rows → `SE = value × (row 3 pointfit all-bin scatter of the same family/path/plane)/√n`;
-    `spearman` rows → `SE = (1−ρ²)/√(n−1)`; cost rows → reported only; LN rows (PA-14) → reported only; a row
-    whose status is `n/a` on either side → reported, not judged. Verdict per judged row: `|head − base| ≤ SE_base`.
-    `--design` lists patterns (`{"row":4,"metric":"angle","family":"shape/*","path":"measure"}`) that are judged by
-    the task's own bar instead and printed in their own table. Exit 1 when any judged row outside the design list
-    moves beyond its SE (either direction: an unexplained improvement is still a change), with the row's base,
-    head, SE and direction printed. A control section counts the `analysis` (legacy) rows that are not
-    bit-identical (PA-15; must be 0).
+  - FITS cards on every v2 image, written by the generator LAST — after `BAYERPAT`, inside `_write`, never in
+    `_cards` (M-5: `_write` inserts `BAYERPAT` after `_cards`, and the OSC `.ideal.fits` and the u16 sibling carry
+    their own card dicts): the float file gets `EGAIN` (e⁻/ADU = `gain/65535`), `ATH_CSCL = 65535.0`, `ATH_CFNM =
+    1.0`; the `.ideal.fits` the same three; the `.u16.fits` sibling `EGAIN` only;
+  - the truth CSV columns `clipped_core_px` (the star's own core pixels — within `max(1, 0.5·fit_fwhm_gm)` px of its
+    noiseless peak — at or above `sat` in the NOISY image), `sat_neighbour_only` (1 when `saturated = 1` and the
+    star's own stamp + background never reaches `sat`), `sat_gray` (1 when the own noiseless peak + background is
+    within 2 % of `sat`), `snr_ap` (the noiseless stamp summed in the PA-11 aperture — radius
+    `max(1.5·fit_fwhm_gm, 3)` — over `sqrt(S/g + N_ap·(sky/g + rn²))`; `fit_fwhm_gm` IS the module's fitted
+    `fwhm()` by D-2, so the SNR bar compares one quantity, M-14);
+  - `bin/augment_v2.py manifests/v2.json` — for every pre-existing record: rewrites the float file's header in
+    place with the three cards appended in the generator's order (data bytes untouched, verified by a sha256 of the
+    data part before and after), rewrites `.ideal.fits` (three cards) and `.u16.fits` (`EGAIN`) the same way,
+    appends the four truth columns (re-rendering the noiseless stars from the family's seeds without the CRLB;
+    refuses an image whose re-rendered `flux_img` or `peak` differ from the stored truth by more than 1e-9),
+    updates `sha256` in the manifest, records `augmented` in each record's `extra`. A regeneration and the
+    augmented file agree byte for byte (`make_v2.py --check` proves it).
 
-- [ ] **Step 1: Write the failing lab tests** (`tests/test_donut.py`, `tests/test_augment.py`,
-  `tests/test_scorecard_diff.py`, additions to `test_families.py`, `test_scorecard.py`, `test_run_probe.py`)
+- [ ] **Step 1: Write the failing lab tests** (`tests/test_donut.py`, `tests/test_augment.py`, additions)
 
 ```python
 """Donut stars (PA-9): a disc convolved with a Gaussian, pixel-integrated, with no width truth."""
@@ -366,10 +355,24 @@ class TestAugment(unittest.TestCase):
         self.assertAlmostEqual(float(h["EGAIN"]), spec["gain"] / 65535.0, places=9)
         self.assertEqual(float(h["ATH_CSCL"]), 65535.0); self.assertEqual(float(h["ATH_CFNM"]), 1.0)
         self.assertEqual(aug.data_sha256(rec["path"]), before)
+        _, hu = fitsio.read_fits(rec["extra"]["u16"])
+        self.assertIn("EGAIN", hu); self.assertNotIn("ATH_CSCL", hu)
         rows = list(csv.DictReader(open(rec["truth"])))
         for c in ("clipped_core_px", "sat_neighbour_only", "sat_gray", "snr_ap"):
             self.assertIn(c, rows[0])
         self.assertTrue(all(float(r["snr_ap"]) > 0 for r in rows if r["saturated"] == "0"))
+
+    def test_augmented_file_equals_a_fresh_generation_byte_for_byte(self):
+        d1, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+        spec = dict(families.FAMILIES["osc/f2.6/m4"]); spec.update(size=256, density=150)
+        families.CARDS_V2 = False                        # the pre-augment generator
+        rec = families.build("osc/f2.6/m4", spec, d1, seed=11, only_first=True)[0]
+        families.CARDS_V2 = True
+        aug.augment_record(rec, spec, seed=11)
+        fresh = families.build("osc/f2.6/m4", spec, d2, seed=11, only_first=True)[0]
+        for a, b in ((rec["path"], fresh["path"]), (rec["extra"]["ideal"], fresh["extra"]["ideal"]),
+                     (rec["extra"]["u16"], fresh["extra"]["u16"])):
+            self.assertEqual(open(a, "rb").read(), open(b, "rb").read(), a)
 
     def test_augment_refuses_a_truth_that_does_not_reproduce(self):
         d = tempfile.mkdtemp()
@@ -378,6 +381,131 @@ class TestAugment(unittest.TestCase):
         with self.assertRaises(aug.TruthMismatch):
             aug.augment_record(rec, spec, seed=12)      # another seed: flux_img differs
 ```
+
+Additions: `test_families.py::test_fwhm16_families_are_isolated_at_six_fwhm` (min_sep ≥ 96 on `sharp/m4/f16.0`,
+every pair of truth positions farther than that), `test_families.py::test_cards_carry_egain_and_cscl_after_bayerpat`
+(card order on an OSC image: …, `BAYERPAT`, `EGAIN`, `ATH_CSCL`, `ATH_CFNM`), `test_families.py::test_clipped_core_px_counts_the_noisy_core`.
+
+- [ ] **Step 2: Run them and see them fail**
+
+Run: `cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab && python3 -m unittest discover -s tests -v 2>&1 | tail -30`
+Expected: `AttributeError`/`ModuleNotFoundError` on `disc`, `augment_v2`, `CARDS_V2`.
+
+- [ ] **Step 3: Implement** render `disc` (evaluate: `w/(π a²)` inside radius `a`, else 0; `cutout_radius`: `a + 3 blur`),
+  the family entries, the cards in `_write` (after `BAYERPAT`; the ideal and u16 dicts), `_stats`/`_write` (the three
+  saturation counts need the NOISY image: computed in `_write` after `noise.apply`, before the CSV is written;
+  `_build_twins` recomputes them per twin), `snr_ap`, `augment_v2.py`.
+
+- [ ] **Step 4: Generate and augment** (heavy; one at a time; `memory_pressure` ≥ 30 % free; disk ≥ 100 GiB)
+
+```
+cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab
+python3 bin/make_v2.py --families sharp/m4/f12.0,sharp/m4/f16.0,sharp/gauss/f12.0,sharp/gauss/f16.0,donut/r6,donut/r10
+python3 bin/augment_v2.py manifests/v2.json            # every pre-existing record; prints per family: cards, columns, sha
+python3 bin/make_v2.py --check --families sharp/m4/f2.6,twins/sharp/m4/f2.6,background/neb3,osc/f2.6/m4,sharp/m4/f16.0,donut/r6
+du -sk ~/.athenaeum-acc/star-lab-v2 | tee results/plan-a/t01a-generator/data-root-kib.txt
+```
+
+Expected: six new families with their SNR-bin reports (the FWHM 12/16 families print `>300` bins as `n/a (ceiling)`
+where the lattice's 300 stars cannot fill them — reported, allowed by P-23); `--check` `ok` on every named family
+(the augmented record regenerates to the same bytes and the same truth); the data root ≤ 10 485 760 KiB.
+
+- [ ] **Step 5: Commit and push** (athenaeum-lab)
+
+```
+lab: Plan A step 1a - FWHM 12/16 and donut families, EGAIN/ATH_CSCL/ATH_CFNM cards after BAYERPAT, saturation and SNR truth columns, augment_v2
+```
+
+**Acceptance:** all lab tests pass; `make_v2.py --check` ok on the six named families; data root ≤ 10 GB; the family
+count in the manifest is 170; every record's `extra.augmented` or a fresh generation. No bar is read.
+
+---
+
+### Task 1b: Lab tooling — the probe's new lines and arms, the scorecard rows, the plan and gate hooks
+
+**Files:**
+- Modify: `star-lab/starlab/probe_io.py` (`refused` lines, `analysis-mode`), `star-lab/starlab/probe_plan.py`
+  (`legacy-analysis`, `analysis-mode` jobs, `STAR_PROBE_ARGS`), `star-lab/bin/run_probe.py` (`STAR_PROBE_ARGS`),
+  `star-lab/starlab/scorecard.py` (new rows, `_threshold`), `star-lab/starlab/scorecard_build.py` (wire the rows),
+  `star-lab/bin/scorecard.py` (`--rows`), `star-lab/bin/path_compare.py` (`--probe-dir`), `star-lab/bin/gates.py`
+  (`STARLAB_ACC_COPY`, `STARLAB_SCRATCH`), `star-lab/starlab/__init__.py` (`SCRATCH_ROOT`)
+- Test: `star-lab/tests/test_scorecard.py`, `test_run_probe.py`, `test_path_compare.py`, `test_gates.py` (additions)
+
+**Interfaces:**
+- Produces:
+  - `probe_io.load` → `{"seeds", "stars", "frames", "refused": {path: [...]}}`; a `refused` line is
+    `{"kind":"refused","path":…, "plane":p, "seed":i, "reason":"regionTooSmall", "regionRadius":r,
+    "backgroundStart":b, "widthStart":w, "growthSteps":g, "iterations":n|null}`;
+  - `probe_plan`: the stack invocation stays `--paths measure,betas,register`; the u16 invocation becomes `--paths
+    legacy-analysis` (JSONL path `analysis`); a NEW invocation per u16 sibling `--paths analysis-mode --domain adu
+    --clip 65535` → `<name>.amode.jsonl` (added to the plan from Task 12 on through `probe_plan.ANALYSIS_MODE =
+    True`; off until then so the diff tool's row sets stay comparable); `run_probe.py` honours `STAR_PROBE_ARGS`
+    (extra `star_probe` flags appended to every `measure` invocation, recorded in each run record's `cmd` so
+    `--verify` and `complete()` tell the runs apart);
+  - scorecard rows (all `_row(...)` with numeric fields so `scorecard_diff.py` can judge them):
+    - row 1 `fit outcomes` per family × path: `accepted + refused = seeds` (`ok` boolean, per-reason counts);
+    - row 1 `donut outcome` (families with kind `donut`): `accepted %`, `refused %` by reason over matched donuts;
+    - row 4 `axis order`: the share of accepted fits with `fwhmX >= fwhmY` (n, share);
+    - row 10 `saturation flag vs truth`: FP = flagged ∧ truth-unsaturated over truth-unsaturated (share), FN = not
+      flagged ∧ `clipped_core_px >= 3` (count), plus the reported counts `neighbour_only`, `gray`, `under_3_core`,
+      `wing_fit_missing` (stars whose frame line says the wing fit returned none, I-3);
+    - row 6 `star SNR vs truth`: `(snr / snr_ap − 1)` median and 1.4826·MAD over matched unsaturated stars (bias,
+      scatter, n), `n_no_gain` when the frame line says `snrGain: null`;
+    - row 1 `budget coverage` (path `analysis-mode`): `cellsCovered / cellsWithStars` (share);
+    - row 9 `invocation` for `analysis-mode` as for the other one-path tags;
+    - `_threshold(path, frames)`: reads the frame line's `options.measure.seedSource`; `matchedFilter` →
+      (`fisher_snr`, `seedThreshold`), `peak` → (`peak_snr`, `detectionSigma`), `structure` → (`fisher_snr`, 5.0);
+  - `bin/scorecard.py --rows 1,…` (score only the named row groups; Task 6a's threshold table reads row 1 alone);
+    `bin/path_compare.py --probe-dir` (part 2 reads a given probe directory instead of the v2 root's); `gates.py`
+    env overrides `STARLAB_ACC_COPY` (default `~/.athenaeum-acc/tierA-lnB-f1`) and `STARLAB_SCRATCH` (default
+    `DATA_ROOT/gates`); `determinism` covers the two new family kinds by construction (it walks the manifest).
+
+- [ ] **Step 1: Write the failing lab tests**: `test_scorecard.py::test_fit_outcomes_row_sums_to_seeds`,
+  `test_saturation_flag_row_counts_fp_fn`, `test_star_snr_row`, `test_axis_order_row`, `test_threshold_reads_seed_source`,
+  `test_budget_coverage_row`; `test_run_probe.py::test_plan_has_legacy_analysis_and_amode_off`,
+  `test_star_probe_args_reach_the_cmd_and_the_record`; `test_path_compare.py::test_probe_dir_argument`;
+  `test_gates.py::test_env_overrides_for_acc_copy_and_scratch`. Each builds hand-made JSONL lines/rows as the existing
+  tests do (`tests/test_scorecard.py` style).
+
+- [ ] **Step 2: Run, fail, implement, run.**
+
+- [ ] **Step 3: Commit and push**
+
+```
+lab: Plan A step 1b - refused lines, legacy-analysis and analysis-mode arms, the fit-outcome / axis-order / saturation / SNR / budget rows, --rows, STAR_PROBE_ARGS, gates env
+```
+
+**Acceptance:** all lab tests pass; `python3 bin/run_probe.py manifests/v2.json --dry-run` lists the same 673 stack/LN
+jobs plus the u16 `legacy-analysis` jobs under their old output names (no output is invalidated: `complete()` reads
+the recorded `cmd`, which for the u16 jobs now differs — those re-run at Task 2; the stack jobs do not).
+
+---
+
+### Task 1c: `scorecard_diff.py` and the baseline rows for the new columns
+
+**Files:**
+- Create: `star-lab/bin/scorecard_diff.py`, `star-lab/tests/test_scorecard_diff.py`
+- Produce: `results/plan-a/t01c-baseline/{scorecard-summary.md,noreg-vs-baseline.txt}`
+
+**Interfaces:**
+- Consumes: the baseline full scorecard `~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz`
+  (sha256 in the committed summary).
+- Produces `bin/scorecard_diff.py <base.json[.gz]> <head.json[.gz]> --out noreg.txt [--design design.json]`: pairs
+  rows by `(row, metric, family, path, plane, bin, truth, egroup)`; per row kind the standard error of the BASE row:
+  `bias/scatter/n` rows → `SE = scatter/√n`; `median/scatter/n` rows → `SE = 1.2533·scatter/√n`; `share` or
+  `completeness`/`raw`/`coverage` over `n` → `SE = √(p(1−p)/n)` floored at `1/n`; `per_mpx` counts → `√count/area`;
+  row 7 `value` rows → `SE = value × (row 3 pointfit all-bin scatter of the same family/path/plane)/√n`;
+  `spearman` rows → `SE = (1−ρ²)/√(n−1)`; cost rows → reported only; LN rows (PA-14) → reported only; a row
+  whose status is `n/a` on either side → reported, not judged. Verdict per judged row: `|head − base| ≤ SE_base`.
+  `--design` lists patterns (`{"row":4,"metric":"angle","family":"shape/*","path":"measure"}`), each optionally
+  carrying `"rule": "one-sided"` (I-5: the row is judged by `|bias_head| ≤ |bias_base| + SE_base` and
+  `scatter_head ≤ scatter_base + SE_base` — a width that got worse is a miss, one that got better is recorded) or
+  no rule (judged by the task's own bar, printed in the design table). Exit 1 when any judged row outside the
+  design list moves beyond its SE (either direction: an unexplained improvement is still a change) or any
+  `one-sided` row misses, with the row's base, head, SE and direction printed. A control section counts the
+  `analysis` (legacy) rows that are not bit-identical (PA-15; must be 0).
+
+- [ ] **Step 1: Write the failing tests** (`tests/test_scorecard_diff.py`)
 
 ```python
 """scorecard_diff.py: the per-row standard error and the verdict."""
@@ -416,75 +544,52 @@ class TestDiff(unittest.TestCase):
         rep = sd.compare(base, head, design=[{"row": 4, "metric": "angle", "family": "shape/*", "path": "measure"}])
         self.assertEqual(rep["moved"], []); self.assertEqual(len(rep["design"]), 1); self.assertEqual(len(rep["ln"]), 1)
 
+    def test_one_sided_design_rule_passes_an_improvement_and_fails_a_worsening(self):
+        base = [row(bias=0.010, scatter=0.005, n=400)]                     # SE 0.00025
+        better = [row(bias=0.002, scatter=0.004, n=400)]
+        worse = [row(bias=0.012, scatter=0.005, n=400)]
+        d = [{"row": 3, "metric": "fwhm", "rule": "one-sided"}]
+        self.assertEqual(sd.compare(base, better, design=d)["one_sided_missed"], [])
+        self.assertEqual(len(sd.compare(base, worse, design=d)["one_sided_missed"]), 1)
+
     def test_legacy_analysis_control_counts_non_identical_rows(self):
         base = [row(path="analysis", bias=0.01)]; head = [row(path="analysis", bias=0.0100001)]
         self.assertEqual(sd.compare(base, head, design=[])["control_mismatch"], 1)
 ```
 
-Additions: `test_families.py::test_fwhm16_families_are_isolated_at_six_fwhm` (min_sep ≥ 96 on `sharp/m4/f16.0`,
-every pair of truth positions farther than that), `test_families.py::test_cards_carry_egain_and_cscl`,
-`test_scorecard.py::test_fit_outcomes_row_sums_to_seeds`, `test_scorecard.py::test_saturation_flag_row_counts_fp_fn`,
-`test_scorecard.py::test_star_snr_row`, `test_scorecard.py::test_axis_order_row`,
-`test_scorecard.py::test_threshold_reads_seed_source`, `test_run_probe.py::test_plan_has_legacy_analysis_and_amode_off`.
+- [ ] **Step 2: Run, fail, implement, run.**
 
-- [ ] **Step 2: Run them and see them fail**
-
-Run: `cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab && python3 -m unittest discover -s tests -v 2>&1 | tail -30`
-Expected: `AttributeError`/`ModuleNotFoundError` on `disc`, `augment_v2`, `scorecard_diff`, `fit outcomes`.
-
-- [ ] **Step 3: Implement** render `disc` (evaluate: `w/(π a²)` inside radius `a`, else 0; `cutout_radius`: `a + 3 blur`),
-  the family entries, `_cards`, `_stats` (the three saturation counts need the NOISY image: compute them in `_write`
-  after `noise.apply`, before the CSV is written; `_build_twins` recomputes them per twin), `snr_ap`, `augment_v2.py`,
-  `probe_io`/`probe_plan`, the rows, `scorecard_diff.py`, `gates.py` env overrides (`STARLAB_ACC_COPY` default
-  `~/.athenaeum-acc/tierA-lnB-f1`; `STARLAB_SCRATCH` default `DATA_ROOT/gates`).
-
-- [ ] **Step 4: Generate and augment** (heavy; one at a time; `memory_pressure` ≥ 30 % free; disk ≥ 100 GiB)
-
-```
-cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab
-python3 bin/make_v2.py --families sharp/m4/f12.0,sharp/m4/f16.0,sharp/gauss/f12.0,sharp/gauss/f16.0,donut/r6,donut/r10
-python3 bin/augment_v2.py manifests/v2.json            # every pre-existing record; prints per family: cards, columns, sha
-python3 bin/make_v2.py --check --families sharp/m4/f2.6,twins/sharp/m4/f2.6,background/neb3,osc/f2.6/m4,sharp/m4/f16.0,donut/r6
-du -sk ~/.athenaeum-acc/star-lab-v2 | tee results/plan-a/t01-lab/data-root-kib.txt
-```
-
-Expected: six new families with their SNR-bin reports (the FWHM 12/16 families print `>300` bins as `n/a (ceiling)`
-where the lattice's 300 stars cannot fill them — reported, allowed by P-23); `--check` `ok` on every named family
-(the augmented record regenerates to the same bytes and the same truth); the data root ≤ 10 485 760 KiB.
-
-- [ ] **Step 5: Rebuild the baseline rows the new rows need, without re-running probes.** The new rows (`fit
+- [ ] **Step 3: Rebuild the baseline rows the new rows need, without re-running probes.** The new rows (`fit
   outcomes`, `axis order`, …) need the probe's new lines, which the baseline binary never wrote; the new truth
   columns need no probe. Build the baseline scorecard ONCE more from the EXISTING probe outputs
-  (`~/.athenaeum-acc/star-lab-v2/probe`, unchanged, verified) so the diff base has the new truth-only rows (`saturation
-  flag vs truth` reads only truth + the baseline's lack of a flag → every baseline star unflagged: FP 0, FN = all).
+  (`~/.athenaeum-acc/star-lab-v2/probe`, unchanged, verified) so the diff base has the new truth-only rows
+  (`saturation flag vs truth` reads only truth + the baseline's lack of a flag → every baseline star unflagged: FP 0,
+  FN = all).
 
 ```
-python3 bin/run_probe.py manifests/v2.json --verify                     # 673 planned, 673 proven (the f5321979 binaries)
-mkdir -p ~/.athenaeum-acc/star-lab-a/t01-lab
+python3 bin/run_probe.py manifests/v2.json --verify                     # the stack/LN jobs proven (f5321979); the u16 jobs report "command differs" (expected, Task 1b)
+mkdir -p ~/.athenaeum-acc/star-lab-a/t01c-baseline
 python3 bin/scorecard.py manifests/v2.json --probe-dir ~/.athenaeum-acc/star-lab-v2/probe --erp-dir ~/.athenaeum-acc/star-lab-v2/erp \
-  --out ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.md --json ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.json
+  --out ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.md --json ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.json
 python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz \
-  ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.json --out results/plan-a/t01-lab/noreg-vs-baseline.txt
-gzip -k ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.json; mkdir -p ~/.athenaeum-acc/star-lab-a/results/t01-lab; mv ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/results/t01-lab/
-python3 bin/scorecard_summary.py ~/.athenaeum-acc/star-lab-a/t01-lab/scorecard.json --out results/plan-a/t01-lab/scorecard-summary.md --full ~/.athenaeum-acc/star-lab-a/results/t01-lab/scorecard.json.gz --title "Plan A t01: baseline rows with the new truth columns"
+  ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.json --out results/plan-a/t01c-baseline/noreg-vs-baseline.txt
+gzip -k ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.json; mkdir -p ~/.athenaeum-acc/star-lab-a/results/t01c-baseline; mv ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/results/t01c-baseline/
+python3 bin/scorecard_summary.py ~/.athenaeum-acc/star-lab-a/t01c-baseline/scorecard.json --out results/plan-a/t01c-baseline/scorecard-summary.md --full ~/.athenaeum-acc/star-lab-a/results/t01c-baseline/scorecard.json.gz --title "Plan A t01c: baseline rows with the new truth columns"
 ```
 
-Expected: the diff reports 0 moved rows among the rows both files hold (the probe outputs are the same; only new
-rows and the ERP cells can differ by nothing), the six new families appear with `output missing` rows (no probe
-output yet — Task 2's run fills them), the legacy-analysis control mismatch is 0.
+Expected: the diff reports 0 moved rows among the rows both files hold (the probe outputs are the same), the six
+new families appear with `output missing` rows (no probe output yet — Task 2's run fills them), the legacy-analysis
+control mismatch is 0.
 
-- [ ] **Step 6: Commit and push** (athenaeum-lab)
+- [ ] **Step 4: Commit and push**
 
 ```
-lab: Plan A step 1 - FWHM 12/16 and donut families, EGAIN/ATH_CSCL cards, saturation and SNR truth columns, the fit-outcome and saturation rows, scorecard_diff
+lab: Plan A step 1c - scorecard_diff (per-row SE, design lists, one-sided rule, the legacy control) and the baseline rows with the new truth columns
 ```
 
-**Acceptance:** all lab tests pass; `make_v2.py --check` ok on the six named families; data root ≤ 10 GB;
-`run_probe.py --verify` 673/673; `noreg-vs-baseline.txt` 0 moved, control 0; the family count in the manifest is 170.
-No bar is read in this task.
+**Acceptance:** all lab tests pass; `noreg-vs-baseline.txt` 0 moved, control 0. No bar is read in Tasks 1a–1c.
 
 ---
-
 ### Task 2: Extraction into `star_measure/` with no behaviour change (spec §5 step 2)
 
 **Files:**
@@ -513,7 +618,22 @@ pub struct MeasureOptions {
     pub max_stars: usize,
     pub seeds: SeedSpec,
     pub fit: FitParams,
+    /// A noise model the caller already computed (the adapter's Median3 arm hands the MRS σ to its detector
+    /// BEFORE detection, `measure.rs:383-404`); `None` = the module computes it. Nothing is computed twice (I-1).
+    pub noise: Option<NoiseModel>,
 }
+
+/// Wall time per phase the module owns (I-1); the adapter adds `read_ms` and `detect_ms` and keeps
+/// `ChannelMeasurement.timings` exactly as today.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PhaseTimings { pub background_ms: u64, pub noise_ms: u64, pub fit_ms: u64 }
+
+/// The stratified-sample sky statistic (`stats::stratified_sample` → `clip_sample` → median / MAD /
+/// avg-dev / `location_scale` / `noise_scale_factors`), moved from the adapter so Plan C reads one value (I-8).
+/// Bit-identical: the same functions, the same sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyLevel { pub median: f64, pub mad: f64, pub median_mean_dev: f64, pub location: f64, pub scale: f64,
+                      pub noise_scale_low: f64, pub noise_scale_high: f64 }
 
 /// Where the seeds come from. Task 2: the adapter detects (Peak/Structure) and passes them in.
 #[derive(Debug, Clone, PartialEq)]
@@ -525,7 +645,9 @@ pub struct PlaneMeasurement {
     pub beta: f64,
     pub frame: FrameAggregates,
     pub noise: NoiseModel,
+    pub sky: SkyLevel,
     pub seeds: usize,
+    pub timings: PhaseTimings,
 }
 
 pub fn measure_plane(plane: &[f32], w: usize, h: usize, opts: &MeasureOptions,
@@ -551,11 +673,15 @@ pub fn fit_stars_at(plane: &[f32], w: usize, h: usize, seeds: &[Seed], beta: f64
   it that).
 - `stacking::measure::measure_plane_detailed` keeps its signature and its seed detection (Peak/Structure/Full on the
   ADU-scaled copy) and hands `SeedSpec::Given(seeds)` to `star_measure::measure_plane`, then builds
-  `ChannelMeasurement` from `PlaneMeasurement` + the sample statistics exactly as before.
+  `ChannelMeasurement` from `PlaneMeasurement` (`sky` for `median`/`mad`/`median_mean_dev`/`location`/`scale`/the
+  noise-scale factors; `timings` + its own `read_ms`/`detect_ms`) exactly as before. The Median3 arm computes the
+  noise first (as today) and passes it as `MeasureOptions.noise`; the `None` arm lets the module compute it — in
+  both arms background/MRS run exactly once, in the same order on the same bytes.
 
 - [ ] **Step 1: Write the failing tests** (in `star_measure/mod.rs` `#[cfg(test)]`; the moved tests of
-  `psf_signal.rs` travel with their code into `fit.rs`/`frame.rs`/`domain.rs` unchanged; `measure.rs`'s test
-  helper `field` becomes `pub(crate)` under `#[cfg(test)]` by a hand edit so the module's tests reuse the fixture)
+  `psf_signal.rs` travel with their code into `fit.rs`/`frame.rs`/`domain.rs` unchanged; `measure.rs`'s `mod tests`
+  becomes `pub(crate) mod tests` and its helper `field` `pub(crate) fn field`, both under `#[cfg(test)]`, by a hand
+  edit so the module's tests reuse the fixture — M-2)
 
 ```rust
 #[test]
@@ -567,14 +693,23 @@ fn module_measure_equals_the_adapter_bit_for_bit() {
     let (pm, seeds) = crate::stacking::measure::measure_plane_detailed(&data, w, h,
         &crate::stacking::measure::MeasureOptions::default(), None, crate::stacking::measure::SeedSource::Fast);
     let opts = MeasureOptions { domain: Domain::Calibrated { gain_e_per_unit: None }, psf_model: PsfModel::Auto,
-        max_stars: 24576, seeds: SeedSpec::Given(seeds), fit: FitParams::default() };
+        max_stars: 24576, seeds: SeedSpec::Given(seeds), fit: FitParams::default(), noise: None };
     let m = measure_plane(&data, w, h, &opts, None);
     assert_eq!(m.stars, pm.fits);
     assert_eq!(m.beta, adapter.channel.beta);
     assert_eq!(m.frame.fwhm_px, adapter.channel.fwhm_px);
     assert_eq!(m.frame.tflux / ADU_SCALE as f64, adapter.channel.tflux);
+    assert_eq!(m.sky.median, adapter.channel.median);
+    assert_eq!(m.sky.scale, adapter.channel.scale);
 }
 
+#[test]
+fn a_precomputed_noise_model_is_used_and_not_recomputed() {
+    // MeasureOptions.noise = Some(model with sigma 123.0): PlaneMeasurement.noise == that model and timings.noise_ms == 0
+}
+
+/// A smoke only (M-11): after the move the wrapper and the entry point share one body. The real pins of this
+/// task are the probe parity gate and `measure.rs`'s literals.
 #[test]
 fn fit_stars_at_equals_fit_stars_with_beta() {
     use crate::test_support::{moffat_field, MoffatStar};
@@ -620,7 +755,9 @@ CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo check -p athen
 Expected: every pre-existing pin passes untouched, in particular
 `the_shipped_none_path_measures_exactly_these_numbers`, `measure_plane_with_seeds_pinned_before_task_3b_rewrite`,
 `seed_source_fast_is_bit_identical_to_measure_plane`,
-`measure_plane_detailed_returns_the_seeds_it_fitted_and_the_same_measurement`, `fit_stars_with_beta_matches_fit_stars_for_the_resolved_beta`;
+`measure_plane_detailed_returns_the_seeds_it_fitted_and_the_same_measurement`, `fit_stars_with_beta_matches_fit_stars_for_the_resolved_beta`,
+`measure_timings_are_components_of_the_plane_duration` (I-1: the per-phase timings still reach `ChannelMeasurement`),
+`the_median_prefilter_keeps_a_well_sampled_population` (the Median3 arm with the precomputed noise);
 the headless build compiles (the module is `render`-only); the `render`-only build compiles without `solver`
 (the module never names `stacking`).
 
@@ -632,16 +769,20 @@ cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab
 STARLAB_SCRATCH=~/.athenaeum-acc/star-lab-a/t02-extract/gates python3 bin/gates.py --only probe_build,probe_parity,seed_parity | tee results/plan-a/t02-extract/gates.txt
 python3 bin/run_probe.py manifests/v2.json --out ~/.athenaeum-acc/star-lab-a/t02-extract/probe && python3 bin/run_probe.py manifests/v2.json --out ~/.athenaeum-acc/star-lab-a/t02-extract/probe --verify
 python3 bin/scorecard.py manifests/v2.json --probe-dir ~/.athenaeum-acc/star-lab-a/t02-extract/probe --erp-dir ~/.athenaeum-acc/star-lab-v2/erp --out ~/.athenaeum-acc/star-lab-a/t02-extract/scorecard.md --json ~/.athenaeum-acc/star-lab-a/t02-extract/scorecard.json
-python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t01-lab/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/t02-extract/scorecard.json --out results/plan-a/t02-extract/noreg.txt
+python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t01c-baseline/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/t02-extract/scorecard.json --out results/plan-a/t02-extract/noreg.txt
 python3 bin/scorecard_summary.py ~/.athenaeum-acc/star-lab-a/t02-extract/scorecard.json --out results/plan-a/t02-extract/scorecard-summary.md --full <gz> --title "Plan A t02: extraction"
 diff <(grep -v '^From \|built ' results/baseline-2026-10-07/scorecard-summary.md) <(grep -v '^From \|built \|f12.0\|f16.0\|donut\|fit outcomes\|axis order\|saturation flag\|star SNR' results/plan-a/t02-extract/scorecard-summary.md)
+# I-7: the legacy control's own determinism, once, with THIS binary
+for f in sharp/m4/f2.6/i0 background/neb3_4096/i0 osc/f2.6/m4/i0; do for r in 1 2; do $PROBE measure ~/.athenaeum-acc/star-lab-v2/$f.u16.fits --paths legacy-analysis --out /tmp/claude-501/ctrl-$r.jsonl; done; cmp /tmp/claude-501/ctrl-1.jsonl /tmp/claude-501/ctrl-2.jsonl && echo "$f: identical"; done | tee results/plan-a/t02-extract/control-determinism.txt
 ```
 
 Expected: `probe_parity` PASS with `0 mismatches` against `tierA-lnB-f1`'s stored `.athf` (the OLD binary's artifact
 read by the NEW module's numbers — the bit-identity proof after one f32 narrowing); `seed_parity` PASS; the
 scorecard diff: every judged row identical (0 moved, and the printed max |Δ| over all paired numeric fields is 0.0);
 the summary diff: no line of the baseline summary changes (the only additions are the new families' and rows'
-lines). The six new families now have measure rows (their numbers are simply recorded here; no bar).
+lines). The six new families now have measure rows (their numbers are simply recorded here; no bar). The control
+determinism file reads `identical` three times, which arms PA-15's bit-identity rule; otherwise PA-15's tolerance
+rule applies from here on (the file says which).
 
 - [ ] **Step 6: Commit** (athenaeum, no push; lab results committed and pushed)
 
@@ -664,7 +805,8 @@ and render-only checks green. Numbers: none read as a bar; the baseline cells ar
   (remove `PSF_FIT_VERSION`), `crates/athenaeum-core/src/stacking/config.rs` (lines 19, 806–878: the three
   subtrees, their doc comments, the `*_with_fit_version` helpers renamed `*_with_measure_version`; the JSON key
   `"psfFitVersion"` → `"measureVersion"`), `crates/athenaeum-core/src/stacking/plan.rs` (hand-edit the three
-  comment lines 581, 3187, 6410 that name `PSF_FIT_VERSION`), `crates/athenaeum-core/src/stacking/measure.rs`
+  comment lines 581, 3187, 6410 that name `PSF_FIT_VERSION`, and the pinned literals of
+  `stage_hashes_are_pinned_to_golden_literals` at line 7828), `crates/athenaeum-core/src/stacking/measure.rs`
   (hand-edit the doc comment at line 1071), `docs/stacking/README.md` (the Tier C paragraph's `PSF_FIT_VERSION = 3`
   gets a pointer to the new section; the new section records the policy)
 
@@ -692,10 +834,13 @@ fn every_fit_reading_stage_hash_follows_measure_version() {
 }
 ```
 
-Update `stage_hashes_are_pinned_to_golden_literals` (its three fit-reading literals move; the calibration and
-prepare literals must NOT move — assert that explicitly) and the Measure-only staleness test named in the spec
-(`measure.rs:1071`'s doc comment and `plan.rs`'s `fits_artifact_fresh` tests, which key on `PSF_FIT_VERSION 3`:
-they read the constant through `MEASURE_VERSION` now).
+Update `stage_hashes_are_pinned_to_golden_literals` — it lives in `crates/athenaeum-core/src/stacking/plan.rs`
+(line 7828, a never-rustfmt file: hand edit; its three fit-reading literals move; the calibration and prepare
+literals must NOT move — assert that explicitly, M-1); replace
+`all_three_fit_derived_subtree_hashes_follow_the_psf_fit_version` (`config.rs:1594`) with the test above so no
+dangling `PSF_FIT_VERSION` remains; and the Measure-only staleness test named in the spec (`measure.rs:1071`'s
+doc comment and `plan.rs`'s `fits_artifact_fresh` tests, which key on `PSF_FIT_VERSION 3`: they read the constant
+through `MEASURE_VERSION` now).
 
 - [ ] **Step 2: Run, see them fail, implement, run again**
 
@@ -741,11 +886,11 @@ Numbers unchanged; every seed gets an outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RefusalReason {
-    /// The width-start box (Task 6) / the nominal stamp (today) leaves the image.
+    /// The width-start box (Task 6b) / the nominal stamp (today) leaves the image.
     OutsideImage,
     /// Fewer than 10 finite pixels in the region.
     TooFewPixels,
-    /// The core is darker than the ring (Task 6's donut test).
+    /// The core is darker than the ring (Task 6b's donut test).
     Donut,
     /// The fitter returned `None` (α < 0.3, A ≤ 0, β out of bounds).
     FitFailed,
@@ -754,7 +899,7 @@ pub enum RefusalReason {
     CentreMoved,
     CentreAtRim,
     RegionTooSmall,
-    /// `min(fwhm_x, fwhm_y) < 0.8` px (Task 6; a hot pixel that got a seed).
+    /// `min(fwhm_x, fwhm_y) < 0.8` px (Task 6b; a hot pixel that got a seed).
     NarrowerThanPixel,
     Duplicate,
 }
@@ -788,6 +933,10 @@ impl RefusalCounts { pub fn total(&self) -> usize; pub fn add(&mut self, r: Refu
   24576 seeds).
 - The invariant `stars_fitted + stars_refused == stars_detected` is an assertion inside `measure_plane`
   (`debug_assert!` + a test), and a scorecard row.
+- How the outcomes are collected (M-4): the same `seeds.par_iter().map_init(FitScratch::default, …)` chain now
+  yields `Outcome` per seed and is `collect()`ed into a `Vec` in seed order (rayon's indexed collect keeps the
+  order); the accepted fits are then extracted sequentially — never a `Mutex` or a channel — so `dedupe`'s input
+  and the Kahan sums of `signal_totals` see exactly the order they see today and the pins stay exact.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -917,15 +1066,19 @@ fn eccentricity_and_fwhm_are_unchanged_by_the_swap() { /* fwhm() and eccentricit
 - [ ] **Step 3: Lab cycle** `t05-f2`, with `--design`:
   `{"row":4,"metric":"angle"}`, `{"row":4,"metric":"axis order"}`, `{"row":4,"metric":"ecc","family":"shape/*"}`,
   `{"row":3,"metric":"fwhm axis"}`, `{"row":2,"metric":"centroid"}` (the conditioning may move centroids within
-  their own CRLB), `{"row":7}` (frame values follow the fits by last bits), `{"row":11}`, and every `measure`/`betas`
-  row of rows 3, 5, 6 `captured fraction` within SE (judged, not design).
+  their own CRLB), `{"row":7}` (frame values follow the fits), `{"row":11}`, and — I-5 — `{"row":3,"rule":"one-sided"}`
+  and `{"row":5,"rule":"one-sided"}` on every family × path `measure`/`betas`: the conditioning changes WHEN every
+  fit stops (today's `‖Δp‖/‖p‖ < 1e-5` spans absolute pixel coordinates, so a 0.01–0.03 px step in α counted as
+  converged on a 2048² image), so widths and backgrounds move by more than a last bit; their bar is one-sided —
+  `|bias_head| ≤ |bias_base| + SE_base` and `scatter_head ≤ scatter_base + SE_base` — a row that got worse is a
+  miss that goes to the owner, one that got better is recorded. Row 6 `captured fraction` is judged within SE.
 
 - [ ] **Step 4: Read the bar.** Row 4 `axis order` = 100 % on every family × path `measure`; row 4 `angle` on the
   `shape/*` families at e ≥ 0.3, the `eff` cell (prepixel CRLB): ≤ 1.5 on each of the 24 families with e ∈ {0.3,
   0.5, 0.7}. Baseline for the record: `shape/f2.6/e0.3/t30` rms 44.564°, `e0.5/t30` 32.339° (ERP 7.849° / 2.129°).
 
 - [ ] **Step 5: `path_compare.py` part 2** re-run on the t05 outputs (`--data-root` pointing at the v2 root, the probe
-  dir argument added in Task 1) → `results/plan-a/t05-f2/path-compare.txt`: the "fwhm_x < fwhm_y" counts must be 0
+  dir argument added in Task 1b) → `results/plan-a/t05-f2/path-compare.txt`: the "fwhm_x < fwhm_y" counts must be 0
   of N on every `e0.3` family (baseline 71–145 of 346–427).
 
 - [ ] **Step 6: No-regression**: `noreg.txt` 0 moved outside the design list; control 0.
@@ -947,33 +1100,38 @@ fix(star_measure): F-2 canonical axes (fwhm_x >= fwhm_y, theta on the major axis
 ```
 
 **Acceptance:** `axis order` 100 %; angle `eff` ≤ 1.5 on every `shape` family at e ≥ 0.3 (24 rows, each printed in
-`results/plan-a/t05-f2/bars.txt`); part 2 counts 0; `noreg.txt` 0 moved outside the design list. A miss → the owner,
-with the 24 cells, before Task 6.
+`results/plan-a/t05-f2/bars.txt`); part 2 counts 0; `noreg.txt` 0 moved outside the design list and 0 one-sided
+rows missed. A miss → the owner, with the 24 cells, before Task 6a.
 
 ---
 
-### Task 6: F-1 with F-7 — the matched-filter seeds, the region, the rim background and the per-star width start (spec §3 F-1, F-7)
+### Task 6a: F-1, the seeds — the matched filter, the mask, the PA-2 threshold sweep (spec §2.1 `seeds`, §3 F-1)
+
+No fit change in this task: `fit_one` is Task 5's. The seeds change; the threshold is chosen on the `seeds` rows
+before any fitted bar exists (PA-2 made structural).
 
 **Files:**
 - Create: `crates/athenaeum-core/src/star_measure/seeds.rs`
-- Modify: `star_measure/fit.rs` (`fit_one`: width start, region rule PA-12, rim `b0`, the donut and
-  narrower-than-pixel refusals, the pixel mask), `star_measure/mod.rs` (`SeedSpec::MatchedFilter { threshold }`,
-  `FitStarsOptions { fit: FitParams, mask: Option<Vec<bool>> }` — `fit_stars_at(plane, w, h, seeds, beta,
-  opts: &FitStarsOptions, pool)` replaces Task 2's `fit: &FitParams` argument, and `measure_plane` takes the mask
-  through `MeasureOptions.mask: Option<Vec<bool>>`; `PlaneMeasurement.field_width`), `stacking/measure.rs` (hand edit: `SeedSource::Fast` keeps
-  Peak for now — the config switch is Task 7; a probe override `SeedOverride::MatchedFilter` so the lab measures
-  the new seeds before the config lands), `examples/star_probe.rs` (`--seeds matched|peak|structure`, default
-  `matched` from this task on), `docs/stacking/README.md` (R-OSP-2 the threshold choice, R-OSP-4 the region rule)
+- Modify: `star_measure/mod.rs` (`SeedSpec::MatchedFilter { threshold }`, `MeasureOptions.mask: Option<Vec<bool>>`,
+  `FitStarsOptions { fit: FitParams, mask: Option<Vec<bool>>, field_width: Option<f64> }` — `fit_stars_at(plane, w,
+  h, seeds, beta, opts: &FitStarsOptions, pool)` replaces Task 2's `fit: &FitParams` argument; `PlaneMeasurement.field_width:
+  FieldWidth`), `star_measure/fit.rs` (the mask honoured in the region and the aperture; `field_width` threaded to
+  `fit_one` for Task 6b), `star_measure/domain.rs` (`NoiseSource::None`), `stacking/measure.rs` (hand edit:
+  `SeedSource::Fast` keeps Peak for now — the config switch is Task 7; a probe override `SeedOverride::MatchedFilter`
+  so the lab measures the new seeds before the config lands), `examples/star_probe.rs` (`--seeds
+  matched|peak|structure`, `--seed-threshold K`; default `matched` from this task on), `docs/stacking/README.md`
+  (R-OSP-2 the threshold choice)
 
 **Interfaces:**
 - Produces (`seeds.rs`):
 
 ```rust
-/// A Gaussian matched filter at the field width, in a separable convolution over the finite pixels
+/// A Gaussian matched filter at the field width, in a separable convolution over the finite, unmasked pixels
 /// (a non-finite or masked pixel contributes nothing and normalises nothing — the border is not a star).
 pub struct MatchedFilter { pub fwhm_px: f64 }
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FieldWidth { pub fwhm_px: f64, pub from_stars: usize }
-pub const DEFAULT_THRESHOLD: f64 = <k chosen by PA-2>;
+pub const DEFAULT_THRESHOLD: f64 = <k chosen by PA-2 in step 4>;
 /// Two passes: a 3-px kernel finds the 100 brightest candidates, their moment widths give the field width
 /// (median, clamped to [1.5, 24] px); the second pass runs at that width. A field width ≥ 6 px runs the second
 /// pass on the 2×2 super-pixel plane (kernel halved; candidate positions ×2, refined on the full plane).
@@ -982,20 +1140,18 @@ pub const DEFAULT_THRESHOLD: f64 = <k chosen by PA-2>;
 /// UNFILTERED plane (the hot-pixel rule). Position: the flux-weighted centroid in a (2·ceil(F)+1)² box on the
 /// background-subtracted plane; `peak` = that box's maximum − background; `flux` = the filtered response (the
 /// matched filter's integrated signal — the selection key). Sorted by `flux` descending, truncated to `max_stars`.
+/// A `NoiseModel` with `source == NoiseSource::None` returns no seeds and one `warn!` (Review Focus 4).
+/// Public: Plan C calls it on its own 2×2 super-pixel OSC plane (I-8).
 pub fn detect(plane: &[f32], w: usize, h: usize, noise: &NoiseModel, threshold: f64, max_stars: usize,
               mask: Option<&[bool]>, pool: Option<&Arc<rayon::ThreadPool>>) -> (Vec<Seed>, FieldWidth);
+/// The field width of GIVEN seeds (I-4): the median moment width of the ≤ 100 brightest in a fixed 15-px box,
+/// clamped to [1.5, 24] px — the retired `initial_sigma`'s role in FWHM units. `fit_stars_at` calls it when
+/// `FitStarsOptions.field_width` is `None` (LN refits, Peak/Structure seeds, Plan C's mosaic sites).
+pub fn field_width_of(plane: &[f32], w: usize, h: usize, seeds: &[Seed], mask: Option<&[bool]>) -> FieldWidth;
 ```
 
-  `fit_one` (PA-12): `F_start` per star from background-subtracted second moments in a box of radius
-  `2·F_field` (clamped [0.6, 40] px; the box's own rim median is the subtraction level), the region grows from
-  `r_start = max(3, ceil(1.5·F_start))` to `r_max = clamp(ceil(6·F_start), 6, 96)` while `(m_r − s_r) >
-  0.01·(max − s_r)`; `b0 = s_r` (the final rim median); `a0 = max − b0`; the start σ from `F_start` with the
-  moment axis ratio as today. Refusals: `Donut` when the 3×3 core mean about the moment centroid is below
-  `0.8 ×` the mean of the 1-px ring at radius `F_start/2.3548` (both background-subtracted) — a Gaussian reads a
-  ratio ≈ 1.4; `NarrowerThanPixel` when the accepted `min(fwhm_x, fwhm_y) < 0.8` px. Admission (`OutsideImage`)
-  tests the width-start box, no longer a field-level nominal stamp (`initial_sigma`/`stamp_radius` are retired).
 - The adapter: `SeedOverride::MatchedFilter` (probe) runs `seeds::detect` on the ADU-scaled plane with the module's
-  `NoiseModel`; `Peak`/`Structure` unchanged.
+  `NoiseModel`; `Peak`/`Structure` unchanged, their seeds' `field_width` from `field_width_of`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1021,10 +1177,76 @@ fn refused_noise_estimate_seeds_nothing_and_warns() {
 }
 
 #[test]
-fn hot_pixel_is_not_seeded_and_if_given_is_refused_narrower_than_pixel() {
-    // a single pixel at 0.9 on sky 0.05 with 0.002 noise: detect → 0 seeds; SeedSpec::Given at its position → Refused(NarrowerThanPixel)
+fn hot_pixel_is_not_seeded() {
+    // a single pixel at 0.9 on sky 0.05 with 0.002 noise: detect → 0 seeds (the cross-neighbour rule)
 }
 
+#[test]
+fn given_seeds_get_a_field_width_from_their_own_moments() {
+    // 30 Moffat-4 stars at FWHM 5 handed as SeedSpec::Given / fit_stars_at with field_width None:
+    // PlaneMeasurement.field_width.fwhm_px within 10 % of 5.0, from_stars == 30
+}
+
+#[test]
+fn pixel_mask_excludes_masked_pixels_from_detection_and_fit() {
+    // a checkerboard mask: detect sees only unmasked pixels; the fit's pixel count equals the unmasked count in the region
+}
+```
+
+- [ ] **Step 2: Run, fail, implement, run.** The `measure.rs` pins hold (the adapter default is still Peak; the fits
+  are Task 5's) except that `field_width_of` replaces `initial_sigma` for the size start — a bit-level move on the
+  Peak path too: re-pin the literals with the comment "Task 6a: the size start comes from the seeds' own moment
+  width (I-4)". `fit_stars_at_equals_fit_stars_with_beta` (Task 2) keeps passing: both go through `field_width_of`.
+
+- [ ] **Step 3: Lab cycle** `t06a-seeds` with `--seeds matched` at a PROVISIONAL `K = 4.0` (the sweep follows; this run
+  exists so the `seeds` rows and the fitted rows at the new seeds are recorded before step 4 chooses): `--design`:
+  `{"row":1}` (the seed population), `{"row":2,"path":"seeds"}`, `{"row":10,"metric":"seed flux rank"}`,
+  `{"row":3}`, `{"row":5}`, `{"row":7}`, `{"row":11}`, `{"row":4,"metric":"floor"}`, `{"row":6,"metric":"captured
+  fraction"}` (new seeds → new fitted population; the fits themselves are unchanged) — judged: row 4 `ecc`, `angle`,
+  `axis order` on `shape/*`, row 2 `measure`, every `register`/`analysis` row.
+
+- [ ] **Step 4: Choose the threshold (PA-2).** Build the probe once (it takes `--seed-threshold`); run only the 46
+  `twins/*` t1 images and `artefacts` at K ∈ {3.0, 3.5, 4.0, 4.5, 5.0, 6.0} (`run_probe.py --families … --out
+  ~/.athenaeum-acc/star-lab-a/t06a-k/K<k>/probe` with `STAR_PROBE_ARGS="--seeds matched --seed-threshold <k>"`),
+  score row 1 only (`scorecard.py --rows 1`), and tabulate `false detections / Mpx` cause `nothing` per image on
+  the `seeds` path. `DEFAULT_THRESHOLD` = the smallest K with every image ≤ 0.5. The 7 `background/*` images join the
+  sweep AS A REPORTED COLUMN (M-9: they carry F-6/F-7 bars, so they do not decide; the nebula knots are printed so
+  the chosen K's false-positive rate on them is known before Task 6b reads the bars). Commit the table as
+  `results/plan-a/t06a-seeds/threshold-choice.txt`, set the constant, rebuild the probe, and re-run step 3's cycle
+  at the chosen K (the committed `t06a-seeds` summary is the one at `DEFAULT_THRESHOLD`).
+
+- [ ] **Step 5: Record R-OSP-2** (the table, the value, the data it was chosen on) in `docs/stacking/README.md`. Commit.
+
+```
+feat(star_measure): F-1 seeds - a two-pass matched filter at the field width (threshold <k>, ruling R-OSP-2), the pixel mask, the field width of given seeds; no fit change
+```
+
+**Acceptance:** the six tests green; the threshold table committed with the chosen K and its rule; `noreg.txt` 0
+moved outside the design list; control 0. No fitted bar is read here (Task 6b).
+
+---
+
+### Task 6b: F-1 with F-7, the fit — the region, the rim background, the per-star width start, the donut and hot-pixel refusals (spec §3 F-1, F-7)
+
+**Files:**
+- Modify: `star_measure/fit.rs` (`fit_one`: width start, region rule PA-12, rim `b0`, the `Donut` and
+  `NarrowerThanPixel` refusals), `star_measure/diagnostics.rs` (the two reasons were declared in Task 4),
+  `examples/star_probe.rs` (nothing new), `docs/stacking/README.md` (R-OSP-4 the region rule)
+
+**Interfaces:**
+- Produces: `fit_one` (PA-12): `F_start` per star from background-subtracted second moments in a box of radius
+  `2·F_field` (`F_field` = `FieldWidth.fwhm_px`, from the matched filter or `field_width_of`; the box's own rim median
+  is the subtraction level; clamped [0.6, 40] px), the region grows from `r_start = max(3, ceil(1.5·F_start))` to
+  `r_max = clamp(ceil(6·F_start), 6, 96)` while `(m_r − s_r) > 0.01·(max − s_r)`; `b0 = s_r` (the final rim median);
+  `a0 = max − b0`; the start σ from `F_start` with the moment axis ratio as today. Refusals: `Donut` when the 3×3 core
+  mean about the moment centroid is below `0.8 ×` the mean of the 1-px ring at radius `F_start/2.3548` (both
+  background-subtracted) — a Gaussian reads a ratio ≈ 1.4; `NarrowerThanPixel` when the accepted `min(fwhm_x, fwhm_y)
+  < 0.8` px. Admission (`OutsideImage`) tests the width-start box, no longer a field-level nominal stamp
+  (`stamp_radius` is retired; `initial_sigma` went in Task 6a).
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
 #[test]
 fn broad_stars_fit_inside_a_region_that_scales_with_their_own_width() {
     // 20 Moffat-4 stars at FWHM 14 px (α ≈ 16) on 1024²: every fit accepted, region_radius ≥ 0.5·growth·FWTM, no RegionTooSmall
@@ -1037,38 +1259,34 @@ fn donut_is_refused_with_its_reason() {
 }
 
 #[test]
+fn a_given_hot_pixel_is_refused_narrower_than_pixel() {
+    // SeedSpec::Given at a single 0.9 pixel on sky 0.05: Refused(NarrowerThanPixel)
+}
+
+#[test]
 fn rim_background_start_is_the_sky_under_nebulosity() {
     // a star on a quadratic nebula ramp: |b0 − local sky| < 0.3 σ (the F-7 bar's own condition, unit-tested on one star)
 }
 
 #[test]
-fn pixel_mask_excludes_masked_pixels_from_detection_and_fit() {
-    // a checkerboard mask: the fit uses only unmasked pixels (its pixel count equals the unmasked count in the region)
+fn edge_region_is_clipped_by_the_border_and_still_refuses_when_too_small() {
+    // a star 10 px from the border at FWHM 8: the region stops at the border; RegionTooSmall when 0.5·FWTM > r
 }
 ```
 
-- [ ] **Step 2: Run, fail, implement, run.** Then the pins: `measure.rs`'s pinned literals hold for the PEAK seeds
-  (the adapter default is still Peak until Task 7) but `fit_one`'s region/background/width start moved the fits by
-  design → the literals move again with their comment. `psf_signal.rs`'s
-  `fixed_beta_fit_recovers_centre_width_background_and_aperture_signal` must still pass at its tolerances.
+- [ ] **Step 2: Run, fail, implement, run.** The `measure.rs` and `psf_signal.rs` literals move by design (region,
+  background, width start) → re-pinned with their comment; `fixed_beta_fit_recovers_centre_width_background_and_aperture_signal`
+  must still pass at its tolerances.
 
-- [ ] **Step 3: Choose the threshold (PA-2) BEFORE any F-1 bar is read.** Build the probe with `--seeds matched
-  --seed-threshold K`; run only the 46 `twins/*` t1 images and the 7 `background/*` images at K ∈ {3.0, 3.5, 4.0,
-  4.5, 5.0, 6.0} (`run_probe.py --families … --out ~/.athenaeum-acc/star-lab-a/t06-k/K<k>/probe` with
-  `STAR_PROBE_ARGS="--seeds matched --seed-threshold <k>"`, a pass-through the plan gains in Task 1), score row 1
-  only (`scorecard.py --rows 1`, a flag added in Task 1), and tabulate `false detections / Mpx` cause `nothing` per
-  image. `DEFAULT_THRESHOLD` = the smallest K with every image ≤ 0.5. Commit the table as
-  `results/plan-a/t06-f1/threshold-choice.txt` and set the constant. Only then run step 4.
+- [ ] **Step 3: Lab cycle** `t06b-f1` (v2 AND `manifests/inject.json` → `~/.athenaeum-acc/star-lab-a/t06b-f1/inject-probe`;
+  the probe's default seeds are `matched` at `DEFAULT_THRESHOLD`). `--design`: `{"row":1,"metric":"fit outcomes"}`,
+  `{"row":1,"metric":"completeness"}`, `{"row":1,"metric":"donut outcome"}`, `{"row":3}`, `{"row":5}`, `{"row":7}`,
+  `{"row":10}`, `{"row":11}`, `{"row":4,"metric":"floor"}`, `{"row":6,"metric":"captured fraction"}` (the region and
+  background move the signal) — the judged remainder is row 4 `ecc`/`angle`/`axis order` on `shape/*` (F-2's gains
+  must hold), row 2 `measure` centroids, row 1 `false detections` and `bright coverage` (the seeds are Task 6a's),
+  and every `register`/`analysis` row.
 
-- [ ] **Step 4: Lab cycle** `t06-f1` (v2 AND `manifests/inject.json` → `~/.athenaeum-acc/star-lab-a/t06-f1/inject-probe`;
-  the probe's default seeds are now `matched`). `--design`: `{"row":1}` (the seed population changes: completeness
-  against the new threshold, false detections, bright coverage, doubles), `{"row":2,"path":"seeds"}`,
-  `{"row":3}`, `{"row":5}`, `{"row":7}`, `{"row":10}`, `{"row":11}`, `{"row":4,"metric":"floor"}`,
-  `{"row":6,"metric":"captured fraction"}` (the region and background move the signal) — i.e. F-1 touches most
-  measure rows by design; the judged remainder is row 4 `ecc`/`angle`/`axis order` on `shape/*` (F-2's gains must
-  hold), row 2 `measure` centroids, and every `register`/`analysis` row.
-
-- [ ] **Step 5: Read the bars** (`results/plan-a/t06-f1/bars.txt`, cells copied verbatim):
+- [ ] **Step 4: Read the bars** (`results/plan-a/t06b-f1/bars.txt`, cells copied verbatim):
   - fitted / seeded at FWHM 8: `sharp/m4/f8.0` frame line `fits / seeds` ≥ 99 % (baseline 82.7 % fitted of 92.0 %
     seeded, i.e. 0.899 of the seeds);
   - frame FWHM error vs `pointfit` ≤ 1 % on `sharp/m4/f{2.6,3.5,5.0,8.0,12.0,16.0}` (row 7 `frame FWHM` ÷ the
@@ -1080,30 +1298,30 @@ fn pixel_mask_excludes_masked_pixels_from_detection_and_fit() {
   - raw mode (injections): row 1 completeness of the injected stars above the threshold ≥ 99 % on the 7 raw
     entries and 3 mosaics (`inject/raw/*`, `inject/mosaic/*`; baseline `raw/corpus` 96.9–97.4 %, the Pro raw
     96.3–98.4 %); the injected FWHM bias recorded (judged at Task 9 with F-4);
-  - `_DSC5767.fit` is the corpus's; its seed count is read at Task 12 (the corpus run).
-  - Cost: the probe's `measure` wall on `background/neb3_4096` (baseline 0.39 s) and the m42 corpus measure batch are
-    read at Task 12; here the per-family row 9 cells are recorded.
+  - `_DSC5767.fit` is the corpus's; its seed count is read at Task 12 (the corpus run);
+  - cost: the per-family row 9 cells are recorded (the m42 corpus batch and the stage time are Tasks 12 and 13).
 
-- [ ] **Step 6: Record** R-OSP-2 (the threshold table and value), R-OSP-4 (PA-12's rule and the donut/hot-pixel
-  refusals) in `docs/stacking/README.md`. Commit.
+- [ ] **Step 5: Record** R-OSP-4 (PA-12's rule and the donut/hot-pixel refusals) in `docs/stacking/README.md`. Commit.
 
 ```
-fix(star_measure): F-1/F-7 matched-filter seeds at the field width (threshold <k>, ruling R-OSP-2), per-star width start, a region that scales with the star, the rim background start, donut and hot-pixel refusals (<bar cells>)
+fix(star_measure): F-1/F-7 per-star width start, a region that scales with the star, the rim background start, donut and hot-pixel refusals (<bar cells>)
 ```
 
-**Acceptance:** every bar in step 5 met, cells verbatim in `bars.txt`; `noreg.txt` 0 moved outside the design
+**Acceptance:** every bar in step 4 met, cells verbatim in `bars.txt`; `noreg.txt` 0 moved outside the design
 list; control 0. A miss → the owner with the cells; Task 7 waits. (Every `<cells>` in a commit message of this
 plan is filled with the measured numbers from that task's `bars.txt`; a commit never carries the angle brackets.)
 
 ---
-
 ### Task 7: The stacking Measure config — `seed_source`, the legacy decode, presets, the panel, R-M4c-11 (spec §2.2)
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/stacking/config.rs` (`MeasurementConfig` gains `seed_source: SeedSource`,
   `seed_threshold: f64`; a shadow-struct `Deserialize`; `clamp_seed_threshold`), `crates/athenaeum-core/src/stacking/measure.rs`
   (hand edits: `MeasureOptions.seed_source`, `SeedSource` → `SeedOverride` for the probe override, the adapter's
-  dispatch; `DEFAULT_SEED_DETECTOR` retired), `crates/athenaeum-core/src/ts_export.rs` (`SeedSource`),
+  dispatch; `DEFAULT_SEED_DETECTOR` retired), `crates/athenaeum-core/examples/weight_audit.rs` and
+  `examples/integrate_probe.rs` (the `SeedSource` → `SeedOverride` rename reaches them too, M-3: `grep -rl
+  SeedSource crates/athenaeum-core/examples` before the build so `--all-targets` is green),
+  `crates/athenaeum-core/src/ts_export.rs` (`SeedSource`),
   `src/types/stacking.ts` (regenerated), `src/components/stacking/panels/MeasurePanel.tsx`,
   `src/components/stacking/stageSummary.ts` (`seedSourceLabel`), `src/settings/registry.ts` (no change: the
   stacking tab lists sections, not fields), `crates/athenaeum-core/src/api/stacking.rs` (nothing: presets and
@@ -1190,8 +1408,8 @@ fn seed_threshold_is_clamped_with_a_warn() { … }
   literals kept in a comment, and the Peak/Structure tests set `seed_source` explicitly.
 
 - [ ] **Step 4: Lab cycle** `t07-config`: the probe now takes its seeds from the config's default — identical to
-  Task 6's `--seeds matched` run. Gate: `noreg.txt` against t06: 0 moved rows, max |Δ| = 0 (the config switch is
-  not a numeric change). The design list is empty.
+  Task 6b's run. Gate: `noreg.txt` against t06b: 0 moved rows, max |Δ| = 0 (the config switch is not a numeric
+  change). The design list is empty.
 
 - [ ] **Step 5: README.** R-M4c-11 gains: "superseded for the default by R-OSP-2 (2026-10): `seedSource =
   matchedFilter` is the default; `peak` and `structure` remain explicit choices with their own dials; a stored
@@ -1201,7 +1419,7 @@ fn seed_threshold_is_clamped_with_a_warn() { … }
 feat(stacking): measurement.seedSource (matchedFilter default, peak, structure) with one legacy decode for every stored document, seedThreshold, the Measure panel and presets; R-M4c-11 updated
 ```
 
-**Acceptance:** the six-fixture decode test; tsc, vitest and `ts_contract` green; `noreg.txt` vs t06 0 moved, max
+**Acceptance:** the six-fixture decode test; tsc, vitest and `ts_contract` green; `noreg.txt` vs t06b 0 moved, max
 |Δ| 0; both hosts' `get_stacking_presets`/`get_stacking_defaults` answer the new shape through the unchanged
 handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 
@@ -1210,9 +1428,9 @@ handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 ### Task 8: F-3 — the saturation test and the unsaturated statistics (spec §2.1, §3 F-3)
 
 **Files:**
-- Create: `crates/athenaeum-core/src/star_measure/photometry.rs` (`saturation`)
+- Create: `crates/athenaeum-core/src/star_measure/photometry.rs` (`annulus_sigma`, `saturation`)
 - Modify: `star_measure/fit.rs` (after `accept`: the flag), `star_measure/beta.rs` (the discrete search samples
-  the 64 brightest UNSATURATED accepted-by-prefit seeds), `star_measure/frame.rs` (`frame_shape` over the
+  the 64 brightest UNSATURATED seeds — unsaturated by the verdict), `star_measure/frame.rs` (`frame_shape` over the
   unsaturated subset; `stars_unsaturated`), `star_measure/mod.rs` (`MeasureOptions.saturation_fraction`),
   `stacking/measure.rs` (hand edit: `ChannelMeasurement.stars_unsaturated`), `examples/star_probe.rs` (`--clip`,
   `--saturation-fraction`), `docs/stacking/README.md` (R-OSP-5)
@@ -1222,19 +1440,33 @@ handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 
 ```rust
 // photometry.rs
-pub struct SaturationVerdict { pub saturated: bool, pub clip_hit: bool, pub core_pixels: u16, pub overshoot_sigma: f64 }
+/// The star's own sky annulus (PA-11 radii: inner max(3·FWHM, 6), width max(FWHM, 3)): σ = 1.4826·MAD of the
+/// finite, unmasked pixels present, and their count. Non-finite, masked and off-image pixels are absent (Review
+/// Focus 1 and 5). `None` under 8 present pixels. Owned here (I-2) and reused by `star_snr` (Task 11).
+pub fn annulus_sigma(plane: &[f32], w: usize, h: usize, x: f64, y: f64, fwhm: f64, mask: Option<&[bool]>)
+    -> Option<(f64 /* sigma_sky */, usize /* n_sky */)>;
+
+pub struct SaturationVerdict { pub saturated: bool, pub clip_hit: bool, pub core_pixels: u16, pub overshoot_sigma: f64,
+                               pub wing_fit: bool }
 /// PA-8. `clip`: Some(level) in the plane's units when the domain knows it (RawAdu: saturation_fraction × clip);
-/// None on a calibrated plane. `sigma_local` from the star's own annulus (PA-11 radii), never the plane σ.
+/// None on a calibrated plane. `sigma_local` is `annulus_sigma`'s σ, never the plane σ; without it (None) only the
+/// clip clause can flag. The wing fit is `fit_moffat_2d` (free β, bound [1, 20]) on the non-core pixels at this
+/// task (I-3); a `None` wing fit leaves `saturated = false` with `wing_fit = false` — never a flag from a missing
+/// fit. Task 9 swaps the call to `fit_moffat_2d_bounded` with `BETA_BOUNDS`.
 pub fn saturation(plane: &[f32], w: usize, h: usize, fit: &StarFit, region: &[PixelSample], clip: Option<f64>,
-                  sigma_local: f64, pool_scratch: &mut FitScratch) -> SaturationVerdict;
+                  sigma_local: Option<f64>, scratch: &mut FitScratch) -> SaturationVerdict;
 ```
 
   `StarFit.flags |= SATURATED` when the verdict says so; `stars_fitted` keeps counting every accepted fit (M-4);
   `FrameAggregates.stars_unsaturated`; `frame_shape(fits)` → `frame_shape(fits.iter().filter(|f| !f.flags.saturated()))`
-  with `None` when empty (Review Focus 3); the β sample excludes flagged stars (the pre-fit at the sample's β=4
-  decides the flag before the search — one extra fixed-β fit per sample star, 64 fits); the width start uses only
+  with `None` when empty (Review Focus 3 — the adapter then reports `fwhm_px = 0.0`, which passes `select_frames`'s
+  `max_fwhm_px` as the spec allows; the plan gate's and the UI's treatment of `stars_unsaturated = 0` is Plan C's,
+  M-12); the β sample excludes stars the verdict flagged (the verdict is read on each sample star's region before
+  the search, from the clip clause and the wing fit — no fixed-β fit decides it); the width start uses only
   unflagged stars for the field width (the matched filter's 100 candidates: those whose peak exceeds the known
   clip or whose core holds ≥ 3 pixels within 2 σ of their maximum are skipped before the field-width median).
+  `PlaneMeasurement.wing_fit_missing: usize` counts the stars whose wing fit returned `None` (the probe prints it;
+  the lab row reports it).
 - `Domain::Calibrated` → `clip = None`; `Domain::RawAdu { clip }` → `Some(saturation_fraction × clip)`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1249,6 +1481,17 @@ fn a_clipped_moffat_core_is_flagged_and_an_unclipped_one_is_not() {
 
 #[test]
 fn raw_domain_clip_clause_flags_a_peak_above_the_fraction_times_clip() { /* RawAdu { clip: 65535 }, fraction 0.95, a peak at 63000 → clip_hit */ }
+
+#[test]
+fn annulus_sigma_is_the_mad_of_the_present_pixels() {
+    // a star 4 px from the border with a NaN wedge in its annulus: sigma equals 1.4826·MAD of the finite, in-image
+    // pixels only, n_sky counts exactly those; a fully masked annulus → None
+}
+
+#[test]
+fn a_missing_wing_fit_never_flags() {
+    // a stamp whose non-core pixels are too few for fit_moffat_2d (< 12): saturated == false, wing_fit == false, counted in wing_fit_missing
+}
 
 #[test]
 fn all_saturated_sample_leaves_the_frame_statistic_empty_not_wrong() {
@@ -1299,7 +1542,8 @@ moved outside the design list; control 0.
   Free { ln_min, ln_max }}`: the free arm carries `params[7] = ln β`, Jacobian column `j[7] = A·power·(−ln(base))·β`
   (chain rule), the step clamp in ln β to `[ln_min, ln_max]`, `MoffatExponent::new(exp(params[7]))`; tests.
 - athenaeum: `star_measure/beta.rs` (continuous), `star_measure/fit.rs` (`BETA_AT_CAP`), `star_measure/mod.rs`
-  (`BetaSource`, `PlaneMeasurement.beta_source`), `stacking/psf_signal.rs` (`PsfModel::Auto` doc, `group_beta` doc:
+  (`BetaSource`, `PlaneMeasurement.beta_source`), `star_measure/photometry.rs` (`saturation`'s wing fit swaps to
+  `fit_moffat_2d_bounded` with `BETA_BOUNDS`, I-3), `stacking/psf_signal.rs` (`PsfModel::Auto` doc, `group_beta` doc:
   the lower median of continuous βs — still "always one of the members' own βs"), `stacking/measure.rs` (hand
   edit: doc only), `src/components/stacking/panels/MeasurePanel.tsx` + `stageSummary.ts` (`psfModelLabel('auto')`
   → "Auto (per-frame β)", help text), `rustafits` submodule pointer, `Cargo.lock` (unchanged: path dep, same
@@ -1364,8 +1608,15 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
 
 - [ ] **Step 3: Lab cycle** `t09-f4` (v2 and injections). `--design`: `{"row":3}` (every width moves with β),
   `{"row":7}`, `{"row":11}`, `{"row":10,"metric":"auto beta vs saturated top-64 seeds"}`, `{"row":10,"metric":"auto
-  beta agrees"}`, `{"row":6,"metric":"captured fraction"}` (the FWTM ellipse follows β), `{"row":4,"metric":"floor"}`,
+  beta agrees"}`, `{"row":10,"metric":"saturation flag vs truth"}` (the wing fitter changed, I-3; the F-3 bar is read
+  again here and must still hold), `{"row":1,"metric":"fit outcomes"}` (a formerly `None` wing fit now flags or
+  not), `{"row":6,"metric":"captured fraction"}` (the FWTM ellipse follows β), `{"row":4,"metric":"floor"}`,
   `{"row":4,"metric":"ecc"}`, `{"row":5}`, `{"row":2,"path":"measure"}` (within CRLB).
+  Re-pins (M-6): `group_beta_is_the_lower_median_and_always_an_auto_candidate` (`psf_signal.rs:1515` — the
+  "always an `AUTO_BETAS` candidate" clause becomes "always one of the members' own βs") and
+  `auto_model_prefers_the_generating_beta` (`:975` — asserts `|β − 4| < 0.2` instead of `== 4.0`), each with its
+  comment. LN's reference fit under `PsfModel::Auto` (`ln/scale.rs:993`) now runs the 64-fit bounded sample: the
+  Normalize stage wall is not under the +20 % bar and is reported in Task 13's stage table.
 
 - [ ] **Step 4: Read the bars** (`bars.txt`):
   - frame FWHM error vs `pointfit` (row 7 `frame FWHM` ÷ truth `pointfit: med` − 1): ≤ 1 % at FWHM ≥ 2 px and ≤ 3 %
@@ -1379,7 +1630,9 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
     the 7 raw + 3 mosaic + 9 calibrated entries at FWHM ≥ 2 px (baseline Horse C11 G −3.68 %, QHY set 107 +5.33 %,
     `raw/corpus` plane 1 +9.06 %, mosaics plane 2 −5.85 %); a VNG-plane row (planes 1/2 of mosaics) that misses is
     reported under the out-of-scope VNG item, not judged (spec §3 "Out of scope");
-  - row 3's `beta sensitivity` line stays (the discrete arm is a lab diagnostic).
+  - row 3's `beta sensitivity` line stays (the discrete arm is a lab diagnostic);
+  - F-3's self-consistency row again with the bounded wing fitter: FP ≤ 1 %, FN 0 on ≥ 3-clipped-core stars, and
+    `wing_fit_missing` printed (expected to fall: the bounded fit returns on Gaussian-like wings).
 
 - [ ] **Step 5: The UI label, README R-OSP-6, commit** (athenaeum: the module, the pointer, the UI; lab results).
 
@@ -1454,7 +1707,7 @@ fix(star_measure): F-5 star flux = the fitted model's FWTM flux times a per-fram
 ### Task 11: F-6 — the per-star SNR and HFR (spec §3 F-6, §4.2 HFR)
 
 **Files:**
-- Modify: `star_measure/photometry.rs` (`star_snr`, `hfr`), `star_measure/fit.rs` (`StarFit.snr`, `.hfr`;
+- Modify: `star_measure/photometry.rs` (`star_snr` over Task 8's `annulus_sigma`, `hfr`), `star_measure/fit.rs` (`StarFit.snr`, `.hfr`;
   non-persisted like `peak5`), `star_measure/frame.rs` (`snr_median`, `hfr_median`), `star_measure/mod.rs`
   (`PlaneMeasurement.snr_gain`), `star_measure/domain.rs` (`Domain::gain_e_per_working_unit()`),
   `stacking/measure.rs` (hand edit: the adapter reads `EGAIN`, `ATH_CSCL`, `ATH_CFNM` from the FITS header through
@@ -1464,8 +1717,9 @@ fix(star_measure): F-5 star flux = the fitted model's FWTM flux times a per-fram
 
 **Interfaces:**
 - Produces: `star_snr(plane, w, h, fit, gain: Option<f64>) -> (f64 /* snr */, SnrTerms { s, n_ap, sigma_sky, n_sky,
-  shot_term: bool })` per PA-11: `σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky)`; without `g` the first term is omitted
-  and `shot_term = false`. `hfr(plane, w, h, fit) -> f64`: the radius about the fitted centre inside which the
+  shot_term: bool })` per PA-11 with `(σ_sky, N_sky)` from `photometry::annulus_sigma` (Task 8, I-2; `None` →
+  `snr = NaN`, counted in `PlaneMeasurement.snr_missing`): `σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky)`; without `g`
+  the first term is omitted and `shot_term = false`. `hfr(plane, w, h, fit) -> f64`: the radius about the fitted centre inside which the
   background-subtracted cumulative sum (pixels sorted by distance, `b = fit.background`) reaches `0.5 × fit.signal`,
   interpolated between the two bracketing pixels; `NaN` when the 5F circle holds less than half of `signal`.
   Non-finite and masked pixels are skipped and never counted in `N_ap`/`N_sky` (Review Focus 1, 5).
@@ -1480,9 +1734,7 @@ fn snr_matches_the_analytic_value_on_a_white_noise_star() {
 #[test]
 fn snr_without_gain_omits_the_shot_term_and_says_so() { /* terms.shot_term == false; snr is larger than with the gain */ }
 #[test]
-fn snr_annulus_skips_non_finite_pixels() { /* a NaN wedge in the annulus: n_sky counts only finite pixels; snr finite */ }
-#[test]
-fn edge_star_snr_uses_the_present_annulus_pixels() { /* a star 4 px from the border: n_sky < full count, snr finite, not NaN */ }
+fn edge_star_snr_uses_the_present_annulus_pixels() { /* a star 4 px from the border with a NaN wedge: n_sky < full count (Task 8's annulus_sigma), snr finite, not NaN */ }
 #[test]
 fn hfr_of_a_gaussian_is_the_half_flux_radius() { /* σ 2 → HFR ≈ 1.1774σ within 3 % on a noiseless stamp */ }
 #[test]
@@ -1496,7 +1748,7 @@ fn the_adapter_reads_egain_cscl_cfnm_into_the_gain() { /* a FITS with EGAIN 0.76
 
 - [ ] **Step 4: Read the bar** (`bars.txt`): row 6 `star SNR vs truth` median bias ≤ 3 % on every `sharp/*` (42) and
   `background/*` (7) family (unsaturated, isolated by the families' own `min_sep`); `n_no_gain` must be 0 (every v2
-  image carries EGAIN from Task 1). The u16 `analysis-mode` arm is Task 12's.
+  image carries EGAIN from Task 1a). The u16 `analysis-mode` arm is Task 12's.
 
 - [ ] **Step 5: R-OSP-8; commit.**
 
@@ -1514,8 +1766,8 @@ feat(star_measure): F-6 per-star SNR (S/σ_S with the EGAIN/ATH_CSCL gain, the s
 - Create: `crates/athenaeum-core/src/star_measure/budget.rs`
 - Modify: `star_measure/mod.rs` (`Mode`, `PlaneMeasurement.budget`), `examples/star_probe.rs` (`--paths
   analysis-mode`, `--clip`, `--budget N`; the raw-domain read keeps `PlaneReader` — XISF and `read_raw` are Plan
-  C's), `docs/stacking/README.md` (R-OSP-9), lab: `probe_plan.ANALYSIS_MODE = True`, `scorecard_build` scores the
-  `analysis-mode` path with the measure rows (threshold key `fisher_snr`, `seedThreshold`)
+  C's), `docs/stacking/README.md` (R-OSP-9), lab: `probe_plan.ANALYSIS_MODE = True` (Task 1b's switch),
+  `scorecard_build` scores the `analysis-mode` path with the measure rows (threshold key `fisher_snr`, `seedThreshold`)
 
 **Interfaces:**
 - Produces (`budget.rs`, PA-10): `pub struct BudgetReport { pub cells_with_stars: u8, pub cells_covered: u8, pub
@@ -1572,113 +1824,136 @@ too).
 ### Task 13: The real-data checkpoint at master level (spec §5 step 5, owner rule)
 
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
-`harness/acceptance/{prepare-catalog.sh,server.sh,api.sh,tier1/checkpoint.sh,tier1/rerun-build.sh,tier1/project-run.sh,
-tier1/tier1-extract.py,tier1/tier1-compare.py}` and `harness/ln-model/horse-c11-prep.sh` + the controller's
-`~/.athenaeum-acc/lnB/hc11-run.sh` (copied into `harness/acceptance/hc11-run.sh` in this task, the one script the
-harness lacked). Nothing is built per cycle.
+`harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
+tier1/tier1-compare.py}` plus the controller's `~/.athenaeum-acc/lnB/hc11-run.sh`, copied into
+`harness/acceptance/hc11-run.sh` with its stale path fixed (I-6). Nothing is built per cycle.
+
+**The clone recipe (deletes no acceptance copy, needs no owner decision).** `/Volumes/BigMac` is APFS, so `cp -Rc`
+clones a before tree in seconds at zero cost until a file is rewritten; and the Calibrate stage hash carries no
+`MEASURE_VERSION` (`calibration_subtree`, Task 3's test asserts its literal must NOT move), so the before trees'
+`calibrated`/`prepared` artifacts are, by construction, exactly what the after run would write. Each after run
+therefore starts from Measure on a clone of its before tree. New bytes at peak, one dataset at a time: set 204
+≈ 46 GB (registered 40 + rej 1.2 + ln 0.8 + stackout 3.5), run B ≈ 38 GB (registered 37 + ln 1), Horse C11 ≈ 26 GB
+(registered 23 + ln 1 + stackout 1.4) — each inside the 65 GiB headroom above the 100 GiB floor (165 GiB free
+today). Task 14 holds clones only. If the clone recipe fails at execution (a `cp -Rc` that copies instead of
+cloning, a path rewrite the server does not honour, a run that refuses `rerunFrom: "measure"`), the task STOPS and
+reports the numbers; it never deletes a copy and never falls back on its own. The fallback, written as a fallback
+and taken only on the owner's word, is the fresh-from-template recipe in the order Horse C11 → run B → set 204,
+each after-copy's `stackwork` removed once its rows are recorded.
 
 **Files:**
-- Modify: `harness/acceptance/README.md` (item 12: this checkpoint's recipe), `harness/acceptance/hc11-run.sh`
-  (added), `harness/acceptance/tier1/tier1-run.sh` (`ATH_ACC_SET_REFERENCE=<json>`: one `set_frame_set_reference`
-  call after `set_stacking_config`, echoed into `run.txt`, a refusal stops the run), `harness/acceptance/tier1/tier1-compare.py` (`--numeric` gains the `beta` and `starsRefused` lines beside
-  `fwhmPx`; already prints `beta` per L-25), `docs/stacking/README.md` (the acceptance run, R-OSP-10),
+- Modify: `harness/acceptance/README.md` (item 12: this checkpoint's recipe), `harness/acceptance/hc11-run.sh` (added
+  from `~/.athenaeum-acc/lnB/hc11-run.sh`; `ACC="${0:A:h}"` — the harness directory, as `horse-c11-prep.sh` does —
+  replaces the stale `$REPO/docs/superpowers/research/scripts/acceptance`; `ATHENAEUM_REPO` names the athenaeum
+  checkout; the set-182 pin `69845` and `c11-config.json` unchanged), `harness/acceptance/tier1/tier1-run.sh`
+  (`ATH_ACC_SET_REFERENCE=<json>`: one `set_frame_set_reference` call after `set_stacking_config`, echoed into
+  `run.txt`, a refusal stops the run; `ATH_ACC_RERUN_FROM=<stage>` replaces the hardcoded `"calibrate"` in the
+  `start_stacking` body, default `calibrate`), `harness/acceptance/tier1/project-run.sh` (the same
+  `ATH_ACC_RERUN_FROM`), `harness/acceptance/tier1/tier1-extract.py` and `tier1-compare.py --numeric` (`--run-id N`:
+  the run to read in a DB that holds more than one finished run of the set; default the latest `done` run, as
+  today; `--numeric` gains the `starsRefused` line beside `fwhmPx`/`beta`), `harness/acceptance/clone-before.sh`
+  (new: steps 1–3 of the recipe below, refusing a target under anything but `~/.athenaeum-acc/` and a source that is
+  not one of the three before trees), `docs/stacking/README.md` (the acceptance run, R-OSP-10),
   `docs/superpowers/research/2026-10-XX-star-measurement-after-plan-a.md` (§"Real data", written in Task 14)
 
 **Interfaces:**
 - Consumes: the "before" trees (PA-13): `~/.athenaeum-acc/tierA-lnB-f1` (set 204, run 5, reference 28934 after the
-  two-pass pick, Measure stage 3.62 min, wall 901 s), `~/.athenaeum-acc/lnB-runB-f1` (run B, project
-  `af136ec9-1885-4087-b684-9136ad655e9b`, wall 811 s), `~/.athenaeum-acc/hc11B-f1` (Horse C11 set 182, pinned frame
-  69845, wall 661 s). `ATH_ACC_DB` for `prepare-catalog.sh` is the tierA template's DB for set 204
-  (`checkpoint.sh` copies `tierA-template`), the 6b-3 catalog `.backup` for run B, the dev catalog `.backup` for
-  Horse C11 (`horse-c11-prep.sh`, which calls `prepare-catalog.sh`).
-- Produces: `~/.athenaeum-acc/tierA-starA` (set 204 after), `~/.athenaeum-acc/starA-runB`, `~/.athenaeum-acc/starA-hc11`,
+  two-pass pick, Measure stage 3.62 min, LN 2.46 min, wall 901 s), `~/.athenaeum-acc/lnB-runB-f1` (run B, project
+  `af136ec9-1885-4087-b684-9136ad655e9b`, run 6, wall 811 s), `~/.athenaeum-acc/hc11B-f1` (Horse C11 set 182, run 5,
+  pinned frame 69845, wall 661 s).
+- Produces: `~/.athenaeum-acc/starA-s204`, `~/.athenaeum-acc/starA-runB`, `~/.athenaeum-acc/starA-hc11` (clones),
   each with `extract.txt`, `compare.txt`, `run.txt`; `results/plan-a/t13-real/` in athenaeum-lab (the three compare
-  files, the weight rank table, the stage table).
+  files, the weight rank table, the stage table incl. the LN stage wall, M-6).
 
-- [ ] **Step 0: Disk and the owner.** Each after-copy holds every intermediate (`cleanup keepAll`, the compare reads
-  `.athln` sidecars and registered frames): set 204 ≈ 95 GB, run B ≈ 69 GB, Horse C11 ≈ 52 GB (today's copies'
-  sizes). `/Volumes/BigMac` has 165 GiB free with a 100 GiB floor. The three cannot coexist with the floor; one at
-  a time, each deleted after its rows are recorded, still needs 95 GB of headroom for set 204. **Before this task
-  starts, the owner names which existing copies may go** (candidates with their accepted records already in
-  `docs/stacking/README.md` and the LN acceptance report: `tierA-lnB-main` 95 GB, `lnB-runB-f1` 69 GB after its
-  Measure-equivalence check below has been read, `hc11-main` 4.2 GB, `acc6b3-runB` 69 GB). Nothing is deleted on
-  the implementer's initiative; the task records the owner's answer. Time Machine stays off during the runs
-  (`checkpoint.sh` refuses while a backup runs).
+- [ ] **Step 0: Disk arithmetic, written before anything runs.** `df -k /Volumes/BigMac` ≥ 100 GiB + the dataset's
+  peak (46 / 38 / 26 GB) + the throwaway `target-main` build of step 1 (≈ 6 GB, deleted after step 1, M-8). Time
+  Machine stays off during the runs (`tmutil status` `Running = 0`, the same refusal `checkpoint.sh` applies).
 
 - [ ] **Step 1: Measure-equivalence of the before trees (PA-13).** Build local main's `measure_probe` in a throwaway
-  worktree target (`tier1/rerun-build.sh` does this for a run; here only the example is needed: `git worktree add
-  /tmp/claude-501/.../main-wt ed5fa8de && CARGO_TARGET_DIR=.superpowers/target-main cargo build --release -p
-  athenaeum-core --example measure_probe`), then for three calibrated frames of each tree (the first, the median
-  and the last `calibrated` artifact of the mono group by `frames.id`, read from the copy with `immutable=1`):
-  `measure_probe <calibrated.fits> auto` versus the tree's `stacking_artifacts.payload_json` (`kind = 'metrics'`)
-  — every `ChannelMeasurement` field equal as printed (timings excluded). Equal on all nine → the trees are the
-  before; a difference → that dataset's before is re-run with `rerun-build.sh ed5fa8de starA-before-<ds>` (set
-  204 through `checkpoint.sh`'s own path; run B/Horse C11 through their scripts on the main worktree's build) and
-  the owner is told the disk this costs. Record the nine comparisons in `results/plan-a/t13-real/before-equivalence.txt`.
+  worktree target (`git worktree add <scratchpad>/main-wt ed5fa8de && CARGO_TARGET_DIR=.superpowers/target-main
+  cargo build --release -p athenaeum-core --example measure_probe`), then for three calibrated frames of each tree
+  (the first, the median and the last `calibrated` artifact of the mono group by `frames.id`, read from the copy
+  with `immutable=1`): `measure_probe <calibrated.fits> auto` versus the tree's `stacking_artifacts.payload_json`
+  (`kind = 'metrics'`) — every `ChannelMeasurement` field equal as printed (timings excluded). Equal on all nine →
+  the trees are the before. A difference → that dataset's before is re-made with `rerun-build.sh ed5fa8de
+  starA-before-<ds>` on the SAME clone recipe (the main worktree's build measuring the clone from `measure`), the
+  disk it costs named first. Record the nine comparisons in `results/plan-a/t13-real/before-equivalence.txt`; delete
+  the worktree and `.superpowers/target-main` afterwards.
 
-- [ ] **Step 2: Pin the reference.** The before run's pick, per dataset: set 204 — `stacking_runs.reference_frame_id`
-  of run 5 in `tierA-lnB-f1` (28934, the two-pass result); run B — the project's reference uuid in
-  `stacking_project_config.reference_frame_uuid` of `lnB-runB-f1` (already a manual pin on the project path); Horse
-  C11 — 69845 (already pinned by `hc11-run.sh`). The after runs send, before `start_stacking`, the before config
-  with `reference.mode = "manual"` and `reference.twoPass = false` through `ATH_ACC_SET_CONFIG` (set 204:
-  `~/.athenaeum-acc/starA/set204.json`, the `get_stacking_config` document of run 5 with those two fields changed and
-  `paths` absent) and `set_frame_set_reference {"framesSetId": 204, "frameId": 28934}` (a line added to
-  `tier1-run.sh` under `ATH_ACC_SET_REFERENCE=<json file>`, mirroring `ATH_ACC_SET_CONFIG`); run B through
-  `ATH_ACC_PROJECT_CONFIG` with `reference.mode = "manual"` (the uuid is already stored); Horse C11 through
-  `hc11-run.sh` as is. A reference that `get_stacking_plan` reports differently from the pin refuses the run.
+- [ ] **Step 2: Pin the reference** — the before run's effective pick, read from each before tree's RUN ROW (I-6):
+  set 204 `stacking_runs.reference_frame_id` of run 5 in `tierA-lnB-f1` (28934, the two-pass result); run B
+  `stacking_runs.reference_frame_id` of run 6 in `lnB-runB-f1` — and because run B ran `reference.mode = manual` WITH
+  `twoPass = true`, the stored `stacking_project_config.reference_frame_uuid` is shown equal to that row's frame
+  before it is used (both printed in `bars.txt`; a mismatch stops the task); Horse C11 69845 (pinned by
+  `hc11-run.sh`, equal to run 5's row). The after runs send, before `start_stacking`, the before config with
+  `reference.mode = "manual"` and `reference.twoPass = false`: set 204 through `ATH_ACC_SET_CONFIG`
+  (`~/.athenaeum-acc/starA/set204.json`, the `get_stacking_config` document of run 5 with those two fields changed and
+  `paths` absent) and `ATH_ACC_SET_REFERENCE` (`{"framesSetId": 204, "frameId": 28934}`); run B through
+  `ATH_ACC_PROJECT_CONFIG` with the same two fields; Horse C11 through `hc11-run.sh` as is (its `c11-config.json`
+  already carries `manual`). A reference that `get_stacking_plan` reports differently from the pin refuses the run.
 
 - [ ] **Step 3: Build the branch's release server** (one compile): `CARGO_TARGET_DIR=.superpowers/target-acc
   CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-web -p athenaeum-core --example measure_probe`. Record
   `git rev-parse HEAD` and the submodule sha.
 
-- [ ] **Step 4: Run, one at a time** (each: `memory_pressure` ≥ 30 %, `df` ≥ 100 GiB + the copy's size):
+- [ ] **Step 4: Run, one dataset at a time** (each: `memory_pressure` ≥ 30 %, step 0's `df`):
 
 ```
 cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/harness/acceptance
-ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json \
-  zsh tier1/checkpoint.sh starA lnB-f1 --numeric                       # expected wall ≈ 901 s (+ Measure ≤ +20 %: 3.62 → ≤ 4.34 min)
-python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/tierA-starA ~/.athenaeum-acc/tierA-lnB-f1 >> ~/.athenaeum-acc/tierA-starA/compare.txt
-# record, then free: rm -rf ~/.athenaeum-acc/tierA-starA/stackwork (keep athenaeum.db, stackout, extract/compare/run.txt, logs)
-D=~/.athenaeum-acc/starA-runB; mkdir -p $D/library $D/stackwork $D/stackout; sqlite3 -readonly ~/.athenaeum-acc/acc6b3-runB/athenaeum.db ".backup $D/athenaeum.db"
-sqlite3 $D/athenaeum.db "UPDATE settings SET value = replace(value, 'acc6b3-runB', 'starA-runB') WHERE value LIKE '%acc6b3-runB%';"
-ATH_ACC_PROJECT_CONFIG=~/.athenaeum-acc/starA/runB.json zsh tier1/project-run.sh $ATHENAEUM_REPO $D 8961 af136ec9-1885-4087-b684-9136ad655e9b   # expected ≈ 811 s
-python3 tier1/tier1-compare.py --pairs <head masters>=<lnB-runB-f1 masters> > $D/compare.txt
-zsh ../ln-model/horse-c11-prep.sh ~/.athenaeum-acc/starA-hc11 8970 && cp ~/.athenaeum-acc/hc11B-f1/c11-config.json ~/.athenaeum-acc/starA-hc11/ && zsh hc11-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-hc11 8971   # expected ≈ 661 s
+# clone-before.sh <before> <after>: (1) cp -Rc; (2) sqlite3 on the clone: UPDATE settings SET value = replace(value,'<before>','<after>')
+#   WHERE value LIKE '%<before>%'; UPDATE stacking_artifacts SET path = replace(path,'<before>','<after>') WHERE path LIKE '%<before>%';
+#   (3) rm -rf <after>/stackwork/*/{registered,ln,rej,runs} <after>/stackout/*  (stale by hash; the clone references cost nothing)
+zsh clone-before.sh ~/.athenaeum-acc/tierA-lnB-f1 ~/.athenaeum-acc/starA-s204
+ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json \
+  zsh tier1/tier1-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-s204 8950 204        # expected wall ≈ 901 − 134 s (no Calibrate); Measure 3.62 → ≤ 4.34 min
+python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-s204 --run-id 6 > ~/.athenaeum-acc/starA-s204/extract.txt     # run 6: the DB also holds run 5
+python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 --run-id 6 > ~/.athenaeum-acc/starA-s204/compare.txt
+python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 >> ~/.athenaeum-acc/starA-s204/compare.txt
+zsh clone-before.sh ~/.athenaeum-acc/lnB-runB-f1 ~/.athenaeum-acc/starA-runB
+ATH_ACC_RERUN_FROM=measure ATH_ACC_PROJECT_CONFIG=~/.athenaeum-acc/starA/runB.json \
+  zsh tier1/project-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-runB 8961 af136ec9-1885-4087-b684-9136ad655e9b   # expected ≈ 811 s minus Prepare
+python3 tier1/tier1-compare.py --pairs <head masters>=<lnB-runB-f1 masters> > ~/.athenaeum-acc/starA-runB/compare.txt
+zsh clone-before.sh ~/.athenaeum-acc/hc11B-f1 ~/.athenaeum-acc/starA-hc11
+ATH_ACC_RERUN_FROM=measure zsh hc11-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-hc11 8971                     # expected ≈ 661 s minus Calibrate
 python3 tier1/tier1-compare.py --pairs <head L and G masters>=<hc11B-f1 masters> > ~/.athenaeum-acc/starA-hc11/compare.txt
 ```
 
-  Every master (both sides) is measured by `measure_probe` from THIS build (the new path) inside
-  `tier1-compare.py` — that is "both masters are measured by the new path".
+  `clone-before.sh` prints, after step (1), `du -sk` of the clone (expected ≈ 0 new bytes: `df` before and after
+  equal within 1 GiB — a larger difference means the volume did not clone, and the task stops). Every master (both
+  sides) is measured by `measure_probe` from THIS build (the new path) inside `tier1-compare.py` — that is "both
+  masters are measured by the new path".
 
 - [ ] **Step 5: Read the bars** per dataset (`results/plan-a/t13-real/bars.txt`, the compare files verbatim):
   - master median within ±0.1 %, MAD ±1 %, noise (MRS σ) ±2 %, FWHM ±1 % (the §8 rows of `--numeric`, `docs/stacking/
     README.md` "masters within 0.1 % median / 1 % MAD / 2 % noise / 1 % FWHM") — mono and every OSC plane, plain and
     drizzled; "or better" means a row that is inside the tolerance passes whatever the direction;
-  - per-frame weights: Spearman ρ ≥ 0.9 against the before run (`stacking_run_frames.weight` joined by `frame_id`),
-    and every frame whose weight rank moved by more than 10 % of N is listed with the scorecard row that explains
-    it (F-5's captured fraction, F-3's unsaturated statistic, F-4's β) — a move without a row goes to the owner;
+  - per-frame weights: Spearman ρ ≥ 0.9 against the before run (`stacking_run_frames.weight` joined by `frame_id`,
+    before run 5 / after run 6 on set 204), and every frame whose weight rank moved by more than 10 % of N is listed
+    with the scorecard row that explains it (F-5's captured fraction, F-3's unsaturated statistic, F-4's β) — a
+    move without a row goes to the owner;
   - LN relative scale `s` per frame: median ratio within 1 ± 0.5 %, scatter ≤ 1 % (the §8 row), read from the
     `.athln` grids;
   - Measure stage wall ≤ 1.2 × the before tree's (set 204: 3.62 min → ≤ 4.34 min; run B and Horse C11 from their
-    `extract.txt`); total wall reported (interleaving is not possible without a second 95 GB copy: the before walls
-    are quoted with their dates, R-TA-9 noted);
+    `extract.txt`); the Normalize stage wall is REPORTED beside it (M-6: LN's reference fit under `Auto` now runs
+    the bounded sample fit; set 204 before 2.46 min); the total wall is reported with the stages that did not run
+    named (R-TA-9: no interleaved bracket);
   - the stacking `metrics` payload's `starsRefused` and `beta` per frame are reported (new fields), and the master
     `beta` line (L-25) beside the FWHM row.
 
 - [ ] **Step 6: Record** the run (R-OSP-10) in `docs/stacking/README.md` with every row's number; commit the compare
-  files in the lab; delete the after-copies' `stackwork` once the rows are recorded (keep the rest for the final
-  gates' `probe_parity`, which reads `tierA-starA` — set `STARLAB_ACC_COPY=~/.athenaeum-acc/tierA-starA` in Task 14;
-  the parity gate needs the `.athf` files under `stackwork/…`, so set 204's `stackwork` is deleted only AFTER Task 14).
+  files in the lab. The three clones stay through Task 14 (`probe_parity` reads `starA-s204`'s `calibrated` +
+  `fits.0` + `metrics` of one 6224×4168 mono frame: `STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204`); after Task 14 the
+  clones' `registered/`, `ln/`, `rej/` and `stackout/` may be removed (the only new bytes), never a before tree.
 
 ```
-docs(stacking): Plan A real-data checkpoint - set 204, run B, Horse C11 before/after at master level with the reference pinned (ruling R-OSP-10: <rows>)
+docs(stacking): Plan A real-data checkpoint - set 204, run B, Horse C11 before/after at master level on clones from Measure with the reference pinned (ruling R-OSP-10: <rows>)
 ```
 
 **Acceptance:** every master row inside the tolerances; ρ ≥ 0.9 with every larger move explained; LN scale within
-0.5 %; Measure ≤ +20 % on each dataset. A miss goes to the owner with the compare file before Task 14.
+0.5 %; Measure ≤ +20 % on each dataset; the clone recipe's `df` check held on all three. A miss goes to the owner
+with the compare file before Task 14.
 
 ---
-
 ### Task 14: One full uniform lab run and the "after Plan A" note (spec §5 "At the end")
 
 **Files:**
@@ -1700,13 +1975,15 @@ python3 bin/scorecard.py manifests/v2.json --probe-dir ~/.athenaeum-acc/star-lab
 python3 bin/scorecard.py manifests/inject.json --probe-dir ~/.athenaeum-acc/star-lab-a/final/inject-probe --out … --json …
 python3 bin/scorecard_summary.py …; python3 bin/baseline_flags.py …; python3 bin/twin_saturation.py …; python3 bin/path_compare.py … ; python3 bin/star_test_corpus.py table …
 python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz <final json> --out results/plan-a/final/noreg-vs-baseline.txt --design results/plan-a/final/design-all.json
-STARLAB_ACC_COPY=~/.athenaeum-acc/tierA-starA STARLAB_SCRATCH=~/.athenaeum-acc/star-lab-a/final/gates python3 bin/gates.py > results/plan-a/final/gates.txt
+STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_SCRATCH=~/.athenaeum-acc/star-lab-a/final/gates python3 bin/gates.py > results/plan-a/final/gates.txt
 ```
 
   `design-all.json` is the union of every task's design list (so the final diff against the ORIGINAL baseline
-  prints the by-design rows in their table and judges the rest: 0 moved expected). The gates: 13 PASS expected
-  (`probe_parity` now against `tierA-starA`'s artifacts written by the Task 13 build — the same code as this run's
-  probe; `determinism` covers 170 families).
+  prints the by-design rows in their table and judges the rest: 0 moved expected); Task 5's `one-sided` rows keep
+  their rule in the final diff too — judged against the original baseline by the same one-sided test, never set
+  aside (M-13). The gates: 13 PASS expected (`probe_parity` now against the `starA-s204` clone's artifacts written
+  by the Task 13 build — the same code as this run's probe; `determinism` covers 170 families). Only clones are on
+  disk for this task: no before tree was deleted at any point.
 
 - [ ] **Step 2: The note** `2026-10-XX-star-measurement-after-plan-a.md`, beside the baseline and in its format
   (numbers copied as printed; derived numbers marked): §1 verdict per bar (F-0…F-7, the budget, the costs, the real
@@ -1743,39 +2020,39 @@ the note's §1 reads "met" or carries the owner's ruling; the full core suite gr
 | Spec item | Task |
 | ---- | ---- |
 | §2.1 module units `domain`, `fit`, `frame`, `robust` move | 2 |
-| §2.1 `seeds` (matched filter, default seed source) | 6, 7 |
+| §2.1 `seeds` (matched filter, default seed source) | 6a, 7 |
 | §2.1 `beta` | 9 (discrete moved in 2) |
 | §2.1 `photometry` (saturation test, flux, SNR) | 8, 10, 11 |
 | §2.1 `budget` | 12 |
 | §2.1 `diagnostics` | 4 |
 | §2.1 public surface `measure_plane`, `fit_stars_at`, `MEASURE_VERSION` | 2, 3 |
-| §2.1 the saturation test (clip clause, flat-top, truth flag, self-consistency row) | 1 (row), 8 |
+| §2.1 the saturation test (clip clause, flat-top, truth flag, self-consistency row) | 1b (row), 8, 9 (the bounded wing fit) |
 | §2.1 exemptions (LN L-14/L-23/peak-SNR, registration cuts) | untouched (2, 10 leave `ln/selection.rs`, `register/detect.rs` as they are) |
-| §2.2 stacking adapter, `psf_signal` formulas, LN refit via `fit_stars_at`, master statistics | 2, 10 |
+| §2.2 stacking adapter, `psf_signal` formulas, LN refit via `fit_stars_at`, master statistics | 2, 6a (`field_width_of` for given seeds), 10 |
 | §2.2 `stars_fitted` meaning, unsaturated statistic, `stars_refused` + per-reason counts | 4, 8 |
 | §2.2 Measure config: `seed_source`, legacy decode of every stored document, Median3 = Peak's, R-M4c-11 | 7 |
 | §2.2 `psf_model` Auto = continuous β, Moffat4 kept, `STACKING_CONFIG_VERSION` unchanged | 9, 7 |
 | §2.2 Analysis/Blink, not touched (plate-solve detector, rustafits analysis), the lab's two modes + `legacy-analysis` | 12 (the arm), Plan C (the switch) |
 | §3 doctrine, F-0 | 4 |
-| §3 F-1 (region, cap, rim background, width start, seeds, new families, donut) | 1, 6 |
+| §3 F-1 (region, cap, rim background, width start, seeds, new families, donut) | 1a, 6a, 6b |
 | §3 F-2 (axes, conditioning, conditional convergence change) | 5 |
 | §3 F-3 (unsaturated sample/statistic, twin bars, re-judged after F-4) | 8, 9 |
 | §3 F-4 (continuous β, rustafits bound and ln β, Gaussian limit, every β a finite number) | 9 |
 | §3 F-5 (flux, aperture correction, psfSel) | 10 |
-| §3 F-6 (SNR definition, gain, lab EGAIN/`ATH_CSCL`, truth SNR) | 1, 11 |
-| §3 F-7 (rim background under nebulosity) | 6 |
+| §3 F-6 (SNR definition, gain, lab EGAIN/`ATH_CSCL`, truth SNR) | 1a, 8 (the annulus), 11 |
+| §3 F-7 (rim background under nebulosity) | 6b |
 | §3 F-8, F-9 | Plan B (the LN rows are printed, PA-14) |
-| §3 raw-mode truth (injections: completeness, FWHM) | 6, 9 |
+| §3 raw-mode truth (injections: completeness, FWHM) | 6b, 9 |
 | §3 the budget (≥ 90 % of cells) | 12 |
-| §3 no regressions (SE rule, mechanical) | 1 (tool), every fix task |
+| §3 no regressions (SE rule, mechanical) | 1c (tool), every fix task |
 | §3 cost (Measure ≤ +20 %, Analysis ≤ 0.6 s incl. on-demand) | 12, 13 |
 | §3 out of scope (VNG, resampling) | 14 §7 (restated) |
 | §4.4 `MEASURE_VERSION` in the three stage hashes, the pinned tests, the bump policy | 3 |
 | §4.4 `measure_version`/`stars_refused` columns, `FrameAnalysis` fields, collab meta | Plan C |
-| §5 step 1 (lab first) | 1 |
+| §5 step 1 (lab first) | 1a, 1b, 1c |
 | §5 step 2 (extraction gate) | 2 |
 | §5 step 3 (F-0) | 4 |
-| §5 step 4 (one fix per step, config with F-1 and F-4) | 5–11, 7 |
+| §5 step 4 (one fix per step, config with F-1 and F-4) | 5, 6a, 6b, 8–11; the config in 7 and 9 |
 | §5 step 5 (real-data checkpoint, pinned reference, pass bars) | 13 |
 | §5 "At the end" (uniform run, after report) | 14 |
 | §6 global constraints | Global Constraints |
