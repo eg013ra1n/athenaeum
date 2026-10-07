@@ -6,7 +6,8 @@
 //!
 //!   star_probe measure <image.fits> --out <file.jsonl> [--config <json>]
 //!       [--plane all|N] [--debayer RGGB|BGGR|GRBG|GBRG] [--rect x,y,w,h]
-//!       [--paths measure,betas,register,analysis]   (default: measure,betas,register) [--betas 2.5,4,6,10]
+//!       [--paths measure,betas,register,analysis,legacy-analysis]   (default: measure,betas,register)
+//!       [--betas 2.5,4,6,10]   (legacy-analysis = the analysis path, `path: "analysis"`; any other name exits 1)
 //!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
@@ -249,16 +250,35 @@ fn analysis_domain_ok(raw_max: f32) -> bool {
     raw_max > 1.5
 }
 
+/// Ruling F2 (Plan A): the `--paths` names. `legacy-analysis` is the `analysis` path
+/// under the name it keeps once the Analysis tab measures through the shared module;
+/// its JSONL `path` stays `"analysis"`. Any other name is an error.
+fn resolve_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    paths
+        .iter()
+        .map(|p| match p.as_str() {
+            "measure" | "betas" | "register" | "analysis" => Ok(p.clone()),
+            "legacy-analysis" => Ok("analysis".to_string()),
+            o => Err(format!(
+                "unknown path: {o} (known: measure, betas, register, analysis, legacy-analysis)"
+            )),
+        })
+        .collect()
+}
+
 /// Returns `Err` instead of exiting once the output file exists, so the
 /// `BufWriter` drops (and flushes) first: a failed run leaves complete lines.
+/// An unknown `--paths` name is an `Err` before the image is read or any output
+/// file exists (ruling F2; `main` exits 1 on it).
 fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
+    let paths = resolve_paths(&a.paths)?;
     let (mut planes, mut w, mut h) = read_planes(&a.image);
     let raw_max = planes
         .iter()
         .flatten()
         .filter(|v| v.is_finite())
         .fold(f32::MIN, |m, &v| m.max(v));
-    let want = |p: &str| a.paths.iter().any(|q| q == p);
+    let want = |p: &str| paths.iter().any(|q| q == p);
     // Every `analysis` precondition is checked before any output file exists.
     if want("analysis") {
         if a.rect.is_some() || a.debayer.is_some() {
@@ -728,6 +748,48 @@ mod tests {
         assert_eq!(lines[0]["path"], "analysis");
         assert_eq!(lines[0]["fits"], 0);
         assert_eq!(lines[0]["conversion"], "none");
+    }
+
+    /// The lines of a probe output without the analysis path's two clock fields: the
+    /// frame line's `wallMs` and the production `FrameAnalysis.analyzed_at` stamp it
+    /// carries in `frame`. Two runs of the same path differ in those two only.
+    fn without_clocks(out: &Path) -> Vec<String> {
+        read_lines(out)
+            .into_iter()
+            .map(|mut v| {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("wallMs");
+                    if let Some(f) = o.get_mut("frame").and_then(Value::as_object_mut) {
+                        f.remove("analyzed_at");
+                    }
+                }
+                v.to_string()
+            })
+            .collect()
+    }
+
+    /// Ruling F2 (Plan A, Task 1b): `legacy-analysis` is the `analysis` path under its
+    /// lasting name (the same lines, `path: "analysis"`), and an unknown `--paths` name
+    /// is refused before any output file exists. The outputs are compared without their
+    /// clock fields (`without_clocks`): a byte compare fails on two runs of one path.
+    #[test]
+    fn legacy_analysis_is_an_alias_of_analysis_and_an_unknown_path_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let data: Vec<f32> = gaussian_field(128, 128, 0, true).iter().map(|v| (v * 65535.0).round()).collect();
+        let img = d.path().join("p.fits");
+        write_fits_f32(&img, 128, 128, 1, &data, &[]).unwrap();
+        let a = d.path().join("a.jsonl");
+        cmd_measure(args(img.clone(), a.clone(), &["analysis"])).unwrap();
+        let b = d.path().join("b.jsonl");
+        cmd_measure(args(img.clone(), b.clone(), &["legacy-analysis"])).unwrap();
+        assert_eq!(without_clocks(&a), without_clocks(&b));
+        let lines = read_lines(&b);
+        assert!(lines.iter().filter(|v| v["kind"] == "star").count() > 0, "the control is not empty");
+        assert!(lines.iter().all(|v| v["path"] == "analysis"));
+        let c = d.path().join("c.jsonl");
+        let err = cmd_measure(args(img, c.clone(), &["bogus"])).unwrap_err();
+        assert!(err.contains("unknown path: bogus"), "{err}");
+        assert!(!c.exists(), "no output file for a refused path");
     }
 
     #[test]
