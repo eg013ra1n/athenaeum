@@ -33,9 +33,22 @@ const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 
 /// The matched filter's threshold in units of the filtered plane's measured noise σ_f (ruling R-OSP-2).
 ///
-/// PROVISIONAL (Plan A Task 6a step 3): 4.0 until the PA-2 sweep over the `twins/*` and `artefacts` families chooses
-/// it by the false-detection rule, before any fitted bar is read.
-pub const DEFAULT_THRESHOLD: f64 = 4.0;
+/// Chosen by PA-2 (Plan A Task 6a) before any fitted bar was read. The rule: the smallest K of {3.0, 3.5, 4.0, 4.5, 5.0,
+/// 6.0} at which every `twins/*` family (46, run whole) and `artefacts` read ≤ 0.5 false detections per Mpx of cause
+/// `nothing` on the `seeds` path; the `background/*` families are reported only. The table (athenaeum-lab
+/// `star-lab/results/plan-a/t06a-seeds/threshold-choice.txt`; star_probe 7e3289d7 built from athenaeum 71cac35c):
+///
+/// | K | deciding cells over 0.5 | worst deciding cell, `nothing` / Mpx |
+/// | ---- | ---- | ---- |
+/// | 3.0 | 45 of 47 | `twins/sharp/gauss/f1.2` 1001.8 |
+/// | 3.5 | 41 | `twins/sharp/m10/f1.2` 196.8 |
+/// | 4.0 | 40 | `twins/sharp/m10/f1.2` 32.2 (`artefacts` 10.0) |
+/// | 4.5 | 29 | `twins/sharp/blur1/f1.2` 3.42 (`artefacts` 1.19) |
+/// | 5.0 | 1 | `twins/sharp/blur2.5/f1.2` 0.56 |
+/// | 6.0 | 0 | every deciding cell 0.00 |
+///
+/// The narrow fields decide it: at a field width clamped to 1.5 px the filtered noise has the most maxima per area.
+pub const DEFAULT_THRESHOLD: f64 = 6.0;
 
 /// The first pass's kernel FWHM, px, and the field width when no candidate's half-maximum width reads.
 const FIRST_PASS_FWHM_PX: f64 = 3.0;
@@ -259,7 +272,7 @@ impl Detection<'_> {
     /// the candidate's own pixel and ρ = [`HOT_PIXEL_NEIGHBOUR_RATIO`] (`d` is background-subtracted). When fewer
     /// than 2 cross-neighbours are present (a checkerboard mask), the 4 diagonal neighbours stand in.
     ///
-    /// A bright candidate (`c ≥ threshold·σ_plane/ρ`, ≈ 27 σ at a threshold of 4) sees the plan's rule unchanged: its
+    /// A bright candidate (`c ≥ threshold·σ_plane/ρ`, 40 σ at the default 6) sees the plan's rule unchanged: its
     /// neighbours must stand `threshold·σ_plane` clear, which a lone hot pixel's never do. The cap is the finding of
     /// Task 6a: a matched-filter detection at `threshold·σ_f` puts only ≈ 0.16–0.27·threshold σ on each unfiltered
     /// pixel, so the uncapped level asked a faint star for 3–6 times the threshold and became the threshold itself

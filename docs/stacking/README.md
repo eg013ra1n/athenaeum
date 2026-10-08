@@ -1987,3 +1987,60 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       | centroid scatter (measure) | 921 / 913 | 42 / 48 | 0.0237 → 0.0239 | PASS |
       | centroid bias (register) | 650 / 656 | 22 / 20 | 0.00128 → 0.00136 | PASS |
       | centroid scatter (register) | 618 / 676 | 40 / 33 | 0.0181 → 0.0179 | PASS |
+- **F-1 seeds - the matched filter, the mask, the field width (Task 6a; no fit change, ruling F16).**
+  - **The detector** (`star_measure::seeds`). A two-pass Gaussian matched filter on the plane minus its mesh
+    background (the 128-px model). Every absent pixel (non-finite, or `false` in the pixel mask) counts zero and leaves
+    the normalisation: `f = Σk·d/√Σk²` is the filter's signal in units of the pixel σ, with the same noise wherever data
+    is present, so a registered frame's NaN border neither seeds nor dims its neighbours; `flux = 2πσ_F²·Σk·d/Σk²` is
+    the least-squares Gaussian flux, the selection key. Candidates are the local maxima of `f` above `K·σ_f` (σ_f =
+    1.4826·MAD over the stratified sample), placed by their flux-weighted centroid, sorted by flux.
+  - **The field width (PA-17).** The first pass (FWHM 3 px) gives its 100 brightest candidates; the median of their
+    azimuthal half-maximum widths (rings of 0.5 px, the box rim's median as background, every candidate, no
+    saturation test) clamped to [1.5, 24] px is the field width; the second pass runs at it, on the 2×2 super-pixel
+    plane from 6 px on. `field_width_of` gives seeds handed in by another detector the same width. No fit reads it
+    before Task 6b; it is reported as `PlaneMeasurement.field_width` and `FitOutcome.field_width`.
+  - **The pixel mask.** `MeasureOptions.mask` / `FitStarsOptions.mask` (`false` = absent, like a non-finite pixel) in
+    the detector, the field width, the fit's region and aperture (`FitDiagnostics.pixels_used` counts the region's
+    present pixels). The noise model and the sky statistic read the whole plane (a Plan C note). A plane with no
+    noise estimate (no MRS, no positive `N*`) reports `NoiseSource::None` (`none` in the `metrics` payload, F43) and
+    the detector seeds nothing, with one `warn!`.
+  - **The hot-pixel rule's defect and its ruling.** The plan's rule asked a candidate for ≥ 2 of 4 cross-neighbours
+    above `background + K·σ_plane` on the unfiltered plane. A matched-filter detection at `K·σ_f` puts only
+    ≈ 0.16–0.27·K σ on each unfiltered pixel, so that rule passed a star only near a Fisher SNR of 3K–6K, refused the
+    noise peaks for the same reason, and became the threshold in place of K (PA-2's sweep would have read 0 false
+    detections at every K). Measured at K 4 (path `seeds`, expected set Fisher SNR ≥ 4):
+
+    | family | completeness, the plan's rule | completeness, capped | `nothing` / Mpx, capped |
+    | ---- | ---- | ---- | ---- |
+    | `twins/sharp/m4/f2.6` | 84.7 % of 1789 | 98.8 % | 9.06 |
+    | `twins/sharp/m4/f8.0` | 74.2 % of 1803 | 94.6 % | 0.00 |
+    | `artefacts` | 80.9 % of 580 | 95.2 % | 10.01 |
+
+    Hot pixels (0.24 per Mpx) and cosmic rays (10.01 per Mpx) are seeded at the same rate under both. Controller
+    ruling: the level is `background + min(K·σ_plane, 0.15·(c − background))`, `c` the candidate's own pixel; 0.15 is
+    geometry (the cross-neighbour/peak ratio of a pixel-integrated Gaussian of FWHM 1.0 px is 0.157), fitted to no bar,
+    and a bright candidate (`c ≥ K·σ_plane/0.15`) sees the plan's rule unchanged. Under a checkerboard mask the
+    diagonal neighbours stand in. Pinned by `a_broad_star_at_fisher_snr_20_passes_the_neighbour_test` (FWHM 8, Fisher
+    SNR 20: 6 of 20 passed the plan's level, 20 of 20 the capped one) and `hot_pixel_is_not_seeded`.
+  - **R-OSP-2 - the threshold, `seeds::DEFAULT_THRESHOLD = 6.0`** (PA-2, ruling F37), chosen before any fitted bar
+    was read: the smallest K of {3.0, 3.5, 4.0, 4.5, 5.0, 6.0} at which every `twins/*` family (46, run whole) and
+    `artefacts` read ≤ 0.5 false detections per Mpx of cause `nothing` on the `seeds` path. The twins enter row 1
+    through the scorecard's opt-in `--twins-detection` (controller ruling; off by default, a scorecard without it is
+    byte-identical to one before it). The data: athenaeum-lab `star-lab/results/plan-a/t06a-seeds/threshold-choice.txt`
+    (lab c02e39e; star_probe 7e3289d7 built from athenaeum 71cac35c; 307 invocations per K, 307/307 proven).
+
+    | K | deciding cells over 0.5 (of 47) | worst deciding cell, `nothing` / Mpx | `background/flat` (reported) |
+    | ---- | ---- | ---- | ---- |
+    | 3.0 | 45 | `twins/sharp/gauss/f1.2` 1001.8 | 258.9 |
+    | 3.5 | 41 | `twins/sharp/m10/f1.2` 196.8 | 47.9 |
+    | 4.0 | 40 | `twins/sharp/m10/f1.2` 32.2 | 4.77 |
+    | 4.5 | 29 | `twins/sharp/blur1/f1.2` 3.42 | 0.48 |
+    | 5.0 | 1 | `twins/sharp/blur2.5/f1.2` 0.56 | 0.24 |
+    | 6.0 | 0 | 0.00 | 0.00 |
+
+    The narrow fields decide it: at a field width clamped to 1.5 px the filtered noise has the most maxima per area.
+  - **The surfaces.** The stacking adapter's probe override gains `SeedSource::MatchedFilter { threshold }` (the
+    config's default stays the peak detector until Task 7, which renames the enum `SeedOverride`, ruling F26).
+    `star_probe` gains `--seeds matched|peak|structure` (default `matched`) and `--seed-threshold K`; every frame line's
+    `options.measure` names the effective `seedSource` and `seedThreshold` (ruling F3), which the scorecard's
+    expected set reads (`matchedFilter` → Fisher SNR ≥ K).
