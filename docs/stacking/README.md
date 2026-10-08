@@ -1907,6 +1907,26 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (the existing zero-star path). One `warn!` (`outcome = "defocused"`). Checked on the round-3b probe outputs
       before it was coded: `donut/r6` 82 of 87 readable seeds (94.3 %), `donut/r10` 61 of 61; every other lab frame
       0.1 % or less (the worst, `density/d1000`, 2 of 2741; `halo/i0`'s 39 faint noise-level seeds are unreadable).
+    - **Task 6b acceptance (final lab cycle, 2026-10-08, athenaeum c2a7eb60; athenaeum-lab
+      `star-lab/results/plan-a/t06b-f1/`).** 697/697 probes proven, 53 712 scorecard rows, 0 missing; inject 90/90 proven.
+      `lab_cycle` bars line PASS (with the owner and moved cells below); noreg vs t06a PASS and noreg-cumulative vs
+      t01c PASS (0 moved, 0 lost, control 0) with the 32-entry design list (R4's population and fit-change groups
+      named with their mechanism). Numbers: fitted / seeded at FWHM 8 = 95.6 / 96.0 = 99.6 % (baseline 89.9 %); donut
+      0 accepted on `donut/r6` and `donut/r10` (defocused 50 / 11, donut 86 / 77) and no plane outside `donut/*` is
+      defocused (956 frame lines); F-7 background bias neb0.1 -0.087, neb0.5 -0.211, neb3 +0.146 sigma, flat -0.054
+      sigma; raw mode 100.0 % of the non-edge Fisher >= 20 injected stars on every `inject/raw/*` and `inject/mosaic/*`
+      plane (18 planes); frame FWHM within 1 % on every `sharp/m4` cell except the owner cells below.
+    - **Owner rulings recorded (2026-10-08).** (a) Raw-mode completeness is judged on NON-edge injected stars; the
+      26 edge stars (Fisher >= 20) are listed beside it as a record, their light is cut by the border (refused
+      `outsideImage`). (b) `background/neb3_4096` (+1.889 sigma, frame beta 10 on Moffat-4 stars) moves to Tasks 8/9
+      and is not a 6b STOP. (c) Donut stars count as defocused frames (the rule above).
+    - **To the owner / later tasks.** R2's cells go to F-3 (Task 8): `f2.0` i0 (+2.96 %), `f12.0` i0-2 (+1.14 to
+      +1.21 %), `f16.0` i0-1 (+1.47, +1.76 %), unsaturated-only +2.62 % and within 0.04 % for the rest;
+      `sharp/gauss/*` (-1.4 to -2.6 %) go to F-4.
+    - **Carried items.** The drizzle model bias of 5-8 % goes to Task 9 and the real-data checkpoint; psfSel's auto-beta
+      drift goes to Tasks 8/9 and Plan B; PA-12's bright-star region goes to Task 8; same-star fwhm at Fisher 40-100 (beta
+      held) reads worse, 0.03179 to 0.03300, mechanism open, to Tasks 8/9; same-star ecc above Fisher 300 reads worse,
+      0.08979 to 0.09084, carried with it.
 - **F-2 - canonical axes and a conditioned fit (Task 5; numbers move by design).**
   - **Canonical axes.** `accept` reports the major axis on `fwhm_x`/`fwtm_x` and `theta` on that axis, in
     `[-π/2, π/2)` (`canonical_theta`). The fitter's first axis was whichever its start made it, so the same star
