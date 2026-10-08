@@ -2806,8 +2806,12 @@ mod tests {
         let (full, _) = masked_probe(bicubic, 512, 0, LnOverlap::Legacy, false);
         let (half, _) = masked_probe(bicubic, 420, 100, LnOverlap::Masked, false);
         let rel = (half.scale - full.scale).abs() / full.scale;
+        // Plan A Task 6b round 3 (ruling R9: the fit's start shape from the region's starting square; reported to the
+        // controller): half 1.216295 / full 1.213104 (0.263 %) became half 1.217607 / full 1.213308 (0.354 %), both
+        // nearer the true 1.25 — the half-covered path, on fewer stars, moved more. The bound 0.003 → 0.004; the LN
+        // scale itself is Plan B's to re-baseline (PA-14, spec F-8).
         assert!(
-            rel < 0.003,
+            rel < 0.004,
             "half {} vs full {}: {rel}",
             half.scale,
             full.scale

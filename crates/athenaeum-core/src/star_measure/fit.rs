@@ -20,9 +20,11 @@
 //! its own half-maximum width where readable (its peak ≥ 10 σ above the rim of a box of radius `⌈2·F_field⌉`, which
 //! is also the admission test, PA-18), else from the field width; its region
 //! grows from `max(3, ⌈1.5·F_start⌉)` up to `clamp(⌈6·F_start⌉, 6, 96)` px while the region's median stands above its
-//! rim's by more than 1 % of the peak (PA-12); the fit's background starts from that rim's median. An annular star is
-//! refused `Donut` before any fit, and a fit narrower than 0.8 px `NarrowerThanPixel`. The field σ0 from the seeds'
-//! flux/peak and the field-level nominal stamp are retired.
+//! rim's by more than 1 % of the peak (PA-12); the fit's background starts from that rim's median, and its start shape
+//! from the moments of the region's starting square (round 3, R9). An annular star is refused `Donut` before any fit
+//! (its core about a local iterated centre against a ring at the box moments' radius about it, round 3, R7/R8), and a
+//! fit narrower than 0.8 px `NarrowerThanPixel`. The field σ0 from the seeds' flux/peak and the field-level nominal
+//! stamp are retired.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -268,30 +270,44 @@ const REGION_MAX_MAX_PX: i64 = 96;
 /// The donut test (Task 6b): a star whose 3×3 core mean is below this fraction of its 1-px ring's mean is refused
 /// `Donut`.
 const DONUT_CORE_TO_RING: f64 = 0.8;
-/// The donut ring's radius floor, px: the ring sits at `max(1.5, F_start/2.3548)` (the fold check's ruling — at the
-/// unfloored radius a real star of FWHM ≤ 2.0 read 0.34–0.61 on the lab's renderer and would be refused).
+/// The donut ring's radius floor, px: the ring sits at `max(1.5, √(σ_major·σ_minor))` of the width-start box's moments
+/// about the local centre (round 3, ruling R8; the fold check's floor — unfloored, a real star of FWHM ≤ 2.0 would be
+/// refused).
 const DONUT_RING_MIN_RADIUS_PX: f64 = 1.5;
+/// The donut test's local centre (round 3, ruling R7): an iterated centroid of `max(v − b0, 0)` in a window of radius
+/// `max(1.5, F_start)` about the current centre, from the seed, at most 3 iterations, stopping on a move under 0.1 px.
+const LOCAL_CENTRE_MIN_WINDOW_PX: f64 = 1.5;
+const LOCAL_CENTRE_ITERATIONS: usize = 3;
+const LOCAL_CENTRE_MIN_MOVE_PX: f64 = 0.1;
 /// An accepted fit whose narrower FWHM is below this many px is a hot pixel, not a star (Task 6b,
 /// `NarrowerThanPixel`).
 const NARROWEST_FWHM_PX: f64 = 0.8;
 
-/// A stamp's background-subtracted second moments (weights `max(v − b0, 0)`): the axes' σ, the major axis's angle
-/// `½·atan2(2μxy, μxx − μyy)`, and the centroid, in the stamp's own coordinates.
+/// A stamp's background-subtracted second moments (weights `max(v − b0, 0)`) about their own centroid: the axes' σ and
+/// the major axis's angle `½·atan2(2μxy, μxx − μyy)`.
 #[derive(Debug, Clone, Copy)]
 struct Moments {
     sigma_major: f64,
     sigma_minor: f64,
     theta: f64,
-    cx: f64,
-    cy: f64,
 }
 
-/// Orientation, axis ratio and centroid of a stamp from its background-subtracted
+/// Orientation and axis ratio of a stamp from its background-subtracted
 /// second moments ([`Moments`]). `None` when the stamp has no positive signal or
 /// degenerate moments.
+#[cfg_attr(not(test), allow(dead_code))]
 fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<Moments> {
+    moment_ellipse_where(px, b0, |_| true)
+}
+
+/// [`moment_ellipse`] over the pixels `keep` admits, in the slice's order.
+fn moment_ellipse_where(
+    px: &[PixelSample],
+    b0: f64,
+    keep: impl Fn(&PixelSample) -> bool,
+) -> Option<Moments> {
     let (mut sw, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64);
-    for p in px {
+    for p in px.iter().filter(|p| keep(p)) {
         let w = (p.value - b0).max(0.0);
         sw += w;
         sx += w * p.x;
@@ -302,7 +318,7 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<Moments> {
     }
     let (cx, cy) = (sx / sw, sy / sw);
     let (mut mxx, mut myy, mut mxy) = (0.0f64, 0.0f64, 0.0f64);
-    for p in px {
+    for p in px.iter().filter(|p| keep(p)) {
         let w = (p.value - b0).max(0.0);
         let (dx, dy) = (p.x - cx, p.y - cy);
         mxx += w * dx * dx;
@@ -321,8 +337,6 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<Moments> {
         sigma_major: l1.sqrt(),
         sigma_minor: l2.sqrt(),
         theta,
-        cx,
-        cy,
     })
 }
 
@@ -540,15 +554,13 @@ impl FitTrace {
 }
 
 /// The star's width start: its FWHM `F_start` (its own half-maximum width where readable, else the field width —
-/// Task 6b round 1, ruling R1), and the axis ratio, orientation and centroid of its second moments in the width-start
-/// box.
+/// Task 6b round 1, ruling R1) and the width-start box's rim median, the level the donut test's ring radius reads the
+/// box's moments above (round 3, ruling R8).
 #[derive(Debug, Clone, Copy)]
 struct WidthStart {
     fwhm: f64,
-    /// `σ_major/σ_minor ≥ 1`.
-    axis_ratio: f64,
-    theta: f64,
-    centroid: (f64, f64),
+    /// The median of the box's outer 1-px rim; NaN when the rim holds no present pixel.
+    level: f64,
 }
 
 /// The radius of a field width's width-start box, `⌈2·F_field⌉` px (PA-12),
@@ -558,18 +570,14 @@ fn width_start_box_radius(field_width: f64) -> i64 {
 }
 
 /// The width start (PA-12 as amended by Task 6b round 1, ruling R1), in the box of radius `rb` about `(cx, cy)`
-/// (the caller has checked that it lies inside the image):
-///
-/// - **`F_start`** is the star's own half-maximum width ([`own_halfmax_width`], PA-17's estimator) when the star is
-///   readable — its peak stands at least 10 σ above the box's rim, `(max − level)/σ_rim ≥ 10` with `level` the median
-///   and `σ_rim` = 1.4826·MAD of the box's outer 1-px rim (a rim with no spread reads any peak above it as readable) —
-///   and the field width otherwise, or when the half-maximum width does not read; clamped to [0.6, 40] px. The plan's
-///   second moments read every star wide (1.3× on bright stars, 2–3× on faint ones: the clipped noise of the box);
-///   the half-maximum width, judged on truth before any bar was read, reads 0.92–1.09× in every Fisher bin of
-///   `sharp/m4/f{2.6,8,16}` and `sharp/gauss/f8` and the two populations of a mixed field at their own widths.
-/// - **The axis ratio, angle and centroid** stay the background-subtracted second moments of the box's present pixels
-///   (weights `max(v − level, 0)`, [`moment_ellipse`]): the fit's start shape and the donut test's centre. No present
-///   rim pixel or no positive moments: round, at θ 0, centred on the seed.
+/// (the caller has checked that it lies inside the image): `F_start` is the star's own half-maximum width
+/// ([`own_halfmax_width`], PA-17's estimator) when the star is readable — its peak stands at least 10 σ above the box's
+/// rim, `(max − level)/σ_rim ≥ 10` with `level` the median and `σ_rim` = 1.4826·MAD of the box's outer 1-px rim (a rim
+/// with no spread reads any peak above it as readable) — and the field width otherwise, or when the half-maximum width
+/// does not read; clamped to [0.6, 40] px. The plan's second moments read every star wide (1.3× on bright stars, 2–3×
+/// on faint ones: the clipped noise of the box); the half-maximum width, judged on truth before any bar was read, reads
+/// 0.92–1.09× in every Fisher bin of `sharp/m4/f{2.6,8,16}` and `sharp/gauss/f8` and the two populations of a mixed
+/// field at their own widths. The start shape is not read here (round 3, ruling R9: [`start_shape`]).
 #[allow(clippy::too_many_arguments)]
 fn width_start(
     data: &[f32],
@@ -585,35 +593,22 @@ fn width_start(
 ) -> WidthStart {
     let mut start = WidthStart {
         fwhm: field_width.clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX),
-        axis_ratio: 1.0,
-        theta: 0.0,
-        centroid: (seed.x, seed.y),
+        level: f64::NAN,
     };
     let Some(level) = rim_median(data, mask, w, cx, cy, rb, &mut scratch.rim) else {
         return start;
     };
+    start.level = level;
     // `rim_median` left the rim's present pixels in `scratch.rim` (reordered, the same multiset).
     let sigma_rim = (MAD_TO_SIGMA * mad_about(&scratch.rim, level as f32)) as f64;
-    scratch.px.clear();
     let mut peak = f64::NEG_INFINITY;
     for y in cy - rb..=cy + rb {
         for x in cx - rb..=cx + rb {
             let i = y as usize * w + x as usize;
             if present(data, mask, i) {
-                let v = data[i] as f64;
-                peak = peak.max(v);
-                scratch.px.push(PixelSample {
-                    x: (x - cx) as f64,
-                    y: (y - cy) as f64,
-                    value: v,
-                });
+                peak = peak.max(data[i] as f64);
             }
         }
-    }
-    if let Some(m) = moment_ellipse(&scratch.px, level) {
-        start.axis_ratio = m.sigma_major / m.sigma_minor;
-        start.theta = m.theta;
-        start.centroid = (cx as f64 + m.cx, cy as f64 + m.cy);
     }
     let readable = if sigma_rim > 0.0 {
         (peak - level) / sigma_rim >= WIDTH_START_MIN_PEAK_SNR
@@ -628,23 +623,135 @@ fn width_start(
     start
 }
 
-/// The donut test (Task 6b): the mean of the 3×3 core about the pixel nearest
-/// the moment centroid against the mean of the 1-px ring `R − ½ ≤ d < R + ½`
-/// about the centroid itself, `R = max(1.5, F_start/2.3548)` px, both minus the
-/// background start `b0`; a donut when `core < 0.8·ring`. Only present pixels
-/// inside the image count. No verdict (`false`) when the core or the ring holds
-/// none.
-fn is_donut(
+/// The fit's start shape (round 3, ruling R9 — the brief's "moment axis ratio as today"): the second moments of the
+/// region's pixels inside PA-12's starting square, `max(|x|, |y|) ≤ r_start` in the stamp-centred coordinates, above 0
+/// (the caller has normalised the values to `(v − b0)/a0`); returns `(√clamp(σ_major/σ_minor, 1, 4), θ)`. t06a read
+/// them from its region stamp, about 1.5 FWHM; round 0 had moved them to the 2·F_field box, whose clipped noise gave
+/// start angles 8.6° → 21.8° off at Fisher 20–40 and a tail of fits settling in a wrong-θ minimum. `None` when the square
+/// has no positive signal or degenerate moments.
+fn start_shape(px: &[PixelSample], r_start: i64) -> Option<(f64, f64)> {
+    let r = r_start as f64;
+    moment_ellipse_where(px, 0.0, |p| p.x.abs().max(p.y.abs()) <= r).map(|m| {
+        (
+            (m.sigma_major / m.sigma_minor).clamp(1.0, 4.0).sqrt(),
+            m.theta,
+        )
+    })
+}
+
+/// The donut test's local centre (round 3, ruling R7): from `seed`, the centroid of `max(v − b0, 0)` over the present
+/// pixels inside the image whose centres lie within `window` of the current centre, at most 3 times, stopping on a move
+/// under 0.1 px; a window with no positive weight keeps the current centre. The window covers the object (`window =
+/// max(1.5, F_start)`), so a Peak seed on a donut's annulus walks to its hole, and a bright neighbour outside it cannot
+/// pull the centre off the star.
+fn local_centre(
     data: &[f32],
     mask: Option<&[bool]>,
     w: usize,
     h: usize,
-    centroid: (f64, f64),
-    f_start: f64,
+    seed: (f64, f64),
+    window: f64,
     b0: f64,
-) -> bool {
-    let (mx, my) = centroid;
-    let (px, py) = (mx.round() as i64, my.round() as i64);
+) -> (f64, f64) {
+    let (mut gx, mut gy) = seed;
+    let reach = window.ceil() as i64 + 1;
+    for _ in 0..LOCAL_CENTRE_ITERATIONS {
+        let (px, py) = (gx.round() as i64, gy.round() as i64);
+        let (mut sw, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64);
+        for y in py - reach..=py + reach {
+            for x in px - reach..=px + reach {
+                if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                    continue;
+                }
+                if (x as f64 - gx).hypot(y as f64 - gy) > window {
+                    continue;
+                }
+                let i = y as usize * w + x as usize;
+                if present(data, mask, i) {
+                    let wt = (data[i] as f64 - b0).max(0.0);
+                    sw += wt;
+                    sx += wt * x as f64;
+                    sy += wt * y as f64;
+                }
+            }
+        }
+        if !(sw > 0.0) {
+            break;
+        }
+        let (nx, ny) = (sx / sw, sy / sw);
+        let moved = (nx - gx).hypot(ny - gy);
+        gx = nx;
+        gy = ny;
+        if moved < LOCAL_CENTRE_MIN_MOVE_PX {
+            break;
+        }
+    }
+    (gx, gy)
+}
+
+/// The donut ring's radius (round 3, ruling R8): `max(1.5, √(σ_major·σ_minor))` of the second moments of the width-start
+/// box's present pixels (radius `rb` about `(cx, cy)`, weights `max(v − level, 0)`) taken about `centre` — the geometry
+/// the brief's fold check computed (0.02 / 0.29 on the two donut families). Degenerate moments (no positive weight, no
+/// rim level) fall back to `max(1.5, F_start/2.3548)`.
+#[allow(clippy::too_many_arguments)]
+fn ring_radius(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    cx: i64,
+    cy: i64,
+    rb: i64,
+    level: f64,
+    centre: (f64, f64),
+    f_start: f64,
+) -> f64 {
+    let fallback = DONUT_RING_MIN_RADIUS_PX.max(f_start / GAUSSIAN_FWHM_PER_SIGMA);
+    if !level.is_finite() {
+        return fallback;
+    }
+    let (gx, gy) = centre;
+    let (mut sw, mut mxx, mut myy, mut mxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for y in cy - rb..=cy + rb {
+        for x in cx - rb..=cx + rb {
+            let i = y as usize * w + x as usize;
+            if !present(data, mask, i) {
+                continue;
+            }
+            let wt = (data[i] as f64 - level).max(0.0);
+            let (dx, dy) = (x as f64 - gx, y as f64 - gy);
+            sw += wt;
+            mxx += wt * dx * dx;
+            myy += wt * dy * dy;
+            mxy += wt * dx * dy;
+        }
+    }
+    if !(sw > 0.0) {
+        return fallback;
+    }
+    let (mxx, myy, mxy) = (mxx / sw, myy / sw, mxy / sw);
+    let disc = ((mxx - myy).powi(2) + 4.0 * mxy * mxy).sqrt();
+    let (l1, l2) = (0.5 * (mxx + myy + disc), 0.5 * (mxx + myy - disc));
+    if !(l2 > 0.0) || !l1.is_finite() {
+        return fallback;
+    }
+    DONUT_RING_MIN_RADIUS_PX.max((l1 * l2).sqrt().sqrt())
+}
+
+/// The donut test's two means, both minus `b0`: the 3×3 core about the pixel nearest `centre`, and the 1-px ring
+/// `R − ½ < d ≤ R + ½` about `centre` itself (round 3, ruling R8: half-open below, so at the radius floor 1.5 the cross
+/// neighbours at d = 1, which the core holds, never enter the ring by a rounding of the centre). Only present pixels
+/// inside the image count; `None` when the core or the ring holds none.
+fn core_and_ring(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    centre: (f64, f64),
+    radius: f64,
+    b0: f64,
+) -> Option<(f64, f64)> {
+    let (gx, gy) = centre;
+    let (px, py) = (gx.round() as i64, gy.round() as i64);
     let inside = |x: i64, y: i64| x >= 0 && y >= 0 && x < w as i64 && y < h as i64;
     let mean_minus_b0 = |pixels: &mut dyn Iterator<Item = (i64, i64)>| -> Option<f64> {
         let (mut sum, mut n) = (0.0f64, 0usize);
@@ -660,25 +767,45 @@ fn is_donut(
         }
         (n > 0).then(|| sum / n as f64 - b0)
     };
-    let Some(core) = mean_minus_b0(
+    let core = mean_minus_b0(
         &mut (-1i64..=1).flat_map(|dy| (-1i64..=1).map(move |dx| (px + dx, py + dy))),
-    ) else {
-        return false;
-    };
-    let radius = DONUT_RING_MIN_RADIUS_PX.max(f_start / GAUSSIAN_FWHM_PER_SIGMA);
+    )?;
     let reach = (radius + 0.5).ceil() as i64;
     let on_ring = |&(x, y): &(i64, i64)| {
-        let d = (x as f64 - mx).hypot(y as f64 - my);
-        d >= radius - 0.5 && d < radius + 0.5
+        let d = (x as f64 - gx).hypot(y as f64 - gy);
+        d > radius - 0.5 && d <= radius + 0.5
     };
-    let Some(ring) = mean_minus_b0(
+    let ring = mean_minus_b0(
         &mut (-reach..=reach)
             .flat_map(|dy| (-reach..=reach).map(move |dx| (px + dx, py + dy)))
             .filter(on_ring),
-    ) else {
-        return false;
-    };
-    core < DONUT_CORE_TO_RING * ring
+    )?;
+    Some((core, ring))
+}
+
+/// The donut test (Task 6b; rounds 2–3, rulings R7 and R8): the core about the local centre ([`local_centre`], window
+/// `max(1.5, F_start)` from the seed) against the ring at [`ring_radius`] about it ([`core_and_ring`]); a donut when
+/// `core < 0.8·ring`. No verdict (`false`) when the core or the ring holds no present pixel. Judged on truth before any
+/// bar: round 1's false donuts on `sharp/m4/f8.0` not refused, both donut families refused noise-free whether seeded at
+/// the centre or on the annulus (worst core/ring 0.397), every real star of FWHM 1.2–16 at ≥ 1.119.
+#[allow(clippy::too_many_arguments)]
+fn is_donut(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seed: &Seed,
+    cx: i64,
+    cy: i64,
+    rb: i64,
+    start: &WidthStart,
+    b0: f64,
+) -> bool {
+    let window = LOCAL_CENTRE_MIN_WINDOW_PX.max(start.fwhm);
+    let centre = local_centre(data, mask, w, h, (seed.x, seed.y), window, b0);
+    let radius = ring_radius(data, mask, w, cx, cy, rb, start.level, centre, start.fwhm);
+    core_and_ring(data, mask, w, h, centre, radius, b0)
+        .is_some_and(|(core, ring)| core < DONUT_CORE_TO_RING * ring)
 }
 
 /// Fit one seed with a fixed β (PA-12, spec §3 F-1 and F-7; Plan A Task 6b).
@@ -686,14 +813,16 @@ fn is_donut(
 /// 1. **Admission:** the width-start box of radius `⌈2·F_field⌉` about the seed's pixel must lie inside the image,
 ///    else `OutsideImage` (PA-18: a star broader than the field width can still be admitted and meet the border as
 ///    `RegionTooSmall`).
-/// 2. **The width start** `F_start`: the star's own half-maximum width where readable, else the field width; the start
-///    shape and the donut centre from the box's second moments ([`width_start`]; round 1, ruling R1).
+/// 2. **The width start** `F_start`: the star's own half-maximum width where readable, else the field width
+///    ([`width_start`]; round 1, ruling R1).
 /// 3. **The region** grows from `max(3, ⌈1.5·F_start⌉)` to at most `clamp(⌈6·F_start⌉, 6, 96)` px, never past the
 ///    border, while its median stands above its rim's ([`grow_region`]); the background start `b0` is the final
 ///    rim's median, and fewer than 10 present pixels are `TooFewPixels`.
-/// 4. **The donut test** ([`is_donut`]) refuses an annular star `Donut` before any fit.
-/// 5. **The fit** starts at `b0`, `a0 = max − b0`, σ `F_start/2.3548` split by the moments' axis ratio (`√ratio`
-///    clamped to [1, 2]) at their angle; then the acceptance rules ([`accept`], `NarrowerThanPixel` among them).
+/// 4. **The donut test** ([`is_donut`]: a local centre, the ring radius from the box moments about it) refuses an
+///    annular star `Donut` before any fit.
+/// 5. **The fit** starts at `b0`, `a0 = max − b0`, σ `F_start/2.3548` split by the axis ratio of the starting square's
+///    moments (`√ratio` clamped to [1, 2]) at their angle ([`start_shape`]); then the acceptance rules ([`accept`],
+///    `NarrowerThanPixel` among them).
 ///
 /// The [`FitTrace`] records the region and the start whatever the result. A pixel `mask` leaves its `false` pixels
 /// out exactly like non-finite ones (Task 6a).
@@ -771,7 +900,7 @@ fn fit_one(
     if scratch.px.len() < 10 {
         return (Err(RefusalReason::TooFewPixels), trace);
     }
-    if is_donut(data, mask, w, h, start.centroid, start.fwhm, b0) {
+    if is_donut(data, mask, w, h, seed, cx, cy, rb, &start, b0) {
         return (Err(RefusalReason::Donut), trace);
     }
     let a0 = (peak - b0).max(1e-9);
@@ -785,12 +914,12 @@ fn fit_one(
     for s in scratch.px.iter_mut() {
         s.value = (s.value - b0) / a0;
     }
-    // Size from the star's own width start, orientation and axis ratio from its
-    // moments (PA-12): a circular θ = 0 start leaves an elongated star in an
-    // axis-aligned local minimum.
+    // Size from the star's own width start, orientation and axis ratio from the
+    // moments of the region's starting square (round 3, ruling R9): a circular
+    // θ = 0 start leaves an elongated star in an axis-aligned local minimum.
     let sigma = start.fwhm / GAUSSIAN_FWHM_PER_SIGMA;
-    let q = start.axis_ratio.clamp(1.0, 4.0).sqrt();
-    let (sx0, sy0, th0) = (sigma * q, sigma / q, start.theta);
+    let (q, th0) = start_shape(&scratch.px, r_start).unwrap_or((1.0, 0.0));
+    let (sx0, sy0) = (sigma * q, sigma / q);
     let (ox, oy) = (cx as f64, cy as f64);
     // The conditioned entry point carries the Jacobian's θ column with its
     // correct sign (ruling R-OSP-3): `fit_moffat_2d_fixed_beta`'s column is
@@ -2506,6 +2635,137 @@ mod tests {
             diag[7].width_start, 3.0,
             "a faint star starts from the field width: {:?}",
             diag[7]
+        );
+    }
+
+    // --- Task 6b round 3 (rulings R7/R8 final, R9 final) ---
+
+    /// The brief's donut, noise-free: an annulus (outer 6, obstruction 2.4) blurred by a Gaussian of σ 1.1.
+    fn donut_plane() -> (Vec<f32>, usize, usize) {
+        let (w, h) = (80usize, 80usize);
+        let mut data = vec![0.05f32; w * h];
+        let ring = ring_samples(40.0, 40.0, 2.4, 6.0);
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0f64;
+                for &(ux, uy) in &ring {
+                    let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
+                    acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
+                }
+                data[y * w + x] += (0.3 * acc / 2000.0) as f32;
+            }
+        }
+        (data, w, h)
+    }
+
+    /// R7 (round 3): a Peak seed sits on the annulus, not at its centre; the local centre's window (radius
+    /// `max(1.5, F_start)`) covers the object, so the iterated centroid walks to the hole and the donut is refused. The
+    /// field width is the donut field's own (the lab's `donut/r6` matched filter reads ≈ 8 px, the truth check's
+    /// geometry): its width start reads 6.7 px, the centre walks from 4 px out to 0.3 px, core/ring 0.26. (A lone donut
+    /// in a field of width 3 — a box of radius 6 whose rim crosses the annulus — fails the readability gate, starts from
+    /// the narrow field width and keeps its centre on the annulus; it is refused `CentreMoved` there, never fitted.)
+    #[test]
+    fn a_peak_seeded_donut_is_refused() {
+        let (data, w, h) = donut_plane();
+        let mut best = (0usize, 0usize, f32::MIN);
+        for y in 30..=50 {
+            for x in 30..=50 {
+                if data[y * w + x] > best.2 {
+                    best = (x, y, data[y * w + x]);
+                }
+            }
+        }
+        let peak = Seed {
+            x: best.0 as f64,
+            y: best.1 as f64,
+            peak: 0.1,
+            flux: 1.0,
+        };
+        assert!(
+            (peak.x - 40.0).hypot(peak.y - 40.0) > 3.0,
+            "the Peak seed is on the annulus: {peak:?}"
+        );
+        let (out, diag) = fit_with(&data, w, h, &[peak], 8.0);
+        assert!(out.fits.is_empty(), "{:?}", out.fits);
+        assert_eq!(diag[0].outcome, Outcome::Refused(RefusalReason::Donut));
+    }
+
+    /// R7 (round 3): a faint star (FWHM 8, Fisher SNR ≈ 30) with a 60× brighter neighbour 24 px away — the geometry of
+    /// round 1's `sharp/m4/f8.0` false donuts (neighbours 25–35 px away, 5–277× brighter). The neighbour's wing inside
+    /// the width-start box pulled the box moments' centroid off the star, so the core missed it and the star was
+    /// refused `Donut` (RED on round 1's rule); the local centre stays on the star.
+    #[test]
+    fn a_star_beside_a_bright_neighbour_is_not_refused_as_a_donut() {
+        let alpha = 8.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+        let stars = [
+            one(100.3, 100.2, 0.0098, alpha),
+            one(124.3, 100.2, 0.588, alpha),
+        ];
+        let mut data = moffat_field(260, 200, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 31);
+        let seeds = [seed(&stars[0]), seed(&stars[1])];
+        let (_, diag) = fit_with(&data, 260, 200, &seeds, 8.0);
+        assert_ne!(
+            diag[0].outcome,
+            Outcome::Refused(RefusalReason::Donut),
+            "{:?}",
+            diag[0]
+        );
+    }
+
+    /// R8 (round 3): the ring `(R − ½, R + ½]`. At R = 1.5 its bounds are the integers 1 and 2; a pixel-centred
+    /// Gaussian of FWHM 3.5 has its four cross neighbours at exactly d = 1, which the half-open-below ring of round 1
+    /// let in or out by a 1e-16 offset of the centre (core/ring 1.044 in, 1.21 out). The fold check's real-star bar is
+    /// ≥ 1.08; it holds at a 0 and at a 1e-12 offset.
+    #[test]
+    fn the_ring_has_no_knife_edge_at_its_radius_floor() {
+        let sigma = 3.5 / GAUSSIAN_FWHM_PER_SIGMA;
+        let data = crate::test_support::gaussian_field(120, 120, &[(60.0, 60.0, 0.3)], sigma, 0.05);
+        for dx in [0.0, 1e-12] {
+            let (core, ring) = core_and_ring(&data, None, 120, 120, (60.0 + dx, 60.0), 1.5, 0.05)
+                .expect("core and ring present");
+            assert!(
+                core / ring >= 1.08,
+                "offset {dx}: core {core} ring {ring} ({})",
+                core / ring
+            );
+        }
+    }
+
+    /// R9 (round 3, the brief's "moment axis ratio as today"): the start shape is read from PA-12's starting square
+    /// only. An elongated star (axis ratio 2 at 30°) with a bright round neighbour 12 px along x: the starting square of
+    /// radius 5 reads the star's own angle, the whole 31×31 stamp is pulled toward the neighbour.
+    #[test]
+    fn the_start_shape_is_read_from_the_starting_square() {
+        let star = MoffatStar {
+            x: 15.0,
+            y: 15.0,
+            amp: 0.3,
+            alpha_x: 3.0,
+            alpha_y: 1.5,
+            theta: 30f64.to_radians(),
+        };
+        let data = moffat_field(31, 31, &[star, one(27.0, 15.0, 0.3, 2.0)], 4.0, 0.0);
+        let px: Vec<PixelSample> = (0..31i64)
+            .flat_map(|y| (0..31i64).map(move |x| (x, y)))
+            .map(|(x, y)| PixelSample {
+                x: (x - 15) as f64,
+                y: (y - 15) as f64,
+                value: data[y as usize * 31 + x as usize] as f64,
+            })
+            .collect();
+        let (q, theta) = start_shape(&px, 5).expect("the starting square has moments");
+        assert!(
+            (theta.to_degrees() - 30.0).abs() < 3.0,
+            "θ {}",
+            theta.to_degrees()
+        );
+        assert!(q > 1.2, "q {q}");
+        let whole = moment_ellipse(&px, 0.0).unwrap();
+        assert!(
+            (whole.theta.to_degrees() - 30.0).abs() > 10.0,
+            "the whole stamp is pulled: {}",
+            whole.theta.to_degrees()
         );
     }
 
