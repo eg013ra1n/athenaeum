@@ -1865,7 +1865,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   `stacking`; their `clip` and `samples` fields joined the logging dictionary
   (`docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`).
 - **F-0 - every seed has an outcome (Task 4; numbers unchanged).** `star_measure::diagnostics` holds
-  `RefusalReason` (eleven camelCase names, `outsideImage` … `duplicate`), `Outcome` (`Accepted { star }`,
+  `RefusalReason` (twelve camelCase names with `defocused`, `outsideImage` … `duplicate`), `Outcome` (`Accepted { star }`,
   `Refused(reason)`, and the Budget mode's `NotSelected` / `Trimmed` from Task 12), the per-seed `FitDiagnostics`
   and `RefusalCounts`. The identity `accepted + refused + not_selected + trimmed = seeds` (ruling F13) is a
   `debug_assert!` in the fit and in `measure_plane`, a test, and the lab's `fit outcomes` row.
@@ -1873,11 +1873,11 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     same `seeds.par_iter().map_init(FitScratch::default, …)` chain, collected per seed in seed order. The accepted
     fits are read off it sequentially and handed to `dedupe`, so its input, its stable sort and the Kahan sums see
     exactly the order they saw before. A fit the ±1 px drop removes is refused `duplicate`.
-  - **Today's reasons.** The nominal stamp leaves the image → `outsideImage`; fewer than 10 finite region pixels →
+  - **Today's reasons.** `outsideImage`; fewer than 10 finite region pixels →
     `tooFewPixels`; the fitter returns `None` → `fitFailed`. The first acceptance gate is still one condition; its
     reason is `nonFinite` (a parameter or the residual), else `residualTooLarge`, else `fitFailed` (`A ≤ 0` or an
     `α ≤ 0`). The centroid tolerance → `centreMoved`; the inner region → `centreAtRim`; half the FWTM beyond the
-    region radius → `regionTooSmall`. `donut` and `narrowerThanPixel` are declared now and produced from Task 6b.
+    region radius → `regionTooSmall`. `donut`, `narrowerThanPixel` and `defocused` are produced from Task 6b (R-OSP-4).
   - **Where the counts land.** `FitOutcome.refused` and `PlaneMeasurement.refused` always carry the counts.
     `ChannelMeasurement` gains `stars_refused` and `refused_by_reason` (keys = the camelCase names), so the
     `metrics` payload grows two keys; both are serde defaults, so an older payload decodes as `0` / `{}`. The
@@ -1898,35 +1898,6 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `{"row":1,"metric":"donut outcome","family":"donut/*","path":"measure","kind":"reported"}`; it is judged
       at Task 6b. With it both diffs PASS (0 moved, 0 lost, control 0 mismatch). Without it, they read FAIL on
       exactly those two rows.
-    - **The defocused-frame rule (Task 6b round 4a, owner ruling 2026-10-08: "heavily defocused stars are not
-      stars").** A faint donut cannot be told from a blurred star by its own pixels, but defocus belongs to the
-      whole frame. After the per-seed outcomes: with `n_read` the plane's readable seeds (the width start's
-      10 sigma_rim gate passed) and `n_donut` those refused `Donut`, `n_donut >= 5` and `n_donut >= 0.25 * n_read`
-      make the plane DEFOCUSED: every fit it would have accepted is refused `Defocused`, the per-seed `Donut`
-      refusals keep theirs, `FitOutcome.defocused` / `PlaneMeasurement.defocused` are set and the plane has no fits
-      (the existing zero-star path). One `warn!` (`outcome = "defocused"`). Checked on the round-3b probe outputs
-      before it was coded: `donut/r6` 82 of 87 readable seeds (94.3 %), `donut/r10` 61 of 61; every other lab frame
-      0.1 % or less (the worst, `density/d1000`, 2 of 2741; `halo/i0`'s 39 faint noise-level seeds are unreadable).
-    - **Task 6b acceptance (final lab cycle, 2026-10-08, athenaeum c2a7eb60; athenaeum-lab
-      `star-lab/results/plan-a/t06b-f1/`).** 697/697 probes proven, 53 712 scorecard rows, 0 missing; inject 90/90 proven.
-      `lab_cycle` bars line PASS (with the owner and moved cells below); noreg vs t06a PASS and noreg-cumulative vs
-      t01c PASS (0 moved, 0 lost, control 0) with the 32-entry design list (R4's population and fit-change groups
-      named with their mechanism). Numbers: fitted / seeded at FWHM 8 = 95.6 / 96.0 = 99.6 % (baseline 89.9 %); donut
-      0 accepted on `donut/r6` and `donut/r10` (defocused 50 / 11, donut 86 / 77) and no plane outside `donut/*` is
-      defocused (956 frame lines); F-7 background bias neb0.1 -0.087, neb0.5 -0.211, neb3 +0.146 sigma, flat -0.054
-      sigma; raw mode 100.0 % of the non-edge Fisher >= 20 injected stars on every `inject/raw/*` and `inject/mosaic/*`
-      plane (18 planes); frame FWHM within 1 % on every `sharp/m4` cell except the owner cells below.
-    - **Owner rulings recorded (2026-10-08).** (a) Raw-mode completeness is judged on NON-edge injected stars; the
-      26 edge stars (Fisher >= 20) are listed beside it as a record, their light is cut by the border (refused
-      `outsideImage`). (b) `background/neb3_4096` (+1.889 sigma, frame beta 10 on Moffat-4 stars) moves to Tasks 8/9
-      and is not a 6b STOP. (c) Donut stars count as defocused frames (the rule above).
-    - **To the owner / later tasks.** R2's cells go to F-3 (Task 8): `f2.0` i0 (+2.96 %), `f12.0` i0-2 (+1.14 to
-      +1.21 %), `f16.0` i0-1 (+1.47, +1.76 %), unsaturated-only +2.62 % and within 0.04 % for the rest;
-      `sharp/gauss/*` (-1.4 to -2.6 %) go to F-4.
-    - **Carried items.** The drizzle model bias of 5-8 % goes to Task 9 and the real-data checkpoint; psfSel's auto-beta
-      drift goes to Tasks 8/9 and Plan B; PA-12's bright-star region goes to Task 8; same-star fwhm at Fisher 40-100 (beta
-      held) reads worse, 0.03179 to 0.03300, mechanism open, to Tasks 8/9; same-star ecc above Fisher 300 reads worse,
-      0.08979 to 0.09084, carried with it.
 - **F-2 - canonical axes and a conditioned fit (Task 5; numbers move by design).**
   - **Canonical axes.** `accept` reports the major axis on `fwhm_x`/`fwtm_x` and `theta` on that axis, in
     `[-π/2, π/2)` (`canonical_theta`). The fitter's first axis was whichever its start made it, so the same star
@@ -1963,6 +1934,60 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       Ruling F7: the legacy analysis path, rustafits `analysis::metrics`, is the lab control through Plan A.
       `fit_one` calls the new entry point.
     - **Push order (M-7).** rustafits `one-star-path-beta` goes to both remotes before athenaeum `main`.
+  - **R-OSP-4 - the Task 6b fit rules (controller and owner rulings, 2026-10-08; fix wave A after the task review).**
+    - **The A-g width start (R1).** A star starts from its own half-maximum width (`own_halfmax_width`) when it is
+      readable, else from the field width, clamped to [0.6, 40]. Readable = the star's OWN peak (the maximum inside the
+      `HALFMAX_PEAK_SEARCH_PX` window `own_halfmax_width` centres on, not the box maximum, which a brighter
+      neighbour's wing raises) minus the rim median is at least 10 x 1.4826 MAD of the width-start box's rim. Chosen
+      on a truth criterion, before any bar was read.
+    - **The PA-12 region and rim b0.** The width-start box has radius ceil(2 x F_field); b0 is the median of its
+      outer 1-px rim, and the fit's B is read relative to it.
+    - **The PA-18 box admission.** A star whose width-start box leaves the image is refused `outsideImage`.
+    - **The D start shape (R9).** The start axis ratio and angle come from the second moments inside PA-12's
+      starting square, radius max(3, ceil(1.5 x F_start)), above b0.
+    - **The donut test (R7, R8).** Centred on a local iterated centroid of max(v - b0, 0) (window max(1.5, F_start),
+      at most 3 iterations, stop under 0.1 px); ring radius max(1.5, sqrt(sigma_major x sigma_minor)) from the box
+      moments about that centre; ring (R - 1/2, R + 1/2], core 3 x 3; refused when core < 0.8 x ring. At a pixel
+      centre the cross neighbours (d = 1) are not in the ring; an offset of 1e-12 px puts one in (the decision is
+      unharmed: every ratio is well clear of 0.8).
+    - **`NarrowerThanPixel`.** A fit narrower than a pixel is refused with that reason.
+    - **The defocused-frame verdict, measure path only (owner ruling 2026-10-08: "defocused stars are not stars").**
+      Rule: with `n_read` the plane's readable seeds (the width start's gate passed) and `n_donut` those refused
+      `Donut`, `n_donut >= 5` and `n_donut >= 0.25 * n_read` make the plane DEFOCUSED: every fit it would have accepted
+      is refused `Defocused`, the per-seed `Donut` refusals keep theirs, `FitOutcome.defocused` /
+      `PlaneMeasurement.defocused` are set and the plane has no fits (the existing zero-star path).
+      Measure path only: `FitStarsOptions.defocus_verdict` (default `false`) is set by `measure_plane` alone. LN's
+      refits (`fit_stars_with_beta`, `fit_stars_at`, `fit_stars`) keep the per-star `Donut` refusal and never get the
+      plane rule, because LN sees at most 200 seeds on a warped plane and could condemn a frame Measure keeps.
+      One `warn!` per plane from the adapter (`outcome = "defocused"`, `count = n_donut`, `stars_detected`, `path`,
+      `plane`). Checked on the round-3b probe outputs before it was coded: `donut/r6` 82 of 87 readable seeds
+      (94.3 %), `donut/r10` 61 of 61; every other lab frame 0.1 % or less (the worst, `density/d1000`, 2 of 2741).
+    - **Owner rulings of 2026-10-08.** (a) Raw-mode completeness is judged on NON-edge injected stars with Fisher SNR
+      >= 20; edge stars are listed beside it as a record (refused `outsideImage`). (b) `background/neb3_4096` moves to
+      Tasks 8/9 (frame beta 10 on Moffat-4 stars; a perfect flat sky model would carry +0.005 sigma) and is not a 6b
+      STOP. (c) Defocused stars are not stars (the verdict above).
+    - **Carried.**
+      - The drizzle model bias, 5-8 % low, which predates 6b: to Task 9 and the real-data checkpoint.
+      - psfSel's auto-beta drift, 1.25 -> 1.30 %: to Tasks 8/9 and Plan B.
+      - PA-12's bright-star region, which stops at about 2 FWHM with 0.5-3.8 sigma of wing at the rim: to Task 8.
+      - Same-star at t06b vs t06a, to Tasks 8/9: fwhm at Fisher 40-100 0.03179 -> 0.03300; ecc above Fisher 300
+        0.08979 -> 0.09084.
+      - Parked 6a review minors: M1 and M2 (mask coverage) to Plan C; M5, M7, M8 and M9 to the final review.
+      - M7 (task review): the defocused rule's false-positive rate on real frames is unmeasured; count `defocused`
+        frames on real data at Task 13.
+    - **Acceptance: t06b-f1 final run (numbers below).**
+    - **Earlier lab cycle (2026-10-08, athenaeum c2a7eb60), before fix wave A.**
+      Results in athenaeum-lab `star-lab/results/plan-a/t06b-f1/`: 697/697 probes proven, 53 712 scorecard rows, 0 missing; inject 90/90 proven.
+      `lab_cycle` bars line PASS (with the owner and moved cells below); noreg vs t06a PASS and noreg-cumulative vs
+      t01c PASS (0 moved, 0 lost, control 0) with the 32-entry design list (R4's population and fit-change groups
+      named with their mechanism). Numbers: fitted / seeded at FWHM 8 = 95.6 / 96.0 = 99.6 % (baseline 89.9 %); donut
+      0 accepted on `donut/r6` and `donut/r10` (defocused 50 / 11, donut 86 / 77) and no plane outside `donut/*` is
+      defocused (956 frame lines); F-7 background bias neb0.1 -0.087, neb0.5 -0.211, neb3 +0.146 sigma, flat -0.054
+      sigma; raw mode 100.0 % of the non-edge Fisher >= 20 injected stars on every `inject/raw/*` and `inject/mosaic/*`
+      plane (18 planes); frame FWHM within 1 % on every `sharp/m4` cell except the owner cells below.
+      To the owner / later tasks: R2's cells go to F-3 (Task 8): `f2.0` i0 (+2.96 %), `f12.0` i0-2 (+1.14 to
+      +1.21 %), `f16.0` i0-1 (+1.47, +1.76 %), unsaturated-only +2.62 % and within 0.04 % for the rest;
+      `sharp/gauss/*` (-1.4 to -2.6 %) go to F-4.
   - **Moved pins (by design).** Each literal carries its previous value.
     - `the_shipped_none_path_measures_exactly_these_numbers`: `psf_signal_weight` and `fwhm_px`.
     - `measure_plane_with_seeds_pinned_before_task_3b_rewrite`: `fwhm_px`, `eccentricity`, `tflux`,
