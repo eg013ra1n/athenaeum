@@ -1089,7 +1089,7 @@ pub(crate) fn start_stacking_with_solver(
             switched_from: None,
         },
         measurement: SummaryMeasurement {
-            seed_source: "fast".to_string(),
+            seed_source: plan.config.measurement.seed_source.as_str().to_string(),
             scale_estimator: plan.config.normalization.scale_estimator,
         },
         groups: Vec::new(),
@@ -12593,7 +12593,7 @@ pub(crate) fn test_context(
             switched_from: None,
         },
         measurement: SummaryMeasurement {
-            seed_source: "fast".to_string(),
+            seed_source: "matchedFilter".to_string(),
             scale_estimator: config.normalization.scale_estimator,
         },
         groups: Vec::new(),

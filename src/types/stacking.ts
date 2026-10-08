@@ -221,7 +221,8 @@ keyword: string,
  * the local background (spec §9.2). The measurement detector's two
  * levels sit at `background + k*noise` and `background + (k/2)*noise`,
  * so the seed population follows THIS frame's sky instead of a fixed
- * bright-pixel budget (M4a Task 2, ruling R-M4a-1).
+ * bright-pixel budget (M4a Task 2, ruling R-M4a-1). Peak only: the
+ * matched filter and the structure map do not read it.
  */
 detectionSigma: number, 
 /**
@@ -231,17 +232,11 @@ detectionSigma: number,
  */
 seedPrefilter: SeedPrefilter, 
 /**
- * WHICH detector finds the seeds (math reference §5.1, ruling
- * R-M4c-11): the peak threshold `detectionSigma` steers, or the
- * structure map. A stored config written before M4c Task 0 has no such
- * field and decodes to the shipped default.
- *
- * `structure` reads neither `detectionSigma` nor `seedPrefilter` — it
- * carries its own threshold and its own median — and it applies one
- * stage the peak detector has no equivalent of: an automatic minimum
- * structure size, derived per frame from the accepted candidates' own
- * size distribution (see `structure::StructureParams::min_structure_size`).
- * Its dials are calibrated constants, not config fields.
+ * Legacy mirror of [`Self::seed_source`] (peak vs structure, R-M4c-11),
+ * kept so older readers of the stored document still find the field. It
+ * steers nothing: the measurement stage reads `seed_source` only.
+ * A stored config written before M4c Task 0 has no such field and
+ * decodes to the shipped default.
  */
 seedDetector: SeedDetector, 
 /**

@@ -705,6 +705,7 @@ fn measure_frame_inner(
             detection_sigma = opts.detection_sigma,
             seed_prefilter = opts.seed_prefilter.as_str(),
             seed_detector = opts.seed_source.as_str(),
+            seed_threshold = opts.seed_threshold,
             read_ms = m.timings.read_ms,
             background_ms = m.timings.background_ms,
             noise_ms = m.timings.noise_ms,

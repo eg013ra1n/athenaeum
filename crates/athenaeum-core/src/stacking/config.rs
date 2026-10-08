@@ -163,23 +163,18 @@ pub struct MeasurementConfig {
     /// the local background (spec §9.2). The measurement detector's two
     /// levels sit at `background + k*noise` and `background + (k/2)*noise`,
     /// so the seed population follows THIS frame's sky instead of a fixed
-    /// bright-pixel budget (M4a Task 2, ruling R-M4a-1).
+    /// bright-pixel budget (M4a Task 2, ruling R-M4a-1). Peak only: the
+    /// matched filter and the structure map do not read it.
     pub detection_sigma: f64,
     /// What the seed detection runs on (math reference §5.1): the plane as
     /// it is, or its 3×3 median. Everything downstream of detection always
     /// measures the untouched plane. Read by the peak detector only.
     pub seed_prefilter: SeedPrefilter,
-    /// WHICH detector finds the seeds (math reference §5.1, ruling
-    /// R-M4c-11): the peak threshold `detectionSigma` steers, or the
-    /// structure map. A stored config written before M4c Task 0 has no such
-    /// field and decodes to the shipped default.
-    ///
-    /// `structure` reads neither `detectionSigma` nor `seedPrefilter` — it
-    /// carries its own threshold and its own median — and it applies one
-    /// stage the peak detector has no equivalent of: an automatic minimum
-    /// structure size, derived per frame from the accepted candidates' own
-    /// size distribution (see `structure::StructureParams::min_structure_size`).
-    /// Its dials are calibrated constants, not config fields.
+    /// Legacy mirror of [`Self::seed_source`] (peak vs structure, R-M4c-11),
+    /// kept so older readers of the stored document still find the field. It
+    /// steers nothing: the measurement stage reads `seed_source` only.
+    /// A stored config written before M4c Task 0 has no such field and
+    /// decodes to the shipped default.
     pub seed_detector: SeedDetector,
     /// The seed source (spec §2.2): the star-measurement module's matched filter (default), the peak threshold
     /// (reads `detectionSigma` and `seedPrefilter`), or the structure map. A document without it is decoded by
@@ -276,9 +271,9 @@ impl<'de> Deserialize<'de> for MeasurementConfig {
     }
 }
 
-/// Serde default for [`MeasurementConfig::detection_sigma`] — a stored
-/// config written before M4a Task 2 has no such field and must decode to
-/// the calibrated value, not to `0.0`.
+/// The calibrated [`MeasurementConfig::detection_sigma`] default (used by
+/// `Default` and by the legacy decode when a stored document has no such
+/// field — not to `0.0`).
 fn default_detection_sigma() -> f64 {
     crate::stacking::measure::DEFAULT_DETECTION_SIGMA as f64
 }
@@ -577,8 +572,6 @@ pub fn resolve_config(
         );
         config.grouping.stops_width = MIN_STOPS_WIDTH;
     }
-    config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
-    config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
     config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
     // M4c Task 3: the same backend guard for the large-scale filter's two
     // integers. Out of range these are not preferences but a broken filter
@@ -613,10 +606,15 @@ pub fn resolve_config(
     Ok(config)
 }
 
-/// L-9 and the spec §6 clamps for the LN fields, on any config that came from
+/// L-9 and the spec §6 clamps for the LN fields (and the two seed clamps
+/// `detectionSigma` / `seedThreshold`), on any config that came from
 /// storage or from a caller (resolve_config, a plan override, a decoded user
 /// preset). Idempotent.
 pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
+    // The two seed clamps ride the same shared resolver, so a plan override or
+    // a decoded preset cannot carry an out-of-range value past resolve_config.
+    config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
+    config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
     use crate::stacking::integrate::LnScaleMode;
     use crate::stacking::ln::{effective_scale_mode, snap_ln_scale, MAX_GRID_SIZE, MIN_GRID_SIZE};
     let local = &mut config.normalization.local;
@@ -2072,6 +2070,22 @@ mod tests {
         assert_eq!(hi.measurement.seed_threshold, 20.0);
         let ok = resolve_config(Some(r#"{"measurement":{"seedThreshold":4.5}}"#), None).unwrap();
         assert_eq!(ok.measurement.seed_threshold, 4.5);
+    }
+
+    #[test]
+    fn seed_clamps_ride_the_shared_resolver() {
+        // A decoded preset / plan override never passes resolve_config; the
+        // shared resolver must clamp both seed dials there too.
+        let mut cfg: StackingConfig =
+            serde_json::from_str(r#"{"measurement":{"seedThreshold":0.5,"detectionSigma":0.1}}"#).unwrap();
+        resolve_ln_fields(&mut cfg);
+        assert_eq!(cfg.measurement.seed_threshold, 2.0);
+        assert_eq!(cfg.measurement.detection_sigma, MIN_DETECTION_SIGMA);
+        let mut ok = StackingConfig::default();
+        let before = ok.measurement.clone();
+        resolve_ln_fields(&mut ok);
+        assert_eq!(ok.measurement.seed_threshold, before.seed_threshold);
+        assert_eq!(ok.measurement.detection_sigma, before.detection_sigma);
     }
 
     #[test]

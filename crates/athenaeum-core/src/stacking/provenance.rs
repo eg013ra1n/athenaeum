@@ -71,10 +71,10 @@ pub struct SummaryReference {
 }
 
 /// What stage 3 (measurement, Task 7) used, recorded once at the top of the
-/// summary — a run-wide choice, not a per-frame one. `seed_source` is always
-/// `"fast"` in M1 (the fast detector path is the pipeline's only seed
-/// source; ruling 13's carry-forward — the probe never recorded it, this
-/// summary does). `scale_estimator` mirrors `cfg.normalization.scale_estimator`,
+/// summary — a run-wide choice, not a per-frame one. `seed_source` is the
+/// config's `measurement.seedSource` spelling (`"matchedFilter"` | `"peak"` |
+/// `"structure"`) since 2026-10 (Plan A Task 7); summaries written before say
+/// `"fast"`, which meant the peak detector. `scale_estimator` mirrors `cfg.normalization.scale_estimator`,
 /// which [`crate::stacking::config::MeasurementConfig::measure_options`]
 /// keeps in lockstep with the measurement stage's own estimator, so this
 /// field is knowable from the config alone, before stage 3 ever runs.
@@ -301,7 +301,7 @@ mod tests {
                 switched_from: None,
             },
             measurement: SummaryMeasurement {
-                seed_source: "fast".into(),
+                seed_source: "matchedFilter".into(),
                 scale_estimator,
             },
             config,

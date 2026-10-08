@@ -242,7 +242,7 @@ export function MeasurePanel({
         <p className="mt-1 text-[11px] text-content-muted">
           default {seedSourceLabel(defaults.measurement.seedSource)} — which stars the fits
           start from. The matched filter is the star-measurement module's own detector
-          (one star path for Analysis and Stacking, R-OSP-2) and reads only the seed
+          (the one star path, R-OSP-2) and reads only the seed
           threshold. The peak threshold reads the detection threshold and the pre-filter
           below. The structure map groups connected pixels and reads neither; it finds
           fewer stars on an undersampled frame and measured worse on colour frames than

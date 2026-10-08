@@ -6227,7 +6227,7 @@ mod tests {
     /// this pin drives BOTH from the same config change.
     #[test]
     fn the_ln_hashes_follow_the_measure_seed_config() {
-        use crate::stacking::structure::SeedDetector;
+        use crate::stacking::config::SeedSource;
 
         let cfg = StackingConfig::default();
         let calibrated = "calibrated-hash";
@@ -6272,26 +6272,26 @@ mod tests {
 
         // A changed Measure SEED config moves the measurement hash ...
         let mut seed_cfg = cfg.clone();
-        seed_cfg.measurement.seed_detector = match cfg.measurement.seed_detector {
-            SeedDetector::Peak => SeedDetector::Structure,
-            SeedDetector::Structure => SeedDetector::Peak,
+        seed_cfg.measurement.seed_source = match cfg.measurement.seed_source {
+            SeedSource::MatchedFilter => SeedSource::Peak,
+            _ => SeedSource::MatchedFilter,
         };
         let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
         assert_ne!(
             measurement, seed_measurement,
-            "sanity: the measurement hash itself must follow seedDetector"
+            "sanity: the measurement hash itself must follow seedSource"
         );
 
         // ... and both LN hashes must move with it.
         assert_ne!(
             ln(&seed_cfg, &seed_measurement),
             ln(&cfg, &measurement),
-            "a changed seedDetector must invalidate the per-frame LN hash"
+            "a changed seedSource must invalidate the per-frame LN hash"
         );
         assert_ne!(
             seeds(&seed_cfg, &seed_measurement),
             seeds(&cfg, &measurement),
-            "a changed seedDetector must invalidate the seeds-calibration hash"
+            "a changed seedSource must invalidate the seeds-calibration hash"
         );
 
         // The seam is the folded VALUE, not the subtree: handing the same
@@ -6412,7 +6412,7 @@ mod tests {
     /// `structure`.
     #[test]
     fn the_registration_hash_follows_the_measure_seed_config() {
-        use crate::stacking::structure::SeedDetector;
+        use crate::stacking::config::SeedSource;
 
         let cfg = StackingConfig::default();
         let calibrated = "calibrated-hash";
@@ -6428,14 +6428,14 @@ mod tests {
 
         // A changed Measure SEED config moves the measurement hash ...
         let mut seed_cfg = cfg.clone();
-        seed_cfg.measurement.seed_detector = match cfg.measurement.seed_detector {
-            SeedDetector::Peak => SeedDetector::Structure,
-            SeedDetector::Structure => SeedDetector::Peak,
+        seed_cfg.measurement.seed_source = match cfg.measurement.seed_source {
+            SeedSource::MatchedFilter => SeedSource::Peak,
+            _ => SeedSource::MatchedFilter,
         };
         let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
         assert_ne!(
             measurement, seed_measurement,
-            "sanity: the measurement hash itself must follow seedDetector"
+            "sanity: the measurement hash itself must follow seedSource"
         );
 
         // ... and the registration hash must move with it, even though
@@ -6443,7 +6443,7 @@ mod tests {
         assert_ne!(
             reg(&seed_cfg, &seed_measurement),
             reg(&cfg, &measurement),
-            "a changed seedDetector must invalidate the registration hash"
+            "a changed seedSource must invalidate the registration hash"
         );
 
         // The seam is the folded VALUE, not the subtree.
