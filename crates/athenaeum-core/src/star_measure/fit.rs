@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
-use super::seeds::{field_width_of, own_halfmax_width, FieldWidth, HALFMAX_PEAK_SEARCH_PX};
+use super::seeds::{field_width_of, own_halfmax_width, FieldWidth};
 use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 
 /// `2√(2 ln 2)`: a Gaussian's FWHM per σ (the start width [`FitDiagnostics::width_start`] reports).
@@ -623,16 +623,11 @@ fn width_start(
     start.level = level;
     // `rim_median` left the rim's present pixels in `scratch.rim` (reordered, the same multiset).
     let sigma_rim = (MAD_TO_SIGMA * mad_about(&scratch.rim, level as f32)) as f64;
-    // The star's OWN peak (Task 6b fix wave A, review M2): the maximum inside the window `own_halfmax_width` centres
-    // its read on (the seed's rounded position, ±`HALFMAX_PEAK_SEARCH_PX`), not the box maximum, which a brighter
-    // neighbour's wing inside the box would raise.
-    let (sx, sy) = (seed.x.round() as i64, seed.y.round() as i64);
+    // The readability gate reads the width-start box maximum, kept by measurement (t06b-m2-check, 2026-10-08): the
+    // star's-own-peak alternative lost 547 fits and read same-star fwhm worse.
     let mut peak = f64::NEG_INFINITY;
-    for y in sy - HALFMAX_PEAK_SEARCH_PX..=sy + HALFMAX_PEAK_SEARCH_PX {
-        for x in sx - HALFMAX_PEAK_SEARCH_PX..=sx + HALFMAX_PEAK_SEARCH_PX {
-            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
-                continue;
-            }
+    for y in cy - rb..=cy + rb {
+        for x in cx - rb..=cx + rb {
             let i = y as usize * w + x as usize;
             if present(data, mask, i) {
                 peak = peak.max(data[i] as f64);
@@ -2621,10 +2616,8 @@ mod tests {
         let (w, h) = (330usize, 100usize);
         let mut data = vec![0.05f32; w * h];
         let donuts: Vec<(usize, usize)> = (0..8).map(|i| (30 + 35 * i, 30)).collect();
-        // Gain 4: a donut's seed window (the star's own peak, ±2 px about the seed) lies in its hole (radius 2.4), so
-        // its corners must stand 10 σ over the rim for the donut to be readable (fix wave A, M2).
         for &(x, y) in &donuts {
-            add_donut_gain(&mut data, w, x, y, 4.0);
+            add_donut(&mut data, w, x, y);
         }
         let alpha = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
         let stars = [one(100.0, 75.0, 0.3, alpha), one(220.0, 75.0, 0.3, alpha)];
@@ -2898,12 +2891,11 @@ mod tests {
         );
     }
 
-    /// Task 6b fix wave A, review M2 (RED before the fix: the gate read the box maximum). A 5 σ FWHM-3 star with a 50x
-    /// brighter FWHM-1.5 neighbour 5 px away, inside its ⌈2·3⌉ = 6 px box: the box maximum is the neighbour's, the
-    /// star's own peak (±2 px about its seed) stands about 6 σ over the rim, so it is NOT readable and starts at the
-    /// field width exactly. The neighbour's own start is its own width.
+    /// t06b-m2-check (2026-10-08): the own-peak gate lost 547 fits and read same-star fwhm +0.3 % worse (10-20, 20-40);
+    /// the box-maximum gate is kept by measurement. A 5 sigma FWHM-3 star beside a 50x brighter neighbour 5 px away,
+    /// inside its box, reads readable by the box maximum, so it starts from its own half-maximum width, not the field's.
     #[test]
-    fn a_faint_stars_readability_is_its_own_peak_not_a_neighbours() {
+    fn a_star_near_a_bright_neighbour_is_readable_by_the_box_maximum() {
         let stars = [
             one(100.0, 100.0, 0.010, 3.449),
             one(105.0, 100.0, 0.5, 1.725),
@@ -2912,15 +2904,10 @@ mod tests {
         add_noise(&mut data, 0.002, 33);
         let seeds: Vec<Seed> = stars.iter().map(seed).collect();
         let (_, diag) = fit_with(&data, 200, 200, &seeds, 3.0);
-        assert_eq!(
+        assert_ne!(
             diag[0].width_start, 3.0,
-            "a faint star beside a bright one starts from the field width: {:?}",
+            "the neighbour's wing makes the box maximum clear the gate: {:?}",
             diag[0]
-        );
-        assert!(
-            (diag[1].width_start / 1.5 - 1.0).abs() < 0.25,
-            "the bright neighbour reads its own width: {:?}",
-            diag[1]
         );
     }
 

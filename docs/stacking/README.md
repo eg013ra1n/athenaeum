@@ -1936,9 +1936,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **Push order (M-7).** rustafits `one-star-path-beta` goes to both remotes before athenaeum `main`.
   - **R-OSP-4 - the Task 6b fit rules (controller and owner rulings, 2026-10-08; fix wave A after the task review).**
     - **The A-g width start (R1).** A star starts from its own half-maximum width (`own_halfmax_width`) when it is
-      readable, else from the field width, clamped to [0.6, 40]. Readable = the star's OWN peak (the maximum inside the
-      `HALFMAX_PEAK_SEARCH_PX` window `own_halfmax_width` centres on, not the box maximum, which a brighter
-      neighbour's wing raises) minus the rim median is at least 10 x 1.4826 MAD of the width-start box's rim. Chosen
+      readable, else from the field width, clamped to [0.6, 40]. Readable = the width-start box maximum minus the rim median is at least 10 x 1.4826 MAD of the width-start box's
+      rim; the gate reads the box maximum, kept by measurement (t06b-m2-check, 2026-10-08), and the own-peak alternative
+      (the maximum inside the `HALFMAX_PEAK_SEARCH_PX` window) was measured worse: 547 fits lost, same-star fwhm +0.3 % worse. Chosen
       on a truth criterion, before any bar was read.
     - **The PA-12 region and rim b0.** The width-start box has radius ceil(2 x F_field); b0 is the median of its
       outer 1-px rim, and the fit's B is read relative to it.
