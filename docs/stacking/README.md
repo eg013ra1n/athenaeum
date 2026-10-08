@@ -1970,12 +1970,25 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       - The drizzle model bias, 5-8 % low, which predates 6b: to Task 9 and the real-data checkpoint.
       - psfSel's auto-beta drift, 1.25 -> 1.30 %: to Tasks 8/9 and Plan B.
       - PA-12's bright-star region, which stops at about 2 FWHM with 0.5-3.8 sigma of wing at the rim: to Task 8.
-      - Same-star at t06b vs t06a, to Tasks 8/9: fwhm at Fisher 40-100 0.03179 -> 0.03300; ecc above Fisher 300
-        0.08979 -> 0.09084.
+      - Same-star at t06b vs t06a: fwhm at Fisher 40-100 0.03179 -> 0.03300, to Tasks 8/9.
+      - **Owner ruling 2026-10-08: ecc above Fisher 300 is moved to Task 8**, which must bring same-star ecc >300
+        back to <= t06a (sign rule). Measure 0.08979 -> 0.09084 (up 28691 / down 27304, 2 sqrt 473); betas@10
+        0.09024 -> 0.09114 and betas@6 0.09219 -> 0.09293 (betas@2.5 at Fisher 20-40 0.35746 -> 0.35696); every
+        other bin NOT WORSE. The row 4 ecc design entries (measure and betas@*) stay set aside for this reason. Row 4
+        angle stays set aside on the lab's `angle-same-star.txt` (24 shape families, same in every Fisher bin; the
+        measure code is unchanged since round 3); row 2 centroid (measure and register) is re-listed for Task 8 (same-star NOT WORSE in every bin).
       - Parked 6a review minors: M1 and M2 (mask coverage) to Plan C; M5, M7, M8 and M9 to the final review.
       - M7 (task review): the defocused rule's false-positive rate on real frames is unmeasured; count `defocused`
         frames on real data at Task 13.
-    - **Acceptance: t06b-f1 final run (numbers below).**
+    - **Acceptance: t06b-f1 final run (athenaeum 1100f0f5, athenaeum-lab 9d893a3a; results in `star-lab/results/plan-a/t06b-f1/`).**
+      697/697 probes proven, 53 790 scorecard rows, 0 missing; inject 90/90 proven (2 826 rows). Bars PASS, to the
+      owner as ruled: R2 F-3 cells (`sharp/m4` f2.0 +2.96 %, f12.0 +1.21 / +1.14 / +1.20 %, f16.0 +1.76 / +1.47 %;
+      unsaturated-only +2.62 % and within 0.04 % for the rest), `sharp/gauss` F-4 (-1.4 to -2.6 %), `neb3_4096`
+      bias +1.889 sigma to Tasks 8/9; raw mode 26 edge stars recorded, not counted. With the final 32-entry design
+      list (owner rulings above; axis order, false detections and bright coverage set aside by population, +15 383
+      truth-matched stars): noreg vs t06a-seeds PASS and noreg-cumulative vs t01c-baseline PASS, both 0 moved, 0
+      one-sided missed, 0 lost, control 0. Same-star (measure, pooled): fwhm BETTER, ecc BETTER, centroid BETTER;
+      WORSE bins fwhm 40-100 and ecc >300, both carried above.
     - **Earlier lab cycle (2026-10-08, athenaeum c2a7eb60), before fix wave A.**
       Results in athenaeum-lab `star-lab/results/plan-a/t06b-f1/`: 697/697 probes proven, 53 712 scorecard rows, 0 missing; inject 90/90 proven.
       `lab_cycle` bars line PASS (with the owner and moved cells below); noreg vs t06a PASS and noreg-cumulative vs
