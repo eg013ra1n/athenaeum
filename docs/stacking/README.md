@@ -1898,3 +1898,45 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `{"row":1,"metric":"donut outcome","family":"donut/*","path":"measure","kind":"reported"}`; it is judged
       at Task 6b. With it both diffs PASS (0 moved, 0 lost, control 0 mismatch). Without it, they read FAIL on
       exactly those two rows.
+- **F-2 - canonical axes and a conditioned fit (Task 5; numbers move by design).**
+  - **Canonical axes.** `accept` reports the major axis on `fwhm_x`/`fwtm_x` and `theta` on that axis, in
+    `[-π/2, π/2)` (`canonical_theta`). The fitter's first axis was whichever its start made it, so the same star
+    could read (major, minor, θ) or (minor, major, θ ± 90°). Both forms are the same ellipse. The gates, the
+    aperture, `fwhm()`, `eccentricity()` and every reader outside the module are symmetric in the swap:
+    - the register σ pairs, which every consumer reduces to `σx² + σy²`;
+    - LN `to_seed`'s `σx·σy`;
+    - the `ln_scale_probe` ellipse.
+    An `.athf` written before keeps the fitter's order; it is stale by `MEASURE_VERSION`.
+  - **The conditioned fit.** `fit_one` hands the fitter the stamp centred on `(cx, cy)`, with values
+    `(v − b0)/a0`. The fit starts at `B = 0`, `A = 1`, `x0 = seed.x − cx`, and the result is mapped back
+    (`x0 + cx`, `B·a0 + b0`, `A·a0`). `fit_residual` was amplitude-normalised already. `conv_tol` and the cost
+    test keep their values; the step-size test now sees O(1) parameters on every star instead of a norm
+    dominated by the position or the sky level.
+  - **R-OSP-3 - the rustafits change fired on unit-level numbers (controller ruling, Task 5).** The Moffat
+    solver's Jacobian built its θ column as `2uv·(1/αy² − 1/αx²)`. That is the negative of
+    `∂Q/∂θ = 2uv·(1/αx² − 1/αy²)` (`∂u/∂θ = v`, `∂v/∂θ = −u`). Its θ steps went uphill: once the other
+    parameters had compensated, every step was rejected and the fit stopped away from the minimum. The deciding
+    numbers, noiseless and measured before any lab run:
+    - **The canonical-axes fixture** (αx 3, αy 6, θ 20°, β 4): θ −73.83° against the true −70° on every star,
+      not converged, residual 7.2e-3. Corrected: −70.0000°, αx/αy 6.00000/3.00000, residual 2.8e-7 (the f32
+      floor), converged in 5 iterations.
+    - **A 31×31 stamp** (αx 2.5, αy 4, θ 30°, β 4) started at θ 35°: 44.84°, not converged; the fit walks away
+      from the truth. Corrected: 30.0000°.
+    - **The remedy is the column.** Tighter tolerances, 1000 iterations or 50 rejects end at the same wrong θ,
+      so the plan's per-parameter convergence test was not added. It becomes a second, recorded change only if
+      the lab bar misses with the corrected column.
+    - **The rustafits change.** It is on branch `one-star-path-beta` (from 8321412, commit 197fd93). The new
+      public `fit_moffat_2d_fixed_beta_conditioned` takes the corrected column through a private `ThetaColumn`
+      option. The option is threaded into the shared solver and the frozen C3 reference; the solver is not
+      duplicated.
+    - **The legacy entry points.** `fit_moffat_2d` and `fit_moffat_2d_fixed_beta` keep the legacy column and
+      are output-identical to 1.3.0, pinned bit for bit (`the_legacy_entry_points_are_output_identical_to_1_3_0`).
+      Ruling F7: the legacy analysis path, rustafits `analysis::metrics`, is the lab control through Plan A.
+      `fit_one` calls the new entry point.
+    - **Push order (M-7).** rustafits `one-star-path-beta` goes to both remotes before athenaeum `main`.
+  - **Moved pins (by design).** Each literal carries its previous value.
+    - `the_shipped_none_path_measures_exactly_these_numbers`: `psf_signal_weight` and `fwhm_px`.
+    - `measure_plane_with_seeds_pinned_before_task_3b_rewrite`: `fwhm_px`, `eccentricity`, `tflux`,
+      `tmean_flux`, `psf_signal_weight` and `psf_snr`.
+    - The counts, β and every noise/sky field are unchanged. The module-vs-adapter equality pins stay
+      equalities.

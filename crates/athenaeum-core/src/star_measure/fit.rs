@@ -6,12 +6,19 @@
 //! F-0 (Plan A Task 4): every seed gets exactly one outcome — an accepted fit or a counted
 //! [`RefusalReason`] — collected in seed order from the same parallel chain, so the accepted fits, their order and
 //! every number are what they were before the outcomes were recorded.
+//!
+//! F-2 (Plan A Task 5): the fitter sees a stamp-centred, amplitude-normalised problem (every parameter O(1), so its
+//! step-size convergence test means the same on every star), through rustafits' conditioned entry point, whose
+//! Jacobian carries the θ column with its correct sign (ruling R-OSP-3); and every accepted fit reports canonical
+//! axes — the major axis on `fwhm_x`, `theta` on it, in `[-π/2, π/2)`.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
 
-use astroimage::analysis::fitting::{fit_moffat_2d_fixed_beta, Moffat2DResult, PixelSample};
+use astroimage::analysis::fitting::{
+    fit_moffat_2d_fixed_beta_conditioned, Moffat2DResult, PixelSample,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -151,10 +158,15 @@ pub struct StarFit {
     pub y: f64,
     pub background: f64,
     pub amplitude: f64,
+    /// The MAJOR axis's FWHM: `fwhm_x >= fwhm_y` on every accepted fit (F-2, canonical axes).
     pub fwhm_x: f64,
     pub fwhm_y: f64,
+    /// The FWTMs follow the FWHMs: `fwtm_x` is the major axis's.
     pub fwtm_x: f64,
     pub fwtm_y: f64,
+    /// Angle of the major (`fwhm_x`) axis from the image x axis, radians, in `[-π/2, π/2)` (F-2). A fit decoded from
+    /// a `fits` artifact written before Plan A keeps the fitter's own axis order; such a file is stale by
+    /// `MEASURE_VERSION`.
     pub theta: f64,
     pub beta: f64,
     /// Normalized fit residual, `sqrt(cost/n)/amplitude`.
@@ -490,10 +502,13 @@ fn fit_one(
                 top.sort_by(f64::total_cmp);
             }
             scratch.vals.push(v);
+            // F-2: stamp-centred coordinates (exact integers), the value
+            // normalised below once the start background and amplitude are
+            // known.
             scratch.px.push(PixelSample {
-                x: x as f64,
-                y: y as f64,
-                value: v as f64,
+                x: (x - cx) as f64,
+                y: (y - cy) as f64,
+                value: v64,
             });
         }
     }
@@ -503,22 +518,40 @@ fn fit_one(
     let b0 = median_in_place(&mut scratch.vals) as f64;
     trace.background_start = b0;
     let a0 = (peak - b0).max(1e-9);
+    // F-2 (Plan A Task 5): the fitter sees a conditioned problem — the stamp
+    // centred on (cx, cy) and the values as `(v − b0)/a0`, so it starts at
+    // B = 0, A = 1 with every parameter O(1). Its step-size convergence test
+    // (`‖Δp‖/‖p‖ < conv_tol`) then means the same thing on every star: with
+    // absolute coordinates and native amplitudes `‖p‖` was dominated by the
+    // position (thousands of pixels) or the sky level. The result is mapped
+    // back below; `fit_residual` is already amplitude-normalised.
+    for s in scratch.px.iter_mut() {
+        s.value = (s.value - b0) / a0;
+    }
     // Size from the field σ (flux/peak), orientation and axis ratio from the
     // stamp's moments: a circular θ = 0 seed leaves an elongated star in an
     // axis-aligned local minimum, and Moffat wings inflate the moments' size.
-    let (sx0, sy0, th0) = match moment_ellipse(&scratch.px, b0) {
+    // The moments are translation- and scale-invariant: the normalised stamp
+    // above 0 is the raw stamp above b0, divided by a0.
+    let (sx0, sy0, th0) = match moment_ellipse(&scratch.px, 0.0) {
         Some((major, minor, theta)) => {
             let q = (major / minor).clamp(1.0, 4.0).sqrt();
             (sigma0 * q, sigma0 / q, theta)
         }
         None => (sigma0, sigma0, 0.0),
     };
-    let Some(fit) = fit_moffat_2d_fixed_beta(
+    let (ox, oy) = (cx as f64, cy as f64);
+    // The conditioned entry point carries the Jacobian's θ column with its
+    // correct sign (ruling R-OSP-3): `fit_moffat_2d_fixed_beta`'s column is
+    // the negative of ∂Q/∂θ, so its θ steps went uphill and a noiseless
+    // elliptical star stalled 3.8° off. That entry point keeps its column for
+    // the legacy analysis path (ruling F7).
+    let Some(mut fit) = fit_moffat_2d_fixed_beta_conditioned(
         &scratch.px,
-        b0,
-        a0,
-        seed.x,
-        seed.y,
+        0.0,
+        1.0,
+        seed.x - ox,
+        seed.y - oy,
         sx0,
         sy0,
         th0,
@@ -529,6 +562,11 @@ fn fit_one(
     ) else {
         return (Err(RefusalReason::FitFailed), trace);
     };
+    // Back to image coordinates and the plane's units.
+    fit.x0 += ox;
+    fit.y0 += oy;
+    fit.b = fit.b * a0 + b0;
+    fit.a *= a0;
     trace.converged = fit.converged;
     let mut f = match accept(&fit, seed, cx as f64, cy as f64, r as f64, p) {
         Ok(f) => f,
@@ -601,16 +639,35 @@ fn accept(
     if 0.5 * p.growth * fwtm_x.max(fwtm_y) > r {
         return Err(RefusalReason::RegionTooSmall);
     }
+    // F-2 (Plan A Task 5): canonical axes. The fitter's first axis is
+    // whichever its start made it, so the same star could read (major, minor,
+    // θ) or (minor, major, θ ± 90°). Every accepted fit reports the major axis
+    // on `fwhm_x`/`fwtm_x` and `theta` on that axis, in [-π/2, π/2). Both
+    // forms are the same ellipse, so the gates above (symmetric in the pair)
+    // and the aperture are unaffected.
+    let (fwhm_a, fwhm_b) = (m.fwhm_x(), m.fwhm_y());
+    let (fwhm_x, fwhm_y, fwtm_x, fwtm_y, theta) = if fwhm_a >= fwhm_b {
+        (fwhm_a, fwhm_b, fwtm_x, fwtm_y, m.theta)
+    } else {
+        // The fitter's θ is in [-π/2, π/2]; the perpendicular axis lies a
+        // quarter turn away, on the side that stays in range.
+        let perpendicular = if m.theta < 0.0 {
+            m.theta + std::f64::consts::FRAC_PI_2
+        } else {
+            m.theta - std::f64::consts::FRAC_PI_2
+        };
+        (fwhm_b, fwhm_a, fwtm_y, fwtm_x, perpendicular)
+    };
     Ok(StarFit {
         x: m.x0,
         y: m.y0,
         background: m.b,
         amplitude: m.a,
-        fwhm_x: m.fwhm_x(),
-        fwhm_y: m.fwhm_y(),
+        fwhm_x,
+        fwhm_y,
         fwtm_x,
         fwtm_y,
-        theta: m.theta,
+        theta: canonical_theta(theta),
         beta: m.beta,
         residual: m.fit_residual,
         signal: 0.0,
@@ -618,6 +675,22 @@ fn accept(
         peak5: f64::NAN,
         flags: StarFlags::default(),
     })
+}
+
+/// `theta` wrapped into `[-π/2, π/2)` (F-2): an axis is a line, so θ and θ ± π name the same one. A value already in
+/// range is returned as it is.
+fn canonical_theta(theta: f64) -> f64 {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    if (-FRAC_PI_2..FRAC_PI_2).contains(&theta) {
+        return theta;
+    }
+    let t = (theta + FRAC_PI_2).rem_euclid(PI) - FRAC_PI_2;
+    // `rem_euclid` may round up to its divisor on a value just below a multiple of it.
+    if t >= FRAC_PI_2 {
+        t - PI
+    } else {
+        t
+    }
 }
 
 /// Sum `pixel − background` over the pixels whose centres lie inside the
@@ -884,6 +957,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::star_measure::fit_stars_at;
     use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
 
     fn round(x: f64, y: f64, amp: f64) -> MoffatStar {
@@ -1218,7 +1292,8 @@ mod tests {
         };
         // Start the fit AT the star so it converges there — the point is
         // where it settles relative to the region, not how it got there.
-        let fit = fit_moffat_2d_fixed_beta(
+        // Plan A Task 5: the conditioned entry point, which is the fitter `fit_one` calls now.
+        let fit = fit_moffat_2d_fixed_beta_conditioned(
             &px,
             b0,
             (peak - b0).max(1e-9),
@@ -1506,6 +1581,131 @@ mod tests {
         let b = fit_stars_with_beta(&data, 20, 20, &seeds, 7.5, &FitParams::default(), None);
         assert_eq!(a.beta, 7.5);
         assert_eq!(a.beta, b.beta);
+    }
+
+    // --- Plan A Task 5 (F-2): canonical axes and a conditioned fit ---
+
+    fn grid(n: usize, alpha_x: f64, alpha_y: f64, theta: f64) -> (Vec<MoffatStar>, Vec<Seed>) {
+        let stars: Vec<MoffatStar> = (0..n)
+            .map(|i| MoffatStar {
+                x: 30.0 + (i % 8) as f64 * 40.0,
+                y: 30.0 + (i / 8) as f64 * 40.0,
+                amp: 0.3,
+                alpha_x,
+                alpha_y,
+                theta,
+            })
+            .collect();
+        let seeds = stars
+            .iter()
+            .map(|s| Seed {
+                x: s.x,
+                y: s.y,
+                peak: s.amp,
+                flux: 1.0,
+            })
+            .collect();
+        (stars, seeds)
+    }
+
+    #[test]
+    fn accepted_fits_have_canonical_axes() {
+        // αx 3 / αy 6 at θ = 20°: the generator's u axis (θ) is the MINOR one; the canonical fit must report the major
+        // axis on fwhm_x and θ_canonical = 20° + 90° (mod 180°)
+        let (stars, seeds) = grid(40, 3.0, 6.0, 20f64.to_radians());
+        let data = moffat_field(360, 240, &stars, 4.0, 0.05);
+        let out = fit_stars_at(&data, 360, 240, &seeds, 4.0, &FitParams::default(), None);
+        assert!(out.fits.len() >= 36, "{}", out.fits.len());
+        let want = (20f64 + 90.0).to_radians();
+        for f in &out.fits {
+            assert!(f.fwhm_x >= f.fwhm_y, "{f:?}");
+            let d = ((f.theta - want + std::f64::consts::FRAC_PI_2)
+                .rem_euclid(std::f64::consts::PI)
+                - std::f64::consts::FRAC_PI_2)
+                .abs();
+            assert!(d < 2f64.to_radians(), "theta {} vs {want}", f.theta);
+            assert!((f.fwtm_x / f.fwhm_x - f.fwtm_y / f.fwhm_y).abs() < 1e-9);
+            assert!(
+                f.theta >= -std::f64::consts::FRAC_PI_2 && f.theta < std::f64::consts::FRAC_PI_2
+            );
+        }
+    }
+
+    #[test]
+    fn fit_is_translation_and_scale_invariant() {
+        let star = |x, y, amp| MoffatStar {
+            x,
+            y,
+            amp,
+            alpha_x: 3.0,
+            alpha_y: 4.5,
+            theta: 0.5,
+        };
+        // The bright copy is ×1024, not ×1000 (controller ruling, Task 5): the planes are noiseless f32, so their only
+        // noise is f32 rounding, and a factor that is not a power of two rounds the bright copy differently from the
+        // faint one — that alone moves a noiseless fit by ~1e-8 relative (the residual, which sits at that rounding
+        // floor, by 20 %). A power of two scales every f32 value exactly. The seed's peak AND flux scale with it, so
+        // σ0 = √(flux/(2π·peak)) is the same start on both.
+        const K: f64 = 1024.0;
+        let near = moffat_field(80, 80, &[star(30.3, 20.7, 0.3)], 4.0, 0.05);
+        let far = moffat_field(3100, 2100, &[star(3000.3, 2000.7, 0.3)], 4.0, 0.05);
+        let bright = moffat_field(80, 80, &[star(30.3, 20.7, 0.3 * K)], 4.0, 0.05 * K as f32);
+        let f = |d: &[f32], w, h, x, y, p, flux| {
+            fit_stars_at(
+                d,
+                w,
+                h,
+                &[Seed {
+                    x,
+                    y,
+                    peak: p,
+                    flux,
+                }],
+                4.0,
+                &FitParams::default(),
+                None,
+            )
+            .fits[0]
+        };
+        let a = f(&near, 80, 80, 30.3, 20.7, 0.3, 1.0);
+        let b = f(&far, 3100, 2100, 3000.3, 2000.7, 0.3, 1.0);
+        let c = f(&bright, 80, 80, 30.3, 20.7, 0.3 * K, K);
+        let rel = |p: f64, q: f64| ((p - q) / q).abs();
+        assert!(
+            rel(b.x - 2970.0, a.x) < 1e-9 && rel(b.y - 1980.0, a.y) < 1e-9,
+            "translation: {a:?} {b:?}"
+        );
+        for (p, q) in [
+            (a.fwhm_x, b.fwhm_x),
+            (a.fwhm_y, b.fwhm_y),
+            (a.theta, b.theta),
+            (a.residual, b.residual),
+        ] {
+            assert!(rel(p, q) < 1e-9, "{p} vs {q}");
+        }
+        assert!(
+            rel(c.amplitude, K * a.amplitude) < 1e-9 && rel(c.background, K * a.background) < 1e-9,
+            "scale: amplitude {:e}, background {:e}",
+            rel(c.amplitude, K * a.amplitude),
+            rel(c.background, K * a.background)
+        );
+        assert!(
+            rel(c.fwhm_x, a.fwhm_x) < 1e-9 && rel(c.residual, a.residual) < 1e-9,
+            "scale: fwhm_x {:e}, residual {:e}",
+            rel(c.fwhm_x, a.fwhm_x),
+            rel(c.residual, a.residual)
+        );
+    }
+
+    /// A pin, not RED (ruling F28): `fwhm()` and `eccentricity()` are symmetric in x/y by construction.
+    #[test]
+    fn eccentricity_and_fwhm_are_unchanged_by_the_swap() {
+        let mut f = StarFit::test_at(1.0, 1.0, 1.0);
+        f.fwhm_x = 2.0;
+        f.fwhm_y = 3.0;
+        let (fw, e) = (f.fwhm(), f.eccentricity());
+        std::mem::swap(&mut f.fwhm_x, &mut f.fwhm_y);
+        assert_eq!((f.fwhm(), f.eccentricity()), (fw, e));
     }
 
     /// L-12: `peak5` is the mean of the five brightest finite pixels of the
