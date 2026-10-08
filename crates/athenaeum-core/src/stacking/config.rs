@@ -1983,11 +1983,26 @@ mod tests {
         use crate::api::stacking::NamedPreset;
         let cases = [
             (r#"{"measurement":{}}"#, SeedSource::MatchedFilter), // pre-M4a
-            (r#"{"measurement":{"detectionSigma":20.0,"seedPrefilter":"none"}}"#, SeedSource::MatchedFilter), // the old default
-            (r#"{"measurement":{"detectionSigma":16.0}}"#, SeedSource::Peak), // an explicit sigma
-            (r#"{"measurement":{"seedPrefilter":"median3"}}"#, SeedSource::Peak), // the prefilter
-            (r#"{"measurement":{"seedDetector":"structure","seedPrefilter":"median3"}}"#, SeedSource::Structure), // Median3 is Peak's only
-            (r#"{"measurement":{"seedSource":"peak","detectionSigma":20.0}}"#, SeedSource::Peak), // a new document says so
+            (
+                r#"{"measurement":{"detectionSigma":20.0,"seedPrefilter":"none"}}"#,
+                SeedSource::MatchedFilter,
+            ), // the old default
+            (
+                r#"{"measurement":{"detectionSigma":16.0}}"#,
+                SeedSource::Peak,
+            ), // an explicit sigma
+            (
+                r#"{"measurement":{"seedPrefilter":"median3"}}"#,
+                SeedSource::Peak,
+            ), // the prefilter
+            (
+                r#"{"measurement":{"seedDetector":"structure","seedPrefilter":"median3"}}"#,
+                SeedSource::Structure,
+            ), // Median3 is Peak's only
+            (
+                r#"{"measurement":{"seedSource":"peak","detectionSigma":20.0}}"#,
+                SeedSource::Peak,
+            ), // a new document says so
         ];
         for (json, want) in cases {
             let c = resolve_config(Some(json), None).unwrap();
@@ -2000,14 +2015,23 @@ mod tests {
         }
         // the global document and a user preset go through the same decode
         assert_eq!(
-            resolve_config(None, Some(r#"{"measurement":{"detectionSigma":20.0}}"#)).unwrap().measurement.seed_source,
+            resolve_config(None, Some(r#"{"measurement":{"detectionSigma":20.0}}"#))
+                .unwrap()
+                .measurement
+                .seed_source,
             SeedSource::MatchedFilter
         );
-        let p: NamedPreset =
-            serde_json::from_str(r#"{"name":"x","config":{"measurement":{"seedDetector":"structure"}}}"#).unwrap();
+        let p: NamedPreset = serde_json::from_str(
+            r#"{"name":"x","config":{"measurement":{"seedDetector":"structure"}}}"#,
+        )
+        .unwrap();
         assert_eq!(p.config.measurement.seed_source, SeedSource::Structure);
         // `seedSource` wins over a contradicting `seedDetector`; the wire detector mirrors the source.
-        let c = resolve_config(Some(r#"{"measurement":{"seedSource":"matchedFilter","seedDetector":"structure"}}"#), None).unwrap();
+        let c = resolve_config(
+            Some(r#"{"measurement":{"seedSource":"matchedFilter","seedDetector":"structure"}}"#),
+            None,
+        )
+        .unwrap();
         assert_eq!(c.measurement.seed_source, SeedSource::MatchedFilter);
         assert_eq!(c.measurement.seed_detector, SeedDetector::Peak);
     }
@@ -2016,7 +2040,10 @@ mod tests {
     fn seed_source_moves_the_measurement_stage_hash_and_the_default_is_the_matched_filter() {
         let cfg = StackingConfig::default();
         assert_eq!(cfg.measurement.seed_source, SeedSource::MatchedFilter);
-        assert_eq!(cfg.measurement.seed_threshold, crate::star_measure::seeds::DEFAULT_THRESHOLD);
+        assert_eq!(
+            cfg.measurement.seed_threshold,
+            crate::star_measure::seeds::DEFAULT_THRESHOLD
+        );
         let mut peak = cfg.clone();
         peak.measurement.seed_source = SeedSource::Peak;
         assert_ne!(
@@ -2030,7 +2057,9 @@ mod tests {
             stage_hash(&measurement_subtree(&k), &[], &[])
         );
         assert_eq!(
-            cfg.measurement.measure_options(ScaleEstimator::Bwmv).seed_source,
+            cfg.measurement
+                .measure_options(ScaleEstimator::Bwmv)
+                .seed_source,
             SeedSource::MatchedFilter
         );
     }

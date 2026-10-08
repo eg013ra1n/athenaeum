@@ -46,12 +46,12 @@
 //!
 //! `--seed full` still wins over `--seed-detector`: it names a detector
 //! outright, while `--seed-detector` steers the production (`fast`) path.
+use athenaeum_core::stacking::config::SeedSource;
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedOverride,
 };
 use athenaeum_core::stacking::prefilter::SeedPrefilter;
 use athenaeum_core::stacking::psf_signal::PsfModel;
-use athenaeum_core::stacking::config::SeedSource;
 use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
@@ -207,9 +207,9 @@ fn parse_args() -> Args {
                 });
             }
             "--seed-detector" => {
-                let v = it
-                    .next()
-                    .unwrap_or_else(|| bad_arg("--seed-detector needs a value (peak|structure|matched)"));
+                let v = it.next().unwrap_or_else(|| {
+                    bad_arg("--seed-detector needs a value (peak|structure|matched)")
+                });
                 seed_detector = Some(match v.as_str() {
                     "peak" => SeedSource::Peak,
                     "structure" => SeedSource::Structure,
