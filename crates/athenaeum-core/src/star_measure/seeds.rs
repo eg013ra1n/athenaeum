@@ -517,17 +517,18 @@ fn background(plane: &[f32], w: usize, h: usize, mask: Option<&[bool]>) -> Vec<f
 /// width ≥ 6 px runs the second pass on the 2×2 super-pixel plane (kernel halved; candidate positions ×2,
 /// refined on the full plane). Candidates: local maxima of the filtered plane above `threshold·σ_f` (σ_f =
 /// 1.4826·MAD of the filtered plane over the stratified sample) with ≥ 2 of 4 cross-neighbours above `background
-/// + threshold·σ_plane` on the UNFILTERED plane (the hot-pixel rule). Position: the flux-weighted centroid in a
-/// (2·ceil(F)+1)² box on the background-subtracted plane; `peak` = that box's maximum − background; `flux` = the
-/// filtered response (the matched filter's integrated signal — the selection key). Sorted by `flux` descending,
-/// truncated to `max_stars`. A `NoiseModel` with `source == NoiseSource::None` returns no seeds and one `warn!`
-/// (Review Focus 4). Public: Plan C calls it on its own 2×2 super-pixel OSC plane (I-8).
+/// + min(threshold·σ_plane, 0.15·(c − background))` on the UNFILTERED plane, `c` the candidate's own pixel (the
+/// hot-pixel rule with its capped level — controller ruling, Task 6a; R-OSP-2). Position: the flux-weighted
+/// centroid in a (2·ceil(F)+1)² box on the background-subtracted plane; `peak` = that box's maximum − background;
+/// `flux` = the filtered response (the matched filter's integrated signal — the selection key). Sorted by `flux`
+/// descending, truncated to `max_stars`. A `NoiseModel` with `source == NoiseSource::None` returns no seeds and one
+/// `warn!` (Review Focus 4). Public: Plan C calls it on its own 2×2 super-pixel OSC plane (I-8).
 ///
 /// The plane is in the module's working units (ADU-scaled); `mask[i] == false` marks pixel `i` absent like a
 /// non-finite one. Two candidates whose centroids land within 1 px are one star (the brighter is kept). With a
-/// checkerboard mask the cross-neighbours of a present pixel are all absent, so the diagonal ones stand in. The
-/// hot-pixel level is capped at `0.15·(c − background)` (controller ruling, Task 6a; R-OSP-2):
-/// `background + min(threshold·σ_plane, 0.15·(c − background))`, `c` the candidate's own pixel.
+/// checkerboard mask the cross-neighbours of a present pixel are all absent, so the diagonal ones stand in. The cap
+/// (`0.15` = [`HOT_PIXEL_NEIGHBOUR_RATIO`]) leaves a bright candidate (`c − background ≥ threshold·σ_plane/0.15`)
+/// under the uncapped `background + threshold·σ_plane`.
 #[allow(clippy::too_many_arguments)]
 pub fn detect(
     plane: &[f32],

@@ -1291,8 +1291,10 @@ fn run_compare(
     // Both sides get the SAME measurement (spec-consistent FWHM/eccentricity/
     // PSFSW/PSF SNR/noise/location/scale), rather than reading some of them
     // off a log — `measure_plane` already tells us when MRS noise wasn't
-    // available (`NoiseSource::BackgroundResidual`), so that signal drives
-    // item 6's null-out instead of a second raw `noise_mrs` call.
+    // available (any source but `NoiseSource::Mrs`: the background residual,
+    // or since Plan A Task 6a `NoiseSource::None` when neither estimate
+    // exists), so that signal drives item 6's null-out instead of a second
+    // raw `noise_mrs` call.
     let pixels = output.width * output.height;
     let mut plane_stats = Vec::with_capacity(output.channels);
     let compare_opts = MeasureOptions::default();
@@ -1308,7 +1310,7 @@ fn run_compare(
             &compare_opts,
             Some(pool),
         );
-        let pixel_diff_skipped = theirs_m.noise_source == NoiseSource::BackgroundResidual;
+        let pixel_diff_skipped = theirs_m.noise_source != NoiseSource::Mrs;
 
         let (median_diff, median_rel_diff, pixels_compared) = if pixel_diff_skipped {
             (None, None, None)
