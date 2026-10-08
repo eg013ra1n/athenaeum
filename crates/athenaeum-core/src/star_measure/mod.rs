@@ -18,6 +18,7 @@ pub mod domain;
 pub mod fit;
 pub mod frame;
 pub mod robust;
+pub mod seeds;
 
 pub use beta::{AUTO_BETAS, AUTO_SAMPLE};
 pub use diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
@@ -27,6 +28,7 @@ pub use domain::{
 };
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
+pub use seeds::{FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 
 /// Version of the measurement path's own behaviour — bumped whenever
 /// `star_measure::fit`'s `fit_one`, `accept` or the aperture (or anything else in this module) change what a
@@ -76,6 +78,10 @@ pub struct MeasureOptions {
     /// Keep one [`FitDiagnostics`] per seed in [`PlaneMeasurement::diagnostics`] (F-0). The lab's probe sets it; the
     /// run never does — the per-seed vector costs memory on 24 576 seeds. The refusal counts are kept either way.
     pub diagnostics: bool,
+    /// The plane's pixel mask (Task 6a): `mask[i] == false` makes pixel `i` absent, like a non-finite one, for the
+    /// matched filter, the field width and the fit (its region and aperture). One plane, one mask; `None` = every
+    /// pixel present. The noise model and the sky statistic read the whole plane.
+    pub mask: Option<Vec<bool>>,
 }
 
 impl Default for MeasureOptions {
@@ -91,20 +97,25 @@ impl Default for MeasureOptions {
             noise: None,
             scale_estimator: ScaleEstimator::Bwmv,
             diagnostics: false,
+            mask: None,
         }
     }
 }
 
-/// Wall time per phase the module owns (I-1); the adapter adds `read_ms` and `detect_ms` and keeps
-/// `ChannelMeasurement.timings` exactly as today. A phase the module did not run (a precomputed noise model) reads 0.
+/// Wall time per phase the module owns (I-1); the adapter adds `read_ms` and its own `detect_ms` and keeps
+/// `ChannelMeasurement.timings` exactly as today. A phase the module did not run (a precomputed noise model, seeds
+/// handed in) reads 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PhaseTimings {
     pub background_ms: u64,
     pub noise_ms: u64,
+    /// The module's own matched filter ([`SeedSpec::MatchedFilter`], Task 6a).
+    pub detect_ms: u64,
     pub fit_ms: u64,
 }
 
-/// Where the seeds come from. Task 2: the adapter detects (Peak/Structure) and passes them in.
+/// Where the seeds come from. Task 2: the adapter detects (Peak/Structure) and passes them in; Task 6a: the module's
+/// own matched filter ([`seeds::detect`]).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SeedSpec {
     /// No seeds: nothing is fitted.
@@ -112,15 +123,23 @@ pub enum SeedSpec {
     None,
     /// Seeds from the caller's detector, expected brightest-first (the detector's order).
     Given(Vec<Seed>),
+    /// The module's two-pass matched filter at the field width, `threshold` in units of the filtered plane's measured
+    /// noise ([`DEFAULT_THRESHOLD`], ruling R-OSP-2).
+    MatchedFilter { threshold: f64 },
 }
 
-impl SeedSpec {
-    fn seeds(&self) -> &[Seed] {
-        match self {
-            SeedSpec::None => &[],
-            SeedSpec::Given(seeds) => seeds,
-        }
-    }
+/// What [`fit_stars_at`] fits with besides the plane, the seeds and β (Task 6a; Tasks 9-11 add fields, so a caller
+/// writes `..Default::default()`, ruling F14).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FitStarsOptions {
+    pub fit: FitParams,
+    /// `mask[i] == false` makes pixel `i` absent, like a non-finite one, in the fit's region and aperture (Plan C's
+    /// CFA green sites); `None` = every pixel present.
+    pub mask: Option<Vec<bool>>,
+    /// The field width (FWHM, px) the fit is handed (Task 6b's width start reads it; Task 6a's fit does not), as
+    /// `FitOutcome.field_width` reports it with `from_stars = 0`; `None` = [`seeds::field_width_of`] of the given
+    /// seeds.
+    pub field_width: Option<f64>,
 }
 
 /// One plane's measurement (PA-1: the stacking adapter keeps its own `stacking::measure::PlaneMeasurement`). Energies
@@ -136,6 +155,9 @@ pub struct PlaneMeasurement {
     pub sky: SkyLevel,
     /// Seeds handed to the fitter.
     pub seeds: usize,
+    /// The field width (Task 6a): the matched filter's own ([`SeedSpec::MatchedFilter`]), or
+    /// [`seeds::field_width_of`] the given seeds (`from_stars = 0` with the first pass's 3 px when no star read).
+    pub field_width: FieldWidth,
     /// The seeds not accepted, by reason (F-0): `refused.accounted(stars.len()) == seeds` (ruling F13).
     pub refused: RefusalCounts,
     /// One record per seed, in seed order, when `MeasureOptions::diagnostics` is set; empty otherwise.
@@ -143,9 +165,10 @@ pub struct PlaneMeasurement {
     pub timings: PhaseTimings,
 }
 
-/// Measure one plane: the noise model (unless `opts.noise` carries one) and the fits on the working-unit copy, the
-/// frame aggregates over the accepted fits, the sky statistic on the native plane. The fit runs on `pool` when given
-/// one, as do the background model and MRS.
+/// Measure one plane: the noise model (unless `opts.noise` carries one), the seeds (the matched filter, or the given
+/// ones and their field width) and the fits on the working-unit copy, the frame aggregates over the accepted fits,
+/// the sky statistic on the native plane. The fit runs on `pool` when given one, as do the background model, MRS and
+/// the matched filter.
 pub fn measure_plane(
     plane: &[f32],
     w: usize,
@@ -158,7 +181,31 @@ pub fn measure_plane(
         Some(given) => (given, PhaseTimings::default()),
         None => domain::noise_model(&working, w, h, pool),
     };
-    let seeds = opts.seeds.seeds();
+    let mask = opts.mask.as_deref();
+    let t = Instant::now();
+    let (detected, field_width) = match &opts.seeds {
+        SeedSpec::None => (None, seeds::field_width_of(&working, w, h, &[], mask)),
+        SeedSpec::Given(given) => (None, seeds::field_width_of(&working, w, h, given, mask)),
+        SeedSpec::MatchedFilter { threshold } => {
+            let (found, field) = seeds::detect(
+                &working,
+                w,
+                h,
+                &noise,
+                *threshold,
+                opts.max_stars,
+                mask,
+                pool,
+            );
+            timings.detect_ms = t.elapsed().as_millis() as u64;
+            (Some(found), field)
+        }
+    };
+    let seeds: &[Seed] = match (&opts.seeds, &detected) {
+        (_, Some(found)) => found,
+        (SeedSpec::Given(given), None) => given,
+        _ => &[],
+    };
     let t = Instant::now();
     let fit_call = || {
         fit::fit_stars_diagnosed(
@@ -168,6 +215,8 @@ pub fn measure_plane(
             seeds,
             opts.psf_model,
             &opts.fit,
+            mask,
+            Some(field_width.fwhm_px),
             None,
             opts.diagnostics,
         )
@@ -194,6 +243,7 @@ pub fn measure_plane(
         noise,
         sky,
         seeds: seeds.len(),
+        field_width,
         refused: outcome.refused,
         diagnostics,
         timings,
@@ -201,17 +251,31 @@ pub fn measure_plane(
 }
 
 /// The refit entry point LN uses (PA-6): every seed fitted at `beta`. The plane is in the module's working units
-/// (ADU-scaled), exactly as `fit_stars_with_beta` takes it.
+/// (ADU-scaled), exactly as `fit_stars_with_beta` takes it. `opts.mask` makes pixels absent in the region and the
+/// aperture; `opts.field_width` (else [`seeds::field_width_of`] the seeds) is reported as `FitOutcome.field_width`
+/// (Task 6a: no fit reads it yet).
 pub fn fit_stars_at(
     plane: &[f32],
     w: usize,
     h: usize,
     seeds: &[Seed],
     beta: f64,
-    fit: &FitParams,
+    opts: &FitStarsOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit::fit_stars_with_beta(plane, w, h, seeds, beta, fit, pool)
+    fit::fit_stars_with_beta_diagnosed(
+        plane,
+        w,
+        h,
+        seeds,
+        beta,
+        &opts.fit,
+        opts.mask.as_deref(),
+        opts.field_width,
+        pool,
+        false,
+    )
+    .0
 }
 
 #[cfg(test)]
@@ -337,7 +401,16 @@ mod tests {
                 flux: 1.0,
             })
             .collect();
-        let a = fit_stars_at(&data, 220, 180, &seeds, 4.0, &FitParams::default(), None);
+        // Plan A Task 6a (ruling F14): `fit_stars_at` takes `&FitStarsOptions` in place of `&FitParams`.
+        let a = fit_stars_at(
+            &data,
+            220,
+            180,
+            &seeds,
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
         let b = fit::fit_stars_with_beta(&data, 220, 180, &seeds, 4.0, &FitParams::default(), None);
         assert_eq!(a, b);
         assert_eq!(a.fits.len(), 20);
@@ -631,5 +704,153 @@ mod tests {
             "median {}",
             m.sky.median
         );
+    }
+
+    // --- Plan A Task 6a (F-1, the seeds): the matched filter, the mask, the field width ---
+
+    fn working(data: &[f32]) -> Vec<f32> {
+        data.iter().map(|v| v * ADU_SCALE).collect()
+    }
+
+    #[test]
+    fn nan_border_seeds_nothing_on_the_border_and_fits_every_interior_star() {
+        use crate::test_support::nan_border_field;
+        let data = nan_border_field(240, 240, 6, true); // 40 Gaussian stars at FWHM 3.5, a 6-px NaN border
+        let scaled = working(&data);
+        let (noise, _) = domain::noise_model(&scaled, 240, 240, None);
+        let (seeds, _) = seeds::detect(
+            &scaled,
+            240,
+            240,
+            &noise,
+            DEFAULT_THRESHOLD,
+            24576,
+            None,
+            None,
+        );
+        assert_eq!(seeds.len(), 40);
+        assert!(
+            seeds.iter().all(|s| s.x >= 14.0 && s.y >= 14.0),
+            "no seed within 8 px of the border"
+        );
+        let m = measure_plane(
+            &data,
+            240,
+            240,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.stars.len(), 40);
+    }
+
+    #[test]
+    fn refused_noise_estimate_seeds_nothing_and_warns() {
+        let data = vec![0.05f32; 256 * 256]; // a constant plane: MRS at its floor, no residuals
+        let m = measure_plane(
+            &data,
+            256,
+            256,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.noise.source, NoiseSource::None);
+        assert_eq!(m.seeds, 0);
+        assert!(m.stars.is_empty());
+    }
+
+    #[test]
+    fn given_seeds_get_a_field_width_from_the_halfmax_profile() {
+        use crate::test_support::{moffat_field, MoffatStar};
+        // PA-17: Moffat-4 at FWHM 5 (α = 5/(2√(2^{1/4} − 1)) = 5.748) reads +1.8 % noiseless; the bar is the estimator's own 10 %
+        let stars: Vec<MoffatStar> = (0..30)
+            .map(|i| MoffatStar {
+                x: 40.0 + (i % 6) as f64 * 60.0,
+                y: 40.0 + (i / 6) as f64 * 60.0,
+                amp: 0.3,
+                alpha_x: 5.748,
+                alpha_y: 5.748,
+                theta: 0.0,
+            })
+            .collect();
+        let mut data = moffat_field(400, 340, &stars, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.006, 1); // peak SNR 50
+        let seeds: Vec<Seed> = stars
+            .iter()
+            .map(|s| Seed {
+                x: s.x,
+                y: s.y,
+                peak: s.amp,
+                flux: 1.0,
+            })
+            .collect();
+        let fw = seeds::field_width_of(&working(&data), 400, 340, &seeds, None);
+        assert_eq!(fw.from_stars, 30);
+        assert!((fw.fwhm_px / 5.0 - 1.0).abs() < 0.10, "{fw:?}");
+        let out = fit_stars_at(
+            &working(&data),
+            400,
+            340,
+            &seeds,
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
+        assert!(
+            (out.field_width.fwhm_px - fw.fwhm_px).abs() < 1e-9,
+            "fit_stars_at computed the same width"
+        );
+    }
+
+    #[test]
+    fn pixel_mask_excludes_masked_pixels_from_detection_and_fit() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let mask: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect(); // a checkerboard
+        let scaled = working(&data);
+        let (noise, _) = domain::noise_model(&scaled, w, h, None);
+        let (seeds, _) = seeds::detect(
+            &scaled,
+            w,
+            h,
+            &noise,
+            DEFAULT_THRESHOLD,
+            24576,
+            Some(&mask),
+            None,
+        );
+        assert!(seeds.len() >= 140, "{}", seeds.len());
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                diagnostics: true,
+                mask: Some(mask.clone()),
+                seeds: SeedSpec::Given(seeds.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(m.stars.len() >= 140);
+        // the fit's pixel count is the unmasked count of its region: (2r+1)² / 2 ± 1
+        for d in m
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.outcome, Outcome::Accepted { .. }))
+            .take(5)
+        {
+            let r = d.region_radius as usize;
+            let n = (2 * r + 1) * (2 * r + 1);
+            assert!((d.pixels_used as i64 - (n / 2) as i64).abs() <= 1, "{d:?}");
+        }
     }
 }

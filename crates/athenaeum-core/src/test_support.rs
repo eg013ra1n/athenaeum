@@ -152,6 +152,37 @@ pub(crate) fn fixture_field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>,
     (data, w, h)
 }
 
+/// The `star_probe` example's NaN-border fixture (Plan A Task 6a, ruling F38), so a lib test reaches it: background
+/// 0.05; with `stars`, 40 Gaussian stars (σ 1.5 px, FWHM 3.5, amplitude 0.4) on a 25-px grid from (30, 30); a
+/// deterministic pseudo-noise of ±0.001 (the MRS noise estimate needs some); every pixel with `x < border` or
+/// `y < border` NaN. Byte-identical to the example's own `gaussian_field(w, h, nan_border, stars)`, which an example
+/// cannot import from here.
+pub(crate) fn nan_border_field(w: usize, h: usize, border: usize, stars: bool) -> Vec<f32> {
+    let mut d = vec![0.05f32; w * h];
+    if stars {
+        for k in 0..40 {
+            let (cx, cy) = (30.0 + (k % 8) as f32 * 25.0, 30.0 + (k / 8) as f32 * 25.0);
+            for y in 0..h {
+                for x in 0..w {
+                    let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    d[y * w + x] += 0.4 * (-r2 / (2.0 * 1.5f32.powi(2))).exp();
+                }
+            }
+        }
+    }
+    for (i, v) in d.iter_mut().enumerate() {
+        *v += 0.002 * (((i as u64).wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0 - 0.5);
+    }
+    for y in 0..h {
+        for x in 0..w {
+            if x < border || y < border {
+                d[y * w + x] = f32::NAN
+            }
+        }
+    }
+    d
+}
+
 /// Background-subtracted intensity-weighted centroid in a `(2r+1)²` box
 /// around `(x0, y0)`. NaN samples are skipped.
 pub(crate) fn centroid(

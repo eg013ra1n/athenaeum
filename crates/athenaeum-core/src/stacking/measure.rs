@@ -247,7 +247,8 @@ pub struct PlaneMeasurement {
 /// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
 /// Checkpoint B probe's `--seeds full` cross-checks against the slower,
 /// two-pass detector to see whether the choice moves the measurement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `PartialEq` only since Plan A Task 6a: `MatchedFilter` carries an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeedSource {
     /// `ImageAnalyzer::detect_fast_data` — the single-pass detector
     /// `measure_plane` has used since Plan 2.
@@ -260,6 +261,12 @@ pub enum SeedSource {
     /// [`MeasureOptions::seed_detector`] says so, so a caller only passes it
     /// explicitly to override a config that says `Peak`.
     Structure,
+    /// The star-measurement module's two-pass matched filter at the field
+    /// width ([`crate::star_measure::seeds::detect`], Plan A Task 6a), its
+    /// `threshold` in units of the filtered plane's measured noise. A probe
+    /// override only: the config's default stays `Fast` (Peak) until Task 7,
+    /// which also renames this enum `SeedOverride` (ruling F26).
+    MatchedFilter { threshold: f64 },
 }
 
 /// Measure one plane. Detection, fitting, the background model and MRS run
@@ -341,10 +348,13 @@ pub fn measure_plane_diagnosed(
     // to the module, which then does not measure it again (I-1); every
     // other arm lets the module measure it. Either way the two run exactly
     // once, background first, and give the reported `noise`/`m_star`/
-    // `n_star` (Plan A Task 2).
+    // `n_star` (Plan A Task 2). The matched filter (Plan A Task 6a) needs
+    // the same σ before it runs: its threshold is noise-relative, and a
+    // plane with no noise estimate seeds nothing.
     let precomputed: Option<(sm::NoiseModel, sm::PhaseTimings)> =
         match (seed_source, opts.seed_prefilter) {
             (SeedSource::Fast, SeedPrefilter::Median3) => Some(sm::noise_model(&scaled, w, h, pool)),
+            (SeedSource::MatchedFilter { .. }, _) => Some(sm::noise_model(&scaled, w, h, pool)),
             _ => None,
         };
 
@@ -478,6 +488,22 @@ pub fn measure_plane_diagnosed(
             seeds.truncate(opts.max_stars.max(8));
             seeds
         }
+        SeedSource::MatchedFilter { threshold } => {
+            // The module's own detector on the same ADU-scaled bytes the
+            // module fits, with the noise model computed above (the module
+            // is then handed it and does not measure it again). Sorted by
+            // the filter's flux, capped at `max_stars`.
+            match precomputed.as_ref() {
+                Some((noise, _)) => {
+                    sm::seeds::detect(&scaled, w, h, noise, threshold, opts.max_stars, None, pool).0
+                }
+                None => {
+                    // Unreachable: the match above computes it for this arm.
+                    warn!("matched-filter seeds without a noise model; the plane measures as starless");
+                    Vec::new()
+                }
+            }
+        }
     };
     let detect_ms = t.elapsed().as_millis() as u64;
     let stars_detected = seeds.len();
@@ -501,11 +527,13 @@ pub fn measure_plane_diagnosed(
         noise,
         scale_estimator: opts.scale_estimator,
         diagnostics,
+        mask: None,
     };
     let m = sm::measure_plane(data, w, h, &module_opts, pool);
     let seeds = match module_opts.seeds {
         sm::SeedSpec::Given(seeds) => seeds,
-        sm::SeedSpec::None => Vec::new(),
+        // The adapter always detects itself and hands the seeds in.
+        sm::SeedSpec::None | sm::SeedSpec::MatchedFilter { .. } => Vec::new(),
     };
     // The background/noise phases are whoever measured them: the Median3
     // arm above, else the module.

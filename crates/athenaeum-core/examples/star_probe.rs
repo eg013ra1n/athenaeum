@@ -10,6 +10,8 @@
 //!       [--betas 2.5,4,6,10]   (legacy-analysis = the analysis path, `path: "analysis"`; any other name exits 1)
 //!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
 //!       [--diagnostics]   (one `refused` line per seed the measure path did not accept)
+//!       [--seeds matched|peak|structure]   (default matched: the module's matched filter, Plan A Task 6a)
+//!       [--seed-threshold K]   (the matched filter's threshold in σ_f; default `star_measure::DEFAULT_THRESHOLD`)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -26,6 +28,14 @@
 //! `{kind: refused, path, plane, seed (the seed line's i), reason,
 //! regionRadius, backgroundStart, widthStart, growthSteps, iterations,
 //! converged}`.
+//!
+//! F-1 seeds (Plan A Task 6a, ruling F3): the measure path's seeds come from
+//! `--seeds` (`matched` = `SeedSource::MatchedFilter` at `--seed-threshold`;
+//! `peak` = the config's peak detector, forced even under a structure config;
+//! `structure` = the structure map). Every frame line's `options.measure`
+//! carries the EFFECTIVE `seedSource` (`matchedFilter` | `peak` |
+//! `structure`) and `seedThreshold` (the matched filter's K, else null), so
+//! the lab reads the threshold the probe actually ran.
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +57,8 @@ use athenaeum_core::stacking::measure::{
 use athenaeum_core::stacking::psf_signal::{self, fit_stars_with_beta, FitParams, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
-use athenaeum_core::star_measure::{FitDiagnostics, Outcome, RefusalCounts};
+use athenaeum_core::stacking::structure::SeedDetector;
+use athenaeum_core::star_measure::{FitDiagnostics, Outcome, RefusalCounts, DEFAULT_THRESHOLD};
 use serde_json::{json, Value};
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -182,6 +193,49 @@ fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
     }))
 }
 
+/// `--seeds` (Plan A Task 6a): which detector seeds the measure path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedChoice {
+    Matched,
+    Peak,
+    Structure,
+}
+
+impl SeedChoice {
+    fn parse(s: &str) -> SeedChoice {
+        match s {
+            "matched" => SeedChoice::Matched,
+            "peak" => SeedChoice::Peak,
+            "structure" => SeedChoice::Structure,
+            o => die(format!("--seeds matched|peak|structure, not {o}")),
+        }
+    }
+
+    /// The frame line's `seedSource` (ruling F3): the spelling the stacking config gets in Task 7.
+    fn source_name(self) -> &'static str {
+        match self {
+            SeedChoice::Matched => "matchedFilter",
+            SeedChoice::Peak => "peak",
+            SeedChoice::Structure => "structure",
+        }
+    }
+}
+
+/// The adapter options and the seed override the measure path runs with: `peak` forces the peak detector (a
+/// structure config would otherwise turn `Fast` into the structure map), `matched` runs the module's matched filter at
+/// `threshold`.
+fn effective_seeds(mut opts: MeasureOptions, choice: SeedChoice, threshold: f64) -> (MeasureOptions, SeedSource) {
+    let source = match choice {
+        SeedChoice::Matched => SeedSource::MatchedFilter { threshold },
+        SeedChoice::Peak => {
+            opts.seed_detector = SeedDetector::Peak;
+            SeedSource::Fast
+        }
+        SeedChoice::Structure => SeedSource::Structure,
+    };
+    (opts, source)
+}
+
 struct MeasureArgs {
     image: PathBuf,
     out: PathBuf,
@@ -193,6 +247,8 @@ struct MeasureArgs {
     betas: Vec<f64>,
     domain: Domain,
     diagnostics: bool,
+    seeds: SeedChoice,
+    seed_threshold: f64,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -208,6 +264,8 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         betas: vec![2.5, 4.0, 6.0, 10.0],
         domain: Domain::Auto,
         diagnostics: false,
+        seeds: SeedChoice::Matched,
+        seed_threshold: DEFAULT_THRESHOLD,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
@@ -242,6 +300,14 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
             }
             "--paths" => a.paths = v().split(',').map(String::from).collect(),
             "--domain" => a.domain = Domain::parse(&v()),
+            "--seeds" => a.seeds = SeedChoice::parse(&v()),
+            "--seed-threshold" => {
+                a.seed_threshold = v()
+                    .parse()
+                    .ok()
+                    .filter(|k: &f64| k.is_finite() && *k > 0.0)
+                    .unwrap_or_else(|| die("--seed-threshold: a positive number"))
+            }
             "--betas" => {
                 a.betas = v()
                     .split(',')
@@ -350,6 +416,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         h = r.3;
     }
     let (opts, det, reg_max, from_config) = load_config(&a.config);
+    let (opts, seed_source) = effective_seeds(opts, a.seeds, a.seed_threshold);
     let non_finite: usize = planes.iter().flatten().filter(|v| !v.is_finite()).count();
     let selected: Vec<usize> = match a.plane {
         Some(p) if p < planes.len() => vec![p],
@@ -363,7 +430,15 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         std::fs::File::create(&a.out).unwrap_or_else(|e| die(format!("{}: {e}", a.out.display())));
     let mut out = BufWriter::new(file);
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
-    let options = json!({ "measure": opts, "detection": { "minSnr": det.min_snr, "maxEccentricity": det.max_eccentricity },
+    // Ruling F3: the EFFECTIVE seed source and threshold, override included.
+    let mut measure_options = serde_json::to_value(opts).unwrap_or_else(|e| die(format!("options: {e}")));
+    if let Some(m) = measure_options.as_object_mut() {
+        m.insert("seedSource".into(), json!(a.seeds.source_name()));
+        let k = (a.seeds == SeedChoice::Matched).then_some(a.seed_threshold);
+        m.insert("seedThreshold".into(), json!(k));
+    }
+    let options = json!({ "measure": measure_options,
+                          "detection": { "minSnr": det.min_snr, "maxEccentricity": det.max_eccentricity },
                           "registerMaxStars": reg_max, "fromConfig": from_config, "rawMax": raw_max });
 
     let mut fits0: Option<Vec<StarFit>> = None;
@@ -375,7 +450,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         }
         let t = Instant::now();
         let (pm, seeds, diagnostics) =
-            measure_plane_diagnosed(&planes[p], w, h, &opts, None, SeedSource::Fast, a.diagnostics);
+            measure_plane_diagnosed(&planes[p], w, h, &opts, None, seed_source, a.diagnostics);
         let wall = t.elapsed().as_millis() as u64;
         let s = ADU_SCALE as f64;
         if want("measure") {
@@ -676,6 +751,8 @@ mod tests {
             betas: vec![4.0],
             domain: Domain::Auto,
             diagnostics: false,
+            seeds: SeedChoice::Matched,
+            seed_threshold: DEFAULT_THRESHOLD,
         }
     }
 
@@ -747,6 +824,41 @@ mod tests {
         assert_eq!(refused as u64, frame["refused"]["total"].as_u64().unwrap());
         assert_eq!(frame["fits"].as_u64().unwrap() + refused as u64, frame["seeds"].as_u64().unwrap());
         assert!(lines.iter().filter(|v| v["kind"] == "refused").all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
+    }
+
+    /// Plan A Task 6a (ruling F3): every frame line names the EFFECTIVE seed source and threshold the measure path ran,
+    /// so the lab's expected set reads the threshold the probe actually used; `--seeds peak` writes no seedThreshold.
+    #[test]
+    fn the_frame_line_names_the_effective_seed_source_and_threshold() {
+        assert_eq!(SeedChoice::parse("matched"), SeedChoice::Matched);
+        assert_eq!(SeedChoice::parse("peak"), SeedChoice::Peak);
+        assert_eq!(SeedChoice::parse("structure"), SeedChoice::Structure);
+        let d = tempfile::tempdir().unwrap();
+        let img = d.path().join("p.fits");
+        write_fits_f32(&img, 240, 240, 1, &gaussian_field(240, 240, 0, true), &[]).unwrap();
+        for (choice, source, k) in [
+            (SeedChoice::Matched, "matchedFilter", json!(5.5)),
+            (SeedChoice::Peak, "peak", Value::Null),
+            (SeedChoice::Structure, "structure", Value::Null),
+        ] {
+            let out = d.path().join(format!("{source}.jsonl"));
+            let mut a = args(img.clone(), out.clone(), &["measure", "betas", "register"]);
+            a.seeds = choice;
+            a.seed_threshold = 5.5;
+            cmd_measure(a).unwrap();
+            let lines = read_lines(&out);
+            let frames: Vec<&Value> = lines.iter().filter(|v| v["kind"] == "frame").collect();
+            assert_eq!(frames.len(), 3);
+            for f in &frames {
+                assert_eq!(f["options"]["measure"]["seedSource"], source, "{f}");
+                assert_eq!(f["options"]["measure"]["seedThreshold"], k, "{f}");
+            }
+            let m = frames.iter().find(|f| f["path"] == "measure").unwrap();
+            assert!(m["fits"].as_u64().unwrap() > 0, "{source}: {m}");
+        }
+        let structure = MeasureOptions { seed_detector: SeedDetector::Structure, ..MeasureOptions::default() };
+        let (o, s) = effective_seeds(structure, SeedChoice::Peak, 4.0);
+        assert_eq!((o.seed_detector, s), (SeedDetector::Peak, SeedSource::Fast), "peak is forced over a structure config");
     }
 
     #[test]

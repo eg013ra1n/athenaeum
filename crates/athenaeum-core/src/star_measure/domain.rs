@@ -31,6 +31,10 @@ pub enum NoiseSource {
     Mrs,
     /// MRS was unavailable; `noise` is `N*`.
     BackgroundResidual,
+    /// Neither estimate measured the plane (MRS at its floor on a constant or near-constant plane, and `N*` missing
+    /// or zero): `sigma` is 0, the matched filter has no threshold and seeds nothing (Review Focus 4, Plan A Task 6a).
+    /// Serialized `none` in the stacking `metrics` payload (ruling F43).
+    None,
 }
 
 /// What the plane handed to the module is.
@@ -132,8 +136,9 @@ pub fn to_working_units<'a>(plane: &'a [f32], domain: &Domain) -> Cow<'a, [f32]>
 
 /// `background_residual` + `noise_mrs` on the working-unit plane, in that order, with the fallbacks and `warn!`s the
 /// stacking Measure stage has always applied: no background model → `M* = N* = 0`; no MRS estimate → σ = `N*`,
-/// [`NoiseSource::BackgroundResidual`]. Both run on `pool` when given one. The returned timings carry
-/// `background_ms` and `noise_ms` (`fit_ms` is 0).
+/// [`NoiseSource::BackgroundResidual`]. When neither measured the plane (no MRS estimate and no positive `N*`) the
+/// σ is 0 and the source [`NoiseSource::None`] (Plan A Task 6a), with its own `warn!`. Both run on `pool` when given
+/// one. The returned timings carry `background_ms` and `noise_ms` (`detect_ms` and `fit_ms` are 0).
 pub fn noise_model(
     working: &[f32],
     w: usize,
@@ -164,12 +169,21 @@ pub fn noise_model(
     };
     let (sigma, source) = match mrs {
         Some(n) => (n as f64, NoiseSource::Mrs),
-        None => {
+        None if n_star.is_finite() && n_star > 0.0 => {
             warn!(
                 n_star,
                 "MRS noise unavailable; using the background residual scale"
             );
             (n_star, NoiseSource::BackgroundResidual)
+        }
+        None => {
+            warn!(
+                n_star,
+                width = w,
+                height = h,
+                "no noise estimate: MRS and the background residual both refused the plane"
+            );
+            (0.0, NoiseSource::None)
         }
     };
     let noise_ms = t.elapsed().as_millis() as u64;
@@ -183,6 +197,7 @@ pub fn noise_model(
         PhaseTimings {
             background_ms,
             noise_ms,
+            detect_ms: 0,
             fit_ms: 0,
         },
     )

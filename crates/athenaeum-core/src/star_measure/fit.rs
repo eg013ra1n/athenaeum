@@ -11,6 +11,10 @@
 //! step-size convergence test means the same on every star), through rustafits' conditioned entry point, whose
 //! Jacobian carries the θ column with its correct sign (ruling R-OSP-3); and every accepted fit reports canonical
 //! axes — the major axis on `fwhm_x`, `theta` on it, in `[-π/2, π/2)`.
+//!
+//! F-1 seeds (Plan A Task 6a, no fit change — ruling F16): a pixel mask makes a pixel absent, exactly like a
+//! non-finite one, in the region's growth, its pixels and the aperture; the field width is threaded to `fit_one`
+//! for Task 6b's width start and reported as [`FitOutcome::field_width`], read by no fit yet.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -23,6 +27,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
+use super::seeds::{field_width_of, FieldWidth};
 use crate::integration::stats::median_in_place;
 
 /// `2√(2 ln 2)`: a Gaussian's FWHM per σ (the start width [`FitDiagnostics::width_start`] reports).
@@ -220,6 +225,9 @@ pub struct FitOutcome {
     pub seeds: usize,
     /// The seeds not accepted, by reason (F-0): `refused.accounted(fits.len()) == seeds` (ruling F13).
     pub refused: RefusalCounts,
+    /// The field width the call used (Task 6a, ruling F14): `FieldWidth { fwhm_px: f, from_stars: 0 }` for a given
+    /// `f`, else [`field_width_of`] the seeds. No fit reads it before Task 6b.
+    pub field_width: FieldWidth,
 }
 
 /// Full width at tenth maximum of a Moffat profile, `2α√(10^{1/β} − 1)`.
@@ -282,11 +290,18 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
     Some((l1.sqrt(), l2.sqrt(), theta))
 }
 
-/// Pushes the finite pixels of row `y`, columns `xs`, onto `scratch`.
+/// Whether pixel `i` is present: finite, and not `false` in the mask (Task 6a).
+#[inline]
+fn present(data: &[f32], mask: Option<&[bool]>, i: usize) -> bool {
+    data[i].is_finite() && mask.map_or(true, |m| m[i])
+}
+
+/// Pushes the present (finite, unmasked) pixels of row `y`, columns `xs`, onto `scratch`.
 /// `xs` is a plain range (inclusive or not) so both a full-width row and a
 /// side-strip's narrow one share this loop.
 fn push_finite_row(
     data: &[f32],
+    mask: Option<&[bool]>,
     w: usize,
     y: i64,
     xs: impl Iterator<Item = i64>,
@@ -294,15 +309,15 @@ fn push_finite_row(
 ) {
     let row = y as usize * w;
     for x in xs {
-        let v = data[row + x as usize];
-        if v.is_finite() {
-            scratch.push(v);
+        let i = row + x as usize;
+        if present(data, mask, i) {
+            scratch.push(data[i]);
         }
     }
 }
 
-/// Median of the `(2r+1)²` square centred on `(cx, cy)`, non-finite pixels
-/// skipped. `None` when the square holds no finite pixel.
+/// Median of the `(2r+1)²` square centred on `(cx, cy)`, non-finite and masked
+/// pixels skipped. `None` when the square holds no present pixel.
 ///
 /// `scratch` is the running multiset the caller (`sampling_radius`) grows
 /// as it grows `r`: when `prev_r` is `Some`, `scratch` already holds the
@@ -316,6 +331,7 @@ fn push_finite_row(
 /// depend on insertion order.
 fn region_median(
     data: &[f32],
+    mask: Option<&[bool]>,
     w: usize,
     cx: i64,
     cy: i64,
@@ -327,7 +343,7 @@ fn region_median(
         None => {
             scratch.clear();
             for y in cy - r..=cy + r {
-                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+                push_finite_row(data, mask, w, y, cx - r..=cx + r, scratch);
             }
         }
         Some(pr) => {
@@ -335,16 +351,16 @@ fn region_median(
             // Top and bottom strips: full new width, the rows the smaller
             // square did not cover at all.
             for y in cy - r..cy - pr {
-                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+                push_finite_row(data, mask, w, y, cx - r..=cx + r, scratch);
             }
             for y in (cy + pr + 1)..=(cy + r) {
-                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+                push_finite_row(data, mask, w, y, cx - r..=cx + r, scratch);
             }
             // Left and right strips: the smaller square's own row range,
             // the new columns only.
             for y in cy - pr..=cy + pr {
-                push_finite_row(data, w, y, cx - r..cx - pr, scratch);
-                push_finite_row(data, w, y, (cx + pr + 1)..=(cx + r), scratch);
+                push_finite_row(data, mask, w, y, cx - r..cx - pr, scratch);
+                push_finite_row(data, mask, w, y, (cx + pr + 1)..=(cx + r), scratch);
             }
         }
     }
@@ -369,6 +385,7 @@ fn region_median(
 /// last dropping one), or `r_max` when every step kept dropping.
 fn sampling_radius(
     data: &[f32],
+    mask: Option<&[bool]>,
     w: usize,
     cx: i64,
     cy: i64,
@@ -379,14 +396,14 @@ fn sampling_radius(
 ) -> i64 {
     let step = p.region_growth_step_px.max(1) as i64;
     let mut r = r_start;
-    let Some(mut prev) = region_median(data, w, cx, cy, None, r, scratch) else {
+    let Some(mut prev) = region_median(data, mask, w, cx, cy, None, r, scratch) else {
         return r;
     };
     while r + step <= r_max {
         let next = r + step;
         // `scratch` currently holds exactly the square at `r` (the last
         // radius region_median built or grew it to) — that IS `prev_r`.
-        let Some(m) = region_median(data, w, cx, cy, Some(r), next, scratch) else {
+        let Some(m) = region_median(data, mask, w, cx, cy, Some(r), next, scratch) else {
             return r;
         };
         r = next;
@@ -423,6 +440,7 @@ struct FitTrace {
     background_start: f64,
     width_start: f64,
     growth_steps: u8,
+    pixels_used: u32,
     converged: bool,
 }
 
@@ -435,6 +453,7 @@ impl FitTrace {
             background_start: self.background_start,
             width_start: self.width_start,
             growth_steps: self.growth_steps,
+            pixels_used: self.pixels_used,
             iterations: None,
             converged: self.converged,
         }
@@ -446,12 +465,18 @@ impl FitTrace {
 /// reason when the stamp leaves the image, the region holds too few pixels,
 /// the fit fails, or the acceptance rules (math reference §1.4) reject it.
 /// The [`FitTrace`] records the region and the start whatever the result.
+/// A pixel `mask` leaves its `false` pixels out exactly like non-finite ones
+/// (Task 6a); `_field_width` (FWHM, px) is threaded here for Task 6b's width
+/// start and read by nothing yet (ruling F16).
+#[allow(clippy::too_many_arguments)]
 fn fit_one(
     data: &[f32],
+    mask: Option<&[bool]>,
     w: usize,
     h: usize,
     seed: &Seed,
     sigma0: f64,
+    _field_width: f64,
     beta: f64,
     p: &FitParams,
     scratch: &mut FitScratch,
@@ -467,6 +492,7 @@ fn fit_one(
         background_start: f64::NAN,
         width_start: GAUSSIAN_FWHM_PER_SIGMA * sigma0,
         growth_steps: 0,
+        pixels_used: 0,
         converged: false,
     };
     let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
@@ -477,7 +503,17 @@ fn fit_one(
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
     let r_max = (2 * nominal).min(48).min(to_border);
     let r_start = (nominal / 2).max(3).min(r_max);
-    let r = sampling_radius(data, w, cx, cy, r_start, r_max, p, &mut scratch.region);
+    let r = sampling_radius(
+        data,
+        mask,
+        w,
+        cx,
+        cy,
+        r_start,
+        r_max,
+        p,
+        &mut scratch.region,
+    );
     let step = p.region_growth_step_px.max(1) as i64;
     trace.region_radius = r as u16;
     trace.growth_steps = ((r - r_start) / step).clamp(0, u8::MAX as i64) as u8;
@@ -491,10 +527,11 @@ fn fit_one(
     let mut top = [f64::NEG_INFINITY; 5];
     for y in cy - r..=cy + r {
         for x in cx - r..=cx + r {
-            let v = data[y as usize * w + x as usize];
-            if !v.is_finite() {
+            let i = y as usize * w + x as usize;
+            if !present(data, mask, i) {
                 continue;
             }
+            let v = data[i];
             let v64 = v as f64;
             peak = peak.max(v64);
             if v64 > top[0] {
@@ -512,6 +549,8 @@ fn fit_one(
             });
         }
     }
+    // The region's present pixels: at most (2r+1)² ≤ 97², so a u32 holds it.
+    trace.pixels_used = scratch.px.len() as u32;
     if scratch.px.len() < 10 {
         return (Err(RefusalReason::TooFewPixels), trace);
     }
@@ -572,8 +611,8 @@ fn fit_one(
         Ok(f) => f,
         Err(reason) => return (Err(reason), trace),
     };
-    aperture(data, w, h, &mut f, p.growth);
-    // At least 10 finite pixels were gathered, so all five slots are filled.
+    aperture(data, mask, w, h, &mut f, p.growth);
+    // At least 10 present pixels were gathered, so all five slots are filled.
     f.peak5 = top.iter().sum::<f64>() / top.len() as f64;
     (Ok(f), trace)
 }
@@ -693,11 +732,18 @@ fn canonical_theta(theta: f64) -> f64 {
     }
 }
 
-/// Sum `pixel − background` over the pixels whose centres lie inside the
-/// ellipse with semi-axes `k·fwtm/2`, rotated by `theta` about the fitted
-/// centre (`u = dx·cosθ + dy·sinθ`, `v = −dx·sinθ + dy·cosθ`); `area` is
-/// the ellipse's analytic area.
-pub(crate) fn aperture(data: &[f32], w: usize, h: usize, f: &mut StarFit, k: f64) {
+/// Sum `pixel − background` over the present (finite, unmasked) pixels whose
+/// centres lie inside the ellipse with semi-axes `k·fwtm/2`, rotated by
+/// `theta` about the fitted centre (`u = dx·cosθ + dy·sinθ`,
+/// `v = −dx·sinθ + dy·cosθ`); `area` is the ellipse's analytic area.
+pub(crate) fn aperture(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    f: &mut StarFit,
+    k: f64,
+) {
     let (a, b) = (0.5 * k * f.fwtm_x, 0.5 * k * f.fwtm_y);
     let (st, ct) = f.theta.sin_cos();
     let hx = ((a * ct).powi(2) + (b * st).powi(2)).sqrt();
@@ -713,9 +759,9 @@ pub(crate) fn aperture(data: &[f32], w: usize, h: usize, f: &mut StarFit, k: f64
             let u = dx * ct + dy * st;
             let v = -dx * st + dy * ct;
             if (u / a).powi(2) + (v / b).powi(2) <= 1.0 {
-                let pv = data[y * w + x];
-                if pv.is_finite() {
-                    sum += pv as f64 - f.background;
+                let i = y * w + x;
+                if present(data, mask, i) {
+                    sum += data[i] as f64 - f.background;
                 }
             }
         }
@@ -766,6 +812,7 @@ fn dedupe(mut fits: Vec<(usize, StarFit)>) -> Vec<(usize, StarFit)> {
 ///
 /// The accepted fits, in seed order (the `Auto` β search's sample reads
 /// their residuals); [`fit_all_outcomes`] keeps every seed's outcome.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fit_all(
     data: &[f32],
     w: usize,
@@ -774,9 +821,11 @@ pub(super) fn fit_all(
     sigma0: f64,
     beta: f64,
     p: &FitParams,
+    mask: Option<&[bool]>,
+    field_width: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<StarFit> {
-    fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, pool)
+    fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, mask, field_width, pool)
         .into_iter()
         .filter_map(|(result, _)| result.ok())
         .collect()
@@ -786,6 +835,7 @@ pub(super) fn fit_all(
 /// the one `fit_all` always ran, collected per seed instead of filtered in
 /// flight — rayon's indexed `collect` keeps the order, so the accepted fits
 /// read off it sequentially are exactly the list the filtered chain gave.
+#[allow(clippy::too_many_arguments)]
 fn fit_all_outcomes(
     data: &[f32],
     w: usize,
@@ -794,6 +844,8 @@ fn fit_all_outcomes(
     sigma0: f64,
     beta: f64,
     p: &FitParams,
+    mask: Option<&[bool]>,
+    field_width: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<(Result<StarFit, RefusalReason>, FitTrace)> {
     let body = || {
@@ -804,7 +856,7 @@ fn fit_all_outcomes(
             // worker processes — `fit_one` clears each buffer itself, so
             // this is only the allocation that disappears, never the data.
             .map_init(FitScratch::default, |scratch, s| {
-                fit_one(data, w, h, s, sigma0, beta, p, scratch)
+                fit_one(data, mask, w, h, s, sigma0, field_width, beta, p, scratch)
             })
             .collect()
     };
@@ -830,11 +882,32 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(data, w, h, seeds, model, p, pool, false).0
+    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false).0
+}
+
+/// The field width a fit call reports (Task 6a): the caller's `Some(f)` with `from_stars = 0`, else
+/// [`field_width_of`] the seeds.
+fn resolve_field_width(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    mask: Option<&[bool]>,
+    given: Option<f64>,
+) -> FieldWidth {
+    match given {
+        Some(fwhm_px) => FieldWidth {
+            fwhm_px,
+            from_stars: 0,
+        },
+        None => field_width_of(data, w, h, seeds, mask),
+    }
 }
 
 /// [`fit_stars`], also returning one [`FitDiagnostics`] per seed, in seed
 /// order, when `diagnostics` is set (empty otherwise: the run never asks).
+/// `mask` and `field_width` as [`super::FitStarsOptions`] carries them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_diagnosed(
     data: &[f32],
     w: usize,
@@ -842,9 +915,12 @@ pub(super) fn fit_stars_diagnosed(
     seeds: &[Seed],
     model: PsfModel,
     p: &FitParams,
+    mask: Option<&[bool]>,
+    field_width: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
 ) -> (FitOutcome, Vec<FitDiagnostics>) {
+    let field = resolve_field_width(data, w, h, seeds, mask, field_width);
     let sigma0 = initial_sigma(seeds);
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
@@ -852,9 +928,11 @@ pub(super) fn fit_stars_diagnosed(
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
         // `Auto` search below never runs for it.
         PsfModel::Fixed(b) => b,
-        PsfModel::Auto => super::beta::auto_beta(data, w, h, seeds, sigma0, p, pool),
+        PsfModel::Auto => {
+            super::beta::auto_beta(data, w, h, seeds, sigma0, p, mask, field.fwhm_px, pool)
+        }
     };
-    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, pool, diagnostics)
+    fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
@@ -880,7 +958,7 @@ pub fn fit_stars_with_beta(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, pool, false).0
+    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false).0
 }
 
 /// [`fit_stars_with_beta`], also returning one [`FitDiagnostics`] per seed,
@@ -890,7 +968,9 @@ pub fn fit_stars_with_beta(
 /// in seed order; the accepted fits are read off it sequentially — the very
 /// list the filtered chain collected before — and handed to [`dedupe`], so
 /// the kept fits, their order and every sum over them are unchanged. A seed
-/// whose fit the duplicate drop removed is refused `Duplicate`.
+/// whose fit the duplicate drop removed is refused `Duplicate`. `mask` and
+/// `field_width` as [`super::FitStarsOptions`] carries them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_with_beta_diagnosed(
     data: &[f32],
     w: usize,
@@ -898,11 +978,42 @@ pub(super) fn fit_stars_with_beta_diagnosed(
     seeds: &[Seed],
     beta: f64,
     p: &FitParams,
+    mask: Option<&[bool]>,
+    field_width: Option<f64>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    diagnostics: bool,
+) -> (FitOutcome, Vec<FitDiagnostics>) {
+    let field = resolve_field_width(data, w, h, seeds, mask, field_width);
+    fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
+}
+
+/// The body both entry points share once β and the field width are resolved.
+#[allow(clippy::too_many_arguments)]
+fn fit_at_width(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    beta: f64,
+    p: &FitParams,
+    mask: Option<&[bool]>,
+    field: FieldWidth,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
 ) -> (FitOutcome, Vec<FitDiagnostics>) {
     let sigma0 = initial_sigma(seeds);
-    let per_seed = fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, pool);
+    let per_seed = fit_all_outcomes(
+        data,
+        w,
+        h,
+        seeds,
+        sigma0,
+        beta,
+        p,
+        mask,
+        field.fwhm_px,
+        pool,
+    );
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(per_seed.len());
     let mut traces: Vec<FitTrace> =
         Vec::with_capacity(if diagnostics { per_seed.len() } else { 0 });
@@ -949,6 +1060,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
             beta,
             seeds: seeds.len(),
             refused,
+            field_width: field,
         },
         records,
     )
@@ -957,7 +1069,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::star_measure::fit_stars_at;
+    use crate::star_measure::{fit_stars_at, FitStarsOptions};
     use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
 
     fn round(x: f64, y: f64, amp: f64) -> MoffatStar {
@@ -1395,7 +1507,8 @@ mod tests {
 
     /// Mirrors `sampling_radius`'s own loop exactly, but through the real
     /// (incremental) `region_median`, collecting every intermediate median
-    /// — `sampling_radius` itself only returns the final radius.
+    /// — `sampling_radius` itself only returns the final radius. Plan A Task 6a
+    /// (ruling F14): `region_median` takes the pixel mask; `None` here.
     fn incremental_sampling_radius_with_seq(
         data: &[f32],
         w: usize,
@@ -1409,13 +1522,13 @@ mod tests {
         let mut scratch: Vec<f32> = Vec::new();
         let mut seq = Vec::new();
         let mut r = r_start;
-        let Some(mut prev) = region_median(data, w, cx, cy, None, r, &mut scratch) else {
+        let Some(mut prev) = region_median(data, None, w, cx, cy, None, r, &mut scratch) else {
             return (r, seq);
         };
         seq.push(prev);
         while r + step <= r_max {
             let next = r + step;
-            let Some(m) = region_median(data, w, cx, cy, Some(r), next, &mut scratch) else {
+            let Some(m) = region_median(data, None, w, cx, cy, Some(r), next, &mut scratch) else {
                 return (r, seq);
             };
             r = next;
@@ -1442,7 +1555,8 @@ mod tests {
         let (r_seq, seq_new) =
             incremental_sampling_radius_with_seq(&data, 200, cx, cy, r_start, r_max, &p);
         let mut scratch: Vec<f32> = Vec::new();
-        let r_prod = sampling_radius(&data, 200, cx, cy, r_start, r_max, &p, &mut scratch);
+        // Plan A Task 6a (ruling F14): `sampling_radius` takes the pixel mask; `None` = every pixel present.
+        let r_prod = sampling_radius(&data, None, 200, cx, cy, r_start, r_max, &p, &mut scratch);
 
         assert_eq!(
             r_prod, r_seq,
@@ -1500,7 +1614,8 @@ mod tests {
         let (r_seq, seq_new) =
             incremental_sampling_radius_with_seq(&data, 120, cx, cy, r_start, r_max, &p);
         let mut scratch: Vec<f32> = Vec::new();
-        let r_prod = sampling_radius(&data, 120, cx, cy, r_start, r_max, &p, &mut scratch);
+        // Plan A Task 6a (ruling F14): `sampling_radius` takes the pixel mask; `None` = every pixel present.
+        let r_prod = sampling_radius(&data, None, 120, cx, cy, r_start, r_max, &p, &mut scratch);
 
         assert_eq!(
             r_prod, r_seq,
@@ -1614,7 +1729,16 @@ mod tests {
         // axis on fwhm_x and θ_canonical = 20° + 90° (mod 180°)
         let (stars, seeds) = grid(40, 3.0, 6.0, 20f64.to_radians());
         let data = moffat_field(360, 240, &stars, 4.0, 0.05);
-        let out = fit_stars_at(&data, 360, 240, &seeds, 4.0, &FitParams::default(), None);
+        // Plan A Task 6a (ruling F14): `fit_stars_at` takes `&FitStarsOptions` in place of `&FitParams`.
+        let out = fit_stars_at(
+            &data,
+            360,
+            240,
+            &seeds,
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
         assert!(out.fits.len() >= 36, "{}", out.fits.len());
         let want = (20f64 + 90.0).to_radians();
         for f in &out.fits {
@@ -1662,7 +1786,8 @@ mod tests {
                     flux,
                 }],
                 4.0,
-                &FitParams::default(),
+                // Plan A Task 6a (ruling F14): `&FitStarsOptions` in place of `&FitParams`.
+                &FitStarsOptions::default(),
                 None,
             )
             .fits[0]

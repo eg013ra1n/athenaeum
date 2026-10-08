@@ -104,6 +104,9 @@ pub struct FitDiagnostics {
     pub width_start: f64,
     /// Steps the sampling region grew from its start radius.
     pub growth_steps: u8,
+    /// The region's present pixels — finite and unmasked — the fit was handed (Task 6a); 0 when the seed was refused
+    /// before its region was gathered (`OutsideImage`).
+    pub pixels_used: u32,
     /// `None` until the rustafits entry point reports it (Task 9).
     pub iterations: Option<u16>,
     /// The fitter's own convergence flag (not an acceptance criterion; reported only).
