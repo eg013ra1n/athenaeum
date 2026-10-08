@@ -16,8 +16,9 @@
 //! non-finite one, in the region's growth, its pixels and the aperture; the field width is reported as
 //! [`FitOutcome::field_width`].
 //!
-//! F-1 with F-7, the fit (Plan A Task 6b, ruling R-OSP-4): every star starts from its own width, `F_start`, read
-//! from its second moments in a box of radius `⌈2·F_field⌉` (the box is also the admission test, PA-18); its region
+//! F-1 with F-7, the fit (Plan A Task 6b, ruling R-OSP-4 as amended by round 1, ruling R1): every star starts from
+//! its own half-maximum width where readable (its peak ≥ 10 σ above the rim of a box of radius `⌈2·F_field⌉`, which
+//! is also the admission test, PA-18), else from the field width; its region
 //! grows from `max(3, ⌈1.5·F_start⌉)` up to `clamp(⌈6·F_start⌉, 6, 96)` px while the region's median stands above its
 //! rim's by more than 1 % of the peak (PA-12); the fit's background starts from that rim's median. An annular star is
 //! refused `Donut` before any fit, and a fit narrower than 0.8 px `NarrowerThanPixel`. The field σ0 from the seeds'
@@ -35,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
-use super::seeds::{field_width_of, FieldWidth};
-use crate::integration::stats::median_in_place;
+use super::seeds::{field_width_of, own_halfmax_width, FieldWidth};
+use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 
 /// `2√(2 ln 2)`: a Gaussian's FWHM per σ (the start width [`FitDiagnostics::width_start`] reports).
 const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
@@ -247,9 +248,12 @@ pub fn fwtm_from_alpha(alpha: f64, beta: f64) -> f64 {
     2.0 * alpha * (10f64.powf(1.0 / beta) - 1.0).sqrt()
 }
 
-/// The width-start box's radius per field FWHM (PA-12): `F_start` is read in a box of radius `⌈2·F_field⌉` px, and
-/// a seed whose box leaves the image is refused `OutsideImage` (PA-18).
+/// The width-start box's radius per field FWHM (PA-12): the box of radius `⌈2·F_field⌉` px in which the width start's
+/// readability gate and moments are read; a seed whose box leaves the image is refused `OutsideImage` (PA-18).
 const WIDTH_START_BOX_PER_FIELD: f64 = 2.0;
+/// The width start reads the star's own half-maximum width only when its peak stands at least this many σ_rim above the
+/// width-start box's rim; a fainter star starts from the field width (Task 6b round 1, ruling R1).
+const WIDTH_START_MIN_PEAK_SNR: f64 = 10.0;
 /// `F_start`'s clamp, px (PA-12).
 const WIDTH_START_MIN_PX: f64 = 0.6;
 const WIDTH_START_MAX_PX: f64 = 40.0;
@@ -535,8 +539,9 @@ impl FitTrace {
     }
 }
 
-/// The star's own width start (PA-12): its FWHM `F_start`, the axis ratio and
-/// orientation of its moments, and their centroid in image coordinates.
+/// The star's width start: its FWHM `F_start` (its own half-maximum width where readable, else the field width —
+/// Task 6b round 1, ruling R1), and the axis ratio, orientation and centroid of its second moments in the width-start
+/// box.
 #[derive(Debug, Clone, Copy)]
 struct WidthStart {
     fwhm: f64,
@@ -552,19 +557,25 @@ fn width_start_box_radius(field_width: f64) -> i64 {
     ((WIDTH_START_BOX_PER_FIELD * field_width).ceil() as i64).max(1)
 }
 
-/// `F_start` (PA-12): the background-subtracted second moments of the present
-/// pixels in the box of radius `rb` about `(cx, cy)` — the subtraction level is
-/// the median of the box's own outer 1-px rim, the weights `max(v − level, 0)`
-/// ([`moment_ellipse`]) — as the FWHM of the Gaussian of the same geometric-mean
-/// σ, `2.3548·√(σ_major·σ_minor)`, clamped to [0.6, 40] px. The caller has
-/// checked that the box lies inside the image. A box with no present rim pixel or
-/// no positive moments starts from the field width itself (clamped the same
-/// way), round, at θ 0, centred on the seed.
+/// The width start (PA-12 as amended by Task 6b round 1, ruling R1), in the box of radius `rb` about `(cx, cy)`
+/// (the caller has checked that it lies inside the image):
+///
+/// - **`F_start`** is the star's own half-maximum width ([`own_halfmax_width`], PA-17's estimator) when the star is
+///   readable — its peak stands at least 10 σ above the box's rim, `(max − level)/σ_rim ≥ 10` with `level` the median
+///   and `σ_rim` = 1.4826·MAD of the box's outer 1-px rim (a rim with no spread reads any peak above it as readable) —
+///   and the field width otherwise, or when the half-maximum width does not read; clamped to [0.6, 40] px. The plan's
+///   second moments read every star wide (1.3× on bright stars, 2–3× on faint ones: the clipped noise of the box);
+///   the half-maximum width, judged on truth before any bar was read, reads 0.92–1.09× in every Fisher bin of
+///   `sharp/m4/f{2.6,8,16}` and `sharp/gauss/f8` and the two populations of a mixed field at their own widths.
+/// - **The axis ratio, angle and centroid** stay the background-subtracted second moments of the box's present pixels
+///   (weights `max(v − level, 0)`, [`moment_ellipse`]): the fit's start shape and the donut test's centre. No present
+///   rim pixel or no positive moments: round, at θ 0, centred on the seed.
 #[allow(clippy::too_many_arguments)]
 fn width_start(
     data: &[f32],
     mask: Option<&[bool]>,
     w: usize,
+    h: usize,
     seed: &Seed,
     cx: i64,
     cy: i64,
@@ -572,38 +583,49 @@ fn width_start(
     field_width: f64,
     scratch: &mut FitScratch,
 ) -> WidthStart {
-    let fallback = WidthStart {
+    let mut start = WidthStart {
         fwhm: field_width.clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX),
         axis_ratio: 1.0,
         theta: 0.0,
         centroid: (seed.x, seed.y),
     };
     let Some(level) = rim_median(data, mask, w, cx, cy, rb, &mut scratch.rim) else {
-        return fallback;
+        return start;
     };
+    // `rim_median` left the rim's present pixels in `scratch.rim` (reordered, the same multiset).
+    let sigma_rim = (MAD_TO_SIGMA * mad_about(&scratch.rim, level as f32)) as f64;
     scratch.px.clear();
+    let mut peak = f64::NEG_INFINITY;
     for y in cy - rb..=cy + rb {
         for x in cx - rb..=cx + rb {
             let i = y as usize * w + x as usize;
             if present(data, mask, i) {
+                let v = data[i] as f64;
+                peak = peak.max(v);
                 scratch.px.push(PixelSample {
                     x: (x - cx) as f64,
                     y: (y - cy) as f64,
-                    value: data[i] as f64,
+                    value: v,
                 });
             }
         }
     }
-    match moment_ellipse(&scratch.px, level) {
-        Some(m) => WidthStart {
-            fwhm: (GAUSSIAN_FWHM_PER_SIGMA * (m.sigma_major * m.sigma_minor).sqrt())
-                .clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX),
-            axis_ratio: m.sigma_major / m.sigma_minor,
-            theta: m.theta,
-            centroid: (cx as f64 + m.cx, cy as f64 + m.cy),
-        },
-        None => fallback,
+    if let Some(m) = moment_ellipse(&scratch.px, level) {
+        start.axis_ratio = m.sigma_major / m.sigma_minor;
+        start.theta = m.theta;
+        start.centroid = (cx as f64 + m.cx, cy as f64 + m.cy);
     }
+    let readable = if sigma_rim > 0.0 {
+        (peak - level) / sigma_rim >= WIDTH_START_MIN_PEAK_SNR
+    } else {
+        peak > level
+    };
+    if readable {
+        if let Some(own) = own_halfmax_width(data, w, h, seed.x, seed.y, mask) {
+            start.fwhm = own.clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX);
+        }
+    }
+    start
 }
 
 /// The donut test (Task 6b): the mean of the 3×3 core about the pixel nearest
@@ -664,7 +686,8 @@ fn is_donut(
 /// 1. **Admission:** the width-start box of radius `⌈2·F_field⌉` about the seed's pixel must lie inside the image,
 ///    else `OutsideImage` (PA-18: a star broader than the field width can still be admitted and meet the border as
 ///    `RegionTooSmall`).
-/// 2. **The width start** `F_start` from the star's own second moments in that box ([`width_start`]).
+/// 2. **The width start** `F_start`: the star's own half-maximum width where readable, else the field width; the start
+///    shape and the donut centre from the box's second moments ([`width_start`]; round 1, ruling R1).
 /// 3. **The region** grows from `max(3, ⌈1.5·F_start⌉)` to at most `clamp(⌈6·F_start⌉, 6, 96)` px, never past the
 ///    border, while its median stands above its rim's ([`grow_region`]); the background start `b0` is the final
 ///    rim's median, and fewer than 10 present pixels are `TooFewPixels`.
@@ -700,7 +723,7 @@ fn fit_one(
     if cx - rb < 0 || cy - rb < 0 || cx + rb >= w as i64 || cy + rb >= h as i64 {
         return (Err(RefusalReason::OutsideImage), trace);
     }
-    let start = width_start(data, mask, w, seed, cx, cy, rb, field_width, scratch);
+    let start = width_start(data, mask, w, h, seed, cx, cy, rb, field_width, scratch);
     trace.width_start = start.fwhm;
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
     let r_max = ((REGION_MAX_PER_WIDTH * start.fwhm).ceil() as i64)
@@ -1968,12 +1991,17 @@ mod tests {
         // The bright copy is ×1024, not ×1000 (controller ruling, Task 5): the planes are noiseless f32, so their only
         // noise is f32 rounding, and a factor that is not a power of two rounds the bright copy differently from the
         // faint one — that alone moves a noiseless fit by ~1e-8 relative (the residual, which sits at that rounding
-        // floor, by 20 %). A power of two scales every f32 value exactly. The seed's peak AND flux scale with it, so
-        // σ0 = √(flux/(2π·peak)) is the same start on both.
+        // floor, by 20 %). A power of two scales every f32 value exactly. The seed's peak AND flux scale with it (the
+        // width start, a half-maximum width since Task 6b, is scale-free either way).
         const K: f64 = 1024.0;
-        let near = moffat_field(80, 80, &[star(30.3, 20.7, 0.3)], 4.0, 0.05);
-        let far = moffat_field(3100, 2100, &[star(3000.3, 2000.7, 0.3)], 4.0, 0.05);
-        let bright = moffat_field(80, 80, &[star(30.3, 20.7, 0.3 * K)], 4.0, 0.05 * K as f32);
+        // Plan A Task 6b round 1 (ruling F14): the sub-pixel phases are binary-exact (.25, .75). With 30.3 / 3000.3
+        // the seed's offset from its pixel, `x − round(x)`, differs by 1.8e-13 between the two copies (3000.3 is not
+        // 2970 + 30.3 in f64), so the two fits started 1.8e-13 apart and the residual, at the f32 rounding floor
+        // (8.2e-9), read 1.3e-9 apart once the width start became the star's own half-maximum width. With exact phases
+        // the far copy is an exact translate: the same pixels, the same start.
+        let near = moffat_field(80, 80, &[star(30.25, 20.75, 0.3)], 4.0, 0.05);
+        let far = moffat_field(3100, 2100, &[star(3000.25, 2000.75, 0.3)], 4.0, 0.05);
+        let bright = moffat_field(80, 80, &[star(30.25, 20.75, 0.3 * K)], 4.0, 0.05 * K as f32);
         let f = |d: &[f32], w, h, x, y, p, flux| {
             fit_stars_at(
                 d,
@@ -1992,9 +2020,9 @@ mod tests {
             )
             .fits[0]
         };
-        let a = f(&near, 80, 80, 30.3, 20.7, 0.3, 1.0);
-        let b = f(&far, 3100, 2100, 3000.3, 2000.7, 0.3, 1.0);
-        let c = f(&bright, 80, 80, 30.3, 20.7, 0.3 * K, K);
+        let a = f(&near, 80, 80, 30.25, 20.75, 0.3, 1.0);
+        let b = f(&far, 3100, 2100, 3000.25, 2000.75, 0.3, 1.0);
+        let c = f(&bright, 80, 80, 30.25, 20.75, 0.3 * K, K);
         let rel = |p: f64, q: f64| ((p - q) / q).abs();
         assert!(
             rel(b.x - 2970.0, a.x) < 1e-9 && rel(b.y - 1980.0, a.y) < 1e-9,
@@ -2365,12 +2393,31 @@ mod tests {
             3.0,
         );
         assert_eq!(out.fits.len(), 1);
+        // Task 6b round 1 (ruling R1; reported to the controller): the brief asserted b0 itself within 0.3 σ. With the
+        // width start the star's own half-maximum width (2.81 px here), PA-12's region starts and stops at
+        // r = ⌈1.5·2.81⌉ = 5 (1.9 FWHM; `(m_r − s_r)` is already below 1 % of the peak), where the rim still holds
+        // ≈ 0.3 % of this bright star's peak, +0.59 σ (b0 0.056911 vs the sky 0.055738); the moments' inflated width
+        // had started the region wider. The F-7 bar reads the fit's background (row 5), which stays within 0.3 σ
+        // (−0.08 σ), and the rim start is still the better start: closer to the sky than the plain median of the same
+        // square, the start it replaced.
+        let r = diag[0].region_radius as i64;
+        let mut square: Vec<f32> = Vec::new();
+        for y in 40 - r..=40 + r {
+            for x in 40 - r..=40 + r {
+                square.push(data[y as usize * w + x as usize]);
+            }
+        }
+        let plain = median_in_place(&mut square) as f64;
         assert!(
-            (diag[0].background_start - local_sky).abs() < 0.3 * 0.002,
-            "b0 {} vs sky {local_sky}",
+            (diag[0].background_start - local_sky).abs() < (plain - local_sky).abs(),
+            "b0 {} vs the square median {plain}, sky {local_sky}",
             diag[0].background_start
         );
-        assert!((out.fits[0].background - local_sky).abs() < 0.3 * 0.002);
+        assert!(
+            (out.fits[0].background - local_sky).abs() < 0.3 * 0.002,
+            "fitted background {} vs sky {local_sky}",
+            out.fits[0].background
+        );
     }
 
     #[test]
@@ -2417,6 +2464,48 @@ mod tests {
         assert_eq!(
             diag[0].outcome,
             Outcome::Refused(RefusalReason::OutsideImage)
+        );
+    }
+
+    /// Task 6b round 1, ruling R1: the width start is the star's own half-maximum width where its peak stands at least
+    /// 10 σ_rim above the width-start box's rim, else the field width. Six bright FWHM-3 stars and one bright FWHM-7 star
+    /// (a broad star among sharp ones) start from their own widths; a faint FWHM-3 star (peak ≈ 5 σ) starts from the
+    /// field width exactly. The candidates were judged on truth before any bar was read
+    /// (`star-lab-a/t06b-f1/diag/fstart_candidates.py`): the half-maximum width read 1.02–1.04 (FWHM 3) and 0.99–1.01
+    /// (FWHM 7) of the truth on the two-population plane.
+    #[test]
+    fn width_start_is_the_own_width_where_readable_else_the_field_width() {
+        let mut stars: Vec<MoffatStar> = (0..6)
+            .map(|i| {
+                one(
+                    40.0 + (i % 3) as f64 * 60.0,
+                    50.0 + (i / 3) as f64 * 100.0,
+                    0.3,
+                    3.449,
+                )
+            })
+            .collect();
+        stars.push(one(250.3, 49.6, 0.3, 8.048)); // FWHM 7
+        stars.push(one(250.0, 150.0, 0.010, 3.449)); // FWHM 3 at ≈ 5 σ
+        let mut data = moffat_field(320, 200, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 21);
+        let seeds: Vec<Seed> = stars.iter().map(seed).collect();
+        let (_, diag) = fit_with(&data, 320, 200, &seeds, 3.0);
+        for d in &diag[..6] {
+            assert!(
+                (d.width_start / 3.0 - 1.0).abs() < 0.1,
+                "a sharp star's own width: {d:?}"
+            );
+        }
+        assert!(
+            (diag[6].width_start / 7.0 - 1.0).abs() < 0.1,
+            "a broad star among sharp ones starts from its own width: {:?}",
+            diag[6]
+        );
+        assert_eq!(
+            diag[7].width_start, 3.0,
+            "a faint star starts from the field width: {:?}",
+            diag[7]
         );
     }
 

@@ -799,6 +799,26 @@ pub fn halfmax_width(
     None
 }
 
+/// One star's own half-maximum width (PA-17): [`halfmax_width`] in a box of half-width 15 px, read again in a box of
+/// `⌈3·F⌉` (≤ 48) when the first read is ≥ 7 px (a re-read whose box leaves the image keeps the first). `None` when no
+/// read crosses half the maximum. The field width's per-star read, and the fit's width start where the star is
+/// readable (Task 6b round 1, ruling R1).
+pub(crate) fn own_halfmax_width(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    x: f64,
+    y: f64,
+    mask: Option<&[bool]>,
+) -> Option<f64> {
+    let first = halfmax_width(plane, w, h, x, y, HALFMAX_BOX_PX, mask)?;
+    if first < HALFMAX_REMEASURE_FROM_PX {
+        return Some(first);
+    }
+    let wide = ((3.0 * first).ceil() as usize).min(HALFMAX_BOX_MAX_PX);
+    Some(halfmax_width(plane, w, h, x, y, wide, mask).unwrap_or(first))
+}
+
 /// The field width of GIVEN seeds (I-4, PA-17): the median `halfmax_width` of the ≤ 100 brightest, all of them —
 /// no saturation test (ruling F25 as folded) — (box 15 px; a first read ≥ 7 px is re-measured in a `3·F` box,
 /// ≤ 48), clamped to [1.5, 24] px. `fit_stars_at` calls it when
@@ -819,15 +839,7 @@ pub fn field_width_of(
     let mut widths: Vec<f64> = order
         .iter()
         .take(FIELD_WIDTH_STARS)
-        .filter_map(|&i| {
-            let s = &seeds[i];
-            let first = halfmax_width(plane, w, h, s.x, s.y, HALFMAX_BOX_PX, mask)?;
-            if first < HALFMAX_REMEASURE_FROM_PX {
-                return Some(first);
-            }
-            let wide = ((3.0 * first).ceil() as usize).min(HALFMAX_BOX_MAX_PX);
-            Some(halfmax_width(plane, w, h, s.x, s.y, wide, mask).unwrap_or(first))
-        })
+        .filter_map(|&i| own_halfmax_width(plane, w, h, seeds[i].x, seeds[i].y, mask))
         .collect();
     if widths.is_empty() {
         return FieldWidth::unmeasured();

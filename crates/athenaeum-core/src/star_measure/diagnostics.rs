@@ -100,8 +100,8 @@ pub struct FitDiagnostics {
     /// The background the fit started from: the median of the sampling region's outer 1-px rim (Task 6b, F-7),
     /// working units.
     pub background_start: f64,
-    /// The FWHM (px) the fit started from: the star's own `F_start`, from its second moments in the width-start box
-    /// (Task 6b, PA-12).
+    /// The FWHM (px) the fit started from, `F_start`: the star's own half-maximum width where readable (its peak ≥ 10 σ
+    /// above the width-start box's rim), else the field width (Task 6b, PA-12 as amended by round 1, ruling R1).
     pub width_start: f64,
     /// Steps the sampling region grew from its start radius.
     pub growth_steps: u8,

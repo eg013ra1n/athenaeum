@@ -54,11 +54,13 @@ use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
     measure_plane_diagnosed, MeasureOptions, SeedSource, ADU_SCALE,
 };
-use athenaeum_core::stacking::psf_signal::{self, fit_stars_with_beta, FitParams, StarFit};
+use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
 use athenaeum_core::stacking::structure::SeedDetector;
-use athenaeum_core::star_measure::{FitDiagnostics, Outcome, RefusalCounts, DEFAULT_THRESHOLD};
+use athenaeum_core::star_measure::{
+    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts, DEFAULT_THRESHOLD,
+};
 use serde_json::{json, Value};
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -481,9 +483,15 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         }
         if want("betas") {
             let scaled: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
+            // Ruling R3 (Plan A Task 6b round 1): the betas arm starts from the measure path's own field width (the
+            // matched filter's, for its seeds), so at the measure's β it fits the measure's stars exactly.
+            let betas_opts = FitStarsOptions {
+                field_width: Some(pm.field_width.fwhm_px),
+                ..Default::default()
+            };
             for &b in &a.betas {
                 let t = Instant::now();
-                let o = fit_stars_with_beta(&scaled, w, h, &seeds, b, &FitParams::default(), None);
+                let o = fit_stars_at(&scaled, w, h, &seeds, b, &betas_opts, None);
                 let (ff, fe) = psf_signal::frame_shape(&o.fits).unwrap_or((0.0, 0.0));
                 for f in &o.fits {
                     emit(fit_line("betas", p, Some(b), f))
@@ -825,6 +833,64 @@ mod tests {
         assert_eq!(refused as u64, frame["refused"]["total"].as_u64().unwrap());
         assert_eq!(frame["fits"].as_u64().unwrap() + refused as u64, frame["seeds"].as_u64().unwrap());
         assert!(lines.iter().filter(|v| v["kind"] == "refused").all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
+    }
+
+    /// Plan A Task 6b round 1 (ruling R3): the betas arm starts from the measure path's field width, so at the measure's
+    /// own β it fits exactly the measure's stars. The image holds 60 narrow (FWHM 3, amplitude 0.4) and 60 broad (FWHM
+    /// 7, amplitude 0.3) Moffat-4 stars: the matched filter's width (its first pass ranks by 3-px flux, where a broad
+    /// star leads) and `field_width_of` the seeds (ranked by peak, where a narrow one leads) differ by ~4 px.
+    #[test]
+    fn the_betas_arm_starts_from_the_measure_width() {
+        let (w, h) = (640usize, 480usize);
+        let mut data = vec![0.05f32; w * h];
+        for i in 0..120usize {
+            let narrow = (i + i / 12) % 2 == 0;
+            let (alpha, amp) = if narrow {
+                (3.449f32, 0.4f32)
+            } else {
+                (8.048, 0.3)
+            };
+            let (cx, cy) = (30.0 + (i % 12) as f32 * 50.0, 30.0 + (i / 12) as f32 * 45.0);
+            for y in 0..h {
+                for x in 0..w {
+                    let q = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)) / (alpha * alpha);
+                    data[y * w + x] += amp * (1.0 + q).powi(-4);
+                }
+            }
+        }
+        for (i, v) in data.iter_mut().enumerate() {
+            *v += 0.002 * (((i as u64).wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0 - 0.5);
+        }
+        let d = tempfile::tempdir().unwrap();
+        let img = d.path().join("p.fits");
+        write_fits_f32(&img, w, h, 1, &data, &[]).unwrap();
+        let out = d.path().join("p.jsonl");
+        let mut a = args(img, out.clone(), &["measure", "betas"]);
+        a.betas = vec![2.5, 4.0, 6.0, 10.0];
+        cmd_measure(a).unwrap();
+        let lines = read_lines(&out);
+        let frame = lines
+            .iter()
+            .find(|v| v["kind"] == "frame" && v["path"] == "measure")
+            .unwrap();
+        let beta = frame["beta"].as_f64().unwrap();
+        let stars = |path: &str| -> Vec<String> {
+            let mut s: Vec<String> = lines
+                .iter()
+                .filter(|v| {
+                    v["kind"] == "star" && v["path"] == path && v["beta"].as_f64() == Some(beta)
+                })
+                .map(|v| format!("{} {} {} {}", v["x"], v["y"], v["fwhm"], v["background"]))
+                .collect();
+            s.sort();
+            s
+        };
+        let (m, b) = (stars("measure"), stars("betas"));
+        assert!(m.len() > 100, "{}", m.len());
+        assert_eq!(
+            m, b,
+            "the betas arm at the measure's β fits the measure's stars exactly"
+        );
     }
 
     /// Plan A Task 6a (ruling F3): every frame line names the EFFECTIVE seed source and threshold the measure path ran,

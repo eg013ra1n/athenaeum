@@ -1096,7 +1096,8 @@ pub(crate) mod tests {
     /// `psf_signal_weight` and `fwhm_px` moved by design; the counts and β did not.
     ///
     /// Rewritten by Plan A Task 6b (F-1/F-7: the per-star width start, the region that scales with the star, the rim
-    /// background start): `psf_signal_weight` and `fwhm_px` moved by design; the counts and β did not.
+    /// background start): `psf_signal_weight` and `fwhm_px` moved by design; the counts and β did not. Rewritten again by
+    /// Task 6b round 1 (ruling R1: the width start is the star's own half-maximum width where readable): the same two.
     #[test]
     fn the_shipped_none_path_measures_exactly_these_numbers() {
         let (data, w, h) = field(7, 1.0, 0.002);
@@ -1109,18 +1110,19 @@ pub(crate) mod tests {
             "the whole fixture field is detected and fitted"
         );
         assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
-        // F-1/F-7 (Task 6b): the per-star width start, the region rule (PA-12) and the rim background start moved
-        // the fit; the previous literal was 1.387_179_128_762_254_4e-3 (Task 5's; before it 1.387_068_045_273_481_56e-3).
-        assert_eq!(c.psf_signal_weight, 1.387_793_525_585_654_9e-3);
+        // F-1/F-7 (Task 6b round 1, ruling R1): the width start became the star's own half-maximum width; the
+        // previous literal was 1.387_793_525_585_654_9e-3 (Task 6b's first round, the box moments), before it
+        // 1.387_179_128_762_254_4e-3 (Task 5) and 1.387_068_045_273_481_56e-3.
+        assert_eq!(c.psf_signal_weight, 1.390_799_753_469_352e-3);
         // `fwhm_px` is a shape aggregate over 150 Moffat fits whose arithmetic
         // (Tier C C3: `powi`/`powf`, the reused residual) rounds differently
         // per platform's libm — the first push after C3 read 4.122_658_320_014_302_5
         // on the Windows runner against this Mac's ..._304, one ulp. A last-bit
         // FWHM is not a contract, so this aggregate is pinned to a few ulp,
         // never exactly; the fields above stay exact on every platform.
-        // F-1/F-7 (Task 6b): the per-star width start, the region rule (PA-12) and the rim background start moved
-        // the fit; the previous literal was 4.123_100_751_260_767 (Task 5's; before it 4.122_658_320_014_304).
-        assert_ulp_close(c.fwhm_px, 4.123_653_811_131_548, "fwhm_px");
+        // F-1/F-7 (Task 6b round 1, ruling R1): as above; the previous literal was 4.123_653_811_131_548 (Task 6b's
+        // first round), before it 4.123_100_751_260_767 (Task 5) and 4.122_658_320_014_304.
+        assert_ulp_close(c.fwhm_px, 4.129_358_265_048_832, "fwhm_px");
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
         // so they're zeroed before the comparison (perf tier 1 Task 0).
@@ -1323,7 +1325,7 @@ pub(crate) mod tests {
     ///
     /// Rewritten by Plan A Task 6b (F-1/F-7: the per-star width start, the region that scales with the star, the rim
     /// background start): the same six fit-derived fields moved by design; the counts, β and every noise/sky field
-    /// did not.
+    /// did not. Rewritten again by Task 6b round 1 (ruling R1: the own half-maximum width start): the same six.
     #[test]
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
@@ -1338,16 +1340,19 @@ pub(crate) mod tests {
         // ..._036_08 — 1e-16 absolute, 4e-15 relative). They are pinned to a
         // few ulp and then snapped to the pinned value, so the remaining 20
         // fields are compared EXACTLY through one Debug string as before.
-        // F-1/F-7 (Task 6b): the per-star width start, the region rule (PA-12) and the rim background start moved
-        // the fit; the previous literal was 4.121_938_449_255_613 (Task 5's; before it 4.121_806_182_224_867).
-        assert_ulp_close(m.fwhm_px, 4.123_144_488_377_148, "fwhm_px");
-        // F-1/F-7 (Task 6b): as above; the previous literal was 0.111_709_924_171_636_75 (Task 5's; before it
-        // 0.095_246_020_871_036_08).
-        assert_ulp_close(m.eccentricity, 0.109_077_618_457_969_11, "eccentricity");
-        m.fwhm_px = 4.123_144_488_377_148;
-        m.eccentricity = 0.109_077_618_457_969_11;
-        // F-1/F-7 (Task 6b): the per-star width start, the region rule (PA-12) and the rim background start moved
-        // the fit; the previous literal was fwhm_px 4.121938449255613, eccentricity 0.11170992417163675, tflux
+        // F-1/F-7 (Task 6b round 1, ruling R1: the own half-maximum width start); the previous literal was
+        // 4.123_144_488_377_148 (Task 6b's first round), before it 4.121_938_449_255_613 (Task 5) and
+        // 4.121_806_182_224_867.
+        assert_ulp_close(m.fwhm_px, 4.130_191_893_023_729, "fwhm_px");
+        // As above; the previous literal was 0.109_077_618_457_969_11 (Task 6b's first round), before it
+        // 0.111_709_924_171_636_75 (Task 5) and 0.095_246_020_871_036_08.
+        assert_ulp_close(m.eccentricity, 0.110_290_631_118_640_29, "eccentricity");
+        m.fwhm_px = 4.130_191_893_023_729;
+        m.eccentricity = 0.110_290_631_118_640_29;
+        // F-1/F-7 (Task 6b round 1, ruling R1): the own half-maximum width start moved the fit; Task 6b's first round
+        // read fwhm_px 4.123144488377148, eccentricity 0.10907761845796911, tflux 569.3936624492295, tmean_flux
+        // 11.820962540092, psf_signal_weight 0.001469309237358735, psf_snr 0.002156102665484917. Before it (Task 6b,
+        // the box moments, from Task 5's): fwhm_px 4.121938449255613, eccentricity 0.11170992417163675, tflux
         // 568.9959995966527, tmean_flux 11.82062196789549, psf_signal_weight 0.0014682407736153376, psf_snr
         // 0.0021530920856719002 (every other field unchanged). Task 5's own move (the corrected Moffat θ column,
         // attribution.txt) was from fwhm_px 4.121806182224867, eccentricity 0.09524602087103608, tflux
@@ -1357,16 +1362,16 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, \
-beta: 10.0, fwhm_px: 4.123144488377148, eccentricity: 0.10907761845796911, \
-tflux: 569.3936624492295, tmean_flux: 11.820962540092, \
+beta: 10.0, fwhm_px: 4.130191893023729, eccentricity: 0.11029063111864029, \
+tflux: 571.0240326481198, tmean_flux: 11.813958121959663, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
 noise_source: Mrs, median: 0.08010764420032501, \
 mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
 snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
-scale: 0.0020880382508039474, psf_signal_weight: 0.001469309237358735, \
-psf_snr: 0.002156102665484917, timings: MeasureTimings { read_ms: 0, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0014726432553409737, \
+psf_snr: 0.002168467672133753, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }

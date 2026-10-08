@@ -2098,7 +2098,13 @@ mod tests {
             "sigma=0.45: fwhm must be > 0 (star must be detected)"
         );
 
-        assert!(ratio_07 < 0.985, "ratio_07={ratio_07}");
+        // Plan A Task 6b round 1 (ruling R1; reported to the controller): the star measurement's width start became
+        // the star's own half-maximum width, which on a drizzled drop_shrink-0.6 output reads the pixel spike of nine
+        // dithered noiseless frames (2.08 output px against a fitted FWHM of 4.40; drop_shrink 1.0: 3.37 against 4.45),
+        // so the fit's region starts smaller and ds 0.6 reads 4.40 where the box moments read 4.31: ratio_07 0.9897
+        // where it read 0.9690 (ratio_045 0.9695 where 0.9587). The margin 0.985 was the moments' region; what the
+        // test states — drop_shrink 0.6 sharpens, and more so for the undersampled star — holds and stays asserted.
+        assert!(ratio_07 < 1.0, "ratio_07={ratio_07}");
         assert!(
             ratio_045 < ratio_07,
             "ratio_045={ratio_045} ratio_07={ratio_07}"
