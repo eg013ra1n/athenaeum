@@ -2044,3 +2044,33 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     `star_probe` gains `--seeds matched|peak|structure` (default `matched`) and `--seed-threshold K`; every frame line's
     `options.measure` names the effective `seedSource` and `seedThreshold` (ruling F3), which the scorecard's
     expected set reads (`matchedFilter` → Fisher SNR ≥ K).
+  - **Acceptance.** The lab step `t06a-seeds`, recorded in athenaeum-lab `star-lab/results/plan-a/t06a-seeds/`
+    (lab 1270f68). The cycle ran at K 6.0 on star_probe d06cab40, built from athenaeum f5bbc822; all 697 outputs are
+    proven.
+    - **Population.** The matched filter seeds 32 % more stars: 79 269 → 104 475 seeds and 77 978 → 101 097
+      accepted fits on the measure path. `fit outcomes` is ok on all 177 rows.
+    - **The design list.** The brief's 22-entry list left the rows this population moves unnamed (26 762
+      quantities, 163 one-sided misses against t05). By controller ruling the list was amended to 34 entries,
+      with the reason "a new seed population, the matched filter, +32 % seeds; same-star test vs truth: unchanged
+      where β held". The amended list:
+      - `fit outcomes` on `betas@*`: reported;
+      - row 2 `centroid` on `measure` and `register`: set aside (on `register` for this step only; Task 8 restores
+        the F10 one-sided entry);
+      - row 4 `ecc` and `angle` on `measure` and `betas@*`: set aside;
+      - row 4 `axis order`: reported;
+      - row 8: set aside;
+      - row 10 `auto beta vs saturated`, `peak5` and `saturation flag`: reported.
+
+      With it both no-regression diffs PASS: 0 moved, 0 missed, 0 lost, control 0 against t05 (34 entries) and
+      against t01c (the 77-entry union).
+    - **The β flip, owned by F-3.** athenaeum-lab `bin/same_star.py` compares the same truth star in both runs. On
+      68 of 376 planes the auto β changed (66 upward, e.g. 4 → 10 on 25), because the matched filter puts saturated
+      stars into the auto-β top-64 sample (row 10 `n_sat64` median 0 → 31). There the same stars' FWHM error
+      against the pointfit truth reads 2.77 % → 5.72 % (24 365 worse, 4 765 better, worse in every Fisher bin).
+      Row 3's set-aside note records that the fits are not unchanged on those planes. F-3 (Task 8, the β sample on
+      unsaturated stars) owns the cure: on the planes in `beta-flips.tsv`, t08's β must equal t05's.
+    - **Where β held, the same stars measure the same.** FWHM error 2.508 % → 2.505 %; eccentricity unchanged;
+      the bright centroid improves (Fisher SNR > 300: 0.0133 → 0.0097 px). The register centroid improves
+      (0.0294 → 0.0290 px).
+    - **The F-2 rows at t06a (reported).** Angle `eff` is 0.75–1.28 on the 24 shape cells (t05: 0.82–1.31). Axis
+      order is 100 % on every family and path.
