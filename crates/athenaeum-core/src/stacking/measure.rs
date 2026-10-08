@@ -1214,12 +1214,25 @@ pub(crate) mod tests {
     /// Plan A Task 4 (F-0): the channel accounts for every seed it detected,
     /// its per-reason counts sum to `stars_refused`, the two keys reach the
     /// `metrics` payload, and a payload written before the task decodes with
-    /// no refusals.
+    /// no refusals. Two stars sit 4 px from the right and bottom edges: the
+    /// adapter's own detector seeds them, and their nominal stamp (5·σ0 ≈ 9
+    /// px) leaves the image, so the fitter refuses them `outsideImage` and the
+    /// accounting is never the trivial `stars_refused: 0`.
     #[test]
     fn channel_accounts_for_every_seed_and_an_old_payload_decodes() {
-        let (data, w, h) = field(7, 1.0, 0.002);
+        let (mut data, w, h) = field(7, 1.0, 0.002);
+        for &(sx, sy) in &[(763.0f64, 250.0f64), (250.0, 507.0)] {
+            for y in 0..h {
+                for x in 0..w {
+                    let r2 = (x as f64 - sx).powi(2) + (y as f64 - sy).powi(2);
+                    data[y * w + x] += (0.25 * (-r2 / (2.0 * 1.8 * 1.8)).exp()) as f32;
+                }
+            }
+        }
         let c = measure_plane(&data, w, h, &MeasureOptions::default(), None);
         assert!(c.stars_detected > 0);
+        assert!(c.stars_refused >= 1, "the edge stars are refused: {c:?}");
+        assert!(c.refused_by_reason.get("outsideImage").copied().unwrap_or(0) >= 1, "{:?}", c.refused_by_reason);
         assert_eq!(c.stars_fitted + c.stars_refused, c.stars_detected);
         assert_eq!(c.refused_by_reason.values().sum::<usize>(), c.stars_refused);
         let json = serde_json::to_string(&c).unwrap();

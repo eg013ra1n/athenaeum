@@ -1889,4 +1889,12 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     there and reads as no flags; the layout and `FITS_ARTIFACT_VERSION` are unchanged.
   - **Acceptance.** The lab step `t04-f0`, recorded in athenaeum-lab `star-lab/results/plan-a/t04-f0/`. The bar:
     `fit outcomes` ok on every image, and 0 moved rows against `t02-extract` (`noreg.txt`) and against
-    `t01c-baseline` (`noreg-cumulative.txt`).
+    `t01c-baseline` (`noreg-cumulative.txt`). `fit outcomes` was ok on all 885 rows (189 of 189 images per path).
+    - **The donut ruling.** The `donut outcome` row (row 1, path `measure`, `donut/r6` and `donut/r10`) moved by
+      design: seeds that were unaccounted are now refused with a reason. On `donut/r10` that is 56 `centreMoved` +
+      13 `regionTooSmall`; on `donut/r6`, 61 `regionTooSmall`. The accepted counts are unchanged (0 / 69 and
+      24 / 85).
+    - By controller ruling the row is a `reported` design entry,
+      `{"row":1,"metric":"donut outcome","family":"donut/*","path":"measure","kind":"reported"}`; it is judged
+      at Task 6b. With it both diffs PASS (0 moved, 0 lost, control 0 mismatch). Without it, they read FAIL on
+      exactly those two rows.
