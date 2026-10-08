@@ -5,10 +5,10 @@
 import { RefreshCw } from 'lucide-react';
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
 import { Checkbox } from '../../settings/Checkbox';
-import { psfModelLabel, seedDetectorLabel, weightModeLabel } from '../stageSummary';
+import { psfModelLabel, seedSourceLabel, weightModeLabel } from '../stageSummary';
 import type {
   PsfModel,
-  SeedDetector,
+  SeedSource,
   SeedPrefilter,
   StackingConfig,
   WeightMode,
@@ -28,7 +28,7 @@ const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
 
 const SEED_PREFILTERS: SeedPrefilter[] = ['none', 'median3'];
 
-const SEED_DETECTORS: SeedDetector[] = ['peak', 'structure'];
+const SEED_SOURCES: SeedSource[] = ['matchedFilter', 'peak', 'structure'];
 
 /** Label for the image the seed detection runs on. */
 function seedPrefilterLabel(v: SeedPrefilter): string {
@@ -96,9 +96,10 @@ export function MeasurePanel({
 }: MeasurePanelProps) {
   const m = config.measurement;
   const sel = config.selection;
-  // The peak detector's two dials mean nothing to the structure map, which
-  // carries its own threshold and its own pre-filter.
-  const peakOnlyDisabled = m.seedDetector === 'structure';
+  // Each seed source reads its own dials: the matched filter its σ_f threshold,
+  // the peak threshold its σ and pre-filter, the structure map neither.
+  const peakOnlyDisabled = m.seedSource !== 'peak';
+  const matchedOnlyDisabled = m.seedSource !== 'matchedFilter';
 
   const patchMeasurement = (patch: Partial<StackingConfig['measurement']>) => {
     onChange({ ...config, measurement: { ...m, ...patch } });
@@ -218,30 +219,47 @@ export function MeasurePanel({
       />
 
       <div>
-        <label className="block text-xs text-content-secondary mb-1">Seed detector</label>
+        <label className="block text-xs text-content-secondary mb-1">Seed source</label>
         <select
-          value={m.seedDetector}
+          value={m.seedSource}
           disabled={disabled}
-          onChange={(e) => patchMeasurement({ seedDetector: e.target.value as SeedDetector })}
+          onChange={(e) => {
+            // seedDetector stays on the wire (old documents round-trip) and mirrors the source.
+            const seedSource = e.target.value as SeedSource;
+            patchMeasurement({
+              seedSource,
+              seedDetector: seedSource === 'structure' ? 'structure' : 'peak',
+            });
+          }}
           className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
         >
-          {SEED_DETECTORS.map((v) => (
+          {SEED_SOURCES.map((v) => (
             <option key={v} value={v}>
-              {seedDetectorLabel(v)}
+              {seedSourceLabel(v)}
             </option>
           ))}
         </select>
         <p className="mt-1 text-[11px] text-content-muted">
-          default {seedDetectorLabel(defaults.measurement.seedDetector)} — which stars the
-          fits start from. The structure map groups connected pixels instead of
-          thresholding single ones, so it finds fewer stars on an undersampled frame; it
-          has no threshold of its own, ignores the two settings below, and drops the
-          smallest structures using a size floor it derives from each frame. Measured
-          better than the peak threshold on mono frames and worse on colour ones — it
-          takes the blue channel's weight correlation from 0.68 to 0.42 and the
-          frame-ranking overlap from 14/20 to 11/20 (spec §9.2).
+          default {seedSourceLabel(defaults.measurement.seedSource)} — which stars the fits
+          start from. The matched filter is the star-measurement module's own detector
+          (one star path for Analysis and Stacking, R-OSP-2) and reads only the seed
+          threshold. The peak threshold reads the detection threshold and the pre-filter
+          below. The structure map groups connected pixels and reads neither; it finds
+          fewer stars on an undersampled frame and measured worse on colour frames than
+          the peak threshold (R-M4c-11).
         </p>
       </div>
+
+      <NumericField
+        label="Seed threshold (σ_f)"
+        value={m.seedThreshold}
+        onCommit={(n) => patchMeasurement({ seedThreshold: n })}
+        min={2}
+        max={20}
+        step={0.5}
+        disabled={disabled || matchedOnlyDisabled}
+        help={`default ${defaults.measurement.seedThreshold.toFixed(1)} — the matched filter's response above its own noise, in σ_f. Lower measures more, fainter stars.`}
+      />
 
       <NumericField
         label="Detection threshold (σ)"

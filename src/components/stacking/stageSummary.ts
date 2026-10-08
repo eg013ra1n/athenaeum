@@ -16,7 +16,7 @@ import type {
   PsfModel,
   RejectionChoice,
   RejectionNormalization,
-  SeedDetector,
+  SeedSource,
   Stage,
   StackingConfig,
   StackingPlan,
@@ -132,9 +132,10 @@ export function weightModeLabel(v: WeightMode): string {
   }
 }
 
-/** Label for the detector that finds the PSF fits' seeds. */
-export function seedDetectorLabel(v: SeedDetector): string {
+/** Label for the source that finds the PSF fits' seeds. */
+export function seedSourceLabel(v: SeedSource): string {
   switch (v) {
+    case 'matchedFilter': return 'matched filter';
     case 'peak': return 'peak threshold';
     case 'structure': return 'structure map';
   }
@@ -262,15 +263,15 @@ export function stageSummary(
     case 'debayer':
       return config.calibration.debayerOsc ? 'VNG debayer' : 'Debayer off';
     case 'measure': {
-      // M4c Task 0 (ruling R-M4c-11): the detector decides whether the two
-      // seed dials mean anything at all, so a non-default one replaces them
-      // in the row rather than sitting beside numbers it ignores.
+      // R-M4c-11 / R-OSP-2: the seed source decides which dials mean anything, so
+      // the row names the source with the dial that steers it.
+      const mm = config.measurement;
       const seeds =
-        config.measurement.seedDetector === 'structure'
+        mm.seedSource === 'structure'
           ? 'structure-map seeds'
-          : `σ ${config.measurement.detectionSigma}${
-              config.measurement.seedPrefilter === 'median3' ? ' · 3×3 median seeds' : ''
-            }`;
+          : mm.seedSource === 'peak'
+            ? `σ ${mm.detectionSigma}${mm.seedPrefilter === 'median3' ? ' · 3×3 median seeds' : ''}`
+            : `seeds: ${seedSourceLabel('matchedFilter')} (σ_f ${mm.seedThreshold.toFixed(1)})`;
       return `${weightModeLabel(config.measurement.weightMode)} weight · ${psfModelLabel(config.measurement.psfModel)} PSF · max ${config.measurement.maxStars} stars · ${seeds}`;
     }
     case 'reference':
