@@ -1064,7 +1064,8 @@ pub(crate) mod tests {
             "the whole fixture field is detected and fitted"
         );
         assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
-        // F-2 (Task 5): conditioning moved the fit; the previous literal was 1.387_068_045_273_481_56e-3.
+        // F-2 (Task 5): the corrected Moffat θ column moved the fit (attribution.txt); the previous literal was
+        // 1.387_068_045_273_481_56e-3.
         assert_eq!(c.psf_signal_weight, 1.387_179_128_762_254_4e-3);
         // `fwhm_px` is a shape aggregate over 150 Moffat fits whose arithmetic
         // (Tier C C3: `powi`/`powf`, the reused residual) rounds differently
@@ -1072,7 +1073,8 @@ pub(crate) mod tests {
         // on the Windows runner against this Mac's ..._304, one ulp. A last-bit
         // FWHM is not a contract, so this aggregate is pinned to a few ulp,
         // never exactly; the fields above stay exact on every platform.
-        // F-2 (Task 5): conditioning moved the fit; the previous literal was 4.122_658_320_014_304.
+        // F-2 (Task 5): the corrected Moffat θ column moved the fit (attribution.txt); the previous literal was
+        // 4.122_658_320_014_304.
         assert_ulp_close(c.fwhm_px, 4.123_100_751_260_767, "fwhm_px");
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
@@ -1286,15 +1288,18 @@ pub(crate) mod tests {
         // ..._036_08 — 1e-16 absolute, 4e-15 relative). They are pinned to a
         // few ulp and then snapped to the pinned value, so the remaining 20
         // fields are compared EXACTLY through one Debug string as before.
-        // F-2 (Task 5): conditioning moved the fit; the previous literal was 4.121_806_182_224_867.
+        // F-2 (Task 5): the corrected Moffat θ column moved the fit (attribution.txt); the previous literal was
+        // 4.121_806_182_224_867.
         assert_ulp_close(m.fwhm_px, 4.121_938_449_255_613, "fwhm_px");
-        // F-2 (Task 5): conditioning moved the fit; the previous literal was 0.095_246_020_871_036_08.
+        // F-2 (Task 5): the corrected Moffat θ column moved the fit (attribution.txt); the previous literal was
+        // 0.095_246_020_871_036_08.
         assert_ulp_close(m.eccentricity, 0.111_709_924_171_636_75, "eccentricity");
         m.fwhm_px = 4.121_938_449_255_613;
         m.eccentricity = 0.111_709_924_171_636_75;
-        // F-2 (Task 5): conditioning moved the fit; the previous literal was fwhm_px 4.121806182224867, eccentricity
-        // 0.09524602087103608, tflux 569.0781285580445, tmean_flux 11.823163448679521, psf_signal_weight
-        // 0.0014687684228686841, psf_snr 0.0021537136857493117 (every other field unchanged).
+        // F-2 (Task 5): the corrected Moffat θ column moved the fit (attribution.txt); the previous literal was
+        // fwhm_px 4.121806182224867, eccentricity 0.09524602087103608, tflux 569.0781285580445, tmean_flux
+        // 11.823163448679521, psf_signal_weight 0.0014687684228686841, psf_snr 0.0021537136857493117 (every other
+        // field unchanged).
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \

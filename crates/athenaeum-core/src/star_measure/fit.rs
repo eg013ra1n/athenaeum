@@ -1708,6 +1708,94 @@ mod tests {
         assert_eq!((f.fwhm(), f.eccentricity()), (fw, e));
     }
 
+    /// A pin, not RED (ruling F28; review M4): `canonical_theta` and the axis swap in `accept`, both added and
+    /// verified with Task 5, at their boundaries. Every θ they return lies in `[-π/2, π/2)`.
+    #[test]
+    fn canonical_theta_and_the_swap_hold_at_their_boundaries() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let in_range = |t: f64| (-FRAC_PI_2..FRAC_PI_2).contains(&t);
+        // The two ends: -π/2 stays, π/2 is the same axis and folds to -π/2.
+        assert_eq!(canonical_theta(-FRAC_PI_2), -FRAC_PI_2);
+        assert_eq!(canonical_theta(FRAC_PI_2), -FRAC_PI_2);
+        // Just inside each end: returned exactly as given.
+        let (lo, hi) = (-FRAC_PI_2 + 1e-12, FRAC_PI_2 - 1e-12);
+        assert_eq!(canonical_theta(lo).to_bits(), lo.to_bits());
+        assert_eq!(canonical_theta(hi).to_bits(), hi.to_bits());
+        // Just outside each end: folded by π to just inside the other.
+        let below = canonical_theta(-FRAC_PI_2 - 1e-9);
+        assert!(
+            in_range(below) && (below - (FRAC_PI_2 - 1e-9)).abs() < 1e-12,
+            "{below}"
+        );
+        let above = canonical_theta(FRAC_PI_2 + 1e-9);
+        assert!(
+            in_range(above) && (above - (-FRAC_PI_2 + 1e-9)).abs() < 1e-12,
+            "{above}"
+        );
+        // Whole turns either way: in range and the same axis (a multiple of π away).
+        for k in -4..=4 {
+            for t in [-FRAC_PI_2, -1.0, 0.0, 0.3, FRAC_PI_2 - 1e-15, FRAC_PI_2] {
+                let c = canonical_theta(t + k as f64 * PI);
+                let turns = (c - t) / PI;
+                assert!(
+                    in_range(c) && (turns - turns.round()).abs() < 1e-9,
+                    "{t} + {k}π -> {c}"
+                );
+            }
+        }
+
+        // Through `accept`: a clean fit at the seed, β 4.
+        let fit = |alpha_x: f64, alpha_y: f64, theta: f64| Moffat2DResult {
+            b: 0.0,
+            a: 1.0,
+            x0: 10.0,
+            y0: 10.0,
+            alpha_x,
+            alpha_y,
+            theta,
+            beta: 4.0,
+            converged: true,
+            fit_residual: 0.01,
+        };
+        let seed = Seed {
+            x: 10.0,
+            y: 10.0,
+            peak: 1.0,
+            flux: 10.0,
+        };
+        let p = FitParams::default();
+        let acc = |m: Moffat2DResult| {
+            accept(&m, &seed, 10.0, 10.0, 20.0, &p).expect("a clean fit is accepted")
+        };
+        // Minor axis first (fwhm_x < fwhm_y): swapped, θ a quarter turn away, on the side that stays in range.
+        for theta in [-FRAC_PI_2, -0.3, 0.0, 0.3, FRAC_PI_2] {
+            let f = acc(fit(2.0, 3.0, theta));
+            assert!(f.fwhm_x > f.fwhm_y, "{f:?}");
+            assert_eq!(
+                (f.fwtm_x, f.fwtm_y),
+                (fwtm_from_alpha(3.0, 4.0), fwtm_from_alpha(2.0, 4.0))
+            );
+            assert!(in_range(f.theta), "θ {theta} -> {}", f.theta);
+            assert!(
+                ((f.theta - theta).abs() - FRAC_PI_2).abs() < 1e-12,
+                "θ {theta} -> {}",
+                f.theta
+            );
+        }
+        // Major axis already first: θ unchanged, but for the one end that folds.
+        for theta in [-FRAC_PI_2, -0.3, 0.3] {
+            let f = acc(fit(3.0, 2.0, theta));
+            assert!(f.fwhm_x > f.fwhm_y);
+            assert_eq!(f.theta.to_bits(), theta.to_bits());
+        }
+        assert_eq!(acc(fit(3.0, 2.0, FRAC_PI_2)).theta, -FRAC_PI_2);
+        // A round star (fwhm_x == fwhm_y): no swap, θ only folded into range.
+        let f = acc(fit(2.5, 2.5, 0.7));
+        assert_eq!((f.fwhm_x, f.theta), (f.fwhm_y, 0.7));
+        let f = acc(fit(2.5, 2.5, FRAC_PI_2));
+        assert_eq!((f.fwhm_x, f.theta), (f.fwhm_y, -FRAC_PI_2));
+    }
+
     /// L-12: `peak5` is the mean of the five brightest finite pixels of the
     /// square `fit_one` sampled — independent of the fitted model.
     #[test]
