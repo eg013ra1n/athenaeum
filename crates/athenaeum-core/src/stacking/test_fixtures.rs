@@ -765,8 +765,9 @@ const GAUSSIAN_FWHM_FACTOR: f64 = 2.354_820_045_030_949_3;
 /// `noise` (`0.0` = none, reproducible via `seed`). Lifted out of
 /// `measure.rs`'s own private `field()` test helper (M2 Task 3) so
 /// `ln::scale`'s tests build the same kind of field without duplicating the
-/// rendering step; `measure.rs` keeps its own star-placement grid and calls
-/// this for the pixels.
+/// rendering step; the 150-star measure fixture keeps its own star-placement
+/// grid in `crate::test_support::fixture_field` (moved out of `measure.rs` in
+/// Plan A Task 2) and renders its pixels with `crate::test_support::gaussian_field`.
 pub(crate) fn synthetic_star_field(
     w: usize,
     h: usize,

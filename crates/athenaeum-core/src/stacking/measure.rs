@@ -1016,7 +1016,7 @@ pub(crate) mod tests {
     /// ulp, 4.122_658_320_014_302_55 → 4.122_658_320_014_304; every other
     /// field here — the fit counts, β and `psf_signal_weight` — is
     /// bit-identical across that change, which is why
-    /// `psf_signal::PSF_FIT_VERSION` was NOT bumped (no cached `metrics`,
+    /// the fit-version constant (3 then; now `star_measure::MEASURE_VERSION`) was NOT bumped (no cached `metrics`,
     /// `fits` or `.athln` artifact is made wrong by a last-bit FWHM).
     #[test]
     fn the_shipped_none_path_measures_exactly_these_numbers() {

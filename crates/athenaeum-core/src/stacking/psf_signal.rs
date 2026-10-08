@@ -1,7 +1,7 @@
 //! The PSF-signal family of frame-quality estimators (math reference §1;
-//! spec §4.1): the PSF Signal Weight / PSF SNR formulas, the group β and
-//! `PSF_FIT_VERSION`. The elliptical Moffat fits, the hybrid PSF/aperture
-//! flux, the robust totals, the large-scale background residual and MRS
+//! spec §4.1): the PSF Signal Weight / PSF SNR formulas, the group β (the
+//! cache-key constant is `star_measure::MEASURE_VERSION`). The elliptical
+//! Moffat fits, the hybrid PSF/aperture flux, the robust totals, the large-scale background residual and MRS
 //! noise moved to [`crate::star_measure`] (one star-measurement path, Plan A
 //! Task 2) and are re-exported here, so every `psf_signal::…` caller is
 //! unchanged; `fit_stars`/`fit_stars_with_beta` are thin wrappers over the
@@ -16,28 +16,6 @@ pub use crate::star_measure::{
     background_residual, frame_shape, fwtm_from_alpha, noise_mrs, signal_totals, FitOutcome,
     FitParams, PsfModel, Seed, SignalTotals, StarFit, AUTO_BETAS, AUTO_SAMPLE, RCR_LIMIT,
 };
-
-/// Version of the PSF fitter's own behaviour — bumped whenever
-/// `star_measure::fit`'s `fit_one`, `accept` or the aperture change what a
-/// fit accepts or measures; folded into every artifact hash that stores
-/// fit-derived numbers.
-///
-/// Without it a cached artifact cannot tell that the code which produced it
-/// has changed: the config it was keyed on is untouched, but the numbers
-/// would come out different today. M4a Task 2 is exactly that case — the
-/// adaptive sampling region and the inner-region rule moved which stars are
-/// accepted, for the quality measurement AND for local normalization's
-/// PSF-flux scale, which fits through the same `fit_stars` with
-/// `FitParams::default()` (ruling R-M4a-15).
-///
-/// 1 = the fixed `5σ` stamp with the `0.85·r` centre rule (M1-M3).
-/// 2 = the adaptive sampling region + `inner_margin` (M4a Task 2).
-/// 3 = no change to what a fit accepts — bumped so every cached `metrics`
-/// artifact is treated as stale until it comes with a sibling `fits`
-/// artifact (Tier C Task 1, spec §2.2.7): the two are written together from
-/// this version on, and a document from before it never carries `fits` at
-/// all.
-pub const PSF_FIT_VERSION: u32 = 3;
 
 /// [`crate::star_measure::fit::fit_stars`] (Plan A Task 2: the fit moved;
 /// this wrapper keeps every LN and probe call site unchanged).

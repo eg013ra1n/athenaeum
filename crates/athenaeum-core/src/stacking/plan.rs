@@ -578,7 +578,7 @@ pub(crate) fn measurement_hash_for(cfg: &StackingConfig, calibrated_hash: &str) 
 /// CONTENT moves with `measurement.maxStars`/`detectionSigma`/
 /// `seedDetector`/`seedPrefilter`/`structure` — none of which
 /// `registration_subtree` carries (it serializes only `cfg.registration` +
-/// `PSF_FIT_VERSION`). Without this fold-in, changing `measurement.maxStars`
+/// the measure version, formerly `PSF_FIT_VERSION`). Without this fold-in, changing `measurement.maxStars`
 /// rewrote every `.athf` (Measure's own hash follows it) while the plan
 /// gate still reported Register cached and a run reused stale registration
 /// rows built from fits the file on disk no longer matched — exactly the
@@ -3184,7 +3184,7 @@ pub fn build_plan(
             // Tier C Task 1 (fix round 1): the frame's Measure output is
             // fully cached only when its `metrics` row AND every one of its
             // planes' `fits` rows are fresh — the two are written together
-            // from `PSF_FIT_VERSION` 3 on, so a `metrics`-only hit (an old
+            // from the measure version 3 (formerly `PSF_FIT_VERSION`) on, so a `metrics`-only hit (an old
             // catalog re-measured before this task shipped, or a `fits`
             // file removed by hand) is honestly reported as needing Measure
             // again, the same way Task 6a's `registered` artifact is
@@ -6407,7 +6407,7 @@ mod tests {
     /// Normalize — Register now reads the same `.athf` artifact for a mono
     /// frame (`stacking::register::detect::stars_from_fits`), and
     /// `registration_subtree` carries only `cfg.registration` +
-    /// `PSF_FIT_VERSION`, neither of which reacts to `measurement.
+    /// the measure version (formerly `PSF_FIT_VERSION`), neither of which reacts to `measurement.
     /// seedDetector`/`maxStars`/`detectionSigma`/`seedPrefilter`/
     /// `structure`.
     #[test]
@@ -7887,13 +7887,14 @@ mod tests {
         // 2026-10-05 LN model fixes Task 13: fluxEstimator + aperture (aperture only under commonAperture)
         // 2026-10-06: LN_MODEL_VERSION 4 (L-23) - the reference-frames saturation map (ln_* only; calib/meas/reg unchanged).
         // 2026-10-06: F1 growth curve is the default (L-24) - ln_* only; calib/meas/reg unchanged.
+        // 2026-10-08 one star-measurement path Plan A Task 3 (R-OSP-1): MEASURE_VERSION 4 replaces the old fit-version constant (3) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=e2e095a141978cef ln=ef20c66bf5361a7a ln_cal=bd753b9cf3bc2dcf",
-                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=e2e095a141978cef ln=a5c51bf532e5ea58 ln_cal=bd753b9cf3bc2dcf",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=9b207c2f8e46cb8f ln=30d49a2cae2ed006 ln_cal=5e591b34200b9d66",
-                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=9b207c2f8e46cb8f ln=1c7b1fd8995e8f13 ln_cal=5e591b34200b9d66",
+                "default: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=976a5d70cc5612bd ln_ref=2676a6e017eebe13 ln=5f2cbe34312ca3c6 ln_cal=f6195d69cd7bbaee",
+                "fastPreview: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=2706ef847c1a810b ln_ref=2676a6e017eebe13 ln=fe6f762d887c933e ln_cal=f6195d69cd7bbaee",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=800ee8fdd2bacfef ln_ref=1237e3e6fdf2cf1c ln=46fc25da33fffe7e ln_cal=6bb6c12538e4e622",
+                "custom: calib=2b725e5e99c87f49 meas=657bcdd04ab6b2b9 reg=9637c675b85c1985 ln_ref=1237e3e6fdf2cf1c ln=25d1f3545a18d351 ln_cal=6bb6c12538e4e622",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no

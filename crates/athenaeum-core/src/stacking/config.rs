@@ -16,10 +16,11 @@ use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
-use crate::stacking::psf_signal::{PsfModel, PSF_FIT_VERSION};
+use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::DistortionChoice;
 use crate::stacking::structure::SeedDetector;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
+use crate::star_measure::MEASURE_VERSION;
 
 /// Bumped only when the `StackingConfig` shape changes in a way an old
 /// stored document can't decode through `#[serde(default)]` alone (spec
@@ -806,29 +807,29 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 /// Stage 3 (measurement) config subtree: the measurement settings, the
 /// scale estimator normalization keeps in lockstep with it (see
 /// [`MeasurementConfig::measure_options`]), and
-/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`] — the config alone
+/// [`crate::star_measure::MEASURE_VERSION`] — the config alone
 /// cannot express "the fitter itself now accepts different stars", which is
 /// what M4a Task 2 did to every stored measurement (ruling R-M4a-15).
 pub fn measurement_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    measurement_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+    measurement_subtree_with_measure_version(cfg, MEASURE_VERSION)
 }
 
-/// [`measurement_subtree`] with the fitter version supplied, so a test can
+/// [`measurement_subtree`] with the measure version supplied, so a test can
 /// prove the hash actually follows it (nothing else should call this with
-/// anything but [`PSF_FIT_VERSION`]).
-fn measurement_subtree_with_fit_version(
+/// anything but [`MEASURE_VERSION`]).
+fn measurement_subtree_with_measure_version(
     cfg: &StackingConfig,
-    psf_fit_version: u32,
+    measure_version: u32,
 ) -> serde_json::Value {
     serde_json::json!({
         "measurement": cfg.measurement,
         "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
-        "psfFitVersion": psf_fit_version,
+        "measureVersion": measure_version,
     })
 }
 
 /// Stage 5 (registration) config subtree, plus
-/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`] (Tier C Task 3, ruling
+/// [`crate::star_measure::MEASURE_VERSION`] (Tier C Task 3, ruling
 /// C-6): a mono frame's registration star list can now come straight from
 /// Measure's own accepted PSF fits (`stacking::register::detect::
 /// stars_from_fits`) instead of a fresh detection, so a fitter change —
@@ -840,18 +841,18 @@ fn measurement_subtree_with_fit_version(
 /// (perf tier A Task 6a) and re-running every downstream stage that reads
 /// it (Normalize, Integrate).
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    registration_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+    registration_subtree_with_measure_version(cfg, MEASURE_VERSION)
 }
 
-/// [`registration_subtree`] with the fitter version supplied — see
-/// [`measurement_subtree_with_fit_version`].
-fn registration_subtree_with_fit_version(
+/// [`registration_subtree`] with the measure version supplied — see
+/// [`measurement_subtree_with_measure_version`].
+fn registration_subtree_with_measure_version(
     cfg: &StackingConfig,
-    psf_fit_version: u32,
+    measure_version: u32,
 ) -> serde_json::Value {
     serde_json::json!({
         "registration": cfg.registration,
-        "psfFitVersion": psf_fit_version,
+        "measureVersion": measure_version,
     })
 }
 
@@ -867,7 +868,7 @@ fn registration_subtree_with_fit_version(
 /// along too (harmless — it just widens what invalidates a sidecar — but
 /// plays no role in `relative_scale`'s own model choice; fix round 1, item
 /// 11: an earlier version of this comment claimed otherwise), plus
-/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`]: `relative_scale` fits
+/// [`crate::star_measure::MEASURE_VERSION`]: `relative_scale` fits
 /// its matched stars through the same `fit_stars` /
 /// `FitParams::default()` the measurement uses, so a change to what the
 /// fitter accepts silently changes every `.athln` — and no config field
@@ -875,14 +876,14 @@ fn registration_subtree_with_fit_version(
 /// [`crate::stacking::ln::LN_MODEL_VERSION`] (`lnModelVersion`): a change in
 /// what an existing config's LN model produces moves the hashes the same way.
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    normalization_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+    normalization_subtree_with_measure_version(cfg, MEASURE_VERSION)
 }
 
-/// [`normalization_subtree`] with the fitter version supplied — see
-/// [`measurement_subtree_with_fit_version`].
-fn normalization_subtree_with_fit_version(
+/// [`normalization_subtree`] with the measure version supplied — see
+/// [`measurement_subtree_with_measure_version`].
+fn normalization_subtree_with_measure_version(
     cfg: &StackingConfig,
-    psf_fit_version: u32,
+    measure_version: u32,
 ) -> serde_json::Value {
     serde_json::json!({
         "normalization": canonical_normalization(cfg),
@@ -890,7 +891,7 @@ fn normalization_subtree_with_fit_version(
             "psfModel": cfg.measurement.psf_model,
             "maxStars": cfg.measurement.max_stars,
         },
-        "psfFitVersion": psf_fit_version,
+        "measureVersion": measure_version,
         "lnModelVersion": crate::stacking::ln::LN_MODEL_VERSION,
     })
 }
@@ -1583,45 +1584,77 @@ mod tests {
     }
 
     /// Ruling R-M4a-15 (registration folded in by Tier C Task 3, ruling
-    /// C-6): the PSF fitter's own behaviour is not expressible in the
-    /// config, so the artifact hashes that store fit-derived numbers fold
-    /// in [`PSF_FIT_VERSION`] instead. All three must: the measurement
-    /// stage stores PSFSW/TFlux/star counts, local normalization's
+    /// C-6; the constant became `star_measure::MEASURE_VERSION` in Plan A
+    /// Task 3, ruling R-OSP-1): the measurement path's own behaviour is not
+    /// expressible in the config, so the artifact hashes that store
+    /// fit-derived numbers fold in [`MEASURE_VERSION`] instead. All three
+    /// must: Measure stores PSFSW/TFlux/star counts, local normalization's
     /// `.athln` stores a PSF-flux scale measured with the SAME fitter, and
-    /// registration can now build a mono frame's star list straight from
-    /// the fitter's own accepted fits.
+    /// registration builds a mono frame's star list from the fitter's own
+    /// accepted fits. Replaces
+    /// `all_three_fit_derived_subtree_hashes_follow_the_psf_fit_version`.
     #[test]
-    fn all_three_fit_derived_subtree_hashes_follow_the_psf_fit_version() {
+    fn every_fit_reading_stage_hash_follows_measure_version() {
         let cfg = StackingConfig::default();
-        let h = |v: u32| {
+        for (name, a, b) in [
             (
-                stage_hash(&measurement_subtree_with_fit_version(&cfg, v), &[], &[]),
-                stage_hash(&normalization_subtree_with_fit_version(&cfg, v), &[], &[]),
-                stage_hash(&registration_subtree_with_fit_version(&cfg, v), &[], &[]),
-            )
-        };
-        let (m_now, n_now, r_now) = h(PSF_FIT_VERSION);
-        let (m_old, n_old, r_old) = h(PSF_FIT_VERSION - 1);
-        assert_ne!(m_now, m_old, "the measurement hash must follow the fitter");
-        assert_ne!(n_now, n_old, "the LN hash must follow the fitter");
-        assert_ne!(r_now, r_old, "the registration hash must follow the fitter");
-        // And the shipped helpers are the versioned ones at the current
-        // constant — not a second, drifting copy of the JSON shape.
+                "measurement",
+                measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION + 1),
+            ),
+            (
+                "registration",
+                registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                registration_subtree_with_measure_version(&cfg, MEASURE_VERSION + 1),
+            ),
+            (
+                "normalization",
+                normalization_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                normalization_subtree_with_measure_version(&cfg, MEASURE_VERSION + 1),
+            ),
+        ] {
+            assert_ne!(stage_hash(&a, &[], &[]), stage_hash(&b, &[], &[]), "{name}");
+            assert!(
+                a.get("measureVersion").is_some() && a.get("psfFitVersion").is_none(),
+                "{name}: one key, the new one"
+            );
+        }
+        // The shipped helpers are the versioned ones at the current constant
+        // - not a second, drifting copy of the JSON shape.
         assert_eq!(
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
-            m_now,
-            "measurement_subtree must hash as the current fitter version"
-        );
-        assert_eq!(
-            stage_hash(&normalization_subtree(&cfg), &[], &[]),
-            n_now,
-            "normalization_subtree must hash as the current fitter version"
+            stage_hash(
+                &measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                &[],
+                &[]
+            )
         );
         assert_eq!(
             stage_hash(&registration_subtree(&cfg), &[], &[]),
-            r_now,
-            "registration_subtree must hash as the current fitter version"
+            stage_hash(
+                &registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                &[],
+                &[]
+            )
         );
+        assert_eq!(
+            stage_hash(&normalization_subtree(&cfg), &[], &[]),
+            stage_hash(
+                &normalization_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                &[],
+                &[]
+            )
+        );
+        // the calibration and prepare subtrees carry no measure version: a
+        // bump must not recalibrate
+        assert!(calibration_subtree(&cfg).get("measureVersion").is_none());
+        assert!(prepare_subtree(&cfg).get("measureVersion").is_none());
+    }
+
+    /// PIN, not RED (ruling F28): Plan A's one bump (PA-4).
+    #[test]
+    fn measure_version_is_four_after_plan_a() {
+        assert_eq!(MEASURE_VERSION, 4, "Plan A's one bump (PA-4)");
     }
 
     /// M4c Task 3: the large-scale filter's two integers are clamped to the

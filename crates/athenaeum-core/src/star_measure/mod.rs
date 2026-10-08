@@ -26,6 +26,34 @@ pub use domain::{
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
 
+/// Version of the measurement path's own behaviour — bumped whenever
+/// `star_measure::fit`'s `fit_one`, `accept` or the aperture (or anything else in this module) change what a
+/// fit accepts or measures; folded as `"measureVersion"` into every artifact hash that stores
+/// fit-derived numbers (`measurement_subtree`, `registration_subtree`, `normalization_subtree`).
+///
+/// Without it a cached artifact cannot tell that the code which produced it
+/// has changed: the config it was keyed on is untouched, but the numbers
+/// would come out different today. M4a Task 2 is exactly that case — the
+/// adaptive sampling region and the inner-region rule moved which stars are
+/// accepted, for the quality measurement AND for local normalization's
+/// PSF-flux scale, which fits through the same `fit_stars` with
+/// `FitParams::default()` (ruling R-M4a-15).
+///
+/// 1 = the fixed `5σ` stamp with the `0.85·r` centre rule (M1-M3).
+/// 2 = the adaptive sampling region + `inner_margin` (M4a Task 2).
+/// 3 = no change to what a fit accepts — bumped so every cached `metrics`
+/// artifact is treated as stale until it comes with a sibling `fits`
+/// artifact (Tier C Task 1, spec §2.2.7): the two are written together from
+/// this version on, and a document from before it never carries `fits` at
+/// all. (Versions 1-3 were `PSF_FIT_VERSION`, formerly in `stacking::psf_signal`.)
+/// 4 = Plan A, the one star-measurement path (this module, F-0…F-7; ruling
+/// R-OSP-1, spec §4.4).
+///
+/// Policy: ONE bump per merged plan that changes what a fit accepts or
+/// measures, never one per task; Plan C = 5. `AnalysisConfig::config_hash`
+/// is Plan C's.
+pub const MEASURE_VERSION: u32 = 4;
+
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
 /// every test literal uses `..Default::default()` so a later field never breaks an earlier test).

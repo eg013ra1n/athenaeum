@@ -1440,9 +1440,10 @@ fn rcr_sorted_deviations<T: Sample>(sorted: &[T], out: &mut Vec<f64>) -> f64 {
 /// half-normal abscissae are thread-local and reused).
 ///
 /// This is a second implementation of the same algorithm as
-/// `stacking::robust::rcr`, which cannot be reached from here (`stacking` is
-/// gated behind `render + solver`, `integration` is not). A cross-check test
-/// in `stacking::robust` holds the two to the same answers.
+/// `star_measure::robust::rcr`, which cannot be reached from here
+/// (`star_measure` is gated behind `render`, `integration` is not). A
+/// cross-check test in `star_measure::robust` holds the two to the same
+/// answers.
 fn reject_rcr<T: Sample>(values: &mut [T], limit: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {

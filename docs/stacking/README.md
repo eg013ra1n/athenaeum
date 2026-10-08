@@ -1005,7 +1005,7 @@ per-frame weights ρ = 1.0, LN scale −0.035 %), the external-masters gate PASS
 **What shipped.** (1) **Measure persists its PSF fits** as the per-plane `fits`
 artifact (`stacking/fits_artifact.rs`, `FITS_ARTIFACT_VERSION = 1`, kind
 `fits.<plane>`), and the group's β is the LOWER median of the members' Auto β
-(`psf_signal::group_beta`, `PsfModel::Fixed(β)`, `PSF_FIT_VERSION = 3`;
+(`psf_signal::group_beta`, `PsfModel::Fixed(β)`, `PSF_FIT_VERSION = 3`, since replaced by `star_measure::MEASURE_VERSION` — see "One star-measurement path, Plan A";
 `stacking_run_groups.beta`). (2) **LN's relative scale comes from those fits
 as SEEDS, not fluxes** (ruling C-12 — H2 finding: a Moffat fit's integrated
 `signal` is NOT warp-invariant, the B-spline-warped frame differs from the
@@ -1847,3 +1847,20 @@ weight_audit_compare.py`).
 Frontend: `src/components/stacking/` (above),
 `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
 
+## One star-measurement path, Plan A
+
+Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; plan `docs/superpowers/plans/` (Plan A).
+
+- **R-OSP-1 - `star_measure::MEASURE_VERSION = 4` replaces `psf_signal::PSF_FIT_VERSION` (3).** The constant lives
+  in `crates/athenaeum-core/src/star_measure/mod.rs` with versions 1-3 recorded as the old constant's history. It is
+  folded as `"measureVersion"` (formerly `"psfFitVersion"`) into the three fit-reading stage subtrees only:
+  `measurement_subtree`, `registration_subtree` and `normalization_subtree` (helpers `*_with_measure_version`).
+  `calibration_subtree` and the prepare subtree do not carry it, so a bump never recalibrates.
+- **Policy.** ONE bump per merged plan that changes what a fit accepts or measures, never one per task. Plan A is 4;
+  Plan C (the Analysis switch) is 5. `AnalysisConfig::config_hash` is Plan C's.
+- **Risk.** The first run after Plan A re-measures, re-registers (mono) and re-normalizes every set; the `calib`
+  column of the stage-hash golden literals is unchanged, every other column moved
+  (`stage_hashes_are_pinned_to_golden_literals`).
+- **Logging.** The moved measure-path warnings now log under the tracing target `star_measure` rather than
+  `stacking`; their `clip` and `samples` fields joined the logging dictionary
+  (`docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`).
