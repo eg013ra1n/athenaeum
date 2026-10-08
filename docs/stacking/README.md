@@ -491,6 +491,18 @@ estimators disagree by 1.6–2.2× on exactly the debayered planes where both
 detectors overshoot, so the next investigation belongs on the VNG planes or
 the PSF fitter's acceptance, not on a third detector.
 
+*Superseded for the default by R-OSP-2 (2026-10):* `measurement.seedSource =
+matchedFilter` is the default (the star-measurement module's two-pass matched
+filter at `measurement.seedThreshold`, default `seeds::DEFAULT_THRESHOLD`,
+clamped to [2, 20]); `peak` (reads `detectionSigma` and `seedPrefilter`) and
+`structure` remain explicit choices with their own dials; a stored document
+without `seedSource` decodes per spec §2.2 (`legacy_seed_source`: structure
+stays structure, a `median3` prefilter or a `detectionSigma` other than 20
+stays peak, everything else becomes the matched filter; a stored value is
+never reinterpreted in other units). `seedDetector` stays on the wire for
+round-trips and mirrors the source. A plane with no noise estimate (a
+noiseless synthetic) seeds nothing under the matched filter, by design.
+
 **Three more rejection algorithms** (ruling R-M4c-1): `Rejection::{MinMax,
 Esd, Rcr}` appended to the engine enum (`integration/combine.rs`) and
 `RejectionChoice::{minMax, esd, rcr}` to the config

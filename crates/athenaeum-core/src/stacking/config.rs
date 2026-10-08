@@ -149,8 +149,8 @@ impl Default for GroupingConfig {
 
 /// spec §9.2 `measurement:` — Plan 2's weighting/selection inputs, chosen
 /// once per run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct MeasurementConfig {
     pub weight_mode: WeightMode,
     pub psf_model: PsfModel,
@@ -164,12 +164,10 @@ pub struct MeasurementConfig {
     /// levels sit at `background + k*noise` and `background + (k/2)*noise`,
     /// so the seed population follows THIS frame's sky instead of a fixed
     /// bright-pixel budget (M4a Task 2, ruling R-M4a-1).
-    #[serde(default = "default_detection_sigma")]
     pub detection_sigma: f64,
     /// What the seed detection runs on (math reference §5.1): the plane as
     /// it is, or its 3×3 median. Everything downstream of detection always
     /// measures the untouched plane. Read by the peak detector only.
-    #[serde(default)]
     pub seed_prefilter: SeedPrefilter,
     /// WHICH detector finds the seeds (math reference §5.1, ruling
     /// R-M4c-11): the peak threshold `detectionSigma` steers, or the
@@ -182,8 +180,100 @@ pub struct MeasurementConfig {
     /// structure size, derived per frame from the accepted candidates' own
     /// size distribution (see `structure::StructureParams::min_structure_size`).
     /// Its dials are calibrated constants, not config fields.
-    #[serde(default)]
     pub seed_detector: SeedDetector,
+    /// The seed source (spec §2.2): the star-measurement module's matched filter (default), the peak threshold
+    /// (reads `detectionSigma` and `seedPrefilter`), or the structure map. A document without it is decoded by
+    /// [`legacy_seed_source`]; one that carries it uses it as is.
+    pub seed_source: SeedSource,
+    /// The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
+    /// [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`] by [`resolve_config`].
+    pub seed_threshold: f64,
+}
+
+/// Where the Measure stage takes its seeds from (spec §2.2, ruling R-OSP-2; R-M4c-11 for the other two).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SeedSource {
+    /// The module's two-pass matched filter ([`crate::star_measure::seeds::detect`]) at `seedThreshold`.
+    #[default]
+    MatchedFilter,
+    /// The peak threshold: `detectionSigma` and `seedPrefilter`.
+    Peak,
+    /// The structure map.
+    Structure,
+}
+
+impl SeedSource {
+    /// The serde name, for logs: `"matchedFilter"` / `"peak"` / `"structure"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeedSource::MatchedFilter => "matchedFilter",
+            SeedSource::Peak => "peak",
+            SeedSource::Structure => "structure",
+        }
+    }
+}
+
+/// The one decode for every stored document that has no `seedSource` (set, global, user preset — spec §2.2):
+/// Structure → Structure; otherwise `seedPrefilter = median3` or a `detectionSigma` other than the old default
+/// (20) → Peak; otherwise → MatchedFilter. A stored value is never reinterpreted in other units.
+fn legacy_seed_source(
+    detector: Option<SeedDetector>,
+    prefilter: Option<SeedPrefilter>,
+    sigma: Option<f64>,
+) -> SeedSource {
+    if detector == Some(SeedDetector::Structure) {
+        return SeedSource::Structure;
+    }
+    let old_sigma = crate::stacking::measure::DEFAULT_DETECTION_SIGMA as f64;
+    if prefilter == Some(SeedPrefilter::Median3) || sigma.is_some_and(|s| s != old_sigma) {
+        return SeedSource::Peak;
+    }
+    SeedSource::MatchedFilter
+}
+
+/// The wire shape of [`MeasurementConfig`]: every field optional so the decode can tell "absent" from "default"
+/// (the legacy decode needs it).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct MeasurementConfigWire {
+    weight_mode: Option<WeightMode>,
+    psf_model: Option<PsfModel>,
+    max_stars: Option<usize>,
+    formula: Option<FormulaWeights>,
+    keyword: Option<String>,
+    detection_sigma: Option<f64>,
+    seed_prefilter: Option<SeedPrefilter>,
+    seed_detector: Option<SeedDetector>,
+    seed_source: Option<SeedSource>,
+    seed_threshold: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for MeasurementConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = MeasurementConfigWire::deserialize(d)?;
+        let base = MeasurementConfig::default();
+        let seed_source = w.seed_source.unwrap_or_else(|| {
+            legacy_seed_source(w.seed_detector, w.seed_prefilter, w.detection_sigma)
+        });
+        Ok(MeasurementConfig {
+            weight_mode: w.weight_mode.unwrap_or(base.weight_mode),
+            psf_model: w.psf_model.unwrap_or(base.psf_model),
+            max_stars: w.max_stars.unwrap_or(base.max_stars),
+            formula: w.formula.unwrap_or(base.formula),
+            keyword: w.keyword.unwrap_or(base.keyword),
+            detection_sigma: w.detection_sigma.unwrap_or(base.detection_sigma),
+            seed_prefilter: w.seed_prefilter.unwrap_or(base.seed_prefilter),
+            // Kept on the wire for round-trips; it mirrors the source (Structure <=> Structure, else Peak).
+            seed_detector: if seed_source == SeedSource::Structure {
+                SeedDetector::Structure
+            } else {
+                SeedDetector::Peak
+            },
+            seed_source,
+            seed_threshold: w.seed_threshold.unwrap_or(base.seed_threshold),
+        })
+    }
 }
 
 /// Serde default for [`MeasurementConfig::detection_sigma`] — a stored
@@ -203,7 +293,9 @@ impl Default for MeasurementConfig {
             keyword: "SSWEIGHT".to_string(),
             detection_sigma: default_detection_sigma(),
             seed_prefilter: crate::stacking::measure::DEFAULT_SEED_PREFILTER,
-            seed_detector: crate::stacking::measure::DEFAULT_SEED_DETECTOR,
+            seed_detector: SeedDetector::Peak,
+            seed_source: SeedSource::MatchedFilter,
+            seed_threshold: crate::star_measure::seeds::DEFAULT_THRESHOLD,
         }
     }
 }
@@ -225,7 +317,8 @@ impl MeasurementConfig {
             min_snr: MeasureOptions::default().min_snr,
             detection_sigma: self.detection_sigma as f32,
             seed_prefilter: self.seed_prefilter,
-            seed_detector: self.seed_detector,
+            seed_source: self.seed_source,
+            seed_threshold: self.seed_threshold,
             // Not a config field: a run picks the detector, not its dials
             // (M4c Task 0, ruling R-M4c-11).
             structure: MeasureOptions::default().structure,
@@ -485,6 +578,7 @@ pub fn resolve_config(
         config.grouping.stops_width = MIN_STOPS_WIDTH;
     }
     config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
+    config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
     config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
     // M4c Task 3: the same backend guard for the large-scale filter's two
     // integers. Out of range these are not preferences but a broken filter
@@ -623,6 +717,32 @@ fn clamp_detection_sigma(value: f64) -> f64 {
             "stacking config: detectionSigma above the maximum; clamped"
         );
         return MAX_DETECTION_SIGMA;
+    }
+    value
+}
+
+/// [`MeasurementConfig::seed_threshold`]'s range (ruling R-OSP-2).
+pub const MIN_SEED_THRESHOLD: f64 = 2.0;
+pub const MAX_SEED_THRESHOLD: f64 = 20.0;
+
+/// [`MeasurementConfig::seed_threshold`] into [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`], warning when it
+/// moves. `!(x >= MIN)` so a NaN clamps too.
+fn clamp_seed_threshold(value: f64) -> f64 {
+    if !(value >= MIN_SEED_THRESHOLD) {
+        warn!(
+            seed_threshold = value,
+            min = MIN_SEED_THRESHOLD,
+            "stacking config: seedThreshold below the minimum; clamped"
+        );
+        return MIN_SEED_THRESHOLD;
+    }
+    if value > MAX_SEED_THRESHOLD {
+        warn!(
+            seed_threshold = value,
+            max = MAX_SEED_THRESHOLD,
+            "stacking config: seedThreshold above the maximum; clamped"
+        );
+        return MAX_SEED_THRESHOLD;
     }
     value
 }
@@ -1566,19 +1686,20 @@ mod tests {
         // strongest form of the same contract: a different detector is a
         // different star population, whatever the other dials say.
         let mut structure = cfg.clone();
+        structure.measurement.seed_source = SeedSource::Structure;
         structure.measurement.seed_detector = SeedDetector::Structure;
         assert_ne!(config_hash(&cfg), config_hash(&structure));
         assert_ne!(
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
             stage_hash(&measurement_subtree(&structure), &[], &[]),
-            "the measurement stage hash must follow seedDetector"
+            "the measurement stage hash must follow seedSource"
         );
         assert_eq!(
             structure
                 .measurement
                 .measure_options(ScaleEstimator::Bwmv)
-                .seed_detector,
-            SeedDetector::Structure,
+                .seed_source,
+            SeedSource::Structure,
             "and the resolved measure options carry it"
         );
     }
@@ -1858,6 +1979,73 @@ mod tests {
     }
 
     #[test]
+    fn every_older_measurement_shape_decodes_to_the_spec_seed_source() {
+        use crate::api::stacking::NamedPreset;
+        let cases = [
+            (r#"{"measurement":{}}"#, SeedSource::MatchedFilter), // pre-M4a
+            (r#"{"measurement":{"detectionSigma":20.0,"seedPrefilter":"none"}}"#, SeedSource::MatchedFilter), // the old default
+            (r#"{"measurement":{"detectionSigma":16.0}}"#, SeedSource::Peak), // an explicit sigma
+            (r#"{"measurement":{"seedPrefilter":"median3"}}"#, SeedSource::Peak), // the prefilter
+            (r#"{"measurement":{"seedDetector":"structure","seedPrefilter":"median3"}}"#, SeedSource::Structure), // Median3 is Peak's only
+            (r#"{"measurement":{"seedSource":"peak","detectionSigma":20.0}}"#, SeedSource::Peak), // a new document says so
+        ];
+        for (json, want) in cases {
+            let c = resolve_config(Some(json), None).unwrap();
+            assert_eq!(c.measurement.seed_source, want, "{json}");
+            assert_eq!(
+                c.measurement.detection_sigma,
+                if json.contains("16.0") { 16.0 } else { 20.0 },
+                "never reinterpreted: {json}"
+            );
+        }
+        // the global document and a user preset go through the same decode
+        assert_eq!(
+            resolve_config(None, Some(r#"{"measurement":{"detectionSigma":20.0}}"#)).unwrap().measurement.seed_source,
+            SeedSource::MatchedFilter
+        );
+        let p: NamedPreset =
+            serde_json::from_str(r#"{"name":"x","config":{"measurement":{"seedDetector":"structure"}}}"#).unwrap();
+        assert_eq!(p.config.measurement.seed_source, SeedSource::Structure);
+        // `seedSource` wins over a contradicting `seedDetector`; the wire detector mirrors the source.
+        let c = resolve_config(Some(r#"{"measurement":{"seedSource":"matchedFilter","seedDetector":"structure"}}"#), None).unwrap();
+        assert_eq!(c.measurement.seed_source, SeedSource::MatchedFilter);
+        assert_eq!(c.measurement.seed_detector, SeedDetector::Peak);
+    }
+
+    #[test]
+    fn seed_source_moves_the_measurement_stage_hash_and_the_default_is_the_matched_filter() {
+        let cfg = StackingConfig::default();
+        assert_eq!(cfg.measurement.seed_source, SeedSource::MatchedFilter);
+        assert_eq!(cfg.measurement.seed_threshold, crate::star_measure::seeds::DEFAULT_THRESHOLD);
+        let mut peak = cfg.clone();
+        peak.measurement.seed_source = SeedSource::Peak;
+        assert_ne!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&peak), &[], &[])
+        );
+        let mut k = cfg.clone();
+        k.measurement.seed_threshold += 0.5;
+        assert_ne!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&k), &[], &[])
+        );
+        assert_eq!(
+            cfg.measurement.measure_options(ScaleEstimator::Bwmv).seed_source,
+            SeedSource::MatchedFilter
+        );
+    }
+
+    #[test]
+    fn seed_threshold_is_clamped_with_a_warn() {
+        let lo = resolve_config(Some(r#"{"measurement":{"seedThreshold":0.5}}"#), None).unwrap();
+        assert_eq!(lo.measurement.seed_threshold, 2.0);
+        let hi = resolve_config(Some(r#"{"measurement":{"seedThreshold":99.0}}"#), None).unwrap();
+        assert_eq!(hi.measurement.seed_threshold, 20.0);
+        let ok = resolve_config(Some(r#"{"measurement":{"seedThreshold":4.5}}"#), None).unwrap();
+        assert_eq!(ok.measurement.seed_threshold, 4.5);
+    }
+
+    #[test]
     fn config_hash_is_canonical_and_pinned() {
         let default_hash = config_hash(&StackingConfig::default());
         let value = serde_json::to_value(StackingConfig::default()).unwrap();
@@ -1982,7 +2170,11 @@ mod tests {
         //
         // And here (2026-10-06): F1 growth curve is the default (L-24) -
         // `fluxEstimator` and `aperture` take their new default values.
-        assert_eq!(default_hash, "03af478211b610de");
+        //
+        // And here (2026-10-08 one star-measurement path Plan A Task 7, R-OSP-2): `measurement` gains `seedSource`
+        // (default matchedFilter) and `seedThreshold` (default `seeds::DEFAULT_THRESHOLD`) in the serialized config,
+        // and `seedDetector` now mirrors the source. Was "03af478211b610de".
+        assert_eq!(default_hash, "1de1a3136b8dc4ac");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part

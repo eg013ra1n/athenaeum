@@ -7888,13 +7888,14 @@ mod tests {
         // 2026-10-06: LN_MODEL_VERSION 4 (L-23) - the reference-frames saturation map (ln_* only; calib/meas/reg unchanged).
         // 2026-10-06: F1 growth curve is the default (L-24) - ln_* only; calib/meas/reg unchanged.
         // 2026-10-08 one star-measurement path Plan A Task 3 (R-OSP-1): MEASURE_VERSION 4 replaces the old fit-version constant (3) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
+        // 2026-10-08 one star-measurement path Plan A Task 7 (R-OSP-2): `measurement.seedSource` (matchedFilter) and `seedThreshold` join the measurement subtree (hand edit) - meas moves on every line, and reg, ln and (custom) follow; calib, ln_ref and ln_cal are UNCHANGED.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=976a5d70cc5612bd ln_ref=2676a6e017eebe13 ln=5f2cbe34312ca3c6 ln_cal=f6195d69cd7bbaee",
-                "fastPreview: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=2706ef847c1a810b ln_ref=2676a6e017eebe13 ln=fe6f762d887c933e ln_cal=f6195d69cd7bbaee",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=914ab607908c9b36 reg=800ee8fdd2bacfef ln_ref=1237e3e6fdf2cf1c ln=46fc25da33fffe7e ln_cal=6bb6c12538e4e622",
-                "custom: calib=2b725e5e99c87f49 meas=657bcdd04ab6b2b9 reg=9637c675b85c1985 ln_ref=1237e3e6fdf2cf1c ln=25d1f3545a18d351 ln_cal=6bb6c12538e4e622",
+                "default: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=5304aff46f287eb2 ln_ref=2676a6e017eebe13 ln=c280caa7a7b6c3bd ln_cal=f6195d69cd7bbaee",
+                "fastPreview: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=59572d1effaa50d4 ln_ref=2676a6e017eebe13 ln=a338b80e89bc6061 ln_cal=f6195d69cd7bbaee",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=9c0b40285429d40b ln_ref=1237e3e6fdf2cf1c ln=ed547a4e794451e0 ln_cal=6bb6c12538e4e622",
+                "custom: calib=2b725e5e99c87f49 meas=e1f010e0202a1502 reg=96c5de182db4a56c ln_ref=1237e3e6fdf2cf1c ln=e6e439531f8f82ab ln_cal=6bb6c12538e4e622",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no

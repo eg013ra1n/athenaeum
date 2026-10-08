@@ -2059,7 +2059,13 @@ mod tests {
             .zip(maps.iter())
             .map(|(p, m)| frame(p, m, &weight, &pair))
             .collect();
-        let measure = MeasureOptions::default();
+        // Plan A Task 7 (R-OSP-2): the product default seed source is the matched filter, which seeds nothing on a
+        // plane with no noise estimate by design (`star_measure::seeds::detect`); this fixture's registered output
+        // is noiseless (sigma 0, measured), so the test names the peak detector its readings below were made with.
+        let measure = MeasureOptions {
+            seed_source: crate::stacking::config::SeedSource::Peak,
+            ..MeasureOptions::default()
+        };
         let mut input = base_input(&frames, &measure);
         input.scale = 2;
         input.drop_shrink = drop_shrink;

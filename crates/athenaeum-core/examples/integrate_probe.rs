@@ -56,7 +56,7 @@ use athenaeum_core::stacking::master_cards::{
 };
 use athenaeum_core::stacking::measure::{
     measure_frame_with_seeds, measure_plane, measure_plane_with_seeds, MeasureOptions, NoiseSource,
-    SeedSource, ADU_SCALE,
+    SeedOverride, ADU_SCALE,
 };
 use athenaeum_core::stacking::register::align::{model_name, SeedPolicy, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
@@ -93,7 +93,7 @@ struct Args {
     reg: RegistrationConfig,
     rejection: RejectionChoice,
     maps: bool,
-    seeds: SeedSource,
+    seeds: SeedOverride,
     seeds_report: usize,
     compare: Option<PathBuf>,
     json: Option<PathBuf>,
@@ -114,7 +114,7 @@ fn parse_args() -> Args {
         reg: RegistrationConfig::default(),
         rejection: RejectionChoice::Auto,
         maps: false,
-        seeds: SeedSource::Fast,
+        seeds: SeedOverride::Fast,
         seeds_report: 0,
         compare: None,
         json: None,
@@ -169,8 +169,8 @@ fn parse_args() -> Args {
             }
             "--seeds" => {
                 a.seeds = match value.as_str() {
-                    "fast" => SeedSource::Fast,
-                    "full" => SeedSource::Full,
+                    "fast" => SeedOverride::Fast,
+                    "full" => SeedOverride::Full,
                     _ => usage(),
                 }
             }
@@ -763,7 +763,7 @@ fn main() {
                         h,
                         &measure_opts,
                         Some(&pool),
-                        SeedSource::Fast,
+                        SeedOverride::Fast,
                     )
                     .channel;
                     let full_m = measure_plane_with_seeds(
@@ -772,7 +772,7 @@ fn main() {
                         h,
                         &measure_opts,
                         Some(&pool),
-                        SeedSource::Full,
+                        SeedOverride::Full,
                     )
                     .channel;
                     let fast_within = within_half_px_fraction(&fast_xy, &full_xy);

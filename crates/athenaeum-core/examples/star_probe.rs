@@ -10,8 +10,8 @@
 //!       [--betas 2.5,4,6,10]   (legacy-analysis = the analysis path, `path: "analysis"`; any other name exits 1)
 //!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
 //!       [--diagnostics]   (one `refused` line per seed the measure path did not accept)
-//!       [--seeds matched|peak|structure]   (default matched: the module's matched filter, Plan A Task 6a)
-//!       [--seed-threshold K]   (the matched filter's threshold in σ_f; default `star_measure::DEFAULT_THRESHOLD`)
+//!       [--seeds matched|peak|structure]   (default: the config's `seedSource`, the matched filter without `--config`)
+//!       [--seed-threshold K]   (the matched filter's threshold in σ_f; default: the config's `seedThreshold`)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -49,17 +49,16 @@ use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::geometry::{Linear, LinearKind};
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::resample::{warp_rows, Plane};
-use athenaeum_core::stacking::config::StackingConfig;
+use athenaeum_core::stacking::config::{SeedSource, StackingConfig};
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
-    measure_plane_diagnosed, MeasureOptions, SeedSource, ADU_SCALE,
+    measure_plane_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
-use athenaeum_core::stacking::structure::SeedDetector;
 use athenaeum_core::star_measure::{
-    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts, DEFAULT_THRESHOLD,
+    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts,
 };
 use serde_json::{json, Value};
 
@@ -213,29 +212,30 @@ impl SeedChoice {
         }
     }
 
-    /// The frame line's `seedSource` (ruling F3): the spelling the stacking config gets in Task 7.
-    fn source_name(self) -> &'static str {
+    fn source(self) -> SeedSource {
         match self {
-            SeedChoice::Matched => "matchedFilter",
-            SeedChoice::Peak => "peak",
-            SeedChoice::Structure => "structure",
+            SeedChoice::Matched => SeedSource::MatchedFilter,
+            SeedChoice::Peak => SeedSource::Peak,
+            SeedChoice::Structure => SeedSource::Structure,
         }
     }
 }
 
-/// The adapter options and the seed override the measure path runs with: `peak` forces the peak detector (a
-/// structure config would otherwise turn `Fast` into the structure map), `matched` runs the module's matched filter at
-/// `threshold`.
-fn effective_seeds(mut opts: MeasureOptions, choice: SeedChoice, threshold: f64) -> (MeasureOptions, SeedSource) {
-    let source = match choice {
-        SeedChoice::Matched => SeedSource::MatchedFilter { threshold },
-        SeedChoice::Peak => {
-            opts.seed_detector = SeedDetector::Peak;
-            SeedSource::Fast
-        }
-        SeedChoice::Structure => SeedSource::Structure,
-    };
-    (opts, source)
+/// The adapter options the measure path runs with (Task 7): `--seeds` / `--seed-threshold` override what the config
+/// says (no `--config` = the stacking default, the matched filter at its default threshold), and the override is
+/// always `Fast`, so the options ARE the effective source. Ruling F3: the frame line prints them.
+fn effective_seeds(
+    mut opts: MeasureOptions,
+    choice: Option<SeedChoice>,
+    threshold: Option<f64>,
+) -> (MeasureOptions, SeedOverride) {
+    if let Some(c) = choice {
+        opts.seed_source = c.source();
+    }
+    if let Some(k) = threshold {
+        opts.seed_threshold = k;
+    }
+    (opts, SeedOverride::Fast)
 }
 
 struct MeasureArgs {
@@ -249,8 +249,8 @@ struct MeasureArgs {
     betas: Vec<f64>,
     domain: Domain,
     diagnostics: bool,
-    seeds: SeedChoice,
-    seed_threshold: f64,
+    seeds: Option<SeedChoice>,
+    seed_threshold: Option<f64>,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -266,8 +266,8 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         betas: vec![2.5, 4.0, 6.0, 10.0],
         domain: Domain::Auto,
         diagnostics: false,
-        seeds: SeedChoice::Matched,
-        seed_threshold: DEFAULT_THRESHOLD,
+        seeds: None,
+        seed_threshold: None,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
@@ -302,13 +302,14 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
             }
             "--paths" => a.paths = v().split(',').map(String::from).collect(),
             "--domain" => a.domain = Domain::parse(&v()),
-            "--seeds" => a.seeds = SeedChoice::parse(&v()),
+            "--seeds" => a.seeds = Some(SeedChoice::parse(&v())),
             "--seed-threshold" => {
-                a.seed_threshold = v()
-                    .parse()
-                    .ok()
-                    .filter(|k: &f64| k.is_finite() && *k > 0.0)
-                    .unwrap_or_else(|| die("--seed-threshold: a positive number"))
+                a.seed_threshold = Some(
+                    v().parse()
+                        .ok()
+                        .filter(|k: &f64| k.is_finite() && *k > 0.0)
+                        .unwrap_or_else(|| die("--seed-threshold: a positive number")),
+                )
             }
             "--betas" => {
                 a.betas = v()
@@ -435,8 +436,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     // Ruling F3: the EFFECTIVE seed source and threshold, override included.
     let mut measure_options = serde_json::to_value(opts).unwrap_or_else(|e| die(format!("options: {e}")));
     if let Some(m) = measure_options.as_object_mut() {
-        m.insert("seedSource".into(), json!(a.seeds.source_name()));
-        let k = (a.seeds == SeedChoice::Matched).then_some(a.seed_threshold);
+        m.insert("seedSource".into(), json!(opts.seed_source.as_str()));
+        let k = (opts.seed_source == SeedSource::MatchedFilter).then_some(opts.seed_threshold);
         m.insert("seedThreshold".into(), json!(k));
     }
     let options = json!({ "measure": measure_options,
@@ -759,8 +760,8 @@ mod tests {
             betas: vec![4.0],
             domain: Domain::Auto,
             diagnostics: false,
-            seeds: SeedChoice::Matched,
-            seed_threshold: DEFAULT_THRESHOLD,
+            seeds: None,
+            seed_threshold: None,
         }
     }
 
@@ -910,8 +911,8 @@ mod tests {
         ] {
             let out = d.path().join(format!("{source}.jsonl"));
             let mut a = args(img.clone(), out.clone(), &["measure", "betas", "register"]);
-            a.seeds = choice;
-            a.seed_threshold = 5.5;
+            a.seeds = Some(choice);
+            a.seed_threshold = Some(5.5);
             cmd_measure(a).unwrap();
             let lines = read_lines(&out);
             let frames: Vec<&Value> = lines.iter().filter(|v| v["kind"] == "frame").collect();
@@ -923,9 +924,14 @@ mod tests {
             let m = frames.iter().find(|f| f["path"] == "measure").unwrap();
             assert!(m["fits"].as_u64().unwrap() > 0, "{source}: {m}");
         }
-        let structure = MeasureOptions { seed_detector: SeedDetector::Structure, ..MeasureOptions::default() };
-        let (o, s) = effective_seeds(structure, SeedChoice::Peak, 4.0);
-        assert_eq!((o.seed_detector, s), (SeedDetector::Peak, SeedSource::Fast), "peak is forced over a structure config");
+        // No flags: the config's own source stands; `--seeds` overrides it.
+        let structure = MeasureOptions { seed_source: SeedSource::Structure, ..MeasureOptions::default() };
+        let (o, s) = effective_seeds(structure, None, None);
+        assert_eq!((o.seed_source, s), (SeedSource::Structure, SeedOverride::Fast), "the config's source stands");
+        let (o, _) = effective_seeds(structure, Some(SeedChoice::Peak), None);
+        assert_eq!(o.seed_source, SeedSource::Peak, "peak is forced over a structure config");
+        assert_eq!(MeasureOptions::default().seed_source, SeedSource::MatchedFilter);
+        assert_eq!(MeasureOptions::default().seed_threshold, athenaeum_core::star_measure::seeds::DEFAULT_THRESHOLD);
     }
 
     #[test]

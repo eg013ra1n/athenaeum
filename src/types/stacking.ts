@@ -9,6 +9,8 @@ export type SeedPrefilter = "none" | "median3";
 
 export type SeedDetector = "peak" | "structure";
 
+export type SeedSource = "matchedFilter" | "peak" | "structure";
+
 export type PsfModel = "auto" | "moffat4";
 
 export type WeightMode = "psfSignalWeight" | "psfSnr" | "noise" | "formula" | "exposure" | "keyword" | "none";
@@ -241,7 +243,18 @@ seedPrefilter: SeedPrefilter,
  * size distribution (see `structure::StructureParams::min_structure_size`).
  * Its dials are calibrated constants, not config fields.
  */
-seedDetector: SeedDetector, };
+seedDetector: SeedDetector, 
+/**
+ * The seed source (spec §2.2): the star-measurement module's matched filter (default), the peak threshold
+ * (reads `detectionSigma` and `seedPrefilter`), or the structure map. A document without it is decoded by
+ * [`legacy_seed_source`]; one that carries it uses it as is.
+ */
+seedSource: SeedSource, 
+/**
+ * The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
+ * [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`] by [`resolve_config`].
+ */
+seedThreshold: number, };
 
 export type ReferenceMode = "auto" | "manual";
 

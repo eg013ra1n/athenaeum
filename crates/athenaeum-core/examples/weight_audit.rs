@@ -30,7 +30,7 @@
 //! `cargo run --release -p athenaeum-core --example weight_audit -- \
 //!     [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] [--max-stars <n>] \
 //!     [--min-snr <x>] [--prefilter none|median3] \
-//!     [--seed-detector peak|structure] [--sensitivity <s>] \
+//!     [--seed-detector peak|structure|matched] [--sensitivity <s>] \
 //!     [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…`
 //!
 //! `--sigma` is `MeasureOptions::detection_sigma` — the seed-detection
@@ -39,7 +39,7 @@
 //! become a fit seed; `--prefilter` is `MeasureOptions::seed_prefilter`,
 //! what the seed DETECTION runs on (the fits and every other estimator
 //! always see the untouched plane). `--seed-detector` is
-//! `MeasureOptions::seed_detector` — WHICH detector finds the seeds (M4c
+//! `MeasureOptions::seed_source` — WHICH detector finds the seeds (M4c
 //! Task 0) — and `--sensitivity` is the structure detector's own
 //! `StructureParams::sensitivity`, ignored by the peak detector. All
 //! default to the production values.
@@ -47,11 +47,11 @@
 //! `--seed full` still wins over `--seed-detector`: it names a detector
 //! outright, while `--seed-detector` steers the production (`fast`) path.
 use athenaeum_core::stacking::measure::{
-    measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
+    measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedOverride,
 };
 use athenaeum_core::stacking::prefilter::SeedPrefilter;
 use athenaeum_core::stacking::psf_signal::PsfModel;
-use athenaeum_core::stacking::structure::SeedDetector;
+use athenaeum_core::stacking::config::SeedSource;
 use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
@@ -102,13 +102,13 @@ fn read_planes(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
 }
 
 struct Args {
-    seed: SeedSource,
+    seed: SeedOverride,
     sigma: Option<f32>,
     psf: PsfModel,
     max_stars: Option<usize>,
     min_snr: Option<f32>,
     prefilter: Option<SeedPrefilter>,
-    seed_detector: Option<SeedDetector>,
+    seed_detector: Option<SeedSource>,
     sensitivity: Option<f64>,
     out: Option<String>,
     truncate: bool,
@@ -118,7 +118,7 @@ struct Args {
 
 const USAGE: &str = "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
 [--max-stars <n>] [--min-snr <x>] [--prefilter none|median3] \
-[--seed-detector peak|structure] [--sensitivity <s>] [--out <file.jsonl>] \
+[--seed-detector peak|structure|matched] [--sensitivity <s>] [--out <file.jsonl>] \
 [--truncate] [--dump-planes <file.bin>] <file>…";
 
 /// Prints `usage:` context plus `msg` and exits 2 — used for every
@@ -131,7 +131,7 @@ fn bad_arg(msg: &str) -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut seed = SeedSource::Fast;
+    let mut seed = SeedOverride::Fast;
     let mut sigma = None;
     let mut psf = PsfModel::Auto;
     let mut max_stars = None;
@@ -152,8 +152,8 @@ fn parse_args() -> Args {
                     .next()
                     .unwrap_or_else(|| bad_arg("--seed needs a value (fast|full)"));
                 seed = match v.as_str() {
-                    "full" => SeedSource::Full,
-                    "fast" => SeedSource::Fast,
+                    "full" => SeedOverride::Full,
+                    "fast" => SeedOverride::Fast,
                     other => bad_arg(&format!("unknown --seed value '{other}' (want fast|full)")),
                 };
             }
@@ -209,12 +209,13 @@ fn parse_args() -> Args {
             "--seed-detector" => {
                 let v = it
                     .next()
-                    .unwrap_or_else(|| bad_arg("--seed-detector needs a value (peak|structure)"));
+                    .unwrap_or_else(|| bad_arg("--seed-detector needs a value (peak|structure|matched)"));
                 seed_detector = Some(match v.as_str() {
-                    "peak" => SeedDetector::Peak,
-                    "structure" => SeedDetector::Structure,
+                    "peak" => SeedSource::Peak,
+                    "structure" => SeedSource::Structure,
+                    "matched" => SeedSource::MatchedFilter,
                     other => bad_arg(&format!(
-                        "unknown --seed-detector value '{other}' (want peak|structure)"
+                        "unknown --seed-detector value '{other}' (want peak|structure|matched)"
                     )),
                 });
             }
@@ -289,7 +290,7 @@ fn main() {
         opts.seed_prefilter = prefilter;
     }
     if let Some(detector) = args.seed_detector {
-        opts.seed_detector = detector;
+        opts.seed_source = detector;
     }
     if let Some(sensitivity) = args.sensitivity {
         opts.structure.sensitivity = sensitivity;
@@ -302,7 +303,7 @@ seed_detector {:?} sensitivity {}",
         opts.max_stars,
         opts.psf_model,
         opts.seed_prefilter,
-        opts.seed_detector,
+        opts.seed_source,
         opts.structure.sensitivity
     );
 

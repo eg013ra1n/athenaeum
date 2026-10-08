@@ -381,6 +381,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::resample::Interpolation,
             crate::stacking::prefilter::SeedPrefilter,
             crate::stacking::structure::SeedDetector,
+            crate::stacking::config::SeedSource,
             crate::stacking::psf_signal::PsfModel,
             crate::stacking::weights::WeightMode,
             crate::stacking::weights::FormulaWeights,

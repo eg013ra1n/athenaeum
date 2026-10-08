@@ -168,6 +168,9 @@ pub struct PlaneMeasurement {
     pub sky: SkyLevel,
     /// Seeds handed to the fitter.
     pub seeds: usize,
+    /// The seeds the module's own matched filter found ([`SeedSpec::MatchedFilter`]); empty for given seeds, which
+    /// the caller already holds (Task 7: the stacking adapter returns them to the lab's probe).
+    pub detected: Vec<Seed>,
     /// The field width the fit started from (Task 6a; the width-start boxes read it from Task 6b): the caller's
     /// [`MeasureOptions::field_width`] when given, else the matched filter's own ([`SeedSpec::MatchedFilter`]), or
     /// [`seeds::field_width_of`] the given seeds (`from_stars = 0` with the first pass's 3 px when no star read).
@@ -284,6 +287,7 @@ pub fn measure_plane(
         noise,
         sky,
         seeds: seeds.len(),
+        detected: detected.unwrap_or_default(),
         field_width,
         refused: outcome.refused,
         diagnostics,
@@ -332,7 +336,7 @@ mod tests {
     fn module_measure_equals_the_adapter_bit_for_bit() {
         use crate::stacking::measure::{
             measure_plane_detailed, measure_plane_with_seeds, MeasureOptions as AdapterOptions,
-            SeedSource,
+            SeedOverride,
         };
         let (data, w, h) = fixture_field(2026_09_19, 1.0, 0.002); // 150 Gaussian stars, σ 1.8 px, bg 0.08, noise 0.002
         let adapter = measure_plane_with_seeds(
@@ -341,7 +345,7 @@ mod tests {
             h,
             &AdapterOptions::default(),
             None,
-            SeedSource::Fast,
+            SeedOverride::Fast,
         );
         let (pm, seeds) = measure_plane_detailed(
             &data,
@@ -349,7 +353,7 @@ mod tests {
             h,
             &AdapterOptions::default(),
             None,
-            SeedSource::Fast,
+            SeedOverride::Fast,
         );
         let opts = MeasureOptions {
             seeds: SeedSpec::Given(seeds),
@@ -801,7 +805,7 @@ mod tests {
     }
 
     /// Plan A Task 6b (Task 6a review M3, controller ruling): the adapter's matched-filter arm hands the detector's own
-    /// field width to the fit with its seeds, so the probe's measure path (`SeedSource::MatchedFilter`, the seeds
+    /// field width to the fit with its seeds, so the probe's measure path (`SeedOverride::MatchedFilter`, the seeds
     /// handed to the module as `Given`) and the module's own `SeedSpec::MatchedFilter` start every star from the same
     /// width and fit the same stars; `field_width_of` serves only seeds another detector found.
     ///
@@ -814,7 +818,7 @@ mod tests {
     #[test]
     fn adapter_matched_filter_seeds_fit_exactly_as_the_module_matched_filter() {
         use crate::stacking::measure::{
-            measure_plane_diagnosed, MeasureOptions as AdapterOptions, SeedSource,
+            measure_plane_diagnosed, MeasureOptions as AdapterOptions, SeedOverride,
         };
         use crate::test_support::{add_noise, moffat_field, MoffatStar};
         let (w, h) = (640usize, 480usize);
@@ -840,7 +844,7 @@ mod tests {
             h,
             &AdapterOptions::default(),
             None,
-            SeedSource::MatchedFilter {
+            SeedOverride::MatchedFilter {
                 threshold: DEFAULT_THRESHOLD,
             },
             false,

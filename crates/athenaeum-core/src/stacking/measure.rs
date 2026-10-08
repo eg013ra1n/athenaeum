@@ -16,7 +16,8 @@ use tracing::{debug, warn};
 
 use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed, StarFit};
-use super::structure::{self, SeedDetector, StructureParams};
+use super::structure::{self, StructureParams};
+use crate::stacking::config::SeedSource;
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{LocationScale, ScaleEstimator};
 use crate::integration::IntegrationError;
@@ -62,12 +63,15 @@ pub struct MeasureOptions {
     /// inverted against the external reference (M4a Task 2, ruling
     /// R-M4a-1).
     pub detection_sigma: f32,
-    /// WHICH detector finds the seeds (spec §9.2 `measurement.seedDetector`,
-    /// ruling R-M4c-11). `Peak` reads `detection_sigma` and
-    /// `seed_prefilter`; `Structure` reads `structure` instead — the two
-    /// detectors share no dial.
-    pub seed_detector: SeedDetector,
-    /// The structure detector's own dials, used only when `seed_detector`
+    /// WHICH detector finds the seeds (spec §2.2 `measurement.seedSource`,
+    /// rulings R-OSP-2 and R-M4c-11). `MatchedFilter` reads `seed_threshold`;
+    /// `Peak` reads `detection_sigma` and `seed_prefilter`; `Structure` reads
+    /// `structure` instead — the detectors share no dial.
+    pub seed_source: SeedSource,
+    /// The matched filter's threshold in units of the filtered plane's noise
+    /// (ruling R-OSP-2), read when `seed_source` is `MatchedFilter`.
+    pub seed_threshold: f64,
+    /// The structure detector's own dials, used only when `seed_source`
     /// is `Structure`. Not a `StackingConfig` field: a run selects the
     /// detector, never its internals (M4c Task 0 calibrated them once).
     pub structure: StructureParams,
@@ -82,7 +86,8 @@ impl Default for MeasureOptions {
             min_snr: 5.0,
             seed_prefilter: DEFAULT_SEED_PREFILTER,
             detection_sigma: DEFAULT_DETECTION_SIGMA,
-            seed_detector: DEFAULT_SEED_DETECTOR,
+            seed_source: SeedSource::MatchedFilter,
+            seed_threshold: sm::seeds::DEFAULT_THRESHOLD,
             structure: StructureParams::default(),
         }
     }
@@ -113,15 +118,6 @@ pub const DEFAULT_DETECTION_SIGMA: f32 = 20.0;
 /// Default for [`MeasureOptions::seed_prefilter`] and
 /// [`crate::stacking::config::MeasurementConfig::seed_prefilter`].
 pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
-
-/// Default for [`MeasureOptions::seed_detector`] and
-/// [`crate::stacking::config::MeasurementConfig::seed_detector`].
-///
-/// M4c Task 0 (ruling R-M4c-11) calibrated the structure detector against
-/// the same external per-frame log M4a's peak threshold was calibrated on,
-/// on the same 368 real frames; that task's report carries the grid and
-/// the verdict this constant is.
-pub const DEFAULT_SEED_DETECTOR: SeedDetector = SeedDetector::Peak;
 
 /// Per-phase wall time of one plane's measurement (perf tier 1 Task 0).
 /// Skipped by serde: the cached `metrics` artifact payload must not change
@@ -243,7 +239,7 @@ pub struct PlaneMeasurement {
     pub channel: ChannelMeasurement,
     pub fits: Vec<StarFit>,
     /// The field width the module's fit started from (Plan A Task 6b): the matched
-    /// filter's own for [`SeedSource::MatchedFilter`], else `field_width_of` the
+    /// filter's own for [`SeedOverride::MatchedFilter`], else `field_width_of` the
     /// seeds. Reported, not persisted.
     pub field_width: sm::FieldWidth,
     /// The plane is defocused (owner ruling 2026-10-08): `fits` is empty and the zero-star path below takes it.
@@ -253,28 +249,27 @@ pub struct PlaneMeasurement {
     pub defocus_donuts: usize,
 }
 
-/// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
-/// Checkpoint B probe's `--seeds full` cross-checks against the slower,
-/// two-pass detector to see whether the choice moves the measurement).
-/// `PartialEq` only since Plan A Task 6a: `MatchedFilter` carries an `f64`.
+/// A probe-level override of the seed detector (ruling F26). A run never passes one: it selects its detector
+/// through the config's [`SeedSource`] (`MeasureOptions::seed_source`), and `Fast` means exactly that. The other
+/// variants force one detector whatever the options say (the dev harnesses' `--seeds`). `PartialEq` only since Plan A
+/// Task 6a: `MatchedFilter` carries an `f64`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SeedSource {
-    /// `ImageAnalyzer::detect_fast_data` — the single-pass detector
-    /// `measure_plane` has used since Plan 2.
+pub enum SeedOverride {
+    /// Whatever `MeasureOptions::seed_source` says: the matched filter at `seed_threshold`, the peak detector
+    /// (`ImageAnalyzer::detect_fast_data` at `detection_sigma` and `seed_prefilter`) or the structure map.
     Fast,
     /// `ImageAnalyzer::analyze_data` — the full two-pass detect+measure
     /// pipeline; its per-star metrics become the seeds instead.
     Full,
     /// [`crate::stacking::structure::detect_structures`] — the structure-map
     /// detector (M4c Task 0). `Fast` resolves to this whenever
-    /// [`MeasureOptions::seed_detector`] says so, so a caller only passes it
-    /// explicitly to override a config that says `Peak`.
+    /// [`MeasureOptions::seed_source`] says so, so a caller only passes it
+    /// explicitly to override a config that says otherwise.
     Structure,
     /// The star-measurement module's two-pass matched filter at the field
     /// width ([`crate::star_measure::seeds::detect`], Plan A Task 6a), its
-    /// `threshold` in units of the filtered plane's measured noise. A probe
-    /// override only: the config's default stays `Fast` (Peak) until Task 7,
-    /// which also renames this enum `SeedOverride` (ruling F26).
+    /// `threshold` in units of the filtered plane's measured noise, whatever
+    /// the options say.
     MatchedFilter { threshold: f64 },
 }
 
@@ -291,7 +286,7 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> ChannelMeasurement {
-    measure_plane_with_seeds(data, w, h, opts, pool, SeedSource::Fast).channel
+    measure_plane_with_seeds(data, w, h, opts, pool, SeedOverride::Fast).channel
 }
 
 /// As `measure_plane`, but the seeds handed to the PSF fitter come from the
@@ -304,7 +299,7 @@ pub fn measure_plane_with_seeds(
     h: usize,
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
-    seed_source: SeedSource,
+    seed_source: SeedOverride,
 ) -> PlaneMeasurement {
     measure_plane_detailed(data, w, h, opts, pool, seed_source).0
 }
@@ -318,7 +313,7 @@ pub fn measure_plane_detailed(
     h: usize,
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
-    seed_source: SeedSource,
+    seed_source: SeedOverride,
 ) -> (PlaneMeasurement, Vec<Seed>) {
     let (pm, seeds, _) = measure_plane_diagnosed(data, w, h, opts, pool, seed_source, false);
     (pm, seeds)
@@ -335,18 +330,37 @@ pub fn measure_plane_diagnosed(
     h: usize,
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
-    seed_source: SeedSource,
+    seed_source: SeedOverride,
     diagnostics: bool,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
-    let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
-
-    // A run selects its detector through the config; `seed_source` is the
-    // probe-level override the dev harnesses pass. `Fast` means "whatever
-    // the options say", so the two never contradict each other silently.
-    let seed_source = match (seed_source, opts.seed_detector) {
-        (SeedSource::Fast, SeedDetector::Structure) => SeedSource::Structure,
-        (s, _) => s,
+    // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
+    // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
+    // silently.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Detector {
+        Peak,
+        Full,
+        Structure,
+        Matched(f64),
+    }
+    let detector = match seed_source {
+        SeedOverride::Fast => match opts.seed_source {
+            SeedSource::MatchedFilter => Detector::Matched(opts.seed_threshold),
+            SeedSource::Peak => Detector::Peak,
+            SeedSource::Structure => Detector::Structure,
+        },
+        SeedOverride::Full => Detector::Full,
+        SeedOverride::Structure => Detector::Structure,
+        SeedOverride::MatchedFilter { threshold } => Detector::Matched(threshold),
     };
+
+    // The ADU-scaled copy exists only for the detectors that read it (Task 7, C5). The matched filter runs inside
+    // the module on the module's own working copy, the only one on that path.
+    let scaled: Option<Vec<f32>> = match detector {
+        Detector::Matched(_) => None,
+        _ => Some(data.iter().map(|v| v * ADU_SCALE).collect()),
+    };
+    let scaled_ref: &[f32] = scaled.as_deref().unwrap_or(&[]);
 
     // The pre-filtered peak detection needs the noise σ BEFORE it runs, and
     // from the UNFILTERED plane: a pre-filtered detection copy has its own,
@@ -357,24 +371,20 @@ pub fn measure_plane_diagnosed(
     // to the module, which then does not measure it again (I-1); every
     // other arm lets the module measure it. Either way the two run exactly
     // once, background first, and give the reported `noise`/`m_star`/
-    // `n_star` (Plan A Task 2). The matched filter (Plan A Task 6a) needs
-    // the same σ before it runs: its threshold is noise-relative, and a
-    // plane with no noise estimate seeds nothing.
+    // `n_star` (Plan A Task 2).
     let precomputed: Option<(sm::NoiseModel, sm::PhaseTimings)> =
-        match (seed_source, opts.seed_prefilter) {
-            (SeedSource::Fast, SeedPrefilter::Median3) => Some(sm::noise_model(&scaled, w, h, pool)),
-            (SeedSource::MatchedFilter { .. }, _) => Some(sm::noise_model(&scaled, w, h, pool)),
+        match (detector, opts.seed_prefilter) {
+            (Detector::Peak, SeedPrefilter::Median3) => {
+                Some(sm::noise_model(scaled_ref, w, h, pool))
+            }
             _ => None,
         };
 
     let t = Instant::now();
-    // The matched filter's own field width rides with its seeds (Plan A Task 6b,
-    // Task 6a review M3), so the fit starts every star from the width
-    // `SeedSpec::MatchedFilter` would give it; the other detectors' seeds get
-    // the module's `field_width_of`.
-    let mut detector_width: Option<sm::FieldWidth> = None;
-    let seeds: Vec<Seed> = match seed_source {
-        SeedSource::Fast => {
+    // The matched filter runs inside the module (its own working copy, its own field width); the other detectors'
+    // seeds are handed in and get the module's `field_width_of`.
+    let seeds: Vec<Seed> = match detector {
+        Detector::Peak => {
             // Detection may run on a pre-filtered copy; EVERYTHING after it
             // (the fits below, `background_residual`, `noise_mrs`, the
             // sample statistics) stays on the untouched plane.
@@ -386,11 +396,11 @@ pub fn measure_plane_diagnosed(
                 // three siblings (`background_residual`, `noise_mrs`,
                 // `fit_stars`) above/below.
                 SeedPrefilter::Median3 => Some(match pool {
-                    Some(p) => p.install(|| prefilter::median3(&scaled, w, h)),
-                    None => prefilter::median3(&scaled, w, h),
+                    Some(p) => p.install(|| prefilter::median3(scaled_ref, w, h)),
+                    None => prefilter::median3(scaled_ref, w, h),
                 }),
             };
-            let detect_data: &[f32] = detect_on.as_deref().unwrap_or(&scaled);
+            let detect_data: &[f32] = detect_on.as_deref().unwrap_or(scaled_ref);
             // Noise-relative levels, not the detector's default rank budget:
             // the seed population has to be set by how far above THIS
             // frame's sky a star stands, not by a bright-pixel count that a
@@ -450,7 +460,7 @@ pub fn measure_plane_diagnosed(
                 }
             }
         }
-        SeedSource::Full => {
+        Detector::Full => {
             // `measure_cap` defaults to 500 and truncates AFTER measurement
             // (unlike `with_max_stars`, which caps detection) — left at the
             // default, the full path only ever measures the 500 brightest
@@ -463,7 +473,7 @@ pub fn measure_plane_diagnosed(
             if let Some(p) = pool {
                 analyzer = analyzer.with_thread_pool(Arc::clone(p));
             }
-            match analyzer.analyze_data(&scaled, w, h, 1) {
+            match analyzer.analyze_data(scaled_ref, w, h, 1) {
                 Ok(r) => r
                     .stars
                     .iter()
@@ -481,7 +491,7 @@ pub fn measure_plane_diagnosed(
                 }
             }
         }
-        SeedSource::Structure => {
+        Detector::Structure => {
             // The map is built from the same ADU-scaled copy everything
             // else measures, so the saturation limit — a `[0, 1]` fraction
             // in the config — is scaled with it. The detector carries the
@@ -495,35 +505,17 @@ pub fn measure_plane_diagnosed(
                 ..opts.structure
             };
             let mut seeds = match pool {
-                Some(pl) => pl.install(|| structure::detect_structures(&scaled, w, h, &p)),
-                None => structure::detect_structures(&scaled, w, h, &p),
+                Some(pl) => pl.install(|| structure::detect_structures(scaled_ref, w, h, &p)),
+                None => structure::detect_structures(scaled_ref, w, h, &p),
             };
             // Brightest first already, so the cap keeps the brightest.
             seeds.truncate(opts.max_stars.max(8));
             seeds
         }
-        SeedSource::MatchedFilter { threshold } => {
-            // The module's own detector on the same ADU-scaled bytes the
-            // module fits, with the noise model computed above (the module
-            // is then handed it and does not measure it again). Sorted by
-            // the filter's flux, capped at `max_stars`.
-            match precomputed.as_ref() {
-                Some((noise, _)) => {
-                    let (found, width) =
-                        sm::seeds::detect(&scaled, w, h, noise, threshold, opts.max_stars, None, pool);
-                    detector_width = Some(width);
-                    found
-                }
-                None => {
-                    // Unreachable: the match above computes it for this arm.
-                    warn!("matched-filter seeds without a noise model; the plane measures as starless");
-                    Vec::new()
-                }
-            }
-        }
+        // The module detects at the head of its own call (below).
+        Detector::Matched(_) => Vec::new(),
     };
-    let detect_ms = t.elapsed().as_millis() as u64;
-    let stars_detected = seeds.len();
+    let adapter_detect_ms = t.elapsed().as_millis() as u64;
     // The detectors were this copy's only reader; the module makes its own
     // working-unit copy of `data` (the same `v * ADU_SCALE` bytes), so the
     // plane is never held twice.
@@ -539,19 +531,28 @@ pub fn measure_plane_diagnosed(
         },
         psf_model: opts.psf_model,
         max_stars: opts.max_stars,
-        seeds: sm::SeedSpec::Given(seeds),
+        seeds: match detector {
+            Detector::Matched(threshold) => sm::SeedSpec::MatchedFilter { threshold },
+            _ => sm::SeedSpec::Given(seeds),
+        },
         fit: FitParams::default(),
         noise,
         scale_estimator: opts.scale_estimator,
         diagnostics,
         mask: None,
-        field_width: detector_width,
+        field_width: None,
     };
     let m = sm::measure_plane(data, w, h, &module_opts, pool);
     let seeds = match module_opts.seeds {
         sm::SeedSpec::Given(seeds) => seeds,
-        // The adapter always detects itself and hands the seeds in.
-        sm::SeedSpec::None | sm::SeedSpec::MatchedFilter { .. } => Vec::new(),
+        // The matched filter ran inside the module; it hands its seeds back.
+        sm::SeedSpec::MatchedFilter { .. } => m.detected,
+        sm::SeedSpec::None => Vec::new(),
+    };
+    let stars_detected = m.seeds;
+    let detect_ms = match detector {
+        Detector::Matched(_) => m.timings.detect_ms,
+        _ => adapter_detect_ms,
     };
     // The background/noise phases are whoever measured them: the Median3
     // arm above, else the module.
@@ -625,7 +626,7 @@ pub fn measure_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<FrameMeasurement, IntegrationError> {
-    measure_frame_with_seeds(path, opts, pool, cancel, SeedSource::Fast)
+    measure_frame_with_seeds(path, opts, pool, cancel, SeedOverride::Fast)
 }
 
 /// As `measure_frame`, but every plane is seeded via `measure_plane_with_seeds`.
@@ -634,7 +635,7 @@ pub fn measure_frame_with_seeds(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
-    seed_source: SeedSource,
+    seed_source: SeedOverride,
 ) -> Result<FrameMeasurement, IntegrationError> {
     measure_frame_inner(path, opts, pool, cancel, seed_source).map(|(m, _)| m)
 }
@@ -652,7 +653,7 @@ pub fn measure_frame_with_fits(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<(FrameMeasurement, Vec<Vec<StarFit>>), IntegrationError> {
-    measure_frame_inner(path, opts, pool, cancel, SeedSource::Fast)
+    measure_frame_inner(path, opts, pool, cancel, SeedOverride::Fast)
 }
 
 fn measure_frame_inner(
@@ -660,7 +661,7 @@ fn measure_frame_inner(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
-    seed_source: SeedSource,
+    seed_source: SeedOverride,
 ) -> Result<(FrameMeasurement, Vec<Vec<StarFit>>), IntegrationError> {
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
@@ -703,7 +704,7 @@ fn measure_frame_inner(
             psf_snr = m.psf_snr,
             detection_sigma = opts.detection_sigma,
             seed_prefilter = opts.seed_prefilter.as_str(),
-            seed_detector = opts.seed_detector.as_str(),
+            seed_detector = opts.seed_source.as_str(),
             read_ms = m.timings.read_ms,
             background_ms = m.timings.background_ms,
             noise_ms = m.timings.noise_ms,
@@ -764,8 +765,8 @@ pub(crate) mod tests {
     fn measure_plane_detailed_returns_the_seeds_it_fitted_and_the_same_measurement() {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
-        let plain = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
-        let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedSource::Fast);
+        let plain = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast);
+        let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedOverride::Fast);
         assert_eq!(seeds.len(), detailed.channel.stars_detected);
         assert!(!seeds.is_empty());
         for f in &detailed.fits {
@@ -847,7 +848,7 @@ pub(crate) mod tests {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
         let a = measure_plane(&data, w, h, &opts, None);
-        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel;
+        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast).channel;
         let stars_fitted = a.stars_fitted;
         assert_eq!(without_timings(a), without_timings(b));
         assert!(stars_fitted > 0, "fixture should fit stars: {stars_fitted}");
@@ -978,7 +979,7 @@ pub(crate) mod tests {
     fn measure_plane_and_frame_expose_the_accepted_fits() {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
-        let pm = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        let pm = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast);
         assert_eq!(pm.fits.len(), pm.channel.stars_fitted);
         assert!(!pm.fits.is_empty(), "fixture should fit stars");
 
@@ -1056,6 +1057,7 @@ pub(crate) mod tests {
             w,
             h,
             &MeasureOptions {
+                seed_source: SeedSource::Peak,
                 detection_sigma: 5.0,
                 ..MeasureOptions::default()
             },
@@ -1066,6 +1068,7 @@ pub(crate) mod tests {
             w,
             h,
             &MeasureOptions {
+                seed_source: SeedSource::Peak,
                 detection_sigma: HIGH_SIGMA,
                 ..MeasureOptions::default()
             },
@@ -1121,7 +1124,12 @@ pub(crate) mod tests {
     #[test]
     fn the_shipped_none_path_measures_exactly_these_numbers() {
         let (data, w, h) = field(7, 1.0, 0.002);
-        let opts = MeasureOptions::default();
+        // Task 7 (R-OSP-2): the product default is the matched filter now (its numbers are pinned in
+        // `the_matched_filter_default_measures_exactly_these_numbers`); these literals are the PEAK detector's, kept.
+        let opts = MeasureOptions {
+            seed_source: SeedSource::Peak,
+            ..MeasureOptions::default()
+        };
         assert_eq!(opts.seed_prefilter, SeedPrefilter::None);
         let c = measure_plane(&data, w, h, &opts, None);
         assert_eq!(
@@ -1150,7 +1158,7 @@ pub(crate) mod tests {
         assert_eq!(
             without_timings(c),
             without_timings(
-                measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel
+                measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast).channel
             )
         );
     }
@@ -1164,12 +1172,23 @@ pub(crate) mod tests {
     #[test]
     fn the_median_prefilter_keeps_a_well_sampled_population() {
         let (data, w, h) = field(7, 1.0, 0.002);
-        let plain = measure_plane(&data, w, h, &MeasureOptions::default(), None);
+        // The pre-filter is the peak detector's dial (Task 7): both arms run it explicitly.
+        let plain = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seed_source: SeedSource::Peak,
+                ..MeasureOptions::default()
+            },
+            None,
+        );
         let filtered = measure_plane(
             &data,
             w,
             h,
             &MeasureOptions {
+                seed_source: SeedSource::Peak,
                 seed_prefilter: SeedPrefilter::Median3,
                 ..MeasureOptions::default()
             },
@@ -1209,9 +1228,12 @@ pub(crate) mod tests {
     #[test]
     fn the_structure_detector_seeds_a_measurement() {
         let (data, w, h) = field(7, 1.0, 0.002);
-        let peak = MeasureOptions::default();
+        let peak = MeasureOptions {
+            seed_source: SeedSource::Peak,
+            ..MeasureOptions::default()
+        };
         let structure = MeasureOptions {
-            seed_detector: SeedDetector::Structure,
+            seed_source: SeedSource::Structure,
             ..MeasureOptions::default()
         };
         let a = measure_plane(&data, w, h, &peak, None);
@@ -1236,23 +1258,23 @@ pub(crate) mod tests {
         assert_eq!((b.m_star, b.n_star), (a.m_star, a.n_star));
         assert_eq!((b.median, b.mad, b.location), (a.median, a.mad, a.location));
         assert!(b.psf_signal_weight > 0.0 && b.psf_snr > 0.0);
-        // The config selects the detector; `SeedSource::Fast` follows it,
+        // The config selects the detector; `SeedOverride::Fast` follows it,
         // and naming the source explicitly is the same measurement. Timings
         // are wall-clock, not measurement output, so they're zeroed before
         // the comparison (perf tier 1 Task 0).
         assert_eq!(
             without_timings(b),
             without_timings(
-                measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Structure).channel
+                measure_plane_with_seeds(&data, w, h, &peak, None, SeedOverride::Structure).channel
             )
         );
         // ... while an explicit `Full` still wins over the config.
         assert_eq!(
             without_timings(
-                measure_plane_with_seeds(&data, w, h, &structure, None, SeedSource::Full).channel
+                measure_plane_with_seeds(&data, w, h, &structure, None, SeedOverride::Full).channel
             ),
             without_timings(
-                measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Full).channel
+                measure_plane_with_seeds(&data, w, h, &peak, None, SeedOverride::Full).channel
             )
         );
     }
@@ -1273,9 +1295,10 @@ pub(crate) mod tests {
         assert_eq!(d.seed_prefilter, DEFAULT_SEED_PREFILTER);
         assert!(json.contains("\"seedPrefilter\":\"none\""));
         // M4c Task 0 (ruling R-M4c-11): which detector, and its own dials.
-        assert_eq!(d.seed_detector, DEFAULT_SEED_DETECTOR);
-        assert_eq!(d.seed_detector, SeedDetector::Peak);
-        assert!(json.contains("\"seedDetector\":\"peak\""));
+        // Task 7 (R-OSP-2): the default source is the module's matched filter.
+        assert_eq!(d.seed_source, SeedSource::MatchedFilter);
+        assert_eq!(d.seed_threshold, sm::seeds::DEFAULT_THRESHOLD);
+        assert!(json.contains("\"seedSource\":\"matchedFilter\""));
         assert_eq!(d.structure, StructureParams::default());
         assert_eq!(
             serde_json::from_str::<MeasureOptions>("{}").unwrap(),
@@ -1351,9 +1374,13 @@ pub(crate) mod tests {
     #[test]
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
-        let opts = MeasureOptions::default();
+        // Task 7 (R-OSP-2): the PEAK detector's pin, kept as it was; the matched-filter default is pinned beside it.
+        let opts = MeasureOptions {
+            seed_source: SeedSource::Peak,
+            ..MeasureOptions::default()
+        };
         let mut m = without_timings(
-            measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel,
+            measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast).channel,
         );
         // The two shape aggregates over the 150 Moffat fits round differently
         // per platform's libm since Tier C C3 (the first CI run after it read
@@ -1397,6 +1424,51 @@ snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
 scale: 0.0020880382508039474, psf_signal_weight: 0.001472612103695384, \
 psf_snr: 0.0021686705358941864, timings: MeasureTimings { read_ms: 0, \
+background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
+        );
+    }
+
+    /// Task 7 (R-OSP-2, ruling F14): the shipped default is the module's matched filter. The Peak literals of
+    /// `the_shipped_none_path_measures_exactly_these_numbers` were psf_signal_weight 1.390_901_839_370_229e-3 and
+    /// fwhm_px 4.129_401_659_376_219 on this fixture; the counts and β did not move.
+    #[test]
+    fn the_matched_filter_default_measures_exactly_these_numbers() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let c = measure_plane(&data, w, h, &MeasureOptions::default(), None);
+        assert_eq!((c.stars_detected, c.stars_fitted), (150, 150));
+        assert_eq!(c.beta, 10.0);
+        assert_eq!(c.psf_signal_weight, 1.391_065_217_128_910_3e-3);
+        assert_ulp_close(c.fwhm_px, 4.129_369_725_278_327, "fwhm_px");
+    }
+
+    /// Task 7 (ruling F14): the full-record pin on the matched-filter default; the Peak record is
+    /// `measure_plane_with_seeds_pinned_before_task_3b_rewrite` (its fwhm_px 4.130_443_961_173_142, eccentricity
+    /// 0.113_127_912_625_514_87, psf_signal_weight 0.001_472_612_103_695_384, psf_snr 0.002_168_670_535_894_186_4).
+    #[test]
+    fn measure_plane_with_seeds_matched_filter_default_record() {
+        let (data, w, h) = field(2026_09_19, 1.0, 0.002);
+        let mut m = without_timings(
+            measure_plane_with_seeds(&data, w, h, &MeasureOptions::default(), None, SeedOverride::Fast).channel,
+        );
+        // The two shape aggregates are pinned to a few ulp and snapped, as in the Peak record.
+        assert_ulp_close(m.fwhm_px, 4.130_362_798_202_614, "fwhm_px");
+        assert_ulp_close(m.eccentricity, 0.111_119_809_985_610_2, "eccentricity");
+        m.fwhm_px = 4.130_362_798_202_614;
+        m.eccentricity = 0.111_119_809_985_610_2;
+        assert_eq!(
+            format!("{m:?}"),
+            "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
+stars_refused: 0, refused_by_reason: {}, \
+beta: 10.0, fwhm_px: 4.130362798202614, eccentricity: 0.1111198099856102, \
+tflux: 571.0623650541556, tmean_flux: 11.813897354284132, \
+mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
+n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
+noise_source: Mrs, median: 0.08010764420032501, \
+mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
+snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
+noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0014727345373840676, \
+psf_snr: 0.0021687588170541364, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }
