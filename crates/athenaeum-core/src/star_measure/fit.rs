@@ -2658,6 +2658,10 @@ mod tests {
         (data, w, h)
     }
 
+    /// A pin, not RED (ruling F28): round 1's box-moment centre also refuses this donut at the field's own width (its
+    /// 33-px box covers the annulus); the pin guards R7's window, which a window of `F_start/2` (round 2's first ruling)
+    /// fails — the centre stays on the annulus, core/ring 2.48 (`star-lab-a/t06b-f1/diag`).
+    ///
     /// R7 (round 3): a Peak seed sits on the annulus, not at its centre; the local centre's window (radius
     /// `max(1.5, F_start)`) covers the object, so the iterated centroid walks to the hole and the donut is refused. The
     /// field width is the donut field's own (the lab's `donut/r6` matched filter reads ≈ 8 px, the truth check's
