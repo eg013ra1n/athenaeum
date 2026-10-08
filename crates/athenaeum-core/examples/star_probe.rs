@@ -803,8 +803,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = args(d.path().join("p.fits"), d.path().join("p.jsonl"), &["measure"]);
         a.diagnostics = true;
-        // The NaN border alone refuses no seed (the detector seeds nothing there), so one more star sits 8 px from the
-        // unmasked right edge: it is seeded, and its nominal stamp (8 px) leaves the image (outsideImage).
+        // The NaN border alone refuses no seed (the detector seeds nothing there), so one more star sits 7 px from the
+        // unmasked right edge: it is seeded, and its width-start box (radius ⌈2·F_field⌉ = 8 px for the field's FWHM
+        // ≈ 3.7; the nominal stamp before Plan A Task 6b) leaves the image (outsideImage).
         let mut data = gaussian_field(240, 240, 6, true);
         for y in 0..240 {
             for x in 0..240 {

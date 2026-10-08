@@ -218,10 +218,10 @@ const XY_STRETCH: f64 = 1.5;
 /// Seeds from the structure map, brightest (largest flux) first.
 ///
 /// `plane` is `w × h` row-major in the caller's own units; `peak` and `flux`
-/// come back background-subtracted (`initial_sigma` in
-/// [`super::psf_signal::fit_stars`] reads them as a star's amplitude and
-/// total signal, so a sky pedestal in either would corrupt the fitter's
-/// starting width).
+/// come back background-subtracted (a seed's `peak` orders the stars whose
+/// half-maximum widths give [`super::psf_signal::fit_stars`] its field width,
+/// so a sky pedestal would blur that order; before Plan A Task 6b both also
+/// sized the fitter's starting width).
 pub fn detect_structures(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> Vec<Seed> {
     if w < 3 || h < 3 || plane.len() < w * h {
         return Vec::new();

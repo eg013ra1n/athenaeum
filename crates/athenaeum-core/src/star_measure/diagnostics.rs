@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RefusalReason {
-    /// The width-start box (Task 6b) / the nominal stamp (today) leaves the image.
+    /// The width-start box (radius `⌈2·F_field⌉`, Task 6b) leaves the image.
     OutsideImage,
     /// Fewer than 10 finite pixels in the region.
     TooFewPixels,
@@ -87,9 +87,9 @@ pub enum Outcome {
 }
 
 /// One seed's record (`MeasureOptions::diagnostics`). The fields a refusal leaves unmeasured read their "not
-/// reached" value: `region_radius` the nominal stamp radius when the seed was refused before its region grew
-/// (`OutsideImage`), `background_start` NaN before the region's median was taken, `growth_steps` 0, `converged` false
-/// when the fitter never returned a fit.
+/// reached" value: `region_radius` the width-start box's radius when the seed was refused before its region grew
+/// (`OutsideImage`), `width_start` and `background_start` NaN before they were measured, `growth_steps` 0,
+/// `converged` false when the fitter never returned a fit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitDiagnostics {
     /// The seed's index in the seed list the fitter was handed (the probe's seed line `i`).
@@ -97,10 +97,11 @@ pub struct FitDiagnostics {
     pub outcome: Outcome,
     /// The sampling region's radius, px (the square is `(2r+1)²`).
     pub region_radius: u16,
-    /// The background the fit started from: the sampling region's median, working units.
+    /// The background the fit started from: the median of the sampling region's outer 1-px rim (Task 6b, F-7),
+    /// working units.
     pub background_start: f64,
-    /// The FWHM (px) the fit started from: today the field σ from the seeds' flux/peak ratio as a Gaussian FWHM
-    /// (`2√(2 ln 2)·σ0`), the same for every seed of the call; from Task 6b the star's own `F_start`.
+    /// The FWHM (px) the fit started from: the star's own `F_start`, from its second moments in the width-start box
+    /// (Task 6b, PA-12).
     pub width_start: f64,
     /// Steps the sampling region grew from its start radius.
     pub growth_steps: u8,

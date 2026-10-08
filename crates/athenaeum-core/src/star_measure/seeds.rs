@@ -3,8 +3,8 @@
 //! filter's integrated signal, and the field width itself: the azimuthal half-maximum width of the brightest
 //! candidates (PA-17), which [`field_width_of`] also gives seeds another detector handed in (I-4).
 //!
-//! Task 6a changes no fit (ruling F16): `fit_one` keeps its `initial_sigma` start until Task 6b; the field width serves
-//! the filter's second pass and `PlaneMeasurement.field_width` only.
+//! Task 6a changed no fit (ruling F16). From Task 6b the field width also sizes every star's width-start box in the fit
+//! (radius `⌈2·F_field⌉`, PA-12): the matched filter's own for its seeds, [`field_width_of`] for seeds handed in.
 //!
 //! **The filter.** It runs on the plane minus its mesh background (the 128-px model the noise residual uses). Every
 //! absent pixel — non-finite, or `false` in the caller's mask — counts zero and leaves the normalisation: per position
@@ -12,7 +12,7 @@
 //! separable convolution. `f = num/√den` is the matched filter's signal in units of the pixel σ, with the same noise
 //! wherever data is present (a registered frame's NaN border neither seeds nor dims its neighbours), and
 //! `flux = 2πσ_F²·num/den` is the least-squares flux of a Gaussian star of the field width at that position: the
-//! selection key, and with `peak` the `flux/peak` ratio of a Gaussian (`2πσ²`) the fit's field σ0 reads.
+//! selection key.
 //!
 //! **The super-pixel pass.** At a field width ≥ 6 px the second pass runs on 2×2 blocks: a block carries the sum of its
 //! present pixels and their count, so `num = Σ k·sum` and `den = Σ k²·count` are the same least-squares terms on a

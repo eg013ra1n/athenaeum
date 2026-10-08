@@ -250,19 +250,19 @@ fn detect_seeds(
 
 /// A fit seed from a registration [`Star`]. `Star` carries no peak
 /// amplitude (registration only ever needed flux + optional σ), but
-/// [`fit_stars`] reads `Seed::peak` in exactly one place — the field-level
-/// `initial_sigma()` median used to size the fit stamp — so an amplitude
+/// [`fit_stars`] reads `Seed::peak` in exactly one place — the order in
+/// which `star_measure::seeds::field_width_of` picks the ≤ 100 brightest
+/// seeds whose half-maximum widths give the field width (every star's
+/// width-start box, Plan A Task 6b; before it, the field-level
+/// `initial_sigma` median that sized the fit stamp) — so an amplitude
 /// backed out of the flux/σ the detector already refined
 /// (`peak = flux / (2π·σx·σy)`, the closed form for a 2-D Gaussian's
 /// total) is accurate where it exists. Without a refined σ there is no
 /// reliable peak estimate at all: `star.flux` alone (no 2π·σx·σy
 /// denominator to shrink it back down) reads as a peak of order the
-/// star's own total flux, which — if most of the brightest stars in a
-/// plane lack a refined σ — collapses the whole-field `initial_sigma`
-/// median toward its 0.7 px floor and starves every wider star of a big
-/// enough fit stamp. `peak = 0.0` instead: `initial_sigma` filters
-/// `peak > 0.0` and `fit_one` never reads `Seed::peak` at all, so a
-/// σ-less seed drops out of that one median instead of poisoning it.
+/// star's own total flux, which would put σ-less seeds first in that
+/// order. `peak = 0.0` instead: they sort last, and `fit_one` never reads
+/// `Seed::peak` at all.
 fn to_seed(star: &Star) -> Seed {
     let peak = match star.sigma {
         Some((sx, sy)) if sx > 0.0 && sy > 0.0 => star.flux / (2.0 * PI * sx * sy),
@@ -1427,10 +1427,11 @@ fn choose_pairing_widened(
 /// variants measured.
 ///
 /// Survivors become [`Seed`]s (`peak`/`flux` copied from the Measure fit's
-/// own `amplitude`/`signal` — used only by [`fit_stars_with_beta`]'s
-/// field-level `initial_sigma` heuristic to size the fit stamp, a RATIO
-/// any unit difference between Measure's ADU-scaled fits and this native
-/// plane cancels out of), sorted brightest-first (the convention
+/// own `amplitude`/`signal` — `peak` used only to order the seeds whose
+/// half-maximum widths give [`fit_stars_with_beta`] its field width, an
+/// ORDER any unit difference between Measure's ADU-scaled fits and this
+/// native plane leaves unchanged; before Plan A Task 6b the field-level
+/// `initial_sigma` ratio of the two sized the fit stamp), sorted brightest-first (the convention
 /// [`detect_seeds`]'s own `to_seed` documents), capped at `max_stars`, then
 /// fitted with [`fit_stars_with_beta`] at the reference's DEFAULT β —
 /// never a seed's own original Measure β, which no longer matters: this is

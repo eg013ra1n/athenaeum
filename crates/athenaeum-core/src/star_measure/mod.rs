@@ -82,6 +82,12 @@ pub struct MeasureOptions {
     /// matched filter, the field width and the fit (its region and aperture). One plane, one mask; `None` = every
     /// pixel present. The noise model and the sky statistic read the whole plane.
     pub mask: Option<Vec<bool>>,
+    /// A field width the caller's detector already measured (Task 6b, Task 6a review M3): the stacking adapter's
+    /// matched-filter arm hands the detector's own [`FieldWidth`] with its seeds, so the fit starts from the width
+    /// [`SeedSpec::MatchedFilter`] would have given it. `None` = the module's matched filter's own width, or
+    /// [`seeds::field_width_of`] the given seeds. Given, it is the width the fit reads and
+    /// [`PlaneMeasurement::field_width`] reports; the matched filter's own second pass still runs at its own.
+    pub field_width: Option<FieldWidth>,
 }
 
 impl Default for MeasureOptions {
@@ -98,6 +104,7 @@ impl Default for MeasureOptions {
             scale_estimator: ScaleEstimator::Bwmv,
             diagnostics: false,
             mask: None,
+            field_width: None,
         }
     }
 }
@@ -136,10 +143,13 @@ pub struct FitStarsOptions {
     /// `mask[i] == false` makes pixel `i` absent, like a non-finite one, in the fit's region and aperture (Plan C's
     /// CFA green sites); `None` = every pixel present.
     pub mask: Option<Vec<bool>>,
-    /// The field width (FWHM, px) the fit is handed (Task 6b's width start reads it; Task 6a's fit does not), as
-    /// `FitOutcome.field_width` reports it with `from_stars = 0`; `None` = [`seeds::field_width_of`] of the given
-    /// seeds.
+    /// The field width (FWHM, px) the fit is handed — its width-start box has radius `⌈2·field_width⌉` (Task 6b,
+    /// PA-12) — as `FitOutcome.field_width` reports it with `from_stars = 0`; `None` = [`seeds::field_width_of`] of
+    /// the given seeds.
     pub field_width: Option<f64>,
+    /// Keep one [`FitDiagnostics`] per seed in [`FitOutcome::diagnostics`] (Task 6b: the refit path reports them as
+    /// `measure_plane` does); empty otherwise.
+    pub diagnostics: bool,
 }
 
 /// One plane's measurement (PA-1: the stacking adapter keeps its own `stacking::measure::PlaneMeasurement`). Energies
@@ -155,7 +165,8 @@ pub struct PlaneMeasurement {
     pub sky: SkyLevel,
     /// Seeds handed to the fitter.
     pub seeds: usize,
-    /// The field width (Task 6a): the matched filter's own ([`SeedSpec::MatchedFilter`]), or
+    /// The field width the fit started from (Task 6a; the width-start boxes read it from Task 6b): the caller's
+    /// [`MeasureOptions::field_width`] when given, else the matched filter's own ([`SeedSpec::MatchedFilter`]), or
     /// [`seeds::field_width_of`] the given seeds (`from_stars = 0` with the first pass's 3 px when no star read).
     pub field_width: FieldWidth,
     /// The seeds not accepted, by reason (F-0): `refused.accounted(stars.len()) == seeds` (ruling F13).
@@ -182,12 +193,33 @@ pub fn measure_plane(
         None => domain::noise_model(&working, w, h, pool),
     };
     let mask = opts.mask.as_deref();
+    // A width the caller's detector measured (Task 6b, Task 6a review M3) stands in for the module's own, which is
+    // then not computed for given seeds; one that is not a positive number is refused loudly and the module's own is
+    // used.
+    let given_width = match opts.field_width {
+        Some(given) if given.fwhm_px.is_finite() && given.fwhm_px > 0.0 => Some(given),
+        Some(bad) => {
+            tracing::warn!(
+                fwhm_px = bad.fwhm_px,
+                from_stars = bad.from_stars,
+                "measure: the given field width is not a positive number; the module's own is used"
+            );
+            None
+        }
+        None => None,
+    };
     let t = Instant::now();
     let (detected, field_width) = match &opts.seeds {
-        SeedSpec::None => (None, seeds::field_width_of(&working, w, h, &[], mask)),
-        SeedSpec::Given(given) => (None, seeds::field_width_of(&working, w, h, given, mask)),
+        SeedSpec::None => (
+            None,
+            given_width.unwrap_or_else(|| seeds::field_width_of(&working, w, h, &[], mask)),
+        ),
+        SeedSpec::Given(given) => (
+            None,
+            given_width.unwrap_or_else(|| seeds::field_width_of(&working, w, h, given, mask)),
+        ),
         SeedSpec::MatchedFilter { threshold } => {
-            let (found, field) = seeds::detect(
+            let (found, own) = seeds::detect(
                 &working,
                 w,
                 h,
@@ -198,7 +230,7 @@ pub fn measure_plane(
                 pool,
             );
             timings.detect_ms = t.elapsed().as_millis() as u64;
-            (Some(found), field)
+            (Some(found), given_width.unwrap_or(own))
         }
     };
     let seeds: &[Seed] = match (&opts.seeds, &detected) {
@@ -221,7 +253,7 @@ pub fn measure_plane(
             opts.diagnostics,
         )
     };
-    let (outcome, diagnostics) = match pool {
+    let mut outcome = match pool {
         // Already inside this `install` — `fit_stars`'s own pool param gets
         // `None` so it does not nest a second, pointless `install` inside
         // this one (perf tier 1 Task 2).
@@ -234,6 +266,7 @@ pub fn measure_plane(
         seeds.len(),
         "every seed has exactly one outcome (ruling F13)"
     );
+    let diagnostics = std::mem::take(&mut outcome.diagnostics);
     let frame = FrameAggregates::of(&outcome.fits);
     let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
     PlaneMeasurement {
@@ -252,8 +285,9 @@ pub fn measure_plane(
 
 /// The refit entry point LN uses (PA-6): every seed fitted at `beta`. The plane is in the module's working units
 /// (ADU-scaled), exactly as `fit_stars_with_beta` takes it. `opts.mask` makes pixels absent in the region and the
-/// aperture; `opts.field_width` (else [`seeds::field_width_of`] the seeds) is reported as `FitOutcome.field_width`
-/// (Task 6a: no fit reads it yet).
+/// aperture; `opts.field_width` (else [`seeds::field_width_of`] the seeds) sizes every star's width-start box (Task
+/// 6b, PA-12) and is reported as `FitOutcome.field_width`; `opts.diagnostics` keeps one record per seed in
+/// `FitOutcome.diagnostics`.
 pub fn fit_stars_at(
     plane: &[f32],
     w: usize,
@@ -273,9 +307,8 @@ pub fn fit_stars_at(
         opts.mask.as_deref(),
         opts.field_width,
         pool,
-        false,
+        opts.diagnostics,
     )
-    .0
 }
 
 #[cfg(test)]
@@ -645,45 +678,162 @@ mod tests {
         );
         assert_eq!(m.stars.len(), 1);
         assert_eq!(m.refused.by_reason.get(&RefusalReason::Duplicate), Some(&1));
-        // a seed whose region cannot hold half the FWTM → RegionTooSmall, not a silent drop: a broad star, α 12
-        // (FWTM 21.2 at β 4, half 10.6 px), on a 60×60 plane, 7 px from its left border. The seed's flux/peak gives
-        // σ0 0.98 and the minimum nominal stamp, 6 px, so it is admitted, and the border caps the region at r = 7.
-        // (At the plane's centre, the brief's first draft, the region grows to r = 26 and the star is accepted.)
-        let broad = MoffatStar {
-            x: 7.0,
-            y: 30.0,
-            amp: 0.5,
-            alpha_x: 12.0,
-            alpha_y: 12.0,
-            theta: 0.0,
-        };
-        let data = moffat_field(60, 60, &[broad], 4.0, 0.05);
+        // a seed whose region cannot hold half the FWTM → RegionTooSmall, not a silent drop. Plan A Task 6b (ruling
+        // F14): the field-level nominal stamp this fixture relied on is gone, so it takes PA-18's border geometry — a
+        // FWHM-12 star (α 13.8, half-FWTM 12.2 px) 10 px from the left border of a field whose width is 3 px. Four
+        // FWHM-3 stars (α 3.45) give that width: the broad star's own half-maximum box leaves the image, so
+        // `field_width_of` reads the four. Its width-start box (radius ⌈2·F_field⌉ ≤ 7) fits, the border clips its
+        // region at r = 10, and 12.2 > 10.
+        let stars = [
+            MoffatStar {
+                x: 10.0,
+                y: 100.0,
+                amp: 0.3,
+                alpha_x: 13.8,
+                alpha_y: 13.8,
+                theta: 0.0,
+            },
+            MoffatStar {
+                x: 70.0,
+                y: 40.0,
+                amp: 0.3,
+                alpha_x: 3.45,
+                alpha_y: 3.45,
+                theta: 0.0,
+            },
+            MoffatStar {
+                x: 150.0,
+                y: 40.0,
+                amp: 0.3,
+                alpha_x: 3.45,
+                alpha_y: 3.45,
+                theta: 0.0,
+            },
+            MoffatStar {
+                x: 70.0,
+                y: 160.0,
+                amp: 0.3,
+                alpha_x: 3.45,
+                alpha_y: 3.45,
+                theta: 0.0,
+            },
+            MoffatStar {
+                x: 150.0,
+                y: 160.0,
+                amp: 0.3,
+                alpha_x: 3.45,
+                alpha_y: 3.45,
+                theta: 0.0,
+            },
+        ];
+        let data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        let seeds: Vec<Seed> = stars
+            .iter()
+            .map(|s| Seed {
+                x: s.x,
+                y: s.y,
+                peak: s.amp,
+                flux: 1.0,
+            })
+            .collect();
         let m = measure_plane(
             &data,
-            60,
-            60,
+            200,
+            200,
             &MeasureOptions {
                 diagnostics: true,
-                seeds: SeedSpec::Given(vec![Seed {
-                    x: 7.0,
-                    y: 30.0,
-                    peak: 0.5,
-                    flux: 3.0,
-                }]),
+                seeds: SeedSpec::Given(seeds),
                 psf_model: PsfModel::Moffat4,
                 ..Default::default()
             },
             None,
         );
+        assert_eq!(m.field_width.from_stars, 4, "{:?}", m.field_width);
+        assert!(
+            (m.field_width.fwhm_px / 3.0 - 1.0).abs() < 0.1,
+            "{:?}",
+            m.field_width
+        );
         assert_eq!(
             m.diagnostics[0].outcome,
             Outcome::Refused(RefusalReason::RegionTooSmall)
         );
-        assert!(m.diagnostics[0].region_radius >= 3);
+        assert_eq!(m.diagnostics[0].region_radius, 10);
+        assert_eq!(m.stars.len(), 4, "the four narrow stars fit");
         assert_eq!(
             m.refused.by_reason.get(&RefusalReason::RegionTooSmall),
             Some(&1)
         );
+    }
+
+    /// Plan A Task 6b (Task 6a review M3, controller ruling): the adapter's matched-filter arm hands the detector's own
+    /// field width to the fit with its seeds, so the probe's measure path (`SeedSource::MatchedFilter`, the seeds
+    /// handed to the module as `Given`) and the module's own `SeedSpec::MatchedFilter` start every star from the same
+    /// width and fit the same stars; `field_width_of` serves only seeds another detector found.
+    ///
+    /// The plane makes the two estimators read different stars: 120 Moffat-4 stars, 60 narrow (FWHM 3, amplitude
+    /// 0.4) and 60 broad (FWHM 7, amplitude 0.3). The 100 brightest by peak — what `field_width_of` the given seeds
+    /// reads — are the 60 narrow and 40 broad ones (a narrow median); the matched filter's first pass ranks by its
+    /// 3-px flux, where a broad star reads ≈ 1.7× its amplitude, so its 100 are the 60 broad and 40 narrow ones (a
+    /// broad median) — box radii ⌈2·F⌉ far apart.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn adapter_matched_filter_seeds_fit_exactly_as_the_module_matched_filter() {
+        use crate::stacking::measure::{
+            measure_plane_diagnosed, MeasureOptions as AdapterOptions, SeedSource,
+        };
+        use crate::test_support::{add_noise, moffat_field, MoffatStar};
+        let (w, h) = (640usize, 480usize);
+        let stars: Vec<MoffatStar> = (0..120)
+            .map(|i| {
+                let narrow = (i + i / 12) % 2 == 0;
+                let alpha = if narrow { 3.449 } else { 8.048 };
+                MoffatStar {
+                    x: 30.0 + (i % 12) as f64 * 50.0,
+                    y: 30.0 + (i / 12) as f64 * 45.0,
+                    amp: if narrow { 0.4 } else { 0.3 },
+                    alpha_x: alpha,
+                    alpha_y: alpha,
+                    theta: 0.0,
+                }
+            })
+            .collect();
+        let mut data = moffat_field(w, h, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 11);
+        let (pm, seeds, _) = measure_plane_diagnosed(
+            &data,
+            w,
+            h,
+            &AdapterOptions::default(),
+            None,
+            SeedSource::MatchedFilter {
+                threshold: DEFAULT_THRESHOLD,
+            },
+            false,
+        );
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(seeds.len(), m.seeds);
+        // The premise: `field_width_of` the same seeds reads a different width.
+        let given = seeds::field_width_of(&working(&data), w, h, &seeds, None);
+        assert!(
+            (given.fwhm_px - m.field_width.fwhm_px).abs() > 1.0,
+            "given {given:?} vs the matched filter's {:?}",
+            m.field_width
+        );
+        assert_eq!(pm.field_width, m.field_width, "the detector's own width");
+        assert_eq!(pm.channel.beta, m.beta);
+        assert_eq!(pm.fits, m.stars, "the same fits");
     }
 
     /// No seeds, nothing fitted: the frame aggregates are `None`, the β is the `Auto` fallback 4.0, and the noise and

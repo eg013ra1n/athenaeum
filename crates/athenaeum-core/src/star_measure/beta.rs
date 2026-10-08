@@ -9,16 +9,15 @@ pub const AUTO_BETAS: [f64; 4] = [2.5, 4.0, 6.0, 10.0];
 pub const AUTO_SAMPLE: usize = 64;
 
 /// `PsfModel::Auto`'s β: fits the brightest [`AUTO_SAMPLE`] seeds with every β in [`AUTO_BETAS`] and keeps the β
-/// with the smallest median residual over its accepted fits; 4.0 when no candidate accepts at least 8 fits. `sigma0`
-/// is the field σ `fit_stars` computed from the same seeds. Seeds are expected brightest-first (the detector's order).
-/// `mask` and `field_width` reach every sample fit as they reach the frame's (Task 6a).
+/// with the smallest median residual over its accepted fits; 4.0 when no candidate accepts at least 8 fits. Seeds are
+/// expected brightest-first (the detector's order). `mask` and `field_width` reach every sample fit as they reach the
+/// frame's (Task 6a); each sample fit starts from its star's own width start, as the frame's do (Task 6b).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn auto_beta(
     data: &[f32],
     w: usize,
     h: usize,
     seeds: &[Seed],
-    sigma0: f64,
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: f64,
@@ -27,7 +26,7 @@ pub(crate) fn auto_beta(
     let sample = &seeds[..seeds.len().min(AUTO_SAMPLE)];
     let mut best: Option<(f64, f64)> = None; // (median residual, β)
     for &b in &AUTO_BETAS {
-        let mut res: Vec<f64> = fit_all(data, w, h, sample, sigma0, b, p, mask, field_width, pool)
+        let mut res: Vec<f64> = fit_all(data, w, h, sample, b, p, mask, field_width, pool)
             .iter()
             .map(|f| f.residual)
             .collect();

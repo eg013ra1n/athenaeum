@@ -1,5 +1,5 @@
 //! The per-star fit (math reference §1.4; spec 2026-10-07 §2.1 `fit`): elliptical Moffat fits on the seeds, the
-//! adaptive sampling region, the acceptance rules, the hybrid PSF/aperture flux inside each fit's FWTM ellipse and the
+//! per-star sampling region, the acceptance rules, the hybrid PSF/aperture flux inside each fit's FWTM ellipse and the
 //! ±1 px duplicate drop. Moved verbatim from `psf_signal` (Plan A Task 2); the `Auto` β search lives in
 //! [`super::beta`]. Coordinates are 0-based pixel centres.
 //!
@@ -13,8 +13,15 @@
 //! axes — the major axis on `fwhm_x`, `theta` on it, in `[-π/2, π/2)`.
 //!
 //! F-1 seeds (Plan A Task 6a, no fit change — ruling F16): a pixel mask makes a pixel absent, exactly like a
-//! non-finite one, in the region's growth, its pixels and the aperture; the field width is threaded to `fit_one`
-//! for Task 6b's width start and reported as [`FitOutcome::field_width`], read by no fit yet.
+//! non-finite one, in the region's growth, its pixels and the aperture; the field width is reported as
+//! [`FitOutcome::field_width`].
+//!
+//! F-1 with F-7, the fit (Plan A Task 6b, ruling R-OSP-4): every star starts from its own width, `F_start`, read
+//! from its second moments in a box of radius `⌈2·F_field⌉` (the box is also the admission test, PA-18); its region
+//! grows from `max(3, ⌈1.5·F_start⌉)` up to `clamp(⌈6·F_start⌉, 6, 96)` px while the region's median stands above its
+//! rim's by more than 1 % of the peak (PA-12); the fit's background starts from that rim's median. An annular star is
+//! refused `Donut` before any fit, and a fit narrower than 0.8 px `NarrowerThanPixel`. The field σ0 from the seeds'
+//! flux/peak and the field-level nominal stamp are retired.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -25,6 +32,7 @@ use astroimage::analysis::fitting::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 use super::seeds::{field_width_of, FieldWidth};
@@ -80,12 +88,13 @@ pub struct FitParams {
     /// reference §1.4). A fit that walked out towards the region's rim is
     /// measuring something the region only half covers.
     pub inner_margin: f64,
-    /// Growth step of the adaptive sampling region, in pixels.
+    /// Growth step of the sampling region, in pixels.
     pub region_growth_step_px: usize,
-    /// The region stops growing once its median stops falling by at least
-    /// this fraction per step — a region that still gets darker as it grows
-    /// has not yet left the star.
-    pub region_growth_min_drop: f64,
+    /// The region grows while its median stands above the median of its own
+    /// outer rim by more than this fraction of its peak above that rim —
+    /// `(m_r − s_r) > 0.01·(max − s_r)` (PA-12, Plan A Task 6b): a region whose
+    /// median still holds the star's light has not yet left the star.
+    pub region_growth_contrast: f64,
 }
 
 impl Default for FitParams {
@@ -99,7 +108,7 @@ impl Default for FitParams {
             max_fit_residual: 1.0,
             inner_margin: 0.15,
             region_growth_step_px: 1,
-            region_growth_min_drop: 0.01,
+            region_growth_contrast: 0.01,
         }
     }
 }
@@ -226,8 +235,11 @@ pub struct FitOutcome {
     /// The seeds not accepted, by reason (F-0): `refused.accounted(fits.len()) == seeds` (ruling F13).
     pub refused: RefusalCounts,
     /// The field width the call used (Task 6a, ruling F14): `FieldWidth { fwhm_px: f, from_stars: 0 }` for a given
-    /// `f`, else [`field_width_of`] the seeds. No fit reads it before Task 6b.
+    /// `f`, else [`field_width_of`] the seeds. Every star's width-start box has radius `⌈2·fwhm_px⌉` (Task 6b, PA-12).
     pub field_width: FieldWidth,
+    /// One record per seed, in seed order, when the caller asked for them (`FitStarsOptions::diagnostics`,
+    /// `MeasureOptions::diagnostics`); empty otherwise (Task 6b, ruling F14).
+    pub diagnostics: Vec<FitDiagnostics>,
 }
 
 /// Full width at tenth maximum of a Moffat profile, `2α√(10^{1/β} − 1)`.
@@ -235,31 +247,45 @@ pub fn fwtm_from_alpha(alpha: f64, beta: f64) -> f64 {
     2.0 * alpha * (10f64.powf(1.0 / beta) - 1.0).sqrt()
 }
 
-/// Field-level initial σ from the seeds' flux/peak ratio (a Gaussian's
-/// `flux/peak = 2πσ²`): median over the 100 brightest, clamped to [0.7, 10].
-fn initial_sigma(seeds: &[Seed]) -> f64 {
-    let mut s: Vec<f64> = seeds
-        .iter()
-        .take(100)
-        .filter(|s| s.peak > 0.0 && s.flux > 0.0)
-        .map(|s| (s.flux / (2.0 * std::f64::consts::PI * s.peak)).sqrt())
-        .collect();
-    if s.is_empty() {
-        return 2.0;
-    }
-    s.sort_by(|a, b| a.total_cmp(b));
-    s[s.len() / 2].clamp(0.7, 10.0)
+/// The width-start box's radius per field FWHM (PA-12): `F_start` is read in a box of radius `⌈2·F_field⌉` px, and
+/// a seed whose box leaves the image is refused `OutsideImage` (PA-18).
+const WIDTH_START_BOX_PER_FIELD: f64 = 2.0;
+/// `F_start`'s clamp, px (PA-12).
+const WIDTH_START_MIN_PX: f64 = 0.6;
+const WIDTH_START_MAX_PX: f64 = 40.0;
+/// The region's start radius, `max(3, ⌈1.5·F_start⌉)` px (PA-12).
+const REGION_START_PER_WIDTH: f64 = 1.5;
+const REGION_START_MIN_PX: i64 = 3;
+/// The region's cap, `clamp(⌈6·F_start⌉, 6, 96)` px, and never past the image border (PA-12; spec §3 F-1: ≥ 6 FWHM,
+/// cap 96 px).
+const REGION_MAX_PER_WIDTH: f64 = 6.0;
+const REGION_MAX_MIN_PX: i64 = 6;
+const REGION_MAX_MAX_PX: i64 = 96;
+/// The donut test (Task 6b): a star whose 3×3 core mean is below this fraction of its 1-px ring's mean is refused
+/// `Donut`.
+const DONUT_CORE_TO_RING: f64 = 0.8;
+/// The donut ring's radius floor, px: the ring sits at `max(1.5, F_start/2.3548)` (the fold check's ruling — at the
+/// unfloored radius a real star of FWHM ≤ 2.0 read 0.34–0.61 on the lab's renderer and would be refused).
+const DONUT_RING_MIN_RADIUS_PX: f64 = 1.5;
+/// An accepted fit whose narrower FWHM is below this many px is a hot pixel, not a star (Task 6b,
+/// `NarrowerThanPixel`).
+const NARROWEST_FWHM_PX: f64 = 0.8;
+
+/// A stamp's background-subtracted second moments (weights `max(v − b0, 0)`): the axes' σ, the major axis's angle
+/// `½·atan2(2μxy, μxx − μyy)`, and the centroid, in the stamp's own coordinates.
+#[derive(Debug, Clone, Copy)]
+struct Moments {
+    sigma_major: f64,
+    sigma_minor: f64,
+    theta: f64,
+    cx: f64,
+    cy: f64,
 }
 
-fn stamp_radius(sigma: f64) -> usize {
-    ((5.0 * sigma).ceil() as usize).clamp(6, 48)
-}
-
-/// Orientation and axis ratio of a stamp from its background-subtracted
-/// second moments: `(sigma_major, sigma_minor, theta)` with θ the angle of
-/// the major axis, `½·atan2(2μxy, μxx − μyy)`. `None` when the stamp has no
-/// positive signal or degenerate moments.
-fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
+/// Orientation, axis ratio and centroid of a stamp from its background-subtracted
+/// second moments ([`Moments`]). `None` when the stamp has no positive signal or
+/// degenerate moments.
+fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<Moments> {
     let (mut sw, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64);
     for p in px {
         let w = (p.value - b0).max(0.0);
@@ -287,7 +313,13 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
         return None;
     }
     let theta = 0.5 * (2.0 * mxy).atan2(mxx - myy);
-    Some((l1.sqrt(), l2.sqrt(), theta))
+    Some(Moments {
+        sigma_major: l1.sqrt(),
+        sigma_minor: l2.sqrt(),
+        theta,
+        cx,
+        cy,
+    })
 }
 
 /// Whether pixel `i` is present: finite, and not `false` in the mask (Task 6a).
@@ -317,18 +349,21 @@ fn push_finite_row(
 }
 
 /// Median of the `(2r+1)²` square centred on `(cx, cy)`, non-finite and masked
-/// pixels skipped. `None` when the square holds no present pixel.
+/// pixels skipped, and the largest pixel this call appended (`−∞` when it
+/// appended none). `None` when the square holds no present pixel.
 ///
-/// `scratch` is the running multiset the caller (`sampling_radius`) grows
+/// `scratch` is the running multiset the caller ([`grow_region`]) grows
 /// as it grows `r`: when `prev_r` is `Some`, `scratch` already holds the
 /// finite pixels of the smaller `(2*prev_r+1)²` square and only the RING
 /// newly exposed between `prev_r` and `r` is appended — the two squares
-/// share a centre and `sampling_radius` only ever grows `r`, so that ring
+/// share a centre and the region only ever grows `r`, so that ring
 /// is the exact set difference of the two squares, each pixel entering the
 /// multiset exactly once. `prev_r = None` rebuilds the square from
 /// scratch (the growth loop's first radius). Either way the resulting
 /// multiset is identical to a full rebuild at `r` — a median does not
-/// depend on insertion order.
+/// depend on insertion order. The appended pixels' maximum is read before
+/// the median reorders the multiset.
+#[allow(clippy::too_many_arguments)]
 fn region_median(
     data: &[f32],
     mask: Option<&[bool]>,
@@ -338,16 +373,18 @@ fn region_median(
     prev_r: Option<i64>,
     r: i64,
     scratch: &mut Vec<f32>,
-) -> Option<f64> {
-    match prev_r {
+) -> Option<(f64, f64)> {
+    let appended_from = match prev_r {
         None => {
             scratch.clear();
             for y in cy - r..=cy + r {
                 push_finite_row(data, mask, w, y, cx - r..=cx + r, scratch);
             }
+            0
         }
         Some(pr) => {
-            debug_assert!(r > pr, "sampling_radius only ever grows r");
+            debug_assert!(r > pr, "the region only ever grows r");
+            let from = scratch.len();
             // Top and bottom strips: full new width, the rows the smaller
             // square did not cover at all.
             for y in cy - r..cy - pr {
@@ -362,28 +399,64 @@ fn region_median(
                 push_finite_row(data, mask, w, y, cx - r..cx - pr, scratch);
                 push_finite_row(data, mask, w, y, (cx + pr + 1)..=(cx + r), scratch);
             }
+            from
         }
-    }
+    };
     if scratch.is_empty() {
         return None;
     }
-    Some(median_in_place(scratch) as f64)
+    let max = scratch[appended_from..]
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64));
+    Some((median_in_place(scratch) as f64, max))
 }
 
-/// The adaptive sampling region (math reference §1.4): start at half the
-/// nominal stamp and grow while the region's MEDIAN keeps falling by at
-/// least `min_drop` per step. A region whose median still drops as it grows
-/// is still inside the star's light; once the median flattens, the region
-/// has reached the local sky and there is nothing to gain from more pixels
-/// — which is exactly the sky-relative behaviour a fixed `5σ` stamp lacks:
-/// on a bright sky the star's share of the median is small, so the region
-/// settles sooner, and on a dark one it keeps growing.
+/// Median of the present pixels on the outer 1-px rim of the `(2r+1)²` square
+/// centred on `(cx, cy)` — the pixels at Chebyshev distance exactly `r`
+/// (`r = 0`: the centre pixel). `None` when the rim holds no present pixel.
+/// `buf` is scratch, cleared first.
+fn rim_median(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    cx: i64,
+    cy: i64,
+    r: i64,
+    buf: &mut Vec<f32>,
+) -> Option<f64> {
+    buf.clear();
+    if r == 0 {
+        push_finite_row(data, mask, w, cy, cx..=cx, buf);
+    } else {
+        push_finite_row(data, mask, w, cy - r, cx - r..=cx + r, buf);
+        push_finite_row(data, mask, w, cy + r, cx - r..=cx + r, buf);
+        for y in cy - r + 1..cy + r {
+            push_finite_row(data, mask, w, y, cx - r..=cx - r, buf);
+            push_finite_row(data, mask, w, y, cx + r..=cx + r, buf);
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    Some(median_in_place(buf) as f64)
+}
+
+/// The sampling region (PA-12, spec §3 F-1): start at `r_start` and grow, one
+/// step at a time up to `r_max`, while the square's median `m_r` stands above
+/// the median of its own outer 1-px rim `s_r` by more than
+/// `FitParams::region_growth_contrast` of the square's peak above that rim —
+/// `(m_r − s_r) > 0.01·(max − s_r)`. The growth is judged on (median − local
+/// sky), not on the absolute median, so a bright or sloping sky does not stop it
+/// early, and a region that still holds the star's light in its median keeps
+/// growing.
 ///
-/// `r_max` is the caller's cap (twice the nominal stamp, and never past the
-/// image border). Returns the radius the growth stopped at — the first
-/// radius whose median no longer dropped by `min_drop` (one step past the
-/// last dropping one), or `r_max` when every step kept dropping.
-fn sampling_radius(
+/// Returns the final radius and its rim median `s_r` — the fit's background
+/// start `b0` (F-7: the sky under the star read where the star is not). A rim
+/// with no present pixel (every one non-finite or masked) leaves the square's own
+/// median as the level, so the growth stops there. `(r_start, NaN)` when the
+/// starting square holds no present pixel.
+#[allow(clippy::too_many_arguments)]
+fn grow_region(
     data: &[f32],
     mask: Option<&[bool]>,
     w: usize,
@@ -392,44 +465,46 @@ fn sampling_radius(
     r_start: i64,
     r_max: i64,
     p: &FitParams,
-    scratch: &mut Vec<f32>,
-) -> i64 {
+    scratch: &mut FitScratch,
+) -> (i64, f64) {
     let step = p.region_growth_step_px.max(1) as i64;
     let mut r = r_start;
-    let Some(mut prev) = region_median(data, mask, w, cx, cy, None, r, scratch) else {
-        return r;
+    let Some((mut m, mut max)) = region_median(data, mask, w, cx, cy, None, r, &mut scratch.region)
+    else {
+        return (r, f64::NAN);
     };
-    while r + step <= r_max {
+    loop {
+        let s = rim_median(data, mask, w, cx, cy, r, &mut scratch.rim).unwrap_or(m);
+        if r + step > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
+            return (r, s);
+        }
         let next = r + step;
-        // `scratch` currently holds exactly the square at `r` (the last
-        // radius region_median built or grew it to) — that IS `prev_r`.
-        let Some(m) = region_median(data, mask, w, cx, cy, Some(r), next, scratch) else {
-            return r;
+        // `scratch.region` holds exactly the square at `r` — that IS `prev_r`.
+        let Some((m_next, max_next)) =
+            region_median(data, mask, w, cx, cy, Some(r), next, &mut scratch.region)
+        else {
+            return (r, s);
         };
         r = next;
-        if !(m < (1.0 - p.region_growth_min_drop) * prev) {
-            break;
-        }
-        prev = m;
+        m = m_next;
+        max = max.max(max_next);
     }
-    r
 }
 
 /// Per-worker scratch [`fit_one`] reuses across seeds instead of
-/// allocating fresh buffers every call: the region-median growth's running
-/// multiset (`region`) and the stamp's pixel/value buffers (`px`/`vals`).
-/// `fit_all` hands one instance to each rayon worker via `map_init` (a
-/// thread-local, one instance per worker for the whole `fit_all` call, not
-/// per seed) instead of `fit_one` allocating two fresh `Vec`s — three,
-/// counting `region` — on every seed. Every buffer is `clear()`ed at the
-/// point it starts being rebuilt for a new seed, so a worker's retained
-/// capacity is invisible to the numbers: the content is always exactly
-/// what a fresh, empty `Vec` would have accumulated.
+/// allocating fresh buffers every call: the region's running multiset
+/// (`region`), the rim medians' buffer (`rim`) and the stamp's pixels (`px`,
+/// the width-start box's first, then the region's). `fit_all` hands one
+/// instance to each rayon worker via `map_init` (a thread-local, one instance
+/// per worker for the whole `fit_all` call, not per seed). Every buffer is
+/// `clear()`ed at the point it starts being rebuilt for a new seed, so a
+/// worker's retained capacity is invisible to the numbers: the content is
+/// always exactly what a fresh, empty `Vec` would have accumulated.
 #[derive(Default)]
 struct FitScratch {
     region: Vec<f32>,
+    rim: Vec<f32>,
     px: Vec<PixelSample>,
-    vals: Vec<f32>,
 }
 
 /// What [`fit_one`] records about one seed beside its result: [`FitDiagnostics`] without the seed index and the
@@ -460,14 +535,145 @@ impl FitTrace {
     }
 }
 
-/// Fit one seed with a fixed β, seeded from the field σ (size) and the
-/// stamp's second moments (orientation and axis ratio); `Err` with its
-/// reason when the stamp leaves the image, the region holds too few pixels,
-/// the fit fails, or the acceptance rules (math reference §1.4) reject it.
-/// The [`FitTrace`] records the region and the start whatever the result.
-/// A pixel `mask` leaves its `false` pixels out exactly like non-finite ones
-/// (Task 6a); `_field_width` (FWHM, px) is threaded here for Task 6b's width
-/// start and read by nothing yet (ruling F16).
+/// The star's own width start (PA-12): its FWHM `F_start`, the axis ratio and
+/// orientation of its moments, and their centroid in image coordinates.
+#[derive(Debug, Clone, Copy)]
+struct WidthStart {
+    fwhm: f64,
+    /// `σ_major/σ_minor ≥ 1`.
+    axis_ratio: f64,
+    theta: f64,
+    centroid: (f64, f64),
+}
+
+/// The radius of a field width's width-start box, `⌈2·F_field⌉` px (PA-12),
+/// at least 1.
+fn width_start_box_radius(field_width: f64) -> i64 {
+    ((WIDTH_START_BOX_PER_FIELD * field_width).ceil() as i64).max(1)
+}
+
+/// `F_start` (PA-12): the background-subtracted second moments of the present
+/// pixels in the box of radius `rb` about `(cx, cy)` — the subtraction level is
+/// the median of the box's own outer 1-px rim, the weights `max(v − level, 0)`
+/// ([`moment_ellipse`]) — as the FWHM of the Gaussian of the same geometric-mean
+/// σ, `2.3548·√(σ_major·σ_minor)`, clamped to [0.6, 40] px. The caller has
+/// checked that the box lies inside the image. A box with no present rim pixel or
+/// no positive moments starts from the field width itself (clamped the same
+/// way), round, at θ 0, centred on the seed.
+#[allow(clippy::too_many_arguments)]
+fn width_start(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    seed: &Seed,
+    cx: i64,
+    cy: i64,
+    rb: i64,
+    field_width: f64,
+    scratch: &mut FitScratch,
+) -> WidthStart {
+    let fallback = WidthStart {
+        fwhm: field_width.clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX),
+        axis_ratio: 1.0,
+        theta: 0.0,
+        centroid: (seed.x, seed.y),
+    };
+    let Some(level) = rim_median(data, mask, w, cx, cy, rb, &mut scratch.rim) else {
+        return fallback;
+    };
+    scratch.px.clear();
+    for y in cy - rb..=cy + rb {
+        for x in cx - rb..=cx + rb {
+            let i = y as usize * w + x as usize;
+            if present(data, mask, i) {
+                scratch.px.push(PixelSample {
+                    x: (x - cx) as f64,
+                    y: (y - cy) as f64,
+                    value: data[i] as f64,
+                });
+            }
+        }
+    }
+    match moment_ellipse(&scratch.px, level) {
+        Some(m) => WidthStart {
+            fwhm: (GAUSSIAN_FWHM_PER_SIGMA * (m.sigma_major * m.sigma_minor).sqrt())
+                .clamp(WIDTH_START_MIN_PX, WIDTH_START_MAX_PX),
+            axis_ratio: m.sigma_major / m.sigma_minor,
+            theta: m.theta,
+            centroid: (cx as f64 + m.cx, cy as f64 + m.cy),
+        },
+        None => fallback,
+    }
+}
+
+/// The donut test (Task 6b): the mean of the 3×3 core about the pixel nearest
+/// the moment centroid against the mean of the 1-px ring `R − ½ ≤ d < R + ½`
+/// about the centroid itself, `R = max(1.5, F_start/2.3548)` px, both minus the
+/// background start `b0`; a donut when `core < 0.8·ring`. Only present pixels
+/// inside the image count. No verdict (`false`) when the core or the ring holds
+/// none.
+fn is_donut(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    centroid: (f64, f64),
+    f_start: f64,
+    b0: f64,
+) -> bool {
+    let (mx, my) = centroid;
+    let (px, py) = (mx.round() as i64, my.round() as i64);
+    let inside = |x: i64, y: i64| x >= 0 && y >= 0 && x < w as i64 && y < h as i64;
+    let mean_minus_b0 = |pixels: &mut dyn Iterator<Item = (i64, i64)>| -> Option<f64> {
+        let (mut sum, mut n) = (0.0f64, 0usize);
+        for (x, y) in pixels {
+            if !inside(x, y) {
+                continue;
+            }
+            let i = y as usize * w + x as usize;
+            if present(data, mask, i) {
+                sum += data[i] as f64;
+                n += 1;
+            }
+        }
+        (n > 0).then(|| sum / n as f64 - b0)
+    };
+    let Some(core) = mean_minus_b0(
+        &mut (-1i64..=1).flat_map(|dy| (-1i64..=1).map(move |dx| (px + dx, py + dy))),
+    ) else {
+        return false;
+    };
+    let radius = DONUT_RING_MIN_RADIUS_PX.max(f_start / GAUSSIAN_FWHM_PER_SIGMA);
+    let reach = (radius + 0.5).ceil() as i64;
+    let on_ring = |&(x, y): &(i64, i64)| {
+        let d = (x as f64 - mx).hypot(y as f64 - my);
+        d >= radius - 0.5 && d < radius + 0.5
+    };
+    let Some(ring) = mean_minus_b0(
+        &mut (-reach..=reach)
+            .flat_map(|dy| (-reach..=reach).map(move |dx| (px + dx, py + dy)))
+            .filter(on_ring),
+    ) else {
+        return false;
+    };
+    core < DONUT_CORE_TO_RING * ring
+}
+
+/// Fit one seed with a fixed β (PA-12, spec §3 F-1 and F-7; Plan A Task 6b).
+///
+/// 1. **Admission:** the width-start box of radius `⌈2·F_field⌉` about the seed's pixel must lie inside the image,
+///    else `OutsideImage` (PA-18: a star broader than the field width can still be admitted and meet the border as
+///    `RegionTooSmall`).
+/// 2. **The width start** `F_start` from the star's own second moments in that box ([`width_start`]).
+/// 3. **The region** grows from `max(3, ⌈1.5·F_start⌉)` to at most `clamp(⌈6·F_start⌉, 6, 96)` px, never past the
+///    border, while its median stands above its rim's ([`grow_region`]); the background start `b0` is the final
+///    rim's median, and fewer than 10 present pixels are `TooFewPixels`.
+/// 4. **The donut test** ([`is_donut`]) refuses an annular star `Donut` before any fit.
+/// 5. **The fit** starts at `b0`, `a0 = max − b0`, σ `F_start/2.3548` split by the moments' axis ratio (`√ratio`
+///    clamped to [1, 2]) at their angle; then the acceptance rules ([`accept`], `NarrowerThanPixel` among them).
+///
+/// The [`FitTrace`] records the region and the start whatever the result. A pixel `mask` leaves its `false` pixels
+/// out exactly like non-finite ones (Task 6a).
 #[allow(clippy::too_many_arguments)]
 fn fit_one(
     data: &[f32],
@@ -475,53 +681,43 @@ fn fit_one(
     w: usize,
     h: usize,
     seed: &Seed,
-    sigma0: f64,
-    _field_width: f64,
+    field_width: f64,
     beta: f64,
     p: &FitParams,
     scratch: &mut FitScratch,
 ) -> (Result<StarFit, RefusalReason>, FitTrace) {
-    // Admission: the seed must have room for the NOMINAL stamp. The
-    // adaptive region below starts at half of it and may grow to twice it,
-    // but a seed that cannot even host the nominal one sits on the border
-    // and is measuring a truncated star.
-    let nominal = stamp_radius(sigma0) as i64;
-    // `stamp_radius` is at most 48, so every radius below fits a u16.
+    let rb = width_start_box_radius(field_width);
+    // Until the region grows, its radius reads the width-start box's; the start width and background read NaN.
     let mut trace = FitTrace {
-        region_radius: nominal as u16,
+        region_radius: rb.min(u16::MAX as i64) as u16,
         background_start: f64::NAN,
-        width_start: GAUSSIAN_FWHM_PER_SIGMA * sigma0,
+        width_start: f64::NAN,
         growth_steps: 0,
         pixels_used: 0,
         converged: false,
     };
     let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
-    if cx - nominal < 0 || cy - nominal < 0 || cx + nominal >= w as i64 || cy + nominal >= h as i64
-    {
+    if cx - rb < 0 || cy - rb < 0 || cx + rb >= w as i64 || cy + rb >= h as i64 {
         return (Err(RefusalReason::OutsideImage), trace);
     }
+    let start = width_start(data, mask, w, seed, cx, cy, rb, field_width, scratch);
+    trace.width_start = start.fwhm;
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
-    let r_max = (2 * nominal).min(48).min(to_border);
-    let r_start = (nominal / 2).max(3).min(r_max);
-    let r = sampling_radius(
-        data,
-        mask,
-        w,
-        cx,
-        cy,
-        r_start,
-        r_max,
-        p,
-        &mut scratch.region,
-    );
+    let r_max = ((REGION_MAX_PER_WIDTH * start.fwhm).ceil() as i64)
+        .clamp(REGION_MAX_MIN_PX, REGION_MAX_MAX_PX)
+        .min(to_border);
+    let r_start = ((REGION_START_PER_WIDTH * start.fwhm).ceil() as i64)
+        .max(REGION_START_MIN_PX)
+        .min(r_max);
+    let (r, b0) = grow_region(data, mask, w, cx, cy, r_start, r_max, p, scratch);
     let step = p.region_growth_step_px.max(1) as i64;
+    // `r ≤ 96`, so the radius fits a u16.
     trace.region_radius = r as u16;
     trace.growth_steps = ((r - r_start) / step).clamp(0, u8::MAX as i64) as u8;
+    trace.background_start = b0;
     let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
     scratch.px.clear();
     scratch.px.reserve(cap);
-    scratch.vals.clear();
-    scratch.vals.reserve(cap);
     let mut peak = f64::NEG_INFINITY;
     // The five largest values seen, ascending (L-12's `peak5`).
     let mut top = [f64::NEG_INFINITY; 5];
@@ -531,14 +727,12 @@ fn fit_one(
             if !present(data, mask, i) {
                 continue;
             }
-            let v = data[i];
-            let v64 = v as f64;
+            let v64 = data[i] as f64;
             peak = peak.max(v64);
             if v64 > top[0] {
                 top[0] = v64;
                 top.sort_by(f64::total_cmp);
             }
-            scratch.vals.push(v);
             // F-2: stamp-centred coordinates (exact integers), the value
             // normalised below once the start background and amplitude are
             // known.
@@ -549,13 +743,14 @@ fn fit_one(
             });
         }
     }
-    // The region's present pixels: at most (2r+1)² ≤ 97², so a u32 holds it.
+    // The region's present pixels: at most (2r+1)² ≤ 193², so a u32 holds it.
     trace.pixels_used = scratch.px.len() as u32;
     if scratch.px.len() < 10 {
         return (Err(RefusalReason::TooFewPixels), trace);
     }
-    let b0 = median_in_place(&mut scratch.vals) as f64;
-    trace.background_start = b0;
+    if is_donut(data, mask, w, h, start.centroid, start.fwhm, b0) {
+        return (Err(RefusalReason::Donut), trace);
+    }
     let a0 = (peak - b0).max(1e-9);
     // F-2 (Plan A Task 5): the fitter sees a conditioned problem — the stamp
     // centred on (cx, cy) and the values as `(v − b0)/a0`, so it starts at
@@ -567,18 +762,12 @@ fn fit_one(
     for s in scratch.px.iter_mut() {
         s.value = (s.value - b0) / a0;
     }
-    // Size from the field σ (flux/peak), orientation and axis ratio from the
-    // stamp's moments: a circular θ = 0 seed leaves an elongated star in an
-    // axis-aligned local minimum, and Moffat wings inflate the moments' size.
-    // The moments are translation- and scale-invariant: the normalised stamp
-    // above 0 is the raw stamp above b0, divided by a0.
-    let (sx0, sy0, th0) = match moment_ellipse(&scratch.px, 0.0) {
-        Some((major, minor, theta)) => {
-            let q = (major / minor).clamp(1.0, 4.0).sqrt();
-            (sigma0 * q, sigma0 / q, theta)
-        }
-        None => (sigma0, sigma0, 0.0),
-    };
+    // Size from the star's own width start, orientation and axis ratio from its
+    // moments (PA-12): a circular θ = 0 start leaves an elongated star in an
+    // axis-aligned local minimum.
+    let sigma = start.fwhm / GAUSSIAN_FWHM_PER_SIGMA;
+    let q = start.axis_ratio.clamp(1.0, 4.0).sqrt();
+    let (sx0, sy0, th0) = (sigma * q, sigma / q, start.theta);
     let (ox, oy) = (cx as f64, cy as f64);
     // The conditioned entry point carries the Jacobian's θ column with its
     // correct sign (ruling R-OSP-3): `fit_moffat_2d_fixed_beta`'s column is
@@ -619,7 +808,8 @@ fn fit_one(
 
 /// The acceptance rules (math reference §1.4), each refusal with its reason. The first gate is one condition, as it
 /// always was; its reason is `NonFinite` when a parameter or the residual is not finite, else `ResidualTooLarge`
-/// when the residual reaches the cap, else `FitFailed` (`A ≤ 0` or an `α ≤ 0`).
+/// when the residual reaches the cap, else `FitFailed` (`A ≤ 0` or an `α ≤ 0`). The last (Task 6b) refuses a fit
+/// whose narrower FWHM is below 0.8 px `NarrowerThanPixel`.
 fn accept(
     m: &Moffat2DResult,
     seed: &Seed,
@@ -677,6 +867,11 @@ fn accept(
     );
     if 0.5 * p.growth * fwtm_x.max(fwtm_y) > r {
         return Err(RefusalReason::RegionTooSmall);
+    }
+    // Task 6b: a fit narrower than a pixel on either axis is a hot pixel (or a
+    // cosmic) that got a seed, not a star.
+    if m.fwhm_x().min(m.fwhm_y()) < NARROWEST_FWHM_PX {
+        return Err(RefusalReason::NarrowerThanPixel);
     }
     // F-2 (Plan A Task 5): canonical axes. The fitter's first axis is
     // whichever its start made it, so the same star could read (major, minor,
@@ -818,14 +1013,13 @@ pub(super) fn fit_all(
     w: usize,
     h: usize,
     seeds: &[Seed],
-    sigma0: f64,
     beta: f64,
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<StarFit> {
-    fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, mask, field_width, pool)
+    fit_all_outcomes(data, w, h, seeds, beta, p, mask, field_width, pool)
         .into_iter()
         .filter_map(|(result, _)| result.ok())
         .collect()
@@ -841,7 +1035,6 @@ fn fit_all_outcomes(
     w: usize,
     h: usize,
     seeds: &[Seed],
-    sigma0: f64,
     beta: f64,
     p: &FitParams,
     mask: Option<&[bool]>,
@@ -856,7 +1049,7 @@ fn fit_all_outcomes(
             // worker processes — `fit_one` clears each buffer itself, so
             // this is only the allocation that disappears, never the data.
             .map_init(FitScratch::default, |scratch, s| {
-                fit_one(data, mask, w, h, s, sigma0, field_width, beta, p, scratch)
+                fit_one(data, mask, w, h, s, field_width, beta, p, scratch)
             })
             .collect()
     };
@@ -882,11 +1075,12 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false).0
+    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false)
 }
 
-/// The field width a fit call reports (Task 6a): the caller's `Some(f)` with `from_stars = 0`, else
-/// [`field_width_of`] the seeds.
+/// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
+/// the caller's `Some(f)` with `from_stars = 0`, else [`field_width_of`] the seeds. A given width that is not a
+/// positive number is refused with a `warn!` and the seeds' own is used.
 fn resolve_field_width(
     data: &[f32],
     w: usize,
@@ -896,16 +1090,25 @@ fn resolve_field_width(
     given: Option<f64>,
 ) -> FieldWidth {
     match given {
-        Some(fwhm_px) => FieldWidth {
+        Some(fwhm_px) if fwhm_px.is_finite() && fwhm_px > 0.0 => FieldWidth {
             fwhm_px,
             from_stars: 0,
         },
+        Some(bad) => {
+            warn!(
+                fwhm_px = bad,
+                count = seeds.len(),
+                "fit: the given field width is not a positive number; the seeds' own is used"
+            );
+            field_width_of(data, w, h, seeds, mask)
+        }
         None => field_width_of(data, w, h, seeds, mask),
     }
 }
 
-/// [`fit_stars`], also returning one [`FitDiagnostics`] per seed, in seed
-/// order, when `diagnostics` is set (empty otherwise: the run never asks).
+/// [`fit_stars`], also keeping one [`FitDiagnostics`] per seed, in seed
+/// order, in [`FitOutcome::diagnostics`] when `diagnostics` is set (empty
+/// otherwise: the run never asks).
 /// `mask` and `field_width` as [`super::FitStarsOptions`] carries them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_diagnosed(
@@ -919,28 +1122,25 @@ pub(super) fn fit_stars_diagnosed(
     field_width: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
-) -> (FitOutcome, Vec<FitDiagnostics>) {
+) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
-    let sigma0 = initial_sigma(seeds);
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
         // Tier C Task 1: a caller-resolved β (the group β, or any other
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
         // `Auto` search below never runs for it.
         PsfModel::Fixed(b) => b,
-        PsfModel::Auto => {
-            super::beta::auto_beta(data, w, h, seeds, sigma0, p, mask, field.fwhm_px, pool)
-        }
+        PsfModel::Auto => super::beta::auto_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
     };
     fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
 /// [`fit_stars`] itself runs once `Auto`'s search (or `Moffat4`'s fixed
-/// 4.0) has resolved a model to a number: `σ0` from the seeds (the same
-/// `initial_sigma` estimate `fit_stars` computes), then
-/// `dedupe(fit_all(..))`. `beta` is echoed back unchanged on the returned
-/// `FitOutcome`.
+/// 4.0) has resolved a model to a number: the field width from the seeds
+/// (the same [`field_width_of`] `fit_stars` reads), every star from its own
+/// width start (Task 6b), then `dedupe(fit_all(..))`. `beta` is echoed back
+/// unchanged on the returned `FitOutcome`.
 ///
 /// Exposed so a caller that must fit two independent planes at the SAME β
 /// — e.g. local normalization's `relative_scale`, which resolves β from a
@@ -958,11 +1158,12 @@ pub fn fit_stars_with_beta(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false).0
+    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false)
 }
 
-/// [`fit_stars_with_beta`], also returning one [`FitDiagnostics`] per seed,
-/// in seed order, when `diagnostics` is set (empty otherwise).
+/// [`fit_stars_with_beta`], also keeping one [`FitDiagnostics`] per seed, in
+/// seed order, in [`FitOutcome::diagnostics`] when `diagnostics` is set
+/// (empty otherwise).
 ///
 /// The outcomes (M-4): every seed's result comes off [`fit_all_outcomes`]
 /// in seed order; the accepted fits are read off it sequentially — the very
@@ -982,7 +1183,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
     field_width: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
-) -> (FitOutcome, Vec<FitDiagnostics>) {
+) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
     fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
 }
@@ -1000,20 +1201,8 @@ fn fit_at_width(
     field: FieldWidth,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
-) -> (FitOutcome, Vec<FitDiagnostics>) {
-    let sigma0 = initial_sigma(seeds);
-    let per_seed = fit_all_outcomes(
-        data,
-        w,
-        h,
-        seeds,
-        sigma0,
-        beta,
-        p,
-        mask,
-        field.fwhm_px,
-        pool,
-    );
+) -> FitOutcome {
+    let per_seed = fit_all_outcomes(data, w, h, seeds, beta, p, mask, field.fwhm_px, pool);
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(per_seed.len());
     let mut traces: Vec<FitTrace> =
         Vec::with_capacity(if diagnostics { per_seed.len() } else { 0 });
@@ -1048,22 +1237,20 @@ fn fit_at_width(
         seeds.len(),
         "every seed has exactly one outcome (ruling F13)"
     );
-    let records = traces
+    let diagnostics = traces
         .into_iter()
         .zip(outcomes)
         .enumerate()
         .map(|(seed, (trace, outcome))| trace.record(seed, outcome))
         .collect();
-    (
-        FitOutcome {
-            fits,
-            beta,
-            seeds: seeds.len(),
-            refused,
-            field_width: field,
-        },
-        records,
-    )
+    FitOutcome {
+        fits,
+        beta,
+        seeds: seeds.len(),
+        refused,
+        field_width: field,
+        diagnostics,
+    }
 }
 
 #[cfg(test)]
@@ -1447,14 +1634,15 @@ mod tests {
         );
     }
 
-    // --- Task 5 pin: sampling_radius's incremental ring-append multiset ---
+    // --- Task 5 pins of the incremental ring-append multiset, moved to `grow_region` (Plan A Task 6b, ruling F14) ---
+    //
+    // `sampling_radius` (the median-falls rule) is retired; `grow_region` (PA-12) grows the same multiset through the
+    // same `region_median`. The oracle below rebuilds every square and every rim from scratch and applies PA-12's
+    // rule independently; the square medians it visits are Task 5's recorded literals (the squares are the same).
 
-    /// An INDEPENDENT re-implementation of the pre-Task-5 rescan-every-step
-    /// algorithm — full `(2r+1)²` square rebuild at every radius, never
-    /// calling `region_median`/`push_finite_row` — so the pin tests below
-    /// check the incremental code against a real oracle, not against a copy
-    /// of itself.
-    fn pin_rescan_region_median(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<f64> {
+    /// An INDEPENDENT rescan oracle: the full `(2r+1)²` square's median and maximum, never calling
+    /// `region_median`/`push_finite_row`.
+    fn pin_rescan_square(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<(f64, f64)> {
         let mut v: Vec<f32> = Vec::new();
         for y in cy - r..=cy + r {
             let row = y as usize * w;
@@ -1468,13 +1656,31 @@ mod tests {
         if v.is_empty() {
             return None;
         }
+        let max = v.iter().fold(f64::NEG_INFINITY, |m, &p| m.max(p as f64));
+        Some((median_in_place(&mut v) as f64, max))
+    }
+
+    /// The oracle's rim: every pixel of the square whose Chebyshev distance from the centre is exactly `r`.
+    fn pin_rescan_rim(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<f64> {
+        let mut v: Vec<f32> = Vec::new();
+        for y in cy - r..=cy + r {
+            for x in cx - r..=cx + r {
+                if (x - cx).abs().max((y - cy).abs()) == r {
+                    let p = data[y as usize * w + x as usize];
+                    if p.is_finite() {
+                        v.push(p);
+                    }
+                }
+            }
+        }
+        if v.is_empty() {
+            return None;
+        }
         Some(median_in_place(&mut v) as f64)
     }
 
-    /// The pre-Task-5 growth loop over [`pin_rescan_region_median`], byte-
-    /// for-byte the same control flow `sampling_radius` has (same stop
-    /// rule), returning the stopping radius AND every median it visited.
-    fn pin_rescan_sampling_radius(
+    /// PA-12's growth over the oracle: the stopping radius, its rim median, and every square median visited.
+    fn pin_rescan_grow_region(
         data: &[f32],
         w: usize,
         cx: i64,
@@ -1482,34 +1688,25 @@ mod tests {
         r_start: i64,
         r_max: i64,
         p: &FitParams,
-    ) -> (i64, Vec<f64>) {
-        let step = p.region_growth_step_px.max(1) as i64;
+    ) -> (i64, f64, Vec<f64>) {
         let mut seq = Vec::new();
         let mut r = r_start;
-        let Some(mut prev) = pin_rescan_region_median(data, w, cx, cy, r) else {
-            return (r, seq);
-        };
-        seq.push(prev);
-        while r + step <= r_max {
-            let next = r + step;
-            let Some(m) = pin_rescan_region_median(data, w, cx, cy, next) else {
-                return (r, seq);
-            };
-            r = next;
+        let mut max = f64::NEG_INFINITY;
+        loop {
+            let (m, square_max) = pin_rescan_square(data, w, cx, cy, r).expect("a present square");
+            max = max.max(square_max);
             seq.push(m);
-            if !(m < (1.0 - p.region_growth_min_drop) * prev) {
-                break;
+            let s = pin_rescan_rim(data, w, cx, cy, r).unwrap_or(m);
+            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
+                return (r, s, seq);
             }
-            prev = m;
+            r += 1;
         }
-        (r, seq)
     }
 
-    /// Mirrors `sampling_radius`'s own loop exactly, but through the real
-    /// (incremental) `region_median`, collecting every intermediate median
-    /// — `sampling_radius` itself only returns the final radius. Plan A Task 6a
-    /// (ruling F14): `region_median` takes the pixel mask; `None` here.
-    fn incremental_sampling_radius_with_seq(
+    /// Mirrors `grow_region`'s own loop exactly, but collecting every square median it visits through the real
+    /// (incremental) `region_median` — `grow_region` itself returns only the radius and the rim median.
+    fn incremental_grow_region_with_seq(
         data: &[f32],
         w: usize,
         cx: i64,
@@ -1517,52 +1714,52 @@ mod tests {
         r_start: i64,
         r_max: i64,
         p: &FitParams,
-    ) -> (i64, Vec<f64>) {
-        let step = p.region_growth_step_px.max(1) as i64;
+    ) -> (i64, f64, Vec<f64>) {
         let mut scratch: Vec<f32> = Vec::new();
+        let mut rim: Vec<f32> = Vec::new();
         let mut seq = Vec::new();
         let mut r = r_start;
-        let Some(mut prev) = region_median(data, None, w, cx, cy, None, r, &mut scratch) else {
-            return (r, seq);
-        };
-        seq.push(prev);
-        while r + step <= r_max {
-            let next = r + step;
-            let Some(m) = region_median(data, None, w, cx, cy, Some(r), next, &mut scratch) else {
-                return (r, seq);
-            };
-            r = next;
-            seq.push(m);
-            if !(m < (1.0 - p.region_growth_min_drop) * prev) {
-                break;
+        let (mut m, mut max) =
+            region_median(data, None, w, cx, cy, None, r, &mut scratch).expect("a present square");
+        seq.push(m);
+        loop {
+            let s = rim_median(data, None, w, cx, cy, r, &mut rim).unwrap_or(m);
+            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
+                return (r, s, seq);
             }
-            prev = m;
+            let (m_next, max_next) =
+                region_median(data, None, w, cx, cy, Some(r), r + 1, &mut scratch).expect("grows");
+            r += 1;
+            m = m_next;
+            max = max.max(max_next);
+            seq.push(m);
         }
-        (r, seq)
     }
 
-    /// A fixture star well inside the field, growth walking several steps.
-    #[test]
-    fn sampling_radius_incremental_matches_rescan_on_a_normal_star() {
-        let stars = [round(100.4, 100.6, 0.6)];
-        let mut data = moffat_field(200, 200, &stars, 4.0, 0.05);
-        add_noise(&mut data, 0.01, 41);
+    /// The three agree bit for bit, and the visited square medians are the first of Task 5's recorded literals.
+    fn assert_growth_matches(
+        data: &[f32],
+        w: usize,
+        (cx, cy): (i64, i64),
+        (r_start, r_max): (i64, i64),
+        task5_medians: &[f64],
+    ) -> (i64, f64) {
         let p = FitParams::default();
-        let (cx, cy) = (100i64, 100i64);
-        let (r_start, r_max) = (5i64, 25i64);
-
-        let (r_ref, seq_ref) = pin_rescan_sampling_radius(&data, 200, cx, cy, r_start, r_max, &p);
-        let (r_seq, seq_new) =
-            incremental_sampling_radius_with_seq(&data, 200, cx, cy, r_start, r_max, &p);
-        let mut scratch: Vec<f32> = Vec::new();
-        // Plan A Task 6a (ruling F14): `sampling_radius` takes the pixel mask; `None` = every pixel present.
-        let r_prod = sampling_radius(&data, None, 200, cx, cy, r_start, r_max, &p, &mut scratch);
-
+        let (r_ref, s_ref, seq_ref) = pin_rescan_grow_region(data, w, cx, cy, r_start, r_max, &p);
+        let (r_seq, s_seq, seq_new) =
+            incremental_grow_region_with_seq(data, w, cx, cy, r_start, r_max, &p);
+        let mut scratch = FitScratch::default();
+        let (r_prod, s_prod) = grow_region(data, None, w, cx, cy, r_start, r_max, &p, &mut scratch);
         assert_eq!(
-            r_prod, r_seq,
-            "production sampling_radius vs the sequence wrapper"
+            (r_prod, s_prod.to_bits()),
+            (r_seq, s_seq.to_bits()),
+            "production vs the sequence wrapper"
         );
-        assert_eq!(r_ref, r_seq, "growth stopped at a different radius");
+        assert_eq!(
+            (r_ref, s_ref.to_bits()),
+            (r_seq, s_seq.to_bits()),
+            "growth stopped elsewhere"
+        );
         assert_eq!(seq_ref.len(), seq_new.len(), "different number of steps");
         for (a, b) in seq_ref.iter().zip(&seq_new) {
             assert_eq!(
@@ -1571,14 +1768,36 @@ mod tests {
                 "median sequence: {seq_ref:?} vs {seq_new:?}"
             );
         }
+        let n = seq_new.len().min(task5_medians.len());
+        assert!(
+            n > 1,
+            "the growth visits more than its first square: {seq_new:?}"
+        );
+        for (got, want) in seq_new[..n].iter().zip(&task5_medians[..n]) {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{seq_new:?} vs Task 5's {task5_medians:?}"
+            );
+        }
+        (r_prod, s_prod)
+    }
 
-        // Recorded literals (Task 5, pinned before the incremental change
-        // shipped, cross-checked against `pin_rescan_sampling_radius` above
-        // on every run — this assertion additionally survives a future
-        // change that broke both the oracle and the incremental code the
-        // same way).
-        assert_eq!(r_prod, 15);
-        let expected: [f64; 11] = [
+    // Recorded at Task 6b on this build: the stopping radius and its rim median, the fit's background start (the
+    // normal star stops at r = 11 under PA-12's rule; the border star runs to its cap, to_border = 13).
+    const R_NORMAL: i64 = 11;
+    const S_NORMAL: f64 = 0.05049996078014374;
+    const R_BORDER: i64 = 13;
+    const S_BORDER: f64 = 0.04011831432580948;
+
+    /// A fixture star well inside the field, growth walking several steps.
+    #[test]
+    fn grow_region_incremental_matches_rescan_on_a_normal_star() {
+        let stars = [round(100.4, 100.6, 0.6)];
+        let mut data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.01, 41);
+        // Task 5's recorded square medians at r = 5…15 (pinned before the incremental change shipped).
+        let task5: [f64; 11] = [
             0.11737800389528275,
             0.07933449000120163,
             0.06783409416675568,
@@ -1591,48 +1810,27 @@ mod tests {
             0.05354057624936104,
             0.053332407027482986,
         ];
-        assert_eq!(seq_new.len(), expected.len());
-        for (got, want) in seq_new.iter().zip(&expected) {
-            assert_eq!(got.to_bits(), want.to_bits(), "{seq_new:?} vs {expected:?}");
-        }
+        let (r, s) = assert_growth_matches(&data, 200, (100, 100), (5, 25), &task5);
+        // Recorded at Task 6b: the stopping radius and its rim median (the background start).
+        assert_eq!(
+            (r, s.to_bits()),
+            (R_NORMAL, S_NORMAL.to_bits()),
+            "r {r}, s {s:?}"
+        );
     }
 
     /// A fixture star near the image border, so `r_max` is tight and the
     /// growth loop exercises a shorter, boundary-constrained walk.
     #[test]
-    fn sampling_radius_incremental_matches_rescan_near_the_border() {
+    fn grow_region_incremental_matches_rescan_near_the_border() {
         let stars = [round(15.3, 12.7, 0.5)];
         let mut data = moffat_field(120, 120, &stars, 3.0, 0.04);
         add_noise(&mut data, 0.008, 43);
-        let p = FitParams::default();
         let (cx, cy) = (15i64, 13i64);
         let to_border = cx.min(cy).min(120 - 1 - cx).min(120 - 1 - cy);
-        let (r_start, r_max) = (3i64, to_border);
-        assert!(r_max >= r_start, "fixture must leave room to grow");
-
-        let (r_ref, seq_ref) = pin_rescan_sampling_radius(&data, 120, cx, cy, r_start, r_max, &p);
-        let (r_seq, seq_new) =
-            incremental_sampling_radius_with_seq(&data, 120, cx, cy, r_start, r_max, &p);
-        let mut scratch: Vec<f32> = Vec::new();
-        // Plan A Task 6a (ruling F14): `sampling_radius` takes the pixel mask; `None` = every pixel present.
-        let r_prod = sampling_radius(&data, None, 120, cx, cy, r_start, r_max, &p, &mut scratch);
-
-        assert_eq!(
-            r_prod, r_seq,
-            "production sampling_radius vs the sequence wrapper"
-        );
-        assert_eq!(r_ref, r_seq, "growth stopped at a different radius");
-        assert_eq!(seq_ref.len(), seq_new.len(), "different number of steps");
-        for (a, b) in seq_ref.iter().zip(&seq_new) {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "median sequence: {seq_ref:?} vs {seq_new:?}"
-            );
-        }
-
-        assert_eq!(r_prod, 13);
-        let expected: [f64; 11] = [
+        assert!(to_border >= 3, "fixture must leave room to grow");
+        // Task 5's recorded square medians at r = 3…13.
+        let task5: [f64; 11] = [
             0.255771666765213,
             0.1849888265132904,
             0.12626828253269196,
@@ -1645,10 +1843,12 @@ mod tests {
             0.04728369787335396,
             0.04579973965883255,
         ];
-        assert_eq!(seq_new.len(), expected.len());
-        for (got, want) in seq_new.iter().zip(&expected) {
-            assert_eq!(got.to_bits(), want.to_bits(), "{seq_new:?} vs {expected:?}");
-        }
+        let (r, s) = assert_growth_matches(&data, 120, (cx, cy), (3, to_border), &task5);
+        assert_eq!(
+            (r, s.to_bits()),
+            (R_BORDER, S_BORDER.to_bits()),
+            "r {r}, s {s:?}"
+        );
     }
 
     #[test]
@@ -1963,5 +2163,283 @@ mod tests {
             out.fits[0].peak5,
             expected
         );
+    }
+
+    // --- Plan A Task 6b (F-1 with F-7): the per-star width start, the region, the rim background, the refusals ---
+
+    use crate::star_measure::{measure_plane, seeds, MeasureOptions, SeedSpec};
+    use crate::test_support::nan_border_field;
+
+    fn one(x: f64, y: f64, amp: f64, alpha: f64) -> MoffatStar {
+        MoffatStar {
+            x,
+            y,
+            amp,
+            alpha_x: alpha,
+            alpha_y: alpha,
+            theta: 0.0,
+        }
+    }
+    fn seed(s: &MoffatStar) -> Seed {
+        Seed {
+            x: s.x,
+            y: s.y,
+            peak: s.amp,
+            flux: 1.0,
+        }
+    }
+    fn fit_with(
+        data: &[f32],
+        w: usize,
+        h: usize,
+        seeds: &[Seed],
+        field: f64,
+    ) -> (FitOutcome, Vec<FitDiagnostics>) {
+        let opts = FitStarsOptions {
+            field_width: Some(field),
+            diagnostics: true,
+            ..Default::default()
+        };
+        let out = fit_stars_at(data, w, h, seeds, 4.0, &opts, None);
+        let d = out.diagnostics.clone();
+        (out, d)
+    }
+
+    /// A deterministic 2000-point sunflower lattice over the annulus `r_in ≤ r ≤ r_out` about `(cx, cy)`: point `k`
+    /// at the radius enclosing the area fraction `(k + ½)/2000` of the annulus, turned by the golden angle per point,
+    /// so the points sample the annulus uniformly by area.
+    fn ring_samples(cx: f64, cy: f64, r_in: f64, r_out: f64) -> Vec<(f64, f64)> {
+        const N: usize = 2000;
+        let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+        (0..N)
+            .map(|k| {
+                let t = (k as f64 + 0.5) / N as f64;
+                let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
+                let (s, c) = (k as f64 * golden).sin_cos();
+                (cx + r * c, cy + r * s)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn broad_stars_fit_inside_a_region_that_scales_with_their_own_width() {
+        // FWHM 14 at β 4: α = 14 / (2√(2^{1/4} − 1)) = 16.09; half-FWTM = 14.2 px — the D1 cause-1 regime
+        let stars: Vec<MoffatStar> = (0..20)
+            .map(|i| {
+                one(
+                    120.0 + (i % 5) as f64 * 180.0,
+                    120.0 + (i / 5) as f64 * 180.0,
+                    0.3,
+                    16.09,
+                )
+            })
+            .collect();
+        let data = moffat_field(1024, 840, &stars, 4.0, 0.05);
+        let seeds: Vec<Seed> = stars.iter().map(seed).collect();
+        let (out, diag) = fit_with(&data, 1024, 840, &seeds, 14.0);
+        assert_eq!(out.fits.len(), 20, "{:?}", out.refused);
+        for (f, d) in out.fits.iter().zip(&diag) {
+            assert!((f.fwhm() / 14.0 - 1.0).abs() < 0.01, "{}", f.fwhm());
+            assert!(
+                d.region_radius as f64 >= 0.5 * f.fwtm_x.max(f.fwtm_y),
+                "{d:?}"
+            );
+            assert!(d.region_radius as f64 >= 1.5 * 14.0 && d.region_radius <= 96);
+        }
+    }
+
+    #[test]
+    fn donut_is_refused_with_its_reason() {
+        // an annulus (outer 6, obstruction 2.4) blurred by a Gaussian of σ 1.1 (FWHM 2.6), rendered by numeric convolution
+        let (w, h) = (80usize, 80usize);
+        let mut data = vec![0.05f32; w * h];
+        let ring = ring_samples(40.0, 40.0, 2.4, 6.0); // 2000 samples of the annulus, uniform
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0f64;
+                for &(ux, uy) in &ring {
+                    let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
+                    acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
+                }
+                data[y * w + x] += (0.3 * acc / 2000.0) as f32;
+            }
+        }
+        let (out, diag) = fit_with(
+            &data,
+            w,
+            h,
+            &[Seed {
+                x: 40.0,
+                y: 40.0,
+                peak: 0.1,
+                flux: 1.0,
+            }],
+            3.0,
+        );
+        assert!(
+            out.fits.is_empty(),
+            "a donut must never fit: {:?}",
+            out.fits
+        );
+        assert_eq!(diag[0].outcome, Outcome::Refused(RefusalReason::Donut));
+    }
+
+    /// A pin on the ring radius's 1.5-px floor (ruling F28: before this task no star is refused `Donut` at all, so it
+    /// cannot fail by behaviour; it fails on a Donut rule without the floor): a sharp real star is never a donut.
+    /// Computed on point-sampled Moffat-4 and Gaussian stars over 100 sub-pixel phases: core/ring ≥ 2.32 at FWHM 1.2,
+    /// ≥ 1.61 at 1.6, ≥ 1.37 at 2.0 (the unfloored radius read 0.29–0.59 there).
+    #[test]
+    fn sharp_stars_are_never_refused_as_donuts() {
+        for (k, fwhm) in [1.2f64, 1.6, 2.0].into_iter().enumerate() {
+            let alpha = fwhm / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+            let stars: Vec<MoffatStar> = (0..25)
+                .map(|i| {
+                    one(
+                        20.0 + (i % 5) as f64 * 30.1 - 0.2,
+                        20.0 + (i / 5) as f64 * 30.1 - 0.2,
+                        0.3,
+                        alpha,
+                    )
+                })
+                .collect();
+            let mut data = moffat_field(160, 160, &stars, 4.0, 0.05);
+            crate::test_support::add_noise(&mut data, 0.002, k as u64);
+            let seeds: Vec<Seed> = stars.iter().map(seed).collect();
+            let (_, diag) = fit_with(&data, 160, 160, &seeds, fwhm);
+            assert_eq!(diag.len(), 25);
+            assert!(
+                diag.iter()
+                    .all(|d| d.outcome != Outcome::Refused(RefusalReason::Donut)),
+                "FWHM {fwhm}: {diag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_given_hot_pixel_is_refused_narrower_than_pixel() {
+        let (mut data, w, h) = crate::test_support::fixture_field(3, 0.0, 0.002);
+        data[100 * w + 100] = 0.9;
+        let (out, diag) = fit_with(
+            &data,
+            w,
+            h,
+            &[Seed {
+                x: 100.0,
+                y: 100.0,
+                peak: 0.85,
+                flux: 0.85,
+            }],
+            3.0,
+        );
+        assert!(out.fits.is_empty());
+        assert_eq!(
+            diag[0].outcome,
+            Outcome::Refused(RefusalReason::NarrowerThanPixel)
+        );
+    }
+
+    #[test]
+    fn rim_background_start_is_the_sky_under_nebulosity() {
+        // sky 0.05 + a quadratic ramp of amplitude 0.02 over the 80-px stamp; σ_px = 0.002; the F-7 condition at one star
+        let (w, h) = (80usize, 80usize);
+        let mut data = moffat_field(w, h, &[one(40.3, 39.7, 0.3, 3.0)], 4.0, 0.0);
+        for y in 0..h {
+            for x in 0..w {
+                let r2 = ((x as f64 - 10.0).powi(2) + (y as f64 - 70.0).powi(2)) / 6400.0;
+                data[y * w + x] += 0.05 + (0.02 * r2) as f32;
+            }
+        }
+        crate::test_support::add_noise(&mut data, 0.002, 4);
+        let local_sky =
+            0.05 + 0.02 * ((40.3f64 - 10.0).powi(2) + (39.7f64 - 70.0).powi(2)) / 6400.0;
+        let (out, diag) = fit_with(
+            &data,
+            w,
+            h,
+            &[Seed {
+                x: 40.3,
+                y: 39.7,
+                peak: 0.3,
+                flux: 1.0,
+            }],
+            3.0,
+        );
+        assert_eq!(out.fits.len(), 1);
+        assert!(
+            (diag[0].background_start - local_sky).abs() < 0.3 * 0.002,
+            "b0 {} vs sky {local_sky}",
+            diag[0].background_start
+        );
+        assert!((out.fits[0].background - local_sky).abs() < 0.3 * 0.002);
+    }
+
+    #[test]
+    fn border_limited_region_refuses_a_broad_star_region_too_small() {
+        // PA-18: a FWHM-12 star (α 13.8) in a FWHM-3 field, 10 px from the border: the width-start box (radius 6) fits,
+        // the region is clipped at r = 10, and 0.5·FWTM = 12.2 > 10 → RegionTooSmall
+        let data = moffat_field(200, 200, &[one(10.0, 100.0, 0.3, 13.8)], 4.0, 0.05);
+        let (out, diag) = fit_with(
+            &data,
+            200,
+            200,
+            &[Seed {
+                x: 10.0,
+                y: 100.0,
+                peak: 0.3,
+                flux: 1.0,
+            }],
+            3.0,
+        );
+        assert!(out.fits.is_empty());
+        assert_eq!(
+            diag[0].outcome,
+            Outcome::Refused(RefusalReason::RegionTooSmall)
+        );
+        assert_eq!(diag[0].region_radius, 10);
+    }
+
+    #[test]
+    fn a_star_whose_width_start_box_leaves_the_image_is_outside_image() {
+        let data = moffat_field(200, 200, &[one(4.0, 100.0, 0.3, 3.0)], 4.0, 0.05);
+        let (out, diag) = fit_with(
+            &data,
+            200,
+            200,
+            &[Seed {
+                x: 4.0,
+                y: 100.0,
+                peak: 0.3,
+                flux: 1.0,
+            }],
+            3.0,
+        );
+        assert!(out.fits.is_empty());
+        assert_eq!(
+            diag[0].outcome,
+            Outcome::Refused(RefusalReason::OutsideImage)
+        );
+    }
+
+    #[test]
+    fn nan_border_region_growth_skips_non_finite_pixels() {
+        let data = nan_border_field(240, 240, 6, true);
+        let m = measure_plane(
+            &data,
+            240,
+            240,
+            &MeasureOptions {
+                diagnostics: true,
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: seeds::DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.stars.len(), 40);
+        assert!(m
+            .stars
+            .iter()
+            .all(|f| f.background.is_finite() && f.fwhm().is_finite()));
     }
 }
