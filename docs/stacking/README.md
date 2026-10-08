@@ -1940,3 +1940,48 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `tmean_flux`, `psf_signal_weight` and `psf_snr`.
     - The counts, β and every noise/sky field are unchanged. The module-vs-adapter equality pins stay
       equalities.
+  - **Acceptance.** The lab step `t05-f2` is recorded in athenaeum-lab `star-lab/results/plan-a/t05-f2/` (commit
+    62dacd9).
+    - **The bar holds.** Row 4 `angle` `eff` against the prepixel CRLB is 0.82–1.31 on all 24 `shape` families
+      with e ≥ 0.3 (t04: 3.40–9.76; `shape/f2.6/e0.3/t30` rms 44.56° → 25.61°, `e0.5/t30` 32.34° → 11.88°).
+      `axis order` is 100 % on every family, path `measure` (77 978 fits, 0 minor-first). Path-compare part 2
+      reads `fwhm_x < fwhm_y` on 0 of N on every shape family (baseline 71–145 on e0.3). The legacy analysis
+      control is bit-identical.
+    - **Attribution.** Two diagnostic arms ran on local scratch branches from 7658d698 and were never merged:
+      - the conditioning with the legacy column: 307 moved, 35 missed, every one a last-bit change (≤ 1.1e-13)
+        but one `betas@10` image;
+      - the corrected column without the conditioning: 11 185 moved, 1 523 missed;
+      - full F-2 for comparison: 11 076 moved, 1 521 missed.
+
+      The corrected θ column therefore owns every moved and missed group. The conditioning is a near no-op on
+      today's fits, because the legacy fits stopped on the stall, not on the step-size test. The canonical axes
+      only relabel; they account for the first part of the angle gain, 3.40–9.76 → 2.37–7.95.
+    - **Owner decision, 2026-10-08:** the corrected column is accepted. Its degradations are a tracked debt.
+    - **The design list.** It was amended by controller ruling (`design.json`, 42 entries, each new one noted as
+      the corrected θ column's). It sets aside row 4 `ecc` (every family) and `floor`, rows 3 and 5, row 2
+      `centroid` (measure and register), row 6 `captured fraction`, row 8, and `kernel growth` on
+      `resampled/f3.0`/betas@10. It reports the row 1 and row 10 counts. With it both no-regression diffs PASS
+      against t04 and t01c: 0 moved, 0 missed, 0 lost, control 0.
+    - **The round-star ecc floor** is accepted as the free-θ noise floor. On `background/flat`, `median_e` rises
+      from 0.1107 to 0.1255, beside the ERP's free-θ Moffat value of 0.1279.
+    - **The debt.** athenaeum-lab `bin/debt_check.py` checks `results/plan-a/debt.json`, groups that are judged
+      against t01c every time:
+      - row 3 `fwhm` `bias` and `scatter`, on `pointfit` only (spec D-2; prepixel and pixbox are printed, never
+        judged);
+      - row 5 `background` `bias`;
+      - row 2 `centroid` `bias_x`/`bias_y` and `scatter_x`/`scatter_y`, on measure and on register.
+
+      Each group PASSES when its head pooled median (of |value| for a bias key) is no higher than the base's,
+      and the count of (row, key) judgments worse than the base beyond SE exceeds the count better beyond SE by
+      no more than 2·√(worse + better). The target is every group PASS by the end of Plan A, checked at Tasks
+      6b, 9 and 14. The starting debt at t05 (`t05-f2/debt.txt`):
+
+      | group | worse / better | pooled median t01c → t05 | verdict |
+      | ---- | ---- | ---- | ---- |
+      | fwhm bias (measure, pointfit) | 96 / 69 | 0.01045 → 0.00969 | OPEN (sign test) |
+      | fwhm scatter (measure, pointfit) | 68 / 98 | 0.01552 → 0.01553 | OPEN (median) |
+      | background bias (measure) | 141 / 36 | 0.0502 → 0.0563 | OPEN (median and sign test) |
+      | centroid bias (measure) | 33 / 34 | 0.00175 → 0.00170 | PASS |
+      | centroid scatter (measure) | 42 / 48 | 0.0237 → 0.0239 | OPEN (median) |
+      | centroid bias (register) | 22 / 20 | 0.00128 → 0.00136 | OPEN (median) |
+      | centroid scatter (register) | 40 / 33 | 0.0181 → 0.0179 | PASS |
