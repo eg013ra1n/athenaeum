@@ -2042,7 +2042,14 @@ mod tests {
                 let data = gaussian_field(W, H, &[(cx, cy, 0.5)], sigma, 0.01);
                 let name = format!("f{i}{j}.fits");
                 paths.push(write_mono(dir.path(), &name, W, H, &data));
-                maps.push(translation_map(-(i as f64) / 3.0, -(j as f64) / 3.0));
+                // `translation_map(dx, dy)` maps subject x to reference x − dx (its
+                // matrix carries −dx), so (i/3, j/3) brings this frame's star at
+                // (20 + i/3, 20 + j/3) to reference (20, 20). The call used to pass
+                // (−i/3, −j/3), which sent it to (20 + 2i/3, 20 + 2j/3): the nine copies
+                // sat on a 3x3 grid of pitch 4/3 output px and the plane was a jagged
+                // composite, not a drizzled star (an M3 fixture bug, found in Plan A
+                // Task 6b round 3b).
+                maps.push(translation_map(i as f64 / 3.0, j as f64 / 3.0));
             }
         }
         let weight = [1.0f64];
