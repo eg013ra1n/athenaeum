@@ -2,15 +2,24 @@
 //! adaptive sampling region, the acceptance rules, the hybrid PSF/aperture flux inside each fit's FWTM ellipse and the
 //! ±1 px duplicate drop. Moved verbatim from `psf_signal` (Plan A Task 2); the `Auto` β search lives in
 //! [`super::beta`]. Coordinates are 0-based pixel centres.
+//!
+//! F-0 (Plan A Task 4): every seed gets exactly one outcome — an accepted fit or a counted
+//! [`RefusalReason`] — collected in seed order from the same parallel chain, so the accepted fits, their order and
+//! every number are what they were before the outcomes were recorded.
 
 use std::collections::HashMap;
+use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
 
 use astroimage::analysis::fitting::{fit_moffat_2d_fixed_beta, Moffat2DResult, PixelSample};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 use crate::integration::stats::median_in_place;
+
+/// `2√(2 ln 2)`: a Gaussian's FWHM per σ (the start width [`FitDiagnostics::width_start`] reports).
+const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +92,58 @@ impl Default for FitParams {
     }
 }
 
+/// Per-accepted-fit flags (spec 2026-10-07 §3 F-0), persisted as the `.athf` record's flags byte
+/// (`stacking::fits_artifact`). Set from Task 8 (`SATURATED`) and Task 9 (`BETA_AT_CAP`); nothing sets them yet, so
+/// every fit reads none. A bit this build does not name is kept as it is (a newer writer's flag survives a round
+/// trip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StarFlags(pub u8);
+
+impl StarFlags {
+    /// The star's core is clipped (F-3).
+    pub const SATURATED: StarFlags = StarFlags(1);
+    /// The fitted β sits at its bound (F-4).
+    pub const BETA_AT_CAP: StarFlags = StarFlags(2);
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn contains(self, other: StarFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`).
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (StarFlags::SATURATED, "saturated"),
+            (StarFlags::BETA_AT_CAP, "betaAtCap"),
+        ]
+        .into_iter()
+        .filter(|(f, _)| self.contains(*f))
+        .map(|(_, n)| n)
+        .collect()
+    }
+}
+
+impl BitOr for StarFlags {
+    type Output = StarFlags;
+    fn bitor(self, rhs: StarFlags) -> StarFlags {
+        StarFlags(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for StarFlags {
+    fn bitor_assign(&mut self, rhs: StarFlags) {
+        self.0 |= rhs.0;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StarFit {
@@ -108,6 +169,10 @@ pub struct StarFit {
     /// artifact.
     #[serde(skip, default = "not_measured")]
     pub peak5: f64,
+    /// [`StarFlags`]: written and read as the `.athf` flags byte; a fit decoded from a file written before Plan A
+    /// Task 4 (whose byte is 0) reads none.
+    #[serde(default)]
+    pub flags: StarFlags,
 }
 
 fn not_measured() -> f64 {
@@ -141,6 +206,8 @@ pub struct FitOutcome {
     pub beta: f64,
     /// Seeds handed in.
     pub seeds: usize,
+    /// The seeds not accepted, by reason (F-0): `refused.accounted(fits.len()) == seeds` (ruling F13).
+    pub refused: RefusalCounts,
 }
 
 /// Full width at tenth maximum of a Moffat profile, `2α√(10^{1/β} − 1)`.
@@ -336,10 +403,37 @@ struct FitScratch {
     vals: Vec<f32>,
 }
 
+/// What [`fit_one`] records about one seed beside its result: [`FitDiagnostics`] without the seed index and the
+/// final outcome, which only the duplicate drop settles.
+#[derive(Debug, Clone, Copy)]
+struct FitTrace {
+    region_radius: u16,
+    background_start: f64,
+    width_start: f64,
+    growth_steps: u8,
+    converged: bool,
+}
+
+impl FitTrace {
+    fn record(self, seed: usize, outcome: Outcome) -> FitDiagnostics {
+        FitDiagnostics {
+            seed,
+            outcome,
+            region_radius: self.region_radius,
+            background_start: self.background_start,
+            width_start: self.width_start,
+            growth_steps: self.growth_steps,
+            iterations: None,
+            converged: self.converged,
+        }
+    }
+}
+
 /// Fit one seed with a fixed β, seeded from the field σ (size) and the
-/// stamp's second moments (orientation and axis ratio); `None` when the
-/// stamp leaves the image, the fit fails, or the acceptance rules (math
-/// reference §1.4) reject it.
+/// stamp's second moments (orientation and axis ratio); `Err` with its
+/// reason when the stamp leaves the image, the region holds too few pixels,
+/// the fit fails, or the acceptance rules (math reference §1.4) reject it.
+/// The [`FitTrace`] records the region and the start whatever the result.
 fn fit_one(
     data: &[f32],
     w: usize,
@@ -349,21 +443,32 @@ fn fit_one(
     beta: f64,
     p: &FitParams,
     scratch: &mut FitScratch,
-) -> Option<StarFit> {
+) -> (Result<StarFit, RefusalReason>, FitTrace) {
     // Admission: the seed must have room for the NOMINAL stamp. The
     // adaptive region below starts at half of it and may grow to twice it,
     // but a seed that cannot even host the nominal one sits on the border
     // and is measuring a truncated star.
     let nominal = stamp_radius(sigma0) as i64;
+    // `stamp_radius` is at most 48, so every radius below fits a u16.
+    let mut trace = FitTrace {
+        region_radius: nominal as u16,
+        background_start: f64::NAN,
+        width_start: GAUSSIAN_FWHM_PER_SIGMA * sigma0,
+        growth_steps: 0,
+        converged: false,
+    };
     let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
     if cx - nominal < 0 || cy - nominal < 0 || cx + nominal >= w as i64 || cy + nominal >= h as i64
     {
-        return None;
+        return (Err(RefusalReason::OutsideImage), trace);
     }
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
     let r_max = (2 * nominal).min(48).min(to_border);
     let r_start = (nominal / 2).max(3).min(r_max);
     let r = sampling_radius(data, w, cx, cy, r_start, r_max, p, &mut scratch.region);
+    let step = p.region_growth_step_px.max(1) as i64;
+    trace.region_radius = r as u16;
+    trace.growth_steps = ((r - r_start) / step).clamp(0, u8::MAX as i64) as u8;
     let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
     scratch.px.clear();
     scratch.px.reserve(cap);
@@ -393,9 +498,10 @@ fn fit_one(
         }
     }
     if scratch.px.len() < 10 {
-        return None;
+        return (Err(RefusalReason::TooFewPixels), trace);
     }
     let b0 = median_in_place(&mut scratch.vals) as f64;
+    trace.background_start = b0;
     let a0 = (peak - b0).max(1e-9);
     // Size from the field σ (flux/peak), orientation and axis ratio from the
     // stamp's moments: a circular θ = 0 seed leaves an elongated star in an
@@ -407,7 +513,7 @@ fn fit_one(
         }
         None => (sigma0, sigma0, 0.0),
     };
-    let fit = fit_moffat_2d_fixed_beta(
+    let Some(fit) = fit_moffat_2d_fixed_beta(
         &scratch.px,
         b0,
         a0,
@@ -420,14 +526,23 @@ fn fit_one(
         p.max_iter,
         p.conv_tol,
         p.max_rejects,
-    )?;
-    let mut f = accept(&fit, seed, cx as f64, cy as f64, r as f64, p)?;
+    ) else {
+        return (Err(RefusalReason::FitFailed), trace);
+    };
+    trace.converged = fit.converged;
+    let mut f = match accept(&fit, seed, cx as f64, cy as f64, r as f64, p) {
+        Ok(f) => f,
+        Err(reason) => return (Err(reason), trace),
+    };
     aperture(data, w, h, &mut f, p.growth);
     // At least 10 finite pixels were gathered, so all five slots are filled.
     f.peak5 = top.iter().sum::<f64>() / top.len() as f64;
-    Some(f)
+    (Ok(f), trace)
 }
 
+/// The acceptance rules (math reference §1.4), each refusal with its reason. The first gate is one condition, as it
+/// always was; its reason is `NonFinite` when a parameter or the residual is not finite, else `ResidualTooLarge`
+/// when the residual reaches the cap, else `FitFailed` (`A ≤ 0` or an `α ≤ 0`).
 fn accept(
     m: &Moffat2DResult,
     seed: &Seed,
@@ -435,7 +550,7 @@ fn accept(
     cy: f64,
     r: f64,
     p: &FitParams,
-) -> Option<StarFit> {
+) -> Result<StarFit, RefusalReason> {
     let finite = [
         m.b,
         m.a,
@@ -457,12 +572,18 @@ fn accept(
     // fraction of the amplitude, i.e. explains nothing.
     let settled = m.fit_residual.is_finite() && m.fit_residual < p.max_fit_residual;
     if !settled || !finite || m.a <= 0.0 || m.alpha_x <= 0.0 || m.alpha_y <= 0.0 {
-        return None;
+        return Err(if !finite {
+            RefusalReason::NonFinite
+        } else if !settled {
+            RefusalReason::ResidualTooLarge
+        } else {
+            RefusalReason::FitFailed
+        });
     }
     if (m.x0 - seed.x).abs() > p.centroid_tolerance_px
         || (m.y0 - seed.y).abs() > p.centroid_tolerance_px
     {
-        return None;
+        return Err(RefusalReason::CentreMoved);
     }
     // The fitted centre must sit inside the sampling region shrunk by
     // `inner_margin` per side (math reference §1.4). With the default
@@ -471,16 +592,16 @@ fn accept(
     // whose light the region barely contains.
     let inner = (1.0 - 2.0 * p.inner_margin) * r;
     if (m.x0 - cx).abs() > inner || (m.y0 - cy).abs() > inner {
-        return None;
+        return Err(RefusalReason::CentreAtRim);
     }
     let (fwtm_x, fwtm_y) = (
         fwtm_from_alpha(m.alpha_x, m.beta),
         fwtm_from_alpha(m.alpha_y, m.beta),
     );
     if 0.5 * p.growth * fwtm_x.max(fwtm_y) > r {
-        return None;
+        return Err(RefusalReason::RegionTooSmall);
     }
-    Some(StarFit {
+    Ok(StarFit {
         x: m.x0,
         y: m.y0,
         background: m.b,
@@ -495,6 +616,7 @@ fn accept(
         signal: 0.0,
         area: 0.0,
         peak5: f64::NAN,
+        flags: StarFlags::default(),
     })
 }
 
@@ -529,12 +651,15 @@ pub(crate) fn aperture(data: &[f32], w: usize, h: usize, f: &mut StarFit, k: f64
     f.area = std::f64::consts::PI * a * b;
 }
 
-/// Drop every fit that has a brighter accepted fit within ±1 px.
-fn dedupe(mut fits: Vec<StarFit>) -> Vec<StarFit> {
-    fits.sort_by(|a, b| b.amplitude.total_cmp(&a.amplitude));
+/// Drop every fit that has a brighter accepted fit within ±1 px. Each fit
+/// travels with its seed index, which the comparison never reads: the stable
+/// sort orders the pairs exactly as it orders the bare fits, so the kept
+/// fits and their order are the duplicate drop's as always.
+fn dedupe(mut fits: Vec<(usize, StarFit)>) -> Vec<(usize, StarFit)> {
+    fits.sort_by(|a, b| b.1.amplitude.total_cmp(&a.1.amplitude));
     let mut grid: HashMap<(i64, i64), Vec<(f64, f64)>> = HashMap::new();
     let mut out = Vec::with_capacity(fits.len());
-    for f in fits {
+    for (seed, f) in fits {
         let (gx, gy) = (f.x.floor() as i64, f.y.floor() as i64);
         let mut clash = false;
         'scan: for dy in -1..=1 {
@@ -553,7 +678,7 @@ fn dedupe(mut fits: Vec<StarFit>) -> Vec<StarFit> {
             continue;
         }
         grid.entry((gx, gy)).or_default().push((f.x, f.y));
-        out.push(f);
+        out.push((seed, f));
     }
     out
 }
@@ -565,6 +690,9 @@ fn dedupe(mut fits: Vec<StarFit>) -> Vec<StarFit> {
 /// `measure_plane` wraps the whole `fit_stars` call) passes `None` here — nesting an
 /// `install` inside another is legal but pointless, since the outer one
 /// already runs every parallel iterator inside it on that same pool.
+///
+/// The accepted fits, in seed order (the `Auto` β search's sample reads
+/// their residuals); [`fit_all_outcomes`] keeps every seed's outcome.
 pub(super) fn fit_all(
     data: &[f32],
     w: usize,
@@ -575,6 +703,26 @@ pub(super) fn fit_all(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<StarFit> {
+    fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, pool)
+        .into_iter()
+        .filter_map(|(result, _)| result.ok())
+        .collect()
+}
+
+/// Every seed's result and trace, in seed order (M-4): the parallel chain is
+/// the one `fit_all` always ran, collected per seed instead of filtered in
+/// flight — rayon's indexed `collect` keeps the order, so the accepted fits
+/// read off it sequentially are exactly the list the filtered chain gave.
+fn fit_all_outcomes(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    sigma0: f64,
+    beta: f64,
+    p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<(Result<StarFit, RefusalReason>, FitTrace)> {
     let body = || {
         seeds
             .par_iter()
@@ -585,7 +733,6 @@ pub(super) fn fit_all(
             .map_init(FitScratch::default, |scratch, s| {
                 fit_one(data, w, h, s, sigma0, beta, p, scratch)
             })
-            .filter_map(|f| f)
             .collect()
     };
     match pool {
@@ -610,6 +757,21 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
+    fit_stars_diagnosed(data, w, h, seeds, model, p, pool, false).0
+}
+
+/// [`fit_stars`], also returning one [`FitDiagnostics`] per seed, in seed
+/// order, when `diagnostics` is set (empty otherwise: the run never asks).
+pub(super) fn fit_stars_diagnosed(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    model: PsfModel,
+    p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    diagnostics: bool,
+) -> (FitOutcome, Vec<FitDiagnostics>) {
     let sigma0 = initial_sigma(seeds);
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
@@ -619,7 +781,7 @@ pub fn fit_stars(
         PsfModel::Fixed(b) => b,
         PsfModel::Auto => super::beta::auto_beta(data, w, h, seeds, sigma0, p, pool),
     };
-    fit_stars_with_beta(data, w, h, seeds, beta, p, pool)
+    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, pool, diagnostics)
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
@@ -645,13 +807,78 @@ pub fn fit_stars_with_beta(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
+    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, pool, false).0
+}
+
+/// [`fit_stars_with_beta`], also returning one [`FitDiagnostics`] per seed,
+/// in seed order, when `diagnostics` is set (empty otherwise).
+///
+/// The outcomes (M-4): every seed's result comes off [`fit_all_outcomes`]
+/// in seed order; the accepted fits are read off it sequentially — the very
+/// list the filtered chain collected before — and handed to [`dedupe`], so
+/// the kept fits, their order and every sum over them are unchanged. A seed
+/// whose fit the duplicate drop removed is refused `Duplicate`.
+pub(super) fn fit_stars_with_beta_diagnosed(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    beta: f64,
+    p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    diagnostics: bool,
+) -> (FitOutcome, Vec<FitDiagnostics>) {
     let sigma0 = initial_sigma(seeds);
-    let fits = dedupe(fit_all(data, w, h, seeds, sigma0, beta, p, pool));
-    FitOutcome {
-        fits,
-        beta,
-        seeds: seeds.len(),
+    let per_seed = fit_all_outcomes(data, w, h, seeds, sigma0, beta, p, pool);
+    let mut outcomes: Vec<Outcome> = Vec::with_capacity(per_seed.len());
+    let mut traces: Vec<FitTrace> =
+        Vec::with_capacity(if diagnostics { per_seed.len() } else { 0 });
+    let mut accepted: Vec<(usize, StarFit)> = Vec::with_capacity(per_seed.len());
+    for (i, (result, trace)) in per_seed.into_iter().enumerate() {
+        match result {
+            Ok(f) => {
+                // Settled by the duplicate drop: a kept fit is overwritten
+                // below with its star index, a dropped one stays Duplicate.
+                outcomes.push(Outcome::Refused(RefusalReason::Duplicate));
+                accepted.push((i, f));
+            }
+            Err(reason) => outcomes.push(Outcome::Refused(reason)),
+        }
+        if diagnostics {
+            traces.push(trace);
+        }
     }
+    let kept = dedupe(accepted);
+    for (star, &(seed, _)) in kept.iter().enumerate() {
+        outcomes[seed] = Outcome::Accepted { star };
+    }
+    let mut refused = RefusalCounts::default();
+    for o in &outcomes {
+        if let Outcome::Refused(reason) = *o {
+            refused.add(reason);
+        }
+    }
+    let fits: Vec<StarFit> = kept.into_iter().map(|(_, f)| f).collect();
+    debug_assert_eq!(
+        refused.accounted(fits.len()),
+        seeds.len(),
+        "every seed has exactly one outcome (ruling F13)"
+    );
+    let records = traces
+        .into_iter()
+        .zip(outcomes)
+        .enumerate()
+        .map(|(seed, (trace, outcome))| trace.record(seed, outcome))
+        .collect();
+    (
+        FitOutcome {
+            fits,
+            beta,
+            seeds: seeds.len(),
+            refused,
+        },
+        records,
+    )
 }
 
 #[cfg(test)]
@@ -1017,8 +1244,10 @@ mod tests {
             peak: 0.5,
             flux: std::f64::consts::PI * 0.5 * 25.0 / 3.0,
         };
-        assert!(
-            accept(&fit, &seed, cx, cy, r, &p).is_none(),
+        // Plan A Task 4 (F-0): the refusal carries its reason.
+        assert_eq!(
+            accept(&fit, &seed, cx, cy, r, &p).err(),
+            Some(RefusalReason::CentreAtRim),
             "|x0 − cx| = 8 exceeds (1 − 2·0.15)·10 = 7"
         );
         let off = FitParams {
@@ -1026,7 +1255,7 @@ mod tests {
             ..p
         };
         assert!(
-            accept(&fit, &seed, cx, cy, r, &off).is_some(),
+            accept(&fit, &seed, cx, cy, r, &off).is_ok(),
             "with the rule off the same fit is accepted"
         );
     }

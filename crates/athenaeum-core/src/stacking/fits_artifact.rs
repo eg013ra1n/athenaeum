@@ -4,8 +4,9 @@
 //! re-detecting the same stars a second time.
 //!
 //! One [`StarFit`] per record, every field narrowed from the in-memory
-//! `f64` to a little-endian `f32` (13 × 4 bytes) plus one reserved flags
-//! byte — 53 bytes per fit, ≈ 200–400 KB per plane on a typical field. The
+//! `f64` to a little-endian `f32` (13 × 4 bytes) plus one flags byte
+//! ([`StarFlags`], Plan A Task 4: the byte was reserved and written 0 before)
+//! — 53 bytes per fit, ≈ 200–400 KB per plane on a typical field. The
 //! narrowing is deliberate (spec §2.2.1): the values downstream feed a
 //! RATIO (Normalize's relative flux scale) or a star LIST (Register's
 //! reused detections), and the audit measured the systematic loss the
@@ -24,6 +25,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use super::psf_signal::StarFit;
+use crate::star_measure::StarFlags;
 
 /// File magic — four ASCII bytes.
 const MAGIC: [u8; 4] = *b"ATHF";
@@ -33,10 +35,13 @@ const MAGIC: [u8; 4] = *b"ATHF";
 pub const FITS_ARTIFACT_VERSION: u16 = 1;
 
 /// `x, y, background, amplitude, fwhm_x, fwhm_y, fwtm_x, fwtm_y, theta,
-/// beta, residual, signal, area` — [`StarFit`]'s 13 fields, in declaration
-/// order, each a little-endian `f32` — plus one reserved flags byte (`0`
-/// today). Fields are written/read individually (never a `#[repr(C)]`
-/// cast), so struct alignment/padding never enters the on-disk shape.
+/// beta, residual, signal, area` — [`StarFit`]'s 13 persisted numbers, in
+/// declaration order, each a little-endian `f32` — plus the flags byte
+/// ([`StarFit::flags`], bit 0 saturated, bit 1 β at its cap). The byte held
+/// `0` in every file written before Plan A Task 4, so such a file reads as
+/// no flags and the layout and [`FITS_ARTIFACT_VERSION`] are unchanged.
+/// Fields are written/read individually (never a `#[repr(C)]` cast), so
+/// struct alignment/padding never enters the on-disk shape.
 const FIELDS_PER_RECORD: usize = 13;
 const RECORD_LEN: usize = FIELDS_PER_RECORD * 4 + 1;
 const HEADER_LEN: usize = 4 + 2 + 4; // magic + version + count
@@ -102,7 +107,7 @@ fn encode_fit(fit: &StarFit, out: &mut Vec<u8>) {
     ] {
         out.extend_from_slice(&(v as f32).to_le_bytes());
     }
-    out.push(0u8); // flags, reserved for a future revision
+    out.push(fit.flags.bits());
 }
 
 /// `record` must be exactly [`RECORD_LEN`] bytes — enforced by the caller
@@ -128,6 +133,8 @@ fn decode_fit(record: &[u8]) -> StarFit {
         area: field(12),
         // Not persisted (spec 2026-10-04 L-12).
         peak5: f64::NAN,
+        // Every bit as written (a file from before Plan A Task 4 holds 0).
+        flags: StarFlags(record[FIELDS_PER_RECORD * 4]),
     }
 }
 
@@ -249,6 +256,7 @@ mod tests {
             signal: signed(rng, 1e6),
             area: rng.next_f64() * 1000.0,
             peak5: f64::NAN,
+            flags: StarFlags::default(),
         }
     }
 
@@ -372,6 +380,25 @@ mod tests {
             read_fits(&path),
             Err(FitsArtifactError::Truncated(_))
         ));
+    }
+
+    /// Plan A Task 4: the reserved byte is the `StarFlags` byte. It round-trips, and a record whose byte is 0 (every
+    /// file written before this task) reads as no flags.
+    #[test]
+    fn flags_byte_round_trips_and_an_old_file_reads_zero() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("f.athf");
+        let mut fit = StarFit::test_at(10.0, 20.0, 1000.0);
+        fit.flags = StarFlags::SATURATED | StarFlags::BETA_AT_CAP;
+        write_fits(&p, &[fit]).unwrap();
+        let back = read_fits(&p).unwrap();
+        assert_eq!(back[0].flags, StarFlags::SATURATED | StarFlags::BETA_AT_CAP);
+        // a v1 record with the reserved byte 0 (today's files)
+        let mut bytes = std::fs::read(&p).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] = 0;
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(read_fits(&p).unwrap()[0].flags, StarFlags::default());
     }
 
     #[test]

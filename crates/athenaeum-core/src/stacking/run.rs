@@ -16326,6 +16326,7 @@ mod tests {
             signal: 40000.0,
             area: 28.0,
             peak5: f64::NAN,
+            flags: crate::star_measure::StarFlags::default(),
         };
 
         let seed_fits = |fits: &[psf_signal::StarFit]| {

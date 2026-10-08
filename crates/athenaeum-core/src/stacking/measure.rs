@@ -4,6 +4,7 @@
 //! weight — everything the weighting, selection and normalization stages
 //! consume. Reads through `PlaneReader`, one plane at a time.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -140,6 +141,14 @@ pub struct MeasureTimings {
 pub struct ChannelMeasurement {
     pub stars_detected: usize,
     pub stars_fitted: usize,
+    /// Seeds the PSF fitter refused, each for a counted reason (F-0, Plan A
+    /// Task 4): `stars_fitted + stars_refused == stars_detected`. `0` in a
+    /// `metrics` payload written before that task.
+    pub stars_refused: usize,
+    /// `stars_refused` by `star_measure::RefusalReason`, keyed by its
+    /// camelCase name (`{"regionTooSmall": 12, "duplicate": 3}`); empty in a
+    /// payload written before Plan A Task 4.
+    pub refused_by_reason: BTreeMap<String, usize>,
     pub beta: f64,
     pub fwhm_px: f64,
     pub eccentricity: f64,
@@ -295,6 +304,24 @@ pub fn measure_plane_detailed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedSource,
 ) -> (PlaneMeasurement, Vec<Seed>) {
+    let (pm, seeds, _) = measure_plane_diagnosed(data, w, h, opts, pool, seed_source, false);
+    (pm, seeds)
+}
+
+/// [`measure_plane_detailed`], also returning the module's per-seed outcome
+/// records (F-0, Plan A Task 4) when `diagnostics` is set — one per seed, in
+/// the returned seeds' order (empty otherwise). Same call, same numbers: the
+/// records are a report the lab's `star_probe --diagnostics` writes; the run
+/// never asks for them.
+pub fn measure_plane_diagnosed(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedSource,
+    diagnostics: bool,
+) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
     // A run selects its detector through the config; `seed_source` is the
@@ -473,6 +500,7 @@ pub fn measure_plane_detailed(
         fit: FitParams::default(),
         noise,
         scale_estimator: opts.scale_estimator,
+        diagnostics,
     };
     let m = sm::measure_plane(data, w, h, &module_opts, pool);
     let seeds = match module_opts.seeds {
@@ -493,6 +521,8 @@ pub fn measure_plane_detailed(
     let channel = ChannelMeasurement {
         stars_detected,
         stars_fitted: m.frame.stars_fitted,
+        stars_refused: m.refused.total(),
+        refused_by_reason: m.refused.by_name(),
         beta: m.beta,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
@@ -534,6 +564,7 @@ pub fn measure_plane_detailed(
             fits: m.stars,
         },
         seeds,
+        m.diagnostics,
     )
 }
 
@@ -1180,6 +1211,24 @@ pub(crate) mod tests {
         assert_eq!(c.noise_source, NoiseSource::Mrs);
     }
 
+    /// Plan A Task 4 (F-0): the channel accounts for every seed it detected,
+    /// its per-reason counts sum to `stars_refused`, the two keys reach the
+    /// `metrics` payload, and a payload written before the task decodes with
+    /// no refusals.
+    #[test]
+    fn channel_accounts_for_every_seed_and_an_old_payload_decodes() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let c = measure_plane(&data, w, h, &MeasureOptions::default(), None);
+        assert!(c.stars_detected > 0);
+        assert_eq!(c.stars_fitted + c.stars_refused, c.stars_detected);
+        assert_eq!(c.refused_by_reason.values().sum::<usize>(), c.stars_refused);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"starsRefused\":") && json.contains("\"refusedByReason\":"), "{json}");
+        let old: ChannelMeasurement =
+            serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
+        assert_eq!((old.stars_refused, old.refused_by_reason.len()), (0, 0));
+    }
+
     /// Tier A task-3b pin (controller ruling R-TA-2): `measure_plane_with_seeds`
     /// must return the identical `ChannelMeasurement` (timings excluded, per
     /// `without_timings`) before and after the `estimate_noise_mrs`
@@ -1197,6 +1246,10 @@ pub(crate) mod tests {
     /// similar quantities, so it amplifies the same last-bit move).
     /// `stars_fitted`, `beta`, `tflux`, `m_star`, `n_star`,
     /// `psf_signal_weight` and `psf_snr` are bit-identical.
+    ///
+    /// Plan A Task 4 (F-0) added two fields to the literal, `stars_refused: 0`
+    /// and `refused_by_reason: {}` (150 seeds, 150 fits: nothing refused);
+    /// every number in it is unchanged.
     #[test]
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
@@ -1218,6 +1271,7 @@ pub(crate) mod tests {
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
+stars_refused: 0, refused_by_reason: {}, \
 beta: 10.0, fwhm_px: 4.121806182224867, eccentricity: 0.09524602087103608, \
 tflux: 569.0781285580445, tmean_flux: 11.823163448679521, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \

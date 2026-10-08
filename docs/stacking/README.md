@@ -1864,3 +1864,29 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
 - **Logging.** The moved measure-path warnings now log under the tracing target `star_measure` rather than
   `stacking`; their `clip` and `samples` fields joined the logging dictionary
   (`docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`).
+- **F-0 - every seed has an outcome (Task 4; numbers unchanged).** `star_measure::diagnostics` holds
+  `RefusalReason` (eleven camelCase names, `outsideImage` … `duplicate`), `Outcome` (`Accepted { star }`,
+  `Refused(reason)`, and the Budget mode's `NotSelected` / `Trimmed` from Task 12), the per-seed `FitDiagnostics`
+  and `RefusalCounts`. The identity `accepted + refused + not_selected + trimmed = seeds` (ruling F13) is a
+  `debug_assert!` in the fit and in `measure_plane`, a test, and the lab's `fit outcomes` row.
+  - **Order (M-4).** `fit_one` returns `Result<StarFit, RefusalReason>` plus its trace. The outcomes come off the
+    same `seeds.par_iter().map_init(FitScratch::default, …)` chain, collected per seed in seed order. The accepted
+    fits are read off it sequentially and handed to `dedupe`, so its input, its stable sort and the Kahan sums see
+    exactly the order they saw before. A fit the ±1 px drop removes is refused `duplicate`.
+  - **Today's reasons.** The nominal stamp leaves the image → `outsideImage`; fewer than 10 finite region pixels →
+    `tooFewPixels`; the fitter returns `None` → `fitFailed`. The first acceptance gate is still one condition; its
+    reason is `nonFinite` (a parameter or the residual), else `residualTooLarge`, else `fitFailed` (`A ≤ 0` or an
+    `α ≤ 0`). The centroid tolerance → `centreMoved`; the inner region → `centreAtRim`; half the FWTM beyond the
+    region radius → `regionTooSmall`. `donut` and `narrowerThanPixel` are declared now and produced from Task 6b.
+  - **Where the counts land.** `FitOutcome.refused` and `PlaneMeasurement.refused` always carry the counts.
+    `ChannelMeasurement` gains `stars_refused` and `refused_by_reason` (keys = the camelCase names), so the
+    `metrics` payload grows two keys; both are serde defaults, so an older payload decodes as `0` / `{}`. The
+    per-seed vector is kept only when `star_measure::MeasureOptions.diagnostics` is set: the run never sets it (it
+    costs memory on 24 576 seeds). The adapter's `measure_plane_diagnosed` hands it to `star_probe --diagnostics`,
+    which writes one `refused` line per refused seed; every measure and betas frame line carries `refused` counts.
+  - **The `.athf` flags byte.** The reserved byte is now `StarFit.flags: StarFlags` (bit 0 `SATURATED`, bit 1
+    `BETA_AT_CAP`; set from Tasks 8 / 9, so every fit reads none today). A file written before this task holds 0
+    there and reads as no flags; the layout and `FITS_ARTIFACT_VERSION` are unchanged.
+  - **Acceptance.** The lab step `t04-f0`, recorded in athenaeum-lab `star-lab/results/plan-a/t04-f0/`. The bar:
+    `fit outcomes` ok on every image, and 0 moved rows against `t02-extract` (`noreg.txt`) and against
+    `t01c-baseline` (`noreg-cumulative.txt`).

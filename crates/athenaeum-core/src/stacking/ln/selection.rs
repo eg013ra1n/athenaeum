@@ -254,6 +254,7 @@ mod tests {
             signal,
             area: 28.0,
             peak5,
+            flags: crate::star_measure::StarFlags::default(),
         }
     }
 

@@ -9,12 +9,23 @@
 //!       [--paths measure,betas,register,analysis,legacy-analysis]   (default: measure,betas,register)
 //!       [--betas 2.5,4,6,10]   (legacy-analysis = the analysis path, `path: "analysis"`; any other name exits 1)
 //!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
+//!       [--diagnostics]   (one `refused` line per seed the measure path did not accept)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
 //!
-//! Energies (background, amplitude, signal, peak5; seed peak and flux) are
-//! written ÷ 65535, the lab's image units; production carries them ×65535.
+//! Energies (background, amplitude, signal, peak5; seed peak and flux; a
+//! refused line's backgroundStart) are written ÷ 65535, the lab's image units;
+//! production carries them ×65535.
+//!
+//! F-0 (Plan A Task 4): every star line carries `flags` (the named
+//! `StarFlags`, `[]` until a later task sets one); the measure and betas frame
+//! lines carry `refused: {total, byReason, notSelected, trimmed}`, so
+//! `fits + refused.total + notSelected + trimmed = seeds`; with
+//! `--diagnostics` the measure path also writes one line per refused seed,
+//! `{kind: refused, path, plane, seed (the seed line's i), reason,
+//! regionRadius, backgroundStart, widthStart, growthSteps, iterations,
+//! converged}`.
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -31,11 +42,12 @@ use athenaeum_core::resample::{warp_rows, Plane};
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
-    measure_plane_detailed, MeasureOptions, SeedSource, ADU_SCALE,
+    measure_plane_diagnosed, MeasureOptions, SeedSource, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, fit_stars_with_beta, FitParams, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
+use athenaeum_core::star_measure::{FitDiagnostics, Outcome, RefusalCounts};
 use serde_json::{json, Value};
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -143,8 +155,31 @@ fn fit_line(path: &str, plane: usize, beta: Option<f64>, f: &StarFit) -> Value {
         "background": f.background / s, "amplitude": f.amplitude / s, "signal": f.signal / s,
         "peak5": n_or_null(f.peak5 / s),
         "fwhmX": f.fwhm_x, "fwhmY": f.fwhm_y, "fwhm": f.fwhm(), "ecc": f.eccentricity(),
-        "thetaDeg": f.theta.to_degrees(), "residual": f.residual,
+        "thetaDeg": f.theta.to_degrees(), "residual": f.residual, "flags": f.flags.names(),
     })
+}
+
+/// A frame line's `refused` object (F-0): the refused seeds by reason and the
+/// two budget outcomes, so `fits + total + notSelected + trimmed = seeds`.
+fn refused_counts(c: &RefusalCounts) -> Value {
+    json!({"total": c.total(), "byReason": c.by_reason, "notSelected": c.not_selected, "trimmed": c.trimmed})
+}
+
+/// One `refused` line per seed the path did not accept (`--diagnostics`);
+/// `None` for an accepted one.
+fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
+    let reason = match d.outcome {
+        Outcome::Accepted { .. } => return None,
+        Outcome::Refused(r) => r.name(),
+        Outcome::NotSelected => "notSelected",
+        Outcome::Trimmed => "trimmed",
+    };
+    Some(json!({
+        "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "reason": reason,
+        "regionRadius": d.region_radius, "backgroundStart": n_or_null(d.background_start / ADU_SCALE as f64),
+        "widthStart": n_or_null(d.width_start), "growthSteps": d.growth_steps, "iterations": d.iterations,
+        "converged": d.converged,
+    }))
 }
 
 struct MeasureArgs {
@@ -157,6 +192,7 @@ struct MeasureArgs {
     paths: Vec<String>,
     betas: Vec<f64>,
     domain: Domain,
+    diagnostics: bool,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -171,8 +207,13 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         paths: vec!["measure".into(), "betas".into(), "register".into()],
         betas: vec![2.5, 4.0, 6.0, 10.0],
         domain: Domain::Auto,
+        diagnostics: false,
     };
     while let Some(k) = it.next() {
+        if k == "--diagnostics" {
+            a.diagnostics = true;
+            continue;
+        }
         let mut v = || {
             it.next()
                 .unwrap_or_else(|| die(format!("{k}: value missing")))
@@ -333,7 +374,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             continue;
         }
         let t = Instant::now();
-        let (pm, seeds) = measure_plane_detailed(&planes[p], w, h, &opts, None, SeedSource::Fast);
+        let (pm, seeds, diagnostics) =
+            measure_plane_diagnosed(&planes[p], w, h, &opts, None, SeedSource::Fast, a.diagnostics);
         let wall = t.elapsed().as_millis() as u64;
         let s = ADU_SCALE as f64;
         if want("measure") {
@@ -345,9 +387,17 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             for f in &pm.fits {
                 emit(fit_line("measure", p, None, f))
             }
+            for d in &diagnostics {
+                if let Some(line) = refused_line("measure", p, d) {
+                    emit(line)
+                }
+            }
+            // The adapter runs every seed (no budget): notSelected and trimmed are 0.
+            let refused = json!({"total": pm.channel.stars_refused, "byReason": pm.channel.refused_by_reason,
+                                 "notSelected": 0, "trimmed": 0});
             emit(
                 json!({"kind": "frame", "path": "measure", "plane": p, "beta": pm.channel.beta,
-                        "seeds": seeds.len(), "fits": pm.fits.len(),
+                        "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
                         "statistic": "residual-weighted mean over all accepted fits",
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
                         "channel": pm.channel, "options": options, "conversion": conversion,
@@ -365,7 +415,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 }
                 emit(
                     json!({"kind": "frame", "path": "betas", "plane": p, "beta": b, "seeds": seeds.len(),
-                            "fits": o.fits.len(), "statistic": "residual-weighted mean over all accepted fits",
+                            "fits": o.fits.len(), "refused": refused_counts(&o.refused), "statistic": "residual-weighted mean over all accepted fits",
                             "frameFwhm": ff, "frameEcc": fe, "options": options, "conversion": conversion,
                             "domain": domain, "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );
@@ -625,6 +675,7 @@ mod tests {
             paths: paths.iter().map(|p| p.to_string()).collect(),
             betas: vec![4.0],
             domain: Domain::Auto,
+            diagnostics: false,
         }
     }
 
@@ -666,6 +717,36 @@ mod tests {
                 "no star line for {path}"
             );
         }
+    }
+
+    /// Plan A Task 4 (F-0, ruling F13): with `--diagnostics` every refused seed has a `refused` line, the frame line
+    /// counts them, and fits + refused = seeds.
+    #[test]
+    fn refused_lines_plus_fits_equal_seeds() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = args(d.path().join("p.fits"), d.path().join("p.jsonl"), &["measure"]);
+        a.diagnostics = true;
+        // The NaN border alone refuses no seed (the detector seeds nothing there), so one more star sits 8 px from the
+        // unmasked right edge: it is seeded, and its nominal stamp (8 px) leaves the image (outsideImage).
+        let mut data = gaussian_field(240, 240, 6, true);
+        for y in 0..240 {
+            for x in 0..240 {
+                let r2 = (x as f32 - 232.0).powi(2) + (y as f32 - 160.0).powi(2);
+                data[y * 240 + x] += 0.4 * (-r2 / (2.0 * 1.5f32.powi(2))).exp();
+            }
+        }
+        write_fits_f32(&a.image, 240, 240, 1, &data, &[]).unwrap();
+        cmd_measure(a).unwrap();
+        let lines = read_lines(&d.path().join("p.jsonl"));
+        let frame = lines.iter().find(|v| v["kind"] == "frame" && v["path"] == "measure").unwrap();
+        let refused = lines.iter().filter(|v| v["kind"] == "refused").count();
+        assert!(
+            lines.iter().any(|v| v["kind"] == "refused" && v["reason"] == "outsideImage"),
+            "the edge star is refused outsideImage: {frame}"
+        );
+        assert_eq!(refused as u64, frame["refused"]["total"].as_u64().unwrap());
+        assert_eq!(frame["fits"].as_u64().unwrap() + refused as u64, frame["seeds"].as_u64().unwrap());
+        assert!(lines.iter().filter(|v| v["kind"] == "refused").all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
     }
 
     #[test]

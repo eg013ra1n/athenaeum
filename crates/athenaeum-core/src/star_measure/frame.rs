@@ -131,6 +131,7 @@ mod tests {
             signal: mean * 10.0,
             area: 10.0,
             peak5: f64::NAN,
+            flags: crate::star_measure::StarFlags::default(),
         }
     }
 

@@ -13,17 +13,19 @@ use std::time::Instant;
 use crate::integration::stats::ScaleEstimator;
 
 pub mod beta;
+pub mod diagnostics;
 pub mod domain;
 pub mod fit;
 pub mod frame;
 pub mod robust;
 
 pub use beta::{AUTO_BETAS, AUTO_SAMPLE};
+pub use diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 pub use domain::{
     background_residual, noise_model, noise_mrs, sky_level, to_working_units, Domain, NoiseModel,
     NoiseSource, SkyLevel, ADU_SCALE,
 };
-pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit};
+pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
 
 /// Version of the measurement path's own behaviour — bumped whenever
@@ -71,6 +73,9 @@ pub struct MeasureOptions {
     pub noise: Option<NoiseModel>,
     /// The scale estimator the adapter keeps in lockstep with normalization (PA-21).
     pub scale_estimator: ScaleEstimator,
+    /// Keep one [`FitDiagnostics`] per seed in [`PlaneMeasurement::diagnostics`] (F-0). The lab's probe sets it; the
+    /// run never does — the per-seed vector costs memory on 24 576 seeds. The refusal counts are kept either way.
+    pub diagnostics: bool,
 }
 
 impl Default for MeasureOptions {
@@ -85,6 +90,7 @@ impl Default for MeasureOptions {
             fit: FitParams::default(),
             noise: None,
             scale_estimator: ScaleEstimator::Bwmv,
+            diagnostics: false,
         }
     }
 }
@@ -130,6 +136,10 @@ pub struct PlaneMeasurement {
     pub sky: SkyLevel,
     /// Seeds handed to the fitter.
     pub seeds: usize,
+    /// The seeds not accepted, by reason (F-0): `refused.accounted(stars.len()) == seeds` (ruling F13).
+    pub refused: RefusalCounts,
+    /// One record per seed, in seed order, when `MeasureOptions::diagnostics` is set; empty otherwise.
+    pub diagnostics: Vec<FitDiagnostics>,
     pub timings: PhaseTimings,
 }
 
@@ -150,16 +160,31 @@ pub fn measure_plane(
     };
     let seeds = opts.seeds.seeds();
     let t = Instant::now();
-    let outcome = match pool {
+    let fit_call = || {
+        fit::fit_stars_diagnosed(
+            &working,
+            w,
+            h,
+            seeds,
+            opts.psf_model,
+            &opts.fit,
+            None,
+            opts.diagnostics,
+        )
+    };
+    let (outcome, diagnostics) = match pool {
         // Already inside this `install` — `fit_stars`'s own pool param gets
         // `None` so it does not nest a second, pointless `install` inside
         // this one (perf tier 1 Task 2).
-        Some(p) => {
-            p.install(|| fit::fit_stars(&working, w, h, seeds, opts.psf_model, &opts.fit, None))
-        }
-        None => fit::fit_stars(&working, w, h, seeds, opts.psf_model, &opts.fit, None),
+        Some(p) => p.install(fit_call),
+        None => fit_call(),
     };
     timings.fit_ms = t.elapsed().as_millis() as u64;
+    debug_assert_eq!(
+        outcome.refused.accounted(outcome.fits.len()),
+        seeds.len(),
+        "every seed has exactly one outcome (ruling F13)"
+    );
     let frame = FrameAggregates::of(&outcome.fits);
     let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
     PlaneMeasurement {
@@ -169,6 +194,8 @@ pub fn measure_plane(
         noise,
         sky,
         seeds: seeds.len(),
+        refused: outcome.refused,
+        diagnostics,
         timings,
     }
 }
@@ -381,6 +408,209 @@ mod tests {
             },
         );
         assert!(matches!(raw, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// The seeds of `fixture_field(7, …)` (ruling F38): its 150 grid positions, rebuilt from the same `SplitMix64`
+    /// stream (seed 7, three draws per star: x, y, amplitude), with `peak` = the plane's maximum in the 3×3 box about
+    /// each and `flux = 2π·σ²·peak` (σ 1.8, the fixture's), brightest first. The plane must be that fixture: every
+    /// rebuilt position is checked to hold a star.
+    fn test_seeds_of(plane: &[f32], w: usize, h: usize) -> Vec<Seed> {
+        assert_eq!(
+            (w, h),
+            (768, 512),
+            "test_seeds_of reads fixture_field(7, …) only"
+        );
+        let mut rng = crate::geometry::ransac::SplitMix64(7);
+        let mut seeds = Vec::with_capacity(150);
+        for j in 0..10 {
+            for i in 0..15 {
+                let x = 40.0 + i as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
+                let y = 40.0 + j as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
+                let _amplitude = rng.next_f64();
+                let (cx, cy) = (x.round() as usize, y.round() as usize);
+                let mut peak = f64::NEG_INFINITY;
+                for yy in cy - 1..=cy + 1 {
+                    for xx in cx - 1..=cx + 1 {
+                        peak = peak.max(plane[yy * w + xx] as f64);
+                    }
+                }
+                assert!(peak > 0.08 + 0.05, "no star at ({x}, {y}): peak {peak}");
+                seeds.push(Seed {
+                    x,
+                    y,
+                    peak,
+                    flux: 2.0 * std::f64::consts::PI * 1.8 * 1.8 * peak,
+                });
+            }
+        }
+        seeds.sort_by(|a, b| b.peak.total_cmp(&a.peak));
+        seeds
+    }
+
+    /// F-0 (ruling F13): every seed has exactly one outcome, the per-seed records are only a report, and asking for
+    /// them moves no number.
+    #[test]
+    fn every_seed_has_exactly_one_outcome_and_the_numbers_do_not_move() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let seeds = test_seeds_of(&data, w, h); // the 150 star centres as seeds (peak/flux from the fixture's amplitudes)
+        let before = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                diagnostics: true,
+                seeds: SeedSpec::Given(seeds.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.diagnostics.len(), seeds.len());
+        assert_eq!(m.refused.accounted(m.stars.len()), seeds.len());
+        assert_eq!(
+            m.refused.not_selected + m.refused.trimmed,
+            0,
+            "Mode::All has no budget outcomes"
+        );
+        let accepted = m
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.outcome, Outcome::Accepted { .. }))
+            .count();
+        assert_eq!(accepted, m.stars.len());
+        assert_eq!(m.stars, before.stars, "diagnostics change no number");
+    }
+
+    #[test]
+    fn edge_seed_is_refused_outside_image_with_its_reason() {
+        let data = vec![0.05f32; 64 * 64];
+        let opts = MeasureOptions {
+            diagnostics: true,
+            seeds: SeedSpec::Given(vec![Seed {
+                x: 2.0,
+                y: 30.0,
+                peak: 0.5,
+                flux: 5.0,
+            }]),
+            ..Default::default()
+        };
+        let m = measure_plane(&data, 64, 64, &opts, None);
+        assert_eq!(
+            m.diagnostics[0].outcome,
+            Outcome::Refused(RefusalReason::OutsideImage)
+        );
+        assert_eq!(m.refused.by_reason[&RefusalReason::OutsideImage], 1);
+        assert_eq!(m.refused.total(), 1);
+        assert!(m.stars.is_empty());
+    }
+
+    #[test]
+    fn starless_plane_has_no_outcomes_and_no_panic() {
+        let data = vec![0.05f32; 128 * 128];
+        let m = measure_plane(
+            &data,
+            128,
+            128,
+            &MeasureOptions {
+                diagnostics: true,
+                seeds: SeedSpec::Given(vec![]),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(m.stars.is_empty() && m.diagnostics.is_empty() && m.refused.total() == 0);
+        assert_eq!(m.frame.fwhm_px, None);
+    }
+
+    #[test]
+    fn duplicate_and_rim_refusals_are_counted_by_reason() {
+        use crate::test_support::{moffat_field, MoffatStar};
+        // one star, two seeds 0.5 px apart → one Accepted, one Duplicate
+        let star = MoffatStar {
+            x: 40.3,
+            y: 40.7,
+            amp: 0.5,
+            alpha_x: 3.0,
+            alpha_y: 3.0,
+            theta: 0.0,
+        };
+        let data = moffat_field(80, 80, &[star], 4.0, 0.05);
+        let seeds = vec![
+            Seed {
+                x: 40.3,
+                y: 40.7,
+                peak: 0.5,
+                flux: 3.0,
+            },
+            Seed {
+                x: 40.8,
+                y: 40.7,
+                peak: 0.49,
+                flux: 2.9,
+            },
+        ];
+        let m = measure_plane(
+            &data,
+            80,
+            80,
+            &MeasureOptions {
+                diagnostics: true,
+                seeds: SeedSpec::Given(seeds),
+                psf_model: PsfModel::Moffat4,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.stars.len(), 1);
+        assert_eq!(m.refused.by_reason.get(&RefusalReason::Duplicate), Some(&1));
+        // a seed whose region cannot hold half the FWTM → RegionTooSmall, not a silent drop: a broad star, α 12
+        // (FWTM 21.2 at β 4, half 10.6 px), on a 60×60 plane, 7 px from its left border. The seed's flux/peak gives
+        // σ0 0.98 and the minimum nominal stamp, 6 px, so it is admitted, and the border caps the region at r = 7.
+        // (At the plane's centre, the brief's first draft, the region grows to r = 26 and the star is accepted.)
+        let broad = MoffatStar {
+            x: 7.0,
+            y: 30.0,
+            amp: 0.5,
+            alpha_x: 12.0,
+            alpha_y: 12.0,
+            theta: 0.0,
+        };
+        let data = moffat_field(60, 60, &[broad], 4.0, 0.05);
+        let m = measure_plane(
+            &data,
+            60,
+            60,
+            &MeasureOptions {
+                diagnostics: true,
+                seeds: SeedSpec::Given(vec![Seed {
+                    x: 7.0,
+                    y: 30.0,
+                    peak: 0.5,
+                    flux: 3.0,
+                }]),
+                psf_model: PsfModel::Moffat4,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            m.diagnostics[0].outcome,
+            Outcome::Refused(RefusalReason::RegionTooSmall)
+        );
+        assert!(m.diagnostics[0].region_radius >= 3);
+        assert_eq!(
+            m.refused.by_reason.get(&RefusalReason::RegionTooSmall),
+            Some(&1)
+        );
     }
 
     /// No seeds, nothing fitted: the frame aggregates are `None`, the β is the `Auto` fallback 4.0, and the noise and

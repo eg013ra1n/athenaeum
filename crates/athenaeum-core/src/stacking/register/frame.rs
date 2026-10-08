@@ -927,6 +927,7 @@ mod tests {
                 signal: 40000.0 + i as f64 * 1000.0,
                 area: 28.0,
                 peak5: f64::NAN,
+                flags: crate::star_measure::StarFlags::default(),
             })
             .collect();
         let expected = stars_from_fits(&fits, &cfg.detection, cfg.max_stars);
