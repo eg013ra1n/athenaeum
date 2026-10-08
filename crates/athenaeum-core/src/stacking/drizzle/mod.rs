@@ -2118,6 +2118,35 @@ mod tests {
         // sharpens both — is asserted; the ordering and the 0.97 margin, which the fit no longer resolves, are not.
         assert!(ratio_07 < 1.0, "ratio_07={ratio_07}");
         assert!(ratio_045 < 1.0, "ratio_045={ratio_045}");
+
+        // Plan A Task 6b (round 4a): the four measured widths against truth. The truths are the lab's point fits (a
+        // Gaussian and a free-beta Moffat) of the exact noiseless registered output of this fixture, in output px;
+        // t06a is the width the measurement read before Task 6b. The assertion: no width is further from EITHER
+        // truth than t06a's was (the ratios above cannot see a width that moved away from truth, as the ratio-only
+        // reading of round 1 did not). The readings, (t06a, round 3, truths gauss / moffat_free):
+        //   sigma 0.7,  ds 0.6: 3.2343, 3.2782 (truth 3.4785 / 3.4784)
+        //   sigma 0.7,  ds 1.0: 3.3352, 3.3921 (truth 3.6167 / 3.5756)
+        //   sigma 0.45, ds 0.6: 2.2394, 2.2538 (truth 2.4410 / 2.4410)
+        //   sigma 0.45, ds 1.0: 2.3435, 2.3562 (truth 2.5514 / 2.4885)
+        // Every width reads 5-8 % LOW against truth: a model bias of the fit on a drizzled, spiky, non-Moffat star
+        // that predates Task 6b (t06a reads 5.8-8.3 % low, round 3 5.1-7.7 %). It is carried to Task 9 and the
+        // real-data checkpoint, not fixed here.
+        let widths = [
+            (fwhm_07_06, 3.2343, 3.4785, 3.4784),
+            (fwhm_07_10, 3.3352, 3.6167, 3.5756),
+            (fwhm_045_06, 2.2394, 2.4410, 2.4410),
+            (fwhm_045_10, 2.3435, 2.5514, 2.4885),
+        ];
+        for (k, (now, t06a, gauss, moffat)) in widths.into_iter().enumerate() {
+            assert!(
+                (now - gauss).abs() <= (t06a - gauss).abs(),
+                "width {k}: {now} is further from the Gaussian truth {gauss} than t06a's {t06a}"
+            );
+            assert!(
+                (now - moffat).abs() <= (t06a - moffat).abs(),
+                "width {k}: {now} is further from the free-Moffat truth {moffat} than t06a's {t06a}"
+            );
+        }
     }
 
     // ── (f) LN ──

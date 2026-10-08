@@ -2816,6 +2816,22 @@ mod tests {
             half.scale,
             full.scale
         );
+        // Plan A Task 6b (round 4a): guard the present level against the true 1.25 too, not only the consistency.
+        // The readings: t06a half 1.216921 (|d| 0.033079), full 1.216857 (|d| 0.033143), consistency 0.000053; at 6b
+        // round 1 full moved 1.216857 -> 1.213308 and the consistency 0.000053 -> 0.003543 (half 1.217607). The
+        // bounds are t06a's own half distance and the present full distance. The lab referee over 133 rows: F1, the
+        // default, is unchanged (1.539 % -> 1.538 %); psfSel under auto beta moved 1.25 % -> 1.30 %. The level is
+        // carried to Tasks 8/9 and Plan B (the LN scale re-baseline, PA-14, spec F-8).
+        assert!(
+            (half.scale - 1.25).abs() <= 0.0331,
+            "half {} is further from 1.25 than t06a's",
+            half.scale
+        );
+        assert!(
+            (full.scale - 1.25).abs() <= 0.0370,
+            "full {} is further from 1.25 than round 1's",
+            full.scale
+        );
     }
 
     /// The production masked scale path: the member's own measured fits seed

@@ -173,6 +173,8 @@ pub struct PlaneMeasurement {
     pub refused: RefusalCounts,
     /// One record per seed, in seed order, when `MeasureOptions::diagnostics` is set; empty otherwise.
     pub diagnostics: Vec<FitDiagnostics>,
+    /// The plane is defocused (owner ruling 2026-10-08): `stars` is empty, the accepted fits were refused `Defocused`.
+    pub defocused: bool,
     pub timings: PhaseTimings,
 }
 
@@ -279,6 +281,7 @@ pub fn measure_plane(
         field_width,
         refused: outcome.refused,
         diagnostics,
+        defocused: outcome.defocused,
         timings,
     }
 }
@@ -353,6 +356,29 @@ mod tests {
         assert_eq!(m.sky.median, adapter.channel.median);
         assert_eq!(m.sky.scale, adapter.channel.scale);
         assert_eq!(m.sky.noise_scale_high, adapter.channel.noise_scale_high);
+    }
+
+    /// A pin (ruling F28: no plane was defocused before the rule): the Gaussian-star `fixture_field` is not defocused
+    /// and keeps its stars.
+    #[test]
+    fn fixture_field_is_not_defocused() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let seeds = test_seeds_of(&data, w, h);
+        let n = seeds.len();
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.seeds, n);
+        assert!(!m.defocused, "{:?}", m.refused);
+        assert!(m.stars.len() >= 100, "{}", m.stars.len());
+        assert!(!m.refused.by_reason.contains_key(&RefusalReason::Defocused));
     }
 
     #[test]

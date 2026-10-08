@@ -1898,6 +1898,15 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `{"row":1,"metric":"donut outcome","family":"donut/*","path":"measure","kind":"reported"}`; it is judged
       at Task 6b. With it both diffs PASS (0 moved, 0 lost, control 0 mismatch). Without it, they read FAIL on
       exactly those two rows.
+    - **The defocused-frame rule (Task 6b round 4a, owner ruling 2026-10-08: "heavily defocused stars are not
+      stars").** A faint donut cannot be told from a blurred star by its own pixels, but defocus belongs to the
+      whole frame. After the per-seed outcomes: with `n_read` the plane's readable seeds (the width start's
+      10 sigma_rim gate passed) and `n_donut` those refused `Donut`, `n_donut >= 5` and `n_donut >= 0.25 * n_read`
+      make the plane DEFOCUSED: every fit it would have accepted is refused `Defocused`, the per-seed `Donut`
+      refusals keep theirs, `FitOutcome.defocused` / `PlaneMeasurement.defocused` are set and the plane has no fits
+      (the existing zero-star path). One `warn!` (`outcome = "defocused"`). Checked on the round-3b probe outputs
+      before it was coded: `donut/r6` 82 of 87 readable seeds (94.3 %), `donut/r10` 61 of 61; every other lab frame
+      0.1 % or less (the worst, `density/d1000`, 2 of 2741; `halo/i0`'s 39 faint noise-level seeds are unreadable).
 - **F-2 - canonical axes and a conditioned fit (Task 5; numbers move by design).**
   - **Canonical axes.** `accept` reports the major axis on `fwhm_x`/`fwtm_x` and `theta` on that axis, in
     `[-π/2, π/2)` (`canonical_theta`). The fitter's first axis was whichever its start made it, so the same star

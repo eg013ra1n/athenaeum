@@ -246,6 +246,9 @@ pub struct PlaneMeasurement {
     /// filter's own for [`SeedSource::MatchedFilter`], else `field_width_of` the
     /// seeds. Reported, not persisted.
     pub field_width: sm::FieldWidth,
+    /// The plane is defocused (owner ruling 2026-10-08): `fits` is empty and the zero-star path below takes it.
+    /// Reported, not persisted.
+    pub defocused: bool,
 }
 
 /// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
@@ -604,6 +607,7 @@ pub fn measure_plane_diagnosed(
             channel,
             fits: m.stars,
             field_width: m.field_width,
+            defocused: m.defocused,
         },
         seeds,
         m.diagnostics,

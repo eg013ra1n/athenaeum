@@ -36,11 +36,15 @@ pub enum RefusalReason {
     NarrowerThanPixel,
     /// A brighter accepted fit lies within ±1 px (the duplicate drop).
     Duplicate,
+    /// The whole plane is defocused (owner ruling 2026-10-08): at least 5 and at least a quarter of its readable seeds
+    /// were refused `Donut`, so every fit it would have accepted is refused with this reason. The per-seed `Donut`
+    /// refusals keep theirs.
+    Defocused,
 }
 
 impl RefusalReason {
     /// Every reason, in declaration (and `Ord`) order.
-    pub const ALL: [RefusalReason; 11] = [
+    pub const ALL: [RefusalReason; 12] = [
         RefusalReason::OutsideImage,
         RefusalReason::TooFewPixels,
         RefusalReason::Donut,
@@ -52,6 +56,7 @@ impl RefusalReason {
         RefusalReason::RegionTooSmall,
         RefusalReason::NarrowerThanPixel,
         RefusalReason::Duplicate,
+        RefusalReason::Defocused,
     ];
 
     /// The serialized (camelCase) name: the key of `ChannelMeasurement::refused_by_reason` and the `reason` of a
@@ -69,6 +74,7 @@ impl RefusalReason {
             RefusalReason::RegionTooSmall => "regionTooSmall",
             RefusalReason::NarrowerThanPixel => "narrowerThanPixel",
             RefusalReason::Duplicate => "duplicate",
+            RefusalReason::Defocused => "defocused",
         }
     }
 }
