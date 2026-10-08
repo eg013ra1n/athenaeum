@@ -79,7 +79,10 @@ pub mod provenance;
 pub mod psf_signal;
 pub mod register;
 pub mod rej;
-pub mod robust;
+// Robust Chauvenet Rejection moved to the star-measurement module with the
+// PSF-signal totals that use it (one star-measurement path, Plan A Task 2);
+// re-exported so `stacking::robust::…` callers are unchanged.
+pub use crate::star_measure::robust;
 pub mod run;
 pub mod solve;
 pub mod structure;

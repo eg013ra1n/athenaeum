@@ -196,7 +196,19 @@ pub fn stratified_sample(data: &[f32], width: usize, height: usize) -> Vec<f32> 
 /// restrictions to `[c − 4σ, c]` / `[c, c + 4σ]` about the median `c`.
 /// `None` below 8 samples or when a side empties.
 pub fn noise_scale_factors(values: &[f32]) -> Option<(f32, f32)> {
-    let v = clip_sample(values, NOISE_CLIP_LO, NOISE_CLIP_HI);
+    noise_scale_factors_within(values, NOISE_CLIP_LO, NOISE_CLIP_HI)
+}
+
+/// [`noise_scale_factors`] with the clip range `(clip_lo, clip_hi)` given
+/// instead of the unit domain's `[NOISE_CLIP_LO, NOISE_CLIP_HI]` — the same
+/// arithmetic, so the unit-domain call is bit-identical; a raw-ADU plane
+/// passes its own range (`star_measure::sky_level`).
+pub fn noise_scale_factors_within(
+    values: &[f32],
+    clip_lo: f32,
+    clip_hi: f32,
+) -> Option<(f32, f32)> {
+    let v = clip_sample(values, clip_lo, clip_hi);
     if v.len() < 8 {
         return None;
     }
@@ -204,9 +216,9 @@ pub fn noise_scale_factors(values: &[f32]) -> Option<(f32, f32)> {
     let mut low: Vec<f32> = v.iter().copied().filter(|&x| x <= c).collect();
     let mut high: Vec<f32> = v.iter().copied().filter(|&x| x >= c).collect();
     for _ in 0..2 {
-        let lo = (c as f64 - 4.0 * stddev_about_mean(&low)).max(NOISE_CLIP_LO as f64) as f32;
+        let lo = (c as f64 - 4.0 * stddev_about_mean(&low)).max(clip_lo as f64) as f32;
         low.retain(|&x| x >= lo);
-        let hi = (c as f64 + 4.0 * stddev_about_mean(&high)).min(NOISE_CLIP_HI as f64) as f32;
+        let hi = (c as f64 + 4.0 * stddev_about_mean(&high)).min(clip_hi as f64) as f32;
         high.retain(|&x| x <= hi);
     }
     if low.len() < 2 || high.len() < 2 {

@@ -39,6 +39,11 @@ pub mod cache;
 pub mod analysis;
 #[cfg(feature = "render")]
 pub mod flat_analysis;
+// One star-measurement path (spec 2026-10-07): the stacking Measure stage's
+// fit, β, frame aggregates, noise and sky statistic, `render`-gated like
+// `analysis` so the Analysis tab can consume it without `stacking`.
+#[cfg(feature = "render")]
+pub mod star_measure;
 pub mod orientation;
 // catalog/gaia builds on both astroimage (proper-motion) and solvemyastro (cache).
 #[cfg(all(feature = "render", feature = "solver"))]

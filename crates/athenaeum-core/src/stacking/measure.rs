@@ -17,15 +17,16 @@ use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed, StarFit};
 use super::structure::{self, SeedDetector, StructureParams};
 use crate::integration::plane_reader::PlaneReader;
-use crate::integration::stats::{self, LocationScale, ScaleEstimator, CLIP_HI, CLIP_LO};
+use crate::integration::stats::{LocationScale, ScaleEstimator};
 use crate::integration::IntegrationError;
+use crate::star_measure as sm;
 
-/// Calibrated frames are float32 in `[0, 1]`; the detector and the MRS
-/// estimator carry absolute floors tuned for 16-bit ADU data, so they see a
-/// copy scaled by this factor. Every estimator this module reports is
-/// scale-invariant (PSF Signal Weight, PSF SNR) or divided back into
-/// native units.
-pub const ADU_SCALE: f32 = 65535.0;
+// `ADU_SCALE` (calibrated frames are float32 in `[0, 1]`; the detector and
+// the MRS estimator see a copy scaled by it) and `NoiseSource` moved to the
+// star-measurement module (Plan A Task 2, ruling F43); re-exported so every
+// `measure::ADU_SCALE` caller and `ChannelMeasurement`'s serialized enum are
+// untouched.
+pub use crate::star_measure::domain::{NoiseSource, ADU_SCALE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -120,15 +121,6 @@ pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
 /// on the same 368 real frames; that task's report carries the grid and
 /// the verdict this constant is.
 pub const DEFAULT_SEED_DETECTOR: SeedDetector = SeedDetector::Peak;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum NoiseSource {
-    #[default]
-    Mrs,
-    /// MRS was unavailable; `noise` is `N*`.
-    BackgroundResidual,
-}
 
 /// Per-phase wall time of one plane's measurement (perf tier 1 Task 0).
 /// Skipped by serde: the cached `metrics` artifact payload must not change
@@ -262,7 +254,11 @@ pub enum SeedSource {
 }
 
 /// Measure one plane. Detection, fitting, the background model and MRS run
-/// on an ADU-scaled copy; the sample statistics run on the native data.
+/// on an ADU-scaled copy; the sample statistics run on the native data. The
+/// fit, the noise, the frame aggregates and the sample statistics are the
+/// star-measurement module's ([`crate::star_measure::measure_plane`], Plan A
+/// Task 2); this adapter reads the plane, runs the configured seed detector
+/// and maps the module's result onto `ChannelMeasurement`.
 pub fn measure_plane(
     data: &[f32],
     w: usize,
@@ -301,47 +297,6 @@ pub fn measure_plane_detailed(
 ) -> (PlaneMeasurement, Vec<Seed>) {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
-    // The background model and the noise σ are measured FIRST, and on the
-    // UNFILTERED plane, because the seed detection below may need that σ:
-    // a pre-filtered detection copy has its own, smaller noise, and a level
-    // derived from it would move down with the stars the filter attenuates
-    // (M4a Task 2 fix round 2, ruling R-M4a-14). Same numbers as before —
-    // both are pure functions of `scaled` — computed once and reused for
-    // the reported `noise`/`m_star`/`n_star` further down.
-    let t = Instant::now();
-    let bg = match pool {
-        Some(p) => p.install(|| psf_signal::background_residual(&scaled, w, h)),
-        None => psf_signal::background_residual(&scaled, w, h),
-    };
-    let background_ms = t.elapsed().as_millis() as u64;
-    let (m_star, n_star) = match bg {
-        Some(v) => v,
-        None => {
-            warn!(
-                width = w,
-                height = h,
-                "large-scale background model unavailable; M* and N* are zero"
-            );
-            (0.0, 0.0)
-        }
-    };
-    let t = Instant::now();
-    let mrs = match pool {
-        Some(p) => p.install(|| psf_signal::noise_mrs(&scaled, w, h)),
-        None => psf_signal::noise_mrs(&scaled, w, h),
-    };
-    let (noise_adu, noise_source) = match mrs {
-        Some(n) => (n as f64, NoiseSource::Mrs),
-        None => {
-            warn!(
-                n_star,
-                "MRS noise unavailable; using the background residual scale"
-            );
-            (n_star, NoiseSource::BackgroundResidual)
-        }
-    };
-    let noise_ms = t.elapsed().as_millis() as u64;
-
     // A run selects its detector through the config; `seed_source` is the
     // probe-level override the dev harnesses pass. `Fast` means "whatever
     // the options say", so the two never contradict each other silently.
@@ -349,6 +304,22 @@ pub fn measure_plane_detailed(
         (SeedSource::Fast, SeedDetector::Structure) => SeedSource::Structure,
         (s, _) => s,
     };
+
+    // The pre-filtered peak detection needs the noise σ BEFORE it runs, and
+    // from the UNFILTERED plane: a pre-filtered detection copy has its own,
+    // smaller noise, and a level derived from it would move down with the
+    // stars the filter attenuates (M4a Task 2 fix round 2, ruling
+    // R-M4a-14). That one arm measures the background model and MRS here,
+    // on the same ADU-scaled bytes the module would, and hands the result
+    // to the module, which then does not measure it again (I-1); every
+    // other arm lets the module measure it. Either way the two run exactly
+    // once, background first, and give the reported `noise`/`m_star`/
+    // `n_star` (Plan A Task 2).
+    let precomputed: Option<(sm::NoiseModel, sm::PhaseTimings)> =
+        match (seed_source, opts.seed_prefilter) {
+            (SeedSource::Fast, SeedPrefilter::Median3) => Some(sm::noise_model(&scaled, w, h, pool)),
+            _ => None,
+        };
 
     let t = Instant::now();
     let seeds: Vec<Seed> = match seed_source {
@@ -380,6 +351,7 @@ pub fn measure_plane_detailed(
             // level the detector measured on the filtered copy would fall
             // with the peaks and the filter would cancel itself — which is
             // exactly what fix round 1 measured (ruling R-M4a-14).
+            let noise_adu = precomputed.as_ref().map_or(0.0, |(n, _)| n.sigma);
             let levels = match opts.seed_prefilter {
                 SeedPrefilter::None => DetectionLevels::NoiseRelative {
                     k1: opts.detection_sigma,
@@ -482,95 +454,84 @@ pub fn measure_plane_detailed(
     };
     let detect_ms = t.elapsed().as_millis() as u64;
     let stars_detected = seeds.len();
+    // The detectors were this copy's only reader; the module makes its own
+    // working-unit copy of `data` (the same `v * ADU_SCALE` bytes), so the
+    // plane is never held twice.
+    drop(scaled);
 
-    let params = FitParams::default();
-    let t = Instant::now();
-    let outcome = match pool {
-        // Already inside this `install` — `fit_stars`'s own pool param gets
-        // `None` so it does not nest a second, pointless `install` inside
-        // this one (perf tier 1 Task 2).
-        Some(p) => p.install(|| {
-            psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params, None)
-        }),
-        None => psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params, None),
+    let (noise, own_phases) = match precomputed {
+        Some((model, phases)) => (Some(model), Some(phases)),
+        None => (None, None),
     };
-    let fit_ms = t.elapsed().as_millis() as u64;
-    let totals = psf_signal::signal_totals(&outcome.fits);
-    let (fwhm_px, eccentricity) = psf_signal::frame_shape(&outcome.fits).unwrap_or((0.0, 0.0));
-    let sample = stats::stratified_sample(data, w, h);
-    let clipped = stats::clip_sample(&sample, CLIP_LO, CLIP_HI);
-    let (median, mad, median_mean_dev) = if clipped.is_empty() {
-        warn!(
-            samples = sample.len(),
-            "no in-range samples after clipping; the plane may not be in [0, 1]"
-        );
-        (0.0, 0.0, 0.0)
-    } else {
-        let m = stats::median_of(&clipped);
-        (
-            m as f64,
-            stats::mad_about(&clipped, m) as f64,
-            stats::avg_dev_about(&clipped, m) as f64,
-        )
+    let module_opts = sm::MeasureOptions {
+        domain: sm::Domain::Calibrated {
+            gain_e_per_unit: None,
+        },
+        psf_model: opts.psf_model,
+        max_stars: opts.max_stars,
+        seeds: sm::SeedSpec::Given(seeds),
+        fit: FitParams::default(),
+        noise,
+        scale_estimator: opts.scale_estimator,
     };
-    let ls = stats::location_scale(&clipped, opts.scale_estimator).unwrap_or(LocationScale {
-        location: median as f32,
-        scale: 0.0,
-    });
-    let (noise_scale_low, noise_scale_high) = stats::noise_scale_factors(&sample)
-        .map(|(a, b)| (a as f64, b as f64))
-        .unwrap_or((0.0, 0.0));
+    let m = sm::measure_plane(data, w, h, &module_opts, pool);
+    let seeds = match module_opts.seeds {
+        sm::SeedSpec::Given(seeds) => seeds,
+        sm::SeedSpec::None => Vec::new(),
+    };
+    // The background/noise phases are whoever measured them: the Median3
+    // arm above, else the module.
+    let phases = own_phases.unwrap_or(m.timings);
 
     let s = ADU_SCALE as f64;
-    let noise = noise_adu / s;
+    let noise = m.noise.sigma / s;
     let snr_weight = if noise > 0.0 {
-        (median_mean_dev / noise).powi(2)
+        (m.sky.median_mean_dev / noise).powi(2)
     } else {
         0.0
     };
-    let stars_fitted = outcome.fits.len();
     let channel = ChannelMeasurement {
         stars_detected,
-        stars_fitted,
-        beta: outcome.beta,
-        fwhm_px,
-        eccentricity,
-        tflux: totals.tflux / s,
-        tmean_flux: totals.tmean_flux / s,
-        mean_flux_rejected: totals.rejected,
-        m_star: m_star / s,
-        n_star: n_star / s,
+        stars_fitted: m.frame.stars_fitted,
+        beta: m.beta,
+        fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
+        eccentricity: m.frame.eccentricity.unwrap_or(0.0),
+        tflux: m.frame.tflux / s,
+        tmean_flux: m.frame.tmean_flux / s,
+        mean_flux_rejected: m.frame.mean_flux_rejected,
+        m_star: m.noise.m_star / s,
+        n_star: m.noise.n_star / s,
         noise,
-        noise_source,
-        median,
-        mad,
-        median_mean_dev,
+        noise_source: m.noise.source,
+        median: m.sky.median,
+        mad: m.sky.mad,
+        median_mean_dev: m.sky.median_mean_dev,
         snr_weight,
-        noise_scale_low,
-        noise_scale_high,
-        location: ls.location as f64,
-        scale: ls.scale as f64,
+        noise_scale_low: m.sky.noise_scale_low,
+        noise_scale_high: m.sky.noise_scale_high,
+        location: m.sky.location,
+        scale: m.sky.scale,
         // Both estimators are scale-invariant, so the ADU-unit inputs give
         // the native-unit answer.
         psf_signal_weight: psf_signal::psf_signal_weight(
-            totals.tflux,
-            totals.tmean_flux,
-            noise_adu,
-            m_star,
+            m.frame.tflux,
+            m.frame.tmean_flux,
+            m.noise.sigma,
+            m.noise.m_star,
         ),
-        psf_snr: psf_signal::psf_snr(totals.tflux, noise_adu),
+        psf_snr: psf_signal::psf_snr(m.frame.tflux, m.noise.sigma),
         timings: MeasureTimings {
             read_ms: 0,
-            background_ms,
-            noise_ms,
+            background_ms: phases.background_ms,
+            noise_ms: phases.noise_ms,
             detect_ms,
-            fit_ms,
+            fit_ms: m.timings.fit_ms,
         },
     };
     (
         PlaneMeasurement {
             channel,
-            fits: outcome.fits,
+            fits: m.stars,
         },
         seeds,
     )
@@ -674,31 +635,18 @@ fn measure_frame_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
-    use crate::geometry::ransac::SplitMix64;
-    use crate::stacking::test_fixtures::synthetic_star_field;
     use crate::test_support::add_noise;
     use std::path::PathBuf;
 
     /// 150 Gaussian stars (σ 1.8 px) on a jittered 15×10 grid, amplitudes
-    /// `(0.1..0.3)·amp_scale`, background 0.08, Gaussian noise `noise`.
+    /// `(0.1..0.3)·amp_scale`, background 0.08, Gaussian noise `noise` —
+    /// [`crate::test_support::fixture_field`] (moved there in Plan A Task 2,
+    /// ruling F44, so the star-measurement module's own tests build it too).
     fn field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>, usize, usize) {
-        let (w, h) = (768, 512);
-        let mut rng = SplitMix64(seed);
-        let mut stars = Vec::new();
-        for j in 0..10 {
-            for i in 0..15 {
-                let x = 40.0 + i as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
-                let y = 40.0 + j as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
-                stars.push((x, y, (0.1 + 0.2 * rng.next_f64()) * amp_scale));
-            }
-        }
-        let sigma = 1.8;
-        let fwhm = 2.354_820_045_030_949_3 * sigma;
-        let data = synthetic_star_field(w, h, &stars, fwhm, noise, seed + 100);
-        (data, w, h)
+        crate::test_support::fixture_field(seed, amp_scale, noise)
     }
 
     fn write(dir: &Path, name: &str, planes: &[&[f32]], w: usize, h: usize) -> PathBuf {

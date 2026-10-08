@@ -122,6 +122,36 @@ pub(crate) fn gaussian_field(
     data
 }
 
+/// The stacking Measure stage's 150-star fixture (moved here from
+/// `stacking::measure`'s tests in Plan A Task 2, ruling F44, so the
+/// `render`-only star-measurement tests build it without `stacking`): 150
+/// Gaussian stars (σ 1.8 px) on a jittered 15×10 grid of a 768×512 plane,
+/// amplitudes `(0.1..0.3)·amp_scale`, background 0.08, Gaussian noise `noise`
+/// seeded by `seed + 100`. Byte-identical to the field the measure pins were
+/// recorded on: the σ takes the same FWHM round trip
+/// `stacking::test_fixtures::synthetic_star_field` gives it.
+pub(crate) fn fixture_field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>, usize, usize) {
+    const GAUSSIAN_FWHM_FACTOR: f64 = 2.354_820_045_030_949_3;
+    let (w, h) = (768, 512);
+    let mut rng = crate::geometry::ransac::SplitMix64(seed);
+    let mut stars = Vec::new();
+    for j in 0..10 {
+        for i in 0..15 {
+            let x = 40.0 + i as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
+            let y = 40.0 + j as f64 * 48.0 + (rng.next_f64() - 0.5) * 16.0;
+            stars.push((x, y, (0.1 + 0.2 * rng.next_f64()) * amp_scale));
+        }
+    }
+    let sigma = 1.8;
+    let fwhm = GAUSSIAN_FWHM_FACTOR * sigma;
+    let sigma = fwhm / GAUSSIAN_FWHM_FACTOR;
+    let mut data = gaussian_field(w, h, &stars, sigma, 0.08);
+    if noise > 0.0 {
+        add_noise(&mut data, noise, seed + 100);
+    }
+    (data, w, h)
+}
+
 /// Background-subtracted intensity-weighted centroid in a `(2r+1)²` box
 /// around `(x0, y0)`. NaN samples are skipped.
 pub(crate) fn centroid(
