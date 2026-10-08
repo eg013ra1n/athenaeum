@@ -249,6 +249,8 @@ pub struct PlaneMeasurement {
     /// The plane is defocused (owner ruling 2026-10-08): `fits` is empty and the zero-star path below takes it.
     /// Reported, not persisted.
     pub defocused: bool,
+    /// The readable seeds refused `Donut` (the verdict's `n_donut`). Reported, not persisted.
+    pub defocus_donuts: usize,
 }
 
 /// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
@@ -608,6 +610,7 @@ pub fn measure_plane_diagnosed(
             fits: m.stars,
             field_width: m.field_width,
             defocused: m.defocused,
+            defocus_donuts: m.defocus_donuts,
         },
         seeds,
         m.diagnostics,
@@ -675,6 +678,18 @@ fn measure_frame_inner(
         let pm = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
         let mut m = pm.channel;
         m.timings.read_ms = read_ms;
+        // Once per plane, from the measure path only (Task 6b fix wave A, review M1): the fit reports the verdict, this
+        // is the one place that knows the file.
+        if pm.defocused {
+            warn!(
+                outcome = "defocused",
+                count = pm.defocus_donuts,
+                stars_detected = m.stars_detected,
+                path = %path.display(),
+                plane,
+                "measure: the plane is defocused; no star is measured"
+            );
+        }
         debug!(
             path = %path.display(),
             plane,

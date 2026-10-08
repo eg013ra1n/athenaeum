@@ -150,6 +150,9 @@ pub struct FitStarsOptions {
     /// Keep one [`FitDiagnostics`] per seed in [`FitOutcome::diagnostics`] (Task 6b: the refit path reports them as
     /// `measure_plane` does); empty otherwise.
     pub diagnostics: bool,
+    /// Apply the plane-level defocused verdict (owner ruling 2026-10-08): `true` only on the measure path
+    /// ([`measure_plane`]); every other caller (LN's refits) keeps the per-star `Donut` refusal alone.
+    pub defocus_verdict: bool,
 }
 
 /// One plane's measurement (PA-1: the stacking adapter keeps its own `stacking::measure::PlaneMeasurement`). Energies
@@ -175,6 +178,8 @@ pub struct PlaneMeasurement {
     pub diagnostics: Vec<FitDiagnostics>,
     /// The plane is defocused (owner ruling 2026-10-08): `stars` is empty, the accepted fits were refused `Defocused`.
     pub defocused: bool,
+    /// The readable seeds refused `Donut` (the verdict's `n_donut`).
+    pub defocus_donuts: usize,
     pub timings: PhaseTimings,
 }
 
@@ -253,6 +258,7 @@ pub fn measure_plane(
             Some(field_width.fwhm_px),
             None,
             opts.diagnostics,
+            true,
         )
     };
     let mut outcome = match pool {
@@ -282,6 +288,7 @@ pub fn measure_plane(
         refused: outcome.refused,
         diagnostics,
         defocused: outcome.defocused,
+        defocus_donuts: outcome.defocus_donuts,
         timings,
     }
 }
@@ -311,6 +318,7 @@ pub fn fit_stars_at(
         opts.field_width,
         pool,
         opts.diagnostics,
+        opts.defocus_verdict,
     )
 }
 

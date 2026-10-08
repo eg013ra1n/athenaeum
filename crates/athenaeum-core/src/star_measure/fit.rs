@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
-use super::seeds::{field_width_of, own_halfmax_width, FieldWidth};
+use super::seeds::{field_width_of, own_halfmax_width, FieldWidth, HALFMAX_PEAK_SEARCH_PX};
 use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 
 /// `2√(2 ln 2)`: a Gaussian's FWHM per σ (the start width [`FitDiagnostics::width_start`] reports).
@@ -246,6 +246,8 @@ pub struct FitOutcome {
     /// The plane is defocused (owner ruling 2026-10-08, [`plane_is_defocused`]): `fits` is empty and every seed that
     /// would have been accepted is refused [`RefusalReason::Defocused`].
     pub defocused: bool,
+    /// The readable seeds that refused `Donut` (the verdict's `n_donut`); 0 unless the caller asked for the verdict.
+    pub defocus_donuts: usize,
 }
 
 /// A plane with this many readable seeds refused `Donut`, and at least [`DEFOCUSED_DONUT_FRACTION`] of its readable
@@ -621,9 +623,16 @@ fn width_start(
     start.level = level;
     // `rim_median` left the rim's present pixels in `scratch.rim` (reordered, the same multiset).
     let sigma_rim = (MAD_TO_SIGMA * mad_about(&scratch.rim, level as f32)) as f64;
+    // The star's OWN peak (Task 6b fix wave A, review M2): the maximum inside the window `own_halfmax_width` centres
+    // its read on (the seed's rounded position, ±`HALFMAX_PEAK_SEARCH_PX`), not the box maximum, which a brighter
+    // neighbour's wing inside the box would raise.
+    let (sx, sy) = (seed.x.round() as i64, seed.y.round() as i64);
     let mut peak = f64::NEG_INFINITY;
-    for y in cy - rb..=cy + rb {
-        for x in cx - rb..=cx + rb {
+    for y in sy - HALFMAX_PEAK_SEARCH_PX..=sy + HALFMAX_PEAK_SEARCH_PX {
+        for x in sx - HALFMAX_PEAK_SEARCH_PX..=sx + HALFMAX_PEAK_SEARCH_PX {
+            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                continue;
+            }
             let i = y as usize * w + x as usize;
             if present(data, mask, i) {
                 peak = peak.max(data[i] as f64);
@@ -760,7 +769,9 @@ fn ring_radius(
 
 /// The donut test's two means, both minus `b0`: the 3×3 core about the pixel nearest `centre`, and the 1-px ring
 /// `R − ½ < d ≤ R + ½` about `centre` itself (round 3, ruling R8: half-open below, so at the radius floor 1.5 the cross
-/// neighbours at d = 1, which the core holds, never enter the ring by a rounding of the centre). Only present pixels
+/// neighbours at d = 1, which the core holds, are not in the ring when the centre sits exactly on a pixel centre; an
+/// offset of even 1e-12 px puts one of them at d > 1, inside the ring, so a knife edge remains on that one side — the
+/// verdict is unharmed, every core/ring ratio sits well clear of 0.8). Only present pixels
 /// inside the image count; `None` when the core or the ring holds none.
 fn core_and_ring(
     data: &[f32],
@@ -1250,7 +1261,7 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false)
+    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false, false)
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -1297,6 +1308,7 @@ pub(super) fn fit_stars_diagnosed(
     field_width: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
+    defocus_verdict: bool,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
     let beta = match model {
@@ -1307,7 +1319,19 @@ pub(super) fn fit_stars_diagnosed(
         PsfModel::Fixed(b) => b,
         PsfModel::Auto => super::beta::auto_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
     };
-    fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
+    fit_at_width(
+        data,
+        w,
+        h,
+        seeds,
+        beta,
+        p,
+        mask,
+        field,
+        pool,
+        diagnostics,
+        defocus_verdict,
+    )
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
@@ -1333,7 +1357,7 @@ pub fn fit_stars_with_beta(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false)
+    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false, false)
 }
 
 /// [`fit_stars_with_beta`], also keeping one [`FitDiagnostics`] per seed, in
@@ -1358,9 +1382,22 @@ pub(super) fn fit_stars_with_beta_diagnosed(
     field_width: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
+    defocus_verdict: bool,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
-    fit_at_width(data, w, h, seeds, beta, p, mask, field, pool, diagnostics)
+    fit_at_width(
+        data,
+        w,
+        h,
+        seeds,
+        beta,
+        p,
+        mask,
+        field,
+        pool,
+        diagnostics,
+        defocus_verdict,
+    )
 }
 
 /// The body both entry points share once β and the field width are resolved.
@@ -1376,6 +1413,7 @@ fn fit_at_width(
     field: FieldWidth,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
+    defocus_verdict: bool,
 ) -> FitOutcome {
     let per_seed = fit_all_outcomes(data, w, h, seeds, beta, p, mask, field.fwhm_px, pool);
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(per_seed.len());
@@ -1387,16 +1425,9 @@ fn fit_at_width(
         .iter()
         .filter(|(r, t)| t.readable && matches!(r, Err(RefusalReason::Donut)))
         .count();
-    let defocused = plane_is_defocused(n_read, n_donut);
-    if defocused {
-        warn!(
-            outcome = "defocused",
-            count = n_donut,
-            seeds = seeds.len(),
-            readable = n_read,
-            "fit: the plane is defocused; no star is measured"
-        );
-    }
+    // The plane rule is the measure path's alone (Task 6b fix wave A, review I1): LN and every other caller keep the
+    // per-star `Donut` refusal and never see the plane verdict. The event is the adapter's (it knows the path).
+    let defocused = defocus_verdict && plane_is_defocused(n_read, n_donut);
     for (i, (result, trace)) in per_seed.into_iter().enumerate() {
         match result {
             Ok(_) if defocused => outcomes.push(Outcome::Refused(RefusalReason::Defocused)),
@@ -1442,6 +1473,7 @@ fn fit_at_width(
         field_width: field,
         diagnostics,
         defocused,
+        defocus_donuts: if defocus_verdict { n_donut } else { 0 },
     }
 }
 
@@ -2392,9 +2424,22 @@ mod tests {
         seeds: &[Seed],
         field: f64,
     ) -> (FitOutcome, Vec<FitDiagnostics>) {
+        fit_with_verdict(data, w, h, seeds, field, true)
+    }
+
+    /// [`fit_with`] with the plane verdict chosen: `true` is the measure path's call, `false` every other caller's.
+    fn fit_with_verdict(
+        data: &[f32],
+        w: usize,
+        h: usize,
+        seeds: &[Seed],
+        field: f64,
+        defocus_verdict: bool,
+    ) -> (FitOutcome, Vec<FitDiagnostics>) {
         let opts = FitStarsOptions {
             field_width: Some(field),
             diagnostics: true,
+            defocus_verdict,
             ..Default::default()
         };
         let out = fit_stars_at(data, w, h, seeds, 4.0, &opts, None);
@@ -2484,6 +2529,11 @@ mod tests {
     /// Adds an annulus (outer 6, obstruction 2.4) blurred by a Gaussian of σ 1.1 at `(cx, cy)` to `data`, the way
     /// `donut_is_refused_with_its_reason` renders one, over the 25×25 pixels about it only.
     fn add_donut(data: &mut [f32], w: usize, cx: usize, cy: usize) {
+        add_donut_gain(data, w, cx, cy, 1.0);
+    }
+
+    /// [`add_donut`] with its amplitude scaled by `gain`.
+    fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f64) {
         let ring = ring_samples(cx as f64, cy as f64, 2.4, 6.0);
         for y in cy - 12..=cy + 12 {
             for x in cx - 12..=cx + 12 {
@@ -2492,7 +2542,7 @@ mod tests {
                     let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
                     acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
                 }
-                data[y * w + x] += (0.3 * acc / 2000.0) as f32;
+                data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
             }
         }
     }
@@ -2502,11 +2552,79 @@ mod tests {
     /// `Defocused`, and the plane carries no fit.
     #[test]
     fn a_donut_field_plane_is_defocused_and_has_no_fits() {
+        let (data, w, h, seeds) = donut_field();
+        // The field width of a defocused frame is the donuts' (their box must clear the ring: radius 2·8 = 16 > 6).
+        let (out, diag) = fit_with(&data, w, h, &seeds, 8.0);
+        assert!(out.defocused, "{:?}", out.refused);
+        assert!(out.fits.is_empty(), "{:?}", out.fits);
+        for d in &diag[..8] {
+            assert_eq!(d.outcome, Outcome::Refused(RefusalReason::Donut), "{d:?}");
+        }
+        for d in &diag[8..] {
+            assert_eq!(
+                d.outcome,
+                Outcome::Refused(RefusalReason::Defocused),
+                "{d:?}"
+            );
+        }
+        assert_eq!(out.refused.by_reason[&RefusalReason::Donut], 8);
+        assert_eq!(out.refused.by_reason[&RefusalReason::Defocused], 2);
+        assert_eq!(out.refused.accounted(0), seeds.len());
+        assert_eq!(out.defocus_donuts, 8);
+    }
+
+    /// Task 6b fix wave A, review I1 (RED before the fix: `fit_stars_at` re-decided the plane verdict on every call).
+    /// An LN-style call (`defocus_verdict` false) on the plane whose donuts are most of its readable stars keeps its
+    /// two non-donut fits; the donuts keep their per-star `Donut` refusal and the plane is not defocused.
+    #[test]
+    fn an_ln_style_call_on_a_donut_field_keeps_its_non_donut_fits() {
+        let (data, w, h, seeds) = donut_field();
+        let (out, diag) = fit_with_verdict(&data, w, h, &seeds, 8.0, false);
+        assert!(!out.defocused, "{:?}", out.refused);
+        assert_eq!(out.fits.len(), 2, "{:?}", out.refused);
+        for d in &diag[..8] {
+            assert_eq!(d.outcome, Outcome::Refused(RefusalReason::Donut), "{d:?}");
+        }
+        assert!(!out
+            .refused
+            .by_reason
+            .contains_key(&RefusalReason::Defocused));
+        assert_eq!(out.defocus_donuts, 0);
+    }
+
+    /// The measure path (`measure_plane`) asks for the verdict and marks the same plane defocused, with no star.
+    #[test]
+    fn the_measure_path_marks_the_donut_field_plane_defocused() {
+        use crate::star_measure::{measure_plane, MeasureOptions, SeedSpec};
+        let (data, w, h, seeds) = donut_field();
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds),
+                field_width: Some(FieldWidth {
+                    fwhm_px: 8.0,
+                    from_stars: 0,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(m.defocused, "{:?}", m.refused);
+        assert!(m.stars.is_empty());
+        assert_eq!(m.defocus_donuts, 8);
+    }
+
+    /// Eight donuts and two sharp stars on a flat plane (330 x 100), the donuts' seeds first.
+    fn donut_field() -> (Vec<f32>, usize, usize, Vec<Seed>) {
         let (w, h) = (330usize, 100usize);
         let mut data = vec![0.05f32; w * h];
         let donuts: Vec<(usize, usize)> = (0..8).map(|i| (30 + 35 * i, 30)).collect();
+        // Gain 4: a donut's seed window (the star's own peak, ±2 px about the seed) lies in its hole (radius 2.4), so
+        // its corners must stand 10 σ over the rim for the donut to be readable (fix wave A, M2).
         for &(x, y) in &donuts {
-            add_donut(&mut data, w, x, y);
+            add_donut_gain(&mut data, w, x, y, 4.0);
         }
         let alpha = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
         let stars = [one(100.0, 75.0, 0.3, alpha), one(220.0, 75.0, 0.3, alpha)];
@@ -2525,25 +2643,16 @@ mod tests {
             })
             .collect();
         seeds.extend(stars.iter().map(seed));
-        // The field width of a defocused frame is the donuts' (their box must clear the ring: radius 2·8 = 16 > 6).
-        let (out, diag) = fit_with(&data, w, h, &seeds, 8.0);
-        assert!(out.defocused, "{:?}", out.refused);
-        assert!(out.fits.is_empty(), "{:?}", out.fits);
-        for d in &diag[..8] {
-            assert_eq!(d.outcome, Outcome::Refused(RefusalReason::Donut), "{d:?}");
-        }
-        for d in &diag[8..] {
-            assert_eq!(d.outcome, Outcome::Refused(RefusalReason::Defocused), "{d:?}");
-        }
-        assert_eq!(out.refused.by_reason[&RefusalReason::Donut], 8);
-        assert_eq!(out.refused.by_reason[&RefusalReason::Defocused], 2);
-        assert_eq!(out.refused.accounted(0), seeds.len());
+        (data, w, h, seeds)
     }
 
     /// The rule's two thresholds, exactly: 5 donuts are the minimum and a quarter of the readable seeds the fraction.
     #[test]
     fn the_defocused_rule_needs_five_donuts_and_a_quarter_of_the_readable_seeds() {
-        assert!(!plane_is_defocused(4, 4), "four donuts are under the minimum");
+        assert!(
+            !plane_is_defocused(4, 4),
+            "four donuts are under the minimum"
+        );
         assert!(plane_is_defocused(5, 5));
         assert!(plane_is_defocused(20, 5), "exactly a quarter");
         assert!(!plane_is_defocused(21, 5), "just under a quarter");
@@ -2557,7 +2666,14 @@ mod tests {
         let (w, h) = (330usize, 330usize);
         let alpha = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
         let stars: Vec<MoffatStar> = (0..100)
-            .map(|i| one(30.0 + (i % 10) as f64 * 30.3, 30.0 + (i / 10) as f64 * 30.3, 0.3, alpha))
+            .map(|i| {
+                one(
+                    30.0 + (i % 10) as f64 * 30.3,
+                    30.0 + (i / 10) as f64 * 30.3,
+                    0.3,
+                    alpha,
+                )
+            })
             .collect();
         let mut data = moffat_field(w, h, &stars, 4.0, 0.05);
         // Between grid stars, 21 px from the nearest: clear of their regions.
@@ -2579,7 +2695,10 @@ mod tests {
         for d in &diag[100..] {
             assert_eq!(d.outcome, Outcome::Refused(RefusalReason::Donut), "{d:?}");
         }
-        assert!(!out.refused.by_reason.contains_key(&RefusalReason::Defocused));
+        assert!(!out
+            .refused
+            .by_reason
+            .contains_key(&RefusalReason::Defocused));
     }
 
     /// A pin on the ring radius's 1.5-px floor (ruling F28: before this task no star is refused `Donut` at all, so it
@@ -2779,6 +2898,32 @@ mod tests {
         );
     }
 
+    /// Task 6b fix wave A, review M2 (RED before the fix: the gate read the box maximum). A 5 σ FWHM-3 star with a 50x
+    /// brighter FWHM-1.5 neighbour 5 px away, inside its ⌈2·3⌉ = 6 px box: the box maximum is the neighbour's, the
+    /// star's own peak (±2 px about its seed) stands about 6 σ over the rim, so it is NOT readable and starts at the
+    /// field width exactly. The neighbour's own start is its own width.
+    #[test]
+    fn a_faint_stars_readability_is_its_own_peak_not_a_neighbours() {
+        let stars = [
+            one(100.0, 100.0, 0.010, 3.449),
+            one(105.0, 100.0, 0.5, 1.725),
+        ];
+        let mut data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 33);
+        let seeds: Vec<Seed> = stars.iter().map(seed).collect();
+        let (_, diag) = fit_with(&data, 200, 200, &seeds, 3.0);
+        assert_eq!(
+            diag[0].width_start, 3.0,
+            "a faint star beside a bright one starts from the field width: {:?}",
+            diag[0]
+        );
+        assert!(
+            (diag[1].width_start / 1.5 - 1.0).abs() < 0.25,
+            "the bright neighbour reads its own width: {:?}",
+            diag[1]
+        );
+    }
+
     // --- Task 6b round 3 (rulings R7/R8 final, R9 final) ---
 
     /// The brief's donut, noise-free: an annulus (outer 6, obstruction 2.4) blurred by a Gaussian of σ 1.1.
@@ -2863,7 +3008,7 @@ mod tests {
     /// let in or out by a 1e-16 offset of the centre (core/ring 1.044 in, 1.21 out). The fold check's real-star bar is
     /// ≥ 1.08; it holds at a 0 and at a 1e-12 offset.
     #[test]
-    fn the_ring_has_no_knife_edge_at_its_radius_floor() {
+    fn the_ring_excludes_the_cross_neighbours_at_a_pixel_centre() {
         let sigma = 3.5 / GAUSSIAN_FWHM_PER_SIGMA;
         let data = crate::test_support::gaussian_field(120, 120, &[(60.0, 60.0, 0.3)], sigma, 0.05);
         for dx in [0.0, 1e-12] {

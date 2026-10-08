@@ -66,7 +66,7 @@ const HALFMAX_REMEASURE_FROM_PX: f64 = 7.0;
 const HALFMAX_BOX_MAX_PX: usize = 48;
 /// The rings' centre is the brightest present pixel within this many px of the seed (Chebyshev), so a brighter
 /// neighbour inside the box is never measured in the seed's place.
-const HALFMAX_PEAK_SEARCH_PX: i64 = 2;
+pub(super) const HALFMAX_PEAK_SEARCH_PX: i64 = 2;
 /// The kernel's reach, in σ.
 const KERNEL_REACH_SIGMAS: f64 = 3.0;
 /// Two candidates whose centroids land within this distance (px) are one star (a tied or masked-centre maximum).
@@ -822,8 +822,8 @@ pub(crate) fn own_halfmax_width(
 /// The field width of GIVEN seeds (I-4, PA-17): the median `halfmax_width` of the ≤ 100 brightest, all of them —
 /// no saturation test (ruling F25 as folded) — (box 15 px; a first read ≥ 7 px is re-measured in a `3·F` box,
 /// ≤ 48), clamped to [1.5, 24] px. `fit_stars_at` calls it when
-/// `FitStarsOptions.field_width` is `None` (LN refits, Peak/Structure seeds, Plan C's mosaic sites); Task 6b's
-/// width start reads it; this task's fit does not.
+/// `FitStarsOptions.field_width` is `None` (LN refits, Peak/Structure seeds, Plan C's mosaic sites); the fit's
+/// width start reads the field width it returns (Task 6b).
 ///
 /// "Brightest" is by `peak` (a stable sort, so equal peaks keep the given order). A re-measure whose larger box
 /// leaves the image keeps the first read. No star read → `from_stars = 0` and the first pass's 3 px.
