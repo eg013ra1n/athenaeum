@@ -1971,17 +1971,19 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       - row 5 `background` `bias`;
       - row 2 `centroid` `bias_x`/`bias_y` and `scatter_x`/`scatter_y`, on measure and on register.
 
-      Each group PASSES when its head pooled median (of |value| for a bias key) is no higher than the base's,
-      and the count of (row, key) judgments worse than the base beyond SE exceeds the count better beyond SE by
-      no more than 2·√(worse + better). The target is every group PASS by the end of Plan A, checked at Tasks
-      6b, 9 and 14. The starting debt at t05 (`t05-f2/debt.txt`):
+      Each group is judged by the final rule. Values are |value| for a bias key. Over every (row, key) of the
+      group, the rows where t05 is worse than t01c by any amount (up, exact ties excluded) may exceed the rows
+      where it is better (down) by no more than 2·√(up + down). The same two-sigma sign test then applies to the
+      judgments beyond the row's SE (worse against better). The pooled medians are printed, never judged. The
+      target is every group PASS by the end of Plan A, checked at Tasks 6b, 9 and 14. The starting debt at t05
+      (`t05-f2/debt.txt`, athenaeum-lab 4a35b05):
 
-      | group | worse / better | pooled median t01c → t05 | verdict |
-      | ---- | ---- | ---- | ---- |
-      | fwhm bias (measure, pointfit) | 96 / 69 | 0.01045 → 0.00969 | OPEN (sign test) |
-      | fwhm scatter (measure, pointfit) | 68 / 98 | 0.01552 → 0.01553 | OPEN (median) |
-      | background bias (measure) | 141 / 36 | 0.0502 → 0.0563 | OPEN (median and sign test) |
-      | centroid bias (measure) | 33 / 34 | 0.00175 → 0.00170 | PASS |
-      | centroid scatter (measure) | 42 / 48 | 0.0237 → 0.0239 | OPEN (median) |
-      | centroid bias (register) | 22 / 20 | 0.00128 → 0.00136 | OPEN (median) |
-      | centroid scatter (register) | 40 / 33 | 0.0181 → 0.0179 | PASS |
+      | group | up / down | worse / better | pooled median t01c → t05 | verdict |
+      | ---- | ---- | ---- | ---- | ---- |
+      | fwhm bias (measure, pointfit) | 446 / 483 | 96 / 69 | 0.01045 → 0.00969 | OPEN (beyond SE: 27 > 25.7) |
+      | fwhm scatter (measure, pointfit) | 434 / 473 | 68 / 98 | 0.01552 → 0.01553 | PASS |
+      | background bias (measure) | 574 / 351 | 141 / 36 | 0.0502 → 0.0563 | OPEN (both: 223 > 60.8, 105 > 26.6) |
+      | centroid bias (measure) | 943 / 932 | 33 / 34 | 0.00175 → 0.00170 | PASS |
+      | centroid scatter (measure) | 921 / 913 | 42 / 48 | 0.0237 → 0.0239 | PASS |
+      | centroid bias (register) | 650 / 656 | 22 / 20 | 0.00128 → 0.00136 | PASS |
+      | centroid scatter (register) | 618 / 676 | 40 / 33 | 0.0181 → 0.0179 | PASS |
