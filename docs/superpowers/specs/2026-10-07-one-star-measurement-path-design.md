@@ -69,8 +69,8 @@ Public surface: `measure_plane(plane, opts) -> PlaneMeasurement` (stars, frame a
 counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, opts)`. The module exports
 `MEASURE_VERSION` (§4.4).
 
-**The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike;
-revised 2026-10-09).** The method an established stacking program uses, adopted as is (owner ruling 2026-10-09)
+**The saturation test (one definition, used by every module caller, raw and calibrated planes, frames and integrated
+masters alike; revised 2026-10-09).** The method an established stacking program uses, adopted as is (owner ruling 2026-10-09)
 after the earlier flat-top test failed on lab truth. Three of its inputs are the module's own substitutes (bg, σ,
 pixel0), named below; there is no raw-clip clause and no `saturation_fraction`.
 
@@ -104,10 +104,20 @@ Per seed (every seed gets the whole test, as the reference method fits every can
 Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample and the frame
 statistic use unflagged stars only; the field width reads every candidate (F25), the per-star width start is the
 star's own (F-3). The unflagged bright seeds' verdict fits are the β sample's free-β fits (F-4), and every star is
-then fitted at the frame β with the SAME exclusion as its verdict fit (pixels ≥ its level, ×3 iterations): an
-unflagged star excludes nothing (byte-identical to a plain fit), and a flagged star without a plateau excludes
-nothing. Registration's `passes_register_cuts` (peak ≥ 0.95) still holds, since censoring raises the fitted peak;
+then fitted at the frame β. A FLAGGED star (own or cross-plane flag, below) excludes the pixels ≥ its own level
+(norm when its own plateau test failed), ×3 iterations; an unflagged star excludes nothing, and its fit is
+byte-identical to a plain fit (revised 2026-10-09: excluding the top of unflagged plateau stars cost 218
+truth-unsaturated bright stars their width in the lab). Registration's `passes_register_cuts` (peak ≥ 0.95) still holds, since censoring raises the fitted peak;
 the parity gate checks it.
+
+**Multi-plane frames (owner ruling 2026-10-09).** On a frame or master with more than one plane (the debayered
+OSC planes), a star flagged on ANY plane — or refused `MostlySaturated` there — is flagged on EVERY plane at that
+position (seed positions matched within 1 px; only a plane's own flags spread, so the union is not transitive). The
+union is formed after every plane's verdict pass and before any plane's β sample, frame statistic or at-β fits; one
+multi-plane entry serves frames and master statistics alike. Reason: the debayer mixes channels, so a star clipped
+in one channel corrupts the others around it, and a debayered R or B plane shows no plateau at the seed pixel. The
+reference method measures one plane of a colour image and has no such rule; this is our extension. Lab: OSC false
+negatives 52 of 1229 → 0; the 90 added flags are all saturated in another channel.
 
 **Known limit (owner ruling 2026-10-09).** A star with a small clipped core (3–5 px) fails the full-3×3 plateau
 test, so its verdict fit runs uncensored. It is still flagged (its fitted A exceeds the range), but its own FWHM is
@@ -130,14 +140,15 @@ there (lab, 30 % vignetting: 99.95 % of the clipped stars flagged).
   design: a plane's brightest star when its own peak sets the range, a sharp star whose model peak tops its
   brightest pixel, and, through the cap, a star the flat division lifts above full scale (lab: 0.6–0.8 %, 7.5 %
   under 30 % vignetting).
-  The truth flag also marks stars a neighbour clips and stars that barely reach the clip (in the v2 i0 truth: 81 of
-  4105 saturated only through a neighbour, 25 within 2 % of the clip); no per-star test sees those, and they are
+  The truth flag also marks stars a neighbour clips and stars that barely reach the clip (in the v2 i0 truth: 61 saturated
+  only through a neighbour and 90 within 2 % of the clip, two-sided, among the saturated); no per-star test sees those, and they are
   reported as counts, not judged.
 
 **Exemptions (unchanged consumers of the numbers, not callers of the module's tests):** LN keeps its L-14 relative
 rule, its L-23 reference-frames mask and its peak-SNR cut on warped planes, where a core is interpolated
 (`ln/selection.rs:129-157`); registration keeps `passes_register_cuts` (0.95 × 65535 and
-1/residual ≥ 10, `register/detect.rs:182-195`). Routing them through the module is a later question, not this spec.
+1/residual ≥ 10, `register/detect.rs:182-195`); LN's reference fit (`fit_stars` on the integrated reference,
+`ln/scale.rs`) runs no verdict. Routing them through the module is a later question, not this spec.
 
 ### 2.2 Consumers
 

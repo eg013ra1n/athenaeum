@@ -333,11 +333,15 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   - **Order (ruling F9, kept):** seeds → field width → verdicts → β sample → fits at β. The field width (PA-17)
     runs no saturation test (ruling F25 as folded). The unflagged bright seeds' verdict fits are the β sample:
     Task 8's discrete search takes the 64 brightest unflagged seeds, Task 9 takes their free β (C-b). Every star is
-    then fitted at the frame β with the same per-star exclusion as its verdict fit (Q6).
+    then fitted at the frame β; only a FLAGGED star (own or cross-plane) carries its verdict fit's exclusion (Q6 as
+    revised 2026-10-09).
   - **Flagged stars (C-c)** stay in `.athf` with `SATURATED`; the β sample and the frame statistic read unflagged
     stars only (F-3); the field width reads every candidate (F25) and the per-star width start is the star's own
-    (Q8). The at-β fit applies the SAME per-star exclusion as the verdict fit (Q6): an unflagged star excludes
-    nothing (byte-identical), a flagged star without a plateau excludes nothing. Registration's
+    (Q8). The at-β fit applies the verdict fit's exclusion to FLAGGED stars only (Q6 as revised 2026-10-09 after the
+    lab: censoring unflagged plateau stars cost 218 truth-unsaturated stars their width): an unflagged star excludes
+    nothing and is byte-identical; a flagged star without a plateau excludes pixels ≥ norm. On a multi-plane frame or
+    master the flags are united across planes before any β sample, statistic or at-β fit (owner ruling 2026-10-09;
+    a `MostlySaturated` refusal spreads too; spec §2.1 "Multi-plane frames"). Registration's
     `passes_register_cuts` (`detect.rs:183–186`) still holds since censoring raises the fitted peak; the parity gate
     checks it. The known limit (small-core stars fitted uncensored, FWHM +31 %, no consumer) is spec §2.1's.
   - **Bar (C-d).** Row 10: FN ≤ 0.5 % among truth-saturated stars with `clipped_core_px ≥ 3`; FP reported as a
@@ -2383,9 +2387,9 @@ pub fn saturation_verdict(region: &[PixelSample], seed_x: f64, seed_y: f64, b0: 
 - Every seed whose region is gathered gets a verdict (C-b). A seed refused before its region (`OutsideImage`,
   `TooFewPixels`) or as a `Donut` has none; `Err(MostlySaturated)` refuses the seed, counted in `stars_refused` by reason.
   `FitDiagnostics.verdict: Option<SaturationVerdict>` records it.
-- `fit_one` sets `StarFit.flags |= SATURATED` from the verdict; the star is still fitted at the frame β with the SAME
-  exclusion (pixels ≥ its level, ×3 iterations; an unflagged star, or a flagged one without a plateau, excludes
-  nothing and is byte-identical) and stays in `.athf` with its flag (C-c, Q6). A verdict with `fit = false` is no
+- `fit_one` sets `StarFit.flags |= SATURATED` from the verdict (own or cross-plane); a FLAGGED star is fitted at the
+  frame β with its verdict fit's exclusion (pixels ≥ its own level, norm without a plateau; ×3 iterations); an
+  unflagged star excludes nothing and is byte-identical (Q6 as revised 2026-10-09) and stays in `.athf` with its flag (C-c, Q6). A verdict with `fit = false` is no
   flag and no refusal; that seed is out of the β sample and the payoff, and the probe prints it (Q4). `stars_fitted` keeps counting every accepted fit (M-4);
   `FrameAggregates.stars_unsaturated`; `frame_shape(fits)` → `frame_shape(fits.iter().filter(|f|
   !f.flags.saturated()))` with `None` when empty (Review Focus 3 — the adapter then reports `fwhm_px = 0.0`, which
@@ -2606,6 +2610,16 @@ fn beta_sample_skips_saturated_stars() {
     `twins/mixture/b` 2.62 %); `auto beta agrees` 100 % of pairs on every family (β discrete: zero flips; baseline
     0.0 % of 1 pair on five families) — the twin rows are judged AGAIN at Task 9 (N-6), where "void at the cap" may
     apply.
+  - **Outcome (t08-f3, rulings 2026-10-09, `progress.md`):** FN mono 3/4089 (0.073 %), OSC 0/1229 with the
+    cross-plane flag (52 without it); FP mono 0.294 %, OSC 0.411 % (90 cross, all saturated in another channel);
+    twins 44/46. MOVED TO TASK 9 with research R3's evidence (`task-8-research-R3-report.md`): `twins/sharp/m2.5/f1.6`
+    and `twins/sharp/m4/f2.0` (discrete β near-ties on undersampled stars; samples saturation-free; held β ≤ 0.10 %),
+    `sharp/m4/f2.0` i0 (+2.62 % at β 6, +0.27 % at the truth β 4), and, by owner ruling, `betas@10` / `betas@6` ecc
+    above Fisher 300 and `betas@2.5` at 20–40 (inherited from 6b/7: the betas@ rows are identical t06b → t08). The
+    68 planes' "β = t05" is met by its own terms: 19 exceptions, each the 6a seed source (R3 `qc-planes.tsv`); β vs
+    the truth is Task 9's. Design additions: planes whose frame β changed (under the control: every unflagged fit
+    equals its held-β fit, 37 278 / 37 278), `artefacts` rows 1 and 4 (`MostlySaturated`), OSC row 8 on
+    `osc/f3.5`, `osc/f5.0/blur1`, `osc_pairs/f3.5` (the cross-plane population).
 
 - [ ] **Step 5: Record R-OSP-5 and commit.** R-OSP-5 records spec §2.1's test with its constants (5σ, 0.7, 0.1,
   3 of 8 / 8 of 8, iterations ×3, n ≤ 8), the three substitutes (bg, σ, pixel0) and the known limit with its three
@@ -2800,6 +2814,11 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
   - row 3's `beta sensitivity` line stays (the discrete arm is a lab diagnostic);
   - F-3's self-consistency row again with the verdict fit on the bounded fitter (PA-23, C-d): FN ≤ 0.5 % on
     ≥ 3-clipped-core stars; FP (count and share), the payoff and the `mostlySaturated` refusals reported, no bar.
+  - **Carried from Task 8 (2026-10-09):** the twins `twins/sharp/m2.5/f1.6` and `twins/sharp/m4/f2.0` (≤ 1 %,
+    |Δβ|/β ≤ 10 %), `sharp/m4/f2.0` i0 frame FWHM (≤ 3 % below FWHM 2 px under F-4's own row, ≤ 1 % if it sits at
+    ≥ 2 px), β vs the truth on the 19 planes of R3's table, OSC row 8 on the three cross-plane families re-read,
+    and the owner ruling: same-star ecc above Fisher 300 on `betas@10` / `betas@6` and `betas@2.5` at 20–40 back to
+    ≤ t06a by the sign rule — a miss there goes to the owner with a 6b cause study.
 
 - [ ] **Step 5: The UI label, README R-OSP-6, commit** (athenaeum: the module, the pointer, the UI; lab results).
 
