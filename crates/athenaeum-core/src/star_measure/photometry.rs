@@ -11,7 +11,9 @@
 //!    and `pixel0 − minhigh ≤ 0.1·range`. The level is then `min(pixel0, norm) − 0.1·range`, else `norm`.
 //! 2. **The verdict fit** ([`saturation_verdict`]): a free-β Moffat on the region's pixels below the level, the
 //!    iteration limit ×3 when any pixel is excluded; no more pixels than the fit's 8 parameters refuses the seed
-//!    [`RefusalReason::MostlySaturated`].
+//!    [`RefusalReason::MostlySaturated`]. From Task 9 (F-4, ruling R-OSP-6) it is rustafits' bounded fit
+//!    (`fit_moffat_2d_bounded`: ln β in [`BETA_BOUNDS`], start β [`BETA_START`], the corrected θ column), and the
+//!    unflagged bright seeds' verdict β are the frame β's sample ([`super::beta`]).
 //! 3. **The flag**: the verdict fit's amplitude above the range. The plateau test only sets the level.
 //!
 //! 4. **The cross-plane rule** (owner ruling 2026-10-09): on an image of more than one plane, a star flagged on any
@@ -23,8 +25,9 @@
 //! carries its flag, and a flagged one (own or cross) is fitted without its pixels ≥ its level (Q6 as revised
 //! 2026-10-09: an unflagged star is fitted with no exclusion).
 
-use astroimage::analysis::fitting::{fit_moffat_2d, PixelSample};
+use astroimage::analysis::fitting::{fit_moffat_2d_bounded, PixelSample};
 
+use super::beta::{BETA_BOUNDS, BETA_START};
 use super::diagnostics::RefusalReason;
 use super::fit::{FitParams, FitScratch};
 use crate::integration::stats::{median_in_place, MAD_TO_SIGMA};
@@ -126,6 +129,17 @@ pub struct SaturationPlane {
 }
 
 impl SaturationPlane {
+    /// No saturation test (F-4, Q7): every threshold, level and range infinite, so no seed has a plateau, no pixel is
+    /// excluded and nothing is flagged. [`saturation_verdict`] on it is the bare bounded free-β fit from the verdict
+    /// fit's own starts — the frame β's own sample for a caller that ran no verdict ([`super::beta::frame_beta`]).
+    pub const UNTESTED: SaturationPlane = SaturationPlane {
+        bg: 0.0,
+        threshold: f64::INFINITY,
+        norm: f64::INFINITY,
+        range: f64::INFINITY,
+        colour: false,
+    };
+
     /// `threshold = bg + 5·sigma`, `range = min(plane_max, norm) − bg`; `plane_max` over the plane's finite,
     /// unmasked pixels.
     pub fn new(bg: f64, sigma: f64, plane_max: f64, norm: f64, colour: bool) -> Self {
@@ -201,15 +215,18 @@ pub struct SaturationVerdict {
     pub excluded: u32,
     /// The verdict fit's A (working units).
     pub amplitude: f64,
-    /// Its free β (the β sample's fit, C-b).
+    /// Its free β, inside [`BETA_BOUNDS`] (the frame β's sample reads it, C-b).
     pub beta: f64,
     /// Its FWHM, `√(fwhm_x·fwhm_y)` (the payoff reads it, C-d).
     pub fwhm: f64,
     /// `amplitude > range` (the star's own flag), or a cross flag (`cross`).
     pub saturated: bool,
     /// `false` = the verdict fit failed (not n ≤ p): `amplitude`, `beta`, `fwhm` NaN, `saturated` false unless a cross
-    /// flag.
+    /// flag. A β at a bound is a successful fit.
     pub fit: bool,
+    /// The verdict fit's LM iterations (F-4: [`super::FitDiagnostics::iterations`]); 0 when the fitter returned
+    /// nothing.
+    pub iterations: u16,
     /// The flag came from another plane (the cross-plane rule, owner ruling 2026-10-09, ruling R-OSP-5): on an image of
     /// more than one plane a star flagged on any plane is flagged on every plane at that position
     /// ([`super::cross_plane_flags`]); `saturated` is then true and the rest of the verdict stays this plane's own.
@@ -217,15 +234,16 @@ pub struct SaturationVerdict {
     pub cross: bool,
 }
 
-/// Spec §2.1 per seed (PA-23): the plateau test, the level, then the free-β verdict fit (`fit_moffat_2d` at this
-/// task, `fit_moffat_2d_bounded` with `BETA_BOUNDS` from Task 9) on the region's pixels below the level, started at
-/// `b0`, the seed and `f_start` (PA-12), with `3 × params.max_iter` when any pixel is excluded.
+/// Spec §2.1 per seed (PA-23): the plateau test, the level, then the free-β verdict fit (`fit_moffat_2d_bounded` in
+/// [`BETA_BOUNDS`] from β [`BETA_START`], Task 9; `fit_moffat_2d` through Task 8) on the region's pixels below the
+/// level, started at `b0`, the seed and `f_start` (PA-12), with `3 × params.max_iter` when any pixel is excluded.
 /// `Err(MostlySaturated)` when ≤ 8 pixels remain (the fit's 8 parameters).
 ///
 /// `region`, `seed_x`, `seed_y` are in stamp coordinates, as [`plateau_level`] reads them. The fit sees the module's
 /// conditioned problem (F-2): the values `(v − b0)/a0` with `a0` = the region's maximum − `b0`, started at B = 0,
 /// A = 1, round at `σ = f_start/2.3548`, θ = 0; the amplitude is mapped back to working units. A fit that returns
-/// nothing, or a non-finite or non-positive amplitude or width, is `fit = false` (no flag, no refusal; Q4).
+/// nothing (α < 0.3, A ≤ 0 or a non-finite parameter), or a non-finite or non-positive amplitude or width, is
+/// `fit = false` (no flag, no refusal; Q4); a β at a bound is a fit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn saturation_verdict(
     region: &[PixelSample],
@@ -278,8 +296,9 @@ pub(crate) fn saturation_verdict(
         saturated: false,
         fit: false,
         cross: false,
+        iterations: 0,
     };
-    let Some(m) = fit_moffat_2d(
+    let Some(m) = fit_moffat_2d_bounded(
         kept,
         0.0,
         1.0,
@@ -288,12 +307,15 @@ pub(crate) fn saturation_verdict(
         sigma,
         sigma,
         0.0,
+        BETA_START,
+        BETA_BOUNDS,
         max_iter,
         params.conv_tol,
         params.max_rejects,
     ) else {
         return Ok(verdict);
     };
+    verdict.iterations = u16::try_from(m.iters).unwrap_or(u16::MAX);
     let amplitude = m.a * a0;
     let fwhm = (m.fwhm_x() * m.fwhm_y()).sqrt();
     if !(amplitude.is_finite()

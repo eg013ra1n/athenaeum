@@ -204,7 +204,10 @@ export function MeasurePanel({
           ))}
         </select>
         <p className="mt-1 text-[11px] text-content-muted">
-          default {psfModelLabel(defaults.measurement.psfModel)}
+          default {psfModelLabel(defaults.measurement.psfModel)} — the Moffat β every star is
+          fitted at. Auto measures it per frame: the median free-β fit of the frame's brightest
+          unsaturated stars, between 1.5 and 100 (a Gaussian star reads near 100), 4 when
+          fewer than 8 of them fit. Moffat-4 holds β at 4 on every frame.
         </p>
       </div>
 

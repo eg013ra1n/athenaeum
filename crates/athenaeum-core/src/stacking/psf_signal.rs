@@ -46,12 +46,15 @@ pub fn fit_stars_with_beta(
 }
 
 /// One β for a whole group (Tier C ruling C-1/C-1a): the LOWER median of the
-/// group's measured members' own `Auto`-resolved β so the result is always
-/// one of [`AUTO_BETAS`] — a plain mean of e.g. `4.0` and `6.0` would give
-/// `5.0`, a candidate `Auto` never fits at. `betas` is expected non-empty
+/// group's measured members' own `Auto`-resolved β, so the result is always
+/// one of the members' own βs — since Plan A Task 9 (F-4) each a continuous
+/// per-frame β in [`crate::star_measure::BETA_BOUNDS`], so the group β is the
+/// β some member was actually measured at, never an average no frame read.
+/// The code is unchanged from the discrete ladder (`AUTO_BETAS`), where the
+/// same rule kept it a candidate. `betas` is expected non-empty
 /// (a group that reached this call measured at least one frame); an empty
-/// slice returns `4.0` (the same fallback `Auto`'s own search uses when no
-/// candidate accepts ≥ 8 fits) rather than panicking — this is a reporting
+/// slice returns `4.0` (the same fallback `Auto` uses when fewer than 8 of
+/// its sample's fits are accepted) rather than panicking — this is a reporting
 /// path, not a precondition the pipeline enforces upstream.
 ///
 /// Recorded only — nothing consumes the resolved β yet (Tier C Task 2 will
@@ -102,12 +105,14 @@ pub fn psf_snr(tflux: f64, sigma_n: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// Renamed in Plan A Task 9 from `…_and_always_an_auto_candidate`: β is continuous from F-4, so the clause is
+    /// "always one of the members' own βs" (ruling F14, M-6).
     #[test]
-    fn group_beta_is_the_lower_median_and_always_an_auto_candidate() {
+    fn group_beta_is_the_lower_median_and_always_one_of_the_members_betas() {
         // Odd count: the exact middle.
         assert_eq!(group_beta(&[2.5, 4.0, 6.0]), 4.0);
         // Even count: the LOWER of the two middle values, not their mean —
-        // a plain average (5.0) is not a candidate `Auto` ever fits at.
+        // a plain average (5.0) is a β no member was measured at.
         assert_eq!(group_beta(&[4.0, 6.0]), 4.0);
         // One element: itself.
         assert_eq!(group_beta(&[10.0]), 10.0);
@@ -115,9 +120,13 @@ mod tests {
         assert_eq!(group_beta(&[6.0, 6.0, 6.0, 6.0]), 6.0);
         // Order independence.
         assert_eq!(group_beta(&[10.0, 2.5, 6.0, 4.0]), 4.0);
-        // The result is always literally one of `AUTO_BETAS`, whatever the
-        // input mix (the whole point of "lower median" over "mean").
-        assert!(AUTO_BETAS.contains(&group_beta(&[2.5, 4.0, 6.0, 10.0])));
+        // The result is always literally one of the members' own βs,
+        // whatever the input mix (the whole point of "lower median" over
+        // "mean") — the discrete ladder's and continuous ones alike (F-4).
+        assert!(AUTO_BETAS.contains(&group_beta(&AUTO_BETAS)));
+        let continuous = [5.5, 3.17, 100.0, 2.9, 4.82, 1.5];
+        assert_eq!(group_beta(&continuous), 3.17);
+        assert!(continuous.contains(&group_beta(&continuous)));
         // Empty: the documented fallback, not a panic.
         assert_eq!(group_beta(&[]), 4.0);
     }

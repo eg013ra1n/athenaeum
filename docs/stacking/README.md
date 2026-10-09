@@ -2246,3 +2246,63 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     44 of 46 families ≤ 1 %, and `twins/sharp/m2.5/f1.6` and `twins/sharp/m4/f2.0` move to Task 9 (discrete β near-ties
     on undersampled stars; at held β they read ≤ 0.10 %); R2 f12.0 / f16.0 ≤ 0.04 %, and `sharp/m4/f2.0` i0 moves to
     Task 9 (+2.62 % at β 6, +0.27 % at the truth β 4); β-change control 37 278 / 37 278.
+- **F-4 - the continuous per-frame β (Task 9; numbers move by design).**
+  - **R-OSP-6 - `PsfModel::Auto` is a continuous per-frame β, from a bounded free-β fit (spec §3 F-4).** The
+    discrete search over `AUTO_BETAS` is retired; the ladder stays as the probe's betas arm (row 3's β sensitivity),
+    which no production path reads. The Gaussian is the large-β limit: there is no separate Gaussian model, and β
+    stays a finite number everywhere (`.athf` f32, `metrics`, `stacking_run_groups.beta`, `group_beta`,
+    `PsfModel::Fixed`); `FITS_ARTIFACT_VERSION` and `MEASURE_VERSION` (4, one bump per plan) are unchanged.
+    - **The fit** (rustafits `fit_moffat_2d_bounded`, branch `one-star-path-beta`): a free-β Moffat whose solver
+      carries **ln β** — the Gaussian limit is a flat ridge in (α, β), which a step in ln β crosses in a few
+      iterations — with the Jacobian column `A·(1+Q)^−β·(−ln(1+Q))·β` (the chain rule) and each step's ln β clamped
+      to the caller's bounds. A fit that ends at a bound is returned with β exactly that bound; only a non-finite
+      parameter, α < 0.3 or A ≤ 0 refuses it. It carries the corrected θ column (R-OSP-3). `fit_moffat_2d` (β linear,
+      [1, 20], the legacy θ column) is output-identical: the solver's `BetaParam::FreeLinear` arm is its code, and
+      `fit_moffat_2d_is_byte_identical_to_before` pins it bit for bit on a C3 stamp. Unit: a noiseless Gaussian
+      (σ 2) reaches β 100 in 39 iterations at −0.32 % FWHM; Moffat β 4 and 2.5 are recovered to 1e-8.
+    - **The fit at β has no β ceiling** (rustafits, the same branch). The shared Moffat acceptance refused any
+      β > 20, the fixed arm included, so every star of a frame whose β rose above 20 was refused `fitFailed`. The
+      conditioned fixed-β entry point (R-OSP-3, the one the fits at β use) now fits any fixed β ≥ 1; below 20 its
+      output is what it was, and the two 1.3.0 entry points keep their [1, 20] (Phase A deviation from the plan's
+      "legacy entry points identical", for the controller's ruling).
+    - **The constants** (`star_measure::beta`): `BETA_BOUNDS = (1.5, 100)` (at β 100 a Gaussian star reads −0.32 %,
+      β 30 −1.04 %, spec re-review N-1); `BETA_START = 3.0` (the verdict fit's start β, the free arm's through Task
+      8, so only the parametrisation, the bounds and the θ column changed); `AUTO_SAMPLE = 64`; `BETA_MIN_FITS = 8`;
+      `BETA_FALLBACK = 4.0`.
+    - **The measure path (C-b, PA-23).** The verdict fit of R-OSP-5 IS the bounded fit (`BETA_BOUNDS`, start 3.0;
+      its region, starts, exclusion and ×3 iterations unchanged), and a β at a bound is a successful verdict fit.
+      The frame β is the median of the verdict β of the 64 brightest seeds whose verdict fit succeeded unflagged
+      (own and cross-plane flags united first), the mean of the two middle ones for an even count, clamped to the
+      bounds — read, not fitted a second time. At least 8: `BetaSource::Fitted { sample }`; fewer: β 4.0,
+      `BetaSource::Fallback`, one `warn!` per plane. Every star is then fitted at that β (the fixed-β conditioned
+      fit of R-OSP-3, unchanged).
+    - **Q7 - a caller that runs no verdict.** `fit_stars` under `Auto` (LN's reference fit, `ln/scale.rs`) and
+      `star_measure::frame_beta` (Plan C's green sites, ruling F45: it takes `FitStarsOptions`, so the mask and the
+      field width reach the sample) run their own sample: the bounded fit of the 64 brightest seeds from the verdict
+      fit's starts, with no saturation test and no exclusion (`SaturationPlane::UNTESTED`); the same median, minimum
+      and fallback. LN's reference is a warped plane, exempt from §2.1's test. Cost: its β reads high on a frame
+      with many saturated bright stars, as before Task 9; Plan B (F1) owns LN.
+    - **`BETA_AT_CAP`.** A fitted frame β at a bound (exactly 1.5 or 100) flags every star fitted at it (the
+      `.athf` flags byte, bit 2; the probe's `betaAtCap`); a caller's fixed β (`Moffat4`, `Fixed`, `fit_stars_at`)
+      never does. `group_beta` is unchanged code: the lower median of its members' continuous βs, so it is always
+      one of their own.
+  - **The surfaces.** `star_measure::{BetaSource, BETA_BOUNDS, frame_beta}`; `PlaneMeasurement.beta_source` (the
+    module's and the adapter's; reported, not persisted) and `FitOutcome.beta_source`; `StarFlags::beta_at_cap()`;
+    `SaturationVerdict.iterations`, which fills `FitDiagnostics.iterations` from the bounded verdict fit (`None`
+    where no verdict ran: the fixed-β fit reports none); the probe's measure frame line `betaSource` (`fitted` |
+    `fallback` | `fixed`) and `betaSample`. The Measure and Normalize panels label the model "Auto (per-frame β)".
+  - **Moved pins (by design: the continuous β).** Each literal carries its previous value. The three earlier tests
+    ruling F14 names (`group_beta`'s, renamed `…_always_one_of_the_members_betas`; `auto_model_prefers_the_generating_beta`,
+    Moffat-4 within 0.2 of 4 and a Gaussian field ≥ 60; `beta_sample_skips_saturated_stars`, within 0.2 of 4), LN's
+    `target_is_fitted_with_the_reference_beta` (3.933 on its Moffat-4 field, no longer a ladder value), and the four
+    `stacking::measure` fixture pins: β 10 → ≈ 99.3 on the Gaussian fixture, frame FWHM 4.129 → 4.229 px against the
+    Gaussian truth 4.2387 (−2.59 % → −0.22 %), tflux −1.5 % (the FWTM aperture follows β), and 6 of 150 flagged (was
+    9; the bounded verdict fit's amplitude on a Gaussian star no longer overshoots the range the way the free fit
+    stopped at β 20 did). At a non-integral β the fits run on `powf` throughout, so those records pin β and every
+    fit-derived field to a few ulp (the counts, noise and sky stay exact). The drizzle sharpening test's four widths
+    do not move (its lone, flagged star leaves the sample empty: β 4.0 before and after).
+  - **The real frame** (LDN_1272, release probe, `--paths measure`, 3 interleaved runs, deterministic): mono β 2.5 →
+    2.108 (`fitted`, 64), frame FWHM 2.325 → 2.251 px, 12 778 → 12 767 fits, Measure wall 1.60 → 1.74 s; the OSC
+    `_d` frame's planes β 2.5 / 4 / 2.5 → 2.271 / 5.407 / 6.249, frame FWHM 1.499 / 1.499 / 1.363 → 1.471 / 1.539 /
+    1.524 px, wall +6–8 %. Verdict fits failed: mono 68 → 68, OSC 131 / 95 / 49 → 119 / 94 / 45.
+  - **Acceptance.** `<pending t09-f4>`.

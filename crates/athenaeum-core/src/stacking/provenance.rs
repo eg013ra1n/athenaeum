@@ -197,8 +197,9 @@ pub struct SummaryGroup {
     #[serde(default)]
     pub drizzle: Option<DrizzleStats>,
     /// Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
-    /// from its members' own `Auto` picks — always one of
-    /// `psf_signal::AUTO_BETAS`. `None` when the group measured no frame at
+    /// from its members' own `Auto` picks — always one of their own βs
+    /// (continuous from Plan A Task 9, F-4; one of `psf_signal::AUTO_BETAS`
+    /// before it). `None` when the group measured no frame at
     /// all, or on a summary written before this task. `#[serde(default)]`,
     /// see `SummaryFrame::ln_scale`'s own doc for the convention.
     #[serde(default)]

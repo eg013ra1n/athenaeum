@@ -3168,8 +3168,9 @@ pub(crate) struct MeasuredFrame {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MeasuredGroup {
     /// The group β: the lower median of every measured member's own `Auto`
-    /// pick ([`psf_signal::group_beta`]), always one of
-    /// [`psf_signal::AUTO_BETAS`]. `None` when the group measured no
+    /// pick ([`psf_signal::group_beta`]), always one of their own βs
+    /// (continuous from Plan A Task 9, F-4; one of
+    /// [`psf_signal::AUTO_BETAS`] before it). `None` when the group measured no
     /// frame at all. Nothing reads this yet — Task 2 will hand it to the
     /// LN reference build and to every mapped fit's flux correction as
     /// `PsfModel::Fixed`.

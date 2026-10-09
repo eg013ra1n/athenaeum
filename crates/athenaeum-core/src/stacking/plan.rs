@@ -685,9 +685,12 @@ pub(crate) struct LnReferencePayload {
 /// `normalization_subtree` carries `psfModel` (the CHOICE) but never the
 /// value `Auto` resolves to, which moves with the group's measured
 /// population, not with `cfg`. Folded at `{:.6}` for the reason
-/// [`SeedsCalibration`]'s `k` is: β is picked from a small fixed ladder
-/// (`psf_signal::AUTO_BETAS`), so the last bits of an `f64` carry nothing,
-/// and the rounding keeps the two sides' formatting agreement exact.
+/// [`SeedsCalibration`]'s `k` is: the rounding keeps the two sides'
+/// formatting agreement exact. β was picked from a small fixed ladder
+/// (`psf_signal::AUTO_BETAS`) until Plan A Task 9; it is continuous since
+/// (F-4), and both sides still fold the same stored `f64`, so a β that moves
+/// by less than 5e-7 — nothing LN can see — is the only change the rounding
+/// hides.
 ///
 /// `None` hashes as "not recorded" (nothing folded), never as some default
 /// value — which is what keeps the run and the gate in step for a group

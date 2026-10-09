@@ -2265,11 +2265,9 @@ mod tests {
         );
 
         assert_eq!(r.beta, ref_out.beta);
-        assert!(
-            crate::stacking::psf_signal::AUTO_BETAS.contains(&r.beta),
-            "beta {} is not one of AUTO_BETAS",
-            r.beta
-        );
+        // F-4 (Plan A Task 9, ruling R-OSP-6): `Auto` is a continuous β (the reference's own bounded free-β sample,
+        // Q7), so on this purely-Moffat-4 field it reads near 4 (3.933 here) where it was one of `AUTO_BETAS`.
+        assert!((r.beta - 4.0).abs() < 0.2, "beta {}", r.beta);
     }
 
     #[test]

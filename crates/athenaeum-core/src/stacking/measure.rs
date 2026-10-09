@@ -34,6 +34,9 @@ pub use crate::star_measure::domain::{NoiseSource, ADU_SCALE};
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MeasureOptions {
+    /// `Auto` (the default) is the continuous per-frame β from Plan A Task 9 (F-4, ruling R-OSP-6): the median of the
+    /// unflagged bright seeds' bounded free-β verdict fits, in `star_measure::BETA_BOUNDS`; `Moffat4` fits every star
+    /// at 4.
     pub psf_model: PsfModel,
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,
@@ -257,6 +260,8 @@ pub struct PlaneMeasurement {
     /// The seeds flagged by the cross-plane rule (another plane's own flag at their position; Task 8 fix wave, owner
     /// ruling 2026-10-09; the probe's `crossFlags`); 0 on a single plane. Reported, not persisted.
     pub cross_flags: usize,
+    /// Where `channel.beta` came from (F-4, Plan A Task 9; the probe's `betaSource`). Reported, not persisted.
+    pub beta_source: sm::BetaSource,
 }
 
 /// One plane's result from [`measure_planes_diagnosed`].
@@ -774,6 +779,7 @@ fn adapter_tail(
             defocus_donuts: m.defocus_donuts,
             verdict_fit_failed: m.verdict_fit_failed,
             cross_flags: m.cross_flags,
+            beta_source: m.beta_source,
         },
         seeds,
         m.diagnostics,
@@ -1549,25 +1555,37 @@ pub(crate) mod tests {
             (150, 150),
             "the whole fixture field is detected and fitted"
         );
-        assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
-        // F-1 (Task 6b round 3, ruling R9): the start shape is read from the region's starting square; the previous
-        // literal was 1.390_799_753_469_352e-3 (round 1, the own half-maximum width start), before it
+        // F-4 (Task 9, ruling R-OSP-6): β is continuous and these Gaussian stars read near the cap (the previous literal
+        // was 10.0, the discrete ladder's widest). The fits now run at a non-integral β, on `powf` throughout where
+        // β 10 ran on `powi`, so β and the fit-derived numbers are pinned to a few ulp, like `fwhm_px` below.
+        assert_ulp_close(c.beta, 99.288_572_538_934_94, "beta");
+        // F-4: the FWTM aperture follows β; the previous literal was 1.390_901_839_370_229e-3 (Task 6b round 3).
+        // F-1 (Task 6b round 3, ruling R9): the start shape is read from the region's starting square; the literal
+        // before it was 1.390_799_753_469_352e-3 (round 1, the own half-maximum width start), before it
         // 1.387_793_525_585_654_9e-3 (Task 6b's first round), 1.387_179_128_762_254_4e-3 (Task 5) and
         // 1.387_068_045_273_481_56e-3.
-        assert_eq!(c.psf_signal_weight, 1.390_901_839_370_229e-3);
+        assert_ulp_close(
+            c.psf_signal_weight,
+            1.387_279_026_471_343_5e-3,
+            "psf_signal_weight",
+        );
         // `fwhm_px` is a shape aggregate over 150 Moffat fits whose arithmetic
         // (Tier C C3: `powi`/`powf`, the reused residual) rounds differently
         // per platform's libm — the first push after C3 read 4.122_658_320_014_302_5
         // on the Windows runner against this Mac's ..._304, one ulp. A last-bit
         // FWHM is not a contract, so this aggregate is pinned to a few ulp,
         // never exactly; the fields above stay exact on every platform.
-        // F-3 (Task 8, ruling R-OSP-5): the frame statistic reads the unflagged fits only — 141 of the 150 here (the
-        // brightest stars' verdict fits top the plane's range, by design); the fits, β and the totals did not move. The
-        // previous literal was 4.129_401_659_376_219 (Task 6b round 3).
+        // F-4 (Task 9): the fits at β ≈ 99.3 read the Gaussian truth 2.3548·1.8 = 4.2387 at −0.22 % (β 10: −2.59 %),
+        // and the bounded verdict fit's amplitude on these Gaussian stars tops the plane's range on 6 of 150 (was 9:
+        // the free fit stopped at its β 20, overshooting the peak), so the statistic reads 144; the previous literals
+        // were 141 and 4.129_098_214_007_167_5 (Task 8).
+        // F-3 (Task 8, ruling R-OSP-5): the frame statistic reads the unflagged fits only (the brightest stars'
+        // verdict fits top the plane's range, by design). The literal before Task 8 was 4.129_401_659_376_219 (Task 6b
+        // round 3).
         // F-1 (Task 6b round 3, ruling R9): as above; the literal before it was 4.129_358_265_048_832 (round 1), before
         // it 4.123_653_811_131_548 (Task 6b's first round), 4.123_100_751_260_767 (Task 5) and 4.122_658_320_014_304.
-        assert_eq!(c.stars_unsaturated, 141);
-        assert_ulp_close(c.fwhm_px, 4.129_098_214_007_167_5, "fwhm_px");
+        assert_eq!(c.stars_unsaturated, 144);
+        assert_ulp_close(c.fwhm_px, 4.229_318_383_224_882, "fwhm_px");
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
         // so they're zeroed before the comparison (perf tier 1 Task 0).
@@ -1822,13 +1840,36 @@ pub(crate) mod tests {
         // F-3 (Task 8, ruling R-OSP-5): the statistic's population is the 141 unflagged fits of 150 (the fits did not
         // move); the previous literals were fwhm_px 4.130_443_961_173_142 and eccentricity 0.113_127_912_625_514_87
         // (Task 6b round 3).
-        assert_ulp_close(m.fwhm_px, 4.130_618_758_639_208_5, "fwhm_px");
-        // As above; the literal before Task 8 was 0.113_127_912_625_514_87, before it 0.110_290_631_118_640_29 (round 1),
-        // 0.109_077_618_457_969_11 (Task 6b's first round), 0.111_709_924_171_636_75 (Task 5) and
+        // F-4 (Task 9, ruling R-OSP-6): β is continuous (≈ 99.6 on these Gaussian stars), so the fits run on `powf`
+        // throughout and every fit-derived field — β, the two shape aggregates, the totals and the two estimators —
+        // is pinned to a few ulp and snapped; the counts, noise and sky fields stay exact. Task 8's record read
+        // stars_unsaturated 141, beta 10.0, fwhm_px 4.130_618_758_639_208_5, eccentricity 0.113_726_031_990_419_54,
+        // tflux 571.050_742_147_855_2, tmean_flux 11.813_155_657_437_393, psf_signal_weight 0.001_472_612_103_695_384,
+        // psf_snr 0.002_168_670_535_894_186_4; the bounded verdict fit flags 1 of 150 here (was 9).
+        // F-3 (Task 8): the literal before Task 8 was fwhm_px 4.130_443_961_173_142 (Task 6b round 3).
+        // As above; the eccentricity before Task 8 was 0.113_127_912_625_514_87, before it 0.110_290_631_118_640_29
+        // (round 1), 0.109_077_618_457_969_11 (Task 6b's first round), 0.111_709_924_171_636_75 (Task 5) and
         // 0.095_246_020_871_036_08.
-        assert_ulp_close(m.eccentricity, 0.113_726_031_990_419_54, "eccentricity");
-        m.fwhm_px = 4.130_618_758_639_208_5;
-        m.eccentricity = 0.113_726_031_990_419_54;
+        for (got, want, what) in [
+            (&mut m.beta, 99.560_183_873_386_31, "beta"),
+            (&mut m.fwhm_px, 4.229_139_719_359_381, "fwhm_px"),
+            (
+                &mut m.eccentricity,
+                0.111_005_918_977_448_41,
+                "eccentricity",
+            ),
+            (&mut m.tflux, 562.456_944_818_559_5, "tflux"),
+            (&mut m.tmean_flux, 11.956_347_340_224_768, "tmean_flux"),
+            (
+                &mut m.psf_signal_weight,
+                0.001_468_032_078_137_789,
+                "psf_signal_weight",
+            ),
+            (&mut m.psf_snr, 0.002_103_888_624_833_64, "psf_snr"),
+        ] {
+            assert_ulp_close(*got, want, what);
+            *got = want;
+        }
         // F-1 (Task 6b round 3, ruling R9): the start shape from the region's starting square moved the fit; round 1
         // read fwhm_px 4.130191893023729, eccentricity 0.11029063111864029, tflux 571.0240326481198, tmean_flux
         // 11.813958121959663, psf_signal_weight 0.0014726432553409737, psf_snr 0.002168467672133753.
@@ -1844,17 +1885,17 @@ pub(crate) mod tests {
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
-stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 141, \
-beta: 10.0, fwhm_px: 4.1306187586392085, eccentricity: 0.11372603199041954, \
-tflux: 571.0507421478552, tmean_flux: 11.813155657437393, \
+stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
+beta: 99.56018387338631, fwhm_px: 4.229139719359381, eccentricity: 0.11100591897744841, \
+tflux: 562.4569448185595, tmean_flux: 11.956347340224768, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
 noise_source: Mrs, median: 0.08010764420032501, \
 mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
 snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
-scale: 0.0020880382508039474, psf_signal_weight: 0.001472612103695384, \
-psf_snr: 0.0021686705358941864, timings: MeasureTimings { read_ms: 0, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.001468032078137789, \
+psf_snr: 0.00210388862483364, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }
@@ -1867,12 +1908,20 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         let (data, w, h) = field(7, 1.0, 0.002);
         let c = measure_plane(&data, w, h, &MeasureOptions::default(), None);
         assert_eq!((c.stars_detected, c.stars_fitted), (150, 150));
-        assert_eq!(c.beta, 10.0);
-        assert_eq!(c.psf_signal_weight, 1.391_065_217_128_910_3e-3);
-        // F-3 (Task 8, ruling R-OSP-5): the statistic over the 141 unflagged fits of 150; the previous literal was
+        // F-4 (Task 9, ruling R-OSP-6): β is continuous, near the cap on these Gaussian stars, and the fit-derived
+        // numbers are pinned to a few ulp (the fits run on `powf`); the previous literals were beta 10.0,
+        // psf_signal_weight 1.391_065_217_128_910_3e-3, stars_unsaturated 141 (the bounded verdict fit flags 6, was 9)
+        // and fwhm_px 4.129_063_469_967_53.
+        assert_ulp_close(c.beta, 99.246_318_146_702_68, "beta");
+        assert_ulp_close(
+            c.psf_signal_weight,
+            1.387_250_758_422_298e-3,
+            "psf_signal_weight",
+        );
+        // F-3 (Task 8, ruling R-OSP-5): the statistic over the unflagged fits; the literal before Task 8 was
         // 4.129_369_725_278_327.
-        assert_eq!(c.stars_unsaturated, 141);
-        assert_ulp_close(c.fwhm_px, 4.129_063_469_967_53, "fwhm_px");
+        assert_eq!(c.stars_unsaturated, 144);
+        assert_ulp_close(c.fwhm_px, 4.229_284_321_565_829, "fwhm_px");
     }
 
     /// Task 7 (ruling F14): the full-record pin on the matched-filter default; the Peak record is
@@ -1892,27 +1941,46 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             )
             .channel,
         );
-        // The two shape aggregates are pinned to a few ulp and snapped, as in the Peak record. F-3 (Task 8, ruling
-        // R-OSP-5): over the 141 unflagged fits of 150 (the fits did not move); the previous literals were fwhm_px
-        // 4.130_362_798_202_614 and eccentricity 0.111_119_809_985_610_2.
-        assert_ulp_close(m.fwhm_px, 4.130_521_827_498_531, "fwhm_px");
-        assert_ulp_close(m.eccentricity, 0.112_086_634_567_625_24, "eccentricity");
-        m.fwhm_px = 4.130_521_827_498_531;
-        m.eccentricity = 0.112_086_634_567_625_24;
+        // The fit-derived fields are pinned to a few ulp and snapped, as in the Peak record (F-4, Task 9: the continuous
+        // β runs the fits on `powf`). Task 8's record read stars_unsaturated 141, beta 10.0, fwhm_px
+        // 4.130_521_827_498_531, eccentricity 0.112_086_634_567_625_24, tflux 571.062_365_054_155_6, tmean_flux
+        // 11.813_897_354_284_132, psf_signal_weight 0.001_472_734_537_384_067_6, psf_snr 0.002_168_758_817_054_136_4.
+        // F-3 (Task 8, ruling R-OSP-5): the literals before it were fwhm_px 4.130_362_798_202_614 and eccentricity
+        // 0.111_119_809_985_610_2.
+        for (got, want, what) in [
+            (&mut m.beta, 99.522_522_213_158_42, "beta"),
+            (&mut m.fwhm_px, 4.229_136_928_323_991_5, "fwhm_px"),
+            (
+                &mut m.eccentricity,
+                0.111_441_301_280_083_44,
+                "eccentricity",
+            ),
+            (&mut m.tflux, 562.457_809_883_053_6, "tflux"),
+            (&mut m.tmean_flux, 11.956_339_865_260_546, "tmean_flux"),
+            (
+                &mut m.psf_signal_weight,
+                0.001_468_033_418_188_667_2,
+                "psf_signal_weight",
+            ),
+            (&mut m.psf_snr, 0.002_103_895_096_442_766_7, "psf_snr"),
+        ] {
+            assert_ulp_close(*got, want, what);
+            *got = want;
+        }
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
-stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 141, \
-beta: 10.0, fwhm_px: 4.130521827498531, eccentricity: 0.11208663456762524, \
-tflux: 571.0623650541556, tmean_flux: 11.813897354284132, \
+stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
+beta: 99.52252221315842, fwhm_px: 4.2291369283239915, eccentricity: 0.11144130128008344, \
+tflux: 562.4578098830536, tmean_flux: 11.956339865260546, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
 noise_source: Mrs, median: 0.08010764420032501, \
 mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
 snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
-scale: 0.0020880382508039474, psf_signal_weight: 0.0014727345373840676, \
-psf_snr: 0.0021687588170541364, timings: MeasureTimings { read_ms: 0, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0014680334181886672, \
+psf_snr: 0.0021038950964427667, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }

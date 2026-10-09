@@ -34,6 +34,11 @@
 //! succeeded unflagged; every star is fitted at β and carries its flag in [`StarFlags::SATURATED`], a flagged one
 //! (own or cross-plane) without its pixels ≥ its level, ×3 iterations (Q6 as revised 2026-10-09). A seed whose verdict
 //! fit keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
+//!
+//! F-4 (Plan A Task 9, ruling R-OSP-6): `PsfModel::Auto`'s β is continuous — the median of the sample's bounded
+//! free-β fits ([`super::beta`]: the verdict fits on the measure path, the module's own sample fits for a caller that
+//! ran no verdict), clamped to [`super::beta::BETA_BOUNDS`]; a frame β at a bound flags every star fitted at it
+//! [`StarFlags::BETA_AT_CAP`]. The fits at β are unchanged.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -46,6 +51,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use super::beta::BetaSource;
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 use super::photometry::{
     saturation_verdict, SaturationPlane, SaturationVerdict, EXCLUDED_ITERATION_FACTOR,
@@ -59,8 +65,10 @@ const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum PsfModel {
-    /// Fit the brightest `AUTO_SAMPLE` seeds with every β in `AUTO_BETAS`
-    /// and keep the β with the smallest median residual.
+    /// The continuous per-frame β (F-4, Task 9): the median of the bounded free-β fits of the
+    /// [`super::beta::AUTO_SAMPLE`] brightest unsaturated seeds, clamped to [`super::beta::BETA_BOUNDS`]
+    /// ([`super::beta`]); 4.0 when fewer than 8 fits are accepted. Through Task 8, the discrete search over
+    /// `AUTO_BETAS`.
     #[default]
     Auto,
     Moffat4,
@@ -138,7 +146,8 @@ pub struct StarFlags(pub u8);
 impl StarFlags {
     /// The star's core is clipped (F-3).
     pub const SATURATED: StarFlags = StarFlags(1);
-    /// The fitted β sits at its bound (F-4).
+    /// The star was fitted at a fitted frame β that sits at a bound of [`super::beta::BETA_BOUNDS`] (F-4, Task 9):
+    /// set on every star of such a plane, never under a caller's fixed β.
     pub const BETA_AT_CAP: StarFlags = StarFlags(2);
 
     pub const fn bits(self) -> u8 {
@@ -156,6 +165,12 @@ impl StarFlags {
     /// [`StarFlags::SATURATED`] is set (F-3): the β sample and the frame statistic skip the star.
     pub const fn saturated(self) -> bool {
         self.contains(StarFlags::SATURATED)
+    }
+
+    /// [`StarFlags::BETA_AT_CAP`] is set (F-4): the star was fitted at a frame β that sits at a bound of
+    /// [`super::beta::BETA_BOUNDS`].
+    pub const fn beta_at_cap(self) -> bool {
+        self.contains(StarFlags::BETA_AT_CAP)
     }
 
     /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`).
@@ -249,6 +264,8 @@ impl StarFit {
 pub struct FitOutcome {
     pub fits: Vec<StarFit>,
     pub beta: f64,
+    /// Where `beta` came from (F-4, Task 9): [`BetaSource::Fixed`] for a caller's β.
+    pub beta_source: BetaSource,
     /// Seeds handed in.
     pub seeds: usize,
     /// The seeds not accepted, by reason (F-0): `refused.accounted(fits.len()) == seeds` (ruling F13).
@@ -550,9 +567,9 @@ fn grow_region(
 /// Per-worker scratch [`fit_one`] reuses across seeds instead of
 /// allocating fresh buffers every call: the region's running multiset
 /// (`region`), the rim medians' buffer (`rim`) and the stamp's pixels (`px`,
-/// the width-start box's first, then the region's). `fit_all` hands one
+/// the width-start box's first, then the region's). [`fit_all_outcomes`] hands one
 /// instance to each rayon worker via `map_init` (a thread-local, one instance
-/// per worker for the whole `fit_all` call, not per seed). Every buffer is
+/// per worker for the whole call, not per seed). Every buffer is
 /// `clear()`ed at the point it starts being rebuilt for a new seed, so a
 /// worker's retained capacity is invisible to the numbers: the content is
 /// always exactly what a fresh, empty `Vec` would have accumulated.
@@ -611,7 +628,8 @@ impl FitTrace {
             width_start: self.width_start,
             growth_steps: self.growth_steps,
             pixels_used: self.pixels_used,
-            iterations: None,
+            // The bounded verdict fit's (F-4, Task 9): the fixed-β fit at β reports none.
+            iterations: verdict.filter(|v| v.fit).map(|v| v.iterations),
             converged: self.converged,
             verdict,
         }
@@ -1234,9 +1252,10 @@ fn seed_pass(
 }
 
 /// Every seed's verdict-pass record, in seed order (F-3). Runs on `pool` when given one, one [`FitScratch`] per worker
-/// as [`fit_all_outcomes`] does.
+/// as [`fit_all_outcomes`] does. On [`SaturationPlane::UNTESTED`] each record's verdict is the bare bounded free-β
+/// fit — the frame β's own sample for a caller that ran no verdict (F-4, Q7, [`super::beta::frame_beta`]).
 #[allow(clippy::too_many_arguments)]
-fn seed_passes(
+pub(super) fn seed_passes(
     data: &[f32],
     w: usize,
     h: usize,
@@ -1460,30 +1479,8 @@ fn dedupe(mut fits: Vec<(usize, StarFit)>) -> Vec<(usize, StarFit)> {
 /// `install` inside another is legal but pointless, since the outer one
 /// already runs every parallel iterator inside it on that same pool.
 ///
-/// The accepted fits, in seed order (the `Auto` β search's sample reads
-/// their residuals); [`fit_all_outcomes`] keeps every seed's outcome.
-/// `passes` (one per seed, F-3) as [`fit_all_outcomes`] takes them.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn fit_all(
-    data: &[f32],
-    w: usize,
-    h: usize,
-    seeds: &[Seed],
-    beta: f64,
-    p: &FitParams,
-    mask: Option<&[bool]>,
-    field_width: f64,
-    passes: Option<&[SeedPass]>,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Vec<StarFit> {
-    fit_all_outcomes(data, w, h, seeds, beta, p, mask, field_width, passes, pool)
-        .into_iter()
-        .filter_map(|(result, _)| result.ok())
-        .collect()
-}
-
 /// Every seed's result and trace, in seed order (M-4): the parallel chain is
-/// the one `fit_all` always ran, collected per seed instead of filtered in
+/// the one `fit_all` ran (retired with the discrete `Auto` search, Task 9), collected per seed instead of filtered in
 /// flight — rayon's indexed `collect` keeps the order, so the accepted fits
 /// read off it sequentially are exactly the list the filtered chain gave.
 /// `passes` (F-3): one per seed, in seed order, when the caller ran the verdict pass — each seed is fitted from its
@@ -1522,11 +1519,9 @@ fn fit_all_outcomes(
     }
 }
 
-/// Fit every seed with the chosen model. `Auto` fits the brightest
-/// `AUTO_SAMPLE` seeds with each β in `AUTO_BETAS`, keeps the β with the
-/// smallest median residual over its accepted fits (β = 4 when fewer than
-/// 8 fits are accepted for every candidate; [`super::beta::auto_beta`]),
-/// then fits all seeds with it — via [`fit_stars_with_beta`], once β is
+/// Fit every seed with the chosen model. `Auto` resolves the continuous frame β from its own sample — the bounded
+/// free-β fits of the brightest `AUTO_SAMPLE` seeds, no saturation test (F-4, Q7; [`super::beta::frame_beta`]; β = 4
+/// when fewer than 8 fits are accepted) — then fits all seeds with it, as [`fit_stars_with_beta`] does once β is
 /// resolved to a number.
 /// Seeds are expected brightest-first (the detector's order).
 pub fn fit_stars(
@@ -1544,7 +1539,7 @@ pub fn fit_stars(
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
 /// the caller's `Some(f)` with `from_stars = 0`, else [`field_width_of`] the seeds. A given width that is not a
 /// positive number is refused with a `warn!` and the seeds' own is used.
-fn resolve_field_width(
+pub(super) fn resolve_field_width(
     data: &[f32],
     w: usize,
     h: usize,
@@ -1627,9 +1622,10 @@ pub(super) fn verdict_pass(
 }
 
 /// β, then every seed fitted at it on `field`'s width. `passes` (the measure path's, [`verdict_pass`], cross-plane
-/// flags applied): the order is seeds → field width → verdicts → β sample (the `Auto` search over the seeds whose
-/// verdict fit succeeded unflagged) → fits at β, each from its seed's record. `None` (every other caller): no verdict,
-/// no flag, the brightest seeds as the β sample.
+/// flags applied): the order is seeds → field width → verdicts → β sample (`Auto`: the median verdict β of the seeds
+/// whose verdict fit succeeded unflagged, [`super::beta::verdict_beta`]) → fits at β, each from its seed's record.
+/// `None` (every other caller): no verdict, no flag, and `Auto` fits its own sample of the brightest seeds
+/// ([`super::beta::sample_beta`], Q7). A fitted β at a bound flags every accepted fit [`StarFlags::BETA_AT_CAP`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_after_passes(
     data: &[f32],
@@ -1645,17 +1641,18 @@ pub(super) fn fit_after_passes(
     diagnostics: bool,
     defocus_verdict: bool,
 ) -> FitOutcome {
-    let beta = match model {
-        PsfModel::Moffat4 => 4.0,
+    let (beta, beta_source) = match model {
+        PsfModel::Moffat4 => (4.0, BetaSource::Fixed),
         // Tier C Task 1: a caller-resolved β (the group β, or any other
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
-        // `Auto` search below never runs for it.
-        PsfModel::Fixed(b) => b,
-        PsfModel::Auto => {
-            super::beta::auto_beta(data, w, h, seeds, passes, p, mask, field.fwhm_px, pool)
-        }
+        // `Auto` sample below never runs for it.
+        PsfModel::Fixed(b) => (b, BetaSource::Fixed),
+        PsfModel::Auto => match passes {
+            Some(v) => super::beta::verdict_beta(v),
+            None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
+        },
     };
-    fit_at_width(
+    let mut outcome = fit_at_width(
         data,
         w,
         h,
@@ -1668,14 +1665,21 @@ pub(super) fn fit_after_passes(
         pool,
         diagnostics,
         defocus_verdict,
-    )
+    );
+    outcome.beta_source = beta_source;
+    if matches!(beta_source, BetaSource::Fitted { .. }) && super::beta::at_bound(beta) {
+        for f in &mut outcome.fits {
+            f.flags |= StarFlags::BETA_AT_CAP;
+        }
+    }
+    outcome
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
-/// [`fit_stars`] itself runs once `Auto`'s search (or `Moffat4`'s fixed
+/// [`fit_stars`] itself runs once `Auto`'s sample (or `Moffat4`'s fixed
 /// 4.0) has resolved a model to a number: the field width from the seeds
 /// (the same [`field_width_of`] `fit_stars` reads), every star from its own
-/// width start (Task 6b), then `dedupe(fit_all(..))`. `beta` is echoed back
+/// width start (Task 6b), then the duplicate drop over [`fit_all_outcomes`]. `beta` is echoed back
 /// unchanged on the returned `FitOutcome`.
 ///
 /// Exposed so a caller that must fit two independent planes at the SAME β
@@ -1827,6 +1831,7 @@ fn fit_at_width(
     FitOutcome {
         fits,
         beta,
+        beta_source: BetaSource::Fixed,
         seeds: seeds.len(),
         refused,
         field_width: field,
@@ -1923,6 +1928,8 @@ mod tests {
         }
     }
 
+    /// F-4 (Task 9, ruling F14): `Auto` is continuous, so the Moffat-4 field reads within 0.2 of its generating β 4
+    /// (was `== 4.0`, a ladder pick) and the Gaussian field at the large-β limit, ≥ 60 (was 10.0, the ladder's top).
     #[test]
     fn auto_model_prefers_the_generating_beta() {
         let stars: Vec<MoffatStar> = (0..70)
@@ -1944,7 +1951,7 @@ mod tests {
             &FitParams::default(),
             None,
         );
-        assert_eq!(out.beta, 4.0);
+        assert!((out.beta - 4.0).abs() < 0.2, "{}", out.beta);
         assert!(out.fits.len() >= 60, "{}", out.fits.len());
 
         let gstars: Vec<(f64, f64, f64)> = stars.iter().map(|s| (s.x, s.y, s.amp)).collect();
@@ -1967,9 +1974,10 @@ mod tests {
             &FitParams::default(),
             None,
         );
-        assert_eq!(
-            out.beta, 10.0,
-            "a Gaussian field is closest to the largest β"
+        assert!(
+            out.beta >= 60.0,
+            "a Gaussian field is the large-β limit: {}",
+            out.beta
         );
         assert!(
             out.fits.len() >= 60,
@@ -1981,9 +1989,10 @@ mod tests {
     #[test]
     fn fit_stars_with_beta_matches_fit_stars_for_the_resolved_beta() {
         // The same Gaussian field `auto_model_prefers_the_generating_beta`
-        // uses, which resolves to a NON-default β (10.0) under `Auto` — so
-        // this pins `fit_stars_with_beta` reproducing an arbitrary resolved
-        // β exactly, not just the β = 4.0 default.
+        // uses, which resolves to a NON-default β under `Auto` (at or near
+        // the cap from F-4; 10.0 on the discrete ladder) — so this pins
+        // `fit_stars_with_beta` reproducing an arbitrary resolved β exactly,
+        // not just the β = 4.0 default.
         let stars: Vec<MoffatStar> = (0..70)
             .map(|i| {
                 round(

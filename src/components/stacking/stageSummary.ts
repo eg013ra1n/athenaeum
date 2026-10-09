@@ -143,7 +143,7 @@ export function seedSourceLabel(v: SeedSource): string {
 
 export function psfModelLabel(v: PsfModel): string {
   switch (v) {
-    case 'auto': return 'Auto';
+    case 'auto': return 'Auto (per-frame β)';
     case 'moffat4': return 'Moffat-4';
   }
 }

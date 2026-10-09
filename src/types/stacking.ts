@@ -420,7 +420,8 @@ width: number | null, height: number | null, exposure: number | null, frameCount
 /**
  * Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
  * once from its members' own `Auto` picks — `psf_signal::group_beta`,
- * always one of `psf_signal::AUTO_BETAS`. `None` for a run predating
+ * always one of their own βs (continuous from Plan A Task 9, F-4; one of
+ * `psf_signal::AUTO_BETAS` before it). `None` for a run predating
  * this task, or a group that measured no frame at all.
  *
  * Read by the PLAN GATE since M1 (final fix wave, ruling C-30): the β
@@ -516,8 +517,9 @@ weightMapPath: string | null, coveragePath: string | null, drizzleCoveragePath: 
 drizzle: DrizzleStats | null, 
 /**
  * Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
- * from its members' own `Auto` picks — always one of
- * `psf_signal::AUTO_BETAS`. `None` when the group measured no frame at
+ * from its members' own `Auto` picks — always one of their own βs
+ * (continuous from Plan A Task 9, F-4; one of `psf_signal::AUTO_BETAS`
+ * before it). `None` when the group measured no frame at
  * all, or on a summary written before this task. `#[serde(default)]`,
  * see `SummaryFrame::ln_scale`'s own doc for the convention.
  */

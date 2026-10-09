@@ -55,6 +55,14 @@
 //! measured even when `--plane` selects one (the cross-plane rule needs every
 //! plane's verdicts); the measure frame line also carries `crossFlags` and
 //! its `wallMs` is the plane's own share of the call.
+//!
+//! F-4 (Plan A Task 9, ruling R-OSP-6): the measure path's β is continuous
+//! (`Auto`, the median bounded free-β verdict fit of the unflagged bright
+//! seeds); its frame line carries `betaSource` (`fitted` | `fallback` |
+//! `fixed`) and `betaSample` (the fits the median is over, null unless
+//! `fitted`), and every star line's `flags` may name `betaAtCap`. The betas
+//! arm keeps the discrete ladder (`--betas`, default 2.5,4,6,10) as row 3's
+//! β-sensitivity diagnostic.
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -551,6 +559,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 .unwrap_or(0);
             emit(
                 json!({"kind": "frame", "path": "measure", "plane": p, "beta": pm.channel.beta,
+                        "betaSource": pm.beta_source.name(), "betaSample": pm.beta_source.sample(),
                         "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
                         "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
@@ -958,16 +967,25 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let img = d.path().join("p.fits");
         write_fits_f32(&img, w, h, 1, &data, &[]).unwrap();
+        // F-4 (Plan A Task 9): the measure's β is continuous, so it is no longer one of the ladder's — the measure
+        // runs first, and the betas arm then runs at exactly the β it read (the JSON number round-trips the f64).
+        let first = d.path().join("m.jsonl");
+        cmd_measure(args(img.clone(), first.clone(), &["measure"])).unwrap();
+        let measure_beta = |lines: &[Value]| -> f64 {
+            lines
+                .iter()
+                .find(|v| v["kind"] == "frame" && v["path"] == "measure")
+                .unwrap()["beta"]
+                .as_f64()
+                .unwrap()
+        };
+        let beta = measure_beta(&read_lines(&first));
         let out = d.path().join("p.jsonl");
         let mut a = args(img, out.clone(), &["measure", "betas"]);
-        a.betas = vec![2.5, 4.0, 6.0, 10.0];
+        a.betas = vec![2.5, beta, 10.0];
         cmd_measure(a).unwrap();
         let lines = read_lines(&out);
-        let frame = lines
-            .iter()
-            .find(|v| v["kind"] == "frame" && v["path"] == "measure")
-            .unwrap();
-        let beta = frame["beta"].as_f64().unwrap();
+        assert_eq!(measure_beta(&lines), beta, "the measure is deterministic");
         let stars = |path: &str| -> Vec<String> {
             let mut s: Vec<String> = lines
                 .iter()

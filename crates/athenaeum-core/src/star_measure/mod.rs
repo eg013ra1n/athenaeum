@@ -22,7 +22,7 @@ pub mod photometry;
 pub mod robust;
 pub mod seeds;
 
-pub use beta::{AUTO_BETAS, AUTO_SAMPLE};
+pub use beta::{frame_beta, BetaSource, AUTO_BETAS, AUTO_SAMPLE, BETA_BOUNDS};
 pub use diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 pub use domain::{
     background_residual, noise_model, noise_mrs, sky_level, to_working_units, Domain, NoiseModel,
@@ -171,6 +171,9 @@ pub struct PlaneMeasurement {
     pub stars: Vec<StarFit>,
     /// The β every star was fitted at.
     pub beta: f64,
+    /// Where `beta` came from (F-4, Task 9): `Fitted { sample }` (the median of the unflagged bright seeds' bounded
+    /// free-β verdict fits), `Fallback` (fewer than 8, β 4.0) or `Fixed` (`Moffat4`, `Fixed(b)`).
+    pub beta_source: BetaSource,
     pub frame: FrameAggregates,
     pub noise: NoiseModel,
     pub sky: SkyLevel,
@@ -486,6 +489,7 @@ fn finish_working(
     PlaneMeasurement {
         stars: outcome.fits,
         beta: outcome.beta,
+        beta_source: outcome.beta_source,
         frame,
         noise,
         sky,
@@ -597,6 +601,7 @@ mod tests {
             saturated,
             fit: true,
             cross: false,
+            iterations: 12,
         }))
     }
 
@@ -1610,8 +1615,9 @@ mod tests {
 
         #[test]
         fn beta_sample_skips_saturated_stars() {
-            // 70 Moffat-4 stars, the 40 brightest clipped: the discrete Auto search must still resolve 4.0 (the baseline
-            // flipped to 10); R2: 40 of 40 flagged, 0 of 30
+            // 70 Moffat-4 stars, the 40 brightest clipped: Auto must still resolve β 4 from the unsaturated 30 (the
+            // baseline flipped to 10); R2: 40 of 40 flagged, 0 of 30. F-4 (Task 9, ruling F14): β is continuous, so
+            // within 0.2 of 4 (was `== 4.0`, the discrete ladder's pick)
             let stars: Vec<MoffatStar> = (0..70)
                 .map(|i| MoffatStar {
                     x: 20.0 + (i % 10) as f64 * 40.3,
@@ -1644,10 +1650,12 @@ mod tests {
                 },
                 None,
             );
-            assert_eq!(
-                m.beta, 4.0,
-                "the sample is the unsaturated 30, not the clipped 40"
+            assert!(
+                (m.beta - 4.0).abs() < 0.2,
+                "the sample is the unsaturated 30, not the clipped 40: {}",
+                m.beta
             );
+            assert_eq!(m.beta_source, BetaSource::Fitted { sample: 30 });
             assert_eq!(m.frame.stars_unsaturated, 30);
         }
 
