@@ -90,8 +90,8 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
    them, and a star whose aperture leaves the finite area is refused `OutsideImage`. Pinned in Task 6a
    (`nan_border_seeds_nothing_on_the_border_and_fits_every_interior_star`), Task 6b
    (`border_limited_region_refuses_a_broad_star_region_too_small`) and Task 8
-   (`annulus_sigma_is_the_mad_of_the_present_pixels`, the one annulus both the flat-top test and the SNR read,
-   I-2); the probe's `nan_border_runs_every_path` keeps passing at every task.
+   (`annulus_sigma_is_the_mad_of_the_present_pixels`, the annulus the SNR reads, I-2; the saturation test reads
+   the plane's σ since PA-23); the probe's `nan_border_runs_every_path` keeps passing at every task.
 2. **Very sparse frames under the β sample's minimum** (fewer than 8 free-β fits on unsaturated stars: a 3-star
    frame, a flat field, a frame whose bright stars all saturate). β falls back to 4.0 with a `warn!`,
    `PlaneMeasurement.beta_source = BetaSource::Fallback`, and the frame still measures. Pinned in Task 9
@@ -106,8 +106,9 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
    (`aperture_correction_without_an_unsaturated_isolated_star_is_one_and_flagged`).
 4. **A plane whose noise estimate is refused** (MRS at its floor on a constant or near-constant plane; `N*` under
    100 residuals). The matched filter's threshold has no σ: the detector returns no seeds with one `warn!`, the
-   flat-top test and the SNR take `σ_local` from the star's own annulus (never the plane σ), and `NoiseModel.source
-   = NoiseSource::None` is reported. Pinned in Task 6a (`refused_noise_estimate_seeds_nothing_and_warns`).
+   SNR takes `σ_local` from the star's own annulus (never the plane σ), the saturation test's threshold reads the
+   plane σ (PA-23; `sigma` is 0 here, so only given seeds reach the test, Task 8 open item 1), and
+   `NoiseModel.source = NoiseSource::None` is reported. Pinned in Task 6a (`refused_noise_estimate_seeds_nothing_and_warns`).
 5. **A star at the image edge** (the width-start box partly outside; the region cap clipped by the border; an
    aperture or annulus crossing it). Admission refuses `OutsideImage` when the width-start box leaves the image;
    a region clipped by the border fits only when its radius still holds `0.5·growth·FWTM` (reachable only for a
@@ -162,7 +163,9 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   `fit_moffat_2d` and `fit_moffat_2d_fixed_beta` stay byte-identical (their callers in `metrics.rs`, the debug binary
   and the pins keep their bytes; a golden test pins it). The result carries `iters`. No rustafits crate version bump
   in Plan A (a path dependency; `Cargo.lock` unchanged); a release is the owner's `rustafits-release` procedure.
-- **PA-8 The flat-top test's constants** are fixed a priori, not measured: core = the pixels within 2 σ_local of the
+- **PA-8 The flat-top test's constants** *(superseded by C-a, owner 2026-10-09: the test is PA-23. F9's wing-fit
+  wording below goes with it; F9's order is kept in PA-23. The text stays as history.)* are fixed a priori, not
+  measured: core = the pixels within 2 σ_local of the
   observed maximum inside a radius of `max(1.5, 0.5·FWHM_start)` px; the star is flagged saturated when that core
   holds ≥ 3 pixels AND the free-β wing fit (on the pixels outside the core, ≥ 12 of them) predicts, at the maximum's
   position, a value above the observed maximum by more than `max(3 σ_local, 0.01·observed maximum)`. The 3 is the
@@ -297,6 +300,32 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   factor `F(x, y)/ATH_CFNM` of P-21 is taken as 1 because Measure holds no flat — documented on the adapter, and
   the vignetting error it leaves (the flat's own range, up to the corner ratio the pedestal warning measures) is
   reported in the SNR row's note, not hidden. The lab writes `ATH_CFNM = 1.0` so the approximation is exact there.
+- **PA-23 The saturation test (supersedes PA-8; owner rulings 2026-10-09, controller rulings C-a…C-g in
+  `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-8-handoff-spec.md`).** PA-8 failed on lab truth (research
+  R1: FN 60 % on exact ties, 97 % under 1 % flat scatter). The owner adopted an established stacking program's
+  method as is; its lab check (research R2) flags ≥ 99.9 % of the clipped stars on exact ties, 1 % flat scatter and
+  30 % vignetting. Spec §2.1 is the one definition; this ruling adds the plan-level precision.
+  - **Substitutes (C-a).** The plane's bg = `SkyLevel.median` (the module's sky median, in the plane's own domain,
+    scaled to working units) and σ = `NoiseModel.sigma` (its plane noise, working units); norm = `ADU_SCALE` for `Domain::Calibrated` (1.0 unit) and 2^bits − 1
+    for `Domain::RawAdu`. pixel0 and its 8 neighbours are read from the seed's region at the rounded seed centre;
+    an absent neighbour is not above the threshold. Cost if wrong: FN/FP move away from R2's numbers; Phase C
+    reads them against the bar.
+  - **The verdict fit (C-a, C-b).** Every seed with a region gets one, as the reference method fits every
+    candidate. It is `fit_moffat_2d` (free β, bound [1, 20]) at Task 8 and `fit_moffat_2d_bounded` with
+    `BETA_BOUNDS` from Task 9 on. It runs on the region's pixels below the level, from the module's own starts
+    (PA-12: `b0`, `F_start`, the seed centre), with `3 × FitParams::max_iter` when any pixel is excluded. With
+    ≤ 8 pixels left (the fit's 8 parameters) the seed is refused `RefusalReason::MostlySaturated`. Flag =
+    A > range. Phase A reports the Measure-stage wall time on one real frame before and after; any restriction
+    for speed goes to the owner with those numbers (cost if wrong: a slower Measure).
+  - **Order (ruling F9, kept):** seeds → field width → verdicts → β sample → fits at β. The field width (PA-17)
+    runs no saturation test (ruling F25 as folded). The unflagged bright seeds' verdict fits are the β sample:
+    Task 8's discrete search takes the 64 brightest unflagged seeds, Task 9 takes their free β (C-b). Every star is
+    then fitted at the frame β as now.
+  - **Flagged stars (C-c)** stay in `.athf` with `SATURATED`; the β sample and the frame statistic read unflagged
+    stars only (F-3). The known limit (small-core stars fitted uncensored, FWHM +31 %, no consumer) is spec §2.1's.
+  - **Bar (C-d).** Row 10: FN ≤ 0.5 % among truth-saturated stars with `clipped_core_px ≥ 3`; FP reported as a
+    count and share, no bar; the payoff (the censored verdict fit's FWHM error where the plateau test passed)
+    reported. The F-3 twin bars and Task 8's carried items (the Task 8 brief's C1) are unchanged.
 
 ## File structure
 
@@ -312,7 +341,7 @@ athenaeum (`crates/athenaeum-core/src/` unless noted):
 | `star_measure/photometry.rs` | `annulus_sigma` and the per-seed saturation verdict (Task 8), model flux + aperture correction (Task 10), SNR and HFR (Task 11) |
 | `star_measure/frame.rs` | `frame_shape`, `signal_totals`, `FrameAggregates` (moved + the unsaturated statistic, Task 8) |
 | `star_measure/budget.rs` | the Analysis-mode selection (Task 12) |
-| `star_measure/diagnostics.rs` | `RefusalReason`, `Outcome` (incl. `NotSelected`, `Trimmed`), `FitDiagnostics`, `RefusalCounts` (Task 4) |
+| `star_measure/diagnostics.rs` | `RefusalReason`, `Outcome` (incl. `NotSelected`, `Trimmed`), `FitDiagnostics`, `RefusalCounts` (Task 4); `MostlySaturated` and `FitDiagnostics.verdict` (Task 8) |
 | `star_measure/robust.rs` | moved verbatim from `stacking/robust.rs` |
 | `test_support.rs` | `fixture_field` (the 150-star field moved from `measure.rs`'s tests, ruling F44), `nan_border_field` (Task 6a), `StarFit::test_at` (Task 4) |
 | `stacking/measure.rs` | the adapter: `PlaneReader` → `Domain::Calibrated`, options from the config, `ChannelMeasurement` (+ `stars_refused`, `stars_unsaturated`, `refused_by_reason`), `.athf` write path unchanged |
@@ -353,7 +382,10 @@ Run the lab tests from `star-lab/`: `python3 -m unittest discover -s tests -v`.
   Option<&Arc<rayon::ThreadPool>>) -> PlaneMeasurement` with `opts.mode = Mode::Budget { budget }` (D-3, default
   500), `opts.domain = Domain::RawAdu { clip, gain_e_per_adu }` (clip from BITPIX/BZERO or DATAMAX, the caller's job;
   gain from EGAIN), `opts.seeds = SeedSpec::MatchedFilter { threshold }` (the Settings → Analysis field in σ_f units,
-  default `seeds::DEFAULT_THRESHOLD`), `opts.saturation_fraction` (Settings → Analysis), `opts.scale_estimator`.
+  default `seeds::DEFAULT_THRESHOLD`), `opts.colour` (the saturation test's mono/colour rule, spec §2.1; Plan C's
+  mosaic input sets its own value, Task 8 open item 3), `opts.scale_estimator`. There is no
+  `opts.saturation_fraction`: spec §2.1 has had no clip clause since 2026-10-09. The test's raw-ADU norm is
+  2^bits − 1; whether `clip` carries it is Task 8 open item 2.
 - Per star (`StarFit`): `x, y, background, amplitude, fwhm_x ≥ fwhm_y, theta` (radians, image frame, on `fwhm_x`'s
   axis), `beta`, `residual`, `signal` (the F-5 flux), `snr` (F-6; `f64::NAN` when not measured), `hfr` (F-6, on the
   F-5 flux), `peak5`, `flags: StarFlags` (`SATURATED`, `BETA_AT_CAP`), plus `fwhm()`, `eccentricity()`.
@@ -365,7 +397,8 @@ Run the lab tests from `star-lab/`: `python3 -m unittest discover -s tests -v`.
   noise.sigma` and `snr_weight`'s denominator read `sky.median`, never `noise.m_star`, which is the median of the mesh
   RESIDUALS — I-8), `seeds` (stars detected), `refused: RefusalCounts` (`stars_refused` and per-reason counts),
   `budget: Option<BudgetReport>`, `snr_gain: Option<f64>` (None = the shot term was omitted), `diagnostics`,
-  `timings: PhaseTimings`, `wing_fit_missing`, `snr_missing`.
+  `timings: PhaseTimings`, `snr_missing`. `wing_fit_missing` is retired with PA-8: a seed the verdict refuses is
+  counted under `mostlySaturated`.
 - `star_measure::seeds::detect(plane, w, h, noise, threshold, max_stars, mask, pool)` is public: Plan C calls it on
   its own 2×2 super-pixel OSC plane and hands the native-coordinate sites to `fit_stars_at` with the CFA mask.
 - `star_measure::MEASURE_VERSION` for `AnalysisConfig::config_hash` and the `frame_analysis.measure_version` column.
@@ -2248,16 +2281,24 @@ handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 
 ### Task 8: F-3 — the per-seed saturation verdict and the unsaturated statistics (spec §2.1, §3 F-3)
 
+**Rewritten 2026-10-09.** PA-8's flat-top wing test failed on lab truth (research R1); the owner adopted an
+established stacking program's method as is (spec §2.1 as revised, PA-23). C-a (owner 2026-10-09) supersedes this
+task's former interface (`region_verdict`, `SaturationVerdict { clip_hit, core_pixels, overshoot_sigma, wing_fit }`,
+`MeasureOptions.saturation_fraction`, `PlaneMeasurement.wing_fit_missing`, the probe's `--saturation-fraction` and
+`wingFitMissing`) and its tests. The text below replaces them; the superseded text is at 51021d06.
+
 **Files:**
-- Create: `crates/athenaeum-core/src/star_measure/photometry.rs` (`annulus_sigma`, `region_verdict`)
-- Modify: `star_measure/fit.rs` (`fit_one` takes the seed's verdict and copies it into `StarFit.flags`; the
-  verdict step runs before the fits — ruling F9), `star_measure/beta.rs` (the discrete search samples the 64
-  brightest seeds whose verdict is unsaturated), `star_measure/frame.rs` (`frame_shape` over the unsaturated
-  subset; `stars_unsaturated`), `star_measure/mod.rs` (`MeasureOptions.saturation_fraction`,
-  `PlaneMeasurement.wing_fit_missing`; the order seeds → field width → verdicts → β sample → fits at β),
-  `stacking/measure.rs` (hand edit: `ChannelMeasurement.stars_unsaturated`),
-  `examples/star_probe.rs` (`--clip`, `--saturation-fraction`; frame line `wingFitMissing`), `docs/stacking/README.md`
-  (R-OSP-5)
+- Create: `crates/athenaeum-core/src/star_measure/photometry.rs` (`annulus_sigma`, which Task 11's SNR reads and the
+  saturation test no longer does; `SaturationPlane`, `plateau_level`, `SaturationVerdict`, `saturation_verdict`)
+- Modify: `star_measure/diagnostics.rs` (`RefusalReason::MostlySaturated`; `FitDiagnostics.verdict`),
+  `star_measure/fit.rs` (the verdict runs per seed once its region is gathered, before the fits — F9's order;
+  `fit_one` copies the verdict's flag into `StarFit.flags`; `FitScratch` becomes `pub(crate)`),
+  `star_measure/beta.rs` (the discrete search samples the 64 brightest seeds whose verdict is unflagged),
+  `star_measure/frame.rs` (`frame_shape` over the unflagged subset; `stars_unsaturated`), `star_measure/mod.rs`
+  (`MeasureOptions.colour`; one `SaturationPlane` per plane; the order seeds → field width → verdicts → β sample →
+  fits at β), `stacking/measure.rs` (hand edit: `ChannelMeasurement.stars_unsaturated`; `colour` for a debayered
+  OSC group's planes), `examples/star_probe.rs` (each seed's verdict on its fit or refused line under
+  `--diagnostics`; `colour` for a 3-plane input), `docs/stacking/README.md` (R-OSP-5)
 - Not modified: `star_measure/seeds.rs` — the field width runs no saturation test (PA-17, ruling F25 as folded), so
   `detect` and `field_width_of` keep Task 6a's signatures (Plan C's `detect` included).
 - Earlier tests this task edits (ruling F14): none break — `FrameAggregates.fwhm_px` was `Option<f64>` from Task 2.
@@ -2273,77 +2314,110 @@ handlers (`cargo test -p athenaeum-web` and `-p athenaeum-tauri --lib` green).
 pub fn annulus_sigma(plane: &[f32], w: usize, h: usize, x: f64, y: f64, fwhm: f64, mask: Option<&[bool]>)
     -> Option<(f64 /* sigma_sky */, usize /* n_sky */)>;
 
+/// The plane-level inputs of the saturation test (spec §2.1, PA-23), once per plane, in working units.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SaturationVerdict { pub saturated: bool, pub clip_hit: bool, pub core_pixels: u16, pub overshoot_sigma: f64,
-                               pub wing_fit: bool }
-/// PA-8, per SEED (ruling F9): the clip clause on the region's maximum, the core count within 2 σ_local of that
-/// maximum inside `max(1.5, 0.5·fwhm_start)` px of it, and the free-β wing fit on the pixels outside the core
-/// (≥ 12 of them, `fit_moffat_2d`, bound [1, 20] at this task; `fit_moffat_2d_bounded` with `BETA_BOUNDS` from
-/// Task 9 — I-3), started at the region's rim median, the maximum and `fwhm_start`. `clip`: `Some(level)` in the
-/// plane's units when the domain knows it (RawAdu: `saturation_fraction × clip`), `None` on a calibrated plane.
-/// `sigma_local` = `annulus_sigma` at the seed; `None` → only the clip clause can flag. A wing fit that returns
-/// `None`, or cannot run because fewer than 12 pixels lie outside the core, leaves `saturated = false` with
-/// `wing_fit = false` and is counted in `wing_fit_missing` — never a flag from a missing fit.
-pub fn region_verdict(region: &[PixelSample], max_x: f64, max_y: f64, fwhm_start: f64, clip: Option<f64>,
-                      sigma_local: Option<f64>, scratch: &mut FitScratch) -> SaturationVerdict;
+pub struct SaturationPlane { pub bg: f64, pub threshold: f64, pub norm: f64, pub range: f64, pub colour: bool }
+impl SaturationPlane {
+    /// `threshold = bg + 5·sigma`, `range = min(plane_max, norm) − bg`; `plane_max` over the plane's finite,
+    /// unmasked pixels.
+    pub fn new(bg: f64, sigma: f64, plane_max: f64, norm: f64, colour: bool) -> Self;
+}
+
+/// The plateau test at the seed pixel: pixel0 = the region's pixel at the rounded seed centre, its 8 neighbours
+/// from the region (an absent one is not above the threshold); the neighbours ≥ `threshold` must number ≥ 3 (mono)
+/// or 8 (colour), with `meanhigh − bg ≥ 0.7·range` and `pixel0 − minhigh ≤ 0.1·range`. `Some(level)` with
+/// `level = min(pixel0, norm) − 0.1·range` when it passes, else `None` (the level is then `norm`).
+pub(crate) fn plateau_level(region: &[PixelSample], seed_x: f64, seed_y: f64, plane: &SaturationPlane) -> Option<f64>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SaturationVerdict {
+    pub plateau: bool,   // the plateau test passed
+    pub level: f64,      // its level, else norm
+    pub excluded: u32,   // the region's pixels ≥ level, left out of the verdict fit
+    pub amplitude: f64,  // the verdict fit's A
+    pub beta: f64,       // its free β (the β sample's fit, C-b)
+    pub fwhm: f64,       // its FWHM (the payoff reads it, C-d)
+    pub saturated: bool, // amplitude > range
+}
+
+/// Spec §2.1 per seed (PA-23): the plateau test, the level, then the free-β verdict fit (`fit_moffat_2d` at this
+/// task, `fit_moffat_2d_bounded` with `BETA_BOUNDS` from Task 9) on the region's pixels below the level, started at
+/// `b0`, the seed and `f_start` (PA-12), with `3 × params.max_iter` when any pixel is excluded.
+/// `Err(MostlySaturated)` when ≤ 8 pixels remain (the fit's 8 parameters).
+pub fn saturation_verdict(region: &[PixelSample], seed_x: f64, seed_y: f64, b0: f64, f_start: f64,
+                          plane: &SaturationPlane, params: &FitParams, scratch: &mut FitScratch)
+    -> Result<SaturationVerdict, RefusalReason>;
 ```
 
-  `fit_one` receives the verdict and sets `StarFit.flags |= SATURATED` when it says so; `stars_fitted` keeps
-  counting every accepted fit (M-4); `FrameAggregates.stars_unsaturated`; `frame_shape(fits)` →
-  `frame_shape(fits.iter().filter(|f| !f.flags.saturated()))` with `None` when empty (Review Focus 3 — the adapter
-  then reports `fwhm_px = 0.0`, which passes `select_frames`'s `max_fwhm_px` as the spec allows; the plan gate's
-  and the UI's treatment of `stars_unsaturated = 0` is Plan C's, M-12); the β sample is the 64 brightest seeds whose
-  verdict is unsaturated. The verdict is computed once per seed on its own region AFTER the field width is known
-  (the region's `F_start` reads `F_field`, PA-12) and reused by the fit; the field width itself (PA-17) reads every
-  candidate and no verdict — no second, partial rule exists (ruling F25 as folded; cost if wrong: a field width
-  biased on frames dominated by saturated stars, which the lab's `saturated/*` families show).
-  `PlaneMeasurement.wing_fit_missing: usize` counts the seeds whose wing fit is missing (returned `None`, or fewer
-  than 12 pixels outside the core; the probe prints it as `wingFitMissing`; the lab row reports it).
-- `Domain::Calibrated` → `clip = None`; `Domain::RawAdu { clip }` → `Some(saturation_fraction × clip)`.
+- The plane's inputs: bg = `sky.median` and σ = `noise.sigma` in working units; norm = `ADU_SCALE` for
+  `Domain::Calibrated`, 2^bits − 1 for `Domain::RawAdu` (open item 2); `colour = MeasureOptions.colour` (default
+  `false`; the stacking adapter sets it for a debayered OSC group's planes, the probe for a 3-plane input).
+- Every seed whose region is gathered gets a verdict (C-b). A seed refused before its region (`OutsideImage`,
+  `TooFewPixels`) has none; `Err(MostlySaturated)` refuses the seed, counted in `stars_refused` by reason.
+  `FitDiagnostics.verdict: Option<SaturationVerdict>` records it.
+- `fit_one` sets `StarFit.flags |= SATURATED` from the verdict; the star is still fitted at the frame β as now and
+  stays in `.athf` with its flag (C-c). `stars_fitted` keeps counting every accepted fit (M-4);
+  `FrameAggregates.stars_unsaturated`; `frame_shape(fits)` → `frame_shape(fits.iter().filter(|f|
+  !f.flags.saturated()))` with `None` when empty (Review Focus 3 — the adapter then reports `fwhm_px = 0.0`, which
+  passes `select_frames`'s `max_fwhm_px` as the spec allows; the plan gate's and the UI's treatment of
+  `stars_unsaturated = 0` is Plan C's, M-12); the β sample (discrete here) is the 64 brightest unflagged seeds. The
+  field width (PA-17) reads every candidate and no verdict, because the verdict's region needs it (ruling F25 as
+  folded; cost if wrong: a field width biased on frames dominated by saturated stars).
 
-- [ ] **Step 1: Write the failing tests** (`photometry.rs` and `mod.rs` tests)
+**Open before Phase A** (the controller rules; report `task-8-report-spec.md`):
+1. σ = `NoiseModel.sigma` is this text's reading of "the module's sky σ estimate"; under `NoiseSource::None` it is
+   0, so the threshold falls to bg (only given seeds reach the test).
+2. Raw-ADU norm: `Domain::RawAdu.clip` comes from BITPIX/BZERO or DATAMAX. Either `clip` must be 2^bits − 1, or the
+   domain gains the bit depth.
+3. Colour: the reference method's colour rule fits the stacking adapter's debayered planes; Plan C's raw mosaic
+   (super-pixel detection, green-site fit) needs its own ruling. R2 left OSC out.
+4. A verdict fit the fitter refuses (`None`) for any other reason: refuse the seed (`FitFailed`, as the reference
+   method drops it) or leave it unflagged. R2 saw 130–232 such fits among 72,207 unsaturated stars and none among
+   the saturated ones. Refusing moves row 1 `fit outcomes`, which then needs a design-list entry.
+5. C-a says "fewer pixels than parameters"; this text and its test pin the reference's n ≤ p (n ≤ 8, as R2's
+   port). The two differ only at exactly 8 pixels.
+6. The at-β fit of a censored star ("as now", C-b) keeps its pixels ≥ level, so its `.athf` width is uncensored.
+   The payoff lives in the verdict fit only.
+7. Task 9's `frame_beta` reads the verdict fits' β (C-b). For a caller that runs no verdict (LN's reference fit,
+   `ln/scale.rs:993`; Plan C's green-site call, F45): does `fit_stars_at` run verdicts, or does `frame_beta` keep
+   its own sample fit?
+8. C-c names the width start. This text keeps PA-17/F25: the field width reads every candidate, because the
+   verdict's region needs it.
+9. Lab side: row 10's `wing_fit_missing` column (Task 1b) and Phase B's `bars.py` need the C-d change (FN as a
+   share, FP with no bar, the payoff from the probe's verdict fields).
+
+- [ ] **Step 1: Write the failing tests** (`photometry.rs` and `mod.rs` tests). They pin the method on the module's
+  own seed region (C-f; R2's fixtures, not R1's ± 6F box).
 
 ```rust
 use crate::test_support::{moffat_field, MoffatStar, add_noise};
 
 fn clipped(data: &mut [f32], at: f32) { for v in data.iter_mut() { if *v > at { *v = at; } } }
-fn region_of(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Vec<PixelSample> {
-    let mut px = Vec::new();
-    for y in cy - r..=cy + r { for x in cx - r..=cx + r {
-        let v = data[y as usize * w + x as usize];
-        if v.is_finite() { px.push(PixelSample { x: x as f64, y: y as f64, value: v as f64 }); }
-    } }
+/// `data` measured at the given seeds through the module's own regions, diagnostics on, Moffat-4 (no β sample).
+fn measured(data: &[f32], w: usize, h: usize, seeds: Vec<Seed>) -> PlaneMeasurement {
+    measure_plane(data, w, h, &MeasureOptions { seeds: SeedSpec::Given(seeds), psf_model: PsfModel::Moffat4,
+        diagnostics: true, ..Default::default() }, None)
+}
+fn verdict(m: &PlaneMeasurement, seed: usize) -> SaturationVerdict {
+    m.diagnostics.iter().find(|d| d.seed == seed).and_then(|d| d.verdict).expect("a seed with a region has a verdict")
+}
+fn seed_at(x: f64, y: f64) -> Seed { Seed { x, y, peak: 0.9, flux: 1.0 } }
+/// R2's single-star fixtures: FWHM 2.6 at β 4 (α 2.99), off the pixel grid.
+fn small_core_star(x: f64, y: f64, amp: f64) -> MoffatStar { MoffatStar { x, y, amp, alpha_x: 2.99, alpha_y: 2.99, theta: 0.0 } }
+/// A hand-built region about (20, 20): the 3x3 `core` (row-major, centre at index 4, `None` = absent), then `ring_n`
+/// of the 16 pixels of the r = 2 ring at `ring`.
+fn hand_region(core: [Option<f32>; 9], ring: f32, ring_n: usize) -> Vec<PixelSample> {
+    let mut px: Vec<PixelSample> = core.iter().enumerate().filter_map(|(i, v)| v.map(|v| PixelSample {
+        x: 19.0 + (i % 3) as f64, y: 19.0 + (i / 3) as f64, value: v as f64 })).collect();
+    let ring_xy = (-2i64..=2).flat_map(|dy| (-2i64..=2).map(move |dx| (dx, dy))).filter(|&(dx, dy)| dx.abs() == 2 || dy.abs() == 2);
+    px.extend(ring_xy.take(ring_n).map(|(dx, dy)| PixelSample { x: 20.0 + dx as f64, y: 20.0 + dy as f64, value: ring as f64 }));
     px
 }
-
-#[test]
-fn a_clipped_moffat_core_is_flagged_and_an_unclipped_one_is_not() {
-    // FWHM 2.6 at β 4 (α 2.99), amplitude 3× the clip 0.95 → ≥ 5 core pixels at the clip → saturated;
-    // the same star at 0.6× the clip → not; a broad Gaussian-like star (FWHM 10, peak SNR 150, unclipped) → not (R-3)
-    let star = |amp| MoffatStar { x: 30.3, y: 30.7, amp, alpha_x: 2.99, alpha_y: 2.99, theta: 0.0 };
-    let mut hot = moffat_field(60, 60, &[star(2.85)], 4.0, 0.05); clipped(&mut hot, 0.95); add_noise(&mut hot, 0.002, 1);
-    let mut cool = moffat_field(60, 60, &[star(0.57)], 4.0, 0.05); add_noise(&mut cool, 0.002, 1);
-    let mut scratch = FitScratch::default();
-    let sig = Some(0.002);
-    let v = region_verdict(&region_of(&hot, 60, 30, 31, 12), 30.0, 31.0, 2.6, None, sig, &mut scratch);
-    assert!(v.saturated && v.wing_fit && v.core_pixels >= 5 && v.overshoot_sigma > 3.0, "{v:?}");
-    let v = region_verdict(&region_of(&cool, 60, 30, 31, 12), 30.0, 31.0, 2.6, None, sig, &mut scratch);
-    assert!(!v.saturated && v.wing_fit, "{v:?}");
-    let mut broad = moffat_field(120, 120, &[MoffatStar { x: 60.0, y: 60.0, amp: 0.3, alpha_x: 24.0, alpha_y: 24.0, theta: 0.0 }], 20.0, 0.05);
-    add_noise(&mut broad, 0.002, 2);
-    let v = region_verdict(&region_of(&broad, 120, 60, 60, 40), 60.0, 60.0, 10.0, None, sig, &mut scratch);
-    assert!(!v.saturated, "a broad unclipped star has many near-peak pixels but no overshoot: {v:?}");
-}
-
-#[test]
-fn raw_domain_clip_clause_flags_a_peak_above_the_fraction_times_clip() {
-    let mut data = moffat_field(60, 60, &[MoffatStar { x: 30.0, y: 30.0, amp: 63000.0, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }], 4.0, 1000.0);
-    clipped(&mut data, 63000.0);
-    let mut scratch = FitScratch::default();
-    let v = region_verdict(&region_of(&data, 60, 30, 30, 12), 30.0, 30.0, 2.6, Some(0.95 * 65535.0), Some(50.0), &mut scratch);
-    assert!(v.clip_hit && v.saturated);
-    let v = region_verdict(&region_of(&data, 60, 30, 30, 12), 30.0, 30.0, 2.6, Some(0.99 * 65535.0), Some(50.0), &mut scratch);
-    assert!(!v.clip_hit);
+fn twelve_clipped() -> (Vec<f32>, Vec<Seed>) {
+    let stars: Vec<MoffatStar> = (0..12).map(|i| MoffatStar { x: 30.0 + (i % 4) as f64 * 50.0, y: 30.0 + (i / 4) as f64 * 50.0,
+        amp: 3.0, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }).collect();
+    let mut data = moffat_field(220, 170, &stars, 4.0, 0.05); clipped(&mut data, 0.95); add_noise(&mut data, 0.002, 5);
+    (data, stars.iter().map(|s| seed_at(s.x, s.y)).collect())
 }
 
 #[test]
@@ -2363,48 +2437,112 @@ fn annulus_sigma_is_the_mad_of_the_present_pixels() {
     assert!(annulus_sigma(&data, w, h, 32.0, 32.0, 2.6, Some(&all)).is_none(), "a fully masked annulus");
 }
 
-/// The pocket (ruling F29): every pixel within Chebyshev distance 3 of the star is NaN except the 5-pixel plus
-/// about it and ten pixels of the r = 3 rim (the top rim row and the bottom row's middle three).
-fn pocket(dx: i64, dy: i64) -> bool { dx.abs() + dy.abs() <= 1 || dy == -3 || (dy == 3 && dx.abs() <= 1) }
+#[test]
+fn the_range_is_the_plane_max_capped_at_full_scale_less_the_median() {
+    let p = SaturationPlane::new(0.05, 0.002, 1.24, 1.0, false);
+    assert!((p.range - 0.95).abs() < 1e-12 && (p.threshold - 0.06).abs() < 1e-12, "{p:?}");
+    let p = SaturationPlane::new(0.05, 0.002, 0.6, 1.0, true);
+    assert!((p.range - 0.55).abs() < 1e-12 && p.colour, "{p:?}");
+}
 
 #[test]
-fn a_missing_wing_fit_never_flags() {
-    // A clipped star whose own region holds fewer than 12 pixels outside its core, in the module's own geometry.
-    // Computed on this fixture (noise 0.0005): the plus is clipped flat at 0.95; F_start 1.5–1.7 (r_start 3); the
-    // region stops at r = 3 (m_r − s_r = 0.0005 against 0.01·(max − s_r) = 0.009) with 15 present pixels; the core
-    // holds 4 or 5 of them (by where the maximum sits among the equal clipped ones), so 10 or 11 lie outside it —
-    // no wing fit, and a core ≥ 3 means only the wing fit could have flagged it. Eight unclipped Moffat-4 stars
-    // (α 3) give the field width; their wing fits return. The ring 6..9 of PA-11 stays present (σ_local exists).
-    let (w, h, cx, cy) = (240usize, 160usize, 120i64, 80i64);
-    let stars: Vec<MoffatStar> = (0..8).map(|i| MoffatStar { x: [30.0, 80.0, 160.0, 210.0][i % 4], y: [40.0, 120.0][i / 4],
-        amp: 0.3, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }).collect();
-    let mut data = moffat_field(w, h, &stars, 4.0, 0.05);
-    let spot = crate::test_support::gaussian_field(w, h, &[(cx as f64, cy as f64, 4.0)], 0.8, 0.0);
-    for (v, s) in data.iter_mut().zip(&spot) { *v += s; }
-    add_noise(&mut data, 0.0005, 7);
-    clipped(&mut data, 0.95);
-    for dy in -3i64..=3 { for dx in -3i64..=3 {
-        if !pocket(dx, dy) { data[(cy + dy) as usize * w + (cx + dx) as usize] = f32::NAN; }
+fn the_plateau_test_needs_three_neighbours_on_mono_all_eight_on_colour_and_a_high_flat_top() {
+    // range 0.9, threshold 0.06; `c` at the clip, `k` at the sky (under the threshold); the level is 0.95 − 0.09
+    let (c, k) = (Some(0.95f32), Some(0.05f32));
+    let mono = SaturationPlane::new(0.05, 0.002, 0.95, 1.0, false);
+    let colour = SaturationPlane { colour: true, ..mono };
+    let level = |core: [Option<f32>; 9], p: &SaturationPlane| plateau_level(&hand_region(core, 0.3, 16), 20.0, 20.0, p);
+    assert!(level([c, c, c, k, c, k, k, k, k], &mono).is_some(), "mono: 3 of 8 above the threshold");
+    assert!(level([c, c, k, k, c, k, k, k, k], &mono).is_none(), "mono: 2 of 8");
+    let l = level([c; 9], &colour).expect("colour: 8 of 8");
+    assert!((l - 0.86).abs() < 1e-6, "{l}");
+    assert!(level([c, c, c, c, c, c, c, c, None], &colour).is_none(), "colour: 7 of 8, one absent");
+    assert!(level([c, c, c, c, c, Some(0.84), c, c, c], &mono).is_none(), "pixel0 − minhigh 0.11 > 0.1·range");
+    let (h, p0) = (Some(0.5f32), Some(0.55f32));
+    assert!(level([h, h, h, h, p0, h, h, h, h], &mono).is_none(), "a flat top at half the range: meanhigh too low");
+}
+
+#[test]
+fn no_more_unexcluded_pixels_than_parameters_refuses_the_seed_mostly_saturated() {
+    // the 3x3 is a plateau at the clip, so the level excludes all nine and the ring's k pixels are left for the
+    // 8-parameter fit: 8 → refused (n ≤ p, open item 5), 9 → the fit runs
+    let plane = SaturationPlane::new(0.05, 0.002, 0.95, 1.0, false);
+    let mut s = FitScratch::default();
+    let r = saturation_verdict(&hand_region([Some(0.95); 9], 0.3, 8), 20.0, 20.0, 0.05, 2.6, &plane, &FitParams::default(), &mut s);
+    assert_eq!(r, Err(RefusalReason::MostlySaturated));
+    let r = saturation_verdict(&hand_region([Some(0.95); 9], 0.3, 9), 20.0, 20.0, 0.05, 2.6, &plane, &FitParams::default(), &mut s);
+    assert_ne!(r, Err(RefusalReason::MostlySaturated), "nine pixels left: the fit runs");
+}
+
+#[test]
+fn a_clipped_star_without_a_full_3x3_plateau_is_fitted_uncensored_and_still_flagged() {
+    // amplitude 3× the clip 0.95: about eight pixels reach the clip, but one neighbour of the centre pixel sits ≈ 0.11
+    // below it (> 0.1·range), so the plateau test fails, the level is norm and nothing is excluded; the uncensored
+    // fit overshoots (R2: A/range 1.30, FWHM +48 %) — spec §2.1's known limit
+    let mut hot = moffat_field(60, 60, &[small_core_star(30.3, 30.7, 2.85)], 4.0, 0.05); clipped(&mut hot, 0.95); add_noise(&mut hot, 0.002, 1);
+    let v = verdict(&measured(&hot, 60, 60, vec![seed_at(30.3, 30.7)]), 0);
+    assert!(!v.plateau && v.excluded == 0 && v.saturated, "{v:?}");
+}
+
+#[test]
+fn a_planes_brightest_unclipped_star_is_flagged_because_its_own_peak_sets_the_range() {
+    // by design (spec §2.1): the lone star at 0.6× the clip sets the plane max, so the range is its own brightest
+    // pixel − bg, and the fitted peak between pixels tops it (R2: A/range 1.08)
+    let mut cool = moffat_field(60, 60, &[small_core_star(30.3, 30.7, 0.57)], 4.0, 0.05); add_noise(&mut cool, 0.002, 1);
+    let v = verdict(&measured(&cool, 60, 60, vec![seed_at(30.3, 30.7)]), 0);
+    assert!(!v.plateau && v.saturated, "{v:?}");
+}
+
+#[test]
+fn a_lone_broad_unclipped_star_passes_the_plateau_test_and_its_censored_fit_keeps_its_width() {
+    // FWHM 9.01 (α 24, β 20), peak 0.3 on 0.05: its 3x3 lies within 0.1·range of the centre, so its top is censored
+    // (R2: FWHM within 0.2 %). The flag is not pinned: the lone star sets the range itself (R2: A/range 0.994)
+    let mut broad = moffat_field(120, 120, &[MoffatStar { x: 60.0, y: 60.0, amp: 0.3, alpha_x: 24.0, alpha_y: 24.0, theta: 0.0 }], 20.0, 0.05);
+    add_noise(&mut broad, 0.002, 2);
+    let v = verdict(&measured(&broad, 120, 120, vec![seed_at(60.0, 60.0)]), 0);
+    let truth = 2.0 * 24.0 * (2f64.powf(1.0 / 20.0) - 1.0).sqrt();
+    assert!(v.plateau && v.excluded >= 9, "{v:?}");
+    assert!((v.fwhm / truth - 1.0).abs() < 0.03, "{} vs {truth}", v.fwhm);
+}
+
+#[test]
+fn a_full_clipped_plateau_is_censored_flagged_and_keeps_its_width() {
+    // every 3x3 of the twelve sits at the clip: the plateau test passes, the level excludes the plateau, and the
+    // censored fit reads the width (R2: 12 of 12 censored and flagged, FWHM median −0.6 %)
+    let (data, seeds) = twelve_clipped();
+    let m = measured(&data, 220, 170, seeds);
+    let truth = 2.0 * 3.0 * (2f64.powf(0.25) - 1.0).sqrt();
+    let mut err: Vec<f64> = (0..12).map(|i| {
+        let v = verdict(&m, i);
+        assert!(v.plateau && v.excluded >= 9 && v.saturated, "{i}: {v:?}");
+        (v.fwhm / truth - 1.0).abs()
+    }).collect();
+    err.sort_by(f64::total_cmp);
+    assert!(err[6] < 0.03, "median |ΔF|/F {}", err[6]);
+}
+
+#[test]
+fn the_capped_range_flags_a_small_core_star_beside_a_plateau_lifted_above_full_scale() {
+    // a flat-divided field: vignetting 1 + 0.3·d²/28900 about (40, 40) lifts the full plateau at (190, 120) to
+    // ≈ 1.24 (legal on a calibrated plane), which sets the plane max. The range stays 1 − bg, so the small-core star
+    // keeps A/range ≈ 1.25 and is flagged; an uncapped range (1.24 − bg) would put it at ≈ 1.0
+    let stars = [small_core_star(40.3, 40.7, 2.85), MoffatStar { x: 190.0, y: 120.0, amp: 3.0, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }];
+    let (w, h) = (240usize, 160usize);
+    let mut data = moffat_field(w, h, &stars, 4.0, 0.05); clipped(&mut data, 0.95);
+    for y in 0..h { for x in 0..w {
+        let d2 = (x as f64 - 40.0).powi(2) + (y as f64 - 40.0).powi(2);
+        data[y * w + x] *= (1.0 + 0.3 * d2 / 28900.0) as f32;
     } }
-    let region = region_of(&data, w, cx, cy, 3);
-    assert_eq!(region.len(), 15);
-    let mut scratch = FitScratch::default();
-    let v = region_verdict(&region, cx as f64, cy as f64, 1.6, None, Some(0.0005), &mut scratch);
-    assert!(v.core_pixels >= 4, "the flat-top premise holds: {v:?}");
-    assert!(!v.wing_fit && !v.saturated, "fewer than 12 pixels outside the core: no wing fit, no flag: {v:?}");
-    let mut seeds: Vec<Seed> = stars.iter().map(|s| Seed { x: s.x, y: s.y, peak: s.amp, flux: 1.0 }).collect();
-    seeds.push(Seed { x: cx as f64, y: cy as f64, peak: 0.9, flux: 4.0 });
-    let m = measure_plane(&data, w, h, &MeasureOptions { seeds: SeedSpec::Given(seeds), ..Default::default() }, None);
-    assert_eq!(m.wing_fit_missing, 1, "the pocket star alone");
-    assert!(m.stars.iter().all(|f| !f.flags.saturated()));
+    add_noise(&mut data, 0.002, 3);
+    let m = measured(&data, w, h, vec![seed_at(40.3, 40.7), seed_at(190.0, 120.0)]);
+    let (small, lifted) = (verdict(&m, 0), verdict(&m, 1));
+    assert!(!small.plateau && small.saturated, "{small:?}");
+    assert!(lifted.plateau && lifted.excluded >= 9 && lifted.saturated, "{lifted:?}");
 }
 
 #[test]
 fn all_saturated_sample_leaves_the_frame_statistic_empty_not_wrong() {
-    let stars: Vec<MoffatStar> = (0..12).map(|i| MoffatStar { x: 30.0 + (i % 4) as f64 * 50.0, y: 30.0 + (i / 4) as f64 * 50.0,
-        amp: 3.0, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }).collect();
-    let mut data = moffat_field(220, 170, &stars, 4.0, 0.05); clipped(&mut data, 0.95); add_noise(&mut data, 0.002, 5);
-    let seeds: Vec<Seed> = stars.iter().map(|s| Seed { x: s.x, y: s.y, peak: 0.9, flux: 1.0 }).collect();
+    let (data, seeds) = twelve_clipped();
     let m = measure_plane(&data, 220, 170, &MeasureOptions { seeds: SeedSpec::Given(seeds), psf_model: PsfModel::Moffat4, ..Default::default() }, None);
     assert_eq!(m.frame.stars_fitted, 12);
     assert_eq!(m.frame.stars_unsaturated, 0);
@@ -2414,7 +2552,8 @@ fn all_saturated_sample_leaves_the_frame_statistic_empty_not_wrong() {
 
 #[test]
 fn beta_sample_skips_saturated_stars() {
-    // 70 Moffat-4 stars, the 40 brightest clipped: the discrete Auto search must still resolve 4.0 (the baseline flipped to 10)
+    // 70 Moffat-4 stars, the 40 brightest clipped: the discrete Auto search must still resolve 4.0 (the baseline
+    // flipped to 10); R2: 40 of 40 flagged, 0 of 30
     let stars: Vec<MoffatStar> = (0..70).map(|i| MoffatStar { x: 20.0 + (i % 10) as f64 * 40.3, y: 20.0 + (i / 10) as f64 * 40.7,
         amp: if i < 40 { 2.0 } else { 0.25 }, alpha_x: 5.0, alpha_y: 5.0, theta: 0.0 }).collect();
     let mut data = moffat_field(420, 320, &stars, 4.0, 0.05); clipped(&mut data, 0.95); add_noise(&mut data, 0.002, 6);
@@ -2426,6 +2565,10 @@ fn beta_sample_skips_saturated_stars() {
 ```
 
 - [ ] **Step 2: Run, fail, implement, run.** Re-pin the measure.rs literals (by design: the statistic's population).
+  A fixture premise that does not hold on the module's region (the comments quote R2's port, which used the box
+  ± ceil(6F)) is a STOP with the verdict's fields, not a retuned fixture. Report the Measure-stage wall time on one
+  real calibrated frame, before (51021d06) and after (C-b); any restriction for speed goes to the owner with those
+  numbers.
 
 - [ ] **Step 3: Lab cycle** `t08-f3`. Design list: `{"row":7,"path":"measure","kind":"set-aside"}`,
   `{"row":7,"path":"betas@*","kind":"set-aside"}` (the statistic's population), `{"row":11,"path":"measure","kind":"set-aside"}`,
@@ -2435,28 +2578,34 @@ fn beta_sample_skips_saturated_stars() {
   `{"row":3,"family":"twins/*","path":"measure","kind":"set-aside"}`, `{"row":3,"family":"twins/*","path":"betas@*","kind":"set-aside"}`,
   `{"row":1,"path":"register","kind":"reported"}`, `{"row":2,"path":"register","kind":"one-sided","keys":["bias_x","bias_y","scatter_x","scatter_y"]}` (F10). Row 1
   `bright coverage (300)` is JUDGED within SE (it counts saturated stars, N-5 — unchanged by design; ruling F20
-  removed it from the list).
+  removed it from the list). Open item 4 may add a row-1 `fit outcomes` entry.
 
 - [ ] **Step 4: Read the bars** (`bars.txt`):
-  - self-consistency (row 10 `saturation flag vs truth`, pooled over every family × `measure`): false positives
-    ≤ 1 % of truth-unsaturated stars; false negatives 0 among stars with `clipped_core_px ≥ 3`; the
-    `neighbour_only`, `gray`, `under_3_core` and `wing_fit_missing` counts are printed beside (the v2 i0 truth has 81
+  - self-consistency (row 10 `saturation flag vs truth`, pooled over every family × `measure`; C-d): false
+    negatives ≤ 0.5 % among truth-saturated stars with `clipped_core_px ≥ 3`; false positives reported as a count
+    and a share of the truth-unsaturated stars, no bar (R2: 0.6–0.8 %, 7.5 % under 30 % vignetting); the
+    `neighbour_only`, `gray`, `under_3_core` and `mostlySaturated` counts printed beside (the v2 i0 truth has 81
     neighbour-only and 25 gray of 4105 saturated — reported, not judged);
+  - the payoff (C-d, reported): the verdict fit's |ΔFWHM|/FWHM vs truth (median / p90) over truth-saturated stars
+    whose plateau test passed, beside those whose test failed (R2 on exact ties: 2.2 / 9.9 % censored, 30.9 /
+    66.2 % on the failed ones);
   - twins (row 11, `base vs deep (2x flux)`): frame |ΔFWHM|/FWHM ≤ 1 % on every `twins/sharp/*` and `twins/mixture/*`
     family (baseline `twins/sharp/m4/f2.0` 9.99 %, `twins/sharp/m2.5/f1.6` 15.93 %, `twins/sharp/m4/f2.6` 2.93 %,
     `twins/mixture/b` 2.62 %); `auto beta agrees` 100 % of pairs on every family (β discrete: zero flips; baseline
     0.0 % of 1 pair on five families) — the twin rows are judged AGAIN at Task 9 (N-6), where "void at the cap" may
     apply.
 
-- [ ] **Step 5: Record R-OSP-5 (PA-8's constants, the per-seed order seeds → field width → verdicts → β sample →
-  fits, the field width's absence of any saturation test with its cost, and the row); commit.**
+- [ ] **Step 5: Record R-OSP-5 and commit.** R-OSP-5 records spec §2.1's test with its constants (5σ, 0.7, 0.1,
+  3 of 8 / 8 of 8, iterations ×3, n ≤ 8), the two substitutes (σ, pixel0) and the known limit with its three
+  consumers. It also records the per-seed order seeds → field width → verdicts → β sample → fits at β, the field
+  width's absence of any saturation test with its cost, the row, the payoff and the Measure wall time.
 
 ```
-fix(star_measure): F-3 one saturation test per seed after the field width (raw clip clause + the flat-top wing test, ruling R-OSP-5); the beta sample and the frame statistic use unsaturated stars (twins: <cells>; flag FP/FN: <cells>)
+fix(star_measure): F-3 one saturation test per seed after the field width (the plateau test, a censored free-beta verdict fit, flagged when its amplitude tops the plane's range; ruling R-OSP-5); the beta sample and the frame statistic use unflagged stars (twins: <cells>; flag FN/FP: <cells>)
 ```
 
-**Acceptance:** FP ≤ 1 %, FN 0 on ≥ 3-clipped-core stars; every twin family ≤ 1 % with zero flips; both diffs 0
-moved outside the design list; control 0.
+**Acceptance:** FN ≤ 0.5 % on ≥ 3-clipped-core stars, with FP and the payoff reported; every twin family ≤ 1 % with
+zero flips; both diffs 0 moved outside the design list; control 0; the Measure wall time before and after reported.
 
 ---
 
@@ -2472,8 +2621,9 @@ moved outside the design list; control 0.
   rule), the step clamp in ln β to `[ln_min, ln_max]`, `MoffatExponent::new(exp(params[7]))`; tests.
 - athenaeum: `star_measure/beta.rs` (continuous; `frame_beta` takes `&FitStarsOptions` — ruling F45),
   `star_measure/fit.rs` (`BETA_AT_CAP`), `star_measure/mod.rs` (`BetaSource`, `PlaneMeasurement.beta_source`),
-  `star_measure/photometry.rs` (`region_verdict`'s wing fit swaps to `fit_moffat_2d_bounded` with `BETA_BOUNDS`,
-  I-3), `stacking/psf_signal.rs` (`PsfModel::Auto` doc, `group_beta` doc: the lower median of continuous βs —
+  `star_measure/photometry.rs` (the verdict fit uses the bounded one: `saturation_verdict` swaps to
+  `fit_moffat_2d_bounded` with `BETA_BOUNDS`, PA-23; the former "bounded wing fit", I-3, is superseded by C-a, owner
+  2026-10-09), `stacking/psf_signal.rs` (`PsfModel::Auto` doc, `group_beta` doc: the lower median of continuous βs —
   still "always one of the members' own βs"), `stacking/measure.rs` (hand edit: doc only),
   `src/components/stacking/panels/MeasurePanel.tsx` + `stageSummary.ts` (`psfModelLabel('auto')` → "Auto (per-frame
   β)", help text), `rustafits` submodule pointer, `Cargo.lock` (unchanged: path dep, same version),
@@ -2498,7 +2648,8 @@ pub fn fit_moffat_2d_bounded(pixels: &[PixelSample], init_b: f64, init_a: f64, i
 - Produces (athenaeum): `beta::BETA_BOUNDS: (f64, f64) = (1.5, 100.0)`; `beta::frame_beta(plane, w, h, sample: &[Seed],
   opts: &FitStarsOptions, pool) -> (f64, BetaSource)` = the median of the bounded free-β fits of the 64 brightest
   unsaturated sample seeds (≥ 8 accepted fits, else `(4.0, BetaSource::Fallback)` with a `warn!`), clamped to the
-  bounds; `BetaSource::{Fitted { sample: usize }, Fallback, Fixed}`; `StarFit.flags |= BETA_AT_CAP` when the frame
+  bounds. Those free-β fits are the seeds' verdict fits (C-b, PA-23): `frame_beta` reads their β and does not fit
+  them a second time. Its signature for a caller that ran no verdicts is Task 8 open item 7; `BetaSource::{Fitted { sample: usize }, Fallback, Fixed}`; `StarFit.flags |= BETA_AT_CAP` when the frame
   β sits at a bound. `PsfModel::Auto` → `frame_beta`; `Moffat4`/`Fixed(b)` unchanged. `group_beta`: unchanged
   code (any number). `FitDiagnostics.iterations` filled from the bounded fit's `iters` on the sample; `None` on
   the fixed-β pass still (the fixed entry point reports none).
@@ -2607,9 +2758,9 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
   `{"row":7,"path":"measure","kind":"set-aside"}`, `{"row":7,"path":"betas@*","kind":"set-aside"}`,
   `{"row":11,"path":"measure","kind":"set-aside"}`, `{"row":11,"path":"betas@*","kind":"set-aside"}`,
   `{"row":10,"metric":"auto beta vs saturated top-64 seeds","path":"measure","kind":"set-aside"}`,
-  `{"row":10,"metric":"saturation flag vs truth","path":"measure","kind":"set-aside"}` (the wing fitter changed, I-3;
-  the F-3 bar is read again here and must still hold), `{"row":1,"metric":"fit outcomes","path":"measure","kind":"set-aside"}`
-  (a formerly `None` wing fit now flags or not), `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`,
+  `{"row":10,"metric":"saturation flag vs truth","path":"measure","kind":"set-aside"}` (the verdict fit moved to the
+  bounded fitter, PA-23; the F-3 bar is read again here and must still hold), `{"row":1,"metric":"fit outcomes","path":"measure","kind":"set-aside"}`
+  (the bounded verdict fit and the continuous β change which seeds are refused and flagged), `{"row":6,"metric":"captured fraction","path":"measure","kind":"set-aside"}`,
   `{"row":6,"metric":"captured fraction","path":"betas@*","kind":"set-aside"}` (the FWTM ellipse follows β),
   `{"row":4,"metric":"floor","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"floor","path":"betas@*","kind":"set-aside"}`,
   `{"row":4,"metric":"ecc","path":"measure","kind":"set-aside"}`, `{"row":4,"metric":"ecc","path":"betas@*","kind":"set-aside"}`,
@@ -2635,8 +2786,8 @@ analysis: fit_moffat_2d_bounded - a free-beta Moffat fit in ln beta with caller 
     `raw/corpus` plane 1 +9.06 %, mosaics plane 2 −5.85 %); a VNG-plane row (planes 1/2 of mosaics) that misses is
     reported under the out-of-scope VNG item, not judged (spec §3 "Out of scope");
   - row 3's `beta sensitivity` line stays (the discrete arm is a lab diagnostic);
-  - F-3's self-consistency row again with the bounded wing fitter: FP ≤ 1 %, FN 0 on ≥ 3-clipped-core stars, and
-    `wing_fit_missing` printed (expected to fall: the bounded fit returns on Gaussian-like wings).
+  - F-3's self-consistency row again with the verdict fit on the bounded fitter (PA-23, C-d): FN ≤ 0.5 % on
+    ≥ 3-clipped-core stars; FP (count and share), the payoff and the `mostlySaturated` refusals reported, no bar.
 
 - [ ] **Step 5: The UI label, README R-OSP-6, commit** (athenaeum: the module, the pointer, the UI; lab results).
 
@@ -3359,7 +3510,7 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | §2.1 `budget` | 12 |
 | §2.1 `diagnostics` | 4 |
 | §2.1 public surface `measure_plane`, `fit_stars_at`, `MEASURE_VERSION` | 2, 3 |
-| §2.1 the saturation test (clip clause, flat-top, truth flag, self-consistency row, per-seed verdict F9) | 1b (row), 8, 9 (the bounded wing fit) |
+| §2.1 the saturation test as revised 2026-10-09 (plateau test, level, censored free-β verdict fit on every seed, flag A > range, known limit, truth flag, self-consistency row FN ≤ 0.5 %, FP reported; per-seed order F9; PA-23 supersedes PA-8) | 1b (row), 8, 9 (the verdict fit on the bounded fitter) |
 | §2.1 exemptions (LN L-14/L-23/peak-SNR, registration cuts) | untouched (2, 10 leave `ln/selection.rs`, `register/detect.rs` as they are) |
 | §2.2 stacking adapter, `psf_signal` formulas, LN refit via `fit_stars_at`, master statistics | 2, 6a (`field_width_of` for given seeds), 10 |
 | §2.2 `stars_fitted` meaning, unsaturated statistic, `stars_refused` + per-reason counts | 4, 8 |

@@ -5,7 +5,8 @@ Important 12, Minor 14 — all folded in). Program: star measurement (part 1 was
 the former parts 2 and 3). Baseline: `docs/superpowers/research/2026-10-07-star-measurement-baseline.md` (lab
 athenaeum-lab e65af49, probes from f5321979); the path comparison below is
 `star-lab/results/baseline-2026-10-07/path-compare.txt` (lab 5fc780c, computed from the committed summary and
-the existing probe outputs). A second independent re-review (N-1…N-9) is folded in as well.
+the existing probe outputs). A second independent re-review (N-1…N-9) is folded in as well. Revised 2026-10-09:
+§2.1's saturation test is replaced (owner rulings 2026-10-09) after the flat-top test failed on lab truth.
 
 ## 1. Goal and owner decisions
 
@@ -68,19 +69,57 @@ Public surface: `measure_plane(plane, opts) -> PlaneMeasurement` (stars, frame a
 counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, opts)`. The module exports
 `MEASURE_VERSION` (§4.4).
 
-**The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike):**
-- where the clip is known (raw ADU: from BITPIX/BZERO, or DATAMAX when present), the star's peak pixel ≥
-  `saturation_fraction` × the clip;
-- in every domain, a flat-top test on the star's own core: the core is flatter than the star's own profile by more
-  than the local noise — the profile is a free-β fit on the star's non-core pixels (not a fit at the frame's β, which
-  this flag helps choose), it overshoots the observed maximum, and several core pixels sit within the noise of that
-  maximum. A calibrated plane's clip level varies per pixel after the flat division
-  ("saturated cores above 1.0 are legal", `docs/stacking/README.md`), so no plane-relative threshold is used here.
+**The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike;
+revised 2026-10-09).** The method an established stacking program uses, adopted as is (owner ruling 2026-10-09)
+after the earlier flat-top test failed on lab truth. Two of its inputs are the module's own substitutes, named
+below; there is no raw-clip clause and no `saturation_fraction`.
+
+Per plane, in the module's working units:
+- **bg** = the plane's median; **σ** = the plane's MRS noise (`domain`), the substitute for the reference method's
+  background-noise estimate; **threshold** = bg + 5σ;
+- **norm** = the plane's full scale: 1.0 in the unit domain, 2^bits − 1 for integer raw ADU (65535 for BITPIX 16);
+  **range** = min(plane max, norm) − bg.
+
+Per seed (every seed gets the whole test, as the reference method fits every candidate):
+- **The plateau test at the seed pixel.** pixel0 = the pixel at the rounded seed centre, the substitute for the
+  reference method's own pick: the matched filter's peak is, like that pick, the local maximum of a smoothed plane.
+  Of pixel0's 8 neighbours, those ≥ threshold count: a mono plane needs ≥ 3 of them, a colour plane all 8; meanhigh
+  and minhigh are their mean and minimum. The test passes when meanhigh − bg ≥ 0.7·range AND
+  pixel0 − minhigh ≤ 0.1·range.
+- **The level** = min(pixel0, norm) − 0.1·range when the plateau test passes, else norm.
+- **The verdict fit**: a free-β Moffat on the seed's own region (F-1) with every pixel ≥ the level excluded (left
+  out of the fit, never modelled as clipped). The iteration limit is ×3 when anything is excluded. When no more
+  pixels remain than the fit has parameters, the seed is refused with its own `FitDiagnostics` reason.
+- **The flag**: saturated when the verdict fit's amplitude A > range. The plateau test only sets the level; the
+  flag always comes from the fit.
+
+Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample, the width start
+and the frame statistic use unflagged stars only (F-3). The unflagged bright seeds' verdict fits are the β sample's
+free-β fits (F-4), and every star is then fitted at the frame β.
+
+**Known limit (owner ruling 2026-10-09).** A star with a small clipped core (3–5 px) fails the full-3×3 plateau
+test, so its verdict fit runs uncensored. It is still flagged (its fitted A exceeds the range), but its own FWHM is
+not trusted (+31 % median in the lab). No consumer reads it:
+- the frame statistics exclude flagged stars;
+- the Analysis tab (Plan C) takes unsaturated stars;
+- registration takes centroids.
+
+Where the plateau test passes, the censored fit reads the width within 2.2 % median (9.9 % p90) against 41 %
+uncensored (lab research 2026-10-09, exact ties).
+
+The range is plane-relative and capped at norm. A calibrated plane's clip level varies per pixel after the flat
+division ("saturated cores above 1.0 are legal", `docs/stacking/README.md`); the cap is what keeps the test working
+there (lab, 30 % vignetting: 99.95 % of the clipped stars flagged).
+
 - Bars that say "unsaturated" mean the truth's `saturated` flag (the star reaches the generator's clip,
-  `families.py`); one self-consistency row checks the module's flag against it: false positives ≤ 1 % of the
-  truth-unsaturated stars; false negatives 0 among the stars with at least 3 clipped core pixels in the noisy image.
+  `families.py`); one self-consistency row checks the module's flag against it: false negatives ≤ 0.5 % among the
+  truth-saturated stars with at least 3 clipped core pixels in the noisy image; false positives are reported as a
+  count and a share of the truth-unsaturated stars, with no bar. The test flags some bright unsaturated stars by
+  design: a plane's brightest star when its own peak sets the range, a sharp star whose model peak tops its
+  brightest pixel, and, through the cap, a star the flat division lifts above full scale (lab: 0.6–0.8 %, 7.5 %
+  under 30 % vignetting).
   The truth flag also marks stars a neighbour clips and stars that barely reach the clip (in the v2 i0 truth: 81 of
-  4105 saturated only through a neighbour, 25 within 2 % of the clip); no core test sees those, and they are
+  4105 saturated only through a neighbour, 25 within 2 % of the clip); no per-star test sees those, and they are
   reported as counts, not judged.
 
 **Exemptions (unchanged consumers of the numbers, not callers of the module's tests):** LN keeps its L-14 relative
@@ -226,8 +265,10 @@ All NOT NULL columns of `frame_analysis` and the `star_metrics` row (`db/schema.
 
 ### 4.5 Settings → Analysis
 
-- Kept: the star budget (`maxStars`, default 500; `measureCap` folds into it), the saturation fraction, the trail
-  threshold, batch concurrency, and the frontend rejection defaults.
+- Kept: the star budget (`maxStars`, default 500; `measureCap` folds into it), the trail threshold, batch
+  concurrency, and the frontend rejection defaults.
+- The saturation fraction has no reader once §2.1's test lost its clip clause (2026-10-09); whether it is removed
+  with the fields below is decided before Plan C.
 - The detection threshold becomes a new field in the matched filter's units (its default set from the lab); the
   stored `detectionSigma` measured the retired detector's peak threshold and is ignored (named in the release
   note).
@@ -302,5 +343,5 @@ At the end: one full uniform lab run (all gates, the full scorecard) and an "aft
   frames on the new numbers, the gate is reported to the owner with those numbers before any default changes.
 - **F-1 on real defocus.** A heavily defocused (annular) star is not a Moffat; such frames get refusals with reasons
   and a frame FWHM only from the stars that fit, possibly none. The Analysis tab shows the refusal count.
-- **Speed.** Matched-filter detection, per-star width starts and the free-β sample fit add cost; the 0.6 s and +20 %
-  bars hold them.
+- **Speed.** Matched-filter detection, per-star width starts and the free-β verdict fit on every seed (§2.1) add
+  cost; the 0.6 s and +20 % bars hold them.
