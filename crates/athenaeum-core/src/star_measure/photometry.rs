@@ -12,8 +12,9 @@
 //! 2. **The verdict fit** ([`saturation_verdict`]): a free-β Moffat on the region's pixels below the level, the
 //!    iteration limit ×3 when any pixel is excluded; no more pixels than the fit's 8 parameters refuses the seed
 //!    [`RefusalReason::MostlySaturated`]. From Task 9 (F-4, ruling R-OSP-6) it is rustafits' bounded fit
-//!    (`fit_moffat_2d_bounded`: ln β in [`BETA_BOUNDS`], start β [`BETA_START`], the corrected θ column), and the
-//!    unflagged bright seeds' verdict β are the frame β's sample ([`super::beta`]).
+//!    (`fit_moffat_2d_bounded`: ln β in [`BETA_BOUNDS`], start β [`BETA_START`], the corrected θ column), a point
+//!    model; the unflagged bright seeds are the frame β's sample, each re-fitted on the same pixels from the same
+//!    starts with the pixel-integrated model ([`integrated_beta`], the owner's E5; [`super::beta`]).
 //! 3. **The flag**: the verdict fit's amplitude above the range. The plateau test only sets the level.
 //!
 //! 4. **The cross-plane rule** (owner ruling 2026-10-09): on an image of more than one plane, a star flagged on any
@@ -215,7 +216,9 @@ pub struct SaturationVerdict {
     pub excluded: u32,
     /// The verdict fit's A (working units).
     pub amplitude: f64,
-    /// Its free β, inside [`BETA_BOUNDS`] (the frame β's sample reads it, C-b).
+    /// Its free β, inside [`BETA_BOUNDS`]: the point model's, reported (the probe's verdict line). The frame β's
+    /// sample does not read it: a sample star is re-fitted pixel-integrated ([`integrated_beta`], E5), because the
+    /// point model reads an undersampled star's β high.
     pub beta: f64,
     /// Its FWHM, `√(fwhm_x·fwhm_y)` (the payoff reads it, C-d).
     pub fwhm: f64,
@@ -258,33 +261,10 @@ pub(crate) fn saturation_verdict(
     let plateau = plateau_level(region, seed_x, seed_y, plane);
     let level = plateau.unwrap_or(plane.norm);
     let kept = &mut scratch.verdict;
-    kept.clear();
-    let mut peak = f64::NEG_INFINITY;
-    let mut excluded = 0u32;
-    for s in region {
-        peak = peak.max(s.value);
-        if s.value >= level {
-            excluded += 1;
-        } else {
-            kept.push(PixelSample {
-                x: s.x,
-                y: s.y,
-                value: s.value,
-            });
-        }
-    }
-    if kept.len() <= VERDICT_FIT_PARAMS {
+    let Some((a0, excluded)) = verdict_pixels(region, level, b0, kept) else {
         return Err(RefusalReason::MostlySaturated);
-    }
-    let a0 = (peak - b0).max(1e-9);
-    for s in kept.iter_mut() {
-        s.value = (s.value - b0) / a0;
-    }
-    let max_iter = if excluded > 0 {
-        EXCLUDED_ITERATION_FACTOR * params.max_iter
-    } else {
-        params.max_iter
     };
+    let max_iter = verdict_max_iter(excluded, params);
     let sigma = f_start / GAUSSIAN_FWHM_PER_SIGMA;
     let mut verdict = SaturationVerdict {
         plateau: plateau.is_some(),
@@ -312,6 +292,7 @@ pub(crate) fn saturation_verdict(
         max_iter,
         params.conv_tol,
         params.max_rejects,
+        1,
     ) else {
         return Ok(verdict);
     };
@@ -332,6 +313,92 @@ pub(crate) fn saturation_verdict(
     verdict.saturated = amplitude > plane.range;
     verdict.fit = true;
     Ok(verdict)
+}
+
+/// The verdict fit's pixels (spec §2.1): the region's pixels below `level`, conditioned `(v − b0)/a0` into `kept`
+/// (cleared first), with `a0` = the region's maximum − `b0` (at least 1e-9) — the maximum over every region pixel, the
+/// excluded ones included. `Some((a0, excluded))`, or `None` when no more pixels remain than the fit's 8 parameters.
+fn verdict_pixels(
+    region: &[PixelSample],
+    level: f64,
+    b0: f64,
+    kept: &mut Vec<PixelSample>,
+) -> Option<(f64, u32)> {
+    kept.clear();
+    let mut peak = f64::NEG_INFINITY;
+    let mut excluded = 0u32;
+    for s in region {
+        peak = peak.max(s.value);
+        if s.value >= level {
+            excluded += 1;
+        } else {
+            kept.push(PixelSample {
+                x: s.x,
+                y: s.y,
+                value: s.value,
+            });
+        }
+    }
+    if kept.len() <= VERDICT_FIT_PARAMS {
+        return None;
+    }
+    let a0 = (peak - b0).max(1e-9);
+    for s in kept.iter_mut() {
+        s.value = (s.value - b0) / a0;
+    }
+    Some((a0, excluded))
+}
+
+/// The verdict fit's iteration limit: `params.max_iter`, ×[`EXCLUDED_ITERATION_FACTOR`] when any pixel is excluded.
+fn verdict_max_iter(excluded: u32, params: &FitParams) -> usize {
+    if excluded > 0 {
+        EXCLUDED_ITERATION_FACTOR * params.max_iter
+    } else {
+        params.max_iter
+    }
+}
+
+/// One sample star's β for the frame β (F-4 as revised by the owner's ruling E5, 2026-10-09; ruling R-OSP-6): the
+/// verdict fit's own problem — the region's pixels below `level` (the verdict's level), conditioned as
+/// [`saturation_verdict`] conditions them, started at B = 0, A = 1, the seed, round at `σ = f_start/2.3548`, θ = 0
+/// and β [`BETA_START`], in [`BETA_BOUNDS`], with the verdict's iteration budget — fitted with the PIXEL-INTEGRATED
+/// bounded free-β Moffat at `k = `[`super::beta::sample_subsample`]`(f_start)` sub-samples per pixel side. The point
+/// model reads an undersampled star's β high (its pixels integrate a flatter core); the integrated one does not.
+/// `None` when no more pixels remain than the fit's 8 parameters, or when the fit fails the verdict fit's own
+/// acceptance (no fit; a non-finite or non-positive amplitude or width; a non-finite β). A β at a bound is a fit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn integrated_beta(
+    region: &[PixelSample],
+    seed_x: f64,
+    seed_y: f64,
+    b0: f64,
+    f_start: f64,
+    level: f64,
+    params: &FitParams,
+    scratch: &mut FitScratch,
+) -> Option<f64> {
+    let kept = &mut scratch.verdict;
+    let (_, excluded) = verdict_pixels(region, level, b0, kept)?;
+    let sigma = f_start / GAUSSIAN_FWHM_PER_SIGMA;
+    let m = fit_moffat_2d_bounded(
+        kept,
+        0.0,
+        1.0,
+        seed_x,
+        seed_y,
+        sigma,
+        sigma,
+        0.0,
+        BETA_START,
+        BETA_BOUNDS,
+        verdict_max_iter(excluded, params),
+        params.conv_tol,
+        params.max_rejects,
+        super::beta::sample_subsample(f_start),
+    )?;
+    let fwhm = (m.fwhm_x() * m.fwhm_y()).sqrt();
+    (m.a.is_finite() && m.a > 0.0 && m.beta.is_finite() && fwhm.is_finite() && fwhm > 0.0)
+        .then_some(m.beta)
 }
 
 #[cfg(test)]

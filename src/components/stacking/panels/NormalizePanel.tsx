@@ -14,7 +14,7 @@ import { NumericField } from '../NumericField';
 import { LN_SCALES, apertureLabel, effectiveScaleMode, fluxEstimatorLabel, resolvedScaleLines } from './lnScale';
 import { Checkbox } from '../../settings/Checkbox';
 import { ParamPair } from '../ParamPair';
-import { outputNormLabel, psfModelLabel, rejectionNormLabel } from '../stageSummary';
+import { normalizePsfModelLabel, outputNormLabel, rejectionNormLabel } from '../stageSummary';
 import type { LnAperture, LnFluxEstimator, OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
 
 const OUTPUT_NORMS: OutputNormalization[] = [
@@ -291,11 +291,11 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
                 className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
               >
                 {PSF_MODELS.map((v) => (
-                  <option key={v} value={v}>{psfModelLabel(v)}</option>
+                  <option key={v} value={v}>{normalizePsfModelLabel(v)}</option>
                 ))}
               </select>
               <p className="mt-1 text-[11px] text-content-muted">
-                default {psfModelLabel(defaults.normalization.local.psfModel)}
+                default {normalizePsfModelLabel(defaults.normalization.local.psfModel)}
               </p>
             </div>
 

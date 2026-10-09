@@ -27,7 +27,8 @@
 //! `--diagnostics` the measure path also writes one line per refused seed,
 //! `{kind: refused, path, plane, seed (the seed line's i), reason,
 //! regionRadius, backgroundStart, widthStart, growthSteps, iterations,
-//! converged}`.
+//! converged}` — `iterations` is the bounded verdict fit's LM iterations
+//! (null where no verdict fit succeeded), `converged` the fit at β's flag.
 //!
 //! F-1 seeds (Plan A Task 6a, ruling F3): the measure path's seeds come from
 //! `--seeds` (`matched` = `SeedSource::MatchedFilter` at `--seed-threshold`;
@@ -56,13 +57,16 @@
 //! plane's verdicts); the measure frame line also carries `crossFlags` and
 //! its `wallMs` is the plane's own share of the call.
 //!
-//! F-4 (Plan A Task 9, ruling R-OSP-6): the measure path's β is continuous
-//! (`Auto`, the median bounded free-β verdict fit of the unflagged bright
-//! seeds); its frame line carries `betaSource` (`fitted` | `fallback` |
-//! `fixed`) and `betaSample` (the fits the median is over, null unless
-//! `fitted`), and every star line's `flags` may name `betaAtCap`. The betas
-//! arm keeps the discrete ladder (`--betas`, default 2.5,4,6,10) as row 3's
-//! β-sensitivity diagnostic.
+//! F-4 (Plan A Task 9, ruling R-OSP-6, revised by the owner's E5): the
+//! measure path's β is continuous (`Auto`, the median of the pixel-integrated
+//! bounded free-β fits of the unflagged bright seeds, each on its verdict
+//! fit's own pixels); its frame line carries `betaSource` (`fitted` |
+//! `fallback` | `fixed`) and `betaSample` (the fits the median is over, null
+//! unless `fitted`), and every star line's `flags` may name `betaAtCap`. With
+//! `--diagnostics` a sample star's line (star or refused) also carries
+//! `sampleBeta`, its own integrated fit's β; no other line has the key. The
+//! betas arm keeps the discrete ladder (`--betas`, default 2.5,4,6,10) as
+//! row 3's β-sensitivity diagnostic.
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -234,12 +238,21 @@ fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
         Outcome::NotSelected => "notSelected",
         Outcome::Trimmed => "trimmed",
     };
-    Some(json!({
+    let mut line = json!({
         "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "reason": reason,
         "regionRadius": d.region_radius, "backgroundStart": n_or_null(d.background_start / ADU_SCALE as f64),
         "widthStart": n_or_null(d.width_start), "growthSteps": d.growth_steps, "iterations": d.iterations,
         "converged": d.converged, "verdict": verdict_json(d.verdict),
-    }))
+    });
+    insert_sample_beta(&mut line, d);
+    Some(line)
+}
+
+/// A frame β sample star's own integrated fit β (F-4, E5): `sampleBeta` on its line, only where the record has one.
+fn insert_sample_beta(line: &mut Value, d: &FitDiagnostics) {
+    if let (Some(b), Some(obj)) = (d.sample_beta, line.as_object_mut()) {
+        obj.insert("sampleBeta".into(), n_or_null(b));
+    }
 }
 
 /// `--seeds` (Plan A Task 6a): which detector seeds the measure path.
@@ -540,6 +553,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
                     obj.insert("seed".into(), json!(d.seed));
                     obj.insert("verdict".into(), verdict_json(d.verdict));
+                    if let Some(b) = d.sample_beta {
+                        obj.insert("sampleBeta".into(), n_or_null(b));
+                    }
                 }
                 emit(line)
             }

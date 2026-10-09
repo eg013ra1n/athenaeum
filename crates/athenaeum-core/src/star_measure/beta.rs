@@ -3,11 +3,19 @@
 //! brightest unsaturated stars, clamped to the bounds; every star is then fitted at it. The Gaussian is the large-β
 //! limit (a Gaussian frame reads at or near the cap), never a separate model, so β is a finite number everywhere.
 //!
-//! On the measure path those fits are the seeds' saturation verdict fits (C-b, PA-23): the sample is the
-//! [`AUTO_SAMPLE`] brightest seeds whose verdict fit succeeded unflagged, and their β is read, not fitted a second
-//! time ([`verdict_beta`]). A caller that ran no verdict — LN's reference fit through `fit_stars`, Plan C's green
-//! sites (ruling F45) — gets its own sample from the same starts (Q7, [`frame_beta`]). Fewer than
-//! [`BETA_MIN_FITS`] accepted fits: [`BETA_FALLBACK`], [`BetaSource::Fallback`], with a `warn!`.
+//! **The sample's fit is pixel-integrated** (the owner's ruling E5, 2026-10-09): a point Moffat fitted to a star whose
+//! pixels integrate its light reads β high, more so the fewer pixels its FWHM spans (m2.5: 3.5 at FWHM 1.2 px, 2.8 at
+//! 2.6 px), so each sample star is fitted with the model and its Jacobian averaged over `k × k` midpoint sub-samples
+//! per pixel, `k = clamp(⌈10 / F_start⌉, 3, 9)` ([`sample_subsample`]). The point model stays everywhere else: the
+//! saturation verdict fit and every star's fit at β.
+//!
+//! On the measure path the sample is the [`AUTO_SAMPLE`] brightest seeds whose verdict fit succeeded unflagged
+//! (C-b, PA-23; [`sample_seeds`]), and each is re-fitted on the verdict fit's own problem — its region, minus the
+//! pixels its level excluded, from its starts, with its iteration budget ([`verdict_beta`],
+//! `photometry::integrated_beta`). A caller that ran no verdict — `fit_stars` (tests and probes; a run's LN reference
+//! fit is handed the group β), Plan C's green sites (ruling F45) — fits its own sample of the brightest seeds the same
+//! way (Q7, [`frame_beta`]). Fewer than [`BETA_MIN_FITS`] accepted fits: [`BETA_FALLBACK`],
+//! [`BetaSource::Fallback`], with a `warn!`.
 //!
 //! Through Task 8 this module held the discrete `Auto` search over [`AUTO_BETAS`] (moved from `psf_signal` in Task
 //! 2); the ladder stays as the probe's betas arm (row 3's β sensitivity), which no production path reads.
@@ -17,7 +25,6 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::fit::{self, FitParams, Seed, SeedPass};
-use super::photometry::SaturationPlane;
 use super::FitStarsOptions;
 
 /// The discrete β ladder the `Auto` search used through Task 8; now the probe's betas arm only.
@@ -28,18 +35,35 @@ pub const AUTO_SAMPLE: usize = 64;
 /// Gaussian star reads −0.32 % in FWHM.
 pub const BETA_BOUNDS: (f64, f64) = (1.5, 100.0);
 /// The bounded verdict fit's start β (the free arm's start through Task 8, so only the parametrisation, the bounds
-/// and the θ column changed).
+/// and the θ column changed), and the sample fit's.
 pub const BETA_START: f64 = 3.0;
 /// Fewer accepted fits in the sample than this: [`BETA_FALLBACK`].
 pub const BETA_MIN_FITS: usize = 8;
 /// The β of a frame whose sample is too small ([`BetaSource::Fallback`]).
 pub const BETA_FALLBACK: f64 = 4.0;
+/// The sample fit's sub-samples per pixel side (E5): `⌈SAMPLE_SUBSAMPLE_PX / F_start⌉`, clamped to
+/// [`SAMPLE_SUBSAMPLE_RANGE`] — about 10 sub-samples across the star's FWHM.
+pub const SAMPLE_SUBSAMPLE_PX: f64 = 10.0;
+/// The clamp of [`sample_subsample`]: at least 3 per side (a well-sampled star still sees its pixels' curvature), at
+/// most 9 (81 model evaluations per pixel).
+pub const SAMPLE_SUBSAMPLE_RANGE: (usize, usize) = (3, 9);
+
+/// The sample fit's `k` for a star whose width start is `f_start` px (E5): `clamp(⌈10 / f_start⌉, 3, 9)`; a
+/// non-finite or non-positive width reads the clamp's end it tends to.
+pub fn sample_subsample(f_start: f64) -> usize {
+    let (lo, hi) = SAMPLE_SUBSAMPLE_RANGE;
+    let k = (SAMPLE_SUBSAMPLE_PX / f_start).ceil();
+    if k.is_nan() {
+        return lo;
+    }
+    k.clamp(lo as f64, hi as f64) as usize
+}
 
 /// Where a plane's β came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BetaSource {
-    /// `PsfModel::Auto`: the median of `sample` accepted bounded free-β fits ([`BETA_MIN_FITS`] ≤ `sample` ≤
-    /// [`AUTO_SAMPLE`]).
+    /// `PsfModel::Auto`: the median of `sample` accepted pixel-integrated bounded free-β fits ([`BETA_MIN_FITS`] ≤
+    /// `sample` ≤ [`AUTO_SAMPLE`]).
     Fitted { sample: usize },
     /// `PsfModel::Auto` with fewer than [`BETA_MIN_FITS`] accepted fits: β = [`BETA_FALLBACK`].
     Fallback,
@@ -72,9 +96,29 @@ pub fn at_bound(beta: f64) -> bool {
     beta <= BETA_BOUNDS.0 || beta >= BETA_BOUNDS.1
 }
 
-/// The frame β for a caller that ran no verdict (Q7, ruling F45): the bounded free-β fit — no saturation test, no
-/// exclusion, from the verdict fit's own starts ([`SaturationPlane::UNTESTED`]) — of the [`AUTO_SAMPLE`] brightest of
-/// `sample` (expected brightest-first), on `opts.mask` and from `opts.field_width` (else the seeds' own,
+/// A plane's β, where it came from, and the sample's accepted fits as `(seed index, integrated β)` in sample order
+/// (each sample star's [`super::FitDiagnostics::sample_beta`]); `fits` is empty for a caller's β.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SampleBeta {
+    pub(super) beta: f64,
+    pub(super) source: BetaSource,
+    pub(super) fits: Vec<(usize, f64)>,
+}
+
+impl SampleBeta {
+    /// The caller's β ([`BetaSource::Fixed`]): no sample.
+    pub(super) fn fixed(beta: f64) -> Self {
+        SampleBeta {
+            beta,
+            source: BetaSource::Fixed,
+            fits: Vec::new(),
+        }
+    }
+}
+
+/// The frame β for a caller that ran no verdict (Q7, ruling F45): the pixel-integrated bounded free-β fit (E5) — no
+/// saturation test, no exclusion, from the verdict fit's own starts — of the [`AUTO_SAMPLE`] brightest of `sample`
+/// (expected brightest-first), on `opts.mask` and from `opts.field_width` (else the seeds' own,
 /// `seeds::field_width_of`); the median of the accepted fits' β, clamped to [`BETA_BOUNDS`]; fewer than
 /// [`BETA_MIN_FITS`] → `(BETA_FALLBACK, BetaSource::Fallback)` with a `warn!`.
 pub fn frame_beta(
@@ -87,7 +131,8 @@ pub fn frame_beta(
 ) -> (f64, BetaSource) {
     let mask = opts.mask.as_deref();
     let field = fit::resolve_field_width(plane, w, h, sample, mask, opts.field_width);
-    sample_beta(plane, w, h, sample, &opts.fit, mask, field.fwhm_px, pool)
+    let s = sample_beta(plane, w, h, sample, &opts.fit, mask, field.fwhm_px, pool);
+    (s.beta, s.source)
 }
 
 /// [`frame_beta`] on a field width the caller already resolved (`fit_stars`'s, from every seed).
@@ -101,38 +146,57 @@ pub(super) fn sample_beta(
     mask: Option<&[bool]>,
     field_width: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (f64, BetaSource) {
+) -> SampleBeta {
     let sample = &seeds[..seeds.len().min(AUTO_SAMPLE)];
-    let passes = fit::seed_passes(
-        data,
-        w,
-        h,
-        sample,
-        mask,
-        field_width,
-        &SaturationPlane::UNTESTED,
-        p,
-        pool,
-    );
-    median_beta(passes.iter().filter_map(|v| match v.verdict {
-        Some(Ok(sv)) if sv.fit => Some(sv.beta),
-        _ => None,
-    }))
+    let betas = fit::own_sample_fits(data, w, h, sample, mask, field_width, p, pool);
+    let indices: Vec<usize> = (0..sample.len()).collect();
+    sample_median(&indices, &betas)
 }
 
-/// The measure path's frame β (C-b): the verdict β of the [`AUTO_SAMPLE`] brightest seeds whose verdict fit
-/// succeeded unflagged (own and cross-plane flags united first on a multi-plane image), median, clamped; fewer than
-/// [`BETA_MIN_FITS`] → the fallback. `passes` in seed order (brightest first).
-pub(super) fn verdict_beta(passes: &[SeedPass]) -> (f64, BetaSource) {
-    median_beta(
-        passes
-            .iter()
-            .filter_map(|v| match v.verdict {
-                Some(Ok(sv)) if sv.fit && !sv.saturated => Some(sv.beta),
-                _ => None,
-            })
-            .take(AUTO_SAMPLE),
-    )
+/// The measure path's frame β (C-b as revised by E5): the [`sample_seeds`] of `passes` (seed order, brightest first;
+/// cross-plane flags already united), each re-fitted with the pixel-integrated model on its verdict fit's own problem
+/// (`fit::sample_fits`); the median of the accepted fits' β, clamped; fewer than [`BETA_MIN_FITS`] → the fallback.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verdict_beta(
+    data: &[f32],
+    w: usize,
+    seeds: &[Seed],
+    p: &FitParams,
+    mask: Option<&[bool]>,
+    passes: &[SeedPass],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> SampleBeta {
+    let sample = sample_seeds(passes);
+    let betas = fit::sample_fits(data, w, seeds, mask, p, passes, &sample, pool);
+    sample_median(&sample, &betas)
+}
+
+/// The measure path's β sample (C-b): the indices of the [`AUTO_SAMPLE`] first seeds of `passes` (seed order,
+/// brightest first) whose verdict fit succeeded unflagged — an own or a cross-plane flag, a failed verdict fit, a
+/// `MostlySaturated` refusal or no verdict at all keeps a seed out.
+pub(super) fn sample_seeds(passes: &[SeedPass]) -> Vec<usize> {
+    passes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| match v.verdict {
+            Some(Ok(sv)) if sv.fit && !sv.saturated => Some(i),
+            _ => None,
+        })
+        .take(AUTO_SAMPLE)
+        .collect()
+}
+
+/// The frame β from the sample's fits: `betas[j]` is seed `sample[j]`'s integrated β, `None` = not accepted; the
+/// accepted ones' median ([`median_beta`]) and the fits themselves.
+fn sample_median(sample: &[usize], betas: &[Option<f64>]) -> SampleBeta {
+    debug_assert_eq!(sample.len(), betas.len());
+    let fits: Vec<(usize, f64)> = sample
+        .iter()
+        .zip(betas)
+        .filter_map(|(&i, b)| b.filter(|b| b.is_finite()).map(|b| (i, b)))
+        .collect();
+    let (beta, source) = median_beta(fits.iter().map(|&(_, b)| b));
+    SampleBeta { beta, source, fits }
 }
 
 /// The median of the sample's β (the mean of the two middle ones for an even count), clamped to [`BETA_BOUNDS`].
@@ -163,6 +227,215 @@ fn median_beta(betas: impl Iterator<Item = f64>) -> (f64, BetaSource) {
 mod tests {
     use super::*;
     use crate::star_measure::{measure_plane, seeds, MeasureOptions, SeedSpec};
+    use crate::test_support::{integrated_field, IntegratedProfile};
+
+    /// A noiseless field of 70 stars of one `profile` (10 × 7, off-grid centres, amplitudes 0.2–0.4 on a 0.05 sky, the
+    /// first `bright` at 0.9), every pixel integrated over 15 × 15 sub-samples, spaced so no star's rendered window
+    /// reaches another's; the plane, its size and the seeds at the true centres, brightest first.
+    fn integrated_stars(
+        profile: IntegratedProfile,
+        bright: usize,
+    ) -> (Vec<f32>, usize, usize, Vec<Seed>) {
+        let f = match profile {
+            IntegratedProfile::Moffat { fwhm, .. } | IntegratedProfile::Gaussian { fwhm } => fwhm,
+        };
+        let reach = (6.0 * f).max(6.0) + 2.0;
+        let spacing = (2.0 * reach).ceil() + 2.0;
+        let margin = reach.ceil() + 2.0;
+        let (w, h) = (
+            (2.0 * margin + 9.0 * spacing + 2.0) as usize,
+            (2.0 * margin + 6.0 * spacing + 2.0) as usize,
+        );
+        let mut stars: Vec<(f64, f64, f64)> = (0..70)
+            .map(|i| {
+                let (fx, fy) = ((i as f64 * 0.618_034) % 1.0, (i as f64 * 0.414_214) % 1.0);
+                (
+                    margin + (i % 10) as f64 * spacing + fx,
+                    margin + (i / 10) as f64 * spacing + fy,
+                    if i < bright {
+                        0.9
+                    } else {
+                        0.2 + 0.05 * (i % 5) as f64
+                    },
+                )
+            })
+            .collect();
+        stars.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let data = integrated_field(w, h, &stars, profile, 15, 0.05);
+        let seeds = stars
+            .iter()
+            .map(|&(x, y, amp)| Seed {
+                x,
+                y,
+                peak: amp,
+                flux: amp,
+            })
+            .collect();
+        (data, w, h, seeds)
+    }
+
+    /// E5 (the owner's ruling 2026-10-09): on pixel-integrated stars the frame β is the truth β within 1 % at every
+    /// sampling from FWHM 1.2 px (undersampled; the point model read m2.5 at 3.5 there) to 8 px — the sample fit
+    /// integrates its model over `k = clamp(⌈10/F_start⌉, 3, 9)` sub-samples per pixel side.
+    fn frame_beta_reads_the_truth_beta_on_integrated_stars(beta: f64) {
+        let mut worst = 0.0_f64;
+        for fwhm in [1.2, 1.6, 2.0, 2.6, 3.5, 5.0, 8.0] {
+            let (data, w, h, seeds) = integrated_stars(IntegratedProfile::Moffat { fwhm, beta }, 0);
+            let (got, src) = frame_beta(&data, w, h, &seeds, &FitStarsOptions::default(), None);
+            let err = got / beta - 1.0;
+            println!(
+                "integrated m{beta} F {fwhm}: frame beta {got:.4} ({:+.3} %), {src:?}",
+                100.0 * err
+            );
+            assert_eq!(src, BetaSource::Fitted { sample: 64 }, "m{beta} F {fwhm}");
+            assert!(
+                err.abs() < 0.01,
+                "m{beta} F {fwhm}: frame beta {got} vs {beta}"
+            );
+            worst = worst.max(err.abs());
+        }
+        println!("integrated m{beta}: worst {:.3} %", 100.0 * worst);
+    }
+
+    #[test]
+    fn frame_beta_is_the_truth_on_integrated_moffat_2_5_stars() {
+        frame_beta_reads_the_truth_beta_on_integrated_stars(2.5);
+    }
+
+    #[test]
+    fn frame_beta_is_the_truth_on_integrated_moffat_4_stars() {
+        frame_beta_reads_the_truth_beta_on_integrated_stars(4.0);
+    }
+
+    #[test]
+    fn frame_beta_is_the_truth_on_integrated_moffat_10_stars() {
+        frame_beta_reads_the_truth_beta_on_integrated_stars(10.0);
+    }
+
+    /// The Gaussian is the large-β limit on integrated pixels too: an integrated Gaussian frame reads β ≥ 60.
+    #[test]
+    fn an_integrated_gaussian_frame_reads_near_the_cap() {
+        for fwhm in [1.6, 4.0] {
+            let (data, w, h, seeds) = integrated_stars(IntegratedProfile::Gaussian { fwhm }, 0);
+            let (got, src) = frame_beta(&data, w, h, &seeds, &FitStarsOptions::default(), None);
+            println!("integrated gaussian F {fwhm}: frame beta {got:.4}, {src:?}");
+            assert!(got >= 60.0, "F {fwhm}: {got}");
+            assert!(matches!(src, BetaSource::Fitted { .. }));
+        }
+    }
+
+    /// The measure path (verdicts first): the frame β is the median of the sample's integrated fits, and each sample
+    /// star's record carries its own (`FitDiagnostics::sample_beta`) — only theirs, every one an unflagged successful
+    /// verdict among the first 64 such.
+    #[test]
+    fn the_measure_path_reads_beta_from_the_samples_integrated_fits() {
+        // Two stars well above the rest set the plane's range, so the 68 others stay unflagged.
+        let (mut data, w, h, seeds) = integrated_stars(
+            IntegratedProfile::Moffat {
+                fwhm: 2.0,
+                beta: 2.5,
+            },
+            2,
+        );
+        crate::test_support::add_noise(&mut data, 0.0005, 11);
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds.clone()),
+                diagnostics: true,
+                ..Default::default()
+            },
+            None,
+        );
+        println!(
+            "measure path, integrated m2.5 F 2.0: beta {:.4} {:?}",
+            m.beta, m.beta_source
+        );
+        assert!((m.beta / 2.5 - 1.0).abs() < 0.02, "{}", m.beta);
+        let eligible: Vec<usize> = m
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.verdict, Some(v) if v.fit && !v.saturated))
+            .map(|d| d.seed)
+            .take(AUTO_SAMPLE)
+            .collect();
+        let with: Vec<(usize, f64)> = m
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.sample_beta.map(|b| (d.seed, b)))
+            .collect();
+        assert!(with.iter().all(|(s, _)| eligible.contains(s)));
+        assert_eq!(m.beta_source, BetaSource::Fitted { sample: with.len() });
+        assert!(with.len() >= 60, "{}", with.len());
+        assert_eq!(median_beta(with.iter().map(|&(_, b)| b)).0, m.beta);
+    }
+
+    /// Review M-3: the sample is the first [`AUTO_SAMPLE`] seeds (seed order) whose verdict fit succeeded unflagged; a
+    /// cross-plane flag, an own flag, a failed verdict fit, a `MostlySaturated` refusal and a seed with no verdict are
+    /// left out, and the frame β is the median of the chosen seeds' fits.
+    #[test]
+    fn the_sample_is_the_first_64_unflagged_successful_verdicts() {
+        use crate::star_measure::photometry::SaturationVerdict;
+        use crate::star_measure::RefusalReason;
+        let v = |beta: f64, saturated: bool, cross: bool, fit: bool| SaturationVerdict {
+            plateau: false,
+            level: 1.0,
+            excluded: 0,
+            amplitude: 1.0,
+            beta,
+            fwhm: 3.0,
+            saturated,
+            fit,
+            iterations: 5,
+            cross,
+        };
+        let mut passes = vec![
+            SeedPass::for_test(Some(Ok(v(9.0, true, true, true)))), // cross-flagged
+            SeedPass::for_test(Some(Ok(v(f64::NAN, false, false, false)))), // verdict fit failed
+            SeedPass::for_test(Some(Err(RefusalReason::MostlySaturated))),
+            SeedPass::for_test(None), // refused before its region
+            SeedPass::for_test(Some(Ok(v(8.0, true, false, true)))), // own flag
+        ];
+        passes.extend(
+            (0..70).map(|j| {
+                SeedPass::for_test(Some(Ok(v(2.0 + 0.01 * j as f64, false, false, true))))
+            }),
+        );
+        let sample = sample_seeds(&passes);
+        assert_eq!(sample, (5..69).collect::<Vec<_>>());
+        let verdict_beta_of = |i: usize| match passes[i].verdict {
+            Some(Ok(sv)) => Some(sv.beta),
+            _ => None,
+        };
+        let betas: Vec<Option<f64>> = sample.iter().map(|&i| verdict_beta_of(i)).collect();
+        let s = sample_median(&sample, &betas);
+        assert_eq!(s.source, BetaSource::Fitted { sample: 64 });
+        assert!((s.beta - 2.315).abs() < 1e-12, "{}", s.beta);
+        assert_eq!(
+            s.fits,
+            sample
+                .iter()
+                .map(|&i| (i, verdict_beta_of(i).unwrap()))
+                .collect::<Vec<_>>()
+        );
+        // a failed sample fit leaves its seed out of the median and out of `fits`
+        let mut betas = betas;
+        betas[0] = None;
+        let s = sample_median(&sample, &betas);
+        assert_eq!(s.source, BetaSource::Fitted { sample: 63 });
+        assert_eq!(s.fits.first().map(|f| f.0), Some(6));
+    }
+
+    #[test]
+    fn the_sample_fit_samples_about_ten_per_fwhm_between_three_and_nine() {
+        let k: Vec<usize> = [0.0, 1.0, 1.2, 2.0, 2.6, 3.5, 5.0, 10.0, 40.0, f64::NAN]
+            .iter()
+            .map(|&f| sample_subsample(f))
+            .collect();
+        assert_eq!(k, [9, 9, 9, 5, 4, 3, 3, 3, 3, 3]);
+    }
 
     #[test]
     fn frame_beta_is_the_median_of_the_sample_and_gaussian_reads_near_the_cap() {

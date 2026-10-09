@@ -287,6 +287,93 @@ pub(crate) fn moffat_field(
     data
 }
 
+/// The profile of one [`integrated_field`]: a round Moffat `(1 + r²/α²)^(−β)` or a round Gaussian, both of FWHM
+/// `fwhm` px and peak 1.
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IntegratedProfile {
+    Moffat { fwhm: f64, beta: f64 },
+    Gaussian { fwhm: f64 },
+}
+
+#[cfg(feature = "render")]
+impl IntegratedProfile {
+    /// The profile as a function of the squared distance from its centre, peak 1.
+    fn eval(self) -> impl Fn(f64) -> f64 + Sync {
+        // (1/α², −β) for a Moffat; (1/(2σ²), ∞) marks a Gaussian.
+        let (scale, beta) = match self {
+            IntegratedProfile::Moffat { fwhm, beta } => {
+                let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+                (1.0 / (alpha * alpha), -beta)
+            }
+            IntegratedProfile::Gaussian { fwhm } => {
+                let sigma = fwhm / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt());
+                (1.0 / (2.0 * sigma * sigma), f64::INFINITY)
+            }
+        };
+        move |r2: f64| {
+            if beta.is_infinite() {
+                (-r2 * scale).exp()
+            } else {
+                (1.0 + r2 * scale).powf(beta)
+            }
+        }
+    }
+
+    fn fwhm(self) -> f64 {
+        match self {
+            IntegratedProfile::Moffat { fwhm, .. } | IntegratedProfile::Gaussian { fwhm } => fwhm,
+        }
+    }
+}
+
+/// Row-major float plane of round stars `(x, y, amplitude)` of one `profile` on a flat `background`, every pixel the
+/// light it COLLECTS: the mean of the profile over `sub × sub` midpoint sub-samples of the pixel (offsets
+/// `(i + 0.5)/sub − 0.5` px), where [`moffat_field`] and [`gaussian_field`] sample the profile at the pixel centre.
+/// Each star is rendered out to `max(6·FWHM, 6) + 2` px — beyond the largest region the fitter grows (6·`F_start`,
+/// at least 6 px) — and its wings past that are dropped. Pixel centres at integer coordinates; rows in parallel.
+#[cfg(feature = "render")]
+pub(crate) fn integrated_field(
+    w: usize,
+    h: usize,
+    stars: &[(f64, f64, f64)],
+    profile: IntegratedProfile,
+    sub: usize,
+    background: f32,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let reach = (6.0 * profile.fwhm()).max(6.0) + 2.0;
+    let at = profile.eval();
+    let offsets: Vec<f64> = (0..sub)
+        .map(|i| (i as f64 + 0.5) / sub as f64 - 0.5)
+        .collect();
+    let inv = 1.0 / (sub * sub) as f64;
+    let mut data = vec![background; w * h];
+    data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let yf = y as f64;
+        for &(sx, sy, amp) in stars {
+            if (yf - sy).abs() > reach {
+                continue;
+            }
+            let x0 = ((sx - reach).ceil().max(0.0)) as usize;
+            let x1 = ((sx + reach).floor().min(w as f64 - 1.0)) as usize;
+            for (x, v) in row.iter_mut().enumerate().take(x1 + 1).skip(x0) {
+                let xf = x as f64;
+                let mut sum = 0.0;
+                for &oy in &offsets {
+                    let dy = yf + oy - sy;
+                    for &ox in &offsets {
+                        let dx = xf + ox - sx;
+                        sum += at(dx * dx + dy * dy);
+                    }
+                }
+                *v += (amp * sum * inv) as f32;
+            }
+        }
+    });
+    data
+}
+
 /// A plausible accepted fit at `(x, y)` with `amplitude` (Plan A Task 4): the fixture the `StarFit` literal sites can
 /// call instead of spelling every field (ruling F36). Every other field is a round, well-sampled star — FWHM 3 px,
 /// FWTM 6 px, β 4, a small residual, a positive signal over its FWTM-ellipse area — with no flags; `peak5` is

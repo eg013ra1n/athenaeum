@@ -148,6 +148,15 @@ export function psfModelLabel(v: PsfModel): string {
   }
 }
 
+/** The Normalize stage's PSF model label: in a run, local normalization's `Auto` fits every frame of a group at the
+ *  group's one β (the lower median of its frames' measured β), not at a β of its own. */
+export function normalizePsfModelLabel(v: PsfModel): string {
+  switch (v) {
+    case 'auto': return 'Auto (group β: lower median of the frames\' β)';
+    case 'moffat4': return 'Moffat-4';
+  }
+}
+
 export function flatNormModeLabel(v: FlatNormMode): string {
   switch (v) {
     case 'centralThird': return 'central third';

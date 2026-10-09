@@ -2266,8 +2266,11 @@ mod tests {
 
         assert_eq!(r.beta, ref_out.beta);
         // F-4 (Plan A Task 9, ruling R-OSP-6): `Auto` is a continuous β (the reference's own bounded free-β sample,
-        // Q7), so on this purely-Moffat-4 field it reads near 4 (3.933 here) where it was one of `AUTO_BETAS`.
-        assert!((r.beta - 4.0).abs() < 0.2, "beta {}", r.beta);
+        // Q7) where it was one of `AUTO_BETAS`. The first F-4 build's point-model sample read this Moffat-4 field at
+        // 3.933 (`|β − 4| < 0.2`); since the owner's E5 the sample is fitted PIXEL-INTEGRATED, and this fixture is
+        // point-sampled (`moffat_field`, FWHM 2.5 px), so it reads low by construction: 3.506 — the mirror of the
+        // point model reading an integrated star high. The equality above is what this test pins.
+        assert!((r.beta - 3.506).abs() < 0.01, "beta {}", r.beta);
     }
 
     #[test]

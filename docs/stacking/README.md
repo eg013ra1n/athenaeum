@@ -2247,62 +2247,111 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     on undersampled stars; at held β they read ≤ 0.10 %); R2 f12.0 / f16.0 ≤ 0.04 %, and `sharp/m4/f2.0` i0 moves to
     Task 9 (+2.62 % at β 6, +0.27 % at the truth β 4); β-change control 37 278 / 37 278.
 - **F-4 - the continuous per-frame β (Task 9; numbers move by design).**
-  - **R-OSP-6 - `PsfModel::Auto` is a continuous per-frame β, from a bounded free-β fit (spec §3 F-4).** The
-    discrete search over `AUTO_BETAS` is retired; the ladder stays as the probe's betas arm (row 3's β sensitivity),
-    which no production path reads. The Gaussian is the large-β limit: there is no separate Gaussian model, and β
-    stays a finite number everywhere (`.athf` f32, `metrics`, `stacking_run_groups.beta`, `group_beta`,
-    `PsfModel::Fixed`); `FITS_ARTIFACT_VERSION` and `MEASURE_VERSION` (4, one bump per plan) are unchanged.
+  - **R-OSP-6 - `PsfModel::Auto` is a continuous per-frame β, the median of pixel-integrated bounded free-β fits
+    of the sample (spec §3 F-4, as revised by the owner's ruling E5, 2026-10-09).** The discrete search over
+    `AUTO_BETAS` is retired; the ladder stays as the probe's betas arm (row 3's β sensitivity), which no production
+    path reads. The Gaussian is the large-β limit: there is no separate Gaussian model, and β stays a finite number
+    everywhere (`.athf` f32, `metrics`, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`);
+    `FITS_ARTIFACT_VERSION` and `MEASURE_VERSION` (4, one bump per plan) are unchanged.
+    - **Why the sample fit is pixel-integrated (the cause).** Task 9's first build read the frame β as the median of
+      the bounded free-β verdict fits, a POINT model. A point Moffat fitted to stars whose pixels integrate their
+      light reads β high, more so as the star's FWHM in pixels falls, because the integrated core is flatter: on the
+      lab's m2.5 stars it read 3.47 / 3.17 / 2.93 / 2.76 at FWHM 1.2 / 1.6 / 2.0 / 2.6 px, and the frame FWHM read
+      1.4–6 % high on undersampled low-β stars (the lab step `t09-f4` stopped on it; research R-F4: the noiseless
+      sampling term explains +11.65 of the +13.40 % mean β gap over 28 planes, and no point-model statistic — the
+      median, the sample, the region, the background — fixes it). A pixel-integrated model returns the truth β within
+      0.1–0.7 % under every region and background variant, and the point-model FWHM at that β equals the one at the
+      truth β within 0.1 %. **Owner ruling E5 (2026-10-09):** the frame β comes from a pixel-integrated fit of the
+      same sample; the verdict fit and every fit at β stay the point model.
     - **The fit** (rustafits `fit_moffat_2d_bounded`, branch `one-star-path-beta`): a free-β Moffat whose solver
       carries **ln β** — the Gaussian limit is a flat ridge in (α, β), which a step in ln β crosses in a few
       iterations — with the Jacobian column `A·(1+Q)^−β·(−ln(1+Q))·β` (the chain rule) and each step's ln β clamped
       to the caller's bounds. A fit that ends at a bound is returned with β exactly that bound; only a non-finite
-      parameter, α < 0.3 or A ≤ 0 refuses it. It carries the corrected θ column (R-OSP-3). `fit_moffat_2d` (β linear,
-      [1, 20], the legacy θ column) is output-identical: the solver's `BetaParam::FreeLinear` arm is its code, and
-      `fit_moffat_2d_is_byte_identical_to_before` pins it bit for bit on a C3 stamp. Unit: a noiseless Gaussian
-      (σ 2) reaches β 100 in 39 iterations at −0.32 % FWHM; Moffat β 4 and 2.5 are recovered to 1e-8.
-    - **The fit at β has no β ceiling** (rustafits, the same branch). The shared Moffat acceptance refused any
-      β > 20, the fixed arm included, so every star of a frame whose β rose above 20 was refused `fitFailed`. The
+      parameter, α < 0.3 or A ≤ 0 refuses it. It carries the corrected θ column (R-OSP-3). Its `subsample` (k): k = 1
+      is the point model, byte-identical to the entry point's first build (cceab37; the golden pin
+      `the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before`, recorded before the change, every field
+      and the iteration count on three stamps); k ≥ 2 makes the model and its Jacobian at each pixel the mean over
+      k × k midpoint sub-samples at offsets `(i + 0.5)/k − 0.5` px (the Jacobian is pinned against central
+      differences of the integrated model at k = 3, every column). `fit_moffat_2d` (β linear, [1, 20], the legacy θ
+      column) is output-identical: the solver's `BetaParam::FreeLinear` arm is its code, and
+      `fit_moffat_2d_is_byte_identical_to_before` pins it bit for bit on a C3 stamp (recorded at 197fd93). Unit: a
+      noiseless Gaussian (σ 2) reaches β 100 in 39 iterations at −0.32 % FWHM; Moffat β 4 and 2.5 are recovered to
+      1e-8; an integrated m2.5 stamp reads β 2.5098 / 2.5052 at FWHM 1.2 / 2.0 px at k = 7, where k = 1 reads
+      3.127 / 2.814.
+    - **The fit at β has no β ceiling** (rustafits, the same branch, 0ebc618). The shared Moffat acceptance refused
+      any β > 20, the fixed arm included, so every star of a frame whose β rose above 20 was refused `fitFailed`. The
       conditioned fixed-β entry point (R-OSP-3, the one the fits at β use) now fits any fixed β ≥ 1; below 20 its
-      output is what it was, and the two 1.3.0 entry points keep their [1, 20] (Phase A deviation from the plan's
-      "legacy entry points identical", for the controller's ruling).
+      output is what it was, and the two 1.3.0 entry points keep their [1, 20]. A Phase A deviation from the plan's
+      "legacy entry points identical", ACCEPTED by the controller (ledger, 2026-10-09) as the spec's "bound lifted to
+      the cap" for the fit at β.
     - **The constants** (`star_measure::beta`): `BETA_BOUNDS = (1.5, 100)` (at β 100 a Gaussian star reads −0.32 %,
       β 30 −1.04 %, spec re-review N-1); `BETA_START = 3.0` (the verdict fit's start β, the free arm's through Task
-      8, so only the parametrisation, the bounds and the θ column changed); `AUTO_SAMPLE = 64`; `BETA_MIN_FITS = 8`;
-      `BETA_FALLBACK = 4.0`.
-    - **The measure path (C-b, PA-23).** The verdict fit of R-OSP-5 IS the bounded fit (`BETA_BOUNDS`, start 3.0;
-      its region, starts, exclusion and ×3 iterations unchanged), and a β at a bound is a successful verdict fit.
-      The frame β is the median of the verdict β of the 64 brightest seeds whose verdict fit succeeded unflagged
-      (own and cross-plane flags united first), the mean of the two middle ones for an even count, clamped to the
-      bounds — read, not fitted a second time. At least 8: `BetaSource::Fitted { sample }`; fewer: β 4.0,
-      `BetaSource::Fallback`, one `warn!` per plane. Every star is then fitted at that β (the fixed-β conditioned
-      fit of R-OSP-3, unchanged).
-    - **Q7 - a caller that runs no verdict.** `fit_stars` under `Auto` (LN's reference fit, `ln/scale.rs`) and
-      `star_measure::frame_beta` (Plan C's green sites, ruling F45: it takes `FitStarsOptions`, so the mask and the
-      field width reach the sample) run their own sample: the bounded fit of the 64 brightest seeds from the verdict
-      fit's starts, with no saturation test and no exclusion (`SaturationPlane::UNTESTED`); the same median, minimum
-      and fallback. LN's reference is a warped plane, exempt from §2.1's test. Cost: its β reads high on a frame
-      with many saturated bright stars, as before Task 9; Plan B (F1) owns LN.
+      8, and the sample fit's); `AUTO_SAMPLE = 64`; `BETA_MIN_FITS = 8`; `BETA_FALLBACK = 4.0`;
+      `SAMPLE_SUBSAMPLE_PX = 10` and `SAMPLE_SUBSAMPLE_RANGE = (3, 9)`: a sample star is fitted at
+      `k = clamp(⌈10 / F_start⌉, 3, 9)` (`sample_subsample`), about 10 sub-samples across its FWHM.
+    - **The measure path (C-b, PA-23, E5).** The verdict fit of R-OSP-5 IS the bounded fit at k = 1 (`BETA_BOUNDS`,
+      start 3.0; its region, starts, exclusion and ×3 iterations unchanged), and a β at a bound is a successful
+      verdict fit. The sample is the 64 brightest seeds whose verdict fit succeeded unflagged (own and cross-plane
+      flags united first; `sample_seeds`). Each is re-fitted pixel-integrated on the verdict fit's own problem
+      (`photometry::integrated_beta`): its region (re-gathered from the seed's record; steps 1–4 are pure) minus the
+      pixels its level excluded, conditioned the same way, from the same starts (b0, the seed, the star's `F_start`,
+      β 3.0), in `BETA_BOUNDS`, with the verdict's iteration budget, at the star's k. β is the median of the accepted
+      integrated fits (the mean of the two middle ones for an even count), clamped to the bounds. At least 8:
+      `BetaSource::Fitted { sample }`; fewer: β 4.0, `BetaSource::Fallback`, one `warn!` per plane. Every star is
+      then fitted at that β with the point model (the fixed-β conditioned fit of R-OSP-3, unchanged). Unit
+      (`star_measure::beta` tests, noiseless fields of 70 off-grid stars, each pixel integrated over 15 × 15
+      sub-samples): `frame_beta` reads m2.5 / m4 / m10 at +0.11…+0.62 / +0.12…+0.61 / +0.14…+0.79 % of the truth β
+      from FWHM 1.2 to 8 px, an integrated Gaussian at 99.9992 (FWHM 1.6) and 100 (FWHM 4); the measure path reads an
+      integrated m2.5 field at FWHM 2 px at 2.5038.
+    - **Spec delta (§3 F-4; spec §2.1's "the unflagged bright seeds' verdict fits are the β sample's free-β fits").**
+      "Fits nothing twice" no longer holds: each plane runs up to 64 extra fits (the integrated sample fits, up to
+      k² = 81 model evaluations per pixel). Measure wall on LDN_1272 mono, Task 9's first build (1d2d40cb) → E5:
+      1.81 → 1.84 s (+2.0 %, 3 interleaved runs; the owner-item line is +15 %); the OSC `_d` frame's planes +0.9 /
+      +1.5 / +2.6 %.
+    - **Q7 - a caller that runs no verdict.** `fit_stars` under `Auto` and `star_measure::frame_beta` (Plan C's green
+      sites, ruling F45: it takes `FitStarsOptions`, so the mask and the field width reach the sample) fit their own
+      sample the same way: the pixel-integrated fit of the 64 brightest seeds from the verdict fit's starts, with no
+      saturation test and no exclusion (the level of `SaturationPlane::UNTESTED`); the same median, minimum and
+      fallback. Q7 reaches tests and examples only (review M-2): in a run, LN's `Auto` is
+      `PsfModel::Fixed(group β)` (`run.rs`, the grid path included), so `ln/scale.rs`'s reference fit never samples
+      there and the Normalize wall is unaffected; the direct `fit_stars(Auto)` callers are tests and the `ln_*` /
+      `weight_audit` examples.
     - **`BETA_AT_CAP`.** A fitted frame β at a bound (exactly 1.5 or 100) flags every star fitted at it (the
       `.athf` flags byte, bit 2; the probe's `betaAtCap`); a caller's fixed β (`Moffat4`, `Fixed`, `fit_stars_at`)
       never does. `group_beta` is unchanged code: the lower median of its members' continuous βs, so it is always
       one of their own.
   - **The surfaces.** `star_measure::{BetaSource, BETA_BOUNDS, frame_beta}`; `PlaneMeasurement.beta_source` (the
     module's and the adapter's; reported, not persisted) and `FitOutcome.beta_source`; `StarFlags::beta_at_cap()`;
-    `SaturationVerdict.iterations`, which fills `FitDiagnostics.iterations` from the bounded verdict fit (`None`
-    where no verdict ran: the fixed-β fit reports none); the probe's measure frame line `betaSource` (`fitted` |
-    `fallback` | `fixed`) and `betaSample`. The Measure and Normalize panels label the model "Auto (per-frame β)".
-  - **Moved pins (by design: the continuous β).** Each literal carries its previous value. The three earlier tests
-    ruling F14 names (`group_beta`'s, renamed `…_always_one_of_the_members_betas`; `auto_model_prefers_the_generating_beta`,
-    Moffat-4 within 0.2 of 4 and a Gaussian field ≥ 60; `beta_sample_skips_saturated_stars`, within 0.2 of 4), LN's
-    `target_is_fitted_with_the_reference_beta` (3.933 on its Moffat-4 field, no longer a ladder value), and the four
-    `stacking::measure` fixture pins: β 10 → ≈ 99.3 on the Gaussian fixture, frame FWHM 4.129 → 4.229 px against the
-    Gaussian truth 4.2387 (−2.59 % → −0.22 %), tflux −1.5 % (the FWTM aperture follows β), and 6 of 150 flagged (was
-    9; the bounded verdict fit's amplitude on a Gaussian star no longer overshoots the range the way the free fit
-    stopped at β 20 did). At a non-integral β the fits run on `powf` throughout, so those records pin β and every
-    fit-derived field to a few ulp (the counts, noise and sky stay exact). The drizzle sharpening test's four widths
-    do not move (its lone, flagged star leaves the sample empty: β 4.0 before and after).
-  - **The real frame** (LDN_1272, release probe, `--paths measure`, 3 interleaved runs, deterministic): mono β 2.5 →
-    2.108 (`fitted`, 64), frame FWHM 2.325 → 2.251 px, 12 778 → 12 767 fits, Measure wall 1.60 → 1.74 s; the OSC
-    `_d` frame's planes β 2.5 / 4 / 2.5 → 2.271 / 5.407 / 6.249, frame FWHM 1.499 / 1.499 / 1.363 → 1.471 / 1.539 /
-    1.524 px, wall +6–8 %. Verdict fits failed: mono 68 → 68, OSC 131 / 95 / 49 → 119 / 94 / 45.
+    `SaturationVerdict.iterations`, which fills `FitDiagnostics.iterations` with the bounded verdict fit's LM
+    iterations (`None` where no verdict fit succeeded: the fixed-β fit reports none); `FitDiagnostics.sample_beta`,
+    a sample star's integrated β (`None` for every other seed); the probe's measure frame line `betaSource`
+    (`fitted` | `fallback` | `fixed`) and `betaSample`, and with `--diagnostics` `sampleBeta` on a sample star's star
+    or refused line. The Measure panel labels the model "Auto (per-frame β)"; the Normalize panel labels it "Auto
+    (group β: lower median of the frames' β)", because in a run local normalization fits every frame of a group at
+    the group's one β (review M-1).
+  - **Moved pins (by design: the continuous β).** Each literal carries its previous value. Task 9's first build:
+    the three earlier tests ruling F14 names (`group_beta`'s, renamed `…_always_one_of_the_members_betas`;
+    `auto_model_prefers_the_generating_beta`, Moffat-4 within 0.2 of 4 and a Gaussian field ≥ 60;
+    `beta_sample_skips_saturated_stars`, within 0.2 of 4), LN's `target_is_fitted_with_the_reference_beta` (3.933 on
+    its Moffat-4 field, no longer a ladder value), and the four `stacking::measure` fixture pins: β 10 → ≈ 99.3 on
+    the Gaussian fixture, frame FWHM 4.129 → 4.229 px against the Gaussian truth 4.2387 (−2.59 % → −0.22 %), tflux
+    −1.5 % (the FWTM aperture follows β); 6 of 150 flagged (was 9) on the two field-7 pins (the Peak and the
+    matched-filter scalar pins: 144 unflagged), 1 of 150 (was 9) on the two `2026_09_19` records (149 unflagged)
+    (review M-6) — the bounded verdict fit's amplitude on a Gaussian star no longer overshoots the range the way the
+    free fit stopped at β 20 did. At a non-integral β the fits run on `powf` throughout, so those records pin β and
+    every fit-derived field to a few ulp (the counts, noise and sky stay exact). E5 moved β on the four
+    `stacking::measure` pins (99.29 / 99.25 / 99.56 / 99.52 → 99.51 / 99.36 / 99.49 / 99.54, still near the cap:
+    point-sampled stars at FWHM 4.24 px, k = 3) and the fit-derived fields with it (≤ 6e-6 relative; the Peak
+    record's eccentricity −0.44 %), the counts and flags unchanged; and LN's `target_is_fitted_with_the_reference_beta`
+    3.933 → 3.506: its fixture is point-sampled (`moffat_field`, FWHM 2.5 px), and an integrated model reads a
+    point-sampled star's β low, the mirror of the cause above (the reference-β equality it pins holds exactly). The drizzle
+    sharpening test's four widths do not move (its lone, flagged star leaves the sample empty: β 4.0 before and
+    after).
+  - **The real frame** (LDN_1272, release probe, `--paths measure`, 3 interleaved runs, deterministic), Task 9's
+    first build (1d2d40cb) → E5: mono β 2.108 → 2.000 (`fitted`, 64), frame FWHM 2.251 → 2.226 px (−1.1 %),
+    12 767 → 12 749 fits (12 452 → 12 446 unflagged); the OSC `_d` frame's planes β 2.271 / 5.407 / 6.249 → 1.948 /
+    5.292 / 5.192, frame FWHM 1.471 / 1.539 / 1.524 → 1.420 / 1.537 / 1.503 px; verdict fits failed unchanged (mono
+    68, OSC 119 / 94 / 45), no `mostlySaturated` seed. The mono sample's point verdict β reads a median 3.5 % above
+    its integrated β (p90 10.5 %). Before Task 9 (5bd5c926): mono β 2.5, FWHM 2.325 px; OSC β 2.5 / 4 / 2.5, FWHM
+    1.499 / 1.499 / 1.363 px.
   - **Acceptance.** `<pending t09-f4>`.

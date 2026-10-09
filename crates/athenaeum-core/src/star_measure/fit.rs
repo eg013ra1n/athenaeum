@@ -35,10 +35,12 @@
 //! (own or cross-plane) without its pixels ≥ its level, ×3 iterations (Q6 as revised 2026-10-09). A seed whose verdict
 //! fit keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
 //!
-//! F-4 (Plan A Task 9, ruling R-OSP-6): `PsfModel::Auto`'s β is continuous — the median of the sample's bounded
-//! free-β fits ([`super::beta`]: the verdict fits on the measure path, the module's own sample fits for a caller that
-//! ran no verdict), clamped to [`super::beta::BETA_BOUNDS`]; a frame β at a bound flags every star fitted at it
-//! [`StarFlags::BETA_AT_CAP`]. The fits at β are unchanged.
+//! F-4 (Plan A Task 9, ruling R-OSP-6, revised by the owner's E5): `PsfModel::Auto`'s β is continuous — the median
+//! of the sample's PIXEL-INTEGRATED bounded free-β fits ([`super::beta`]: on the measure path the sample is the
+//! unflagged successful verdicts, each re-fitted on its verdict fit's own pixels, [`sample_fits`]; a caller that ran
+//! no verdict fits its own sample, [`own_sample_fits`]), clamped to [`super::beta::BETA_BOUNDS`]; a frame β at a
+//! bound flags every star fitted at it [`StarFlags::BETA_AT_CAP`]. The verdict fit and the fits at β stay the point
+//! model.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -54,7 +56,8 @@ use tracing::warn;
 use super::beta::BetaSource;
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 use super::photometry::{
-    saturation_verdict, SaturationPlane, SaturationVerdict, EXCLUDED_ITERATION_FACTOR,
+    integrated_beta, saturation_verdict, SaturationPlane, SaturationVerdict,
+    EXCLUDED_ITERATION_FACTOR,
 };
 use super::seeds::{field_width_of, own_halfmax_width, FieldWidth};
 use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
@@ -65,7 +68,7 @@ const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum PsfModel {
-    /// The continuous per-frame β (F-4, Task 9): the median of the bounded free-β fits of the
+    /// The continuous per-frame β (F-4, Task 9): the median of the pixel-integrated bounded free-β fits of the
     /// [`super::beta::AUTO_SAMPLE`] brightest unsaturated seeds, clamped to [`super::beta::BETA_BOUNDS`]
     /// ([`super::beta`]); 4.0 when fewer than 8 fits are accepted. Through Task 8, the discrete search over
     /// `AUTO_BETAS`.
@@ -632,6 +635,8 @@ impl FitTrace {
             iterations: verdict.filter(|v| v.fit).map(|v| v.iterations),
             converged: self.converged,
             verdict,
+            // A sample star's is set once the frame β's sample is fitted (`fit_after_passes`).
+            sample_beta: None,
         }
     }
 }
@@ -1280,6 +1285,97 @@ pub(super) fn seed_passes(
     }
 }
 
+/// The frame β sample's pixel-integrated fits on the measure path (F-4 as revised by the owner's ruling E5,
+/// 2026-10-09; ruling R-OSP-6): for each seed index in `sample` (the seeds [`super::beta::sample_seeds`] chose from
+/// `passes`), the verdict fit's own problem re-fitted with the integrated model
+/// ([`super::photometry::integrated_beta`]) — the region its record holds, re-gathered (steps 1–4 are pure, so the
+/// pixels are the verdict's), below the verdict's level. In `sample` order; `None` where the fit failed (or where the
+/// record holds no region or no verdict, which a sample seed never lacks). Runs on `pool` when given one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sample_fits(
+    data: &[f32],
+    w: usize,
+    seeds: &[Seed],
+    mask: Option<&[bool]>,
+    p: &FitParams,
+    passes: &[SeedPass],
+    sample: &[usize],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<Option<f64>> {
+    let body = || {
+        sample
+            .par_iter()
+            .map_init(FitScratch::default, |scratch, &i| {
+                let (Ok(reg), Some(Ok(v))) = (&passes[i].region, passes[i].verdict) else {
+                    return None;
+                };
+                gather_region(data, mask, w, reg.cx, reg.cy, reg.r, &mut scratch.px);
+                integrated_beta_on_region(&seeds[i], reg, v.level, p, scratch)
+            })
+            .collect()
+    };
+    match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
+    }
+}
+
+/// Q7 under E5 (a caller that ran no verdict, [`super::beta::frame_beta`]): for each of `seeds` (the caller's
+/// brightest), [`fit_one`]'s steps 1–4 on `field_width` ([`region_steps`]) and the pixel-integrated fit of the whole
+/// region — no saturation test, no exclusion (the level of [`SaturationPlane::UNTESTED`]). In seed order; `None` where
+/// the seed was refused before its fit or the fit failed. Runs on `pool` when given one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn own_sample_fits(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    mask: Option<&[bool]>,
+    field_width: f64,
+    p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<Option<f64>> {
+    let body = || {
+        seeds
+            .par_iter()
+            .map_init(FitScratch::default, |scratch, s| {
+                let mut trace = FitTrace::before_region(field_width);
+                let (reg, _, _) =
+                    region_steps(data, mask, w, h, s, field_width, p, scratch, &mut trace).ok()?;
+                integrated_beta_on_region(s, &reg, SaturationPlane::UNTESTED.norm, p, scratch)
+            })
+            .collect()
+    };
+    match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
+    }
+}
+
+/// [`integrated_beta`] on the region `scratch.px` holds (gathered for `reg`), in stamp coordinates from `reg`'s rim
+/// median and the star's own `F_start`, below `level`.
+fn integrated_beta_on_region(
+    seed: &Seed,
+    reg: &SeedRegion,
+    level: f64,
+    p: &FitParams,
+    scratch: &mut FitScratch,
+) -> Option<f64> {
+    let region = std::mem::take(&mut scratch.px);
+    let beta = integrated_beta(
+        &region,
+        seed.x - reg.cx as f64,
+        seed.y - reg.cy as f64,
+        reg.b0,
+        reg.start.fwhm,
+        level,
+        p,
+        scratch,
+    );
+    scratch.px = region;
+    beta
+}
+
 /// The acceptance rules (math reference §1.4), each refusal with its reason. The first gate is one condition, as it
 /// always was; its reason is `NonFinite` when a parameter or the residual is not finite, else `ResidualTooLarge`
 /// when the residual reaches the cap, else `FitFailed` (`A ≤ 0` or an `α ≤ 0`). The last (Task 6b) refuses a fit
@@ -1622,10 +1718,12 @@ pub(super) fn verdict_pass(
 }
 
 /// β, then every seed fitted at it on `field`'s width. `passes` (the measure path's, [`verdict_pass`], cross-plane
-/// flags applied): the order is seeds → field width → verdicts → β sample (`Auto`: the median verdict β of the seeds
-/// whose verdict fit succeeded unflagged, [`super::beta::verdict_beta`]) → fits at β, each from its seed's record.
-/// `None` (every other caller): no verdict, no flag, and `Auto` fits its own sample of the brightest seeds
-/// ([`super::beta::sample_beta`], Q7). A fitted β at a bound flags every accepted fit [`StarFlags::BETA_AT_CAP`].
+/// flags applied): the order is seeds → field width → verdicts → β sample (`Auto`: the seeds whose verdict fit
+/// succeeded unflagged, each re-fitted pixel-integrated on its verdict fit's pixels, the median β,
+/// [`super::beta::verdict_beta`]) → fits at β, each from its seed's record. `None` (every other caller): no verdict,
+/// no flag, and `Auto` fits its own sample of the brightest seeds ([`super::beta::sample_beta`], Q7). A fitted β at a
+/// bound flags every accepted fit [`StarFlags::BETA_AT_CAP`]; with `diagnostics`, each sample star's record carries
+/// its integrated β ([`FitDiagnostics::sample_beta`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_after_passes(
     data: &[f32],
@@ -1641,17 +1739,18 @@ pub(super) fn fit_after_passes(
     diagnostics: bool,
     defocus_verdict: bool,
 ) -> FitOutcome {
-    let (beta, beta_source) = match model {
-        PsfModel::Moffat4 => (4.0, BetaSource::Fixed),
+    let sample = match model {
+        PsfModel::Moffat4 => super::beta::SampleBeta::fixed(4.0),
         // Tier C Task 1: a caller-resolved β (the group β, or any other
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
         // `Auto` sample below never runs for it.
-        PsfModel::Fixed(b) => (b, BetaSource::Fixed),
+        PsfModel::Fixed(b) => super::beta::SampleBeta::fixed(b),
         PsfModel::Auto => match passes {
-            Some(v) => super::beta::verdict_beta(v),
+            Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, pool),
             None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
         },
     };
+    let (beta, beta_source) = (sample.beta, sample.source);
     let mut outcome = fit_at_width(
         data,
         w,
@@ -1670,6 +1769,13 @@ pub(super) fn fit_after_passes(
     if matches!(beta_source, BetaSource::Fitted { .. }) && super::beta::at_bound(beta) {
         for f in &mut outcome.fits {
             f.flags |= StarFlags::BETA_AT_CAP;
+        }
+    }
+    // One record per seed, in seed order: a sample star's record carries its integrated fit's β.
+    for &(seed, b) in &sample.fits {
+        if let Some(d) = outcome.diagnostics.get_mut(seed) {
+            debug_assert_eq!(d.seed, seed);
+            d.sample_beta = Some(b);
         }
     }
     outcome

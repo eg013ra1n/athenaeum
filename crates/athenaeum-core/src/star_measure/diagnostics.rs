@@ -122,7 +122,8 @@ pub struct FitDiagnostics {
     /// before its region was gathered (`OutsideImage`). A flagged seed (own or cross-plane) is fitted at β on
     /// `pixels_used − verdict.excluded` of them, an unflagged one on all of them (F-3, Q6 as revised 2026-10-09).
     pub pixels_used: u32,
-    /// `None` until the rustafits entry point reports it (Task 9).
+    /// The bounded verdict fit's LM iterations (F-4, Task 9): every seed whose verdict fit succeeded has them; `None`
+    /// where no verdict ran or its fit failed (the fit at β reports none).
     pub iterations: Option<u16>,
     /// The fitter's own convergence flag (not an acceptance criterion; reported only).
     pub converged: bool,
@@ -130,6 +131,10 @@ pub struct FitDiagnostics {
     /// `None` for a seed refused before its region (`OutsideImage`, `TooFewPixels`), as a `Donut`, or
     /// `MostlySaturated`, and on every path that runs no verdict (`fit_stars_at`, `fit_stars`).
     pub verdict: Option<SaturationVerdict>,
+    /// A frame β sample star's own β: its pixel-integrated bounded free-β fit (F-4 as revised by the owner's ruling
+    /// E5, 2026-10-09; [`super::beta`]), whose median is the frame β. `None` for every other seed, for a sample star
+    /// whose integrated fit failed, and wherever β was the caller's (`Moffat4`, `Fixed`, `fit_stars_at`).
+    pub sample_beta: Option<f64>,
 }
 
 /// The refused seeds of one fit call, by reason, and the two Budget-mode outcomes (Task 12; 0 in `Mode::All`).
