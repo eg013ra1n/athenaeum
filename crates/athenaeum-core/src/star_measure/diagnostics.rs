@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::photometry::SaturationVerdict;
+
 /// Why a seed was not accepted. Serialized as its camelCase name ([`RefusalReason::name`]); the variants a later
 /// task introduces are declared now so the names never move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -40,11 +42,14 @@ pub enum RefusalReason {
     /// were refused `Donut`, so every fit it would have accepted is refused with this reason. The per-seed `Donut`
     /// refusals keep theirs.
     Defocused,
+    /// The saturation test's verdict fit has no more pixels below the star's level than its 8 parameters (F-3, Task 8;
+    /// spec §2.1: n ≤ p). Declared last so every earlier reason keeps its `Ord` position.
+    MostlySaturated,
 }
 
 impl RefusalReason {
     /// Every reason, in declaration (and `Ord`) order.
-    pub const ALL: [RefusalReason; 12] = [
+    pub const ALL: [RefusalReason; 13] = [
         RefusalReason::OutsideImage,
         RefusalReason::TooFewPixels,
         RefusalReason::Donut,
@@ -57,6 +62,7 @@ impl RefusalReason {
         RefusalReason::NarrowerThanPixel,
         RefusalReason::Duplicate,
         RefusalReason::Defocused,
+        RefusalReason::MostlySaturated,
     ];
 
     /// The serialized (camelCase) name: the key of `ChannelMeasurement::refused_by_reason` and the `reason` of a
@@ -75,6 +81,7 @@ impl RefusalReason {
             RefusalReason::NarrowerThanPixel => "narrowerThanPixel",
             RefusalReason::Duplicate => "duplicate",
             RefusalReason::Defocused => "defocused",
+            RefusalReason::MostlySaturated => "mostlySaturated",
         }
     }
 }
@@ -112,12 +119,17 @@ pub struct FitDiagnostics {
     /// Steps the sampling region grew from its start radius.
     pub growth_steps: u8,
     /// The region's present pixels — finite and unmasked — the fit was handed (Task 6a); 0 when the seed was refused
-    /// before its region was gathered (`OutsideImage`).
+    /// before its region was gathered (`OutsideImage`). A seed with a saturation verdict is fitted at β on
+    /// `pixels_used − verdict.excluded` of them (F-3, Q6).
     pub pixels_used: u32,
     /// `None` until the rustafits entry point reports it (Task 9).
     pub iterations: Option<u16>,
     /// The fitter's own convergence flag (not an acceptance criterion; reported only).
     pub converged: bool,
+    /// The seed's saturation verdict (F-3, Task 8): every seed whose region was gathered on the measure path has one.
+    /// `None` for a seed refused before its region (`OutsideImage`, `TooFewPixels`), as a `Donut`, or
+    /// `MostlySaturated`, and on every path that runs no verdict (`fit_stars_at`, `fit_stars`).
+    pub verdict: Option<SaturationVerdict>,
 }
 
 /// The refused seeds of one fit call, by reason, and the two Budget-mode outcomes (Task 12; 0 in `Mode::All`).

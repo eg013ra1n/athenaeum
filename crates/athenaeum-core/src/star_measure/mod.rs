@@ -17,6 +17,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod fit;
 pub mod frame;
+pub mod photometry;
 pub mod robust;
 pub mod seeds;
 
@@ -28,6 +29,7 @@ pub use domain::{
 };
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
+pub use photometry::{SaturationPlane, SaturationVerdict};
 pub use seeds::{FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 
 /// Version of the measurement path's own behaviour — bumped whenever
@@ -88,6 +90,10 @@ pub struct MeasureOptions {
     /// [`seeds::field_width_of`] the given seeds. Given, it is the width the fit reads and
     /// [`PlaneMeasurement::field_width`] reports; the matched filter's own second pass still runs at its own.
     pub field_width: Option<FieldWidth>,
+    /// The plane is one of a debayered colour image's (F-3, Task 8, Q3): the saturation test's plateau needs all 8 of
+    /// pixel0's neighbours, else 3. The stacking adapter sets it for a debayered OSC group's planes, the probe for a
+    /// 3-plane input; an undebayered CFA plane (Plan C's green sites) keeps the mono rule.
+    pub colour: bool,
 }
 
 impl Default for MeasureOptions {
@@ -105,6 +111,7 @@ impl Default for MeasureOptions {
             diagnostics: false,
             mask: None,
             field_width: None,
+            colour: false,
         }
     }
 }
@@ -183,13 +190,17 @@ pub struct PlaneMeasurement {
     pub defocused: bool,
     /// The readable seeds refused `Donut` (the verdict's `n_donut`).
     pub defocus_donuts: usize,
+    /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4): no flag, no refusal,
+    /// out of the β sample.
+    pub verdict_fit_failed: usize,
     pub timings: PhaseTimings,
 }
 
 /// Measure one plane: the noise model (unless `opts.noise` carries one), the seeds (the matched filter, or the given
-/// ones and their field width) and the fits on the working-unit copy, the frame aggregates over the accepted fits,
-/// the sky statistic on the native plane. The fit runs on `pool` when given one, as do the background model, MRS and
-/// the matched filter.
+/// ones and their field width), the sky statistic on the native plane, then the fits on the working-unit copy — each
+/// seed's saturation verdict first (F-3, Task 8: seeds → field width → verdicts → β sample → fits at β, the plane's
+/// inputs from [`saturation_plane`]) — and the frame aggregates over the accepted fits. The fit runs on `pool` when
+/// given one, as do the background model, MRS and the matched filter.
 pub fn measure_plane(
     plane: &[f32],
     w: usize,
@@ -248,6 +259,17 @@ pub fn measure_plane(
         (SeedSpec::Given(given), None) => given,
         _ => &[],
     };
+    // The saturation test reads the sky median (F-3), so the sky statistic precedes the fits (Q7).
+    let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
+    let saturation = saturation_plane(
+        &working,
+        mask,
+        &noise,
+        &sky,
+        &opts.domain,
+        opts.colour,
+        seeds.len(),
+    );
     let t = Instant::now();
     let fit_call = || {
         fit::fit_stars_diagnosed(
@@ -259,6 +281,7 @@ pub fn measure_plane(
             &opts.fit,
             mask,
             Some(field_width.fwhm_px),
+            Some(&saturation),
             None,
             opts.diagnostics,
             true,
@@ -279,7 +302,6 @@ pub fn measure_plane(
     );
     let diagnostics = std::mem::take(&mut outcome.diagnostics);
     let frame = FrameAggregates::of(&outcome.fits);
-    let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
     PlaneMeasurement {
         stars: outcome.fits,
         beta: outcome.beta,
@@ -293,8 +315,41 @@ pub fn measure_plane(
         diagnostics,
         defocused: outcome.defocused,
         defocus_donuts: outcome.defocus_donuts,
+        verdict_fit_failed: outcome.verdict_fit_failed,
         timings,
     }
+}
+
+/// The plane-level inputs of the saturation test (spec §2.1, PA-23), in working units: `bg` = the sky median
+/// (`sky.median`, the native plane's, scaled by `ADU_SCALE` for a calibrated plane), σ = `noise.sigma`, `norm` =
+/// `ADU_SCALE` for `Domain::Calibrated` and `full_scale` for `Domain::RawAdu` (Q2), the plane max over the working
+/// copy's finite, unmasked pixels. Under [`NoiseSource::None`] σ is 0 and the threshold is the sky median: one
+/// `warn!` per plane when there are seeds to judge (Q1).
+fn saturation_plane(
+    working: &[f32],
+    mask: Option<&[bool]>,
+    noise: &NoiseModel,
+    sky: &SkyLevel,
+    domain: &Domain,
+    colour: bool,
+    n_seeds: usize,
+) -> SaturationPlane {
+    let (scale, norm) = match domain {
+        Domain::Calibrated { .. } => (ADU_SCALE as f64, ADU_SCALE as f64),
+        Domain::RawAdu { full_scale, .. } => (1.0, *full_scale),
+    };
+    if noise.source == NoiseSource::None && n_seeds > 0 {
+        tracing::warn!(
+            count = n_seeds,
+            "measure: no noise estimate; the saturation test's threshold is the sky median"
+        );
+    }
+    let plane_max = working
+        .iter()
+        .enumerate()
+        .filter(|&(i, v)| v.is_finite() && mask.map_or(true, |m| m[i]))
+        .fold(f64::NEG_INFINITY, |m, (_, &v)| m.max(v as f64));
+    SaturationPlane::new(sky.median * scale, noise.sigma, plane_max, norm, colour)
 }
 
 /// The refit entry point LN uses (PA-6): every seed fitted at `beta`. The plane is in the module's working units
@@ -438,6 +493,7 @@ mod tests {
             h,
             &Domain::RawAdu {
                 clip: 65535.0,
+                full_scale: 65535.0,
                 gain_e_per_adu: None,
             },
             ScaleEstimator::Bwmv,
@@ -509,6 +565,7 @@ mod tests {
             h,
             &Domain::RawAdu {
                 clip: 65535.0,
+                full_scale: 65535.0,
                 gain_e_per_adu: None,
             },
             ScaleEstimator::Bwmv,
@@ -548,6 +605,7 @@ mod tests {
             &plane,
             &Domain::RawAdu {
                 clip: 65535.0,
+                full_scale: 65535.0,
                 gain_e_per_adu: None,
             },
         );
@@ -848,6 +906,7 @@ mod tests {
                 threshold: DEFAULT_THRESHOLD,
             },
             false,
+            false,
         );
         let m = measure_plane(
             &data,
@@ -1039,6 +1098,248 @@ mod tests {
             let r = d.region_radius as usize;
             let n = (2 * r + 1) * (2 * r + 1);
             assert!((d.pixels_used as i64 - (n / 2) as i64).abs() <= 1, "{d:?}");
+        }
+    }
+
+    /// F-3 (Plan A Task 8): the saturation test on the module's own seed region (C-f; R2's fixtures, not R1's ± 6F
+    /// box), through `measure_plane`.
+    mod saturation {
+        use super::*;
+        use crate::star_measure::photometry::SaturationVerdict;
+        use crate::test_support::{add_noise, moffat_field, MoffatStar};
+
+        fn clipped(data: &mut [f32], at: f32) {
+            for v in data.iter_mut() {
+                if *v > at {
+                    *v = at;
+                }
+            }
+        }
+        /// `data` measured at the given seeds through the module's own regions, diagnostics on, Moffat-4 (no β sample).
+        fn measured(data: &[f32], w: usize, h: usize, seeds: Vec<Seed>) -> PlaneMeasurement {
+            measure_plane(
+                data,
+                w,
+                h,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    psf_model: PsfModel::Moffat4,
+                    diagnostics: true,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        fn verdict(m: &PlaneMeasurement, seed: usize) -> SaturationVerdict {
+            m.diagnostics
+                .iter()
+                .find(|d| d.seed == seed)
+                .and_then(|d| d.verdict)
+                .expect("a seed with a region has a verdict")
+        }
+        fn seed_at(x: f64, y: f64) -> Seed {
+            Seed {
+                x,
+                y,
+                peak: 0.9,
+                flux: 1.0,
+            }
+        }
+        /// R2's single-star fixtures: FWHM 2.6 at β 4 (α 2.99), off the pixel grid.
+        fn small_core_star(x: f64, y: f64, amp: f64) -> MoffatStar {
+            MoffatStar {
+                x,
+                y,
+                amp,
+                alpha_x: 2.99,
+                alpha_y: 2.99,
+                theta: 0.0,
+            }
+        }
+        fn twelve_clipped() -> (Vec<f32>, Vec<Seed>) {
+            let stars: Vec<MoffatStar> = (0..12)
+                .map(|i| MoffatStar {
+                    x: 30.0 + (i % 4) as f64 * 50.0,
+                    y: 30.0 + (i / 4) as f64 * 50.0,
+                    amp: 3.0,
+                    alpha_x: 3.0,
+                    alpha_y: 3.0,
+                    theta: 0.0,
+                })
+                .collect();
+            let mut data = moffat_field(220, 170, &stars, 4.0, 0.05);
+            clipped(&mut data, 0.95);
+            add_noise(&mut data, 0.002, 5);
+            (data, stars.iter().map(|s| seed_at(s.x, s.y)).collect())
+        }
+
+        #[test]
+        fn a_clipped_star_without_a_full_3x3_plateau_is_fitted_uncensored_and_still_flagged() {
+            // amplitude 3× the clip 0.95: about eight pixels reach the clip, but one neighbour of the centre pixel sits ≈ 0.11
+            // below it (> 0.1·range), so the plateau test fails, the level is norm and nothing is excluded; the uncensored
+            // fit overshoots (R2: A/range 1.30, FWHM +48 %) — spec §2.1's known limit
+            let mut hot = moffat_field(60, 60, &[small_core_star(30.3, 30.7, 2.85)], 4.0, 0.05);
+            clipped(&mut hot, 0.95);
+            add_noise(&mut hot, 0.002, 1);
+            let v = verdict(&measured(&hot, 60, 60, vec![seed_at(30.3, 30.7)]), 0);
+            assert!(!v.plateau && v.excluded == 0 && v.saturated, "{v:?}");
+        }
+
+        #[test]
+        fn a_planes_brightest_unclipped_star_is_flagged_because_its_own_peak_sets_the_range() {
+            // by design (spec §2.1): the lone star at 0.6× the clip sets the plane max, so the range is its own brightest
+            // pixel − bg, and the fitted peak between pixels tops it (R2: A/range 1.08)
+            let mut cool = moffat_field(60, 60, &[small_core_star(30.3, 30.7, 0.57)], 4.0, 0.05);
+            add_noise(&mut cool, 0.002, 1);
+            let v = verdict(&measured(&cool, 60, 60, vec![seed_at(30.3, 30.7)]), 0);
+            assert!(!v.plateau && v.saturated, "{v:?}");
+        }
+
+        #[test]
+        fn a_lone_broad_unclipped_star_passes_the_plateau_test_and_its_censored_fit_keeps_its_width(
+        ) {
+            // FWHM 9.01 (α 24, β 20), peak 0.3 on 0.05: its 3x3 lies within 0.1·range of the centre, so its top is censored
+            // (R2: FWHM within 0.2 %). The flag is not pinned: the lone star sets the range itself (R2: A/range 0.994)
+            let mut broad = moffat_field(
+                120,
+                120,
+                &[MoffatStar {
+                    x: 60.0,
+                    y: 60.0,
+                    amp: 0.3,
+                    alpha_x: 24.0,
+                    alpha_y: 24.0,
+                    theta: 0.0,
+                }],
+                20.0,
+                0.05,
+            );
+            add_noise(&mut broad, 0.002, 2);
+            let v = verdict(&measured(&broad, 120, 120, vec![seed_at(60.0, 60.0)]), 0);
+            let truth = 2.0 * 24.0 * (2f64.powf(1.0 / 20.0) - 1.0).sqrt();
+            assert!(v.plateau && v.excluded >= 9, "{v:?}");
+            assert!((v.fwhm / truth - 1.0).abs() < 0.03, "{} vs {truth}", v.fwhm);
+        }
+
+        #[test]
+        fn a_full_clipped_plateau_is_censored_flagged_and_keeps_its_width() {
+            // every 3x3 of the twelve sits at the clip: the plateau test passes, the level excludes the plateau, and the
+            // censored fit reads the width (R2: 12 of 12 censored and flagged, FWHM median −0.6 %)
+            let (data, seeds) = twelve_clipped();
+            let m = measured(&data, 220, 170, seeds);
+            let truth = 2.0 * 3.0 * (2f64.powf(0.25) - 1.0).sqrt();
+            let mut err: Vec<f64> = (0..12)
+                .map(|i| {
+                    let v = verdict(&m, i);
+                    assert!(v.plateau && v.excluded >= 9 && v.saturated, "{i}: {v:?}");
+                    (v.fwhm / truth - 1.0).abs()
+                })
+                .collect();
+            err.sort_by(f64::total_cmp);
+            assert!(err[6] < 0.03, "median |ΔF|/F {}", err[6]);
+        }
+
+        #[test]
+        fn the_capped_range_flags_a_small_core_star_beside_a_plateau_lifted_above_full_scale() {
+            // a flat-divided field: vignetting 1 + 0.3·d²/28900 about (40, 40) lifts the full plateau at (190, 120) to
+            // ≈ 1.24 (legal on a calibrated plane), which sets the plane max. The range stays 1 − bg, so the small-core star
+            // keeps A/range ≈ 1.25 and is flagged; an uncapped range (1.24 − bg) would put it at ≈ 1.0
+            let stars = [
+                small_core_star(40.3, 40.7, 2.85),
+                MoffatStar {
+                    x: 190.0,
+                    y: 120.0,
+                    amp: 3.0,
+                    alpha_x: 3.0,
+                    alpha_y: 3.0,
+                    theta: 0.0,
+                },
+            ];
+            let (w, h) = (240usize, 160usize);
+            let mut data = moffat_field(w, h, &stars, 4.0, 0.05);
+            clipped(&mut data, 0.95);
+            for y in 0..h {
+                for x in 0..w {
+                    let d2 = (x as f64 - 40.0).powi(2) + (y as f64 - 40.0).powi(2);
+                    data[y * w + x] *= (1.0 + 0.3 * d2 / 28900.0) as f32;
+                }
+            }
+            add_noise(&mut data, 0.002, 3);
+            let m = measured(
+                &data,
+                w,
+                h,
+                vec![seed_at(40.3, 40.7), seed_at(190.0, 120.0)],
+            );
+            let (small, lifted) = (verdict(&m, 0), verdict(&m, 1));
+            assert!(!small.plateau && small.saturated, "{small:?}");
+            assert!(
+                lifted.plateau && lifted.excluded >= 9 && lifted.saturated,
+                "{lifted:?}"
+            );
+        }
+
+        #[test]
+        fn all_saturated_sample_leaves_the_frame_statistic_empty_not_wrong() {
+            let (data, seeds) = twelve_clipped();
+            let m = measure_plane(
+                &data,
+                220,
+                170,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    psf_model: PsfModel::Moffat4,
+                    ..Default::default()
+                },
+                None,
+            );
+            assert_eq!(m.frame.stars_fitted, 12);
+            assert_eq!(m.frame.stars_unsaturated, 0);
+            assert_eq!(m.frame.fwhm_px, None);
+            assert!(m.stars.iter().all(|f| f.flags.saturated()));
+        }
+
+        #[test]
+        fn beta_sample_skips_saturated_stars() {
+            // 70 Moffat-4 stars, the 40 brightest clipped: the discrete Auto search must still resolve 4.0 (the baseline
+            // flipped to 10); R2: 40 of 40 flagged, 0 of 30
+            let stars: Vec<MoffatStar> = (0..70)
+                .map(|i| MoffatStar {
+                    x: 20.0 + (i % 10) as f64 * 40.3,
+                    y: 20.0 + (i / 10) as f64 * 40.7,
+                    amp: if i < 40 { 2.0 } else { 0.25 },
+                    alpha_x: 5.0,
+                    alpha_y: 5.0,
+                    theta: 0.0,
+                })
+                .collect();
+            let mut data = moffat_field(420, 320, &stars, 4.0, 0.05);
+            clipped(&mut data, 0.95);
+            add_noise(&mut data, 0.002, 6);
+            let seeds: Vec<Seed> = stars
+                .iter()
+                .map(|s| Seed {
+                    x: s.x,
+                    y: s.y,
+                    peak: s.amp.min(0.9),
+                    flux: s.amp,
+                })
+                .collect();
+            let m = measure_plane(
+                &data,
+                420,
+                320,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert_eq!(
+                m.beta, 4.0,
+                "the sample is the unsaturated 30, not the clipped 40"
+            );
+            assert_eq!(m.frame.stars_unsaturated, 30);
         }
     }
 }

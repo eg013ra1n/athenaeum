@@ -2072,7 +2072,27 @@ mod tests {
         input.write_weight_map = false;
 
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
-        out.stats.fwhm_px[0]
+        // Plan A Task 8 (F-3, ruling R-OSP-5): this fixture's lone star is its plane's brightest, so its saturation
+        // verdict fit tops the plane's range and it is flagged by design (spec §2.1's false positive); the frame
+        // statistic `stats.fwhm_px` reads the unflagged fits only and is 0.0 here. The test is about the drizzled
+        // star's width, so it reads that star's own accepted fit on the same output plane: the number `stats.fwhm_px`
+        // read before Task 8 (the fit did not move; the four widths read 3.2782, 3.3921, 2.2538, 2.3562 as round 3's).
+        assert_eq!(
+            out.stats.fwhm_px[0], 0.0,
+            "the lone, flagged star is out of the frame statistic"
+        );
+        let n = out.width * out.height;
+        let (pm, _) = crate::stacking::measure::measure_plane_detailed(
+            &out.data[..n],
+            out.width,
+            out.height,
+            &measure,
+            None,
+            crate::stacking::measure::SeedOverride::Fast,
+        );
+        assert_eq!(pm.fits.len(), 1, "the drizzled star is fitted");
+        assert!(pm.fits[0].flags.saturated(), "and flagged");
+        pm.fits[0].fwhm()
     }
 
     // R-M3-14 (fix round 1, review-confirmed): `measure_plane` runs on the

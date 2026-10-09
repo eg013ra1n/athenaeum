@@ -1,6 +1,7 @@
 //! Frame aggregates over the accepted fits (math reference §1.1; spec 2026-10-07 §2.1 `frame`): the PSF-signal totals
 //! `TFlux` / `TMeanFlux` and the residual-weighted frame FWHM and eccentricity. Moved verbatim from `psf_signal` (Plan
-//! A Task 2).
+//! A Task 2). F-3 (Task 8): the frame FWHM and eccentricity are the residual-weighted means over the accepted
+//! UNSATURATED fits (the statistic's population); the signal totals still sum every accepted fit.
 
 use super::fit::StarFit;
 
@@ -59,12 +60,18 @@ pub fn signal_totals(fits: &[StarFit]) -> SignalTotals {
 
 /// Frame FWHM and eccentricity: residual-weighted means over the fits
 /// (`ω_i = res_min / res_i`, residuals floored at 1e-6). `None` without fits.
-pub fn frame_shape(fits: &[StarFit]) -> Option<(f64, f64)> {
-    if fits.is_empty() {
+/// Any iterator of fits (Task 8: [`FrameAggregates::of`] hands it the unsaturated ones); it is walked twice.
+pub fn frame_shape<'a, I>(fits: I) -> Option<(f64, f64)>
+where
+    I: IntoIterator<Item = &'a StarFit>,
+    I::IntoIter: Clone,
+{
+    let fits = fits.into_iter();
+    if fits.clone().next().is_none() {
         return None;
     }
     let res_min = fits
-        .iter()
+        .clone()
         .map(|f| f.residual.max(1e-6))
         .fold(f64::INFINITY, f64::min);
     let (mut sw, mut sf, mut se) = (0.0, 0.0, 0.0);
@@ -78,15 +85,18 @@ pub fn frame_shape(fits: &[StarFit]) -> Option<(f64, f64)> {
 }
 
 /// The frame aggregates one plane's accepted fits give (spec 2026-10-07 §2.1 `frame`), in the module's working units.
-/// `fwhm_px`/`eccentricity` are `None` exactly where [`frame_shape`] is `None` (no accepted fit); the stacking adapter
-/// maps that to `0.0`, as its `unwrap_or((0.0, 0.0))` always has (ruling F14 fixes the type now so Task 8's
-/// unsaturated statistic changes no test).
+/// `fwhm_px`/`eccentricity` are the residual-weighted means over the accepted fits NOT flagged
+/// [`super::StarFlags::SATURATED`] (F-3, Task 8), `None` exactly where [`frame_shape`] is `None` (no accepted
+/// unsaturated fit); the stacking adapter maps that to `0.0`, as its `unwrap_or((0.0, 0.0))` always has (which passes
+/// `select_frames`'s `max_fwhm_px`; the plan gate's and the UI's reading of `stars_unsaturated = 0` is Plan C's, M-12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameAggregates {
     pub fwhm_px: Option<f64>,
     pub eccentricity: Option<f64>,
-    /// Every accepted fit.
+    /// Every accepted fit, saturated ones included (M-4).
     pub stars_fitted: usize,
+    /// The accepted fits not flagged saturated: the frame statistic's population (F-3).
+    pub stars_unsaturated: usize,
     /// [`SignalTotals::tflux`].
     pub tflux: f64,
     /// [`SignalTotals::tmean_flux`].
@@ -96,14 +106,17 @@ pub struct FrameAggregates {
 }
 
 impl FrameAggregates {
-    /// [`signal_totals`] and [`frame_shape`] over `fits`, the two calls the stacking Measure stage has always made.
+    /// [`signal_totals`] over every fit and [`frame_shape`] over the unsaturated ones (F-3), the two calls the stacking
+    /// Measure stage has always made.
     pub fn of(fits: &[StarFit]) -> FrameAggregates {
         let totals = signal_totals(fits);
-        let shape = frame_shape(fits);
+        let unsaturated = || fits.iter().filter(|f| !f.flags.saturated());
+        let shape = frame_shape(unsaturated());
         FrameAggregates {
             fwhm_px: shape.map(|(f, _)| f),
             eccentricity: shape.map(|(_, e)| e),
             stars_fitted: fits.len(),
+            stars_unsaturated: unsaturated().count(),
             tflux: totals.tflux,
             tmean_flux: totals.tmean_flux,
             mean_flux_rejected: totals.rejected,

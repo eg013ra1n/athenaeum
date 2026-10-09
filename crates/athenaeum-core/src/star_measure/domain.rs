@@ -43,8 +43,11 @@ pub enum Domain {
     /// A calibrated float plane in [0, 1]; the module multiplies by `ADU_SCALE` exactly where the adapter did.
     Calibrated { gain_e_per_unit: Option<f64> },
     /// A raw ADU plane; `clip` = the sensor's clip level in the plane's own units (BITPIX/BZERO or DATAMAX).
+    /// `full_scale` = the stored integer type's full scale, `2^bits − 1` from BITPIX/BZERO (65535 for unsigned 16-bit,
+    /// 255 for 8-bit; never DATAMAX): the saturation test's `norm` (F-3, Task 8, Q2). `clip` keeps its own readers.
     RawAdu {
         clip: f64,
+        full_scale: f64,
         gain_e_per_adu: Option<f64>,
     },
 }

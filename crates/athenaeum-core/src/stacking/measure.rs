@@ -17,10 +17,10 @@ use tracing::{debug, warn};
 use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed, StarFit};
 use super::structure::{self, StructureParams};
-use crate::stacking::config::SeedSource;
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{LocationScale, ScaleEstimator};
 use crate::integration::IntegrationError;
+use crate::stacking::config::SeedSource;
 use crate::star_measure as sm;
 
 // `ADU_SCALE` (calibrated frames are float32 in `[0, 1]`; the detector and
@@ -145,6 +145,9 @@ pub struct ChannelMeasurement {
     /// camelCase name (`{"regionTooSmall": 12, "duplicate": 3}`); empty in a
     /// payload written before Plan A Task 4.
     pub refused_by_reason: BTreeMap<String, usize>,
+    /// Of `stars_fitted`, the fits not flagged saturated (F-3, Plan A Task 8): the population `fwhm_px` and
+    /// `eccentricity` are measured over. `0` in a payload written before that task.
+    pub stars_unsaturated: usize,
     pub beta: f64,
     pub fwhm_px: f64,
     pub eccentricity: f64,
@@ -247,6 +250,9 @@ pub struct PlaneMeasurement {
     pub defocused: bool,
     /// The readable seeds refused `Donut` (the verdict's `n_donut`). Reported, not persisted.
     pub defocus_donuts: usize,
+    /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Plan A Task 8, Q4; the
+    /// probe's `verdictFitFailed`). Reported, not persisted.
+    pub verdict_fit_failed: usize,
 }
 
 /// A probe-level override of the seed detector (ruling F26). A run never passes one: it selects its detector
@@ -315,7 +321,7 @@ pub fn measure_plane_detailed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedOverride,
 ) -> (PlaneMeasurement, Vec<Seed>) {
-    let (pm, seeds, _) = measure_plane_diagnosed(data, w, h, opts, pool, seed_source, false);
+    let (pm, seeds, _) = measure_plane_diagnosed(data, w, h, opts, pool, seed_source, false, false);
     (pm, seeds)
 }
 
@@ -324,6 +330,14 @@ pub fn measure_plane_detailed(
 /// the returned seeds' order (empty otherwise). Same call, same numbers: the
 /// records are a report the lab's `star_probe --diagnostics` writes; the run
 /// never asks for them.
+///
+/// `colour` (F-3, Plan A Task 8, Q3): the plane is one of a debayered colour
+/// frame's, so the saturation test's plateau needs all 8 neighbours
+/// (`star_measure::MeasureOptions::colour`). [`measure_frame_inner`] sets it
+/// for a 3-plane calibrated frame (a debayered OSC group's), the probe for a
+/// 3-plane input; [`measure_plane_detailed`] and its wrappers measure one
+/// plane on its own and pass `false`.
+#[allow(clippy::too_many_arguments)]
 pub fn measure_plane_diagnosed(
     data: &[f32],
     w: usize,
@@ -332,6 +346,7 @@ pub fn measure_plane_diagnosed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedOverride,
     diagnostics: bool,
+    colour: bool,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
     // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
     // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
@@ -541,6 +556,7 @@ pub fn measure_plane_diagnosed(
         diagnostics,
         mask: None,
         field_width: None,
+        colour,
     };
     let m = sm::measure_plane(data, w, h, &module_opts, pool);
     let seeds = match module_opts.seeds {
@@ -570,6 +586,7 @@ pub fn measure_plane_diagnosed(
         stars_fitted: m.frame.stars_fitted,
         stars_refused: m.refused.total(),
         refused_by_reason: m.refused.by_name(),
+        stars_unsaturated: m.frame.stars_unsaturated,
         beta: m.beta,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
@@ -612,6 +629,7 @@ pub fn measure_plane_diagnosed(
             field_width: m.field_width,
             defocused: m.defocused,
             defocus_donuts: m.defocus_donuts,
+            verdict_fit_failed: m.verdict_fit_failed,
         },
         seeds,
         m.diagnostics,
@@ -666,6 +684,9 @@ fn measure_frame_inner(
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
+    // F-3 (Plan A Task 8, Q3): a 3-plane calibrated frame is a debayered OSC group's, whose saturation test needs all
+    // 8 neighbours of the seed pixel; a mono frame has one plane.
+    let colour = reader.channels() == 3;
     let mut channels = Vec::with_capacity(reader.channels());
     let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(reader.channels());
     for plane in 0..reader.channels() {
@@ -676,7 +697,7 @@ fn measure_frame_inner(
         let data = reader.read_plane(plane)?;
         let read_ms = t.elapsed().as_millis() as u64;
         let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
-        let pm = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
+        let pm = measure_plane_diagnosed(&data, w, h, opts, pool, seed_source, false, colour).0;
         let mut m = pm.channel;
         m.timings.read_ms = read_ms;
         // Once per plane, from the measure path only (Task 6b fix wave A, review M1): the fit reports the verdict, this
@@ -767,14 +788,13 @@ pub(crate) mod tests {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
         let plain = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast);
-        let (detailed, seeds) = measure_plane_detailed(&data, w, h, &opts, None, SeedOverride::Fast);
+        let (detailed, seeds) =
+            measure_plane_detailed(&data, w, h, &opts, None, SeedOverride::Fast);
         assert_eq!(seeds.len(), detailed.channel.stars_detected);
         assert!(!seeds.is_empty());
         for f in &detailed.fits {
             assert!(
-                seeds
-                    .iter()
-                    .any(|sd| (sd.x - f.x).hypot(sd.y - f.y) <= 2.0),
+                seeds.iter().any(|sd| (sd.x - f.x).hypot(sd.y - f.y) <= 2.0),
                 "fit at ({}, {}) has no seed within 2 px",
                 f.x,
                 f.y
@@ -1150,9 +1170,13 @@ pub(crate) mod tests {
         // on the Windows runner against this Mac's ..._304, one ulp. A last-bit
         // FWHM is not a contract, so this aggregate is pinned to a few ulp,
         // never exactly; the fields above stay exact on every platform.
-        // F-1 (Task 6b round 3, ruling R9): as above; the previous literal was 4.129_358_265_048_832 (round 1), before
+        // F-3 (Task 8, ruling R-OSP-5): the frame statistic reads the unflagged fits only — 141 of the 150 here (the
+        // brightest stars' verdict fits top the plane's range, by design); the fits, β and the totals did not move. The
+        // previous literal was 4.129_401_659_376_219 (Task 6b round 3).
+        // F-1 (Task 6b round 3, ruling R9): as above; the literal before it was 4.129_358_265_048_832 (round 1), before
         // it 4.123_653_811_131_548 (Task 6b's first round), 4.123_100_751_260_767 (Task 5) and 4.122_658_320_014_304.
-        assert_ulp_close(c.fwhm_px, 4.129_401_659_376_219, "fwhm_px");
+        assert_eq!(c.stars_unsaturated, 141);
+        assert_ulp_close(c.fwhm_px, 4.129_098_214_007_167_5, "fwhm_px");
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
         // so they're zeroed before the comparison (perf tier 1 Task 0).
@@ -1332,11 +1356,22 @@ pub(crate) mod tests {
         let c = measure_plane(&data, w, h, &MeasureOptions::default(), None);
         assert!(c.stars_detected > 0);
         assert!(c.stars_refused >= 1, "the edge stars are refused: {c:?}");
-        assert!(c.refused_by_reason.get("outsideImage").copied().unwrap_or(0) >= 1, "{:?}", c.refused_by_reason);
+        assert!(
+            c.refused_by_reason
+                .get("outsideImage")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "{:?}",
+            c.refused_by_reason
+        );
         assert_eq!(c.stars_fitted + c.stars_refused, c.stars_detected);
         assert_eq!(c.refused_by_reason.values().sum::<usize>(), c.stars_refused);
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("\"starsRefused\":") && json.contains("\"refusedByReason\":"), "{json}");
+        assert!(
+            json.contains("\"starsRefused\":") && json.contains("\"refusedByReason\":"),
+            "{json}"
+        );
         let old: ChannelMeasurement =
             serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
         assert_eq!((old.stars_refused, old.refused_by_reason.len()), (0, 0));
@@ -1393,12 +1428,16 @@ pub(crate) mod tests {
         // F-1 (Task 6b round 3, ruling R9: the start shape from the starting square); the previous literal was
         // 4.130_191_893_023_729 (round 1), before it 4.123_144_488_377_148 (Task 6b's first round),
         // 4.121_938_449_255_613 (Task 5) and 4.121_806_182_224_867.
-        assert_ulp_close(m.fwhm_px, 4.130_443_961_173_142, "fwhm_px");
-        // As above; the previous literal was 0.110_290_631_118_640_29 (round 1), before it 0.109_077_618_457_969_11
-        // (Task 6b's first round), 0.111_709_924_171_636_75 (Task 5) and 0.095_246_020_871_036_08.
-        assert_ulp_close(m.eccentricity, 0.113_127_912_625_514_87, "eccentricity");
-        m.fwhm_px = 4.130_443_961_173_142;
-        m.eccentricity = 0.113_127_912_625_514_87;
+        // F-3 (Task 8, ruling R-OSP-5): the statistic's population is the 141 unflagged fits of 150 (the fits did not
+        // move); the previous literals were fwhm_px 4.130_443_961_173_142 and eccentricity 0.113_127_912_625_514_87
+        // (Task 6b round 3).
+        assert_ulp_close(m.fwhm_px, 4.130_618_758_639_208_5, "fwhm_px");
+        // As above; the literal before Task 8 was 0.113_127_912_625_514_87, before it 0.110_290_631_118_640_29 (round 1),
+        // 0.109_077_618_457_969_11 (Task 6b's first round), 0.111_709_924_171_636_75 (Task 5) and
+        // 0.095_246_020_871_036_08.
+        assert_ulp_close(m.eccentricity, 0.113_726_031_990_419_54, "eccentricity");
+        m.fwhm_px = 4.130_618_758_639_208_5;
+        m.eccentricity = 0.113_726_031_990_419_54;
         // F-1 (Task 6b round 3, ruling R9): the start shape from the region's starting square moved the fit; round 1
         // read fwhm_px 4.130191893023729, eccentricity 0.11029063111864029, tflux 571.0240326481198, tmean_flux
         // 11.813958121959663, psf_signal_weight 0.0014726432553409737, psf_snr 0.002168467672133753.
@@ -1414,8 +1453,8 @@ pub(crate) mod tests {
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
-stars_refused: 0, refused_by_reason: {}, \
-beta: 10.0, fwhm_px: 4.130443961173142, eccentricity: 0.11312791262551487, \
+stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 141, \
+beta: 10.0, fwhm_px: 4.1306187586392085, eccentricity: 0.11372603199041954, \
 tflux: 571.0507421478552, tmean_flux: 11.813155657437393, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -1439,7 +1478,10 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         assert_eq!((c.stars_detected, c.stars_fitted), (150, 150));
         assert_eq!(c.beta, 10.0);
         assert_eq!(c.psf_signal_weight, 1.391_065_217_128_910_3e-3);
-        assert_ulp_close(c.fwhm_px, 4.129_369_725_278_327, "fwhm_px");
+        // F-3 (Task 8, ruling R-OSP-5): the statistic over the 141 unflagged fits of 150; the previous literal was
+        // 4.129_369_725_278_327.
+        assert_eq!(c.stars_unsaturated, 141);
+        assert_ulp_close(c.fwhm_px, 4.129_063_469_967_53, "fwhm_px");
     }
 
     /// Task 7 (ruling F14): the full-record pin on the matched-filter default; the Peak record is
@@ -1449,18 +1491,28 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
     fn measure_plane_with_seeds_matched_filter_default_record() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
         let mut m = without_timings(
-            measure_plane_with_seeds(&data, w, h, &MeasureOptions::default(), None, SeedOverride::Fast).channel,
+            measure_plane_with_seeds(
+                &data,
+                w,
+                h,
+                &MeasureOptions::default(),
+                None,
+                SeedOverride::Fast,
+            )
+            .channel,
         );
-        // The two shape aggregates are pinned to a few ulp and snapped, as in the Peak record.
-        assert_ulp_close(m.fwhm_px, 4.130_362_798_202_614, "fwhm_px");
-        assert_ulp_close(m.eccentricity, 0.111_119_809_985_610_2, "eccentricity");
-        m.fwhm_px = 4.130_362_798_202_614;
-        m.eccentricity = 0.111_119_809_985_610_2;
+        // The two shape aggregates are pinned to a few ulp and snapped, as in the Peak record. F-3 (Task 8, ruling
+        // R-OSP-5): over the 141 unflagged fits of 150 (the fits did not move); the previous literals were fwhm_px
+        // 4.130_362_798_202_614 and eccentricity 0.111_119_809_985_610_2.
+        assert_ulp_close(m.fwhm_px, 4.130_521_827_498_531, "fwhm_px");
+        assert_ulp_close(m.eccentricity, 0.112_086_634_567_625_24, "eccentricity");
+        m.fwhm_px = 4.130_521_827_498_531;
+        m.eccentricity = 0.112_086_634_567_625_24;
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
-stars_refused: 0, refused_by_reason: {}, \
-beta: 10.0, fwhm_px: 4.130362798202614, eccentricity: 0.1111198099856102, \
+stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 141, \
+beta: 10.0, fwhm_px: 4.130521827498531, eccentricity: 0.11208663456762524, \
 tflux: 571.0623650541556, tmean_flux: 11.813897354284132, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \

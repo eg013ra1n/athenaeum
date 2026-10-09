@@ -21,7 +21,7 @@
 //! production carries them ×65535.
 //!
 //! F-0 (Plan A Task 4): every star line carries `flags` (the named
-//! `StarFlags`, `[]` until a later task sets one); the measure and betas frame
+//! `StarFlags`; the measure path sets `saturated` from Task 8); the measure and betas frame
 //! lines carry `refused: {total, byReason, notSelected, trimmed}`, so
 //! `fits + refused.total + notSelected + trimmed = seeds`; with
 //! `--diagnostics` the measure path also writes one line per refused seed,
@@ -36,6 +36,18 @@
 //! carries the EFFECTIVE `seedSource` (`matchedFilter` | `peak` |
 //! `structure`) and `seedThreshold` (the matched filter's K, else null), so
 //! the lab reads the threshold the probe actually ran.
+//!
+//! F-3 (Plan A Task 8, ruling R-OSP-5): a 3-plane input is measured as a
+//! debayered colour image (`colour`: the saturation test's plateau needs all 8
+//! neighbours). The measure frame line carries `starsUnsaturated` (the frame
+//! statistic's population), `mostlySaturated` (the seeds refused
+//! `mostlySaturated`, also in `refused.byReason`), `verdictFitFailed` (the
+//! seeds whose verdict fit failed otherwise: no flag, no refusal) and
+//! `colour`. With `--diagnostics` every measure star line carries its `seed`
+//! and `verdict`, and every refused line its `verdict` (null when the seed had
+//! none: refused before its region, a donut, or `mostlySaturated`):
+//! `{plateau, level, excluded, amplitude, beta, fwhm, saturated, fit}`, the
+//! level and the amplitude ÷ 65535 like every energy here.
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -58,7 +70,8 @@ use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
 use athenaeum_core::star_measure::{
-    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts,
+    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts, RefusalReason,
+    SaturationVerdict,
 };
 use serde_json::{json, Value};
 
@@ -177,6 +190,19 @@ fn refused_counts(c: &RefusalCounts) -> Value {
     json!({"total": c.total(), "byReason": c.by_reason, "notSelected": c.not_selected, "trimmed": c.trimmed})
 }
 
+/// A seed's saturation verdict (F-3), the level and the amplitude ÷ 65535.
+fn verdict_json(v: Option<SaturationVerdict>) -> Value {
+    let s = ADU_SCALE as f64;
+    match v {
+        None => Value::Null,
+        Some(v) => json!({
+            "plateau": v.plateau, "level": n_or_null(v.level / s), "excluded": v.excluded,
+            "amplitude": n_or_null(v.amplitude / s), "beta": n_or_null(v.beta), "fwhm": n_or_null(v.fwhm),
+            "saturated": v.saturated, "fit": v.fit,
+        }),
+    }
+}
+
 /// One `refused` line per seed the path did not accept (`--diagnostics`);
 /// `None` for an accepted one.
 fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
@@ -190,7 +216,7 @@ fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
         "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "reason": reason,
         "regionRadius": d.region_radius, "backgroundStart": n_or_null(d.background_start / ADU_SCALE as f64),
         "widthStart": n_or_null(d.width_start), "growthSteps": d.growth_steps, "iterations": d.iterations,
-        "converged": d.converged,
+        "converged": d.converged, "verdict": verdict_json(d.verdict),
     }))
 }
 
@@ -434,7 +460,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     let mut out = BufWriter::new(file);
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
     // Ruling F3: the EFFECTIVE seed source and threshold, override included.
-    let mut measure_options = serde_json::to_value(opts).unwrap_or_else(|e| die(format!("options: {e}")));
+    let mut measure_options =
+        serde_json::to_value(opts).unwrap_or_else(|e| die(format!("options: {e}")));
     if let Some(m) = measure_options.as_object_mut() {
         m.insert("seedSource".into(), json!(opts.seed_source.as_str()));
         let k = (opts.seed_source == SeedSource::MatchedFilter).then_some(opts.seed_threshold);
@@ -451,9 +478,19 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         if !need_measure {
             continue;
         }
+        // F-3 (Q3): a 3-plane input is a debayered colour image.
+        let colour = planes.len() == 3;
         let t = Instant::now();
-        let (pm, seeds, diagnostics) =
-            measure_plane_diagnosed(&planes[p], w, h, &opts, None, seed_source, a.diagnostics);
+        let (pm, seeds, diagnostics) = measure_plane_diagnosed(
+            &planes[p],
+            w,
+            h,
+            &opts,
+            None,
+            seed_source,
+            a.diagnostics,
+            colour,
+        );
         let wall = t.elapsed().as_millis() as u64;
         let s = ADU_SCALE as f64;
         if want("measure") {
@@ -462,8 +499,20 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                     json!({"kind": "seed", "plane": p, "i": i, "x": sd.x, "y": sd.y, "peak": sd.peak / s, "flux": sd.flux / s}),
                 );
             }
-            for f in &pm.fits {
-                emit(fit_line("measure", p, None, f))
+            // `--diagnostics`: each accepted star's seed record (its seed index and saturation verdict).
+            let mut star_seed: Vec<Option<&FitDiagnostics>> = vec![None; pm.fits.len()];
+            for d in &diagnostics {
+                if let Outcome::Accepted { star } = d.outcome {
+                    star_seed[star] = Some(d);
+                }
+            }
+            for (k, f) in pm.fits.iter().enumerate() {
+                let mut line = fit_line("measure", p, None, f);
+                if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
+                    obj.insert("seed".into(), json!(d.seed));
+                    obj.insert("verdict".into(), verdict_json(d.verdict));
+                }
+                emit(line)
             }
             for d in &diagnostics {
                 if let Some(line) = refused_line("measure", p, d) {
@@ -473,10 +522,18 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             // The adapter runs every seed (no budget): notSelected and trimmed are 0.
             let refused = json!({"total": pm.channel.stars_refused, "byReason": pm.channel.refused_by_reason,
                                  "notSelected": 0, "trimmed": 0});
+            let mostly_saturated = pm
+                .channel
+                .refused_by_reason
+                .get(RefusalReason::MostlySaturated.name())
+                .copied()
+                .unwrap_or(0);
             emit(
                 json!({"kind": "frame", "path": "measure", "plane": p, "beta": pm.channel.beta,
                         "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
-                        "statistic": "residual-weighted mean over all accepted fits",
+                        "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
+                        "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
+                        "verdictFitFailed": pm.verdict_fit_failed, "colour": colour,
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
                         "channel": pm.channel, "options": options, "conversion": conversion,
                         "domain": domain, "nonFinite": non_finite, "wallMs": wall}),
@@ -810,7 +867,11 @@ mod tests {
     #[test]
     fn refused_lines_plus_fits_equal_seeds() {
         let d = tempfile::tempdir().unwrap();
-        let mut a = args(d.path().join("p.fits"), d.path().join("p.jsonl"), &["measure"]);
+        let mut a = args(
+            d.path().join("p.fits"),
+            d.path().join("p.jsonl"),
+            &["measure"],
+        );
         a.diagnostics = true;
         // The NaN border alone refuses no seed (the detector seeds nothing there), so one more star sits 7 px from the
         // unmasked right edge: it is seeded, and its width-start box (radius ⌈2·F_field⌉ = 8 px for the field's FWHM
@@ -825,15 +886,26 @@ mod tests {
         write_fits_f32(&a.image, 240, 240, 1, &data, &[]).unwrap();
         cmd_measure(a).unwrap();
         let lines = read_lines(&d.path().join("p.jsonl"));
-        let frame = lines.iter().find(|v| v["kind"] == "frame" && v["path"] == "measure").unwrap();
+        let frame = lines
+            .iter()
+            .find(|v| v["kind"] == "frame" && v["path"] == "measure")
+            .unwrap();
         let refused = lines.iter().filter(|v| v["kind"] == "refused").count();
         assert!(
-            lines.iter().any(|v| v["kind"] == "refused" && v["reason"] == "outsideImage"),
+            lines
+                .iter()
+                .any(|v| v["kind"] == "refused" && v["reason"] == "outsideImage"),
             "the edge star is refused outsideImage: {frame}"
         );
         assert_eq!(refused as u64, frame["refused"]["total"].as_u64().unwrap());
-        assert_eq!(frame["fits"].as_u64().unwrap() + refused as u64, frame["seeds"].as_u64().unwrap());
-        assert!(lines.iter().filter(|v| v["kind"] == "refused").all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
+        assert_eq!(
+            frame["fits"].as_u64().unwrap() + refused as u64,
+            frame["seeds"].as_u64().unwrap()
+        );
+        assert!(lines
+            .iter()
+            .filter(|v| v["kind"] == "refused")
+            .all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
     }
 
     /// Plan A Task 6b round 1 (ruling R3): the betas arm starts from the measure path's field width, so at the measure's
@@ -925,13 +997,30 @@ mod tests {
             assert!(m["fits"].as_u64().unwrap() > 0, "{source}: {m}");
         }
         // No flags: the config's own source stands; `--seeds` overrides it.
-        let structure = MeasureOptions { seed_source: SeedSource::Structure, ..MeasureOptions::default() };
+        let structure = MeasureOptions {
+            seed_source: SeedSource::Structure,
+            ..MeasureOptions::default()
+        };
         let (o, s) = effective_seeds(structure, None, None);
-        assert_eq!((o.seed_source, s), (SeedSource::Structure, SeedOverride::Fast), "the config's source stands");
+        assert_eq!(
+            (o.seed_source, s),
+            (SeedSource::Structure, SeedOverride::Fast),
+            "the config's source stands"
+        );
         let (o, _) = effective_seeds(structure, Some(SeedChoice::Peak), None);
-        assert_eq!(o.seed_source, SeedSource::Peak, "peak is forced over a structure config");
-        assert_eq!(MeasureOptions::default().seed_source, SeedSource::MatchedFilter);
-        assert_eq!(MeasureOptions::default().seed_threshold, athenaeum_core::star_measure::seeds::DEFAULT_THRESHOLD);
+        assert_eq!(
+            o.seed_source,
+            SeedSource::Peak,
+            "peak is forced over a structure config"
+        );
+        assert_eq!(
+            MeasureOptions::default().seed_source,
+            SeedSource::MatchedFilter
+        );
+        assert_eq!(
+            MeasureOptions::default().seed_threshold,
+            athenaeum_core::star_measure::seeds::DEFAULT_THRESHOLD
+        );
     }
 
     #[test]
@@ -1041,7 +1130,10 @@ mod tests {
     #[test]
     fn legacy_analysis_is_an_alias_of_analysis_and_an_unknown_path_is_refused() {
         let d = tempfile::tempdir().unwrap();
-        let data: Vec<f32> = gaussian_field(128, 128, 0, true).iter().map(|v| (v * 65535.0).round()).collect();
+        let data: Vec<f32> = gaussian_field(128, 128, 0, true)
+            .iter()
+            .map(|v| (v * 65535.0).round())
+            .collect();
         let img = d.path().join("p.fits");
         write_fits_f32(&img, 128, 128, 1, &data, &[]).unwrap();
         let a = d.path().join("a.jsonl");
@@ -1050,7 +1142,10 @@ mod tests {
         cmd_measure(args(img.clone(), b.clone(), &["legacy-analysis"])).unwrap();
         assert_eq!(without_clocks(&a), without_clocks(&b));
         let lines = read_lines(&b);
-        assert!(lines.iter().filter(|v| v["kind"] == "star").count() > 0, "the control is not empty");
+        assert!(
+            lines.iter().filter(|v| v["kind"] == "star").count() > 0,
+            "the control is not empty"
+        );
         assert!(lines.iter().all(|v| v["path"] == "analysis"));
         let c = d.path().join("c.jsonl");
         let err = cmd_measure(args(img, c.clone(), &["bogus"])).unwrap_err();

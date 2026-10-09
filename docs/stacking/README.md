@@ -2153,3 +2153,59 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (0.0294 → 0.0290 px).
     - **The F-2 rows at t06a (reported).** Angle `eff` is 0.75–1.28 on the 24 shape cells (t05: 0.82–1.31). Axis
       order is 100 % on every family and path.
+- **F-3 - the per-seed saturation verdict and the unsaturated statistics (Task 8; numbers move by design).**
+  - **R-OSP-5 - one saturation test per seed, after the field width: an established stacking program's method,
+    adopted as is (owner ruling 2026-10-09, spec §2.1, PA-23).** The flat-top wing test (PA-8) failed on lab truth
+    and is retired; its constants were never measured here and neither are these.
+    - **The plane's inputs** (`star_measure::photometry::SaturationPlane`, working units): bg = the module's sky
+      median, σ = the noise model's σ, threshold = bg + **5σ**, norm = the plane's full scale (`ADU_SCALE` for a
+      calibrated plane; for raw ADU the stored integer type's, `Domain::RawAdu.full_scale`, never DATAMAX), range =
+      min(plane max, norm) − bg. The cap keeps the range at full scale where a flat division lifts a plateau above
+      1.0.
+    - **The plateau test at the seed pixel** (`plateau_level`): of pixel0's 8 neighbours, those ≥ threshold must
+      number **≥ 3 of 8** on a mono plane or **8 of 8** on a debayered colour plane (`MeasureOptions.colour`: the
+      stacking adapter's 3-plane OSC frames, the probe's 3-plane input), with meanhigh − bg ≥ **0.7**·range and
+      pixel0 − minhigh ≤ **0.1**·range. The level is min(pixel0, norm) − 0.1·range when it passes, else norm.
+    - **The verdict fit** (`saturation_verdict`): a free-β Moffat (`fit_moffat_2d`; the bounded fit from Task 9) on
+      the seed's own region (F-1) without its pixels ≥ the level, started at the region's rim median, the seed and
+      the star's own F_start, round; the iteration limit **×3** when any pixel is excluded. **n ≤ 8** pixels left
+      (the fit's 8 parameters) refuses the seed `mostlySaturated`. A fit that fails otherwise gives no flag and no
+      refusal (`fit = false`, counted as `verdict_fit_failed`) and keeps the seed out of the β sample (Q4).
+    - **The flag** is the verdict fit's amplitude above the range; the plateau test only sets the level.
+    - **The three substitutes** for the reference method's own inputs: bg is the module's sampled, clipped sky median
+      (PA-21), σ is the MRS σ (`N*` when MRS is refused; 0 under `NoiseSource::None`, one `warn!` per plane), and
+      pixel0 is the pixel at the rounded seed centre (`fit_one`'s own `(cx, cy)`).
+    - **The order** (`fit::fit_stars_diagnosed`): seeds → field width → verdicts → β sample → fits at β. The verdict
+      pass runs `fit_one`'s steps 1–4 (admission, width start, region, donut test) per seed, so a seed refused there
+      gets no verdict. The `Auto` β sample is the 64 brightest seeds whose verdict fit succeeded unflagged. Every
+      star is then fitted at the frame β with its verdict's exclusion (pixels ≥ its level, ×3 iterations; Q6) and
+      keeps its flag in the `.athf` flags byte: a star without a plateau has the level norm and is fitted as before.
+      The frame FWHM and eccentricity are the residual-weighted means over the accepted unflagged fits
+      (`FrameAggregates.stars_unsaturated`; `None`, and the adapter's `fwhm_px = 0.0`, when there is none).
+      `stars_fitted` and the PSF-signal totals still count every accepted fit (M-4).
+    - **Measure path only** (Q7). `measure_plane` runs the verdicts; LN's refits (`fit_stars_at`, `fit_stars`,
+      `fit_stars_with_beta`) and the probe's betas arm run none: no flag, the brightest 64 seeds.
+    - **The field width runs no saturation test** (ruling F25 as folded): PA-17's median reads every candidate,
+      because the verdict's region needs it. Cost if wrong: a field width biased on frames dominated by saturated
+      stars.
+    - **Known limit, three consumers.** A star whose clipped core is small (3–5 px) fails the full-3×3 plateau test,
+      so its verdict fit runs uncensored: it is still flagged, but its own FWHM is not trusted. No consumer reads it:
+      the frame statistics exclude flagged stars, the Analysis tab (Plan C) takes unsaturated stars, and registration
+      takes centroids.
+    - **The row and the payoff.** Row 10 `saturation flag vs truth`: false negatives ≤ 0.5 % among truth-saturated
+      stars with ≥ 3 clipped core pixels, false positives reported (a plane's brightest star sets its own range by
+      design). The payoff is the censored verdict fit's FWHM error where the plateau test passed, beside the
+      failed ones: `<pending t08-f3>`.
+    - **Measure wall time** (one real calibrated mono frame, release probe, interleaved runs): `<pending C-b>`.
+  - **The surfaces.** `RefusalReason::MostlySaturated` (`mostlySaturated`, declared last); `FitDiagnostics.verdict`;
+    `ChannelMeasurement.stars_unsaturated` (camelCase `starsUnsaturated`, 0 in a payload written before Task 8); the
+    adapter's `PlaneMeasurement.verdict_fit_failed` (reported, not persisted); the probe's measure frame line
+    `starsUnsaturated`, `mostlySaturated`, `verdictFitFailed`, `colour`, and under `--diagnostics` each star and
+    refused line's `verdict`.
+  - **Moved pins (by design: the statistic's population, the β sample, the stored censored width).** Each literal
+    carries its previous value. On the 150-star fixture fields 9 of 150 fits are flagged (the brightest stars' verdict
+    fits top the plane's range, the by-design false positive); the fits, β and the PSF-signal totals do not move, the
+    frame FWHM and eccentricity move by 4–7e-5 relative (`stacking::measure` tests: the Peak and matched-filter
+    records, `the_shipped_none_path_…`, `the_matched_filter_default_…`). The drizzle sharpening test's lone star is
+    flagged the same way, so `stats.fwhm_px` reads 0.0 there and the test reads the star's own fit (unchanged).
+  - **Acceptance.** The lab step `t08-f3`: `<pending t08-f3>`.

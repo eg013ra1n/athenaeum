@@ -834,6 +834,7 @@ mod tests {
                     stars_fitted: stars,
                     stars_refused: 0,
                     refused_by_reason: Default::default(),
+                    stars_unsaturated: stars,
                     beta: 4.0,
                     fwhm_px: fwhm,
                     eccentricity: ecc,

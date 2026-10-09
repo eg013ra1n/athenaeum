@@ -25,6 +25,14 @@
 //! (its core about a local iterated centre against a ring at the box moments' radius about it, round 3, R7/R8), and a
 //! fit narrower than 0.8 px `NarrowerThanPixel`. The field σ0 from the seeds' flux/peak and the field-level nominal
 //! stamp are retired.
+//!
+//! F-3 (Plan A Task 8, ruling R-OSP-5): on the measure path every seed whose region is gathered gets ONE saturation
+//! verdict ([`super::photometry::saturation_verdict`]: the plateau test at the seed pixel, then a censored free-β
+//! verdict fit, flagged when its amplitude tops the plane's range), after the field width and before the β sample:
+//! seeds → field width → verdicts → β sample → fits at β ([`fit_stars_diagnosed`]). The `Auto` β sample is the 64
+//! brightest seeds whose verdict fit succeeded unflagged; every star is fitted at β with its verdict's exclusion
+//! (pixels ≥ its level, ×3 iterations) and carries its flag in [`StarFlags::SATURATED`]. A seed whose verdict fit
+//! keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -38,6 +46,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
+use super::photometry::{
+    saturation_verdict, SaturationPlane, SaturationVerdict, EXCLUDED_ITERATION_FACTOR,
+};
 use super::seeds::{field_width_of, own_halfmax_width, FieldWidth};
 use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 
@@ -117,9 +128,8 @@ impl Default for FitParams {
 }
 
 /// Per-accepted-fit flags (spec 2026-10-07 §3 F-0), persisted as the `.athf` record's flags byte
-/// (`stacking::fits_artifact`). Set from Task 8 (`SATURATED`) and Task 9 (`BETA_AT_CAP`); nothing sets them yet, so
-/// every fit reads none. A bit this build does not name is kept as it is (a newer writer's flag survives a round
-/// trip).
+/// (`stacking::fits_artifact`). `SATURATED` is set from Task 8 (the measure path's saturation verdict), `BETA_AT_CAP`
+/// from Task 9. A bit this build does not name is kept as it is (a newer writer's flag survives a round trip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StarFlags(pub u8);
@@ -140,6 +150,11 @@ impl StarFlags {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// [`StarFlags::SATURATED`] is set (F-3): the β sample and the frame statistic skip the star.
+    pub const fn saturated(self) -> bool {
+        self.contains(StarFlags::SATURATED)
     }
 
     /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`).
@@ -248,6 +263,9 @@ pub struct FitOutcome {
     pub defocused: bool,
     /// The readable seeds that refused `Donut` (the verdict's `n_donut`); 0 unless the caller asked for the verdict.
     pub defocus_donuts: usize,
+    /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4: no flag, no refusal, out
+    /// of the β sample); 0 on every path that runs no verdict.
+    pub verdict_fit_failed: usize,
 }
 
 /// A plane with this many readable seeds refused `Donut`, and at least [`DEFOCUSED_DONUT_FRACTION`] of its readable
@@ -284,6 +302,8 @@ const REGION_START_MIN_PX: i64 = 3;
 const REGION_MAX_PER_WIDTH: f64 = 6.0;
 const REGION_MAX_MIN_PX: i64 = 6;
 const REGION_MAX_MAX_PX: i64 = 96;
+/// A region with fewer present pixels than this is refused `TooFewPixels`.
+const MIN_REGION_PIXELS: usize = 10;
 /// The donut test (Task 6b): a star whose 3×3 core mean is below this fraction of its 1-px ring's mean is refused
 /// `Donut`.
 const DONUT_CORE_TO_RING: f64 = 0.8;
@@ -535,11 +555,16 @@ fn grow_region(
 /// `clear()`ed at the point it starts being rebuilt for a new seed, so a
 /// worker's retained capacity is invisible to the numbers: the content is
 /// always exactly what a fresh, empty `Vec` would have accumulated.
+///
+/// Public from Task 8 because [`super::photometry::saturation_verdict`] takes it (its fields stay the module's): the
+/// verdict pass hands each worker's instance to the verdict, which builds its fit's pixels in `verdict`.
 #[derive(Default)]
-struct FitScratch {
-    region: Vec<f32>,
-    rim: Vec<f32>,
-    px: Vec<PixelSample>,
+pub struct FitScratch {
+    pub(super) region: Vec<f32>,
+    pub(super) rim: Vec<f32>,
+    pub(super) px: Vec<PixelSample>,
+    /// The saturation verdict fit's pixels: the region's below the level, conditioned (F-3).
+    pub(super) verdict: Vec<PixelSample>,
 }
 
 /// What [`fit_one`] records about one seed beside its result: [`FitDiagnostics`] without the seed index and the
@@ -557,7 +582,26 @@ struct FitTrace {
 }
 
 impl FitTrace {
-    fn record(self, seed: usize, outcome: Outcome) -> FitDiagnostics {
+    /// Until the region grows, its radius reads the width-start box's; the start width and background read NaN.
+    fn before_region(field_width: f64) -> FitTrace {
+        let rb = width_start_box_radius(field_width);
+        FitTrace {
+            region_radius: rb.min(u16::MAX as i64) as u16,
+            background_start: f64::NAN,
+            width_start: f64::NAN,
+            growth_steps: 0,
+            pixels_used: 0,
+            converged: false,
+            readable: false,
+        }
+    }
+
+    fn record(
+        self,
+        seed: usize,
+        outcome: Outcome,
+        verdict: Option<SaturationVerdict>,
+    ) -> FitDiagnostics {
         FitDiagnostics {
             seed,
             outcome,
@@ -568,6 +612,7 @@ impl FitTrace {
             pixels_used: self.pixels_used,
             iterations: None,
             converged: self.converged,
+            verdict,
         }
     }
 }
@@ -851,6 +896,13 @@ fn is_donut(
 ///    moments (`√ratio` clamped to [1, 2]) at their angle ([`start_shape`]); then the acceptance rules ([`accept`],
 ///    `NarrowerThanPixel` among them).
 ///
+/// `verdict` is the seed's saturation verdict when the caller ran the verdict pass (F-3, Task 8; `None` otherwise,
+/// and for a seed the pass gave none — it is refused here at step 1, 3 or 4 exactly as there). `MostlySaturated`
+/// refuses the seed after step 4. A verdict's level is the fit's exclusion (Q6): the region's pixels at or above it
+/// are left out of the fit (its start shape included) and the iteration limit is ×3 when any is; an unflagged star
+/// without a plateau has the level `norm`, which no pixel normally reaches, so it is fitted byte-identically. An
+/// accepted fit copies the verdict's flag into [`StarFlags::SATURATED`].
+///
 /// The [`FitTrace`] records the region and the start whatever the result. A pixel `mask` leaves its `false` pixels
 /// out exactly like non-finite ones (Task 6a).
 #[allow(clippy::too_many_arguments)]
@@ -863,74 +915,44 @@ fn fit_one(
     field_width: f64,
     beta: f64,
     p: &FitParams,
+    verdict: Option<&Result<SaturationVerdict, RefusalReason>>,
     scratch: &mut FitScratch,
 ) -> (Result<StarFit, RefusalReason>, FitTrace) {
-    let rb = width_start_box_radius(field_width);
-    // Until the region grows, its radius reads the width-start box's; the start width and background read NaN.
-    let mut trace = FitTrace {
-        region_radius: rb.min(u16::MAX as i64) as u16,
-        background_start: f64::NAN,
-        width_start: f64::NAN,
-        growth_steps: 0,
-        pixels_used: 0,
-        converged: false,
-        readable: false,
-    };
-    let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
-    if cx - rb < 0 || cy - rb < 0 || cx + rb >= w as i64 || cy + rb >= h as i64 {
+    let mut trace = FitTrace::before_region(field_width);
+    let Some(SeedRegion {
+        cx,
+        cy,
+        rb,
+        start,
+        r_start,
+        r,
+        b0,
+    }) = seed_region(data, mask, w, h, seed, field_width, p, scratch, &mut trace)
+    else {
         return (Err(RefusalReason::OutsideImage), trace);
-    }
-    let start = width_start(data, mask, w, h, seed, cx, cy, rb, field_width, scratch);
-    trace.width_start = start.fwhm;
-    trace.readable = start.readable;
-    let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
-    let r_max = ((REGION_MAX_PER_WIDTH * start.fwhm).ceil() as i64)
-        .clamp(REGION_MAX_MIN_PX, REGION_MAX_MAX_PX)
-        .min(to_border);
-    let r_start = ((REGION_START_PER_WIDTH * start.fwhm).ceil() as i64)
-        .max(REGION_START_MIN_PX)
-        .min(r_max);
-    let (r, b0) = grow_region(data, mask, w, cx, cy, r_start, r_max, p, scratch);
-    let step = p.region_growth_step_px.max(1) as i64;
-    // `r ≤ 96`, so the radius fits a u16.
-    trace.region_radius = r as u16;
-    trace.growth_steps = ((r - r_start) / step).clamp(0, u8::MAX as i64) as u8;
-    trace.background_start = b0;
-    let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
-    scratch.px.clear();
-    scratch.px.reserve(cap);
-    let mut peak = f64::NEG_INFINITY;
-    // The five largest values seen, ascending (L-12's `peak5`).
-    let mut top = [f64::NEG_INFINITY; 5];
-    for y in cy - r..=cy + r {
-        for x in cx - r..=cx + r {
-            let i = y as usize * w + x as usize;
-            if !present(data, mask, i) {
-                continue;
-            }
-            let v64 = data[i] as f64;
-            peak = peak.max(v64);
-            if v64 > top[0] {
-                top[0] = v64;
-                top.sort_by(f64::total_cmp);
-            }
-            // F-2: stamp-centred coordinates (exact integers), the value
-            // normalised below once the start background and amplitude are
-            // known.
-            scratch.px.push(PixelSample {
-                x: (x - cx) as f64,
-                y: (y - cy) as f64,
-                value: v64,
-            });
-        }
-    }
+    };
+    let (peak, top) = gather_region(data, mask, w, cx, cy, r, &mut scratch.px);
     // The region's present pixels: at most (2r+1)² ≤ 193², so a u32 holds it.
     trace.pixels_used = scratch.px.len() as u32;
-    if scratch.px.len() < 10 {
+    if scratch.px.len() < MIN_REGION_PIXELS {
         return (Err(RefusalReason::TooFewPixels), trace);
     }
     if is_donut(data, mask, w, h, seed, cx, cy, rb, &start, b0) {
         return (Err(RefusalReason::Donut), trace);
+    }
+    // F-3 (Task 8, Q6): the verdict's level is the fit's exclusion, its flag the fit's.
+    let (level, saturated) = match verdict {
+        Some(Err(reason)) => return (Err(*reason), trace),
+        Some(Ok(v)) => (Some(v.level), v.saturated),
+        None => (None, false),
+    };
+    let mut max_iter = p.max_iter;
+    if let Some(level) = level {
+        let before = scratch.px.len();
+        scratch.px.retain(|s| s.value < level);
+        if scratch.px.len() < before {
+            max_iter = EXCLUDED_ITERATION_FACTOR * p.max_iter;
+        }
     }
     let a0 = (peak - b0).max(1e-9);
     // F-2 (Plan A Task 5): the fitter sees a conditioned problem — the stamp
@@ -965,7 +987,7 @@ fn fit_one(
         sy0,
         th0,
         beta,
-        p.max_iter,
+        max_iter,
         p.conv_tol,
         p.max_rejects,
     ) else {
@@ -984,7 +1006,183 @@ fn fit_one(
     aperture(data, mask, w, h, &mut f, p.growth);
     // At least 10 present pixels were gathered, so all five slots are filled.
     f.peak5 = top.iter().sum::<f64>() / top.len() as f64;
+    if saturated {
+        f.flags |= StarFlags::SATURATED;
+    }
     (Ok(f), trace)
+}
+
+/// A seed's region as [`fit_one`] and the verdict pass ([`seed_verdict`]) both read it (steps 1–3): the width-start
+/// box radius `rb`, the width start, the starting and final radii and the rim median `b0` (PA-12).
+struct SeedRegion {
+    cx: i64,
+    cy: i64,
+    rb: i64,
+    start: WidthStart,
+    r_start: i64,
+    r: i64,
+    b0: f64,
+}
+
+/// Steps 1–3 of [`fit_one`] (moved out unchanged for the verdict pass, Task 8): the PA-18 box admission (`None` =
+/// `OutsideImage`), the width start and the PA-12 region with its rim median, recorded on `trace`.
+#[allow(clippy::too_many_arguments)]
+fn seed_region(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seed: &Seed,
+    field_width: f64,
+    p: &FitParams,
+    scratch: &mut FitScratch,
+    trace: &mut FitTrace,
+) -> Option<SeedRegion> {
+    let rb = width_start_box_radius(field_width);
+    let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
+    if cx - rb < 0 || cy - rb < 0 || cx + rb >= w as i64 || cy + rb >= h as i64 {
+        return None;
+    }
+    let start = width_start(data, mask, w, h, seed, cx, cy, rb, field_width, scratch);
+    trace.width_start = start.fwhm;
+    trace.readable = start.readable;
+    let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
+    let r_max = ((REGION_MAX_PER_WIDTH * start.fwhm).ceil() as i64)
+        .clamp(REGION_MAX_MIN_PX, REGION_MAX_MAX_PX)
+        .min(to_border);
+    let r_start = ((REGION_START_PER_WIDTH * start.fwhm).ceil() as i64)
+        .max(REGION_START_MIN_PX)
+        .min(r_max);
+    let (r, b0) = grow_region(data, mask, w, cx, cy, r_start, r_max, p, scratch);
+    let step = p.region_growth_step_px.max(1) as i64;
+    // `r ≤ 96`, so the radius fits a u16.
+    trace.region_radius = r as u16;
+    trace.growth_steps = ((r - r_start) / step).clamp(0, u8::MAX as i64) as u8;
+    trace.background_start = b0;
+    Some(SeedRegion {
+        cx,
+        cy,
+        rb,
+        start,
+        r_start,
+        r,
+        b0,
+    })
+}
+
+/// The region's present pixels into `px` (cleared first), in stamp-centred coordinates (exact integers) and plane
+/// values, row by row; returns the region's maximum and its five largest values, ascending (L-12's `peak5`).
+fn gather_region(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    cx: i64,
+    cy: i64,
+    r: i64,
+    px: &mut Vec<PixelSample>,
+) -> (f64, [f64; 5]) {
+    let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
+    px.clear();
+    px.reserve(cap);
+    let mut peak = f64::NEG_INFINITY;
+    // The five largest values seen, ascending (L-12's `peak5`).
+    let mut top = [f64::NEG_INFINITY; 5];
+    for y in cy - r..=cy + r {
+        for x in cx - r..=cx + r {
+            let i = y as usize * w + x as usize;
+            if !present(data, mask, i) {
+                continue;
+            }
+            let v64 = data[i] as f64;
+            peak = peak.max(v64);
+            if v64 > top[0] {
+                top[0] = v64;
+                top.sort_by(f64::total_cmp);
+            }
+            // F-2: stamp-centred coordinates (exact integers), the value
+            // normalised by the caller once the start background and
+            // amplitude are known.
+            px.push(PixelSample {
+                x: (x - cx) as f64,
+                y: (y - cy) as f64,
+                value: v64,
+            });
+        }
+    }
+    (peak, top)
+}
+
+/// One seed's verdict-pass entry (F-3): `None` when the seed is refused before its region (`OutsideImage`,
+/// `TooFewPixels`) or as a `Donut` — [`fit_one`] refuses it again at the same step — else the verdict or
+/// `MostlySaturated`.
+pub(crate) type SeedVerdict = Option<Result<SaturationVerdict, RefusalReason>>;
+
+/// One seed's saturation verdict (spec §2.1, PA-23): [`fit_one`]'s steps 1–4 (admission, width start, region, donut
+/// test) on the same field width, then [`saturation_verdict`] on the unnormalised region in stamp coordinates, from
+/// the region's rim median `b0` and the star's own `F_start`.
+#[allow(clippy::too_many_arguments)]
+fn seed_verdict(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seed: &Seed,
+    field_width: f64,
+    plane: &SaturationPlane,
+    p: &FitParams,
+    scratch: &mut FitScratch,
+) -> SeedVerdict {
+    let mut trace = FitTrace::before_region(field_width);
+    let reg = seed_region(data, mask, w, h, seed, field_width, p, scratch, &mut trace)?;
+    gather_region(data, mask, w, reg.cx, reg.cy, reg.r, &mut scratch.px);
+    if scratch.px.len() < MIN_REGION_PIXELS
+        || is_donut(
+            data, mask, w, h, seed, reg.cx, reg.cy, reg.rb, &reg.start, reg.b0,
+        )
+    {
+        return None;
+    }
+    let region = std::mem::take(&mut scratch.px);
+    let verdict = saturation_verdict(
+        &region,
+        seed.x - reg.cx as f64,
+        seed.y - reg.cy as f64,
+        reg.b0,
+        reg.start.fwhm,
+        plane,
+        p,
+        scratch,
+    );
+    scratch.px = region;
+    Some(verdict)
+}
+
+/// Every seed's verdict, in seed order (F-3). Runs on `pool` when given one, one [`FitScratch`] per worker as
+/// [`fit_all_outcomes`] does.
+#[allow(clippy::too_many_arguments)]
+fn seed_verdicts(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    mask: Option<&[bool]>,
+    field_width: f64,
+    plane: &SaturationPlane,
+    p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<SeedVerdict> {
+    let body = || {
+        seeds
+            .par_iter()
+            .map_init(FitScratch::default, |scratch, s| {
+                seed_verdict(data, mask, w, h, s, field_width, plane, p, scratch)
+            })
+            .collect()
+    };
+    match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
+    }
 }
 
 /// The acceptance rules (math reference §1.4), each refusal with its reason. The first gate is one condition, as it
@@ -1188,6 +1386,7 @@ fn dedupe(mut fits: Vec<(usize, StarFit)>) -> Vec<(usize, StarFit)> {
 ///
 /// The accepted fits, in seed order (the `Auto` β search's sample reads
 /// their residuals); [`fit_all_outcomes`] keeps every seed's outcome.
+/// `verdicts` (one per seed, F-3) as [`fit_all_outcomes`] takes them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_all(
     data: &[f32],
@@ -1198,18 +1397,32 @@ pub(super) fn fit_all(
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: f64,
+    verdicts: Option<&[SeedVerdict]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<StarFit> {
-    fit_all_outcomes(data, w, h, seeds, beta, p, mask, field_width, pool)
-        .into_iter()
-        .filter_map(|(result, _)| result.ok())
-        .collect()
+    fit_all_outcomes(
+        data,
+        w,
+        h,
+        seeds,
+        beta,
+        p,
+        mask,
+        field_width,
+        verdicts,
+        pool,
+    )
+    .into_iter()
+    .filter_map(|(result, _)| result.ok())
+    .collect()
 }
 
 /// Every seed's result and trace, in seed order (M-4): the parallel chain is
 /// the one `fit_all` always ran, collected per seed instead of filtered in
 /// flight — rayon's indexed `collect` keeps the order, so the accepted fits
 /// read off it sequentially are exactly the list the filtered chain gave.
+/// `verdicts` (F-3): one per seed, in seed order, when the caller ran the verdict pass — each seed is fitted with its
+/// own ([`fit_one`]); `None` fits every seed as before.
 #[allow(clippy::too_many_arguments)]
 fn fit_all_outcomes(
     data: &[f32],
@@ -1220,17 +1433,21 @@ fn fit_all_outcomes(
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: f64,
+    verdicts: Option<&[SeedVerdict]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<(Result<StarFit, RefusalReason>, FitTrace)> {
+    debug_assert!(verdicts.map_or(true, |v| v.len() == seeds.len()));
     let body = || {
         seeds
             .par_iter()
+            .enumerate()
             // `map_init` calls `FitScratch::default` once per worker (not
             // per seed) and hands that same instance to every seed the
             // worker processes — `fit_one` clears each buffer itself, so
             // this is only the allocation that disappears, never the data.
-            .map_init(FitScratch::default, |scratch, s| {
-                fit_one(data, mask, w, h, s, field_width, beta, p, scratch)
+            .map_init(FitScratch::default, |scratch, (i, s)| {
+                let verdict = verdicts.and_then(|v| v[i].as_ref());
+                fit_one(data, mask, w, h, s, field_width, beta, p, verdict, scratch)
             })
             .collect()
     };
@@ -1256,7 +1473,9 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false, false)
+    fit_stars_diagnosed(
+        data, w, h, seeds, model, p, None, None, None, pool, false, false,
+    )
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -1291,6 +1510,11 @@ fn resolve_field_width(
 /// order, in [`FitOutcome::diagnostics`] when `diagnostics` is set (empty
 /// otherwise: the run never asks).
 /// `mask` and `field_width` as [`super::FitStarsOptions`] carries them.
+///
+/// `saturation` (F-3, Task 8; the measure path's, [`super::measure_plane`]): the plane's saturation inputs. Given,
+/// the order is seeds → field width → verdicts ([`seed_verdicts`]) → β sample (the `Auto` search over the seeds
+/// whose verdict fit succeeded unflagged) → fits at β, each with its seed's verdict. `None` (every other caller):
+/// no verdict, no flag, the brightest seeds as the β sample.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_diagnosed(
     data: &[f32],
@@ -1301,18 +1525,31 @@ pub(super) fn fit_stars_diagnosed(
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: Option<f64>,
+    saturation: Option<&SaturationPlane>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
+    let verdicts = saturation
+        .map(|plane| seed_verdicts(data, w, h, seeds, mask, field.fwhm_px, plane, p, pool));
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
         // Tier C Task 1: a caller-resolved β (the group β, or any other
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
         // `Auto` search below never runs for it.
         PsfModel::Fixed(b) => b,
-        PsfModel::Auto => super::beta::auto_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
+        PsfModel::Auto => super::beta::auto_beta(
+            data,
+            w,
+            h,
+            seeds,
+            verdicts.as_deref(),
+            p,
+            mask,
+            field.fwhm_px,
+            pool,
+        ),
     };
     fit_at_width(
         data,
@@ -1323,6 +1560,7 @@ pub(super) fn fit_stars_diagnosed(
         p,
         mask,
         field,
+        verdicts.as_deref(),
         pool,
         diagnostics,
         defocus_verdict,
@@ -1389,13 +1627,15 @@ pub(super) fn fit_stars_with_beta_diagnosed(
         p,
         mask,
         field,
+        None,
         pool,
         diagnostics,
         defocus_verdict,
     )
 }
 
-/// The body both entry points share once β and the field width are resolved.
+/// The body both entry points share once β and the field width are resolved. `verdicts`: the measure path's verdict
+/// pass (F-3), `None` on every other path.
 #[allow(clippy::too_many_arguments)]
 fn fit_at_width(
     data: &[f32],
@@ -1406,11 +1646,23 @@ fn fit_at_width(
     p: &FitParams,
     mask: Option<&[bool]>,
     field: FieldWidth,
+    verdicts: Option<&[SeedVerdict]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
 ) -> FitOutcome {
-    let per_seed = fit_all_outcomes(data, w, h, seeds, beta, p, mask, field.fwhm_px, pool);
+    let per_seed = fit_all_outcomes(
+        data,
+        w,
+        h,
+        seeds,
+        beta,
+        p,
+        mask,
+        field.fwhm_px,
+        verdicts,
+        pool,
+    );
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(per_seed.len());
     let mut traces: Vec<FitTrace> =
         Vec::with_capacity(if diagnostics { per_seed.len() } else { 0 });
@@ -1454,12 +1706,20 @@ fn fit_at_width(
         seeds.len(),
         "every seed has exactly one outcome (ruling F13)"
     );
+    let verdict_of = |seed: usize| -> Option<SaturationVerdict> {
+        verdicts.and_then(|v| v[seed].as_ref().and_then(|r| r.ok()))
+    };
     let diagnostics = traces
         .into_iter()
         .zip(outcomes)
         .enumerate()
-        .map(|(seed, (trace, outcome))| trace.record(seed, outcome))
+        .map(|(seed, (trace, outcome))| trace.record(seed, outcome, verdict_of(seed)))
         .collect();
+    let verdict_fit_failed = verdicts.map_or(0, |v| {
+        v.iter()
+            .filter(|x| matches!(x, Some(Ok(sv)) if !sv.fit))
+            .count()
+    });
     FitOutcome {
         fits,
         beta,
@@ -1469,6 +1729,7 @@ fn fit_at_width(
         diagnostics,
         defocused,
         defocus_donuts: if defocus_verdict { n_donut } else { 0 },
+        verdict_fit_failed,
     }
 }
 
