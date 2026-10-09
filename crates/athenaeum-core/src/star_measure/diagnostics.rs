@@ -21,8 +21,8 @@ pub enum RefusalReason {
     TooFewPixels,
     /// The core is darker than the ring (Task 6b's donut test).
     Donut,
-    /// The fitter returned `None` (α < 0.3, A ≤ 0, β out of bounds), or returned a fit with `A ≤ 0` or an axis
-    /// `α ≤ 0`.
+    /// The fitter returned `None` (α < 0.3, A ≤ 0, β out of bounds, or a solve that never left its start — fix round
+    /// A4), or returned a fit with `A ≤ 0` or an axis `α ≤ 0`.
     FitFailed,
     /// A fitted parameter or the fit residual is not finite.
     NonFinite,

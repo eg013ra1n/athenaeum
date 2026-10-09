@@ -2290,8 +2290,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       Now, in the bounded entry point only (`GuardedStep::UncountedBeforeFirstStep`), a refusal before the first
       accepted step raises λ without spending the budget (after one, refusals count as before), and a solve that
       accepted no step and did not converge is refused (`None`): the verdict reads `fit = false`, the sample fit is
-      counted out (`sample_median`'s `debug!` names how many). The legacy entry points and the fit at β keep the
-      counted refusal, output-identical. Unit: a censored integrated m2.5 star (50 above a 1.0 clip, 50 pixels
+      counted out (`sample_median`'s `debug!` names how many). The legacy entry points keep the counted refusal,
+      output-identical; the fit at β kept it until fix round A4 (next item). Unit: a censored integrated m2.5 star (50 above a 1.0 clip, 50 pixels
       excluded, started at F 2.5) is flagged (verdict amplitude 56.98) and its integrated fit reads β 2.5007 (before:
       the start, β 3 and the clipped amplitude 0.96). On the six planes the stuck sample fits go 57 → 0: the real saturated stars among them
       are flagged now; frame β 6.390 → 11.598, 3.000 → 3.551 and 3.000 → 3.666 on the three mono2 frames, 3.687 →
@@ -2301,6 +2301,24 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       still enter the sample unflagged, now with β 2–5 or 27–100 instead of exactly 3 (11–12 of 64 on the mono2
       frames); and a region whose rim median equals its maximum (`a0` at its 1e-9 floor) is conditioned to ±1e8,
       where the shape steps fall under one ulp — one such sample star still reads exactly 3.
+    - **The fit at β never returns its start either** (fix round A4, rustafits, the same branch). The conditioned
+      fixed-β entry point every star is fitted at still counted each guard refusal, so 80 of its fits stopped on
+      their start (B, A, the centre bit for bit) on 10 of the 21 planes surveyed — LDN_1272 mono and OSC, the six
+      inject frames, eleven saturated/density/clipped-mixture lab frames (none on the lab frames): 45 unflagged
+      accepted, 22 flagged accepted, 13 then refused by acceptance. Two causes: 43 had counted guard refusals (22 of
+      them flagged censored stars, the A3 mechanism), 37 unflagged ones five cost rejections from their start (small
+      undersampled stars, 32 of them on the LDN OSC planes). The entry point now takes `fit_moffat_2d_bounded`'s rule
+      (`GuardedStep::UncountedBeforeFirstStep`: an uncounted guard refusal before the first accepted step, and a
+      solve that accepted no step and did not converge refused); the caller counts it `fitFailed` and a plane-level
+      `debug!` names how many fits failed. Only the stuck runs change (the two rules part only in a solve the counted
+      one ended before its first step). After: 0 stuck; the 43 now move — 3 stay flagged fits, 23 are refused
+      `centreMoved` (19 of them the flagged ones, in saturated blobs on the mono2 frames), 16 `narrowerThanPixel`,
+      `residualTooLarge` or `regionTooSmall`, 1 `fitFailed` — and the 37 are refused `fitFailed`. 79 records change,
+      nothing else: the frame β and its sample are identical everywhere; on LDN_1272 mono 1 accepted fit fewer (FWHM
+      +5e-6 relative), on the OSC planes 9 / 10 / 14 fewer (FWHM −5e-5 … −9e-5). Unit: the censored star of A3 at
+      its own β 2.5 left its start (before: A 0.96, the start FWHM 2.5, the seed's centre) and converges at FWHM
+      2.125, centre within 5e-5 px (amplitude 59.8: the point model on integrated pixels); with 3 iterations, or at
+      the 1.3.0 entry point, it does not move: refused here, returned there as it always was.
     - **The fit at β has no β ceiling** (rustafits, the same branch, 0ebc618). The shared Moffat acceptance refused
       any β > 20, the fixed arm included, so every star of a frame whose β rose above 20 was refused `fitFailed`. The
       conditioned fixed-β entry point (R-OSP-3, the one the fits at β use) now fits any fixed β ≥ 1; below 20 its

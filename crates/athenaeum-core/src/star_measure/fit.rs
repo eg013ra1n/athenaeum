@@ -51,7 +51,7 @@ use astroimage::analysis::fitting::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::beta::BetaSource;
 use super::diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
@@ -918,7 +918,10 @@ fn is_donut(
 ///    annular star `Donut` before any fit.
 /// 5. **The fit** starts at `b0`, `a0 = max − b0`, σ `F_start/2.3548` split by the axis ratio of the starting square's
 ///    moments (`√ratio` clamped to [1, 2]) at their angle ([`start_shape`]); then the acceptance rules ([`accept`],
-///    `NarrowerThanPixel` among them).
+///    `NarrowerThanPixel` among them). A fit the fitter refuses is `FitFailed` — a solve that never left its start
+///    among them (fix round A4: rustafits refuses it unless the start itself converged; before, it was returned at
+///    its start as a fit — a censored star whose guard-refused first steps spent the reject budget, a small star whose
+///    first five steps all raised the cost).
 ///
 /// `pass` is the seed's verdict-pass record when the caller ran the verdict pass (F-3, Task 8; `None` otherwise): its
 /// steps 1–4 are taken from it, not run again (a seed refused there is refused with the pass's reason and trace; the
@@ -1913,6 +1916,19 @@ fn fit_at_width(
         if let Outcome::Refused(reason) = *o {
             refused.add(reason);
         }
+    }
+    // A fit at β the fitter refused (a solve that never left its start among them, fix round A4) is counted, not
+    // silent.
+    let failed = refused
+        .by_reason
+        .get(&RefusalReason::FitFailed)
+        .copied()
+        .unwrap_or(0);
+    if failed > 0 {
+        debug!(
+            count = seeds.len(),
+            failed, beta, "fit at beta: seeds whose fit failed are refused fitFailed"
+        );
     }
     let fits: Vec<StarFit> = kept.into_iter().map(|(_, f)| f).collect();
     debug_assert_eq!(
