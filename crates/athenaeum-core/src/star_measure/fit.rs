@@ -1261,7 +1261,8 @@ fn seed_pass(
 
 /// Every seed's verdict-pass record, in seed order (F-3). Runs on `pool` when given one, one [`FitScratch`] per worker
 /// as [`fit_all_outcomes`] does. On [`SaturationPlane::UNTESTED`] each record's verdict is the bare bounded free-β
-/// fit — the frame β's own sample for a caller that ran no verdict (F-4, Q7, [`super::beta::frame_beta`]).
+/// fit (the verdict path; a caller that ran no verdict takes its frame β from the pixel-integrated re-fit, F-4 E5,
+/// [`integrated_beta_on_region`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn seed_passes(
     data: &[f32],
@@ -1950,6 +1951,13 @@ fn fit_at_width(
             .filter(|x| matches!(x.verdict, Some(Ok(sv)) if !sv.fit))
             .count()
     });
+    if verdict_fit_failed > 0 {
+        debug!(
+            count = seeds.len(),
+            failed = verdict_fit_failed,
+            "saturation verdict: seeds whose verdict fit failed are unflagged by amplitude and counted"
+        );
+    }
     FitOutcome {
         fits,
         beta,

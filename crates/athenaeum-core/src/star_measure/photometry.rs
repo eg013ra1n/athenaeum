@@ -15,7 +15,8 @@
 //!    (`fit_moffat_2d_bounded`: ln β in [`BETA_BOUNDS`], start β [`BETA_START`], the corrected θ column), a point
 //!    model; the unflagged bright seeds are the frame β's sample, each re-fitted on the same pixels from the same
 //!    starts with the pixel-integrated model ([`integrated_beta`], the owner's E5; [`super::beta`]).
-//! 3. **The flag**: the verdict fit's amplitude above the range. The plateau test only sets the level.
+//! 3. **The flag**: the verdict fit's amplitude above the range, or (plateau-clip clause, owner 2026-10-09) a passed
+//!    plateau test with `pixel0 − bg ≥ 0.9·range`, whatever the fitted amplitude and even when the fit failed.
 //!
 //! 4. **The cross-plane rule** (owner ruling 2026-10-09): on an image of more than one plane, a star flagged on any
 //!    plane is flagged on every plane at that position (seeds within 1 px; [`super::cross_plane_flags`]), because the
@@ -132,7 +133,8 @@ pub struct SaturationPlane {
 impl SaturationPlane {
     /// No saturation test (F-4, Q7): every threshold, level and range infinite, so no seed has a plateau, no pixel is
     /// excluded and nothing is flagged. [`saturation_verdict`] on it is the bare bounded free-β fit from the verdict
-    /// fit's own starts — the frame β's own sample for a caller that ran no verdict ([`super::beta::frame_beta`]).
+    /// fit's own starts (a caller that ran no verdict takes its frame β from the pixel-integrated re-fit instead,
+    /// [`super::beta::frame_beta`] via `integrated_beta_on_region`).
     pub const UNTESTED: SaturationPlane = SaturationPlane {
         bg: 0.0,
         threshold: f64::INFINITY,
@@ -164,6 +166,7 @@ impl SaturationPlane {
 /// The seed centre is rounded half up, `⌊s + 0.5⌋`: in stamp coordinates that is always (0, 0) for a seed whose
 /// `cx = round(x)` (`fit_one`'s own pixel, rounded half away from zero on a positive image coordinate), including a
 /// seed exactly between two pixels. A region without pixel0 has no plateau.
+#[cfg(test)]
 pub(crate) fn plateau_level(
     region: &[PixelSample],
     seed_x: f64,
@@ -173,7 +176,7 @@ pub(crate) fn plateau_level(
     plateau_test(region, seed_x, seed_y, plane).map(|(level, _)| level)
 }
 
-/// [`plateau_level`] with pixel0's value beside the level: `Some((level, pixel0))` when the test passes. R2 reads
+/// The plateau level with pixel0's value beside it: `Some((level, pixel0))` when the test passes. The plateau-clip clause readss
 /// pixel0 against the clip band.
 pub(crate) fn plateau_test(
     region: &[PixelSample],
@@ -237,7 +240,7 @@ pub struct SaturationVerdict {
     pub saturated: bool,
     /// Clause 1: the verdict fit succeeded and `amplitude > range`.
     pub by_amplitude: bool,
-    /// Clause 2 (R2, owner 2026-10-09): the plateau test passed and `pixel0 − bg ≥ 0.9·range` (pixel0 within the
+    /// Clause 2 (plateau-clip, owner 2026-10-09): the plateau test passed and `pixel0 − bg ≥ 0.9·range` (pixel0 within the
     /// test's own 0.1·range band of the clip), whatever the fitted amplitude. It needs no fit: a verdict whose fit
     /// failed (`fit = false`) with a passed plateau at the clip is flagged.
     pub by_plateau_clip: bool,
@@ -263,7 +266,7 @@ pub struct SaturationVerdict {
 /// conditioned problem (F-2): the values `(v − b0)/a0` with `a0` = the region's maximum − `b0`, started at B = 0,
 /// A = 1, round at `σ = f_start/2.3548`, θ = 0; the amplitude is mapped back to working units. A fit that returns
 /// nothing (α < 0.3, A ≤ 0, a non-finite parameter, or a solve that never left its start — fix round A3), or a
-/// non-finite or non-positive amplitude or width, is `fit = false` (no flag, no refusal; Q4); a β at a bound is a fit.
+/// non-finite or non-positive amplitude or width, is `fit = false` (no refusal; Q4; no amplitude flag, but the plateau-clip clause still applies); a β at a bound is a fit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn saturation_verdict(
     region: &[PixelSample],
@@ -278,7 +281,7 @@ pub(crate) fn saturation_verdict(
     let test = plateau_test(region, seed_x, seed_y, plane);
     let plateau = test.map(|(level, _)| level);
     let level = plateau.unwrap_or(plane.norm);
-    // R2: pixel0 within the plateau test's own band (0.1·range) of the clip
+    // plateau-clip clause: pixel0 within the plateau test's own band (0.1·range) of the clip
     let by_plateau_clip =
         test.is_some_and(|(_, pixel0)| pixel0 - plane.bg >= (1.0 - PLATEAU_RANGE) * plane.range);
     let kept = &mut scratch.verdict;
@@ -618,6 +621,10 @@ mod tests {
             v.fit && v.saturated && v.amplitude > 40.0,
             "the verdict never left its start: {v:?}"
         );
+        assert!(
+            v.by_amplitude,
+            "the amplitude clause carries this star: {v:?}"
+        );
         let beta = integrated_beta(&region, 0.0, 0.0, bg, 2.5, v.level, &params, &mut s)
             .expect("a sample fit");
         println!("integrated sample beta {beta}");
@@ -626,5 +633,25 @@ mod tests {
             "the sample fit never left its start beta"
         );
         assert!((beta / 2.5 - 1.0).abs() < 0.01, "beta {beta}");
+    }
+
+    /// The plateau-clip clause needs no fit: with the verdict fit disabled (`max_iter: 0`, so `fit = false`) a passed
+    /// plateau at the clip still flags the star.
+    #[test]
+    fn a_plateau_at_the_clip_flags_the_star_although_its_verdict_fit_failed() {
+        let region = censored_star_region();
+        let bg = 0.04_f32 as f64;
+        let plane = SaturationPlane::new(bg, 0.002, 1.0, 1.0, false);
+        let params = FitParams {
+            max_iter: 0,
+            ..FitParams::default()
+        };
+        let mut s = FitScratch::default();
+        let v = saturation_verdict(&region, 0.0, 0.0, bg, 2.5, &plane, &params, &mut s)
+            .expect("a verdict");
+        assert!(
+            !v.fit && v.saturated && v.by_plateau_clip && !v.by_amplitude,
+            "{v:?}"
+        );
     }
 }

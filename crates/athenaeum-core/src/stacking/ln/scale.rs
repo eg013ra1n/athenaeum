@@ -1868,7 +1868,9 @@ mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
     use crate::stacking::test_fixtures::synthetic_star_field;
-    use crate::test_support::{add_noise, moffat_field, MoffatStar};
+    use crate::test_support::{
+        add_noise, integrated_field, moffat_field, IntegratedProfile, MoffatStar,
+    };
 
     /// P-13: the pre-existing pins run without a selection. Under
     /// `LnStarSelection::OFF` neither side's plane nor noise is read.
@@ -2202,6 +2204,30 @@ mod tests {
         (reference, target)
     }
 
+    /// [`seeing_difference_pair`] rendered PIXEL-INTEGRATED (each pixel the light it collects,
+    /// `test_support::integrated_field`): the frame β's sample is fitted with the pixel-integrated model (F-4, E5), so
+    /// only an integrated fixture has a Moffat-4 truth for it to read. Same stars, fluxes, seeing and noise seeds.
+    fn seeing_difference_pair_integrated() -> (Vec<f32>, Vec<f32>) {
+        let positions: Vec<(f64, f64)> = star_grid(4).iter().map(|&(x, y, _)| (x, y)).collect();
+        let beta = 4.0;
+        let field = |flux: f64, fwhm: f64, seed: u64| {
+            let alpha = moffat_alpha_for_fwhm(fwhm, beta);
+            let amp = flux * (beta - 1.0) / (PI * alpha * alpha);
+            let stars: Vec<(f64, f64, f64)> = positions.iter().map(|&(x, y)| (x, y, amp)).collect();
+            let mut data = integrated_field(
+                WIDTH,
+                HEIGHT,
+                &stars,
+                IntegratedProfile::Moffat { fwhm, beta },
+                15,
+                0.08,
+            );
+            add_noise(&mut data, NOISE, seed);
+            data
+        };
+        (field(1.8, 2.5, 41), field(1.8 * 0.8, 3.0, 42))
+    }
+
     #[test]
     fn seeing_difference_does_not_bias_the_scale() {
         let (reference, target) = seeing_difference_pair();
@@ -2233,7 +2259,7 @@ mod tests {
 
     #[test]
     fn target_is_fitted_with_the_reference_beta() {
-        let (reference, target) = seeing_difference_pair();
+        let (reference, target) = seeing_difference_pair_integrated();
 
         let r = relative_scale(
             &reference,
@@ -2266,11 +2292,9 @@ mod tests {
 
         assert_eq!(r.beta, ref_out.beta);
         // F-4 (Plan A Task 9, ruling R-OSP-6): `Auto` is a continuous β (the reference's own bounded free-β sample,
-        // Q7) where it was one of `AUTO_BETAS`. The first F-4 build's point-model sample read this Moffat-4 field at
-        // 3.933 (`|β − 4| < 0.2`); since the owner's E5 the sample is fitted PIXEL-INTEGRATED, and this fixture is
-        // point-sampled (`moffat_field`, FWHM 2.5 px), so it reads low by construction: 3.506 — the mirror of the
-        // point model reading an integrated star high. The equality above is what this test pins.
-        assert!((r.beta - 3.506).abs() < 0.01, "beta {}", r.beta);
+        // Q7), fitted pixel-integrated since the owner's E5, on a fixture rendered pixel-integrated: Moffat 4 within
+        // 0.2 as before F-4. The equality above is the target-at-the-reference-β pin.
+        assert!((r.beta - 4.0).abs() < 0.2, "beta {}", r.beta);
     }
 
     #[test]

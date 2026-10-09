@@ -1515,7 +1515,7 @@ mod tests {
         fn a_lone_broad_unclipped_star_passes_the_plateau_test_and_its_censored_fit_keeps_its_width(
         ) {
             // FWHM 9.01 (α 24, β 20), peak 0.3 on 0.05: its 3x3 lies within 0.1·range of the centre, so its top is censored
-            // (R2: FWHM within 0.2 %). The flag is not pinned: the lone star sets the range itself (R2: A/range 0.994)
+            // (R2: FWHM within 0.2 %). The amplitude flag is not pinned: the lone star sets the range itself (R2: A/range 0.994)
             let mut broad = moffat_field(
                 120,
                 120,
@@ -1534,12 +1534,15 @@ mod tests {
             let v = verdict(&measured(&broad, 120, 120, vec![seed_at(60.0, 60.0)]), 0);
             let truth = 2.0 * 24.0 * (2f64.powf(1.0 / 20.0) - 1.0).sqrt();
             assert!(v.plateau && v.excluded >= 9, "{v:?}");
+            // known limit (README R-OSP-6): its top sits within 0.1·range of the clip it sets itself, so the
+            // plateau-clip clause flags the lone broad star
+            assert!(v.by_plateau_clip, "{v:?}");
             assert!((v.fwhm / truth - 1.0).abs() < 0.03, "{} vs {truth}", v.fwhm);
         }
 
         #[test]
-        fn r2_a_seed_inside_a_large_clipped_area_is_flagged_by_the_plateau_clip_clause() {
-            // owner ruling R2 (2026-10-09): a nebula-core-like area, a 12 px disc at the clip on a hazy 0.45 sky with a
+        fn plateau_clip_a_seed_inside_a_large_clipped_area_is_flagged_by_the_plateau_clip_clause() {
+            // owner plateau-clip ruling (2026-10-09): a nebula-core-like area, a 12 px disc at the clip on a hazy 0.45 sky with a
             // faint broad swell. The seed at its centre passes the plateau test with pixel0 at the clip, and the verdict
             // fit sees only the rim, no peak above it (amplitude under the range): the amplitude clause stays silent and
             // the plateau-clip clause flags the seed
@@ -1564,8 +1567,8 @@ mod tests {
         }
 
         #[test]
-        fn r2_a_broad_unclipped_star_below_the_clip_band_of_a_brighter_stars_range_is_not_flagged()
-        {
+        fn plateau_clip_a_broad_unclipped_star_below_the_clip_band_of_a_brighter_stars_range_is_not_flagged(
+        ) {
             // the plane's range is set by a bright narrow star (peak ≈ 0.85); the broad star's flat top (≈ 0.7) passes the
             // plateau test but sits below 0.9·range, so the clause does not fire (pixel0 − bg ≈ 0.81 of the range)
             let mut field = moffat_field(
