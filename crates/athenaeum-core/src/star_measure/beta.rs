@@ -14,7 +14,9 @@
 //! pixels its level excluded, from its starts, with its iteration budget ([`verdict_beta`],
 //! `photometry::integrated_beta`). A caller that ran no verdict — `fit_stars` (tests and probes; a run's LN reference
 //! fit is handed the group β), Plan C's green sites (ruling F45) — fits its own sample of the brightest seeds the same
-//! way (Q7, [`frame_beta`]). Fewer than [`BETA_MIN_FITS`] accepted fits: [`BETA_FALLBACK`],
+//! way (Q7, [`frame_beta`]). A sample star whose fit failed — rustafits refuses a solve that never left its start
+//! (fix round A3: a censored star's guard-refused first steps had ended it there, β exactly 3) — is counted out of the
+//! median, with a `debug!` naming how many. Fewer than [`BETA_MIN_FITS`] accepted fits: [`BETA_FALLBACK`],
 //! [`BetaSource::Fallback`], with a `warn!`.
 //!
 //! Through Task 8 this module held the discrete `Auto` search over [`AUTO_BETAS`] (moved from `psf_signal` in Task
@@ -22,7 +24,7 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::fit::{self, FitParams, Seed, SeedPass};
 use super::FitStarsOptions;
@@ -187,7 +189,8 @@ pub(super) fn sample_seeds(passes: &[SeedPass]) -> Vec<usize> {
 }
 
 /// The frame β from the sample's fits: `betas[j]` is seed `sample[j]`'s integrated β, `None` = not accepted; the
-/// accepted ones' median ([`median_beta`]) and the fits themselves.
+/// accepted ones' median ([`median_beta`]) and the fits themselves. The ones not accepted are counted out, and a
+/// `debug!` says how many.
 fn sample_median(sample: &[usize], betas: &[Option<f64>]) -> SampleBeta {
     debug_assert_eq!(sample.len(), betas.len());
     let fits: Vec<(usize, f64)> = sample
@@ -195,6 +198,13 @@ fn sample_median(sample: &[usize], betas: &[Option<f64>]) -> SampleBeta {
         .zip(betas)
         .filter_map(|(&i, b)| b.filter(|b| b.is_finite()).map(|b| (i, b)))
         .collect();
+    if fits.len() < sample.len() {
+        debug!(
+            count = sample.len(),
+            failed = sample.len() - fits.len(),
+            "beta: sample stars without an accepted integrated fit are counted out of the median"
+        );
+    }
     let (beta, source) = median_beta(fits.iter().map(|&(_, b)| b));
     SampleBeta { beta, source, fits }
 }

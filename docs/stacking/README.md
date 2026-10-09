@@ -2278,6 +2278,29 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       noiseless Gaussian (σ 2) reaches β 100 in 39 iterations at −0.32 % FWHM; Moffat β 4 and 2.5 are recovered to
       1e-8; an integrated m2.5 stamp reads β 2.5098 / 2.5052 at FWHM 1.2 / 2.0 px at k = 7, where k = 1 reads
       3.127 / 2.814.
+    - **A solve that never left its start is not a fit** (fix round A3, rustafits e9cfdb1). On 6 of the 33 t09-f4
+      inject planes some sample stars read β exactly 3 (the start), 57 of their 2112 sample fits — 15–17 of 64 on
+      the mono2 L 300 s frames, where the median landed on it (frame β 3.0000000000000004) — and each of those stars'
+      verdict fits had stopped on its start too. The cause: the solver refuses a step that moves the centroid more
+      than 2 px or takes α under 0.5, and counted each refusal against `max_rejects` (5) like a step whose cost rose.
+      A star whose top is censored and whose fit starts under it (A = 1, the clipped maximum, many times under the
+      truth; a start width under the censored core) overshoots that guard on every first step while λ is still
+      under 1, so five refusals ended the solve on its start, which the bounded entry point returned as a fit; the
+      verdict then read the clipped maximum as the amplitude, so a saturated star went unflagged into the sample.
+      Now, in the bounded entry point only (`GuardedStep::UncountedBeforeFirstStep`), a refusal before the first
+      accepted step raises λ without spending the budget (after one, refusals count as before), and a solve that
+      accepted no step and did not converge is refused (`None`): the verdict reads `fit = false`, the sample fit is
+      counted out (`sample_median`'s `debug!` names how many). The legacy entry points and the fit at β keep the
+      counted refusal, output-identical. Unit: a censored integrated m2.5 star (50 above a 1.0 clip, 50 pixels
+      excluded, started at F 2.5) is flagged (verdict amplitude 56.98) and its integrated fit reads β 2.5007 (before:
+      the start, β 3 and the clipped amplitude 0.96). On the six planes the stuck sample fits go 57 → 0: the real saturated stars among them
+      are flagged now; frame β 6.390 → 11.598, 3.000 → 3.551 and 3.000 → 3.666 on the three mono2 frames, 3.687 →
+      3.733 on one 30 s frame, unchanged on the other two; LDN_1272 mono and OSC are identical but for one non-sample
+      verdict that had been stuck; the wall moves −1 … +10 % (3 interleaved runs). Two things it does not fix,
+      both older than it: seeds inside saturated blobs (a rim at or near the clip, thousands of pixels excluded)
+      still enter the sample unflagged, now with β 2–5 or 27–100 instead of exactly 3 (11–12 of 64 on the mono2
+      frames); and a region whose rim median equals its maximum (`a0` at its 1e-9 floor) is conditioned to ±1e8,
+      where the shape steps fall under one ulp — one such sample star still reads exactly 3.
     - **The fit at β has no β ceiling** (rustafits, the same branch, 0ebc618). The shared Moffat acceptance refused
       any β > 20, the fixed arm included, so every star of a frame whose β rose above 20 was refused `fitFailed`. The
       conditioned fixed-β entry point (R-OSP-3, the one the fits at β use) now fits any fixed β ≥ 1; below 20 its

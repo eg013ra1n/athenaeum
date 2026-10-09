@@ -245,8 +245,8 @@ pub struct SaturationVerdict {
 /// `region`, `seed_x`, `seed_y` are in stamp coordinates, as [`plateau_level`] reads them. The fit sees the module's
 /// conditioned problem (F-2): the values `(v − b0)/a0` with `a0` = the region's maximum − `b0`, started at B = 0,
 /// A = 1, round at `σ = f_start/2.3548`, θ = 0; the amplitude is mapped back to working units. A fit that returns
-/// nothing (α < 0.3, A ≤ 0 or a non-finite parameter), or a non-finite or non-positive amplitude or width, is
-/// `fit = false` (no flag, no refusal; Q4); a β at a bound is a fit.
+/// nothing (α < 0.3, A ≤ 0, a non-finite parameter, or a solve that never left its start — fix round A3), or a
+/// non-finite or non-positive amplitude or width, is `fit = false` (no flag, no refusal; Q4); a β at a bound is a fit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn saturation_verdict(
     region: &[PixelSample],
@@ -365,7 +365,8 @@ fn verdict_max_iter(excluded: u32, params: &FitParams) -> usize {
 /// bounded free-β Moffat at `k = `[`super::beta::sample_subsample`]`(f_start)` sub-samples per pixel side. The point
 /// model reads an undersampled star's β high (its pixels integrate a flatter core); the integrated one does not.
 /// `None` when no more pixels remain than the fit's 8 parameters, or when the fit fails the verdict fit's own
-/// acceptance (no fit; a non-finite or non-positive amplitude or width; a non-finite β). A β at a bound is a fit.
+/// acceptance (no fit — a solve that never left its start among them, fix round A3; a non-finite or non-positive
+/// amplitude or width; a non-finite β): the caller counts the star out of the sample. A β at a bound is a fit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrated_beta(
     region: &[PixelSample],
@@ -540,5 +541,66 @@ mod tests {
             Err(RefusalReason::MostlySaturated),
             "nine pixels left: the fit runs"
         );
+    }
+
+    /// A saturated star as a plane holds it (fix round A3): a round Moffat β 2.5, FWHM 2.2 px, 50 above a 0.04 sky,
+    /// centred at (0.3, −0.2) in a 41 × 41 region about pixel0, each pixel the light it collects (15 × 15 sub-samples),
+    /// clipped at the plane's full scale 1.0 and stored as `f32`. Its plateau's level (0.904) censors the top (50 pixels).
+    fn censored_star_region() -> Vec<PixelSample> {
+        let (amp, beta, fwhm) = (50.0, 2.5, 2.2);
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let offsets: Vec<f64> = (0..15).map(|i| (i as f64 + 0.5) / 15.0 - 0.5).collect();
+        let mut region = Vec::new();
+        for y in -20..=20 {
+            for x in -20..=20 {
+                let (x, y) = (x as f64, y as f64);
+                let mut sum = 0.0;
+                for &oy in &offsets {
+                    for &ox in &offsets {
+                        let r2 = (x + ox - 0.3).powi(2) + (y + oy + 0.2).powi(2);
+                        sum += (1.0 + r2 / (alpha * alpha)).powf(-beta);
+                    }
+                }
+                let v = (0.04 + amp * sum / 225.0).min(1.0) as f32;
+                region.push(PixelSample {
+                    x,
+                    y,
+                    value: v as f64,
+                });
+            }
+        }
+        region
+    }
+
+    /// Fix round A3 (Task 9): a censored star's bounded fits leave their start. The star's top is censored (its plateau
+    /// level excludes 50 pixels) and the fits start under it (B = 0, A = 1 — the clipped maximum, 50× under the truth —
+    /// round at F 2.5 px, β 3), where every early step overshoots the fitter's centroid guard. Before, five such steps
+    /// ended both fits on their start: the verdict read the start amplitude (the clipped maximum, not above the range,
+    /// so the saturated star went unflagged into the β sample) and the sample fit read the start β, exactly 3. Now the
+    /// verdict flags the star and the integrated sample fit, on the verdict's own pixels, reads β 2.5 within the
+    /// module's 1 %.
+    #[test]
+    fn a_censored_star_is_flagged_and_its_integrated_fit_recovers_its_beta() {
+        let region = censored_star_region();
+        let bg = 0.04_f32 as f64;
+        let plane = SaturationPlane::new(bg, 0.002, 1.0, 1.0, false);
+        let params = FitParams::default();
+        let mut s = FitScratch::default();
+        let v = saturation_verdict(&region, 0.0, 0.0, bg, 2.5, &plane, &params, &mut s)
+            .expect("a verdict");
+        println!("verdict: {v:?}");
+        assert!(v.plateau && v.excluded == 50, "{v:?}");
+        assert!(
+            v.fit && v.saturated && v.amplitude > 40.0,
+            "the verdict never left its start: {v:?}"
+        );
+        let beta = integrated_beta(&region, 0.0, 0.0, bg, 2.5, v.level, &params, &mut s)
+            .expect("a sample fit");
+        println!("integrated sample beta {beta}");
+        assert!(
+            beta != 3.0_f64.ln().exp(),
+            "the sample fit never left its start beta"
+        );
+        assert!((beta / 2.5 - 1.0).abs() < 0.01, "beta {beta}");
     }
 }
