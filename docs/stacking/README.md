@@ -2175,16 +2175,39 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **The three substitutes** for the reference method's own inputs: bg is the module's sampled, clipped sky median
       (PA-21), σ is the MRS σ (`N*` when MRS is refused; 0 under `NoiseSource::None`, one `warn!` per plane), and
       pixel0 is the pixel at the rounded seed centre (`fit_one`'s own `(cx, cy)`).
-    - **The order** (`fit::fit_stars_diagnosed`): seeds → field width → verdicts → β sample → fits at β. The verdict
+    - **The order** (`fit::verdict_pass`, then `fit::fit_after_passes`): seeds → field width → verdicts → (on a
+      multi-plane image every plane's verdicts, then the cross-plane rule) → β sample → fits at β. The verdict
       pass runs `fit_one`'s steps 1–4 (admission, width start, region, donut test) per seed, so a seed refused there
       gets no verdict. The `Auto` β sample is the 64 brightest seeds whose verdict fit succeeded unflagged. Every
-      star is then fitted at the frame β with its verdict's exclusion (pixels ≥ its level, ×3 iterations; Q6) and
-      keeps its flag in the `.athf` flags byte: a star without a plateau has the level norm and is fitted as before.
+      star is then fitted at the frame β and keeps its flag in the `.athf` flags byte; only a flagged star is fitted
+      with its verdict's exclusion (Q6 as revised, below).
       The frame FWHM and eccentricity are the residual-weighted means over the accepted unflagged fits
       (`FrameAggregates.stars_unsaturated`; `None`, and the adapter's `fwhm_px = 0.0`, when there is none).
       `stars_fitted` and the PSF-signal totals still count every accepted fit (M-4).
-    - **Measure path only** (Q7). `measure_plane` runs the verdicts; LN's refits (`fit_stars_at`, `fit_stars`,
-      `fit_stars_with_beta`) and the probe's betas arm run none: no flag, the brightest 64 seeds.
+    - **The measure path and the master statistics** (Q7; review I-1 ruled 2026-10-09). `measure_plane` runs the
+      verdicts, and so do the master statistics (`integrate`, `drizzle`, their covered-rectangle crops included),
+      which measure a 3-plane master as a debayered colour image; LN's refits (`fit_stars_at`, `fit_stars`,
+      `fit_stars_with_beta`) and the probe's betas arm run none: no flag, the brightest 64 seeds. The exemptions are
+      LN's reference (its own L-23 mask) and registration's own cuts.
+    - **The cross-plane rule (owner ruling 2026-10-09).** On an image of more than one plane, a star flagged on any
+      plane is flagged on every plane at that position: a star saturated in any channel is saturated in all,
+      because the debayer mixes the channels (the reference measures green only, so this goes beyond it). The match
+      is seed position ≤ 1 px (`CROSS_PLANE_MATCH_PX`, R3's); only a plane's own flags spread
+      (`SaturationVerdict.cross` marks the rest). The union is formed after every plane's verdict pass and before any
+      plane's β sample, frame statistic or fits at β, in ONE multi-plane entry,
+      `stacking::measure::measure_planes_diagnosed` (`star_measure::{prepare_plane, cross_plane_flags,
+      finish_plane}`), which the frame adapter, the master statistics and the probe call; one plane is
+      `measure_plane_diagnosed` unchanged. The entry takes its planes through a reader called once per half, so the
+      frame adapter re-reads a plane from disk instead of holding every plane (`MEASURE_PLANES_RESIDENT` unchanged).
+      R3's mechanism: all 52 OSC false negatives of t08-f3 were G-saturated stars with no plateau at their R or B
+      seed pixel, each flagged on G. Lab: `<pending t08-f3>`.
+    - **Q6 as revised (controller ruling from R3, 2026-10-09).** The fit at β leaves out the pixels ≥ the star's own
+      level (norm when its own plateau test failed), ×3 iterations, ONLY for a flagged star, own or cross. An
+      unflagged star's fit at β is byte-identical to a fit with no verdict. R3: Q6 as first written censored 218
+      truth-unsaturated plateau stars at β (the held-β FWHM 163/55 moves). Lab: `<pending t08-f3>`.
+    - **Formula weighting (review M-3).** A channel with `stars_unsaturated == 0` (no accepted fit, or every one
+      flagged) has no FWHM or eccentricity: it is left out of the group's `fwhm` and `ecc` ranges and those two terms
+      give it zero credit (`stacking::weights::formula_weight`); SNR, stars and the pedestal are unchanged.
     - **The field width runs no saturation test** (ruling F25 as folded): PA-17's median reads every candidate,
       because the verdict's region needs it. Cost if wrong: a field width biased on frames dominated by saturated
       stars.
@@ -2199,9 +2222,11 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **Measure wall time** (one real calibrated mono frame, release probe, interleaved runs): `<pending C-b>`.
   - **The surfaces.** `RefusalReason::MostlySaturated` (`mostlySaturated`, declared last); `FitDiagnostics.verdict`;
     `ChannelMeasurement.stars_unsaturated` (camelCase `starsUnsaturated`, 0 in a payload written before Task 8); the
-    adapter's `PlaneMeasurement.verdict_fit_failed` (reported, not persisted); the probe's measure frame line
-    `starsUnsaturated`, `mostlySaturated`, `verdictFitFailed`, `colour`, and under `--diagnostics` each star and
-    refused line's `verdict`.
+    adapter's `PlaneMeasurement.verdict_fit_failed` and `cross_flags` (reported, not persisted);
+    `SaturationVerdict.cross`; the probe's measure frame line `starsUnsaturated`, `mostlySaturated`,
+    `verdictFitFailed`, `crossFlags`, `colour`, and under `--diagnostics` each star and refused line's `verdict` with
+    its `flagSource` (`own` | `cross` | null). The probe measures every plane of a multi-plane input through the
+    entry, even under `--plane`; a plane's `wallMs` is its own share of the call.
   - **Moved pins (by design: the statistic's population, the β sample, the stored censored width).** Each literal
     carries its previous value. On the 150-star fixture fields 9 of 150 fits are flagged (the brightest stars' verdict
     fits top the plane's range, the by-design false positive); the fits, β and the PSF-signal totals do not move, the

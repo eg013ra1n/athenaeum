@@ -4,11 +4,12 @@
 //! weight — everything the weighting, selection and normalization stages
 //! consume. Reads through `PlaneReader`, one plane at a time.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use astroimage::{DetectionLevels, ImageAnalyzer};
 use serde::{Deserialize, Serialize};
@@ -253,6 +254,21 @@ pub struct PlaneMeasurement {
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Plan A Task 8, Q4; the
     /// probe's `verdictFitFailed`). Reported, not persisted.
     pub verdict_fit_failed: usize,
+    /// The seeds flagged by the cross-plane rule (another plane's own flag at their position; Task 8 fix wave, owner
+    /// ruling 2026-10-09; the probe's `crossFlags`); 0 on a single plane. Reported, not persisted.
+    pub cross_flags: usize,
+}
+
+/// One plane's result from [`measure_planes_diagnosed`].
+#[derive(Debug, Clone)]
+pub struct MeasuredPlane {
+    pub measurement: PlaneMeasurement,
+    /// The seeds the fits were made from, as [`measure_plane_detailed`] returns them.
+    pub seeds: Vec<Seed>,
+    /// One record per seed, in seed order, when `diagnostics` is set; empty otherwise.
+    pub diagnostics: Vec<sm::FitDiagnostics>,
+    /// The plane's own wall time in the call: both of its halves, its `plane(p)` calls included. Reported.
+    pub wall_ms: u64,
 }
 
 /// A probe-level override of the seed detector (ruling F26). A run never passes one: it selects its detector
@@ -333,10 +349,9 @@ pub fn measure_plane_detailed(
 ///
 /// `colour` (F-3, Plan A Task 8, Q3): the plane is one of a debayered colour
 /// frame's, so the saturation test's plateau needs all 8 neighbours
-/// (`star_measure::MeasureOptions::colour`). [`measure_frame_inner`] sets it
-/// for a 3-plane calibrated frame (a debayered OSC group's), the probe for a
-/// 3-plane input; [`measure_plane_detailed`] and its wrappers measure one
-/// plane on its own and pass `false`.
+/// (`star_measure::MeasureOptions::colour`). One plane on its own: no
+/// cross-plane rule; every image of more than one plane goes through
+/// [`measure_planes_diagnosed`], which sets `colour` itself.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_plane_diagnosed(
     data: &[f32],
@@ -348,16 +363,125 @@ pub fn measure_plane_diagnosed(
     diagnostics: bool,
     colour: bool,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
+    let head = adapter_head(data, w, h, opts, pool, seed_source, diagnostics, colour);
+    let m = sm::measure_plane(data, w, h, &head.module_opts, pool);
+    adapter_tail(head, m)
+}
+
+/// The one multi-plane entry (F-3; Task 8 fix wave, owner ruling 2026-10-09): every plane of one image measured as
+/// [`measure_plane_diagnosed`] measures one, with the cross-plane rule between the halves — every plane's verdict
+/// pass ([`sm::prepare_plane`]), then [`sm::cross_plane_flags`] (a star flagged on any plane is flagged on every plane
+/// at that position), then every plane's β sample, fits at β and frame statistic ([`sm::finish_plane`]). The frame
+/// adapter ([`measure_frame`] and its siblings), the master statistics (`integrate`, `drizzle`, their covered-rectangle
+/// crops included) and the lab's probe call it; one plane is exactly [`measure_plane_diagnosed`] without `colour`.
+/// `colour` (Q3) is `n_planes == 3`: a 3-plane calibrated frame or master is a debayered OSC group's.
+///
+/// `plane(p)` hands plane `p`, in its native units. On more than one plane it is called twice per plane, once per
+/// half, so a caller reading from disk holds one plane at a time (`stacking::run`'s `MEASURE_PLANES_RESIDENT` stays
+/// one plane's working set); the second half runs the planes last to first, so the last plane's data passes straight
+/// from its first half to its second. An `Err` from `plane` ends the call with it (the frame adapter's cancel).
+#[allow(clippy::too_many_arguments)]
+pub fn measure_planes_diagnosed<'a, E>(
+    n_planes: usize,
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
+) -> Result<Vec<MeasuredPlane>, E> {
+    if n_planes == 1 {
+        let t = Instant::now();
+        let data = plane(0)?;
+        let _span = tracing::debug_span!("measure_plane", plane = 0).entered();
+        let (measurement, seeds, diagnostics) =
+            measure_plane_diagnosed(&data, w, h, opts, pool, seed_source, diagnostics, false);
+        return Ok(vec![MeasuredPlane {
+            measurement,
+            seeds,
+            diagnostics,
+            wall_ms: t.elapsed().as_millis() as u64,
+        }]);
+    }
+    let colour = n_planes == 3;
+    let mut walls = vec![Duration::ZERO; n_planes];
+    let mut heads = Vec::with_capacity(n_planes);
+    let mut preps = Vec::with_capacity(n_planes);
+    let mut last: Option<Cow<'a, [f32]>> = None;
+    for (p, wall) in walls.iter_mut().enumerate() {
+        let t = Instant::now();
+        let data = plane(p)?;
+        let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+        let head = adapter_head(&data, w, h, opts, pool, seed_source, diagnostics, colour);
+        preps.push(sm::prepare_plane(&data, w, h, &head.module_opts, pool));
+        heads.push(head);
+        if p + 1 == n_planes {
+            last = Some(data);
+        }
+        *wall += t.elapsed();
+    }
+    sm::cross_plane_flags(&mut preps);
+    let mut out: Vec<Option<MeasuredPlane>> = (0..n_planes).map(|_| None).collect();
+    for p in (0..n_planes).rev() {
+        let t = Instant::now();
+        let data = match last.take() {
+            Some(data) => data,
+            None => plane(p)?,
+        };
+        let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+        let (head, prep) = match (heads.pop(), preps.pop()) {
+            (Some(head), Some(prep)) => (head, prep),
+            _ => unreachable!("one head and one prep per plane, taken last to first"),
+        };
+        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        drop(data);
+        let (measurement, seeds, diagnostics) = adapter_tail(head, m);
+        walls[p] += t.elapsed();
+        out[p] = Some(MeasuredPlane {
+            measurement,
+            seeds,
+            diagnostics,
+            wall_ms: walls[p].as_millis() as u64,
+        });
+    }
+    Ok(out.into_iter().flatten().collect())
+}
+
+/// The adapter's seed detector, resolved from the options and the probe's override.
+#[derive(Clone, Copy, PartialEq)]
+enum Detector {
+    Peak,
+    Full,
+    Structure,
+    Matched(f64),
+}
+
+/// What the adapter decides and measures before the module (its detector, the seeds it hands in, the Median3 arm's
+/// noise model), kept until the module's result is mapped onto a [`PlaneMeasurement`].
+struct AdapterHead {
+    detector: Detector,
+    module_opts: sm::MeasureOptions,
+    adapter_detect_ms: u64,
+    own_phases: Option<sm::PhaseTimings>,
+}
+
+/// The adapter's head: the detector, the seeds it hands the module (the matched filter runs inside the module) and
+/// the module's options.
+#[allow(clippy::too_many_arguments)]
+fn adapter_head(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    colour: bool,
+) -> AdapterHead {
     // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
     // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
     // silently.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Detector {
-        Peak,
-        Full,
-        Structure,
-        Matched(f64),
-    }
     let detector = match seed_source {
         SeedOverride::Fast => match opts.seed_source {
             SeedSource::MatchedFilter => Detector::Matched(opts.seed_threshold),
@@ -558,7 +682,26 @@ pub fn measure_plane_diagnosed(
         field_width: None,
         colour,
     };
-    let m = sm::measure_plane(data, w, h, &module_opts, pool);
+    AdapterHead {
+        detector,
+        module_opts,
+        adapter_detect_ms,
+        own_phases,
+    }
+}
+
+/// The adapter's tail: the module's measurement mapped onto a [`PlaneMeasurement`], with the seeds it fitted and its
+/// per-seed records.
+fn adapter_tail(
+    head: AdapterHead,
+    m: sm::PlaneMeasurement,
+) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
+    let AdapterHead {
+        detector,
+        module_opts,
+        adapter_detect_ms,
+        own_phases,
+    } = head;
     let seeds = match module_opts.seeds {
         sm::SeedSpec::Given(seeds) => seeds,
         // The matched filter ran inside the module; it hands its seeds back.
@@ -630,6 +773,7 @@ pub fn measure_plane_diagnosed(
             defocused: m.defocused,
             defocus_donuts: m.defocus_donuts,
             verdict_fit_failed: m.verdict_fit_failed,
+            cross_flags: m.cross_flags,
         },
         seeds,
         m.diagnostics,
@@ -684,22 +828,36 @@ fn measure_frame_inner(
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
-    // F-3 (Plan A Task 8, Q3): a 3-plane calibrated frame is a debayered OSC group's, whose saturation test needs all
-    // 8 neighbours of the seed pixel; a mono frame has one plane.
-    let colour = reader.channels() == 3;
-    let mut channels = Vec::with_capacity(reader.channels());
-    let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(reader.channels());
-    for plane in 0..reader.channels() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(IntegrationError::Cancelled);
-        }
-        let t = Instant::now();
-        let data = reader.read_plane(plane)?;
-        let read_ms = t.elapsed().as_millis() as u64;
-        let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
-        let pm = measure_plane_diagnosed(&data, w, h, opts, pool, seed_source, false, colour).0;
+    let n = reader.channels();
+    // Every plane through the one multi-plane entry (Task 8 fix wave): a 3-plane calibrated frame is a debayered OSC
+    // group's (Q3, all 8 neighbours) and gets the cross-plane rule. `cancel` is checked before each read; a plane is
+    // read once per half, so one plane is held at a time.
+    let mut read_ms = vec![0u64; n];
+    let _span = tracing::debug_span!("measure_frame", path = %path.display()).entered();
+    let planes = measure_planes_diagnosed(
+        n,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        false,
+        |plane| -> Result<Cow<'static, [f32]>, IntegrationError> {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(IntegrationError::Cancelled);
+            }
+            let t = Instant::now();
+            let data = reader.read_plane(plane)?;
+            read_ms[plane] += t.elapsed().as_millis() as u64;
+            Ok(Cow::Owned(data))
+        },
+    )?;
+    let mut channels = Vec::with_capacity(n);
+    let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(n);
+    for (plane, measured) in planes.into_iter().enumerate() {
+        let pm = measured.measurement;
         let mut m = pm.channel;
-        m.timings.read_ms = read_ms;
+        m.timings.read_ms = read_ms[plane];
         // Once per plane, from the measure path only (Task 6b fix wave A, review M1): the fit reports the verdict, this
         // is the one place that knows the file.
         if pm.defocused {
@@ -732,7 +890,7 @@ fn measure_frame_inner(
             noise_ms = m.timings.noise_ms,
             detect_ms = m.timings.detect_ms,
             fit_ms = m.timings.fit_ms,
-            duration_ms = t.elapsed().as_millis() as u64,
+            duration_ms = measured.wall_ms,
             "frame plane measured"
         );
         channels.push(m);
@@ -987,6 +1145,150 @@ pub(crate) mod tests {
             measure_frame(&bad, &opts, None, &AtomicBool::new(false)),
             Err(IntegrationError::BadInput(_))
         ));
+    }
+
+    /// The cross-plane fixture (Plan A Task 8 fix wave): three planes of 24 Gaussian stars (σ 1.8 px, amplitude 0.2) on
+    /// a 6×4 grid of a 320×256 plane, background 0.08, noise 0.002, and one Moffat star (α 3, β 4) at (160.3, 215.7),
+    /// 50 px below the grid: clipped at 0.95 on G (plane 1; a full plateau, flagged by its own verdict) and unclipped at
+    /// amplitude 0.45 on R and B (no plateau, and under the range the single hot pixel at (290, 225) sets on those
+    /// planes, so their own verdicts leave it unflagged).
+    pub(crate) fn cross_plane_fixture() -> ([Vec<f32>; 3], usize, usize) {
+        let (w, h) = (320usize, 256usize);
+        let grid: Vec<(f64, f64, f64)> = (0..4)
+            .flat_map(|j| {
+                (0..6).map(move |i| (35.0 + 50.0 * i as f64, 30.0 + 45.0 * j as f64, 0.2))
+            })
+            .collect();
+        let plane = |amp: f64, clip: bool, seed: u64| {
+            let mut d = crate::test_support::gaussian_field(w, h, &grid, 1.8, 0.08);
+            let star = crate::test_support::moffat_field(
+                w,
+                h,
+                &[crate::test_support::MoffatStar {
+                    x: 160.3,
+                    y: 215.7,
+                    amp,
+                    alpha_x: 3.0,
+                    alpha_y: 3.0,
+                    theta: 0.0,
+                }],
+                4.0,
+                0.0,
+            );
+            for (v, s) in d.iter_mut().zip(&star) {
+                *v += s;
+            }
+            if clip {
+                for v in d.iter_mut() {
+                    *v = v.min(0.95);
+                }
+            } else {
+                d[225 * w + 290] = 0.95;
+            }
+            add_noise(&mut d, 0.002, seed);
+            d
+        };
+        (
+            [
+                plane(0.45, false, 31),
+                plane(3.0, true, 32),
+                plane(0.45, false, 33),
+            ],
+            w,
+            h,
+        )
+    }
+
+    /// The fixture star's fit on one plane and its verdict (from the diagnostics).
+    fn fixture_star(m: &MeasuredPlane) -> (StarFit, sm::SaturationVerdict) {
+        let fits = &m.measurement.fits;
+        let star = fits
+            .iter()
+            .position(|f| (f.x - 160.3).abs() < 1.5 && (f.y - 215.7).abs() < 1.5)
+            .expect("the star is fitted");
+        let verdict = m
+            .diagnostics
+            .iter()
+            .find(|d| matches!(d.outcome, sm::Outcome::Accepted { star: s } if s == star))
+            .and_then(|d| d.verdict)
+            .expect("an accepted star has a verdict");
+        (fits[star], verdict)
+    }
+
+    /// Plan A Task 8 fix wave, owner ruling 2026-10-09: on a multi-plane image a star flagged on any plane is flagged on
+    /// every plane at that position, before any plane's statistics; the frame adapter goes through the same entry.
+    #[test]
+    fn a_star_clipped_on_g_alone_is_flagged_on_all_three_planes_and_left_out_of_the_r_and_b_statistics(
+    ) {
+        let (planes, w, h) = cross_plane_fixture();
+        let opts = MeasureOptions::default();
+        let multi = measure_planes_diagnosed(3, w, h, &opts, None, SeedOverride::Fast, true, |p| {
+            Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice()))
+        })
+        .unwrap();
+        let (g, vg) = fixture_star(&multi[1]);
+        assert!(vg.plateau && vg.saturated && !vg.cross, "G: {vg:?}");
+        assert!(g.flags.saturated());
+        for p in [0, 2] {
+            let (star, v) = fixture_star(&multi[p]);
+            assert!(!v.plateau && v.saturated && v.cross, "plane {p}: {v:?}");
+            assert!(star.flags.saturated(), "plane {p}");
+            assert!(multi[p].measurement.cross_flags >= 1, "plane {p}");
+            // the same plane on its own: its own verdict leaves the star unflagged and its statistic counts it
+            let (alone, _, _) = measure_plane_diagnosed(
+                &planes[p],
+                w,
+                h,
+                &opts,
+                None,
+                SeedOverride::Fast,
+                false,
+                true,
+            );
+            let mine = alone
+                .fits
+                .iter()
+                .find(|f| (f.x - 160.3).abs() < 1.5 && (f.y - 215.7).abs() < 1.5)
+                .expect("the star is fitted alone");
+            assert!(!mine.flags.saturated(), "plane {p} alone");
+            let c = &multi[p].measurement.channel;
+            assert_eq!(
+                c.stars_unsaturated + 1,
+                alone.channel.stars_unsaturated,
+                "plane {p}"
+            );
+            assert_ne!(
+                c.fwhm_px.to_bits(),
+                alone.channel.fwhm_px.to_bits(),
+                "plane {p}"
+            );
+            let unflagged: Vec<&StarFit> = multi[p]
+                .measurement
+                .fits
+                .iter()
+                .filter(|f| !f.flags.saturated())
+                .collect();
+            let (fwhm, _) = sm::frame_shape(unflagged.iter().copied()).expect("unflagged fits");
+            assert_eq!(fwhm.to_bits(), c.fwhm_px.to_bits(), "plane {p}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "osc.fits",
+            &[&planes[0], &planes[1], &planes[2]],
+            w,
+            h,
+        );
+        let (frame, fits) =
+            measure_frame_with_fits(&path, &opts, None, &AtomicBool::new(false)).unwrap();
+        for p in 0..3 {
+            assert_eq!(
+                without_timings(frame.channels[p].clone()),
+                without_timings(multi[p].measurement.channel.clone()),
+                "plane {p}"
+            );
+            assert_eq!(fits[p], multi[p].measurement.fits, "plane {p}");
+        }
     }
 
     /// Tier C Task 1: `measure_plane_with_seeds` hands back the same fits

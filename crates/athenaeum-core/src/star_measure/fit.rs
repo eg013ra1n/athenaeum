@@ -29,10 +29,11 @@
 //! F-3 (Plan A Task 8, ruling R-OSP-5): on the measure path every seed whose region is gathered gets ONE saturation
 //! verdict ([`super::photometry::saturation_verdict`]: the plateau test at the seed pixel, then a censored free-β
 //! verdict fit, flagged when its amplitude tops the plane's range), after the field width and before the β sample:
-//! seeds → field width → verdicts → β sample → fits at β ([`fit_stars_diagnosed`]). The `Auto` β sample is the 64
-//! brightest seeds whose verdict fit succeeded unflagged; every star is fitted at β with its verdict's exclusion
-//! (pixels ≥ its level, ×3 iterations) and carries its flag in [`StarFlags::SATURATED`]. A seed whose verdict fit
-//! keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
+//! seeds → field width → verdicts ([`verdict_pass`]; on a multi-plane image every plane's, then the cross-plane rule)
+//! → β sample → fits at β ([`fit_after_passes`]). The `Auto` β sample is the 64 brightest seeds whose verdict fit
+//! succeeded unflagged; every star is fitted at β and carries its flag in [`StarFlags::SATURATED`], a flagged one
+//! (own or cross-plane) without its pixels ≥ its level, ×3 iterations (Q6 as revised 2026-10-09). A seed whose verdict
+//! fit keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -899,10 +900,11 @@ fn is_donut(
 /// `pass` is the seed's verdict-pass record when the caller ran the verdict pass (F-3, Task 8; `None` otherwise): its
 /// steps 1–4 are taken from it, not run again (a seed refused there is refused with the pass's reason and trace; the
 /// fix wave's cost item, number-neutral), and its verdict is the seed's. `MostlySaturated` refuses the seed after
-/// step 4. A verdict's level is the fit's exclusion (Q6): the region's pixels at or above it
-/// are left out of the fit (its start shape included) and the iteration limit is ×3 when any is; an unflagged star
-/// without a plateau has the level `norm`, which no pixel normally reaches, so it is fitted byte-identically. An
-/// accepted fit copies the verdict's flag into [`StarFlags::SATURATED`].
+/// step 4. A flagged star's level — own flag or cross-plane — is the fit's exclusion (Q6 as revised 2026-10-09): the
+/// region's pixels at or above it are left out of the fit (its start shape included) and the iteration limit is ×3
+/// when any is; its level is `norm` when its own plateau test failed. An unflagged star is fitted with no exclusion,
+/// exactly as with no verdict (R3: Q6 as first written censored 218 truth-unsaturated plateau stars at β). An accepted
+/// fit copies the verdict's flag into [`StarFlags::SATURATED`].
 ///
 /// The [`FitTrace`] records the region and the start whatever the result. A pixel `mask` leaves its `false` pixels
 /// out exactly like non-finite ones (Task 6a).
@@ -947,11 +949,12 @@ fn fit_one(
         b0,
         ..
     } = reg;
-    // F-3 (Task 8, Q6): the verdict's level is the fit's exclusion, its flag the fit's.
+    // F-3 (Task 8, Q6 as revised 2026-10-09): a flagged star's level (own flag or cross-plane) is the fit's exclusion
+    // and its flag the fit's; an unflagged star is fitted exactly as with no verdict.
     let (level, saturated) = match verdict {
         Some(Err(reason)) => return (Err(*reason), trace),
-        Some(Ok(v)) => (Some(v.level), v.saturated),
-        None => (None, false),
+        Some(Ok(v)) if v.saturated => (Some(v.level), true),
+        Some(Ok(_)) | None => (None, false),
     };
     let mut max_iter = p.max_iter;
     if let Some(level) = level {
@@ -1523,9 +1526,7 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(
-        data, w, h, seeds, model, p, None, None, None, pool, false, false,
-    )
+    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false, false)
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -1559,12 +1560,8 @@ fn resolve_field_width(
 /// [`fit_stars`], also keeping one [`FitDiagnostics`] per seed, in seed
 /// order, in [`FitOutcome::diagnostics`] when `diagnostics` is set (empty
 /// otherwise: the run never asks).
-/// `mask` and `field_width` as [`super::FitStarsOptions`] carries them.
-///
-/// `saturation` (F-3, Task 8; the measure path's, [`super::measure_plane`]): the plane's saturation inputs. Given,
-/// the order is seeds → field width → verdicts ([`seed_passes`]) → β sample (the `Auto` search over the seeds
-/// whose verdict fit succeeded unflagged) → fits at β, each with its seed's verdict. `None` (every other caller):
-/// no verdict, no flag, the brightest seeds as the β sample.
+/// `mask` and `field_width` as [`super::FitStarsOptions`] carries them. No verdict, no flag, the brightest seeds as
+/// the β sample: the measure path runs [`verdict_pass`] and [`fit_after_passes`] instead (F-3, Task 8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_diagnosed(
     data: &[f32],
@@ -1575,31 +1572,76 @@ pub(super) fn fit_stars_diagnosed(
     p: &FitParams,
     mask: Option<&[bool]>,
     field_width: Option<f64>,
-    saturation: Option<&SaturationPlane>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
-    let passes =
-        saturation.map(|plane| seed_passes(data, w, h, seeds, mask, field.fwhm_px, plane, p, pool));
+    fit_after_passes(
+        data,
+        w,
+        h,
+        seeds,
+        model,
+        p,
+        mask,
+        field,
+        None,
+        pool,
+        diagnostics,
+        defocus_verdict,
+    )
+}
+
+/// The measure path's head (F-3, Task 8; [`super::prepare_plane`]): the fit's field width ([`resolve_field_width`]
+/// of `field_width`) and every seed's verdict-pass record ([`seed_passes`]) on `saturation`, the plane's saturation
+/// inputs. A multi-plane caller runs it on every plane and applies the cross-plane rule
+/// ([`super::cross_plane_flags`]) before [`fit_after_passes`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verdict_pass(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    p: &FitParams,
+    mask: Option<&[bool]>,
+    field_width: Option<f64>,
+    saturation: &SaturationPlane,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (FieldWidth, Vec<SeedPass>) {
+    let field = resolve_field_width(data, w, h, seeds, mask, field_width);
+    let passes = seed_passes(data, w, h, seeds, mask, field.fwhm_px, saturation, p, pool);
+    (field, passes)
+}
+
+/// β, then every seed fitted at it on `field`'s width. `passes` (the measure path's, [`verdict_pass`], cross-plane
+/// flags applied): the order is seeds → field width → verdicts → β sample (the `Auto` search over the seeds whose
+/// verdict fit succeeded unflagged) → fits at β, each from its seed's record. `None` (every other caller): no verdict,
+/// no flag, the brightest seeds as the β sample.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_after_passes(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    model: PsfModel,
+    p: &FitParams,
+    mask: Option<&[bool]>,
+    field: FieldWidth,
+    passes: Option<&[SeedPass]>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    diagnostics: bool,
+    defocus_verdict: bool,
+) -> FitOutcome {
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
         // Tier C Task 1: a caller-resolved β (the group β, or any other
         // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
         // `Auto` search below never runs for it.
         PsfModel::Fixed(b) => b,
-        PsfModel::Auto => super::beta::auto_beta(
-            data,
-            w,
-            h,
-            seeds,
-            passes.as_deref(),
-            p,
-            mask,
-            field.fwhm_px,
-            pool,
-        ),
+        PsfModel::Auto => {
+            super::beta::auto_beta(data, w, h, seeds, passes, p, mask, field.fwhm_px, pool)
+        }
     };
     fit_at_width(
         data,
@@ -1610,7 +1652,7 @@ pub(super) fn fit_stars_diagnosed(
         p,
         mask,
         field,
-        passes.as_deref(),
+        passes,
         pool,
         diagnostics,
         defocus_verdict,

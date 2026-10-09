@@ -46,9 +46,18 @@
 //! `colour`. With `--diagnostics` every measure star line carries its `seed`
 //! and `verdict`, and every refused line its `verdict` (null when the seed had
 //! none: refused before its region, a donut, or `mostlySaturated`):
-//! `{plateau, level, excluded, amplitude, beta, fwhm, saturated, fit}`, the
-//! level and the amplitude ÷ 65535 like every energy here.
+//! `{plateau, level, excluded, amplitude, beta, fwhm, saturated, fit,
+//! flagSource}`, the level and the amplitude ÷ 65535 like every energy here;
+//! `flagSource` is `own`, `cross` (the cross-plane rule, Task 8 fix wave: a
+//! star flagged on another plane at its position) or null (not flagged).
+//! Every plane goes through the multi-plane entry the run uses
+//! (`measure_planes_diagnosed`), so on a multi-plane input every plane is
+//! measured even when `--plane` selects one (the cross-plane rule needs every
+//! plane's verdicts); the measure frame line also carries `crossFlags` and
+//! its `wallMs` is the plane's own share of the call.
 
+use std::borrow::Cow;
+use std::convert::Infallible;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -64,7 +73,7 @@ use athenaeum_core::resample::{warp_rows, Plane};
 use athenaeum_core::stacking::config::{SeedSource, StackingConfig};
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
-    measure_plane_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
+    measure_planes_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
@@ -199,6 +208,11 @@ fn verdict_json(v: Option<SaturationVerdict>) -> Value {
             "plateau": v.plateau, "level": n_or_null(v.level / s), "excluded": v.excluded,
             "amplitude": n_or_null(v.amplitude / s), "beta": n_or_null(v.beta), "fwhm": n_or_null(v.fwhm),
             "saturated": v.saturated, "fit": v.fit,
+            "flagSource": match (v.saturated, v.cross) {
+                (false, _) => Value::Null,
+                (true, false) => json!("own"),
+                (true, true) => json!("cross"),
+            },
         }),
     }
 }
@@ -472,26 +486,33 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                           "registerMaxStars": reg_max, "fromConfig": from_config, "rawMax": raw_max });
 
     let mut fits0: Option<Vec<StarFit>> = None;
-    for &p in &selected {
-        let need_measure =
-            want("measure") || want("betas") || (want("register") && planes.len() == 1);
-        if !need_measure {
-            continue;
-        }
-        // F-3 (Q3): a 3-plane input is a debayered colour image.
-        let colour = planes.len() == 3;
-        let t = Instant::now();
-        let (pm, seeds, diagnostics) = measure_plane_diagnosed(
-            &planes[p],
+    let need_measure = want("measure") || want("betas") || (want("register") && planes.len() == 1);
+    // F-3 (Q3): a 3-plane input is a debayered colour image. Every plane goes through the run's multi-plane entry
+    // (Task 8 fix wave: the cross-plane rule reads every plane's verdicts), whichever planes are selected.
+    let colour = planes.len() == 3;
+    let mut measured: Vec<_> = if need_measure && !selected.is_empty() {
+        measure_planes_diagnosed(
+            planes.len(),
             w,
             h,
             &opts,
             None,
             seed_source,
             a.diagnostics,
-            colour,
-        );
-        let wall = t.elapsed().as_millis() as u64;
+            |p| Ok::<_, Infallible>(Cow::Borrowed(planes[p].as_slice())),
+        )
+        .unwrap_or_else(|never| match never {})
+        .into_iter()
+        .map(Some)
+        .collect()
+    } else {
+        Vec::new()
+    };
+    for &p in &selected {
+        let Some(mp) = measured.get_mut(p).and_then(Option::take) else {
+            continue;
+        };
+        let (pm, seeds, diagnostics, wall) = (mp.measurement, mp.seeds, mp.diagnostics, mp.wall_ms);
         let s = ADU_SCALE as f64;
         if want("measure") {
             for (i, sd) in seeds.iter().enumerate() {
@@ -533,7 +554,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
                         "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
-                        "verdictFitFailed": pm.verdict_fit_failed, "colour": colour,
+                        "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
                         "channel": pm.channel, "options": options, "conversion": conversion,
                         "domain": domain, "nonFinite": non_finite, "wallMs": wall}),

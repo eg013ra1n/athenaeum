@@ -7,8 +7,9 @@
 //! Plan A Task 2 moved the code here verbatim (no arithmetic changed, no operation reordered); the later tasks fix it
 //! defect by defect against the synthetic truth lab.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::integration::stats::ScaleEstimator;
 
@@ -193,6 +194,9 @@ pub struct PlaneMeasurement {
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4): no flag, no refusal,
     /// out of the β sample.
     pub verdict_fit_failed: usize,
+    /// The seeds flagged by the cross-plane rule ([`cross_plane_flags`]: another plane's own flag at their position);
+    /// 0 on a single plane.
+    pub cross_flags: usize,
     pub timings: PhaseTimings,
 }
 
@@ -200,7 +204,8 @@ pub struct PlaneMeasurement {
 /// ones and their field width), the sky statistic on the native plane, then the fits on the working-unit copy — each
 /// seed's saturation verdict first (F-3, Task 8: seeds → field width → verdicts → β sample → fits at β, the plane's
 /// inputs from [`saturation_plane`]) — and the frame aggregates over the accepted fits. The fit runs on `pool` when
-/// given one, as do the background model, MRS and the matched filter.
+/// given one, as do the background model, MRS and the matched filter. [`prepare_plane`] then [`finish_plane`] on one
+/// working copy; an image of more than one plane goes through both halves with [`cross_plane_flags`] between them.
 pub fn measure_plane(
     plane: &[f32],
     w: usize,
@@ -209,9 +214,125 @@ pub fn measure_plane(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let working = domain::to_working_units(plane, &opts.domain);
+    let prep = prepare_working(plane, &working, w, h, opts, pool);
+    finish_working(&working, w, h, opts, prep, pool)
+}
+
+/// One plane measured through its verdict pass (F-3; Task 8 fix wave, the cross-plane rule): the noise model, the
+/// seeds and their field width, the sky statistic and every seed's verdict-pass record — what [`finish_plane`] needs
+/// besides the plane. Holds no plane-sized buffer.
+#[derive(Debug, Clone)]
+pub struct PlanePrep {
+    noise: NoiseModel,
+    sky: SkyLevel,
+    /// The seeds handed to the fitter: the given ones, or the module's matched filter's.
+    seeds: Vec<Seed>,
+    /// `seeds` came from the module's matched filter (they are [`PlaneMeasurement::detected`]).
+    detected: bool,
+    /// The width reported as [`PlaneMeasurement::field_width`].
+    field_width: FieldWidth,
+    /// The fit's own width ([`fit::verdict_pass`]), the one the fits at β start from.
+    fit_field: FieldWidth,
+    /// One per seed, in seed order.
+    passes: Vec<fit::SeedPass>,
+    cross_flags: usize,
+    timings: PhaseTimings,
+    /// The verdict pass's share of [`PhaseTimings::fit_ms`].
+    verdict_time: Duration,
+}
+
+/// [`measure_plane`]'s first half (Task 8 fix wave): everything up to and including the verdict pass, on its own
+/// working-unit copy (dropped on return). `opts` must be the options [`finish_plane`] is then given.
+pub fn prepare_plane(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlanePrep {
+    let working = domain::to_working_units(plane, &opts.domain);
+    prepare_working(plane, &working, w, h, opts, pool)
+}
+
+/// [`measure_plane`]'s second half: β and the fits at β from `prep`'s records (cross-plane flags included), the frame
+/// aggregates, on a fresh working-unit copy of the same `plane` (the same bytes the first half read).
+pub fn finish_plane(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    prep: PlanePrep,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    let working = domain::to_working_units(plane, &opts.domain);
+    finish_working(&working, w, h, opts, prep, pool)
+}
+
+/// The match radius of the cross-plane rule (px, between seed positions, Euclidean): R3's same-star match.
+pub const CROSS_PLANE_MATCH_PX: f64 = 1.0;
+
+/// The cross-plane rule (owner ruling 2026-10-09, ruling R-OSP-5): on an image of more than one plane a star flagged on
+/// any plane is flagged on every plane at that position — the debayer mixes the channels, so a star saturated in one
+/// is saturated in all (R3: every one of the 52 OSC false negatives was a G-saturated star with no plateau at its R or
+/// B seed pixel). Given every plane's [`PlanePrep`] (after every plane's verdict pass, before any plane's β sample,
+/// frame statistic or fits at β): a seed whose verdict exists (`Some(Ok(_))`, its verdict fit failed or not) and is not
+/// flagged is flagged when a seed of ANOTHER plane within [`CROSS_PLANE_MATCH_PX`] carries its own flag
+/// ([`SaturationVerdict::cross`]). Only own flags spread. One plane (or none): nothing changes.
+pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
+    if planes.len() < 2 {
+        return;
+    }
+    let cell = |s: &Seed| (s.x.floor() as i64, s.y.floor() as i64);
+    // Every own flag's position by its 1-px cell: a seed within 1 px of it lies in the 3×3 cells about its own.
+    let mut own: HashMap<(i64, i64), Vec<(usize, f64, f64)>> = HashMap::new();
+    for (plane, prep) in planes.iter().enumerate() {
+        for (s, pass) in prep.seeds.iter().zip(&prep.passes) {
+            if matches!(pass.verdict, Some(Ok(v)) if v.saturated) {
+                own.entry(cell(s)).or_default().push((plane, s.x, s.y));
+            }
+        }
+    }
+    for (q, prep) in planes.iter_mut().enumerate() {
+        let mut n = 0;
+        for (s, pass) in prep.seeds.iter().zip(prep.passes.iter_mut()) {
+            let Some(Ok(v)) = pass.verdict.as_mut() else {
+                continue;
+            };
+            if v.saturated {
+                continue;
+            }
+            let (cx, cy) = cell(s);
+            let flagged_elsewhere = (cx - 1..=cx + 1).any(|gx| {
+                (cy - 1..=cy + 1).any(|gy| {
+                    own.get(&(gx, gy)).is_some_and(|at| {
+                        at.iter().any(|&(p, x, y)| {
+                            p != q && (x - s.x).hypot(y - s.y) <= CROSS_PLANE_MATCH_PX
+                        })
+                    })
+                })
+            });
+            if flagged_elsewhere {
+                v.saturated = true;
+                v.cross = true;
+                n += 1;
+            }
+        }
+        prep.cross_flags = n;
+    }
+}
+
+/// [`prepare_plane`] on a working copy the caller holds.
+fn prepare_working(
+    plane: &[f32],
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlanePrep {
     let (noise, mut timings) = match opts.noise {
         Some(given) => (given, PhaseTimings::default()),
-        None => domain::noise_model(&working, w, h, pool),
+        None => domain::noise_model(working, w, h, pool),
     };
     let mask = opts.mask.as_deref();
     // A width the caller's detector measured (Task 6b, Task 6a review M3) stands in for the module's own, which is
@@ -233,15 +354,15 @@ pub fn measure_plane(
     let (detected, field_width) = match &opts.seeds {
         SeedSpec::None => (
             None,
-            given_width.unwrap_or_else(|| seeds::field_width_of(&working, w, h, &[], mask)),
+            given_width.unwrap_or_else(|| seeds::field_width_of(working, w, h, &[], mask)),
         ),
         SeedSpec::Given(given) => (
             None,
-            given_width.unwrap_or_else(|| seeds::field_width_of(&working, w, h, given, mask)),
+            given_width.unwrap_or_else(|| seeds::field_width_of(working, w, h, given, mask)),
         ),
         SeedSpec::MatchedFilter { threshold } => {
             let (found, own) = seeds::detect(
-                &working,
+                working,
                 w,
                 h,
                 &noise,
@@ -254,15 +375,15 @@ pub fn measure_plane(
             (Some(found), given_width.unwrap_or(own))
         }
     };
-    let seeds: &[Seed] = match (&opts.seeds, &detected) {
-        (_, Some(found)) => found,
-        (SeedSpec::Given(given), None) => given,
-        _ => &[],
+    let (seeds, detected) = match (detected, &opts.seeds) {
+        (Some(found), _) => (found, true),
+        (None, SeedSpec::Given(given)) => (given.clone(), false),
+        (None, _) => (Vec::new(), false),
     };
     // The saturation test reads the sky median (F-3), so the sky statistic precedes the fits (Q7).
     let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
     let saturation = saturation_plane(
-        &working,
+        working,
         mask,
         &noise,
         &sky,
@@ -271,17 +392,71 @@ pub fn measure_plane(
         seeds.len(),
     );
     let t = Instant::now();
-    let fit_call = || {
-        fit::fit_stars_diagnosed(
-            &working,
+    let pass_call = || {
+        fit::verdict_pass(
+            working,
             w,
             h,
-            seeds,
-            opts.psf_model,
+            &seeds,
             &opts.fit,
             mask,
             Some(field_width.fwhm_px),
-            Some(&saturation),
+            &saturation,
+            None,
+        )
+    };
+    // Already inside this `install`: the pass's own pool param gets `None` (perf tier 1 Task 2).
+    let (fit_field, passes) = match pool {
+        Some(p) => p.install(pass_call),
+        None => pass_call(),
+    };
+    PlanePrep {
+        noise,
+        sky,
+        seeds,
+        detected,
+        field_width,
+        fit_field,
+        passes,
+        cross_flags: 0,
+        timings,
+        verdict_time: t.elapsed(),
+    }
+}
+
+/// [`finish_plane`] on a working copy the caller holds.
+fn finish_working(
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    prep: PlanePrep,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    let PlanePrep {
+        noise,
+        sky,
+        seeds,
+        detected,
+        field_width,
+        fit_field,
+        passes,
+        cross_flags,
+        mut timings,
+        verdict_time,
+    } = prep;
+    let t = Instant::now();
+    let fit_call = || {
+        fit::fit_after_passes(
+            working,
+            w,
+            h,
+            &seeds,
+            opts.psf_model,
+            &opts.fit,
+            opts.mask.as_deref(),
+            fit_field,
+            Some(&passes),
             None,
             opts.diagnostics,
             true,
@@ -294,7 +469,7 @@ pub fn measure_plane(
         Some(p) => p.install(fit_call),
         None => fit_call(),
     };
-    timings.fit_ms = t.elapsed().as_millis() as u64;
+    timings.fit_ms = (verdict_time + t.elapsed()).as_millis() as u64;
     debug_assert_eq!(
         outcome.refused.accounted(outcome.fits.len()),
         seeds.len(),
@@ -309,13 +484,14 @@ pub fn measure_plane(
         noise,
         sky,
         seeds: seeds.len(),
-        detected: detected.unwrap_or_default(),
+        detected: if detected { seeds } else { Vec::new() },
         field_width,
         refused: outcome.refused,
         diagnostics,
         defocused: outcome.defocused,
         defocus_donuts: outcome.defocus_donuts,
         verdict_fit_failed: outcome.verdict_fit_failed,
+        cross_flags,
         timings,
     }
 }
@@ -1340,6 +1516,74 @@ mod tests {
                 "the sample is the unsaturated 30, not the clipped 40"
             );
             assert_eq!(m.frame.stars_unsaturated, 30);
+        }
+
+        #[test]
+        fn an_unflagged_plateau_stars_fit_at_beta_is_the_no_verdict_fit_bit_for_bit_and_a_flagged_ones_is_censored(
+        ) {
+            // Q6 as revised (controller ruling from R3, 2026-10-09): a broad star (FWHM 9 at β 4, peak 0.75 on 0.05)
+            // passes the plateau test but stays under the range the clipped star sets (0.95 − 0.05), so it is unflagged
+            // and its fit at β is the fit with no verdict; the clipped star is flagged and its fit at β leaves out its
+            // pixels ≥ its level, so it reads the width the uncensored fit misses
+            let (w, h) = (240usize, 160usize);
+            let broad = MoffatStar {
+                x: 70.0,
+                y: 80.0,
+                amp: 0.75,
+                alpha_x: 10.35,
+                alpha_y: 10.35,
+                theta: 0.0,
+            };
+            let plateau = MoffatStar {
+                x: 190.0,
+                y: 80.0,
+                amp: 3.0,
+                alpha_x: 3.0,
+                alpha_y: 3.0,
+                theta: 0.0,
+            };
+            let mut data = moffat_field(w, h, &[broad, plateau], 4.0, 0.05);
+            clipped(&mut data, 0.95);
+            add_noise(&mut data, 0.002, 7);
+            let seeds = vec![seed_at(70.0, 80.0), seed_at(190.0, 80.0)];
+            let m = measured(&data, w, h, seeds.clone());
+            let (vb, vc) = (verdict(&m, 0), verdict(&m, 1));
+            assert!(vb.plateau && vb.excluded > 0 && !vb.saturated, "{vb:?}");
+            assert!(vc.plateau && vc.excluded > 0 && vc.saturated, "{vc:?}");
+            let working: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+            let free = fit_stars_at(
+                &working,
+                w,
+                h,
+                &seeds,
+                m.beta,
+                &FitStarsOptions {
+                    field_width: Some(m.field_width.fwhm_px),
+                    ..Default::default()
+                },
+                None,
+            );
+            let at = |fits: &[StarFit], x: f64| -> StarFit {
+                *fits
+                    .iter()
+                    .find(|f| (f.x - x).abs() < 2.0)
+                    .expect("the star is fitted")
+            };
+            let (with, without) = (at(&m.stars, 70.0), at(&free.fits, 70.0));
+            assert_eq!(
+                format!("{with:?}"),
+                format!("{without:?}"),
+                "unflagged: no exclusion"
+            );
+            let (censored, whole) = (at(&m.stars, 190.0), at(&free.fits, 190.0));
+            assert!(censored.flags.saturated() && !whole.flags.saturated());
+            let truth = 2.0 * 3.0 * (2f64.powf(0.25) - 1.0).sqrt();
+            assert!(
+                (censored.fwhm() / truth - 1.0).abs() < (whole.fwhm() / truth - 1.0).abs(),
+                "censored {} vs uncensored {} (truth {truth})",
+                censored.fwhm(),
+                whole.fwhm()
+            );
         }
     }
 }

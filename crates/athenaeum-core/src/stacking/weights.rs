@@ -124,8 +124,10 @@ fn formula_ranges(inputs: &[WeightInput], excluded: &[bool], nch: usize) -> Vec<
             continue;
         }
         for (c, ch) in inp.measurement.channels.iter().enumerate().take(nch) {
-            out[c].fwhm.add(ch.fwhm_px);
-            out[c].ecc.add(ch.eccentricity);
+            if psf_measured(ch) {
+                out[c].fwhm.add(ch.fwhm_px);
+                out[c].ecc.add(ch.eccentricity);
+            }
             out[c].snr.add(ch.snr_weight);
             out[c].stars.add(ch.stars_fitted as f64);
         }
@@ -133,11 +135,32 @@ fn formula_ranges(inputs: &[WeightInput], excluded: &[bool], nch: usize) -> Vec<
     out
 }
 
+/// A channel's FWHM and eccentricity were measured: it has at least one accepted fit not flagged saturated (Plan A
+/// Task 8 fix wave, review M-3). With none — no accepted fit, or every one flagged — `fwhm_px` and `eccentricity` read
+/// 0.0, which is no measurement.
+fn psf_measured(ch: &ChannelMeasurement) -> bool {
+    ch.stars_unsaturated > 0
+}
+
 /// `W = A·(1 − ΔFWHM) + B·(1 − ΔEcc) + C·ΔSNRW + D·ΔStars + P` with each Δ
 /// normalized to the group range (math reference §1.5).
+///
+/// **The unmeasured-PSF rule** (Plan A Task 8 fix wave, review M-3): a channel with `stars_unsaturated == 0` (no
+/// accepted fit, or every one flagged saturated) has no FWHM or eccentricity; it is left out of the group's `fwhm`
+/// and `ecc` ranges and its two terms give zero credit. Its SNR, stars and pedestal terms are unchanged. Without the
+/// rule its 0.0 reads as the sharpest, roundest channel: full credit, and the group range stretched down to 0 (Task 8
+/// widened that case from "no fit" to "every fit flagged").
 fn formula_weight(ch: &ChannelMeasurement, f: &FormulaWeights, r: &FormulaRanges) -> f64 {
-    f.fwhm * r.fwhm.credit_down(ch.fwhm_px)
-        + f.eccentricity * r.ecc.credit_down(ch.eccentricity)
+    let (fwhm, ecc) = if psf_measured(ch) {
+        (
+            r.fwhm.credit_down(ch.fwhm_px),
+            r.ecc.credit_down(ch.eccentricity),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    f.fwhm * fwhm
+        + f.eccentricity * ecc
         + f.snr * r.snr.credit_up(ch.snr_weight)
         + f.stars * r.stars.credit_up(ch.stars_fitted as f64)
         + f.pedestal
@@ -972,6 +995,44 @@ mod tests {
             w[2].channels[0]
         ); // 7.5 + 15 + 10 + 5 + 50
         assert_eq!(w[0].normalized, vec![1.0]);
+    }
+
+    /// Plan A Task 8 fix wave (review M-3): a channel with no unflagged fit has no FWHM or eccentricity.
+    #[test]
+    fn a_frame_whose_every_fit_is_flagged_gets_no_fwhm_or_ecc_credit_and_does_not_stretch_the_range(
+    ) {
+        let mut flagged = meas(&[1.0], 0.0, 0.0, 200, 5.0);
+        flagged.channels[0].stars_unsaturated = 0;
+        let ms = [
+            meas(&[1.0], 2.0, 0.2, 300, 5.0),
+            meas(&[1.0], 4.0, 0.4, 100, 5.0),
+            flagged,
+        ];
+        let inputs: Vec<_> = ms.iter().map(input).collect();
+        let f = FormulaWeights {
+            fwhm: 15.0,
+            eccentricity: 15.0,
+            snr: 0.0,
+            stars: 0.0,
+            pedestal: 50.0,
+        };
+        let w = compute_weights(&inputs, WeightMode::Formula, &f, &[false; 3]);
+        // the ranges stay [2, 4] px and [0.2, 0.4]: the flagged frame's 0.0 is not a measurement
+        assert!(
+            (w[0].channels[0] - 80.0).abs() < 1e-9,
+            "{}",
+            w[0].channels[0]
+        ); // 15 + 15 + 50
+        assert!(
+            (w[1].channels[0] - 50.0).abs() < 1e-9,
+            "{}",
+            w[1].channels[0]
+        ); // 0 + 0 + 50
+        assert!(
+            (w[2].channels[0] - 50.0).abs() < 1e-9,
+            "{}",
+            w[2].channels[0]
+        ); // no FWHM or ecc credit
     }
 
     #[test]

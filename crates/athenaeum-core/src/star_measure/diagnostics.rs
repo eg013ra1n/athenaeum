@@ -119,8 +119,8 @@ pub struct FitDiagnostics {
     /// Steps the sampling region grew from its start radius.
     pub growth_steps: u8,
     /// The region's present pixels — finite and unmasked — the fit was handed (Task 6a); 0 when the seed was refused
-    /// before its region was gathered (`OutsideImage`). A seed with a saturation verdict is fitted at β on
-    /// `pixels_used − verdict.excluded` of them (F-3, Q6).
+    /// before its region was gathered (`OutsideImage`). A flagged seed (own or cross-plane) is fitted at β on
+    /// `pixels_used − verdict.excluded` of them, an unflagged one on all of them (F-3, Q6 as revised 2026-10-09).
     pub pixels_used: u32,
     /// `None` until the rustafits entry point reports it (Task 9).
     pub iterations: Option<u16>,

@@ -14,8 +14,14 @@
 //!    [`RefusalReason::MostlySaturated`].
 //! 3. **The flag**: the verdict fit's amplitude above the range. The plateau test only sets the level.
 //!
-//! The order on the measure path is seeds → field width → verdicts → β sample → fits at β
-//! (`fit::fit_stars_diagnosed`); every star is fitted at β with its verdict's exclusion and carries its flag.
+//! 4. **The cross-plane rule** (owner ruling 2026-10-09): on an image of more than one plane, a star flagged on any
+//!    plane is flagged on every plane at that position (seeds within 1 px; [`super::cross_plane_flags`]), because the
+//!    debayer mixes the channels.
+//!
+//! The order on the measure path is seeds → field width → verdicts → (every plane's verdicts, then the cross-plane
+//! rule) → β sample → fits at β ([`super::prepare_plane`], [`super::finish_plane`]); every star is fitted at β and
+//! carries its flag, and a flagged one (own or cross) is fitted without its pixels ≥ its level (Q6 as revised
+//! 2026-10-09: an unflagged star is fitted with no exclusion).
 
 use astroimage::analysis::fitting::{fit_moffat_2d, PixelSample};
 
@@ -199,10 +205,16 @@ pub struct SaturationVerdict {
     pub beta: f64,
     /// Its FWHM, `√(fwhm_x·fwhm_y)` (the payoff reads it, C-d).
     pub fwhm: f64,
-    /// `amplitude > range`.
+    /// `amplitude > range` (the star's own flag), or a cross flag (`cross`).
     pub saturated: bool,
-    /// `false` = the verdict fit failed (not n ≤ p): `amplitude`, `beta`, `fwhm` NaN, `saturated` false.
+    /// `false` = the verdict fit failed (not n ≤ p): `amplitude`, `beta`, `fwhm` NaN, `saturated` false unless a cross
+    /// flag.
     pub fit: bool,
+    /// The flag came from another plane (the cross-plane rule, owner ruling 2026-10-09, ruling R-OSP-5): on an image of
+    /// more than one plane a star flagged on any plane is flagged on every plane at that position
+    /// ([`super::cross_plane_flags`]); `saturated` is then true and the rest of the verdict stays this plane's own.
+    /// Always `false` on a single plane.
+    pub cross: bool,
 }
 
 /// Spec §2.1 per seed (PA-23): the plateau test, the level, then the free-β verdict fit (`fit_moffat_2d` at this
@@ -265,6 +277,7 @@ pub(crate) fn saturation_verdict(
         fwhm: f64::NAN,
         saturated: false,
         fit: false,
+        cross: false,
     };
     let Some(m) = fit_moffat_2d(
         kept,

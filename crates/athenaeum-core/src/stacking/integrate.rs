@@ -7,6 +7,7 @@
 //! materialization — transforms persist, pixels do not), and folds the
 //! per-plane `StackOutput`s into one `GroupOutput`.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +32,9 @@ use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::{LnFrameGrids, LnGrid};
-use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
+use crate::stacking::measure::{
+    measure_planes_diagnosed, FrameMeasurement, MeasureOptions, SeedOverride,
+};
 use crate::stacking::rej::{process_large_scale, RejBitmap, RejBitmapSet, RejForcedSource};
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
@@ -1426,12 +1429,9 @@ pub fn integrate_group(
             coverage = out.coverage.take();
         }
         // `integrate_planes` already checks `cancel` before each plane's own
-        // engine work, but the tail below runs a real (non-trivial) master
-        // measurement per plane — without this check here, a cancel raised
-        // while `integrate_planes` was finishing its last plane would still
-        // let every remaining tail iteration run its measurement before this
-        // function notices, instead of stopping at the next plane boundary
-        // the way the pre-extraction single loop did.
+        // engine work; this check stops the tail at the next plane boundary
+        // the way the pre-extraction single loop did, and the master
+        // measurement after this loop checks it again before each plane.
         if cancel.load(Ordering::Relaxed) {
             warn!(plane = p, "group integration cancelled");
             return Err(IntegrationError::Cancelled);
@@ -1475,11 +1475,8 @@ pub fn integrate_group(
             per_frame_rejected[k] += out.rejected_per_frame.get(k).copied().unwrap_or(0);
         }
 
-        // Master measurement (spec §6): `measure_plane` wants
-        // `Option<&Arc<rayon::ThreadPool>>`, which the group driver's plain
-        // `&rayon::ThreadPool` can't supply — run it inside `pool.install`
-        // instead so its own parallel work still lands on the caller's
-        // pool, and pass `None` for the explicit handle.
+        // Master measurement (spec §6) runs after this loop, every plane at
+        // once (below); its rectangle is chosen here, on plane 0.
         // Plan 6b-3 D4 refinement (review I1, final review A1): on a grid the
         // statistics come from the largest rectangle every pixel of which at
         // least half the group's frames cover (`k = ceil(n / 2)`; plane 0's
@@ -1546,16 +1543,71 @@ pub fn integrate_group(
                 }
             }
         }
-        let plane_data = &out.base.data;
-        let cm = match measure_rect {
-            Some(r) if !r.is_full(input.width, input.height) => {
-                let sub = crate::stacking::crop::crop_plane(plane_data, input.width, r);
-                pool.install(|| measure_plane(&sub, r.width, r.height, measure, None))
-            }
-            _ => {
-                pool.install(|| measure_plane(plane_data, input.width, input.height, measure, None))
-            }
-        };
+        let plane_duration_ms = (out.base.read_duration
+            + out.base.combine_duration
+            + stats_start.elapsed())
+        .as_millis() as u64;
+        // Perf tier A Task 0 (audit §3.3, item I11): the plane's total
+        // pixel-stack count — every combine call, one per output pixel —
+        // is what `rejection_iters_total`/`medfit_evals_total` divide by
+        // for the means below.
+        let plane_pixels = (out.base.width * out.base.height).max(1) as f64;
+        debug!(
+            plane = p,
+            rejected_low = out.rejected_low,
+            rejected_high = out.rejected_high,
+            read_ms = out.base.read_duration.as_millis() as u64,
+            combine_ms = out.base.combine_duration.as_millis() as u64,
+            combine_cpu_ms = out.base.combine_cpu_duration.as_millis() as u64,
+            rejection_iters_mean = out.base.rejection_iters_total as f64 / plane_pixels,
+            medfit_evals_mean = out.base.medfit_evals_total as f64 / plane_pixels,
+            duration_ms = plane_duration_ms,
+            "plane integrated"
+        );
+    }
+
+    // Master measurement (spec §6), every plane through the one multi-plane
+    // entry (Plan A Task 8 fix wave, owner ruling 2026-10-09): a 3-plane
+    // master is a debayered OSC group's (Q3) and gets the cross-plane rule,
+    // so every plane's verdict pass runs before any plane's statistics —
+    // hence here, after the plane loop, on `data` (on the covered rectangle
+    // when one was chosen). The entry wants
+    // `Option<&Arc<rayon::ThreadPool>>`, which the group driver's plain
+    // `&rayon::ThreadPool` can't supply — it runs inside `pool.install`
+    // instead so its own parallel work still lands on the caller's pool,
+    // with `None` for the explicit handle. `cancel` is checked before each
+    // plane is handed over.
+    let plane_len = input.width * input.height;
+    let crop = measure_rect.filter(|r| !r.is_full(input.width, input.height));
+    let (measure_w, measure_h) = crop.map_or((input.width, input.height), |r| (r.width, r.height));
+    let measured = pool.install(|| {
+        measure_planes_diagnosed(
+            input.channels,
+            measure_w,
+            measure_h,
+            measure,
+            None,
+            SeedOverride::Fast,
+            false,
+            |p| {
+                if cancel.load(Ordering::Relaxed) {
+                    warn!(plane = p, "group integration cancelled");
+                    return Err(IntegrationError::Cancelled);
+                }
+                let plane_data = &data[p * plane_len..(p + 1) * plane_len];
+                Ok(match crop {
+                    Some(r) => Cow::Owned(crate::stacking::crop::crop_plane(
+                        plane_data,
+                        input.width,
+                        r,
+                    )),
+                    None => Cow::Borrowed(plane_data),
+                })
+            },
+        )
+    })?;
+    for (p, measured) in measured.iter().enumerate() {
+        let cm = &measured.measurement.channel;
         master_noise.push(cm.noise);
         master_location.push(cm.location);
         master_scale.push(cm.scale);
@@ -1581,27 +1633,10 @@ pub fn integrate_group(
             0.0
         };
         snr_gain.push(gain);
-
-        let plane_duration_ms = (out.base.read_duration
-            + out.base.combine_duration
-            + stats_start.elapsed())
-        .as_millis() as u64;
-        // Perf tier A Task 0 (audit §3.3, item I11): the plane's total
-        // pixel-stack count — every combine call, one per output pixel —
-        // is what `rejection_iters_total`/`medfit_evals_total` divide by
-        // for the means below.
-        let plane_pixels = (out.base.width * out.base.height).max(1) as f64;
         debug!(
             plane = p,
-            rejected_low = out.rejected_low,
-            rejected_high = out.rejected_high,
-            read_ms = out.base.read_duration.as_millis() as u64,
-            combine_ms = out.base.combine_duration.as_millis() as u64,
-            combine_cpu_ms = out.base.combine_cpu_duration.as_millis() as u64,
-            rejection_iters_mean = out.base.rejection_iters_total as f64 / plane_pixels,
-            medfit_evals_mean = out.base.medfit_evals_total as f64 / plane_pixels,
-            duration_ms = plane_duration_ms,
-            "plane integrated"
+            duration_ms = measured.wall_ms,
+            "master plane measured"
         );
     }
 
@@ -1694,7 +1729,7 @@ mod tests {
     use crate::fits_writer::write_fits_f32;
     use crate::geometry::{Linear, LinearKind};
     use crate::integration::storage_class::StorageClass;
-    use crate::stacking::measure::{measure_frame, ChannelMeasurement};
+    use crate::stacking::measure::{measure_frame, measure_plane, ChannelMeasurement};
     use crate::stacking::rej::RejBitmap;
     use crate::test_support::{add_noise, centroid, gaussian_field};
 
@@ -1984,10 +2019,9 @@ mod tests {
             serde_json::from_str(r#"{"local":{"enabled":true,"scale":512}}"#).unwrap();
         assert_eq!(bare.local.flux_estimator, LnFluxEstimator::CommonAperture);
         assert_eq!(bare.local.aperture, LnAperture::GrowthCurve);
-        let psf: NormalizationConfig = serde_json::from_str(
-            r#"{"local":{"enabled":true,"fluxEstimator":"psfSignal"}}"#,
-        )
-        .unwrap();
+        let psf: NormalizationConfig =
+            serde_json::from_str(r#"{"local":{"enabled":true,"fluxEstimator":"psfSignal"}}"#)
+                .unwrap();
         assert_eq!(psf.local.flux_estimator, LnFluxEstimator::PsfSignal);
     }
 
@@ -2948,6 +2982,119 @@ mod tests {
         assert_eq!(out.rejection_low.as_ref().unwrap().len(), 3 * W * H);
         assert_eq!(out.rejection_high.as_ref().unwrap().len(), 3 * W * H);
         assert_eq!(*planes_seen.lock().unwrap(), vec![(0, 3), (1, 3), (2, 3)]);
+    }
+
+    /// Plan A Task 8 fix wave (owner ruling 2026-10-09, review I-1): a 3-plane master's statistics are the multi-plane
+    /// entry's — a star clipped on G alone is flagged on R and B too and leaves their master FWHM.
+    #[test]
+    fn a_three_plane_masters_statistics_go_through_the_multi_plane_entry() {
+        use crate::stacking::measure::{measure_plane_diagnosed, tests::cross_plane_fixture};
+        let (planes, w, h) = cross_plane_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..3u64 {
+            let mut data: Vec<f32> = planes.iter().flatten().copied().collect();
+            add_noise(&mut data, 0.0005, 910 + i);
+            let path = dir.path().join(format!("osc{i}.fits"));
+            write_fits_f32(&path, w, h, 3, &data, &[]).unwrap();
+            let measurement = measure_frame(
+                &path,
+                &MeasureOptions::default(),
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            frames.push(StackFrame {
+                path,
+                map: identity_map(),
+                measurement,
+                weight: weight(1.0, 3),
+                exposure_s: 30.0,
+                date_obs: None,
+                frame_id: 900021 + i as i64,
+                registered_path: None,
+            });
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: w,
+            height: h,
+            channels: 3,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+            stats_on_covered: false,
+        };
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
+        };
+        let out = integrate_group(
+            &input,
+            &MeasureOptions::default(),
+            &pool(),
+            &AtomicBool::new(false),
+            &progress,
+            io(1 << 24),
+        )
+        .unwrap();
+        let n = w * h;
+        let master = |p: usize| &out.data[p * n..(p + 1) * n];
+        let multi = measure_planes_diagnosed(
+            3,
+            w,
+            h,
+            &MeasureOptions::default(),
+            None,
+            SeedOverride::Fast,
+            false,
+            |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(master(p))),
+        )
+        .unwrap();
+        for p in 0..3 {
+            let c = &multi[p].measurement.channel;
+            assert_eq!(
+                out.stats.master_fwhm_px[p].to_bits(),
+                c.fwhm_px.to_bits(),
+                "plane {p}"
+            );
+            assert_eq!(
+                out.stats.master_eccentricity[p].to_bits(),
+                c.eccentricity.to_bits(),
+                "plane {p}"
+            );
+        }
+        for p in [0, 2] {
+            assert!(multi[p].measurement.cross_flags >= 1, "plane {p}");
+            let (alone, _, _) = measure_plane_diagnosed(
+                master(p),
+                w,
+                h,
+                &MeasureOptions::default(),
+                None,
+                SeedOverride::Fast,
+                false,
+                true,
+            );
+            assert_ne!(
+                out.stats.master_fwhm_px[p].to_bits(),
+                alone.channel.fwhm_px.to_bits(),
+                "plane {p}: the cross flag moves the master's FWHM"
+            );
+        }
     }
 
     /// M3 Task 2, brief tests (g) + (h): `integrate_group` with a real

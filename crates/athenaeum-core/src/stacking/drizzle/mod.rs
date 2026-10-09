@@ -25,6 +25,8 @@
 pub mod geom;
 pub mod phase_table;
 
+use std::borrow::Cow;
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -42,7 +44,7 @@ use crate::stacking::drizzle::phase_table::PhaseTable;
 use crate::stacking::integrate::MIN_STATS_RECT_PX;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::LnFrameGrids;
-use crate::stacking::measure::{measure_plane, MeasureOptions};
+use crate::stacking::measure::{measure_planes_diagnosed, MeasureOptions, SeedOverride};
 use crate::stacking::rej::RejBitmap;
 
 pub use crate::stacking::config::DrizzleKernel;
@@ -1072,57 +1074,11 @@ pub fn drizzle_group(
         let covered = w_buf.iter().filter(|&&v| v > 0.0).count();
         coverage.push(covered as f64 / plane_out_pixels as f64);
 
-        let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
-        let cm = if input.stats_on_covered {
-            // Plan 6b-3 ruling (b), fix round 1: the master's own covered
-            // rectangle (already past `MIN_STATS_RECT_PX`) scaled to the
-            // drizzle grid, for every plane.
-            let Some(master_rect) = input.stats_rect else {
-                return Err(DrizzleError::BadInput(
-                    "a grid drizzle was given no covered rectangle for its statistics".to_string(),
-                ));
-            };
-            let r = master_rect.scaled(input.scale);
-            if r.width < MIN_STATS_RECT_PX
-                || r.height < MIN_STATS_RECT_PX
-                || r.x0 + r.width > out_w
-                || r.y0 + r.height > out_h
-            {
-                return Err(DrizzleError::BadInput(format!(
-                    "the master's covered rectangle {} x {} at ({}, {}) does not fit the {} x {} \
-                     drizzle grid or is under {} px",
-                    r.width, r.height, r.x0, r.y0, out_w, out_h, MIN_STATS_RECT_PX
-                )));
-            }
-            debug!(
-                plane = c,
-                crop_x0 = r.x0,
-                crop_y0 = r.y0,
-                crop_width = r.width,
-                crop_height = r.height,
-                "drizzle statistics on the master's covered rectangle"
-            );
-            if r.is_full(out_w, out_h) {
-                pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None))
-            } else {
-                let sub = crate::stacking::crop::crop_plane(plane_data, out_w, r);
-                pool.install(|| measure_plane(&sub, r.width, r.height, input.measure, None))
-            }
-        } else {
-            pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None))
-        };
-        fwhm_px.push(cm.fwhm_px);
-        eccentricity.push(cm.eccentricity);
-        noise.push(cm.noise);
-
         // Minor 14 (fix round 1): `duration_ms` covers this plane's whole
-        // pass — every frame's deposit AND the `measure_plane` call just
-        // above, not deposition alone (the event name says "deposited",
-        // not "measured", but the timer starts at `plane_start` before
-        // either); `frames` is `input.frames.len()`, i.e. every frame this
-        // plane WOULD have processed, including any skipped for `w <= 0`.
-        // Cosmetic today; split or rename if a later task budgets off this
-        // event specifically.
+        // pass — every frame's deposit (the master measurement runs after
+        // every plane, below, from Plan A Task 8's fix wave); `frames` is
+        // `input.frames.len()`, i.e. every frame this plane WOULD have
+        // processed, including any skipped for `w <= 0`.
         debug!(
             plane = c,
             frames = input.frames.len(),
@@ -1133,6 +1089,72 @@ pub fn drizzle_group(
             deposit_mode = overlap_mode_label(&plane_overlap_modes),
             "drizzle plane deposited"
         );
+    }
+
+    // The master's statistics, every plane through the one multi-plane entry
+    // (Plan A Task 8 fix wave, owner ruling 2026-10-09): a 3-plane drizzle is
+    // a debayered OSC group's (Q3) and gets the cross-plane rule, so every
+    // plane's verdict pass runs before any plane's statistics — hence after
+    // every plane is deposited. With `stats_on_covered`, plan 6b-3 ruling
+    // (b), fix round 1: the master's own covered rectangle (already past
+    // `MIN_STATS_RECT_PX`) scaled to the drizzle grid, for every plane.
+    let crop = if input.stats_on_covered {
+        let Some(master_rect) = input.stats_rect else {
+            return Err(DrizzleError::BadInput(
+                "a grid drizzle was given no covered rectangle for its statistics".to_string(),
+            ));
+        };
+        let r = master_rect.scaled(input.scale);
+        if r.width < MIN_STATS_RECT_PX
+            || r.height < MIN_STATS_RECT_PX
+            || r.x0 + r.width > out_w
+            || r.y0 + r.height > out_h
+        {
+            return Err(DrizzleError::BadInput(format!(
+                "the master's covered rectangle {} x {} at ({}, {}) does not fit the {} x {} \
+                 drizzle grid or is under {} px",
+                r.width, r.height, r.x0, r.y0, out_w, out_h, MIN_STATS_RECT_PX
+            )));
+        }
+        debug!(
+            crop_x0 = r.x0,
+            crop_y0 = r.y0,
+            crop_width = r.width,
+            crop_height = r.height,
+            "drizzle statistics on the master's covered rectangle"
+        );
+        (!r.is_full(out_w, out_h)).then_some(r)
+    } else {
+        None
+    };
+    let (measure_w, measure_h) = crop.map_or((out_w, out_h), |r| (r.width, r.height));
+    let measured = pool
+        .install(|| {
+            measure_planes_diagnosed(
+                input.channels,
+                measure_w,
+                measure_h,
+                input.measure,
+                None,
+                SeedOverride::Fast,
+                false,
+                |c| {
+                    let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
+                    Ok::<_, Infallible>(match crop {
+                        Some(r) => {
+                            Cow::Owned(crate::stacking::crop::crop_plane(plane_data, out_w, r))
+                        }
+                        None => Cow::Borrowed(plane_data),
+                    })
+                },
+            )
+        })
+        .unwrap_or_else(|never| match never {});
+    for m in &measured {
+        let cm = &m.measurement.channel;
+        fwhm_px.push(cm.fwhm_px);
+        eccentricity.push(cm.eccentricity);
+        noise.push(cm.noise);
     }
 
     let ln_frames = if input.use_local_normalization {
@@ -1562,6 +1584,7 @@ mod tests {
     use crate::geometry::{Linear, LinearKind};
     use crate::integration::source::RejectionBitSink;
     use crate::stacking::ln::grid::LnGrid;
+    use crate::stacking::measure::measure_plane;
     use crate::stacking::rej::RejBitmapSet;
     use crate::test_support::gaussian_field;
 
