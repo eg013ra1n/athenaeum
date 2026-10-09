@@ -215,7 +215,7 @@ pub struct SaturationVerdict {
 /// A = 1, round at `σ = f_start/2.3548`, θ = 0; the amplitude is mapped back to working units. A fit that returns
 /// nothing, or a non-finite or non-positive amplitude or width, is `fit = false` (no flag, no refusal; Q4).
 #[allow(clippy::too_many_arguments)]
-pub fn saturation_verdict(
+pub(crate) fn saturation_verdict(
     region: &[PixelSample],
     seed_x: f64,
     seed_y: f64,
