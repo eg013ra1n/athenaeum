@@ -2831,6 +2831,25 @@ the mono and ideal-plane entries; both diffs 0 moved outside the design list; th
 branch (the golden `fit_moffat_2d` pin included); `cargo tree -p athenaeum-core | grep rustafits` shows the path
 dep unchanged in version.
 
+**Outcome (2026-10-09).** Commits (athenaeum, branch `one-star-path`): 1d2d40cb (the first build: bounded free-β
+sample fit, continuous β), 5aecffc9 (owner E5: the frame β from a pixel-integrated re-fit of the sample; review M-1…M-8),
+de4e5b7b (A3: a sample/verdict solve that never left its start is refused), c7e6a2f8 (A4: the same for the fit at β),
+61838081 (R2: the plateau-clip clause), then the close wave (review-2 minors, README, spec, plan). rustafits branch
+`one-star-path-beta`: 0ebc618 → ad0fe66 (subsample k) → e9cfdb1 → c02fa93. Lab step `t09-f4` (athenaeum-lab bd2a059):
+**BAR PASS**: control (fixed-β arms bit for bit but the 71 + 527 stuck lines A4 removed and one moved), frame FWHM 0/58
+over, twins 0/46, inject mono at β 4 0/3, pooled centroid x1.0018 (measure) / x1.0021 (register) against 1.01, FN
+mono 0.098 % / OSC 0 %, FP mono 0.156 %, neb3_4096 −0.253 σ, same-star FWHM pooled better, angle efficiency 1.25;
+Measure wall +4.0 % vs t08-f3. Rulings of 2026-10-09: E5, C6 1-4, C7 1-4, R2, the ERP rule (README R-OSP-5 / R-OSP-6).
+
+Carries. **Task 13:** the M42 / bright-nebula frame-β instability (MUST-RESOLVE before Plan A closes: R2 gives
+13.96 / 3.14 / 3.34 on the mono2 frames, t08 read 2.5 / 2.5 / 6.0; the sample is nebulosity plus near-clip stars whose
+calibrated clip is under 1.0; numbers in the ledger); real OSC planes at the β 1.5 bound; the drizzle widths 5-8 % low;
+the defocused frame count. **Task 14:** the centroid F ≤ 2 debt line (x1.0136 / x1.0113), the owner ecc lines (item 6
+pooled ecc > 300 WORSE, item 7 WORSE under a held β). **Later items (outside Plan A):** the per-frame pixel-phase
+centroid correction; the LM λ start for the ~37 cost-stuck small stars (A4 concern 1: a minimum-progress check); an
+inject ERP driver (owner option); the Windows / Linux runner check of the 1e-12 pins before any push to main; the legacy
+rustafits θ fix and the Settings saturation-fraction question at Plan C.
+
 ---
 
 ### Task 10: F-5 — the profile-independent flux and psfSel (spec §3 F-5)

@@ -2162,7 +2162,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       calibrated plane; for raw ADU the stored integer type's, `Domain::RawAdu.full_scale`, never DATAMAX), range =
       min(plane max, norm) − bg. The cap keeps the range at full scale where a flat division lifts a plateau above
       1.0.
-    - **The plateau test at the seed pixel** (`plateau_level`): of pixel0's 8 neighbours, those ≥ threshold must
+    - **The plateau test at the seed pixel** (`plateau_test`): of pixel0's 8 neighbours, those ≥ threshold must
       number **≥ 3 of 8** on a mono plane or **8 of 8** on a debayered colour plane (`MeasureOptions.colour`: the
       stacking adapter's 3-plane OSC frames, the probe's 3-plane input), with meanhigh − bg ≥ **0.7**·range and
       pixel0 − minhigh ≤ **0.1**·range. The level is min(pixel0, norm) − 0.1·range when it passes, else norm.
@@ -2171,7 +2171,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       the star's own F_start, round; the iteration limit **×3** when any pixel is excluded. **n ≤ 8** pixels left
       (the fit's 8 parameters) refuses the seed `mostlySaturated`. A fit that fails otherwise gives no flag and no
       refusal (`fit = false`, counted as `verdict_fit_failed`) and keeps the seed out of the β sample (Q4).
-    - **The flag** is the verdict fit's amplitude above the range; the plateau test only sets the level.
+    - **The flag** is the verdict fit's amplitude above the range (`by_amplitude`) or the plateau-clip clause below
+      (`by_plateau_clip`); the plateau test otherwise only sets the level.
     - **R2, the plateau-clip clause (owner extension 2026-10-09, after research R-S).** A seed whose plateau test
       passed and whose pixel0 − bg ≥ **0.9**·range (pixel0 within the test's own 0.1·range band of the clip) is
       flagged saturated whatever its fitted amplitude: `flag = by_amplitude || by_plateau_clip`
@@ -2277,8 +2278,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       carries **ln β** — the Gaussian limit is a flat ridge in (α, β), which a step in ln β crosses in a few
       iterations — with the Jacobian column `A·(1+Q)^−β·(−ln(1+Q))·β` (the chain rule) and each step's ln β clamped
       to the caller's bounds. A fit that ends at a bound is returned with β exactly that bound; only a non-finite
-      parameter, α < 0.3 or A ≤ 0 refuses it. It carries the corrected θ column (R-OSP-3). Its `subsample` (k): k = 1
-      is the point model, byte-identical to the entry point's first build (cceab37; the golden pin
+      parameter, α < 0.3, A ≤ 0 or a solve that never left its start (fix round A3, below) refuses it. It carries the
+      corrected θ column (R-OSP-3). Its `subsample` (k): k = 1 is the point model, byte-identical to the entry
+      point's first build (cceab37) for every solve that accepted a step (the golden pin
       `the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before`, recorded before the change, every field
       and the iteration count on three stamps); k ≥ 2 makes the model and its Jacobian at each pixel the mean over
       k × k midpoint sub-samples at offsets `(i + 0.5)/k − 0.5` px (the Jacobian is pinned against central
@@ -2308,8 +2310,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       3.733 on one 30 s frame, unchanged on the other two; LDN_1272 mono and OSC are identical but for one non-sample
       verdict that had been stuck; the wall moves −1 … +10 % (3 interleaved runs). Two things it does not fix,
       both older than it: seeds inside saturated blobs (a rim at or near the clip, thousands of pixels excluded)
-      still enter the sample unflagged, now with β 2–5 or 27–100 instead of exactly 3 (11–12 of 64 on the mono2
-      frames); and a region whose rim median equals its maximum (`a0` at its 1e-9 floor) is conditioned to ±1e8,
+      entered the sample unflagged, then with β 2–5 or 27–100 instead of exactly 3 (11–12 of 64 on the mono2
+      frames; superseded by the plateau-clip clause of R-OSP-5, owner 2026-10-09: they are flagged now); and a region whose rim median equals its maximum (`a0` at its 1e-9 floor) is conditioned to ±1e8,
       where the shape steps fall under one ulp — one such sample star still reads exactly 3.
     - **The fit at β never returns its start either** (fix round A4, rustafits, the same branch). The conditioned
       fixed-β entry point every star is fitted at still counted each guard refusal, so 80 of its fits stopped on
@@ -2394,8 +2396,10 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     `stacking::measure` pins (99.29 / 99.25 / 99.56 / 99.52 → 99.51 / 99.36 / 99.49 / 99.54, still near the cap:
     point-sampled stars at FWHM 4.24 px, k = 3) and the fit-derived fields with it (≤ 6e-6 relative; the Peak
     record's eccentricity −0.44 %), the counts and flags unchanged; and LN's `target_is_fitted_with_the_reference_beta`
-    3.933 → 3.506: its fixture is point-sampled (`moffat_field`, FWHM 2.5 px), and an integrated model reads a
-    point-sampled star's β low, the mirror of the cause above (the reference-β equality it pins holds exactly). The drizzle
+    3.933 → 3.506 (that pin was a known-wrong value of a point-sampled fixture, and is restored in the Task 9 close:
+    the test now renders its Moffat-4 pair pixel-integrated, `test_support::integrated_field`, and pins
+    `|β − 4| < 0.2` again; the reference-β equality holds exactly; the other tests that share the point-sampled pair
+    read no frame β). The drizzle
     sharpening test's four widths do not move (its lone, flagged star leaves the sample empty: β 4.0 before and
     after).
   - **The real frame** (LDN_1272, release probe, `--paths measure`, 3 interleaved runs, deterministic), Task 9's
@@ -2405,4 +2409,42 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     68, OSC 119 / 94 / 45), no `mostlySaturated` seed. The mono sample's point verdict β reads a median 3.5 % above
     its integrated β (p90 10.5 %). Before Task 9 (5bd5c926): mono β 2.5, FWHM 2.325 px; OSC β 2.5 / 4 / 2.5, FWHM
     1.499 / 1.499 / 1.363 px.
-  - **Acceptance.** `<pending t09-f4>`.
+  - **R2 on the real frames** (A5, release probe, `--paths measure`): LDN mono β 1.9997 and FWHM 2.2262 px unchanged;
+    OSC R / G / B β 1.9483 / 5.2918 / 5.1925 → 1.8616 / 5.0372 / 5.1925, FWHM 1.4194 / 1.5365 / 1.5029 →
+    1.4037 / 1.5308 / 1.5029 px (one seed per plane leaves the sample); the three M42 mono2 inject frames flag 11-12 more
+    sample seeds each (clip-only), frame β 11.598 / 3.551 / 3.666 → 13.957 / 3.142 / 3.342. R2 does not steady the M42
+    frame β (the rest of its sample is nebulosity and near-clip stars whose clip on the calibrated plane is under 1.0;
+    t08 read 2.5 / 2.5 / 6.0 on the same frames, so the instability predates F-4): a MUST-RESOLVE Task 13 item.
+  - **Acceptance (lab step `t09-f4`, final: E5 + A3/A4 + R2, athenaeum 61838081 / rustafits c02fa93, lab bd2a059;
+    `star-lab/results/plan-a/t09-f4/{run-log.txt,bars.txt}`).** Cycle 697/697 probes and 90/90 inject proven, 53 789
+    scorecard rows, 0 missing. **BAR: PASS.**
+    - **Control** (a gate): the fixed-β arms' star lines are bit for bit t08-f3's but for those A4 removed: 71 `betas`
+      lines disappear on v2 and 527 on inject (a stuck fit refused), one CHANGES (inject corpus `…_30.00s_0015`,
+      plane 0, β 2.5: FWHM 0.984 → 1.824, ecc 0.553 → 0.930; a stuck base fit that moved to a real minimum), none is
+      new; legacy `analysis` rows 11 736 + 370 bit for bit; cumulative vs t01c 0 / 0 / 0.
+    - Item 1 frame FWHM (C6: converged pointfit truth; C7-2: mixture vs `pixbox`): 0 of 58 images over the bar.
+      Item 2 twins: 0 of 46 families over 1 %. Item 3 inject mono at its own β 4: 0 of 3 cells over 1 %. C7-1 pooled
+      centroid efficiency vs t08-f3: measure x1.0018, register x1.0021 (bar 1.01; F ≤ 2 split x1.0136 / x1.0113, the
+      debt line). Item 4 saturation flag vs truth with R2: FN mono 4 of 4090 = 0.098 % (r3 0.147 %), OSC 0 (bar 0.5 %);
+      FP mono 116 of 74 284 = 0.156 % (t08 0.294 %; the R-S prediction), OSC 0.411 %. Item 5 neb3_4096 background
+      −0.253 σ (bar 0.3). Item 6 same-star FWHM vs truth pooled BETTER (up 87 118 / down 104 168). Item 8 angle
+      efficiency max 1.25 (bar 1.5).
+    - Reported, not judged: owner item 6 pooled ecc > 300 WORSE (up 30 964 / down 27 172; mean |e| 0.0919 → 0.0933) and
+      item 7 WORSE on betas@10 / @6 / @2.5 (PA-12 under a held β, the recorded trade-off, ruling C6-2). Measure-path wall
+      (row 9, sum of 145 family medians) 29 618 → 30 804 ms (+4.0 % vs t08-f3, +2.0 % vs round 3). 30 s inject frame
+      β 4.039 / 3.733 / 2.952 → 4.067 / 3.716 / 2.860; raw OSC planes read the bound 1.5 (VNG item, Task 13).
+    - **Owner rulings of 2026-10-09:** E5 (the frame β from a pixel-integrated fit of the same sample); C6 1-4 (E5;
+      PA-12's ecc trade-off under a held β recorded; the twin β part void where both twins exceed β 10, ΔFWHM always
+      judged; debayered inject planes to the VNG item, mono cells judged, real OSC β 1.5 to Task 13); C7 1-4
+      (small-star centroids accepted and recorded, the per-frame pixel-phase correction a later item; mixture judged vs
+      `pixbox`; inject mono at β 4; twins β part void where EITHER twin exceeds 10); R2 (the plateau-clip clause);
+      the ERP rule (re-run only when the synthetic frames change; "accepted no star" labelled, not "not run"). Fix
+      rounds A3 / A4 (a solve that never left its start is refused and counted) are the controller's, ruled the
+      same day. Debt vs t01c stays OPEN on FWHM scatter (measure) and centroid scatter (measure, register).
+    - **Review round 2 (Task 9 close):** four minors fixed (doc lines in `photometry.rs` / `fit.rs` / rustafits
+      `fitting.rs` and the lines above; `plateau_level` test-only; the plateau-clip tests; LN's restored pin); the
+      logging dictionary notes the reused `count` / `failed` / `beta` fields and a per-plane `debug!` now names the
+      verdict-fit failures. A near-start stall (a first accepted step at a huge λ) would pass the exact-start check; the
+      probe's accepted star lines carry neither the iteration count nor the conditioned amplitude, so the lab count
+      the review asked for is a proxy: of 8 476 censored accepted verdicts in the t09-f4 probe outputs, 0 read β within
+      1e-3 of the start 3.0.
