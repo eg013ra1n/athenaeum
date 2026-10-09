@@ -599,6 +599,8 @@ mod tests {
             beta: 2.5,
             fwhm: 3.0,
             saturated,
+            by_amplitude: saturated,
+            by_plateau_clip: false,
             fit: true,
             cross: false,
             iterations: 12,
@@ -1533,6 +1535,60 @@ mod tests {
             let truth = 2.0 * 24.0 * (2f64.powf(1.0 / 20.0) - 1.0).sqrt();
             assert!(v.plateau && v.excluded >= 9, "{v:?}");
             assert!((v.fwhm / truth - 1.0).abs() < 0.03, "{} vs {truth}", v.fwhm);
+        }
+
+        #[test]
+        fn r2_a_seed_inside_a_large_clipped_area_is_flagged_by_the_plateau_clip_clause() {
+            // owner ruling R2 (2026-10-09): a nebula-core-like area, a 12 px disc at the clip on a hazy 0.45 sky with a
+            // faint broad swell. The seed at its centre passes the plateau test with pixel0 at the clip, and the verdict
+            // fit sees only the rim, no peak above it (amplitude under the range): the amplitude clause stays silent and
+            // the plateau-clip clause flags the seed
+            let (w, h) = (120usize, 120usize);
+            let mut data = vec![0.45f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let r2 = (x as f64 - 60.0).powi(2) + (y as f64 - 60.0).powi(2);
+                    data[y * w + x] +=
+                        (0.1 * (-(r2 / 400.0f64)).exp() + if r2 < 36.0 { 0.5 } else { 0.0 }) as f32;
+                }
+            }
+            clipped(&mut data, 0.95);
+            add_noise(&mut data, 0.002, 4);
+            let m = measured(&data, w, h, vec![seed_at(60.0, 60.0)]);
+            let v = verdict(&m, 0);
+            assert!(v.plateau && v.saturated && v.by_plateau_clip, "{v:?}");
+            assert!(
+                !v.by_amplitude,
+                "the amplitude clause must not carry this case: {v:?}"
+            );
+        }
+
+        #[test]
+        fn r2_a_broad_unclipped_star_below_the_clip_band_of_a_brighter_stars_range_is_not_flagged()
+        {
+            // the plane's range is set by a bright narrow star (peak ≈ 0.85); the broad star's flat top (≈ 0.7) passes the
+            // plateau test but sits below 0.9·range, so the clause does not fire (pixel0 − bg ≈ 0.81 of the range)
+            let mut field = moffat_field(
+                160,
+                120,
+                &[
+                    MoffatStar {
+                        x: 50.0,
+                        y: 60.0,
+                        amp: 0.65,
+                        alpha_x: 24.0,
+                        alpha_y: 24.0,
+                        theta: 0.0,
+                    },
+                    small_core_star(130.0, 60.0, 0.8),
+                ],
+                20.0,
+                0.05,
+            );
+            add_noise(&mut field, 0.002, 6);
+            let m = measured(&field, 160, 120, vec![seed_at(50.0, 60.0)]);
+            let v = verdict(&m, 0);
+            assert!(v.plateau && !v.by_plateau_clip, "{v:?}");
         }
 
         #[test]

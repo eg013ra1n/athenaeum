@@ -49,6 +49,7 @@
 //! none: refused before its region, a donut, or `mostlySaturated`):
 //! `{plateau, level, excluded, amplitude, beta, fwhm, saturated, fit,
 //! flagSource}`, the level and the amplitude ÷ 65535 like every energy here;
+//! `byAmplitude` / `byPlateauClip` name the clause that flagged it (R2);
 //! `flagSource` is `own`, `cross` (the cross-plane rule, Task 8 fix wave: a
 //! star flagged on another plane at its position) or null (not flagged).
 //! Every plane goes through the multi-plane entry the run uses
@@ -220,6 +221,7 @@ fn verdict_json(v: Option<SaturationVerdict>) -> Value {
             "plateau": v.plateau, "level": n_or_null(v.level / s), "excluded": v.excluded,
             "amplitude": n_or_null(v.amplitude / s), "beta": n_or_null(v.beta), "fwhm": n_or_null(v.fwhm),
             "saturated": v.saturated, "fit": v.fit,
+            "byAmplitude": v.by_amplitude, "byPlateauClip": v.by_plateau_clip,
             "flagSource": match (v.saturated, v.cross) {
                 (false, _) => Value::Null,
                 (true, false) => json!("own"),

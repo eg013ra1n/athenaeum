@@ -2172,6 +2172,16 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (the fit's 8 parameters) refuses the seed `mostlySaturated`. A fit that fails otherwise gives no flag and no
       refusal (`fit = false`, counted as `verdict_fit_failed`) and keeps the seed out of the β sample (Q4).
     - **The flag** is the verdict fit's amplitude above the range; the plateau test only sets the level.
+    - **R2, the plateau-clip clause (owner extension 2026-10-09, after research R-S).** A seed whose plateau test
+      passed and whose pixel0 − bg ≥ **0.9**·range (pixel0 within the test's own 0.1·range band of the clip) is
+      flagged saturated whatever its fitted amplitude: `flag = by_amplitude || by_plateau_clip`
+      (`SaturationVerdict`, both reported; the probe's `--diagnostics` verdict carries `byAmplitude` and
+      `byPlateauClip`). The clause needs no fit, so a verdict whose fit failed with a passed plateau at the clip is
+      flagged too. It catches seeds inside large saturated areas (a nebula core: the fit sees no peak above the rim,
+      A/range 0.002-0.05) and bloomed stars whose region holds a neighbour's core. R-S on the lab: flag FP +5
+      (0.149 -> 0.156 %), FN 6 -> 4 (0.147 -> 0.098 %); every blob seed on the real M42 frames flagged. Unchanged:
+      the cross-plane spread, the `mostlySaturated` refusals, the at-beta exclusion of flagged stars. Known limit: the
+      plane's brightest flat-topped star is flagged by construction (it sets the range, so pixel0 - bg = range).
     - **The three substitutes** for the reference method's own inputs: bg is the module's sampled, clipped sky median
       (PA-21), σ is the MRS σ (`N*` when MRS is refused; 0 under `NoiseSource::None`, one `warn!` per plane), and
       pixel0 is the pixel at the rounded seed centre (`fit_one`'s own `(cx, cy)`).

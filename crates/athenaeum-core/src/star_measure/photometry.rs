@@ -170,6 +170,17 @@ pub(crate) fn plateau_level(
     seed_y: f64,
     plane: &SaturationPlane,
 ) -> Option<f64> {
+    plateau_test(region, seed_x, seed_y, plane).map(|(level, _)| level)
+}
+
+/// [`plateau_level`] with pixel0's value beside the level: `Some((level, pixel0))` when the test passes. R2 reads
+/// pixel0 against the clip band.
+pub(crate) fn plateau_test(
+    region: &[PixelSample],
+    seed_x: f64,
+    seed_y: f64,
+    plane: &SaturationPlane,
+) -> Option<(f64, f64)> {
     let (px0, py0) = ((seed_x + 0.5).floor(), (seed_y + 0.5).floor());
     let mut pixel0: Option<f64> = None;
     let (mut n_high, mut sum_high, mut min_high) = (0usize, 0.0f64, f64::INFINITY);
@@ -201,7 +212,7 @@ pub(crate) fn plateau_level(
     {
         return None;
     }
-    Some(pixel0.min(plane.norm) - PLATEAU_RANGE * plane.range)
+    Some((pixel0.min(plane.norm) - PLATEAU_RANGE * plane.range, pixel0))
 }
 
 /// One seed's saturation verdict (spec §2.1, PA-23). `saturated` is the flag the fit copies; `level` is the exclusion
@@ -222,8 +233,14 @@ pub struct SaturationVerdict {
     pub beta: f64,
     /// Its FWHM, `√(fwhm_x·fwhm_y)` (the payoff reads it, C-d).
     pub fwhm: f64,
-    /// `amplitude > range` (the star's own flag), or a cross flag (`cross`).
+    /// The star's own flag or a cross flag: `by_amplitude || by_plateau_clip || cross`.
     pub saturated: bool,
+    /// Clause 1: the verdict fit succeeded and `amplitude > range`.
+    pub by_amplitude: bool,
+    /// Clause 2 (R2, owner 2026-10-09): the plateau test passed and `pixel0 − bg ≥ 0.9·range` (pixel0 within the
+    /// test's own 0.1·range band of the clip), whatever the fitted amplitude. It needs no fit: a verdict whose fit
+    /// failed (`fit = false`) with a passed plateau at the clip is flagged.
+    pub by_plateau_clip: bool,
     /// `false` = the verdict fit failed (not n ≤ p): `amplitude`, `beta`, `fwhm` NaN, `saturated` false unless a cross
     /// flag. A β at a bound is a successful fit.
     pub fit: bool,
@@ -258,8 +275,12 @@ pub(crate) fn saturation_verdict(
     params: &FitParams,
     scratch: &mut FitScratch,
 ) -> Result<SaturationVerdict, RefusalReason> {
-    let plateau = plateau_level(region, seed_x, seed_y, plane);
+    let test = plateau_test(region, seed_x, seed_y, plane);
+    let plateau = test.map(|(level, _)| level);
     let level = plateau.unwrap_or(plane.norm);
+    // R2: pixel0 within the plateau test's own band (0.1·range) of the clip
+    let by_plateau_clip =
+        test.is_some_and(|(_, pixel0)| pixel0 - plane.bg >= (1.0 - PLATEAU_RANGE) * plane.range);
     let kept = &mut scratch.verdict;
     let Some((a0, excluded)) = verdict_pixels(region, level, b0, kept) else {
         return Err(RefusalReason::MostlySaturated);
@@ -273,7 +294,9 @@ pub(crate) fn saturation_verdict(
         amplitude: f64::NAN,
         beta: f64::NAN,
         fwhm: f64::NAN,
-        saturated: false,
+        saturated: by_plateau_clip,
+        by_amplitude: false,
+        by_plateau_clip,
         fit: false,
         cross: false,
         iterations: 0,
@@ -310,7 +333,8 @@ pub(crate) fn saturation_verdict(
     verdict.amplitude = amplitude;
     verdict.beta = m.beta;
     verdict.fwhm = fwhm;
-    verdict.saturated = amplitude > plane.range;
+    verdict.by_amplitude = amplitude > plane.range;
+    verdict.saturated = verdict.by_amplitude || by_plateau_clip;
     verdict.fit = true;
     Ok(verdict)
 }

@@ -397,6 +397,8 @@ mod tests {
             beta,
             fwhm: 3.0,
             saturated,
+            by_amplitude: saturated,
+            by_plateau_clip: false,
             fit,
             iterations: 5,
             cross,
