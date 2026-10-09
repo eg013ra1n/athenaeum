@@ -71,31 +71,43 @@ counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, op
 
 **The saturation test (one definition, used by every module caller on unwarped planes, raw and calibrated alike;
 revised 2026-10-09).** The method an established stacking program uses, adopted as is (owner ruling 2026-10-09)
-after the earlier flat-top test failed on lab truth. Two of its inputs are the module's own substitutes, named
-below; there is no raw-clip clause and no `saturation_fraction`.
+after the earlier flat-top test failed on lab truth. Three of its inputs are the module's own substitutes (bg, σ,
+pixel0), named below; there is no raw-clip clause and no `saturation_fraction`.
 
 Per plane, in the module's working units:
-- **bg** = the plane's median; **σ** = the plane's MRS noise (`domain`), the substitute for the reference method's
-  background-noise estimate; **threshold** = bg + 5σ;
-- **norm** = the plane's full scale: 1.0 in the unit domain, 2^bits − 1 for integer raw ADU (65535 for BITPIX 16);
-  **range** = min(plane max, norm) − bg.
+- **bg** = `SkyLevel.median` scaled to working units: the module's sampled, clipped sky median (PA-21), the
+  substitute for the reference method's full-plane median (the module computes no other); **σ** = `NoiseModel.sigma`
+  (MRS; `N*` when MRS is refused; 0 under `NoiseSource::None`, with one `warn!` per plane when seeds are given), the
+  substitute for the reference method's background-noise estimate; **threshold** = bg + 5σ;
+- **norm** = the plane's full scale in working units: the image of 1.0, `ADU_SCALE`, for a calibrated plane; the
+  stored integer type's full scale for raw ADU (2^bits − 1 from BITPIX/BZERO: 65535 for unsigned 16-bit, i.e.
+  BITPIX 16 with BZERO 32768, and 255 for 8-bit; never DATAMAX). The float raw plane (BITPIX −32) has no integer
+  full scale; Plan C settles it. **range** = min(plane max, norm) − bg, the plane max read over the same working copy.
 
 Per seed (every seed gets the whole test, as the reference method fits every candidate):
-- **The plateau test at the seed pixel.** pixel0 = the pixel at the rounded seed centre, the substitute for the
-  reference method's own pick: the matched filter's peak is, like that pick, the local maximum of a smoothed plane.
+- **The plateau test at the seed pixel.** pixel0 = the pixel at the rounded seed centre (`fit_one`'s own `(cx, cy)`),
+  the substitute for the reference method's own pick: for the matched filter that is the rounded centroid of the box
+  about its local maximum, at most a pixel from that maximum on a plateau; for given seeds the caller's position.
+  Cost: FN/FP move from the lab port's numbers; Phase C measures it.
   Of pixel0's 8 neighbours, those ≥ threshold count: a mono plane needs ≥ 3 of them, a colour plane all 8; meanhigh
   and minhigh are their mean and minimum. The test passes when meanhigh − bg ≥ 0.7·range AND
   pixel0 − minhigh ≤ 0.1·range.
 - **The level** = min(pixel0, norm) − 0.1·range when the plateau test passes, else norm.
 - **The verdict fit**: a free-β Moffat on the seed's own region (F-1) with every pixel ≥ the level excluded (left
   out of the fit, never modelled as clipped). The iteration limit is ×3 when anything is excluded. When no more
-  pixels remain than the fit has parameters, the seed is refused with its own `FitDiagnostics` reason.
+  pixels remain than the fit has parameters (n ≤ 8), the seed is refused `MostlySaturated`. A verdict fit that fails
+  for any other reason (bounds, divergence) gives the seed no flag and no refusal: it is counted in
+  `FitDiagnostics.verdict`, stays out of the β sample, and the frame-β fit decides acceptance as now.
 - **The flag**: saturated when the verdict fit's amplitude A > range. The plateau test only sets the level; the
   flag always comes from the fit.
 
-Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample, the width start
-and the frame statistic use unflagged stars only (F-3). The unflagged bright seeds' verdict fits are the β sample's
-free-β fits (F-4), and every star is then fitted at the frame β.
+Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample and the frame
+statistic use unflagged stars only; the field width reads every candidate (F25), the per-star width start is the
+star's own (F-3). The unflagged bright seeds' verdict fits are the β sample's free-β fits (F-4), and every star is
+then fitted at the frame β with the SAME exclusion as its verdict fit (pixels ≥ its level, ×3 iterations): an
+unflagged star excludes nothing (byte-identical to a plain fit), and a flagged star without a plateau excludes
+nothing. Registration's `passes_register_cuts` (peak ≥ 0.95) still holds, since censoring raises the fitted peak;
+the parity gate checks it.
 
 **Known limit (owner ruling 2026-10-09).** A star with a small clipped core (3–5 px) fails the full-3×3 plateau
 test, so its verdict fit runs uncensored. It is still flagged (its fitted A exceeds the range), but its own FWHM is
@@ -168,7 +180,7 @@ its numbers; a bar is never moved, a row never re-sized, a generator never tuned
 | F-0 | No refusal reasons (`sharp/m4/f8.0`: 82.7 % fitted of 92.0 % seeded) | `FitDiagnostics` per seed; `stars_refused` + per-reason counts in `ChannelMeasurement` and `FrameAnalysis` (§4.2); the `.athf` flags byte carries per-accepted-fit flags (saturated, β at its cap), the file holds accepted fits only | accepted + refused-by-reason = seeds on every image; numbers unchanged against the extraction step |
 | F-1 | Broad / defocused stars collapse (M51 Hα 6.53 px vs analysis 13.39, ERP 14.02; m82 11.43 vs 16.31 / 17.76; `_DSC5767` zero seeds) | region growth judged on (median − sky), not the absolute median; the region cap scales with the star's own width start (≥ 6 FWHM, cap 96 px; today `min(2·nominal, 48)`); background start from the region's rim, not the plain median of a star-filled square; width start from the star's own moments, not one field σ0; matched-filter seeds (§2.1); new lab families FWHM 12 and 16 px and defocused annular ("donut") stars, isolated (`min_sep` ≥ 6 FWHM) | fitted / seeded at FWHM 8: 82.7 % → ≥ 99 %; frame FWHM error vs `pointfit` ≤ 1 % at every FWHM up to 16 px; a donut star is refused with its reason, never reported as a narrow fit |
 | F-2 | Angle: measure rms 44.564° / 32.339° on `shape/f2.6/e0.3|e0.5/t30` vs ERP 7.849° / 2.129° (summary row 4); 71–145 of 346–427 unsaturated fits per `e0.3` family have fwhm_x < fwhm_y (θ on the minor axis; `path-compare.txt` part 2) | canonical axes (fwhm_x ≥ fwhm_y, θ on the major axis); the fitter sees stamp-centred coordinates and amplitude-normalised values so its relative convergence test acts on O(1) parameters (the convergence test itself changes in rustafits only if the lab shows it is needed) | structural: every accepted fit has fwhm_x ≥ fwhm_y and θ on fwhm_x's axis, pinned by a test; the row-4 angle `eff` cell (prepixel CRLB) ≤ 1.5 on the `shape` families with e ≥ 0.3 |
-| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample, the width start and the frame statistic use unsaturated stars only (§2.1's test) | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
+| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample and the frame statistic use unsaturated stars only (§2.1's test); the field width reads every candidate (F25), the per-star width start is the star's own | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
 | F-4 | Model-dependent width (Gaussian / blur pointfit −2.07…−3.04 %; β alone 9.60 %; `mixture/b` +4.88 %) | β becomes continuous per frame: a free-β Moffat fit on the unsaturated bright sample gives the frame's β (median), clamped to [1.5, 100]; every star is then fitted at it. A named rustafits change: `fit_moffat_2d` refuses β > 20 today (`rf/analysis/fitting.rs:545-551`), so its bound is lifted to the cap and the sample fit runs in a conditioned parametrization (ln β), because the Gaussian limit is a flat ridge in (α, β). At β 100 a Gaussian star reads −0.32 % (β 30: −1.04 %; spec re-review N-1). The Gaussian is the large-β limit; there is no separate Gaussian model, so β stays a finite number everywhere (`.athf` f32, `metrics` JSON, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`, `star_metrics.beta`, `median_beta`; `fit_method` is `moffat`; `FITS_ARTIFACT_VERSION` unchanged) | frame FWHM error vs `pointfit` ≤ 1 % at FWHM ≥ 2 px, ≤ 3 % below, on every family whose stars share one profile (`gauss`, `m*`, `blur*`, `mix*`: the lab's pointfit truth there is a free-β fit, `families.py:113-134`) |
 | F-5 | Captured fraction depends on the profile (spread 18.73 % at F 2.6, 22.16 % at F 8.0) → PSFSW / PSFSNR / psfSel | star flux = fitted-model flux in the FWTM ellipse × a per-frame aperture correction from the growth curve (to 5F) of bright unsaturated isolated stars; psfSel reads this flux | spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel: `pairs/iso/blur25mix` t60 −13.03 % and `pairs/iso/blur4` t60 −7.28 % → within ±2 %, the Moffat and Gaussian pairs stay within ±1.2 % |
 | F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | one definition: S / σ_S in an aperture of radius max(1.5·FWHM, 3 px), σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky), σ_sky measured in the annulus; g from EGAIN (raw ADU) or EGAIN with the calibrated-frame cards (`ATH_CSCL`, `ATH_CFNM`); unknown gain → the shot term is omitted and the record says so. Lab: the generator writes EGAIN (and `ATH_CSCL` on unit-domain planes) from its own gain; the truth SNR is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky | median bias vs the truth SNR ≤ 3 % on the unsaturated isolated families (`sharp/*`, `background/*`) |
