@@ -2019,9 +2019,10 @@ mod tests {
             serde_json::from_str(r#"{"local":{"enabled":true,"scale":512}}"#).unwrap();
         assert_eq!(bare.local.flux_estimator, LnFluxEstimator::CommonAperture);
         assert_eq!(bare.local.aperture, LnAperture::GrowthCurve);
-        let psf: NormalizationConfig =
-            serde_json::from_str(r#"{"local":{"enabled":true,"fluxEstimator":"psfSignal"}}"#)
-                .unwrap();
+        let psf: NormalizationConfig = serde_json::from_str(
+            r#"{"local":{"enabled":true,"fluxEstimator":"psfSignal"}}"#,
+        )
+        .unwrap();
         assert_eq!(psf.local.flux_estimator, LnFluxEstimator::PsfSignal);
     }
 

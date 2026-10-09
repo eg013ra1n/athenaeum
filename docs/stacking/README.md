@@ -2200,11 +2200,16 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `measure_plane_diagnosed` unchanged. The entry takes its planes through a reader called once per half, so the
       frame adapter re-reads a plane from disk instead of holding every plane (`MEASURE_PLANES_RESIDENT` unchanged).
       R3's mechanism: all 52 OSC false negatives of t08-f3 were G-saturated stars with no plateau at their R or B
-      seed pixel, each flagged on G. Lab: `<pending t08-f3>`.
+      seed pixel, each flagged on G. Lab (`t08-f3`, round 3): false negatives mono 3/4089 = 0.073 %, OSC 0/1229 (was 52);
+      false positives mono 0.294 %, OSC 0.411 % (5 own + 90 cross, every cross flag a star saturated in another
+      channel). A `MostlySaturated` refusal on one plane counts as an own flag in the union (the Task 8 close; the
+      lab's OSC `MostlySaturated` count is 0, so no lab number moved). The union is idempotent: only own flags
+      (`!cross`) spread.
     - **Q6 as revised (controller ruling from R3, 2026-10-09).** The fit at β leaves out the pixels ≥ the star's own
       level (norm when its own plateau test failed), ×3 iterations, ONLY for a flagged star, own or cross. An
       unflagged star's fit at β is byte-identical to a fit with no verdict. R3: Q6 as first written censored 218
-      truth-unsaturated plateau stars at β (the held-β FWHM 163/55 moves). Lab: `<pending t08-f3>`.
+      truth-unsaturated plateau stars at β (the held-β FWHM 163/55 moves). Lab: 37 278 / 37 278 unflagged measure fits
+      equal the held-β fits (the β-change control).
     - **Formula weighting (review M-3).** A channel with `stars_unsaturated == 0` (no accepted fit, or every one
       flagged) has no FWHM or eccentricity: it is left out of the group's `fwhm` and `ecc` ranges and those two terms
       give it zero credit (`stacking::weights::formula_weight`); SNR, stars and the pedestal are unchanged.
@@ -2214,12 +2219,16 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **Known limit, three consumers.** A star whose clipped core is small (3–5 px) fails the full-3×3 plateau test,
       so its verdict fit runs uncensored: it is still flagged, but its own FWHM is not trusted. No consumer reads it:
       the frame statistics exclude flagged stars, the Analysis tab (Plan C) takes unsaturated stars, and registration
-      takes centroids.
+      takes centroids. Consumers: the frame statistic excludes them; Analysis takes unsaturated stars; registration takes
+      centroids.
     - **The row and the payoff.** Row 10 `saturation flag vs truth`: false negatives ≤ 0.5 % among truth-saturated
       stars with ≥ 3 clipped core pixels, false positives reported (a plane's brightest star sets its own range by
       design). The payoff is the censored verdict fit's FWHM error where the plateau test passed, beside the
-      failed ones: `<pending t08-f3>`.
-    - **Measure wall time** (one real calibrated mono frame, release probe, interleaved runs): `<pending C-b>`.
+      failed ones (|ΔFWHM|/FWHM, median / p90): mono 2.85 / 8.51 % where the plateau test passed, 34.82 / 61.39 % where it
+      failed; OSC 7.93 / 20.95 % and 32.81 / 50.45 %.
+    - **Measure wall time** (one real calibrated mono frame, LDN_1272, release probe): 1.19 → 1.69 s (c59f4385); the
+      verdict pass's region reuse changes nothing. **The real-frame note:** LDN_1272 β 10 → 2.5, frame FWHM
+      2.722 → 2.325 px.
   - **The surfaces.** `RefusalReason::MostlySaturated` (`mostlySaturated`, declared last); `FitDiagnostics.verdict`;
     `ChannelMeasurement.stars_unsaturated` (camelCase `starsUnsaturated`, 0 in a payload written before Task 8); the
     adapter's `PlaneMeasurement.verdict_fit_failed` and `cross_flags` (reported, not persisted);
@@ -2233,4 +2242,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     frame FWHM and eccentricity move by 4–7e-5 relative (`stacking::measure` tests: the Peak and matched-filter
     records, `the_shipped_none_path_…`, `the_matched_filter_default_…`). The drizzle sharpening test's lone star is
     flagged the same way, so `stats.fwhm_px` reads 0.0 there and the test reads the star's own fit (unchanged).
-  - **Acceptance.** The lab step `t08-f3`: `<pending t08-f3>`.
+  - **Acceptance.** The lab step `t08-f3` (round 3, closed by the design entries of the C3 report): FN as above; twins
+    44 of 46 families ≤ 1 %, and `twins/sharp/m2.5/f1.6` and `twins/sharp/m4/f2.0` move to Task 9 (discrete β near-ties
+    on undersampled stars; at held β they read ≤ 0.10 %); R2 f12.0 / f16.0 ≤ 0.04 %, and `sharp/m4/f2.0` i0 moves to
+    Task 9 (+2.62 % at β 6, +0.27 % at the truth β 4); β-change control 37 278 / 37 278.

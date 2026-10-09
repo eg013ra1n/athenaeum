@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use astroimage::{DetectionLevels, ImageAnalyzer};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed, StarFit};
@@ -818,6 +818,69 @@ pub fn measure_frame_with_fits(
     measure_frame_inner(path, opts, pool, cancel, SeedOverride::Fast)
 }
 
+/// The file's identity as the plane reader sees it: size and modification time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> std::io::Result<FileIdentity> {
+        let meta = std::fs::metadata(path)?;
+        Ok(FileIdentity {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// Guards the multi-plane reader (Task 8 close, review M-4): a plane is read once per half, so a file rewritten
+/// between the two reads would mix two images in one measurement. The identity is taken at the first read; any later
+/// read of a different identity is an error (logged here), never a mixed measurement.
+struct ReadGuard<'a> {
+    path: &'a Path,
+    first: Option<FileIdentity>,
+}
+
+impl<'a> ReadGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        ReadGuard { path, first: None }
+    }
+
+    /// Call before every plane read.
+    fn check(&mut self) -> Result<(), IntegrationError> {
+        let now = FileIdentity::of(self.path).map_err(|e| {
+            error!(path = %self.path.display(), error = %e, "measure: the frame cannot be stat-ed between plane reads");
+            IntegrationError::Io(e)
+        })?;
+        match self.first {
+            None => {
+                self.first = Some(now);
+                Ok(())
+            }
+            Some(first) if first == now => Ok(()),
+            Some(first) => {
+                error!(
+                    path = %self.path.display(),
+                    size_first = first.len,
+                    size_now = now.len,
+                    "measure: the frame changed between its two plane reads; the measurement is refused"
+                );
+                Err(IntegrationError::Io(std::io::Error::other(format!(
+                    "{} changed between the two reads of one measurement (size {} -> {}, modified time {:?} -> {:?}); \
+                     the measurement is refused rather than mixing two versions of the file",
+                    self.path.display(),
+                    first.len,
+                    now.len,
+                    first.modified,
+                    now.modified
+                ))))
+            }
+        }
+    }
+}
+
 fn measure_frame_inner(
     path: &Path,
     opts: &MeasureOptions,
@@ -833,6 +896,7 @@ fn measure_frame_inner(
     // group's (Q3, all 8 neighbours) and gets the cross-plane rule. `cancel` is checked before each read; a plane is
     // read once per half, so one plane is held at a time.
     let mut read_ms = vec![0u64; n];
+    let mut guard = ReadGuard::new(path);
     let _span = tracing::debug_span!("measure_frame", path = %path.display()).entered();
     let planes = measure_planes_diagnosed(
         n,
@@ -846,6 +910,7 @@ fn measure_frame_inner(
             if cancel.load(Ordering::Relaxed) {
                 return Err(IntegrationError::Cancelled);
             }
+            guard.check()?;
             let t = Instant::now();
             let data = reader.read_plane(plane)?;
             read_ms[plane] += t.elapsed().as_millis() as u64;
@@ -920,6 +985,30 @@ pub(crate) mod tests {
     /// ruling F44, so the star-measurement module's own tests build it too).
     fn field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>, usize, usize) {
         crate::test_support::fixture_field(seed, amp_scale, noise)
+    }
+
+    /// M-4: the reader seam is the guard (`measure_planes_diagnosed` takes any `plane(p)` closure, and
+    /// `measure_frame_inner`'s is `guard.check()` then the read), so the test drives the guard on a real file: stable
+    /// across reads is fine, a rewritten file (new size) is an error naming the path, and the error is final.
+    #[test]
+    fn the_read_guard_refuses_a_file_changed_between_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("frame.bin");
+        std::fs::write(&f, [0u8; 64]).unwrap();
+        let mut g = ReadGuard::new(&f);
+        g.check().unwrap();
+        g.check().unwrap();
+        std::fs::write(&f, [1u8; 80]).unwrap();
+        let err = g.check().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("changed between the two reads") && msg.contains("frame.bin"),
+            "{msg}"
+        );
+        assert!(msg.contains("64 -> 80"), "{msg}");
+        // A vanished file is an error with the io cause, not a silent pass.
+        std::fs::remove_file(&f).unwrap();
+        assert!(matches!(g.check(), Err(IntegrationError::Io(_))));
     }
 
     fn write(dir: &Path, name: &str, planes: &[&[f32]], w: usize, h: usize) -> PathBuf {

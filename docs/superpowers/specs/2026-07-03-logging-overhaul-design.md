@@ -351,3 +351,5 @@ Reused in their existing senses:
 ## Rollout shape
 
 Phased (detail in the implementation plan): (1) infra — deps, subscriber, files, reload, settings plumbing; (2) command boundary both backends; (3) core sweep module-by-module; (4) submodules (usual branch + bump); (5) Settings UI; (6) MCP crate. Next version branch per the version-branch rule. Docker image and uninstall scripts updated where touched.
+
+**Dictionary note (one-star-path Task 8 close, 2026-10-09):** no new field names. (1) `duration_ms` on `"plane integrated"` and on `"drizzle plane deposited"` now EXCLUDES the master measurement (the multi-plane entry measures after the planes are integrated or deposited). (2) New `"master plane measured"` debug (`stacking::integrate`), once per plane of a group's master: `plane`, `duration_ms` (that plane's own share of the measurement call, both halves). (3) `read_ms` on `"frame plane measured"` sums both reads of a multi-plane frame's plane (a plane is read once per half of the cross-plane rule).

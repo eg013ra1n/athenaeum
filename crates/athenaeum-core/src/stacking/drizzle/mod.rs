@@ -26,7 +26,6 @@ pub mod geom;
 pub mod phase_table;
 
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -34,7 +33,7 @@ use std::time::Instant;
 use astroimage::BayerPattern;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::geometry::{ForwardEval, PixelMap};
 use crate::integration::plane_reader::PlaneReader;
@@ -1128,28 +1127,29 @@ pub fn drizzle_group(
         None
     };
     let (measure_w, measure_h) = crop.map_or((out_w, out_h), |r| (r.width, r.height));
-    let measured = pool
-        .install(|| {
-            measure_planes_diagnosed(
-                input.channels,
-                measure_w,
-                measure_h,
-                input.measure,
-                None,
-                SeedOverride::Fast,
-                false,
-                |c| {
-                    let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
-                    Ok::<_, Infallible>(match crop {
-                        Some(r) => {
-                            Cow::Owned(crate::stacking::crop::crop_plane(plane_data, out_w, r))
-                        }
-                        None => Cow::Borrowed(plane_data),
-                    })
-                },
-            )
-        })
-        .unwrap_or_else(|never| match never {});
+    let measured = pool.install(|| {
+        measure_planes_diagnosed(
+            input.channels,
+            measure_w,
+            measure_h,
+            input.measure,
+            None,
+            SeedOverride::Fast,
+            false,
+            |c| {
+                // The run's cancel, as integrate's master measurement checks it: before each plane's read.
+                if cancel.load(Ordering::Relaxed) {
+                    warn!(plane = c, "drizzle cancelled during the master measurement");
+                    return Err(DrizzleError::Cancelled);
+                }
+                let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
+                Ok::<_, DrizzleError>(match crop {
+                    Some(r) => Cow::Owned(crate::stacking::crop::crop_plane(plane_data, out_w, r)),
+                    None => Cow::Borrowed(plane_data),
+                })
+            },
+        )
+    })?;
     for m in &measured {
         let cm = &m.measurement.channel;
         fwhm_px.push(cm.fwhm_px);
@@ -2607,6 +2607,30 @@ mod tests {
         assert!(matches!(err, DrizzleError::Cancelled), "{err:?}");
     }
 
+    /// Task 8 close, M-1: the master measurement checks the run's cancel (integrate's does). The flag is raised by the
+    /// last frame's own progress tick, after the per-frame check has passed for good, so only the measurement can see it.
+    #[test]
+    fn cancel_during_the_master_measurement_returns_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &uniform(W, H, 0.2));
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [frame(&p0, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+        let cancel = AtomicBool::new(false);
+        let progress = DrizzleProgress {
+            on_frame: &|done, total| {
+                if done == total {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        };
+        let err = drizzle_group(&input, &pool(), &cancel, &progress).unwrap_err();
+        assert!(matches!(err, DrizzleError::Cancelled), "{err:?}");
+    }
+
     // ── (i) memory ──
 
     /// Spec §5.8, plan 6b-3 D9: drizzle's own coverage counts, per output
@@ -3617,6 +3641,58 @@ mod tests {
             measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
+        }
+    }
+
+    /// Task 8 close, M-5: a 3-plane drizzle's statistics go through the multi-plane entry (the cross-plane rule
+    /// between the planes): the reported noise, FWHM and eccentricity are bit-equal to `measure_planes_diagnosed` on
+    /// the drizzled planes. (The mosaic is uniform per colour, so the numbers are the entry's no-star arm; the
+    /// cross-plane rule itself is pinned in `star_measure` and `stacking::measure`.)
+    #[test]
+    fn three_plane_drizzle_statistics_come_from_the_multi_plane_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp = write_mono(
+            dir.path(),
+            "c_f0.fits",
+            W,
+            H,
+            &rggb_mosaic(W, H, 0.4, 0.6, 0.2),
+        );
+        let dp = dir.path().join("c_f0_d.fits");
+        write_fits_f32(&dp, W, H, 3, &vec![9.0f32; W * H * 3], &[]).unwrap();
+        let (map, weight, pair) = (
+            identity_map(),
+            [1.0f64; 3],
+            [NormalizationPair::IDENTITY; 3],
+        );
+        let frames = [cfa_frame(&dp, &mp, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = cfa_input(&frames, &measure, 1);
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        let n = W * H;
+        let want =
+            measure_planes_diagnosed(3, W, H, &measure, None, SeedOverride::Fast, false, |c| {
+                Ok::<_, DrizzleError>(Cow::Borrowed(&out.data[c * n..(c + 1) * n]))
+            })
+            .unwrap();
+        assert_eq!(want.len(), 3);
+        for (c, m) in want.iter().enumerate() {
+            let cm = &m.measurement.channel;
+            assert_eq!(
+                out.stats.noise[c].to_bits(),
+                cm.noise.to_bits(),
+                "plane {c}"
+            );
+            assert_eq!(
+                out.stats.fwhm_px[c].to_bits(),
+                cm.fwhm_px.to_bits(),
+                "plane {c}"
+            );
+            assert_eq!(
+                out.stats.eccentricity[c].to_bits(),
+                cm.eccentricity.to_bits(),
+                "plane {c}"
+            );
         }
     }
 

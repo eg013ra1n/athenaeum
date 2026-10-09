@@ -1176,6 +1176,18 @@ pub(crate) struct SeedPass {
     pub(crate) verdict: SeedVerdict,
 }
 
+#[cfg(test)]
+impl SeedPass {
+    /// A record carrying only `verdict` (the cross-plane rule reads nothing else of it).
+    pub(crate) fn for_test(verdict: SeedVerdict) -> SeedPass {
+        SeedPass {
+            region: Err(RefusalReason::OutsideImage),
+            trace: FitTrace::before_region(3.0),
+            verdict,
+        }
+    }
+}
+
 /// One seed's saturation verdict (spec §2.1, PA-23): [`fit_one`]'s steps 1–4 ([`region_steps`]) on the same field
 /// width, then [`saturation_verdict`] on the unnormalised region in stamp coordinates, from the region's rim median
 /// `b0` and the star's own `F_start`; kept with the steps' outcome ([`SeedPass`]).

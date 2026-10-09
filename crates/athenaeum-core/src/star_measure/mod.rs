@@ -277,7 +277,8 @@ pub const CROSS_PLANE_MATCH_PX: f64 = 1.0;
 /// B seed pixel). Given every plane's [`PlanePrep`] (after every plane's verdict pass, before any plane's β sample,
 /// frame statistic or fits at β): a seed whose verdict exists (`Some(Ok(_))`, its verdict fit failed or not) and is not
 /// flagged is flagged when a seed of ANOTHER plane within [`CROSS_PLANE_MATCH_PX`] carries its own flag
-/// ([`SaturationVerdict::cross`]). Only own flags spread. One plane (or none): nothing changes.
+/// ([`SaturationVerdict::cross`]). Only own flags spread — a `MostlySaturated` refusal counts as one — so a second call
+/// changes nothing. One plane (or none): nothing changes.
 pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
     if planes.len() < 2 {
         return;
@@ -287,7 +288,12 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
     let mut own: HashMap<(i64, i64), Vec<(usize, f64, f64)>> = HashMap::new();
     for (plane, prep) in planes.iter().enumerate() {
         for (s, pass) in prep.seeds.iter().zip(&prep.passes) {
-            if matches!(pass.verdict, Some(Ok(v)) if v.saturated) {
+            // A `MostlySaturated` refusal is the seed's own flag too (owner rule: saturated in any channel is
+            // saturated in all): the verdict fit had nothing left to fit, which only a saturated core does. A
+            // cross-plane flag never spreads again (`!v.cross`), so a second call changes nothing.
+            if matches!(pass.verdict, Some(Ok(v)) if v.saturated && !v.cross)
+                || matches!(pass.verdict, Some(Err(RefusalReason::MostlySaturated)))
+            {
                 own.entry(cell(s)).or_default().push((plane, s.x, s.y));
             }
         }
@@ -317,7 +323,7 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
                 n += 1;
             }
         }
-        prep.cross_flags = n;
+        prep.cross_flags += n;
     }
 }
 
@@ -561,6 +567,133 @@ pub fn fit_stars_at(
 mod tests {
     use super::*;
     use crate::test_support::fixture_field;
+
+    /// A prep whose seeds and verdict-pass records are the given ones (the noise model and sky statistic come from a
+    /// small real plane; the cross-plane rule reads neither).
+    fn prep_with(seeds: &[(f64, f64, fit::SeedVerdict)]) -> PlanePrep {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let mut prep = prepare_plane(&data, w, h, &MeasureOptions::default(), None);
+        prep.seeds = seeds
+            .iter()
+            .map(|&(x, y, _)| Seed {
+                x,
+                y,
+                peak: 1.0,
+                flux: 1.0,
+            })
+            .collect();
+        prep.passes = seeds.iter().map(|s| fit::SeedPass::for_test(s.2)).collect();
+        prep
+    }
+
+    fn verdict(saturated: bool) -> fit::SeedVerdict {
+        Some(Ok(SaturationVerdict {
+            plateau: false,
+            level: 1.0,
+            excluded: 0,
+            amplitude: 1.0,
+            beta: 2.5,
+            fwhm: 3.0,
+            saturated,
+            fit: true,
+            cross: false,
+        }))
+    }
+
+    fn flags(prep: &PlanePrep) -> Vec<(bool, bool)> {
+        prep.passes
+            .iter()
+            .map(|p| match p.verdict {
+                Some(Ok(v)) => (v.saturated, v.cross),
+                _ => (false, false),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_plane_match_edges() {
+        // Plane 0 holds the own flag at (100, 100). Plane 1: exactly 1.0 px away (matches), 1.01 px (does not), two
+        // candidates within 1 px of one flag (one flag each, no double count), the 3x3-cell edge across a cell border.
+        let mut planes = [
+            prep_with(&[(100.0, 100.0, verdict(true)), (200.5, 200.0, verdict(true))]),
+            prep_with(&[
+                (101.0, 100.0, verdict(false)),
+                (100.0, 101.01, verdict(false)),
+                (200.0, 200.0, verdict(false)),
+                (200.9, 200.0, verdict(false)),
+                (300.0, 300.0, verdict(false)),
+            ]),
+        ];
+        cross_plane_flags(&mut planes);
+        assert_eq!(
+            flags(&planes[1]),
+            vec![
+                (true, true),
+                (false, false),
+                (true, true),
+                (true, true),
+                (false, false)
+            ]
+        );
+        assert_eq!(planes[1].cross_flags, 3);
+        // The own-flag plane is unchanged: no flag of plane 1 existed to spread.
+        assert_eq!(flags(&planes[0]), vec![(true, false), (true, false)]);
+        assert_eq!(planes[0].cross_flags, 0);
+        // A flag on two planes at one position: the third plane takes it once; both flagged planes stay own.
+        let mut three = [
+            prep_with(&[(50.0, 50.0, verdict(true))]),
+            prep_with(&[(50.4, 50.0, verdict(true))]),
+            prep_with(&[(50.2, 50.0, verdict(false))]),
+        ];
+        cross_plane_flags(&mut three);
+        assert_eq!(flags(&three[0]), vec![(true, false)]);
+        assert_eq!(flags(&three[1]), vec![(true, false)]);
+        assert_eq!(flags(&three[2]), vec![(true, true)]);
+        assert_eq!(three[2].cross_flags, 1);
+    }
+
+    #[test]
+    fn cross_plane_flags_is_idempotent_and_only_own_flags_spread() {
+        // Plane 0 own flag at A; plane 1 has a seed at A (takes the cross flag) and another 0.9 px further on, which
+        // only the (cross) flag at A could reach: it must stay unflagged, on the first call and on the second.
+        let mut planes = [
+            prep_with(&[(10.0, 10.0, verdict(true))]),
+            prep_with(&[(10.5, 10.0, verdict(false)), (11.4, 10.0, verdict(false))]),
+        ];
+        cross_plane_flags(&mut planes);
+        let once: Vec<_> = planes.iter().map(flags).collect();
+        let counts: Vec<_> = planes.iter().map(|p| p.cross_flags).collect();
+        assert_eq!(once[1], vec![(true, true), (false, false)]);
+        cross_plane_flags(&mut planes);
+        assert_eq!(planes.iter().map(flags).collect::<Vec<_>>(), once);
+        // The counts accumulate what each call set: the second sets nothing and spreads nothing.
+        assert_eq!(counts, vec![0, 1]);
+        assert_eq!(
+            planes.iter().map(|p| p.cross_flags).collect::<Vec<_>>(),
+            counts
+        );
+    }
+
+    #[test]
+    fn a_mostly_saturated_refusal_is_an_own_flag_for_the_other_planes() {
+        let refused: fit::SeedVerdict = Some(Err(RefusalReason::MostlySaturated));
+        let mut planes = [
+            prep_with(&[
+                (30.0, 30.0, refused),
+                (60.0, 60.0, Some(Err(RefusalReason::Donut))),
+            ]),
+            prep_with(&[(30.3, 30.0, verdict(false)), (60.0, 60.0, verdict(false))]),
+        ];
+        cross_plane_flags(&mut planes);
+        // The refused seed itself stays refused (no verdict to flag); the star at its position is flagged on the
+        // other plane. A Donut refusal is no flag.
+        assert!(matches!(
+            planes[0].passes[0].verdict,
+            Some(Err(RefusalReason::MostlySaturated))
+        ));
+        assert_eq!(flags(&planes[1]), vec![(true, true), (false, false)]);
+        assert_eq!(planes[1].cross_flags, 1);
+    }
 
     #[cfg(feature = "solver")]
     #[test]
