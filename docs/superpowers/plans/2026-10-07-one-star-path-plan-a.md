@@ -333,7 +333,7 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   - **Order (ruling F9, kept):** seeds → field width → verdicts → β sample → fits at β. The field width (PA-17)
     runs no saturation test (ruling F25 as folded). The unflagged bright seeds' verdict fits are the β sample:
     Task 8's discrete search takes the 64 brightest unflagged seeds, Task 9 takes their free β (C-b). Every star is
-    then fitted at the frame β as now.
+    then fitted at the frame β with the same per-star exclusion as its verdict fit (Q6).
   - **Flagged stars (C-c)** stay in `.athf` with `SATURATED`; the β sample and the frame statistic read unflagged
     stars only (F-3); the field width reads every candidate (F25) and the per-star width start is the star's own
     (Q8). The at-β fit applies the SAME per-star exclusion as the verdict fit (Q6): an unflagged star excludes
