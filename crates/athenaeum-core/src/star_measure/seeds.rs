@@ -963,6 +963,10 @@ fn detect_on(
         extended,
         filter_snr,
         envelope,
+        noise_correlation: match corr {
+            GainSource::Read(c) => Some(c),
+            GainSource::Unmixed | GainSource::None => None,
+        },
     };
     debug!(
         width = w,
@@ -1068,6 +1072,10 @@ pub struct DetectionReport {
     /// The field's star-width envelope the knot bounds sit at (Task 10b A2b, rulings A2-1 and A2-2): F_env and its
     /// spread `s`, px — the probe's `fieldWidthEnvelope` and `fieldWidthSpread`.
     pub envelope: WidthEnvelope,
+    /// The noise's autocovariance the detection read on this plane (Task 11, ruling R11-1): the ONE read the aperture
+    /// SNR's `kappa(A)` reuses. `None` where nothing was read: a plane stated white (gain 1 by derivation, `kappa`
+    /// 1), or a mixed / unknown one whose correlation could not be measured.
+    pub(crate) noise_correlation: Option<NoiseCorrelation>,
 }
 
 impl DetectionReport {
@@ -1084,6 +1092,7 @@ impl DetectionReport {
                 spread_px: f64::NAN,
                 fwhm_px: f64::NAN,
             },
+            noise_correlation: None,
         }
     }
 }
@@ -1186,6 +1195,37 @@ pub fn detection_noise(
     }
 }
 
+/// The plane's noise correlation read once, for a plane whose seeds were handed in (Task 11, ruling R11-1): the same
+/// read [`detect`] makes on its own plane (`d` = the plane less the prep's one mesh's background, the mesh's noise map
+/// for the quiet half; the mesh is built with its noise map), so the aperture SNR of a given-seed mixed or unknown plane reads the number the matched filter would.
+/// `None` when the plane is too small, has no noise map, or the read fails.
+pub(crate) fn read_noise_correlation(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    mask: Option<&[bool]>,
+    mesh: &BackgroundMesh,
+) -> Option<NoiseCorrelation> {
+    if plane.len() != w * h || mask.is_some_and(|m| m.len() != w * h) || w < 3 || h < 3 {
+        return None;
+    }
+    let present_at = |i: usize| plane[i].is_finite() && mask.map_or(true, |m| m[i]);
+    let present: Option<Vec<bool>> = if (0..w * h).all(present_at) {
+        None
+    } else {
+        Some((0..w * h).map(present_at).collect())
+    };
+    let bg = background(plane, w, h, mask, mesh.background.as_deref());
+    let d: Vec<f32> = (0..w * h)
+        .into_par_iter()
+        .map(|i| if present_at(i) { plane[i] - bg[i] } else { 0.0 })
+        .collect();
+    drop(bg);
+    mesh.noise
+        .as_deref()
+        .and_then(|m| NoiseCorrelation::measure(&d, present.as_deref(), m, w, h))
+}
+
 /// The high-pass box of the noise read (half-width, px): `r = d − (the mean of the other 24 pixels of the 5×5 box)`
 /// keeps a few per cent of anything smooth over a few px (a gradient, a nebula, a star's far wing), so what the read
 /// sees is the noise.
@@ -1205,7 +1245,7 @@ const NOISE_MIN_ANCHORS: usize = 4096;
 /// About this many anchors are read: every row on a small plane, a stride of rows on a large one.
 const NOISE_ANCHOR_TARGET: usize = 1 << 20;
 
-const NOISE_CORR_SIDE: usize = 2 * NOISE_CORR_REACH + 1;
+pub(crate) const NOISE_CORR_SIDE: usize = 2 * NOISE_CORR_REACH + 1;
 
 /// The noise's autocovariance `C(L)` at the lags `|L|∞ ≤ NOISE_CORR_REACH` (`C(−L) = C(L)`; working units²), read once
 /// per plane (Task 10b ruling A1): the filtered-to-pixel σ ratio of the noise at any kernel and grid — the gain σ_f
@@ -1218,12 +1258,21 @@ const NOISE_CORR_SIDE: usize = 2 * NOISE_CORR_REACH + 1;
 /// least-squares solution of `E[r(i)·r(i+L)] = Σ_v H₂(v)·C(L + v)`, `H₂` the high-pass box's autocorrelation. A smooth
 /// structure never reaches it (the high-pass took it out); white noise reads `C(L ≠ 0) = 0`, a gain of 1.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct NoiseCorrelation {
+pub(crate) struct NoiseCorrelation {
     /// `c[dy + R][dx + R]`, `R` = [`NOISE_CORR_REACH`].
     c: [[f64; NOISE_CORR_SIDE]; NOISE_CORR_SIDE],
 }
 
 impl NoiseCorrelation {
+    /// The correlation coefficients `rho(L) = C(L) / C(0)` at `|L|inf <= NOISE_CORR_REACH`, `rho[dy + R][dx + R]`
+    /// (Task 11, ruling R11-1): what an aperture's `kappa(A)` sums. `rho[R][R]` is exactly 1.
+    pub(crate) fn rho(&self) -> [[f64; NOISE_CORR_SIDE]; NOISE_CORR_SIDE] {
+        let c0 = self.c[NOISE_CORR_REACH][NOISE_CORR_REACH];
+        let mut r = self.c;
+        r.iter_mut().flatten().for_each(|v| *v /= c0);
+        r
+    }
+
     /// `None` when the plane is too small, its residual has no spread, fewer than [`NOISE_MIN_ANCHORS`] anchors are
     /// quiet, or the solve fails (`C(0)` not a positive number).
     fn measure(

@@ -4056,6 +4056,48 @@ feat(star_measure): F-6 per-star SNR (S/σ_S with the EGAIN x ATH_CSCL gain, the
 
 **Acceptance:** median bias ≤ 3 % on the 53 families; both diffs 0 moved outside the design list.
 
+**Outcome (2026-10-12).** Commits (athenaeum, WIP branch `one-star-path-t11-wip` from 35870dbf, to be squashed as
+ONE F-6 commit on `one-star-path`): 1224718a (Phase A: `star_snr` = S / σ_S on the star's own ring sky and noise with
+κ(A) from the plane's one noise read and the shot term spread by the CFA site share, the EGAIN × ATH_CSCL header gain
+(omitted and said when absent), `hfr` on the F-5 flux, the frame medians over the statistic's finite fits; probe seed /
+star / frame lines byte-identical to 35870dbf after stripping the new keys), 12706d6c (the review round: a given-seed
+`Mixed` / `Unknown` plane reads its noise correlation off the prep's one mesh, no second mesh build; one warn per
+failed read; the `star_snr` lint allow dropped; doc wording; the probe output byte-identical on the five Phase A
+inputs), then this docs commit. Design read `task-11-report-design.md` (Q1 arm (c); Q2 the structure term measured
+out; Q3 the read is the one quantity; Q4 populations and HFR; Q5 the gain; Q6 the consumers). Rulings index (README
+R-OSP-8, one line each): R11-1 σ_S (arm c: κ(A) from 10b's read, s = 1 / the site share); R11-2 the R / B κ
+under-read (recorded limit); R11-3 the structure term, not in F-6; R11-4 the bar (50 cells, `neb0.5` / `neb3` /
+`neb3_4096` reported, the noise-pull row; amends Step 4 and the Acceptance's 53 families; owner informed); R11-5 the
+populations (amends Files' "finite values only"); R11-6 the header gain only; R11-7 additive; R11-8 the clipped pull
+referee; R11-9 the pull row `reported` in the design list; R11-10 the control STOP. Review `review-t11.md` (1224718a:
+Ready with fixes, 0 Critical / 1 Important / 7 Minor; I1 and m1–m5 fixed in 12706d6c, m6 a note, m7 the squash's
+trailers). Lab (athenaeum-lab, runner): 70b116e (Part 1: the truth `snr_ap` on the star's own ring, 299 of 301 v2
+truth files moved, only `snr_ap`; the noise-pull row; the Mixed note), b3d8434 (design list, bars), 1cd8704 (R11-10:
+`scorecard_diff`'s set of truth steps), 60bbf27 (scripts), 8532f01 (results). `t11-f6` at 1224718a (base t10c-floor)
+**every bar passes; one STOP, the PA-15 control (143 / 138 row-6 cells on path `analysis`: the truth moved, the legacy
+estimator did not), resolved by R11-10**: row 6 worst 0.97 % on the 50 cells (`neb0.1`; `sharp/*` −0.90…+0.51 %),
+`n_no_gain` 0; the nebula cells −16.54 / −75.51 / −60.65 % (= predicted); noise pull 0.92…1.25 on 50 planes
+(`resampled` f2.0 1.07); row 6 on Mixed reported (`osc` −41.5…−24.4 %, `resampled` −5.9 / −1.9 %, as predicted);
+3.84 M lines identical against t10c-floor after the new keys; no-regression and cumulative moved 0, control 0; every
+held bar = t10c-floor (R10c-0 B1 3.60 ≤ 5.39, B3 0.051 ≤ 0.207, B2 0.155 > 0.046 the known miss; twins 48 / 48; FN
+4 / 11 778 · 0 / 1 229; FP 0.244 % / 0.410 %; item 1 58 / 58; S.1 0.81 %; M.1 76.9 s; same-star 0 WORSE; `c_judge`
+82 ok); HFR vs analytic and `snrNoise` (read 50, white 139, unread 0) reported. README R-OSP-8 complete (the rulings,
+the cycle table, the recorded limits); spec §3 F-6 as built and as judged, §4.2's HFR line and the owned-quantities
+table (the noise-correlation row) follow it. Cost, from an interleaved bracket (runner L3, lab 7a70351, 35870dbf vs
+12706d6c): LN +1.3 pp over the null control, so no skip flag on LN's refits; the stack invocation +9.5 pp on small
+synthetic frames; M.1 on the real M42 frames 76.9 s (76.8 s before).
+
+Carries. **Task 12 (its cost bars):** the small-frame stack cost (+9.5 pp, not yet split between the per-star SNR / HFR
+and the given-seed noise read on Mixed planes). **The detection owner (a later item):** R11-2 — the 10b read under-reads κ on R / B by 12–21 % (pull
+1.16–1.28 on R / B at F 5); fixing it moves colour seeds (injected LDN OSC R recall −5…−7 pp with the VNG white-noise
+table). **Plan B / the later nebula-photometry owner:** R11-3 — on nebula sky the real flux error is 3.6–6× σ_S (the
+local sky mismatch under the disc); the RB4 structure term breaks 4 clean cells and its c = 0.8 is circular. **Plan
+C** (the later readers of `snr` / `hfr`, the design read's "Later readers"): `analysis/analyzer.rs` (StarMetric `snr`
+/ `hfr`, `FrameAnalysis.median_snr`) → `db/analysis.rs` / `schema.rs` (`star_metrics.snr`, `hfr`); `collab/gate.rs`
+(`median_snr` rules) and the hub's `collab_rules.rs`; `collab/frame_meta.rs` (`medianSnr`); `api/collab*.rs`;
+`api/sync.rs`; the UI `LightsAnalysisTable.tsx`, `LightsAnalysisView.tsx`, `analysis/LightsAnalysisChartView.tsx` +
+`chartDataTransform.ts`, `FrameInfoPanel.tsx`, collab `project/frames.tsx` / `OverviewTab.tsx`, `types/models.ts`.
+
 ---
 
 ### Task 11b: F-4b — a frame-level β (spec §3 F-4; inserted 2026-10-12, owner: "согласен" to the Fable-reviewed order)

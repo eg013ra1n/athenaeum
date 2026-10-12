@@ -32,7 +32,9 @@ pub use domain::{
 };
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
-pub use photometry::{model_flux_in_fwtm, SaturationPlane, SaturationVerdict};
+pub use photometry::{
+    hfr, model_flux_in_fwtm, star_snr, ApertureNoise, SaturationPlane, SaturationVerdict, SnrTerms,
+};
 pub use seeds::{DetectionReport, FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 
 /// The spatial correlation of a plane's pixel noise (Task 10b A1c, ruling C-10): a fact of the pixels' provenance, so
@@ -84,6 +86,31 @@ impl PixelNoise {
             }
             (PixelNoise::Unknown, true) => PixelNoise::Mixed,
             (v, _) => v,
+        }
+    }
+}
+
+/// How a plane's aperture SNR read the correlation of its pixel noise (Task 11, ruling R11-1): the probe's
+/// `snrNoise`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnrNoise {
+    /// The caller stated the pixels white: `kappa` is 1 by derivation, nothing was read.
+    White,
+    /// The plane's noise correlation was read (the matched filter's own read, or the same read once for given seeds)
+    /// and `kappa(A)` sums it over each aperture.
+    Read,
+    /// A mixed or unknown plane whose correlation could not be read (or which has no seed): `kappa` is 1, the SNR is
+    /// the white-pixel value and over-reads on a really correlated plane.
+    Unread,
+}
+
+impl SnrNoise {
+    /// The value the probe writes: `white` | `read` | `unread`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnrNoise::White => "white",
+            SnrNoise::Read => "read",
+            SnrNoise::Unread => "unread",
         }
     }
 }
@@ -156,6 +183,11 @@ pub struct MeasureOptions {
     /// `White` fixes the detection noise's gain at 1, `Mixed` and `Unknown` (the default) read it. `colour` implies
     /// `Mixed`.
     pub pixel_noise: PixelNoise,
+    /// The share of the plane's pixels that are CFA sites of its own colour (Task 11, ruling R11-1): 0.25 / 0.5 / 0.25
+    /// for a debayered RGGB plane's R / G / B. A flux-preserving interpolation spreads each site's shot noise over
+    /// `1 / share` pixels, so an aperture's shot variance is `1 / share` times the white value. `None` (every plane
+    /// whose pixels are sites) = 1.
+    pub cfa_site_share: Option<f64>,
 }
 
 impl Default for MeasureOptions {
@@ -175,6 +207,7 @@ impl Default for MeasureOptions {
             field_width: None,
             colour: false,
             pixel_noise: PixelNoise::Unknown,
+            cfa_site_share: None,
         }
     }
 }
@@ -246,6 +279,12 @@ pub struct FitStarsOptions<'a> {
     /// disc) and the aperture correction's growth radius `5F` scales with (Task 10b, ruling B3's arm: LN's pair-common
     /// geometry hands both sides `max(F_R, F_T)`); `None` = the plane's own frame FWHM. Never read by a fit.
     pub ring_fwhm: Option<f64>,
+    /// The plane's gain in e- per ADU of the working-unit plane (F-6, Task 11, [`Domain::gain_e_per_working_adu`]): the
+    /// SNR's shot term; `None` omits it. Never read by a fit.
+    pub gain_e_per_working_adu: Option<f64>,
+    /// The plane's pixel-noise correlation and shot spreading the SNR's aperture noise reads (F-6, Task 11); the
+    /// default is white (`kappa` 1, no spreading), which is what LN's and every refit's SNR is.
+    pub aperture_noise: ApertureNoise,
 }
 
 impl FitStarsOptions<'_> {
@@ -257,6 +296,8 @@ impl FitStarsOptions<'_> {
             full_scale: self.full_scale,
             footprint: self.footprint,
             ring_fwhm: self.ring_fwhm,
+            gain: self.gain_e_per_working_adu,
+            noise: self.aperture_noise,
         }
     }
 }
@@ -335,6 +376,16 @@ pub struct PlaneMeasurement {
     /// What the module's matched filter measured besides its seeds (Task 10b, F-10): the detection noise σ_f (propagated
     /// and measured), the noise gain, the structure seeds dropped and the extended flags; `None` for given seeds.
     pub detection: Option<DetectionReport>,
+    /// The gain the stars' SNR used, e- per working ADU (F-6, Task 11, ruling R11-6); `None` = the shot term was omitted
+    /// (the probe's `snrGain` null).
+    pub snr_gain: Option<f64>,
+    /// The accepted fits whose SNR is NaN: no ring sky B_i (counted, never silent), no present aperture pixel, or a
+    /// non-positive aperture variance.
+    pub snr_missing: usize,
+    /// How the aperture noise's correlation was obtained ([`SnrNoise`]).
+    pub snr_noise: SnrNoise,
+    /// `s`, the shot-noise spreading the SNR used (1 / the plane's CFA site share, 1 without one).
+    pub shot_spread: f64,
     pub timings: PhaseTimings,
 }
 
@@ -379,6 +430,10 @@ pub struct PlanePrep {
     /// owner ruling R6).
     saturation: SaturationPlane,
     cross_flags: usize,
+    /// The plane's noise correlation `rho` the aperture SNR's `kappa(A)` sums (Task 11, ruling R11-1); `None` on a white
+    /// plane or where the read failed (`snr_noise` says which).
+    snr_rho: Option<[[f64; 5]; 5]>,
+    snr_noise: SnrNoise,
     timings: PhaseTimings,
     /// The verdict pass's share of [`PhaseTimings::fit_ms`].
     verdict_time: Duration,
@@ -480,13 +535,17 @@ fn prepare_working(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlanePrep {
     let mask = opts.mask.as_deref();
+    let pixel_noise = opts.pixel_noise.with_colour(opts.colour);
     let detecting = matches!(opts.seeds, SeedSpec::MatchedFilter { .. });
+    // Given seeds on a plane not stated white: the aperture SNR's noise read needs the mesh's noise map (R11-1).
+    let given_read = pixel_noise != PixelNoise::White && matches!(opts.seeds, SeedSpec::Given(ref g) if !g.is_empty());
+    let want_noise = detecting || given_read;
     // The plane's ONE background mesh (Task 10b, ruling Q4): `N*`'s model and the matched filter's background (with
     // its noise map, the detection noise's), built once over the plane's present pixels and handed to both. A plane
     // whose noise model is given and whose seeds are given needs none.
     let t = Instant::now();
-    let mesh = (opts.noise.is_none() || detecting).then(|| {
-        let build = || domain::background_mesh(working, w, h, mask, detecting);
+    let mut mesh = (opts.noise.is_none() || want_noise).then(|| {
+        let build = || domain::background_mesh(working, w, h, mask, want_noise);
         match pool {
             Some(p) => p.install(build),
             None => build(),
@@ -549,8 +608,8 @@ fn prepare_working(
                 opts.max_stars,
                 mask,
                 pool,
-                opts.pixel_noise.with_colour(opts.colour),
-                mesh,
+                pixel_noise,
+                mesh.take(),
                 Some(&saturation),
             );
             timings.detect_ms =
@@ -571,6 +630,37 @@ fn prepare_working(
             "measure: no noise estimate; the saturation test's threshold is the sky median"
         );
     }
+    // The aperture SNR's noise correlation (Task 11, ruling R11-1): none on a plane stated white (derived, nothing read);
+    // else the matched filter's own read, or - for seeds handed in - the same read once.
+    let (snr_rho, snr_noise) = if pixel_noise == PixelNoise::White {
+        (None, SnrNoise::White)
+    } else {
+        let read = match &detection {
+            Some(report) => report.noise_correlation,
+            None if !seeds.is_empty() => {
+                let mesh = mesh.unwrap_or_else(|| domain::background_mesh(working, w, h, mask, true));
+                seeds::read_noise_correlation(working, w, h, mask, &mesh)
+            }
+            None => None,
+        };
+        if read.is_none() && !seeds.is_empty() {
+            // The matched filter path has already warned (`detect_on`); say it once.
+            if detection.is_none() {
+                tracing::warn!(
+                    count = seeds.len(),
+                    width = w,
+                    height = h,
+                    "snr: the noise correlation could not be read; the aperture noise is taken white"
+                );
+            } else {
+                tracing::debug!(count = seeds.len(), "snr: the matched filter's noise read failed; aperture noise white");
+            }
+        }
+        match read {
+            Some(c) => (Some(c.rho()), SnrNoise::Read),
+            None => (None, SnrNoise::Unread),
+        }
+    };
     let t = Instant::now();
     let pass_call = || {
         fit::verdict_pass(
@@ -618,6 +708,8 @@ fn prepare_working(
         passes,
         saturation,
         cross_flags: 0,
+        snr_rho,
+        snr_noise,
         timings,
         verdict_time: t.elapsed(),
     }
@@ -643,9 +735,17 @@ fn finish_working(
         passes,
         saturation,
         cross_flags,
+        snr_rho,
+        snr_noise,
         mut timings,
         verdict_time,
     } = prep;
+    // F-6 (Task 11): the SNR's gain, and the shot noise's spreading by a debayered plane's CFA site share (R11-1).
+    let snr_gain = opts.domain.gain_e_per_working_adu();
+    let shot_spread = opts
+        .cfa_site_share
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+        .map_or(1.0, |s| 1.0 / s);
     let t = Instant::now();
     let fit_call = || {
         fit::fit_after_passes(
@@ -660,6 +760,11 @@ fn finish_working(
             Some(&passes),
             fit::Correction {
                 saturation: Some(&saturation),
+                gain: snr_gain,
+                noise: ApertureNoise {
+                    rho: snr_rho,
+                    shot_spread,
+                },
                 ..Default::default()
             },
             None,
@@ -688,6 +793,14 @@ fn finish_working(
     // The fits' signals already carry the plane's aperture correction (F-5: measured after the duplicate drop, inside
     // the fit call), so the totals read the corrected flux.
     let frame = FrameAggregates::of(&outcome.fits);
+    let snr_missing = outcome.fits.iter().filter(|f| f.snr.is_nan()).count();
+    if snr_missing > 0 {
+        tracing::debug!(
+            count = snr_missing,
+            stars_fitted = outcome.fits.len(),
+            "snr: stars without a ring sky have no SNR"
+        );
+    }
     PlaneMeasurement {
         stars: outcome.fits,
         beta: outcome.beta,
@@ -714,6 +827,10 @@ fn finish_working(
             .map(|f| (f - saturation.bg) / saturation.range),
         clip_evidence: saturation.clip_evidence,
         detection,
+        snr_gain,
+        snr_missing,
+        snr_noise,
+        shot_spread,
         timings,
     }
 }
@@ -1901,6 +2018,8 @@ mod tests {
             false,
             false,
             PixelNoise::Unknown,
+            None,
+            None,
         );
         let m = measure_plane(
             &data,
@@ -2972,7 +3091,12 @@ mod tests {
                     .find(|f| (f.x - x).abs() < 2.0)
                     .expect("the star is fitted")
             };
-            let (with, without) = (at(&m.stars, 70.0), at(&free.fits, 70.0));
+            let (with, mut without) = (at(&m.stars, 70.0), at(&free.fits, 70.0));
+            // Task 11 (ruling F14 edit): the SNR reads the plane's noise correlation, which the measure path reads
+            // (this plane's noise is stated `Unknown`) and a bare fit call does not (kappa 1); it is the one field of the
+            // record that is not the fit's. Every other field still compares bit for bit.
+            assert_ne!(with.snr, without.snr, "the measure path read a correlation");
+            without.snr = with.snr;
             assert_eq!(
                 format!("{with:?}"),
                 format!("{without:?}"),

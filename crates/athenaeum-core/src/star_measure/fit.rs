@@ -272,6 +272,16 @@ pub struct StarFit {
     /// n_i: the ring pixels B_i and σ_i read; 0 where the ring is missing. Not persisted.
     #[serde(skip)]
     pub sky_ring_n: u32,
+    /// The star's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]): `S / sigma_S` over the star's own ring
+    /// sky and noise, computed after the aperture correction (`signal`) and again when a ring is re-read
+    /// ([`super::correct_at_ring`]). Every accepted fit carries one, saturated and extended included (R11-5); NaN
+    /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
+    #[serde(skip, default = "not_measured")]
+    pub snr: f64,
+    /// The star's half-flux radius, px (F-6, Task 11, [`super::photometry::hfr`]): NaN without a ring, or when the `5F`
+    /// circle holds less than half of `signal`. Not persisted.
+    #[serde(skip, default = "not_measured")]
+    pub hfr: f64,
     /// [`StarFlags`]: written and read as the `.athf` flags byte; a fit decoded from a file written before Plan A
     /// Task 4 (whose byte is 0) reads none.
     #[serde(default)]
@@ -1629,6 +1639,8 @@ fn accept(
         sky_ring: f64::NAN,
         sky_ring_sigma: f64::NAN,
         sky_ring_n: 0,
+        snr: f64::NAN,
+        hfr: f64::NAN,
         flags: StarFlags::default(),
     })
 }
@@ -1774,6 +1786,11 @@ pub(super) struct Correction<'a> {
     /// The ring width every fit's B_i is read at and `c`'s growth radius scales with (Task 10b, ruling B3's arm):
     /// `None` = the plane's own frame FWHM.
     pub(super) ring_fwhm: Option<f64>,
+    /// The plane's gain in e- per working ADU (F-6, Task 11): the SNR's shot term; `None` omits it. Never read by a fit.
+    pub(super) gain: Option<f64>,
+    /// The plane's pixel-noise correlation and shot spreading the SNR's aperture noise reads (F-6, Task 11); the
+    /// default is white (LN's and every refit's: `kappa` 1).
+    pub(super) noise: super::photometry::ApertureNoise,
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -2140,6 +2157,8 @@ fn fit_at_width(
             f.signal *= c;
         }
     }
+    // F-6 (Task 11): every kept fit's SNR and HFR, from the stored ring and the corrected `signal`.
+    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, &correction, pool);
     let mut refused = RefusalCounts::default();
     for o in &outcomes {
         if let Outcome::Refused(reason) = *o {
@@ -2272,6 +2291,43 @@ fn ring_and_correction(
     (c, stars, missing, ring_fwhm)
 }
 
+/// Every kept fit's aperture SNR and half-flux radius (F-6, Task 11, [`super::photometry::star_snr`] and
+/// [`super::photometry::hfr`]) from its stored ring sky and noise and its (aperture-corrected) `signal`, at the ring
+/// width `ring_fwhm` the rings were read at (`None` = no ring anywhere: every fit reads NaN, both). `correction`
+/// carries the plane's gain and noise correlation (default: no gain, white). Neither value is read by anything else in
+/// the fit; nothing the fit measured moves. `pool` as the fit's.
+#[allow(clippy::too_many_arguments)]
+fn snr_and_hfr(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    kept: &mut [(usize, StarFit)],
+    ring_fwhm: Option<f64>,
+    correction: &Correction<'_>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    let mut body = || {
+        kept.par_iter_mut().for_each(|(_, f)| {
+            f.snr = super::photometry::star_snr(
+                data,
+                w,
+                h,
+                f,
+                correction.gain,
+                mask,
+                &correction.noise,
+            )
+            .0;
+            f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
+        })
+    };
+    match pool {
+        Some(p) => p.install(body),
+        None => body(),
+    }
+}
+
 /// LN's pair-common ring arm (Task 10b, ruling B3) without a second fit: every fit of `outcome` (a fit call's result
 /// on `data` with `seeds`) re-reads its ring sky at `correction.ring_fwhm` and the plane's `c` is measured again from
 /// them, exactly as the fit call itself would have with that ring width ([`ring_and_correction`], the same seeds,
@@ -2312,6 +2368,8 @@ pub(super) fn correct_at_ring(
             f.signal *= c;
         }
     }
+    // F-6 (Task 11): B_i and `signal` moved, so the SNR and HFR are read again.
+    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, correction, pool);
     outcome.fits = kept.into_iter().map(|(_, f)| f).collect();
     outcome.aperture_correction = c;
     outcome.aperture_stars = stars;

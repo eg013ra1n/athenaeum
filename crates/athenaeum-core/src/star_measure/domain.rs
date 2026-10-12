@@ -52,6 +52,20 @@ pub enum Domain {
     },
 }
 
+impl Domain {
+    /// The domain's gain in e- per ADU of the WORKING-unit plane (Task 11, ruling R11-6): a calibrated plane's
+    /// `gain_e_per_unit` (e- per calibrated unit, `EGAIN x ATH_CSCL`) over [`ADU_SCALE`], a raw plane's
+    /// `gain_e_per_adu` as is. `None` when the domain states none, or one that is not a positive number (the SNR then
+    /// omits its shot term and says so; no camera table is consulted).
+    pub fn gain_e_per_working_adu(&self) -> Option<f64> {
+        let g = match *self {
+            Domain::Calibrated { gain_e_per_unit } => gain_e_per_unit.map(|g| g / ADU_SCALE as f64),
+            Domain::RawAdu { gain_e_per_adu, .. } => gain_e_per_adu,
+        };
+        g.filter(|g| g.is_finite() && *g > 0.0)
+    }
+}
+
 /// The plane's noise in the module's working units (ADU-scaled for a `Calibrated` plane, the plane's own ADU for
 /// `RawAdu`): `sigma` is the MRS σ, or `n_star` when MRS refused the plane (`source` says which); `m_star`, `n_star`
 /// are `M*`, `N*` of the large-scale background residual (math reference §1.3), zero when the background model was

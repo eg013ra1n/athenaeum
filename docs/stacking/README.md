@@ -3009,3 +3009,121 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       0001 53 % vs 39 %) is 11b's premise, to be read at 7933f582. **Task 13:** PSFSW (R10c-4) and LDN 1272 0099
       (R10c-5), written into its text. **The later fit-design task:** LDN mono's β 1.5 (R10c-2). **F-1's seeds, if
       wanted:** one seed per clipped component (R10c-3).
+  - **R-OSP-8 - the per-star SNR and HFR: S / σ_S on the star's own ring sky and noise, the plane's noise
+    correlation and the header gain, HFR on the F-5 flux (F-6, Plan A Task 11, rulings R11-1 … R11-10 below; no
+    `MEASURE_VERSION` bump, PA-4; `snr` and `hfr` are not persisted, like `peak5`).** *As built (1224718a; 12706d6c
+    the review round: a given-seed `Mixed` / `Unknown` plane reads its noise correlation off the prep's one mesh, no
+    second mesh build; one `warn!` per failed read; doc wording; the probe output byte-identical on the five Phase A
+    inputs).*
+    `photometry::star_snr` = S / σ_S over the present pixels whose centres lie within max(1.5·FWHM, 3) px of the
+    fitted centre (the fit's own FWHM), S = Σ(v − B_i) on the star's stored `sky_ring` (R-OSP-7b), σ_S² =
+    s·max(S, 0)/g + κ(A)·N_ap·σ_i²·(1 + N_ap/n_i) on its stored `sky_ring_sigma` / `sky_ring_n`; it estimates no sky
+    and no noise. A negative S (the star reads below its ring sky) gives a negative finite SNR, which enters the
+    medians. κ(A) = Σ_{i,j∈A} ρ(i − j) / N_ap over the aperture's present pixels, ρ = C/C(0) from the plane's one
+    noise read (`seeds::NoiseCorrelation`, exposed as `rho()` and `DetectionReport.noise_correlation`; the read itself
+    unchanged); κ ≡ 1 on a `White` plane. s (`ApertureNoise.shot_spread`) = 1 / the CFA site share on a debayered
+    plane (the adapter states 0.25 / 0.5 / 0.25 on a colour group's planes, so 4 / 2 / 4), else 1.
+    `photometry::hfr` = the linear half-signal radius on (v − B_i): the present pixels within 5 × the ring width,
+    taken by distance until their sum reaches half the star's F-5 flux, interpolated by the last pixel's share; NaN
+    without a ring, signal or width, or when that circle holds less than half. Both are computed after `c`, in the
+    fit's tail and in `correct_at_ring` (B_i and `signal` move there). The gain: `stacking::measure::gain_from_header`
+    (FITS and XISF) = EGAIN × `ATH_CSCL`, `ATH_CFNM` never read, read errors `warn!`ed, non-positive → None. Frame:
+    `snr_median` / `hfr_median`; both `PlaneMeasurement`s carry `snr_gain`, `snr_missing`, `snr_noise` (`white` |
+    `read` | `unread`) and `shot_spread`; probe star `snr`, `hfr`, `apSum`, `apN`, frame `snrGain`, `snrMissing`,
+    `snrMedian`, `hfrMedian`, `snrNoise`, `shotSpread`. Spec §3 F-6 "as built", §4.2's HFR line and the
+    owned-quantities table (the noise-correlation row) follow it.
+    - **R11-1 σ_S (arm c).** σ_S² = s·S/g + κ(A)·N_ap·σ_i²·(1 + N_ap/n_i), κ(A) from the plane's ONE noise read (10b's
+      `seeds::NoiseCorrelation`, reach 2; its owner unchanged, Task 11 only reads it); a `White` plane ⇒ κ ≡ 1, no
+      read (C-7's argument, no number chosen). s = 1 / the plane's CFA site share on a debayered plane (R 4, G 2, B 4,
+      derived from a flux-preserving interpolation spreading each site's shot noise), else 1. Given-seed `Mixed` /
+      `Unknown` planes run the same read once; LN's refits and the probe's `betas` arm pass no correlation (κ ≡ 1).
+      Pull classic 1.52–2.12 (`osc`), 1.63 (`resampled`) → (c) 0.92–1.17 / 1.08. Cost if wrong: colour SNR over-read
+      1.5–2.1× (classic) or 1.2–1.6× on bright colour stars (κ without s).
+    - **R11-2 the R/B κ under-read (recorded limit).** The 10b read under-reads κ on R and B by 12–21 % (pull
+      1.16–1.28 on R / B at F 5). Fixing it moves colour seeds (injected LDN OSC R recall −5…−7 pp with the VNG
+      white-noise table) → a later detection-owner item, not Task 11. C-7 (a)'s leak is not visible on real OSC nebula
+      (read / true 0.80–1.06).
+    - **R11-3 the structure term: not in F-6.** F-6 is the noise SNR on σ_i. The RB4 structure term breaks 4 clean
+      cells (−7…−25 %) and its c = 0.8 is circular (fitted on the two nebulae it is judged on). Recorded for Plan B /
+      the later nebula-photometry owner: on nebula sky the real flux error is 3.6–6× σ_S (pull `neb0.5` 3.63, `neb3`
+      6.04: the local sky mismatch under the disc, the annulus method's own limit).
+    - **R11-4 the bar.** Row 6 median bias ≤ 3 % on 50 cells: the 46 `sharp/*` and `background/` flat, grad10, neb0.1,
+      vig20. `neb0.5` / `neb3` / `neb3_4096` are REPORTED with their predicted values (−16.5 / −75.5 / −60.7 % against
+      the white truth): there the white-noise truth is not the star's real error, and any noise SNR misses it. Spec
+      F-6 bar amended (owner informed 2026-10-12; reopen if the owner objects). New row "star SNR noise pull" on
+      `osc/*`, `osc_pairs/*`, `resampled/*`: the robust std of (S_meas − S0)/σ_S, S0 = the generator's noiseless frame
+      through the same debayer / warp in the same aperture (1.00 = σ_S is the real error), per plane within [0.85,
+      1.30]; row 6 on the Mixed families reported with "white truth on a Mixed plane".
+    - **R11-5 populations.** Every accepted fit carries SNR and HFR (saturated and extended included, finite). NaN
+      only without a ring (B_i missing) or, HFR, under half the signal inside 5F. `snr_median` / `hfr_median` =
+      medians over the fits `in_statistic()` (neither saturated nor extended) with finite values; this amends the
+      plan's "finite values only" (the flagged stars lift the frame SNR +10…+24 %). HFR has no truth row; reported
+      only.
+    - **R11-6 the gain: header only, no camera table.** EGAIN × `ATH_CSCL` e⁻ per calibrated unit (PA-22, `ATH_CFNM`
+      ignored), raw domain EGAIN. No gain ⇒ the shot term is omitted and `snrGain` is null on the frame line.
+    - **R11-7 additive.** `StarFit.snr` / `.hfr` `#[serde(skip)]` like `peak5`; `.athf`, `ChannelMeasurement`, the DB,
+      the weights, LN and `MEASURE_VERSION` unchanged; the new frame values ride on the adapter's `PlaneMeasurement`
+      plain fields. Probe seed / star / frame lines byte-identical to 35870dbf after stripping the new keys.
+    - **R11-8 the pull referee is clipped.** The noiseless reference is clipped at sat like the noisy frame (OSC and
+      resampled): an unclipped S0 adds clip loss to (S_meas − S0) that the pull must not charge to σ_S. `resampled`
+      f2.0 classic pull 1.59 (unclipped 1.63); 4 of 525 stars carry a neighbour's clipped core.
+    - **R11-9 the design list.** The pull row is `"kind":"reported"` (`scorecard_diff` knows set-aside / one-sided /
+      reported).
+    - **R11-10 the control STOP (runner Part 2).** The PA-15 control mismatches (143 at the step, 138 cumulative
+      against t01c) were all row 6 `star SNR vs truth` on path `analysis`: the truth `snr_ap` moved onto the 10b ring,
+      the legacy analysis estimator did not. `scorecard_diff` skipped a hard-coded `t09truth`; fixed in the lab: a SET
+      of truth steps ({t09truth, t11truth}), the union gains the t11 truth entries, 4 tests; both diffs re-run without
+      a probe re-run → control 0 (the first-run verdicts kept as `*.pre-R11-10.txt`). Supporting: the rescored-base
+      diff PASS (11 736 analysis rows). No product line moved. R11-8's predicted ≈ 1.04 withdrawn: the head reads 1.07
+      (unclipped 1.08).
+    - **The recorded limits (not bars).** (a) R11-2: the R / B κ under-read of 12–21 %, the detection owner's. (b)
+      R11-3: on nebula sky the real flux error is 3.6–6× σ_S (Plan B / the nebula-photometry owner). (c) R11-6: the
+      gain comes from the header only; the owner's ATR2600M and QHY268M calibrated lights carry no EGAIN, so their
+      SNR has no shot term (`snrGain` null); a ×18 wrong EGAIN moves the median star's SNR +4…+10 %, bright stars up
+      to +64 %. (d) A flagged-only plane (every fit saturated or extended): the rings read no F (the frame FWHM is
+      the unflagged statistic, 10b's rule), so no B_i and every SNR / HFR is NaN, `snrMissing` = all, both medians
+      None. (e) `Unread`: a `Mixed` / `Unknown` plane whose correlation could not be read (or with no seed) gets κ 1
+      and one `warn!`, the frame line says `unread`, and its SNR is the white-pixel value, which over-reads on a
+      really correlated plane.
+    - **The lab cycle `t11-f6` (runner; athenaeum-lab `star-lab/results/plan-a/t11-f6/` at 1224718a, rustafits
+      67c180f, solvemyastro c1c633c; lab 70b116e (Part 1: the ring truth, the pull row, the Mixed note), b3d8434
+      (design list, bars), 1cd8704 (R11-10's tool), 60bbf27 (scripts), 8532f01 (results); base = t10c-floor).**
+      Part 1 re-derived the truth `snr_ap` on the star's own ring (`families._v2_cols`: N_sky = the centres in
+      [10F_t, 12F_t] outside every other truth star's 3F_t disc; S, N_ap and the per-pixel variance unchanged): 301 v2
+      truth files refreshed, 299 changed, only `snr_ap` moved (on the old annulus truth `sharp/*` read +2.4…+9.7 %,
+      emulated: the move was required). **Every bar passes; one STOP (the PA-15 control), resolved by R11-10.**
+
+      | Cell | Bar | Value (`t11-f6`) | Verdict |
+      | ---- | ---- | ---- | ---- |
+      | lab suite / truth sanity | ok | 765 OK / 3 cells, 3 explained, 0 new | ok |
+      | row 6 vs the ring truth, 50 cells | ≤ 3 % | worst 0.97 % (`neb0.1`), `sharp/*` −0.90…+0.51 %; `n_no_gain` 0 | ok |
+      | row 6, `neb0.5` / `neb3` / `neb3_4096` | reported (predicted −16.5 / −75.5 / −60.7 %) | −16.54 / −75.51 / −60.65 % | as predicted |
+      | noise pull, 50 planes (`osc` 24, `osc_pairs` 24, `resampled` 2) | per plane within [0.85, 1.30] | 0.92…1.25; `osc` f2.6 m4 R / G / B 0.92 / 1.04 / 1.06, f5.0 m4 1.16 / 1.01 / 1.17; `resampled` f2.0 1.07 (unclipped 1.08), f3.0 1.04; 0 `apN` mismatches | ok |
+      | row 6 on Mixed (reported, white truth on a Mixed plane) | predicted −25…−41 %, −6 / −2 % | `osc` −41.5…−24.4 %, `resampled` −5.9 / −1.9 % | as predicted |
+      | lines vs t10c-floor | identical after the new keys (and the clocks `wallMs` / `ms` / `analyzed_at`) | 3.84 M lines (v2, inject, L, replica) identical; row 1 register 0 of 1 431 cells differ | ok |
+      | no-regression / cumulative vs t01c | PASS | moved 0, one-sided 0, lost 0, control 0 on both (after R11-10; the rescored base PASS too) | ok |
+      | R10c-0 (22 frames) | B1, B3 pass; B2 the known miss | β₀₀₀₀ 7.568 (SE 1.173); B1 3.60 ≤ 5.39; B3 0.051 ≤ 0.207; B2 0.155 > 0.046 | = t10c-floor |
+      | twins / row 10 | 48 / 48; FN ≤ 0.5 % | 48 / 48 (F 0.69 %, β 6.8 %, 24 void); FN 4 of 11 778 · 0 of 1 229; FP 0.244 % / 0.410 % | = t10c-floor |
+      | C-11 / F-4 item 1 / C1.1–C1.4 | ≤ +0.002; ≥ 56 / 58; pass | frame ecc Δ 0 (frame lines identical), table = t10c-floor's (14 WORSE, 4 STOP-cells); 58 / 58 (worst 2.23 %); ok, control PASS | ok |
+      | S.1 / M.1 / same-star / `c_judge` | ≤ 1.46 % / ≤ 159.8 s / allowance | 0.81 % / 76.9 s (t10c-floor 76.8 s) / 1 333 667 stars, β changed on 0, 0 WORSE / 82 ok, 0 MISS | ok |
+      | HFR vs analytic, Fisher < 20 / 20–100 / ≥ 100 (reported) | — | m4 −0.33 / +0.34 / +0.95 %, m2.5 −1.78 / −1.51 / −1.08 %, m10 −1.23 / −1.15 / −0.66 % (= the dev Mac); gauss −1.05 / −0.45 / −0.10 % (analytic width = the pre-pixel truth FWHM, the Moffat rows' reference; the design read's −4.2 / −2.2 / −1.3 % took the point-fit FWHM for gauss, which reproduces −4.26 / −2.25 / −1.28 %: a reference difference on the same 9 families, runner L3) | reported |
+      | `snrNoise` / `snrMissing` / null gain (reported) | — | read 50, white 139, unread 0 / 0 / 0; per-family medians in `reported.txt` | reported |
+
+    - **Cost.** Measured as an interleaved bracket on the runner (L3, lab 7a70351): A = 35870dbf, B = 12706d6c, rounds
+      A B B A A B, one process at a time. B / A is the summed wall per round, median (min–max):
+      - LN on the product's per-side ring: 1.022 (1.006–1.027);
+      - LN on the pair-common lab arm: 1.043 (1.038–1.049);
+      - the stack invocation on `osc/*` + `resampled/*` + `sharp/m4/*`: 1.104 (1.078–1.132);
+      - the analysis path, which Task 11 does not touch (null control): 1.009 (1.001–1.011).
+
+      Over the null that is +1.3 pp (LN), +3.4 pp (the lab-only arm) and +9.5 pp (stack on small synthetic frames). On
+      the real M42 frames M.1 reads 76.9 s against 76.8 s. Probe lines: B equals 1224718a on the subset (205 436 v2
+      lines plus the LN arms) and equals A once the new keys are stripped. **No skip flag on the LN refits**
+      (`Correction.photometry` is not built): the product's LN path reads +1.3 pp, under the +3 % line, so one SNR /
+      HFR definition holds everywhere. The small-frame stack cost (+9.5 pp, not split between the per-star SNR / HFR
+      and the given-seed noise read on Mixed planes) goes to Task 12's cost bars.
+    - **Carries.** **The detection owner (a later item):** R11-2's R / B κ under-read (fixing it moves colour seeds).
+      **Plan B / the later nebula-photometry owner:** R11-3's structure term (the nebula flux error 3.6–6× σ_S).
+      **Plan C:** the later readers of `snr` / `hfr` (the analyzer's star metrics and `median_snr`, the `star_metrics`
+      columns, the collab gate's `median_snr` rules and the hub's mirror, the Analysis and frame-info views; listed in
+      plan Task 11's Outcome).

@@ -102,6 +102,8 @@
 //! refused `trailed`) and `trailShare` (its input: the share of the judged seeds
 //! refused `centreMoved`, `regionTooSmall` or `centreAtRim`, A4-2), on every detector.
 
+#![recursion_limit = "256"] // the frame line's `json!` literal
+
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::io::{BufWriter, Write};
@@ -119,14 +121,14 @@ use athenaeum_core::resample::{warp_rows, Plane};
 use athenaeum_core::stacking::config::{SeedSource, StackingConfig};
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
-    measure_planes_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
+    gain_from_header, measure_planes_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
 use athenaeum_core::star_measure::{
-    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, PixelNoise, RefusalCounts,
-    RefusalReason, SaturationVerdict,
+    fit_stars_at, star_snr, ApertureNoise, FitDiagnostics, FitStarsOptions, Outcome, PixelNoise,
+    RefusalCounts, RefusalReason, SaturationVerdict,
 };
 use serde_json::{json, Value};
 
@@ -238,6 +240,7 @@ fn fit_line(path: &str, plane: usize, beta: Option<f64>, f: &StarFit) -> Value {
         "thetaDeg": f.theta.to_degrees(), "residual": f.residual, "flags": f.flags.names(),
         "skyRing": n_or_null(f.sky_ring / s), "skyRingSigma": n_or_null(f.sky_ring_sigma / s),
         "skyRingN": f.sky_ring_n, "skyOffset": n_or_null(f.sky_offset() / s),
+        "snr": n_or_null(f.snr), "hfr": n_or_null(f.hfr),
     })
 }
 
@@ -572,6 +575,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             seed_source,
             a.diagnostics,
             pixel_noise,
+            // F-6 (Task 11): e- per calibrated unit, `EGAIN x ATH_CSCL` from the file's header (`null` on the frame line
+            // when the header has no gain: the SNR then omits its shot term).
+            gain_from_header(&a.image),
             |p| Ok::<_, Infallible>(Cow::Borrowed(planes[p].as_slice())),
         )
         .unwrap_or_else(|never| match never {})
@@ -615,8 +621,15 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                     star_seed[star] = Some(d);
                 }
             }
+            // F-6 (Task 11): the aperture sum S and its pixel count, from the plane the fits were measured on.
+            let working: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
             for (k, f) in pm.fits.iter().enumerate() {
                 let mut line = fit_line("measure", p, None, f);
+                let (_, ap) = star_snr(&working, w, h, f, None, None, &ApertureNoise::WHITE);
+                if let Some(obj) = line.as_object_mut() {
+                    obj.insert("apSum".into(), n_or_null(ap.s / s));
+                    obj.insert("apN".into(), json!(ap.n_ap));
+                }
                 if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
                     obj.insert("seed".into(), json!(d.seed));
                     if let Some(v) = filter_snr(d.seed) {
@@ -659,6 +672,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "sigmaFMeasured": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f_measured / s)),
                         "noiseGain": pm.detection.as_ref().map(|d| n_or_null(d.noise_gain)),
                         "pixelNoise": pixel_noise.as_str(),
+                        "snrGain": pm.snr_gain.map(|g| n_or_null(g * s)), "snrMissing": pm.snr_missing,
+                        "snrMedian": pm.snr_median.map(n_or_null), "hfrMedian": pm.hfr_median.map(n_or_null),
+                        "snrNoise": pm.snr_noise.as_str(), "shotSpread": pm.shot_spread,
                         "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
                         "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
                         "fieldWidth": n_or_null(pm.field_width.fwhm_px),

@@ -105,6 +105,29 @@ pub struct FrameAggregates {
     pub tmean_flux: f64,
     /// [`SignalTotals::rejected`].
     pub mean_flux_rejected: usize,
+    /// The median aperture SNR (F-6, Task 11, ruling R11-5) over the fits the frame statistic counts
+    /// ([`super::StarFlags::in_statistic`]: neither saturated nor extended) whose SNR is finite; `None` when there is
+    /// none (a star without a ring reads NaN and is left out, and counted in `PlaneMeasurement::snr_missing`). Counting
+    /// the flagged stars too would lift it by 4 to 24 % on the lab and real frames measured.
+    pub snr_median: Option<f64>,
+    /// The median half-flux radius (px) over the same population with a finite HFR.
+    pub hfr_median: Option<f64>,
+}
+
+/// The median of the finite values of `it` (the mean of the two middle values for an even count); `None` when there
+/// is none.
+fn finite_median(it: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut v: Vec<f64> = it.filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    })
 }
 
 impl FrameAggregates {
@@ -122,6 +145,16 @@ impl FrameAggregates {
             tflux: totals.tflux,
             tmean_flux: totals.tmean_flux,
             mean_flux_rejected: totals.rejected,
+            snr_median: finite_median(
+                fits.iter()
+                    .filter(|f| f.flags.in_statistic())
+                    .map(|f| f.snr),
+            ),
+            hfr_median: finite_median(
+                fits.iter()
+                    .filter(|f| f.flags.in_statistic())
+                    .map(|f| f.hfr),
+            ),
         }
     }
 }
@@ -149,6 +182,8 @@ mod tests {
             sky_ring: f64::NAN,
             sky_ring_sigma: f64::NAN,
             sky_ring_n: 0,
+            snr: f64::NAN,
+            hfr: f64::NAN,
             flags: crate::star_measure::StarFlags::default(),
         }
     }
@@ -198,5 +233,43 @@ mod tests {
         assert!((fwhm - 4.0).abs() < 1e-9, "{fwhm}");
         assert!((ecc - 0.24206).abs() < 1e-4, "{ecc}");
         assert!(frame_shape(&[]).is_none());
+    }
+
+    #[test]
+    fn frame_medians_read_finite_unflagged_stars_only() {
+        // F-6 (Task 11, ruling R11-5): the frame SNR and HFR are the medians over the fits the frame statistic counts
+        // (neither saturated nor extended) whose value is finite. A NaN (no ring) is left out; flagged stars, which
+        // read high, never lift them.
+        let with = |snr: f64, hfr: f64, flags: crate::star_measure::StarFlags| {
+            let mut f = fit_with(1.0);
+            f.snr = snr;
+            f.hfr = hfr;
+            f.flags = flags;
+            f
+        };
+        let none = crate::star_measure::StarFlags::default();
+        let mut fits: Vec<StarFit> = [10.0, 20.0, 30.0, 40.0]
+            .iter()
+            .map(|&v| with(v, v / 10.0, none))
+            .collect();
+        fits.push(with(f64::NAN, f64::NAN, none));
+        fits.push(with(900.0, 9.0, crate::star_measure::StarFlags::SATURATED));
+        fits.push(with(
+            1000.0,
+            10.0,
+            crate::star_measure::StarFlags::SATURATED,
+        ));
+        fits.push(with(800.0, 8.0, crate::star_measure::StarFlags::EXTENDED));
+        let agg = FrameAggregates::of(&fits);
+        assert_eq!(agg.snr_median, Some(25.0));
+        assert_eq!(agg.hfr_median, Some(2.5));
+        let flagged: Vec<StarFit> = fits[5..].to_vec();
+        let agg = FrameAggregates::of(&flagged);
+        assert_eq!((agg.snr_median, agg.hfr_median), (None, None));
+        let agg = FrameAggregates::of(&[]);
+        assert_eq!((agg.snr_median, agg.hfr_median), (None, None));
+        // a lone NaN star leaves the frame without a value, not with NaN
+        let agg = FrameAggregates::of(&[with(f64::NAN, f64::NAN, none)]);
+        assert_eq!((agg.snr_median, agg.hfr_median), (None, None));
     }
 }

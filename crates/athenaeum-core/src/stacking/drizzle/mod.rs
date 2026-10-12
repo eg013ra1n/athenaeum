@@ -1138,6 +1138,7 @@ pub fn drizzle_group(
             false,
             // A master is integrated / drizzled: its pixels are mixed (ruling C-10).
             crate::star_measure::PixelNoise::Mixed,
+            None,
             |c| {
                 // The run's cancel, as integrate's master measurement checks it: before each plane's read.
                 if cancel.load(Ordering::Relaxed) {
@@ -3681,6 +3682,7 @@ mod tests {
             SeedOverride::Fast,
             false,
             crate::star_measure::PixelNoise::Mixed,
+            None,
             |c| Ok::<_, DrizzleError>(Cow::Borrowed(&out.data[c * n..(c + 1) * n])),
         )
         .unwrap();

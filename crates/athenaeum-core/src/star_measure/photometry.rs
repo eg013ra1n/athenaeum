@@ -1078,6 +1078,271 @@ pub(crate) fn aperture_correction(
     (Some(c), n)
 }
 
+/// The aperture SNR's radius per star FWHM (PA-11's aperture, unchanged): `r_ap = max(1.5 * fwhm, 3)` px about the
+/// fitted centre, the pixels whose centres lie within it.
+pub const SNR_APERTURE_PER_FWHM: f64 = 1.5;
+/// … and its floor, px.
+pub const SNR_APERTURE_MIN_PX: f64 = 3.0;
+
+const _: () = assert!(
+    super::seeds::NOISE_CORR_SIDE == 5,
+    "ApertureNoise::rho is the noise read's 5 x 5"
+);
+
+/// What the aperture SNR needs to know about the plane's pixel noise beyond the star's own ring (Task 11, ruling
+/// R11-1).
+///
+/// `rho` is the plane's noise correlation `rho(L) = C(L) / C(0)` (`rho[dy + 2][dx + 2]`), read ONCE per plane by the
+/// matched filter's own noise read (Task 10b A1c; this module never reads or fits it): the variance of a sum over the
+/// aperture's pixels is `sigma^2 * sum_{i,j} rho(i - j)` and not `N * sigma^2` once neighbouring pixels share noise
+/// (a debayered, resampled or integrated plane). `None` = the pixels are white (a sensor plane the caller stated
+/// white: `kappa` is 1, derived, nothing read) or the read failed (then `kappa` is 1 too and the frame line says so,
+/// [`super::SnrNoise`]).
+///
+/// `shot_spread` is `s`: a flux-preserving interpolation (the debayer) spreads each CFA site's shot noise over
+/// `1 / share` pixels, so an aperture's shot variance is `s` times the white `S / g` (R 4, G 2, B 4 on an RGGB
+/// plane's `share` 0.25 / 0.5 / 0.25; 1 on every plane whose pixels are sites). Both are facts of the plane's
+/// provenance, which the caller states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApertureNoise {
+    pub rho: Option<[[f64; 5]; 5]>,
+    pub shot_spread: f64,
+}
+
+impl ApertureNoise {
+    /// White pixels, one site per pixel: `kappa = 1`, `s = 1`.
+    pub const WHITE: ApertureNoise = ApertureNoise {
+        rho: None,
+        shot_spread: 1.0,
+    };
+}
+
+impl Default for ApertureNoise {
+    fn default() -> Self {
+        ApertureNoise::WHITE
+    }
+}
+
+/// The terms of one star's SNR variance (Task 11, ruling R11-1):
+/// `sigma_S^2 = shot_spread * S / g + kappa * n_ap * sigma_sky^2 * (1 + n_ap / n_sky)`, the first term only with a gain
+/// (`shot_term`). `s` is the aperture sum `S = sum (v - B_i)`, `n_ap` its present pixels, `(sigma_sky, n_sky)` the
+/// star's own stored `(sky_ring_sigma, sky_ring_n)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SnrTerms {
+    pub s: f64,
+    pub n_ap: usize,
+    pub sigma_sky: f64,
+    pub n_sky: u32,
+    pub kappa: f64,
+    pub shot_spread: f64,
+    pub shot_term: bool,
+}
+
+/// `kappa(A) = sum_{i,j in A} rho(i - j) / N_ap` over the aperture's present pixels `pix` (integer pixel coordinates):
+/// the variance of the aperture sum of correlated noise in units of its white value `N_ap * sigma^2`. 1 for white
+/// pixels (`rho` = 1 at lag 0 and 0 elsewhere); only pairs within the read's reach (2 px) contribute, and a pixel
+/// absent from the aperture (masked, non-finite, off the plane) contributes none.
+fn aperture_kappa(pix: &[(i64, i64)], rho: &[[f64; 5]; 5]) -> f64 {
+    if pix.is_empty() {
+        return 1.0;
+    }
+    let (x0, x1) = pix
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
+    let (y0, y1) = pix
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
+    let gw = (x1 - x0 + 1) as usize;
+    let mut grid = vec![false; gw * (y1 - y0 + 1) as usize];
+    for &(px, py) in pix {
+        grid[(py - y0) as usize * gw + (px - x0) as usize] = true;
+    }
+    let mut sum = 0.0f64;
+    for &(px, py) in pix {
+        for dy in -2i64..=2 {
+            let qy = py + dy;
+            if qy < y0 || qy > y1 {
+                continue;
+            }
+            for dx in -2i64..=2 {
+                let qx = px + dx;
+                if qx >= x0 && qx <= x1 && grid[(qy - y0) as usize * gw + (qx - x0) as usize] {
+                    sum += rho[(dy + 2) as usize][(dx + 2) as usize];
+                }
+            }
+        }
+    }
+    sum / pix.len() as f64
+}
+
+/// A star's aperture SNR (F-6, Task 11, rulings R11-1 and R11-5): `S / sigma_S` over the pixels whose centres lie
+/// within `max(1.5 * fwhm, 3)` px of the fitted centre that are present (finite and unmasked), `S = sum (v - B_i)`.
+///
+/// The sky and its noise are the star's own stored ring (`sky_ring`, `sky_ring_sigma`, `sky_ring_n`; Task 10b): this
+/// function estimates neither. `sigma_S^2 = shot_spread * max(S, 0) / g + kappa(A) * N_ap * sigma_i^2 * (1 + N_ap /
+/// n_i)`: the star's shot noise (`g` in e- per ADU of the plane's working units; without `gain`, or one that is not a
+/// positive number, the term is omitted and [`SnrTerms::shot_term`] says so) and the sky's, the second factor being the
+/// uncertainty of B_i itself. `kappa(A)` carries the correlation of the noise inside the aperture
+/// ([`ApertureNoise::rho`]; 1 on a white plane); `shot_spread` the interpolation's spreading of the shot noise.
+///
+/// Recorded limits. (R11-2) the noise read under-reads the correlation on a debayered plane's R and B by 12 to 21 %.
+/// (R11-3) on structured sky (nebula) the real flux error is 3.6 to 6 times this noise value: the annulus method's own
+/// limit, the structure term was measured out of F-6. (R11-6) a gain from a header that is wrong moves the median
+/// star's SNR 4 to 10 %, bright stars up to 64 %.
+///
+/// NaN (counted by the caller as `snr_missing`) where the star has no ring (`sky_ring` or its sigma not finite, no
+/// ring pixel), no present aperture pixel, or a variance that is not positive. A saturated or extended star reads
+/// like any other (R11-5): its `S` is the clipped pixels' sum.
+pub fn star_snr(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    f: &StarFit,
+    gain: Option<f64>,
+    mask: Option<&[bool]>,
+    noise: &ApertureNoise,
+) -> (f64, SnrTerms) {
+    let gain = gain.filter(|g| g.is_finite() && *g > 0.0);
+    let mut terms = SnrTerms {
+        s: f64::NAN,
+        n_ap: 0,
+        sigma_sky: f.sky_ring_sigma,
+        n_sky: f.sky_ring_n,
+        kappa: 1.0,
+        shot_spread: noise.shot_spread,
+        shot_term: gain.is_some(),
+    };
+    let r = (SNR_APERTURE_PER_FWHM * f.fwhm()).max(SNR_APERTURE_MIN_PX);
+    if !(f.sky_ring.is_finite()
+        && f.sky_ring_sigma.is_finite()
+        && f.sky_ring_n > 0
+        && f.x.is_finite()
+        && f.y.is_finite()
+        && r.is_finite()
+        && w > 0
+        && h > 0)
+    {
+        return (f64::NAN, terms);
+    }
+    let r2 = r * r;
+    let (y0, y1) = (
+        (f.y - r).ceil().max(0.0),
+        (f.y + r).floor().min((h - 1) as f64),
+    );
+    let (x0, x1) = (
+        (f.x - r).ceil().max(0.0),
+        (f.x + r).floor().min((w - 1) as f64),
+    );
+    let mut pix: Vec<(i64, i64)> = Vec::new();
+    let mut s = 0.0f64;
+    if y1 >= y0 && x1 >= x0 {
+        for py in y0 as usize..=y1 as usize {
+            let dy2 = (py as f64 - f.y).powi(2);
+            for px in x0 as usize..=x1 as usize {
+                if (px as f64 - f.x).powi(2) + dy2 > r2 {
+                    continue;
+                }
+                let i = py * w + px;
+                if data[i].is_finite() && mask.map_or(true, |m| m[i]) {
+                    s += data[i] as f64 - f.sky_ring;
+                    pix.push((px as i64, py as i64));
+                }
+            }
+        }
+    }
+    terms.s = s;
+    terms.n_ap = pix.len();
+    if pix.is_empty() {
+        return (f64::NAN, terms);
+    }
+    if let Some(rho) = &noise.rho {
+        terms.kappa = aperture_kappa(&pix, rho);
+    }
+    let n = pix.len() as f64;
+    let sky =
+        terms.kappa * n * f.sky_ring_sigma * f.sky_ring_sigma * (1.0 + n / f64::from(f.sky_ring_n));
+    let shot = gain.map_or(0.0, |g| noise.shot_spread * s.max(0.0) / g);
+    let var = shot + sky;
+    if var > 0.0 && var.is_finite() {
+        (s / var.sqrt(), terms)
+    } else {
+        (f64::NAN, terms)
+    }
+}
+
+/// A star's half-flux radius (F-6, Task 11, ruling R11-5): the distance about the fitted centre inside which the
+/// background-subtracted cumulative sum reaches half of the star's `signal` (F-5's corrected flux). The present pixels
+/// whose centres lie within `5 * ring_fwhm` ([`GROWTH_RADIUS_PER_FWHM`], the growth curve's aperture) are taken in order
+/// of distance (ties in row-major order), summed as `v - B_i` (the star's stored ring sky), and the radius is
+/// interpolated linearly between the two bracketing pixels' distances by the share of the last pixel's value it takes.
+///
+/// NaN where it is not defined: no ring sky, a `signal` that is not a positive number, no ring width, or the `5F`
+/// circle holding less than half of the signal. By construction the value is at most `5 * ring_fwhm`. A saturated
+/// star's pixels are clipped while its `signal` is the unclipped model's, so its HFR reads wide; an extended one's
+/// reads what its pixels hold (R11-5: reported on every accepted fit, the frame median leaves both out).
+pub fn hfr(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    f: &StarFit,
+    ring_fwhm: f64,
+    mask: Option<&[bool]>,
+) -> f64 {
+    let r = GROWTH_RADIUS_PER_FWHM * ring_fwhm;
+    let target = 0.5 * f.signal;
+    if !(f.sky_ring.is_finite()
+        && f.x.is_finite()
+        && f.y.is_finite()
+        && r.is_finite()
+        && r > 0.0
+        && target.is_finite()
+        && target > 0.0
+        && w > 0
+        && h > 0)
+    {
+        return f64::NAN;
+    }
+    let r2 = r * r;
+    let (y0, y1) = (
+        (f.y - r).ceil().max(0.0),
+        (f.y + r).floor().min((h - 1) as f64),
+    );
+    let (x0, x1) = (
+        (f.x - r).ceil().max(0.0),
+        (f.x + r).floor().min((w - 1) as f64),
+    );
+    if y1 < y0 || x1 < x0 {
+        return f64::NAN;
+    }
+    let mut px: Vec<(f64, f64)> = Vec::new();
+    for py in y0 as usize..=y1 as usize {
+        let dy2 = (py as f64 - f.y).powi(2);
+        for pxl in x0 as usize..=x1 as usize {
+            let d2 = (pxl as f64 - f.x).powi(2) + dy2;
+            let i = py * w + pxl;
+            if d2 <= r2 && data[i].is_finite() && mask.map_or(true, |m| m[i]) {
+                px.push((d2, data[i] as f64 - f.sky_ring));
+            }
+        }
+    }
+    // A stable sort: pixels at one distance keep their row-major order.
+    px.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut cum = 0.0f64;
+    for (k, &(d2, v)) in px.iter().enumerate() {
+        let before = cum;
+        cum += v;
+        if cum >= target {
+            if k == 0 {
+                return d2.sqrt();
+            }
+            let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
+            let d_prev = px[k - 1].0.sqrt();
+            return d_prev + frac * (d2.sqrt() - d_prev);
+        }
+    }
+    f64::NAN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,6 +2133,8 @@ mod tests {
                 sky_ring: f64::NAN,
                 sky_ring_sigma: f64::NAN,
                 sky_ring_n: 0,
+                snr: f64::NAN,
+                hfr: f64::NAN,
                 flags: Default::default(),
             };
             f.fwtm_x = 2.0 * ax * (10f64.powf(1.0 / beta) - 1.0).sqrt();
@@ -2144,6 +2411,490 @@ mod tests {
             ring_sky(&data, None, None, &none, w, h, 70.0, 60.0, 0.1),
             None,
             "4 ring pixels: under 8"
+        );
+    }
+}
+
+/// F-6 (Task 11): the aperture SNR and the half-flux radius, on synthetic planes whose truth is analytic.
+#[cfg(test)]
+mod snr_hfr_tests {
+    use super::*;
+    use crate::star_measure::tests::median;
+    use crate::star_measure::{
+        fit_stars_at, measure_plane, FitStarsOptions, MeasureOptions, PixelNoise, SeedSpec,
+        SnrNoise, ADU_SCALE,
+    };
+    use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
+
+    /// The FWHM of a β = 4 Moffat of alpha 2.99 (the ring width the tests hand the fit, so the ring's pixel count is
+    /// the same on every draw).
+    fn f_true() -> f64 {
+        2.0 * 2.99 * (2f64.powf(0.25) - 1.0).sqrt()
+    }
+
+    fn star(amp: f64) -> (MoffatStar, Seed) {
+        let s = MoffatStar {
+            x: 40.3,
+            y: 39.7,
+            amp,
+            alpha_x: 2.99,
+            alpha_y: 2.99,
+            theta: 0.0,
+        };
+        let seed = Seed {
+            x: s.x,
+            y: s.y,
+            peak: amp * ADU_SCALE as f64,
+            flux: 1.0,
+        };
+        (s, seed)
+    }
+
+    fn scaled(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|x| x * ADU_SCALE).collect()
+    }
+
+    #[test]
+    fn snr_matches_the_analytic_value_on_a_white_noise_star() {
+        // sky 0.05, g 50000 e- per calibrated unit, read noise 0.0005: sigma_px = sqrt(0.05 / g + 0.0005^2) = 0.001118.
+        // The analytic SNR on the star's own ring (R6: 10F..12F, 929 pixel centres at F = 2.6012, a count made by hand;
+        // PA-11's annulus would give 168.03) and aperture (r_ap = 1.5 F = 3.902, 48 pixel centres): 178.97.
+        let g = 50000.0;
+        let (s, seed) = star(0.2);
+        let clean = moffat_field(80, 80, &[s], 4.0, 0.05);
+        let total = std::f64::consts::PI * 0.2 * 2.99 * 2.99 / 3.0;
+        let sigma_px = (0.05 / g + 0.0005f64.powi(2)).sqrt();
+        // the ring's pixel centres at 10F..12F about the exact centre, counted by hand
+        let n_ring = (0..80usize)
+            .flat_map(|y| (0..80usize).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let d = (x as f64 - s.x).hypot(y as f64 - s.y);
+                d >= 10.0 * f_true() && d <= 12.0 * f_true()
+            })
+            .count();
+        assert_eq!(n_ring, 929);
+        let (n_ap, n_ring) = (48.0, n_ring as f64);
+        let r_ap = 1.5 * f_true();
+        let s_ap = total * (1.0 - (1.0 + (r_ap / 2.99).powi(2)).powi(-3));
+        let analytic =
+            s_ap / (s_ap / g + n_ap * sigma_px * sigma_px * (1.0 + n_ap / n_ring)).sqrt();
+        assert!(
+            (analytic - 178.97).abs() < 0.05,
+            "the hand value {analytic}"
+        );
+        let opts = FitStarsOptions {
+            gain_e_per_working_adu: Some(g / ADU_SCALE as f64),
+            ring_fwhm: Some(f_true()),
+            ..Default::default()
+        };
+        let mut snrs = Vec::new();
+        for k in 0..20 {
+            let mut noisy = clean.clone();
+            add_noise(&mut noisy, sigma_px as f32, k);
+            let data = scaled(&noisy);
+            let out = fit_stars_at(&data, 80, 80, &[seed], 4.0, &opts, None);
+            assert_eq!(out.fits.len(), 1, "draw {k}");
+            let f = out.fits[0];
+            assert!(
+                f.sky_ring_n.abs_diff(929) <= 4,
+                "the ring's pixel count (929 about the exact centre, hand count), draw {k}: {}",
+                f.sky_ring_n
+            );
+            let (snr, terms) = star_snr(
+                &data,
+                80,
+                80,
+                &f,
+                opts.gain_e_per_working_adu,
+                None,
+                &ApertureNoise::WHITE,
+            );
+            assert_eq!(snr, f.snr, "the fit carries the same value");
+            // 48 pixel centres at the exact centre and width; the fit's own centre and FWHM move one by a pixel
+            assert!(terms.n_ap.abs_diff(48) <= 1, "draw {k}: {}", terms.n_ap);
+            assert!(terms.shot_term && terms.kappa == 1.0 && terms.shot_spread == 1.0);
+            snrs.push(f.snr);
+        }
+        let med = median(snrs.iter().cloned());
+        assert!(
+            (med / analytic - 1.0).abs() < 0.02,
+            "snr {med} vs analytic {analytic}"
+        );
+    }
+
+    #[test]
+    fn snr_without_gain_omits_the_shot_term_and_says_so() {
+        let (s, seed) = star(0.2);
+        let mut clean = moffat_field(80, 80, &[s], 4.0, 0.05);
+        add_noise(&mut clean, 0.002, 5);
+        let data = scaled(&clean);
+        let with = fit_stars_at(
+            &data,
+            80,
+            80,
+            &[seed],
+            4.0,
+            &FitStarsOptions {
+                gain_e_per_working_adu: Some(1.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let without = fit_stars_at(
+            &data,
+            80,
+            80,
+            &[seed],
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
+        assert!(with.fits[0].snr.is_finite() && without.fits[0].snr.is_finite());
+        assert!(without.fits[0].snr > with.fits[0].snr);
+        let (_, terms) = star_snr(
+            &data,
+            80,
+            80,
+            &without.fits[0],
+            None,
+            None,
+            &ApertureNoise::WHITE,
+        );
+        assert!(!terms.shot_term);
+        let (_, terms) = star_snr(
+            &data,
+            80,
+            80,
+            &with.fits[0],
+            Some(1.0),
+            None,
+            &ApertureNoise::WHITE,
+        );
+        assert!(terms.shot_term);
+        // a gain that is not a positive number is no gain
+        let (snr, terms) = star_snr(
+            &data,
+            80,
+            80,
+            &with.fits[0],
+            Some(f64::NAN),
+            None,
+            &ApertureNoise::WHITE,
+        );
+        assert!(!terms.shot_term && snr == without.fits[0].snr);
+    }
+
+    #[test]
+    fn edge_star_snr_reads_the_stars_own_ring() {
+        // a star 10 px from the border (a closer one is refused `outsideImage` by its fit region) with a NaN wedge beside
+        // it: its ring holds what the plane gives it - the border and the wedge cut it - and the SNR reads exactly those
+        // pixels' sigma and count
+        let s = MoffatStar {
+            x: 10.0,
+            y: 40.0,
+            amp: 0.3,
+            alpha_x: 2.99,
+            alpha_y: 2.99,
+            theta: 0.0,
+        };
+        let mut data = moffat_field(80, 80, &[s], 4.0, 0.05);
+        add_noise(&mut data, 0.002, 3);
+        for y in 50..80 {
+            for x in 0..20 {
+                data[y * 80 + x] = f32::NAN;
+            }
+        }
+        let data = scaled(&data);
+        let seed = Seed {
+            x: 10.0,
+            y: 40.0,
+            peak: 0.3 * ADU_SCALE as f64,
+            flux: 1.0,
+        };
+        let opts = FitStarsOptions {
+            ring_fwhm: Some(f_true()),
+            ..Default::default()
+        };
+        let out = fit_stars_at(&data, 80, 80, &[seed], 4.0, &opts, None);
+        assert_eq!(out.fits.len(), 1, "the edge star fits: {:?}", out.refused);
+        let f = out.fits[0];
+        let (snr, terms) = star_snr(&data, 80, 80, &f, None, None, &ApertureNoise::WHITE);
+        assert!(snr.is_finite() && snr > 0.0, "{snr}");
+        assert_eq!(terms.sigma_sky, f.sky_ring_sigma);
+        assert_eq!(terms.n_sky, f.sky_ring_n);
+        assert!(
+            f64::from(terms.n_sky) < 0.6 * 929.0,
+            "the border and the wedge cut the ring: {}",
+            terms.n_sky
+        );
+        assert!(terms.n_sky >= ANNULUS_MIN_PIXELS as u32);
+    }
+
+    #[test]
+    fn snr_and_hfr_are_nan_and_counted_when_the_ring_is_missing() {
+        // only the star's own 10F..12F ring (0.5 px wider on each side) is absent: the star itself fits, and the SNR
+        // and the HFR alone have no sky to read. The open run reads both, so the test cannot pass on zero fits.
+        let (s, seed) = star(0.2);
+        // an unseeded brighter star sets the plane's range: a lone star would be flagged saturated by F-3's amplitude
+        // clause (its fitted amplitude tops the plane max less the sky), leave the frame statistic empty and the plane
+        // without a ring width (R11-5)
+        let range = MoffatStar {
+            x: 100.0,
+            y: 40.0,
+            amp: 0.45,
+            ..s
+        };
+        let mut data = moffat_field(120, 80, &[s, range], 4.0, 0.05);
+        add_noise(&mut data, 0.002, 9);
+        let opts = |mask: Option<Vec<bool>>| MeasureOptions {
+            seeds: SeedSpec::Given(vec![seed]),
+            mask,
+            pixel_noise: PixelNoise::White,
+            ..Default::default()
+        };
+        let open = measure_plane(&data, 120, 80, &opts(None), None);
+        assert_eq!(open.stars.len(), 1);
+        assert!(open.stars[0].snr.is_finite(), "snr {}", open.stars[0].snr);
+        assert!(open.stars[0].hfr.is_finite(), "hfr {}", open.stars[0].hfr);
+        assert_eq!(open.snr_missing, 0);
+        assert!(open.frame.snr_median.is_some() && open.frame.hfr_median.is_some());
+        let big_f = open.frame.fwhm_px.expect("the frame FWHM");
+        let f = open.stars[0];
+        let (lo, hi) = (10.0 * big_f - 0.5, 12.0 * big_f + 0.5);
+        let mask: Vec<bool> = (0..120 * 80)
+            .map(|i| {
+                let d = ((i % 120) as f64 - f.x).hypot((i / 120) as f64 - f.y);
+                d < lo || d > hi
+            })
+            .collect();
+        let m = measure_plane(&data, 120, 80, &opts(Some(mask)), None);
+        assert_eq!(m.stars.len(), 1, "the star itself is unmasked and fits");
+        assert!(m.stars[0].snr.is_nan() && m.stars[0].hfr.is_nan());
+        assert_eq!(m.snr_missing, 1);
+        assert!(m.frame.snr_median.is_none() && m.frame.hfr_median.is_none());
+        assert_eq!(m.snr_noise, SnrNoise::White);
+    }
+
+    /// Six isolated Gaussian stars (sigma 2, phase (0.3, 0.7)) fitted at beta 100: `c` is measured on six stars and
+    /// `signal` is the total flux, so the HFR is the Gaussian's half-flux radius up to the pixel grid.
+    fn gaussian_stars() -> (Vec<f32>, crate::star_measure::FitOutcome) {
+        let sigma = 2.0;
+        let stars: Vec<(f64, f64, f64)> = (0..6)
+            .map(|i| {
+                (
+                    60.3 + (i % 3) as f64 * 60.0,
+                    59.7 + (i / 3) as f64 * 60.0,
+                    0.3,
+                )
+            })
+            .collect();
+        // an unseeded brighter star sets the plane's range (the clip screen), outside every seeded star's 12F disc
+        let mut rendered = stars.clone();
+        rendered.push((120.0, 290.0, 0.45));
+        let g = gaussian_field(240, 330, &rendered, sigma, 0.0);
+        let data = scaled(&g);
+        let seeds: Vec<Seed> = stars
+            .iter()
+            .map(|&(x, y, p)| Seed {
+                x,
+                y,
+                peak: p,
+                flux: 1.0,
+            })
+            .collect();
+        let out = fit_stars_at(
+            &data,
+            240,
+            330,
+            &seeds,
+            100.0,
+            &FitStarsOptions::default(),
+            None,
+        );
+        (data, out)
+    }
+
+    #[test]
+    fn hfr_of_a_gaussian_is_the_half_flux_radius() {
+        // six isolated stars, so the aperture correction is measured (>= 5 qualify, Task 10) and `signal` is the total
+        // flux; one star would leave c = 1 and signal = 0.898 * total, the HFR 9 % low (computed). The phase (0.3, 0.7)
+        // matters: this interpolated discrete HFR moves with the sub-pixel phase (sigma 2: up to +-8 % over a 0.1-px
+        // phase grid, computed); at this phase it reads +0.2 % with c measured.
+        let (_, out) = gaussian_stars();
+        assert!(
+            out.aperture_correction.is_some(),
+            "c is measured on six isolated stars"
+        );
+        let want = 1.177_41 * 2.0; // the Gaussian's half-flux radius sqrt(2 ln 2) sigma
+        assert_eq!(out.fits.len(), 6);
+        let ring = out.ring_fwhm.expect("a ring width");
+        for f in &out.fits {
+            assert!((f.hfr / want - 1.0).abs() < 0.03, "hfr {} vs {want}", f.hfr);
+            assert!(f.hfr <= 5.0 * ring, "HFR is at most 5F by construction");
+        }
+    }
+
+    #[test]
+    fn hfr_is_nan_when_the_5f_circle_holds_less_than_half_the_signal() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        let mut f = out.fits[0];
+        assert!(hfr(&data, 240, 330, &f, ring, None).is_finite());
+        f.signal *= 2.5; // half of 2.5 x the flux is more than the circle holds
+        assert!(hfr(&data, 240, 330, &f, ring, None).is_nan());
+        f.signal = out.fits[0].signal;
+        f.sky_ring = f64::NAN; // no ring sky
+        assert!(hfr(&data, 240, 330, &f, ring, None).is_nan());
+        assert!(
+            hfr(&data, 240, 330, &out.fits[0], f64::NAN, None).is_nan(),
+            "no ring width"
+        );
+    }
+
+    /// 512 x 512 white noise smoothed by the separable [1, 2, 1] / 4 (a correlated plane: lag-1 rho 2/3 per axis, lag-2
+    /// 1/6) and one star, measured with the seed given and the noise stated mixed.
+    fn smoothed_plane() -> (Vec<f32>, Seed) {
+        let n = 512usize;
+        let mut noise = vec![0.0f32; n * n];
+        add_noise(&mut noise, 0.004, 21);
+        let at = |x: i64, y: i64| {
+            noise[y.clamp(0, n as i64 - 1) as usize * n + x.clamp(0, n as i64 - 1) as usize]
+        };
+        let k = [0.25f32, 0.5, 0.25];
+        let mut rows = vec![0.0f32; n * n];
+        for y in 0..n as i64 {
+            for x in 0..n as i64 {
+                rows[y as usize * n + x as usize] =
+                    (0..3).map(|j| k[j] * at(x + j as i64 - 1, y)).sum();
+            }
+        }
+        let at2 = |x: i64, y: i64| {
+            rows[y.clamp(0, n as i64 - 1) as usize * n + x.clamp(0, n as i64 - 1) as usize]
+        };
+        let mut sm = vec![0.0f32; n * n];
+        for y in 0..n as i64 {
+            for x in 0..n as i64 {
+                sm[y as usize * n + x as usize] =
+                    (0..3).map(|j| k[j] * at2(x, y + j as i64 - 1)).sum();
+            }
+        }
+        let s = MoffatStar {
+            x: 256.3,
+            y: 255.7,
+            amp: 0.3,
+            alpha_x: 2.99,
+            alpha_y: 2.99,
+            theta: 0.0,
+        };
+        // an unseeded brighter star sets the plane's range (R11-5: a lone star flags itself saturated)
+        let range = MoffatStar {
+            x: 100.0,
+            y: 100.0,
+            amp: 0.6,
+            ..s
+        };
+        let sky = moffat_field(n, n, &[s, range], 4.0, 0.05);
+        // the native (unit-domain) plane: `measure_plane` scales it by `ADU_SCALE` itself
+        let data: Vec<f32> = sky.iter().zip(&sm).map(|(a, b)| a + b).collect();
+        (
+            data,
+            Seed {
+                x: s.x,
+                y: s.y,
+                peak: 0.3 * ADU_SCALE as f64,
+                flux: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn snr_on_a_mixed_plane_reads_the_aperture_correlation() {
+        let (native, seed) = smoothed_plane();
+        let data = scaled(&native); // the working-unit plane the fits and the aperture read
+        let n = 512usize;
+        let pm = measure_plane(
+            &native,
+            n,
+            n,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(vec![seed]),
+                pixel_noise: PixelNoise::Mixed,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            pm.snr_noise,
+            SnrNoise::Read,
+            "the correlation is read once for a given-seed mixed plane"
+        );
+        assert_eq!(pm.stars.len(), 1);
+        let f = pm.stars[0];
+        // the same plane through a white aperture: the ratio is sqrt(kappa) of the star's own aperture
+        let (white, wt) = star_snr(&data, n, n, &f, None, None, &ApertureNoise::WHITE);
+        assert_eq!(wt.kappa, 1.0);
+        assert_eq!(wt.shot_spread, 1.0);
+        let (mixed, mt) = (f.snr, {
+            let rho = crate::star_measure::seeds::read_noise_correlation(
+                &data,
+                n,
+                n,
+                None,
+                &crate::star_measure::domain::background_mesh(&data, n, n, None, true),
+            )
+                .expect("the read")
+                .rho();
+            star_snr(
+                &data,
+                n,
+                n,
+                &f,
+                None,
+                None,
+                &ApertureNoise {
+                    rho: Some(rho),
+                    shot_spread: 1.0,
+                },
+            )
+            .1
+        });
+        assert!(
+            (white / mixed - mt.kappa.sqrt()).abs() < 1e-9 * mt.kappa.sqrt(),
+            "{white} / {mixed} vs {}",
+            mt.kappa
+        );
+        // kappa analytic over the star's aperture pixels: rho(dx, dy) = r(dx) r(dy), r = 1, 2/3, 1/6
+        let r = |d: i64| match d.abs() {
+            0 => 1.0,
+            1 => 2.0 / 3.0,
+            2 => 1.0 / 6.0,
+            _ => 0.0,
+        };
+        let r_ap = (1.5 * f.fwhm()).max(3.0);
+        let mut pix = Vec::new();
+        for y in 0..n as i64 {
+            for x in 0..n as i64 {
+                if ((x as f64 - f.x).powi(2) + (y as f64 - f.y).powi(2)) <= r_ap * r_ap
+                    && (x - 256).abs() < 8
+                    && (y - 256).abs() < 8
+                {
+                    pix.push((x, y));
+                }
+            }
+        }
+        let mut analytic = 0.0;
+        for &(x, y) in &pix {
+            for &(x2, y2) in &pix {
+                analytic += r(x - x2) * r(y - y2);
+            }
+        }
+        analytic /= pix.len() as f64;
+        assert_eq!(pix.len(), mt.n_ap);
+        assert!(analytic > 4.5 && analytic < 7.2, "{analytic}");
+        assert!(
+            (mt.kappa / analytic - 1.0).abs() < 0.03,
+            "kappa read {} vs analytic {analytic}",
+            mt.kappa
         );
     }
 }

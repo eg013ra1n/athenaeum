@@ -546,6 +546,8 @@ mod tests {
             sky_ring: f64::NAN,
             sky_ring_sigma: f64::NAN,
             sky_ring_n: 0,
+            snr: f64::NAN,
+            hfr: f64::NAN,
             flags: crate::star_measure::StarFlags::default(),
         }
     }

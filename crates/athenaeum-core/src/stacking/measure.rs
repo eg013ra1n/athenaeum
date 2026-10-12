@@ -287,6 +287,23 @@ pub struct PlaneMeasurement {
     /// structure seeds dropped, the extended flags; the probe's `sigmaF`, `sigmaFMeasured`, `noiseGain`,
     /// `structureDropped`, `extendedSeeds`); `None` for the other detectors. Reported, not persisted.
     pub detection: Option<sm::DetectionReport>,
+    /// The gain the stars' SNR used, e- per ADU of the working-unit plane (Plan A Task 11, ruling R11-6: the header's
+    /// `EGAIN x ATH_CSCL` over 65535; the probe's `snrGain`); `None` = no gain, the shot term was omitted. Reported,
+    /// not persisted (not in [`ChannelMeasurement`], so no cached `metrics` payload changes).
+    pub snr_gain: Option<f64>,
+    /// The accepted fits without an SNR (no ring sky; the probe's `snrMissing`). Reported, not persisted.
+    pub snr_missing: usize,
+    /// The plane's median aperture SNR over the finite values of the fits the frame statistic counts (ruling R11-5; the
+    /// probe's `snrMedian`); `None` = none. Reported, not persisted.
+    pub snr_median: Option<f64>,
+    /// The plane's median half-flux radius, px, over the same population (the probe's `hfrMedian`). Reported, not
+    /// persisted.
+    pub hfr_median: Option<f64>,
+    /// How the SNR's noise correlation was obtained (the probe's `snrNoise`). Reported, not persisted.
+    pub snr_noise: sm::SnrNoise,
+    /// The `s` the shot term would use (the plane's CFA site share spreading it; the probe's `shotSpread`), reported
+    /// even when the gain is absent and the shot term omitted. Not persisted.
+    pub shot_spread: f64,
 }
 
 /// One plane's result from [`measure_planes_diagnosed`].
@@ -377,6 +394,8 @@ pub fn measure_plane_detailed(
         false,
         false,
         sm::PixelNoise::Unknown,
+        None,
+        None,
     );
     (pm, seeds)
 }
@@ -394,6 +413,9 @@ pub fn measure_plane_detailed(
 /// [`measure_planes_diagnosed`], which sets `colour` itself.
 /// `pixel_noise` (Task 10b A1c, ruling C-10): the caller's statement of the plane's noise correlation
 /// ([`sm::PixelNoise`]); the convenience entries above say `Unknown` (the gain is read).
+/// `gain_e_per_unit` (Task 11, ruling R11-6): e- per calibrated unit (`EGAIN x ATH_CSCL`, [`gain_from_header`]), the
+/// SNR's shot term; `None` omits it. `cfa_site_share` (ruling R11-1): the plane's share of its own colour's CFA sites
+/// (0.25 / 0.5 / 0.25 on a debayered RGGB plane), `None` = 1. Neither moves anything but the new SNR / HFR values.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_plane_diagnosed(
     data: &[f32],
@@ -405,6 +427,8 @@ pub fn measure_plane_diagnosed(
     diagnostics: bool,
     colour: bool,
     pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    cfa_site_share: Option<f64>,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
     let head = adapter_head(
         data,
@@ -416,6 +440,8 @@ pub fn measure_plane_diagnosed(
         diagnostics,
         colour,
         pixel_noise,
+        gain_e_per_unit,
+        cfa_site_share,
     );
     let m = sm::measure_plane(data, w, h, &head.module_opts, pool);
     adapter_tail(head, m)
@@ -447,6 +473,7 @@ pub fn measure_planes_diagnosed<'a, E>(
     seed_source: SeedOverride,
     diagnostics: bool,
     pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
     if n_planes == 1 {
@@ -463,6 +490,8 @@ pub fn measure_planes_diagnosed<'a, E>(
             diagnostics,
             false,
             pixel_noise,
+            gain_e_per_unit,
+            None,
         );
         return Ok(vec![MeasuredPlane {
             measurement,
@@ -490,6 +519,9 @@ pub fn measure_planes_diagnosed<'a, E>(
             diagnostics,
             colour,
             pixel_noise,
+            gain_e_per_unit,
+            // A debayered RGGB colour image's planes 0 / 1 / 2 are R / G / B: the share of their own colour's sites.
+            (colour && n_planes == 3).then(|| [0.25, 0.5, 0.25][p]),
         );
         preps.push(sm::prepare_plane(&data, w, h, &head.module_opts, pool));
         heads.push(head);
@@ -556,6 +588,8 @@ fn adapter_head(
     diagnostics: bool,
     colour: bool,
     pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    cfa_site_share: Option<f64>,
 ) -> AdapterHead {
     // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
     // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
@@ -743,9 +777,7 @@ fn adapter_head(
         None => (None, None),
     };
     let module_opts = sm::MeasureOptions {
-        domain: sm::Domain::Calibrated {
-            gain_e_per_unit: None,
-        },
+        domain: sm::Domain::Calibrated { gain_e_per_unit },
         psf_model: opts.psf_model,
         max_stars: opts.max_stars,
         seeds: match detector {
@@ -760,6 +792,7 @@ fn adapter_head(
         field_width: None,
         colour,
         pixel_noise,
+        cfa_site_share,
     };
     AdapterHead {
         detector,
@@ -862,10 +895,61 @@ fn adapter_tail(
             clip_floor: m.clip_floor,
             clip_evidence: m.clip_evidence,
             detection: m.detection,
+            snr_gain: m.snr_gain,
+            snr_missing: m.snr_missing,
+            snr_median: m.frame.snr_median,
+            hfr_median: m.frame.hfr_median,
+            snr_noise: m.snr_noise,
+            shot_spread: m.shot_spread,
         },
         seeds,
         m.diagnostics,
     )
+}
+
+/// The calibrated frame's gain in e- per CALIBRATED unit, read from its header (Plan A Task 11, ruling R11-6, PA-22):
+/// `EGAIN` (e- per ADU of the raw sensor) times `ATH_CSCL` (the calibrated light's unit divisor, ADU per unit). `ATH_CFNM`
+/// is the flat's normalisation and plays no part. No camera table: a frame without either card, or one that is not a
+/// positive number, has no gain (`None`: the SNR omits its shot term and the frame line says so); an unreadable header
+/// is logged, never silent.
+pub fn gain_from_header(path: &Path) -> Option<f64> {
+    let is_xisf = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
+    let (egain, cscl) = if is_xisf {
+        match crate::fits_parser::extract_xisf_header(path) {
+            Ok(text) => (header_text_f64(&text, "EGAIN"), header_text_f64(&text, "ATH_CSCL")),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "snr: the XISF header could not be read; no gain");
+                return None;
+            }
+        }
+    } else {
+        match crate::fits_parser::FitsHeader::from_path(path) {
+            Ok(h) => (h.get_f64("EGAIN"), h.get_f64("ATH_CSCL")),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "snr: the FITS header could not be read; no gain");
+                return None;
+            }
+        }
+    };
+    let gain = egain.zip(cscl).map(|(e, c)| e * c);
+    if gain.is_none() {
+        debug!(path = %path.display(), "snr: no EGAIN and ATH_CSCL in the header; the shot term is omitted");
+    }
+    gain.filter(|g| g.is_finite() && *g > 0.0)
+}
+
+/// The real value of `key` in the header text `extract_xisf_header` returns (`NAME = value` lines).
+fn header_text_f64(text: &str, key: &str) -> Option<f64> {
+    text.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        if k.trim() != key {
+            return None;
+        }
+        v.split('/').next()?.trim().trim_matches('\'').trim().parse::<f64>().ok()
+    })
 }
 
 /// Measure every plane of a calibrated frame; checks `cancel` before each
@@ -1001,6 +1085,7 @@ fn measure_frame_inner(
             3 => sm::PixelNoise::Mixed,
             _ => sm::PixelNoise::Unknown,
         },
+        gain_from_header(path),
         |plane| -> Result<Cow<'static, [f32]>, IntegrationError> {
             if cancel.load(Ordering::Relaxed) {
                 return Err(IntegrationError::Cancelled);
@@ -1426,6 +1511,7 @@ pub(crate) mod tests {
             SeedOverride::Fast,
             true,
             sm::PixelNoise::Mixed,
+            None,
             |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
         )
         .unwrap();
@@ -1448,6 +1534,8 @@ pub(crate) mod tests {
                 false,
                 true,
                 sm::PixelNoise::Mixed,
+                None,
+                None,
             );
             let mine = alone
                 .fits
@@ -2151,5 +2239,96 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             rel <= 1e-12,
             "{what}: got {got:?}, pinned {want:?} (relative {rel:.3e} > 1e-12)"
         );
+    }
+
+    #[test]
+    fn the_adapter_reads_egain_and_cscl_into_the_gain() {
+        use crate::fits_writer::{Card, CardValue};
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("g.fits");
+        let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
+        let cards = [
+            Card::new("EGAIN", CardValue::Real(50000.0 / 65535.0)).unwrap(),
+            Card::new("ATH_CSCL", CardValue::Real(65535.0)).unwrap(),
+            Card::new("ATH_CFNM", CardValue::Real(3000.0)).unwrap(),
+        ];
+        write_fits_f32(&p, w, h, 1, &data, &cards).unwrap();
+        assert!(
+            (gain_from_header(&p).unwrap() - 50000.0).abs() < 1e-6,
+            "EGAIN x ATH_CSCL, CFNM ignored (PA-22)"
+        );
+        let q = d.path().join("n.fits");
+        write_fits_f32(&q, w, h, 1, &data, &[]).unwrap();
+        assert_eq!(gain_from_header(&q), None);
+        let r = d.path().join("only_egain.fits");
+        write_fits_f32(&r, w, h, 1, &data, &cards[..1]).unwrap();
+        assert_eq!(gain_from_header(&r), None, "ATH_CSCL missing: no gain");
+        assert_eq!(gain_from_header(&d.path().join("missing.fits")), None, "an unreadable file has none (logged)");
+    }
+
+    #[test]
+    fn a_debayered_plane_spreads_the_shot_term_by_its_site_share() {
+        // F-6 (Task 11, ruling R11-1): a colour image's planes 0 / 1 / 2 carry s = 4 / 2 / 4 (RGGB site shares 0.25 /
+        // 0.5 / 0.25), a single plane 1; each star's SNR is S / sigma_S with sigma_S^2 = s S / g + kappa N sigma^2 (1 +
+        // N / n) recomputed from the terms to 1e-9, the correlation the plane's own read.
+        let (w, h) = (768usize, 512usize);
+        let planes: Vec<Vec<f32>> = (0..3)
+            .map(|p| crate::test_support::fixture_field(30 + p as u64, 1.0, 0.002).0)
+            .collect();
+        let gain = 50000.0;
+        let opts = MeasureOptions::default();
+        let multi = measure_planes_diagnosed(
+            3,
+            w,
+            h,
+            &opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::Mixed,
+            Some(gain),
+            |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+        )
+        .unwrap();
+        for (p, want) in [4.0, 2.0, 4.0].into_iter().enumerate() {
+            let m = &multi[p].measurement;
+            assert_eq!(m.shot_spread, want, "plane {p}");
+            assert_eq!(m.snr_noise, sm::SnrNoise::Read, "plane {p}");
+            assert!((m.snr_gain.unwrap() - gain / ADU_SCALE as f64).abs() < 1e-12, "plane {p}");
+            assert!(m.fits.len() > 50, "plane {p}: {} fits", m.fits.len());
+            let working: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
+            let rho = sm::seeds::read_noise_correlation(&working, w, h, None, &sm::domain::background_mesh(&working, w, h, None, true)).expect("the read").rho();
+            let noise = sm::ApertureNoise {
+                rho: Some(rho),
+                shot_spread: want,
+            };
+            let mut checked = 0;
+            for f in m.fits.iter().filter(|f| f.snr.is_finite()).take(25) {
+                let (snr, t) = sm::star_snr(&working, w, h, f, m.snr_gain, None, &noise);
+                assert_eq!(snr, f.snr, "plane {p}: the fit's value is the function's");
+                let var = t.shot_spread * t.s.max(0.0) / m.snr_gain.unwrap()
+                    + t.kappa * t.n_ap as f64 * t.sigma_sky.powi(2) * (1.0 + t.n_ap as f64 / f64::from(t.n_sky));
+                assert!(((t.s / var.sqrt()) / f.snr - 1.0).abs() < 1e-9, "plane {p}");
+                assert!(t.kappa > 0.5, "plane {p}: kappa {}", t.kappa);
+                checked += 1;
+            }
+            assert!(checked >= 20, "plane {p}: {checked}");
+        }
+        let single = measure_planes_diagnosed(
+            1,
+            w,
+            h,
+            &opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::White,
+            Some(gain),
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[0].as_slice())),
+        )
+        .unwrap();
+        assert_eq!(single[0].measurement.shot_spread, 1.0);
+        assert_eq!(single[0].measurement.snr_noise, sm::SnrNoise::White);
+        assert!(single[0].measurement.snr_median.is_some() && single[0].measurement.hfr_median.is_some());
     }
 }

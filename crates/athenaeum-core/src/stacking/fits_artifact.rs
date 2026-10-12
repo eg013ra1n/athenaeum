@@ -137,6 +137,8 @@ fn decode_fit(record: &[u8]) -> StarFit {
         sky_ring: f64::NAN,
         sky_ring_sigma: f64::NAN,
         sky_ring_n: 0,
+        snr: f64::NAN,
+        hfr: f64::NAN,
         // Every bit as written (a file from before Plan A Task 4 holds 0).
         flags: StarFlags(record[FIELDS_PER_RECORD * 4]),
     }
@@ -263,6 +265,8 @@ mod tests {
             sky_ring: f64::NAN,
             sky_ring_sigma: f64::NAN,
             sky_ring_n: 0,
+            snr: f64::NAN,
+            hfr: f64::NAN,
             flags: StarFlags::default(),
         }
     }
