@@ -154,6 +154,16 @@ pub struct SaturationPlane {
     pub range: f64,
     /// A debayered colour plane: its plateau needs all 8 neighbours.
     pub colour: bool,
+    /// The maximum of the plane's finite, unmasked pixels (uncapped by `norm`).
+    pub plane_max: f64,
+    /// How many present pixels equal [`SaturationPlane::plane_max`]: two or more is an exact clip.
+    pub max_count: usize,
+    /// The plane's near-clip floor (Task 10c, R10c-10), working units: derived once per plane after the verdict pass
+    /// ([`derive_clip_floor`]); `None` until then and whenever the plane shows no clipped evidence, which leaves the
+    /// near-clip clause with nothing to flag.
+    pub clip_floor: Option<f64>,
+    /// How many pieces of evidence set [`SaturationPlane::clip_floor`]: the tie (one) plus the certified cores.
+    pub clip_evidence: usize,
 }
 
 impl SaturationPlane {
@@ -167,10 +177,14 @@ impl SaturationPlane {
         norm: f64::INFINITY,
         range: f64::INFINITY,
         colour: false,
+        plane_max: f64::INFINITY,
+        max_count: 0,
+        clip_floor: None,
+        clip_evidence: 0,
     };
 
     /// `threshold = bg + 5·sigma`, `range = min(plane_max, norm) − bg`; `plane_max` over the plane's finite,
-    /// unmasked pixels.
+    /// unmasked pixels. One pixel at the maximum, no floor ([`SaturationPlane::with_max_count`] says otherwise).
     pub fn new(bg: f64, sigma: f64, plane_max: f64, norm: f64, colour: bool) -> Self {
         SaturationPlane {
             bg,
@@ -178,8 +192,87 @@ impl SaturationPlane {
             norm,
             range: plane_max.min(norm) - bg,
             colour,
+            plane_max,
+            max_count: 1,
+            clip_floor: None,
+            clip_evidence: 0,
         }
     }
+
+    /// The same plane with `n` present pixels at its maximum.
+    pub fn with_max_count(mut self, n: usize) -> Self {
+        self.max_count = n;
+        self
+    }
+
+    /// The same plane with its near-clip floor set.
+    pub fn with_clip_floor(mut self, floor: Option<f64>) -> Self {
+        self.clip_floor = floor;
+        self
+    }
+
+    /// The knot exemption's band test (Task 10c, R10c-1), read BEFORE any verdict exists: the maximum of the finite
+    /// values `top3x3` stands within the plateau band of the clip, `max - bg >= (1 - PLATEAU_RANGE)·range`. An empty
+    /// or all-non-finite set is not near the clip. On [`SaturationPlane::UNTESTED`] nothing is. The verdict's
+    /// near-clip clause (class B) reads [`SaturationPlane::clip_floor`] instead; every floor is at or above this band
+    /// (the plane max, or a pixel0 that passed clause 2's own band), so class B is a subset of what this test passes.
+    pub(crate) fn near_clip(&self, top3x3: impl IntoIterator<Item = f64>) -> bool {
+        let top = top3x3
+            .into_iter()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        top - self.bg >= (1.0 - PLATEAU_RANGE) * self.range
+    }
+}
+
+/// The plane's near-clip floor (Task 10c, R10c-10; owner: "adjust the threshold in the ideal case"): the lowest value
+/// at which this plane's own clipped evidence shows a clip. Evidence is (1) the plane max, when two or more present
+/// pixels equal it (an exact clip), and (2) `pixel0` of every verdict flagged by clause 1 (the fitted amplitude beyond
+/// the range) AND clause 2 (a plateau with pixel0 within the band of the clip): a certified clipped core. The floor is
+/// the minimum of the evidence, no margin (a 5σ margin changed no lab or real number); no evidence, no floor.
+///
+/// Why per plane: an exact clip collapses the floor onto the clip value, a flat-divided clip (calibrated frames) spans
+/// the spread of its clipped values and the floor is its lowest, and a clip-free plane shows neither a tie nor a
+/// certified core, so nothing is near a clip. Either clause alone certifies unclipped stars (clause 2 a big star with
+/// a flat top, clause 1 the brightest star of a clip-free plane); together they certified none on the 11 clip-free
+/// lab planes. `pixel0`, not the 3×3 maximum: on a debayered plane a core's 3×3 maximum is debayer overshoot.
+///
+/// Every floor is at least `bg + 0.9·range` (the tied maximum is the plane max; clause 2 holds pixel0 above the
+/// band), so class B never flags a star the knot exemption's band test ([`SaturationPlane::near_clip`]) did not pass.
+///
+/// Limits: (a) a clipped plane whose clipped stars are all one-pixel clips has no tie and no certified core, so no
+/// class B; (b) the floor never goes below the plateau band, so a clip lying below `bg + 0.9·range` (a mono plane
+/// whose clip is 0.86 to 0.90 of the range) is not seen; (c) the floor is the frame-wide lowest clipped value, so an
+/// unclipped star between it and a vignetted corner's clip is flagged; (d) one certified star can set the floor;
+/// (e) clauses 1 and 2 keep their own clip-free false positives; (f) a `MostlySaturated` refusal (the heaviest clipped
+/// core) has no verdict, so its pixel0 is never evidence: on a flat-divided clip whose lowest-clipped stars are all
+/// refused, the floor sits too high (the miss side, never a false flag); (g) on an integer plane a chance tie at a
+/// clip-free maximum sets a floor at the plane max, and class B then adds only the star(s) holding that pixel, which
+/// clause 1 flags anyway (e).
+pub(crate) fn derive_clip_floor<'a>(
+    plane: &SaturationPlane,
+    verdicts: impl IntoIterator<Item = &'a SaturationVerdict>,
+) -> Option<(f64, usize)> {
+    if !plane.range.is_finite() {
+        return None;
+    }
+    let mut floor = (plane.max_count >= 2).then_some(plane.plane_max);
+    let mut evidence = usize::from(floor.is_some());
+    for v in verdicts {
+        if v.by_amplitude && v.by_plateau_clip && v.pixel0.is_finite() {
+            floor = Some(floor.map_or(v.pixel0, |f| f.min(v.pixel0)));
+            evidence += 1;
+        }
+    }
+    floor.map(|f| (f, evidence))
+}
+
+/// Re-reads clause 3 (class B) on a verdict that was made before the plane's floor existed: the plateau test did not
+/// pass and the 3×3 maximum stands at or above [`SaturationPlane::clip_floor`]. Level and fit are untouched; `saturated`
+/// is the star's own flag again (a cross flag is applied later).
+pub(crate) fn mark_near_clip(plane: &SaturationPlane, v: &mut SaturationVerdict) {
+    v.by_near_clip = !v.plateau && plane.clip_floor.is_some_and(|f| v.top3x3 >= f);
+    v.saturated = v.by_amplitude || v.by_plateau_clip || v.by_near_clip;
 }
 
 /// The plateau test at the seed pixel: `region` is the unnormalised region in stamp coordinates (`x − cx`, `y − cy`,
@@ -262,7 +355,7 @@ pub struct SaturationVerdict {
     pub beta: f64,
     /// Its FWHM, `√(fwhm_x·fwhm_y)` (the payoff reads it, C-d).
     pub fwhm: f64,
-    /// The star's own flag or a cross flag: `by_amplitude || by_plateau_clip || cross`.
+    /// The star's own flag or a cross flag: `by_amplitude || by_plateau_clip || by_near_clip || cross`.
     pub saturated: bool,
     /// Clause 1: the verdict fit succeeded and `amplitude > range`.
     pub by_amplitude: bool,
@@ -270,6 +363,17 @@ pub struct SaturationVerdict {
     /// test's own 0.1·range band of the clip), whatever the fitted amplitude. It needs no fit: a verdict whose fit
     /// failed (`fit = false`) with a passed plateau at the clip is flagged.
     pub by_plateau_clip: bool,
+    /// Clause 3 (near-clip, Task 10c): the plateau test did NOT pass and the 3x3 maximum about the seed pixel stands
+    /// within the plateau band of the clip ([`SaturationPlane::near_clip`]). An undersampled star clipped on about one
+    /// pixel has no plateau (its neighbours are not high), so clause 2 cannot see it; its clipped pixel stays in the
+    /// fit (level and fit unchanged) and the point model's beta rises instead of the amplitude passing the range.
+    /// Like clause 2 it needs no fit: it holds when the verdict fit failed.
+    pub by_near_clip: bool,
+    /// The region's pixel at the rounded seed centre (working units), NaN when the region lacks it.
+    pub pixel0: f64,
+    /// The maximum of the region's finite pixels within the 3x3 about the seed pixel (working units); negative
+    /// infinity when there are none. Clause 3 reads it against the plane's floor.
+    pub top3x3: f64,
     /// `false` = the verdict fit failed (not n ≤ p): `amplitude`, `beta`, `fwhm` NaN, `saturated` false unless a cross
     /// flag. A β at a bound is a successful fit.
     pub fit: bool,
@@ -317,6 +421,21 @@ pub(crate) fn saturation_verdict(
     // plateau-clip clause: pixel0 within the plateau test's own band (0.1·range) of the clip
     let by_plateau_clip =
         test.is_some_and(|(_, pixel0)| pixel0 - plane.bg >= (1.0 - PLATEAU_RANGE) * plane.range);
+    // near-clip clause (class B): no plateau and the 3x3 maximum at or above the plane's floor. The floor is derived
+    // from the plane's verdicts after this pass ([`derive_clip_floor`]), so a plane without one yet flags nothing and
+    // [`mark_near_clip`] re-reads this clause; the 3x3 maximum and pixel0 are kept for it.
+    let (px0, py0) = ((seed_x + 0.5).floor(), (seed_y + 0.5).floor());
+    let top3x3 = region
+        .iter()
+        .filter(|s| (s.x - px0).abs() <= 1.0 && (s.y - py0).abs() <= 1.0)
+        .map(|s| s.value)
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let pixel0 = region
+        .iter()
+        .find(|s| s.x == px0 && s.y == py0)
+        .map_or(f64::NAN, |s| s.value);
+    let by_near_clip = plateau.is_none() && plane.clip_floor.is_some_and(|f| top3x3 >= f);
     let kept = &mut scratch.verdict;
     let Some((a0, excluded)) = verdict_pixels(region, level, b0, kept) else {
         return Err(RefusalReason::MostlySaturated);
@@ -330,9 +449,12 @@ pub(crate) fn saturation_verdict(
         amplitude: f64::NAN,
         beta: f64::NAN,
         fwhm: f64::NAN,
-        saturated: by_plateau_clip,
+        saturated: by_plateau_clip || by_near_clip,
         by_amplitude: false,
         by_plateau_clip,
+        by_near_clip,
+        pixel0,
+        top3x3,
         fit: false,
         cross: false,
         iterations: 0,
@@ -371,7 +493,7 @@ pub(crate) fn saturation_verdict(
     verdict.beta = m.beta;
     verdict.fwhm = fwhm;
     verdict.by_amplitude = amplitude > plane.range;
-    verdict.saturated = verdict.by_amplitude || by_plateau_clip;
+    verdict.saturated = verdict.by_amplitude || by_plateau_clip || by_near_clip;
     verdict.fit = true;
     verdict.centred = super::fit::placement(
         (m.x0, m.y0),
@@ -1207,6 +1329,296 @@ mod tests {
             !v.fit && v.saturated && v.by_plateau_clip && !v.by_amplitude,
             "{v:?}"
         );
+    }
+
+    /// A pixel-integrated Moffat star (β 2.5, FWHM `fwhm`, amplitude `amp`, centre `(cx, cy)` in stamp coordinates) on
+    /// a 41 x 41 stamp at sky 0.04, clipped at 1.0 (Task 10c's fixtures).
+    fn clipped_star_region(amp: f64, fwhm: f64, cx: f64, cy: f64) -> Vec<PixelSample> {
+        clipped_star_region_on(0.04, amp, fwhm, cx, cy)
+    }
+
+    /// [`clipped_star_region`] on a local background `sky` (the plane's own stays 0.04).
+    fn clipped_star_region_on(sky: f64, amp: f64, fwhm: f64, cx: f64, cy: f64) -> Vec<PixelSample> {
+        let beta = 2.5;
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let offsets: Vec<f64> = (0..15).map(|i| (i as f64 + 0.5) / 15.0 - 0.5).collect();
+        let mut region = Vec::new();
+        for y in -20..=20 {
+            for x in -20..=20 {
+                let (x, y) = (x as f64, y as f64);
+                let mut sum = 0.0;
+                for &oy in &offsets {
+                    for &ox in &offsets {
+                        let r2 = (x + ox - cx).powi(2) + (y + oy - cy).powi(2);
+                        sum += (1.0 + r2 / (alpha * alpha)).powf(-beta);
+                    }
+                }
+                region.push(PixelSample {
+                    x,
+                    y,
+                    value: (sky + amp * sum / 225.0).min(1.0),
+                });
+            }
+        }
+        region
+    }
+
+    /// The plane of the near-clip fixtures: bg 0.04, clip 1.0 (range 0.96), an exact clip (three pixels at the maximum),
+    /// so its floor is the clip value itself.
+    fn exact_clip_plane() -> SaturationPlane {
+        let mut p = SaturationPlane::new(0.04, 0.002, 1.0, 1.0, false).with_max_count(3);
+        let (floor, _) = derive_clip_floor(&p, []).expect("a tie is evidence");
+        p.clip_floor = Some(floor);
+        p
+    }
+
+    fn near_clip_verdict(region: &[PixelSample]) -> SaturationVerdict {
+        near_clip_verdict_on(region, &exact_clip_plane())
+    }
+
+    fn near_clip_verdict_on(region: &[PixelSample], plane: &SaturationPlane) -> SaturationVerdict {
+        let mut s = FitScratch::default();
+        saturation_verdict(
+            region,
+            0.0,
+            0.0,
+            0.04,
+            1.8,
+            f64::INFINITY,
+            plane,
+            &FitParams::default(),
+            &mut s,
+        )
+        .expect("a verdict")
+    }
+
+    /// Task 10c (R10c-1): an undersampled star (FWHM 1.8 px) clipped on about one pixel has no plateau (its neighbours
+    /// sit well under 0.7·range), so clauses 1 and 2 may both miss; clause 3 flags it.
+    #[test]
+    fn an_undersampled_star_clipped_on_one_pixel_is_flagged_near_clip() {
+        let region = clipped_star_region(1.6, 1.8, 0.1, 0.05);
+        let v = near_clip_verdict(&region);
+        assert!(!v.plateau && v.by_near_clip && v.saturated, "{v:?}");
+    }
+
+    /// The test reads the 3x3 maximum, not pixel0: the seed one pixel off the clipped pixel (pixel0 about 0.6·range).
+    #[test]
+    fn near_clip_reads_the_3x3_maximum() {
+        let region = clipped_star_region(1.6, 1.8, 1.2, 0.0);
+        let p0 = region
+            .iter()
+            .find(|s| s.x == 0.0 && s.y == 0.0)
+            .expect("pixel0")
+            .value;
+        assert!(
+            (p0 - 0.04) / 0.96 < 0.7 && (p0 - 0.04) / 0.96 > 0.45,
+            "pixel0 {p0}"
+        );
+        let v = near_clip_verdict(&region);
+        assert!(!v.plateau && v.by_near_clip && v.saturated, "{v:?}");
+    }
+
+    /// A star whose top stands at 0.85·range (below the plane's floor, the exact clip) stays unflagged by the near-clip
+    /// clause.
+    #[test]
+    fn a_star_at_085_of_the_range_is_not_near_clip() {
+        let mut region = clipped_star_region(0.9, 2.5, 0.0, 0.0);
+        let top = region.iter().map(|s| s.value).fold(0.0, f64::max);
+        let k = (0.04 + 0.85 * 0.96 - 0.04) / (top - 0.04);
+        for s in region.iter_mut() {
+            s.value = 0.04 + (s.value - 0.04) * k;
+        }
+        // the plane max (range setter) is a brighter star elsewhere: range 0.96
+        let v = near_clip_verdict(&region);
+        assert!(!v.by_near_clip && !v.by_plateau_clip, "{v:?}");
+    }
+
+    // ---- Task 10c (R10c-10): the near-clip floor derived per plane ----
+
+    /// A hand-made verdict for the floor's evidence rules: only the fields the floor and clause 3 read are meaningful.
+    fn hand_verdict(
+        by_amplitude: bool,
+        by_plateau_clip: bool,
+        plateau: bool,
+        pixel0: f64,
+        top3x3: f64,
+    ) -> SaturationVerdict {
+        SaturationVerdict {
+            plateau,
+            level: 1.0,
+            excluded: 0,
+            amplitude: 1.0,
+            beta: 3.0,
+            fwhm: 3.0,
+            saturated: by_amplitude || by_plateau_clip,
+            by_amplitude,
+            by_plateau_clip,
+            by_near_clip: false,
+            pixel0,
+            top3x3,
+            fit: true,
+            iterations: 5,
+            cross: false,
+            centred: true,
+        }
+    }
+
+    /// Plane of the floor tests: bg 0.04, clip 1.0, range 0.96, in range units `v = bg + u·0.96`.
+    fn floor_plane() -> SaturationPlane {
+        SaturationPlane::new(0.04, 0.002, 1.0, 1.0, false)
+    }
+
+    fn at(u: f64) -> f64 {
+        0.04 + u * 0.96
+    }
+
+    /// With the floor derived, re-read clause 3 on a copy of `v`.
+    fn class_b(plane: &SaturationPlane, mut v: SaturationVerdict) -> bool {
+        mark_near_clip(plane, &mut v);
+        v.by_near_clip
+    }
+
+    /// An exact clip (two or more pixels at the plane max): the floor is the plane max, so a no-plateau star at
+    /// 0.95·range (inside the old fixed 0.9 band) is NOT class B, and one at the clip is.
+    #[test]
+    fn an_exact_clip_puts_the_floor_on_the_plane_max() {
+        let mut plane = floor_plane().with_max_count(4);
+        let (f, n) = derive_clip_floor(&plane, []).expect("a tie");
+        assert_eq!((f, n), (1.0, 1));
+        plane.clip_floor = Some(f);
+        assert!(!class_b(
+            &plane,
+            hand_verdict(false, false, false, at(0.7), at(0.95))
+        ));
+        assert!(class_b(
+            &plane,
+            hand_verdict(false, false, false, at(0.7), 1.0)
+        ));
+    }
+
+    /// A clip-free plane (a unique maximum; the brightest star at 0.9-0.99 of it flagged by one clause only) shows no
+    /// evidence: no floor, no class B whatever the star.
+    #[test]
+    fn a_clip_free_plane_has_no_floor_and_no_class_b() {
+        let plane = floor_plane();
+        let verdicts = [
+            hand_verdict(true, false, false, at(0.9), at(0.99)),
+            hand_verdict(false, true, true, at(0.93), at(0.95)),
+            hand_verdict(false, false, false, at(0.7), at(0.97)),
+        ];
+        assert_eq!(derive_clip_floor(&plane, &verdicts), None);
+        for v in verdicts {
+            assert!(!class_b(&plane, v), "{v:?}");
+        }
+    }
+
+    /// A flat-divided clip: certified cores (clauses 1 AND 2) spread over 0.97-1.03·range, so the floor is the lowest
+    /// pixel0; a one-pixel clip at 0.98 is class B, an unclipped no-plateau star at 0.93 is not.
+    #[test]
+    fn a_flat_divided_clip_spans_its_certified_cores() {
+        let mut plane = floor_plane();
+        plane.range = 1.04 * 0.96;
+        let cores = [
+            hand_verdict(true, true, true, at(1.03), at(1.03)),
+            hand_verdict(true, true, true, at(0.97), at(0.98)),
+            hand_verdict(true, true, true, at(1.0), at(1.01)),
+        ];
+        let (f, n) = derive_clip_floor(&plane, &cores).expect("three cores");
+        assert_eq!(n, 3);
+        assert!((f - at(0.97)).abs() < 1e-12, "{f}");
+        plane.clip_floor = Some(f);
+        assert!(class_b(
+            &plane,
+            hand_verdict(false, false, false, at(0.5), at(0.98))
+        ));
+        assert!(!class_b(
+            &plane,
+            hand_verdict(false, false, false, at(0.5), at(0.93))
+        ));
+    }
+
+    /// An unclipped wide star (F 7.5) passes the plateau test with a fitted amplitude under the range: clause 2 alone,
+    /// not clause 1, so it certifies nothing and the plane has no floor.
+    #[test]
+    fn an_unclipped_wide_plateau_star_sets_no_floor() {
+        let plane = floor_plane();
+        let region = clipped_star_region(0.93 * 0.96, 7.5, 0.0, 0.0);
+        let v = near_clip_verdict_on(&region, &plane);
+        assert!(v.plateau && v.by_plateau_clip && !v.by_amplitude, "{v:?}");
+        assert_eq!(derive_clip_floor(&plane, [&v]), None);
+    }
+
+    /// A certified core whose 3x3 maximum overshoots pixel0 (debayer overshoot): the floor is pixel0, not the maximum.
+    #[test]
+    fn the_floor_reads_pixel0_not_the_3x3_maximum() {
+        let plane = floor_plane();
+        let core = hand_verdict(true, true, true, at(0.96), at(1.07));
+        let (f, _) = derive_clip_floor(&plane, [&core]).expect("a core");
+        assert!((f - at(0.96)).abs() < 1e-12, "{f}");
+    }
+
+    /// The pins: a floor is never below `bg + 0.9·range` (class B is inside the knot exemption's band), the UNTESTED
+    /// plane has none, and a plane without evidence flags no class B.
+    #[test]
+    fn floor_pins() {
+        let plane = floor_plane().with_max_count(2);
+        let certified = hand_verdict(true, true, true, at(0.9), at(0.9));
+        let (f, _) = derive_clip_floor(&plane, [&certified]).expect("evidence");
+        assert!(f >= plane.bg + 0.9 * plane.range - 1e-12, "{f}");
+        let (f, _) = derive_clip_floor(&plane, []).expect("tie");
+        assert!(f >= plane.bg + 0.9 * plane.range - 1e-12, "{f}");
+        assert_eq!(
+            derive_clip_floor(&SaturationPlane::UNTESTED.with_max_count(5), [&certified]),
+            None
+        );
+        let empty = floor_plane();
+        assert_eq!(empty.clip_floor, None);
+        assert!(!class_b(
+            &empty,
+            hand_verdict(false, false, false, at(0.9), 1.0)
+        ));
+    }
+
+    /// I-1: clause 3 on its own. A sharp star on a RAISED local background, clipped on one or two pixels: the fitted
+    /// amplitude (above the local sky) stays under the range and no plateau forms, so clauses 1 and 2 both miss and
+    /// only the near-clip clause flags it. The lab has 27 such stars on neb3_4096 (the raised-background family) and
+    /// 0 on any flat-sky family: the scan over flat sky below finds what it finds.
+    #[test]
+    fn a_clipped_star_on_a_raised_background_is_flagged_by_clause_3_alone() {
+        let plane = exact_clip_plane();
+        let mut found = Vec::new();
+        for sky in [0.25, 0.35, 0.45] {
+            for amp in [0.6, 0.7, 0.8] {
+                for (cx, cy) in [(0.0, 0.0), (0.2, 0.1), (0.35, 0.3)] {
+                    let region = clipped_star_region_on(sky, amp, 1.8, cx, cy);
+                    let v = near_clip_verdict_on(&region, &plane);
+                    if v.by_near_clip && !v.by_amplitude && !v.by_plateau_clip {
+                        found.push((sky, amp, cx, cy));
+                    }
+                }
+            }
+        }
+        assert!(
+            !found.is_empty(),
+            "no raised-background star isolates clause 3"
+        );
+    }
+
+    /// The review's flat-sky scan (amplitude 1.0-1.3 × sub-pixel offsets, sky 0.04, FWHM 1.8): records how many stars
+    /// only clause 3 flags there. The lab's count on its flat-sky families is 0 (27 on neb3_4096).
+    #[test]
+    fn the_flat_sky_scan_of_clause_3_alone() {
+        let plane = exact_clip_plane();
+        let mut only3 = 0;
+        for amp in [1.0, 1.1, 1.2, 1.3] {
+            for (cx, cy) in [(0.0, 0.0), (0.1, 0.05), (0.25, 0.2), (0.4, 0.4), (0.5, 0.5)] {
+                let v = near_clip_verdict_on(&clipped_star_region(amp, 1.8, cx, cy), &plane);
+                if v.by_near_clip && !v.by_amplitude && !v.by_plateau_clip {
+                    only3 += 1;
+                }
+            }
+        }
+        assert_eq!(only3, 0, "flat sky: clause 3 never flags alone");
     }
 
     // ---- F-5 (Plan A Task 10): the star flux ----

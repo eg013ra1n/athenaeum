@@ -327,6 +327,11 @@ pub struct PlaneMeasurement {
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present pixels in their `[10F, 12F]`
     /// ring outside every seed's `3F` disc, or no frame FWHM on the plane).
     pub ring_sky_missing: usize,
+    /// The plane's near-clip floor (Task 10c, R10c-10) in range units, `(floor - bg) / range`; `None` = the plane showed
+    /// no clipped evidence and has no near-clip class.
+    pub clip_floor: Option<f64>,
+    /// How many pieces of evidence set the floor ([`SaturationPlane::clip_evidence`]).
+    pub clip_evidence: usize,
     /// What the module's matched filter measured besides its seeds (Task 10b, F-10): the detection noise σ_f (propagated
     /// and measured), the noise gain, the structure seeds dropped and the extended flags; `None` for given seeds.
     pub detection: Option<DetectionReport>,
@@ -581,10 +586,27 @@ fn prepare_working(
         )
     };
     // Already inside this `install`: the pass's own pool param gets `None` (perf tier 1 Task 2).
-    let (fit_field, passes) = match pool {
+    let (fit_field, mut passes) = match pool {
         Some(p) => p.install(pass_call),
         None => pass_call(),
     };
+    // The plane's near-clip floor (Task 10c, R10c-10) comes from the plane's own verdicts, so clause 3 is re-read here,
+    // before the cross-plane rule; level and fit are untouched.
+    let mut saturation = saturation;
+    let floor = photometry::derive_clip_floor(
+        &saturation,
+        passes.iter().filter_map(|p| match &p.verdict {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }),
+    );
+    saturation.clip_floor = floor.map(|(f, _)| f);
+    saturation.clip_evidence = floor.map_or(0, |(_, n)| n);
+    for pass in passes.iter_mut() {
+        if let Some(Ok(v)) = pass.verdict.as_mut() {
+            photometry::mark_near_clip(&saturation, v);
+        }
+    }
     PlanePrep {
         noise,
         sky,
@@ -687,6 +709,10 @@ fn finish_working(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         ring_sky_missing: outcome.ring_sky_missing,
+        clip_floor: saturation
+            .clip_floor
+            .map(|f| (f - saturation.bg) / saturation.range),
+        clip_evidence: saturation.clip_evidence,
         detection,
         timings,
     }
@@ -710,14 +736,23 @@ fn saturation_plane(
         Domain::Calibrated { .. } => (ADU_SCALE as f64, ADU_SCALE as f64),
         Domain::RawAdu { full_scale, .. } => (1.0, *full_scale),
     };
-    // The maximum of the finite, unmasked values: order-free, so read in parallel.
-    let plane_max = working
+    // The maximum of the finite, unmasked values and how many pixels equal it (an exact clip has two or more): both
+    // order-free, so read in one parallel reduce.
+    let (plane_max, max_count) = working
         .par_iter()
         .enumerate()
         .filter(|&(i, v)| v.is_finite() && mask.map_or(true, |m| m[i]))
-        .map(|(_, &v)| v as f64)
-        .reduce(|| f64::NEG_INFINITY, f64::max);
+        .map(|(_, &v)| (v as f64, 1usize))
+        .reduce(
+            || (f64::NEG_INFINITY, 0),
+            |a, b| match a.0.partial_cmp(&b.0) {
+                Some(std::cmp::Ordering::Greater) => a,
+                Some(std::cmp::Ordering::Less) => b,
+                _ => (a.0, a.1 + b.1),
+            },
+        );
     SaturationPlane::new(sky.median * scale, noise.sigma, plane_max, norm, colour)
+        .with_max_count(max_count)
 }
 
 /// The refit entry point LN uses (PA-6): every seed fitted at `beta`. The plane is in the module's working units
@@ -999,6 +1034,9 @@ mod tests {
             saturated,
             by_amplitude: saturated,
             by_plateau_clip: false,
+            by_near_clip: false,
+            pixel0: f64::NAN,
+            top3x3: f64::NEG_INFINITY,
             fit: true,
             cross: false,
             iterations: 12,

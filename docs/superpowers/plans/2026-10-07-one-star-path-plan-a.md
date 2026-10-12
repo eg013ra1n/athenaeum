@@ -3785,8 +3785,91 @@ and the no-regression table hold as everywhere.
 **Inputs.** 10b's S.3 report (the mechanism split per frame), D2's `M0000_sample.png` and its dumps
 (`t10-scratch/d2/out/`), Task 8's verdict and row 10.
 
-**Files / Steps:** to be written after 10b's joint cycle (lean execution: one design read, one implementer, ONE lab
-step judging the bar above with the F-3 rows; a miss goes to the owner with its numbers).
+**Files / Steps** (written 2026-10-12 from the design read `task-10c-report-design.md`; rulings R10c-0…R10c-6 in
+`task-10c-rulings.md`; lean execution: one design read, one implementer, ONE lab step judging the bar with the F-3
+rows; a miss goes to the owner with its numbers).
+
+**The bar as fixed before code (R10c-0).** The literal min–max form fails at the head and after any fix for a reason
+outside this task (0002's own PSF, β 4.9–5.6 in every brightness bin), so the bar is the robust form, M = the 11 other
+M42 mono2 L calibrated frames, C = the hc11B L replica 0000–0009, s = 1.4826·MAD, SE_j the bootstrap SE (2000×) of
+frame j's median over its own β sample: **B1** |β₀₀₀₀ − med M| / √(s_M² + SE₀²) ≤ k, k the largest such z any of the
+21 clean frames produces left out against the rest of its own set (same run); **B2** SE₀/β₀₀₀₀ ≤ the largest SE_j/β_j
+of the clean frames; **B3** s_M/med M ≤ s_C/med C. Head: 31.777 (SE 15.89): B1 1.79 ≤ 3.11, B2 0.500 > 0.144, B3
+0.088 ≤ 0.207 → FAIL. Predicted after the class: 7.568 (1.13): B1 3.69 ≤ 4.31, **B2 0.149 > 0.059 → FAIL** (M00's
+brightest unclipped stars, r0 0.8–0.9, read β 7.7 against 4.4–5.0 for its faint stars; diag D-M00).
+
+**Files.** `star_measure/photometry.rs` (one near-clip test on `SaturationPlane`: the 3×3 maximum about the seed pixel
+≥ bg + 0.9·range; clause 3 `by_near_clip` in `saturation_verdict` when the plateau test did not pass; the
+`SaturationVerdict.by_near_clip` field), `star_measure/seeds.rs` (`near_clip` calls the same test — the knot exemption
+and the flag read one quantity), `star_measure/beta.rs` (test), `examples/star_probe.rs` (`byNearClip`); spec §2.1 and
+the owned-quantities row, README R-OSP-7c, this task's Outcome.
+
+- [x] Phase A (implementer): the class, tests that fail first (`an_undersampled_star_clipped_on_one_pixel_is_flagged_near_clip`,
+  `near_clip_reads_the_3x3_maximum`, `the_sample_skips_near_clip_stars`, the near-clip pins), the F14 sweep named;
+  release probe frame β on M42 and the hc11B L replica equal to the design read's a3 column; core `--all-targets`,
+  `--no-default-features`, `--examples` green; one commit on `one-star-path-t10c-wip`.
+- [x] Diag D-M00 (beside Phase A): the mechanism of M00's bright-star β and whose job it is (its "doubled frame"
+  reading rejected by the owner, R10c-6).
+- [x] ONE lab step (runner, judgment run): the bar B1–B3; F-3 twins 48 / 48 (F ≤ 1 %, β void where either twin
+  > 10); row 10 FN ≤ 0.5 % mono and OSC (predicted 0 / 12 169, 0 / 1 229), FP reported (predicted 1.02 % / 0.54 %);
+  no-regression 0 moved outside the design list (the 19 β and 9 F planes of `t10-scratch/10c/labeval/a3.vs_base.tsv`;
+  234 planes change their flagged set); control 0.
+- [x] The remainder (B2) ruled before the lab step (owner 2026-10-12, after a Fable review of the plan,
+  `task-10c-review-fable-plan.md`): M42 0000 is a clean frame (sources identical by eye, the reference program's ecc
+  +0.001); its β 7.6 after the class is the frame β estimator's error — a one-sided shoulder in 0000's mean profile
+  (ePSF cut +1 / +1.5 / +2 px: 0.53 / 0.45 / 0.26 vs 0001 0.59 / 0.33 / 0.16) that a single Moffat cannot represent,
+  turned into a flat top by between-pixel cores and over-picked by the peak-ranked sample (53 % vs 32 %); ≈ 1 % of
+  0000's FWHM. B2 is reported as a KNOWN MISS owned by Task 11b (F-4b), not a frame property.
+- [x] Fix round (R10c-8 → R10c-10, added 2026-10-12): the fixed band's false positives cost frame ecc on lab truth,
+  so the floor is derived per plane — design round D2 (`task-10c-report-design2.md`, arm cc), Phase A2 (one
+  implementer), the lab step `t10c-floor` (bars: FN ≤ 0.5 %, FP ≈ base, C-11 ≈ a1c's, M42 B1 / B3 pass).
+- [x] Review (`review-t10c.md` on 9f2cafc7, `review-t10c-2.md` on 7933f582); docs as built (spec §2.1 and F-3, README
+  R-OSP-7c, this Outcome). Ledger items (Fable (d)): on a clip-free plane `range = min(plane max, norm) − bg` puts the
+  brightest CLEAN star in the 0.9·range band (266 lab FP) — a limit Task 11b's sample rule must not inherit; the
+  per-frame split share of the β sample before / after the class (11b's premise). Both carried below.
+- [x] Squash the WIP branch onto `one-star-path` as one commit (the controller, 2026-10-12): WIP `one-star-path-t10c-wip`
+  9f2cafc7 (the class, fixed band) → 7933f582 (the floor derived per plane) → 511087dd (review-2 comment minors) →
+  1c3d8bf2 (these docs), one squashed commit on `one-star-path`; core all targets green before the push (GitLab only).
+
+**Recorded, not built (R10c-2…R10c-5).** β 1.5 stays a clamp (a post-fit reject is a truncated median that biases β
+up near the bound; LDN mono's 1.5 is a whole-frame property → the later fit-design task); the M42 plateau seeds move
+nothing once the class is in (if wanted, one seed per clipped component in `seeds.rs`, F-1's owner); PSFSW's
+saturated share (0.79–0.90 M42, 0.77–0.82 hc11B L; `frame.rs::signal_totals` reads no flag; relative M42 weights 0.40–1.00
+→ 0.82–1.00 with flagged fits out) → Task 13; D0099's β 99.96 at every brightness → Task 13's frame classes.
+
+**Outcome (2026-10-12).** Commits (athenaeum, WIP branch `one-star-path-t10c-wip` from 3deb6cb5, to be squashed as
+ONE F-3 commit on `one-star-path`): 9f2cafc7 (Phase A: clause 3 at the fixed 0.9·range band, one
+`SaturationPlane::near_clip` shared with the knot exemption; probe β / F / unsat equal to the design read's a3 column
+on all 27 planes), 7933f582 (Phase A2: the clip floor derived per plane, R10c-10; the fixed band's F14 fixtures and the
+four `stacking/measure.rs` re-pins reverted to 3deb6cb5's numbers; review 1's I-1 / I-2 / M-2 fixed, M-1 moot; core
+lib 3871 passed / 0 failed / 9 ignored), then this docs commit. Design reads `task-10c-report-design.md` (bar R10c-0,
+arms a / a3 / b / r15 / ps / r3.0) and `task-10c-report-design2.md` (round D2, arm cc); diag D-M00
+`task-10c-report-M00.md` (its "doubled frame" reading REJECTED by the owner, R10c-6); Fable's plan review
+`task-10c-review-fable-plan.md` (R10c-7). Lab (athenaeum-lab, runner): `t10c-nearclip` at 9f2cafc7 (lab 2971210) —
+B1 3.69 ≤ 4.31, B3 0.071 ≤ 0.210, B2 0.149 > 0.059 (the known miss), twins 48 / 48, FN 0 / 11 778 · 0 / 1 229, FP
+1.047 % / 0.543 %, every held bar ok, but C-11's frame ecc WORSE on 68 planes; L2 (same lab commit,
+`l2-ecc-split.txt`) split it: the fixed band's FP set change, 0 truth-saturated among 871 newly flagged → R10c-8, and
+`trails_i0` F referee-dependent → R10c-9. `t10c-floor` at 7933f582 (lab 7eb48fb) **every bar met, B2 the known miss**:
+β₀₀₀₀ 31.777 → 7.568 (SE 1.173), B1 3.60 ≤ 5.39, B3 0.051 ≤ 0.207, B2 0.155 > 0.046; twins 48 / 48 (F worst 0.69 %,
+β 6.8 %); FN 4 / 11 778 (= base) · 0 / 1 229; FP 0.244 % / 0.410 % (base 0.242 / 0.397); 0 of 333 planes moved vs
+base; C-11 frame ecc vs a1c max +0.00145, 0 planes over +0.002; seeds identical 391 / 391; item 1 58 / 58; lab_cycle
+0 MISS in 70 + 20; `c_judge` 82 ok; S.1 0.81 %; M.1 76.8 s; same-star 0 WORSE; one letter-STOP (a new C-11 WORSE
+plane, `osc_pairs/f3.5` t3 p0, 1× the line) accepted as R10c-11. Reviews: `review-t10c.md` (9f2cafc7: Ready with
+fixes, 0 / 2 / 3; M-3 = R10c-9's wording here), `review-t10c-2.md` (7933f582: Ready, 0 / 0 / 3; M-2 / M-3 = the floor's
+limits (f) / (g), in spec §2.1 and README; the code comments are the controller's). Rulings index (README R-OSP-7c,
+one line each): R10c-0 the bar; R10c-1 the class (a3); R10c-2 the clamp; R10c-3 plateau seeds; R10c-4 PSFSW → Task
+13; R10c-5 D0099 → Task 13; R10c-6 the 0000 remainder (corrected by the owner); R10c-7 the order and Task 11b; R10c-8
+the fix round; R10c-9 trails wording; R10c-10 the derived floor; R10c-11 L3's letter-STOP. README R-OSP-7c complete
+(the C table, the per-frame β table, limits (a)–(g)); spec §2.1 (the clip floor), §3 F-3 as built and as judged, the
+owned-quantities table and §5 follow it.
+
+Carries. **Task 11b:** B2 (0000's β 7.568, SE 1.173: 0.155 > 0.046) with its truth family, gate zero and arms
+(R10c-7); Fable's ledger items — (1) the clip-free plane's brightest clean star at the range: out of class B since
+the floor (0 lab planes moved, FP back to base), still flagged by clauses 1 and 2 (limit (e)), so 11b's sample rule
+must not inherit it; (2) the β sample's split share per frame before / after the class (D-M00 at the fixed band: 0000
+53 % vs 32 % in the population), to be read at 7933f582 as 11b's premise. **Task 13:** PSFSW (R10c-4) and D0099
+(R10c-5), already in its text. **The later fit-design task:** LDN mono's β 1.5 (R10c-2; a 3F region floor 1.50 →
+1.78). **F-1's seeds, if wanted:** one seed per clipped component (R10c-3).
 
 ---
 
@@ -3975,6 +4058,47 @@ feat(star_measure): F-6 per-star SNR (S/σ_S with the EGAIN x ATH_CSCL gain, the
 
 ---
 
+### Task 11b: F-4b — a frame-level β (spec §3 F-4; inserted 2026-10-12, owner: "согласен" to the Fable-reviewed order)
+
+**Stub: scope, truth and bars fixed now; Files / Steps after Task 11.** Order 10c → 11 → 11b → 12: Task 11 reads no
+β, this step has an unknown-size lab and fitter component, and Task 12 budgets the FINAL Measure cost. Evidence:
+`task-10c-report-design.md`, `task-10c-report-M00.md` (its "doubled frame" reading rejected by the owner),
+`task-10c-review-fable-plan.md`, figure `t10-scratch/10c-m00/png/owner_doubled.png`.
+
+**The defect.** After Task 10c, M42 0000's frame β reads 7.6 against 2.6–4.8 on its 11 siblings (bar R10c-0 B2 miss):
+its unflagged fits whose core falls between two pixels read point β 9.4 against 3.8 for pixel-centred cores (0001
+4.8 / 4.4, 0008 3.4 / 3.2); the pixel-integrated sample β 9.78 / 4.91. Mechanism (Fable): a one-sided shoulder in the
+frame's mean profile (≈ 12 % of peak at +1.5 px; invisible to the eye and to ecc) that the single elliptical Moffat
+cannot represent × the between-pixel flat top × the peak-ranked sample. NOT pixel phase on symmetric stars (research
+F4: the pixel-integrated model is phase-invariant within 0.1–0.7 % there; 0008 at F 1.62 shows none). Size: ≈ 1 % of
+0000's FWHM (2.342 → 2.267 with the class); 0000 stays the widest frame by ≥ 8 % at any β. The step opens with a
+definition and a referee (β exists for the at-β fits' FWHM and F-5's flux), not with candidates ("re-audit, stop
+patching": E5, R2, A3, A4, the centred sample, the near-clip class all moved β).
+
+**Truth family (lab; reuse, never rebuild).** The existing `ComaPsf` generator (`star-lab/starlab/families.py`: a round
+Moffat core holding `core` of the flux, the rest displaced by d) extended to F 1.6–2.4, core 0.70–0.85, d 0.5–0.8 F,
+random sub-pixel phases; the symmetric m-family at the same F and SNR as the control. **Gate zero: HEAD must FAIL the
+family the way 0000 fails (split / single ≥ ≈ 2 on some cell, a bimodal sample) — else the family lacks the mechanism:
+STOP, the owner is told, no code.**
+
+**Bars (derived, never a fixed 10 %).** (1) Phase invariance: |β_split − β_single| / β ≤ the symmetric control's own
+split spread at the same F and SNR. (2) The consequence: frame FWHM vs the family's model-free half-max (pixbox) within
+F-4's 1 % / 3 %. (3) The M42 bar B1–B3 as fixed in R10c-0, plus 0000's frame FWHM vs its ePSF half-max. (4) No
+regression on the 337 lab planes, the F-3 twins, item 1 ≥ 56 / 58, the Measure wall.
+
+**Candidates, in order (one instrumented build, env-gated arms, the 10c design-read pattern):** (1) one joint sample
+fit — β, α_x, α_y, θ shared by the frame, (x, y, A, B) per star over the 64 stars' pixels at once (block-diagonal LM);
+(2) a shape-anchored β whose model growth curve matches the sample's measured one (F-5's 5F growth sums); (3) the sample
+rule — rank by F-5 flux inside the band below 0.9·range so the sample is not peak-selected (an arm: it moves every
+frame). Task 10b's 3F region floor (RB3) as an arm beside each. Out of scope: the pixel-phase centroid correction
+(other quantity, ruled outside Plan A), C-12d (ecc's shape region), any per-star model change.
+
+**Steps:** (i) the lab: the `coma` grid, gate zero on HEAD, the bars (one runner task); (ii) the design read with the
+arms, judged on the family, the M42 bar and the no-regression table; (iii) one implementer for the winning arm; spec
+F-4 and the owned-quantities row; Task 13's M42 line closed with the numbers.
+
+---
+
 ### Task 12: The Analysis mode and the budget — Plan C's interface, the cost bars (spec D-3, §2.1 `budget`, §3 budget and cost)
 
 **Files:**
@@ -4105,6 +4229,11 @@ diffs 0 moved; control 0. A cost miss → the owner with the walls before Task 1
 Measure-wall read moved out of this task: W.1, T.1–T.3, M.1 are 10b's bars; the M42 β bar is 10c's (10b reports it,
 S.3). This checkpoint owns no fix: a miss here goes back to its owner task as a fix round, and the checkpoint re-runs.
 It reports the M42 β spread at master level and the OSC LN reference R-plane `c` SE (2.19 % at Task 10).
+
+**Carried in by Task 10c (R10c-4, R10c-5).** PSFSW: `frame.rs::signal_totals` sums every accepted fit and reads no
+flag; the saturated share of TFlux is 0.79–0.90 on M42 and 0.77–0.82 on hc11B L; relative M42 weights 0.40–1.00 →
+0.82–1.00 with flagged fits out — the weights' owner judges it against the ERP at master level. D0099 (LDN 1272)
+reads β 99.96 at every brightness (F 4.1 vs the set's 2.0) — a frame-class item (defocused / flat-topped).
 
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
 `harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,

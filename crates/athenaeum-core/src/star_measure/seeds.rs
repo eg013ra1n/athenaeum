@@ -33,7 +33,7 @@ use tracing::{debug, warn};
 use super::beta::BETA_BOUNDS;
 use super::domain::{self, BackgroundMesh, NoiseModel, NoiseSource};
 use super::fit::{Seed, WIDTH_START_MIN_PEAK_SNR};
-use super::photometry::{SaturationPlane, PLATEAU_RANGE};
+use super::photometry::SaturationPlane;
 use super::robust::median_f64;
 use super::PixelNoise;
 use crate::integration::stats::{for_each_stratified, mad_about, median_in_place, MAD_TO_SIGMA};
@@ -1013,8 +1013,8 @@ impl KnotSigma<'_> {
 }
 
 /// The knot exemption (ruling A3; Task 8's owned range, never a new maximum): the brightest present pixel of the 3×3
-/// about the seed stands within the plateau-clip clause's band of the clip, `top − bg ≥ (1 − PLATEAU_RANGE)·range`
-/// ([`SaturationPlane`]). No saturation plane (a standalone [`detect`]): no seed is near the clip.
+/// about the seed stands within the plateau band of the clip ([`SaturationPlane::near_clip`], the same function the
+/// saturation verdict's near-clip clause calls). No saturation plane (a standalone [`detect`]): no seed is near the clip.
 fn near_clip(
     plane: &[f32],
     mask: Option<&[bool]>,
@@ -1027,19 +1027,21 @@ fn near_clip(
         return false;
     };
     let (cx, cy) = (s.x.round() as i64, s.y.round() as i64);
-    let mut top = f64::NEG_INFINITY;
+    let mut vals = [f64::NAN; 9];
+    let mut k = 0;
     for yy in cy - 1..=cy + 1 {
         for xx in cx - 1..=cx + 1 {
             if xx < 0 || yy < 0 || xx >= w as i64 || yy >= h as i64 {
                 continue;
             }
             let i = yy as usize * w + xx as usize;
-            if plane[i].is_finite() && mask.map_or(true, |m| m[i]) {
-                top = top.max(plane[i] as f64);
+            if mask.map_or(true, |m| m[i]) {
+                vals[k] = plane[i] as f64;
+                k += 1;
             }
         }
     }
-    top - sat.bg >= (1.0 - PLATEAU_RANGE) * sat.range
+    sat.near_clip(vals)
 }
 
 /// What the module's matched filter measured on one plane besides its seeds (Task 10b, F-10): the detection noise of
@@ -2976,5 +2978,67 @@ mod tests {
         );
         let g = m.detection.as_ref().expect("detection report").noise_gain;
         assert!(g >= 1.4 && g.is_finite(), "contradiction reads: {g}");
+    }
+
+    /// Task 10c pin (R10c-10): the knot exemption's `near_clip` is the fixed 0.9·range band, read before any verdict;
+    /// the verdict's near-clip clause reads the plane's derived floor, which is never below that band. With the floor
+    /// AT the band the two agree on a clipped star, a star at 0.95·range, one at 0.85·range and a faint star; with a
+    /// floor above it (the exact clip, 1.0) class B is a subset of the exemption's set.
+    #[test]
+    fn the_verdict_near_clip_equals_the_seed_near_clip() {
+        use crate::star_measure::fit::{FitParams, FitScratch};
+        use crate::star_measure::photometry::saturation_verdict;
+        use astroimage::analysis::fitting::PixelSample;
+        let (w, h) = (21usize, 21usize);
+        let bg = 0.04;
+        let plane = SaturationPlane::new(bg, 0.002, 1.0, 1.0, false);
+        let at_band = plane.with_clip_floor(Some(bg + 0.9 * plane.range));
+        let at_clip = plane.with_clip_floor(Some(1.0));
+        for top in [1.0f64, 0.95, 0.85, 0.3] {
+            let mut data = vec![bg as f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let r2 = ((x as f64 - 10.0).powi(2) + (y as f64 - 10.0).powi(2)) / 2.0;
+                    data[y * w + x] = (bg + (top - bg) * (1.0 + r2).powf(-2.5)) as f32;
+                }
+            }
+            let seed = Seed {
+                x: 10.0,
+                y: 10.0,
+                peak: top,
+                flux: top,
+            };
+            let region: Vec<PixelSample> = (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .map(|(x, y)| PixelSample {
+                    x: x as f64 - 10.0,
+                    y: y as f64 - 10.0,
+                    value: data[y * w + x] as f64,
+                })
+                .collect();
+            let verdict = |p: &SaturationPlane| {
+                saturation_verdict(
+                    &region,
+                    0.0,
+                    0.0,
+                    bg,
+                    1.8,
+                    f64::INFINITY,
+                    p,
+                    &FitParams::default(),
+                    &mut FitScratch::default(),
+                )
+                .expect("a verdict")
+            };
+            let v = verdict(&at_band);
+            let seeds_says = near_clip(&data, None, w, h, &seed, Some(&plane));
+            assert_eq!(v.by_near_clip, seeds_says && !v.plateau, "top {top}: {v:?}");
+            let v = verdict(&at_clip);
+            assert!(
+                !v.by_near_clip || seeds_says,
+                "top {top}: class B outside the exemption"
+            );
+            assert_eq!(seeds_says, top - bg >= 0.9 * (1.0 - bg), "top {top}");
+        }
     }
 }

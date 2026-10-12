@@ -2875,3 +2875,137 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       base's own 1.21 - faint real stars; 1 213 unfitted, 653 of them on the clipped Trapezium core plateau - Task 10c);
       `neb0.1` false seeds 0 → 13 (3.1 per Mpx); `donut/r10` `nothing` seeds 14 → 315 (since A1; donut accepted 0); the
       debt check against t01c OPEN on three scatter rows (Task 14 judges).
+  - **R-OSP-7c - the saturation flag's near-clip class: clause 3, read against a clip floor derived per plane (F-3,
+    Plan A Task 10c, rulings R10c-0 … R10c-11 below; no `MEASURE_VERSION` bump, PA-4; the floor is not persisted).**
+    *As built (9f2cafc7 the class at the fixed 0.9·range band; 7933f582 the floor derived per plane).* Clause 3
+    `by_near_clip`: the plateau test did not pass AND the 3×3 maximum about the seed pixel (`SaturationVerdict.top3x3`,
+    the region's present pixels) ≥ the plane's clip floor; `saturated` = clause 1 (A > range) ∨ clause 2 (plateau ∧
+    pixel0 − bg ≥ 0.9·range) ∨ clause 3; it holds when the verdict fit fails; level and fit unchanged. The floor
+    (`photometry::derive_clip_floor`, once per plane after the verdict pass, before the multi-plane rule;
+    `mark_near_clip` re-reads clause 3): evidence = the plane max when ≥ 2 present pixels equal it (`max_count`, from
+    the plane-max reduce, no extra pass) ∪ pixel0 of every seed clauses 1 AND 2 both flag; floor = min, no margin;
+    none → `clip_floor = None` → no class B. Floor ≥ bg + 0.9·range always, so class B ⊆ the knot exemption's
+    `SaturationPlane::near_clip`, which keeps the fixed band (it runs before any verdict) — R10c-1's "one function"
+    is now a documented superset; detection unchanged. Probe: frame `clipFloor` (range units, null = no evidence) and
+    `clipEvidence`, verdict `byNearClip` and `top3x3` (both `PlaneMeasurement`s carry `clip_floor` / `clip_evidence`).
+    Spec §2.1 (the clip floor, limits (a)–(g)) and §3 F-3 "as built" follow it. The fixed band's F14 fixture changes
+    and the four `stacking/measure.rs` re-pins (149 → 122, 144 → 125) were reverted at 7933f582: a clip-free plane has
+    no class B, so they hold at 3deb6cb5's numbers again; the β test adds noise before the clip (an exact tie).
+    - **R10c-0 the bar (fixed before code).** The stub's min–max form fails for reasons outside 10c (0002's own PSF,
+      β 4.9–5.6 in every bin), so the robust form (`bar3.py`): M = the 11 other M42 mono2 L calibrated frames, C = the
+      hc11B L replica 0000–0009, s = 1.4826·MAD, SE_j the 2000× bootstrap SE of frame j's median; **B1** z₀ =
+      |β₀₀₀₀ − med M| / √(s_M² + SE₀²) ≤ k (k = the worst clean frame left out of its own set); **B2** SE₀/β₀₀₀₀ ≤ the
+      clean frames' max SE_j/β_j; **B3** s_M/med M ≤ s_C/med C. Head 31.777 (SE 15.89): B1 1.79 ≤ 3.11, B2 0.500 >
+      0.144, B3 0.088 ≤ 0.207 → FAIL.
+    - **R10c-1 the class (arm a3).** Plateau failed ∧ 3×3 max ≥ bg + 0.9·range (the knot exemption's own reading);
+      censoring (b) rejected (an unconstrained undersampled core reads β 98 on 0000). Costs recorded then: FP mono 0.23 →
+      1.02 %, OSC 0.40 → 0.54 % (974 of +1 213 at 0.90–0.98 of an exact clip, 266 the brightest stars of clip-free
+      planes); 19 β / 9 F lab cells moved; real `c` −1.7 … +2.9 %. Superseded in its level by R10c-10.
+    - **R10c-2 β 1.5: the clamp stays** (`BETA_AT_CAP`). A post-fit reject is a truncated median biasing β up (LDN
+      mono 1.5 → 2.68 at head, 4.0 fallback after a3); 0 of 337 lab planes move. LDN mono's 1.5 is a whole-frame
+      property → the later fit-design task (RB3; a 3F region floor 1.50 → 1.78).
+    - **R10c-3 plateau seeds: not this class.** With the class, the 683 / 855 plateau seeds on 0000 / 0008 move no β,
+      F or `c`; dropping them loses 16 flagged big-star records. If wanted: one seed per clipped component (F-1's seeds).
+    - **R10c-4 PSFSW → Task 13.** `frame.rs::signal_totals` sums every accepted fit, reads no flag; saturated share of
+      TFlux 0.79–0.90 (M42), 0.77–0.82 (hc11B L); relative M42 weights 0.40–1.00 → 0.82–1.00 with flagged fits out.
+    - **R10c-5 stale premise.** LDN 1272 0099 reads β 99.96 at every brightness (5 near-clip of 64, not 63; F 4.1 vs
+      2.0) → Task 13's frame classes (defocused / flat-topped).
+    - **R10c-6 the 0000 remainder, corrected by the owner.** The diag D-M00 read 0000 as a "doubled frame" (ePSF lobe
+      at 1.58 px, 0.28 of peak; asymmetry 0.211 vs 0.136–0.188); **REJECTED**: frames 0000 / 0001 are visually
+      identical and the comparison program's ecc differs by 0.001 (ours 0.656 / 0.652). 0000 is clean; its β 7.6 is
+      OUR frame-β estimator's error (between-pixel cores read point β 9.4 vs 3.8 centred), not a frame property.
+    - **R10c-7 the order (owner, after Fable's plan review).** 10c ships; B2 is a known miss owned by the new Task 11b
+      (F-4b, a frame-level β; truth = the lab's `ComaPsf` extended to F 1.6–2.4, gate zero = HEAD fails it as 0000
+      does; arms joint 64-star fit / growth-curve β / flux-ranked sample, the 3F floor beside); order 10c → 11 → 11b
+      → 12. Fable's mechanism: a one-sided shoulder in 0000's mean profile (ePSF +1 / +1.5 / +2 px 0.53 / 0.45 / 0.26
+      vs 0001 0.59 / 0.33 / 0.16) a single Moffat cannot represent × the between-pixel flat top × the peak-ranked
+      sample (53 % split vs 32 % in the population); ≈ 1 % of 0000's FWHM.
+    - **R10c-8 the fixed band's FP has a truth cost → a fix round.** L2: the C-11 frame-ecc WORSE (68 planes) is the
+      SET change — 871 newly flagged stars, 0 truth-saturated, 843 truth-unsaturated, the brightest (filterSnr 3–15×
+      the rest); truthcheck +0.03…+0.07, `neb3` +0.025, `neb3_4096` +0.024, twins +0.002 (refit Δ ≤ 0.0004). Not
+      accepted as a limit (raw frames clip exactly, like truthcheck): the floor derived per plane; bars FN ≤ 0.5 %, FP
+      ≈ base, C-11 ≈ a1c's, M42 B1 / B3 pass.
+    - **R10c-9 trails wording.** `trails_i0` F +1.43 % (4.3468 → 4.4091) moves toward the pixbox and prepixel truths
+      (−5.34 → −3.98 %, −3.55 → −2.16 %) and away from pointfit (+1.30 → +2.78 %); `trails` is in no bar and has no
+      set referee (its pointfit and pixbox differ by 7 %). No "toward truth" claim either way. At 7933f582 0 lab
+      planes move vs base, so the move is gone with the fixed band.
+    - **R10c-10 the derived floor (design round D2, arm cc).** As built above. Arms measured out: pixel0 of clause-2
+      seeds alone (truthcheck t4 +0.050 ecc), the pixel-histogram pile-up edge (t1 +0.070), ties only (no tie on any
+      calibrated frame: 0000 stays 31.777), any-pixel0 plateau ∧ clause 1 (OSC FP 1.421 %), the 3×3 max as evidence
+      (cc3: LDN OSC G loses its gain), a 5σ margin (changes nothing), the fixed band as no-evidence fallback (FP 0.402 %,
+      truthcheck back to +0.071). Dev-Mac numbers: FN 4 / 12 169 · 0 / 1 229, FP 0.235 / 0.410 %, 0 lab planes moved,
+      ecc ≤ +0.0014; LDN OSC G 3.811 → 2.917 (a3 3.043). Limits below.
+    - **R10c-11 L3's letter-STOP, accepted.** One new C-11 WORSE plane beyond a1c's set, `osc_pairs/f3.5` t3 p0, ecc
+      0.1454 → 0.1469 vs t10-f5-r2 (1× the line, not a STOP-cell; vs a1c +0.0012, inside +0.002), set change only (2
+      newly flagged, refit 0), predicted +0.001 on the dev Mac; table 38 / 24 / 14 / 4 vs a1c's 37 / 24 / 13 / 4.
+    - **The floor's limits (recorded, not bars; (a)–(e) R10c-10, (f)–(g) the final review `review-t10c-2.md`).** (a) A
+      clipped plane whose clipped stars are all one-pixel clips (no tie, no certified core) gets no class B; resampled
+      `f2.0` keeps its 4 FN, as at base; no real frame tested qualifies (7–321 certified cores per plane). (b) The
+      floor never goes below the plateau band: LDN mono's clip at 0.86–0.90 stays unflagged (its β is the clamp,
+      R10c-2). (c) The floor is the frame-wide lowest clipped value: an unclipped star between it and a vignetted
+      corner's clip (about 1.03 on M42) is flagged. (d) A single certified star can set the floor. (e) Clauses 1 and 2
+      keep their own clip-free FP (base 0.23 %). (f) A `MostlySaturated` refusal (the heaviest clipped core) has no
+      verdict, so its pixel0 is never evidence: on a flat-divided clip the floor can only sit too high (FN side) when
+      the lowest-clipped stars are all refused. (g) On an integer plane a chance tie at a clip-free maximum sets a
+      floor at the plane max: class B then adds only the star(s) holding that pixel, which clause 1 flags anyway (e).
+    - **The lab cycle (runner; athenaeum-lab `star-lab/results/plan-a/t10c-nearclip/` at 9f2cafc7, lab 2971210, with
+      L2's split `l2-ecc-split.txt`; `t10c-floor/` at 7933f582, lab 7eb48fb; base = the a1c outputs).** Lab pools
+      11 778 clipped mono (the dev Mac's 12 169 includes alias families) and 333 planes (dev 337).
+
+      | Cell | Bar | `t10c-nearclip` (fixed band) | `t10c-floor` (derived floor) | Verdict |
+      | ---- | ---- | ---- | ---- | ---- |
+      | B1 | z₀ ≤ k | 3.69 ≤ 4.31 | 3.60 ≤ 5.39 | ok |
+      | B2 | SE₀/β₀ ≤ max clean | 0.149 > 0.059 | 0.155 > 0.046 | known miss → Task 11b |
+      | B3 | w_M ≤ w_C | 0.071 ≤ 0.210 | 0.051 ≤ 0.207 | ok |
+      | β₀₀₀₀ (SE) | reported (base 31.777 (15.89)) | 7.568 (1.125) | 7.568 (1.173) | reported |
+      | per-frame β / F / unsat | = the dev Mac's column (22 frames) | 0 mismatches | 0 mismatches | ok |
+      | F-3 twins | 48 / 48, F ≤ 1 % | F worst 0.69 %, β worst 7.7 % (24 void) | F worst 0.69 %, β worst 6.8 % (24 void) | ok |
+      | row 10 FN mono / OSC | ≤ 0.5 % | 0 / 11 778 · 0 / 1 229 | 4 / 11 778 (= base) · 0 / 1 229 | ok |
+      | row 10 FP mono / OSC | reported; floor: mono ≤ base + 0.02 pp | 1.047 % · 0.543 % | 0.244 % · 0.410 % (base 0.242 · 0.397) | ok |
+      | detection control | seed sets identical | 391 / 391 | 391 / 391 | ok |
+      | planes moved vs base (β > 1 % / F > 0.1 %) | the design list only | 19 / 9 (flagged set changed on 231) | 0 / 0 of 333 | ok |
+      | C-11 frame ecc vs a1c | floor: every plane ≤ +0.002 | 68 WORSE, worst truthcheck t3 +0.071, `neb3` +0.0255 | max +0.00145 (`neb3_4096`), 0 over | ok (R10c-8) |
+      | C-11 table vs t10-f5-r2 | ≈ a1c's 37 / 24 / 13 / 4 | 88 cells, 68 WORSE, 29 STOP-cells | 38 / 24 / 14 / 4 | R10c-11 |
+      | cumulative vs t01c | PASS | moved 0 | moved 0 | ok |
+      | F-4 item 1 | ≥ 56 / 58 | 58 / 58 | 58 / 58 | ok |
+      | lab_cycle (C1.1–C1.4, F.0, D.1) | pass | 0 MISS in 70 + 20, F.0 885 / 885, D.1 0.777 / 0.539 | same | ok |
+      | `c_judge` (K.1, N, W, T.4–T.8, I, P) | allowance | 82 ok, 0 MISS | 82 ok, 0 MISS | ok |
+      | S.1 / M.1 | ≤ 1.46 % / ≤ 159.8 s | 0.79 % / 76.7 s | 0.81 % / 76.8 s | ok |
+      | same-star vs a1c | allowance | 0 WORSE, 5 BETTER | 0 WORSE, 6 BETTER | ok |
+      | class-B flags (reported) | — | +1 183 FP mono, +35 OSC | 71: 66 truth-saturated (38 ≥ 3 clipped core px, 28 with 1–2), 5 FP | reported |
+      | `clipFloor` (reported) | — | — | 308 of 333 planes: 272 ties (floor 1.0), 36 certified cores (0.9007–0.9997); 25 none | reported |
+
+    - **Per-frame β (release `star_probe`; base 3deb6cb5 → fixed band 9f2cafc7 → floor 7933f582; floor in range
+      units / evidence count / class-B stars; the dev Mac's `perframe_base_t10c_d2cc.tsv`, which both runner cycles
+      reproduce on the 22 M42 / hc11B L frames with 0 mismatches).**
+
+      | Frame | base | fixed band | floor | floor / evidence / class B |
+      | ---- | ---- | ---- | ---- | ---- |
+      | M42 0000 | 31.777 | 7.568 | 7.568 | 0.925 / 319 / 59 |
+      | M42 0001 | 4.185 | 4.073 | 3.952 | 0.940 / 297 / 23 |
+      | M42 0002 | 5.384 | 4.764 | 4.764 | 0.942 / 310 / 19 |
+      | M42 0003 | 3.395 | 3.324 | 3.307 | 0.928 / 309 / 21 |
+      | M42 0004 | 3.285 | 2.961 | 2.987 | 0.921 / 309 / 31 |
+      | M42 0005 | 3.440 | 3.413 | 3.413 | 0.924 / 308 / 25 |
+      | M42 0006 | 4.108 | 3.313 | 3.230 | 0.927 / 297 / 40 |
+      | M42 0007 | 3.334 | 3.165 | 3.152 | 0.939 / 309 / 24 |
+      | M42 0008 | 2.810 | 2.645 | 2.645 | 0.946 / 321 / 18 |
+      | M42 0009 | 3.700 | 3.379 | 3.383 | 0.944 / 318 / 20 |
+      | M42 0010 | 3.343 | 3.336 | 3.336 | 0.937 / 317 / 17 |
+      | M42 0011 | 3.193 | 3.160 | 3.193 | 0.934 / 315 / 15 |
+      | hc11B L 0000 / 0001 / 0003 / 0007 / 0009 | 3.594 / 4.722 / 3.621 / 4.201 / 5.061 | equal | equal | 0.900–0.908 / 18–22 / 0–1 |
+      | hc11B L 0002 / 0004 / 0005 / 0006 | 3.002 / 4.794 / 4.567 / 3.261 | 3.017 / 4.902 / 4.590 / 3.279 | = fixed band | 0.902–0.910 / 20–22 / 1–3 |
+      | hc11B L 0008 | 4.184 | 4.201 | 4.184 | 0.905 / 19 / 0 |
+      | LDN 1272 mono | 1.500 | 1.500 | 1.500 | 0.900 / 134 / 57 |
+      | LDN 1272 0099 | 99.956 | 99.964 | 99.964 | 0.900 / 114 / 8 |
+      | LDN 1272 OSC R / G / B | 1.590 / 3.811 / 1.848 | 1.634 / 3.043 / 1.749 | 1.590 / 2.917 / 1.754 | 0.936 / 12 / 7 · 0.994 / 12 / 38 · 0.912 / 7 / 11 |
+
+      M42 0000's F 2.342 → 2.267 → 2.267. B3's M spread s_M/med M: 0.088 → 0.071 → 0.051.
+    - **Carries.** **Task 11b:** B2 (0000's β 7.568, SE 1.173; B2 0.155 > 0.046), with its truth family, gate zero and
+      arms (R10c-7); Fable's two ledger items — (1) on a clip-free plane `range = min(plane max, norm) − bg` puts the
+      brightest CLEAN star at the range: the derived floor took it out of class B (0 lab planes moved, FP back to
+      base), but clauses 1 and 2 keep it (limit (e)), and 11b's sample rule must not inherit it; (2) the β sample's
+      split share per frame before / after the class (D-M00 at the fixed band: 0000 53 % vs 32 % in the population,
+      0001 53 % vs 39 %) is 11b's premise, to be read at 7933f582. **Task 13:** PSFSW (R10c-4) and LDN 1272 0099
+      (R10c-5), written into its text. **The later fit-design task:** LDN mono's β 1.5 (R10c-2). **F-1's seeds, if
+      wanted:** one seed per clipped component (R10c-3).

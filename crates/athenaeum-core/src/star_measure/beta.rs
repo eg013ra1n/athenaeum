@@ -344,6 +344,82 @@ mod tests {
         }
     }
 
+    /// Task 10c (R10c-1): 64 clipped undersampled stars (peak clipped at the range, so brightest) ahead of 200 clean
+    /// ones. The clipped stars' point-model beta rises, so the sample must skip them as near-clip and the frame beta
+    /// reads the clean truth.
+    #[test]
+    fn the_sample_skips_near_clip_stars() {
+        let profile = IntegratedProfile::Moffat {
+            fwhm: 1.8,
+            beta: 2.5,
+        };
+        let (cols, rows) = (22usize, 12usize);
+        let spacing = 24.0;
+        let (w, h) = (
+            (spacing * cols as f64) as usize,
+            (spacing * rows as f64) as usize,
+        );
+        let mut stars: Vec<(f64, f64, f64)> = (0..264)
+            .map(|i| {
+                let (fx, fy) = ((i as f64 * 0.618_034) % 1.0, (i as f64 * 0.414_214) % 1.0);
+                let (fx, fy) = if i < 64 {
+                    (0.25 * fx, 0.25 * fy)
+                } else {
+                    (fx, fy)
+                };
+                let amp = if i < 64 {
+                    1.6
+                } else {
+                    0.3 + 0.05 * (i % 5) as f64
+                };
+                (
+                    12.0 + (i % cols) as f64 * spacing + fx,
+                    12.0 + (i / cols) as f64 * spacing + fy,
+                    amp,
+                )
+            })
+            .collect();
+        stars.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let mut data = integrated_field(w, h, &stars, profile, 15, 0.05);
+        // Noise first, then the clip, as a sensor does (R10c-10): the clipped pixels are exactly equal, and that tie is
+        // the plane's own evidence of a clip, which sets the near-clip floor.
+        crate::test_support::add_noise(&mut data, 0.0005, 11);
+        for v in data.iter_mut() {
+            *v = v.min(1.0);
+        }
+        let seeds = stars
+            .iter()
+            .map(|&(x, y, amp)| Seed {
+                x,
+                y,
+                peak: amp.min(1.0),
+                flux: amp,
+            })
+            .collect();
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds),
+                diagnostics: true,
+                ..Default::default()
+            },
+            None,
+        );
+        // The fixture's clipped stars also pass the amplitude clause (their point-model amplitude overshoots the
+        // range), so the frame beta alone cannot tell the clauses apart: pin that clause 3 flags them.
+        let near = m
+            .diagnostics
+            .iter()
+            .take(64)
+            .filter(|d| matches!(d.verdict, Some(v) if v.by_near_clip && v.saturated))
+            .count();
+        assert_eq!(near, 64, "clipped stars flagged near-clip");
+        println!("near-clip sample: beta {:.4} {:?}", m.beta, m.beta_source);
+        assert!((m.beta / 2.5 - 1.0).abs() < 0.02, "{}", m.beta);
+    }
+
     /// The measure path (verdicts first): the frame β is the median of the sample's integrated fits, and each sample
     /// star's record carries its own (`FitDiagnostics::sample_beta`) — only theirs, every one an unflagged successful
     /// verdict among the first 64 such.
@@ -409,6 +485,9 @@ mod tests {
             saturated,
             by_amplitude: saturated,
             by_plateau_clip: false,
+            by_near_clip: false,
+            pixel0: f64::NAN,
+            top3x3: f64::NEG_INFINITY,
             fit,
             iterations: 5,
             cross,

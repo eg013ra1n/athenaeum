@@ -17,6 +17,10 @@ F-10 bar is derived from data or from the PSF and the noise, or reported with it
 Amended 2026-10-12 (Plan A Task 10b as built, after its joint lab cycle and review): §3 row F-10 records what was built
 and how its bars were judged (every ruling with its numbers in `docs/stacking/README.md` R-OSP-7b); §2.1's `seeds` and
 `fit` rows, its field-width sentence, the owned-quantities table and §4's frame statistic follow it.
+Amended 2026-10-12 (Plan A Task 10c as built, after its lab cycle `t10c-floor` and review): §2.1's flag gains the
+near-clip clause with the plane's clip floor and its limits; §3 row F-3 records the class and its bar as judged
+(rulings R10c-0…R10c-11 with their numbers in `docs/stacking/README.md` R-OSP-7c); the owned-quantities table and §5
+follow it; the M42 bar's B2 is a known miss owned by Plan A Task 11b (F-4b, a frame-level β).
 
 ## 1. Goal and owner decisions
 
@@ -111,12 +115,43 @@ Per seed (every seed gets the whole test, as the reference method fits every can
 - **The flag**: saturated when the verdict fit's amplitude A > range, OR (plateau-clip clause, owner 2026-10-09,
   after research R-S) when the plateau test passed and `pixel0 − bg ≥ 0.9·range`, whatever the fitted amplitude and
   even when the fit failed: a seed inside a large saturated area, whose fit sees only the rim, is flagged too. Known
-  limit: the plane's brightest flat-topped star is flagged by construction (it sets the range). Otherwise the plateau
-  test only sets the level and the flag comes from the fit.
+  limit: the plane's brightest flat-topped star is flagged by construction (it sets the range). OR (near-clip clause,
+  Plan A Task 10c, 2026-10-12) when the plateau test did NOT pass and the 3×3 maximum about pixel0 (the region's
+  present pixels) is ≥ the plane's clip floor (below): a star clipped on one or two pixels, whose neighbours' mean is
+  under 0.7·range, keeps the level at norm, so its fit follows the clipped top (A/range 0.92 on M42 0000) and β rises
+  instead of the amplitude passing the range; the flag holds when the fit failed, the level and the fit are unchanged.
+  Otherwise the plateau test only sets the level and the flag comes from the fit.
 - **A fit that never leaves its start is refused** (fix rounds A3 / A4, 2026-10-09): a bounded or conditioned fit
   whose solve accepted no step and did not converge (a guard-refused first step on a censored star used to spend the
   reject budget and return the start as a fit) is `None`: the verdict reads `fit = false`, a sample star is counted out
   of the median, a fit at β is refused `fitFailed`; every refusal is counted and logged at `debug!`.
+
+**The clip floor (Plan A Task 10c, ruling R10c-10; derived per plane; owner: ideally the threshold adapts to the plane).** Once per
+plane, after every seed's verdict and before the multi-plane rule, the plane's own clipped evidence sets the floor
+clause 3 reads (`SaturationPlane::clip_floor`): E = {the plane max, when ≥ 2 present pixels equal it — an exact clip;
+the tie count rides on the plane-max reduce} ∪ {pixel0 of every seed that clause 1 (A > range) AND clause 2 (plateau,
+pixel0 − bg ≥ 0.9·range) both flag — a certified clipped core}; floor = min E, no margin (a 5σ margin changes no lab or
+real number). **E empty → no near-clip class on that plane**: a clip-free plane has no evidence, so its brightest
+clean star (which sets the range) is not flagged by clause 3. An exact clip collapses the floor to the clip value; a
+flat-divided clip takes its lowest certified clipped value (M42 0.921–0.946 of range, its clip running from 0.964;
+hc11B L 0.900–0.910; LDN 1272 mono 0.900; its OSC planes 0.936 / 0.994 / 0.912). pixel0, not the 3×3 maximum, is the
+evidence: on a debayered plane a certified core's 3×3 maximum is debayer overshoot. The floor is never below
+bg + 0.9·range (the tie member is the plane max; clause 2's gate holds pixel0 above the band), so class B is a subset
+of the knot exemption's near-clip set (F-10), which keeps the FIXED 0.9·range band because it runs before any verdict
+exists — a documented superset; detection is unchanged. The fixed band as clause 3's own level (9f2cafc7) was
+measured and replaced: on a clip-free or exact-clip plane it flagged the brightest unsaturated stars (lab FP mono
+0.24 → 1.05 %, 871 newly flagged on 68 planes, 0 of them truth-saturated) and the frame ecc rose toward the faint stars'
+noise-biased value (truthcheck +0.03…+0.07, `neb3` +0.025; R10c-8). Limits (recorded, not bars): (a) a clipped plane
+whose clipped stars are all one-pixel clips (no tie, no certified core) gets no class B — resampled `f2.0` keeps its 4
+false negatives, as before; no real frame tested qualifies (every one has 7–321 certified cores per plane); (b) the
+floor never goes below the plateau band, so LDN 1272 mono's clip at 0.86–0.90 of range stays unflagged (its β is the
+clamp, R10c-2); (c) the floor is the frame-wide lowest clipped value, so an unclipped star between it and a vignetted
+corner's clip (about 1.03 on M42) is flagged; (d) a single certified star can set the floor; (e) clauses 1 and 2 keep
+their own clip-free false positives (lab 0.23 %, the brightest star by construction, above); (f) a `MostlySaturated`
+refusal (the heaviest clipped core) has no verdict, so its pixel0 is never evidence — on a flat-divided clip the floor
+can only sit too high (the false-negative side) when the lowest-clipped stars are all refused; (g) on an integer plane
+a chance tie at a clip-free maximum sets a floor at the plane max — class B then adds only the star(s) holding that
+pixel, which clause 1 flags anyway (e).
 
 Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample and the frame
 statistic use unflagged stars only; the field width reads every candidate (F25), the per-star width start is the
@@ -212,7 +247,7 @@ its numbers; a bar is never moved, a row never re-sized, a generator never tuned
 | F-0 | No refusal reasons (`sharp/m4/f8.0`: 82.7 % fitted of 92.0 % seeded) | `FitDiagnostics` per seed; `stars_refused` + per-reason counts in `ChannelMeasurement` and `FrameAnalysis` (§4.2); the `.athf` flags byte carries per-accepted-fit flags (saturated, β at its cap), the file holds accepted fits only | accepted + refused-by-reason = seeds on every image; numbers unchanged against the extraction step |
 | F-1 | Broad / defocused stars collapse (M51 Hα 6.53 px vs analysis 13.39, ERP 14.02; m82 11.43 vs 16.31 / 17.76; `_DSC5767` zero seeds) | region growth judged on (median − sky), not the absolute median; the region cap scales with the star's own width start (≥ 6 FWHM, cap 96 px; today `min(2·nominal, 48)`); background start from the region's rim, not the plain median of a star-filled square; width start from the star's own moments, not one field σ0; matched-filter seeds (§2.1); new lab families FWHM 12 and 16 px and defocused annular ("donut") stars, isolated (`min_sep` ≥ 6 FWHM) | fitted / seeded at FWHM 8: 82.7 % → ≥ 99 %; frame FWHM error vs `pointfit` ≤ 1 % at every FWHM up to 16 px; a donut star is refused with its reason, never reported as a narrow fit |
 | F-2 | Angle: measure rms 44.564° / 32.339° on `shape/f2.6/e0.3|e0.5/t30` vs ERP 7.849° / 2.129° (summary row 4); 71–145 of 346–427 unsaturated fits per `e0.3` family have fwhm_x < fwhm_y (θ on the minor axis; `path-compare.txt` part 2) | canonical axes (fwhm_x ≥ fwhm_y, θ on the major axis); the fitter sees stamp-centred coordinates and amplitude-normalised values so its relative convergence test acts on O(1) parameters (the convergence test itself changes in rustafits only if the lab shows it is needed) | structural: every accepted fit has fwhm_x ≥ fwhm_y and θ on fwhm_x's axis, pinned by a test; the row-4 angle `eff` cell (prepixel CRLB) ≤ 1.5 on the `shape` families with e ≥ 0.3 |
-| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample and the frame statistic use unsaturated stars only (§2.1's test); the field width reads every candidate (F25), the per-star width start is the star's own | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
+| F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample and the frame statistic use unsaturated stars only (§2.1's test); the field width reads every candidate (F25), the per-star width start is the star's own. **As built (Task 10c, 2026-10-12; athenaeum 9f2cafc7 the class at a fixed band, 7933f582 the floor derived per plane; every ruling with its numbers in `docs/stacking/README.md` R-OSP-7c):** the near-clip clause (§2.1: plateau failed ∧ 3×3 maximum ≥ the plane's clip floor; no evidence, no class B). **As judged** (lab cycle `t10c-floor` at 7933f582, athenaeum-lab 7eb48fb): the M42 frame-β bar R10c-0 (robust form, fixed before code; M = the 11 other M42 mono2 L calibrated frames, C = the hc11B L replica 0000–0009) — M42 0000's β 31.777 (SE 15.89) → 7.568 (SE 1.173), F 2.342 → 2.267; B1 z₀ 3.60 ≤ k 5.39, B3 0.051 ≤ 0.207 pass; **B2 0.155 > 0.046 a known miss** owned by Task 11b (F-4b: the frame β estimator on a one-sided mean-profile shoulder, R10c-6/7; 0000 is a clean frame); row 10 FN 4 of 11 778 (= base; dev Mac 4 of 12 169) and 0 of 1 229, FP 0.244 % / 0.410 % (base 0.242 / 0.397); twins 48 / 48 (F worst 0.69 %, β worst 6.8 %, 24 void); 0 of 333 lab planes moved (β > 1 %, F > 0.1 %) vs base; C-11 frame ecc vs the base max +0.00145, 0 planes over +0.002 (one marginal new C-11 WORSE plane, `osc_pairs/f3.5` t3 p0 at 1× the line, accepted, R10c-11); seed sets identical on 391 of 391 outputs; every held bar (F-4 item 1 58 / 58, C1.1–C1.4, D.1, K.1, S.1 0.81 %, M.1 76.8 s) passes. The fixed-band run (`t10c-nearclip`, lab 2971210) had FP 1.047 % / 0.543 % and C-11 ecc up to +0.071 → the floor (R10c-8) | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
 | F-4 | Model-dependent width (Gaussian / blur pointfit −2.07…−3.04 %; β alone 9.60 %; `mixture/b` +4.88 %) | β becomes continuous per frame: a free-β Moffat fit on the unsaturated bright sample gives the frame's β (median), clamped to [1.5, 100]; every star is then fitted at it. **As built (owner E5, 2026-10-09):** the sample's fit is PIXEL-INTEGRATED (the model the mean over k × k sub-samples per pixel, k = clamp(⌈10/F_start⌉, 3, 9)), because a point model fitted to integrated pixels reads β high on undersampled stars (the lab step stopped on it); the verdict fit and every fit at β stay the point model. "Fits nothing twice" no longer holds: each plane runs up to 64 extra fits. A named rustafits change: `fit_moffat_2d` refuses β > 20 today (`rf/analysis/fitting.rs:545-551`), so its bound is lifted to the cap and the sample fit runs in a conditioned parametrization (ln β), because the Gaussian limit is a flat ridge in (α, β). At β 100 a Gaussian star reads −0.32 % (β 30: −1.04 %; spec re-review N-1). The Gaussian is the large-β limit; there is no separate Gaussian model, so β stays a finite number everywhere (`.athf` f32, `metrics` JSON, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`, `star_metrics.beta`, `median_beta`; `fit_method` is `moffat`; `FITS_ARTIFACT_VERSION` unchanged) | frame FWHM error vs `pointfit` ≤ 1 % at FWHM ≥ 2 px, ≤ 3 % below, on every family whose stars share one profile (`gauss`, `m*`, `blur*`, `mix*`: the lab's pointfit truth there is a free-β fit, `families.py:113-134`) |
 | F-5 | Captured fraction depends on the profile (spread 18.73 % at F 2.6, 22.16 % at F 8.0) → PSFSW / PSFSNR / psfSel | star flux = fitted-model flux in the FWTM ellipse × a per-plane aperture correction `c` (as built, README R-OSP-7): the median over the 64 brightest qualifying fits (at least 5, else `c` = 1) of the 5F growth sum over the model flux, the background the plain mean of the [10F, 12F] far ring outside every seed's 3F disc; a candidate whose fitted amplitude tops the plane's range does not qualify (the F-3 amplitude screen, full scale from the caller); its 12F disc must lie inside the plane and the caller's footprint (LN's `allowed`); `aperture_stars` counts the qualifiers; psfSel reads this flux | spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel: `pairs/iso/blur25mix` t60 −13.03 % and `pairs/iso/blur4` t60 −7.28 % → within ±2 %, the Moffat and Gaussian pairs stay within ±1.2 % |
 | F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | one definition: S / σ_S in an aperture of radius max(1.5·FWHM, 3 px), σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky), σ_sky = the star's own σ_i over its N_sky ring pixels (F-10, 2026-10-11; the [3F, 4F) annulus is retired for SNR); g from EGAIN (raw ADU) or EGAIN with the calibrated-frame cards (`ATH_CSCL`, `ATH_CFNM`); unknown gain → the shot term is omitted and the record says so. Lab: the generator writes EGAIN (and `ATH_CSCL` on unit-domain planes) from its own gain; the truth SNR is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky | median bias vs the truth SNR ≤ 3 % on the unsaturated isolated families (`sharp/*`, `background/*`) |
@@ -309,10 +344,11 @@ STOP and a re-audit of that quantity. One current owner per row; earlier tasks a
 | aperture-scale sky B_i | 10b | `c`'s growth sums, F-6's S and HFR, the b − B_i diagnostic | F-5; F-10 per-star sky |
 | per-star noise σ_i (with its pixel count) | 10b | F-6's σ_sky and N_sky | F-10 per-star sky |
 | flag `saturated` | 8 (F-3) | the β sample, the frame statistic, `c`'s qualifiers, `.athf`, the weights | F-3 row 10 |
-| flag `saturated`, its near-clip class | 10c (from 8) | the β sample, the frame statistic, `c`'s qualifiers, later F-6's SNR and HFR | 10c M42 β |
+| flag `saturated`, its near-clip class (clause 3) | 10c (from 8) | the β sample, the frame statistic, `c`'s qualifiers, the flagged fit's exclusion (level norm), the multi-plane rule, `stars_unsaturated`, `.athf`, later F-6's SNR and HFR | F-3 row 10, C-11; 10c M42 β B1 / B3 (B2 → 11b) |
+| the plane's clip floor (`SaturationPlane::clip_floor`, with its tie count and evidence count; not persisted) | 10c | clause 3 only (the knot exemption keeps the fixed 0.9·range band, a superset); `PlaneMeasurement.clip_floor` / `clip_evidence` and the probe's `clipFloor` / `clipEvidence` report it | F-3 row 10 FP ≤ base + 0.02 pp; C-11 ≤ +0.002 |
 | flag `betaAtCap` | 9 (F-4) | `.athf` and the probe (a diagnostic; no statistic excludes it) | F-4 |
 | flag `extended`; refusal `trailed` | 10b | the β sample, the frame statistic, `c`'s qualifiers, `.athf`, `stars_refused`, the weights | F-10 knots, trails |
-| frame β | 9 (F-4) | every fit at β, the model flux (c's denominator), LN's reference β | F-4; 10c M42 β |
+| frame β | 9 (F-4) | every fit at β, the model flux (c's denominator), LN's reference β | F-4; 10c M42 β (B2 → 11b, F-4b) |
 | `c` | 10 (F-5) | `signal` → PSFSW / PSFSNR, psfSel, Register's and LN's ordering | F-5; F-10 LN, real sky, trails |
 
 LN's clip screen on paths without a verdict (`unverdicted_clip_range`) is a declared second saturation definition,
@@ -439,7 +475,8 @@ clean; push only on the owner's word).
    (continuous β, with the rustafits free-β bound and parametrization) → F-5 (flux, psfSel) → F-10 (one background:
    detection noise, knots, the field width, trails, the per-star sky and noise; its one lab cycle re-judges F-0…F-5
    and F-7 jointly, and it reads the Measure wall first) → F-3's near-clip class (Plan A Task 10c: the saturation flag's
-   near-clip class-B stars, the M42 β bar derived from the set's own spread) → F-6 (SNR, reading F-10's B_i and σ_i);
+   near-clip class-B stars, the M42 β bar derived from the set's own spread) → F-6 (SNR, reading F-10's B_i and σ_i)
+   → F-4b (Plan A Task 11b: a frame-level β, the owner of the M42 bar's B2 miss);
    the F-3 twin rows are judged again after F-4. The stacking Measure config changes (§2.2) land with F-1 and F-4.
 5. **Real-data checkpoint** under the owner's rule (a numeric change is judged on the whole group at master level),
    with the athenaeum-lab acceptance harness (`harness/acceptance/`, reused): set 204 mono and OSC, run B, Horse C11

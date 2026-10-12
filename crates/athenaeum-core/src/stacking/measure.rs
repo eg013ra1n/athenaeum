@@ -278,6 +278,11 @@ pub struct PlaneMeasurement {
     /// The accepted fits without a ring sky B_i (Plan A Task 10b, F-10; the probe's `ringSkyMissing`). Reported, not
     /// persisted.
     pub ring_sky_missing: usize,
+    /// The plane's near-clip floor in range units (Plan A Task 10c, R10c-10; the probe's `clipFloor`); `None` = no
+    /// clipped evidence. Reported, not persisted.
+    pub clip_floor: Option<f64>,
+    /// How many pieces of evidence set `clip_floor` (the probe's `clipEvidence`). Reported, not persisted.
+    pub clip_evidence: usize,
     /// The module's matched-filter report (Plan A Task 10b, F-10: σ_f propagated and measured, the noise gain, the
     /// structure seeds dropped, the extended flags; the probe's `sigmaF`, `sigmaFMeasured`, `noiseGain`,
     /// `structureDropped`, `extendedSeeds`); `None` for the other detectors. Reported, not persisted.
@@ -854,6 +859,8 @@ fn adapter_tail(
             aperture_correction: m.aperture_correction,
             aperture_stars: m.aperture_stars,
             ring_sky_missing: m.ring_sky_missing,
+            clip_floor: m.clip_floor,
+            clip_evidence: m.clip_evidence,
             detection: m.detection,
         },
         seeds,
