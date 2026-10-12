@@ -2973,6 +2973,21 @@ fix(star_measure): F-5 star flux = the fitted model's FWTM flux times a per-fram
 
 **Acceptance:** spread ≤ 2 % at F 2.6 and F 8.0; psfSel bars as above; both diffs 0 moved outside the design list.
 
+**Outcome (2026-10-11).** Commits (athenaeum, WIP branch `one-star-path-t10-wip`, to be squashed into ONE F-5 commit on
+`one-star-path`): 7af3bdc9 (Phase A), 1d527bcb (round 2), d130ed60 (round 3, R6), e3312b03 (round 4: footprint, the
+caller's full scale), then the close commit (the STOP-4 bound, README R-OSP-7). Lab step `t10-f5`: r1 STOP (LN `c` wrong:
+clipped stars in the 64 and a non-linear median ring) -> research RF5 / RF5b / RF5c -> R6 -> RF6 / RF7 / RF8 -> r2 at
+e3312b03 (lab 39bb670) **BAR PASS**: C1.1 0.76 % / 1.38 %, C1.2 +1.72 % / +1.19 %, C1.3 0 / 70, C1.4 0 / 20; control,
+register guard and both no-regression diffs PASS. Rulings of 2026-10-11: C6 (R6: far-ring plain mean, seed mask, amplitude
+screen), C7 (record the paired deltas, do not judge), RF7 (STOP 4: half/full bound 0.004 -> 0.030 = 3 sigma of 0.99 %, both
+truth assertions kept), RF8 (KEEP R6, no per-star residual screen; the injected-star rows are a truth artefact). README
+R-OSP-7, spec §2.1 / F-5 updated.
+
+Carries. **Task 13:** the nebula seed flood (hc11B L 0010 at the 24 576-seed cap: isolation leaves junk qualifiers, `c`
+1.137 +- 25 %; the same seed mechanism as the M42 frame-beta MUST-RESOLVE - re-read `c` there), the nebula-background `c`
+bias (neb3 -11.5 % +- 5.6 % SE, neb3_4096 +13.9 % +- 2.3 %), the OSC LN reference R-plane `c` SE 2.19 %. **Plan B:**
+growth/model falls for fainter stars (all-pairs LN-like -4.7 %). **Plan C:** a CFA-masked plane gets `c` = 1 (no qualifier).
+
 ---
 
 ### Task 11: F-6 — the per-star SNR and HFR (spec §3 F-6, §4.2 HFR)

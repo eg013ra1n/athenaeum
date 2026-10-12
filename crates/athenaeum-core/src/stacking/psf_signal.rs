@@ -1,7 +1,8 @@
 //! The PSF-signal family of frame-quality estimators (math reference §1;
 //! spec §4.1): the PSF Signal Weight / PSF SNR formulas, the group β (the
 //! cache-key constant is `star_measure::MEASURE_VERSION`). The elliptical
-//! Moffat fits, the hybrid PSF/aperture flux, the robust totals, the large-scale background residual and MRS
+//! Moffat fits, the star flux (from Plan A Task 10 the model's FWTM flux times the plane's aperture correction), the
+//! robust totals, the large-scale background residual and MRS
 //! noise moved to [`crate::star_measure`] (one star-measurement path, Plan A
 //! Task 2) and are re-exported here, so every `psf_signal::…` caller is
 //! unchanged; `fit_stars`/`fit_stars_with_beta` are thin wrappers over the
@@ -13,8 +14,9 @@ pub use crate::star_measure::domain::{
     BACKGROUND_MODEL_CELL_PX, MRS_LAYER1_GAIN, MRS_LAYERS, N_STAR_FROM_MAD,
 };
 pub use crate::star_measure::{
-    background_residual, frame_shape, fwtm_from_alpha, noise_mrs, signal_totals, FitOutcome,
-    FitParams, PsfModel, Seed, SignalTotals, StarFit, AUTO_BETAS, AUTO_SAMPLE, RCR_LIMIT,
+    background_residual, frame_shape, fwtm_from_alpha, model_flux_in_fwtm, noise_mrs, signal_totals,
+    FitOutcome, FitParams, FluxCorrection, PsfModel, Seed, SignalTotals, StarFit, AUTO_BETAS,
+    AUTO_SAMPLE, RCR_LIMIT,
 };
 
 /// [`crate::star_measure::fit::fit_stars`] (Plan A Task 2: the fit moved;

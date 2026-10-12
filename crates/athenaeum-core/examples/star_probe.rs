@@ -68,6 +68,12 @@
 //! `sampleBeta`, its own integrated fit's β; no other line has the key. The
 //! betas arm keeps the discrete ladder (`--betas`, default 2.5,4,6,10) as
 //! row 3's β-sensitivity diagnostic.
+//!
+//! F-5 (Plan A Task 10, ruling R-OSP-7): every star's `signal` is the fitted
+//! model's flux in its FWTM ellipse times the plane's aperture correction;
+//! the measure and betas frame lines carry `apertureCorrection` (that `c`,
+//! null when the plane had fewer than 5 qualifying stars: `c = 1`) and
+//! `apertureStars` (the qualifying stars it is the median over).
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -582,6 +588,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
                         "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
+                        "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
                         "channel": pm.channel, "options": options, "conversion": conversion,
                         "domain": domain, "nonFinite": non_finite, "wallMs": wall}),
@@ -591,8 +598,10 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             let scaled: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
             // Ruling R3 (Plan A Task 6b round 1): the betas arm starts from the measure path's own field width (the
             // matched filter's, for its seeds), so at the measure's β it fits the measure's stars exactly.
+            // F-5 round 4: the ADU-scaled plane's full scale caps the aperture correction's clip screen.
             let betas_opts = FitStarsOptions {
                 field_width: Some(pm.field_width.fwhm_px),
+                full_scale: Some(ADU_SCALE as f64),
                 ..Default::default()
             };
             for &b in &a.betas {
@@ -605,6 +614,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 emit(
                     json!({"kind": "frame", "path": "betas", "plane": p, "beta": b, "seeds": seeds.len(),
                             "fits": o.fits.len(), "refused": refused_counts(&o.refused), "statistic": "residual-weighted mean over all accepted fits",
+                            "apertureCorrection": o.aperture_correction, "apertureStars": o.aperture_stars,
                             "frameFwhm": ff, "frameEcc": fe, "options": options, "conversion": conversion,
                             "domain": domain, "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );

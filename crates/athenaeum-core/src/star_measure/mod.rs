@@ -30,7 +30,7 @@ pub use domain::{
 };
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
-pub use photometry::{SaturationPlane, SaturationVerdict};
+pub use photometry::{model_flux_in_fwtm, SaturationPlane, SaturationVerdict};
 pub use seeds::{FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 
 /// Version of the measurement path's own behaviour — bumped whenever
@@ -144,9 +144,9 @@ pub enum SeedSpec {
 }
 
 /// What [`fit_stars_at`] fits with besides the plane, the seeds and β (Task 6a; Tasks 9-11 add fields, so a caller
-/// writes `..Default::default()`, ruling F14).
+/// writes `..Default::default()`, ruling F14). `'a` is the borrowed [`Self::footprint`]'s (F-5 round 4).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct FitStarsOptions {
+pub struct FitStarsOptions<'a> {
     pub fit: FitParams,
     /// `mask[i] == false` makes pixel `i` absent, like a non-finite one, in the fit's region and aperture (Plan C's
     /// CFA green sites); `None` = every pixel present.
@@ -161,6 +161,44 @@ pub struct FitStarsOptions {
     /// Apply the plane-level defocused verdict (owner ruling 2026-10-08): `true` only on the measure path
     /// ([`measure_plane`]); every other caller (LN's refits) keeps the per-star `Donut` refusal alone.
     pub defocus_verdict: bool,
+    /// Where the fits' aperture correction comes from (F-5, Task 10): measured on the plane being fitted (the
+    /// default, so LN's two sides each get their own), or the caller's.
+    pub flux_correction: FluxCorrection,
+    /// The fitted plane's full scale in its own units (F-5 round 4): the aperture correction's clip screen caps the
+    /// plane max at it, `range = min(plane max, full_scale) − sky median` (F-3's amplitude clause); `None` = uncapped,
+    /// `range = plane max − sky median`. LN passes its native planes' `1.0`; the measure path keeps its own
+    /// [`SaturationPlane`] and never reads this.
+    pub full_scale: Option<f64>,
+    /// The aperture correction's footprint (F-5 round 4): a star qualifies only when every pixel centre within `12F` of
+    /// it has `footprint[i] == true` — LN passes its `allowed` region (the eroded coverage or overlap), outside which
+    /// the plane holds zero fill and stars it never seeded. Read by the correction alone, never by a fit (that is
+    /// `mask`'s); borrowed, never copied; `None` = the whole plane.
+    pub footprint: Option<&'a [bool]>,
+}
+
+impl FitStarsOptions<'_> {
+    /// The aperture correction's inputs these options carry (the measure path's saturation plane is never one).
+    fn correction(&self) -> fit::Correction<'_> {
+        fit::Correction {
+            flux: self.flux_correction,
+            saturation: None,
+            full_scale: self.full_scale,
+            footprint: self.footprint,
+        }
+    }
+}
+
+/// The aperture correction `c` a fit call multiplies every accepted fit's model flux by (F-5, Task 10, ruling
+/// R-OSP-7): `StarFit::signal = model_flux_in_fwtm × c`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FluxCorrection {
+    /// Measure `c` on the plane the call fits ([`photometry::aperture_correction`]); `c = 1` (and
+    /// `aperture_correction: None`) when fewer than 5 isolated unsaturated stars qualify.
+    #[default]
+    FromPlane,
+    /// The caller's `c`, applied as is and reported as `FitOutcome::aperture_correction`. One that is not a positive
+    /// number is refused with a `warn!` and the plane's own is measured.
+    Given(f64),
 }
 
 /// One plane's measurement (PA-1: the stacking adapter keeps its own `stacking::measure::PlaneMeasurement`). Energies
@@ -200,6 +238,11 @@ pub struct PlaneMeasurement {
     /// The seeds flagged by the cross-plane rule ([`cross_plane_flags`]: another plane's own flag at their position);
     /// 0 on a single plane.
     pub cross_flags: usize,
+    /// The plane's aperture correction `c` (F-5, Task 10): every star's `signal` is its model flux in its FWTM times
+    /// it. `None` = no correction (`c = 1`): no fit, or fewer than 5 isolated unsaturated stars qualified.
+    pub aperture_correction: Option<f64>,
+    /// The qualifying stars `aperture_correction` is the median over (at most 64; under 5 it is `None`).
+    pub aperture_stars: usize,
     pub timings: PhaseTimings,
 }
 
@@ -238,6 +281,9 @@ pub struct PlanePrep {
     fit_field: FieldWidth,
     /// One per seed, in seed order.
     passes: Vec<fit::SeedPass>,
+    /// The plane's saturation inputs the verdicts read; the aperture correction's clip screen reads its range (F-5,
+    /// owner ruling R6).
+    saturation: SaturationPlane,
     cross_flags: usize,
     timings: PhaseTimings,
     /// The verdict pass's share of [`PhaseTimings::fit_ms`].
@@ -427,6 +473,7 @@ fn prepare_working(
         field_width,
         fit_field,
         passes,
+        saturation,
         cross_flags: 0,
         timings,
         verdict_time: t.elapsed(),
@@ -450,6 +497,7 @@ fn finish_working(
         field_width,
         fit_field,
         passes,
+        saturation,
         cross_flags,
         mut timings,
         verdict_time,
@@ -466,6 +514,10 @@ fn finish_working(
             opts.mask.as_deref(),
             fit_field,
             Some(&passes),
+            fit::Correction {
+                saturation: Some(&saturation),
+                ..Default::default()
+            },
             None,
             opts.diagnostics,
             true,
@@ -485,6 +537,8 @@ fn finish_working(
         "every seed has exactly one outcome (ruling F13)"
     );
     let diagnostics = std::mem::take(&mut outcome.diagnostics);
+    // The fits' signals already carry the plane's aperture correction (F-5: measured after the duplicate drop, inside
+    // the fit call), so the totals read the corrected flux.
     let frame = FrameAggregates::of(&outcome.fits);
     PlaneMeasurement {
         stars: outcome.fits,
@@ -502,6 +556,8 @@ fn finish_working(
         defocus_donuts: outcome.defocus_donuts,
         verdict_fit_failed: outcome.verdict_fit_failed,
         cross_flags,
+        aperture_correction: outcome.aperture_correction,
+        aperture_stars: outcome.aperture_stars,
         timings,
     }
 }
@@ -542,7 +598,8 @@ fn saturation_plane(
 /// (ADU-scaled), exactly as `fit_stars_with_beta` takes it. `opts.mask` makes pixels absent in the region and the
 /// aperture; `opts.field_width` (else [`seeds::field_width_of`] the seeds) sizes every star's width-start box (Task
 /// 6b, PA-12) and is reported as `FitOutcome.field_width`; `opts.diagnostics` keeps one record per seed in
-/// `FitOutcome.diagnostics`.
+/// `FitOutcome.diagnostics`; `opts.flux_correction` says where the fits' aperture correction comes from (F-5: the
+/// plane's own by default), `opts.full_scale` and `opts.footprint` what it reads (F-5 round 4).
 pub fn fit_stars_at(
     plane: &[f32],
     w: usize,
@@ -564,6 +621,35 @@ pub fn fit_stars_at(
         pool,
         opts.diagnostics,
         opts.defocus_verdict,
+        opts.correction(),
+    )
+}
+
+/// [`fit_stars_at`] with β from `model` as [`fit::fit_stars`] resolves it (`Auto`: the brightest seeds' sample, Q7;
+/// `Moffat4`/`Fixed`: as given) — LN's reference side, so its footprint and full scale reach the aperture correction
+/// (F-5 round 4). With default options it is [`fit::fit_stars`].
+pub fn fit_stars_with_model(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    model: PsfModel,
+    opts: &FitStarsOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> FitOutcome {
+    fit::fit_stars_diagnosed(
+        plane,
+        w,
+        h,
+        seeds,
+        model,
+        &opts.fit,
+        opts.mask.as_deref(),
+        opts.field_width,
+        pool,
+        opts.diagnostics,
+        opts.defocus_verdict,
+        opts.correction(),
     )
 }
 
@@ -571,6 +657,158 @@ pub fn fit_stars_at(
 mod tests {
     use super::*;
     use crate::test_support::fixture_field;
+    use crate::test_support::{moffat_field, MoffatStar};
+
+    /// F-5 (Task 10): 30 round Moffat stars of `alpha`, amplitude 0.3, on a 70-px grid of a 480 × 400 plane.
+    pub(super) fn grid30(alpha: f64) -> Vec<MoffatStar> {
+        grid30_spaced(alpha, 70.0, 60.0)
+    }
+
+    /// [`grid30`]'s 6 × 5 stars `pitch` px apart, the first at (`origin`, `origin`).
+    pub(super) fn grid30_spaced(alpha: f64, pitch: f64, origin: f64) -> Vec<MoffatStar> {
+        (0..30)
+            .map(|i| MoffatStar {
+                x: origin + (i % 6) as f64 * pitch,
+                y: origin + (i / 6) as f64 * pitch,
+                amp: 0.3,
+                alpha_x: alpha,
+                alpha_y: alpha,
+                theta: 0.0,
+            })
+            .collect()
+    }
+
+    /// One seed per star, at its true centre.
+    pub(super) fn seeds_of(stars: &[MoffatStar]) -> Vec<Seed> {
+        stars
+            .iter()
+            .map(|s| Seed {
+                x: s.x,
+                y: s.y,
+                peak: s.amp,
+                flux: 1.0,
+            })
+            .collect()
+    }
+
+    /// The median of `it` (the mean of the two middle values for an even count).
+    pub(super) fn median(it: impl Iterator<Item = f64>) -> f64 {
+        let mut v: Vec<f64> = it.collect();
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        assert!(n > 0, "the median of nothing");
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        }
+    }
+
+    #[test]
+    fn ln_refit_takes_a_given_correction() {
+        let stars = grid30(5.0);
+        // F-5 round 4 (the fixture defect of STOP 1 on the no-verdict path): the clip screen's range is the plane max
+        // less the sky median, which the 30 equal stars' wings lift, so every one of them fits above it and none
+        // qualifies. One range-setting star (1.5x the grid amplitude, rendered, NOT seeded) sets the plane max; it sits
+        // 140 px below the grid on a taller plane, outside every grid star's 12F disc and isolation radius.
+        let mut field = stars.clone();
+        field.push(MoffatStar {
+            x: 240.0,
+            y: 480.0,
+            amp: 0.45,
+            ..stars[0]
+        });
+        let data: Vec<f32> = moffat_field(480, 560, &field, 4.0, 0.05)
+            .iter()
+            .map(|v| v * ADU_SCALE)
+            .collect();
+        let own = fit_stars_at(
+            &data,
+            480,
+            560,
+            &seeds_of(&stars),
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
+        let given = fit_stars_at(
+            &data,
+            480,
+            560,
+            &seeds_of(&stars),
+            4.0,
+            &FitStarsOptions {
+                flux_correction: FluxCorrection::Given(1.0),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            own.aperture_correction.unwrap() > 1.05,
+            "{:?}",
+            own.aperture_correction
+        );
+        assert!(
+            (given.fits[0].signal * own.aperture_correction.unwrap() / own.fits[0].signal - 1.0)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// F-5 round 3 (owner ruling R6 / C6): on a path without a saturation verdict (`fit_stars_at`) a clipped star — a
+    /// flat-topped core at the plane max, its fitted amplitude above the range its own plane gives (`plane max − sky
+    /// median`: no full scale given, round 4) — does not enter the aperture correction: the qualifying count and `c`
+    /// equal those of the same call without its seed (the same plane; the field width given, so every other fit is the
+    /// same).
+    #[test]
+    fn a_clipped_star_is_screened_out_of_the_aperture_correction_without_a_verdict() {
+        let (w, h) = (480usize, 560usize);
+        let stars = grid30(5.0);
+        // Far below the grid (≥ 143 px from every grid star): its light, seed disc and isolation touch none of them.
+        let clipped = MoffatStar {
+            x: 240.0,
+            y: 480.0,
+            amp: 1.5,
+            ..stars[0]
+        };
+        let mut field = stars.clone();
+        field.push(clipped);
+        let data: Vec<f32> = moffat_field(w, h, &field, 4.0, 0.05)
+            .iter()
+            .map(|v| v.min(1.0) * ADU_SCALE)
+            .collect();
+        let opts = FitStarsOptions {
+            field_width: Some(4.35),
+            ..Default::default()
+        };
+        let mut with_seeds = seeds_of(&stars);
+        with_seeds.push(Seed {
+            x: clipped.x,
+            y: clipped.y,
+            peak: 1.0,
+            flux: 1.0,
+        });
+        let with = fit_stars_at(&data, w, h, &with_seeds, 4.0, &opts, None);
+        let without = fit_stars_at(&data, w, h, &seeds_of(&stars), 4.0, &opts, None);
+        // The premise: the clipped star is fitted, and its amplitude tops the range (plane max 1.0, sky ≥ 0.05).
+        let fit = with
+            .fits
+            .iter()
+            .find(|f| (f.x - clipped.x).hypot(f.y - clipped.y) < 1.0)
+            .expect("the clipped star is fitted");
+        assert!(
+            fit.amplitude > 0.95 * ADU_SCALE as f64,
+            "amplitude {}",
+            fit.amplitude
+        );
+        assert_eq!(without.aperture_stars, 30);
+        assert_eq!(with.aperture_stars, without.aperture_stars);
+        let (cw, co) = (
+            with.aperture_correction.unwrap(),
+            without.aperture_correction.unwrap(),
+        );
+        assert!((cw / co - 1.0).abs() < 1e-9, "c {cw} vs {co}");
+    }
 
     /// A prep whose seeds and verdict-pass records are the given ones (the noise model and sky statistic come from a
     /// small real plane; the cross-plane rule reads neither).

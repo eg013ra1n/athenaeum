@@ -130,7 +130,9 @@ pub(crate) fn line_fit_deviation(devs_sorted: &[f64]) -> f64 {
     small_sample_factor(n) * (sxy / sxx)
 }
 
-fn median_f64(v: &mut Vec<f64>) -> f64 {
+/// The median of `v` (the mean of the two middle values for an even count; NaN when empty); sorts `v`. Shared with
+/// F-5's aperture correction (`photometry::aperture_correction`, Task 10).
+pub(super) fn median_f64(v: &mut Vec<f64>) -> f64 {
     let n = v.len();
     if n == 0 {
         return f64::NAN;

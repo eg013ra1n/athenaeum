@@ -47,15 +47,34 @@ use crate::geometry::{
 };
 use crate::stacking::groups::median_f64;
 use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
-use crate::stacking::psf_signal::{
-    fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
-};
+use crate::stacking::psf_signal::{FitOutcome, FitParams, PsfModel, Seed, StarFit};
+use crate::star_measure::{fit_stars_at, fit_stars_with_model, FitStarsOptions};
 use crate::stacking::register::detect::{detect_stars, Star, SATURATION};
 use crate::stacking::register::DetectionConfig;
 
 /// Fewer surviving pairs than this and the frame cannot be trusted for
 /// local normalization (spec §5.2 ruling: `LnError::TooFewMatches`).
 pub const MIN_MATCHES: usize = 20;
+
+/// The full scale of every plane LN fits (F-5 round 4): the registered
+/// calibrated frames and the integrated reference are native unit-domain
+/// planes (`[0, 1]`, the calibrated-lights divisor applied; the measure path
+/// reads the same planes as `Domain::Calibrated`), so the aperture
+/// correction's clip screen caps the plane max at 1
+/// (`FitStarsOptions::full_scale`).
+const LN_PLANE_FULL_SCALE: f64 = 1.0;
+
+/// The fit options of an LN fit (F-5 round 4): the aperture correction reads
+/// LN's full scale and, in masked mode, the `allowed` region as its
+/// footprint (borrowed) — a star whose `12F` disc leaves it does not enter
+/// `c`; the fits themselves are what `FitParams::default()` gives.
+fn ln_fit_options(allowed: Option<&[bool]>) -> FitStarsOptions<'_> {
+    FitStarsOptions {
+        full_scale: Some(LN_PLANE_FULL_SCALE),
+        footprint: allowed,
+        ..Default::default()
+    }
+}
 
 /// Final review I-2: a growth-curve correction formed from fewer pairs than
 /// this is logged with a `warn!` (the value itself is never changed).
@@ -990,7 +1009,17 @@ impl PreparedReferenceChannel {
         if let Some(a) = allowed {
             ref_seeds.retain(|s| allowed_at(a, width, s.x, s.y));
         }
-        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, pool);
+        // F-5 round 4: `fit_stars` with LN's full scale and `allowed` as the
+        // aperture correction's footprint (`ln_fit_options`).
+        let outcome = fit_stars_with_model(
+            reference,
+            width,
+            height,
+            &ref_seeds,
+            psf,
+            &ln_fit_options(allowed),
+            pool,
+        );
         let beta = outcome.beta;
 
         let barycentres = link_barycentres(&outcome.fits, &ref_seeds, &fit_params);
@@ -1203,13 +1232,15 @@ fn relative_scale_against_core(
     let detect_ms = t.elapsed().as_millis() as u64;
 
     let t = Instant::now();
-    let tgt_outcome = fit_stars_with_beta(
+    // F-5 round 4: `fit_stars_with_beta` with LN's full scale and `allowed`
+    // as the aperture correction's footprint (`ln_fit_options`).
+    let tgt_outcome = fit_stars_at(
         target,
         width,
         height,
         &tgt_seeds,
         prepared.beta,
-        &fit_params,
+        &ln_fit_options(allowed),
         pool,
     );
     let fit_ms = t.elapsed().as_millis() as u64;
@@ -1636,7 +1667,6 @@ fn relative_scale_from_seeds_core(
     allowed: Option<&[bool]>,
     inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>, SeedFilterBreakdown), LnError> {
-    let fit_params = FitParams::default();
     let mut breakdown = SeedFilterBreakdown {
         available: fits.len(),
         ..Default::default()
@@ -1700,13 +1730,15 @@ fn relative_scale_from_seeds_core(
     let detect_ms = t.elapsed().as_millis() as u64;
 
     let t = Instant::now();
-    let tgt_outcome = fit_stars_with_beta(
+    // F-5 round 4: `fit_stars_with_beta` with LN's full scale and `allowed`
+    // as the aperture correction's footprint (`ln_fit_options`).
+    let tgt_outcome = fit_stars_at(
         target_plane,
         ref_width,
         ref_height,
         &seeds,
         prepared.beta,
-        &fit_params,
+        &ln_fit_options(allowed),
         pool,
     );
     breakdown.fit_accepted = tgt_outcome.fits.len();
@@ -1867,6 +1899,7 @@ pub fn relative_scale(
 mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
+    use crate::stacking::psf_signal::{fit_stars, fit_stars_with_beta};
     use crate::stacking::test_fixtures::synthetic_star_field;
     use crate::test_support::{
         add_noise, integrated_field, moffat_field, IntegratedProfile, MoffatStar,

@@ -262,6 +262,12 @@ pub struct PlaneMeasurement {
     pub cross_flags: usize,
     /// Where `channel.beta` came from (F-4, Plan A Task 9; the probe's `betaSource`). Reported, not persisted.
     pub beta_source: sm::BetaSource,
+    /// The plane's aperture correction every fit's `signal` carries (F-5, Plan A Task 10; the probe's
+    /// `apertureCorrection`); `None` = `c = 1`. Reported, not persisted.
+    pub aperture_correction: Option<f64>,
+    /// The qualifying stars `aperture_correction` is the median over (the probe's `apertureStars`). Reported, not
+    /// persisted.
+    pub aperture_stars: usize,
 }
 
 /// One plane's result from [`measure_planes_diagnosed`].
@@ -780,6 +786,8 @@ fn adapter_tail(
             verdict_fit_failed: m.verdict_fit_failed,
             cross_flags: m.cross_flags,
             beta_source: m.beta_source,
+            aperture_correction: m.aperture_correction,
+            aperture_stars: m.aperture_stars,
         },
         seeds,
         m.diagnostics,
@@ -1570,9 +1578,14 @@ pub(crate) mod tests {
         // E5: follows β; the previous literal was 1.387_279_026_471_343_5e-3 (Task 9's first build).
         assert_ulp_close(
             c.psf_signal_weight,
-            1.387_282_647_214_539e-3,
+            1.702_475_827_736_932_3e-3,
             "psf_signal_weight",
         );
+        // F-5 (Task 10, ruling F14): the star signal is the model flux in the FWTM ellipse x the plane's aperture
+        // correction, so it moved by design: the previous literal was 1.387_282_647_214_539e-3 (E5); the counts, beta
+        // and fwhm_px did not move. F-5 rounds 3/4 (owner ruling R6: `c`'s rim is the far ring [10F, 12F] mean outside
+        // every seed's 3F disc, clipped candidates screened) moved it again from 1.697_635_877_922_333_6e-3 (round 2's
+        // [6F, 8F] median); the counts, beta and fwhm_px did not move.
         // `fwhm_px` is a shape aggregate over 150 Moffat fits whose arithmetic
         // (Tier C C3: `powi`/`powf`, the reused residual) rounds differently
         // per platform's libm — the first push after C3 read 4.122_658_320_014_302_5
@@ -1859,6 +1872,13 @@ pub(crate) mod tests {
         // As above; the eccentricity before Task 8 was 0.113_127_912_625_514_87, before it 0.110_290_631_118_640_29
         // (round 1), 0.109_077_618_457_969_11 (Task 6b's first round), 0.111_709_924_171_636_75 (Task 5) and
         // 0.095_246_020_871_036_08.
+        // F-5 (Task 10, ruling F14): tflux, tmean_flux, psf_signal_weight and psf_snr read the new star signal (model
+        // flux in the FWTM ellipse x the aperture correction): E5's record read tflux 562.457_275_266_816_2, tmean_flux
+        // 11.956_329_869_046_785, psf_signal_weight 0.001_468_030_795_460_277_5, psf_snr 0.002_103_891_096_939_422; the
+        // counts, beta, fwhm_px, eccentricity and every noise/sky field did not move. F-5 rounds 3/4 (owner ruling R6: the
+        // far-ring rim, the clip screen) moved the same four from round 2's tflux 620.461_907_374_79, tmean_flux
+        // 13.189_488_893_656_062, psf_signal_weight 0.001_786_449_849_924_526_7, psf_snr 0.002_560_203_138_709_018_7;
+        // nothing else moved.
         for (got, want, what) in [
             (&mut m.beta, 99.485_664_214_790_5, "beta"),
             (&mut m.fwhm_px, 4.229_131_188_127_607, "fwhm_px"),
@@ -1867,14 +1887,14 @@ pub(crate) mod tests {
                 0.110_520_527_232_258_43,
                 "eccentricity",
             ),
-            (&mut m.tflux, 562.457_275_266_816_2, "tflux"),
-            (&mut m.tmean_flux, 11.956_329_869_046_785, "tmean_flux"),
+            (&mut m.tflux, 626.686_097_226_946_8, "tflux"),
+            (&mut m.tmean_flux, 13.321_799_809_042_265, "tmean_flux"),
             (
                 &mut m.psf_signal_weight,
-                0.001_468_030_795_460_277_5,
+                0.001_822_471_318_034_213_3,
                 "psf_signal_weight",
             ),
-            (&mut m.psf_snr, 0.002_103_891_096_939_422, "psf_snr"),
+            (&mut m.psf_snr, 0.002_611_826_348_685_623, "psf_snr"),
         ] {
             assert_ulp_close(*got, want, what);
             *got = want;
@@ -1896,15 +1916,15 @@ pub(crate) mod tests {
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
 beta: 99.4856642147905, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
-tflux: 562.4572752668162, tmean_flux: 11.956329869046785, \
+tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
 noise_source: Mrs, median: 0.08010764420032501, \
 mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
 snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
-scale: 0.0020880382508039474, psf_signal_weight: 0.0014680307954602775, \
-psf_snr: 0.002103891096939422, timings: MeasureTimings { read_ms: 0, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0018224713180342133, \
+psf_snr: 0.002611826348685623, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }
@@ -1926,9 +1946,13 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         assert_ulp_close(c.beta, 99.358_444_715_324_14, "beta");
         assert_ulp_close(
             c.psf_signal_weight,
-            1.387_249_747_235_731e-3,
+            1.702_397_814_933_499_6e-3,
             "psf_signal_weight",
         );
+        // F-5 (Task 10, ruling F14): the star signal is the model flux in the FWTM ellipse x the plane's aperture
+        // correction; the previous literal was 1.387_249_747_235_731e-3 (E5). The counts, beta and fwhm_px did not move.
+        // F-5 rounds 3/4 (owner ruling R6: the far-ring rim, the clip screen): moved from 1.697_649_473_105_291_6e-3
+        // (round 2); stars_unsaturated, beta and fwhm_px did not move.
         // F-3 (Task 8, ruling R-OSP-5): the statistic over the unflagged fits; the literal before Task 8 was
         // 4.129_369_725_278_327.
         assert_eq!(c.stars_unsaturated, 144);
@@ -1962,6 +1986,12 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         // 0.001_468_033_418_188_667_2, psf_snr 0.002_103_895_096_442_766_7 (the counts and flags did not move).
         // F-3 (Task 8, ruling R-OSP-5): the literals before it were fwhm_px 4.130_362_798_202_614 and eccentricity
         // 0.111_119_809_985_610_2.
+        // F-5 (Task 10, ruling F14): the same four fields read the new star signal; the record before read tflux
+        // 562.457_716_878_329_7, tmean_flux 11.956_344_823_185_944, psf_signal_weight 0.001_468_033_784_191_355_4,
+        // psf_snr 0.002_103_894_400_667_322; the counts, beta, fwhm_px, eccentricity and noise/sky fields did not move.
+        // F-5 rounds 3/4 (owner ruling R6: the far-ring rim, the clip screen) moved the same four from round 2's tflux
+        // 620.456_295_156_370_2, tmean_flux 13.189_375_194_910_12, psf_signal_weight 0.001_786_418_291_297_927_3,
+        // psf_snr 0.002_560_156_823_684_486_6; the counts, beta, fwhm_px, eccentricity and noise/sky fields did not move.
         for (got, want, what) in [
             (&mut m.beta, 99.543_280_832_639_97, "beta"),
             (&mut m.fwhm_px, 4.229_139_285_746_762, "fwhm_px"),
@@ -1970,14 +2000,14 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
                 0.111_441_722_284_783_02,
                 "eccentricity",
             ),
-            (&mut m.tflux, 562.457_716_878_329_7, "tflux"),
-            (&mut m.tmean_flux, 11.956_344_823_185_944, "tmean_flux"),
+            (&mut m.tflux, 626.222_210_579_139_6, "tflux"),
+            (&mut m.tmean_flux, 13.311_944_378_987_553, "tmean_flux"),
             (
                 &mut m.psf_signal_weight,
-                0.001_468_033_784_191_355_4,
+                0.001_819_775_024_070_364_4,
                 "psf_signal_weight",
             ),
-            (&mut m.psf_snr, 0.002_103_894_400_667_322, "psf_snr"),
+            (&mut m.psf_snr, 0.002_607_961_118_702_720_6, "psf_snr"),
         ] {
             assert_ulp_close(*got, want, what);
             *got = want;
@@ -1987,15 +2017,15 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
 beta: 99.54328083263997, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
-tflux: 562.4577168783297, tmean_flux: 11.956344823185944, \
+tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
 noise_source: Mrs, median: 0.08010764420032501, \
 mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
 snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
 noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
-scale: 0.0020880382508039474, psf_signal_weight: 0.0014680337841913554, \
-psf_snr: 0.002103894400667322, timings: MeasureTimings { read_ms: 0, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0018197750240703644, \
+psf_snr: 0.0026079611187027206, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         );
     }

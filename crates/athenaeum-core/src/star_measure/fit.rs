@@ -1,7 +1,7 @@
 //! The per-star fit (math reference §1.4; spec 2026-10-07 §2.1 `fit`): elliptical Moffat fits on the seeds, the
-//! per-star sampling region, the acceptance rules, the hybrid PSF/aperture flux inside each fit's FWTM ellipse and the
-//! ±1 px duplicate drop. Moved verbatim from `psf_signal` (Plan A Task 2); the `Auto` β search lives in
-//! [`super::beta`]. Coordinates are 0-based pixel centres.
+//! per-star sampling region, the acceptance rules, each fit's star flux (from F-5, the model's flux in its FWTM
+//! ellipse times the plane's aperture correction) and the ±1 px duplicate drop. Moved verbatim from `psf_signal`
+//! (Plan A Task 2); the `Auto` β search lives in [`super::beta`]. Coordinates are 0-based pixel centres.
 //!
 //! F-0 (Plan A Task 4): every seed gets exactly one outcome — an accepted fit or a counted
 //! [`RefusalReason`] — collected in seed order from the same parallel chain, so the accepted fits, their order and
@@ -41,6 +41,12 @@
 //! no verdict fits its own sample, [`own_sample_fits`]), clamped to [`super::beta::BETA_BOUNDS`]; a frame β at a
 //! bound flags every star fitted at it [`StarFlags::BETA_AT_CAP`]. The verdict fit and the fits at β stay the point
 //! model.
+//!
+//! F-5 (Plan A Task 10, ruling R-OSP-7): a fit's `signal` is no longer the pixel sum inside its FWTM ellipse (the
+//! fraction of a star's light that ellipse holds is 0.75 of a Moffat-2.5's and 0.94 of a Gaussian's): it is
+//! [`super::photometry::model_flux_in_fwtm`] times the plane's aperture correction `c`
+//! ([`super::photometry::aperture_correction`], measured after the duplicate drop, or the caller's
+//! [`super::FluxCorrection::Given`]). No fit, refusal or acceptance rule reads `signal`: every fit is what it was.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -222,7 +228,10 @@ pub struct StarFit {
     pub beta: f64,
     /// Normalized fit residual, `sqrt(cost/n)/amplitude`.
     pub residual: f64,
-    /// Background-subtracted flux inside the FWTM ellipse.
+    /// The star's flux (F-5, Task 10): the fitted model's flux inside its FWTM ellipse
+    /// ([`super::photometry::model_flux_in_fwtm`]) times the plane's aperture correction
+    /// ([`FitOutcome::aperture_correction`]; 1 when it is `None`). Before Plan A Task 10, the background-subtracted
+    /// pixel sum inside that ellipse.
     pub signal: f64,
     /// Analytic area of that ellipse, `π·(k/2)²·fwtm_x·fwtm_y`.
     pub area: f64,
@@ -287,6 +296,12 @@ pub struct FitOutcome {
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4: no flag, no refusal, out
     /// of the β sample); 0 on every path that runs no verdict.
     pub verdict_fit_failed: usize,
+    /// The aperture correction `c` every fit's `signal` carries (F-5, Task 10): the plane's own
+    /// ([`super::FluxCorrection::FromPlane`]) or the caller's ([`super::FluxCorrection::Given`]). `None` = `c = 1`:
+    /// no fit, or fewer than 5 isolated unsaturated stars qualified.
+    pub aperture_correction: Option<f64>,
+    /// The qualifying stars the plane's own `aperture_correction` is the median over (at most 64); 0 for a caller's.
+    pub aperture_stars: usize,
 }
 
 /// A plane with this many readable seeds refused `Donut`, and at least [`DEFOCUSED_DONUT_FRACTION`] of its readable
@@ -1039,7 +1054,11 @@ fn fit_one(
         Ok(f) => f,
         Err(reason) => return (Err(reason), trace),
     };
-    aperture(data, mask, w, h, &mut f, p.growth);
+    // F-5 (Task 10): the model's flux in its FWTM ellipse; the plane's aperture correction scales it after the
+    // duplicate drop ([`fit_at_width`]). `area` keeps its meaning: the analytic area of the `k·FWTM/2` ellipse.
+    let (a, b) = (0.5 * p.growth * f.fwtm_x, 0.5 * p.growth * f.fwtm_y);
+    f.area = std::f64::consts::PI * a * b;
+    f.signal = super::photometry::model_flux_in_fwtm(&f);
     // At least 10 present pixels were gathered, so all five slots are filled.
     f.peak5 = top.iter().sum::<f64>() / top.len() as f64;
     if saturated {
@@ -1501,44 +1520,6 @@ fn canonical_theta(theta: f64) -> f64 {
     }
 }
 
-/// Sum `pixel − background` over the present (finite, unmasked) pixels whose
-/// centres lie inside the ellipse with semi-axes `k·fwtm/2`, rotated by
-/// `theta` about the fitted centre (`u = dx·cosθ + dy·sinθ`,
-/// `v = −dx·sinθ + dy·cosθ`); `area` is the ellipse's analytic area.
-pub(crate) fn aperture(
-    data: &[f32],
-    mask: Option<&[bool]>,
-    w: usize,
-    h: usize,
-    f: &mut StarFit,
-    k: f64,
-) {
-    let (a, b) = (0.5 * k * f.fwtm_x, 0.5 * k * f.fwtm_y);
-    let (st, ct) = f.theta.sin_cos();
-    let hx = ((a * ct).powi(2) + (b * st).powi(2)).sqrt();
-    let hy = ((a * st).powi(2) + (b * ct).powi(2)).sqrt();
-    let x0 = (f.x - hx).floor().max(0.0) as usize;
-    let x1 = ((f.x + hx).ceil().max(0.0) as usize).min(w.saturating_sub(1));
-    let y0 = (f.y - hy).floor().max(0.0) as usize;
-    let y1 = ((f.y + hy).ceil().max(0.0) as usize).min(h.saturating_sub(1));
-    let mut sum = 0.0f64;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let (dx, dy) = (x as f64 - f.x, y as f64 - f.y);
-            let u = dx * ct + dy * st;
-            let v = -dx * st + dy * ct;
-            if (u / a).powi(2) + (v / b).powi(2) <= 1.0 {
-                let i = y * w + x;
-                if present(data, mask, i) {
-                    sum += data[i] as f64 - f.background;
-                }
-            }
-        }
-    }
-    f.signal = sum;
-    f.area = std::f64::consts::PI * a * b;
-}
-
 /// Drop every fit that has a brighter accepted fit within ±1 px. Each fit
 /// travels with its seed index, which the comparison never reads: the stable
 /// sort orders the pairs exactly as it orders the bare fits, so the kept
@@ -1633,7 +1614,32 @@ pub fn fit_stars(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_diagnosed(data, w, h, seeds, model, p, None, None, pool, false, false)
+    fit_stars_diagnosed(
+        data,
+        w,
+        h,
+        seeds,
+        model,
+        p,
+        None,
+        None,
+        pool,
+        false,
+        false,
+        Correction::default(),
+    )
+}
+
+/// What a fit call's aperture correction reads from its caller (F-5, Task 10; one struct from round 4): where `c`
+/// comes from (`flux`), the clip screen's range (`saturation`, the measure path's plane inputs; else the plane's own
+/// under `full_scale`, [`super::photometry::unverdicted_clip_range`]) and the footprint a qualifier's `12F` disc must
+/// lie in. `Default`: measured on the plane, uncapped, the whole plane.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Correction<'a> {
+    pub(super) flux: super::FluxCorrection,
+    pub(super) saturation: Option<&'a SaturationPlane>,
+    pub(super) full_scale: Option<f64>,
+    pub(super) footprint: Option<&'a [bool]>,
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -1667,8 +1673,9 @@ pub(super) fn resolve_field_width(
 /// [`fit_stars`], also keeping one [`FitDiagnostics`] per seed, in seed
 /// order, in [`FitOutcome::diagnostics`] when `diagnostics` is set (empty
 /// otherwise: the run never asks).
-/// `mask` and `field_width` as [`super::FitStarsOptions`] carries them. No verdict, no flag, the brightest seeds as
-/// the β sample: the measure path runs [`verdict_pass`] and [`fit_after_passes`] instead (F-3, Task 8).
+/// `mask`, `field_width` and the `correction` inputs as [`super::FitStarsOptions`] carries them. No verdict, no flag,
+/// the brightest seeds as the β sample: the measure path runs [`verdict_pass`] and [`fit_after_passes`] instead (F-3,
+/// Task 8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_diagnosed(
     data: &[f32],
@@ -1682,6 +1689,7 @@ pub(super) fn fit_stars_diagnosed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    correction: Correction<'_>,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
     fit_after_passes(
@@ -1694,6 +1702,7 @@ pub(super) fn fit_stars_diagnosed(
         mask,
         field,
         None,
+        correction,
         pool,
         diagnostics,
         defocus_verdict,
@@ -1739,6 +1748,7 @@ pub(super) fn fit_after_passes(
     mask: Option<&[bool]>,
     field: FieldWidth,
     passes: Option<&[SeedPass]>,
+    correction: Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
@@ -1768,6 +1778,7 @@ pub(super) fn fit_after_passes(
         pool,
         diagnostics,
         defocus_verdict,
+        correction,
     );
     outcome.beta_source = beta_source;
     if matches!(beta_source, BetaSource::Fitted { .. }) && super::beta::at_bound(beta) {
@@ -1808,7 +1819,20 @@ pub fn fit_stars_with_beta(
     p: &FitParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
-    fit_stars_with_beta_diagnosed(data, w, h, seeds, beta, p, None, None, pool, false, false)
+    fit_stars_with_beta_diagnosed(
+        data,
+        w,
+        h,
+        seeds,
+        beta,
+        p,
+        None,
+        None,
+        pool,
+        false,
+        false,
+        Correction::default(),
+    )
 }
 
 /// [`fit_stars_with_beta`], also keeping one [`FitDiagnostics`] per seed, in
@@ -1819,8 +1843,9 @@ pub fn fit_stars_with_beta(
 /// in seed order; the accepted fits are read off it sequentially — the very
 /// list the filtered chain collected before — and handed to [`dedupe`], so
 /// the kept fits, their order and every sum over them are unchanged. A seed
-/// whose fit the duplicate drop removed is refused `Duplicate`. `mask` and
-/// `field_width` as [`super::FitStarsOptions`] carries them.
+/// whose fit the duplicate drop removed is refused `Duplicate`. `mask`,
+/// `field_width` and the `correction` inputs as [`super::FitStarsOptions`]
+/// carries them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_stars_with_beta_diagnosed(
     data: &[f32],
@@ -1834,6 +1859,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    correction: Correction<'_>,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
     fit_at_width(
@@ -1849,11 +1875,15 @@ pub(super) fn fit_stars_with_beta_diagnosed(
         pool,
         diagnostics,
         defocus_verdict,
+        correction,
     )
 }
 
 /// The body both entry points share once β and the field width are resolved. `passes`: the measure path's verdict
-/// pass (F-3), `None` on every other path.
+/// pass (F-3), `None` on every other path. `correction` (F-5): the kept fits' model fluxes are scaled by the plane's
+/// aperture correction (measured here, after the duplicate drop: the clip screen reads `correction.saturation`'s range
+/// on the measure path, else the plane's own under `correction.full_scale`, owner ruling R6 / round 4; a qualifier's
+/// `12F` disc lies in `correction.footprint`) or the caller's (`correction.flux`).
 #[allow(clippy::too_many_arguments)]
 fn fit_at_width(
     data: &[f32],
@@ -1868,6 +1898,7 @@ fn fit_at_width(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    correction: Correction<'_>,
 ) -> FitOutcome {
     let per_seed = fit_all_outcomes(
         data,
@@ -1908,9 +1939,43 @@ fn fit_at_width(
             traces.push(trace);
         }
     }
-    let kept = dedupe(accepted);
+    let mut kept = dedupe(accepted);
     for (star, &(seed, _)) in kept.iter().enumerate() {
         outcomes[seed] = Outcome::Accepted { star };
+    }
+    // F-5 (Task 10): the aperture correction, after the duplicate drop and before any total reads `signal`; it moves
+    // no fit, only every kept fit's flux.
+    let given = match correction.flux {
+        super::FluxCorrection::Given(c) if c.is_finite() && c > 0.0 => Some(c),
+        super::FluxCorrection::Given(bad) => {
+            warn!(
+                aperture_correction = bad,
+                count = kept.len(),
+                "fit: the given aperture correction is not a positive number; the plane's own is measured"
+            );
+            None
+        }
+        super::FluxCorrection::FromPlane => None,
+    };
+    let (aperture_correction, aperture_stars) = match given {
+        Some(c) => (Some(c), 0),
+        None => super::photometry::aperture_correction(
+            data,
+            mask,
+            w,
+            h,
+            &kept,
+            seeds,
+            field.fwhm_px,
+            correction.saturation,
+            correction.full_scale,
+            correction.footprint,
+        ),
+    };
+    if let Some(c) = aperture_correction {
+        for (_, f) in &mut kept {
+            f.signal *= c;
+        }
     }
     let mut refused = RefusalCounts::default();
     for o in &outcomes {
@@ -1969,6 +2034,8 @@ fn fit_at_width(
         defocused,
         defocus_donuts: if defocus_verdict { n_donut } else { 0 },
         verdict_fit_failed,
+        aperture_correction,
+        aperture_stars,
     }
 }
 
@@ -2027,6 +2094,10 @@ mod tests {
         assert_eq!(out.beta, 4.0);
         assert_eq!(out.seeds, 3);
         assert_eq!(out.fits.len(), 3);
+        // F-5 (Task 10): fewer than 5 stars qualify for the plane's aperture correction, so `c` is None and every
+        // `signal` below is the bare model flux in the FWTM ellipse (0.8222 of the total).
+        assert_eq!(out.aperture_correction, None);
+        assert!(out.aperture_stars < 5, "{}", out.aperture_stars);
         let fwhm = 2.0 * 5.0 * (2f64.powf(0.25) - 1.0).sqrt(); // 4.3498
         let fwtm = 2.0 * 5.0 * (10f64.powf(0.25) - 1.0).sqrt(); // 8.8220
         assert!((fwtm_from_alpha(5.0, 4.0) - fwtm).abs() < 1e-12);
@@ -2045,7 +2116,7 @@ mod tests {
                 f.background
             );
             let total = std::f64::consts::PI * s.amp * 25.0 / 3.0;
-            let expected = total * (1.0 - 10f64.powf(0.25 - 1.0)); // 0.8222·total
+            let expected = total * (1.0 - 10f64.powf(0.25 - 1.0)); // 0.8222·total (F-5: c = None, the bare model flux)
             assert!(
                 (f.signal - expected).abs() < 0.06 * expected,
                 "signal {} vs {expected}",
@@ -2215,7 +2286,7 @@ mod tests {
         let expected = total * (1.0 - 10f64.powf(0.25 - 1.0));
         assert!(
             (f.signal - expected).abs() < 0.06 * expected,
-            "signal {} vs {expected}: the aperture rotation must follow the fitter's θ convention",
+            "signal {} vs {expected} (the bare model flux, c = None under F-5): the aperture rotation must follow the fitter's θ convention",
             f.signal
         );
         assert!((f.fwhm().powi(2) - f.fwhm_x * f.fwhm_y).abs() < 1e-9);

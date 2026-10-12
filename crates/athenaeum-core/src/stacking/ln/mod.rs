@@ -2810,8 +2810,11 @@ mod tests {
         // controller): half 1.216295 / full 1.213104 (0.263 %) became half 1.217607 / full 1.213308 (0.354 %), both
         // nearer the true 1.25 — the half-covered path, on fewer stars, moved more. The bound 0.003 → 0.004; the LN
         // scale itself is Plan B's to re-baseline (PA-14, spec F-8).
+        // Plan A Task 10 (F-5, STOP 4 ruling): each LN side now carries its own aperture correction; with 12
+        // footprint qualifiers on the target the half/full ratio has sd 0.99 % over 30 noise seeds (RF7), so the
+        // consistency bound 0.004 -> 0.030 (3 sigma). The truth assertions below pass on 30 of 30 seeds.
         assert!(
-            rel < 0.004,
+            rel < 0.030,
             "half {} vs full {}: {rel}",
             half.scale,
             full.scale

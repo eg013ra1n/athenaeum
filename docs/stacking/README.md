@@ -2448,3 +2448,155 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       probe's accepted star lines carry neither the iteration count nor the conditioned amplitude, so the lab count
       the review asked for is a proxy: of 8 476 censored accepted verdicts in the t09-f4 probe outputs, 0 read β within
       1e-3 of the start 3.0.
+
+  - **R-OSP-7 - the star flux is the model's flux in its FWTM ellipse times a per-plane aperture correction (F-5, Plan A
+    Task 10; ruling F14, no `MEASURE_VERSION` bump: one bump per merged plan, PA-4).**
+    - **The signal.** `StarFit::signal` = `photometry::model_flux_in_fwtm` (the analytic `A·π·αx·αy/(β−1)·(1 −
+      10^{(1−β)/β})`, no pixel read; the limit `ln 10` at β = 1) × `c`, the plane's aperture correction; `area` keeps
+      its meaning. `c` is measured after the accepted fits and the ±1 px duplicate drop and before `FrameAggregates::of`,
+      so `tflux`, `tmean_flux`, `psf_signal_weight`, `psf_snr` and every consumer of `signal` read the new flux. The
+      old ellipse sum (`fit.rs::aperture`) is deleted: no production caller and no test needed it.
+    - **`c`** = the median over the 64 brightest qualifying fits (by model flux, ties by seed index) of
+      `growth(star) / model_flux`: `growth` = the sum of `v − b` over the pixels with `r ≤ 5F`, `b` = the PLAIN MEAN
+      of the present pixels at `10F ≤ d ≤ 12F` that lie outside every seed's `3F` disc (owner ruling R6, round 3; until
+      round 2 the median of `[6F, 8F]`); `F` = the plane's frame FWHM (`frame_shape` over the unsaturated fits). A
+      ratio only when the model flux is finite and > 0.
+    - **Qualifying star** (brief C0): an accepted fit after the duplicate drop; not `flags.saturated()` (own or
+      cross-plane); its fitted amplitude not above the plane's range (the clip screen, R6); no other seed handed to the
+      fitter (accepted or not) within `6·F_field` px of its fitted centre; its whole `12F` disc inside the plane and
+      inside the caller's footprint (round 4); no absent pixel (non-finite or masked) within `5F`; a rim pixel left. Constants: `GROWTH_RADIUS_PER_FWHM = 5`,
+      `GROWTH_RIM_INNER/OUTER_PER_FWHM = 10 / 12`, `GROWTH_RIM_SEED_MASK_PER_FWHM = 3`, `CORRECTION_STARS = 64`,
+      `CORRECTION_MIN_RATIOS = 5`, `CORRECTION_ISOLATION_PER_FIELD_FWHM = 6.0`.
+    - **R6 (owner ruling 2026-10-11, brief C6; after the lab's RF5 / RF5b / RF5c research).** Why: on the Measure path
+      `c` worked (t10-f5 r1, C1.1 0.88 / 1.61 %), but LN's `c` was wrong because (1) LN's fits run no saturation verdict,
+      so clipped stars filled the 64 (c −8 to −11 %), and (2) the `[6F, 8F]` median read the neighbours' light
+      non-linearly (part 1's L3 sky, f1v2-findings mechanism 3 - the basis of the ruling, not the bars). The rim is the
+      far ring `[10F, 12F]`, the seed discs (radius `3F`, seed positions, the star's own included, one plane-wide bit
+      mask per call: `photometry::SeedMask`) are left out, `b` is their plain mean. **The clip screen** (F-3's amplitude
+      clause on every path): a candidate whose fitted amplitude > `range = min(plane max, norm) − sky median` does not
+      qualify - on the measure path the plane's own `SaturationPlane`; on a path without a verdict (`fit_stars_at`, its
+      wrappers, LN) `photometry::unverdicted_clip_range` of the fitted plane: plane max over its present pixels,
+      `norm` = the caller's full scale (round 4, below), the sky median of the module's stratified sample clipped to `(0, plane max)` (`SkyLevel`'s
+      clipped median without its one-count margins, which need the plane's units: LN hands native `[0, 1]` planes, the
+      probe ADU-scaled ones). The screened count rides on the per-plane events as `skipped`. The plateau clause is NOT
+      in the screen (RF5b: it adds 0 on both paths and needs a noise σ the refit paths do not have). Predicted by RF5c
+      (non-`c` parts held): every LN bar passes (psfSel max 1.72 %), C1.1 0.76 / 1.38 %. Known costs, recorded: absolute
+      flux on nebula / crowded wide frames (neb3 0.92 → 0.88, hc11B G `_0003` −5.9 %, crowded ±4 %); Task 13 (M42) reads
+      the weights.
+    - **Round 4 (controller rulings, 2026-10-11).** (1) **The footprint**: LN's planes are zero outside its `allowed`
+      region (the eroded coverage / overlap, `ln/mod.rs`) and LN seeds only inside it, so a far-ring mean reaching past
+      it read zero fill and unseeded stars. `FitStarsOptions::footprint` (borrowed `&[bool]`, never copied): a star
+      qualifies for `c` only when every pixel centre within `12F` of it has `footprint[i]`, exactly like the plane-edge
+      rule; read by the aperture correction alone (the fits do not see it). LN passes `allowed` on both sides - the
+      reference's (`PreparedReferenceChannel::build_with`, through the new `star_measure::fit_stars_with_model`) and the
+      target's (`relative_scale_against_core` / `relative_scale_from_seeds_core`, through `fit_stars_at`); legacy mode
+      and every other caller pass none and behave as in round 3. Cost: a star within `12F` of the region's edge does not
+      qualify; a small overlap may fall under 5 (`c` = 1, one `warn!` on that side). (2) **The screen's full scale**
+      is the caller's, in the plane's own units: `FitStarsOptions::full_scale` (`None` = uncapped, `range = plane max −
+      sky median`); LN passes `1.0` (`ln/scale.rs::LN_PLANE_FULL_SCALE`: its registered frames and reference are the
+      unit-domain calibrated planes the measure path reads as `Domain::Calibrated`), the probe's betas path `ADU_SCALE`
+      for its ADU-scaled plane; the measure path keeps its `SaturationPlane`. (3) Plan tests 1 and 2 assume isolated
+      stars and R6's footprint is `12F`, so they run on a 140-px grid on an 841 × 701 plane (a 70-px margin = ⌈12 × 5.78⌉,
+      the widest profile's measured frame FWHM, + 1 px for the last pixel centre; the range-setting star at a cell
+      centre, 99 px from its four stars); the 70-px number stays as a labelled pin (F28,
+      `r6_far_ring_takes_in_the_neighbours_wings_on_a_70_px_grid`: 0.98164, R6's neighbour-wing cost). (4)
+      `ln_refit_takes_a_given_correction` carries round 2's range-setting star (1.5×, unseeded) 140 px below its grid
+      on a 480 × 560 plane. (5) **EXPTIME's one ulp** was serde_json's float parse: the cached `FrameMeasurement`
+      JSON carried ryu's shortest strings (e.g. `96.26476737863949`, bits `…379`) that serde_json without
+      `float_roundtrip` read one ulp low (`…378`; 4 of 4 cached frames had such a field), so the cached run's weights
+      and `weighted_exposure_s` moved an ulp; `athenaeum-core` now enables serde_json's `float_roundtrip` feature (no
+      version change, `Cargo.lock` unchanged) and the crop test passes unedited. (6) The four `stacking::measure`
+      literal pins re-pinned to R6's values (psf_signal_weight 1.6976e-3 → 1.7025e-3 / 1.7024e-3; the `2026_09_19`
+      records' tflux 620.46 → 626.22 / 626.69); no count, β, width or noise/sky field moved. (7) **The wall time** is
+      code layout, not work: on the mono frame (5 rotations) base reads 1 740-1 761 ms, round 3 1 856-1 879, round 4
+      1 726-1 835, and round 4 with a five-line timer added inside `aperture_correction` 1 659-1 721 - faster than base
+      while doing the same work; the `c` computation itself times 5.4-5.7 ms. Nothing to fix.
+    - **Fallbacks.** Fewer than 5 ratios: `c = 1`, `aperture_correction = None`, ONE `warn!` per plane. No fit on the
+      plane (defocused verdict, starless): `None`, `debug!` only. A CFA-masked plane (Plan C, no production caller today)
+      gets `c = 1` by these rules: **a Plan C carry**.
+    - **Surfaces.** `FluxCorrection::{FromPlane (default), Given(f64)}` on `FitStarsOptions` (LN: `FromPlane` on each
+      side), with `full_scale` and the borrowed `footprint` (round 4; `FitStarsOptions<'a>`), and
+      `star_measure::fit_stars_with_model` (`fit_stars_at` with β from a `PsfModel`, LN's reference side); `FitOutcome` and both `PlaneMeasurement`s carry `aperture_correction` and `aperture_stars` (the qualifying
+      count, at most 64; 0 for a caller's `Given`); the probe's measure and betas frame lines carry `apertureCorrection`
+      and `apertureStars`. New log field `aperture_correction` (logging dictionary note, Task 10).
+    - **Moved pins (by design, F14).** The four `stacking::measure` fixture pins (tflux 562.457 → 620.462, tmean_flux
+      11.956 → 13.189, psf_signal_weight 1.468e-3 → 1.786e-3 on the `2026_09_19` records and 1.387e-3 → 1.698e-3 on the
+      field-7 pins; counts, β, fwhm_px, eccentricity, noise and sky unchanged); `fixed_beta_fit_recovers_…_aperture_signal`
+      (3 stars, fewer than 5 qualify, so `c` is None and `signal` is the bare model flux, asserted); the stale message
+      of `aperture_follows_the_fitted_ellipse_orientation`. The plan's two captured-flux tests render one range-setting
+      star of 1.5× the grid amplitude at (25, 25), not seeded: F-3's verdict flags a star whose fitted amplitude tops
+      the plane's range, so a field of equal brightest stars has no unsaturated star and `c` would be None (round 1: test 1
+      0.74880 uncorrected; with the star 0.99169; test 2 spread 0.77 %, all medians within 1 %).
+    - **STOP 2 (round 2) - both tests PASS under R6 (round 3), unedited.** Round 2's record: two LN truth tests failed: `matched_flux_ratio_recovers_a_uniform_scale`
+      reads scale 1.23832 against 1.25 ± 0.01, `the_local_spline_follows_a_scale_gradient` reads A(511) 0.81156 against
+      0.80013 ± 0.01. Mechanism (round 1, LN fixture, Gaussian FWHM 4.2, 60 stars, true seeds, β 4): noiseless `c` =
+      1.0555 at every amplitude; at noise 0.002 `c` = 1.077 / 1.070 / 1.060 / 1.057 / 1.051 at ×0.5 / 0.8 / 1 / 1.2 / 2
+      (the fitted model flux reads low at low SNR and each frame's `c` absorbs its own bias), so `c_ref/c_tgt` between
+      frames of different SNR is off by 1-2 % and LN's scale inherits it. A shared `c` (`Given(c_ref)` on the target)
+      reads ≈ +0.24 % against ≈ −1.36 % per side (rough). The controller rules after the lab step.
+    - **STOP 3 (round 3) - closed by the round-4 rulings but (c)'s first test, STOP 4 below.** Round 3's record: five truth tests failed under R6 and stayed as they were:
+      (a) `captured_flux_is_the_total_flux_on_a_moffat_2_5_field` 0.98164 and the Moffat-2.5 median of
+      `captured_flux_spread_across_profiles_is_within_two_percent` 0.98243 (bar 1 %; spread 1.79 % passes): the 70-px
+      grid is 12.1 F at FWHM 5.78, so the neighbours' β-2.5 wings beyond their `3F` discs sit in the far ring and the
+      plain mean takes them (`b` +8.5e-5 native); the lab's own `growth_mean_rim` / `union_mask` give 0.98164 on the
+      same field, and 0.9946 on a 140-px grid. (b) `ln_refit_takes_a_given_correction`: `c` None - its 30 equal stars
+      fit amplitude 19 660.5009 against the range 19 660.4949 (`plane max − sky median`, the median lifted by the
+      wings), so every one is screened; with round 2's range-setting star (1.5×, unseeded) `c` = 1.21603 over 30 and
+      the assertions hold. (c) `masked_ln_half_coverage_agrees_with_legacy_full_coverage_under_the_production_kernel`
+      (half 1.29403 vs full 1.25211, 3.35 % against 0.4 %) and `masked_ln_recovers_the_half_covered_scale_from_measured_seeds`
+      (1.30677 vs 1.25 ± 0.0125): the target's `c` 1.0226 (20 ratios) against the reference's 1.0662 (30) - LN keeps
+      only the overlap's seeds, the stars beyond it still light the target plane, they sit 46 px (≈ 11 F) from the
+      overlap-edge column, in its far ring, unmasked; a noiseless replica reads those 5 ratios 0.28-0.60 against the rest's 1.111,
+      a quarter of a small sample. Also moved: `stacking::run::a_full_rectangle_crop_writes_what_the_zero_crop_path_writes`
+      (EXPTIME 224.06130914091074 vs 224.0613091409108, one ulp, deterministic; the second run reads cached
+      measurements - plausibly serde_json's float parsing, no `float_roundtrip`) and the four `stacking::measure`
+      literal pins (re-pin owed after the ruling).
+    - **STOP 4 (round 4; closed below).** With the footprint, `masked_ln_recovers_the_half_covered_scale_from_measured_seeds`
+      passes unedited (1.25060), `masked_ln_half_coverage_agrees_with_legacy_full_coverage_under_the_production_kernel`
+      does not: half 1.23724 vs full 1.25211 (1.19 % against 0.4 %; |half − 1.25| 0.0128 passes 0.0331). Per side: the
+      reference's `c` 1.06911 over 26 (full: 1.06908 over 40), the target's 1.07248 over 12 (full: 1.06014 over 40) -
+      the whole move is the target's `c` on 12 qualifiers. A same-plane check reproduces both target values to 7
+      digits on the fixture's target smoothed by the B-spline kernel at integer positions ([1, 4, 1]/6, no prefilter):
+      there the per-star growth/model ratios spread 0.96-1.15 and the 12 inside the overlap footprint have a median 1.2 %
+      above the 40; on the raw (unsmoothed) plane the 12 and the 40 agree within 0.02 % (1.06891 / 1.06908).
+    - **Real frames** (LDN_1272 `…_0000` mono and `…_0000_d` OSC, release probe, `--paths measure`, base = Task 9 close
+      → F-5, 3 interleaved runs; stars fitted, β and frame FWHM identical): mono β 2.000, FWHM 2.226 px, 12 748 fits,
+      `c` 1.3967 (64 qualify), sum of star signal 8 263 → 14 841, wall 1 715-1 870 → 1 723-1 768 ms; OSC R / G / B `c`
+      1.3384 / 1.2529 / 1.2246 (64 each), sum of signal 3 675 / 4 269 / 3 783 → 5 427 / 6 050 / 4 910, wall unchanged
+      within noise. **Round 3 (R6)**, same frames and base: fits, β, FWHM and every star line but `signal` identical;
+      mono `c` 1.3967 → 1.3999 (64, 21 candidates screened), tflux 14 876; OSC R / G / B `c` 1.3579 / 1.2747 / 1.2286
+      (64 each), tflux 5 506 / 6 155 / 4 926; the `c` computation times 5.5 ms on the mono plane, yet the mono wall reads
+      1 817-1 856 ms against base 1 682-1 809 (6 interleaved pairs; OSC +3-5 %) - not explained by `c` (round 4: code
+      layout, above). **Round 4**, same frames and base: the measure path is unchanged from round 3 (the footprint and
+      the full scale are not on it) - fits, β, FWHM identical to base, mono `c` 1.39994 (64), OSC R / G / B 1.35791 /
+      1.27471 / 1.22859 (64 each); mono wall base 1 688-1 757 vs round 4 1 780-1 837 (5 interleaved pairs).
+    - **STOP 4 closed (RF7, controller ruling 2026-10-11).** `masked_ln_half_coverage_agrees_with_legacy_full_coverage_under_the_production_kernel`:
+      both truth assertions stay as they were; only the half-vs-full consistency bound moved 0.004 -> 0.030. F-5 gives
+      each LN side its own aperture correction; with 12 footprint qualifiers on the target the half/full ratio has sd
+      0.99 % over 30 noise seeds (passes 0.4 % in 7 of 30), so 0.030 = 3 sigma; the truth assertions pass on 30 of 30
+      seeds. Real LDN_1272 (RF7): registered planes give the best `c` (per-star MAD 3.6 % vs 8.1 % calibrated, bootstrap
+      SE 0.59 % vs 1.09 %, frame-to-frame spread 1.41 % vs 2.02 %); the pixel-phase effect is real only on undersampled
+      calibrated planes (14 % swing) and the B-spline warp flattens it (+-0.5 %); an LN-like check on registered targets
+      reads the c-corrected model ratio against the model-free growth ratio at +0.18 % (sd 1.08 %). A pixel-integrated
+      denominator gains nothing, a shared star set is worse on real frames (1.41 -> 1.64 %).
+    - **Why a plain mean in the far ring.** Neighbour light is linear, so the mean takes it in proportion and the
+      seed-disc mask removes the neighbours' cores; a median reads it non-linearly (part 1's L3 sky mechanism). The
+      price is paid where the sky is structured (below), and is recorded, not patched (owner rule: no second pass).
+    - **Acceptance (lab step `t10-f5`, r2 at e3312b03, lab 39bb670): BAR PASS**, every number equal to the RF5c
+      prediction to the printed digit. C1.1 spread at F 2.6 / F 8.0 **0.76 % / 1.38 %** (bar 2 %); C1.2 psfSel
+      `pairs/iso/blur25mix` t60 **+1.72 %**, `pairs/iso/blur4` t60 **+1.19 %** (bar +-2 %); C1.3 pure families **0 / 70**
+      over 1.2 % (worst -1.09 %); C1.4 mixtures **0 / 20** miss (worst +1.72 %); control, register guard and both
+      no-regression diffs PASS. r1 was read and is the reason for R6 (C1.1 0.88 / 1.61 %, LN `c` wrong).
+    - **Known limits (recorded, not judged; owner rulings C6, C7, RF8: KEEP R6, no per-star residual screen).**
+      (1) Nebula structure: `c` is biased where the sky has structure the plain mean cannot model - `neb3` row 6 0.8802
+      (c off -11.5 % +- 5.6 % SE), `neb3_4096` 1.1287 (+13.9 % +- 2.3 %; stars selected on bumps, p 0.002), `neb0.5`
+      0.9885, `neb0.1` 0.9964; against t09 the move is `c` itself (+0.05 to +0.30, 10-400 SE). Only a background model
+      fixes it (out of scope). (2) Crowded wide frames +-4 % (`pairs/main` row 6 0.945-1.029, worst 5.48 %).
+      (3) The injected-star rows (calibrated inject +4 to 5.5 %; raw mono2 OSC planes 1.47 / 1.74 / 1.70) are an
+      injection artefact: `c` is set by the frame's own stars (real PSF, beta at the 1.5 cap on raw OSC) and the injected
+      stars' profile is not the frame's PSF; their 5F sums are right. (4) hc11B L 0010: `c` 1.137 +- 25 % (17 of 63
+      ratios > 5) - a nebula SEED FLOOD (the one frame at the 24 576-seed cap; field width 5.14 vs F 7.48, so isolation
+      leaves junk qualifiers), the same mechanism as Task 13's M42 frame-beta MUST-RESOLVE; fixed once, at the seeds.
+    - **Carries.** Task 13: re-read hc11B L 0010's `c` after the seed fix; the nebula-background `c` bias (numbers
+      above); the OSC LN reference R-plane `c` SE 2.19 %. Plan B: growth/model falls for fainter stars (all-pairs
+      LN-like -4.7 %). Plan C: a CFA-masked plane gets `c` = 1 (no qualifier).
