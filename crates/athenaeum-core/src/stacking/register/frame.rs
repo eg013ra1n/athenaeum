@@ -927,6 +927,9 @@ mod tests {
                 signal: 40000.0 + i as f64 * 1000.0,
                 area: 28.0,
                 peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
                 flags: crate::star_measure::StarFlags::default(),
             })
             .collect();

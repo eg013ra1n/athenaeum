@@ -79,7 +79,8 @@ for correctness.
 - Detector: structure layers 5, clustered sources allowed, local-maxima test
   off, no star limit (the vendor UI caps at 24 576).
 - Saturation threshold 1.0 absolute (RCR handles saturated fits); centroid
-  tolerance 1.5 px.
+  tolerance 1.5 px (the product replaced the fixed tolerance with the fit's own half-maximum contour, Task 10b A4-2 —
+  1.5 px at a round FWHM-3 star).
 - PSF model: **Auto** = fit Moffat β ∈ {2.5, 4, 6, 10} and keep the smallest
   robust MAD residual; fixed `Moffat4` is the cheap alternative. Elliptical
   fits, Levenberg–Marquardt, tolerance 1e-6.

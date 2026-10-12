@@ -11,7 +11,7 @@
 //!    the target fitted at the reference's β) — `s_lib`;
 //! 2. replicates that computation step by step with the same public calls
 //!    (`detect_stars` → seeds, `fit_stars`/`fit_stars_with_beta` with
-//!    `FitParams::default()`, nearest-within-4-px pairing, RCR 0.3) so every
+//!    LN's own fit options (`ln_fit_options`), nearest-within-4-px pairing, RCR 0.3) so every
 //!    matched star's two fits are visible — `s_rep` must equal `s_lib`
 //!    whenever pass 1 is the pairing production kept;
 //! 3. measures every matched star again on the SAME pixels with fit-free
@@ -52,6 +52,14 @@
 //! sets the LN scale of the models (default: `ln::resolve_scale` of the
 //! default config on the plane); `--max-stars-sel N` overrides the selection's
 //! own `maxStars` (the detection cap `--max-stars` is a different thing).
+//! `--ln-ring per-side|pair-common` (Plan A Task 10b, ruling B3; default
+//! `per-side`, the product's) picks the ring geometry of the prepared
+//! reference, so the production call and every arm run it: `pair-common`
+//! reads both sides' ring skies and aperture corrections at the larger of the
+//! two frame FWHMs (`PreparedReferenceChannel::build_pair_common`). The
+//! stderr header and every JSON line state `lnRing`, the arm the library
+//! reports it ran. The replication (`sRep`) stays the per-side fit, so under
+//! `pair-common` it is not expected to equal `sLib`.
 //!
 //! Three modes need no reference/members:
 //! - `--estimators <stars.csv>...` reads per-star CSVs written by
@@ -78,7 +86,7 @@
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- \
 //!   --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
 //!   [--max-stars 24576] [--stars-dir DIR] [--tgt-beta <b|auto>] \
-//!   [--ln-scale N] [--max-stars-sel N] \
+//!   [--ln-scale N] [--max-stars-sel N] [--ln-ring per-side|pair-common] \
 //!   [--interpolation bicubicBSpline] [--clamping 0.3] [--dump-warped DIR] \
 //!   [--ref-saturation <reference-saturation.fits>] \
 //!   (--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
@@ -111,11 +119,12 @@ use athenaeum_core::stacking::ln::scale::{
 use athenaeum_core::stacking::ln::{
     accumulate_reference_saturation, eroded_mask, reference_saturation_mask, resolve_scale,
     write_reference_saturation, BackgroundModel, FiniteMask, SaturationMask, ScaleInputs,
-    SelectionSide, TileNoise, TileTable, CLEANING, LN_MASK_MARGIN_PX,
+    SelectionSide, TileNoise, TileTable, ln_fit_options, CLEANING, LN_MASK_MARGIN_PX,
 };
 use athenaeum_core::stacking::psf_signal::{
-    fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
+    FitOutcome, PsfModel, Seed, StarFit,
 };
+use athenaeum_core::star_measure::{fit_stars_at, fit_stars_with_model};
 use athenaeum_core::stacking::register::detect::{detect_stars, Star};
 use athenaeum_core::stacking::register::DetectionConfig;
 use athenaeum_core::stacking::robust::rcr;
@@ -135,7 +144,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: ln_scale_probe --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
 [--max-stars N] [--stars-dir DIR] [--tgt-beta <b|auto>] [--ln-scale N] [--max-stars-sel N] \
-[--interpolation name] [--clamping c] [--dump-warped DIR] [--ref-saturation <fits>] \
+[--ln-ring per-side|pair-common] [--interpolation name] [--clamping c] [--dump-warped DIR] [--ref-saturation <fits>] \
 (--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
        ln_scale_probe --estimators <stars.csv>...
        ln_scale_probe --stack-sim <config.json>
@@ -168,6 +177,8 @@ struct Args {
     /// `--max-stars-sel N`: the selection's own `maxStars` (matched pairs
     /// kept), unlike `max_stars`, the detection cap.
     max_stars_sel: Option<u32>,
+    /// `--ln-ring per-side|pair-common` (Task 10b, B3): `true` = pair-common.
+    pair_common_ring: bool,
     interpolation: Interpolation,
     clamping: f32,
     members: Vec<(String, Source)>,
@@ -206,6 +217,7 @@ fn parse_args() -> Args {
         stars_dir: None,
         ln_scale: None,
         max_stars_sel: None,
+        pair_common_ring: false,
         interpolation: Interpolation::BicubicBSpline,
         clamping: 0.3,
         members: Vec::new(),
@@ -228,6 +240,13 @@ fn parse_args() -> Args {
             "--stars-dir" => a.stars_dir = Some(PathBuf::from(val())),
             "--ln-scale" => a.ln_scale = Some(val().parse().unwrap_or_else(|_| usage())),
             "--max-stars-sel" => a.max_stars_sel = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--ln-ring" => {
+                a.pair_common_ring = match val().as_str() {
+                    "per-side" => false,
+                    "pair-common" => true,
+                    _ => usage(),
+                }
+            }
             "--clamping" => a.clamping = val().parse().unwrap_or_else(|_| usage()),
             "--interpolation" => {
                 let v = val();
@@ -542,7 +561,6 @@ fn main() {
         build_ref_saturation(out, inputs, &pool);
         return;
     }
-    let fit_params = FitParams::default();
 
     // ---- the reference side, prepared once (ln::LnReferenceForDetection) ----
     let t = Instant::now();
@@ -561,6 +579,15 @@ fn main() {
         .masked
         .then(|| eroded_mask(&ref_finite, w, h, LN_MASK_MARGIN_PX));
     let prepared = match ref_allowed.as_deref() {
+        a if args.pair_common_ring => PreparedReferenceChannel::build_pair_common(
+            &ref_sane,
+            w,
+            h,
+            args.beta,
+            args.max_stars,
+            Some(&pool),
+            a,
+        ),
         Some(a) => PreparedReferenceChannel::build_masked(
             &ref_sane,
             w,
@@ -584,13 +611,14 @@ fn main() {
         ref_allowed.as_deref(),
         &pool,
     );
-    let ref_out: FitOutcome = fit_stars(
+    // M-12: through LN's own fit options (`ln_fit_options`: its full scale and the footprint), as `build_with` does.
+    let ref_out: FitOutcome = fit_stars_with_model(
         &ref_sane,
         w,
         h,
         &ref_seeds,
         args.beta,
-        &fit_params,
+        &ln_fit_options(ref_allowed.as_deref()),
         Some(&pool),
     );
     if ref_out.beta != beta {
@@ -606,12 +634,13 @@ fn main() {
         .as_ref()
         .map_or_else(|| "null".to_string(), |p| p.display().to_string());
     eprintln!(
-        "reference {}x{} plane {} beta {beta} fits {} median fit FWHM {ref_fwhm:.3} refSaturation {} ({} ms)",
+        "reference {}x{} plane {} beta {beta} fits {} median fit FWHM {ref_fwhm:.3} refSaturation {} lnRing {} ({} ms)",
         w,
         h,
         args.plane,
         ref_out.fits.len(),
         ref_saturation_label,
+        prepared.ring_geometry(),
         t.elapsed().as_millis()
     );
     let ref_saturation: Option<SaturationMask> = args
@@ -773,7 +802,7 @@ fn main() {
         // ---- 2. the replication ----
         let tgt_seeds = seeds_of(&tgt_sane, w, h, args.max_stars, allowed.as_deref(), &pool);
         let tgt_out =
-            fit_stars_with_beta(&tgt_sane, w, h, &tgt_seeds, beta, &fit_params, Some(&pool));
+            fit_stars_at(&tgt_sane, w, h, &tgt_seeds, beta, &ln_fit_options(allowed.as_deref()), Some(&pool));
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         for (ti, f) in tgt_out.fits.iter().enumerate() {
             if let Some((ri, _)) = ref_tree.nearest_within(f.x, f.y, MATCH_RADIUS_PX) {
@@ -796,7 +825,7 @@ fn main() {
         // Optional: the target fitted at another β (hypothesis H3), on the
         // same seeds; matched to the same reference fits.
         let alt = args.tgt_beta.map(|m| {
-            let o = fit_stars(&tgt_sane, w, h, &tgt_seeds, m, &fit_params, Some(&pool));
+            let o = fit_stars_with_model(&tgt_sane, w, h, &tgt_seeds, m, &ln_fit_options(allowed.as_deref()), Some(&pool));
             let mut z = Vec::new();
             for f in &o.fits {
                 if let Some((ri, _)) = ref_tree.nearest_within(f.x, f.y, MATCH_RADIUS_PX) {
@@ -948,6 +977,7 @@ fn main() {
             "label": label,
             "plane": args.plane,
             "refSaturation": args.ref_saturation.as_ref().map(|p| p.display().to_string()),
+            "lnRing": prepared.ring_geometry(),
             "beta": beta,
             "refFwhmFit": ref_fwhm,
             "tgtFwhmFit": tgt_fwhm,

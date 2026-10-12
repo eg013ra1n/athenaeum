@@ -64,6 +64,50 @@ impl KdTree2 {
         best.map(|(i, d2)| (i, d2.sqrt()))
     }
 
+    /// Every point within `radius` (inclusive) of `(x, y)`, as `(original index, distance)`, nearest first (ties by
+    /// original index).
+    pub fn within(&self, x: f64, y: f64, radius: f64) -> Vec<(usize, f64)> {
+        let mut found: Vec<(usize, f64)> = Vec::new();
+        self.collect(0, self.pts.len(), 0, x, y, radius * radius, &mut found);
+        for f in &mut found {
+            f.1 = f.1.sqrt();
+        }
+        found.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        found
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect(
+        &self,
+        lo: usize,
+        hi: usize,
+        depth: usize,
+        x: f64,
+        y: f64,
+        r2: f64,
+        out: &mut Vec<(usize, f64)>,
+    ) {
+        if lo >= hi {
+            return;
+        }
+        let mid = lo + (hi - lo) / 2;
+        let (px, py) = self.pts[mid];
+        let d2 = (px - x).powi(2) + (py - y).powi(2);
+        if d2 <= r2 {
+            out.push((self.idx[mid], d2));
+        }
+        let diff = if depth % 2 == 0 { x - px } else { y - py };
+        let (near, far) = if diff < 0.0 {
+            ((lo, mid), (mid + 1, hi))
+        } else {
+            ((mid + 1, hi), (lo, mid))
+        };
+        self.collect(near.0, near.1, depth + 1, x, y, r2, out);
+        if diff * diff <= r2 {
+            self.collect(far.0, far.1, depth + 1, x, y, r2, out);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
@@ -123,6 +167,26 @@ mod tests {
             }
         }
         best
+    }
+
+    #[test]
+    fn within_matches_brute_force() {
+        let pts = points(300, 7);
+        let tree = KdTree2::build(&pts);
+        let got = tree.within(3000.0, 2000.0, 900.0);
+        let mut want: Vec<(usize, f64)> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, &(px, py))| (i, ((px - 3000.0).powi(2) + (py - 2000.0).powi(2)).sqrt()))
+            .filter(|&(_, d)| d <= 900.0)
+            .collect();
+        want.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        assert!(!want.is_empty());
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.0, w.0);
+            assert!((g.1 - w.1).abs() < 1e-9);
+        }
     }
 
     #[test]

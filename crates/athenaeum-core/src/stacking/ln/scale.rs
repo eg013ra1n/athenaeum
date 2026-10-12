@@ -30,8 +30,9 @@
 //! ([`fit_local_scale`]) that `ln::normalize_frame` samples on the stride
 //! grid as `A(x, y) = s + spline(x, y)`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::f64::consts::{PI, SQRT_2};
+use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -47,8 +48,9 @@ use crate::geometry::{
 };
 use crate::stacking::groups::median_f64;
 use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
-use crate::stacking::psf_signal::{FitOutcome, FitParams, PsfModel, Seed, StarFit};
-use crate::star_measure::{fit_stars_at, fit_stars_with_model, FitStarsOptions};
+use crate::stacking::psf_signal::{FitOutcome, PsfModel, Seed, StarFit};
+use crate::star_measure::fit::inside_half_max;
+use crate::star_measure::{correct_at_ring, fit_stars_at, fit_stars_with_model, FitStarsOptions};
 use crate::stacking::register::detect::{detect_stars, Star, SATURATION};
 use crate::stacking::register::DetectionConfig;
 
@@ -68,12 +70,118 @@ const LN_PLANE_FULL_SCALE: f64 = 1.0;
 /// LN's full scale and, in masked mode, the `allowed` region as its
 /// footprint (borrowed) — a star whose `12F` disc leaves it does not enter
 /// `c`; the fits themselves are what `FitParams::default()` gives.
-fn ln_fit_options(allowed: Option<&[bool]>) -> FitStarsOptions<'_> {
+pub fn ln_fit_options(allowed: Option<&[bool]>) -> FitStarsOptions<'_> {
     FitStarsOptions {
         full_scale: Some(LN_PLANE_FULL_SCALE),
         footprint: allowed,
         ..Default::default()
     }
+}
+
+/// Plan A Task 10b, ruling B3: the ring geometry of LN's two fits — the ring
+/// width `F` at which each side's ring sky B_i (`[10F, 12F]` outside every
+/// seed's `3F` disc) and its aperture correction `c` (growth radius `5F`)
+/// are read. `PerSide` (the default until the joint cycle's decision, plan
+/// row P.3): each plane at its own frame FWHM, as every other fit call.
+/// `PairCommon` (part 1's F1 v2 rule): both sides at `max(F_R, F_T)`; the
+/// pair's `F` is known only once both sides are fitted, so each side whose
+/// own `F` differs re-reads its ring skies and `c` after the target's fit
+/// ([`crate::star_measure::correct_at_ring`]) — no fit runs twice, no
+/// centre, width or β moves, only the `c` every `signal` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RingGeometry {
+    #[default]
+    PerSide,
+    PairCommon,
+}
+
+impl RingGeometry {
+    /// The arm's name as `ln_scale_probe --ln-ring` spells it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            RingGeometry::PerSide => "per-side",
+            RingGeometry::PairCommon => "pair-common",
+        }
+    }
+}
+
+/// What [`RingGeometry::PairCommon`] keeps of the reference so that every
+/// target's call can re-read the reference's ring skies and `c` at the
+/// pair's ring width (Task 10b, B3): its plane (`reference`'s copy), the
+/// seeds its fit ran on, its footprint (`allowed`, masked mode) and `F_R`,
+/// the frame FWHM its own fit read its rings at. Held only under that arm.
+struct PairCommonReference {
+    plane: Vec<f32>,
+    width: usize,
+    height: usize,
+    seeds: Vec<Seed>,
+    allowed: Option<Vec<bool>>,
+    fwhm: Option<f64>,
+}
+
+/// Task 10b, ruling B3: the reference fits a scale call compares against.
+/// `PerSide`: the reference's own, and the target's fits as they came out
+/// of its call. `PairCommon`: `F = max(F_R, F_T)` over the sides that have a
+/// frame FWHM; the target re-reads its ring skies and `c` at `F` unless its
+/// own `F_T` is `F`, and the reference does likewise on a copy of its fits
+/// (the prepared channel itself is shared by every target and never
+/// changes), both with the options their own fits ran with.
+#[allow(clippy::too_many_arguments)]
+fn ring_matched_reference<'p>(
+    prepared: &'p PreparedReferenceChannel,
+    target: &[f32],
+    width: usize,
+    height: usize,
+    tgt_seeds: &[Seed],
+    tgt_outcome: &mut FitOutcome,
+    allowed: Option<&[bool]>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Cow<'p, [StarFit]> {
+    let Some(pc) = prepared.pair_common.as_ref() else {
+        return Cow::Borrowed(prepared.outcome.fits.as_slice());
+    };
+    let f_t = tgt_outcome.ring_fwhm;
+    let Some(common) = [pc.fwhm, f_t].into_iter().flatten().reduce(f64::max) else {
+        debug!(
+            count = tgt_outcome.fits.len(),
+            "ln scale: pair-common ring: neither side has a frame FWHM; both keep their own"
+        );
+        return Cow::Borrowed(prepared.outcome.fits.as_slice());
+    };
+    if f_t != Some(common) {
+        correct_at_ring(
+            target,
+            width,
+            height,
+            tgt_seeds,
+            tgt_outcome,
+            common,
+            &ln_fit_options(allowed),
+            pool,
+        );
+    }
+    let reference = if pc.fwhm != Some(common) {
+        let mut outcome = prepared.outcome.clone();
+        correct_at_ring(
+            &pc.plane,
+            pc.width,
+            pc.height,
+            &pc.seeds,
+            &mut outcome,
+            common,
+            &ln_fit_options(pc.allowed.as_deref()),
+            pool,
+        );
+        Cow::Owned(outcome.fits)
+    } else {
+        Cow::Borrowed(prepared.outcome.fits.as_slice())
+    };
+    debug!(
+        fwhm_px = common,
+        aperture_correction = ?tgt_outcome.aperture_correction,
+        "ln scale: both sides' ring skies and aperture corrections read at the pair-common ring width"
+    );
+    reference
 }
 
 /// Final review I-2: a growth-curve correction formed from fewer pairs than
@@ -268,12 +376,12 @@ fn detect_seeds(
 }
 
 /// A fit seed from a registration [`Star`]. `Star` carries no peak
-/// amplitude (registration only ever needed flux + optional σ), but
-/// [`fit_stars`] reads `Seed::peak` in exactly one place — the order in
-/// which `star_measure::seeds::field_width_of` picks the ≤ 100 brightest
-/// seeds whose half-maximum widths give the field width (every star's
-/// width-start box, Plan A Task 6b; before it, the field-level
-/// `initial_sigma` median that sized the fit stamp) — so an amplitude
+/// amplitude (registration only ever needed flux + optional σ). Through
+/// Plan A Task 10b [`fit_stars`] read `Seed::peak` in exactly one place —
+/// the order in which `star_measure::seeds::field_width_of` picked the
+/// ≤ 100 brightest seeds whose half-maximum widths gave the field width;
+/// from Task 10b A2 the field width reads every readable seed, unranked,
+/// so no fit reads it and the value is the seed's own record. An amplitude
 /// backed out of the flux/σ the detector already refined
 /// (`peak = flux / (2π·σx·σy)`, the closed form for a 2-D Gaussian's
 /// total) is accurate where it exists. Without a refined σ there is no
@@ -295,40 +403,29 @@ fn to_seed(star: &Star) -> Seed {
     }
 }
 
-/// Radius, in pixels, within which an accepted fit is linked back to the
-/// detection seed (barycentre) it was fitted from — ruling R-M4c-9's pass
-/// 2 needs that link, and [`FitOutcome`] carries no seed index. DERIVED,
-/// not chosen: [`crate::stacking::psf_signal::fit_one`] refuses any fit
-/// whose centre left its own seed by more than `centroid_tolerance_px` on
-/// EITHER axis, so the seed is always within `tolerance·√2` of the fit it
-/// produced, and no other seed can be closer than the `dedupe` pass allows
-/// (fits within ±1 px of a brighter one are already gone). A fit whose
-/// nearest seed still falls outside this radius — which the tolerance
-/// makes impossible for the seed list it was fitted from — takes no part
-/// in pass 2 rather than being paired with a stranger.
-fn seed_link_radius(p: &FitParams) -> f64 {
-    p.centroid_tolerance_px * SQRT_2
-}
-
-/// Per accepted fit, the detection barycentre it came from — the nearest
-/// seed within [`seed_link_radius`], or `None` when there is none (see
-/// that function for why that is a degenerate case, not a normal one).
-/// Positions are in the same plane coordinates as the fits themselves.
-/// `params` must be the SAME [`FitParams`] `fits` was produced with — the
-/// link radius is derived from its own `centroid_tolerance_px`, so reading
-/// a default here while the fits were made with something else would size
-/// the radius against a rule those fits never obeyed (review m4).
-fn link_barycentres(
-    fits: &[StarFit],
-    seeds: &[Seed],
-    params: &FitParams,
-) -> Vec<Option<(f64, f64)>> {
-    let radius = seed_link_radius(params);
+/// Per accepted fit, the detection barycentre it came from — the nearest seed that lies inside the fit's OWN
+/// half-maximum contour ([`inside_half_max`], the predicate [`crate::star_measure`]'s acceptance reads: ruling A4-2),
+/// or `None` when there is none. Ruling R-M4c-9's pass 2 needs the link and [`FitOutcome`] carries no seed index; the
+/// acceptance guarantees the seed a fit was made from is inside that contour, so `None` is a degenerate case (a fit
+/// decoded from elsewhere), never paired with a stranger. The kd query radius is the contour's major semi-axis
+/// (`fwhm_x / 2`); among the seeds within it, the nearest one that passes the ellipse test links (a nearer seed
+/// outside the contour, across an elongated fit's minor axis, does not hide the fit's own seed). Positions are in the same plane coordinates as the fits.
+fn link_barycentres(fits: &[StarFit], seeds: &[Seed]) -> Vec<Option<(f64, f64)>> {
     let points: Vec<(f64, f64)> = seeds.iter().map(|s| (s.x, s.y)).collect();
     let tree = KdTree2::build(&points);
     fits.iter()
         .map(|f| {
-            tree.nearest_within(f.x, f.y, radius)
+            tree.within(f.x, f.y, 0.5 * f.fwhm_x)
+                .into_iter()
+                .find(|&(i, _)| {
+                    inside_half_max(
+                        seeds[i].x - f.x,
+                        seeds[i].y - f.y,
+                        0.5 * f.fwhm_x,
+                        0.5 * f.fwhm_y,
+                        f.theta,
+                    )
+                })
                 .map(|(i, _)| (seeds[i].x, seeds[i].y))
         })
         .collect()
@@ -390,7 +487,7 @@ fn pair_positions(
 /// the ordinary case and pass 2 would run on nearly every real frame — for
 /// nothing, since the only pairs it can add are those whose two fits
 /// drifted across the match radius, and a fit is bounded to
-/// [`seed_link_radius`] of its own seed. The shortfall this pass exists to
+/// its own seed's half-maximum contour. The shortfall this pass exists to
 /// repair is fits that WALKED, which is a property of the target, so the
 /// target is what the threshold is measured against.
 ///
@@ -949,6 +1046,13 @@ pub struct PreparedReferenceChannel {
     /// fallback's own mechanism (see [`relative_scale_against`]).
     barycentre_tree: KdTree2,
     barycentre_of_point: Vec<usize>,
+    /// The ring geometry every scale call against this channel runs (Plan A
+    /// Task 10b, ruling B3); `PerSide` from [`Self::build`] and
+    /// [`Self::build_masked`].
+    ring: RingGeometry,
+    /// The reference's plane, seeds and footprint, kept only under
+    /// [`RingGeometry::PairCommon`] ([`Self::build_pair_common`]).
+    pair_common: Option<PairCommonReference>,
 }
 
 impl PreparedReferenceChannel {
@@ -969,7 +1073,16 @@ impl PreparedReferenceChannel {
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> PreparedReferenceChannel {
-        Self::build_with(reference, width, height, psf, max_stars, pool, None)
+        Self::build_with(
+            reference,
+            width,
+            height,
+            psf,
+            max_stars,
+            pool,
+            None,
+            RingGeometry::PerSide,
+        )
     }
 
     /// The masked preparation (plan 6b-3 D6): the reference's own seeds are
@@ -992,10 +1105,20 @@ impl PreparedReferenceChannel {
             max_stars,
             pool,
             Some(allowed),
+            RingGeometry::PerSide,
         )
     }
 
-    fn build_with(
+    /// [`Self::build`] (`allowed` = `None`) or [`Self::build_masked`]
+    /// (`Some`) under the PAIR-COMMON ring geometry (Plan A Task 10b, ruling
+    /// B3's evaluation arm, `ln_scale_probe --ln-ring pair-common`; the
+    /// product keeps the per-side default until the joint cycle's decision):
+    /// the channel keeps a copy of `reference`, its seeds and `allowed`, and
+    /// every scale call against it reads both sides' ring skies and aperture
+    /// corrections at `max(F_R, F_T)` ([`RingGeometry`]). The fits are the
+    /// per-side build's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_pair_common(
         reference: &[f32],
         width: usize,
         height: usize,
@@ -1004,7 +1127,36 @@ impl PreparedReferenceChannel {
         pool: Option<&Arc<rayon::ThreadPool>>,
         allowed: Option<&[bool]>,
     ) -> PreparedReferenceChannel {
-        let fit_params = FitParams::default();
+        Self::build_with(
+            reference,
+            width,
+            height,
+            psf,
+            max_stars,
+            pool,
+            allowed,
+            RingGeometry::PairCommon,
+        )
+    }
+
+    /// The ring geometry this channel's scale calls run, as
+    /// `ln_scale_probe --ln-ring` names it (`"per-side"` or `"pair-common"`,
+    /// Plan A Task 10b, ruling B3).
+    pub fn ring_geometry(&self) -> &'static str {
+        self.ring.name()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with(
+        reference: &[f32],
+        width: usize,
+        height: usize,
+        psf: PsfModel,
+        max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        allowed: Option<&[bool]>,
+        ring: RingGeometry,
+    ) -> PreparedReferenceChannel {
         let mut ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
         if let Some(a) = allowed {
             ref_seeds.retain(|s| allowed_at(a, width, s.x, s.y));
@@ -1022,12 +1174,20 @@ impl PreparedReferenceChannel {
         );
         let beta = outcome.beta;
 
-        let barycentres = link_barycentres(&outcome.fits, &ref_seeds, &fit_params);
+        let barycentres = link_barycentres(&outcome.fits, &ref_seeds);
         let (barycentre_tree, barycentre_of_point) = tree_over(&barycentres);
 
         let fit_positions: Vec<Option<(f64, f64)>> =
             outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
         let (tree, fit_of_point) = tree_over(&fit_positions);
+        let pair_common = (ring == RingGeometry::PairCommon).then(|| PairCommonReference {
+            plane: reference.to_vec(),
+            width,
+            height,
+            fwhm: outcome.ring_fwhm,
+            seeds: ref_seeds,
+            allowed: allowed.map(<[bool]>::to_vec),
+        });
 
         PreparedReferenceChannel {
             beta,
@@ -1036,6 +1196,8 @@ impl PreparedReferenceChannel {
             fit_of_point,
             barycentre_tree,
             barycentre_of_point,
+            ring,
+            pair_common,
         }
     }
 
@@ -1219,7 +1381,6 @@ fn relative_scale_against_core(
     allowed: Option<&[bool]>,
     inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
-    let fit_params = FitParams::default();
 
     // Perf tier A Task 0 (audit §3.1): wall time per phase, so the LN
     // stage's own `scale_ms` (ln/mod.rs) splits into where it actually
@@ -1234,13 +1395,24 @@ fn relative_scale_against_core(
     let t = Instant::now();
     // F-5 round 4: `fit_stars_with_beta` with LN's full scale and `allowed`
     // as the aperture correction's footprint (`ln_fit_options`).
-    let tgt_outcome = fit_stars_at(
+    let mut tgt_outcome = fit_stars_at(
         target,
         width,
         height,
         &tgt_seeds,
         prepared.beta,
         &ln_fit_options(allowed),
+        pool,
+    );
+    // Task 10b, ruling B3: the pair's ring geometry (per-side: as fitted).
+    let ref_fits = ring_matched_reference(
+        prepared,
+        target,
+        width,
+        height,
+        &tgt_seeds,
+        &mut tgt_outcome,
+        allowed,
         pool,
     );
     let fit_ms = t.elapsed().as_millis() as u64;
@@ -1258,7 +1430,7 @@ fn relative_scale_against_core(
         &tgt_fit_positions,
         &prepared.barycentre_tree,
         &prepared.barycentre_of_point,
-        || link_barycentres(&tgt_outcome.fits, &tgt_seeds, &fit_params),
+        || link_barycentres(&tgt_outcome.fits, &tgt_seeds),
         match_radius_px,
     );
 
@@ -1272,7 +1444,7 @@ fn relative_scale_against_core(
         growth_factor,
         growth_pairs,
         annulus_crowding,
-    } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
+    } = measured_sample(&ref_fits, &tgt_outcome.fits, &pairs, inputs)?;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -1691,7 +1863,7 @@ fn relative_scale_from_seeds_core(
     // `scale_ms` from ≈353 ms to 588 ms for zero benefit. The lost stars
     // are not lost to an overly tight RADIUS; their mapped positions
     // genuinely have no reference counterpart within either radius (a
-    // registration/centroid gap the fit's own `centroid_tolerance_px`
+    // registration/centroid gap the fit's own half-maximum contour
     // cannot bridge, or a Measure detection the deeper, integrated
     // reference never resolved as a stable star in the first place) — so
     // this filter is kept AS IS, at `match_radius_px`, being the cheapest
@@ -1732,13 +1904,24 @@ fn relative_scale_from_seeds_core(
     let t = Instant::now();
     // F-5 round 4: `fit_stars_with_beta` with LN's full scale and `allowed`
     // as the aperture correction's footprint (`ln_fit_options`).
-    let tgt_outcome = fit_stars_at(
+    let mut tgt_outcome = fit_stars_at(
         target_plane,
         ref_width,
         ref_height,
         &seeds,
         prepared.beta,
         &ln_fit_options(allowed),
+        pool,
+    );
+    // Task 10b, ruling B3: the pair's ring geometry (per-side: as fitted).
+    let ref_fits = ring_matched_reference(
+        prepared,
+        target_plane,
+        ref_width,
+        ref_height,
+        &seeds,
+        &mut tgt_outcome,
+        allowed,
         pool,
     );
     breakdown.fit_accepted = tgt_outcome.fits.len();
@@ -1764,7 +1947,7 @@ fn relative_scale_from_seeds_core(
         growth_factor,
         growth_pairs,
         annulus_crowding,
-    } = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
+    } = measured_sample(&ref_fits, &tgt_outcome.fits, &pairs, inputs)?;
     // The pre-selection valid-pair count, as `measured_sample` defines it.
     breakdown.matched = matches;
 
@@ -1899,7 +2082,7 @@ pub fn relative_scale(
 mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
-    use crate::stacking::psf_signal::{fit_stars, fit_stars_with_beta};
+    use crate::stacking::psf_signal::{fit_stars, fit_stars_with_beta, FitParams};
     use crate::stacking::test_fixtures::synthetic_star_field;
     use crate::test_support::{
         add_noise, integrated_field, moffat_field, IntegratedProfile, MoffatStar,
@@ -2290,6 +2473,103 @@ mod tests {
         );
     }
 
+    /// Plan A Task 10b, ruling B3: under the pair-common ring geometry both
+    /// sides of a scale call read their ring skies and `c` at
+    /// `max(F_R, F_T)` — each side's fits are, bit for bit, those of a fit
+    /// call handed that ring width — and nothing is fitted twice; the side
+    /// whose own `F` is the larger keeps its fits as they came. Per-side
+    /// hands back the prepared reference's own fits and leaves the target as
+    /// fitted. Both orders of the seeing pair (reference F 2.5, target 3.0).
+    #[test]
+    fn pair_common_reads_both_sides_at_the_larger_frame_fwhm() {
+        let (narrow, broad) = seeing_difference_pair();
+        let dbg = |f: &[StarFit]| format!("{f:?}");
+        let at = |ring: f64| FitStarsOptions {
+            ring_fwhm: Some(ring),
+            ..ln_fit_options(None)
+        };
+        for (reference, target) in [(&narrow, &broad), (&broad, &narrow)] {
+            let per_side = PreparedReferenceChannel::build(
+                reference,
+                WIDTH,
+                HEIGHT,
+                PsfModel::Moffat4,
+                200,
+                None,
+            );
+            let common = PreparedReferenceChannel::build_pair_common(
+                reference,
+                WIDTH,
+                HEIGHT,
+                PsfModel::Moffat4,
+                200,
+                None,
+                None,
+            );
+            assert_eq!(per_side.ring_geometry(), "per-side");
+            assert_eq!(common.ring_geometry(), "pair-common");
+            assert_eq!(dbg(&common.outcome.fits), dbg(&per_side.outcome.fits));
+            let tgt_seeds = detect_seeds(target, WIDTH, HEIGHT, 200, None);
+            let fitted = fit_stars_at(
+                target,
+                WIDTH,
+                HEIGHT,
+                &tgt_seeds,
+                common.beta,
+                &ln_fit_options(None),
+                None,
+            );
+
+            let mut t = fitted.clone();
+            let r = ring_matched_reference(
+                &per_side, target, WIDTH, HEIGHT, &tgt_seeds, &mut t, None, None,
+            );
+            assert!(matches!(r, Cow::Borrowed(_)), "per-side borrows");
+            assert_eq!(dbg(&t.fits), dbg(&fitted.fits), "per-side: the target as fitted");
+
+            let f_r = common.outcome.ring_fwhm.expect("F_R");
+            let f_t = fitted.ring_fwhm.expect("F_T");
+            let f = f_r.max(f_t);
+            assert!((f_r - f_t).abs() > 0.2, "the pair differs in seeing: {f_r} vs {f_t}");
+            let mut t = fitted.clone();
+            let r = ring_matched_reference(
+                &common, target, WIDTH, HEIGHT, &tgt_seeds, &mut t, None, None,
+            );
+            let ref_seeds = detect_seeds(reference, WIDTH, HEIGHT, 200, None);
+            let ref_want = fit_stars_with_model(
+                reference,
+                WIDTH,
+                HEIGHT,
+                &ref_seeds,
+                PsfModel::Moffat4,
+                &at(f),
+                None,
+            );
+            let tgt_want = fit_stars_at(
+                target,
+                WIDTH,
+                HEIGHT,
+                &tgt_seeds,
+                common.beta,
+                &at(f),
+                None,
+            );
+            assert_eq!(dbg(&r), dbg(&ref_want.fits), "the reference at F {f}");
+            assert_eq!(dbg(&t.fits), dbg(&tgt_want.fits), "the target at F {f}");
+            assert_eq!(t.aperture_correction, tgt_want.aperture_correction);
+            assert_eq!(t.aperture_stars, tgt_want.aperture_stars);
+            assert_eq!(t.ring_sky_missing, tgt_want.ring_sky_missing);
+            if f_r > f_t {
+                assert!(matches!(r, Cow::Borrowed(_)), "the broader reference keeps its own");
+                assert_ne!(t.aperture_correction, fitted.aperture_correction);
+            } else {
+                assert!(matches!(r, Cow::Owned(_)), "the narrower reference is re-read");
+                assert_eq!(dbg(&t.fits), dbg(&fitted.fits), "the broader target keeps its own");
+                assert_ne!(ref_want.aperture_correction, common.outcome.aperture_correction);
+            }
+        }
+    }
+
     #[test]
     fn target_is_fitted_with_the_reference_beta() {
         let (reference, target) = seeing_difference_pair_integrated();
@@ -2371,7 +2651,7 @@ mod tests {
     /// larger than `match_radius_px`, which is what it takes to empty pass
     /// 1 at all (a 2.5 px walk is comfortably INSIDE the 4 px window and
     /// pass 1 keeps every pair: that is the next test). It is also larger
-    /// than the fitter's own `centroid_tolerance_px` allows a real fit to
+    /// than the fitter's own half-maximum centre test allows a real fit to
     /// walk from its own seed, which is exactly why this pins the RULE on
     /// synthesized position lists rather than on two rendered planes: no
     /// achievable pair of real planes can empty the window this way.
@@ -2540,6 +2820,9 @@ mod tests {
             signal: 100.0,
             area: 28.0,
             peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
             flags: crate::star_measure::StarFlags::default(),
         }
     }
@@ -2553,34 +2836,54 @@ mod tests {
         }
     }
 
-    /// Review m8: a fit that walked from its seed still finds it (the link
-    /// radius is `centroid_tolerance_px · √2`), a fit that is farther than
-    /// the fitter could ever have put it links to nothing, and the
-    /// returned positions are the SEEDS' — not the fits'.
+    /// Ruling A4-2: a fit links to the nearest seed inside ITS OWN half-maximum contour — the contour of an
+    /// elongated fit reaches along its major axis, not across it — a seed outside every contour links to none (no
+    /// stranger), and the returned positions are the SEEDS', not the fits'.
     #[test]
-    fn link_barycentres_finds_the_seed_a_walked_fit_came_from() {
-        let params = FitParams::default();
+    fn link_barycentres_reads_the_fits_own_half_max_contour() {
         let seeds = vec![seed_at(100.0, 100.0), seed_at(300.0, 220.0)];
+        let wide = |x: f64, y: f64| StarFit {
+            fwhm_x: 8.0,
+            fwhm_y: 4.0,
+            ..fit_at(x, y)
+        };
         let fits = vec![
-            // Walked by the most the tolerance allows on both axes
-            // (1.5, 1.5) — distance 2.12, exactly the link radius.
-            fit_at(101.5, 101.5),
-            // Twice that: no fitter could have produced this from either
-            // seed, so it must not be linked to a stranger.
+            // 3 px along the major semi-axis 4: inside.
+            wide(103.0, 100.0),
+            // 3 px across the minor semi-axis 2: outside, though nearer than the major reach.
+            wide(300.0, 223.0),
+            // Round FWHM 3, 1.0 px on both axes (1.41 < 1.5): inside.
+            fit_at(101.0, 101.0),
+            // Far from every seed.
             fit_at(304.0, 224.0),
         ];
 
-        let linked = link_barycentres(&fits, &seeds, &params);
+        let linked = link_barycentres(&fits, &seeds);
 
-        assert_eq!(linked.len(), 2);
         assert_eq!(
-            linked[0],
-            Some((100.0, 100.0)),
-            "the walked fit must link to its own seed's barycentre"
+            linked,
+            vec![Some((100.0, 100.0)), None, Some((100.0, 100.0)), None]
+        );
+    }
+
+    /// Review M-4: a seed nearer than the fit's own, but across the minor axis (outside the contour), must not hide
+    /// it — the fit links to the nearest seed that PASSES the contour; with none passing it links to none.
+    #[test]
+    fn link_barycentres_skips_a_nearer_seed_outside_the_contour() {
+        let wide = StarFit {
+            fwhm_x: 8.0,
+            fwhm_y: 4.0,
+            ..fit_at(200.0, 200.0)
+        };
+        // 2.5 px across the minor semi-axis 2 (outside, nearest); 3.5 px along the major semi-axis 4 (inside).
+        let seeds = vec![seed_at(200.0, 202.5), seed_at(203.5, 200.0)];
+        assert_eq!(
+            link_barycentres(std::slice::from_ref(&wide), &seeds),
+            vec![Some((203.5, 200.0))]
         );
         assert_eq!(
-            linked[1], None,
-            "a fit beyond the link radius must link to nothing, not to the nearest stranger"
+            link_barycentres(std::slice::from_ref(&wide), &seeds[..1]),
+            vec![None]
         );
     }
 

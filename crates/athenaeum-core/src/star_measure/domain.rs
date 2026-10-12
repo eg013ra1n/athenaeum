@@ -76,6 +76,65 @@ pub const MRS_LAYERS: usize = 4;
 /// carry this fraction of the pixel noise σ.
 pub const MRS_LAYER1_GAIN: f32 = 0.8907;
 
+/// The plane's one background mesh (Plan A Task 10b, rulings A2 and Q4): the 128-px mesh model over the plane's
+/// PRESENT pixels (finite and, when a mask is given, `mask[i] == true`). It is the large-scale background residual's
+/// model `L` (`N*`, [`background_residual_from`]), the matched filter's background and — with `noise` — the per-cell
+/// clipped σ the detection noise σ_f propagates (its noise map, [`super::seeds`]). [`super::measure_plane`] computes it
+/// ONCE per plane and hands it to both; nothing builds a second one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackgroundMesh {
+    /// The per-pixel background model; `None` when the mesh model was unavailable.
+    pub background: Option<Vec<f32>>,
+    /// The per-pixel noise map (the bicubic interpolation of the per-cell clipped σ); `None` when it was not asked
+    /// for or the model was unavailable.
+    pub noise: Option<Vec<f32>>,
+}
+
+/// The mesh model (cell [`BACKGROUND_MODEL_CELL_PX`]) of `data` over its present pixels (a pixel with
+/// `mask[i] == false` enters as absent, like a non-finite one), with the per-pixel noise map when `want_noise` (a
+/// second bicubic interpolation pass; it changes no other field of the estimate, so the background map is the same
+/// bytes either way). A geometry mismatch gives an empty mesh and a `warn!`.
+pub fn background_mesh(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    mask: Option<&[bool]>,
+    want_noise: bool,
+) -> BackgroundMesh {
+    if data.len() != w * h || mask.is_some_and(|m| m.len() != w * h) {
+        tracing::warn!(
+            len = data.len(),
+            width = w,
+            height = h,
+            "background mesh: plane (or mask) length does not match the geometry"
+        );
+        return BackgroundMesh::default();
+    }
+    let masked: Vec<f32>;
+    let input: &[f32] = match mask {
+        Some(m) => {
+            masked = data
+                .iter()
+                .zip(m)
+                .map(|(&v, &keep)| if keep { v } else { f32::NAN })
+                .collect();
+            &masked
+        }
+        None => data,
+    };
+    let bg = astroimage::analysis::background::estimate_background_mesh(
+        input,
+        w,
+        h,
+        BACKGROUND_MODEL_CELL_PX,
+        want_noise,
+    );
+    BackgroundMesh {
+        background: bg.background_map.filter(|m| m.len() == w * h),
+        noise: bg.noise_map.filter(|m| m.len() == w * h),
+    }
+}
+
 /// `M*`, `N*` of the large-scale background residual (math reference
 /// §1.3): the model `L` is the mesh background (cell 128 px);
 /// `R = {L − v : v ≠ 0, v < L}` over the stratified sample;
@@ -90,16 +149,29 @@ pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64
         );
         return None;
     }
-    let bg = astroimage::analysis::background::estimate_background_mesh(
-        data,
-        w,
-        h,
-        BACKGROUND_MODEL_CELL_PX,
-        // Only `background_map` is read below — the per-pixel noise map
-        // would cost a second bicubic interpolation pass for nothing.
-        false,
-    );
-    let model = bg.background_map?;
+    // Only the background map is read — the per-pixel noise map would cost a second bicubic interpolation pass for
+    // nothing.
+    let mesh = background_mesh(data, w, h, None, false);
+    background_residual_from(data, w, h, mesh.background.as_deref()?)
+}
+
+/// [`background_residual`] against a model `L` already computed — the plane's one [`BackgroundMesh`]. `None` below
+/// 100 residuals, or when `data` or `model` does not match the geometry.
+pub fn background_residual_from(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    model: &[f32],
+) -> Option<(f64, f64)> {
+    if data.len() != w * h || model.len() != w * h {
+        tracing::warn!(
+            len = data.len(),
+            width = w,
+            height = h,
+            "background residual: plane or model length does not match the geometry"
+        );
+        return None;
+    }
     let mut r: Vec<f32> = Vec::with_capacity(data.len() / 32);
     crate::integration::stats::for_each_stratified(w, h, |i| {
         let (v, l) = (data[i], model[i]);
@@ -148,10 +220,33 @@ pub fn noise_model(
     h: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> (NoiseModel, PhaseTimings) {
+    noise_model_with(working, w, h, None, pool)
+}
+
+/// [`noise_model`] with `N*` read against the plane's one [`BackgroundMesh`] when the caller already computed it
+/// ([`super::measure_plane`], ruling Q4), so the mesh is not built a second time; `None` = built here, as
+/// [`noise_model`] does. `background_ms` then covers the residual alone (the mesh is the caller's phase).
+///
+/// On a masked plane the shared mesh leaves the absent pixels out, so `N*` reads the masked mesh (ruling D-1): an
+/// absent pixel is not sky. [`noise_model`] builds its own mesh over the whole plane, so the two differ there.
+pub fn noise_model_with(
+    working: &[f32],
+    w: usize,
+    h: usize,
+    mesh: Option<&BackgroundMesh>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (NoiseModel, PhaseTimings) {
     let t = Instant::now();
-    let bg = match pool {
-        Some(p) => p.install(|| background_residual(working, w, h)),
+    let residual = || match mesh {
+        Some(m) => m
+            .background
+            .as_deref()
+            .and_then(|model| background_residual_from(working, w, h, model)),
         None => background_residual(working, w, h),
+    };
+    let bg = match pool {
+        Some(p) => p.install(residual),
+        None => residual(),
     };
     let background_ms = t.elapsed().as_millis() as u64;
     let (m_star, n_star) = match bg {

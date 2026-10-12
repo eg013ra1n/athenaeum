@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
+
 use crate::integration::stats::ScaleEstimator;
 
 pub mod beta;
@@ -31,7 +33,60 @@ pub use domain::{
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
 pub use photometry::{model_flux_in_fwtm, SaturationPlane, SaturationVerdict};
-pub use seeds::{FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
+pub use seeds::{DetectionReport, FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
+
+/// The spatial correlation of a plane's pixel noise (Task 10b A1c, ruling C-10): a fact of the pixels' provenance, so
+/// the caller states it. Sensor pixels (raw or calibrated, Plan C's CFA super-pixel plane) carry white noise: every
+/// lag-≠0 covariance is 0 and the detection noise's gain is 1 by derivation, nothing read from the plane. A debayered,
+/// resampled, warped or integrated plane mixed its neighbours: the gain is read from the plane's own noise
+/// correlation. `Unknown` is read too: the failure of g := 1 on a mixed plane is a false-seed flood, the failure of
+/// reading on a white plane only A1's lower nebula recall, so the safe side is the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PixelNoise {
+    /// Sensor pixels, never spatially mixed: the gain is 1, not read.
+    White,
+    /// Pixels mixed by debayering, resampling or integration: the gain is read.
+    Mixed,
+    /// The caller does not know: the gain is read.
+    #[default]
+    Unknown,
+}
+
+impl PixelNoise {
+    /// The value the probe and its flags use: `white` | `mixed` | `unknown`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PixelNoise::White => "white",
+            PixelNoise::Mixed => "mixed",
+            PixelNoise::Unknown => "unknown",
+        }
+    }
+
+    /// Parse [`Self::as_str`]'s spelling.
+    pub fn parse(s: &str) -> Option<PixelNoise> {
+        match s {
+            "white" => Some(PixelNoise::White),
+            "mixed" => Some(PixelNoise::Mixed),
+            "unknown" => Some(PixelNoise::Unknown),
+            _ => None,
+        }
+    }
+
+    /// The statement with the debayered-colour fact folded in: a debayered plane is `Mixed`; `White` together with
+    /// `colour` is a contradiction (one `warn!`, the gain is read).
+    pub fn with_colour(self, colour: bool) -> PixelNoise {
+        match (self, colour) {
+            (PixelNoise::White, true) => {
+                tracing::warn!(
+                    "measure: pixel noise stated white on a debayered colour plane; the noise gain is read"
+                );
+                PixelNoise::Mixed
+            }
+            (PixelNoise::Unknown, true) => PixelNoise::Mixed,
+            (v, _) => v,
+        }
+    }
+}
 
 /// Version of the measurement path's own behaviour — bumped whenever
 /// `star_measure::fit`'s `fit_one`, `accept` or the aperture (or anything else in this module) change what a
@@ -83,7 +138,9 @@ pub struct MeasureOptions {
     pub diagnostics: bool,
     /// The plane's pixel mask (Task 6a): `mask[i] == false` makes pixel `i` absent, like a non-finite one, for the
     /// matched filter, the field width and the fit (its region and aperture). One plane, one mask; `None` = every
-    /// pixel present. The noise model and the sky statistic read the whole plane.
+    /// pixel present. The plane's one background mesh (the noise model's `N*` model and the matched filter's background,
+    /// Task 10b ruling Q4) leaves the absent pixels out; the noise model's residual sample, MRS and the sky statistic
+    /// read the whole plane.
     pub mask: Option<Vec<bool>>,
     /// A field width the caller's detector already measured (Task 6b, Task 6a review M3): the stacking adapter's
     /// matched-filter arm hands the detector's own [`FieldWidth`] with its seeds, so the fit starts from the width
@@ -95,6 +152,10 @@ pub struct MeasureOptions {
     /// pixel0's neighbours, else 3. The stacking adapter sets it for a debayered OSC group's planes, the probe for a
     /// 3-plane input; an undebayered CFA plane (Plan C's green sites) keeps the mono rule.
     pub colour: bool,
+    /// The spatial correlation of the plane's pixel noise, stated by the caller (Task 10b A1c, ruling C-10);
+    /// `White` fixes the detection noise's gain at 1, `Mixed` and `Unknown` (the default) read it. `colour` implies
+    /// `Mixed`.
+    pub pixel_noise: PixelNoise,
 }
 
 impl Default for MeasureOptions {
@@ -113,6 +174,7 @@ impl Default for MeasureOptions {
             mask: None,
             field_width: None,
             colour: false,
+            pixel_noise: PixelNoise::Unknown,
         }
     }
 }
@@ -138,8 +200,8 @@ pub enum SeedSpec {
     None,
     /// Seeds from the caller's detector, expected brightest-first (the detector's order).
     Given(Vec<Seed>),
-    /// The module's two-pass matched filter at the field width, `threshold` in units of the filtered plane's measured
-    /// noise ([`DEFAULT_THRESHOLD`], ruling R-OSP-2).
+    /// The module's two-pass matched filter at the field width, `threshold` in units of the detection noise σ_f
+    /// ([`DEFAULT_THRESHOLD`], ruling R-OSP-2; propagated from Task 10b, ruling A1).
     MatchedFilter { threshold: f64 },
 }
 
@@ -161,6 +223,11 @@ pub struct FitStarsOptions<'a> {
     /// Apply the plane-level defocused verdict (owner ruling 2026-10-08): `true` only on the measure path
     /// ([`measure_plane`]); every other caller (LN's refits) keeps the per-star `Donut` refusal alone.
     pub defocus_verdict: bool,
+    /// Apply the plane-level trailed verdict (Task 10b, F-10; rulings A6, Q1, Q5: [`fit::TRAIL_REFUSAL_SHARE`] of the
+    /// judged seeds refused `CentreMoved` / `RegionTooSmall` / `CentreAtRim`), as [`Self::defocus_verdict`]: `true` only on the measure
+    /// path ([`measure_plane`], which always applies it); every other caller (LN's refits) keeps the per-seed refusals
+    /// alone. `FitOutcome::trail_share` is reported either way.
+    pub trail_verdict: bool,
     /// Where the fits' aperture correction comes from (F-5, Task 10): measured on the plane being fitted (the
     /// default, so LN's two sides each get their own), or the caller's.
     pub flux_correction: FluxCorrection,
@@ -171,9 +238,14 @@ pub struct FitStarsOptions<'a> {
     pub full_scale: Option<f64>,
     /// The aperture correction's footprint (F-5 round 4): a star qualifies only when every pixel centre within `12F` of
     /// it has `footprint[i] == true` — LN passes its `allowed` region (the eroded coverage or overlap), outside which
-    /// the plane holds zero fill and stars it never seeded. Read by the correction alone, never by a fit (that is
-    /// `mask`'s); borrowed, never copied; `None` = the whole plane.
+    /// the plane holds zero fill and stars it never seeded. Read by the correction and (Task 10b) the ring sky B_i, a
+    /// pixel outside it being absent from the ring, never by a fit (that is `mask`'s); borrowed, never copied; `None` =
+    /// the whole plane.
     pub footprint: Option<&'a [bool]>,
+    /// The ring width `F` (px) every accepted fit's ring sky B_i is read at (`[10F, 12F]` outside every seed's `3F`
+    /// disc) and the aperture correction's growth radius `5F` scales with (Task 10b, ruling B3's arm: LN's pair-common
+    /// geometry hands both sides `max(F_R, F_T)`); `None` = the plane's own frame FWHM. Never read by a fit.
+    pub ring_fwhm: Option<f64>,
 }
 
 impl FitStarsOptions<'_> {
@@ -184,6 +256,7 @@ impl FitStarsOptions<'_> {
             saturation: None,
             full_scale: self.full_scale,
             footprint: self.footprint,
+            ring_fwhm: self.ring_fwhm,
         }
     }
 }
@@ -232,6 +305,14 @@ pub struct PlaneMeasurement {
     pub defocused: bool,
     /// The readable seeds refused `Donut` (the verdict's `n_donut`).
     pub defocus_donuts: usize,
+    /// The plane is trailed (Task 10b, F-10; rulings A6, Q1, Q5): of at least [`fit::TRAIL_VERDICT_MIN_SEEDS`] judged
+    /// seeds, more than [`fit::TRAIL_REFUSAL_SHARE`] were refused `CentreMoved`, `RegionTooSmall` or `CentreAtRim`, so `stars` is
+    /// empty, the accepted fits were refused `Trailed` and `aperture_correction` is `None`. Never set on a defocused
+    /// plane.
+    pub trailed: bool,
+    /// The share of the judged seeds refused `CentreMoved`, `RegionTooSmall` or `CentreAtRim` ([`fit::trail_share`]), the verdict's
+    /// input; reported on every plane (0 with no seed).
+    pub trail_share: f64,
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4): no flag, no refusal,
     /// out of the β sample.
     pub verdict_fit_failed: usize,
@@ -243,6 +324,12 @@ pub struct PlaneMeasurement {
     pub aperture_correction: Option<f64>,
     /// The qualifying stars `aperture_correction` is the median over (at most 64; under 5 it is `None`).
     pub aperture_stars: usize,
+    /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present pixels in their `[10F, 12F]`
+    /// ring outside every seed's `3F` disc, or no frame FWHM on the plane).
+    pub ring_sky_missing: usize,
+    /// What the module's matched filter measured besides its seeds (Task 10b, F-10): the detection noise σ_f (propagated
+    /// and measured), the noise gain, the structure seeds dropped and the extended flags; `None` for given seeds.
+    pub detection: Option<DetectionReport>,
     pub timings: PhaseTimings,
 }
 
@@ -277,6 +364,8 @@ pub struct PlanePrep {
     detected: bool,
     /// The width reported as [`PlaneMeasurement::field_width`].
     field_width: FieldWidth,
+    /// The matched filter's report ([`PlaneMeasurement::detection`]); its `extended` flags ride with `seeds`.
+    detection: Option<DetectionReport>,
     /// The fit's own width ([`fit::verdict_pass`]), the one the fits at β start from.
     fit_field: FieldWidth,
     /// One per seed, in seed order.
@@ -385,11 +474,38 @@ fn prepare_working(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlanePrep {
+    let mask = opts.mask.as_deref();
+    let detecting = matches!(opts.seeds, SeedSpec::MatchedFilter { .. });
+    // The plane's ONE background mesh (Task 10b, ruling Q4): `N*`'s model and the matched filter's background (with
+    // its noise map, the detection noise's), built once over the plane's present pixels and handed to both. A plane
+    // whose noise model is given and whose seeds are given needs none.
+    let t = Instant::now();
+    let mesh = (opts.noise.is_none() || detecting).then(|| {
+        let build = || domain::background_mesh(working, w, h, mask, detecting);
+        match pool {
+            Some(p) => p.install(build),
+            None => build(),
+        }
+    });
+    let mesh_ms = t.elapsed().as_millis() as u64;
     let (noise, mut timings) = match opts.noise {
         Some(given) => (given, PhaseTimings::default()),
-        None => domain::noise_model(working, w, h, pool),
+        None => {
+            let (model, mut phases) = domain::noise_model_with(working, w, h, mesh.as_ref(), pool);
+            phases.background_ms += mesh_ms;
+            (model, phases)
+        }
     };
-    let mask = opts.mask.as_deref();
+    // The saturation test reads the sky median (F-3), so the sky statistic precedes the fits (Q7); the plane's
+    // saturation inputs precede detection too, whose knot tests read the plateau-clip clause's range (Task 10b).
+    let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
+    let saturation = {
+        let build = || saturation_plane(working, mask, &noise, &sky, &opts.domain, opts.colour);
+        match pool {
+            Some(p) => p.install(build),
+            None => build(),
+        }
+    };
     // A width the caller's detector measured (Task 6b, Task 6a review M3) stands in for the module's own, which is
     // then not computed for given seeds; one that is not a positive number is refused loudly and the module's own is
     // used.
@@ -406,17 +522,20 @@ fn prepare_working(
         None => None,
     };
     let t = Instant::now();
-    let (detected, field_width) = match &opts.seeds {
+    let (detected, field_width, detection) = match &opts.seeds {
         SeedSpec::None => (
             None,
             given_width.unwrap_or_else(|| seeds::field_width_of(working, w, h, &[], mask)),
+            None,
         ),
         SeedSpec::Given(given) => (
             None,
             given_width.unwrap_or_else(|| seeds::field_width_of(working, w, h, given, mask)),
+            None,
         ),
         SeedSpec::MatchedFilter { threshold } => {
-            let (found, own) = seeds::detect(
+            // The mesh moves into the detection, which frees its background map once the plane is subtracted.
+            let (found, own, report) = seeds::detect_with(
                 working,
                 w,
                 h,
@@ -425,9 +544,13 @@ fn prepare_working(
                 opts.max_stars,
                 mask,
                 pool,
+                opts.pixel_noise.with_colour(opts.colour),
+                mesh,
+                Some(&saturation),
             );
-            timings.detect_ms = t.elapsed().as_millis() as u64;
-            (Some(found), given_width.unwrap_or(own))
+            timings.detect_ms =
+                t.elapsed().as_millis() as u64 + if opts.noise.is_some() { mesh_ms } else { 0 };
+            (Some(found), given_width.unwrap_or(own), Some(report))
         }
     };
     let (seeds, detected) = match (detected, &opts.seeds) {
@@ -435,17 +558,14 @@ fn prepare_working(
         (None, SeedSpec::Given(given)) => (given.clone(), false),
         (None, _) => (Vec::new(), false),
     };
-    // The saturation test reads the sky median (F-3), so the sky statistic precedes the fits (Q7).
-    let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
-    let saturation = saturation_plane(
-        working,
-        mask,
-        &noise,
-        &sky,
-        &opts.domain,
-        opts.colour,
-        seeds.len(),
-    );
+    // Under `NoiseSource::None` the saturation test's threshold is the sky median: one `warn!` per plane when there are
+    // seeds to judge (Q1).
+    if noise.source == NoiseSource::None && !seeds.is_empty() {
+        tracing::warn!(
+            count = seeds.len(),
+            "measure: no noise estimate; the saturation test's threshold is the sky median"
+        );
+    }
     let t = Instant::now();
     let pass_call = || {
         fit::verdict_pass(
@@ -471,6 +591,7 @@ fn prepare_working(
         seeds,
         detected,
         field_width,
+        detection,
         fit_field,
         passes,
         saturation,
@@ -495,6 +616,7 @@ fn finish_working(
         seeds,
         detected,
         field_width,
+        detection,
         fit_field,
         passes,
         saturation,
@@ -521,6 +643,10 @@ fn finish_working(
             None,
             opts.diagnostics,
             true,
+            true,
+            detection
+                .as_ref()
+                .map_or(&[][..], |d| d.extended.as_slice()),
         )
     };
     let mut outcome = match pool {
@@ -554,10 +680,14 @@ fn finish_working(
         diagnostics,
         defocused: outcome.defocused,
         defocus_donuts: outcome.defocus_donuts,
+        trailed: outcome.trailed,
+        trail_share: outcome.trail_share,
         verdict_fit_failed: outcome.verdict_fit_failed,
         cross_flags,
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
+        ring_sky_missing: outcome.ring_sky_missing,
+        detection,
         timings,
     }
 }
@@ -565,8 +695,9 @@ fn finish_working(
 /// The plane-level inputs of the saturation test (spec §2.1, PA-23), in working units: `bg` = the sky median
 /// (`sky.median`, the native plane's, scaled by `ADU_SCALE` for a calibrated plane), σ = `noise.sigma`, `norm` =
 /// `ADU_SCALE` for `Domain::Calibrated` and `full_scale` for `Domain::RawAdu` (Q2), the plane max over the working
-/// copy's finite, unmasked pixels. Under [`NoiseSource::None`] σ is 0 and the threshold is the sky median: one
-/// `warn!` per plane when there are seeds to judge (Q1).
+/// copy's finite, unmasked pixels. Under [`NoiseSource::None`] σ is 0 and the threshold is the sky median (the caller
+/// says so once the seeds are known, Q1). Built before detection (Task 10b: the knot tests' near-clip exemption reads
+/// its range), from the same inputs.
 fn saturation_plane(
     working: &[f32],
     mask: Option<&[bool]>,
@@ -574,23 +705,18 @@ fn saturation_plane(
     sky: &SkyLevel,
     domain: &Domain,
     colour: bool,
-    n_seeds: usize,
 ) -> SaturationPlane {
     let (scale, norm) = match domain {
         Domain::Calibrated { .. } => (ADU_SCALE as f64, ADU_SCALE as f64),
         Domain::RawAdu { full_scale, .. } => (1.0, *full_scale),
     };
-    if noise.source == NoiseSource::None && n_seeds > 0 {
-        tracing::warn!(
-            count = n_seeds,
-            "measure: no noise estimate; the saturation test's threshold is the sky median"
-        );
-    }
+    // The maximum of the finite, unmasked values: order-free, so read in parallel.
     let plane_max = working
-        .iter()
+        .par_iter()
         .enumerate()
         .filter(|&(i, v)| v.is_finite() && mask.map_or(true, |m| m[i]))
-        .fold(f64::NEG_INFINITY, |m, (_, &v)| m.max(v as f64));
+        .map(|(_, &v)| v as f64)
+        .reduce(|| f64::NEG_INFINITY, f64::max);
     SaturationPlane::new(sky.median * scale, noise.sigma, plane_max, norm, colour)
 }
 
@@ -621,6 +747,7 @@ pub fn fit_stars_at(
         pool,
         opts.diagnostics,
         opts.defocus_verdict,
+        opts.trail_verdict,
         opts.correction(),
     )
 }
@@ -649,8 +776,41 @@ pub fn fit_stars_with_model(
         pool,
         opts.diagnostics,
         opts.defocus_verdict,
+        opts.trail_verdict,
         opts.correction(),
     )
+}
+
+/// Every fit of `outcome` — a [`fit_stars_at`] / [`fit_stars_with_model`] result on `plane` with `seeds` and `opts` —
+/// re-reads its ring sky B_i, σ_i at the ring width `ring_fwhm`, and the plane's aperture correction is measured again
+/// from them, as the call would have measured them with `opts.ring_fwhm = Some(ring_fwhm)` (Task 10b, ruling B3: LN's
+/// pair-common geometry knows `max(F_R, F_T)` only once both sides are fitted, and fits nothing twice). Every fit's
+/// `signal` becomes its model flux in its FWTM times the new `c`; `aperture_correction`, `aperture_stars` and
+/// `ring_sky_missing` are the new ones; no centre, width, β or flag moves.
+pub fn correct_at_ring(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    outcome: &mut FitOutcome,
+    ring_fwhm: f64,
+    opts: &FitStarsOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    let correction = fit::Correction {
+        ring_fwhm: Some(ring_fwhm),
+        ..opts.correction()
+    };
+    fit::correct_at_ring(
+        plane,
+        opts.mask.as_deref(),
+        w,
+        h,
+        seeds,
+        outcome,
+        &correction,
+        pool,
+    );
 }
 
 #[cfg(test)]
@@ -842,6 +1002,7 @@ mod tests {
             fit: true,
             cross: false,
             iterations: 12,
+            centred: true,
         }))
     }
 
@@ -1000,6 +1161,241 @@ mod tests {
         assert!(!m.defocused, "{:?}", m.refused);
         assert!(m.stars.len() >= 100, "{}", m.stars.len());
         assert!(!m.refused.by_reason.contains_key(&RefusalReason::Defocused));
+    }
+
+    /// Ruling A4 (D2: on the trailed L 0010 all 64 sample seeds were trail segments the fit refuses): the β sample takes
+    /// only seeds whose verdict fit stays centred. RED today: the 25 bright seeds, each 4.5 px off its β-1.8 star (outside
+    /// its half-maximum contour, semi-axis 2.5 px; re-pinned from 1.8 px at ruling A4-2, when the fixed 1.5-px tolerance went), join the sample and pull the frame β to ≈ 1.8. Premise check first: if HEAD already
+    /// reads β within 0.3 of 4, this is a pin — STOP with the numbers.
+    #[test]
+    fn beta_sample_takes_only_seeds_whose_verdict_fit_stays_centred() {
+        use crate::test_support::{add_noise, integrated_field, IntegratedProfile};
+        let (w, h) = (480usize, 400usize);
+        let at = |i: usize| (40.0 + (i % 8) as f64 * 57.0, 40.0 + (i / 8) as f64 * 80.0);
+        let bright: Vec<(f64, f64, f64)> = (0..25)
+            .map(|i| {
+                let (x, y) = at(i);
+                (x, y, 0.4)
+            })
+            .collect();
+        let faint: Vec<(f64, f64, f64)> = (25..40)
+            .map(|i| {
+                let (x, y) = at(i);
+                (x, y, 0.2)
+            })
+            .collect();
+        let a = integrated_field(
+            w,
+            h,
+            &bright,
+            IntegratedProfile::Moffat {
+                fwhm: 5.0,
+                beta: 1.8,
+            },
+            5,
+            0.05,
+        );
+        let b = integrated_field(
+            w,
+            h,
+            &faint,
+            IntegratedProfile::Moffat {
+                fwhm: 5.0,
+                beta: 4.0,
+            },
+            5,
+            0.0,
+        );
+        let mut data: Vec<f32> = a.iter().zip(&b).map(|(p, q)| p + q).collect();
+        add_noise(&mut data, 0.002, 21);
+        let seeds: Vec<Seed> = bright
+            .iter()
+            .map(|&(x, y, p)| Seed {
+                x: x + 4.5,
+                y,
+                peak: p,
+                flux: 2.0,
+            })
+            .chain(faint.iter().map(|&(x, y, p)| Seed {
+                x,
+                y,
+                peak: p,
+                flux: 1.0,
+            }))
+            .collect();
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds),
+                diagnostics: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            (m.beta - 4.0).abs() < 0.3,
+            "frame β {} from the 15 centred stars",
+            m.beta
+        );
+        assert!(
+            m.diagnostics[..25].iter().all(|d| d.sample_beta.is_none()),
+            "no displaced seed in the sample"
+        );
+        assert!(
+            m.diagnostics[25..]
+                .iter()
+                .filter(|d| d.sample_beta.is_some())
+                .count()
+                >= 8
+        );
+    }
+
+    /// Ruling P3 (D2's full proposal): an `extended` seed stays a seed and is fitted, but leaves `c`'s qualifiers and the
+    /// frame FWHM/ecc statistic as it leaves the β sample — the saturation flag's treatment. A Gaussian blob of FWHM 3F
+    /// (F = 4.35 px, `grid30(5.0)` at β 4) and peak 0.05 (25σ; zero-sum ratio ≈ 1.48, the extended replica above) sits
+    /// ≈ 50 px from its four neighbours (outside `c`'s 6F isolation). RED today: the blob's accepted fit is a 31st
+    /// qualifier and pulls the frame FWHM. Premise check first: if HEAD refuses the blob's fit (no 31st qualifier, frame
+    /// FWHM already within 1 %), this is a pin — STOP with the numbers.
+    #[test]
+    fn an_extended_seed_leaves_cs_qualifiers_and_the_frame_statistic() {
+        use crate::test_support::{add_noise, gaussian_field};
+        let stars = grid30(5.0);
+        let plane = |blob: bool| {
+            let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+            if blob {
+                let f = 2.0 * 5.0 * (2f64.powf(0.25) - 1.0).sqrt();
+                let g = gaussian_field(
+                    480,
+                    400,
+                    &[(95.3, 94.8, 0.05)],
+                    3.0 * f / 2.354_820_045,
+                    0.0,
+                );
+                for (d, b) in data.iter_mut().zip(g) {
+                    *d += b;
+                }
+            }
+            add_noise(&mut data, 0.002, 35);
+            let opts = MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                psf_model: PsfModel::Fixed(4.0),
+                ..Default::default()
+            };
+            measure_plane(&data, 480, 400, &opts, None)
+        };
+        let (base, m) = (plane(false), plane(true));
+        assert_eq!(
+            base.aperture_stars, 30,
+            "premise: the 30 stars qualify without the blob"
+        );
+        assert_eq!(m.aperture_stars, 30, "the extended blob is not a qualifier");
+        let (fb, fm) = (base.frame.fwhm_px.unwrap(), m.frame.fwhm_px.unwrap());
+        assert!(
+            (fm / fb - 1.0).abs() < 0.01,
+            "frame FWHM {fm} vs {fb} without the blob"
+        );
+        let blob = m
+            .stars
+            .iter()
+            .find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0)
+            .expect("the blob is seeded and fitted");
+        assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
+    }
+
+    /// Ruling Q4 (Task 10b step 1b, a pin): the plane's ONE background mesh changes no bit. Its background map is the
+    /// same bytes with or without the noise map, on the whole plane and on a masked one (the mesh the matched filter
+    /// built before); `N*` read against it is the noise model's own; and `measure_plane`'s seeds — the matched filter
+    /// on the shared mesh — are exactly `seeds::detect`'s, which builds its own.
+    #[test]
+    fn one_background_mesh_per_plane_changes_no_bit() {
+        use astroimage::analysis::background::estimate_background_mesh;
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+        let mask: Vec<bool> = (0..w * h).map(|i| (i % w) % 7 != 3).collect();
+        let masked: Vec<f32> = scaled
+            .iter()
+            .zip(&mask)
+            .map(|(&v, &k)| if k { v } else { f32::NAN })
+            .collect();
+        for (input, m) in [(&scaled, None), (&masked, Some(mask.as_slice()))] {
+            let old =
+                estimate_background_mesh(input, w, h, domain::BACKGROUND_MODEL_CELL_PX, false)
+                    .background_map
+                    .unwrap();
+            let new = domain::background_mesh(&scaled, w, h, m, true);
+            let map = new.background.as_deref().unwrap();
+            assert!(old.iter().zip(map).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert_eq!(new.noise.as_ref().map(Vec::len), Some(w * h));
+        }
+        let mesh = domain::background_mesh(&scaled, w, h, None, true);
+        let (own, _) = domain::noise_model(&scaled, w, h, None);
+        let (shared, _) = domain::noise_model_with(&scaled, w, h, Some(&mesh), None);
+        assert_eq!(own, shared);
+        let (seeds, field, _) = seeds::detect(
+            &scaled,
+            w,
+            h,
+            &own,
+            DEFAULT_THRESHOLD,
+            24576,
+            None,
+            None,
+            PixelNoise::White,
+        );
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.noise, own);
+        assert_eq!(m.detected, seeds);
+        assert_eq!(m.field_width, field);
+    }
+
+    /// Ruling Q4 / D-1 (recorded, not reverted): on a MASKED plane `N*` reads the masked mesh — an absent pixel (a
+    /// colour plane's other-colour CFA site, Plan C) is not sky, so the model `L` the residual `L − v` is taken
+    /// against must not average it in. This pins that defined value: `measure_plane`'s `N*` with a mask is
+    /// `noise_model_with` against the mesh built over the present pixels, bit for bit, and (`M*` and `N*` both
+    /// being read from the same sample) the unmasked mesh's value is a different number on this fixture. The
+    /// no-mask case stays the bytes of the pre-Q4 code (the test above).
+    #[test]
+    fn on_a_masked_plane_n_star_reads_the_masked_mesh() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let mask: Vec<bool> = (0..w * h).map(|i| (i % w) % 7 != 3).collect();
+        let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+        let masked_mesh = domain::background_mesh(&scaled, w, h, Some(&mask), true);
+        let (want, _) = domain::noise_model_with(&scaled, w, h, Some(&masked_mesh), None);
+        let (unmasked, _) = domain::noise_model(&scaled, w, h, None);
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                mask: Some(mask),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.noise, want);
+        assert_ne!(
+            m.noise.n_star.to_bits(),
+            unmasked.n_star.to_bits(),
+            "the masked mesh moved N* on this fixture"
+        );
     }
 
     #[test]
@@ -1421,11 +1817,13 @@ mod tests {
     /// handed to the module as `Given`) and the module's own `SeedSpec::MatchedFilter` start every star from the same
     /// width and fit the same stars; `field_width_of` serves only seeds another detector found.
     ///
-    /// The plane makes the two estimators read different stars: 120 Moffat-4 stars, 60 narrow (FWHM 3, amplitude
-    /// 0.4) and 60 broad (FWHM 7, amplitude 0.3). The 100 brightest by peak — what `field_width_of` the given seeds
-    /// reads — are the 60 narrow and 40 broad ones (a narrow median); the matched filter's first pass ranks by its
-    /// 3-px flux, where a broad star reads ≈ 1.7× its amplitude, so its 100 are the 60 broad and 40 narrow ones (a
-    /// broad median) — box radii ⌈2·F⌉ far apart.
+    /// The plane makes the two widths differ: 120 Moffat-4 stars, 60 narrow (FWHM 3, amplitude 0.4) and 60 broad
+    /// (FWHM 7, amplitude 0.3), and a cap of 40 seeds. Task 10b A2 gave `field_width_of` the matched filter's own rule
+    /// (I-4: the mode of every readable read), so the widths now differ by the POOL, not the rule (ruling F14, the
+    /// premise rebuilt; through A1 it was the 100 brightest by peak against the first pass's 100 by flux): the matched
+    /// filter reads all 120 first-pass candidates (the narrow reads are the denser mode), while the 40 seeds the cap
+    /// keeps are the broad ones (a broad star's filtered flux reads ≈ 1.7× its amplitude), whose own mode is broad —
+    /// box radii ⌈2·F⌉ far apart.
     #[cfg(feature = "solver")]
     #[test]
     fn adapter_matched_filter_seeds_fit_exactly_as_the_module_matched_filter() {
@@ -1454,13 +1852,17 @@ mod tests {
             &data,
             w,
             h,
-            &AdapterOptions::default(),
+            &AdapterOptions {
+                max_stars: 40,
+                ..Default::default()
+            },
             None,
             SeedOverride::MatchedFilter {
                 threshold: DEFAULT_THRESHOLD,
             },
             false,
             false,
+            PixelNoise::Unknown,
         );
         let m = measure_plane(
             &data,
@@ -1470,12 +1872,13 @@ mod tests {
                 seeds: SeedSpec::MatchedFilter {
                     threshold: DEFAULT_THRESHOLD,
                 },
+                max_stars: 40,
                 ..Default::default()
             },
             None,
         );
         assert_eq!(seeds.len(), m.seeds);
-        // The premise: `field_width_of` the same seeds reads a different width.
+        // The premise: `field_width_of` the same (capped) seeds reads a different width.
         let given = seeds::field_width_of(&working(&data), w, h, &seeds, None);
         assert!(
             (given.fwhm_px - m.field_width.fwhm_px).abs() > 1.0,
@@ -1484,7 +1887,12 @@ mod tests {
         );
         assert_eq!(pm.field_width, m.field_width, "the detector's own width");
         assert_eq!(pm.channel.beta, m.beta);
-        assert_eq!(pm.fits, m.stars, "the same fits");
+        // Debug strings (Task 10b, ruling F14 edit): a fit without a ring sky carries NaN, which `==` never matches.
+        assert_eq!(
+            format!("{:?}", pm.fits),
+            format!("{:?}", m.stars),
+            "the same fits"
+        );
     }
 
     /// No seeds, nothing fitted: the frame aggregates are `None`, the β is the `Auto` fallback 4.0, and the noise and
@@ -1519,7 +1927,7 @@ mod tests {
         let data = nan_border_field(240, 240, 6, true); // 40 Gaussian stars at FWHM 3.5, a 6-px NaN border
         let scaled = working(&data);
         let (noise, _) = domain::noise_model(&scaled, 240, 240, None);
-        let (seeds, _) = seeds::detect(
+        let (seeds, _, _) = seeds::detect(
             &scaled,
             240,
             240,
@@ -1528,6 +1936,7 @@ mod tests {
             24576,
             None,
             None,
+            PixelNoise::White,
         );
         assert_eq!(seeds.len(), 40);
         assert!(
@@ -1618,7 +2027,7 @@ mod tests {
         let mask: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect(); // a checkerboard
         let scaled = working(&data);
         let (noise, _) = domain::noise_model(&scaled, w, h, None);
-        let (seeds, _) = seeds::detect(
+        let (seeds, _, _) = seeds::detect(
             &scaled,
             w,
             h,
@@ -1627,6 +2036,7 @@ mod tests {
             24576,
             Some(&mask),
             None,
+            PixelNoise::White,
         );
         assert!(seeds.len() >= 140, "{}", seeds.len());
         let m = measure_plane(
@@ -1652,6 +2062,519 @@ mod tests {
             let r = d.region_radius as usize;
             let n = (2 * r + 1) * (2 * r + 1);
             assert!((d.pixels_used as i64 - (n / 2) as i64).abs() <= 1, "{d:?}");
+        }
+    }
+
+    /// Task 10b A2b truth test 2 (rulings A2-2, A2-3; written in full before the code, RED at 1bc29ef8): the stars of a
+    /// field whose widths spread about the field width are point sources. [`crate::test_support::width_spread_field_beta`]
+    /// — 600 Moffat stars, FWHM N(3.0, 0.24) px, peak SNR 20-2000, the field of truth test 1 without its events — at
+    /// β 1.5, 2.0 and 2.5, the product's range. Bar at EACH β: stars flagged extended <= the Q7 allowance at p = 0.001
+    /// (the one-sided 97.7 % binomial quantile of Binomial(600, max(0.001, 1/600)): 3). A bound at the field width (A3,
+    /// through A2) flags the bright half that reads broader than the mode (32 of 600 at β 1.5, 5 at β 2.0).
+    #[test]
+    fn stars_whose_widths_spread_around_the_field_width_are_not_flagged() {
+        use crate::test_support::{add_noise, width_spread_field_beta};
+        let (w, h) = (2048usize, 2048usize);
+        for beta in [1.5, 2.0, 2.5] {
+            let (mut data, stars, sigma) = width_spread_field_beta(beta);
+            add_noise(&mut data, sigma as f32, 102);
+            let opts = MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                ..Default::default()
+            };
+            let m = measure_plane(&data, w, h, &opts, None);
+            let det = m.detection.as_ref().expect("the matched filter ran");
+            let is_star = |s: &Seed| stars.iter().any(|t| (t.x - s.x).hypot(t.y - s.y) < 2.0);
+            let found = m.detected.iter().filter(|s| is_star(s)).count();
+            assert!(
+                found >= 590,
+                "beta {beta}: premise: the stars are seeded ({found} of 600)"
+            );
+            let flagged = m
+                .detected
+                .iter()
+                .zip(&det.extended)
+                .filter(|&(s, &e)| e && is_star(s))
+                .count();
+            assert!(
+                flagged <= 3,
+                "beta {beta}: {flagged} of {found} stars flagged extended (Q7 allowance 3); field width {:?}, envelope {:?}",
+                m.field_width,
+                det.envelope
+            );
+        }
+    }
+
+    /// Task 10b A2b truth test 3 (ruling A2-2), a GUARD (F28: it cannot fail at 1bc29ef8, which reads injected β 2.0 /
+    /// 3.0 as 2.02 / 3.01): a small field's β is read within 10 %. Two 2048² fields of 3 000 Moffat stars, β 2.0 and β
+    /// 3.0, FWHM N(2.0, 0.22) px (F ≈ 2.0), peak SNR log-uniform in [20, 3000]. Bars: |β − truth| ≤ 0.10·truth, and at
+    /// most 10 % of the β sample at the 1.5 clamp.
+    #[test]
+    fn small_field_beta_is_read_within_ten_percent() {
+        use crate::star_measure::beta::BETA_BOUNDS;
+        use crate::test_support::{add_noise, spread_moffat_field};
+        let (w, h, sigma) = (2048usize, 2048usize, 0.0003f64);
+        for (truth, seed) in [(2.0f64, 201u64), (3.0, 211)] {
+            let (mut data, _) = spread_moffat_field(
+                (w, h),
+                3000,
+                (2.0, 0.22),
+                truth,
+                sigma,
+                (20.0, 3000.0),
+                (16.0, 30.0),
+                0.05,
+                seed,
+            );
+            add_noise(&mut data, sigma as f32, seed + 1);
+            let opts = MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                diagnostics: true,
+                ..Default::default()
+            };
+            let m = measure_plane(&data, w, h, &opts, None);
+            let sample: Vec<f64> = m.diagnostics.iter().filter_map(|d| d.sample_beta).collect();
+            let at_clamp = sample
+                .iter()
+                .filter(|&&b| b <= BETA_BOUNDS.0 + 1e-6)
+                .count();
+            assert!(
+                sample.len() >= 8,
+                "β {truth}: a fitted sample ({} stars, {:?})",
+                sample.len(),
+                m.beta_source
+            );
+            assert!(
+                (m.beta - truth).abs() <= 0.10 * truth,
+                "β {truth}: read {} (field width {:?})",
+                m.beta,
+                m.field_width
+            );
+            assert!(
+                at_clamp as f64 <= 0.10 * sample.len() as f64,
+                "β {truth}: {at_clamp} of {} sample stars at the 1.5 clamp",
+                sample.len()
+            );
+        }
+    }
+
+    /// Rulings B2, B4: every accepted fit carries B_i (R6's ring) and σ_i. Flat sky 0.05, noise 0.002, β 4, FWHM 4.35:
+    /// the ring 43.5–52.2 px holds ≈ 2615 pixels; B_i within 4 SE of the sky, σ_i within 6 % (4 SE) of the noise.
+    #[test]
+    fn every_accepted_fit_carries_its_ring_sky_and_noise() {
+        use crate::test_support::add_noise;
+        let stars = grid30(5.0);
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 31);
+        let m = measure_plane(
+            &data,
+            480,
+            400,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds_of(&stars)),
+                psf_model: PsfModel::Fixed(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.stars.len(), 30);
+        let (sky, noise) = (0.05 * ADU_SCALE as f64, 0.002 * ADU_SCALE as f64);
+        let f = m.frame.fwhm_px.unwrap();
+        let full = std::f64::consts::PI * ((12.0 * f).powi(2) - (10.0 * f).powi(2));
+        for s in &m.stars {
+            let n = s.sky_ring_n as f64;
+            assert!(n > 0.97 * full && n < 1.03 * full, "{n} of {full}");
+            assert!(
+                (s.sky_ring - sky).abs() < 4.0 * noise / n.sqrt(),
+                "B_i {} vs {sky}",
+                s.sky_ring
+            );
+            assert!(
+                (s.sky_ring_sigma / noise - 1.0).abs() < 0.06,
+                "σ_i {} vs {noise}",
+                s.sky_ring_sigma
+            );
+            assert_eq!(s.sky_offset(), s.background - s.sky_ring);
+        }
+        assert_eq!(m.ring_sky_missing, 0);
+    }
+
+    /// Ruling B2: `c` reads each qualifier's stored B_i — recomputed here from the stored fields and the plane alone, it
+    /// is the plane's `c`. The replica's growth rule: every pixel whose CENTRE lies within 5F of the fit's centre, the
+    /// value in f32 working units (`v * ADU_SCALE`, the module's conversion) widened to f64, minus B_i, summed in
+    /// row-major order. The tolerance 1e-6 covers a different summation order; if the product's rule differs in the
+    /// disc or the units, the replica copies the product's rule — the tolerance is never widened.
+    #[test]
+    fn aperture_correction_is_the_growth_over_the_stored_ring_sky() {
+        use crate::test_support::add_noise;
+        let stars = grid30(5.0);
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 32);
+        let m = measure_plane(
+            &data,
+            480,
+            400,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds_of(&stars)),
+                psf_model: PsfModel::Fixed(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.aperture_stars, 30);
+        let (f, w) = (m.frame.fwhm_px.unwrap(), 480usize);
+        let r2 = (5.0 * f).powi(2);
+        let c = median(m.stars.iter().map(|s| {
+            let growth: f64 = (0..400 * w)
+                .filter(|&i| ((i % w) as f64 - s.x).powi(2) + ((i / w) as f64 - s.y).powi(2) <= r2)
+                .map(|i| (data[i] * ADU_SCALE) as f64 - s.sky_ring)
+                .sum();
+            growth / model_flux_in_fwtm(s)
+        }));
+        assert!(
+            (c / m.aperture_correction.unwrap() - 1.0).abs() < 1e-6,
+            "{c} vs {:?}",
+            m.aperture_correction
+        );
+    }
+
+    /// B_i is every accepted star's (its present ring pixels); `c`'s qualifier rule stays `c`'s: a star whose 12F disc
+    /// leaves the plane has a B_i over its partial ring and is not a qualifier.
+    #[test]
+    fn an_edge_star_has_a_ring_sky_but_does_not_qualify_for_c() {
+        use crate::test_support::add_noise;
+        let mut stars = grid30(5.0);
+        stars.push(MoffatStar {
+            x: 20.0,
+            y: 25.0,
+            ..stars[0]
+        });
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 33);
+        let m = measure_plane(
+            &data,
+            480,
+            400,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(seeds_of(&stars)),
+                psf_model: PsfModel::Fixed(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(m.stars.len(), 31);
+        let edge = m
+            .stars
+            .iter()
+            .find(|s| (s.x - 20.0).abs() < 1.0 && (s.y - 25.0).abs() < 1.0)
+            .unwrap();
+        let f = m.frame.fwhm_px.unwrap();
+        let full = std::f64::consts::PI * ((12.0 * f).powi(2) - (10.0 * f).powi(2));
+        let n = edge.sky_ring_n as f64;
+        assert!(n >= 8.0 && n < 0.75 * full, "{n} of {full}");
+        assert!(
+            (edge.sky_ring - 0.05 * ADU_SCALE as f64).abs()
+                < 4.0 * 0.002 * ADU_SCALE as f64 / n.sqrt()
+        );
+        assert_eq!(m.aperture_stars, 30, "the edge star is not a qualifier");
+    }
+
+    /// Ruling B3's arm: a given ring width sets every ring (and `c`'s growth radius); at F 4 the ring 40–48 px holds
+    /// ≈ 2212 pixels, while the plane's own F 2.61 gives ≈ 940.
+    #[test]
+    fn a_given_ring_width_sets_every_ring() {
+        use crate::test_support::add_noise;
+        let stars = grid30(3.0);
+        let mut unit = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut unit, 0.002, 34);
+        let data: Vec<f32> = unit.iter().map(|v| v * ADU_SCALE).collect();
+        let own = fit_stars_at(
+            &data,
+            480,
+            400,
+            &seeds_of(&stars),
+            4.0,
+            &FitStarsOptions::default(),
+            None,
+        );
+        let common = fit_stars_at(
+            &data,
+            480,
+            400,
+            &seeds_of(&stars),
+            4.0,
+            &FitStarsOptions {
+                ring_fwhm: Some(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let ring = std::f64::consts::PI * (48.0f64.powi(2) - 40.0f64.powi(2));
+        assert!(common
+            .fits
+            .iter()
+            .all(|f| (f.sky_ring_n as f64 / ring - 1.0).abs() < 0.03));
+        assert!(own.fits.iter().all(|f| (f.sky_ring_n as f64) < 0.5 * ring));
+        assert!(own.aperture_correction.is_some() && common.aperture_correction.is_some());
+    }
+
+    /// Task 10b, ruling B3's arm without a second fit: [`correct_at_ring`] after a fit at the plane's own ring width is,
+    /// bit for bit, the fit call handed that ring width — every fit (its ring sky and its signal), `c`, its qualifiers
+    /// and the missing rings.
+    #[test]
+    fn correcting_at_a_ring_width_after_the_fit_is_the_fit_at_that_width() {
+        use crate::test_support::add_noise;
+        let stars = grid30(3.0);
+        let mut unit = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut unit, 0.002, 35);
+        let data: Vec<f32> = unit.iter().map(|v| v * ADU_SCALE).collect();
+        let seeds = seeds_of(&stars);
+        let opts = FitStarsOptions::default();
+        let mut own = fit_stars_at(&data, 480, 400, &seeds, 4.0, &opts, None);
+        let at = fit_stars_at(
+            &data,
+            480,
+            400,
+            &seeds,
+            4.0,
+            &FitStarsOptions {
+                ring_fwhm: Some(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_ne!(own.aperture_correction, at.aperture_correction);
+        correct_at_ring(&data, 480, 400, &seeds, &mut own, 4.0, &opts, None);
+        assert_eq!(format!("{:?}", own.fits), format!("{:?}", at.fits));
+        assert_eq!(
+            (
+                own.aperture_correction,
+                own.aperture_stars,
+                own.ring_sky_missing
+            ),
+            (
+                at.aperture_correction,
+                at.aperture_stars,
+                at.ring_sky_missing
+            )
+        );
+    }
+
+    /// F-10 (Plan A Task 10b, phase A4; rulings A6, Q1, Q5): the frame-level trailed verdict from the refusal
+    /// structure. A trail longer than its fit region cannot be contained, so its seeds end `centreMoved` /
+    /// `regionTooSmall` / `centreAtRim`; over [`fit::TRAIL_VERDICT_MIN_SEEDS`] judged seeds a share of those three above
+    /// [`fit::TRAIL_REFUSAL_SHARE`] marks the plane trailed. No per-star streak refusal exists.
+    mod trailed {
+        use super::*;
+        use crate::test_support::add_noise;
+
+        /// A horizontal trail `len` px long centred at (x, y): Gaussian points of FWHM 2.6 every 0.25 px (peak ≈ 11·amp).
+        fn trail(points: &mut Vec<(f64, f64, f64)>, x: f64, y: f64, len: f64, amp: f64) {
+            let n = (len / 0.25) as usize + 1;
+            points.extend((0..n).map(|k| (x - len / 2.0 + k as f64 * 0.25, y, amp)));
+        }
+
+        /// 20-px trails (amplitude 0.018 per point) at `trails` and round β-4 Moffat stars of FWHM 2.6 and peak 0.2 at
+        /// `round`, on sky 0.05 with noise 0.002; one seed (peak 0.2) at every position, the round ones first.
+        fn fixture(
+            w: usize,
+            h: usize,
+            round: &[(f64, f64)],
+            trails: &[(f64, f64)],
+            seed: u64,
+        ) -> (Vec<f32>, Vec<Seed>) {
+            use crate::test_support::gaussian_field;
+            let mut points = Vec::new();
+            for &(x, y) in trails {
+                trail(&mut points, x, y, 20.0, 0.018);
+            }
+            let mut data = gaussian_field(w, h, &points, 2.6 / 2.354_820_045, 0.05);
+            let a = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+            let stars: Vec<MoffatStar> = round
+                .iter()
+                .map(|&(x, y)| MoffatStar {
+                    x,
+                    y,
+                    amp: 0.2,
+                    alpha_x: a,
+                    alpha_y: a,
+                    theta: 0.0,
+                })
+                .collect();
+            for (d, m) in data.iter_mut().zip(moffat_field(w, h, &stars, 4.0, 0.0)) {
+                *d += m;
+            }
+            add_noise(&mut data, 0.002, seed);
+            let seeds = round
+                .iter()
+                .chain(trails)
+                .map(|&(x, y)| Seed {
+                    x,
+                    y,
+                    peak: 0.2,
+                    flux: 1.0,
+                })
+                .collect();
+            (data, seeds)
+        }
+
+        /// [`fixture`] on a 40-px grid from (30, 30) with a 30-px margin on every side: 13 columns on a 540-px plane (the
+        /// previous version of these tests), as many as fit on a narrower one. Of the `round + trails` grid slots in order,
+        /// every `(round + trails) / round`-th holds a round star (`round` of them), the rest trails.
+        fn trail_plane_fixture(
+            w: usize,
+            h: usize,
+            round: usize,
+            trails: usize,
+            seed: u64,
+        ) -> (Vec<f32>, Vec<Seed>) {
+            let n = round + trails;
+            let cols = 13.min((w - 60) / 40 + 1);
+            assert!(
+                30 + 40 * ((n - 1) / cols) <= h - 30,
+                "{n} slots of {cols} columns do not fit {w} x {h}"
+            );
+            let at = |i: usize| {
+                (
+                    30.0 + 40.0 * (i % cols) as f64,
+                    30.0 + 40.0 * (i / cols) as f64,
+                )
+            };
+            let stride = n / round;
+            let is_round = |i: usize| i % stride == 0 && i / stride < round;
+            let round_at: Vec<(f64, f64)> = (0..n).filter(|&i| is_round(i)).map(at).collect();
+            let trails_at: Vec<(f64, f64)> = (0..n).filter(|&i| !is_round(i)).map(at).collect();
+            assert_eq!((round_at.len(), trails_at.len()), (round, trails));
+            fixture(w, h, &round_at, &trails_at, seed)
+        }
+
+        /// 120 trails and 5 round stars: 125 judged seeds, the trails' fits end centreMoved / regionTooSmall / centreAtRim above the
+        /// derived share → the plane is trailed, keeps no star, `c` is None. No `Streak` reason exists.
+        #[test]
+        fn a_plane_of_trails_is_trailed_by_its_refusal_share_and_keeps_no_star() {
+            let (data, seeds) = trail_plane_fixture(540, 420, 5, 120, 42);
+            let m = measure_plane(
+                &data,
+                540,
+                420,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(m.trailed);
+            assert!(
+                m.trail_share >= fit::TRAIL_REFUSAL_SHARE,
+                "{}",
+                m.trail_share
+            );
+            assert!(m.stars.is_empty());
+            assert_eq!(
+                m.refused
+                    .by_reason
+                    .get(&RefusalReason::Trailed)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                true
+            );
+            assert_eq!(m.aperture_correction, None);
+        }
+
+        /// Under 100 judged seeds there is no verdict, however many fits end centreMoved / regionTooSmall / centreAtRim.
+        #[test]
+        fn fewer_than_the_minimum_judged_seeds_is_never_trailed() {
+            let (data, seeds) = trail_plane_fixture(420, 310, 5, 15, 41);
+            let m = measure_plane(
+                &data,
+                420,
+                310,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(!m.trailed);
+        }
+
+        /// Elongated stars (eccentricity 0.7, the lab's most elongated `shape` family, and a G 0003-like 0.65 field) are
+        /// stars: no verdict, none refused for their shape, all 120 kept.
+        #[test]
+        fn elongated_stars_are_measured_as_is_with_no_verdict() {
+            let (ax, ay) = (
+                2.6 / 0.714 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt()),
+                2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt()),
+            );
+            let stars: Vec<MoffatStar> = (0..120)
+                .map(|i| MoffatStar {
+                    x: 30.0 + 40.0 * (i % 12) as f64,
+                    y: 30.0 + 40.0 * (i / 12) as f64,
+                    amp: 0.2,
+                    alpha_x: ax,
+                    alpha_y: ay,
+                    theta: 0.5,
+                })
+                .collect();
+            let mut data = moffat_field(500, 420, &stars, 4.0, 0.05);
+            add_noise(&mut data, 0.002, 43);
+            let m = measure_plane(
+                &data,
+                500,
+                420,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds_of(&stars)),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(!m.trailed);
+            assert_eq!(m.stars.len(), 120);
+        }
+
+        /// The verdict is the measure path's alone (as the defocused one): an LN-style refit (`fit_stars_at`, the
+        /// default `trail_verdict: false`) of the trailed plane keeps its round stars' fits and reports the share; the
+        /// same call asking for the verdict refuses every one of them `Trailed`, and every seed keeps one outcome.
+        #[test]
+        fn only_a_call_that_asks_for_the_verdict_refuses_a_trailed_planes_fits() {
+            let (data, seeds) = trail_plane_fixture(540, 420, 5, 120, 42);
+            let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+            let off = fit_stars_at(
+                &scaled,
+                540,
+                420,
+                &seeds,
+                4.0,
+                &FitStarsOptions::default(),
+                None,
+            );
+            assert!(!off.trailed);
+            assert!(
+                off.trail_share > fit::TRAIL_REFUSAL_SHARE,
+                "{}",
+                off.trail_share
+            );
+            assert!(!off.fits.is_empty());
+            assert!(!off.refused.by_reason.contains_key(&RefusalReason::Trailed));
+            let opts = FitStarsOptions {
+                trail_verdict: true,
+                ..Default::default()
+            };
+            let on = fit_stars_at(&scaled, 540, 420, &seeds, 4.0, &opts, None);
+            assert!(on.trailed);
+            assert!(on.fits.is_empty());
+            assert_eq!(on.aperture_correction, None);
+            assert_eq!(on.trail_share, off.trail_share);
+            assert_eq!(
+                on.refused.by_reason.get(&RefusalReason::Trailed).copied(),
+                Some(off.fits.len())
+            );
+            assert_eq!(on.refused.accounted(0), seeds.len());
         }
     }
 
@@ -1989,6 +2912,9 @@ mod tests {
             assert!(vb.plateau && vb.excluded > 0 && !vb.saturated, "{vb:?}");
             assert!(vc.plateau && vc.excluded > 0 && vc.saturated, "{vc:?}");
             let working: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+            // Task 10b (ruling F14 edit): each call reads its ring skies at its own frame FWHM, and the flagged star
+            // leaves the measure path's statistic but not the no-verdict call's; at the measure path's ring width
+            // the no-verdict call's ring sky is the same read, so the whole record still compares bit for bit.
             let free = fit_stars_at(
                 &working,
                 w,
@@ -1997,6 +2923,7 @@ mod tests {
                 m.beta,
                 &FitStarsOptions {
                     field_width: Some(m.field_width.fwhm_px),
+                    ring_fwhm: m.frame.fwhm_px,
                     ..Default::default()
                 },
                 None,

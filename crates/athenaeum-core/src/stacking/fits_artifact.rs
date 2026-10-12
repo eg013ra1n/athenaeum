@@ -133,6 +133,10 @@ fn decode_fit(record: &[u8]) -> StarFit {
         area: field(12),
         // Not persisted (spec 2026-10-04 L-12).
         peak5: f64::NAN,
+        // Not persisted either (Plan A Task 10b: the ring sky B_i, σ_i and n_i are re-read on every measure).
+        sky_ring: f64::NAN,
+        sky_ring_sigma: f64::NAN,
+        sky_ring_n: 0,
         // Every bit as written (a file from before Plan A Task 4 holds 0).
         flags: StarFlags(record[FIELDS_PER_RECORD * 4]),
     }
@@ -256,6 +260,9 @@ mod tests {
             signal: signed(rng, 1e6),
             area: rng.next_f64() * 1000.0,
             peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
             flags: StarFlags::default(),
         }
     }

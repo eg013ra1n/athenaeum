@@ -31,7 +31,7 @@
 //! verdict fit, flagged when its amplitude tops the plane's range), after the field width and before the β sample:
 //! seeds → field width → verdicts ([`verdict_pass`]; on a multi-plane image every plane's, then the cross-plane rule)
 //! → β sample → fits at β ([`fit_after_passes`]). The `Auto` β sample is the 64 brightest seeds whose verdict fit
-//! succeeded unflagged; every star is fitted at β and carries its flag in [`StarFlags::SATURATED`], a flagged one
+//! succeeded unflagged (from Task 10b also centred, and not flagged extended by the knot test); every star is fitted at β and carries its flag in [`StarFlags::SATURATED`], a flagged one
 //! (own or cross-plane) without its pixels ≥ its level, ×3 iterations (Q6 as revised 2026-10-09). A seed whose verdict
 //! fit keeps no more pixels than its 8 parameters is refused [`RefusalReason::MostlySaturated`].
 //!
@@ -47,6 +47,12 @@
 //! [`super::photometry::model_flux_in_fwtm`] times the plane's aperture correction `c`
 //! ([`super::photometry::aperture_correction`], measured after the duplicate drop, or the caller's
 //! [`super::FluxCorrection::Given`]). No fit, refusal or acceptance rule reads `signal`: every fit is what it was.
+//!
+//! F-10 (Plan A Task 10b, rulings B1–B4): after the duplicate drop every kept fit carries its aperture-scale sky B_i,
+//! noise σ_i and pixel count n_i ([`super::photometry::ring_skies`]: R6's ring at the plane's frame FWHM, or the
+//! caller's [`super::FitStarsOptions::ring_fwhm`]), and `c` reads the stored B_i; the fit's own `b` stays free (B1).
+//! [`FitOutcome::fit_seeds`] lets a caller re-read both at another ring width without a second fit
+//! ([`super::correct_at_ring`], LN's pair-common arm).
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
@@ -105,8 +111,6 @@ pub struct Seed {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitParams {
-    /// A fit is accepted only if its centre stays within this distance of the seed.
-    pub centroid_tolerance_px: f64,
     /// Aperture growth `k`: the ellipse semi-axes are `k·FWTM/2`.
     pub growth: f64,
     pub max_iter: usize,
@@ -132,7 +136,6 @@ pub struct FitParams {
 impl Default for FitParams {
     fn default() -> Self {
         FitParams {
-            centroid_tolerance_px: 1.5,
             growth: 1.0,
             max_iter: 100,
             conv_tol: 1e-5,
@@ -147,7 +150,8 @@ impl Default for FitParams {
 
 /// Per-accepted-fit flags (spec 2026-10-07 §3 F-0), persisted as the `.athf` record's flags byte
 /// (`stacking::fits_artifact`). `SATURATED` is set from Task 8 (the measure path's saturation verdict), `BETA_AT_CAP`
-/// from Task 9. A bit this build does not name is kept as it is (a newer writer's flag survives a round trip).
+/// from Task 9, `EXTENDED` from Task 10b (the matched filter's knot test). A bit this build does not name is kept as it
+/// is (a newer writer's flag survives a round trip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StarFlags(pub u8);
@@ -158,6 +162,9 @@ impl StarFlags {
     /// The star was fitted at a fitted frame β that sits at a bound of [`super::beta::BETA_BOUNDS`] (F-4, Task 9):
     /// set on every star of such a plane, never under a caller's fixed β.
     pub const BETA_AT_CAP: StarFlags = StarFlags(2);
+    /// The star's seed is not a point source (F-10, Task 10b ruling A3: the knot test's zero-sum ratio): it is fitted
+    /// and kept, but leaves the β sample, `c`'s qualifiers and the frame statistic, as a saturated star does (P3).
+    pub const EXTENDED: StarFlags = StarFlags(4);
 
     pub const fn bits(self) -> u8 {
         self.0
@@ -182,11 +189,23 @@ impl StarFlags {
         self.contains(StarFlags::BETA_AT_CAP)
     }
 
-    /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`).
+    /// [`StarFlags::EXTENDED`] is set (F-10): the β sample, `c`'s qualifiers and the frame statistic skip the star.
+    pub const fn extended(self) -> bool {
+        self.contains(StarFlags::EXTENDED)
+    }
+
+    /// The star is one the frame statistic and `c`'s qualifiers read: neither saturated (F-3) nor extended (F-10, P3).
+    pub const fn in_statistic(self) -> bool {
+        !self.saturated() && !self.extended()
+    }
+
+    /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`,
+    /// `"extended"`).
     pub fn names(self) -> Vec<&'static str> {
         [
             (StarFlags::SATURATED, "saturated"),
             (StarFlags::BETA_AT_CAP, "betaAtCap"),
+            (StarFlags::EXTENDED, "extended"),
         ]
         .into_iter()
         .filter(|(f, _)| self.contains(*f))
@@ -241,6 +260,18 @@ pub struct StarFit {
     /// artifact.
     #[serde(skip, default = "not_measured")]
     pub peak5: f64,
+    /// B_i (Task 10b, F-10, ruling B2): the star's aperture-scale sky, the plain mean of its present pixels at
+    /// `10F ≤ d ≤ 12F` from the fitted centre outside every seed's `3F` disc (R6's ring,
+    /// [`super::photometry::ring_sky`]), in the fit's units; `c` reads it, Task 11's SNR and HFR will. Not persisted:
+    /// NaN on a decoded fit, and where the ring holds fewer than 8 present pixels.
+    #[serde(skip, default = "not_measured")]
+    pub sky_ring: f64,
+    /// σ_i (ruling B4): the RMS of `v − B_i` over B_i's own pixels. Not persisted: NaN where `sky_ring` is.
+    #[serde(skip, default = "not_measured")]
+    pub sky_ring_sigma: f64,
+    /// n_i: the ring pixels B_i and σ_i read; 0 where the ring is missing. Not persisted.
+    #[serde(skip)]
+    pub sky_ring_n: u32,
     /// [`StarFlags`]: written and read as the `.athf` flags byte; a fit decoded from a file written before Plan A
     /// Task 4 (whose byte is 0) reads none.
     #[serde(default)]
@@ -252,6 +283,11 @@ fn not_measured() -> f64 {
 }
 
 impl StarFit {
+    /// The near/far sky difference `b − B_i` (Task 10b, ruling B1: the fit's free local background against its
+    /// aperture-scale ring sky): the structured-sky diagnostic. NaN where the ring is missing.
+    pub fn sky_offset(&self) -> f64 {
+        self.background - self.sky_ring
+    }
     pub fn mean_flux(&self) -> f64 {
         self.signal / self.area
     }
@@ -293,6 +329,13 @@ pub struct FitOutcome {
     pub defocused: bool,
     /// The readable seeds that refused `Donut` (the verdict's `n_donut`); 0 unless the caller asked for the verdict.
     pub defocus_donuts: usize,
+    /// The plane is trailed (Task 10b, F-10; rulings A6, Q1, Q5, [`plane_is_trailed`]): `fits` is empty and every seed
+    /// that would have been accepted is refused [`RefusalReason::Trailed`]. Never set on a defocused plane (that verdict
+    /// is read first) nor when the caller did not ask for it.
+    pub trailed: bool,
+    /// The share of the judged seeds refused `CentreMoved`, `RegionTooSmall` or `CentreAtRim` ([`trail_share`]), whether or not the
+    /// caller asked for the verdict; 0 with no seed.
+    pub trail_share: f64,
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Q4: no flag, no refusal, out
     /// of the β sample); 0 on every path that runs no verdict.
     pub verdict_fit_failed: usize,
@@ -302,6 +345,16 @@ pub struct FitOutcome {
     pub aperture_correction: Option<f64>,
     /// The qualifying stars the plane's own `aperture_correction` is the median over (at most 64); 0 for a caller's.
     pub aperture_stars: usize,
+    /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present ring pixels, or no ring width on
+    /// the plane); their `sky_ring` and `sky_ring_sigma` are NaN and `sky_ring_n` 0.
+    pub ring_sky_missing: usize,
+    /// The seed each fit came from, in `fits` order (`fits[k]` is seed `fit_seeds[k]`'s): what a later re-read of the
+    /// ring sky and `c` at another ring width needs (LN's pair-common arm, [`super::correct_at_ring`]; no second fit).
+    pub fit_seeds: Vec<usize>,
+    /// The ring width F the fits' ring skies B_i and `c` were read at ([`super::photometry::ring_skies`]: the caller's
+    /// `ring_fwhm`, else the plane's frame FWHM over the kept fits neither saturated nor extended); `None` when no ring
+    /// width existed (no fit in the statistic). The one owner of that width: LN's pair-common arm reads it here.
+    pub ring_fwhm: Option<f64>,
 }
 
 /// A plane with this many readable seeds refused `Donut`, and at least [`DEFOCUSED_DONUT_FRACTION`] of its readable
@@ -316,6 +369,42 @@ pub(super) fn plane_is_defocused(n_read: usize, n_donut: usize) -> bool {
     n_donut >= DEFOCUSED_MIN_DONUTS && n_donut as f64 >= DEFOCUSED_DONUT_FRACTION * n_read as f64
 }
 
+/// The trailed-frame verdict's line (Task 10b, F-10; ruling Q5, the majority rule): a plane is trailed when MORE than
+/// half of its judged seeds were refused `CentreMoved`, `RegionTooSmall` or `CentreAtRim` — most of the frame's detected sources cannot
+/// be contained in a fit region, which is what a trail longer than the region does to its fit. A physical criterion,
+/// not a number fitted to one frame: the line derived from the clean frames' own distribution (median + 5·1.4826·MAD)
+/// did not separate the elongated frames from the trailed one (plan Task 10b phase A4 step 2a: clean real and lab
+/// frames ≤ 0.151, the two elongated cases 0.366 / 0.389, the trailed L 0010 0.893). It rests on few real trailed
+/// frames; the lab's synthetic long-trail family crosses it near a streak of one fit-region diameter. ecc is never the
+/// gate (ruling Q1: an elongated star is a real star, measured as such). Ruling A4-2: the share counts every
+/// containment refusal — a streak fit that the half-maximum centre test no longer catches reaches the rim test, so
+/// leaving `CentreAtRim` out would change the quantity, not the frame (clean frames ≤ 0.15, G 0003 0.175, trailed
+/// frames ≥ 0.88 on the A4 proof set).
+pub const TRAIL_REFUSAL_SHARE: f64 = 0.5;
+/// Under this many judged seeds there is no trailed verdict, whatever the share: the minimum detection count of the
+/// plate solver's own trailed-frame rule, quoted (it is private there), not pinned.
+pub const TRAIL_VERDICT_MIN_SEEDS: usize = 100;
+
+/// The share of the `judged` seeds refused `CentreMoved`, `RegionTooSmall` or `CentreAtRim` (Task 10b, F-10, ruling Q1: the refusal
+/// structure a trail leaves): `(centreMoved + regionTooSmall + centreAtRim) / judged`, 0 when nothing was judged. `judged` = the
+/// seeds the fit call gave an outcome (every seed handed in; Task 12's budget outcomes are not judged).
+pub fn trail_share(refused: &RefusalCounts, judged: usize) -> f64 {
+    if judged == 0 {
+        return 0.0;
+    }
+    let n = |r| refused.by_reason.get(&r).copied().unwrap_or(0);
+    (n(RefusalReason::CentreMoved)
+        + n(RefusalReason::RegionTooSmall)
+        + n(RefusalReason::CentreAtRim)) as f64
+        / judged as f64
+}
+
+/// The trailed-frame rule (ruling Q5): at least [`TRAIL_VERDICT_MIN_SEEDS`] judged seeds and a [`trail_share`] above
+/// [`TRAIL_REFUSAL_SHARE`].
+pub(super) fn plane_is_trailed(judged: usize, share: f64) -> bool {
+    judged >= TRAIL_VERDICT_MIN_SEEDS && share > TRAIL_REFUSAL_SHARE
+}
+
 /// Full width at tenth maximum of a Moffat profile, `2α√(10^{1/β} − 1)`.
 pub fn fwtm_from_alpha(alpha: f64, beta: f64) -> f64 {
     2.0 * alpha * (10f64.powf(1.0 / beta) - 1.0).sqrt()
@@ -326,7 +415,7 @@ pub fn fwtm_from_alpha(alpha: f64, beta: f64) -> f64 {
 const WIDTH_START_BOX_PER_FIELD: f64 = 2.0;
 /// The width start reads the star's own half-maximum width only when its peak stands at least this many σ_rim above the
 /// width-start box's rim; a fainter star starts from the field width (Task 6b round 1, ruling R1).
-const WIDTH_START_MIN_PEAK_SNR: f64 = 10.0;
+pub(super) const WIDTH_START_MIN_PEAK_SNR: f64 = 10.0;
 /// `F_start`'s clamp, px (PA-12).
 const WIDTH_START_MIN_PX: f64 = 0.6;
 const WIDTH_START_MAX_PX: f64 = 40.0;
@@ -1266,6 +1355,7 @@ fn seed_pass(
         seed.y - reg.cy as f64,
         reg.b0,
         reg.start.fwhm,
+        reg.r as f64,
         plane,
         p,
         scratch,
@@ -1399,6 +1489,50 @@ fn integrated_beta_on_region(
     beta
 }
 
+/// Is the offset `(dx, dy)` from a fit's centre inside its half-maximum contour (Task 10b ruling A4-2)? The contour is
+/// the ellipse of semi-axes `(semi_x, semi_y)` (half the FWHMs) turned by `theta` — `(u/α_x)² + (v/α_y)² ≤ 2^(1/β) − 1`
+/// in the fit's axes. One definition: the acceptance test, the verdict fit's `centred` and LN's seed link all read it.
+pub(crate) fn inside_half_max(dx: f64, dy: f64, semi_x: f64, semi_y: f64, theta: f64) -> bool {
+    let (c, s) = (theta.cos(), theta.sin());
+    let (u, v) = (dx * c + dy * s, -dx * s + dy * c);
+    (u / semi_x).powi(2) + (v / semi_y).powi(2) <= 1.0
+}
+
+/// [`accept`]'s centre and region tests (math reference §1.4), shared with the verdict fit's `centred` (Task 10b ruling
+/// A4) so the two read one definition: `CentreMoved` when the seed `(seed_x, seed_y)` lies outside the fitted star's own
+/// half-maximum contour ([`inside_half_max`]; ruling A4-2: "is this fit the seed's star?" read at the FWHM's own
+/// definition — a detection lies on its star's core, so its error is bounded by the core's half-widths, not by a fixed
+/// number; at a round FWHM-3 star the contour is 1.5 px); `CentreAtRim` when the fitted centre sits outside the region
+/// about `(cx, cy)` of radius `r` shrunk by `inner_margin` per side; `RegionTooSmall` when half the grown major FWTM
+/// exceeds `r`. The fitted centre `(x0, y0)`, the seed and the region centre in one frame (image or stamp
+/// coordinates); `alpha` the fitted `(α_x, α_y)` at `beta`, turned by `theta`.
+pub(super) fn placement(
+    (x0, y0): (f64, f64),
+    (alpha_x, alpha_y): (f64, f64),
+    beta: f64,
+    (seed_x, seed_y): (f64, f64),
+    (cx, cy, r): (f64, f64, f64),
+    theta: f64,
+    p: &FitParams,
+) -> Result<(), RefusalReason> {
+    let k = (2f64.powf(1.0 / beta) - 1.0).sqrt();
+    if !inside_half_max(seed_x - x0, seed_y - y0, alpha_x * k, alpha_y * k, theta) {
+        return Err(RefusalReason::CentreMoved);
+    }
+    // The fitted centre must sit inside the sampling region shrunk by
+    // `inner_margin` per side (math reference §1.4): a star whose region
+    // stayed narrow is one whose light the region barely contains.
+    let inner = (1.0 - 2.0 * p.inner_margin) * r;
+    if (x0 - cx).abs() > inner || (y0 - cy).abs() > inner {
+        return Err(RefusalReason::CentreAtRim);
+    }
+    let fwtm = fwtm_from_alpha(alpha_x, beta).max(fwtm_from_alpha(alpha_y, beta));
+    if 0.5 * p.growth * fwtm > r {
+        return Err(RefusalReason::RegionTooSmall);
+    }
+    Ok(())
+}
+
 /// The acceptance rules (math reference §1.4), each refusal with its reason. The first gate is one condition, as it
 /// always was; its reason is `NonFinite` when a parameter or the residual is not finite, else `ResidualTooLarge`
 /// when the residual reaches the cap, else `FitFailed` (`A ≤ 0` or an `α ≤ 0`). The last (Task 6b) refuses a fit
@@ -1440,27 +1574,19 @@ fn accept(
             RefusalReason::FitFailed
         });
     }
-    if (m.x0 - seed.x).abs() > p.centroid_tolerance_px
-        || (m.y0 - seed.y).abs() > p.centroid_tolerance_px
-    {
-        return Err(RefusalReason::CentreMoved);
-    }
-    // The fitted centre must sit inside the sampling region shrunk by
-    // `inner_margin` per side (math reference §1.4). With the default
-    // centroid tolerance this only bites on a small region, which is
-    // precisely where it should: a star whose region stayed narrow is one
-    // whose light the region barely contains.
-    let inner = (1.0 - 2.0 * p.inner_margin) * r;
-    if (m.x0 - cx).abs() > inner || (m.y0 - cy).abs() > inner {
-        return Err(RefusalReason::CentreAtRim);
-    }
+    placement(
+        (m.x0, m.y0),
+        (m.alpha_x, m.alpha_y),
+        m.beta,
+        (seed.x, seed.y),
+        (cx, cy, r),
+        m.theta,
+        p,
+    )?;
     let (fwtm_x, fwtm_y) = (
         fwtm_from_alpha(m.alpha_x, m.beta),
         fwtm_from_alpha(m.alpha_y, m.beta),
     );
-    if 0.5 * p.growth * fwtm_x.max(fwtm_y) > r {
-        return Err(RefusalReason::RegionTooSmall);
-    }
     // Task 6b: a fit narrower than a pixel on either axis is a hot pixel (or a
     // cosmic) that got a seed, not a star.
     if m.fwhm_x().min(m.fwhm_y()) < NARROWEST_FWHM_PX {
@@ -1500,6 +1626,9 @@ fn accept(
         signal: 0.0,
         area: 0.0,
         peak5: f64::NAN,
+        sky_ring: f64::NAN,
+        sky_ring_sigma: f64::NAN,
+        sky_ring_n: 0,
         flags: StarFlags::default(),
     })
 }
@@ -1626,20 +1755,25 @@ pub fn fit_stars(
         pool,
         false,
         false,
+        false,
         Correction::default(),
     )
 }
 
 /// What a fit call's aperture correction reads from its caller (F-5, Task 10; one struct from round 4): where `c`
 /// comes from (`flux`), the clip screen's range (`saturation`, the measure path's plane inputs; else the plane's own
-/// under `full_scale`, [`super::photometry::unverdicted_clip_range`]) and the footprint a qualifier's `12F` disc must
-/// lie in. `Default`: measured on the plane, uncapped, the whole plane.
+/// under `full_scale`, [`super::photometry::unverdicted_clip_range`]), the footprint a qualifier's `12F` disc must
+/// lie in and (Task 10b) the ring width every fit's B_i is read at. `Default`: measured on the plane, uncapped, the
+/// whole plane, the plane's own frame FWHM.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Correction<'a> {
     pub(super) flux: super::FluxCorrection,
     pub(super) saturation: Option<&'a SaturationPlane>,
     pub(super) full_scale: Option<f64>,
     pub(super) footprint: Option<&'a [bool]>,
+    /// The ring width every fit's B_i is read at and `c`'s growth radius scales with (Task 10b, ruling B3's arm):
+    /// `None` = the plane's own frame FWHM.
+    pub(super) ring_fwhm: Option<f64>,
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -1689,6 +1823,7 @@ pub(super) fn fit_stars_diagnosed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    trail_verdict: bool,
     correction: Correction<'_>,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
@@ -1706,6 +1841,8 @@ pub(super) fn fit_stars_diagnosed(
         pool,
         diagnostics,
         defocus_verdict,
+        trail_verdict,
+        &[],
     )
 }
 
@@ -1752,6 +1889,8 @@ pub(super) fn fit_after_passes(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    trail_verdict: bool,
+    extended: &[bool],
 ) -> FitOutcome {
     let sample = match model {
         PsfModel::Moffat4 => super::beta::SampleBeta::fixed(4.0),
@@ -1760,7 +1899,7 @@ pub(super) fn fit_after_passes(
         // `Auto` sample below never runs for it.
         PsfModel::Fixed(b) => super::beta::SampleBeta::fixed(b),
         PsfModel::Auto => match passes {
-            Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, pool),
+            Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, extended, pool),
             None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
         },
     };
@@ -1778,7 +1917,9 @@ pub(super) fn fit_after_passes(
         pool,
         diagnostics,
         defocus_verdict,
+        trail_verdict,
         correction,
+        extended,
     );
     outcome.beta_source = beta_source;
     if matches!(beta_source, BetaSource::Fitted { .. }) && super::beta::at_bound(beta) {
@@ -1831,6 +1972,7 @@ pub fn fit_stars_with_beta(
         pool,
         false,
         false,
+        false,
         Correction::default(),
     )
 }
@@ -1859,6 +2001,7 @@ pub(super) fn fit_stars_with_beta_diagnosed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    trail_verdict: bool,
     correction: Correction<'_>,
 ) -> FitOutcome {
     let field = resolve_field_width(data, w, h, seeds, mask, field_width);
@@ -1875,7 +2018,9 @@ pub(super) fn fit_stars_with_beta_diagnosed(
         pool,
         diagnostics,
         defocus_verdict,
+        trail_verdict,
         correction,
+        &[],
     )
 }
 
@@ -1883,7 +2028,8 @@ pub(super) fn fit_stars_with_beta_diagnosed(
 /// pass (F-3), `None` on every other path. `correction` (F-5): the kept fits' model fluxes are scaled by the plane's
 /// aperture correction (measured here, after the duplicate drop: the clip screen reads `correction.saturation`'s range
 /// on the measure path, else the plane's own under `correction.full_scale`, owner ruling R6 / round 4; a qualifier's
-/// `12F` disc lies in `correction.footprint`) or the caller's (`correction.flux`).
+/// `12F` disc lies in `correction.footprint`) or the caller's (`correction.flux`). `extended[i]` (the measure path's
+/// knot flags, empty elsewhere) flags seed `i`'s kept fit [`StarFlags::EXTENDED`] before the correction reads them.
 #[allow(clippy::too_many_arguments)]
 fn fit_at_width(
     data: &[f32],
@@ -1898,7 +2044,9 @@ fn fit_at_width(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
     defocus_verdict: bool,
+    trail_verdict: bool,
     correction: Correction<'_>,
+    extended: &[bool],
 ) -> FitOutcome {
     let per_seed = fit_all_outcomes(
         data,
@@ -1924,9 +2072,32 @@ fn fit_at_width(
     // The plane rule is the measure path's alone (Task 6b fix wave A, review I1): LN and every other caller keep the
     // per-star `Donut` refusal and never see the plane verdict. The event is the adapter's (it knows the path).
     let defocused = defocus_verdict && plane_is_defocused(n_read, n_donut);
+    // The trailed verdict (Task 10b, F-10; rulings A6, Q1, Q5) is the measure path's alone too, read from the refusal
+    // structure of the same fits: the share of the judged seeds whose fit could not be contained (`CentreMoved`,
+    // `RegionTooSmall`, `CentreAtRim`). A seed it pre-empts is refused `Trailed`, so the F-0 identity holds. A defocused plane keeps
+    // its own verdict (read first).
+    let judged = per_seed.len();
+    let n_uncontained = per_seed
+        .iter()
+        .filter(|(r, _)| {
+            matches!(
+                r,
+                Err(RefusalReason::CentreMoved)
+                    | Err(RefusalReason::RegionTooSmall)
+                    | Err(RefusalReason::CentreAtRim)
+            )
+        })
+        .count();
+    let share = if judged == 0 {
+        0.0
+    } else {
+        n_uncontained as f64 / judged as f64
+    };
+    let trailed = trail_verdict && !defocused && plane_is_trailed(judged, share);
     for (i, (result, trace)) in per_seed.into_iter().enumerate() {
         match result {
             Ok(_) if defocused => outcomes.push(Outcome::Refused(RefusalReason::Defocused)),
+            Ok(_) if trailed => outcomes.push(Outcome::Refused(RefusalReason::Trailed)),
             Ok(f) => {
                 // Settled by the duplicate drop: a kept fit is overwritten
                 // below with its star index, a dropped one stays Duplicate.
@@ -1943,35 +2114,27 @@ fn fit_at_width(
     for (star, &(seed, _)) in kept.iter().enumerate() {
         outcomes[seed] = Outcome::Accepted { star };
     }
-    // F-5 (Task 10): the aperture correction, after the duplicate drop and before any total reads `signal`; it moves
-    // no fit, only every kept fit's flux.
-    let given = match correction.flux {
-        super::FluxCorrection::Given(c) if c.is_finite() && c > 0.0 => Some(c),
-        super::FluxCorrection::Given(bad) => {
-            warn!(
-                aperture_correction = bad,
-                count = kept.len(),
-                "fit: the given aperture correction is not a positive number; the plane's own is measured"
-            );
-            None
+    // F-10 (Task 10b, P3): a fit of a seed the knot test flagged extended carries the flag, so `c`'s qualifiers and the
+    // frame statistic skip it as they skip a saturated star.
+    for (seed, f) in &mut kept {
+        if extended.get(*seed).copied().unwrap_or(false) {
+            f.flags |= StarFlags::EXTENDED;
         }
-        super::FluxCorrection::FromPlane => None,
-    };
-    let (aperture_correction, aperture_stars) = match given {
-        Some(c) => (Some(c), 0),
-        None => super::photometry::aperture_correction(
-            data,
-            mask,
-            w,
-            h,
-            &kept,
-            seeds,
-            field.fwhm_px,
-            correction.saturation,
-            correction.full_scale,
-            correction.footprint,
-        ),
-    };
+    }
+    // F-10 (Task 10b, ruling B2) then F-5 (Task 10): every kept fit's ring sky B_i and σ_i, then the aperture
+    // correction from them, after the duplicate drop and before any total reads `signal`; neither moves a fit, `c`
+    // only every kept fit's flux.
+    let (aperture_correction, aperture_stars, ring_sky_missing, ring_fwhm) = ring_and_correction(
+        data,
+        mask,
+        w,
+        h,
+        seeds,
+        &mut kept,
+        field.fwhm_px,
+        &correction,
+        pool,
+    );
     if let Some(c) = aperture_correction {
         for (_, f) in &mut kept {
             f.signal *= c;
@@ -1996,11 +2159,17 @@ fn fit_at_width(
             failed, beta, "fit at beta: seeds whose fit failed are refused fitFailed"
         );
     }
+    let fit_seeds: Vec<usize> = kept.iter().map(|&(seed, _)| seed).collect();
     let fits: Vec<StarFit> = kept.into_iter().map(|(_, f)| f).collect();
     debug_assert_eq!(
         refused.accounted(fits.len()),
         seeds.len(),
         "every seed has exactly one outcome (ruling F13)"
+    );
+    debug_assert_eq!(
+        share,
+        trail_share(&refused, judged),
+        "the verdict's share is the refusal counts' (Task 10b)"
     );
     let verdict_of = |seed: usize| -> Option<SaturationVerdict> {
         passes.and_then(|v| v[seed].verdict.as_ref().and_then(|r| r.ok()))
@@ -2033,10 +2202,121 @@ fn fit_at_width(
         diagnostics,
         defocused,
         defocus_donuts: if defocus_verdict { n_donut } else { 0 },
+        trailed,
+        trail_share: share,
         verdict_fit_failed,
         aperture_correction,
         aperture_stars,
+        ring_sky_missing,
+        fit_seeds,
+        ring_fwhm,
     }
+}
+
+/// Every kept fit's ring sky (Task 10b, F-10, ruling B2: [`super::photometry::ring_skies`] at `correction.ring_fwhm`,
+/// else the plane's own frame FWHM), then the aperture correction from the stored B_i (F-5,
+/// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Returns
+/// `(c, qualifiers, ring_sky_missing, ring_fwhm)`; no `signal` is touched. One body for the fit call and for a later re-read at
+/// another ring width ([`correct_at_ring`]).
+#[allow(clippy::too_many_arguments)]
+fn ring_and_correction(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    kept: &mut [(usize, StarFit)],
+    field_fwhm: f64,
+    correction: &Correction<'_>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (Option<f64>, usize, usize, Option<f64>) {
+    let (ring_fwhm, missing) = super::photometry::ring_skies(
+        data,
+        mask,
+        correction.footprint,
+        w,
+        h,
+        seeds,
+        kept,
+        correction.ring_fwhm,
+        pool,
+    );
+    let given = match correction.flux {
+        super::FluxCorrection::Given(c) if c.is_finite() && c > 0.0 => Some(c),
+        super::FluxCorrection::Given(bad) => {
+            warn!(
+                aperture_correction = bad,
+                count = kept.len(),
+                "fit: the given aperture correction is not a positive number; the plane's own is measured"
+            );
+            None
+        }
+        super::FluxCorrection::FromPlane => None,
+    };
+    let (c, stars) = match given {
+        Some(c) => (Some(c), 0),
+        None => super::photometry::aperture_correction(
+            data,
+            mask,
+            w,
+            h,
+            kept,
+            seeds,
+            field_fwhm,
+            ring_fwhm,
+            correction.saturation,
+            correction.full_scale,
+            correction.footprint,
+        ),
+    };
+    (c, stars, missing, ring_fwhm)
+}
+
+/// LN's pair-common ring arm (Task 10b, ruling B3) without a second fit: every fit of `outcome` (a fit call's result
+/// on `data` with `seeds`) re-reads its ring sky at `correction.ring_fwhm` and the plane's `c` is measured again from
+/// them, exactly as the fit call itself would have with that ring width ([`ring_and_correction`], the same seeds,
+/// field width and qualifier rule); every fit's `signal` becomes its model flux ([`super::model_flux_in_fwtm`], the
+/// value the fit call started from) times the new `c`. The fits themselves (centres, widths, β, flags) do not move.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn correct_at_ring(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    outcome: &mut FitOutcome,
+    correction: &Correction<'_>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(outcome.fit_seeds.len(), outcome.fits.len());
+    let mut kept: Vec<(usize, StarFit)> = outcome
+        .fit_seeds
+        .iter()
+        .copied()
+        .zip(outcome.fits.drain(..))
+        .collect();
+    let (c, stars, missing, ring_fwhm) = ring_and_correction(
+        data,
+        mask,
+        w,
+        h,
+        seeds,
+        &mut kept,
+        outcome.field_width.fwhm_px,
+        correction,
+        pool,
+    );
+    for (_, f) in &mut kept {
+        f.signal = super::photometry::model_flux_in_fwtm(f);
+        if let Some(c) = c {
+            f.signal *= c;
+        }
+    }
+    outcome.fits = kept.into_iter().map(|(_, f)| f).collect();
+    outcome.aperture_correction = c;
+    outcome.aperture_stars = stars;
+    outcome.ring_sky_missing = missing;
+    outcome.ring_fwhm = ring_fwhm;
 }
 
 #[cfg(test)]
@@ -2298,6 +2578,10 @@ mod tests {
     }
 
     #[test]
+    // Ruling A4-2: the 'wander' arm of this test (a seed 3.5 px off whose fit walked back > 1.5 px) read the retired fixed
+    // centroid tolerance. A seed off a star now fits a broad blob (FWHM 15 × 12 at a 6-px offset) whose own half-maximum
+    // contour reaches it, which is accepted by the rule; the contour test itself is pinned on `placement` by
+    // `a_round_star_keeps_the_seed_within_half_its_fwhm` and `an_elongated_fit_owns_the_seeds_along_its_major_axis`.
     fn fits_are_rejected_when_they_wander_duplicate_or_touch_the_border() {
         let stars = [round(60.0, 60.0, 0.5), round(8.0, 100.0, 0.5)];
         let data = moffat_field(160, 160, &stars, 4.0, 0.05);
@@ -2307,7 +2591,6 @@ mod tests {
             peak: 0.5,
             flux: 13.1,
         };
-        let off = Seed { x: 63.5, ..good }; // 3.5 px off: the fit walks back > 1.5 px
         let dup = Seed {
             x: 60.4,
             y: 60.3,
@@ -2322,7 +2605,7 @@ mod tests {
             &data,
             160,
             160,
-            &[good, off, dup, border],
+            &[good, dup, border],
             PsfModel::Moffat4,
             &FitParams::default(),
             None,
@@ -2378,9 +2661,6 @@ mod tests {
         }
         let b0 = median_in_place(&mut vals) as f64;
         let p = FitParams {
-            // The centroid gate must not be what rejects: this test is
-            // about the region rule alone.
-            centroid_tolerance_px: 40.0,
             ..FitParams::default()
         };
         // Start the fit AT the star so it converges there — the point is
@@ -2406,9 +2686,10 @@ mod tests {
             "the fit settled on the star: {}",
             fit.x0
         );
+        // The seed sits on the star (the centre test is not what refuses here, ruling A4-2); the REGION is off-centre.
         let seed = Seed {
-            x: cx,
-            y: cy,
+            x: 100.0,
+            y: 100.0,
             peak: 0.5,
             flux: std::f64::consts::PI * 0.5 * 25.0 / 3.0,
         };
@@ -3225,6 +3506,106 @@ mod tests {
         assert!(plane_is_defocused(20, 5), "exactly a quarter");
         assert!(!plane_is_defocused(21, 5), "just under a quarter");
         assert!(!plane_is_defocused(0, 0));
+    }
+
+    /// Ruling Q5's rule, exactly: at least 100 judged seeds and MORE than half of them uncontained (exactly half is not
+    /// a majority); the share counts `CentreMoved`, `RegionTooSmall` and `CentreAtRim`, over every judged seed.
+    #[test]
+    fn the_trailed_rule_needs_a_hundred_judged_seeds_and_a_majority() {
+        assert!(
+            !plane_is_trailed(99, 1.0),
+            "99 judged seeds are under the minimum"
+        );
+        assert!(plane_is_trailed(100, 0.51));
+        assert!(!plane_is_trailed(100, 0.5), "exactly half");
+        assert!(!plane_is_trailed(0, 0.0));
+        let mut c = RefusalCounts::default();
+        for r in [
+            RefusalReason::CentreMoved,
+            RefusalReason::CentreMoved,
+            RefusalReason::CentreMoved,
+            RefusalReason::RegionTooSmall,
+            RefusalReason::CentreAtRim,
+            RefusalReason::Duplicate,
+        ] {
+            c.add(r);
+        }
+        // 3 centreMoved + 1 regionTooSmall + 1 centreAtRim (ruling A4-2) of 8; the duplicate is not a containment refusal.
+        assert_eq!(trail_share(&c, 8), 0.625);
+        assert_eq!(trail_share(&RefusalCounts::default(), 0), 0.0);
+    }
+
+    /// Ruling A4-2: the trail share counts every containment refusal — `centreAtRim` with `centreMoved` and
+    /// `regionTooSmall` — over the judged seeds; every other refusal stays out.
+    #[test]
+    fn the_trail_share_counts_every_containment_refusal() {
+        let mut c = RefusalCounts::default();
+        for r in [
+            RefusalReason::CentreAtRim,
+            RefusalReason::CentreAtRim,
+            RefusalReason::CentreMoved,
+            RefusalReason::RegionTooSmall,
+            RefusalReason::Donut,
+        ] {
+            c.add(r);
+        }
+        assert_eq!(trail_share(&c, 10), 0.4);
+        let mut rim = RefusalCounts::default();
+        rim.add(RefusalReason::CentreAtRim);
+        assert_eq!(trail_share(&rim, 4), 0.25, "a rim refusal alone is a share");
+    }
+
+    fn alpha_of_fwhm(fwhm: f64, beta: f64) -> f64 {
+        fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt())
+    }
+
+    /// Ruling A4-2 on a round star (Moffat FWHM 3, β 4): the half-maximum contour is today's 1.5 px — a seed 1.4 px
+    /// off along x is the star's, 1.6 px is not.
+    #[test]
+    fn a_round_star_keeps_the_seed_within_half_its_fwhm() {
+        let (beta, a) = (4.0, alpha_of_fwhm(3.0, 4.0));
+        let p = FitParams::default();
+        let at = |dx: f64| {
+            placement(
+                (50.0, 50.0),
+                (a, a),
+                beta,
+                (50.0 + dx, 50.0),
+                (50.0, 50.0, 20.0),
+                0.0,
+                &p,
+            )
+        };
+        assert_eq!(at(1.4), Ok(()));
+        assert_eq!(at(-1.4), Ok(()));
+        assert_eq!(at(1.6), Err(RefusalReason::CentreMoved));
+    }
+
+    /// Ruling A4-2 on an elongated fit (FWHM 21 × 7, turned by 0.6 rad): a seed 3 px along the major axis is the
+    /// star's, a seed 4 px across it (half-width 3.5) is not — the contour, not a fixed box.
+    #[test]
+    fn an_elongated_fit_owns_the_seeds_along_its_major_axis() {
+        let beta = 4.0;
+        let (ax, ay) = (alpha_of_fwhm(21.0, beta), alpha_of_fwhm(7.0, beta));
+        let theta = 0.6f64;
+        let p = FitParams::default();
+        let off = |u: f64, v: f64| {
+            // (u, v) in the fit's axes, back to image offsets.
+            let (c, s) = (theta.cos(), theta.sin());
+            placement(
+                (100.0, 100.0),
+                (ax, ay),
+                beta,
+                (100.0 + u * c - v * s, 100.0 + u * s + v * c),
+                (100.0, 100.0, 40.0),
+                theta,
+                &p,
+            )
+        };
+        assert_eq!(off(3.0, 0.0), Ok(()));
+        assert_eq!(off(9.0, 0.0), Ok(()));
+        assert_eq!(off(0.0, 4.0), Err(RefusalReason::CentreMoved));
+        assert_eq!(off(0.0, 3.0), Ok(()));
     }
 
     /// A sharp plane with 3 donut-shaped ghosts among 100 stars is not defocused: the ghosts keep `Donut`, the stars

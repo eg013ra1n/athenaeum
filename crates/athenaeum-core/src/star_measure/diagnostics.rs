@@ -28,7 +28,7 @@ pub enum RefusalReason {
     NonFinite,
     /// The RMS residual reaches `FitParams::max_fit_residual` of the amplitude: the fit explains nothing.
     ResidualTooLarge,
-    /// The fitted centre left the seed by more than `FitParams::centroid_tolerance_px` on an axis.
+    /// The seed lies outside the fitted star's own half-maximum contour (Task 10b ruling A4-2): the fit is not the seed's star.
     CentreMoved,
     /// The fitted centre lies outside the sampling region shrunk by `FitParams::inner_margin` per side.
     CentreAtRim,
@@ -43,13 +43,19 @@ pub enum RefusalReason {
     /// refusals keep theirs.
     Defocused,
     /// The saturation test's verdict fit has no more pixels below the star's level than its 8 parameters (F-3, Task 8;
-    /// spec §2.1: n ≤ p). Declared last so every earlier reason keeps its `Ord` position.
+    /// spec §2.1: n ≤ p). Declared after every earlier reason so each keeps its `Ord` position.
     MostlySaturated,
+    /// The whole plane is trailed (Task 10b, F-10; rulings A6, Q1, Q5): at least [`super::fit::TRAIL_VERDICT_MIN_SEEDS`]
+    /// seeds were judged and more than [`super::fit::TRAIL_REFUSAL_SHARE`] of them were refused `CentreMoved`,
+    /// `RegionTooSmall` or `CentreAtRim` — most of the plane's sources cannot be contained in a fit region — so every fit it would have
+    /// accepted is refused with this reason. The per-seed refusals keep theirs; there is no per-star streak refusal.
+    /// Declared last so every earlier reason keeps its `Ord` position.
+    Trailed,
 }
 
 impl RefusalReason {
     /// Every reason, in declaration (and `Ord`) order.
-    pub const ALL: [RefusalReason; 13] = [
+    pub const ALL: [RefusalReason; 14] = [
         RefusalReason::OutsideImage,
         RefusalReason::TooFewPixels,
         RefusalReason::Donut,
@@ -63,6 +69,7 @@ impl RefusalReason {
         RefusalReason::Duplicate,
         RefusalReason::Defocused,
         RefusalReason::MostlySaturated,
+        RefusalReason::Trailed,
     ];
 
     /// The serialized (camelCase) name: the key of `ChannelMeasurement::refused_by_reason` and the `reason` of a
@@ -82,6 +89,7 @@ impl RefusalReason {
             RefusalReason::Duplicate => "duplicate",
             RefusalReason::Defocused => "defocused",
             RefusalReason::MostlySaturated => "mostlySaturated",
+            RefusalReason::Trailed => "trailed",
         }
     }
 }

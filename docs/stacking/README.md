@@ -1888,7 +1888,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   - **Today's reasons.** `outsideImage`; fewer than 10 finite region pixels →
     `tooFewPixels`; the fitter returns `None` → `fitFailed`. The first acceptance gate is still one condition; its
     reason is `nonFinite` (a parameter or the residual), else `residualTooLarge`, else `fitFailed` (`A ≤ 0` or an
-    `α ≤ 0`). The centroid tolerance → `centreMoved`; the inner region → `centreAtRim`; half the FWTM beyond the
+    `α ≤ 0`). The seed outside the fit's half-maximum contour (ruling A4-2; before it a fixed 1.5 px centroid tolerance) → `centreMoved`; the inner region → `centreAtRim`; half the FWTM beyond the
     region radius → `regionTooSmall`. `donut`, `narrowerThanPixel` and `defocused` are produced from Task 6b (R-OSP-4).
   - **Where the counts land.** `FitOutcome.refused` and `PlaneMeasurement.refused` always carry the counts.
     `ChannelMeasurement` gains `stars_refused` and `refused_by_reason` (keys = the camelCase names), so the
@@ -2078,6 +2078,35 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     saturation test) clamped to [1.5, 24] px is the field width; the second pass runs at it, on the 2×2 super-pixel
     plane from 6 px on. `field_width_of` gives seeds handed in by another detector the same width. No fit reads it
     before Task 6b; it is reported as `PlaneMeasurement.field_width` and `FitOutcome.field_width`.
+    *Plan A Task 10b phase A2 (F-10, ruling A5; 2026-10-11):* the field width is the HALF-SAMPLE MODE of the
+    half-maximum reads of EVERY readable candidate (`field_width_of`: every given seed, unranked) — readable = the
+    read's brightest pixel at least 10 σ_rim above the read's own box rim, the width start's level (Task 6b R1) —
+    clamped to [1.5, 24]; no count, no saturation test (F25 stands). Every contaminant of the read is wider than the
+    PSF (a clipped core is read at half the clip; a blend, a knot or a sky bump is a broader profile) while the stars
+    share one width, so the PSF is the reads' mode. Design run `t10b-a2-design` (reference: the frame's good stars'
+    reads at read SNR ≥ 50): the median of the 100 brightest read 1.04–4.43× (M42 4.0–4.4, LDN 1272 3.3, L 0000 2.0;
+    lab up to 1.48, 12 cells beyond 10 %), a near-clip exclusion 1.02–1.24, the mode 0.92–1.02 (none). Recorded cost:
+    the SNR 10–20 tier reads narrow, so the mode sits 1–8 % under the bright reads on real frames. PA-17 in the plan
+    carries the full table. Proof (dev Mac, A1 head vs A2, task-10b-report-A2): F_field M42 8.2–8.8 → 1.7–1.95, LDN
+    1272 mono 6.6 → 2.0, L 0000 10.8 → 5.1; M42 injected found 46/49/50 → 57/62/60, L 0000 51 → 59 of 61; the lab
+    families' β and frame FWHM unchanged, `density/d1000` and `doubles/f2.6` recall up. Open for the controller: at an
+    accurate width A1's `extended` test flags far more real stars (LDN mono 128 → 6381 seeds) and LDN's frame β falls
+    to the 1.5 floor (2.00 → 1.50; still 1.50 with the width forced to the fit's 2.23 or 2.45).
+    *Plan A Task 10b phase A2b (F-10, rulings A2-1 to A2-3; 2026-10-11):* the knot tests' bounds sit at the field's
+    star-width ENVELOPE F_env = F_field + 3.09·s, not at F_field (the mode: half the real stars are broader). `s` is the
+    TRUE spread of the stars' widths (`WidthEnvelope`, E4n): 1.4826 × the median of F_field − w over the readable reads
+    with 0.715·F_field ≤ w ≤ F_field (the lower half only, because every contaminant is wider; the floor excludes
+    single-pixel events, which read about 1.3 px), then the reads' own error removed in quadrature, s² = max(0,
+    s_measured² − mean (F_field·e(ν_i))²), e(ν) = √((0.899/ν)² + 0.0208²) (fitted on 12 constant-width lab families).
+    The knot test's 3.09·σ_r already carries each seed's noise, so the envelope must be the true spread: on stars of one
+    width E4n reads F_env/F = 1.00, where the uncorrected spread invented 1.08–1.11. No readable read in the band: s = 0
+    with one `warn!`. `measure` frame lines carry `fieldWidth`, `fieldWidthSpread` (s) and `fieldWidthEnvelope` (F_env).
+    Proof (release probe, HEAD vs E4n): F_env/F G 1.41/1.36/1.29, D0099 1.35, L 0000/0008 1.21/1.30, LDN mono 1.32, M42
+    1.15/1.12/1.07; extended fits LDN mono 6152 → 227, L 0000 257 → 48, M 0000 1687 → 210; β-sample stars kept (of 64)
+    LDN mono 35 → 50, L 0000 40 → 60, M 0000 52 → 58; 22 clean lab families 0 move > 1 SE; the knot fixtures' bins
+    over the allowance and pooled r ≥ 2 passes equal HEAD's (F_env/F 1.00 on constant-width knots). LDN OSC plane 1
+    (F at its 1.5 px clamp, reads compressed by the clamp, so the read law does not hold) keeps s = 0. LDN mono's β stays
+    1.50 (its β pool holds the near-clip stars: Task 10c's class).
   - **The pixel mask.** `MeasureOptions.mask` / `FitStarsOptions.mask` (`false` = absent, like a non-finite pixel) in
     the detector, the field width, the fit's region and aperture (`FitDiagnostics.pixels_used` counts the region's
     present pixels). The noise model and the sky statistic read the whole plane (a Plan C note). A plane with no
@@ -2118,6 +2147,32 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     | 6.0 | 0 | 0.00 | 0.00 |
 
     The narrow fields decide it: at a field width clamped to 1.5 px the filtered noise has the most maxima per area.
+
+    *Plan A Task 10b phase A1 (F-10, rulings A1-A4, Q4; 2026-10-11):* K stays 6.0 but its σ_f is PROPAGATED, no longer
+    measured on the filtered plane: σ_f(x) = the plane's one 128-px mesh's per-cell clipped σ (its noise map) × the
+    noise gain, the filtered-to-pixel σ ratio of the noise at each pass's kernel and grid. The caller states the
+    noise's spatial correlation (`star_measure::PixelNoise`, A1c, ruling C-10): `White` (sensor pixels, raw or
+    calibrated; mono, undebayered CFA, super-pixel) makes the gain 1 by derivation (A1b, ruling C-7: shot, read and
+    dark noise are per pixel and calibration is per-pixel arithmetic, so every lag-≠0 covariance is 0) and nothing is
+    read; `Mixed` (debayered, resampled, warped, integrated) and `Unknown` (the default; a debayered
+    `MeasureOptions.colour` plane is `Mixed`) read it. The Measure stage states `White` for a calibrated mono plane
+    and `Mixed` for a debayered one; master statistics (integrate, drizzle) state `Mixed`. The read comes from the
+    noise's own autocovariance (reach 2 px), read once per plane on the 5×5 high-pass residual (sources beyond 5
+    robust σ and 4 px about them left out, anchors in the quieter half of the noise map) and solved by least squares
+    (white noise reads 1.00, a 3×3 binomial smoothing 2.32 at the 3-px kernel); that read leaks pixel-scale nebula
+    texture, a recorded limit owned by Task 11. The mesh is computed once per plane and shared by `N*` and the filter
+    (Q4: seeds and every probe line bit-identical to fee44d50 on 5 real frames and 12 v2 families). The shared mesh is
+    the masked one, so on a MASKED plane `N*` reads the masked mesh (an absent pixel - Plan C's other-colour CFA
+    site - is not sky; ruling D-1 records the change, no production caller passes a mask today;
+    `on_a_masked_plane_n_star_reads_the_masked_mesh`). Two knot tests at the field width, thresholds derived from a
+    Moffat β 1.5 star and the ratio's noise at z 3.09 (D2), drop structure seeds and flag extended ones
+    (`StarFlags::EXTENDED`: fitted, but out of the β sample, `c`'s qualifiers and the frame FWHM/ecc, P3); a seed
+    within the plateau-clip band of the clip is exempt. The β sample takes only verdicts that pass the fit's own
+    centre and region tests (`SaturationVerdict::centred`, A4). Ruling A1-1 (closes A1's STOP): the plan test
+    "propagated = measured on a clean field" failed on its premise - on the 150-star fixture the MEASURED σ_f reads
+    1.121× the true noise (the bright stars' filtered wings, already so before A1), the propagated one 0.997× - so the
+    test (`propagated_detection_noise_is_the_true_noise_on_a_clean_field`) judges the propagated σ_f against the
+    fixture's TRUE noise within 4 % and reports the measured one.
   - **The surfaces.** The stacking adapter's probe override gains `SeedSource::MatchedFilter { threshold }` (the
     config's default stays the peak detector until Task 7, which renames the enum `SeedOverride`, ruling F26).
     `star_probe` gains `--seeds matched|peak|structure` (default `matched`) and `--seed-threshold K`; every frame line's
@@ -2226,7 +2281,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       give it zero credit (`stacking::weights::formula_weight`); SNR, stars and the pedestal are unchanged.
     - **The field width runs no saturation test** (ruling F25 as folded): PA-17's median reads every candidate,
       because the verdict's region needs it. Cost if wrong: a field width biased on frames dominated by saturated
-      stars.
+      stars. *Task 10b A2:* that cost was real (M42 8.2–8.8 px against stars of ~2; L 0000 10.8 against 5.6); F25
+      stands — still no saturation test — and the estimator became the mode of every readable read, which a clipped
+      core (read wider than the PSF) no longer moves.
     - **Known limit, three consumers.** A star whose clipped core is small (3–5 px) fails the full-3×3 plateau test,
       so its verdict fit runs uncensored: it is still flagged, but its own FWHM is not trusted. No consumer reads it:
       the frame statistics exclude flagged stars, the Analysis tab (Plan C) takes unsaturated stars, and registration
@@ -2459,8 +2516,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **`c`** = the median over the 64 brightest qualifying fits (by model flux, ties by seed index) of
       `growth(star) / model_flux`: `growth` = the sum of `v − b` over the pixels with `r ≤ 5F`, `b` = the PLAIN MEAN
       of the present pixels at `10F ≤ d ≤ 12F` that lie outside every seed's `3F` disc (owner ruling R6, round 3; until
-      round 2 the median of `[6F, 8F]`); `F` = the plane's frame FWHM (`frame_shape` over the unsaturated fits). A
-      ratio only when the model flux is finite and > 0.
+      round 2 the median of `[6F, 8F]`); `F` = the plane's frame FWHM (`frame_shape` over the fits neither saturated
+      nor extended, P3). A ratio only when the model flux is finite and > 0.
     - **Qualifying star** (brief C0): an accepted fit after the duplicate drop; not `flags.saturated()` (own or
       cross-plane); its fitted amplitude not above the plane's range (the clip screen, R6); no other seed handed to the
       fitter (accepted or not) within `6·F_field` px of its fitted centre; its whole `12F` disc inside the plane and
@@ -2600,3 +2657,221 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **Carries.** Task 13: re-read hc11B L 0010's `c` after the seed fix; the nebula-background `c` bias (numbers
       above); the OSC LN reference R-plane `c` SE 2.19 %. Plan B: growth/model falls for fainter stars (all-pairs
       LN-like -4.7 %). Plan C: a CFA-masked plane gets `c` = 1 (no qualifier).
+  - **R-OSP-7b - one background: the aperture-scale sky B_i and noise σ_i per star (F-10, Plan A Task 10b, rulings
+    A1-A6, B1-B5, P1-P5, R1-R3, Q1-Q7 and the cycle's A1-1 … D-1 below; no `MEASURE_VERSION` bump, PA-4; B_i, σ_i
+    and n_i are not persisted, like `peak5`).** Detection (A1, A1b, A1c) is recorded under R-OSP-2 and the field width
+    (A2, A2b) under F-1's field width; this entry carries the per-star sky, the trails, every ruling and the lab cycle.
+    *Phase A3 (2026-10-11):* every accepted fit carries `sky_ring` (B_i: the plain mean of its present pixels at
+    `10F ≤ d ≤ 12F` outside every seed's `3F` disc, R6's ring, row-major sum), `sky_ring_sigma` (σ_i: the RMS of
+    `v − B_i` over the same pixels) and `sky_ring_n`, read ONCE per fit after the duplicate drop
+    (`photometry::ring_skies` / `ring_sky`); `F` = the plane's frame FWHM, or `FitStarsOptions::ring_fwhm`. An edge
+    star reads its partial ring; under 8 pixels (or no frame FWHM) the ring is missing (NaN, NaN, 0) and counted in
+    `ring_sky_missing`. `c` reads the stored B_i (`growth_curve` takes it; the qualifier rule is `c`'s own, plus "B_i
+    present"), so `c` is R6's by construction. The fit's `b` stays free (B1); `StarFit::sky_offset` = `b − B_i` is the
+    near/far diagnostic. `annulus_sigma` is test-only (`#[cfg(test)]`, D-1; B4: Task 11 reads σ_i). LN:
+    `ln::scale::RingGeometry::{PerSide (default), PairCommon}`; pair-common (B3's arm, `ln_scale_probe --ln-ring
+    pair-common`, `PreparedReferenceChannel::build_pair_common`) reads both sides at `max(F_R, F_T)` after both are
+    fitted: the side whose own F is smaller re-reads its rings and `c` through `star_measure::correct_at_ring`
+    (`FitOutcome::fit_seeds` keeps each fit's seed), so nothing is fitted twice; the reference keeps a copy of its
+    plane, seeds and footprint only under that arm. **The `c` gate:** release `star_probe` at A2b vs A3 over v2's quick
+    families, the LDN pair and the 19 inject.json measure frames (49 planes): `apertureCorrection` and `apertureStars`
+    byte-identical on every plane, and every other line identical once the new keys are removed. Proof (σ_i/σ_MRS
+    median): clean lab families 1.00-1.01, real mono frames 1.00-1.08, debayered colour planes 1.24-1.58 (every
+    one of them, G highest; not examined in A3 - an interpolated plane's pixel scatter against the MRS's finest
+    scale is the candidate, Task 11 reads σ_i), `neb0.5` 1.31, `neb3` 4.27 (the ring
+    spans the nebula's structure); `skyOffset/σ_i` median -0.15…+0.30, p90 0.03-1.9 (`doubles/f2.6` 7.0: a neighbour
+    inside the fit region); `ringSkyMissing` 0 on every plane.
+    *Phase A4 (2026-10-11): the trailed-frame verdict, from the refusal structure (rulings A6, Q1, Q5, Q6).* No
+    per-star streak refusal (an elongated star is a real star, measured as such; ecc is never a gate). A trail longer
+    than its fit region cannot be contained, so its seed ends `centreMoved` / `regionTooSmall` / `centreAtRim` (A4-2):
+    `fit::trail_share` = those three over the judged seeds (every seed the fit call gave an outcome), and a plane with
+    at least `fit::TRAIL_VERDICT_MIN_SEEDS` (100, the plate solver's own minimum, quoted) judged seeds and a share
+    above `fit::TRAIL_REFUSAL_SHARE` (0.5, the majority rule: most detected sources cannot be contained) is TRAILED,
+    as the defocused verdict: every fit it would have accepted is refused `Trailed` (`RefusalReason::Trailed`, serde
+    `"trailed"`, declared last; `ALL` 13 -> 14), `stars` empty, `c` None, the zero-star path gives PSF signal
+    weight 0. Measure path only (`FitStarsOptions::trail_verdict`, default `false`; LN's refits never see it); a
+    defocused plane keeps its own verdict. `FitOutcome` / `PlaneMeasurement` (both) report `trailed` and `trail_share`
+    (on every plane); one adapter `warn!` per trailed plane; `star_probe`'s measure frame line carries `trailed` and
+    `trailShare`. Step 0 proved LN's default ring arm unchanged by A3 (`ln_scale_probe` A2b vs A3, two pairs, 19 670
+    lines identical). Proof (release `star_probe` at A3 head vs A4, measure path, matched seeds at 6): the 10 clean
+    hc11B L frames of 2024-10-06 share 0.023-0.136, no verdict, fits identical; L 0010 / L 0011 0.914 / 0.933,
+    verdict; the `trails/` frames OSC 0022 / 0032 (every plane 0.910-0.962), L 0028 / 0032 (0.880 / 0.883) verdict, G
+    0009 (`elongated`) 0.277 and O 0004 (`doubled`) 0.021 none, H 0029 0.419 none (Q6's recorded miss). **Open (STOP
+    to the controller): G 0003 (`elongated`) reads 0.598 (inject) / 0.623 (plain) at A3's head - 0.389 / 0.394 at
+    fee44d50, A1 0.472 / 0.507, A2 0.625 / 0.648 - so the majority rule fires on it**; the plate solver's own rule
+    calls it trailed too (367 of 402 detections streaks).
+    *Phase A4b (2026-10-11, ruling A4-2): the centre test is the fit's own half-maximum contour; the share counts every
+    containment refusal.* `CentreMoved` is now "the seed lies outside `(u/α_x)^2 + (v/α_y)^2 <= 2^(1/β) - 1` in the
+    fit's axes at θ" (`fit::inside_half_max`, read by `fit::placement` for `accept` and the verdict fit's `centred`):
+    a round FWHM-3 star keeps today's 1.5 px, an elongated star owns the seeds along its major axis. The fixed
+    `FitParams::centroid_tolerance_px` was a per-star streak refusal by the back door (Q1) and is removed. The trail
+    share is `centreMoved + regionTooSmall + centreAtRim` over the judged seeds (a streak fit no longer caught by the
+    fixed test reaches the rim test). LN's seed link (`ln::scale::link_barycentres`) reads the same predicate: a fit
+    links to the nearest seed inside its own half-maximum contour (every seed within `fwhm_x / 2`, nearest first,
+    `KdTree2::within`; the first that passes the ellipse test, none otherwise - D-1 M-4).
+    Numbers: `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-10b-report-A4b.md`.
+    - **The design rulings (2026-10-11), one line each.** A1 σ_f propagated (the mesh's noise map × a gain), K 6.0
+      kept (clean field measured / propagated 1.00-1.04). A2 the 128-px mesh stays the plane's one map. A3 two knot
+      tests from a Moffat β 1.5 star's ratios and the noise at z 3.09 (cost: doubles / crowded −2.7 pp at most). A4
+      the β sample only from verdict fits that pass the centre and region tests. A5 the field width is biased (M42 8.5
+      px against fitted 2.4) and 10b owns it. A6 trail segments are not stars (L 0010: 947 accepted fits at the
+      24 576-seed cap against 2 458 clean, `c` 4.48, weight 0.024 of the group max). B1 the fit's b stays free (fixing
+      it triples the nebula FWHM scatter); one sky per scale. B2 B_i on R6's ring (the only geometry passing every F-5
+      bar). B3 LN's pair-common ring only if it passes the nebula-pair bar. B4 σ_i = the RMS of (v − B_i) over B_i's
+      ring (smooth sky 1.00); the [3F, 4F) annulus MAD retired for SNR. B5 the nebula `c` bias recorded (`neb3` 0.882
+      ± 5.6 %, `neb3_4096` 1.128 ± 2.3 %). P1 the spec row is F-10. P2 the M42 β is reported; its bar moves to Task
+      10c (the near-clip class). P3 `extended` leaves the β sample, `c`'s qualifiers and the frame statistic. P4
+      recall floors reconciled before the run, never a bar move. P5 a test whose premise fails is a STOP with numbers.
+      R1 frame classes `trailed` / `elongated` / clean. R2 a bar not derivable before the cycle is REPORTED. R3 the
+      runner's baselines re-measured before C. Q1 no per-star streak refusal (an ecc line at 0.8 refuses 2-32 % of
+      clean real fits). Q2 G 0003 is measured as is. Q3 D.1's floor = the arm − 2 SE. Q4 one mesh per plane, shared.
+      Q5 the trailed line is the majority rule, share > 0.5 (the line derived from the clean frames fired on G 0003 at
+      0.389). Q6 H 0029 (0.414, fittable dwell cores) is a recorded miss. Q7 K.1's allowance is the one-sided 97.7 %
+      binomial quantile at max(p_exp, 1/n).
+    - **The cycle's rulings (2026-10-11 to 2026-10-12), one line each: what was decided, why, the number.**
+      - **A1-1** the clean-field test judges the PROPAGATED σ_f against the fixture's true noise (4 %): the measured
+        σ_f reads 1.121× the true noise (the bright stars' filtered wings), the propagated one 0.997×.
+      - **A1b (C-7)** gain := 1 on a plane whose pixels were never mixed: the read leaked nebula texture (1.81 on
+        `neb3`, 1.07 on `neb0.5`, 1.48 on `neb3_4096` against 1.003-1.038 on real mono; truth 1.000), and every one of
+        the 38 stars D.1 missed clears K at gain 1 (`neb3` 301 → 339 of 629). A structure term instead was rejected
+        (debayered OSC 1.36 / 1.74 → 0.93 / 1.09).
+      - **A1c (C-10)** the caller states the noise's spatial correlation (`PixelNoise` White / Mixed / Unknown,
+        default Unknown = read): A1b keyed on `colour` and missed resampled mono planes (`resampled/f2.0`, `/f3.0`
+        gain 1.88 / 1.95 → 1, false seeds 0 → 1 147 / 1 047, about 270 per Mpx); at A1c 0 / 0 again.
+      - **A2-1** the knot bounds move to the star-width envelope F_env = F_field + 3.09·s: at the mode half the real
+        stars are broader (LDN mono `extended` seeds 128 → 6 381 at A2).
+      - **A2-2** s = E4, the mirrored lower-half spread of the reads ≥ 0.715 F (= 1 − 3.09·e(10)), e(ν) =
+        √((0.899/ν)² + 0.0208²) fitted on 12 constant-width lab families: single-pixel events (1.3 px reads, 25-29 %
+        of G's readable reads) set the plain lower half (G F_env 1.8-2.8 F, the test dormant). LDN mono's β 2.0 → 1.5
+        is its whole β pool at the full well - Task 10c's class, reported, not a bar.
+      - **A2-3** s = E4n, E4 with the reads' own error removed in quadrature: on constant-width knot fixtures E4
+        invented F_env / F 1.08-1.11 (flat knots passing 33 → 54), E4n reads 1.00. Known cost: extended fits L 0000 20
+        → 48, M 0000 86 → 211, LDN mono 164 → 251; LDN OSC plane 1 at the 1.5 px clamp falls back to F_env = F.
+      - **L3-1** C's pooled r ≥ 2 knot bar is Q7's allowance per sky (3 or 4 of 216); K.1 / K.3 read the product's
+        `fieldWidth` / `fieldWidthEnvelope`; pre-A1 builds are judged pooled only (fee44d50 / t10-f5-r2: 185 / 103,
+        the before).
+      - **A4-1** the majority rule stands and G 0003 stays `elongated` when A4 fired on it (0.598 / 0.623, 0.389 at
+        fee44d50): the rise was the seed position under A2's field width (672 of 1 213 `centreMoved` seeds > 1 px from
+        every A1 seed) against a fixed 1.5 px centre tolerance - a streak refusal by the back door, so the fix belongs
+        to the centre test, not to the rule.
+      - **A4-2** the centre test is the fit's own half-maximum contour (96 % of G 0003's `centreMoved` seeds lie
+        inside their fit's ellipse, the fit 0.15 px from the truth); the share counts `centreAtRim` too (L 0010's rim
+        refusals 0 → 3 571 once no fixed test catches the streak first); LN links by the same predicate. Shares then:
+        trailed 0.882-0.92, G 0009 0.326, H 0029 0.447, G 0003 0.175 / 0.176, O 0004 0.015, hc11B L ≤ 0.15; G 0003 β
+        1.75 → ≈ 52 and fits 180 → 880, reported.
+      - **C-1** D.1 is judged on D2's own quantity, found over all 629 truth stars (D2's HEAD 0.591 × 629 = 372 = the
+        scorecard's found): floors 0.743 / 0.499; the scorecard's found / expected (532 / 511) printed beside.
+      - **C-2** the seed set moves on every family by design (σ_f about 3 % lower on flat, D.6 0.969): a population
+        move is set aside only where the same truth stars measure better or unchanged within SE in every bin.
+      - **C-3** D.3's `false ≤ base` at base 0 is not derived: it is read at D.4's 0.5 per Mpx (one `nothing` seed on
+        `shape/f2.6/e0.3/t60`, 0.24 per Mpx, 30.5 px from a star).
+      - **C-4** D.1 `neb3` 301 of 629 against 314: diagnosed before any ruling (→ C-7).
+      - **C-5** (a) same-star materiality: unchanged within max(2 SE, 1 % of the base mean) (1 % is the spec's
+        tightest accuracy tolerance; at 10⁵ pairs the sign test flags 1e-12 drifts); (b) the seeds-path bright
+        centroid (Fisher > 300: 0.0384 → 0.0435 px) is the seed's ±⌈F_field⌉ box at the corrected width (⌈F⌉ 4 → 3, 5
+        → 4; a sawtooth in sub-pixel phase): accepted, no consumer reads a seed at 0.05 px (the fit recovers it,
+        0.0176 → 0.0173).
+      - **C-6** the 19 faint-bin WORSE same-star cells sit on planes where A2's field width came down toward the truth
+        (`saturated/f2.6/n60` 3.99 → 2.89, `density/d600` 4.83 → 3.31; truth 2.6-3.0): accepted as the corrected
+        width's cost.
+      - **C-6b** C-6's check over the 85 β-changed planes (76 pass, 8 within 0.2-1.5 % of the base F, 1 n/a): the
+        cells are re-split by plane.
+      - **C-6c** the 9 planes' 5 WORSE cells exceed their lines by ≤ 1.2× (≤ 0.003) where β moved 0.001-0.004, and 645
+        cells give about 15 WORSE by noise alone (allowance about 22): accepted; from here on the WORSE count prints
+        beside its binomial allowance and one cell beyond 2× its line is a STOP.
+      - **C-7** = A1b. Recorded limits: debayered colour planes keep the leak (Task 11 owns their noise correlation);
+        the mesh noise map reads ≈ 6× the true noise on `neb3`, so heavy-nebula recall stays ≈ 0.54 until a later
+        owner.
+      - **C-8** row 7's frame ecc / FWHM moved on 604 rows (median +0.22 %, p90 +1.1 %); with the same stars unchanged
+        only the population can move the frame statistic → checked on the base's own stars.
+      - **C-8b** that frame SE (about 0.01 % of the value) is no materiality line: C-5 (a) applies to row 7 and D.8
+        (ecc beyond 2 SE on 46 of 142 planes, median 0.00 %, max +2.4 %).
+      - **C-9** P.3, below.
+      - **C-10** = A1c.
+      - **C-11** on a lab family the truth, not the base, referees row 7: a plane beyond materiality that sits closer
+        to the truth counts BETTER (A1b run: ecc beyond materiality on 34 of 331 planes, 13 beyond 2×, doubles −7.4 /
+        −8.3 %).
+      - **C-12** C-11's result: 37 cells, 24 BETTER (the blend families: `doubles/f4.0` FWHM 4.777 → 4.457, truth
+        4.062), 13 WORSE (ecc +0.002…+0.007 on round truth, allowance 3), 4 beyond 2× → a mechanism first.
+      - **C-12b** the 4 move at A2b and stay; no region-size dose-response (Spearman 0.10); 82-85 % of the OSC planes'
+        bright / mid stars shift one way, a frame-β signature → split on the fixed-β arms.
+      - **C-12c** `osc/f2.6/m4` p2 and `osc_pairs/f2.6` p1: no shift at fixed β, the frame β moved (3.482 → 3.397,
+        4.661 → 4.456; truth 4.0) - accepted, F-3 / F-4 judge β; `twins/sharp/blur1/f8.0`: the weights only (fits 587
+        → 526) - C-8; `twins/sharp/m2.5/f3.5` persists at fixed β (+0.0046 ± 0.0017) → the pinned-width check.
+      - **C-12d** forcing that plane's F_field back to the base's 5.304 reproduces the base (frame ecc 0.1096 against
+        0.1094, head 0.1128; β 2.5022; the common stars' ecc per SNR bin equal to 4 digits): the whole shift is A2's
+        corrected width (5.30 → 3.78, truth 3.5), accepted. A later fit-design task owns whether shape wants a region
+        wider than the F-sized windows (β 2.5: +0.003 ecc on bright round stars, +0.02 at SNR < 20 at the true width).
+      - **D-1** the Phase D review (0 Critical / 3 Important / 10 Minor) accepted whole: the trail share's
+        documentation; this record; the masked-plane `N*` recorded, not reverted (R-OSP-2); LN's link takes, among the
+        seeds within the radius, the nearest that passes the contour (M-4); `FitOutcome.ring_fwhm` carries the ring
+        width `ring_skies` chose and LN reads it (M-5, byte-identical); `annulus_sigma` test-only; serde_json's
+        `float_roundtrip` kept and named in the F-5 commit (M-6); LN's half / full bound 0.004 → 0.030 named as RF7's
+        ruled re-pin in the F-10 commit (M-13). `star_probe` and LN's library outputs byte-identical to 4c95b6b4 (the
+        LN probe's replication arm moved by design, M-12).
+    - **P.3 = per-side (ruling C-9).** B3's rule: pair-common iff P.1 passes under it and C1.1-C1.4 hold. It does not:
+      pair-common clears a few cells and adds new misses (`neb0.5` m4 t60 +9.5 pp, `neb3` g t25 +7.7 pp), 15 of 34
+      cells over against per-side's 13. Per-side's misses (worst `neb3` g t45 −15.9 pp, `neb3` b25mix t25 −12.3 pp,
+      `neb0.5` m4 / g +1.5…+3.8 pp; shifted / warped t25 ≈ +1.9 pp against ±1.2) equal the 10b-L before cell for cell:
+      10b does not touch LN's per-side sky, the error lives in LN's own tile sky on nebula (`ln/background.rs`, Plan
+      B) and in sub-10F nebula structure (B5). A recorded limit, reported to the owner; the P.1 / P.2 tables are Plan
+      B's before. No switch to K7.
+    - **Phase C - the joint cycle `t10b-onebg` (runner; athenaeum-lab `star-lab/results/plan-a/t10b-onebg/`).** First
+      run at 6a1addc6 (lab 895136a): STOPs on D.1 `neb3` (→ C-7, A1b), P.1 / P.2 (→ C-9) and row 7 (→ C-8b). Second at
+      7fd911ab (lab 07cd2cb): STOP-A, resampled mono planes flooded (→ C-10, A1c); STOP-B, row 7 on the base's stars
+      (→ C-11 … C-12d). **Third at 4c95b6b4 (lab 4f9e21e, star_probe ea7faf29d0bc; base t10-f5-r2, the F-5 cycle):
+      every bar met or reported, no STOP open**, lab suite 724 OK. The images that interpolate (`resampled/f2.0`,
+      `/f3.0` and the 18 shifted / warped LN targets) run with `--pixel-noise mixed` (C-10); the rest on the probe
+      default.
+
+      | Cell | Bar | Value (third run) | Verdict |
+      | ---- | ---- | ---- | ---- |
+      | C1.1 | F-5 spread at F 2.6 / 8.0 ≤ 2 % | 0.76 % / 1.41 % | ok |
+      | C1.2 | psfSel `pairs/iso/blur25mix` / `blur4` t60 within ±2 % | +1.72 % / +1.19 % | ok |
+      | C1.3 | pure pair targets within ±1.2 % | 0 of 70 over (worst +1.07 %) | ok |
+      | C1.4 | mixture pairs no worse than t01c + SE | 0 of 20 over | ok |
+      | F.0 | accepted + refused = seeds on every `fit outcomes` row | 885 of 885 | ok |
+      | no-regression | v2 + inject against t10-f5-r2 (final design list); cumulative against t01c; legacy control | 0 moved, 0 missed, 0 lost; PASS; 0 mismatches | ok |
+      | D.1 | `neb0.5` / `neb3` found of 629 ≥ 0.743 / 0.499 (C-1); false ≤ 3 per Mpx | 489 = 0.777 / 339 = 0.539 (base 0.591 / 0.343); 1.67 / 2.38 | ok |
+      | D.2 | `halo` false seeds ≤ 5 | 2 (base 256) | ok |
+      | D.3 | completeness ≥ base − 0.005, false ≤ base (C-3), the flat families with `resampled/*` added | all 93 completeness rows in line; `resampled/f2.0`, `/f3.0` 0.986 / 0.985, false 0 / 0 | ok |
+      | D.4 | twins and artefacts `nothing` ≤ 0.5 per Mpx | 0.000 | ok |
+      | D.5 | doubles, `d1000` ≥ base − 0.01; density pairs ≥ base − 0.03 | `doubles/f2.6` 0.772 (0.734), `/f4.0` 0.629 (0.632), `d1000` 0.892 (0.837); pairs 0.865-0.971 (0.852-0.977) | ok |
+      | D.6 | flat σ_f propagated / measured 1.00 ± 0.04 | 0.973 | ok |
+      | D.7 | `neb3_4096` (reported) | completeness 0.719 (0.447), false 30 (0); D2's quantity 1 475 of 2 517 (arm 1 421) | reported |
+      | D.8 | frame FWHM / ecc / `c` on the clean families | in the no-regression diff; row 7 on the base's stars: ecc beyond max(2 SE, 1 %) on 34 of 331 planes, 13 beyond 2×; against the truth (C-11) 24 BETTER / 13 WORSE, the 4 beyond 2× closed by C-12b (2), C-8 weights (1), C-12d (1) | ok (C-8b, C-11, C-12d) |
+      | K.1 | accepted unflagged knots per bin of FWHM ≥ 2F ≤ Q7's allowance; pooled ≤ Q7 per sky (L3-1) | no bin over on any sky; pooled 1 / 1 / 2 of 216 on flat / `neb0.5` / `neb3` (allowance 4 / 3 / 4); the 1.5F row reported (0 / 1 / 2 of 6 bins over) | ok |
+      | K.2 | truth-star completeness ≥ base − 0.01 | 0.987 / 0.928 / 0.655 (0.978 / 0.714 / 0.424) | ok |
+      | K.3 | knots dropped / extended by bin (reported) | of 576 knots accepted: flat 466 (227 extended), `neb0.5` 382 (188), `neb3` 73 (34); truth stars flagged extended 0 | reported |
+      | N.1 | density × nebula completeness ≥ base − 0.03; `c` from ≥ 5 per plane | 0.607-0.862 on the six planes (0.367-0.681); 64 qualifiers each | ok |
+      | W.1 | M42 0000 / 0008 / 0010 injected above threshold found ≥ 99 % | 45 of 45, 41 of 41, 45 of 45 (plain 57 / 60, 59 / 62, 58 / 62) | ok |
+      | W.2 | clean G / L inject frames found ≥ base | G 0001 60 / 61 (60), G 0002 60 / 61 (60), L 0000 60 / 61 (51), L 0008 59 / 60 (51) | ok |
+      | W.3 | F_field / frame FWHM (reported) | M42 inject F_field 1.95 / 1.74 / 1.90 px, frame FWHM 2.34 / 1.64 / 1.89 (F_field before 8.2-8.8) | reported |
+      | T.1 | L 0010 / L 0011 accepted fits ≤ 24 | 0 / 0 (share 0.916 / 0.933) | ok |
+      | T.2 | their PSF signal weight ≤ 0.00182 | no fit, so no weight inputs (the zero-star path) | ok |
+      | T.3 | their `c` None | None / None | ok |
+      | T.4 | the 10 clean L siblings: no verdict; fits A3 → head within √A3 | shares 0.005-0.111; −8…+23 (√A3 45-47) | ok |
+      | T.5 | the 7 `trails/` frames: verdict = rendered class | OSC 0022 / 0032 (0.908-0.962 per plane), L 0028 / 0032 (0.880 / 0.883) trailed; G 0009 `elongated` 0.326 and O 0004 `doubled` 0.017 none; H 0029 0.445 none (Q6's recorded miss) | ok |
+      | T.6 | every other frame: no verdict | G 0003 0.176; inject frames 0.020-0.203; none fires | ok |
+      | T.7 | long-trail family (reported) | the share crosses 0.5 at L / F 5.70 / 5.58 / 5.53 (F 2.6 / 4 / 6), about the fit region's radius (diameter ≈ 12 F); lab `trails` 0.299, no verdict | reported |
+      | T.8 | G 0003, `elongated` (reported) | no verdict, share 0.176, 907 fits, frame ecc 0.646, `c` 1.177, β 49.6 | reported |
+      | B.1 | σ_i / truth noise median 1.00 ± 0.05 on smooth sky | every row within (55 at the first run; ok at the third) | ok |
+      | B.2 | B_i − `sky_local`, b − B_i (reported) | not printed by the cycle; A3's proof table: `skyOffset / σ_i` median −0.15…+0.30 | reported |
+      | B.3 | nebula `c` (recorded limit) | density × `neb3` row 6 d200 / d600 / d1000 1.058 / 1.133 / 1.087 (before 1.058 / 1.135 / 1.069); `neb3` 0.880 beside | recorded |
+      | P.1 | psfSel on nebula-sky pairs, Δ against flat, both ring arms | per-side 13 of 34 cells over (= the before), pair-common 15 | reported (C-9) |
+      | P.2 | shifted / warped targets within the unwarped twin's tolerance | 3 cells at t25, +1.91…+1.96 pp (= the before) | reported (C-9) |
+      | P.3 | B3's decision | per-side | C-9 |
+      | I.1 | inject row 6 Δ ≤ 2 % + 2 SE_c per clean frame | −0.025…+0.009 on 7 frames (allowances 2.80-4.74 %); G 0003 and L 0010 out | ok |
+      | S.1 | M42's 12 calibrated frames, `c` sd ≤ 1.46 % | 0.67 % (base 1.02 %) | ok |
+      | S.2 | seeds per Mpx per clean frame (reported) | max / median 1.04 (M42, 583-675 per Mpx), 1.19 (hc11B G), 1.06 (hc11B L) | reported |
+      | S.3 | M42 frame β 0000 / 0008 / 0010 (reported; Task 10c's bar) | 31.8 / 2.81 / 3.38 (t10-f5-r2 13.96 / 3.14 / 3.34) | reported |
+      | M.1 | m42 corpus Measure batch ≤ 159.8 s | 74.7 s (base, interleaved, 133.5 s) | ok |
+      | M.2 | LDN 1272 (dev Mac, reported) | `c` sd 3.30 → 3.56 % (measure), 2.02 → 2.44 % (betas); mono β 2.0 → 1.5 (Task 10c) | reported |
+      | R.1 | fits wider than 2F (reported) | `neb3` 0 → 5; density × `neb3` d1000 1 → 25; M42 inject 174 → 145, 130 → 64, 119 → 74 | reported |
+      | R.2 | saturated share of Σ signal (reported, Task 10c) | M42 mono2 0.79-0.90 (base 0.82-0.91); hc11B G 0.62-0.73 | reported |
+      | same-star | C-5 (a), against t10-f5-r2 (1.31 M paired stars) | 645 cells: 46 better, 580 unchanged, 19 worse (allowance 23) | ok (C-6c) |
+
+      Also reported: M42 mono2 0000's seeds 7 717 → 15 272 (9 221 added: 8 008 fitted, FWHM / F p50 1.18 against the
+      base's own 1.21 - faint real stars; 1 213 unfitted, 653 of them on the clipped Trapezium core plateau - Task 10c);
+      `neb0.1` false seeds 0 → 13 (3.1 per Mpx); `donut/r10` `nothing` seeds 14 → 315 (since A1; donut accepted 0); the
+      debt check against t01c OPEN on three scatter rows (Task 14 judges).

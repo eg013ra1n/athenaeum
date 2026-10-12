@@ -1136,6 +1136,8 @@ pub fn drizzle_group(
             None,
             SeedOverride::Fast,
             false,
+            // A master is integrated / drizzled: its pixels are mixed (ruling C-10).
+            crate::star_measure::PixelNoise::Mixed,
             |c| {
                 // The run's cancel, as integrate's master measurement checks it: before each plane's read.
                 if cancel.load(Ordering::Relaxed) {
@@ -3670,11 +3672,18 @@ mod tests {
         let input = cfa_input(&frames, &measure, 1);
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
         let n = W * H;
-        let want =
-            measure_planes_diagnosed(3, W, H, &measure, None, SeedOverride::Fast, false, |c| {
-                Ok::<_, DrizzleError>(Cow::Borrowed(&out.data[c * n..(c + 1) * n]))
-            })
-            .unwrap();
+        let want = measure_planes_diagnosed(
+            3,
+            W,
+            H,
+            &measure,
+            None,
+            SeedOverride::Fast,
+            false,
+            crate::star_measure::PixelNoise::Mixed,
+            |c| Ok::<_, DrizzleError>(Cow::Borrowed(&out.data[c * n..(c + 1) * n])),
+        )
+        .unwrap();
         assert_eq!(want.len(), 3);
         for (c, m) in want.iter().enumerate() {
             let cm = &m.measurement.channel;

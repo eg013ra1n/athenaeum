@@ -7,6 +7,16 @@ athenaeum-lab e65af49, probes from f5321979); the path comparison below is
 `star-lab/results/baseline-2026-10-07/path-compare.txt` (lab 5fc780c, computed from the committed summary and
 the existing probe outputs). A second independent re-review (N-1…N-9) is folded in as well. Revised 2026-10-09:
 §2.1's saturation test is replaced (owner rulings 2026-10-09) after the flat-top test failed on lab truth.
+Amended 2026-10-11 (Plan A Task 10b, owner-approved scope; the design rulings are the controller's): §3 row F-10 "one
+background", its bars and the owned-quantities table; §2.1's `seeds`, `fit`, `beta`, `photometry` and `diagnostics`
+rows and the β-sample sentence follow it. F-8 and F-9 keep their meaning (Plan B), so the new row is F-10.
+Amended again 2026-10-11 after the plan review (controller rulings P2/P3, R1–R3): the M42 frame β is reported in
+F-10 and its bar moves to a new owner task (Plan A Task 10c, the saturation flag's near-clip class, F-3); `extended`
+leaves `c`'s qualifiers and the frame statistic as well as the β sample; frame classes `trailed` / `elongated`; every
+F-10 bar is derived from data or from the PSF and the noise, or reported with its reason; one owner per quantity.
+Amended 2026-10-12 (Plan A Task 10b as built, after its joint lab cycle and review): §3 row F-10 records what was built
+and how its bars were judged (every ruling with its numbers in `docs/stacking/README.md` R-OSP-7b); §2.1's `seeds` and
+`fit` rows, its field-width sentence, the owned-quantities table and §4's frame statistic follow it.
 
 ## 1. Goal and owner decisions
 
@@ -57,13 +67,13 @@ moves or leaves: `stacking::robust` (`rcr`, `winsorize`, used by TMeanFlux) move
 | Unit | Responsibility |
 | ---- | ---- |
 | `domain` | input planes: calibrated float (unit domain) or raw ADU, CFA layout; the plane's noise (MRS) and background model |
-| `seeds` | star detection: a matched filter at the field width, threshold in units of the filtered plane's measured noise (selection by integrated signal); the default seed source of both consumers |
-| `fit` | per-star region, background start, width start, the Moffat fit (rustafits `fit_moffat_2d` / `fit_moffat_2d_fixed_beta` as library functions), canonical axes, acceptance, the per-star outcome |
-| `beta` | the per-frame β (§3 F-4) on unsaturated stars |
-| `photometry` | the profile-independent star flux (F-5: model flux in the FWTM ellipse × `c`, `c` from 5F growth sums with the [10F, 12F] plain-mean far ring outside every seed's 3F disc, the amplitude screen, the footprint, the caller's full scale, 64 stars / at least 5, `aperture_stars`), the saturation test, the per-star SNR (F-6) |
-| `frame` | frame aggregates: FWHM, ecc, SNR, the weight inputs, HFR, the trail metric |
+| `seeds` | star detection: a matched filter at the field width on the plane minus its 128-px mesh (the plane's one background map), threshold K = 6 in units of σ_f, the PROPAGATED local noise (the mesh's per-cell clipped σ × the plane's filtered-noise gain: 1 on a plane the caller states white, read on a mixed or unknown one: debayered, resampled, integrated; F-10); the two knot tests (a structure drop, an `extended` flag; F-10); the field width (owned by F-10: the half-sample mode of every readable half-maximum read); selection by integrated signal; the default seed source of both consumers |
+| `fit` | per-star region, background start (the fit-scale sky: a FREE local b, F-7), width start, the Moffat fit (rustafits `fit_moffat_2d` / `fit_moffat_2d_fixed_beta` as library functions), canonical axes, acceptance (the centre test on the fit's own half-maximum contour, F-10), the per-star outcome; the plane-level trailed verdict (F-10; there is no per-seed streak refusal) |
+| `beta` | the per-frame β (§3 F-4) on unsaturated stars whose verdict fit passes the centre and region tests and that the knot test does not mark extended (F-10) |
+| `photometry` | the per-star aperture-scale sky B_i and noise σ_i (F-10: R6's ring, computed once per accepted star, stored on the fit; every aperture consumer reads them), the profile-independent star flux (F-5: model flux in the FWTM ellipse × `c`, `c` from 5F growth sums over (v − B_i), the amplitude screen, the footprint, the caller's full scale, 64 stars / at least 5, none `saturated` or `extended` (F-10), `aperture_stars`), the saturation test, the per-star SNR (F-6, on B_i and σ_i) |
+| `frame` | frame aggregates: FWHM, ecc (over fits flagged neither `saturated` nor `extended`, F-10), SNR, the weight inputs, HFR, the trail metric and the trailed verdict's readers (F-10) |
 | `budget` | the Analysis-mode selection: at most N stars spread over the field |
-| `diagnostics` | `FitDiagnostics`: per-star outcome and refusal reason, region radius, background start, growth steps, iterations |
+| `diagnostics` | `FitDiagnostics`: per-star outcome and refusal reason (F-10 adds `trailed`), region radius, background start, growth steps, iterations |
 
 Public surface: `measure_plane(plane, opts) -> PlaneMeasurement` (stars, frame aggregates, diagnostics, refusal
 counts) and the refit entry point LN needs, `fit_stars_at(plane, seeds, beta, opts)`. The module exports
@@ -110,7 +120,10 @@ Per seed (every seed gets the whole test, as the reference method fits every can
 
 Flagged stars are kept: an accepted fit carries the flag in the `.athf` flags byte. The β sample and the frame
 statistic use unflagged stars only; the field width reads every candidate (F25), the per-star width start is the
-star's own (F-3). The unflagged bright seeds are the β sample (F-4): each is RE-FITTED pixel-integrated, on its verdict fit's own
+star's own (F-3); the field width still reads every candidate (F-10 kept F25: it is now the half-sample mode of the
+readable half-maximum reads, which a clipped core or any other contaminant wider than the PSF does not move). The
+unflagged bright seeds whose verdict fit passes the fit's own centre and region tests and that the
+knot test does not mark extended (F-10) are the β sample (F-4): each is RE-FITTED pixel-integrated, on its verdict fit's own
 pixels and starts (owner E5, 2026-10-09; its median is the frame β), and every star is then fitted at the frame β with
 the point model. A FLAGGED star (own or cross-plane flag, below) excludes the pixels ≥ its own level
 (norm when its own plateau test failed), ×3 iterations; an unflagged star excludes nothing, and its fit is
@@ -202,10 +215,108 @@ its numbers; a bar is never moved, a row never re-sized, a generator never tuned
 | F-3 | β and frame FWHM move with the saturated set (2× flux twins: 9.99 %, 15.93 % with a β flip; 2.93 % with β held) | the β sample and the frame statistic use unsaturated stars only (§2.1's test); the field width reads every candidate (F25), the per-star width start is the star's own | base vs 2× twins: frame FWHM change ≤ 1 %; β change ≤ 10 % relative (while β is still discrete at this step, that means zero flips; the twin rows are judged again after F-4, and the β part is void where both twins sit at the cap) |
 | F-4 | Model-dependent width (Gaussian / blur pointfit −2.07…−3.04 %; β alone 9.60 %; `mixture/b` +4.88 %) | β becomes continuous per frame: a free-β Moffat fit on the unsaturated bright sample gives the frame's β (median), clamped to [1.5, 100]; every star is then fitted at it. **As built (owner E5, 2026-10-09):** the sample's fit is PIXEL-INTEGRATED (the model the mean over k × k sub-samples per pixel, k = clamp(⌈10/F_start⌉, 3, 9)), because a point model fitted to integrated pixels reads β high on undersampled stars (the lab step stopped on it); the verdict fit and every fit at β stay the point model. "Fits nothing twice" no longer holds: each plane runs up to 64 extra fits. A named rustafits change: `fit_moffat_2d` refuses β > 20 today (`rf/analysis/fitting.rs:545-551`), so its bound is lifted to the cap and the sample fit runs in a conditioned parametrization (ln β), because the Gaussian limit is a flat ridge in (α, β). At β 100 a Gaussian star reads −0.32 % (β 30: −1.04 %; spec re-review N-1). The Gaussian is the large-β limit; there is no separate Gaussian model, so β stays a finite number everywhere (`.athf` f32, `metrics` JSON, `stacking_run_groups.beta`, `group_beta`, `PsfModel::Fixed`, `star_metrics.beta`, `median_beta`; `fit_method` is `moffat`; `FITS_ARTIFACT_VERSION` unchanged) | frame FWHM error vs `pointfit` ≤ 1 % at FWHM ≥ 2 px, ≤ 3 % below, on every family whose stars share one profile (`gauss`, `m*`, `blur*`, `mix*`: the lab's pointfit truth there is a free-β fit, `families.py:113-134`) |
 | F-5 | Captured fraction depends on the profile (spread 18.73 % at F 2.6, 22.16 % at F 8.0) → PSFSW / PSFSNR / psfSel | star flux = fitted-model flux in the FWTM ellipse × a per-plane aperture correction `c` (as built, README R-OSP-7): the median over the 64 brightest qualifying fits (at least 5, else `c` = 1) of the 5F growth sum over the model flux, the background the plain mean of the [10F, 12F] far ring outside every seed's 3F disc; a candidate whose fitted amplitude tops the plane's range does not qualify (the F-3 amplitude screen, full scale from the caller); its 12F disc must lie inside the plane and the caller's footprint (LN's `allowed`); `aperture_stars` counts the qualifiers; psfSel reads this flux | spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel: `pairs/iso/blur25mix` t60 −13.03 % and `pairs/iso/blur4` t60 −7.28 % → within ±2 %, the Moffat and Gaussian pairs stay within ±1.2 % |
-| F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | one definition: S / σ_S in an aperture of radius max(1.5·FWHM, 3 px), σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky), σ_sky measured in the annulus; g from EGAIN (raw ADU) or EGAIN with the calibrated-frame cards (`ATH_CSCL`, `ATH_CFNM`); unknown gain → the shot term is omitted and the record says so. Lab: the generator writes EGAIN (and `ATH_CSCL` on unit-domain planes) from its own gain; the truth SNR is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky | median bias vs the truth SNR ≤ 3 % on the unsaturated isolated families (`sharp/*`, `background/*`) |
+| F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | one definition: S / σ_S in an aperture of radius max(1.5·FWHM, 3 px), σ_S² = S/g + N_ap·σ_sky²·(1 + N_ap/N_sky), σ_sky = the star's own σ_i over its N_sky ring pixels (F-10, 2026-10-11; the [3F, 4F) annulus is retired for SNR); g from EGAIN (raw ADU) or EGAIN with the calibrated-frame cards (`ATH_CSCL`, `ATH_CFNM`); unknown gain → the shot term is omitted and the record says so. Lab: the generator writes EGAIN (and `ATH_CSCL` on unit-domain planes) from its own gain; the truth SNR is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky | median bias vs the truth SNR ≤ 3 % on the unsaturated isolated families (`sharp/*`, `background/*`) |
 | F-7 | Fit background under nebulosity +0.998σ (`background/neb3_4096`) | F-1's rim background | ≤ 0.3σ under nebulosity; within ±0.1σ on flat fields |
 | F-8 | The F1 contradiction (synthetic over-read up to +11.84 %; real data within the bars; psfSel the opposite way) | Plan B (§5): first re-baseline the LN rows on Plan A's fits, then test the referee pair (lab field realism against the harness truth on real frames); F1 and the F1 v2 sky change only after | decided by that test; no F1 change before it |
 | F-9 | The c = 1 growth floor (open owner question) | decided in Plan B on that plan's numbers | — |
+| F-10 | One background (2026-10-11; research RB1/RB2, design studies D1/D2, the ERP comparison on the trailed frames). One star met five estimates of sky and noise, none owned. On synthetic nebulae the filtered plane's measured σ_f is the nebula's own (σ_f / noise 1.75 / 6.7 / 32.5 / 30.4 on `neb0.1/0.5/3/3_4096`), so the seeds lose stars (recall vs flat 0.92 / 0.69 / 0.40; every `neb3` star below Fisher 100); a sky sample's error grows with its distance from the star (`neb3` p90: fit b 2.6σ < [6, 8]F 4.4σ < [10, 12]F 5.5σ < mesh 10.1σ < plane median 15.3σ); `c` couples 1:1 to its far ring and ≈ 0.1 to the fit's b, so an SNR built on the fit's b would inherit its 0.48σ p90 noise (47 % of the median star over 5F); the field width reads 8.2–8.8 px on M42 against a fitted 1.7–2.4 px (injected stars found 42/60, 43/62, 38/62); the trailed L 0010 / L 0011 hit the seed cap and keep 947 / 786 trail fragments (clean median 2458), `c` 4.48 / 6.89, weight 0.024 / 0.036 of the group max (the ERP: 2e-9 PSF signal weight) | **As built (Task 10b, 2026-10-12; every ruling with its numbers in `docs/stacking/README.md` R-OSP-7b).** **Detection.** σ_f is PROPAGATED: the 128-px mesh's per-cell clipped σ (its noise map) × the plane's filtered-noise gain, K = 6 unchanged; the mesh is the plane's one map, computed once and shared with N* (so on a masked plane N* reads the masked mesh: an absent pixel is not sky; D-1). The gain is 1 on a plane whose caller states its pixels' noise `White` (sensor pixels, raw or calibrated: shot, read and dark noise are per pixel and calibration is per-pixel arithmetic, so every lag-≠0 covariance is 0; C-7), and it is READ once per plane, from the noise's own autocovariance on the 5×5 high-pass residual, on a `Mixed` (debayered, resampled, warped, integrated) or `Unknown` plane (`star_measure::PixelNoise`, default `Unknown`: gain 1 on mixed pixels floods false seeds, a read on white pixels only costs nebula recall; C-10). The stacking Measure stage states `White` for a calibrated mono plane and `Mixed` for a debayered one; integrate and drizzle state `Mixed`. Two knot tests, thresholds from the PSF and the noise: the bounds are a pixel-centred Moffat β 1.5 through the same kernels (plain 0.972, zero-sum 0.935 at F 2.6–8; 0.911 / 0.885 at F 1.2), read at the field's star-width ENVELOPE F_env = F_field + 3.09·s, s the TRUE spread of the stars' widths (E4n: the mirrored lower-half spread of the readable reads in [0.715·F_field, F_field] with the reads' own error e(ν) = √((0.899/ν)² + 0.0208²) removed in quadrature; A2-1…A2-3: half the real stars are broader than the mode); σ_r = √(1 + r² − 2rρ)/ν, z = 3.09; a seed whose plain f(2F)/f(F) exceeds its bound + 3.09σ_r AND whose zero-sum F response is below K is structure and dropped; a seed whose zero-sum ratio exceeds its bound + 3.09σ_r is `extended` (kept as a seed; out of the β sample, `c`'s qualifiers AND the frame statistic — the saturation flag's treatment, P3); a seed whose peak reaches the plateau-clip level (0.9 of Task 8's `SaturationPlane` range, the owned quantity — no third maximum) is exempt, and whether that near-clip class is right is Task 10c's (F-3). The β sample takes only seeds whose verdict fit passes the fit's centre and region tests. **The field width** is the HALF-SAMPLE MODE of the half-maximum reads of every readable candidate (its brightest pixel ≥ 10 σ_rim above the read's own box rim), clamped to [1.5, 24] px, with no saturation test (F25 stands): every contaminant of a read — a clipped core, a blend, a knot, a sky bump — is wider than the PSF while the stars share one width (A5; M42 8.2–8.8 → 1.7–1.95 px). **Trails.** NO per-star streak refusal (a fitted-ecc line at 0.8 refuses 2–32 % of clean real fits; an elongated star is a real star, measured as such; Q1). The fit's centre test is its own half-maximum contour: a fit is the seed's star when the seed lies inside (u/α_x)² + (v/α_y)² ≤ 2^(1/β) − 1 in the fit's axes (a round FWHM-3 star keeps the former 1.5 px; a fixed tolerance refused elongated stars by the back door; A4-2). The trailed verdict is frame-level only, from the refusal structure — a fit cannot contain a star longer than its region: the trail share = (centreMoved + regionTooSmall + centreAtRim) / judged seeds, and a plane with at least 100 judged seeds and a share > 0.5 is trailed — the MAJORITY rule, a physical criterion (Q5, A4-2; the line derived from the clean frames' distribution, median + 5·1.4826·MAD, did not separate the trailed frames from the elongated G 0003, so it was not built). Like F-1's defocused verdict, every fit the plane would accept is refused `trailed`, `c` is None, the weight inputs are empty; measure path only (LN's refits never see it). ecc is reported beside it, never a gate. Frame classes (rendered before any reading): `trailed` (streaks, no measurable PSF: L 0010, L 0011) is the verdict's target; `elongated` (measurable short dashes: G 0003, ecc ≈ 0.65) gets no verdict and no per-star refusal, is measured as is with its ecc reported, and leaves every clean pooled row — rejecting it is frame selection's job (an ecc gate), not measurement's. Recorded miss: hook-shaped trails whose dwell cores fit (`trails/` H 0029, share 0.445) get no verdict (Q6). **Per-star sky (one definition per scale).** The fit keeps its free local b (fixing it at any ring value triples the nebula FWHM scatter and fails 2–4 F-5 cells: rejected). ONE aperture-scale sky B_i per accepted star on R6's geometry (the plain mean over [10F, 12F] outside every seed's 3F disc, F the frame FWHM), computed once and stored with σ_i (the RMS of (v − B_i) over the same pixels) and their count, not persisted; `c`'s growth sums (v − B_i), byte-identical to R6's by construction; Task 11's SNR and HFR read B_i and σ_i, none re-estimates; b − B_i is stored as a diagnostic. LN keeps each side's own ring width: the pair-common width max(F_R, F_T) failed the nebula-pair bar as the per-side width did and added misses of its own (P.3 = C-9). Recorded limits (with SE, not bars): the nebula `c` bias on R6 (`neb3` 0.880, `neb3_4096` 1.129) and its crowded form (density × `neb3` d200 / d600 / d1000: 1.058 / 1.133 / 1.087 as built, 1.058 / 1.135 / 1.069 before); the real halo `c` carries beyond the fitted model on injected stars (+4–6 % on clean frames, 10b-L); LN's psfSel on nebula-sky pairs and warped targets, unchanged by this row (13 of 34 cells over; Plan B's before, C-9); the mesh noise map reads ≈ 6× the true noise on `neb3` (structure inside a cell counts as noise), so heavy-nebula recall stays ≈ 0.54 until a later owner takes it (C-7); the gain read keeps its nebula-texture leak on debayered colour planes (Task 11, C-7) | the F-10 bars below |
+
+**F-10 bars (fixed 2026-10-11, before any 10b code; revised the same day after the plan review, still before any code;
+one joint lab cycle; baselines in plan Task 10b).** Every bar is derived from data or from the PSF and the noise
+before the cycle; a bar that cannot be is REPORTED with its reason, never kept as an underived number (R2).
+- F-0…F-5 and F-7 re-read unchanged in the same cycle; F-5's four psfSel/spread bars verbatim.
+- Detection: recall on the `seeds` path `neb0.5` and `neb3` ≥ the design arm's (D2: 0.777, 0.539) minus 2 SE of the
+  recall at the cell's n truth stars (0.743, 0.499 at v2 i0's n = 629; recomputed at the scorecard cell's n before the
+  run) with ≤ 3 false seeds per Mpx; `halo` ≤ 5 false seeds (the arm's 2 + 2 Poisson SE); flat, gradient, sharp,
+  mixture, twins, artefacts, coma, fieldpsf, shape and saturated families within −0.005 of the baseline recall with
+  false seeds ≤ the baseline; twins and artefacts ≤ 0.5 `nothing` per Mpx (R-OSP-2); doubles and `d1000` ≥ baseline
+  − 0.01, density pairs ≥ baseline − 0.03; propagated / measured σ_f 1.00 ± 0.04 on flat and twins. A flat-family
+  no-regression move re-sweeps K by PA-2. The `extended` flag moves the frame FWHM, ecc and `c` on the clean families
+  (flat, sharp, density, twins) within SE only.
+- Knots (new family): accepted unflagged fits on truth knots, per (size, amplitude) bin of FWHM ≥ 1.5F, at most the
+  knot tests' own expected pass rate for a Gaussian knot of that size and SNR (from the bounds and the noise) + 2
+  binomial SE; bins below 1.5F reported (the tests are blind there); truth-star recall ≥ baseline − 0.01. Density ×
+  nebula (new): recall ≥ baseline − 0.03 with ≤ 3 false seeds per Mpx, `c` from ≥ 5 stars on every plane.
+- Field width: on each M42 frame, injected stars found ≥ 99 % of those above the detection threshold at the frame's
+  noise (the raw-mode truth rule below), the plain found share reported; on the other clean injected frames (G 0001,
+  G 0002, L 0000, L 0008 — not the elongated G 0003) ≥ the baseline; sharp and blur families' recall within SE of the
+  baseline.
+- Trails: on L 0010 and L 0011 (class `trailed`) accepted stars ≤ 1 % of the clean siblings' median, PSF signal
+  weight ≤ 0.01 × the clean median, `c` = None (< 5 genuine qualifiers); the trailed verdict on each wind-shaken
+  `trails/` frame equals its rendered class; no verdict on every clean frame and on the `elongated` G 0003 (the verdict
+  never fires there, so it changes no clean fit); no star lost on `shape` (e ≤ 0.7), `coma` and `fieldpsf` (recall ≥
+  baseline − 0.005; no per-star refusal exists). The `elongated` G 0003: refusal share and ecc reported. Before any
+  verdict code, the refusal share's line is derived from the clean frames' distribution (A4 step 2a) and must
+  separate the trailed frames from G 0003 and every clean frame; failing that the step stops with the table.
+- Per-star sky: σ_i / truth noise median 1.00 ± 0.05 on smooth sky (flat, gradients, `neb0.1`, sharp, density); `c`
+  byte-identical where the seeds and F are unchanged (B_i is R6's ring, read once); B_i vs `sky_local` and b − B_i
+  reported.
+- LN: psfSel on nebula-sky pairs, as the change against the flat control on the same star field, within ±1.2 %
+  (single-profile targets) and ±2 % (blur targets) on `neb0.5`, the same plus 2 SE on `neb3`; a cell refused for
+  < 20 matched stars is n/a, not a miss; warped targets within their unwarped twin's tolerance. Injected stars with
+  the frame's own PSF: row 6 within 2 % (+ 2 SE of `c`) of the F-5 cycle's value per clean frame; the halo excess
+  is a recorded limit.
+- Real sky (no truth; the F-5 cycle's numbers, re-measured on the cycle's own machine before it): `c`'s
+  frame-to-frame sd ≤ before × (1 + 2/√(2(n − 1))) on a dataset of n ≥ 12 clean frames (1.43 × at n = 12, M42's
+  calibrated set; the sd's own relative SE is 1/√(2(n − 1))); a dataset with fewer clean frames is reported; seeds per
+  Mpx per clean frame reported (no derivation before the cycle; the seed flood it would catch is the trails bars'); the
+  M42 frames' β REPORTED with its mechanism split (knot / extended seeds vs near-clip class-B stars); the bar is Task
+  10c's.
+- Cost: the m42 corpus Measure batch ≤ 1.2 × the same machine's wall at the F-5 cycle's binary, re-measured before the
+  cycle (§3 cost; the dev Mac's 223.1 s is not comparable on another machine; read here first, confirmed at the
+  checkpoint).
+
+**F-10 as judged (2026-10-12; joint cycle `t10b-onebg`, third run at athenaeum 4c95b6b4, athenaeum-lab 4f9e21e).
+Every bar is met or reported, no STOP is open; the cell-by-cell table is `docs/stacking/README.md` R-OSP-7b.** The
+cycle ran three times: at 6a1addc6 (STOPs: `neb3` recall, LN's nebula pairs, the frame statistic), at 7fd911ab (gain 1
+on unmixed planes; STOP: resampled mono planes flooded with 1 147 / 1 047 false seeds) and at 4c95b6b4 (the caller's
+`PixelNoise`: 0 / 0). Judging rules ruled during the cycle, none of them moving a bar: D.1 is read on D2's own quantity,
+found over all 629 truth stars (C-1); a zero-tolerance "false ≤ base" at base 0 is read at R-OSP-2's 0.5 per Mpx (C-3);
+a population move is set aside only where the same truth stars measure better or unchanged (C-2), "unchanged" being
+within max(2 SE, 1 % of the base mean) (C-5), with the WORSE count printed beside its binomial allowance (C-6c) and the
+truth, not the base, as the referee on a lab family (C-11); the trails line is Q5's majority rule (above).
+
+| Bars | As judged |
+| ---- | ---- |
+| F-0…F-5, F-7 | F-0 identity 885 of 885 rows; F-5 spread 0.76 % / 1.41 %, psfSel blur pairs +1.72 % / +1.19 %, pure pairs 0 of 70 over, mixtures 0 of 20; no-regression against the F-5 cycle and cumulative against t01c: 0 moved, 0 missed, 0 lost; legacy control 0 mismatches |
+| Detection | recall `neb0.5` 489 / 629 = 0.777 and `neb3` 339 / 629 = 0.539 (floors 0.743 / 0.499; before 0.591 / 0.343), false 1.67 / 2.38 per Mpx; `halo` false seeds 2 (before 256); every flat-family line held, `resampled/*` included; twins and artefacts 0 `nothing` per Mpx; doubles, `d1000` and the density pairs within their lines; flat σ_f propagated / measured 0.973; `neb3_4096` completeness 0.719 (before 0.447), reported |
+| Knots; density × nebula | accepted unflagged knots of FWHM ≥ 2F pooled 1 / 1 / 2 of 216 on flat / `neb0.5` / `neb3` (allowance 4 / 3 / 4), no bin over its allowance; truth-star completeness 0.987 / 0.928 / 0.655 (before 0.978 / 0.714 / 0.424); density × nebula completeness 0.607–0.862 on the six planes (before 0.367–0.681), `c` from 64 stars on each |
+| Field width | M42 injected stars above the detection threshold found 45 of 45, 41 of 41, 45 of 45; the clean G / L inject frames at or above their before (L 0000 51 → 60 of 61, L 0008 51 → 59 of 60) |
+| Trails | L 0010 / L 0011 trailed (share 0.916 / 0.933): 0 accepted fits, `c` None; six of the seven `trails/` frames match their class (H 0029, 0.445, the recorded miss); no verdict on the ten clean siblings (0.005–0.111) or on G 0003 (0.176); the synthetic long-trail family crosses 0.5 at a streak of 5.5–5.7 F, about the fit region's radius (reported) |
+| Per-star sky | σ_i / truth noise median within 1.00 ± 0.05 on all 55 smooth-sky rows |
+| LN | per-side kept (P.3): nebula-sky pairs 13 of 34 cells over the bar (pair-common 15), shifted / warped targets 3 cells at t25 (+1.91…+1.96 pp), both equal to the before cell for cell; reported as Plan B's before (C-9) |
+| Real sky, cost | injected-star row 6 within 2 % + 2 SE_c on every clean frame (Δ −0.025…+0.009); M42's 12-frame `c` sd 0.67 % (bar 1.46 %, before 1.02 %); M42 frame β 31.8 / 2.81 / 3.38 reported (Task 10c's bar); Measure batch 74.7 s (bar 159.8 s, before 133.5 s) |
+
+Same-star (1.31 M paired truth stars): 645 cells, 46 better, 580 unchanged, 19 worse (allowance 23). Accepted with
+their numbers, never as a bar move: the seed box and the faint-bin noise at the corrected field width (C-5 (b), C-6,
+C-6c), the frame statistic's population and weights (C-8, C-8b) and the corrected width's cost on a heavy-wing shape
+(C-12d: +0.003 ecc on bright round β 2.5 stars at the true width — a later fit-design task's first datum).
+
+**Owned quantities (F-10, 2026-10-11).** Every quantity more than one consumer reads has ONE owner and a truth bar
+at its consumers' scale; a consumer reads it, never re-estimates it; a fix round that adds a second estimate is a
+STOP and a re-audit of that quantity. One current owner per row; earlier tasks are provenance, in parentheses.
+
+| Quantity | Owner (task) | Consumers | Truth bar |
+| ---- | ---- | ---- | ---- |
+| plane sky median (`SkyLevel`) | 8 (from 2, PA-21) | the saturation test's bg; Analysis `background` (Plan C) | F-3 row 10 |
+| plane noise σ (`NoiseModel`: MRS, N*) | 8 (from 6a) | the saturation threshold, the hot-pixel rule, the weights' σ_n, Analysis `noise` (Plan C) | F-3 row 10 |
+| the 128-px mesh map M (the plane's one background map, computed ONCE per plane and shared) | 6a (shared by 10b, Q4) | the matched filter's background and σ_f's per-cell noise map (detection), the knot metrics (through the filtered plane), the plane noise's N* (`domain::background_residual`; on a masked plane the masked mesh, D-1); the saturation test reads `SkyLevel.median`, not the mesh | F-1 fitted/seeded; F-10 detection |
+| detection noise σ_f(x) (its gain from the caller's `PixelNoise` statement: 1 on `White`, read on `Mixed` / `Unknown`) | 10b | the matched filter's threshold, the knot tests' z | F-10 detection |
+| seeds (structure drop, `extended`) | 10b (from 6a) | the field width, every fit, the β sample, `c`'s isolation and the ring's seed mask | F-1 fitted/seeded; F-10 detection, knots, trails |
+| field width F_field | 10b (from 6a, PA-17) | the kernel, the width-start box ⌈2·F_field⌉, `c`'s isolation 6·F_field, the knot kernels and (through the envelope F_env = F_field + 3.09·s) the knot bounds, `field_width_of` for given seeds | F-10 field width; F-1 |
+| frame FWHM F (the unsaturated, unextended statistic) | 9 (F-4; from 8) | B_i's ring [10F, 12F], `c`'s 5F growth radius, LN's `ring_fwhm` | F-4 |
+| fit-scale sky b (free) | 6b (F-7) | the model only (A, widths, β) | F-7 |
+| aperture-scale sky B_i | 10b | `c`'s growth sums, F-6's S and HFR, the b − B_i diagnostic | F-5; F-10 per-star sky |
+| per-star noise σ_i (with its pixel count) | 10b | F-6's σ_sky and N_sky | F-10 per-star sky |
+| flag `saturated` | 8 (F-3) | the β sample, the frame statistic, `c`'s qualifiers, `.athf`, the weights | F-3 row 10 |
+| flag `saturated`, its near-clip class | 10c (from 8) | the β sample, the frame statistic, `c`'s qualifiers, later F-6's SNR and HFR | 10c M42 β |
+| flag `betaAtCap` | 9 (F-4) | `.athf` and the probe (a diagnostic; no statistic excludes it) | F-4 |
+| flag `extended`; refusal `trailed` | 10b | the β sample, the frame statistic, `c`'s qualifiers, `.athf`, `stars_refused`, the weights | F-10 knots, trails |
+| frame β | 9 (F-4) | every fit at β, the model flux (c's denominator), LN's reference β | F-4; 10c M42 β |
+| `c` | 10 (F-5) | `signal` → PSFSW / PSFSNR, psfSel, Register's and LN's ordering | F-5; F-10 LN, real sky, trails |
+
+LN's clip screen on paths without a verdict (`unverdicted_clip_range`) is a declared second saturation definition,
+kept until Plan B decides whether LN's seeds come from the module.
 
 **Raw-mode truth.** Raw-mode truth exists only for injected stars (`manifests/inject.json`: 7 raw entries, 3
 mosaics). In raw mode the bars are completeness ≥ 99 % of the injected stars above the detection threshold and
@@ -249,7 +360,8 @@ All NOT NULL columns of `frame_analysis` and the `star_metrics` row (`db/schema.
 - From the module, shared with stacking: frame FWHM (fit width, D-2), frame ecc, per-star x, y, peak, flux, fwhm,
   fwhm_x, fwhm_y, ecc, θ (radians, image pixel frame, canonical per F-2 — the Blink overlay already draws fwhm_x on θ
   and negates θ under `flip_vertical`, so it is unchanged by design), β, fit residual, `fit_method` (`moffat`).
-- **One frame statistic for both consumers:** the residual-weighted mean over accepted unsaturated fits. The
+- **One frame statistic for both consumers:** the residual-weighted mean over accepted fits flagged neither
+  `saturated` (F-3) nor `extended` (F-10). The
   columns and fields keep their names (`median_fwhm`, `median_eccentricity`; no rename — `FrameAnalysis` stays
   wire- and sync-compatible).
 - New: per-star SNR (F-6) and its median (`median_snr`); HFR = the radius enclosing half of the star's F-5 flux,
@@ -324,8 +436,11 @@ clean; push only on the owner's word).
 3. `FitDiagnostics` and `stars_refused` (F-0). Numbers unchanged.
 4. One fix per step, each judged on its own bar plus the no-regression table: F-2 (axes, convergence) → F-1 with F-7
    (region, background, width start, seeds) → F-3 (the saturation test and its self-consistency row) → F-4
-   (continuous β, with the rustafits free-β bound and parametrization) → F-5 (flux, psfSel) → F-6 (SNR); the F-3
-   twin rows are judged again after F-4. The stacking Measure config changes (§2.2) land with F-1 and F-4.
+   (continuous β, with the rustafits free-β bound and parametrization) → F-5 (flux, psfSel) → F-10 (one background:
+   detection noise, knots, the field width, trails, the per-star sky and noise; its one lab cycle re-judges F-0…F-5
+   and F-7 jointly, and it reads the Measure wall first) → F-3's near-clip class (Plan A Task 10c: the saturation flag's
+   near-clip class-B stars, the M42 β bar derived from the set's own spread) → F-6 (SNR, reading F-10's B_i and σ_i);
+   the F-3 twin rows are judged again after F-4. The stacking Measure config changes (§2.2) land with F-1 and F-4.
 5. **Real-data checkpoint** under the owner's rule (a numeric change is judged on the whole group at master level),
    with the athenaeum-lab acceptance harness (`harness/acceptance/`, reused): set 204 mono and OSC, run B, Horse C11
    stacked before and after, with the reference frame pinned (`ReferenceMode::Manual`, the before run's pick) so a

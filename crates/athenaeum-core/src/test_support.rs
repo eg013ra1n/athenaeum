@@ -397,7 +397,129 @@ impl crate::star_measure::StarFit {
             signal: 8.0 * amplitude,
             area: std::f64::consts::PI * 0.25 * fwtm * fwtm,
             peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
             flags: crate::star_measure::StarFlags::default(),
         }
     }
+}
+
+/// One star of [`spread_moffat_field`]: its centre (pixel centres at integer coordinates), its peak and its FWHM, px.
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpreadStar {
+    pub x: f64,
+    pub y: f64,
+    pub amp: f64,
+    pub fwhm: f64,
+}
+
+/// A field of round Moffat stars of one `beta` whose widths SPREAD (Task 10b A2b's truth tests): `n` stars at seeded
+/// random positions at least `min_sep` px from each other and `margin` px from every edge, each FWHM drawn from
+/// N(`fwhm`, `fwhm_sd`) cut at ±3σ, each peak `sigma` × an SNR log-uniform in `snr` (`sigma` is the noise the caller
+/// adds). Every pixel is the light it collects — the mean of the profile over 5 × 5 midpoint sub-samples, as
+/// [`integrated_field`] — each star rendered out to `max(6·FWHM, 6) + 2` px, on a flat `background`. Returns the
+/// noiseless plane and the stars.
+#[cfg(feature = "render")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spread_moffat_field(
+    (w, h): (usize, usize),
+    n: usize,
+    (fwhm, fwhm_sd): (f64, f64),
+    beta: f64,
+    sigma: f64,
+    snr: (f64, f64),
+    (min_sep, margin): (f64, f64),
+    background: f32,
+    seed: u64,
+) -> (Vec<f32>, Vec<SpreadStar>) {
+    let mut rng = crate::geometry::ransac::SplitMix64(seed);
+    let mut stars: Vec<SpreadStar> = Vec::with_capacity(n);
+    let mut attempts = 0usize;
+    while stars.len() < n {
+        attempts += 1;
+        assert!(
+            attempts < 1000 * n,
+            "{n} stars do not fit {min_sep} px apart"
+        );
+        let x = margin + rng.next_f64() * (w as f64 - 2.0 * margin);
+        let y = margin + rng.next_f64() * (h as f64 - 2.0 * margin);
+        if stars.iter().any(|s| (s.x - x).hypot(s.y - y) < min_sep) {
+            continue;
+        }
+        let z = loop {
+            let u1 = rng.next_f64().max(1e-12);
+            let u2 = rng.next_f64();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            if z.abs() <= 3.0 {
+                break z;
+            }
+        };
+        let ln_snr = snr.0.ln() + rng.next_f64() * (snr.1 / snr.0).ln();
+        stars.push(SpreadStar {
+            x,
+            y,
+            amp: sigma * ln_snr.exp(),
+            fwhm: fwhm + fwhm_sd * z,
+        });
+    }
+    const SUB: usize = 5;
+    let offsets: Vec<f64> = (0..SUB)
+        .map(|i| (i as f64 + 0.5) / SUB as f64 - 0.5)
+        .collect();
+    let inv = 1.0 / (SUB * SUB) as f64;
+    let mut data = vec![background; w * h];
+    for s in &stars {
+        let alpha = s.fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let reach = (6.0 * s.fwhm).max(6.0) + 2.0;
+        let (x0, x1) = (
+            (s.x - reach).ceil().max(0.0) as usize,
+            (s.x + reach).floor().min(w as f64 - 1.0) as usize,
+        );
+        let (y0, y1) = (
+            (s.y - reach).ceil().max(0.0) as usize,
+            (s.y + reach).floor().min(h as f64 - 1.0) as usize,
+        );
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let mut sum = 0.0;
+                for &oy in &offsets {
+                    let dy = y as f64 + oy - s.y;
+                    for &ox in &offsets {
+                        let dx = x as f64 + ox - s.x;
+                        sum += (1.0 + (dx * dx + dy * dy) / (alpha * alpha)).powf(-beta);
+                    }
+                }
+                data[y * w + x] += (s.amp * sum * inv) as f32;
+            }
+        }
+    }
+    (data, stars)
+}
+
+/// Task 10b A2b's width-spread field (truth tests 1 and 2, one field): 600 Moffat β 2.5 stars on a 2048² plane, FWHM
+/// N(3.0, 0.24) px cut at ±3σ, peak SNR log-uniform in [20, 2000] over the noise σ = 0.0004 the caller adds, ≥ 30 px
+/// apart and ≥ 40 px from every edge, on a background of 0.05. Returns the noiseless plane, the stars and σ.
+#[cfg(feature = "render")]
+pub(crate) fn width_spread_field() -> (Vec<f32>, Vec<SpreadStar>, f64) {
+    width_spread_field_beta(2.5)
+}
+
+/// [`width_spread_field`] with the stars' Moffat β `beta` (truth test 2 sweeps the product's β range).
+#[cfg(feature = "render")]
+pub(crate) fn width_spread_field_beta(beta: f64) -> (Vec<f32>, Vec<SpreadStar>, f64) {
+    const SIGMA: f64 = 0.0004;
+    let (data, stars) = spread_moffat_field(
+        (2048, 2048),
+        600,
+        (3.0, 0.24),
+        beta,
+        SIGMA,
+        (20.0, 2000.0),
+        (30.0, 40.0),
+        0.05,
+        101,
+    );
+    (data, stars, SIGMA)
 }

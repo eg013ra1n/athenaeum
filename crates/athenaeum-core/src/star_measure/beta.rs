@@ -9,8 +9,8 @@
 //! per pixel, `k = clamp(⌈10 / F_start⌉, 3, 9)` ([`sample_subsample`]). The point model stays everywhere else: the
 //! saturation verdict fit and every star's fit at β.
 //!
-//! On the measure path the sample is the [`AUTO_SAMPLE`] brightest seeds whose verdict fit succeeded unflagged
-//! (C-b, PA-23; [`sample_seeds`]), and each is re-fitted on the verdict fit's own problem — its region, minus the
+//! On the measure path the sample is the [`AUTO_SAMPLE`] brightest seeds whose verdict fit succeeded unflagged and
+//! centred, their seed not flagged extended (C-b, PA-23; Task 10b A4, P3; [`sample_seeds`]), and each is re-fitted on the verdict fit's own problem — its region, minus the
 //! pixels its level excluded, from its starts, with its iteration budget ([`verdict_beta`],
 //! `photometry::integrated_beta`). A caller that ran no verdict — `fit_stars` (tests and probes; a run's LN reference
 //! fit is handed the group β), Plan C's green sites (ruling F45) — fits its own sample of the brightest seeds the same
@@ -166,22 +166,32 @@ pub(super) fn verdict_beta(
     p: &FitParams,
     mask: Option<&[bool]>,
     passes: &[SeedPass],
+    extended: &[bool],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> SampleBeta {
-    let sample = sample_seeds(passes);
+    let sample = sample_seeds(passes, extended);
     let betas = fit::sample_fits(data, w, seeds, mask, p, passes, &sample, pool);
     sample_median(&sample, &betas)
 }
 
 /// The measure path's β sample (C-b): the indices of the [`AUTO_SAMPLE`] first seeds of `passes` (seed order,
-/// brightest first) whose verdict fit succeeded unflagged — an own or a cross-plane flag, a failed verdict fit, a
-/// `MostlySaturated` refusal or no verdict at all keeps a seed out.
-pub(super) fn sample_seeds(passes: &[SeedPass]) -> Vec<usize> {
+/// brightest first) whose verdict fit succeeded unflagged and stayed CENTRED (Task 10b ruling A4: it passed the fit's
+/// own centre and region tests, so a trail segment the fit cannot contain never joins), and whose seed the knot test
+/// did not flag extended (`extended[i]`; an empty slice = none flagged, as for given seeds; ruling P3) — an own or a
+/// cross-plane flag, a failed verdict fit, a `MostlySaturated` refusal or no verdict at all keeps a seed out.
+pub(super) fn sample_seeds(passes: &[SeedPass], extended: &[bool]) -> Vec<usize> {
     passes
         .iter()
         .enumerate()
         .filter_map(|(i, v)| match v.verdict {
-            Some(Ok(sv)) if sv.fit && !sv.saturated => Some(i),
+            Some(Ok(sv))
+                if sv.fit
+                    && !sv.saturated
+                    && sv.centred
+                    && !extended.get(i).copied().unwrap_or(false) =>
+            {
+                Some(i)
+            }
             _ => None,
         })
         .take(AUTO_SAMPLE)
@@ -402,6 +412,7 @@ mod tests {
             fit,
             iterations: 5,
             cross,
+            centred: fit,
         };
         let mut passes = vec![
             SeedPass::for_test(Some(Ok(v(9.0, true, true, true)))), // cross-flagged
@@ -415,7 +426,7 @@ mod tests {
                 SeedPass::for_test(Some(Ok(v(2.0 + 0.01 * j as f64, false, false, true))))
             }),
         );
-        let sample = sample_seeds(&passes);
+        let sample = sample_seeds(&passes, &[]);
         assert_eq!(sample, (5..69).collect::<Vec<_>>());
         let verdict_beta_of = |i: usize| match passes[i].verdict {
             Some(Ok(sv)) => Some(sv.beta),

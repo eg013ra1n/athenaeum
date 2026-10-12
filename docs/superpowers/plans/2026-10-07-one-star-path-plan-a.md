@@ -252,6 +252,29 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   on Moffat-4 (box radius 1.5 F) and +26 … +33 % on Moffat-2.5, the wings; the matched filter's best-scale
   response read +8.4 … +9.4 % on Moffat-4 and +16 … +17 % on Moffat-2.5. The unit test's bar is the estimator's own
   10 % on a Moffat-4 F 5 field (expected +1.8 %, within 2.5 % under the test's noise).
+  *Revised by Task 10b A2 (ruling A5, 2026-10-11) — which reads the median takes, not how one read is made:* the
+  field width is the HALF-SAMPLE MODE of the half-maximum widths of EVERY candidate (the first pass's; for
+  `field_width_of`, every given seed) whose read is READABLE — its brightest pixel at least 10 σ_rim above the read
+  box's rim median, the width start's own gate (Task 6b R1, `WIDTH_START_MIN_PEAK_SNR`) — clamped to [1.5, 24] px.
+  No count, no ranking (the given seeds' `peak` is no longer read), no saturation test (F25 stands: no second
+  saturation rule). Derivation: every contaminant of a half-maximum read is WIDER than the PSF (a clipped core is
+  read at half the clip, outside the PSF's half maximum; a blend, a knot or a sky bump is a broader profile) while the
+  stars share one width, so the PSF is the reads' mode; the mode estimator is parameter-free (Bickel's half-sample
+  mode). Chosen on the design run `t10b-a2-design` (the first pass's candidates dumped with their reads; 9 clean real
+  frames — M42 mono2 0000/0008/0010, hc11B L 0000/0008, G 0001/0002, LDN 1272 D 0099 and mono 0000 — and 45 lab
+  families; reference = the median read of the frame's good stars at read SNR ≥ 50: accepted unflagged fits, lab truth
+  stars): the rule through Task 10 (median of the 100 brightest) read 1.04–4.43× the reference on the real frames
+  (M42 4.0–4.4, LDN 1272 3.3, L 0000 2.0, D 0099 1.7, L 0008 1.6) and up to 1.48× on the lab (`density/d1000`,
+  `density_pairs`, `neb3_4096`, `saturated/*/n60`; 12 cells beyond 10 %); the near-clip exclusion (median of the 100
+  brightest not within the plateau-clip band) 1.02–1.24 (5 cells, and it needs the saturation plane given seeds
+  lack, I-4); the mode of every readable read 0.92–0.99 real, 0.93–1.02 lab (none beyond 10 %). Recorded cost: the
+  readable tier at SNR 10–20 reads 3–20 % narrow, so the mode sits 1–8 % under the bright reads on real frames (M42
+  0.92–0.94, L 0000 0.93, G 0001 0.94). A median of the reads at SNR ≥ 20 or ≥ 50 read 0.98–1.03, but its threshold
+  is not derived and its breakdown is half the bright tier — the clipped-hundred truth test's construction; not
+  taken. Truth tests: `field_width_reads_the_stars_width_when_the_brightest_hundred_are_saturated`,
+  `…_on_structured_sky`, `field_width_of_given_seeds_follows_the_same_rule` (old rule 4.40 / 10.00 vs the stars'
+  2.76 / 3.30). M42's injected stars read 2.66 against the frame's own stars' 2.13: the injected PSF is broader than
+  the frame's.
 - **PA-18 The border test geometry (ruling F17).** `RegionTooSmall` at the border is reachable only for a star
   broader than the field width: the test puts one Moffat-4 star of FWHM 12 in a field whose width is 3 px, 10 px
   from the border — its width-start box (radius `2·F_field = 6`) fits, its region is clipped at r = 10, and
@@ -2990,10 +3013,796 @@ growth/model falls for fainter stars (all-pairs LN-like -4.7 %). **Plan C:** a C
 
 ---
 
-### Task 11: F-6 — the per-star SNR and HFR (spec §3 F-6, §4.2 HFR)
+### Task 10b: F-10 — one background (detection noise, knots, field width, per-star sky, σ_i) (spec §3 F-10)
+
+Owner-approved scope (2026-10-11, "да, делай 10b сейчас"); the design is the controller's rulings
+(`.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-10b-rulings.md`: A1–A6, B1–B5, C, the two addenda, P1–P5 on
+the draft and R1–R3 on the plan review `review-t10b-plan.md`, every finding of which is applied here), drawn
+from research RB1 (lab 5f705ad) and RB2, design studies D1 (lab d63dfc7, revision 2) and D2
+(`task-10b-design-D2-report.md`), the ERP comparison on the trailed frames (lab 16edeaa) and the planning review
+(`planning-vector-fable.md`). The spec row is F-10 because F-8 and F-9 already name Plan B's items. Principle: plan by
+measured quantity — this task OWNS the detection noise σ_f, the seeds, the field width, the aperture-scale sky B_i and
+the per-star noise σ_i (spec §3 "Owned quantities"); every consumer reads them and none re-estimates them; a fix round
+that adds a second estimate of an owned quantity is a STOP and a re-audit of that quantity, and three fix rounds inside
+one quantity re-audit it before a fourth.
+
+**Out of scope (must not creep in):** LN's tile sky (`ln/background.rs`, Plan B), registration's detector, the budget
+(Task 12), the SNR formula (Task 11), the c = 1 floor (F-9), any per-star residual screen on `c` (RF8's C_res, rejected),
+sub-10F nebula structure (a recorded limit with SE), a hand retune of K, a Settings field, fixing the fit's b (F2,
+rejected outright: D1 rev. 2), a product switch to the two-ring candidate K7 (reported beside R6 only), the near-clip
+class-B stars behind M42 frame 0000's β (D2: a saturation item, not knots — Task 10c's, ruling P2; 10b reports the
+M42 β with its mechanism split, row S.3).
+
+**Base and phases (lean execution: a fresh agent per phase, short reports, the controller restarts between them).**
+WIP branch `one-star-path-t10-wip` (Task 10 complete at fee44d50, not yet squashed); rustafits unchanged (45b5782); lab
+main after 10b-L. A1 → A2 → A3 → A4 on the dev Mac (rust-engineer: A1, A2, A4 opus; A3, a refactor under a
+byte-identity gate, sonnet — lean execution), each committed as `wip(star_measure): F-10 <phase> - …`; L on the runner
+in parallel; L2 (lab tooling) on the runner once A4's interfaces are fixed; C on the runner once A4, L and L2 are in
+(judgment run, sonnet or stronger); D last. No
+lab bar is read before C: the A phases read their unit tests and a real-frame proof table only.
+`MEASURE_VERSION` is not bumped (PA-4); `FITS_ARTIFACT_VERSION` is unchanged (B_i and σ_i are not persisted, like
+`peak5`; `EXTENDED` is a named bit of the existing flags byte).
+
+**Coupling checklist (the task; each phase repeats its part).**
+- Plane sky and plane noise unchanged: the saturation range keeps `SkyLevel.median` and `NoiseModel.sigma`; the mesh
+  M is the plane's one map (ruling A2) — nothing builds a second one.
+- Seeds ↔ F_field ↔ `c`'s isolation (6·F_field) ↔ the ring's seed mask (3F): every seed change moves B_i on nebula
+  and the isolation population; the isolation constant stays 6 unless the knots family says otherwise.
+- The fit's b stays free (B1); B_i is a different scale, never a fit input.
+- The β sample: Task 9's 64 brightest unflagged → plus centred and not extended; it moves the frame β, hence every fit
+  at β and the model flux (c's denominator). `extended` also leaves `c`'s qualifiers and the frame FWHM/ecc statistic
+  (ruling P3: the saturation flag's treatment), so the frame F — B_i's ring, `c`'s 5F — moves with it.
+- Frame classes (ruling R1), rendered before any reading: `trailed` (L 0010, L 0011: streaks, no measurable PSF) is
+  the A4 verdict's target; `elongated` (G 0003: measurable short dashes, ecc ≈ 0.65) is measured as is, its ecc
+  reported, NO trailed verdict, and it leaves every clean pooled row — rejecting it is frame selection's job (an ecc
+  gate), not measurement's.
+- `c`'s qualifiers: ≥ 5 everywhere a clean plane had them, 64 on clean frames; the c = None fallback on junk planes.
+- Rulings this task may revisit, each by its own rule: R-OSP-2 / PA-2 (K re-swept only if a flat-family row moves),
+  PA-17 and F25 (the field width and its saturated candidates), C0's isolation, C6/C7 (R6 stays as B_i's geometry),
+  Task 13's L 0010 item (moved here; its M42 β item moved on to Task 10c, ruling P2), PA-11's annulus for SNR
+  (retired by B4; Task 11 reads σ_i).
+- STOP rules (each with its numbers to the controller): a second estimate of an owned quantity; a moved `c` in A3; a
+  moved pin; a test whose premise fails (P5); P.3's both-arms failure; three fix rounds inside one quantity; a streak
+  refusal-share line that does not separate L 0010 / L 0011 from G 0003 and the clean frames (A4 step 2a: the table at the plan-fix of 2026-10-11 already shows the derived line firing on G 0003 — the first thing A4 hands the controller).
 
 **Files:**
-- Modify: `star_measure/photometry.rs` (`star_snr` over Task 8's `annulus_sigma`, `hfr`), `star_measure/fit.rs`
+- Modify: `star_measure/seeds.rs` (A1: `detection_noise`, `DetectionNoise`, the knot metrics, bounds and verdict,
+  `DetectionReport`; A2: the field width), `star_measure/photometry.rs` (A1: `SaturationVerdict.centred`; A3:
+  `ring_sky`, `RingSky`, `growth_curve` and `aperture_correction` read B_i), `star_measure/fit.rs` (A1: the centre test
+  on the verdict fit, `StarFlags::EXTENDED`; A3: B_i/σ_i on every accepted fit; A4: the trailed verdict from the refusal
+  share, no per-star streak refusal, Q1), `star_measure/beta.rs` (A1: `sample_seeds`), `star_measure/frame.rs` (A1: the FWHM/ecc statistic
+  excludes `EXTENDED` as it excludes `SATURATED`), `star_measure/diagnostics.rs` (A4: `Trailed` only),
+  `star_measure/domain.rs` (A1: the mesh map computed once and shared, Q4), `star_measure/mod.rs` (the new `PlaneMeasurement` / `FitStarsOptions` fields, tests), `stacking/measure.rs` (hand
+  edit: `trail_verdict` on the measure path, as `defocus_verdict`), `stacking/ln/scale.rs` (hand edit: the ring-geometry
+  arm), `stacking/psf_signal.rs` (re-exports), `examples/star_probe.rs` (frame line `sigmaF`, `sigmaFMeasured`,
+  `noiseGain`, `structureDropped`, `extendedSeeds`, `trailed`; star line `skyRing`, `skyRingSigma`, `skyRingN`,
+  `skyOffset`, flag `extended`), `examples/ln_scale_probe.rs` (`--ln-ring per-side|pair-common`), `docs/stacking/README.md`
+  (R-OSP-7b), the logging spec's field dictionary (`sigma_f`, `noise_gain`, `structure_dropped`, `extended`, `trail_share`,
+  `trailed` — Task 9's precedent), the spec's F-10 row "as built" (phase D).
+- Reuse (A1, review finding 13): D2's prototype `.superpowers/sdd/2026-10-07-one-star-path-plan-a/t10-scratch/d2/`
+  `d2_mod.rs` + `patch_seeds.py` (the knot metrics with sub-pixel-centred kernels, the bounds, the gain read on the
+  darkest boxes' high-pass residual) is A1's starting point, ported into `seeds.rs`, not re-designed; it also keeps A1
+  inside one agent's budget.
+- Earlier tests this task edits (ruling F14): every `seeds::detect` call (`seeds.rs` tests :876/:925/:952, `mod.rs`
+  tests :1522/:1621) takes the third tuple element; `growth_curve`'s tests take B_i as an argument; `RefusalReason::ALL`
+  (13 → 15) and every test that counts reasons; every `StarFit {` literal site (29 today, src + examples) gains the
+  three ring fields (or moves to `StarFit::test_at`), hand-edited in the no-rustfmt files. A measure.rs pin that moves
+  is a STOP with its mechanism unless the phase names it here first (the clean 150-star fixture is expected not to move
+  in A1 and A3).
+
+**Interfaces:**
+- A1. `seeds::detection_noise(plane, w, h, mask, fwhm) -> DetectionNoise { sigma: Vec<f32> /* σ_f(x) = the mesh's
+  per-cell clipped σ (its noise map) × gain */, gain: f64, measured: f64 /* 1.4826·MAD of the filtered plane over the
+  stratified sample: today's σ_f */ }` with `median()`; the gain is the noise's filtered-to-pixel σ ratio at that kernel
+  (1.00 on white noise): exactly 1 on a plane the caller states white (A1b/A1c, rulings C-7, C-10; `detect` takes
+  `pixel_noise: PixelNoise { White, Mixed, Unknown }`, default `Unknown`), measured once per plane on a mixed or unknown one (debayered, resampled, integrated) (the estimator is the phase's; D2 read it on the
+  high-pass residual of the darkest boxes). `seeds::detect(…) -> (Vec<Seed>,
+  FieldWidth, DetectionReport { sigma_f, sigma_f_measured, noise_gain, structure_dropped: usize, extended: Vec<bool> })`,
+  a candidate kept when `f(x) > K·σ_f(x)`. `seeds::knot_metrics(d, present, w, h, x, y, fwhm, sigma) -> KnotMetrics
+  { snr, snr_2f, z, z_2f, rho, rho_z }` (D2's definitions: Gaussian kernels at `fwhm` and `2·fwhm` centred on the seed's
+  sub-pixel position, truncated at 3σ of each; plain `f = Σk·d/√Σk²`; zero-sum responses over the 2F box with the
+  box mean removed from each kernel; `rho`, `rho_z` the two kernels' correlations), `seeds::knot_bounds(fwhm) ->
+  KnotBounds { plain, zero_sum }` (the same metrics on a pixel-centred, point-sampled Moffat β = `BETA_BOUNDS.0`
+  stamp of FWHM `fwhm`), `seeds::knot_verdict(m, bounds, threshold, near_clip) -> KnotVerdict::{Star, Extended,
+  Structure}` with `KNOT_Z = 3.09`: Structure when `snr_2f/snr > plain + KNOT_Z·√(1 + plain² − 2·plain·rho)/snr` and
+  `z < threshold`; else Extended when `z > 0` and `z_2f/z > zero_sum + KNOT_Z·√(1 + zero_sum² − 2·zero_sum·rho_z)/z`;
+  `near_clip` → Star, where `near_clip` reads Task 8's owned range, never a new maximum: the seed's peak −
+  `SaturationPlane.bg` ≥ (1 − `PLATEAU_RANGE`)·`SaturationPlane.range` (the plateau-clip clause's own 0.9 level; whether
+  that class is right is Task 10c's). Structure seeds are dropped and counted; `extended[i]` rides with seed `i`.
+  `SaturationVerdict.centred: bool` (the verdict fit passes `accept`'s
+  centre and region tests: `CentreMoved`, `CentreAtRim`, `RegionTooSmall`; false when `fit` is false).
+  `beta::sample_seeds(passes, extended: &[bool])` keeps `fit && !saturated && centred && !extended` (an empty slice =
+  none extended: given seeds). `StarFlags::EXTENDED = StarFlags(4)` on the accepted fit (named `"extended"`).
+  `photometry::growth_curve`'s qualifier rule gains "and not `EXTENDED`" (beside "not saturated"); `frame.rs`:
+  `fwhm_px` / `eccentricity` exclude `EXTENDED` as they exclude `SATURATED` (ruling P3).
+  `PlaneMeasurement.detection: Option<DetectionReport>` (`None` for given seeds).
+- A2. `seeds::field_width_of` and the matched filter's own width keep their signatures and PA-17's half-maximum
+  estimator; what the phase changes (which candidates the median reads — F25 revisited — and how) is recorded in
+  PA-17's text and R-OSP-7b. `FieldWidth` may gain fields the phase names.
+- A3. `StarFit` gains, not persisted (NaN / 0 on a decoded fit, like `peak5`): `sky_ring: f64` (B_i, working units),
+  `sky_ring_sigma: f64` (σ_i = the RMS of (v − B_i) over the same pixels), `sky_ring_n: u32` (n_i), and
+  `fn sky_offset(&self) -> f64 { self.background - self.sky_ring }` (the near/far diagnostic). `photometry::ring_sky(data,
+  mask, footprint, seeds: &SeedMask, w, h, x, y, fwhm) -> Option<RingSky { mean, sigma, n }>`: R6's pixel set (centres
+  at 10F ≤ d ≤ 12F, present = finite, unmasked and inside the footprint, outside every seed's 3F disc), `None` under
+  `ANNULUS_MIN_PIXELS` (8); computed once per accepted fit after the duplicate drop, F = the plane's frame FWHM (or
+  `FitStarsOptions.ring_fwhm`). `growth_curve` takes B_i and keeps `c`'s own qualifier rule (the 12F disc inside the
+  plane and the footprint, no absent pixel within 5F, B_i present); `aperture_correction` reads the stored B_i.
+  `PlaneMeasurement.ring_sky_missing` / `FitOutcome.ring_sky_missing: usize`. `FitStarsOptions.ring_fwhm: Option<f64>`
+  (`None` = the plane's own frame FWHM). `stacking::ln::scale`: `RingGeometry::{PerSide, PairCommon}` (pub(crate),
+  default `PerSide` until phase C's decision); `PairCommon` hands both sides `ring_fwhm = max(F_R, F_T)` — the phase
+  computes each side's `c` after both sides are fitted (no second fit) and says how.
+- A4. `RefusalReason::Trailed`, declared after `MostlySaturated` (`Ord` kept; serde `"trailed"`; `RefusalReason::ALL`
+  13 → 14). There is NO per-star streak refusal (ruling Q1: a fitted-ecc line at 0.8 refuses 2–32 % of clean real fits
+  and the solver's own note puts 8–10 % on healthy frames — an elongated star is a real star, measured as such). The
+  trailed verdict is FRAME-LEVEL ONLY, from the refusal structure (a fit cannot contain a star longer than its
+  region): `fit::trail_share(refused) = (centreMoved + regionTooSmall + centreAtRim) / seeds judged` (A4-2), and
+  `fit::TRAIL_REFUSAL_SHARE: f64 = 0.5`, the majority rule of ruling Q5 (A4 step 2a: most detected sources
+  cannot be contained in a fit region; the derived clean-frame line does not separate, see the step's table); `TRAIL_VERDICT_MIN_SEEDS = 100` (the solver's `looks_trailed`
+  minimum, private there, so quoted, not pinned). When it fires, as 6b's defocused verdict: every fit the plane would
+  accept is refused `Trailed`, `c` None, the frame's weight inputs empty. ecc may be REPORTED beside the verdict,
+  never a gate. `FitStarsOptions.trail_verdict: bool` (true only on the measure path, as `defocus_verdict`);
+  `PlaneMeasurement.trailed: bool`, `.trail_share: f64`.
+
+#### Phase A1 — detection: σ_f propagation, the knot tests, the β sample from centred seeds (rulings A1–A4)
+
+Checklist: σ_f is read by the threshold and by the knot tests' z only; R-OSP-2's table was taken on the measured σ_f,
+which equals the propagated one on clean fields (D2: 1.00–1.04), so K = 6 stays; more seeds on nebula move F_field's
+first-pass candidates, `c`'s isolation and the β sample; the hot-pixel rule, the seed cap 24 576, `NoiseSource::None`
+→ no seeds (Review Focus 4) and the NaN border (Review Focus 1: the knot metrics skip absent pixels) are unchanged.
+`extended` now leaves `c`'s qualifiers and the frame statistic too (P3): `c` MAY move on frames with extended sample
+seeds (M42: 13–24 of 64 in D2) — expected, proof-tabled with the qualifiers it lost; the A3 byte-identity gate is
+unaffected (it compares A2's head with A3's). The knot exemption reads `SaturationPlane` (Task 8's owned range; if
+measure_plane builds it after detection today, A1 moves its construction earlier, same inputs) — no new maximum.
+
+- [ ] **Step 1: Write the failing tests** (`seeds.rs` tests; the β-sample and extended-seed tests in `mod.rs`)
+
+```rust
+use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
+
+/// A noiseless round star of FWHM `fwhm` and peak 1 at (x, y) on an n × n zero plane: Moffat of `beta`, or Gaussian.
+fn round_star(n: usize, x: f64, y: f64, fwhm: f64, beta: Option<f64>) -> Vec<f32> {
+    match beta {
+        Some(b) => {
+            let a = fwhm / (2.0 * (2f64.powf(1.0 / b) - 1.0).sqrt());
+            moffat_field(n, n, &[MoffatStar { x, y, amp: 1.0, alpha_x: a, alpha_y: a, theta: 0.0 }], b, 0.0)
+        }
+        None => gaussian_field(n, n, &[(x, y, 1.0)], fwhm / GAUSSIAN_FWHM_PER_SIGMA, 0.0),
+    }
+}
+
+/// Controller arithmetic (a replica of D2's metric): Moffat β 1.5 at the field width reads plain / zero-sum
+/// 0.9113 / 0.8854 at F 1.2, 0.9716 / 0.9351 at F 2.6, 0.9725 / 0.9328 at F 5, 0.9726 / 0.9326 at F 8.
+#[test]
+fn knot_bounds_are_a_moffat_one_and_a_half_star_at_the_field_width() {
+    for (fwhm, plain, zero_sum) in [(1.2, 0.9113, 0.8854), (2.6, 0.9716, 0.9351), (5.0, 0.9725, 0.9328), (8.0, 0.9726, 0.9326)] {
+        let b = knot_bounds(fwhm);
+        assert!((b.plain - plain).abs() < 0.002 && (b.zero_sum - zero_sum).abs() < 0.002, "F {fwhm}: {b:?}");
+    }
+}
+
+/// Real profiles at the field width are stars at every SNR (replica: Moffat 2.5 reads 0.9025 / 0.8921, the widest).
+#[test]
+fn star_profiles_are_neither_structure_nor_extended() {
+    for fwhm in [2.6, 5.0] {
+        let bounds = knot_bounds(fwhm);
+        for beta in [Some(2.5), Some(4.0), None] {
+            let d = round_star(121, 60.3, 59.8, fwhm, beta);
+            let unit = knot_metrics(&d, None, 121, 121, 60.3, 59.8, fwhm, 1.0);
+            for snr in [8.0, 2000.0] {
+                let m = knot_metrics(&d, None, 121, 121, 60.3, 59.8, fwhm, unit.snr / snr);
+                assert_eq!(knot_verdict(&m, bounds, DEFAULT_THRESHOLD, false), KnotVerdict::Star, "F {fwhm} β {beta:?} snr {snr}: {m:?}");
+            }
+        }
+    }
+}
+
+/// Replica: a Gaussian blob of FWHM 4F at SNR 8 reads plain 1.70, z(F) 3.99 < K (structure); of FWHM 3F at SNR 40,
+/// z(F) 26.6 ≥ K and zero-sum 1.48 (extended); a near-clip seed is exempt.
+#[test]
+fn a_faint_broad_blob_is_structure_and_a_bright_one_extended() {
+    let f = 5.0;
+    let bounds = knot_bounds(f);
+    let at_snr = |k: f64, snr: f64| {
+        let d = round_star(161, 80.3, 79.8, k * f, None);
+        let unit = knot_metrics(&d, None, 161, 161, 80.3, 79.8, f, 1.0);
+        knot_metrics(&d, None, 161, 161, 80.3, 79.8, f, unit.snr / snr)
+    };
+    let faint = at_snr(4.0, 8.0);
+    assert!(faint.z < DEFAULT_THRESHOLD, "{faint:?}");
+    assert_eq!(knot_verdict(&faint, bounds, DEFAULT_THRESHOLD, false), KnotVerdict::Structure);
+    assert_eq!(knot_verdict(&faint, bounds, DEFAULT_THRESHOLD, true), KnotVerdict::Star);
+    assert_eq!(knot_verdict(&at_snr(3.0, 40.0), bounds, DEFAULT_THRESHOLD, false), KnotVerdict::Extended);
+}
+
+/// The propagated σ_f is the filtered noise wherever the plane holds no structure (D2: 1.00–1.04). Controller
+/// arithmetic: a 3×3 binomial smoothing gives the 3-px kernel a gain Σ(k∗b)²/(Σk²·Σb²) = 2.323² (simulated 2.337).
+#[test]
+fn propagated_noise_is_the_filtered_noise_on_white_and_correlated_noise() {
+    let (w, h, sigma) = (512usize, 512usize, 0.002f32);
+    let mut white = vec![0.05f32; w * h];
+    add_noise(&mut white, sigma, 11);
+    let tap = [1.0f32, 2.0, 1.0];
+    let smooth: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            let (mut s, mut k) = (0.0f32, 0.0f32);
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let (xx, yy) = (x + dx, y + dy);
+                    if xx >= 0 && yy >= 0 && xx < w as i64 && yy < h as i64 {
+                        let t = tap[(dx + 1) as usize] * tap[(dy + 1) as usize];
+                        s += t * white[yy as usize * w + xx as usize];
+                        k += t;
+                    }
+                }
+            }
+            s / k
+        })
+        .collect();
+    for (plane, gain) in [(&white, 1.0), (&smooth, 2.33)] {
+        let n = seeds::detection_noise(&working(plane), w, h, None, 3.0);
+        assert!((n.median() / n.measured - 1.0).abs() < 0.04, "propagated {} vs measured {}", n.median(), n.measured);
+        assert!((n.gain / gain - 1.0).abs() < 0.10, "gain {} vs {gain}", n.gain);
+    }
+}
+
+/// Smooth structure the 128-px mesh cannot follow (2σ·sin·sin, period 40 px) reaches the measured σ_f (the filter
+/// integrates it) but neither the propagated σ_f nor the gain. Controller arithmetic (numpy, 3-px kernel): measured
+/// 4.73 σ, the mesh's per-cell clipped σ 1.45 σ.
+#[test]
+fn smooth_structure_reaches_the_measured_noise_but_not_the_propagated_one() {
+    let (w, h, sigma) = (512usize, 512usize, 0.002f32);
+    let tau = std::f64::consts::TAU;
+    let mut data: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f64, (i / w) as f64);
+            0.05 + (2.0 * sigma as f64 * (tau * x / 40.0).sin() * (tau * y / 40.0).sin()) as f32
+        })
+        .collect();
+    add_noise(&mut data, sigma, 5);
+    let n = seeds::detection_noise(&working(&data), w, h, None, 3.0);
+    let px = sigma as f64 * ADU_SCALE as f64;
+    assert!(n.measured > 3.0 * px, "measured {} vs σ {px}", n.measured);
+    assert!(n.median() > 1.2 * px && n.median() < 1.7 * px, "propagated {} vs σ {px}", n.median());
+    assert!((0.95..1.10).contains(&n.gain), "the gain is the noise's, not the sky's: {}", n.gain);
+}
+
+/// The 150-star clean fixture: every star still seeded, nothing dropped or extended, σ_f propagated = measured.
+#[test]
+fn propagated_detection_noise_equals_the_measured_one_on_a_clean_field() {
+    let (data, w, h) = fixture_field(7, 1.0, 0.002);
+    let scaled = working(&data);
+    let (noise, _) = domain::noise_model(&scaled, w, h, None);
+    let (seeds, _, rep) = seeds::detect(&scaled, w, h, &noise, DEFAULT_THRESHOLD, 24576, None, None);
+    assert_eq!(seeds.len(), 150);
+    assert!((rep.sigma_f / rep.sigma_f_measured - 1.0).abs() < 0.04, "{rep:?}");
+    assert_eq!(rep.structure_dropped, 0);
+    assert!(rep.extended.iter().all(|&e| !e), "{rep:?}");
+}
+
+// mod.rs tests
+/// Ruling A4 (D2: on the trailed L 0010 all 64 sample seeds were trail segments the fit refuses): the β sample takes
+/// only seeds whose verdict fit stays centred. RED today: the 25 bright seeds, each 1.8 px off its β-1.8 star (over
+/// the 1.5-px centre tolerance), join the sample and pull the frame β to ≈ 1.8. Premise check first: if HEAD already
+/// reads β within 0.3 of 4, this is a pin — STOP with the numbers.
+#[test]
+fn beta_sample_takes_only_seeds_whose_verdict_fit_stays_centred() {
+    use crate::test_support::{add_noise, integrated_field, IntegratedProfile};
+    let (w, h) = (480usize, 400usize);
+    let at = |i: usize| (40.0 + (i % 8) as f64 * 57.0, 40.0 + (i / 8) as f64 * 80.0);
+    let bright: Vec<(f64, f64, f64)> = (0..25).map(|i| { let (x, y) = at(i); (x, y, 0.4) }).collect();
+    let faint: Vec<(f64, f64, f64)> = (25..40).map(|i| { let (x, y) = at(i); (x, y, 0.2) }).collect();
+    let a = integrated_field(w, h, &bright, IntegratedProfile::Moffat { fwhm: 5.0, beta: 1.8 }, 5, 0.05);
+    let b = integrated_field(w, h, &faint, IntegratedProfile::Moffat { fwhm: 5.0, beta: 4.0 }, 5, 0.0);
+    let mut data: Vec<f32> = a.iter().zip(&b).map(|(p, q)| p + q).collect();
+    add_noise(&mut data, 0.002, 21);
+    let seeds: Vec<Seed> = bright.iter().map(|&(x, y, p)| Seed { x: x + 1.8, y, peak: p, flux: 2.0 })
+        .chain(faint.iter().map(|&(x, y, p)| Seed { x, y, peak: p, flux: 1.0 }))
+        .collect();
+    let m = measure_plane(&data, w, h, &MeasureOptions { seeds: SeedSpec::Given(seeds), diagnostics: true, ..Default::default() }, None);
+    assert!((m.beta - 4.0).abs() < 0.3, "frame β {} from the 15 centred stars", m.beta);
+    assert!(m.diagnostics[..25].iter().all(|d| d.sample_beta.is_none()), "no displaced seed in the sample");
+    assert!(m.diagnostics[25..].iter().filter(|d| d.sample_beta.is_some()).count() >= 8);
+}
+
+/// Ruling P3 (D2's full proposal): an `extended` seed stays a seed and is fitted, but leaves `c`'s qualifiers and the
+/// frame FWHM/ecc statistic as it leaves the β sample — the saturation flag's treatment. A Gaussian blob of FWHM 3F
+/// (F = 4.35 px, `grid30(5.0)` at β 4) and peak 0.05 (25σ; zero-sum ratio ≈ 1.48, the extended replica above) sits
+/// ≈ 50 px from its four neighbours (outside `c`'s 6F isolation). RED today: the blob's accepted fit is a 31st
+/// qualifier and pulls the frame FWHM. Premise check first: if HEAD refuses the blob's fit (no 31st qualifier, frame
+/// FWHM already within 1 %), this is a pin — STOP with the numbers.
+#[test]
+fn an_extended_seed_leaves_cs_qualifiers_and_the_frame_statistic() {
+    use crate::test_support::{add_noise, gaussian_field};
+    let stars = grid30(5.0);
+    let plane = |blob: bool| {
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        if blob {
+            let f = 2.0 * 5.0 * (2f64.powf(0.25) - 1.0).sqrt();
+            let g = gaussian_field(480, 400, &[(95.3, 94.8, 0.05)], 3.0 * f / 2.354_820_045, 0.0);
+            for (d, b) in data.iter_mut().zip(g) { *d += b; }
+        }
+        add_noise(&mut data, 0.002, 35);
+        let opts = MeasureOptions { seeds: SeedSpec::MatchedFilter { threshold: DEFAULT_THRESHOLD }, psf_model: PsfModel::Fixed(4.0), ..Default::default() };
+        measure_plane(&data, 480, 400, &opts, None)
+    };
+    let (base, m) = (plane(false), plane(true));
+    assert_eq!(base.aperture_stars, 30, "premise: the 30 stars qualify without the blob");
+    assert_eq!(m.aperture_stars, 30, "the extended blob is not a qualifier");
+    let (fb, fm) = (base.frame.fwhm_px.unwrap(), m.frame.fwhm_px.unwrap());
+    assert!((fm / fb - 1.0).abs() < 0.01, "frame FWHM {fm} vs {fb} without the blob");
+    let blob = m.stars.iter().find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0).expect("the blob is seeded and fitted");
+    assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
+}
+```
+
+- [ ] **Step 1b: One mesh per plane (ruling Q4; a refactor with no behaviour change).** The mesh map is computed ONCE
+  per plane and shared: today `domain.rs:93` (`background_residual`, N*) and `seeds.rs:487` (the matched filter's
+  background, now also σ_f's per-cell noise map) call `estimate_background_mesh` on the same plane at the same cell
+  size, twice. A shared `domain::background_mesh` result is passed to both; consumers follow the code: N* (through
+  `domain::background_residual`) and the matched filter / σ_f / the knot metrics (through the filtered plane); the
+  saturation test reads `SkyLevel.median` (the stratified sample), NOT the mesh. A test pins the refactor: seeds and N*
+  bit-identical to the pre-refactor head on the v2 quick manifest and the unit fixtures (a moved bit is a STOP, not
+  a re-pin). The two calls are masked differently today (seeds.rs masks the plane first): the phase says whether the
+  shared map is the masked or the unmasked one and proves the bit-identity either way before any σ_f code lands.
+  **As built (ruling D-1, 2026-10-12):** the shared map is the masked one; on a MASKED plane `N*` therefore reads the masked
+  mesh (an absent pixel is not sky; no production caller passes a mask today), a recorded change from the pre-Q4 value,
+  pinned by `on_a_masked_plane_n_star_reads_the_masked_mesh`. Unmasked planes are bit-identical.
+- [ ] **Step 2: Run, fail, implement, run** (`cargo test -p athenaeum-core --lib -- star_measure --test-threads=4`, then
+  core `--all-targets`, `--no-default-features`). Start from D2's prototype (Files: Reuse) — port its metrics, bounds
+  and gain read, then make the tests pass. The probe's frame and star lines gain A1's fields.
+- [ ] **Step 3: Proof table** (release `star_probe`, base `t10-scratch/star_probe.base`-style build at fee44d50, 3
+  interleaved runs): LDN_1272 mono + OSC `_0000_d`, hc11B L 0000 / 0010 / 0011 (the ERP replica set
+  `~/.athenaeum-acc/star-lab-a/t10b/erp-l0010/`), M42 mono2 0000 / 0008 / 0010 — seeds, `structureDropped`,
+  `extendedSeeds` (and extended in the β sample), `sigmaF` / `sigmaFMeasured` / `noiseGain`, fits, β, F_field, `c` +
+  `apertureStars`, Measure wall. Expected from D2 (not a bar): M42 seeds and injected found up, L 0010's sample no longer
+  trail segments. WIP commit.
+
+#### Phase A2 — the field width (ruling A5; designed here, judged in C)
+
+Checklist: F_field is read by the second pass's kernel, the width-start box ⌈2·F_field⌉ (PA-12) and so every region,
+the donut test's box, `c`'s isolation 6·F_field, the knot bounds and the knot kernels (A1), and `field_width_of` for
+given seeds (LN, Register); a change moves F-1's rows on every family, so they are re-read in C. D2: 8.2–8.8 px on M42
+vs a fitted 1.7–2.4, 10.7 vs 5.6–7.0 on hc11B L 0000 / 0008 (saturated stars and the brightest candidates);
+at the fitted F, M42 finds 57 / 62 / 60 injected stars.
+
+- [ ] **Step 1: Design on numbers, not bars.** The phase may probe the inject frames and the `sharp/*`, `saturated/*`
+  and `background/*` families as a design run (named `t10b-a2-design`, never a bar read), then picks the rule.
+- [ ] **Step 2: The truth tests the phase writes in full before the code** (`seeds.rs`): (a)
+  `field_width_reads_the_stars_width_when_the_brightest_hundred_are_saturated` (100 clipped stars among 300 of FWHM 2.4:
+  F_field within 10 % of the unsaturated stars' width); (b) `field_width_reads_the_stars_width_on_structured_sky`
+  (compact sky bumps among the brightest candidates: within 10 %); (c) `field_width_of_given_seeds_follows_the_same_rule`
+  (I-4); PA-17's 10 % test and PA-18's border geometry kept unedited. A test the old rule passes is a pin (F28).
+- [ ] **Step 3: Implement, run, proof table** as A1 step 3 plus F_field / frame FWHM per frame; PA-17's ruling text
+  updated with the rule and the numbers it was chosen on. WIP commit.
+
+#### Phase A3 — one aperture-scale sky and noise per star; `c` reads B_i; the LN ring switch (rulings B1–B4)
+
+Checklist: B_i's inputs are the frame FWHM (F-4's statistic over unsaturated fits), the seed set (A1/A2) and the
+mask / footprint; its readers are `c` now and Task 11's SNR / HFR later; `annulus_sigma` stays only as a test-backed
+function with no SNR reader (B4); `c` must not move — this phase is a refactor for `c`, and a moved `c` is a STOP.
+
+- [ ] **Step 1: Write the failing tests** (`mod.rs` / `photometry.rs` tests; `grid30`, `seeds_of`, `median` are the
+  module's test helpers)
+
+```rust
+/// Rulings B2, B4: every accepted fit carries B_i (R6's ring) and σ_i. Flat sky 0.05, noise 0.002, β 4, FWHM 4.35:
+/// the ring 43.5–52.2 px holds ≈ 2615 pixels; B_i within 4 SE of the sky, σ_i within 6 % (4 SE) of the noise.
+#[test]
+fn every_accepted_fit_carries_its_ring_sky_and_noise() {
+    let stars = grid30(5.0);
+    let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+    add_noise(&mut data, 0.002, 31);
+    let m = measure_plane(&data, 480, 400, &MeasureOptions { seeds: SeedSpec::Given(seeds_of(&stars)), psf_model: PsfModel::Fixed(4.0), ..Default::default() }, None);
+    assert_eq!(m.stars.len(), 30);
+    let (sky, noise) = (0.05 * ADU_SCALE as f64, 0.002 * ADU_SCALE as f64);
+    let f = m.frame.fwhm_px.unwrap();
+    let full = std::f64::consts::PI * ((12.0 * f).powi(2) - (10.0 * f).powi(2));
+    for s in &m.stars {
+        let n = s.sky_ring_n as f64;
+        assert!(n > 0.97 * full && n < 1.03 * full, "{n} of {full}");
+        assert!((s.sky_ring - sky).abs() < 4.0 * noise / n.sqrt(), "B_i {} vs {sky}", s.sky_ring);
+        assert!((s.sky_ring_sigma / noise - 1.0).abs() < 0.06, "σ_i {} vs {noise}", s.sky_ring_sigma);
+        assert_eq!(s.sky_offset(), s.background - s.sky_ring);
+    }
+    assert_eq!(m.ring_sky_missing, 0);
+}
+
+/// Ruling B2: `c` reads each qualifier's stored B_i — recomputed here from the stored fields and the plane alone, it is
+/// the plane's `c`. The replica's growth rule: every pixel whose CENTRE lies within 5F of the fit's centre, the value
+/// in f32 working units (`v * ADU_SCALE`, the module's conversion) widened to f64, minus B_i, summed in row-major
+/// order. The tolerance 1e-6 covers a different summation order; if the product's rule differs in the disc or the
+/// units, the replica copies the product's rule — the tolerance is never widened.
+#[test]
+fn aperture_correction_is_the_growth_over_the_stored_ring_sky() {
+    let stars = grid30(5.0);
+    let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+    add_noise(&mut data, 0.002, 32);
+    let m = measure_plane(&data, 480, 400, &MeasureOptions { seeds: SeedSpec::Given(seeds_of(&stars)), psf_model: PsfModel::Fixed(4.0), ..Default::default() }, None);
+    assert_eq!(m.aperture_stars, 30);
+    let (f, w) = (m.frame.fwhm_px.unwrap(), 480usize);
+    let r2 = (5.0 * f).powi(2);
+    let c = median(m.stars.iter().map(|s| {
+        let growth: f64 = (0..400 * w)
+            .filter(|&i| ((i % w) as f64 - s.x).powi(2) + ((i / w) as f64 - s.y).powi(2) <= r2)
+            .map(|i| (data[i] * ADU_SCALE) as f64 - s.sky_ring)
+            .sum();
+        growth / model_flux_in_fwtm(s)
+    }));
+    assert!((c / m.aperture_correction.unwrap() - 1.0).abs() < 1e-6, "{c} vs {:?}", m.aperture_correction);
+}
+
+/// B_i is every accepted star's (its present ring pixels); `c`'s qualifier rule stays `c`'s: a star whose 12F disc
+/// leaves the plane has a B_i over its partial ring and is not a qualifier.
+#[test]
+fn an_edge_star_has_a_ring_sky_but_does_not_qualify_for_c() {
+    let mut stars = grid30(5.0);
+    stars.push(MoffatStar { x: 20.0, y: 25.0, ..stars[0] });
+    let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+    add_noise(&mut data, 0.002, 33);
+    let m = measure_plane(&data, 480, 400, &MeasureOptions { seeds: SeedSpec::Given(seeds_of(&stars)), psf_model: PsfModel::Fixed(4.0), ..Default::default() }, None);
+    assert_eq!(m.stars.len(), 31);
+    let edge = m.stars.iter().find(|s| (s.x - 20.0).abs() < 1.0 && (s.y - 25.0).abs() < 1.0).unwrap();
+    let f = m.frame.fwhm_px.unwrap();
+    let full = std::f64::consts::PI * ((12.0 * f).powi(2) - (10.0 * f).powi(2));
+    let n = edge.sky_ring_n as f64;
+    assert!(n >= 8.0 && n < 0.75 * full, "{n} of {full}");
+    assert!((edge.sky_ring - 0.05 * ADU_SCALE as f64).abs() < 4.0 * 0.002 * ADU_SCALE as f64 / n.sqrt());
+    assert_eq!(m.aperture_stars, 30, "the edge star is not a qualifier");
+}
+
+/// Ruling B3's arm: a given ring width sets every ring (and `c`'s growth radius); at F 4 the ring 40–48 px holds
+/// ≈ 2212 pixels, while the plane's own F 2.61 gives ≈ 940.
+#[test]
+fn a_given_ring_width_sets_every_ring() {
+    let stars = grid30(3.0);
+    let mut unit = moffat_field(480, 400, &stars, 4.0, 0.05);
+    add_noise(&mut unit, 0.002, 34);
+    let data: Vec<f32> = unit.iter().map(|v| v * ADU_SCALE).collect();
+    let own = fit_stars_at(&data, 480, 400, &seeds_of(&stars), 4.0, &FitStarsOptions::default(), None);
+    let common = fit_stars_at(&data, 480, 400, &seeds_of(&stars), 4.0, &FitStarsOptions { ring_fwhm: Some(4.0), ..Default::default() }, None);
+    let ring = std::f64::consts::PI * (48.0f64.powi(2) - 40.0f64.powi(2));
+    assert!(common.fits.iter().all(|f| (f.sky_ring_n as f64 / ring - 1.0).abs() < 0.03));
+    assert!(own.fits.iter().all(|f| (f.sky_ring_n as f64) < 0.5 * ring));
+    assert!(own.aperture_correction.is_some() && common.aperture_correction.is_some());
+}
+```
+
+- [ ] **Step 2: Run, fail, implement, run** (as A1). LN: `RingGeometry` with both arms, `PerSide` default;
+  `ln_scale_probe --ln-ring` prints which arm ran.
+- [ ] **Step 3: The `c` gate.** `star_probe` at A2's head vs this head over v2's quick manifest + the inject frames:
+  every plane's `apertureCorrection` and `apertureStars` byte-identical (B_i on a qualifier is R6's b by construction);
+  a moved `c` is a STOP with the first plane and its mechanism. Proof table: per frame median σ_i / σ_MRS, median and
+  p90 of `skyOffset` / σ_i, `ringSkyMissing`. WIP commit.
+
+#### Phase A4 — the trailed verdict from the refusal structure (ruling A6, its addendum, and Q1–Q2)
+
+Checklist (checked first, at fee44d50): the measure path has NO trail verdict (`trail` greps to 0 over `star_measure/`,
+`stacking/measure.rs`, `psf_signal.rs`, `weights.rs`); the stacking selection has no eccentricity, FWHM or star-count
+gate; the program's existing trail definitions are the plate solver's point-like line and share rule (`looks_trailed`)
+and the Analysis-based plate-solve input gate (median ecc AND trail R², Plan C) — NONE is reused as a per-star
+refusal (Q1: the line refuses real, elongated stars; `RefusalReason::Streak` does not exist). The signal is the
+refusal structure the fits already produce: a trail longer than its region cannot be contained, so its seeds end
+`centreMoved` / `regionTooSmall`. Readers of the verdict: the frame's `stars` (empty), `c` (None), the weights (PSF
+signal weight → 0 of the group), `stars_refused` by reason. Before the code, render and label the 7 wind-shaken
+`trails/` frames (the owner's lesson: look at the outlier frame first); 10b-L labels the inject frames and L 0011
+(classes per R1/Q2: `trailed` / `elongated` / clean).
+
+- [ ] **Step 1: Write the failing tests** (`mod.rs` tests). Fixtures: `trail`, `fixture` as below (trails of 20 px,
+  round Moffat stars; the same builders as before), the assertions re-expressed for the frame-level verdict:
+
+```rust
+/// 120 trails and 5 round stars: 125 judged seeds, the trails' fits end centreMoved / regionTooSmall / centreAtRim above the
+/// derived share → the plane is trailed, keeps no star, `c` is None. No `Streak` reason exists.
+#[test]
+fn a_plane_of_trails_is_trailed_by_its_refusal_share_and_keeps_no_star() {
+    let (data, seeds) = trail_plane_fixture(540, 420, 5, 120, 42);
+    let m = measure_plane(&data, 540, 420, &MeasureOptions { seeds: SeedSpec::Given(seeds), ..Default::default() }, None);
+    assert!(m.trailed);
+    assert!(m.trail_share >= fit::TRAIL_REFUSAL_SHARE, "{}", m.trail_share);
+    assert!(m.stars.is_empty());
+    assert_eq!(m.refused.by_reason.get(&RefusalReason::Trailed).copied().unwrap_or(0) > 0, true);
+    assert_eq!(m.aperture_correction, None);
+}
+
+/// Under 100 judged seeds there is no verdict, however many fits end centreMoved / regionTooSmall / centreAtRim.
+#[test]
+fn fewer_than_the_minimum_judged_seeds_is_never_trailed() {
+    let (data, seeds) = trail_plane_fixture(420, 310, 5, 15, 41);
+    let m = measure_plane(&data, 420, 310, &MeasureOptions { seeds: SeedSpec::Given(seeds), ..Default::default() }, None);
+    assert!(!m.trailed);
+}
+
+/// Elongated stars (eccentricity 0.7, the lab's most elongated `shape` family, and a G 0003-like 0.65 field) are
+/// stars: no verdict, none refused for their shape, all 120 kept.
+#[test]
+fn elongated_stars_are_measured_as_is_with_no_verdict() {
+    let (ax, ay) = (2.6 / 0.714 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt()), 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt()));
+    let stars: Vec<MoffatStar> = (0..120).map(|i| MoffatStar { x: 30.0 + 40.0 * (i % 12) as f64, y: 30.0 + 40.0 * (i / 12) as f64, amp: 0.2, alpha_x: ax, alpha_y: ay, theta: 0.5 }).collect();
+    let mut data = moffat_field(500, 420, &stars, 4.0, 0.05);
+    add_noise(&mut data, 0.002, 43);
+    let m = measure_plane(&data, 500, 420, &MeasureOptions { seeds: SeedSpec::Given(seeds_of(&stars)), ..Default::default() }, None);
+    assert!(!m.trailed);
+    assert_eq!(m.stars.len(), 120);
+}
+```
+
+  (`trail_plane_fixture(w, h, round, trails, seed)` is `fixture` laid out on the 13-column grid of the previous
+  version of this test; the phase writes it in full.) No test names a `Streak` reason or the solver's eccentricity
+  line; the `solver`-feature pin of `MAX_ECCENTRICITY` is dropped with the line.
+
+- [ ] **Step 2a: The derived line, before any code (a STOP rule).** The share of seeds refused `centreMoved` +
+  `regionTooSmall` is computed from existing outputs — D2's `t10-scratch/d2/out/base3` (the same product code as
+  t10-f5-r2; the `~/.athenaeum-acc/star-lab-inject/probe` dirs carry no refusal records and add nothing) — on every
+  clean real and lab frame, and the line is median + 5·1.4826·MAD of that distribution, required to separate L 0010
+  / L 0011 (verdict) from G 0003 and every clean frame (no verdict). Computed 2026-10-11 on the dev Mac (measure
+  path, share = refused-of-those-two-kinds / seeds):
+
+  | frames / families | share |
+  | ---- | ---- |
+  | L 0010 (`trailed`) | 21 939 / 24 576 = 0.893 |
+  | lab `trails` (a `trailed` family) | 116 / 317 = 0.366 |
+  | G 0003 (`elongated`) | 829 / 2129 = 0.389 |
+  | clean real: LDN 1272 0077 / 0099 / 0127 | 0.024 / 0.041 / 0.054 |
+  | clean real: hc11B G 0001 / 0002, L 0000 / 0008 | 0.074 / 0.138, 0.083 / 0.077 |
+  | clean real: M42 mono2 0000 / 0008 / 0010 | 0.058 / 0.064 / 0.071 |
+  | clean lab: `doubles/f4.0` / `/f2.6`, `halo`, `density/d1000` | 0.151 / 0.093, 0.047, 0.011 |
+  | clean lab: every other family (≈ 45 cells; `sharp/*`, `shape/*`, `coma`, `fieldpsf`, `background/*`, …) | 0.000–0.006 |
+
+  Result: over every clean frame (59) median = MAD = 0, so the line is 0.000 (degenerate: the lab families are
+  almost all zero); over the 10 clean real frames alone it is 0.067 + 5·1.4826·0.0116 = 0.153. NEITHER separates the
+  verdicts from G 0003 (0.389 > 0.153), and the lab `trails` family (0.366) sits below G 0003, so no derived line puts
+  the lab trails over G 0003 either. The derivation does not separate as written: A4 STOPS here with this table to the
+  controller before any code (the gap 0.389–0.893 exists for the real frames, but a line inside it is chosen, not
+  derived; L 0011 is not in the table — its share is the first row A4 adds). The options for the controller, with the
+  numbers: a second signal for the verdict (the refusal structure's `regionTooSmall` alone, or the share among seeds
+  of SNR ≥ 10, each computed on the same outputs), a derived line over the REAL trailed vs elongated frames with the
+  n = 1 caveat stated, or the verdict reported without a gate. ecc is never the gate (Q1).
+
+  **Controller ruling Q5 (2026-10-11).** The lab `trails` family is seven wind-shaken frames whose stars are elongated
+  but measurable: it is class `elongated`, like G 0003, not `trailed`. The verdict line is the MAJORITY rule, share
+  > 0.5: most of the frame's detected sources cannot be contained in a fit region. That is a physical criterion, not a
+  number fitted to one frame. On the table above it gives no verdict on every clean frame (≤ 0.151) and on both
+  elongated cases (0.366, 0.389), and a verdict on L 0010 (0.893). A4 adds L 0011 as its first row: L 0011 at or below
+  0.5 → STOP with the table. The rule rests on n = 1 real trailed frame, so phase L2 adds a synthetic long-trail family
+  on the runner: streak lengths from 2F to 300F at three PSF widths, with the share measured against streak length. The
+  crossing of 0.5 is expected near a streak length of one fit-region diameter. It is reported in C; it is not a bar.
+  `fit::TRAIL_REFUSAL_SHARE = 0.5`, documented with this rationale.
+- [ ] **Step 2b: Run, fail, implement, run** once step 2a is ruled. The verdict reads the share of the verdict fits'
+  refusals (or, if the controller rules a pre-fit signal, the signal's own computation); whether it is decided
+  before the verdict fits (saving L 0010's 24 576 fits) is the phase's choice; the F-0 identity holds either way (a
+  seed the verdict pre-empts is refused `Trailed`).
+- [ ] **Step 3: Proof table** on the 12 hc11B L frames of 2024-10-06 (the ERP replica set) and the 7 `trails/` frames:
+  class, seeds, refusal share, fits, `trailed`, PSF signal weight, `c` + `apertureStars`, with the ERP's numbers and
+  the plate solver's own verdict beside, and A3 head's fits per frame beside A4's (T.4 reads this phase's own delta);
+  G 0003's share and ecc (T.8). On the dev Mac also (R3: LDN 1272 is not on the runner): LDN 1272's `c`
+  frame-to-frame sd over its calibrated frames at A4's head vs fee44d50 (RF7's 2.02 %; reported, with M.2). WIP commit.
+
+#### Phase L — 10b-L, the lab families (runner; done 2026-10-11, lab f95cd1a)
+
+Checklist: each new family's truth sanity line before it referees; inject frames labelled by rendered class before
+any of them judges `c`, β or a background (a trailed frame is never a referee).
+
+Handoff `/Volumes/Universe/athenaeum-runner/handoffs/task-10b-L-handoff.md`: (a) psfSel pairs on nebula sky, (b)
+B-spline-warped targets, (c) injection with the frame's own PSF, (d) a knots family, (e) density × nebula, (f) real-sky
+stability rows; truth sanity per family, an ERP column for the new synthetic families, and one proof run at fee44d50 —
+the "before" every new row of phase C is judged against. Phase C also needs the frames labelled by class, R1's three:
+`trailed` (L 0010, L 0011), `elongated` (G 0003 — 10b-L's conservative "trailed" label becomes `elongated`), clean;
+the 7 `trails/` frames and every inject frame — the label tooling is L2's. Done (lab f95cd1a, report
+`handoffs/task-10b-L-report.md`): every family built; LDN 1272 NOT built (no frame on the runner: its rows run on the
+dev Mac, reported, R3); L 0011 not among the 21 labelled frames (L2). A family that is not built is reported as not
+built; its rows below turn `reported`, never half a referee.
+
+#### Phase L2 — lab tooling (runner, after A4's interfaces are fixed; review finding 12)
+
+Checklist: C's agent runs one command per step and is never blocked on tooling; Task 10's lab-cycle-tool brief is the
+precedent (one tooling agent, its own report, a suite run). Nothing here reads a bar.
+
+- [ ] **Step 1: The scorecard and the probe readers learn A1–A4's surface:** the reason `trailed`
+  (`RefusalReason::ALL` 13 → 14 breaks the scorecard's reason enumeration — the `fit outcomes` identity must count
+  them); the `extended` flag (a star-line flag, kept out of the β-sample and `c`-qualifier readers as `saturated`
+  is); the frame keys A1–A4 add to `star_probe` (`sigmaF`, `sigmaFMeasured`, `noiseGain`, `structureDropped`,
+  `extendedSeeds`, `trailed`, `trailShare`, and whatever the phases name) and the star keys (`skyRing`, `skyRingSigma`,
+  `skyRingN`, `skyOffset`, flag `extended`).
+- [ ] **Step 2: The rows C reads that no tool prints yet:** K.3's dropped / extended split by (size, amplitude) bin
+  with K.1's per-bin expected pass rate beside (the knot tests' arithmetic, D2's `knots.py` replica); a verdict
+  column for the T rows (frame, class, verdict, refusal share, the solver's verdict); W.1's injected-above-threshold
+  count per frame (the raw-mode truth rule's computation); I.1's per-frame Δ against 10b-L's before with SE_c; P.1's
+  Δ against the flat control with the < 20-matched n/a rule; S.1's sd with n and the derived factor.
+- [ ] **Step 3: The driver and the data:** the `--ln-ring per-side|pair-common` arm in the LN driver (one probe run
+  per arm); the 7 `trails/` frames and the 12 hc11B L replica frames on the runner with their classes; L 0011
+  rendered and labelled; `star-lab/frame-classes.json` gains `elongated` (G 0003) and L 0011.
+- [ ] **Step 4: Suite + one dry run** of every new reader on t10-f5-r2's outputs (byte-identical rows where the
+  surface is unchanged); lab commit and push; a short report.
+
+#### Phase C — one joint lab cycle `t10b-onebg` (runner, judgment run)
+
+Checklist: every upstream quantity is re-read in this one cycle — seeds (D, K, N), the field width (W), the fits
+(F.0–F.7, D.8), the frame β (F-3, F-4; the M42 β reported, S.3), B_i and σ_i (B), `c` (C1, I.1, S.1, T.3), trails
+(T); a row that moves outside the design list is a STOP, never a design-list edit after the run. Frame classes (R1):
+the `elongated` G 0003 and the `trailed` L 0010 / L 0011 sit in no clean pooled row (W.2, I.1, S.1, S.2, B); every
+bar below is derived from data or from the PSF and the noise before the run, or reported with its reason (R2).
+
+- [x] **Step 0: Runner baselines, before the run (ruling R3).** At t10-f5-r2's binary (fee44d50's product code), one
+  job at a time on an otherwise idle runner: (a) the m42 corpus `measure` batch wall — M.1's base (the dev Mac's
+  223.1 s is printed beside, never compared); (b) `c`'s frame-to-frame sd per dataset over its clean frames (M42's 12
+  calibrated frames, hc11B L, G, the M42 inject frames) — S.1's base, 10b-L (f)'s values beside. Written to
+  `results/plan-a/t10b-onebg/baseline-runner.txt` and committed before step 2. LDN 1272 is not on the runner: its rows
+  are the dev Mac's (A4's proof table, M.2), reported.
+- [x] **Step 1: Bars and design list first.** `results/plan-a/t10b-onebg/{bars.py,design.json}` encode the table below;
+  run against t10-f5-r2's outputs, 10b-L's before and step 0 → `bars-baseline.txt` (C1.1–C1.4 pass on t10-f5-r2; every
+  new row prints its before). D2 measured recall with its own matcher: where its HEAD number and the scorecard's
+  t10-f5-r2 cell differ by more than 0.01 the controller reconciles BEFORE step 2 (a matcher difference, never a bar
+  move); D.1's floors are then computed at the scorecard cell's n (D2's arm − 2 SE), and K.1's per-bin expected pass
+  rate from A1's bounds by the knot tests' own arithmetic (D2's `knots.py` replica, each bin's size and SNR) — both
+  printed in `bars-baseline.txt` before step 2.
+  Design list: row 1 (`completeness`, `false detections`, `bright coverage`) on `seeds`, `measure`, `betas@*` set aside
+  (judged below; `fit outcomes` stays the F-0 gate); rows 3–7 and 11 on `measure` and `betas@*` set aside on
+  `background/*`, `density*`, `doubles/*`, `saturated/*` and the 10b-L families, one-sided everywhere else (row 2's keys
+  per F10, row 3 `kernel growth` `["scatter"]`); row 6 `captured fraction` set aside (C1.1); register row 1 reported,
+  row 2 one-sided (F10); row 10 judged by F-3's bar; LN: the C1.2–C1.4 cells and P.1/P.2 judged, every other arm
+  reported (PA-14); the legacy control 0 mismatches. Anything else that moves → STOP with the first ≤ 10 rows and a
+  mechanism.
+- [x] **Step 2: Run** at A4's head, one job at a time: `python3 bin/lab_cycle.py --step t10b-onebg --prev t10-f5-r2
+  --base-probe-dir <t10-f5-r2's probe dir> --inject --bars results/plan-a/t10b-onebg/bars.py --design
+  results/plan-a/t10b-onebg/design.json --jobs <n>`, plus the 10b-L manifests, the LN probe once per `--ln-ring` arm,
+  the 12 hc11B L replica frames, the 7 `trails/` frames (classes from L2), and the m42 corpus `measure` batch (M.1).
+- [x] **Step 3: Read the bars.** A miss is a STOP with ≤ 10 lines of evidence, never a re-run with changed flags. B3's
+  rule (P.3) is applied as written. K7's predicted rows (D1's dumps) are printed beside R6's, no switch. A miss the
+  table already predicts (P.1 on `neb0.5`) is reported with its numbers like any other.
+
+| # | Cell | Bar | Baseline (source) |
+| ---- | ---- | ---- | ---- |
+| C1.1–C1.4 | Task 10's C1 cells | verbatim | 0.76 / 1.38 %; +1.72 / +1.19 %; 0 of 70; 0 of 20 (t10-f5-r2, lab 39bb670) |
+| F.0–F.7 | F-0 `fit outcomes`; F-1 fitted/seeded at `sharp/m4/f8.0` and frame FWHM ≤ 1 % to F 16, donut accepted 0; F-2 axis order, angle eff ≤ 1.5; F-3 twins ≤ 1 % / Δβ ≤ 10 %, row 10 FN ≤ 0.5 %; F-4 ≤ 1 % / ≤ 3 %; F-7 ≤ 0.3σ neb, ±0.1σ flat; raw-mode injected ≥ 99 % | the spec's bars | all PASS at t09-f4 / t10-f5-r2 (angle eff 1.25, FN 0.098 %, `neb3_4096` −0.253σ) |
+| D.1 | row 1 `seeds` completeness `neb0.5`, `neb3`; false / Mpx | ≥ D2's arm minus 2 SE of the recall at the cell's n truth stars (0.777 − 0.034 = 0.743, 0.539 − 0.040 = 0.499 at v2 i0's n = 629; the usual one-sided ~2.3 % false-alarm level, Q3 — 1 SE would fail ~16 % of the time on noise alone; step 1 recomputes at the scorecard cell's n); ≤ 3 | 0.591, 0.343 (D2 HEAD); the arm 0.777, 0.539 (D2) |
+| D.2 | `halo` false seeds | ≤ 5 (D2's arm 2 + 2 Poisson SE) | 256 (D2) |
+| D.3 | completeness and false seeds on flat, grad10, vig20, `sharp/*`, `mixture/*`, `twins/*`, artefacts, coma, fieldpsf, `shape/*`, `saturated/*` | ≥ base − 0.005; false ≤ base | t10-f5-r2 |
+| D.4 | `twins/*`, artefacts `nothing` / Mpx | ≤ 0.5 (R-OSP-2) | 0.00 at K 6 (t06a) |
+| D.5 | `doubles/f2.6`, `/f4.0`, `d1000`; density pairs | ≥ base − 0.01; ≥ base − 0.03 | D2 HEAD 0.700 / 0.598 / 0.726; 0.907 |
+| D.6 | σ_f propagated / measured, flat and `twins/*` | 1.00 ± 0.04 (a flat-family move re-sweeps K, PA-2) | D2 1.00–1.04 |
+| D.7 | `neb3_4096` completeness, false / Mpx | reported | D2 0.364 / 0 → 0.565 / 67 |
+| D.8 | frame FWHM, ecc, `c` on flat, `sharp/*`, `density/*`, `twins/*` (the `extended` flag's reach, P3) | within SE of base | t10-f5-r2 |
+| K.1 | knots: accepted unflagged fits on truth knots, per (FWHM/F, peak) bin of FWHM ≥ 1.5F | ≤ the knot tests' expected pass rate at the bin's size and SNR (step 1, from A1's bounds) + 2 binomial SE at the bin's n; bins < 1.5F reported (the tests are blind there); the pooled ratio to base printed | 10b-L before: flat 80 % accepted (r0.75–r3 90–100 %, r5 57 %), `neb0.5` 31 %, `neb3` 0 seeded |
+| K.2 | knots: truth-star completeness | ≥ base − 0.01 | 10b-L before |
+| K.3 | knots: stars dropped / extended by size and amplitude bin | reported | — |
+| N.1 | density × nebula: completeness; false / Mpx; `c` qualifiers | ≥ base − 0.03; ≤ 3; ≥ 5 per plane | 10b-L before |
+| W.1 | M42 mono2 0000 / 0008 / 0010 injected found | per frame ≥ 99 % of the injected stars above the detection threshold at the frame's propagated σ_f (the raw-mode truth rule, F.0–F.7's computation); the plain found / injected reported | 42/60, 43/62, 38/62 (D2 HEAD); 57 / 62 / 60 at the fitted F |
+| W.2 | injected found, G 0001 / 0002, L 0000 / 0008 (clean; the `elongated` G 0003 is T.8's) | ≥ base; no trailed verdict on any of them (T.4/T.6), so A4 costs none | 60/61, 61/61, 51/60, 49/61 (RB1) |
+| W.3 | F_field / frame FWHM per frame and family; sample share flagged extended | reported | D2: M42 8.2–8.8 vs 1.7–2.4 |
+| T.1 | L 0010, L 0011 accepted fits | ≤ 1 % of the clean median (≤ 24) | 947, 786 vs 2458 (ERP report) |
+| T.2 | L 0010, L 0011 PSF signal weight | ≤ 0.01 × clean median (≤ 0.00182) | 0.0053, 0.0082 vs 0.182 |
+| T.3 | L 0010, L 0011 `c` | None (< 5 qualifiers) | 4.48 (29), 6.89 (25) |
+| T.4 | the 10 clean L siblings: fits; verdict | no verdict (the refusal share below the derived line, A4 step 2a); fits: the A4 phase's own delta (A4 head vs A3 head, A4's proof table) within √base — the verdict never fires, so A4 changes no clean fit; the A1 move (D2: G 0002 2738 → 2395, L 0008 2241 → 2597) is read by D.3 / D.8 and the proof tables, not here | 2068–2629 per frame (ERP report) |
+| T.5 | the 7 `trails/` frames: verdict | = the rendered class (the refusal share against the derived line); the solver's verdict printed | A4 labels |
+| T.6 | every other frame (G 0003 included, R1/Q2) and v2 family: verdict; `shape/*` (e ≤ 0.7), coma, fieldpsf `measure` completeness | no verdict; ≥ base − 0.005 (no per-star refusal exists to lose a star, Q1) | t10-f5-r2 |
+| T.7 | lab `trails` family: refusals by kind (centreMoved / regionTooSmall / Trailed) and trail length, the share beside | reported | share 0.366 (A4 step 2a) |
+| T.8 | G 0003 (`elongated`, ecc 0.65) | reported: NO verdict (Q2), refusal share, ecc, `c`, the ERP's weight beside; out of every clean pooled row. Should the verdict fire there, that is a ruling, not a bar | 10b-L class (relabelled `elongated`, R1); HEAD 356 fits, refusal share 0.389 (A4 step 2a) |
+| B.1 | σ_i / truth noise, median (p90), flat, grad10, vig20, `neb0.1`, `sharp/*`, `density/*` | median 1.00 ± 0.05 | D1 D-6: 1.00 (≤ 1.05) |
+| B.2 | B_i − `sky_local` (RB1's table), b − B_i at the qualifiers | reported, R6's column and K7's predicted rows beside | RB1 5f705ad; D1 d63dfc7 |
+| B.3 | row 6 `neb3`, `neb3_4096` with SE; density × `neb3` row 6 d200 / d600 / d1000 | recorded limit | 0.880 ± 5.6 %, 1.129 ± 2.3 %; 1.058 / 1.135 / 1.069 (10b-L (e)) |
+| P.1 | psfSel, nebula-sky pairs (iso/m4, iso/g, iso/blur25mix × t25/t45/t60 × `neb0.5`, `neb3`), both ring arms | Δ vs the flat control on the same star field within ±1.2 % (m4, g) / ±2 % (blur25mix) on `neb0.5`, the same + 2 SE on `neb3`; a cell refused for < 20 matched stars is n/a, not a miss. The before already misses on `neb0.5` (Δ vs flat, t25 / t45 / t60: m4 +1.85 / +1.50 / +2.49, g −0.07 / +3.28 / +3.84, b25mix t60 −2.17 pp): P.3's STOP branch is the likely outcome | 10b-L before; flat control m4 +0.22 / +0.21 / +0.30, g +0.01 / +0.17 / +0.24, b25mix +0.18 / +0.68 / +1.48 % |
+| P.2 | psfSel, warped targets (the same families, flat sky) | the unwarped twin's tolerance | 10b-L before |
+| P.3 | B3's decision | pair-common iff P.1 passes under it AND C1.1–C1.4 pass under it; P.1 failing under both arms → STOP (no switch to K7) | — |
+| I.1 | inject row 6 with the frame's own PSF, clean frames (G 0003, L 0010 out) | Δ vs 10b-L's before per clean frame ≤ 2 % + 2·SE_c (a stability row); the +4–6 % halo (the real halo `c` carries beyond the fitted model) reported, a recorded limit | 10b-L (c) per frame; pooled G 1.0465, L 1.0642, mono2 1.0439 |
+| S.1 | `c` frame-to-frame sd per dataset, clean frames | M42's 12 calibrated frames: ≤ step 0's sd × (1 + 2/√(2·11)) = 1.43 × (the sd's own relative SE at n = 12 is 21 %); hc11B L, G (n = 2 each) and the 3 M42 inject frames: reported, no bar | step 0 (runner, t10-f5-r2); 10b-L (f) beside: M42 12 1.02 %, L 1.94 %, G 1.43 %, M42 inject 1.28 % |
+| S.2 | seeds / Mpx per clean frame vs its dataset's median | reported (R2: [0.5, 2] × was not derivable before the cycle; the flood it guards is T.1's) | 10b-L (f): M42 269–330 (max/median 1.15), hc11B G 47–83, L 58–60 |
+| S.3 | M42 mono2 frame β 0000 / 0008 / 0010 | reported, mechanism split (knot / extended seeds vs near-clip class-B stars; D2: 35 of 52 sample stars at peak ≥ 0.95 of range); the bar is Task 10c's | 13.96 / 3.14 / 3.34 (t10-f5-r2); predicted miss on 0000 (D2: near-clip class B) |
+| M.1 | m42 corpus `measure` batch wall, on the runner | ≤ 1.2 × step 0's wall at t10-f5-r2's binary (R3) | step 0; the dev Mac's 223.1 s (2026-10-07) printed beside, never compared |
+| M.2 | LDN_1272 mono + OSC Measure wall, 3 interleaved vs fee44d50; LDN 1272 `c` frame-to-frame sd over its calibrated frames (dev Mac, R3) | reported | A-phase proof tables; RF7 2.02 % |
+
+- [x] **Step 4: Results** committed and pushed in the lab (`results(plan-a): t10b-onebg - F-10 bars <ok|items>`);
+  a STOP commits under `results/plan-a/t10b-onebg/stop-r<n>/`.
+
+#### Phase D — one review of Tasks 10 + 10b, then the squash
+
+Checklist: no consumer estimates an owned quantity a second time (a sky, noise or seed estimator outside its owner is
+a finding); ruling F14's test edits named; README, spec and plan records match the code.
+
+- [x] One review (the most capable model; Fable ran it) of the WIP branch from 588c4a5f; each fix round goes to a fresh agent and re-runs only the bars
+  its change touches, under a new step name. Then README R-OSP-7b (rulings A1–A6, B1–B5, P1–P5, R1–R3, the decision
+  P.3, the C table), the spec's F-10 row "as built", this task's Outcome block.
+- [x] Core `--all-targets` and `--no-default-features` green; the WIP branch squashed onto `one-star-path` as two
+  commits — Task 10's F-5 commit, then:
+
+```
+fix(star_measure): F-10 one background - propagated detection noise, knot tests, the field width, the trailed verdict from the refusal structure, one aperture-scale sky and noise per star (recall neb0.5/neb3 <cells>; L 0010/0011 <cells>; C1 <cells>)
+```
+
+**Acceptance:** every bar of phase C met or reported to the owner with its numbers (a predicted miss included); `c`
+byte-identical across A3; both diffs 0 moved outside the design list; control 0; no owned quantity estimated twice.
+
+**Outcome (2026-10-12).** Commits (athenaeum, WIP branch `one-star-path-t10-wip`, squashed as the F-10 commit on
+`one-star-path` after Task 10's F-5 commit): the planning rounds de178d0b, ebf9ad46, ec2f0ec4, 945080aa; A1 16fa8813
+(propagated σ_f, knot tests, centred β sample, one mesh per plane), e016d2cf (STOP A1-1 closed), 23816f3c (waste out
+of the noise read), a1114959 (the read's lag sums in row order: the same gain on every run); A2 1bc29ef8 (the field
+width as the half-sample mode); A2b ca273f66 (the knot bounds at the star-width envelope, E4n); A3 dbaf3348 (B_i / σ_i
+per star, `c` reads B_i, the LN ring switch); A4 c472cc78 (the trailed verdict from the refusal structure); A4b
+6a1addc6 (the half-maximum-contour centre test, the rim in the share); A1b 7fd911ab (gain 1 on unmixed planes); A1c
+4c95b6b4 (the caller's `PixelNoise`); D fixes 759b9d6e; then this docs commit. Lab (athenaeum-lab, runner): 10b-L
+f95cd1a, L2 b5b5c40 … fecabcd (tooling, frame classes, the long-trail family, Q7's allowance), L3 2332ce9 (K.1 at the
+product's widths). Phase C `t10b-onebg` in three runs: 6a1addc6 (lab 895136a; STOPs D.1 `neb3`, P.1 / P.2, row 7),
+7fd911ab (lab 07cd2cb; STOP-A the resampled flood, STOP-B row 7 on the base's stars), 4c95b6b4 (lab 4f9e21e) **BAR
+PASS, no STOP open**: C1.1 0.76 % / 1.41 %, C1.2 +1.72 % / +1.19 %, C1.3 0 / 70, C1.4 0 / 20; F.0 885 / 885;
+no-regression 0 moved / 0 missed / 0 lost, cumulative PASS, control 0; D.1 `neb0.5` 0.777 and `neb3` 0.539 (floors
+0.743 / 0.499); `halo` false seeds 2; K.1 pooled 1 / 1 / 2 of 216 (allowance 4 / 3 / 4); W.1 45 of 45, 41 of 41, 45 of
+45; L 0010 / L 0011 trailed with 0 fits and `c` None; 6 of the 7 `trails/` frames match their class (H 0029 the
+recorded miss); B.1 σ_i / truth within 1.00 ± 0.05; S.1 0.67 % (bar 1.46 %); M.1 74.7 s (bar 159.8 s); same-star 645
+cells, 19 worse (allowance 23); P.1 / P.2 reported (C-9). Phase D: review `review-t10-t10b.md` (0 Critical / 3
+Important / 10 Minor; ruling D-1, all accepted), fix round 759b9d6e (`star_probe` and LN's library outputs
+byte-identical to 4c95b6b4). Owed in the squash bodies (D-1): M-6 serde_json's `float_roundtrip` named in the F-5
+commit; M-13 the LN half / full bound 0.004 → 0.030 named in the F-5 commit as RF7's ruled re-pin (it landed in 0515d8b4, Task 10). Rulings index
+(README R-OSP-7b, one line each): the design A1–A6, B1–B5 and the two addenda; P1–P5 and R1–R3 (the plan review);
+Q1–Q7 (the plan fixes); A1-1, A2-1…A2-3, L3-1, A4-1, A4-2 (the phases); C-1…C-12d (the cycle; C-7 = A1b, C-9 = P.3
+per-side, C-10 = A1c); D-1 (the review). README R-OSP-7b complete (with the cell-by-cell C table); spec §3 F-10 as
+built and as judged, §2.1, the owned-quantities table and §4 follow it.
+
+Carries. **Task 10c:** the near-clip pool (LDN mono's whole β pool sits at the full well, frame β 2.0 → 1.5, A2-2;
+clamp vs post-fit reject is 10c's question with its numbers, RB3); 653 of M42 0000's 1 213 unfitted added seeds sit on
+the clipped Trapezium core plateau (the saturation mask should keep the plateau out of detection); PSFSW's TFlux is ≈
+80 % saturated-model flux on hc11B L 0000 (A4-2; R.2 at the third run: M42 mono2 0.79–0.90, hc11B G 0.62–0.73), so a
+frame's weight hangs on a few clipped stars' model flux; the M42 frame β 31.8 / 2.81 / 3.38 (S.3) against 10c's
+derived bar. **Task 11 (RB4):** the debayer's noise correlation κ (lag-1 R 0.20 / G 0.29 / B 0.30 against mono 0.004),
+the colour-plane gain read's nebula-texture leak (C-7 (a)), σ_i / σ_MRS 1.24–1.58 on debayered colour planes — the
+SNR's noise there. **Plan B:** LN on nebula sky — the P.1 / P.2 tables (`a1c/p1-table.txt`: per-side 13 of 34 cells
+over, pair-common 15; shifted / warped t25 +1.91…+1.96 pp) are its "before"; the error lives in LN's tile sky
+(`ln/background.rs`). **A later fit-design task:** C-12d — on a heavy-wing profile (β 2.5) shape at the true width
+reads +0.003 ecc on bright round stars and +0.02 at SNR < 20; whether shape wants a region wider than the F-sized
+windows; with it the fit-side part of G 0003's rise (`regionTooSmall` 65 → 148 at F 9.89 → 8.36, A4-2). **A later
+nebula-recall owner:** the mesh noise map reads ≈ 6× the true noise on `neb3` (structure inside a cell counts as
+noise), so heavy-nebula recall stays ≈ 0.54 (C-7 (b)). **Plan C:** its CFA super-pixel `detect` call states
+`PixelNoise::White` (undebayered sensor pixels, C-10); on its masked planes `N*` reads the masked mesh (D-1). **Task
+13** (ruling Q6, not yet in its text): the weights on trailed / tailed frames against the ERP (L 0010, L 0011, H 0029)
+— a tailed frame's `c` takes the tail light and PSFSW goes as `c`²; a fix, if one is needed, belongs to the weights'
+owner.
+
+---
+
+### Task 10c: near-clip saturation (spec §3 F-3, owner of the saturation flag's near-clip class)
+
+**Stub (ruling P2, 2026-10-11): scope, readers and the bar's derivation are fixed now; Files and Steps are to be
+written after 10b's joint cycle.** Runs right after Task 10b and before Task 11 — `c`'s qualifiers, the frame
+statistic and later F-6's SNR and HFR all read the saturation flag. Within Plan A's existing MUST-RESOLVE scope (the
+M42 frame β, moved from Task 13 through Task 10b's S.3); F-3's owner (Task 8) is closed, so this task owns the class.
+
+**Scope.** The saturation flag's near-clip class-B definition: bright stars whose peak sits near the clip yet carry no
+`saturated` flag, so they enter the β sample, `c`'s qualifiers and the frame statistic (D2: on M42 mono2 0000, 35 of
+its 52 accepted β-sample stars have β ≥ 10 and a peak at ≥ 0.95 of range; LDN 1272 0099 the same, 63 of 64; frame β
+13.96 at t10-f5-r2 against 3.14 / 3.34 on 0008 / 0010). The class reads Task 8's `SaturationPlane` range (`bg`,
+`range`) — never a new maximum; 10b's knot exemption (`near_clip`) reads the same level. Out of scope: the knot /
+extended share of the M42 β (10b's, S.3), the plateau test's other clauses unless the class's definition needs them
+(recorded with its numbers), the c = 1 floor (F-9).
+
+**Owner of** the `saturated` flag's near-clip class (spec §3 owned quantities). Readers: the β sample, the frame
+FWHM/ecc statistic, `c`'s qualifiers, later F-6's SNR and HFR, `.athf`.
+
+**Bar — derived from data before any 10c code, never a fixed 10 %.** The M42 frame β judged against the set's own
+spread: M42's 12 clean calibrated frames (10b-L (f): β 2.99–4.79 without 0000, 13.96 with it) and a clean comparison
+set (hc11B L: 3.67–4.97); the statistic (0000's β inside the other frames' spread, that spread no wider than the
+comparison set's) and its SE are written from 10b's S.3 report before code. F-3's twin rows and row 10 (FN ≤ 0.5 %)
+and the no-regression table hold as everywhere.
+
+**Inputs.** 10b's S.3 report (the mechanism split per frame), D2's `M0000_sample.png` and its dumps
+(`t10-scratch/d2/out/`), Task 8's verdict and row 10.
+
+**Files / Steps:** to be written after 10b's joint cycle (lean execution: one design read, one implementer, ONE lab
+step judging the bar above with the F-3 rows; a miss goes to the owner with its numbers).
+
+---
+
+### Task 11: F-6 — the per-star SNR and HFR (spec §3 F-6, §4.2 HFR)
+
+**Reads Task 10b's sky and noise (moved by Task 10b, 2026-10-11).** Task 11 estimates no sky and no noise: S, σ_sky
+and N_sky are the star's stored `sky_ring`, `sky_ring_sigma` and `sky_ring_n` (B_i, σ_i, n_i), and HFR subtracts
+`sky_ring`. PA-11 keeps the aperture radius; its annulus is retired for SNR (ruling B4), so the tests below that build
+PA-11's annulus (`snr_matches_the_analytic_value_on_a_white_noise_star`'s `n_sky`,
+`edge_star_snr_uses_the_present_annulus_pixels`, `snr_is_nan_and_counted_when_no_annulus_pixel_is_present`) are
+rewritten on 10b's ring when this task is briefed, and the lab's `snr_ap` truth column takes the ring's pixel count.
+Checklist: HFR ≤ 5F by construction (a c ≠ 1 case on Gaussian truth); SNR vs truth on `background/*` is now a real
+bar; the gain plumbing is orthogonal.
+
+**Files:**
+- Modify: `star_measure/photometry.rs` (`star_snr` over the stored σ_i (moved by Task 10b, 2026-10-11; was Task 8's `annulus_sigma`), `hfr`), `star_measure/fit.rs`
   (`StarFit.snr`, `.hfr`; non-persisted like `peak5`; the `StarFit` literal sites of ruling F36 gain the two fields
   — the same five hand-edited sites as Task 4, or `StarFit::test_at` where it was adopted), `star_measure/frame.rs`
   (`snr_median`, `hfr_median`: medians over the finite values only, so a `snr_missing` NaN never poisons the frame
@@ -3006,11 +3815,12 @@ growth/model falls for fainter stars (all-pairs LN-like -4.7 %). **Plan C:** a C
 
 **Interfaces:**
 - Produces: `star_snr(plane, w, h, fit, gain: Option<f64> /* e⁻ per working ADU */, mask: Option<&[bool]>) -> (f64 /* snr */, SnrTerms { s,
-  n_ap, sigma_sky, n_sky, shot_term: bool })` per PA-11 with `(σ_sky, N_sky)` from `photometry::annulus_sigma` (Task
-  8, I-2; `None` → `snr = NaN`, counted in `PlaneMeasurement.snr_missing`): `σ_S² = S/g + N_ap·σ_sky²·(1 +
+  n_ap, sigma_sky, n_sky, shot_term: bool })` per PA-11's aperture with `(σ_sky, N_sky)` = the fit's `(sky_ring_sigma,
+  sky_ring_n)` (moved by Task 10b, 2026-10-11; was `photometry::annulus_sigma`; a NaN σ_i → `snr = NaN`, counted in
+  `PlaneMeasurement.snr_missing`): `σ_S² = S/g + N_ap·σ_sky²·(1 +
   N_ap/N_sky)`; without `g` the first term is omitted and `shot_term = false`. `hfr(plane, w, h, fit, mask:
   Option<&[bool]>) -> f64`: the radius about the fitted centre inside which the background-subtracted cumulative sum
-  (pixels sorted by distance, `b = fit.background`) reaches `0.5 × fit.signal`, interpolated between the two
+  (pixels sorted by distance, `b = fit.sky_ring` — moved by Task 10b, 2026-10-11; was `fit.background`) reaches `0.5 × fit.signal`, interpolated between the two
   bracketing pixels; `NaN` when the 5F circle holds less than half of `signal`. Non-finite and masked pixels are
   skipped and never counted in `N_ap`/`N_sky` (Review Focus 1, 5; ruling F39: both take the mask).
 
@@ -3271,7 +4081,8 @@ fn budget_mode_accounts_for_every_seed() {
     analysis 25.2 s / 77 = 0.33 s), max printed; `background/neb3_4096` `analysis-mode` wall printed beside the
     legacy 0.21 s;
   - Measure cost, second read: the corpus m42 `measure` batch wall ≤ 1.2 × 223.1 s = 267.7 s (per-frame ≈ 2.9 s →
-    ≤ 3.5 s; the first read is Task 13's stage time);
+    ≤ 3.5 s; the first read is Task 10b's M.1 — moved by Task 10b, 2026-10-11; that read is the runner's against its
+    own t10-f5-r2 wall (R3), so 223.1 s binds only on the dev Mac — and Task 13's stage time confirms it);
   - `_DSC5767.fit`: the `measure` frame line's `seeds` > 0 on each plane (baseline 0 on every plane); recorded — the
     signedness question is Plan C's;
   - bright coverage and completeness of `analysis-mode` against the legacy `analysis` on `sharp/m4/f2.6` recorded
@@ -3288,6 +4099,12 @@ diffs 0 moved; control 0. A cost miss → the owner with the walls before Task 1
 
 ---
 ### Task 13: The real-data checkpoint at master level (spec §5 step 5, owner rule)
+
+**Moved by Task 10b, 2026-10-11.** The M42 frame-β MUST-RESOLVE (Task 9's carry), the hc11B L 0010 seed flood and its
+`c` re-read (Task 10's carry; L 0010 and L 0011 are trailed frames, now Task 10b's trailed verdict) and the first
+Measure-wall read moved out of this task: W.1, T.1–T.3, M.1 are 10b's bars; the M42 β bar is 10c's (10b reports it,
+S.3). This checkpoint owns no fix: a miss here goes back to its owner task as a fix round, and the checkpoint re-runs.
+It reports the M42 β spread at master level and the OSC LN reference R-plane `c` SE (2.19 % at Task 10).
 
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
 `harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
@@ -3460,7 +4277,8 @@ cp ~/.athenaeum-acc/starA-s204/{before,extract,compare,run}.txt ../../results/pl
     owner;
   - LN relative scale `s` per frame, on all three datasets: median ratio within 1 ± 0.5 % (the §8 row), read from
     the `.athln` grids; the per-frame scatter of the ratio is REPORTED beside it, not a bar (ruling F23 e, PA-14);
-  - Measure stage wall ≤ 1.2 × the before tree's (set 204: 3.62 min → ≤ 4.34 min; run B and Horse C11 from their
+  - Measure stage wall ≤ 1.2 × the before tree's — a confirmation at master level of Task 10b's first read (M.1; moved
+    by Task 10b, 2026-10-11) — (set 204: 3.62 min → ≤ 4.34 min; run B and Horse C11 from their
     `before.txt` stage times); the Normalize stage wall is REPORTED beside it (M-6: LN's reference fit under `Auto`
     now runs the bounded sample fit; set 204 before 2.46 min); the total wall is reported with the stages that did
     not run named (R-TA-9: no interleaved bracket);
@@ -3585,16 +4403,17 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | §3 doctrine, F-0 | 4 |
 | §3 F-1 (region, cap, rim background, width start, seeds, new families, donut and its ring-radius floor) | 1a (families, PA-9), 6a, 6b |
 | §3 F-2 (axes, conditioning, conditional convergence change as a new entry point F7) | 5 |
-| §3 F-3 (unsaturated sample/statistic, twin bars, re-judged after F-4) | 8, 9 |
+| §3 F-3 (unsaturated sample/statistic, twin bars, re-judged after F-4; the near-clip class and the M42 β bar) | 8, 9, 10c |
 | §3 F-4 (continuous β, rustafits bound and ln β, Gaussian limit, every β a finite number, the linear arm kept F8) | 9 |
 | §3 F-5 (flux, aperture correction, psfSel, the pairs families F24) | 10 |
 | §3 F-6 (SNR definition, gain `EGAIN × ATH_CSCL` F6, lab cards, truth SNR with the annulus term F5) | 1a, 8 (the annulus), 11 |
 | §3 F-7 (rim background under nebulosity, every `neb*` family F23) | 6b |
 | §3 F-8, F-9 | Plan B (the LN rows are printed, PA-14) |
+| §3 F-10 (one background: propagated σ_f, knot tests, the field width, the trailed verdict from the refusal structure, B_i / σ_i per star, the LN ring arm, the owned-quantities table; one joint cycle re-judging F-0…F-5, F-7) | 10b (Task 11 reads B_i / σ_i; Task 13 confirms); 10c (the near-clip class) |
 | §3 raw-mode truth (injections: completeness, FWHM) | 6b, 9 |
 | §3 the budget (≥ 90 % of cells), the `NotSelected`/`Trimmed` identity F13 | 12 |
 | §3 no regressions (SE rule incl. per-axis, mechanical, step and cumulative F21, design-list semantics F20, `betas@*`, row-2 keys F10) | 1c (tool), every fix task, 14 |
-| §3 cost (Measure ≤ +20 %, Analysis ≤ 0.6 s incl. on-demand) | 12, 13 |
+| §3 cost (Measure ≤ +20 %, Analysis ≤ 0.6 s incl. on-demand) | 10b (the first Measure read), 12, 13 |
 | §3 out of scope (VNG, resampling) | 14 §7 (restated) |
 | §4.4 `MEASURE_VERSION` in the three stage hashes, the pinned tests, the bump policy | 3 |
 | §4.4 `measure_version`/`stars_refused` columns, `FrameAnalysis` fields, collab meta | Plan C |

@@ -1589,6 +1589,8 @@ pub fn integrate_group(
             None,
             SeedOverride::Fast,
             false,
+            // A master is integrated / drizzled: its pixels are mixed (ruling C-10).
+            crate::star_measure::PixelNoise::Mixed,
             |p| {
                 if cancel.load(Ordering::Relaxed) {
                     warn!(plane = p, "group integration cancelled");
@@ -3062,6 +3064,7 @@ mod tests {
             None,
             SeedOverride::Fast,
             false,
+            crate::star_measure::PixelNoise::Mixed,
             |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(master(p))),
         )
         .unwrap();
@@ -3089,6 +3092,7 @@ mod tests {
                 SeedOverride::Fast,
                 false,
                 true,
+                crate::star_measure::PixelNoise::Mixed,
             );
             assert_ne!(
                 out.stats.master_fwhm_px[p].to_bits(),

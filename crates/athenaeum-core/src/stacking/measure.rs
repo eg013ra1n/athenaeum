@@ -254,6 +254,13 @@ pub struct PlaneMeasurement {
     pub defocused: bool,
     /// The readable seeds refused `Donut` (the verdict's `n_donut`). Reported, not persisted.
     pub defocus_donuts: usize,
+    /// The plane is trailed (Plan A Task 10b, F-10; rulings A6, Q1, Q5: more than half of at least 100 judged seeds
+    /// refused `centreMoved` / `regionTooSmall` / `centreAtRim`): `fits` is empty and the zero-star path below takes it, as a defocused
+    /// plane's. Reported, not persisted.
+    pub trailed: bool,
+    /// The verdict's input, the share of the judged seeds refused `centreMoved`, `regionTooSmall` or `centreAtRim` (A4-2; the probe's
+    /// `trailShare`). Reported, not persisted.
+    pub trail_share: f64,
     /// The seeds whose saturation verdict fit failed for a reason other than n ≤ p (F-3, Plan A Task 8, Q4; the
     /// probe's `verdictFitFailed`). Reported, not persisted.
     pub verdict_fit_failed: usize,
@@ -268,6 +275,13 @@ pub struct PlaneMeasurement {
     /// The qualifying stars `aperture_correction` is the median over (the probe's `apertureStars`). Reported, not
     /// persisted.
     pub aperture_stars: usize,
+    /// The accepted fits without a ring sky B_i (Plan A Task 10b, F-10; the probe's `ringSkyMissing`). Reported, not
+    /// persisted.
+    pub ring_sky_missing: usize,
+    /// The module's matched-filter report (Plan A Task 10b, F-10: σ_f propagated and measured, the noise gain, the
+    /// structure seeds dropped, the extended flags; the probe's `sigmaF`, `sigmaFMeasured`, `noiseGain`,
+    /// `structureDropped`, `extendedSeeds`); `None` for the other detectors. Reported, not persisted.
+    pub detection: Option<sm::DetectionReport>,
 }
 
 /// One plane's result from [`measure_planes_diagnosed`].
@@ -348,7 +362,17 @@ pub fn measure_plane_detailed(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedOverride,
 ) -> (PlaneMeasurement, Vec<Seed>) {
-    let (pm, seeds, _) = measure_plane_diagnosed(data, w, h, opts, pool, seed_source, false, false);
+    let (pm, seeds, _) = measure_plane_diagnosed(
+        data,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        false,
+        false,
+        sm::PixelNoise::Unknown,
+    );
     (pm, seeds)
 }
 
@@ -363,6 +387,8 @@ pub fn measure_plane_detailed(
 /// (`star_measure::MeasureOptions::colour`). One plane on its own: no
 /// cross-plane rule; every image of more than one plane goes through
 /// [`measure_planes_diagnosed`], which sets `colour` itself.
+/// `pixel_noise` (Task 10b A1c, ruling C-10): the caller's statement of the plane's noise correlation
+/// ([`sm::PixelNoise`]); the convenience entries above say `Unknown` (the gain is read).
 #[allow(clippy::too_many_arguments)]
 pub fn measure_plane_diagnosed(
     data: &[f32],
@@ -373,8 +399,19 @@ pub fn measure_plane_diagnosed(
     seed_source: SeedOverride,
     diagnostics: bool,
     colour: bool,
+    pixel_noise: sm::PixelNoise,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
-    let head = adapter_head(data, w, h, opts, pool, seed_source, diagnostics, colour);
+    let head = adapter_head(
+        data,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        diagnostics,
+        colour,
+        pixel_noise,
+    );
     let m = sm::measure_plane(data, w, h, &head.module_opts, pool);
     adapter_tail(head, m)
 }
@@ -386,6 +423,10 @@ pub fn measure_plane_diagnosed(
 /// adapter ([`measure_frame`] and its siblings), the master statistics (`integrate`, `drizzle`, their covered-rectangle
 /// crops included) and the lab's probe call it; one plane is exactly [`measure_plane_diagnosed`] without `colour`.
 /// `colour` (Q3) is `n_planes == 3`: a 3-plane calibrated frame or master is a debayered OSC group's.
+///
+/// `pixel_noise` is the caller's statement for every plane of the image (ruling C-10): `White` for a calibrated sensor
+/// frame (the Measure stage's mono plane), `Mixed` for a master (integrated, drizzled) or any debayered / resampled
+/// image, `Unknown` otherwise; a debayered 3-plane image is `Mixed` whatever is stated.
 ///
 /// `plane(p)` hands plane `p`, in its native units. On more than one plane it is called twice per plane, once per
 /// half, so a caller reading from disk holds one plane at a time (`stacking::run`'s `MEASURE_PLANES_RESIDENT` stays
@@ -400,14 +441,24 @@ pub fn measure_planes_diagnosed<'a, E>(
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedOverride,
     diagnostics: bool,
+    pixel_noise: sm::PixelNoise,
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
     if n_planes == 1 {
         let t = Instant::now();
         let data = plane(0)?;
         let _span = tracing::debug_span!("measure_plane", plane = 0).entered();
-        let (measurement, seeds, diagnostics) =
-            measure_plane_diagnosed(&data, w, h, opts, pool, seed_source, diagnostics, false);
+        let (measurement, seeds, diagnostics) = measure_plane_diagnosed(
+            &data,
+            w,
+            h,
+            opts,
+            pool,
+            seed_source,
+            diagnostics,
+            false,
+            pixel_noise,
+        );
         return Ok(vec![MeasuredPlane {
             measurement,
             seeds,
@@ -424,7 +475,17 @@ pub fn measure_planes_diagnosed<'a, E>(
         let t = Instant::now();
         let data = plane(p)?;
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
-        let head = adapter_head(&data, w, h, opts, pool, seed_source, diagnostics, colour);
+        let head = adapter_head(
+            &data,
+            w,
+            h,
+            opts,
+            pool,
+            seed_source,
+            diagnostics,
+            colour,
+            pixel_noise,
+        );
         preps.push(sm::prepare_plane(&data, w, h, &head.module_opts, pool));
         heads.push(head);
         if p + 1 == n_planes {
@@ -489,6 +550,7 @@ fn adapter_head(
     seed_source: SeedOverride,
     diagnostics: bool,
     colour: bool,
+    pixel_noise: sm::PixelNoise,
 ) -> AdapterHead {
     // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
     // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
@@ -692,6 +754,7 @@ fn adapter_head(
         mask: None,
         field_width: None,
         colour,
+        pixel_noise,
     };
     AdapterHead {
         detector,
@@ -783,11 +846,15 @@ fn adapter_tail(
             field_width: m.field_width,
             defocused: m.defocused,
             defocus_donuts: m.defocus_donuts,
+            trailed: m.trailed,
+            trail_share: m.trail_share,
             verdict_fit_failed: m.verdict_fit_failed,
             cross_flags: m.cross_flags,
             beta_source: m.beta_source,
             aperture_correction: m.aperture_correction,
             aperture_stars: m.aperture_stars,
+            ring_sky_missing: m.ring_sky_missing,
+            detection: m.detection,
         },
         seeds,
         m.diagnostics,
@@ -920,6 +987,13 @@ fn measure_frame_inner(
         pool,
         seed_source,
         false,
+        // The Measure stage measures calibrated sensor frames (ruling C-10): one plane is white, a debayered
+        // 3-plane frame is mixed.
+        match n {
+            1 => sm::PixelNoise::White,
+            3 => sm::PixelNoise::Mixed,
+            _ => sm::PixelNoise::Unknown,
+        },
         |plane| -> Result<Cow<'static, [f32]>, IntegrationError> {
             if cancel.load(Ordering::Relaxed) {
                 return Err(IntegrationError::Cancelled);
@@ -947,6 +1021,17 @@ fn measure_frame_inner(
                 path = %path.display(),
                 plane,
                 "measure: the plane is defocused; no star is measured"
+            );
+        }
+        // Plan A Task 10b (F-10): the trailed verdict, logged here for the same reason.
+        if pm.trailed {
+            warn!(
+                outcome = "trailed",
+                trail_share = pm.trail_share,
+                stars_detected = m.stars_detected,
+                path = %path.display(),
+                plane,
+                "measure: the plane is trailed; no star is measured"
             );
         }
         debug!(
@@ -1325,9 +1410,17 @@ pub(crate) mod tests {
     ) {
         let (planes, w, h) = cross_plane_fixture();
         let opts = MeasureOptions::default();
-        let multi = measure_planes_diagnosed(3, w, h, &opts, None, SeedOverride::Fast, true, |p| {
-            Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice()))
-        })
+        let multi = measure_planes_diagnosed(
+            3,
+            w,
+            h,
+            &opts,
+            None,
+            SeedOverride::Fast,
+            true,
+            sm::PixelNoise::Mixed,
+            |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+        )
         .unwrap();
         let (g, vg) = fixture_star(&multi[1]);
         assert!(vg.plateau && vg.saturated && !vg.cross, "G: {vg:?}");
@@ -1347,6 +1440,7 @@ pub(crate) mod tests {
                 SeedOverride::Fast,
                 false,
                 true,
+                sm::PixelNoise::Mixed,
             );
             let mine = alone
                 .fits

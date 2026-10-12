@@ -81,7 +81,7 @@ pub use reference::{
 pub use scale::{
     relative_scale, relative_scale_against, relative_scale_against_with_diag,
     relative_scale_from_seeds, relative_scale_from_seeds_with_breakdown,
-    relative_scale_from_seeds_with_diag, PreparedReferenceChannel, ScaleInputs, ScaleMatchDiag, ScaleResult,
+    relative_scale_from_seeds_with_diag, ln_fit_options, PreparedReferenceChannel, ScaleInputs, ScaleMatchDiag, ScaleResult,
     SeedFilterBreakdown, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };

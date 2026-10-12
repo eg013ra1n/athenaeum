@@ -30,25 +30,38 @@
 //! The star flux (F-5, Task 10, ruling R-OSP-7): a fit's `signal` is [`model_flux_in_fwtm`] (the fitted model's
 //! analytic flux inside its own FWTM ellipse) times the plane's [`aperture_correction`] `c`, the median ratio of the
 //! [`growth_curve`] flux at `5F` to the model flux over the 64 brightest isolated unsaturated fits — so the flux no
-//! longer depends on how much of a profile its FWTM ellipse holds. The growth curve's sky is the plain mean of the far
-//! ring `[10F, 12F]` outside every seed's `3F` disc, and a candidate whose fitted amplitude tops the plane's range is
-//! screened out (F-3's amplitude clause, on every path; owner ruling R6, 2026-10-11). Round 4: off the measure path
-//! the screen's full scale is the caller's ([`super::FitStarsOptions::full_scale`]), and a caller's footprint
-//! ([`super::FitStarsOptions::footprint`], LN's `allowed` region) must hold a candidate's whole `12F` disc.
+//! longer depends on how much of a profile its FWTM ellipse holds. The growth curve's sky is the star's stored B_i,
+//! and a candidate whose fitted amplitude tops the plane's range is screened out (F-3's amplitude clause, on every
+//! path; owner ruling R6, 2026-10-11). Round 4: off the measure path the screen's full scale is the caller's
+//! ([`super::FitStarsOptions::full_scale`]), and a caller's footprint ([`super::FitStarsOptions::footprint`], LN's
+//! `allowed` region) must hold a candidate's whole `12F` disc.
+//!
+//! One aperture-scale sky and noise per star (Task 10b, F-10, rulings B1–B4): every accepted fit carries B_i, the plain
+//! mean of its present pixels at `10F ≤ d ≤ 12F` outside every seed's `3F` disc (R6's ring, [`ring_sky`], measured
+//! once per fit after the duplicate drop, [`ring_skies`]), σ_i, the RMS of `v − B_i` over the same pixels, and n_i.
+//! Every aperture consumer reads them and none re-estimates them: `c` now, Task 11's SNR and HFR later. The fit's own
+//! local `b` stays free (B1): it is the model's scale, B_i the aperture's; `b − B_i` is the stored near/far diagnostic
+//! ([`super::StarFit::sky_offset`]).
 
 use std::collections::HashMap;
 
 use astroimage::analysis::fitting::{fit_moffat_2d_bounded, PixelSample};
+use rayon::prelude::*;
 
 use super::beta::{BETA_BOUNDS, BETA_START};
 use super::diagnostics::RefusalReason;
 use super::fit::{FitParams, FitScratch, Seed, StarFit};
-use crate::integration::stats::{self, median_in_place, MAD_TO_SIGMA};
+use crate::integration::stats;
+#[cfg(test)]
+use crate::integration::stats::{median_in_place, MAD_TO_SIGMA};
 
 /// PA-11: the annulus's inner radius is `max(3·FWHM, 6)` px …
+#[cfg(test)]
 pub const ANNULUS_INNER_PER_FWHM: f64 = 3.0;
+#[cfg(test)]
 pub const ANNULUS_INNER_MIN_PX: f64 = 6.0;
 /// … and its width `max(FWHM, 3)` px.
+#[cfg(test)]
 pub const ANNULUS_WIDTH_MIN_PX: f64 = 3.0;
 /// [`annulus_sigma`] reads nothing from fewer present pixels than this.
 pub const ANNULUS_MIN_PIXELS: usize = 8;
@@ -75,9 +88,11 @@ const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 
 /// The star's own sky annulus (PA-11 radii: inner max(3·FWHM, 6), width max(FWHM, 3)): σ = 1.4826·MAD of the
 /// finite, unmasked pixels present, and their count. Non-finite, masked and off-image pixels are absent (Review
-/// Focus 1 and 5). `None` under 8 present pixels. Owned here (I-2) and reused by `star_snr` (Task 11).
+/// Focus 1 and 5). `None` under 8 present pixels. Retired for the SNR by Task 10b's ruling B4 (no seed mask; its p90
+/// read 1.09–1.32 of the truth): kept as a `#[cfg(test)]` function (a test is its only reader); Task 11 reads σ_i ([`ring_sky`]).
 ///
 /// A pixel belongs to the ring when its centre lies at a distance `d` from `(x, y)` with `inner ≤ d < inner + width`.
+#[cfg(test)]
 pub fn annulus_sigma(
     plane: &[f32],
     w: usize,
@@ -266,6 +281,10 @@ pub struct SaturationVerdict {
     /// ([`super::cross_plane_flags`]); `saturated` is then true and the rest of the verdict stays this plane's own.
     /// Always `false` on a single plane.
     pub cross: bool,
+    /// The verdict fit passed the fit's own centre and region tests (Task 10b ruling A4; `CentreMoved`,
+    /// `CentreAtRim`, `RegionTooSmall`, [`super::fit`]'s `placement`, on the seed's region): only a centred verdict
+    /// joins the frame β's sample. `false` when the fit failed (`fit = false`).
+    pub centred: bool,
 }
 
 /// Spec §2.1 per seed (PA-23): the plateau test, the level, then the free-β verdict fit (`fit_moffat_2d_bounded` in
@@ -278,6 +297,8 @@ pub struct SaturationVerdict {
 /// A = 1, round at `σ = f_start/2.3548`, θ = 0; the amplitude is mapped back to working units. A fit that returns
 /// nothing (α < 0.3, A ≤ 0, a non-finite parameter, or a solve that never left its start — fix round A3), or a
 /// non-finite or non-positive amplitude or width, is `fit = false` (no refusal; Q4; no amplitude flag, but the plateau-clip clause still applies); a β at a bound is a fit.
+/// A successful fit is `centred` when it passes the fit's centre and region tests on the region of radius `r` about
+/// the stamp origin (Task 10b ruling A4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn saturation_verdict(
     region: &[PixelSample],
@@ -285,6 +306,7 @@ pub(crate) fn saturation_verdict(
     seed_y: f64,
     b0: f64,
     f_start: f64,
+    r: f64,
     plane: &SaturationPlane,
     params: &FitParams,
     scratch: &mut FitScratch,
@@ -314,6 +336,7 @@ pub(crate) fn saturation_verdict(
         fit: false,
         cross: false,
         iterations: 0,
+        centred: false,
     };
     let Some(m) = fit_moffat_2d_bounded(
         kept,
@@ -350,6 +373,16 @@ pub(crate) fn saturation_verdict(
     verdict.by_amplitude = amplitude > plane.range;
     verdict.saturated = verdict.by_amplitude || by_plateau_clip;
     verdict.fit = true;
+    verdict.centred = super::fit::placement(
+        (m.x0, m.y0),
+        (m.alpha_x, m.alpha_y),
+        m.beta,
+        (seed_x, seed_y),
+        (0.0, 0.0, r),
+        m.theta,
+        params,
+    )
+    .is_ok();
     Ok(verdict)
 }
 
@@ -443,13 +476,14 @@ pub(crate) fn integrated_beta(
 /// F-5 (Task 10, ruling R-OSP-7): the growth-curve aperture's radius per frame FWHM `F` — a star's growth-curve flux
 /// is the sum over the pixels whose centres lie within `5F` of its fitted centre.
 pub const GROWTH_RADIUS_PER_FWHM: f64 = 5.0;
-/// The growth-curve aperture's local sky (owner ruling R6, 2026-10-11): the plain mean of the present pixels at
-/// `10F ≤ d ≤ 12F` from the same centre that lie outside every seed's [`GROWTH_RIM_SEED_MASK_PER_FWHM`] disc. Far
-/// enough out that a star's own wing barely reaches it; the mask keeps the neighbours' cores out of it.
+/// The growth-curve aperture's local sky (owner ruling R6, 2026-10-11; from Task 10b every accepted star's B_i,
+/// ruling B2, [`ring_sky`]): the plain mean of the present pixels at `10F ≤ d ≤ 12F` from the same centre that lie
+/// outside every seed's [`GROWTH_RIM_SEED_MASK_PER_FWHM`] disc. Far enough out that a star's own wing barely reaches
+/// it; the mask keeps the neighbours' cores out of it.
 pub const GROWTH_RIM_INNER_PER_FWHM: f64 = 10.0;
 pub const GROWTH_RIM_OUTER_PER_FWHM: f64 = 12.0;
 /// The radius, per frame FWHM, of the disc about every seed of the call (the star's own included, by its seed
-/// position) whose pixels the growth-curve rim leaves out (R6).
+/// position) whose pixels the ring sky B_i leaves out (R6).
 pub const GROWTH_RIM_SEED_MASK_PER_FWHM: f64 = 3.0;
 /// A fit whose centre lies within this many FIELD widths (`FitOutcome::field_width`) of another seed handed to the
 /// fitter, accepted or not, is not isolated and does not enter the aperture correction.
@@ -477,7 +511,7 @@ pub fn model_flux_in_fwtm(f: &StarFit) -> f64 {
 
 /// The plane-wide union of the discs of radius `r` about every seed of one fit call (F-5, owner ruling R6): a pixel is
 /// covered when its centre lies within `r` of a seed's own position (`d² ≤ r²`; seed coordinates, not fitted centres).
-/// One bit per pixel, built once per call; [`growth_curve`]'s rim leaves the covered pixels out.
+/// One bit per pixel, built once per call; [`ring_sky`] leaves the covered pixels out.
 pub(crate) struct SeedMask {
     bits: Vec<u64>,
 }
@@ -513,15 +547,27 @@ impl SeedMask {
     }
 }
 
-/// A star's growth-curve flux at `5F` (F-5; rim by owner ruling R6, 2026-10-11): `Σ (v − b)` over the pixels whose
-/// centres lie within [`GROWTH_RADIUS_PER_FWHM`]` · fwhm` of `(x, y)`, `b` the plain mean of the present (finite,
-/// unmasked) pixels at `10F ≤ d ≤ 12F` from it that `seeds` does not cover. Returns `(growth, b)`. `None` — the star
-/// does not qualify — when the `12F` disc leaves the plane or the caller's `footprint` (some pixel centre within `12F`
-/// with `footprint[i] == false`: LN's region outside its `allowed` mask holds zero fill and unseeded stars, F-5 round
-/// 4), a pixel within `5F` is absent (it would bias the sum low by its missing light), or no rim pixel is left.
-/// `inside` is scratch.
+/// One star's aperture-scale sky and noise (Task 10b, F-10, rulings B2 and B4), in the plane's units: what
+/// [`ring_sky`] reads over R6's ring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingSky {
+    /// B_i: the plain mean of the ring's present pixels.
+    pub mean: f64,
+    /// σ_i: the RMS of `v − B_i` over the same pixels.
+    pub sigma: f64,
+    /// n_i: the present ring pixels read.
+    pub n: u32,
+}
+
+/// A star's aperture-scale sky B_i and noise σ_i (Task 10b, F-10, rulings B2 and B4): R6's ring — the pixels whose
+/// centres lie at `10F ≤ d ≤ 12F` from `(x, y)` ([`GROWTH_RIM_INNER_PER_FWHM`], [`GROWTH_RIM_OUTER_PER_FWHM`]) that
+/// are present (finite, unmasked, and inside the caller's `footprint`), on the plane, and outside every seed's disc
+/// (`seeds`, [`GROWTH_RIM_SEED_MASK_PER_FWHM`]` · F`, built once per call). `mean` is their plain mean, summed in
+/// row-major order (the sum the growth curve's rim read before Task 10b, bit for bit, wherever the `12F` disc lies on
+/// the plane and the footprint); `sigma` is the RMS of `v − mean` over the same pixels; a star near an edge reads its
+/// partial ring. `None` under [`ANNULUS_MIN_PIXELS`] present pixels or for a non-finite centre or width.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn growth_curve(
+pub(crate) fn ring_sky(
     data: &[f32],
     mask: Option<&[bool]>,
     footprint: Option<&[bool]>,
@@ -531,14 +577,192 @@ pub(crate) fn growth_curve(
     x: f64,
     y: f64,
     fwhm: f64,
-    inside: &mut Vec<f64>,
-) -> Option<(f64, f64)> {
-    let (r_ap, r_in, r_out) = (
-        GROWTH_RADIUS_PER_FWHM * fwhm,
+) -> Option<RingSky> {
+    let (r_in, r_out) = (
         GROWTH_RIM_INNER_PER_FWHM * fwhm,
         GROWTH_RIM_OUTER_PER_FWHM * fwhm,
     );
-    if !(r_out.is_finite() && r_out > 0.0)
+    if !(x.is_finite() && y.is_finite() && r_out.is_finite() && r_out > 0.0) || w == 0 || h == 0 {
+        return None;
+    }
+    let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
+    let (y0, y1) = (
+        (y - r_out).ceil().max(0.0),
+        (y + r_out).floor().min((h - 1) as f64),
+    );
+    let (x0, x1) = (
+        (x - r_out).ceil().max(0.0),
+        (x + r_out).floor().min((w - 1) as f64),
+    );
+    if y1 < y0 || x1 < x0 {
+        return None;
+    }
+    let (y0, y1, x0, x1) = (y0 as i64, y1 as i64, x0 as i64, x1 as i64);
+    // The plain sum is the mean's (row-major, as the growth curve's rim summed it); the variance reads sums shifted by
+    // the first ring value, so no large sky level cancels in them.
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    let (mut shift, mut s1, mut s2) = (f64::NAN, 0.0f64, 0.0f64);
+    for py in y0..=y1 {
+        let dy2 = (py as f64 - y).powi(2);
+        if dy2 > r_out2 {
+            continue;
+        }
+        // The pixels surely inside the inner circle (one pixel of margin) are never read: every pixel left is tested
+        // by the same `d²` as before, so the ring's set and order do not change.
+        let half = if dy2 < r_in2 {
+            (r_in2 - dy2).sqrt() - 1.0
+        } else {
+            0.0
+        };
+        let (skip_lo, skip_hi) = if half > 0.0 {
+            ((x - half).floor() as i64 + 1, (x + half).ceil() as i64 - 1)
+        } else {
+            (i64::MAX, i64::MIN)
+        };
+        let row = py as usize * w;
+        let mut px = x0;
+        while px <= x1 {
+            if px >= skip_lo && px <= skip_hi {
+                px = skip_hi + 1;
+                continue;
+            }
+            let d2 = (px as f64 - x).powi(2) + dy2;
+            let i = row + px as usize;
+            px += 1;
+            if d2 < r_in2 || d2 > r_out2 || seeds.covers(i) {
+                continue;
+            }
+            let v = data[i];
+            if !(v.is_finite() && mask.map_or(true, |m| m[i]) && footprint.map_or(true, |f| f[i])) {
+                continue;
+            }
+            let v = v as f64;
+            sum += v;
+            n += 1;
+            if shift.is_nan() {
+                shift = v;
+            }
+            let d = v - shift;
+            s1 += d;
+            s2 += d * d;
+        }
+    }
+    if n < ANNULUS_MIN_PIXELS {
+        return None;
+    }
+    let nf = n as f64;
+    let mean = sum / nf;
+    let var = (s2 / nf - (s1 / nf).powi(2)).max(0.0);
+    Some(RingSky {
+        mean,
+        sigma: var.sqrt(),
+        n: u32::try_from(n).unwrap_or(u32::MAX),
+    })
+}
+
+/// Every kept fit's B_i, σ_i and n_i (Task 10b, F-10, ruling B2: once per accepted fit, after the duplicate drop), at
+/// the ring width `F` returned: the caller's `given` (LN's pair-common arm, [`super::FitStarsOptions::ring_fwhm`];
+/// one that is not a positive number is refused with a `warn!`), else the plane's frame FWHM over the kept fits
+/// neither saturated nor extended ([`super::frame::frame_shape`], the `FrameAggregates::fwhm_px` statistic). The
+/// seeds' `3F` discs are built once ([`SeedMask`]). A fit without a ring (fewer than 8 present pixels, or no `F`: no
+/// fit in the statistic) keeps NaN, NaN, 0 and is counted in the returned `missing`. `pool` as the fit's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ring_skies(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    footprint: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    kept: &mut [(usize, StarFit)],
+    given: Option<f64>,
+    pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+) -> (Option<f64> /* F */, usize /* missing */) {
+    for (_, f) in kept.iter_mut() {
+        f.sky_ring = f64::NAN;
+        f.sky_ring_sigma = f64::NAN;
+        f.sky_ring_n = 0;
+    }
+    if kept.is_empty() {
+        return (None, 0);
+    }
+    let own = || {
+        super::frame::frame_shape(
+            kept.iter()
+                .map(|(_, f)| f)
+                .filter(|f| f.flags.in_statistic()),
+        )
+        .map(|(f, _)| f)
+    };
+    let fwhm = match given {
+        Some(f) if f.is_finite() && f > 0.0 => Some(f),
+        Some(bad) => {
+            tracing::warn!(
+                fwhm_px = bad,
+                count = kept.len(),
+                "ring sky: the given ring width is not a positive number; the plane's own frame FWHM is used"
+            );
+            own()
+        }
+        None => own(),
+    }
+    .filter(|f| f.is_finite() && *f > 0.0);
+    let Some(f_ring) = fwhm else {
+        tracing::debug!(
+            count = kept.len(),
+            "ring sky: no frame FWHM on the plane; no star carries a ring sky"
+        );
+        return (None, kept.len());
+    };
+    let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring);
+    let mut body = || {
+        kept.par_iter_mut().for_each(|(_, f)| {
+            if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
+                f.sky_ring = r.mean;
+                f.sky_ring_sigma = r.sigma;
+                f.sky_ring_n = r.n;
+            }
+        })
+    };
+    match pool {
+        Some(p) => p.install(body),
+        None => body(),
+    }
+    let missing = kept.iter().filter(|(_, f)| f.sky_ring_n == 0).count();
+    tracing::debug!(
+        count = kept.len(),
+        missing,
+        fwhm_px = f_ring,
+        "ring sky measured"
+    );
+    (Some(f_ring), missing)
+}
+
+/// A star's growth-curve flux at `5F` (F-5; its sky the star's stored B_i from Task 10b, ruling B2): `Σ (v − b)` over
+/// the pixels whose centres lie within [`GROWTH_RADIUS_PER_FWHM`]` · fwhm` of `(x, y)`, summed in row-major order, `b`
+/// the caller's B_i ([`ring_sky`]). `None` — the star does not qualify (`c`'s own rule, unchanged) — when `b` is
+/// missing (not finite), the `12F` disc leaves the plane or the caller's `footprint` (some pixel centre within `12F`
+/// with `footprint[i] == false`: LN's region outside its `allowed` mask holds zero fill and unseeded stars, F-5 round
+/// 4), or a pixel within `5F` is absent (it would bias the sum low by its missing light). `inside` is scratch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn growth_curve(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    footprint: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    x: f64,
+    y: f64,
+    fwhm: f64,
+    b: f64,
+    inside: &mut Vec<f64>,
+) -> Option<f64> {
+    let (r_ap, r_out) = (
+        GROWTH_RADIUS_PER_FWHM * fwhm,
+        GROWTH_RIM_OUTER_PER_FWHM * fwhm,
+    );
+    if !b.is_finite()
+        || !(r_out.is_finite() && r_out > 0.0)
         || x - r_out < 0.0
         || y - r_out < 0.0
         || x + r_out > (w as f64 - 1.0)
@@ -546,9 +770,8 @@ pub(crate) fn growth_curve(
     {
         return None;
     }
-    let (r_ap2, r_in2, r_out2) = (r_ap * r_ap, r_in * r_in, r_out * r_out);
+    let (r_ap2, r_out2) = (r_ap * r_ap, r_out * r_out);
     inside.clear();
-    let (mut rim_sum, mut rim_n) = (0.0f64, 0usize);
     let (y0, y1) = ((y - r_out).ceil() as usize, (y + r_out).floor() as usize);
     let (x0, x1) = ((x - r_out).ceil() as usize, (x + r_out).floor() as usize);
     for py in y0..=y1 {
@@ -559,23 +782,15 @@ pub(crate) fn growth_curve(
             if d2 <= r_out2 && footprint.is_some_and(|f| !f[i]) {
                 return None;
             }
-            let present = data[i].is_finite() && mask.map_or(true, |m| m[i]);
             if d2 <= r_ap2 {
-                if !present {
+                if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
                     return None;
                 }
                 inside.push(data[i] as f64);
-            } else if d2 >= r_in2 && d2 <= r_out2 && present && !seeds.covers(i) {
-                rim_sum += data[i] as f64;
-                rim_n += 1;
             }
         }
     }
-    if rim_n == 0 {
-        return None;
-    }
-    let b = rim_sum / rim_n as f64;
-    Some((inside.iter().map(|v| v - b).sum(), b))
+    Some(inside.iter().map(|v| v - b).sum())
 }
 
 /// The clip screen's range on a path without a saturation verdict (F-5, owner ruling R6 / C6): F-3's
@@ -619,19 +834,20 @@ pub(crate) fn unverdicted_clip_range(
     .range
 }
 
-/// The plane's aperture correction (F-5, ruling R-OSP-7; rim and screen by owner ruling R6, 2026-10-11):
-/// `c = median(growth / model)` over the [`CORRECTION_STARS`] brightest qualifying fits by [`model_flux_in_fwtm`] (ties
-/// by seed index), the growth the [`growth_curve`] flux at `5F` against the far-ring mean outside every seed's `3F`
-/// disc ([`SeedMask`], built once here), `F` the plane's frame FWHM ([`super::frame_shape`] over the unsaturated fits,
-/// the `FrameAggregates::fwhm_px` statistic). A qualifying fit is accepted (`fits` = the kept fits after the duplicate
-/// drop, with their seed indices), not flagged saturated (own or cross-plane), has a finite positive model flux, passes
-/// the clip screen (its fitted amplitude not above the range, F-3's amplitude clause: `saturation`'s
-/// [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the caller's `full_scale`),
-/// has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm` of its fitted centre,
-/// and a [`growth_curve`] (its `12F` disc inside the plane and the caller's `footprint`, no absent pixel within `5F`,
-/// a rim pixel left). Returns `(c, ratios)`: `c` is `None`
-/// with no fit at all (`debug!`) or with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is
-/// used uncorrected, `c = 1`); both per-plane events count the screened candidates (`skipped`).
+/// The plane's aperture correction (F-5, ruling R-OSP-7; rim and screen by owner ruling R6, 2026-10-11; the rim read
+/// once per star from Task 10b, ruling B2): `c = median(growth / model)` over the [`CORRECTION_STARS`] brightest
+/// qualifying fits by [`model_flux_in_fwtm`] (ties by seed index), the growth the [`growth_curve`] flux at `5F` against
+/// the fit's stored B_i ([`StarFit::sky_ring`], [`ring_skies`]), `F` = `ring_fwhm`, the ring width the B_i were read at
+/// (the plane's frame FWHM over the fits neither saturated nor extended, or the caller's
+/// [`super::FitStarsOptions::ring_fwhm`]). A qualifying fit is accepted (`fits` = the kept fits after the duplicate
+/// drop, with their seed indices), not flagged saturated (own or cross-plane) nor extended (Task 10b, P3), has a
+/// finite positive model flux, passes the clip screen (its fitted amplitude not above the range, F-3's amplitude
+/// clause: `saturation`'s [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the
+/// caller's `full_scale`), has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm`
+/// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
+/// `footprint`, no absent pixel within `5F`). Returns `(c, ratios)`: `c` is `None` with no fit at all (`debug!`) or
+/// with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
+/// per-plane events count the screened candidates (`skipped`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -641,6 +857,7 @@ pub(crate) fn aperture_correction(
     fits: &[(usize, StarFit)],
     seeds: &[Seed],
     field_fwhm: f64,
+    ring_fwhm: Option<f64>,
     saturation: Option<&SaturationPlane>,
     full_scale: Option<f64>,
     footprint: Option<&[bool]>,
@@ -656,13 +873,10 @@ pub(crate) fn aperture_correction(
         || unverdicted_clip_range(data, mask, w, h, full_scale),
         |s| s.range,
     );
-    let frame_fwhm =
-        super::frame::frame_shape(fits.iter().map(|(_, f)| f).filter(|f| !f.flags.saturated()))
-            .map(|(f, _)| f);
     let r_iso = CORRECTION_ISOLATION_PER_FIELD_FWHM * field_fwhm;
     let mut ratios: Vec<f64> = Vec::new();
     let mut screened = 0usize;
-    if let Some(f_frame) = frame_fwhm.filter(|f| f.is_finite() && *f > 0.0) {
+    if let Some(f_ring) = ring_fwhm.filter(|f| f.is_finite() && *f > 0.0) {
         if r_iso.is_finite() && r_iso > 0.0 {
             // Every seed by its `r_iso` cell: a seed within `r_iso` of a centre lies in the 3×3 cells about it.
             let cell = |x: f64, y: f64| ((x / r_iso).floor() as i64, (y / r_iso).floor() as i64);
@@ -682,9 +896,10 @@ pub(crate) fn aperture_correction(
                     })
                 })
             };
+            // Neither saturated (F-3) nor extended (F-10, P3): a knot is not a star whose growth curve `c` reads.
             let mut candidates: Vec<(usize, &StarFit, f64)> = fits
                 .iter()
-                .filter(|(_, f)| !f.flags.saturated())
+                .filter(|(_, f)| f.flags.in_statistic())
                 .map(|(i, f)| (*i, f, model_flux_in_fwtm(f)))
                 .filter(|&(_, _, m)| m.is_finite() && m > 0.0)
                 .collect();
@@ -695,30 +910,27 @@ pub(crate) fn aperture_correction(
                 !clipped
             });
             candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-            if !candidates.is_empty() {
-                let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_frame);
-                let mut inside = Vec::new();
-                for (seed, f, model) in candidates {
-                    if ratios.len() == CORRECTION_STARS {
-                        break;
-                    }
-                    if !isolated(seed, f) {
-                        continue;
-                    }
-                    if let Some((growth, _)) = growth_curve(
-                        data,
-                        mask,
-                        footprint,
-                        &seed_mask,
-                        w,
-                        h,
-                        f.x,
-                        f.y,
-                        f_frame,
-                        &mut inside,
-                    ) {
-                        ratios.push(growth / model);
-                    }
+            let mut inside = Vec::new();
+            for (seed, f, model) in candidates {
+                if ratios.len() == CORRECTION_STARS {
+                    break;
+                }
+                if !isolated(seed, f) {
+                    continue;
+                }
+                if let Some(growth) = growth_curve(
+                    data,
+                    mask,
+                    footprint,
+                    w,
+                    h,
+                    f.x,
+                    f.y,
+                    f_ring,
+                    f.sky_ring,
+                    &mut inside,
+                ) {
+                    ratios.push(growth / model);
                 }
             }
         }
@@ -728,7 +940,7 @@ pub(crate) fn aperture_correction(
         tracing::warn!(
             count = n,
             skipped = screened,
-            fwhm_px = frame_fwhm,
+            fwhm_px = ring_fwhm,
             "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
         );
         return (None, n);
@@ -738,7 +950,7 @@ pub(crate) fn aperture_correction(
         count = n,
         skipped = screened,
         aperture_correction = c,
-        fwhm_px = frame_fwhm,
+        fwhm_px = ring_fwhm,
         "aperture correction measured"
     );
     (Some(c), n)
@@ -868,6 +1080,7 @@ mod tests {
             0.0,
             0.05,
             2.6,
+            f64::INFINITY,
             &plane,
             &FitParams::default(),
             &mut s,
@@ -879,6 +1092,7 @@ mod tests {
             0.0,
             0.05,
             2.6,
+            f64::INFINITY,
             &plane,
             &FitParams::default(),
             &mut s,
@@ -933,8 +1147,18 @@ mod tests {
         let plane = SaturationPlane::new(bg, 0.002, 1.0, 1.0, false);
         let params = FitParams::default();
         let mut s = FitScratch::default();
-        let v = saturation_verdict(&region, 0.0, 0.0, bg, 2.5, &plane, &params, &mut s)
-            .expect("a verdict");
+        let v = saturation_verdict(
+            &region,
+            0.0,
+            0.0,
+            bg,
+            2.5,
+            f64::INFINITY,
+            &plane,
+            &params,
+            &mut s,
+        )
+        .expect("a verdict");
         println!("verdict: {v:?}");
         assert!(v.plateau && v.excluded == 50, "{v:?}");
         assert!(
@@ -967,8 +1191,18 @@ mod tests {
             ..FitParams::default()
         };
         let mut s = FitScratch::default();
-        let v = saturation_verdict(&region, 0.0, 0.0, bg, 2.5, &plane, &params, &mut s)
-            .expect("a verdict");
+        let v = saturation_verdict(
+            &region,
+            0.0,
+            0.0,
+            bg,
+            2.5,
+            f64::INFINITY,
+            &plane,
+            &params,
+            &mut s,
+        )
+        .expect("a verdict");
         assert!(
             !v.fit && v.saturated && v.by_plateau_clip && !v.by_amplitude,
             "{v:?}"
@@ -1219,6 +1453,9 @@ mod tests {
                 signal: 0.0,
                 area: 0.0,
                 peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
                 flags: Default::default(),
             };
             f.fwtm_x = 2.0 * ax * (10f64.powf(1.0 / beta) - 1.0).sqrt();
@@ -1242,9 +1479,10 @@ mod tests {
         );
     }
 
-    /// A pin (C0's qualifying rules; rim and edge by owner ruling R6): the growth-curve flux of a lone round Gaussian
-    /// star is its total within its `5F` disc, measured against the `[10F, 12F]` rim mean; the `12F` disc leaving the
-    /// plane, or one absent pixel within `5F`, refuses it; an absent rim pixel is only left out.
+    /// A pin (C0's qualifying rules; rim and edge by owner ruling R6; the rim read by `ring_sky` and handed in as B_i
+    /// from Task 10b, ruling B2): the growth-curve flux of a lone round Gaussian star is its total within its `5F` disc,
+    /// measured against the `[10F, 12F]` ring mean; the `12F` disc leaving the plane, one absent pixel within `5F` or a
+    /// missing B_i refuses it; an absent ring pixel is only left out of B_i.
     #[test]
     fn growth_curve_is_the_disc_sum_over_the_rim_and_refuses_an_edge_or_absent_pixel() {
         let (w, h) = (120usize, 120usize);
@@ -1255,33 +1493,29 @@ mod tests {
         let total = 2.0 * std::f64::consts::PI * sigma * sigma * amp;
         let none = SeedMask::new(w, h, &[], 0.0);
         let mut scratch = Vec::new();
-        let (g, b) = growth_curve(
-            &data,
-            None,
-            None,
-            &none,
-            w,
-            h,
-            60.3,
-            59.6,
-            fwhm,
-            &mut scratch,
-        )
-        .unwrap();
-        assert!((g / total - 1.0).abs() < 1e-3, "{g} vs {total}");
+        let b = ring_sky(&data, None, None, &none, w, h, 60.3, 59.6, fwhm)
+            .unwrap()
+            .mean;
         assert_eq!(b, 50.0, "the far ring is flat sky");
+        let g = growth_curve(&data, None, None, w, h, 60.3, 59.6, fwhm, b, &mut scratch).unwrap();
+        assert!((g / total - 1.0).abs() < 1e-3, "{g} vs {total}");
         // The 12F disc (56.5 px) leaves a 120-px plane from a centre 30 px off its edge.
+        assert_eq!(
+            growth_curve(&data, None, None, w, h, 30.0, 60.0, fwhm, b, &mut scratch),
+            None
+        );
+        // A missing B_i (Task 10b): no qualifier.
         assert_eq!(
             growth_curve(
                 &data,
                 None,
                 None,
-                &none,
                 w,
                 h,
-                30.0,
-                60.0,
+                60.3,
+                59.6,
                 fwhm,
+                f64::NAN,
                 &mut scratch
             ),
             None
@@ -1289,18 +1523,7 @@ mod tests {
         let mut holed = data.clone();
         holed[62 * w + 61] = f32::NAN; // 2.5 px from the centre, inside 5F (23.5 px)
         assert_eq!(
-            growth_curve(
-                &holed,
-                None,
-                None,
-                &none,
-                w,
-                h,
-                60.3,
-                59.6,
-                fwhm,
-                &mut scratch
-            ),
+            growth_curve(&holed, None, None, w, h, 60.3, 59.6, fwhm, b, &mut scratch),
             None
         );
         let mut mask = vec![true; w * h];
@@ -1310,28 +1533,31 @@ mod tests {
                 &data,
                 Some(&mask),
                 None,
-                &none,
                 w,
                 h,
                 60.3,
                 59.6,
                 fwhm,
+                b,
                 &mut scratch
             ),
             None
         );
         let mut rim_hole = data.clone();
         rim_hole[59 * w + (60 + 52)] = f32::NAN; // 51.7 px out: in the [10F, 12F] = [47.1, 56.5] rim
-        let (g2, _) = growth_curve(
+        let b2 = ring_sky(&rim_hole, None, None, &none, w, h, 60.3, 59.6, fwhm)
+            .unwrap()
+            .mean;
+        let g2 = growth_curve(
             &rim_hole,
             None,
             None,
-            &none,
             w,
             h,
             60.3,
             59.6,
             fwhm,
+            b2,
             &mut scratch,
         )
         .unwrap();
@@ -1347,7 +1573,7 @@ mod tests {
         }
     }
 
-    /// R6 (owner ruling 2026-10-11): a neighbour inside the `[10F, 12F]` ring leaves the rim mean `b` where it is when
+    /// R6 (owner ruling 2026-10-11): a neighbour inside the `[10F, 12F]` ring leaves the ring mean B_i where it is when
     /// its seed is handed to the call (its `3F` disc is masked out of the ring) and lifts it when it is not.
     #[test]
     fn a_seeded_neighbour_in_the_rim_ring_is_masked_out_of_the_rim_mean() {
@@ -1362,17 +1588,19 @@ mod tests {
         let r = GROWTH_RIM_SEED_MASK_PER_FWHM * fwhm;
         let own = SeedMask::new(w, h, &[seed_at(x, y)], r);
         let both = SeedMask::new(w, h, &[seed_at(x, y), seed_at(nx, ny)], r);
-        let mut scratch = Vec::new();
-        let (_, b_lone) =
-            growth_curve(&lone, None, None, &own, w, h, x, y, fwhm, &mut scratch).unwrap();
-        let (_, b_masked) =
-            growth_curve(&pair, None, None, &both, w, h, x, y, fwhm, &mut scratch).unwrap();
+        let b_lone = ring_sky(&lone, None, None, &own, w, h, x, y, fwhm)
+            .unwrap()
+            .mean;
+        let b_masked = ring_sky(&pair, None, None, &both, w, h, x, y, fwhm)
+            .unwrap()
+            .mean;
         assert!(
             (b_masked - b_lone).abs() < 1e-9,
             "seeded neighbour: b {b_masked} vs {b_lone}"
         );
-        let (_, b_open) =
-            growth_curve(&pair, None, None, &own, w, h, x, y, fwhm, &mut scratch).unwrap();
+        let b_open = ring_sky(&pair, None, None, &own, w, h, x, y, fwhm)
+            .unwrap()
+            .mean;
         assert!(
             b_open - b_lone > 1.0,
             "unseeded neighbour: b {b_open} vs {b_lone}"
@@ -1386,7 +1614,6 @@ mod tests {
         let (w, h) = (160usize, 160usize);
         let sigma = 2.0;
         let fwhm = sigma * 2.354_820_045; // 12F = 56.5 px; the far edges are at 159
-        let none = SeedMask::new(w, h, &[], 0.0);
         let mut scratch = Vec::new();
         for (x, y, measured) in [
             (52.0, 80.0, false),
@@ -1399,14 +1626,14 @@ mod tests {
             (80.0, 102.0, true),
         ] {
             let data = gaussian_field(w, h, &[(x, y, 1000.0)], sigma, 50.0);
-            let g = growth_curve(&data, None, None, &none, w, h, x, y, fwhm, &mut scratch);
+            let g = growth_curve(&data, None, None, w, h, x, y, fwhm, 50.0, &mut scratch);
             assert_eq!(g.is_some(), measured, "({x}, {y}): {g:?}");
         }
     }
 
     /// F-5 round 4: the caller's footprint holds the whole `12F` disc like the plane edge — one pixel outside the
     /// footprint 56 px from the centre (inside `12F` = 56.5 px) refuses the star, one 57 px from it does not, and the
-    /// measured star's growth and rim are those of the call without a footprint (the footprint is read, never summed).
+    /// measured star's growth is that of the call without a footprint (the footprint is read, never summed).
     #[test]
     fn the_growth_curve_refuses_a_star_whose_12f_disc_leaves_the_footprint() {
         let (w, h) = (160usize, 160usize);
@@ -1414,9 +1641,8 @@ mod tests {
         let fwhm = sigma * 2.354_820_045; // 12F = 56.5 px
         let (x, y) = (80.0, 80.0);
         let data = gaussian_field(w, h, &[(x, y, 1000.0)], sigma, 50.0);
-        let none = SeedMask::new(w, h, &[], 0.0);
         let mut scratch = Vec::new();
-        let bare = growth_curve(&data, None, None, &none, w, h, x, y, fwhm, &mut scratch).unwrap();
+        let bare = growth_curve(&data, None, None, w, h, x, y, fwhm, 50.0, &mut scratch).unwrap();
         for (px, measured) in [(136usize, false), (137, true)] {
             let mut footprint = vec![true; w * h];
             footprint[80 * w + px] = false;
@@ -1424,12 +1650,12 @@ mod tests {
                 &data,
                 None,
                 Some(&footprint),
-                &none,
                 w,
                 h,
                 x,
                 y,
                 fwhm,
+                50.0,
                 &mut scratch,
             );
             assert_eq!(g.is_some(), measured, "outside at x = {px}: {g:?}");
@@ -1437,5 +1663,75 @@ mod tests {
                 assert_eq!(g, bare, "the footprint changes no sum");
             }
         }
+    }
+
+    /// Task 10b (ruling B2): `ring_sky` reads exactly the pixels a plain scan of the plane finds in the ring — centres at
+    /// `10F ≤ d ≤ 12F`, present (finite, unmasked, inside the footprint) and outside every seed's `3F` disc — summed in
+    /// row-major order, so B_i is that scan's mean bit for bit (the inner circle it never visits is not in the ring);
+    /// σ_i is their RMS about B_i; a star near a corner reads its partial ring; under 8 pixels there is none.
+    #[test]
+    fn ring_sky_is_the_plain_scan_of_the_ring_pixels() {
+        use crate::test_support::add_noise;
+        let (w, h) = (150usize, 130usize);
+        let mut data = gaussian_field(w, h, &[(70.4, 61.7, 900.0), (101.0, 95.0, 700.0)], 1.6, 0.0);
+        for v in data.iter_mut() {
+            *v += 3000.0;
+        }
+        add_noise(&mut data, 12.0, 41);
+        data[17 * w + 33] = f32::NAN;
+        let mut mask = vec![true; w * h];
+        mask[60 * w + 120] = false;
+        let mut footprint = vec![true; w * h];
+        footprint[100 * w + 30] = false;
+        let seeds = [seed_at(70.4, 61.7), seed_at(101.0, 95.0)];
+        for &(x, y, fwhm) in &[
+            (70.4, 61.7, 4.1),
+            (66.25, 58.5, 3.3),
+            (8.6, 120.2, 2.7),
+            (140.0, 4.0, 1.9),
+        ] {
+            let sm = SeedMask::new(w, h, &seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * fwhm);
+            let r_in2 = (GROWTH_RIM_INNER_PER_FWHM * fwhm).powi(2);
+            let r_out2 = (GROWTH_RIM_OUTER_PER_FWHM * fwhm).powi(2);
+            let mut picked: Vec<f64> = Vec::new();
+            for py in 0..h {
+                let dy2 = (py as f64 - y).powi(2);
+                for px in 0..w {
+                    let d2 = (px as f64 - x).powi(2) + dy2;
+                    let i = py * w + px;
+                    if d2 >= r_in2
+                        && d2 <= r_out2
+                        && !sm.covers(i)
+                        && data[i].is_finite()
+                        && mask[i]
+                        && footprint[i]
+                    {
+                        picked.push(data[i] as f64);
+                    }
+                }
+            }
+            let got =
+                ring_sky(&data, Some(&mask), Some(&footprint), &sm, w, h, x, y, fwhm).unwrap();
+            assert_eq!(got.n as usize, picked.len(), "({x}, {y}) F {fwhm}");
+            let mean = picked.iter().sum::<f64>() / picked.len() as f64;
+            assert_eq!(
+                got.mean, mean,
+                "({x}, {y}) F {fwhm}: the scan's mean, bit for bit"
+            );
+            let rms = (picked.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / picked.len() as f64)
+                .sqrt();
+            assert!(
+                (got.sigma / rms - 1.0).abs() < 1e-9,
+                "σ_i {} vs {rms}",
+                got.sigma
+            );
+        }
+        let none = SeedMask::new(w, h, &[], 0.0);
+        assert_eq!(
+            ring_sky(&data, None, None, &none, w, h, 70.0, 60.0, 0.1),
+            None,
+            "4 ring pixels: under 8"
+        );
     }
 }

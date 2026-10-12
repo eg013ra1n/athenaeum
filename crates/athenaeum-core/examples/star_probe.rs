@@ -12,6 +12,8 @@
 //!       [--diagnostics]   (one `refused` line per seed the measure path did not accept)
 //!       [--seeds matched|peak|structure]   (default: the config's `seedSource`, the matched filter without `--config`)
 //!       [--seed-threshold K]   (the matched filter's threshold in σ_f; default: the config's `seedThreshold`)
+//!       [--pixel-noise white|mixed|unknown]   (the caller's statement of the pixels' noise correlation, ruling C-10;
+//!                              default: what the Measure stage states for a calibrated frame, 1 plane white, 3 mixed)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -74,6 +76,29 @@
 //! the measure and betas frame lines carry `apertureCorrection` (that `c`,
 //! null when the plane had fewer than 5 qualifying stars: `c = 1`) and
 //! `apertureStars` (the qualifying stars it is the median over).
+//!
+//! F-10 (Plan A Task 10b, phase A1): the matched filter's measure frame line
+//! carries `sigmaF` (the propagated detection noise its second pass
+//! thresholded at, native units), `sigmaFMeasured` (the filtered plane's
+//! measured σ, the rule through Task 10), `noiseGain` (the noise's
+//! filtered-to-pixel ratio, exactly 1 when `pixelNoise` is `white`), `structureDropped` (seeds the knot test
+//! dropped) and `extendedSeeds` (seeds it flagged extended; each seed line
+//! carries `extended`); all `null` for the other detectors. A star whose
+//! seed was flagged carries the flag `extended`. Each seed line (and, with
+//! `--diagnostics`, each measure star line) carries `filterSnr`, the seed's
+//! matched-filter response over the propagated σ_f it was thresholded at;
+//! absent when not computed (other detectors, a star line without its seed).
+//!
+//! F-10 (Plan A Task 10b, phase A2b): the measure frame line also carries
+//! `fieldWidth` (the plane's field width, px, the fit's and the knot kernels'),
+//! `fieldWidthSpread` (`s`, px: the stars' width spread about it) and
+//! `fieldWidthEnvelope` (F_env = fieldWidth + 3.09·s, px: the FWHM the knot
+//! bounds sit at); the last two `null` when the matched filter did not run.
+//!
+//! F-10 (Plan A Task 10b, phase A4): the measure frame line carries `trailed`
+//! (the plane-level trailed verdict: no star kept, every would-be accepted fit
+//! refused `trailed`) and `trailShare` (its input: the share of the judged seeds
+//! refused `centreMoved`, `regionTooSmall` or `centreAtRim`, A4-2), on every detector.
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -98,8 +123,8 @@ use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
 use athenaeum_core::star_measure::{
-    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, RefusalCounts, RefusalReason,
-    SaturationVerdict,
+    fit_stars_at, FitDiagnostics, FitStarsOptions, Outcome, PixelNoise, RefusalCounts,
+    RefusalReason, SaturationVerdict,
 };
 use serde_json::{json, Value};
 
@@ -209,6 +234,8 @@ fn fit_line(path: &str, plane: usize, beta: Option<f64>, f: &StarFit) -> Value {
         "peak5": n_or_null(f.peak5 / s),
         "fwhmX": f.fwhm_x, "fwhmY": f.fwhm_y, "fwhm": f.fwhm(), "ecc": f.eccentricity(),
         "thetaDeg": f.theta.to_degrees(), "residual": f.residual, "flags": f.flags.names(),
+        "skyRing": n_or_null(f.sky_ring / s), "skyRingSigma": n_or_null(f.sky_ring_sigma / s),
+        "skyRingN": f.sky_ring_n, "skyOffset": n_or_null(f.sky_offset() / s),
     })
 }
 
@@ -226,7 +253,7 @@ fn verdict_json(v: Option<SaturationVerdict>) -> Value {
         Some(v) => json!({
             "plateau": v.plateau, "level": n_or_null(v.level / s), "excluded": v.excluded,
             "amplitude": n_or_null(v.amplitude / s), "beta": n_or_null(v.beta), "fwhm": n_or_null(v.fwhm),
-            "saturated": v.saturated, "fit": v.fit,
+            "saturated": v.saturated, "fit": v.fit, "centred": v.centred,
             "byAmplitude": v.by_amplitude, "byPlateauClip": v.by_plateau_clip,
             "flagSource": match (v.saturated, v.cross) {
                 (false, _) => Value::Null,
@@ -320,6 +347,7 @@ struct MeasureArgs {
     diagnostics: bool,
     seeds: Option<SeedChoice>,
     seed_threshold: Option<f64>,
+    pixel_noise: Option<PixelNoise>,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -337,6 +365,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         diagnostics: false,
         seeds: None,
         seed_threshold: None,
+        pixel_noise: None,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
@@ -372,6 +401,12 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
             "--paths" => a.paths = v().split(',').map(String::from).collect(),
             "--domain" => a.domain = Domain::parse(&v()),
             "--seeds" => a.seeds = Some(SeedChoice::parse(&v())),
+            "--pixel-noise" => {
+                a.pixel_noise = Some(
+                    PixelNoise::parse(&v())
+                        .unwrap_or_else(|| die("--pixel-noise: white | mixed | unknown")),
+                )
+            }
             "--seed-threshold" => {
                 a.seed_threshold = Some(
                     v().parse()
@@ -519,6 +554,12 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     // F-3 (Q3): a 3-plane input is a debayered colour image. Every plane goes through the run's multi-plane entry
     // (Task 8 fix wave: the cross-plane rule reads every plane's verdicts), whichever planes are selected.
     let colour = planes.len() == 3;
+    // Ruling C-10: what the Measure stage states for a calibrated frame unless the flag says otherwise.
+    let pixel_noise = a.pixel_noise.unwrap_or(match planes.len() {
+        1 => PixelNoise::White,
+        3 => PixelNoise::Mixed,
+        _ => PixelNoise::Unknown,
+    });
     let mut measured: Vec<_> = if need_measure && !selected.is_empty() {
         measure_planes_diagnosed(
             planes.len(),
@@ -528,6 +569,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             None,
             seed_source,
             a.diagnostics,
+            pixel_noise,
             |p| Ok::<_, Infallible>(Cow::Borrowed(planes[p].as_slice())),
         )
         .unwrap_or_else(|never| match never {})
@@ -544,10 +586,25 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         let (pm, seeds, diagnostics, wall) = (mp.measurement, mp.seeds, mp.diagnostics, mp.wall_ms);
         let s = ADU_SCALE as f64;
         if want("measure") {
+            // F-10 (Task 10b): the matched filter's knot flag rides on its seed's line (`null` for other detectors), and
+            // its filtered SNR (the response over the propagated σ_f) as `filterSnr`, absent when not computed.
+            let extended = |i: usize| {
+                pm.detection
+                    .as_ref()
+                    .map(|d| d.extended.get(i).copied().unwrap_or(false))
+            };
+            let filter_snr = |i: usize| {
+                pm.detection
+                    .as_ref()
+                    .and_then(|d| d.filter_snr.get(i).copied())
+            };
             for (i, sd) in seeds.iter().enumerate() {
-                emit(
-                    json!({"kind": "seed", "plane": p, "i": i, "x": sd.x, "y": sd.y, "peak": sd.peak / s, "flux": sd.flux / s}),
-                );
+                let mut line = json!({"kind": "seed", "plane": p, "i": i, "x": sd.x, "y": sd.y, "peak": sd.peak / s,
+                                      "flux": sd.flux / s, "extended": extended(i)});
+                if let (Some(v), Some(obj)) = (filter_snr(i), line.as_object_mut()) {
+                    obj.insert("filterSnr".into(), n_or_null(v));
+                }
+                emit(line);
             }
             // `--diagnostics`: each accepted star's seed record (its seed index and saturation verdict).
             let mut star_seed: Vec<Option<&FitDiagnostics>> = vec![None; pm.fits.len()];
@@ -560,6 +617,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 let mut line = fit_line("measure", p, None, f);
                 if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
                     obj.insert("seed".into(), json!(d.seed));
+                    if let Some(v) = filter_snr(d.seed) {
+                        obj.insert("filterSnr".into(), n_or_null(v));
+                    }
                     obj.insert("verdict".into(), verdict_json(d.verdict));
                     if let Some(b) = d.sample_beta {
                         obj.insert("sampleBeta".into(), n_or_null(b));
@@ -589,7 +649,18 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
                         "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
                         "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
+                        "ringSkyMissing": pm.ring_sky_missing,
+                        "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share),
                         "frameFwhm": pm.channel.fwhm_px, "frameEcc": pm.channel.eccentricity,
+                        "sigmaF": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f / s)),
+                        "sigmaFMeasured": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f_measured / s)),
+                        "noiseGain": pm.detection.as_ref().map(|d| n_or_null(d.noise_gain)),
+                        "pixelNoise": pixel_noise.as_str(),
+                        "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
+                        "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
+                        "fieldWidth": n_or_null(pm.field_width.fwhm_px),
+                        "fieldWidthSpread": pm.detection.as_ref().map(|d| n_or_null(d.envelope.spread_px)),
+                        "fieldWidthEnvelope": pm.detection.as_ref().map(|d| n_or_null(d.envelope.fwhm_px)),
                         "channel": pm.channel, "options": options, "conversion": conversion,
                         "domain": domain, "nonFinite": non_finite, "wallMs": wall}),
             );
@@ -615,6 +686,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                     json!({"kind": "frame", "path": "betas", "plane": p, "beta": b, "seeds": seeds.len(),
                             "fits": o.fits.len(), "refused": refused_counts(&o.refused), "statistic": "residual-weighted mean over all accepted fits",
                             "apertureCorrection": o.aperture_correction, "apertureStars": o.aperture_stars,
+                            "ringSkyMissing": o.ring_sky_missing,
                             "frameFwhm": ff, "frameEcc": fe, "options": options, "conversion": conversion,
                             "domain": domain, "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
                 );
@@ -877,6 +949,7 @@ mod tests {
             diagnostics: false,
             seeds: None,
             seed_threshold: None,
+            pixel_noise: None,
         }
     }
 
