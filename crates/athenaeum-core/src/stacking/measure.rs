@@ -152,7 +152,23 @@ pub struct ChannelMeasurement {
     /// Of `stars_fitted`, the fits not flagged saturated (F-3, Plan A Task 8): the population `fwhm_px` and
     /// `eccentricity` are measured over. `0` in a payload written before that task.
     pub stars_unsaturated: usize,
+    /// The β every star of this plane was fitted at: under the stacking Measure stage's `Auto` the group β (Plan A
+    /// Task 11b, owner decision R11b-12 — `psf_signal::group_beta` of the members' [`Self::beta_own`], the value
+    /// `stacking_run_groups.beta` records and LN fits at), a group of one's own β; under `Moffat4` 4.0; elsewhere the
+    /// plane's own `Auto` β.
     pub beta: f64,
+    /// The plane's own β (F-4's E5 estimator, unchanged; Task 11b): a diagnostic, never consumed — reported beside
+    /// `beta`. `Some` only from the two-pass group measure ([`measure_planes_pass1`]); `None` on every single-pass
+    /// path (`Moffat4`, `Fixed`, the master statistics) and in a payload written before Task 11b — and then never
+    /// serialized, so those payloads stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beta_own: Option<f64>,
+    /// The plane's own β sits at a bound of [`crate::star_measure::BETA_BOUNDS`] (`star_measure::beta::at_bound`, the
+    /// test that sets `StarFlags::BETA_AT_CAP` on a fit at a frame β): the own β is then a clamp, not an estimate.
+    /// `false` wherever `beta_own` is `None` and in a payload written before this field; then never serialized, so
+    /// those payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub beta_own_at_cap: bool,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -557,6 +573,154 @@ pub fn measure_planes_diagnosed<'a, E>(
     Ok(out.into_iter().flatten().collect())
 }
 
+/// One image's first pass of the stacking Measure stage's group measure (Plan A Task 11b, owner decision R11b-12):
+/// every plane's adapter head (its detector and seeds) and verdict pass ([`sm::prepare_plane`], with
+/// [`sm::cross_plane_flags`] between the planes of a multi-plane image), then every plane's own β
+/// ([`sm::plane_beta`]: F-4's E5 estimator, unchanged). Holds no plane-sized buffer — the seeds and their per-seed
+/// records, a few hundred bytes a seed — so a whole group's first passes can wait for the group β, which
+/// [`measure_planes_pass2`] then fits every plane at.
+pub struct PlanesPass1 {
+    w: usize,
+    h: usize,
+    heads: Vec<AdapterHead>,
+    preps: Vec<sm::PlanePrep>,
+    beta_own: Vec<f64>,
+    walls: Vec<Duration>,
+}
+
+impl PlanesPass1 {
+    /// Every plane's own β, in plane order.
+    pub fn beta_own(&self) -> &[f64] {
+        &self.beta_own
+    }
+
+    /// The image's plane count.
+    pub fn planes(&self) -> usize {
+        self.beta_own.len()
+    }
+}
+
+/// [`measure_planes_diagnosed`]'s first half for the group measure (Task 11b): the same heads and verdict passes with
+/// the same arguments, then each plane's own β. `plane(p)` as there: one plane is read once (its β reads the copy
+/// its verdict pass read), a plane of a multi-plane image twice (after every plane's verdict pass, the cross-plane
+/// rule, last to first so the last plane passes straight through).
+#[allow(clippy::too_many_arguments)]
+pub fn measure_planes_pass1<'a, E>(
+    n_planes: usize,
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
+) -> Result<PlanesPass1, E> {
+    // The arguments `measure_planes_diagnosed` hands its heads: one plane is mono (no colour, no site share).
+    let colour = n_planes == 3;
+    let mut walls = vec![Duration::ZERO; n_planes];
+    let mut heads = Vec::with_capacity(n_planes);
+    let mut preps = Vec::with_capacity(n_planes);
+    let mut beta_own = vec![f64::NAN; n_planes];
+    let mut last: Option<Cow<'a, [f32]>> = None;
+    for (p, wall) in walls.iter_mut().enumerate() {
+        let t = Instant::now();
+        let data = plane(p)?;
+        let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+        let head = adapter_head(
+            &data,
+            w,
+            h,
+            opts,
+            pool,
+            seed_source,
+            diagnostics,
+            colour,
+            pixel_noise,
+            gain_e_per_unit,
+            colour.then(|| [0.25, 0.5, 0.25][p]),
+        );
+        let prep = sm::prepare_plane(&data, w, h, &head.module_opts, pool);
+        if n_planes == 1 {
+            beta_own[p] = sm::plane_beta(&data, w, h, &head.module_opts, &prep, pool).0;
+        } else if p + 1 == n_planes {
+            last = Some(data);
+        }
+        heads.push(head);
+        preps.push(prep);
+        *wall += t.elapsed();
+    }
+    if n_planes > 1 {
+        sm::cross_plane_flags(&mut preps);
+        for p in (0..n_planes).rev() {
+            let t = Instant::now();
+            let data = match last.take() {
+                Some(data) => data,
+                None => plane(p)?,
+            };
+            let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+            beta_own[p] = sm::plane_beta(&data, w, h, &heads[p].module_opts, &preps[p], pool).0;
+            walls[p] += t.elapsed();
+        }
+    }
+    Ok(PlanesPass1 {
+        w,
+        h,
+        heads,
+        preps,
+        beta_own,
+        walls,
+    })
+}
+
+/// The group measure's second pass (Task 11b): every plane of `pass1`'s image fitted at `betas[p]`
+/// (`PsfModel::Fixed`, fit exactly like `Moffat4`'s fixed 4.0) from its own verdict pass — the group β on every plane
+/// of a group's member, a group of one's own β per plane — through [`sm::finish_plane`] and the adapter's tail, as
+/// [`measure_planes_diagnosed`]'s second half. Every fit, F, `c`, F-6 statistic and `ChannelMeasurement` comes from
+/// here; `channel.beta` is `betas[p]` and `channel.beta_own` the plane's own β. `plane(p)` must hand the same bytes
+/// the first pass read (the frame adapter's read guard spans both passes). `betas` must hold one β per plane
+/// (`debug_assert!`; [`measure_frame_pass2`], the only production caller, refuses a mismatch with an error).
+pub fn measure_planes_pass2<'a, E>(
+    pass1: PlanesPass1,
+    betas: &[f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
+) -> Result<Vec<MeasuredPlane>, E> {
+    let PlanesPass1 {
+        w,
+        h,
+        heads,
+        preps,
+        beta_own,
+        walls,
+    } = pass1;
+    debug_assert_eq!(
+        betas.len(),
+        heads.len(),
+        "one β per plane (checked by measure_frame_pass2)"
+    );
+    let mut out = Vec::with_capacity(heads.len());
+    for (p, (mut head, prep)) in heads.into_iter().zip(preps).enumerate() {
+        let t = Instant::now();
+        let data = plane(p)?;
+        let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+        head.module_opts.psf_model = PsfModel::Fixed(betas[p]);
+        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        drop(data);
+        let (mut measurement, seeds, diagnostics) = adapter_tail(head, m);
+        measurement.channel.beta_own = Some(beta_own[p]);
+        measurement.channel.beta_own_at_cap = sm::beta::at_bound(beta_own[p]);
+        out.push(MeasuredPlane {
+            measurement,
+            seeds,
+            diagnostics,
+            wall_ms: (walls[p] + t.elapsed()).as_millis() as u64,
+        });
+    }
+    Ok(out)
+}
+
 /// The adapter's seed detector, resolved from the options and the probe's override.
 #[derive(Clone, Copy, PartialEq)]
 enum Detector {
@@ -843,6 +1007,9 @@ fn adapter_tail(
         refused_by_reason: m.refused.by_name(),
         stars_unsaturated: m.frame.stars_unsaturated,
         beta: m.beta,
+        // The two-pass group measure sets it (`measure_planes_pass2`); a single pass reads no own β of its own.
+        beta_own: None,
+        beta_own_at_cap: false,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -919,7 +1086,10 @@ pub fn gain_from_header(path: &Path) -> Option<f64> {
         .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
     let (egain, cscl) = if is_xisf {
         match crate::fits_parser::extract_xisf_header(path) {
-            Ok(text) => (header_text_f64(&text, "EGAIN"), header_text_f64(&text, "ATH_CSCL")),
+            Ok(text) => (
+                header_text_f64(&text, "EGAIN"),
+                header_text_f64(&text, "ATH_CSCL"),
+            ),
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "snr: the XISF header could not be read; no gain");
                 return None;
@@ -948,7 +1118,13 @@ fn header_text_f64(text: &str, key: &str) -> Option<f64> {
         if k.trim() != key {
             return None;
         }
-        v.split('/').next()?.trim().trim_matches('\'').trim().parse::<f64>().ok()
+        v.split('/')
+            .next()?
+            .trim()
+            .trim_matches('\'')
+            .trim()
+            .parse::<f64>()
+            .ok()
     })
 }
 
@@ -1078,27 +1254,63 @@ fn measure_frame_inner(
         pool,
         seed_source,
         false,
-        // The Measure stage measures calibrated sensor frames (ruling C-10): one plane is white, a debayered
-        // 3-plane frame is mixed.
-        match n {
-            1 => sm::PixelNoise::White,
-            3 => sm::PixelNoise::Mixed,
-            _ => sm::PixelNoise::Unknown,
-        },
+        frame_pixel_noise(n),
         gain_from_header(path),
-        |plane| -> Result<Cow<'static, [f32]>, IntegrationError> {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(IntegrationError::Cancelled);
-            }
-            guard.check()?;
-            let t = Instant::now();
-            let data = reader.read_plane(plane)?;
-            read_ms[plane] += t.elapsed().as_millis() as u64;
-            Ok(Cow::Owned(data))
-        },
+        |plane| read_guarded(&reader, &mut guard, cancel, &mut read_ms, plane),
     )?;
-    let mut channels = Vec::with_capacity(n);
-    let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(n);
+    Ok(assemble_frame(
+        path,
+        opts,
+        w,
+        h,
+        planes,
+        &read_ms,
+        start.elapsed(),
+    ))
+}
+
+/// The Measure stage measures calibrated sensor frames (ruling C-10): one plane is white, a debayered 3-plane frame
+/// is mixed.
+fn frame_pixel_noise(n: usize) -> sm::PixelNoise {
+    match n {
+        1 => sm::PixelNoise::White,
+        3 => sm::PixelNoise::Mixed,
+        _ => sm::PixelNoise::Unknown,
+    }
+}
+
+/// One plane of the frame for the measurement: `cancel` checked first, the read guard's identity check, the read
+/// timed into `read_ms[plane]`.
+fn read_guarded(
+    reader: &PlaneReader,
+    guard: &mut ReadGuard<'_>,
+    cancel: &AtomicBool,
+    read_ms: &mut [u64],
+    plane: usize,
+) -> Result<Cow<'static, [f32]>, IntegrationError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(IntegrationError::Cancelled);
+    }
+    guard.check()?;
+    let t = Instant::now();
+    let data = reader.read_plane(plane)?;
+    read_ms[plane] += t.elapsed().as_millis() as u64;
+    Ok(Cow::Owned(data))
+}
+
+/// The measured planes as the frame's [`FrameMeasurement`] and its per-plane fits, with the frame adapter's per-plane
+/// log lines (the defocused and trailed verdicts, `"frame plane measured"`).
+fn assemble_frame(
+    path: &Path,
+    opts: &MeasureOptions,
+    w: usize,
+    h: usize,
+    planes: Vec<MeasuredPlane>,
+    read_ms: &[u64],
+    elapsed: Duration,
+) -> (FrameMeasurement, Vec<Vec<StarFit>>) {
+    let mut channels = Vec::with_capacity(planes.len());
+    let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(planes.len());
     for (plane, measured) in planes.into_iter().enumerate() {
         let pm = measured.measurement;
         let mut m = pm.channel;
@@ -1132,6 +1344,7 @@ fn measure_frame_inner(
             stars_detected = m.stars_detected,
             stars_fitted = m.stars_fitted,
             beta = m.beta,
+            beta_own = m.beta_own,
             fwhm_px = m.fwhm_px,
             eccentricity = m.eccentricity,
             noise = m.noise,
@@ -1152,14 +1365,136 @@ fn measure_frame_inner(
         channels.push(m);
         fits_by_plane.push(pm.fits);
     }
-    Ok((
+    (
         FrameMeasurement {
             width: w,
             height: h,
             channels,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: elapsed.as_millis() as u64,
         },
         fits_by_plane,
+    )
+}
+
+/// A calibrated frame's first pass of the Measure stage's group measure (Plan A Task 11b, owner decision R11b-12):
+/// [`measure_planes_pass1`] over the frame's planes as [`measure_frame_with_fits`] reads them, plus the file's
+/// identity at that read, so the second pass refuses a file rewritten in between rather than fitting one file's
+/// records on another's pixels.
+pub struct FramePass1 {
+    planes: PlanesPass1,
+    identity: Option<FileIdentity>,
+    read_ms: Vec<u64>,
+    elapsed: Duration,
+}
+
+impl FramePass1 {
+    /// Every plane's own β, in plane order.
+    pub fn beta_own(&self) -> &[f64] {
+        self.planes.beta_own()
+    }
+}
+
+/// [`measure_frame_with_fits`]'s first half for the group measure (Task 11b): every plane's verdict pass and own β.
+pub fn measure_frame_pass1(
+    path: &Path,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+) -> Result<FramePass1, IntegrationError> {
+    let start = Instant::now();
+    let reader = PlaneReader::open(path)?;
+    let (w, h) = (reader.width(), reader.height());
+    let n = reader.channels();
+    let mut read_ms = vec![0u64; n];
+    let mut guard = ReadGuard::new(path);
+    let _span = tracing::debug_span!("measure_frame_pass1", path = %path.display()).entered();
+    let planes = measure_planes_pass1(
+        n,
+        w,
+        h,
+        opts,
+        pool,
+        SeedOverride::Fast,
+        false,
+        frame_pixel_noise(n),
+        gain_from_header(path),
+        |plane| read_guarded(&reader, &mut guard, cancel, &mut read_ms, plane),
+    )?;
+    Ok(FramePass1 {
+        planes,
+        identity: guard.first,
+        read_ms,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// [`measure_frame_with_fits`]'s second half for the group measure (Task 11b): every plane of `pass1` fitted at
+/// `betas[p]` ([`measure_planes_pass2`]), the same frame result and log lines; the read guard carries the first
+/// pass's identity, so a file that changed since is refused (logged), never measured half-and-half. `opts` are the
+/// first pass's. `duration_ms` is both passes' own time.
+pub fn measure_frame_pass2(
+    path: &Path,
+    pass1: FramePass1,
+    betas: &[f64],
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+) -> Result<(FrameMeasurement, Vec<Vec<StarFit>>), IntegrationError> {
+    let start = Instant::now();
+    if betas.len() != pass1.planes.planes() {
+        error!(
+            path = %path.display(),
+            betas = betas.len(),
+            planes = pass1.planes.planes(),
+            "measure: one beta per plane required; the measurement is refused"
+        );
+        return Err(IntegrationError::Io(std::io::Error::other(format!(
+            "{}: {} betas for {} planes (one per plane required)",
+            path.display(),
+            betas.len(),
+            pass1.planes.planes()
+        ))));
+    }
+    let FramePass1 {
+        planes,
+        identity,
+        mut read_ms,
+        elapsed,
+    } = pass1;
+    let reader = PlaneReader::open(path)?;
+    let (w, h) = (reader.width(), reader.height());
+    if (w, h, reader.channels()) != (planes.w, planes.h, planes.planes()) {
+        error!(
+            path = %path.display(),
+            "measure: the frame's geometry changed between the two passes; the measurement is refused"
+        );
+        return Err(IntegrationError::Io(std::io::Error::other(format!(
+            "{} changed between the two passes of one measurement (now {}x{}x{}, was {}x{}x{})",
+            path.display(),
+            w,
+            h,
+            reader.channels(),
+            planes.w,
+            planes.h,
+            planes.planes()
+        ))));
+    }
+    let mut guard = ReadGuard {
+        path,
+        first: identity,
+    };
+    let _span = tracing::debug_span!("measure_frame_pass2", path = %path.display()).entered();
+    let measured = measure_planes_pass2(planes, betas, pool, |plane| {
+        read_guarded(&reader, &mut guard, cancel, &mut read_ms, plane)
+    })?;
+    Ok(assemble_frame(
+        path,
+        opts,
+        w,
+        h,
+        measured,
+        &read_ms,
+        elapsed + start.elapsed(),
     ))
 }
 
@@ -2104,7 +2439,7 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -2205,7 +2540,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -2263,7 +2598,11 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         let r = d.path().join("only_egain.fits");
         write_fits_f32(&r, w, h, 1, &data, &cards[..1]).unwrap();
         assert_eq!(gain_from_header(&r), None, "ATH_CSCL missing: no gain");
-        assert_eq!(gain_from_header(&d.path().join("missing.fits")), None, "an unreadable file has none (logged)");
+        assert_eq!(
+            gain_from_header(&d.path().join("missing.fits")),
+            None,
+            "an unreadable file has none (logged)"
+        );
     }
 
     #[test]
@@ -2294,10 +2633,21 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             let m = &multi[p].measurement;
             assert_eq!(m.shot_spread, want, "plane {p}");
             assert_eq!(m.snr_noise, sm::SnrNoise::Read, "plane {p}");
-            assert!((m.snr_gain.unwrap() - gain / ADU_SCALE as f64).abs() < 1e-12, "plane {p}");
+            assert!(
+                (m.snr_gain.unwrap() - gain / ADU_SCALE as f64).abs() < 1e-12,
+                "plane {p}"
+            );
             assert!(m.fits.len() > 50, "plane {p}: {} fits", m.fits.len());
             let working: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
-            let rho = sm::seeds::read_noise_correlation(&working, w, h, None, &sm::domain::background_mesh(&working, w, h, None, true)).expect("the read").rho();
+            let rho = sm::seeds::read_noise_correlation(
+                &working,
+                w,
+                h,
+                None,
+                &sm::domain::background_mesh(&working, w, h, None, true),
+            )
+            .expect("the read")
+            .rho();
             let noise = sm::ApertureNoise {
                 rho: Some(rho),
                 shot_spread: want,
@@ -2307,7 +2657,10 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
                 let (snr, t) = sm::star_snr(&working, w, h, f, m.snr_gain, None, &noise);
                 assert_eq!(snr, f.snr, "plane {p}: the fit's value is the function's");
                 let var = t.shot_spread * t.s.max(0.0) / m.snr_gain.unwrap()
-                    + t.kappa * t.n_ap as f64 * t.sigma_sky.powi(2) * (1.0 + t.n_ap as f64 / f64::from(t.n_sky));
+                    + t.kappa
+                        * t.n_ap as f64
+                        * t.sigma_sky.powi(2)
+                        * (1.0 + t.n_ap as f64 / f64::from(t.n_sky));
                 assert!(((t.s / var.sqrt()) / f.snr - 1.0).abs() < 1e-9, "plane {p}");
                 assert!(t.kappa > 0.5, "plane {p}: kappa {}", t.kappa);
                 checked += 1;
@@ -2329,6 +2682,172 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         .unwrap();
         assert_eq!(single[0].measurement.shot_spread, 1.0);
         assert_eq!(single[0].measurement.snr_noise, sm::SnrNoise::White);
-        assert!(single[0].measurement.snr_median.is_some() && single[0].measurement.hfr_median.is_some());
+        assert!(
+            single[0].measurement.snr_median.is_some()
+                && single[0].measurement.hfr_median.is_some()
+        );
+    }
+
+    /// Plan A Task 11b (owner decision R11b-12): a field of 30 round Moffat stars of FWHM 4 px and Moffat `beta` on a
+    /// 480 x 400 plane, amplitudes 0.04 to 0.33 (one star at the plane maximum would make every equal star read
+    /// saturated by the amplitude clause), background 0.08, Gaussian noise 0.002 — the two members of a synthetic
+    /// group whose own βs differ.
+    fn moffat_member(beta: f64, seed: u64) -> Vec<f32> {
+        let alpha = 4.0 / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let stars: Vec<crate::test_support::MoffatStar> = (0..30)
+            .map(|i| crate::test_support::MoffatStar {
+                x: 60.0 + (i % 6) as f64 * 70.0 + 0.3,
+                y: 60.0 + (i / 6) as f64 * 60.0 + 0.6,
+                amp: 0.04 + 0.01 * i as f64,
+                alpha_x: alpha,
+                alpha_y: alpha,
+                theta: 0.0,
+            })
+            .collect();
+        let mut plane = crate::test_support::moffat_field(480, 400, &stars, beta, 0.08);
+        crate::test_support::add_noise(&mut plane, 0.002, seed);
+        plane
+    }
+
+    fn pass1_of(plane: &[f32], opts: &MeasureOptions) -> PlanesPass1 {
+        measure_planes_pass1(
+            1,
+            480,
+            400,
+            opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::White,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(plane)),
+        )
+        .unwrap()
+    }
+
+    fn pass2_of(plane: &[f32], pass1: PlanesPass1, beta: f64) -> MeasuredPlane {
+        measure_planes_pass2(pass1, &[beta], None, |_| {
+            Ok::<_, std::convert::Infallible>(Cow::Borrowed(plane))
+        })
+        .unwrap()
+        .remove(0)
+    }
+
+    fn single_pass(plane: &[f32], opts: &MeasureOptions) -> MeasuredPlane {
+        measure_planes_diagnosed(
+            1,
+            480,
+            400,
+            opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::White,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(plane)),
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    /// Task 11b: two members whose own βs differ (2.5 and 6 in the pixels) are both fitted at the group β, the lower
+    /// median of their own βs: every fit, `channel.beta` and the frame F of each member is the one a single pass at
+    /// `PsfModel::Fixed(group β)` measures, `beta_own` keeps each member's own β, and the member whose own β is not
+    /// the group's reads a different F than its own-β single pass — the β ridge the group β removes from the
+    /// comparison.
+    #[test]
+    fn a_two_member_group_is_fitted_at_the_shared_beta() {
+        let opts = MeasureOptions::default();
+        let planes = [moffat_member(2.5, 7), moffat_member(6.0, 8)];
+        let firsts: Vec<PlanesPass1> = planes.iter().map(|p| pass1_of(p, &opts)).collect();
+        let own: Vec<f64> = firsts.iter().map(|f| f.beta_own()[0]).collect();
+        assert!(own[0] < 3.5 && own[1] > 4.5, "own betas {own:?}");
+        let group = psf_signal::group_beta(&own);
+        assert_eq!(
+            group, own[0],
+            "the lower median of two is the smaller own beta"
+        );
+
+        for ((plane, first), &own_beta) in planes.iter().zip(firsts).zip(&own) {
+            let m = pass2_of(plane, first, group);
+            assert_eq!(m.measurement.channel.beta, group);
+            assert_eq!(m.measurement.channel.beta_own, Some(own_beta));
+            assert_eq!(m.measurement.beta_source, sm::BetaSource::Fixed);
+            assert!(
+                m.measurement.fits.len() >= 25,
+                "{} fits",
+                m.measurement.fits.len()
+            );
+            assert!(m.measurement.fits.iter().all(|f| f.beta == group));
+
+            let at_group = single_pass(
+                plane,
+                &MeasureOptions {
+                    psf_model: PsfModel::Fixed(group),
+                    ..opts
+                },
+            );
+            // Debug-compared: a fit's NaN fields (no ring sky) are equal there, never under `==`.
+            assert_eq!(
+                format!("{:?}", m.measurement.fits),
+                format!("{:?}", at_group.measurement.fits)
+            );
+            assert_eq!(
+                m.measurement.channel.fwhm_px,
+                at_group.measurement.channel.fwhm_px
+            );
+            assert_eq!(
+                m.measurement.channel.tflux,
+                at_group.measurement.channel.tflux
+            );
+            assert_eq!(
+                m.measurement.aperture_correction,
+                at_group.measurement.aperture_correction
+            );
+        }
+        // The member at its own β 6 reads another F than at the shared β: the ridge is real on this field.
+        let own_single = single_pass(&planes[1], &opts);
+        assert_eq!(
+            own_single.measurement.channel.beta, own[1],
+            "pass 1 reads the single pass's own beta"
+        );
+        let shared = pass2_of(&planes[1], pass1_of(&planes[1], &opts), group);
+        assert!(
+            (shared.measurement.channel.fwhm_px / own_single.measurement.channel.fwhm_px - 1.0)
+                .abs()
+                > 1e-3,
+            "F at the shared beta {} vs own {}",
+            shared.measurement.channel.fwhm_px,
+            own_single.measurement.channel.fwhm_px
+        );
+    }
+
+    /// Task 11b: a group of one is fitted at its own β — the two passes at the member's own β reproduce the single
+    /// `Auto` pass's fits and frame F exactly (only the β's source reads `fixed`).
+    #[test]
+    fn a_group_of_one_is_fitted_at_its_own_beta() {
+        let opts = MeasureOptions::default();
+        let plane = moffat_member(3.0, 9);
+        let first = pass1_of(&plane, &opts);
+        let own = first.beta_own()[0];
+        let group = psf_signal::group_beta(&[own]);
+        assert_eq!(group, own);
+        let two = pass2_of(&plane, first, group);
+        let single = single_pass(&plane, &opts);
+        assert_eq!(single.measurement.channel.beta, own);
+        assert_eq!(two.measurement.channel.beta, own);
+        assert_eq!(two.measurement.channel.beta_own, Some(own));
+        assert_eq!(
+            format!("{:?}", two.measurement.fits),
+            format!("{:?}", single.measurement.fits)
+        );
+        assert_eq!(
+            two.measurement.channel.fwhm_px,
+            single.measurement.channel.fwhm_px
+        );
+        assert_eq!(
+            single.measurement.channel.beta_own, None,
+            "a single pass reads no own beta of its own"
+        );
     }
 }

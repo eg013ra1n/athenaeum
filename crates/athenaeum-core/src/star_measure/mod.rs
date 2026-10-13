@@ -466,6 +466,51 @@ pub fn finish_plane(
     finish_working(&working, w, h, opts, prep, pool)
 }
 
+/// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
+/// `opts.psf_model` (the one resolution, `fit::resolve_beta`): under `Auto` F-4's E5 estimator on `prep`'s verdict
+/// pass, unchanged; under `Moffat4` / `Fixed(b)` the caller's β ([`BetaSource::Fixed`]). On a fresh working-unit copy
+/// of the same `plane` `prep` was prepared from; on an image of more than one plane, after [`cross_plane_flags`].
+///
+/// Plan A Task 11b (owner decision R11b-12): the stacking Measure stage's first pass. Every member of a group is
+/// prepared and reads its own β here; the group β (`stacking::psf_signal::group_beta` of the members' own βs) is
+/// resolved once; [`finish_plane`] then fits every member at `PsfModel::Fixed(group β)`. `prep` is borrowed, never
+/// changed, so the second pass fits the very records this β was read from.
+pub fn plane_beta(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    prep: &PlanePrep,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (f64, BetaSource) {
+    let working = domain::to_working_units(plane, &opts.domain);
+    let extended = prep
+        .detection
+        .as_ref()
+        .map_or(&[][..], |d| d.extended.as_slice());
+    // As `finish_working`'s fit call: inside the pool's `install`, so the sample's own pool param is `None`.
+    let call = || {
+        fit::resolve_beta(
+            &working,
+            w,
+            h,
+            &prep.seeds,
+            opts.psf_model,
+            &opts.fit,
+            opts.mask.as_deref(),
+            prep.fit_field,
+            Some(&prep.passes),
+            extended,
+            None,
+        )
+    };
+    let sample = match pool {
+        Some(p) => p.install(call),
+        None => call(),
+    };
+    (sample.beta, sample.source)
+}
+
 /// The match radius of the cross-plane rule (px, between seed positions, Euclidean): R3's same-star match.
 pub const CROSS_PLANE_MATCH_PX: f64 = 1.0;
 

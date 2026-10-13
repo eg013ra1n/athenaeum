@@ -44,6 +44,7 @@ use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{self, EstimateInputs};
+use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
 
@@ -561,9 +562,111 @@ impl HashMemo {
 
 /// Stage 3 (measurement) config-hash for one frame: `measurement_subtree`
 /// keyed on the frame's OWN stage-1 hash — never the DB row's stored one,
-/// which may itself be stale (spec §9.3: stage 3 depends on stage 1).
-pub(crate) fn measurement_hash_for(cfg: &StackingConfig, calibrated_hash: &str) -> String {
-    stage_hash(&measurement_subtree(cfg), &[calibrated_hash], &[])
+/// which may itself be stale (spec §9.3: stage 3 depends on stage 1) — the
+/// value its `metrics` and `fits.<plane>` rows are keyed on and every later
+/// stage folds in (C-17, C-18).
+///
+/// `group_beta` (Plan A Task 11b, owner decision R11b-12): under
+/// `measurement.psfModel = Auto` every member of a group is fitted at the
+/// group β, so the `.athf` content moves with it — folded at `{:.6}`, the
+/// precedent of `normalization_hash_for`'s `ln_beta` (and its
+/// `the_ln_hashes_follow_the_group_beta` pin). A β that cannot be resolved
+/// (`None`: the plan gate cannot read every member's own β from the stored
+/// rows, or a run's group measured nothing) folds a token no production row
+/// carries (no production path persists under `None`; test fixtures that write under `None` match it, `None == None`),
+/// so a real row always reads stale, never a false hit. Under `Moffat4` (and
+/// `Fixed`) the fits never depended on the group, nothing is folded, and the
+/// hash is byte-identical to the one before Task 11b.
+pub(crate) fn measurement_hash_for(
+    cfg: &StackingConfig,
+    calibrated_hash: &str,
+    group_beta: Option<f64>,
+) -> String {
+    if !matches!(cfg.measurement.psf_model, PsfModel::Auto) {
+        return stage_hash(&measurement_subtree(cfg), &[calibrated_hash], &[]);
+    }
+    let beta = match group_beta {
+        Some(b) => format!("measure_beta:{b:.6}"),
+        None => "measure_beta:unresolved".to_string(),
+    };
+    stage_hash(&measurement_subtree(cfg), &[calibrated_hash, &beta], &[])
+}
+
+/// A stored `metrics` payload's first pass, when it is still valid (Task 11b, owner decision R11b-12): the row's
+/// `config_hash` equals [`measurement_hash_for`] at the β its fits were made at — `psf_signal::group_beta` of its
+/// channels' `beta`, which is the group β on every member of a group (all its channels share it) and a group of one's
+/// own (the lower median of its channels' own βs, the value its row was keyed on). Then every input of the frame's
+/// own β is unchanged and its channels' own βs are returned (`beta_own`, or `beta` on a payload that has none: such a
+/// payload's fits were made at its own β). `None` under a model other than `Auto` (nothing to reuse: one pass), for a
+/// payload without channels, and for a row keyed otherwise (a stale config or calibration, or a row written before
+/// Task 11b). The ONE rule: `stage_measure` reuses a frame's first pass by it and [`build_plan`] resolves the group β
+/// the run would fit at by it.
+pub(crate) fn pass1_own_betas(
+    cfg: &StackingConfig,
+    calibrated_hash: &str,
+    config_hash: &str,
+    m: &FrameMeasurement,
+) -> Option<Vec<f64>> {
+    if !matches!(cfg.measurement.psf_model, PsfModel::Auto) || m.channels.is_empty() {
+        return None;
+    }
+    let fitted: Vec<f64> = m.channels.iter().map(|c| c.beta).collect();
+    let keyed = measurement_hash_for(
+        cfg,
+        calibrated_hash,
+        Some(crate::stacking::psf_signal::group_beta(&fitted)),
+    );
+    (config_hash == keyed).then(|| {
+        m.channels
+            .iter()
+            .map(|c| c.beta_own.unwrap_or(c.beta))
+            .collect()
+    })
+}
+
+/// The group β the run's Measure stage would fit every member of each group at, as far as the stored rows tell
+/// (Task 11b; DB-only, like every check here): `psf_signal::group_beta` over the own βs of every non-excluded
+/// member's `metrics` row whose first pass is valid ([`pass1_own_betas`], the rule the run reuses a first pass by).
+/// A group with a member whose first pass is not on record has no entry — the run measures that member's own β first,
+/// so its group β is not known here, and every member's measurement hash folds "unresolved" and reads stale
+/// (conservative: a needless re-measure, never a false cache hit). Empty unless `measurement.psfModel` is `Auto`.
+fn gate_measure_betas(
+    conn: &Connection,
+    cfg: &StackingConfig,
+    subject: &StackSubject,
+    groups: &[IntegrationGroup],
+    excluded: &HashSet<i64>,
+    memo: &mut HashMemo,
+) -> Result<HashMap<String, f64>, ApiError> {
+    let mut out = HashMap::new();
+    if !matches!(cfg.measurement.psf_model, PsfModel::Auto) {
+        return Ok(out);
+    }
+    'groups: for g in groups {
+        let mut own: Vec<f64> = Vec::new();
+        for f in g.frames.iter().filter(|f| !excluded.contains(&f.frame_id)) {
+            let Some(row) = find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?
+            else {
+                continue 'groups;
+            };
+            let Some(calib) = memo.calibration_hash(conn, cfg, f) else {
+                continue 'groups;
+            };
+            let betas = row
+                .payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
+                .and_then(|m| pass1_own_betas(cfg, &calib, &row.config_hash, &m));
+            match betas {
+                Some(b) => own.extend(b),
+                None => continue 'groups,
+            }
+        }
+        if !own.is_empty() {
+            out.insert(g.key.clone(), crate::stacking::psf_signal::group_beta(&own));
+        }
+    }
+    Ok(out)
 }
 
 /// Stage 5 (registration) config-hash for one frame against a given
@@ -1173,7 +1276,13 @@ pub(crate) fn read_project_config(
     conn: &Connection,
     settings: &SettingsManager,
     project_id: &str,
-) -> Result<(StackingConfig, Option<crate::db::stacking::ProjectConfigRow>), ApiError> {
+) -> Result<
+    (
+        StackingConfig,
+        Option<crate::db::stacking::ProjectConfigRow>,
+    ),
+    ApiError,
+> {
     match crate::db::stacking::get_project_config(conn, project_id)? {
         Some(row) => {
             let config = resolve_config(Some(&row.config_json), None)
@@ -1565,6 +1674,7 @@ fn compute_register_stale(
     memo: &mut HashMemo,
     origins: &FrameOrigins,
     grid: Option<&crate::collab::grid::CanonicalGrid>,
+    measure_betas: &HashMap<String, f64>,
 ) -> Result<bool, ApiError> {
     let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(true);
@@ -1679,8 +1789,13 @@ fn compute_register_stale(
             return Ok(true);
         };
         // Ruling C-18: the same measurement hash `stacking::run` folds in
-        // when it builds this frame's registration row.
-        let frame_measurement_hash = measurement_hash_for(cfg, &frame_calib_hash);
+        // when it builds this frame's registration row — at the group β
+        // `build_plan` resolved for the Measure check (Task 11b).
+        let frame_measurement_hash = measurement_hash_for(
+            cfg,
+            &frame_calib_hash,
+            measure_betas.get(&group.key).copied(),
+        );
         let expected = registration_hash_for(
             cfg,
             reference_frame_id,
@@ -3026,10 +3141,14 @@ pub fn build_plan(
         } else {
             (None, HashMap::new())
         };
-    let ln_grid_dims: Option<(u64, u64, bool)> = project.as_ref().and_then(|p| {
-        p.grid_dims
-            .map(|(w, h)| (w, h, p.grid.current.is_some()))
-    });
+    let ln_grid_dims: Option<(u64, u64, bool)> = project
+        .as_ref()
+        .and_then(|p| p.grid_dims.map(|(w, h)| (w, h, p.grid.current.is_some())));
+    // Task 11b (owner decision R11b-12): under `Auto` every member's
+    // measurement hash folds its group's β — the one the run would resolve,
+    // read from the stored first passes (`gate_measure_betas`). Shared with
+    // the register gate below, which folds the same measurement hash.
+    let measure_betas = gate_measure_betas(conn, &cfg, subject, &groups, &excluded_set, &mut memo)?;
 
     for g in &groups {
         // Fix round 1, item 5: the group's LN reference artifact carries the
@@ -3175,7 +3294,7 @@ pub fn build_plan(
             // `measurement_hash_for` a second time for `fits_fresh`).
             let expected_measurement_hash: Option<String> = current_calib_hash
                 .as_deref()
-                .map(|hash| measurement_hash_for(&cfg, hash));
+                .map(|hash| measurement_hash_for(&cfg, hash, measure_betas.get(&g.key).copied()));
             let metrics_fresh = match (&metrics_artifact, &expected_measurement_hash) {
                 (Some(row), Some(hash)) => &row.config_hash == hash,
                 _ => false,
@@ -3393,6 +3512,7 @@ pub fn build_plan(
         &mut memo,
         &origins,
         project_grid.as_ref(),
+        &measure_betas,
     )?;
 
     let mut stale_stages = Vec::new();
@@ -3726,7 +3846,7 @@ mod tests {
                     reference_id,
                     &reference_calib,
                     &frame_calib,
-                    &measurement_hash_for(&cfg, &frame_calib),
+                    &measurement_hash_for(&cfg, &frame_calib, None),
                 );
                 store_registration(&f.conn, &subject, |set_id| RegistrationRecord {
                     frames_set_id: set_id,
@@ -3780,6 +3900,7 @@ mod tests {
                 &mut memo,
                 &origins,
                 Some(&grid),
+                &HashMap::new(),
             )
             .unwrap()
         };
@@ -4136,7 +4257,10 @@ mod tests {
             "{:?}",
             pedestal[0]
         );
-        assert!(!plan.warnings.iter().any(|w| w.contains(&key_b) && w.contains("flat but no")));
+        assert!(!plan
+            .warnings
+            .iter()
+            .any(|w| w.contains(&key_b) && w.contains("flat but no")));
         // The set-level sentence rides on the readiness only.
         assert_eq!(plan.readiness.calibration_warnings.len(), 1);
         assert!(!plan
@@ -5605,7 +5729,10 @@ mod tests {
     #[test]
     fn too_few_frames_is_a_blocker() {
         let f = test_fixtures::frame_set("LDN 1272");
-        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"].iter().enumerate() {
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"]
+            .iter()
+            .enumerate()
+        {
             test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
         }
 
@@ -5986,6 +6113,14 @@ mod tests {
     /// `fits` rows exist. Values beyond the channel count are irrelevant to
     /// every test that uses this: `build_plan` never opens a calibrated or
     /// measured file's actual pixels.
+    /// The measurement hash a [`minimal_metrics_payload`] row is keyed on to read fresh (Plan A Task 11b): under
+    /// `Auto` the gate folds the group β it resolves from the members' stored own βs (`gate_measure_betas`), and the
+    /// minimal payload's channels carry `ChannelMeasurement::default()`'s β 0.0 and no `betaOwn` — so a group whose
+    /// every member has such a row resolves 0.0, and its rows must be keyed on it.
+    fn minimal_measurement_hash(cfg: &StackingConfig, calibrated_hash: &str) -> String {
+        measurement_hash_for(cfg, calibrated_hash, Some(0.0))
+    }
+
     fn minimal_metrics_payload(channels: usize) -> String {
         serde_json::to_string(&FrameMeasurement {
             width: 1,
@@ -6106,7 +6241,7 @@ mod tests {
             )
             .unwrap();
 
-            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            let metrics_hash = minimal_measurement_hash(&cfg, &hash);
             metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
@@ -6236,7 +6371,7 @@ mod tests {
         let calibrated = "calibrated-hash";
         let reference_ids = [11i64, 22, 33];
         let reference_hash = "ln-reference-hash";
-        let measurement = measurement_hash_for(&cfg, calibrated);
+        let measurement = measurement_hash_for(&cfg, calibrated, Some(4.0));
         let calibration = SeedsCalibration {
             frame_ids: vec![11, 22],
             k: vec![0.994],
@@ -6279,7 +6414,7 @@ mod tests {
             SeedSource::MatchedFilter => SeedSource::Peak,
             _ => SeedSource::MatchedFilter,
         };
-        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
+        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated, Some(4.0));
         assert_ne!(
             measurement, seed_measurement,
             "sanity: the measurement hash itself must follow seedSource"
@@ -6313,8 +6448,9 @@ mod tests {
     #[test]
     fn the_ln_reference_hash_ignores_the_scale_and_the_frame_hashes_follow_it() {
         let cfg = StackingConfig::default();
-        let reference =
-            |s: Option<u32>| normalization_hash_for(&cfg, "r", "m", &[1, 2], "", None, Some(4.0), s);
+        let reference = |s: Option<u32>| {
+            normalization_hash_for(&cfg, "r", "m", &[1, 2], "", None, Some(4.0), s)
+        };
         // The run passes no token for the reference (L-19); a token would move it.
         assert_ne!(reference(None), reference(Some(1024)));
         let frame = |s: u32| {
@@ -6323,6 +6459,80 @@ mod tests {
         assert_ne!(frame(1024), frame(1536));
         let cal = |s: u32| seeds_calibration_hash_for(&cfg, "ref", &[(1, "r", "m")], Some(4.0), s);
         assert_ne!(cal(1024), cal(1536));
+    }
+
+    /// Plan A Task 11b (owner decision R11b-12): under `Auto` every member's `.athf` is fitted at the group β, so the
+    /// measurement hash its `metrics` / `fits` rows are keyed on follows it at `{:.6}` (the `ln_beta` precedent
+    /// below), no production row carries an unresolved β, and `Moffat4` stays byte-identical to the hash before the
+    /// task. `pass1_own_betas` accepts a row exactly when it is keyed on the β its fits were made at.
+    #[test]
+    fn the_measurement_hash_follows_the_group_beta_under_auto_only() {
+        use crate::stacking::measure::ChannelMeasurement;
+        let auto = StackingConfig::default();
+        assert!(matches!(auto.measurement.psf_model, PsfModel::Auto));
+        let calibrated = "calibrated-hash";
+        let before =
+            |cfg: &StackingConfig| stage_hash(&measurement_subtree(cfg), &[calibrated], &[]);
+        let at = |cfg: &StackingConfig, b: Option<f64>| measurement_hash_for(cfg, calibrated, b);
+
+        assert_eq!(at(&auto, Some(3.3)), at(&auto, Some(3.3)));
+        assert_eq!(
+            at(&auto, Some(3.3)),
+            at(&auto, Some(3.3 + 1e-9)),
+            "folded at 6 decimals"
+        );
+        assert_ne!(at(&auto, Some(3.3)), at(&auto, Some(3.31)));
+        assert_ne!(at(&auto, None), at(&auto, Some(3.3)));
+        assert_ne!(
+            at(&auto, Some(3.3)),
+            before(&auto),
+            "a pre-11b Auto row is stale"
+        );
+        assert_ne!(at(&auto, None), before(&auto));
+
+        let mut moffat = StackingConfig::default();
+        moffat.measurement.psf_model = PsfModel::Moffat4;
+        assert_eq!(
+            at(&moffat, Some(3.3)),
+            before(&moffat),
+            "Moffat4 is byte-identical"
+        );
+        assert_eq!(at(&moffat, None), before(&moffat));
+
+        let payload = |beta: f64, own: Option<f64>| FrameMeasurement {
+            width: 1,
+            height: 1,
+            channels: vec![ChannelMeasurement {
+                beta,
+                beta_own: own,
+                ..Default::default()
+            }],
+            duration_ms: 0,
+        };
+        let m = payload(3.3, Some(7.5));
+        assert_eq!(
+            pass1_own_betas(&auto, calibrated, &at(&auto, Some(3.3)), &m),
+            Some(vec![7.5])
+        );
+        assert_eq!(
+            pass1_own_betas(&auto, calibrated, &at(&auto, Some(4.0)), &m),
+            None
+        );
+        assert_eq!(pass1_own_betas(&auto, calibrated, &before(&auto), &m), None);
+        assert_eq!(
+            pass1_own_betas(&auto, "other-calibration", &at(&auto, Some(3.3)), &m),
+            None
+        );
+        // A payload without `betaOwn` was fitted at its own β.
+        let m = payload(3.3, None);
+        assert_eq!(
+            pass1_own_betas(&auto, calibrated, &at(&auto, Some(3.3)), &m),
+            Some(vec![3.3])
+        );
+        assert_eq!(
+            pass1_own_betas(&moffat, calibrated, &before(&moffat), &payload(4.0, None)),
+            None
+        );
     }
 
     /// M1 (final fix wave, ruling C-30): the group β — the value
@@ -6340,7 +6550,7 @@ mod tests {
         let cfg = StackingConfig::default();
         let reference_ids = [11i64, 22, 33];
         let reference_hash = "ln-reference-hash";
-        let measurement = measurement_hash_for(&cfg, "calibrated-hash");
+        let measurement = measurement_hash_for(&cfg, "calibrated-hash", Some(4.0));
         let calibration = SeedsCalibration {
             frame_ids: vec![11, 22],
             k: vec![0.994],
@@ -6420,7 +6630,7 @@ mod tests {
         let cfg = StackingConfig::default();
         let calibrated = "calibrated-hash";
         let reference_calibrated = "reference-calibrated-hash";
-        let measurement = measurement_hash_for(&cfg, calibrated);
+        let measurement = measurement_hash_for(&cfg, calibrated, Some(4.0));
 
         let reg = |cfg: &StackingConfig, measurement: &str| {
             registration_hash_for(cfg, 7, reference_calibrated, calibrated, measurement)
@@ -6435,7 +6645,7 @@ mod tests {
             SeedSource::MatchedFilter => SeedSource::Peak,
             _ => SeedSource::MatchedFilter,
         };
-        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
+        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated, Some(4.0));
         assert_ne!(
             measurement, seed_measurement,
             "sanity: the measurement hash itself must follow seedSource"
@@ -6539,7 +6749,7 @@ mod tests {
             )
             .unwrap();
 
-            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            let metrics_hash = measurement_hash_for(&cfg, &hash, None);
             metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
@@ -6604,8 +6814,16 @@ mod tests {
         };
         // M1: `None` for β on both sides — these fixtures record no run
         // group with a β, so the gate resolves `None` too.
-        let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None, None);
+        let reference_hash = normalization_hash_for(
+            &cfg,
+            &combined,
+            "",
+            &reference_member_ids,
+            "",
+            None,
+            None,
+            None,
+        );
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -6695,8 +6913,7 @@ mod tests {
         // scale (spec 2026-10-04 §2), so the edit pins a fixed scale that
         // differs from the auto one.
         let mut cfg2 = cfg.clone();
-        cfg2.normalization.local.scale_mode =
-            Some(crate::stacking::integrate::LnScaleMode::Fixed);
+        cfg2.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Fixed);
         cfg2.normalization.local.scale = 2048;
         let plan2 = build_plan(
             &f.conn,
@@ -6802,7 +7019,7 @@ mod tests {
             )
             .unwrap();
 
-            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            let metrics_hash = measurement_hash_for(&cfg, &hash, None);
             metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
@@ -6893,7 +7110,7 @@ mod tests {
         let mut registration_hashes: HashMap<i64, String> = HashMap::new();
         for &frame_id in &ids[..2] {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
             let expected = registration_hash_for(
                 &cfg,
                 ids[0],
@@ -6931,8 +7148,16 @@ mod tests {
         };
         // M1: `None` for β on both sides — these fixtures record no run
         // group with a β, so the gate resolves `None` too.
-        let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None, None);
+        let reference_hash = normalization_hash_for(
+            &cfg,
+            &combined,
+            "",
+            &reference_member_ids,
+            "",
+            None,
+            None,
+            None,
+        );
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -7190,7 +7415,7 @@ mod tests {
                     group_key: &groups[0].key,
                     kind: "metrics",
                     path: None,
-                    config_hash: &measurement_hash_for(&cfg, &calib_hash),
+                    config_hash: &measurement_hash_for(&cfg, &calib_hash, None),
                     size: None,
                     modified_at: None,
                     payload_json: Some("{}"),
@@ -7338,7 +7563,7 @@ mod tests {
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for &frame_id in &ids[..2] {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
             let expected = registration_hash_for(
                 &cfg,
                 ids[0],
@@ -7424,7 +7649,7 @@ mod tests {
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
             let expected = registration_hash_for(
                 &cfg,
                 ids[0],
@@ -7527,7 +7752,7 @@ mod tests {
         let reference_hash = calib_hashes.get(&group_reference).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
             let expected = registration_hash_for(
                 &cfg,
                 group_reference,
@@ -7646,7 +7871,7 @@ mod tests {
         let reference_hash = calib_hashes.get(&switched_to).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
             let expected = registration_hash_for(
                 &cfg,
                 switched_to,
@@ -7859,7 +8084,7 @@ mod tests {
         };
         let line = |name: &str, cfg: &StackingConfig| {
             let calib = stage_hash(&calibration_subtree(cfg), &masters, &src());
-            let meas = measurement_hash_for(cfg, &calib);
+            let meas = measurement_hash_for(cfg, &calib, Some(1.5));
             let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
             let ln_ref =
                 normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5), None);
@@ -7892,13 +8117,14 @@ mod tests {
         // 2026-10-06: F1 growth curve is the default (L-24) - ln_* only; calib/meas/reg unchanged.
         // 2026-10-08 one star-measurement path Plan A Task 3 (R-OSP-1): MEASURE_VERSION 4 replaces the old fit-version constant (3) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-08 one star-measurement path Plan A Task 7 (R-OSP-2): `measurement.seedSource` (matchedFilter) and `seedThreshold` join the measurement subtree (hand edit) - meas moves on every line, and reg, ln and (custom) follow; calib, ln_ref and ln_cal are UNCHANGED.
+        // 2026-10-13 one star-measurement path Plan A Task 11b (owner decision R11b-12): under `Auto` (all four lines) the measurement hash folds the group beta (`measure_beta:1.500000` here) - meas, reg and ln move on every line; calib, ln_ref and ln_cal are UNCHANGED (Moffat4 would not move).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=5304aff46f287eb2 ln_ref=2676a6e017eebe13 ln=c280caa7a7b6c3bd ln_cal=f6195d69cd7bbaee",
-                "fastPreview: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=59572d1effaa50d4 ln_ref=2676a6e017eebe13 ln=a338b80e89bc6061 ln_cal=f6195d69cd7bbaee",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=22e028e28274e94d reg=9c0b40285429d40b ln_ref=1237e3e6fdf2cf1c ln=ed547a4e794451e0 ln_cal=6bb6c12538e4e622",
-                "custom: calib=2b725e5e99c87f49 meas=e1f010e0202a1502 reg=96c5de182db4a56c ln_ref=1237e3e6fdf2cf1c ln=e6e439531f8f82ab ln_cal=6bb6c12538e4e622",
+                "default: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=478536aa8678edba ln_ref=2676a6e017eebe13 ln=2f19f183b2f12b77 ln_cal=f6195d69cd7bbaee",
+                "fastPreview: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=b61848004bf0ab46 ln_ref=2676a6e017eebe13 ln=715484427a4950be ln_cal=f6195d69cd7bbaee",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=60d6857040956328 ln_ref=1237e3e6fdf2cf1c ln=e81ae122b7b28658 ln_cal=6bb6c12538e4e622",
+                "custom: calib=2b725e5e99c87f49 meas=f9ce75e901d7ba19 reg=cde510750fb8539c ln_ref=1237e3e6fdf2cf1c ln=f380eb5216cb7300 ln_cal=6bb6c12538e4e622",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -9255,7 +9481,7 @@ mod tests {
         let mut metrics: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
             let c = prepare_hash_for_catalog(&cfg, gf);
-            let m = measurement_hash_for(&cfg, &c);
+            let m = measurement_hash_for(&cfg, &c, None);
             up("metrics", Some(gf.frame_id), &m, None, Some("{}"));
             calib.insert(gf.frame_id, c);
             metrics.insert(gf.frame_id, m);
@@ -9294,7 +9520,8 @@ mod tests {
             hs.sort_unstable();
             hs.join(",")
         };
-        let reference_hash = normalization_hash_for(&cfg, &combined, "", &ids, "", None, None, None);
+        let reference_hash =
+            normalization_hash_for(&cfg, &combined, "", &ids, "", None, None, None);
         let ref_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: ids.clone(),
             reference_hash: reference_hash.clone(),

@@ -1872,7 +1872,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   Plan C (the Analysis switch) is 5. `AnalysisConfig::config_hash` is Plan C's.
 - **Risk.** The first run after Plan A re-measures, re-registers (mono) and re-normalizes every set; the `calib`
   column of the stage-hash golden literals is unchanged, every other column moved
-  (`stage_hashes_are_pinned_to_golden_literals`).
+  (`stage_hashes_are_pinned_to_golden_literals`). Task 11b adds a once-only ripple of its own: every `Auto` set
+  re-measures, re-registers and re-normalizes once on its first run after the group β lands (R-OSP-9, review I3).
 - **Logging.** The moved measure-path warnings now log under the tracing target `star_measure` rather than
   `stacking`; their `clip` and `samples` fields joined the logging dictionary
   (`docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`).
@@ -3127,3 +3128,156 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       **Plan C:** the later readers of `snr` / `hfr` (the analyzer's star metrics and `median_snr`, the `star_metrics`
       columns, the collab gate's `median_snr` rules and the hub's mirror, the Analysis and frame-info views; listed in
       plan Task 11's Outcome).
+  - **R-OSP-9 - the stacking group β: under `Auto` every member of a group is fitted at ONE β, `psf_signal::group_beta`
+    of the members' own βs; the frame's own β is a diagnostic (F-4b, Plan A Task 11b, owner decision R11b-12; rulings
+    R11b-0 … R11b-13 below; no `MEASURE_VERSION` bump, PA-4).** *As built (0f70e3c0; 3af1fd8d the review round: pass 1
+    ticks progress, `beta_own_at_cap`, the fan-out length check an `error!` + `Err`, doc notes — review I1, I2, M1–M4).*
+    Stage 3 under `measurement.psfModel = Auto` (`run.rs::measure_group_two_pass`) is two-pass over `PlanePrep`: pass 1
+    per frame in parallel (`measure_frame_pass1`: read, seeds, verdict passes, `star_measure::plane_beta` = F-4's E5
+    estimator, unchanged → each plane's own β); the group β resolved once = `psf_signal::group_beta` (the lower median,
+    always one of the members' own βs) over every measured plane of every measured member — the value LN already fitted
+    its reference and every member at (`PsfModel::Fixed`, perf tier C Task 1); pass 2 per frame (`measure_frame_pass2`)
+    at `PsfModel::Fixed(group β)` (`star_measure::fit::resolve_beta`, the one place a β comes from a `PsfModel`). Every
+    at-β fit, F, `.athf`, `c` and F-6 is made at the group β; `ChannelMeasurement.beta` = the β the fits were made at =
+    `stacking_run_groups.beta` = LN's reference β (pinned by `measure_writes_fits_artifacts_and_the_group_beta`).
+    `ChannelMeasurement.beta_own` (serde default, skipped when None) and `beta_own_at_cap` (skipped when false;
+    `beta::at_bound(beta_own)`) carry the own β; `SummaryFrame.beta_own` / `beta_own_at_cap` in the provenance; the
+    probe's measure frame line `betaOwn` / `betaOwnAtCap`, and `--psf-beta B` runs pass 1 then pass 2 at `Fixed(B)` on
+    every plane. A group of one sits at its own β (an OSC frame at the lower median of its planes' own βs, so the cache
+    key stays unambiguous). `Moffat4` / `Fixed`: one pass, byte-identical, the old hash
+    (`moffat4_measure_is_one_pass_and_unchanged`). The single-frame path (`star_probe`'s default, Analysis / Plan C)
+    keeps its own β. A member whose pass 1 passed and pass 2 failed still counts in the lower median (M2; every `.athf`
+    is still at it). `BETA_AT_CAP` is never set at the group β (a fixed β); the own β's bound is `beta_own_at_cap`.
+    Progress: pass 1 and pass 2 each tick half a frame (`FanOutTicker::with_scale(2)`), the stage lands on total (I1).
+    Logging: one `info!` per group (`run_id`, `group_key`, `beta`, `count`, `beta_own_min`, `beta_own_max`), a `debug!`
+    per frame plane (`frame_id`, `plane`, `beta_own`, `beta`), `beta_own` on `"frame plane measured"` (the logging
+    dictionary has the three new names).
+    - **The cache.** `plan::measurement_hash_for(cfg, calib, group β)` folds `measure_beta:{:.6}` under `Auto` only
+      (`unresolved` for None; no production row carries it). A stored row's first pass is valid iff its key equals the
+      hash at `group_beta` of its own channels' β (`pass1_own_betas`, one rule for the run and the gate), so a valid row
+      gives the own β without a frame read; the gate rebuilds the same group β from the stored rows of the non-excluded
+      members (`gate_measure_betas`) and marks the group's Measure stale when any member lacks a valid first pass
+      (conservative, as HEAD's missing-row rule). Register and LN fold the group-β'd hash (`group_measurement_hash`).
+      Unchanged group β: a full hit, nothing read. Moved: every member misses pass 2 (I2 below).
+    - **The mechanism (D0, R11b-2, R11b-7; the second design ruling).** M42 0000 is a composite PSF: 5 % wider than 0001
+      (held β 4 1.044–1.047, the ERP 1.050 / 1.053, HFR 1.050; free β 1.088) with a weak frame-wide +x skew (skew x z
+      19.6 > k 10.9), the same shape star by star (the owner's eye; the ERP's β 4.35 vs 4.55 on 0001). A single Moffat
+      fitted to such a star has two basins on a shallow ridge — narrow with heavy wings (β < 3.5, FWHM 1.90 px: the
+      shoulder as wing) or wide with light wings (β ≥ 7, 2.32 px: the shoulder as core) — so the per-star β is BIMODAL
+      (0000's point β over peak 0.1–0.6 of range: < 3.5 / 3.5–7 / ≥ 7 = 0.41 / 0.27 / 0.32; 0001 0.19 / 0.68 / 0.13)
+      and any median over the sample is a basin-mix statistic; the frame-summed χ²(β) is unimodal at a model-mismatch
+      value (0000 5–7, 0001 4). F rides the (α, β) ridge identically on every frame at +1.8 % per unit β (D0 S3: 0000
+      2.199 / 2.240 / 2.279 at β 3.3 / 4 / 5), so 3c is a bar on Δβ between the frames, not on any β's value: HEAD's
+      1.088 is the ridge at Δβ 3.6. B2 and 3c contradict each other BY THE MODEL, not by an estimator, and every arm
+      that read 0000 better read the clean frames worse. The consumers never needed a per-frame β: the weights compare
+      F across the group, `c` is per plane and absorbs the model, and LN already fitted every member at one group β —
+      so before this task Measure's F and LN's F sat at two different βs.
+    - **The decision and the rule (R11b-12, the owner, 2026-10-13: the group β for stacking, Moffat 4 by default — the
+      default clarified as Analysis / Blink, Plan C).** In stacking Measure every at-β fit, F, `.athf`, `c` and F-6 are
+      made at the GROUP β; a group of one at its own β; the own β is `beta_own`, reported, never consumed — a frame whose
+      own β sits far from the group β gets no flag and no exclusion; `Moffat4` / `Fixed` unchanged; the single-frame
+      path reads its own β. **Plan C:** the Analysis tab / Blink default PSF is Moffat 4 (the reference frame
+      analyser's default), the frame's own β shown as a diagnostic, Auto selectable. This amends F-4's "every star is
+      then fitted at it" (the frame's β) for stacking; F-4's lab bar is unchanged; B2 is not a bar.
+    - **R11b-0 the order (owner).** 0000 and 0001 look identical star by star → a localization step D0 first (S1 the
+      ERP, S2 model-free pixels, S3 our fit at a held β, S4 our free β), each by the R10c-0 B1 z / leave-one-out k rule.
+    - **R11b-1 an ePSF bar candidate** (0000's F / ePSF half-max +5.97 % vs −2.0…+3.24 %), dropped by R11b-2 (the ePSF
+      is built at our centres).
+    - **R11b-2 D0's outcome.** First separation at S1 / S2 (width z 2.34 > 1.91, skew x 19.6 > 10.9), NOT the shape and
+      NOT our fit at a held β; β 7.568 lives only in S4 — our estimator's error on a 5 % wider, weakly skewed frame.
+    - **R11b-3 gate zero** (β / β(control) ≥ 1.8 AND ΔF over the control ≥ +2 pp on a skew cell), fixed before the run.
+    - **R11b-4 gate zero passes; the arms' bars.** `skew/f1.6/s1` reproduces 0000's pattern (ours +2.88 pp vs the ERP's
+      −0.14 pp, β 1.94×); bars B-2 (family ΔF err ≤ max(the ERP's, 0) + 0.5 pp), B-3 (M42 B1–B3 with B2 required, 3b,
+      3c ∈ [1.044, 1.062]), B-4 (no regression); phase invariance reported, β itself not a bar on the family.
+    - **Owner rule (2026-10-12).** Mechanism / algorithm questions inside the task go to a fresh design reviewer; its
+      answer, truth-checked by the controller, is the ruling; the owner is informed of outcomes.
+    - **R11b-5 a fifth arm `band`** (owner: the brightest stars carry aberrations more strongly): the sample = eligible
+      seeds at peak 0.05–0.6 of range, ≤ 256, stratified over 4 log-peak bins × a 4 × 4 grid.
+    - **R11b-6 `band` read** (0000 β 8.23, 0001 4.17): its truth check had read the POINT β, the frame β is the
+      integrated one — corrected by R11b-7.
+    - **R11b-7 the bimodal per-star β** (the mechanism above); path (d) amended to a joint sample fit with a
+      frame-shared displaced-copy shoulder; fallback the summed-profile β.
+    - **R11b-8 `shoulder` read** (β 2.17–14.46 over the 12 frames, 3c 1.0735; summed profile 0000 6.80 vs 3.36): both
+      fail B-3 by construction; the ninth estimator → "stop patching, re-audit the model".
+    - **R11b-9 the second design ruling** — the group β as the consumed quantity, the per-frame β a diagnostic, B2 not a
+      bar; truth-checked (the ridge +1.8 % per unit β; clean-frame s_M 0.168); it amends the owner's F-4, so the owner
+      was asked before code.
+    - **R11b-10 owner challenge** (the rationale was unclear; the reference programs do not do this): the group β
+      withdrawn as the recommendation; a reference-style frame FWHM (median of per-star own-free-β point-fit FWHM) read
+      0000 / 0001 1.0524 (ours 1.0883).
+    - **R11b-11 the L4 read** — F_ref on the point fits (measured out, below); the pixel-integrated `fref` arm was built
+      (A4) and never judged.
+    - **Owner fact (2026-10-13).** The reference frame analyser's default PSF is Moffat 4 (one fixed β for every frame);
+      its M42 ratio 0000 / 0001 1.050; ours at a held β 4 1.044–1.047, at the per-frame β 1.088.
+    - **R11b-12 the owner's decision** (above).
+    - **R11b-13 the L5 read** (the table below): no further estimator; the group β is kept; 3c and 3b FWHM_m2 are
+      recorded as the composite-PSF definition limit; Task 13 judges at master level.
+    - **The lab read L5 (runner; athenaeum-lab 1e52339 at 0f70e3c0, `star-lab/results/plan-a/t11b-l5/`).** Step 0 = the
+      default (single-frame) path against L2's `head`; then the 12 M42 frames replayed at `--psf-beta` = the group β.
+
+      | Cell | Bar | Value (L5) | Verdict |
+      | ---- | ---- | ---- | ---- |
+      | Step 0: single-frame path vs `head` (24 M42 / L1 planes + the 463-invocation quick manifest: 487 files, 1 849 458 lines) | identical | identical but for the additive `betaOwn` (== `beta`) on 255 measure frame lines | ok (accepted) |
+      | M42 group β | — | 3.3066 (0003's own β; 0000's own 7.568) | reported |
+      | 3c F(0000) / F(0001) | ∈ [1.044, 1.062] | 1.0431 ± 0.0013 (own β 1.0883) | miss by 0.0009 (0.7 SE): the definition limit |
+      | 3b ours / HFR | z₀ ≤ k | 1.01 ≤ 2.66 (own β 4.63 > 3.74) | ok |
+      | 3b ours / FWHM_m2 | z₀ ≤ k | 5.16 > 2.16, sign flipped: 0000 0.7246 vs the others' 0.7425 (own β 5.47 > 5.16) | miss: the definition limit |
+      | B1 / B3 on `beta_own` | = Task 10c | 3.60 ≤ 5.39 / 0.051 ≤ 0.207 (`betaOwn` == the default run's β on all 12) | ok |
+      | B2 | not a bar | — | resolved by definition |
+      | F / the ERP's free-Moffat F (informational) | — | 0000 0.964, the 11 others 0.973–1.010 (own β 1.022 vs 0.965–1.004) | reported |
+      | F at the group β / F at the own β | — | 0000 0.943, 0008 1.032 (own β 2.645), the rest 0.968–1.013 | reported |
+      | accepted fits at the group β | — | 0000 13 843 → 13 654, 0008 14 908 → 15 089, 0003 unchanged (`centreMoved` / `narrowerThanPixel` / `regionTooSmall`) | reported |
+      | probe wall, `--psf-beta` / default (ABBAAB, median) | information | 0000 0.992, 0008 1.024 | reported; M.1 is Task 13's |
+
+      3c's lower edge was D0 S3's own held-β reading (1.044–1.047 at β 3.3–5); the independent widths span 1.043–1.062
+      on 0000 (ours 1.043, HFR 1.050, the ERP 1.050 / 1.053, FWHM_m2 1.062). 3b's FWHM_m2 k fell 5.16 → 2.16 because
+      the 11 clean frames tightened under one β.
+    - **Measured out — never re-propose (nine estimators and the reference-style F; archive: the WIP branch
+      `one-star-path-t11b-wip` and its bundles, none merged).**
+      - *joint* (β, α_x, α_y, θ shared over the 64-star sample, block-diagonal LM): 0000 β 6.14, 3c 1.069, B2 miss,
+        B-2 f1.6 s1 2.52 pp vs 0.50.
+      - *growth* (the β whose model growth curve matches the sample's F-5 5F sums): 3c 1.057, but β 2.754 is
+        sky-coupled; item 1 27 of 58 over, twins 33 / 46, C-11 Δecc up to 0.111.
+      - *flux* (rank by F-5 flux below 0.9·range): 0000 β 6.77, 3c 1.081, 3b HFR miss.
+      - *± floor* (Task 10b's 3F region floor on the sample fits, beside head / joint / flux): 0000 β 5.7–6.0, but B1
+        misses (the clean frames' k shrinks to 2.8–4.5); 3c 1.071–1.078.
+      - *band* (R11b-5): 0000 β 8.23; fails B2 by construction.
+      - *shoulder* (a frame-shared displaced-copy shoulder in a joint fit): not identifiable on real data — β 2.17–14.46,
+        f at its 0.5 bound for a 0.25 % χ² gain; 3c 1.0735.
+      - *summed profile*: 0000 6.80 vs the others' median 3.36 (0003 6.60); a clean-frame spread 10× HEAD's (±4 % F
+        noise in every clean group).
+      - *moment ratio* (HFR / FWHM against the Moffat's own ratio): skew-insensitive (0000 2.35, 0001 2.21) but
+        sky-coupled through the 5F total — drags β from ≈ 4 to 2.3 on every M42 frame.
+      - *the Auto ladder* (a fixed β chosen by summed χ²): the discretised profile — 6 on 0000, 4 on 0001 (F +3.5 %),
+        plus the 9.6 % β-alone jumps F-4 removed.
+      - *multi-start* (repair the integrated fit): only picks the global of two basins 3.9 % apart; the sum still says
+        5–7.
+      - *F_ref on the point fits* (the frame F = the median of each star's own free-β point-fit FWHM): passes M42 (3c
+        1.0455 / 1.0524, 3b both, twins 46 / 46) but misses item 1 (51 / 58: +1.0 % at F 1.2, worst m2.5 f1.2 +6.3 %)
+        and B-2 f1.6 s1 (1.11 / 1.62 vs 0.50) — a point model on pixel-integrated undersampled stars reads wide (E5's
+        own reason); trimmed means read low.
+    - **The upgrade ripple (review I3).** Every pre-11b `Auto` row is keyed without a β, so it is stale on the first plan
+      build after this lands: every existing `Auto` set re-measures, re-registers and re-normalizes ONCE on its first
+      run (`.athf` files overwritten in place, no orphans); `Moffat4` / `Fixed` sets keep their hashes. Named in the
+      release notes. Task 11c halves it (its pass-1 artifact is keyed without the group β).
+    - **I2 — a group-β move re-runs pass 1 today.** The pass-1 records are not stored, so when an exclusion moves the
+      lower median every member re-reads and re-detects, not only re-fits (HEAD's Measure × (3n − 1)/(2n − 1) reads for
+      the group). Not a correctness bug; the doc comment on `measure_group_two_pass` says it; **Task 11c** owns it.
+    - **Memory (the review's ruling).** A freshly measured member holds its pass-1 records until pass 2 (≈ 250 B per
+      seed, ≤ 6 MB per plane at the detector's 24 576 cap): 6–15 MB on M42; a 300-frame OSC group ≈ 0.7 GB typical,
+      5.4 GB worst, uncounted by admission. Kept in 11b; a bound (drop and recompute) computes twice, against the
+      owner's disk-as-cache rule → the spill, Task 11c.
+    - **Cost.** A mono plane is read twice, an OSC frame 3n − 1 times (2n − 1 before); the verdict pass is not
+      repeated. The probe-level bracket above is information only; the stage-level Measure wall (M.1, ≤ 1.2×) is Task
+      13's, whose bar now covers the two-pass Measure.
+    - **Recorded limits (not bars).** (a) 3c (1.0431 vs 1.044) and 3b FWHM_m2 on M42: the composite-PSF definition
+      limit — the referees themselves disagree by 1.9 % on 0000. (b) The single-frame path over-reads a skewed frame's
+      half-max by the ridge (+1.8 % per unit β; 0000 +4 %), as every standalone tool does: there is no second frame to
+      share with (a Task 14 debt line). (c) A mixed-profile group reads every F at one β: comparability over per-frame
+      truth (F-4's lab bar is per family).
+    - **Carries.** **Task 11c:** spill pass 1 to `<working_dir>/<set_slug>/measured/` (I2, the memory, half the
+      ripple). **Task 12:** the analysis mode's default PSF is Moffat 4 (R11b-12). **Task 13:** its M42 frame-β line is
+      closed by this definition; M.1 covers the two-pass Measure; master-level judgment of the group β. **Task 14:**
+      limit (b) as a debt line. **Plan C:** Moffat 4 by default, the own β shown, Auto selectable; the Measure panel
+      still labels the model "Auto (per-frame β)" (`stageSummary.ts`), which now names the diagnostic, not the β the
+      fits are made at — a label line owed with the next frontend touch.

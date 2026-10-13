@@ -1909,17 +1909,9 @@ pub(super) fn fit_after_passes(
     trail_verdict: bool,
     extended: &[bool],
 ) -> FitOutcome {
-    let sample = match model {
-        PsfModel::Moffat4 => super::beta::SampleBeta::fixed(4.0),
-        // Tier C Task 1: a caller-resolved β (the group β, or any other
-        // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
-        // `Auto` sample below never runs for it.
-        PsfModel::Fixed(b) => super::beta::SampleBeta::fixed(b),
-        PsfModel::Auto => match passes {
-            Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, extended, pool),
-            None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
-        },
-    };
+    let sample = resolve_beta(
+        data, w, h, seeds, model, p, mask, field, passes, extended, pool,
+    );
     let (beta, beta_source) = (sample.beta, sample.source);
     let mut outcome = fit_at_width(
         data,
@@ -1952,6 +1944,35 @@ pub(super) fn fit_after_passes(
         }
     }
     outcome
+}
+
+/// The β [`fit_after_passes`] fits at, resolved from `model` — the ONE place it is resolved, so the measure path's own
+/// β ([`super::plane_beta`], Task 11b pass 1) and its fits are never two computations: `Moffat4` 4.0; `Fixed(b)` b,
+/// fit exactly like `Moffat4`'s fixed 4.0 (Tier C Task 1: a caller-resolved β, the stacking group β of Task 11b
+/// among them); `Auto` the verdict sample's ([`super::beta::verdict_beta`]) given `passes`, else the brightest
+/// seeds' own sample ([`super::beta::sample_beta`], Q7).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_beta(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    model: PsfModel,
+    p: &FitParams,
+    mask: Option<&[bool]>,
+    field: FieldWidth,
+    passes: Option<&[SeedPass]>,
+    extended: &[bool],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> super::beta::SampleBeta {
+    match model {
+        PsfModel::Moffat4 => super::beta::SampleBeta::fixed(4.0),
+        PsfModel::Fixed(b) => super::beta::SampleBeta::fixed(b),
+        PsfModel::Auto => match passes {
+            Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, extended, pool),
+            None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
+        },
+    }
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail

@@ -859,6 +859,8 @@ mod tests {
                     refused_by_reason: Default::default(),
                     stars_unsaturated: stars,
                     beta: 4.0,
+                    beta_own: None,
+                    beta_own_at_cap: false,
                     fwhm_px: fwhm,
                     eccentricity: ecc,
                     tflux: 1.0,

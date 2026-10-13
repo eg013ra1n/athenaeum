@@ -14,6 +14,8 @@
 //!       [--seed-threshold K]   (the matched filter's threshold in σ_f; default: the config's `seedThreshold`)
 //!       [--pixel-noise white|mixed|unknown]   (the caller's statement of the pixels' noise correlation, ruling C-10;
 //!                              default: what the Measure stage states for a calibrated frame, 1 plane white, 3 mixed)
+//!       [--psf-beta B]   (the measure path fitted at `PsfModel::Fixed(B)` from its own verdict pass: the stacking
+//!                         Measure stage's second pass, so the lab replays a group's fits at its group β frame by frame)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -73,6 +75,14 @@
 //! betas arm keeps the discrete ladder (`--betas`, default 2.5,4,6,10) as
 //! row 3's β-sensitivity diagnostic.
 //!
+//! F-4b (Plan A Task 11b, owner decision R11b-12): the stacking Measure stage
+//! fits every member of a group at the group β (the lower median of the
+//! members' own βs). The measure frame line's `betaOwn` is the plane's own β
+//! (F-4's estimator; null under a fixed model); `--psf-beta B` runs the
+//! measure path the way that stage's second pass does — the verdict pass and
+//! the own β first, then every fit at `Fixed(B)` (`betaSource` `fixed`,
+//! `beta` B) — and the options record `psfModel: "fixed"`, `psfBeta: B`.
+//!
 //! F-5 (Plan A Task 10, ruling R-OSP-7): every star's `signal` is the fitted
 //! model's flux in its FWTM ellipse times the plane's aperture correction;
 //! the measure and betas frame lines carry `apertureCorrection` (that `c`,
@@ -121,14 +131,15 @@ use athenaeum_core::resample::{warp_rows, Plane};
 use athenaeum_core::stacking::config::{SeedSource, StackingConfig};
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
-    gain_from_header, measure_planes_diagnosed, MeasureOptions, SeedOverride, ADU_SCALE,
+    gain_from_header, measure_planes_diagnosed, measure_planes_pass1, measure_planes_pass2,
+    MeasureOptions, SeedOverride, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
 use athenaeum_core::star_measure::{
-    fit_stars_at, star_snr, ApertureNoise, FitDiagnostics, FitStarsOptions, Outcome, PixelNoise,
-    RefusalCounts, RefusalReason, SaturationVerdict,
+    fit_stars_at, star_snr, ApertureNoise, BetaSource, FitDiagnostics, FitStarsOptions, Outcome,
+    PixelNoise, RefusalCounts, RefusalReason, SaturationVerdict,
 };
 use serde_json::{json, Value};
 
@@ -353,6 +364,7 @@ struct MeasureArgs {
     seeds: Option<SeedChoice>,
     seed_threshold: Option<f64>,
     pixel_noise: Option<PixelNoise>,
+    psf_beta: Option<f64>,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -371,6 +383,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         seeds: None,
         seed_threshold: None,
         pixel_noise: None,
+        psf_beta: None,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
@@ -418,6 +431,14 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
                         .ok()
                         .filter(|k: &f64| k.is_finite() && *k > 0.0)
                         .unwrap_or_else(|| die("--seed-threshold: a positive number")),
+                )
+            }
+            "--psf-beta" => {
+                a.psf_beta = Some(
+                    v().parse()
+                        .ok()
+                        .filter(|b: &f64| b.is_finite() && *b > 1.0)
+                        .unwrap_or_else(|| die("--psf-beta: a number above 1")),
                 )
             }
             "--betas" => {
@@ -549,6 +570,10 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         m.insert("seedSource".into(), json!(opts.seed_source.as_str()));
         let k = (opts.seed_source == SeedSource::MatchedFilter).then_some(opts.seed_threshold);
         m.insert("seedThreshold".into(), json!(k));
+        if let Some(b) = a.psf_beta {
+            m.insert("psfModel".into(), json!("fixed"));
+            m.insert("psfBeta".into(), json!(b));
+        }
     }
     let options = json!({ "measure": measure_options,
                           "detection": { "minSnr": det.min_snr, "maxEccentricity": det.max_eccentricity },
@@ -565,7 +590,29 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         3 => PixelNoise::Mixed,
         _ => PixelNoise::Unknown,
     });
-    let mut measured: Vec<_> = if need_measure && !selected.is_empty() {
+    let mut measured: Vec<_> = if need_measure && !selected.is_empty() && a.psf_beta.is_some() {
+        // `--psf-beta`: the stacking Measure stage's two passes (Task 11b), the second at the given β on every plane.
+        let read = |p: usize| Ok::<_, Infallible>(Cow::Borrowed(planes[p].as_slice()));
+        let pass1 = measure_planes_pass1(
+            planes.len(),
+            w,
+            h,
+            &opts,
+            None,
+            seed_source,
+            a.diagnostics,
+            pixel_noise,
+            gain_from_header(&a.image),
+            read,
+        )
+        .unwrap_or_else(|never| match never {});
+        let betas = vec![a.psf_beta.unwrap_or(4.0); pass1.planes()];
+        measure_planes_pass2(pass1, &betas, None, read)
+            .unwrap_or_else(|never| match never {})
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else if need_measure && !selected.is_empty() {
         measure_planes_diagnosed(
             planes.len(),
             w,
@@ -658,6 +705,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 .unwrap_or(0);
             emit(
                 json!({"kind": "frame", "path": "measure", "plane": p, "beta": pm.channel.beta,
+                        "betaOwn": pm.channel.beta_own.or((pm.beta_source != BetaSource::Fixed).then_some(pm.channel.beta)),
+                        "betaOwnAtCap": pm.channel.beta_own_at_cap,
                         "betaSource": pm.beta_source.name(), "betaSample": pm.beta_source.sample(),
                         "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
                         "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
@@ -969,6 +1018,7 @@ mod tests {
             seeds: None,
             seed_threshold: None,
             pixel_noise: None,
+            psf_beta: None,
         }
     }
 

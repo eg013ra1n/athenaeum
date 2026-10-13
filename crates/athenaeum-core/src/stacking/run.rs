@@ -77,26 +77,30 @@ use crate::stacking::integrate::{
 };
 use crate::stacking::ln::{
     self, build_reference as build_ln_reference, build_reference_saturation, normalize_frame,
-    read_reference, read_reference_saturation_masks, write_reference,
-    write_reference_saturation, BackgroundModel, LnError, LnFrameGrids, LnReference,
-    LnReferenceForDetection, LnScaleSeeds, SaturationMask, TileTable, CLEANING,
+    read_reference, read_reference_saturation_masks, write_reference, write_reference_saturation,
+    BackgroundModel, LnError, LnFrameGrids, LnReference, LnReferenceForDetection, LnScaleSeeds,
+    SaturationMask, TileTable, CLEANING,
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
-    stamp_grid_cards, write_cropped_drizzle, write_cropped_master, write_drizzled_master,
-    remove_partial_outputs, write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle,
+    remove_partial_outputs, stamp_grid_cards, write_cropped_drizzle, write_cropped_master,
+    write_drizzled_master, write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle,
     WrittenMaster,
 };
-use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
+use crate::stacking::measure::{
+    measure_frame_pass1, measure_frame_pass2, measure_frame_with_fits, FrameMeasurement,
+    FramePass1, MeasureOptions,
+};
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
     cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
-    measurement_hash_for, normalization_hash_for, registration_hash_for, registration_row_is_fresh,
-    seeds_calibration_hash_for, store_registration, stored_reference_frame, stored_registrations,
-    wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
+    measurement_hash_for, normalization_hash_for, pass1_own_betas, registration_hash_for,
+    registration_row_is_fresh, seeds_calibration_hash_for, store_registration,
+    stored_reference_frame, stored_registrations, wants_cfa_mosaic, HashMemo, LnReferencePayload,
+    MasterWork, PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -3171,9 +3175,12 @@ pub(crate) struct MeasuredGroup {
     /// pick ([`psf_signal::group_beta`]), always one of their own βs
     /// (continuous from Plan A Task 9, F-4; one of
     /// [`psf_signal::AUTO_BETAS`] before it). `None` when the group measured no
-    /// frame at all. Nothing reads this yet — Task 2 will hand it to the
-    /// LN reference build and to every mapped fit's flux correction as
-    /// `PsfModel::Fixed`.
+    /// frame at all. Stage 6 fits its reference and every member's seeds at
+    /// it (`PsfModel::Fixed`), and from Plan A Task 11b (owner decision
+    /// R11b-12) stage 3 fitted every member at it under `Auto`
+    /// ([`measure_group_two_pass`]) — one value, resolved once, read by both;
+    /// every later stage's measurement hash folds it
+    /// ([`group_measurement_hash`]).
     pub beta: Option<f64>,
 }
 
@@ -3398,11 +3405,20 @@ fn member_coverages(
     ref_h: usize,
 ) -> Vec<f64> {
     match field {
-        Some(field) => members.iter().map(|m| field.coverage_of(m.frame_id)).collect(),
+        Some(field) => members
+            .iter()
+            .map(|m| field.coverage_of(m.frame_id))
+            .collect(),
         None => members
             .iter()
             .map(|m| {
-                reference_coverage(&m.map, m.measurement.width, m.measurement.height, ref_w, ref_h)
+                reference_coverage(
+                    &m.map,
+                    m.measurement.width,
+                    m.measurement.height,
+                    ref_w,
+                    ref_h,
+                )
             })
             .collect(),
     }
@@ -3637,6 +3653,9 @@ pub(crate) struct FanOutTicker {
     stage: Stage,
     group_key: Option<String>,
     total: usize,
+    /// Sub-frame units per frame: `1` everywhere but a two-pass stage ([`Self::with_scale`]). `done` counts units;
+    /// the event carries whole frames (`units / scale`) against the same `total`.
+    scale: usize,
     done: AtomicUsize,
     gate: Mutex<(Instant, usize)>,
     /// Fix wave item 3: a byte pair FROZEN at construction — most callers
@@ -3693,6 +3712,7 @@ impl FanOutTicker {
             stage,
             group_key,
             total,
+            scale: 1,
             done: AtomicUsize::new(done_so_far),
             // Armed so the FIRST tick emits: the throttle measures from the
             // last emit, and there has been none.
@@ -3705,17 +3725,30 @@ impl FanOutTicker {
         }
     }
 
+    /// Count in `scale` units per frame (Measure's two passes tick half a frame each, `scale = 2`): `done_so_far`
+    /// is then in units too, and [`Self::tick_units`] advances by a number of them. The event's `current` stays in
+    /// whole frames and `total` in frames, so a stage that lands on `total` still does.
+    fn with_scale(mut self, scale: usize) -> Self {
+        self.scale = scale.max(1);
+        self
+    }
+
     /// One more frame finished; emits (throttled) and returns the running
     /// count.
     fn tick(&self, frame_id: Option<i64>) -> usize {
-        let current = self.done.fetch_add(1, Ordering::SeqCst) + 1;
+        self.tick_units(frame_id, 1)
+    }
+
+    /// `units` more sub-frame units finished (see [`Self::with_scale`]); otherwise [`Self::tick`].
+    fn tick_units(&self, frame_id: Option<i64>, units: usize) -> usize {
+        let current = self.done.fetch_add(units, Ordering::SeqCst) + units;
         let now = Instant::now();
         let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let (last_emit, last_current) = *gate;
         if current < last_current {
             return current;
         }
-        let force = current >= self.total;
+        let force = current >= self.total * self.scale;
         if !force && now.duration_since(last_emit) < Duration::from_millis(PROGRESS_THROTTLE_MS) {
             return current;
         }
@@ -3724,7 +3757,7 @@ impl FanOutTicker {
         let percent = if self.total == 0 {
             100.0
         } else {
-            100.0 * current as f64 / self.total as f64
+            100.0 * current as f64 / (self.total * self.scale) as f64
         };
         emit_event(
             self.emitter.as_ref(),
@@ -3735,7 +3768,7 @@ impl FanOutTicker {
                 project_id,
                 stage: self.stage,
                 group_key: self.group_key.clone(),
-                current,
+                current: current / self.scale,
                 total: self.total,
                 percent,
                 bytes_done: self.bytes_done,
@@ -4240,6 +4273,26 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
             to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
         }
 
+        // Plan A Task 11b (owner decision R11b-12): under `Auto` every member
+        // is fitted at the group β in two passes (`measure_group_two_pass`),
+        // which takes every frame to measure; `Moffat4` (and `Fixed`) keep the
+        // single pass below, unchanged (under `Auto` it finds nothing to do).
+        let auto = matches!(cfg.measurement.psf_model, psf_signal::PsfModel::Auto);
+        let mut auto_group_beta: Option<f64> = None;
+        if auto {
+            auto_group_beta = measure_group_two_pass(
+                rc,
+                group,
+                &cfg,
+                &opts,
+                &mut entries,
+                std::mem::take(&mut to_measure),
+                force_fresh,
+                (current, total),
+                (group_max_w, group_max_h),
+            )?;
+        }
+
         // Freshness check (skipped entirely under a Measure-or-earlier
         // `rerun_from`): a `metrics` artifact whose hash matches this
         // frame's CURRENT stage-1 hash is reused straight from
@@ -4259,7 +4312,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 let conn = db(&rc.ctx)?.conn();
                 rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
             };
-            let expected_hash = measurement_hash_for(&cfg, &calib_hash);
+            let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
 
             let mut reused = false;
             if !force_fresh {
@@ -4398,97 +4451,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                             let conn = db(&rc.ctx)?.conn();
                             rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
                         };
-                        let expected_hash = measurement_hash_for(&cfg, &calib_hash);
-                        let payload = serde_json::to_string(&m).map_err(|e| {
-                            RunError::Other(format!("failed to serialize measurement: {e}"))
-                        })?;
-                        {
-                            let conn = db(&rc.ctx)?.conn();
-                            upsert_artifact(
-                                &conn,
-                                &NewArtifact {
-                                    subject: &rc.subject,
-                                    frame_id: Some(frame.frame_id),
-                                    group_key: &group.key,
-                                    kind: "metrics",
-                                    path: None,
-                                    config_hash: &expected_hash,
-                                    size: None,
-                                    modified_at: None,
-                                    payload_json: Some(&payload),
-                                },
-                            )?;
-                        }
-                        // Tier C Task 1 (spec §2.2.1): persist every plane's
-                        // accepted star fits beside `metrics`, one
-                        // `.athf` file and one `stacking_artifacts` row per
-                        // plane, keyed on the SAME `expected_hash` — the two
-                        // are a product of the same computation and share
-                        // its staleness (see `plan.rs`'s per-frame loop).
-                        let stem = calibrated_file_stem(group, frame);
-                        for (plane, plane_fits) in fits.iter().enumerate() {
-                            let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
-                            // Final fix wave (ruling C-30, the whole-branch
-                            // review's I1): a `.athf` write failure DEGRADES,
-                            // it does not fail the run. Every consumer of
-                            // this artifact already falls back on its own —
-                            // Register to detection with a warn
-                            // (`resolve_register_fits`), Normalize to
-                            // detection (`fits_paths`' `None` arm), the plan
-                            // gate to "Measure is stale"
-                            // (`fits_artifact_fresh`) — so a full stop here
-                            // would be the ONE place in the seam that treats
-                            // a missing optimization as a correctness
-                            // failure, and it would throw away the whole
-                            // stage's real output (`metrics`, which IS
-                            // written) over a cache file. Same shape as
-                            // `.rej`'s latched write failure (M3's
-                            // `RejBitmapSet`) and the LN sidecar's per-frame
-                            // exclusion: loud, never silent, never fatal.
-                            //
-                            // The plane's `stacking_artifacts` row is SKIPPED
-                            // — never a row for a file that is not on disk.
-                            // An EXISTING row from an earlier run is left
-                            // alone on purpose: if the old file is still
-                            // there and valid (a transient rename failure),
-                            // it stays reusable; if it is gone or wrong,
-                            // `is_fresh`'s own size-on-disk check reports it
-                            // stale, which is exactly the fallback above.
-                            if let Err(e) = fits_artifact::write_fits(&fits_path, plane_fits) {
-                                #[cfg(test)]
-                                FITS_WRITE_FAILURE_LOG
-                                    .lock()
-                                    .unwrap()
-                                    .push(fits_path.clone());
-                                tracing::warn!(
-                                    run_id = rc.run_id,
-                                    group_key = %group.key,
-                                    frame_id = frame.frame_id,
-                                    plane,
-                                    path = %fits_path.display(),
-                                    error = %e,
-                                    "fits artifact write failed; consumers will fall back"
-                                );
-                                continue;
-                            }
-                            let (size, modified_at) = file_identity(&fits_path)?;
-                            let kind = fits_artifact::artifact_kind(plane);
-                            let conn = db(&rc.ctx)?.conn();
-                            upsert_artifact(
-                                &conn,
-                                &NewArtifact {
-                                    subject: &rc.subject,
-                                    frame_id: Some(frame.frame_id),
-                                    group_key: &group.key,
-                                    kind: &kind,
-                                    path: fits_path.to_str(),
-                                    config_hash: &expected_hash,
-                                    size: Some(size),
-                                    modified_at: Some(&modified_at),
-                                    payload_json: None,
-                                },
-                            )?;
-                        }
+                        let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
+                        persist_measurement(rc, group, frame, &m, &fits, &expected_hash)?;
                         entries[idx].measurement = Some(m);
                     }
                 }
@@ -4592,7 +4556,11 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         // `Auto` β regardless of which frames end up combined). `None`
         // when the group measured nothing at all. Recorded only — nothing
         // consumes it yet (Task 2 will).
-        let group_beta_value: Option<f64> = {
+        // Task 11b: under `Auto` the value the two passes resolved and fitted
+        // every member at — the same lower median, over the members' OWN βs.
+        let group_beta_value: Option<f64> = if auto {
+            auto_group_beta
+        } else {
             let betas: Vec<f64> = entries
                 .iter()
                 .filter_map(|e| e.measurement.as_ref())
@@ -4695,6 +4663,465 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         duration_ms: stage_start.elapsed().as_millis() as u64,
     });
 
+    Ok(())
+}
+
+/// Stage 3 under `measurement.psfModel = Auto` (Plan A Task 11b, owner decision R11b-12; the task's design ruling 2
+/// §1/§3): every member of `group` is fitted at ONE β, the group β — [`psf_signal::group_beta`] (the lower median) of
+/// the members' own βs, the very value `stacking_run_groups.beta` records and stage 6 fits its reference and every
+/// member's seeds at (`PsfModel::Fixed(group β)`) — so no frame's F is compared across the group at a β of its own,
+/// and Measure's F and LN's F sit at one β. Two passes over `star_measure`'s `PlanePrep` seam:
+///
+/// 1. per frame, fanned out: the verdict pass and the frame's own β, F-4's E5 estimator unchanged
+///    ([`measure_frame_pass1`]); a stored `metrics` row whose first pass is still valid
+///    ([`pass1_own_betas`]) gives the own β without reading the frame;
+/// 2. the group β, once; then per frame, fanned out: every fit, F, `.athf`, `c` and F-6 statistic at
+///    `PsfModel::Fixed(group β)` ([`measure_frame_pass2`]) — unless the frame's stored row is keyed on this very group β
+///    with fresh `fits` rows (a cache hit). A frame whose first pass came from its row but whose second pass is stale
+///    runs both passes again (first-pass records are not stored); its own β reads the same.
+///
+/// A group of one is fitted at its own β (the lower median of its planes' own βs, which is its own β on a mono
+/// frame). Every row is keyed on `measurement_hash_for(cfg, calib, Some(group β))`: the group β moving (a member
+/// excluded, added or re-measured to another own β) re-runs pass 2 for the whole group, never pass 1 of a member whose
+/// row still holds it. The first passes of the frames read here wait in memory for the group β (seeds and per-seed
+/// records, no plane). Returns the group β, `None` when no member was measured.
+///
+/// Cost, plainly: the first-pass records are not stored, so a stale pass 2 re-reads and re-detects (re-runs pass 1 for)
+/// EVERY member of the group — a group-β move (an exclusion that shifts the lower median) costs the group a full
+/// Measure read pass again. Task 11c (spill pass 1 to the work dir) owns that cost.
+///
+/// The group β is the lower median over every member whose pass 1 succeeded, including one whose pass 2 then fails and
+/// is excluded: that member still counted in the median. No re-computation loop; every `.athf` written is at the one
+/// group β regardless.
+///
+/// Progress: the bar moves from the first frame. Each frame is two half-ticks on a doubled scale (pass 1, pass 2:
+/// [`FanOutTicker::with_scale`]), so the stage keeps its `total` and lands on it; a frame that reuses a stored first
+/// pass ticks both halves in pass 2, a cache hit both at once.
+#[allow(clippy::too_many_arguments)]
+fn measure_group_two_pass(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    cfg: &StackingConfig,
+    opts: &MeasureOptions,
+    entries: &mut [MeasuredFrame],
+    to_measure: Vec<(usize, GroupFrame, PathBuf)>,
+    force_fresh: bool,
+    (current, total): (usize, usize),
+    (group_max_w, group_max_h): (u64, u64),
+) -> Result<Option<f64>, RunError> {
+    /// One frame of the group on its way through the two passes.
+    struct Member {
+        idx: usize,
+        frame: GroupFrame,
+        path: PathBuf,
+        calib_hash: String,
+        /// The stored row whose first pass is valid: its measurement and its key.
+        cached: Option<(FrameMeasurement, String)>,
+        /// The frame's own β per plane (pass 1, read or reused).
+        own: Option<Vec<f64>>,
+        /// Pass 1 run here, waiting for the group β.
+        pass1: Option<FramePass1>,
+    }
+    fn exclude(rc: &mut RunContext, entry: &mut MeasuredFrame, msg: String) {
+        rc.runtime_exclusions
+            .push((entry.frame.frame_id, msg.clone()));
+        entry.included = false;
+        tracing::warn!(
+            run_id = rc.run_id,
+            frame_id = entry.frame.frame_id,
+            reason = %msg,
+            "frame excluded"
+        );
+        entry.reason = Some(msg);
+    }
+
+    // Pass 1 from the stored rows (skipped under a Measure-or-earlier `rerun_from`, as the single pass's reuse is).
+    let mut members: Vec<Member> = Vec::with_capacity(to_measure.len());
+    for (idx, frame, path) in to_measure {
+        let calib_hash = {
+            let conn = db(&rc.ctx)?.conn();
+            rc.memo.calibration_hash_checked(&conn, cfg, &frame)?
+        };
+        let mut member = Member {
+            idx,
+            frame,
+            path,
+            calib_hash,
+            cached: None,
+            own: None,
+            pass1: None,
+        };
+        if !force_fresh {
+            let existing = {
+                let conn = db(&rc.ctx)?.conn();
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    "metrics",
+                    Some(member.frame.frame_id),
+                )?
+            };
+            if let Some(payload) = existing.as_ref().and_then(|row| row.payload_json.as_ref()) {
+                match serde_json::from_str::<FrameMeasurement>(payload) {
+                    Ok(m) => {
+                        let row = existing.as_ref().expect("a payload has its row");
+                        if let Some(own) =
+                            pass1_own_betas(cfg, &member.calib_hash, &row.config_hash, &m)
+                        {
+                            member.own = Some(own);
+                            member.cached = Some((m, row.config_hash.clone()));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            frame_id = member.frame.frame_id,
+                            error = %e,
+                            "stored metrics payload failed to parse; re-measuring"
+                        );
+                    }
+                }
+            }
+        }
+        members.push(member);
+    }
+
+    let working_set_bytes = measure_working_set_bytes(group_max_w, group_max_h);
+    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool.clone();
+
+    // Pass 1, fanned out, for every member without a reusable first pass.
+    let need_pass1: Vec<usize> = (0..members.len())
+        .filter(|&i| members[i].own.is_none())
+        .collect();
+    let mut pass1_failed = 0usize;
+    if !need_pass1.is_empty() {
+        log_admission(
+            rc,
+            Stage::Measure,
+            &group.key,
+            working_set_bytes,
+            0,
+            admission_n,
+        );
+        let jobs: Vec<(i64, PathBuf)> = need_pass1
+            .iter()
+            .map(|&i| (members[i].frame.frame_id, members[i].path.clone()))
+            .collect();
+        // Half a frame per pass-1 frame (scale 2), so the bar moves from the first frame.
+        let ticker1 = FanOutTicker::new(
+            rc,
+            Stage::Measure,
+            Some(group.key.clone()),
+            current * 2,
+            total,
+            0,
+            0,
+        )
+        .with_scale(2);
+        let ticker1_ref = &ticker1;
+        let cancel_ref: &AtomicBool = &rc.cancel;
+        let results = fan_out(jobs, admission_n, cancel_ref, move |(frame_id, path)| {
+            let out = measure_frame_pass1(&path, opts, Some(pool_ref), cancel_ref)
+                .map_err(|e| format!("measurement failed: {e}"));
+            ticker1_ref.tick_units(Some(frame_id), 1);
+            out
+        });
+        rc.check_cancel()?;
+        for (&i, res) in need_pass1.iter().zip(results) {
+            match res {
+                None => return Err(RunError::Cancelled),
+                Some(Err(msg)) => {
+                    pass1_failed += 1;
+                    exclude(rc, &mut entries[members[i].idx], msg)
+                }
+                Some(Ok(pass1)) => {
+                    members[i].own = Some(pass1.beta_own().to_vec());
+                    members[i].pass1 = Some(pass1);
+                }
+            }
+        }
+    }
+
+    // The group β, once: the lower median of every measured member's own βs (every plane of every frame, as stage 6's
+    // group β always was).
+    let measured: Vec<usize> = (0..members.len())
+        .filter(|&i| members[i].own.is_some())
+        .collect();
+    let own_all: Vec<f64> = measured
+        .iter()
+        .flat_map(|&i| members[i].own.clone().unwrap_or_default())
+        .collect();
+    if own_all.is_empty() {
+        return Ok(None);
+    }
+    let group_beta = psf_signal::group_beta(&own_all);
+    let (own_min, own_max) = own_all
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+            (lo.min(b), hi.max(b))
+        });
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        beta = group_beta,
+        count = measured.len(),
+        beta_own_min = own_min,
+        beta_own_max = own_max,
+        "measure: group beta resolved; every member is fitted at it"
+    );
+    for &i in &measured {
+        for (plane, &b) in members[i].own.iter().flatten().enumerate() {
+            tracing::debug!(
+                run_id = rc.run_id,
+                frame_id = members[i].frame.frame_id,
+                plane,
+                beta_own = b,
+                beta = group_beta,
+                "measure: frame own beta"
+            );
+        }
+    }
+
+    // Pass 2: a cache hit where the stored row is keyed on this group β with fresh `fits` rows, else fitted.
+    let mut reused = 0usize;
+    let mut need_pass2: Vec<usize> = Vec::new();
+    for &i in &measured {
+        let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
+        if let Some((m, key)) = &members[i].cached {
+            if *key == expected {
+                let fresh = {
+                    let conn = db(&rc.ctx)?.conn();
+                    fits_artifact_fresh_for_planes(
+                        &conn,
+                        &rc.subject,
+                        &group.key,
+                        members[i].frame.frame_id,
+                        m.channels.len(),
+                        &expected,
+                    )?
+                };
+                if fresh {
+                    entries[members[i].idx].measurement = Some(m.clone());
+                    entries[members[i].idx].cached_metrics = true;
+                    reused += 1;
+                    continue;
+                }
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    frame_id = members[i].frame.frame_id,
+                    "cached metrics found but its fits sidecar is missing or stale; re-measuring"
+                );
+            }
+        }
+        need_pass2.push(i);
+    }
+    if need_pass2.is_empty() {
+        // Nothing left to fit: every member of the group is done (reused, or excluded in pass 1).
+        if reused > 0 || !need_pass1.is_empty() {
+            rc.progress(
+                Stage::Measure,
+                Some(group.key.clone()),
+                current + members.len(),
+                total,
+                0,
+                0,
+                None,
+                None,
+            );
+        }
+        return Ok(Some(group_beta));
+    }
+    if need_pass1.is_empty() {
+        log_admission(
+            rc,
+            Stage::Measure,
+            &group.key,
+            working_set_bytes,
+            0,
+            admission_n,
+        );
+    }
+    let jobs: Vec<(i64, PathBuf, Option<FramePass1>)> = need_pass2
+        .iter()
+        .map(|&i| {
+            (
+                members[i].frame.frame_id,
+                members[i].path.clone(),
+                members[i].pass1.take(),
+            )
+        })
+        .collect();
+    let ticker = FanOutTicker::new(
+        rc,
+        Stage::Measure,
+        Some(group.key.clone()),
+        // Units (scale 2): the earlier groups, the pass-1 half-ticks of this group (a failed frame completed at once,
+        // it never reaches pass 2) and the cache hits' two halves.
+        current * 2 + need_pass1.len() + pass1_failed + reused * 2,
+        total,
+        0,
+        0,
+    )
+    .with_scale(2);
+    let cancel_ref: &AtomicBool = &rc.cancel;
+    let ticker_ref = &ticker;
+    let results = fan_out(
+        jobs,
+        admission_n,
+        cancel_ref,
+        move |(frame_id, path, pass1)| {
+            let ran_pass1 = pass1.is_some();
+            let pass1 = match pass1 {
+                Some(p) => Ok(p),
+                None => measure_frame_pass1(&path, opts, Some(pool_ref), cancel_ref),
+            };
+            // One β per plane of THIS read (a group of one's planes included): every plane at the group β.
+            let out = pass1
+                .and_then(|p| {
+                    let betas = vec![group_beta; p.beta_own().len()];
+                    measure_frame_pass2(&path, p, &betas, opts, Some(pool_ref), cancel_ref)
+                })
+                .map_err(|e| format!("measurement failed: {e}"));
+            // The frame's pass 1 ran here (half already ticked) or came from its row (both halves now).
+            ticker_ref.tick_units(Some(frame_id), if ran_pass1 { 1 } else { 2 });
+            out
+        },
+    );
+    rc.check_cancel()?;
+    for (&i, res) in need_pass2.iter().zip(results) {
+        match res {
+            None => return Err(RunError::Cancelled),
+            Some(Err(msg)) => exclude(rc, &mut entries[members[i].idx], msg),
+            Some(Ok((m, fits))) => {
+                let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
+                persist_measurement(rc, group, &members[i].frame, &m, &fits, &expected)?;
+                entries[members[i].idx].measurement = Some(m);
+            }
+        }
+    }
+    Ok(Some(group_beta))
+}
+
+/// A frame's measurement hash after stage 3 — [`measurement_hash_for`] at the group β stage 3 resolved for its group
+/// (`RunContext::measured_groups`; Plan A Task 11b: under `Auto` every member's `.athf` was fitted at it, so every
+/// stage that folds the measurement hash — Register's and Normalize's reads of the `fits` artifact, C-17 / C-18 —
+/// folds it too, and the plan gate resolves the same value, `build_plan`'s `gate_measure_betas`). Under `Moffat4`
+/// the β is not folded at all.
+fn group_measurement_hash(
+    rc: &RunContext,
+    cfg: &StackingConfig,
+    group_key: &str,
+    calibrated_hash: &str,
+) -> String {
+    measurement_hash_for(
+        cfg,
+        calibrated_hash,
+        rc.measured_groups.get(group_key).and_then(|g| g.beta),
+    )
+}
+
+/// Stage 3's write of one measured frame (factored out of [`stage_measure`] by Plan A Task 11b, which writes from two
+/// paths): the `metrics` row (`payload_json` = the measurement) and, per plane, its accepted fits as one `.athf` file
+/// and one `stacking_artifacts` row, every one keyed on `expected_hash`.
+fn persist_measurement(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+    m: &FrameMeasurement,
+    fits: &[Vec<psf_signal::StarFit>],
+    expected_hash: &str,
+) -> Result<(), RunError> {
+    let payload = serde_json::to_string(&m)
+        .map_err(|e| RunError::Other(format!("failed to serialize measurement: {e}")))?;
+    {
+        let conn = db(&rc.ctx)?.conn();
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &rc.subject,
+                frame_id: Some(frame.frame_id),
+                group_key: &group.key,
+                kind: "metrics",
+                path: None,
+                config_hash: expected_hash,
+                size: None,
+                modified_at: None,
+                payload_json: Some(&payload),
+            },
+        )?;
+    }
+    // Tier C Task 1 (spec §2.2.1): persist every plane's
+    // accepted star fits beside `metrics`, one
+    // `.athf` file and one `stacking_artifacts` row per
+    // plane, keyed on the SAME `expected_hash` — the two
+    // are a product of the same computation and share
+    // its staleness (see `plan.rs`'s per-frame loop).
+    let stem = calibrated_file_stem(group, frame);
+    for (plane, plane_fits) in fits.iter().enumerate() {
+        let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
+        // Final fix wave (ruling C-30, the whole-branch
+        // review's I1): a `.athf` write failure DEGRADES,
+        // it does not fail the run. Every consumer of
+        // this artifact already falls back on its own —
+        // Register to detection with a warn
+        // (`resolve_register_fits`), Normalize to
+        // detection (`fits_paths`' `None` arm), the plan
+        // gate to "Measure is stale"
+        // (`fits_artifact_fresh`) — so a full stop here
+        // would be the ONE place in the seam that treats
+        // a missing optimization as a correctness
+        // failure, and it would throw away the whole
+        // stage's real output (`metrics`, which IS
+        // written) over a cache file. Same shape as
+        // `.rej`'s latched write failure (M3's
+        // `RejBitmapSet`) and the LN sidecar's per-frame
+        // exclusion: loud, never silent, never fatal.
+        //
+        // The plane's `stacking_artifacts` row is SKIPPED
+        // — never a row for a file that is not on disk.
+        // An EXISTING row from an earlier run is left
+        // alone on purpose: if the old file is still
+        // there and valid (a transient rename failure),
+        // it stays reusable; if it is gone or wrong,
+        // `is_fresh`'s own size-on-disk check reports it
+        // stale, which is exactly the fallback above.
+        if let Err(e) = fits_artifact::write_fits(&fits_path, plane_fits) {
+            #[cfg(test)]
+            FITS_WRITE_FAILURE_LOG
+                .lock()
+                .unwrap()
+                .push(fits_path.clone());
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                frame_id = frame.frame_id,
+                plane,
+                path = %fits_path.display(),
+                error = %e,
+                "fits artifact write failed; consumers will fall back"
+            );
+            continue;
+        }
+        let (size, modified_at) = file_identity(&fits_path)?;
+        let kind = fits_artifact::artifact_kind(plane);
+        let conn = db(&rc.ctx)?.conn();
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &rc.subject,
+                frame_id: Some(frame.frame_id),
+                group_key: &group.key,
+                kind: &kind,
+                path: fits_path.to_str(),
+                config_hash: expected_hash,
+                size: Some(size),
+                modified_at: Some(&modified_at),
+                payload_json: None,
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -5477,7 +5904,7 @@ fn resolve_register_fits(
     if planes != 1 {
         return None;
     }
-    let expected_hash = measurement_hash_for(&rc.config, calibrated_hash);
+    let expected_hash = group_measurement_hash(rc, &rc.config, group_key, calibrated_hash);
     let kind = fits_artifact::artifact_kind(0);
 
     // Ruling C-18, item 8: the SAME per-plane freshness rule the plan gate
@@ -5733,7 +6160,7 @@ fn register_group_pass(
         // `compute_register_stale` folds in — must match, or the gate and
         // the run disagree about whether a stored registration row is
         // fresh.
-        let frame_measurement_hash = measurement_hash_for(&cfg, &frame_hash);
+        let frame_measurement_hash = group_measurement_hash(rc, &cfg, &group.key, &frame_hash);
         let expected_hash = registration_hash_for(
             &cfg,
             reference_frame_id,
@@ -7805,6 +8232,13 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
         ),
         ln_scale: entry.ln_scale,
         cached_ln: entry.cached_ln,
+        // Task 11b: the frame's own β, where the two-pass Measure read one (mean across channels, as `fwhm_px`).
+        beta_own: m.and_then(|meas| {
+            let own: Vec<f64> = meas.channels.iter().filter_map(|c| c.beta_own).collect();
+            (!own.is_empty() && own.len() == meas.channels.len())
+                .then(|| own.iter().sum::<f64>() / own.len() as f64)
+        }),
+        beta_own_at_cap: m.is_some_and(|meas| meas.channels.iter().any(|c| c.beta_own_at_cap)),
     }
 }
 
@@ -8009,7 +8443,8 @@ fn skip_group(
         None,
         None,
         None,
-        None,        None,
+        None,
+        None,
     );
     Ok(GroupOutcome::Skipped)
 }
@@ -8065,7 +8500,8 @@ fn fail_group(
         None,
         None,
         None,
-        None,        None,
+        None,
+        None,
     );
     Ok(GroupOutcome::Failed)
 }
@@ -10551,7 +10987,7 @@ fn run_group_normalization(
                     let conn = db(&rc.ctx)?.conn();
                     rc.memo.calibration_hash_checked(&conn, &cfg, gf)?
                 };
-                measurement_hash_for(&cfg, &calib_hash)
+                group_measurement_hash(rc, &cfg, &group.key, &calib_hash)
             }
             None => String::new(),
         };
@@ -11754,19 +12190,20 @@ fn build_and_write_ln_reference(
         },
     );
     let map_start = Instant::now();
-    let mut maps = build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
-        if matches!(e, IntegrationError::Cancelled) {
-            RunError::Cancelled
-        } else {
-            tracing::error!(
-                run_id = rc.run_id,
-                group_key = %group.key,
-                error = %e,
-                "ln reference saturation map failed"
-            );
-            RunError::Other(format!("LN reference saturation map failed: {e}"))
-        }
-    })?;
+    let mut maps =
+        build_reference_saturation(input, &built.frames_used, pool, cancel).map_err(|e| {
+            if matches!(e, IntegrationError::Cancelled) {
+                RunError::Cancelled
+            } else {
+                tracing::error!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    error = %e,
+                    "ln reference saturation map failed"
+                );
+                RunError::Other(format!("LN reference saturation map failed: {e}"))
+            }
+        })?;
     let map_path = rc.layout.ln_reference_saturation_path(&group.key);
     let masks = write_reference_saturation(
         &mut maps,
@@ -11968,7 +12405,8 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
         drizzle_total += d;
         output_total += o;
         #[cfg(test)]
-        if rc.subject.project_id().is_some() && CANCEL_AFTER_NEXT_GROUP.swap(false, Ordering::SeqCst)
+        if rc.subject.project_id().is_some()
+            && CANCEL_AFTER_NEXT_GROUP.swap(false, Ordering::SeqCst)
         {
             rc.cancel.store(true, Ordering::SeqCst);
         }
@@ -12437,8 +12875,9 @@ fn record_crop_item(
         // row land together or not at all, so a failure never leaves the group
         // naming a final file the caller then removes. Dropping `tx` on an
         // early return rolls it back.
-        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(anyhow::Error::from)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(anyhow::Error::from)?;
         update_group(
             &tx,
             item.group_id,
@@ -12454,46 +12893,74 @@ fn record_crop_item(
         if rc.subject.project_id().is_some()
             && FORCE_RECORD_FAILURE_AFTER_GROUP.swap(false, Ordering::SeqCst)
         {
-            return Err(RunError::Other("forced record failure after the group row".to_string()));
+            return Err(RunError::Other(
+                "forced record failure after the group row".to_string(),
+            ));
         }
-        let row = |kind: MasterLightKind,
-                   path: &str,
-                   format: &str,
-                   rect: CropRect,
-                   channels: usize| {
-            insert_master_light(
-                &tx,
-                &NewMasterLight {
-                    subject: &rc.subject,
-                    run_id: rc.run_id,
-                    group_key: &item.group_key,
-                    kind: kind.as_db_str(),
-                    path,
-                    format,
-                    width: rect.width as i64,
-                    height: rect.height as i64,
-                    channels: channels as i64,
-                    frames: item.frames as i64,
-                    total_exposure_s: item.total_exposure_s,
-                },
-            )
-        };
-        row(MasterLightKind::Master, &master_path, &format_str, out.rect, item.channels)?;
+        let row =
+            |kind: MasterLightKind, path: &str, format: &str, rect: CropRect, channels: usize| {
+                insert_master_light(
+                    &tx,
+                    &NewMasterLight {
+                        subject: &rc.subject,
+                        run_id: rc.run_id,
+                        group_key: &item.group_key,
+                        kind: kind.as_db_str(),
+                        path,
+                        format,
+                        width: rect.width as i64,
+                        height: rect.height as i64,
+                        channels: channels as i64,
+                        frames: item.frames as i64,
+                        total_exposure_s: item.total_exposure_s,
+                    },
+                )
+            };
+        row(
+            MasterLightKind::Master,
+            &master_path,
+            &format_str,
+            out.rect,
+            item.channels,
+        )?;
         if let Some(path) = coverage.as_deref() {
             row(MasterLightKind::Coverage, path, "fits", out.rect, 1)?;
         }
         if let Some((path, drect)) = drizzle.as_ref() {
-            row(MasterLightKind::Drizzle, path, &format_str, *drect, item.channels)?;
+            row(
+                MasterLightKind::Drizzle,
+                path,
+                &format_str,
+                *drect,
+                item.channels,
+            )?;
             if let Some(path) = weight_map.as_deref() {
-                row(MasterLightKind::WeightMap, path, &format_str, *drect, item.channels)?;
+                row(
+                    MasterLightKind::WeightMap,
+                    path,
+                    &format_str,
+                    *drect,
+                    item.channels,
+                )?;
             }
             if let Some(path) = drizzle_coverage.as_deref() {
-                row(MasterLightKind::DrizzleCoverage, path, "fits", *drect, item.channels)?;
+                row(
+                    MasterLightKind::DrizzleCoverage,
+                    path,
+                    "fits",
+                    *drect,
+                    item.channels,
+                )?;
             }
         }
         tx.commit().map_err(anyhow::Error::from)?;
     }
-    if let Some(g) = rc.summary.groups.iter_mut().find(|g| g.key == item.group_key) {
+    if let Some(g) = rc
+        .summary
+        .groups
+        .iter_mut()
+        .find(|g| g.key == item.group_key)
+    {
         g.master_path = Some(master_path.clone());
         g.rejection_low_path = rejection_low;
         g.rejection_high_path = rejection_high;
@@ -12935,8 +13402,7 @@ mod tests {
         let ctx2 = Arc::new(ServiceContext::new_for_tests(db2.clone()));
         let (rc2, _k2, _w2, _o2) = pedestal_stage_one(&ctx2, &db2, true, true);
         assert!(
-            !rc2
-                .warnings
+            !rc2.warnings
                 .iter()
                 .any(|w| w.contains("flat but no dark or bias")),
             "{:?}",
@@ -14277,6 +14743,313 @@ mod tests {
         );
     }
 
+    /// Plan A Task 11b: the frame set's stored `metrics` rows, by frame id: (key, measurement, created at).
+    fn metrics_by_frame(
+        conn: &rusqlite::Connection,
+        set_id: i64,
+    ) -> HashMap<i64, (String, FrameMeasurement, String)> {
+        crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some("metrics"))
+            .unwrap()
+            .into_iter()
+            .map(|a| {
+                let m: FrameMeasurement =
+                    serde_json::from_str(a.payload_json.as_deref().unwrap()).unwrap();
+                (a.frame_id.unwrap(), (a.config_hash, m, a.created_at))
+            })
+            .collect()
+    }
+
+    /// Plan A Task 11b (owner decision R11b-12): the cache follows the group β. An unchanged group β is a cache hit
+    /// (no row rewritten); a group β that moves — here two members' stored own βs set below every other's, so the
+    /// lower median of four moves (one member's cannot: this fixture's Gaussian stars read one own β on every frame)
+    /// — makes the plan gate report Measure stale and re-runs the second pass for EVERY member: each row is re-keyed
+    /// on the new group β, every channel fitted at it, and the own βs read again from the pixels (the first pass is
+    /// redone where its records were not kept).
+    #[test]
+    fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let run = |label: &str| {
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Measure)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            crate::db::stacking::list_groups(&fixture.conn, run_id).unwrap()[0].beta
+        };
+        let measure_stale = || {
+            build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                &subject,
+                Some(cfg.clone()),
+            )
+            .unwrap()
+            .stale_stages
+            .contains(&Stage::Measure)
+        };
+        let calibrated = |frame_id: i64| {
+            crate::db::stacking::find_artifact(
+                &fixture.conn,
+                &subject,
+                &group_key,
+                "calibrated",
+                Some(frame_id),
+            )
+            .unwrap()
+            .unwrap()
+            .config_hash
+        };
+
+        let beta1 = run("run 1").expect("a group beta");
+        let rows1 = metrics_by_frame(&fixture.conn, fixture.set_id);
+        assert_eq!(rows1.len(), 4);
+        for (frame_id, (hash, _, _)) in &rows1 {
+            assert_eq!(
+                *hash,
+                measurement_hash_for(&cfg, &calibrated(*frame_id), Some(beta1))
+            );
+        }
+        assert!(!measure_stale(), "an unchanged group is cached");
+
+        // Unchanged group beta: a cache hit, nothing rewritten.
+        assert_eq!(run("run 2"), Some(beta1));
+        let rows2 = metrics_by_frame(&fixture.conn, fixture.set_id);
+        for (frame_id, (hash, _, created)) in &rows2 {
+            assert_eq!(hash, &rows1[frame_id].0);
+            assert_eq!(
+                created, &rows1[frame_id].2,
+                "frame {frame_id}: a cache hit rewrites nothing"
+            );
+        }
+
+        // Two members' stored own betas below every other's: the lower median of four moves to the larger of them.
+        let mut ids: Vec<i64> = rows1.keys().copied().collect();
+        ids.sort_unstable();
+        let lowered = [(ids[0], 1.6), (ids[1], 1.7)];
+        assert!(rows1
+            .values()
+            .all(|(_, m, _)| m.channels[0].beta_own.unwrap() > 1.7));
+        for (frame_id, own) in lowered {
+            let (hash, mut m, _) = rows1[&frame_id].clone();
+            m.channels[0].beta_own = Some(own);
+            let payload = serde_json::to_string(&m).unwrap();
+            upsert_artifact(
+                &fixture.conn,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some(&payload),
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            measure_stale(),
+            "the gate resolves the moved group beta and reads every member stale"
+        );
+
+        assert_eq!(run("run 3"), Some(1.7));
+        let rows3 = metrics_by_frame(&fixture.conn, fixture.set_id);
+        for (frame_id, (hash, m, _)) in &rows3 {
+            assert_eq!(
+                *hash,
+                measurement_hash_for(&cfg, &calibrated(*frame_id), Some(1.7)),
+                "frame {frame_id}"
+            );
+            assert_ne!(*hash, rows1[frame_id].0, "frame {frame_id}: re-keyed");
+            assert_eq!(
+                m.channels[0].beta, 1.7,
+                "frame {frame_id}: fitted at the new group beta"
+            );
+            assert_eq!(
+                m.channels[0].beta_own, rows1[frame_id].1.channels[0].beta_own,
+                "frame {frame_id}: the own beta is the pixels' again"
+            );
+        }
+    }
+
+    /// Plan A Task 11b: `Moffat4` keeps the single pass, byte-identical to before the task — every row keyed on the
+    /// measurement hash without a β, its payload the single-pass measurement exactly (no `betaOwn` key), every fit at 4.
+    #[test]
+    fn moffat4_measure_is_one_pass_and_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0)];
+        let noise = [5.0f32; 3];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let mut cfg = StackingConfig::default();
+        cfg.measurement.psf_model = psf_signal::PsfModel::Moffat4;
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            WorkingLayout::new(working.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Measure).unwrap();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let opts = cfg
+            .measurement
+            .measure_options(cfg.normalization.scale_estimator);
+        let rows =
+            crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("metrics")).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let frame_id = row.frame_id.unwrap();
+            let calibrated = crate::db::stacking::find_artifact(
+                &fixture.conn,
+                &subject,
+                &plan_groups[0].key,
+                "calibrated",
+                Some(frame_id),
+            )
+            .unwrap()
+            .unwrap();
+            let before = crate::stacking::config::stage_hash(
+                &crate::stacking::config::measurement_subtree(&cfg),
+                &[calibrated.config_hash.as_str()],
+                &[],
+            );
+            assert_eq!(row.config_hash, before, "frame {frame_id}: the pre-11b key");
+            let payload = row.payload_json.unwrap();
+            assert!(!payload.contains("betaOwn"), "frame {frame_id}: {payload}");
+            let (single, fits) = measure_frame_with_fits(
+                Path::new(calibrated.path.as_deref().unwrap()),
+                &opts,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let strip = |mut v: serde_json::Value| {
+                v.as_object_mut().unwrap().remove("durationMs");
+                v
+            };
+            assert_eq!(
+                strip(serde_json::from_str(&payload).unwrap()),
+                strip(serde_json::to_value(&single).unwrap()),
+                "frame {frame_id}: the single pass, exactly"
+            );
+            assert!(fits[0].iter().all(|f| f.beta == 4.0));
+        }
+        assert_eq!(
+            crate::db::stacking::list_groups(&fixture.conn, run_id).unwrap()[0].beta,
+            Some(4.0)
+        );
+    }
+
+    /// Plan A Task 11b: a group of one is fitted at its own β — its row's `beta` is its `betaOwn`, which is the group
+    /// row's β (the run itself stops after Measure: one frame is no stackable group).
+    #[test]
+    fn a_group_of_one_is_fitted_at_its_own_beta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &[(0.0, 0.0)], &[5.0]);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            WorkingLayout::new(working.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        assert!(
+            run_stages_for_test(&mut rc, Stage::Measure).is_err(),
+            "one frame is no stackable group"
+        );
+        let rows = metrics_by_frame(&fixture.conn, fixture.set_id);
+        assert_eq!(rows.len(), 1);
+        let (_, m, _) = rows.values().next().unwrap();
+        let own = m.channels[0].beta_own.expect("the own beta");
+        assert_eq!(m.channels[0].beta, own);
+        assert_eq!(
+            crate::db::stacking::list_groups(&fixture.conn, run_id).unwrap()[0].beta,
+            Some(own)
+        );
+    }
+
     /// Perf tier C Task 1: stage 3 writes one `fits.0` artifact per frame
     /// (this fixture's mono field, one plane) alongside `metrics`, each
     /// readable back with `read_fits` and matching that frame's own
@@ -14285,6 +15058,11 @@ mod tests {
     /// cached; deleting one frame's `.athf` file (not its DB row) makes
     /// the plan gate report Measure stale for that frame, even though its
     /// `metrics` row is untouched.
+    ///
+    /// Plan A Task 11b (owner decision R11b-12): the members' own picks are
+    /// now `betaOwn`, and every member's `.athf` β == its `metrics` β ==
+    /// `stacking_run_groups.beta` == the β stage 6 fits its reference at
+    /// (`RunContext::measured_groups`, mapped `Auto` → `Fixed`).
     #[test]
     fn measure_writes_fits_artifacts_and_the_group_beta() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14352,12 +15130,18 @@ mod tests {
         );
 
         let mut betas: Vec<f64> = Vec::new();
+        let mut fitted_at: Vec<(f64, i64)> = Vec::new();
         for metrics_row in &metrics {
             let frame_id = metrics_row.frame_id.expect("metrics row has a frame_id");
             let m: FrameMeasurement =
                 serde_json::from_str(metrics_row.payload_json.as_deref().unwrap()).unwrap();
             assert_eq!(m.channels.len(), 1, "mono fixture: one channel");
-            betas.push(m.channels[0].beta);
+            betas.push(
+                m.channels[0]
+                    .beta_own
+                    .expect("the two-pass Measure records the own beta"),
+            );
+            fitted_at.push((m.channels[0].beta, frame_id));
 
             let fits_row = fits_rows
                 .iter()
@@ -14371,9 +15155,28 @@ mod tests {
                 m.channels[0].stars_fitted,
                 "read_fits must return exactly the frame's stars_fitted count"
             );
+            // `.athf` stores every number as an `f32`.
+            assert!(
+                fits.iter()
+                    .all(|f| f.beta as f32 == m.channels[0].beta as f32),
+                "every .athf fit is at the frame's fitted beta"
+            );
         }
 
         let expected_beta = psf_signal::group_beta(&betas);
+        for (beta, frame_id) in &fitted_at {
+            assert_eq!(
+                *beta, expected_beta,
+                "frame {frame_id} is fitted at the group beta"
+            );
+        }
+        assert_eq!(
+            rc1.measured_groups
+                .get(&plan_groups[0].key)
+                .and_then(|g| g.beta),
+            Some(expected_beta),
+            "stage 6 fits its reference at the same group beta"
+        );
         let groups_after = crate::db::stacking::list_groups(&fixture.conn, run_id1).unwrap();
         assert_eq!(groups_after.len(), 1);
         assert_eq!(
@@ -16307,7 +17110,8 @@ mod tests {
 
         let group_key = "mono__floor_test";
         let calibrated_hash = "floor-test-calibrated-hash";
-        let expected_hash = measurement_hash_for(&cfg, calibrated_hash);
+        // No Measure ran on this context: the group β is not resolved (Task 11b), as `resolve_register_fits` reads it.
+        let expected_hash = measurement_hash_for(&cfg, calibrated_hash, None);
 
         // A fixed-value fit that survives `passes_register_cuts` on its
         // own — the same shape `detect::tests::good_fit()` pins — repeated
@@ -17142,6 +17946,75 @@ mod tests {
             assert_eq!(last.get("setId"), Some(&set_id), "{last}");
             assert_eq!(last.get("projectId"), Some(&project_id), "{last}");
         }
+    }
+
+    /// Task 11b review I1: pass 1 of the group measure ticks. The bar moves from the first frame: the first event
+    /// after the stage-start event is a pass-1 half-tick (1 of 8 units on 4 frames, 12.5 %), the percents never go backwards, and the stage
+    /// still lands on `total`.
+    #[test]
+    fn measure_pass_one_ticks_and_the_stage_lands_on_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let recorder = Arc::new(Recording::new());
+        let mut rc = test_context(
+            ctx.clone(),
+            recorder.clone() as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Measure).unwrap();
+
+        let measure: Vec<serde_json::Value> = recorder
+            .events(STACKING_PROGRESS_EVENT)
+            .into_iter()
+            .filter(|e| e["stage"] == "measure")
+            .collect();
+        assert!(measure.len() >= 2, "{measure:?}");
+        let percents: Vec<f64> = measure
+            .iter()
+            .map(|e| e["percent"].as_f64().unwrap())
+            .collect();
+        assert!(
+            percents
+                .iter()
+                .find(|&&p| p > 0.0)
+                .is_some_and(|p| (p - 12.5).abs() < 1e-9),
+            "the first tick after the stage-start event is a pass-1 half-tick: {percents:?}"
+        );
+        assert!(
+            percents.windows(2).all(|w| w[0] <= w[1]),
+            "progress never goes backwards: {percents:?}"
+        );
+        let last = measure.last().unwrap();
+        assert_eq!(last["current"], last["total"], "{last}");
+        assert_eq!(last["current"], 4, "{last}");
     }
 
     /// v0.6.3: the fan-out stages' per-frame ticker. Two workers race 250
@@ -18014,7 +18887,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -18111,7 +18985,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -18202,7 +19077,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -18331,7 +19207,8 @@ mod tests {
         // P-13: this test reads the plan against the stored config, so OFF (not storable:
         // it serializes as null) is replaced by the finite selection that cuts nothing.
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
             max_stars: 5000,
@@ -18491,7 +19368,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the finite selection that cuts nothing (synthetic stars).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
             max_stars: 5000,
@@ -18541,7 +19419,10 @@ mod tests {
 
         // Run 1 builds the reference and its map, with the same cards.
         let (run1, _, _) = run(false);
-        assert!(map_path.exists(), "the saturation map is written beside the reference");
+        assert!(
+            map_path.exists(),
+            "the saturation map is written beside the reference"
+        );
         assert_eq!(run_card(&reference_path), run1.to_string());
         assert_eq!(run_card(&map_path), run1.to_string());
 
@@ -18557,9 +19438,16 @@ mod tests {
             logs3.contains("the cached LN reference has no usable saturation map; rebuilding"),
             "{logs3}"
         );
-        assert!(logs3.contains("ln reference saturation map built"), "{logs3}");
+        assert!(
+            logs3.contains("ln reference saturation map built"),
+            "{logs3}"
+        );
         assert!(map_path.exists(), "the map is rebuilt");
-        assert_eq!(run_card(&reference_path), run3.to_string(), "the reference is rebuilt");
+        assert_eq!(
+            run_card(&reference_path),
+            run3.to_string(),
+            "the reference is rebuilt"
+        );
         assert_eq!(run_card(&map_path), run3.to_string());
         let group_summary = rc3
             .summary
@@ -18599,15 +19487,19 @@ mod tests {
         // P-13: this test reads the plan against the stored config, so OFF (not storable:
         // it serializes as null) is replaced by the finite selection that cuts nothing.
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
             min_peak_snr: 5.0,
             max_stars: 5000,
             saturation: 1.0,
         };
         cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
-        let expected_scale =
-            ln::resolve_scale(&cfg.normalization.local, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let expected_scale = ln::resolve_scale(
+            &cfg.normalization.local,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18695,7 +19587,10 @@ mod tests {
         assert_eq!(g.ln_scale_px, Some(expected_scale), "{g:?}");
         assert_eq!(
             (g.ln_width, g.ln_height),
-            (Some(STAR_FIELD_WIDTH as u32), Some(STAR_FIELD_HEIGHT as u32))
+            (
+                Some(STAR_FIELD_WIDTH as u32),
+                Some(STAR_FIELD_HEIGHT as u32)
+            )
         );
         assert!(
             !plan_after.stale_stages.contains(&Stage::Normalize),
@@ -18908,7 +19803,10 @@ mod tests {
         assert!(!aperture.is_empty(), "{:?}", rc.runtime_exclusions);
         for (_, why) in &aperture {
             assert!(why.chars().count() < 200, "{why}");
-            assert!(why.contains("(< 20)") && why.contains("matched stars fit"), "{why}");
+            assert!(
+                why.contains("(< 20)") && why.contains("matched stars fit"),
+                "{why}"
+            );
             assert!(!why.ends_with("matched stars (< 20)"), "{why}");
         }
         let hits: Vec<&String> = rc
@@ -18946,7 +19844,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -19042,7 +19941,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
         cfg.reference.mode = ReferenceMode::Manual;
 
@@ -19157,7 +20057,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -19347,7 +20248,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -19435,7 +20337,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -19572,7 +20475,8 @@ mod tests {
         cfg.normalization.local.enabled = true;
         // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
         // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator = crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -22013,7 +22917,11 @@ mod tests {
         assert_eq!(reader.channels(), 1);
         let (w, h) = (reader.width(), reader.height());
         let cov = reader.read_plane(0).unwrap();
-        assert_eq!(cov[(h / 2) * w + w / 2], 4.0, "every frame covers the centre");
+        assert_eq!(
+            cov[(h / 2) * w + w / 2],
+            4.0,
+            "every frame covers the centre"
+        );
         assert!(cov[0] < 4.0, "the shifted frames leave the corner");
         let run_row = crate::db::stacking::get_run(&fixture.conn, on_run)
             .unwrap()
@@ -22077,10 +22985,7 @@ mod tests {
                 .read_plane(0)
                 .unwrap()
         };
-        let (a, b) = (
-            plane(&drizzled(off).path),
-            plane(&drizzled(on).path),
-        );
+        let (a, b) = (plane(&drizzled(off).path), plane(&drizzled(on).path));
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
         assert!(lights(off).iter().all(|m| m.kind != "drizzle_coverage"));
         let row = lights(on)
@@ -22201,8 +23106,7 @@ mod tests {
             let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, depth)
                 .expect("a rect")
                 .scaled(2);
-            let drz =
-                PlaneReader::open(Path::new(group.drizzle_path.as_deref().unwrap())).unwrap();
+            let drz = PlaneReader::open(Path::new(group.drizzle_path.as_deref().unwrap())).unwrap();
             let (dw, dh) = (drz.width(), drz.height());
             assert_eq!((dw, dh), (w * 2, h * 2));
             let plane = drz.read_plane(0).unwrap();
@@ -22210,13 +23114,8 @@ mod tests {
                 .measurement
                 .measure_options(cfg.normalization.scale_estimator);
             let sub = crate::stacking::crop::crop_plane(&plane, dw, rect);
-            let on_rect = crate::stacking::measure::measure_plane(
-                &sub,
-                rect.width,
-                rect.height,
-                &opts,
-                None,
-            );
+            let on_rect =
+                crate::stacking::measure::measure_plane(&sub, rect.width, rect.height, &opts, None);
             assert_eq!(dstats.noise[0].to_bits(), on_rect.noise.to_bits());
             assert_eq!(dstats.fwhm_px[0].to_bits(), on_rect.fwhm_px.to_bits());
             let whole = crate::stacking::measure::measure_plane(&plane, dw, dh, &opts, None);
@@ -22290,13 +23189,8 @@ mod tests {
             .measurement
             .measure_options(cfg.normalization.scale_estimator);
         let sub = crate::stacking::crop::crop_plane(&plane, w, rect);
-        let on_rect = crate::stacking::measure::measure_plane(
-            &sub,
-            rect.width,
-            rect.height,
-            &opts,
-            None,
-        );
+        let on_rect =
+            crate::stacking::measure::measure_plane(&sub, rect.width, rect.height, &opts, None);
         assert_eq!(stats.master_noise[0].to_bits(), on_rect.noise.to_bits());
         assert_eq!(stats.master_psf_snr[0].to_bits(), on_rect.psf_snr.to_bits());
         let whole = crate::stacking::measure::measure_plane(&plane, w, h, &opts, None);
@@ -26662,7 +27556,10 @@ mod tests {
             entries.iter().filter(|e| e.included).count(),
             4,
             "{:?}",
-            entries.iter().map(|e| (&e.frame.filename, &e.reason)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.frame.filename, &e.reason))
+                .collect::<Vec<_>>()
         );
         for e in entries {
             let Some(RegisteredFrameOutcome::Aligned {
@@ -27000,7 +27897,10 @@ mod tests {
         let conn = project_conn(&db_path);
         let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
         for (key, dir) in [
-            (crate::settings::keys::STACKING_WORKING_DIR, tmp.join("work")),
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.join("work"),
+            ),
             (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.join("out")),
         ] {
             crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
@@ -27065,14 +27965,25 @@ mod tests {
             .unwrap();
         let started = start_seeded_project(&ctx).expect("a project run starts");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !ctx.compute_queue.snapshot().iter().any(|e| e.label == "Stacking · p1") {
-            assert!(Instant::now() < deadline, "{:?}", ctx.compute_queue.snapshot());
+        while !ctx
+            .compute_queue
+            .snapshot()
+            .iter()
+            .any(|e| e.label == "Stacking · p1")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{:?}",
+                ctx.compute_queue.snapshot()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(hold);
         wait_for_run(&ctx, started.run_id);
 
-        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        let row = crate::db::stacking::get_run(&conn, started.run_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "done", "{row:?}");
         // The run validates its folders in Save mode, which canonicalizes.
         let out = crate::test_support::canonical_path(&tmp.path().join("out")).join("p1");
@@ -27081,16 +27992,13 @@ mod tests {
             out,
             "the run row names the folder the run writes into"
         );
-        let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         assert_eq!(summary.grid, Some(grid));
         assert_eq!(summary.project_id.as_deref(), Some("p1"));
         let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
         let master = master_row(&masters, "master");
-        assert!(
-            Path::new(&master.path).starts_with(&out),
-            "{}",
-            master.path
-        );
+        assert!(Path::new(&master.path).starts_with(&out), "{}", master.path);
         assert_eq!((master.width, master.height), (512, 384));
     }
 
@@ -27162,7 +28070,9 @@ mod tests {
             plan.blockers
         );
         assert!(
-            plan.warnings.iter().any(|w| w.contains("a WCS that cannot be used")),
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("a WCS that cannot be used")),
             "{:?}",
             plan.warnings
         );
@@ -27207,12 +28117,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, conn, started, grid) =
             start_sky_project(tmp.path(), |cfg| cfg.normalization.local.enabled = true);
-        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        let row = crate::db::stacking::get_run(&conn, started.run_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "done", "{row:?}");
         let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
         let master = master_row(&masters, "master");
         let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
-        assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
+        assert_eq!(
+            header.get_str("ATH_GRID").as_deref(),
+            Some(grid.hash().as_str())
+        );
         assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
         assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
         let canonical: String = conn
@@ -27222,7 +28137,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(header.get_str("FILTER").as_deref(), Some(canonical.as_str()));
+        assert_eq!(
+            header.get_str("FILTER").as_deref(),
+            Some(canonical.as_str())
+        );
         let plan = build_plan(
             &conn,
             &ctx.settings,
@@ -27263,8 +28181,7 @@ mod tests {
         for i in 0..3usize {
             let uuid = format!("l{i}");
             let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
-            let mut f =
-                test_fixtures::sky_frame(&uuid, (target.0 + dither.0, target.1 + dither.1));
+            let mut f = test_fixtures::sky_frame(&uuid, (target.0 + dither.0, target.1 + dither.1));
             f.noise_seed = 100 + i as u64;
             f.manifest_wcs = false;
             let landed = tmp.path().join("collab");
@@ -27282,8 +28199,14 @@ mod tests {
             rotation_deg: 0.0,
         };
         for (key, dir) in [
-            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
-            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.path().join("work"),
+            ),
+            (
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                tmp.path().join("out"),
+            ),
         ] {
             crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
         }
@@ -27312,15 +28235,21 @@ mod tests {
         )
         .expect("a project run starts");
         wait_for_run(&ctx, started.run_id);
-        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        let row = crate::db::stacking::get_run(&conn, started.run_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "done", "{row:?}");
         assert_eq!(solver.calls(), 3, "every frame is solved locally");
 
         let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
         let master = master_row(&masters, "master");
         let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
-        assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
-        let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            header.get_str("ATH_GRID").as_deref(),
+            Some(grid.hash().as_str())
+        );
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         let reference = summary.reference.filename.expect("a reference frame");
         let with_manifest_wcs: i64 = conn
             .query_row(
@@ -27364,7 +28293,9 @@ mod tests {
             );
         }
         assert!(
-            plan.warnings.iter().all(|w| !w.contains("plate-solved locally")),
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("plate-solved locally")),
             "the run's cached solves are the plan's: {:?}",
             plan.warnings
         );
@@ -27439,7 +28370,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (_ctx, conn, rc, grid) = run_sky_project(tmp.path(), drizzle_2x);
         let masters = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
-        let master = masters.iter().find(|m| m.kind == "master").expect("a master");
+        let master = masters
+            .iter()
+            .find(|m| m.kind == "master")
+            .expect("a master");
         let drizzled = masters
             .iter()
             .find(|m| m.kind == "drizzle")
@@ -27463,12 +28397,22 @@ mod tests {
                 (mx - x).hypot(my - y) < tol,
                 "{path}: star at ({mx}, {my}), the WCS says ({x}, {y})"
             );
-            assert_eq!(header.get_str("FILTER").as_deref(), Some("Lum"), "the canonical filter");
+            assert_eq!(
+                header.get_str("FILTER").as_deref(),
+                Some("Lum"),
+                "the canonical filter"
+            );
             assert_eq!(header.get_str("ROWORDER").as_deref(), Some("BOTTOM-UP"));
             assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
             assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
-            assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
-            assert!(header.get_str("PLTSOLVD").is_none(), "a grid TAN is not a plate solve");
+            assert_eq!(
+                header.get_str("ATH_GRID").as_deref(),
+                Some(grid.hash().as_str())
+            );
+            assert!(
+                header.get_str("PLTSOLVD").is_none(),
+                "a grid TAN is not a plate solve"
+            );
         }
         let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
         assert!((header.get_f64("CRVAL1").unwrap() - 83.8).abs() < 1e-9);
@@ -27587,7 +28531,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (_ctx, conn, rc, _grid) = run_sky_project_filter(tmp.path(), "", |_| {});
         let masters = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
-        let master = masters.iter().find(|m| m.kind == "master").expect("a master");
+        let master = masters
+            .iter()
+            .find(|m| m.kind == "master")
+            .expect("a master");
         let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
         assert!(header.get_str("FILTER").is_none(), "no FILTER card");
         assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
@@ -27605,10 +28552,15 @@ mod tests {
     /// footprint — on a grid wide enough for both, with LN on. The star
     /// field is the e2e's own (review I5: the same spacing and seed, so the
     /// strip registration is tried here first, far cheaper than in Task 9).
-    fn seed_two_field_project(conn: &rusqlite::Connection, landed: &Path) -> crate::collab::grid::CanonicalGrid {
+    fn seed_two_field_project(
+        conn: &rusqlite::Connection,
+        landed: &Path,
+    ) -> crate::collab::grid::CanonicalGrid {
         crate::db::stacking::insert_test_project(conn, "p1");
         let target: (f64, f64) = (83.8, -5.4);
-        let east = test_fixtures::EAST_PAIR_OFFSET_WIDTHS * 384.0 * 1.5 / 3600.0 / target.1.to_radians().cos();
+        let east = test_fixtures::EAST_PAIR_OFFSET_WIDTHS * 384.0 * 1.5
+            / 3600.0
+            / target.1.to_radians().cos();
         let stars = test_fixtures::sky_stars(
             (target.0 + east / 2.0, target.1),
             0.2,
@@ -27617,9 +28569,22 @@ mod tests {
         );
         let mut uuids: Vec<(String, (f64, f64))> = (0..4)
             // seed_sky_project's dithers, for the same reason (D8, review I6).
-            .map(|i| (format!("a{i}"), (target.0 + (i as f64 - 1.5) * 0.001, target.1 + (i % 2) as f64 * 0.0005)))
+            .map(|i| {
+                (
+                    format!("a{i}"),
+                    (
+                        target.0 + (i as f64 - 1.5) * 0.001,
+                        target.1 + (i % 2) as f64 * 0.0005,
+                    ),
+                )
+            })
             .collect();
-        uuids.extend((0..2).map(|i| (format!("b{i}"), (target.0 + east + i as f64 * 0.002, target.1))));
+        uuids.extend((0..2).map(|i| {
+            (
+                format!("b{i}"),
+                (target.0 + east + i as f64 * 0.002, target.1),
+            )
+        }));
         for (i, (uuid, centre)) in uuids.iter().enumerate() {
             let mut f = test_fixtures::sky_frame(uuid, *centre);
             f.noise_seed = 300 + i as u64;
@@ -27651,18 +28616,37 @@ mod tests {
         let conn = project_conn(&db_path);
         let grid = seed_two_field_project(&conn, &tmp.path().join("collab"));
         for (key, dir) in [
-            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
-            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.path().join("work"),
+            ),
+            (
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                tmp.path().join("out"),
+            ),
         ] {
             crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
         }
         crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
         let mut cfg = sky_config(&conn);
         cfg.normalization.local.enabled = true;
-        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
-            .unwrap();
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
         let run = |cfg: StackingConfig| {
-            let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+            let mut rc = project_rc(
+                &ctx,
+                &conn,
+                "p1",
+                cfg,
+                &tmp.path().join("work"),
+                &tmp.path().join("out"),
+            );
             rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
             run_pipeline(&mut rc).unwrap();
             rc
@@ -27670,9 +28654,15 @@ mod tests {
         let rc = run(cfg.clone());
         let group = rc.plan_groups[0].key.clone();
         let entries = &rc.measured[&group];
-        for e in entries.iter().filter(|e| e.frame.filename.starts_with("c_b")) {
+        for e in entries
+            .iter()
+            .filter(|e| e.frame.filename.starts_with("c_b"))
+        {
             let Some(RegisteredFrameOutcome::Aligned { record, .. }) = &e.registration else {
-                panic!("{} did not register over its ≈ 15 % strip: {:?}", e.frame.filename, e.reason);
+                panic!(
+                    "{} did not register over its ≈ 15 % strip: {:?}",
+                    e.frame.filename, e.reason
+                );
             };
             assert!(
                 record.matched_stars >= 4,
@@ -27682,13 +28672,39 @@ mod tests {
             );
         }
         for e in entries {
-            assert!(e.included, "{} stays in the stack: {:?}", e.frame.filename, e.reason);
-            let ln = crate::db::stacking::find_artifact(&conn, &rc.subject, &group, "ln", Some(e.frame.frame_id)).unwrap();
-            let marker = crate::db::stacking::find_artifact(&conn, &rc.subject, &group, LN_GLOBAL_ARTIFACT_KIND, Some(e.frame.frame_id)).unwrap();
+            assert!(
+                e.included,
+                "{} stays in the stack: {:?}",
+                e.frame.filename, e.reason
+            );
+            let ln = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group,
+                "ln",
+                Some(e.frame.frame_id),
+            )
+            .unwrap();
+            let marker = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group,
+                LN_GLOBAL_ARTIFACT_KIND,
+                Some(e.frame.frame_id),
+            )
+            .unwrap();
             if e.frame.filename.starts_with("c_b") {
-                assert!(ln.is_none() && marker.is_some(), "{} falls back", e.frame.filename);
+                assert!(
+                    ln.is_none() && marker.is_some(),
+                    "{} falls back",
+                    e.frame.filename
+                );
             } else {
-                assert!(ln.is_some() && marker.is_none(), "{} is normalized locally", e.frame.filename);
+                assert!(
+                    ln.is_some() && marker.is_none(),
+                    "{} is normalized locally",
+                    e.frame.filename
+                );
             }
         }
         assert_eq!(
@@ -27702,11 +28718,29 @@ mod tests {
         );
 
         let again = run(cfg.clone());
-        for e in again.measured[&group].iter().filter(|e| e.frame.filename.starts_with("c_b")) {
-            assert!(e.cached_ln, "{}: the marker is a cache hit", e.frame.filename);
+        for e in again.measured[&group]
+            .iter()
+            .filter(|e| e.frame.filename.starts_with("c_b"))
+        {
+            assert!(
+                e.cached_ln,
+                "{}: the marker is a cache hit",
+                e.frame.filename
+            );
         }
-        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
-        assert!(!plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
+        let plan = build_plan(
+            &conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan.stale_stages
+        );
 
         // Review fix 5: a lost marker is re-derived — the member is
         // normalized again (falls back again) and the marker is rewritten.
@@ -27724,29 +28758,61 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 1, "the marker row of {b0} existed");
         let third = run(cfg.clone());
-        let e = third.measured[&group].iter().find(|e| e.frame.frame_id == b0).unwrap();
-        assert!(!e.cached_ln, "{}: no marker, so no cache hit", e.frame.filename);
+        let e = third.measured[&group]
+            .iter()
+            .find(|e| e.frame.frame_id == b0)
+            .unwrap();
         assert!(
-            crate::db::stacking::find_artifact(&conn, &third.subject, &group, LN_GLOBAL_ARTIFACT_KIND, Some(b0))
-                .unwrap()
-                .is_some(),
+            !e.cached_ln,
+            "{}: no marker, so no cache hit",
+            e.frame.filename
+        );
+        assert!(
+            crate::db::stacking::find_artifact(
+                &conn,
+                &third.subject,
+                &group,
+                LN_GLOBAL_ARTIFACT_KIND,
+                Some(b0)
+            )
+            .unwrap()
+            .is_some(),
             "the marker is rewritten"
         );
 
         // The twin: excluding a central member moves the field (five frames
         // in scope, three needed), so every LN hash moves — and the plan says
         // so now, not after the next run has re-derived the member list.
-        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &["a1".to_string()], None)
-            .unwrap();
-        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
-        assert!(plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &["a1".to_string()],
+            None,
+        )
+        .unwrap();
+        let plan = build_plan(
+            &conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan.stale_stages
+        );
     }
 
     fn master_row<'a>(
         rows: &'a [crate::db::stacking::MasterLight],
         kind: &str,
     ) -> &'a crate::db::stacking::MasterLight {
-        rows.iter().find(|m| m.kind == kind).unwrap_or_else(|| panic!("no {kind} row in {rows:?}"))
+        rows.iter()
+            .find(|m| m.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind} row in {rows:?}"))
     }
 
     /// Plan 6b-3 D10, Review Focus 1: `cropToCoverage = 0` is today's path —
@@ -27758,8 +28824,14 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-        let (fixture, light_ids, working, output) = seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
-        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
         let mut cfg = StackingConfig::default();
         cfg.output.coverage_map = true;
         cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
@@ -27778,7 +28850,10 @@ mod tests {
         .unwrap();
         wait_for_run(&ctx, started.run_id);
         let rows = crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
-        assert!(rows.len() >= 5, "master, coverage, drizzle, weight map, drizzle coverage: {rows:?}");
+        assert!(
+            rows.len() >= 5,
+            "master, coverage, drizzle, weight map, drizzle coverage: {rows:?}"
+        );
         for m in &rows {
             assert!(
                 crate::test_support::canonical_path(Path::new(&m.path))
@@ -27786,7 +28861,11 @@ mod tests {
                 "{}",
                 m.path
             );
-            let expected = if m.kind.ends_with("coverage") { "fits" } else { "xisf" };
+            let expected = if m.kind.ends_with("coverage") {
+                "fits"
+            } else {
+                "xisf"
+            };
             assert_eq!(m.format, expected, "{}", m.kind);
         }
         assert!(
@@ -27827,24 +28906,58 @@ mod tests {
         let mut cfg = sky_config(&conn);
         weighted(&mut cfg);
         cfg.output.crop_to_coverage = 4;
-        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
-            .unwrap();
-        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
         rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
         run_pipeline(&mut rc).unwrap();
 
         let cropped = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
-        for (kind, s) in [("master", 1), ("coverage", 1), ("drizzle", 2), ("weight_map", 2), ("drizzle_coverage", 2)] {
+        for (kind, s) in [
+            ("master", 1),
+            ("coverage", 1),
+            ("drizzle", 2),
+            ("weight_map", 2),
+            ("drizzle_coverage", 2),
+        ] {
             let (a, b) = (master_row(&full, kind), master_row(&cropped, kind));
             let r = rect.scaled(s);
-            assert_eq!((b.width as usize, b.height as usize), (r.width, r.height), "{kind}");
-            assert!(Path::new(&b.path).starts_with(tmp.path().join("out")), "{kind}: {}", b.path);
-            let (ra, rb) = (PlaneReader::open(Path::new(&a.path)).unwrap(), PlaneReader::open(Path::new(&b.path)).unwrap());
+            assert_eq!(
+                (b.width as usize, b.height as usize),
+                (r.width, r.height),
+                "{kind}"
+            );
+            assert!(
+                Path::new(&b.path).starts_with(tmp.path().join("out")),
+                "{kind}: {}",
+                b.path
+            );
+            let (ra, rb) = (
+                PlaneReader::open(Path::new(&a.path)).unwrap(),
+                PlaneReader::open(Path::new(&b.path)).unwrap(),
+            );
             for p in 0..ra.channels() {
-                let expected = crate::stacking::crop::crop_plane(&ra.read_plane(p).unwrap(), ra.width(), r);
+                let expected =
+                    crate::stacking::crop::crop_plane(&ra.read_plane(p).unwrap(), ra.width(), r);
                 let got = rb.read_plane(p).unwrap();
                 assert!(
-                    expected.iter().zip(&got).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    expected
+                        .iter()
+                        .zip(&got)
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
                     "{kind} plane {p}: the crop changes no pixel"
                 );
             }
@@ -27852,21 +28965,39 @@ mod tests {
             let hb = crate::fits_parser::FitsHeader::from_path(Path::new(&b.path)).unwrap();
             for (key, origin) in [("CRPIX1", r.x0), ("CRPIX2", r.y0)] {
                 let moved = ha.get_f64(key).unwrap() - origin as f64;
-                assert!((hb.get_f64(key).unwrap() - moved).abs() < 1e-9, "{kind} {key}");
+                assert!(
+                    (hb.get_f64(key).unwrap() - moved).abs() < 1e-9,
+                    "{kind} {key}"
+                );
             }
         }
         let groups = crate::db::stacking::list_groups(&conn, rc.run_id).unwrap();
-        assert_eq!(groups[0].master_path.as_deref(), Some(master_row(&cropped, "master").path.as_str()));
-        assert_eq!(groups[0].drizzle_path.as_deref(), Some(master_row(&cropped, "drizzle").path.as_str()));
+        assert_eq!(
+            groups[0].master_path.as_deref(),
+            Some(master_row(&cropped, "master").path.as_str())
+        );
+        assert_eq!(
+            groups[0].drizzle_path.as_deref(),
+            Some(master_row(&cropped, "drizzle").path.as_str())
+        );
         let g = &rc.summary.groups[0];
         assert_eq!(g.master_path, groups[0].master_path);
-        assert_eq!(g.coverage_path.as_deref(), Some(master_row(&cropped, "coverage").path.as_str()));
-        assert_eq!(g.weight_map_path.as_deref(), Some(master_row(&cropped, "weight_map").path.as_str()));
+        assert_eq!(
+            g.coverage_path.as_deref(),
+            Some(master_row(&cropped, "coverage").path.as_str())
+        );
+        assert_eq!(
+            g.weight_map_path.as_deref(),
+            Some(master_row(&cropped, "weight_map").path.as_str())
+        );
         assert_eq!(
             g.drizzle_coverage_path.as_deref(),
             Some(master_row(&cropped, "drizzle_coverage").path.as_str())
         );
-        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+        assert!(
+            !rc.layout.uncropped_dir(rc.run_id).exists(),
+            "the scratch folder is removed"
+        );
     }
 
     /// The sky project with a second group: three `R` frames about 40 px east
@@ -27916,9 +29047,22 @@ mod tests {
             let mut cfg = sky_config(&conn);
             cfg.registration.geometry = geometry;
             cfg.output.crop_to_coverage = 3;
-            crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
-                .unwrap();
-            let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+            crate::db::stacking::set_project_config(
+                &conn,
+                "p1",
+                &serde_json::to_string(&cfg).unwrap(),
+                &[],
+                None,
+            )
+            .unwrap();
+            let mut rc = project_rc(
+                &ctx,
+                &conn,
+                "p1",
+                cfg,
+                &tmp.path().join("work"),
+                &tmp.path().join("out"),
+            );
             rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
             run_pipeline(&mut rc).unwrap();
             rc
@@ -27931,7 +29075,13 @@ mod tests {
                 .filter(|m| m.kind == "master")
                 .map(|m| {
                     let h = crate::fits_parser::FitsHeader::from_path(Path::new(&m.path)).unwrap();
-                    (m.group_key, h.get_f64("CRPIX1").unwrap(), h.get_f64("CRPIX2").unwrap(), m.width, m.height)
+                    (
+                        m.group_key,
+                        h.get_f64("CRPIX1").unwrap(),
+                        h.get_f64("CRPIX2").unwrap(),
+                        m.width,
+                        m.height,
+                    )
                 })
                 .collect()
         };
@@ -27939,7 +29089,10 @@ mod tests {
         let native = run(RegistrationGeometry::Native);
         let n = rects(&native);
         assert_eq!(n.len(), 2, "{n:?}");
-        assert!((n[0].1 - n[1].1).abs() > 20.0, "two rectangles about 40 px apart: {n:?}");
+        assert!(
+            (n[0].1 - n[1].1).abs() > 20.0,
+            "two rectangles about 40 px apart: {n:?}"
+        );
         for m in crate::db::stacking::list_master_lights(&conn, native.run_id)
             .unwrap()
             .iter()
@@ -27949,17 +29102,40 @@ mod tests {
             let (w, h) = (r.width(), r.height());
             let c = r.read_plane(0).unwrap();
             let reaches = |mut it: Box<dyn Iterator<Item = f32> + '_>| it.any(|v| v >= 3.0);
-            assert!(reaches(Box::new(c[..w].iter().copied())), "{}: first row", m.path);
-            assert!(reaches(Box::new(c[(h - 1) * w..].iter().copied())), "{}: last row", m.path);
-            assert!(reaches(Box::new((0..h).map(|y| c[y * w]))), "{}: first column", m.path);
-            assert!(reaches(Box::new((0..h).map(|y| c[y * w + w - 1]))), "{}: last column", m.path);
+            assert!(
+                reaches(Box::new(c[..w].iter().copied())),
+                "{}: first row",
+                m.path
+            );
+            assert!(
+                reaches(Box::new(c[(h - 1) * w..].iter().copied())),
+                "{}: last row",
+                m.path
+            );
+            assert!(
+                reaches(Box::new((0..h).map(|y| c[y * w]))),
+                "{}: first column",
+                m.path
+            );
+            assert!(
+                reaches(Box::new((0..h).map(|y| c[y * w + w - 1]))),
+                "{}: last column",
+                m.path
+            );
         }
 
         let co = run(RegistrationGeometry::CoRegistered);
         let c = rects(&co);
         assert_eq!(c.len(), 2, "{c:?}");
-        assert_eq!((c[0].1, c[0].2, c[0].3, c[0].4), (c[1].1, c[1].2, c[1].3, c[1].4), "one rectangle for the run");
-        assert!(c[0].3 > n[0].3.max(n[1].3), "the union is wider than either group's own: {c:?} vs {n:?}");
+        assert_eq!(
+            (c[0].1, c[0].2, c[0].3, c[0].4),
+            (c[1].1, c[1].2, c[1].3, c[1].4),
+            "one rectangle for the run"
+        );
+        assert!(
+            c[0].3 > n[0].3.max(n[1].3),
+            "the union is wider than either group's own: {c:?} vs {n:?}"
+        );
     }
 
     /// Plan 6b-3 D10: a crop pass that cannot write never loses a master —
@@ -27975,25 +29151,47 @@ mod tests {
         let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
         let mut cfg = sky_config(&conn);
         cfg.output.crop_to_coverage = 2;
-        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
-            .unwrap();
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
         // A file where the output folder's parent should be: every final
         // write fails at `create_dir_all`.
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").unwrap();
-        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &blocker.join("out"));
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &blocker.join("out"),
+        );
         rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
         run_pipeline(&mut rc).unwrap();
 
         let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
         let master = master_row(&rows, "master");
         let scratch = rc.layout.uncropped_dir(rc.run_id);
-        assert!(Path::new(&master.path).starts_with(&scratch), "{}", master.path);
+        assert!(
+            Path::new(&master.path).starts_with(&scratch),
+            "{}",
+            master.path
+        );
         assert!(Path::new(&master.path).exists(), "the master survives");
         assert_eq!(master.format, "fits");
-        assert_eq!(rc.summary.groups[0].master_path.as_deref(), Some(master.path.as_str()));
+        assert_eq!(
+            rc.summary.groups[0].master_path.as_deref(),
+            Some(master.path.as_str())
+        );
         assert!(
-            rc.warnings.iter().any(|w| w.contains("could not be finalized") && w.contains("-uncropped")),
+            rc.warnings
+                .iter()
+                .any(|w| w.contains("could not be finalized") && w.contains("-uncropped")),
             "{:?}",
             rc.warnings
         );
@@ -28009,8 +29207,14 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-        let (fixture, light_ids, _working, _output) = seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
-        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
         let run_with = |crop: u32| -> (String, RunSummary) {
             let mut cfg = StackingConfig::default();
             cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
@@ -28026,10 +29230,14 @@ mod tests {
             )
             .unwrap();
             wait_for_run(&ctx, started.run_id);
-            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id).unwrap().unwrap();
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+                .unwrap()
+                .unwrap();
             assert_eq!(row.status, "done", "{row:?}");
-            let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
-            let rows = crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
+            let summary: RunSummary =
+                serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+            let rows =
+                crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
             (master_row(&rows, "master").path.clone(), summary)
         };
         let (k0, _) = run_with(0);
@@ -28037,10 +29245,16 @@ mod tests {
         assert!(k1.ends_with(".xisf") && !k1.contains("-uncropped"), "{k1}");
         let read = |p: &str| astroimage::ImageConverter::read_raw(Path::new(p)).unwrap();
         let ((ma, pa), (mb, pb)) = (read(&k0), read(&k1));
-        assert_eq!((ma.width, ma.height, ma.channels), (mb.width, mb.height, mb.channels));
+        assert_eq!(
+            (ma.width, ma.height, ma.channels),
+            (mb.width, mb.height, mb.channels)
+        );
         match (pa, pb) {
             (astroimage::PixelData::Float32(a), astroimage::PixelData::Float32(b)) => {
-                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "the same pixels");
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "the same pixels"
+                );
             }
             _ => panic!("expected Float32 samples"),
         }
@@ -28054,7 +29268,10 @@ mod tests {
         };
         assert_eq!(keys(&k1), keys(&k0), "the same keywords but the run id");
         assert!(
-            summary.warnings.iter().all(|w| !w.contains("crop") && !w.contains("uncropped")),
+            summary
+                .warnings
+                .iter()
+                .all(|w| !w.contains("crop") && !w.contains("uncropped")),
             "{:?}",
             summary.warnings
         );
@@ -28105,18 +29322,32 @@ mod tests {
             master.path
         );
         assert_eq!(master.format, "fits");
-        let written = rc.summary.groups.iter().find(|g| g.key == master.group_key).unwrap();
+        let written = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == master.group_key)
+            .unwrap();
         assert_eq!(written.master_path.as_deref(), Some(master.path.as_str()));
         let groups = crate::db::stacking::list_groups(&conn, rc.run_id).unwrap();
-        let row = groups.iter().find(|g| g.group_key == master.group_key).unwrap();
+        let row = groups
+            .iter()
+            .find(|g| g.group_key == master.group_key)
+            .unwrap();
         assert_eq!(row.master_path.as_deref(), Some(master.path.as_str()));
         assert_eq!(
-            rc.warnings.iter().filter(|w| w.contains("did not finish")).count(),
+            rc.warnings
+                .iter()
+                .filter(|w| w.contains("did not finish"))
+                .count(),
             1,
             "{:?}",
             rc.warnings
         );
-        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+        assert!(
+            !rc.layout.uncropped_dir(rc.run_id).exists(),
+            "the scratch folder is removed"
+        );
     }
 
     /// Plan 6b-3 D10 fix round 1: a crop that fails is finalized uncropped
@@ -28157,14 +29388,31 @@ mod tests {
 
         let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
         let master = master_row(&rows, "master");
-        assert!(Path::new(&master.path).starts_with(tmp.path().join("out")), "{}", master.path);
+        assert!(
+            Path::new(&master.path).starts_with(tmp.path().join("out")),
+            "{}",
+            master.path
+        );
         assert!(Path::new(&master.path).exists());
         assert_eq!((master.width, master.height), (512, 384), "uncropped");
-        assert_eq!(rc.summary.groups[0].master_path.as_deref(), Some(master.path.as_str()));
-        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
-        let said: Vec<_> = rc.warnings.iter().filter(|w| w.contains("written uncropped")).collect();
+        assert_eq!(
+            rc.summary.groups[0].master_path.as_deref(),
+            Some(master.path.as_str())
+        );
+        assert!(
+            !rc.layout.uncropped_dir(rc.run_id).exists(),
+            "the scratch folder is removed"
+        );
+        let said: Vec<_> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("written uncropped"))
+            .collect();
         assert_eq!(said.len(), 1, "{:?}", rc.warnings);
-        assert!(rc.warnings.iter().all(|w| !w.contains("could not be finalized")));
+        assert!(rc
+            .warnings
+            .iter()
+            .all(|w| !w.contains("could not be finalized")));
     }
 
     /// Plan 6b-3 D10 fix round 1: a `K` no pixel reaches (more frames than
@@ -28192,7 +29440,10 @@ mod tests {
             .filter(|w| w.contains("no pixel is covered by 5 frames"))
             .collect();
         assert_eq!(said.len(), 1, "{:?}", rc.warnings);
-        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+        assert!(
+            !rc.layout.uncropped_dir(rc.run_id).exists(),
+            "the scratch folder is removed"
+        );
     }
 
     /// Final review B2: the crop pass emits an Output-stage tick per group
@@ -28235,7 +29486,10 @@ mod tests {
         assert_eq!(ticks[0]["total"], 2);
         assert!(ticks[0]["groupKey"].is_string(), "{:?}", ticks[0]);
         let last = ticks.last().unwrap();
-        assert_eq!((last["current"].as_u64(), last["total"].as_u64()), (Some(2), Some(2)));
+        assert_eq!(
+            (last["current"].as_u64(), last["total"].as_u64()),
+            (Some(2), Some(2))
+        );
         assert_eq!(last["percent"].as_f64(), Some(100.0));
     }
 
@@ -28281,9 +29535,16 @@ mod tests {
         let (in_scratch, finalized): (Vec<&&crate::db::stacking::MasterLight>, Vec<_>) = masters
             .iter()
             .partition(|m| Path::new(&m.path).starts_with(&scratch));
-        assert_eq!(in_scratch.len(), 1, "the failed group's rows still name scratch");
+        assert_eq!(
+            in_scratch.len(),
+            1,
+            "the failed group's rows still name scratch"
+        );
         assert_eq!(finalized.len(), 1, "the other group is finalized");
-        assert!(Path::new(&in_scratch[0].path).exists(), "its master survives");
+        assert!(
+            Path::new(&in_scratch[0].path).exists(),
+            "its master survives"
+        );
         assert!(Path::new(&finalized[0].path).starts_with(tmp.path().join("out")));
         let named = in_scratch[0].group_key.as_str();
         assert!(
@@ -28370,7 +29631,10 @@ mod tests {
             .expect("the failed group's master row still names scratch");
         // Every row names a file that exists (none names a removed final file).
         for m in &rows {
-            assert!(Path::new(&m.path).exists(), "row names a missing file: {m:?}");
+            assert!(
+                Path::new(&m.path).exists(),
+                "row names a missing file: {m:?}"
+            );
         }
         // The group rows agree: each group's master_path is a file on disk.
         let n: i64 = conn
@@ -28390,7 +29654,10 @@ mod tests {
             .collect();
         assert_eq!(groups.len() as i64, n);
         for (key, p) in &groups {
-            assert!(Path::new(p).exists(), "group {key} names a missing file {p}");
+            assert!(
+                Path::new(p).exists(),
+                "group {key} names a missing file {p}"
+            );
             if *key == failed.group_key {
                 assert!(
                     Path::new(p).starts_with(&scratch),

@@ -132,6 +132,17 @@ pub struct SummaryFrame {
     /// `ln_scale`'s own doc.
     #[serde(default)]
     pub cached_ln: bool,
+    /// The frame's own β (Plan A Task 11b, owner decision R11b-12; mean across channels like `fwhm_px`): F-4's
+    /// per-frame estimate, a diagnostic beside the group β every member was fitted at (`SummaryGroup::beta`). `None`
+    /// when the frame was not measured, under `Moffat4`, and in a summary written before Task 11b. `#[serde(default)]`,
+    /// see `ln_scale`'s own doc.
+    #[serde(default)]
+    pub beta_own: Option<f64>,
+    /// Whether the frame's own β sat at a bound of the β range on any channel (`ChannelMeasurement::beta_own_at_cap`):
+    /// then `beta_own` is a clamp, not an estimate. `false` when not measured, under `Moffat4`, and in a summary
+    /// written before this field. `#[serde(default)]`, see `ln_scale`'s own doc.
+    #[serde(default)]
+    pub beta_own_at_cap: bool,
 }
 
 /// One integration group's whole result. `stats`/`master_path`/rejection
@@ -199,7 +210,9 @@ pub struct SummaryGroup {
     /// Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
     /// from its members' own `Auto` picks — always one of their own βs
     /// (continuous from Plan A Task 9, F-4; one of `psf_signal::AUTO_BETAS`
-    /// before it). `None` when the group measured no frame at
+    /// before it). From Plan A Task 11b (owner decision R11b-12) every
+    /// member was fitted at it under `Auto` (each frame's own β is
+    /// `SummaryFrame::beta_own`). `None` when the group measured no frame at
     /// all, or on a summary written before this task. `#[serde(default)]`,
     /// see `SummaryFrame::ln_scale`'s own doc for the convention.
     #[serde(default)]

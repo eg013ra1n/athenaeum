@@ -4139,6 +4139,71 @@ frame). Task 10b's 3F region floor (RB3) as an arm beside each. Out of scope: th
 arms, judged on the family, the M42 bar and the no-regression table; (iii) one implementer for the winning arm; spec
 F-4 and the owned-quantities row; Task 13's M42 line closed with the numbers.
 
+**Outcome (as built, 2026-10-13).** Commits (athenaeum, branch `one-star-path-t11b-impl` from af7de707): 0f70e3c0
+(F-4b: under `Auto` the stacking Measure fits every group member at the GROUP β — two-pass over `PlanePrep`,
+`psf_signal::group_beta` of the members' own βs (the lower median, LN's value), the frame's own β kept as the
+diagnostic `beta_own`; the measurement hash folds the group β under `Auto` only; `star_probe --psf-beta`), 3af1fd8d
+(the review round: I1 pass-1 progress, I2 the doc note, M1–M4 incl. `beta_own_at_cap` and the fan-out length check as
+an `error!` + `Err`), then this docs commit. Not merged, the archive: the WIP branch `one-star-path-t11b-wip` and its
+bundles (the arms, `band`, `shoulder`), the A4 `fref` edits in a stash. The path (rulings R11b-0…R11b-13, README
+R-OSP-9): D0 put 0000's separation in our free-β estimator on a 5 % wider, weakly skewed frame, not in its pixels'
+shape (R11b-0/2); gate zero passed on the `skew` family (R11b-3/4); nine estimators (head and six arms in L2, `band`,
+`shoulder`, the summed profile) and the reference-style F_ref (L4) were measured out (R11b-5…R11b-11): a single
+Moffat on a composite PSF has a bimodal per-star β and a χ²-best β at a mismatch value; the second design ruling
+(R11b-9) made the group β the consumed quantity; the owner challenged it (R11b-10), then decided (R11b-12): the group β
+for stacking, Moffat 4 by default for Analysis / Blink (Plan C). Review `review-t11b.md` (0f70e3c0: Ready with fixes,
+0 Critical / 3 Important / 6 Minor; I1, I2 (doc) and M1–M4 fixed in 3af1fd8d; I3 the upgrade ripple → README and the
+release notes; M5 / M6 notes; the memory ruling → Task 11c). Gates: `stacking::` 835 / 0 / 2 ignored, `star_measure::`
+172, `check --all-targets`, `ts_contract`. **The bars** (lab L5, athenaeum-lab 1e52339 at 0f70e3c0): Step 0 the
+single-frame path unchanged in value (487 files, 1 849 458 lines identical but for the additive `betaOwn` == `beta`;
+B-4 follows, every lab image being a group of one at its own β); M42 group β 3.3066 (0003's own β); **3c F(0000) /
+F(0001) 1.0431 ± 0.0013 against [1.044, 1.062] — missed by 0.0009 (0.7 SE; own β 1.0883)**; **3b ours / HFR passes
+(z₀ 1.01 ≤ k 2.66); 3b ours / FWHM_m2 misses (z₀ 5.16 > k 2.16, the sign flipped)**; **B2 is not a bar** (resolved by
+the definition); B1 / B3 on `beta_own` = Task 10c's (3.60 ≤ 5.39, 0.051 ≤ 0.207); F / the ERP's F 0000 0.964 vs
+0.973–1.010; the probe wall `--psf-beta` / default 0.992 (0000) / 1.024 (0008), information. Controller decision
+(R11b-13): no further estimator (the owner: no new rounds); the group β is kept. Spec §3 F-4 as built and as judged,
+the owned-quantities table (frame F, frame β, the group-β row, `betaAtCap`), §5's Plan C default PSF and §7's risk; the
+logging dictionary (`beta_own`, `beta_own_min`, `beta_own_max`).
+
+Limits (README R-OSP-9). 3c and 3b FWHM_m2 on M42: the composite-PSF definition limit (the independent referees span
+1.043–1.062 on 0000). The single-frame path over-reads a skewed frame's half-max by the ridge (+1.8 % per unit β; 0000
++4 %). A mixed-profile group reads every F at one β (comparability over per-frame truth). Not judged here: the
+stage-level Measure wall (M.1, Task 13).
+
+Carries. **Task 11c** (below): the pass-1 spill — memory, I2, half the upgrade ripple. **Task 12:** the analysis
+mode's default PSF is Moffat 4. **Task 13:** its M42 frame-β line is closed by definition; M.1 now covers the two-pass
+Measure; the group β judged at master level. **Task 14:** the single-frame ridge as a debt line. **Plan C:** Moffat 4
+by default, the own β shown as a diagnostic, Auto selectable; the Measure panel's "Auto (per-frame β)" label
+(`stageSummary.ts`) now names the diagnostic. **The release notes:** the upgrade ripple — every existing `Auto` set
+re-measures, re-registers and re-normalizes once (review I3).
+
+---
+
+### Task 11c: Spill the Measure first pass to the work dir (review memory ruling, I2; inserted 2026-10-13)
+
+**Stub: scope and bars fixed now; Files / Steps when it is picked up (before Task 13's cycle or with it).** Task 11b
+holds every freshly measured member's pass-1 records (`PlanePrep`: the seeds, `SeedPass`, the `DetectionReport`
+per-seed vectors; no plane-sized buffer) in memory until pass 2 and stores none of them.
+
+**Change.** Pass 1 writes one per-frame artifact (every plane's `PlanePrep` records) under
+`<working_dir>/<set_slug>/measured/`, keyed on the calib hash + the measurement subtree — NOT the group β — as a new
+`stacking_artifacts` kind; pass 2 reads it back; a valid artifact skips pass 1 (no frame read, no detection). Cost:
+serde on `PlanePrep`'s ≈ 10 structs and one artifact kind (cleanup and the work-usage count follow the existing kinds).
+
+**Why.** (1) Memory: ≈ 250 B per seed, ≤ 6 MB per plane at the detector's 24 576 cap — a 300-frame OSC group holds
+≈ 0.7 GB typical, 5.4 GB worst, uncounted by admission. (2) I2: a group-β move (an exclusion that moves the lower
+median) re-runs pass 1 for every member today; with the spill only pass 2 re-runs. (3) Half the upgrade ripple
+(R-OSP-9): the pass-1 artifact survives a re-key. A bound (drop the records over a budget, re-run pass 1 inside pass 2)
+is rejected: it computes twice by design, against the owner's "disk as cache" rule.
+
+**Bars.** (1) Byte-identical vs 11b: every `.athf`, `metrics` payload, group β and stage hash of a run equals
+3af1fd8d's on the same inputs, fresh and from the artifact. (2) A β move re-runs only pass 2: a run-level test (the
+`measure_reruns_pass_two_for_the_group_when_the_group_beta_moves` pattern) proves no frame read and no detection on a
+valid artifact. (3) Memory bounded to the admitted workers: pass-1 residency is the admitted workers' planes, not the
+group's. (4) The wall, interleaved against 11b: Measure on M42 (≤ 1.2 ×), and a re-run after an exclusion that moves
+the group β (it falls by the pass-1 share). (5) The owner's "disk as cache" rule: the artifact is the one stored copy,
+written once, read by pass 2 and by every later run whose key matches, never recomputed while valid.
+
 ---
 
 ### Task 12: The Analysis mode and the budget — Plan C's interface, the cost bars (spec D-3, §2.1 `budget`, §3 budget and cost)
@@ -4147,7 +4212,7 @@ F-4 and the owned-quantities row; Task 13's M42 line closed with the numbers.
 - Create: `crates/athenaeum-core/src/star_measure/budget.rs`
 - Modify: `star_measure/mod.rs` (`Mode`, `PlaneMeasurement.budget`; the outcomes `NotSelected`/`Trimmed` are
   emitted here — ruling F13), `examples/star_probe.rs` (`--paths analysis-mode`, `--clip`, `--budget N`; the
-  raw-domain read keeps `PlaneReader` — XISF and `read_raw` are Plan C's), `docs/stacking/README.md` (R-OSP-9),
+  raw-domain read keeps `PlaneReader` — XISF and `read_raw` are Plan C's), `docs/stacking/README.md` (R-OSP-10),
   lab: `probe_plan.ANALYSIS_MODE = True` (Task 1b's switch), `scorecard_build` scores the `analysis-mode` path with
   the measure rows (threshold key `fisher_snr`, `seedThreshold`)
 - Earlier tests this task edits (ruling F14): none (`Mode` defaults to `All` in `MeasureOptions::default()`).
@@ -4172,6 +4237,9 @@ pub fn trim(fits: &[StarFit], w: usize, h: usize, budget: usize) -> Vec<usize>;
   `Outcome::Trimmed`, its diagnostics record kept), and report; `Mode::All` is the stacking path. The per-frame β
   sample and the aperture correction use the budget's own candidates (they are the brightest anyway). The identity
   `accepted + refused + not_selected + trimmed = seeds` holds (Task 4's assertion, extended).
+
+  **Default PSF (Task 11b, owner decision R11b-12, 2026-10-13):** the analysis mode's default PSF is Moffat 4 (Plan C's
+  Analysis / Blink default), the frame's own β reported as a diagnostic, Auto selectable.
 
 - [ ] **Step 1: Write the failing tests** (`budget.rs` and `mod.rs` tests)
 
@@ -4254,7 +4322,7 @@ fn budget_mode_accounts_for_every_seed() {
   - bright coverage and completeness of `analysis-mode` against the legacy `analysis` on `sharp/m4/f2.6` recorded
     (baseline legacy 7.3 % of 300, 21.5 % of 554 expected) — Plan C's comparison, not a bar here.
 
-- [ ] **Step 5: R-OSP-9; commit.**
+- [ ] **Step 5: R-OSP-10; commit.**
 
 ```
 feat(star_measure): Analysis mode - a budget of N good unsaturated stars spread over a 4x4 grid before fitting, NotSelected/Trimmed outcomes, the BudgetReport (coverage <cell>, m42 analysis-mode <s>/frame, measure batch <s>)
@@ -4276,6 +4344,9 @@ It reports the M42 β spread at master level and the OSC LN reference R-plane `c
 flag; the saturated share of TFlux is 0.79–0.90 on M42 and 0.77–0.82 on hc11B L; relative M42 weights 0.40–1.00 →
 0.82–1.00 with flagged fits out — the weights' owner judges it against the ERP at master level. D0099 (LDN 1272)
 reads β 99.96 at every brightness (F 4.1 vs the set's 2.0) — a frame-class item (defocused / flat-topped).
+
+**Closed by Task 11b (2026-10-13).** Its M42 frame-β line is closed by definition (the stacking group β, README
+R-OSP-9: B2 is not a bar); the Measure-wall bar (M.1) now covers the two-pass Measure.
 
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
 `harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
@@ -4322,7 +4393,7 @@ taken only on the owner's word, is `prepare-catalog.sh` from the template into a
   `sqlite3.connect(f"file:{path}?immutable=1", uri=True)` (ruling F19: a plain connect can write a before tree's
   `-wal`/`-shm`)), `harness/acceptance/clone-before.sh` (new: the recipe's steps (1)–(4) below; refuses a target
   under anything but `~/.athenaeum-acc/` and a source that is not one of the three before trees; the ONE script that
-  opens a clone's DB writable), `docs/stacking/README.md` (the acceptance run, R-OSP-10),
+  opens a clone's DB writable), `docs/stacking/README.md` (the acceptance run, R-OSP-11),
   `docs/superpowers/research/2026-10-XX-star-measurement-after-plan-a.md` (§4 "Real data", written in Task 14)
 
 **Interfaces:**
@@ -4456,13 +4527,13 @@ cp ~/.athenaeum-acc/starA-s204/{before,extract,compare,run}.txt ../../results/pl
   - the stacking `metrics` payload's `starsRefused` and `beta` per frame are reported (new fields), and the master
     `beta` line (L-25) beside the FWHM row.
 
-- [ ] **Step 6: Record** the run (R-OSP-10) in `docs/stacking/README.md` with every row's number; the compare files
+- [ ] **Step 6: Record** the run (R-OSP-11) in `docs/stacking/README.md` with every row's number; the compare files
   are already committed in the lab per dataset (step 4). Only `starA-s204` is on disk after this task (`probe_parity`
   reads its `calibrated` + `fits.0` + `metrics` of one 6224×4168 mono frame on run 6: `STARLAB_ACC_COPY=
   ~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=6`); Task 14 deletes it at its end. No before tree is touched.
 
 ```
-docs(stacking): Plan A real-data checkpoint - Horse C11, run B, set 204 before/after at master level on clones from Measure with the reference pinned (ruling R-OSP-10: <rows>)
+docs(stacking): Plan A real-data checkpoint - Horse C11, run B, set 204 before/after at master level on clones from Measure with the reference pinned (ruling R-OSP-11: <rows>)
 ```
 
 **Acceptance:** every master row inside the tolerances on the three datasets; ρ ≥ 0.9 on each with every larger
@@ -4569,13 +4640,13 @@ owner's ruling; the full core suite green on both repositories; the ERP's name a
 | §2.2 stacking adapter, `psf_signal` formulas, LN refit via `fit_stars_at`, master statistics | 2, 6a (`field_width_of` for given seeds), 10 |
 | §2.2 `stars_fitted` meaning, unsaturated statistic, `stars_refused` + per-reason counts | 4, 8 |
 | §2.2 Measure config: `seed_source`, legacy decode of every stored document, Median3 = Peak's, R-M4c-11 | 7 |
-| §2.2 `psf_model` Auto = continuous β, Moffat4 kept, `STACKING_CONFIG_VERSION` unchanged | 9, 7 |
+| §2.2 `psf_model` Auto = continuous β (in stacking the group β), Moffat4 kept, `STACKING_CONFIG_VERSION` unchanged | 9, 7, 11b |
 | §2.2 Analysis/Blink, not touched (plate-solve detector, rustafits analysis), the lab's two modes + `legacy-analysis` | 1b (the alias, F2), 12 (the arm), Plan C (the switch) |
 | §3 doctrine, F-0 | 4 |
 | §3 F-1 (region, cap, rim background, width start, seeds, new families, donut and its ring-radius floor) | 1a (families, PA-9), 6a, 6b |
 | §3 F-2 (axes, conditioning, conditional convergence change as a new entry point F7) | 5 |
 | §3 F-3 (unsaturated sample/statistic, twin bars, re-judged after F-4; the near-clip class and the M42 β bar) | 8, 9, 10c |
-| §3 F-4 (continuous β, rustafits bound and ln β, Gaussian limit, every β a finite number, the linear arm kept F8) | 9 |
+| §3 F-4 (continuous β, rustafits bound and ln β, Gaussian limit, every β a finite number, the linear arm kept F8) | 9; 11b (the stacking group β, the own β a diagnostic), 11c (the first pass spilled) |
 | §3 F-5 (flux, aperture correction, psfSel, the pairs families F24) | 10 |
 | §3 F-6 (SNR definition, gain `EGAIN × ATH_CSCL` F6, lab cards, truth SNR with the annulus term F5) | 1a, 8 (the annulus), 11 |
 | §3 F-7 (rim background under nebulosity, every `neb*` family F23) | 6b |
