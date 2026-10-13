@@ -166,6 +166,26 @@ impl WorkingLayout {
         self.root.join("fits")
     }
 
+    /// `root/measured` — the parent of every group's Measure first-pass artifacts (Plan A Task 11c, R11c-6): one
+    /// `.athm` file per frame holding every plane's pass-1 records, with a `stacking_artifacts` row of kind
+    /// `measured` behind it. An intermediate: it goes with `Intermediates` and `All` (not with `metrics`, which
+    /// keys on the calibration CONFIG hash and survives a re-calibration: a re-calibration rewrites the calibrated
+    /// file, whose new identity stales every first-pass artifact anyway).
+    pub fn measured_root(&self) -> PathBuf {
+        self.root.join("measured")
+    }
+
+    /// `root/measured/<group_key>` — one group's first-pass artifacts.
+    pub fn measured_dir(&self, group_key: &str) -> PathBuf {
+        self.measured_root().join(group_key)
+    }
+
+    /// `root/measured/<group_key>/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME collision-safe
+    /// stem [`crate::stacking::run::calibrated_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
+    pub fn measured_path(&self, group_key: &str, stem: &str) -> PathBuf {
+        self.measured_dir(group_key).join(format!("{stem}.athm"))
+    }
+
     /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
     pub fn runs_root(&self) -> PathBuf {
         self.root.join("runs")
@@ -714,7 +734,9 @@ pub struct EstimateInputs<'a> {
 /// which drifts from the true count in exactly the mixed-pixel-scale (M4b)
 /// and native-geometry-mode groups this owner decision introduced. This is
 /// a footprint estimate, not an exact accounting: it ignores compression,
-/// FITS header overhead, and the ln/intermediates M2 adds.
+/// FITS header overhead, and the ln/intermediates M2 adds, and the Measure
+/// first-pass artifacts (`measured/`, Plan A Task 11c, R11c-6: about 2 % of the calibrated term, so no term of
+/// their own, like the other uncounted intermediates).
 ///
 /// M3 Task 5 (spec §7): when `i.drizzle` is `Some`, two more per-group terms
 /// use the SAME largest-member geometry the master term above does —
@@ -859,6 +881,9 @@ pub struct WorkUsage {
     /// fits, cached like `metrics` (no file of its own) but WITH a file
     /// behind each row, so it earns a byte counter `metrics` never needed.
     pub fits_bytes: u64,
+    /// Plan A Task 11c: bytes under `measured/` — the Measure first-pass artifacts (R11c-6), about 2 % of the
+    /// calibrated footprint.
+    pub measured_bytes: u64,
     pub runs_bytes: u64,
     /// M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
     /// (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
@@ -884,6 +909,7 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
     let registered_bytes = crate::api::sync::dir_size_bytes(&layout.registered_root());
     let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
     let fits_bytes = crate::api::sync::dir_size_bytes(&layout.fits_root());
+    let measured_bytes = crate::api::sync::dir_size_bytes(&layout.measured_root());
     let runs_bytes = crate::api::sync::dir_size_bytes(&layout.runs_root());
     let rej_bytes = crate::api::sync::dir_size_bytes(&layout.rej_root());
     let previews_bytes = crate::api::sync::dir_size_bytes(&layout.previews_root());
@@ -892,6 +918,7 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
         registered_bytes,
         ln_bytes,
         fits_bytes,
+        measured_bytes,
         runs_bytes,
         rej_bytes,
         previews_bytes,
@@ -899,6 +926,7 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
             + registered_bytes
             + ln_bytes
             + fits_bytes
+            + measured_bytes
             + runs_bytes
             + rej_bytes
             + previews_bytes,
@@ -956,12 +984,19 @@ pub enum CleanupWhat {
 /// inputs, so the stored `k` is still a measurement of exactly this group
 /// against exactly this reference. Only `All` drops it.
 ///
+/// `measured` (Plan A Task 11c) is in the list although it sits beside `metrics` and `fits`: unlike them it is keyed
+/// on the calibrated file's IDENTITY (a stored size + mtime stamp, R11c-4), which a re-calibration after this cleanup
+/// rewrites, so a kept artifact would never be usable again; its directory goes with `calibrated/`.
+///
 /// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
 /// cache) is deliberately absent too: it is a payload row that only `All`
 /// drops.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",
+    // Plan A Task 11c (R11c-6): the Measure first-pass artifact (`measured/`, a file behind each row) goes with the
+    // calibrated frames it was read from, whose identity it is stamped with.
+    "measured",
     // M4d Task 1: the calibrated CFA mosaic lives IN `calibrated/` beside
     // its debayered sibling, so the directory removal above already takes
     // the file — this is its row.
@@ -1048,6 +1083,7 @@ pub fn cleanup_work(
         CleanupWhat::Intermediates => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.prepared_root());
+            dirs.push(layout.measured_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
             dirs.push(layout.tmp_root());
@@ -1055,6 +1091,7 @@ pub fn cleanup_work(
         CleanupWhat::All => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.prepared_root());
+            dirs.push(layout.measured_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
             dirs.push(layout.tmp_root());
@@ -2214,6 +2251,60 @@ mod tests {
         .unwrap();
         assert_eq!(freed, 128);
         assert!(!layout.rej_root().exists());
+    }
+
+    /// Plan A Task 11c (R11c-6): `measured/` bytes are counted by `work_usage` (and in the total), survive
+    /// `Registered` with their rows, and are removed with their rows by `Intermediates` and by `All`.
+    #[test]
+    fn measured_bytes_are_counted_and_intermediates_or_all_remove_them() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (4, 'Measured')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        assert_eq!(
+            layout.measured_path("g", "f1"),
+            layout.root.join("measured").join("g").join("f1.athm")
+        );
+        let file = layout.measured_path("g", "f1");
+        write_bytes(&file, 96);
+        seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 96);
+
+        let usage = work_usage(&layout);
+        assert_eq!(usage.measured_bytes, 96);
+        assert_eq!(usage.total_bytes, 96, "the only bytes on disk are under measured/");
+        let row_count = |c: &Connection| {
+            crate::db::stacking::list_artifacts(c, &StackSubject::FrameSet(4), Some("measured"))
+                .unwrap()
+                .len()
+        };
+        assert_eq!(row_count(&c), 1);
+
+        let freed = cleanup_work(&c, &StackSubject::FrameSet(4), &layout, CleanupWhat::Registered)
+            .unwrap();
+        assert_eq!(freed, 0);
+        assert!(file.exists(), "Registered keeps measured/");
+        assert_eq!(row_count(&c), 1, "…and its row");
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(4),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 96);
+        assert!(!layout.measured_root().exists());
+        assert_eq!(row_count(&c), 0, "Intermediates drops the rows too");
+        assert_eq!(work_usage(&layout).measured_bytes, 0);
+
+        write_bytes(&file, 64);
+        seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 64);
+        let freed =
+            cleanup_work(&c, &StackSubject::FrameSet(4), &layout, CleanupWhat::All).unwrap();
+        assert_eq!(freed, 64);
+        assert!(!layout.measured_root().exists());
+        assert_eq!(row_count(&c), 0, "All drops the rows too");
     }
 
     /// Plan 6b-3 D10 (fix round 1): a crop run's scratch folder can hold the

@@ -43,6 +43,7 @@
 //! local `b` stays free (B1): it is the model's scale, B_i the aperture's; `b − B_i` is the stored near/far diagnostic
 //! ([`super::StarFit::sky_offset`]).
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use astroimage::analysis::fitting::{fit_moffat_2d_bounded, PixelSample};
@@ -142,7 +143,7 @@ pub fn annulus_sigma(
 }
 
 /// The plane-level inputs of the saturation test (spec §2.1, PA-23), once per plane, in working units.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SaturationPlane {
     /// The sky median (the module's sampled, clipped `SkyLevel::median`, PA-21), in working units.
     pub bg: f64,
@@ -339,7 +340,7 @@ pub(crate) fn plateau_test(
 
 /// One seed's saturation verdict (spec §2.1, PA-23). `saturated` is the flag the fit copies; `level` is the exclusion
 /// the fit at β applies (Q6).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SaturationVerdict {
     /// The plateau test passed.
     pub plateau: bool,

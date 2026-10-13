@@ -70,6 +70,7 @@ pub mod ln;
 pub mod master_cards;
 pub mod measure;
 pub mod origin;
+pub mod pass1_artifact;
 pub mod paths;
 pub mod plan;
 pub mod prefilter;

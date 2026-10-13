@@ -4181,14 +4181,20 @@ re-measures, re-registers and re-normalizes once (review I3).
 
 ### Task 11c: Spill the Measure first pass to the work dir (review memory ruling, I2; inserted 2026-10-13)
 
-**Stub: scope and bars fixed now; Files / Steps when it is picked up (before Task 13's cycle or with it).** Task 11b
-holds every freshly measured member's pass-1 records (`PlanePrep`: the seeds, `SeedPass`, the `DetectionReport`
-per-seed vectors; no plane-sized buffer) in memory until pass 2 and stores none of them.
+**Scope and bars fixed 2026-10-13 (the stub); Files / Interfaces / Steps by the design read
+(`task-11c-report-design.md`), which sharpened the stub where the code contradicts it ("design read" below).** Task
+11b holds every freshly measured member's pass-1 records in memory until pass 2 and stores none of them: per plane the
+`PlanePrep` (the seeds, one `SeedPass` per seed, the `DetectionReport` per-seed vectors and its 5×5 noise correlation,
+the `SaturationPlane`, the sky and noise models, the phase timings) and the adapter head (detector and module options;
+its `mask` is `None`, its `Given` seeds are `prep.seeds` again, `measure.rs:944`). No plane-sized buffer anywhere.
 
-**Change.** Pass 1 writes one per-frame artifact (every plane's `PlanePrep` records) under
-`<working_dir>/<set_slug>/measured/`, keyed on the calib hash + the measurement subtree — NOT the group β — as a new
-`stacking_artifacts` kind; pass 2 reads it back; a valid artifact skips pass 1 (no frame read, no detection). Cost:
-serde on `PlanePrep`'s ≈ 10 structs and one artifact kind (cleanup and the work-usage count follow the existing kinds).
+**Change.** Pass 1 writes one per-frame artifact (every plane's records) to
+`<working_dir>/<set_slug>/measured/<group_key>/<stem>.athm` (a project's under `_projects/<slug>/`), keyed on the calib
+hash + the measurement subtree — NOT the group β — as the new `stacking_artifacts` kind `measured`; pass 2 reads it
+back; a valid artifact skips all pass-1 work: no pass-1 plane read, no detection, no verdict pass, no own-β sample
+(design read: pass 2 still reads the frame, its fits need the pixels). Cost: `Serialize, Deserialize` on 16
+`star_measure` types (design read: not ≈ 10), one codec module, one artifact kind (it goes with `Intermediates`; the
+work usage gains `measuredBytes`).
 
 **Why.** (1) Memory: ≈ 250 B per seed, ≤ 6 MB per plane at the detector's 24 576 cap — a 300-frame OSC group holds
 ≈ 0.7 GB typical, 5.4 GB worst, uncounted by admission. (2) I2: a group-β move (an exclusion that moves the lower
@@ -4196,13 +4202,247 @@ median) re-runs pass 1 for every member today; with the spill only pass 2 re-run
 (R-OSP-9): the pass-1 artifact survives a re-key. A bound (drop the records over a budget, re-run pass 1 inside pass 2)
 is rejected: it computes twice by design, against the owner's "disk as cache" rule.
 
-**Bars.** (1) Byte-identical vs 11b: every `.athf`, `metrics` payload, group β and stage hash of a run equals
-3af1fd8d's on the same inputs, fresh and from the artifact. (2) A β move re-runs only pass 2: a run-level test (the
-`measure_reruns_pass_two_for_the_group_when_the_group_beta_moves` pattern) proves no frame read and no detection on a
-valid artifact. (3) Memory bounded to the admitted workers: pass-1 residency is the admitted workers' planes, not the
-group's. (4) The wall, interleaved against 11b: Measure on M42 (≤ 1.2 ×), and a re-run after an exclusion that moves
-the group β (it falls by the pass-1 share). (5) The owner's "disk as cache" rule: the artifact is the one stored copy,
-written once, read by pass 2 and by every later run whose key matches, never recomputed while valid.
+**Bars.** (1) Byte-identical vs 11b: every `.athf` (bytes), `metrics` payload minus its timings (design read:
+`durationMs` and each channel's `timings` hold wall-clock time; every other field byte-equal in the JSON), group β (f64
+bits) and stage hash (`metrics`, `fits.<p>`) of a run equals ec39507e's (3af1fd8d's values) on the same inputs, fresh and from the
+artifact. (2) A β move re-runs only pass 2: a run-level test (the
+`measure_reruns_pass_two_for_the_group_when_the_group_beta_moves` pattern) proves no pass-1 work on a valid artifact
+(design read: counted at `measure_frame_pass1`, the one entry of all pass-1 work). (3) Memory bounded to the admitted
+workers: at most `admission_n` frames' pass-1 records alive at once (a test-only live counter's peak); the pass-1
+results carry the own β only. (4) The wall, interleaved against ec39507e (3af1fd8d's code) on M42: Measure ≤ 1.2 ×;
+a re-run after an exclusion that moves the group β ≤ (1 − s/2) × 11b's (design read: s = the pass-1 share of 11b's
+fresh Measure, measured in the same bracket; a working spill saves ≈ s, a broken one ≈ 0). (5) Disk as cache: the
+artifact is the one stored copy, written once (its row upserted right after pass 1, so a cancelled run's re-run reuses
+it), read by pass 2 and by every later run whose key and source stamp match, never recomputed while valid.
+
+**Rulings of the design read (R11c-1…R11c-6; README R-OSP-9, its 11c amendment).**
+- **R11c-1 stored vs derived.** Stored, per plane: the `PlanePrep` verbatim, the head's `adapter_detect_ms` and
+  `own_phases`, the pass-1 wall; per frame: `w`, `h`, the header gain, `read_ms`, `elapsed`, `beta_own`, the source
+  stamp. Rebuilt from `opts` + plane index + plane count + the stored gain: the head's detector and module options,
+  through ONE builder `module_options` that `adapter_head` itself calls (no second construction; `finish_plane` reads
+  only `domain`, `psf_model`, `fit`, `mask`, `diagnostics`, `cfa_site_share`). Timings: the stored pass-1 phase times
+  are the measurement's own (the `metrics` cache-hit convention: a reused row keeps its timings); pass 2 adds its read
+  and fit time; the Measure `StageTiming` is this run's wall, the only timing the panel shows.
+- **R11c-2 format.** postcard (already a core dependency; f64 as 8 raw LE bytes, so NaN, ±inf and every f64 round-trip
+  exactly; ≈ 160 B a seed against ≈ 250 B in memory) behind a hand-rolled header in `.athf`'s style: `b"ATHM"` · u16
+  `PASS1_ARTIFACT_VERSION` = 1 · u32 `MEASURE_VERSION` · u32 head length · u64 xxh3 of the head · the head (postcard
+  `Pass1Head`: stamp, w, h, own βs) · u64 body length · the body (postcard) · u64 xxh3 of every byte before it. JSON is
+  refused: the records hold NaN and ±inf (`SaturationPlane::UNTESTED`, `top3x3 = −inf`, a failed verdict's NaNs).
+  postcard is not self-describing, so a golden pin of a hand-built record (length + xxh3) fails on any layout change
+  and forces a version bump; a refused decode (magic, version, measure version, checksum, length) is a `warn!` and
+  pass 1 re-runs, never a mis-decode. `PASS1_ARTIFACT_VERSION` versions the bytes, `MEASURE_VERSION` the numbers (in
+  the subtree, so in the key; in the header as a loud second check). The key folds the format version too, so a bump
+  re-keys every row (stale, `debug!`) instead of a warn per frame.
+- **R11c-3 key.** `pass1_hash_for(cfg, calib) = stage_hash(&measurement_subtree(cfg), &[calib,
+  "measure_pass1:v<PASS1_ARTIFACT_VERSION>"], &[])`: never a `metrics` key (those fold `measure_beta:…` or nothing),
+  independent of the group β. `Auto` only: `Moffat4` / `Fixed` keep the single pass and write nothing.
+- **R11c-4 identity.** The stamp is the read guard's `FileIdentity` at pass 1's first plane read: size and mtime (signed
+  ns since the epoch; `None` where the filesystem has none). Usable iff it equals the calibrated file's identity now;
+  else stale → pass 1 re-runs (`debug!` when found before use, `warn!` when the file changed after this run validated
+  it), never an exclusion. Pass 2's own read guard is unchanged: a change between its plane reads is still refused.
+- **R11c-5 flow.** (0) Per member, on the controller: the `metrics` row's own β (`pass1_own_betas`, unchanged), else the
+  `measured` row (`is_fresh` at `pass1_hash_for`) + `read_pass1_head` + the stamp + the plane count → the head's own β;
+  else pass 1 is owed. (1) Fanned out: `measure_frame_pass1` → `write_pass1` → the records dropped IN the worker, which
+  returns the own β and the written file's identity; the `measured` rows are upserted on the controller at once. (2)
+  The group β. (3) Per member needing pass 2, its source: the artifact (validated in (0) or (1), or validated now for a
+  member whose own β came from its row) or pass 1 in the worker (11b's arm, for a member with no valid artifact — the
+  upgrade ripple — which writes it). The worker `read_pass1`s (checksum, stamp) and falls back to pass 1 on any
+  refusal. `force_fresh` (`rerun_from` ≤ Measure) skips the artifact as it skips the `metrics` row: pass 1 runs and the
+  artifact is overwritten in place. A write failure (disk full) is a `warn!`, no row, the records dropped and pass 1
+  re-run in that member's pass-2 worker — twice only on failure, never held, so bar 3 holds unconditionally (holding
+  is refused: on a full disk the Mac cannot swap). Residency: each phase holds at most one frame's records per
+  admitted worker; `fan_out`'s results hold the own β (1) and `(m, fits)` (3, as before). The progress rule is
+  unchanged: a member whose pass 1 ran in this run's phase 1 ticks its second half only.
+- **R11c-6 lifecycle.** `measured/` and its rows go with `Intermediates` and `All` (not with `metrics`: a
+  re-calibration rewrites the calibrated file, and its new stamp stales every artifact anyway); an excluded frame's
+  artifact stays (a restore reuses it); the project sweep drops its rows as every kind's (rows only). `WorkUsage` gains
+  `measured_bytes` (TS `measuredBytes`, `ts_contract`); no Tauri / web command changes (both hosts already call
+  `paths::work_usage` / `cleanup_work` through `api::stacking`). The space estimate gains no term (≈ 1.9 % of the
+  calibrated term; its doc names it with the other uncounted intermediates). The plan gate is unchanged
+  (`gate_measure_betas` reads `metrics` only: a member whose own β lives only in its artifact reads unresolved there,
+  11b's conservative rule). Upgrade: no artifact on the first run; a member whose `metrics` row holds its pass 1 runs
+  pass 1 inside pass 2 once, writing it.
+
+**Files:**
+- Create: `crates/athenaeum-core/src/stacking/pass1_artifact.rs` (the codec, `PASS1_ARTIFACT_KIND`, its tests;
+  hand-formatted: the `rustfmt` rule names only `star_measure/*.rs`) and its `mod` line in `stacking/mod.rs`.
+- Modify (derives only, no value moves; `rustfmt` by explicit path): `star_measure/mod.rs` (`PlanePrep`,
+  `PhaseTimings`, `SnrNoise`; `#[cfg(test)] PlanePrep::for_pin`, the encoding pin), `domain.rs` (`NoiseModel`,
+  `SkyLevel`), `fit.rs` (`Seed`, `SeedPass`, `SeedRegion`, `WidthStart`, `FitTrace`), `seeds.rs` (`FieldWidth`,
+  `DetectionReport`, `WidthEnvelope`, `NoiseCorrelation`), `photometry.rs` (`SaturationPlane`, `SaturationVerdict`);
+  `NoiseSource` and `RefusalReason` already derive both.
+- Modify (hand edits only): `stacking/measure.rs` (`module_options`, the record view and `FramePass1::from_record`,
+  `FramePass1::source`, the `#[cfg(test)]` hooks `PASS1_LOG` and `Pass1Live`), `stacking/plan.rs` (`pass1_hash_for`, its
+  golden), `stacking/run.rs` (`measure_group_two_pass`: `Member.pass1` → a `Pass1Source`; its doc's "Cost, plainly"
+  paragraph replaced by the spill; the tests), `stacking/paths.rs` (`measured_root` / `measured_dir` / `measured_path`,
+  `WorkUsage`, `cleanup_work`, `INTERMEDIATE_ARTIFACT_KINDS` and its doc, `estimate_bytes`' doc).
+- Modify: `src/types/stacking.ts` (generated `measuredBytes`), `docs/stacking/README.md` (R-OSP-9's 11c amendment:
+  R11c-1…6, the bars and Step 5's numbers), `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md` (§9.3 one
+  paragraph, §9.5 the `measured/` line). No new log field (`frame_id`, `path`, `error`, `reason`, `count`).
+- Lab (athenaeum-lab, committed and pushed): `harness/acceptance/clone-before.sh` (Task 13's recipe exactly as Task 13
+  states it, landed here; allow-list: the three before trees + `star-lab-mono2`), `tier1/tier1-run.sh`
+  (`ATH_ACC_RERUN_FROM`, Task 13's edit, landed here), `tier1/tier1-extract.py` (`--measure-phases`: the pass-1
+  share), `tier1/tier1-compare.py` (`--measure-identity`: `.athf` sha256, payload minus timings, group β, keys; every
+  connect `immutable=1`), `results/plan-a/t11c-wall/`.
+- Earlier tests this task edits (ruling F14): `measure_reruns_pass_two_for_the_group_when_the_group_beta_moves` (its
+  doc and the pass-1 counts), `moffat4_measure_is_one_pass_and_unchanged` (+ no `measured` row: a pin line). No
+  `WorkUsage` literal exists outside `work_usage`.
+
+**Interfaces:**
+- Produces:
+
+```rust
+// stacking/pass1_artifact.rs
+pub const PASS1_ARTIFACT_KIND: &str = "measured";
+pub const PASS1_ARTIFACT_VERSION: u16 = 1;
+/// The calibrated file's identity at pass 1's first plane read (the read guard's `FileIdentity`, stored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStamp { pub len: u64, pub modified_ns: Option<i128> }
+/// What step (0) reads without the body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pass1Head { pub source: Option<SourceStamp>, pub width: u32, pub height: u32, pub beta_own: Vec<f64> }
+#[derive(Debug)]
+pub enum Pass1ArtifactError { BadMagic { found: [u8; 4] }, BadVersion { found: u16 }, BadMeasureVersion { found: u32 },
+    Checksum, Truncated(String), Decode(postcard::Error),
+    Stale { stored: Option<SourceStamp>, now: Option<SourceStamp> }, Io(std::io::Error) }
+/// tmp + `rename_replace` as `write_fits`, through a borrowed view (no clone of the records); the bytes written.
+pub fn write_pass1(path: &Path, pass1: &FramePass1) -> std::io::Result<u64>;
+/// Magic, versions, the head and its xxh3; the body is not read.
+pub fn read_pass1_head(path: &Path) -> Result<Pass1Head, Pass1ArtifactError>;
+/// The whole record: the checksum, the stamp against `calibrated` now (`Stale`), the heads rebuilt from `opts`.
+pub fn read_pass1(path: &Path, calibrated: &Path, opts: &MeasureOptions) -> Result<FramePass1, Pass1ArtifactError>;
+
+// stacking/plan.rs
+pub(crate) fn pass1_hash_for(cfg: &StackingConfig, calibrated_hash: &str) -> String;
+// stacking/paths.rs, impl WorkingLayout
+pub fn measured_root(&self) -> PathBuf;                               // root/measured
+pub fn measured_path(&self, group_key: &str, stem: &str) -> PathBuf;  // root/measured/<group>/<stem>.athm
+// stacking/measure.rs
+impl FramePass1 { pub(crate) fn source(&self) -> Option<SourceStamp>; }
+#[cfg(test)] pub(crate) static PASS1_LOG: Mutex<Vec<PathBuf>>;       // one entry per `measure_frame_pass1` call
+#[cfg(test)] pub(crate) fn pass1_peak(dir: &Path) -> usize;           // peak live `FramePass1` of a calibrated dir
+```
+
+- [ ] **Step 1: RED, run level** (`stacking::run::tests`; one filter, `stacking::run::tests::measure_`). First the two
+  test-only hooks: `PASS1_LOG` pushed at the head of `measure_frame_pass1`; `Pass1Live`, a `#[cfg(test)]` field of
+  `FramePass1` counting live values and their peak per calibrated directory (every construction carries one; the
+  destructurings gain `..`). Then, each on `seed_star_group`'s four mono frames with the test pool's one thread
+  (admission 1), "log" = `PASS1_LOG` entries under the test's own tree, nothing referencing Step 2's API:
+  - `measure_reruns_pass_two_…` extended: log 4 after run 1, 0 after run 2, **0 after run 3** (the β move); four
+    `measured` rows after run 1, their `created_at` unchanged by runs 2–3 (bar 5); the run-3 own-β assertion stays,
+    its doc now says the own β is the artifact's. HEAD: no rows, run 3 logs 4.
+  - `measure_pass1_residency_is_the_admitted_workers`: `pass1_peak` of the group's calibrated dir is 1 over a fresh
+    run and over a β-move run (bar 3). HEAD: 4 on the fresh run.
+  - `measure_pass1_from_the_artifact_after_a_lost_pass_two`: run 1; the `metrics` and `fits.0` rows deleted (a run
+    cancelled after pass 1) → run 2 logs 0, four `metrics` rows again, the group β's f64 bits equal. HEAD: 4.
+  - `measure_pass1_artifact_of_a_changed_source_reruns_pass_one`: run 1; one calibrated file's mtime + 10 s
+    (`File::set_modified`), every `fits.0` row deleted → run 2 logs exactly that file, excludes nothing. HEAD: 4.
+  - `measure_pass1_corrupt_artifact_is_recomputed`: run 1; one byte of one `.athm` body flipped, `fits.0` rows
+    deleted → run 2 logs exactly that frame, excludes nothing. HEAD: no `measured` row to corrupt (the setup's
+    `expect`).
+  - `measure_pass1_write_failure_recomputes_in_pass_two`: a file planted at `<root>/measured/<group>` → run 1: no
+    `measured` row, four `metrics` rows, log 8, peak 1. HEAD: log 4, peak 4.
+  - `measure_pass1_rerun_from_measure_recomputes_it`: run 1; run 2 with `rerun_from = Some(Stage::Measure)` → log 4,
+    four `measured` rows. HEAD: no rows.
+  - `measure_pass1_upgrade_runs_it_inside_pass_two_once`: run 1; `delete_artifacts(…, &["measured"])` and the
+    directory removed; the β moved (the extended test's lowered-own-β edit) → run 2 logs 4 and leaves four rows; moved
+    again (two other rows lowered) → run 3 logs 0. HEAD: no rows.
+  Run: each fails for the HEAD reason named.
+
+- [ ] **Step 2: RED, codec, key and lifecycle** (they do not compile at HEAD: the module, `pass1_hash_for`,
+  `measured_bytes` are absent):
+  - `stacking::pass1_artifact::tests`: `round_trips_a_mono_and_a_three_plane_first_pass_bit_exactly` (a real
+    `measure_frame_pass1` on `measure.rs`'s `write` fixtures, mono and 3-plane, and the hand-built `for_pin` record
+    with NaN, ±inf and a starless plane: re-encoding the read-back value gives the written bytes);
+    `pass_two_from_a_read_back_first_pass_equals_pass_two_in_memory` (mono and 3-plane: two pass-1 runs, one through
+    the file, each through `measure_frame_pass2` at one β — the `FrameMeasurement` minus `duration_ms` / `timings` and
+    every plane's fits Debug-equal, `a_two_member_group_is_fitted_at_the_shared_beta`'s convention);
+    `refuses_bad_magic_versions_checksum_and_truncation` (one typed arm each, never `Ok`);
+    `the_head_reads_without_the_body` (a corrupt body: the head `Ok`, `read_pass1` `Checksum`; a flipped head byte: the
+    head refused); `a_changed_source_reads_stale` (`Stale` with both stamps).
+  - `stacking::plan::tests::pass1_hash_is_never_a_metrics_key`: ≠ `measurement_hash_for` at `Some(b)` for b ∈ {1.5,
+    3.3066, 4.0} and at `None`; moves with `measurement.maxStars` and with the calib hash; a golden literal beside
+    `stage_hashes_are_pinned_to_golden_literals`'; the extended run-level test's `measured` rows carry it.
+  - `stacking::paths::tests::measured_bytes_are_counted_and_intermediates_or_all_remove_them` (the `rej_bytes_…`
+    pattern: in `measured_bytes` and `total_bytes`; `Registered` keeps the directory and the rows, `Intermediates`
+    and `All` remove both).
+  - Pin (ruling F28, outside RED): `star_measure::tests::the_plane_prep_encoding_is_pinned` — `for_pin`'s postcard
+    bytes, length and xxh3 literal (hand-built values, so no platform's libm enters); a layout change fails it until
+    `PASS1_ARTIFACT_VERSION` moves.
+
+- [ ] **Step 3: Implement** R11c-1…R11c-6 in the Files order (derives → codec → key → paths → flow), each file's
+  filter green before the next. Then the pins (F28; green at HEAD and after):
+  `measure_pass1_spill_is_byte_identical_fresh_and_from_the_artifact` (run 1 fresh; `fits.0` rows deleted; run 2 from
+  the artifact; both against an in-memory `measure_frame_pass1` + `measure_frame_pass2` at the run's group β per frame:
+  `.athf` bytes, the payload minus timings, the group β's bits, every `metrics` / `fits.0` key — bar 1) and
+  `moffat4_measure_is_one_pass_and_unchanged` (+ no `measured` row, no `measured/`).
+
+- [ ] **Step 4: Gates.** `cargo test -p athenaeum-core --lib -- stacking:: --test-threads=4` (835 + the new, 0 failed,
+  2 ignored), `cargo test -p athenaeum-core --lib -- star_measure:: --test-threads=4` (172 + the pin),
+  `cargo check -p athenaeum-core --all-targets` (`star_probe` keeps `PlanesPass1` in memory), `cargo test -p
+  athenaeum-core --test ts_contract` (`TS_RS_WRITE=1` once for `measuredBytes`).
+
+- [ ] **Step 5: Bar 4, the wall (dev Mac only; one heavy job at a time; `memory_pressure` ≥ 30 % free and `df` ≥ 100 GiB
+  plus ≈ 10 GB before each run; Time Machine off — manual since 2026-10-04).** M42 = `~/.athenaeum-acc/star-lab-mono2`
+  set 107 (QHY268M, 12 lights, `stackwork/M_42/`). (a) `clone-before.sh` → `~/.athenaeum-acc/t11c-A` and `t11c-B` (each
+  a `cp -Rc` clone, its paths rewritten); A served from a worktree of ec39507e made as `rerun-build.sh` makes one
+  (submodules included, no catalog step), B from this branch; both release servers built before the bracket. (b) The
+  set's stored config read once (`get_stacking_config`; `measurement.psfModel` must read `auto`, printed): `base.json`
+  without an exclusion, `excl.json` with the frame of lowest `betaOwn` in A1's `metrics` rows (read `immutable=1`). (c)
+  The bracket A1 B1 A2 B2 A3 B3, each = (i) `ATH_ACC_SET_CONFIG=base.json ATH_ACC_RERUN_FROM=measure zsh
+  tier1/tier1-run.sh <repo> <clone> <port> 107` then (ii) the same with `excl.json` and `ATH_ACC_RERUN_FROM=reference`
+  (Measure not forced: its own cache decides), `tier1-extract.py <clone> --run-id N --measure-phases` after each; pair 3
+  runs A3(i) B3(i) A3(ii) B3(ii), so each state is compared before the next run overwrites it. Timed: the Measure
+  `StageTiming` (`tier1-extract.py`'s `stacking stage finished` line). Each (ii)'s `stacking_run_groups.beta` must
+  differ from its (i)'s, else the next-lowest frame, noted. (d) Bars, into `bars.txt`: **4a** the median over the pairs
+  of B(i) / A(i) ≤ 1.2; **4b** the median of B(ii) / A(ii) ≤ 1 − s/2, s = the median over A(i) of the pass-1 share
+  (`--measure-phases`: from the Measure admission event to `measure: group beta resolved`, over the Measure wall), 1 − s
+  printed as the expected ratio; **bar 1 on real data**, `tier1-compare.py --measure-identity` A3 vs B3 after (i) and
+  after (ii): 0 differences. Reported: the `.athm` bytes per plane (mean, max), B's `measuredBytes`, each run's wall.
+  (e) **Bar 1 on real colour data (owner, 2026-10-13; R11c-7).** After the M42 bracket, set 204
+  (`~/.athenaeum-acc/tierA-lnB-f1`, before run 5: `osc__NoFilter__bin1__180s` 105 frames + `mono__NoFilter__bin1__180s`
+  92; full-run wall 901 s) through `clone-before.sh` (a before tree, already on its allow-list) → `~/.athenaeum-acc/t11c-osc-A` /
+  `t11c-osc-B`, served by the same two builds. Runs A(i) B(i) A(ii) B(ii): (i) `ATH_ACC_RERUN_FROM=measure` with the
+  set's stored config (`measurement.psfModel` must read `auto`, printed); (ii) `ATH_ACC_RERUN_FROM=reference` with
+  the OSC member of lowest `betaOwn` in A(i)'s rows excluded (read `immutable=1`), its group β checked to move (else
+  the next-lowest, noted). Bar: `tier1-compare.py --measure-identity` A vs B after (i) and after (ii), **0
+  differences on both groups** (in (ii) the mono group is a cache hit on both sides; the OSC group is pass 2 from the
+  artifact on B, pass 1 + pass 2 on A). Information, not a bar: the OSC pass-1 share s, the (ii) ratio B / A, the
+  `.athm` bytes per plane on OSC (mean, max), B's `measuredBytes`. (≈ 1 h, ≈ 90 GB transient.)
+  (f) Every clone and the A worktree with its target deleted; the lab committed and pushed. A miss goes to the owner
+  with its numbers, before Task 12.
+
+- [ ] **Step 6: Docs; commit** (`one-star-path`, not pushed): R-OSP-9's 11c amendment (R11c-1…6, the gates, bars 1–5
+  with Step 5's numbers), spec §9.3 / §9.5.
+
+```
+feat(stacking): F-4b pass-1 spill - every Auto member's Measure first pass written once to measured/<group>/<stem>.athm (postcard records behind a magic, two versions and two checksums; keyed on the calib hash + measurement subtree, never the group beta; the source stamp stored, a changed file re-runs pass 1); a group-beta move re-runs only pass 2, pass-1 residency = the admitted workers (M42 Measure 0.99x, exclusion re-run 0.27x against 1 - s/2 = 0.62)
+```
+
+**Acceptance:** Step 1's eight fail at HEAD for the reasons named and pass; Step 2's pass; both pins hold; the gates
+green; on M42 bars 4a, 4b and bar 1 hold; on set 204 bar 1 holds on the OSC and the mono group, fresh and from the
+artifact. Carries: **Task 12** — a `PlanePrep` field bumps `PASS1_ARTIFACT_VERSION`
+(the pin fails until it does); **Task 13** — `clone-before.sh` (allow-list of four) and `ATH_ACC_RERUN_FROM` exist,
+its M.1 Measure includes the spill, its three datasets report the `.athm` bytes per plane; **the release notes** — the
+first run after the upgrade also writes `measured/` (≈ 1.9 % of the calibrated footprint: set 204, 0.94 GB beside 50 GB).
+
+**Outcome (2026-10-14; branch `one-star-path-t11c`, 6abffeb0 → a6a28f39 review fixes → 89958c3f; lab c4d9b92; not
+pushed).** Pass 1 now spills: every `Auto` member's Measure first pass is written once to
+`measured/<group>/<stem>.athm` (R11c-1 … R11c-6: the `PlanePrep` stored and the options rebuilt through one builder,
+postcard behind two checksums, a key independent of the group β, the source stamp, the controller/worker flow, the
+`Intermediates` lifecycle) and read back by pass 2; a group-β move re-runs pass 2 only (I2) and pass-1 residency is the
+admitted workers (the memory ruling). Review: 0 Critical / 2 Important / 3 Minor, all fixed (a6a28f39, 89958c3f).
+**The bars** (`t11c-wall/bars.txt`): 4a M42 fresh Measure B / A median 0.9885 against 1.2 PASS; 4b exclusion re-run
+0.2700 against 1 − s/2 = 0.6181 (s = 0.7638, expected 1 − s = 0.2362) PASS; bar 1 `--measure-identity` M42 (i) 0 /
+(ii) 0 and set 204 (OSC 105 + mono 92, R11c-7) (i) 0 / (ii) 0 PASS. Set 204, information: fresh Measure 678.7 → 643.0 s;
+exclusion re-run Measure 396.9 → 83.0 s (0.209), run wall 1021 → 691 s; OSC pass-1 share 0.533; `.athm` per plane 1.94 MB
+OSC / 3.63 MB mono; `measured/` 0.94 GB beside `calibrated/` 50 GB = about 1.9 % (the design read's "about 1 %" was
+low). Gates: `stacking::` 853 / 0 / 2 ignored, `star_measure::` 173, `check --all-targets` clean, `ts_contract`. Attempt 1
+of the driver stopped on a lab-tool bug (fixed, lab 6a8d4bb). Limits (README R-OSP-9, the 11c amendment): pass 2 still
+holds every member's `(FrameMeasurement, fits)` until persisted (C2); the golden pin is the only layout guard and
+`RefusalReason`'s variant order is format (C3); the plan gate reads `metrics` only (C4); no space-estimate term (C5).
+Carries: **Task 12** a `PlanePrep` field bumps `PASS1_ARTIFACT_VERSION`; **Task 13** the M.2 stage wall; **release
+notes** the first run after the upgrade also writes `measured/`.
 
 ---
 
@@ -4348,6 +4588,21 @@ reads β 99.96 at every brightness (F 4.1 vs the set's 2.0) — a frame-class it
 **Closed by Task 11b (2026-10-13).** Its M42 frame-β line is closed by definition (the stacking group β, README
 R-OSP-9: B2 is not a bar); the Measure-wall bar (M.1) now covers the two-pass Measure.
 
+**Added by Task 11c (owner, 2026-10-14): M.2, the Measure STAGE wall on real data.** M.1 judges only the lab m42
+corpus batch on the runner (74.7 s, bar 159.8 s) — small frames, where the cost does not show. On set 204 (197 frames:
+105 OSC + 92 mono, 407 planes of 6248×4176, dev Mac, admission 5 on a 10-thread pool) the stage went **3.62 min before
+Plan A** (`tierA-lnB-f1` run 5; per-plane medians read 0.04 / background 0.32 / noise 0.38 / detect 0.16 / **fit
+0.21** / total 1.68 s) **→ 11.31 min at ec39507e** (= the 11c branch, 11c Step 5 run `OA-i`; read 0.12 / background
+0.44 / noise 0.39 / detect 0.29 / **fit 2.14** / total 5.72 s): **3.1×, almost all of it the fit (10×)**. The owner:
+"more than 3 times slower than it was and 4 times slower than the ERP does it". Task 13: (1) the Measure stage wall
+and the per-plane sub-stage medians on each of its three datasets, beside the ERP's own measurement time on the same
+frames; (2) a profile of the fit's 2.1 s a plane — stars fitted per plane against the 24 576 cap, LM iterations per
+fit, the verdict pass's share, the two-pass share, the second read; (3) **bar M.2 (owner-accepted 2026-10-14; the owner
+may amend it): set 204's Measure stage ≤ 1.2 × 3.62 min = 4.3 min on the dev Mac, interleaved bracket, with the ERP's
+time printed beside**. This checkpoint owns no fix: a miss opens a Measure-performance task (scope by the owner)
+before Plan A closes, under the method rules — a speedup keeps every `.athf` bit-identical or is judged on the whole
+group at master level, and one that misses a tolerance row is reverted, never tuned toward it.
+
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
 `harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
 tier1/tier1-compare.py}` plus the controller's `~/.athenaeum-acc/lnB/hc11-run.sh`, copied into
@@ -4376,7 +4631,8 @@ taken only on the owner's word, is `prepare-catalog.sh` from the template into a
   athenaeum checkout; the set-182 pin `69845` unchanged; it reads `$W/c11-config.json` FROM THE TREE IT RUNS, as
   today), `harness/acceptance/tier1/tier1-run.sh` (`ATH_ACC_SET_REFERENCE=<file>` — a file path, like
   `ATH_ACC_SET_CONFIG`, ruling F42 — holding the `set_frame_set_reference` argument, sent once after
-  `set_stacking_config`, echoed into `run.txt`, a refusal stops the run; `ATH_ACC_RERUN_FROM=<stage>` replaces the
+  `set_stacking_config`, echoed into `run.txt`, a refusal stops the run; `ATH_ACC_RERUN_FROM=<stage>` (EXISTS since Task 11c in
+  `tier1-run.sh`; Task 13 adds it to `project-run.sh` and `hc11-run.sh`) replaces the
   hardcoded `"calibrate"` in the `start_stacking` body at `tier1-run.sh:57`, default `calibrate`;
   `ATH_ACC_EXPECT_REFERENCE=<frame id>`: the run stops before `start_stacking` when `get_stacking_plan`'s
   `reference` names another frame),
@@ -4391,7 +4647,7 @@ taken only on the owner's word, is `prepare-catalog.sh` from the template into a
   run is the AFTER run, so every line that reads a clone's DB as its base names the before run, ruling F19 as
   folded); EVERY `sqlite3.connect` in both scripts — `tier1-compare.py:149,249,262,277,643,651` — becomes
   `sqlite3.connect(f"file:{path}?immutable=1", uri=True)` (ruling F19: a plain connect can write a before tree's
-  `-wal`/`-shm`)), `harness/acceptance/clone-before.sh` (new: the recipe's steps (1)–(4) below; refuses a target
+  `-wal`/`-shm`)), `harness/acceptance/clone-before.sh` (EXISTS since Task 11c, allow-list of four: the three before trees + `star-lab-mono2`; Task 13 extends it, not creates it: the recipe's steps (1)–(4) below; refuses a target
   under anything but `~/.athenaeum-acc/` and a source that is not one of the three before trees; the ONE script that
   opens a clone's DB writable), `docs/stacking/README.md` (the acceptance run, R-OSP-11),
   `docs/superpowers/research/2026-10-XX-star-measurement-after-plan-a.md` (§4 "Real data", written in Task 14)

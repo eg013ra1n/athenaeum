@@ -22,6 +22,7 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{LocationScale, ScaleEstimator};
 use crate::integration::IntegrationError;
 use crate::stacking::config::SeedSource;
+use crate::stacking::pass1_artifact::{Pass1ArtifactError, Pass1Head, SourceStamp};
 use crate::star_measure as sm;
 
 // `ADU_SCALE` (calibrated frames are float32 in `[0, 1]`; the detector and
@@ -730,6 +731,59 @@ enum Detector {
     Matched(f64),
 }
 
+/// The detector the options and the probe's override select. `Fast` means "whatever the options say", so the two never
+/// contradict each other silently. The one rule [`adapter_head`] and a stored first pass's rebuild
+/// ([`FramePass1::from_record`]) share.
+fn resolve_detector(seed_source: SeedOverride, opts: &MeasureOptions) -> Detector {
+    match seed_source {
+        SeedOverride::Fast => match opts.seed_source {
+            SeedSource::MatchedFilter => Detector::Matched(opts.seed_threshold),
+            SeedSource::Peak => Detector::Peak,
+            SeedSource::Structure => Detector::Structure,
+        },
+        SeedOverride::Full => Detector::Full,
+        SeedOverride::Structure => Detector::Structure,
+        SeedOverride::MatchedFilter { threshold } => Detector::Matched(threshold),
+    }
+}
+
+/// The module's options for one plane (Plan A Task 11c, R11c-1): the ONE construction [`adapter_head`] and a stored
+/// first pass's rebuild share. `seeds` are the ones the adapter's detector handed in (ignored for the matched filter,
+/// which detects inside the module); `noise` is the Median3 arm's precomputed model. The stored first pass rebuilds
+/// with `noise = None`: [`sm::finish_plane`] reads only `domain`, `psf_model`, `fit`, `mask`, `diagnostics` and
+/// `cfa_site_share` of these options, and the model it needs is in the stored `PlanePrep`.
+#[allow(clippy::too_many_arguments)]
+fn module_options(
+    opts: &MeasureOptions,
+    detector: Detector,
+    seeds: Vec<Seed>,
+    noise: Option<sm::NoiseModel>,
+    diagnostics: bool,
+    colour: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    cfa_site_share: Option<f64>,
+) -> sm::MeasureOptions {
+    sm::MeasureOptions {
+        domain: sm::Domain::Calibrated { gain_e_per_unit },
+        psf_model: opts.psf_model,
+        max_stars: opts.max_stars,
+        seeds: match detector {
+            Detector::Matched(threshold) => sm::SeedSpec::MatchedFilter { threshold },
+            _ => sm::SeedSpec::Given(seeds),
+        },
+        fit: FitParams::default(),
+        noise,
+        scale_estimator: opts.scale_estimator,
+        diagnostics,
+        mask: None,
+        field_width: None,
+        colour,
+        pixel_noise,
+        cfa_site_share,
+    }
+}
+
 /// What the adapter decides and measures before the module (its detector, the seeds it hands in, the Median3 arm's
 /// noise model), kept until the module's result is mapped onto a [`PlaneMeasurement`].
 struct AdapterHead {
@@ -758,16 +812,7 @@ fn adapter_head(
     // A run selects its detector through the config's `seed_source`; `seed_override` is the probe-level override
     // the dev harnesses pass. `Fast` means "whatever the options say", so the two never contradict each other
     // silently.
-    let detector = match seed_source {
-        SeedOverride::Fast => match opts.seed_source {
-            SeedSource::MatchedFilter => Detector::Matched(opts.seed_threshold),
-            SeedSource::Peak => Detector::Peak,
-            SeedSource::Structure => Detector::Structure,
-        },
-        SeedOverride::Full => Detector::Full,
-        SeedOverride::Structure => Detector::Structure,
-        SeedOverride::MatchedFilter { threshold } => Detector::Matched(threshold),
-    };
+    let detector = resolve_detector(seed_source, opts);
 
     // The ADU-scaled copy exists only for the detectors that read it (Task 7, C5). The matched filter runs inside
     // the module on the module's own working copy, the only one on that path.
@@ -940,24 +985,17 @@ fn adapter_head(
         Some((model, phases)) => (Some(model), Some(phases)),
         None => (None, None),
     };
-    let module_opts = sm::MeasureOptions {
-        domain: sm::Domain::Calibrated { gain_e_per_unit },
-        psf_model: opts.psf_model,
-        max_stars: opts.max_stars,
-        seeds: match detector {
-            Detector::Matched(threshold) => sm::SeedSpec::MatchedFilter { threshold },
-            _ => sm::SeedSpec::Given(seeds),
-        },
-        fit: FitParams::default(),
+    let module_opts = module_options(
+        opts,
+        detector,
+        seeds,
         noise,
-        scale_estimator: opts.scale_estimator,
         diagnostics,
-        mask: None,
-        field_width: None,
         colour,
         pixel_noise,
+        gain_e_per_unit,
         cfa_site_share,
-    };
+    );
     AdapterHead {
         detector,
         module_opts,
@@ -1385,12 +1423,287 @@ pub struct FramePass1 {
     identity: Option<FileIdentity>,
     read_ms: Vec<u64>,
     elapsed: Duration,
+    /// The frame's header gain, the one every plane's options were built with (stored: the rebuild needs it).
+    gain: Option<f64>,
+    /// Test-only: counts this value among the live first passes of its calibrated directory ([`pass1_peak`]).
+    #[cfg(test)]
+    _live: Pass1Live,
+}
+
+/// Test-only: one entry per [`measure_frame_pass1`] call — the one entry of all first-pass work (Task 11c, bar 2). A
+/// test reads the entries under its own temp tree, as `FITS_WRITE_FAILURE_LOG` is read.
+#[cfg(test)]
+pub(crate) static PASS1_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: `(directory, remaining)` — once `remaining` first passes of frames under the directory have finished,
+/// the run's cancel flag is set (a deterministic mid-phase-1 cancel; Task 11c review I2). The artifact is written by
+/// the caller after `measure_frame_pass1` returns, so the cancel lands between that write and the next frame.
+#[cfg(test)]
+pub(crate) static PASS1_CANCEL_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: per calibrated directory, `(live, peak)` count of [`FramePass1`] values (Task 11c, bar 3).
+#[cfg(test)]
+static PASS1_LIVE: std::sync::Mutex<Vec<(std::path::PathBuf, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: a live [`FramePass1`]'s registration in [`PASS1_LIVE`], undone on drop.
+#[cfg(test)]
+struct Pass1Live(std::path::PathBuf);
+
+#[cfg(test)]
+impl Pass1Live {
+    fn new(frame: &Path) -> Pass1Live {
+        let dir = frame.parent().unwrap_or(frame).to_path_buf();
+        let mut all = PASS1_LIVE.lock().unwrap();
+        match all.iter_mut().find(|(d, _, _)| *d == dir) {
+            Some((_, live, peak)) => {
+                *live += 1;
+                *peak = (*peak).max(*live);
+            }
+            None => all.push((dir.clone(), 1, 1)),
+        }
+        Pass1Live(dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Pass1Live {
+    fn drop(&mut self) {
+        let mut all = PASS1_LIVE.lock().unwrap();
+        if let Some((_, live, _)) = all.iter_mut().find(|(d, _, _)| *d == self.0) {
+            *live -= 1;
+        }
+    }
+}
+
+/// Test-only: the most [`FramePass1`] values of `dir` (a calibrated directory) ever alive at once.
+#[cfg(test)]
+pub(crate) fn pass1_peak(dir: &Path) -> usize {
+    PASS1_LIVE
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(d, _, _)| d == dir)
+        .map_or(0, |(_, _, peak)| *peak)
 }
 
 impl FramePass1 {
     /// Every plane's own β, in plane order.
     pub fn beta_own(&self) -> &[f64] {
         self.planes.beta_own()
+    }
+
+    /// The calibrated file's identity at this first pass's first plane read (Plan A Task 11c, R11c-4).
+    pub(crate) fn source(&self) -> Option<SourceStamp> {
+        self.identity.map(stamp_of)
+    }
+
+    /// What a controller reads without the body (Task 11c, R11c-2).
+    pub(crate) fn head(&self) -> Pass1Head {
+        Pass1Head {
+            source: self.source(),
+            width: self.planes.w as u32,
+            height: self.planes.h as u32,
+            beta_own: self.planes.beta_own.clone(),
+        }
+    }
+
+    /// The records a stored first pass keeps (Task 11c, R11c-1), borrowed: nothing is cloned to be written.
+    pub(crate) fn body(&self) -> Pass1BodyRef<'_> {
+        Pass1BodyRef {
+            gain: self.gain,
+            read_ms: &self.read_ms,
+            elapsed: self.elapsed,
+            planes: self
+                .planes
+                .heads
+                .iter()
+                .zip(&self.planes.preps)
+                .zip(&self.planes.walls)
+                .map(|((head, prep), &wall)| PlaneRecordRef {
+                    prep,
+                    adapter_detect_ms: head.adapter_detect_ms,
+                    own_phases: head.own_phases,
+                    wall,
+                })
+                .collect(),
+        }
+    }
+
+    /// A stored first pass read back (Task 11c, R11c-1 / R11c-4): the heads rebuilt from `opts`, the plane index, the
+    /// plane count and the stored gain through the ONE [`module_options`] builder, the read guard seeded with the
+    /// identity of `calibrated` NOW, which must equal the stored stamp ([`Pass1ArtifactError::Stale`] otherwise).
+    pub(crate) fn from_record(
+        head: Pass1Head,
+        body: Pass1Body,
+        calibrated: &Path,
+        opts: &MeasureOptions,
+    ) -> Result<FramePass1, Pass1ArtifactError> {
+        let n = head.beta_own.len();
+        if n == 0 || body.planes.len() != n || body.read_ms.len() != n {
+            return Err(Pass1ArtifactError::Truncated(format!(
+                "{} planes in the head, {} records and {} read times in the body",
+                n,
+                body.planes.len(),
+                body.read_ms.len()
+            )));
+        }
+        let now = FileIdentity::of(calibrated)?;
+        if head.source != Some(stamp_of(now)) {
+            return Err(Pass1ArtifactError::Stale {
+                stored: head.source,
+                now: Some(stamp_of(now)),
+            });
+        }
+        let detector = resolve_detector(SeedOverride::Fast, opts);
+        let colour = n == 3;
+        let mut heads = Vec::with_capacity(n);
+        let mut preps = Vec::with_capacity(n);
+        let mut walls = Vec::with_capacity(n);
+        for (p, record) in body.planes.into_iter().enumerate() {
+            let seeds = match detector {
+                Detector::Matched(_) => Vec::new(),
+                _ => record.prep.seeds().to_vec(),
+            };
+            heads.push(AdapterHead {
+                detector,
+                module_opts: module_options(
+                    opts,
+                    detector,
+                    seeds,
+                    None,
+                    false,
+                    colour,
+                    frame_pixel_noise(n),
+                    body.gain,
+                    colour.then(|| [0.25, 0.5, 0.25][p]),
+                ),
+                adapter_detect_ms: record.adapter_detect_ms,
+                own_phases: record.own_phases,
+            });
+            preps.push(record.prep);
+            walls.push(record.wall);
+        }
+        Ok(FramePass1 {
+            planes: PlanesPass1 {
+                w: head.width as usize,
+                h: head.height as usize,
+                heads,
+                preps,
+                beta_own: head.beta_own,
+                walls,
+            },
+            identity: Some(now),
+            read_ms: body.read_ms,
+            elapsed: body.elapsed,
+            gain: body.gain,
+            #[cfg(test)]
+            _live: Pass1Live::new(calibrated),
+        })
+    }
+}
+
+/// One plane's stored first-pass record, borrowed for writing (Task 11c, R11c-1): the `PlanePrep` verbatim, the head's
+/// detection time and own phase times, the plane's pass-1 wall. The detector and the module options are not here:
+/// they are rebuilt from the options, the plane index and count and the stored gain.
+#[derive(Serialize)]
+pub(crate) struct PlaneRecordRef<'a> {
+    pub(crate) prep: &'a sm::PlanePrep,
+    pub(crate) adapter_detect_ms: u64,
+    pub(crate) own_phases: Option<sm::PhaseTimings>,
+    pub(crate) wall: Duration,
+}
+
+/// A frame's stored first-pass body, borrowed for writing (the postcard bytes are those of [`Pass1Body`]).
+#[derive(Serialize)]
+pub(crate) struct Pass1BodyRef<'a> {
+    pub(crate) gain: Option<f64>,
+    pub(crate) read_ms: &'a [u64],
+    pub(crate) elapsed: Duration,
+    pub(crate) planes: Vec<PlaneRecordRef<'a>>,
+}
+
+/// [`PlaneRecordRef`], read back.
+#[derive(Deserialize)]
+pub(crate) struct PlaneRecord {
+    pub(crate) prep: sm::PlanePrep,
+    pub(crate) adapter_detect_ms: u64,
+    pub(crate) own_phases: Option<sm::PhaseTimings>,
+    pub(crate) wall: Duration,
+}
+
+/// [`Pass1BodyRef`], read back.
+#[derive(Deserialize)]
+pub(crate) struct Pass1Body {
+    pub(crate) gain: Option<f64>,
+    pub(crate) read_ms: Vec<u64>,
+    pub(crate) elapsed: Duration,
+    pub(crate) planes: Vec<PlaneRecord>,
+}
+
+impl Pass1Body {
+    /// The borrowed view whose bytes are this value's.
+    #[cfg(test)]
+    pub(crate) fn view(&self) -> Pass1BodyRef<'_> {
+        Pass1BodyRef {
+            gain: self.gain,
+            read_ms: &self.read_ms,
+            elapsed: self.elapsed,
+            planes: self
+                .planes
+                .iter()
+                .map(|r| PlaneRecordRef {
+                    prep: &r.prep,
+                    adapter_detect_ms: r.adapter_detect_ms,
+                    own_phases: r.own_phases,
+                    wall: r.wall,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Whether a stored head describes `calibrated` as it is now (the controller's check in step (0), Plan A Task 11c,
+/// R11c-5): the stamp equals the file's identity now ([`Pass1ArtifactError::Stale`] otherwise) and the geometry and
+/// the plane count are the file's own (a header probe, no pixel read).
+pub(crate) fn check_pass1_head(
+    head: &Pass1Head,
+    calibrated: &Path,
+) -> Result<(), Pass1ArtifactError> {
+    let now = stamp_of(FileIdentity::of(calibrated)?);
+    if head.source != Some(now) {
+        return Err(Pass1ArtifactError::Stale {
+            stored: head.source,
+            now: Some(now),
+        });
+    }
+    let reader = PlaneReader::open(calibrated)
+        .map_err(|e| Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}"))))?;
+    let file = (reader.width(), reader.height(), reader.channels());
+    let stored = (
+        head.width as usize,
+        head.height as usize,
+        head.beta_own.len(),
+    );
+    if file != stored {
+        return Err(Pass1ArtifactError::Mismatch(format!(
+            "the head says {stored:?} (width, height, planes), the file is {file:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// A read guard identity as the stored stamp: the size and the modification time as signed nanoseconds since the Unix
+/// epoch.
+fn stamp_of(id: FileIdentity) -> SourceStamp {
+    SourceStamp {
+        len: id.len,
+        modified_ns: id.modified.map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => after.as_nanos() as i128,
+            Err(before) => -(before.duration().as_nanos() as i128),
+        }),
     }
 }
 
@@ -1401,12 +1714,15 @@ pub fn measure_frame_pass1(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<FramePass1, IntegrationError> {
+    #[cfg(test)]
+    PASS1_LOG.lock().unwrap().push(path.to_path_buf());
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
     let n = reader.channels();
     let mut read_ms = vec![0u64; n];
     let mut guard = ReadGuard::new(path);
+    let gain = gain_from_header(path);
     let _span = tracing::debug_span!("measure_frame_pass1", path = %path.display()).entered();
     let planes = measure_planes_pass1(
         n,
@@ -1417,14 +1733,27 @@ pub fn measure_frame_pass1(
         SeedOverride::Fast,
         false,
         frame_pixel_noise(n),
-        gain_from_header(path),
+        gain,
         |plane| read_guarded(&reader, &mut guard, cancel, &mut read_ms, plane),
     )?;
+    #[cfg(test)]
+    {
+        let mut hooks = PASS1_CANCEL_AFTER.lock().unwrap();
+        if let Some((_, remaining)) = hooks.iter_mut().find(|(dir, _)| path.starts_with(dir)) {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     Ok(FramePass1 {
         planes,
         identity: guard.first,
         read_ms,
         elapsed: start.elapsed(),
+        gain,
+        #[cfg(test)]
+        _live: Pass1Live::new(path),
     })
 }
 
@@ -1460,6 +1789,7 @@ pub fn measure_frame_pass2(
         identity,
         mut read_ms,
         elapsed,
+        ..
     } = pass1;
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
@@ -1509,7 +1839,7 @@ pub(crate) mod tests {
     /// `(0.1..0.3)·amp_scale`, background 0.08, Gaussian noise `noise` —
     /// [`crate::test_support::fixture_field`] (moved there in Plan A Task 2,
     /// ruling F44, so the star-measurement module's own tests build it too).
-    fn field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>, usize, usize) {
+    pub(crate) fn field(seed: u64, amp_scale: f64, noise: f32) -> (Vec<f32>, usize, usize) {
         crate::test_support::fixture_field(seed, amp_scale, noise)
     }
 
@@ -1537,7 +1867,13 @@ pub(crate) mod tests {
         assert!(matches!(g.check(), Err(IntegrationError::Io(_))));
     }
 
-    fn write(dir: &Path, name: &str, planes: &[&[f32]], w: usize, h: usize) -> PathBuf {
+    pub(crate) fn write(
+        dir: &Path,
+        name: &str,
+        planes: &[&[f32]],
+        w: usize,
+        h: usize,
+    ) -> PathBuf {
         let mut all = Vec::new();
         for p in planes {
             all.extend_from_slice(p);

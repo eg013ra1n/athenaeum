@@ -101,7 +101,7 @@ pub enum PsfModel {
 }
 
 /// A detection to fit: centroid, background-subtracted peak and flux.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Seed {
     pub x: f64,
     pub y: f64,
@@ -704,7 +704,7 @@ pub(crate) struct FitScratch {
 
 /// What [`fit_one`] records about one seed beside its result: [`FitDiagnostics`] without the seed index and the
 /// final outcome, which only the duplicate drop settles.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct FitTrace {
     region_radius: u16,
     background_start: f64,
@@ -758,7 +758,7 @@ impl FitTrace {
 /// The star's width start: its FWHM `F_start` (its own half-maximum width where readable, else the field width —
 /// Task 6b round 1, ruling R1) and the width-start box's rim median, the level the donut test's ring radius reads the
 /// box's moments above (round 3, ruling R8).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct WidthStart {
     fwhm: f64,
     /// The median of the box's outer 1-px rim; NaN when the rim holds no present pixel.
@@ -1168,7 +1168,7 @@ fn fit_one(
 
 /// A seed's region as [`fit_one`] and the verdict pass ([`seed_pass`]) both read it (steps 1–3): the width-start
 /// box radius `rb`, the width start, the starting and final radii and the rim median `b0` (PA-12).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct SeedRegion {
     cx: i64,
     cy: i64,
@@ -1310,7 +1310,7 @@ fn region_steps(
 /// width, params), so the frame's fits and every β-candidate pass on the same field width reuse the record instead of
 /// recomputing the width start, the region's growth and the donut test; the numbers cannot move. They re-gather the
 /// region's pixels: keeping them would hold (2r+1)² samples per seed against this record's ≈ 0.2 KB.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct SeedPass {
     /// The region, or the refusal at step 1, 3 or 4 (`OutsideImage`, `TooFewPixels`, `Donut`).
     region: Result<SeedRegion, RefusalReason>,
@@ -1322,6 +1322,67 @@ pub(crate) struct SeedPass {
 
 #[cfg(test)]
 impl SeedPass {
+    /// Hand-built records for the encoding pin (Plan A Task 11c): every value is an exact binary fraction, so no
+    /// platform's libm enters, and NaN / negative infinity ride where the real records hold them. `0` is a fitted seed
+    /// (a region, a trace, a verdict), `1` a seed refused at the donut test (no verdict), `2` one refused as mostly
+    /// saturated (a verdict that is an `Err`).
+    pub(crate) fn for_pin(i: usize) -> SeedPass {
+        match i {
+            0 => SeedPass {
+                region: Ok(SeedRegion {
+                    cx: 10,
+                    cy: 20,
+                    rb: 6,
+                    start: WidthStart {
+                        fwhm: 3.5,
+                        level: 0.125,
+                        readable: true,
+                    },
+                    r_start: 9,
+                    r: 12,
+                    b0: -0.0625,
+                }),
+                trace: FitTrace {
+                    region_radius: 12,
+                    background_start: 0.5,
+                    width_start: f64::NAN,
+                    growth_steps: 2,
+                    pixels_used: 441,
+                    converged: true,
+                    readable: true,
+                },
+                verdict: Some(Ok(SaturationVerdict {
+                    plateau: false,
+                    level: 0.75,
+                    excluded: 3,
+                    amplitude: 0.5,
+                    beta: 2.5,
+                    fwhm: 3.25,
+                    saturated: true,
+                    by_amplitude: false,
+                    by_plateau_clip: false,
+                    by_near_clip: true,
+                    pixel0: f64::NAN,
+                    top3x3: f64::NEG_INFINITY,
+                    fit: true,
+                    iterations: 17,
+                    cross: true,
+                    centred: false,
+                })),
+            },
+            1 => SeedPass {
+                region: Err(RefusalReason::Donut),
+                trace: FitTrace::before_region(3.0),
+                verdict: None,
+            },
+            _ => SeedPass {
+                region: Err(RefusalReason::TooFewPixels),
+                trace: FitTrace::before_region(4.0),
+                verdict: Some(Err(RefusalReason::MostlySaturated)),
+            },
+        }
+    }
+
     /// A record carrying only `verdict` (the cross-plane rule reads nothing else of it).
     pub(crate) fn for_test(verdict: SeedVerdict) -> SeedPass {
         SeedPass {

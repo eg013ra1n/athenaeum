@@ -593,7 +593,12 @@ export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBy
  * fits, cached like `metrics` (no file of its own) but WITH a file
  * behind each row, so it earns a byte counter `metrics` never needed.
  */
-fitsBytes: number, runsBytes: number, 
+fitsBytes: number, 
+/**
+ * Plan A Task 11c: bytes under `measured/` — the Measure first-pass artifacts (R11c-6), about 2 % of the
+ * calibrated footprint.
+ */
+measuredBytes: number, runsBytes: number, 
 /**
  * M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
  * (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.

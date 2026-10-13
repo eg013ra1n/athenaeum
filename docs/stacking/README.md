@@ -3281,3 +3281,50 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       limit (b) as a debt line. **Plan C:** Moffat 4 by default, the own β shown, Auto selectable; the Measure panel
       still labels the model "Auto (per-frame β)" (`stageSummary.ts`), which now names the diagnostic, not the β the
       fits are made at — a label line owed with the next frontend touch.
+    - **The 11c amendment: the pass-1 spill (Plan A Task 11c; rulings R11c-1 … R11c-7; `PASS1_ARTIFACT_VERSION` = 1).**
+      Under `Auto`, pass 1 writes one artifact per member, `<working_dir>/<set_slug>/measured/<group>/<stem>.athm`
+      (a project's under `_projects/<slug>/`), the new `stacking_artifacts` kind `measured`; pass 2 reads it back and a
+      valid artifact skips every pass-1 plane read, detection, verdict pass and own-β sample. Pass 2 still reads the
+      frame (its fits need the pixels).
+      - R11c-1 stored vs derived: the `PlanePrep` verbatim, the head's timings, `w`, `h`, gain, `beta_own` and the
+        source stamp are stored; the detector and module options are rebuilt through ONE builder (`module_options`)
+        that `adapter_head` itself calls, so there is no second construction.
+      - R11c-2 format: postcard behind a hand-rolled header (`b"ATHM"`, the artifact version, `MEASURE_VERSION`, head
+        length + xxh3, body length, a whole-file xxh3); JSON refused (the records hold NaN and ±inf). Any refusal is a
+        `warn!` and pass 1 re-runs, never a mis-decode.
+      - R11c-3 key: `pass1_hash_for(cfg, calib)` = the measurement subtree + the calib hash + `measure_pass1:v<N>`,
+        independent of the group β, so a β move re-runs pass 2 only; `Moffat4` / `Fixed` write nothing.
+      - R11c-4 identity: the stamp is the read guard's size + mtime at pass 1's first plane read; a mismatch re-runs
+        pass 1 (never an exclusion).
+      - R11c-5 flow: validate on the controller, pass 1 fanned out and written inside the worker (records dropped
+        there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
+        A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.
+      - R11c-6 lifecycle: `measured/` goes with `Intermediates` and `All`, an excluded frame's artifact stays;
+        `WorkUsage.measuredBytes`; no command changes on either host.
+      - R11c-7 (owner): bar 1 on real colour data, set 204's OSC and mono groups.
+      - **Bars (lab c4d9b92, `star-lab/results/plan-a/t11c-wall/bars.txt`; A = ec39507e, B = 89958c3f).**
+
+        | Bar | Rule | Value | Verdict |
+        | ---- | ---- | ---- | ---- |
+        | 4a M42 fresh Measure, B / A | median ≤ 1.2 | 0.9885 (pairs 1.0542 / 0.9685 / 0.9885) | PASS |
+        | 4b M42 exclusion re-run, B / A | median ≤ 1 − s/2 = 0.6181 | 0.2700 (0.2622 / 0.2700 / 0.2823); s = 0.7638, expected 1 − s = 0.2362 | PASS |
+        | 1 M42, `--measure-identity` | 0 differences | (i) 0 / (ii) 0 | PASS |
+        | 1 set 204 (OSC 105 + mono 92) | 0 differences | (i) 0 / (ii) 0 | PASS |
+
+        Set 204, information: fresh Measure A 678.7 s / B 643.0 s; exclusion re-run Measure A 396.9 s → B 83.0 s (B / A
+        0.209), run wall 1021 → 691 s; the OSC pass-1 share of the stage 0.533. `.athm` bytes per plane: OSC mean
+        1.94 MB, mono 3.63 MB (max 3.82 MB), M42 2.55 MB. `measured/` 0.94 GB beside `calibrated/` 50 GB = about 1.9 %
+        (the design read's "about 1 %" was low). Attempt 1 of the driver stopped on a lab-tool bug (a moved beta
+        required set 107's unmeasured groups to move; fixed in the lab, 6a8d4bb).
+      - **Review** (`review-t11c.md`, 6abffeb0): Ready with fixes, 0 Critical / 2 Important / 3 Minor, all fixed in
+        a6a28f39 (I1 a log field dropped, I2 measured rows kept on cancel, M1 a cache-hit member does not validate its
+        artifact, M2 pass-2 identity over both seed specs, M3 a typed `Mismatch`); 89958c3f tightened M1's test.
+        Gates at 89958c3f: `stacking::` 853 / 0 / 2 ignored, `star_measure::` 173, `check --all-targets` clean,
+        `ts_contract` pass.
+      - **Limits and later items.** (C2) Pass 2 still holds every member's `(FrameMeasurement, fits)` until they are
+        persisted (0.1–0.3 GB on a 300-frame OSC group); bar 3 covered pass 1 only. (C3) The postcard golden pin is the
+        only layout guard, and `RefusalReason`'s variant order is part of the format; the bump is
+        `PASS1_ARTIFACT_VERSION`, and a `PlanePrep` field change fails the pin until it is bumped (Task 12). (C4) The
+        plan gate reads `metrics` only, so a cancelled run reads conservatively stale (11b's rule). (C5) The space
+        estimate has no term for `measured/` (about 1.9 % of the calibrated term). (C6) Bar 4b's `1 − s/2` is lenient
+        and kept; `1 − s` is printed as the expected ratio. The Measure stage wall on real data is Task 13's M.2.

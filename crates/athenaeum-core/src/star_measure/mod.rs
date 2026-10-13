@@ -7,6 +7,7 @@
 //! Plan A Task 2 moved the code here verbatim (no arithmetic changed, no operation reordered); the later tasks fix it
 //! defect by defect against the synthetic truth lab.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,7 +93,7 @@ impl PixelNoise {
 
 /// How a plane's aperture SNR read the correlation of its pixel noise (Task 11, ruling R11-1): the probe's
 /// `snrNoise`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnrNoise {
     /// The caller stated the pixels white: `kappa` is 1 by derivation, nothing was read.
     White,
@@ -215,7 +216,7 @@ impl Default for MeasureOptions {
 /// Wall time per phase the module owns (I-1); the adapter adds `read_ms` and its own `detect_ms` and keeps
 /// `ChannelMeasurement.timings` exactly as today. A phase the module did not run (a precomputed noise model, seeds
 /// handed in) reads 0.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhaseTimings {
     pub background_ms: u64,
     pub noise_ms: u64,
@@ -410,7 +411,7 @@ pub fn measure_plane(
 /// One plane measured through its verdict pass (F-3; Task 8 fix wave, the cross-plane rule): the noise model, the
 /// seeds and their field width, the sky statistic and every seed's verdict-pass record — what [`finish_plane`] needs
 /// besides the plane. Holds no plane-sized buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanePrep {
     noise: NoiseModel,
     sky: SkyLevel,
@@ -437,6 +438,127 @@ pub struct PlanePrep {
     timings: PhaseTimings,
     /// The verdict pass's share of [`PhaseTimings::fit_ms`].
     verdict_time: Duration,
+}
+
+impl PlanePrep {
+    /// The seeds handed to the fitter (the given ones, or the matched filter's): what the stacking adapter's head
+    /// hands the module again as `SeedSpec::Given` when a stored first pass is read back (Plan A Task 11c).
+    pub(crate) fn seeds(&self) -> &[Seed] {
+        &self.seeds
+    }
+
+    /// A hand-built record for the encoding pin (Plan A Task 11c, `the_plane_prep_encoding_is_pinned`): exact binary
+    /// fractions only, NaN and infinities where the real records hold them. `starless` = a plane without a seed (no
+    /// detection report, the untested saturation plane).
+    #[cfg(test)]
+    pub(crate) fn for_pin(starless: bool) -> PlanePrep {
+        let mut rho = [[0.0f64; 5]; 5];
+        for (i, row) in rho.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = if i == 2 && j == 2 {
+                    1.0
+                } else {
+                    (i * 5 + j) as f64 / 128.0
+                };
+            }
+        }
+        let seeds = if starless {
+            Vec::new()
+        } else {
+            vec![
+                Seed {
+                    x: 10.5,
+                    y: 20.25,
+                    peak: 0.5,
+                    flux: 4.0,
+                },
+                Seed {
+                    x: 33.75,
+                    y: 8.0,
+                    peak: 0.25,
+                    flux: 1.5,
+                },
+            ]
+        };
+        PlanePrep {
+            noise: NoiseModel {
+                sigma: 12.5,
+                source: NoiseSource::BackgroundResidual,
+                m_star: 0.25,
+                n_star: 3.125,
+            },
+            sky: SkyLevel {
+                median: 0.0625,
+                mad: 0.001953125,
+                median_mean_dev: 0.0029296875,
+                location: 0.0625,
+                scale: 0.00390625,
+                noise_scale_low: 1.0,
+                noise_scale_high: 1.25,
+            },
+            seeds,
+            detected: !starless,
+            field_width: FieldWidth {
+                fwhm_px: 3.5,
+                from_stars: if starless { 0 } else { 2 },
+            },
+            detection: (!starless).then(|| DetectionReport {
+                sigma_f: 0.5,
+                sigma_f_measured: f64::NAN,
+                noise_gain: 1.0,
+                structure_dropped: 1,
+                extended: vec![false, true],
+                filter_snr: vec![11.5, f64::INFINITY],
+                envelope: seeds::WidthEnvelope {
+                    spread_px: 0.25,
+                    fwhm_px: 4.0,
+                },
+                noise_correlation: Some(seeds::NoiseCorrelation::for_pin()),
+            }),
+            fit_field: FieldWidth {
+                fwhm_px: 3.75,
+                from_stars: if starless { 0 } else { 2 },
+            },
+            passes: if starless {
+                Vec::new()
+            } else {
+                vec![
+                    fit::SeedPass::for_pin(0),
+                    fit::SeedPass::for_pin(1),
+                    fit::SeedPass::for_pin(2),
+                ]
+            },
+            saturation: if starless {
+                SaturationPlane::UNTESTED
+            } else {
+                SaturationPlane {
+                    bg: 0.0625,
+                    threshold: 0.125,
+                    norm: 65535.0,
+                    range: 0.875,
+                    colour: true,
+                    plane_max: 1.0,
+                    max_count: 3,
+                    clip_floor: Some(0.9375),
+                    clip_evidence: 2,
+                }
+            },
+            cross_flags: 1,
+            snr_rho: (!starless).then_some(rho),
+            snr_noise: if starless {
+                SnrNoise::Unread
+            } else {
+                SnrNoise::Read
+            },
+            timings: PhaseTimings {
+                background_ms: 1,
+                noise_ms: 2,
+                detect_ms: 3,
+                fit_ms: 4,
+            },
+            verdict_time: Duration::new(2, 500),
+        }
+    }
 }
 
 /// [`measure_plane`]'s first half (Task 8 fix wave): everything up to and including the verdict pass, on its own
@@ -1015,6 +1137,21 @@ mod tests {
     use super::*;
     use crate::test_support::fixture_field;
     use crate::test_support::{moffat_field, MoffatStar};
+
+    /// Plan A Task 11c, ruling F28 (a pin, outside RED): the first-pass artifact's body is postcard, which is not
+    /// self-describing, so this fails on ANY layout change of a serialised type (a `PlanePrep` field, `RefusalReason`'s
+    /// variant order, a derive's field order) until `PASS1_ARTIFACT_VERSION` moves and the literals are re-recorded.
+    /// The values are hand-built exact binary fractions: no platform's libm enters.
+    #[test]
+    fn the_plane_prep_encoding_is_pinned() {
+        let bytes =
+            postcard::to_stdvec(&[PlanePrep::for_pin(false), PlanePrep::for_pin(true)]).unwrap();
+        assert_eq!(
+            (bytes.len(), xxhash_rust::xxh3::xxh3_64(&bytes)),
+            (1011, 7_237_352_163_525_747_691u64),
+            "the layout of a serialised first-pass type changed: bump PASS1_ARTIFACT_VERSION"
+        );
+    }
 
     /// F-5 (Task 10): 30 round Moffat stars of `alpha`, amplitude 0.3, on a 70-px grid of a 480 × 400 plane.
     pub(super) fn grid30(alpha: f64) -> Vec<MoffatStar> {

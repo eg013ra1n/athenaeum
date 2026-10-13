@@ -23,6 +23,7 @@
 //! present pixels and their count, so `num = Σ k·sum` and `den = Σ k²·count` are the same least-squares terms on a
 //! coarser grid (the kernel halved in cells) at a quarter of the cost.
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -98,7 +99,7 @@ pub struct MatchedFilter {
 /// seed ([`field_width_of`]; PA-17 as revised by Task 10b A2), clamped to [1.5, 24] px, and how many readable reads it
 /// was taken over (`from_stars = 0`: none; `fwhm_px` is then the first pass's 3 px, or the caller's own value —
 /// `FitOutcome.field_width` for a given `FitStarsOptions.field_width`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FieldWidth {
     pub fwhm_px: f64,
     pub from_stars: usize,
@@ -1050,7 +1051,7 @@ fn near_clip(
 
 /// What the module's matched filter measured on one plane besides its seeds (Task 10b, F-10): the detection noise of
 /// its second pass and the knot tests' outcome. Reported (the probe's frame line), not persisted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetectionReport {
     /// The σ_f the second pass thresholded at (working units): the median of the propagated σ_f(x) over the
     /// stratified sample, or the measured one when no gain was measured.
@@ -1257,13 +1258,26 @@ pub(crate) const NOISE_CORR_SIDE: usize = 2 * NOISE_CORR_REACH + 1;
 /// the residual median) at every lag `|L|∞ ≤ NOISE_LAG_REACH` of the half plane, both ends quiet; and `C` the
 /// least-squares solution of `E[r(i)·r(i+L)] = Σ_v H₂(v)·C(L + v)`, `H₂` the high-pass box's autocorrelation. A smooth
 /// structure never reaches it (the high-pass took it out); white noise reads `C(L ≠ 0) = 0`, a gain of 1.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NoiseCorrelation {
     /// `c[dy + R][dx + R]`, `R` = [`NOISE_CORR_REACH`].
     c: [[f64; NOISE_CORR_SIDE]; NOISE_CORR_SIDE],
 }
 
 impl NoiseCorrelation {
+    /// A hand-built correlation for the encoding pin (Plan A Task 11c): exact binary fractions, `c[dy][dx]` =
+    /// `(dy * side + dx) / 64`.
+    #[cfg(test)]
+    pub(crate) fn for_pin() -> NoiseCorrelation {
+        let mut c = [[0.0; NOISE_CORR_SIDE]; NOISE_CORR_SIDE];
+        for (dy, row) in c.iter_mut().enumerate() {
+            for (dx, v) in row.iter_mut().enumerate() {
+                *v = (dy * NOISE_CORR_SIDE + dx) as f64 / 64.0 + 1.0;
+            }
+        }
+        NoiseCorrelation { c }
+    }
+
     /// The correlation coefficients `rho(L) = C(L) / C(0)` at `|L|inf <= NOISE_CORR_REACH`, `rho[dy + R][dx + R]`
     /// (Task 11, ruling R11-1): what an aperture's `kappa(A)` sums. `rho[R][R]` is exactly 1.
     pub(crate) fn rho(&self) -> [[f64; NOISE_CORR_SIDE]; NOISE_CORR_SIDE] {
@@ -1654,7 +1668,7 @@ fn read_error(nu: f64) -> f64 {
 ///
 /// No readable read in `[floor, F_field]` (none at all, or a field width clamped below every read): `s = 0` and the
 /// bounds sit at the field width.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WidthEnvelope {
     /// `s_true`, px: the stars' width spread about the field width, the reads' own error removed.
     pub spread_px: f64,

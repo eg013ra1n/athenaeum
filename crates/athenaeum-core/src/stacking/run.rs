@@ -88,8 +88,11 @@ use crate::stacking::master_cards::{
     WrittenMaster,
 };
 use crate::stacking::measure::{
-    measure_frame_pass1, measure_frame_pass2, measure_frame_with_fits, FrameMeasurement,
-    FramePass1, MeasureOptions,
+    check_pass1_head, measure_frame_pass1, measure_frame_pass2, measure_frame_with_fits,
+    FrameMeasurement, FramePass1, MeasureOptions,
+};
+use crate::stacking::pass1_artifact::{
+    read_pass1, read_pass1_head, write_pass1, Pass1ArtifactError, Pass1Head, PASS1_ARTIFACT_KIND,
 };
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
@@ -97,7 +100,8 @@ use crate::stacking::paths::{
 };
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
-    measurement_hash_for, normalization_hash_for, pass1_own_betas, registration_hash_for,
+    measurement_hash_for, normalization_hash_for, pass1_hash_for, pass1_own_betas,
+    registration_hash_for,
     registration_row_is_fresh, seeds_calibration_hash_for, store_registration,
     stored_reference_frame, stored_registrations, wants_cfa_mosaic, HashMemo, LnReferencePayload,
     MasterWork, PlanMaster, Stage,
@@ -4670,33 +4674,43 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 /// §1/§3): every member of `group` is fitted at ONE β, the group β — [`psf_signal::group_beta`] (the lower median) of
 /// the members' own βs, the very value `stacking_run_groups.beta` records and stage 6 fits its reference and every
 /// member's seeds at (`PsfModel::Fixed(group β)`) — so no frame's F is compared across the group at a β of its own,
-/// and Measure's F and LN's F sit at one β. Two passes over `star_measure`'s `PlanePrep` seam:
+/// and Measure's F and LN's F sit at one β. Two passes over `star_measure`'s `PlanePrep` seam, with the first pass
+/// SPILLED to the work dir (Plan A Task 11c, R11c-1 .. R11c-6):
 ///
-/// 1. per frame, fanned out: the verdict pass and the frame's own β, F-4's E5 estimator unchanged
-///    ([`measure_frame_pass1`]); a stored `metrics` row whose first pass is still valid
-///    ([`pass1_own_betas`]) gives the own β without reading the frame;
-/// 2. the group β, once; then per frame, fanned out: every fit, F, `.athf`, `c` and F-6 statistic at
-///    `PsfModel::Fixed(group β)` ([`measure_frame_pass2`]) — unless the frame's stored row is keyed on this very group β
-///    with fresh `fits` rows (a cache hit). A frame whose first pass came from its row but whose second pass is stale
-///    runs both passes again (first-pass records are not stored); its own β reads the same.
+/// 0. per member, on the controller: the own β from the frame's `metrics` row when its first pass is still valid
+///    ([`pass1_own_betas`]), else from its first-pass artifact — the `measured` row fresh at [`pass1_hash_for`] and
+///    its head ([`read_pass1_head`]) describing the calibrated file as it is now ([`check_pass1_head`]) — else pass 1
+///    is owed;
+/// 1. fanned out, for the members owed pass 1: the verdict pass and the frame's own β, F-4's E5 estimator unchanged
+///    ([`measure_frame_pass1`]), written to the artifact ([`write_pass1`]) and DROPPED in the worker — which returns
+///    the own β and whether the file was written; the controller upserts the `measured` rows at once, so a run
+///    cancelled after this phase leaves the work for the next one;
+/// 2. the group β, once;
+/// 3. per member that needs its second pass, fanned out: every fit, F, `.athf`, `c` and F-6 statistic at
+///    `PsfModel::Fixed(group β)` ([`measure_frame_pass2`]) — unless the frame's stored row is keyed on this very group
+///    β with fresh `fits` rows (a cache hit). The first pass comes from the artifact ([`read_pass1`]: the checksum,
+///    the stamp), or — a member with no valid artifact (the upgrade ripple), a refused read, a failed write — from
+///    pass 1 run in this worker, which writes the artifact too.
 ///
 /// A group of one is fitted at its own β (the lower median of its planes' own βs, which is its own β on a mono
-/// frame). Every row is keyed on `measurement_hash_for(cfg, calib, Some(group β))`: the group β moving (a member
-/// excluded, added or re-measured to another own β) re-runs pass 2 for the whole group, never pass 1 of a member whose
-/// row still holds it. The first passes of the frames read here wait in memory for the group β (seeds and per-seed
-/// records, no plane). Returns the group β, `None` when no member was measured.
+/// frame). Every `metrics` row is keyed on `measurement_hash_for(cfg, calib, Some(group β))`: the group β moving (a
+/// member excluded, added or re-measured to another own β) re-runs pass 2 for the whole group and pass 1 for no
+/// member whose artifact is valid. The artifact is keyed on the calibration hash and the measurement subtree, NOT the
+/// group β. `force_fresh` (`rerun_from` ≤ Measure) skips the artifact as it skips the `metrics` row: pass 1 runs and
+/// the artifact is overwritten in place. Returns the group β, `None` when no member was measured.
 ///
-/// Cost, plainly: the first-pass records are not stored, so a stale pass 2 re-reads and re-detects (re-runs pass 1 for)
-/// EVERY member of the group — a group-β move (an exclusion that shifts the lower median) costs the group a full
-/// Measure read pass again. Task 11c (spill pass 1 to the work dir) owns that cost.
+/// Residency: each phase holds at most one frame's first pass per admitted worker — `fan_out`'s phase-1 results carry
+/// the own β only, its phase-3 results `(measurement, fits)`. A write failure (disk full) is a `warn!`, no row, the
+/// records dropped and pass 1 re-run in that member's pass-2 worker: twice only on failure, never held (holding is
+/// refused: on a full disk the machine cannot swap), so the bound holds unconditionally.
 ///
 /// The group β is the lower median over every member whose pass 1 succeeded, including one whose pass 2 then fails and
 /// is excluded: that member still counted in the median. No re-computation loop; every `.athf` written is at the one
 /// group β regardless.
 ///
 /// Progress: the bar moves from the first frame. Each frame is two half-ticks on a doubled scale (pass 1, pass 2:
-/// [`FanOutTicker::with_scale`]), so the stage keeps its `total` and lands on it; a frame that reuses a stored first
-/// pass ticks both halves in pass 2, a cache hit both at once.
+/// [`FanOutTicker::with_scale`]), so the stage keeps its `total` and lands on it; a member whose pass 1 ran in phase 1
+/// ticks its second half only in phase 3, any other member both halves there, a cache hit both at once.
 #[allow(clippy::too_many_arguments)]
 fn measure_group_two_pass(
     rc: &mut RunContext,
@@ -4709,6 +4723,25 @@ fn measure_group_two_pass(
     (current, total): (usize, usize),
     (group_max_w, group_max_h): (u64, u64),
 ) -> Result<Option<f64>, RunError> {
+    /// Where a member's first pass comes from in phase 3.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Pass1Source {
+        /// No valid artifact: pass 1 runs in the pass-2 worker (and writes the artifact).
+        Owed,
+        /// The artifact on disk, validated by the controller (row, head, stamp).
+        Artifact,
+    }
+    /// What a phase-1 worker hands back: the own β, and whether the artifact was written (the records are dropped).
+    struct Pass1Done {
+        own: Vec<f64>,
+        written: bool,
+    }
+    /// What a phase-3 worker hands back besides the measurement: whether it wrote the artifact (it ran pass 1).
+    struct Pass2Done {
+        measurement: FrameMeasurement,
+        fits: Vec<Vec<psf_signal::StarFit>>,
+        written: bool,
+    }
     /// One frame of the group on its way through the two passes.
     struct Member {
         idx: usize,
@@ -4719,8 +4752,43 @@ fn measure_group_two_pass(
         cached: Option<(FrameMeasurement, String)>,
         /// The frame's own β per plane (pass 1, read or reused).
         own: Option<Vec<f64>>,
-        /// Pass 1 run here, waiting for the group β.
-        pass1: Option<FramePass1>,
+        /// Where the first-pass artifact lives (or will).
+        spill: PathBuf,
+        /// The artifact's key ([`pass1_hash_for`]).
+        pass1_key: String,
+        source: Pass1Source,
+        /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
+        /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
+        spill_pending: bool,
+    }
+    /// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
+    /// why (stale before use `debug!`, any other refusal `warn!`).
+    fn validate_spill(run_id: i64, frame_id: i64, spill: &Path, path: &Path) -> Option<Pass1Head> {
+        let usable = read_pass1_head(spill).and_then(|head| check_pass1_head(&head, path).map(|()| head));
+        match usable {
+            Ok(head) => Some(head),
+            // Found stale before use: the calibrated file is not the one the artifact was read from.
+            Err(e @ Pass1ArtifactError::Stale { .. }) => {
+                tracing::debug!(
+                    run_id,
+                    frame_id,
+                    path = %spill.display(),
+                    error = %e,
+                    "measure: first-pass artifact is stale; pass 1 re-runs"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id,
+                    frame_id,
+                    path = %spill.display(),
+                    error = %e,
+                    "measure: first-pass artifact refused; pass 1 re-runs"
+                );
+                None
+            }
+        }
     }
     fn exclude(rc: &mut RunContext, entry: &mut MeasuredFrame, msg: String) {
         rc.runtime_exclusions
@@ -4734,33 +4802,72 @@ fn measure_group_two_pass(
         );
         entry.reason = Some(msg);
     }
+    /// The first pass of one frame, run in a worker, and its artifact written best-effort: a failed write is a
+    /// `warn!` (the caller keeps the records only for as long as it needs them).
+    fn run_pass1_and_spill(
+        frame_id: i64,
+        path: &Path,
+        spill: &Path,
+        opts: &MeasureOptions,
+        pool: &Arc<rayon::ThreadPool>,
+        cancel: &AtomicBool,
+    ) -> Result<(FramePass1, bool), crate::integration::IntegrationError> {
+        let pass1 = measure_frame_pass1(path, opts, Some(pool), cancel)?;
+        let written = match write_pass1(spill, &pass1) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    frame_id,
+                    path = %spill.display(),
+                    error = %e,
+                    "measure: first-pass artifact write failed; the first pass re-runs when it is needed"
+                );
+                false
+            }
+        };
+        Ok((pass1, written))
+    }
 
-    // Pass 1 from the stored rows (skipped under a Measure-or-earlier `rerun_from`, as the single pass's reuse is).
+    // Step 0: the own β from the stored rows (skipped under a Measure-or-earlier `rerun_from`, as the single pass's
+    // reuse is): the `metrics` row first, else the first-pass artifact.
     let mut members: Vec<Member> = Vec::with_capacity(to_measure.len());
     for (idx, frame, path) in to_measure {
         let calib_hash = {
             let conn = db(&rc.ctx)?.conn();
             rc.memo.calibration_hash_checked(&conn, cfg, &frame)?
         };
+        let stem = calibrated_file_stem(group, &frame);
         let mut member = Member {
             idx,
             frame,
             path,
+            spill: rc.layout.measured_path(&group.key, &stem),
+            pass1_key: pass1_hash_for(cfg, &calib_hash),
             calib_hash,
             cached: None,
             own: None,
-            pass1: None,
+            source: Pass1Source::Owed,
+            spill_pending: false,
         };
         if !force_fresh {
-            let existing = {
+            let (existing, spilled) = {
                 let conn = db(&rc.ctx)?.conn();
-                crate::db::stacking::find_artifact(
-                    &conn,
-                    &rc.subject,
-                    &group.key,
-                    "metrics",
-                    Some(member.frame.frame_id),
-                )?
+                (
+                    crate::db::stacking::find_artifact(
+                        &conn,
+                        &rc.subject,
+                        &group.key,
+                        "metrics",
+                        Some(member.frame.frame_id),
+                    )?,
+                    crate::db::stacking::find_artifact(
+                        &conn,
+                        &rc.subject,
+                        &group.key,
+                        PASS1_ARTIFACT_KIND,
+                        Some(member.frame.frame_id),
+                    )?,
+                )
             };
             if let Some(payload) = existing.as_ref().and_then(|row| row.payload_json.as_ref()) {
                 match serde_json::from_str::<FrameMeasurement>(payload) {
@@ -4783,6 +4890,28 @@ fn measure_group_two_pass(
                     }
                 }
             }
+            if spilled.is_some_and(|row| is_fresh(&row, &member.pass1_key)) {
+                if member.own.is_none() {
+                    if let Some(head) = validate_spill(
+                        rc.run_id,
+                        member.frame.frame_id,
+                        &member.spill,
+                        &member.path,
+                    ) {
+                        member.source = Pass1Source::Artifact;
+                        member.own = Some(head.beta_own);
+                    }
+                } else {
+                    member.spill_pending = true;
+                }
+            } else {
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    frame_id = member.frame.frame_id,
+                    path = %member.spill.display(),
+                    "measure: no usable first-pass artifact row"
+                );
+            }
         }
         members.push(member);
     }
@@ -4791,7 +4920,7 @@ fn measure_group_two_pass(
     let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool.clone();
 
-    // Pass 1, fanned out, for every member without a reusable first pass.
+    // Step 1, fanned out, for every member without a reusable first pass: pass 1, spilled, dropped in the worker.
     let need_pass1: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].own.is_none())
         .collect();
@@ -4805,9 +4934,15 @@ fn measure_group_two_pass(
             0,
             admission_n,
         );
-        let jobs: Vec<(i64, PathBuf)> = need_pass1
+        let jobs: Vec<(i64, PathBuf, PathBuf)> = need_pass1
             .iter()
-            .map(|&i| (members[i].frame.frame_id, members[i].path.clone()))
+            .map(|&i| {
+                (
+                    members[i].frame.frame_id,
+                    members[i].path.clone(),
+                    members[i].spill.clone(),
+                )
+            })
             .collect();
         // Half a frame per pass-1 frame (scale 2), so the bar moves from the first frame.
         let ticker1 = FanOutTicker::new(
@@ -4822,12 +4957,34 @@ fn measure_group_two_pass(
         .with_scale(2);
         let ticker1_ref = &ticker1;
         let cancel_ref: &AtomicBool = &rc.cancel;
-        let results = fan_out(jobs, admission_n, cancel_ref, move |(frame_id, path)| {
-            let out = measure_frame_pass1(&path, opts, Some(pool_ref), cancel_ref)
-                .map_err(|e| format!("measurement failed: {e}"));
-            ticker1_ref.tick_units(Some(frame_id), 1);
-            out
-        });
+        let results = fan_out(
+            jobs,
+            admission_n,
+            cancel_ref,
+            move |(frame_id, path, spill)| {
+                let out =
+                    run_pass1_and_spill(frame_id, &path, &spill, opts, pool_ref, cancel_ref)
+                        .map(|(pass1, written)| Pass1Done {
+                            own: pass1.beta_own().to_vec(),
+                            written,
+                        })
+                        .map_err(|e| format!("measurement failed: {e}"));
+                ticker1_ref.tick_units(Some(frame_id), 1);
+                out
+            },
+        );
+        // Every file written gets its row BEFORE a cancel is honoured: a cancelled run's re-run reuses it (R11c-5 (1)).
+        for (&i, res) in need_pass1.iter().zip(&results) {
+            if let Some(Ok(Pass1Done { written: true, .. })) = res {
+                upsert_pass1_row(
+                    rc,
+                    group,
+                    &members[i].frame,
+                    &members[i].spill,
+                    &members[i].pass1_key,
+                )?;
+            }
+        }
         rc.check_cancel()?;
         for (&i, res) in need_pass1.iter().zip(results) {
             match res {
@@ -4836,16 +4993,18 @@ fn measure_group_two_pass(
                     pass1_failed += 1;
                     exclude(rc, &mut entries[members[i].idx], msg)
                 }
-                Some(Ok(pass1)) => {
-                    members[i].own = Some(pass1.beta_own().to_vec());
-                    members[i].pass1 = Some(pass1);
+                Some(Ok(done)) => {
+                    members[i].own = Some(done.own);
+                    if done.written {
+                        members[i].source = Pass1Source::Artifact;
+                    }
                 }
             }
         }
     }
 
-    // The group β, once: the lower median of every measured member's own βs (every plane of every frame, as stage 6's
-    // group β always was).
+    // Step 2, the group β, once: the lower median of every measured member's own βs (every plane of every frame, as
+    // stage 6's group β always was).
     let measured: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].own.is_some())
         .collect();
@@ -4884,7 +5043,7 @@ fn measure_group_two_pass(
         }
     }
 
-    // Pass 2: a cache hit where the stored row is keyed on this group β with fresh `fits` rows, else fitted.
+    // Step 3: a cache hit where the stored row is keyed on this group β with fresh `fits` rows, else fitted.
     let mut reused = 0usize;
     let mut need_pass2: Vec<usize> = Vec::new();
     for &i in &measured {
@@ -4933,6 +5092,23 @@ fn measure_group_two_pass(
         }
         return Ok(Some(group_beta));
     }
+    // A member whose own β came from its `metrics` row and that needs pass 2 now: its artifact is validated here, for
+    // the first time (R11c-5 (3)); a refused one leaves it owed.
+    for &i in &need_pass2 {
+        if members[i].spill_pending {
+            members[i].spill_pending = false;
+            if validate_spill(
+                rc.run_id,
+                members[i].frame.frame_id,
+                &members[i].spill,
+                &members[i].path,
+            )
+            .is_some()
+            {
+                members[i].source = Pass1Source::Artifact;
+            }
+        }
+    }
     if need_pass1.is_empty() {
         log_admission(
             rc,
@@ -4943,13 +5119,17 @@ fn measure_group_two_pass(
             admission_n,
         );
     }
-    let jobs: Vec<(i64, PathBuf, Option<FramePass1>)> = need_pass2
+    // Per job: the frame, its calibrated file, its artifact, where its first pass comes from, and whether its first
+    // half was already ticked by phase 1.
+    let jobs: Vec<(i64, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
         .iter()
         .map(|&i| {
             (
                 members[i].frame.frame_id,
                 members[i].path.clone(),
-                members[i].pass1.take(),
+                members[i].spill.clone(),
+                members[i].source,
+                need_pass1.contains(&i),
             )
         })
         .collect();
@@ -4971,37 +5151,105 @@ fn measure_group_two_pass(
         jobs,
         admission_n,
         cancel_ref,
-        move |(frame_id, path, pass1)| {
-            let ran_pass1 = pass1.is_some();
-            let pass1 = match pass1 {
-                Some(p) => Ok(p),
-                None => measure_frame_pass1(&path, opts, Some(pool_ref), cancel_ref),
+        move |(frame_id, path, spill, source, first_half_ticked)| {
+            // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
+            // artifact — for a member owed it or whose artifact is refused now.
+            let from_artifact = match source {
+                Pass1Source::Artifact => match read_pass1(&spill, &path, opts) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            frame_id,
+                            path = %spill.display(),
+                            error = %e,
+                            "measure: first-pass artifact refused after it was validated; pass 1 re-runs"
+                        );
+                        None
+                    }
+                },
+                Pass1Source::Owed => None,
+            };
+            let first = match from_artifact {
+                Some(p) => Ok((p, false)),
+                None => run_pass1_and_spill(frame_id, &path, &spill, opts, pool_ref, cancel_ref),
             };
             // One β per plane of THIS read (a group of one's planes included): every plane at the group β.
-            let out = pass1
-                .and_then(|p| {
+            let out = first
+                .and_then(|(p, written)| {
                     let betas = vec![group_beta; p.beta_own().len()];
                     measure_frame_pass2(&path, p, &betas, opts, Some(pool_ref), cancel_ref)
+                        .map(|(measurement, fits)| Pass2Done {
+                            measurement,
+                            fits,
+                            written,
+                        })
                 })
                 .map_err(|e| format!("measurement failed: {e}"));
-            // The frame's pass 1 ran here (half already ticked) or came from its row (both halves now).
-            ticker_ref.tick_units(Some(frame_id), if ran_pass1 { 1 } else { 2 });
+            // Phase 1 already ticked the first half of a member it ran; any other member ticks both halves here.
+            ticker_ref.tick_units(Some(frame_id), if first_half_ticked { 1 } else { 2 });
             out
         },
     );
+    // Every artifact a worker wrote gets its row BEFORE a cancel is honoured, as in phase 1.
+    for (&i, res) in need_pass2.iter().zip(&results) {
+        if let Some(Ok(Pass2Done { written: true, .. })) = res {
+            upsert_pass1_row(
+                rc,
+                group,
+                &members[i].frame,
+                &members[i].spill,
+                &members[i].pass1_key,
+            )?;
+        }
+    }
     rc.check_cancel()?;
     for (&i, res) in need_pass2.iter().zip(results) {
         match res {
             None => return Err(RunError::Cancelled),
             Some(Err(msg)) => exclude(rc, &mut entries[members[i].idx], msg),
-            Some(Ok((m, fits))) => {
+            Some(Ok(done)) => {
                 let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
-                persist_measurement(rc, group, &members[i].frame, &m, &fits, &expected)?;
-                entries[members[i].idx].measurement = Some(m);
+                persist_measurement(
+                    rc,
+                    group,
+                    &members[i].frame,
+                    &done.measurement,
+                    &done.fits,
+                    &expected,
+                )?;
+                entries[members[i].idx].measurement = Some(done.measurement);
             }
         }
     }
     Ok(Some(group_beta))
+}
+
+/// A frame's first-pass artifact row, upserted right after its file was written (Plan A Task 11c, R11c-5: a cancelled
+/// run's re-run reuses it). The identity recorded is the file's own, as `fits.<plane>`'s is.
+fn upsert_pass1_row(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+    spill: &Path,
+    key: &str,
+) -> Result<(), RunError> {
+    let (size, modified_at) = file_identity(spill)?;
+    let conn = db(&rc.ctx)?.conn();
+    upsert_artifact(
+        &conn,
+        &NewArtifact {
+            subject: &rc.subject,
+            frame_id: Some(frame.frame_id),
+            group_key: &group.key,
+            kind: PASS1_ARTIFACT_KIND,
+            path: spill.to_str(),
+            config_hash: key,
+            size: Some(size),
+            modified_at: Some(&modified_at),
+            payload_json: None,
+        },
+    )?;
+    Ok(())
 }
 
 /// A frame's measurement hash after stage 3 — [`measurement_hash_for`] at the group β stage 3 resolved for its group
@@ -14763,8 +15011,8 @@ mod tests {
     /// (no row rewritten); a group β that moves — here two members' stored own βs set below every other's, so the
     /// lower median of four moves (one member's cannot: this fixture's Gaussian stars read one own β on every frame)
     /// — makes the plan gate report Measure stale and re-runs the second pass for EVERY member: each row is re-keyed
-    /// on the new group β, every channel fitted at it, and the own βs read again from the pixels (the first pass is
-    /// redone where its records were not kept).
+    /// on the new group β, every channel fitted at it, and the own βs are the artifact's (Plan A Task 11c: pass 1
+    /// was spilled to `measured/` once, so the move runs no pass 1 at all and the artifact rows are untouched).
     #[test]
     fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14836,6 +15084,17 @@ mod tests {
         };
 
         let beta1 = run("run 1").expect("a group beta");
+        let logged = || pass1_logged_under(working.path()).len();
+        let measured1 = rows_of_kind(&fixture.conn, fixture.set_id, "measured");
+        assert_eq!(logged(), 4, "run 1 ran pass 1 for every member, once");
+        assert_eq!(measured1.len(), 4, "run 1 stored every member's first pass");
+        for (frame_id, row) in &measured1 {
+            assert_eq!(
+                row.config_hash,
+                pass1_hash_for(&cfg, &calibrated(*frame_id)),
+                "frame {frame_id}: keyed on the calibration hash and the measurement subtree, not the group beta"
+            );
+        }
         let rows1 = metrics_by_frame(&fixture.conn, fixture.set_id);
         assert_eq!(rows1.len(), 4);
         for (frame_id, (hash, _, _)) in &rows1 {
@@ -14856,6 +15115,8 @@ mod tests {
                 "frame {frame_id}: a cache hit rewrites nothing"
             );
         }
+
+        assert_eq!(logged(), 4, "a cache hit runs no pass 1");
 
         // Two members' stored own betas below every other's: the lower median of four moves to the larger of them.
         let mut ids: Vec<i64> = rows1.keys().copied().collect();
@@ -14890,6 +15151,17 @@ mod tests {
         );
 
         assert_eq!(run("run 3"), Some(1.7));
+        assert_eq!(
+            logged(),
+            4,
+            "the group-beta move re-ran pass 2 only: no pass 1 on a valid artifact"
+        );
+        for (frame_id, row) in rows_of_kind(&fixture.conn, fixture.set_id, "measured") {
+            assert_eq!(
+                row.created_at, measured1[&frame_id].created_at,
+                "frame {frame_id}: the artifact is written once and reused"
+            );
+        }
         let rows3 = metrics_by_frame(&fixture.conn, fixture.set_id);
         for (frame_id, (hash, m, _)) in &rows3 {
             assert_eq!(
@@ -14904,9 +15176,502 @@ mod tests {
             );
             assert_eq!(
                 m.channels[0].beta_own, rows1[frame_id].1.channels[0].beta_own,
-                "frame {frame_id}: the own beta is the pixels' again"
+                "frame {frame_id}: the own beta is the artifact's (the pixels' first read)"
             );
         }
+    }
+
+    /// Plan A Task 11c: the `measure_frame_pass1` calls (test log) whose path lies under `root` — every pass-1 read of
+    /// one test's own working tree, immune to sibling tests (`FITS_WRITE_FAILURE_LOG`'s reasoning).
+    fn pass1_logged_under(root: &Path) -> Vec<PathBuf> {
+        crate::stacking::measure::PASS1_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
+    /// Plan A Task 11c: the `stacking_artifacts` rows of one kind, by frame id.
+    fn rows_of_kind(
+        conn: &rusqlite::Connection,
+        set_id: i64,
+        kind: &str,
+    ) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
+        crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some(kind))
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.frame_id.unwrap(), a))
+            .collect()
+    }
+
+    /// Plan A Task 11c: four mono frames of `seed_star_group` measured one Measure stage at a time on the test pool's
+    /// one thread (admission 1), with what the Step 1 tests count.
+    struct Pass1Rig {
+        _tmp: tempfile::TempDir,
+        ctx: Arc<ServiceContext>,
+        fixture: test_fixtures::Fixture,
+        working: tempfile::TempDir,
+        output: tempfile::TempDir,
+        cfg: StackingConfig,
+        layout: WorkingLayout,
+        plan_groups: Vec<IntegrationGroup>,
+        group_key: String,
+        subject: StackSubject,
+    }
+
+    /// What one Measure stage did.
+    struct Pass1Out {
+        beta: Option<f64>,
+        /// The `measure_frame_pass1` calls this run made.
+        logged: Vec<PathBuf>,
+        excluded: usize,
+    }
+
+    impl Pass1Rig {
+        fn new() -> Pass1Rig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+            let (fixture, light_ids, working, output) =
+                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            let cfg = StackingConfig::default();
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let group_key = plan_groups[0].key.clone();
+            let subject = StackSubject::FrameSet(fixture.set_id);
+            Pass1Rig {
+                _tmp: tmp,
+                ctx,
+                fixture,
+                working,
+                output,
+                cfg,
+                layout,
+                plan_groups,
+                group_key,
+                subject,
+            }
+        }
+
+        fn run(&self, label: &str, rerun_from: Option<Stage>) -> Pass1Out {
+            self.try_run(rerun_from, None)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"))
+        }
+
+        /// One Measure stage; `cancel_after = Some(n)` sets the run's cancel flag once the n-th first pass under this
+        /// rig's working tree has finished (a test-only hook in `measure_frame_pass1`, no timing).
+        fn try_run(
+            &self,
+            rerun_from: Option<Stage>,
+            cancel_after: Option<usize>,
+        ) -> Result<Pass1Out, RunError> {
+            let before = pass1_logged_under(self.working.path()).len();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &self.plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            let mut rc = test_context(
+                self.ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                self.cfg.clone(),
+                self.plan_groups.clone(),
+                self.layout.clone(),
+                self.output.path().to_path_buf(),
+                group_ids,
+            );
+            rc.rerun_from = rerun_from;
+            if let Some(n) = cancel_after {
+                crate::stacking::measure::PASS1_CANCEL_AFTER
+                    .lock()
+                    .unwrap()
+                    .push((self.working.path().to_path_buf(), n));
+            }
+            let result = run_stages_for_test(&mut rc, Stage::Measure);
+            crate::stacking::measure::PASS1_CANCEL_AFTER
+                .lock()
+                .unwrap()
+                .retain(|(dir, _)| dir != self.working.path());
+            result?;
+            Ok(Pass1Out {
+                beta: crate::db::stacking::list_groups(&self.fixture.conn, run_id).unwrap()[0].beta,
+                logged: pass1_logged_under(self.working.path())[before..].to_vec(),
+                excluded: rc.runtime_exclusions.len(),
+            })
+        }
+
+        fn rows(&self, kind: &str) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
+            rows_of_kind(&self.fixture.conn, self.fixture.set_id, kind)
+        }
+
+        fn calibrated_path(&self, frame_id: i64) -> PathBuf {
+            let row = crate::db::stacking::find_artifact(
+                &self.fixture.conn,
+                &self.subject,
+                &self.group_key,
+                "calibrated",
+                Some(frame_id),
+            )
+            .unwrap()
+            .unwrap();
+            PathBuf::from(row.path.unwrap())
+        }
+
+        /// The root of the (not yet existing) pass-1 spill directory, named without the code under test.
+        fn measured_root(&self) -> PathBuf {
+            self.layout.calibrated_root().parent().unwrap().join("measured")
+        }
+
+        fn delete_rows(&self, kinds: &[&str]) {
+            crate::db::stacking::delete_artifacts(&self.fixture.conn, &self.subject, kinds)
+                .unwrap();
+        }
+
+        /// The group β moves: the stored own β of the given members goes below every other's (the
+        /// `measure_reruns_pass_two_…` edit).
+        fn lower_own_betas(&self, lowered: &[(i64, f64)]) {
+            let rows = metrics_by_frame(&self.fixture.conn, self.fixture.set_id);
+            for &(frame_id, own) in lowered {
+                let (hash, mut m, _) = rows[&frame_id].clone();
+                m.channels[0].beta_own = Some(own);
+                let payload = serde_json::to_string(&m).unwrap();
+                upsert_artifact(
+                    &self.fixture.conn,
+                    &NewArtifact {
+                        subject: &self.subject,
+                        frame_id: Some(frame_id),
+                        group_key: &self.group_key,
+                        kind: "metrics",
+                        path: None,
+                        config_hash: &hash,
+                        size: None,
+                        modified_at: None,
+                        payload_json: Some(&payload),
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        fn sorted_ids(&self) -> Vec<i64> {
+            let mut ids: Vec<i64> = self.rows("metrics").keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        }
+    }
+
+    /// Plan A Task 11c, bar 3: a first pass is alive only while its worker holds it, so the peak over a fresh run
+    /// and over a group-β-move run is the admitted workers (one here), never the group (four).
+    #[test]
+    fn measure_pass1_residency_is_the_admitted_workers() {
+        let rig = Pass1Rig::new();
+        let calibrated_dir = rig.layout.calibrated_dir(&rig.group_key);
+        rig.run("run 1", None);
+        assert_eq!(
+            crate::stacking::measure::pass1_peak(&calibrated_dir),
+            1,
+            "a fresh run holds one frame's first pass at a time"
+        );
+        let ids = rig.sorted_ids();
+        assert_eq!(ids.len(), 4);
+        rig.lower_own_betas(&[(ids[0], 1.6), (ids[1], 1.7)]);
+        assert_eq!(rig.run("run 2", None).beta, Some(1.7), "the group beta moved");
+        assert_eq!(
+            crate::stacking::measure::pass1_peak(&calibrated_dir),
+            1,
+            "a group-beta move holds one frame's first pass at a time"
+        );
+    }
+
+    /// Plan A Task 11c: a run cancelled after pass 1 (the `metrics` and `fits.0` rows gone, the first pass on disk)
+    /// resumes from the artifact: no pass-1 work, the same group β to the bit, the four rows back.
+    #[test]
+    fn measure_pass1_from_the_artifact_after_a_lost_pass_two() {
+        let rig = Pass1Rig::new();
+        let first = rig.run("run 1", None);
+        assert_eq!(first.logged.len(), 4);
+        rig.delete_rows(&["metrics", "fits.0"]);
+        assert!(rig.rows("metrics").is_empty());
+        let second = rig.run("run 2", None);
+        assert!(
+            second.logged.is_empty(),
+            "pass 1 re-ran for {:?}",
+            second.logged
+        );
+        assert_eq!(rig.rows("metrics").len(), 4);
+        assert_eq!(
+            second.beta.map(f64::to_bits),
+            first.beta.map(f64::to_bits),
+            "the group beta from the artifacts' own betas is the one the pixels gave"
+        );
+    }
+
+    /// Plan A Task 11c (R11c-4): a calibrated file whose mtime moved since the artifact was written makes THAT
+    /// frame's first pass stale; it re-runs, the others do not, nothing is excluded.
+    #[test]
+    fn measure_pass1_artifact_of_a_changed_source_reruns_pass_one() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        let touched = rig.calibrated_path(ids[2]);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&touched)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(file);
+        rig.delete_rows(&["fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.logged, vec![touched], "only the touched file re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Plan A Task 11c (R11c-2): an artifact that fails its checksum is recomputed (a `warn!`), never decoded and
+    /// never an exclusion.
+    #[test]
+    fn measure_pass1_corrupt_artifact_is_recomputed() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        let row = rig
+            .rows("measured")
+            .remove(&ids[1])
+            .expect("run 1 wrote a measured row for every member");
+        let artifact = PathBuf::from(row.path.unwrap());
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x5a;
+        std::fs::write(&artifact, &bytes).unwrap();
+        rig.delete_rows(&["fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(
+            second.logged,
+            vec![rig.calibrated_path(ids[1])],
+            "only the corrupt artifact's frame re-ran pass 1"
+        );
+        assert_eq!(second.excluded, 0);
+    }
+
+    /// Plan A Task 11c review I2 (R11c-5 (1), bar 5): a run cancelled during phase 1, after at least one frame's pass 1
+    /// finished and its artifact was written, leaves that frame's `measured` row; the next run reuses it (no pass 1
+    /// for that frame) and the others run pass 1.
+    #[test]
+    fn measure_pass1_cancelled_run_keeps_the_rows_of_the_files_it_wrote() {
+        let rig = Pass1Rig::new();
+        let cancelled = rig.try_run(None, Some(2));
+        assert!(
+            matches!(cancelled, Err(RunError::Cancelled)),
+            "the run honoured the cancel"
+        );
+        let written: Vec<PathBuf> = rig
+            .rows("measured")
+            .values()
+            .map(|row| PathBuf::from(row.path.clone().unwrap()))
+            .collect();
+        assert!(
+            !written.is_empty() && written.iter().all(|p| p.is_file()),
+            "the cancelled run left rows for files that exist"
+        );
+        let kept = rig.rows("measured").len();
+        assert!(kept < 4, "the cancel landed mid-phase-1 ({kept} of 4 written)");
+        let second = rig.run("run 2", None);
+        assert_eq!(
+            second.logged.len(),
+            4 - kept,
+            "the next run runs pass 1 only for the frames the cancelled run did not finish"
+        );
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Plan A Task 11c review M1 (R11c-5 (3)): a member whose own beta is on its `metrics` row is a cache hit and its
+    /// artifact is never opened — a corrupt one raises no refusal `warn!` on a run that needs no pass 2.
+    #[test]
+    fn measure_pass1_cache_hit_member_does_not_validate_its_artifact() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        let artifact = PathBuf::from(rig.rows("measured")[&ids[1]].path.clone().unwrap());
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        // A HEAD byte: a head read (step 0's validation) refuses it, so the test fails if a cache hit validates.
+        bytes[crate::stacking::pass1_artifact::PREFIX_LEN] ^= 0x5a;
+        std::fs::write(&artifact, &bytes).unwrap();
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let second = tracing::subscriber::with_default(subscriber, || rig.run("run 2", None));
+        assert!(second.logged.is_empty(), "a cache hit runs no pass 1");
+        let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("first-pass artifact"),
+            "no refusal logged for a cache-hit member: {text}"
+        );
+    }
+
+    /// Plan A Task 11c (R11c-5): a spill that cannot be written (here a file where its directory belongs) is a
+    /// `warn!`, no `measured` row, the records dropped and pass 1 re-run in that member's pass-2 worker — twice, never
+    /// held, so residency stays the admitted workers' even on a full disk.
+    #[test]
+    fn measure_pass1_write_failure_recomputes_in_pass_two() {
+        let rig = Pass1Rig::new();
+        std::fs::create_dir_all(rig.measured_root()).unwrap();
+        std::fs::write(rig.measured_root().join(&rig.group_key), b"not a directory").unwrap();
+        let out = rig.run("run 1", None);
+        assert!(rig.rows("measured").is_empty(), "no row for a file that is not there");
+        assert_eq!(rig.rows("metrics").len(), 4);
+        assert_eq!(out.excluded, 0);
+        assert_eq!(out.logged.len(), 8, "pass 1 ran twice per member");
+        assert_eq!(
+            crate::stacking::measure::pass1_peak(&rig.layout.calibrated_dir(&rig.group_key)),
+            1
+        );
+    }
+
+    /// Plan A Task 11c (R11c-5): `rerun_from <= Measure` skips the artifact as it skips the `metrics` row: pass 1
+    /// runs for every member and the artifact is overwritten in place (rows present, one per member).
+    #[test]
+    fn measure_pass1_rerun_from_measure_recomputes_it() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let second = rig.run("run 2", Some(Stage::Measure));
+        assert_eq!(second.logged.len(), 4, "a forced Measure re-runs every first pass");
+        assert_eq!(rig.rows("measured").len(), 4);
+    }
+
+    /// Plan A Task 11c (upgrade path): a member with a `metrics` row but no artifact (a catalog from before the
+    /// spill) runs pass 1 inside pass 2 ONCE and leaves the artifact; the next group-beta move reads it.
+    #[test]
+    fn measure_pass1_upgrade_runs_it_inside_pass_two_once() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        rig.delete_rows(&["measured"]);
+        let _ = std::fs::remove_dir_all(rig.measured_root());
+        let ids = rig.sorted_ids();
+        rig.lower_own_betas(&[(ids[0], 1.6), (ids[1], 1.7)]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.beta, Some(1.7));
+        assert_eq!(second.logged.len(), 4, "the upgrade ripple: pass 1 inside pass 2, once");
+        assert_eq!(rig.rows("measured").len(), 4);
+        rig.lower_own_betas(&[(ids[2], 1.2), (ids[3], 1.3)]);
+        let third = rig.run("run 3", None);
+        assert_eq!(third.beta, Some(1.3), "the group beta moved again");
+        assert!(
+            third.logged.is_empty(),
+            "pass 1 re-ran for {:?}",
+            third.logged
+        );
+    }
+
+    /// Plan A Task 11c, bar 1 (a pin, ruling F28: green at HEAD of the spill and after): every `.athf` (bytes), every
+    /// `metrics` payload minus its wall-clock `durationMs`, the group β (f64 bits) and every `metrics` / `fits.0` key
+    /// of a run equal the in-memory two-pass measurement's (11b's: `measure_frame_pass1` then `measure_frame_pass2` at
+    /// the run's group β) — fresh, and again from the artifact after the `fits.0` rows are gone.
+    #[test]
+    fn measure_pass1_spill_is_byte_identical_fresh_and_from_the_artifact() {
+        let rig = Pass1Rig::new();
+        let opts = rig
+            .cfg
+            .measurement
+            .measure_options(rig.cfg.normalization.scale_estimator);
+        let strip = |mut v: serde_json::Value| {
+            v.as_object_mut().unwrap().remove("durationMs");
+            v
+        };
+        // Per frame: (metrics key, fits.0 key, payload minus its timing, the .athf bytes).
+        let snapshot = || {
+            let metrics = rig.rows("metrics");
+            let fits = rig.rows("fits.0");
+            assert_eq!((metrics.len(), fits.len()), (4, 4));
+            metrics
+                .into_iter()
+                .map(|(frame_id, row)| {
+                    let fits_row = &fits[&frame_id];
+                    let payload =
+                        serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
+                    (
+                        frame_id,
+                        (
+                            row.config_hash.clone(),
+                            fits_row.config_hash.clone(),
+                            strip(payload),
+                            std::fs::read(fits_row.path.as_deref().unwrap()).unwrap(),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        let fresh = rig.run("fresh", None);
+        let beta = fresh.beta.expect("a group beta");
+        let from_fresh = snapshot();
+        for (frame_id, (_, _, payload, athf)) in &from_fresh {
+            let path = rig.calibrated_path(*frame_id);
+            let cancel = AtomicBool::new(false);
+            let pass1 = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let betas = vec![beta; pass1.beta_own().len()];
+            let (m, fits) =
+                measure_frame_pass2(&path, pass1, &betas, &opts, None, &cancel).unwrap();
+            assert_eq!(
+                payload,
+                &strip(serde_json::to_value(&m).unwrap()),
+                "frame {frame_id}: payload"
+            );
+            let reference = rig.working.path().join(format!("reference-{frame_id}.athf"));
+            fits_artifact::write_fits(&reference, &fits[0]).unwrap();
+            assert_eq!(
+                athf,
+                &std::fs::read(&reference).unwrap(),
+                "frame {frame_id}: the .athf bytes"
+            );
+        }
+
+        rig.delete_rows(&["fits.0"]);
+        let again = rig.run("from the artifact", None);
+        assert!(again.logged.is_empty(), "pass 1 re-ran for {:?}", again.logged);
+        assert_eq!(
+            again.beta.map(f64::to_bits),
+            Some(beta.to_bits()),
+            "the group beta, to the bit"
+        );
+        assert_eq!(
+            snapshot(),
+            from_fresh,
+            "keys, payloads and .athf bytes from the artifact are the fresh run's"
+        );
     }
 
     /// Plan A Task 11b: `Moffat4` keeps the single pass, byte-identical to before the task — every row keyed on the
@@ -14996,6 +15761,17 @@ mod tests {
         assert_eq!(
             crate::db::stacking::list_groups(&fixture.conn, run_id).unwrap()[0].beta,
             Some(4.0)
+        );
+        // Plan A Task 11c: the single pass spills nothing.
+        assert!(
+            rows_of_kind(&fixture.conn, fixture.set_id, "measured").is_empty(),
+            "no measured row under Moffat4"
+        );
+        assert!(
+            !WorkingLayout::new(working.path(), &set_slug(SET_NAME))
+                .measured_root()
+                .exists(),
+            "no measured/ under Moffat4"
         );
     }
 
@@ -28470,7 +29246,7 @@ mod tests {
             }
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             assert!(
-                ["fits", "athf", "rej", "athln", "json", "png", "jpg"].contains(&ext),
+                ["fits", "athf", "athm", "rej", "athln", "json", "png", "jpg"].contains(&ext),
                 "an unexpected output {}",
                 p.display()
             );

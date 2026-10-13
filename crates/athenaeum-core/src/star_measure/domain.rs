@@ -70,7 +70,7 @@ impl Domain {
 /// `RawAdu`): `sigma` is the MRS σ, or `n_star` when MRS refused the plane (`source` says which); `m_star`, `n_star`
 /// are `M*`, `N*` of the large-scale background residual (math reference §1.3), zero when the background model was
 /// unavailable.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NoiseModel {
     pub sigma: f64,
     pub source: NoiseSource,
@@ -317,7 +317,7 @@ pub fn noise_model_with(
 
 /// The stratified-sample sky statistic (I-8, PA-21) in the plane's NATIVE units: the median, MAD and mean absolute
 /// deviation of the clipped sample, the normalization location and two-sided scale, and the noise-scale factors.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SkyLevel {
     pub median: f64,
     pub mad: f64,

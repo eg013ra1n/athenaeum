@@ -592,6 +592,20 @@ pub(crate) fn measurement_hash_for(
     stage_hash(&measurement_subtree(cfg), &[calibrated_hash, &beta], &[])
 }
 
+/// The key of a frame's Measure first-pass artifact, the `measured` kind (Plan A Task 11c, R11c-3): the measurement
+/// subtree keyed on the frame's OWN stage-1 hash and the artifact's format version, NOT on the group β — the records
+/// are a function of the pixels and the options only, so a group-β move leaves them valid. The format version is
+/// folded in so a bump re-keys every row (stale, `debug!`) instead of a `warn!` per frame. Never a `metrics` key (those
+/// fold `measure_beta:...` or nothing). Used under `Auto` only: `Moffat4` / `Fixed` keep the single pass and write
+/// nothing.
+pub(crate) fn pass1_hash_for(cfg: &StackingConfig, calibrated_hash: &str) -> String {
+    let format = format!(
+        "measure_pass1:v{}",
+        crate::stacking::pass1_artifact::PASS1_ARTIFACT_VERSION
+    );
+    stage_hash(&measurement_subtree(cfg), &[calibrated_hash, &format], &[])
+}
+
 /// A stored `metrics` payload's first pass, when it is still valid (Task 11b, owner decision R11b-12): the row's
 /// `config_hash` equals [`measurement_hash_for`] at the β its fits were made at — `psf_signal::group_beta` of its
 /// channels' `beta`, which is the group β on every member of a group (all its channels share it) and a group of one's
@@ -8146,6 +8160,27 @@ mod tests {
                 .unwrap(),
             r#"{"exposureToleranceSec":2.0}"#
         );
+    }
+
+    /// Plan A Task 11c (R11c-3): the first-pass artifact's key is never a `metrics` key (those fold `measure_beta:...`
+    /// or nothing), does not move with the group beta (it takes none), moves with the measurement config and the
+    /// calibration hash, and is pinned beside `stage_hashes_are_pinned_to_golden_literals`' calibration hash.
+    #[test]
+    fn pass1_hash_is_never_a_metrics_key() {
+        let cfg = StackingConfig::default();
+        let calib = "f3cf4be2b2178358";
+        let key = pass1_hash_for(&cfg, calib);
+        for b in [1.5, 3.3066, 4.0] {
+            assert_ne!(key, measurement_hash_for(&cfg, calib, Some(b)), "beta {b}");
+        }
+        assert_ne!(key, measurement_hash_for(&cfg, calib, None));
+        let mut other = cfg.clone();
+        other.measurement.max_stars += 1;
+        assert_ne!(key, pass1_hash_for(&other, calib), "moves with measurement.maxStars");
+        assert_ne!(key, pass1_hash_for(&cfg, "another-calibration"), "moves with the calib hash");
+        assert_eq!(key, pass1_hash_for(&cfg, calib), "a pure function of its inputs");
+        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4).
+        assert_eq!(key, "3c734a7e6da780d3");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over

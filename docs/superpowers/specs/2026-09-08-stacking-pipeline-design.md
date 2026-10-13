@@ -1421,6 +1421,14 @@ mosaic is reported neither cached nor fresh — so the gate and the run can
 never disagree about what the first Bayer run will redo.
 `deleteIntermediates` removes the kind with `calibrated`.
 
+Plan A Task 11c adds the `measured` kind (`measured/<group>/<stem>.athm`): the
+Measure first pass of every `Auto` member, written once. Its key is the
+measurement subtree + the calibrated-file hash + the artifact format version,
+never the group β (a β move re-runs pass 2 only). The stored source stamp
+(size + mtime at pass 1's first plane read) must equal the calibrated file's
+identity now, else pass 1 re-runs; `Moffat4` / `Fixed` write nothing.
+`deleteIntermediates` removes it with `calibrated`.
+
 ### 9.4 Paths
 
 - Global defaults: `stacking.working_dir`, `stacking.output_dir` (empty =
@@ -1448,6 +1456,7 @@ never disagree about what the first Bayer run will redo.
                                                   mosaic — M4d, `drizzle.bayer`)
   registered/<group key>/r_<stem>.fits          (optional)
   ln/<group key>/reference.fits, <stem>.athln    (M2)
+  measured/<group key>/<stem>.athm              (Auto only — Task 11c, the Measure first pass)
   rej/run-<id>/<group key>/<stem>.rej            (drizzle runs only, temporary)
   runs/run-<id>.json
 <output>/
