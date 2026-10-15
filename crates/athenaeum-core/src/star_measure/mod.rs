@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use crate::integration::stats::ScaleEstimator;
 
 pub mod beta;
+pub mod budget;
 pub mod diagnostics;
 pub mod domain;
 pub mod fit;
@@ -26,6 +27,7 @@ pub mod robust;
 pub mod seeds;
 
 pub use beta::{frame_beta, BetaSource, AUTO_BETAS, AUTO_SAMPLE, BETA_BOUNDS};
+pub use budget::BudgetReport;
 pub use diagnostics::{FitDiagnostics, Outcome, RefusalCounts, RefusalReason};
 pub use domain::{
     background_residual, noise_model, noise_mrs, sky_level, to_working_units, Domain, NoiseModel,
@@ -189,6 +191,22 @@ pub struct MeasureOptions {
     /// `1 / share` pixels, so an aperture's shot variance is `1 / share` times the white value. `None` (every plane
     /// whose pixels are sites) = 1.
     pub cfa_site_share: Option<f64>,
+    /// Which seeds are fitted (Task 12): every one (`All`, the stacking path and the default) or the Analysis mode's
+    /// budget ([`budget`]).
+    pub mode: Mode,
+}
+
+/// What [`measure_plane`] fits (Plan A Task 12, spec D-3): `All` fits every seed (the stacking Measure stage's path,
+/// byte-identical to before the budget existed); `Budget { budget }` fits the candidates [`budget::select_candidates`]
+/// chose and keeps at most `budget` of the accepted fits ([`budget::trim`]), spread over a 4 × 4 grid of the plane. A
+/// budget no smaller than the seed count measures exactly what `All` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    All,
+    Budget {
+        budget: usize,
+    },
 }
 
 impl Default for MeasureOptions {
@@ -209,6 +227,7 @@ impl Default for MeasureOptions {
             colour: false,
             pixel_noise: PixelNoise::Unknown,
             cfa_site_share: None,
+            mode: Mode::All,
         }
     }
 }
@@ -299,6 +318,7 @@ impl FitStarsOptions<'_> {
             ring_fwhm: self.ring_fwhm,
             gain: self.gain_e_per_working_adu,
             noise: self.aperture_noise,
+            neighbours: None,
         }
     }
 }
@@ -387,6 +407,8 @@ pub struct PlaneMeasurement {
     pub snr_noise: SnrNoise,
     /// `s`, the shot-noise spreading the SNR used (1 / the plane's CFA site share, 1 without one).
     pub shot_spread: f64,
+    /// What the budget did (Task 12, [`budget::BudgetReport`]): `Some` exactly under [`Mode::Budget`].
+    pub budget: Option<BudgetReport>,
     pub timings: PhaseTimings,
 }
 
@@ -404,8 +426,13 @@ pub fn measure_plane(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let working = domain::to_working_units(plane, &opts.domain);
-    let prep = prepare_working(plane, &working, w, h, opts, pool);
-    finish_working(&working, w, h, opts, prep, pool)
+    match opts.mode {
+        Mode::All => {
+            let prep = prepare_working(plane, &working, w, h, opts, pool);
+            finish_working(&working, w, h, opts, prep, pool)
+        }
+        Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool),
+    }
 }
 
 /// One plane measured through its verdict pass (F-3; Task 8 fix wave, the cross-plane rule): the noise model, the
@@ -570,6 +597,14 @@ pub fn prepare_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlanePrep {
+    if opts.mode != Mode::All {
+        // The budget lives in `measure_plane` alone (R12-2): the stacking halves keep every seed.
+        tracing::warn!(
+            width = w,
+            height = h,
+            "measure: the budget applies to measure_plane only; every seed is measured"
+        );
+    }
     let working = domain::to_working_units(plane, &opts.domain);
     prepare_working(plane, &working, w, h, opts, pool)
 }
@@ -692,7 +727,22 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
     }
 }
 
-/// [`prepare_plane`] on a working copy the caller holds.
+/// What [`prepare_head`] measures before any seed is fitted: the noise model, the sky, the saturation plane, the seeds
+/// (detected, or given), the field width, the detection report and the aperture SNR's noise read.
+struct Head {
+    noise: NoiseModel,
+    sky: SkyLevel,
+    seeds: Vec<Seed>,
+    detected: bool,
+    field_width: FieldWidth,
+    detection: Option<DetectionReport>,
+    saturation: SaturationPlane,
+    snr_rho: Option<[[f64; 5]; 5]>,
+    snr_noise: SnrNoise,
+    timings: PhaseTimings,
+}
+
+/// [`prepare_plane`] on a working copy the caller holds: the head, then the verdict pass over every seed.
 fn prepare_working(
     plane: &[f32],
     working: &[f32],
@@ -701,11 +751,50 @@ fn prepare_working(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlanePrep {
+    let head = prepare_head(plane, working, w, h, opts, pool);
+    let passes = prepare_passes(
+        working,
+        w,
+        h,
+        opts,
+        pool,
+        &head.seeds,
+        head.field_width,
+        head.saturation,
+    );
+    PlanePrep {
+        noise: head.noise,
+        sky: head.sky,
+        seeds: head.seeds,
+        detected: head.detected,
+        field_width: head.field_width,
+        detection: head.detection,
+        fit_field: passes.fit_field,
+        passes: passes.passes,
+        saturation: passes.saturation,
+        cross_flags: 0,
+        snr_rho: head.snr_rho,
+        snr_noise: head.snr_noise,
+        timings: head.timings,
+        verdict_time: passes.verdict_time,
+    }
+}
+
+/// [`prepare_working`]'s first half: noise, mesh, sky, saturation plane, detection and the noise correlation.
+fn prepare_head(
+    plane: &[f32],
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Head {
     let mask = opts.mask.as_deref();
     let pixel_noise = opts.pixel_noise.with_colour(opts.colour);
     let detecting = matches!(opts.seeds, SeedSpec::MatchedFilter { .. });
     // Given seeds on a plane not stated white: the aperture SNR's noise read needs the mesh's noise map (R11-1).
-    let given_read = pixel_noise != PixelNoise::White && matches!(opts.seeds, SeedSpec::Given(ref g) if !g.is_empty());
+    let given_read = pixel_noise != PixelNoise::White
+        && matches!(opts.seeds, SeedSpec::Given(ref g) if !g.is_empty());
     let want_noise = detecting || given_read;
     // The plane's ONE background mesh (Task 10b, ruling Q4): `N*`'s model and the matched filter's background (with
     // its noise map, the detection noise's), built once over the plane's present pixels and handed to both. A plane
@@ -805,7 +894,8 @@ fn prepare_working(
         let read = match &detection {
             Some(report) => report.noise_correlation,
             None if !seeds.is_empty() => {
-                let mesh = mesh.unwrap_or_else(|| domain::background_mesh(working, w, h, mask, true));
+                let mesh =
+                    mesh.unwrap_or_else(|| domain::background_mesh(working, w, h, mask, true));
                 seeds::read_noise_correlation(working, w, h, mask, &mesh)
             }
             None => None,
@@ -820,7 +910,10 @@ fn prepare_working(
                     "snr: the noise correlation could not be read; the aperture noise is taken white"
                 );
             } else {
-                tracing::debug!(count = seeds.len(), "snr: the matched filter's noise read failed; aperture noise white");
+                tracing::debug!(
+                    count = seeds.len(),
+                    "snr: the matched filter's noise read failed; aperture noise white"
+                );
             }
         }
         match read {
@@ -828,13 +921,50 @@ fn prepare_working(
             None => (None, SnrNoise::Unread),
         }
     };
+    Head {
+        noise,
+        sky,
+        seeds,
+        detected,
+        field_width,
+        detection,
+        saturation,
+        snr_rho,
+        snr_noise,
+        timings,
+    }
+}
+
+/// What [`prepare_passes`] adds: the fit's field width, one verdict-pass record per seed handed in, the saturation plane
+/// with its near-clip floor read from those records, and the pass's wall time.
+struct Passes {
+    fit_field: FieldWidth,
+    passes: Vec<fit::SeedPass>,
+    saturation: SaturationPlane,
+    verdict_time: Duration,
+}
+
+/// [`prepare_working`]'s second half: the verdict pass over `seeds` (every seed, or the budget's candidates), the clip
+/// floor from their verdicts and the near-clip class.
+#[allow(clippy::too_many_arguments)]
+fn prepare_passes(
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seeds: &[Seed],
+    field_width: FieldWidth,
+    saturation: SaturationPlane,
+) -> Passes {
+    let mask = opts.mask.as_deref();
     let t = Instant::now();
     let pass_call = || {
         fit::verdict_pass(
             working,
             w,
             h,
-            &seeds,
+            seeds,
             &opts.fit,
             mask,
             Some(field_width.fwhm_px),
@@ -864,20 +994,10 @@ fn prepare_working(
             photometry::mark_near_clip(&saturation, v);
         }
     }
-    PlanePrep {
-        noise,
-        sky,
-        seeds,
-        detected,
-        field_width,
-        detection,
+    Passes {
         fit_field,
         passes,
         saturation,
-        cross_flags: 0,
-        snr_rho,
-        snr_noise,
-        timings,
         verdict_time: t.elapsed(),
     }
 }
@@ -998,7 +1118,229 @@ fn finish_working(
         snr_missing,
         snr_noise,
         shot_spread,
+        budget: None,
         timings,
+    }
+}
+
+/// [`measure_plane`] under [`Mode::Budget`] (Task 12, R12-2…R12-6): the head over every seed, the budget's candidates,
+/// the verdict pass and the fits on the candidates alone, then the trim. The ring sky and `c` still read every detected
+/// seed (R12-5). `Moffat4` and `Fixed(b)` run no β sample; `Auto` samples the candidates' verdicts (R12-1).
+fn measure_budget(
+    plane: &[f32],
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    budget: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    let head = prepare_head(plane, working, w, h, opts, pool);
+    let Head {
+        noise,
+        sky,
+        seeds,
+        detected,
+        field_width,
+        detection,
+        saturation,
+        snr_rho,
+        snr_noise,
+        mut timings,
+    } = head;
+    let select_t = Instant::now();
+    let (candidates, _counts) = budget::select_candidates(&seeds, w, h, budget);
+    let select_time = select_t.elapsed();
+    let seed_cells: Vec<u8> = seeds
+        .iter()
+        .map(|s| budget::cell_of(s.x, s.y, w, h))
+        .collect();
+    let sub: Vec<Seed> = candidates.iter().map(|&i| seeds[i]).collect();
+    let extended: Vec<bool> = detection.as_ref().map_or(Vec::new(), |d| {
+        candidates
+            .iter()
+            .map(|&i| d.extended.get(i).copied().unwrap_or(false))
+            .collect()
+    });
+    let prepared = prepare_passes(working, w, h, opts, pool, &sub, field_width, saturation);
+    let Passes {
+        fit_field,
+        passes,
+        saturation,
+        verdict_time,
+    } = prepared;
+    let snr_gain = opts.domain.gain_e_per_working_adu();
+    let shot_spread = opts
+        .cfa_site_share
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+        .map_or(1.0, |s| 1.0 / s);
+    let t = Instant::now();
+    let fit_call = || {
+        fit::fit_after_passes(
+            working,
+            w,
+            h,
+            &sub,
+            opts.psf_model,
+            &opts.fit,
+            opts.mask.as_deref(),
+            fit_field,
+            Some(&passes),
+            fit::Correction {
+                saturation: Some(&saturation),
+                gain: snr_gain,
+                noise: ApertureNoise {
+                    rho: snr_rho,
+                    shot_spread,
+                },
+                neighbours: Some(fit::Neighbours {
+                    seeds: &seeds,
+                    of_fit: &candidates,
+                }),
+                ..Default::default()
+            },
+            None,
+            opts.diagnostics,
+            true,
+            true,
+            &extended,
+        )
+    };
+    let mut outcome = match pool {
+        Some(p) => p.install(fit_call),
+        None => fit_call(),
+    };
+    // The candidate selection's wall is part of `fit_ms` (M-5), so the timings sum covers it.
+    timings.fit_ms = (select_time + verdict_time + t.elapsed()).as_millis() as u64;
+    // R12-4: the trim over the accepted fits, each in its SEED's cell.
+    let accepted: Vec<usize> = outcome.fit_seeds.iter().map(|&k| candidates[k]).collect();
+    let fit_cells: Vec<u8> = accepted.iter().map(|&i| seed_cells[i]).collect();
+    let removed = budget::trim(&outcome.fits, &fit_cells, budget);
+    let mut is_removed = vec![false; outcome.fits.len()];
+    for &k in &removed {
+        is_removed[k] = true;
+    }
+    // New star index of every kept fit (the fit call's order).
+    let mut star_of: Vec<Option<usize>> = Vec::with_capacity(is_removed.len());
+    let mut kept_seeds: Vec<usize> = Vec::new();
+    let mut stars: Vec<StarFit> = Vec::with_capacity(is_removed.len() - removed.len());
+    for (k, f) in std::mem::take(&mut outcome.fits).into_iter().enumerate() {
+        if is_removed[k] {
+            star_of.push(None);
+        } else {
+            star_of.push(Some(stars.len()));
+            kept_seeds.push(accepted[k]);
+            stars.push(f);
+        }
+    }
+    let plane_verdict = outcome.defocused || outcome.trailed;
+    let report = budget::report(
+        &seed_cells,
+        &candidates,
+        &accepted,
+        &kept_seeds,
+        plane_verdict,
+    );
+    let mut refused = std::mem::take(&mut outcome.refused);
+    refused.not_selected = seeds.len() - candidates.len();
+    refused.trimmed = removed.len();
+    debug_assert_eq!(
+        refused.accounted(stars.len()),
+        seeds.len(),
+        "every seed has exactly one outcome (ruling F13)"
+    );
+    // One record per detected seed, in seed order (R12-2): the candidates' records re-indexed to the detected seeds,
+    // `Accepted { star }` renumbered after the trim, the trimmed fits' records kept as `Trimmed`.
+    let diagnostics = if opts.diagnostics {
+        let mut by_seed: Vec<Option<FitDiagnostics>> = vec![None; seeds.len()];
+        for mut d in std::mem::take(&mut outcome.diagnostics) {
+            let seed = candidates[d.seed];
+            d.seed = seed;
+            if let Outcome::Accepted { star } = d.outcome {
+                d.outcome = match star_of[star] {
+                    Some(star) => Outcome::Accepted { star },
+                    None => Outcome::Trimmed,
+                };
+            }
+            by_seed[seed] = Some(d);
+        }
+        by_seed
+            .into_iter()
+            .enumerate()
+            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let frame = FrameAggregates::of(&stars);
+    let snr_missing = stars.iter().filter(|f| f.snr.is_nan()).count();
+    let ring_sky_missing = stars.iter().filter(|f| f.sky_ring_n == 0).count();
+    if snr_missing > 0 {
+        tracing::debug!(
+            count = snr_missing,
+            stars_fitted = stars.len(),
+            "snr: stars without a ring sky have no SNR"
+        );
+    }
+    tracing::debug!(
+        budget,
+        candidates = report.candidates,
+        kept = report.kept,
+        not_selected = report.not_selected,
+        trimmed = report.trimmed,
+        cells_with_stars = report.cells_with_stars,
+        cells_covered = report.cells_covered,
+        "budget applied"
+    );
+    PlaneMeasurement {
+        stars,
+        beta: outcome.beta,
+        beta_source: outcome.beta_source,
+        frame,
+        noise,
+        sky,
+        seeds: seeds.len(),
+        detected: if detected { seeds } else { Vec::new() },
+        field_width,
+        refused,
+        diagnostics,
+        defocused: outcome.defocused,
+        defocus_donuts: outcome.defocus_donuts,
+        trailed: outcome.trailed,
+        trail_share: outcome.trail_share,
+        verdict_fit_failed: outcome.verdict_fit_failed,
+        cross_flags: 0,
+        aperture_correction: outcome.aperture_correction,
+        aperture_stars: outcome.aperture_stars,
+        ring_sky_missing,
+        clip_floor: saturation
+            .clip_floor
+            .map(|f| (f - saturation.bg) / saturation.range),
+        clip_evidence: saturation.clip_evidence,
+        detection,
+        snr_gain,
+        snr_missing,
+        snr_noise,
+        shot_spread,
+        budget: Some(report),
+        timings,
+    }
+}
+
+/// A seed the budget never fitted: the "not reached" values of [`FitDiagnostics`].
+fn not_selected_record(seed: usize) -> FitDiagnostics {
+    FitDiagnostics {
+        seed,
+        outcome: Outcome::NotSelected,
+        region_radius: 0,
+        background_start: f64::NAN,
+        width_start: f64::NAN,
+        growth_steps: 0,
+        pixels_used: 0,
+        iterations: None,
+        converged: false,
+        verdict: None,
+        sample_beta: None,
     }
 }
 
@@ -3294,5 +3636,411 @@ mod tests {
                 whole.fwhm()
             );
         }
+    }
+
+    // ---- Plan A Task 12: the Analysis mode and the budget ----
+
+    fn uniform(n: usize, w: usize, h: usize, seed: u64) -> Vec<MoffatStar> {
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        (0..n)
+            .map(|_| MoffatStar {
+                x: 20.0 + rng.next_f64() * (w as f64 - 40.0),
+                y: 20.0 + rng.next_f64() * (h as f64 - 40.0),
+                amp: 0.05 + 0.3 * rng.next_f64(),
+                alpha_x: 3.0,
+                alpha_y: 3.0,
+                theta: 0.0,
+            })
+            .collect()
+    }
+
+    /// The 1024² field with pseudo-noise, as the probe's own fixture adds it (ruling F29): the MRS noise estimate needs
+    /// some, and a noiseless plane is a refused noise model that seeds nothing under `SeedSpec::MatchedFilter` (Review
+    /// Focus 4).
+    fn noisy_field(stars: &[MoffatStar], noise_seed: u64) -> Vec<f32> {
+        let mut data = moffat_field(1024, 1024, stars, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, noise_seed);
+        data
+    }
+
+    fn budget_opts(budget: usize) -> MeasureOptions {
+        MeasureOptions {
+            mode: Mode::Budget { budget },
+            seeds: SeedSpec::MatchedFilter {
+                threshold: seeds::DEFAULT_THRESHOLD,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn budget_covers_every_cell_that_holds_a_star() {
+        let stars = uniform(800, 1024, 1024, 11);
+        let data = noisy_field(&stars, 11);
+        let m = measure_plane(&data, 1024, 1024, &budget_opts(500), None);
+        let b = m.budget.unwrap();
+        assert!(
+            m.stars.len() <= 500 && m.stars.len() >= 480,
+            "{}",
+            m.stars.len()
+        );
+        assert_eq!(b.cells_with_stars, 16);
+        assert_eq!(b.cells_covered, 16);
+        assert_eq!(
+            m.stars.len() + m.refused.total() + m.refused.not_selected + m.refused.trimmed,
+            m.seeds
+        );
+    }
+
+    #[test]
+    fn budget_keeps_the_brightest_per_cell_when_one_cell_dominates() {
+        let mut stars = uniform(600, 256, 256, 3); // all inside the top-left cell of a 1024² plane
+        stars.extend((0..15).map(|i| MoffatStar {
+            x: 300.0 + (i % 5) as f64 * 150.0,
+            y: 300.0 + (i / 5) as f64 * 200.0,
+            amp: 0.2,
+            alpha_x: 3.0,
+            alpha_y: 3.0,
+            theta: 0.0,
+        }));
+        let data = noisy_field(&stars, 3);
+        let m = measure_plane(&data, 1024, 1024, &budget_opts(200), None);
+        let b = m.budget.unwrap();
+        assert_eq!(
+            b.cells_covered, b.cells_with_stars,
+            "every cell with a star keeps one"
+        );
+        let outside = m
+            .stars
+            .iter()
+            .filter(|f| f.x >= 256.0 || f.y >= 256.0)
+            .count();
+        assert!(outside >= 14, "the sparse cells' stars are kept: {outside}");
+        assert!(m.stars.len() <= 200);
+    }
+
+    #[test]
+    fn budget_mode_accounts_for_every_seed() {
+        let stars = uniform(900, 1024, 1024, 5);
+        let data = noisy_field(&stars, 5);
+        let m = measure_plane(
+            &data,
+            1024,
+            1024,
+            &MeasureOptions {
+                diagnostics: true,
+                ..budget_opts(500)
+            },
+            None,
+        );
+        let b = m.budget.unwrap();
+        assert!(
+            b.not_selected > 0,
+            "900 seeds, 1.25 × 500 / 16 per cell: many are never fitted"
+        );
+        assert_eq!(
+            m.diagnostics
+                .iter()
+                .filter(|d| d.outcome == Outcome::NotSelected)
+                .count(),
+            b.not_selected
+        );
+        assert_eq!(
+            m.diagnostics
+                .iter()
+                .filter(|d| d.outcome == Outcome::Trimmed)
+                .count(),
+            b.trimmed
+        );
+        assert_eq!(
+            m.stars.len() + m.refused.total() + b.not_selected + b.trimmed,
+            m.seeds
+        );
+        assert_eq!(m.refused.not_selected, b.not_selected);
+        assert!(
+            m.diagnostics.iter().enumerate().all(|(i, d)| d.seed == i),
+            "one record per detected seed, in seed order"
+        );
+    }
+
+    /// M-2 (Task 12 review): after a trim that removes stars from the middle of the order, every renumbered
+    /// `Accepted { star }` points at the fit of its own seed (the star sits on the seed's position), and the
+    /// record's `star` indices are a permutation-free 0..kept.
+    #[test]
+    fn a_renumbered_accepted_star_is_the_fit_of_its_own_seed() {
+        let stars = uniform(900, 1024, 1024, 5);
+        let data = noisy_field(&stars, 5);
+        let m = measure_plane(
+            &data,
+            1024,
+            1024,
+            &MeasureOptions {
+                diagnostics: true,
+                ..budget_opts(200)
+            },
+            None,
+        );
+        let b = m.budget.unwrap();
+        assert!(
+            b.trimmed > 0 && !m.stars.is_empty(),
+            "the trim removes stars"
+        );
+        let mut seen = vec![false; m.stars.len()];
+        let mut first_gap = false;
+        for d in &m.diagnostics {
+            match d.outcome {
+                Outcome::Accepted { star } => {
+                    assert!(!seen[star], "star {star} claimed twice");
+                    seen[star] = true;
+                    let s = &m.detected[d.seed];
+                    let off = (m.stars[star].x - s.x).hypot(m.stars[star].y - s.y);
+                    assert!(off < 2.0, "star {star} is {off} px from seed {}", d.seed);
+                }
+                Outcome::Trimmed => first_gap = true,
+                _ => {}
+            }
+        }
+        assert!(seen.iter().all(|&x| x), "every kept star has its record");
+        assert!(first_gap, "a Trimmed record sits between the accepted ones");
+    }
+
+    /// R12-2 / R12-3: a budget no smaller than the seed count selects every seed and trims nothing. The measurement is then
+    /// `Mode::All`'s bit for bit (Debug text, so NaN fields compare; the wall-clock timings set equal), on given and
+    /// matched-filter seeds, under both PSF models.
+    #[test]
+    fn a_budget_at_or_above_the_seed_count_is_mode_all_bit_for_bit() {
+        let (fixture, fw, fh) = crate::test_support::fixture_field(7, 1.0, 0.002);
+        let given = test_seeds_of(&fixture, fw, fh);
+        let noisy = noisy_field(&uniform(300, 1024, 1024, 9), 9);
+        for (plane, w, h, spec) in [
+            (&fixture, fw, fh, SeedSpec::Given(given)),
+            (
+                &noisy,
+                1024,
+                1024,
+                SeedSpec::MatchedFilter {
+                    threshold: seeds::DEFAULT_THRESHOLD,
+                },
+            ),
+        ] {
+            for psf_model in [PsfModel::Auto, PsfModel::Moffat4] {
+                let all = MeasureOptions {
+                    seeds: spec.clone(),
+                    psf_model,
+                    diagnostics: true,
+                    ..Default::default()
+                };
+                let a = measure_plane(plane, w, h, &all, None);
+                let mut b = measure_plane(
+                    plane,
+                    w,
+                    h,
+                    &MeasureOptions {
+                        mode: Mode::Budget { budget: a.seeds },
+                        ..all.clone()
+                    },
+                    None,
+                );
+                let r = b.budget.take().expect("a budget report");
+                assert_eq!(
+                    (r.not_selected, r.trimmed, r.candidates, r.kept),
+                    (0, 0, a.seeds, a.stars.len())
+                );
+                b.timings = a.timings;
+                assert_eq!(format!("{b:?}"), format!("{a:?}"));
+            }
+        }
+    }
+
+    /// Determinism (no order-dependent container in the selection, the trim or the re-indexing): two runs, one result.
+    #[test]
+    fn the_budget_measurement_is_deterministic() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let opts = MeasureOptions {
+            diagnostics: true,
+            ..budget_opts(500)
+        };
+        let a = measure_plane(&data, 1024, 1024, &opts, None);
+        let mut b = measure_plane(&data, 1024, 1024, &opts, None);
+        b.timings = a.timings;
+        assert_eq!(format!("{b:?}"), format!("{a:?}"));
+    }
+
+    /// F13 with the diagnostics off (the Analysis tab's setting): the counts are kept in `refused` and the report, and
+    /// asking for the per-seed records moves no number.
+    #[test]
+    fn the_budget_identity_holds_without_diagnostics_and_they_move_no_number() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let off = measure_plane(&data, 1024, 1024, &budget_opts(500), None);
+        let on = measure_plane(
+            &data,
+            1024,
+            1024,
+            &MeasureOptions {
+                diagnostics: true,
+                ..budget_opts(500)
+            },
+            None,
+        );
+        let b = off.budget.unwrap();
+        assert!(off.diagnostics.is_empty());
+        assert_eq!(off.refused.accounted(off.stars.len()), off.seeds);
+        assert_eq!(
+            (off.refused.not_selected, off.refused.trimmed),
+            (b.not_selected, b.trimmed)
+        );
+        assert_eq!(
+            (b.kept, b.candidates),
+            (off.stars.len(), off.seeds - b.not_selected)
+        );
+        assert_eq!(
+            format!("{:?}", off.stars),
+            format!("{:?}", on.stars),
+            "diagnostics change no number"
+        );
+    }
+
+    /// R12-1 (owner): under the Analysis default, Moffat 4 is zero extra work. Every fit is at 4, the source is the
+    /// caller's, and no record carries a sample β. `Auto` runs the verdict sample on the candidates only.
+    #[test]
+    fn budget_with_moffat4_fits_at_four_and_runs_no_beta_sample() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let opts = |psf_model| MeasureOptions {
+            psf_model,
+            diagnostics: true,
+            ..budget_opts(500)
+        };
+        assert_eq!(budget::ANALYSIS_PSF_MODEL, PsfModel::Moffat4);
+        let m = measure_plane(&data, 1024, 1024, &opts(budget::ANALYSIS_PSF_MODEL), None);
+        assert_eq!((m.beta, m.beta_source), (4.0, BetaSource::Fixed));
+        assert!(
+            m.diagnostics.iter().all(|d| d.sample_beta.is_none()),
+            "R12-1: no beta sample under Moffat 4"
+        );
+        assert!(m
+            .stars
+            .iter()
+            .all(|f| f.beta == 4.0 && !f.flags.beta_at_cap()));
+        let a = measure_plane(&data, 1024, 1024, &opts(PsfModel::Auto), None);
+        assert!(
+            matches!(a.beta_source, BetaSource::Fitted { .. }),
+            "{:?}",
+            a.beta_source
+        );
+        let sampled: Vec<&FitDiagnostics> = a
+            .diagnostics
+            .iter()
+            .filter(|d| d.sample_beta.is_some())
+            .collect();
+        assert!(!sampled.is_empty());
+        assert!(
+            sampled.iter().all(|d| d.outcome != Outcome::NotSelected),
+            "Auto's sample is the candidates'"
+        );
+    }
+
+    /// R12-5: the budget fits a subset. The ring sky still leaves out every seed's 3F disc, and `c`'s isolation still
+    /// reads every seed, exactly as when all of them are fitted. In working units at a given ring width and field width,
+    /// so the two calls fit A identically.
+    #[test]
+    fn the_ring_sky_and_the_isolation_read_every_seed_not_only_the_fitted_ones() {
+        let (f_ring, field) = (2.6, Some(2.61));
+        let star = |x: f64, y: f64, amp: f64| MoffatStar {
+            x,
+            y,
+            amp,
+            alpha_x: 3.0,
+            alpha_y: 3.0,
+            theta: 0.0,
+        };
+        let run = |stars: &[MoffatStar], fitted: usize, neighbours: bool| {
+            let mut data = moffat_field(200, 200, stars, 4.0, 0.05);
+            crate::test_support::add_noise(&mut data, 0.002, 7);
+            let data: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+            let seeds: Vec<Seed> = stars
+                .iter()
+                .map(|s| Seed {
+                    x: s.x,
+                    y: s.y,
+                    peak: s.amp * ADU_SCALE as f64,
+                    flux: s.amp,
+                })
+                .collect();
+            let of_fit: Vec<usize> = (0..fitted).collect();
+            let n = neighbours.then(|| fit::Neighbours {
+                seeds: &seeds,
+                of_fit: &of_fit,
+            });
+            fit::fit_stars_with_beta_diagnosed(
+                &data,
+                200,
+                200,
+                &seeds[..fitted],
+                4.0,
+                &FitParams::default(),
+                None,
+                field,
+                None,
+                false,
+                false,
+                false,
+                fit::Correction {
+                    ring_fwhm: Some(f_ring),
+                    neighbours: n,
+                    ..Default::default()
+                },
+            )
+        };
+        // B 11·F from A: inside A's [10F, 12F] ring.
+        let ring = [
+            star(100.0, 100.0, 0.3),
+            star(100.0 + 11.0 * f_ring, 100.0, 0.3),
+        ];
+        let (both, alone, with_n) = (
+            run(&ring, 2, false),
+            run(&ring, 1, false),
+            run(&ring, 1, true),
+        );
+        let a = both
+            .fits
+            .iter()
+            .find(|f| (f.x - 100.0).abs() < 1.0)
+            .unwrap();
+        assert_eq!(
+            with_n.fits[0].sky_ring.to_bits(),
+            a.sky_ring.to_bits(),
+            "B's disc is left out of A's ring"
+        );
+        assert!(
+            alone.fits[0].sky_ring > a.sky_ring,
+            "without it, B lifts A's ring sky"
+        );
+        // C (brighter, so the clip screen keeps A) 12 px from A: within 6 · field width, so A is not isolated.
+        let iso = [star(100.0, 100.0, 0.3), star(100.0, 112.0, 0.6)];
+        assert_eq!(run(&iso, 1, false).aperture_stars, 1, "alone, A qualifies");
+        assert_eq!(
+            run(&iso, 1, true).aperture_stars,
+            0,
+            "with its neighbour, A is not isolated"
+        );
+    }
+
+    /// A pin (ruling F28): the default is the stacking path, so every existing literal stays on it.
+    #[test]
+    fn the_default_mode_is_all() {
+        assert_eq!(MeasureOptions::default().mode, Mode::All);
+        let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(test_seeds_of(&data, w, h)),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(m.budget.is_none());
+        assert_eq!(m.refused.not_selected + m.refused.trimmed, 0);
     }
 }

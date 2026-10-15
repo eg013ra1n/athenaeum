@@ -4448,44 +4448,274 @@ notes** the first run after the upgrade also writes `measured/`.
 
 ### Task 12: The Analysis mode and the budget — Plan C's interface, the cost bars (spec D-3, §2.1 `budget`, §3 budget and cost)
 
+**Design read (2026-10-15, `task-12-report-design.md`).** Scope and bars as fixed on 2026-10-07. The Files, Interfaces,
+tests and Steps are reconciled with 8bbcc135 (written before Tasks 4–11c). Where the code contradicted the plan, the
+text below says "design read". Rulings:
+- **R12-0 (owner):** every lab run is on the dev Mac (no runner). The base is the dev-Mac cycle `t12-base` at 8bbcc135.
+- **R12-1 (owner, 2026-10-15):** under the Analysis default `PsfModel::Moffat4` there is NO own-β work of any kind: no
+  β sample, no extra fit, and not the verdict fits' β either. Moffat 4 means zero extra work, `beta` = 4 and
+  `beta_source` = `BetaSource::Fixed`. The frame's β exists only when the caller selects `PsfModel::Auto`. The existing
+  verdict sample then runs on the budget's candidates and is reported as today. This replaces the 2026-10-13
+  "own β shown as a diagnostic" for the Analysis mode.
+- **R12-2 (where the budget lives):** only in `measure_plane`. The selection runs after detection and before the
+  verdict pass, so both per-seed fits (verdict and at-β) run on the candidates only. `PlanePrep` is not changed. The
+  stacking halves `prepare_plane`, `finish_plane` and `plane_beta` stay `Mode::All` only. So `PASS1_ARTIFACT_VERSION`
+  stays 1, and `the_plane_prep_encoding_is_pinned`, unchanged, is the proof.
+- **R12-3 (the selection):** cells, ranks, quota and round-robin under Interfaces.
+- **R12-4 (the trim):** unflagged fits first, then a round-robin by SNR.
+- **R12-5 (neighbours):** the ring sky's seed discs and `c`'s isolation read every detected seed, not only the fitted
+  ones.
+- **R12-6 (what a cell with measurable stars is):** see `budget::report`.
+- **R12-7 (the probe):** no seed lines; `analysis-mode` runs alone, on the raw file; the cost walls are read without
+  `--diagnostics`.
+
 **Files:**
-- Create: `crates/athenaeum-core/src/star_measure/budget.rs`
-- Modify: `star_measure/mod.rs` (`Mode`, `PlaneMeasurement.budget`; the outcomes `NotSelected`/`Trimmed` are
-  emitted here — ruling F13), `examples/star_probe.rs` (`--paths analysis-mode`, `--clip`, `--budget N`; the
-  raw-domain read keeps `PlaneReader` — XISF and `read_raw` are Plan C's), `docs/stacking/README.md` (R-OSP-10),
-  lab: `probe_plan.ANALYSIS_MODE = True` (Task 1b's switch), `scorecard_build` scores the `analysis-mode` path with
-  the measure rows (threshold key `fisher_snr`, `seedThreshold`)
-- Earlier tests this task edits (ruling F14): none (`Mode` defaults to `All` in `MeasureOptions::default()`).
+- Create: `crates/athenaeum-core/src/star_measure/budget.rs`.
+- Modify `star_measure/mod.rs`:
+  - add `pub mod budget` and the re-exports;
+  - add `Mode`, `MeasureOptions.mode` and `PlaneMeasurement.budget`;
+  - split `prepare_working` into `prepare_head` (noise, mesh, sky, saturation plane, detection, noise correlation) and
+    `prepare_passes` (verdict pass, clip floor, near-clip class). This is a pure restructuring: `Mode::All` stays
+    byte-identical;
+  - add `finish_working_with(.., neighbours: Option<fit::Neighbours>)`; `finish_working` calls it with `None`;
+  - add `measure_plane`'s Budget branch;
+  - `prepare_plane` reads no `mode`: with `Mode::Budget` it logs a `warn!` and measures every seed.
+- Modify `star_measure/fit.rs`: `pub(super) struct Neighbours`, `Correction.neighbours`; `ring_and_correction` hands
+  them to the ring sky and to `c`.
+- Modify `star_measure/photometry.rs`: `aperture_correction` gains `own: Option<&[usize]>`. It has one call site.
+- Modify `stacking/measure.rs`: `module_options`, the ONE exhaustive `sm::MeasureOptions` literal in the tree, gains
+  `mode: sm::Mode::All`. Hand edit; never rustfmt this file.
+- Modify `examples/star_probe.rs` (hand edits):
+  - the path `analysis-mode`, `--clip C`, `--budget N` and `--psf moffat4|auto`;
+  - the module doc's paragraph;
+  - the `tests::args` helper.
+- Docs:
+  - `docs/stacking/README.md`: R-OSP-10, with R12-0…R12-7 and the bars;
+  - spec §2.1: the `budget` row as built; spec §3: the budget "as built and as judged";
+  - the logging spec's field dictionary gains `budget`, `candidates`, `kept`, `not_selected`, `trimmed`,
+    `cells_with_stars` and `cells_covered`.
+- Lab (athenaeum-lab `main`, committed and pushed): the L1 list in Step 3.
+- Formatting: `rustfmt` by explicit path on the four `star_measure` files only.
+- Earlier code and tests this task edits (ruling F14):
+  - `stacking/measure.rs::module_options` (one field);
+  - the probe's `tests::args` gains `clip`, `budget` and `psf` (each `None`);
+  - lab `tests/test_run_probe.py::{test_plan_has_legacy_analysis_and_amode_off,
+    test_inject_and_corpus_run_the_analysis_arm_as_legacy_analysis}`: the switch is on, and the corpus gains its amode
+    job.
+
+  No `star_measure::` or `stacking::` test changes: every literal there uses `..Default::default()`, and
+  `Mode::default()` is `All`.
+- Not changed:
+  - `PlanePrep`, so `PASS1_ARTIFACT_VERSION` stays 1;
+  - `MEASURE_VERSION` (PA-4: `Mode::All` moves no number);
+  - every TS type: `BudgetReport` reaches no `ts_export` type in Plan A, so there is no `ts_contract` move;
+  - every command.
 
 **Interfaces:**
-- Produces (`budget.rs`, PA-10, ruling F40):
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+// star_measure/mod.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode { #[default] All, Budget { budget: usize } }
+pub struct MeasureOptions { /* … */ pub mode: Mode }                     // Default: Mode::All (the stacking path)
+pub struct PlaneMeasurement { /* … */ pub budget: Option<BudgetReport> }   // Some exactly under Mode::Budget
+
+// star_measure/budget.rs (PA-10, ruling F40; design read R12-3…R12-6)
+pub const DEFAULT_BUDGET: usize = 500;                          // D-3; Plan C's `maxStars` default reads it
+pub const ANALYSIS_PSF_MODEL: PsfModel = PsfModel::Moffat4;     // R11b-12, R12-1: Plan C's and the probe's default
+pub const CANDIDATE_FACTOR: f64 = 1.25;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetReport { pub cells_with_stars: u8, pub cells_covered: u8, pub candidates: usize, pub kept: usize,
                           pub not_selected: usize, pub trimmed: usize }
-/// The seed indices to fit (per-cell quotas, round-robin by rank) and the per-cell seed counts.
-pub fn select_candidates(seeds: &[Seed], w: usize, h: usize, budget: usize) -> (Vec<usize>, [u16; 16]);
-/// Keeps at most `budget` fits by SNR round-robin over the cells; returns the indices it removed. The report is
-/// assembled by `measure_plane` from `select_candidates`' counts, the fit outcomes and this trim.
-pub fn trim(fits: &[StarFit], w: usize, h: usize, budget: usize) -> Vec<usize>;
+/// The 4 × 4 cell of a position: `4·cy + cx`, `cx = ⌊4x/w⌋`, `cy = ⌊4y/h⌋`, each clamped to [0, 3].
+pub fn cell_of(x: f64, y: f64, w: usize, h: usize) -> u8;
+/// The seeds to fit, ascending (= rank order), and the per-cell seed counts (R12-3).
+pub fn select_candidates(seeds: &[Seed], w: usize, h: usize, budget: usize) -> (Vec<usize>, [u32; 16]);
+/// The fits to remove, ascending, so that at most `budget` remain; `cells[k]` = the cell of fit k's SEED (R12-4).
+pub fn trim(fits: &[StarFit], cells: &[u8], budget: usize) -> Vec<usize>;
+/// The report (R12-6) from every seed's cell, the candidates, the accepted fits before the trim and the kept fits
+/// (seed indices), and whether a plane verdict (defocused / trailed) emptied the plane.
+pub fn report(seed_cells: &[u8], candidates: &[usize], accepted: &[usize], kept: &[usize], plane_verdict: bool)
+    -> BudgetReport;
+
+// star_measure/fit.rs: the budget's fitted subset still masks and isolates against every seed (R12-5)
+#[derive(Debug, Clone, Copy)]   // `Correction` is `Copy`
+pub(super) struct Neighbours<'a> { pub(super) seeds: &'a [Seed], pub(super) of_fit: &'a [usize] }
+pub(super) struct Correction<'a> { /* … */ pub(super) neighbours: Option<Neighbours<'a>> }  // None = the fitted seeds
+// star_measure/photometry.rs: `own[k]` = the index into `seeds` of fit k's seed; None = the identity
+pub(crate) fn aperture_correction(/* data, mask, w, h, fits, seeds, */ own: Option<&[usize]> /* , field_fwhm, … */)
+    -> (Option<f64>, usize);
 ```
 
-  `Mode::Budget { budget }` makes `measure_plane` fit only the selected candidates (every unselected seed gets
-  `Outcome::NotSelected`), drop refused ones, keep saturated ones with their flag, trim (every trimmed fit gets
-  `Outcome::Trimmed`, its diagnostics record kept), and report; `Mode::All` is the stacking path. The per-frame β
-  sample and the aperture correction use the budget's own candidates (they are the brightest anyway). The identity
-  `accepted + refused + not_selected + trimmed = seeds` holds (Task 4's assertion, extended).
+**The rules (deterministic; every tie-break named).**
+- **Cell.** Every cell assignment uses `cell_of` of the SEED's position: the selection, the trim and the report alike.
+  So coverage can never exceed 1. A fit that moved across a cell edge keeps its seed's cell.
+- **R12-3, selection.**
+  - Rank = seed index: the detector hands seeds sorted by matched-filter integrated signal (`flux`) descending, as a
+    stable sort; given seeds count as brightest-first.
+  - Quota `q = ⌈1.25·N/16⌉`; target `T = 16·q` (640 at N = 500).
+  - Water-fill by round-robin: seed i's key is (its rank within its own cell, i), and the candidates are the first
+    `min(T, seeds)` keys. In each round every cell that still holds seeds gives its next brightest. A short cell's
+    unused share passes to the other cells in later rounds. The last partial round goes to the cells whose next seed
+    ranks first.
+  - Returned ascending, so the fit sees the candidates in rank order. With N ≥ seeds, every seed is a candidate and
+    the result is `Mode::All`'s.
+  - N = 0: nothing is selected, every seed is `NotSelected`, and there is one `warn!`.
+  - Cost: one sort of at most 24 576 keys, under 2 ms.
+  - Design read (PA-10's "round-robin by rank when a cell holds fewer" made exact): without the refill, test 2's
+    field fits 31 of its 200.
+- **R12-4, trim.** Tier 0 = `flags.in_statistic()` (neither saturated nor extended); tier 1 = the others. A fit's
+  round r = its rank within (cell, tier), ordered by SNR descending (NaN last), then fit index. Keep the first N of
+  (tier, r, SNR desc with NaN last, fit index). Ties fall to the lower fit index, which is the duplicate drop's
+  amplitude order.
+  - So flagged fits count against N when kept. They fill only the slots no unflagged fit wants (D-3: "good
+    unsaturated stars").
+  - PA-10's plain SNR round-robin would keep saturated stars first: they have the highest SNR, and the frame
+    statistic ignores them.
+- **R12-5, neighbours.** The ring sky masks the 3F disc of EVERY detected seed, and `c`'s isolation tests every seed
+  (`Correction.neighbours = Some(Neighbours { seeds: S, of_fit: C })`). Then a candidate's B_i, σ_i, SNR and HFR are
+  what `Mode::All` reads at the same ring width. On m42, about 97 % of the seeds are not candidates. Every other
+  caller (LN's refits) passes `None`.
+- **R12-6, the report.**
+  - `cells_with_stars` = the cells holding an accepted fit before the trim, plus the cells holding a `NotSelected`
+    seed and no accepted candidate (cells the budget might have covered).
+  - `cells_covered` = the cells holding a kept fit.
+  - A plane whose verdict is defocused or trailed has 0 / 0: by the module's own verdict it holds no measurable star,
+    and the scorecard skips a 0-cell image (`rows_budget_coverage` divides only where `cellsWithStars > 0`).
+  - `candidates` = |C|, `kept` = |stars|, `not_selected` = seeds − |C|, `trimmed` = accepted − kept.
+  - Design read: PA-10's literal "any seed above threshold" would score the module's own refusals (a cell whose only
+    seed is an edge star or a blend) as budget misses; a defocused donut image would read 0 / 16.
+- **The flow under `Mode::Budget`** (`measure_plane` only, R12-2):
+  1. `prepare_head` → all seeds S and the full detection report R.
+  2. `select_candidates` → C.
+  3. `prepare_passes` on S[C]. R is sub-indexed (`extended`, `filter_snr`) for the fit. The fit's field width is the
+     head's, unchanged. The near-clip floor comes from C's verdicts.
+  4. β from `opts.psf_model` as given: `Moffat4` 4 with no sample (R12-1); `Auto` the verdict sample over C; `Fixed(b)`
+     b.
+  5. The fits at β on S[C], the refusals, the plane verdicts (over C), the duplicate drop, the ring sky and `c` with
+     the neighbours, SNR and HFR.
+  6. `trim`: the removed fits' outcome becomes `Outcome::Trimmed`; their diagnostics records are kept.
+  7. Assemble:
+     - `stars` = the kept fits in the fit call's order; `seeds` = |S|; `detected` = S; `detection` = R (every seed);
+     - `refused` = the fit call's `by_reason`, plus `not_selected` and `trimmed`;
+     - `diagnostics` (when asked): one per seed of S, in seed order. C's records are re-indexed to S, and
+       `Accepted { star }` is renumbered after the trim. A `NotSelected` record carries the not-reached values:
+       `region_radius` 0, NaN starts, 0 steps and pixels, no iterations, `converged` false, `verdict` and
+       `sample_beta` `None`;
+     - over the kept fits: `frame`, `snr_missing`, `ring_sky_missing`;
+     - the fit call's, over C: `aperture_correction`, `aperture_stars`, `trail_share`, `defocus_donuts`,
+       `verdict_fit_failed`, `clip_floor`, `clip_evidence`;
+     - `budget` = `Some(report)`.
+  8. One `debug!` carries the report fields.
+  - Multi-plane inputs: one plane at a time, with no cross-plane rule (Plan C's raw input is one plane).
 
-  **Default PSF (Task 11b, owner decision R11b-12, 2026-10-13):** the analysis mode's default PSF is Moffat 4 (Plan C's
-  Analysis / Blink default), the frame's own β reported as a diagnostic, Auto selectable.
+- [x] **Step 1: Write the failing tests** (`budget.rs`, `mod.rs`, the probe).
+  - Every new test fails to compile at 8bbcc135 (no `Mode`, `budget`, `Neighbours`, `own`, nor the probe path).
+    That is their RED; each one's reason is in its doc line.
+  - Pins (ruling F28, outside RED): `the_plane_prep_encoding_is_pinned` and
+    `every_seed_has_exactly_one_outcome_and_the_numbers_do_not_move`, both unchanged, plus the new
+    `the_default_mode_is_all`.
 
-- [ ] **Step 1: Write the failing tests** (`budget.rs` and `mod.rs` tests)
+`budget.rs`:
 
 ```rust
-use crate::test_support::{moffat_field, MoffatStar};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn seed(x: f64, y: f64) -> Seed { Seed { x, y, peak: 1.0, flux: 1.0 } }
+    /// A seed in the middle of cell `c` of a 400² plane (100-px cells).
+    fn in_cell(c: u8) -> Seed { seed(50.0 + 100.0 * (c % 4) as f64, 50.0 + 100.0 * (c / 4) as f64) }
+    fn fit(snr: f64, flags: StarFlags) -> StarFit {
+        StarFit { x: 0.0, y: 0.0, background: 0.0, amplitude: 1.0, fwhm_x: 2.0, fwhm_y: 2.0, fwtm_x: 4.0, fwtm_y: 4.0,
+                  theta: 0.0, beta: 4.0, residual: 0.0, signal: 1.0, area: 1.0, peak5: f64::NAN, sky_ring: 0.0,
+                  sky_ring_sigma: 1.0, sky_ring_n: 10, snr, hfr: 1.0, flags }
+    }
+
+    #[test]
+    fn a_cell_is_the_4x4_grid_index_of_the_position() {
+        assert_eq!(cell_of(0.0, 0.0, 400, 400), 0);
+        assert_eq!(cell_of(99.999, 0.0, 400, 400), 0);
+        assert_eq!(cell_of(100.0, 0.0, 400, 400), 1);
+        assert_eq!(cell_of(399.5, 399.5, 400, 400), 15);
+        assert_eq!(cell_of(-0.5, 400.0, 400, 400), 12, "clamped into the grid");
+        assert_eq!(cell_of(250.0, 150.0, 400, 300), 10);
+    }
+
+    /// R12-3: budget 64 → quota 5, target 80.
+    #[test]
+    fn every_cell_gets_its_quota_by_rank_and_a_short_cell_hands_its_share_on() {
+        let full: Vec<Seed> = (0..160).map(|i| in_cell((i % 16) as u8)).collect();   // 10 per cell, interleaved by rank
+        let (c, n) = select_candidates(&full, 400, 400, 64);
+        assert_eq!(n, [10; 16]);
+        assert_eq!(c, (0..80).collect::<Vec<_>>(), "the 5 brightest of every cell");
+        let mut short: Vec<Seed> = (0..100).map(|_| in_cell(0)).collect();           // ranks 0..99 in cell 0
+        short.extend((0..30).map(|i| in_cell(1 + (i / 2) as u8)));                   // ranks 100..129: two per cell 1..=15
+        let (c, n) = select_candidates(&short, 400, 400, 64);
+        assert_eq!(n[0], 100);
+        assert!(n[1..].iter().all(|&k| k == 2));
+        assert_eq!(c.len(), 80);
+        assert!((100..130).all(|i| c.contains(&i)), "every short cell's seeds are candidates");
+        assert_eq!(c[..50], (0..50).collect::<Vec<_>>()[..], "cell 0 takes the 50 slots left, brightest first");
+        assert!(c.windows(2).all(|p| p[0] < p[1]), "ascending = rank order");
+    }
+
+    /// R12-3's tie-break: budget 25 → quota 2, target 32. Rounds 1–9 take 30 (nine each in cells 0–2, three in cell 3).
+    /// Round 10 has 2 slots for cells 0, 1 and 2, whose tenth seeds rank 32, 31 and 30: cells 2 and 1 take them.
+    #[test]
+    fn the_last_partial_round_goes_to_the_cells_whose_next_seed_ranks_first() {
+        let mut s: Vec<Seed> = (0..27).map(|r| in_cell((r % 3) as u8)).collect();
+        s.extend((0..3).map(|_| in_cell(3)));
+        s.extend([2u8, 1, 0, 0, 1, 2].map(in_cell));
+        let (c, _) = select_candidates(&s, 400, 400, 25);
+        assert_eq!(c, (0..32).collect::<Vec<_>>());
+        assert_eq!(select_candidates(&s, 400, 400, 25).0, c, "the same input, the same selection");
+    }
+
+    #[test]
+    fn a_budget_at_or_above_the_seed_count_takes_every_seed_and_zero_takes_none() {
+        let s: Vec<Seed> = (0..40).map(|i| in_cell((i * 7 % 16) as u8)).collect();
+        assert_eq!(select_candidates(&s, 400, 400, 40).0, (0..40).collect::<Vec<_>>());
+        assert_eq!(select_candidates(&s, 400, 400, 1000).0.len(), 40);
+        assert!(select_candidates(&s, 400, 400, 0).0.is_empty());
+        assert!(trim(&vec![fit(10.0, StarFlags::default()); 5], &[0; 5], 5).is_empty());
+    }
+
+    /// R12-4. Cell 0 holds SNR 50 (saturated), 40, 30, 30, 20; cell 1 holds 25 and NaN; cell 2 holds 5 (extended).
+    /// Unflagged first: round 1 is 40 and 25; round 2 is fit 2 (the 30-tie to the lower index) and the NaN; then
+    /// 30 and 20; the flagged come last.
+    #[test]
+    fn the_trim_keeps_unflagged_fits_first_round_robin_by_snr() {
+        let ok = StarFlags::default();
+        let fits = [fit(50.0, StarFlags::SATURATED), fit(40.0, ok), fit(30.0, ok), fit(30.0, ok), fit(20.0, ok),
+                    fit(25.0, ok), fit(f64::NAN, ok), fit(5.0, StarFlags::EXTENDED)];
+        let cells = [0, 0, 0, 0, 0, 1, 1, 2];
+        assert!(trim(&fits, &cells, 8).is_empty());
+        assert_eq!(trim(&fits, &cells, 6), vec![0, 7], "both flagged go before any unflagged fit");
+        assert_eq!(trim(&fits, &cells, 4), vec![0, 3, 4, 7], "round-robin: cell 1's NaN (round 2) before fit 3 (round 3)");
+        assert_eq!(trim(&fits, &cells, 3), vec![0, 3, 4, 6, 7]);
+    }
+
+    /// R12-6. Seeds lie in cells 0, 0, 1, 2 and 3; the candidates are seeds 0, 2 and 3; the accepted fits are seeds 0
+    /// and 3; seed 0 is kept.
+    #[test]
+    fn the_report_counts_the_cells_the_budget_could_have_covered() {
+        let cells = [0u8, 0, 1, 2, 3];
+        let r = report(&cells, &[0, 2, 3], &[0, 3], &[0], false);
+        // cell 0: with stars, covered; cell 1: its only candidate refused, nothing unexamined, not counted; cell 2: accepted then
+        // trimmed, with stars but not covered; cell 3: no candidate, seed 4 not selected, with stars
+        assert_eq!((r.cells_with_stars, r.cells_covered), (3, 1));
+        assert_eq!((r.candidates, r.kept, r.not_selected, r.trimmed), (3, 1, 2, 1));
+        assert_eq!(report(&cells, &[0, 2, 3], &[], &[], true).cells_with_stars, 0, "a plane verdict: no measurable star");
+    }
+}
+```
+
+`mod.rs` (the plan's three, kept as written 2026-10-07 — they read the code at 8bbcc135 correctly — plus six):
+
+```rust
+// `moffat_field`, `MoffatStar` and `fixture_field` are already imported at the top of `mod tests` (8bbcc135 l. 1138-1139).
 fn uniform(n: usize, w: usize, h: usize, seed: u64) -> Vec<MoffatStar> {
     let mut rng = crate::geometry::ransac::SplitMix64(seed);
     (0..n).map(|_| MoffatStar { x: 20.0 + rng.next_f64() * (w as f64 - 40.0), y: 20.0 + rng.next_f64() * (h as f64 - 40.0),
@@ -4501,11 +4731,16 @@ fn noisy_field(stars: &[MoffatStar], noise_seed: u64) -> Vec<f32> {
     data
 }
 
+fn budget_opts(budget: usize) -> MeasureOptions {
+    MeasureOptions { mode: Mode::Budget { budget }, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD },
+                     ..Default::default() }
+}
+
 #[test]
 fn budget_covers_every_cell_that_holds_a_star() {
     let stars = uniform(800, 1024, 1024, 11);
     let data = noisy_field(&stars, 11);
-    let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 500 }, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
+    let m = measure_plane(&data, 1024, 1024, &budget_opts(500), None);
     let b = m.budget.unwrap();
     assert!(m.stars.len() <= 500 && m.stars.len() >= 480, "{}", m.stars.len());
     assert_eq!(b.cells_with_stars, 16);
@@ -4518,7 +4753,7 @@ fn budget_keeps_the_brightest_per_cell_when_one_cell_dominates() {
     let mut stars = uniform(600, 256, 256, 3);                              // all inside the top-left cell of a 1024² plane
     stars.extend((0..15).map(|i| MoffatStar { x: 300.0 + (i % 5) as f64 * 150.0, y: 300.0 + (i / 5) as f64 * 200.0, amp: 0.2, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 }));
     let data = noisy_field(&stars, 3);
-    let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 200 }, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
+    let m = measure_plane(&data, 1024, 1024, &budget_opts(200), None);
     let b = m.budget.unwrap();
     assert_eq!(b.cells_covered, b.cells_with_stars, "every cell with a star keeps one");
     let outside = m.stars.iter().filter(|f| f.x >= 256.0 || f.y >= 256.0).count();
@@ -4530,46 +4765,408 @@ fn budget_keeps_the_brightest_per_cell_when_one_cell_dominates() {
 fn budget_mode_accounts_for_every_seed() {
     let stars = uniform(900, 1024, 1024, 5);
     let data = noisy_field(&stars, 5);
-    let m = measure_plane(&data, 1024, 1024, &MeasureOptions { mode: Mode::Budget { budget: 500 }, diagnostics: true, seeds: SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD }, ..Default::default() }, None);
+    let m = measure_plane(&data, 1024, 1024, &MeasureOptions { diagnostics: true, ..budget_opts(500) }, None);
     let b = m.budget.unwrap();
     assert!(b.not_selected > 0, "900 seeds, 1.25 × 500 / 16 per cell: many are never fitted");
     assert_eq!(m.diagnostics.iter().filter(|d| d.outcome == Outcome::NotSelected).count(), b.not_selected);
     assert_eq!(m.diagnostics.iter().filter(|d| d.outcome == Outcome::Trimmed).count(), b.trimmed);
     assert_eq!(m.stars.len() + m.refused.total() + b.not_selected + b.trimmed, m.seeds);
     assert_eq!(m.refused.not_selected, b.not_selected);
+    assert!(m.diagnostics.iter().enumerate().all(|(i, d)| d.seed == i), "one record per detected seed, in seed order");
+}
+
+/// R12-2 / R12-3: a budget no smaller than the seed count selects every seed and trims nothing. The measurement is then
+/// `Mode::All`'s bit for bit (Debug text, so NaN fields compare; the wall-clock timings set equal), on given and
+/// matched-filter seeds, under both PSF models.
+#[test]
+fn a_budget_at_or_above_the_seed_count_is_mode_all_bit_for_bit() {
+    let (fixture, fw, fh) = crate::test_support::fixture_field(7, 1.0, 0.002);
+    let given = test_seeds_of(&fixture, fw, fh);
+    let noisy = noisy_field(&uniform(300, 1024, 1024, 9), 9);
+    for (plane, w, h, spec) in [(&fixture, fw, fh, SeedSpec::Given(given)),
+                                (&noisy, 1024, 1024, SeedSpec::MatchedFilter { threshold: seeds::DEFAULT_THRESHOLD })] {
+        for psf_model in [PsfModel::Auto, PsfModel::Moffat4] {
+            let all = MeasureOptions { seeds: spec.clone(), psf_model, diagnostics: true, ..Default::default() };
+            let a = measure_plane(plane, w, h, &all, None);
+            let mut b = measure_plane(plane, w, h, &MeasureOptions { mode: Mode::Budget { budget: a.seeds }, ..all.clone() }, None);
+            let r = b.budget.take().expect("a budget report");
+            assert_eq!((r.not_selected, r.trimmed, r.candidates, r.kept), (0, 0, a.seeds, a.stars.len()));
+            b.timings = a.timings;
+            assert_eq!(format!("{b:?}"), format!("{a:?}"));
+        }
+    }
+}
+
+/// Determinism (no order-dependent container in the selection, the trim or the re-indexing): two runs, one result.
+#[test]
+fn the_budget_measurement_is_deterministic() {
+    let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+    let opts = MeasureOptions { diagnostics: true, ..budget_opts(500) };
+    let a = measure_plane(&data, 1024, 1024, &opts, None);
+    let mut b = measure_plane(&data, 1024, 1024, &opts, None);
+    b.timings = a.timings;
+    assert_eq!(format!("{b:?}"), format!("{a:?}"));
+}
+
+/// F13 with the diagnostics off (the Analysis tab's setting): the counts are kept in `refused` and the report, and
+/// asking for the per-seed records moves no number.
+#[test]
+fn the_budget_identity_holds_without_diagnostics_and_they_move_no_number() {
+    let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+    let off = measure_plane(&data, 1024, 1024, &budget_opts(500), None);
+    let on = measure_plane(&data, 1024, 1024, &MeasureOptions { diagnostics: true, ..budget_opts(500) }, None);
+    let b = off.budget.unwrap();
+    assert!(off.diagnostics.is_empty());
+    assert_eq!(off.refused.accounted(off.stars.len()), off.seeds);
+    assert_eq!((off.refused.not_selected, off.refused.trimmed), (b.not_selected, b.trimmed));
+    assert_eq!((b.kept, b.candidates), (off.stars.len(), off.seeds - b.not_selected));
+    assert_eq!(format!("{:?}", off.stars), format!("{:?}", on.stars), "diagnostics change no number");
+}
+
+/// R12-1 (owner): under the Analysis default, Moffat 4 is zero extra work. Every fit is at 4, the source is the
+/// caller's, and no record carries a sample β. `Auto` runs the verdict sample on the candidates only.
+#[test]
+fn budget_with_moffat4_fits_at_four_and_runs_no_beta_sample() {
+    let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+    let opts = |psf_model| MeasureOptions { psf_model, diagnostics: true, ..budget_opts(500) };
+    assert_eq!(budget::ANALYSIS_PSF_MODEL, PsfModel::Moffat4);
+    let m = measure_plane(&data, 1024, 1024, &opts(budget::ANALYSIS_PSF_MODEL), None);
+    assert_eq!((m.beta, m.beta_source), (4.0, BetaSource::Fixed));
+    assert!(m.diagnostics.iter().all(|d| d.sample_beta.is_none()), "R12-1: no beta sample under Moffat 4");
+    assert!(m.stars.iter().all(|f| f.beta == 4.0 && !f.flags.beta_at_cap()));
+    let a = measure_plane(&data, 1024, 1024, &opts(PsfModel::Auto), None);
+    assert!(matches!(a.beta_source, BetaSource::Fitted { .. }), "{:?}", a.beta_source);
+    let sampled: Vec<&FitDiagnostics> = a.diagnostics.iter().filter(|d| d.sample_beta.is_some()).collect();
+    assert!(!sampled.is_empty());
+    assert!(sampled.iter().all(|d| d.outcome != Outcome::NotSelected), "Auto's sample is the candidates'");
+}
+
+/// R12-5: the budget fits a subset. The ring sky still leaves out every seed's 3F disc, and `c`'s isolation still
+/// reads every seed, exactly as when all of them are fitted. In working units at a given ring width and field width,
+/// so the two calls fit A identically.
+#[test]
+fn the_ring_sky_and_the_isolation_read_every_seed_not_only_the_fitted_ones() {
+    let (f_ring, field) = (2.6, Some(2.61));
+    let star = |x: f64, y: f64, amp: f64| MoffatStar { x, y, amp, alpha_x: 3.0, alpha_y: 3.0, theta: 0.0 };
+    let run = |stars: &[MoffatStar], fitted: usize, neighbours: bool| {
+        let mut data = moffat_field(200, 200, stars, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, 7);
+        let data: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+        let seeds: Vec<Seed> = stars.iter().map(|s| Seed { x: s.x, y: s.y, peak: s.amp * ADU_SCALE as f64, flux: s.amp }).collect();
+        let of_fit: Vec<usize> = (0..fitted).collect();
+        let n = neighbours.then(|| fit::Neighbours { seeds: &seeds, of_fit: &of_fit });
+        fit::fit_stars_with_beta_diagnosed(&data, 200, 200, &seeds[..fitted], 4.0, &FitParams::default(), None, field,
+            None, false, false, false, fit::Correction { ring_fwhm: Some(f_ring), neighbours: n, ..Default::default() })
+    };
+    // B 11·F from A: inside A's [10F, 12F] ring.
+    let ring = [star(100.0, 100.0, 0.3), star(100.0 + 11.0 * f_ring, 100.0, 0.3)];
+    let (both, alone, with_n) = (run(&ring, 2, false), run(&ring, 1, false), run(&ring, 1, true));
+    let a = both.fits.iter().find(|f| (f.x - 100.0).abs() < 1.0).unwrap();
+    assert_eq!(with_n.fits[0].sky_ring.to_bits(), a.sky_ring.to_bits(), "B's disc is left out of A's ring");
+    assert!(alone.fits[0].sky_ring > a.sky_ring, "without it, B lifts A's ring sky");
+    // C (brighter, so the clip screen keeps A) 12 px from A: within 6 · field width, so A is not isolated.
+    let iso = [star(100.0, 100.0, 0.3), star(100.0, 112.0, 0.6)];
+    assert_eq!(run(&iso, 1, false).aperture_stars, 1, "alone, A qualifies");
+    assert_eq!(run(&iso, 1, true).aperture_stars, 0, "with its neighbour, A is not isolated");
+}
+
+/// A pin (ruling F28): the default is the stacking path, so every existing literal stays on it.
+#[test]
+fn the_default_mode_is_all() {
+    assert_eq!(MeasureOptions::default().mode, Mode::All);
+    let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
+    let m = measure_plane(&data, w, h, &MeasureOptions { seeds: SeedSpec::Given(test_seeds_of(&data, w, h)), ..Default::default() }, None);
+    assert!(m.budget.is_none());
+    assert_eq!(m.refused.not_selected + m.refused.trimmed, 0);
 }
 ```
 
-- [ ] **Step 2: Run, fail, implement, run.**
+The probe (`examples/star_probe.rs` tests; `args` gains `clip: None, budget: None, psf: None`):
 
-- [ ] **Step 3: Lab cycle** `t12-amode`: v2 with the new `analysis-mode` arm on every u16 sibling, and the corpus
-  (`manifests/corpus.json` → `~/.athenaeum-acc/star-lab-a/t12-amode/corpus-probe`: `measure` on the calibrated
-  reads and `analysis-mode` on the raw files, one path per invocation). Design list: `{"row":1,"path":"register","kind":"reported"}`
-  only (the new path adds rows; the existing paths' rows are judged and must not move).
+```rust
+fn amode_args(img: PathBuf, out: PathBuf, budget: usize) -> MeasureArgs {
+    MeasureArgs { domain: Domain::Adu, diagnostics: true, clip: Some(65535.0), budget: Some(budget),
+                  ..args(img, out, &["analysis-mode"]) }
+}
 
-- [ ] **Step 4: Read the bars** (`bars.txt`):
-  - budget: row 1 `budget coverage` ≥ 0.9 on every v2 image — the spec's ≥ 90 % of the 4 × 4 cells that hold
-    measurable stars, on every image whatever its seed count (`cells_with_stars` printed); the
-    `analysis-mode` `fit outcomes` row `ok` on every image (the four-term identity, ruling F13);
-  - Analysis cost: the corpus m42 `analysis-mode` invocation walls, mean over the 77 frames ≤ 0.6 s (baseline legacy
-    analysis 25.2 s / 77 = 0.33 s), max printed; `background/neb3_4096` `analysis-mode` wall printed beside the
-    legacy 0.21 s;
-  - Measure cost, second read: the corpus m42 `measure` batch wall ≤ 1.2 × 223.1 s = 267.7 s (per-frame ≈ 2.9 s →
-    ≤ 3.5 s; the first read is Task 10b's M.1 — moved by Task 10b, 2026-10-11; that read is the runner's against its
-    own t10-f5-r2 wall (R3), so 223.1 s binds only on the dev Mac — and Task 13's stage time confirms it);
-  - `_DSC5767.fit`: the `measure` frame line's `seeds` > 0 on each plane (baseline 0 on every plane); recorded — the
-    signedness question is Plan C's;
-  - bright coverage and completeness of `analysis-mode` against the legacy `analysis` on `sharp/m4/f2.6` recorded
-    (baseline legacy 7.3 % of 300, 21.5 % of 554 expected) — Plan C's comparison, not a bar here.
+fn amode_frame(dir: &Path, a: impl FnOnce(PathBuf, PathBuf) -> MeasureArgs) -> (Vec<Value>, Value) {
+    let data: Vec<f32> = gaussian_field(256, 256, 0, true).iter().map(|v| (v * 65535.0).round()).collect();
+    let img = dir.join("p.fits");
+    write_fits_f32(&img, 256, 256, 1, &data, &[]).unwrap();
+    let out = dir.join("p.amode.jsonl");
+    cmd_measure(a(img, out.clone())).unwrap();
+    let lines = read_lines(&out);
+    let f = lines.iter().find(|v| v["kind"] == "frame").cloned().unwrap();
+    (lines, f)
+}
 
-- [ ] **Step 5: R-OSP-10; commit.**
+/// Task 12 (R12-7, R12-1). On 256² with 40 stars in 12 cells and budget 16 (quota 2, target 32), there are 8 seeds not
+/// selected and about 16 trimmed. No seed line is written (the lab merges every file's seed lines into the measure
+/// path's). The frame line carries the counts, the report, the effective seed source and Moffat 4.
+#[test]
+fn analysis_mode_writes_the_budget_report_and_no_seed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let (lines, f) = amode_frame(d.path(), |i, o| amode_args(i, o, 16));
+    let n = |v: &Value| v.as_u64().unwrap();
+    let (b, r) = (&f["budget"], &f["refused"]);
+    assert!(lines.iter().all(|v| v["kind"] != "seed" && v["path"] == "analysis-mode"));
+    assert_eq!(lines.iter().filter(|v| v["kind"] == "frame").count(), 1);
+    assert_eq!(n(&f["fits"]) + n(&r["total"]) + n(&r["notSelected"]) + n(&r["trimmed"]), n(&f["seeds"]));
+    assert_eq!((n(&r["notSelected"]), n(&r["trimmed"])), (n(&b["notSelected"]), n(&b["trimmed"])));
+    assert_eq!(n(&b["candidates"]) + n(&b["notSelected"]), n(&f["seeds"]));
+    assert_eq!(n(&b["kept"]), n(&f["fits"]));
+    assert!(n(&f["fits"]) <= 16 && n(&b["notSelected"]) > 0 && n(&b["trimmed"]) > 0, "{f}");
+    assert_eq!(b["cellsCovered"], b["cellsWithStars"]);
+    assert_eq!(lines.iter().filter(|v| v["kind"] == "refused").count() as u64, n(&f["seeds"]) - n(&f["fits"]));
+    assert_eq!(lines.iter().filter(|v| v["reason"] == "notSelected").count() as u64, n(&b["notSelected"]));
+    let m = &f["options"]["measure"];
+    assert_eq!((m["seedSource"].as_str(), m["seedThreshold"].as_f64()), (Some("matchedFilter"), Some(6.0)));
+    assert_eq!((m["psfModel"].as_str(), m["budget"].as_u64()), (Some("moffat4"), Some(16)));
+    assert_eq!((f["beta"].as_f64(), f["betaSource"].as_str()), (Some(4.0), Some("fixed")));
+    assert!(f.get("betaOwn").is_none(), "R12-1: no own beta under Moffat 4");
+    assert_eq!((f["domain"].as_str(), f["conversion"].as_str()), (Some("adu"), Some("none")));
+}
+
+#[test]
+fn analysis_mode_with_psf_auto_reports_the_fitted_beta() {
+    let d = tempfile::tempdir().unwrap();
+    let (_, f) = amode_frame(d.path(), |i, o| MeasureArgs { psf: Some(PsfModel::Auto), ..amode_args(i, o, 16) });
+    assert_eq!(f["options"]["measure"]["psfModel"], "auto");
+    assert!(matches!(f["betaSource"].as_str(), Some("fitted" | "fallback")), "{f}");
+    assert!(f["beta"].as_f64().unwrap().is_finite());
+}
+
+/// R12-7: the analysis-mode path runs alone, on a raw-domain file, with the matched filter, and a float file needs
+/// `--clip`. Each refusal is an `Err` before any output file exists.
+#[test]
+fn analysis_mode_is_refused_before_any_output_when_its_input_is_not_the_analysis_tabs() {
+    let d = tempfile::tempdir().unwrap();
+    let field = gaussian_field(128, 128, 0, true);
+    let raw: Vec<f32> = field.iter().map(|v| (v * 65535.0).round()).collect();
+    let (ri, ui, out) = (d.path().join("r.fits"), d.path().join("u.fits"), d.path().join("o.jsonl"));
+    write_fits_f32(&ri, 128, 128, 1, &raw, &[]).unwrap();
+    write_fits_f32(&ui, 128, 128, 1, &field, &[]).unwrap();
+    let a = || amode_args(ri.clone(), out.clone(), 16);
+    for (args, want) in [
+        (MeasureArgs { paths: vec!["analysis-mode".into(), "measure".into()], ..a() }, "runs alone"),
+        (MeasureArgs { domain: Domain::Unit, ..a() }, "raw"),
+        (amode_args(ui.clone(), out.clone(), 16), "raw-domain"),
+        (MeasureArgs { seeds: Some(SeedChoice::Peak), ..a() }, "matched filter"),
+        (MeasureArgs { clip: None, ..a() }, "--clip"),
+    ] {
+        let err = cmd_measure(args).unwrap_err();
+        assert!(err.contains(want), "{err}");
+        assert!(!out.exists(), "no output file for a refused invocation");
+    }
+}
+```
+
+- [x] **Step 2: Run, fail, implement, run.** Order:
+  1. `budget.rs`'s pure functions → its six tests;
+  2. `Neighbours` and `own` → `the_ring_sky_and_the_isolation_…`, with the whole `star_measure::` suite unchanged;
+  3. the `prepare_working` split, then `the_default_mode_is_all` and the full `star_measure::` and `stacking::` suites
+     before any Budget code (the `Mode::All` refactor proven on its own);
+  4. `Mode`, `budget` and the Budget branch → the other mod.rs tests;
+  5. `module_options`;
+  6. the probe (below) → its three tests.
+
+  **The probe's `analysis-mode` path (R12-7):**
+  - Checked before any output file, each an `Err`:
+    - the path runs alone (its planes are read raw: no `normalise`);
+    - no `--rect`, `--debayer`, `--config` or `--psf-beta`;
+    - `--domain` is `adu` or `auto`, never `unit`;
+    - `raw_max > 1.5` (`analysis_domain_ok`);
+    - `--seeds` absent or `matched`.
+  - The domain is `Domain::RawAdu`:
+    - `full_scale` = 2^bits − 1 from the header's BITPIX / BZERO (signed: 2^(bits−1) − 1); a float file has `--clip`;
+    - `clip` = `--clip`, else `DATAMAX` > 0, else `full_scale`;
+    - `gain_e_per_adu` = the header's `EGAIN`, else `None`.
+  - `--budget` defaults to `budget::DEFAULT_BUDGET` (a value under 1 exits 1). `--psf moffat4|auto` (`MeasureArgs.psf:
+    Option<PsfModel>`) defaults to `budget::ANALYSIS_PSF_MODEL`.
+  - `pixel_noise`: as the flag says, else white for 1 plane and mixed for 3; `colour` = 3 planes. Each selected plane
+    gets `star_measure::measure_plane` with `SeedSpec::MatchedFilter { threshold: --seed-threshold or
+    DEFAULT_THRESHOLD }`, on its own.
+  - Lines:
+    - NO seed lines;
+    - star lines `fit_line("analysis-mode", …)` plus `apSum` / `apN`; with `--diagnostics` also `seed` (the detected
+      seed's index), `filterSnr`, `verdict` and, under Auto, `sampleBeta`;
+    - with `--diagnostics`, `refused_line("analysis-mode", …)` for every record not accepted (reasons include
+      `notSelected` and `trimmed`).
+  - One frame line per plane, with the keys below. There is no `betaOwn` or `betaOwnAtCap` (R12-1).
+
+    | Group | Keys |
+    | ---- | ---- |
+    | Identity | `kind: "frame"`, `path: "analysis-mode"`, `plane` |
+    | β | `beta`, `betaSource`, `betaSample` |
+    | Counts | `seeds`, `fits`, `refused` (`refused_counts`), `budget` (`BudgetReport`, camelCase) |
+    | Frame statistic | `statistic` = "residual-weighted mean over the kept fits neither saturated nor extended", `starsUnsaturated`, `mostlySaturated`, `verdictFitFailed`, `colour` |
+    | Correction and plane verdicts | `apertureCorrection`, `apertureStars`, `ringSkyMissing`, `clipFloor`, `clipEvidence`, `trailed`, `trailShare`, `defocused`, `frameFwhm`, `frameEcc` |
+    | Detection | `sigmaF`, `sigmaFMeasured`, `noiseGain`, `pixelNoise`, `structureDropped`, `extendedSeeds`, `fieldWidth`, `fieldWidthSpread`, `fieldWidthEnvelope` |
+    | SNR | `snrGain`, `snrMissing`, `snrMedian`, `snrNoise`, `shotSpread`, `hfrMedian` |
+    | Timings | `timings {backgroundMs, noiseMs, detectMs, fitMs}` (the module's phases, so a cost miss can be attributed) |
+    | Options | `options.measure {seedSource: "matchedFilter", seedThreshold, psfModel, budget, clip, fullScale, gainEPerAdu, maxStars}`, `options.rawMax` |
+    | Read | `conversion: "none"`, `domain`, `nonFinite`, `wallMs` |
+
+  - Energies are ÷ 65535, the lab's units, as on every line.
+  - The reader stays `PlaneReader`: XISF and `read_raw` are Plan C's.
+  - Gates (`CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4`, nothing else heavy running):
+    - `cargo test -p athenaeum-core --lib -- star_measure:: --test-threads=4`;
+    - `cargo test -p athenaeum-core --lib -- stacking:: --test-threads=4`;
+    - `cargo test -p athenaeum-core --example star_probe -- --test-threads=4`;
+    - `cargo check -p athenaeum-core --all-targets`;
+    - `cargo check -p athenaeum-core --no-default-features`;
+    - no `ts_contract` (no TS type moved).
+
+- [x] **Step 3: Lab tools (L1), then the cycle `t12-amode`** (dev Mac, R12-0; one heavy job at a time;
+  `memory_pressure` ≥ 30 % free; ≥ 100 GiB free).
+  - **Order:** commit L1 only after `t12-base`'s scorecard is final. Once the switch is on, a re-score of `t12-base`
+    would plan amode jobs and list them as missing.
+  - **Keep the 8bbcc135 probe:** copy it before its worktree goes, from
+    `/Volumes/BigMac/Users/astrobureau/Documents/Projects/acc-base-8bbcc135/.superpowers/target-acc/release/examples/star_probe`
+    to `~/.athenaeum-acc/star-lab-a/t12-amode/bin/star_probe-8bbcc135`, recording its sha256. Delete the worktree after
+    Step 4, not after Step 3.
+  - **L1 (athenaeum-lab `star-lab/`, in one commit, then `git push origin main`):**
+    1. `starlab/probe_plan.py`:
+       - `ANALYSIS_MODE = True`;
+       - `corpus_jobs` gains, per FITS frame, `_measure(fam, name, path, base, "analysis-mode", ("--domain", "adu"),
+         sfx="amode", tag="analysis-mode")`. There is no `--clip` (the probe reads it from the header) and no
+         `--debayer` (the raw mosaic is one plane; Plan C's CFA rule comes later);
+       - XISF frames skipped with the reason;
+       - the module docstring.
+    2. `tests/test_run_probe.py`:
+       - the two tests above;
+       - new `test_the_corpus_runs_the_analysis_mode_arm_on_fits_frames_only`: args `[path, "--paths",
+         "analysis-mode", "--domain", "adu", *star_probe_args(), "--out", <base>.amode.jsonl]`, and none for XISF.
+    3. `starlab/scorecard_build.py`: `analysis-mode` joins the row-1 detection loop and row 2. It passes
+       `frames=` its OWN frame lines, so `_threshold` reads its `options.measure` (`fisher_snr`, `seedThreshold`). It
+       also joins rows 3–6 (flux unit 1.0; the SNR rows with its own frames) and the OSC G-plane remap beside
+       `analysis`.
+    4. `tests/test_scorecard.py`: `test_the_analysis_mode_output_is_read_when_the_plan_runs_it` is extended with two
+       star lines. An `analysis-mode` `fwhm` row appears, and the measure path's `seeds` count is the measure file's
+       alone.
+    5. `starlab/scorecard.py`: `rows_budget_coverage`'s docstring and `ideal` text get R12-6's definition. The
+       arithmetic is unchanged.
+    6. `bin/measure_wall.py`:
+       - new repeatable `--arm-probe NAME=PATH` (default `--probe`) and `--arm-path NAME=measure|analysis-mode|legacy-
+         analysis` (default `measure`);
+       - `analysis-mode` is `--paths analysis-mode --domain adu` and never `--debayer`;
+       - every arm's sha256 goes into the provenance record; byte identity per arm across rounds, as today;
+       - tests in `tests/test_t10b_l2.py`: the per-arm commands, both sha256s, and the defaults planning today's
+         commands exactly.
+    7. `results/plan-a/t12-amode/design.json` = `[{"row": 1, "path": "register", "kind": "reported"}]`.
+       `results/plan-a/t12-amode/bars.py` comes with `tests/test_t12_bars.py`, whose fixtures cover: a 0 / 0 plane
+       skipped and counted; `min_share` 0.89 → MISS; identity `ok: false` → MISS; the wall JSONs → mean and max; the
+       `_DSC5767` seeds lines.
+
+    Already there, reused unchanged:
+    - `rows_fit_outcomes` (notSelected / trimmed via `_budget_count`), `rows_budget_coverage`, row 9 `invocation` and
+      `rows_cost` for `analysis-mode` (`ONE_PATH_TAGS`), `_threshold("analysis-mode")`;
+    - `probe_io`'s `notSelected` / `trimmed` reasons, `AMODE_ARGS`, `_analysis_jobs`' amode arm;
+    - `run_probe.py` (the corpus driver: one path per invocation, `--verify`), `lab_cycle.py`, `measure_wall.py`'s
+      interleaved rounds and idle wait.
+  - **The cycle** (cwd athenaeum-lab):
+
+    ```
+    python3 star-lab/bin/lab_cycle.py --step t12-amode --prev t12-base --inject \
+      --design star-lab/results/plan-a/t12-amode/design.json \
+      --athenaeum /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
+    ```
+
+    Use the same `--jobs` as `t12-base`. It runs v2 with the `analysis-mode` arm on every u16 sibling (303 jobs: 305
+    siblings minus `resampled`) and the inject manifest (its raw frames gain the arm). The existing paths' rows are
+    judged and must not move; the new rows are only-head.
+  - **The corpus:**
+
+    ```
+    ATHENAEUM_REPO=<the athenaeum checkout> STAR_PROBE_ARGS="--diagnostics --seeds matched --seed-threshold 6.0" \
+      python3 star-lab/bin/run_probe.py star-lab/manifests/corpus.json --out ~/.athenaeum-acc/star-lab-a/t12-amode/corpus-probe
+    ```
+
+    Then the same with `--verify`. That gives 140 FITS frames × (`measure` on the calibrated read, i.e. the unit-domain
+    read of the raw file, `legacy-analysis`, `analysis-mode` on the raw file), one path per invocation.
+
+- [x] **Step 4: Walls and bars** (`bars.txt`; dev Mac, R12-0).
+  - **Bar provenance:** all three fixed numbers come from the dev Mac on 2026-10-07: athenaeum star-truth-lab
+    f5321979, `star_probe` sha256 `ef9be3c0…`, BEFORE Plan A (the old measure path, no `--diagnostics`).
+    - Legacy analysis 25.2 s / 77 frames and m42 `measure` 223.1 s: athenaeum-lab
+      `results/probe-runs-2026-10-07/batches.txt`, the sums of the 77 invocations' `/usr/bin/time` real.
+    - `neb3_4096` legacy 0.21 s: `results/baseline-2026-10-07/scorecard-summary.md`, row 9.
+    - The runner's M.1 series (133.2 s → 76.9 s through Task 11) was never compared with them. The dev Mac has no read
+      after 2026-10-07; the brackets below are that read.
+  - **The two brackets** (each `measure_wall.py`, 77 m42 frames, three interleaved rounds, nothing else running):
+
+    ```
+    # (a) Measure, before / after
+    python3 star-lab/bin/measure_wall.py --probe <head star_probe> --arm A= --arm-probe A=<star_probe-8bbcc135> \
+      --arm B= --set m42 --repeats 3 --root "$HOME/Pictures/star test" \
+      --out ~/.athenaeum-acc/star-lab-a/t12-amode/wall-measure
+    # (b) Analysis mode beside the same-day legacy control
+    python3 star-lab/bin/measure_wall.py --probe <head star_probe> --arm amode= --arm-path amode=analysis-mode \
+      --arm legacy= --arm-path legacy=legacy-analysis --set m42 --repeats 3 --root "$HOME/Pictures/star test" \
+      --out ~/.athenaeum-acc/star-lab-a/t12-amode/wall-amode
+    ```
+
+    Both run with empty flags, i.e. without `--diagnostics`: production's setting and the 2026-10-07 command. Then
+    `python3 star-lab/results/plan-a/t12-amode/bars.py` (or the cycle replayed with `--reuse-probe` and `--bars`).
+  - **The bars:**
+    - **Budget:**
+      - row 1 `budget coverage`: `cellsCovered / cellsWithStars` ≥ 0.9 on every v2 image with `cellsWithStars > 0`
+        (every family's `min_share`). The 0 / 0 planes (plane verdicts, R12-6) are counted and listed;
+      - the `analysis-mode` `fit outcomes` row is `ok` on every family (the four-term identity, ruling F13).
+    - **Analysis cost:**
+      - (b)'s `amode` arm: the mean over the 77 frames of the invocation real (the median over rounds) ≤ 0.6 s;
+      - printed beside it: the max, the frame lines' phase medians (from the corpus probe), and the same-day `legacy`
+        mean beside 2026-10-07's 0.33 s;
+      - `background/neb3_4096` `analysis-mode` wall (the cycle's row 9) printed beside the legacy 0.21 s and the same
+        run's legacy row.
+    - **Measure cost (second read):** (a)'s B median sum ≤ 1.2 × 223.1 s = 267.7 s (per frame ≈ 2.9 s → ≤ 3.5 s), read
+      in absolute terms. B / A per round and their median are printed as the attribution:
+      - if A also exceeds 267.7 s, the miss predates Task 12 (the territory of M.2, which is Task 13's) and goes to the
+        owner with both walls;
+      - B / A > 1.2 is Task 12's own miss;
+      - expect B / A ≈ 1: `Mode::All` only got the structural split.
+
+      The first read (M.1) is Task 10b's on the runner; Task 13's M.2 is the stage wall on set 204.
+    - **Recorded:**
+      - `_DSC5767.fit`: the corpus `measure` frame line's `seeds` per plane (baseline 0; `Mode::All` is unchanged, so
+        it equals 8bbcc135's; the signedness question is Plan C's);
+      - bright coverage and completeness of `analysis-mode` against legacy `analysis` on `sharp/m4/f2.6` (baseline
+        legacy 7.3 % of 300, 21.5 % of 554 expected), which is Plan C's comparison;
+      - the corpus `analysis-mode` coverage and identity on the real frames (information).
+
+- [x] **Step 5: R-OSP-10 (R12-0…R12-7, the bars with Step 4's numbers), the spec rows, the logging dictionary;
+  commit** (`one-star-path`, not pushed; lab committed and pushed).
 
 ```
-feat(star_measure): Analysis mode - a budget of N good unsaturated stars spread over a 4x4 grid before fitting, NotSelected/Trimmed outcomes, the BudgetReport (coverage <cell>, m42 analysis-mode <s>/frame, measure batch <s>)
+feat(star_measure): Analysis mode - a budget of N good unsaturated stars spread over a 4x4 grid before fitting (water-filled candidates, unflagged-first SNR round-robin trim, ring and isolation against every seed), NotSelected/Trimmed outcomes, the BudgetReport, Moffat 4 with no beta work (coverage 100% worst, m42 analysis-mode 0.70 s/frame - B3 miss recorded, measure batch 111.9 s, B/A 1.028)
 ```
 
-**Acceptance:** coverage ≥ 0.9 everywhere; m42 analysis-mode mean ≤ 0.6 s; m42 measure batch ≤ 267.7 s; both
-diffs 0 moved; control 0. A cost miss → the owner with the walls before Task 13 (the +20 % bar binds there too).
+**Acceptance:**
+- Step 1's tests fail at 8bbcc135 for the reasons named and pass; the pins hold (`PASS1_ARTIFACT_VERSION` 1).
+- The Step 2 gates are green.
+- Coverage ≥ 0.9 on every image that holds measurable stars; analysis-mode fit outcomes ok everywhere.
+- m42 analysis-mode mean ≤ 0.6 s; m42 measure batch ≤ 267.7 s (B / A printed).
+- Both diffs (v2, inject) 0 moved; the control 0.
+- A cost miss → the owner with the walls and the phase medians before Task 13 (the +20 % bar binds there too).
+
+**Outcome (2026-10-16; branch `one-star-path-t12`: 98f0c660 plan, a7ac7659 Steps 1-2, a00238f7 review fixes, then the
+docs commit; lab b6dfc13 -> 92fbded; not pushed).** `Mode::Budget` is in: the selection (water-filled 4 x 4 candidates,
+quota 1.25 N / 16), the unflagged-first SNR round-robin trim, ring sky and `c` against every seed (R12-5), the
+`NotSelected` / `Trimmed` outcomes and records, the `BudgetReport`, Moffat 4 with no own-beta work of any kind (R12-1, owner),
+and the probe's `analysis-mode` path (R12-7). `Mode::All` is op for op unchanged: `PlanePrep` untouched,
+`PASS1_ARTIFACT_VERSION` 1, `MEASURE_VERSION` 4. Review (fable): READY WITH FIXES 0 / 1 / 5, all fixed in a00238f7.
+Gates: `star_measure::` 190, `stacking::` 853 / 0 / 2 ignored, `star_probe` 19, `check --all-targets` and
+`--no-default-features` as before. **The bars** (dev Mac, R12-0; `t12-amode-pn/bars.txt`): B1 coverage worst 100 % (141
+planes, 2 donut planes 0 / 0 skipped) PASS; B2 143 / 143 PASS; B4 111.9 s <= 267.7 (A 108.9, B / A 1.028 - small, real,
+unexplained) PASS; **B3 0.70 s against 0.6 s: a recorded miss (R12-8, owner)** - phase medians bg 178 / noise 234 /
+detect 141 / fit 65 ms, the whole-plane passes are the stacking path's own code, so their speed-up is Measure-perf work
+beside M.2, judged at master level, no Analysis-only shortcut. Both diffs 0 moved, control 0. Recorded: `_DSC5767` seeds
+15041 / 15786 / 9039 (from 0); sharp/m4/f2.6 bright coverage 100 % vs legacy 7.3 %, completeness 92.6 % of 537 vs 21.5 % of
+554; corpus coverage 99.9 % (worst 93.8 %). Rulings R12-0 ... R12-9 (README R-OSP-10). The first t12 lab round ran with the
+pixel-noise statement unset (R12-9) and was redone as `t12-base-pn` / `t12-amode-pn`. Limits: candidates-only plane values,
+raw OSC as one plane, the raw-mode completeness bar. Carries: **Task 13** the B3 whole-plane cost beside M.2; **Plan C** the
+Analysis tab / Blink switch (`analysis/analyzer.rs map_result`), XISF / `read_raw`, the CFA rule for raw OSC, the
+completeness bar at N >= seeds.
 
 ---
 ### Task 13: The real-data checkpoint at master level (spec §5 step 5, owner rule)
@@ -4601,7 +5198,7 @@ fit, the verdict pass's share, the two-pass share, the second read; (3) **bar M.
 may amend it): set 204's Measure stage ≤ 1.2 × 3.62 min = 4.3 min on the dev Mac, interleaved bracket, with the ERP's
 time printed beside**. This checkpoint owns no fix: a miss opens a Measure-performance task (scope by the owner)
 before Plan A closes, under the method rules — a speedup keeps every `.athf` bit-identical or is judged on the whole
-group at master level, and one that misses a tolerance row is reverted, never tuned toward it.
+group at master level, and one that misses a tolerance row is reverted, never tuned toward it. **Added by Task 12 (R12-8):** the Analysis mode's B3 miss (0.70 s against 0.6 s per m42 frame, the three whole-plane passes: background 178 / noise 234 / detect 141 ms) is the same Measure-performance family; this checkpoint reads the whole-plane cost beside M.2.
 
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
 `harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,

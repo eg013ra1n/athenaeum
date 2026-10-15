@@ -3328,3 +3328,83 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         plan gate reads `metrics` only, so a cancelled run reads conservatively stale (11b's rule). (C5) The space
         estimate has no term for `measured/` (about 1.9 % of the calibrated term). (C6) Bar 4b's `1 − s/2` is lenient
         and kept; `1 − s` is printed as the expected ratio. The Measure stage wall on real data is Task 13's M.2.
+
+  - **R-OSP-10 - the Analysis mode: `Mode::Budget { budget }` fits at most N good unsaturated stars spread over a 4 × 4
+    grid, with no own-β work at the default Moffat 4 (spec D-3, PA-10, ruling F40; Plan A Task 12; rulings R12-0 …
+    R12-9; `MEASURE_VERSION` and `PASS1_ARTIFACT_VERSION` unchanged).** *As built (a7ac7659; a00238f7 the review round:
+    the amode `snrGain` in the lab unit, a saturating target, the renumbering pin, refusal and `raw_scales` tests, the
+    BZERO wording, the selection wall in `fit_ms`).* `star_measure::Mode` (`All` by default = the stacking path, op for op
+    unchanged; `Budget { budget }`) lives in `MeasureOptions.mode`; `star_measure/budget.rs` holds `DEFAULT_BUDGET` = 500,
+    `ANALYSIS_PSF_MODEL` = `Moffat4`, `CANDIDATE_FACTOR` = 1.25, `cell_of`, `select_candidates`, `trim`, `report` and the
+    serialized `BudgetReport { cellsWithStars, cellsCovered, candidates, kept, notSelected, trimmed }`
+    (`PlaneMeasurement.budget`, `Some` exactly under `Mode::Budget`).
+    - **R12-2 the budget lives in `measure_plane` only.** `prepare_working` was split into `prepare_head` (noise, mesh,
+      sky, saturation plane, detection, noise correlation) and `prepare_passes` (verdict pass, clip floor, near-clip
+      class), a pure restructuring. The selection runs after detection and before the verdict pass, so both per-seed
+      fits run on the candidates only. `PlanePrep` is untouched, so `PASS1_ARTIFACT_VERSION` stays 1
+      (`the_plane_prep_encoding_is_pinned` unchanged is the proof); `prepare_plane`, `finish_plane` and `plane_beta` stay
+      `Mode::All` only (`prepare_plane` under `Budget` logs a `warn!` and measures every seed).
+    - **R12-3 the selection.** The cell is `cell_of` of the SEED's position (`4·cy + cx`, each clamped to [0, 3]) — for
+      the selection, the trim and the report alike, so coverage can never exceed 1. Rank = seed index (the detector's
+      brightest-first order). Quota `q = ⌈1.25·N/16⌉`, target `16·q` (640 at N = 500); a water-fill round-robin (key =
+      rank within the seed's own cell, then index): every cell that still holds seeds gives its next brightest, a short
+      cell's unused share passes to the others. Returned ascending (= rank order). N ≥ seeds selects every seed (=
+      `Mode::All`'s fit set); N = 0 selects nothing (every seed `NotSelected`, one `warn!`).
+    - **R12-4 the trim.** Tier 0 = `flags.in_statistic()` (neither saturated nor extended), tier 1 = the rest; round r =
+      the fit's rank within (cell, tier) by SNR descending (NaN last, then fit index); the first N of (tier, r, SNR, fit
+      index) are kept. Flagged fits fill only the slots no unflagged fit wants (a plain SNR round-robin would keep the
+      saturated stars first). The removed fits become `Outcome::Trimmed` and keep their diagnostics records;
+      `Accepted { star }` is renumbered after the trim (pinned: RED on a broken counter).
+    - **R12-5 neighbours.** The ring sky masks the 3F disc of EVERY detected seed and `c`'s isolation tests every seed
+      (`fit::Neighbours`, `aperture_correction(.., own)`), not only the fitted ones; so a candidate's B_i, σ_i, SNR and
+      HFR are what `Mode::All` reads at the same ring width. Every other caller (LN's refits) passes `None`.
+    - **R12-6 the report.** `cellsWithStars` = the cells holding an accepted fit before the trim, plus the cells holding
+      a `NotSelected` seed and no accepted candidate; `cellsCovered` = the cells holding a kept fit; a plane whose
+      verdict is defocused or trailed is 0 / 0 and the coverage bar skips it. (The literal "any seed above threshold"
+      would score the module's own refusals — an edge star, a blend — and a defocused donut image 0 / 16 as budget
+      misses.) `candidates` = |C|, `kept` = |stars|, `notSelected` = seeds − |C|, `trimmed` = accepted − kept; one
+      `debug!` ("budget applied") carries them.
+    - **R12-1 no own-β work at Moffat 4 (owner, 2026-10-15).** Under the default `PsfModel::Moffat4` the mode makes no β
+      sample, no extra fit and not even the verdict fit's free point-model β (it reads undersampled stars high, E5);
+      `beta` = 4, `beta_source` = `Fixed`. The 64 pixel-integrated free-β fits (k² = 9 … 81 sub-samples a pixel) would by
+      estimate cost at least the 500-star fit itself. The frame's own β exists only when the caller selects `Auto` (the
+      verdict sample then runs over the budget's candidates); `Fixed(b)` is b. A diagnostic β at Moffat 4 is Plan C's
+      opt-in, if wanted.
+    - **R12-7 the probe.** `star_probe`'s `analysis-mode` path (with `--budget N`, `--clip C`, `--psf moffat4|auto`)
+      runs alone on the RAW file in ADU, writes no seed lines, and the cost walls are read without `--diagnostics`; the
+      frame line carries `timings` (background / noise / detect / fit_ms, the selection wall inside `fit_ms`), the
+      budget report and `snrGain` in the lab unit.
+    - **R12-0 and R12-9 (the lab).** No runner for this task (owner): every run is dev-Mac, base `t12-base-pn` at
+      8bbcc135 (the pre-Task-12 probe, a lab worktree before the amode switch). The interpolated-image pixel-noise
+      statement is the lab default since 92fbded (resampled and warp pair targets ran white without it: T11.5 pull
+      2.26 / 2.52 instead of 1.07 / 1.04). With it the dev-Mac base reproduces the runner's t11-f6 cumulative report line
+      for line except the row-9 walls. Head `t12-amode-pn` (a00238f7, lab 92fbded): noreg vs the base PASS, 0 moved /
+      control 0; cumulative vs t01c PASS; the held rows (D, T11) PASS.
+    - **Bars (athenaeum-lab `star-lab/results/plan-a/t12-amode*/bars.txt`; read with `grep` / `sed -n`).**
+
+      | Bar | Rule | Value | Verdict |
+      | ---- | ---- | ---- | ---- |
+      | B1 budget coverage, worst image | ≥ 0.9 of the cells that hold measurable stars | 100 % worst (141 planes scored, 0 below; 2 planes 0 / 0 skipped: donut r10 / r6 plane 0) | PASS |
+      | B2 analysis-mode fit outcomes identity | ok on every family | 143 / 143 rows | PASS |
+      | B3 m42 analysis-mode mean per frame | ≤ 0.6 s | **0.70 s** (rounds 0.705 / 0.701 / 0.702, 77 frames; r1 0.72; max 0.92); legacy the same day 0.316 s (2026-10-07: 0.33) | **MISS, recorded (R12-8)** |
+      | B4 m42 `measure` batch, B (head) sum | ≤ 1.2 × 223.1 = 267.7 s | 111.9 s (A = 8bbcc135 108.9 s; B / A 1.028 / 1.023 / 1.037, median 1.028) | PASS |
+
+      B4: the 2026-10-07 223.1 s was the OLD measure path (the corpus batch is 2× faster now; M.2 is the stacking fit, not
+      this). B / A 1.028 is small, real, beyond both spreads, and unexplained (`Mode::All` got only the structural split).
+    - **R12-8 B3 is a recorded miss (owner, 2026-10-16).** The cost is the three whole-plane passes, the stacking path's
+      own code: corpus phase medians background 178 / noise 234 / detect 141 ms (= 553 of ~630 ms) against the budget's
+      fit 65 ms (max 265); `background/neb3_4096` 0.46 s against legacy 0.20. Their speed-up goes to the Measure-perf work
+      beside Task 13's M.2, judged at master level; there is no Analysis-only shortcut (one path, one code).
+    - **Recorded rows (information).** `_DSC5767.fit` `measure` seeds per plane 15041 / 15786 / 9039 (baseline 0;
+      `Mode::All` is unchanged); `sharp/m4/f2.6` bright coverage 100 % (analysis-mode) against 7.3 % (legacy analysis),
+      completeness 92.6 % of 537 against 21.5 % of 554; corpus analysis-mode coverage 99.9 % (worst 93.8 %), corpus
+      identity ok.
+    - **Limits.** (a) The per-plane values taken from the fits (aperture correction and its stars, trail share, defocus donuts,
+      verdict-fit failures, the near-clip floor and its evidence) are read over the candidates only, not every seed; the
+      ring sky and `c`'s isolation still read every seed (R12-5). (b) A raw OSC input is ONE plane (no per-colour split): the mode measures the mosaic as a mono plane; the CFA rule is
+      Plan C's. (c) The raw-mode completeness bar (≥ 99 % of the injected stars above threshold) is not met by the 500
+      cap on a dense field and is Plan C's at N ≥ seeds.
+    - **Carries.** **Task 13:** the B3 whole-plane cost beside M.2 (R12-8). **Plan C:** the Analysis tab / Blink switch
+      (`analysis/analyzer.rs map_result`), XISF / `read_raw`, the CFA rule for raw OSC, the completeness bar at N ≥ seeds,
+      the optional own-β diagnostic at Moffat 4. Logging: the dictionary has the new names (`budget`, `candidates`,
+      `kept`, `not_selected`, `trimmed`, `cells_with_stars`, `cells_covered`). No command, type or `ts_export` change.

@@ -1852,6 +1852,18 @@ pub(super) struct Correction<'a> {
     /// The plane's pixel-noise correlation and shot spreading the SNR's aperture noise reads (F-6, Task 11); the
     /// default is white (LN's and every refit's: `kappa` 1).
     pub(super) noise: super::photometry::ApertureNoise,
+    /// The seeds the ring sky masks and `c`'s isolation reads when the fitted seeds are a subset of the detected ones
+    /// (the budget's candidates, Task 12, R12-5); `None` = the fitted seeds themselves.
+    pub(super) neighbours: Option<Neighbours<'a>>,
+}
+
+/// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
+/// of the fit call's seed `k`. The ring sky leaves out the `3F` disc of every one of `seeds`, and `c`'s isolation test
+/// reads every one, exactly as when all of them are fitted.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Neighbours<'a> {
+    pub(super) seeds: &'a [Seed],
+    pub(super) of_fit: &'a [usize],
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -2331,13 +2343,18 @@ fn ring_and_correction(
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> (Option<f64>, usize, usize, Option<f64>) {
+    // R12-5: a budgeted call fits a subset; the discs and the isolation read every detected seed.
+    let (all_seeds, own) = match correction.neighbours {
+        Some(n) => (n.seeds, Some(n.of_fit)),
+        None => (seeds, None),
+    };
     let (ring_fwhm, missing) = super::photometry::ring_skies(
         data,
         mask,
         correction.footprint,
         w,
         h,
-        seeds,
+        all_seeds,
         kept,
         correction.ring_fwhm,
         pool,
@@ -2362,7 +2379,8 @@ fn ring_and_correction(
             w,
             h,
             kept,
-            seeds,
+            all_seeds,
+            own,
             field_fwhm,
             ring_fwhm,
             correction.saturation,

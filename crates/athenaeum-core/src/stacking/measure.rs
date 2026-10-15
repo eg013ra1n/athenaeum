@@ -781,6 +781,7 @@ fn module_options(
         colour,
         pixel_noise,
         cfa_site_share,
+        mode: sm::Mode::All,
     }
 }
 

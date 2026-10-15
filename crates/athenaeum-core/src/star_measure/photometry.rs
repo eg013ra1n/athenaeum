@@ -970,7 +970,8 @@ pub(crate) fn unverdicted_clip_range(
 /// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
 /// `footprint`, no absent pixel within `5F`). Returns `(c, ratios)`: `c` is `None` with no fit at all (`debug!`) or
 /// with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
-/// per-plane events count the screened candidates (`skipped`).
+/// per-plane events count the screened candidates (`skipped`). `own[k]` (Task 12, the budget fits a subset of `seeds`) is
+/// the index into `seeds` of fit seed `k`, the one the isolation test skips; `None` = the identity.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -979,6 +980,7 @@ pub(crate) fn aperture_correction(
     h: usize,
     fits: &[(usize, StarFit)],
     seeds: &[Seed],
+    own: Option<&[usize]>,
     field_fwhm: f64,
     ring_fwhm: Option<f64>,
     saturation: Option<&SaturationPlane>,
@@ -1007,7 +1009,9 @@ pub(crate) fn aperture_correction(
             for (j, s) in seeds.iter().enumerate() {
                 grid.entry(cell(s.x, s.y)).or_default().push(j);
             }
-            let isolated = |own: usize, f: &StarFit| -> bool {
+            // `own[k]` = the index into `seeds` of fit k's seed (the budget fits a subset, Task 12); `None` = the identity.
+            let isolated = |fit_seed: usize, f: &StarFit| -> bool {
+                let own = own.map_or(fit_seed, |o| o[fit_seed]);
                 let (cx, cy) = cell(f.x, f.y);
                 !(cx - 1..=cx + 1).any(|gx| {
                     (cy - 1..=cy + 1).any(|gy| {

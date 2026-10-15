@@ -88,7 +88,7 @@ moves or leaves: `stacking::robust` (`rcr`, `winsorize`, used by TMeanFlux) move
 | `beta` | the per-frame β (§3 F-4) on unsaturated stars whose verdict fit passes the centre and region tests and that the knot test does not mark extended (F-10); in stacking the members' own βs feed the group β every member is fitted at, and the frame's own β is the diagnostic `beta_own` (F-4 as built, Task 11b) |
 | `photometry` | the per-star aperture-scale sky B_i and noise σ_i (F-10: R6's ring, computed once per accepted star, stored on the fit; every aperture consumer reads them), the profile-independent star flux (F-5: model flux in the FWTM ellipse × `c`, `c` from 5F growth sums over (v − B_i), the amplitude screen, the footprint, the caller's full scale, 64 stars / at least 5, none `saturated` or `extended` (F-10), `aperture_stars`), the saturation test, the per-star SNR (F-6, on B_i and σ_i) |
 | `frame` | frame aggregates: FWHM, ecc (over fits flagged neither `saturated` nor `extended`, F-10), SNR, the weight inputs, HFR, the trail metric and the trailed verdict's readers (F-10) |
-| `budget` | the Analysis-mode selection: at most N stars spread over the field |
+| `budget` | the Analysis-mode selection: at most N stars spread over the field. *As built (Plan A Task 12, README R-OSP-10): `Mode::Budget`, water-filled 4 x 4 candidates and an unflagged-first SNR trim, no own-beta work at Moffat 4.* |
 | `diagnostics` | `FitDiagnostics`: per-star outcome and refusal reason (F-10 adds `trailed`), region radius, background start, growth steps, iterations |
 
 Public surface: `measure_plane(plane, opts) -> PlaneMeasurement` (stars, frame aggregates, diagnostics, refusal
@@ -374,6 +374,7 @@ mosaics). In raw mode the bars are completeness ≥ 99 % of the injected stars a
 F-1 / F-4's FWHM bar on the injected stars; F-6 and F-7 have no raw truth.
 
 **The budget (D-3).** The 500 stars cover ≥ 90 % of the 4 × 4 field cells that hold measurable stars.
+*As built and judged (Task 12):* coverage worst 100 % over 141 planes (R12-6's cell definition); the cost bar for the Analysis mode, 0.6 s per m42 frame, is a recorded MISS at 0.70 s (R12-8: the three whole-plane passes, a Measure-performance item beside Task 13's M.2); the stacking Measure batch 111.9 s, B / A 1.028.
 
 **No regressions (every fix step).** Every scorecard row a fix does not change by design stays within its own
 standard error of the baseline; each fix names the rows it changes by design and judges them by its own bar. Cost
