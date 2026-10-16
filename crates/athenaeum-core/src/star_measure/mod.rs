@@ -474,6 +474,24 @@ impl PlanePrep {
         &self.seeds
     }
 
+    /// The verdict pass's wall (a share of [`PhaseTimings::fit_ms`]); read-only, reported in the debug lines only
+    /// (Plan A Task 13, 13-P).
+    pub(crate) fn verdict_time(&self) -> Duration {
+        self.verdict_time
+    }
+
+    /// `(fits, iterations)`: the seeds whose bounded verdict fit succeeded and the sum of their LM iterations
+    /// (Plan A Task 13, 13-P; read-only, derived from the stored per-seed records).
+    pub(crate) fn verdict_iterations(&self) -> (usize, u64) {
+        self.passes
+            .iter()
+            .filter_map(|p| match &p.verdict {
+                Some(Ok(v)) if v.fit => Some(u64::from(v.iterations)),
+                _ => None,
+            })
+            .fold((0, 0), |(n, it), i| (n + 1, it + i))
+    }
+
     /// A hand-built record for the encoding pin (Plan A Task 11c, `the_plane_prep_encoding_is_pinned`): exact binary
     /// fractions only, NaN and infinities where the real records hold them. `starless` = a plane without a seed (no
     /// detection report, the untested saturation plane).

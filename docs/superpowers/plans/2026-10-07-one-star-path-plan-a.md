@@ -5200,10 +5200,25 @@ time printed beside**. This checkpoint owns no fix: a miss opens a Measure-perfo
 before Plan A closes, under the method rules — a speedup keeps every `.athf` bit-identical or is judged on the whole
 group at master level, and one that misses a tolerance row is reverted, never tuned toward it. **Added by Task 12 (R12-8):** the Analysis mode's B3 miss (0.70 s against 0.6 s per m42 frame, the three whole-plane passes: background 178 / noise 234 / detect 141 ms) is the same Measure-performance family; this checkpoint reads the whole-plane cost beside M.2.
 
+**Reconciled by the Task 13 design read (2026-10-16, at b6c5d5b3; `.superpowers/sdd/2026-10-07-one-star-path-plan-a/
+task-13-report-design.md`).** Scope and bars unchanged. Against the 2026-10-07 text: (a) the three before runs are
+pinned by commit — all three were made by LN checkpoint B at **d5f26b7e** (2026-10-06, rustafits 83214127), whose
+Measure is byte-equal to local main **ed5fa8de** (the one Measure diff between them is the `measure_plane_detailed`
+refactor, pinned by its own same-output test; the gitlink is the same); (b) `hc11-run.sh` is not ported: Horse C11 runs
+through `tier1-run.sh` like set 204; (c) Step 3 (c) (PA-13) reads the before run's own `stacking_run_frames.metrics_json`
+(each tree carries two `metrics` rows per frame) and reproduces each set's measurement options (Horse C11's `maxStars
+500` and `mad` scale estimator are not `measure_probe`'s defaults — as written it failed by construction there);
+(d) project runs key frames by `project_frame` (`frame_id` is NULL) and write `run-project.txt` only; (e) M.2 gets its own
+interleaved Measure-only bracket on two more clones, the fit profile one additive instrumentation step (13-P), the ERP
+time its own step; (f) the clone recipe also rewrites `files.path` under the before tree (Horse C11's in-run masters);
+(g) results live in athenaeum-lab `star-lab/results/plan-a/t13-real/`; (h) `--numeric`'s `NUMERIC:` line is Tier C's
+table (ρ 0.99, rejected fraction, LN scatter), not this task's verdict.
+
 Under the owner's rule a numeric change is judged on the whole group at master level. The harness is reused:
-`harness/acceptance/{server.sh,api.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
-tier1/tier1-compare.py}` plus the controller's `~/.athenaeum-acc/lnB/hc11-run.sh`, copied into
-`harness/acceptance/hc11-run.sh` with its stale path fixed (I-6). Nothing is built per cycle.
+`harness/acceptance/{server.sh,api.sh,clone-before.sh,tier1/tier1-run.sh,tier1/project-run.sh,tier1/tier1-extract.py,
+tier1/tier1-compare.py,tier1/t11c-tools.py}` and the lab's ERP job runner `star-lab/erp/run_job.sh`; one driver
+`t13-real.sh` and one helper `tier1/t13-tools.py` are added. Nothing is built per cycle: two servers once (Step 1), the
+13-P server once (Step 4).
 
 **The clone recipe (deletes no acceptance copy, needs no owner decision).** `/Volumes/BigMac` is APFS, so `cp -Rc`
 clones a before tree in seconds at zero cost until a file is rewritten; and the Calibrate stage hash carries no
@@ -5211,188 +5226,272 @@ clones a before tree in seconds at zero cost until a file is rewritten; and the 
 `calibrated`/`prepared` artifacts are, by construction, exactly what the after run would write. Each after run
 therefore starts from Measure on a clone of its before tree. **Order and lifetime (ruling F11): Horse C11 → run B →
 set 204, one at a time; each clone is THIS task's scratch and is deleted (`rm -rf` of the whole clone — a clone
-holds no byte the before tree lacks) as soon as its `extract.txt` and `compare.txt` are committed in the lab, except
-set 204's, which Task 14 reads (`probe_parity`).** New bytes at peak are therefore one dataset's: Horse C11 ≈ 26 GB
-(registered 23 + ln 1 + stackout 1.4), run B ≈ 38 GB (registered 37 + ln 1), set 204 ≈ 46 GB (registered 40 + rej
-1.2 + ln 0.8 + stackout 3.5) — each inside the 65 GiB headroom above the 100 GiB floor (165 GiB free today), and the
-peak over the task is 46 GB. If the clone recipe fails at execution (a `cp -Rc` that copies instead of cloning, a
-path rewrite the server does not honour, a run that refuses `rerunFrom: "measure"`), the task STOPS and reports the
-numbers; it never deletes a before tree and never falls back on its own. The fallback, written as a fallback and
-taken only on the owner's word, is `prepare-catalog.sh` from the template into a fresh `~/.athenaeum-acc/starA-<ds>`
-(the fresh-from-template recipe) in the same order, each after-copy's `stackwork` removed once its rows are recorded.
+holds no byte the before tree lacks) as soon as its result files are committed in the lab, except set 204's, which
+Task 14 reads (`probe_parity`); the two M.2 clones (`starA-m2-A`, `starA-m2-B`, Measure-only: `fits/` 0.13 GB and
+`measured/` 0.94 GB each) are deleted after Step 5.** New bytes at peak are one dataset's: Horse C11 ≈ 26 GB, run B ≈
+38 GB, set 204 ≈ 46 GB (t11c measured 44–47 GB per set-204 run), then 46 + 2.2 GB — far inside the 100 GiB floor
+(939 GiB free on 2026-10-16). If the recipe fails at execution (a `cp -Rc` that copies, a path rewrite the server does
+not honour, a refused `rerunFrom: "measure"`), the dataset STOPs with its numbers; nothing deletes a before tree or
+falls back on its own. The fallback, taken only on the owner's word (Fable while the owner is away), is
+`prepare-catalog.sh` into a fresh `~/.athenaeum-acc/starA-<ds>`, same order.
 
-**Files:**
-- Modify: `harness/acceptance/README.md` (item 12: this checkpoint's recipe), `harness/acceptance/hc11-run.sh` (added
-  from `~/.athenaeum-acc/lnB/hc11-run.sh`; `ACC="${0:A:h}"` — the harness directory, as `horse-c11-prep.sh` does —
-  replaces the stale `$REPO/docs/superpowers/research/scripts/acceptance` (ruling F33); `ATHENAEUM_REPO` names the
-  athenaeum checkout; the set-182 pin `69845` unchanged; it reads `$W/c11-config.json` FROM THE TREE IT RUNS, as
-  today), `harness/acceptance/tier1/tier1-run.sh` (`ATH_ACC_SET_REFERENCE=<file>` — a file path, like
-  `ATH_ACC_SET_CONFIG`, ruling F42 — holding the `set_frame_set_reference` argument, sent once after
-  `set_stacking_config`, echoed into `run.txt`, a refusal stops the run; `ATH_ACC_RERUN_FROM=<stage>` (EXISTS since Task 11c in
-  `tier1-run.sh`; Task 13 adds it to `project-run.sh` and `hc11-run.sh`) replaces the
-  hardcoded `"calibrate"` in the `start_stacking` body at `tier1-run.sh:57`, default `calibrate`;
-  `ATH_ACC_EXPECT_REFERENCE=<frame id>`: the run stops before `start_stacking` when `get_stacking_plan`'s
-  `reference` names another frame),
-  `harness/acceptance/tier1/project-run.sh` (the same `ATH_ACC_RERUN_FROM` in its `start_project_stacking` body),
-  `harness/acceptance/tier1/tier1-extract.py` and `tier1-compare.py` (`--run-id N` on both: the run to read in a DB
-  that holds more than one finished run — default the latest `done` run, as today; `--numeric` gains `--project-id
-  <uuid>`, the project twin of `--set-id`, selecting that project's run the way `project-run.sh` records it, so run
-  B gets the same `--numeric` rows as a set (ruling F41); `--numeric` gains the `starsRefused` line beside
-  `fwhmPx`/`beta`, `--base-db <path>` (read the base side's rows from this DB instead of `<W_base>/athenaeum.db`
-  — the Horse C11 clone's checkpointed DB, step 4) and `--base-run-id N` (the base side's run, the twin of
-  `--run-id`; default the base DB's latest `done` run, as today — which on a clone holding the before AND the after
-  run is the AFTER run, so every line that reads a clone's DB as its base names the before run, ruling F19 as
-  folded); EVERY `sqlite3.connect` in both scripts — `tier1-compare.py:149,249,262,277,643,651` — becomes
-  `sqlite3.connect(f"file:{path}?immutable=1", uri=True)` (ruling F19: a plain connect can write a before tree's
-  `-wal`/`-shm`)), `harness/acceptance/clone-before.sh` (EXISTS since Task 11c, allow-list of four: the three before trees + `star-lab-mono2`; Task 13 extends it, not creates it: the recipe's steps (1)–(4) below; refuses a target
-  under anything but `~/.athenaeum-acc/` and a source that is not one of the three before trees; the ONE script that
-  opens a clone's DB writable), `docs/stacking/README.md` (the acceptance run, R-OSP-11),
-  `docs/superpowers/research/2026-10-XX-star-measurement-after-plan-a.md` (§4 "Real data", written in Task 14)
+**Files** (athenaeum-lab unless named):
+- Modify `harness/acceptance/clone-before.sh`: step (2) also runs `UPDATE files SET path = replace(path,'<before>',
+  '<after>') WHERE path LIKE '<before>/%'` and prints its count (Horse C11's in-run masters under `library/`, 8+; 0 on
+  the other two), so no run opens a before tree's byte through the catalog. Allow-list, refusals and step (4) unchanged
+  (`c11-config.json` is no longer read: `make-config` builds all three configs).
+- Modify `tier1/tier1-run.sh`: `ATH_ACC_SET_REFERENCE=<file>` (`{"framesSetId": N, "frameId": F}`, sent BEFORE the
+  `ATH_ACC_SET_CONFIG` call so a manual config never meets an unset reference; anything but `null` refuses; echoed into
+  `run.txt`); `ATH_ACC_EXPECT_REFERENCE=<frame id>` (after both calls `get_stacking_plan {setId}` must read
+  `reference.mode == "manual"`, `reference.frameId == F` and no blocker, else the run refuses before `start_stacking`;
+  the plan's reference line goes into `run.txt`); `ATH_ACC_STOP_AFTER=<stage>` (after the start, poll `<W>/logs/*.jsonl`
+  for this run's `"stacking stage finished"` of that stage, then `cancel_stacking {runId}`, wait for its
+  `stacking-complete`, write `stop_after <stage> duration_ms=<n>`); a `stacking-complete` without `"success":true` exits
+  1 unless STOP_AFTER cancelled it; the server is stopped by its own pid (`project-run.sh`'s trap), never `pkill -f`.
+- Modify `tier1/project-run.sh`: `ATH_ACC_RERUN_FROM` (replaces the hardcoded `"calibrate"`, default unchanged),
+  `ATH_ACC_EXPECT_REFERENCE=<project frame id>` (`get_project_stacking_plan`), `ATH_ACC_STOP_AFTER` (as above).
+- Modify `tier1/tier1-extract.py`: reads `run-project.txt` when `run.txt` is absent; prints 13-P's fields when present
+  (`verdict_ms` on `"frame plane measured"`; the `"frame plane first pass"` line's `beta_ms`, `verdict_fits`,
+  `verdict_iterations`, `seeds`, `duration_ms`).
+- Modify `tier1/tier1-compare.py --numeric`: `--project-id <uuid>` (twin of `--set-id`: the latest `done` run with
+  that `stacking_runs.project_id`, ruling F41); `--run-id N` / `--base-run-id M` (that run on its side, default the
+  latest `done` as today — on a clone holding the before AND the after run the default is the AFTER run, so every
+  base side names its run, F19 as folded); `--base-db <path>` (base rows from that DB; base masters and `.athln` still
+  from `<W_base>`); frames joined by `COALESCE(frame_id, project_frame)` in `load_frame_weights` and the per-group
+  breakdown; the §8 master rows also on each `_drizzleNx` head/base pair (beside the head-only level row);
+  `starsRefused head=… base=…` under each plane's `beta` line; every `sqlite3.connect` (six: `run_identity`'s `reg`,
+  `run_id_for_set`, `load_groups`, `load_frame_weights`, two in `report_weights`) → `ro_connect` (`immutable=1`, F19).
+- Create `tier1/t13-tools.py` (stdlib, every connect `immutable=1`): `before <clone> <ds>` (the before run's row,
+  `reference_mode`, `config_hash`, `summary_json.stages`; for Horse C11 / run B also the original's row — equal, or
+  WAL-stale → base rows from the clone); `make-config <clone> <ds> <out> [--ref-out F]` (set: the stored
+  `stacking_set_config` document, `paths` removed, `reference.mode = "manual"`, `reference.twoPass = false`, checked
+  against the before run's `stacking_runs.config_json` — any other differing key STOPs; `--ref-out` = the run row's
+  `reference_frame_id`; project: `stacking_project_config` → `{projectId, config, excludedFrameUuids,
+  referenceFrameUuid}` = the uuid of the run row's reference project frame); `equivalence` (Step 3 (c)); `weights <head>
+  <base db> --run R --base-run B` (Spearman ρ overall — the bar — and per group; every frame whose within-group rank
+  moved by > 10 % of its group's N with before/after weight and rank, before β per plane, after `beta`/`betaOwn`,
+  `starsFitted`/`starsUnsaturated`/`starsRefused`, `tflux`/`noise`/`mStar` ratios, `fwhmPx`, `eccentricity`, and a
+  candidate row: F-4 (a before β off the group's modal before β), F-3 (unsaturated share < 0.9 or fwhm/ecc moved > 2 %),
+  F-5 (`tflux` ratio off the group's median ratio by > 5 %), none); `profile <clone> --run N [--cap 24576]` (Step 4);
+  `erp-sum <dir>` (Step 6); `bars <res>…` (Step 7: `bars.txt`, each dataset's ≤ 30-line `verdict.txt`, the M.2 line).
+- Create `harness/acceptance/t13-real.sh` (the `t11c-wall.sh` pattern): `zsh t13-real.sh <ds>`, ds ∈ `hc11 | runB |
+  s204 | p0 | m2 | erp | all` (`all` = the six in that order, stopping at the first STOP); `zsh t13-real.sh --cleanup
+  <ds>` (that dataset's clones only; refuses a before tree). Env: `T13_A_REPO` (the ed5fa8de worktree; required),
+  `T13_B_REPO` (default this checkout), `T13_P_REPO` (the 13-P worktree: `p0` and m2's B arm; unset → `p0` skipped,
+  m2's B arm = `T13_B_REPO`), `ATH_ACC_EXTRA_PATHS` (default `$HOME/Pictures`: set 204's and run B's lights). It builds
+  nothing (a missing binary refuses; each repo's HEAD and submodule shas recorded); before every clone and run:
+  `memory_pressure` ≥ 30 % free, `df` ≥ 100 GiB + the step's peak, Time Machine idle, no cargo/rustc, no acceptance
+  server — a miss STOPs (exit 3), never waits. Results in `star-lab/results/plan-a/t13-real/<ds>/` plus
+  `run-log.txt`; stdout = that step's ≤ 30-line verdict. Exit 0 = done (a missed bar is a result); 3 resources; 4 a
+  tool or run failure; 5 an equivalence, reference or config mismatch. A STOP leaves the step's clone for inspection,
+  writes no before tree and stops its own server.
+- Create `star-lab/erp/erp_subframes_t13.js`: Task 10b's subframe-measurement script (`results/plan-a/t10b/erp-l0010/
+  erp_subframes.js`, same process settings) with its job path `$HOME/.athenaeum-acc/t13-erp/ss-job.json`.
+- Modify `harness/acceptance/README.md`: item 12 (this recipe: `clone-before.sh`, the four env vars, `t13-real.sh`,
+  `t13-tools.py`).
+- athenaeum, Step 4 (13-P): `crates/athenaeum-core/src/stacking/measure.rs` (hand edits only),
+  `crates/athenaeum-core/src/star_measure/mod.rs` (two read-only `PlanePrep` accessors),
+  `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md` (the new field names in the dictionary).
+- athenaeum, Step 8: `docs/stacking/README.md` (the acceptance run, R-OSP-11), this task's Outcome;
+  `docs/superpowers/research/2026-10-XX-star-measurement-after-plan-a.md` §4 "Real data" is written in Task 14.
 
 **Interfaces:**
-- Consumes: the "before" trees (PA-13), read ONLY through their clones after step (2)'s checkpoint, never directly
-  (ruling F19): `~/.athenaeum-acc/hc11B-f1` (Horse C11 set 182, run 5, pinned frame 69845, wall 661 s — its
-  `athenaeum.db-wal` is 6.8 MB and un-checkpointed, so an `immutable=1` read of the original shows run 5 as
-  `running`), `~/.athenaeum-acc/lnB-runB-f1` (run B, project `af136ec9-1885-4087-b684-9136ad655e9b`, run 6, wall
-  811 s), `~/.athenaeum-acc/tierA-lnB-f1` (set 204, run 5, reference 28934 after the two-pass pick, Measure stage
-  3.62 min, LN 2.46 min, wall 901 s).
-- Produces: `~/.athenaeum-acc/starA-hc11`, `~/.athenaeum-acc/starA-runB`, `~/.athenaeum-acc/starA-s204` (clones; the
-  first two deleted inside this task, the third kept for Task 14), each with `extract.txt`, `compare.txt`,
-  `run.txt`, `before.txt` (the before run's row and stage times, read from the clone); `results/plan-a/t13-real/` in
-  athenaeum-lab (the three compare files, the three before files, the weight rank table, the stage table incl. the
-  LN stage wall, M-6, `before-equivalence.txt`, `bars.txt`).
+- Consumes the before trees (PA-13), read ONLY through their clones after the clone's checkpoint (ruling F19), all made
+  at d5f26b7e by LN checkpoint B (2026-10-06):
+  - `~/.athenaeum-acc/hc11B-f1` — Horse C11, set 182, run 5 (10:49–11:00 UTC): mono L 180 s (74 included) + G 120 s
+    (28), 9576×6388; reference 69845 (manual, `twoPass` true); `maxStars 500`, scale estimator `mad`, LN F1 growth
+    curve; stages masters 1.44 / calibrate 3.17 / **Measure 1.65** / register 1.08 / normalize 1.19 / integrate 1.98
+    min, total 10.52; plane medians read 0.09 / background 0.40 / noise 0.64 / detect 0.23 / fit 0.08 / total 1.66 s;
+    a 6.8 MB un-checkpointed WAL (an `immutable=1` read of the original shows run 5 `running`).
+  - `~/.athenaeum-acc/lnB-runB-f1` — run B, project `af136ec9-1885-4087-b684-9136ad655e9b`, run 6 (10:24–10:37 UTC):
+    `osc__None__180s` 101 + `mono__L__180s` 83; reference project frame 123 = `aaa72b42-65a9-493a-ad08-6628d0af0340`
+    (manual, `twoPass` true; file `…_0171`); stages calibrate 1.80 / **Measure 3.55** / register 1.85 / normalize 2.66 /
+    integrate 3.23 min (wall 811 s); measurement options = the defaults; `run-project.txt` only.
+  - `~/.athenaeum-acc/tierA-lnB-f1` — set 204, run 5 (09:55–10:10 UTC): osc 105 + mono 92 (407 planes of 6248×4176);
+    reference 28934 (auto, two-pass, switched from 29034); stages calibrate 2.23 / **Measure 3.62** / register 1.47 /
+    normalize 2.46 / integrate 3.83 / drizzle 1.18 min (wall 901 s); measurement options = the defaults.
+  - Before-run facts the bars read: no plane reaches the 24 576 cap (median detected 6.1 k OSC / 7.1 k mono); per-frame
+    β was discrete and mixed inside every group (set 204 mono 78 × 10, 7 × 6, 4 × 2.5, 3 × 4; OSC 71 all-2.5, 34 with a
+    4 or 6 on a plane; Horse C11 L 48 × 2.5, 25 × 4, 1 × 10) — what Plan A's group β (F-4b) and F-5 remove.
+- Produces: clones `~/.athenaeum-acc/starA-{hc11,runB}` (deleted in Step 3), `starA-s204` (kept for Task 14),
+  `starA-m2-{A,B}` (deleted after Step 5); `star-lab/results/plan-a/t13-real/{hc11,runB,s204,p0,m2,erp}/` (`clone.txt`,
+  `before.txt`, `config.json`, `ref.json`, `run.txt`, `extract.txt`, `compare.txt`, `weights.txt`, `profile.txt`,
+  `verdict.txt`), `before-equivalence.txt`, `bars.txt`, `run-log.txt`; athenaeum: the 13-P commit, the README record.
 
-- [ ] **Step 0: Disk arithmetic, written before anything runs.** `df -k /Volumes/BigMac` ≥ 100 GiB + the dataset's
-  peak (26 / 38 / 46 GB, in that order) + the throwaway `target-main` build of step 1 (≈ 6 GB, deleted after
-  step 1, M-8). The server's own `space` blocker compares free bytes with the FULL footprint estimate
-  (`stacking/plan.rs:2851-2865`; ≈ 99 GB for set 204, no discount for `rerunFrom` or fresh artifacts), so free
-  space must also exceed that estimate (165 GiB does today); the step writes both numbers down in `bars.txt`. Time
-  Machine stays off during the runs (`tmutil status` `Running = 0`, the same refusal `checkpoint.sh` applies).
+- [x] **Step 0: Resources, written before anything runs** (into `bars.txt`). `df -k /Volumes/BigMac` ≥ 100 GiB + 46 GB
+  (set 204 kept) + 2.2 GB (M.2 clones) + the two worktree targets (≈ 6 GB each); the server's `space` blocker compares
+  free bytes with the FULL footprint estimate (`stacking/plan.rs`, ≈ 99 GB for set 204, no discount for `rerunFrom`) —
+  939 GiB free meets both. `tmutil status` `Running = 0`; `memory_pressure` ≥ 30 % free. Remove the worktree
+  `acc-base-8bbcc135` and its target (Task 13 has no 8bbcc135 arm: Task 12 left `Mode::All` op for op unchanged).
 
-- [ ] **Step 1: Measure-equivalence of the before trees (PA-13).** Build local main's `measure_probe` in a throwaway
-  worktree target (`git worktree add <scratchpad>/main-wt ed5fa8de && CARGO_TARGET_DIR=.superpowers/target-main
-  CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-core --example measure_probe`, run from the worktree), then
-  — after `clone-before.sh` has made that dataset's clone (step 4 (1)–(2); the clone is made FIRST, then read) —
-  for three calibrated frames of each tree (the first, the median and the last `calibrated` artifact of the mono
-  group by `frames.id`, read from the CLONE with `immutable=1`): `measure_probe <calibrated.fits> auto` versus the
-  clone's `stacking_artifacts.payload_json` (`kind = 'metrics'`) — every `ChannelMeasurement` field equal as
-  printed (timings excluded). Equal on all three → the tree is the before. A difference → that dataset's before is
-  re-made ON THE SAME CLONE RECIPE with the main worktree's build (ruling F42): a second clone
-  `~/.athenaeum-acc/starA-before-<ds>` by `clone-before.sh`, then `tier1-run.sh`/`project-run.sh`/`hc11-run.sh` from
-  `measure` with `$ATHENAEUM_MAIN_WT` (the worktree, whose `.superpowers/target-main/release/athenaeum-web` is
-  built with `-p athenaeum-web` then) in place of `$ATHENAEUM_REPO`, the disk it costs (that dataset's peak, a
-  second time) named first; the after clone then compares against `starA-before-<ds>`. Record the nine comparisons
-  in `results/plan-a/t13-real/before-equivalence.txt`; delete the worktree and `.superpowers/target-main` after the
-  last dataset's step 1.
+- [x] **Step 1: Build two servers, once, one compile at a time.**
+  A (local main, ed5fa8de): `git worktree add /Volumes/BigMac/Users/astrobureau/Documents/Projects/acc-base-ed5fa8de
+  ed5fa8de && git -C …/acc-base-ed5fa8de submodule update --init`, then in it `CARGO_TARGET_DIR=<wt>/.superpowers/
+  target-acc CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-web` AND, as a second call, `cargo build --release -p athenaeum-core --example
+  measure_probe --example weight_audit` (one call naming `-p athenaeum-web` beside `--example` builds ONLY the examples) (`server.sh` serves `$REPO/.superpowers/target-acc`, so the worktree's target lives there,
+  not in `target-main`). A is Step 3 (c)'s probe, M.2's before arm and — only if (c) fails — the F42 re-make's server.
+  B (this checkout, b6c5d5b3): `CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo build --release -p
+  athenaeum-web`, then `... cargo build --release -p athenaeum-core --example measure_probe` (the `measure_probe` that `tier1-compare.py` measures BOTH
+  sides' masters with: "both masters by the new path"). Record both HEADs and submodule shas. From here no source in
+  either checkout changes while a run goes (`server.sh`'s incremental build would rebuild mid-task): 13-P is written in
+  its own worktree.
 
-- [ ] **Step 2: Pin the reference** — the before run's effective pick, read from each CLONE's RUN ROW after the
-  checkpoint (I-6, ruling F19), into `before.txt`: Horse C11 `stacking_runs.reference_frame_id` of run 5 in
-  `starA-hc11` (69845, equal to `hc11-run.sh`'s pin — a difference stops the task); run B
-  `stacking_runs.reference_frame_id` of run 6 in `starA-runB` — and because run B ran `reference.mode = manual` WITH
-  `twoPass = true`, the stored `stacking_project_config.reference_frame_uuid` is shown equal to that row's frame
-  before it is used (both printed in `bars.txt`; a mismatch stops the task); set 204
-  `stacking_runs.reference_frame_id` of run 5 in `starA-s204` (28934, the two-pass result). Every after run sends,
-  before its start call, the before config with `reference.mode = "manual"` and `reference.twoPass = false` (ruling
-  F18, Horse C11 included): Horse C11 through the CLONE's `c11-config.json`, which `clone-before.sh` step (4)
-  rewrites with `twoPass: false` (`hc11B-f1/c11-config.json`, carrying `twoPass: true`, is untouched); run B through
-  `ATH_ACC_PROJECT_CONFIG=~/.athenaeum-acc/starA/runB.json` (the `get_project_stacking_config` document of run 6
-  with the two fields changed); set 204 through `ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json` (the
-  `get_stacking_config` document of run 5 with the two fields changed and `paths` absent) and
-  `ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json` holding `{"framesSetId": 204, "frameId": 28934}`.
-  A reference that `get_stacking_plan` reports differently from the pin refuses the run (`tier1-run.sh` and
-  `hc11-run.sh` print `plan.reference`; the operator checks it against `before.txt` before `start_stacking`
-  returns — `tier1-run.sh` gains that check: `ATH_ACC_EXPECT_REFERENCE=<frame id>` stops the run on a mismatch).
+- [x] **Step 2: The lab tools** (Files above), with unit tests beside `t11c-tools.py`'s, and `zsh t13-real.sh --check`
+  (every binary present, every before tree's run row readable, the configs buildable, nothing run). Lab commit + push.
 
-- [ ] **Step 3: Build the branch's release server** (one compile): `CARGO_TARGET_DIR=.superpowers/target-acc
-  CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-web -p athenaeum-core --example measure_probe`. Record
-  `git rev-parse HEAD` and the submodule sha in `bars.txt`.
+- [x] **Step 3: The three datasets, one at a time, Horse C11 → run B → set 204** (`export T13_A_REPO=/Volumes/BigMac/
+  Users/astrobureau/Documents/Projects/acc-base-ed5fa8de; cd athenaeum-lab/harness/acceptance; zsh t13-real.sh hc11 &&
+  zsh t13-real.sh runB && zsh t13-real.sh s204`). Each step, in the driver:
+  (a) `zsh clone-before.sh ~/.athenaeum-acc/<before> ~/.athenaeum-acc/starA-<ds>` → `clone.txt` (df within 1 GiB,
+  checkpoint, the three rewrites with counts, stale-by-hash trees removed).
+  (b) `t13-tools.py before` → `before.txt` (run row, effective reference, stage times; Horse C11: base rows from the
+  clone via `--base-db`; run B: 123 ↔ `aaa72b42…` shown equal — the run row's effective pick is what is pinned).
+  (c) **Measure-equivalence (PA-13).** Three frames per tree — the first, the median and the last by frame id of the
+  mono group (Horse C11 L, run B `mono__L__180s`, set 204 mono) of the before run — measured by A's build on the
+  clone's calibrated artifact: set 204 and run B `measure_probe <file> auto` (their options are
+  `MeasureOptions::default()`: auto, 24 576, σ 20, peak, no prefilter, BWMV); Horse C11 `weight_audit --max-stars 500
+  --sigma 20 --seed-detector peak --prefilter none --psf auto <file>`; every `ChannelMeasurement` field equal to the
+  before run's `stacking_run_frames.metrics_json` (minus `durationMs`; Horse C11 also minus `location`/`scale`, the two
+  fields the normalization scale estimator feeds — its config says `mad`, the probe has BWMV). Nine comparisons →
+  `before-equivalence.txt`. A difference STOPs the dataset (exit 5); the F42 re-make (`clone-before.sh` → a second
+  clone `starA-before-<ds>`, its run from `measure` on A's server, the disk named first) is then taken by the
+  controller on a Fable ruling, never by the driver.
+  (d) `t13-tools.py make-config` → `config.json` (+ `ref.json`): the before config with `reference.mode = "manual"`,
+  `twoPass = false` (ruling F18: a two-pass or auto pick re-reads Plan A's metrics and could move the reference, and
+  every downstream row would then differ by the reference instead of the measurement — set 204's own run switched
+  29034 → 28934); pins 69845 / project frame 123 / 28934.
+  (e) The run from Measure on B's server (`$R` = that dataset's `star-lab/results/plan-a/t13-real/<ds>`):
+  ```
+  ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=$R/config.json ATH_ACC_SET_REFERENCE=$R/ref.json ATH_ACC_EXPECT_REFERENCE=69845 \
+    zsh tier1/tier1-run.sh $T13_B_REPO ~/.athenaeum-acc/starA-hc11 8971 182                    # ≈ 8 min (Measure ≈ 3)
+  ATH_ACC_RERUN_FROM=measure ATH_ACC_PROJECT_CONFIG=$R/config.json ATH_ACC_EXPECT_REFERENCE=123 \
+    zsh tier1/project-run.sh $T13_B_REPO ~/.athenaeum-acc/starA-runB 8961 af136ec9-1885-4087-b684-9136ad655e9b   # ≈ 18 min
+  ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=$R/config.json ATH_ACC_SET_REFERENCE=$R/ref.json ATH_ACC_EXPECT_REFERENCE=28934 \
+    zsh tier1/tier1-run.sh $T13_B_REPO ~/.athenaeum-acc/starA-s204 8950 204                    # ≈ 21.5 min (t11c: Measure 10.7)
+  ```
+  The after run id is read from `run.txt` / `run-project.txt` (expected 6 / 7 / 6); the before ids (5 / 6 / 5) from
+  `before.txt`.
+  (f) `tier1-extract.py <clone> --run-id R --measure-phases > extract.txt`; `tier1-compare.py --numeric <clone>
+  ~/.athenaeum-acc/<before> {--set-id 182 | --project-id af136ec9-… | --set-id 204} --run-id R --base-run-id B
+  [--base-db ~/.athenaeum-acc/starA-hc11/athenaeum.db] > compare.txt` (base masters from the original's `stackout`,
+  opened read-only; both sides measured by B's `measure_probe`); `tier1-compare.py --ln-grids <clone>
+  ~/.athenaeum-acc/<before> >> compare.txt`; `t13-tools.py weights … > weights.txt`; `t13-tools.py profile … >
+  profile.txt`.
+  (g) `t13-tools.py bars` → `verdict.txt`; lab commit `results(plan-a): t13-real <ds> - …`; then, for hc11 and runB
+  only and only after the commit returned 0, `rm -rf ~/.athenaeum-acc/starA-<ds>`. Expected step walls ≈ 12 / 22 /
+  27 min.
 
-- [ ] **Step 4: Run, one dataset at a time, in the order Horse C11 → run B → set 204** (each: `memory_pressure`
-  ≥ 30 %, step 0's `df`, step 1's equivalence on ITS clone, step 2's pin):
+- [x] **Step 4: 13-P, the fit profile's instrumentation (athenaeum, additive, debug level, no number moves).** Written
+  while Step 3 runs, in its own worktree `/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-t13p` (branch
+  `one-star-path-t13-p` from b6c5d5b3); built after Step 3 (its own `.superpowers/target-acc`). Measurable today
+  without it: stars detected / fitted per plane against the cap and every named phase (`"frame plane measured"`), the
+  two-pass share (`--measure-phases`), the second read (`read_ms` sums both passes' reads: mono 2 reads, OSC planes 0–1
+  three, plane 2 two), the verdict fits' LM iterations on sampled frames (`star_probe measure --psf-beta B
+  --diagnostics`). Not measurable: the verdict pass's share (folded into `fit_ms` via `PlanePrep::verdict_time`) and
+  the β sample (`sm::plane_beta`, no timer — today only `duration_ms` minus the named phases, 2.3 s of t11c's 5.4 s a
+  plane). The step: (i) in `measure_frame_pass1`, one `debug!` per plane after its first pass, `"frame plane first
+  pass"` {`path`, `plane`, `seeds`, `verdict_ms`, `verdict_fits`, `verdict_iterations` (Σ LM iterations of the
+  successful verdict fits), `beta_ms` (the wall of `sm::plane_beta`, timed in `measure_planes_pass1`), `beta_own`,
+  `duration_ms`}; (ii) `"frame plane measured"` gains `verdict_ms` (read from the plane's `PlanePrep` before
+  `finish_plane` consumes it). Read-only accessors `PlanePrep::verdict_time()` / `verdict_iterations()`; new values
+  ride only in-memory structs: `PhaseTimings`, `PlanePrep` and the `.athm` record are untouched (`PASS1_ARTIFACT_VERSION`
+  1, the encoding pin unchanged), `MeasureTimings` stays `#[serde(skip)]`. The fit at β returns no iteration count (the
+  fixed-β conditioned entry; a rustafits change is out of scope) — the profile gives its ms per fitted star instead.
+  Test: one log-asserting test (`docs/logging/README.md` pattern) on a synthetic two-pass group: both lines carry their
+  fields and `verdict_ms ≤ fit_ms`. Gates: `cargo test -p athenaeum-core --lib -- star_measure:: --test-threads=4`, the
+  same for `stacking::`, `cargo check -p athenaeum-core --all-targets` and `--no-default-features`; the full
+  `--all-targets` suite on the runner from a git bundle (else here before any push); one review (fable, the diff).
+  Data gate `zsh t13-real.sh p0`: clones `starA-m2-{A,B}` of `tierA-lnB-f1`; P0 = the 13-P server Measure-only
+  (`ATH_ACC_RERUN_FROM=measure ATH_ACC_STOP_AFTER=measure`, Step 3 (d)'s set-204 config) on `starA-m2-B`, then
+  `tier1-compare.py --measure-identity ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/starA-m2-B --set-id 204 --run-id-a
+  <s204 run> --run-id-b <P0 run>` → **0 differences** (both clones hold the same row history, as t11c's pair); P0's
+  `profile.txt` is the first profile. A difference, a failed gate or a review that does not pass by Step 5's start drops
+  13-P: the bracket runs on B and the profile prints what is measurable without it — 13-P is never fixed tonight.
+  ```
+  feat(stacking): Task 13 profile lines - the Measure first pass's verdict and beta-sample times and LM iterations at debug (set 204 metrics and .athf identical)
+  ```
 
-```
-cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/harness/acceptance
-# clone-before.sh <before> <after>:
-#   (1) cp -Rc <before> <after>; prints df before/after (equal within 1 GiB, else exit 1: the volume did not clone);
-#   (2) sqlite3 <after>/athenaeum.db 'PRAGMA wal_checkpoint(TRUNCATE);' then, on the checkpointed clone (the one
-#       writable open of this task; `journal_mode` unchanged):
-#         UPDATE settings SET value = replace(value,'<before>','<after>') WHERE value LIKE '%<before>%';
-#         UPDATE stacking_artifacts SET path = replace(path,'<before>','<after>') WHERE path LIKE '%<before>%';
-#       and prints the two change counts;
-#   (3) rm -rf <after>/stackwork/{*,_projects/*}/{registered,ln,rej,runs} <after>/stackout/*  (stale by hash; the clone
-#       references cost nothing; `_projects/<slug>/` is run B's project tree, one level deeper);
-#   (4) if <after>/c11-config.json exists: rewrite it with reference.twoPass = false (python3 json round-trip), print the diff.
-zsh clone-before.sh ~/.athenaeum-acc/hc11B-f1 ~/.athenaeum-acc/starA-hc11
-sqlite3 "file:$HOME/.athenaeum-acc/starA-hc11/athenaeum.db?immutable=1" "SELECT id,status,reference_frame_id FROM stacking_runs WHERE frames_set_id=182 ORDER BY id" > ~/.athenaeum-acc/starA-hc11/before.txt   # run 5 done, 69845
-ATH_ACC_RERUN_FROM=measure ATH_ACC_EXPECT_REFERENCE=69845 zsh hc11-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-hc11 8971     # expected ≈ 661 s minus Calibrate
-python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-hc11 --run-id 6 > ~/.athenaeum-acc/starA-hc11/extract.txt
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-hc11 ~/.athenaeum-acc/hc11B-f1 --set-id 182 --run-id 6 \
-  --base-db ~/.athenaeum-acc/starA-hc11/athenaeum.db --base-run-id 5 > ~/.athenaeum-acc/starA-hc11/compare.txt   # the clone holds run 5 (before) AND run 6 (after)
-python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-hc11 ~/.athenaeum-acc/hc11B-f1 >> ~/.athenaeum-acc/starA-hc11/compare.txt
-cp ~/.athenaeum-acc/starA-hc11/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/hc11/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - Horse C11 before/after rows" && rm -rf ~/.athenaeum-acc/starA-hc11
-zsh clone-before.sh ~/.athenaeum-acc/lnB-runB-f1 ~/.athenaeum-acc/starA-runB
-sqlite3 "file:$HOME/.athenaeum-acc/starA-runB/athenaeum.db?immutable=1" "SELECT id,status,reference_frame_id FROM stacking_runs ORDER BY id" > ~/.athenaeum-acc/starA-runB/before.txt
-ATH_ACC_RERUN_FROM=measure ATH_ACC_PROJECT_CONFIG=~/.athenaeum-acc/starA/runB.json \
-  zsh tier1/project-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-runB 8961 af136ec9-1885-4087-b684-9136ad655e9b   # expected ≈ 811 s minus Prepare
-python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-runB --run-id 7 > ~/.athenaeum-acc/starA-runB/extract.txt
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-runB ~/.athenaeum-acc/lnB-runB-f1 --project-id af136ec9-1885-4087-b684-9136ad655e9b --run-id 7 --base-run-id 6 > ~/.athenaeum-acc/starA-runB/compare.txt
-python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-runB ~/.athenaeum-acc/lnB-runB-f1 >> ~/.athenaeum-acc/starA-runB/compare.txt
-cp ~/.athenaeum-acc/starA-runB/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/runB/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - run B before/after rows" && rm -rf ~/.athenaeum-acc/starA-runB
-zsh clone-before.sh ~/.athenaeum-acc/tierA-lnB-f1 ~/.athenaeum-acc/starA-s204
-sqlite3 "file:$HOME/.athenaeum-acc/starA-s204/athenaeum.db?immutable=1" "SELECT id,status,reference_frame_id FROM stacking_runs WHERE frames_set_id=204 ORDER BY id" > ~/.athenaeum-acc/starA-s204/before.txt   # run 5 done, 28934
-ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=~/.athenaeum-acc/starA/set204.json ATH_ACC_SET_REFERENCE=~/.athenaeum-acc/starA/set204-ref.json ATH_ACC_EXPECT_REFERENCE=28934 \
-  zsh tier1/tier1-run.sh $ATHENAEUM_REPO ~/.athenaeum-acc/starA-s204 8950 204        # expected wall ≈ 901 − 134 s (no Calibrate); Measure 3.62 → ≤ 4.34 min
-python3 tier1/tier1-extract.py ~/.athenaeum-acc/starA-s204 --run-id 6 > ~/.athenaeum-acc/starA-s204/extract.txt     # run 6: the DB also holds run 5
-python3 tier1/tier1-compare.py --numeric ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 --run-id 6 --base-run-id 5 > ~/.athenaeum-acc/starA-s204/compare.txt
-python3 tier1/tier1-compare.py --ln-grids ~/.athenaeum-acc/starA-s204 ~/.athenaeum-acc/tierA-lnB-f1 >> ~/.athenaeum-acc/starA-s204/compare.txt
-cp ~/.athenaeum-acc/starA-s204/{before,extract,compare,run}.txt ../../results/plan-a/t13-real/s204/ && git -C ../.. add results/plan-a/t13-real && git -C ../.. commit -m "lab: Plan A t13 - set 204 before/after rows"   # the clone STAYS for Task 14
-```
+- [x] **Step 5: M.2, the interleaved Measure-only bracket on set 204** (`zsh t13-real.sh m2`, ≈ 50 min). A = ed5fa8de
+  on `starA-m2-A`, B = 13-P (else b6c5d5b3) on `starA-m2-B`; rounds A1 B1 A2 B2 A3 B3, each `ATH_ACC_RERUN_FROM=measure
+  ATH_ACC_STOP_AFTER=measure` with Step 3 (d)'s set-204 config (Measure reads only the measurement subtree; the
+  reference is never reached; `rerunFrom ≤ measure` forces pass 1 fresh, R11c-5). Per round: the Measure stage wall, the
+  pass-1 share, the plane medians (read / background / noise / detect / fit / total) per group; B rounds also
+  `profile.txt` (Step 4's shares: verdict, fit at β, β sample, the whole-plane passes, reads; stars per plane against
+  the cap; verdict iterations; fit-at-β ms per star). **Bar (owner, 2026-10-14):** median B ≤ 1.2 × median A — the
+  owner's 4.3 min (= 1.2 × 3.62 of 2026-10-06) and A's today value against 3.62 printed beside — with the ERP's time
+  on the same frames (Step 6) on the same line, and R12-8's whole-plane cost beside it (background / noise / detect
+  plane medians A vs B; Analysis mode on m42 178 / 234 / 141 ms). Expected: a miss (t11c: 10.7 min). This checkpoint owns
+  no fix: the miss opens the Measure-performance task (scope by the owner) with this profile. The clones are deleted
+  after the lab commit.
 
-  The run ids (`6`, `7`, `6`) are the expected next ids after each clone's last run (Horse C11 run 5, run B run 6,
-  set 204 run 5); the operator reads the actual id from `run.txt` and uses that. The before run ids (`5`, `6`, `5`)
-  are passed as `--base-run-id` on every `--numeric` line, read from `before.txt` (ruling F19 as folded). The
-  `--numeric` base side on each line is the ORIGINAL before tree, opened `immutable=1` by the Task 13 edit of
-  `tier1-compare.py` — for Horse C11 the stale-WAL rows are therefore read from the CLONE's checkpointed DB instead
-  (`--base-db <path>`: the clone's `athenaeum.db`, while the base masters stay the original tree's `stackout`); that
-  DB holds run 5 AND the after run 6, so without `--base-run-id 5` the base side's default "latest done run" would be
-  run 6 and the line would compare the after run with itself. The other two trees carry checkpointed DBs (verified in
-  step 2 by comparing the clone's run row with an `immutable=1` read of the original: equal, or `--base-db` is used
-  there too, always with `--base-run-id`). Every master (both sides) is measured by
-  `measure_probe` from THIS build (the new path) inside `tier1-compare.py` — that is "both masters are measured by
-  the new path".
+- [x] **Step 6: The ERP's measurement time on the same frames** (`zsh t13-real.sh erp`, dev Mac — M.2's machine — last,
+  with nothing else running; refuses beside an open instance and below 30 % free memory). Its subframe measurement
+  process (the step its batch preprocessing runs before weighting), set up as Task 10b's script, on the files our
+  Measure reads: set 204 = `starA-s204`'s 92 mono `calibrated/mono__…/c_*.fits` in chunks of 10 per instance and 105 OSC
+  `c_*_d.fits` in chunks of 3 (the 16 GB rule: ≤ 10 × 26 Mpx per instance); Horse C11 = `hc11B-f1`'s 106 calibrated
+  files (a file read, no catalog open) in chunks of 4. Time = the process's own in-instance time (around its execution,
+  file loading included, as our Measure includes its reads), summed per group; the launches' wall and peak RSS beside.
+  ≈ 25 + 15 min. Run B is not run: its 184 frames are set 204's cameras and nights (same reference file `…_0171`), so
+  set 204's per-frame time × 184 is printed, labelled derived. A chunk that hangs past 10 min is killed (only the
+  instance this step launched); the line then reads "not measured (<reason>)" and the 2026-10-04 batch log's
+  measurement step is printed instead, labelled "another machine (16 threads), Horse C11 164 frames incl. R and B,
+  170 s — not comparable". The OSC chunks under-use the cores, so its OSC time is an upper bound — said on the line.
 
-- [ ] **Step 5: Read the bars** per dataset (`results/plan-a/t13-real/bars.txt`, the compare files verbatim):
+- [x] **Step 7: Read the bars** (`t13-tools.py bars` → `star-lab/results/plan-a/t13-real/bars.txt`, compare files
+  verbatim), per dataset:
   - master median within ±0.1 %, MAD ±1 %, noise (MRS σ) ±2 %, FWHM ±1 % (the §8 rows of `--numeric`, `docs/stacking/
     README.md` "masters within 0.1 % median / 1 % MAD / 2 % noise / 1 % FWHM") — mono and every OSC plane, plain and
-    drizzled; "or better" means a row that is inside the tolerance passes whatever the direction;
-  - per-frame weights, on all three datasets (ruling F41): Spearman ρ ≥ 0.9 against the before run
-    (`stacking_run_frames.weight` joined by `frame_id`, before run / after run as `before.txt` and `run.txt` name
-    them), and every frame whose weight rank moved by more than 10 % of N is listed with the scorecard row that
-    explains it (F-5's captured fraction, F-3's unsaturated statistic, F-4's β) — a move without a row goes to the
-    owner;
-  - LN relative scale `s` per frame, on all three datasets: median ratio within 1 ± 0.5 % (the §8 row), read from
-    the `.athln` grids; the per-frame scatter of the ratio is REPORTED beside it, not a bar (ruling F23 e, PA-14);
-  - Measure stage wall ≤ 1.2 × the before tree's — a confirmation at master level of Task 10b's first read (M.1; moved
-    by Task 10b, 2026-10-11) — (set 204: 3.62 min → ≤ 4.34 min; run B and Horse C11 from their
-    `before.txt` stage times); the Normalize stage wall is REPORTED beside it (M-6: LN's reference fit under `Auto`
-    now runs the bounded sample fit; set 204 before 2.46 min); the total wall is reported with the stages that did
-    not run named (R-TA-9: no interleaved bracket);
-  - the stacking `metrics` payload's `starsRefused` and `beta` per frame are reported (new fields), and the master
-    `beta` line (L-25) beside the FWHM row.
+    drizzled; "or better" means a row that is inside the tolerance passes whatever the direction; the rejected
+    fraction and drizzle level / coverage rows are reported;
+  - per-frame weights, on all three datasets (ruling F41): Spearman ρ ≥ 0.9 against the before run (overall, joined
+    by `COALESCE(frame_id, project_frame)`, the runs `before.txt` and `run.txt` name), per-group ρ beside; every frame
+    whose within-group rank moved by more than 10 % of N is listed with the scorecard row that explains it (F-5's
+    captured fraction, F-3's unsaturated statistic, F-4's β) — a move without a row goes to the owner (Fable rules
+    while the owner is away);
+  - LN relative scale `s` per frame, on all three datasets: median ratio within 1 ± 0.5 % (the §8 row), read from the
+    `.athln` grids; the scatter is REPORTED beside it, not a bar (ruling F23 e, PA-14);
+  - Measure stage wall ≤ 1.2 × the before tree's (M.1's confirmation at master level): set 204 from Step 5's bracket
+    (M.2); Horse C11 and run B against `before.txt` (1.65 / 3.55 min; no bracket — a ratio within 1.05–1.35 is printed
+    "drift-ambiguous", R-TA-9, and gets one A Measure-only round on a clone before it is read); the Normalize stage wall
+    is REPORTED beside it (M-6; set 204 before 2.46 min); the total wall is reported with the stages that did not run
+    named (R-TA-9);
+  - the stacking `metrics` payload's `starsRefused` and `beta` / `betaOwn` per frame are reported, the master `beta`
+    and `starsRefused` lines (L-25) beside the FWHM row; the profile (Step 4) and the ERP line (Step 6) are printed.
 
-- [ ] **Step 6: Record** the run (R-OSP-11) in `docs/stacking/README.md` with every row's number; the compare files
-  are already committed in the lab per dataset (step 4). Only `starA-s204` is on disk after this task (`probe_parity`
-  reads its `calibrated` + `fits.0` + `metrics` of one 6224×4168 mono frame on run 6: `STARLAB_ACC_COPY=
-  ~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=6`); Task 14 deletes it at its end. No before tree is touched.
+- [x] **Step 8: Record** the run (R-OSP-11) in `docs/stacking/README.md` with every row's number and this task's Outcome;
+  fast-forward `one-star-path-t13` to the 13-P commit when it passed; remove the A and 13-P worktrees and their targets.
+  Only `starA-s204` stays on disk (`probe_parity` reads its `calibrated` + `fits.0` + `metrics` of one 6224×4168 mono
+  frame on its run: `STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=<run>`); Task 14 deletes it at its
+  end. No before tree is touched.
 
 ```
-docs(stacking): Plan A real-data checkpoint - Horse C11, run B, set 204 before/after at master level on clones from Measure with the reference pinned (ruling R-OSP-11: <rows>)
+docs(stacking): Plan A real-data checkpoint - Horse C11, run B, set 204 before/after at master level on clones from Measure with the reference pinned, the M.2 bracket and the fit profile (ruling R-OSP-11: <rows>)
 ```
 
-**Acceptance:** every master row inside the tolerances on the three datasets; ρ ≥ 0.9 on each with every larger
-move explained; LN scale median within 0.5 % on each; Measure ≤ +20 % on each dataset; the clone recipe's `df`
-check held on all three; `before-equivalence.txt` equal on all nine. A miss goes to the owner with the compare
-file before Task 14.
+**Acceptance:** every master row inside the tolerances on the three datasets; ρ ≥ 0.9 on each with every larger move
+explained; LN scale median within 0.5 % on each; Measure ≤ +20 % on each dataset (set 204 = M.2 on the interleaved
+bracket, with the ERP's time and the fit profile printed); the clone recipe's `df` check held on every clone;
+`before-equivalence.txt` equal on all nine; P0's identity 0 differences when 13-P is in. This checkpoint owns no fix: a
+miss goes, with its compare file, to its owner task's fix round (weights / LN / master rows: F-5 Task 10, F-3 Tasks 8 /
+10c, β Task 11b; Measure wall: the Measure-performance task the owner scopes) — Fable rules the routing while the owner
+is away — and the checkpoint re-runs after the fix, before Task 14.
+
+**Outcome (2026-10-16 night; branch `one-star-path-t13`: ba7a1ecf plan, then the docs commit; 13-P `40bad38c` on
+`one-star-path-t13-p`, its review fixes still to fold in; lab d43e019 -> 8077164 -> f819e12 / 2260ab7 / 88f6cb2 -> c7f512f;
+not pushed).** All three datasets ran as clones from Measure with the before reference pinned `manual` and `twoPass =
+false`; the attribution (ed5fa8de, the A arm) reproduces the before trees exactly on all three, so every delta is Plan
+A's own. **Rows:** weights rho 0.4642 (Horse C11, 78 movers) / 0.9553 (run B) / 0.9595 (set 204); masters 1/6, 0/4,
+0/8 median sub-checks (sharper and, on set 204 mono, 3.8 % noisier; Horse C11 less noisy, L median +10.3 % on pedestal
+data); LN s +3.00 / -0.95 / -0.97 %; Measure 1.338 / 2.752 / 2.726; **M.2: A 3.61 min, B 9.88 min, B / A 2.738, the owner's
+4.34 min MISS, the ERP 4.00 min (ours / ERP 2.47x)**; profile: the seed cap on 50 / 92 mono planes, 22 961 fitted against
+A 6 884 and the ERP 8 272, 0.102 against 0.027 ms per star. **Rulings:** R13-3 (Fable for the owner) weights and masters
+ACCEPTED (ERP join rho 0.931 -> 0.956 mono, 0.903 -> 0.936 OSC; the master level is a re-definition); R13-4 the LN row is
+a re-definition (the LN reference is the top-N by weight and moved with the weights; reference-corrected -0.21 % mono,
+-0.06 / -0.06 / +0.13 % OSC), no fix round, Horse C11 closed (disjoint top-5 sets). **Limits:** the single-run walls
+are one night; the harness LN row is not yet re-based (lab item). **Carries:** the Measure-performance task (the OWNER
+scopes it; README R-OSP-11 holds Fable's five-line proposal) before Plan A closes; **Task 14** the LN-row re-base and
+the 13-P review fixes folded into its commit. Tool defects: lab f819e12, 2260ab7, 88f6cb2; Step 1's build command.
+README R-OSP-11.
 
 ---
 
@@ -5425,7 +5524,7 @@ python3 bin/baseline_flags.py   $S/scorecard.json --out $R/divergent-families.tx
 python3 bin/twin_saturation.py  manifests/v2.json --probe-dir $S/probe --out $R/twin-saturation.txt
 python3 bin/path_compare.py     $R/scorecard-summary.md --data-root ~/.athenaeum-acc/star-lab-v2 --probe-dir $S/probe --out $R/path-compare.txt
 python3 bin/star_test_corpus.py table manifests/corpus.json --probe-dir $S/corpus-probe --out $R/corpus-table.md
-python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t12-amode/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-t12.txt            # no design list: Task 13 changed no code path the lab reads → 0 moved
+python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t12-amode/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-t12.txt            # no design list: Task 13's one code commit (13-P) adds debug log lines only, no number moves → 0 moved
 python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-baseline.txt --design results/plan-a/design-cumulative.json
 gzip -k $S/scorecard.json && mv $S/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/results/final/
 STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=6 STARLAB_SCRATCH=$S/gates python3 bin/gates.py > $R/gates.txt
@@ -5437,7 +5536,7 @@ grep -h '"kind": "provenance"' $S/probe/run_log.jsonl $S/inject-probe/run_log.js
   rest: 0 moved expected (ruling F21, M-13). Task 5's `one-sided` rows keep their rule in the final diff too —
   judged against the original baseline by the same one-sided test wherever no later step set them aside, never
   silently set aside. The gates: 13 PASS expected (`probe_parity` on the `starA-s204` clone's run 6 artifacts
-  written by the Task 13 build — the same code as this run's probe, ruling F12; `determinism` covers 170
+  written by b6c5d5b3 (13-P adds debug lines only, no number — the same measurement code as this run's probe, ruling F12); `determinism` covers 170
   families). Only one clone is on disk for this task; no before tree was touched at any point.
 
 - [ ] **Step 2: The note** `2026-10-XX-star-measurement-after-plan-a.md`, beside the baseline and in its format

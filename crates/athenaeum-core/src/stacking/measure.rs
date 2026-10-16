@@ -333,6 +333,9 @@ pub struct MeasuredPlane {
     pub diagnostics: Vec<sm::FitDiagnostics>,
     /// The plane's own wall time in the call: both of its halves, its `plane(p)` calls included. Reported.
     pub wall_ms: u64,
+    /// The verdict pass's wall in ms, where the plane went through [`sm::prepare_plane`] (the group measure and the
+    /// multi-plane path); `None` on the mono single-call path. Reported in `"frame plane measured"` only (13-P).
+    pub verdict_ms: Option<u64>,
 }
 
 /// A probe-level override of the seed detector (ruling F26). A run never passes one: it selects its detector
@@ -515,6 +518,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             seeds,
             diagnostics,
             wall_ms: t.elapsed().as_millis() as u64,
+            verdict_ms: None,
         }]);
     }
     let colour = n_planes == 3;
@@ -560,6 +564,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             (Some(head), Some(prep)) => (head, prep),
             _ => unreachable!("one head and one prep per plane, taken last to first"),
         };
+        let verdict_ms = prep.verdict_time().as_millis() as u64;
         let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
         drop(data);
         let (measurement, seeds, diagnostics) = adapter_tail(head, m);
@@ -569,6 +574,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             seeds,
             diagnostics,
             wall_ms: walls[p].as_millis() as u64,
+            verdict_ms: Some(verdict_ms),
         });
     }
     Ok(out.into_iter().flatten().collect())
@@ -586,6 +592,8 @@ pub struct PlanesPass1 {
     heads: Vec<AdapterHead>,
     preps: Vec<sm::PlanePrep>,
     beta_own: Vec<f64>,
+    /// The wall of each plane's [`sm::plane_beta`], in ms. In memory only (13-P): a stored first pass read back holds 0.
+    beta_ms: Vec<u64>,
     walls: Vec<Duration>,
 }
 
@@ -624,6 +632,7 @@ pub fn measure_planes_pass1<'a, E>(
     let mut heads = Vec::with_capacity(n_planes);
     let mut preps = Vec::with_capacity(n_planes);
     let mut beta_own = vec![f64::NAN; n_planes];
+    let mut beta_ms = vec![0u64; n_planes];
     let mut last: Option<Cow<'a, [f32]>> = None;
     for (p, wall) in walls.iter_mut().enumerate() {
         let t = Instant::now();
@@ -644,7 +653,9 @@ pub fn measure_planes_pass1<'a, E>(
         );
         let prep = sm::prepare_plane(&data, w, h, &head.module_opts, pool);
         if n_planes == 1 {
+            let tb = Instant::now();
             beta_own[p] = sm::plane_beta(&data, w, h, &head.module_opts, &prep, pool).0;
+            beta_ms[p] = tb.elapsed().as_millis() as u64;
         } else if p + 1 == n_planes {
             last = Some(data);
         }
@@ -661,7 +672,9 @@ pub fn measure_planes_pass1<'a, E>(
                 None => plane(p)?,
             };
             let _span = tracing::debug_span!("measure_plane", plane = p).entered();
+            let tb = Instant::now();
             beta_own[p] = sm::plane_beta(&data, w, h, &heads[p].module_opts, &preps[p], pool).0;
+            beta_ms[p] = tb.elapsed().as_millis() as u64;
             walls[p] += t.elapsed();
         }
     }
@@ -671,6 +684,7 @@ pub fn measure_planes_pass1<'a, E>(
         heads,
         preps,
         beta_own,
+        beta_ms,
         walls,
     })
 }
@@ -694,6 +708,7 @@ pub fn measure_planes_pass2<'a, E>(
         heads,
         preps,
         beta_own,
+        beta_ms: _,
         walls,
     } = pass1;
     debug_assert_eq!(
@@ -707,6 +722,7 @@ pub fn measure_planes_pass2<'a, E>(
         let data = plane(p)?;
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
         head.module_opts.psf_model = PsfModel::Fixed(betas[p]);
+        let verdict_ms = prep.verdict_time().as_millis() as u64;
         let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
         drop(data);
         let (mut measurement, seeds, diagnostics) = adapter_tail(head, m);
@@ -717,6 +733,7 @@ pub fn measure_planes_pass2<'a, E>(
             seeds,
             diagnostics,
             wall_ms: (walls[p] + t.elapsed()).as_millis() as u64,
+            verdict_ms: Some(verdict_ms),
         });
     }
     Ok(out)
@@ -1398,6 +1415,7 @@ fn assemble_frame(
             noise_ms = m.timings.noise_ms,
             detect_ms = m.timings.detect_ms,
             fit_ms = m.timings.fit_ms,
+            verdict_ms = measured.verdict_ms,
             duration_ms = measured.wall_ms,
             "frame plane measured"
         );
@@ -1594,6 +1612,7 @@ impl FramePass1 {
                 heads,
                 preps,
                 beta_own: head.beta_own,
+                beta_ms: vec![0; n],
                 walls,
             },
             identity: Some(now),
@@ -1737,6 +1756,21 @@ pub fn measure_frame_pass1(
         gain,
         |plane| read_guarded(&reader, &mut guard, cancel, &mut read_ms, plane),
     )?;
+    for (plane, (prep, wall)) in planes.preps.iter().zip(&planes.walls).enumerate() {
+        let (verdict_fits, verdict_iterations) = prep.verdict_iterations();
+        debug!(
+            path = %path.display(),
+            plane,
+            seeds = prep.seeds().len(),
+            verdict_ms = prep.verdict_time().as_millis() as u64,
+            verdict_fits,
+            verdict_iterations,
+            beta_ms = planes.beta_ms[plane],
+            beta_own = planes.beta_own[plane],
+            duration_ms = wall.as_millis() as u64,
+            "frame plane first pass"
+        );
+    }
     #[cfg(test)]
     {
         let mut hooks = PASS1_CANCEL_AFTER.lock().unwrap();
@@ -3085,6 +3119,72 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         )
         .unwrap()
         .remove(0)
+    }
+
+    /// Plan A Task 13 (13-P): a frame's two passes log their profile at debug. `"frame plane first pass"` carries the
+    /// seeds, the verdict pass's wall, fits and LM iterations, the β sample's wall, the own β and the plane's wall;
+    /// `"frame plane measured"` gains `verdict_ms`, which is a share of `fit_ms`.
+    #[test]
+    fn the_two_passes_log_the_fit_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = moffat_member(3.0, 11);
+        let path = write(dir.path(), "profile.fits", &[plane.as_slice()], 480, 400);
+        let opts = MeasureOptions::default();
+        let cancel = AtomicBool::new(false);
+        let mut result = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let pass1 = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let beta = pass1.beta_own()[0];
+            result =
+                Some(measure_frame_pass2(&path, pass1, &[beta], &opts, None, &cancel).unwrap());
+        });
+        let (frame, _) = result.unwrap();
+        let line = |msg: &str| {
+            logs.lines()
+                .find(|l| l.contains(msg))
+                .unwrap_or_else(|| panic!("no {msg:?} line in:\n{logs}"))
+                .to_string()
+        };
+        let first = line("frame plane first pass");
+        for field in [
+            "path=",
+            "plane=0",
+            "seeds=",
+            "verdict_ms=",
+            "verdict_fits=",
+            "verdict_iterations=",
+            "beta_ms=",
+            "beta_own=",
+            "duration_ms=",
+        ] {
+            assert!(first.contains(field), "{field} missing: {first}");
+        }
+        let field = |l: &str, name: &str| -> u64 {
+            let at = l.find(&format!(" {name}=")).unwrap() + name.len() + 2;
+            l[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(field(&first, "seeds") >= 20, "{first}");
+        assert!(field(&first, "verdict_fits") >= 20, "{first}");
+        assert!(
+            field(&first, "verdict_iterations") >= field(&first, "verdict_fits"),
+            "{first}"
+        );
+        let measured = line("frame plane measured");
+        assert!(measured.contains("verdict_ms="), "{measured}");
+        assert!(
+            field(&measured, "verdict_ms") <= frame.channels[0].timings.fit_ms,
+            "{measured}"
+        );
+        assert_eq!(
+            field(&measured, "fit_ms"),
+            frame.channels[0].timings.fit_ms,
+            "{measured}"
+        );
     }
 
     /// Task 11b: two members whose own βs differ (2.5 and 6 in the pixels) are both fitted at the group β, the lower

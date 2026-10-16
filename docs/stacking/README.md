@@ -3408,3 +3408,82 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (`analysis/analyzer.rs map_result`), XISF / `read_raw`, the CFA rule for raw OSC, the completeness bar at N ≥ seeds,
       the optional own-β diagnostic at Moffat 4. Logging: the dictionary has the new names (`budget`, `candidates`,
       `kept`, `not_selected`, `trimmed`, `cells_with_stars`, `cells_covered`). No command, type or `ts_export` change.
+
+  - **R-OSP-11 - the real-data checkpoint at master level (Plan A Task 13; rulings R13-0 ... R13-4; read with `grep` /
+    `sed -n` from athenaeum-lab `star-lab/results/plan-a/{t13-real,t13-attrib}/*/verdict.txt`, `t13-real/{m2,p0,erp,
+    ln-truth}`; lab d43e019 ... c7f512f, pushed).** *The design.* Each dataset is a clone of its d5f26b7e before tree
+    (Horse C11 `hc11B-f1` run 5, run B `lnB-runB-f1` run 6, set 204 `tierA-lnB-f1` run 5) run from Measure with the
+    before run's reference pinned `manual` (69845 / 123 / 28934) and `twoPass = false`; the after server is b6c5d5b3 (the
+    13-P build for P0 and the M.2 B arm). **The attribution:** the same three runs by ed5fa8de (A; it holds the LN model
+    fixes 42d4f338, 61e9608b, 002a1e08 that d5f26b7e does not) reproduce the before trees EXACTLY (masters, weights rho
+    1.0000, LN s ratio 1.000000, Measure 1.000 +- 0.007 on all three), so **every delta below is Plan A's own**.
+    - **Rows (B = b6c5d5b3 against the before run; PA-13 Measure equivalence equal on all three).**
+
+      | Row | Horse C11 | run B | set 204 |
+      | ---- | ---- | ---- | ---- |
+      | master median / MAD | G +0.03 / -0.18 %; L +10.32 / +2.01 % (1/6 pass) | L +0.22 / +2.12 %, OSC p0 +0.36 % (0/4) | mono +0.147 / +3.54 %, drizzled +0.131 %, OSC +0.38 / -0.22 / -0.31 % (0/8) |
+      | master noise | G -6.48 %, L -10.52 % (less noise) | L +0.62 %, OSC p0 +1.68 % (within) | mono +3.83 %, drizzle2x +4.60 %, OSC p0 +1.97 % (5/8) |
+      | master FWHM | G +0.185 %, L -0.42 % (beta 3.30 vs 3.39) | L -1.82 %, OSC p0 -1.17 % (sharper) | mono -2.04 %, drizzle2x -2.61 %, OSC p0 -3.37 % (5/8) |
+      | weights rho (bar >= 0.9) | **0.4642** (G -0.170, L 0.520; 78 movers, each with a scorecard row) | 0.9553 (L 0.942, OSC 0.814; 63 movers) | 0.9595 (mono 0.936, OSC 0.833; 63 movers) |
+      | LN s median (bar +-0.5 %), scatter | +3.00 %, 0.20 % | -0.95 %, 0.08 % | -0.97 %, 0.08 % |
+      | Measure, one run (before) | 2.21 (1.65) min = 1.338, drift-ambiguous | 9.78 (3.55) = 2.752 | 9.88 (3.62) = 2.726 |
+      | Normalize (before) | 1.22 (1.19) | 3.19 (2.66) | 3.10 (2.46) |
+      | total (before) | 10.4 (11.0) | 18.5 (13.5) | 20.0 (15.0) |
+
+      set 204 also: drizzle level 3/4 (OSC p0 0.9978), coverage 2/4, rejected fraction PASS. Run B's masters were
+      unreadable in the first pass (tool defects below) and read from the attribution's B re-run.
+    - **M.2 (set 204, interleaved Measure-only bracket A1 B1 A2 B2 A3 B3).** A = ed5fa8de **3.61 min** (3.61 / 3.61 /
+      3.57; = the 2026-10-06 3.62, no drift); B = 13-P **9.88 min** (10.08 / 9.78 / 9.88): **B / A 2.738, bar 1.2 MISS;
+      the owner's 4.34 min MISS.** The ERP's own subframe measurement on the same calibrated files: **4.00 min**
+      in-instance (mono 92 files 116.1 s = 1.26 s / frame, peak 8.7 GB; OSC 105 files 124.2 s = 1.18 s / frame in
+      chunks of 3, an upper bound; Horse C11 106 files 252.7 s = 2.38 s / frame; run B derived 3.74 min): **ours / ERP
+      2.47x**, A ~ ERP. Plane medians A / B (ms), mono: read 36 / 76, background 327 / 412, noise 346 / 298, detect 172 /
+      171, **fit 185 / 3552**, total 1652 / 7510; OSC: fit 200 / 1557, total 1551 / 4313.
+    - **The fit profile (13-P, P0 identity 0 differences against the set 204 run).** Mono, 92 planes: the seed cap
+      (24 576) is hit on **50 / 92** planes; **22 961 stars fitted per plane against A 6 884 and the ERP 8 272** (3.3x);
+      fit 3.55 s / plane = the verdict pass 1.21 s (15.75 LM iterations per fit, share 0.157) + the fit at the group
+      beta 2.33 s = **0.102 ms per star against A's 0.027** (185 ms / 6 884, 4x); the beta sample 38 ms (0.005); pass 1 =
+      0.757 of the Measure wall; the whole-plane passes (read 73 / background 374 / noise 297 / detect 216) barely
+      moved. OSC, 315 planes: 12 235 seeds, no cap hit, fit 1.65 s (verdict 0.72 + at beta 0.93). The pre-Plan-A 0.21 s
+      fit was cheap by COUNT (6 884 stars), not by kernel.
+    - **R13-3 (Fable, standing in for the owner, 2026-10-16 night).** (Q3 / Q4) Plan A's weights and masters are
+      ACCEPTED: tonight's ERP rows say the weights track the ERP better, set 204 mono Spearman(ERP PSFSW, weight) 0.931
+      -> 0.956, OSC 0.903 -> 0.936, OSC plane-0 FWHM A 3.60 / B 3.07 / ERP 3.06; the sharper, noisier master is PSFSW on
+      better inputs (mono Neff 84 -> 71 = the +3.8 % noise; a weight-mode choice, not a code fix). Horse C11 rho 0.46 is
+      the old fixed-ellipse flux (x6 - 22 per frame, enclosed fraction 0.83 - 0.93) being the artefact; on the 78 movers
+      Spearman(ERP PSFSW, weight) is G -0.16 -> +0.72, L +0.26 -> +0.81. No F-3 / F-4 / F-5 round. (Q1) The master
+      level shifts are a re-definition (the LN offset term under F-10's ring sky), report-only; Horse C11's L +10.3 % is
+      pedestal data (OFFSET 1, no dark or bias, 2x in the corners), where two sky definitions differ most.
+    - **R13-4 and the LN verdict (Fable final, `ln-truth/`).** The LN reference is NOT pinned: `build_reference`
+      integrates the top-N frames by sky-penalized weight, and Plan A's weights changed its composition (set 204 top-20
+      shared 16 / 20 mono, 11 / 20 OSC; OSC anchor 29034 -> 28949). The row s_B / s_A therefore read the reference's own
+      star-flux change (phot_B / phot_A 0.990 mono, 0.994 / 0.991 / 0.987 OSC); reference-corrected, the estimator's
+      move is **-0.21 % mono, -0.06 / -0.06 / +0.13 % OSC**, inside +-0.5 %. Against aperture photometry on the registered
+      planes (gap = s / phot - 1): median |gap| A -> B mono 0.270 -> 0.313 % (n 91, a 0.04 pp difference under the ~0.1 pp
+      noise), OSC 0.401 -> 0.196, 0.326 -> 0.247, 0.780 -> 0.683 %, pooled 0.348 -> 0.339 %. Master / reference star
+      flux A -> B -0.56 % mono, -0.27 / -0.13 / -0.02 % OSC, within the combined noise (0.6 - 1.3 sigma). **RULING:
+      re-definition, no Task 10b / Task 10 fix round; the harness row is re-based to the reference-corrected ratio
+      (bar +-0.5 %), with the raw ratio, the top-N overlap and the anchors printed beside (a pair without truth prints
+      "reported, n/a").** Horse C11 closed by the controller: its `referenceFrames` is 5 and the top-5-by-weight sets of
+      A and B are disjoint in both groups. The harness re-base itself is a lab item for Task 14's notes.
+    - **Routing.** (1) The **Measure-performance task**, scoped by the OWNER (Fable's proposal, five lines): first
+      the budgeted population (R-OSP-10's `Mode::Budget` for what the stacking Measure consumes: weights, F, beta, `c`,
+      F-6), judged on the whole group at master level since it moves `.athf` and flattens the depth tilt; second the
+      per-star kernel, every `.athf` bit-identical, then the verdict pass skipped for a seed whose peak cannot reach the
+      clip floor; third the whole-plane passes (R12-8's family); out of bounds: the 6 sigma threshold (R-OSP-2), the
+      Moffat conditioning (R-OSP-3), the verdict rule (R-OSP-5), the beta estimator (R-OSP-6), the group-beta two-pass
+      (R-OSP-9). Bars: set 204 Measure <= 4.34 min interleaved, Horse C11 <= 1.2 x A, the ERP's 1.2 s / frame printed
+      beside; acceptance = this checkpoint's compare re-run. (2) The LN item: closed (above). (3) Nothing else
+      re-runs: no weight, master or LN fix round opens from this checkpoint.
+    - **Tool defects found and fixed tonight.** Lab f819e12 (project masters sit one level down in `stackout/<project>/`
+      and rejection / coverage maps were classified as masters), 2260ab7 (`ATH_ACC_STOP_AFTER` polled for the
+      `stacking stage finished` line, which the server writes only at the run's end: a stage now ends at the later
+      stage's `fan-out admitted` line), 88f6cb2 (`erp_group`'s file array under zsh `set -u`). **Plan defect:** Step 1's
+      `cargo build -p athenaeum-web -p athenaeum-core --example ...` builds only the examples, so the server needs its own
+      `-p athenaeum-web` call (B's server was a stale binary until rebuilt).
+    - **Limits and carries.** (a) Horse C11 Measure 1.338 and the single-run walls are one-night, not interleaved; the
+      attribution's same-night B / A (hc11 1.327, runB 2.696, set 204 2.729) supersede them. (b) The ERP OSC time is an
+      upper bound. (c) Horse C11's B tree is deleted; only `starA-s204` stays for Task 14 (`probe_parity`). (d) 13-P
+      is additive debug lines only (`PlanePrep` and `.athm` untouched); its review round (0 / 1 / 4, `measure_planes_
+      diagnosed` multi-plane `verdict_ms`) folds into the 13-P commit. **Task 14:** the LN-row re-base, the Measure
+      cost as the Measure-performance task leaves it.
