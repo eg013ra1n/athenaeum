@@ -5567,6 +5567,198 @@ reverted with its numbers, never tuned toward the row.
   LN scale, registration parity — on the whole group. Any numeric move is a change of record with its numbers (R13-3's
   standard), never a silent one.
 
+**Design read (2026-10-16 night; report `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-13b-report-design.md`,
+scripts and outputs in the session scratchpad `t13b-design/`).** Scope, rules, lever order and bars above are kept;
+where the code contradicts the stub the sharpening is marked **(S)**.
+
+*The arithmetic (Q1).* Single-thread cost per plane (P-core s; `RAYON_NUM_THREADS=1` probe runs on set 204's
+calibrated frames, attributed with the system sampler): mono wide 0058 12.7 (LM solves 7.7 — the verdict pass about
+twice the pass-2 fit —, `signal_totals` 0.59), mono sharp 0075 7.3 (LM 2.6, `signal_totals` 0.84), OSC 0163 6.8 per
+plane (LM 3.2); the whole-plane passes W (read to detection) 2.42–2.58 on the mono planes, the OSC planes taken
+alike (≈ 2.6 with the second read and working copies). Per fit (verdict + pass 2 + photometry): 0.44 ms at
+F 4.1, 0.13 ms at F 2.0, 0.30 ms on the OSC planes; flat across brightness (0058's top 1 910 / 3 810 / 9 502 seeds: 0.38 /
+0.42 / 0.51 ms). The stage log (set 204 run 6, b6c5d5b3): Σ plane walls / 5 = the stage wall (mono 977 / 5 = 195 s
+against 198; OSC 1 960 / 5 = 392 against 395), so the five workers are never idle; Σ single-thread cost ≈ 3 100 P-core s (modelled: 42 wide and 50 sharp mono
+planes, 315 OSC planes)
+against 593 s = 5.3 P-core equivalents (the dev Mac has 4 performance + 6 efficiency cores, ceiling ≈ 6.1–6.7):
+concurrency headroom ≤ ~20 %, measured in Step 0. Phase means are 1.2–5.8× their medians in the same run (mono
+background 1 929 / 334 ms, OSC detect 1 115 / 220): the per-phase walls carry the pool's queueing, so walls never rank
+the costs — single-thread runs do. **W alone
+is 407 planes × 2.6 = 1 060 P-core s = 200 s at today's throughput against the ERP's 240 s: lever 3 is required, not
+optional (S).** Targets per plane: W ≤ 1.8; fits ≤ (mono 4 600, OSC 2 750) × the per-fit cost; totals ≤ 0.05 s → set
+204 ≈ 1 140 P-core s ≈ 216 s at 5.3 — level with the ERP; the margin comes from the bit-identical items (≈ 5–10 %) and
+concurrency (≤ 20 %). OSC planes are 75 % of the target cost: the ERP measures an OSC file at about its mono cost (1.18
+against 1.26 s / frame), we measure three planes. No out-of-bounds item is a large cost once the population is budgeted
+(the 6σ threshold drives detection only; the group-β two-pass costs a second read and working copy, ≈ 0.1 s / plane).
+If Step 0's measured projection misses the re-timed ERP with every in-bounds lever at its target: STOP S1 to the owner
+with the table (contingencies, not in this task: one detection per OSC frame shared by its planes; a warm-started pass-2
+LM judged by tolerance).
+
+*(S) Population (a) is not `Mode::Budget` as built.* R12-3 ranks a cell's candidates brightest-first and R12-4 trims by
+SNR descending: the N brightest unsaturated stars per cell, which the owner's rule forbids (frame PSF statistics sample
+across brightness, never the N brightest). One stratified selection (`star_measure/population.rs`) serves both modes;
+`Mode::Budget`'s candidates switch to it (one path, R12-8; Plan C has no consumer yet; the Analysis rows are re-based).
+Kept from Task 12: the 4 × 4 cells, the selection after detection and before the verdict pass (R12-2), every seed as a
+neighbour (R12-5), the `NotSelected` / `Trimmed` records, the `BudgetReport`.
+
+*(S) PSFSW is a sum, not a sample statistic.* `PSFSW ∝ TFlux · TMeanFlux / (σ_N · M*)`, TFlux and TMeanFlux sums over the
+accepted fits (TMeanFlux RCR-winsorized: 6 482 of 20 014 values clipped on 0058), so it carries the star count. Over a
+fixed-N budget the count cancels: the wide / sharp class ratio (0058/0059 against 0075/0076) moves +202 %; over the
+fitted union (a) ∪ (b) it moves −12 … +16 % depending on M. The totals therefore run over the COMPLETE detection: an
+accepted fit contributes its signal and mean flux; an unfitted seed its matched-filter flux × r (r = the plane's median
+signal / flux over (a)'s accepted fits; rank correlation flux ↔ signal 0.971–0.980) over the frame-FWHM ellipse area,
+counted with weight p (the accepted share of (a)'s faintest stratum). Measured with a simplified RCR: PSFSW / today
+1.03–1.05, class differential 2 %. **Fable rules this estimator before Step 3 (a hard numeric choice).**
+
+*(S) β and its sample stay.* The stub lists β in (a), but the β estimator and the group-β two-pass are out of bounds
+(R-OSP-6, R-OSP-9; R11b-6: a band-sampled β arm did not move the 0000 defect). The β sample stays the first 64
+qualifying seeds in brightness order — all inside list (b) — so every own β and the group β stay bit-identical (gated).
+
+*(S) The verdict-pass skip is dropped.* It is not bit-identical by construction: the verdict fit's amplitude is
+unbounded (`by_amplitude` cannot be ruled out from the peak), and `verdict_fit_failed` and the `.athm` `SeedPass` bytes
+change. Its saving comes with lever 1: the verdict pass runs on the fitted set only (R12-2's order).
+
+*(S) The kernel lever is small.* The LM solves are 36–61 % of a plane's CPU and cannot change bit-identically (a
+continuous β takes `powf` per pixel where the old Moffat 4 took `powi`; pass 2 re-solves cold from moments); allocation
+reuse, the region growth's exact median and buffer reuse are ≈ 5–10 %. The big bit-identical item is elsewhere:
+`robust::rcr` is O(n²) per plane (`order.remove(0)`, the deviations re-sorted per removal): 0.22–0.84 s per plane.
+
+*(S) LN rows cannot be an identity guard; registration can.* The LN reference is the top-N by weight (R13-4) and the
+weights move, so the LN guard is the reference-corrected ratio (±0.5 %); the harness re-base (Task 14's carry) moves into
+Step 0. Registration parity IS an identity: the reference is pinned, Register reads x, y, signal (sort key), amplitude,
+background, fwhm, residual from `.athf` (no flags, no isolation; top 2 000 by signal after its cuts, `MIN_INLIERS` 8,
+homography 30), and signal = model flux × `c` — a per-plane factor keeps the order.
+
+*(S) ERP OSC chunks.* The 16 GB rule (≤ 10 targets of 26 Mpx per instance, one target at a time) caps an OSC chunk at 3
+files; what chunks of 3 inflate is the per-instance warm-up, paid 35 times. The re-time measures the warm-up.
+
+**Decisions (each with its evidence).**
+- **List (b)** = the first M seeds in detector order (brightest-first by matched-filter flux). Mono: M = 2 ×
+  `registration.max_stars` (4 000 at the default); OSC (Register re-detects on luminance, so LN only): M = 4 × LN's
+  500-pair cap = 2 000. Evidence: on 0058 / 0059 / 0075 / 0076 the top 2 000 fits by signal that pass Register's cuts lie
+  within seed rank 3 270 / 3 575 / 3 397 / 3 330 (M = 4 000 captures 100 %, M = 3 000 99.8–99.9 %); the top 500 within
+  910–1 283; LN needs ≥ 20 matches, ≤ 500 pairs at peak SNR ≥ 40, 40 distinct for the spline, 100 for the growth curve.
+  M folds into the measurement hash. The registration-identity gate decides; a miss raises the factor once (2 → 3, cost
+  printed), else STOP S2.
+- **Population (a)**, N = 1 000 for stacking (`Mode::Budget`'s N stays the caller's, 500 by default). Eligible: not
+  extended; no other detected seed within 1.5 F (F = the detection field width; every seed counts, R12-5); not flagged by
+  the pre-fit saturation clauses (plateau, near-clip, pixel 0, top 3 × 3); filter SNR ≥ 20 and below the eligible pool's
+  95th percentile. Strata: 4 × 4 cells × 4 brightness quartiles (log filter SNR within the band) = 64, quota ⌈N / 64⌉
+  water-filled, picks evenly spaced by rank inside a stratum (deterministic). Evidence (30 draws per N, four set 204 mono
+  frames): FWHM sd N = 500 0.29–0.31 %, 1 000 0.15–0.24 %, 2 000 0.12–0.17 %; ecc sd 0.0042–0.0052 / 0.0029–0.0040 /
+  0.0021–0.0027; HFR median 0.29–0.45 / 0.20–0.31 / 0.18–0.25 % — at N = 1 000 below the consecutive-frame difference
+  (0058 → 0059: FWHM 0.37 %, ecc 0.005). Re-definition against today's all-fits value: FWHM +1.3–1.6 % on the wide
+  frames, +0.0–0.35 % on the sharp; ecc −0.015 … −0.028; the SNR median 9–19 → 25–29.
+- **(a)'s consumers:** `frame_shape` (FWHM, ecc), the F-6 medians, the ring width F (= the frame FWHM, so B_i, σ_i, SNR,
+  HFR and `c` follow it), `c` (one qualifying fit per stratum = 64 = `CORRECTION_STARS`). Not (a): β (above), the PSFSW
+  totals (above), the star counts.
+- **Star counts:** `min_stars`, the D·ΔStars term and the `best_by_weight` / `sky_penalized_order` tie-breaks read
+  `stars_detected` (the complete detection), so `minStars` keeps its meaning; `stars_fitted` = the accepted fits of
+  (a) ∪ (b).
+- **Close pairs:** the 1.5 F test runs on the seed list before the fit; a pair stays in (b) when ranked. **Merged pairs:
+  no post-fit rule** — inside (a) they are 0.32–0.86 % of the fits (1.5–2.7 % of all fits: the SNR floor removes the
+  faint junk) and move (a)'s FWHM +0.05–0.20 %, ecc +0.0003–0.0013, at or below the N = 1 000 sampling sd; re-opened if
+  Step 5 prints a merged share > 2 % in (a) on a dataset.
+- **The 24 576 cap stays:** it cuts at filter SNR 9.4 (0075); (a)'s floor is 20 and (b) ends near filter SNR 73–154;
+  raising it costs detection (knot tests per candidate) and moves the ring masks on the 50 capped planes, for no consumer.
+- **`Mode::All` stays op for op** (the probe's `measure` path, the Analysis star map, any caller that asks); the stacking
+  Measure runs `Mode::Population`; the probe gains `--paths population` (the lab and `probe_parity`).
+- **Versions:** `MEASURE_VERSION` 4 → 5 (every statistic moves); `PASS1_ARTIFACT_VERSION` 1 → 2 (`PlanePrep` gains the
+  selection; the golden pin re-pinned). Release note: the first run after the upgrade re-measures.
+
+**Files.**
+- New: `crates/athenaeum-core/src/star_measure/population.rs` (`rustfmt` by path).
+- `star_measure/mod.rs` (`Mode::Population`; `prepare_plane` / `plane_beta` / `finish_plane` under it; `PlanePrep`
+  gains the selection; read→working fusion), `budget.rs` (`select_candidates` → the stratified rank), `fit.rs` (verdict
+  pass and `fit_after_passes` over the fitted set; scratch reuse), `photometry.rs` (`aperture_correction`'s sample from
+  the strata; ring F from (a); SNR / HFR buffers), `frame.rs` (`FrameAggregates` over (a), `signal_totals_complete`),
+  `robust.rs` (`rcr` O(n) per removal, bit-identical), `domain.rs` (native sky sample at the read; mesh / MRS buffer
+  reuse), `seeds.rs` (`d` fused into the first filter pass; buffer reuse).
+- `stacking/measure.rs` (the adapter passes `Mode::Population` and M; 13b-P debug timers), `stacking/pass1_artifact.rs`
+  (version 2), `stacking/plan.rs` (`measurement_hash_for` folds M), `stacking/weights.rs` (star counts →
+  `stars_detected`), `stacking/run.rs` (hand edits only, and only if Step 4's scheduling item lands).
+- `crates/athenaeum-core/examples/star_probe.rs` (`--paths population`).
+- athenaeum-lab: `harness/acceptance/t13b.sh` (ERP warm-up rounds, the H / N brackets, CPU-s), `tier1/t13-tools.py`
+  (means beside medians, CPU-s per plane, the reference-corrected LN row), the star-lab cycle `t13b-pop`.
+- Docs: `docs/stacking/README.md` R-OSP-12, `docs/settings/README.md` (`minStars` reads the detected count), this
+  task's Outcome.
+
+**Interfaces.**
+
+```rust
+// star_measure/population.rs
+pub const STATISTIC_STARS: usize = 1000;   // N, stacking
+pub const STATISTIC_SNR_FLOOR: f64 = 20.0; // filter SNR
+pub const STATISTIC_TOP_QUANTILE: f64 = 0.95;
+pub const BRIGHTNESS_STRATA: usize = 4;
+pub const ISOLATION_PER_FIELD_FWHM: f64 = 1.5;
+pub struct Population { pub fitted: Vec<usize>, pub statistic: Vec<usize>, pub stratum: Vec<u8>, pub list: usize }
+pub fn select(seeds: &[Seed], pre_saturated: &[bool], w: usize, h: usize, field_fwhm: f64,
+              statistic: usize, list: usize) -> Population;
+// star_measure
+pub enum Mode { All, Budget { budget: usize }, Population { statistic: usize, list: usize } }
+// star_measure::frame
+pub fn signal_totals_complete(fits: &[StarFit], fit_seed: &[usize], seeds: &[Seed], pop: &Population,
+                              area_f: f64) -> SignalTotals;
+```
+
+Unchanged: the `.athf` layout (its content = the accepted fits of `fitted`), Register and LN code, every command,
+`ts_export` (no new type crosses; `stars_detected` is already serialized).
+
+**Steps** (lean-execution: one phase per agent, reports ≤ 80 lines; one heavy job at a time on the dev Mac).
+**Controller amendments (2026-10-16 night).** (1) 13-P is already on `one-star-path`: 40bad38c and its review fixes
+c2713ca2 were cherry-picked and squashed into 5836a970 (`git diff c2713ca2 5836a970 -- crates/` is empty), so Task 14's
+13-P carry is closed and Step 0 builds on HEAD. (2) The owner is asleep and delegated: STOP S1 / S2 / S3 go to a Fable
+ruling (owner: «если что спрашивай у fable»), recorded in `task-13b-rulings.md` with its cost if wrong; the owner may
+overturn it in the morning. (3) Push is allowed (owner: «пуш разрешаю тоже»): code reaches the runner through GitLab
+`origin` work branches, and Step 6 pushes `one-star-path` after the full `--all-targets` re-gate.
+
+- [ ] **Step 0 — baseline and profile (dev Mac; sonnet; ≈ 3 h).** 13b-P on top of HEAD (13-P included, amendment 1):
+  additive `debug!` timers (wall
+  and thread CPU) for every untimed sub-step — working copies, `sky_level`, `saturation_plane` with its queue wait, mesh statistics
+  against map evaluation, MRS layers against its serial loops, the detection passes, `signal_totals`, ring sky, `c`, SNR /
+  HFR, the `.athf` write — folded into Step 1's commit. Lab tools (haiku): `t13b.sh`, the reference-corrected LN row, CPU-s
+  per plane from `ps -o cputime` at the stage's bounds. Runs: the ERP re-time (set 204 OSC chunks of 3 with 1-file chunks
+  interleaved, 3 rounds; mono 10-file against 1-file; run B measured the same way; Horse C11 warm-up only; the owner
+  closes their own ERP instance first); one H Measure-only run on a set 204 clone at 5836a970 with 13b-P (CPU-s,
+  per-sub-step means). Output: the projection table (each lever's measured share against the re-timed ERP). **STOP S1**
+  if it misses with every in-bounds lever at its target.
+- [ ] **Step 1 — the bit-identical items (rust-engineer sonnet; ≈ 3 h; review opus).** `rcr` O(n) per removal (a
+  property test against the old implementation on random and real vectors), read→working fusion with the native sky
+  sample, `d` fused into the first filter pass, mesh / MRS / detection buffer reuse, SNR / HFR / LM scratch reuse (the
+  rustafits LM's four allocations only if Step 0 shows malloc ≥ 5 % of LM time — then a new entry point, F7). Proof
+  (haiku): `--measure-identity` bar 1 on M42 and set 204 (OSC 105 + mono 92) 0 / 0; the runner: `probe_parity` on the lab
+  corpus 0 moved. Single-thread re-time of the three planes.
+- [ ] **Step 2 — Fable rules** the PSFSW totals estimator and confirms the (a) rule set (N, band, strata, `c`).
+- [ ] **Step 3 — populations (rust-engineer sonnet; ≈ 5 h; review opus).** `population.rs`, `Mode::Population` through
+  the two passes, `Mode::Budget` on the shared rank, `signal_totals_complete`, the star-count consumers, versions,
+  `--paths population`. Gates: `star_measure::`, `stacking::`, `star_probe`, `check --all-targets`,
+  `--no-default-features`; the registration identity and the β identity on set 204 (STOP S2 on a miss after the one
+  factor raise). The runner (sonnet, judgment): star-lab cycle `t13b-pop` — noreg against the Task 12 base with the spec
+  §8 tolerance rows, cumulative report; Analysis rows B1 / B2 re-based.
+- [ ] **Step 4 — the measured remaining gap (rust-engineer sonnet; ≈ 3 h).** Only as far as Step 3's re-time leaves a gap:
+  numeric whole-plane items (separable map evaluation; a map evaluated only where read), each with its tolerance row and
+  master-level check; Measure frame workers scheduled as pool tasks if Step 0 showed throughput < 85 % of the core
+  ceiling. A miss after these: STOP S3 with the numbers (never tuned toward a row).
+- [ ] **Step 5 — acceptance (dev Mac; sonnet judgment run; ≈ 5 h).** Measure-only brackets H N H N H N on clones of
+  `tierA-lnB-f1` run 5, `lnB-runB-f1` run 6, `hc11B-f1` run 5 (before reference pinned `manual`, `twoPass = false`; H =
+  5836a970); Analysis B3 (Task 12 bracket (b)); the set 204 quality run N from Measure on a clone, against
+  `starA-s204` read-only as H (never modified). Prints: per-plane means and medians, CPU-s per plane, (a)'s merged
+  share, fitted counts.
+- [ ] **Step 6 — review and record (opus review, Fable if it struggles; sonnet docs; ≈ 2 h).** README R-OSP-12, settings
+  doc, this Outcome, ledger; squash on `one-star-path`, then push to GitLab `origin` after the full re-gate (amendment 3).
+
+**Acceptance.**
+- Speed: the Step 5 bracket median of N < the ERP's warm-up-corrected total (marginal per-file × files + one warm-up;
+  the in-instance sum printed beside) on each of set 204, run B and Horse C11.
+- Analysis: B3 ≤ 0.6 s per m42 frame.
+- Quality (set 204, N against H, whole groups): registration results identical (identity mode); every plane's own β
+  and the group β identical; weights ρ(N, H) ≥ 0.9 per group and the ERP join ρ(N) ≥ ρ(H) − 0.01 (H: mono 0.956, OSC
+  0.936); LN reference-corrected ratio within ±0.5 % (raw ratio, top-N overlap and anchors beside); masters per Task
+  13's sub-check rows, each move a change of record with its numbers.
+- The lab: `t13b-pop` noreg PASS with every spec §8 tolerance row; Step 1's identity 0 / 0.
+- Gates: as Step 3, and the full `cargo test -p athenaeum-core --all-targets` before any push.
+
 ---
 
 ### Task 14: One full uniform lab run and the "after Plan A" note (spec §5 "At the end")
