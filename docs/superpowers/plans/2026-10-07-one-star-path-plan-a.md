@@ -5491,7 +5491,81 @@ a re-definition (the LN reference is the top-N by weight and moved with the weig
 are one night; the harness LN row is not yet re-based (lab item). **Carries:** the Measure-performance task (the OWNER
 scopes it; README R-OSP-11 holds Fable's five-line proposal) before Plan A closes; **Task 14** the LN-row re-base and
 the 13-P review fixes folded into its commit. Tool defects: lab f819e12, 2260ab7, 88f6cb2; Step 1's build command.
-README R-OSP-11.
+README R-OSP-11. **Scoped by the owner 2026-10-16: Task 13b.**
+
+---
+
+### Task 13b: Measure performance — faster than the ERP (owner scope 2026-10-16; inserted before Task 14)
+
+**Scope and bars fixed 2026-10-16 by the owner ("согласен, запиши это в задачу ускорения Measure и скорость должна быть
+быстрее ERP"); Files / Interfaces / Steps by the task's design read, which may sharpen this stub where the code
+contradicts it.** Inputs: Task 13's M.2 profile (`t13-real/p0/profile.txt`, `m2/`), Fable's Q5 five lines
+(`t13-real/fable-ruling.md`, README R-OSP-11), R12-8 (the Analysis B3 miss), and the 2026-10-16 reads below.
+
+**What Task 13 measured (why it is slow).** Set 204 Measure 9.88 min against 3.61 before Plan A and the ERP's 4.00:
+3.3× more stars × a 4× slower per-star fit. Mono planes fit 22 961 stars (the 24 576 seed cap on 50 / 92 planes)
+against A's 6 884 and the ERP's 8 272; the fixed-β fit costs 0.102 ms / star against A's 0.027; the verdict pass is
+16 % (15.75 LM iterations / fit); the whole-plane passes (background 374 / noise 297 / detect 216 ms, two reads 73 ms)
+barely moved.
+
+**What the 2026-10-16 reads settled (owner questions; scripts in the session scratchpad, numbers here).**
+- **The detections are stars, not noise.** Fits repeat on the next dithered frame at the same SKY position (affine
+  match on the stars, ≤ 1.5 px): 0058 → 0059 88.2 % of 20 014 (dither 5.3 px), capped 0075 → 0076 95.2 % of 23 836
+  (dither 2.6 px); chance at a shifted position 0.3–0.7 %; the same SENSOR pixel 0.0 % (no hot-pixel detections);
+  SNR < 5 still repeats 68–86 %. The count is the deeper matched filter (6σ_f against the old 20σ peak) on a Milky Way
+  field. The 50 capped planes are the sharp runs 0074–0082 and 0137–0144 (frame FWHM 2.1–3.3 px against 4–5); the ERP
+  agrees (FWHM 2.0–2.7, 9–16 k stars against its usual ≈ 5 k). **The 6σ threshold stays** (Fable's out-of-bounds list).
+- **The cap cuts the candidate list itself.** On a capped plane detection keeps the 24 576 strongest candidates by
+  matched-filter SNR (0075: the last kept reads 9.4); visibly real fainter stars are never measured.
+- **Faint stars are most of the cost and add little.** SNR < 10 is 24–51 % of the fits (0075 / 0058). They also carry
+  the eccentricity noise tail: dropping the outlier tail (FWHM > 1.3F or ecc > 0.85) moves 0058's frame ecc by
+  −0.018 — six times what the close pairs move.
+- **Close pairs.** The fit takes every pixel of its box (no deblending; the neighbour seeds only mask the ring sky and
+  `c`'s isolation), so a pair fits as one wide elongated star. Pairs whose companion has its own seed < 1.5F: 2.2 % of
+  0058's fits (median FWHM 6.67 against 4.73, ecc 0.88 against 0.65), 0.7 % of 0075's; their residual-weighted share
+  1.2 % / 0.5 % → frame FWHM +0.33 % / +0.05 %, ecc +0.002 / +0.0002. Merged pairs (no second seed; the shape FWHM >
+  1.3F and ecc > 0.8, a mix of real pairs and faint junk on the contact sheet): +0.54 % / +0.14 %, ecc +0.003 / +0.001.
+  Small today because the frame shape is residual-weighted; the effect grows with PSF width and crowding (≈ 5× from
+  0075 to 0058). They are not the ERP FWHM gap (+8.6 % on 0058). The ERP drops clustered sources by default
+  (`allowClusteredSources = false`).
+
+**The rules (owner-agreed 2026-10-16).**
+1. **Two populations, never one list cut for both.** (a) The **frame-statistic population** — FWHM, eccentricity,
+   weights (PSFSW), β, `c`, the F-6 medians — is a budget of good unsaturated ISOLATED stars spread over the 4 × 4 grid
+   and stratified across brightness (the mid band, never the N brightest; R-OSP-10's `Mode::Budget`, built in Task
+   12). (b) The **star list Register and LN read** (the `.athf` per plane: `resolve_register_fits` for mono
+   registration, `run_group_normalization` and `measure_ln_seeds_calibration` for LN) holds what THOSE stages need,
+   sized by their own gates (the registration-parity gate, the LN rows) — measured, not assumed.
+2. **Close pairs leave the frame statistic, not the catalogue.** A star with another seed within 1.5F is out of
+   population (a); its fit is skipped only when list (b) does not need it. A merged pair (no second seed) can only be
+   cut after its fit, by a shape rule the design read measures before adopting.
+3. **Detection stays complete.** Every candidate keeps its record (position, filter SNR, flux; `PlaneMeasurement::
+   detected`, the budget's `NotSelected` / `Trimmed` outcomes); the budget and the pair rule choose only which
+   candidates get the PSF fit. The design read decides whether detection keeps the 24 576 cap once the fit no longer
+   scales with it (detect is ≈ 0.2 s / plane).
+4. **`Mode::All` stays**: the full fitted list for the probe, the Analysis star map, any caller that asks.
+
+**Levers, in order (Fable Q5).** (1) The budgeted population — the 2–3× candidate; it moves `.athf` and every
+statistic above, so it is judged on the whole group at master level. (2) The per-star cost — region pixels per fit,
+LM iterations, allocation; a kernel change keeps every `.athf` bit-identical. Then the verdict pass — skip it for a
+seed whose peak cannot reach the clip floor, bit-identical by construction or not at all. (3) The whole-plane passes
+(background, noise, detect, the second read) with R12-8's Analysis B3 in the same family.
+
+**Out of bounds** (Fable Q5 item 4): the 6σ threshold (R-OSP-2), the Moffat conditioning (R-OSP-3), the verdict rule
+(R-OSP-5), the β estimator (R-OSP-6), the group-β two-pass (R-OSP-9). A speedup that misses a spec §8 tolerance row is
+reverted with its numbers, never tuned toward the row.
+
+**Bars.**
+- **Speed (owner, 2026-10-16; supersedes M.2's 4.34 min): the Measure stage is faster than the ERP's measurement of
+  the same frames on the same machine, on each of set 204, run B and Horse C11.** Ours = the stage wall, interleaved
+  bracket, median of 3 (Task 13's m2 procedure). The ERP = its in-instance time including file loads (Task 13 Step 6).
+  First re-time the ERP's OSC half in full chunks: Task 13's chunks of 3 under-used the cores, so 4.00 min is an upper
+  bound and would make the bar soft. Run B's ERP time is measured, not derived. Horse C11 (ours 2.21 min against the
+  ERP's 4.21) passes today and must stay faster. Reported beside: A (3.61 min), the per-plane sub-stage medians.
+- **Analysis:** B3 ≤ 0.6 s per m42 frame (R12-8's miss, 0.70 s).
+- **Quality:** the set 204 checkpoint re-run against 5836a970 at master level — masters, weights (with the ERP join),
+  LN scale, registration parity — on the whole group. Any numeric move is a change of record with its numbers (R13-3's
+  standard), never a silent one.
 
 ---
 
