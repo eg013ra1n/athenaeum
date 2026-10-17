@@ -3487,3 +3487,90 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       is additive debug lines only (`PlanePrep` and `.athm` untouched); its review round (0 / 1 / 4, `measure_planes_
       diagnosed` multi-plane `verdict_ms`) folds into the 13-P commit. **Task 14:** the LN-row re-base, the Measure
       cost as the Measure-performance task leaves it.
+
+  - **R-OSP-12 - Measure performance, route A: the stacking Measure's numbers are 5836a970's, only faster (Plan A Task
+    13b; rulings R13b-1 ... R13b-12; branch `one-star-path-t13b`, 3b8b1e41; lab 591c556, 4b18f85, 086309c, 2b89a75).**
+    *The bar and how it ended.* The owner asked for a Measure faster than the ERP. Set 204 Measure 9.90 min (5836a970,
+    "H") against the ERP's warm-up-corrected 3.77 min (226.4 s); Horse C11 2.22 against 3.71 min. The first design
+    (fit a budgeted population, estimate the weight's totals over the rest) reached the bar on paper and was REFUSED by
+    synthetic truth; the owner chose **route A, 2026-10-17 ("A: как раньше")**: every seed is fitted and the weight is
+    exactly 5836a970's. **The stacking Measure's numbers equal 5836a970 bit for bit** (`MEASURE_VERSION` 4 and
+    `PASS1_ARTIFACT_VERSION` 1 restored, so artifacts measured before stay valid); only the bit-identical speedups
+    remain. "Faster than the ERP" on set 204 is NOT met and goes to its own cycle (below).
+    - **The speedups kept (all bit-identical).** rustafits (07b8287, branch `one-star-path-13b`): background mesh **1.16
+      -> 0.58 s** and MRS **0.62 -> 0.11 s** per plane (B3 smoothers as contiguous slice passes in the same add order,
+      bicubic per-column tables, per-cell MAD median by integer select on f32 bits, branch-free masks). Athenaeum: `rcr`
+      by **verified decisions, x4.5** (phase 0 decides each rejection from a 2^-16 table of sqrt(2)*erfinv with a rigorous
+      interval, |X~ - X| <= 1.76e-10; undecided iterations, the ending iteration and every returned value are recomputed
+      exactly, so the kept set and the location / scale bits are identical; the proof is in the module comment; signal
+      totals 0.705 -> 0.154 s on 0058, 0.905 -> 0.197 on 0075, 0.797 -> 0.178 on OSC; assumption libm ln / exp within
+      1e-12 / 1e-11 relative); `hfr` by lazy chunked selection (SNR / HFR -45...-60 %); ring sky per-row range. Ideas
+      skipped as under 1 % of a plane on the 13b-P timers: read->working fusion, `d` fusion, buffer reuse.
+    - **Brackets** (Measure-only, interleaved H N H N H N, clones of the before trees, reference pinned `manual`,
+      `twoPass = false`; H = 5836a970, N = 3f275540). **Set 204 9.90 -> 7.95 min (9.82 / 9.97 / 9.90 against 7.97 / 7.95 /
+      7.93; N / H 0.803; ERP 3.77 min -> 2.11x, bar MISSED). Horse C11 2.22 -> 1.43 min (0.647; ERP 3.71 min -> 0.39x, bar
+      MET, faster than the ERP).** CPU-s per plane H -> N: set 204 12.65 -> 10.55 (cores busy 8.66 -> 9.00), Horse C11
+      8.76 -> 5.38. Run B was not run. The review fix round (3b8b1e41) did not re-run the brackets; its single-thread wall
+      against 5836a970: 0058 12.90 -> 11.09 s, 0075 6.60 -> 4.76, OSC x3 20.86 -> 17.14 (the bracket's N was measured
+      before the timer gating below; the gated head is no slower in detect, so the bracket is a slight over-estimate of
+      N's wall). **Analysis B3** (Task 12 bracket (b), m42, 3 rounds, 3b8b1e41): analysis-mode 0.464 s per frame — PASS
+      (bar 0.6; Task 12 0.723); legacy analysis 0.240 (0.339).
+    - **Proofs.** Lab `t13b-id` (591c556) at the Step 1 head against the base, 67 658 noreg rows: moved 0 / missed 0 / lost
+      0 / control 0, max |delta| 0, raw trees 2 590 files with 0 different once clock content is dropped; lab `t13b-final`
+      (4b18f85) at 3f275540: measure / betas / register / seeds / legacy analysis 0 moved (11 736 legacy rows), inject
+      measure rows 0, probe census 0 changed values of any existing key; only the analysis-mode rows move (1 537 v2 / 755
+      inject, below). **Set 204 (Step 5a, route A before the shape revert): registration 565 / 565, group and plane
+      beta, 197 registered frames byte-identical, PSFSW / totals / noise / counts bit-equal on every channel, weights and
+      `weight_channels` identical on 197 frames, 199 LN files identical, every master / drizzle / weight / rejection image
+      HDU identical** (the Measure stage ran 477 s against 593 s). Final probe identity 3b8b1e41 against 5836a970
+      (`star_probe measure --paths measure,betas,register --diagnostics`, wall fields and the probe-only keys dropped):
+      0058 123 717 lines, 0075 146 068, OSC 0163 225 442 = 495 k lines, **0 differing**; debug on against off, 0 differing.
+    - **Tried and REFUSED (measured out; do not re-propose without a truth-validated weight).** The stacking weight
+      (PSFSW, TMeanFlux) estimated over a budgeted population (a) of N = 1 000 plus a list (b) of M = 4 000 mono / 2 000
+      OSC, the rest imputed. (1) **Imputed totals** (R13b-1 / 8 / 11): with 20 % of the seeds unfitted (the small-M row,
+      139 mono frames) the truth row gave a **depth tilt -5.5 % (point-fit -4.0 %) on N against -0.5 % (-0.9 %) on H,
+      per-frame tails p5 -31 % / p95 +10 % and extremes -42 % / +46 %, 35 / 139 frames more than 10 % off H, H nearer
+      truth on 82 / 139**; production would impute 75-90 %. Mechanism: the mixed vector's `rcr` collapses the winsor bounds
+      onto the fitted stars (P_Nfit / P_N median 1.96, p90 16.5). At the default M the corpus imputed nothing (0 / 187
+      frames), so the first truth row was no verdict. (2) **rcr bounds from the fitted vector alone, imputed means
+      clipped** (test C): rho 0.56 against H 0.97, depth tilt +39.6 %, spread 699 % - H's and the truth's own `rcr` run
+      over ALL stars; DEAD. (3) The per-class ERP join (R13b-8) could not resolve its own -0.01 slack (P(delta rho < -0.01)
+      0.60-0.73 by paired bootstrap), so R13b-9 moved the referee to synthetic truth AFTER the 3c miss - stated here; the
+      owner may overturn. (4) **The (a) frame shape** (frame FWHM / ecc over population (a)): vs truth MIXED (FWHM toward
+      9 / away 16, ecc toward 101 / away 78; nebulae ecc +0.017 / +0.020, seven wide-PSF sharp rows +0.011...+0.013,
+      fieldpsf FWHM +1.0 %), inject hc11B G image 2 FWHM 9.87 -> 12.85 px (**+30 %**), tierA mosaic p0 -16 %; with every
+      seed fitted it buys no speed, so the controller reverted it to all fits (3f275540). Also measured: set 204 weights
+      rho(N, H) 0.991 / 0.985 under the refused totals - it was the truth row, not rho against H, that refused them.
+      Population c from a stratum sample had SE 2.1-4.7 % (R13b-6 reverted c to the 64 brightest of (a); the final c is
+      5836a970's again).
+    - **Kept in the tree, UNUSED by the stacking Measure.** `Mode::Population`, `population::select`, `StarPopulation::
+      probe_default`, the probe's `--paths population`, the lab's `t13b-pop` family: the probe / lab read them; the
+      stacking adapter does not pass them. `Mode::Population` reports its totals over the fitted set (documented: NOT the
+      stacking weight, R13b-11); `write_pass1` refuses (error logged) a record whose prep is not storable.
+      `signal_totals_complete` and the imputation were removed in the fix round. **`Mode::Budget`** (the Analysis path)
+      takes the shared cell-first, rank-spread selection and a stratified trim: cell-first water-fill, then (cell,
+      SNR-quartile) classes rank-spread, the flagged tier last and given the cells the unflagged tier left uncovered
+      (the R12 coverage contract holds, 12 / 12); it moves the Analysis rows (1 537 v2 / 755 inject; B1 100 %, B2 143 /
+      143), re-based by a runner cycle (`t13b-final2`).
+    - **The pre-fit clip evidence (R13b-10 / 12).** The population's pre-saturation screen anchored both clauses on
+      min(plane max, norm) - bg, so a clip-free plane flagged every star within 10 % of its brightest (truthcheck frame
+      ecc +0.014...+0.088 against truth 0). The first fix (range = norm - bg when `max_count < 2`) failed on calibrated
+      frames (set 204 mono has `max_count` 1, plane max 0.862 / 0.868 < norm); R13b-12's evidence is `max_count >= 2 ||
+      a seed's full-scale 3x3 plateau core`: real clipped planes keep the old screen bit for bit (plateau cores 145 / 152
+      / 37-52-24 on 0058 / 0075 / OSC 0163), a clip-free plane screens at full scale. Truthcheck frame ecc head - base
+      -0.0015...-0.0020 (PASS); 169 / 189 planes with evidence 0 moved. Bounded concern: a clip-free plane of FWHM >~ 8.5
+      px with a star >= 0.7 of full scale gives false evidence. Only the Population mode reads it.
+    - **13b-P timers (debug-only).** `SubSteps` wall + thread-CPU timers for every sub-step ("frame plane substeps",
+      "... fit", "fits artifact write timed"); after the review they exist only when `stacking::measure` is at debug
+      (`enabled!` at creation: no clock read otherwise), `RcrTimer` reads clocks only inside `rcr_timing(true)`, and a
+      `clock_gettime` failure warns once. The always-on version made detect 192 -> 406 ms on a mono plane in the bracket;
+      gated, detect is within 1-2 % of 5836a970. Spec dictionary: `aperture_se`, `statistic`, `list`, `fitted`,
+      `pre_saturated`, `plateau_cores`, and the clock-failure `error` field.
+    - **Handed on.** (1) The **weight-redesign cycle, "faster than the ERP"**: a truth-validated weight that does not need
+      every faint star fitted (the winsorized TMeanFlux is fragile in every variant: H's own fitted-only / all ratio is
+      1.88); the (a) frame shape returns there with a truth gate. (2) **Task 13c** (parallelism research, per-machine
+      budget, dynamic scaling, results identical at every thread count). (3) `c` against `c_true` on undersampled OSC,
+      doubles and nebulae - already off on the base: doubles/f4.0 +16.1 %, sharp/m4/f16.0 +7-8 %, OSC +6...+10 %,
+      nebulae +-11-12 %; not 13b's. (4) The **knot exemption** in `seeds.rs` reads the same plane-max band pre-fit
+      (pre-existing, Task 10c). (5) A not-bit-identical rustafits item (the per-cell quickselect permutation feeds the
+      mean sum, about -0.15 s per plane). (6) `minStars` reads `stars_fitted` as before; no settings change.

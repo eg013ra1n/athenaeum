@@ -8,6 +8,7 @@
 //! defect by defect against the synthetic truth lab.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,8 +24,10 @@ pub mod domain;
 pub mod fit;
 pub mod frame;
 pub mod photometry;
+pub mod population;
 pub mod robust;
 pub mod seeds;
+pub mod substeps;
 
 pub use beta::{frame_beta, BetaSource, AUTO_BETAS, AUTO_SAMPLE, BETA_BOUNDS};
 pub use budget::BudgetReport;
@@ -38,7 +41,9 @@ pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_L
 pub use photometry::{
     hfr, model_flux_in_fwtm, star_snr, ApertureNoise, SaturationPlane, SaturationVerdict, SnrTerms,
 };
+pub use population::{Population, PopulationReport};
 pub use seeds::{DetectionReport, FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
+pub use substeps::{Step, SubSteps};
 
 /// The spatial correlation of a plane's pixel noise (Task 10b A1c, ruling C-10): a fact of the pixels' provenance, so
 /// the caller states it. Sensor pixels (raw or calibrated, Plan C's CFA super-pixel plane) carry white noise: every
@@ -142,7 +147,7 @@ impl SnrNoise {
 /// R-OSP-1, spec §4.4).
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
-/// measures, never one per task; Plan C = 5. `AnalysisConfig::config_hash`
+/// measures, never one per task; Plan C = 6. `AnalysisConfig::config_hash`
 /// is Plan C's.
 pub const MEASURE_VERSION: u32 = 4;
 
@@ -191,21 +196,35 @@ pub struct MeasureOptions {
     /// `1 / share` pixels, so an aperture's shot variance is `1 / share` times the white value. `None` (every plane
     /// whose pixels are sites) = 1.
     pub cfa_site_share: Option<f64>,
-    /// Which seeds are fitted (Task 12): every one (`All`, the stacking path and the default) or the Analysis mode's
-    /// budget ([`budget`]).
+    /// Which seeds are fitted (Task 12): every one (`All`, the stacking Measure's path and the default) or, for probes and the lab, a [`Mode::Population`] / [`Mode::Budget`] subset
+    /// (the Analysis mode's budget: [`budget`]).
     pub mode: Mode,
 }
 
-/// What [`measure_plane`] fits (Plan A Task 12, spec D-3): `All` fits every seed (the stacking Measure stage's path,
+/// What [`measure_plane`] fits (Plan A Task 12, spec D-3): `All` fits every seed (the stacking Measure's path,
 /// byte-identical to before the budget existed); `Budget { budget }` fits the candidates [`budget::select_candidates`]
 /// chose and keeps at most `budget` of the accepted fits ([`budget::trim`]), spread over a 4 × 4 grid of the plane. A
-/// budget no smaller than the seed count measures exactly what `All` does.
+/// budget no smaller than the seed count measures exactly what `All` does. `Population { statistic, list }` (Plan A
+/// Task 13b; probe / lab only, the stacking Measure runs `All`): the pass fits population (a) - `statistic` isolated, brightness-stratified
+/// stars the frame statistic, the ring width and `c` read - and list (b), the first `list` seeds the star-list consumers
+/// read ([`population`]); every other detected seed keeps its detection record. It needs the module's own matched
+/// filter (the selection reads the filter SNR and the knot flags); given seeds fit every seed with a `warn!`.
+///
+/// Route A (owner decision 2026-10-17, after the R13b-11 STOP): the stacking Measure runs `All`, not `Population` - the
+/// frame weight (PSFSW, `c`, the ring width) and the frame shape (FWHM, eccentricity, the F-6 medians) read every fit
+/// exactly as at 5836a970 (so `MEASURE_VERSION` stays 4). `Population` is kept, unused by stacking, for the cycle that
+/// replaces the weight and the shape with truth-validated ones that do not need every faint star fitted (and for the
+/// probes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
     All,
     Budget {
         budget: usize,
+    },
+    Population {
+        statistic: usize,
+        list: usize,
     },
 }
 
@@ -319,6 +338,8 @@ impl FitStarsOptions<'_> {
             gain: self.gain_e_per_working_adu,
             noise: self.aperture_noise,
             neighbours: None,
+            population: None,
+            timers: None,
         }
     }
 }
@@ -386,6 +407,8 @@ pub struct PlaneMeasurement {
     pub aperture_correction: Option<f64>,
     /// The qualifying stars `aperture_correction` is the median over (at most 64; under 5 it is `None`).
     pub aperture_stars: usize,
+    /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
+    pub aperture_se: Option<f64>,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present pixels in their `[10F, 12F]`
     /// ring outside every seed's `3F` disc, or no frame FWHM on the plane).
     pub ring_sky_missing: usize,
@@ -409,7 +432,14 @@ pub struct PlaneMeasurement {
     pub shot_spread: f64,
     /// What the budget did (Task 12, [`budget::BudgetReport`]): `Some` exactly under [`Mode::Budget`].
     pub budget: Option<BudgetReport>,
+    /// What the two populations did (Plan A Task 13b, [`PopulationReport`]): `Some` exactly when the pass fitted a
+    /// [`Population`].
+    pub population: Option<PopulationReport>,
     pub timings: PhaseTimings,
+    /// The plane's sub-step wall and thread-CPU timers (Plan A Task 13b, 13-P); reported in the debug lines only, never
+    /// compared, serialized or read by a number. A plane whose first pass was read back from a stored `.athm` carries
+    /// the second pass's alone.
+    pub sub_steps: SubSteps,
 }
 
 /// Measure one plane: the noise model (unless `opts.noise` carries one), the seeds (the matched filter, or the given
@@ -425,13 +455,17 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
-    let working = domain::to_working_units(plane, &opts.domain);
+    let sub = SubSteps::default();
+    let working = {
+        let _s = sub.span(Step::WorkCopy);
+        domain::to_working_units(plane, &opts.domain)
+    };
     match opts.mode {
-        Mode::All => {
-            let prep = prepare_working(plane, &working, w, h, opts, pool);
+        Mode::All | Mode::Population { .. } => {
+            let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
             finish_working(&working, w, h, opts, prep, pool)
         }
-        Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool),
+        Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
     }
 }
 
@@ -463,11 +497,57 @@ pub struct PlanePrep {
     snr_rho: Option<[[f64; 5]; 5]>,
     snr_noise: SnrNoise,
     timings: PhaseTimings,
-    /// The verdict pass's share of [`PhaseTimings::fit_ms`].
+    /// The verdict pass's share of [`PhaseTimings::fit_ms`] (the population selection included).
     verdict_time: Duration,
+    /// The two populations (Plan A Task 13b): `Some` exactly when the plane was prepared under [`Mode::Population`]
+    /// with a detection to select from. Then `passes` holds one record per FITTED seed (`population.fitted[k]`'s is
+    /// `passes[k]`), not per detected seed; `None` = one record per seed. NOT stored: only the probes run
+    /// [`Mode::Population`] and the stacking Measure (the one writer of a first-pass artifact) runs [`Mode::All`], so a
+    /// stored prep always has `None` and the first-pass layout stays 5836a970's (`PASS1_ARTIFACT_VERSION` 1).
+    #[serde(skip)]
+    population: Option<Population>,
+    /// The plane's sub-step timers (Plan A Task 13b, 13-P): not stored, so a `.athm` read back holds zeros.
+    #[serde(skip)]
+    sub: SubSteps,
+}
+
+/// The seeds the verdict pass ran on, in the order of its records: every seed, or the population's `fitted`.
+fn pass_seeds<'a>(
+    seeds: &'a [Seed],
+    population: Option<&'a Population>,
+) -> Box<dyn Iterator<Item = &'a Seed> + 'a> {
+    match population {
+        Some(p) => Box::new(p.fitted.iter().map(move |&i| &seeds[i])),
+        None => Box::new(seeds.iter()),
+    }
+}
+
+/// The seeds a fit call runs on and their knot flags: all of them (borrowed, no copy) or the population's `fitted`.
+fn fit_inputs<'a>(
+    seeds: &'a [Seed],
+    detection: Option<&'a DetectionReport>,
+    population: Option<&Population>,
+) -> (Cow<'a, [Seed]>, Cow<'a, [bool]>) {
+    let extended = detection.map_or(&[][..], |d| d.extended.as_slice());
+    match population {
+        None => (Cow::Borrowed(seeds), Cow::Borrowed(extended)),
+        Some(p) => (
+            Cow::Owned(p.fitted.iter().map(|&i| seeds[i]).collect()),
+            Cow::Owned(
+                p.fitted
+                    .iter()
+                    .map(|&i| extended.get(i).copied().unwrap_or(false))
+                    .collect(),
+            ),
+        ),
+    }
 }
 
 impl PlanePrep {
+    fn pass_seeds(&self) -> Box<dyn Iterator<Item = &Seed> + '_> {
+        pass_seeds(&self.seeds, self.population.as_ref())
+    }
+
     /// The seeds handed to the fitter (the given ones, or the matched filter's): what the stacking adapter's head
     /// hands the module again as `SeedSpec::Given` when a stored first pass is read back (Plan A Task 11c).
     pub(crate) fn seeds(&self) -> &[Seed] {
@@ -478,6 +558,13 @@ impl PlanePrep {
     /// (Plan A Task 13, 13-P).
     pub(crate) fn verdict_time(&self) -> Duration {
         self.verdict_time
+    }
+
+    /// Whether this record can be stored in a `.athm` and read back whole: a [`Mode::Population`] record keeps one
+    /// verdict record per FITTED seed and its `population` is not stored, so a stored copy would read back with
+    /// `passes` shorter than `seeds` (Plan A Task 13b review, M1).
+    pub(crate) fn is_storable(&self) -> bool {
+        self.population.is_none()
     }
 
     /// `(fits, iterations)`: the seeds whose bounded verdict fit succeeded and the sum of their LM iterations
@@ -602,6 +689,15 @@ impl PlanePrep {
                 fit_ms: 4,
             },
             verdict_time: Duration::new(2, 500),
+            // A pin only: an unencoded population (`#[serde(skip)]`), so the encoding pin's bytes stay 5836a970's; a stored
+            // record never has one (`is_storable`).
+            population: (!starless).then(|| Population {
+                fitted: vec![0, 1],
+                statistic: vec![1],
+                stratum: vec![37],
+                list: 1,
+            }),
+            sub: SubSteps::default(),
         }
     }
 }
@@ -615,7 +711,7 @@ pub fn prepare_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlanePrep {
-    if opts.mode != Mode::All {
+    if matches!(opts.mode, Mode::Budget { .. }) {
         // The budget lives in `measure_plane` alone (R12-2): the stacking halves keep every seed.
         tracing::warn!(
             width = w,
@@ -623,8 +719,12 @@ pub fn prepare_plane(
             "measure: the budget applies to measure_plane only; every seed is measured"
         );
     }
-    let working = domain::to_working_units(plane, &opts.domain);
-    prepare_working(plane, &working, w, h, opts, pool)
+    let sub = SubSteps::default();
+    let working = {
+        let _s = sub.span(Step::WorkCopy);
+        domain::to_working_units(plane, &opts.domain)
+    };
+    prepare_working(plane, &working, w, h, opts, pool, sub)
 }
 
 /// [`measure_plane`]'s second half: β and the fits at β from `prep`'s records (cross-plane flags included), the frame
@@ -637,7 +737,10 @@ pub fn finish_plane(
     prep: PlanePrep,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
-    let working = domain::to_working_units(plane, &opts.domain);
+    let working = {
+        let _s = prep.sub.span(Step::WorkCopy);
+        domain::to_working_units(plane, &opts.domain)
+    };
     finish_working(&working, w, h, opts, prep, pool)
 }
 
@@ -658,24 +761,29 @@ pub fn plane_beta(
     prep: &PlanePrep,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> (f64, BetaSource) {
-    let working = domain::to_working_units(plane, &opts.domain);
-    let extended = prep
-        .detection
-        .as_ref()
-        .map_or(&[][..], |d| d.extended.as_slice());
+    let working = {
+        let _s = prep.sub.span(Step::WorkCopy);
+        domain::to_working_units(plane, &opts.domain)
+    };
+    // The seeds the verdict pass ran on (all of them, or population `fitted`) and their knot flags.
+    let (fit_seeds, extended) = fit_inputs(
+        &prep.seeds,
+        prep.detection.as_ref(),
+        prep.population.as_ref(),
+    );
     // As `finish_working`'s fit call: inside the pool's `install`, so the sample's own pool param is `None`.
     let call = || {
         fit::resolve_beta(
             &working,
             w,
             h,
-            &prep.seeds,
+            &fit_seeds,
             opts.psf_model,
             &opts.fit,
             opts.mask.as_deref(),
             prep.fit_field,
             Some(&prep.passes),
-            extended,
+            &extended,
             None,
         )
     };
@@ -705,7 +813,7 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
     // Every own flag's position by its 1-px cell: a seed within 1 px of it lies in the 3×3 cells about its own.
     let mut own: HashMap<(i64, i64), Vec<(usize, f64, f64)>> = HashMap::new();
     for (plane, prep) in planes.iter().enumerate() {
-        for (s, pass) in prep.seeds.iter().zip(&prep.passes) {
+        for (s, pass) in prep.pass_seeds().zip(&prep.passes) {
             // A `MostlySaturated` refusal is the seed's own flag too (owner rule: saturated in any channel is
             // saturated in all): the verdict fit had nothing left to fit, which only a saturated core does. A
             // cross-plane flag never spreads again (`!v.cross`), so a second call changes nothing.
@@ -718,7 +826,14 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
     }
     for (q, prep) in planes.iter_mut().enumerate() {
         let mut n = 0;
-        for (s, pass) in prep.seeds.iter().zip(prep.passes.iter_mut()) {
+        // Borrow `seeds` and `population` beside `passes` (the records are the only thing changed).
+        let PlanePrep {
+            seeds,
+            population,
+            passes,
+            ..
+        } = prep;
+        for (s, pass) in pass_seeds(seeds, population.as_ref()).zip(passes.iter_mut()) {
             let Some(Ok(v)) = pass.verdict.as_mut() else {
                 continue;
             };
@@ -758,6 +873,7 @@ struct Head {
     snr_rho: Option<[[f64; 5]; 5]>,
     snr_noise: SnrNoise,
     timings: PhaseTimings,
+    sub: SubSteps,
 }
 
 /// [`prepare_plane`] on a working copy the caller holds: the head, then the verdict pass over every seed.
@@ -768,18 +884,31 @@ fn prepare_working(
     h: usize,
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    sub: SubSteps,
 ) -> PlanePrep {
-    let head = prepare_head(plane, working, w, h, opts, pool);
+    let head = prepare_head(plane, working, w, h, opts, pool, sub);
+    // Plan A Task 13b: the two populations are chosen from the detection alone, BEFORE the verdict pass, which then runs
+    // over the fitted seeds only (R12-2's order).
+    let select_t = Instant::now();
+    let population = match opts.mode {
+        Mode::Population { statistic, list } => {
+            select_population(working, w, h, opts, &head, statistic, list, true)
+        }
+        _ => None,
+    };
+    let select_time = select_t.elapsed();
+    let (pass_seeds, _) = fit_inputs(&head.seeds, None, population.as_ref());
     let passes = prepare_passes(
         working,
         w,
         h,
         opts,
         pool,
-        &head.seeds,
+        &pass_seeds,
         head.field_width,
         head.saturation,
     );
+    drop(pass_seeds);
     PlanePrep {
         noise: head.noise,
         sky: head.sky,
@@ -794,8 +923,72 @@ fn prepare_working(
         snr_rho: head.snr_rho,
         snr_noise: head.snr_noise,
         timings: head.timings,
-        verdict_time: passes.verdict_time,
+        verdict_time: select_time + passes.verdict_time,
+        population,
+        sub: head.sub,
     }
+}
+
+/// The populations' selection ([`population::select`]) over the head's detection; `None` for seeds without a detection
+/// report (given seeds carry no filter SNR and no knot flags to select by: every seed is fitted, said once per plane
+/// when `fitting`, the selection being the fit's).
+fn select_population(
+    working: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    head: &Head,
+    statistic: usize,
+    list: usize,
+    fitting: bool,
+) -> Option<Population> {
+    let Some(detection) = head.detection.as_ref() else {
+        if fitting {
+            tracing::warn!(
+                width = w,
+                height = h,
+                count = head.seeds.len(),
+                "measure: the populations select from the matched filter's detection; every seed is measured"
+            );
+        }
+        return None;
+    };
+    let pre = population::pre_saturated(
+        working,
+        opts.mask.as_deref(),
+        w,
+        h,
+        &head.seeds,
+        &head.saturation,
+    );
+    let pop = population::select(
+        &head.seeds,
+        &detection.filter_snr,
+        &detection.extended,
+        &pre,
+        w,
+        h,
+        head.field_width.fwhm_px,
+        statistic,
+        list,
+    );
+    tracing::debug!(
+        seeds = head.seeds.len(),
+        statistic = pop.statistic.len(),
+        list = pop.list,
+        fitted = pop.fitted.len(),
+        pre_saturated = pre.iter().filter(|&&p| p).count(),
+        plateau_cores = population::plateau_core_count(
+            working,
+            opts.mask.as_deref(),
+            w,
+            h,
+            &head.seeds,
+            &head.saturation
+        ),
+        "populations selected"
+    );
+    Some(pop)
 }
 
 /// [`prepare_working`]'s first half: noise, mesh, sky, saturation plane, detection and the noise correlation.
@@ -806,6 +999,7 @@ fn prepare_head(
     h: usize,
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    sub: SubSteps,
 ) -> Head {
     let mask = opts.mask.as_deref();
     let pixel_noise = opts.pixel_noise.with_colour(opts.colour);
@@ -819,7 +1013,10 @@ fn prepare_head(
     // whose noise model is given and whose seeds are given needs none.
     let t = Instant::now();
     let mut mesh = (opts.noise.is_none() || want_noise).then(|| {
-        let build = || domain::background_mesh(working, w, h, mask, want_noise);
+        let build = || {
+            let _s = sub.span(Step::Mesh);
+            domain::background_mesh(working, w, h, mask, want_noise)
+        };
         match pool {
             Some(p) => p.install(build),
             None => build(),
@@ -829,16 +1026,25 @@ fn prepare_head(
     let (noise, mut timings) = match opts.noise {
         Some(given) => (given, PhaseTimings::default()),
         None => {
-            let (model, mut phases) = domain::noise_model_with(working, w, h, mesh.as_ref(), pool);
+            let (model, mut phases) =
+                domain::noise_model_timed(working, w, h, mesh.as_ref(), pool, Some(&sub));
             phases.background_ms += mesh_ms;
             (model, phases)
         }
     };
     // The saturation test reads the sky median (F-3), so the sky statistic precedes the fits (Q7); the plane's
     // saturation inputs precede detection too, whose knot tests read the plateau-clip clause's range (Task 10b).
-    let sky = domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator);
+    let sky = {
+        let _s = sub.span(Step::SkyLevel);
+        domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator)
+    };
     let saturation = {
-        let build = || saturation_plane(working, mask, &noise, &sky, &opts.domain, opts.colour);
+        let submitted = Instant::now();
+        let build = || {
+            sub.add_wall(Step::SatWait, submitted.elapsed());
+            let _s = sub.span(Step::SatPlane);
+            saturation_plane(working, mask, &noise, &sky, &opts.domain, opts.colour)
+        };
         match pool {
             Some(p) => p.install(build),
             None => build(),
@@ -885,6 +1091,7 @@ fn prepare_head(
                 pixel_noise,
                 mesh.take(),
                 Some(&saturation),
+                Some(&sub),
             );
             timings.detect_ms =
                 t.elapsed().as_millis() as u64 + if opts.noise.is_some() { mesh_ms } else { 0 };
@@ -950,6 +1157,7 @@ fn prepare_head(
         snr_rho,
         snr_noise,
         timings,
+        sub,
     }
 }
 
@@ -1044,7 +1252,16 @@ fn finish_working(
         snr_noise,
         mut timings,
         verdict_time,
+        population,
+        sub,
     } = prep;
+    // Plan A Task 13b: under a population the fit call runs on `fitted` (its records are `passes`) and reads every
+    // detected seed as a neighbour, as the budget does (R12-5).
+    let (fit_seeds, extended) = fit_inputs(&seeds, detection.as_ref(), population.as_ref());
+    let (in_statistic, _) = population
+        .as_ref()
+        .map_or((Vec::new(), Vec::new()), Population::fit_flags);
+    let of_fit: &[usize] = population.as_ref().map_or(&[], |p| p.fitted.as_slice());
     // F-6 (Task 11): the SNR's gain, and the shot noise's spreading by a debayered plane's CFA site share (R11-1).
     let snr_gain = opts.domain.gain_e_per_working_adu();
     let shot_spread = opts
@@ -1057,7 +1274,7 @@ fn finish_working(
             working,
             w,
             h,
-            &seeds,
+            &fit_seeds,
             opts.psf_model,
             &opts.fit,
             opts.mask.as_deref(),
@@ -1070,15 +1287,21 @@ fn finish_working(
                     rho: snr_rho,
                     shot_spread,
                 },
+                neighbours: population.as_ref().map(|_| fit::Neighbours {
+                    seeds: &seeds,
+                    of_fit,
+                }),
+                population: population.as_ref().map(|_| population::PopulationView {
+                    statistic: &in_statistic,
+                }),
+                timers: Some(&sub),
                 ..Default::default()
             },
             None,
             opts.diagnostics,
             true,
             true,
-            detection
-                .as_ref()
-                .map_or(&[][..], |d| d.extended.as_slice()),
+            &extended,
         )
     };
     let mut outcome = match pool {
@@ -1089,15 +1312,62 @@ fn finish_working(
         None => fit_call(),
     };
     timings.fit_ms = (verdict_time + t.elapsed()).as_millis() as u64;
+    let mut refused = std::mem::take(&mut outcome.refused);
+    refused.not_selected = seeds.len() - fit_seeds.len();
     debug_assert_eq!(
-        outcome.refused.accounted(outcome.fits.len()),
+        refused.accounted(outcome.fits.len()),
         seeds.len(),
         "every seed has exactly one outcome (ruling F13)"
     );
-    let diagnostics = std::mem::take(&mut outcome.diagnostics);
+    // One record per detected seed, in seed order: the fit call's records re-indexed to the detected seeds, the ones
+    // the populations left out `NotSelected` (as the budget does).
+    let mut diagnostics = std::mem::take(&mut outcome.diagnostics);
+    if population.is_some() && opts.diagnostics {
+        let mut by_seed: Vec<Option<FitDiagnostics>> = vec![None; seeds.len()];
+        for mut d in diagnostics {
+            let seed = of_fit[d.seed];
+            d.seed = seed;
+            by_seed[seed] = Some(d);
+        }
+        diagnostics = by_seed
+            .into_iter()
+            .enumerate()
+            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed)))
+            .collect();
+    }
     // The fits' signals already carry the plane's aperture correction (F-5: measured after the duplicate drop, inside
-    // the fit call), so the totals read the corrected flux.
-    let frame = FrameAggregates::of(&outcome.fits);
+    // the fit call), so the totals read the corrected flux. The frame statistic reads population (a) alone.
+    let frame = match &population {
+        None => FrameAggregates::of_timed(&outcome.fits, Some(&sub)),
+        Some(_) => {
+            let in_a: Vec<bool> = outcome.fit_seeds.iter().map(|&k| in_statistic[k]).collect();
+            FrameAggregates::of_population(&outcome.fits, &in_a, Some(&sub))
+        }
+    };
+    let population_report = population.as_ref().map(|p| {
+        let (mut accepted, mut merged) = (0usize, 0usize);
+        for (f, &k) in outcome.fits.iter().zip(&outcome.fit_seeds) {
+            if in_statistic[k] {
+                accepted += 1;
+                merged += usize::from(
+                    f.fwhm() > MERGED_PAIR_FWHM_PER_FIELD * field_width.fwhm_px
+                        && f.eccentricity() > MERGED_PAIR_ECCENTRICITY,
+                );
+            }
+        }
+        PopulationReport {
+            statistic: p.statistic.len(),
+            list: p.list,
+            fitted: p.fitted.len(),
+            statistic_accepted: accepted,
+            merged_share: if accepted == 0 {
+                f64::NAN
+            } else {
+                merged as f64 / accepted as f64
+            },
+            aperture_se: outcome.aperture_se,
+        }
+    });
     let snr_missing = outcome.fits.iter().filter(|f| f.snr.is_nan()).count();
     if snr_missing > 0 {
         tracing::debug!(
@@ -1116,7 +1386,7 @@ fn finish_working(
         seeds: seeds.len(),
         detected: if detected { seeds } else { Vec::new() },
         field_width,
-        refused: outcome.refused,
+        refused,
         diagnostics,
         defocused: outcome.defocused,
         defocus_donuts: outcome.defocus_donuts,
@@ -1126,6 +1396,7 @@ fn finish_working(
         cross_flags,
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
+        aperture_se: outcome.aperture_se,
         ring_sky_missing: outcome.ring_sky_missing,
         clip_floor: saturation
             .clip_floor
@@ -1137,9 +1408,16 @@ fn finish_working(
         snr_noise,
         shot_spread,
         budget: None,
+        population: population_report,
         timings,
+        sub_steps: sub,
     }
 }
+
+/// A fit wider than this many field widths with an eccentricity above [`MERGED_PAIR_ECCENTRICITY`] is a merged pair
+/// the seed isolation could not see (the design read's rule; reported as [`PopulationReport::merged_share`]).
+const MERGED_PAIR_FWHM_PER_FIELD: f64 = 1.3;
+const MERGED_PAIR_ECCENTRICITY: f64 = 0.8;
 
 /// [`measure_plane`] under [`Mode::Budget`] (Task 12, R12-2…R12-6): the head over every seed, the budget's candidates,
 /// the verdict pass and the fits on the candidates alone, then the trim. The ring sky and `c` still read every detected
@@ -1152,8 +1430,9 @@ fn measure_budget(
     opts: &MeasureOptions,
     budget: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    steps: SubSteps,
 ) -> PlaneMeasurement {
-    let head = prepare_head(plane, working, w, h, opts, pool);
+    let head = prepare_head(plane, working, w, h, opts, pool, steps);
     let Head {
         noise,
         sky,
@@ -1165,9 +1444,22 @@ fn measure_budget(
         snr_rho,
         snr_noise,
         mut timings,
+        sub: steps,
     } = head;
     let select_t = Instant::now();
-    let (candidates, _counts) = budget::select_candidates(&seeds, w, h, budget);
+    // The shared stratified rank (Task 13b): by the detection's filter SNR, the knot-flagged and pre-fit saturated seeds
+    // last; the seeds of a plane without a detection report rank by detector order.
+    let pre = population::pre_saturated(working, opts.mask.as_deref(), w, h, &seeds, &saturation);
+    let (brightness, skip): (Vec<f64>, Vec<bool>) = match detection.as_ref() {
+        Some(d) => (
+            d.filter_snr.clone(),
+            (0..seeds.len())
+                .map(|i| pre[i] || d.extended.get(i).copied().unwrap_or(false))
+                .collect(),
+        ),
+        None => (budget::rank_brightness(seeds.len()), pre),
+    };
+    let (candidates, _counts) = budget::select_candidates(&seeds, &brightness, &skip, w, h, budget);
     let select_time = select_t.elapsed();
     let seed_cells: Vec<u8> = seeds
         .iter()
@@ -1215,6 +1507,7 @@ fn measure_budget(
                     seeds: &seeds,
                     of_fit: &candidates,
                 }),
+                timers: Some(&steps),
                 ..Default::default()
             },
             None,
@@ -1290,7 +1583,7 @@ fn measure_budget(
     } else {
         Vec::new()
     };
-    let frame = FrameAggregates::of(&stars);
+    let frame = FrameAggregates::of_timed(&stars, Some(&steps));
     let snr_missing = stars.iter().filter(|f| f.snr.is_nan()).count();
     let ring_sky_missing = stars.iter().filter(|f| f.sky_ring_n == 0).count();
     if snr_missing > 0 {
@@ -1330,6 +1623,7 @@ fn measure_budget(
         cross_flags: 0,
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
+        aperture_se: outcome.aperture_se,
         ring_sky_missing,
         clip_floor: saturation
             .clip_floor
@@ -1341,7 +1635,9 @@ fn measure_budget(
         snr_noise,
         shot_spread,
         budget: Some(report),
+        population: None,
         timings,
+        sub_steps: steps,
     }
 }
 
@@ -4060,5 +4356,183 @@ mod tests {
         );
         assert!(m.budget.is_none());
         assert_eq!(m.refused.not_selected + m.refused.trimmed, 0);
+    }
+
+    // ---- Plan A Task 13b: the two star populations ----
+
+    fn population_opts(statistic: usize, list: usize) -> MeasureOptions {
+        MeasureOptions {
+            mode: Mode::Population { statistic, list },
+            seeds: SeedSpec::MatchedFilter {
+                threshold: seeds::DEFAULT_THRESHOLD,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The pass fits (a) U (b) and nothing else: every other seed keeps its detection record as `NotSelected`, the F-0
+    /// identity holds with `not_selected`, list (b) is the first M seeds, and the report counts what was selected.
+    #[test]
+    fn a_population_fits_a_and_b_and_leaves_the_rest_not_selected() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let opts = MeasureOptions {
+            diagnostics: true,
+            ..population_opts(200, 150)
+        };
+        let m = measure_plane(&data, 1024, 1024, &opts, None);
+        let r = m.population.clone().expect("a population report");
+        assert!(r.statistic > 100 && r.statistic <= 200, "{r:?}");
+        assert_eq!(r.list, 150);
+        assert!(r.fitted >= 150 && r.fitted <= 150 + r.statistic, "{r:?}");
+        assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
+        assert_eq!(
+            m.stars.len() + m.refused.total() + m.refused.not_selected + m.refused.trimmed,
+            m.seeds,
+            "ruling F13 with the populations"
+        );
+        assert_eq!(m.diagnostics.len(), m.seeds, "one record per detected seed");
+        assert_eq!(
+            m.diagnostics
+                .iter()
+                .filter(|d| d.outcome == Outcome::NotSelected)
+                .count(),
+            m.refused.not_selected
+        );
+        assert!(
+            m.diagnostics[..150]
+                .iter()
+                .all(|d| d.outcome != Outcome::NotSelected),
+            "list (b) is the first M seeds"
+        );
+        assert!(m.budget.is_none());
+        assert!(r.statistic_accepted <= r.statistic);
+        assert!(m.frame.fwhm_px.is_some());
+        // `c` is the median of at most the 64 brightest qualifying fits of (a).
+        // R13b-6: no per-stratum cap - a field this rich fills the 64 from (a)'s brightest qualifiers.
+        assert_eq!(
+            m.aperture_stars,
+            photometry::CORRECTION_STARS,
+            "{}",
+            m.aperture_stars
+        );
+        assert_eq!(r.aperture_se.is_some(), m.aperture_correction.is_some());
+        // Deterministic.
+        let again = measure_plane(&data, 1024, 1024, &opts, None);
+        assert_eq!(format!("{:?}", again.stars), format!("{:?}", m.stars));
+    }
+
+    /// With no population (a) the frame statistic has no star to read, and the star list alone is fitted; with (a) the
+    /// statistic reads (a)'s accepted fits only.
+    #[test]
+    fn the_frame_statistic_reads_population_a_alone() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let list_only = measure_plane(&data, 1024, 1024, &population_opts(0, 120), None);
+        let r = list_only.population.clone().unwrap();
+        assert_eq!((r.statistic, r.fitted), (0, 120));
+        assert_eq!(list_only.frame.fwhm_px, None, "no (a), no frame FWHM");
+        assert_eq!(list_only.frame.snr_median, None);
+        assert!(!list_only.stars.is_empty(), "the star list is still fitted");
+        assert_eq!(list_only.frame.stars_fitted, list_only.stars.len());
+    }
+
+    /// The plane's own β and its sample are bit-identical to `Mode::All`'s when the β sample sits inside list (b)
+    /// (R13b-3), and a list at or above the seed count fits the very stars `Mode::All` fits (centres, widths, β).
+    #[test]
+    fn the_own_beta_and_the_fits_of_list_b_are_mode_alls() {
+        let data = noisy_field(&uniform(900, 1024, 1024, 5), 5);
+        let all = MeasureOptions {
+            mode: Mode::All,
+            ..population_opts(0, 0)
+        };
+        let prep_all = prepare_plane(&data, 1024, 1024, &all, None);
+        let beta_all = plane_beta(&data, 1024, 1024, &all, &prep_all, None);
+        for list in [400, 100_000] {
+            let opts = population_opts(300, list);
+            let prep = prepare_plane(&data, 1024, 1024, &opts, None);
+            let beta = plane_beta(&data, 1024, 1024, &opts, &prep, None);
+            assert_eq!(beta.0.to_bits(), beta_all.0.to_bits(), "list {list}");
+            assert_eq!(beta.1, beta_all.1, "list {list}");
+        }
+        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None);
+        let opts = population_opts(300, 100_000);
+        let prep = prepare_plane(&data, 1024, 1024, &opts, None);
+        let m = finish_plane(&data, 1024, 1024, &opts, prep, None);
+        assert_eq!(m.refused.not_selected, 0);
+        assert_eq!(m.stars.len(), m_all.stars.len());
+        for (a, b) in m.stars.iter().zip(&m_all.stars) {
+            assert_eq!(
+                (
+                    a.x.to_bits(),
+                    a.y.to_bits(),
+                    a.fwhm_x.to_bits(),
+                    a.beta.to_bits()
+                ),
+                (
+                    b.x.to_bits(),
+                    b.y.to_bits(),
+                    b.fwhm_x.to_bits(),
+                    b.beta.to_bits()
+                )
+            );
+        }
+    }
+
+    /// Given seeds carry no filter SNR to select by: every seed is fitted and no report is made.
+    #[test]
+    fn a_population_over_given_seeds_fits_every_seed() {
+        let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
+        let given = test_seeds_of(&data, w, h);
+        let m = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seeds: SeedSpec::Given(given),
+                mode: Mode::Population {
+                    statistic: 1000,
+                    list: 10,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(m.population.is_none());
+        assert_eq!(m.refused.not_selected, 0);
+        assert_eq!(m.refused.accounted(m.stars.len()), m.seeds);
+    }
+
+    /// Three planes through the stacking halves under a population: the cross-plane rule reads each plane's records by
+    /// their FITTED seeds. The selection is not part of the stored first-pass bytes (route A keeps 5836a970's layout):
+    /// a record read back holds none.
+    #[test]
+    fn the_halves_run_a_population_across_planes() {
+        let planes: Vec<Vec<f32>> = (0..2)
+            .map(|k| noisy_field(&uniform(500, 1024, 1024, 21), 31 + k))
+            .collect();
+        let opts = MeasureOptions {
+            colour: true,
+            ..population_opts(150, 200)
+        };
+        let mut preps: Vec<PlanePrep> = planes
+            .iter()
+            .map(|p| prepare_plane(p, 1024, 1024, &opts, None))
+            .collect();
+        for prep in &preps {
+            let pop = prep.population.as_ref().expect("a selection");
+            assert_eq!(
+                prep.passes.len(),
+                pop.fitted.len(),
+                "a record per fitted seed"
+            );
+        }
+        cross_plane_flags(&mut preps);
+        let bytes = postcard::to_stdvec(&preps[0]).unwrap();
+        let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
+        assert!(back.population.is_none(), "the selection is not stored");
+        for (p, prep) in planes.iter().zip(preps) {
+            let m = finish_plane(p, 1024, 1024, &opts, prep, None);
+            let r = m.population.unwrap();
+            assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
+        }
     }
 }

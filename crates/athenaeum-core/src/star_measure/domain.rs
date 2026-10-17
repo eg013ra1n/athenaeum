@@ -11,7 +11,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::PhaseTimings;
+use super::substeps;
+use super::{PhaseTimings, Step, SubSteps};
 use crate::integration::stats::{
     self, median_in_place, LocationScale, ScaleEstimator, CLIP_HI, CLIP_LO, NOISE_CLIP_HI,
     NOISE_CLIP_LO,
@@ -250,13 +251,29 @@ pub fn noise_model_with(
     mesh: Option<&BackgroundMesh>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> (NoiseModel, PhaseTimings) {
+    noise_model_timed(working, w, h, mesh, pool, None)
+}
+
+/// [`noise_model_with`] with its two estimators timed into `sub` ([`Step::Residual`], [`Step::Mrs`]; Plan A Task 13b,
+/// 13-P). Timers only: the numbers are [`noise_model_with`]'s.
+pub(crate) fn noise_model_timed(
+    working: &[f32],
+    w: usize,
+    h: usize,
+    mesh: Option<&BackgroundMesh>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    sub: Option<&SubSteps>,
+) -> (NoiseModel, PhaseTimings) {
     let t = Instant::now();
-    let residual = || match mesh {
-        Some(m) => m
-            .background
-            .as_deref()
-            .and_then(|model| background_residual_from(working, w, h, model)),
-        None => background_residual(working, w, h),
+    let residual = || {
+        let _s = substeps::span(sub, Step::Residual);
+        match mesh {
+            Some(m) => m
+                .background
+                .as_deref()
+                .and_then(|model| background_residual_from(working, w, h, model)),
+            None => background_residual(working, w, h),
+        }
     };
     let bg = match pool {
         Some(p) => p.install(residual),
@@ -276,8 +293,14 @@ pub fn noise_model_with(
     };
     let t = Instant::now();
     let mrs = match pool {
-        Some(p) => p.install(|| noise_mrs(working, w, h)),
-        None => noise_mrs(working, w, h),
+        Some(p) => p.install(|| {
+            let _s = substeps::span(sub, Step::Mrs);
+            noise_mrs(working, w, h)
+        }),
+        None => {
+            let _s = substeps::span(sub, Step::Mrs);
+            noise_mrs(working, w, h)
+        }
     };
     let (sigma, source) = match mrs {
         Some(n) => (n as f64, NoiseSource::Mrs),

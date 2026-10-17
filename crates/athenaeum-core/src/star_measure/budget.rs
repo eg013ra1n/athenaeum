@@ -5,8 +5,8 @@
 //!
 //! - [`select_candidates`] (R12-3): the seeds to fit — a quota of `⌈1.25·N/16⌉` per cell by rank, a short cell's unused
 //!   share passed on round-robin.
-//! - [`trim`] (R12-4): after the fits, the removal that leaves at most N — unflagged fits first, round-robin by SNR over
-//!   the cells.
+//! - [`trim`] (R12-4, Task 13b review I3): after the fits, the removal that leaves at most N — unflagged fits first, the
+//!   kept rank-spread over (cell, brightness-class) strata so no class loses its share.
 //! - [`report`] (R12-6): the coverage numbers the lab's `budget coverage` row reads.
 //!
 //! Every cell assignment is the SEED's ([`cell_of`] of the seed's position), so coverage can never exceed 1.
@@ -60,38 +60,81 @@ pub fn cell_of(x: f64, y: f64, w: usize, h: usize) -> u8 {
     CELLS_PER_SIDE as u8 * axis(y, h) + axis(x, w)
 }
 
-/// The seeds to fit, ascending (= rank order), and the per-cell seed counts (R12-3). The seeds are brightest-first (the
-/// detector's order), so the seed index is the rank. The quota is `q = ⌈1.25·N/16⌉` per cell and the target `16·q`;
-/// the candidates are the first `min(target, seeds)` of the keys (rank within the seed's own cell, seed index), which is
-/// the round-robin with a short cell's share handed on, the last partial round going to the cells whose next seed ranks
-/// first. `N = 0` selects nothing (one `warn!`). One sort of at most 24 576 keys.
+/// The seeds to fit, ascending, and the per-cell seed counts (R12-3, Task 13b). The owner's rule is that a statistic
+/// never reads the N brightest, so inside a cell the candidates are rank-spread over its brightness range (the same
+/// even-rank picks as population (a), [`super::population::spread`]) and not its first `q`. The target is `16·q`,
+/// `q = ⌈1.25·N/16⌉`, handed to the 16 cells water-fill style (a short cell gives all it has and passes its share on,
+/// so every cell with seeds is covered). A cell's pool is its seeds that are not `skip`ped (knot-flagged, pre-fit
+/// saturated) and have a finite `brightness` (higher = brighter: the detection's filter SNR, or [`rank_brightness`]
+/// without a detection report); a cell with no such seed falls back to all its seeds, and a pool short of the target
+/// is topped up in detector order, so the candidates number `min(16·q, seeds)` as before. `N = 0` selects nothing
+/// (one `warn!`).
 pub fn select_candidates(
     seeds: &[Seed],
+    brightness: &[f64],
+    skip: &[bool],
     w: usize,
     h: usize,
     budget: usize,
 ) -> (Vec<usize>, [u32; 16]) {
     let mut counts = [0u32; CELLS];
-    let keys: Vec<(u32, usize)> = seeds
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let c = usize::from(cell_of(s.x, s.y, w, h));
-            counts[c] += 1;
-            (counts[c] - 1, i)
-        })
-        .collect();
+    let mut all: Vec<Vec<usize>> = vec![Vec::new(); CELLS];
+    for (i, s) in seeds.iter().enumerate() {
+        let c = usize::from(cell_of(s.x, s.y, w, h));
+        counts[c] += 1;
+        all[c].push(i);
+    }
     if budget == 0 {
         tracing::warn!(count = seeds.len(), "budget: a budget of 0 selects no star");
         return (Vec::new(), counts);
     }
     let quota = (CANDIDATE_FACTOR * budget as f64 / CELLS as f64).ceil() as usize;
     let target = quota.saturating_mul(CELLS).min(seeds.len());
-    let mut order = keys;
-    order.sort_unstable();
-    let mut chosen: Vec<usize> = order.into_iter().take(target).map(|(_, i)| i).collect();
+    let key = |i: usize| brightness.get(i).copied().unwrap_or(f64::NAN);
+    let by_brightness = |a: &usize, b: &usize| key(*a).total_cmp(&key(*b)).then(a.cmp(b));
+    let pools: Vec<Vec<usize>> = all
+        .iter()
+        .map(|members| {
+            let mut pool: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| !skip.get(i).copied().unwrap_or(false) && key(i).is_finite())
+                .collect();
+            if pool.is_empty() {
+                pool = members.clone();
+            }
+            pool.sort_by(by_brightness);
+            pool
+        })
+        .collect();
+    let mut available = [0usize; CELLS];
+    for (c, pool) in pools.iter().enumerate() {
+        available[c] = pool.len();
+    }
+    let take = super::population::water_fill(&available, target);
+    let mut chosen: Vec<usize> = Vec::with_capacity(target);
+    for (c, pool) in pools.iter().enumerate() {
+        chosen.extend(super::population::spread(pool, take[c]));
+    }
+    if chosen.len() < target {
+        let mut picked = vec![false; seeds.len()];
+        for &i in &chosen {
+            picked[i] = true;
+        }
+        let fill: Vec<usize> = (0..seeds.len())
+            .filter(|&i| !picked[i])
+            .take(target - chosen.len())
+            .collect();
+        chosen.extend(fill);
+    }
     chosen.sort_unstable();
     (chosen, counts)
+}
+
+/// The brightness key of seeds without a detection report: the detector's order is brightest first, so the key falls
+/// with the index.
+pub fn rank_brightness(n: usize) -> Vec<f64> {
+    (0..n).map(|i| (n - i) as f64).collect()
 }
 
 /// SNR descending, NaN after every number.
@@ -104,42 +147,98 @@ fn snr_desc(a: f64, b: f64) -> Ordering {
     }
 }
 
-/// The fits to remove, ascending, so that at most `budget` remain; `cells[k]` = the cell of fit k's SEED (R12-4). Tier 0
-/// is `flags.in_statistic()` (neither saturated nor extended), tier 1 the others; a fit's round is its rank within
-/// (cell, tier) by SNR descending (NaN last), then fit index; the kept are the first `budget` of (tier, round, SNR
-/// descending, fit index). Flagged fits so fill only the slots no unflagged fit wants.
+/// The kept fits of one tier: `total` of `members` (fit indices), cell first and brightness-class second, as
+/// [`select_candidates`] picks seeds. The total is handed to the 16 cells water-fill style (every cell with fits is
+/// covered once `total` reaches the cell count - the R12 coverage contract); inside a cell the fits are cut into
+/// [`BRIGHTNESS_STRATA`] equal-count SNR classes of the tier (NaN faintest, the classes are the tier's own quartiles so a
+/// class means the same in every cell), the cell's share is handed to its classes water-fill style and a class's picks
+/// are evenly rank-spaced ([`super::population::spread`]) - so a trim never empties the faint end. `covered` marks the
+/// cells an earlier tier already keeps a fit in: the tier gives its first stars to the others.
+fn pick_tier(
+    fits: &[StarFit],
+    cells: &[u8],
+    members: &mut [usize],
+    total: usize,
+    covered: &[bool; CELLS],
+) -> Vec<usize> {
+    use super::population::{spread, water_fill, BRIGHTNESS_STRATA};
+    members.sort_by(|&a, &b| snr_desc(fits[a].snr, fits[b].snr).reverse().then(a.cmp(&b)));
+    let band = members.len();
+    let mut strata: Vec<[Vec<usize>; BRIGHTNESS_STRATA]> =
+        (0..CELLS).map(|_| Default::default()).collect();
+    for (rank, &k) in members.iter().enumerate() {
+        let class = (BRIGHTNESS_STRATA * rank / band).min(BRIGHTNESS_STRATA - 1);
+        strata[usize::from(cells[k]).min(CELLS - 1)][class].push(k);
+    }
+    let mut available = [0usize; CELLS];
+    for (c, classes) in strata.iter().enumerate() {
+        available[c] = classes.iter().map(Vec::len).sum();
+    }
+    // One star first to every cell the earlier tier left uncovered (the R12 coverage contract holds across tiers), the
+    // rest of the total water-fill style.
+    let mut per_cell = [0usize; CELLS];
+    let mut left = total.min(band);
+    for c in 0..CELLS {
+        if left > 0 && !covered[c] && available[c] > 0 {
+            per_cell[c] = 1;
+            left -= 1;
+        }
+    }
+    let mut room = available;
+    for c in 0..CELLS {
+        room[c] -= per_cell[c];
+    }
+    for (c, t) in water_fill(&room, left).into_iter().enumerate() {
+        per_cell[c] += t;
+    }
+    let mut kept = Vec::with_capacity(total);
+    for (c, classes) in strata.iter().enumerate() {
+        let mut in_class = [0usize; BRIGHTNESS_STRATA];
+        for (i, m) in classes.iter().enumerate() {
+            in_class[i] = m.len();
+        }
+        let take = water_fill(&in_class, per_cell[c]);
+        for (m, t) in classes.iter().zip(take) {
+            kept.extend(spread(m, t));
+        }
+    }
+    kept
+}
+
+/// The fits to remove, ascending, so that at most `budget` remain; `cells[k]` = the cell of fit k's SEED (R12-4, Task 13b
+/// review I3). Tier 0 is `flags.in_statistic()` (neither saturated nor extended), tier 1 the others; the flagged fits
+/// only fill the slots no unflagged fit wants. Inside a tier the kept fits are rank-spread over cells, then brightness
+/// classes, as population (a)'s pick is ([`pick_tier`]) - the old trim dropped the lowest-SNR fits of every cell
+/// and so took about half of the faintest class; this one keeps every class its share.
 pub fn trim(fits: &[StarFit], cells: &[u8], budget: usize) -> Vec<usize> {
     debug_assert_eq!(fits.len(), cells.len());
     if fits.len() <= budget {
         return Vec::new();
     }
-    let tier = |k: usize| usize::from(!fits[k].flags.in_statistic());
-    let mut by_group: Vec<usize> = (0..fits.len()).collect();
-    by_group.sort_by(|&a, &b| {
-        (cells[a], tier(a))
-            .cmp(&(cells[b], tier(b)))
-            .then_with(|| snr_desc(fits[a].snr, fits[b].snr))
-            .then(a.cmp(&b))
-    });
-    let mut round = vec![0usize; fits.len()];
-    let mut run = 0usize;
-    for (n, &k) in by_group.iter().enumerate() {
-        let new_group = n == 0 || {
-            let p = by_group[n - 1];
-            (cells[p], tier(p)) != (cells[k], tier(k))
-        };
-        run = if new_group { 0 } else { run + 1 };
-        round[k] = run;
+    let (mut good, mut flagged): (Vec<usize>, Vec<usize>) =
+        (0..fits.len()).partition(|&k| fits[k].flags.in_statistic());
+    let mut kept = if good.len() >= budget {
+        pick_tier(fits, cells, &mut good, budget, &[false; CELLS])
+    } else {
+        let rest = budget - good.len();
+        let mut covered = [false; CELLS];
+        for &k in &good {
+            covered[usize::from(cells[k]).min(CELLS - 1)] = true;
+        }
+        let mut kept = good;
+        kept.extend(pick_tier(fits, cells, &mut flagged, rest, &covered));
+        kept
+    };
+    kept.sort_unstable();
+    let mut removed = Vec::with_capacity(fits.len() - kept.len());
+    let mut it = kept.iter().peekable();
+    for k in 0..fits.len() {
+        if it.peek() == Some(&&k) {
+            it.next();
+        } else {
+            removed.push(k);
+        }
     }
-    let mut order: Vec<usize> = (0..fits.len()).collect();
-    order.sort_by(|&a, &b| {
-        (tier(a), round[a])
-            .cmp(&(tier(b), round[b]))
-            .then_with(|| snr_desc(fits[a].snr, fits[b].snr))
-            .then(a.cmp(&b))
-    });
-    let mut removed: Vec<usize> = order.split_off(budget);
-    removed.sort_unstable();
     removed
 }
 
@@ -232,7 +331,7 @@ mod tests {
     fn an_absurd_budget_selects_every_seed_without_overflow() {
         let seeds: Vec<Seed> = (0..40).map(|i| in_cell((i % 16) as u8)).collect();
         for budget in [usize::MAX, usize::MAX / 2, 1 << 62] {
-            let (c, n) = select_candidates(&seeds, 400, 400, budget);
+            let (c, n) = pick(&seeds, budget);
             assert_eq!(c, (0..40).collect::<Vec<_>>(), "budget {budget}");
             assert_eq!(n.iter().sum::<u32>(), 40);
         }
@@ -248,20 +347,42 @@ mod tests {
         assert_eq!(cell_of(250.0, 150.0, 400, 300), 10);
     }
 
-    /// R12-3: budget 64 → quota 5, target 80.
+    /// [`select_candidates`] on the detector order (no detection report), nothing skipped.
+    fn pick(seeds: &[Seed], budget: usize) -> (Vec<usize>, [u32; 16]) {
+        select_candidates(seeds, &rank_brightness(seeds.len()), &[], 400, 400, budget)
+    }
+
+    /// R12-3 re-pinned by Task 13b (the shared stratified rank, the owner's rule that a statistic never reads the N
+    /// brightest): budget 64 -> quota 5, target 80 candidates, spread over the 4 x 4 cells AND the four brightness
+    /// classes. Before: the 5 brightest of every cell.
     #[test]
-    fn every_cell_gets_its_quota_by_rank_and_a_short_cell_hands_its_share_on() {
+    fn the_candidates_spread_over_the_cells_and_the_brightness_not_the_brightest() {
         let full: Vec<Seed> = (0..160).map(|i| in_cell((i % 16) as u8)).collect(); // 10 per cell, interleaved by rank
-        let (c, n) = select_candidates(&full, 400, 400, 64);
+        let (c, n) = pick(&full, 64);
         assert_eq!(n, [10; 16]);
-        assert_eq!(
-            c,
-            (0..80).collect::<Vec<_>>(),
-            "the 5 brightest of every cell"
-        );
+        assert_eq!(c.len(), 80);
+        assert_ne!(c, (0..80).collect::<Vec<_>>(), "not the brightest 80");
+        assert!(c.windows(2).all(|p| p[0] < p[1]), "ascending");
+        for class in 0..4 {
+            let n_class = c.iter().filter(|&&i| i / 40 == class).count();
+            assert!(
+                (15..=25).contains(&n_class),
+                "class {class} holds {n_class} of 40 seeds"
+            );
+        }
+        for cell in 0..16 {
+            let n_cell = c.iter().filter(|&&i| i % 16 == cell).count();
+            assert_eq!(n_cell, 5, "cell {cell} gets its quota");
+        }
+    }
+
+    /// R12-3's short-cell rule survives: a short cell's unused share passes to the others, every seed of a short
+    /// cell is a candidate, and the long cell's picks span its brightness range.
+    #[test]
+    fn a_short_cell_hands_its_share_on() {
         let mut short: Vec<Seed> = (0..100).map(|_| in_cell(0)).collect(); // ranks 0..99 in cell 0
         short.extend((0..30).map(|i| in_cell(1 + (i / 2) as u8))); // ranks 100..129: two per cell 1..=15
-        let (c, n) = select_candidates(&short, 400, 400, 64);
+        let (c, n) = pick(&short, 64);
         assert_eq!(n[0], 100);
         assert!(n[1..].iter().all(|&k| k == 2));
         assert_eq!(c.len(), 80);
@@ -269,47 +390,47 @@ mod tests {
             (100..130).all(|i| c.contains(&i)),
             "every short cell's seeds are candidates"
         );
-        assert_eq!(
-            c[..50],
-            (0..50).collect::<Vec<_>>()[..],
-            "cell 0 takes the 50 slots left, brightest first"
+        let cell0: Vec<usize> = c.iter().copied().filter(|&i| i < 100).collect();
+        assert_eq!(cell0.len(), 50, "cell 0 takes the 50 slots left");
+        assert!(
+            cell0.iter().any(|&i| i >= 50),
+            "its picks reach into the faint half, not the 50 brightest"
         );
-        assert!(c.windows(2).all(|p| p[0] < p[1]), "ascending = rank order");
     }
 
-    /// R12-3's tie-break: budget 25 → quota 2, target 32. Rounds 1–9 take 30 (nine each in cells 0–2, three in cell 3).
-    /// Round 10 has 2 slots for cells 0, 1 and 2, whose tenth seeds rank 32, 31 and 30: cells 2 and 1 take them.
+    /// Skipped (flagged) and key-less seeds enter only when the pool is short, brightest first; the selection is
+    /// deterministic.
     #[test]
-    fn the_last_partial_round_goes_to_the_cells_whose_next_seed_ranks_first() {
-        let mut s: Vec<Seed> = (0..27).map(|r| in_cell((r % 3) as u8)).collect();
-        s.extend((0..3).map(|_| in_cell(3)));
-        s.extend([2u8, 1, 0, 0, 1, 2].map(in_cell));
-        let (c, _) = select_candidates(&s, 400, 400, 25);
-        assert_eq!(c, (0..32).collect::<Vec<_>>());
-        assert_eq!(
-            select_candidates(&s, 400, 400, 25).0,
-            c,
-            "the same input, the same selection"
-        );
+    fn skipped_seeds_only_top_up_a_short_pool() {
+        let seeds: Vec<Seed> = (0..60).map(|i| in_cell((i % 16) as u8)).collect();
+        let mut key = rank_brightness(60);
+        key[7] = f64::NAN;
+        let mut skip = vec![false; 60];
+        skip[0] = true;
+        // budget 25 -> target 32 of 60: the pool of 58 covers it, so neither the skipped nor the NaN seed is taken
+        let (c, _) = select_candidates(&seeds, &key, &skip, 400, 400, 25);
+        assert_eq!(c.len(), 32);
+        assert!(!c.contains(&0) && !c.contains(&7));
+        assert_eq!(select_candidates(&seeds, &key, &skip, 400, 400, 25).0, c);
+        // budget 64 -> target 80 > 60: everything, the two left out of the pool last
+        let (c, _) = select_candidates(&seeds, &key, &skip, 400, 400, 64);
+        assert_eq!(c, (0..60).collect::<Vec<_>>());
     }
 
     #[test]
     fn a_budget_at_or_above_the_seed_count_takes_every_seed_and_zero_takes_none() {
         let s: Vec<Seed> = (0..40).map(|i| in_cell((i * 7 % 16) as u8)).collect();
-        assert_eq!(
-            select_candidates(&s, 400, 400, 40).0,
-            (0..40).collect::<Vec<_>>()
-        );
-        assert_eq!(select_candidates(&s, 400, 400, 1000).0.len(), 40);
-        assert!(select_candidates(&s, 400, 400, 0).0.is_empty());
+        assert_eq!(pick(&s, 40).0, (0..40).collect::<Vec<_>>());
+        assert_eq!(pick(&s, 1000).0.len(), 40);
+        assert!(pick(&s, 0).0.is_empty());
         assert!(trim(&vec![fit(10.0, StarFlags::default()); 5], &[0; 5], 5).is_empty());
     }
 
-    /// R12-4. Cell 0 holds SNR 50 (saturated), 40, 30, 30, 20; cell 1 holds 25 and NaN; cell 2 holds 5 (extended).
-    /// Unflagged first: round 1 is 40 and 25; round 2 is fit 2 (the 30-tie to the lower index) and the NaN; then
-    /// 30 and 20; the flagged come last.
+    /// R12-4 (Task 13b review I3). Cell 0 holds SNR 50 (saturated), 40, 30, 30, 20; cell 1 holds 25 and NaN; cell 2
+    /// holds 5 (extended). The flagged fits (0 and 7) go before any unflagged one, and a trim that leaves room for all
+    /// of them removes nothing.
     #[test]
-    fn the_trim_keeps_unflagged_fits_first_round_robin_by_snr() {
+    fn the_trim_keeps_unflagged_fits_first() {
         let ok = StarFlags::default();
         let fits = [
             fit(50.0, StarFlags::SATURATED),
@@ -328,12 +449,40 @@ mod tests {
             vec![0, 7],
             "both flagged go before any unflagged fit"
         );
-        assert_eq!(
-            trim(&fits, &cells, 4),
-            vec![0, 3, 4, 7],
-            "round-robin: cell 1's NaN (round 2) before fit 3 (round 3)"
+        // Five of the six unflagged fits survive the next cut, one flagged-free removal per step, never a flagged keep.
+        for budget in 1..6 {
+            let removed = trim(&fits, &cells, budget);
+            assert_eq!(removed.len(), 8 - budget);
+            assert!(
+                removed.contains(&0) && removed.contains(&7),
+                "{budget}: {removed:?}"
+            );
+        }
+        assert_eq!(trim(&fits, &cells, 0).len(), 8);
+    }
+
+    /// Review I3: the trim spreads the kept fits over the brightness classes. 400 unflagged fits in one cell, SNR 1..400,
+    /// budget 200: every SNR quartile keeps exactly 50 (the old trim kept the 200 brightest and emptied the two faint
+    /// classes), and the faintest class is still present.
+    #[test]
+    fn the_trim_keeps_the_faintest_class_its_share() {
+        let ok = StarFlags::default();
+        let fits: Vec<StarFit> = (1..=400).map(|i| fit(f64::from(i), ok)).collect();
+        let removed = trim(&fits, &vec![0; 400], 200);
+        assert_eq!(removed.len(), 200);
+        let mut kept_per_class = [0usize; 4];
+        for k in (0..400).filter(|k| !removed.contains(k)) {
+            kept_per_class[k / 100] += 1;
+        }
+        assert_eq!(kept_per_class, [50; 4], "{kept_per_class:?}");
+        // Two cells of unequal depth: the water level hands the short cell's unused share on, every class survives.
+        let cells: Vec<u8> = (0..400).map(|k| u8::from(k % 8 == 0)).collect();
+        let removed = trim(&fits, &cells, 200);
+        assert_eq!(removed.len(), 200);
+        assert!(
+            (0..100).any(|k| !removed.contains(&k)),
+            "the faintest class keeps stars"
         );
-        assert_eq!(trim(&fits, &cells, 3), vec![0, 3, 4, 6, 7]);
     }
 
     /// R12-6. Seeds lie in cells 0, 0, 1, 2 and 3; the candidates are seeds 0, 2 and 3; the accepted fits are seeds 0

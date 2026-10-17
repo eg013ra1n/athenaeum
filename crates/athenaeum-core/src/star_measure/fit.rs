@@ -355,6 +355,9 @@ pub struct FitOutcome {
     pub aperture_correction: Option<f64>,
     /// The qualifying stars the plane's own `aperture_correction` is the median over (at most 64); 0 for a caller's.
     pub aperture_stars: usize,
+    /// The standard error of the median `aperture_correction` is, from the ratios' MAD (`1.2533 * 1.4826 * MAD /
+    /// sqrt(n)`); `None` where `c` was not measured on the plane's own ratios.
+    pub aperture_se: Option<f64>,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present ring pixels, or no ring width on
     /// the plane); their `sky_ring` and `sky_ring_sigma` are NaN and `sky_ring_n` 0.
     pub ring_sky_missing: usize,
@@ -1855,6 +1858,12 @@ pub(super) struct Correction<'a> {
     /// The seeds the ring sky masks and `c`'s isolation reads when the fitted seeds are a subset of the detected ones
     /// (the budget's candidates, Task 12, R12-5); `None` = the fitted seeds themselves.
     pub(super) neighbours: Option<Neighbours<'a>>,
+    /// Population (a) among the fit call's seeds (Plan A Task 13b, [`super::population`]): the ring width reads its
+    /// fits alone and `c` is the median of the 64 brightest qualifying fits of (a). `None` = every fit counts, as before.
+    pub(super) population: Option<super::population::PopulationView<'a>>,
+    /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
+    /// Timers only; `None` for every caller but the measure path.
+    pub(super) timers: Option<&'a super::SubSteps>,
 }
 
 /// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
@@ -2235,17 +2244,18 @@ fn fit_at_width(
     // F-10 (Task 10b, ruling B2) then F-5 (Task 10): every kept fit's ring sky B_i and σ_i, then the aperture
     // correction from them, after the duplicate drop and before any total reads `signal`; neither moves a fit, `c`
     // only every kept fit's flux.
-    let (aperture_correction, aperture_stars, ring_sky_missing, ring_fwhm) = ring_and_correction(
-        data,
-        mask,
-        w,
-        h,
-        seeds,
-        &mut kept,
-        field.fwhm_px,
-        &correction,
-        pool,
-    );
+    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm) =
+        ring_and_correction(
+            data,
+            mask,
+            w,
+            h,
+            seeds,
+            &mut kept,
+            field.fwhm_px,
+            &correction,
+            pool,
+        );
     if let Some(c) = aperture_correction {
         for (_, f) in &mut kept {
             f.signal *= c;
@@ -2320,6 +2330,7 @@ fn fit_at_width(
         verdict_fit_failed,
         aperture_correction,
         aperture_stars,
+        aperture_se,
         ring_sky_missing,
         fit_seeds,
         ring_fwhm,
@@ -2342,23 +2353,28 @@ fn ring_and_correction(
     field_fwhm: f64,
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (Option<f64>, usize, usize, Option<f64>) {
+) -> (Option<f64>, usize, Option<f64>, usize, Option<f64>) {
     // R12-5: a budgeted call fits a subset; the discs and the isolation read every detected seed.
     let (all_seeds, own) = match correction.neighbours {
         Some(n) => (n.seeds, Some(n.of_fit)),
         None => (seeds, None),
     };
-    let (ring_fwhm, missing) = super::photometry::ring_skies(
-        data,
-        mask,
-        correction.footprint,
-        w,
-        h,
-        all_seeds,
-        kept,
-        correction.ring_fwhm,
-        pool,
-    );
+    let (ring_fwhm, missing) = {
+        let _s = super::substeps::span(correction.timers, super::Step::RingSky);
+        super::photometry::ring_skies(
+            data,
+            mask,
+            correction.footprint,
+            w,
+            h,
+            all_seeds,
+            kept,
+            correction.ring_fwhm,
+            correction.population.map(|p| p.statistic),
+            pool,
+            correction.timers,
+        )
+    };
     let given = match correction.flux {
         super::FluxCorrection::Given(c) if c.is_finite() && c > 0.0 => Some(c),
         super::FluxCorrection::Given(bad) => {
@@ -2371,24 +2387,28 @@ fn ring_and_correction(
         }
         super::FluxCorrection::FromPlane => None,
     };
-    let (c, stars) = match given {
-        Some(c) => (Some(c), 0),
-        None => super::photometry::aperture_correction(
-            data,
-            mask,
-            w,
-            h,
-            kept,
-            all_seeds,
-            own,
-            field_fwhm,
-            ring_fwhm,
-            correction.saturation,
-            correction.full_scale,
-            correction.footprint,
-        ),
+    let (c, stars, se) = match given {
+        Some(c) => (Some(c), 0, None),
+        None => {
+            let _s = super::substeps::span(correction.timers, super::Step::ApertureC);
+            super::photometry::aperture_correction(
+                data,
+                mask,
+                w,
+                h,
+                kept,
+                all_seeds,
+                own,
+                field_fwhm,
+                ring_fwhm,
+                correction.saturation,
+                correction.full_scale,
+                correction.footprint,
+                correction.population,
+            )
+        }
     };
-    (c, stars, missing, ring_fwhm)
+    (c, stars, se, missing, ring_fwhm)
 }
 
 /// Every kept fit's aperture SNR and half-flux radius (F-6, Task 11, [`super::photometry::star_snr`] and
@@ -2408,7 +2428,9 @@ fn snr_and_hfr(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     let mut body = || {
+        let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
+            let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
             f.snr = super::photometry::star_snr(
                 data,
                 w,
@@ -2451,7 +2473,7 @@ pub(super) fn correct_at_ring(
         .copied()
         .zip(outcome.fits.drain(..))
         .collect();
-    let (c, stars, missing, ring_fwhm) = ring_and_correction(
+    let (c, stars, se, missing, ring_fwhm) = ring_and_correction(
         data,
         mask,
         w,
@@ -2473,6 +2495,7 @@ pub(super) fn correct_at_ring(
     outcome.fits = kept.into_iter().map(|(_, f)| f).collect();
     outcome.aperture_correction = c;
     outcome.aperture_stars = stars;
+    outcome.aperture_se = se;
     outcome.ring_sky_missing = missing;
     outcome.ring_fwhm = ring_fwhm;
 }

@@ -80,6 +80,39 @@ pub struct MeasureOptions {
     /// is `Structure`. Not a `StackingConfig` field: a run selects the
     /// detector, never its internals (M4c Task 0 calibrated them once).
     pub structure: StructureParams,
+    /// The two star populations (Plan A Task 13b, [`sm::population`]): `None` = every seed is fitted (the stacking Measure
+    /// stage since route A, owner decision 2026-10-17, and the tests), `Some` = the pass fits the frame-statistic
+    /// population and the star list only (the probes; the weight that needs it is a later cycle, STOP R13b-11).
+    pub population: Option<StarPopulation>,
+}
+
+/// The star-list sizes of the Measure stage's populations (R13b-3): list (b) is the first `list_mono` seeds of a mono
+/// plane, the first `list_colour` of a colour plane's (Register re-detects a colour frame on its luminance, so only
+/// local normalization reads those).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StarPopulation {
+    /// N, the frame-statistic stars (population (a)).
+    pub statistic: usize,
+    pub list_mono: usize,
+    pub list_colour: usize,
+}
+
+/// A mono plane's star list is this many times `registration.max_stars` (the top registration stars by signal lie
+/// within seed rank 3 270-3 575 on set 204, against 2 x 2 000 = 4 000).
+pub const MONO_LIST_PER_REGISTRATION_STAR: usize = 2;
+/// A colour plane's star list: 4 x local normalization's 500-pair cap (its paired stars lie within seed rank 1 349).
+pub const COLOUR_LIST_STARS: usize = 2000;
+
+impl StarPopulation {
+    /// The probe / lab sizes (the stacking Measure runs `Mode::All` and does not use a population) for a run whose registration keeps `registration_max_stars` stars.
+    pub fn probe_default(registration_max_stars: usize) -> StarPopulation {
+        StarPopulation {
+            statistic: sm::population::STATISTIC_STARS,
+            list_mono: MONO_LIST_PER_REGISTRATION_STAR * registration_max_stars,
+            list_colour: COLOUR_LIST_STARS,
+        }
+    }
 }
 
 impl Default for MeasureOptions {
@@ -94,6 +127,7 @@ impl Default for MeasureOptions {
             seed_source: SeedSource::MatchedFilter,
             seed_threshold: sm::seeds::DEFAULT_THRESHOLD,
             structure: StructureParams::default(),
+            population: None,
         }
     }
 }
@@ -262,6 +296,9 @@ impl FrameMeasurement {
 pub struct PlaneMeasurement {
     pub channel: ChannelMeasurement,
     pub fits: Vec<StarFit>,
+    /// The plane's sub-step wall and thread-CPU timers (Plan A Task 13b, 13-P), reported in `"frame plane substeps"`
+    /// only. Never compared, never persisted.
+    pub sub_steps: sm::SubSteps,
     /// The field width the module's fit started from (Plan A Task 6b): the matched
     /// filter's own for [`SeedOverride::MatchedFilter`], else `field_width_of` the
     /// seeds. Reported, not persisted.
@@ -292,6 +329,12 @@ pub struct PlaneMeasurement {
     /// The qualifying stars `aperture_correction` is the median over (the probe's `apertureStars`). Reported, not
     /// persisted.
     pub aperture_stars: usize,
+    /// The standard error of `aperture_correction` as the median of its ratios (Plan A Task 13b; the probe's
+    /// `apertureSe`). Reported, not persisted.
+    pub aperture_se: Option<f64>,
+    /// What the two populations did on the plane (Plan A Task 13b; the probe's selection counts). `None` = every seed
+    /// was fitted. Reported, not persisted.
+    pub population: Option<sm::PopulationReport>,
     /// The accepted fits without a ring sky B_i (Plan A Task 10b, F-10; the probe's `ringSkyMissing`). Reported, not
     /// persisted.
     pub ring_sky_missing: usize,
@@ -781,6 +824,13 @@ fn module_options(
     gain_e_per_unit: Option<f64>,
     cfa_site_share: Option<f64>,
 ) -> sm::MeasureOptions {
+    let mode = match opts.population {
+        Some(p) => sm::Mode::Population {
+            statistic: p.statistic,
+            list: if colour { p.list_colour } else { p.list_mono },
+        },
+        None => sm::Mode::All,
+    };
     sm::MeasureOptions {
         domain: sm::Domain::Calibrated { gain_e_per_unit },
         psf_model: opts.psf_model,
@@ -798,7 +848,7 @@ fn module_options(
         colour,
         pixel_noise,
         cfa_site_share,
-        mode: sm::Mode::All,
+        mode,
     }
 }
 
@@ -1104,6 +1154,7 @@ fn adapter_tail(
         PlaneMeasurement {
             channel,
             fits: m.stars,
+            sub_steps: m.sub_steps,
             field_width: m.field_width,
             defocused: m.defocused,
             defocus_donuts: m.defocus_donuts,
@@ -1114,6 +1165,8 @@ fn adapter_tail(
             beta_source: m.beta_source,
             aperture_correction: m.aperture_correction,
             aperture_stars: m.aperture_stars,
+            aperture_se: m.aperture_se,
+            population: m.population,
             ring_sky_missing: m.ring_sky_missing,
             clip_floor: m.clip_floor,
             clip_evidence: m.clip_evidence,
@@ -1354,6 +1407,58 @@ fn read_guarded(
     Ok(Cow::Owned(data))
 }
 
+/// Plan A Task 13b (13-P): one plane's sub-step profile as two debug lines, `"frame plane substeps"` (the plane-wide
+/// passes) and `"frame plane substeps fit"` (the fit tail). Each step reports its wall `<step>_us` and the thread CPU
+/// `<step>_cpu_us` it used, summed over the pool tasks that did the work; `sat_wait_us` is a wall alone. A plane whose
+/// first pass was read back from a stored `.athm` reports the second pass's steps only.
+fn log_substeps(path: &Path, plane: usize, s: &sm::SubSteps) {
+    use sm::Step::*;
+    let (w, c) = (|k| s.wall_us(k), |k| s.cpu_us(k));
+    debug!(
+        path = %path.display(),
+        plane,
+        work_copy_us = w(WorkCopy),
+        work_copy_cpu_us = c(WorkCopy),
+        sky_level_us = w(SkyLevel),
+        sky_level_cpu_us = c(SkyLevel),
+        sat_plane_us = w(SatPlane),
+        sat_plane_cpu_us = c(SatPlane),
+        sat_wait_us = w(SatWait),
+        mesh_us = w(Mesh),
+        mesh_cpu_us = c(Mesh),
+        residual_us = w(Residual),
+        residual_cpu_us = c(Residual),
+        mrs_us = w(Mrs),
+        mrs_cpu_us = c(Mrs),
+        detect_prep_us = w(DetectPrep),
+        detect_prep_cpu_us = c(DetectPrep),
+        detect_pass1_us = w(DetectPass1),
+        detect_pass1_cpu_us = c(DetectPass1),
+        detect_widths_us = w(DetectWidths),
+        detect_widths_cpu_us = c(DetectWidths),
+        detect_pass2_us = w(DetectPass2),
+        detect_pass2_cpu_us = c(DetectPass2),
+        detect_knots_us = w(DetectKnots),
+        detect_knots_cpu_us = c(DetectKnots),
+        "frame plane substeps"
+    );
+    debug!(
+        path = %path.display(),
+        plane,
+        signal_totals_us = w(SignalTotals),
+        signal_totals_cpu_us = c(SignalTotals),
+        rcr_us = w(Rcr),
+        rcr_cpu_us = c(Rcr),
+        ring_sky_us = w(RingSky),
+        ring_sky_cpu_us = c(RingSky),
+        aperture_c_us = w(ApertureC),
+        aperture_c_cpu_us = c(ApertureC),
+        snr_hfr_us = w(SnrHfr),
+        snr_hfr_cpu_us = c(SnrHfr),
+        "frame plane substeps fit"
+    );
+}
+
 /// The measured planes as the frame's [`FrameMeasurement`] and its per-plane fits, with the frame adapter's per-plane
 /// log lines (the defocused and trailed verdicts, `"frame plane measured"`).
 fn assemble_frame(
@@ -1419,6 +1524,7 @@ fn assemble_frame(
             duration_ms = measured.wall_ms,
             "frame plane measured"
         );
+        log_substeps(path, plane, &pm.sub_steps);
         channels.push(m);
         fits_by_plane.push(pm.fits);
     }
@@ -1699,8 +1805,9 @@ pub(crate) fn check_pass1_head(
             now: Some(now),
         });
     }
-    let reader = PlaneReader::open(calibrated)
-        .map_err(|e| Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}"))))?;
+    let reader = PlaneReader::open(calibrated).map_err(|e| {
+        Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}")))
+    })?;
     let file = (reader.width(), reader.height(), reader.channels());
     let stored = (
         head.width as usize,
@@ -1720,10 +1827,12 @@ pub(crate) fn check_pass1_head(
 fn stamp_of(id: FileIdentity) -> SourceStamp {
     SourceStamp {
         len: id.len,
-        modified_ns: id.modified.map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
-            Ok(after) => after.as_nanos() as i128,
-            Err(before) => -(before.duration().as_nanos() as i128),
-        }),
+        modified_ns: id
+            .modified
+            .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(after) => after.as_nanos() as i128,
+                Err(before) => -(before.duration().as_nanos() as i128),
+            }),
     }
 }
 
@@ -1902,13 +2011,7 @@ pub(crate) mod tests {
         assert!(matches!(g.check(), Err(IntegrationError::Io(_))));
     }
 
-    pub(crate) fn write(
-        dir: &Path,
-        name: &str,
-        planes: &[&[f32]],
-        w: usize,
-        h: usize,
-    ) -> PathBuf {
+    pub(crate) fn write(dir: &Path, name: &str, planes: &[&[f32]], w: usize, h: usize) -> PathBuf {
         let mut all = Vec::new();
         for p in planes {
             all.extend_from_slice(p);
@@ -3185,6 +3288,86 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             frame.channels[0].timings.fit_ms,
             "{measured}"
         );
+    }
+
+    /// Plan A Task 13b (13-P): each plane logs its sub-step profile at debug, `"frame plane substeps"` (the plane-wide
+    /// passes) and `"frame plane substeps fit"` (the fit tail), a wall `<step>_us` and a thread-CPU `<step>_cpu_us` per
+    /// step, and the timers move no number.
+    #[test]
+    fn a_plane_logs_its_sub_step_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = moffat_member(3.0, 11);
+        let path = write(dir.path(), "substeps.fits", &[plane.as_slice()], 480, 400);
+        let opts = MeasureOptions::default();
+        let cancel = AtomicBool::new(false);
+        let mut result = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let pass1 = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let beta = pass1.beta_own()[0];
+            result =
+                Some(measure_frame_pass2(&path, pass1, &[beta], &opts, None, &cancel).unwrap());
+        });
+        let (frame, _) = result.unwrap();
+        let line = |msg: &str, not: &str| {
+            logs.lines()
+                .find(|l| l.contains(msg) && (not.is_empty() || !l.contains(not)))
+                .unwrap_or_else(|| panic!("no {msg:?} line in:\n{logs}"))
+                .to_string()
+        };
+        let first = line("frame plane substeps", "substeps fit");
+        let fit = line("frame plane substeps fit", "");
+        for step in [
+            "work_copy",
+            "sky_level",
+            "sat_plane",
+            "mesh",
+            "residual",
+            "mrs",
+            "detect_prep",
+            "detect_pass1",
+            "detect_widths",
+            "detect_pass2",
+            "detect_knots",
+        ] {
+            assert!(first.contains(&format!(" {step}_us=")), "{step}: {first}");
+            assert!(
+                first.contains(&format!(" {step}_cpu_us=")),
+                "{step}: {first}"
+            );
+        }
+        assert!(first.contains(" sat_wait_us="), "{first}");
+        for step in ["signal_totals", "rcr", "ring_sky", "aperture_c", "snr_hfr"] {
+            assert!(fit.contains(&format!(" {step}_us=")), "{step}: {fit}");
+            assert!(fit.contains(&format!(" {step}_cpu_us=")), "{step}: {fit}");
+        }
+        assert!(
+            first.contains("path=") && first.contains("plane=0"),
+            "{first}"
+        );
+        let field = |l: &str, name: &str| -> u64 {
+            let at = l.find(&format!(" {name}=")).unwrap() + name.len() + 2;
+            l[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        // The RCR is a share of the totals; the plane-wide passes took real time on a real plane.
+        assert!(
+            field(&fit, "rcr_us") <= field(&fit, "signal_totals_us"),
+            "{fit}"
+        );
+        assert!(
+            field(&first, "mrs_us") > 0 && field(&first, "detect_pass1_us") > 0,
+            "{first}"
+        );
+        #[cfg(unix)]
+        {
+            assert!(field(&first, "mrs_cpu_us") > 0, "{first}");
+            assert!(field(&fit, "snr_hfr_cpu_us") > 0, "{fit}");
+        }
+        assert!(frame.channels[0].stars_fitted >= 20);
     }
 
     /// Task 11b: two members whose own βs differ (2.5 and 6 in the pixels) are both fitted at the group β, the lower

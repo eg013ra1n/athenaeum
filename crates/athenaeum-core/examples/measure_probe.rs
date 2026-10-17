@@ -20,13 +20,16 @@
 //! measuring many files at once (and comparing against an external
 //! per-frame log) use `examples/weight_audit.rs` instead.
 //!
-//! `cargo run --release -p athenaeum-core --example measure_probe -- <file.fits|file.xisf> [auto|moffat4]`
+//! `cargo run --release -p athenaeum-core --example measure_probe -- <file.fits|file.xisf> [auto|moffat4] [population]`
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use athenaeum_core::stacking::measure::{measure_frame, measure_plane, MeasureOptions};
+use athenaeum_core::stacking::measure::{
+    measure_frame, measure_plane, MeasureOptions, StarPopulation,
+};
 use athenaeum_core::stacking::psf_signal::PsfModel;
+use athenaeum_core::stacking::register::RegistrationConfig;
 
 /// As `integrate_probe.rs::read_planes_any`: FITS via `PlaneReader`,
 /// anything else via `astroimage::ImageConverter::read_raw` (XISF, the
@@ -81,7 +84,7 @@ fn main() {
     let path = match args.next() {
         Some(p) => p,
         None => {
-            eprintln!("usage: measure_probe <file.fits|file.xisf> [auto|moffat4]");
+            eprintln!("usage: measure_probe <file.fits|file.xisf> [auto|moffat4] [population]");
             std::process::exit(2);
         }
     };
@@ -89,8 +92,16 @@ fn main() {
         Some("moffat4") => PsfModel::Moffat4,
         _ => PsfModel::Auto,
     };
+    // `population` (Plan A Task 13b): the Measure stage's two star populations at the default registration budget.
+    let population = args
+        .next()
+        .as_deref()
+        .map(|a| a == "population")
+        .unwrap_or(false)
+        .then(|| StarPopulation::probe_default(RegistrationConfig::default().max_stars));
     let opts = MeasureOptions {
         psf_model: model,
+        population,
         ..MeasureOptions::default()
     };
 

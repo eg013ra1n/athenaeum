@@ -36,7 +36,8 @@ use super::domain::{self, BackgroundMesh, NoiseModel, NoiseSource};
 use super::fit::{Seed, WIDTH_START_MIN_PEAK_SNR};
 use super::photometry::SaturationPlane;
 use super::robust::median_f64;
-use super::PixelNoise;
+use super::substeps;
+use super::{PixelNoise, Step, SubSteps};
 use crate::integration::stats::{for_each_stratified, mad_about, median_in_place, MAD_TO_SIGMA};
 
 /// `2√(2 ln 2)`: a Gaussian's FWHM per σ.
@@ -693,6 +694,7 @@ pub fn detect(
         pixel_noise,
         None,
         None,
+        None,
     )
 }
 
@@ -713,6 +715,7 @@ pub(crate) fn detect_with(
     pixel_noise: PixelNoise,
     mesh: Option<BackgroundMesh>,
     saturation: Option<&SaturationPlane>,
+    sub: Option<&SubSteps>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
     if plane.len() != w * h || mask.is_some_and(|m| m.len() != w * h) || w < 3 || h < 3 {
         warn!(
@@ -764,6 +767,7 @@ pub(crate) fn detect_with(
             pixel_noise,
             mesh,
             saturation,
+            sub,
         )
     };
     match pool {
@@ -784,7 +788,9 @@ fn detect_on(
     pixel_noise: PixelNoise,
     mesh: BackgroundMesh,
     saturation: Option<&SaturationPlane>,
+    sub: Option<&SubSteps>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
+    let prep_span = substeps::span(sub, Step::DetectPrep);
     let present_at = |i: usize| plane[i].is_finite() && mask.map_or(true, |m| m[i]);
     let present: Option<Vec<bool>> = if (0..w * h).all(present_at) {
         None
@@ -844,14 +850,19 @@ fn detect_on(
     };
     let pass_noise = |fwhm: f64, step: usize| PassNoise::of(map, corr, fwhm, step);
     let none = |field: FieldWidth| (Vec::new(), field, DetectionReport::none());
+    drop(prep_span);
 
     // Pass 1: the 3-px kernel; its readable candidates give the field width.
     let first_filter = MatchedFilter {
         fwhm_px: FIRST_PASS_FWHM_PX,
     };
-    let Some(first) = run_pass(first_filter, &full, &det, pass_noise(FIRST_PASS_FWHM_PX, 1)) else {
+    let pass1_span = substeps::span(sub, Step::DetectPass1);
+    let first = run_pass(first_filter, &full, &det, pass_noise(FIRST_PASS_FWHM_PX, 1));
+    drop(pass1_span);
+    let Some(first) = first else {
         return none(FieldWidth::unmeasured());
     };
+    let widths_span = substeps::span(sub, Step::DetectWidths);
     let first_seeds = sort_and_merge(first.seeds);
     let at: Vec<(f64, f64)> = first_seeds.iter().map(|(s, _)| (s.x, s.y)).collect();
     let reads = readable_widths(plane, w, h, &at, mask);
@@ -866,11 +877,13 @@ fn detect_on(
         WidthEnvelope::at(field.fwhm_px)
     };
     drop(reads);
+    drop(widths_span);
 
     // Pass 2: at the field width, on the 2×2 super-pixel plane from 6 px on.
     let filter = MatchedFilter {
         fwhm_px: field.fwhm_px,
     };
+    let pass2_span = substeps::span(sub, Step::DetectPass2);
     let super_pixel = field.fwhm_px >= SUPER_PIXEL_FROM_PX;
     let (second, seeds) = if super_pixel {
         let (sw, sh) = (w.div_ceil(2), h.div_ceil(2));
@@ -918,8 +931,11 @@ fn detect_on(
         (p, s)
     };
 
+    drop(pass2_span);
+
     // The knot tests (ruling A3) at the field width, on the full-resolution plane, z in units of σ_f there, their
     // bounds at the envelope (A2b): a structure seed is dropped and counted, an extended one kept and flagged.
+    let knots_span = substeps::span(sub, Step::DetectKnots);
     let knot_sigma = match pass_noise(field.fwhm_px, 1) {
         PassNoise::Propagated { map, gain, .. } => KnotSigma::Propagated { map, gain },
         PassNoise::Measured => KnotSigma::Measured(second.sigma_f_measured),
@@ -928,6 +944,7 @@ fn detect_on(
     let verdicts: Vec<KnotVerdict> = seeds
         .par_iter()
         .map(|(s, _)| {
+            let _leaf = substeps::leaf(sub, Step::DetectKnots);
             let sigma = knot_sigma.at(s, w, h, second.sigma_f_measured);
             let m = knot_metrics(&d, present.as_deref(), w, h, s.x, s.y, field.fwhm_px, sigma);
             knot_verdict(
@@ -956,6 +973,7 @@ fn detect_on(
     kept.truncate(max_stars);
     extended.truncate(max_stars);
     filter_snr.truncate(max_stars);
+    drop(knots_span);
     let report = DetectionReport {
         sigma_f: second.sigma_f,
         sigma_f_measured: second.sigma_f_measured,
@@ -1020,7 +1038,7 @@ impl KnotSigma<'_> {
 /// The knot exemption (ruling A3; Task 8's owned range, never a new maximum): the brightest present pixel of the 3×3
 /// about the seed stands within the plateau band of the clip ([`SaturationPlane::near_clip`], the same function the
 /// saturation verdict's near-clip clause calls). No saturation plane (a standalone [`detect`]): no seed is near the clip.
-fn near_clip(
+pub(super) fn near_clip(
     plane: &[f32],
     mask: Option<&[bool]>,
     w: usize,

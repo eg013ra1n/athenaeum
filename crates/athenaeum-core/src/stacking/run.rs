@@ -5335,7 +5335,32 @@ fn persist_measurement(
         // it stays reusable; if it is gone or wrong,
         // `is_fresh`'s own size-on-disk check reports it
         // stale, which is exactly the fallback above.
-        if let Err(e) = fits_artifact::write_fits(&fits_path, plane_fits) {
+        let timed = tracing::enabled!(target: "athenaeum_core::stacking::run", tracing::Level::DEBUG);
+        let (write_t, write_cpu0) = (
+            std::time::Instant::now(),
+            if timed {
+                crate::star_measure::substeps::thread_cpu_ns()
+            } else {
+                0
+            },
+        );
+        let written = fits_artifact::write_fits(&fits_path, plane_fits);
+        // Plan A Task 13b (13-P): the write's wall and this thread's CPU, timers only.
+        if timed {
+            tracing::debug!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                frame_id = frame.frame_id,
+                plane,
+                count = plane_fits.len(),
+                athf_write_us = write_t.elapsed().as_micros() as u64,
+                athf_write_cpu_us = crate::star_measure::substeps::thread_cpu_ns()
+                    .saturating_sub(write_cpu0)
+                    / 1_000,
+                "fits artifact write timed"
+            );
+        }
+        if let Err(e) = written {
             #[cfg(test)]
             FITS_WRITE_FAILURE_LOG
                 .lock()

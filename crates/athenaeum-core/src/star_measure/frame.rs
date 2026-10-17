@@ -134,9 +134,58 @@ impl FrameAggregates {
     /// [`signal_totals`] over every fit and [`frame_shape`] over the ones neither saturated (F-3) nor extended (F-10),
     /// the two calls the stacking Measure stage has always made.
     pub fn of(fits: &[StarFit]) -> FrameAggregates {
-        let totals = signal_totals(fits);
+        Self::of_timed(fits, None)
+    }
+
+    /// [`Self::of`] with the signal totals (and the RCR inside them) timed into `sub` (Plan A Task 13b, 13-P). Timers
+    /// only: the numbers are [`Self::of`]'s.
+    pub fn of_timed(fits: &[StarFit], sub: Option<&super::SubSteps>) -> FrameAggregates {
+        Self::build(fits, None, sub)
+    }
+
+    /// [`Self::of_timed`] with the frame statistic - the residual-weighted FWHM and eccentricity and the F-6 medians -
+    /// read over population (a) alone (Plan A Task 13b; probe / lab only, the stacking Measure runs `Mode::All`):
+    /// `in_statistic[k]` says whether `fits[k]` is in it, and it must be as long as `fits`. The signal totals are
+    /// [`signal_totals`] over the FITTED set (the probe's `fittedTotals`): they are NOT the stacking weight (R13b-11
+    /// found a totals estimator over the complete detection defective). The counts read the accepted fits.
+    pub fn of_population(
+        fits: &[StarFit],
+        in_statistic: &[bool],
+        sub: Option<&super::SubSteps>,
+    ) -> FrameAggregates {
+        debug_assert_eq!(fits.len(), in_statistic.len());
+        Self::build(fits, Some(in_statistic), sub)
+    }
+
+    fn build(
+        fits: &[StarFit],
+        population: Option<&[bool]>,
+        sub: Option<&super::SubSteps>,
+    ) -> FrameAggregates {
+        let totals_of = || signal_totals(fits);
+        let totals = match sub {
+            Some(s) if s.is_on() => {
+                super::substeps::take_rcr();
+                let totals = {
+                    let _t = s.span(super::Step::SignalTotals);
+                    super::substeps::rcr_timing(true, totals_of)
+                };
+                let (wall_ns, cpu_ns) = super::substeps::take_rcr();
+                s.add_wall(super::Step::Rcr, std::time::Duration::from_nanos(wall_ns));
+                s.add_cpu_ns(super::Step::Rcr, cpu_ns);
+                totals
+            }
+            _ => totals_of(),
+        };
         let unsaturated = || fits.iter().filter(|f| !f.flags.saturated());
-        let shape = frame_shape(fits.iter().filter(|f| f.flags.in_statistic()));
+        // The fits the frame statistic counts: neither saturated nor extended, and in population (a) where there is one.
+        let counted = || {
+            fits.iter()
+                .enumerate()
+                .filter(move |(k, f)| f.flags.in_statistic() && population.map_or(true, |p| p[*k]))
+                .map(|(_, f)| f)
+        };
+        let shape = frame_shape(counted());
         FrameAggregates {
             fwhm_px: shape.map(|(f, _)| f),
             eccentricity: shape.map(|(_, e)| e),
@@ -145,16 +194,8 @@ impl FrameAggregates {
             tflux: totals.tflux,
             tmean_flux: totals.tmean_flux,
             mean_flux_rejected: totals.rejected,
-            snr_median: finite_median(
-                fits.iter()
-                    .filter(|f| f.flags.in_statistic())
-                    .map(|f| f.snr),
-            ),
-            hfr_median: finite_median(
-                fits.iter()
-                    .filter(|f| f.flags.in_statistic())
-                    .map(|f| f.hfr),
-            ),
+            snr_median: finite_median(counted().map(|f| f.snr)),
+            hfr_median: finite_median(counted().map(|f| f.hfr)),
         }
     }
 }

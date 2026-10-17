@@ -6,7 +6,10 @@
 //!
 //!   star_probe measure <image.fits> --out <file.jsonl> [--config <json>]
 //!       [--plane all|N] [--debayer RGGB|BGGR|GRBG|GBRG] [--rect x,y,w,h]
-//!       [--paths measure,betas,register,analysis,legacy-analysis]   (default: measure,betas,register)
+//!       [--paths measure,betas,register,analysis,legacy-analysis,population]   (default: measure,betas,register)
+//!       (population = probe / lab only; the stacking Measure runs Mode::All - Plan A Task 13b: the frame-statistic population
+//!        and the star list only, lines `path: "population"`, the frame line adds `population`, `apertureSe` and `fittedTotals`
+//!        (TFlux / TMeanFlux over the fitted set alone; NOT the stacking weight, R13b-11); replaces measure)
 //!       [--betas 2.5,4,6,10]   (legacy-analysis = the analysis path, `path: "analysis"`; any other name exits 1)
 //!       [--domain auto|unit|adu]   (default auto: the P-4 rule; unit never divides, adu always divides by 65535)
 //!       [--diagnostics]   (one `refused` line per seed the measure path did not accept)
@@ -138,6 +141,7 @@ use astroimage::processing::vng::vng_debayer_f32;
 use astroimage::BayerPattern;
 use athenaeum_core::analysis::analyzer::{analyze_frame, build_analyzer};
 use athenaeum_core::analysis::config::AnalysisConfig;
+use athenaeum_core::fits_parser::FitsHeader;
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::geometry::{Linear, LinearKind};
 use athenaeum_core::integration::plane_reader::PlaneReader;
@@ -146,12 +150,11 @@ use athenaeum_core::stacking::config::{SeedSource, StackingConfig};
 use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::measure::{
     gain_from_header, measure_planes_diagnosed, measure_planes_pass1, measure_planes_pass2,
-    MeasureOptions, SeedOverride, ADU_SCALE,
+    MeasureOptions, SeedOverride, StarPopulation, ADU_SCALE,
 };
 use athenaeum_core::stacking::psf_signal::{self, StarFit};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, stars_from_fits};
 use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
-use athenaeum_core::fits_parser::FitsHeader;
 use athenaeum_core::star_measure::{
     self as sm, fit_stars_at, star_snr, ApertureNoise, BetaSource, FitDiagnostics, FitStarsOptions,
     Outcome, PixelNoise, PsfModel, RefusalCounts, RefusalReason, SaturationVerdict,
@@ -544,10 +547,12 @@ fn resolve_paths(paths: &[String]) -> Result<Vec<String>, String> {
     paths
         .iter()
         .map(|p| match p.as_str() {
-            "measure" | "betas" | "register" | "analysis" | "analysis-mode" => Ok(p.clone()),
+            "measure" | "betas" | "register" | "analysis" | "analysis-mode" | "population" => {
+                Ok(p.clone())
+            }
             "legacy-analysis" => Ok("analysis".to_string()),
             o => Err(format!(
-                "unknown path: {o} (known: measure, betas, register, analysis, legacy-analysis, analysis-mode)"
+                "unknown path: {o} (known: measure, betas, register, analysis, legacy-analysis, analysis-mode, population)"
             )),
         })
         .collect()
@@ -599,7 +604,20 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         h = r.3;
     }
     let (opts, det, reg_max, from_config) = load_config(&a.config);
-    let (opts, seed_source) = effective_seeds(opts, a.seeds, a.seed_threshold);
+    let (mut opts, seed_source) = effective_seeds(opts, a.seeds, a.seed_threshold);
+    // `population` (Plan A Task 13b): a probe / lab path (the stacking Measure runs `Mode::All`), fitting the frame-statistic
+    // population and the star list only; its lines carry `path: "population"`. It replaces `measure`.
+    if want("population") {
+        if want("measure") {
+            die("the population path replaces the measure path: name one of them")
+        }
+        opts.population = Some(StarPopulation::probe_default(reg_max));
+    }
+    let measure_path = if want("population") {
+        "population"
+    } else {
+        "measure"
+    };
     let non_finite: usize = planes.iter().flatten().filter(|v| !v.is_finite()).count();
     let selected: Vec<usize> = match a.plane {
         Some(p) if p < planes.len() => vec![p],
@@ -630,7 +648,10 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                           "registerMaxStars": reg_max, "fromConfig": from_config, "rawMax": raw_max });
 
     let mut fits0: Option<Vec<StarFit>> = None;
-    let need_measure = want("measure") || want("betas") || (want("register") && planes.len() == 1);
+    let need_measure = want("measure")
+        || want("population")
+        || want("betas")
+        || (want("register") && planes.len() == 1);
     // F-3 (Q3): a 3-plane input is a debayered colour image. Every plane goes through the run's multi-plane entry
     // (Task 8 fix wave: the cross-plane rule reads every plane's verdicts), whichever planes are selected.
     let colour = planes.len() == 3;
@@ -690,7 +711,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
         };
         let (pm, seeds, diagnostics, wall) = (mp.measurement, mp.seeds, mp.diagnostics, mp.wall_ms);
         let s = ADU_SCALE as f64;
-        if want("measure") {
+        if want("measure") || want("population") {
             // F-10 (Task 10b): the matched filter's knot flag rides on its seed's line (`null` for other detectors), and
             // its filtered SNR (the response over the propagated σ_f) as `filterSnr`, absent when not computed.
             let extended = |i: usize| {
@@ -721,7 +742,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             // F-6 (Task 11): the aperture sum S and its pixel count, from the plane the fits were measured on.
             let working: Vec<f32> = planes[p].iter().map(|v| v * ADU_SCALE).collect();
             for (k, f) in pm.fits.iter().enumerate() {
-                let mut line = fit_line("measure", p, None, f);
+                let mut line = fit_line(measure_path, p, None, f);
                 let (_, ap) = star_snr(&working, w, h, f, None, None, &ApertureNoise::WHITE);
                 if let Some(obj) = line.as_object_mut() {
                     obj.insert("apSum".into(), n_or_null(ap.s / s));
@@ -740,13 +761,22 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 emit(line)
             }
             for d in &diagnostics {
-                if let Some(line) = refused_line("measure", p, d) {
+                if let Some(line) = refused_line(measure_path, p, d) {
                     emit(line)
                 }
             }
-            // The adapter runs every seed (no budget): notSelected and trimmed are 0.
+            // The adapter runs every seed (no budget) unless the populations choose: then `notSelected` is the detected
+            // seeds they left out (their detection record stays), `trimmed` is 0.
+            let not_selected = pm.population.as_ref().map_or(0, |r| seeds.len() - r.fitted);
             let refused = json!({"total": pm.channel.stars_refused, "byReason": pm.channel.refused_by_reason,
-                                 "notSelected": 0, "trimmed": 0});
+                                 "notSelected": not_selected, "trimmed": 0});
+            // Task 13b: what the populations did - the selection counts, (a)'s accepted fits, the share of them that
+            // are merged pairs and `c`'s standard error as the median of the 64 brightest ratios.
+            let population = pm.population.as_ref().map(|r| {
+                json!({"statistic": r.statistic, "list": r.list, "fitted": r.fitted,
+                       "statisticAccepted": r.statistic_accepted, "mergedShare": n_or_null(r.merged_share),
+                       "apertureSe": r.aperture_se.map(n_or_null)})
+            });
             let mostly_saturated = pm
                 .channel
                 .refused_by_reason
@@ -754,12 +784,23 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                 .copied()
                 .unwrap_or(0);
             emit(
-                json!({"kind": "frame", "path": "measure", "plane": p, "beta": pm.channel.beta,
+                json!({"kind": "frame", "path": measure_path, "plane": p, "beta": pm.channel.beta,
                         "betaOwn": pm.channel.beta_own.or((pm.beta_source != BetaSource::Fixed).then_some(pm.channel.beta)),
                         "betaOwnAtCap": pm.channel.beta_own_at_cap,
                         "betaSource": pm.beta_source.name(), "betaSample": pm.beta_source.sample(),
                         "seeds": seeds.len(), "fits": pm.fits.len(), "refused": refused,
-                        "statistic": "residual-weighted mean over the accepted fits not flagged saturated",
+                        "statistic": if pm.population.is_some() {
+                            "residual-weighted mean over population (a)'s accepted fits not flagged saturated"
+                        } else {
+                            "residual-weighted mean over the accepted fits not flagged saturated"
+                        },
+                        "population": population, "apertureSe": pm.aperture_se.map(n_or_null),
+                        "fittedTotals": pm.population.as_ref().map(|_| {
+                            // Task 13b Step 3b: the totals over the accepted fits alone, beside the complete-detection ones (the fallback R13b-1 names)
+                            let t = athenaeum_core::star_measure::signal_totals(&pm.fits);
+                            let u = athenaeum_core::star_measure::ADU_SCALE as f64;
+                            json!({"tflux": n_or_null(t.tflux / u), "tmeanFlux": n_or_null(t.tmean_flux / u), "meanFluxRejected": t.rejected})
+                        }),
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
                         "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
                         "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
@@ -916,7 +957,11 @@ fn raw_scales(image: &Path, clip_arg: Option<f64>) -> Result<(f64, f64, Option<f
         }
     };
     let clip = clip_arg
-        .or_else(|| header.get_f64("DATAMAX").filter(|d| d.is_finite() && *d > 0.0))
+        .or_else(|| {
+            header
+                .get_f64("DATAMAX")
+                .filter(|d| d.is_finite() && *d > 0.0)
+        })
         .unwrap_or(full_scale);
     let gain = header
         .get_f64("EGAIN")
@@ -937,10 +982,15 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
         );
     }
     if a.domain == Domain::Unit {
-        return Err("the analysis-mode path reads the raw file: --domain adu or auto, not unit".into());
+        return Err(
+            "the analysis-mode path reads the raw file: --domain adu or auto, not unit".into(),
+        );
     }
     if a.seeds.is_some_and(|c| c != SeedChoice::Matched) {
-        return Err("the analysis-mode path detects with the matched filter: --seeds matched or none".into());
+        return Err(
+            "the analysis-mode path detects with the matched filter: --seeds matched or none"
+                .into(),
+        );
     }
     let (planes, w, h) = read_planes(&a.image);
     let raw_max = planes
@@ -994,8 +1044,7 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
         },
         "rawMax": raw_max,
     });
-    let file =
-        std::fs::File::create(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
+    let file = std::fs::File::create(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
     let mut out = BufWriter::new(file);
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
     let s = ADU_SCALE as f64;
@@ -1310,6 +1359,42 @@ mod tests {
                 "no star line for {path}"
             );
         }
+    }
+
+    /// Plan A Task 13b: `--paths population` is a probe / lab path (the stacking Measure runs `Mode::All`) - its lines carry
+    /// `path: "population"`, the frame line reports the populations, `notSelected` counts the seeds they left out and
+    /// the F-0 identity holds. It replaces `measure`.
+    #[test]
+    fn the_population_path_reports_the_populations_and_replaces_measure() {
+        let d = tempfile::tempdir().unwrap();
+        let lines = run_paths(
+            d.path(),
+            gaussian_field(240, 240, 6, true),
+            240,
+            240,
+            &["population"],
+        );
+        let frame = lines
+            .iter()
+            .find(|v| v["kind"] == "frame" && v["path"] == "population")
+            .expect("a population frame line");
+        assert!(lines.iter().all(|v| v["path"] != "measure"));
+        let p = &frame["population"];
+        let fitted = p["fitted"].as_u64().unwrap();
+        assert!(
+            fitted > 0 && fitted <= frame["seeds"].as_u64().unwrap(),
+            "{frame}"
+        );
+        assert!(p["statisticAccepted"].as_u64().unwrap() <= p["statistic"].as_u64().unwrap());
+        assert_eq!(
+            frame["fits"].as_u64().unwrap()
+                + frame["refused"]["total"].as_u64().unwrap()
+                + frame["refused"]["notSelected"].as_u64().unwrap(),
+            frame["seeds"].as_u64().unwrap()
+        );
+        assert!(lines
+            .iter()
+            .any(|v| v["kind"] == "star" && v["path"] == "population"));
     }
 
     /// Plan A Task 4 (F-0, ruling F13): with `--diagnostics` every refused seed has a `refused` line, the frame line
@@ -1648,7 +1733,10 @@ mod tests {
         }
     }
 
-    fn amode_frame(dir: &Path, a: impl FnOnce(PathBuf, PathBuf) -> MeasureArgs) -> (Vec<Value>, Value) {
+    fn amode_frame(
+        dir: &Path,
+        a: impl FnOnce(PathBuf, PathBuf) -> MeasureArgs,
+    ) -> (Vec<Value>, Value) {
         let data: Vec<f32> = gaussian_field(256, 256, 0, true)
             .iter()
             .map(|v| (v * 65535.0).round())
@@ -1658,7 +1746,11 @@ mod tests {
         let out = dir.join("p.amode.jsonl");
         cmd_measure(a(img, out.clone())).unwrap();
         let lines = read_lines(&out);
-        let f = lines.iter().find(|v| v["kind"] == "frame").cloned().unwrap();
+        let f = lines
+            .iter()
+            .find(|v| v["kind"] == "frame")
+            .cloned()
+            .unwrap();
         (lines, f)
     }
 
@@ -1671,30 +1763,71 @@ mod tests {
         let (lines, f) = amode_frame(d.path(), |i, o| amode_args(i, o, 16));
         let n = |v: &Value| v.as_u64().unwrap();
         let (b, r) = (&f["budget"], &f["refused"]);
-        assert!(lines.iter().all(|v| v["kind"] != "seed" && v["path"] == "analysis-mode"));
+        assert!(lines
+            .iter()
+            .all(|v| v["kind"] != "seed" && v["path"] == "analysis-mode"));
         assert_eq!(lines.iter().filter(|v| v["kind"] == "frame").count(), 1);
-        assert_eq!(n(&f["fits"]) + n(&r["total"]) + n(&r["notSelected"]) + n(&r["trimmed"]), n(&f["seeds"]));
-        assert_eq!((n(&r["notSelected"]), n(&r["trimmed"])), (n(&b["notSelected"]), n(&b["trimmed"])));
+        assert_eq!(
+            n(&f["fits"]) + n(&r["total"]) + n(&r["notSelected"]) + n(&r["trimmed"]),
+            n(&f["seeds"])
+        );
+        assert_eq!(
+            (n(&r["notSelected"]), n(&r["trimmed"])),
+            (n(&b["notSelected"]), n(&b["trimmed"]))
+        );
         assert_eq!(n(&b["candidates"]) + n(&b["notSelected"]), n(&f["seeds"]));
         assert_eq!(n(&b["kept"]), n(&f["fits"]));
-        assert!(n(&f["fits"]) <= 16 && n(&b["notSelected"]) > 0 && n(&b["trimmed"]) > 0, "{f}");
+        assert!(
+            n(&f["fits"]) <= 16 && n(&b["notSelected"]) > 0 && n(&b["trimmed"]) > 0,
+            "{f}"
+        );
         assert_eq!(b["cellsCovered"], b["cellsWithStars"]);
-        assert_eq!(lines.iter().filter(|v| v["kind"] == "refused").count() as u64, n(&f["seeds"]) - n(&f["fits"]));
-        assert_eq!(lines.iter().filter(|v| v["reason"] == "notSelected").count() as u64, n(&b["notSelected"]));
+        assert_eq!(
+            lines.iter().filter(|v| v["kind"] == "refused").count() as u64,
+            n(&f["seeds"]) - n(&f["fits"])
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|v| v["reason"] == "notSelected")
+                .count() as u64,
+            n(&b["notSelected"])
+        );
         let m = &f["options"]["measure"];
-        assert_eq!((m["seedSource"].as_str(), m["seedThreshold"].as_f64()), (Some("matchedFilter"), Some(6.0)));
-        assert_eq!((m["psfModel"].as_str(), m["budget"].as_u64()), (Some("moffat4"), Some(16)));
-        assert_eq!((f["beta"].as_f64(), f["betaSource"].as_str()), (Some(4.0), Some("fixed")));
-        assert!(f.get("betaOwn").is_none(), "R12-1: no own beta under Moffat 4");
-        assert_eq!((f["domain"].as_str(), f["conversion"].as_str()), (Some("adu"), Some("none")));
+        assert_eq!(
+            (m["seedSource"].as_str(), m["seedThreshold"].as_f64()),
+            (Some("matchedFilter"), Some(6.0))
+        );
+        assert_eq!(
+            (m["psfModel"].as_str(), m["budget"].as_u64()),
+            (Some("moffat4"), Some(16))
+        );
+        assert_eq!(
+            (f["beta"].as_f64(), f["betaSource"].as_str()),
+            (Some(4.0), Some("fixed"))
+        );
+        assert!(
+            f.get("betaOwn").is_none(),
+            "R12-1: no own beta under Moffat 4"
+        );
+        assert_eq!(
+            (f["domain"].as_str(), f["conversion"].as_str()),
+            (Some("adu"), Some("none"))
+        );
     }
 
     #[test]
     fn analysis_mode_with_psf_auto_reports_the_fitted_beta() {
         let d = tempfile::tempdir().unwrap();
-        let (_, f) = amode_frame(d.path(), |i, o| MeasureArgs { psf: Some(PsfModel::Auto), ..amode_args(i, o, 16) });
+        let (_, f) = amode_frame(d.path(), |i, o| MeasureArgs {
+            psf: Some(PsfModel::Auto),
+            ..amode_args(i, o, 16)
+        });
         assert_eq!(f["options"]["measure"]["psfModel"], "auto");
-        assert!(matches!(f["betaSource"].as_str(), Some("fitted" | "fallback")), "{f}");
+        assert!(
+            matches!(f["betaSource"].as_str(), Some("fitted" | "fallback")),
+            "{f}"
+        );
         assert!(f["beta"].as_f64().unwrap().is_finite());
     }
 
@@ -1705,15 +1838,37 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let field = gaussian_field(128, 128, 0, true);
         let raw: Vec<f32> = field.iter().map(|v| (v * 65535.0).round()).collect();
-        let (ri, ui, out) = (d.path().join("r.fits"), d.path().join("u.fits"), d.path().join("o.jsonl"));
+        let (ri, ui, out) = (
+            d.path().join("r.fits"),
+            d.path().join("u.fits"),
+            d.path().join("o.jsonl"),
+        );
         write_fits_f32(&ri, 128, 128, 1, &raw, &[]).unwrap();
         write_fits_f32(&ui, 128, 128, 1, &field, &[]).unwrap();
         let a = || amode_args(ri.clone(), out.clone(), 16);
         for (args, want) in [
-            (MeasureArgs { paths: vec!["analysis-mode".into(), "measure".into()], ..a() }, "runs alone"),
-            (MeasureArgs { domain: Domain::Unit, ..a() }, "raw"),
+            (
+                MeasureArgs {
+                    paths: vec!["analysis-mode".into(), "measure".into()],
+                    ..a()
+                },
+                "runs alone",
+            ),
+            (
+                MeasureArgs {
+                    domain: Domain::Unit,
+                    ..a()
+                },
+                "raw",
+            ),
             (amode_args(ui.clone(), out.clone(), 16), "raw-domain"),
-            (MeasureArgs { seeds: Some(SeedChoice::Peak), ..a() }, "matched filter"),
+            (
+                MeasureArgs {
+                    seeds: Some(SeedChoice::Peak),
+                    ..a()
+                },
+                "matched filter",
+            ),
             (MeasureArgs { clip: None, ..a() }, "--clip"),
         ] {
             let err = cmd_measure(args).unwrap_err();
@@ -1742,7 +1897,11 @@ mod tests {
         cmd_measure(amode_args(img, out.clone(), 16)).unwrap();
         let lines = read_lines(&out);
         let f = lines.iter().find(|v| v["kind"] == "frame").unwrap();
-        assert_eq!(f["options"]["measure"]["gainEPerAdu"].as_f64(), Some(0.5), "{f}");
+        assert_eq!(
+            f["options"]["measure"]["gainEPerAdu"].as_f64(),
+            Some(0.5),
+            "{f}"
+        );
         let g = f["snrGain"].as_f64().expect("snrGain with an EGAIN header");
         assert!((g - 0.5 * 65535.0).abs() < 1e-6, "snrGain {g}");
     }
@@ -1752,18 +1911,36 @@ mod tests {
     #[test]
     fn analysis_mode_refuses_rect_debayer_config_and_psf_beta() {
         let d = tempfile::tempdir().unwrap();
-        let raw: Vec<f32> = gaussian_field(128, 128, 0, true).iter().map(|v| (v * 65535.0).round()).collect();
+        let raw: Vec<f32> = gaussian_field(128, 128, 0, true)
+            .iter()
+            .map(|v| (v * 65535.0).round())
+            .collect();
         let (img, out) = (d.path().join("r.fits"), d.path().join("o.jsonl"));
         write_fits_f32(&img, 128, 128, 1, &raw, &[]).unwrap();
         let a = || amode_args(img.clone(), out.clone(), 16);
         for args in [
-            MeasureArgs { rect: Some((0, 0, 64, 64)), ..a() },
-            MeasureArgs { debayer: Some("RGGB".into()), ..a() },
-            MeasureArgs { config: Some(d.path().join("c.json")), ..a() },
-            MeasureArgs { psf_beta: Some(3.0), ..a() },
+            MeasureArgs {
+                rect: Some((0, 0, 64, 64)),
+                ..a()
+            },
+            MeasureArgs {
+                debayer: Some("RGGB".into()),
+                ..a()
+            },
+            MeasureArgs {
+                config: Some(d.path().join("c.json")),
+                ..a()
+            },
+            MeasureArgs {
+                psf_beta: Some(3.0),
+                ..a()
+            },
         ] {
             let err = cmd_measure(args).unwrap_err();
-            assert!(err.contains("no --rect, --debayer, --config or --psf-beta"), "{err}");
+            assert!(
+                err.contains("no --rect, --debayer, --config or --psf-beta"),
+                "{err}"
+            );
             assert!(!out.exists(), "no output file for a refused invocation");
         }
     }
@@ -1799,18 +1976,57 @@ mod tests {
     #[test]
     fn raw_scales_reads_full_scale_clip_and_gain_from_the_header() {
         let d = tempfile::tempdir().unwrap();
-        let h = |name: &str, bitpix, extra: &[(&str, &str)]| header_file(d.path(), name, &raw_header(bitpix, extra));
-        let u16f = h("a.fits", 16, &[("BZERO", "32768"), ("DATAMAX", "60000"), ("EGAIN", "0.8")]);
-        assert_eq!(raw_scales(&u16f, None).unwrap(), (60000.0, 65535.0, Some(0.8)));
-        assert_eq!(raw_scales(&u16f, Some(50000.0)).unwrap().0, 50000.0, "--clip beats DATAMAX");
-        let plain = h("b.fits", 16, &[("BZERO", "32768"), ("DATAMAX", "0"), ("EGAIN", "-1")]);
-        assert_eq!(raw_scales(&plain, None).unwrap(), (65535.0, 65535.0, None), "DATAMAX 0 and EGAIN <= 0 are unset");
-        assert_eq!(raw_scales(&h("c.fits", 16, &[]), None).unwrap().1, 32767.0, "signed 16-bit");
-        assert_eq!(raw_scales(&h("d.fits", 16, &[("BZERO", "1000")]), None).unwrap().1, 32767.0, "offset-only BZERO");
+        let h = |name: &str, bitpix, extra: &[(&str, &str)]| {
+            header_file(d.path(), name, &raw_header(bitpix, extra))
+        };
+        let u16f = h(
+            "a.fits",
+            16,
+            &[("BZERO", "32768"), ("DATAMAX", "60000"), ("EGAIN", "0.8")],
+        );
+        assert_eq!(
+            raw_scales(&u16f, None).unwrap(),
+            (60000.0, 65535.0, Some(0.8))
+        );
+        assert_eq!(
+            raw_scales(&u16f, Some(50000.0)).unwrap().0,
+            50000.0,
+            "--clip beats DATAMAX"
+        );
+        let plain = h(
+            "b.fits",
+            16,
+            &[("BZERO", "32768"), ("DATAMAX", "0"), ("EGAIN", "-1")],
+        );
+        assert_eq!(
+            raw_scales(&plain, None).unwrap(),
+            (65535.0, 65535.0, None),
+            "DATAMAX 0 and EGAIN <= 0 are unset"
+        );
+        assert_eq!(
+            raw_scales(&h("c.fits", 16, &[]), None).unwrap().1,
+            32767.0,
+            "signed 16-bit"
+        );
+        assert_eq!(
+            raw_scales(&h("d.fits", 16, &[("BZERO", "1000")]), None)
+                .unwrap()
+                .1,
+            32767.0,
+            "offset-only BZERO"
+        );
         assert_eq!(raw_scales(&h("e.fits", 8, &[]), None).unwrap().1, 255.0);
-        assert_eq!(raw_scales(&h("f.fits", 8, &[("BZERO", "-128")]), None).unwrap().1, 127.0);
+        assert_eq!(
+            raw_scales(&h("f.fits", 8, &[("BZERO", "-128")]), None)
+                .unwrap()
+                .1,
+            127.0
+        );
         let fl = h("g.fits", -32, &[]);
         assert!(raw_scales(&fl, None).unwrap_err().contains("--clip"));
-        assert_eq!(raw_scales(&fl, Some(4095.0)).unwrap(), (4095.0, 4095.0, None));
+        assert_eq!(
+            raw_scales(&fl, Some(4095.0)).unwrap(),
+            (4095.0, 4095.0, None)
+        );
     }
 }

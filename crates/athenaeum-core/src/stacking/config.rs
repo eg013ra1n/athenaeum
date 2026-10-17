@@ -317,6 +317,8 @@ impl MeasurementConfig {
             // Not a config field: a run picks the detector, not its dials
             // (M4c Task 0, ruling R-M4c-11).
             structure: MeasureOptions::default().structure,
+            // The run fits every seed (route A); only the probes opt into the two populations.
+            population: None,
         }
     }
 }
@@ -2077,7 +2079,8 @@ mod tests {
         // A decoded preset / plan override never passes resolve_config; the
         // shared resolver must clamp both seed dials there too.
         let mut cfg: StackingConfig =
-            serde_json::from_str(r#"{"measurement":{"seedThreshold":0.5,"detectionSigma":0.1}}"#).unwrap();
+            serde_json::from_str(r#"{"measurement":{"seedThreshold":0.5,"detectionSigma":0.1}}"#)
+                .unwrap();
         resolve_ln_fields(&mut cfg);
         assert_eq!(cfg.measurement.seed_threshold, 2.0);
         assert_eq!(cfg.measurement.detection_sigma, MIN_DETECTION_SIGMA);

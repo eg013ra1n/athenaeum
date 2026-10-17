@@ -743,8 +743,16 @@ pub(crate) fn ring_sky(
             (i64::MAX, i64::MIN)
         };
         let row = py as usize * w;
-        let mut px = x0;
-        while px <= x1 {
+        // (The margin holds while r_out < ~1e7 px, far beyond any ring: 10-12 F.)
+        // The row's pixels past the outer circle (one pixel of margin) are never read either: each one fails the
+        // `d2 > r_out2` test below, so the ring's set and order do not change.
+        let reach = (r_out2 - dy2).sqrt() + 1.0;
+        let (row_x0, row_x1) = (
+            x0.max((x - reach).floor() as i64),
+            x1.min((x + reach).ceil() as i64),
+        );
+        let mut px = row_x0;
+        while px <= row_x1 {
             if px >= skip_lo && px <= skip_hi {
                 px = skip_hi + 1;
                 continue;
@@ -787,7 +795,8 @@ pub(crate) fn ring_sky(
 /// the ring width `F` returned: the caller's `given` (LN's pair-common arm, [`super::FitStarsOptions::ring_fwhm`];
 /// one that is not a positive number is refused with a `warn!`), else the plane's frame FWHM over the kept fits
 /// neither saturated nor extended ([`super::frame::frame_shape`], the `FrameAggregates::fwhm_px` statistic). The
-/// seeds' `3F` discs are built once ([`SeedMask`]). A fit without a ring (fewer than 8 present pixels, or no `F`: no
+/// seeds' `3F` discs are built once ([`SeedMask`]). `statistic` (Plan A Task 13b): per fit-call seed, whether the seed is in
+/// the frame-statistic population (a) - the plane's own `F` then reads those fits alone; `None` = every fit. A fit without a ring (fewer than 8 present pixels, or no `F`: no
 /// fit in the statistic) keeps NaN, NaN, 0 and is counted in the returned `missing`. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ring_skies(
@@ -799,7 +808,9 @@ pub(crate) fn ring_skies(
     seeds: &[Seed],
     kept: &mut [(usize, StarFit)],
     given: Option<f64>,
+    statistic: Option<&[bool]>,
     pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+    sub: Option<&super::SubSteps>,
 ) -> (Option<f64> /* F */, usize /* missing */) {
     for (_, f) in kept.iter_mut() {
         f.sky_ring = f64::NAN;
@@ -812,6 +823,7 @@ pub(crate) fn ring_skies(
     let own = || {
         super::frame::frame_shape(
             kept.iter()
+                .filter(|(seed, _)| statistic.map_or(true, |s| s[*seed]))
                 .map(|(_, f)| f)
                 .filter(|f| f.flags.in_statistic()),
         )
@@ -840,6 +852,7 @@ pub(crate) fn ring_skies(
     let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring);
     let mut body = || {
         kept.par_iter_mut().for_each(|(_, f)| {
+            let _leaf = super::substeps::leaf(sub, super::Step::RingSky);
             if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
                 f.sky_ring = r.mean;
                 f.sky_ring_sigma = r.sigma;
@@ -972,6 +985,11 @@ pub(crate) fn unverdicted_clip_range(
 /// with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
 /// per-plane events count the screened candidates (`skipped`). `own[k]` (Task 12, the budget fits a subset of `seeds`) is
 /// the index into `seeds` of fit seed `k`, the one the isolation test skips; `None` = the identity.
+///
+/// `population` (Plan A Task 13b, R13b-6): only fits of population (a) are candidates (its screens, the ring's `F` = (a)'s
+/// FWHM) and `c` is the median of the 64 brightest of them by model flux (ties by seed index); there is no per-stratum
+/// cap (the faint strata's ratios are a fit-bias, not noise). The third return value is the median's standard error, `1.2533 * 1.4826 * MAD / sqrt(n)`, printed in the debug line and
+/// reported on the frame line (`None` when `c` was not measured).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -986,13 +1004,14 @@ pub(crate) fn aperture_correction(
     saturation: Option<&SaturationPlane>,
     full_scale: Option<f64>,
     footprint: Option<&[bool]>,
-) -> (Option<f64>, usize) {
+    population: Option<super::population::PopulationView<'_>>,
+) -> (Option<f64>, usize, Option<f64>) {
     if fits.is_empty() {
         tracing::debug!(
             count = seeds.len(),
             "aperture correction: no fits on the plane; none measured"
         );
-        return (None, 0);
+        return (None, 0, None);
     }
     let clip_range = saturation.map_or_else(
         || unverdicted_clip_range(data, mask, w, h, full_scale),
@@ -1026,7 +1045,9 @@ pub(crate) fn aperture_correction(
             // Neither saturated (F-3) nor extended (F-10, P3): a knot is not a star whose growth curve `c` reads.
             let mut candidates: Vec<(usize, &StarFit, f64)> = fits
                 .iter()
-                .filter(|(_, f)| f.flags.in_statistic())
+                .filter(|(i, f)| {
+                    f.flags.in_statistic() && population.map_or(true, |p| p.statistic[*i])
+                })
                 .map(|(i, f)| (*i, f, model_flux_in_fwtm(f)))
                 .filter(|&(_, _, m)| m.is_finite() && m > 0.0)
                 .collect();
@@ -1070,17 +1091,23 @@ pub(crate) fn aperture_correction(
             fwhm_px = ring_fwhm,
             "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
         );
-        return (None, n);
+        return (None, n, None);
     }
     let c = super::robust::median_f64(&mut ratios);
+    // The median's standard error from the ratios' own spread (population (a) reports it; the rule is the same for any
+    // set of ratios).
+    let mut dev: Vec<f64> = ratios.iter().map(|r| (r - c).abs()).collect();
+    let mad = super::robust::median_f64(&mut dev);
+    let se = 1.2533 * 1.4826 * mad / (n as f64).sqrt();
     tracing::debug!(
         count = n,
         skipped = screened,
         aperture_correction = c,
+        aperture_se = se,
         fwhm_px = ring_fwhm,
         "aperture correction measured"
     );
-    (Some(c), n)
+    (Some(c), n, Some(se))
 }
 
 /// The aperture SNR's radius per star FWHM (PA-11's aperture, unchanged): `r_ap = max(1.5 * fwhm, 3)` px about the
@@ -1319,33 +1346,59 @@ pub fn hfr(
     if y1 < y0 || x1 < x0 {
         return f64::NAN;
     }
-    let mut px: Vec<(f64, f64)> = Vec::new();
-    for py in y0 as usize..=y1 as usize {
-        let dy2 = (py as f64 - f.y).powi(2);
-        for pxl in x0 as usize..=x1 as usize {
-            let d2 = (pxl as f64 - f.x).powi(2) + dy2;
-            let i = py * w + pxl;
-            if d2 <= r2 && data[i].is_finite() && mask.map_or(true, |m| m[i]) {
-                px.push((d2, data[i] as f64 - f.sky_ring));
+    // The pixels in order of distance, ties in row-major order — the order of a stable sort by `d²`. The scan stops at
+    // the pixel where the cumulative sum reaches half the signal (typically a small share of the circle), so the order
+    // is produced lazily: the keys `(d², push index)` are a strict total order, and each round selects the next chunk of
+    // smallest keys out of the rest and sorts only that chunk. The same pixels are summed in the same order.
+    HFR_SCRATCH.with(|cell| {
+        let mut px = cell.borrow_mut();
+        px.clear();
+        for py in y0 as usize..=y1 as usize {
+            let dy2 = (py as f64 - f.y).powi(2);
+            for pxl in x0 as usize..=x1 as usize {
+                let d2 = (pxl as f64 - f.x).powi(2) + dy2;
+                let i = py * w + pxl;
+                if d2 <= r2 && data[i].is_finite() && mask.map_or(true, |m| m[i]) {
+                    let seq = px.len() as u32;
+                    px.push((d2, seq, data[i] as f64 - f.sky_ring));
+                }
             }
         }
-    }
-    // A stable sort: pixels at one distance keep their row-major order.
-    px.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut cum = 0.0f64;
-    for (k, &(d2, v)) in px.iter().enumerate() {
-        let before = cum;
-        cum += v;
-        if cum >= target {
-            if k == 0 {
-                return d2.sqrt();
+        let by_distance =
+            |a: &(f64, u32, f64), b: &(f64, u32, f64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+        let len = px.len();
+        let (mut cum, mut prev_d2) = (0.0f64, f64::NAN);
+        let (mut start, mut chunk) = (0usize, 48usize);
+        while start < len {
+            let end = len.min(start + chunk);
+            if end < len {
+                px[start..].select_nth_unstable_by(end - start - 1, by_distance);
             }
-            let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
-            let d_prev = px[k - 1].0.sqrt();
-            return d_prev + frac * (d2.sqrt() - d_prev);
+            px[start..end].sort_unstable_by(by_distance);
+            for k in start..end {
+                let (d2, _, v) = px[k];
+                let before = cum;
+                cum += v;
+                if cum >= target {
+                    if k == 0 {
+                        return d2.sqrt();
+                    }
+                    let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
+                    let d_prev = prev_d2.sqrt();
+                    return d_prev + frac * (d2.sqrt() - d_prev);
+                }
+                prev_d2 = d2;
+            }
+            start = end;
+            chunk *= 2;
         }
-    }
-    f64::NAN
+        f64::NAN
+    })
+}
+
+thread_local! {
+    /// [`hfr`]'s pixel scratch, one per thread: cleared at every call, so no value crosses calls.
+    static HFR_SCRATCH: std::cell::RefCell<Vec<(f64, u32, f64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -2739,6 +2792,103 @@ mod snr_hfr_tests {
         }
     }
 
+    /// The pre-Task-13b-1a `hfr` (a full stable sort of the circle's pixels), verbatim, as the oracle of
+    /// `hfr_is_bit_equal_to_the_full_sort`.
+    fn hfr_reference(
+        data: &[f32],
+        w: usize,
+        h: usize,
+        f: &StarFit,
+        ring_fwhm: f64,
+        mask: Option<&[bool]>,
+    ) -> f64 {
+        let r = GROWTH_RADIUS_PER_FWHM * ring_fwhm;
+        let target = 0.5 * f.signal;
+        if !(f.sky_ring.is_finite()
+            && f.x.is_finite()
+            && f.y.is_finite()
+            && r.is_finite()
+            && r > 0.0
+            && target.is_finite()
+            && target > 0.0
+            && w > 0
+            && h > 0)
+        {
+            return f64::NAN;
+        }
+        let r2 = r * r;
+        let (y0, y1) = (
+            (f.y - r).ceil().max(0.0),
+            (f.y + r).floor().min((h - 1) as f64),
+        );
+        let (x0, x1) = (
+            (f.x - r).ceil().max(0.0),
+            (f.x + r).floor().min((w - 1) as f64),
+        );
+        if y1 < y0 || x1 < x0 {
+            return f64::NAN;
+        }
+        let mut px: Vec<(f64, f64)> = Vec::new();
+        for py in y0 as usize..=y1 as usize {
+            let dy2 = (py as f64 - f.y).powi(2);
+            for pxl in x0 as usize..=x1 as usize {
+                let d2 = (pxl as f64 - f.x).powi(2) + dy2;
+                let i = py * w + pxl;
+                if d2 <= r2 && data[i].is_finite() && mask.map_or(true, |m| m[i]) {
+                    px.push((d2, data[i] as f64 - f.sky_ring));
+                }
+            }
+        }
+        px.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cum = 0.0f64;
+        for (k, &(d2, v)) in px.iter().enumerate() {
+            let before = cum;
+            cum += v;
+            if cum >= target {
+                if k == 0 {
+                    return d2.sqrt();
+                }
+                let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
+                let d_prev = px[k - 1].0.sqrt();
+                return d_prev + frac * (d2.sqrt() - d_prev);
+            }
+        }
+        f64::NAN
+    }
+
+    /// Task 13b 1a: the lazily ordered `hfr` returns the full-sort value to the bit, across signals that reach half
+    /// within the first chunk, in later chunks and never, with a masked and a NaN-holed plane and edge stars.
+    #[test]
+    fn hfr_is_bit_equal_to_the_full_sort() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        let (w, h) = (240usize, 330usize);
+        let mask: Vec<bool> = (0..w * h).map(|i| i % 7 != 3).collect();
+        let mut holed = data.clone();
+        for i in (0..w * h).step_by(11) {
+            holed[i] = f32::NAN;
+        }
+        let mut checked = 0;
+        for base in &out.fits {
+            for (dx, dy) in [(0.0, 0.0), (-base.x + 3.0, 0.0), (0.0, -base.y + 2.5)] {
+                let mut f = *base;
+                f.x += dx;
+                f.y += dy;
+                for scale in [0.002, 0.05, 0.3, 0.6, 1.0, 1.4, 2.2, 6.0] {
+                    f.signal = base.signal * scale;
+                    for r in [ring, 0.4 * ring, 1.7 * ring] {
+                        for (d, m) in [(&data, None), (&data, Some(&mask[..])), (&holed, None)] {
+                            let (a, b) = (hfr(d, w, h, &f, r, m), hfr_reference(d, w, h, &f, r, m));
+                            assert_eq!(a.to_bits(), b.to_bits(), "scale {scale} r {r}: {a} vs {b}");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 500);
+    }
+
     #[test]
     fn hfr_is_nan_when_the_5f_circle_holds_less_than_half_the_signal() {
         let (data, out) = gaussian_stars();
@@ -2847,8 +2997,8 @@ mod snr_hfr_tests {
                 None,
                 &crate::star_measure::domain::background_mesh(&data, n, n, None, true),
             )
-                .expect("the read")
-                .rho();
+            .expect("the read")
+            .rho();
             star_snr(
                 &data,
                 n,

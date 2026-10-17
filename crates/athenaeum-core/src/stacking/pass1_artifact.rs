@@ -201,8 +201,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Pass1Head, Pass1Body), Pass1Artifa
         return Err(Pass1ArtifactError::Truncated("the head".to_string()));
     }
     let head = decode_head(&bytes[PREFIX_LEN..head_end], head_sum)?;
-    let body_len =
-        u64::from_le_bytes(bytes[head_end..head_end + 8].try_into().expect("8-byte slice"));
+    let body_len = u64::from_le_bytes(
+        bytes[head_end..head_end + 8]
+            .try_into()
+            .expect("8-byte slice"),
+    );
     let body_start = head_end + 8;
     let expected = (body_start as u64)
         .checked_add(body_len)
@@ -234,6 +237,18 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Pass1Head, Pass1Body), Pass1Artifa
 /// reads back as a refused artifact, never a wrong answer). The records are serialised through a borrowed view, never
 /// cloned. Returns the bytes written.
 pub fn write_pass1(path: &Path, pass1: &FramePass1) -> std::io::Result<u64> {
+    if let Some(plane) = pass1
+        .body()
+        .planes
+        .iter()
+        .position(|r| !r.prep.is_storable())
+    {
+        let e = std::io::Error::other(
+            "a Mode::Population plane record cannot be stored: its per-seed records are per fitted seed",
+        );
+        tracing::error!(path = %path.display(), plane, error = %e, "first-pass artifact refused");
+        return Err(e);
+    }
     let bytes = encode(&pass1.head(), &pass1.body())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -430,7 +445,10 @@ mod tests {
             b[at] ^= 0x01;
             b
         };
-        assert!(matches!(decode(&flip(0)), Err(Pass1ArtifactError::BadMagic { .. })));
+        assert!(matches!(
+            decode(&flip(0)),
+            Err(Pass1ArtifactError::BadMagic { .. })
+        ));
         assert!(matches!(
             decode(&flip(4)),
             Err(Pass1ArtifactError::BadVersion { found }) if found == PASS1_ARTIFACT_VERSION ^ 1
@@ -455,11 +473,45 @@ mod tests {
             decode(&good[..good.len() - 9]),
             Err(Pass1ArtifactError::Truncated(_))
         ));
-        assert!(matches!(decode(&good[..10]), Err(Pass1ArtifactError::Truncated(_))));
+        assert!(matches!(
+            decode(&good[..10]),
+            Err(Pass1ArtifactError::Truncated(_))
+        ));
         let mut longer = good.clone();
         longer.push(0);
-        assert!(matches!(decode(&longer), Err(Pass1ArtifactError::Truncated(_))));
+        assert!(matches!(
+            decode(&longer),
+            Err(Pass1ArtifactError::Truncated(_))
+        ));
         assert!(matches!(decode(&[]), Err(Pass1ArtifactError::Truncated(_))));
+    }
+
+    /// Plan A Task 13b review (M1): a first pass run under `Mode::Population` keeps one verdict record per FITTED seed
+    /// and does not store its population, so the artifact refuses to write it (a read-back would index the records by
+    /// the wrong seeds). The stacking Measure runs `Mode::All`, which writes as always.
+    #[test]
+    fn a_population_first_pass_is_refused_not_stored() {
+        use crate::stacking::measure::StarPopulation;
+        let dir = tempfile::tempdir().unwrap();
+        let path = frames(dir.path()).remove(0);
+        let artifact = dir.path().join("mono.athm");
+        let opts = MeasureOptions {
+            population: Some(StarPopulation::probe_default(2000)),
+            ..MeasureOptions::default()
+        };
+        let pass1 = measure_frame_pass1(&path, &opts, None, &AtomicBool::new(false)).unwrap();
+        let err =
+            write_pass1(&artifact, &pass1).expect_err("a population record must not be stored");
+        assert!(err.to_string().contains("Population"), "{err}");
+        assert!(!artifact.exists());
+        let all = measure_frame_pass1(
+            &path,
+            &MeasureOptions::default(),
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        write_pass1(&artifact, &all).unwrap();
     }
 
     /// R11c-5 step (0): the head is read without the body — a corrupt body leaves it `Ok` while the whole read says
@@ -481,7 +533,11 @@ mod tests {
         let at = good.len() - 20;
         body_flipped[at] ^= 0x40;
         std::fs::write(&artifact, &body_flipped).unwrap();
-        assert_eq!(read_pass1_head(&artifact).unwrap(), head, "the body is not read");
+        assert_eq!(
+            read_pass1_head(&artifact).unwrap(),
+            head,
+            "the body is not read"
+        );
         assert!(matches!(
             read_pass1(&artifact, &path, &opts),
             Err(Pass1ArtifactError::Checksum)

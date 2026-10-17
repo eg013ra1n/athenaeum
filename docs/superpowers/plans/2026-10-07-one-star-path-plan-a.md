@@ -5713,7 +5713,7 @@ ruling (owner: «если что спрашивай у fable»), recorded in `ta
 overturn it in the morning. (3) Push is allowed (owner: «пуш разрешаю тоже»): code reaches the runner through GitLab
 `origin` work branches, and Step 6 pushes `one-star-path` after the full `--all-targets` re-gate.
 
-- [ ] **Step 0 — baseline and profile (dev Mac; sonnet; ≈ 3 h).** 13b-P on top of HEAD (13-P included, amendment 1):
+- [x] **Step 0 — baseline and profile (dev Mac; sonnet; ≈ 3 h).** 13b-P on top of HEAD (13-P included, amendment 1):
   additive `debug!` timers (wall
   and thread CPU) for every untimed sub-step — working copies, `sky_level`, `saturation_plane` with its queue wait, mesh statistics
   against map evaluation, MRS layers against its serial loops, the detection passes, `signal_totals`, ring sky, `c`, SNR /
@@ -5723,29 +5723,29 @@ overturn it in the morning. (3) Push is allowed (owner: «пуш разреша�
   closes their own ERP instance first); one H Measure-only run on a set 204 clone at 5836a970 with 13b-P (CPU-s,
   per-sub-step means). Output: the projection table (each lever's measured share against the re-timed ERP). **STOP S1**
   if it misses with every in-bounds lever at its target.
-- [ ] **Step 1 — the bit-identical items (rust-engineer sonnet; ≈ 3 h; review opus).** `rcr` O(n) per removal (a
+- [x] **Step 1 — the bit-identical items (rust-engineer sonnet; ≈ 3 h; review opus).** `rcr` O(n) per removal (a
   property test against the old implementation on random and real vectors), read→working fusion with the native sky
   sample, `d` fused into the first filter pass, mesh / MRS / detection buffer reuse, SNR / HFR / LM scratch reuse (the
   rustafits LM's four allocations only if Step 0 shows malloc ≥ 5 % of LM time — then a new entry point, F7). Proof
   (haiku): `--measure-identity` bar 1 on M42 and set 204 (OSC 105 + mono 92) 0 / 0; the runner: `probe_parity` on the lab
   corpus 0 moved. Single-thread re-time of the three planes.
-- [ ] **Step 2 — Fable rules** the PSFSW totals estimator and confirms the (a) rule set (N, band, strata, `c`).
-- [ ] **Step 3 — populations (rust-engineer sonnet; ≈ 5 h; review opus).** `population.rs`, `Mode::Population` through
+- [x] **Step 2 — Fable rules** the PSFSW totals estimator and confirms the (a) rule set (N, band, strata, `c`).
+- [x] **Step 3 — populations (rust-engineer sonnet; ≈ 5 h; review opus).** `population.rs`, `Mode::Population` through
   the two passes, `Mode::Budget` on the shared rank, `signal_totals_complete`, the star-count consumers, versions,
   `--paths population`. Gates: `star_measure::`, `stacking::`, `star_probe`, `check --all-targets`,
   `--no-default-features`; the registration identity and the β identity on set 204 (STOP S2 on a miss after the one
   factor raise). The runner (sonnet, judgment): star-lab cycle `t13b-pop` — noreg against the Task 12 base with the spec
   §8 tolerance rows, cumulative report; Analysis rows B1 / B2 re-based.
-- [ ] **Step 4 — the measured remaining gap (rust-engineer sonnet; ≈ 3 h).** Only as far as Step 3's re-time leaves a gap:
+- [x] **Step 4 — the measured remaining gap (rust-engineer sonnet; ≈ 3 h).** Only as far as Step 3's re-time leaves a gap:
   numeric whole-plane items (separable map evaluation; a map evaluated only where read), each with its tolerance row and
   master-level check; Measure frame workers scheduled as pool tasks if Step 0 showed throughput < 85 % of the core
   ceiling. A miss after these: STOP S3 with the numbers (never tuned toward a row).
-- [ ] **Step 5 — acceptance (dev Mac; sonnet judgment run; ≈ 5 h).** Measure-only brackets H N H N H N on clones of
+- [x] **Step 5 — acceptance (dev Mac; sonnet judgment run; ≈ 5 h).** Measure-only brackets H N H N H N on clones of
   `tierA-lnB-f1` run 5, `lnB-runB-f1` run 6, `hc11B-f1` run 5 (before reference pinned `manual`, `twoPass = false`; H =
   5836a970); Analysis B3 (Task 12 bracket (b)); the set 204 quality run N from Measure on a clone, against
   `starA-s204` read-only as H (never modified). Prints: per-plane means and medians, CPU-s per plane, (a)'s merged
   share, fitted counts.
-- [ ] **Step 6 — review and record (opus review, Fable if it struggles; sonnet docs; ≈ 2 h).** README R-OSP-12, settings
+- [x] **Step 6 — review and record (opus review, Fable if it struggles; sonnet docs; ≈ 2 h).** README R-OSP-12, settings
   doc, this Outcome, ledger; squash on `one-star-path`, then push to GitLab `origin` after the full re-gate (amendment 3).
 
 **Acceptance.**
@@ -5758,6 +5758,85 @@ overturn it in the morning. (3) Push is allowed (owner: «пуш разреша�
   13's sub-check rows, each move a change of record with its numbers.
 - The lab: `t13b-pop` noreg PASS with every spec §8 tolerance row; Step 1's identity 0 / 0.
 - Gates: as Step 3, and the full `cargo test -p athenaeum-core --all-targets` before any push.
+
+**Outcome (2026-10-17; branch `one-star-path-t13b`: 76aa53d5 plan ... 3f275540 route A final, 3b8b1e41 review fixes, then
+the docs commit; lab 591c556, 4b18f85, 086309c, 2b89a75; rustafits 07b8287 on `one-star-path-13b`; not squashed or
+pushed to `one-star-path`).** **Route A (owner, 2026-10-17, "A: как раньше"): the stacking Measure's numbers are
+5836a970's exactly** (probe identity 495 k lines, 0 differing; `MEASURE_VERSION` 4 and `PASS1_ARTIFACT_VERSION` 1
+restored), only the bit-identical speedups remain: rustafits mesh 1.16 -> 0.58 s and MRS 0.62 -> 0.11 s per plane, `rcr`
+by verified decisions x4.5 (rigorous bound, exact recompute on undecided iterations), `hfr` and ring-sky selection, the
+13b-P timers gated on debug. **Brackets (H 5836a970, N 3f275540, interleaved x3):** set 204 **9.90 -> 7.95 min (N / H 0.803;
+ERP 3.77 min, 2.11x, bar MISSED)**; Horse C11 **2.22 -> 1.43 min (0.647; ERP 3.71 min, 0.39x, bar MET)**; run B not run;
+Analysis B3 (Task 12 bracket (b), m42, 3 rounds, 3b8b1e41 rebuilt): analysis-mode 35.7 s / 77 = **0.464 s per frame — PASS** (bar 0.6; Task 12 0.723), legacy analysis 18.5 s / 77 = 0.240 (Task 12 0.339) — the rustafits mesh / MRS cut. **Proofs:** lab `t13b-id` 591c556 and `t13b-final` 4b18f85 0 moved (only the analysis-mode rows
+move, by the Budget selection); set 204 Step 5a master pixels, weights, LN and registration identical. **Refused (measured
+out):** the budgeted population with imputed PSFSW totals (depth tilt -5.5 / -4.0 % against H -0.5 / -0.9 %, per-frame
+tails +-40 %; rcr-bounds test C rho 0.56) and the (a) frame shape (mixed against truth, hc11B G +30 %); kept unused:
+`Mode::Population`, `population::select`, the probe's `--paths population`. **Steps as run:** Steps 0-2 as planned; Step 3
+built the population and was STOPPED at 3c (R13b-8 miss, R13b-9 moved the referee to synthetic truth after the miss,
+R13b-11 refused the imputed totals); Step 4 became 4a (`rcr`) only; Step 5 was Step 5a (identity run) + 5b (Measure-only
+brackets on set 204 and Horse C11); Step 6 holds the opus review (0 C / 3 I / 5 M, fixed in 3b8b1e41) and these docs; the
+settings doc is unchanged (`minStars` reads `stars_fitted`). **Carries:** the weight-redesign cycle "faster than the ERP"
+(a truth-validated weight; the (a) frame shape with a truth gate); Task 13c (parallelism); `c` against `c_true` on
+undersampled OSC, doubles, nebulae; the knot exemption's plane-max band (Task 10c); the squash onto `one-star-path`, the
+full `--all-targets` re-gate and the push. README R-OSP-12.
+
+---
+
+### Task 13c: Parallelism research — use the machine fully, numbers unchanged (owner, 2026-10-17; inserted before Task 14)
+
+**Scope fixed 2026-10-17 by the owner ("Добавь исследование распараллеливания расчетов, чтобы оптимально и по
+максимуму использовать ресурсы"); Files / Steps by the task's design read.** Task 13b closed the bit-identical CPU work
+(rustafits mesh 2×, MRS 5×, `rcr` 4.5×, hfr) and left Measure at ≈ 477 s on set 204 with every seed fitted (route A).
+This task asks the other question: is the machine fully used while the pipeline runs, and where does it wait.
+
+**What is known.** Step 0c (Task 13b): the Measure stage kept ≈ 8.6 of 10 cores busy on the dev Mac (4 performance +
+6 efficiency cores, 16 GB) with 5 frames admitted on a 10-thread pool, 12.6 CPU-s per plane; the design read estimated
+≤ 20 % concurrency headroom from a single stage. Never measured: the other heavy stages (Calibrate, Register, Normalize,
+Integrate, Drizzle), the performance- vs efficiency-core split, I/O wait, memory-bandwidth limits, serial sections
+between stages, and the runner class (M4 Max, 16 cores, 128 GB), where admission and pool sizes tuned for 16 GB may leave
+most of the machine idle.
+
+**Questions (the research note answers each with measurements on BOTH machine classes):**
+1. Per stage: wall, CPU-s, cores busy / available over time, P- vs E-core time, peak memory, I/O wait; where the
+   pipeline is serial (Amdahl fraction per stage and between stages).
+2. Admission and pools: the `ComputeQueue` / per-stage admission counts and rayon pool sizes — fixed numbers or derived
+   from cores and RAM? Nested pools or oversubscription? A memory-budget-driven admission (frames in flight = what
+   fits in RAM with a margin) instead of a constant.
+3. Granularity: per frame vs per plane (an OSC frame's three planes), the work-stealing grain inside a plane, idle tails
+   at the end of a fan-out (the last frames running alone).
+4. Overlap: reading / decoding the next frame while the current one computes (prefetch), streaming frames between stages
+   (a calibrated frame measured while the next calibrates) instead of stage barriers, disk-as-cache reads that could be
+   memory-mapped.
+5. Hardware: the efficiency cores (do they help or slow the tail), SIMD in the hot loops (auto-vectorized or not), and
+   the GPU as research only (what would move there; no implementation in this task).
+
+**Scaling to the machine (owner, 2026-10-17: «ресурсы могли динамически скейлится в зависимости от платформы и
+доступных ресурсов» → clarified: «оно может быть подобрано под машину, но так чтобы утилизировать все доступное»).**
+The goal is that every machine is used to the full of what it has — not one machine's constants applied everywhere. The
+budget may be fixed per machine (chosen when the run starts); in-run adaptation is needed only where measurement shows
+it is (e.g. memory pressure on a small machine):
+- **Platform discovery at start:** physical / logical cores and the performance / efficiency split (Apple silicon
+  perflevels, hybrid x86), total and available memory, and the container limits of the Docker / web build (cgroup v1 /
+  v2 CPU quota and memory limit — a container must never size itself from the host's numbers); macOS, Windows and Linux.
+- **Sizing for full use:** frames in flight and pool widths chosen from those numbers and the measured per-frame peak
+  memory so the cores stay busy without swapping — on the 16 GB dev Mac AND on the 128 GB runner (where today's numbers,
+  tuned for 16 GB, likely leave most of it idle). A guard only where measured: back off under memory pressure, and share
+  the `ComputeQueue` with a concurrent scan or export instead of oversubscribing.
+- **User control:** the Settings → Stacking / compute knobs stay as caps and overrides of the automatic budget
+  (`docs/settings/README.md` contract), with the chosen budget logged at `info` (`stacking` start line: cores, memory,
+  frames in flight, pool sizes, why).
+- **Determinism:** results must not depend on the thread count or the admission level — the same bytes at 1, 4, 10 and 16
+  threads and under a forced scale-down mid-run (a test matrix on the probe and one stacking run).
+
+**Bars.** Every change is bit-identical (deterministic reduction order; the 13b identity procedure: probe `cmp` on
+set 204 0058 / 0075 / OSC 0163, the lab cycle 0 moved, set 204 master pixels identical) at every thread count and
+admission level; speed is judged by interleaved brackets on the dev Mac AND the runner (and one constrained container
+run: a Docker build with a CPU quota and a memory limit below the host's); peak memory stays within the available budget
+on every platform (the 16 GB rules on the dev Mac; no swap); no regression on the small machine. A change that pays < 5 % of a stage or costs memory the small machine does not have is recorded,
+not merged.
+
+**Deliverable.** A research note `docs/superpowers/research/2026-10-XX-stacking-parallelism.md` (the measurements, the
+ranked levers with their measured gains), then the bit-identical changes that pass the bars, in phases (lean-execution).
 
 ---
 
