@@ -1580,12 +1580,18 @@ pub fn integrate_group(
     let plane_len = input.width * input.height;
     let crop = measure_rect.filter(|r| !r.is_full(input.width, input.height));
     let (measure_w, measure_h) = crop.map_or((input.width, input.height), |r| (r.width, r.height));
+    // FM-28: the master is always measured at All. `fitStars` is a per-frame speed control; the master is one
+    // high-SNR image, and its FWHM / eccentricity / star count must stay comparable across K.
+    let master_measure = MeasureOptions {
+        fit_stars: None,
+        ..measure.clone()
+    };
     let measured = pool.install(|| {
         measure_planes_diagnosed(
             input.channels,
             measure_w,
             measure_h,
-            measure,
+            &master_measure,
             None,
             SeedOverride::Fast,
             false,
@@ -3103,6 +3109,93 @@ mod tests {
                 out.stats.master_fwhm_px[p].to_bits(),
                 alone.channel.fwhm_px.to_bits(),
                 "plane {p}: the cross flag moves the master's FWHM"
+            );
+        }
+    }
+
+    /// FM-28 (F1 review I1): the master's statistics are measured at All whatever `fitStars` the frames used.
+    #[test]
+    fn master_measurement_ignores_fit_stars() {
+        use crate::stacking::measure::tests::cross_plane_fixture;
+        let (planes, w, h) = cross_plane_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..3u64 {
+            let mut data: Vec<f32> = planes.iter().flatten().copied().collect();
+            add_noise(&mut data, 0.0005, 910 + i);
+            let path = dir.path().join(format!("osc{i}.fits"));
+            write_fits_f32(&path, w, h, 3, &data, &[]).unwrap();
+            let measurement = measure_frame(
+                &path,
+                &MeasureOptions::default(),
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            frames.push(StackFrame {
+                path,
+                map: identity_map(),
+                measurement,
+                weight: weight(1.0, 3),
+                exposure_s: 30.0,
+                date_obs: None,
+                frame_id: 900031 + i as i64,
+                registered_path: None,
+            });
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: w,
+            height: h,
+            channels: 3,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+            stats_on_covered: false,
+        };
+        let run = |measure: &MeasureOptions| {
+            let on_plane = nop_plane();
+            let on_band = nop_band();
+            let progress = GroupProgress {
+                on_plane: &on_plane,
+                engine: EngineProgress {
+                    on_band: &on_band,
+                    on_combine: &on_band,
+                },
+            };
+            integrate_group(
+                &input,
+                measure,
+                &pool(),
+                &AtomicBool::new(false),
+                &progress,
+                io(1 << 24),
+            )
+            .unwrap()
+        };
+        let all = run(&MeasureOptions::default());
+        let k = run(&MeasureOptions {
+            fit_stars: Some(1),
+            ..MeasureOptions::default()
+        });
+        for p in 0..3 {
+            assert_eq!(
+                k.stats.master_fwhm_px[p].to_bits(),
+                all.stats.master_fwhm_px[p].to_bits(),
+                "plane {p} fwhm"
+            );
+            assert_eq!(
+                k.stats.master_eccentricity[p].to_bits(),
+                all.stats.master_eccentricity[p].to_bits(),
+                "plane {p} ecc"
             );
         }
     }

@@ -84,6 +84,10 @@ pub struct MeasureOptions {
     /// stage since route A, owner decision 2026-10-17, and the tests), `Some` = the pass fits the frame-statistic
     /// population and the star list only (the probes; the weight that needs it is a later cycle, STOP R13b-11).
     pub population: Option<StarPopulation>,
+    /// Fast measurement (FM-2): `Some(k)` fits the first `k` seeds in detection order only
+    /// ([`sm::Mode::Brightest`]); `None` = every seed (the shipped behaviour). Ignored when `population` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_stars: Option<usize>,
 }
 
 /// The star-list sizes of the Measure stage's populations (R13b-3): list (b) is the first `list_mono` seeds of a mono
@@ -128,6 +132,7 @@ impl Default for MeasureOptions {
             seed_threshold: sm::seeds::DEFAULT_THRESHOLD,
             structure: StructureParams::default(),
             population: None,
+            fit_stars: None,
         }
     }
 }
@@ -177,7 +182,7 @@ pub struct ChannelMeasurement {
     pub stars_detected: usize,
     pub stars_fitted: usize,
     /// Seeds the PSF fitter refused, each for a counted reason (F-0, Plan A
-    /// Task 4): `stars_fitted + stars_refused == stars_detected`. `0` in a
+    /// Task 4): `stars_fitted + stars_refused == stars_detected` (plus the not-selected seeds under `fitStars`). `0` in a
     /// `metrics` payload written before that task.
     pub stars_refused: usize,
     /// `stars_refused` by `star_measure::RefusalReason`, keyed by its
@@ -829,7 +834,10 @@ fn module_options(
             statistic: p.statistic,
             list: if colour { p.list_colour } else { p.list_mono },
         },
-        None => sm::Mode::All,
+        None => match opts.fit_stars {
+            Some(k) => sm::Mode::Brightest { k },
+            None => sm::Mode::All,
+        },
     };
     sm::MeasureOptions {
         domain: sm::Domain::Calibrated { gain_e_per_unit },
@@ -2028,6 +2036,48 @@ pub(crate) mod tests {
     fn without_timings(mut c: ChannelMeasurement) -> ChannelMeasurement {
         c.timings = MeasureTimings::default();
         c
+    }
+
+    /// F1 review M5: `fit_stars` reaches the module through `module_options` - the same seeds are detected, at most
+    /// `k` are fitted, and `None` (or a `k` at or above the seed count) is `All`.
+    #[test]
+    fn fit_stars_reaches_the_module_and_none_is_all() {
+        const K: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let path = write(dir.path(), "f.fits", &[&data], w, h);
+        let cancel = AtomicBool::new(false);
+        let all = measure_frame(&path, &MeasureOptions::default(), None, &cancel).unwrap();
+        let k = measure_frame(
+            &path,
+            &MeasureOptions {
+                fit_stars: Some(K),
+                ..MeasureOptions::default()
+            },
+            None,
+            &cancel,
+        )
+        .unwrap();
+        let huge = measure_frame(
+            &path,
+            &MeasureOptions {
+                fit_stars: Some(1_000_000),
+                ..MeasureOptions::default()
+            },
+            None,
+            &cancel,
+        )
+        .unwrap();
+        let (a, k, h) = (&all.channels[0], &k.channels[0], &huge.channels[0]);
+        assert!(a.stars_detected > K);
+        assert_eq!(k.stars_detected, a.stars_detected);
+        assert!(k.stars_fitted + k.stars_refused <= K);
+        assert!(k.stars_fitted < a.stars_fitted);
+        assert_eq!(
+            format!("{:?}", without_timings(h.clone())),
+            format!("{:?}", without_timings(a.clone())),
+            "a k above the seed count is All"
+        );
     }
 
     #[test]

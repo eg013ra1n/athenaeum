@@ -434,6 +434,64 @@ mod tests {
         }
     }
 
+    /// F1 review M5: a `Mode::Brightest` first pass (k verdict records of the detected seeds) written and read back
+    /// finishes like the one in memory, and its record count is what tells the finish the prefix.
+    #[test]
+    fn a_brightest_first_pass_round_trips_through_the_artifact() {
+        const K: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let strip = |m: &FrameMeasurement| {
+            let mut v = serde_json::to_value(m).unwrap();
+            v.as_object_mut().unwrap().remove("durationMs");
+            v
+        };
+        let sources = [
+            crate::stacking::config::SeedSource::MatchedFilter,
+            crate::stacking::config::SeedSource::Peak,
+        ];
+        for (source, path) in sources
+            .iter()
+            .flat_map(|&s| frames(dir.path()).into_iter().map(move |p| (s, p)))
+        {
+            let opts = MeasureOptions {
+                seed_source: source,
+                fit_stars: Some(K),
+                ..MeasureOptions::default()
+            };
+            let name = format!("{}_{source:?}", path.file_stem().unwrap().to_str().unwrap());
+            let in_memory = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let through_file = {
+                let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+                let artifact = dir.path().join(format!("{name}.athm"));
+                write_pass1(&artifact, &fresh).unwrap();
+                read_pass1(&artifact, &path, &opts).unwrap()
+            };
+            let beta = group_beta(in_memory.beta_own());
+            let betas = vec![beta; in_memory.beta_own().len()];
+            let (m_mem, fits_mem) =
+                measure_frame_pass2(&path, in_memory, &betas, &opts, None, &cancel).unwrap();
+            let (m_file, fits_file) =
+                measure_frame_pass2(&path, through_file, &betas, &opts, None, &cancel).unwrap();
+            assert_eq!(strip(&m_file), strip(&m_mem), "{name}: the measurement");
+            assert_eq!(
+                format!("{fits_file:?}"),
+                format!("{fits_mem:?}"),
+                "{name}: the fits"
+            );
+            for c in &m_file.channels {
+                assert!(
+                    c.stars_detected > K,
+                    "{name}: the fixture detects more than K"
+                );
+                assert!(
+                    c.stars_fitted + c.stars_refused <= K,
+                    "{name}: at most K fits"
+                );
+            }
+        }
+    }
+
     /// R11c-2: a wrong magic, format version, measure version, checksum (head, body, trailer) and every length
     /// mismatch is one typed arm, never an `Ok`.
     #[test]

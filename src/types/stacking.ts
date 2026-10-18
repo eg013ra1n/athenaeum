@@ -249,7 +249,16 @@ seedSource: SeedSource,
  * The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
  * [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`] by [`resolve_config`].
  */
-seedThreshold: number, };
+seedThreshold: number, 
+/**
+ * Fast measurement (FM-2, FM-3): the first K seeds in detection order (filter flux descending) get the PSF
+ * fits, the rest keep their detection record and are not fitted; `None` = all (the shipped behaviour). No
+ * imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. Clamped up to
+ * `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` and canonicalized to `None` at or above
+ * `measurement.maxStars` by [`resolve_config`]. Absent from the document at `None`, so every All-mode hash is
+ * the one before the field existed.
+ */
+fitStars?: number, };
 
 export type ReferenceMode = "auto" | "manual";
 

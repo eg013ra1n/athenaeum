@@ -20,8 +20,11 @@
 
 use super::student_t;
 use serde::{Deserialize, Serialize};
+use simd::Kernel;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+
+mod simd;
 
 /// A stack element the rejection routines can order and read: the plain
 /// sample for master builds, a `(value, frame index)` pair for the
@@ -250,6 +253,88 @@ fn sort_asc<T: Sample>(v: &mut [T]) {
     v.sort_by(|a, b| a.value().partial_cmp(&b.value()).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+thread_local! {
+    // `median_unsorted`'s widened copy of the stack and the vector selection's ping-pong buffers, reused per call.
+    static MEDIAN_SELECT_SCRATCH: RefCell<(Vec<f64>, simd::SelectScratch)> =
+        RefCell::new((Vec::new(), simd::SelectScratch::default()));
+}
+
+/// The median [`sort_asc`] + [`median_sorted`] give, of a set the caller does not need sorted afterwards (fast-measurement
+/// S1c): the sort exists only to read the middle order statistic(s), so on the vector kernel they come from S1's
+/// selection ([`simd::select_order_stats`]) over the widened values instead — `O(n)` against a stable `O(n log n)` sort.
+///
+/// Bit for bit: on NaN-free input the comparator is a total preorder whose only non-trivial tie is `−0.0 == +0.0`, so each
+/// order statistic is one value with one bit pattern (`±inf` included) and ANY correct selection returns the sorted array's;
+/// f32 → f64 widening is exact and order-preserving, and the even-`n` mean is the same f32 expression `median_sorted`
+/// evaluates, on the same two f32s. Anything else — a NaN in the set, a zero among the order statistics read (which zero
+/// a selection lands on depends on the algorithm), the selection's round cap, fewer than three samples, the scalar kernel
+/// (`ATHENAEUM_SCALAR_SELECTION`) — runs today's sort, which also leaves `v` sorted.
+fn median_unsorted<T: Sample>(v: &mut [T]) -> f32 {
+    let n = v.len();
+    if n >= 3 {
+        if let Some((lo, hi)) = select_unsorted(v, n / 2, n % 2 == 0) {
+            return if n % 2 == 1 { hi } else { (lo + hi) / 2.0 };
+        }
+    }
+    sort_asc(v);
+    median_sorted(v)
+}
+
+/// The element a `v.sort_by(f32::total_cmp)` would leave at index `len / 2` — the plain positional (upper) "median" the
+/// engine's rejection attribution reads (fast-measurement S1c) — without sorting `v` on the vector kernel. Same bit-for-bit
+/// argument and the same hand-backs as [`median_unsorted`] (a NaN, a zero result, the round cap, fewer than three samples,
+/// the scalar kernel run the sort, which here is `total_cmp`, so a NaN set is still safe); on the selection path `v` is left
+/// untouched, on the sort path sorted — callers use it as scratch.
+pub(crate) fn upper_median_total(v: &mut [f32]) -> f32 {
+    let n = v.len();
+    if n >= 3 {
+        if let Some((_, hi)) = select_unsorted(v, n / 2, false) {
+            return hi;
+        }
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[n / 2]
+}
+
+/// The vector kernel's answer for ranks `k − 1` (when `need_lower`, else equal to `k`) and `k` of `v`, as f32s, or `None`
+/// when the sort must answer: scalar kernel, a NaN in the set, the selection's round cap, or a zero among the values read
+/// (which zero a selection lands on depends on the algorithm; the sort's tie order decides its sign).
+fn select_unsorted<T: Sample>(v: &[T], k: usize, need_lower: bool) -> Option<(f32, f32)> {
+    let simd::Kernel::Vector(_) = simd::active() else {
+        return None;
+    };
+    let picked = MEDIAN_SELECT_SCRATCH.with(|cell| {
+        let (wide, sel) = &mut *cell.borrow_mut();
+        wide.clear();
+        let mut nan = false;
+        wide.extend(v.iter().map(|s| {
+            let x = s.value();
+            nan |= x.is_nan();
+            x as f64
+        }));
+        if nan {
+            return None;
+        }
+        match simd::select_order_stats(wide, k, need_lower, sel) {
+            Some((lo, hi)) if lo != 0.0 && hi != 0.0 => Some((lo as f32, hi as f32)),
+            _ => None,
+        }
+    });
+    #[cfg(test)]
+    {
+        let counter = if picked.is_some() { &MEDIAN_VECTOR } else { &MEDIAN_FALLBACK };
+        counter.with(|c| c.set(c.get() + 1));
+    }
+    picked
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how often [`median_unsorted`] on the vector kernel answered from the selection / handed back to the sort.
+    static MEDIAN_VECTOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEDIAN_FALLBACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Combine one pixel column: `values` holds the same pixel from N frames
@@ -272,10 +357,8 @@ pub fn combine_pixel(values: &mut [f32], recipe: IntegrationRecipe) -> (f32, usi
     if kept == 0 {
         // Nothing survived — fall back to the median of the full stack (this
         // reproduces the legacy winsorized all-rejected guard).
-        if !sorted {
-            sort_asc(values);
-        }
-        return (median_sorted(values), n);
+        let m = if sorted { median_sorted(values) } else { median_unsorted(values) };
+        return (m, n);
     }
 
     // Phase 2 — combine the survivors.
@@ -283,10 +366,7 @@ pub fn combine_pixel(values: &mut [f32], recipe: IntegrationRecipe) -> (f32, usi
     let val = match recipe.combination {
         Combination::Average => mean(survivors),
         Combination::Median => {
-            if !sorted {
-                sort_asc(survivors);
-            }
-            median_sorted(survivors)
+            if sorted { median_sorted(survivors) } else { median_unsorted(survivors) }
         }
     };
     (val, n - kept)
@@ -351,7 +431,7 @@ pub fn mask_get(mask: &[u64], i: usize) -> bool {
 /// weighted, not `out_values`-based — can read it directly out of that
 /// prefix instead of re-sorting `work` a second time. Always `false` when
 /// every sample was rejected (the early return below): that branch's own
-/// median already comes from a fresh sort of `out_values`, not `work`, so
+/// median already comes from `out_values` (selection or sort), not `work`, so
 /// there is nothing for the caller to reuse either way.
 pub fn combine_pixel_weighted(
     work: &mut [(f32, u16)],
@@ -375,8 +455,7 @@ pub fn combine_pixel_weighted(
     if kept == 0 {
         scratch.clear();
         scratch.extend(work.iter().map(|&(_, i)| out_values[i as usize]));
-        sort_asc(scratch);
-        return (median_sorted(scratch), n, false);
+        return (median_unsorted(scratch), n, false);
     }
     for &(_, i) in &work[..kept] {
         mask_set(mask, i as usize);
@@ -406,8 +485,7 @@ pub fn combine_pixel_weighted(
         Combination::Median => {
             scratch.clear();
             scratch.extend(work[..kept].iter().map(|&(_, i)| out_values[i as usize]));
-            sort_asc(scratch);
-            median_sorted(scratch)
+            median_unsorted(scratch)
         }
     };
     (value, n - kept, sorted)
@@ -765,9 +843,10 @@ thread_local! {
     static LINEAR_FIT_VALUE_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
     // Task 13c 4d: beside the residuals, the windowed residual median's
     // window values and its members' ranks `i` — see
-    // `residual_median_in_window`.
-    static MEDFIT_RESIDUAL_SCRATCH: RefCell<(Vec<f64>, Vec<f64>, Vec<u32>)> =
-        RefCell::new((Vec::new(), Vec::new(), Vec::new()));
+    // `residual_median_in_window`. Fast-measurement S1: and the vector
+    // kernel's selection buffers.
+    static MEDFIT_RESIDUAL_SCRATCH: RefCell<(Vec<f64>, Vec<f64>, Vec<u32>, simd::SelectScratch)> =
+        RefCell::new((Vec::new(), Vec::new(), Vec::new(), simd::SelectScratch::default()));
 }
 
 /// Test-only branch counters of the windowed residual median (13c 4d r1):
@@ -884,6 +963,12 @@ struct ResidualWindow {
 /// equal, so which one a selection lands on depends on the algorithm, and
 /// the median's zero sign is the one bit this function cannot promise; a
 /// zero order statistic returns `None` and the full selection reproduces it.
+///
+/// Fast-measurement S1: on [`Kernel::Vector`] both selections are
+/// [`simd::select_order_stats`] — out of place, so `residuals` keep their
+/// rank order on every path — under the same argument (one value per order
+/// statistic on NaN-free input, a zero handed back).
+#[allow(clippy::too_many_arguments)]
 fn residual_median_in_window(
     values: &[f64],
     b: f64,
@@ -892,7 +977,9 @@ fn residual_median_in_window(
     window_values: &mut Vec<f64>,
     members: &mut Vec<u32>,
     members_valid: &mut bool,
-) -> Option<(f64, f64, f64)> {
+    kernel: Kernel,
+    sel: &mut simd::SelectScratch,
+) -> WindowMedian {
     let m = residuals.len();
     let k = m / 2;
     let odd = m % 2 == 1;
@@ -900,7 +987,7 @@ fn residual_median_in_window(
     if below > if odd { k } else { k - 1 } || k >= le {
         #[cfg(test)]
         window_branches::bump(window_branches::MISS, m);
-        return None; // the median's ranks are not inside the window
+        return WindowMedian::Miss; // the median's ranks are not inside the window
     }
     let inside = le - below;
     let in_window = |r: f64| r >= lo_bound && r <= hi_bound;
@@ -908,6 +995,18 @@ fn residual_median_in_window(
         #[cfg(test)]
         window_branches::bump(window_branches::IN_PLACE, m);
         *members_valid = false;
+        if let Kernel::Vector(_) = kernel {
+            let Some((lo, hi)) = simd::select_order_stats(residuals, k, !odd, sel) else {
+                return WindowMedian::Undecided; // round cap: the scalar selection decides
+            };
+            if lo == 0.0 || hi == 0.0 {
+                // `residuals` untouched (out of place): still in rank order.
+                #[cfg(test)]
+                window_branches::bump(window_branches::IN_PLACE_ZERO, m);
+                return WindowMedian::Undecided;
+            }
+            return WindowMedian::Found(if odd { hi } else { 0.5 * (lo + hi) }, lo, hi);
+        }
         let (left, hi, _) = residuals.select_nth_unstable_by(k, f64::total_cmp);
         let hi = *hi;
         let lo = if odd { hi } else { left.iter().cloned().fold(f64::NEG_INFINITY, f64::max) };
@@ -918,7 +1017,7 @@ fn residual_median_in_window(
             window_branches::bump(window_branches::IN_PLACE_ZERO, m);
             residuals.clear();
             residuals.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
-            return None;
+            return WindowMedian::Miss;
         }
         (lo, hi)
     } else {
@@ -970,17 +1069,39 @@ fn residual_median_in_window(
         *members_valid = true;
         window_values.clear();
         window_values.extend(members.iter().map(|&i| residuals[i as usize]));
-        let (left, hi, _) = window_values.select_nth_unstable_by(k - below, f64::total_cmp);
-        let hi = *hi;
-        let lo = if odd { hi } else { left.iter().cloned().fold(f64::NEG_INFINITY, f64::max) };
+        let (lo, hi) = if let Kernel::Vector(_) = kernel {
+            match simd::select_order_stats(window_values, k - below, !odd, sel) {
+                Some(r) => r,
+                None => return WindowMedian::Undecided, // round cap; `residuals` untouched
+            }
+        } else {
+            let (left, hi, _) = window_values.select_nth_unstable_by(k - below, f64::total_cmp);
+            let hi = *hi;
+            (if odd { hi } else { left.iter().cloned().fold(f64::NEG_INFINITY, f64::max) }, hi)
+        };
         if lo == 0.0 || hi == 0.0 {
             #[cfg(test)]
             window_branches::bump(window_branches::MEMBERS_ZERO, m);
-            return None; // `residuals` untouched
+            // `residuals` untouched. On the vector kernel the selection that
+            // just ran already met the zero: the full one would meet it again.
+            return if let Kernel::Vector(_) = kernel { WindowMedian::Undecided } else { WindowMedian::Miss };
         }
         (lo, hi)
     };
-    Some((if odd { hi } else { 0.5 * (lo + hi) }, lo, hi))
+    WindowMedian::Found(if odd { hi } else { 0.5 * (lo + hi) }, lo, hi)
+}
+
+/// What [`residual_median_in_window`] settled.
+enum WindowMedian {
+    /// The median `a` and its two order statistics `(a, lo, hi)`.
+    Found(f64, f64, f64),
+    /// Not decided here (ranks outside the window, or a scalar-kernel zero):
+    /// the full selection runs.
+    Miss,
+    /// A vector-kernel selection already ran and hit an exact zero or its
+    /// round cap: the partitioned full selection would repeat it, so the
+    /// scalar selection runs next.
+    Undecided,
 }
 
 /// Minimum-absolute-deviation line `y = a + b·i` over `values[i]` (math
@@ -1098,7 +1219,28 @@ fn residual_median_in_window(
 /// - A separate count pass that sends a window over half the stack straight
 ///   to the full selection: slower than selecting it in place under
 ///   `f64::total_cmp`, as this code does.
+///
+/// # Vector kernels, bit-identical (fast-measurement S1)
+///
+/// On [`Kernel::Vector`] (NEON on aarch64, AVX2 on x86_64 when detected;
+/// [`simd::active`], forced scalar by [`simd::FORCE_SCALAR_ENV`]) the
+/// residual build and its window counts, the residual median's selection
+/// (a branch-free three-way partition, [`simd::select_order_stats`]) and the
+/// residual-sign sum (exact integer sums) run vectorized; everything else —
+/// the least-squares seed, the bracket, the bisection, the 4d window — is
+/// the one code above. Every value is the scalar path's, bit for bit: the
+/// [`simd`] module doc gives the argument, and the 4d oracle tests run on
+/// both kernels (`medfit_line_*` / `reject_linear_fit_*` tests,
+/// `medfit_line_vector_kernel_matches_scalar_on_a_randomized_stress`). A
+/// full selection reached with a finite slope on a NaN-free stack takes the
+/// partition; a zero median, a non-finite slope or a non-finite stack take
+/// the scalar selection below, unchanged.
 pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
+    medfit_line_with(values, warm_start_b, simd::active())
+}
+
+/// [`medfit_line`] on an explicit [`Kernel`].
+fn medfit_line_with(values: &[f64], warm_start_b: Option<f64>, kernel: Kernel) -> (f64, f64) {
     let n = values.len();
     if n == 0 {
         return (0.0, 0.0);
@@ -1146,7 +1288,7 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
     let values_finite = sigma_b.is_finite();
 
     MEDFIT_RESIDUAL_SCRATCH.with(|cell| {
-        let (scratch, window_values, members) = &mut *cell.borrow_mut();
+        let (scratch, window_values, members, sel) = &mut *cell.borrow_mut();
         // O(n) selection instead of an O(n log n) sort per bracket
         // evaluation (ruling R-M4a-16, finding 1) — this is the DEFAULT
         // rejection path for every n >= 20 stack (`RejectionChoice::Auto`),
@@ -1211,24 +1353,63 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
             // (no previous evaluation, a non-finite input, a window that
             // missed, or a median that is an exact zero) runs the full
             // selection below on them.
-            let windowed = match bounds {
+            let windowed: WindowMedian = match bounds {
                 Some((lo, hi)) => {
-                    let (mut below, mut le) = (0usize, 0usize);
-                    scratch.extend(values.iter().enumerate().map(|(i, &y)| {
-                        let r = y - b * i as f64;
-                        below += (r < lo) as usize;
-                        le += (r <= hi) as usize;
-                        r
-                    }));
+                    let (below, le) = if let Kernel::Vector(t) = kernel {
+                        simd::residuals_counted(t, values, b, lo, hi, scratch)
+                    } else {
+                        let (mut below, mut le) = (0usize, 0usize);
+                        scratch.extend(values.iter().enumerate().map(|(i, &y)| {
+                            let r = y - b * i as f64;
+                            below += (r < lo) as usize;
+                            le += (r <= hi) as usize;
+                            r
+                        }));
+                        (below, le)
+                    };
                     let window = ResidualWindow { lo, hi, below, le };
-                    residual_median_in_window(values, b, window, scratch, window_values, members, &mut members_valid)
+                    residual_median_in_window(
+                        values,
+                        b,
+                        window,
+                        scratch,
+                        window_values,
+                        members,
+                        &mut members_valid,
+                        kernel,
+                        sel,
+                    )
                 }
                 None => {
-                    scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
-                    None
+                    if let Kernel::Vector(t) = kernel {
+                        simd::residuals(t, values, b, scratch);
+                    } else {
+                        scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
+                    }
+                    WindowMedian::Miss
                 }
             };
-            let a = if let Some((a, lo, hi)) = windowed {
+            // S1: the full selection by the partition — only on a NaN-free
+            // residual set (finite stack, finite slope: see `values_finite`)
+            // and only when no order statistic it read is a zero; `scratch`
+            // keeps its rank order for the scalar selection otherwise.
+            let partitioned = match (&windowed, kernel) {
+                (WindowMedian::Miss, Kernel::Vector(_)) if values_finite && b.is_finite() => {
+                    match simd::select_order_stats(scratch, m / 2, m % 2 == 0, sel) {
+                        Some((lo, hi)) if lo != 0.0 && hi != 0.0 => {
+                            Some((if m % 2 == 1 { hi } else { 0.5 * (lo + hi) }, lo, hi))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let a = if let WindowMedian::Found(a, lo, hi) = windowed {
+                prev = Some((b, lo, hi));
+                a
+            } else if let Some((a, lo, hi)) = partitioned {
+                #[cfg(test)]
+                window_branches::bump(window_branches::FULL, m);
                 prev = Some((b, lo, hi));
                 a
             } else {
@@ -1255,15 +1436,11 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
                     0.5 * (lo_max + hi)
                 }
             };
-            let mut sum = 0.0;
-            for (i, &y) in values.iter().enumerate() {
-                let resid = y - (a + b * i as f64);
-                if resid > 0.0 {
-                    sum += i as f64;
-                } else if resid < 0.0 {
-                    sum -= i as f64;
-                }
-            }
+            let sum = if let Kernel::Vector(t) = kernel {
+                simd::sign_sum(t, values, a, b)
+            } else {
+                simd::sign_sum_scalar(values, a, b)
+            };
             (sum, a)
         };
 
@@ -2600,40 +2777,42 @@ mod tests {
     /// call (mirrors `reject_linear_fit`'s own usage).
     #[test]
     fn medfit_line_matches_the_pre_task_9_oracle_bit_for_bit() {
-        for seed in 0..1000u64 {
-            let mut rng = SplitMix64(0xD1B5_4A32_D192_ED03 ^ seed);
-            let n = 8 + (rng.next_u64() % 200) as usize; // 8..=207
-            let quantize = seed % 3 == 0;
-            let values: Vec<f64> = (0..n)
-                .map(|_| {
-                    let raw = 100.0 + 5.0 * next_gaussian(&mut rng);
-                    if quantize {
-                        (raw / 2.0).round() * 2.0 // coarse quantization: frequent ties
-                    } else {
-                        raw
-                    }
-                })
-                .collect();
+        for kernel in kernels() {
+            for seed in 0..1000u64 {
+                let mut rng = SplitMix64(0xD1B5_4A32_D192_ED03 ^ seed);
+                let n = 8 + (rng.next_u64() % 200) as usize; // 8..=207
+                let quantize = seed % 3 == 0;
+                let values: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let raw = 100.0 + 5.0 * next_gaussian(&mut rng);
+                        if quantize {
+                            (raw / 2.0).round() * 2.0 // coarse quantization: frequent ties
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect();
 
-            let cold = medfit_line(&values, None);
-            let cold_oracle = medfit_line_oracle(&values, None);
-            assert_eq!(
-                (cold.0.to_bits(), cold.1.to_bits()),
-                (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
-                "seed {seed} n {n} (cold): {cold:?} vs oracle {cold_oracle:?}"
-            );
+                let cold = medfit_line_with(&values, None, kernel);
+                let cold_oracle = medfit_line_oracle(&values, None);
+                assert_eq!(
+                    (cold.0.to_bits(), cold.1.to_bits()),
+                    (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
+                    "{kernel:?} seed {seed} n {n} (cold): {cold:?} vs oracle {cold_oracle:?}"
+                );
 
-            // A warm-started second call, exactly as `reject_linear_fit`
-            // chains iterations — the seed comes from the cold call's own
-            // converged slope, so it must be identical too for this to be a
-            // meaningful second check rather than a repeat of the first.
-            let warm = medfit_line(&values, Some(cold.1));
-            let warm_oracle = medfit_line_oracle(&values, Some(cold_oracle.1));
-            assert_eq!(
-                (warm.0.to_bits(), warm.1.to_bits()),
-                (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
-                "seed {seed} n {n} (warm): {warm:?} vs oracle {warm_oracle:?}"
-            );
+                // A warm-started second call, exactly as `reject_linear_fit`
+                // chains iterations — the seed comes from the cold call's own
+                // converged slope, so it must be identical too for this to be a
+                // meaningful second check rather than a repeat of the first.
+                let warm = medfit_line_with(&values, Some(cold.1), kernel);
+                let warm_oracle = medfit_line_oracle(&values, Some(cold_oracle.1));
+                assert_eq!(
+                    (warm.0.to_bits(), warm.1.to_bits()),
+                    (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
+                    "{kernel:?} seed {seed} n {n} (warm): {warm:?} vs oracle {warm_oracle:?}"
+                );
+            }
         }
     }
 
@@ -2650,14 +2829,16 @@ mod tests {
             &[f64::NAN, f64::NAN, f64::NAN],
             &[1.0, 2.0, 3.0, 4.0, f64::NAN, 6.0, 7.0, 8.0],
         ];
-        for values in cases {
-            let a = medfit_line(values, None);
-            let b = medfit_line_oracle(values, None);
-            assert_eq!(
-                (a.0.to_bits(), a.1.to_bits()),
-                (b.0.to_bits(), b.1.to_bits()),
-                "{values:?}: {a:?} vs oracle {b:?}"
-            );
+        for kernel in kernels() {
+            for values in cases {
+                let a = medfit_line_with(values, None, kernel);
+                let b = medfit_line_oracle(values, None);
+                assert_eq!(
+                    (a.0.to_bits(), a.1.to_bits()),
+                    (b.0.to_bits(), b.1.to_bits()),
+                    "{kernel:?} {values:?}: {a:?} vs oracle {b:?}"
+                );
+            }
         }
     }
 
@@ -2760,6 +2941,14 @@ mod tests {
     /// with either one disabled this test fails on a `−0.0` vs `+0.0` median.
     #[test]
     fn medfit_line_windowed_median_matches_the_full_selection_bit_for_bit() {
+        for kernel in kernels() {
+            windowed_median_matches_the_full_selection(kernel);
+        }
+    }
+
+    /// [`medfit_line_windowed_median_matches_the_full_selection_bit_for_bit`]
+    /// on one [`Kernel`] (fast-measurement S1: run on each).
+    fn windowed_median_matches_the_full_selection(kernel: Kernel) {
         const MS: [usize; 10] = [2, 3, 20, 21, 30, 74, 105, 164, 208, 260];
         window_branches::reset();
         for seed in 0..120_000u64 {
@@ -2768,12 +2957,12 @@ mod tests {
             let shape = (seed / 10) % 10;
             let values = bit_identity_stack(&mut rng, m, shape);
 
-            let cold = medfit_line(&values, None);
+            let cold = medfit_line_with(&values, None, kernel);
             let cold_oracle = medfit_line_oracle(&values, None);
             assert_eq!(
                 (cold.0.to_bits(), cold.1.to_bits()),
                 (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
-                "seed {seed} m {m} shape {shape} (cold): {cold:?} vs oracle {cold_oracle:?}"
+                "{kernel:?} seed {seed} m {m} shape {shape} (cold): {cold:?} vs oracle {cold_oracle:?}"
             );
 
             let warm_seed = match (seed / 100) % 8 {
@@ -2789,18 +2978,18 @@ mod tests {
                 // 1e307 on finite y: `b·i` overflows to ±inf INSIDE the window path.
                 _ => [f64::INFINITY, f64::NAN, 1e300, 1e307, -1e307][(rng.next_u64() % 5) as usize],
             };
-            let warm = medfit_line(&values, Some(warm_seed));
+            let warm = medfit_line_with(&values, Some(warm_seed), kernel);
             let warm_oracle = medfit_line_oracle(&values, Some(warm_seed));
             assert_eq!(
                 (warm.0.to_bits(), warm.1.to_bits()),
                 (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
-                "seed {seed} m {m} shape {shape} (warm {warm_seed:?}): {warm:?} vs oracle {warm_oracle:?}"
+                "{kernel:?} seed {seed} m {m} shape {shape} (warm {warm_seed:?}): {warm:?} vs oracle {warm_oracle:?}"
             );
         }
         let counts = window_branches::read();
         for (kind, name) in window_branches::NAMES.iter().enumerate() {
             eprintln!(
-                "window branch {name}: odd m {} even m {}",
+                "{kernel:?} window branch {name}: odd m {} even m {}",
                 counts[kind * 2],
                 counts[kind * 2 + 1]
             );
@@ -2813,7 +3002,10 @@ mod tests {
                 continue;
             }
             for (parity, label) in ["odd", "even"].iter().enumerate() {
-                assert!(counts[kind * 2 + parity] > 0, "window branch {name} never ran for {label} m: {counts:?}");
+                assert!(
+                    counts[kind * 2 + parity] > 0,
+                    "{kernel:?}: window branch {name} never ran for {label} m: {counts:?}"
+                );
             }
         }
     }
@@ -2887,30 +3079,383 @@ mod tests {
     /// once, exercising the warm start too).
     #[test]
     fn reject_linear_fit_matches_the_pre_task_9_oracle() {
-        for seed in 0..500u64 {
-            let mut rng = SplitMix64(0xA5A5_1234_5678_9ABC ^ seed);
-            let n = 20 + (rng.next_u64() % 188) as usize; // 20..=207
-            let mut values: Vec<f32> = (0..n)
-                .map(|_| (100.0 + 5.0 * next_gaussian(&mut rng)) as f32)
-                .collect();
-            // A handful of high outliers, same shape as the discrimination
-            // fixture above.
-            let n_out = 1 + (rng.next_u64() % 5) as usize;
-            for k in 0..n_out.min(n) {
-                values[k] = 300.0 + 10.0 * k as f32;
-            }
+        for kernel in kernels() {
+            let _forced = ForceKernel::new(kernel);
+            for seed in 0..500u64 {
+                let mut rng = SplitMix64(0xA5A5_1234_5678_9ABC ^ seed);
+                let n = 20 + (rng.next_u64() % 188) as usize; // 20..=207
+                let mut values: Vec<f32> = (0..n)
+                    .map(|_| (100.0 + 5.0 * next_gaussian(&mut rng)) as f32)
+                    .collect();
+                // A handful of high outliers, same shape as the discrimination
+                // fixture above.
+                let n_out = 1 + (rng.next_u64() % 5) as usize;
+                for k in 0..n_out.min(n) {
+                    values[k] = 300.0 + 10.0 * k as f32;
+                }
 
-            let mut a = values.clone();
-            let mut b = values;
-            let (kept_a, sorted_a) = reject_linear_fit(&mut a, 5.0, 3.5);
-            let (kept_b, sorted_b) = reject_linear_fit_oracle(&mut b, 5.0, 3.5);
-            assert_eq!(kept_a, kept_b, "seed {seed} n {n}: survivor count");
-            assert_eq!(sorted_a, sorted_b, "seed {seed} n {n}: sorted flag");
-            let bits_a: Vec<u32> = a[..kept_a].iter().map(|v| v.to_bits()).collect();
-            let bits_b: Vec<u32> = b[..kept_b].iter().map(|v| v.to_bits()).collect();
+                let mut a = values.clone();
+                let mut b = values;
+                let (kept_a, sorted_a) = reject_linear_fit(&mut a, 5.0, 3.5);
+                let (kept_b, sorted_b) = reject_linear_fit_oracle(&mut b, 5.0, 3.5);
+                assert_eq!(kept_a, kept_b, "seed {seed} n {n}: survivor count");
+                assert_eq!(sorted_a, sorted_b, "seed {seed} n {n}: sorted flag");
+                let bits_a: Vec<u32> = a[..kept_a].iter().map(|v| v.to_bits()).collect();
+                let bits_b: Vec<u32> = b[..kept_b].iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    bits_a, bits_b,
+                    "{kernel:?} seed {seed} n {n}: survivor values (bit-for-bit)"
+                );
+            }
+        }
+    }
+
+    // ── Fast-measurement S1: the vector kernels, bit for bit ───────────────
+
+    /// Every kernel this CPU runs, scalar first. On aarch64 the NEON kernel
+    /// must be among them, so no identity test passes by running the scalar
+    /// path alone.
+    fn kernels() -> Vec<Kernel> {
+        let ks = Kernel::available();
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(ks.len(), 2, "the NEON kernel is missing on aarch64: {ks:?}");
+        if require_vector_kernel() {
+            assert_eq!(ks.len(), 2, "ATHENAEUM_REQUIRE_VECTOR_KERNEL is set but no vector kernel runs: {ks:?}");
+        }
+        ks
+    }
+
+    /// `ATHENAEUM_REQUIRE_VECTOR_KERNEL` set to anything but "" or "0": a run
+    /// that compared nothing (no AVX2 on an x86_64 runner) must fail, not pass.
+    fn require_vector_kernel() -> bool {
+        std::env::var("ATHENAEUM_REQUIRE_VECTOR_KERNEL").is_ok_and(|v| !v.is_empty() && v != "0")
+    }
+
+    /// Forces the calling thread's `medfit_line` kernel until dropped.
+    struct ForceKernel;
+    impl ForceKernel {
+        fn new(kernel: Kernel) -> Self {
+            simd::force(Some(kernel));
+            ForceKernel
+        }
+    }
+    impl Drop for ForceKernel {
+        fn drop(&mut self) {
+            simd::force(None);
+        }
+    }
+
+    fn line_bits(l: (f64, f64)) -> (u64, u64) {
+        (l.0.to_bits(), l.1.to_bits())
+    }
+
+    /// S1: the vector kernel against the scalar kernel, `to_bits`, over
+    /// 143 200 seeded stacks — 400 of every size `m` in 3..=360, the ten
+    /// [`bit_identity_stack`] shapes 40 each — cold, then warm on the 4d
+    /// test's seed rotation (the cold slope, a perturbed slope, ±0, `∓1.5·σ_b`
+    /// and non-finite seeds); and `reject_linear_fit` on every 4th stack's
+    /// NaN-free f32 copy (survivor count and survivor bits).
+    #[test]
+    fn medfit_line_vector_kernel_matches_scalar_on_a_randomized_stress() {
+        let ks = kernels();
+        if ks.len() < 2 {
+            eprintln!("no vector kernel on this CPU: nothing to compare");
+            return;
+        }
+        let (scalar, vector) = (ks[0], ks[1]);
+        let (mut stacks, mut rejections) = (0u64, 0u64);
+        for seed in 0..143_200u64 {
+            let mut rng = SplitMix64(0x5151_FA57_0000_0000 ^ seed);
+            let m = 3 + (seed % 358) as usize;
+            let shape = (seed / 358) % 10;
+            let values = bit_identity_stack(&mut rng, m, shape);
+            let cold = medfit_line_with(&values, None, scalar);
+            let cold_v = medfit_line_with(&values, None, vector);
             assert_eq!(
-                bits_a, bits_b,
-                "seed {seed} n {n}: survivor values (bit-for-bit)"
+                line_bits(cold_v),
+                line_bits(cold),
+                "seed {seed} m {m} shape {shape} (cold): vector {cold_v:?} vs scalar {cold:?}"
+            );
+            let warm_seed = match (seed / 3580) % 8 {
+                0 | 1 => cold.1,
+                2 => cold.1 + (rng.next_f64() - 0.5) * 1e-2 * (1.0 + cold.1.abs()),
+                3 => 0.0,
+                4 => -0.0,
+                5 => -1.5 * medfit_sigma_b(&values),
+                6 => 1.5 * medfit_sigma_b(&values),
+                _ => [f64::INFINITY, f64::NAN, 1e300, 1e307, -1e307][(rng.next_u64() % 5) as usize],
+            };
+            let warm = medfit_line_with(&values, Some(warm_seed), scalar);
+            let warm_v = medfit_line_with(&values, Some(warm_seed), vector);
+            assert_eq!(
+                line_bits(warm_v),
+                line_bits(warm),
+                "seed {seed} m {m} shape {shape} (warm {warm_seed:?}): vector {warm_v:?} vs scalar {warm:?}"
+            );
+            stacks += 1;
+            if seed % 4 == 0 && shape != 8 {
+                let f32s: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                let (mut a, mut b) = (f32s.clone(), f32s);
+                let ka = {
+                    let _f = ForceKernel::new(scalar);
+                    reject_linear_fit(&mut a, 5.0, 3.5)
+                };
+                let kb = {
+                    let _f = ForceKernel::new(vector);
+                    reject_linear_fit(&mut b, 5.0, 3.5)
+                };
+                assert_eq!(kb, ka, "seed {seed} m {m} shape {shape}: survivor count");
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+                assert_eq!(
+                    bits(&b[..kb.0]),
+                    bits(&a[..ka.0]),
+                    "seed {seed} m {m} shape {shape}: survivors"
+                );
+                rejections += 1;
+            }
+        }
+        eprintln!("S1 stress: {stacks} stacks cold + warm, {rejections} reject_linear_fit stacks, vector == scalar");
+    }
+
+    /// S1 primitives against the scalar expressions they replace, `to_bits`:
+    /// every length 0..=67 (all vector tails), slopes incl. ±0, overflow,
+    /// ±inf and NaN, intercepts incl. ±0 and NaN.
+    #[test]
+    fn simd_primitives_match_the_scalar_expressions_bit_for_bit() {
+        let t = match simd::VectorToken::detect() {
+            Some(t) => t,
+            None => {
+                assert!(
+                    !cfg!(target_arch = "aarch64") && !require_vector_kernel(),
+                    "no vector kernel on this CPU (aarch64, or ATHENAEUM_REQUIRE_VECTOR_KERNEL is set)"
+                );
+                eprintln!("no vector kernel on this CPU: nothing to compare");
+                return;
+            }
+        };
+        let mut rng = SplitMix64(0x5151_0001);
+        let slopes = [
+            0.0,
+            -0.0,
+            0.37,
+            -1.25e-3,
+            1e-310,
+            3.0e5,
+            1e307,
+            -1e307,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let mut out = Vec::new();
+        for m in 0..=67usize {
+            for (si, &b) in slopes.iter().enumerate() {
+                let values: Vec<f64> = (0..m)
+                    .map(|i| {
+                        if si % 3 == 0 {
+                            (i % 3) as f64 // exact zero residuals and cancellations at b = 0
+                        } else {
+                            100.0 + 5.0 * next_gaussian(&mut rng)
+                        }
+                    })
+                    .collect();
+                let want: Vec<f64> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &y)| y - b * i as f64)
+                    .collect();
+                let want_bits: Vec<u64> = want.iter().map(|r| r.to_bits()).collect();
+                simd::residuals(t, &values, b, &mut out);
+                assert_eq!(
+                    out.iter().map(|r| r.to_bits()).collect::<Vec<_>>(),
+                    want_bits,
+                    "residuals m {m} b {b}"
+                );
+                for (lo, hi) in [(97.5, 102.5), (-1e300, 1e300), (1.0, 1.0), (f64::NAN, 0.0)] {
+                    out.push(123.0); // `out` is cleared, whatever it held
+                    let (below, le) = simd::residuals_counted(t, &values, b, lo, hi, &mut out);
+                    assert_eq!(
+                        out.iter().map(|r| r.to_bits()).collect::<Vec<_>>(),
+                        want_bits,
+                        "counted m {m} b {b}"
+                    );
+                    assert_eq!(
+                        below,
+                        want.iter().filter(|&&r| r < lo).count(),
+                        "below m {m} b {b} lo {lo}"
+                    );
+                    assert_eq!(
+                        le,
+                        want.iter().filter(|&&r| r <= hi).count(),
+                        "le m {m} b {b} hi {hi}"
+                    );
+                }
+                for a in [0.0, -0.0, 1.0, 100.0, -3.5, 1e308, f64::NAN] {
+                    assert_eq!(
+                        simd::sign_sum(t, &values, a, b).to_bits(),
+                        simd::sign_sum_scalar(&values, a, b).to_bits(),
+                        "sign sum m {m} a {a} b {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// S1: [`simd::select_order_stats`] returns the sorted order statistics
+    /// of NaN-free sets — every rank `k` of every size 1..=70, with and
+    /// without the `(k − 1)`-th, over Gaussian, tie-heavy, signed-zero,
+    /// ±inf-carrying and constant populations; a nonzero result `to_bits`
+    /// equal to the sorted value, a zero one equal to zero (the caller hands
+    /// zeros back); the input left untouched.
+    #[test]
+    fn select_order_stats_matches_the_sorted_order_statistics() {
+        let check = |got: f64, want: f64, what: &str| {
+            if want == 0.0 {
+                assert!(got == 0.0, "{what}: {got:?} vs {want:?}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{what}: {got:?} vs {want:?}");
+            }
+        };
+        let mut sel = simd::SelectScratch::default();
+        let mut rng = SplitMix64(0x5151_0002);
+        for trial in 0..4200usize {
+            let n = 1 + trial % 70;
+            let shape = (trial / 70) % 6;
+            let v: Vec<f64> = (0..n)
+                .map(|_| match shape {
+                    0 => 100.0 + 5.0 * next_gaussian(&mut rng),
+                    1 => next_gaussian(&mut rng).round(),
+                    2 => [0.0, -0.0, 1.0, -1.0, 0.0][(rng.next_u64() % 5) as usize],
+                    3 => match rng.next_u64() % 6 {
+                        0 => f64::INFINITY,
+                        1 => f64::NEG_INFINITY,
+                        _ => next_gaussian(&mut rng),
+                    },
+                    4 => 7.25,
+                    // subnormals and the smallest normal, both signs
+                    _ => {
+                        let m = [5e-324, f64::MIN_POSITIVE / 3.0, 2.0 * 5e-324, f64::MIN_POSITIVE, 0.0];
+                        let x = m[(rng.next_u64() % 5) as usize];
+                        if rng.next_u64() % 2 == 0 { x } else { -x }
+                    }
+                })
+                .collect();
+            let before: Vec<u64> = v.iter().map(|x| x.to_bits()).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            for k in 0..n {
+                for need_lower in [false, true] {
+                    if need_lower && k == 0 {
+                        continue;
+                    }
+                    let (lo, hi) = simd::select_order_stats(&v, k, need_lower, &mut sel)
+                        .expect("the default round cap never trips on these sizes");
+                    let what =
+                        format!("trial {trial} n {n} shape {shape} k {k} lower {need_lower}");
+                    check(hi, sorted[k], &what);
+                    check(
+                        lo,
+                        if need_lower { sorted[k - 1] } else { sorted[k] },
+                        &what,
+                    );
+                }
+            }
+            assert_eq!(
+                v.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                before,
+                "trial {trial}: input modified"
+            );
+        }
+    }
+
+    /// S1: a capped [`simd::select_order_stats_capped`] either gives up
+    /// (`None`, the caller's scalar fallback) or returns the sorted order
+    /// statistics, so a trip of the round cap can never change a value.
+    #[test]
+    fn select_order_stats_round_cap_gives_up_or_is_right() {
+        let mut sel = simd::SelectScratch::default();
+        let mut rng = SplitMix64(0x5151_0003);
+        let (mut gave_up, mut answered) = (0usize, 0usize);
+        for trial in 0..2000usize {
+            let n = 2 + trial % 300;
+            let v: Vec<f64> = (0..n).map(|_| next_gaussian(&mut rng)).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            let k = (rng.next_u64() % n as u64) as usize;
+            for rounds in [0usize, 1, 2, 64] {
+                match simd::select_order_stats_capped(&v, k, false, &mut sel, rounds) {
+                    None => gave_up += 1,
+                    Some((lo, hi)) => {
+                        assert_eq!(hi.to_bits(), sorted[k].to_bits(), "trial {trial} cap {rounds}");
+                        assert_eq!(lo.to_bits(), hi.to_bits());
+                        answered += 1;
+                    }
+                }
+            }
+        }
+        assert!(gave_up > 0 && answered > 0, "gave up {gave_up}, answered {answered}");
+    }
+
+    /// S1: cost of one `medfit_line` call on the vector kernel against the
+    /// scalar kernel, cold and warm — the pool and protocol of
+    /// [`diag_medfit_windowed_median_cost`] (sorted Gaussian stacks with two
+    /// high outliers, 256 per `m`, 50 000 calls per cell, 5 interleaved
+    /// rounds, the per-cell minimum). Not run by default (timing):
+    /// `cargo test --release -p athenaeum-core --lib -- --ignored
+    /// diag_medfit_vector_kernel_cost --nocapture`.
+    #[test]
+    #[ignore]
+    fn diag_medfit_vector_kernel_cost() {
+        use std::time::Instant;
+        const ITERS: usize = 50_000;
+        const POOL: usize = 256;
+        let ks = kernels();
+        assert_eq!(ks.len(), 2, "no vector kernel on this CPU");
+        let (scalar, vector) = (ks[0], ks[1]);
+        eprintln!("medfit_line cost per call (ns), vector vs scalar kernel");
+        eprintln!(
+            "| m | cold vector | cold scalar | cold v/s | warm vector | warm scalar | warm v/s |"
+        );
+        eprintln!("| ---- | ---- | ---- | ---- | ---- | ---- | ---- |");
+        for &m in &[20usize, 30, 74, 92, 105, 164, 208, 260] {
+            let mut rng = SplitMix64(0x13C4_D000 ^ m as u64);
+            let pool: Vec<(Vec<f64>, Vec<f64>, f64)> = (0..POOL)
+                .map(|_| {
+                    let mut full: Vec<f64> = (0..m)
+                        .map(|_| 100.0 + 5.0 * next_gaussian(&mut rng))
+                        .collect();
+                    full[0] = 200.0 + 10.0 * rng.next_f64();
+                    full[1] = 180.0 + 10.0 * rng.next_f64();
+                    full.sort_by(|p, q| p.partial_cmp(q).unwrap());
+                    let cold_b = medfit_line_oracle(&full, None).1;
+                    let survivors = full[..m - 2].to_vec();
+                    (full, survivors, cold_b)
+                })
+                .collect();
+            let time = |kernel: Kernel, warm: bool| -> f64 {
+                let t = Instant::now();
+                for it in 0..ITERS {
+                    let (full, survivors, cold_b) = &pool[it % POOL];
+                    let out = if warm {
+                        medfit_line_with(std::hint::black_box(survivors), Some(*cold_b), kernel)
+                    } else {
+                        medfit_line_with(std::hint::black_box(full), None, kernel)
+                    };
+                    std::hint::black_box(out);
+                }
+                t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
+            };
+            let (mut cv, mut cs, mut wv, mut ws) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            for _ in 0..5 {
+                cs = cs.min(time(scalar, false));
+                cv = cv.min(time(vector, false));
+                ws = ws.min(time(scalar, true));
+                wv = wv.min(time(vector, true));
+            }
+            eprintln!(
+                "| {m} | {cv:.0} | {cs:.0} | {:.3} | {wv:.0} | {ws:.0} | {:.3} |",
+                cv / cs,
+                wv / ws
             );
         }
     }
@@ -3950,5 +4495,218 @@ mod tests {
             IntegrationRecipe::average(Rejection::Rcr { limit: 0.5 }).describe(),
             "Average | RCR (0.5)"
         );
+    }
+
+
+    // ── Fast-measurement S1c: the unsorted-survivor median through S1's selection ───────────────────────────────────
+
+    fn f32_stack(rng: &mut SplitMix64, m: usize, shape: u64) -> Vec<f32> {
+        bit_identity_stack(rng, m, shape).into_iter().map(|x| x as f32).collect()
+    }
+
+    /// `median_unsorted` against `sort_asc` + `median_sorted`, `to_bits`: 400 sizes x the ten stack shapes (the production
+    /// shape, unsorted, ramps, ties, contaminated tails, zeros of both signs, constants, a +-inf / NaN sample, huge and tiny
+    /// magnitudes — cast to f32, so overflow gives infinities and underflow zeros) x 6 stacks, on every kernel this CPU runs;
+    /// the vector kernel must answer from the selection on most of them and hand the zero / NaN ones back to the sort.
+    #[test]
+    fn median_unsorted_matches_the_sort_on_a_randomized_stress() {
+        let ks = kernels();
+        let mut rng = SplitMix64(0x5EED_51C0_0001);
+        let (mut compared, mut taken, mut handed_back) = (0usize, 0usize, 0usize);
+        for m in (1..=360usize).chain([400, 512, 777, 1000]) {
+            for shape in 0..10u64 {
+                for _ in 0..6 {
+                    let base = f32_stack(&mut rng, m, shape);
+                    // A NaN in the set goes to today's sort on every kernel, and that sort may itself panic on a comparator
+                    // that is no total order (the std sort says so): the answer is then "the same panic or the same bits".
+                    let attempt = |kernel: Option<Kernel>| {
+                        let _g = kernel.map(ForceKernel::new);
+                        std::panic::catch_unwind(|| {
+                            let mut v = base.clone();
+                            if kernel.is_none() {
+                                sort_asc(&mut v);
+                                median_sorted(&v).to_bits()
+                            } else {
+                                median_unsorted(&mut v).to_bits()
+                            }
+                        })
+                        .ok()
+                    };
+                    let want = attempt(None);
+                    for &kernel in &ks {
+                        let (v0, f0) = (MEDIAN_VECTOR.with(std::cell::Cell::get), MEDIAN_FALLBACK.with(std::cell::Cell::get));
+                        let got = attempt(Some(kernel));
+                        assert_eq!(got, want, "{kernel:?} m {m} shape {shape}");
+                        let (v1, f1) = (MEDIAN_VECTOR.with(std::cell::Cell::get), MEDIAN_FALLBACK.with(std::cell::Cell::get));
+                        if matches!(kernel, Kernel::Vector(_)) {
+                            taken += v1 - v0;
+                            handed_back += f1 - f0;
+                        } else {
+                            assert_eq!((v1, f1), (v0, f0), "the scalar kernel must not touch the selection");
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 20_000);
+        if ks.len() > 1 {
+            assert!(taken > 10_000, "the selection answered only {taken} times");
+            assert!(handed_back > 500, "only {handed_back} stacks went back to the sort (zeros / NaN)");
+        }
+    }
+
+    /// `combine_pixel` — value bits and rejected count — on the vector kernel against the forced-scalar kernel, for every
+    /// rejection x both combinations (the median step is shared: in `combine_pixel` only None / sigma clip, and the small-n
+    /// early returns, reach `median_unsorted`; linear fit, min-max, ESD, RCR, percentile and winsorized return their survivors
+    /// sorted and do not), on sizes
+    /// 3..=80 and a few large, the ten stack shapes (NaN-carrying stacks excluded: they take today's sort on every kernel).
+    #[test]
+    fn combine_pixel_vector_kernel_matches_scalar_for_every_rejection() {
+        let ks = kernels();
+        if ks.len() < 2 {
+            eprintln!("no vector kernel on this CPU: nothing to compare");
+            return;
+        }
+        let rejections = [
+            Rejection::None,
+            Rejection::PercentileClip { low: 0.2, high: 0.1 },
+            Rejection::SigmaClip { sigma_low: 4.0, sigma_high: 3.0 },
+            Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 },
+            Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 },
+            Rejection::MinMax { low: 1, high: 1 },
+            Rejection::Esd { outliers_fraction: 0.3, alpha: 0.05, low_relaxation: 1.5 },
+            Rejection::Rcr { limit: 4.0 },
+        ];
+        let mut rng = SplitMix64(0x5EED_51C0_0002);
+        let (mut cases, mut taken) = (0usize, 0usize);
+        for m in (3..=80usize).chain([100, 164, 250, 360]) {
+            for shape in 0..10u64 {
+                for _ in 0..3 {
+                    let base = f32_stack(&mut rng, m, shape);
+                    // A NaN-carrying stack runs today's sort on every kernel (and that sort can panic on it: see the helper's test).
+                    if base.iter().any(|x| x.is_nan()) {
+                        continue;
+                    }
+                    for rejection in rejections {
+                        for recipe in [IntegrationRecipe::average(rejection), IntegrationRecipe::median(rejection)] {
+                            let run = |kernel: Kernel| {
+                                let _g = ForceKernel::new(kernel);
+                                let mut v = base.clone();
+                                let (val, rej) = combine_pixel(&mut v, recipe);
+                                (val.to_bits(), rej)
+                            };
+                            let want = run(Kernel::Scalar);
+                            let v0 = MEDIAN_VECTOR.with(std::cell::Cell::get);
+                            let got = run(ks[1]);
+                            taken += MEDIAN_VECTOR.with(std::cell::Cell::get) - v0;
+                            assert_eq!(got, want, "{:?} m {m} shape {shape}", recipe);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 30_000, "{cases} cases");
+        assert!(taken > 3_000, "the selection answered only {taken} times");
+    }
+
+    /// `upper_median_total` against `sort_by(total_cmp)` + `v[len / 2]` (the engine's rejection-attribution read), `to_bits`:
+    /// sizes 1..=360 and a few large x the ten shapes x 6 stacks, NaN-carrying ones included (the `total_cmp` sort is safe on
+    /// them, so the answer is the same bits on every kernel), on every kernel this CPU runs.
+    #[test]
+    fn upper_median_total_matches_the_total_cmp_sort_on_a_randomized_stress() {
+        let ks = kernels();
+        let mut rng = SplitMix64(0x5EED_51C0_0003);
+        let (mut compared, mut taken, mut handed_back) = (0usize, 0usize, 0usize);
+        for m in (1..=360usize).chain([400, 512, 777, 1000]) {
+            for shape in 0..10u64 {
+                for _ in 0..6 {
+                    let base = f32_stack(&mut rng, m, shape);
+                    let mut sorted = base.clone();
+                    sorted.sort_by(|a, b| a.total_cmp(b));
+                    let want = sorted[m / 2].to_bits();
+                    for &kernel in &ks {
+                        let _g = ForceKernel::new(kernel);
+                        let (v0, f0) = (MEDIAN_VECTOR.with(std::cell::Cell::get), MEDIAN_FALLBACK.with(std::cell::Cell::get));
+                        let mut v = base.clone();
+                        assert_eq!(upper_median_total(&mut v).to_bits(), want, "{kernel:?} m {m} shape {shape}");
+                        let (v1, f1) = (MEDIAN_VECTOR.with(std::cell::Cell::get), MEDIAN_FALLBACK.with(std::cell::Cell::get));
+                        if matches!(kernel, Kernel::Vector(_)) {
+                            taken += v1 - v0;
+                            handed_back += f1 - f0;
+                        } else {
+                            assert_eq!((v1, f1), (v0, f0), "the scalar kernel must not touch the selection");
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 20_000);
+        if ks.len() > 1 {
+            assert!(taken > 10_000, "the selection answered only {taken} times");
+            assert!(handed_back > 500, "only {handed_back} stacks went back to the sort (zeros / NaN)");
+        }
+    }
+
+    /// `combine_pixel_weighted` — value bits, rejected count, sortedness flag, survivor mask and the compacted prefix — on the
+    /// vector kernel against the forced-scalar kernel for every rejection x both combinations (the stacking engine's call:
+    /// its Median combination and its all-rejected fallback are the selection's consumers), sizes 3..=80 and a few large, the
+    /// ten shapes, NaN-free stacks (the sorting rejections themselves can panic on NaN, as `combine_pixel`'s test says).
+    #[test]
+    fn combine_pixel_weighted_vector_kernel_matches_scalar_for_every_rejection() {
+        let ks = kernels();
+        if ks.len() < 2 {
+            eprintln!("no vector kernel on this CPU: nothing to compare");
+            return;
+        }
+        let rejections = [
+            Rejection::None,
+            Rejection::PercentileClip { low: 0.2, high: 0.1 },
+            Rejection::SigmaClip { sigma_low: 4.0, sigma_high: 3.0 },
+            Rejection::SigmaClip { sigma_low: 0.3, sigma_high: 0.3 }, // rejects nearly everything: the all-rejected fallback
+            Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 },
+            Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 },
+            Rejection::MinMax { low: 1, high: 1 },
+            Rejection::Esd { outliers_fraction: 0.3, alpha: 0.05, low_relaxation: 1.5 },
+            Rejection::Rcr { limit: 4.0 },
+        ];
+        let mut rng = SplitMix64(0x5EED_51C0_0004);
+        let (mut cases, mut taken) = (0usize, 0usize);
+        for m in (3..=80usize).chain([100, 164, 250, 360]) {
+            for shape in 0..10u64 {
+                for _ in 0..3 {
+                    let base = f32_stack(&mut rng, m, shape);
+                    if base.iter().any(|x| x.is_nan()) {
+                        continue;
+                    }
+                    let weights: Vec<f32> = (0..m).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
+                    for rejection in rejections {
+                        for recipe in [IntegrationRecipe::average(rejection), IntegrationRecipe::median(rejection)] {
+                            let run = |kernel: Kernel| {
+                                let _g = ForceKernel::new(kernel);
+                                let mut work: Vec<(f32, u16)> = base.iter().enumerate().map(|(i, &x)| (x, i as u16)).collect();
+                                let mut mask = vec![0u64; mask_words(m)];
+                                let mut scratch = Vec::new();
+                                let (val, rej, sorted) =
+                                    combine_pixel_weighted(&mut work, &base, &weights, recipe, &mut mask, &mut scratch);
+                                let kept = m - rej;
+                                let prefix: Vec<(u32, u16)> = work[..kept.min(m)].iter().map(|&(x, i)| (x.to_bits(), i)).collect();
+                                (val.to_bits(), rej, sorted, mask, prefix)
+                            };
+                            let want = run(Kernel::Scalar);
+                            let v0 = MEDIAN_VECTOR.with(std::cell::Cell::get);
+                            let got = run(ks[1]);
+                            taken += MEDIAN_VECTOR.with(std::cell::Cell::get) - v0;
+                            assert_eq!(got, want, "{:?} m {m} shape {shape}", recipe);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 30_000, "{cases} cases");
+        assert!(taken > 3_000, "the selection answered only {taken} times");
     }
 }

@@ -13393,7 +13393,14 @@ fn measure_ln_seeds_calibration(
         planes
             .iter()
             .map(|path| match path {
-                Some(p) => fits_artifact::read_fits(p).unwrap_or_default(),
+                Some(p) => fits_artifact::read_fits(p).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %e,
+                        "ln calibration: fits artifact unreadable; this plane contributes no stars"
+                    );
+                    Vec::new()
+                }),
                 None => Vec::new(),
             })
             .collect()

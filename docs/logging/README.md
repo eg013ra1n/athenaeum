@@ -138,5 +138,7 @@ Every stacking stage start logs a debug `memory relief` line (footprint before /
 | ---- | ---- | ---- |
 | `RAYON_NUM_THREADS=<n>` | Sizes the image pool on both hosts (and rayon's global pool) and overrides machine discovery. Read once at start. | `pool_threads`, `pool_why = "env"` on `compute budget resolved`; a value that is not a positive integer `warn!`s and the pool is sized automatically |
 | `ATHENAEUM_TOKEN_STORE=file` | A release build keeps the hub token in the 0600 file only, never the OS keychain. Debug builds always do. The lab servers set it, so a rebuilt ad-hoc-signed binary never raises a keychain prompt. | one info `token store: file only` at the first account call; any other value `warn!`s once and is ignored |
+| `ATHENAEUM_SCALAR_SELECTION=1` | Forces the scalar oracle for Integrate's selection kernels (the before arm of a timing or an identity proof on one binary). Anything but "" or "0" counts. | one info `integration selection kernel resolved` with `kind` (`"scalar"` / the vector kernel's name) and `forced` (bool, `true` when this variable forced the scalar kernel) |
+| `ATHENAEUM_REQUIRE_VECTOR_KERNEL=1` | Tests only: the selection stress and identity tests fail instead of passing green when no vector kernel ran (an x86 CPU without AVX2 would otherwise skip silently). | no log line; the failure message names the kernels seen |
 
-Both are described in `docs/stacking/README.md` R-OSP-13 (Task 13c).
+The first two are described in `docs/stacking/README.md` R-OSP-13 (Task 13c), the last two in R-OSP-14 (fast-measurement cycle).

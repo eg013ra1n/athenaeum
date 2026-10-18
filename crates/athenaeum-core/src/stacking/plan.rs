@@ -8162,6 +8162,95 @@ mod tests {
         );
     }
 
+    /// Fast measurement (FM-3, FM-27): a `fitStars` that resolves to All (a K at or above `measurement.maxStars`) and
+    /// an absent key resolve to the same config, so they share every stage hash, and that line carries the 78fdc673
+    /// literals of `stage_hashes_are_pinned_to_golden_literals`' default (meas, reg, ln).
+    #[test]
+    fn fit_stars_none_leaves_every_stage_hash_literal_unchanged() {
+        use crate::stacking::config::{
+            calibration_subtree, resolve_config, stage_hash, SourceIdentity,
+        };
+        let line = |cfg: &StackingConfig| {
+            let masters = [
+                "/m/dark.fits|100|2026-01-01T00:00:00+00:00",
+                "/m/flat.fits|200|2026-01-01T00:00:00+00:00",
+            ];
+            let src = [SourceIdentity {
+                file_id: 42,
+                size: 123_456,
+                modified_at: "2026-01-01T00:00:00Z".into(),
+            }];
+            let calib_k = crate::stacking::ln::SeedsCalibration {
+                frame_ids: vec![11, 22],
+                k: vec![0.994],
+            };
+            let calib = stage_hash(&calibration_subtree(cfg), &masters, &src);
+            let meas = measurement_hash_for(cfg, &calib, Some(1.5));
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let ln_ref =
+                normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5), None);
+            let ln = normalization_hash_for(
+                cfg,
+                &reg,
+                &meas,
+                &[11, 22],
+                &ln_ref,
+                Some(&calib_k),
+                Some(1.5),
+                Some(1024),
+            );
+            (meas, reg, ln)
+        };
+        let absent = resolve_config(Some("{}"), None).unwrap();
+        let at_max = resolve_config(Some(r#"{"measurement":{"fitStars":30000}}"#), None).unwrap();
+        assert_eq!(at_max.measurement.fit_stars, None);
+        assert_eq!(line(&at_max), line(&absent));
+        assert_eq!(line(&absent), line(&StackingConfig::default()));
+        let (meas, reg, ln) = line(&at_max);
+        assert_eq!(meas, "7107c326cd4b34c0");
+        assert_eq!(reg, "478536aa8678edba");
+        assert_eq!(ln, "2f19f183b2f12b77");
+    }
+
+    #[test]
+    fn fit_stars_k_moves_measure_register_normalize_hashes() {
+        use crate::stacking::config::{calibration_subtree, stage_hash};
+        let line = |cfg: &StackingConfig| {
+            let calib = stage_hash(&calibration_subtree(cfg), &["m"], &[]);
+            let meas = measurement_hash_for(cfg, &calib, Some(1.5));
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let ln = normalization_hash_for(
+                cfg,
+                &reg,
+                &meas,
+                &[11, 22],
+                "",
+                None,
+                Some(1.5),
+                Some(1024),
+            );
+            (calib, meas, reg, ln)
+        };
+        let all = line(&StackingConfig::default());
+        let mut k = StackingConfig::default();
+        k.measurement.fit_stars = Some(4000);
+        let got = line(&k);
+        assert_eq!(got.0, all.0, "calibration is not a Measure reader");
+        assert_ne!(got.1, all.1, "measure");
+        assert_ne!(got.2, all.2, "register");
+        assert_ne!(got.3, all.3, "normalize");
+        // The first-pass artifact key moves too: it is what stops an All run from reading a K-prepared `.athm`
+        // (the finish derives the prefix from the record count).
+        assert_ne!(
+            pass1_hash_for(&k, &got.0),
+            pass1_hash_for(&StackingConfig::default(), &all.0),
+            "pass1"
+        );
+        let mut k2 = k.clone();
+        k2.measurement.fit_stars = Some(5000);
+        assert_ne!(line(&k2).1, got.1, "a different K is a different hash");
+    }
+
     /// Plan A Task 11c (R11c-3): the first-pass artifact's key is never a `metrics` key (those fold `measure_beta:...`
     /// or nothing), does not move with the group beta (it takes none), moves with the measurement config and the
     /// calibration hash, and is pinned beside `stage_hashes_are_pinned_to_golden_literals`' calibration hash.
@@ -8176,9 +8265,21 @@ mod tests {
         assert_ne!(key, measurement_hash_for(&cfg, calib, None));
         let mut other = cfg.clone();
         other.measurement.max_stars += 1;
-        assert_ne!(key, pass1_hash_for(&other, calib), "moves with measurement.maxStars");
-        assert_ne!(key, pass1_hash_for(&cfg, "another-calibration"), "moves with the calib hash");
-        assert_eq!(key, pass1_hash_for(&cfg, calib), "a pure function of its inputs");
+        assert_ne!(
+            key,
+            pass1_hash_for(&other, calib),
+            "moves with measurement.maxStars"
+        );
+        assert_ne!(
+            key,
+            pass1_hash_for(&cfg, "another-calibration"),
+            "moves with the calib hash"
+        );
+        assert_eq!(
+            key,
+            pass1_hash_for(&cfg, calib),
+            "a pure function of its inputs"
+        );
         // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4).
         assert_eq!(key, "3c734a7e6da780d3");
     }

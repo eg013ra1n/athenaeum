@@ -138,6 +138,12 @@ fn ring_matched_reference<'p>(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Cow<'p, [StarFit]> {
     let Some(pc) = prepared.pair_common.as_ref() else {
+        // Per-side geometry: the target keeps its own ring width and `c` (a log line only; fitStars F1, FM-24).
+        debug!(
+            fwhm_px = ?tgt_outcome.ring_fwhm,
+            aperture_correction = ?tgt_outcome.aperture_correction,
+            "ln scale: per-side ring: the target's own ring width and aperture correction"
+        );
         return Cow::Borrowed(prepared.outcome.fits.as_slice());
     };
     let f_t = tgt_outcome.ring_fwhm;

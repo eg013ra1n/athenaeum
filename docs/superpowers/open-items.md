@@ -196,6 +196,15 @@ re-count on the next Windows run. Removing the e2e's unix gate is untried; the
 old reason ("loopback engines on background tasks") no longer applies — it
 runs real iroh nodes on a multi-thread runtime, which Tokio supports on Windows.
 
+**rustafits `byte_identical_to_before` tests fail on Windows / MSVC at every commit (found 2026-10-18 on the Windows
+runner OBS-PC1).** `fit_moffat_2d`, `bounded_fit_at_one_sample_per_pixel` and `legacy_entry_points_1_3_0` pin Apple bit
+patterns, and libm `pow` differs between macOS and MSVC. They fail at the pre-cycle head and at the final head alike, so
+this is pre-existing and not a regression of the fast-measurement levers (whose Windows identity is proven by the
+`star_probe` probe-diff instead). The same cause fails one athenaeum-core pin on Windows:
+`stacking::measure::the_matched_filter_default_measures_exactly_these_numbers` (β 99.35844471522273 vs the pinned
+99.35844471532414, relative 1.02e-12 against its 1e-12 bar), again at both heads. Needs per-platform pins or a
+tolerance-free MSVC golden; not scheduled.
+
 **The `unclean_shutdown_mid_transfer_resumes_on_restart` `--skip` in the
 Windows CI job is load-bearing, not cosmetic.** Whoever removes it should
 expect the job to start failing intermittently, and now that the job is
@@ -289,6 +298,11 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
 - **The PSF fit's background setup** (clipped-median start, region growth).
 - **The β flips in the master FWHM measurement:** `measure_probe`'s `fwhmPx` jumps ±2.6 … 6.7 % when β flips (−6.3 … +6.7 % at checkpoint B); the second-moment read is flat (±0.02 %). A fit whose β differs between two masters is a harness flag, not a reading.
 - **The 2026-09-07 eccentricity audit** (branch `feature/star-detection-fix`, unpushed).
+- **Broad faint fits among the "brightest by signal"** (fast-measurement F0, 2026-10-18; ruling FM-26). On some set 204 OSC
+  planes 20 of the 64 brightest unflagged fits by signal are filter-SNR ≈ 10 seeds with FWHM ≈ 10 px against the frame's
+  3.5 px; they enter H's TFlux and may enter `c`'s 64 and LN's 500 pairs. An estimator artefact, not a frame defect.
+  Later weight cycle: an extended / FWHM screen on the signal-ranked candidates of `c` and LN's pairs, judged by truth.
+  Evidence: lab `star-lab/results/plan-a/fast-measure/f0-cut/` (89acd1d), `.superpowers/sdd/2026-10-18-fast-measurement/fm-f0-rulings.md`.
 - **F1 on small or edge-heavy frames.** F1 drops a pair whose circle is not fully present or whose `[6F, 8F]` annulus is under half present, and a member with fewer than 20 valid pairs (`MIN_MATCHES`) is excluded, with no fallback to PSF signal. On 6000 × 4000 frames this costs about 1 % of pairs and F1 still fills its 500-pair quota. On the run tests' 192 × 144 synthetic field it keeps 17 of 24 pairs, so every member is excluded there and those tests pin `psfSignal`. Measured on centre crops of set 204 mono, 12 members, with `ln_scale_probe`:
   - At 1500 × 1000, F1 keeps exactly as many pairs as PSF signal selects (117–244), and the growth curve reaches its 100 pairs.
   - At 600 × 400, F1 keeps at most one pair fewer (20–45), with 18–42 growth pairs.

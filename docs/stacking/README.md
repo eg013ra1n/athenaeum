@@ -3665,3 +3665,26 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       b296dbc4 run swapped 911 MB there, and Step 5's interleaved H / N decides. (3) The master-build prefetch,
       unmeasured. (4) The Linux, macOS 11–12 and Windows discovery paths are tested only through their parsers; no x86
       SIMD run.
+  - **R-OSP-14 - fast measurement: All stays, the GPU path ends, per-core SIMD lands bit-identical (Plan A fast-measurement
+    cycle; branch `one-star-path-fm`, final code head 61e526d6 (squashed onto `one-star-path` at the close); research note
+    `docs/superpowers/research/2026-10-18-fast-measurement.md`; plan `docs/superpowers/plans/2026-10-18-fast-measurement-plan.md`;
+    lab `star-lab/results/plan-a/fast-measure/`).**
+    *The bar and how it ended.* Set 204 on the dev Mac 1 090.7 -> 847.1 s (0.777, interleaved bracket H ff3c0a83 / N db762cd9)
+    against the ERP's 1 005 s: **met at the defaults** (All, GPU off), which also satisfies the owner's Q1 ("with the fast
+    mode"). Final-head figures: whole run 1082.2 → 794.1 s (N/H 0.734; N runs 794.1 / 796.8 / 793.6), against the ERP's 1005 s (run 2: 968 s) — 21 % faster at defaults; Measure 0.624, Normalize 0.761, Integrate 0.699, Drizzle 0.844, Register 0.966, Calibrate 0.981; identity H3 / N3 1310 files + 197 rows, 0 differing; the per-stage swap max-rule misses come from single N runs and are the OS's response to read rate (Normalize reads ≈ 58 GB per run, now 25 % faster) — malloc at every stage start N ≤ H (lab `fast-measure/a1-mem/vmmap-compare.txt`); lab 1910574 (set 204), 164 lights, 3 pairs from Calibrate: whole run 305 → 267 s (N/H 0.876; the ERP's 2788 s → 10.4x), Measure 0.885, Integrate 0.667; identity 3 / 3 pairs (1962 files); swap 0 in all six runs; lab ae93eac (Horse C11 runner), MSVC / AVX2 on OBS-PC1, vector gate on ("S1 stress … vector == scalar"); `star_probe` probe-diff 0 / 0 / 0 on 0058 / 0075 / 0163_d; the only failing tests are the pre-existing Windows pins (open-items); lab 9d3035e (Windows identity).
+    - **`measurement.fitStars` (All | K) is kept as a config field and a probe flag only.** F3's truth run (SK2) found no K
+      that passes: K 4 000 / 5 000 / 8 000 miss K1 (estimator tilt), K3 (families worse than All) and K4 (14-21 of 32
+      injected real planes move more than 1 %, worst -20.8 %: bright stars are not representative on sparse frames), though
+      K2 (weight ranking) passes. No Settings UI, no preset, no panel (FM-19). The master is always measured at All (FM-28).
+    - **The GPU path ends.** Two-sum fails in plain WGSL on Metal, Vulkan and DX12 (only MSL `math_mode(safe)` passes);
+      Kernel 2 is 1.08x / 0.99x end to end (issue-bound, about 30 % of nominal); the GPU-able share of the run is about 89 s,
+      10.5 % even at infinite speed, below SG6's 15 % (FM-31). No `gpu` feature, `compute.gpu` or module exists.
+    - **Per-core levers, bit-identical per platform, scalar oracle kept:** S1 (Integrate selection, NEON / AVX2; combine
+      0.655x / 0.633x), S1c (Median combination 0.68-0.71), S2b-1 (rustafits LM pass monomorphized + NEON; 1-thread 0.57-0.69x),
+      S2b-2 (point-model columns two per vector; 0.95-0.97x). `ATHENAEUM_SCALAR_SELECTION` forces the scalar kernel and
+      `ATHENAEUM_REQUIRE_VECTOR_KERNEL` makes the tests fail when no vector kernel ran (`docs/logging/README.md`).
+    - **Measured out, do not re-propose:** K at 4 000 / 5 000 / 8 000; Kernel 2 on the GPU; the GPU star-fit path at All;
+      percentile / sigma / winsorized internals on the vector selection; caching u / v / base from the cost pass; the
+      target-rank pivot. **Next levers** (number-changing, truth-gated): a vectorized `pow` (about 31 % of the fit thread),
+      Normalize's LN reference build (about 34 %) and detection (about 20 %). **Rule:** per-core efficiency before threads or
+      GPU; compare work units with the ERP, not stage walls.

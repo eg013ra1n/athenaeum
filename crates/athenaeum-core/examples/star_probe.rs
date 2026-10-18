@@ -19,6 +19,9 @@
 //!                              default: what the Measure stage states for a calibrated frame, 1 plane white, 3 mixed)
 //!       [--psf-beta B]   (the measure path fitted at `PsfModel::Fixed(B)` from its own verdict pass: the stacking
 //!                         Measure stage's second pass, so the lab replays a group's fits at its group β frame by frame)
+//!       [--fit-stars K]   (fast measurement, FM-2: the measure path fits the first K seeds in detection order only, the
+//!                          rest keep their detection record as `notSelected`; unclamped, the lab's K may sit below the product's floor;
+//!                          a `--config` document is replayed as stored, its `fitStars` too, never clamped by `resolve_config`)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -389,6 +392,8 @@ struct MeasureArgs {
     budget: Option<usize>,
     /// `--psf` (the analysis-mode path): the PSF model; default the Analysis mode's.
     psf: Option<PsfModel>,
+    /// `--fit-stars` (the measure path): fit the first K seeds only (`Mode::Brightest`).
+    fit_stars: Option<usize>,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -411,6 +416,7 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         clip: None,
         budget: None,
         psf: None,
+        fit_stars: None,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
@@ -482,6 +488,14 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
                         .ok()
                         .filter(|n: &usize| *n >= 1)
                         .unwrap_or_else(|| die("--budget: an integer of at least 1")),
+                )
+            }
+            "--fit-stars" => {
+                a.fit_stars = Some(
+                    v().parse()
+                        .ok()
+                        .filter(|n: &usize| *n >= 1)
+                        .unwrap_or_else(|| die("--fit-stars: an integer of at least 1")),
                 )
             }
             "--psf" => {
@@ -612,6 +626,14 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             die("the population path replaces the measure path: name one of them")
         }
         opts.population = Some(StarPopulation::probe_default(reg_max));
+    }
+    // `--fit-stars K` (fast measurement): unclamped, straight to the module's `Mode::Brightest`.
+    if let Some(k) = a.fit_stars {
+        opts.fit_stars = Some(k);
+    }
+    // A `--config` document may carry `fitStars` itself; population wins in the module, so refuse both.
+    if opts.population.is_some() && opts.fit_stars.is_some() {
+        die("fitStars (--fit-stars or the --config document) and the population path both choose the fitted seeds: name one")
     }
     let measure_path = if want("population") {
         "population"
@@ -767,7 +789,11 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             }
             // The adapter runs every seed (no budget) unless the populations choose: then `notSelected` is the detected
             // seeds they left out (their detection record stays), `trimmed` is 0.
-            let not_selected = pm.population.as_ref().map_or(0, |r| seeds.len() - r.fitted);
+            let not_selected = match (pm.population.as_ref(), opts.fit_stars) {
+                (Some(r), _) => seeds.len() - r.fitted,
+                (None, Some(k)) => seeds.len().saturating_sub(k),
+                (None, None) => 0,
+            };
             let refused = json!({"total": pm.channel.stars_refused, "byReason": pm.channel.refused_by_reason,
                                  "notSelected": not_selected, "trimmed": 0});
             // Task 13b: what the populations did - the selection counts, (a)'s accepted fits, the share of them that
@@ -921,7 +947,27 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
             Err(e) => return Err(format!("analysis: {e:#}")),
         }
     }
+    // Debug-only (feature `lm-counters`): the Moffat LM solves this process ran, by free-parameter count.
+    #[cfg(feature = "lm-counters")]
+    emit(lm_counters_line());
     out.flush().map_err(|e| format!("flush: {e}"))
+}
+
+/// The process-wide Moffat LM solve counters as one `lmCounters` line: `fixedBeta` (7 free parameters: EVERY fixed-β Moffat
+/// solve in the process, whichever stage ran it) and `freeBeta` (8: every free-β solve, the saturation verdict and the β
+/// sample, point and integrated, all planes merged), each with solves, iterations, accepted and
+/// refused steps (by the step guard / by the cost), Jacobian passes computed and reused, cost passes, the summed window
+/// pixels and the solves by window size (≤ 32, 64, 128, 256, 512, 1024, 2048 px, more).
+#[cfg(feature = "lm-counters")]
+fn lm_counters_line() -> Value {
+    let c = astroimage::analysis::fitting::lm_counters::lm_counters();
+    let one = |k: &astroimage::analysis::fitting::lm_counters::LmSolveCounters| {
+        json!({"solves": k.solves, "iterations": k.iterations, "acceptedSteps": k.accepted_steps,
+               "refusedGuard": k.refused_guard, "refusedCost": k.refused_cost, "jacobianPasses": k.jacobian_passes,
+               "jacobianReused": k.jacobian_reused, "costPasses": k.cost_passes, "pixels": k.pixels,
+               "pixelHistogram": k.pixel_histogram})
+    };
+    json!({"kind": "lmCounters", "fixedBeta": one(&c[0]), "freeBeta": one(&c[1])})
 }
 
 /// The raw file's clip level, full scale and gain for `Domain::RawAdu` (R12-7): `full_scale` = `2^bits - 1` from BITPIX /
@@ -1318,6 +1364,7 @@ mod tests {
             clip: None,
             budget: None,
             psf: None,
+            fit_stars: None,
         }
     }
 

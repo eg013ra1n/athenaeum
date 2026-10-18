@@ -180,6 +180,9 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", 
 default = ["render", "solver"]
 render = ["dep:rustafits"]
 solver = ["dep:solvemyastro"]
+# Debug-only Moffat LM solve counters (rustafits `lm-counters`), printed by the star_probe example as one `lmCounters` line;
+# zero numeric effect, never in default (fast-measurement S2b-1).
+lm-counters = ["render", "rustafits/lm-counters"]
 
 [[example]]
 name = "band_profile"

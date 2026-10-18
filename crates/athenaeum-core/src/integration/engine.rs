@@ -1404,8 +1404,7 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                                     scratch.push(rej_vals[i]);
                                 }
                             }
-                            scratch.sort_by(|a, b| a.total_cmp(b));
-                            let median = scratch[scratch.len() / 2];
+                            let median = combine::upper_median_total(&mut scratch);
                             for i in 0..n {
                                 if combine::mask_get(&present, i) {
                                     row_rejected[i] += 1;
@@ -1475,15 +1474,14 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             // case (`kept == 0`, full `work` instead of a
                             // prefix, no sortedness promised) keep the
                             // original path: copy the relevant values out,
-                            // sort them, and read the same position.
+                            // take their median (selection or sort), and read the same position.
                             let median = if work_sorted && kept > 0 {
                                 work[kept / 2].0
                             } else {
                                 scratch.clear();
                                 let source = if kept > 0 { &work[..kept] } else { &work[..] };
                                 scratch.extend(source.iter().map(|&(v, _)| v));
-                                scratch.sort_by(|a, b| a.total_cmp(b));
-                                scratch[scratch.len() / 2]
+                                combine::upper_median_total(&mut scratch)
                             };
                             for i in 0..n {
                                 if combine::mask_get(&present, i) && !combine::mask_get(&mask, i) {

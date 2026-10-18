@@ -183,7 +183,21 @@ pub struct MeasurementConfig {
     /// The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
     /// [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`] by [`resolve_config`].
     pub seed_threshold: f64,
+    /// Fast measurement (FM-2, FM-3): the first K seeds in detection order (filter flux descending) get the PSF
+    /// fits, the rest keep their detection record and are not fitted; `None` = all (the shipped behaviour). No
+    /// imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. Clamped up to
+    /// `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` and canonicalized to `None` at or above
+    /// `measurement.maxStars` by [`resolve_config`]. Absent from the document at `None`, so every All-mode hash is
+    /// the one before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fit_stars: Option<u32>,
 }
+
+/// The smallest `measurement.fitStars` ([`resolve_config`] clamps up to `max(MIN_FIT_STARS, registration.maxStars)`):
+/// mono Register takes Measure's fits whenever they exist and never falls back to detection, so a K under its
+/// budget would starve it (FM-3).
+pub const MIN_FIT_STARS: u32 = 1_000;
 
 /// Where the Measure stage takes its seeds from (spec §2.2, ruling R-OSP-2; R-M4c-11 for the other two).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
@@ -242,6 +256,7 @@ struct MeasurementConfigWire {
     seed_detector: Option<SeedDetector>,
     seed_source: Option<SeedSource>,
     seed_threshold: Option<f64>,
+    fit_stars: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for MeasurementConfig {
@@ -267,6 +282,7 @@ impl<'de> Deserialize<'de> for MeasurementConfig {
             },
             seed_source,
             seed_threshold: w.seed_threshold.unwrap_or(base.seed_threshold),
+            fit_stars: w.fit_stars,
         })
     }
 }
@@ -291,6 +307,7 @@ impl Default for MeasurementConfig {
             seed_detector: SeedDetector::Peak,
             seed_source: SeedSource::MatchedFilter,
             seed_threshold: crate::star_measure::seeds::DEFAULT_THRESHOLD,
+            fit_stars: None,
         }
     }
 }
@@ -319,6 +336,7 @@ impl MeasurementConfig {
             structure: MeasureOptions::default().structure,
             // The run fits every seed (route A); only the probes opt into the two populations.
             population: None,
+            fit_stars: self.fit_stars.map(|k| k as usize),
         }
     }
 }
@@ -611,12 +629,13 @@ pub fn resolve_config(
 /// L-9 and the spec §6 clamps for the LN fields (and the two seed clamps
 /// `detectionSigma` / `seedThreshold`), on any config that came from
 /// storage or from a caller (resolve_config, a plan override, a decoded user
-/// preset). Idempotent.
+/// preset), and the `measurement.fitStars` clamp ([`resolve_fit_stars`]). Idempotent.
 pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
     // The two seed clamps ride the same shared resolver, so a plan override or
     // a decoded preset cannot carry an out-of-range value past resolve_config.
     config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
     config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
+    resolve_fit_stars(config);
     use crate::stacking::integrate::LnScaleMode;
     use crate::stacking::ln::{effective_scale_mode, snap_ln_scale, MAX_GRID_SIZE, MIN_GRID_SIZE};
     let local = &mut config.normalization.local;
@@ -673,6 +692,50 @@ pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
             clamped, "stacking config: LN starSelection.saturation out of range; clamped"
         );
         sel.saturation = clamped;
+    }
+}
+
+/// `measurement.fitStars` (FM-3): a K under the floor `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` is clamped up
+/// to it with a `warn!`; a K at or above `measurement.maxStars` is All and is stored as `None` (equivalent configs
+/// share hashes); a `selection.minStars` above the effective K warns, since selection reads `stars_fitted` and every
+/// frame would be excluded. Idempotent. The probe passes its K straight to the module and never comes through here.
+fn resolve_fit_stars(config: &mut StackingConfig) {
+    let Some(k) = config.measurement.fit_stars else {
+        return;
+    };
+    let floor = MIN_FIT_STARS.max(u32::try_from(config.registration.max_stars).unwrap_or(u32::MAX));
+    let resolves_to_all = |k: u32| k as usize >= config.measurement.max_stars;
+    let k = if k < floor {
+        if resolves_to_all(floor) {
+            warn!(
+                value = k,
+                clamped = floor,
+                "stacking config: fitStars below the floor; resolves to all"
+            );
+        } else {
+            warn!(
+                value = k,
+                clamped = floor,
+                "stacking config: fitStars below the floor; clamped"
+            );
+        }
+        floor
+    } else {
+        k
+    };
+    if resolves_to_all(k) {
+        config.measurement.fit_stars = None;
+        return;
+    }
+    config.measurement.fit_stars = Some(k);
+    if let Some(min) = config.selection.min_stars {
+        if min > k as usize {
+            warn!(
+                value = min,
+                count = k,
+                "stacking config: selection.minStars above fitStars; every frame would be excluded"
+            );
+        }
     }
 }
 
@@ -2260,5 +2323,110 @@ mod tests {
                 "no stage subtree may carry the drizzle kernel version: {json}"
             );
         }
+    }
+
+    // ---- fitStars (FM-2, FM-3) ----
+
+    /// Resolve `json` as a set document and count the WARN events it logged.
+    fn resolve_counting_warns(json: &str) -> (StackingConfig, usize) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(n.clone()));
+        let cfg = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            resolve_config(Some(json), None).unwrap()
+        });
+        (cfg, n.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn all_serializes_without_the_key() {
+        let v = serde_json::to_value(StackingConfig::default()).unwrap();
+        assert!(v["measurement"].get("fitStars").is_none());
+        let mut c = StackingConfig::default();
+        c.measurement.fit_stars = Some(4000);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["measurement"]["fitStars"], 4000);
+    }
+
+    #[test]
+    fn document_without_fit_stars_decodes_all() {
+        let c = resolve_config(Some(r#"{"measurement":{"maxStars":24576}}"#), None).unwrap();
+        assert_eq!(c.measurement.fit_stars, None);
+        let c = resolve_config(Some("{}"), None).unwrap();
+        assert_eq!(c.measurement.fit_stars, None);
+    }
+
+    #[test]
+    fn fit_stars_at_or_above_max_stars_is_none() {
+        for k in [24_576, 30_000] {
+            let (c, warns) =
+                resolve_counting_warns(&format!(r#"{{"measurement":{{"fitStars":{k}}}}}"#));
+            assert_eq!(c.measurement.fit_stars, None, "k {k}");
+            assert_eq!(warns, 0);
+        }
+        let (c, _) = resolve_counting_warns(r#"{"measurement":{"fitStars":4000}}"#);
+        assert_eq!(c.measurement.fit_stars, Some(4000));
+    }
+
+    #[test]
+    fn fit_stars_below_min_is_clamped_with_a_warning() {
+        // registration.maxStars default 2000 > MIN_FIT_STARS: use a registration budget under it.
+        let (c, warns) = resolve_counting_warns(
+            r#"{"measurement":{"fitStars":500},"registration":{"maxStars":600}}"#,
+        );
+        assert_eq!(c.measurement.fit_stars, Some(MIN_FIT_STARS));
+        assert_eq!(warns, 1);
+    }
+
+    #[test]
+    fn fit_stars_below_register_max_stars_is_clamped_to_it_with_a_warning() {
+        let (c, warns) = resolve_counting_warns(
+            r#"{"measurement":{"fitStars":1500},"registration":{"maxStars":3000}}"#,
+        );
+        assert_eq!(c.measurement.fit_stars, Some(3000));
+        assert_eq!(warns, 1);
+        // The default registration budget (2000) is the floor at the defaults.
+        let (c, _) = resolve_counting_warns(r#"{"measurement":{"fitStars":1200}}"#);
+        assert_eq!(c.measurement.fit_stars, Some(2000));
+    }
+
+    #[test]
+    fn fit_stars_with_a_floor_at_max_stars_resolves_to_all() {
+        // registration.maxStars 30 000 lifts the floor above measurement.maxStars: the clamp lands on All.
+        let (c, warns) = resolve_counting_warns(
+            r#"{"measurement":{"fitStars":5000},"registration":{"maxStars":30000}}"#,
+        );
+        assert_eq!(c.measurement.fit_stars, None);
+        assert_eq!(warns, 1);
+    }
+
+    #[test]
+    fn min_stars_above_fit_stars_warns() {
+        let (c, warns) = resolve_counting_warns(
+            r#"{"measurement":{"fitStars":4000},"selection":{"minStars":5000}}"#,
+        );
+        assert_eq!(c.measurement.fit_stars, Some(4000));
+        assert_eq!(warns, 1);
+        let (_, warns) = resolve_counting_warns(
+            r#"{"measurement":{"fitStars":4000},"selection":{"minStars":3000}}"#,
+        );
+        assert_eq!(warns, 0);
     }
 }

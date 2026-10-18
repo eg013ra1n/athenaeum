@@ -23,8 +23,8 @@
 //!
 //! cargo run --release -p athenaeum-core --example integrate_probe -- \
 //!   <reference.fits> <dir-with-c_*.fits> --out <dir> [--limit N] [--osc] \
-//!   [--distortion off|auto] [--rejection auto|linearFit|winsorized|sigma] \
-//!   [--maps] [--seeds fast|full] [--seeds-report N] \
+//!   [--distortion off|auto] [--rejection auto|linearFit|winsorized|sigma|percentile|none] \
+//!   [--combination average|median] [--maps] [--seeds fast|full] [--seeds-report N] \
 //!   [--interpolation nearest|bilinear|bicubicSpline|bicubicBSpline|lanczos3|lanczos4|mitchellNetravali] \
 //!   [--compare <external-master.xisf>] [--json <path>] \
 //!   [--set-name <str>] [--threads N]
@@ -40,6 +40,7 @@ use astroimage::ImageAnalyzer;
 
 use athenaeum_core::fits_parser::FitsHeader;
 use athenaeum_core::geometry::PixelMap;
+use athenaeum_core::integration::combine::Combination;
 use athenaeum_core::integration::engine::EngineProgress;
 use athenaeum_core::integration::io_policy::IoPolicy;
 use athenaeum_core::integration::plane_reader::PlaneReader;
@@ -74,7 +75,8 @@ use athenaeum_core::stacking::weights::{
 fn usage() -> ! {
     eprintln!(
         "usage: integrate_probe <reference.fits> <dir> --out <dir> [--limit N] [--osc] \
-[--distortion off|auto] [--rejection auto|linearFit|winsorized|sigma] [--maps] \
+[--distortion off|auto] [--rejection auto|linearFit|winsorized|sigma|percentile|none] \
+[--combination average|median] [--maps] \
 [--seeds fast|full] [--seeds-report N] [--interpolation nearest|bilinear|bicubicSpline| \
 bicubicBSpline|lanczos3|lanczos4|mitchellNetravali] [--compare master.xisf] [--json path] \
 [--set-name str] [--threads N]\n\
@@ -92,6 +94,7 @@ struct Args {
     osc: bool,
     reg: RegistrationConfig,
     rejection: RejectionChoice,
+    combination: Combination,
     maps: bool,
     seeds: SeedOverride,
     seeds_report: usize,
@@ -113,6 +116,7 @@ fn parse_args() -> Args {
         osc: false,
         reg: RegistrationConfig::default(),
         rejection: RejectionChoice::Auto,
+        combination: Combination::Average,
         maps: false,
         seeds: SeedOverride::Fast,
         seeds_report: 0,
@@ -164,6 +168,15 @@ fn parse_args() -> Args {
                         sigma_low: 4.0,
                         sigma_high: 3.0,
                     },
+                    "percentile" => RejectionChoice::PercentileClip { low: 0.2, high: 0.1 },
+                    "none" => RejectionChoice::None,
+                    _ => usage(),
+                }
+            }
+            "--combination" => {
+                a.combination = match value.as_str() {
+                    "average" => Combination::Average,
+                    "median" => Combination::Median,
                     _ => usage(),
                 }
             }
@@ -923,6 +936,7 @@ fn main() {
 
     let integration = IntegrationConfig {
         rejection: args.rejection,
+        combination: args.combination,
         write_rejection_maps: args.maps,
         ..IntegrationConfig::default()
     };

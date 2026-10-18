@@ -196,7 +196,8 @@ pub struct MeasureOptions {
     /// `1 / share` pixels, so an aperture's shot variance is `1 / share` times the white value. `None` (every plane
     /// whose pixels are sites) = 1.
     pub cfa_site_share: Option<f64>,
-    /// Which seeds are fitted (Task 12): every one (`All`, the stacking Measure's path and the default) or, for probes and the lab, a [`Mode::Population`] / [`Mode::Budget`] subset
+    /// Which seeds are fitted (Task 12): every one (`All`, the default), the first `k` ([`Mode::Brightest`], the stacking
+    /// Measure's `fitStars`) or, for probes and the lab, a [`Mode::Population`] / [`Mode::Budget`] subset
     /// (the Analysis mode's budget: [`budget`]).
     pub mode: Mode,
 }
@@ -205,7 +206,7 @@ pub struct MeasureOptions {
 /// byte-identical to before the budget existed); `Budget { budget }` fits the candidates [`budget::select_candidates`]
 /// chose and keeps at most `budget` of the accepted fits ([`budget::trim`]), spread over a 4 × 4 grid of the plane. A
 /// budget no smaller than the seed count measures exactly what `All` does. `Population { statistic, list }` (Plan A
-/// Task 13b; probe / lab only, the stacking Measure runs `All`): the pass fits population (a) - `statistic` isolated, brightness-stratified
+/// Task 13b; probe / lab only; the stacking Measure runs `All` or `Brightest`): the pass fits population (a) - `statistic` isolated, brightness-stratified
 /// stars the frame statistic, the ring width and `c` read - and list (b), the first `list` seeds the star-list consumers
 /// read ([`population`]); every other detected seed keeps its detection record. It needs the module's own matched
 /// filter (the selection reads the filter SNR and the knot flags); given seeds fit every seed with a `warn!`.
@@ -225,6 +226,17 @@ pub enum Mode {
     Population {
         statistic: usize,
         list: usize,
+    },
+    /// Fast measurement (`fitStars`, FM-2): the verdict pass and the fits at β run on the first `k` seeds in detection
+    /// order (filter flux descending); `seeds[k..]` keep their detection record as [`Outcome::NotSelected`]. No
+    /// imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. It reuses the budget seam
+    /// (FM-24): the ring-sky mask and `c`'s isolation run over EVERY detected seed, so B_i and the isolation are
+    /// `All`'s; only the ring width F (over the `k` in-statistic fits) and `c`'s 64 candidates can move. A `k` at or
+    /// above the seed count fits exactly what `All` fits, bit for bit. It runs through the stacking halves
+    /// ([`prepare_plane`] / [`finish_plane`]); the prepared record holds `k` verdict records, which is how the finish
+    /// (and a stored first pass read back) knows the prefix, so the encoding is unchanged.
+    Brightest {
+        k: usize,
     },
 }
 
@@ -461,7 +473,7 @@ pub fn measure_plane(
         domain::to_working_units(plane, &opts.domain)
     };
     match opts.mode {
-        Mode::All | Mode::Population { .. } => {
+        Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
             finish_working(&working, w, h, opts, prep, pool)
         }
@@ -486,7 +498,7 @@ pub struct PlanePrep {
     detection: Option<DetectionReport>,
     /// The fit's own width ([`fit::verdict_pass`]), the one the fits at β start from.
     fit_field: FieldWidth,
-    /// One per seed, in seed order.
+    /// One per seed, in seed order; under [`Mode::Brightest`] one per FITTED seed (the first `k`).
     passes: Vec<fit::SeedPass>,
     /// The plane's saturation inputs the verdicts read; the aperture correction's clip screen reads its range (F-5,
     /// owner ruling R6).
@@ -502,8 +514,8 @@ pub struct PlanePrep {
     /// The two populations (Plan A Task 13b): `Some` exactly when the plane was prepared under [`Mode::Population`]
     /// with a detection to select from. Then `passes` holds one record per FITTED seed (`population.fitted[k]`'s is
     /// `passes[k]`), not per detected seed; `None` = one record per seed. NOT stored: only the probes run
-    /// [`Mode::Population`] and the stacking Measure (the one writer of a first-pass artifact) runs [`Mode::All`], so a
-    /// stored prep always has `None` and the first-pass layout stays 5836a970's (`PASS1_ARTIFACT_VERSION` 1).
+    /// [`Mode::Population`] and the stacking Measure (the one writer of a first-pass artifact) runs [`Mode::All`] or
+    /// [`Mode::Brightest`], so a stored prep always has `None` and the first-pass layout stays 5836a970's (`PASS1_ARTIFACT_VERSION` 1).
     #[serde(skip)]
     population: Option<Population>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): not stored, so a `.athm` read back holds zeros.
@@ -527,10 +539,18 @@ fn fit_inputs<'a>(
     seeds: &'a [Seed],
     detection: Option<&'a DetectionReport>,
     population: Option<&Population>,
+    prefix: Option<usize>,
 ) -> (Cow<'a, [Seed]>, Cow<'a, [bool]>) {
     let extended = detection.map_or(&[][..], |d| d.extended.as_slice());
     match population {
-        None => (Cow::Borrowed(seeds), Cow::Borrowed(extended)),
+        None => match prefix {
+            // `Mode::Brightest`: the first k seeds (still borrowed, no copy) and their knot flags.
+            Some(k) => (
+                Cow::Borrowed(&seeds[..k.min(seeds.len())]),
+                Cow::Borrowed(&extended[..k.min(extended.len())]),
+            ),
+            None => (Cow::Borrowed(seeds), Cow::Borrowed(extended)),
+        },
         Some(p) => (
             Cow::Owned(p.fitted.iter().map(|&i| seeds[i]).collect()),
             Cow::Owned(
@@ -540,6 +560,23 @@ fn fit_inputs<'a>(
                     .collect(),
             ),
         ),
+    }
+}
+
+/// The `Mode::Brightest` prefix of a prepared plane: `Some(k)` when the verdict pass ran on fewer seeds than were
+/// detected and no population chose them (a population's records are per fitted seed, `population` set). Derived from
+/// the record count, so a stored first pass read back finishes the same fits.
+fn brightest_prefix(seeds: usize, passes: usize, population: bool) -> Option<usize> {
+    (!population && passes < seeds).then_some(passes)
+}
+
+/// What [`brightest_prefix`] must return for `mode`: `None` at `All` (and under a population or the budget),
+/// `(k < seeds).then_some(k)` at `Brightest { k }`. A debug check that a prepared (or stored) first pass matches the
+/// options it is finished with.
+fn expected_prefix(mode: Mode, seeds: usize, population: bool) -> Option<usize> {
+    match mode {
+        Mode::Brightest { k } if !population => (k < seeds).then_some(k),
+        _ => None,
     }
 }
 
@@ -766,10 +803,21 @@ pub fn plane_beta(
         domain::to_working_units(plane, &opts.domain)
     };
     // The seeds the verdict pass ran on (all of them, or population `fitted`) and their knot flags.
+    let prefix = brightest_prefix(
+        prep.seeds.len(),
+        prep.passes.len(),
+        prep.population.is_some(),
+    );
+    debug_assert_eq!(
+        prefix,
+        expected_prefix(opts.mode, prep.seeds.len(), prep.population.is_some()),
+        "prepared plane's record count disagrees with opts.mode"
+    );
     let (fit_seeds, extended) = fit_inputs(
         &prep.seeds,
         prep.detection.as_ref(),
         prep.population.as_ref(),
+        prefix,
     );
     // As `finish_working`'s fit call: inside the pool's `install`, so the sample's own pool param is `None`.
     let call = || {
@@ -876,7 +924,8 @@ struct Head {
     sub: SubSteps,
 }
 
-/// [`prepare_plane`] on a working copy the caller holds: the head, then the verdict pass over every seed.
+/// [`prepare_plane`] on a working copy the caller holds: the head, then the verdict pass over every seed (the first
+/// `k` under [`Mode::Brightest`]).
 fn prepare_working(
     plane: &[f32],
     working: &[f32],
@@ -897,7 +946,12 @@ fn prepare_working(
         _ => None,
     };
     let select_time = select_t.elapsed();
-    let (pass_seeds, _) = fit_inputs(&head.seeds, None, population.as_ref());
+    // `Mode::Brightest`: the verdict pass runs on the first k seeds only (FM-2).
+    let prefix = match opts.mode {
+        Mode::Brightest { k } => Some(k),
+        _ => None,
+    };
+    let (pass_seeds, _) = fit_inputs(&head.seeds, None, population.as_ref(), prefix);
     let passes = prepare_passes(
         working,
         w,
@@ -1257,11 +1311,24 @@ fn finish_working(
     } = prep;
     // Plan A Task 13b: under a population the fit call runs on `fitted` (its records are `passes`) and reads every
     // detected seed as a neighbour, as the budget does (R12-5).
-    let (fit_seeds, extended) = fit_inputs(&seeds, detection.as_ref(), population.as_ref());
+    let prefix = brightest_prefix(seeds.len(), passes.len(), population.is_some());
+    debug_assert_eq!(
+        prefix,
+        expected_prefix(opts.mode, seeds.len(), population.is_some()),
+        "prepared plane's record count disagrees with opts.mode"
+    );
+    let (fit_seeds, extended) = fit_inputs(&seeds, detection.as_ref(), population.as_ref(), prefix);
     let (in_statistic, _) = population
         .as_ref()
         .map_or((Vec::new(), Vec::new()), Population::fit_flags);
-    let of_fit: &[usize] = population.as_ref().map_or(&[], |p| p.fitted.as_slice());
+    // `Mode::Brightest` fits seeds[..k]: the fit call's seed k is detected seed k, and (as the budget and the
+    // populations) every detected seed stays a neighbour for the ring sky's mask and `c`'s isolation (FM-24).
+    let prefix_of_fit: Vec<usize> = prefix.map_or_else(Vec::new, |k| (0..k).collect());
+    let subset = population.is_some() || prefix.is_some();
+    let of_fit: &[usize] = match population.as_ref() {
+        Some(p) => p.fitted.as_slice(),
+        None => prefix_of_fit.as_slice(),
+    };
     // F-6 (Task 11): the SNR's gain, and the shot noise's spreading by a debayered plane's CFA site share (R11-1).
     let snr_gain = opts.domain.gain_e_per_working_adu();
     let shot_spread = opts
@@ -1287,7 +1354,7 @@ fn finish_working(
                     rho: snr_rho,
                     shot_spread,
                 },
-                neighbours: population.as_ref().map(|_| fit::Neighbours {
+                neighbours: subset.then_some(fit::Neighbours {
                     seeds: &seeds,
                     of_fit,
                 }),
@@ -1322,7 +1389,7 @@ fn finish_working(
     // One record per detected seed, in seed order: the fit call's records re-indexed to the detected seeds, the ones
     // the populations left out `NotSelected` (as the budget does).
     let mut diagnostics = std::mem::take(&mut outcome.diagnostics);
-    if population.is_some() && opts.diagnostics {
+    if subset && opts.diagnostics {
         let mut by_seed: Vec<Option<FitDiagnostics>> = vec![None; seeds.len()];
         for mut d in diagnostics {
             let seed = of_fit[d.seed];
@@ -4533,6 +4600,120 @@ mod tests {
             let m = finish_plane(p, 1024, 1024, &opts, prep, None);
             let r = m.population.unwrap();
             assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
+        }
+    }
+
+    // ---- Fast measurement (fitStars): Mode::Brightest ----
+
+    fn brightest_opts(k: Option<usize>) -> MeasureOptions {
+        MeasureOptions {
+            mode: k.map_or(Mode::All, |k| Mode::Brightest { k }),
+            seeds: SeedSpec::MatchedFilter {
+                threshold: seeds::DEFAULT_THRESHOLD,
+            },
+            diagnostics: true,
+            ..Default::default()
+        }
+    }
+
+    /// A `k` at or above the seed count fits exactly what `Mode::All` fits, through `measure_plane` and through the
+    /// stacking halves (Debug text, so NaN fields compare; the wall-clock timings set equal).
+    #[test]
+    fn brightest_k_at_seed_count_is_bit_identical_to_all() {
+        let data = noisy_field(&uniform(400, 1024, 1024, 9), 9);
+        let a = measure_plane(&data, 1024, 1024, &brightest_opts(None), None);
+        assert!(a.seeds > 50, "{}", a.seeds);
+        for k in [a.seeds, a.seeds + 1_000] {
+            let opts = brightest_opts(Some(k));
+            let mut b = measure_plane(&data, 1024, 1024, &opts, None);
+            b.timings = a.timings;
+            assert_eq!(format!("{b:?}"), format!("{a:?}"), "measure_plane, k {k}");
+            let prep = prepare_plane(&data, 1024, 1024, &opts, None);
+            assert_eq!(prep.passes.len(), prep.seeds.len(), "k {k}: a full prefix");
+            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None);
+            c.timings = a.timings;
+            assert_eq!(format!("{c:?}"), format!("{a:?}"), "halves, k {k}");
+        }
+    }
+
+    /// The verdict pass and the fits run on `seeds[..k]` and nothing else: every other seed is `NotSelected`, the
+    /// F-0 identity holds, the detection count is unchanged.
+    #[test]
+    fn brightest_k_fits_exactly_the_first_k() {
+        let data = noisy_field(&uniform(600, 1024, 1024, 5), 5);
+        let all = measure_plane(&data, 1024, 1024, &brightest_opts(None), None);
+        let k = 150;
+        assert!(all.seeds > k + 50);
+        let m = measure_plane(&data, 1024, 1024, &brightest_opts(Some(k)), None);
+        assert_eq!(m.seeds, all.seeds, "stars_detected is unchanged");
+        assert_eq!(m.refused.not_selected, m.seeds - k);
+        assert_eq!(m.refused.accounted(m.stars.len()), m.seeds);
+        assert!(m.stars.len() <= k);
+        assert!(!m.stars.is_empty());
+        for (i, d) in m.diagnostics.iter().enumerate() {
+            assert_eq!(d.seed, i);
+            assert_eq!(d.outcome == Outcome::NotSelected, i >= k, "seed {i}");
+        }
+        // Every fitted star lies on one of the first k seeds.
+        let first: Vec<(f64, f64)> = m.detected[..k].iter().map(|s| (s.x, s.y)).collect();
+        for st in &m.stars {
+            assert!(
+                first.iter().any(|&(x, y)| (x - st.x).hypot(y - st.y) < 3.0),
+                "star ({}, {}) is not on a fitted seed",
+                st.x,
+                st.y
+            );
+        }
+    }
+
+    /// The detection records of the seeds past `k` are kept whole (positions, count), through the halves too, and
+    /// a stored first pass read back finishes the very same fits (the prefix is derived from the record count).
+    #[test]
+    fn brightest_k_keeps_every_detection_record() {
+        let data = noisy_field(&uniform(600, 1024, 1024, 5), 5);
+        let all = measure_plane(&data, 1024, 1024, &brightest_opts(None), None);
+        let opts = brightest_opts(Some(120));
+        let m = measure_plane(&data, 1024, 1024, &opts, None);
+        assert_eq!(m.detected.len(), all.detected.len());
+        for (a, b) in m.detected.iter().zip(&all.detected) {
+            assert_eq!(
+                (a.x.to_bits(), a.y.to_bits()),
+                (b.x.to_bits(), b.y.to_bits())
+            );
+        }
+        assert_eq!(m.diagnostics.len(), all.seeds);
+        assert_eq!(
+            m.detection.as_ref().map(|d| d.filter_snr.len()),
+            all.detection.as_ref().map(|d| d.filter_snr.len())
+        );
+        let prep = prepare_plane(&data, 1024, 1024, &opts, None);
+        assert_eq!(prep.passes.len(), 120);
+        assert_eq!(prep.seeds.len(), all.seeds);
+        let bytes = postcard::to_stdvec(&prep).unwrap();
+        let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
+        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None);
+        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None);
+        stored.timings = direct.timings;
+        direct.timings = stored.timings;
+        assert_eq!(format!("{stored:?}"), format!("{direct:?}"));
+        assert_eq!(direct.refused.not_selected, all.seeds - 120);
+    }
+
+    /// The plane's own β and its sample are `Mode::All`'s when the sample (the 64 brightest unflagged verdict fits)
+    /// lies inside the first k seeds.
+    #[test]
+    fn brightest_k_beta_sample_identical_when_inside_k() {
+        let data = noisy_field(&uniform(600, 1024, 1024, 5), 5);
+        let all = brightest_opts(None);
+        let prep_all = prepare_plane(&data, 1024, 1024, &all, None);
+        let beta_all = plane_beta(&data, 1024, 1024, &all, &prep_all, None);
+        for k in [300usize, 450] {
+            assert!(prep_all.seeds.len() > k);
+            let opts = brightest_opts(Some(k));
+            let prep = prepare_plane(&data, 1024, 1024, &opts, None);
+            let beta = plane_beta(&data, 1024, 1024, &opts, &prep, None);
+            assert_eq!(beta.0.to_bits(), beta_all.0.to_bits(), "k {k}");
+            assert_eq!(beta.1, beta_all.1, "k {k}");
         }
     }
 }
