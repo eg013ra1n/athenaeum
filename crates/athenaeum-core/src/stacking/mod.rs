@@ -87,6 +87,7 @@ pub use crate::star_measure::robust;
 pub mod run;
 pub mod solve;
 pub mod structure;
+pub(crate) mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod weights;

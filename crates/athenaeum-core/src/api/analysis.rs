@@ -135,18 +135,13 @@ pub fn reset_analysis_config(ctx: &ServiceContext) -> Result<AnalysisConfig, Api
 /// boundary, so each wrapper owns that boundary instead and calls this fn
 /// synchronously from inside it).
 ///
-/// `thread_budget` caps the worker-pool concurrency below (was a hardcoded
-/// `16` pre-conversion on both platforms). It's threaded in as a plain
-/// `usize` because it's read from `AppState`/`WebAppState::max_blink_threads`
-/// (`min(vCPUs, 16)`), a platform-state field that has no `ServiceContext`
-/// equivalent — same shape as `set_scan_root_monitor_enabled`'s
-/// `monitor: &MonitorService` param (Task 9 report). Passing the real
-/// per-machine cap here instead of a hardcoded `16` can only ever shrink
-/// the effective ceiling (never raise it, since `max_blink_threads` is
-/// itself `min(vCPUs, 16)`) — see the Task 12 report drift catalog for the
-/// (bounded, disclosed) behavior-tightening this implies for machines with
-/// fewer than 16 cores and a manually-configured `batch_concurrency` above
-/// the core count.
+/// `thread_budget` caps the worker-pool concurrency below. It is read from
+/// `AppState`/`WebAppState::max_blink_threads` (the image pool's size,
+/// `machine::pool_threads`, which has no 16 cap since Task 13c), a
+/// platform-state field that has no `ServiceContext` equivalent: same shape
+/// as `set_scan_root_monitor_enabled`'s `monitor: &MonitorService` param.
+/// The old hardcoded `16` ceiling is gone, so on a machine with more than 16
+/// pool threads a configured `batch_concurrency` above 16 is now honoured.
 pub fn analyze_frame_set(
     ctx: &ServiceContext,
     frame_set_id: i64,

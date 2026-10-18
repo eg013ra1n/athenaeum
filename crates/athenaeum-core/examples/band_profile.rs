@@ -58,6 +58,8 @@ fn main() {
             storage, readers, pool.current_num_threads(),
         ),
         storage,
+        // A band profile of the stacking Integrate shape (Task 13c L3).
+        prefetch_local: true,
     };
     println!("storage {:?}, {} readers", io.storage, io.read_concurrency);
 

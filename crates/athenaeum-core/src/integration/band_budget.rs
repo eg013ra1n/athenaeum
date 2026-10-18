@@ -42,105 +42,11 @@ pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 const CONFIGURED_MIN_MB: usize = 256;
 const CONFIGURED_MAX_MB: usize = 16384;
 
-/// Physical RAM this process may actually use, in bytes.
-///
-/// On Linux this is `min(MemTotal, container limit)` — **load-bearing for the
-/// Docker/web build**: `/proc/meminfo` reports the HOST's RAM inside a
-/// container, so without the cgroup read a 2 GB container would size an 8 GiB
-/// budget and be OOM-killed.
-pub fn total_ram_bytes() -> Option<u64> {
-    platform_total_ram()
-}
-
-#[cfg(target_os = "linux")]
-fn platform_total_ram() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
-    let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
-    linux_total_ram_from(&meminfo, v2.as_deref(), v1.as_deref())
-}
-
-/// Pure computation over `/proc/meminfo`'s content plus the two possible
-/// cgroup limit-file contents. Split out of `platform_total_ram`'s Linux arm
-/// (which does nothing else but read those three files) so the container-
-/// clamping logic itself — not just `parse_cgroup_limit`'s number parsing —
-/// has a test that can run on every dev machine, same treatment as
-/// `parse_cgroup_limit` below.
-///
-/// `v2`/`v1` are `Some(contents)` when that file could be read, `None` when
-/// it doesn't exist (no cgroup there, or a v1-only / non-container host for
-/// `v2`). cgroup v2 wins when it names a real limit; `v2` holding the literal
-/// `max` (or being absent) falls through to v1; neither present is `total`
-/// unmodified.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_total_ram_from(meminfo: &str, v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
-    let mut total = None;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            total = Some(kb.saturating_mul(1024));
-            break;
-        }
-    }
-    let total = total?;
-    let limit = v2.and_then(parse_cgroup_limit).or_else(|| v1.and_then(parse_cgroup_limit));
-    Some(match limit {
-        Some(l) => total.min(l),
-        None => total,
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn platform_total_ram() -> Option<u64> {
-    let mut size: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    let name = b"hw.memsize\0";
-    // SAFETY: `name` is NUL-terminated, `size`/`len` are correctly sized and
-    // owned by this frame, and the new-value pointer is null (a pure read).
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr() as *const libc::c_char,
-            &mut size as *mut u64 as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 && size > 0 { Some(size) } else { None }
-}
-
-#[cfg(windows)]
-fn platform_total_ram() -> Option<u64> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    // SAFETY: MEMORYSTATUSEX is a plain POD struct; zeroing it and stamping
-    // dwLength is exactly the documented calling convention.
-    let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 && st.ullTotalPhys > 0 {
-        Some(st.ullTotalPhys)
-    } else {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
-fn platform_total_ram() -> Option<u64> {
-    None
-}
-
-/// Parse one cgroup memory-limit file. `None` means "no limit here": cgroup v2
-/// writes the literal `max`, and v1 writes a sentinel near `u64::MAX` — a
-/// number that large is not a container limit, it is the absence of one.
-///
-/// Only `platform_total_ram`'s Linux arm calls this in production; it stays a
-/// plain (non-`#[cfg]`) function so its own unit tests run on every dev
-/// machine, including this one.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_cgroup_limit(text: &str) -> Option<u64> {
-    const UNLIMITED_FLOOR: u64 = 1 << 62;
-    let v: u64 = text.trim().parse().ok()?;
-    if v == 0 || v >= UNLIMITED_FLOOR { None } else { Some(v) }
-}
+/// Physical RAM this process may actually use, in bytes. The probe lives in
+/// `services::machine` (Task 13c); re-exported so every caller compiles as is.
+pub use crate::services::machine::total_ram_bytes;
+#[cfg(test)]
+use crate::services::machine::{linux_total_ram_from, parse_cgroup_limit};
 
 /// A quarter of physical RAM, clamped. A quarter and not a half because the
 /// same process also holds the catalog, the render pipeline and the transfer

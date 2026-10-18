@@ -18,7 +18,7 @@ pub struct AppState {
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.
     pub image_semaphore: RwLock<Arc<tokio::sync::Semaphore>>,
-    /// CPU-based upper bound for blink threads (min(vCPUs, 16))
+    /// Upper bound for blink threads: the image pool's size (no 16 cap)
     pub max_blink_threads: usize,
     /// Handle to the background folder-monitoring service. Commands use this
     /// to `kick()` the loop awake when settings change so the user doesn't

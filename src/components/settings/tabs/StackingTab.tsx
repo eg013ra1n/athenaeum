@@ -2,9 +2,11 @@
 // (stage list + inspector) · Default folders. `StackingSection` renders its
 // own two registered sections (`stacking.pipeline`, `stacking.folders`)
 // from ONE component — same shared-element pattern as `AnalysisTab.tsx`.
+// `stacking.compute` is its own KV section.
 // Per-set overrides live on each frame set's own Stacking tab
 // (`src/components/stacking/StackingTab.tsx`), unrelated to this file.
 import StackingSection from '../StackingSection';
+import { StackingComputeSection } from '../sections/StackingComputeSection';
 import { renderTabSections, type TabSectionEntry } from './tabSectionEntry';
 
 const stackingSection = <StackingSection />;
@@ -12,6 +14,7 @@ const stackingSection = <StackingSection />;
 export const STACKING_SECTIONS: TabSectionEntry[] = [
   { sectionId: 'stacking.pipeline', element: stackingSection },
   { sectionId: 'stacking.folders', element: stackingSection },
+  { sectionId: 'stacking.compute', element: <StackingComputeSection /> },
 ];
 
 export function StackingTab() {

@@ -199,6 +199,10 @@ pub struct DrizzleStats {
     pub noise: Vec<f64>,
     /// Per plane, the fraction of output pixels with `W > 0`.
     pub coverage: Vec<f64>,
+    /// Time the deposit loop WAITED for a frame's input (source plane and
+    /// rejection bitmap). Task 13c L2: the next frame is read by a helper
+    /// thread while the current one deposits, so this is the part of the
+    /// read the overlap did not hide, not the read's full duration.
     pub read_ms: u64,
     pub deposit_ms: u64,
     pub bytes_read: u64,
@@ -297,8 +301,8 @@ impl From<IntegrationError> for DrizzleError {
 /// source plane in RAM (`width * height * 4`); when `ln` is set, two more
 /// reference-geometry planes for the per-frame `A`/`B` grids
 /// (`2 * width * height * 4`); and, when `use_rejection` is set, one
-/// reference-geometry `RejBitmap`
-/// (`channels * height * ceil(width / 64) * 8`); and, when `write_coverage`
+/// reference-geometry `RejBitmap`, two of them under the same prefetch
+/// (`2 * channels * height * ceil(width / 64) * 8`); and, when `write_coverage`
 /// is set, `(channels + 1)` count planes (`(channels + 1) * out_w * out_h * 4`:
 /// the kept planes plus the one being counted).
 ///
@@ -325,7 +329,10 @@ pub fn estimate_memory_bytes(
     }
     need += out_w * out_h * 4; // measure_plane's own ADU-scaled copy
     need += out_w * out_h * 4; // B5: detect_fast_data's own `lum` working copy
-    need += width as u64 * height as u64 * 4;
+                               // Task 13c L2: TWO source planes live at once — the one being deposited
+                               // and the next frame's, which the prefetch helper has read (or is
+                               // reading) meanwhile.
+    need += 2 * width as u64 * height as u64 * 4;
     if ln {
         need += 2 * width as u64 * height as u64 * 4;
     }
@@ -333,14 +340,28 @@ pub fn estimate_memory_bytes(
         // B5: one frame's `RejBitmap` (reference geometry) held in RAM —
         // `crate::stacking::rej`'s own on-disk body layout, mirrored here:
         // `channels * height * words` u64 words, `words = ceil(width / 64)`.
+        // Task 13c L2: two are live (the deposited frame's and the
+        // prefetched next one's).
         let words = (width as u64).div_ceil(64);
-        need += channels as u64 * height as u64 * words * 8;
+        need += 2 * channels as u64 * height as u64 * words * 8;
     }
     if write_coverage {
         // Plan 6b-3 D9: the kept count planes plus the one being counted.
         need += (channels as u64 + 1) * out_w * out_h * 4;
     }
     need
+}
+
+/// The bytes `estimate_memory_bytes` charges for the PREFETCHED next frame
+/// (Task 13c L2): one source plane and, with rejection, one `RejBitmap`. A
+/// serial run does not hold them.
+fn prefetch_extra_bytes(input: &DrizzleInput<'_>) -> u64 {
+    let mut extra = input.width as u64 * input.height as u64 * 4;
+    if input.use_rejection {
+        let words = (input.width as u64).div_ceil(64);
+        extra += input.channels as u64 * input.height as u64 * words * 8;
+    }
+    extra
 }
 
 /// Everything [`deposit_band`] needs for one frame's deposit pass, bundled
@@ -643,6 +664,161 @@ pub fn drizzle_group(
     cancel: &AtomicBool,
     progress: &DrizzleProgress<'_>,
 ) -> Result<DrizzleOutput, DrizzleError> {
+    drizzle_group_impl(input, pool, cancel, progress, true)
+}
+
+/// One frame's file inputs for one plane pass: the source plane and, when the
+/// run uses rejection, the frame's bitmap. Read by [`load_frame_inputs`].
+struct LoadedFrame {
+    src: Vec<f32>,
+    width: usize,
+    height: usize,
+    rej: Option<RejBitmap>,
+}
+
+/// Reads everything one deposit iteration needs from disk, in the order the
+/// serial loop always did (open, channel check, geometry, plane, bitmap), so
+/// the first failure and its text are the same wherever this runs.
+fn load_frame_inputs(
+    input: &DrizzleInput<'_>,
+    frame: &DrizzleFrame<'_>,
+    c: usize,
+) -> Result<LoadedFrame, DrizzleError> {
+    let src_path = match frame.cfa {
+        Some(cfa) => cfa.path,
+        None => frame.path,
+    };
+    let reader = PlaneReader::open(src_path)?;
+    // B1 (M3 final fix wave, I1): only `channels` has to match the group; a
+    // frame's own width/height is its SOURCE geometry, `map` places it on
+    // the shared grid. A mosaic is single-plane by definition.
+    let want_channels = if frame.cfa.is_some() {
+        1
+    } else {
+        input.channels
+    };
+    if reader.channels() != want_channels {
+        return Err(DrizzleError::BadInput(format!(
+            "{}: {} channel(s) != expected {}",
+            src_path.display(),
+            reader.channels(),
+            want_channels
+        )));
+    }
+    let width = reader.width();
+    let height = reader.height();
+    if width == 0 || height == 0 {
+        return Err(DrizzleError::BadInput(format!(
+            "{}: source geometry {width}x{height} is empty",
+            src_path.display()
+        )));
+    }
+    let src = reader.read_plane(if frame.cfa.is_some() { 0 } else { c })?;
+    let rej = if input.use_rejection {
+        match frame.rej {
+            Some(path) => Some(
+                RejBitmap::read(path, input.width, input.height, input.channels)
+                    .map_err(|e| DrizzleError::Io(e.to_string()))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(LoadedFrame {
+        src,
+        width,
+        height,
+        rej,
+    })
+}
+
+/// Whether the frame deposits on plane `c` (the loop's own `w <= 0` skip).
+fn frame_deposits(input: &DrizzleInput<'_>, frame: &DrizzleFrame<'_>, c: usize) -> bool {
+    let w = if input.use_weights {
+        frame.weight[c] as f32
+    } else {
+        1.0
+    };
+    w > 0.0
+}
+
+/// Task 13c L2: where the deposit loop gets each frame's inputs. `Serial`
+/// reads on the calling thread (the pre-L2 shape, kept for the equality
+/// tests); `Prefetch` receives them from ONE helper that reads the next
+/// depositing frame while the current one deposits. The helper hands over a
+/// frame's `Result` in frame order and the consumer returns it at that
+/// frame's turn, so a run fails where and with what text it always did.
+enum FrameFeed {
+    Serial,
+    Prefetch(std::sync::mpsc::Receiver<Result<LoadedFrame, DrizzleError>>),
+}
+
+impl FrameFeed {
+    fn start<'scope, 'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        input: &'env DrizzleInput<'env>,
+        c: usize,
+        prefetch: bool,
+    ) -> Self {
+        if !prefetch {
+            return FrameFeed::Serial;
+        }
+        // Rendezvous: the helper holds at most one finished frame while it
+        // waits for the consumer, so one extra source plane is ever alive.
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        // A refused OS thread must not fail the run: warn and read serially.
+        let spawned = std::thread::Builder::new()
+            .name("drizzle-prefetch".into())
+            .spawn_scoped(scope, move || {
+                for frame in input.frames {
+                    if !frame_deposits(input, frame, c) {
+                        continue;
+                    }
+                    let loaded = load_frame_inputs(input, frame, c);
+                    let failed = loaded.is_err();
+                    // A closed receiver means the consumer left (error/cancel).
+                    if tx.send(loaded).is_err() || failed {
+                        return;
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => FrameFeed::Prefetch(rx),
+            Err(e) => {
+                warn!(plane = c, error = %e, "drizzle prefetch thread refused, reading frames serially");
+                FrameFeed::Serial
+            }
+        }
+    }
+
+    fn next(
+        &mut self,
+        input: &DrizzleInput<'_>,
+        frame: &DrizzleFrame<'_>,
+        c: usize,
+    ) -> Result<LoadedFrame, DrizzleError> {
+        match self {
+            FrameFeed::Serial => load_frame_inputs(input, frame, c),
+            FrameFeed::Prefetch(rx) => rx.recv().unwrap_or_else(|_| {
+                // The helper only ends early after sending an error or on a
+                // panic (which the scope re-raises); name it, never hide it.
+                warn!(plane = c, "drizzle prefetch helper ended without a frame");
+                Err(DrizzleError::Io(
+                    "drizzle prefetch helper ended without a frame".to_string(),
+                ))
+            }),
+        }
+    }
+}
+
+fn drizzle_group_impl(
+    input: &DrizzleInput<'_>,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: &DrizzleProgress<'_>,
+    prefetch: bool,
+) -> Result<DrizzleOutput, DrizzleError> {
     if input.channels == 0 {
         return Err(DrizzleError::BadInput("channels must be > 0".to_string()));
     }
@@ -722,6 +898,23 @@ pub fn drizzle_group(
         // Unknown total (ruling R-M3-7): refuse above a flat 4 GiB.
         None => 4 * 1024 * 1024 * 1024,
     };
+    let mut prefetch = prefetch;
+    if need > have && prefetch {
+        // The estimate charges the prefetched frame's plane (and rejection
+        // bitmap) too. A group within that one extra frame of the ceiling
+        // still fits serially: run without the prefetch rather than refuse it.
+        let serial_need = need.saturating_sub(prefetch_extra_bytes(input));
+        if serial_need <= have {
+            info!(
+                need,
+                serial_need,
+                have,
+                "drizzle prefetch would exceed the memory ceiling, reading frames serially"
+            );
+            prefetch = false;
+        }
+    }
+    let need = if prefetch { need } else { need.saturating_sub(prefetch_extra_bytes(input)) };
     if need > have {
         return Err(DrizzleError::Memory { need, have });
     }
@@ -797,261 +990,229 @@ pub fn drizzle_group(
         // told to have taken the tabulated path without a profiler.
         let mut plane_overlap_modes = [0usize; 3];
 
-        for frame in input.frames {
-            // Cancel checked once per frame (perf shape) — the band loop
-            // itself never checks it.
-            if cancel.load(Ordering::Relaxed) {
-                return Err(DrizzleError::Cancelled);
-            }
+        // Task 13c L2: the frame loop runs inside a scope so the prefetch
+        // helper is joined on every exit path (success, error, cancel).
+        let plane_result: Result<(), DrizzleError> = std::thread::scope(|scope| {
+            let mut feed = FrameFeed::start(scope, input, c, prefetch);
+            for frame in input.frames {
+                // Cancel checked once per frame (perf shape) — the band loop
+                // itself never checks it.
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(DrizzleError::Cancelled);
+                }
 
-            // Safe direct index: validated up front (Important 3, above)
-            // that `frame.weight.len() == input.channels` whenever
-            // `use_weights` is on.
-            let w = if input.use_weights {
-                frame.weight[c] as f32
-            } else {
-                1.0
-            };
-            if w <= 0.0 {
+                // Safe direct index: validated up front (Important 3, above)
+                // that `frame.weight.len() == input.channels` whenever
+                // `use_weights` is on.
+                let w = if input.use_weights {
+                    frame.weight[c] as f32
+                } else {
+                    1.0
+                };
+                // The helper's own predicate (`frame_deposits`), so the consumer
+                // and the prefetch helper can never disagree about a frame —
+                // a NaN weight skips on both sides.
+                if !frame_deposits(input, frame, c) {
+                    done_units += 1;
+                    (progress.on_frame)(done_units, total_units);
+                    continue;
+                }
+
+                let read_start = Instant::now();
+                // M4d Task 1 (ruling R-M4d-2): under Bayer drizzle the source of
+                // EVERY plane is the one single-plane mosaic — `plane 0` of it,
+                // three times over (once per output plane), each pass keeping
+                // only the pixels of that plane's own colour.
+                //
+                // Tier A task 11 (Z5, considered and NOT landed): this reads
+                // the SAME mosaic file up to three times per frame (once per
+                // `c` in `0..input.channels`) because the loop nest above is
+                // `for c in 0..channels { for frame in frames { ... } }` — the
+                // PLANE loop is outer, the frame loop inner, on purpose (this
+                // is what keeps only ONE `(i_buf, w_buf)` accumulator pair
+                // alive at a time — `estimate_memory_bytes`'s R-M3-7/16 doc
+                // above states the formula's whole premise as "the channels
+                // output-data planes plus the ONE `I`/`W` accumulator pair
+                // alive at a time", not `channels` pairs). Caching a frame's
+                // decoded mosaic across its three plane passes only pays off
+                // if the SAME frame is visited for `c=1` right after `c=0`,
+                // which this loop order never does — every OTHER frame in the
+                // group is read for `c=0` in between. The only cache that
+                // could still help is "every frame's mosaic held for the whole
+                // group", which costs `frame_count × mosaic_bytes` ON TOP of
+                // the existing per-plane terms `estimate_memory_bytes` already
+                // budgets (104 MB per frame at 6248×4176 f32, so a 50-frame
+                // OSC group would add ≈5.2 GB) — for any group past a handful
+                // of frames this blows well past the R-M3-7 refusal ceiling
+                // (half of probed total RAM, or the 4 GiB floor when unknown),
+                // which the estimate above is checked against BEFORE any
+                // output allocation happens. Restructuring the loop so frame
+                // is outer and all `channels` accumulators are held live
+                // instead trades that same memory pressure for a different
+                // fixed cost (3 output planes × 4× area at 2× scale ≈ 3 × 417
+                // MB ≈ 1.25 GB plus the weight-map planes on a real OSC
+                // group's geometry) and is a materially bigger, riskier change
+                // than this task's scope — so the re-read stays, and only the
+                // per-pixel Z1 skip above lands this task.
+                let loaded = feed.next(input, frame, c)?;
+                let src_width = loaded.width;
+                let src_height = loaded.height;
+                let read_bytes = (src_width * src_height * 4) as u64;
+                plane_bytes_read += read_bytes;
+                bytes_read_total += read_bytes;
+                let read_elapsed = read_start.elapsed();
+                read_duration_total += read_elapsed;
+                plane_read += read_elapsed;
+                let src = loaded.src;
+                let rej_bitmap = loaded.rej;
+
+                let has_ln = input.use_local_normalization && frame.ln.is_some();
+                if has_ln {
+                    let grids = frame.ln.expect("has_ln implies Some");
+                    let grid = grids.channels.get(c).ok_or_else(|| {
+                        DrizzleError::BadInput(format!(
+                            "{}: local-normalization grids have no channel {c}",
+                            frame.path.display()
+                        ))
+                    })?;
+                    if grid.ref_width != input.width || grid.ref_height != input.height {
+                        return Err(DrizzleError::BadInput(format!(
+                            "{}: local-normalization grid geometry {}x{} != group geometry {}x{}",
+                            frame.path.display(),
+                            grid.ref_width,
+                            grid.ref_height,
+                            input.width,
+                            input.height
+                        )));
+                    }
+                    let mut scratch = LnScratch::for_grid(grid);
+                    for y in 0..input.height {
+                        let start = y * input.width;
+                        let end = start + input.width;
+                        grid.evaluate_row_into(
+                            y,
+                            &mut a_plane_buf[start..end],
+                            &mut b_plane_buf[start..end],
+                            &mut scratch,
+                        );
+                    }
+                }
+
+                // Safe direct index: validated up front (Important 3, above)
+                // that `frame.output_pair.len() == input.channels`.
+                let pair = frame.output_pair[c];
+
+                let fwd = frame.map.forward_eval();
+                // Tier A task 11 (Z1), fix round 1 (ruling R-TA-10): a
+                // per-frame constant, sampled across this frame's own native
+                // geometry (NOT the reference geometry — the samples must
+                // land inside the domain `deposit_band` actually indexes) —
+                // see `geom::drop_bound_half_diag`'s doc for the exactness
+                // argument and why it needed correcting.
+                let half_diag = geom::drop_bound_half_diag(
+                    frame.map,
+                    src_width,
+                    src_height,
+                    input.drop_shrink,
+                    input.scale,
+                );
+                // Tier C item C2 (spec §3.2, ruling C-3): with no distortion
+                // layer the mapped drop is ONE parallelogram for the whole
+                // frame, so its overlap areas tabulate once here — see
+                // `SquareOverlapPlan::resolve`, which the C2 pins drive too.
+                let overlap_plan = SquareOverlapPlan::resolve(
+                    input.kernel,
+                    frame.map,
+                    src_width,
+                    src_height,
+                    input.scale,
+                    input.drop_shrink,
+                    input.force_exact_overlap_for_measurement,
+                );
+                let overlap = overlap_plan.overlap();
+                plane_overlap_modes[match overlap {
+                    SquareOverlap::Exact => 0,
+                    SquareOverlap::Frame(_) => 1,
+                    SquareOverlap::Tiled => 2,
+                }] += 1;
+
+                let ctx = FrameDepositCtx {
+                    src: &src,
+                    src_width,
+                    src_height,
+                    ref_width: input.width,
+                    ref_height: input.height,
+                    map: frame.map,
+                    fwd,
+                    half_diag,
+                    scale: input.scale,
+                    drop_shrink: input.drop_shrink,
+                    kernel: input.kernel,
+                    kernel_table: kernel_table.as_ref(),
+                    rej: rej_bitmap.as_ref(),
+                    ln: has_ln.then(|| (&a_plane_buf[..], &b_plane_buf[..])),
+                    pair,
+                    w,
+                    plane: c,
+                    cfa: frame.cfa.map(|s| s.pattern),
+                    overlap,
+                };
+
+                let deposit_start = Instant::now();
+                pool.install(|| {
+                    if input.write_coverage {
+                        i_buf
+                            .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
+                            .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                            .zip(cov_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                            .enumerate()
+                            .for_each_init(
+                                // A per-worker snapshot buffer, reused across bands,
+                                // frames and planes (fix round 1).
+                                Vec::<f32>::new,
+                                |before, (band_idx, ((ib, wb), cb))| {
+                                    before.clear();
+                                    before.extend_from_slice(wb);
+                                    deposit_band(ib, wb, band_idx, out_w, &ctx);
+                                    for ((count, &after), &prior) in
+                                        cb.iter_mut().zip(wb.iter()).zip(before.iter())
+                                    {
+                                        if after > prior {
+                                            *count += 1.0;
+                                        }
+                                    }
+                                },
+                            );
+                    } else {
+                        i_buf
+                            .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
+                            .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                            .enumerate()
+                            .for_each(|(band_idx, (ib, wb))| {
+                                deposit_band(ib, wb, band_idx, out_w, &ctx);
+                            });
+                    }
+                });
+                let deposit_elapsed = deposit_start.elapsed();
+                deposit_duration_total += deposit_elapsed;
+                plane_deposit += deposit_elapsed;
+                // Ruling R-T4-6c: this frame's pixel work is done for this
+                // plane, so its displacement grid goes back now. The plane
+                // loop is the OUTER one, so a frame's next plane is separated
+                // from this one by every other frame's deposit — holding the
+                // grid until then is exactly the "every frame's grid alive at
+                // once" shape that made a `tps` drizzle thrash. An OSC frame
+                // therefore rebuilds its forward grid once per plane; that is
+                // the documented cost of the spline arm.
+                drop(ctx);
+                released_bytes += frame.map.release_grids() as u64;
+
                 done_units += 1;
                 (progress.on_frame)(done_units, total_units);
-                continue;
             }
-
-            let read_start = Instant::now();
-            // M4d Task 1 (ruling R-M4d-2): under Bayer drizzle the source of
-            // EVERY plane is the one single-plane mosaic — `plane 0` of it,
-            // three times over (once per output plane), each pass keeping
-            // only the pixels of that plane's own colour.
-            //
-            // Tier A task 11 (Z5, considered and NOT landed): this reads
-            // the SAME mosaic file up to three times per frame (once per
-            // `c` in `0..input.channels`) because the loop nest above is
-            // `for c in 0..channels { for frame in frames { ... } }` — the
-            // PLANE loop is outer, the frame loop inner, on purpose (this
-            // is what keeps only ONE `(i_buf, w_buf)` accumulator pair
-            // alive at a time — `estimate_memory_bytes`'s R-M3-7/16 doc
-            // above states the formula's whole premise as "the channels
-            // output-data planes plus the ONE `I`/`W` accumulator pair
-            // alive at a time", not `channels` pairs). Caching a frame's
-            // decoded mosaic across its three plane passes only pays off
-            // if the SAME frame is visited for `c=1` right after `c=0`,
-            // which this loop order never does — every OTHER frame in the
-            // group is read for `c=0` in between. The only cache that
-            // could still help is "every frame's mosaic held for the whole
-            // group", which costs `frame_count × mosaic_bytes` ON TOP of
-            // the existing per-plane terms `estimate_memory_bytes` already
-            // budgets (104 MB per frame at 6248×4176 f32, so a 50-frame
-            // OSC group would add ≈5.2 GB) — for any group past a handful
-            // of frames this blows well past the R-M3-7 refusal ceiling
-            // (half of probed total RAM, or the 4 GiB floor when unknown),
-            // which the estimate above is checked against BEFORE any
-            // output allocation happens. Restructuring the loop so frame
-            // is outer and all `channels` accumulators are held live
-            // instead trades that same memory pressure for a different
-            // fixed cost (3 output planes × 4× area at 2× scale ≈ 3 × 417
-            // MB ≈ 1.25 GB plus the weight-map planes on a real OSC
-            // group's geometry) and is a materially bigger, riskier change
-            // than this task's scope — so the re-read stays, and only the
-            // per-pixel Z1 skip above lands this task.
-            let src_path = match frame.cfa {
-                Some(cfa) => cfa.path,
-                None => frame.path,
-            };
-            let reader = PlaneReader::open(src_path)?;
-            // B1 (M3 final fix wave, I1): only `channels` has to match the
-            // group — a frame's own width/height is read straight off the
-            // file and carried through as its SOURCE geometry; `map`
-            // (subject → reference) is what places it correctly on the
-            // shared output grid regardless of how it compares to the
-            // reference's own size. A mosaic is single-plane by definition,
-            // and its own geometry is the frame's native one (the debayer
-            // runs at native resolution), so the same `map` carries it.
-            let want_channels = if frame.cfa.is_some() {
-                1
-            } else {
-                input.channels
-            };
-            if reader.channels() != want_channels {
-                return Err(DrizzleError::BadInput(format!(
-                    "{}: {} channel(s) != expected {}",
-                    src_path.display(),
-                    reader.channels(),
-                    want_channels
-                )));
-            }
-            let src_width = reader.width();
-            let src_height = reader.height();
-            if src_width == 0 || src_height == 0 {
-                return Err(DrizzleError::BadInput(format!(
-                    "{}: source geometry {src_width}x{src_height} is empty",
-                    src_path.display()
-                )));
-            }
-            let src = reader.read_plane(if frame.cfa.is_some() { 0 } else { c })?;
-            let read_bytes = (src_width * src_height * 4) as u64;
-            plane_bytes_read += read_bytes;
-            bytes_read_total += read_bytes;
-            let read_elapsed = read_start.elapsed();
-            read_duration_total += read_elapsed;
-            plane_read += read_elapsed;
-
-            let rej_bitmap = if input.use_rejection {
-                match frame.rej {
-                    Some(path) => Some(
-                        RejBitmap::read(path, input.width, input.height, input.channels)
-                            .map_err(|e| DrizzleError::Io(e.to_string()))?,
-                    ),
-                    None => None,
-                }
-            } else {
-                None
-            };
-
-            let has_ln = input.use_local_normalization && frame.ln.is_some();
-            if has_ln {
-                let grids = frame.ln.expect("has_ln implies Some");
-                let grid = grids.channels.get(c).ok_or_else(|| {
-                    DrizzleError::BadInput(format!(
-                        "{}: local-normalization grids have no channel {c}",
-                        frame.path.display()
-                    ))
-                })?;
-                if grid.ref_width != input.width || grid.ref_height != input.height {
-                    return Err(DrizzleError::BadInput(format!(
-                        "{}: local-normalization grid geometry {}x{} != group geometry {}x{}",
-                        frame.path.display(),
-                        grid.ref_width,
-                        grid.ref_height,
-                        input.width,
-                        input.height
-                    )));
-                }
-                let mut scratch = LnScratch::for_grid(grid);
-                for y in 0..input.height {
-                    let start = y * input.width;
-                    let end = start + input.width;
-                    grid.evaluate_row_into(
-                        y,
-                        &mut a_plane_buf[start..end],
-                        &mut b_plane_buf[start..end],
-                        &mut scratch,
-                    );
-                }
-            }
-
-            // Safe direct index: validated up front (Important 3, above)
-            // that `frame.output_pair.len() == input.channels`.
-            let pair = frame.output_pair[c];
-
-            let fwd = frame.map.forward_eval();
-            // Tier A task 11 (Z1), fix round 1 (ruling R-TA-10): a
-            // per-frame constant, sampled across this frame's own native
-            // geometry (NOT the reference geometry — the samples must
-            // land inside the domain `deposit_band` actually indexes) —
-            // see `geom::drop_bound_half_diag`'s doc for the exactness
-            // argument and why it needed correcting.
-            let half_diag = geom::drop_bound_half_diag(
-                frame.map,
-                src_width,
-                src_height,
-                input.drop_shrink,
-                input.scale,
-            );
-            // Tier C item C2 (spec §3.2, ruling C-3): with no distortion
-            // layer the mapped drop is ONE parallelogram for the whole
-            // frame, so its overlap areas tabulate once here — see
-            // `SquareOverlapPlan::resolve`, which the C2 pins drive too.
-            let overlap_plan = SquareOverlapPlan::resolve(
-                input.kernel,
-                frame.map,
-                src_width,
-                src_height,
-                input.scale,
-                input.drop_shrink,
-                input.force_exact_overlap_for_measurement,
-            );
-            let overlap = overlap_plan.overlap();
-            plane_overlap_modes[match overlap {
-                SquareOverlap::Exact => 0,
-                SquareOverlap::Frame(_) => 1,
-                SquareOverlap::Tiled => 2,
-            }] += 1;
-
-            let ctx = FrameDepositCtx {
-                src: &src,
-                src_width,
-                src_height,
-                ref_width: input.width,
-                ref_height: input.height,
-                map: frame.map,
-                fwd,
-                half_diag,
-                scale: input.scale,
-                drop_shrink: input.drop_shrink,
-                kernel: input.kernel,
-                kernel_table: kernel_table.as_ref(),
-                rej: rej_bitmap.as_ref(),
-                ln: has_ln.then(|| (&a_plane_buf[..], &b_plane_buf[..])),
-                pair,
-                w,
-                plane: c,
-                cfa: frame.cfa.map(|s| s.pattern),
-                overlap,
-            };
-
-            let deposit_start = Instant::now();
-            pool.install(|| {
-                if input.write_coverage {
-                    i_buf
-                        .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
-                        .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
-                        .zip(cov_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
-                        .enumerate()
-                        .for_each_init(
-                            // A per-worker snapshot buffer, reused across bands,
-                            // frames and planes (fix round 1).
-                            Vec::<f32>::new,
-                            |before, (band_idx, ((ib, wb), cb))| {
-                                before.clear();
-                                before.extend_from_slice(wb);
-                                deposit_band(ib, wb, band_idx, out_w, &ctx);
-                                for ((count, &after), &prior) in
-                                    cb.iter_mut().zip(wb.iter()).zip(before.iter())
-                                {
-                                    if after > prior {
-                                        *count += 1.0;
-                                    }
-                                }
-                            },
-                        );
-                } else {
-                    i_buf
-                        .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
-                        .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
-                        .enumerate()
-                        .for_each(|(band_idx, (ib, wb))| {
-                            deposit_band(ib, wb, band_idx, out_w, &ctx);
-                        });
-                }
-            });
-            let deposit_elapsed = deposit_start.elapsed();
-            deposit_duration_total += deposit_elapsed;
-            plane_deposit += deposit_elapsed;
-            // Ruling R-T4-6c: this frame's pixel work is done for this
-            // plane, so its displacement grid goes back now. The plane
-            // loop is the OUTER one, so a frame's next plane is separated
-            // from this one by every other frame's deposit — holding the
-            // grid until then is exactly the "every frame's grid alive at
-            // once" shape that made a `tps` drizzle thrash. An OSC frame
-            // therefore rebuilds its forward grid once per plane; that is
-            // the documented cost of the spline arm.
-            drop(ctx);
-            released_bytes += frame.map.release_grids() as u64;
-
-            done_units += 1;
-            (progress.on_frame)(done_units, total_units);
-        }
+            Ok(())
+        });
+        plane_result?;
 
         for idx in 0..plane_out_pixels {
             data[c * plane_out_pixels + idx] = if w_buf[idx] > 0.0 {
@@ -2857,10 +3018,11 @@ mod tests {
         let weight_map = channels as u64 * out_w * out_h * 4;
         let measure_scratch = out_w * out_h * 4;
         let detector_scratch = out_w * out_h * 4;
-        let source = width as u64 * height as u64 * 4;
+        // Task 13c L2: the deposited frame's plane plus the prefetched next one.
+        let source = 2 * width as u64 * height as u64 * 4;
         let ln_planes = 2 * width as u64 * height as u64 * 4;
         let words = (width as u64).div_ceil(64);
-        let rej_bitmap = channels as u64 * height as u64 * words * 8;
+        let rej_bitmap = 2 * channels as u64 * height as u64 * words * 8;
         // Plan 6b-3 D9: `channels + 1` count planes; at 3 channels this is
         // distinguishable from a flat `2` or `channels`.
         let coverage_planes = (channels as u64 + 1) * out_w * out_h * 4;
@@ -4240,5 +4402,235 @@ mod tests {
             shrunk_exact.1, shrunk_table.1,
             "at dropShrink 0.9 the gate must let the table through"
         );
+    }
+
+    // ── Task 13c L2: the next frame is read while the current one deposits ──
+
+    fn run_impl(
+        input: &DrizzleInput<'_>,
+        prefetch: bool,
+        cancel: &AtomicBool,
+        progress: &DrizzleProgress<'_>,
+    ) -> Result<DrizzleOutput, DrizzleError> {
+        drizzle_group_impl(input, &pool(), cancel, progress, prefetch)
+    }
+
+    fn assert_same_bits(a: &DrizzleOutput, b: &DrizzleOutput) {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.data), bits(&b.data), "data");
+        assert_eq!(
+            a.weight.as_deref().map(bits),
+            b.weight.as_deref().map(bits),
+            "weight"
+        );
+        assert_eq!(a.stats.bytes_read, b.stats.bytes_read);
+        assert_eq!(a.stats.coverage, b.stats.coverage);
+    }
+
+    #[test]
+    fn prefetch_matches_serial_mono_with_a_zero_weight_frame_and_a_rejection_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let d = gaussian_field(W, H, &[(20.0 + i as f64, 20.0, 0.5)], 2.0, 0.01);
+                write_mono(dir.path(), &format!("f{i}.fits"), W, H, &d)
+            })
+            .collect();
+        let stems: Vec<String> = (0..4).map(|i| format!("f{i}")).collect();
+        let set = RejBitmapSet::create(&dir.path().join("rej"), &stems, W, H, 1).unwrap();
+        let words = W.div_ceil(64);
+        let mut band = vec![0u64; H * 4 * words];
+        for row in 0..H {
+            band[(row * 4 + 3) * words] = 0x0f0f_0f0f_0f0f_0f0f;
+        }
+        set.plane_sink(0).record_band(0, H, &band).unwrap();
+        let rej3 = set.path(3).to_path_buf();
+        let maps: Vec<PixelMap> = (0..4)
+            .map(|i| translation_map(i as f64 * 0.3, 0.2))
+            .collect();
+        let weights: [[f64; 1]; 4] = [[1.0], [0.7], [0.0], [1.3]];
+        let pair = identity_pair();
+        let frames: Vec<DrizzleFrame<'_>> = (0..4)
+            .map(|i| {
+                let mut f = frame(&paths[i], &maps[i], &weights[i], &pair);
+                if i == 3 {
+                    f.rej = Some(&rej3);
+                }
+                f
+            })
+            .collect();
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        input.use_rejection = true;
+        input.write_coverage = true;
+        let no = AtomicBool::new(false);
+        let serial = run_impl(&input, false, &no, &no_progress()).unwrap();
+        let ahead = run_impl(&input, true, &no, &no_progress()).unwrap();
+        assert_same_bits(&serial, &ahead);
+        assert_eq!(
+            serial.coverage.as_deref().map(|v| v.to_vec()),
+            ahead.coverage.as_deref().map(|v| v.to_vec())
+        );
+    }
+
+    #[test]
+    fn prefetch_matches_serial_for_osc_bayer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mosaics = Vec::new();
+        let mut debayered = Vec::new();
+        for i in 0..3 {
+            let mut m = rggb_mosaic(W, H, 0.4, 0.6, 0.2);
+            m[i * 7] = 0.9;
+            mosaics.push(write_mono(dir.path(), &format!("c_f{i}.fits"), W, H, &m));
+            let dp = dir.path().join(format!("c_f{i}_d.fits"));
+            write_fits_f32(&dp, W, H, 3, &vec![9.0f32; W * H * 3], &[]).unwrap();
+            debayered.push(dp);
+        }
+        let map = identity_map();
+        let weights = [[1.0f64; 3], [0.0; 3], [0.5; 3]];
+        let pair = [NormalizationPair::IDENTITY; 3];
+        let frames: Vec<DrizzleFrame<'_>> = (0..3)
+            .map(|i| cfa_frame(&debayered[i], &mosaics[i], &map, &weights[i], &pair))
+            .collect();
+        let measure = MeasureOptions::default();
+        let input = cfa_input(&frames, &measure, 2);
+        let no = AtomicBool::new(false);
+        let serial = run_impl(&input, false, &no, &no_progress()).unwrap();
+        let ahead = run_impl(&input, true, &no, &no_progress()).unwrap();
+        assert_same_bits(&serial, &ahead);
+    }
+
+    #[test]
+    fn prefetch_fails_at_the_same_frame_with_the_same_error_as_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = uniform(W, H, 0.3);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &d);
+        let p1 = write_mono(dir.path(), "f1.fits", W, H, &d);
+        let missing = dir.path().join("missing.fits");
+        let p3 = write_mono(dir.path(), "f3.fits", W, H, &d);
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [
+            frame(&p0, &map, &weight, &pair),
+            frame(&p1, &map, &weight, &pair),
+            frame(&missing, &map, &weight, &pair),
+            frame(&p3, &map, &weight, &pair),
+        ];
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+        let no = AtomicBool::new(false);
+        let run = |prefetch: bool| {
+            let done = std::sync::atomic::AtomicUsize::new(0);
+            let on_frame = |n: usize, _t: usize| done.store(n, Ordering::SeqCst);
+            let progress = DrizzleProgress {
+                on_frame: &on_frame,
+            };
+            let err = run_impl(&input, prefetch, &no, &progress).unwrap_err();
+            (format!("{err:?}"), done.load(Ordering::SeqCst))
+        };
+        let (serial_err, serial_done) = run(false);
+        let (ahead_err, ahead_done) = run(true);
+        assert_eq!(serial_err, ahead_err);
+        assert_eq!(serial_done, 2, "frames before the failing one deposited");
+        assert_eq!(ahead_done, serial_done);
+    }
+
+    #[test]
+    fn prefetch_cancel_mid_group_returns_cancelled_and_joins_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = uniform(W, H, 0.3);
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|i| write_mono(dir.path(), &format!("f{i}.fits"), W, H, &d))
+            .collect();
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames: Vec<DrizzleFrame<'_>> = paths
+            .iter()
+            .map(|p| frame(p, &map, &weight, &pair))
+            .collect();
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+        let cancel = AtomicBool::new(false);
+        let on_frame = |n: usize, _t: usize| {
+            if n == 2 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        };
+        let progress = DrizzleProgress {
+            on_frame: &on_frame,
+        };
+        let err = run_impl(&input, true, &cancel, &progress).unwrap_err();
+        assert!(matches!(err, DrizzleError::Cancelled), "{err:?}");
+    }
+
+    /// Final review B, M1: the consumer skips with the helper's own
+    /// predicate, so a NaN weight (skipped by both) cannot desynchronise the
+    /// prefetch feed from the loop.
+    #[test]
+    fn prefetch_matches_serial_with_a_nan_weight_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let d = gaussian_field(W, H, &[(20.0 + i as f64, 20.0, 0.5)], 2.0, 0.01);
+                write_mono(dir.path(), &format!("n{i}.fits"), W, H, &d)
+            })
+            .collect();
+        let maps: Vec<PixelMap> = (0..4).map(|i| translation_map(i as f64 * 0.3, 0.2)).collect();
+        let weights: [[f64; 1]; 4] = [[1.0], [f64::NAN], [0.8], [1.2]];
+        let pair = identity_pair();
+        let frames: Vec<DrizzleFrame<'_>> =
+            (0..4).map(|i| frame(&paths[i], &maps[i], &weights[i], &pair)).collect();
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+        let no = AtomicBool::new(false);
+        let serial = run_impl(&input, false, &no, &no_progress()).unwrap();
+        let ahead = run_impl(&input, true, &no, &no_progress()).unwrap();
+        assert_same_bits(&serial, &ahead);
+    }
+
+    /// Final review B, M2: a group whose prefetch estimate is over the
+    /// R-M3-7 ceiling but whose serial one fits runs serially instead of
+    /// being refused; one over even the serial figure is still refused.
+    #[test]
+    fn prefetch_estimate_over_the_ceiling_falls_back_to_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = uniform(W, H, 0.3);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| write_mono(dir.path(), &format!("q{i}.fits"), W, H, &d))
+            .collect();
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames: Vec<DrizzleFrame<'_>> =
+            paths.iter().map(|p| frame(p, &map, &weight, &pair)).collect();
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        let need = estimate_memory_bytes(
+            input.width,
+            input.height,
+            input.channels,
+            input.scale,
+            input.use_local_normalization,
+            input.write_weight_map,
+            input.use_rejection,
+            input.write_coverage,
+        );
+        let serial_need = need - prefetch_extra_bytes(&input);
+        // have = total / 2: land it between the serial and the prefetch need.
+        input.ram_total_bytes = Some(serial_need * 2 + 2);
+        assert!(serial_need < need);
+        let no = AtomicBool::new(false);
+        let reference = {
+            let mut open = base_input(&frames, &measure);
+            open.ram_total_bytes = None;
+            run_impl(&open, false, &no, &no_progress()).unwrap()
+        };
+        let got = run_impl(&input, true, &no, &no_progress()).expect("must fall back to serial");
+        assert_same_bits(&reference, &got);
+        input.ram_total_bytes = Some(serial_need);
+        let err = run_impl(&input, true, &no, &no_progress()).unwrap_err();
+        assert!(matches!(err, DrizzleError::Memory { .. }), "{err:?}");
     }
 }

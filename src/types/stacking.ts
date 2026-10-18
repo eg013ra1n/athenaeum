@@ -695,7 +695,14 @@ fwhmPx: Array<number>, eccentricity: Array<number>, noise: Array<number>,
 /**
  * Per plane, the fraction of output pixels with `W > 0`.
  */
-coverage: Array<number>, readMs: number, depositMs: number, bytesRead: number, };
+coverage: Array<number>, 
+/**
+ * Time the deposit loop WAITED for a frame's input (source plane and
+ * rejection bitmap). Task 13c L2: the next frame is read by a helper
+ * thread while the current one deposits, so this is the part of the
+ * read the overlap did not hide, not the read's full duration.
+ */
+readMs: number, depositMs: number, bytesRead: number, };
 
 export type MasterLightKind = "master" | "drizzle" | "weightMap" | "coverage" | "drizzleCoverage";
 

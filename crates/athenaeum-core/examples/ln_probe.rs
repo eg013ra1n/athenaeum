@@ -525,6 +525,7 @@ registration row for each — run stacking through Register first); found {}",
         band_budget_bytes: 1 << 30,
         read_concurrency: 4,
         storage: StorageClass::Local,
+        prefetch_local: true,
     };
     let cancel = AtomicBool::new(false);
     let on_progress = |plane: usize, total: usize| eprintln!("reference: plane {plane}/{total}");
@@ -643,14 +644,14 @@ registration row for each — run stacking through Register first); found {}",
         // `measure_frame_with_fits` stage 3 calls. Production reads a
         // cached `.athf` instead, so that time is reported SEPARATELY and
         // subtracted from the calibration's own wall time below.
-        let fits_ms = std::cell::Cell::new(0u128);
+        let fits_ms = std::sync::atomic::AtomicU64::new(0);
         let load_fits = |i: usize| -> Vec<Vec<athenaeum_core::stacking::psf_signal::StarFit>> {
             let t = Instant::now();
             let out =
                 measure_frame_with_fits(&stack_frames[i].path, &measure_opts, Some(&pool), &cancel)
                     .map(|(_, fits)| fits)
                     .unwrap_or_default();
-            fits_ms.set(fits_ms.get() + t.elapsed().as_millis());
+            fits_ms.fetch_add(t.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
             out
         };
         let started = Instant::now();
@@ -672,6 +673,7 @@ registration row for each — run stacking through Register first); found {}",
             &|done, total, frame_id| {
                 eprintln!("calibration: frame {}/{total} (id {frame_id})", done + 1);
             },
+            &ln_calibration::run_jobs_serial,
         );
         let total_ms = started.elapsed().as_millis();
         match measured {
@@ -682,7 +684,7 @@ registration row for each — run stacking through Register first); found {}",
 catalog has no artifact for)",
                     k.k,
                     total_ms as f64 / 1000.0,
-                    fits_ms.get() as f64 / 1000.0
+                    fits_ms.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0
                 );
                 measured_calibration = serde_json::json!({
                     "frameIds": k.frame_ids,
@@ -693,8 +695,8 @@ catalog has no artifact for)",
                         "outcome": format!("{:?}", c.outcome),
                     })).collect::<Vec<_>>(),
                     "wallMs": total_ms as u64,
-                    "loadFitsMs": fits_ms.get() as u64,
-                    "netMs": total_ms.saturating_sub(fits_ms.get()) as u64,
+                    "loadFitsMs": fits_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    "netMs": total_ms.saturating_sub(fits_ms.load(std::sync::atomic::Ordering::Relaxed) as u128) as u64,
                 });
             }
             None => eprintln!("calibration: no measurement (cancelled or no scratch directory)"),

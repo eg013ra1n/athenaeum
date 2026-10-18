@@ -720,6 +720,21 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     ],
   },
 
+  {
+    id: 'stacking.compute',
+    tab: 'stacking',
+    title: 'Compute',
+    description: 'How many frames the per-frame stacking stages work on at once.',
+    fields: [
+      {
+        id: 'memoryBudget',
+        label: 'Frame memory budget (MB)',
+        help: 'Memory the per-frame stages (Calibrate, Measure, Register, Normalize) may use for frames in flight — more lets more frames run at once, up to the CPU threads; 0 = automatic, and a value above the machine\'s memory is capped to it.',
+        keywords: ['compute.memory_budget_mb', 'memory', 'threads', 'frames in flight', 'parallel'],
+      },
+    ],
+  },
+
   // ── Transfers ────────────────────────────────────────────────────────────
   {
     id: 'transfers.account',

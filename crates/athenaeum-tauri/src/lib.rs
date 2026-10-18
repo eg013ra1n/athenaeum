@@ -55,9 +55,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage({
-            let max_threads = std::thread::available_parallelism()
-                .map(|n| n.get().min(16))
-                .unwrap_or(4);
+            let (max_threads, pool_why) =
+                athenaeum_core::services::machine::pool_threads(athenaeum_core::services::machine::profile());
+            athenaeum_core::services::machine::log_compute_budget_resolved(max_threads, pool_why);
             // Limit concurrent image processing to half of available cores.
             // Each annotated request runs converter + analyzer sequentially,
             // both using pool.install(). Too many concurrent requests starve

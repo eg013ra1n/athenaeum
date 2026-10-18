@@ -41,6 +41,7 @@ fn fixed_io_policy() -> IoPolicy {
         band_budget_bytes: MIN_BUDGET_BYTES,
         read_concurrency: 1,
         storage: StorageClass::Local,
+        prefetch_local: false,
     }
 }
 

@@ -127,3 +127,16 @@ module's `ENV_LOCK` — see `logging/mod.rs::tests` for both patterns.
   snake_case dictionary fields; new field names go through the spec.
 - Never `println!`/`eprintln!` in production code (grep-gated); never log
   secrets or full header dumps.
+
+## Memory diagnostics (stacking, dev only)
+
+Every stacking stage start logs a debug `memory relief` line (footprint before / after the allocator's free-page release) and the run logs debug `memory checkpoint` lines at named points. `ATH_VMMAP_DIAG=1` (macOS only, default off) additionally writes `vmmap --summary <own pid>` at each stage start to `<log dir>/vmmap/<run_id>-<stage>-<group>.txt`; a spawn failure logs a `warn!` and the stage carries on.
+
+## Other environment switches you will see in the logs
+
+| Variable | Effect | Logged as |
+| ---- | ---- | ---- |
+| `RAYON_NUM_THREADS=<n>` | Sizes the image pool on both hosts (and rayon's global pool) and overrides machine discovery. Read once at start. | `pool_threads`, `pool_why = "env"` on `compute budget resolved`; a value that is not a positive integer `warn!`s and the pool is sized automatically |
+| `ATHENAEUM_TOKEN_STORE=file` | A release build keeps the hub token in the 0600 file only, never the OS keychain. Debug builds always do. The lab servers set it, so a rebuilt ad-hoc-signed binary never raises a keychain prompt. | one info `token store: file only` at the first account call; any other value `warn!`s once and is ignored |
+
+Both are described in `docs/stacking/README.md` R-OSP-13 (Task 13c).

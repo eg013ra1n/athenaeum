@@ -60,8 +60,18 @@ value, a default or render code. Two consumers read it: the search index
 | Analysis | `analysis.detection` `analysis.measurement` `analysis.psf` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
 | Calibration | `calibration.matching` `calibration.memory` `calibration.masterFormat` |
-| Stacking | `stacking.pipeline` `stacking.folders` |
+| Stacking | `stacking.pipeline` `stacking.folders` `stacking.compute` |
 | Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.collabStreams` `transfers.storage` |
+
+`stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",
+`StackingComputeSection`, `SettingNumber` with `intCodec(0, 1048576)`, generic `get_setting` / `set_setting`, default
+`"0"` in `defaults::all()`). It caps the memory the per-frame stacking stages (Calibrate, Measure, Register, Normalize)
+may use for frames in flight, and every fan-out re-reads it. `0` = automatic = a quarter of the memory the process may
+use (the cgroup / job limit when it is below physical memory, else physical memory). A value above that memory is
+**clamped to it in Rust** (`services::machine::memory_budget_from`, `budget_why = "setting-clamped"`, one `warn!` per
+value), because the codec cannot know the machine. `1` is valid: one frame in flight. Integrate and Drizzle ignore it;
+they keep `integration.band_budget_mb` and their own budgets. The thread count is not a setting:
+`RAYON_NUM_THREADS` (environment, read at start) is the override (`docs/stacking/README.md` R-OSP-13).
 
 ## 3. Render it — the field components and the autosave rule
 

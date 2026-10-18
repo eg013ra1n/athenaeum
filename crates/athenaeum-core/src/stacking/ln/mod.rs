@@ -68,9 +68,9 @@ pub use background::{
 };
 pub use selection::{rank_candidates, Candidates, SaturationMask, SelectionRule, SelectionSide};
 pub use calibration::{
-    calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
-    ChannelCalibration, ChannelOutcome, SeedsCalibration, SEEDS_CALIBRATION_BAND,
-    SEEDS_CALIBRATION_FRAMES, SEEDS_CALIBRATION_MIN_RATIOS,
+    calibration_k, measure_seeds_calibration, run_jobs_serial, select_calibration_frames,
+    CalibrationMeasurement, ChannelCalibration, ChannelOutcome, RunJobs, SeedsCalibration,
+    SEEDS_CALIBRATION_BAND, SEEDS_CALIBRATION_FRAMES, SEEDS_CALIBRATION_MIN_RATIOS,
 };
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{
@@ -1899,6 +1899,7 @@ mod tests {
                 None,
                 &cancel,
                 &|_, _, _| {},
+                &calibration::run_jobs_serial,
             );
         });
         let lines = scale_lines(&logs);
@@ -1912,6 +1913,180 @@ mod tests {
                 "{l}"
             );
         }
+    }
+
+    /// Task 13c L17: the 2 x N calibration arms land BY JOB INDEX, so a serial
+    /// executor and a 4-worker one give the same measurement bit for bit —
+    /// including a frame whose seeds arm fails (the skip branch) — and a
+    /// cancel returns `None`.
+    #[test]
+    fn calibration_arms_land_by_index_whatever_the_concurrency() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let reference_plane = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames: Vec<StackFrame> = Vec::new();
+        for f in 0..4usize {
+            let target_stars: Vec<(f64, f64, f64)> = stars
+                .iter()
+                .map(|&(x, y, a)| (x, y, a * (0.8 + 0.05 * f as f64)))
+                .collect();
+            let plane = synthetic_star_field(W, H, &target_stars, 4.2, 0.002, 20 + f as u64);
+            let path = dir.path().join(format!("t{f}.fits"));
+            write_fits_f32(&path, W, H, 1, &plane, &[]).unwrap();
+            frames.push(StackFrame {
+                path,
+                map: PixelMap::linear(Linear::identity()).unwrap(),
+                measurement: FrameMeasurement {
+                    width: W,
+                    height: H,
+                    channels: vec![Default::default()],
+                    duration_ms: 0,
+                },
+                weight: FrameWeight {
+                    channels: vec![1.0],
+                    normalized: vec![1.0],
+                    mean: 1.0,
+                    normalized_mean: 1.0,
+                    missing: None,
+                },
+                exposure_s: 180.0,
+                date_obs: None,
+                frame_id: 100 + f as i64,
+                registered_path: None,
+            });
+        }
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection = LnReferenceForDetection::build(
+            &reference,
+            PsfModel::Moffat4,
+            measure.max_stars,
+            None,
+            None,
+        );
+        let ref_bg = ref_models(&reference, cfg.scale);
+        let cancel = AtomicBool::new(false);
+        // The seeds arm of calibration slot 2 (job 4) fails.
+        fn failing<'a>(
+            job: &'a (dyn Fn(usize) -> Option<LnFrameOutcome> + Sync),
+        ) -> impl Fn(usize) -> Option<LnFrameOutcome> + Sync + 'a {
+            move |j: usize| if j == 4 { None } else { job(j) }
+        }
+        let seen: Mutex<Vec<Vec<Option<Vec<u32>>>>> = Mutex::new(Vec::new());
+        let record = |out: &[Option<LnFrameOutcome>]| {
+            let bits = out
+                .iter()
+                .map(|o| {
+                    o.as_ref()
+                        .map(|o| o.channel_scales.iter().map(|v| v.to_bits() as u32).collect())
+                })
+                .collect();
+            seen.lock().unwrap().push(bits);
+        };
+        let run = |exec: &calibration::RunJobs<'_>, ids: &Mutex<Vec<usize>>| {
+            let progress = |_d: usize, _t: usize, id: i64| {
+                ids.lock().unwrap().push(id as usize);
+            };
+            measure_seeds_calibration(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                &frames,
+                &[0, 1, 2, 3],
+                &|_| vec![Vec::new()],
+                &cfg,
+                cfg.scale,
+                &measure,
+                Interpolation::BicubicBSpline,
+                0.3,
+                &dir.path().join("cal"),
+                None,
+                &cancel,
+                &progress,
+                exec,
+            )
+        };
+        let serial = |n: usize, job: &(dyn Fn(usize) -> Option<LnFrameOutcome> + Sync)| {
+            let out = calibration::run_jobs_serial(n, &failing(job));
+            record(&out);
+            out
+        };
+        let parallel = |n: usize, job: &(dyn Fn(usize) -> Option<LnFrameOutcome> + Sync)| {
+            let next = AtomicUsize::new(0);
+            let results: Mutex<Vec<Option<LnFrameOutcome>>> =
+                Mutex::new((0..n).map(|_| None).collect());
+            let job = failing(job);
+            std::thread::scope(|sc| {
+                for _ in 0..4 {
+                    sc.spawn(|| loop {
+                        let j = next.fetch_add(1, Ordering::SeqCst);
+                        if j >= n {
+                            return;
+                        }
+                        let out = job(j);
+                        results.lock().unwrap()[j] = out;
+                    });
+                }
+            });
+            let out = results.into_inner().unwrap();
+            record(&out);
+            out
+        };
+        let (ids_a, ids_b) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+        let a = run(&serial, &ids_a).expect("serial measurement");
+        let b = run(&parallel, &ids_b).expect("parallel measurement");
+        assert_eq!(a.frame_ids, vec![100, 101, 102, 103]);
+        assert_eq!(a.frame_ids, b.frame_ids);
+        assert_eq!(a.channels.len(), b.channels.len());
+        for (x, y) in a.channels.iter().zip(&b.channels) {
+            assert_eq!(x.k.to_bits(), y.k.to_bits());
+            assert_eq!(x.samples, y.samples);
+        }
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen[0], seen[1], "job results must land at the same indices");
+        assert!(seen[0][4].is_none(), "the failed seeds arm stays None");
+        assert!(seen[0][5].is_some(), "its detection arm still ran");
+        // Progress: one tick per frame whose two arms both ran (the injected failure
+        // bypasses the job, so frame 102 never completes its pair).
+        let mut got = ids_b.into_inner().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 101, 103]);
+
+        cancel.store(true, Ordering::SeqCst);
+        let ids = Mutex::new(Vec::new());
+        assert!(run(&calibration::run_jobs_serial, &ids).is_none());
     }
 
     /// Ruling C-14 item 7: end to end through `normalize_frame`, the

@@ -978,6 +978,7 @@ fn main() {
         band_budget_bytes: 1024 * 1024 * 1024,
         read_concurrency: 4,
         storage: StorageClass::Local,
+        prefetch_local: true,
     };
 
     let output = match integrate_group(&group_input, &measure_opts, &pool, &cancel, &progress, io) {

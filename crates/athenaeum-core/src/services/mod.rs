@@ -4,6 +4,7 @@
 //! startup and passes it (or references to it) into service functions.
 
 pub mod compute_queue;
+pub mod machine;
 pub mod operation_queue;
 
 use crate::cache::MemoryImageCache;

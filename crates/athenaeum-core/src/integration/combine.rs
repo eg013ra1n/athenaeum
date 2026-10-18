@@ -763,7 +763,43 @@ thread_local! {
     // rejection runs inside the per-pixel band loop, so a fresh `Vec` per
     // pixel is not acceptable.
     static LINEAR_FIT_VALUE_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
-    static MEDFIT_RESIDUAL_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+    // Task 13c 4d: beside the residuals, the windowed residual median's
+    // window values and its members' ranks `i` — see
+    // `residual_median_in_window`.
+    static MEDFIT_RESIDUAL_SCRATCH: RefCell<(Vec<f64>, Vec<f64>, Vec<u32>)> =
+        RefCell::new((Vec::new(), Vec::new(), Vec::new()));
+}
+
+/// Test-only branch counters of the windowed residual median (13c 4d r1):
+/// index `kind * 2 + (m is even)`, per thread. Compiled out of non-test builds.
+#[cfg(test)]
+pub(crate) mod window_branches {
+    use std::cell::Cell;
+    pub(crate) const FULL: usize = 0; // full selection (no previous eval, non-finite input, fall-back reached it)
+    pub(crate) const MISS: usize = 1; // the median's ranks are not inside the window
+    pub(crate) const IN_PLACE: usize = 2; // window over half the stack: in-place selection
+    pub(crate) const IN_PLACE_ZERO: usize = 3; // in-place selection landed on a zero
+    pub(crate) const FILTER: usize = 4; // members filtered from the previous members
+    pub(crate) const COMPACT: usize = 5; // members compacted from the residuals
+    pub(crate) const MEMBERS_ZERO: usize = 6; // window selection landed on a zero
+    pub(crate) const NAMES: [&str; 7] =
+        ["full_selection", "window_miss", "in_place", "in_place_zero", "filter", "compact", "members_zero"];
+    thread_local! {
+        static COUNTS: Cell<[u64; 14]> = const { Cell::new([0; 14]) };
+    }
+    pub(crate) fn bump(kind: usize, m: usize) {
+        COUNTS.with(|c| {
+            let mut a = c.get();
+            a[kind * 2 + (m % 2 == 0) as usize] += 1;
+            c.set(a);
+        });
+    }
+    pub(crate) fn reset() {
+        COUNTS.with(|c| c.set([0; 14]));
+    }
+    pub(crate) fn read() -> [u64; 14] {
+        COUNTS.with(Cell::get)
+    }
 }
 
 thread_local! {
@@ -800,6 +836,151 @@ fn robust_sign(x: f64) -> f64 {
     } else {
         -1.0
     }
+}
+
+/// The window [`residual_median_in_window`] reads the median from, and what
+/// the residual build counted against it: `below` residuals `< lo`, `le`
+/// residuals `<= hi`.
+#[derive(Clone, Copy)]
+struct ResidualWindow {
+    lo: f64,
+    hi: f64,
+    below: usize,
+    le: usize,
+}
+
+/// [`medfit_line`]'s residual median at slope `b`, read from the residuals
+/// inside a window only (perf tier 13c, item 4d). `residuals` is the full
+/// selection's own scratch — built by its own expression, in rank order —
+/// and `window` says how many of them fall below and inside the window. The
+/// selection runs on the window's members alone; on the bisection's late
+/// steps that is a handful of the stack. A window holding more than half of
+/// the stack is selected in place instead (compacting it costs more than it
+/// saves), and `residuals` is rebuilt in rank order whenever that path
+/// returns `None`.
+///
+/// The members are found by compaction, or — cheaper — by filtering the
+/// previous evaluation's members (`members`, ranks, valid when
+/// `members_valid`): the filter is used only when it finds exactly the
+/// `le − below` members the count saw, so it can never miss one (the
+/// previous members are distinct ranks).
+///
+/// Returns `Some((a, lo, hi))` — the median and the two order statistics it
+/// was read from, `lo == hi` for odd `m` — or `None` when the full selection
+/// must run instead, on `residuals` exactly as built. The caller guarantees
+/// a NaN-free residual set.
+///
+/// Why the value is the full selection's, bit for bit. On NaN-free input the
+/// full selection's comparator is a total preorder, so it returns the
+/// `m/2`-th order statistic (odd `m`) or the mean of the `(m/2 − 1)`-th —
+/// the max of its lower partition — and the `m/2`-th (even `m`). Every
+/// residual below the window precedes every residual inside it in any sorted
+/// order, so when the count puts the needed ranks inside the window, the
+/// window's own order statistics at the shifted ranks are those values —
+/// whatever the bounds were. `f64::total_cmp` orders the selections here: on
+/// NaN-free input it refines that preorder, splitting only `−0.0` from
+/// `+0.0`. A nonzero value is one bit pattern, and the mean is the same
+/// `0.5 * (lo + hi)`. Zero is the exception: `+0.0` and `−0.0` compare
+/// equal, so which one a selection lands on depends on the algorithm, and
+/// the median's zero sign is the one bit this function cannot promise; a
+/// zero order statistic returns `None` and the full selection reproduces it.
+fn residual_median_in_window(
+    values: &[f64],
+    b: f64,
+    window: ResidualWindow,
+    residuals: &mut Vec<f64>,
+    window_values: &mut Vec<f64>,
+    members: &mut Vec<u32>,
+    members_valid: &mut bool,
+) -> Option<(f64, f64, f64)> {
+    let m = residuals.len();
+    let k = m / 2;
+    let odd = m % 2 == 1;
+    let ResidualWindow { lo: lo_bound, hi: hi_bound, below, le } = window;
+    if below > if odd { k } else { k - 1 } || k >= le {
+        #[cfg(test)]
+        window_branches::bump(window_branches::MISS, m);
+        return None; // the median's ranks are not inside the window
+    }
+    let inside = le - below;
+    let in_window = |r: f64| r >= lo_bound && r <= hi_bound;
+    let (lo, hi) = if inside > m / 2 {
+        #[cfg(test)]
+        window_branches::bump(window_branches::IN_PLACE, m);
+        *members_valid = false;
+        let (left, hi, _) = residuals.select_nth_unstable_by(k, f64::total_cmp);
+        let hi = *hi;
+        let lo = if odd { hi } else { left.iter().cloned().fold(f64::NEG_INFINITY, f64::max) };
+        if lo == 0.0 || hi == 0.0 {
+            // The selection reordered `residuals`: rebuild them in rank
+            // order for the full selection.
+            #[cfg(test)]
+            window_branches::bump(window_branches::IN_PLACE_ZERO, m);
+            residuals.clear();
+            residuals.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
+            return None;
+        }
+        (lo, hi)
+    } else {
+        let mut found = false;
+        if *members_valid {
+            // In-place filter (`w <= p`), branch-free.
+            let mut w = 0usize;
+            for p in 0..members.len() {
+                let i = members[p];
+                members[w] = i;
+                w += in_window(residuals[i as usize]) as usize;
+            }
+            found = w == inside;
+            #[cfg(test)]
+            if found {
+                window_branches::bump(window_branches::FILTER, m);
+            }
+            members.truncate(w);
+        }
+        if !found {
+            #[cfg(test)]
+            window_branches::bump(window_branches::COMPACT, m);
+            // Compact the members' ranks, eight residuals at a time: a
+            // chunk without a member is skipped after one vectorizable
+            // count (the members of a sorted stack's window sit in a few
+            // runs of ranks), a chunk with one stores branch-free — always
+            // store, advance only when inside.
+            members.clear();
+            members.resize(m, 0);
+            let mut w = 0usize;
+            let mut chunks = residuals.chunks_exact(8);
+            let mut base = 0u32;
+            for chunk in &mut chunks {
+                let n_in: usize = chunk.iter().map(|&r| in_window(r) as usize).sum();
+                if n_in > 0 {
+                    for (o, &r) in chunk.iter().enumerate() {
+                        members[w] = base + o as u32;
+                        w += in_window(r) as usize;
+                    }
+                }
+                base += 8;
+            }
+            for (o, &r) in chunks.remainder().iter().enumerate() {
+                members[w] = base + o as u32;
+                w += in_window(r) as usize;
+            }
+            members.truncate(w);
+        }
+        *members_valid = true;
+        window_values.clear();
+        window_values.extend(members.iter().map(|&i| residuals[i as usize]));
+        let (left, hi, _) = window_values.select_nth_unstable_by(k - below, f64::total_cmp);
+        let hi = *hi;
+        let lo = if odd { hi } else { left.iter().cloned().fold(f64::NEG_INFINITY, f64::max) };
+        if lo == 0.0 || hi == 0.0 {
+            #[cfg(test)]
+            window_branches::bump(window_branches::MEMBERS_ZERO, m);
+            return None; // `residuals` untouched
+        }
+        (lo, hi)
+    };
+    Some((if odd { hi } else { 0.5 * (lo + hi) }, lo, hi))
 }
 
 /// Minimum-absolute-deviation line `y = a + b·i` over `values[i]` (math
@@ -880,6 +1061,43 @@ fn robust_sign(x: f64) -> f64 {
 /// dropped on purpose because the R-M4a-17 dispersion calibration rests on
 /// it. The measurement lives in
 /// `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-6-report.md`.
+///
+/// # The residual median: windowed, bit-identical (perf tier 13c, item 4d)
+///
+/// Every evaluation after a call's first reads the residual median inside a
+/// window bounded by the previous evaluation's order statistics — each
+/// residual moves by `−Δb·i`, so each order statistic moves by at most
+/// `|Δb|·(m − 1)`, in one direction — counted while the residuals are built,
+/// instead of running a full selection over the stack; see
+/// [`residual_median_in_window`] for why the value is the same, bit for bit.
+/// The count decides exactness, whatever the bounds; a finite stack whose
+/// `chisq` overflowed (`values_finite` false; NaN / inf input returns before
+/// `rofunc`), a non-finite slope, a missed window and a median that is an
+/// exact zero all take the full selection, unchanged. Not a numeric change: the bracket,
+/// the bisection, the sign sum and every returned bit are as before
+/// (`medfit_line_windowed_median_matches_the_full_selection_bit_for_bit`).
+/// `diag_medfit_windowed_median_cost` (release, M4 Max): new/old per call
+/// 0.74–0.85 cold and 0.61–0.73 warm over `m` = 20–208 (`m` = 105: 0.75–0.76
+/// cold, 0.65 warm). Measured on the same benchmark and NOT kept — do not
+/// re-propose:
+///
+/// - Keeping the rank permutation sorted by the previous evaluation's
+///   residuals and repairing it by insertion: exact, but the early bracket
+///   steps reorder most of the stack — 1.27–4.57× cold, 0.88–2.0× warm.
+/// - The full selection under `f64::total_cmp` (an integer compare) alone:
+///   0.95–0.99×; it only pays inside the window.
+/// - A two-sided bound from the bisection bracket's endpoints (a computed
+///   residual `y − b·i` is monotone non-increasing in `b`, exactly, so every
+///   order statistic is): no narrower than the one-sided bound on average,
+///   no gain; nor a guessed window an eighth that wide around the endpoints'
+///   interpolated median, retried wide on a miss.
+/// - Bounds from the previous median's partition (the max of the new
+///   residuals of the samples at or below it, the min of those at or above):
+///   exact and narrower, but its serial min/max reductions cost 1.04–1.18×
+///   the full selection.
+/// - A separate count pass that sends a window over half the stack straight
+///   to the full selection: slower than selecting it in place under
+///   `f64::total_cmp`, as this code does.
 pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
     let n = values.len();
     if n == 0 {
@@ -916,8 +1134,19 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
         return (a_ls, b_ls);
     }
 
+    // Task 13c 4d: the windowed residual median is eligible only on a
+    // NaN-free residual set (the gate excludes only finite stacks whose
+    // `chisq` overflowed: a NaN / inf input has `sigma_b` NaN and returned
+    // above, before `rofunc`), and `y − b·i` is NaN-free whenever every `y`
+    // and `b` are finite: a finite product is finite or ±inf, never NaN, and
+    // a finite `y` minus a finite-or-±inf product is never NaN either. A
+    // finite `sigma_b` proves every `y` finite: `chisq` is a sum of squares,
+    // so it is finite only if every `resid = y − (a_ls + b_ls·i)` is, and a
+    // non-finite `y` (or `a_ls`/`b_ls`) makes its `resid` ±inf or NaN.
+    let values_finite = sigma_b.is_finite();
+
     MEDFIT_RESIDUAL_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
+        let (scratch, window_values, members) = &mut *cell.borrow_mut();
         // O(n) selection instead of an O(n log n) sort per bracket
         // evaluation (ruling R-M4a-16, finding 1) — this is the DEFAULT
         // rejection path for every n >= 20 stack (`RejectionChoice::Auto`),
@@ -943,27 +1172,88 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
         // measurement in the Task 9 report shows the same direction on the
         // real 60-frame set. Kept here as the reasoning a future attempt at
         // this item should read before re-trying the same shape.
+        //
+        // Task 13c 4d: the previous evaluation's slope and the two order
+        // statistics its median was read from (`lo == hi` for odd `m`) —
+        // what the next evaluation's window is bounded by — and whether
+        // `members` holds this call's previous window members.
+        let mut prev: Option<(f64, f64, f64)> = None;
+        let mut members_valid = false;
         let mut rofunc = |b: f64| -> (f64, f64) {
             // Perf tier A Task 0: one evaluation, thread-local, flushed by
             // `take_rejection_counters` — see that function's doc.
             MEDFIT_EVALS.with(|c| c.set(c.get() + 1));
+            let m = values.len();
+            // Task 13c 4d: every residual moves by `−(b − pb)·i`, `i ∈ [0,
+            // m−1]`, so each order statistic moves by at most that much and
+            // only in that direction. The margin covers the rounding of both
+            // evaluations' residuals near the window (`|y| <= |r| + |b|·i`);
+            // it buys hit rate only — the count decides exactness on its
+            // own, whatever the bounds.
+            let bounds = match prev {
+                Some((pb, plo, phi)) if values_finite && b.is_finite() => {
+                    let db = b - pb;
+                    let span = (m - 1) as f64;
+                    let margin =
+                        16.0 * f64::EPSILON * (plo.abs() + phi.abs() + (b.abs() + pb.abs() + db.abs()) * span);
+                    let lo = plo - db.max(0.0) * span - margin;
+                    let hi = phi + (-db).max(0.0) * span + margin;
+                    if lo <= hi { Some((lo, hi)) } else { None } // NaN: no window
+                }
+                _ => None,
+            };
             scratch.clear();
-            scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
-            let m = scratch.len();
-            let cmp = |p: &f64, q: &f64| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal);
-            let a = if m % 2 == 1 {
-                *scratch.select_nth_unstable_by(m / 2, cmp).1
+            // Task 13c 4d: the residual median read inside that window
+            // instead of a full selection — see `residual_median_in_window`
+            // for why it is the same value, bit for bit. The residuals are
+            // the full selection's own (same expression, same buffer, rank
+            // order), counted against the window as they are built. `None`
+            // (no previous evaluation, a non-finite input, a window that
+            // missed, or a median that is an exact zero) runs the full
+            // selection below on them.
+            let windowed = match bounds {
+                Some((lo, hi)) => {
+                    let (mut below, mut le) = (0usize, 0usize);
+                    scratch.extend(values.iter().enumerate().map(|(i, &y)| {
+                        let r = y - b * i as f64;
+                        below += (r < lo) as usize;
+                        le += (r <= hi) as usize;
+                        r
+                    }));
+                    let window = ResidualWindow { lo, hi, below, le };
+                    residual_median_in_window(values, b, window, scratch, window_values, members, &mut members_valid)
+                }
+                None => {
+                    scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
+                    None
+                }
+            };
+            let a = if let Some((a, lo, hi)) = windowed {
+                prev = Some((b, lo, hi));
+                a
             } else {
-                // I3 (perf tier A Task 9): the max of the lower partition
-                // `select_nth_unstable_by` already produced IS the lower
-                // median element — there is no cheaper way to learn it than
-                // scanning `lo` (an unsorted partition of unknown internal
-                // order; a second `select_nth_unstable_by` call to find its
-                // max would cost MORE than this linear fold, not less), so
-                // this was already the minimal shape before Task 9 and
-                // stays textually unchanged.
-                let (lo, hi, _) = scratch.select_nth_unstable_by(m / 2, cmp);
-                0.5 * (lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + *hi)
+                #[cfg(test)]
+                window_branches::bump(window_branches::FULL, m);
+                let cmp = |p: &f64, q: &f64| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal);
+                if m % 2 == 1 {
+                    let a = *scratch.select_nth_unstable_by(m / 2, cmp).1;
+                    prev = Some((b, a, a));
+                    a
+                } else {
+                    // I3 (perf tier A Task 9): the max of the lower partition
+                    // `select_nth_unstable_by` already produced IS the lower
+                    // median element — there is no cheaper way to learn it than
+                    // scanning `lo` (an unsorted partition of unknown internal
+                    // order; a second `select_nth_unstable_by` call to find its
+                    // max would cost MORE than this linear fold, not less), so
+                    // this was already the minimal shape before Task 9 and
+                    // keeps its arithmetic (13c 4d only names the two terms).
+                    let (lo, hi, _) = scratch.select_nth_unstable_by(m / 2, cmp);
+                    let lo_max = lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let hi = *hi;
+                    prev = Some((b, lo_max, hi));
+                    0.5 * (lo_max + hi)
+                }
             };
             let mut sum = 0.0;
             for (i, &y) in values.iter().enumerate() {
@@ -2122,10 +2412,25 @@ mod tests {
     // lives) — used ONLY here, to prove I1 (`t_i = b·i` fused) and I2 (four
     // integer sign-sum accumulators) moved zero bits.
 
+    thread_local! {
+        // 13c 4d: the oracle's residual scratch, reused across calls like
+        // the production function's own, so `diag_medfit_windowed_median_cost`
+        // does not time an allocation per call the production path never pays.
+        static ORACLE_RESIDUAL_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+    }
+
     /// Verbatim pre-Task-9 `medfit_line` (I1/I2's oracle): `rofunc`
     /// recomputes `b * i as f64` at both the residual-build and sign-test
-    /// sites, and accumulates the sign sum into one running f64 total.
+    /// sites, and accumulates the sign sum into one running f64 total. Since
+    /// 13c 4d it is also the oracle of the windowed residual median: its
+    /// `rofunc` is the full selection on every evaluation.
     fn medfit_line_oracle(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
+        ORACLE_RESIDUAL_SCRATCH.with(|cell| medfit_line_oracle_with(values, warm_start_b, &mut cell.borrow_mut()))
+    }
+
+    /// [`medfit_line_oracle`]'s body, verbatim except that the residual
+    /// scratch is passed in instead of a fresh local `Vec`.
+    fn medfit_line_oracle_with(values: &[f64], warm_start_b: Option<f64>, scratch: &mut Vec<f64>) -> (f64, f64) {
         let n = values.len();
         if n == 0 {
             return (0.0, 0.0);
@@ -2158,7 +2463,6 @@ mod tests {
             return (a_ls, b_ls);
         }
 
-        let mut scratch: Vec<f64> = Vec::new();
         let mut rofunc = |b: f64| -> (f64, f64) {
             scratch.clear();
             scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
@@ -2353,6 +2657,225 @@ mod tests {
                 (a.0.to_bits(), a.1.to_bits()),
                 (b.0.to_bits(), b.1.to_bits()),
                 "{values:?}: {a:?} vs oracle {b:?}"
+            );
+        }
+    }
+
+    /// One randomized stack for the 13c 4d bit-identity test: `shape` picks
+    /// the population — the production shape (sorted ascending, Gaussian),
+    /// unsorted, a noisy ramp, coarsely quantized (ties), a contaminated tail, a stack
+    /// dominated by exact zeros of both signs, a constant stack, a ±inf or a
+    /// NaN sample, and large / small magnitudes. Shapes 7 (constant:
+    /// `sigma_b` 0) and 8 (±inf / NaN: `sigma_b` NaN) and the single 1e300
+    /// case of shape 9 (`chisq` overflows to +inf, so the `values_finite`
+    /// gate sends it to the full selection) test the guards before `rofunc`,
+    /// not the window; 1e±150 keeps `chisq` finite and nonzero and does reach
+    /// it.
+    fn bit_identity_stack(rng: &mut SplitMix64, m: usize, shape: u64) -> Vec<f64> {
+        let gauss = |rng: &mut SplitMix64| 100.0 + 5.0 * next_gaussian(rng);
+        let sort = |v: &mut Vec<f64>| v.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+        let mut v: Vec<f64> = match shape {
+            0 | 1 => (0..m).map(|_| gauss(rng)).collect(),
+            2 => (0..m).map(|i| 10.0 + 0.5 * i as f64 + 0.01 * next_gaussian(rng)).collect(),
+            3 => (0..m).map(|_| (gauss(rng) / 2.0).round() * 2.0).collect(),
+            4 => (0..m).map(|_| next_gaussian(rng).round()).collect(), // 5-7 distinct values
+            5 => {
+                let mut v: Vec<f64> = (0..m).map(|_| gauss(rng)).collect();
+                let n_out = 1 + (rng.next_u64() % 5) as usize;
+                for x in v.iter_mut().take(n_out.min(m)) {
+                    *x = 300.0 + 50.0 * rng.next_f64();
+                }
+                v
+            }
+            6 => (0..m)
+                .map(|_| match rng.next_u64() % 8 {
+                    0..=2 => 0.0,
+                    3..=5 => -0.0,
+                    6 => 1.0 + (rng.next_u64() % 3) as f64,
+                    _ => -1.0 - (rng.next_u64() % 3) as f64,
+                })
+                .collect(),
+            7 => {
+                let c = [0.0, -0.0, 1.0, -3.5, 100.0][(rng.next_u64() % 5) as usize];
+                vec![c; m]
+            }
+            8 => {
+                let mut v: Vec<f64> = (0..m).map(|_| gauss(rng)).collect();
+                let at = (rng.next_u64() % m as u64) as usize;
+                v[at] = [f64::INFINITY, f64::NEG_INFINITY, f64::NAN][(rng.next_u64() % 3) as usize];
+                v
+            }
+            _ => {
+                // 1e300: `chisq` overflows, the `values_finite` gate case.
+                let scale = match rng.next_u64() % 8 {
+                    0 => 1e300,
+                    1..=4 => 1e150,
+                    _ => 1e-150,
+                };
+                (0..m).map(|_| scale * next_gaussian(rng)).collect()
+            }
+        };
+        // Sorted ascending is what `reject_linear_fit` hands `medfit_line`.
+        if matches!(shape, 1 | 3 | 5 | 6 | 9) {
+            sort(&mut v);
+        }
+        v
+    }
+
+    /// `medfit_line`'s own `sigma_b` (same expressions), for the warm seeds
+    /// below that steer its bracket onto an exact zero slope.
+    fn medfit_sigma_b(values: &[f64]) -> f64 {
+        let nf = values.len() as f64;
+        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+        for (i, &y) in values.iter().enumerate() {
+            let x = i as f64;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+        let del = nf * sxx - sx * sx;
+        let b_ls = (nf * sxy - sx * sy) / del;
+        let a_ls = (sy - b_ls * sx) / nf;
+        let mut chisq = 0.0;
+        for (i, &y) in values.iter().enumerate() {
+            let resid = y - (a_ls + b_ls * i as f64);
+            chisq += resid * resid;
+        }
+        (chisq / del).sqrt()
+    }
+
+    /// 13c 4d: `medfit_line` (the windowed residual median) bit-identical to
+    /// [`medfit_line_oracle`] (the full selection on every evaluation) over
+    /// 120 000 seeded stacks: 12 000 per `m ∈ {2, 3, 20, 21, 30, 74, 105, 164,
+    /// 208, 260}` across the ten [`bit_identity_stack`] shapes, each run cold
+    /// and then warm. The warm seed rotates through the cold call's own slope
+    /// (`reject_linear_fit`'s chaining), a perturbed slope, `+0.0` and `−0.0`
+    /// (a zero slope makes zero-valued `y` residuals of both signs, so the
+    /// median itself can be a signed zero — the case the window hands back to
+    /// the full selection), `∓1.5·σ_b` (which puts the first bisection
+    /// midpoint on exactly `+0.0`, so that case also reaches both window
+    /// paths, not only the first evaluation's full selection), and a
+    /// non-finite seed. Both zero fall-backs were checked to be load-bearing:
+    /// with either one disabled this test fails on a `−0.0` vs `+0.0` median.
+    #[test]
+    fn medfit_line_windowed_median_matches_the_full_selection_bit_for_bit() {
+        const MS: [usize; 10] = [2, 3, 20, 21, 30, 74, 105, 164, 208, 260];
+        window_branches::reset();
+        for seed in 0..120_000u64 {
+            let mut rng = SplitMix64(0x4D3D_13C4_0000_0000 ^ seed);
+            let m = MS[(seed % 10) as usize];
+            let shape = (seed / 10) % 10;
+            let values = bit_identity_stack(&mut rng, m, shape);
+
+            let cold = medfit_line(&values, None);
+            let cold_oracle = medfit_line_oracle(&values, None);
+            assert_eq!(
+                (cold.0.to_bits(), cold.1.to_bits()),
+                (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
+                "seed {seed} m {m} shape {shape} (cold): {cold:?} vs oracle {cold_oracle:?}"
+            );
+
+            let warm_seed = match (seed / 100) % 8 {
+                0 | 1 => cold.1,
+                2 => cold.1 + (rng.next_f64() - 0.5) * 1e-2 * (1.0 + cold.1.abs()),
+                3 => 0.0,
+                4 => -0.0,
+                // `b2 = b1 ± 3·σ_b` lands exactly on `−b1`, so the first
+                // bisection midpoint is exactly `+0.0`: a zero slope AFTER an
+                // evaluation, i.e. inside the window path.
+                5 => -1.5 * medfit_sigma_b(&values),
+                6 => 1.5 * medfit_sigma_b(&values),
+                // 1e307 on finite y: `b·i` overflows to ±inf INSIDE the window path.
+                _ => [f64::INFINITY, f64::NAN, 1e300, 1e307, -1e307][(rng.next_u64() % 5) as usize],
+            };
+            let warm = medfit_line(&values, Some(warm_seed));
+            let warm_oracle = medfit_line_oracle(&values, Some(warm_seed));
+            assert_eq!(
+                (warm.0.to_bits(), warm.1.to_bits()),
+                (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
+                "seed {seed} m {m} shape {shape} (warm {warm_seed:?}): {warm:?} vs oracle {warm_oracle:?}"
+            );
+        }
+        let counts = window_branches::read();
+        for (kind, name) in window_branches::NAMES.iter().enumerate() {
+            eprintln!(
+                "window branch {name}: odd m {} even m {}",
+                counts[kind * 2],
+                counts[kind * 2 + 1]
+            );
+        }
+        // `window_miss` is unreachable by construction: the bound plus its
+        // rounding margin always holds both median ranks (the guard is a
+        // defence the count keeps for exactness), so it is printed, not asserted.
+        for (kind, name) in window_branches::NAMES.iter().enumerate() {
+            if kind == window_branches::MISS {
+                continue;
+            }
+            for (parity, label) in ["odd", "even"].iter().enumerate() {
+                assert!(counts[kind * 2 + parity] > 0, "window branch {name} never ran for {label} m: {counts:?}");
+            }
+        }
+    }
+
+    /// 13c 4d: cost of one `medfit_line` call (windowed residual median)
+    /// against one [`medfit_line_oracle`] call (the full selection on every
+    /// evaluation — today's kernel before 4d), cold and warm, at the stack
+    /// sizes the real sets integrate. Inputs are the production shape — a
+    /// sorted Gaussian stack with two high outliers — drawn from a pool of
+    /// 256 seeded stacks per `m` so the branch predictor cannot learn one
+    /// stack. Cold is the first call on the `m`-stack (no seed); warm is
+    /// the call `reject_linear_fit` makes next: the `m − 2` survivors seeded
+    /// with the cold slope. 50 000 calls per cell, old and new interleaved
+    /// over 5 rounds, the per-cell minimum reported. Not run by default
+    /// (timing): `cargo test --release -p athenaeum-core --lib --
+    /// --ignored diag_medfit_windowed_median_cost --nocapture`.
+    #[test]
+    #[ignore]
+    fn diag_medfit_windowed_median_cost() {
+        use std::time::Instant;
+        const ITERS: usize = 50_000;
+        const POOL: usize = 256;
+        eprintln!("medfit_line cost per call (ns), new = windowed median, old = full selection");
+        eprintln!("| m | cold new | cold old | cold new/old | warm new | warm old | warm new/old |");
+        eprintln!("| ---- | ---- | ---- | ---- | ---- | ---- | ---- |");
+        for &m in &[20usize, 30, 74, 105, 164, 208] {
+            let mut rng = SplitMix64(0x13C4_D000 ^ m as u64);
+            let pool: Vec<(Vec<f64>, Vec<f64>, f64)> = (0..POOL)
+                .map(|_| {
+                    let mut full: Vec<f64> = (0..m).map(|_| 100.0 + 5.0 * next_gaussian(&mut rng)).collect();
+                    full[0] = 200.0 + 10.0 * rng.next_f64();
+                    full[1] = 180.0 + 10.0 * rng.next_f64();
+                    full.sort_by(|p, q| p.partial_cmp(q).unwrap());
+                    let cold_b = medfit_line_oracle(&full, None).1;
+                    let survivors = full[..m - 2].to_vec();
+                    (full, survivors, cold_b)
+                })
+                .collect();
+            let time = |f: &dyn Fn(&[f64], Option<f64>) -> (f64, f64), warm: bool| -> f64 {
+                let t = Instant::now();
+                for it in 0..ITERS {
+                    let (full, survivors, cold_b) = &pool[it % POOL];
+                    let out = if warm {
+                        f(std::hint::black_box(survivors), Some(*cold_b))
+                    } else {
+                        f(std::hint::black_box(full), None)
+                    };
+                    std::hint::black_box(out);
+                }
+                t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
+            };
+            let (mut cn, mut co, mut wn, mut wo) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            for _ in 0..5 {
+                co = co.min(time(&medfit_line_oracle, false));
+                cn = cn.min(time(&medfit_line, false));
+                wo = wo.min(time(&medfit_line_oracle, true));
+                wn = wn.min(time(&medfit_line, true));
+            }
+            eprintln!(
+                "| {m} | {cn:.0} | {co:.0} | {:.3} | {wn:.0} | {wo:.0} | {:.3} |",
+                cn / co,
+                wn / wo
             );
         }
     }

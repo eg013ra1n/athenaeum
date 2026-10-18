@@ -50,14 +50,52 @@ impl AccountConfig {
     /// the DB or logs. Release builds keep the keychain-first behavior; a
     /// keychain-stored token from a prior release run is simply not seen by a
     /// dev build (one re-login when switching), never migrated or deleted.
+    ///
+    /// A release build is file-only too when [`TOKEN_STORE_ENV`] is `file`:
+    /// the acceptance harness starts locally built release servers whose
+    /// ad-hoc signature changes on every rebuild, so the keychain prompt
+    /// re-fired on every lab run (owner, 2026-10-17).
     fn token_store(&self) -> TokenStore {
         let file = self
             .account_dir
             .join(format!("token_{}", sanitize(&self.hub_host)));
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions)
+            || file_only_requested(std::env::var(TOKEN_STORE_ENV).ok().as_deref())
+        {
             return TokenStore::file_only(self.hub_host.clone(), file);
         }
         TokenStore::new(self.hub_host.clone(), file)
+    }
+}
+
+/// `ATHENAEUM_TOKEN_STORE=file` keeps a release build off the OS keychain
+/// (the 0600 file only), for locally built headless servers.
+const TOKEN_STORE_ENV: &str = "ATHENAEUM_TOKEN_STORE";
+
+/// Whether [`TOKEN_STORE_ENV`]'s value asks for the file-only store. Logged
+/// once per process when it does; any other non-empty value is ignored with a
+/// `warn!`, never guessed.
+fn file_only_requested(value: Option<&str>) -> bool {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("file") => {
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "token store: file only ({TOKEN_STORE_ENV}=file), the OS keychain is not used"
+                )
+            });
+            true
+        }
+        None | Some("") => false,
+        Some(other) => {
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    value = other,
+                    "token store: unknown {TOKEN_STORE_ENV} value ignored (only `file` is recognised)"
+                )
+            });
+            false
+        }
     }
 }
 
@@ -515,6 +553,19 @@ mod tests {
         assert_eq!(store.load().unwrap().as_deref(), Some("dev-token-xyz"));
         store.delete().unwrap();
         assert!(!file.exists(), "delete removes the file");
+    }
+
+    /// `ATHENAEUM_TOKEN_STORE=file` (any case, trimmed) is the one value that
+    /// keeps a release build off the keychain; unset, empty or anything else
+    /// leaves the keychain-first default. Pure on the value, so the test never
+    /// touches the process environment.
+    #[test]
+    fn token_store_env_only_file_requests_file_only() {
+        assert!(file_only_requested(Some("file")));
+        assert!(file_only_requested(Some(" FILE ")));
+        assert!(!file_only_requested(None));
+        assert!(!file_only_requested(Some("")));
+        assert!(!file_only_requested(Some("keychain")));
     }
 
     /// Fix (B4 review, minor #1): a wrong/expired OTP code must read as a

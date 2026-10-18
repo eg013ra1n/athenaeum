@@ -66,7 +66,7 @@ pub struct WebAppState {
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.
     pub image_semaphore: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
-    /// CPU-based upper bound for blink threads (min(vCPUs, 16)).
+    /// Upper bound for blink threads: the image pool's size (no 16 cap).
     pub max_blink_threads: usize,
     /// Handle to the background folder-monitoring service. Routes use this
     /// to `kick()` the loop awake when monitor-relevant settings change.
@@ -135,9 +135,9 @@ async fn main() {
     }
 
     // Build thread pool
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(16))
-        .unwrap_or(4);
+    let (max_threads, pool_why) =
+        athenaeum_core::services::machine::pool_threads(athenaeum_core::services::machine::profile());
+    athenaeum_core::services::machine::log_compute_budget_resolved(max_threads, pool_why);
     let image_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(max_threads)
         .build()

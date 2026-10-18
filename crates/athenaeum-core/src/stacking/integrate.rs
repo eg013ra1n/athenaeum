@@ -1750,6 +1750,7 @@ mod tests {
             band_budget_bytes,
             read_concurrency: 2,
             storage: StorageClass::Local,
+            prefetch_local: true,
         }
     }
 

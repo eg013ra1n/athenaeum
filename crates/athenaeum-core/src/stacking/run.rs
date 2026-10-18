@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,7 @@ use crate::plate_solve::storage::PlateSolveRecord;
 use crate::registration::db::RegistrationRecord;
 use crate::resample::Interpolation;
 use crate::services::compute_queue::ComputeJobKind;
+use crate::services::machine;
 use crate::services::{ServiceContext, StackHandle};
 #[cfg(test)]
 use crate::stacking::config::config_hash;
@@ -1438,6 +1439,38 @@ impl Drop for RunHandleGuard {
     }
 }
 
+/// The `stacking budget` line: what this run sized itself from (profile,
+/// memory now, the budget and why, the pool and why, `compute.max_concurrent`).
+/// Unknown `Option` values log as `-1`.
+fn log_stacking_budget(rc: &RunContext) {
+    // The width the pool really has; the why is the process-wide resolved one (no env re-read).
+    let pool_threads = rc.ctx.image_pool.current_num_threads();
+    let (_, pool_why) = machine::pool_threads(machine::profile());
+    let budget = fan_budget(rc);
+    let max_concurrent = match db(&rc.ctx) {
+        Ok(d) => match rc.ctx.settings.get_compute_max_concurrent(&d.conn()) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                tracing::warn!(error = %e, "compute.max_concurrent unreadable for the budget line");
+                -1
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "catalog unavailable for the budget line's compute.max_concurrent");
+            -1
+        }
+    };
+    machine::machine_fields_info!(
+        "stacking budget",
+        run_id = rc.run_id,
+        memory_budget_bytes = machine::opt_i64(budget.bytes),
+        budget_why = budget.why,
+        pool_threads,
+        pool_why,
+        max_concurrent
+    );
+}
+
 /// The whole pipeline, run in order. Queue admission happens FIRST (ruling
 /// 2 / decision 1): a `QueueCancelled` while queued becomes
 /// [`RunError::Cancelled`] before `set_run_status(running)` is ever called,
@@ -1452,6 +1485,8 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
         .compute_queue
         .acquire(ComputeJobKind::Stacking, &label, rc.cancel.clone())
         .map_err(|_queue_cancelled| RunError::Cancelled)?;
+
+    log_stacking_budget(rc);
 
     {
         let conn = db(&rc.ctx)?.conn();
@@ -1543,6 +1578,7 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
     }
 
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Masters, None);
     let total = items.len();
 
     // Fix round 1, item 3: the opener — forced (`current == 0` bypasses
@@ -1664,6 +1700,7 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
     // above was swallowed by the throttle.
     rc.progress(Stage::Masters, None, total, total, 0, 0, None, None);
 
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Masters,
         duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -1728,6 +1765,159 @@ struct CalibrateJob {
     out: PathBuf,
     mosaic_out: Option<PathBuf>,
     opts: CalibratedLightOptions,
+}
+
+/// One group's resolved stage-1 work (Task 13c L4a): the jobs left after cache reuse and exclusions, and the
+/// sizing the cross-group queue decision needs.
+struct CalibrateGroupPlan {
+    /// Index into the run's `plan_groups`.
+    group_idx: usize,
+    jobs: Vec<CalibrateJob>,
+    /// The LARGEST frame's (width, height) in the group.
+    plane_px: (u64, u64),
+    working_set_bytes: u64,
+    /// Preloaded-master bytes counted from the jobs (an upper bound on what the preload will hold).
+    shared_bytes_est: u64,
+}
+
+/// The distinct master files a group's jobs need preloaded: the dark (the bias when there is no dark — never
+/// both) and the flat. Sorted, so the preload order is deterministic.
+fn distinct_preload_paths(jobs: &[CalibrateJob]) -> BTreeSet<PathBuf> {
+    let mut distinct: BTreeSet<PathBuf> = BTreeSet::new();
+    for job in jobs {
+        let subtrahend = job
+            .spec
+            .inputs
+            .dark_path
+            .clone()
+            .or_else(|| job.spec.inputs.bias_path.clone());
+        distinct.extend(subtrahend);
+        distinct.extend(job.spec.inputs.flat_path.clone());
+    }
+    distinct
+}
+
+/// What one group's phase 1 pushed to `rc.warnings` / `rc.runtime_exclusions`.
+#[derive(Default)]
+struct GroupListStash {
+    warnings: Vec<String>,
+    exclusions: Vec<(i64, String)>,
+}
+
+/// Move everything pushed to the run's lists since `(warn_mark, excl_mark)` into a stash.
+fn take_list_stash(rc: &mut RunContext, warn_mark: usize, excl_mark: usize) -> GroupListStash {
+    GroupListStash {
+        warnings: rc.warnings.split_off(warn_mark),
+        exclusions: rc.runtime_exclusions.split_off(excl_mark),
+    }
+}
+
+/// Put the stashes of groups `*next..=upto` back onto the run's lists, in group order.
+fn replay_list_stash(
+    rc: &mut RunContext,
+    stash: &mut [GroupListStash],
+    next: &mut usize,
+    upto: usize,
+) {
+    while *next <= upto && *next < stash.len() {
+        let s = std::mem::take(&mut stash[*next]);
+        rc.warnings.extend(s.warnings);
+        rc.runtime_exclusions.extend(s.exclusions);
+        *next += 1;
+    }
+}
+
+/// Run the calibrate jobs of one or several groups through ONE [`fan_out_groups`] queue; `plans[k]`, `preloads[k]`
+/// and `tickers[k]` belong together. Results per group, in that group's job order.
+fn calibrate_queue(
+    rc: &RunContext,
+    plans: &[&CalibrateGroupPlan],
+    preloads: &[&PreloadedMasters],
+    tickers: &[&FanOutTicker],
+    scratch: &Path,
+    gate: &AdmissionGate,
+    label: FanOutLabel,
+) -> Vec<Vec<Option<Result<GeneratedLight, String>>>> {
+    let cancel_ref: &AtomicBool = &rc.cancel;
+    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+    // Arcs only — cheap. Every job's own dark was already prebuilt into `rc.hot_maps`, so each worker's clone is
+    // a cache HIT for every lookup `execute_generation` makes; it never inserts into its clone.
+    let hot_maps_snapshot: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = rc.hot_maps.clone();
+    let working_sets: Vec<u64> = plans.iter().map(|p| p.working_set_bytes).collect();
+    let groups: Vec<Vec<&CalibrateJob>> = plans.iter().map(|p| p.jobs.iter().collect()).collect();
+    fan_out_groups(
+        groups,
+        &working_sets,
+        gate,
+        label,
+        cancel_ref,
+        move |g: usize, job: &CalibrateJob| {
+            let mut local_maps = hot_maps_snapshot.clone();
+            let out = execute_generation(
+                &job.spec,
+                &job.out,
+                job.mosaic_out.as_deref(),
+                scratch,
+                &job.opts,
+                &mut local_maps,
+                Some(preloads[g]),
+                Some(pool_ref),
+                cancel_ref,
+            )
+            .map_err(|e| {
+                if matches!(
+                    e.downcast_ref::<IntegrationError>(),
+                    Some(IntegrationError::Cancelled)
+                ) {
+                    CANCELLED_MARKER.to_string()
+                } else {
+                    format!("calibration failed: {e:#}")
+                }
+            });
+            tickers[g].tick(Some(job.frame_id));
+            out
+        },
+    )
+}
+
+/// Stage 1's commit loop for ONE group, in the group's own frame order (never completion order):
+/// `commit_calibrated`'s artifact-row writes and `rc.warnings` land exactly where the old sequential stage put
+/// them.
+///
+/// Task 4 fix round: the `?` on `commit_calibrated` is a DB failure, not a calibration failure — if it fires at
+/// frame k, the run fails and frames k+1.. in this group are already written to disk with no
+/// `stacking_artifacts` row. That is not a leak: the next run's freshness check finds no row, regenerates those
+/// frames, and the write is the same atomic temp-file + rename `execute_generation` always uses.
+///
+/// `bytes_done` for a GENERATED frame is only known once `commit_calibrated` returns its file's real size, so
+/// the byte count advances at the group boundary, not mid-fan-out.
+fn commit_calibrate_group(
+    rc: &mut RunContext,
+    jobs: &[CalibrateJob],
+    results: Vec<Option<Result<GeneratedLight, String>>>,
+    bytes_done: &mut u64,
+) -> Result<(), RunError> {
+    for (pos, res) in results.into_iter().enumerate() {
+        let job = &jobs[pos];
+        match res {
+            None => return Err(RunError::Cancelled),
+            Some(Err(msg)) if msg == CANCELLED_MARKER => return Err(RunError::Cancelled),
+            Some(Err(msg)) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id = job.frame_id,
+                    error = %msg,
+                    "calibration failed; frame excluded"
+                );
+                rc.runtime_exclusions.push((job.frame_id, msg));
+            }
+            Some(Ok(generated)) => {
+                *bytes_done += commit_calibrated(rc, job, generated)?;
+                rc.cached_calibrated.insert(job.frame_id, false);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The collision-safe calibrated-file STEM for one frame of a group (fix
@@ -1955,7 +2145,19 @@ fn resolve_calibrate_job(
 /// iteration that measures a dark, so `rc.hot_maps.contains_key` already
 /// short-circuits every later job naming the same dark, within this call and
 /// across calls alike.
-fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path) {
+fn prebuild_hot_maps(
+    rc: &mut RunContext,
+    jobs: &[CalibrateJob],
+    scratch: &Path,
+    group_key: &str,
+    plane_px: (u64, u64),
+    resident_bytes: u64,
+) {
+    // Distinct darks still to measure, in job order (the order the serial
+    // loop visited them, so warnings land in today's group order). Deduped
+    // BEFORE spawning: a concurrent run would otherwise write `scratch` per
+    // dark twice.
+    let mut darks: Vec<PathBuf> = Vec::new();
     for job in jobs {
         if !job.opts.hot_pixel_correction {
             continue;
@@ -1963,28 +2165,71 @@ fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path)
         let Some(dark) = &job.spec.dark_path else {
             continue;
         };
-        if rc.hot_maps.contains_key(dark) {
+        if rc.hot_maps.contains_key(dark) || darks.contains(dark) {
             continue;
         }
-        let measured = match hot_pixel_map_from_dark(dark, scratch) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(
-                    path = %dark.display(),
-                    error = %format!("{e:#}"),
-                    "measuring the master dark failed — hot-pixel correction refused"
-                );
-                HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
-            }
-        };
+        darks.push(dark.clone());
+    }
+    if darks.is_empty() {
+        return;
+    }
+    let gate = preload_gate(rc, plane_px, darks.len(), resident_bytes);
+    let results = fan_out(
+        darks.clone(),
+        &gate,
+        FanOutLabel::new(rc, Stage::Calibrate, Some(group_key), "hot-maps"),
+        &rc.cancel,
+        |dark: PathBuf| -> Result<HotPixelMapOutcome, String> {
+            Ok(match hot_pixel_map_from_dark(&dark, scratch) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dark.display(),
+                        error = %format!("{e:#}"),
+                        "measuring the master dark failed — hot-pixel correction refused"
+                    );
+                    HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
+                }
+            })
+        },
+    );
+    for (dark, result) in darks.into_iter().zip(results) {
+        // `None`: the fan-out saw a cancel before starting this dark; the
+        // caller's cancel check right after ends the group.
+        let Some(Ok(measured)) = result else { continue };
         if let HotPixelMapOutcome::Refused(reason) = &measured {
             rc.warnings.push(format!(
                 "Hot-pixel correction skipped for {}: {reason}",
                 dark.display()
             ));
         }
-        rc.hot_maps.insert(dark.clone(), Arc::new(measured));
+        rc.hot_maps.insert(dark, Arc::new(measured));
     }
+}
+
+/// Planes resident per worker while a master is decoded or a hot-pixel map
+/// measured (one full plane read plus its scratch/result copy).
+const PRELOAD_PLANES_RESIDENT: u64 = 3;
+
+/// The admission gate for the Calibrate preload fan-outs: `PRELOAD_PLANES_RESIDENT`
+/// planes of the group's geometry per worker against the live budget.
+/// `resident_bytes` is what earlier groups' preloads already hold (the merged Calibrate prelude keeps every
+/// group's masters resident at once; `0` for a per-group preload, whose predecessors were dropped).
+fn preload_gate(
+    rc: &RunContext,
+    plane_px: (u64, u64),
+    items: usize,
+    resident_bytes: u64,
+) -> AdmissionGate {
+    let working_set = PRELOAD_PLANES_RESIDENT * plane_px.0 * plane_px.1 * 4;
+    let budget = fan_budget(rc);
+    let n = admission_with_shared(
+        resident_bytes,
+        working_set,
+        rc.ctx.image_pool.current_num_threads().min(items.max(1)),
+        budget.bytes,
+    );
+    AdmissionGate::budgeted(rc, working_set, resident_bytes, n)
 }
 
 /// Stage 1's per-group PRELOAD phase (perf tier 1 Task 5): decode every
@@ -2018,32 +2263,40 @@ fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path)
 /// `BTreeSet` rather than a `HashSet`) so preload order — and therefore
 /// warn order — is deterministic run to run.
 fn build_preloaded_masters(
-    cancel: &AtomicBool,
+    rc: &RunContext,
     jobs: &[CalibrateJob],
     scratch: &Path,
+    group_key: &str,
+    plane_px: (u64, u64),
+    resident_bytes: u64,
 ) -> Result<PreloadedMasters, RunError> {
-    let mut distinct: BTreeSet<PathBuf> = BTreeSet::new();
-    for job in jobs {
-        let subtrahend = job
-            .spec
-            .inputs
-            .dark_path
-            .clone()
-            .or_else(|| job.spec.inputs.bias_path.clone());
-        distinct.extend(subtrahend);
-        distinct.extend(job.spec.inputs.flat_path.clone());
+    let cancel: &AtomicBool = &rc.cancel;
+    let distinct = distinct_preload_paths(jobs);
+    if cancel.load(Ordering::SeqCst) {
+        return Err(RunError::Cancelled);
     }
+    // Task 13c L1: the distinct masters decode concurrently (each decode is
+    // independent, so the samples are bit-identical to the serial loop);
+    // results come back by index, in the BTreeSet's sorted order.
+    let paths: Vec<PathBuf> = distinct.into_iter().collect();
+    let gate = preload_gate(rc, plane_px, paths.len(), resident_bytes);
+    let results = fan_out(
+        paths.clone(),
+        &gate,
+        FanOutLabel::new(rc, Stage::Calibrate, Some(group_key), "preload"),
+        cancel,
+        |path: PathBuf| preload_master_plane(&path, scratch, cancel),
+    );
     let mut planes = HashMap::new();
-    for path in distinct {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(RunError::Cancelled);
-        }
-        match preload_master_plane(&path, scratch, cancel) {
-            Ok(plane) => {
+    for (path, result) in paths.into_iter().zip(results) {
+        match result {
+            // Never started: a cancel was raised before this master's turn.
+            None => return Err(RunError::Cancelled),
+            Some(Ok(plane)) => {
                 planes.insert(path, plane);
             }
-            Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
-            Err(e) => {
+            Some(Err(IntegrationError::Cancelled)) => return Err(RunError::Cancelled),
+            Some(Err(e)) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
@@ -2394,6 +2647,7 @@ fn commit_prepared(
 /// [`execute_prepare`]: crate::stacking::prepare::execute_prepare
 fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Calibrate, None);
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
     let groups = rc.plan_groups.clone();
     let cfg = rc.config.clone();
@@ -2492,8 +2746,19 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
 
-        let working_set_bytes = calibrate_working_set_bytes(group_max_w, group_max_h);
-        let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+        // Conservative for Prepare: an OSC group with the debayer on is charged the debayered footprint.
+        let working_set_bytes = calibrate_working_set_bytes(
+            group_max_w,
+            group_max_h,
+            group.color_mode,
+            cfg.calibration.debayer_osc,
+        );
+        let budget = fan_budget(rc);
+        let admission_n = admission(
+            working_set_bytes,
+            rc.ctx.image_pool.current_num_threads(),
+            budget.bytes,
+        );
         log_admission(
             rc,
             Stage::Calibrate,
@@ -2501,6 +2766,8 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
             working_set_bytes,
             0,
             admission_n,
+            budget,
+            "prepare",
         );
         let ticker = FanOutTicker::new(
             rc,
@@ -2517,7 +2784,8 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
         let job_refs: Vec<&PrepareRunJob> = jobs.iter().collect();
         let results = fan_out(
             job_refs,
-            admission_n,
+            &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
+            FanOutLabel::new(rc, Stage::Calibrate, Some(&group.key), "prepare"),
             cancel_ref,
             move |job: &PrepareRunJob| {
                 let out =
@@ -2571,6 +2839,7 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
         );
     }
 
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Calibrate,
         duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -2579,14 +2848,17 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
 }
 
 /// Planes of one w×h channel resident while a fan-out worker calibrates one
-/// frame (perf tier 1 Task 4): the light band, the `out` plane, a 3-plane
-/// VNG debayer output and the calibration formula's own band scratch — one
-/// frame at a time per worker, never a whole group. Unlike
-/// `MEASURE_PLANES_RESIDENT`/`LN_PLANES_RESIDENT` above, not measured with
-/// `/usr/bin/time -l` this cycle: Task 10's acceptance run reads the
-/// "fan-out admitted" line this stage now logs (`log_admission`) against
-/// real RSS instead.
-pub(crate) const CALIBRATE_PLANES_RESIDENT: u64 = 8;
+/// MONO frame (the light band in, the `out` plane): measured 2026-10-17 on
+/// Horse C11 (mono 9576×6388, admission 1) as work 1 393 MiB − shared
+/// 933 MiB ≈ 460 MiB = 1.9 planes of 233 MiB; one plane of margin → 3.
+/// (Task 13c L1; it was a flat 8, which counted a debayer output even on mono.)
+pub(crate) const CALIBRATE_PLANES_RESIDENT_MONO: u64 = 3;
+
+/// The same for a DEBAYERED OSC frame (mosaic in + 3 debayered planes out):
+/// measured on set 204 (OSC 6248×4176, admission 1) as work 600 MiB − shared
+/// 199 MiB ≈ 400 MiB = 3.8 planes of 104 MiB (at admission 4: 1 798 − 199 MiB,
+/// 400 MiB per worker, consistent); one plane of margin → 5.
+pub(crate) const CALIBRATE_PLANES_RESIDENT_OSC: u64 = 5;
 
 /// Stage-1-worker cancellation marker (perf tier 1 Task 4): a fan-out
 /// worker cannot return `RunError` (the closure's error type is `String`,
@@ -2821,6 +3093,12 @@ fn warn_flat_only_group(
 /// A project or an attested set takes [`stage_prepare`] instead (plan 6b-2
 /// C11, C12).
 fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
+    stage_calibrate_with(rc, None)
+}
+
+/// [`stage_calibrate`] with the cross-group queue decision overridable (`Some(true)` = always one queue,
+/// `Some(false)` = always per group; tests pin the two against each other).
+fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<(), RunError> {
     // Plan 6b-2 C11, C12: a project, or an attested set, prepares instead.
     if stage_one_kind(rc)? == StageOneKind::Prepare {
         return stage_prepare(rc);
@@ -2832,6 +3110,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         ));
     };
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Calibrate, None);
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
     let groups = rc.plan_groups.clone();
     let cfg = rc.config.clone();
@@ -2878,242 +3157,340 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         None,
     );
 
-    for group in &groups {
-        rc.check_cancel()?;
-        std::fs::create_dir_all(rc.layout.calibrated_dir(&group.key))
-            .map_err(|e| RunError::Other(format!("failed to create calibrated dir: {e}")))?;
+    // Task 13c L4a. Phase 1 (group order, sequential): resolve every group's jobs and name its flat-only
+    // lights. Phase 2: when ONE queue over every group's jobs does not lower any group's admission
+    // (`merged_admission`), the jobs of all groups run through it, longest first; otherwise each group runs
+    // its own queue as before. Phase 3 (group order): commit. Scheduling only — the files, artifact rows and
+    // their commit order (group, then frame) are the per-group loop's.
+    let mut plans: Vec<CalibrateGroupPlan> = Vec::new();
+    // Phase 1 runs every group before any of them commits, so its entries in `rc.warnings` and
+    // `rc.runtime_exclusions` would land ahead of the earlier groups' commit warnings. Each group's are set aside
+    // here and replayed at that group's phase 3, which restores the per-group loop's order (Task 13c L4 review M2).
+    let (warn_mark, excl_mark) = (rc.warnings.len(), rc.runtime_exclusions.len());
+    let mut stash: Vec<GroupListStash> = Vec::with_capacity(groups.len());
+    let mut replayed = 0usize;
+    // A cancel or an error anywhere below replays every stash still held before it returns (Task 13c final review A, M1).
+    let phase1: Result<(), RunError> = (|| {
+        for (group_idx, group) in groups.iter().enumerate() {
+            rc.check_cancel()?;
+            if group_idx > 0 {
+                stash.push(take_list_stash(rc, warn_mark, excl_mark));
+            }
+            std::fs::create_dir_all(rc.layout.calibrated_dir(&group.key))
+                .map_err(|e| RunError::Other(format!("failed to create calibrated dir: {e}")))?;
 
-        // Owner decision 2026-09-10 (same rule `stage_measure` uses): a
-        // group's members can carry different native geometry (M4b — a
-        // second camera, a bin-2 member), so admission sizing below budgets
-        // for the LARGEST frame in the group rather than a single
-        // group-wide width/height.
-        let group_max_w = group
-            .frames
-            .iter()
-            .map(|f| f.width.max(0) as u64)
-            .max()
-            .unwrap_or(0);
-        let group_max_h = group
-            .frames
-            .iter()
-            .map(|f| f.height.max(0) as u64)
-            .max()
-            .unwrap_or(0);
+            // Owner decision 2026-09-10 (same rule `stage_measure` uses): a
+            // group's members can carry different native geometry (M4b — a
+            // second camera, a bin-2 member), so admission sizing below budgets
+            // for the LARGEST frame in the group rather than a single
+            // group-wide width/height.
+            let group_max_w = group
+                .frames
+                .iter()
+                .map(|f| f.width.max(0) as u64)
+                .max()
+                .unwrap_or(0);
+            let group_max_h = group
+                .frames
+                .iter()
+                .map(|f| f.height.max(0) as u64)
+                .max()
+                .unwrap_or(0);
 
-        let mut jobs: Vec<CalibrateJob> = Vec::new();
-        for frame in &group.frames {
-            if excluded_set.contains(&frame.frame_id) {
+            let mut jobs: Vec<CalibrateJob> = Vec::new();
+            for frame in &group.frames {
+                if excluded_set.contains(&frame.frame_id) {
+                    continue;
+                }
+                rc.check_cancel()?;
+
+                match resolve_calibrate_job(rc, &cfg, group, frame, &scratch)? {
+                    CalibrateResolved::Reused { bytes } => {
+                        bytes_done += bytes;
+                        rc.cached_calibrated.insert(frame.frame_id, true);
+                        current += 1;
+                        rc.progress(
+                            Stage::Calibrate,
+                            Some(group.key.clone()),
+                            current,
+                            total,
+                            bytes_done,
+                            bytes_total,
+                            Some(frame.frame_id),
+                            None,
+                        );
+                    }
+                    CalibrateResolved::Excluded { reason } => {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            frame_id = frame.frame_id,
+                            error = %reason,
+                            "calibration failed; frame excluded"
+                        );
+                        rc.runtime_exclusions.push((frame.frame_id, reason));
+                        current += 1;
+                        // Task 4 fix round: the same progress tick `Reused`
+                        // emits above — an all-`Excluded` group used to emit
+                        // nothing here and leave the bar short of `total`.
+                        rc.progress(
+                            Stage::Calibrate,
+                            Some(group.key.clone()),
+                            current,
+                            total,
+                            bytes_done,
+                            bytes_total,
+                            Some(frame.frame_id),
+                            None,
+                        );
+                    }
+                    CalibrateResolved::Job(job) => {
+                        jobs.push(*job);
+                    }
+                }
+            }
+            // Spec 2026-10-04 §5.1: evaluated here, per group, before the
+            // cached-group `continue`, so a run whose stage 1 is fully cached
+            // still names its flat-only lights.
+            let visited: Vec<i64> = group
+                .frames
+                .iter()
+                .map(|f| f.frame_id)
+                .filter(|id| !excluded_set.contains(id))
+                .filter(|id| !rc.runtime_exclusions.iter().any(|(e, _)| e == id))
+                .collect();
+            warn_flat_only_group(rc, &cfg, group, &visited, &scratch);
+            if jobs.is_empty() {
                 continue;
             }
-            rc.check_cancel()?;
-
-            match resolve_calibrate_job(rc, &cfg, group, frame, &scratch)? {
-                CalibrateResolved::Reused { bytes } => {
-                    bytes_done += bytes;
-                    rc.cached_calibrated.insert(frame.frame_id, true);
-                    current += 1;
-                    rc.progress(
-                        Stage::Calibrate,
-                        Some(group.key.clone()),
-                        current,
-                        total,
-                        bytes_done,
-                        bytes_total,
-                        Some(frame.frame_id),
-                        None,
-                    );
-                }
-                CalibrateResolved::Excluded { reason } => {
-                    tracing::warn!(
-                        run_id = rc.run_id,
-                        frame_id = frame.frame_id,
-                        error = %reason,
-                        "calibration failed; frame excluded"
-                    );
-                    rc.runtime_exclusions.push((frame.frame_id, reason));
-                    current += 1;
-                    // Task 4 fix round: the same progress tick `Reused`
-                    // emits above — an all-`Excluded` group used to emit
-                    // nothing here and leave the bar short of `total`.
-                    rc.progress(
-                        Stage::Calibrate,
-                        Some(group.key.clone()),
-                        current,
-                        total,
-                        bytes_done,
-                        bytes_total,
-                        Some(frame.frame_id),
-                        None,
-                    );
-                }
-                CalibrateResolved::Job(job) => {
-                    jobs.push(*job);
-                }
-            }
+            let group_debayers = jobs.iter().any(|j| j.spec.debayer);
+            let working_set_bytes = calibrate_working_set_bytes(
+                group_max_w,
+                group_max_h,
+                group.color_mode,
+                group_debayers,
+            );
+            // The planes this group will preload, counted from its jobs (the preload itself runs later and can only
+            // hold fewer, when a decode fails): the cross-group decision needs them before any master is decoded.
+            let shared_bytes_est =
+                distinct_preload_paths(&jobs).len() as u64 * group_max_w * group_max_h * 4;
+            plans.push(CalibrateGroupPlan {
+                group_idx,
+                jobs,
+                plane_px: (group_max_w, group_max_h),
+                working_set_bytes,
+                shared_bytes_est,
+            });
         }
-        // Spec 2026-10-04 §5.1: evaluated here, per group, before the
-        // cached-group `continue`, so a run whose stage 1 is fully cached
-        // still names its flat-only lights.
-        let visited: Vec<i64> = group
-            .frames
-            .iter()
-            .map(|f| f.frame_id)
-            .filter(|id| !excluded_set.contains(id))
-            .filter(|id| !rc.runtime_exclusions.iter().any(|(e, _)| e == id))
-            .collect();
-        warn_flat_only_group(rc, &cfg, group, &visited, &scratch);
-        if jobs.is_empty() {
-            continue;
-        }
-        prebuild_hot_maps(rc, &jobs, &scratch);
-        // Perf tier 1 Task 5: decode this group's shared master subtrahend
-        // (dark, or bias when there is no dark — mirroring the engine's own
-        // rule, fix round 1 Important finding 1) and flat once, on the run
-        // thread, before the fan-out — every worker's `execute_generation`
-        // call below then reads them from RAM instead of re-opening and
-        // re-band-reading them per frame.
-        let preloaded = build_preloaded_masters(&rc.cancel, &jobs, &scratch)?;
-
-        // Perf tier 1 Task 5 fix round 1, Important finding 2: the preloaded
-        // planes are resident ONCE per group, not once per worker, so they
-        // are charged separately from the per-worker working set —
-        // `shared_bytes` is the REAL count of planes this group actually
-        // preloaded: one subtrahend (dark or bias, never both) and one flat
-        // PER DISTINCT MASTER the group's jobs resolve to, not a hard-coded
-        // 2, so a group missing a link (or a preload failure) doesn't
-        // over-charge the budget, and native-mode grouping's several
-        // distinct masters per group don't under-charge it either.
-        // `admission_with_shared` subtracts this from the RAM budget BEFORE
-        // dividing by the per-worker working set.
-        let shared_bytes = preloaded.planes.len() as u64 * group_max_w * group_max_h * 4;
-        let working_set_bytes = calibrate_working_set_bytes(group_max_w, group_max_h);
-        let admission_n = admission_with_shared(
-            shared_bytes,
-            working_set_bytes,
-            rc.ctx.image_pool.current_num_threads(),
-        );
-        log_admission(
-            rc,
-            Stage::Calibrate,
-            &group.key,
-            working_set_bytes,
-            shared_bytes,
-            admission_n,
-        );
-        let ticker = FanOutTicker::new(
-            rc,
-            Stage::Calibrate,
-            Some(group.key.clone()),
-            current,
-            total,
-            bytes_done,
-            bytes_total,
-        );
-        let ticker_ref = &ticker;
-        let cancel_ref: &AtomicBool = &rc.cancel;
-        let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
-        let preloaded_ref: &PreloadedMasters = &preloaded;
-        // Arcs only — cheap. Every job's own dark was already prebuilt into
-        // `rc.hot_maps` above, so each worker's own clone is a cache HIT for
-        // every lookup `execute_generation` makes; it never inserts into its
-        // clone, so the clones never need to be merged back.
-        let hot_maps_snapshot: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = rc.hot_maps.clone();
-        let scratch_ref: &Path = &scratch;
-        let job_refs: Vec<&CalibrateJob> = jobs.iter().collect();
-        let results = fan_out(
-            job_refs,
-            admission_n,
-            cancel_ref,
-            move |job: &CalibrateJob| {
-                let mut local_maps = hot_maps_snapshot.clone();
-                let out = execute_generation(
-                    &job.spec,
-                    &job.out,
-                    job.mosaic_out.as_deref(),
-                    scratch_ref,
-                    &job.opts,
-                    &mut local_maps,
-                    Some(preloaded_ref),
-                    Some(pool_ref),
-                    cancel_ref,
-                )
-                .map_err(|e| {
-                    if matches!(
-                        e.downcast_ref::<IntegrationError>(),
-                        Some(IntegrationError::Cancelled)
-                    ) {
-                        CANCELLED_MARKER.to_string()
-                    } else {
-                        format!("calibration failed: {e:#}")
-                    }
-                });
-                ticker_ref.tick(Some(job.frame_id));
-                out
-            },
-        );
-
-        rc.check_cancel()?;
-        current = ticker.done();
-
-        // Committed in the fan-out's ORIGINAL (frame) order, never
-        // completion order — `commit_calibrated`'s artifact-row writes and
-        // `rc.warnings` must land exactly where the old sequential stage
-        // put them.
-        //
-        // Task 4 fix round: the `?` below is a DB failure inside
-        // `commit_calibrated`, not a calibration failure — if it fires at
-        // frame k, the run fails and frames k+1.. in this group are already
-        // written to disk with no `stacking_artifacts` row. That is not a
-        // leak: the next run's freshness check finds no row, regenerates
-        // those frames, and the write is the same atomic temp-file +
-        // rename `execute_generation` always uses, so the stale file is
-        // simply overwritten in place.
-        for (pos, res) in results.into_iter().enumerate() {
-            let job = &jobs[pos];
-            match res {
-                None => return Err(RunError::Cancelled),
-                Some(Err(msg)) if msg == CANCELLED_MARKER => return Err(RunError::Cancelled),
-                Some(Err(msg)) => {
-                    tracing::warn!(
-                        run_id = rc.run_id,
-                        frame_id = job.frame_id,
-                        error = %msg,
-                        "calibration failed; frame excluded"
-                    );
-                    rc.runtime_exclusions.push((job.frame_id, msg));
-                }
-                Some(Ok(generated)) => {
-                    bytes_done += commit_calibrated(rc, job, generated)?;
-                    rc.cached_calibrated.insert(job.frame_id, false);
-                }
-            }
-        }
-
-        // Perf tier 1 Task 4, ruling 7: `bytes_done` for a GENERATED frame
-        // is only known once `commit_calibrated` returns its file's real
-        // size, which happens after the whole fan-out — so, unlike the old
-        // per-frame loop, the byte count does not advance mid-fan-out. Fix
-        // wave item 3: the ticker's own per-frame ticks (`FanOutTicker::
-        // tick` above) DO carry a byte pair now, but it is frozen at this
-        // group's start (the `bytes_done`/`bytes_total` passed into
-        // `FanOutTicker::new` above) — only the `current`/count climbs
-        // during the fan-out itself. This one final `progress` call is
-        // what actually advances `bytes_done`, at the group boundary, once
-        // the fan-out has committed and the group's real generated sizes
-        // are known.
-        rc.progress(
-            Stage::Calibrate,
-            Some(group.key.clone()),
-            current,
-            total,
-            bytes_done,
-            bytes_total,
-            None,
-            None,
-        );
+        Ok(())
+    })();
+    if let Err(e) = phase1 {
+        stash.push(take_list_stash(rc, warn_mark, excl_mark));
+        replay_list_stash(rc, &mut stash, &mut replayed, usize::MAX);
+        return Err(e);
+    }
+    if !groups.is_empty() {
+        stash.push(take_list_stash(rc, warn_mark, excl_mark));
     }
 
+    let phase23: Result<(), RunError> = (|| {
+        let pool_threads = rc.ctx.image_pool.current_num_threads();
+        // The stage-start read feeds the merge decision only; each fan-out below re-reads the live budget.
+        let budget = fan_budget(rc);
+        let loads: Vec<GroupLoad> = plans
+            .iter()
+            .map(|p| GroupLoad {
+                working_set_bytes: p.working_set_bytes,
+                shared_bytes: p.shared_bytes_est,
+            })
+            .collect();
+        let decision = merged_admission(&loads, pool_threads, budget.bytes);
+        let merge = plans.len() >= 2 && force_merge.unwrap_or(decision.merge);
+        if plans.len() >= 2 {
+            tracing::debug!(
+                run_id = rc.run_id,
+                stage = Stage::Calibrate.as_str(),
+                count = plans.len(),
+                admission = decision.merged,
+                admission_per_group_min = decision.per_group_min,
+                admission_per_group_max = decision.per_group_max,
+                merged = merge,
+                "cross-group queue decision"
+            );
+        }
+
+        if merge {
+            // Every group's masters are resident at once (`shared_sum`), hot maps and scratch are built per group
+            // and never concurrently.
+            let mut preloads: Vec<PreloadedMasters> = Vec::with_capacity(plans.len());
+            // What the earlier groups' preloads hold while this one decodes (M4).
+            let mut resident_bytes = 0u64;
+            for plan in &plans {
+                rc.check_cancel()?;
+                let key = groups[plan.group_idx].key.as_str();
+                let warn_before = rc.warnings.len();
+                prebuild_hot_maps(rc, &plan.jobs, &scratch, key, plan.plane_px, resident_bytes);
+                stash[plan.group_idx]
+                    .warnings
+                    .extend(rc.warnings.split_off(warn_before));
+                let pre = build_preloaded_masters(
+                    rc,
+                    &plan.jobs,
+                    &scratch,
+                    key,
+                    plan.plane_px,
+                    resident_bytes,
+                )?;
+                resident_bytes += pre.planes.len() as u64 * plan.plane_px.0 * plan.plane_px.1 * 4;
+                preloads.push(pre);
+            }
+            let shared_sum: u64 = plans
+                .iter()
+                .zip(&preloads)
+                .map(|(p, pre)| pre.planes.len() as u64 * p.plane_px.0 * p.plane_px.1 * 4)
+                .sum();
+            let ws_max = plans.iter().map(|p| p.working_set_bytes).max().unwrap_or(0);
+            let budget = fan_budget(rc);
+            let admission_n = admission_with_shared(shared_sum, ws_max, pool_threads, budget.bytes);
+            log_admission(rc, Stage::Calibrate, "", ws_max, shared_sum, admission_n, budget, "calibrate");
+            // One ticker per group, all counting into one stage-wide counter, so `current` never runs backwards
+            // however the groups' items interleave.
+            let mut tickers: Vec<FanOutTicker> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                let t = FanOutTicker::new(
+                    rc,
+                    Stage::Calibrate,
+                    Some(groups[plan.group_idx].key.clone()),
+                    current,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                );
+                tickers.push(match tickers.first() {
+                    Some(first) => t.sharing_state(first),
+                    None => t,
+                });
+            }
+            let results = calibrate_queue(
+                rc,
+                &plans.iter().collect::<Vec<_>>(),
+                &preloads.iter().collect::<Vec<_>>(),
+                &tickers.iter().collect::<Vec<_>>(),
+                &scratch,
+                &AdmissionGate::budgeted(rc, ws_max, shared_sum, admission_n),
+                FanOutLabel::new(rc, Stage::Calibrate, None, "calibrate"),
+            );
+            current = tickers.first().map_or(current, FanOutTicker::done);
+            // Per group, in group order: a group's completed results commit (frame order) before a cancel or an
+            // error in a LATER group is honoured, as the per-group loop did.
+            for (plan, res) in plans.iter().zip(results) {
+                replay_list_stash(rc, &mut stash, &mut replayed, plan.group_idx);
+                commit_calibrate_group(rc, &plan.jobs, res, &mut bytes_done)?;
+                rc.progress(
+                    Stage::Calibrate,
+                    Some(groups[plan.group_idx].key.clone()),
+                    current,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    None,
+                    None,
+                );
+            }
+            rc.check_cancel()?;
+        } else {
+            for plan in &plans {
+                rc.check_cancel()?;
+                let group = &groups[plan.group_idx];
+                replay_list_stash(rc, &mut stash, &mut replayed, plan.group_idx);
+                prebuild_hot_maps(rc, &plan.jobs, &scratch, &group.key, plan.plane_px, 0);
+                // Perf tier 1 Task 5: decode this group's shared master subtrahend
+                // (dark, or bias when there is no dark — mirroring the engine's own
+                // rule, fix round 1 Important finding 1) and flat once, on the run
+                // thread, before the fan-out — every worker's `execute_generation`
+                // call below then reads them from RAM instead of re-opening and
+                // re-band-reading them per frame.
+                let preloaded =
+                    build_preloaded_masters(rc, &plan.jobs, &scratch, &group.key, plan.plane_px, 0)?;
+
+                // Perf tier 1 Task 5 fix round 1, Important finding 2: the preloaded
+                // planes are resident ONCE per group, not once per worker, so they
+                // are charged separately from the per-worker working set —
+                // `shared_bytes` is the REAL count of planes this group actually
+                // preloaded: one subtrahend (dark or bias, never both) and one flat
+                // PER DISTINCT MASTER the group's jobs resolve to, not a hard-coded
+                // 2, so a group missing a link (or a preload failure) doesn't
+                // over-charge the budget, and native-mode grouping's several
+                // distinct masters per group don't under-charge it either.
+                // `admission_with_shared` subtracts this from the RAM budget BEFORE
+                // dividing by the per-worker working set.
+                let shared_bytes = preloaded.planes.len() as u64 * plan.plane_px.0 * plan.plane_px.1 * 4;
+                // The live budget, read right before this group's fan-out (Task 13c L4 review I2).
+                let budget = fan_budget(rc);
+                let admission_n = admission_with_shared(
+                    shared_bytes,
+                    plan.working_set_bytes,
+                    pool_threads,
+                    budget.bytes,
+                );
+                log_admission(
+                    rc,
+                    Stage::Calibrate,
+                    &group.key,
+                    plan.working_set_bytes,
+                    shared_bytes,
+                    admission_n,
+                    budget,
+                    "calibrate",
+                );
+                let ticker = FanOutTicker::new(
+                    rc,
+                    Stage::Calibrate,
+                    Some(group.key.clone()),
+                    current,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                );
+                let mut results = calibrate_queue(
+                    rc,
+                    &[plan],
+                    &[&preloaded],
+                    &[&ticker],
+                    &scratch,
+                    &AdmissionGate::budgeted(rc, plan.working_set_bytes, shared_bytes, admission_n),
+                    FanOutLabel::new(rc, Stage::Calibrate, Some(&group.key), "calibrate"),
+                );
+
+                rc.check_cancel()?;
+                current = ticker.done();
+                commit_calibrate_group(
+                    rc,
+                    &plan.jobs,
+                    results.pop().unwrap_or_default(),
+                    &mut bytes_done,
+                )?;
+                rc.progress(
+                    Stage::Calibrate,
+                    Some(group.key.clone()),
+                    current,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    None,
+                    None,
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = phase23 {
+        replay_list_stash(rc, &mut stash, &mut replayed, usize::MAX);
+        return Err(e);
+    }
+
+    // Groups with nothing to calibrate (fully cached, or all excluded) after the last plan.
+    replay_list_stash(rc, &mut stash, &mut replayed, groups.len().saturating_sub(1));
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Calibrate,
         duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -3182,7 +3559,7 @@ pub(crate) struct MeasuredGroup {
     /// frame at all. Stage 6 fits its reference and every member's seeds at
     /// it (`PsfModel::Fixed`), and from Plan A Task 11b (owner decision
     /// R11b-12) stage 3 fitted every member at it under `Auto`
-    /// ([`measure_group_two_pass`]) — one value, resolved once, read by both;
+    /// ([`measure_two_pass_prepare`]) — one value, resolved once, read by both;
     /// every later stage's measurement hash folds it
     /// ([`group_measurement_hash`]).
     pub beta: Option<f64>,
@@ -3432,16 +3809,27 @@ pub(crate) fn ln_working_set_bytes_masked(w: u64, h: u64) -> u64 {
     ln_working_set_bytes(w, h) + LN_MASKED_EXTRA_PLANES * w * h * 4
 }
 
-/// `CALIBRATE_PLANES_RESIDENT` planes of one w×h channel, in bytes — ONE
+/// The calibrate planes (mono [`CALIBRATE_PLANES_RESIDENT_MONO`], debayered
+/// OSC [`CALIBRATE_PLANES_RESIDENT_OSC`]) of one w×h channel, in bytes — ONE
 /// worker's own Calibrate fan-out footprint (perf tier 1 Task 5 fix round
-/// 1, Important finding 2). The group's shared preloaded master planes are
-/// NOT folded in here — they are resident once per group, not once per
-/// worker, so they are charged through `admission_with_shared`'s
-/// `shared_bytes` instead; folding a fixed `+2 planes` into this per-worker
-/// number over-charged every worker's own budget on a group with one
-/// shared master and under-charged a native-mode group with several.
-pub(crate) fn calibrate_working_set_bytes(w: u64, h: u64) -> u64 {
-    CALIBRATE_PLANES_RESIDENT * w * h * 4
+/// 1, Important finding 2; per colour mode since Task 13c L1). `debayer` is
+/// whether this group's frames are actually debayered; a mono group (or an
+/// OSC group kept as mosaics) never holds the 3-plane output. The group's
+/// shared preloaded master planes are NOT folded in here — they are
+/// resident once per group, not once per worker, so they are charged
+/// through `admission_with_shared`'s `shared_bytes` instead.
+pub(crate) fn calibrate_working_set_bytes(
+    w: u64,
+    h: u64,
+    colour_mode: ColorMode,
+    debayer: bool,
+) -> u64 {
+    let planes = if colour_mode == ColorMode::Osc && debayer {
+        CALIBRATE_PLANES_RESIDENT_OSC
+    } else {
+        CALIBRATE_PLANES_RESIDENT_MONO
+    };
+    planes * w * h * 4
 }
 
 /// Planes of ONE channel (ref geometry `w × h`) resident while a register
@@ -3525,19 +3913,37 @@ pub(crate) fn register_working_set_bytes(w: u64, h: u64, frame_planes: usize) ->
     planes * w * h * 4
 }
 
+/// The memory budget one fan-out's admission divides by, resolved ONCE per
+/// fan-out from the live `compute.memory_budget_mb` (Task 13c): the setting
+/// when positive, else a quarter of the memory this process may use. `bytes`
+/// is `None` when auto and the total is unknown (admission 1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FanBudget {
+    pub(crate) bytes: Option<u64>,
+    pub(crate) why: &'static str,
+}
+
+fn fan_budget(rc: &RunContext) -> FanBudget {
+    match machine::memory_budget(&rc.ctx) {
+        Some((b, why)) => FanBudget { bytes: Some(b), why },
+        None => FanBudget { bytes: None, why: "unknown" },
+    }
+}
+
 /// Memory-budgeted worker count for a fan-out stage (decision 3):
-/// `clamp(budget / working_set, 1, max_workers)`. `budget =
-/// total_ram_bytes() / 4`; when the total is unknown, the budget is treated
-/// as exhausted (admission 1 — the conservative, single-frame-at-a-time
-/// fallback) rather than guessed. `max_workers` is the app pool's width — a
+/// `clamp(budget / working_set, 1, max_workers)`. `mem_budget` is
+/// `compute.memory_budget_mb` or, at the default, `total_ram_bytes() / 4`;
+/// when it is unknown (`None`), the budget is treated as exhausted
+/// (admission 1 — the conservative, single-frame-at-a-time fallback) rather
+/// than guessed. `max_workers` is the app pool's width — a
 /// frame worker that outnumbers the pixel pool only queues behind it (perf
 /// tier 1 Task 2: every fan-out's own worker threads now hand their pixel
 /// work to `image_pool`, so admitting more frame workers than the pool has
 /// threads cannot buy any more parallelism, only more RAM held at once).
-fn admission(working_set_bytes: u64, max_workers: usize) -> usize {
+fn admission(working_set_bytes: u64, max_workers: usize, mem_budget: Option<u64>) -> usize {
     let working_set = working_set_bytes.max(1);
-    let n = match total_ram_bytes() {
-        Some(total) => (total / 4) / working_set,
+    let n = match mem_budget {
+        Some(budget) => budget / working_set,
         None => 1,
     };
     n.clamp(1, max_workers.max(1) as u64) as usize
@@ -3546,17 +3952,22 @@ fn admission(working_set_bytes: u64, max_workers: usize) -> usize {
 /// `admission` for a fan-out whose working set also carries bytes resident
 /// ONCE per group rather than once per worker (perf tier 1 Task 5 fix
 /// round 1, Important finding 2) — Calibrate's preloaded master
-/// subtrahend/flat planes. `shared_bytes` is subtracted from the RAM
+/// subtrahend/flat planes. `shared_bytes` is subtracted from the memory
 /// budget BEFORE the per-worker division (`saturating_sub`, so a shared
 /// cost that exceeds the whole budget clamps to admission 1 rather than
 /// underflowing), then the remainder is divided by `working_set_bytes`
-/// exactly as [`admission`] does. Same `total_ram_bytes()` semantics as
-/// `admission`: an unknown total is a budget treated as exhausted
+/// exactly as [`admission`] does. Same `mem_budget` semantics as
+/// `admission`: an unknown budget is treated as exhausted
 /// (admission 1), never guessed.
-fn admission_with_shared(shared_bytes: u64, working_set_bytes: u64, max_workers: usize) -> usize {
+fn admission_with_shared(
+    shared_bytes: u64,
+    working_set_bytes: u64,
+    max_workers: usize,
+    mem_budget: Option<u64>,
+) -> usize {
     let working_set = working_set_bytes.max(1);
-    let n = match total_ram_bytes() {
-        Some(total) => (total / 4).saturating_sub(shared_bytes) / working_set,
+    let n = match mem_budget {
+        Some(budget) => budget.saturating_sub(shared_bytes) / working_set,
         None => 1,
     };
     n.clamp(1, max_workers.max(1) as u64) as usize
@@ -3574,23 +3985,199 @@ fn log_admission(
     working_set_bytes: u64,
     shared_bytes: u64,
     admission: usize,
+    budget: FanBudget,
+    pass: &str,
 ) {
     tracing::info!(
         run_id = rc.run_id,
         stage = stage.as_str(),
+        pass,
         group_key,
         working_set_bytes,
         shared_bytes,
         admission,
+        memory_budget_bytes = machine::opt_i64(budget.bytes),
+        budget_why = budget.why,
         pool_threads = rc.ctx.image_pool.current_num_threads(),
         "fan-out admitted"
     );
 }
 
-/// Fan `items` out across `min(admission, items.len()).max(1)` worker
+/// End a per-group meter if it is still open (`finish` consumes it; a drop is the aborted path).
+fn finish_meter(m: &mut Option<crate::stacking::telemetry::StageMeter>) {
+    if let Some(m) = m.take() {
+        m.finish();
+    }
+}
+
+/// The live admission of one fan-out (Task 13c, S7): `start` workers are spawned, and a worker re-reads
+/// `target` before EVERY pull — while `live > target` it retires (a CAS on `live`) instead of pulling. The
+/// target is clamped to `[1, start]` (never above what was started, always one worker). Because the workers
+/// pull from one FIFO and results land by item index, a retiring worker changes WHEN items run, never which
+/// item lands where: the output is bit-identical to any other admission by construction.
+///
+/// The production target source re-computes the admission from the live `compute.memory_budget_mb` at most
+/// once per second and only ever LOWERS the target (workers that retired do not come back).
+pub(crate) struct AdmissionGate {
+    start: usize,
+    target: AtomicUsize,
+    live: AtomicUsize,
+    retired: AtomicUsize,
+    source: Option<TargetSource>,
+}
+
+/// Where a production gate re-reads its target from.
+struct TargetSource {
+    ctx: Arc<ServiceContext>,
+    working_set_bytes: u64,
+    shared_bytes: u64,
+    max_workers: usize,
+    last_check: Mutex<Instant>,
+}
+
+/// Re-read the live budget at most this often.
+const GATE_REFRESH: Duration = Duration::from_secs(1);
+
+impl AdmissionGate {
+    /// A fixed gate: `start` workers, never re-read (tests, and the shape every fan-out had before).
+    #[cfg(test)]
+    pub(crate) fn fixed(start: usize) -> Self {
+        Self::build(start, None)
+    }
+
+    /// The production gate: `start` is the admission just computed from `working_set_bytes` (and `shared_bytes`
+    /// resident once per group); the live budget lowers the target if memory shrinks mid-fan-out.
+    fn budgeted(rc: &RunContext, working_set_bytes: u64, shared_bytes: u64, start: usize) -> Self {
+        Self::budgeted_on(&rc.ctx, working_set_bytes, shared_bytes, start)
+    }
+
+    fn budgeted_on(
+        ctx: &Arc<ServiceContext>,
+        working_set_bytes: u64,
+        shared_bytes: u64,
+        start: usize,
+    ) -> Self {
+        Self::build(
+            start,
+            Some(TargetSource {
+                ctx: ctx.clone(),
+                working_set_bytes,
+                shared_bytes,
+                max_workers: ctx.image_pool.current_num_threads(),
+                last_check: Mutex::new(Instant::now()),
+            }),
+        )
+    }
+
+    fn build(start: usize, source: Option<TargetSource>) -> Self {
+        let start = start.max(1);
+        Self {
+            start,
+            target: AtomicUsize::new(start),
+            live: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+            source,
+        }
+    }
+
+    /// Set the target (clamped to `[1, start]`). Tests drive the gate with it.
+    #[cfg(test)]
+    pub(crate) fn set_target(&self, target: usize) {
+        self.target
+            .store(target.clamp(1, self.start), Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> usize {
+        self.target.load(Ordering::SeqCst)
+    }
+
+    /// Re-compute the target from the live budget (rate-limited; a no-op for a fixed gate). A failed read
+    /// keeps the target and logs; the DB lock is held only inside the read, never across item work.
+    fn refresh(&self, label: &FanOutLabel) {
+        let Some(src) = &self.source else { return };
+        let Ok(mut last) = src.last_check.try_lock() else {
+            return;
+        };
+        if last.elapsed() < GATE_REFRESH {
+            return;
+        }
+        *last = Instant::now();
+        match machine::try_memory_budget(&src.ctx) {
+            Err(e) => tracing::warn!(
+                run_id = label.run_id,
+                stage = label.stage.as_str(),
+                error = %e,
+                "fan-out admission: memory budget unreadable; keeping the target"
+            ),
+            Ok(budget) => {
+                let why = budget.map_or("unknown", |b| b.1);
+                let want = admission_with_shared(
+                    src.shared_bytes,
+                    src.working_set_bytes,
+                    src.max_workers,
+                    budget.map(|b| b.0),
+                )
+                .clamp(1, self.start);
+                let from = self.target.load(Ordering::SeqCst);
+                if want < from {
+                    self.target.store(want, Ordering::SeqCst);
+                    tracing::info!(
+                        run_id = label.run_id,
+                        stage = label.stage.as_str(),
+                        group_key = %label.group_key.as_deref().unwrap_or(""),
+                        from,
+                        to = want,
+                        budget_why = why,
+                        "fan-out admission lowered"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `true` when this worker must retire instead of pulling (it has already left `live`).
+    fn retire_if_over_target(&self) -> bool {
+        loop {
+            let live = self.live.load(Ordering::SeqCst);
+            if live <= self.target.load(Ordering::SeqCst).max(1) {
+                return false;
+            }
+            if self
+                .live
+                .compare_exchange(live, live - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+/// What a fan-out says about itself in `fan-out admission lowered` / `fan-out finished`.
+pub(crate) struct FanOutLabel {
+    pub(crate) run_id: i64,
+    pub(crate) stage: Stage,
+    pub(crate) group_key: Option<String>,
+    /// Which fan-out of the stage ("measure", "pass1", "pass2", "rewrite", "align", ...).
+    pub(crate) pass: &'static str,
+}
+
+impl FanOutLabel {
+    fn new(rc: &RunContext, stage: Stage, group_key: Option<&str>, pass: &'static str) -> Self {
+        Self {
+            run_id: rc.run_id,
+            stage,
+            group_key: group_key.map(str::to_string),
+            pass,
+        }
+    }
+}
+
+/// Fan `items` out across `min(gate.start, items.len()).max(1)` worker
 /// threads pulling from one shared FIFO queue (`std::thread::scope`) —
 /// never more workers than there is work, and always at least one so a
-/// non-empty `items` makes progress even when `admission` itself is 0.
+/// non-empty `items` makes progress even when the admission itself is 0.
 /// `cancel` checked before each item is pulled — never mid-item, since
 /// only the item's own function (a caller that needs per-item
 /// cancellation captures its OWN `&AtomicBool` into `f`) can decide that.
@@ -3598,10 +4185,13 @@ fn log_admission(
 /// item was never started because `cancel` fired first is `None` —
 /// callers check `cancel` once, right after this returns, rather than
 /// inspecting every entry for that case. The error type is the caller's
-/// (plan 6b-3 D7: Normalize keeps its typed `LnError`).
+/// (plan 6b-3 D7: Normalize keeps its typed `LnError`). The `gate` may retire
+/// workers before their next pull (see [`AdmissionGate`]); one
+/// `fan-out finished` line closes the fan-out.
 fn fan_out<T, R, E, F>(
     items: Vec<T>,
-    admission: usize,
+    gate: &AdmissionGate,
+    label: FanOutLabel,
     cancel: &AtomicBool,
     f: F,
 ) -> Vec<Option<Result<R, E>>>
@@ -3617,24 +4207,153 @@ where
     }
     let queue: Mutex<VecDeque<(usize, T)>> = Mutex::new(items.into_iter().enumerate().collect());
     let results: Mutex<Vec<Option<Result<R, E>>>> = Mutex::new((0..n).map(|_| None).collect());
+    let workers = gate.start.min(n).max(1);
+    gate.live.store(workers, Ordering::SeqCst);
+    gate.retired.store(0, Ordering::SeqCst);
+    // Timing only: when the last item was pulled and when each worker left, relative to `t0`.
+    let t0 = Instant::now();
+    let last_pull_ns = AtomicU64::new(0);
+    let exit_ns_sum = AtomicU64::new(0);
 
     std::thread::scope(|scope| {
-        for _ in 0..admission.min(n).max(1) {
-            scope.spawn(|| loop {
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
-                let next = queue.lock().unwrap().pop_front();
-                let Some((idx, item)) = next else {
-                    return;
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let leave = |retired: bool| {
+                    exit_ns_sum.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::SeqCst);
+                    if !retired {
+                        gate.live.fetch_sub(1, Ordering::SeqCst);
+                    }
                 };
-                let out = f(item);
-                results.lock().unwrap()[idx] = Some(out);
+                loop {
+                    if cancel.load(Ordering::SeqCst) {
+                        leave(false);
+                        return;
+                    }
+                    gate.refresh(&label);
+                    if gate.retire_if_over_target() {
+                        // A worker leaving an already-drained queue was exiting anyway: not a retirement.
+                        if !queue.lock().unwrap().is_empty() {
+                            gate.retired.fetch_add(1, Ordering::SeqCst);
+                        }
+                        leave(true);
+                        return;
+                    }
+                    let next = queue.lock().unwrap().pop_front();
+                    let Some((idx, item)) = next else {
+                        leave(false);
+                        return;
+                    };
+                    last_pull_ns.fetch_max(t0.elapsed().as_nanos() as u64, Ordering::SeqCst);
+                    let out = f(item);
+                    results.lock().unwrap()[idx] = Some(out);
+                }
             });
         }
     });
 
+    let end_ns = t0.elapsed().as_nanos() as u64;
+    let idle_ns = (workers as u64 * end_ns).saturating_sub(exit_ns_sum.load(Ordering::SeqCst));
+    tracing::info!(
+        run_id = label.run_id,
+        stage = label.stage.as_str(),
+        group_key = %label.group_key.as_deref().unwrap_or(""),
+        pass = label.pass,
+        items = n,
+        admission = gate.start,
+        workers,
+        retired = gate.retired.load(Ordering::SeqCst),
+        duration_ms = end_ns / 1_000_000,
+        tail_ms = end_ns.saturating_sub(last_pull_ns.load(Ordering::SeqCst)) / 1_000_000,
+        idle_worker_ms = idle_ns / 1_000_000,
+        "fan-out finished"
+    );
+
     results.into_inner().unwrap()
+}
+
+/// One group's side of the cross-group queue decision (Task 13c L4a): the per-worker working set and the
+/// bytes the group holds resident ONCE (Calibrate's preloaded masters; `0` for a stage without any).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GroupLoad {
+    pub(crate) working_set_bytes: u64,
+    pub(crate) shared_bytes: u64,
+}
+
+/// What [`merged_admission`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MergedAdmission {
+    /// The admission of one queue over every group: the LARGEST working set, the SUM of the shared bytes.
+    pub(crate) merged: usize,
+    /// The smallest / largest admission any group gets from its own queue today.
+    pub(crate) per_group_min: usize,
+    pub(crate) per_group_max: usize,
+    /// `merged >= per_group_max`: the one queue lowers nobody's admission. Otherwise the stage keeps its
+    /// per-group queues (the plan's fallback).
+    pub(crate) merge: bool,
+}
+
+/// The merged-vs-per-group decision for a stage whose groups could share one queue (Task 13c L4a).
+pub(crate) fn merged_admission(
+    loads: &[GroupLoad],
+    max_workers: usize,
+    mem_budget: Option<u64>,
+) -> MergedAdmission {
+    let own: Vec<usize> = loads
+        .iter()
+        .map(|l| admission_with_shared(l.shared_bytes, l.working_set_bytes, max_workers, mem_budget))
+        .collect();
+    let ws_max = loads.iter().map(|l| l.working_set_bytes).max().unwrap_or(0);
+    let shared_sum: u64 = loads.iter().map(|l| l.shared_bytes).sum();
+    let merged = admission_with_shared(shared_sum, ws_max, max_workers, mem_budget);
+    let per_group_min = own.iter().copied().min().unwrap_or(1);
+    let per_group_max = own.iter().copied().max().unwrap_or(1);
+    MergedAdmission {
+        merged,
+        per_group_min,
+        per_group_max,
+        merge: merged >= per_group_max,
+    }
+}
+
+/// [`fan_out`] over the items of SEVERAL groups as ONE queue (Task 13c L4a): `groups[g]` are group `g`'s items
+/// and `working_sets[g]` its per-item working set. The queue runs longest first — descending working set, ties
+/// by (group, item) order — so the big items start early and the small ones fill the tail; the order is stable
+/// and deterministic. `f(g, item)` runs one item. The results come back per group in that group's ORIGINAL item
+/// order (`None` = never started because `cancel` fired), exactly as `fan_out` returns them for one group.
+fn fan_out_groups<T, R, E, F>(
+    groups: Vec<Vec<T>>,
+    working_sets: &[u64],
+    gate: &AdmissionGate,
+    label: FanOutLabel,
+    cancel: &AtomicBool,
+    f: F,
+) -> Vec<Vec<Option<Result<R, E>>>>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    F: Fn(usize, T) -> Result<R, E> + Sync,
+{
+    let lens: Vec<usize> = groups.iter().map(Vec::len).collect();
+    let mut entries: Vec<(usize, usize, u64, T)> = Vec::with_capacity(lens.iter().sum());
+    for (g, items) in groups.into_iter().enumerate() {
+        let ws = working_sets.get(g).copied().unwrap_or(0);
+        for (i, item) in items.into_iter().enumerate() {
+            entries.push((g, i, ws, item));
+        }
+    }
+    entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    let slots: Vec<(usize, usize)> = entries.iter().map(|e| (e.0, e.1)).collect();
+    let queue: Vec<(usize, T)> = entries.into_iter().map(|e| (e.0, e.3)).collect();
+    let flat = fan_out(queue, gate, label, cancel, |(g, item)| f(g, item));
+    let mut out: Vec<Vec<Option<Result<R, E>>>> = lens
+        .iter()
+        .map(|&n| (0..n).map(|_| None).collect())
+        .collect();
+    for ((g, i), res) in slots.into_iter().zip(flat) {
+        out[g][i] = res;
+    }
+    out
 }
 
 /// Per-frame progress from INSIDE a fan-out (v0.6.3). [`RunContext::progress`]
@@ -3660,15 +4379,16 @@ pub(crate) struct FanOutTicker {
     /// Sub-frame units per frame: `1` everywhere but a two-pass stage ([`Self::with_scale`]). `done` counts units;
     /// the event carries whole frames (`units / scale`) against the same `total`.
     scale: usize,
-    done: AtomicUsize,
-    gate: Mutex<(Instant, usize)>,
+    done: Arc<AtomicUsize>,
+    gate: Arc<Mutex<(Instant, usize)>>,
     /// Fix wave item 3: a byte pair FROZEN at construction — most callers
     /// (Measure/Register/Normalize) pass `(0, 0)`, since their per-frame
     /// ticks have no byte figure of their own to report. Calibrate passes
     /// the group's real `(bytes_done, bytes_total)` as they stood the
     /// instant this group's fan-out started, so its per-frame ticks keep
     /// showing a non-zero byte readout through the fan-out instead of
-    /// reporting `0, 0` for the whole thing.
+    /// reporting `0, 0` for the whole thing. A MERGED Calibrate queue's tickers all carry the stage-start
+    /// `bytes_done` until the commit loop emits each group's real figure (final review A, M3).
     bytes_done: u64,
     bytes_total: u64,
 }
@@ -3717,13 +4437,13 @@ impl FanOutTicker {
             group_key,
             total,
             scale: 1,
-            done: AtomicUsize::new(done_so_far),
+            done: Arc::new(AtomicUsize::new(done_so_far)),
             // Armed so the FIRST tick emits: the throttle measures from the
             // last emit, and there has been none.
-            gate: Mutex::new((
+            gate: Arc::new(Mutex::new((
                 Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS),
                 0,
-            )),
+            ))),
             bytes_done,
             bytes_total,
         }
@@ -3782,6 +4502,16 @@ impl FanOutTicker {
             },
         );
         current
+    }
+
+    /// Count into `first`'s running count AND share its throttle / order gate (Task 13c L4a): the tickers of
+    /// several groups feeding one queue count into ONE stage-wide number, and emit through one gate, so
+    /// `current` never runs backwards however their items interleave and the event rate is not multiplied by
+    /// the number of groups.
+    fn sharing_state(mut self, first: &FanOutTicker) -> Self {
+        self.done = first.done.clone();
+        self.gate = first.gate.clone();
+        self
     }
 
     /// The count reached so far (cached + ticked).
@@ -4064,7 +4794,14 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
 /// is marked `status = "skipped"` and excluded from later stages; a run
 /// with no viable group fails outright.
 fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
+    stage_measure_with(rc, None)
+}
+
+/// [`stage_measure`] with the cross-group pass-1 queue decision overridable (`Some(true)` = always one queue, `Some(false)` =
+/// per-group queues): the tests compare the two shapes.
+fn stage_measure_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<(), RunError> {
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Measure, None);
     // Plan 6b-2 C14: a project's frames without a manifest WCS are solved
     // first; the Solve boundary's exclusions reach `stage1_failed` below.
     solve_project_frames(rc)?;
@@ -4088,572 +4825,225 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 
     let mut any_group_viable = false;
 
-    for group in &groups {
-        rc.check_cancel()?;
-
-        let mut entries: Vec<MeasuredFrame> = Vec::with_capacity(group.frames.len());
-        let mut to_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
-        // Owner decision 2026-09-10: a group's members can carry different
-        // native geometry now, so admission sizing below uses the LARGEST
-        // frame in the group rather than a (now nonexistent) single
-        // group-wide width/height — conservative, never under-admits.
-        let group_max_w = group
-            .frames
-            .iter()
-            .map(|f| f.width.max(0) as u64)
-            .max()
-            .unwrap_or(0);
-        let group_max_h = group
-            .frames
-            .iter()
-            .map(|f| f.height.max(0) as u64)
-            .max()
-            .unwrap_or(0);
-
-        for frame in &group.frames {
-            if excluded_set.contains(&frame.frame_id) {
-                entries.push(MeasuredFrame {
-                    frame: frame.clone(),
-                    calibrated: None,
-                    planes: 0,
-                    measurement: None,
-                    weight: None,
-                    included: false,
-                    reason: Some("excluded manually".to_string()),
-                    registration: None,
-                    cached_calibrated: false,
-                    cached_metrics: false,
-                    ln_scale: None,
-                    cached_ln: false,
-                });
-                continue;
-            }
-            if let Some(reason) = stage1_failed.get(&frame.frame_id) {
-                entries.push(MeasuredFrame {
-                    frame: frame.clone(),
-                    calibrated: None,
-                    planes: 0,
-                    measurement: None,
-                    weight: None,
-                    included: false,
-                    reason: Some(reason.clone()),
-                    registration: None,
-                    cached_calibrated: false,
-                    cached_metrics: false,
-                    ln_scale: None,
-                    cached_ln: false,
-                });
-                continue;
-            }
-
-            let calibrated_path: Option<PathBuf> = {
-                let conn = db(&rc.ctx)?.conn();
-                crate::db::stacking::find_artifact(
-                    &conn,
-                    &rc.subject,
-                    &group.key,
-                    "calibrated",
-                    Some(frame.frame_id),
-                )?
-                .and_then(|a| a.path)
-                .map(PathBuf::from)
-            };
-            let Some(calibrated_path) = calibrated_path else {
-                let reason = "measurement failed: no calibrated artifact on record".to_string();
-                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                entries.push(MeasuredFrame {
-                    frame: frame.clone(),
-                    calibrated: None,
-                    planes: 0,
-                    measurement: None,
-                    weight: None,
-                    included: false,
-                    reason: Some(reason),
-                    registration: None,
-                    cached_calibrated: false,
-                    cached_metrics: false,
-                    ln_scale: None,
-                    cached_ln: false,
-                });
-                continue;
-            };
-
-            // Plan 6b-2 C9: a project frame whose landed file changed since
-            // the frame source read it leaves the run here.
-            if let Some(reason) = changed_during_run(rc, frame.frame_id)? {
-                tracing::warn!(run_id = rc.run_id, frame_id = frame.frame_id, reason = %reason, "frame excluded");
-                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                entries.push(MeasuredFrame {
-                    frame: frame.clone(),
-                    calibrated: None,
-                    planes: 0,
-                    measurement: None,
-                    weight: None,
-                    included: false,
-                    reason: Some(reason),
-                    registration: None,
-                    cached_calibrated: false,
-                    cached_metrics: false,
-                    ln_scale: None,
-                    cached_ln: false,
-                });
-                continue;
-            }
-
-            let planes = match PlaneReader::open(&calibrated_path) {
-                Ok(r) => Ok(r.channels()),
-                Err(e) => Err(format!("calibrated frame unreadable: {e}")),
-            };
-            let planes = match planes {
-                Ok(p) if p > 0 => p,
-                Ok(_) => {
-                    let reason = "calibrated frame has no planes".to_string();
-                    rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                    let cached_calibrated = rc
-                        .cached_calibrated
-                        .get(&frame.frame_id)
-                        .copied()
-                        .unwrap_or(false);
-                    entries.push(MeasuredFrame {
-                        frame: frame.clone(),
-                        calibrated: Some(calibrated_path),
-                        planes: 0,
-                        measurement: None,
-                        weight: None,
-                        included: false,
-                        reason: Some(reason),
-                        registration: None,
-                        cached_calibrated,
-                        cached_metrics: false,
-                        ln_scale: None,
-                        cached_ln: false,
-                    });
-                    continue;
-                }
-                Err(reason) => {
-                    rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                    let cached_calibrated = rc
-                        .cached_calibrated
-                        .get(&frame.frame_id)
-                        .copied()
-                        .unwrap_or(false);
-                    entries.push(MeasuredFrame {
-                        frame: frame.clone(),
-                        calibrated: Some(calibrated_path),
-                        planes: 0,
-                        measurement: None,
-                        weight: None,
-                        included: false,
-                        reason: Some(reason),
-                        registration: None,
-                        cached_calibrated,
-                        cached_metrics: false,
-                        ln_scale: None,
-                        cached_ln: false,
-                    });
-                    continue;
-                }
-            };
-
-            let cached_calibrated = rc
-                .cached_calibrated
-                .get(&frame.frame_id)
-                .copied()
-                .unwrap_or(false);
-            entries.push(MeasuredFrame {
-                frame: frame.clone(),
-                calibrated: Some(calibrated_path.clone()),
-                planes,
-                measurement: None,
-                weight: None,
-                included: false,
-                reason: None,
-                registration: None,
-                cached_calibrated,
-                cached_metrics: false,
-                ln_scale: None,
-                cached_ln: false,
-            });
-            to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
-        }
-
-        // Plan A Task 11b (owner decision R11b-12): under `Auto` every member
-        // is fitted at the group β in two passes (`measure_group_two_pass`),
-        // which takes every frame to measure; `Moffat4` (and `Fixed`) keep the
-        // single pass below, unchanged (under `Auto` it finds nothing to do).
-        let auto = matches!(cfg.measurement.psf_model, psf_signal::PsfModel::Auto);
-        let mut auto_group_beta: Option<f64> = None;
-        if auto {
-            auto_group_beta = measure_group_two_pass(
+    let auto = matches!(cfg.measurement.psf_model, psf_signal::PsfModel::Auto);
+    if !auto {
+        for group in &groups {
+            rc.check_cancel()?;
+            let (entries, to_measure, gw, gh) =
+                measure_group_prepare(rc, group, &excluded_set, &stage1_failed)?;
+            measure_group_finish(
                 rc,
                 group,
                 &cfg,
                 &opts,
-                &mut entries,
-                std::mem::take(&mut to_measure),
+                entries,
+                to_measure,
+                None,
                 force_fresh,
-                (current, total),
-                (group_max_w, group_max_h),
+                (gw, gh),
+                &excluded_set,
+                &stage1_failed,
+                &mut current,
+                total,
+                0,
+                &mut any_group_viable,
             )?;
         }
-
-        // Freshness check (skipped entirely under a Measure-or-earlier
-        // `rerun_from`): a `metrics` artifact whose hash matches this
-        // frame's CURRENT stage-1 hash is reused straight from
-        // `payload_json` — but ONLY when every one of its planes' `fits`
-        // rows is ALSO fresh (Tier C Task 1 fix round 1, the same
-        // `fits_artifact_fresh` rule `plan.rs`'s own gate uses): a
-        // `metrics`-only hit (a `fits` file removed by hand between runs)
-        // is re-measured, which rewrites BOTH artifacts for that frame —
-        // never a partial "keep the stale metrics, hope Task 2 falls back"
-        // outcome. Without this a plain run (no `rerun_from`) could never
-        // heal a missing `fits` file on its own; only "Re-run from Measure"
-        // would.
-        let group_measurable = to_measure.len();
-        let mut needing_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
-        for (idx, frame, path) in to_measure {
-            let calib_hash = {
-                let conn = db(&rc.ctx)?.conn();
-                rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
-            };
-            let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
-
-            let mut reused = false;
-            if !force_fresh {
-                let existing = {
-                    let conn = db(&rc.ctx)?.conn();
-                    crate::db::stacking::find_artifact(
-                        &conn,
-                        &rc.subject,
-                        &group.key,
-                        "metrics",
-                        Some(frame.frame_id),
-                    )?
-                };
-                if let Some(row) = existing {
-                    if row.config_hash == expected_hash {
-                        if let Some(payload) = &row.payload_json {
-                            match serde_json::from_str::<FrameMeasurement>(payload) {
-                                Ok(m) => {
-                                    let fits_fresh = {
-                                        let conn = db(&rc.ctx)?.conn();
-                                        fits_artifact_fresh(
-                                            &conn,
-                                            &rc.subject,
-                                            &group.key,
-                                            frame.frame_id,
-                                            Some(payload.as_str()),
-                                            &expected_hash,
-                                        )?
-                                    };
-                                    if fits_fresh {
-                                        entries[idx].measurement = Some(m);
-                                        entries[idx].cached_metrics = true;
-                                        reused = true;
-                                    } else {
-                                        tracing::debug!(
-                                            run_id = rc.run_id,
-                                            frame_id = frame.frame_id,
-                                            "cached metrics found but its fits sidecar is missing \
-                                             or stale; re-measuring"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        run_id = rc.run_id,
-                                        frame_id = frame.frame_id,
-                                        error = %e,
-                                        "stored metrics payload failed to parse; re-measuring"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !reused {
-                needing_measure.push((idx, frame, path));
-            }
+    } else {
+        // Plan A Task 11b (owner decision R11b-12): under `Auto` every member is fitted at the group beta in two
+        // passes. Task 13c L4c: phase 1 per group in group order (everything up to the pass-1 item list), phase 2
+        // ONE pass-1 queue over every group's items when the merged admission lowers no group's (else each group's
+        // own queue, run in phase 3), phase 3 per group in group order (group beta, pass 2 and the rest: the beta
+        // barrier stays per group).
+        struct AutoGroup {
+            entries: Vec<MeasuredFrame>,
+            state: TwoPassState,
+            max_wh: (u64, u64),
+            /// What phase 1 pushed to `rc.warnings` / `rc.runtime_exclusions` for this group: replayed at the
+            /// group's phase 3, so the run's lists keep the order the per-group loop produced.
+            warnings: Vec<String>,
+            exclusions: Vec<(i64, String)>,
         }
-
-        // Cached frames count as done the moment the group starts (they
-        // cost nothing), so the bar shows the reuse straight away.
-        let reused_in_group = group_measurable - needing_measure.len();
-        if reused_in_group > 0 {
-            rc.progress(
-                Stage::Measure,
-                Some(group.key.clone()),
-                current + reused_in_group,
-                total,
-                0,
-                0,
-                None,
-                None,
+        let mut prepared: Vec<AutoGroup> = Vec::with_capacity(groups.len());
+        // The marks of the group being prepared: an error or cancel mid phase 1 puts the stashed lists back, in
+        // group order, ahead of that group's partial entries (Task 13c final review A, M1).
+        let mut marks = (rc.warnings.len(), rc.runtime_exclusions.len());
+        let phase1: Result<(), RunError> = (|| {
+            for group in &groups {
+                rc.check_cancel()?;
+                marks = (rc.warnings.len(), rc.runtime_exclusions.len());
+                let (warn_mark, excl_mark) = marks;
+                let (entries, to_measure, gw, gh) =
+                    measure_group_prepare(rc, group, &excluded_set, &stage1_failed)?;
+                let state =
+                    measure_two_pass_prepare(rc, group, &cfg, to_measure, force_fresh, (gw, gh))?;
+                prepared.push(AutoGroup {
+                    entries,
+                    state,
+                    max_wh: (gw, gh),
+                    warnings: rc.warnings.split_off(warn_mark),
+                    exclusions: rc.runtime_exclusions.split_off(excl_mark),
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = phase1 {
+            let partial = (
+                rc.warnings.split_off(marks.0),
+                rc.runtime_exclusions.split_off(marks.1),
             );
+            replay_measure_stash(rc, prepared.into_iter().map(|g| (g.warnings, g.exclusions)));
+            rc.warnings.extend(partial.0);
+            rc.runtime_exclusions.extend(partial.1);
+            return Err(e);
         }
-
-        if !needing_measure.is_empty() {
-            let working_set_bytes = measure_working_set_bytes(group_max_w, group_max_h);
-            let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
-            log_admission(
-                rc,
-                Stage::Measure,
-                &group.key,
-                working_set_bytes,
-                0,
-                admission_n,
-            );
-            let meta: Vec<(usize, GroupFrame)> = needing_measure
-                .iter()
-                .map(|(idx, f, _)| (*idx, f.clone()))
-                .collect();
-            let items: Vec<(i64, PathBuf)> = needing_measure
-                .into_iter()
-                .map(|(_, f, p)| (f.frame_id, p))
-                .collect();
-
-            let ticker = FanOutTicker::new(
-                rc,
-                Stage::Measure,
-                Some(group.key.clone()),
-                current + reused_in_group,
-                total,
-                0,
-                0,
-            );
-            let cancel_ref: &AtomicBool = &rc.cancel;
-            let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
-            let ticker_ref = &ticker;
-            let results = fan_out(items, admission_n, cancel_ref, move |(frame_id, path)| {
-                let out = measure_frame_with_fits(&path, &opts, Some(pool_ref), cancel_ref)
-                    .map_err(|e| format!("measurement failed: {e}"));
-                ticker_ref.tick(Some(frame_id));
-                out
-            });
-
-            rc.check_cancel()?;
-
-            for (pos, res) in results.into_iter().enumerate() {
-                let (idx, frame) = &meta[pos];
-                let idx = *idx;
-                match res {
-                    None => return Err(RunError::Cancelled),
-                    Some(Err(msg)) => {
-                        rc.runtime_exclusions.push((frame.frame_id, msg.clone()));
-                        entries[idx].included = false;
-                        entries[idx].reason = Some(msg.clone());
-                        tracing::warn!(
-                            run_id = rc.run_id,
-                            frame_id = frame.frame_id,
-                            reason = %msg,
-                            "frame excluded"
-                        );
-                    }
-                    Some(Ok((m, fits))) => {
-                        let calib_hash = {
-                            let conn = db(&rc.ctx)?.conn();
-                            rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
-                        };
-                        let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
-                        persist_measurement(rc, group, frame, &m, &fits, &expected_hash)?;
-                        entries[idx].measurement = Some(m);
-                    }
-                }
-            }
-        }
-
-        // Carry-forward: a non-finite location/scale in any channel excludes
-        // the frame from weighing entirely, rather than failing the group.
-        let mut weigh_indices: Vec<usize> = Vec::new();
-        for (i, entry) in entries.iter_mut().enumerate() {
-            let Some(m) = &entry.measurement else {
-                continue;
-            };
-            let non_finite = m
-                .channels
-                .iter()
-                .any(|c| !c.location.is_finite() || !c.scale.is_finite());
-            if non_finite {
-                let reason = "measurement invalid: non-finite location/scale".to_string();
-                rc.runtime_exclusions
-                    .push((entry.frame.frame_id, reason.clone()));
-                entry.included = false;
-                entry.reason = Some(reason);
-                continue;
-            }
-            weigh_indices.push(i);
-        }
-
-        if !weigh_indices.is_empty() {
-            let keyword_values: Vec<Option<f64>> = weigh_indices
-                .iter()
-                .map(|&i| {
-                    if cfg.measurement.weight_mode == WeightMode::Keyword {
-                        entries[i].calibrated.as_deref().and_then(|p| {
-                            FitsHeader::from_path(p)
-                                .ok()
-                                .and_then(|h| h.get_f64(&cfg.measurement.keyword))
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let (weights, selection_reasons) = {
-                let inputs: Vec<WeightInput> = weigh_indices
-                    .iter()
-                    .zip(keyword_values.iter())
-                    .map(|(&i, &kw)| WeightInput {
-                        measurement: entries[i].measurement.as_ref().unwrap(),
-                        exposure_s: entries[i].frame.exposure_s,
-                        keyword_value: kw,
-                    })
-                    .collect();
-                let excluded_flags = vec![false; inputs.len()];
-                let w = compute_weights(
-                    &inputs,
-                    cfg.measurement.weight_mode,
-                    &cfg.measurement.formula,
-                    &excluded_flags,
-                );
-                let manual = vec![false; inputs.len()];
-                let sel = select_frames(&inputs, &w, &manual, &cfg.selection);
-                (w, sel)
-            };
-
-            for (i, &idx) in weigh_indices.iter().enumerate() {
-                entries[idx].weight = Some(weights[i].clone());
-                match &selection_reasons[i] {
-                    Some(reason) => {
-                        entries[idx].included = false;
-                        entries[idx].reason = Some(reason.clone());
-                        tracing::warn!(
-                            run_id = rc.run_id,
-                            frame_id = entries[idx].frame.frame_id,
-                            reason = %reason,
-                            "frame excluded"
-                        );
-                    }
-                    None => {
-                        entries[idx].included = true;
-                    }
-                }
-                tracing::debug!(
-                    run_id = rc.run_id,
-                    frame_id = entries[idx].frame.frame_id,
-                    weight = weights[i].normalized_mean,
-                    included = entries[idx].included,
-                    "frame measured"
-                );
-            }
-        }
-
-        let included_count = entries.iter().filter(|e| e.included).count();
-
-        // Perf tier C Task 1 (ruling C-1/C-1a): one β for the whole group,
-        // the lower median of every MEASURED member's own `Auto` pick —
-        // every channel of every frame this stage actually measured
-        // (fresh or reused from a cached `metrics` row), never narrowed to
-        // `included` (weighing/selection happens above, over the SAME
-        // `Auto` β regardless of which frames end up combined). `None`
-        // when the group measured nothing at all. Recorded only — nothing
-        // consumes it yet (Task 2 will).
-        // Task 11b: under `Auto` the value the two passes resolved and fitted
-        // every member at — the same lower median, over the members' OWN βs.
-        let group_beta_value: Option<f64> = if auto {
-            auto_group_beta
-        } else {
-            let betas: Vec<f64> = entries
-                .iter()
-                .filter_map(|e| e.measurement.as_ref())
-                .flat_map(|m| m.channels.iter().map(|c| c.beta))
-                .collect();
-            if betas.is_empty() {
-                None
-            } else {
-                Some(psf_signal::group_beta(&betas))
-            }
-        };
-        rc.measured_groups.insert(
-            group.key.clone(),
-            MeasuredGroup {
-                beta: group_beta_value,
-            },
-        );
-        if let Some(beta) = group_beta_value {
+        let p1_counts: Vec<usize> = prepared.iter().map(|g| g.state.need_pass1.len()).collect();
+        let mut merged_results: Vec<Option<Vec<Option<Result<Pass1Done, String>>>>> =
+            (0..groups.len()).map(|_| None).collect();
+        let p1_groups: Vec<usize> = (0..groups.len()).filter(|&g| p1_counts[g] > 0).collect();
+        let pool_threads = rc.ctx.image_pool.current_num_threads();
+        let budget = fan_budget(rc);
+        let loads: Vec<GroupLoad> = p1_groups
+            .iter()
+            .map(|&g| GroupLoad {
+                working_set_bytes: prepared[g].state.working_set_bytes,
+                shared_bytes: 0,
+            })
+            .collect();
+        let decision = merged_admission(&loads, pool_threads, budget.bytes);
+        let merge = p1_groups.len() >= 2 && force_merge.unwrap_or(decision.merge);
+        if p1_groups.len() >= 2 {
             tracing::debug!(
                 run_id = rc.run_id,
-                group_key = %group.key,
-                beta,
-                "stacking group beta resolved"
+                stage = Stage::Measure.as_str(),
+                count = p1_groups.len(),
+                admission = decision.merged,
+                admission_per_group_min = decision.per_group_min,
+                admission_per_group_max = decision.per_group_max,
+                merged = merge,
+                "cross-group queue decision"
             );
         }
-
-        {
-            let conn = db(&rc.ctx)?.conn();
-            let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
-                RunError::Other(format!(
-                    "no stacking_run_groups row for group {}",
-                    group.key
-                ))
-            })?;
-            if included_count < 3 {
-                tracing::warn!(
-                    run_id = rc.run_id,
-                    group_key = %group.key,
-                    count = included_count,
-                    "stacking group skipped: fewer than 3 included frames"
-                );
-                rc.warnings.push(format!(
-                    "group {} skipped: fewer than 3 included frames",
-                    group.key
-                ));
-                update_group(
-                    &conn,
-                    group_id,
-                    &GroupUpdate {
-                        included_count: Some(included_count as i64),
-                        status: Some("skipped"),
-                        beta: group_beta_value,
-                        ..Default::default()
-                    },
-                )?;
-            } else {
-                any_group_viable = true;
-                update_group(
-                    &conn,
-                    group_id,
-                    &GroupUpdate {
-                        included_count: Some(included_count as i64),
-                        beta: group_beta_value,
-                        ..Default::default()
-                    },
-                )?;
+        if merge {
+            let working_sets: Vec<u64> = loads.iter().map(|l| l.working_set_bytes).collect();
+            let ws_max = working_sets.iter().copied().max().unwrap_or(0);
+            let admission_n = admission(ws_max, pool_threads, budget.bytes);
+            log_admission(rc, Stage::Measure, "", ws_max, 0, admission_n, budget, "pass1");
+            // One ticker per group, all counting into one stage-wide counter (half-frames, scale 2).
+            let mut tickers: Vec<FanOutTicker> = Vec::with_capacity(p1_groups.len());
+            for &g in &p1_groups {
+                let t = FanOutTicker::new(
+                    rc,
+                    Stage::Measure,
+                    Some(groups[g].key.clone()),
+                    current * 2,
+                    total,
+                    0,
+                    0,
+                )
+                .with_scale(2);
+                tickers.push(match tickers.first() {
+                    Some(first) => t.sharing_state(first),
+                    None => t,
+                });
+            }
+            let jobs: Vec<Vec<(i64, PathBuf, PathBuf)>> = p1_groups
+                .iter()
+                .map(|&g| pass1_jobs(&prepared[g].state))
+                .collect();
+            let cancel_ref: &AtomicBool = &rc.cancel;
+            let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+            let tickers_ref = &tickers;
+            let opts_ref = &opts;
+            let results = fan_out_groups(
+                jobs,
+                &working_sets,
+                &AdmissionGate::budgeted(rc, ws_max, 0, admission_n),
+                FanOutLabel::new(rc, Stage::Measure, None, "pass1"),
+                cancel_ref,
+                move |k, job| run_pass1_item(job, opts_ref, pool_ref, cancel_ref, &tickers_ref[k]),
+            );
+            // Every file written gets its row BEFORE a cancel is honoured (R11c-5 (1)), group by group.
+            for (&g, res) in p1_groups.iter().zip(&results) {
+                if let Err(e) = upsert_pass1_rows(rc, &groups[g], &prepared[g].state, res) {
+                    replay_measure_stash(rc, prepared.into_iter().map(|g| (g.warnings, g.exclusions)));
+                    return Err(e);
+                }
+            }
+            for (&g, res) in p1_groups.iter().zip(results) {
+                merged_results[g] = Some(res);
             }
         }
-
-        rc.measured.insert(group.key.clone(), entries);
-
-        let group_reachable = group
-            .frames
-            .iter()
-            .filter(|f| {
-                !excluded_set.contains(&f.frame_id) && !stage1_failed.contains_key(&f.frame_id)
-            })
-            .count();
-        current += group_reachable;
-        rc.progress(
-            Stage::Measure,
-            Some(group.key.clone()),
-            current,
-            total,
-            0,
-            0,
-            None,
-            None,
-        );
+        // A cancel or an error in the shared tail replays every stash still held before it returns (M1).
+        let mut rest = groups.iter().zip(prepared).enumerate();
+        let phase3: Result<(), RunError> = (|| {
+            while let Some((g, (group, pg))) = rest.next() {
+                let AutoGroup {
+                    mut entries,
+                    mut state,
+                    max_wh,
+                    warnings,
+                    exclusions,
+                } = pg;
+                rc.warnings.extend(warnings);
+                rc.runtime_exclusions.extend(exclusions);
+                rc.check_cancel()?;
+                let pass1 = match merged_results[g].take() {
+                    Some(res) => Some(res),
+                    None if state.need_pass1.is_empty() => None,
+                    None => {
+                        let res = measure_pass1_queue(rc, group, &opts, &state, current, total);
+                        upsert_pass1_rows(rc, group, &state, &res)?;
+                        Some(res)
+                    }
+                };
+                let pass1_failed = match pass1 {
+                    Some(res) => apply_pass1_results(rc, &mut entries, &mut state, res)?,
+                    None => 0,
+                };
+                // The stage counter holds the pass-1 half-ticks of every group still to finish on the cross-group
+                // queue; on a per-group queue, only this group's.
+                let pass1_base = if merge {
+                    p1_counts[g..].iter().sum()
+                } else {
+                    p1_counts[g]
+                };
+                let auto_group_beta = measure_two_pass_rest(
+                    rc,
+                    group,
+                    &cfg,
+                    &opts,
+                    &mut entries,
+                    state,
+                    pass1_failed,
+                    (current, total),
+                    pass1_base,
+                    merge,
+                )?;
+                measure_group_finish(
+                    rc,
+                    group,
+                    &cfg,
+                    &opts,
+                    entries,
+                    Vec::new(),
+                    auto_group_beta,
+                    force_fresh,
+                    max_wh,
+                    &excluded_set,
+                    &stage1_failed,
+                    &mut current,
+                    total,
+                    if merge { p1_counts[g + 1..].iter().sum() } else { 0 },
+                    &mut any_group_viable,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = phase3 {
+            replay_measure_stash(rc, rest.map(|(_, (_, g))| (g.warnings, g.exclusions)));
+            return Err(e);
+        }
     }
 
     if !any_group_viable {
@@ -4662,12 +5052,734 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         ));
     }
 
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Measure,
         duration_ms: stage_start.elapsed().as_millis() as u64,
     });
 
     Ok(())
+}
+
+/// Put the phase-1 lists of the groups a failed Measure never reached back onto the run's lists, in group order
+/// (Task 13c final review A, M1): a cancel or an error must not drop a warning already raised.
+fn replay_measure_stash(
+    rc: &mut RunContext,
+    stashes: impl IntoIterator<Item = (Vec<String>, Vec<(i64, String)>)>,
+) {
+    for (warnings, exclusions) in stashes {
+        rc.warnings.extend(warnings);
+        rc.runtime_exclusions.extend(exclusions);
+    }
+}
+
+/// Everything `stage_measure` does for one group before its measurement: the group's frames as [`MeasuredFrame`]s
+/// (manual and stage-1 exclusions, the calibrated artifact, its planes) and the list of frames to measure. Returns
+/// `(entries, to_measure, group_max_w, group_max_h)`.
+#[allow(clippy::type_complexity)]
+fn measure_group_prepare(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    excluded_set: &HashSet<i64>,
+    stage1_failed: &HashMap<i64, String>,
+) -> Result<(Vec<MeasuredFrame>, Vec<(usize, GroupFrame, PathBuf)>, u64, u64), RunError> {
+    let mut entries: Vec<MeasuredFrame> = Vec::with_capacity(group.frames.len());
+    let mut to_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
+    // Owner decision 2026-09-10: a group's members can carry different
+    // native geometry now, so admission sizing below uses the LARGEST
+    // frame in the group rather than a (now nonexistent) single
+    // group-wide width/height — conservative, never under-admits.
+    let group_max_w = group
+        .frames
+        .iter()
+        .map(|f| f.width.max(0) as u64)
+        .max()
+        .unwrap_or(0);
+    let group_max_h = group
+        .frames
+        .iter()
+        .map(|f| f.height.max(0) as u64)
+        .max()
+        .unwrap_or(0);
+
+    for frame in &group.frames {
+        if excluded_set.contains(&frame.frame_id) {
+            entries.push(MeasuredFrame {
+                frame: frame.clone(),
+                calibrated: None,
+                planes: 0,
+                measurement: None,
+                weight: None,
+                included: false,
+                reason: Some("excluded manually".to_string()),
+                registration: None,
+                cached_calibrated: false,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            });
+            continue;
+        }
+        if let Some(reason) = stage1_failed.get(&frame.frame_id) {
+            entries.push(MeasuredFrame {
+                frame: frame.clone(),
+                calibrated: None,
+                planes: 0,
+                measurement: None,
+                weight: None,
+                included: false,
+                reason: Some(reason.clone()),
+                registration: None,
+                cached_calibrated: false,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            });
+            continue;
+        }
+
+        let calibrated_path: Option<PathBuf> = {
+            let conn = db(&rc.ctx)?.conn();
+            crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                "calibrated",
+                Some(frame.frame_id),
+            )?
+            .and_then(|a| a.path)
+            .map(PathBuf::from)
+        };
+        let Some(calibrated_path) = calibrated_path else {
+            let reason = "measurement failed: no calibrated artifact on record".to_string();
+            rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+            entries.push(MeasuredFrame {
+                frame: frame.clone(),
+                calibrated: None,
+                planes: 0,
+                measurement: None,
+                weight: None,
+                included: false,
+                reason: Some(reason),
+                registration: None,
+                cached_calibrated: false,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            });
+            continue;
+        };
+
+        // Plan 6b-2 C9: a project frame whose landed file changed since
+        // the frame source read it leaves the run here.
+        if let Some(reason) = changed_during_run(rc, frame.frame_id)? {
+            tracing::warn!(run_id = rc.run_id, frame_id = frame.frame_id, reason = %reason, "frame excluded");
+            rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+            entries.push(MeasuredFrame {
+                frame: frame.clone(),
+                calibrated: None,
+                planes: 0,
+                measurement: None,
+                weight: None,
+                included: false,
+                reason: Some(reason),
+                registration: None,
+                cached_calibrated: false,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            });
+            continue;
+        }
+
+        let planes = match PlaneReader::open(&calibrated_path) {
+            Ok(r) => Ok(r.channels()),
+            Err(e) => Err(format!("calibrated frame unreadable: {e}")),
+        };
+        let planes = match planes {
+            Ok(p) if p > 0 => p,
+            Ok(_) => {
+                let reason = "calibrated frame has no planes".to_string();
+                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                let cached_calibrated = rc
+                    .cached_calibrated
+                    .get(&frame.frame_id)
+                    .copied()
+                    .unwrap_or(false);
+                entries.push(MeasuredFrame {
+                    frame: frame.clone(),
+                    calibrated: Some(calibrated_path),
+                    planes: 0,
+                    measurement: None,
+                    weight: None,
+                    included: false,
+                    reason: Some(reason),
+                    registration: None,
+                    cached_calibrated,
+                    cached_metrics: false,
+                    ln_scale: None,
+                    cached_ln: false,
+                });
+                continue;
+            }
+            Err(reason) => {
+                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                let cached_calibrated = rc
+                    .cached_calibrated
+                    .get(&frame.frame_id)
+                    .copied()
+                    .unwrap_or(false);
+                entries.push(MeasuredFrame {
+                    frame: frame.clone(),
+                    calibrated: Some(calibrated_path),
+                    planes: 0,
+                    measurement: None,
+                    weight: None,
+                    included: false,
+                    reason: Some(reason),
+                    registration: None,
+                    cached_calibrated,
+                    cached_metrics: false,
+                    ln_scale: None,
+                    cached_ln: false,
+                });
+                continue;
+            }
+        };
+
+        let cached_calibrated = rc
+            .cached_calibrated
+            .get(&frame.frame_id)
+            .copied()
+            .unwrap_or(false);
+        entries.push(MeasuredFrame {
+            frame: frame.clone(),
+            calibrated: Some(calibrated_path.clone()),
+            planes,
+            measurement: None,
+            weight: None,
+            included: false,
+            reason: None,
+            registration: None,
+            cached_calibrated,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+        });
+        to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
+    }
+    Ok((entries, to_measure, group_max_w, group_max_h))
+}
+
+/// Everything `stage_measure` does for one group after its pass-1/pass-2 fits: the single-pass measurement of
+/// `Moffat4`/`Fixed` (a no-op under `Auto`, whose frames the two passes took), weights, selection, the group β, the
+/// `stacking_run_groups` row, `rc.measured` and the stage progress. `auto_group_beta` is the two-pass group β.
+#[allow(clippy::too_many_arguments)]
+fn measure_group_finish(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    cfg: &StackingConfig,
+    opts: &MeasureOptions,
+    mut entries: Vec<MeasuredFrame>,
+    to_measure: Vec<(usize, GroupFrame, PathBuf)>,
+    auto_group_beta: Option<f64>,
+    force_fresh: bool,
+    (group_max_w, group_max_h): (u64, u64),
+    excluded_set: &HashSet<i64>,
+    stage1_failed: &HashMap<i64, String>,
+    current_ref: &mut usize,
+    total: usize,
+    ahead_halves: usize,
+    any_group_viable: &mut bool,
+) -> Result<(), RunError> {
+    let mut current = *current_ref;
+    let auto = matches!(cfg.measurement.psf_model, psf_signal::PsfModel::Auto);
+    // Freshness check (skipped entirely under a Measure-or-earlier
+    // `rerun_from`): a `metrics` artifact whose hash matches this
+    // frame's CURRENT stage-1 hash is reused straight from
+    // `payload_json` — but ONLY when every one of its planes' `fits`
+    // rows is ALSO fresh (Tier C Task 1 fix round 1, the same
+    // `fits_artifact_fresh` rule `plan.rs`'s own gate uses): a
+    // `metrics`-only hit (a `fits` file removed by hand between runs)
+    // is re-measured, which rewrites BOTH artifacts for that frame —
+    // never a partial "keep the stale metrics, hope Task 2 falls back"
+    // outcome. Without this a plain run (no `rerun_from`) could never
+    // heal a missing `fits` file on its own; only "Re-run from Measure"
+    // would.
+    let group_measurable = to_measure.len();
+    let mut needing_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
+    for (idx, frame, path) in to_measure {
+        let calib_hash = {
+            let conn = db(&rc.ctx)?.conn();
+            rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
+        };
+        let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
+
+        let mut reused = false;
+        if !force_fresh {
+            let existing = {
+                let conn = db(&rc.ctx)?.conn();
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    "metrics",
+                    Some(frame.frame_id),
+                )?
+            };
+            if let Some(row) = existing {
+                if row.config_hash == expected_hash {
+                    if let Some(payload) = &row.payload_json {
+                        match serde_json::from_str::<FrameMeasurement>(payload) {
+                            Ok(m) => {
+                                let fits_fresh = {
+                                    let conn = db(&rc.ctx)?.conn();
+                                    fits_artifact_fresh(
+                                        &conn,
+                                        &rc.subject,
+                                        &group.key,
+                                        frame.frame_id,
+                                        Some(payload.as_str()),
+                                        &expected_hash,
+                                    )?
+                                };
+                                if fits_fresh {
+                                    entries[idx].measurement = Some(m);
+                                    entries[idx].cached_metrics = true;
+                                    reused = true;
+                                } else {
+                                    tracing::debug!(
+                                        run_id = rc.run_id,
+                                        frame_id = frame.frame_id,
+                                        "cached metrics found but its fits sidecar is missing \
+                                         or stale; re-measuring"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    frame_id = frame.frame_id,
+                                    error = %e,
+                                    "stored metrics payload failed to parse; re-measuring"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !reused {
+            needing_measure.push((idx, frame, path));
+        }
+    }
+
+    // Cached frames count as done the moment the group starts (they
+    // cost nothing), so the bar shows the reuse straight away.
+    let reused_in_group = group_measurable - needing_measure.len();
+    if reused_in_group > 0 {
+        rc.progress(
+            Stage::Measure,
+            Some(group.key.clone()),
+            current + reused_in_group,
+            total,
+            0,
+            0,
+            None,
+            None,
+        );
+    }
+
+    if !needing_measure.is_empty() {
+        let working_set_bytes = measure_working_set_bytes(group_max_w, group_max_h);
+        let budget = fan_budget(rc);
+        let admission_n = admission(
+            working_set_bytes,
+            rc.ctx.image_pool.current_num_threads(),
+            budget.bytes,
+        );
+        log_admission(
+            rc,
+            Stage::Measure,
+            &group.key,
+            working_set_bytes,
+            0,
+            admission_n,
+            budget,
+            "measure",
+        );
+        let meta: Vec<(usize, GroupFrame)> = needing_measure
+            .iter()
+            .map(|(idx, f, _)| (*idx, f.clone()))
+            .collect();
+        let items: Vec<(i64, PathBuf)> = needing_measure
+            .into_iter()
+            .map(|(_, f, p)| (f.frame_id, p))
+            .collect();
+
+        let ticker = FanOutTicker::new(
+            rc,
+            Stage::Measure,
+            Some(group.key.clone()),
+            current + reused_in_group,
+            total,
+            0,
+            0,
+        );
+        let cancel_ref: &AtomicBool = &rc.cancel;
+        let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+        let ticker_ref = &ticker;
+        let gate = AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n);
+        let label = FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "measure");
+        let results = fan_out(items, &gate, label, cancel_ref, move |(frame_id, path)| {
+            let out = measure_frame_with_fits(&path, &opts, Some(pool_ref), cancel_ref)
+                .map_err(|e| format!("measurement failed: {e}"));
+            ticker_ref.tick(Some(frame_id));
+            out
+        });
+
+        rc.check_cancel()?;
+
+        for (pos, res) in results.into_iter().enumerate() {
+            let (idx, frame) = &meta[pos];
+            let idx = *idx;
+            match res {
+                None => return Err(RunError::Cancelled),
+                Some(Err(msg)) => {
+                    rc.runtime_exclusions.push((frame.frame_id, msg.clone()));
+                    entries[idx].included = false;
+                    entries[idx].reason = Some(msg.clone());
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = frame.frame_id,
+                        reason = %msg,
+                        "frame excluded"
+                    );
+                }
+                Some(Ok((m, fits))) => {
+                    let calib_hash = {
+                        let conn = db(&rc.ctx)?.conn();
+                        rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
+                    };
+                    let expected_hash = measurement_hash_for(&cfg, &calib_hash, None);
+                    persist_measurement(rc, group, frame, &m, &fits, &expected_hash)?;
+                    entries[idx].measurement = Some(m);
+                }
+            }
+        }
+    }
+
+    // Carry-forward: a non-finite location/scale in any channel excludes
+    // the frame from weighing entirely, rather than failing the group.
+    let mut weigh_indices: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let Some(m) = &entry.measurement else {
+            continue;
+        };
+        let non_finite = m
+            .channels
+            .iter()
+            .any(|c| !c.location.is_finite() || !c.scale.is_finite());
+        if non_finite {
+            let reason = "measurement invalid: non-finite location/scale".to_string();
+            rc.runtime_exclusions
+                .push((entry.frame.frame_id, reason.clone()));
+            entry.included = false;
+            entry.reason = Some(reason);
+            continue;
+        }
+        weigh_indices.push(i);
+    }
+
+    if !weigh_indices.is_empty() {
+        let keyword_values: Vec<Option<f64>> = weigh_indices
+            .iter()
+            .map(|&i| {
+                if cfg.measurement.weight_mode == WeightMode::Keyword {
+                    entries[i].calibrated.as_deref().and_then(|p| {
+                        FitsHeader::from_path(p)
+                            .ok()
+                            .and_then(|h| h.get_f64(&cfg.measurement.keyword))
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let (weights, selection_reasons) = {
+            let inputs: Vec<WeightInput> = weigh_indices
+                .iter()
+                .zip(keyword_values.iter())
+                .map(|(&i, &kw)| WeightInput {
+                    measurement: entries[i].measurement.as_ref().unwrap(),
+                    exposure_s: entries[i].frame.exposure_s,
+                    keyword_value: kw,
+                })
+                .collect();
+            let excluded_flags = vec![false; inputs.len()];
+            let w = compute_weights(
+                &inputs,
+                cfg.measurement.weight_mode,
+                &cfg.measurement.formula,
+                &excluded_flags,
+            );
+            let manual = vec![false; inputs.len()];
+            let sel = select_frames(&inputs, &w, &manual, &cfg.selection);
+            (w, sel)
+        };
+
+        for (i, &idx) in weigh_indices.iter().enumerate() {
+            entries[idx].weight = Some(weights[i].clone());
+            match &selection_reasons[i] {
+                Some(reason) => {
+                    entries[idx].included = false;
+                    entries[idx].reason = Some(reason.clone());
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = entries[idx].frame.frame_id,
+                        reason = %reason,
+                        "frame excluded"
+                    );
+                }
+                None => {
+                    entries[idx].included = true;
+                }
+            }
+            tracing::debug!(
+                run_id = rc.run_id,
+                frame_id = entries[idx].frame.frame_id,
+                weight = weights[i].normalized_mean,
+                included = entries[idx].included,
+                "frame measured"
+            );
+        }
+    }
+
+    let included_count = entries.iter().filter(|e| e.included).count();
+
+    // Perf tier C Task 1 (ruling C-1/C-1a): one β for the whole group,
+    // the lower median of every MEASURED member's own `Auto` pick —
+    // every channel of every frame this stage actually measured
+    // (fresh or reused from a cached `metrics` row), never narrowed to
+    // `included` (weighing/selection happens above, over the SAME
+    // `Auto` β regardless of which frames end up combined). `None`
+    // when the group measured nothing at all. Recorded only — nothing
+    // consumes it yet (Task 2 will).
+    // Task 11b: under `Auto` the value the two passes resolved and fitted
+    // every member at — the same lower median, over the members' OWN βs.
+    let group_beta_value: Option<f64> = if auto {
+        auto_group_beta
+    } else {
+        let betas: Vec<f64> = entries
+            .iter()
+            .filter_map(|e| e.measurement.as_ref())
+            .flat_map(|m| m.channels.iter().map(|c| c.beta))
+            .collect();
+        if betas.is_empty() {
+            None
+        } else {
+            Some(psf_signal::group_beta(&betas))
+        }
+    };
+    rc.measured_groups.insert(
+        group.key.clone(),
+        MeasuredGroup {
+            beta: group_beta_value,
+        },
+    );
+    if let Some(beta) = group_beta_value {
+        tracing::debug!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            beta,
+            "stacking group beta resolved"
+        );
+    }
+
+    {
+        let conn = db(&rc.ctx)?.conn();
+        let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
+            RunError::Other(format!(
+                "no stacking_run_groups row for group {}",
+                group.key
+            ))
+        })?;
+        if included_count < 3 {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                count = included_count,
+                "stacking group skipped: fewer than 3 included frames"
+            );
+            rc.warnings.push(format!(
+                "group {} skipped: fewer than 3 included frames",
+                group.key
+            ));
+            update_group(
+                &conn,
+                group_id,
+                &GroupUpdate {
+                    included_count: Some(included_count as i64),
+                    status: Some("skipped"),
+                    beta: group_beta_value,
+                    ..Default::default()
+                },
+            )?;
+        } else {
+            *any_group_viable = true;
+            update_group(
+                &conn,
+                group_id,
+                &GroupUpdate {
+                    included_count: Some(included_count as i64),
+                    beta: group_beta_value,
+                    ..Default::default()
+                },
+            )?;
+        }
+    }
+
+    rc.measured.insert(group.key.clone(), entries);
+
+    let group_reachable = group
+        .frames
+        .iter()
+        .filter(|f| {
+            !excluded_set.contains(&f.frame_id) && !stage1_failed.contains_key(&f.frame_id)
+        })
+        .count();
+    current += group_reachable;
+    // `ahead_halves`: the pass-1 half-ticks of the groups still to come on the cross-group queue, already in the
+    // stage counter; the bar never steps back below them (Task 13c L4 review I1).
+    rc.progress(
+        Stage::Measure,
+        Some(group.key.clone()),
+        current + ahead_halves / 2,
+        total,
+        0,
+        0,
+        None,
+        None,
+    );
+    *current_ref = current;
+    Ok(())
+}
+
+
+/// Where a member's first pass comes from in phase 3.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass1Source {
+    /// No valid artifact: pass 1 runs in the pass-2 worker (and writes the artifact).
+    Owed,
+    /// The artifact on disk, validated by the controller (row, head, stamp).
+    Artifact,
+}
+/// What a phase-1 worker hands back: the own β, and whether the artifact was written (the records are dropped).
+struct Pass1Done {
+    own: Vec<f64>,
+    written: bool,
+}
+/// What a phase-3 worker hands back besides the measurement: whether it wrote the artifact (it ran pass 1).
+struct Pass2Done {
+    measurement: FrameMeasurement,
+    fits: Vec<Vec<psf_signal::StarFit>>,
+    written: bool,
+}
+/// One frame of the group on its way through the two passes.
+struct MeasureMember {
+    idx: usize,
+    frame: GroupFrame,
+    path: PathBuf,
+    calib_hash: String,
+    /// The stored row whose first pass is valid: its measurement and its key.
+    cached: Option<(FrameMeasurement, String)>,
+    /// The frame's own β per plane (pass 1, read or reused).
+    own: Option<Vec<f64>>,
+    /// Where the first-pass artifact lives (or will).
+    spill: PathBuf,
+    /// The artifact's key ([`pass1_hash_for`]).
+    pass1_key: String,
+    source: Pass1Source,
+    /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
+    /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
+    spill_pending: bool,
+}
+/// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
+/// why (stale before use `debug!`, any other refusal `warn!`).
+fn validate_pass1_spill(run_id: i64, frame_id: i64, spill: &Path, path: &Path) -> Option<Pass1Head> {
+    let usable = read_pass1_head(spill).and_then(|head| check_pass1_head(&head, path).map(|()| head));
+    match usable {
+        Ok(head) => Some(head),
+        // Found stale before use: the calibrated file is not the one the artifact was read from.
+        Err(e @ Pass1ArtifactError::Stale { .. }) => {
+            tracing::debug!(
+                run_id,
+                frame_id,
+                path = %spill.display(),
+                error = %e,
+                "measure: first-pass artifact is stale; pass 1 re-runs"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                run_id,
+                frame_id,
+                path = %spill.display(),
+                error = %e,
+                "measure: first-pass artifact refused; pass 1 re-runs"
+            );
+            None
+        }
+    }
+}
+fn exclude_measured_member(rc: &mut RunContext, entry: &mut MeasuredFrame, msg: String) {
+    rc.runtime_exclusions
+        .push((entry.frame.frame_id, msg.clone()));
+    entry.included = false;
+    tracing::warn!(
+        run_id = rc.run_id,
+        frame_id = entry.frame.frame_id,
+        reason = %msg,
+        "frame excluded"
+    );
+    entry.reason = Some(msg);
+}
+/// The first pass of one frame, run in a worker, and its artifact written best-effort: a failed write is a
+/// `warn!` (the caller keeps the records only for as long as it needs them).
+fn run_pass1_and_spill(
+    frame_id: i64,
+    path: &Path,
+    spill: &Path,
+    opts: &MeasureOptions,
+    pool: &Arc<rayon::ThreadPool>,
+    cancel: &AtomicBool,
+) -> Result<(FramePass1, bool), crate::integration::IntegrationError> {
+    let pass1 = measure_frame_pass1(path, opts, Some(pool), cancel)?;
+    let written = match write_pass1(spill, &pass1) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                frame_id,
+                path = %spill.display(),
+                error = %e,
+                "measure: first-pass artifact write failed; the first pass re-runs when it is needed"
+            );
+            false
+        }
+    };
+    Ok((pass1, written))
+}
+
+/// The members of one group on their way through the two passes, and the sizing its fan-outs share (Task 13c L4c:
+/// the prepare step, the pass-1 queue and the rest used to be one function, so several groups' pass-1 items can share
+/// one queue).
+struct TwoPassState {
+    members: Vec<MeasureMember>,
+    /// Indices into `members` owed pass 1.
+    need_pass1: Vec<usize>,
+    working_set_bytes: u64,
 }
 
 /// Stage 3 under `measurement.psfModel = Auto` (Plan A Task 11b, owner decision R11b-12; the task's design ruling 2
@@ -4711,133 +5823,28 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 /// Progress: the bar moves from the first frame. Each frame is two half-ticks on a doubled scale (pass 1, pass 2:
 /// [`FanOutTicker::with_scale`]), so the stage keeps its `total` and lands on it; a member whose pass 1 ran in phase 1
 /// ticks its second half only in phase 3, any other member both halves there, a cache hit both at once.
-#[allow(clippy::too_many_arguments)]
-fn measure_group_two_pass(
+///
+/// Split by Task 13c L4c into [`measure_two_pass_prepare`] (step 0, the controller reads), the pass-1 queue
+/// ([`measure_pass1_queue`] per group, or one queue over several groups in `stage_measure`), [`apply_pass1_results`]
+/// and [`measure_two_pass_rest`] (the group β and pass 2); the order of one group's steps is unchanged.
+fn measure_two_pass_prepare(
     rc: &mut RunContext,
     group: &IntegrationGroup,
     cfg: &StackingConfig,
-    opts: &MeasureOptions,
-    entries: &mut [MeasuredFrame],
     to_measure: Vec<(usize, GroupFrame, PathBuf)>,
     force_fresh: bool,
-    (current, total): (usize, usize),
     (group_max_w, group_max_h): (u64, u64),
-) -> Result<Option<f64>, RunError> {
-    /// Where a member's first pass comes from in phase 3.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Pass1Source {
-        /// No valid artifact: pass 1 runs in the pass-2 worker (and writes the artifact).
-        Owed,
-        /// The artifact on disk, validated by the controller (row, head, stamp).
-        Artifact,
-    }
-    /// What a phase-1 worker hands back: the own β, and whether the artifact was written (the records are dropped).
-    struct Pass1Done {
-        own: Vec<f64>,
-        written: bool,
-    }
-    /// What a phase-3 worker hands back besides the measurement: whether it wrote the artifact (it ran pass 1).
-    struct Pass2Done {
-        measurement: FrameMeasurement,
-        fits: Vec<Vec<psf_signal::StarFit>>,
-        written: bool,
-    }
-    /// One frame of the group on its way through the two passes.
-    struct Member {
-        idx: usize,
-        frame: GroupFrame,
-        path: PathBuf,
-        calib_hash: String,
-        /// The stored row whose first pass is valid: its measurement and its key.
-        cached: Option<(FrameMeasurement, String)>,
-        /// The frame's own β per plane (pass 1, read or reused).
-        own: Option<Vec<f64>>,
-        /// Where the first-pass artifact lives (or will).
-        spill: PathBuf,
-        /// The artifact's key ([`pass1_hash_for`]).
-        pass1_key: String,
-        source: Pass1Source,
-        /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
-        /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
-        spill_pending: bool,
-    }
-    /// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
-    /// why (stale before use `debug!`, any other refusal `warn!`).
-    fn validate_spill(run_id: i64, frame_id: i64, spill: &Path, path: &Path) -> Option<Pass1Head> {
-        let usable = read_pass1_head(spill).and_then(|head| check_pass1_head(&head, path).map(|()| head));
-        match usable {
-            Ok(head) => Some(head),
-            // Found stale before use: the calibrated file is not the one the artifact was read from.
-            Err(e @ Pass1ArtifactError::Stale { .. }) => {
-                tracing::debug!(
-                    run_id,
-                    frame_id,
-                    path = %spill.display(),
-                    error = %e,
-                    "measure: first-pass artifact is stale; pass 1 re-runs"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    run_id,
-                    frame_id,
-                    path = %spill.display(),
-                    error = %e,
-                    "measure: first-pass artifact refused; pass 1 re-runs"
-                );
-                None
-            }
-        }
-    }
-    fn exclude(rc: &mut RunContext, entry: &mut MeasuredFrame, msg: String) {
-        rc.runtime_exclusions
-            .push((entry.frame.frame_id, msg.clone()));
-        entry.included = false;
-        tracing::warn!(
-            run_id = rc.run_id,
-            frame_id = entry.frame.frame_id,
-            reason = %msg,
-            "frame excluded"
-        );
-        entry.reason = Some(msg);
-    }
-    /// The first pass of one frame, run in a worker, and its artifact written best-effort: a failed write is a
-    /// `warn!` (the caller keeps the records only for as long as it needs them).
-    fn run_pass1_and_spill(
-        frame_id: i64,
-        path: &Path,
-        spill: &Path,
-        opts: &MeasureOptions,
-        pool: &Arc<rayon::ThreadPool>,
-        cancel: &AtomicBool,
-    ) -> Result<(FramePass1, bool), crate::integration::IntegrationError> {
-        let pass1 = measure_frame_pass1(path, opts, Some(pool), cancel)?;
-        let written = match write_pass1(spill, &pass1) {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(
-                    frame_id,
-                    path = %spill.display(),
-                    error = %e,
-                    "measure: first-pass artifact write failed; the first pass re-runs when it is needed"
-                );
-                false
-            }
-        };
-        Ok((pass1, written))
-    }
-
+) -> Result<TwoPassState, RunError> {
     // Step 0: the own β from the stored rows (skipped under a Measure-or-earlier `rerun_from`, as the single pass's
     // reuse is): the `metrics` row first, else the first-pass artifact.
-    let mut members: Vec<Member> = Vec::with_capacity(to_measure.len());
+    let mut members: Vec<MeasureMember> = Vec::with_capacity(to_measure.len());
     for (idx, frame, path) in to_measure {
         let calib_hash = {
             let conn = db(&rc.ctx)?.conn();
             rc.memo.calibration_hash_checked(&conn, cfg, &frame)?
         };
         let stem = calibrated_file_stem(group, &frame);
-        let mut member = Member {
+        let mut member = MeasureMember {
             idx,
             frame,
             path,
@@ -4892,7 +5899,7 @@ fn measure_group_two_pass(
             }
             if spilled.is_some_and(|row| is_fresh(&row, &member.pass1_key)) {
                 if member.own.is_none() {
-                    if let Some(head) = validate_spill(
+                    if let Some(head) = validate_pass1_spill(
                         rc.run_id,
                         member.frame.frame_id,
                         &member.spill,
@@ -4917,91 +5924,172 @@ fn measure_group_two_pass(
     }
 
     let working_set_bytes = measure_working_set_bytes(group_max_w, group_max_h);
-    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
-    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool.clone();
-
-    // Step 1, fanned out, for every member without a reusable first pass: pass 1, spilled, dropped in the worker.
     let need_pass1: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].own.is_none())
         .collect();
-    let mut pass1_failed = 0usize;
-    if !need_pass1.is_empty() {
-        log_admission(
-            rc,
-            Stage::Measure,
-            &group.key,
-            working_set_bytes,
-            0,
-            admission_n,
-        );
-        let jobs: Vec<(i64, PathBuf, PathBuf)> = need_pass1
-            .iter()
-            .map(|&i| {
-                (
-                    members[i].frame.frame_id,
-                    members[i].path.clone(),
-                    members[i].spill.clone(),
-                )
-            })
-            .collect();
-        // Half a frame per pass-1 frame (scale 2), so the bar moves from the first frame.
-        let ticker1 = FanOutTicker::new(
-            rc,
-            Stage::Measure,
-            Some(group.key.clone()),
-            current * 2,
-            total,
-            0,
-            0,
-        )
-        .with_scale(2);
-        let ticker1_ref = &ticker1;
-        let cancel_ref: &AtomicBool = &rc.cancel;
-        let results = fan_out(
-            jobs,
-            admission_n,
-            cancel_ref,
-            move |(frame_id, path, spill)| {
-                let out =
-                    run_pass1_and_spill(frame_id, &path, &spill, opts, pool_ref, cancel_ref)
-                        .map(|(pass1, written)| Pass1Done {
-                            own: pass1.beta_own().to_vec(),
-                            written,
-                        })
-                        .map_err(|e| format!("measurement failed: {e}"));
-                ticker1_ref.tick_units(Some(frame_id), 1);
-                out
-            },
-        );
-        // Every file written gets its row BEFORE a cancel is honoured: a cancelled run's re-run reuses it (R11c-5 (1)).
-        for (&i, res) in need_pass1.iter().zip(&results) {
-            if let Some(Ok(Pass1Done { written: true, .. })) = res {
-                upsert_pass1_row(
-                    rc,
-                    group,
-                    &members[i].frame,
-                    &members[i].spill,
-                    &members[i].pass1_key,
-                )?;
-            }
+    Ok(TwoPassState {
+        members,
+        need_pass1,
+        working_set_bytes,
+    })
+}
+
+/// The pass-1 jobs of one group: `(frame id, calibrated file, artifact path)` per member owed pass 1.
+fn pass1_jobs(state: &TwoPassState) -> Vec<(i64, PathBuf, PathBuf)> {
+    state
+        .need_pass1
+        .iter()
+        .map(|&i| {
+            (
+                state.members[i].frame.frame_id,
+                state.members[i].path.clone(),
+                state.members[i].spill.clone(),
+            )
+        })
+        .collect()
+}
+
+/// One pass-1 item, run in a worker: the first pass, spilled and dropped; ticks half a frame.
+fn run_pass1_item(
+    (frame_id, path, spill): (i64, PathBuf, PathBuf),
+    opts: &MeasureOptions,
+    pool: &Arc<rayon::ThreadPool>,
+    cancel: &AtomicBool,
+    ticker: &FanOutTicker,
+) -> Result<Pass1Done, String> {
+    let out = run_pass1_and_spill(frame_id, &path, &spill, opts, pool, cancel)
+        .map(|(pass1, written)| Pass1Done {
+            own: pass1.beta_own().to_vec(),
+            written,
+        })
+        .map_err(|e| format!("measurement failed: {e}"));
+    ticker.tick_units(Some(frame_id), 1);
+    out
+}
+
+/// Step 1 for ONE group, fanned out on its own queue (the per-group shape; also the fallback of the cross-group
+/// queue). `current` is the stage-wide count of frames finished before this group.
+fn measure_pass1_queue(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    opts: &MeasureOptions,
+    state: &TwoPassState,
+    current: usize,
+    total: usize,
+) -> Vec<Option<Result<Pass1Done, String>>> {
+    // The live budget, read right before this fan-out (Task 13c L4 review I2).
+    let budget = fan_budget(rc);
+    let admission_n = admission(
+        state.working_set_bytes,
+        rc.ctx.image_pool.current_num_threads(),
+        budget.bytes,
+    );
+    log_admission(
+        rc,
+        Stage::Measure,
+        &group.key,
+        state.working_set_bytes,
+        0,
+        admission_n,
+        budget,
+        "pass1",
+    );
+    // Half a frame per pass-1 frame (scale 2), so the bar moves from the first frame.
+    let ticker1 = FanOutTicker::new(
+        rc,
+        Stage::Measure,
+        Some(group.key.clone()),
+        current * 2,
+        total,
+        0,
+        0,
+    )
+    .with_scale(2);
+    let ticker1_ref = &ticker1;
+    let cancel_ref: &AtomicBool = &rc.cancel;
+    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+    fan_out(
+        pass1_jobs(state),
+        &AdmissionGate::budgeted(rc, state.working_set_bytes, 0, admission_n),
+        FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass1"),
+        cancel_ref,
+        move |job| run_pass1_item(job, opts, pool_ref, cancel_ref, ticker1_ref),
+    )
+}
+
+/// Every pass-1 file written gets its row BEFORE a cancel is honoured: a cancelled run's re-run reuses it (R11c-5 (1)).
+fn upsert_pass1_rows(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    state: &TwoPassState,
+    results: &[Option<Result<Pass1Done, String>>],
+) -> Result<(), RunError> {
+    for (&i, res) in state.need_pass1.iter().zip(results) {
+        if let Some(Ok(Pass1Done { written: true, .. })) = res {
+            upsert_pass1_row(
+                rc,
+                group,
+                &state.members[i].frame,
+                &state.members[i].spill,
+                &state.members[i].pass1_key,
+            )?;
         }
-        rc.check_cancel()?;
-        for (&i, res) in need_pass1.iter().zip(results) {
-            match res {
-                None => return Err(RunError::Cancelled),
-                Some(Err(msg)) => {
-                    pass1_failed += 1;
-                    exclude(rc, &mut entries[members[i].idx], msg)
-                }
-                Some(Ok(done)) => {
-                    members[i].own = Some(done.own);
-                    if done.written {
-                        members[i].source = Pass1Source::Artifact;
-                    }
+    }
+    Ok(())
+}
+
+/// Take a group's pass-1 results: honour a cancel, exclude a failed member, record the own β of the rest. Returns
+/// how many members failed pass 1.
+fn apply_pass1_results(
+    rc: &mut RunContext,
+    entries: &mut [MeasuredFrame],
+    state: &mut TwoPassState,
+    results: Vec<Option<Result<Pass1Done, String>>>,
+) -> Result<usize, RunError> {
+    rc.check_cancel()?;
+    let mut pass1_failed = 0usize;
+    for (&i, res) in state.need_pass1.iter().zip(results) {
+        match res {
+            None => return Err(RunError::Cancelled),
+            Some(Err(msg)) => {
+                pass1_failed += 1;
+                exclude_measured_member(rc, &mut entries[state.members[i].idx], msg)
+            }
+            Some(Ok(done)) => {
+                state.members[i].own = Some(done.own);
+                if done.written {
+                    state.members[i].source = Pass1Source::Artifact;
                 }
             }
         }
     }
+    Ok(pass1_failed)
+}
+
+/// Steps 2 and 3 of the two-pass measure (the group β, then pass 2 per member) once pass 1 is done.
+/// `pass1_base` is the number of pass-1 half-ticks the stage counter already holds beyond `current * 2` when this
+/// group's pass 2 starts: the group's own pass-1 members on a per-group queue, every not-yet-finished group's on the
+/// cross-group queue.
+#[allow(clippy::too_many_arguments)]
+fn measure_two_pass_rest(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    cfg: &StackingConfig,
+    opts: &MeasureOptions,
+    entries: &mut [MeasuredFrame],
+    state: TwoPassState,
+    pass1_failed: usize,
+    (current, total): (usize, usize),
+    pass1_base: usize,
+    pass1_shared: bool,
+) -> Result<Option<f64>, RunError> {
+    let TwoPassState {
+        mut members,
+        need_pass1,
+        working_set_bytes,
+    } = state;
+    let pool = rc.ctx.image_pool.clone();
+    let pool_ref: &Arc<rayon::ThreadPool> = &pool;
 
     // Step 2, the group β, once: the lower median of every measured member's own βs (every plane of every frame, as
     // stage 6's group β always was).
@@ -5082,7 +6170,9 @@ fn measure_group_two_pass(
             rc.progress(
                 Stage::Measure,
                 Some(group.key.clone()),
-                current + members.len(),
+                // The pass-1 half-ticks of the groups still to come on the shared queue are already in the stage
+                // counter; the bar never steps back below them.
+                current + members.len() + (pass1_base - need_pass1.len()) / 2,
                 total,
                 0,
                 0,
@@ -5097,7 +6187,7 @@ fn measure_group_two_pass(
     for &i in &need_pass2 {
         if members[i].spill_pending {
             members[i].spill_pending = false;
-            if validate_spill(
+            if validate_pass1_spill(
                 rc.run_id,
                 members[i].frame.frame_id,
                 &members[i].spill,
@@ -5109,7 +6199,11 @@ fn measure_group_two_pass(
             }
         }
     }
-    if need_pass1.is_empty() {
+    // The live budget, read right before this group's pass-2 fan-out (Task 13c L4 review I2). A group whose
+    // pass 1 ran on the shared queue gets its own line here too (M3): it has none of its own yet.
+    let budget = fan_budget(rc);
+    let admission_n = admission(working_set_bytes, pool.current_num_threads(), budget.bytes);
+    if need_pass1.is_empty() || pass1_shared {
         log_admission(
             rc,
             Stage::Measure,
@@ -5117,6 +6211,8 @@ fn measure_group_two_pass(
             working_set_bytes,
             0,
             admission_n,
+            budget,
+            "pass2",
         );
     }
     // Per job: the frame, its calibrated file, its artifact, where its first pass comes from, and whether its first
@@ -5139,7 +6235,7 @@ fn measure_group_two_pass(
         Some(group.key.clone()),
         // Units (scale 2): the earlier groups, the pass-1 half-ticks of this group (a failed frame completed at once,
         // it never reaches pass 2) and the cache hits' two halves.
-        current * 2 + need_pass1.len() + pass1_failed + reused * 2,
+        current * 2 + pass1_base + pass1_failed + reused * 2,
         total,
         0,
         0,
@@ -5149,7 +6245,8 @@ fn measure_group_two_pass(
     let ticker_ref = &ticker;
     let results = fan_out(
         jobs,
-        admission_n,
+        &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
+        FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass2"),
         cancel_ref,
         move |(frame_id, path, spill, source, first_half_ticked)| {
             // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
@@ -5206,7 +6303,7 @@ fn measure_group_two_pass(
     for (&i, res) in need_pass2.iter().zip(results) {
         match res {
             None => return Err(RunError::Cancelled),
-            Some(Err(msg)) => exclude(rc, &mut entries[members[i].idx], msg),
+            Some(Err(msg)) => exclude_measured_member(rc, &mut entries[members[i].idx], msg),
             Some(Ok(done)) => {
                 let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
                 persist_measurement(
@@ -5666,6 +6763,7 @@ fn group_reference_idx(
 /// then resolves each group's own reference from it.
 fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Reference, None);
     let cfg = rc.config.clone();
     // Spec §5.4, plan 6b-2 C15: a project's reference must carry a WCS.
     rc.wcs_rule = wcs_tiers(rc)?;
@@ -5871,6 +6969,7 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
         None,
     );
 
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Reference,
         duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -6671,7 +7770,12 @@ fn register_group_pass(
         .max()
         .unwrap_or(1);
     let working_set_bytes = register_working_set_bytes(ref_w as u64, ref_h as u64, batch_planes);
-    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+    let budget = fan_budget(rc);
+    let admission_n = admission(
+        working_set_bytes,
+        rc.ctx.image_pool.current_num_threads(),
+        budget.bytes,
+    );
     log_admission(
         rc,
         Stage::Register,
@@ -6679,6 +7783,8 @@ fn register_group_pass(
         working_set_bytes,
         0,
         admission_n,
+        budget,
+        "register",
     );
     // Perf tier A Task 6a fix round 1: both fan-outs below write into the
     // SAME per-group directory — created once here rather than once per
@@ -6724,7 +7830,8 @@ fn register_group_pass(
         let rewrite_ticker_ref = &rewrite_ticker;
         let rewrite_results = fan_out(
             needs_artifact_rewrite,
-            admission_n,
+            &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
+            FanOutLabel::new(rc, Stage::Register, Some(&group.key), "rewrite"),
             cancel_ref,
             move |item: ArtifactRewriteItem| -> Result<(i64, String, Result<PathBuf, String>), String> {
                 let frame_id = item.frame_id;
@@ -6868,7 +7975,9 @@ fn register_group_pass(
     let reference_name_ref = &reference_name;
     let compose_ref = &compose;
 
-    let results = fan_out(items, admission_n, cancel_ref, move |item: RegisterItem| {
+    let gate = AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n);
+    let lbl = FanOutLabel::new(rc, Stage::Register, Some(&group.key), "align");
+    let results = fan_out(items, &gate, lbl, cancel_ref, move |item: RegisterItem| {
         let out = if item.is_reference {
             Ok((identity_registration(ref_stars_ref), None))
         } else {
@@ -7822,11 +8931,13 @@ fn delivered_dims(rc: &RunContext, native: (usize, usize)) -> (usize, usize) {
 /// share ONE progress total. A `Manual` reference never moves.
 fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
+    let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Register, None);
     let cfg = rc.config.clone();
 
     if cfg.registration.geometry == RegistrationGeometry::Native {
         register_native_groups(rc)?;
         write_frame_rows(rc)?;
+        meter.finish();
         rc.timings.push(crate::stacking::provenance::StageTiming {
             stage: Stage::Register,
             duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -8006,6 +9117,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
 
     write_frame_rows(rc)?;
 
+    meter.finish();
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Register,
         duration_ms: stage_start.elapsed().as_millis() as u64,
@@ -9569,6 +10681,9 @@ fn process_group_output(
             &paths,
             rc.ctx.image_pool.current_num_threads(),
         )?
+        // Task 13c L3: registered artifacts are positional file reads, so
+        // Integrate and the LN reference build prefetch on every class.
+        .with_local_prefetch()
     };
 
     // Stage 6 (local normalization, M2 Task 5): resolves/caches the group's
@@ -9592,6 +10707,9 @@ fn process_group_output(
     let ln_active = normalization_cfg.local.enabled
         || normalization_cfg.rejection == RejectionNormalization::Local;
     let normalize_start = Instant::now();
+    let mut normalize_meter = ln_active.then(|| {
+        crate::stacking::telemetry::StageMeter::start(rc, Stage::Normalize, Some(&group.key))
+    });
     let mut ln_reference_path: Option<String> = None;
     let mut ln_scale_px: Option<u32> = None;
     // M2 Task 7 (fix round 1, item 3): every member `run_group_normalization`
@@ -9633,6 +10751,7 @@ fn process_group_output(
                             count = members.len(),
                             "stacking group skipped: local normalization left fewer than 3 members"
                         );
+                        finish_meter(&mut normalize_meter);
                         let n = normalize_start.elapsed();
                         let (_, i, d, o) = zero();
                         return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
@@ -9658,6 +10777,7 @@ fn process_group_output(
                             pick.idx
                         }
                         None => {
+                            finish_meter(&mut normalize_meter);
                             let n = normalize_start.elapsed();
                             let (_, i, d, o) = zero();
                             return Ok((
@@ -9688,6 +10808,7 @@ fn process_group_output(
             // in this function uses) rather than falling into the generic
             // "warn and continue with global normalization" arm below.
             Err(RunError::ExclusionPersistFailed(msg)) => {
+                finish_meter(&mut normalize_meter);
                 let n = normalize_start.elapsed();
                 let (_, i, d, o) = zero();
                 return Ok((
@@ -9728,6 +10849,7 @@ fn process_group_output(
             None,
         );
     }
+    finish_meter(&mut normalize_meter);
     let normalize_dur = normalize_start.elapsed();
 
     // M2 Task 7 (fix round 1, item 3): `GroupInput.ln`, aligned with
@@ -9966,6 +11088,17 @@ fn process_group_output(
     };
 
     let integrate_start = Instant::now();
+    let mut integrate_meter = Some(crate::stacking::telemetry::StageMeter::start(
+        rc,
+        Stage::Integrate,
+        Some(&group.key),
+    ));
+    crate::stacking::telemetry::memory_checkpoint(
+        rc.run_id,
+        "integrate",
+        &group.key,
+        "integrate band plan",
+    );
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     // The span names the group on the integration's own events (the master
@@ -9978,6 +11111,7 @@ fn process_group_output(
         Ok(o) => o,
         Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
         Err(e) => {
+            finish_meter(&mut integrate_meter);
             let outcome = fail_group(
                 rc,
                 group,
@@ -10007,6 +11141,7 @@ fn process_group_output(
         true,
         None,
     );
+    finish_meter(&mut integrate_meter);
     let integrate_dur = integrate_start.elapsed();
 
     // B3 (M3 final fix wave, I3): integration itself completed correctly —
@@ -10558,6 +11693,11 @@ fn process_group_output(
                 None,
             );
             let drizzle_start = Instant::now();
+            let mut drizzle_meter = Some(crate::stacking::telemetry::StageMeter::start(
+                rc,
+                Stage::Drizzle,
+                Some(&group.key),
+            ));
 
             // Fix round 1, Minor M4: `output.output_pairs[p][k]` below is a
             // bare double index — a shape mismatch would otherwise panic
@@ -10780,7 +11920,14 @@ fn process_group_output(
                         }
                     }
                 };
+            finish_meter(&mut drizzle_meter);
             drizzle_dur = drizzle_start.elapsed();
+            crate::stacking::telemetry::memory_checkpoint(
+                rc.run_id,
+                "drizzle",
+                &group.key,
+                "drizzle buffers dropped",
+            );
 
             match drizzle_outcome {
                 Ok((wd, stats, drz_cards)) => {
@@ -10981,6 +12128,13 @@ fn process_group_output(
     // R-M3-11 places Drizzle strictly between Integrate and Output); this
     // is the correction.
     let output_dur = output_start.elapsed().saturating_sub(drizzle_dur);
+    drop(members);
+    crate::stacking::telemetry::memory_checkpoint(
+        rc.run_id,
+        "output",
+        &group.key,
+        "group members dropped",
+    );
     rc.progress(
         Stage::Output,
         Some(group.key.clone()),
@@ -11688,6 +12842,11 @@ fn run_group_normalization(
             measure_opts,
             input.interpolation,
             input.clamping,
+            if grid_mode {
+                ln_working_set_bytes_masked(input.width as u64, input.height as u64)
+            } else {
+                ln_working_set_bytes(input.width as u64, input.height as u64)
+            },
             &rc.ctx.image_pool,
             &rc.cancel,
         );
@@ -11843,7 +13002,12 @@ fn run_group_normalization(
     } else {
         ln_working_set_bytes(input.width as u64, input.height as u64)
     };
-    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+    let budget = fan_budget(rc);
+    let admission_n = admission(
+        working_set_bytes,
+        rc.ctx.image_pool.current_num_threads(),
+        budget.bytes,
+    );
     log_admission(
         rc,
         Stage::Normalize,
@@ -11851,6 +13015,8 @@ fn run_group_normalization(
         working_set_bytes,
         0,
         admission_n,
+        budget,
+        "normalize",
     );
     let interpolation = input.interpolation;
     let clamping = input.clamping;
@@ -11885,7 +13051,8 @@ fn run_group_normalization(
     let member_ids_ref: &[i64] = &member_ids;
     let results = fan_out(
         needs_normalize.clone(),
-        admission_n,
+        &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
+        FanOutLabel::new(rc, Stage::Normalize, Some(&group.key), "normalize"),
         cancel_ref,
         move |i: usize| {
             // Perf tier C Task 2: the fits FILE CONTENTS are read here,
@@ -12213,6 +13380,7 @@ fn measure_ln_seeds_calibration(
     measure_opts: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
+    working_set_bytes: u64,
     pool: &Arc<rayon::ThreadPool>,
     cancel: &AtomicBool,
 ) -> Option<ln::SeedsCalibration> {
@@ -12272,6 +13440,30 @@ fn measure_ln_seeds_calibration(
         );
     };
 
+    // The 2 x N arms admit like the main Normalize fan-out (same working set,
+    // same budget); that fan-out's own `fan-out admitted` line is the one
+    // lab parsers read, so none is emitted here. Results land by job index.
+    let admission_n = admission(
+        working_set_bytes,
+        pool.current_num_threads(),
+        fan_budget(rc).bytes,
+    );
+    let run_jobs = |n: usize,
+                    job: &(dyn Fn(usize) -> Option<ln::LnFrameOutcome> + Sync)|
+     -> Vec<Option<ln::LnFrameOutcome>> {
+        let gate = AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n);
+        fan_out(
+            (0..n).collect::<Vec<usize>>(),
+            &gate,
+            FanOutLabel::new(rc, Stage::Normalize, Some(&group.key), "seeds"),
+            cancel,
+            |j| Ok::<_, std::convert::Infallible>(job(j)),
+        )
+        .into_iter()
+        .map(|r| r.and_then(|r| r.ok()).flatten())
+        .collect()
+    };
+
     let measurement = ln::measure_seeds_calibration(
         ln_reference,
         reference_for_detection,
@@ -12288,6 +13480,7 @@ fn measure_ln_seeds_calibration(
         Some(pool),
         cancel,
         &on_progress,
+        &run_jobs,
     )?;
 
     // One warn for the whole group when any channel ran short of ratios
@@ -12330,6 +13523,13 @@ fn measure_ln_seeds_calibration(
             ln::ChannelOutcome::TooFewRatios => {}
         }
     }
+    // One checkpoint per group, after every channel's line (final review A, M2).
+    crate::stacking::telemetry::memory_checkpoint(
+        rc.run_id,
+        "normalize",
+        &group.key,
+        "ln seeds calibration",
+    );
 
     Some(measurement.calibration())
 }
@@ -12546,6 +13746,12 @@ fn build_and_write_ln_reference(
         ln_scale_px = scale_px,
         duration_ms = build_start.elapsed().as_millis() as u64,
         "ln reference built"
+    );
+    crate::stacking::telemetry::memory_checkpoint(
+        rc.run_id,
+        "normalize",
+        &group.key,
+        "ln reference built",
     );
 
     Ok((built, masks))
@@ -13849,6 +15055,42 @@ mod tests {
     }
 
     #[test]
+    fn admission_reads_the_budget_none_default_and_setting() {
+        let gib = 1u64 << 30;
+        // Unknown budget: one worker, exactly as an unknown RAM total was.
+        assert_eq!(admission(gib, 16, None), 1);
+        // The default budget is a quarter of RAM: the number is today's.
+        if let Some(total) = total_ram_bytes() {
+            let today = (((total / 4) / gib).clamp(1, 16)) as usize;
+            assert_eq!(admission(gib, 16, Some(total / 4)), today);
+            assert_eq!(
+                admission_with_shared(gib / 2, gib, 16, Some(total / 4)),
+                (((total / 4).saturating_sub(gib / 2) / gib).clamp(1, 16)) as usize
+            );
+        }
+        // A setting drives it, clamped to [1, max_workers].
+        assert_eq!(admission(gib, 16, Some(5 * gib)), 5);
+        assert_eq!(admission(gib, 4, Some(64 * gib)), 4);
+        assert_eq!(admission(gib, 16, Some(gib / 4)), 1);
+        assert_eq!(admission_with_shared(10 * gib, gib, 16, Some(2 * gib)), 1);
+        assert_eq!(admission_with_shared(gib, gib, 16, Some(5 * gib)), 4);
+    }
+
+    #[test]
+    fn fan_budget_follows_the_live_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(dir.path().join("t.db"));
+        let auto = machine::memory_budget(&ctx);
+        assert_eq!(auto.map(|(_, w)| w).unwrap_or("auto"), "auto");
+        let conn = ctx.db.get().unwrap().conn();
+        ctx.settings
+            .persist_setting(&conn, crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB, "2048")
+            .unwrap();
+        drop(conn);
+        assert_eq!(machine::memory_budget(&ctx), Some((2048 << 20, "setting")));
+    }
+
+    #[test]
     fn cancel_before_admission_finishes_cancelled() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
@@ -13999,6 +15241,141 @@ mod tests {
         assert!(row.error.as_deref().unwrap_or("").contains("panicked"));
     }
 
+    // ── Task 13c L1: Calibrate working set + parallel master decode ─────
+
+    /// The measured per-frame working set, per colour mode: mono 3 planes,
+    /// a debayered OSC group 5 (was a flat 8). Admission on the hc11 and
+    /// set 204 geometries against a 16 GiB-machine (4 GiB) and a 128 GiB
+    /// -machine (32 GiB) budget.
+    #[test]
+    fn calibrate_working_set_is_per_colour_mode() {
+        let (w, h) = (9576u64, 6388u64);
+        let plane = w * h * 4;
+        assert_eq!(calibrate_working_set_bytes(w, h, ColorMode::Mono, false), 3 * plane);
+        // A mono group never holds a debayer output, whatever the flag says.
+        assert_eq!(calibrate_working_set_bytes(w, h, ColorMode::Mono, true), 3 * plane);
+        // An OSC group kept as mosaics (debayer off) is mono-sized too.
+        assert_eq!(calibrate_working_set_bytes(w, h, ColorMode::Osc, false), 3 * plane);
+        assert_eq!(calibrate_working_set_bytes(w, h, ColorMode::Osc, true), 5 * plane);
+
+        let gib = 1u64 << 30;
+        // hc11: 978 743 808 shared bytes, 4 GiB budget -> admission 4; 128 GiB machine -> the pool.
+        let hc11_ws = calibrate_working_set_bytes(w, h, ColorMode::Mono, false);
+        assert_eq!(admission_with_shared(978_743_808, hc11_ws, 16, Some(4 * gib)), 4);
+        assert_eq!(admission_with_shared(978_743_808, hc11_ws, 10, Some(32 * gib)), 10);
+        // set 204 OSC (6248x4176, 199 MB shared): 7 on 4 GiB; mono capped by the pool at 10.
+        let (w2, h2) = (6248u64, 4176u64);
+        let osc = calibrate_working_set_bytes(w2, h2, ColorMode::Osc, true);
+        let mono = calibrate_working_set_bytes(w2, h2, ColorMode::Mono, false);
+        assert_eq!(admission_with_shared(199 << 20, osc, 16, Some(4 * gib)), 7);
+        assert_eq!(admission_with_shared(199 << 20, mono, 10, Some(4 * gib)), 10);
+    }
+
+    /// The preload by fan-out equals the serial decode bit for bit, and the
+    /// hot-pixel pre-build measures each distinct dark once, pushing its
+    /// warnings in job order.
+    #[test]
+    fn parallel_master_preload_matches_the_serial_decode() {
+        use crate::fits_writer::write_fits_f32;
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 12usize);
+        let write = |name: &str, base: f32| -> PathBuf {
+            let data: Vec<f32> = (0..w * h).map(|i| base + (i % 7) as f32 * 0.25).collect();
+            let p = dir.path().join(name);
+            write_fits_f32(&p, w, h, 1, &data, &[]).unwrap();
+            p
+        };
+        let dark_a = write("dark_a.fits", 10.0);
+        let dark_b = write("dark_b.fits", 20.0);
+        let flat = write("flat.fits", 1.0);
+        let opts: CalibratedLightOptions = serde_json::from_str("{}").unwrap();
+        assert!(opts.hot_pixel_correction);
+        let job = |id: i64, dark: &Path| CalibrateJob {
+            frame_id: id,
+            group_key: "g".into(),
+            hash: String::new(),
+            spec: GenerationSpec {
+                inputs: crate::calibration_library::light_cal::LightCalInputs {
+                    light_path: dir.path().join(format!("light{id}.fits")),
+                    dark_path: Some(dark.to_path_buf()),
+                    bias_path: None,
+                    flat_path: Some(flat.clone()),
+                    flat_norm: true,
+                    flat_norm_mode: Default::default(),
+                    cfa_geometry: None,
+                    params: Default::default(),
+                    scale_divisor: 1.0,
+                    output_path: dir.path().join(format!("out{id}.fits")),
+                    cards: vec![],
+                    scratch_dir: dir.path().to_path_buf(),
+                },
+                cards: vec![],
+                cfa_geometry: None,
+                dark_path: Some(dark.to_path_buf()),
+                debayer: false,
+                format: Default::default(),
+            },
+            out: dir.path().join(format!("o{id}.fits")),
+            mosaic_out: None,
+            opts: opts.clone(),
+        };
+        // Two lights share dark A, one uses dark B.
+        let jobs = vec![job(1, &dark_a), job(2, &dark_a), job(3, &dark_b)];
+
+        let db = tempfile::tempdir().unwrap();
+        let mut ctx = ServiceContext::new_for_tests(db.path().join("t.db"));
+        ctx.image_pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap());
+        let working = tempfile::tempdir().unwrap();
+        let mut rc = test_context(
+            Arc::new(ctx),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            1,
+            "L1",
+            StackingConfig::default(),
+            Vec::new(),
+            WorkingLayout::new(working.path(), &set_slug("L1")),
+            working.path().to_path_buf(),
+            HashMap::new(),
+        );
+        let scratch = dir.path();
+
+        let preloaded =
+            build_preloaded_masters(&rc, &jobs, scratch, "g", (w as u64, h as u64), 0).unwrap();
+        assert_eq!(preloaded.planes.len(), 3);
+        let never = AtomicBool::new(false);
+        for p in [&dark_a, &dark_b, &flat] {
+            let serial = preload_master_plane(p, scratch, &never).unwrap();
+            let got = &preloaded.planes[p];
+            assert_eq!((got.width, got.height), (serial.width, serial.height));
+            assert_eq!(
+                got.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                serial.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{}",
+                p.display()
+            );
+        }
+
+        prebuild_hot_maps(&mut rc, &jobs, scratch, "g", (w as u64, h as u64), 0);
+        assert_eq!(rc.hot_maps.len(), 2, "one map per distinct dark");
+        assert!(rc.hot_maps.contains_key(&dark_a) && rc.hot_maps.contains_key(&dark_b));
+        let refused: Vec<&String> = rc.warnings.iter().filter(|m| m.contains("Hot-pixel")).collect();
+        for (i, d) in [&dark_a, &dark_b].iter().enumerate() {
+            if let HotPixelMapOutcome::Refused(_) = &*rc.hot_maps[*d] {
+                assert!(refused.iter().any(|m| m.contains(&d.display().to_string())), "{i}");
+            }
+        }
+        // Warnings follow job order: dark A's (if any) before dark B's.
+        let pos = |d: &PathBuf| refused.iter().position(|m| m.contains(&d.display().to_string()));
+        if let (Some(a), Some(b)) = (pos(&dark_a), pos(&dark_b)) {
+            assert!(a < b);
+        }
+        // A second call is a no-op (cache hit): nothing new is pushed.
+        let n = rc.warnings.len();
+        prebuild_hot_maps(&mut rc, &jobs, scratch, "g", (w as u64, h as u64), 0);
+        assert_eq!(rc.warnings.len(), n);
+    }
+
     // ── stage_calibrate ──────────────────────────────────────────────────
 
     /// Perf tier 1 Task 4: the fan-out must produce the same calibrated
@@ -14028,6 +15405,9 @@ mod tests {
     /// keeps the header block count, and therefore the data offset,
     /// identical) read back bit-for-bit via `PlaneReader`.
     ///
+    /// Since Task 13c D1 `source_cards_for_file` returns its cards keyword-sorted,
+    /// so the order is now deterministic; the sorted comparison below stays.
+    ///
     /// Controller ruling (2026-09-19): no env var or static forces
     /// admission — two SEPARATE `ServiceContext`s give the two runs two
     /// different `image_pool` widths instead. `ServiceContext::new_for_tests`'s
@@ -14035,7 +15415,7 @@ mod tests {
     /// time) whatever the working-set math says; a second context built
     /// here with a 4-thread pool clamps `admission` up to 4 instead —
     /// `admission`'s RAM-budget term is astronomically larger than this
-    /// fixture's `CALIBRATE_PLANES_RESIDENT * 64 * 48 * 4` (~96 KB) working
+    /// fixture's `CALIBRATE_PLANES_RESIDENT_MONO * 64 * 48 * 4` (~37 KB) working
     /// set on any machine with a few GB of RAM, so the pool WIDTH is the
     /// clamp that actually binds. Two separate working folders + run ids;
     /// the parallel run also sets `rerun_from = Some(Stage::Calibrate)` (the
@@ -14116,7 +15496,12 @@ mod tests {
         // doc comment above), `calibrate_working_set_bytes` for the
         // per-worker term.
         assert!(
-            admission_with_shared(2 * 64 * 48 * 4, calibrate_working_set_bytes(64, 48), 4) > 1,
+            admission_with_shared(
+                2 * 64 * 48 * 4,
+                calibrate_working_set_bytes(64, 48, ColorMode::Mono, false),
+                4,
+                total_ram_bytes().map(|t| t / 4),
+            ) > 1,
             "fixture working set must admit more than one worker for this pin to test the fan-out"
         );
         let working_par = tempfile::tempdir().unwrap();
@@ -18818,6 +20203,869 @@ mod tests {
         assert_eq!(last["current"], 4, "{last}");
     }
 
+    fn gate_label(pass: &'static str) -> FanOutLabel {
+        FanOutLabel {
+            run_id: 77,
+            stage: Stage::Measure,
+            group_key: Some("g-test".to_string()),
+            pass,
+        }
+    }
+
+    /// Task 13c L4a: the cross-group queue runs longest first (descending working set, ties by group then item
+    /// order) and hands every group its results back in its OWN item order.
+    #[test]
+    fn fan_out_groups_runs_longest_first_and_splits_results_by_group() {
+        let order = Mutex::new(Vec::<(usize, u32)>::new());
+        let cancel = AtomicBool::new(false);
+        // Group 0 small (ws 10), group 1 big (ws 30), group 2 small again (ws 10): one worker, so the pull
+        // order is the queue order.
+        let out = fan_out_groups(
+            vec![vec![1u32, 2], vec![10, 20, 30], vec![100]],
+            &[10, 30, 10],
+            &AdmissionGate::fixed(1),
+            gate_label("t"),
+            &cancel,
+            |g, v| {
+                order.lock().unwrap().push((g, v));
+                Ok::<u32, String>(v * 2)
+            },
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![(1, 10), (1, 20), (1, 30), (0, 1), (0, 2), (2, 100)]
+        );
+        let flat: Vec<Vec<Option<Result<u32, String>>>> = vec![
+            vec![Some(Ok(2)), Some(Ok(4))],
+            vec![Some(Ok(20)), Some(Ok(40)), Some(Ok(60))],
+            vec![Some(Ok(200))],
+        ];
+        assert_eq!(out, flat);
+        // Admission N gives the same split.
+        let wide = fan_out_groups(
+            vec![vec![1u32, 2], vec![10, 20, 30], vec![100]],
+            &[10, 30, 10],
+            &AdmissionGate::fixed(8),
+            gate_label("t"),
+            &cancel,
+            |_, v| Ok::<u32, String>(v * 2),
+        );
+        assert_eq!(wide, flat);
+        // An empty group stays an empty slot.
+        let with_empty = fan_out_groups(
+            vec![vec![], vec![5u32]],
+            &[1, 1],
+            &AdmissionGate::fixed(2),
+            gate_label("t"),
+            &cancel,
+            |_, v| Ok::<u32, String>(v),
+        );
+        assert_eq!(with_empty, vec![vec![], vec![Some(Ok(5))]]);
+    }
+
+    /// Task 13c L4a: one queue is used only when it lowers no group's admission. Uniform groups merge; a
+    /// group with a much bigger working set (or a big shared sum) makes the merged admission fall below a
+    /// small group's own, so the stage keeps its per-group queues.
+    #[test]
+    fn merged_admission_falls_back_when_it_would_lower_a_groups_admission() {
+        const GIB: u64 = 1 << 30;
+        let plane = |w: u64, h: u64| w * h * 4;
+        // Uniform and tiny against a roomy budget: everything clamps to the pool width, so merge.
+        let small = GroupLoad {
+            working_set_bytes: 3 * plane(64, 48),
+            shared_bytes: 2 * plane(64, 48),
+        };
+        let d = merged_admission(&[small, small], 4, Some(8 * GIB));
+        assert_eq!((d.merged, d.per_group_min, d.per_group_max, d.merge), (4, 4, 4, true));
+        // A mixed pair: mono 9576x6388 next to a tiny group on a 1 GiB budget. The big group's working set
+        // sets the merged ws, so the tiny group would lose workers: fall back.
+        let big = GroupLoad {
+            working_set_bytes: 3 * plane(9576, 6388),
+            shared_bytes: 2 * plane(9576, 6388),
+        };
+        let d = merged_admission(&[big, small], 16, Some(8 * GIB));
+        assert!(d.merged < d.per_group_max, "{d:?}");
+        assert!(!d.merge, "{d:?}");
+        // Set 204 on the dev Mac (OSC 6248x4176 debayered + a mono group, 4 GiB, pool 10) falls back.
+        let osc = GroupLoad {
+            working_set_bytes: 5 * plane(6248, 4176),
+            shared_bytes: 2 * plane(6248, 4176),
+        };
+        let mono = GroupLoad {
+            working_set_bytes: 3 * plane(6248, 4176),
+            shared_bytes: 2 * plane(6248, 4176),
+        };
+        let d = merged_admission(&[osc, mono], 10, Some(4 * GIB));
+        assert!(!d.merge, "{d:?}");
+        // An unknown budget is admission 1 everywhere: nothing to lose, merge.
+        let d = merged_admission(&[big, small], 16, None);
+        assert_eq!((d.merged, d.per_group_max, d.merge), (1, 1, true));
+    }
+
+    /// Task 13c L4a: stage 1 over several groups through ONE queue gives the files, warnings, exclusions and
+    /// cache flags the per-group queues give (same bytes, same commit order).
+    #[test]
+    fn calibrate_one_queue_across_groups_matches_per_group_queues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut ctx_raw = ServiceContext::new_for_tests(db_path.clone());
+        ctx_raw.image_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        );
+        let ctx = Arc::new(ctx_raw);
+        let (fixture, _fine, _coarse, _tiny, working, output) = seed_two_geometry_groups(&db_path);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 3, "{plan_groups:?}");
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        type Rows = Vec<(String, Option<i64>, String, Option<i64>)>;
+        type Snapshot = (
+            Vec<(String, Vec<u8>)>,
+            Vec<String>,
+            Vec<(i64, String)>,
+            Vec<(i64, bool)>,
+            Rows,
+            Vec<(u64, u64)>,
+        );
+        // `mode`: 0 = per-group queues, 1 = one queue over every group, 2 = the pre-L4 baseline — the stage run
+        // once per group, in group order, on one run context.
+        let run = |mode: u8| -> Snapshot {
+            let w = tempfile::tempdir().unwrap();
+            let layout = WorkingLayout::new(w.path(), &set_slug(SET_NAME));
+            // The shared catalog keeps the other shape's rows otherwise: compare rows written by THIS shape.
+            fixture
+                .conn
+                .execute("DELETE FROM stacking_artifacts", [])
+                .unwrap();
+            let rec = Arc::new(Recording::new());
+            let mut rc = test_context(
+                ctx.clone(),
+                rec.clone() as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids.clone(),
+            );
+            // Both runs share one catalog: regenerate rather than reuse the other run's rows.
+            rc.rerun_from = Some(Stage::Calibrate);
+            if mode == 2 {
+                for g in &plan_groups {
+                    rc.plan_groups = vec![g.clone()];
+                    stage_calibrate_with(&mut rc, Some(false)).unwrap();
+                }
+                rc.plan_groups = plan_groups.clone();
+            } else {
+                stage_calibrate_with(&mut rc, Some(mode == 1)).unwrap();
+            }
+            let rows: Rows = crate::db::stacking::list_artifacts(&fixture.conn, &rc.subject, Some("calibrated"))
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.group_key, r.frame_id, r.config_hash, r.size))
+                .collect();
+            let progress: Vec<(u64, u64)> = rec
+                .events(STACKING_PROGRESS_EVENT)
+                .iter()
+                .filter(|e| e["stage"] == Stage::Calibrate.as_str())
+                .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
+                .collect();
+            let mut files = Vec::new();
+            for g in &plan_groups {
+                let dir = layout.calibrated_dir(&g.key);
+                let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                names.sort();
+                for n in names {
+                    files.push((
+                        format!("{}/{}", g.key, n.file_name().unwrap().to_string_lossy()),
+                        std::fs::read(&n).unwrap(),
+                    ));
+                }
+            }
+            let mut cached: Vec<(i64, bool)> = rc.cached_calibrated.iter().map(|(k, v)| (*k, *v)).collect();
+            cached.sort();
+            (
+                files,
+                rc.warnings.clone(),
+                rc.runtime_exclusions.clone(),
+                cached,
+                rows,
+                progress,
+            )
+        };
+        let per_group = run(0);
+        let merged = run(1);
+        let baseline = run(2);
+        assert!(!per_group.0.is_empty(), "the fixture calibrates something");
+        assert_eq!(per_group.0.len(), merged.0.len());
+        assert_eq!(per_group.1, merged.1, "warnings in the same order");
+        assert_eq!(per_group.2, merged.2, "exclusions");
+        assert_eq!(per_group.3, merged.3, "cache flags");
+        // The artifact rows, in commit order (ORDER BY id): group, then frame, same hash and size.
+        assert!(!per_group.4.is_empty(), "the fixture writes calibrated rows");
+        assert_eq!(per_group.4, merged.4, "calibrated rows and their commit order");
+        // The pre-L4 order — one stage run per group — for the lists and the rows.
+        assert_eq!(baseline.4, merged.4, "rows against the pre-L4 group-by-group order");
+        assert_eq!(baseline.1, merged.1, "warnings against the pre-L4 interleaving");
+        assert_eq!(baseline.2, merged.2, "exclusions against the pre-L4 interleaving");
+        assert_eq!(baseline.0.len(), merged.0.len());
+        // Review I1: the stage-wide progress never steps back and lands on its total, in both shapes.
+        for (name, shot) in [("per-group", &per_group), ("merged", &merged)] {
+            assert!(!shot.5.is_empty(), "{name}: no progress events");
+            assert!(
+                shot.5.windows(2).all(|w| w[0].0 <= w[1].0),
+                "{name}: calibrate progress went backwards: {:?}",
+                shot.5
+            );
+            let (last, total) = *shot.5.last().unwrap();
+            assert_eq!(last, total, "{name}: the last event lands on total: {:?}", shot.5);
+        }
+        for (a, b) in per_group.0.iter().zip(&merged.0) {
+            assert_eq!(a.0, b.0);
+            assert!(a.1 == b.1, "{} differs between the two queue shapes", a.0);
+        }
+    }
+
+    /// Cancels the run on the first Calibrate tick that carries a frame (a worker finishing inside the queue).
+    struct CancelOnCalibrateTick {
+        inner: Recording,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl ProgressEmitter for CancelOnCalibrateTick {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            if event_name == STACKING_PROGRESS_EVENT
+                && payload["stage"] == Stage::Calibrate.as_str()
+                && payload["current"].as_u64().unwrap_or(0) > 0
+            {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            self.inner.emit_json(event_name, payload);
+        }
+    }
+
+    /// Task 13c final review A, M1: a cancel during the merged Calibrate queue still replays every stashed phase-1
+    /// list (group 0's warnings and exclusions reach `rc.warnings` / `rc.runtime_exclusions`).
+    #[test]
+    fn calibrate_cancel_in_merged_queue_replays_phase1_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut ctx_raw = ServiceContext::new_for_tests(db_path.clone());
+        ctx_raw.image_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let ctx = Arc::new(ctx_raw);
+        let (fixture, _fine, _coarse, _tiny, working, output) = seed_two_geometry_groups(&db_path);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let w = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(w.path(), &set_slug(SET_NAME));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = Arc::new(CancelOnCalibrateTick {
+            inner: Recording::new(),
+            cancel: cancel.clone(),
+        });
+        let mut rc = test_context(
+            ctx.clone(),
+            emitter as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        rc.cancel = cancel;
+        rc.rerun_from = Some(Stage::Calibrate);
+        // The fixture's per-group hot-pixel warnings are stashed per group before the merged queue runs.
+        let r = stage_calibrate_with(&mut rc, Some(true));
+        assert!(matches!(r, Err(RunError::Cancelled)), "{r:?}");
+        let w2 = tempfile::tempdir().unwrap();
+        let mut uncancelled = test_context(
+            ctx.clone(),
+            Arc::new(Recording::new()) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            WorkingLayout::new(w2.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            )
+            .1,
+        );
+        uncancelled.rerun_from = Some(Stage::Calibrate);
+        stage_calibrate_with(&mut uncancelled, Some(true)).unwrap();
+        // Every warning the full merged run raised is present after the cancel (phase-1 ones replayed, commit-time
+        // ones are a subset of the full run's).
+        for w in &rc.warnings {
+            assert!(uncancelled.warnings.contains(w), "{w}");
+        }
+        assert!(
+            !rc.warnings.is_empty(),
+            "the stashed lists were dropped by the cancel (the fixture raises a hot-pixel warning per group)"
+        );
+        assert_eq!(rc.warnings, uncancelled.warnings, "every stashed warning, in group order");
+    }
+
+    /// Rewrites `compute.memory_budget_mb` the first time a progress event of `stage` names `group_key`: a settings
+    /// change landing between two groups' fan-outs (the first event of a group's own fan-out comes after that
+    /// group's admission line).
+    struct BudgetSwitch {
+        ctx: Arc<ServiceContext>,
+        stage: Stage,
+        group_key: String,
+        to_mb: u64,
+        done: AtomicBool,
+    }
+
+    impl ProgressEmitter for BudgetSwitch {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            if event_name != STACKING_PROGRESS_EVENT
+                || payload["stage"] != self.stage.as_str()
+                || payload["groupKey"] != self.group_key.as_str()
+                || self.done.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let conn = self.ctx.db.get().unwrap().conn();
+            self.ctx
+                .settings
+                .persist_setting(
+                    &conn,
+                    crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB,
+                    &self.to_mb.to_string(),
+                )
+                .unwrap();
+        }
+    }
+
+    /// The `memory_budget_bytes` of every `fan-out admitted` line of `stage` naming `group_key`, in log order.
+    fn admitted_budgets(text: &str, stage: Stage, group_key: &str) -> Vec<u64> {
+        text.lines()
+            .filter(|l| {
+                l.contains("fan-out admitted")
+                    && l.contains(&format!("stage=\"{}\"", stage.as_str()))
+                    && l.contains(group_key)
+            })
+            .map(|l| {
+                let rest = l.split("memory_budget_bytes=").nth(1).expect("budget field");
+                rest.split_whitespace().next().unwrap().parse().unwrap()
+            })
+            .collect()
+    }
+
+    /// Task 13c L4 review I2: the memory budget is read right before EACH fan-out, so a settings change between
+    /// two groups' fan-outs is seen by the second group (Calibrate, per-group queues).
+    #[test]
+    fn calibrate_reads_the_budget_before_each_groups_fan_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut ctx_raw = ServiceContext::new_for_tests(db_path.clone());
+        ctx_raw.image_pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap());
+        let ctx = Arc::new(ctx_raw);
+        let (fixture, _fine, _coarse, _tiny, working, output) = seed_two_geometry_groups(&db_path);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) =
+            seed_run_and_groups(&fixture.conn, fixture.set_id, &plan_groups, working.path(), output.path());
+        let set_budget = |mb: u64| {
+            let conn = ctx.db.get().unwrap().conn();
+            ctx.settings
+                .persist_setting(&conn, crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB, &mb.to_string())
+                .unwrap();
+        };
+        set_budget(2048);
+        let w = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(w.path(), &set_slug(SET_NAME));
+        let switch = Arc::new(BudgetSwitch {
+            ctx: ctx.clone(),
+            stage: Stage::Calibrate,
+            group_key: plan_groups[0].key.clone(),
+            to_mb: 1024,
+            done: AtomicBool::new(false),
+        });
+        let mut rc = test_context(
+            ctx.clone(),
+            switch.clone() as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        rc.rerun_from = Some(Stage::Calibrate);
+        let (res, text) =
+            crate::stacking::telemetry::capture_logs(|| stage_calibrate_with(&mut rc, Some(false)));
+        res.unwrap();
+        assert!(switch.done.load(Ordering::SeqCst), "the budget was switched mid-stage");
+        let first = admitted_budgets(&text, Stage::Calibrate, &plan_groups[0].key);
+        assert_eq!(first, vec![2048u64 << 20], "the first group ran on the old budget: {text}");
+        for g in &plan_groups[1..] {
+            let later = admitted_budgets(&text, Stage::Calibrate, &g.key);
+            assert!(!later.is_empty(), "no admission line for {}: {text}", g.key);
+            assert!(
+                later.iter().all(|&b| b == 1024u64 << 20),
+                "{} did not see the new budget: {later:?}",
+                g.key
+            );
+        }
+    }
+
+    /// Task 13c L4 review I2, Measure: a later group's pass-1 queue reads the budget when it starts, not at the
+    /// stage's start (per-group queues).
+    #[test]
+    fn measure_reads_the_budget_before_each_groups_fan_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut ctx_raw = ServiceContext::new_for_tests(db_path.clone());
+        ctx_raw.image_pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap());
+        let ctx = Arc::new(ctx_raw);
+        let (fixture, _fine, _coarse, _tiny, working, output) = seed_two_geometry_groups(&db_path);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) =
+            seed_run_and_groups(&fixture.conn, fixture.set_id, &plan_groups, working.path(), output.path());
+        let w = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(w.path(), &set_slug(SET_NAME));
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout.clone(),
+            output.path().to_path_buf(),
+            group_ids.clone(),
+        );
+        stage_calibrate(&mut rc).unwrap();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            ctx.settings
+                .persist_setting(&conn, crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB, "2048")
+                .unwrap();
+        }
+        let switch = Arc::new(BudgetSwitch {
+            ctx: ctx.clone(),
+            stage: Stage::Measure,
+            group_key: plan_groups[0].key.clone(),
+            to_mb: 1024,
+            done: AtomicBool::new(false),
+        });
+        rc.emitter = switch.clone() as Arc<dyn ProgressEmitter>;
+        let (res, text) =
+            crate::stacking::telemetry::capture_logs(|| stage_measure_with(&mut rc, Some(false)));
+        res.unwrap();
+        assert!(switch.done.load(Ordering::SeqCst), "the budget was switched mid-stage");
+        let first = admitted_budgets(&text, Stage::Measure, &plan_groups[0].key);
+        assert_eq!(first.first(), Some(&(2048u64 << 20)), "the first group's pass 1 ran on the old budget: {text}");
+        for g in &plan_groups[1..] {
+            let later = admitted_budgets(&text, Stage::Measure, &g.key);
+            assert!(!later.is_empty(), "no admission line for {}: {text}", g.key);
+            assert!(
+                later.iter().all(|&b| b == 1024u64 << 20),
+                "{} did not see the new budget: {later:?}",
+                g.key
+            );
+        }
+    }
+
+    /// Task 13c L4c: Measure's per-worker working set carries no shared bytes, so equal-sized groups (an OSC and a
+    /// mono group of one sensor size, four mono groups of the runner) merge: the one queue lowers nobody's admission.
+    #[test]
+    fn measure_pass1_loads_of_equal_sized_groups_merge() {
+        const GIB: u64 = 1 << 30;
+        let load = |w: u64, h: u64| GroupLoad {
+            working_set_bytes: measure_working_set_bytes(w, h),
+            shared_bytes: 0,
+        };
+        // Dev Mac set 204: OSC + mono, one sensor size, 4 GiB budget, pool 10.
+        let d = merged_admission(&[load(6248, 4176), load(6248, 4176)], 10, Some(4 * GIB));
+        assert!(d.merge, "{d:?}");
+        // Runner: four mono groups, 8 GiB budget (RAM / 4 of 32 GiB), pool 16.
+        let hc11 = load(9576, 6388);
+        let d = merged_admission(&[hc11; 4], 16, Some(8 * GIB));
+        assert!(d.merge, "{d:?}");
+        // A group with a larger frame lowers nobody's admission only when its own admission is already the max.
+        let d = merged_admission(&[load(6248, 4176), load(9576, 6388)], 16, Some(8 * GIB));
+        assert!(!d.merge, "{d:?}");
+    }
+
+    /// Task 13c L4c: stage 3 over several groups with ONE pass-1 queue gives the artifacts, metrics, group betas,
+    /// measured order, warnings and exclusions the per-group queues give.
+    #[test]
+    fn measure_one_pass1_queue_across_groups_matches_per_group_queues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut ctx_raw = ServiceContext::new_for_tests(db_path.clone());
+        ctx_raw.image_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        );
+        let ctx = Arc::new(ctx_raw);
+        let (fixture, _fine, _coarse, _tiny, working, output) = seed_two_geometry_groups(&db_path);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 3, "{plan_groups:?}");
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let w = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(w.path(), &set_slug(SET_NAME));
+        let rec = Arc::new(Recording::new());
+        let mut rc = test_context(
+            ctx.clone(),
+            rec.clone() as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout.clone(),
+            output.path().to_path_buf(),
+            group_ids.clone(),
+        );
+        stage_calibrate(&mut rc).unwrap();
+        let (warn0, excl0) = (rc.warnings.len(), rc.runtime_exclusions.len());
+        // Both shapes re-measure from scratch in place over the same calibrated files.
+        rc.rerun_from = Some(Stage::Measure);
+        type Rows = Vec<(String, Option<i64>, String, String, Option<i64>)>;
+        type Snapshot = (
+            String,
+            Vec<(String, Vec<u8>)>,
+            Vec<String>,
+            Vec<(i64, String)>,
+            Vec<String>,
+            Rows,
+            Vec<(u64, u64)>,
+        );
+        // `mode`: 0 = per-group queues, 1 = one pass-1 queue, 2 = the pre-L4 baseline (the stage run once per
+        // group, in group order, on this run context; its outcome is not compared — a group alone may be too small).
+        let mut run = |mode: u8| -> Snapshot {
+            rc.measured.clear();
+            rc.measured_groups.clear();
+            rc.warnings.truncate(warn0);
+            rc.runtime_exclusions.truncate(excl0);
+            rec.0.lock().unwrap().clear();
+            // Each shape writes its own rows; the calibrated ones stay (they are the input).
+            fixture
+                .conn
+                .execute(
+                    "DELETE FROM stacking_artifacts WHERE kind NOT IN ('calibrated', 'calibrated_mosaic')",
+                    [],
+                )
+                .unwrap();
+            let outcome = if mode == 2 {
+                for g in &plan_groups {
+                    rc.plan_groups = vec![g.clone()];
+                    let _ = stage_measure_with(&mut rc, Some(false));
+                }
+                rc.plan_groups = plan_groups.clone();
+                String::new()
+            } else {
+                format!("{:?}", stage_measure_with(&mut rc, Some(mode == 1)).map_err(|e| format!("{e:?}")))
+            };
+            let mut rows: Rows = Vec::new();
+            for kind in ["metrics", "measured"] {
+                for r in crate::db::stacking::list_artifacts(&fixture.conn, &rc.subject, Some(kind)).unwrap() {
+                    // A first-pass artifact's bytes carry its wall-clock timings: its size differs run to run.
+                    let size = if kind == "measured" { None } else { r.size };
+                    rows.push((r.group_key, r.frame_id, r.kind, r.config_hash, size));
+                }
+            }
+            let progress: Vec<(u64, u64)> = rec
+                .events(STACKING_PROGRESS_EVENT)
+                .iter()
+                .filter(|e| e["stage"] == Stage::Measure.as_str())
+                .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
+                .collect();
+            let mut files = Vec::new();
+            for g in &plan_groups {
+                for dir in [layout.measured_dir(&g.key), layout.fits_dir(&g.key)] {
+                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                    let mut names: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
+                    names.sort();
+                    for n in names {
+                        files.push((
+                            format!("{}/{}", g.key, n.file_name().unwrap().to_string_lossy()),
+                            std::fs::read(&n).unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut order = Vec::new();
+            for g in &plan_groups {
+                let beta = rc.measured_groups.get(&g.key).map(|m| m.beta);
+                order.push(format!("{} beta={beta:?}", g.key));
+                for e in rc.measured.get(&g.key).into_iter().flatten() {
+                    order.push(format!(
+                        "{} {} {:?} {:?} {}",
+                        e.frame.frame_id,
+                        e.included,
+                        e.reason,
+                        e.cached_metrics,
+                        // The wall-clock `durationMs` is the one field that differs run to run.
+                        {
+                            let mut v = serde_json::to_value(&e.measurement).unwrap();
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("durationMs");
+                            }
+                            v.to_string()
+                        }
+                    ));
+                }
+            }
+            (
+                outcome,
+                files,
+                rc.warnings.clone(),
+                rc.runtime_exclusions.clone(),
+                order,
+                rows,
+                progress,
+            )
+        };
+        let per_group = run(0);
+        let merged = run(1);
+        let baseline = run(2);
+        assert!(
+            per_group.1.iter().any(|(n, _)| n.ends_with(".athm")),
+            "the fixture writes first-pass artifacts: {:?}",
+            per_group.1.iter().map(|f| &f.0).collect::<Vec<_>>()
+        );
+        assert_eq!(per_group.0, merged.0, "outcome");
+        assert_eq!(per_group.2, merged.2, "warnings in the same order");
+        assert_eq!(per_group.3, merged.3, "exclusions");
+        assert_eq!(per_group.4, merged.4, "betas, measured order and metrics");
+        // Artifact rows (metrics, first-pass `measured`) by (group, frame, kind, hash, size), ORDER BY id.
+        assert!(!per_group.5.is_empty(), "the fixture writes measure rows");
+        assert_eq!(per_group.5, merged.5, "measure rows");
+        // The pre-L4 order: one stage run per group.
+        assert_eq!(baseline.2, merged.2, "warnings against the pre-L4 interleaving");
+        assert_eq!(baseline.3, merged.3, "exclusions against the pre-L4 interleaving");
+        assert_eq!(baseline.4, merged.4, "measured order and metrics against the pre-L4 order");
+        assert_eq!(baseline.5, merged.5, "measure rows against the pre-L4 order");
+        // Review I1: the stage-wide progress never steps back and lands on its total, in both shapes.
+        for (name, shot) in [("per-group", &per_group), ("merged", &merged)] {
+            assert!(!shot.6.is_empty(), "{name}: no progress events");
+            assert!(
+                shot.6.windows(2).all(|w| w[0].0 <= w[1].0),
+                "{name}: measure progress went backwards: {:?}",
+                shot.6
+            );
+            let (last, total) = *shot.6.last().unwrap();
+            assert_eq!(last, total, "{name}: the last event lands on total: {:?}", shot.6);
+        }
+        assert_eq!(per_group.1.len(), merged.1.len());
+        for (a, b) in per_group.1.iter().zip(&merged.1) {
+            assert_eq!(a.0, b.0);
+            if a.0.ends_with(".athm") {
+                // The body carries the first pass's wall-clock timings (`read_ms`, `elapsed`): two runs never
+                // agree on those bytes, so compare what describes the pixels (stamp, geometry, own beta); the
+                // pass-2 output derived from the body is compared byte for byte below (`.athf`) and above (metrics).
+                let d = tempfile::tempdir().unwrap();
+                std::fs::write(d.path().join("a"), &a.1).unwrap();
+                std::fs::write(d.path().join("b"), &b.1).unwrap();
+                let ha = crate::stacking::pass1_artifact::read_pass1_head(&d.path().join("a")).unwrap();
+                let hb = crate::stacking::pass1_artifact::read_pass1_head(&d.path().join("b")).unwrap();
+                assert_eq!(ha, hb, "{} head differs between the two queue shapes", a.0);
+            } else {
+                assert!(a.1 == b.1, "{} differs between the two queue shapes", a.0);
+            }
+        }
+    }
+
+    /// Task 13c S7: a target dropped mid-run retires workers before their next pull; the results are those
+    /// of admission 1 and of admission N, never more than `start` workers ran, and the run finished.
+    #[test]
+    fn fan_out_gate_dropped_mid_run_is_identical_and_bounded() {
+        const N: usize = 64;
+        let work = |i: usize| -> Result<u64, String> {
+            std::thread::sleep(Duration::from_millis(2));
+            Ok((i as u64).wrapping_mul(2_654_435_761).rotate_left(7) ^ 0xA5)
+        };
+        let run = |gate: &AdmissionGate, drop_to: Option<(usize, usize)>| {
+            let done = AtomicUsize::new(0);
+            let running = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let cancel = AtomicBool::new(false);
+            let out = fan_out(
+                (0..N).collect::<Vec<usize>>(),
+                gate,
+                gate_label("t"),
+                &cancel,
+                |i| {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let r = work(i);
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    if let Some((after, to)) = drop_to {
+                        if done.fetch_add(1, Ordering::SeqCst) + 1 == after {
+                            gate.set_target(to);
+                        }
+                    }
+                    r
+                },
+            );
+            (out, peak.load(Ordering::SeqCst))
+        };
+        let one = run(&AdmissionGate::fixed(1), None);
+        let many = run(&AdmissionGate::fixed(N), None);
+        let gate = AdmissionGate::fixed(8);
+        let (dropped, peak) = run(&gate, Some((10, 2)));
+        assert_eq!(dropped.len(), N);
+        assert!(dropped.iter().all(|r| r.is_some()), "every item ran");
+        assert_eq!(dropped, one.0, "identical to admission 1");
+        assert_eq!(dropped, many.0, "identical to admission N");
+        assert!(peak <= 8, "never more than start workers: {peak}");
+        assert_eq!(gate.target(), 2);
+        assert!(gate.retired.load(Ordering::SeqCst) >= 1, "workers retired");
+        // The target is clamped to [1, start].
+        gate.set_target(0);
+        assert_eq!(gate.target(), 1);
+        gate.set_target(99);
+        assert_eq!(gate.target(), 8);
+        // Dropped all the way to 1 mid-run still finishes with one worker.
+        let g1 = AdmissionGate::fixed(6);
+        let (to_one, _) = run(&g1, Some((3, 1)));
+        assert_eq!(to_one, one.0);
+    }
+
+    /// The `fan-out finished` line carries every fixed field; an `admission lowered` source is covered by
+    /// the live-budget test below.
+    #[test]
+    fn fan_out_finished_line_has_its_fields() {
+        let cancel = AtomicBool::new(false);
+        let gate = AdmissionGate::fixed(3);
+        let (_, text) = crate::stacking::telemetry::capture_logs(|| {
+            fan_out(
+                vec![1u64, 2, 3, 4, 5, 6],
+                &gate,
+                gate_label("pass1"),
+                &cancel,
+                |i| {
+                    std::thread::sleep(Duration::from_millis(5));
+                    Ok::<u64, String>(i)
+                },
+            )
+        });
+        let line = text
+            .lines()
+            .find(|l| l.contains("fan-out finished"))
+            .unwrap_or_else(|| panic!("no fan-out finished line: {text}"));
+        for f in [
+            "run_id=77",
+            "stage=\"measure\"",
+            "group_key=g-test",
+            "pass=\"pass1\"",
+            "items=6",
+            "admission=3",
+            "workers=3",
+            "retired=0",
+            "duration_ms=",
+            "tail_ms=",
+            "idle_worker_ms=",
+        ] {
+            assert!(line.contains(f), "{f} missing in {line}");
+        }
+        assert_eq!(text.matches("fan-out finished").count(), 1);
+    }
+
+    /// The production gate lowers its target from the live memory budget (one `warn` for an unreadable read is
+    /// not asserted here; this pins the lowering and its log line).
+    #[test]
+    fn fan_out_gate_lowers_from_the_live_memory_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("t.db")));
+        let conn = ctx.db.get().unwrap().conn();
+        // 1 MiB budget against a 64 MiB working set: admission 1.
+        ctx.settings
+            .persist_setting(&conn, crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB, "1")
+            .unwrap();
+        drop(conn);
+        let gate = AdmissionGate::budgeted_on(&ctx, 64 << 20, 0, 4);
+        // The rate limit measures from construction: arm it.
+        if let Some(src) = &gate.source {
+            *src.last_check.lock().unwrap() = Instant::now() - Duration::from_secs(5);
+        }
+        let mut label = gate_label("t");
+        label.run_id = 78;
+        label.group_key = Some("g-live".to_string());
+        let ((), text) = crate::stacking::telemetry::capture_logs(|| gate.refresh(&label));
+        assert_eq!(gate.target.load(Ordering::SeqCst), 1);
+        let line = text
+            .lines()
+            .find(|l| l.contains("fan-out admission lowered"))
+            .unwrap_or_else(|| panic!("no lowered line: {text}"));
+        for f in [
+            "run_id=78",
+            "group_key=g-live",
+            "from=4",
+            "to=1",
+            "budget_why=\"setting",
+        ] {
+            assert!(line.contains(f), "{f} missing in {line}");
+        }
+        // Rate-limited: an immediate second refresh does nothing, and a raised budget never raises the target.
+        gate.refresh(&label);
+        assert_eq!(gate.target.load(Ordering::SeqCst), 1);
+        // A raised budget never raises the target: persist a roomy value, let the rate limit pass, refresh.
+        let conn = ctx.db.get().unwrap().conn();
+        ctx.settings
+            .persist_setting(&conn, crate::settings::keys::COMPUTE_MEMORY_BUDGET_MB, "4096")
+            .unwrap();
+        drop(conn);
+        if let Some(src) = &gate.source {
+            *src.last_check.lock().unwrap() = Instant::now() - Duration::from_secs(5);
+        }
+        let ((), text2) = crate::stacking::telemetry::capture_logs(|| gate.refresh(&label));
+        assert_eq!(gate.target.load(Ordering::SeqCst), 1, "{text2}");
+        assert!(!text2.contains("fan-out admission lowered"), "{text2}");
+    }
+
     /// v0.6.3: the fan-out stages' per-frame ticker. Two workers race 250
     /// ticks through one ticker: the recorded percents never go backwards
     /// (the gate is held across the emit), the first tick is emitted (the
@@ -18869,9 +21117,11 @@ mod tests {
         assert_eq!(ticker.done(), TOTAL);
         let events = rec.events.lock().unwrap().clone();
         assert!(!events.is_empty(), "no ticks recorded at all");
-        assert_eq!(
-            events[0].0,
-            DONE_SO_FAR + 1,
+        // Two workers: the one whose `fetch_add` returned 52 can take the gate
+        // before the one holding 51, which then drops its stale tick — so the
+        // first emitted tick is 51 or 52, never a restart from 0.
+        assert!(
+            (DONE_SO_FAR + 1..=DONE_SO_FAR + 2).contains(&events[0].0),
             "the first tick continues from done_so_far and is emitted: {events:?}"
         );
         let mut last = -1.0f64;

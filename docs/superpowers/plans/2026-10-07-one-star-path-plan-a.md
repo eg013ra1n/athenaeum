@@ -5838,6 +5838,528 @@ not merged.
 **Deliverable.** A research note `docs/superpowers/research/2026-10-XX-stacking-parallelism.md` (the measurements, the
 ranked levers with their measured gains), then the bit-identical changes that pass the bars, in phases (lean-execution).
 
+**Design read (2026-10-17; report `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-13c-report-design.md`; code
+read at 4ce275bf, no runs).** Scope, questions, scaling rules and bars above are kept; where the code contradicts the
+stub the sharpening is marked **(S)**.
+
+*The map (Q1): every place parallelism is decided today.*
+
+| Decision | Where | Today | From |
+| ---- | ---- | ---- | ---- |
+| App pool `image_pool` (all stacking pixel work) | `athenaeum-tauri/src/lib.rs` `run()`, `athenaeum-web/src/main.rs` | `min(available_parallelism, 16)`: 10 dev Mac, 16 runner | cores + a constant |
+| rayon global pool | rayon default | `available_parallelism` or `RAYON_NUM_THREADS` | the probes, the scanner, any call outside an `install` |
+| `ComputeQueue` | `services/compute_queue.rs` | `compute.max_concurrent` = 1 (1–8); a run holds one slot; the scanner is not in it | setting |
+| Fan-out admission (Calibrate, Measure pass 1 / pass 2, Register, Normalize) | `stacking/run.rs` `admission`, `admission_with_shared`, `fan_out` | `clamp((total_ram / 4 − shared) / working_set, 1, pool)`; working sets in planes of one f32 channel: Measure 8 (measured, R-TA-3), Normalize 8 + 3 masked (analytic, not re-measured since the background-model rewrite), Calibrate 8 (analytic; counts a 3-plane debayer output even on mono), Register 4 mono / 6 OSC (measured) | RAM + constants |
+| ... set 204, dev Mac | `t13-real/s204/extract.txt` (lab) | Measure 5 / 5, Normalize 5 / 5, Register 10 mono / 6 OSC (pool 10); Calibrate ≈ 4 (computed with two shared master planes) | |
+| ... runner (computed) | | every fan-out 16 = the pool (Measure 41 → 16) | |
+| Within a frame | `star_measure` (`pool.install` around each parallel step; indexed `collect`), Register warp / write, LN, the VNG debayer | the pool | |
+| Calibrate, one frame | `calibration_library/light_cal.rs` `calibrate_light_compute_inner` | ONE thread: `BandSource` concurrency 1, 256 MiB bands; only the OSC debayer is installed on the pool (`export/calibrated_generator.rs::debayer_plane`) | |
+| Measure, one OSC frame | `stacking/measure.rs::measure_planes_diagnosed` | three planes in sequence, two halves each (one plane resident) | |
+| Groups and stages | `stacking/run.rs` | groups in sequence inside each stage, stages in sequence: Measure has 4 barriers (2 groups × 2 passes), Calibrate / Register / Normalize 2 | |
+| Integrate bands | `integration/band_budget.rs`, `engine.rs` `band_loop` / `loop_band_rows` | budget RAM / 4 in [256 MiB, 8 GiB] ÷ `max_concurrent` (4 GiB dev Mac, 8 GiB runner); combine one row per pool task; read concurrency = pool (local) or 2 × pool in [8, 32] (network); next-band prefetch ONLY on network storage | RAM, storage class, `integration.band_budget_mb`, `integration.read_concurrency` |
+| Drizzle | `stacking/drizzle/mod.rs` | frames in sequence: read, then deposit in `DRIZZLE_BAND_ROWS` = 512-row bands on the pool | constant |
+| Submodules | rustafits (decode, mesh, MRS, detection, VNG), solvemyastro (the plate-solve seed fallback) | rayon on the current pool | |
+| Elsewhere | Blink permits `max(threads / 2, 2)`; Analysis batch `cores / 3` in [2, 16]; plate-solve batch `cores / 3` in [2, 8] | | |
+
+Platform discovery today: cores = std's `available_parallelism` (affinity; on Linux the cgroup CPU quota), no
+performance / efficiency split; memory = `band_budget::total_ram_bytes()` (Linux `min(MemTotal, cgroup v2 memory.max |
+v1 limit)` at the namespace root, macOS `hw.memsize`, Windows `ullTotalPhys`); no available memory, no swap, no Windows
+job-object limit. Logged: `blink semaphore initialized` (start), `fan-out admitted` (working set, shared, admission,
+pool). Dev Mac (`sysctl`): Apple M4, 4 P + 6 E, 16 GiB, 128 B lines. Runner: M4 Max 16 cores (12 P + 4 E for that
+part; Step 0 confirms), 128 GB, the same macOS build (runner memo; t09-f4 parity certified bit for bit).
+
+*What the existing data says.* Set 204 at 5836a970 re-run from Measure (`t13-real/s204/extract.txt`): Measure 9.88
+(7.95 after 13b, 5b), Register 1.12, Normalize 3.10, Integrate 3.98, Drizzle 1.56 min; Calibrate 2.06 (Tier C table,
+2026-09-20) — ≈ 19.8 min from Calibrate today. Measure 9.00 of 10 cores busy (5b). Integrate per plane: read 6.05 s,
+combine 53.0 s wall at 524.9 CPU-s = 9.9 cores — the combine is saturated, the read is serial (10 %). Drizzle per
+plane: read 3.75 s (28 %), deposit 5.17 s, 4.6 s unnamed; 4 × 13.5 = 54 s of the stage's 94 s, 40 s unattributed.
+Measure pass 1 share 0.75. One frame does not fill the runner: single-frame probes used 4.9–6.6 of 16 cores (runner memo,
+t11-f6). E-core worth r_E = 0.35–0.45 P (13b design read: ceiling 6.1–6.7 P-equivalents on 4 P + 6 E).
+
+- **(S1) The runner is not admission-starved.** Admission scales with RAM and is capped by the pool: on 128 GB every
+  fan-out admits 16 = the pool, and the band budget sits at its 8 GiB cap. Its questions are granularity, serial
+  sections, I/O and E-cores; the `.min(16)` pool cap (both hosts) limits only a machine above 16 cores.
+- **(S2) Determinism is structural today (Q4).** Static sweep of core `stacking` / `star_measure` / `integration` /
+  `calibration_library` / `export`, rustafits and solvemyastro: no result reads a thread count (`current_num_threads` /
+  `available_parallelism` feed only admission and read concurrency); `fan_out` lands results at the item index and
+  commits in frame order; rayon collects are indexed; the one parallel reduce on the Measure path
+  (`star_measure/mod.rs` saturation plane) is max + count, exact; rustafits' parallel fold + reduce
+  (`adaptive_detection.rs`) builds integer histograms; no `find_any`, no entropy-seeded RNG, no float sum through a
+  shared atomic; drizzle bands own disjoint output rows and deposit frames in order. **Partition-dependent, never proved:**
+  the Integrate / LN band rows (per pixel by design — but the dev Mac's 4 GiB and the runner's 8 GiB budgets already cut
+  different bands) and drizzle's band-skip bound (sampled, R-TA-10). A lever that changes a partition carries an identity
+  proof; scheduling-only levers are bit-identical by construction and still run the matrix.
+- **(S3) Calibrate is single-threaded per frame** except the OSC debayer, and its 8-plane working set was never measured
+  (it counts a debayer output a mono frame never has): on mono, admission (≈ 4 on 16 GB) IS its parallelism.
+- **(S4) Integrate's prefetch premise is stale.** `loop_band_rows` gates prefetch to network storage because a local
+  "read" was a CPU-bound warp; since Tier A's materialized registered frames it is a file read (6.05 s against a 53.0 s
+  saturated combine) that the combine waits for.
+- **(S5) Drizzle is one frame at a time.** Read and deposit alternate; 17 bands of 512 rows at 2× (8 352 rows: 16 full +
+  a 160-row band) give ≈ 80 % deposit occupancy on 10 threads and ≈ 78 % on 16 by band arithmetic.
+- **(S6) Measure on the dev Mac is near its ceiling** (9.00 / 10): its headroom is the 4 barriers' tails and E-core
+  tails, not admission.
+- **(S7) No in-run mechanism exists** for the "forced scale-down mid-run" row. Because `fan_out` workers pull from one FIFO
+  and results land by index, a gate that retires workers before their next pull is bit-identical by construction; Step 1
+  builds it behaviour-neutral, fed by the live memory cap, so the row is real whatever L6 decides.
+- **(S8) The Tauri host builds `image_pool` before the database opens** (`.manage` in `run()`), so a Settings thread cap
+  needs a pool built after the DB (74 `image_pool` sites). The matrix's thread knob is `RAYON_NUM_THREADS`, honoured by
+  both hosts' `image_pool` from Step 1; a Settings thread cap comes only with L7.
+- **(S9) Tools.** `powermetrics` needs root (sudo asks a password on the dev Mac). `proc_pid_rusage(RUSAGE_INFO_V6)`
+  (macOS 27 SDK `sys/resource.h`, verified) gives per process: user / system time, P-core time (`ri_user_ptime`,
+  `ri_system_ptime`), `ri_runnable_time` (ready but no core: oversubscription), `ri_phys_footprint`,
+  `ri_lifetime_max_phys_footprint`, disk bytes. The interval-max reset (`proc_rlimit_control`) is a private syscall: per
+  stage peaks come from a 250 ms sampler and from fresh-server stage runs. `taskpolicy -c background` confines a probe to
+  the E cluster → r_E without root.
+
+*Measurement design (Q2).* In-process, timing only (no number moves), least code:
+- `compute budget resolved` (host start) and `stacking budget` (run start): logical CPUs, P / E cores, CPU quota,
+  memory total / limit / available, memory budget, pool threads, `max_concurrent`, why (auto / env / cap / cgroup).
+- Real-time stage bounds: `stacking stage started`, then `stacking stage telemetry` at its end (today's `stage finished`
+  lines are written only at the run's end): wall, CPU, P-CPU, runnable, cores busy, serial ms (< 1.5 cores busy), full ms
+  (≥ 90 % of the logical CPUs), gap since the previous stage, sampler peak footprint, lifetime-max footprint, minimum
+  available memory, swap delta, disk read / write bytes; on Linux the cgroup v2 `cpu` / `io` / `memory.pressure` totals.
+- `fan-out finished` per fan-out: items, admission, wall, tail ms (last item pulled → last worker done), idle-worker ms.
+- debug, 1 s: `stacking telemetry sample` (stage, cores busy, P-cores busy, footprint, available) — the curve.
+- Derived per stage and machine: P-equivalents busy (P time + r_E × E time) against the ceiling (4 + 6 r_E; 12 + 4 r_E),
+  serial share + gaps (Amdahl), tail share, I/O share (per-frame `read_ms` / `write_ms` sums, disk bytes / wall),
+  peak against budget, swap. Probe ladders (one heavy job at a time): Measure planes 0058 / 0075 / 0163 at
+  `RAYON_NUM_THREADS` 1 / 2 / 4 / 10 (dev Mac), 1 / 4 / 8 / 12 / 16 (runner) with the 13b-P lines → speedup and the
+  Karp–Flatt serial fraction; `integrate_probe` / `drizzle_probe` alike; the 1-thread E-only run → r_E. The harness'
+  `ps` sampler stays as a cross-check (1 s, with RSS).
+
+*Levers (Q3), ranked by expected gain per machine class from the data above; Step 2 re-ranks on measurements.*
+
+| # | Lever | Dev Mac | Runner | Identity | Cost |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| L1 | Calibrate: admission from the measured per-colour-mode working set; row-parallel arithmetic on the pool (tail) | mono ≈ 4 single-threaded frames in flight → up to 10: −20…−30 % of Calibrate (bounded by ≈ 14 GB of mono I/O) | admission already 16; tails only | admission: scheduling; row-parallel: element-wise — matrix | low / medium |
+| L2 | Drizzle: read the next frame during the deposit | ≤ −16 % of Drizzle (read 28 % of plane time) | more (deposit scales, read does not) | scheduling | low (+1 plane) |
+| L3 | Integrate: prefetch on local storage (S4) | ≤ −10 % (read 10 %) | ≤ −17 % (combine ≈ 1.8× faster, read I/O-bound) | scheduling; halved bands = partition → matrix | low |
+| L4 | Fan-out tails: one queue per pass for both groups, longest item first (OSC before mono); Measure 4 barriers → 2 | ≤ 3–5 % of the fan-out stages | ≈ 5–10 % (≈ 6 items per worker) | scheduling (by index, frame-order commit) | medium (`run.rs` group loops) |
+| L5 | Drizzle bands ≥ 4 × pool | ≈ −5 % of Drizzle (occupancy 80 → 95 %) | same | partition (R-TA-10 skip) → proof first | low |
+| L6 | Available-memory admission + pressure back-off through the gate | only if Step 2 shows swap or a free-memory shortfall | none expected (32 GiB budget) | scheduling | medium |
+| L7 | Pool width above 16; a Settings thread cap (lazy pool, S8) | none | none | scheduling | medium |
+| L8 | `ComputeQueue` sharing: the budget split across running heavy jobs (as `per_job_budget` does for memory) | sharing correctness | same | scheduling | low |
+| L9 | Per-plane OSC granularity in Measure | none: memory-bound, cross-plane halves | none: frames = pool | — | record |
+| L10 | Streaming between stages | L1 + L4 take most; saves one read (Measure 94 ms of 5.1 s per plane) | | cache semantics move | high — note |
+| L11 | mmap of disk-as-cache reads | reads are drive-bound; saves a copy, not the read | | — | note |
+| L12 | E-cores (QoS, placement) | keep them (+2.1–2.7 P-eq); the risk is a last item on an E core (≈ 2.5×), L4 covers it | 4 of 16 | scheduling | measure first |
+| L13 | SIMD | aarch64: NEON baseline, evidence by disassembly of release-probe hot symbols; x86_64 builds carry no `target-cpu` (SSE2): runtime AVX2 dispatch is bit-identical by construction (no FMA contraction or reassociation) but neither machine measures it | | by construction | note; x86 run owed |
+| L14 | GPU | research only: combine, deposit, warp, mesh / MRS move well; per-star LM fits do not | | NOT bit-identical (reduction order, FMA) → a Tier C-style tolerance task | note |
+
+Projection: dev Mac L1 + L2 + L3 + L4 ≈ 1–1.5 of ≈ 19.8 min (5–8 % of the run; each ≥ 5 % of its stage). Runner: at full
+use 12 + 4 r_E ≈ 13.4–13.8 P-eq against 6.1–6.7 → set 204 ≈ 9–10 min; the measured gap is its lever list.
+
+*Determinism matrix (Q4).* (a) Probe identity (13b's `star_probe measure --paths measure,betas,register --diagnostics`
+diff, wall fields dropped) on 0058 / 0075 / 0163 at `RAYON_NUM_THREADS` 1 / 4 / 10 (dev Mac) and 16 (runner). (b) A
+12 mono + 12 OSC subset of set 204 (manual exclusions), LN and drizzle 2× on, run from Calibrate at pool 1 / 4 / 10,
+admission forced to 1 (memory cap 1 MB), band budget 256 MiB (`integration.band_budget_mb`), the memory cap lowered
+mid-Measure (the gate), on the dev Mac, and pool 16 on the runner: every artifact byte (calibrated, `.athm`, `.athf`,
+metrics rows, registered, `.athln`, masters, drizzle, weight, coverage, rejection maps) against the dev Mac pool-10 run.
+Today's code first (Step 3); then after each lever.
+
+*Platform discovery and the budget (Q5).* `services/machine.rs`, probed once: logical CPUs (std, cgroup-aware on Linux),
+P / E (macOS `hw.perflevel0/1.physicalcpu`; Linux `/sys/devices/cpu_core|cpu_atom/cpus` or `cpu_capacity`; Windows
+`GetSystemCpuSetInformation` EfficiencyClass), CPU quota (cgroup v2 `cpu.max`, v1 `cfs_quota_us / cfs_period_us`;
+Windows job CPU rate), memory total / limit (today's `total_ram_bytes` moved here and re-exported; + Windows job memory
+limit); available memory read at each stage start (macOS host VM statistics free + inactive + purgeable + speculative;
+Linux `MemAvailable` ∧ (limit − `memory.current`); Windows `ullAvailPhys`). Step 1 keeps today's auto rule exactly (pool
+`min(cores, 16)`, budget total / 4); Step 4 changes it only where measured. User control (`docs/settings/README.md`
+contract): one new KV `compute.memory_budget_mb` (0 = auto), Settings → Stacking → **Compute** (`stacking.compute`,
+`SettingNumber`), read live by every admission and by the gate; `integration.band_budget_mb`,
+`integration.read_concurrency`, `compute.max_concurrent` keep their roles; `RAYON_NUM_THREADS` is the thread override
+(env, start-time, logged with why = env).
+
+**Decisions.** Measure before building: no lever lands before Step 2's numbers and Step 3's matrix on today's code. A lever
+is merged only if ≥ 5 % of its stage on at least one machine, no slower on the dev Mac beyond the bracket's spread, and
+within the 16 GB memory rules. Cross-machine byte comparison is allowed (same macOS build, t09-f4 parity). The container
+run sizes from the cgroup (`--cpus 4 --memory 8g --memory-swap 8g`: 4 threads, 8 GiB, Measure admission 2) — swap
+forbidden so a mis-size shows as an OOM kill, never as a slow run.
+
+**Files.**
+- New: `crates/athenaeum-core/src/services/machine.rs`, `crates/athenaeum-core/src/stacking/telemetry.rs` (`rustfmt` by
+  path).
+- `services/mod.rs`, `stacking/mod.rs` (modules); `integration/band_budget.rs` (`total_ram_bytes` → `machine`,
+  re-exported); `stacking/run.rs` (the meter at each stage bound, `fan_out` + gate + `fan-out finished`, `admission` /
+  `admission_with_shared` read the budget; hand edits only, grep-guided); `settings/mod.rs` (key, default, `all()`);
+  `crates/athenaeum-core/Cargo.toml` (windows-sys features `Win32_System_Threading`, `Win32_System_ProcessStatus`,
+  `Win32_System_JobObjects`); `athenaeum-tauri/src/lib.rs`, `athenaeum-web/src/main.rs` (pool width via
+  `machine::pool_threads`, `compute budget resolved`).
+- Step 4, only the levers that land: `calibration_library/light_cal.rs`, `export/calibrated_generator.rs`,
+  `stacking/run.rs` `calibrate_working_set_bytes` (L1); `stacking/drizzle/mod.rs` (L2, L5); `integration/engine.rs`
+  (L3); `stacking/run.rs` group loops (L4); `services/compute_queue.rs` (L8).
+- Frontend: `src/settings/registry.ts` (`stacking.compute`), `src/components/settings/tabs/StackingTab.tsx` + its section,
+  the registry coverage test.
+- athenaeum-lab: `harness/acceptance/t13c.sh` (from `t13b.sh`: gates, the 1 s sampler with RSS, full / Measure-only /
+  subset runs, fresh-server stage stops), `tier1/t13c-tools.py` (stage table from the telemetry lines, curves,
+  Karp–Flatt, the every-artifact identity diff), the subset prepare, the container launcher, star-lab cycle `t13c-id`.
+- Docs: the research note; `docs/stacking/README.md` R-OSP-13; `docs/settings/README.md`; the logging spec's dictionary
+  extension (Task 13c fields); this Outcome.
+
+**Interfaces.**
+
+```rust
+// services/machine.rs
+pub struct MachineProfile { pub logical_cpus: usize, pub perf_cores: Option<usize>, pub eff_cores: Option<usize>,
+                            pub cpu_quota: Option<f64>, pub mem_total: Option<u64>, pub mem_limit: Option<u64> }
+pub fn profile() -> &'static MachineProfile;            // probed once
+pub fn available_memory() -> Option<u64>;
+pub fn pool_threads(p: &MachineProfile) -> (usize, &'static str); // RAYON_NUM_THREADS, else min(logical, 16) (Step 1)
+pub struct ProcSample { pub cpu_ns: u64, pub p_cpu_ns: Option<u64>, pub runnable_ns: Option<u64>, pub footprint: u64,
+                        pub footprint_lifetime_max: u64, pub disk_read: u64, pub disk_write: u64, pub swap_used: Option<u64> }
+pub fn proc_sample() -> ProcSample; // macOS RUSAGE_INFO_V6 (a repr(C) mirror + size test if libc lacks it); Linux /proc + cgroup; Windows
+// stacking/telemetry.rs
+pub(crate) struct StageMeter; // start(rc, stage) logs "stacking stage started"; finish() logs "stacking stage telemetry"; owns the 250 ms sampler
+// stacking/run.rs
+pub(crate) struct AdmissionGate { start: usize, target: AtomicUsize } // live workers > target retire before their next pull; never above start
+fn fan_out<T, R, E, F>(items: Vec<T>, gate: &AdmissionGate, label: FanOutLabel<'_>, cancel: &AtomicBool, f: F)
+    -> Vec<Option<Result<R, E>>>; // + "fan-out finished"
+fn admission(working_set_bytes: u64, max_workers: usize, mem_budget: u64) -> usize; // compute.memory_budget_mb, else total / 4
+```
+
+Unchanged: every artifact layout and hash, every command (the key rides `get_setting` / `set_setting`), `ts_export`.
+
+**Steps** (lean-execution: one phase per agent, reports ≤ 80 lines; one heavy job at a time on the dev Mac).
+**Controller amendments (2026-10-17).** (1) The `.min(16)` pool cap contradicts the owner's goal (full use of ANY
+machine): Step 1 sets the pool width to `available_parallelism` (cgroup / job-limit aware via `services/machine.rs`;
+`RAYON_NUM_THREADS` still overrides), the memory-driven fan-out admission still bounds frames in flight, and Step 3's
+matrix adds a pool above 16 (a 20- or 24-thread run on the runner, oversubscribed on purpose) to prove the cap's removal
+is byte-identical. Only the Settings THREAD cap (a lazily built pool, 74 call sites) stays deferred as L7. (2) Step 0's
+runner question (which real datasets it holds, free disk) is asked at once, so STOP R0 is known before Step 1 ends.
+**Plan-review amendments (2026-10-17; owner asked for an independent review — `task-13c-review-fable-plan.md`: ready
+with fixes, 1 Critical / 5 Important / 10 Minor; all taken except #12, the owner's bar).**
+(3) **Option fields** are logged as `-1` (`-1.0` for `cpu_quota`), never omitted (1a's convention, logging spec); every
+reader treats `-1` or absent as unknown. (4) **The ≥ 16-thread rows run on both machines, each against itself** (R0: the
+runner holds Horse C11 only): dev Mac — the set 204 subset at pool 1 / 4 / 10 / 16 / 24 (`RAYON_NUM_THREADS`,
+oversubscribed on purpose, so the OSC paths — VNG, 3-plane Measure, Bayer drizzle — run above 10 threads); runner — its
+Horse C11 subset at pool 1 / 16 / 24 against its own pool-16 run. This replaces "pool 16 on the runner … against the dev
+Mac pool-10 run" in the matrix, Step 4 and Acceptance. (5) **`compute.memory_budget_mb` is a cap**: a value above the
+effective memory (`mem_limit`, else `mem_total`) is clamped to it with a `warn!` and `budget_why = "setting-clamped"`;
+`1` stays valid (the admission-1 arm). (6) **Step 1's probe `cmp` is a numerics tripwire only** (`star_probe` runs on the
+global pool: no `fan_out`, no gate, no `machine.rs`); the server path's identity after Step 1 is Step 3's matrix (b).
+(7) **Order:** after Step 1 the controller builds `target-acc` from Step 1's head (one build at a time) and pushes the
+branch + the lab; Step 3's dev Mac arms (haiku) run BEFORE Step 2 (same build, D1 surfaces first); the runner runs its
+Step 2 and its Step 3 arms together. (8) **Working sets** from `subset-stages` are `peak − footprint at stage start`
+(`stacking stage started` carries `footprint_bytes`), Calibrate's preloaded master planes labelled shared; Integrate and
+Drizzle ignore the knob (their budgets: `integration.band_budget_mb`, `drizzle/mod.rs` total / 2), so their rows are not
+"admission 1". (9) **Caveats for Step 2 and the note:** `vm.swapusage` is system-wide (swap delta 0 needs a quiet
+machine); memory bandwidth has no instrument of its own — the runner's all-P ladder 1–12 separates it (Karp–Flatt rising
+with p = bandwidth, flat = serial), r_E is taken per probe (Measure, Integrate, Drizzle) from the E-only arm with I/O
+excluded (`taskpolicy -c background` also throttles I/O). (10) The gate only lowers; if 4c builds L6 as pressure
+back-off it decides "raise back when available memory clears" there. (11) **Levers added for Step 2 to rank:** L15
+admission above the pool width on the runner when `runnable_ms` / the frame workers' serial share (reads, per-frame
+setup) leaves cores idle; L16 Drizzle frame-outer order with three accumulator pairs on a machine whose RAM holds them
+(today plane-outer re-reads each OSC mosaic 3×, `drizzle/mod.rs` ≈ 820–856; bit-identical per plane); L5 needs a
+test-only band-rows knob first (`DRIZZLE_BAND_ROWS` is a constant). (12) Container row: admission = budget / working set
+(1 on Horse C11's 9576 × 6388, 2 on set 204), not "Measure admission 2". (13) S2: "no `find_any` on the stacking path"
+(the plate solver's verified early exit is timing-dependent but not on the stacking path: Register seeds from stored
+solves). **Not taken, proposed to the owner:** #12 merge bar "≥ 5 % of its stage OR ≥ 1 % of the run" (5 % of Register
+is 3 s, 4 % of Measure 19 s would be refused).
+**Owner bar (2026-10-17, answering #12: «Мне надо чтобы было быстрее ERP в общем прогоне. Смотри сам сколько это
+процентов»).** The task's speed bar is the WHOLE run (Masters → Output) faster than the ERP's whole run on the same frames,
+the same machine and the same work (calibration recipe, LN, drizzle as the ERP ran them). Per lever: merged when
+bit-identical, within the memory rules and faster beyond its interleaved bracket's spread on at least one machine with no
+regression on the other — no fixed percentage floor; a lever whose gain is < 1 % of the run AND whose cost is medium or
+high is recorded, not merged. ERP data in hand: **Horse C11 on the runner, 2026-10-04 batch log (164 lights, four
+filters, flats only, LN, no drizzle, 16 threads): 46:27.62** — flats 2.3 min, calibrate 9.1, measure 2.9, register 4.4,
+LN 20.6, integrate 7.1. Ours on Horse C11 (dev Mac, Task 13, 106 lights L + G): calibrate 3.08, measure 2.21 (1.43 after
+13b), register 1.08, normalize 1.22, integrate 2.01 ≈ 8.8 min ≈ 5.0 s per light against the ERP's 16.2 s per light on
+the bigger machine. **Set 204: no ERP whole-run measurement exists** (only its subframe measurement, 3.77–4.00 min) →
+Step 2 adds one ERP whole-run on set 204 on the dev Mac (the owner's batch parameters, same masters, LN, drizzle 2×), and
+the runner's `full` run reproduces the 2026-10-04 batch work on all 164 lights for a same-machine comparison.
+
+- [x] **Step 0 — inventory (controller; 20 min).** Runner: `sysctl hw.perflevel0/1.physicalcpu hw.memsize`, macOS build,
+  `~/.athenaeum-acc` trees for set 204 (with calibrated frames) and Horse C11, a container runtime, free disk; dev Mac:
+  the container VM. **STOP R0** if the runner lacks set 204: the transfer route is the owner's call.
+- [x] **Step 1 — telemetry, discovery, the gate, the knob (rust-engineer sonnet ≈ 3 h; frontend-dev sonnet ≈ 45 min;
+  review opus ≈ 1 h; lab tools haiku ≈ 30 min).** Behaviour-neutral. Gates: `stacking::`, `services::`,
+  `integration::band_budget`, `check --all-targets`, `--no-default-features`, both hosts, the registry coverage test; a
+  gate unit test (target dropped mid-fan-out → identical results); identity: probe `cmp` 0058 / 0075 / 0163 0 differing.
+- [x] **Step 2 — measure both machines (dev Mac sonnet judgment ≈ 4 h; runner sonnet ≈ 3 h, concurrently).** Each: one
+  full set 204 run from Calibrate at defaults on a clone (reference pinned `manual`, `twoPass = false`); the subset at
+  admission 1 with a fresh server per stage stop (`ATH_ACC_STOP_AFTER`) → per-stage working sets; the probe ladders and
+  the E-only run; dev Mac also one Measure-only run of the desktop build with its window hidden (App Nap). Output: the
+  note's measurement sections, each lever's projection from measured shares. **STOP M1** if no lever projects ≥ 5 % of a
+  stage on either machine: the note closes the task (owner).
+- [x] **Step 3 — the matrix on today's code (haiku proof runs; dev Mac ≈ 2 h, runner ≈ 1 h).** (a) + (b). **STOP D1** on
+  any differing byte: a determinism bug, Fable rules before any lever.
+- [x] **Step 4 — the levers in Step 2's order (rust-engineer sonnet ≈ 2 h per group; review opus per group).** 4a
+  scheduling-only (L1 admission, L2, L3 without a band change, L4); 4b partition levers (L5, L3 with halved bands), proof
+  first; 4c the budget rule (L6 / L7 / L8) only where Step 2 measured the need (swap, a free-memory shortfall, > 16 cores,
+  concurrent jobs). Per lever: (a) + (b) at 1 / 10 and 16; an interleaved stage bracket H N H N H N (median of 3) on both
+  machines; a miss against the bars is reverted with its numbers.
+- [x] **Step 5 — acceptance (dev Mac sonnet ≈ 3 h; runner sonnet ≈ 2 h; container sonnet ≈ 2–3 h, on the runner if it
+  has a runtime).** Full set 204 from Calibrate, interleaved H N H N H N on clones (H = 4ce275bf + Step 1, N = Step 4's
+  head): per-stage and total medians, cores busy, peak footprint, swap; N's artifacts byte-identical to H's; container:
+  Horse C11 Measure-only H N H N under the cgroup caps, the budget line reading the cgroup; the lab `t13c-id` (runner)
+  0 moved.
+  **Status 2026-10-18:** runner (a) full Horse C11 H 377 → N 317 s and (b) the container arm (`--memory 12g --cpus 8`,
+  the Horse C11 subset) 117.6 → 105.0 s, no OOM — DONE; the final head 23b81727 byte-identical to that N (lab dc531cc);
+  dev Mac (`--rounds 2`, H 52350b03 = a7d18865 + token / N 23b81727): set 204 1170 → 1081 s (0.923), Horse C11 535 → 388 s
+  (0.725), swap N ≤ H, identity PASS — two set 204 stages above 1 (calibrate 1.029, register 1.018) ruled noise by Fable
+  (`task-13c-ruling-fable-step5.md`) — DONE; the lab `t13c-id` cycle (runner, lab 0998187): 0 moved, max |Δ| 0 over 67 686
+  rows + 3 328 inject rows — DONE.
+- [x] **Step 6 — review and record (opus review, Fable if it struggles; sonnet docs ≈ 2 h).** Note, README R-OSP-13,
+  settings doc, logging dictionary, this Outcome, ledger; squash on `one-star-path`; full `cargo test -p athenaeum-core
+  --all-targets` before any push.
+  **Status 2026-10-18:** final review A (Fable, 0 C / 1 I / 6 M) + B (opus, 0 C / 2 I / 9 M), fixed in 76ad9e0a /
+  23b81727; the docs pass (note, README R-OSP-13, settings doc, logging spec note, CLAUDE.md) DONE; squash, full
+  `--all-targets` and push owed.
+
+**Step 4 — from Step 2's numbers (2026-10-17; ranking `.superpowers/sdd/2026-10-07-one-star-path-plan-a/
+task-13c-report-rank.md`, code read at a7d18865, no runs).** Replaces the 4a / 4b / 4c split of the Step 4 line above;
+its per-lever rules (matrix, bracket, revert with numbers) and the Owner bar stand. `L` = `athenaeum-lab/star-lab/
+results/plan-a/t13c/`, `R` = `…/t13c-runner/`, `RA` = `R/prepare-runner-hc11-hc11-runner-all/`. Runs: dev Mac set 204
+1237.7 s and Horse C11 551.3 s (`L/full-{s204,hc11}/stage-table.txt`), runner Horse C11 (164 lights) 399.9 s
+(`RA/stage-table-dedup.txt`).
+
+*Step 4 and the owner bar (review C1, 2026-10-17).* The owner's ERP whole run on set 204 (dev Mac, quiet, 197 lights =
+92 mono + 105 OSC, the same 4 masters, manual reference, LN, drizzle 2x, VNG; run 1, IC.maxStars 24 576;
+`athenaeum-lab/star-lab/results/plan-a/t13c/erp-s204/verdict.txt`) took 1005 s against our 1237.7 s (Step 2 full-s204,
+`L/full-s204/stage-table.txt`): **the bar is NOT MET on set 204 today and Step 4 does not reach it.** Met on Horse C11
+on the runner (6.67 vs 46.46 min). Per stage (ours / ERP / delta):
+
+| Stage | Ours s | ERP s | Delta s |
+| ---- | ---- | ---- | ---- |
+| calibrate + cosmetic + debayer | 127.3 | 84 + 72 = 156 | -29 |
+| measure | 511.4 | 72 | +439 |
+| reference + register | 69.4 | 134 | -65 |
+| local normalization | 194.0 | 351 | -157 |
+| integrate | 244.8 | 113 | +132 |
+| drizzle | 90.8 | 170 | -79 |
+| total | 1237.7 | 1005 | +233 (+23 %) |
+
+The gap sits in Measure (+439 s, route A, numbers-identical by the 13b ruling) and Integrate (+132 s). Both are CPU-
+bound: Integrate runs 79 % of its samples at >= 9 cores, mean 8.53 (`L/full-s204/curves/curve-integrate.csv`), 2043
+CPU-s over about 10.4 G samples = about 196 ns per sample. No scheduling lever reaches them; L3 recovers at most the
+about 20 s of band reads. Step 4's own projection (below) is 1133-1176 s, still above 1005. **Decided (owner,
+2026-10-17, after the ERP's second run — the "max stars" mode = the batch script's Maximum-quality preset, all 309
+parameter lines identical, 16:08 = 968 s): 13c delivers 4a–4c AND (b) 4d, bit-identical; then a "fast measurement" cycle
+BEFORE Task 14 — (c) a star-fit budget `measurement.fitStars` (All | K brightest; default All; detection, Register and
+LN unchanged) shipped only past a truth bar, beside a GPU prototype for the per-star fits and the Integrate combine
+(float32, a tolerance + truth acceptance); then Task 14.** Why the ERP fits fewer stars (research
+`task-13c-report-research-starcount.md`): its `maxStars` 24 576 never binds (max 16 717); its detector's peak-height test
+(+ kurtosis ≥ 5 below 7.5σ) completes at a matched-filter SNR ≈ 18–28 vs our 6 — a detection THRESHOLD was measured out
+(it re-defines the weight unevenly: the mean-flux term −29 % on wide vs −14 % on sharp frames). The options were:
+  (a) re-state the bar per machine and dataset (met on Horse C11 / runner, 400 s vs 2788; open on set 204);
+  (b) **4d - Integrate combine CPU audit, bit-identical; measure first.** Per-phase CPU of one plane on `integrate_probe`
+      (band read, LN `evaluate_row`, the per-pixel stable `sort_by` on (value, tie) in `integration/combine.rs`, the
+      Auto ladder's iterations, f32 <-> f64 traffic, mask writes) with `sample <pid>` (no root). Only operation-order-
+      preserving changes land, each through the 13b identity procedure. Honest expectation 1.3-2x on the combine's CPU
+      = -50...-120 s, which with Step 4 lands at about 1000-1100 s: AT the ERP, not under it;
+  (c) Measure's 511 vs 72 s is a numbers decision (how many stars are fitted) that belongs to the owed truth-validated
+      weight cycle, not to 13c.
+
+*What the numbers change.*
+1. **Normalize's peak is per GROUP, not per frame.** `ln::reference::build_reference` integrates the reference through
+   `integrate_planes` at the run's whole `IoPolicy` band budget (4 GiB dev Mac, 8 GiB runner). Subset Normalize peak:
+   7.60 GiB at admission 1, 8.00 at admission 5, 5.33 at band budget 256 MiB with every byte identical
+   (`L/matrix-{adm1,pool10,band256}/stage-table.txt`, `L/matrix-diff-band256-vs-pool10`). So the "≈ 40 planes per OSC
+   frame" (`L/subset-stages/working-sets.txt`) and the runner's "≈ 8 GiB shared"
+   (`R/subset-stages-hc11-derived/working-sets-derived.txt`) are this build. Per-plane LN for OSC frames is not needed.
+2. **Each stage starts where the previous one peaked.** hc11 dev Mac: Measure starts at 1 768 524 008 B, Calibrate
+   peaked at 1 768 573 160 (`L/full-hc11/telemetry.jsonl`). Runner: Measure starts at 10.6 GiB after a 10.9 GiB
+   Calibrate with every worker joined (`RA/stage-table-dedup.txt`). Set 204: mono Normalize starts at 6.53 GB;
+   the curve drops 8.56 -> 6.47 at 1104.8 s and 6.47 -> 3.06 at 1109.9 s (cores 9.2), i.e. 1 s and 6 s AFTER the start,
+   so that memory is live at the boundary (`L/full-s204/curves/curve-normalize.csv`). The workspace uses the system
+   allocator (no `#[global_allocator]`), which keeps freed pages until memory pressure - **an inference, with counter-
+   evidence**: Integrate -> Drizzle boundaries drop 4.8-5.2 GB instantly with no call (6.38 -> 1.55 GB, 6.89 -> 1.74),
+   and set 204 Measure -> Reference drops to 0.34 GB while hc11 keeps 3.85 GiB. hc11 Integrate: L goes 6.91 -> 7.61 GiB
+   and G 6.48 -> 8.02 GiB; the +450 MB swap is group G's (`L/full-hc11/telemetry.jsonl`). The Measure-start = Calibrate-
+   peak observation (1.65 GiB both) is confirmed.
+3. **Normalize's serial part is the seeds calibration.** `ln::calibration::measure_seeds_calibration` runs 7 frames ×
+   2 arms one after another at 1–3 cores. Runner: ≈ 11 s per group × 4 groups, against a ≈ 7 s build at ≈ 12 cores;
+   76 s of the 92.1 s stage fall outside the four fan-outs (17.0 s). Dev Mac: set 204 OSC 34 s and mono 16 s, hc11
+   12 s and 11 s. Sources: `RA/curves/curve-normalize.csv`, `L/full-*/curves/curve-normalize.csv`, and the time from
+   `stacking stage started` to `fan-out admitted` in each `telemetry*.jsonl`.
+4. **Calibrate's 8 planes is 2–40× too many, and its master preload is serial.** Measured per-frame working sets:
+   mono ≈ 0.2 plane (`R/subset-stages-hc11-derived/`) - **an artefact**: 0.95 GiB work minus 933 MiB charged
+   shared (4 planes, `fan-out admitted`) leaves 40 MB for a frame whose input + output alone are >= 2 planes of 233 MiB,
+   and set 204 mono Calibrate is disk-bound (0.0-0.7 cores for 23 s, about 16 GB at about 700 MB/s,
+   `L/full-s204/curves/curve-calibrate.csv` 103-127 s), so no mono plane count is known until 4a-0; OSC + debayer ≈ 4 planes (0.93 GiB at admission 1 against
+   2.10 GiB at admission 4, `L/matrix-{adm1,pool10}`). `build_preloaded_masters` + `prebuild_hot_maps` run at exactly
+   1.0 core for 3–4 s per group: 14 s of the runner's 43.5 s (`RA/curves/curve-calibrate.csv`), 4 + 5 s on hc11 dev Mac.
+   hc11 dev Mac Calibrate: admission 1, 0.72 cores, 183.9 s = 33 % of its run. Set 204 mono: 23 s at 0.5 cores
+   (≈ 620 MB/s of I/O). Set 204 OSC: a ≈ 1 s stall every ≈ 4 s at admission 4 (`L/full-s204/curves/curve-calibrate.csv`).
+5. Measure's 8 planes holds (1.78 vs 5.02 GiB at admission 1 vs 5 = 8.1 planes), and so does Register's OSC 6
+   (5.7 planes). Runner Integrate is saturated: 13.87 of 16 cores, P-eq 12.44 of 13.2, 0 % serial, 0 MB read
+   (page cache). Its 121.7 s (30 % of the run) is CPU work, not a 13c lever.
+
+*Ranked (projected s; negative = faster; per machine from the measured shares above).*
+
+| # | Lever | s204 dev Mac (1238) | hc11 dev Mac (551) | hc11 runner (400) | Identity | 16 GB | Cost |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| M | 4a memory must-fix | +3…+7 | +2…+4 | 0 | M1 memory-only; M2 band partition; M3 scheduling | swap 0 | medium |
+| 1 | L1 Calibrate working set per colour mode + parallel master decode | −10…−20 | −120…−145 (upper bound, pending 4a-0's mono point) | −5…−8 | scheduling | charged | low |
+| 2 | L17 seeds-calibration arms through a fan-out | −15…−20 | −12…−15 | −32…−36 | scheduling | per-arm LN set admitted | low |
+| 3 | M3's LN admission (per-frame set measured, shared planes charged) | −10…−15 | −15…−25 | 0 | scheduling | after M1/M2 | low |
+| 4 | L4 one queue per pass across groups, longest first (Calibrate, Register, Measure pass 1) | −10…−15 | −4…−6 | −15…−25 | scheduling | masters of all groups charged | medium |
+| 5 | L3 Integrate prefetch on local storage | −12…−18 | −6…−9 | 0 | partition where halved | 2 half bands = 1 band | low |
+| 6 | L2 Drizzle reads frame i+1 while i deposits | −12…−20 | — | — | scheduling | +1 source plane | low |
+| 7 | L15 admission above the pool (runner Measure) | — | — | ≤ −5 | scheduling | n/a | medium |
+
+Projection after 4a–4c (arithmetic on the table's credits, L2 included; review I3/I4 moved L1): set 204 dev Mac best
+1237.7 + 3 − 10 − 20 − 15 − 15 − 18 − 20 = 1132.7 s (M, L1, L17, M3, L4, L3, L2), worst 1237.7 + 7 − 10 − 15 − 10 − 10 −
+12 − 12 = 1175.7 s: **≈ 1133–1176 s (18.9–19.6 min), against the ERP's 1005 s - the bar is not met on set 204 (C1
+above)**; hc11 dev Mac ≈ 355–400 s (L1's hc11 credit is an upper bound until 4a-0 names the mono working set); runner
+hc11 best 399.9 + 0 − 8 − 36 − 0 − 25 − 0 − 5 (L15) = 325.9 s, worst 399.9 − 5 − 32 − 15 = 347.9 s: ≈ 326–348 s against
+the ERP's 2787.6 s. L1's cut credit (s204 −25…−35 → −10…−20, runner −10…−12 → −5…−8): mono s204 earns 0 (disk-bound,
+I3) and the cross-group preload overlap is L4's alone (I4).
+
+*Rules for every lever below.* Identity = matrix (b) only. Every scheduling-only lever is identical by construction (I7). Probe (a) is not re-run: no Step 4 lever touches
+`star_probe`'s path (amendment 6). **Matrix S** = dev Mac subset at pool 1 / 10 / 16, adm1 and capdrop, against today's
+`L/matrix-pool10`; plus the runner hc11 subset at pool 1 / 16, adm1 and capdrop, against `R/matrix-hc11-pool16`.
+**Matrix S runs once per group (after 4a, after 4b), and per lever only for the partition levers M2 and L3 and for
+L17 (its `.athln` rows); each lever's own unit test and bracket stay.
+**Matrix P** = Matrix S + band256 + the lever's own band arm. Bracket = interleaved H N H N H N, median of 3 (the spread printed beside it), on clones,
+the stage sums from `stacking stage telemetry`; H = the head before the lever. Every N run has swap delta 0 and peak ≤
+budget + the run's start footprint (+ Drizzle's own estimate in Drizzle).
+
+- [x] **4a — CLOSED 2026-10-17 by measurement + owner ruling (supersedes the M1–M3 text below).** 4a-0 (247fdfde, lab
+  `t13c/4a0/`): the carry-over between stages is NOT live data — `vmmap --summary` at every boundary shows it as
+  `Malloc Large (empty)` (freed large blocks the macOS system allocator keeps, resident-dirty and swapped);
+  `malloc_zone_pressure_relief` returned 0 at all 28 stage starts (STOP M0). LN's shared set is small (OSC +238–295 MiB,
+  mono +83–237) — the "8 GiB LN" was that retained heap, so M2 / M3's premise is gone. A global jemalloc (aa311100, lab
+  `t13c/m1/`) removed the carry-over (boundaries 80–490 MiB) and every swap (s204 lifetime max 9.7 → 5.98 GiB). **Owner:
+  «давай не усложнять с jemloc и тп, оставь системные контроли памяти, ос лучше знает» → reverted (afb87500); the system
+  allocator stays; the relief call and the 4a-0 telemetry stay.** Consequence for every later lever: the dev Mac's memory
+  bar is "no more swap than H in any stage" (Step 2 / 4a-0 measured up to +761 MB in Normalize and +483 MB in Integrate
+  on the system allocator), not "swap 0"; a lever that raises frames in flight (L1, L4) is bracketed for swap as well
+  as wall. The superseded plan text follows for the record.
+- [ ] ~~4a — the memory must-fix (first; nothing in 4b lands before 4a passes).~~ M1 and M3 are ONE agent phase (same
+  files, both memory/scheduling-only); M2 follows it, conditional on M1 (I2).
+  - **4a-0 measure (telemetry only, ≈ 1 h code + one run per machine).** `footprint_bytes` on `ln reference built`, on
+    the seeds-calibration lines and on Integrate's band-plan line, **and after each explicit drop**: the drizzled
+    buffers after their DB rows (at the `drizzle_group` call in `run.rs`) and the group's `members` at the end of
+    `process_group_output`. `vmmap --summary <pid>` runs at EVERY stage and group boundary, unconditionally, not only
+    on a STOP M0. At each stage / group start, a debug `memory
+    relief` line: footprint before / after the platform release call — macOS `malloc_zone_pressure_relief(NULL, 0)`,
+    Linux glibc `malloc_trim(0)`, none on Windows. Files: `services/machine.rs` (`release_free_memory()`),
+    `stacking/telemetry.rs` (`StageMeter::start`), `stacking/run.rs`, `stacking/ln/{reference,calibration}.rs` (log
+    fields only). Runs, each one fresh server per machine, admission 1 and 4: the set 204 subset from Calibrate (dev
+    Mac) and the hc11 subset (runner). The container has no 4a-0 run: its `memory relief` line (Docker is `debian:bookworm-slim`, glibc, so `malloc_trim(0)`
+    compiles) is read in Step 5's container run. Out: per colour mode, the LN shared bytes (after the build − before), the LN
+    per-frame set and Calibrate's per-frame set (two points each), and what the release returns at each boundary.
+    **STOP M0** if the release returns < 1 GiB where the start footprint exceeds the live set: name the holder
+    (`vmmap --summary <pid>` at that boundary; no root needed) and free it in scope instead of M1.
+  - **M1 — release at every stage and group boundary.** `StageMeter::start` calls `machine::release_free_memory()`.
+    Memory-only, bit-identical by construction. Test: a unit test that the call returns and the footprint does not
+    rise. Matrix S once per group (after 4a), not per lever (I7). Acceptance: each stage's start footprint ≤ the run's start
+    + the live set 4a-0 named; **no absolute number (the earlier "set 204 mono Normalize starts ≤ 3.5 GB" is dropped:
+    that memory is live at the boundary, I1) until 4a-0 says what is live.**
+  - **M2 — band budgets from what is left.** The LN reference build and Integrate get `band = max(budget − shared
+    resident, 256 MiB)` (the upper bound never binds, m1). The subtraction sits on the PRE-cap budget (32 GiB − shared,
+    then the 8 GiB `resolve_budget_bytes` cap), so the runner's bands do not move (I6); the alternative is to add the
+    runner band arm to Matrix P. Shared resident = the LN reference planes, saturation maps and detection copy, plus
+    Integrate's output planes. It is computed from geometry and colour mode, never from a sampled footprint, so one
+    machine and config always cut the same bands. Files: `integration/{band_budget,io_policy}.rs`, `stacking/run.rs`
+    (`process_group_output`, `run_group_normalization`), `stacking/ln/reference.rs` (takes the narrowed `IoPolicy`).
+    Partition: a reviewer checks the per-pixel argument (S2) on the `engine.rs` combine paths and the LN build, then
+    Matrix P with the arm `band-m2` (dev Mac); per lever (M2 is a partition lever). The pre-cap subtraction leaves the
+    runner's 8 GiB cap, so its bands do not change (pool16 arm only). **M2's memory acceptance is conditional on M1:**
+    at admission 1 the Normalize start (about 3.7 GiB) + the build (about budget − shared, shared 0.3–1 GB) peaks at
+    about 6.5–7 GiB, over budget + the run start (4.7 GiB), unless M1 frees the carry-over. If STOP M0 names a live
+    holder that cannot be scoped, M2 subtracts that carry-over too (code state per stage and colour mode, deterministic,
+    never a sample) - the fallback is written now. Bracket: dev Mac set 204 and hc11, rerun from Normalize (Integrate + Drizzle follow);
+    runner hc11 from Normalize, which must show no regression. Acceptance: swap 0 in Normalize / Integrate / Drizzle on
+    the dev Mac; Normalize + Integrate ≤ H + 2 % (band256's measured cost: Normalize +2.6 %, Integrate ≤ +8 % at
+    256 MiB, `L/matrix-{pool10,pool10r,band256}`).
+  - **M3 — LN admission from measured sets.** The Normalize fan-out and the L17 arms admit through
+    `admission_with_shared(LN shared, LN per-frame per colour mode from 4a-0)`. This replaces `LN_PLANES_RESIDENT` and
+    `LN_MASKED_EXTRA_PLANES` as analytic constants (`stacking/run.rs`). Scheduling-only. Test: the admission unit tests
+    plus one per colour mode. Matrix S once per group (after 4a), shared with M1's run. Bracket: as M2. Acceptance: swap 0; hc11 dev Mac Normalize ≤ 65 s (from 81.3).
+- [x] **4b — scheduling-only speed levers, in rank order.**
+  - **L1 Calibrate.** (a) `calibrate_working_set_bytes(w, h, colour mode, debayer)` from 4a-0, rounded up + 1 plane. **No expected
+    number is written:** mono comes from 4a-0's two points on hc11 (dev Mac) AND set 204, set 204 mono's credit is 0
+    (disk-bound, I3), and the OSC gain is the about 1 s lock-step stall every 4 s (4 workers reading at once), which a
+    higher admission dissolves only statistically. (b) `build_preloaded_masters` decodes its DISTINCT masters through
+    `fan_out` (BTreeSet order kept, by index); the next-group overlap is L4's, not L1's (I4). `prebuild_hot_maps` gets
+    the same treatment, but a concurrent run writes `scratch` per dark and pushes `rc.warnings`: dedupe by dark path
+    BEFORE spawning, collect the warnings and push them in today's group order. Files: `stacking/run.rs` (the constant,
+    `stage_calibrate`, `build_preloaded_masters`, `prebuild_hot_maps`); `light_cal.rs` unchanged.
+    Test: preload by fan-out equals the serial preload bit for bit (fixture with two masters). Matrix S once per group (after 4b's first lever lands), not per lever. Bracket:
+    Calibrate only (`ATH_ACC_STOP_AFTER=calibrate`) on dev Mac hc11 AND set 204, and on runner hc11. Acceptance: hc11 dev
+    Mac ≤ 70 s (183.9), set 204 no regression (mono credit 0; OSC only), runner ≤ 38 s (43.5; the preload overlap is L4's). Risk: hc11 moves 41 GB, and at Register's
+    measured 1.24 GB/s combined (`L/full-s204/stage-table.txt`) that sets a ≈ 34 s floor.
+  - **L17 seeds-calibration arms concurrent.** In `ln::calibration::measure_seeds_calibration` the 7 × 2 arms run
+    through a fan-out over (frame, arm), gated by M3. Ratios are pushed in index order as today, the median sorts, and
+    each arm writes its own scratch sidecar. Progress events come in completion order (UI only). Files:
+    `stacking/ln/calibration.rs` (the arm loop of `measure_seeds_calibration`), `stacking/run.rs`
+    (`measure_ln_seeds_calibration` passes the gate). Test: concurrency 1 vs 4 give the same `SeedsCalibration` bit for
+    bit (synthetic group) **including a frame whose seeds arm fails (the skip branch), so landing by index is
+    exercised** (m5). Matrix S once per group plus per lever for L17 (its `.athln` and `ln_calibration` rows). Dev Mac
+    credit −15…−20 holds only if M3's per-frame LN set admits >= 3 arms (m8). Bracket: from Normalize, runner hc11 and dev Mac set 204. Acceptance: runner Normalize
+    ≤ 65 s (92.1); dev Mac no regression.
+  - **L4 one queue per pass across groups.** Calibrate, Register and Measure PASS 1 each make one `fan_out` over every
+    group's items, longest first (OSC, then larger frames). Results land by index and commit in today's group-then-frame
+    order. **Measure pass 2 stays per group as today:** `fan_out` is a static FIFO `Vec` with results by index, and the
+    group's beta (lower median over its pass 1) is a real barrier (I5); a dynamic queue is out of scope (cost high if
+    wanted). L4 owns the cross-group preload overlap (I4), and its Measure tail credit is re-measured at the bracket
+    (I5 narrows it). In Calibrate every group's masters are
+    resident at once and charged as shared; where that lowers the dev Mac's admission, per-group queues stay there.
+    `stage_output_groups` (Normalize → Integrate → Drizzle per group) is unchanged. Files: `stacking/run.rs` (the three
+    group loops in `stage_calibrate`, `stage_measure`, `stage_register`). Test: one queue over two groups vs two queues, same commits and artifacts
+    (fixture). Matrix S once per group. Bracket: Calibrate → Register (`ATH_ACC_STOP_AFTER=register`) on runner hc11 (4 groups) and
+    dev Mac set 204 (the dev Mac's −4…−6 s is inside the spread: "no regression" is the criterion, merge on the runner).
+    Acceptance: runner Calibrate + Measure + Register ≤ 165 s (186.2); dev Mac no regression.
+  - **L2 Drizzle prefetch.** A scoped reader loads frame i+1's source plane (or mosaic) while frame i deposits, and
+    `estimate_memory_bytes` gains one source plane. Files: `stacking/drizzle/mod.rs` (the frame loop of the deposit). Test: drizzle
+    with and without prefetch, same output. Matrix S once per group (drizzle 2× + Bayer on the subset). Bracket: dev Mac set 204,
+    rerun from Integrate. Acceptance: Drizzle ≤ 78 s (90.8).
+- [x] **4c — partition levers and the budget rule.**
+  - **L3 Integrate prefetch on local storage.** `loop_band_rows` / `band_loop` prefetch on every storage class and halve
+    the band only where two full bands do not fit M2's band budget. On the runner nothing is halved. Files:
+    `integration/engine.rs` (`loop_band_rows` / `band_loop`). Partition where halved: Matrix P with the arm `band-half` (dev Mac). Bracket:
+    rerun from Integrate, dev Mac set 204 and hc11; runner hc11, which must show no regression. **Pre-registered revert:** the prefetch
+    thread competing with a combine at 9.3 cores; the dev Mac gain (−12…−18 s = 5–7 %) equals the measured spread
+    (subset Integrate 14.5 vs 15.4 s, pool10 / pool10r = 6 %), so the spread is printed beside every median and a gain
+    inside it reverts. Acceptance: set 204 Integrate ≤ 230 s (244.8), hc11 ≤ 117 s (123.3), both beyond the spread.
+  - **L15 admission above the pool, runner only; measure first.** One bracket arm on runner hc11 Measure (stop after
+    Measure) at `compute.memory_budget_mb` 49152 and `max_workers` = 2 × pool. It runs only AFTER L4 (its 27 % tail is L4's; ≥ 2 % of a 78 s stage is 1.6 s, inside the spread
+    otherwise) and lands only if Measure is ≥ 2 % faster beyond the spread; otherwise it is recorded. Runner Measure
+    today: 78.3 s at 9.44 cores, 27 % tail, mostly L4's.
+  - **Recorded, not built.**
+    - L5: ≈ −5 % of set 204 Drizzle ≈ 4.5 s = 0.4 % of the run, and it needs a band knob + an R-TA-10 proof
+      (< 1 %, medium cost).
+    - L6: subsumed by M2 + M3; the gate stays the capdrop path.
+    - L7: no machine has more than 16 logical CPUs; pool 24 passes on both (`L/matrix-diff-pool24-vs-pool10`,
+      `R/matrix-diff-hc11-pool24-vs-pool16`).
+    - L8: no concurrent job was measured; `max_concurrent` is 1 on both machines.
+    - L9: Measure's 8 planes was confirmed; set 204 Measure runs at P-eq 4.86 of 5.5.
+    - L10 / L11: set 204 Measure reads at 169 MB/s and is CPU-bound.
+    - L12: r_E 0.25 dev Mac (`L/ladder/ladder-table.txt`), 0.29 runner (`R/ladder/ladder-table.txt`). Keep the E
+      cores; L4 takes the tails.
+    - L13 / L14: notes only.
+    - L16: three accumulator pairs ≈ +1.25 GB at 2× on a 6248×4176 OSC group, on top of a Drizzle peak already at
+      6.62 GiB — refused on 16 GB. The runner's measured work has no drizzle.
+    - The LN reference build: already ≈ 12 cores on the runner and 9.4 on the dev Mac.
+    - Group pipelining in `stage_output_groups`: after L17 no low-use phase is left to fill.
+    - Runner Integrate: saturated (point 5).
+
+**Acceptance.**
+- Identity: (a) 0 differing lines at 1 / 4 / 10 / 16 threads; (b) every artifact byte identical at pool 1 / 4 / 10 / 16,
+  admission 1, band budget 256 MiB and the mid-run cap drop; set 204 N against H identical; the lab 0 moved.
+- Speed: each merged lever ≥ 5 % of its stage by its bracket on at least one machine, no dev Mac stage slower beyond the
+  bracket's spread; the full run N < H on both machines; the container N ≤ H.
+- Memory: swap delta 0 in every dev Mac stage; peak footprint within the budget + the measured baseline everywhere; no
+  container OOM kill.
+- The budget line at `info` on all three; the Settings field per the contract; the research note with every row above.
+- Gates: as Step 1, and the full `--all-targets` before any push.
+
+**Closed (2026-10-18; branch `one-star-path-t13c`, final code head 23b81727; research note
+`docs/superpowers/research/2026-10-18-task-13c-parallelism.md`; README R-OSP-13).** **Landed** (bit-identical; every
+lever bracketed H N H N H N): Step 1 telemetry, discovery, the gate and `compute.memory_budget_mb` (the 16-thread cap gone);
+the D1 card-order fix 9486bf48; **L1** 13c11124 (hc11 dev Mac Calibrate 184.8 → 79.8 s); **L17** ec547c3a (runner
+Normalize group L 27.9 → 22.8 s, dev Mac set 204 136.8 → 125.8 s); **L4a + L4c** 2c5bd1ba + r1 da0837ed (runner
+Calibrate + Measure + Register 154.7 → 149.2 s, dev Mac level); **4d** d4535980 + r1 b296dbc4 (runner Integrate 98.6 →
+79.2 s); **L2** bb240c05 (set 204 Drizzle 86.4 → 70.8 s); **L3** f3859de6, scoped to stacking in 23b81727 (set 204
+Integrate 189.6 → 172.2 s); the token switch 6494596c (`ATHENAEUM_TOKEN_STORE=file`). **Recorded, not landed:** jemalloc
+(owner; reverted afb87500), M2 / M3 (premise gone), L4b (−1.2 s = 0.3 % of the runner run; reverted 28be0f3e), L15
+(≤ 2 s after L4), L5, L6–L14, L16, 4d's measured-out variants. **Owner bar:** runner Horse C11 **MET**, 317 s against the
+ERP's 2 787.6 s (8.8×; Step 5 (a) H 377 s; the container arm 117.6 → 105.0 s, no OOM); dev Mac set 204 **NOT MET**,
+1081 s at the final head (Step 5; 1105.5 s at b296dbc4) against 1005 s (+76 s; Measure +404 s). That gap goes to the
+fast-measurement cycle (`measurement.fitStars` + the GPU prototype), then Task 14. **Determinism:** Step 3 matrices PASS
+on both machines, runner Matrix S PASS at b296dbc4, dev Mac at the final head PASS (lab d7a5029: pool1, pool16, adm1, capdrop — admission lowered seen —, band256, pool10r vs pool10, 791 files each, 0 differing / 0 missing). **Lab:** `t13c-id` 0 moved. **Owed (owner):** the App Nap run (Step 2: a Measure-only run of the desktop build with its window hidden).
+
 ---
 
 ### Task 14: One full uniform lab run and the "after Plan A" note (spec §5 "At the end")

@@ -143,7 +143,8 @@ pub(crate) fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
 /// `fits_header` blob (format-aware, so an XISF source works too). Pure DB — no
 /// disk re-read of the (possibly huge) light file. Missing blob → a warn (an
 /// output stripped of its source metadata is a real, visible loss, never a
-/// silent one) and the catalog-derived Bayer cards only.
+/// silent one) and the catalog-derived Bayer cards only. The result is always
+/// keyword-sorted (deterministic across runs).
 ///
 /// The Bayer fallback runs on BOTH paths deliberately: sync-ingest inserts an
 /// EMPTY `fits_header` row while three scanner branches insert no row at all —
@@ -171,6 +172,7 @@ pub fn source_cards_for_file(
         );
         let mut cards = Vec::new();
         append_bayer_cards_from_columns(conn, frame_id, file_id, &mut cards)?;
+        sort_cards_by_keyword(&mut cards);
         return Ok(cards);
     };
     let keys = parse_stored_header_keys(format, &header_text);
@@ -179,7 +181,16 @@ pub fn source_cards_for_file(
         .filter_map(|(k, v)| card_from_kv(k, v))
         .collect();
     append_bayer_cards_from_columns(conn, frame_id, file_id, &mut cards)?;
+    sort_cards_by_keyword(&mut cards);
     Ok(cards)
+}
+
+/// Source cards come back keyword-sorted: the stored-header parsers return a
+/// `HashMap` (a new `RandomState` seed per map), so without this the copy-through
+/// card order of every calibrated frame differed from one generation to the next.
+/// Stable sort; the same precedent as the registered-frame writer.
+fn sort_cards_by_keyword(cards: &mut [Card]) {
+    cards.sort_by(|a, b| a.keyword.cmp(&b.keyword));
 }
 
 /// Bayer/CFA cards the stored blob can legitimately lack while the catalog

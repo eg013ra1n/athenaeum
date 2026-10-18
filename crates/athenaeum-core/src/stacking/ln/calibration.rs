@@ -311,7 +311,8 @@ impl CalibrationMeasurement {
 /// into it; `load_fits(i)` yields frame `i`'s per-plane fits (empty lists
 /// are fine — that frame's seeds arm then falls back and contributes no
 /// ratio). `on_progress(done, total, frame_id)` is called before each
-/// calibration frame so the caller can emit a stage event.
+/// calibration frame (once both its arms are done) so the caller can emit
+/// a stage event. `run_jobs` runs the 2 x N arm jobs (see [`RunJobs`]).
 ///
 /// Returns `None` — silently, per the review's M3 — when the run is
 /// cancelled mid-measurement, and also when `scratch_dir` cannot be created
@@ -330,7 +331,7 @@ pub fn measure_seeds_calibration(
     ref_models: &[BackgroundModel],
     frames: &[StackFrame],
     indices: &[usize],
-    load_fits: &dyn Fn(usize) -> Vec<Vec<StarFit>>,
+    load_fits: &(dyn Fn(usize) -> Vec<Vec<StarFit>> + Sync),
     cfg: &LocalNormalizationConfig,
     scale_px: u32,
     measure: &MeasureOptions,
@@ -339,7 +340,8 @@ pub fn measure_seeds_calibration(
     scratch_dir: &Path,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
-    on_progress: &dyn Fn(usize, usize, i64),
+    on_progress: &(dyn Fn(usize, usize, i64) + Sync),
+    run_jobs: &RunJobs<'_>,
 ) -> Option<CalibrationMeasurement> {
     let channels = reference.planes.len();
     if let Err(e) = std::fs::create_dir_all(scratch_dir) {
@@ -355,59 +357,84 @@ pub fn measure_seeds_calibration(
     let _scratch = ScratchDir(scratch_dir);
 
     let mut ratios: Vec<Vec<f64>> = vec![Vec::with_capacity(indices.len()); channels];
-    let mut frame_ids: Vec<i64> = Vec::with_capacity(indices.len());
+    // Recorded whether or not a frame's two arms go on to produce a ratio:
+    // `frame_ids` is the SAMPLE, and the sample is what the group's
+    // `ln_calibration` hash keys on. A frame that failed is still one the
+    // measurement asked about.
+    let frame_ids: Vec<i64> = indices
+        .iter()
+        .filter_map(|&i| frames.get(i).map(|f| f.frame_id))
+        .collect();
     let total = indices.len();
     // Tags every event of the throwaway arms, so a log reader can tell them from
     // the main pass's own "ln relative scale" events.
-    let _span = tracing::debug_span!("ln_seeds_calibration").entered();
-    for (done, &i) in indices.iter().enumerate() {
+    let span = tracing::debug_span!("ln_seeds_calibration");
+
+    // Job j = frame `indices[j / 2]`, arm `j % 2` (0 seeds, 1 detection).
+    // Each frame's progress ticks once, when its second arm lands.
+    let arms_done: Vec<std::sync::atomic::AtomicU8> = (0..total)
+        .map(|_| std::sync::atomic::AtomicU8::new(0))
+        .collect();
+    let frames_done = std::sync::atomic::AtomicUsize::new(0);
+    let job = |j: usize| -> Option<super::LnFrameOutcome> {
         if cancel.load(AtomicOrdering::Relaxed) {
             return None;
         }
+        let slot = j / 2;
+        let frame = frames.get(indices[slot])?;
+        let _in = span.enter();
+        let outcome = if j % 2 == 0 {
+            let fits = load_fits(indices[slot]);
+            let out = run_arm(
+                reference,
+                reference_for_detection,
+                ref_models,
+                frame,
+                LnScaleSeeds::Measured(&fits),
+                cfg,
+                scale_px,
+                measure,
+                interpolation,
+                clamping,
+                &scratch_dir.join(format!("seeds-{}.athln", frame.frame_id)),
+                pool,
+                cancel,
+            );
+            drop(fits);
+            out
+        } else {
+            run_arm(
+                reference,
+                reference_for_detection,
+                ref_models,
+                frame,
+                LnScaleSeeds::ForcedDetection,
+                cfg,
+                scale_px,
+                measure,
+                interpolation,
+                clamping,
+                &scratch_dir.join(format!("detect-{}.athln", frame.frame_id)),
+                pool,
+                cancel,
+            )
+        };
+        if arms_done[slot].fetch_add(1, AtomicOrdering::SeqCst) == 1 {
+            let done = frames_done.fetch_add(1, AtomicOrdering::SeqCst);
+            on_progress(done, total, frame.frame_id);
+        }
+        outcome
+    };
+    let mut outcomes = run_jobs(2 * total, &job);
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return None;
+    }
+    outcomes.resize_with(2 * total, || None);
+
+    for (slot, &i) in indices.iter().enumerate() {
         let Some(frame) = frames.get(i) else { continue };
-        // Recorded whether or not its two arms go on to produce a ratio:
-        // `frame_ids` is the SAMPLE, and the sample is what the group's
-        // `ln_calibration` hash keys on. A frame that failed is still one
-        // the measurement asked about.
-        frame_ids.push(frame.frame_id);
-        on_progress(done, total, frame.frame_id);
-
-        let fits = load_fits(i);
-        let seeds_outcome = run_arm(
-            reference,
-            reference_for_detection,
-            ref_models,
-            frame,
-            LnScaleSeeds::Measured(&fits),
-            cfg,
-            scale_px,
-            measure,
-            interpolation,
-            clamping,
-            &scratch_dir.join(format!("seeds-{}.athln", frame.frame_id)),
-            pool,
-            cancel,
-        );
-        drop(fits);
-        if cancel.load(AtomicOrdering::Relaxed) {
-            return None;
-        }
-        let detected_outcome = run_arm(
-            reference,
-            reference_for_detection,
-            ref_models,
-            frame,
-            LnScaleSeeds::ForcedDetection,
-            cfg,
-            scale_px,
-            measure,
-            interpolation,
-            clamping,
-            &scratch_dir.join(format!("detect-{}.athln", frame.frame_id)),
-            pool,
-            cancel,
-        );
-
+        let detected_outcome = outcomes[2 * slot + 1].take();
+        let seeds_outcome = outcomes[2 * slot].take();
         match (seeds_outcome, detected_outcome) {
             (Some(seeds), Some(detected)) => {
                 for (channel, bucket) in ratios.iter_mut().enumerate() {
@@ -450,6 +477,23 @@ pub fn measure_seeds_calibration(
         frame_ids,
         channels: calibration_k(&ratios),
     })
+}
+
+/// Runs `n` independent arm jobs (job `j` = `job(j)`) and returns their
+/// results BY JOB INDEX, however many run at once and in whatever order.
+pub type RunJobs<'a> = dyn Fn(
+        usize,
+        &(dyn Fn(usize) -> Option<super::LnFrameOutcome> + Sync),
+    ) -> Vec<Option<super::LnFrameOutcome>>
+    + Sync
+    + 'a;
+
+/// A serial executor: jobs in index order on the calling thread.
+pub fn run_jobs_serial(
+    n: usize,
+    job: &(dyn Fn(usize) -> Option<super::LnFrameOutcome> + Sync),
+) -> Vec<Option<super::LnFrameOutcome>> {
+    (0..n).map(job).collect()
 }
 
 /// Removes the scratch directory when the measurement returns, whichever

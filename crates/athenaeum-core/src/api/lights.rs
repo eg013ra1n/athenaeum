@@ -1265,6 +1265,44 @@ mod tests {
         assert_eq!(card_str(&cards, "INSTRUME").as_deref(), Some("TestCam"));
     }
 
+    /// Task 13c D1: the copy-through cards come back in keyword order, identical
+    /// across calls (a HashMap's per-map seed used to shuffle them), with the
+    /// column-derived Bayer cards sorted in too (this header has no BAYERPAT).
+    #[test]
+    fn source_cards_are_keyword_sorted_and_deterministic() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let file_id = 1 + 1_000_000;
+        seed_header_and_bayer(
+            &conn,
+            file_id,
+            "INSTRUME= 'TestCam'\nEXPTIME = 120.0\nGAIN    = 100\nOFFSET  = 50\nFILTER  = 'Ha'\nOBJECT  = 'M42'\nTELESCOP= 'Scope'\nCCD-TEMP= -10.0\nEND",
+            Some("RGGB"),
+            Some(0),
+            Some(1),
+            Some("TOP-DOWN"),
+        );
+        let seq = |cards: &[Card]| -> Vec<(String, String)> {
+            cards
+                .iter()
+                .map(|c| (c.keyword.clone(), format!("{:?}", c.value)))
+                .collect()
+        };
+        let a = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
+        let b = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
+        assert!(
+            card_str(&a, "BAYERPAT").is_some(),
+            "column-derived Bayer cards present"
+        );
+        assert!(a.len() > 8);
+        assert_eq!(seq(&a), seq(&b), "two calls must agree card for card");
+        assert!(
+            a.windows(2).all(|w| w[0].keyword <= w[1].keyword),
+            "source cards must be keyword-sorted"
+        );
+    }
+
     /// Precedence: whatever the file's own header declared wins. The column is
     /// a fallback for a silent blob, not an override of a present card.
     #[test]

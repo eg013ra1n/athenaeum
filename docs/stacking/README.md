@@ -3574,3 +3574,94 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       nebulae +-11-12 %; not 13b's. (4) The **knot exemption** in `seeds.rs` reads the same plane-max band pre-fit
       (pre-existing, Task 10c). (5) A not-bit-identical rustafits item (the per-cell quickselect permutation feeds the
       mean sum, about -0.15 s per plane). (6) `minStars` reads `stars_fitted` as before; no settings change.
+
+  - **R-OSP-13 - parallelism: each machine used to the full of what it has, every number unchanged (Plan A Task 13c;
+    branch `one-star-path-t13c`, final code head 23b81727; research note
+    `docs/superpowers/research/2026-10-18-task-13c-parallelism.md`; lab `star-lab/results/plan-a/{t13c,t13c-runner}/`).**
+    *The bar and how it ended.* The owner asked for full use of every machine ("подобрано под машину, но так чтобы
+    утилизировать все доступное") and set the bar as the WHOLE run faster than the ERP's whole run on the same frames,
+    machine and work. **Met on the runner** (M4 Max, 12 P + 4 E, 128 GiB): Horse C11, 164 lights, 317 s against the ERP's
+    2 787.6 s = 8.8× (Step 5, H a7d18865 377 s). **Not met on the dev Mac** (M4, 4 P + 6 E, 16 GiB): set 204 1237.7 →
+    1105.5 s at b296dbc4 and **1081 s at the final head** (Step 5, H a7d18865 1170 s, N/H 0.923) against the ERP's 1005 s
+    (+76 s: Measure +404 s is the gap). Dev Mac Horse C11 535 → 388 s (0.725). Step 5's two set 204 stages above 1
+    (calibrate 1.029, register 1.018, 2 rounds) are bracket noise by Fable's ruling (`task-13c-ruling-fable-step5.md`); the
+    Calibrate peak (3.88 GiB on a 4 GiB budget, swap 0) is L1's admission by construction. The
+    rest of the gap goes to the fast-measurement cycle, below. Every lever is bit-identical by construction or by proof,
+    and no artifact layout, cache hash, command or `ts_export` field changed.
+    - **The rulings.**
+      1. **Results land by index.** `fan_out` workers pull from one FIFO; a result lands at its item's index and commits
+         in today's group-then-frame order. Nothing on the stacking path reads the thread count. The `AdmissionGate`
+         retires a worker before its next pull and only ever lowers the count. `fan_out_groups` orders a merged queue by
+         (working set desc, group, item) and scatters results back per group in item order. L17's jobs land at
+         2 · slot + arm.
+      2. **Admission comes from measured working sets**: `clamp((budget − shared) / working_set, 1, pool)`. In planes
+         of one f32 channel: Calibrate mono 3 / debayered OSC 5 (`CALIBRATE_PLANES_RESIDENT_*`, measured, was 8), Measure
+         8, Register 4 mono / 6 OSC, Normalize 8 (+ 3 masked). The L17 seeds arms use the Normalize working set.
+         Integrate and Drizzle keep their own budgets (`integration.band_budget_mb`; Drizzle total / 2 plus L2's one
+         prefetch plane).
+      3. **Groups share one queue only when it lowers nobody.** `merged_admission` merges when at least two groups
+         have jobs and the one queue's admission (largest working set, summed shared bytes) is ≥ every group's own;
+         otherwise the per-group queues stay. Merged: Calibrate and Measure pass 1. Measure pass 2 stays per group,
+         because the group β is a real barrier.
+      4. **The budget is read per fan-out** (`fan_budget` before each one, not once per stage). The gate's live read is
+         rate-limited to 1 s and goes through `try_conn`; an unreadable budget keeps the current target and never guesses.
+      5. **Band prefetch for stacking only.** `IoPolicy::prefetch_local` is set at the one stacking resolve, which feeds
+         Integrate and the LN reference build: prefetch plus a halved band on every storage class. Master builds keep
+         network-only prefetch (unchanged, unmeasured). The Drizzle read-ahead (L2) falls back to serial when its extra
+         plane would cross the R-M3-7 ceiling or a thread cannot be spawned.
+      6. **The owner bar (2026-10-17).** A lever lands when it is bit-identical, swaps no more than H in any stage, and
+         is faster beyond its interleaved bracket's spread on one machine with no regression on the other. Under 1 % of
+         the run at medium or high cost → recorded, not merged (L4b).
+      7. **The system allocator stays** (owner: «оставь системные контроли памяти, ос лучше знает»). The stage-to-stage
+         carry-over is freed-but-retained heap (`Malloc Large (empty)`), which the OS reclaims under pressure. jemalloc
+         removed it and every swap, and was reverted (afb87500). The relief call (`malloc_zone_pressure_relief` on macOS,
+         `malloc_trim` on Linux) and the 4a-0 memory telemetry stay.
+    - **Discovery and the budget** (`services/machine.rs`, probed once). Logical CPUs, P / E cores (macOS perflevels,
+      Linux `cpu_core` / `cpu_atom` or capacity, Windows EfficiencyClass), the cgroup v1 / v2 or Windows job CPU quota,
+      memory total / limit, and the available memory read live. The image pool is `RAYON_NUM_THREADS`, else the logical
+      CPUs, or the quota when it binds; the 16-thread cap is gone. The budget is the KV `compute.memory_budget_mb`
+      (Settings → Stacking → **Compute**, "Frame memory budget (MB)"): 0 = auto = a quarter of the memory the process may
+      use (the cgroup / job limit when below physical memory). A larger value is clamped to that memory
+      (`budget_why = "setting-clamped"`, one `warn!` per value), and `1` is valid (one frame in flight). Logged at info
+      as `compute budget resolved` (each host, at start) and `stacking budget` (each run).
+    - **Environment.** `RAYON_NUM_THREADS=<n>` sizes the image pool on both hosts (and rayon's global pool) and
+      overrides discovery (`pool_why = "env"`; anything but a positive integer warns and sizes automatically).
+      `ATHENAEUM_TOKEN_STORE=file` keeps a release build's hub token in the 0600 file, off the OS keychain. It is logged
+      once at the first account call ("token store: file only"); any other value warns and is ignored. Debug builds are
+      always file-only. The lab's `server.sh` and `star-lab-mono-run.sh` set it, so a rebuilt ad-hoc-signed server never
+      raises a keychain prompt. `ATH_VMMAP_DIAG=1` (macOS, dev only) writes `vmmap --summary` at every stage start
+      (`docs/logging/README.md`).
+    - **Telemetry** (timing only; fields in the logging spec's Task 13c entries). `stacking stage started` /
+      `stacking stage telemetry` (wall, CPU, P-CPU, runnable, cores busy, serial / full / gap ms, peaks, min available,
+      swap delta, disk bytes; Linux PSI), a debug `stacking telemetry sample` every second, `fan-out finished` (items,
+      admission, workers, tail, idle workers), `fan-out admission lowered`, the debug `cross-group queue decision`,
+      `memory relief` and `memory checkpoint`. Every `Option` is logged as `-1`. `read_ms` changed meaning in L2 / L3
+      (spec note).
+    - **The measured gains** (median of 3, interleaved). **L1**, Calibrate working sets + a parallel distinct-master
+      decode (13c11124): hc11 dev Mac 184.8 → 79.8 s (admission 1 → 4); 12 GiB container 23.3 → 12.8 s; set 204 and the
+      runner level (disk-bound mono; admission already 16). **L17**, the seeds-calibration arms through one fan-out
+      (ec547c3a): runner group L Normalize 27.9 → 22.8 s; dev Mac set 204 136.8 → 125.8 s. **L4a / L4c**, one queue across
+      groups (2c5bd1ba, r1 da0837ed): runner Calibrate + Measure + Register 154.7 → 149.2 s (tails 31 / 27 → 6–8 %); dev Mac
+      level. **4d**, the windowed residual median in `medfit_line`'s `rofunc` (d4535980, r1 b296dbc4; proof and
+      measured-out variants in `combine.rs`): runner Integrate 98.6 → 79.2 s, CPU 1 504 → 1 194 s. **L3**, Integrate band
+      prefetch on local storage (f3859de6, scoped in 23b81727): set 204 189.6 → 172.2 s, peak 6.79 → 5.89 GiB. **L2**,
+      Drizzle reads frame i+1 while frame i deposits (bb240c05): set 204 86.4 → 70.8 s. **Whole runs:** runner Horse C11
+      377 → 317 s (0.841); the container subset 117.6 → 105.0 s with no OOM. Identity PASS in every bracket.
+    - **Determinism.** The matrix (pool 1 / 4 / 10 / 16 / 24, admission 1, band 256 MiB, a mid-run cap drop, pool 16 vs 16
+      across processes) passed on both machines at a7d18865 and on the runner at b296dbc4 (the dev Mac at the final
+      head: PASS (lab d7a5029: pool1, pool16, adm1, capdrop — admission lowered seen —, band256, pool10r vs pool10, 791 files each, 0 differing / 0 missing)). Its one finding, D1, was
+      pre-existing: `source_cards_for_file` copied calibrated-header cards in `HashMap` order. They are now keyword-sorted
+      (9486bf48). `.athm` is exempt from the byte compare by design (source mtime, pass-1 timings).
+    - **Recorded, not landed** (numbers in the note; do not re-propose without new ones). jemalloc (owner). M2 / M3: the
+      LN shared set is +83…+295 MiB once the retained heap is gone. L4b, one Register align queue: −1.2 s = 0.3 % of the
+      runner run, dev Mac falls back; reverted 28be0f3e. L15, admission above the pool: ≤ 2 s after L4. L5, drizzle bands
+      ≥ 4 × pool: 0.4 % of the run, needs an R-TA-10 proof. L6 (subsumed). L7, the Settings thread cap: deferred, no
+      machine has > 16 CPUs. L8 – L13: no concurrent job, Measure 8 planes, CPU-bound reads, keep the E cores (r_E 0.25 /
+      0.29), SIMD a note. L16: +1.25 GB on a 6.62 GiB Drizzle peak, refused on 16 GB. 4d's variants: an insertion-
+      repaired permutation 1.27–4.57×, `total_cmp` alone 0.95–0.99×, partition bounds 1.04–1.18×.
+    - **Carries.** (1) The **fast-measurement cycle** (owner order: 13c → it → Task 14): `measurement.fitStars` (All | K
+      brightest, default All) shipped only past a truth bar, beside a GPU prototype per `task-13c-report-research-gpu.md`
+      and its Fable review (Kernel 2 measured first; the verdict fits stay on the CPU). (2) The Normalize swap watch: one
+      b296dbc4 run swapped 911 MB there, and Step 5's interleaved H / N decides. (3) The master-build prefetch,
+      unmeasured. (4) The Linux, macOS 11–12 and Windows discovery paths are tested only through their parsers; no x86
+      SIMD run.

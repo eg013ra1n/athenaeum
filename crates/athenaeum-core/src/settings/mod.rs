@@ -87,6 +87,10 @@ pub mod defaults {
     // physical RAM, clamped) — see integration::band_budget.
     pub const INTEGRATION_BAND_BUDGET_MB: &str = "0";
 
+    // Memory budget the stacking fan-out admission divides by, MB. 0 = auto
+    // (a quarter of the memory this process may use) — see services::machine.
+    pub const COMPUTE_MEMORY_BUDGET_MB: &str = "0";
+
     // The container a NEW calibration master is written in. A rebuild
     // ignores this — it keeps the container its file already has.
     pub const CALIBRATION_MASTER_FORMAT: &str = "fits";
@@ -202,6 +206,10 @@ pub mod defaults {
             (
                 super::keys::INTEGRATION_BAND_BUDGET_MB,
                 INTEGRATION_BAND_BUDGET_MB,
+            ),
+            (
+                super::keys::COMPUTE_MEMORY_BUDGET_MB,
+                COMPUTE_MEMORY_BUDGET_MB,
             ),
             (
                 super::keys::INTEGRATION_READ_CONCURRENCY,
@@ -340,6 +348,7 @@ pub mod keys {
     /// Banded-integration working-memory budget, MB. `0` = auto (a quarter of
     /// physical RAM, clamped by `integration::band_budget`).
     pub const INTEGRATION_BAND_BUDGET_MB: &str = "integration.band_budget_mb";
+    pub const COMPUTE_MEMORY_BUDGET_MB: &str = "compute.memory_budget_mb";
 
     /// Reads kept in flight per integration. `0` = auto (from the storage
     /// class — see `integration::storage_class`).
@@ -673,6 +682,32 @@ impl SettingsManager {
         }))
     }
 
+    /// Configured stacking memory budget in MB (`compute.memory_budget_mb`).
+    /// `0` is the auto sentinel. Unparseable degrades to auto, logged first
+    /// — same stance as `get_integration_band_budget_mb`.
+    pub fn get_compute_memory_budget_mb(&self, conn: &Connection) -> Result<u64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::COMPUTE_MEMORY_BUDGET_MB,
+            defaults::COMPUTE_MEMORY_BUDGET_MB,
+        )?;
+        Ok(value.parse().unwrap_or_else(|_| {
+            // The admission gate and every `fan_budget` read this setting, so
+            // warn once per distinct bad value, not once per read.
+            static LAST_BAD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());
+            if last.as_deref() != Some(value.as_str()) {
+                tracing::warn!(
+                    key = keys::COMPUTE_MEMORY_BUDGET_MB,
+                    value = %value,
+                    "unparseable setting value — falling back to auto"
+                );
+                *last = Some(value.clone());
+            }
+            0
+        }))
+    }
+
     /// The container a NEW calibration master is written in — `fits` or
     /// `xisf`, read once per build (`api::masters::run_build`). A rebuild
     /// never calls this: it keeps the container its own file already has
@@ -829,6 +864,7 @@ mod tests {
             keys::CALIBRATION_MASTER_FORMAT,
             keys::COMPUTE_MAX_CONCURRENT,
             keys::INTEGRATION_BAND_BUDGET_MB,
+            keys::COMPUTE_MEMORY_BUDGET_MB,
             keys::SYNC_MAX_CONCURRENT_RECEIVES,
             keys::UPDATES_AUTO_CHECK,
             keys::FLAT_CONTOUR_CONTOURS,

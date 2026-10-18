@@ -10,7 +10,6 @@ use super::io_policy::IoPolicy;
 use super::registered_source::RegisteredSource;
 use super::source::{FrameSource, RejectionBitSink, RejectionBitSource};
 use super::stats::NormalizationPair;
-use super::storage_class::StorageClass;
 use super::IntegrationError;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -197,29 +196,38 @@ struct BandStats {
 
 /// The rows per band `band_loop` will actually use for this source/policy.
 ///
-/// Fix wave (whole-branch review, item 1): the halving below — and the
-/// prefetch it exists for — is now gated on `StorageClass::Network`. On a
-/// local SSD what `band_loop` calls a band "read" is a CPU-bound warp, not
-/// an I/O wait (compute audit §1): overlapping it with the combine on the
-/// SAME pool bought nothing, and the halved bands cost real margin —
-/// smaller bands mean more of them, and each one re-reads the per-frame
-/// header/probe overhead. On network storage the read genuinely is
-/// latency-bound, so keeping two bands resident (the current one combining,
-/// the next one being prefetched) is the point, and halving keeps peak
-/// memory at the pre-task figure. Fix round 1, Important finding 1: this
-/// used to be computed independently (and un-halved) by the flat's pass-1
-/// forecast and the rejection-map scratch cap, so both drifted out of step
-/// with what `band_loop` actually does the moment the halving landed — a
-/// flat build's "band N of M" doubled M mid-run, and the no-maps scratch
-/// pair over-allocated ~2x. Extracted here so the three call sites (this
-/// one, the flat forecast, the scratch cap) share one number, gated the
-/// same way, and can never drift apart again.
+/// Half the band budget when the policy prefetches (`IoPolicy::prefetches`),
+/// the whole budget otherwise. A prefetching loop keeps two bands resident
+/// (the current one combining, the next one being read), and
+/// `band_rows_for_budget` already charges one band plus its scratch against
+/// the WHOLE budget, so two full bands never fit it; halving keeps the peak
+/// at the single-band figure.
+///
+/// History. Perf tier 1 Task 1 introduced the prefetch and the halving for
+/// every class. The first fix wave (whole-branch review, item 1) then gated
+/// both on `StorageClass::Network`: on a local SSD what `band_loop` called a
+/// band "read" was a CPU-bound warp (compute audit section 1), so
+/// overlapping it with the combine on the SAME pool bought nothing, and the
+/// smaller bands cost margin. Task 13c L3 ungated it for the STACKING run
+/// only (`IoPolicy::prefetch_local`, set by `stacking::run`): since the
+/// registered frame became a required artifact a band read is a positional
+/// file read (`read_rows_with_scratch`, readers opened once), i.e. an I/O
+/// wait: the dev Mac curves show a 1-s dip to 0.5-0.8 cores at every band
+/// boundary (about 19 s of a 237 s run on set 204, 8 s of 119 s on hc11),
+/// exactly what a prefetch hides. Halving is measured nearly free: the
+/// 16x-more-bands arm (band256) ran Integrate 15.6 s against 15.4 / 17.6 s
+/// and passed identity. The calibration-library master builds keep the
+/// network-only gate (final review B, I1): nobody measured them with it and
+/// their raw sets often sit on USB / HDD, where a second concurrent pread
+/// stream means more seeks.
+///
+/// Fix round 1, Important finding 1: this used to be computed independently
+/// (and un-halved) by the flat's pass-1 forecast and the rejection-map
+/// scratch cap, so both drifted out of step with what `band_loop` actually
+/// does. The three call sites (the band loop, the flat forecast, the scratch
+/// cap) share this one number so they can never drift apart again.
 fn loop_band_rows<S: FrameSource + ?Sized>(src: &S, io: IoPolicy) -> usize {
-    let budget = if matches!(io.storage, StorageClass::Network) {
-        io.band_budget_bytes / 2
-    } else {
-        io.band_budget_bytes
-    };
+    let budget = if io.prefetches() { io.band_budget_bytes / 2 } else { io.band_budget_bytes };
     src.band_rows_for_budget(budget).max(1).min(src.height())
 }
 
@@ -252,14 +260,12 @@ fn band_loop<S: FrameSource + ?Sized>(
     // total than this once `integrate_flat_inner` wraps it with pass 1.
     let per_row_bytes = src.bytes_per_row();
     let bytes_total = (h * per_row_bytes) as u64;
-    // Fix wave item 1: whether this run overlaps the next band's read with
-    // the current band's combine at all — see `loop_band_rows`'s doc for
-    // the reasoning. When false, the loop below runs the pre-tier-1 shape:
-    // read band N, then combine band N, with `has_next` forced false so the
-    // scoped thread never spawns and `next` is never read. The
-    // double-buffer machinery (`cur`/`next`, the swap at the loop's end)
-    // stays in place either way so both shapes share one implementation.
-    let prefetch = matches!(io.storage, StorageClass::Network);
+    // Whether this run overlaps the next band's read with the current band's
+    // combine at all (`IoPolicy::prefetches`; `loop_band_rows`'s doc). When
+    // false the loop runs the serial shape: read band N, then combine band N,
+    // with `has_next` forced false so no thread spawns and `next` is never
+    // read. A refused thread (below) degrades a prefetching run the same way.
+    let prefetch = io.prefetches();
     let mut cur = BandPlanes::new(src);
     let mut next = BandPlanes::new(src);
     let read_duration = std::sync::Mutex::new(std::time::Duration::ZERO);
@@ -332,9 +338,8 @@ fn band_loop<S: FrameSource + ?Sized>(
         let next_rows = band_rows.min(h.saturating_sub(next_y0));
 
         if !prefetch {
-            // No overlap on this run (see `loop_band_rows`'s doc): this IS
-            // band N's own read, done synchronously before its combine
-            // below — the pre-tier-1 shape.
+            // No overlap on this run: this IS band N's own read, done
+            // synchronously before its combine below.
             bytes_read += read_one(band_idx, y0, rows, &mut cur)?;
             if cancel.load(Ordering::Relaxed) {
                 return Err(IntegrationError::Cancelled);
@@ -354,7 +359,11 @@ fn band_loop<S: FrameSource + ?Sized>(
         let combine_result: Result<(), IntegrationError>;
         let prefetch_result: Option<Result<u64, IntegrationError>>;
         {
-            let next_ref = &mut next;
+            // The next band's buffer rides in a slot so a refused prefetch
+            // thread (which never runs its closure) leaves it for the
+            // synchronous fallback below.
+            let next_slot = std::sync::Mutex::new(Some(&mut next));
+            let next_slot = &next_slot;
             let read_one = &read_one;
             // Fix round 1, Important finding 2: snapshot the high-water mark
             // ONCE, before the prefetch thread (if any) starts touching it
@@ -372,14 +381,30 @@ fn band_loop<S: FrameSource + ?Sized>(
             // This snapshot needs zero lock traffic per tick and is
             // monotone across bands by construction: the NEXT band's
             // snapshot is taken only after THIS band's prefetch (if any)
-            // has already been folded into `bytes_reported` below. When
-            // `prefetch` is false this is simply the bytes through this
-            // band's own read, just completed above.
+            // has already been folded into `bytes_reported` below. On the last
+            // band (no next read) this is simply the bytes through this
+            // band's own read.
             let bytes_at_band_start = *bytes_reported.lock().unwrap();
             let (c, p) = std::thread::scope(|scope| {
-                let prefetch_handle = has_next.then(|| {
-                    scope.spawn(move || read_one(band_idx + 1, next_y0, next_rows, next_ref))
-                });
+                // A refused OS thread must not fail the run: warn and read the
+                // next band synchronously after this band's combine instead.
+                let prefetch_handle = if has_next {
+                    match std::thread::Builder::new()
+                        .name("band-prefetch".into())
+                        .spawn_scoped(scope, || {
+                            let into = next_slot.lock().unwrap().take().expect("next band buffer taken once");
+                            read_one(band_idx + 1, next_y0, next_rows, into)
+                        })
+                    {
+                        Ok(h) => Some(h),
+                        Err(e) => {
+                            tracing::warn!(error = %e, band = band_idx + 2, "band prefetch thread refused, reading the next band synchronously");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let t_combine = std::time::Instant::now();
                 let out_band = &mut out[y0 * w..(y0 + rows) * w];
                 let tick = || {
@@ -399,7 +424,14 @@ fn band_loop<S: FrameSource + ?Sized>(
                 };
                 let c = pool.install(|| combine(BandJob { planes: &cur, out_band, y0, rows, width: w }, &tick));
                 combine_duration += t_combine.elapsed();
-                let p = prefetch_handle.map(|j| j.join().expect("band prefetch thread panicked"));
+                let p = match prefetch_handle {
+                    Some(j) => Some(j.join().expect("band prefetch thread panicked")),
+                    None if has_next => {
+                        let into = next_slot.lock().unwrap().take().expect("next band buffer still held");
+                        Some(read_one(band_idx + 1, next_y0, next_rows, into))
+                    }
+                    None => None,
+                };
                 (c, p)
             });
             combine_result = c;
@@ -1735,7 +1767,7 @@ fn integrate_flat_inner(
     // Deliberately the UN-halved budget: this pass reads and sums one band
     // at a time with no double buffering, so it never needs the prefetch
     // `loop_band_rows` sizes for — that halving applies only inside
-    // `band_loop` (pass 2, below), and only on network storage.
+    // `band_loop` (pass 2, below).
     let band_rows = src.band_rows_for_budget(io.band_budget_bytes).min(cy1 - cy0);
     let mut planes = BandPlanes::new(&src);
     // Computed once, next to `band_rows` — pass 1 only ever reads the
@@ -1880,18 +1912,16 @@ mod tests {
 
     /// Every engine test cares about the memory budget only; concurrency and
     /// storage class are Task 6's concern, so this fixes them to an arbitrary
-    /// valid value. `Local` (the un-gated default) — most of this module's
-    /// tests pin the pre-tier-1 serial shape, which is exactly what a local
-    /// build runs since the fix wave gated the prefetch on network storage.
+    /// valid value. `Local` with `prefetch_local` (the stacking run's policy,
+    /// Task 13c L3): prefetch and the halved band apply, like `Network`.
     fn io(band_budget_bytes: usize) -> IoPolicy {
-        IoPolicy { band_budget_bytes, read_concurrency: 1, storage: StorageClass::Local }
+        IoPolicy { band_budget_bytes, read_concurrency: 1, storage: StorageClass::Local, prefetch_local: true }
     }
 
-    /// Same as `io`, but `Network` — for the tests that specifically pin the
-    /// band-prefetch/double-buffer behaviour, which the fix wave gated on
-    /// network storage (`loop_band_rows`'s doc).
+    /// Same as `io`, but `Network` — kept for the tests that pin the
+    /// band-prefetch/double-buffer behaviour on network storage.
     fn io_network(band_budget_bytes: usize) -> IoPolicy {
-        IoPolicy { band_budget_bytes, read_concurrency: 1, storage: StorageClass::Network }
+        IoPolicy { band_budget_bytes, read_concurrency: 1, storage: StorageClass::Network, prefetch_local: false }
     }
 
     fn write(dir: &std::path::Path, name: &str, w: usize, h: usize, f: impl Fn(usize, usize) -> f32) -> std::path::PathBuf {
@@ -2265,9 +2295,9 @@ mod tests {
         let on_band = nop();
         // band_rows_for_budget's per-row cost is sum(width * bytes_per_sample
         // over every frame) + width*8 headroom = 3*32*4 + 32*8 = 384 + 256 =
-        // 640; budget 12_800 -> band_rows = 12_800/640 = 20 exactly, so the
-        // 48-row image runs as 20/20/8-row bands. `io()` is `Local`, so the
-        // fix wave's network-only gate leaves this budget un-halved.
+        // 640; budget 25_600 halves (every class) to 12_800 -> band_rows =
+        // 12_800/640 = 20 exactly, so the 48-row image runs as 20/20/8-row
+        // bands.
         let out = integrate_bias_like(
             &paths,
             IntegrationRecipe::median(Rejection::None),
@@ -2275,7 +2305,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band, on_combine: &nop() },
-            io(12_800),
+            io(25_600),
         )
         .unwrap();
         assert_eq!(out.band_rows, 20, "budget math must give exactly 20-row bands here");
@@ -2351,6 +2381,7 @@ mod tests {
             band_budget_bytes: MIN_BUDGET_BYTES,
             read_concurrency: 16,
             storage: StorageClass::Local,
+            prefetch_local: true,
         };
         integrate_bias_like_inner(
             &paths,
@@ -2465,6 +2496,7 @@ mod tests {
             band_budget_bytes: 2 * (w * 4 * 64),
             read_concurrency: 1,
             storage: StorageClass::Network,
+            prefetch_local: false,
         };
         let mut out = vec![0f32; w * h];
         let calls: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -2659,10 +2691,10 @@ mod tests {
     /// reports on `cur >= 1` calls) — both must come from `loop_band_rows`,
     /// the one function shared since this fix. `io(1)` (used by the sibling
     /// test above) floors both to a single row either way, which is exactly
-    /// what hid the pre-fix drift; this uses `io_network` (fix wave: the
-    /// halving `loop_band_rows` applies is now gated on `StorageClass::
-    /// Network`, and this test exists specifically to pin that the forecast
-    /// and `band_loop` never drift apart when it fires) with the SAME
+    /// what hid the pre-fix drift; this uses the `Local` `io` (since Task 13c L3
+    /// the halving `loop_band_rows` applies is not gated on the storage
+    /// class; this test pins that the forecast and `band_loop` never drift
+    /// apart under it) with the SAME
     /// multi-band budget the geometry pin two tests up already established
     /// gives 3 bands (20+20+8 rows) post-halving.
     #[test]
@@ -2686,7 +2718,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band, on_combine: &nop() },
-            io_network(25_600), // -> pass 2 band_rows 20 (post-halving), 3 bands: 20+20+8
+            io(25_600), // -> pass 2 band_rows 20 (post-halving), 3 bands: 20+20+8
         )
         .unwrap();
         let calls = calls.into_inner().unwrap();
@@ -3628,7 +3660,7 @@ mod tests {
                 on_band: &nop(),
                 on_combine: &nop(),
             },
-            io(4096),
+            io(8192),
         )
         .unwrap();
         assert_eq!(
@@ -4089,15 +4121,46 @@ mod tests {
         }
     }
 
+    /// Task 13c L3: the same bit-identity pin on a `Local` policy, which
+    /// now halves the band and prefetches too: a many-band run equals a
+    /// single-band run, and the band count is the halved one.
+    #[test]
+    fn local_policy_halved_prefetched_bands_equal_a_single_band_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (64, 512);
+        let paths: Vec<_> = (0..6)
+            .map(|i| write(dir.path(), &format!("l{i}.fits"), w, h, move |x, y| (x * 3 + y * 7 + i * 11) as f32 * 0.01))
+            .collect();
+        let on_band = nop();
+        let run = |budget: usize| {
+            integrate_bias_like(
+                &paths,
+                IntegrationRecipe::median(Rejection::None),
+                &pool(),
+                dir.path(),
+                &AtomicBool::new(false),
+                EngineProgress { on_band: &on_band, on_combine: &nop() },
+                io(budget),
+            )
+            .unwrap()
+        };
+        let single = run(usize::MAX / 4);
+        // Same arithmetic as the Network sibling: the halved budget lands
+        // on 2-row bands, so 256 bands.
+        let many = run(4 * (6 * w * 4 + 8 * w));
+        assert_eq!(many.band_rows, 2, "Local must run the halved band");
+        assert_eq!(many.bands, 256);
+        assert_eq!(single.data, many.data, "Local prefetch changed the output");
+    }
+
     /// Perf tier 1 Task 1, fix wave triage item 12 (renamed from
     /// `band_prefetch_overlaps_read_and_combine_without_changing_the_
     /// output`, whose name and docstring claimed a wall-clock overlap this
     /// test never actually asserts — see the ruling in the body below):
     /// with a network-storage budget that forces many (prefetching) bands,
     /// the output must equal a single-band run's, bit for bit. Uses
-    /// `io_network` — the fix wave gated the prefetch this test exists to
-    /// exercise on `StorageClass::Network`, so `io`'s `Local` default would
-    /// silently turn this into a no-op serial run.
+    /// `io_network`; the `Local` + `prefetch_local` twin is
+    /// `local_policy_halved_prefetched_bands_equal_a_single_band_run`.
     #[test]
     fn band_prefetch_does_not_change_the_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -4120,7 +4183,7 @@ mod tests {
         };
         let single = run(usize::MAX / 4);
         // `io_network` runs this budget through `loop_band_rows`'s
-        // network-only halving (its doc), so 4x the per-2-row-band cost
+        // prefetch halving (its doc), so 4x the per-2-row-band cost
         // here — 4 * (6*64*4 + 8*64) B — lands on 2-row bands once
         // `band_rows_for_budget` sees the halved (2x) figure.
         let many = run(4 * (6 * w * 4 + 8 * w));
@@ -4142,183 +4205,200 @@ mod tests {
         // than a timer.
     }
 
-    /// Perf tier 1 Task 1, deterministic companion to the pin above: band
-    /// N+1's read must START before band N's combine FINISHES. A
-    /// `FrameSource` double logs read start/end under its own mutex; the
-    /// combine closure sleeps a few ms (comfortably longer than the fake
-    /// read's own near-zero cost or any thread-spawn jitter) so the
-    /// ordering is decided by the overlap itself, not by scheduling luck.
-    /// Run against the PRE-task serial loop, this fails: the old code only
-    /// starts band N+1's read after band N's combine has already returned.
+    /// `FrameSource` double for the band-loop ordering pins: logs read and
+    /// combine events under its own mutex and lets a combine WAIT (condvar,
+    /// 10 s deadline) for a named event, so overlap is decided by the event
+    /// itself, never by a sleep race.
+    struct EventSource {
+        width: usize,
+        height: usize,
+        n: usize,
+        events: std::sync::Mutex<Vec<String>>,
+        cv: std::sync::Condvar,
+    }
+    impl EventSource {
+        fn new(width: usize, height: usize, n: usize) -> Self {
+            Self { width, height, n, events: std::sync::Mutex::new(Vec::new()), cv: std::sync::Condvar::new() }
+        }
+        fn note(&self, s: impl Into<String>) {
+            self.events.lock().unwrap().push(s.into());
+            self.cv.notify_all();
+        }
+        /// True if `needle` was logged within the 10 s deadline.
+        fn wait_for(&self, needle: &str) -> bool {
+            let g = self.events.lock().unwrap();
+            let (_g, res) = self
+                .cv
+                .wait_timeout_while(g, std::time::Duration::from_secs(10), |ev| !ev.iter().any(|e| e == needle))
+                .unwrap();
+            !res.timed_out()
+        }
+    }
+    impl FrameSource for EventSource {
+        fn width(&self) -> usize { self.width }
+        fn height(&self) -> usize { self.height }
+        fn frame_count(&self) -> usize { self.n }
+        fn plane_kinds(&self) -> Vec<PlaneKind> { vec![PlaneKind::F32Le; self.n] }
+        fn bytes_per_row(&self) -> usize { self.width * 4 * self.n }
+        fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
+            (budget_bytes / (self.width * 4 * self.n).max(1)).max(1)
+        }
+        fn read_band_with_progress(
+            &self,
+            y0: usize,
+            rows: usize,
+            out: &mut BandPlanes,
+            _concurrency: usize,
+            on_bytes: &(dyn Fn(u64) + Sync),
+            _cancel: &AtomicBool,
+        ) -> Result<(), IntegrationError> {
+            self.note(format!("read start {y0}"));
+            out.set_rows(rows);
+            on_bytes((rows * self.width * 4 * self.n) as u64);
+            self.note(format!("read end {y0}"));
+            Ok(())
+        }
+    }
+
+    /// Runs an 8x8, 2-frame `EventSource` through `band_loop` at a 256 B
+    /// budget (per-row cost 64: halved = 2-row bands / 4 bands, whole =
+    /// 4-row bands / 2 bands). When `expect_overlap`, band 0's combine
+    /// blocks until band 1's read has STARTED (condvar, 10 s deadline),
+    /// which a serial loop can never satisfy; otherwise the combine does not
+    /// wait. Returns the stats and the event log.
+    fn run_event_source(policy: IoPolicy, expect_overlap: bool) -> (BandStats, Vec<String>, bool) {
+        let (w, h) = (8usize, 8usize);
+        let src = EventSource::new(w, h, 2);
+        let band_rows_expected = loop_band_rows(&src, policy);
+        let overlapped = std::sync::atomic::AtomicBool::new(false);
+        let mut out = vec![0f32; w * h];
+        let combine = |job: BandJob<'_>, tick: &(dyn Fn() + Sync)| -> Result<(), IntegrationError> {
+            src.note(format!("combine start {}", job.y0));
+            if expect_overlap && job.y0 == 0 {
+                let next = format!("read start {band_rows_expected}");
+                overlapped.store(src.wait_for(&next), Ordering::SeqCst);
+            }
+            for v in job.out_band.iter_mut() {
+                *v = 0.0;
+            }
+            tick();
+            src.note(format!("combine end {}", job.y0));
+            Ok(())
+        };
+        let stats = band_loop(
+            &src,
+            &pool(),
+            &AtomicBool::new(false),
+            &EngineProgress { on_band: &nop(), on_combine: &nop() },
+            policy,
+            &mut out,
+            &combine,
+        )
+        .unwrap();
+        let events = src.events.into_inner().unwrap();
+        (stats, events, overlapped.load(Ordering::SeqCst))
+    }
+
+    /// Perf tier 1 Task 1, deterministic companion to the pin above, over
+    /// BOTH storage classes that prefetch: `Network` (always) and `Local`
+    /// with `prefetch_local` (the stacking run, Task 13c L3). Band N+1's read
+    /// must START before band N's combine FINISHES — band 0's combine waits
+    /// on that very event, so it is decided by the overlap itself.
     #[test]
     fn band_prefetch_starts_the_next_read_before_the_current_combine_finishes() {
-        struct EventSource {
-            width: usize,
-            height: usize,
-            n: usize,
-            events: std::sync::Mutex<Vec<String>>,
-        }
-        impl EventSource {
-            fn note(&self, s: impl Into<String>) {
-                self.events.lock().unwrap().push(s.into());
-            }
-        }
-        impl FrameSource for EventSource {
-            fn width(&self) -> usize { self.width }
-            fn height(&self) -> usize { self.height }
-            fn frame_count(&self) -> usize { self.n }
-            fn plane_kinds(&self) -> Vec<PlaneKind> { vec![PlaneKind::F32Le; self.n] }
-            fn bytes_per_row(&self) -> usize { self.width * 4 * self.n }
-            fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
-                (budget_bytes / (self.width * 4 * self.n).max(1)).max(1)
-            }
-            fn read_band_with_progress(
-                &self,
-                y0: usize,
-                rows: usize,
-                out: &mut BandPlanes,
-                _concurrency: usize,
-                on_bytes: &(dyn Fn(u64) + Sync),
-                _cancel: &AtomicBool,
-            ) -> Result<(), IntegrationError> {
-                self.note(format!("read start {y0}"));
-                out.set_rows(rows);
-                on_bytes((rows * self.width * 4 * self.n) as u64);
-                self.note(format!("read end {y0}"));
-                Ok(())
-            }
-        }
-
-        let (w, h) = (8usize, 8usize);
-        let src = EventSource { width: w, height: h, n: 2, events: std::sync::Mutex::new(Vec::new()) };
-        // per-row cost = w*4*n = 64; `Network` storage is required here — the
-        // fix wave gates the prefetch this test pins on it — and `band_loop`
-        // then halves the budget it sizes bands against, so 256/2 = 128 ->
-        // band_rows = 2, giving 4 bands (y0 = 0, 2, 4, 6) — enough for a
-        // middle band to prefetch while its predecessor combines.
-        let policy = IoPolicy { band_budget_bytes: 256, read_concurrency: 1, storage: StorageClass::Network };
-        let mut out = vec![0f32; w * h];
-        let combine = |job: BandJob<'_>, tick: &(dyn Fn() + Sync)| -> Result<(), IntegrationError> {
-            src.note(format!("combine start {}", job.y0));
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            for v in job.out_band.iter_mut() {
-                *v = 0.0;
-            }
-            tick();
-            src.note(format!("combine end {}", job.y0));
-            Ok(())
+        let network = IoPolicy {
+            band_budget_bytes: 256,
+            read_concurrency: 1,
+            storage: StorageClass::Network,
+            prefetch_local: false,
         };
-        let stats = band_loop(
-            &src,
-            &pool(),
-            &AtomicBool::new(false),
-            &EngineProgress { on_band: &nop(), on_combine: &nop() },
-            policy,
-            &mut out,
-            &combine,
-        )
-        .unwrap();
-        assert!(stats.bands >= 3, "need at least 3 bands to exercise a middle overlap, got {}", stats.bands);
-        let events = src.events.into_inner().unwrap();
-        let pos = |needle: &str| events.iter().position(|e| e == needle).unwrap_or_else(|| panic!("missing event {needle:?} in {events:?}"));
-        let combine_end_0 = pos("combine end 0");
-        // Band index 1 starts at y0 = band_rows = 2.
-        let read_start_1 = pos("read start 2");
-        assert!(
-            read_start_1 < combine_end_0,
-            "band 1's read did not start before band 0's combine finished: {events:?}"
-        );
+        let local_stacking = IoPolicy {
+            band_budget_bytes: 256,
+            read_concurrency: 1,
+            storage: StorageClass::Local,
+            prefetch_local: true,
+        };
+        for (label, policy) in [("network", network), ("local+prefetch_local", local_stacking)] {
+            let (stats, events, overlapped) = run_event_source(policy, true);
+            // 256 halves to 128 -> 2-row bands, 4 bands.
+            assert_eq!(stats.band_rows, 2, "{label}: prefetching policy must halve the band");
+            assert_eq!(stats.bands, 4, "{label}: 8 rows at 2 rows/band is 4 bands");
+            assert!(overlapped, "{label}: band 1's read never started during band 0's combine: {events:?}");
+            let pos = |needle: &str| events.iter().position(|e| e == needle).unwrap_or_else(|| panic!("missing event {needle:?} in {events:?}"));
+            assert!(
+                pos("read start 2") < pos("combine end 0"),
+                "{label}: band 1's read did not start before band 0's combine finished: {events:?}"
+            );
+        }
     }
 
-    /// Fix wave item 1's companion pin, the other side of the gate: on
-    /// `Local` storage `band_loop` must run the pre-tier-1 shape — no
-    /// halving in `loop_band_rows` and no prefetch thread ever spawned, so
-    /// a band's read completes strictly before its OWN combine starts, and
-    /// the next band's read never starts until the previous band's combine
-    /// has already finished. Same `EventSource` double, budget and
-    /// dimensions as the `Network` sibling above, `Local` swapped in: the
-    /// un-halved geometry gives twice the rows per band (4 rather than 2)
-    /// and half the bands (2 rather than 4), and the event log is fully
-    /// deterministic rather than merely ordered, since nothing overlaps.
+    /// Final review B, I1: a calibration-library master build resolves the
+    /// default `IoPolicy` (`prefetch_local: false`): on `Local` storage it
+    /// runs the pre-L3 shape — no halving, no prefetch thread, a band's read
+    /// completes strictly before its own combine and the next band's read
+    /// does not start until the previous combine has finished.
     #[test]
-    fn band_loop_stays_serial_and_un_halved_on_local_storage() {
-        struct EventSource {
-            width: usize,
-            height: usize,
-            n: usize,
-            events: std::sync::Mutex<Vec<String>>,
-        }
-        impl EventSource {
-            fn note(&self, s: impl Into<String>) {
-                self.events.lock().unwrap().push(s.into());
-            }
-        }
-        impl FrameSource for EventSource {
-            fn width(&self) -> usize { self.width }
-            fn height(&self) -> usize { self.height }
-            fn frame_count(&self) -> usize { self.n }
-            fn plane_kinds(&self) -> Vec<PlaneKind> { vec![PlaneKind::F32Le; self.n] }
-            fn bytes_per_row(&self) -> usize { self.width * 4 * self.n }
-            fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
-                (budget_bytes / (self.width * 4 * self.n).max(1)).max(1)
-            }
-            fn read_band_with_progress(
-                &self,
-                y0: usize,
-                rows: usize,
-                out: &mut BandPlanes,
-                _concurrency: usize,
-                on_bytes: &(dyn Fn(u64) + Sync),
-                _cancel: &AtomicBool,
-            ) -> Result<(), IntegrationError> {
-                self.note(format!("read start {y0}"));
-                out.set_rows(rows);
-                on_bytes((rows * self.width * 4 * self.n) as u64);
-                self.note(format!("read end {y0}"));
-                Ok(())
-            }
-        }
-
-        let (w, h) = (8usize, 8usize);
-        let src = EventSource { width: w, height: h, n: 2, events: std::sync::Mutex::new(Vec::new()) };
-        // per-row cost = w*4*n = 64; `Local` storage never halves (the
-        // gate), so 256 -> band_rows = 4, giving 2 bands (y0 = 0, 4) — half
-        // the `Network` sibling's band count at the same budget, pinning
-        // the un-halved geometry directly.
-        let policy = IoPolicy { band_budget_bytes: 256, read_concurrency: 1, storage: StorageClass::Local };
-        let mut out = vec![0f32; w * h];
-        let combine = |job: BandJob<'_>, tick: &(dyn Fn() + Sync)| -> Result<(), IntegrationError> {
-            src.note(format!("combine start {}", job.y0));
-            for v in job.out_band.iter_mut() {
-                *v = 0.0;
-            }
-            tick();
-            src.note(format!("combine end {}", job.y0));
-            Ok(())
+    fn master_build_policy_stays_serial_and_un_halved_on_local_storage() {
+        let policy = IoPolicy {
+            band_budget_bytes: 256,
+            read_concurrency: 1,
+            storage: StorageClass::Local,
+            prefetch_local: false,
         };
-        let stats = band_loop(
-            &src,
-            &pool(),
-            &AtomicBool::new(false),
-            &EngineProgress { on_band: &nop(), on_combine: &nop() },
-            policy,
-            &mut out,
-            &combine,
-        )
-        .unwrap();
-        assert_eq!(stats.band_rows, 4, "Local storage must not halve the band budget");
+        assert!(!policy.prefetches());
+        let (stats, events, _) = run_event_source(policy, false);
+        assert_eq!(stats.band_rows, 4, "a master build on Local must not halve the band");
         assert_eq!(stats.bands, 2, "8 rows at 4 rows/band is 2 bands");
-        let events = src.events.into_inner().unwrap();
-        assert_eq!(
-            events,
-            vec![
-                "read start 0", "read end 0", "combine start 0", "combine end 0",
-                "read start 4", "read end 4", "combine start 4", "combine end 4",
-            ],
-            "Local storage must run strictly serially — read N, combine N, read N+1, … — \
-             with no overlap: {events:?}"
-        );
+        let expected = [
+            "read start 0",
+            "read end 0",
+            "combine start 0",
+            "combine end 0",
+            "read start 4",
+            "read end 4",
+            "combine start 4",
+            "combine end 4",
+        ];
+        assert_eq!(events, expected, "serial loop must not overlap reads and combines");
+        // Network still prefetches under the default flag.
+        assert!(IoPolicy { storage: StorageClass::Network, ..policy }.prefetches());
     }
+
+    /// Final review B, I1: the master-build policy and the stacking policy
+    /// give the same bytes on Local storage (halving and prefetch are pure
+    /// scheduling).
+    #[test]
+    fn master_and_stacking_policies_give_identical_output_on_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (64, 128);
+        let paths: Vec<_> = (0..5)
+            .map(|i| write(dir.path(), &format!("m{i}.fits"), w, h, move |x, y| (x * 3 + y * 7 + i * 11) as f32 * 0.01))
+            .collect();
+        let on_band = nop();
+        let run = |prefetch_local: bool| {
+            let policy = IoPolicy {
+                band_budget_bytes: 4 * (5 * w * 4 + 8 * w),
+                read_concurrency: 1,
+                storage: StorageClass::Local,
+                prefetch_local,
+            };
+            integrate_bias_like(
+                &paths,
+                IntegrationRecipe::median(Rejection::None),
+                &pool(),
+                dir.path(),
+                &AtomicBool::new(false),
+                EngineProgress { on_band: &on_band, on_combine: &nop() },
+                policy,
+            )
+            .unwrap()
+        };
+        let master = run(false);
+        let stacking = run(true);
+        assert!(stacking.bands > master.bands, "stacking policy must run the smaller (halved) bands");
+        assert_eq!(master.data, stacking.data, "prefetch scheduling changed the output");
+    }
+
 
     /// Fix wave item 2: a prefetch that fails while the combine is ALSO
     /// failing must not be swallowed — `band_loop` still has to return
@@ -4374,7 +4454,7 @@ mod tests {
 
         let (w, h) = (8usize, 16usize);
         let src = FailingSource { width: w, height: h };
-        let policy = IoPolicy { band_budget_bytes: w * 4, read_concurrency: 1, storage: StorageClass::Network };
+        let policy = IoPolicy { band_budget_bytes: w * 4, read_concurrency: 1, storage: StorageClass::Network, prefetch_local: false };
         let mut out = vec![0f32; w * h];
         let combine = |_job: BandJob<'_>, _tick: &(dyn Fn() + Sync)| -> Result<(), IntegrationError> {
             // Band 0's own combine ALSO fails, concurrently with band 1's
