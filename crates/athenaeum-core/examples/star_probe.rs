@@ -113,6 +113,11 @@
 //! `fieldWidthEnvelope` (F_env = fieldWidth + 3.09·s, px: the FWHM the knot
 //! bounds sit at); the last two `null` when the matched filter did not run.
 //!
+//! R-OSP-15 (Plan A Task 14b, route E): the measure and analysis-mode frame lines always carry `fieldWidthAtFloor`
+//! (`FieldWidth::at_floor`: the field-width pool's unclamped half-sample mode lay below the narrowest read a
+//! representable star gives, 1.607042 px). On a plane stated white the field-width pass searches the 3x3 median of
+//! the detection plane; every other read is unchanged.
+//!
 //! F-10 (Plan A Task 10b, phase A4): the measure frame line carries `trailed`
 //! (the plane-level trailed verdict: no star kept, every would-be accepted fit
 //! refused `trailed`) and `trailShare` (its input: the share of the judged seeds
@@ -844,6 +849,7 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
                         "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
                         "fieldWidth": n_or_null(pm.field_width.fwhm_px),
+                        "fieldWidthAtFloor": pm.field_width.at_floor(),
                         "fieldWidthSpread": pm.detection.as_ref().map(|d| n_or_null(d.envelope.spread_px)),
                         "fieldWidthEnvelope": pm.detection.as_ref().map(|d| n_or_null(d.envelope.fwhm_px)),
                         "channel": pm.channel, "options": options, "conversion": conversion,
@@ -1161,6 +1167,7 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
             "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
             "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
             "fieldWidth": n_or_null(pm.field_width.fwhm_px),
+            "fieldWidthAtFloor": pm.field_width.at_floor(),
             "fieldWidthSpread": pm.detection.as_ref().map(|d| n_or_null(d.envelope.spread_px)),
             "fieldWidthEnvelope": pm.detection.as_ref().map(|d| n_or_null(d.envelope.fwhm_px)),
             "snrGain": pm.snr_gain.map(|g| n_or_null(g * s)), "snrMissing": pm.snr_missing,

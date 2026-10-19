@@ -143,6 +143,11 @@ pub struct SummaryFrame {
     /// written before this field. `#[serde(default)]`, see `ln_scale`'s own doc.
     #[serde(default)]
     pub beta_own_at_cap: bool,
+    /// Whether the frame's field width sat at the clamp floor on any channel
+    /// (`ChannelMeasurement::field_width_at_floor`). `false` when not measured and in a summary written before this
+    /// field. `#[serde(default)]`, see `ln_scale`'s own doc.
+    #[serde(default)]
+    pub field_width_at_floor: bool,
 }
 
 /// One integration group's whole result. `stats`/`master_path`/rejection

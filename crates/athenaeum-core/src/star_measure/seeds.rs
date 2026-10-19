@@ -114,6 +114,397 @@ impl FieldWidth {
             from_stars: 0,
         }
     }
+
+    /// The pool's UNCLAMPED half-sample mode lay below [`FIELD_WIDTH_FLOOR_READ_PX`] (route E, Q4): the field width
+    /// sits at the clamp floor — a sub-floor star field, or a pool still won by narrow reads (a cluster of five or
+    /// more hot pixels, a dense jump path). `from_stars > 0 && fwhm_px < FIELD_WIDTH_FLOOR_READ_PX` is exactly that,
+    /// because the clamp floor (1.5) lies below the floor read: a mode under 1.5 reads 1.5, a mode in
+    /// `[1.5, 1.607042)` reads itself. `false` for a caller's own width and for a pool that read nothing. It is a
+    /// method, not a field, so the postcard `PlanePrep` of the first-pass artifact carries the flag in the width it
+    /// already stores and its bytes do not move.
+    ///
+    /// Two silent limits, both named: a debayered plane (an interpolated event reads about 1.86 px, above the floor
+    /// read, and takes no median, so the width can move without a flag — triggers: a refused cosmetic map on an OSC
+    /// stacking frame, which stamps no `ATH_CHPX`, and a debayered Analysis plane) and, on a masked plane whose median
+    /// has some present cell, a mask that thins the windows. A mask leaving no median cell at all (an R/B-site CFA
+    /// mask) falls back to the first pass on d, warned.
+    pub fn at_floor(&self) -> bool {
+        self.from_stars > 0 && self.fwhm_px < FIELD_WIDTH_FLOOR_READ_PX
+    }
+}
+
+/// The narrowest half-maximum read a representable star gives (route S §2: `floor_read_px(4, 4)` = 1.607 041 5…).
+const FIELD_WIDTH_FLOOR_READ_PX: f64 = 1.607042;
+
+/// The autocovariance of the 3×3 median of unit white noise, normalised to the pixel variance, by lag class
+/// `(0,0) (1,0) (1,1) (2,0) (2,1) (2,2)` (`|dx|, |dy|` sorted; zero beyond lag 2 = `NOISE_CORR_REACH`): a Monte Carlo of
+/// 2.5·10⁸ windows (E2, M1). Derived — nothing is read from the plane (C-10).
+const MEDIAN3_WHITE_COV: [f64; 6] = [0.16612, 0.09492, 0.06085, 0.04497, 0.02959, 0.01463];
+
+/// σ(K∘d_M) ÷ σ_pixel of white noise, for a kernel of FWHM `fwhm` px on a grid of `step` (the formula of
+/// `NoiseCorrelation::gain`, on the median's covariance). The shipped arm reads one cell, `(3, 1)` = 0.945; the others
+/// (F 1.5 0.666 · 2 0.803 · 4.7 1.041 · step 2 F 6 1.055 · 12 1.106 · 24 1.119) are the derived reference, pinned by
+/// the tests (M1).
+fn median_gain(fwhm: f64, step: usize) -> f64 {
+    let rr = NOISE_CORR_REACH as i64;
+    let mut c = [[0.0f64; NOISE_CORR_SIDE]; NOISE_CORR_SIDE];
+    for dy in -rr..=rr {
+        for dx in -rr..=rr {
+            let (a, b) = (
+                dx.unsigned_abs().max(dy.unsigned_abs()),
+                dx.unsigned_abs().min(dy.unsigned_abs()),
+            );
+            let class = match (a, b) {
+                (0, 0) => 0,
+                (1, 0) => 1,
+                (1, 1) => 2,
+                (2, 0) => 3,
+                (2, 1) => 4,
+                _ => 5,
+            };
+            c[(dy + rr) as usize][(dx + rr) as usize] = MEDIAN3_WHITE_COV[class];
+        }
+    }
+    // `gain` normalises by C(0); the median's own variance is below the pixel's, so scale back to the pixel unit.
+    NoiseCorrelation { c }.gain(fwhm, step) * MEDIAN3_WHITE_COV[0].sqrt()
+}
+
+/// How a full row of [`median3`] is computed: the column-triple network in scalar, NEON (aarch64) or AVX2 (x86_64,
+/// runtime detection) lanes. `min` / `max` are exact, so every kernel equals (`==`) the sort ([`median3_cell`], the
+/// oracle — R-OSP-14); on x86 a zero tie may differ in sign, which no consumer reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKernel {
+    // Reached through `best` on a CPU without a vector kernel, and by the tests on every CPU.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    Network,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+impl RowKernel {
+    fn best() -> RowKernel {
+        #[cfg(target_arch = "aarch64")]
+        {
+            RowKernel::Neon
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return RowKernel::Avx2;
+            }
+            RowKernel::Network
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            RowKernel::Network
+        }
+    }
+}
+
+fn med3(a: f32, b: f32, c: f32) -> f32 {
+    a.min(b).max(a.max(b).min(c))
+}
+
+/// Sorts the column triples `(r0[x], r1[x], r2[x])` for `x` in `xs` into `lo ≤ mid ≤ hi`.
+fn sort_columns(
+    r: [&[f32]; 3],
+    lo: &mut [f32],
+    mid: &mut [f32],
+    hi: &mut [f32],
+    xs: std::ops::Range<usize>,
+) {
+    for x in xs {
+        let (a, b, c) = (r[0][x], r[1][x], r[2][x]);
+        let (a, b) = (a.min(b), a.max(b));
+        let (b, c) = (b.min(c), b.max(c));
+        let (a, b) = (a.min(b), a.max(b));
+        lo[x] = a;
+        mid[x] = b;
+        hi[x] = c;
+    }
+}
+
+/// The window medians `out[x]` for `x` in `xs` (`xs` inside `1..w-1`) from the sorted column triples: the median of
+/// the three columns' minima's maximum, medians' median and maxima's minimum.
+fn window_medians(
+    lo: &[f32],
+    mid: &[f32],
+    hi: &[f32],
+    out: &mut [f32],
+    xs: std::ops::Range<usize>,
+) {
+    for x in xs {
+        let max_lo = lo[x - 1].max(lo[x]).max(lo[x + 1]);
+        let min_hi = hi[x - 1].min(hi[x]).min(hi[x + 1]);
+        out[x] = med3(max_lo, med3(mid[x - 1], mid[x], mid[x + 1]), min_hi);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn row_neon(r: [&[f32]; 3], lo: &mut [f32], mid: &mut [f32], hi: &mut [f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let w = out.len();
+    let mut x = 0usize;
+    // SAFETY: every load / store reads or writes the four lanes `x..x + 4` with `x + 4 <= w` (columns) or
+    // `x + 5 <= w` (the window stage reads `x - 1 .. x + 5`); all slices have length `w`. NEON is baseline on aarch64.
+    unsafe {
+        while x + 4 <= w {
+            let (a, b, c) = (
+                vld1q_f32(r[0].as_ptr().add(x)),
+                vld1q_f32(r[1].as_ptr().add(x)),
+                vld1q_f32(r[2].as_ptr().add(x)),
+            );
+            let (a, b) = (vminq_f32(a, b), vmaxq_f32(a, b));
+            let (b, c) = (vminq_f32(b, c), vmaxq_f32(b, c));
+            let (a, b) = (vminq_f32(a, b), vmaxq_f32(a, b));
+            vst1q_f32(lo.as_mut_ptr().add(x), a);
+            vst1q_f32(mid.as_mut_ptr().add(x), b);
+            vst1q_f32(hi.as_mut_ptr().add(x), c);
+            x += 4;
+        }
+    }
+    sort_columns(r, lo, mid, hi, x..w);
+    let mut x = 1usize;
+    // SAFETY: see above; the loop condition `x + 5 <= w` bounds the `x + 1 .. x + 5` load.
+    unsafe {
+        while x + 5 <= w {
+            let (l0, l1, l2) = (
+                vld1q_f32(lo.as_ptr().add(x - 1)),
+                vld1q_f32(lo.as_ptr().add(x)),
+                vld1q_f32(lo.as_ptr().add(x + 1)),
+            );
+            let (m0, m1, m2) = (
+                vld1q_f32(mid.as_ptr().add(x - 1)),
+                vld1q_f32(mid.as_ptr().add(x)),
+                vld1q_f32(mid.as_ptr().add(x + 1)),
+            );
+            let (h0, h1, h2) = (
+                vld1q_f32(hi.as_ptr().add(x - 1)),
+                vld1q_f32(hi.as_ptr().add(x)),
+                vld1q_f32(hi.as_ptr().add(x + 1)),
+            );
+            let max_lo = vmaxq_f32(vmaxq_f32(l0, l1), l2);
+            let min_hi = vminq_f32(vminq_f32(h0, h1), h2);
+            let med_mid = vmaxq_f32(vminq_f32(m0, m1), vminq_f32(vmaxq_f32(m0, m1), m2));
+            let m = vmaxq_f32(
+                vminq_f32(max_lo, med_mid),
+                vminq_f32(vmaxq_f32(max_lo, med_mid), min_hi),
+            );
+            vst1q_f32(out.as_mut_ptr().add(x), m);
+            x += 4;
+        }
+    }
+    window_medians(lo, mid, hi, out, x..w - 1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn row_avx2(
+    r: [&[f32]; 3],
+    lo: &mut [f32],
+    mid: &mut [f32],
+    hi: &mut [f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let w = out.len();
+    let mut x = 0usize;
+    while x + 8 <= w {
+        let (a, b, c) = (
+            _mm256_loadu_ps(r[0].as_ptr().add(x)),
+            _mm256_loadu_ps(r[1].as_ptr().add(x)),
+            _mm256_loadu_ps(r[2].as_ptr().add(x)),
+        );
+        let (a, b) = (_mm256_min_ps(a, b), _mm256_max_ps(a, b));
+        let (b, c) = (_mm256_min_ps(b, c), _mm256_max_ps(b, c));
+        let (a, b) = (_mm256_min_ps(a, b), _mm256_max_ps(a, b));
+        _mm256_storeu_ps(lo.as_mut_ptr().add(x), a);
+        _mm256_storeu_ps(mid.as_mut_ptr().add(x), b);
+        _mm256_storeu_ps(hi.as_mut_ptr().add(x), c);
+        x += 8;
+    }
+    sort_columns(r, lo, mid, hi, x..w);
+    let mut x = 1usize;
+    while x + 9 <= w {
+        let (l0, l1, l2) = (
+            _mm256_loadu_ps(lo.as_ptr().add(x - 1)),
+            _mm256_loadu_ps(lo.as_ptr().add(x)),
+            _mm256_loadu_ps(lo.as_ptr().add(x + 1)),
+        );
+        let (m0, m1, m2) = (
+            _mm256_loadu_ps(mid.as_ptr().add(x - 1)),
+            _mm256_loadu_ps(mid.as_ptr().add(x)),
+            _mm256_loadu_ps(mid.as_ptr().add(x + 1)),
+        );
+        let (h0, h1, h2) = (
+            _mm256_loadu_ps(hi.as_ptr().add(x - 1)),
+            _mm256_loadu_ps(hi.as_ptr().add(x)),
+            _mm256_loadu_ps(hi.as_ptr().add(x + 1)),
+        );
+        let max_lo = _mm256_max_ps(_mm256_max_ps(l0, l1), l2);
+        let min_hi = _mm256_min_ps(_mm256_min_ps(h0, h1), h2);
+        let med_mid = _mm256_max_ps(
+            _mm256_min_ps(m0, m1),
+            _mm256_min_ps(_mm256_max_ps(m0, m1), m2),
+        );
+        let m = _mm256_max_ps(
+            _mm256_min_ps(max_lo, med_mid),
+            _mm256_min_ps(_mm256_max_ps(max_lo, med_mid), min_hi),
+        );
+        _mm256_storeu_ps(out.as_mut_ptr().add(x), m);
+        x += 8;
+    }
+    window_medians(lo, mid, hi, out, x..w - 1);
+}
+
+/// One interior row's medians `out[1..w-1]` by `kernel`; `lo` / `mid` / `hi` are the thread's row buffers (length `w`).
+fn median_row(
+    kernel: RowKernel,
+    r: [&[f32]; 3],
+    bufs: &mut (Vec<f32>, Vec<f32>, Vec<f32>),
+    out: &mut [f32],
+) {
+    let (lo, mid, hi) = (&mut bufs.0[..], &mut bufs.1[..], &mut bufs.2[..]);
+    match kernel {
+        RowKernel::Network => {
+            let w = out.len();
+            sort_columns(r, lo, mid, hi, 0..w);
+            window_medians(lo, mid, hi, out, 1..w - 1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        RowKernel::Neon => row_neon(r, lo, mid, hi, out),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Avx2` is only constructed by `RowKernel::best` after runtime detection (or by tests that check it).
+        RowKernel::Avx2 => unsafe { row_avx2(r, lo, mid, hi, out) },
+    }
+}
+
+/// The reference cell: the median of the window's present finite pixels by a sort (`n ≥ 3`: the middle one, an even
+/// `n` the mean of the middle two); an absent own pixel or `n ≤ 2` → `None`.
+fn median3_cell(
+    d: &[f32],
+    present: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+) -> Option<f32> {
+    let is_present = |i: usize| present.map_or(true, |p| p[i]) && d[i].is_finite();
+    if !is_present(y * w + x) {
+        return None;
+    }
+    let mut v = [0.0f32; 9];
+    let mut n = 0usize;
+    for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+        for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+            let i = yy * w + xx;
+            if is_present(i) {
+                v[n] = d[i];
+                n += 1;
+            }
+        }
+    }
+    if n < 3 {
+        return None;
+    }
+    let v = &mut v[..n];
+    v.sort_by(f32::total_cmp);
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    })
+}
+
+/// d_M: the 3×3 median of `d` over each window's present pixels. A cell whose own pixel is absent (masked, non-finite)
+/// is absent; otherwise `n ≥ 3` present pixels give their median (an even `n`: the mean of the middle two), `n ≤ 2` an
+/// absent cell. Returns the plane (absent cells 0) and, unless every cell is present, the presence. Full rows of
+/// finite present pixels run in SIMD lanes ([`RowKernel`]); a row near an absent or non-finite pixel, and the two edge
+/// columns, take the sort.
+fn median3(
+    d: &[f32],
+    present: Option<&[bool]>,
+    w: usize,
+    h: usize,
+) -> (Vec<f32>, Option<Vec<bool>>) {
+    median3_with(RowKernel::best(), d, present, w, h)
+}
+
+fn median3_with(
+    kernel: RowKernel,
+    d: &[f32],
+    present: Option<&[bool]>,
+    w: usize,
+    h: usize,
+) -> (Vec<f32>, Option<Vec<bool>>) {
+    let mut out = vec![0.0f32; w * h];
+    // A row is clean when every pixel is present and finite; a fast row needs its three rows clean.
+    let clean: Vec<bool> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let row = y * w..(y + 1) * w;
+            d[row.clone()].iter().all(|v| v.is_finite())
+                && present.map_or(true, |p| p[row].iter().all(|&k| k))
+        })
+        .collect();
+    let all_clean = clean.iter().all(|&c| c);
+    let fast = |y: usize| w >= 3 && y >= 1 && y + 1 < h && clean[y - 1] && clean[y] && clean[y + 1];
+    let new_bufs = || (vec![0.0f32; w], vec![0.0f32; w], vec![0.0f32; w]);
+    let fill = |y: usize,
+                orow: &mut [f32],
+                mut krow: Option<&mut [bool]>,
+                bufs: &mut (Vec<f32>, Vec<f32>, Vec<f32>)| {
+        let edge = |x: usize, orow: &mut [f32], krow: &mut Option<&mut [bool]>| match median3_cell(
+            d, present, w, h, x, y,
+        ) {
+            Some(v) => orow[x] = v,
+            None => {
+                if let Some(k) = krow {
+                    k[x] = false;
+                }
+            }
+        };
+        if fast(y) {
+            let r = [
+                &d[(y - 1) * w..y * w],
+                &d[y * w..(y + 1) * w],
+                &d[(y + 1) * w..(y + 2) * w],
+            ];
+            median_row(kernel, r, bufs, orow);
+            edge(0, orow, &mut krow);
+            edge(w - 1, orow, &mut krow);
+        } else {
+            for x in 0..w {
+                edge(x, orow, &mut krow);
+            }
+        }
+    };
+    if all_clean && present.is_none() && w >= 2 && h >= 2 {
+        // Every window holds at least four present pixels: no absent cell, no presence plane (a plane one pixel wide
+        // or tall has windows of two or three, so it takes the per-cell path with its presence plane).
+        out.par_chunks_mut(w)
+            .enumerate()
+            .for_each_init(new_bufs, |bufs, (y, orow)| fill(y, orow, None, bufs));
+        return (out, None);
+    }
+    let mut ok = vec![true; w * h];
+    out.par_chunks_mut(w)
+        .zip(ok.par_chunks_mut(w))
+        .enumerate()
+        .for_each_init(new_bufs, |bufs, (y, (orow, krow))| {
+            fill(y, orow, Some(krow), bufs)
+        });
+    let any_absent = ok.iter().any(|&k| !k);
+    (out, any_absent.then_some(ok))
+}
+
+/// The 3×3 median of the detection plane ([`median3`]) with its count plane (`None` = every cell present). It lives
+/// through pass 1 only: it is dropped before the width reads and pass 2.
+struct MedianPlane {
+    d: Vec<f32>,
+    count: Option<Vec<f32>>,
 }
 
 /// The grid a pass filters: per cell, the sum of its present background-subtracted pixels and, unless every cell
@@ -849,7 +1240,50 @@ fn detect_on(
         _ => None,
     };
     let pass_noise = |fwhm: f64, step: usize| PassNoise::of(map, corr, fwhm, step);
+    // The median plane's noise: the same map × the gain of the median's white-noise covariance at this kernel and
+    // grid (a White plane's read gain is 1, `GainSource::Unmixed`, so the `gain_read × G_M` composition never occurs).
+    let pass_noise_m = |fwhm: f64, step: usize| match pass_noise(fwhm, step) {
+        PassNoise::Propagated { map, median, gain } => PassNoise::Propagated {
+            map,
+            median,
+            gain: gain * median_gain(fwhm, step),
+        },
+        m => m,
+    };
     let none = |field: FieldWidth| (Vec::new(), field, DetectionReport::none());
+    // The 3×3 median of the detection plane (route E): only on a plane its caller states White (a debayered plane's
+    // events are blobs the median keeps, and its correlated noise has no derived median gain).
+    let median_on = pixel_noise == PixelNoise::White;
+    let med: Option<MedianPlane> = median_on
+        .then(|| {
+            let started = std::time::Instant::now();
+            let (md, mpresent) = median3(&d, present.as_deref(), w, h);
+            debug!(
+                width = w,
+                height = h,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "detection median plane built"
+            );
+            let usable = mpresent.as_ref().map_or(true, |p| p.iter().any(|&k| k));
+            if !usable {
+                // No window holds three present pixels around a present centre (an R/B-site CFA mask): pass 1 searches
+                // d, as it did before route E, rather than seeding nothing.
+                warn!(
+                    width = w,
+                    height = h,
+                    "detection median plane has no present cell; pass 1 searches the detection plane"
+                );
+                return None;
+            }
+            let mcount = mpresent
+                .as_ref()
+                .map(|p| p.iter().map(|&k| if k { 1.0 } else { 0.0 }).collect());
+            Some(MedianPlane {
+                d: md,
+                count: mcount,
+            })
+        })
+        .flatten();
     drop(prep_span);
 
     // Pass 1: the 3-px kernel; its readable candidates give the field width.
@@ -857,7 +1291,25 @@ fn detect_on(
         fwhm_px: FIRST_PASS_FWHM_PX,
     };
     let pass1_span = substeps::span(sub, Step::DetectPass1);
-    let first = run_pass(first_filter, &full, &det, pass_noise(FIRST_PASS_FWHM_PX, 1));
+    let first = match med {
+        Some(m) => {
+            // Pass 1 searches d_M; everything else reads d. d_M is dropped here, before the width reads and pass 2.
+            let grid = Grid {
+                sum: &m.d,
+                count: m.count.as_deref(),
+                w,
+                h,
+                step: 1,
+            };
+            run_pass(
+                first_filter,
+                &grid,
+                &det,
+                pass_noise_m(FIRST_PASS_FWHM_PX, 1),
+            )
+        }
+        None => run_pass(first_filter, &full, &det, pass_noise(FIRST_PASS_FWHM_PX, 1)),
+    };
     drop(pass1_span);
     let Some(first) = first else {
         return none(FieldWidth::unmeasured());
@@ -868,8 +1320,20 @@ fn detect_on(
     let reads = readable_widths(plane, w, h, &at, mask);
     drop(at);
     let mut widths: Vec<f64> = reads.iter().map(|&(width, _)| width).collect();
-    let field = field_width_of_reads(&mut widths);
+    let (field, mode_px) = field_width_of_reads(&mut widths);
     drop(widths);
+    // Never silent (Q4): a width at the clamp floor is recorded, once per detected plane, before pass 2 so no early
+    // return skips it.
+    if let (true, Some(mode_px)) = (field.at_floor(), mode_px) {
+        warn!(
+            fwhm_px = field.fwhm_px,
+            mode_px,
+            from_stars = field.from_stars,
+            width = w,
+            height = h,
+            "field width at the clamp floor"
+        );
+    }
     // The knot bounds' star-width envelope over the same readable reads (Task 10b A2b, ruling A2-2: E4).
     let envelope = if field.from_stars > 0 {
         WidthEnvelope::of(&reads, field.fwhm_px)
@@ -911,7 +1375,7 @@ fn detect_on(
         };
         let s = sort_and_merge(std::mem::take(&mut p.seeds));
         (p, s)
-    } else if field.from_stars == 0 {
+    } else if field.from_stars == 0 && !median_on {
         // No width was read: the field width is the first pass's own, so its candidates stand.
         (
             PassOutcome {
@@ -924,6 +1388,8 @@ fn detect_on(
             first_seeds,
         )
     } else {
+        // (On a White plane whose pool read nothing this is pass 2 on d at 3 px: the seeds are d's first-pass
+        // candidates, as the first-pass shortcut above gives them on any other plane — never d_M's.)
         let Some(mut p) = run_pass(filter, &full, &det, pass_noise(field.fwhm_px, 1)) else {
             return none(field);
         };
@@ -2079,7 +2545,11 @@ fn own_halfmax_read(
 /// clamped to [1.5, 24] px; `from_stars` counts the readable reads. No count, no ranking and no saturation test (F25
 /// stands): every contaminant of a half-maximum read is WIDER than the PSF — a clipped core is read at half the clip,
 /// outside the PSF's half maximum; a blend, a knot or a sky bump is a broader profile — while the stars share one
-/// width, so the PSF is the reads' mode wherever the brightest candidates sit. No readable read → the first pass's 3 px with
+/// width, so the PSF is the reads' mode wherever the brightest candidates sit. (Route E, R-OSP-15: that premise holds
+/// on the pool the 3×3 median of the detection plane gives a White plane's first pass — a single-pixel event of up to
+/// four pixels is not a candidate there, so no NARROWER contaminant enters the pool; on a debayered plane, whose
+/// interpolated events read wider than the floor, it held already, and a narrow-read pool is then flagged by
+/// [`FieldWidth::at_floor`].) No readable read → the first pass's 3 px with
 /// `from_stars = 0`. Reads run in parallel and are sorted before the mode, so the width does not depend on the order
 /// of `at`.
 fn field_width_from(
@@ -2093,7 +2563,7 @@ fn field_width_from(
         .into_iter()
         .map(|(width, _)| width)
         .collect();
-    field_width_of_reads(&mut widths)
+    field_width_of_reads(&mut widths).0
 }
 
 /// The (width, peak SNR) of the readable half-maximum reads of the positions `at` ([`field_width_from`]'s pool; the
@@ -2112,17 +2582,21 @@ fn readable_widths(
         .collect()
 }
 
-/// The field width of the readable reads `widths` ([`field_width_from`]): their half-sample mode, clamped; sorts
-/// `widths`.
-fn field_width_of_reads(widths: &mut [f64]) -> FieldWidth {
+/// The field width of the readable reads `widths` ([`field_width_from`]): their half-sample mode, clamped, and that mode
+/// UNCLAMPED (`None` for an empty pool; the floor warn's `mode_px`); sorts `widths`.
+fn field_width_of_reads(widths: &mut [f64]) -> (FieldWidth, Option<f64>) {
     if widths.is_empty() {
-        return FieldWidth::unmeasured();
+        return (FieldWidth::unmeasured(), None);
     }
     let n = widths.len();
-    FieldWidth {
-        fwhm_px: half_sample_mode(widths).clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX),
-        from_stars: n,
-    }
+    let mode = half_sample_mode(widths);
+    (
+        FieldWidth {
+            fwhm_px: mode.clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX),
+            from_stars: n,
+        },
+        Some(mode),
+    )
 }
 
 /// The half-sample mode (Bickel's): sorted, the half of the values with the smallest range is kept, again and again,
@@ -2164,7 +2638,8 @@ fn half_sample_mode(v: &mut [f64]) -> f64 {
 /// read is readable, clamped to [1.5, 24] px; no ranking (the seeds' order and `peak` do not matter) and no saturation
 /// test (ruling F25). `fit_stars_at` calls it when `FitStarsOptions.field_width` is `None` (LN refits, Peak/Structure
 /// seeds, Plan C's mosaic sites); the fit's width start reads the field width it returns (Task 6b). No readable read →
-/// `from_stars = 0` and the first pass's 3 px.
+/// `from_stars = 0` and the first pass's 3 px. The width may be [`FieldWidth::at_floor`]: a caller reading it carries
+/// the flag (`fieldWidthAtFloor`) with NO warn — the warn lives only in the detection path (`detect_on`).
 pub fn field_width_of(
     plane: &[f32],
     w: usize,
@@ -2185,6 +2660,668 @@ mod tests {
 
     fn working(data: &[f32]) -> Vec<f32> {
         data.iter().map(|v| v * ADU_SCALE).collect()
+    }
+
+    /// FNV-1a over the bit patterns of a detection's every number (seeds, field width, report).
+    fn detect_digest(out: &(Vec<Seed>, FieldWidth, DetectionReport)) -> u64 {
+        let (seeds, fw, r) = out;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for s in seeds {
+            for v in [s.x, s.y, s.peak, s.flux] {
+                eat(v.to_bits());
+            }
+        }
+        eat(fw.fwhm_px.to_bits());
+        eat(fw.from_stars as u64);
+        for v in [
+            r.sigma_f,
+            r.sigma_f_measured,
+            r.noise_gain,
+            r.envelope.fwhm_px,
+            r.envelope.spread_px,
+        ] {
+            eat(v.to_bits());
+        }
+        eat(r.structure_dropped as u64);
+        for v in &r.filter_snr {
+            eat(v.to_bits());
+        }
+        for e in &r.extended {
+            eat(*e as u64);
+        }
+        h
+    }
+
+    /// `detect_on` as `detect_with` calls it (the mesh from the plane), on the calling thread.
+    fn detect_plane(
+        scaled: &[f32],
+        w: usize,
+        h: usize,
+        mask: Option<&[bool]>,
+        pixel_noise: PixelNoise,
+    ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
+        let (noise, _) = domain::noise_model(scaled, w, h, None);
+        let mesh = domain::background_mesh(scaled, w, h, mask, true);
+        detect_on(
+            scaled,
+            w,
+            h,
+            noise.sigma as f32,
+            DEFAULT_THRESHOLD,
+            24576,
+            mask,
+            pixel_noise,
+            mesh,
+            None,
+            None,
+        )
+    }
+
+    /// 300 Moffat-4 stars of FWHM 5 px on a 2048² plane (>= 30 px apart, 40 px from the edge), noise sigma 0.0004.
+    fn broad_star_field() -> (Vec<f32>, Vec<crate::test_support::SpreadStar>, f64) {
+        use crate::test_support::spread_moffat_field;
+        const SIGMA: f64 = 0.0004;
+        let (data, stars) = spread_moffat_field(
+            (2048, 2048),
+            300,
+            (5.0, 0.15),
+            4.0,
+            SIGMA,
+            (20.0, 2000.0),
+            (30.0, 40.0),
+            0.05,
+            301,
+        );
+        (data, stars, SIGMA)
+    }
+
+    /// Single-pixel events, `per_mpx` of them per Mpx at least 25 px from every star: half pure, half with the two
+    /// opposite cross-neighbours at 0.3 of the event (the 6a rule's two-neighbour pass), e log-uniform 13-200 sigma.
+    fn add_single_pixel_events(
+        data: &mut [f32],
+        (w, h): (usize, usize),
+        stars: &[crate::test_support::SpreadStar],
+        sigma: f64,
+        per_mpx: f64,
+        seed: u64,
+    ) -> usize {
+        let n = (per_mpx * (w * h) as f64 / 1e6) as usize;
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        let mut taken = std::collections::HashSet::new();
+        let mut placed = 0usize;
+        while placed < n {
+            let x = 40 + (rng.next_f64() * (w - 80) as f64) as usize;
+            let y = 40 + (rng.next_f64() * (h - 80) as f64) as usize;
+            if stars
+                .iter()
+                .any(|s| (s.x - x as f64).hypot(s.y - y as f64) < 25.0)
+                || !taken.insert((x / 6, y / 6))
+            {
+                continue;
+            }
+            let e = (sigma * 13.0 * (200.0f64 / 13.0).powf(rng.next_f64())) as f32;
+            data[y * w + x] += e;
+            if placed % 2 == 1 {
+                data[y * w + x - 1] += 0.3 * e;
+                data[y * w + x + 1] += 0.3 * e;
+            }
+            placed += 1;
+        }
+        placed
+    }
+
+    /// RED at 69b4710b: the field-width pass reads the 1.5 clamp on a field of broad stars among single-pixel events.
+    #[test]
+    fn field_width_reads_broad_stars_among_single_pixel_events() {
+        use crate::test_support::add_noise;
+        let (w, h) = (2048usize, 2048usize);
+        let (noiseless, stars, sigma) = broad_star_field();
+        let mut twin = noiseless.clone();
+        add_noise(&mut twin, sigma as f32, 302);
+        let mut events = twin.clone();
+        let placed = add_single_pixel_events(&mut events, (w, h), &stars, sigma, 1324.0, 303);
+        assert!(placed > 5000);
+        let run = |plane: &[f32]| detect_plane(&working(plane), w, h, None, PixelNoise::White).1;
+        let f_twin = run(&twin).fwhm_px;
+        assert!((f_twin / 5.0 - 1.0).abs() <= 0.1, "twin reads {f_twin}");
+        let fw = run(&events);
+        assert!(!fw.at_floor(), "events {fw:?}");
+        assert!(
+            (fw.fwhm_px / f_twin - 1.0).abs() <= 0.1,
+            "events {fw:?} vs the event-free twin {f_twin}"
+        );
+    }
+
+    /// The reference median of `d`'s window at `(x, y)` over its present pixels, by a full sort.
+    fn sorted_window_median(
+        d: &[f32],
+        present: &[bool],
+        w: usize,
+        h: usize,
+        x: usize,
+        y: usize,
+    ) -> Option<f32> {
+        if !present[y * w + x] {
+            return None;
+        }
+        let mut v: Vec<f32> = Vec::new();
+        for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+            for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                if present[yy * w + xx] {
+                    v.push(d[yy * w + xx]);
+                }
+            }
+        }
+        if v.len() < 3 {
+            return None;
+        }
+        v.sort_by(f32::total_cmp);
+        let n = v.len();
+        Some(if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        })
+    }
+
+    /// Every row kernel this CPU runs, the scalar network first.
+    fn row_kernels() -> Vec<RowKernel> {
+        let mut ks = vec![RowKernel::Network];
+        #[cfg(target_arch = "aarch64")]
+        ks.push(RowKernel::Neon);
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            ks.push(RowKernel::Avx2);
+        }
+        ks
+    }
+
+    /// `median3` of `d` (absent cells carry 0, as `detect_on` builds it) against the sort, every cell, every kernel.
+    fn assert_median3_matches_the_sort(
+        d: &[f32],
+        present: &[bool],
+        w: usize,
+        h: usize,
+        what: &str,
+    ) {
+        let all = present.iter().all(|&p| p);
+        let given = (!all).then_some(present);
+        for kernel in row_kernels() {
+            let (out, ok) = median3_with(kernel, d, given, w, h);
+            let ok_at = |i: usize| ok.as_ref().map_or(true, |o| o[i]);
+            for y in 0..h {
+                for x in 0..w {
+                    let want = sorted_window_median(d, present, w, h, x, y);
+                    assert_eq!(
+                        ok_at(y * w + x),
+                        want.is_some(),
+                        "{what} {kernel:?} ({x},{y}) presence"
+                    );
+                    if let Some(v) = want {
+                        assert_eq!(out[y * w + x], v, "{what} {kernel:?} ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn median3_is_the_fifth_of_a_sorted_window() {
+        // Tests are exempt from the zero-print rule: this shows an x86 run that the AVX2 row ran against the sort.
+        eprintln!("median3 kernels exercised: {:?}", row_kernels());
+        let mut rng = crate::geometry::ransac::SplitMix64(41);
+        let (w, h) = (37usize, 29usize);
+        // Random, ties (a handful of levels), 30 % and 70 % absent.
+        for case in 0..4 {
+            let raw: Vec<f32> = (0..w * h)
+                .map(|_| {
+                    let u = rng.next_f64();
+                    if case == 0 {
+                        (u * 5.0).floor() as f32
+                    } else {
+                        (u * 200.0 - 100.0) as f32
+                    }
+                })
+                .collect();
+            let present: Vec<bool> = (0..w * h)
+                .map(|_| match case {
+                    0 | 1 => true,
+                    2 => rng.next_f64() > 0.3,
+                    _ => rng.next_f64() > 0.7,
+                })
+                .collect();
+            let d: Vec<f32> = raw
+                .iter()
+                .zip(&present)
+                .map(|(&v, &p)| if p { v } else { 0.0 })
+                .collect();
+            assert_median3_matches_the_sort(&d, &present, w, h, &format!("case {case}"));
+        }
+        // A plane one pixel wide or tall: windows of two or three pixels, so the n <= 2 cells are absent, as in the sort.
+        for (w, h) in [(1usize, 9usize), (9, 1), (1, 1), (2, 2)] {
+            let d: Vec<f32> = (0..w * h).map(|_| rng.next_f64() as f32).collect();
+            let present = vec![true; w * h];
+            assert_median3_matches_the_sort(&d, &present, w, h, &format!("thin {w}x{h}"));
+        }
+        // Every row-tail length of every kernel (NEON 4 lanes, AVX2 8 lanes), random and tie-heavy, borders included.
+        for w in 3..=40usize {
+            for ties in [false, true] {
+                let h = 7usize;
+                let d: Vec<f32> = (0..w * h)
+                    .map(|_| {
+                        let u = rng.next_f64();
+                        if ties {
+                            (u * 3.0).floor() as f32
+                        } else {
+                            u as f32
+                        }
+                    })
+                    .collect();
+                let present = vec![true; w * h];
+                assert_median3_matches_the_sort(&d, &present, w, h, &format!("w {w} ties {ties}"));
+            }
+        }
+        // A NaN pixel routes its three rows to the sort and is never a median input; its own cell is absent.
+        let (w, h) = (21usize, 9usize);
+        let mut d: Vec<f32> = (0..w * h).map(|_| rng.next_f64() as f32).collect();
+        d[4 * w + 9] = f32::NAN;
+        let present: Vec<bool> = d.iter().map(|v| v.is_finite()).collect();
+        let d0: Vec<f32> = d
+            .iter()
+            .map(|&v| if v.is_finite() { v } else { 0.0 })
+            .collect();
+        for kernel in row_kernels() {
+            let (out, ok) = median3_with(kernel, &d, None, w, h);
+            let ok = ok.expect("the NaN cell is absent");
+            assert!(
+                !ok[4 * w + 9],
+                "{kernel:?}: a NaN own pixel is an absent cell"
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let want = sorted_window_median(&d0, &present, w, h, x, y);
+                    assert_eq!(ok[y * w + x], want.is_some(), "{kernel:?} ({x},{y})");
+                    if let Some(v) = want {
+                        assert_eq!(out[y * w + x], v, "{kernel:?} ({x},{y})");
+                    }
+                }
+            }
+        }
+        // A masked-corner fixture: n = 4 present (even) -> the middle-two mean; n <= 2 -> absent; an absent own
+        // pixel -> absent although n >= 3.
+        let (w, h) = (5usize, 5usize);
+        let d: Vec<f32> = (0..w * h).map(|i| (i * i % 11) as f32).collect();
+        let mut present = vec![true; w * h];
+        // Window of (0, 0): own + (1,0) (0,1) (1,1) present = 4.
+        let corner: Vec<f32> = [d[0], d[1], d[w], d[w + 1]].to_vec();
+        let mut sorted = corner.clone();
+        sorted.sort_by(f32::total_cmp);
+        let want_even = 0.5 * (sorted[1] + sorted[2]);
+        let (out, ok) = median3(&d, None, w, h);
+        assert!(ok.is_none());
+        assert_eq!(out[0], want_even, "n = 4: the middle two's mean");
+        // Only the own pixel and one neighbour present at (4, 4): n = 2 -> absent.
+        for &(x, y) in &[(3usize, 4usize), (4, 3), (3, 3)] {
+            present[y * w + x] = false;
+        }
+        let d0: Vec<f32> = d
+            .iter()
+            .zip(&present)
+            .map(|(&v, &p)| if p { v } else { 0.0 })
+            .collect();
+        let (_, ok) = median3(&d0, Some(&present), w, h);
+        let ok = ok.unwrap();
+        assert!(!ok[4 * w + 4], "n = 1 -> absent");
+        // An absent own pixel with 8 present neighbours -> absent.
+        let mut present = vec![true; w * h];
+        present[2 * w + 2] = false;
+        let d0: Vec<f32> = d
+            .iter()
+            .zip(&present)
+            .map(|(&v, &p)| if p { v } else { 0.0 })
+            .collect();
+        let (_, ok) = median3(&d0, Some(&present), w, h);
+        assert!(
+            !ok.unwrap()[2 * w + 2],
+            "an absent own pixel is an absent cell"
+        );
+        // n = 2: a corner whose two neighbours are masked.
+        let mut present = vec![true; w * h];
+        present[1] = false;
+        present[w] = false;
+        let d0: Vec<f32> = d
+            .iter()
+            .zip(&present)
+            .map(|(&v, &p)| if p { v } else { 0.0 })
+            .collect();
+        let (_, ok) = median3(&d0, Some(&present), w, h);
+        assert!(!ok.unwrap()[0], "n = 2 -> absent");
+    }
+
+    #[test]
+    fn median3_removes_events_up_to_four_pixels_not_a_debayered_blob() {
+        let (w, h) = (60usize, 40usize);
+        let shapes: [&[(usize, usize)]; 5] = [
+            &[(0, 0)],
+            &[(0, 0), (1, 0)],
+            &[(0, 0), (1, 0), (2, 0)],
+            &[(0, 0), (1, 0), (0, 1), (1, 1)],
+            &[(0, 0), (1, 0), (0, 1), (2, 1)],
+        ];
+        for (n, shape) in shapes.iter().enumerate() {
+            let mut d = vec![0.0f32; w * h];
+            for &(dx, dy) in *shape {
+                d[(18 + dy) * w + 25 + dx] = 100.0;
+            }
+            let (out, _) = median3(&d, None, w, h);
+            assert!(
+                out.iter().all(|&v| v == 0.0),
+                "a {}-pixel event survived",
+                n + 1
+            );
+        }
+        // A debayered hot pixel: a 3x3 blob (the interpolation spreads it over its whole neighbourhood).
+        let mut d = vec![0.0f32; w * h];
+        for dy in 0..3 {
+            for dx in 0..3 {
+                d[(18 + dy) * w + 25 + dx] = 100.0;
+            }
+        }
+        let (out, _) = median3(&d, None, w, h);
+        assert_eq!(out[19 * w + 26], 100.0, "the blob's centre survives");
+    }
+
+    #[test]
+    fn median_gain_matches_a_white_noise_simulation() {
+        // (fwhm, step, plane side): the large kernels on the larger plane for a +-1 % sample error.
+        for &(fwhm, step, side) in &[
+            (1.5, 1, 2048usize),
+            (3.0, 1, 2048),
+            (4.7, 1, 2048),
+            (6.0, 2, 4096),
+            (12.0, 2, 4096),
+        ] {
+            let mut d = vec![0.0f32; side * side];
+            add_noise(&mut d, 1.0, 7 + side as u64);
+            let (md, _) = median3(&d, None, side, side);
+            let (sums, counts, gw, gh) = if step == 1 {
+                (md, None, side, side)
+            } else {
+                let g = side / 2;
+                let mut s = vec![0.0f32; g * g];
+                for y in 0..side {
+                    for x in 0..side {
+                        s[(y / 2) * g + x / 2] += md[y * side + x];
+                    }
+                }
+                (s, Some(vec![4.0f32; g * g]), g, g)
+            };
+            let grid = Grid {
+                sum: &sums,
+                count: counts.as_deref(),
+                w: gw,
+                h: gh,
+                step,
+            };
+            let out = MatchedFilter { fwhm_px: fwhm }.apply(&grid);
+            let margin = 40;
+            let vals: Vec<f64> = (margin..gh - margin)
+                .flat_map(|y| {
+                    let f = &out.f;
+                    (margin..gw - margin).map(move |x| f[y * gw + x] as f64)
+                })
+                .collect();
+            let n = vals.len() as f64;
+            let mean = vals.iter().sum::<f64>() / n;
+            let sd = (vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
+            let g = median_gain(fwhm, step);
+            assert!(
+                (sd / g - 1.0).abs() <= 0.01,
+                "F {fwhm} step {step}: simulated sigma {sd:.4} vs derived gain {g:.4}"
+            );
+        }
+        // The derived table's own values (M1).
+        for &(fwhm, step, want) in &[
+            (1.5, 1, 0.666),
+            (2.0, 1, 0.803),
+            (3.0, 1, 0.945),
+            (4.7, 1, 1.041),
+            (6.0, 2, 1.055),
+            (12.0, 2, 1.106),
+            (24.0, 2, 1.119),
+        ] {
+            let g = median_gain(fwhm, step);
+            assert!(
+                (g / want - 1.0).abs() <= 0.01,
+                "F {fwhm} step {step}: {g} vs {want}"
+            );
+        }
+    }
+
+    /// A field of `n` Gaussian stars of FWHM `fwhm` on 1024^2, sigma 0.0004, SNR 150-300.
+    fn gaussian_stars_field(fwhm: f64, seed: u64) -> Vec<f32> {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        let (w, h) = (1024usize, 1024usize);
+        let sigma = 0.0004f64;
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        let stars: Vec<(f64, f64, f64)> = (0..120)
+            .map(|i| {
+                let (cx, cy) = (60.0 + (i % 12) as f64 * 80.0, 60.0 + (i / 12) as f64 * 90.0);
+                (
+                    cx + rng.next_f64(),
+                    cy + rng.next_f64(),
+                    sigma * (150.0 + 150.0 * rng.next_f64()),
+                )
+            })
+            .collect();
+        let mut data =
+            integrated_field(w, h, &stars, IntegratedProfile::Gaussian { fwhm }, 5, 0.05);
+        add_noise(&mut data, sigma as f32, seed + 1);
+        data
+    }
+
+    #[test]
+    fn a_sub_floor_field_is_flagged_and_warned_once() {
+        let (w, h) = (1024usize, 1024usize);
+        let count = |logs: &str| logs.matches("field width at the clamp floor").count();
+        let sharp = working(&gaussian_stars_field(1.2, 311));
+        let mut fw = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            fw = Some(detect_plane(&sharp, w, h, None, PixelNoise::White).1);
+        });
+        let fw = fw.unwrap();
+        assert!(
+            fw.from_stars >= 20 && fw.at_floor(),
+            "sub-floor field: {fw:?}"
+        );
+        assert_eq!(fw.fwhm_px, 1.5, "{fw:?}");
+        assert_eq!(count(&logs), 1, "exactly one floor warn:\n{logs}");
+        let line = logs
+            .lines()
+            .find(|l| l.contains("field width at the clamp floor"))
+            .unwrap();
+        let field = |name: &str| -> f64 {
+            let at = line
+                .find(&format!("{name}="))
+                .unwrap_or_else(|| panic!("{name} in {line}"))
+                + name.len()
+                + 1;
+            line[at..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(field("mode_px") < FIELD_WIDTH_FLOOR_READ_PX, "{line}");
+        assert_eq!(field("fwhm_px"), 1.5, "{line}");
+        for k in ["from_stars=", "width=1024", "height=1024"] {
+            assert!(line.contains(k), "{k} in {line}");
+        }
+        // The flag is the method on every plane kind: a Mixed plane warns exactly when its width is at the floor.
+        let mut mixed = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            mixed = Some(detect_plane(&sharp, w, h, None, PixelNoise::Mixed).1);
+        });
+        let mixed = mixed.unwrap();
+        assert_eq!(count(&logs), mixed.at_floor() as usize, "{mixed:?}\n{logs}");
+        let ok = working(&gaussian_stars_field(3.0, 321));
+        let mut fw = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            fw = Some(detect_plane(&ok, w, h, None, PixelNoise::White).1);
+        });
+        let fw = fw.unwrap();
+        assert!(fw.from_stars >= 20 && !fw.at_floor(), "F 3 field: {fw:?}");
+        assert_eq!(count(&logs), 0, "{logs}");
+    }
+
+    /// Step 7 counts this line and Step 8 times the median from its `duration_ms`: one per White plane (where d_M is
+    /// built), none on a Mixed or Unknown plane, and no `detect_median` field.
+    #[test]
+    fn the_median_plane_debug_line_is_logged_once_per_white_plane() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let scaled = working(&data);
+        let line = "detection median plane built";
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let _ = detect_plane(&scaled, w, h, None, PixelNoise::White);
+        });
+        assert_eq!(logs.matches(line).count(), 1, "{logs}");
+        let l = logs.lines().find(|l| l.contains(line)).unwrap();
+        for k in ["width=768", "height=512", "duration_ms="] {
+            assert!(l.contains(k), "{k} in {l}");
+        }
+        assert!(!l.contains("detect_median"), "{l}");
+        for noise in [PixelNoise::Mixed, PixelNoise::Unknown] {
+            let logs = crate::stacking::solve::tests::captured_logs(|| {
+                let _ = detect_plane(&scaled, w, h, None, noise);
+            });
+            assert_eq!(logs.matches(line).count(), 0, "{noise:?}:\n{logs}");
+        }
+    }
+
+    /// M5: the White digest with a few single-pixel events on the fixture, pinned at the fix head (route E, r1). It
+    /// pins d_M's effect bit for bit, which the event-free `NEW_WHITE_DIGEST` cannot.
+    const EVENTS_WHITE_DIGEST: u64 = 0xf919_0ffb_6e50_1fa9;
+
+    #[test]
+    fn the_white_plane_detector_digest_with_single_pixel_events_is_pinned() {
+        let (mut data, w, h) = fixture_field(7, 1.0, 0.002);
+        let placed = add_single_pixel_events(&mut data, (w, h), &[], 0.002, 100.0, 17);
+        assert!(placed >= 30, "{placed}");
+        let out = detect_plane(&working(&data), w, h, None, PixelNoise::White);
+        let digest = detect_digest(&out);
+        assert!(!out.1.at_floor(), "{:?}", out.1);
+        assert_eq!(digest, EVENTS_WHITE_DIGEST, "{digest:#018x}");
+    }
+
+    /// M2: a mask that leaves no 3x3 window three present pixels around a present centre (only the R sites of a Bayer
+    /// plane present) leaves d_M without a cell. Pass 1 then runs on d as it did before route E: the plane's width and
+    /// seeds equal the 69b4710b path (here the same call on an Unknown plane), warned once.
+    #[test]
+    fn a_plane_whose_median_has_no_present_cell_searches_the_detection_plane() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let scaled = working(&data);
+        let mask: Vec<bool> = (0..w * h)
+            .map(|i| (i % w) % 2 == 0 && (i / w) % 2 == 0)
+            .collect();
+        let (_, mpresent) = median3(&vec![0.0f32; w * h], Some(&mask), w, h);
+        assert!(
+            mpresent.unwrap().iter().all(|&k| !k),
+            "the premise: no median cell"
+        );
+        let mut white = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            white = Some(detect_plane(&scaled, w, h, Some(&mask), PixelNoise::White));
+        });
+        let white = white.unwrap();
+        assert_eq!(
+            logs.matches("detection median plane has no present cell")
+                .count(),
+            1,
+            "{logs}"
+        );
+        let old = detect_plane(&scaled, w, h, Some(&mask), PixelNoise::Unknown);
+        // Every spike of a one-in-four mask looks like a lone hot pixel, so the old path seeds nothing here either: the
+        // pin is that route E changes no number against it (the fallback), not that stars are found.
+        assert_eq!(white.1, old.1, "FieldWidth");
+        assert_eq!(white.0.len(), old.0.len(), "seed count");
+    }
+
+    #[test]
+    fn at_floor_is_the_unclamped_mode_below_the_floor_read() {
+        for mode in [1.2f64, 1.5, 1.6, 1.607042, 1.61, 3.0, 30.0] {
+            // A pool of identical reads has that mode exactly.
+            let mut widths = vec![mode; 7];
+            let (fw, unclamped) = field_width_of_reads(&mut widths);
+            assert_eq!(unclamped, Some(mode));
+            assert_eq!(fw.from_stars, 7);
+            assert_eq!(
+                fw.at_floor(),
+                mode < FIELD_WIDTH_FLOOR_READ_PX,
+                "mode {mode}: {fw:?}"
+            );
+            assert_eq!(
+                fw.fwhm_px,
+                mode.clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX)
+            );
+        }
+        let (fw, unclamped) = field_width_of_reads(&mut []);
+        assert!(unclamped.is_none() && !fw.at_floor() && fw.from_stars == 0);
+        // A given width never flags.
+        assert!(!FieldWidth {
+            fwhm_px: 1.5,
+            from_stars: 0
+        }
+        .at_floor());
+    }
+
+    /// The digest of the detector at 69b4710b on a plane stated Mixed or Unknown (recorded there before the port).
+    const OLD_NOT_WHITE_DIGEST: u64 = 0xed7d_a725_b74c_8634;
+    /// The digest of the detector at 69b4710b on a White plane, `fixture_field(7, 1.0, 0.002)`.
+    const OLD_WHITE_DIGEST: u64 = 0x6546_30f1_e236_762b;
+    /// The digest of route E's detector on the same plane, stated White (I1 (a)): equal to the old one, the fixture has
+    /// no single-pixel event for the median to remove and its pool is the same 150 stars.
+    const NEW_WHITE_DIGEST: u64 = 0x6546_30f1_e236_762b;
+
+    #[test]
+    fn the_white_plane_detector_digest_is_pinned() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let out = detect_plane(&working(&data), w, h, None, PixelNoise::White);
+        let digest = detect_digest(&out);
+        assert!(!out.1.at_floor());
+        assert_eq!(
+            digest, NEW_WHITE_DIGEST,
+            "White digest {digest:#018x} (69b4710b: {OLD_WHITE_DIGEST:#018x})"
+        );
+    }
+
+    #[test]
+    fn a_plane_not_stated_white_detects_as_before() {
+        let (data, w, h) = fixture_field(7, 1.0, 0.002);
+        let scaled = working(&data);
+        for noise in [PixelNoise::Mixed, PixelNoise::Unknown] {
+            let digest = detect_digest(&detect_plane(&scaled, w, h, None, noise));
+            assert_eq!(digest, OLD_NOT_WHITE_DIGEST, "{noise:?}: {digest:#018x}");
+        }
+    }
+
+    #[test]
+    fn a_pool_that_reads_nothing_seeds_as_the_old_first_pass() {
+        // 150 faint stars (peak 5-15 sigma): the matched filter finds them all, none is readable (SNR >= 10) on d
+        // nor on d_M.
+        let (data, w, h) = fixture_field(7, 0.05, 0.002);
+        let out = detect_plane(&working(&data), w, h, None, PixelNoise::White);
+        assert_eq!(out.1.from_stars, 0, "{:?}", out.1);
+        assert_eq!(out.1.fwhm_px, FIRST_PASS_FWHM_PX);
+        assert!(!out.1.at_floor());
+        assert_eq!(out.0.len(), 150);
+        let digest = detect_digest(&out);
+        // 69b4710b's value on this fixture, recorded before the port.
+        assert_eq!(digest, 0x814a_14ab_687e_b237, "{digest:#018x}");
     }
 
     #[test]
@@ -2759,51 +3896,60 @@ mod tests {
                 at.push((x, y));
             }
         }
-        let run = |data: &[f32]| {
-            let scaled = working(data);
-            let (noise, _) = domain::noise_model(&scaled, w, h, None);
-            let (_, fw, report) = seeds::detect(
-                &scaled,
-                w,
-                h,
-                &noise,
-                DEFAULT_THRESHOLD,
-                24576,
-                None,
-                None,
-                PixelNoise::White,
-            );
-            (fw, report.envelope)
-        };
-        let ((f0, e0), (f1, e1)) = (run(&plain), run(&events));
-        // Premise: the events reach the field width's readable reads, each narrower than the envelope's floor.
-        let floor = f0.fwhm_px * (1.0 - KNOT_Z * read_error(WIDTH_START_MIN_PEAK_SNR));
-        let scaled = working(&events);
-        let event_reads: Vec<f64> = at
-            .iter()
-            .filter_map(|&(x, y)| own_halfmax_read(&scaled, w, h, x as f64, y as f64, None))
-            .filter(|r| r.snr >= WIDTH_START_MIN_PEAK_SNR)
-            .map(|r| r.width)
-            .collect();
-        assert!(
-            f1.from_stars >= f0.from_stars + 125 && event_reads.iter().all(|&r| r < floor),
-            "premise: readable reads {} → {} with the events; event reads {:?} vs floor {floor}",
-            f0.from_stars,
-            f1.from_stars,
-            &event_reads[..event_reads.len().min(10)]
-        );
-        let f = f0.fwhm_px;
-        assert!(
-            (e1.fwhm_px - e0.fwhm_px).abs() <= 0.02 * f,
-            "F_env with events {e1:?} vs without {e0:?} (F {f}, {f1:?})"
-        );
-        for (fw, e) in [(f0, e0), (f1, e1)] {
-            let want = 1.0 + KNOT_Z * sigma_true / fw.fwhm_px;
+        for kind in [PixelNoise::White, PixelNoise::Unknown] {
+            let run = |data: &[f32]| {
+                let scaled = working(data);
+                let (noise, _) = domain::noise_model(&scaled, w, h, None);
+                let (_, fw, report) = seeds::detect(
+                    &scaled,
+                    w,
+                    h,
+                    &noise,
+                    DEFAULT_THRESHOLD,
+                    24576,
+                    None,
+                    None,
+                    kind,
+                );
+                (fw, report.envelope)
+            };
+            let ((f0, e0), (f1, e1)) = (run(&plain), run(&events));
+            // Premise. White (route E, R-OSP-15): each event reads narrower than the envelope's floor, but the 3x3 median of
+            // the first pass's detection plane removes a three-pixel event, so it is no candidate and the pool does not
+            // grow. Unknown (no median; the original premise of Task 10b A2b): the events reach the field width's readable
+            // reads, each narrower than the envelope's floor, so the envelope bars guard the narrow side of A2-2.
+            let floor = f0.fwhm_px * (1.0 - KNOT_Z * read_error(WIDTH_START_MIN_PEAK_SNR));
+            let scaled = working(&events);
+            let event_reads: Vec<f64> = at
+                .iter()
+                .filter_map(|&(x, y)| own_halfmax_read(&scaled, w, h, x as f64, y as f64, None))
+                .filter(|r| r.snr >= WIDTH_START_MIN_PEAK_SNR)
+                .map(|r| r.width)
+                .collect();
+            let reached = match kind {
+                PixelNoise::White => f1.from_stars <= f0.from_stars + 5,
+                _ => f1.from_stars >= f0.from_stars + 125,
+            };
             assert!(
-                (e.fwhm_px / fw.fwhm_px - want).abs() <= 0.05,
-                "F_env/F {} vs 1 + 3.09·σ_true/F {want} (σ_true {sigma_true}, {e:?}, {fw:?})",
-                e.fwhm_px / fw.fwhm_px
+                reached && event_reads.iter().all(|&r| r < floor),
+                "premise ({kind:?}): readable reads {} → {} with the events; event reads {:?} vs floor {floor}",
+                f0.from_stars,
+                f1.from_stars,
+                &event_reads[..event_reads.len().min(10)]
             );
+            let f = f0.fwhm_px;
+            assert!(
+                (e1.fwhm_px - e0.fwhm_px).abs() <= 0.02 * f,
+                "F_env with events {e1:?} vs without {e0:?} (F {f}, {f1:?})"
+            );
+            for (fw, e) in [(f0, e0), (f1, e1)] {
+                let want = 1.0 + KNOT_Z * sigma_true / fw.fwhm_px;
+                assert!(
+                    (e.fwhm_px / fw.fwhm_px - want).abs() <= 0.05,
+                    "F_env/F {} vs 1 + 3.09·σ_true/F {want} (σ_true {sigma_true}, {e:?}, {fw:?})",
+                    e.fwhm_px / fw.fwhm_px
+                );
+            }
         }
     }
 

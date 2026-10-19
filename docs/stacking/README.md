@@ -3688,3 +3688,75 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       target-rank pivot. **Next levers** (number-changing, truth-gated): a vectorized `pow` (about 31 % of the fit thread),
       Normalize's LN reference build (about 34 %) and detection (about 20 %). **Rule:** per-core efficiency before threads or
       GPU; compare work units with the ERP, not stage walls.
+
+  - **R-OSP-15 - a field width robust to single-pixel events: route E, a 3x3 median on the detection plane of the field-width
+    pass (Plan A Task 14b; branch `one-star-path-t14b`, code 5cf5f09b + review fix c8cdc1b3; plan
+    `docs/superpowers/plans/2026-10-07-one-star-path-plan-a.md` `### Task 14b`; design `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-14b-erp-design.md`;
+    lab `star-lab/results/plan-a/t14b/`).**
+    *The defect.* Since Task 10b (ruling A5) the field width is the half-sample mode of every readable pass-1 read, on the
+    premise that every contaminant is WIDER than the PSF. A hot / warm pixel is narrower: raw m101's pools are mostly
+    single-pixel events, the mode sat at the 1.5 px clamp, every gate scaled to a 1.5-px star, and nothing said so. At 69b4710b
+    the stacking `measure` path read 0.379 (2025) / 0.094 (2023) of the reference product on m101 (29 of 30 frames at the floor)
+    and 0.094 on the raw M51 Halpha single; despiked copies read 0.962. Calibrated broad sets were never affected.
+    *The rule.* On a plane its caller states White (`PixelNoise::White`: raw / calibrated mono, the Analysis mode's 2x2
+    super-pixel plane), pass 1 (the 3-px kernel whose readable candidates give the field width and the knot envelope) searches
+    d_M, the 3x3 median of the background-subtracted plane d. Everything else reads d: the 6a neighbour rule (kept in both
+    passes), centroid, peak, the half-maximum reads, pass 2, the super-pixel plane, the knot tests, the fits. d_M is dropped
+    right after pass 1. A window holds its present pixels (finite, unmasked, inside the image); n >= 3 gives their median
+    (even n: the mean of the middle two), n <= 2 gives an absent cell, and a cell whose OWN pixel is absent is absent on d_M
+    (a masked centre never becomes a candidate). Noise: the noise map x `MEDIAN3_WHITE_COV`-derived gain G_M(F, step) (F 1.5
+    0.666 ... F 24 1.119), K = 6 unchanged. Mixed / Unknown (debayered) planes run no median. If no cell of a masked plane has a
+    median (an R/B-site mask) pass 1 falls back to d, as it did before route E. `from_stars == 0` pass 2 runs on d at 3 px.
+    Cost: column triples sorted once, med3(max of mins, med of meds, min of maxs), NEON / AVX2 lanes equal to the sort oracle
+    (`median3_cell`); MEASURE_VERSION stays 4 (one bump per merged plan) and staleness is proven by the runs' own logs.
+    *Never silent.* `FieldWidth::at_floor()` (a method: `from_stars > 0 && fwhm_px < 1.607042`, so it survives the stored
+    first-pass round trip) raises one `warn!` "field width at the clamp floor" per detected plane (`fwhm_px`, `mode_px`,
+    `from_stars`, `width`, `height`) and sets `channel.fieldWidthAtFloor` (skip-if-false; summary and TS too). **It fires** on a
+    sub-floor star field (all 12 lab `f1.2` families; ASI533MC `...0023`; the Gamma Scuti single `..._0010`, Step 5 ruling; R3
+    unmoved) and on the Markarian raw CFA-site MEASURE planes p0 / p2 (field width 1.52-1.56, S3-R3: a mixed plane whose pool a
+    narrow-read cluster wins, where design 3 had expected silence), and on a White pool still won by narrow reads (clusters of
+    >= 5 pixels, a dense jump path). **Two silent limits** (the `at_floor` doc comment in `star_measure/seeds.rs` is the wording): (1) a debayered (Mixed / Unknown)
+    plane with warm pixels - no median, so no flag unless the pool itself lands under the floor; triggers: a refused cosmetic
+    map on an OSC stacking frame (it stamps no `ATH_CHPX`) and a debayered Analysis plane; (2) on a masked plane whose median
+    has some present cell, a mask that thins the windows. The R/B-site CFA mask (no median cell at all) is NOT silent: it falls
+    back to the first pass on d with one warn, and `at_floor` still fires on d. No production caller sets a mask today. Callers
+    of given seeds (`field_width_of`: Peak / Structure seeds, LN refits, Plan C sites) carry `fieldWidthAtFloor` WITHOUT a
+    warn - the warn lives only in the detection path. Owner of the limits: Plan C's per-site table.
+    *Three recorded limits, with owners.* (a) Events inside a broad star's fit window: lab L3 completeness deficits against the
+    twin (`spikes/a` -1.54, `b` -5.88, `c0000` -1.49, `c0010` -4.17 pp), identical under `off` (the bar is pass1 >= off; about
+    one star: centreMoved / donut) - owner: a later fit-robustness cycle. (b) Half-sample-mode fragility on trail, flat-top
+    and wind-shaken pools (E3c): Horse C11 14 of 106 planes move > 2 % under pass1 and none is median-specific - 761 L 0009
+    (two satellite trails = 57 % of the pool: `off` 12.09 on the trail, pass1 6.86 on the stars, clean-star HSM 6.84, a near-tie),
+    837 G 0004 (wind-shaken, no single width: 9.87 -> 8.68), 842 G 0004 (pass1 corrects `off`: events pulled it 11 % low,
+    4.66 -> 5.25), 756 / 760 (flat tops, HSM noise); removing as many reads at random moves the same planes (median probability
+    0.44 vs 0.01 elsewhere), the HSM bootstrap sd is 2.0 % = the R4 bar - owner: its own cycle. Horse C11 L 0010 / L 0011
+    (2024-10-06) are untracked frames (every star a long streak) refused as trailed with "measure: the plane is trailed; no
+    star is measured"; run 6 integrated 104 of 106. (c) Debayered planes: the median is off there (silent limit 1) - owner: Plan C.
+    *Measured out, do not re-propose.* **`both`** (the reference product's whole model, pass 2 on d_M too): fails R1 `0015`
+    (0.994), R3 m42 (|d| 1.12 / 1.47 %), singles (1.016, 4 frames > 2 %) and L5' completeness (10 of 11 families, worst
+    `neb0.5` -2.44 pp): faint stars drop and the FWHM skews +1-2.5 %; nu50 at F 1.5 goes 5.9 -> ~10.5, broad +12-17 %. **The
+    KNOT_Z veto** (keep a d candidate when K o M >= 3.09 G_M): keeps 6-10 % of 3-in-a-line events and 34 % of 2x2 events, and
+    50 % / 38 % of m101's event seeds. **A d_M peak search** in `halfmax_read`: removes the ten ±2-px jumps onto an event but
+    widens reads 3-7 %. **A box-mean background** for the median. **The synthetic census collapse:** the lab families
+    `spikes/c0000` and `spikes/c0010` (star density 11.7 / 4.05 reads / Mpx, ln-sigma 0.145 / 0.048) did NOT reproduce the
+    collapse (RED 4.885 / 4.885 and 11.951 / 11.951 against twins; event : star reads 21 : 49 vs real 440 : 728), so the RED
+    proof rests on real m101 (R1, 0.379 / 0.094 under `off`). Route S (a neighbour-share screen below the floor read, plan text
+    in 2da08d82) is the fallback on paper only; on Horse C11 it would move none (it engages below 1.607 px only).
+    *Numbers.* Step 5: E head star_probe a445e109c2f2 differs from 69b4710b and the prototype; identity with the prototype's
+    `pass1` 961 / 961 once the new `fieldWidthAtFloor` key is dropped (without it 20 files differ: 2 corpus singles and 18 lab
+    `f1.2` planes; STOP P ruling); corpus R1 median 0.9469 (2025 0.947 / 2023 0.957, min 0.8705, 30 / 30 off the floor), `0015`
+    0.9505, R2 M51 Halpha 0.9911, R3 m42 0.9942 (max gap 0.23 %), singles 0.9973; set 204 R4 PASS (407 planes, frame FWHM max
+    0.05 %); Horse C11 R4 PASS by Q7's reading (14 moved, all explained: random band 14 / clean-star bracket 9 / reference 4 /
+    nearer 3; median ÷ reference 0.9592 -> 0.9590); registration 100 % sharp and broad; determinism identical. Step 6: probes
+    1041 / 1041 (inject 109 / 109); L1 0.9903-1.0000, L2 0.9968-0.9998, L3 pass1 >= off, L4, L5' 1523 / 1523 cells in 137
+    families, F-10 recall `neb0.5` 0.777 / `neb3` 0.539, PA-2 0 / Mpx; the 18 appended set-aside families (12 lab incl. 3 twins,
+    6 inject; S3 ruling) take `design.json` to 396 entries and the noreg diffs read 0 moved outside the list; the two OSC
+    inject families move in `analysis-mode` only (its 2x2 super-pixel plane is White). Median-noise gain ratio +0.3 % / -2.7 % (E3's Q5 measurement on the prototype, carried to the E head by Step 5's identity - not a Step 6 number).
+    Step 7 (lab 2739765): set 204 run 7 and Horse C11 run 6 succeed at their pinned references; "detection median plane built"
+    92 / 106 (= the White planes), "frame plane first pass" 407 / 106, Measure rows = measured frames (no stale reuse), floor
+    warns 0 / 0, gates 13 / 13, probe_parity 20 010 fits / 200 100 fields bit-equal. Step 8 (lab bc68fb9): median pass 0.262
+    ms / Mpx (m101 `0000`, 61.17 Mpx) and 0.193 (set 204 `0058`, 25.94 Mpx) against <= 0.35; B3 m42 0.500 s per frame, 0.937 x
+    69b4710b; 100 % of interior rows on the fast path; peak RSS delta vs 69b4710b +0.00 planes (star_probe 9.08 vs 9.07, m101
+    9.46 vs 9.47). **Open item (pre-existing):** the mono Measure peak is 8.82-8.83 planes (`measure_probe`, `0058`), the same at
+    69b4710b, against `MEASURE_PLANES_RESIDENT = 8` (fitted on an OSC frame): the working-set estimate is about 10 % low for
+    mono frames (`docs/superpowers/open-items.md`).

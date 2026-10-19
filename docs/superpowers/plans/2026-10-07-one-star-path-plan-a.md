@@ -275,6 +275,13 @@ panel), `sqlite3` with `immutable=1` for reading acceptance copies, the athenaeu
   `…_on_structured_sky`, `field_width_of_given_seeds_follows_the_same_rule` (old rule 4.40 / 10.00 vs the stars'
   2.76 / 3.30). M42's injected stars read 2.66 against the frame's own stars' 2.13: the injected PSF is broader than
   the frame's.
+  *Revised by Task 14b, route E (2026-10-19) - which plane the pool is searched on, not how a read is made:* on a plane its
+  caller states White, the first pass (the 3-px kernel whose readable candidates give the field width and the envelope)
+  searches d_M, the 3x3 median of the detection plane; the reads, the half-sample mode, pass 2 and the fits stay on d. A
+  hot / warm pixel is narrower than the PSF, so on raw mono frames the mode sat at the 1.5 px clamp and the premise above
+  ("every contaminant is wider") failed. A width under 1.607042 px is recorded, never silent (`FieldWidth::at_floor`, the
+  `warn!` "field width at the clamp floor" with `mode_px`, `channel.fieldWidthAtFloor`). Reference: `docs/stacking/README.md`
+  R-OSP-15; the Task 14b section below.
 - **PA-18 The border test geometry (ruling F17).** `RegionTooSmall` at the border is reachable only for a star
   broader than the field width: the test puts one Moffat-4 star of FWHM 12 in a field whose width is 3 px, 10 px
   from the border — its width-start box (radius `2·F_field = 6`) fits, its region is clipped at r = 10, and
@@ -6362,6 +6369,478 @@ on both machines, runner Matrix S PASS at b296dbc4, dev Mac at the final head PA
 
 ---
 
+### Task 14b: A field width robust to single-pixel events — route E, a 3×3 median on the detection plane of the field-width pass (R-OSP-15; inserted 2026-10-19 before Task 14's note; re-routed by the owner the same day, Fable-reviewed)
+
+**Why (Task 14's blocker and the owner's route).** Task 14's corpus table read the stacking `measure` path at 0.335 of
+the ERP on m101 (2025 set 0.379, 2023 set 0.094; baseline 0.9015) and the raw M51 Hα single at 0.094. The diagnostic
+(`task-14-report-m101-diag.md`, lab be106a6) named the FIELD WIDTH, not the fit: since Task 10b (3deb6cb5, wip 1bc29ef8,
+ruling A5) the width is the half-sample mode of every readable pass-1 read, on the premise that every contaminant of a
+half-maximum read is WIDER than the PSF; a hot / warm pixel is narrower, raw m101's pools are mostly single-pixel events,
+the mode sits at the 1.5 px clamp, every downstream gate is scaled to a 1.5-px star and nothing flags it (despiked copies
+read 0.962× the ERP; calibrated broad sets read right). Route S (a neighbour-share screen below the floor read) was
+planned and reviewed at 2da08d82; the owner then asked how the ERP bounds the width — it has no per-frame width: a 3×3
+median on a copy of the detection plane decides which structures are detected, every measurement reads the original —
+and ruled **«давай пробовать подход erp и в лабу добавь горячие пиксели»**: route E, the lab's hot-pixel families kept,
+the never-silent floor flag kept. Exposure: the Analysis tab on raw lights (Plan C) and any stacking frame that keeps
+warm pixels.
+
+**Design and review.** In `.superpowers/sdd/2026-10-07-one-star-path-plan-a/`: `task-14b-erp-design.md` (E1, opus,
+read-only: the ERP's mechanism, the numpy evidence, the rule, the E3 matrix); `task-14b-report-e2.md` (the prototype:
+branch `t14b-erp-proto` 5d2fea51 in the worktree `athenaeum-t14b-erp-proto`, star_probe sha256 c384be87…, a process-wide
+`--detect-median off|pass1|both` switch); `task-14b-report-{s0,s1,s1b,e3a,e3b,e3c}.md` (the numbers below);
+`task-14b-rulings.md` (S1-R1); `task-14b-review-erp-fable.md` (**READY WITH FIXES 0 C / 6 I / 4 M** — rulings Q1–Q10
+and fixes I1–I6, M1–M4 are binding and folded here; this section is the executable form). Route S
+(`task-14b-design.md`, `task-14b-review-fable.md`) is the fallback on paper only, at this section's text in 2da08d82
+(`git show 2da08d82:docs/superpowers/plans/2026-10-07-one-star-path-plan-a.md`, l.6365–6667). **MEASURE_VERSION stays
+4** (Q3: one bump per merged plan, Plan A is unshipped); that no pre-E Measure / Register / LN artifact is reused is
+proven by the runs' own logs (Step 7), not assumed from a cleared cache.
+
+**The rule (R-OSP-15, route E, arm `pass1`).**
+- **Placement.** On a plane its caller states White (C-10: raw / calibrated mono, Plan C's super-pixel plane), pass 1 —
+  the 3-px kernel whose readable candidates give the field width and the knot envelope — searches d_M, the 3×3 median
+  of the background-subtracted plane d. Everything else reads d, unchanged: the 6a hot-pixel rule (kept in both passes),
+  centroid, peak, the half-maximum reads, pass 2 (seeds, flux key, filter SNR), the super-pixel plane, the knot tests,
+  the fits. The width is the whole lever: the pool needs readable candidates only, where d_M costs ≤ 1 % of them; seeds
+  need completeness, where d_M would cost 12–17 % of ν on broad stars and 30–150 % at F ≤ 2 — the median never sits
+  under the seeds (Q1).
+- **Noise (Q5).** σ_f,M(x) = the noise map(x) × G_M(F, step); a White plane's read gain is 1 (`GainSource::Unmixed`), so
+  the `gain_read × G_M` composition never occurs. Pass 1 is always F 3, step 1: the shipped arm reads one cell, G_M(3, 1)
+  = 0.945, from `median_gain` over the six-number table `MEDIAN3_WHITE_COV` (derived, nothing read — C-10); K = 6
+  unchanged; no noise map → `run_pass`'s measured σ of K∘M. The other cells (F 1.5 0.666 · 2 0.803 · 4.7 1.041 · step 2
+  F 6 1.055 · 12 1.106) are the derived reference, pinned (M1), unused by the shipped arm.
+- **Mixed / Unknown planes (debayered OSC): no median.** A debayered event is a blob d_M keeps (96–100 %) and correlated
+  noise has no derived median gain; these planes stay byte-identical to 69b4710b (I1 (b) pins it).
+- **Masks and borders (E2's rule, adopted — Q10).** A cell whose own pixel is absent (masked, non-finite, a CFA site) is
+  absent on d_M; otherwise its window's present pixels: n ≥ 3 → their median (even n: the mean of the middle two),
+  n ≤ 2 → absent. G_M is the full window's (σ runs up to ~1.3× within 1 px of an edge: a few extra candidates whose read
+  boxes leave the image). A green-site checkerboard (5-pixel windows) is Plan C's table.
+- **`from_stars == 0`.** A pool that read nothing runs pass 2 on d at 3 px: the seeds are d's first-pass candidates,
+  as 69b4710b's `from_stars == 0` path gives them (M4 pins it), never d_M's.
+- **Cost and memory (Q9, I5).** The median of 9 is the column-triple network (column triples sorted once and shared by
+  three windows, then med3(max of mins, med of meds, min of maxs)); full rows in NEON (aarch64) / AVX2 (x86_64, runtime
+  detection) lanes with per-thread row buffers, bit-identical to the scalar path because min / max are exact (the scalar
+  generic sort is the oracle — R-OSP-14); partial windows scalar. d_M (4 B/px, plus its presence when masked) lives
+  through pass 1 only and is dropped before pass 2: the Detect peak is d + d_M + the filter buffers during pass 1. Fusing
+  the median into `convolve_rows` (banded) only if Step 8's measurement demands it.
+- **The floor flag (Q4, I4).** `FieldWidth::at_floor()` = the pool's UNCLAMPED half-sample mode lay below
+  `FIELD_WIDTH_FLOOR_READ_PX` 1.607042 (the narrowest read a representable star gives, route S §2) — the true
+  statement, no new count. It is a METHOD, `from_stars > 0 && fwhm_px < FIELD_WIDTH_FLOOR_READ_PX`, exactly equivalent
+  because the clamp floor 1.5 lies below 1.607042 (a mode < 1.5 reads 1.5, a mode in [1.5, 1.607042) reads itself).
+  `FieldWidth` keeps its two fields: the postcard `PlanePrep` of the first-pass artifact (Task 11c), which carries it,
+  neither changes bytes nor drops the flag on read-back (the prototype's `#[serde(skip)]` field decodes `false` on every
+  spilled plane). One `warn!` per detected plane at the floor, emitted right after the pool's width (before pass 2, so
+  no early return skips it), every plane kind: `"field width at the clamp floor"` {`fwhm_px`, `mode_px` (the unclamped
+  mode — new, logging dictionary), `from_stars`, `width`, `height`}. Given-seed pools (`field_width_of`: LN refits,
+  Peak / Structure seeds, Plan C's sites) answer the same method and do not warn (their callers read them many times per
+  frame). `ChannelMeasurement.field_width_at_floor` (`#[serde(default, skip_serializing_if = "std::ops::Not::not")]`:
+  unflagged payloads byte-identical), `SummaryFrame.field_width_at_floor` (any channel, `#[serde(default)]`), TS
+  regenerated. Stacking keeps the frame and measures it as is (record + warn, no M-3 — route S Q4 stands). The debug line
+  `"matched filter seeds detected"` keeps its 69b4710b fields (no `at_floor`, no `detect_median`).
+- **Never silent — scoped (Q4, I6).** The flag fires on a sub-floor star field (lab `sharp/*/f1.2`, ASI533MC `…_0023`
+  1.538 — the warn is right there) and on a White pool still won by narrow reads (≥ 5-pixel clusters, a dense jump
+  path). Two named silent limits, in the README and the doc comment with their triggers: a debayered plane (an
+  interpolated event reads ≈ 1.86 px > 1.607 and takes no median: the width can move without a flag; triggers a refused
+  cosmetic map on an OSC stacking frame — no `ATH_CHPX` — and Plan C's debayered Analysis) and an R/B-site CFA mask (as
+  route S Q5 wrote them).
+- **Recorded limits (out of 14b, each with its owner).** **(L3)** An event inside a broad star's 12-px fit window
+  refuses that one fit (residualTooLarge / centreMoved / donut) under every arm, `off` included — the fit reads d by
+  design, as the ERP's fits read the original; ≤ 1 star per plane in raw Analysis mode, nil in stacking where the
+  cosmetic map runs before Measure → the fit-robustness cycle (a single-pixel outlier clip inside the fit window),
+  beside route S's narrow-side refusal (Q6). **(HSM)** A trail-dominated, flat-topped or wind-shaken pool is HSM-fragile
+  (E3c, Horse C11: HSM bootstrap sd 2.0 %, 32 of 106 planes with P(move > 2 % under random removal) ≥ 0.2; satellite
+  trails 57 % of 761's pool (`L 0009`); 837 (`G 0004`, 10-05) wind-shaken; 811 (`L 0010`, 10-06) four trails, FWHM 0
+  under both arms) → its own cycle and estimator (Q8); 14b only checks that 811 hits the existing zero-fitted warn
+  (Step 7). **(Debayered)** as above. Reported, not ruled (Q2): route S's M2 — the share of accepted fits below 0.715·F_field
+  on m101 `0000` / `0010` and `spikes/c0000` (the narrow-side refusal cycle starts there).
+- **Measured out (do not re-propose).** Arm `both`, the ERP's whole model (pass 2 on d_M too): faint stars lost, FWHM
+  +1–2.5 % — R1 `0015` 0.9938, R3 m42 1.12 / 1.47 %, singles 1.0156 with four > 2 %, L5′ completeness −0.9…−2.4 pp on 10
+  of 11 families (Q1). The KNOT_Z veto (keeps 6–10 % of three-in-a-line events, 34 % of 2×2 events, 38–50 % of raw
+  m101's event seeds). A peak search on d_M for the half-maximum read (removes 10 of `0000`'s 12 remaining narrow reads,
+  widens reads 3–7 %). A box-mean background in the gain check (high-passes broad-kernel noise by up to −18 %). A
+  synthetic census collapse (Steps 1 / 1b: census-density event families read their twins' widths; S1-R1 puts the RED
+  proof on real m101).
+
+**Files.**
+- Modify (athenaeum, Step 3): `crates/athenaeum-core/src/star_measure/seeds.rs` — ported from 5d2fea51 (`git show
+  5d2fea51:crates/athenaeum-core/src/star_measure/seeds.rs`; 20d01b52's pool dump is never merged) WITHOUT `DetectMedian`,
+  the `AtomicU8`, `set_detect_median` / `detect_median()`, the `Both` arms, `detect_on`'s `detect_median` parameter and
+  debug fields (`median_on = pixel_noise == PixelNoise::White`), and WITH: `FieldWidth::at_floor()` in place of the
+  prototype's field, `field_width_of_reads` returning the unclamped mode, the warn after the pool, d_M dropped after pass
+  1, `median3`'s SIMD rows and per-thread row buffers (the prototype allocates three `Vec`s per row), the M1 / M2 doc
+  text, PA-17 / A5's doc text on `field_width_from` (the "every contaminant reads wider" premise now holds on d_M's pool,
+  not d's), the tests below. `stacking/measure.rs` (`ChannelMeasurement` beside `beta_own_at_cap` l.211; the adapter
+  literal l.1126 = `m.field_width.at_floor()`; the two Debug goldens l.2966 / l.3067 re-pinned — a format change, not a
+  number), `stacking/weights.rs` (the literal l.863), `stacking/provenance.rs` (`SummaryFrame` beside `beta_own_at_cap`
+  l.145), `stacking/run.rs` (the summary fill l.~9626), `src/types/stacking.ts` (regenerated: `TS_RS_WRITE=1 cargo test
+  -p athenaeum-core --test ts_contract`, never by hand), `crates/athenaeum-core/examples/star_probe.rs`
+  (`fieldWidthAtFloor` on the measure and analysis-mode frame lines l.846 / l.1163, always; the header doc; no
+  `--detect-median`). `star_measure/mod.rs` and `fit.rs` stay untouched (no `FieldWidth` literal changes). No command,
+  route or UI change (the two-backend rule is untouched).
+- Docs (Step 9): `docs/stacking/README.md` R-OSP-15; this plan's PA-17 ("Revised by Task 14b, route E");
+  `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md` (field dictionary: `mode_px`); `task-14b-erp-design.md`
+  (I6); the ledger; this task's Outcome.
+- athenaeum-lab — done in Steps 0–1b (lab 65441ee / 55727a3 / d155496): `star-lab/bin/{despike,spikes_census,
+  calibrated_field_width,median_gain_check}.py`, `manifests/spikes-m101.json`, `starlab/{artefacts,families}.py`,
+  `manifests/v2.json` (+15 entries), `results/plan-a/t14b/{design.json,bars.py,corpus_bars.py,red_read.py}`, their tests.
+  Step 2 modifies `results/plan-a/t14b/{bars.py,corpus_bars.py}`, `bin/{calibrated_field_width,median_gain_check}.py`,
+  `harness/acceptance/tier1/tier1-run.sh` (+ README item 12), and creates `bin/probe_identity.py`, `bin/hsm_pool.py`,
+  `bin/register_check.py`, `harness/acceptance/tier1/run_log_count.py`, `results/plan-a/t14b/e3a-lab-families.txt`;
+  Step 9 appends the `t14b` entries to `results/plan-a/design-cumulative.json`.
+
+**Interfaces.**
+
+```rust
+// star_measure/seeds.rs — ported from 5d2fea51 (no DetectMedian, no AtomicU8, no set_detect_median, no `Both`)
+/// The narrowest half-maximum read a representable star gives (route S §2: floor_read_px(4, 4) = 1.607 041 5…).
+const FIELD_WIDTH_FLOOR_READ_PX: f64 = 1.607042;
+/// The autocovariance of the median-of-9 of white noise, normalised to the pixel variance, by lag class (0,0) (1,0) (1,1)
+/// (2,0) (2,1) (2,2), zero beyond lag 2 (NOISE_CORR_REACH): a Monte Carlo of 2.5·10⁸ windows (E2) (M1).
+const MEDIAN3_WHITE_COV: [f64; 6] = [0.16612, 0.09492, 0.06085, 0.04497, 0.02959, 0.01463];
+/// σ(K∘d_M) ÷ σ_pixel of white noise at a kernel of FWHM `fwhm` on a grid of `step` (NoiseCorrelation::gain's formula).
+fn median_gain(fwhm: f64, step: usize) -> f64;
+/// d_M: own pixel absent → absent; else n ≥ 3 present → their median (even n: middle-two mean); n ≤ 2 → absent.
+/// Returns the plane (absent cells 0) and, unless every cell is present, the presence. Full rows in SIMD lanes.
+fn median3(d: &[f32], present: Option<&[bool]>, w: usize, h: usize) -> (Vec<f32>, Option<Vec<bool>>);
+impl FieldWidth {
+    /// The pool's unclamped half-sample mode lay below FIELD_WIDTH_FLOOR_READ_PX (Q4): `from_stars > 0 && fwhm_px <
+    /// FIELD_WIDTH_FLOOR_READ_PX`, exact because the clamp floor 1.5 lies below it; `false` for a given width.
+    pub fn at_floor(&self) -> bool;
+}
+/// The readable reads' half-sample mode, clamped, and the UNCLAMPED mode (`None` for an empty pool) for the floor warn.
+fn field_width_of_reads(widths: &mut [f64]) -> (FieldWidth, Option<f64>);
+// detect_on keeps 69b4710b's signature; inside: `let median_on = pixel_noise == PixelNoise::White;`
+// stacking/measure.rs, ChannelMeasurement (beside beta_own_at_cap)
+#[serde(default, skip_serializing_if = "std::ops::Not::not")] pub field_width_at_floor: bool,
+// stacking/provenance.rs, SummaryFrame
+#[serde(default)] pub field_width_at_floor: bool,   // any channel
+// examples/star_probe.rs, the measure and analysis-mode frame lines
+"fieldWidthAtFloor": pm.field_width.at_floor(),
+```
+
+**Unit tests (`seeds.rs` unless named; written first — the RED one is run at the branch's code, which is 69b4710b's,
+and its failure recorded before any rule code).**
+- `median3_is_the_fifth_of_a_sorted_window` (E2's, extended — M2): random, ties, masks incl. 70 % absent, borders; a NaN
+  pixel routes its rows to the generic path and is never a median input; a masked-corner fixture pins even n (n = 4 →
+  the middle-two mean), n ≤ 2 → absent, and an absent own pixel → absent although n ≥ 3; the NEON / AVX2 rows bit-equal
+  to the generic sort on random and tie-heavy rows at every row-tail length.
+- `median3_removes_events_up_to_four_pixels_not_a_debayered_blob` (E2's).
+- `median_gain_matches_a_white_noise_simulation` (E2's — M1): F 1.5 / 3 / 4.7 step 1 on 2048², step-2 F 6 / 12 on 4096²,
+  ± 1 %; the table cells F 1.5 0.666 / 2 0.803 / 3 0.945 / 4.7 1.041 / step-2 F 24 1.119 ± 1 %.
+- **RED** `field_width_reads_broad_stars_among_single_pixel_events` (E2's `detect_median_pass1_…`, the arms gone): 300
+  Moffat-4 F 5 stars on 2048², 1 324 events / Mpx (half pure, half with two 0.3·e neighbours, e 13–200 σ): the width
+  within PA-17's 10 % of the event-free twin's and `!at_floor()`. At 69b4710b it reads the 1.5 clamp (the RED run
+  asserts the width only — `at_floor()` does not exist there).
+- `a_sub_floor_field_is_flagged_and_warned_once` (E2's `a_sub_floor_field_is_flagged_at_the_floor` + I4): F 1.2 →
+  `at_floor()` and exactly one `"field width at the clamp floor"` warn with `mode_px` < 1.607042 and `fwhm_px` 1.5; F 3 →
+  neither (the log-asserting pattern of `docs/logging/README.md`).
+- `at_floor_is_the_unclamped_mode_below_the_floor_read` — `field_width_of_reads` over pools whose mode is 1.2 / 1.5 /
+  1.6 / 1.607042 / 1.61 / 3 / 30 and an empty pool: `at_floor()` == (unclamped mode < `FIELD_WIDTH_FLOOR_READ_PX`), the
+  returned mode unclamped (the method's equivalence, pinned).
+- `the_white_plane_detector_digest_is_pinned` (I1 (a)) — E2's FNV `detect_digest` (seeds, width, report) of the NEW
+  detector on `fixture_field(7, 1.0, 0.002)` as White; the report quotes it beside 69b4710b's `0x654630f1e236762b`.
+- `a_plane_not_stated_white_detects_as_before` (I1 (b)) — the same fixture as Mixed and as Unknown: each digest equal
+  to the 69b4710b detector's, recorded at the branch's code before the port (if they equal `0x654630f1e236762b` the
+  test pins that one constant).
+- `a_pool_that_reads_nothing_seeds_as_the_old_first_pass` (M4) — a White fixture of faint stars whose pass 1 yields no
+  readable read on d nor on d_M: `from_stars` 0 and the digest equal to the 69b4710b detector's on it (its first-pass
+  candidates as seeds), recorded before the port.
+- `stacking/measure.rs`: `a_floor_field_width_rides_the_channel_and_the_summary` — a sub-floor mono plane through the
+  two-pass group measure WITH its first pass spilled and read back (`pass1_artifact`): `field_width_at_floor` on the
+  channel and on `SummaryFrame`; an unflagged payload's JSON bytes unchanged; a payload without the field deserializes.
+- Existing: E2's `detect_median_off_is_bitwise_the_old_detector` dies with the switch (I1). The two Debug goldens re-pinned
+  (format only). Every White-plane detection test whose pass-1 pool can move (stars ≤ 2 px, event fixtures) swept for
+  invalidated pins (F14), each re-pin named in the report with what the median removed. `pass1_artifact`'s encoding pins
+  untouched (`FieldWidth` unchanged, `PASS1_ARTIFACT_VERSION` 1).
+
+**The lab state.** Steps 0–1b built 15 manifest entries (lab 55727a3 / d155496): seven event families
+`spikes/{a/m4/f5.0, b/m4/f12.0, pure/m4/f5.0, a/m4/f2.6, a/gauss/f1.6, c0000/m4/f5.0, c0010/m4/f12.0}`, each with its
+`…/clean` twin (same field key, noise key and seeds, events off — the truth anchor), and `under/gauss/f1.5` (no events,
+random phase — the anchor-edge control). Events follow the m101 census (`manifests/spikes-m101.json`: the rate, the e/σ
+quantiles, the e ≥ 50 σ stamps; `pure` = delta stamps); `c0000` / `c0010` add the census's star side (11.9 / 4.3
+readable reads per Mpx, per-star FWHM ln-σ 0.145 / 0.048 — S1-R1). None collapses at 69b4710b (S1, S1b): the lab
+proves no regression and the event-fit limit; real m101 proves the fix (R1). `results/plan-a/t14b/design.json`
+(`step: "t14b"`, PA-19 set-aside): the 12 `sharp/*/f1.2` + `twins/sharp/*/f1.2`, `spikes/*`, `under/gauss/f1.5`;
+`bars.py` reads the event families from it (I2, Step 2).
+
+**Bars (fixed now, as Fable worded them; truth bars at E3's `pass1` values ± the tool's precision).**
+- **R1** m101: per-subset median measure ÷ ERP ≥ 0.90 — 2025 (`0000`–`0014`, 15) and 2023 (`0001`–`0015` without the
+  known-bad ERP rows `0002` / `0004`, 13); no counted frame < 0.85 (one below goes to the I3 adjudicator, sonnet: despike
+  it with `bin/despike.py`, read it with the same binary; E ÷ despiked-E ≥ 0.95 → the ERP's row, recorded; else ours);
+  `fieldWidthAtFloor` false on all 30; `0015` within ± 1 % of 0.950. E3a `pass1`: 0.9469 (min 0.8705) / 0.9573, 30 / 30,
+  0.9505. **R2** M51 Hα ≥ 0.85, not at floor (0.9911). **R3** m42: median ÷ ERP within ± 0.005 of 0.994 and every frame
+  |ΔFWHM| ≤ 1 % vs `off` (0.9942, max 0.21 %); singles median within ± 0.005 of 0.996 (0.9973), each within ± 2 % of
+  `off` except M51 Hα and ASI533MC `…_0023` (sub-floor: `fieldWidthAtFloor` true allowed, recorded); m42 `0054`
+  (trailed, 0 fitted under `off` too) and the 5 XISF singles (FITS-only reader) are probe gaps, recorded, not misses
+  (M3).
+- **R4** set 204 (407 planes, as written): field width |E ÷ off − 1| ≤ 2 %, or `from_stars` fell ≥ 10 % and frame FWHM
+  ÷ ERP in 0.94–1.06; frame FWHM |Δ| max ≤ 1.5 %, median ≤ 0.5 %; sharp-run seeds ≥ 0.99 × `off`; none at floor (E3b:
+  407 / 407, 0.05 % / 0.000 %, 1.0000, 0). Horse C11 (106 planes, Q7 — the estimator's noise is the bar's size there):
+  per plane |E ÷ off − 1| ≤ 2 %, OR the move lies inside the plane's random-removal 5–95 % band (300 removals of as many
+  reads as E removed), OR E's width lies inside the clean-star HSM / median bracket or nearer it than `off`'s; the
+  frame-FWHM max clause only on planes none of the three explains; set level median frame FWHM ÷ ERP within ± 0.5 pp of
+  `off` (0.9592 → 0.9590). The ERP is not the per-plane referee on trailed frames (761 `L 0009`: its 8.93 sits above 8
+  of 9 night-mates; the clean-star HSM 6.84 = E 6.86). Fable's reading of E3b / E3c: PASS.
+- **Lab** — **L1** F_field(events) ÷ twin ∈ [0.97, 1.03] on every `spikes/*` event family; **L2** frame FWHM(events) ÷
+  twin ∈ [0.97, 1.01] (`spikes/a/gauss/f1.6` [0.97, 1.03]); **L3** (Q6) completeness(E) ≥ completeness(`off`) per event
+  family, the deficit vs the twin reported with its refusal reasons (E3a: −1.54 / −5.88 / −1.49 / −4.17 pp on `a` f5.0 /
+  `b` / `c0000` / `c0010`, `off` the same); **L4** `fieldWidthAtFloor` false on every `spikes/*` event family and
+  `under/gauss/f1.5`, the latter F_field ± 1 % and frame FWHM ± 0.5 % vs `off`; **L5′** every family outside
+  `design.json` vs `off`: FWHM bias vs truth ± 0.5 pp, FWHM scatter ≤ 1.05×, completeness ≥ `off` − 0.5 pp, false / Mpx
+  ≤ `off` + 0.1, β median ± 2 % (E3a: every delta 0); the 12 `f1.2` families by their existing bars (F-1 / F-4 frame
+  FWHM vs pointfit ≤ 3 % below F 2; twins ≤ 1 % FWHM, β ≤ 10 %), `fieldWidthAtFloor` recorded; **F-10** recall `neb0.5`
+  ≥ 0.743, `neb3` ≥ 0.499, ≤ 3 false / Mpx, `halo` ≤ 5 (0.777 / 0.539, 1.67 / 2.38, 2); **PA-2** every `twins/*` and
+  `artefacts` ≤ 0.5 false / Mpx of cause `nothing` (0.000).
+- **Noise gain (Q5):** σ(K∘M) ÷ σ(K∘d) on structure-free frame-difference pairs within ± 3 % of G_M at F 3 step 1 — met
+  (E3b: +0.3 % set 204 `0058`–`0059`, −2.7 % m101 `0000`–`0001`; Step 2's tool reproduces it). A property of the derived
+  table, not of the code: re-read only if the table changes.
+- **Registration** ≥ 98 % of `off`'s top-500 register stars within 0.05 px (10 sharp + 10 broad, set 204; E3b 100 % /
+  100 %). **Determinism** m101 `0000` twice and at `RAYON_NUM_THREADS=1`: identical.
+- **Cost (Q9) and memory (I5):** the median pass ≤ 0.35 ms / Mpx (median of 3, on m101 `0000` 61.17 Mpx and set 204
+  `0058` 25.94 Mpx (6224 × 4168; the plan's 26.09 was wrong, Step 8 report); E2's scalar 0.65 / 0.49); B3 analysis-mode ≤ 0.6 s per m42 frame and ≤ 1.03 × `off` by an
+  interleaved bracket (0.439 is stale: E3b's `off` read 0.4558); the Measure peak within R-OSP-13's per-frame working set
+  (`MEASURE_PLANES_RESIDENT` = 8 planes of one f32 channel).
+- **Staleness (Q3, I3):** in run 7 (set 204) and run 6 (Horse C11) at the E head, one `detection median plane built`
+  per measured White plane, one `frame plane first pass` per measured plane and a Measure artifact row per measured
+  frame, all inside the run's window — then probe_parity is re-armed on run 7 (gates 13 / 13).
+- **Never silent (Q8):** Horse C11's 811 (`L 0010`, 10-06) carries an existing zero-fitted warn in run 6's log.
+- **Identity:** the Mixed / Unknown digests unchanged (I1 (b)); the E head's outputs equal the prototype's `pass1`
+  everywhere E3 measured it (Step 5).
+
+**STOPs — who rules (recorded in `task-14b-rulings.md`; the owner informed, never a menu).**
+- **T** (Step 2): a re-worded tool does not reproduce Fable's reading of E3's own outputs → the controller (a tool bug;
+  Fable only if the reading itself is in question).
+- **P** (Step 5): an E-head output differs from the prototype's `pass1` → the controller; a sonnet run re-judges every
+  truth bar on the E head's outputs with Step 2's tools; any miss → S2.
+- **S2**: a truth bar misses — R1 (adjudicated ours), R2, R3, R4 unexplained by Q7's reading, L1, L2, L4, F-10, PA-2 →
+  **Fable** rules a fix vs route S (the paper fallback at 2da08d82); `both` stays measured out.
+- **S3** (Step 6): a family outside `design.json` misses L5′, or an inject row moves outside the list → **Fable**.
+- **Q3** (Step 7): a staleness count short (a pre-E artifact reused) → the controller: delete that clone's Measure work
+  (`stackwork/*/measured`), re-run; no ruling.
+- **Q8** (Step 7): 811 measured without a zero-fitted warn → **Fable** (the never-silent rule).
+- **C** (Step 8): the cost or memory bar missed → the controller dispatches performance work (the fused banded median in
+  `convolve_rows`), then Step 8 again — never route S (Q9).
+
+**Steps** (lean-execution: one phase per agent with a one-page handoff, reports ≤ 80 lines, one heavy job at a time on
+the dev Mac — 16 GiB, one compile at a time).
+
+Done before this fold (records; their outputs are inputs below):
+- [x] **Step 0 — census and m101 references** (lab 65441ee, `task-14b-report-s0.md`): despike.py's criterion (e > 5 σ,
+  brightest neighbour < 0.35·e) on full frames — `0000` 81 040 events (1 324.8 / Mpx), `0010` 35 469 (579.8 / Mpx); the
+  e ≥ 50 σ events' median share 0.0036 / 0.0075 (S = the 8 neighbours' summed excess ÷ e): pure single pixels, S0 not
+  fired; 69b4710b (star_probe a2d11d4a…, copied to `~/.athenaeum-acc/star-lab-a/t14b/star_probe-69b4710b`) raw →
+  despiked `from_stars` 1 168 → 728 (width 1.50 → 4.684) and 429 → 262 (1.50 → 11.304).
+- [x] **Step 1 — families, tools, RED read** (lab 55727a3, `task-14b-report-s1.md`): the five event families + twins +
+  `under/gauss/f1.5`, `bars.py` / `corpus_bars.py` / `calibrated_field_width.py` / `median_gain_check.py`, 914 lab tests;
+  **STOP S1 fired**: the families read their twins' widths (`spikes/a` 5.148 = twin, `b` 11.937, `pure` 5.148) →
+  S1-R1 (the census's star side as two new families, one try).
+- [x] **Step 1b** (lab d155496, `task-14b-report-s1b.md`): `spikes/c0000/m4/f5.0` (80 stars → 11.68 reads / Mpx) and
+  `spikes/c0010/m4/f12.0` (30 → 4.05) + twins read 4.885 / 4.885 and 11.951 / 11.951 → S1 fired again; per S1-R1 the
+  RED proof rests on real m101 (event : star reads 21 : 49 here vs 440 : 728 on real `0000`).
+- [x] **E1 – E3c and the review**: E2 smoke m101 `0010` — `off` = 69b4710b (1.500 / 1.1557), E width 11.299, FWHM 11.749
+  (0.958 × ERP), median 38–40 ms scalar on 61 Mpx. E3a (lab fd1f100): `off` = 69b4710b (corpus 420 / 420, lab 539 / 541
+  + 2 wall-clock-only); `pass1` meets R1–R3 and L1, L2, L4, L5′, F-10, PA-2 at the values under **Bars**; `both` fails
+  (measured out). E3b (lab 3a166cd): set 204 R4 PASS; Horse C11 14 planes moved (judged under Q7); noise gain, registration,
+  determinism, B3 1.017 × `off` (0.4636 / 0.4558 s); the median 0.96 % of set 204's Measure but 5.3 % on m101 `0000`
+  (scalar). E3c (proto 20d01b52 pool dump, lab a76116a): the moves are HSM fragility, not the median. Fable: READY WITH
+  FIXES → this section.
+
+- [ ] **Step 2 — the bar tools as Fable worded them (lab code; sonnet; ≈ 2.5 h; no build, no probe run; may run beside
+  Step 3).** (a) `bars.py`: the event families from `design.json`'s `spikes/*` entries (fnmatch over the manifest, twin
+  = `…/clean`) instead of five names, so `c0000` / `c0010` are judged by the tool (retires `e3a/tools/bars14.py`); L3
+  per Q6 with the deficit and its refusal reasons printed; M2's sub-`0.715·F_field` accepted share on `spikes/c0000`
+  printed. (b) `calibrated_field_width.py`: R4 per Q7 (the three-way reading, the set-level clause, the max clause only
+  on unexplained planes; `--sharp` absent → the seeds clause reads n/a, not MISS); the band and the bracket from E3c's
+  `pool_lib.py` / `set_level.py` / `clean_all.py` promoted as `bin/hsm_pool.py` (substance unchanged), reading E3c's
+  pool dumps `~/.athenaeum-acc/star-lab-a/t14b-erp/e3c/{off,pass1}/<id>/` (proto 20d01b52) — valid for the E head once
+  Step 5 proves its per-plane outputs equal the prototype's `pass1`. (c) `median_gain_check.py --ratio`: σ(K∘M) ÷ σ(K∘d)
+  on structure-free frame-difference pairs (E3b's `noise_correlation.py`, promoted) vs G_M. (d) `corpus_bars.py`: the M3
+  gaps print `gap`, not `miss`; M2's share on m101 `0000` / `0010`; `adjudicate` takes `--probe-args ""`. (e)
+  `bin/probe_identity.py NEW REF… [--drop-key K]…` from `e3a/tools/ident.py` (always drops `wallMs` / `timings` /
+  `analyzed_at`; NEW and REF are directories or single files). (f) `bin/register_check.py OUTDIR NAME=PROBE[,ARGS]…`
+  from `e3b/register_check.py` (arms by binary, the first is the baseline). (g)
+  `results/plan-a/t14b/e3a-lab-families.txt`: the 78 families E3a probed
+  (`~/.athenaeum-acc/star-lab-a/t14b-erp/pass1/lab/`). (h) `tier1/tier1-run.sh`: `ATH_ACC_LOG_EXTRA`, if set, is
+  appended to its `ATHENAEUM_LOG` (README item 12); `tier1/run_log_count.py <clone> --set-id N --run-id R MESSAGE…`
+  prints, inside the run's window (its `stacking_runs` start / finish), the count of each message (and the `path` of
+  each line that carries one), the run's measured planes, White (mono) planes and frames from its rows, and the Measure
+  artifact rows written in the window. A fixture test per tool; `python3 -m unittest` green. Then the re-worded tools
+  re-judge E3's own outputs — fixed answers, Fable's reading: `bars.py` on E3a's `off` / `pass1` scorecards → L1 L2 L4
+  L5′ F-10 PA-2 PASS, L3 PASS with the four deficits above; R4 on E3b's planes → set 204 PASS, Horse C11 PASS (761, 837,
+  842 nearer or inside; 756, 760 inside the bracket; the other nine of the 14 moved planes inside the band; set level
+  0.9592 → 0.9590); `--ratio` F 3 step 1 +0.3 % / −2.7 %; `corpus_bars.py` R1–R3 PASS with the gaps. Else **STOP T**.
+  Lab commit + push.
+- [ ] **Step 3 — the code (rust-engineer sonnet; ≈ 5 h) on `one-star-path-t14b`.** First, at the branch's code (=
+  69b4710b's): the tests above written; the RED one run and its failure recorded; the 69b4710b digests (Mixed and
+  Unknown on `fixture_field(7, 1.0, 0.002)`, the `from_stars == 0` fixture) recorded by a throw-away print, then pinned.
+  Then the port (**Files**), the SIMD rows, the stacking field, the probe key, the regenerated types.
+
+  ```
+  cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
+  git show 5d2fea51:crates/athenaeum-core/src/star_measure/seeds.rs > <scratchpad>/seeds-5d2fea51.rs   # the port's source
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib star_measure:: -- --test-threads=4 2>&1 | tail -5
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib stacking:: -- --test-threads=4 2>&1 | tail -5
+  TS_RS_WRITE=1 CARGO_TARGET_DIR=.superpowers/target-acc cargo test -p athenaeum-core --test ts_contract && git diff --stat src/types/
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo check -p athenaeum-core --all-targets && CARGO_TARGET_DIR=.superpowers/target-acc cargo check -p athenaeum-core --no-default-features
+  rustfmt <the changed .rs files>
+  git diff 2da08d82 -- crates/ src/ | grep -c -i -E "$(python3 -c 'import sys; sys.path.insert(0,"../athenaeum-lab/star-lab/bin"); import run_probe; print(run_probe.erp_pattern())')"   # 0
+  ```
+
+  One commit: `fix(stacking): Plan A Task 14b - the field-width pass searches a 3x3 median of the detection plane on
+  white planes (route E), a never-silent floor flag (R-OSP-15)`. The report quotes the White digest old → new, the
+  Mixed / Unknown and `from_stars == 0` values, and every re-pinned existing test with its reason.
+- [ ] **Step 4 — review (opus)** of `git diff 2da08d82..HEAD -- crates/ src/` against this section, the E design, the
+  Fable review and `git diff 2da08d82 5d2fea51` (what was ported, what was dropped). Focus: no switch residue; the Mixed /
+  Unknown path untouched; d_M dropped before pass 2; SIMD = scalar (the oracle reaches every lane width and row tail);
+  `at_floor()`'s equivalence and its read-back through the first-pass artifact; one warn per plane; `from_stars == 0`;
+  unflagged payload bytes. Critical / Important → a fix round by a FRESH rust-engineer with a handoff; Fable if it
+  struggles.
+- [ ] **Step 5 — the E head equals the prototype's `pass1` (haiku, fixed answers; ≈ 2.5 h).**
+
+  ```
+  cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-core --example star_probe --example ln_scale_probe --example measure_probe
+  P=$PWD/.superpowers/target-acc/release/examples/star_probe; T=~/.athenaeum-acc/star-lab-a/t14b; E=~/.athenaeum-acc/star-lab-a/t14b-erp
+  SHA=$(shasum -a 256 $P | cut -c1-12); echo $SHA    # SHA = the E head's star_probe, recorded
+  cmp -s $P $T/star_probe-69b4710b && echo SAME-AS-69b4710b-STOP
+  cmp -s $P ../athenaeum-t14b-erp-proto/.superpowers/target-acc/release/examples/star_probe && echo SAME-AS-PROTO-STOP
+  cd ../athenaeum-lab/star-lab; R=results/plan-a/t14b; mkdir -p $E/e4
+  export ATHENAEUM_REPO=/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum STAR_PROBE_ARGS="--diagnostics --seeds matched --seed-threshold 6.0"
+  python3 bin/run_probe.py manifests/corpus.json --out $E/e4/corpus && python3 bin/run_probe.py manifests/corpus.json --out $E/e4/corpus --verify --expect-sha $SHA
+  FAMS=$(paste -sd, $R/e3a-lab-families.txt)
+  python3 bin/run_probe.py manifests/v2.json --families $FAMS --out $E/e4/lab && python3 bin/run_probe.py manifests/v2.json --families $FAMS --out $E/e4/lab --verify --expect-sha $SHA
+  python3 bin/calibrated_field_width.py --acc ~/.athenaeum-acc/starA-s204 --frame-set 204 --run-id 6 --probe $P --out $E/e4/s204 --base $E/e3b/off/s204 --sharp 74-82,137-144 --erp-json $E/e3b/erp-s204.json > $R/e4-r4-s204.txt
+  python3 bin/calibrated_field_width.py --acc ~/.athenaeum-acc/hc11B-f1 --frame-set 182 --run-id 5 --probe $P --out $E/e4/hc11 --base $E/e3b/off/hc11 --erp-json $E/e3b/erp-hc11.json --hsm-dir $R/e3c > $R/e4-r4-hc11.txt
+  { python3 bin/probe_identity.py $E/e4/corpus $E/pass1/corpus --drop-key detectMedian
+    python3 bin/probe_identity.py $E/e4/lab $E/pass1/lab --drop-key detectMedian --drop-key ms
+    python3 bin/probe_identity.py $E/e4/s204 $E/e3b/pass1/s204 --drop-key detectMedian
+    python3 bin/probe_identity.py $E/e4/hc11 $E/e3b/pass1/hc11 --drop-key detectMedian; } > $R/e4-identity.txt
+  python3 $R/corpus_bars.py --arm off=$E/off/corpus --arm pass1=$E/e4/corpus --out $R/e4-corpus-bars.txt
+  F0="$HOME/Pictures/star test/m101/2025-05-24_00-29-31_R_-10.00_120.00s_0000.fits"
+  for k in a b; do $P measure "$F0" --paths measure --diagnostics --seeds matched --seed-threshold 6.0 --out $E/e4/det-$k.jsonl; done
+  RAYON_NUM_THREADS=1 $P measure "$F0" --paths measure --diagnostics --seeds matched --seed-threshold 6.0 --out $E/e4/det-c.jsonl
+  { python3 bin/probe_identity.py $E/e4/det-b.jsonl $E/e4/det-a.jsonl; python3 bin/probe_identity.py $E/e4/det-c.jsonl $E/e4/det-a.jsonl; } > $R/e4-determinism.txt
+  python3 bin/register_check.py $E/e4/register off=$T/star_probe-69b4710b pass1=$P > $R/e4-register.txt
+  ```
+
+  Fixed answers: the sha differs from both; `--verify` proves corpus 420 / 420 and the lab every job but the two
+  ln_scale_probe `sel` jobs (as in E3a); `e4-identity.txt` all equal (corpus 420, lab 541, set 204 407 planes, Horse
+  C11 106 planes); the R4 verdicts PASS (set 204 as written, Horse C11 by Q7's reading); `e4-corpus-bars.txt` at E3a's
+  `pass1` cells (R1 0.9469 / 0.9573, min 0.8705, `0015` 0.9505, 30 / 30 off the floor; R2 0.9911; R3 0.9942 / max
+  0.21 %, singles 0.9973, the M3 gaps), ASI533MC `…_0023`'s `fieldWidthAtFloor` and M2's shares printed; determinism
+  identical; registration ≥ 98 % sharp and broad. *Amended at Step 9 (STOP P ruling):* `e4-identity.txt` is all equal once the new `channel.fieldWidthAtFloor` key (I4; the prototype never had it) is dropped from the compared files — without that drop 20 files differ (2 corpus singles, 18 lab `f1.2` families); the R4 Horse C11 line carries `--hsm-dir $R/e3c` (above), without it Q7's reading is not applied and the verdict is FAIL. Any other answer → **STOP P** (no results commit; the identity file
+  to the controller). Lab commit (`results/plan-a/t14b/e4-*`) + push.
+- [ ] **Step 6 — the lab cycle at the E head (sonnet judgment; ≈ 3 h; ≥ 100 GiB free, lab_cycle's rule).**
+
+  ```
+  cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab
+  python3 star-lab/bin/lab_cycle.py --step t14b --prev final --inject --expect-sha a445e109c2f2,c0c430320d91 \
+    --design /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/star-lab/results/plan-a/t14b/design.json \
+    --prev-extract ~/.athenaeum-acc/star-lab-a/results/final/final-same-star.tsv.gz \
+    --athenaeum /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
+  cd star-lab; A=~/.athenaeum-acc/star-lab-a; R=results/plan-a/t14b
+  python3 $R/bars.py --design $R/design.json --arm off=$A/t14b-erp/scorecards/sc-off.json.gz,$A/t14b-erp/off/lab --arm pass1=$A/results/t14b/scorecard.json.gz,$A/t14b/probe --out $R/lab-bars.txt
+  python3 bin/scorecard_diff.py $A/results/fm-H/scorecard.json.gz $A/results/t14b/scorecard.json.gz --design $R/design.json --out $R/noreg-vs-fmH.txt
+  python3 bin/scorecard_diff.py $A/final/scorecard-inject.json $A/results/t14b/scorecard-inject.json.gz --design $R/design.json --out $R/noreg-inject-vs-final.txt
+  python3 results/plan-a/final/fmh_identity.py $A/results/final/scorecard.json.gz $A/results/t14b/scorecard.json.gz > $R/identity-vs-final.txt
+  ```
+
+  Bars: **Lab** under **Bars** (L1–L5′, F-10, PA-2). The noreg diffs: rows move only in `design.json` families or in a
+  family that meets L5′ — such a family is appended to `design.json` as a `t14b` set-aside whose `note` carries its L5′
+  cells, and the diffs re-run → 0 moved outside the list, 0 one-sided; inject 0 moved outside the list (its two
+  Markarian OSC frames identical: debayered). *Amended at Step 9 (S3 ruling):* the sentence about the OSC inject frames is wrong — CFA-site and debayered planes are Mixed (median off) and keep every `measure` / `seeds` / `register` / `betas@*` / `analysis` row identical, but the Analysis mode measures OSC on the 2×2 super-pixel plane, a White plane (design §3), so those two families move in `analysis-mode` only and are set aside with the other inject families. `--expect-sha` takes BOTH binaries (star_probe and ln_scale_probe), `--design` is absolute (lab_cycle runs its sub-steps from `star-lab/`), and `bars.py`'s `off` arm is E3a's `sc-off` (`results/final` predates the `spikes/*` / `under/*` families). A miss → **STOP S2** (L1, L2, L4, F-10, PA-2) or **S3** (L5′, inject).
+  Lab commit + push.
+- [ ] **Step 7 — the staleness proof and the gates on the E head (haiku, fixed answers; ≈ 1.5 h; one run at a time).**
+
+  ```
+  cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum-lab/harness/acceptance
+  REPO=/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum; L=../../star-lab/results/plan-a; R=$L/t14b/e4-runs; mkdir -p $R
+  df -h ~/.athenaeum-acc    # recorded; less than Task 13's hc11 growth (t13-real/hc11/clone.txt) + 20 GiB → the controller first
+  export ATH_ACC_LOG_EXTRA="athenaeum_core::star_measure::seeds=debug"
+  ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=$L/t13-real/s204/config.json ATH_ACC_SET_REFERENCE=$L/t13-real/s204/ref.json ATH_ACC_EXPECT_REFERENCE=28934 \
+    zsh tier1/tier1-run.sh $REPO ~/.athenaeum-acc/starA-s204 8950 204     # run 7, ≈ 22 min
+  zsh clone-before.sh ~/.athenaeum-acc/hc11B-f1 ~/.athenaeum-acc/starA-hc11
+  ATH_ACC_RERUN_FROM=measure ATH_ACC_SET_CONFIG=$L/t13-real/hc11/config.json ATH_ACC_SET_REFERENCE=$L/t13-real/hc11/ref.json ATH_ACC_EXPECT_REFERENCE=69845 \
+    zsh tier1/tier1-run.sh $REPO ~/.athenaeum-acc/starA-hc11 8971 182     # run 6, ≈ 8 min
+  M=("detection median plane built" "frame plane first pass" "field width at the clamp floor" "measure: the plane is trailed; no star is measured" "measure: the plane is defocused; no star is measured")
+  python3 tier1/run_log_count.py ~/.athenaeum-acc/starA-s204 --set-id 204 --run-id 7 "${M[@]}" > $R/s204-run7-counts.txt
+  python3 tier1/run_log_count.py ~/.athenaeum-acc/starA-hc11 --set-id 182 --run-id 6 "${M[@]}" > $R/hc11-run6-counts.txt
+  cd ../../star-lab && STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=7 STARLAB_SCRATCH=~/.athenaeum-acc/star-lab-a/t14b/gates7 python3 bin/gates.py > results/plan-a/t14b/e4-runs/gates-run7.txt
+  ```
+
+  Fixed answers: both runs `success: true` at their pinned references, run ids 7 / 6; `detection median plane built`
+  = the run's measured White planes (set 204: its 92 mono planes; Horse C11: every measured plane, all mono), `frame
+  plane first pass` = its measured planes (set 204: 407), Measure artifact rows written in the window = its measured
+  frames; `field width at the clamp floor` 0 on both (R4: none at floor); 811 (`L 0010`, 10-06; `e3c/hc11-ids.txt`
+  names its file) carries one trailed or defocused warn (if the run does not measure it, `star_probe measure` on its
+  calibrated file shows the warn on stderr); gates 13 / 13, probe_parity 0 mismatches at run 7's group β. A short
+  count → **STOP Q3**; 811 silent → **STOP Q8**; a gate below → the controller with its output (Fable if
+  probe_parity). Lab commit + push; then `rm -rf ~/.athenaeum-acc/starA-hc11` (results-only rule); `starA-s204` stays
+  for Task 14.
+- [ ] **Step 8 — cost and memory (sonnet; ≈ 1.5 h; the machine quiet; the last measurement).** (i) The median pass in
+  work units (M4): the E head's star_probe with `RUST_LOG=athenaeum_core::star_measure::seeds=debug`, 3 runs each on
+  m101 `0000` and set 204 `0058`'s calibrated mono file (`starA-s204`); the `duration_ms` of `detection median plane
+  built` ÷ Mpx, median of 3, beside candidates / Mpx (the debug line's `count`, `from_stars`), the probe wall and run
+  7's Measure stage wall (Step 7). (ii) B3 (`$P`, `$T` as in Step 5): `python3 bin/measure_wall.py --probe $P --root "$HOME/Pictures/star test"
+  --set m42 --arm pass1= --arm-path pass1=analysis-mode --arm off= --arm-probe off=$T/star_probe-69b4710b --arm-path
+  off=analysis-mode --repeats 3 --out $T/e4-wall-amode` — the 69b4710b binary IS `off` (E3a's identity; no same-binary
+  `off` exists once the switch is gone); E ≤ 0.6 s per frame and ≤ 1.03 × the bracket's `off`. (iii) Memory:
+  `/usr/bin/time -l` peak RSS minus the binary's no-argument baseline (the recipe in `stacking/run.rs`'s
+  `MEASURE_PLANES_RESIDENT` doc), the E head and 69b4710b, on `measure_probe <set 204 0058 calibrated> auto` and
+  `star_probe measure <m101 0000>`, in planes of w × h × 4 B; one `vmmap -summary` per binary on m101 `0000` taken while
+  pass 1 runs (E: when `detection median plane built` appears). Bars under **Bars** (Cost and memory): the mono Measure
+  peak ≤ 8 planes; the m101 delta reported (≈ +1 plane during pass 1 expected). A miss → **STOP C**. Lab commit + push
+  (`results/plan-a/t14b/e4-cost.txt`).
+- [ ] **Step 9 — docs, suites, final review (sonnet docs; haiku suites with fixed answers; Fable reviews the branch;
+  ≈ 2.5 h).** Docs (I6): README R-OSP-15 — the rule, the never-silent scope with its two silent limits and their
+  triggers, the three recorded limits with their owners and E3c's numbers, the measured-out items with their numbers,
+  Steps 5–8's numbers; `task-14b-erp-design.md` — §3's window rule rewritten to E2's (own pixel absent → absent), the
+  scope, the limits, the measured-out items; this plan's PA-17 ("Revised by Task 14b, route E"); the logging dictionary
+  (`mode_px`); the ledger; this section's Outcome; the lab's `design-cumulative.json` gains the `t14b` entries
+  (`design.json` with Step 6's appended families), committed and pushed. Suites, one at a time (fixed answers: all
+  green — a failure only in the two documented collab wall-clock / free-bytes tests counts when it passes re-run alone;
+  0 ERP-name hits):
+
+  ```
+  cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --all-targets -- --test-threads=4 2>&1 | tail -5
+  CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo test -p athenaeum-web -p athenaeum-tauri --lib -- --test-threads=4 2>&1 | tail -5
+  CARGO_TARGET_DIR=.superpowers/target-acc cargo check -p athenaeum-core --no-default-features
+  npx tsc --noEmit && npx vitest run
+  grep -rn -i -E "$(python3 -c 'import sys; sys.path.insert(0,"../athenaeum-lab/star-lab/bin"); import run_probe; print(run_probe.erp_pattern())')" crates/ src/ docs/ rustafits/src ../athenaeum-lab/star-lab ../athenaeum-lab/harness | grep -v 'erp/run_job.sh' | wc -l   # 0
+  ```
+
+  The docs commit on `one-star-path-t14b`; the prototype's worktree removed (`git worktree remove
+  ../athenaeum-t14b-erp-proto`; its branch stays on GitLab, its target dir freed — the results-only disk rule). Final
+  review: Fable, of `git diff 2da08d82..HEAD`; Critical / Important fixed by a fresh agent. The controller squashes the
+  branch onto `one-star-path` as one commit, not pushed (push only on the owner's word); then Task 14's re-runs (its
+  amendments below).
+
+**Acceptance.**
+- Unit tests as listed, the RED one recorded failing at 69b4710b's code and passing at the head; the Mixed / Unknown
+  digests unchanged; MEASURE_VERSION 4; no command change; unflagged metrics payloads byte-identical.
+- Step 2's tools reproduce Fable's reading of E3; Step 5's identity with the prototype's `pass1`; R1–R4 met (R1's
+  per-frame clause met or adjudicated); lab L1–L5′, F-10, PA-2 met and the noreg diffs 0 moved outside `design.json`;
+  noise gain, registration and determinism met; Step 7's staleness counts exact, 811 warned and gates 13 / 13 on run 7;
+  Step 8's ≤ 0.35 ms / Mpx and B3; the memory bar met as memory delta 0 vs 69b4710b (STOP C ruling) - the ≤ 8-plane bar is the pre-existing open item.
+- Suites green; the review's Critical and Important items fixed; README R-OSP-15 names the two silent limits with their
+  triggers and the three recorded limits with their owners; the logging dictionary carries `mode_px`.
+
+**Outcome (Step 9a, 2026-10-19).** Branch `one-star-path-t14b`: design 8c708d5e (route E, Fable-reviewed 0 C / 6 I / 4 M), code
+**5cf5f09b** (the port: `seeds.rs` median pass, `at_floor` method, `mode_px` warn, `ChannelMeasurement.field_width_at_floor`,
+summary, TS) and review fix **c8cdc1b3** (debug line restored, Unknown-plane envelope twin, masked-plane fallback); prototype
+`t14b-erp-proto` 5d2fea51 / 20d01b52 (GitLab only). Lab (athenaeum-lab main): 65441ee, 55727a3, d155496 (Steps 0-1b), fd1f100
+(E3a), 3a166cd (E3b), a76116a (E3c), 8749fca (Step 2), e6d0f8c (Step 5), 4d5ea51 (Step 6), 2739765 (Step 7), bc68fb9 (Step 8).
+Numbers (full list in README R-OSP-15): m101 0.379 / 0.094 -> 0.947 / 0.957, 30 / 30 off the floor; M51 Halpha 0.094 -> 0.991;
+m42 0.9942 (max gap 0.23 %); set 204 R4 PASS; Horse C11 R4 PASS by Q7 (14 moved, all explained); gates 13 / 13 on run 7;
+median pass 0.262 / 0.193 ms / Mpx; B3 0.937 x 69b4710b; `design.json` 396 entries. Rulings: S1-R1 (census families, RED proof
+rests on real m101), Q1-Q10 and I1-I6 (Fable), STOP P (the `fieldWidthAtFloor` key and the missing `--hsm-dir`), S3-R1..R4
+(append the nine lab and six inject families, three twins under a twin bar), STOP C (the 8-plane bar is a pre-existing
+mismatch, not route E). Plan-text fixes the run found are folded into Steps 5, 6 and the Step 8 figure above. Open items:
+`MEASURE_PLANES_RESIDENT`; the Windows runner's `D:\t14b-avx2-target`; rustafits d0f0b16e is on GitLab only. Step 9b (suites),
+the final review and the squash follow; `eprintln!` of the median kernels was added to `median3_is_the_fifth_of_a_sorted_window`.
+
+---
+
 ### Task 14: One full uniform lab run and the "after Plan A" note (spec §5 "At the end")
 
 **Files:**
@@ -6370,16 +6849,20 @@ on both machines, runner Matrix S PASS at b296dbc4, dev Mac at the final head PA
   (the ledger)
 - Lab: `results/plan-a/final/{gates.txt,scorecard-summary.md,scorecard-inject-summary.md,divergent-families.txt,
   noreg-vs-baseline.txt,noreg-vs-t12.txt,path-compare.txt,twin-saturation.txt,corpus-table.md,provenance.txt,
-  run-log.txt}`, `results/plan-a/design-cumulative.json` (the union after Task 12, unchanged here)
+  run-log.txt}`, `results/plan-a/design-cumulative.json` (the union after Task 12, unchanged here). As run (2026-10-19)
+  also `noreg-vs-t01c.txt`, `noreg-vs-fmH.txt`, `noreg-inject-vs-fmH.txt`, `fmh-identity{,-inject}.txt`,
+  `probe-parity-groupbeta.txt`, `debt-final.txt`, `debt-lines.txt`, `corpus-amode.md`, `wall-amode-final.{txt,json}`,
+  `m101-diag/`; `design-cumulative.json` gains Task 14b's `t14b` entries (its Step 9)
 
-- [ ] **Step 1: One uniform run, in this order, one job at a time, every command and wall logged in `run-log.txt`:**
+- [x] **Step 1: One uniform run, in this order, one job at a time, every command and wall logged in `run-log.txt`**
+  (DONE 2026-10-19 at 69b4710b, lab 10593e4; the stale lines below are corrected and the run's record follows the block):
 
 ```
 cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum && git status --porcelain --untracked-files=no   # clean
 CARGO_TARGET_DIR=.superpowers/target-acc CARGO_BUILD_JOBS=4 cargo build --release -p athenaeum-core --example star_probe --example ln_scale_probe --example measure_probe
 cd ../athenaeum-lab/star-lab
 S=~/.athenaeum-acc/star-lab-a/final; R=results/plan-a/final; mkdir -p $S $R ~/.athenaeum-acc/star-lab-a/results/final
-export STAR_PROBE_ARGS="--diagnostics"
+export STAR_PROBE_ARGS="--diagnostics --seeds matched --seed-threshold 6.0"   # = bin/lab_cycle.py DEFAULT_PROBE_ARGS; Step 1 ran the literal "--diagnostics" (both added flags are the probe's defaults without --config: the matched filter at seeds::DEFAULT_THRESHOLD 6.0); every later run uses lab_cycle's default
 python3 bin/run_probe.py manifests/v2.json     --out $S/probe        && python3 bin/run_probe.py manifests/v2.json     --out $S/probe        --verify
 python3 bin/run_probe.py manifests/inject.json --out $S/inject-probe && python3 bin/run_probe.py manifests/inject.json --out $S/inject-probe --verify
 python3 bin/run_probe.py manifests/corpus.json --out $S/corpus-probe && python3 bin/run_probe.py manifests/corpus.json --out $S/corpus-probe --verify
@@ -6391,10 +6874,14 @@ python3 bin/baseline_flags.py   $S/scorecard.json --out $R/divergent-families.tx
 python3 bin/twin_saturation.py  manifests/v2.json --probe-dir $S/probe --out $R/twin-saturation.txt
 python3 bin/path_compare.py     $R/scorecard-summary.md --data-root ~/.athenaeum-acc/star-lab-v2 --probe-dir $S/probe --out $R/path-compare.txt
 python3 bin/star_test_corpus.py table manifests/corpus.json --probe-dir $S/corpus-probe --out $R/corpus-table.md
-python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t12-amode/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-t12.txt            # no design list: Task 13's one code commit (13-P) adds debug log lines only, no number moves → 0 moved
+python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/t12-amode/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-t12.txt            # as run: 13 973 moved, all analysis-mode = Task 13b's deliberate changes (record below); the identity proof is noreg-vs-fmH
 python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-v2/results/baseline-2026-10-07-fw/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-baseline.txt --design results/plan-a/design-cumulative.json
+python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/fm-H/scorecard.json.gz $S/scorecard.json --out $R/noreg-vs-fmH.txt                     # 0 moved (lab d264370)
+python3 bin/scorecard_diff.py ~/.athenaeum-acc/star-lab-a/results/fm-H/scorecard-inject.json.gz $S/scorecard-inject.json --out $R/noreg-inject-vs-fmH.txt   # 0 moved
+python3 results/plan-a/final/fmh_identity.py ~/.athenaeum-acc/star-lab-a/results/fm-H/scorecard.json.gz $S/scorecard.json > $R/fmh-identity.txt       # measured fields equal
+python3 bin/debt_check.py ~/.athenaeum-acc/star-lab-a/results/t01c-baseline/scorecard.json.gz $S/scorecard.json --debt results/plan-a/debt.json --out $R/debt-final.txt
 gzip -k $S/scorecard.json && mv $S/scorecard.json.gz ~/.athenaeum-acc/star-lab-a/results/final/
-STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=6 STARLAB_SCRATCH=$S/gates python3 bin/gates.py > $R/gates.txt
+STARLAB_ACC_COPY=~/.athenaeum-acc/starA-s204 STARLAB_ACC_RUN_ID=6 STARLAB_SCRATCH=$S/gates python3 bin/gates.py > $R/gates.txt   # probe_parity replays the run's group β since lab 8c3194c (Task 11b)
 grep -h '"kind": "provenance"' $S/probe/run_log.jsonl $S/inject-probe/run_log.jsonl $S/corpus-probe/run_log.jsonl > $R/provenance.txt   # the three one-binary records
 ```
 
@@ -6402,9 +6889,59 @@ grep -h '"kind": "provenance"' $S/probe/run_log.jsonl $S/inject-probe/run_log.js
   (PA-19), so the final diff against the ORIGINAL baseline prints the by-design rows in their table and judges the
   rest: 0 moved expected (ruling F21, M-13). Task 5's `one-sided` rows keep their rule in the final diff too —
   judged against the original baseline by the same one-sided test wherever no later step set them aside, never
-  silently set aside. The gates: 13 PASS expected (`probe_parity` on the `starA-s204` clone's run 6 artifacts
-  written by b6c5d5b3 (13-P adds debug lines only, no number — the same measurement code as this run's probe, ruling F12); `determinism` covers 170
-  families). Only one clone is on disk for this task; no before tree was touched at any point.
+  silently set aside. The gates: 13 PASS expected — `probe_parity` on the `starA-s204` clone's run 6 artifacts
+  (written by b6c5d5b3) replays the run's GROUP β (`--psf-beta`, `stacking_run_groups.beta`): since Task 11b the stacking
+  Measure fits every star at its group's β, so the gate's old own-β premise (the probe as a group of one) was stale —
+  fixed in lab 8c3194c; `determinism` covers 170 families. Only one clone is on disk for this task; no before tree was touched at any point.
+
+  **As run and amended (2026-10-19; ledger "Task 14").**
+  - Step 1 (sonnet, lab 10593e4, `task-14-report-r1.md`): probes v2 996 / inject 109 / corpus 420, 0 failed, all proven
+    at 69b4710b (one binary each); noreg vs baseline-fw and vs t01c PASS (0 moved outside the 305-entry union, 0
+    one-sided); determinism 170 / 170, truth_normal, truth_crowded PASS.
+  - `noreg-vs-t12`: 13 973 moved, all analysis-mode — Task 13b's deliberate changes (the Budget selection: `t13b-final`
+    1 537 moved; the I3 trim: `t13b-final2` 14 045; both analysis-mode only, noreg-cumulative vs t01c PASS), not the
+    seeds flags. "0 moved vs t12" predated 13b; 13b recorded these moves by path (`t13b-final{,2}/moved-by-path*.txt`;
+    its `design.json` files are empty), so its list is the explanation and the diff stays as run. **The direct proof is
+    the diff against fm-H:** v2 + inject 0 moved, inject bit-identical, v2's 529 094 measured fields equal, only 2 495
+    lab-computed model fields differ (efficiency_model, LN intercept / slope; max relative 1.3e-13, runner vs dev Mac
+    arithmetic) — lab d264370.
+  - `probe_parity`: 12 / 13 at the stale own-β premise → under run 6's group β 99.89317394922529 PASS (20 012 / 20 012
+    fits, 0 / 200 120 field mismatches, channel 27 / 27; lab 913053d); the gate fixed in lab 8c3194c → **gates 13 / 13**.
+  - Step 2a, the bar inventory (opus): `task-14-bars-inventory.md` (51 bars + 10 superseded chains; rulings in the ledger).
+  - Phase 1b (sonnet, lab 8c3194c + eb92f03, `task-14-report-1b.md`): **B3 analysis-mode 0.439 s per m42 frame PASS**
+    (legacy 0.234; Task 13b 0.464); the corpus analysis-mode comparison **`corpus-amode.md`** (m42, m101, singles,
+    `_DSC5767`, `sharp/*` pooled: analysis-mode FWHM bias 4.79 % vs legacy 0.51 %, scatter 1.19 vs 2.22 %; m101
+    analysis-mode ~1.2 px — the field-width collapse below; m42 `0054` trailed → 0 fits); centroid F ≤ 2 vs t08-f3
+    ×1.0140 / ×1.0109; owner ecc items 6 / 7 vs t06a WORSE (the held-β cell empty); the t01c parts not computable (no
+    probe dir or same-star extract survives).
+  - **The debt:** `debt-final.txt` (debt_check vs t01c): OPEN on fwhm scatter (measure, pointfit), centroid scatter
+    (measure), centroid scatter (register); the four bias groups PASS. **Owner ruling 2026-10-19 «Закрыть, долг
+    перенести»:** Plan A closes with the debt OPEN, carried to a later cycle (centroid → the owed per-frame pixel-phase
+    correction; FWHM scatter → research); the Task 14 debt lines (centroid F ≤ 2, ecc items 6 / 7) fall under it.
+  - **Blocker → Task 14b:** `corpus-table.md` read m101's `measure` path at 0.335 of the ERP (baseline 0.9015); the
+    diagnostic (lab be106a6) found the field-width collapse on single-pixel events → Task 14b, inserted above.
+
+  **After Task 14b lands — what Task 14 re-runs (the note waits for these; amended for 14b's route E).**
+  - Always: the corpus probe, `corpus-table.md` (m101 and M51 Hα move by design) and `corpus-amode.md`
+    (`python3 results/plan-a/final/corpus_amode.py <corpus-probe>`); the gates on set 204 **run 7** (14b's Step 7 ran
+    them there and re-armed probe_parity: `STARLAB_ACC_RUN_ID=7`, not 6). 14b's Step 5 corpus outputs
+    (`~/.athenaeum-acc/star-lab-a/t14b-erp/e4/corpus`) and Step 7's `gates-run7.txt` serve when their star_probe sha256
+    is the landed head's (the provenance record); else Step 1's corpus line and the gates line at run 7 re-run.
+  - Only if 14b moved them (its Step 6 lab cycle: the `design.json` families — the 12 `f1.2` families and their twins,
+    `spikes/*`, `under/gauss/f1.5` — plus any family Step 6 appended after it met L5′; the `spikes/*` families are
+    only-head rows): the v2 / inject probes and scorecards, `scorecard-summary.md`, `scorecard-inject-summary.md`,
+    `divergent-families.txt`, `twin-saturation.txt`, `path-compare.txt`, `noreg-vs-baseline.txt` (with
+    `design-cumulative.json` + the `t14b` entries), `noreg-vs-fmH.txt` (with 14b's `design.json`), `debt-final.txt` and
+    the `sharp/*` half of `corpus-amode.md` (`sharp_amode.py`) — from 14b's Step 6 probe dirs (`--reuse-probe`; the same
+    sha256 proviso).
+  - Cited, not re-run: B3 (14b's Step 8 bracket against the 69b4710b binary replaces 0.439 in the note), the centroid /
+    ecc debt lines, the bar inventory.
+  - Step 2's note waits for 14b's close and these re-runs: §4 cites 14b's R1–R4 (Horse C11 under its Q7 reading), §6 the
+    analysis-mode corpus rows after 14b, §7 14b's two silent limits (a debayered plane, an R/B-site mask), its three
+    recorded limits (an event inside a fit window → the fit-robustness cycle; HSM fragility on trail / flat-top /
+    wind-shaken pools → its own cycle; the debayered plane) and the sub-`0.715·F_field` share it reported (M2). Step 4's
+    `rm -rf ~/.athenaeum-acc/starA-s204` and the `final/` probe dirs wait until 14b's Step 7 (run 7) and these re-runs
+    are done.
 
 - [ ] **Step 2: The note** `2026-10-XX-star-measurement-after-plan-a.md`, beside the baseline and in its format
   (numbers copied as printed; derived numbers marked): §1 verdict per bar (F-0…F-7, the budget, the costs, the real
@@ -6437,9 +6974,12 @@ grep -rn -i -E "$(python3 -c 'import sys; sys.path.insert(0,"../athenaeum-lab/st
 docs(research): star measurement after Plan A - one uniform lab run, every bar against its baseline cell, the real-data checkpoint
 ```
 
-**Acceptance:** 13 gates PASS; `noreg-vs-t12.txt` 0 moved; `noreg-vs-baseline.txt` 0 moved outside
-`design-cumulative.json` and 0 one-sided misses; every Plan A bar line in the note's §1 reads "met" or carries the
-owner's ruling; the full core suite green on both repositories; the ERP's name absent.
+**Acceptance:** 13 gates PASS (probe_parity at the run's group β, lab 8c3194c; on set 204 run 7 after Task 14b);
+`noreg-vs-fmH.txt` 0 moved outside Task 14b's design list (amended 2026-10-19: `noreg-vs-t12.txt` is kept as run — its
+moves are Task 13b's analysis-mode changes); `noreg-vs-baseline.txt` 0 moved outside `design-cumulative.json` (with the
+`t14b` entries) and 0 one-sided misses; the corpus table meets Task 14b's R1–R3; the debt carried under the owner's
+ruling; every Plan A bar line in the note's §1 reads "met" or carries the owner's ruling; the full core suite green on
+both repositories; the ERP's name absent.
 
 ---
 

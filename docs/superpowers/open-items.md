@@ -2188,6 +2188,16 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ---
 
+## Measured, deferred engineering items
+
+A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
+
+### Measure working set on mono frames (Plan A Task 14b, 2026-10-19)
+
+- **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
+
+---
+
 ## Awaiting a call from the owner
 
 - **D1–D4 from the DB-layer audit.** Single process per catalog file (proposed: ratify); keep the pool-exhaustion panic (proposed: keep); executor per-stage connections (proposed: defer); same-volume rename reconcile (proposed: defer, since the scanner heals it in practice).

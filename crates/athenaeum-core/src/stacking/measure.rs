@@ -209,6 +209,12 @@ pub struct ChannelMeasurement {
     /// those payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub beta_own_at_cap: bool,
+    /// The plane's field width sat at the clamp floor ([`crate::star_measure::seeds::FieldWidth::at_floor`], route E,
+    /// R-OSP-15): a sub-floor star field or a pool still won by narrow reads. The frame is kept and measured as is
+    /// (record + warn, no M-3). `false` otherwise and in a payload written before this field; then never serialized,
+    /// so unflagged payloads stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub field_width_at_floor: bool,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -1124,6 +1130,7 @@ fn adapter_tail(
         // The two-pass group measure sets it (`measure_planes_pass2`); a single pass reads no own β of its own.
         beta_own: None,
         beta_own_at_cap: false,
+        field_width_at_floor: m.field_width.at_floor(),
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -2963,7 +2970,7 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3064,7 +3071,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3272,6 +3279,67 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
         )
         .unwrap()
         .remove(0)
+    }
+
+    /// Route E (R-OSP-15): a field width at the clamp floor rides the channel and survives the first pass's spill.
+    /// A sharp mono plane (Gaussian FWHM 1.0 px, below the narrowest read a representable star gives) through the
+    /// two-pass group measure WITH its first pass written to the artifact and read back: the channel carries the
+    /// flag; an unflagged payload's JSON has no such key; a payload without the field deserializes.
+    #[test]
+    fn a_floor_field_width_rides_the_channel_and_the_summary() {
+        use crate::stacking::pass1_artifact::{read_pass1, write_pass1};
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        let dir = tempfile::tempdir().unwrap();
+        let stars: Vec<(f64, f64, f64)> = (0..48)
+            .map(|i| {
+                (
+                    40.0 + (i % 8) as f64 * 55.0 + 0.3,
+                    40.0 + (i / 8) as f64 * 55.0 + 0.6,
+                    0.05 + 0.01 * (i % 5) as f64,
+                )
+            })
+            .collect();
+        let mut sharp = integrated_field(
+            480,
+            400,
+            &stars,
+            IntegratedProfile::Gaussian { fwhm: 1.0 },
+            5,
+            0.08,
+        );
+        add_noise(&mut sharp, 0.0004, 77);
+        let broad = moffat_member(3.0, 11);
+        let opts = MeasureOptions::default();
+        let cancel = AtomicBool::new(false);
+        let through_file = |name: &str, plane: &[f32]| {
+            let path = write(dir.path(), name, &[plane], 480, 400);
+            let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let artifact = dir.path().join(format!("{name}.athm"));
+            write_pass1(&artifact, &fresh).unwrap();
+            let back = read_pass1(&artifact, &path, &opts).unwrap();
+            let beta = back.beta_own()[0];
+            measure_frame_pass2(&path, back, &[beta], &opts, None, &cancel)
+                .unwrap()
+                .0
+        };
+        let flagged = through_file("sharp.fits", &sharp);
+        assert!(
+            flagged.channels[0].field_width_at_floor,
+            "the flag is lost on the spilled first pass: {:?}",
+            flagged.channels[0].fwhm_px
+        );
+        let json = serde_json::to_value(&flagged.channels[0]).unwrap();
+        assert_eq!(json["fieldWidthAtFloor"], serde_json::json!(true));
+        let plain = through_file("broad.fits", &broad);
+        assert!(!plain.channels[0].field_width_at_floor);
+        let json = serde_json::to_value(&plain.channels[0]).unwrap();
+        assert!(
+            json.get("fieldWidthAtFloor").is_none(),
+            "an unflagged payload's bytes are unchanged"
+        );
+        // A payload written before the field deserializes (false).
+        let back: ChannelMeasurement = serde_json::from_value(json).unwrap();
+        assert!(!back.field_width_at_floor);
     }
 
     /// Plan A Task 13 (13-P): a frame's two passes log their profile at debug. `"frame plane first pass"` carries the

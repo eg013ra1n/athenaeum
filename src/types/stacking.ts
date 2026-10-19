@@ -489,7 +489,13 @@ betaOwn: number | null,
  * then `beta_own` is a clamp, not an estimate. `false` when not measured, under `Moffat4`, and in a summary
  * written before this field. `#[serde(default)]`, see `ln_scale`'s own doc.
  */
-betaOwnAtCap: boolean, };
+betaOwnAtCap: boolean, 
+/**
+ * Whether the frame's field width sat at the clamp floor on any channel
+ * (`ChannelMeasurement::field_width_at_floor`). `false` when not measured and in a summary written before this
+ * field. `#[serde(default)]`, see `ln_scale`'s own doc.
+ */
+fieldWidthAtFloor: boolean, };
 
 export type SummaryGroup = { key: string, frameCount: number, includedCount: number, masterPath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, stats: GroupStats | null, normalizationReferenceFrameId: number | null, 
 /**

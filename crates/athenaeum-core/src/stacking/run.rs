@@ -9624,6 +9624,8 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
                 .then(|| own.iter().sum::<f64>() / own.len() as f64)
         }),
         beta_own_at_cap: m.is_some_and(|meas| meas.channels.iter().any(|c| c.beta_own_at_cap)),
+        field_width_at_floor: m
+            .is_some_and(|meas| meas.channels.iter().any(|c| c.field_width_at_floor)),
     }
 }
 
@@ -14649,6 +14651,63 @@ mod tests {
     use crate::stacking::integrate::{LargeScaleRejection, RejectionChoice};
     use crate::stacking::rej::RejBitmap;
     use crate::stacking::test_fixtures::{self, LightSpec};
+
+    /// Route E: `SummaryFrame.field_width_at_floor` is true when any channel's field width sat at the floor, false
+    /// otherwise and for a frame without a measurement; a summary written before the field reads it as false.
+    #[test]
+    fn the_summary_frame_carries_the_floor_flag() {
+        use crate::stacking::groups::GroupFrame;
+        use crate::stacking::measure::{ChannelMeasurement, FrameMeasurement};
+        let channel = |flag: bool| ChannelMeasurement {
+            field_width_at_floor: flag,
+            ..Default::default()
+        };
+        let entry = |measurement: Option<FrameMeasurement>| MeasuredFrame {
+            frame: GroupFrame {
+                frame_id: 1,
+                file_id: 1,
+                filename: "f.fits".into(),
+                path: "/f.fits".into(),
+                size: 1,
+                modified_at: "2026-01-01".into(),
+                exposure_s: Some(60.0),
+                date_obs: None,
+                width: 64,
+                height: 48,
+                pixel_scale_arcsec: None,
+                scale_source: None,
+            },
+            calibrated: None,
+            planes: 1,
+            measurement,
+            weight: None,
+            included: true,
+            reason: None,
+            registration: None,
+            cached_calibrated: false,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+        };
+        let frame = |flags: &[bool]| FrameMeasurement {
+            width: 64,
+            height: 48,
+            channels: flags.iter().map(|&f| channel(f)).collect(),
+            duration_ms: 0,
+        };
+        assert!(
+            summary_frame_for(&entry(Some(frame(&[false, true, false]))), None)
+                .field_width_at_floor
+        );
+        assert!(
+            !summary_frame_for(&entry(Some(frame(&[false, false]))), None).field_width_at_floor
+        );
+        assert!(!summary_frame_for(&entry(None), None).field_width_at_floor);
+        let mut json = serde_json::to_value(summary_frame_for(&entry(None), None)).unwrap();
+        json.as_object_mut().unwrap().remove("fieldWidthAtFloor");
+        let back: SummaryFrame = serde_json::from_value(json).unwrap();
+        assert!(!back.field_width_at_floor);
+    }
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
         LightSpec {

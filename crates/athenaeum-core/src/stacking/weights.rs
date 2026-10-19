@@ -861,6 +861,7 @@ mod tests {
                     beta: 4.0,
                     beta_own: None,
                     beta_own_at_cap: false,
+                    field_width_at_floor: false,
                     fwhm_px: fwhm,
                     eccentricity: ecc,
                     tflux: 1.0,
