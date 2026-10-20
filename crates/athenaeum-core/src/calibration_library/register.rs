@@ -558,6 +558,31 @@ mod tests {
         assert!(g.size.is_some(), "a registered master must record its size");
     }
 
+    /// G-5: a stamped origin survives write -> registration -> the stored
+    /// header, so the origin rule judges an in-app master like a raw set -
+    /// for both containers the library writes.
+    #[test]
+    fn registered_master_records_its_stamped_origin() {
+        use crate::fits_writer::{Card, CardValue};
+        for format in [OutputFormat::Fits, OutputFormat::Xisf] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            let raw = seed_source_set(&conn, dir.path());
+            let path = dir.path().join(format!("master_dark.{}", format.extension()));
+            let cards = HeaderBuilder::new(FrameKind::MasterDark)
+                .instrume("TestCam").exptime(300.0).gain(100).offset(50)
+                .binning(1, 1).ccd_temp(-10.0)
+                .custom(Card::new("XORGSUBF", CardValue::Integer(1584)).unwrap())
+                .custom(Card::new("YORGSUBF", CardValue::Integer(1064)).unwrap())
+                .build().unwrap();
+            crate::fits_writer::write_image_f32(&path, 8, 8, 1, &vec![100.0; 64], &cards, format, XisfBounds::Adu16)
+                .unwrap();
+            let reg = register_master(&conn, raw, &path, "{}").unwrap();
+            let g = crate::calibration::geometry::geometry_for_set(&conn, reg.master_set_id).unwrap();
+            assert_eq!(g.origin, Some((1584, 1064)), "{format:?}");
+        }
+    }
+
     #[test]
     fn matcher_excludes_superseded_sets() {
         let dir = tempfile::tempdir().unwrap();

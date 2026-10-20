@@ -44,6 +44,11 @@ pub struct MasterHeaderInputs {
     pub date_obs_midpoint: Option<DateTime<Utc>>,
     pub frame_count: u32,
     pub source_set_uuid: String,
+    /// The sub-frame origin (`XORGSUBF`, `YORGSUBF`) EVERY member records
+    /// (ruling G-5): stamped into the master so the calibration-geometry
+    /// origin rule can judge it. `None` when members disagree, when some
+    /// record none, or when none records one.
+    pub origin: Option<(i32, i32)>,
 }
 
 /// The Bayer/CFA geometry a calibration set's member frames agree on.
@@ -215,6 +220,41 @@ fn master_kind_for(imagetyp: &str) -> Option<FrameKind> {
     }
 }
 
+/// The origin every member of `set_id` records (ruling G-5), read per member
+/// from its stored header (`calibration::geometry::origin_for_file` - the
+/// same reader the matcher uses). Members that disagree, or some that record
+/// none, lose the origin: `None` and one `warn!`. None recording one is the
+/// ordinary shape for a camera without sub-frame readout: `None`, `debug!`.
+fn members_origin(conn: &Connection, set_id: i64) -> Result<Option<(i32, i32)>> {
+    let file_ids: Vec<i64> = conn
+        .prepare(
+            "SELECT f.file_id FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             WHERE csf.set_id = ?1 ORDER BY csf.frame_id",
+        )?
+        .query_map([set_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut origins = Vec::with_capacity(file_ids.len());
+    for &file_id in &file_ids {
+        origins.push(crate::calibration::geometry::origin_for_file(conn, file_id)?);
+    }
+    let recorded: Vec<(i32, i32)> = origins.iter().flatten().copied().collect();
+    if recorded.is_empty() {
+        debug!(set_id, count = file_ids.len(), "no member records a sub-frame origin; master origin not stamped");
+        return Ok(None);
+    }
+    let first = recorded[0];
+    if recorded.len() == origins.len() && recorded.iter().all(|&o| o == first) {
+        return Ok(Some(first));
+    }
+    warn!(
+        set_id,
+        count = file_ids.len(),
+        "master origin not stamped: members disagree or some record none"
+    );
+    Ok(None)
+}
+
 pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<MasterHeaderInputs> {
     // Set-level values (already aggregated by the scanner's clustering).
     // `binning` (calibration_set's text summary, e.g. "1x1") is intentionally
@@ -256,6 +296,7 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
     // Bayer/CFA geometry by member majority (frames.bayerpat/xbayroff/
     // ybayroff/roworder — all four are real columns since Task 1).
     let bayer = load_bayer_consensus(conn, source_set_id)?;
+    let origin = members_origin(conn, source_set_id)?;
 
     let midpoint = match (parse_dt(min_dt.as_deref()), parse_dt(max_dt.as_deref())) {
         (Some(a), Some(b)) => Some(a + (b - a) / 2),
@@ -279,6 +320,7 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
         date_obs_midpoint: midpoint,
         frame_count: frame_count as u32,
         source_set_uuid: uuid,
+        origin,
     })
 }
 
@@ -432,6 +474,18 @@ pub fn build_master_cards(
                 "unrecognized row order — ROWORDER omitted from master"
             ),
         }
+    }
+    // Sub-frame origin (ruling G-5): only when every member agreed, so the
+    // calibration-geometry origin rule can judge this master like a raw set.
+    if let Some((x, y)) = inputs.origin {
+        b = b.custom(
+            Card::new("XORGSUBF", crate::fits_writer::CardValue::Integer(i64::from(x)))?
+                .with_comment("Subframe X position"),
+        );
+        b = b.custom(
+            Card::new("YORGSUBF", crate::fits_writer::CardValue::Integer(i64::from(y)))?
+                .with_comment("Subframe Y position"),
+        );
     }
     b = b
         .ath_src(&inputs.source_set_uuid)
@@ -614,6 +668,77 @@ mod tests {
                 rusqlite::params![id, bp, x, y, ro],
             ).unwrap();
         }
+    }
+
+    /// One stored header per member of `set_id`, in frame-id order, recording
+    /// `origins[i]` (G-5 fixtures; `seed` writes no `fits_header` rows).
+    fn stamp_member_origins(conn: &Connection, set_id: i64, origins: &[Option<(i32, i32)>]) {
+        let file_ids: Vec<i64> = conn
+            .prepare(
+                "SELECT f.file_id FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 WHERE csf.set_id = ?1 ORDER BY csf.frame_id",
+            )
+            .unwrap()
+            .query_map([set_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(file_ids.len(), origins.len(), "fixture must cover every member");
+        for (file_id, origin) in file_ids.into_iter().zip(origins) {
+            crate::db::insert_fits_header(
+                conn,
+                file_id,
+                &crate::calibration::geometry::test_support::fits_header_text(*origin),
+            )
+            .unwrap();
+        }
+    }
+
+    const NOT_STAMPED: &str = "master origin not stamped: members disagree or some record none";
+
+    /// G-5: a master carries the sub-frame origin every member records.
+    #[test]
+    fn master_cards_carry_the_members_agreed_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        stamp_member_origins(&conn, set_id, &[Some((1584, 1064)), Some((1584, 1064))]);
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_int(&cards, "XORGSUBF"), Some(1584));
+        assert_eq!(card_int(&cards, "YORGSUBF"), Some(1064));
+    }
+
+    /// G-5: members that disagree, or some that record none - no stamp, one warn.
+    #[test]
+    fn master_origin_is_not_stamped_when_members_disagree_or_some_record_none() {
+        for origins in [[Some((1584, 1064)), Some((0, 0))], [Some((1584, 1064)), None]] {
+            let conn = Connection::open_in_memory().unwrap();
+            let set_id = seed(&conn);
+            stamp_member_origins(&conn, set_id, &origins);
+            let (inputs, warns) = crate::calibration::geometry::test_support::count_warns(
+                NOT_STAMPED,
+                || load_header_inputs(&conn, set_id).unwrap(),
+            );
+            assert_eq!(inputs.origin, None, "{origins:?}");
+            assert_eq!(warns, 1, "{origins:?}");
+            let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", None, None).unwrap();
+            assert!(!has_card(&cards, "XORGSUBF") && !has_card(&cards, "YORGSUBF"), "{origins:?}");
+        }
+    }
+
+    /// No member records an origin (a camera without sub-frame readout): nothing
+    /// is lost, so no warn - a debug line only.
+    #[test]
+    fn master_origin_absent_when_no_member_records_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let (inputs, warns) = crate::calibration::geometry::test_support::count_warns(
+            NOT_STAMPED,
+            || load_header_inputs(&conn, set_id).unwrap(),
+        );
+        assert_eq!(inputs.origin, None);
+        assert_eq!(warns, 0);
+        assert!(!has_card(&cards_for(&conn, set_id), "XORGSUBF"));
     }
 
     fn cards_for(conn: &Connection, set_id: i64) -> Vec<Card> {
