@@ -3760,3 +3760,26 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     9.46 vs 9.47). **Open item (pre-existing):** the mono Measure peak is 8.82-8.83 planes (`measure_probe`, `0058`), the same at
     69b4710b, against `MEASURE_PLANES_RESIDENT = 8` (fitted on an OSC frame): the working-set estimate is about 10 % low for
     mono frames (`docs/superpowers/open-items.md`).
+- **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
+  every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
+  - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
+    corpus 420 outputs, one binary each, identical to Task 14b's own. Every bar is met or carries its ruling. 13 gates
+    PASS on set 204 run 7. No row moved outside the 701-entry design list against the 2026-10-07 baseline.
+  - *The headline.* The captured-fraction spread went from 18.73 / 22.16 % to 0.77 / 1.41 %. A 2× flux twin moves the
+    frame FWHM 0.06 % (9.99 % before, `sharp/m4/f2.0`). The Gaussian frame FWHM reads −0.28 % (−2.58 %, f8.0). m101
+    `measure` ÷ the ERP is 0.947 / 0.957 (0.379 / 0.094 before Task 14b). Set 204's whole run takes 794 s against the
+    ERP's 1005 s.
+  - *Debt carried* (owner 2026-10-19, «Закрыть, долг перенести»). The debt check against t01c stays OPEN on fwhm
+    scatter (measure, pointfit), centroid scatter (measure) and centroid scatter (register). The centroid goes to the
+    owed per-frame pixel-phase correction, the FWHM scatter to research. The Task 14 debt lines fall under the same
+    ruling: the centroid F ≤ 2 split (re-read at c10be63b: measure ×1.0140, register ×1.0112), the owner ecc items 6 / 7 (WORSE, 0.09187 → 0.09339) and the
+    11b single-frame ridge.
+  - *Open items.*
+    - The VNG per-plane widths and the resampling broadening (out of scope).
+    - The injected OSC captured fraction, 1.81–2.34: explained, a scorecard / truth artefact (I.1 extended, sized by the Measure aperture correction `c`).
+    - The Measure aperture correction `c` on undersampled OSC planes: not persisted or logged, hot pixels feed it on an uncorrected R plane, one `c` per plane overstates faint stars (note section 7; first Plan B item: log `c` per plane).
+    - R-OSP-15's two silent limits and three recorded limits, with their owners.
+    - `MEASURE_PLANES_RESIDENT` (8 against 8.82 mono).
+    - The ERP refresh for Task 14b's 15 new units.
+    - F1's over-read and the nebula-sky LN pairs go to Plan B; the Analysis switch (`analysis-mode`, 0.500 s per m42
+      frame) goes to Plan C.

@@ -269,6 +269,7 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **An offline scan root logs `scan root offline (path does not exist)` from `check_scan_root_overlap` — it is not a symlink problem.** | The WARN pair at startup for a root on an unmounted share | Verified 2026-09-17: `/Volumes/Universe` is an SMB mount with no symlink anywhere in the chain; `canonicalize()` fails with `NotFound` exactly while the share is not mounted, the check falls back to the stored path (correct), and the line appears twice because both transfer folders are validated against every root. The message now names the `NotFound` case as "offline" so it is not read as damage. |
 | **`.deb`/`.rpm` installs are refused by the updater by rule — deferred, not a bug.** | `crates/athenaeum-core/src/updates/manifest.rs::platform_supported` | A package-manager install falls back to nothing rather than being handed the AppImage entry and choking on `dpkg -i` after a 100 MB download. The updater plugin itself can install over a `.deb`, so a `linux-x86_64-deb` manifest key plus a `.deb` build/sign leg is a real, scoped follow-up (spec §8 "Out of scope"), pending its own task. |
 | **An unset `FILTER` is a frame state, not a camera property — there is no "OSC" filter convention.** | `collab::filters::match_filter`, `collab::gate`, the hub dictionary, any "map empty FILTER to an OSC canonical" proposal | Owner ruling 2026-09-28. OSC cameras shoot with or without a filter, and mono cameras without a wheel shoot without one too, so an empty `FILTER` cannot be inferred to mean anything from `BAYERPAT`. It is one more unmapped raw name for the spec §6.2 mapping flow (`filter_mappings (instrume, filter_raw) → canonical`, the normaliser, the publish-flow modal), where the PUBLISHER picks the canonical — `L`, `None`, whatever the project offers. A hub-side special case for `channel = "osc"` was proposed on 2026-09-28 and withdrawn the same day. |
+| **Injected OSC captured fraction ~2× is a scorecard artefact.** | Star-measurement scorecard Row 6 on inject frames, OSC families | Row 6 divides the measured flux (fitted FWTM flux × the plane's aperture correction `c`, taken from the frame's real stars) by an injected Moffat-β-4 star with no wing; on undersampled OSC planes `c` is 1.9–2.7, so injected stars read ×`c` (the c-free model / truth is 0.95–1.02). I.1 extended; `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-14-report-capfrac.md`. |
 
 ---
 
@@ -276,6 +277,16 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### The Measure aperture correction `c` on undersampled OSC planes (2026-10-20)
+
+Product findings of the Plan A closing diagnostic (note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`, section 7; first Plan B item). Weights and LN read `c`.
+
+- (a) `c` is neither persisted (`stacking/measure.rs:339`) nor logged at the level a run keeps, so real runs cannot be checked. First Plan B item: log `c` per plane.
+- (b) Hot pixels feed `c` on an uncorrected R plane: raw 0013 p0 `c` 1.334 vs 2.097 / 2.074 (0004 / 0007); 36 of its 64 `c` stars are hot pixels; the same stars' 0004 → 0013 ratio 0.617 vs 1.007 / 0.970 on p1 / p2 (R weight ×0.40). Stacking is exposed only on a refused hot-pixel map (no `ATH_CHPX`) or a raw-mode measurement.
+- (c) Sharp R, probe path (own β): mosaic 0176 → 0206 p0 ratio 0.863 after `c` vs ~0.985 on G / B (~×0.77 R weight); the product fits at the group β (2.24 on set 204 OSC), so unverified there until (a).
+- (d) Brightness dependence on undersampled R / B: real-star aperture / model 1.57 (top 64) → ~1.2 (rank 500–2000) on raw 0004 p0; G flat (1.23 → 1.18). One `c` per plane overstates fainter stars there.
+- Set 204 run 7 LN's own `c` (log `ln scale: per-side ring`): OSC p0 1.00, p1 1.13, p2 1.12, mono 1.13, benign.
 
 ### LN model fixes (2026-10-04 … 2026-10-06)
 
