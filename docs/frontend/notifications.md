@@ -97,3 +97,23 @@ Other collab outcomes notified from the page, each after a `console.error` / `co
 
 Toasts show titles only, so the failure reason is part of the Live pill's title.
 
+
+## Detail moved from CLAUDE.md (2026-10-20) - Notifications and listener pattern
+
+### Notifications
+
+One global system: `notify()` from `useNotifications()` (`src/contexts/NotificationContext.tsx`) — never ad-hoc toasts or banners. Fields: `title`, `detail`, `kind` (`NotificationKind` — adding one means the union AND the icon map in `NotificationPanel.tsx`), `tone`, `hasErrors`, `link`, `toast` (`false` = history entry only), `dedupeKey`. History and the dedupe set persist to `localStorage`. Backend events become notifications in the existing completion handler of the relevant hook (`useScanProgress`, `useExportProgress`, `useAnalysisProgress`, …), on **discrete outcomes only — never on `*-progress`**. Timestamps via `formatTimestamp` (`src/utils/dateFormatting.ts`). Full contract: `docs/frontend/notifications.md`.
+
+**Tauri/SSE listener pattern (required, StrictMode-safe).** `api.listen` is async and React 18 StrictMode double-mounts in dev; awaiting the unlisten into a variable lets the cleanup run before it resolves → a leaked second listener. Always:
+
+```ts
+useEffect(() => {
+  let cancelled = false;
+  let unlisten: (() => void) | undefined;
+  api.listen<T>('event', (p) => { if (cancelled) return; handle(p); })
+    .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+    .catch((err) => console.error('[X] listen failed:', err));
+  return () => { cancelled = true; unlisten?.(); };
+}, []);
+```
+
