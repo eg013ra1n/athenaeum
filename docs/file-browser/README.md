@@ -26,3 +26,10 @@
 - **`bulk_update_calibration_metadata`** (Equipment page) propagates set-level edits to every member frame with `frames.override = 1` so the scanner won't undo it.
 - **Override flag**: any save sets `frames.override = 1`; trailing `recompute_override_flag_for_frames` clears it back to 0 if everything matches FITS-header originals (semantic compare: ±1e-6 floats, instant-aware DATE-OBS).
 
+
+## Detail moved from CLAUDE.md (2026-10-20) - File browser rules
+
+### Dual-pane file browser
+
+`FileManager → Browse Files` (`src/components/dualpane/`) owns Move/Rename/Mkdir, catalog search, bulk metadata editing and the Blink launcher. **User-facing Delete is the Black Hole flow** (`commands/duplicates.rs`) — there is no delete/cancel/list-unfinished file-operation command. The Move pipeline (`crates/athenaeum-core/src/file_op/`) runs on the single serialized `operation_queue` worker shared with archive: `AtomicRename` vs `CopyVerifyDelete` (xxHash-verified) chosen by device id, an `EXDEV` at execute time degrades that one row. **Hot-sync is structural, not special-cased**: the executor matches the scanner's own non-canonicalized path spelling — never add `canonicalize` on that path; directory rename is a separator-strict SUBSTR prefix swap (`db/operations.rs::rename_files_path_prefix`), never `REPLACE`. `bulk_update_frame_metadata` cascades through the calibration/session junctions, prunes calibration sets that lose their last member, sets `frames.override = 1` (cleared again by `recompute_override_flag_for_frames` when everything matches the header). Spec `docs/superpowers/specs/2026-05-05-dual-pane-file-browser-design.md`; reference `docs/file-browser/README.md`.
+

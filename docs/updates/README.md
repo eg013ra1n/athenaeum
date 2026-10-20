@@ -51,3 +51,9 @@ channel` (stage `announce`) copies it to `latest.json`/`latest-beta.json`.
 installs. `docker/Dockerfile` copies `RELEASE_NOTES.md` into the image
 (`.dockerignore` re-includes it) so core's `include_str!` has something to
 embed in a Docker build too.
+
+## Detail moved from CLAUDE.md (2026-10-20) - In-app updates rules
+
+### In-app updates
+
+Core owns the check (`athenaeum-core/src/updates/`: `https://artfrom.space/updates/latest.json` + `latest-beta.json` under `updates.check_beta`, `semver` compare, notes embedded via `include_str!("RELEASE_NOTES.md")`, "what's new" once per version via `updates.last_seen_version`); `tauri-plugin-updater` owns download / minisign verify / install / relaunch (`commands/updates.rs`, Rust-side only — `updater:default` is NOT granted to the webview). Five commands: `check_for_updates`, `get_whats_new`, `get_release_notes`, `install_update { channel }`, `restart_app`; web mirrors answer the check and the notes and `501` for install/restart. Three version forms — Cargo `0.6.5-beta.1`, `tauri.conf.json` `0.6.5-1`, tag/manifest dotted — and `install_update`'s `version_comparator` is the ONE place that normalizes. Manifest keys `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64-nsis`, `windows-x86_64-msi`, `linux-x86_64`; `deb`/`rpm` refused by rule. Frontend `src/contexts/UpdatesContext.tsx` + `src/components/updates/`. Pipeline stages, signing key and manifest rules: `docs/updates/README.md`; spec `docs/superpowers/specs/2026-09-16-in-app-updates-design.md`.
