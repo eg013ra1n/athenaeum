@@ -1193,6 +1193,18 @@ mod tests {
         write_xisf_with_image_body(path, &body);
     }
 
+    /// R4 (calibration geometry, 2026-10-20): an XISF whose keywords carry no
+    /// NAXIS takes its size from `<Image geometry="w:h:c">` - the stored
+    /// image, the same post-binning array a FITS NAXIS describes.
+    #[test]
+    fn xisf_image_geometry_fills_naxis_without_keywords() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("no_naxis.xisf");
+        write_xisf_with_keywords(&path, &[("IMAGETYP", "'Dark'")]);
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!((frame.naxis1, frame.naxis2), (Some(100), Some(100)));
+    }
+
     /// Same minimal XISF container, but the `<Image>` body is passed verbatim —
     /// the general form behind `write_xisf_with_keywords`, used by the CFA tests
     /// to place a native `<ColorFilterArray …/>` next to (or instead of) the

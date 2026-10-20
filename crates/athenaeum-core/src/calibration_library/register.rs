@@ -542,6 +542,22 @@ mod tests {
         parity_for(OutputFormat::Xisf);
     }
 
+    /// R5 (calibration geometry, 2026-10-20): a registered master's size is
+    /// the size of the file it registers - the same parse the scanner runs -
+    /// so a master never loses a match its raw set had.
+    #[test]
+    fn registered_master_records_its_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let raw = seed_source_set(&conn, dir.path());
+        let master_path = write_master(dir.path());
+        let reg = register_master(&conn, raw, &master_path, "{}").unwrap();
+        let parsed = crate::fits_parser::parse_fits(&master_path, 0).unwrap();
+        let g = crate::calibration::geometry::geometry_for_set(&conn, reg.master_set_id).unwrap();
+        assert_eq!(g.size, parsed.naxis1.zip(parsed.naxis2));
+        assert!(g.size.is_some(), "a registered master must record its size");
+    }
+
     #[test]
     fn matcher_excludes_superseded_sets() {
         let dir = tempfile::tempdir().unwrap();
