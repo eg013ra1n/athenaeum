@@ -25,3 +25,10 @@ The legacy `is_archived` boolean is the soft-hide flag (`archive_frame_set` / `u
 
 **Restore semantics (the safe one)**: zip is the inventory; restore makes disk match by filling gaps. For each `archive_operation_files` row, if the file already exists at `source_path` skip (no overwrite, no duplicate); else copy from temp → target. Cleanly handles copy-disposition calibrations and cross-archive-move cases.
 
+
+## Detail moved from CLAUDE.md (2026-10-20) - Archive rules
+
+### Archive feature
+
+Moves a finished frame set's data into one `.zip` per frame type under a configured archive folder, keeping catalog metadata. Three states on `frames_set`: WIP (`is_archived = 0`) → soft-archived (`is_archived = 1`, `archived_at NULL`, toolbar **Move and ZIP**) → zipped (`archived_at` set, **Unarchive**); the planner refuses to ZIP unless `is_archived = 1 AND archived_at IS NULL`. Modules in `crates/athenaeum-core/src/archive/`: `planner` (`build_plan` no DB writes / `commit_plan` writes rows), `executor` (cooperative cancel), `rollback`, `resume` (idempotent step log), `restore` (reconcile-based: the zip is the inventory, fill gaps, never overwrite), `zip_writer`/`zip_reader`, `path_layout`, `shared_calibration`. Multi-folder destinations in `archive_roots` (explicit > only-root > `is_default` > error). Events `archive-progress` + `archive-finished`; commands mirrored in `routes/archive.rs`. Spec `docs/superpowers/specs/2026-04-29-archive-feature-design.md`; reference `docs/archive/README.md`.
+

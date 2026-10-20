@@ -21,3 +21,18 @@ In-app master (dark/flat/bias/darkflat) creation from a matched raw calibration 
 
 **Key files**: `crates/athenaeum-core/src/integration/` (banded reader `banded.rs`, combiners `combine.rs`, recipes `engine.rs` — streams N-frames-per-band, never N-full-frames, into RAM), `crates/athenaeum-core/src/calibration_library/` (`paths.rs`, `headers.rs`, `register.rs`), `crates/athenaeum-core/src/api/masters.rs` (orchestration: preview/start/cancel/batch/rebuild/archive-originals/provenance queries), `crates/athenaeum-core/src/services/compute_queue.rs`. Frontend: `src/contexts/MasterBuildContext.tsx` + `src/hooks/useMasterBuilds.ts` + `src/components/ComputeQueueIndicator.tsx` (sidebar), `src/components/calibration/CreateMasterDialog.tsx` (shared by Equipment and Coverage-tab entry points).
 
+
+## Detail moved from CLAUDE.md (2026-10-20) - Master library rules
+
+### Master calibration library
+
+In-app master dark/flat/bias/darkflat builds from a matched raw set, registered directly into the catalog, every consumer relinked, optional archive-of-originals — no external stacker. Exactly one `scan_roots` row may be `kind='calibration_library'` (code-enforced). Fixed v1 layout `<LibraryRoot>/<INSTRUME>/<MasterType>/master_…` (`calibration_library/paths.rs`), container from `calibration.master_format`. Reference: `docs/masters/README.md`; spec `docs/superpowers/specs/2026-07-04-phase2-calibration-library-design.md`.
+
+- **Direct registration invariant**: a built master gets rows byte-identical to scanner ingestion BY CONSTRUCTION (same parser, same inserts, same `create_master_sets_from_frames`), pinned by `direct_registration_matches_scanner_ingestion`.
+- **Relink/supersede**: `calibration_set.superseded_by_set_id` on the raw set and every consumer link repointed in one transaction; matcher, auto-link and dialogs exclude superseded sets; `delete_master` and Black Hole/void un-supersede through `db::master_unregister`. Masters are always auto-link candidates — `master_preferences` only orders the list.
+- **Raw-master-dark convention, no dark scaling** (out of scope, spec §9). Flats are stored illumination-only, normalized to their central-third mean stamped as `ATH_FNRM`.
+- **ComputeQueue** (`services/compute_queue.rs`) is an admission controller, not a runner; `compute.max_concurrent` default 1 — batch builds are dependency-ordered only as a real guarantee at 1, otherwise a flat degrades through the fallback chain with a `warn!`.
+- **Rebuild** is provenance-gated, in place, always a fresh Auto recipe (no recipe override in v1). A frame-set archive always forces `Copy` for a master file.
+
+Key files: `crates/athenaeum-core/src/integration/` (banded reader, combiners, recipes — N-frames-per-band, never N-full-frames), `calibration_library/`, `api/masters.rs`; frontend `src/contexts/MasterBuildContext.tsx`, `src/hooks/useMasterBuilds.ts`, `src/components/calibration/CreateMasterDialog.tsx`.
+
