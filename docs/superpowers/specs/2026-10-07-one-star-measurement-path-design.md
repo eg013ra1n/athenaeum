@@ -36,15 +36,25 @@ Plan C default PSF, Moffat 4) and §7's first risk follow it.
 Amended 2026-10-20 (Plan B scope, from the Plan B design read and the controller's rulings R-B1…R-B10 on it, under the
 owner's standing rulings: the ERP is a column in every LN table, synthetic and real, never the referee; the referee is
 synthetic truth and the harness photometric truth; a cell where ours and the ERP both miss the truth by more than 3 %
-the same way flags that truth as suspect; the ERP is re-run only when synthetic frames change): §3 rows F-8 (the LN
-estimator and its referee) and F-9 (BOTH `c` = 1 floors: Measure's fit-call floor and LN F1's growth floor, R-B1) get
-their defects, changes and bars; three rows are added, F-11 (`c` kept per plane, additive, R-B2), F-12 (`c`'s
-qualifiers and sample, `MEASURE_VERSION` 5, R-B8) and F-13 (LN's own seeds, saturation definitions and nebula sky,
-R-B9); every Plan B bar is fixed in the new "Plan B bars" block before any Plan B measurement; the owned-quantities
-table (`c`, seeds, the `saturated` flag) and the clip-screen sentence below it follow; §5's Plan B paragraph becomes
-stages B0–B6. Open with the owner: new ERP LN runs where none exist (set 204 full mono and OSC, run B mono and OSC;
-the nebula-sky and the injected pairs); until then those cells read "not run". Plan B's rulings and acceptance runs go
-to `docs/stacking/README.md` as R-OSP-16.
+the same way flags that truth as suspect (an estimated truth only, R-B12 below); the ERP is re-run only when synthetic
+frames change): §3 rows F-8 (the LN estimator and its referee) and F-9 (BOTH `c` = 1 floors: Measure's fit-call floor
+and LN F1's growth floor, R-B1) get their defects, changes and bars; three rows are added, F-11 (`c` kept per plane,
+additive, R-B2), F-12 (`c`'s qualifiers and sample, `MEASURE_VERSION` 5, R-B8) and F-13 (LN's own seeds, saturation
+definitions and nebula sky, R-B9); every Plan B bar is fixed in the new "Plan B bars" block before any Plan B
+measurement; the owned-quantities table (`c`, seeds, the `saturated` flag) and the clip-screen sentence below it
+follow; §5's Plan B paragraph becomes stages B0–B6. Plan B's rulings and acceptance runs go to
+`docs/stacking/README.md` as R-OSP-16.
+Amended again 2026-10-20 (Plan B scope, after the owner's ERP answer and the independent review of the amendment
+above: Critical 4, Important 6, Minor 6, all folded in; Plan B's rulings are R-B1…R-B16, R-B16 accepting the review
+in full). The owner's ERP answer (YES): ERP LN runs on every real set (set 204 full mono and OSC, run B mono and OSC),
+and the first ERP LN run on existing frames that never had one (the nebula-sky and the injected pairs) runs once under
+the "ERP in every LN table" ruling; the re-run rule governs later runs, and a cell reads "not run" only until its run
+has happened. A before-vs-after bar is a no-change guard for a stage that does not intend to move that quantity; a
+stage that moves it by design (B3's estimator, B4's `c`) is judged against the validated truth (R-B11). The 3 % rule
+applies to estimated truths only, never to a synthetic s_true (R-B12). The first amendment's details the controller
+accepted are tagged (R-B13). `c`'s definition lands before B3's master-level run, so the stages run B0 → B1 → B2 →
+B4 → B3 → B5 → B6, labels kept (R-B14); B0 re-measures on fresh work dirs (R-B15) and stacks the four master-level
+groups as B4's before-runs, B4's after-runs being B3's. Every Plan B bar stays fixed before any Plan B measurement.
 
 ## 1. Goal and owner decisions
 
@@ -277,8 +287,8 @@ its numbers; a bar is never moved, a row never re-sized, a generator never tuned
 | F-5 | Captured fraction depends on the profile (spread 18.73 % at F 2.6, 22.16 % at F 8.0) → PSFSW / PSFSNR / psfSel | star flux = fitted-model flux in the FWTM ellipse × a per-plane aperture correction `c` (as built, README R-OSP-7): the median over the 64 brightest qualifying fits (at least 5, else `c` = 1) of the 5F growth sum over the model flux, the background the plain mean of the [10F, 12F] far ring outside every seed's 3F disc; a candidate whose fitted amplitude tops the plane's range does not qualify (the F-3 amplitude screen, full scale from the caller); its 12F disc must lie inside the plane and the caller's footprint (LN's `allowed`); `aperture_stars` counts the qualifiers; psfSel reads this flux | spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel: `pairs/iso/blur25mix` t60 −13.03 % and `pairs/iso/blur4` t60 −7.28 % → within ±2 %, the Moffat and Gaussian pairs stay within ±1.2 % |
 | F-6 | No per-star SNR (stacking); the analysis SNR treats ADU as electrons (gain 1, `rf/analysis/snr.rs`) | **As built (Task 11, 2026-10-12; athenaeum 1224718a, 12706d6c the review round; every ruling with its numbers in `docs/stacking/README.md` R-OSP-8).** **SNR.** One definition: S / σ_S over the present pixels whose centres lie within max(1.5·FWHM, 3 px) of the fitted centre (the fit's own FWHM), S = Σ(v − B_i) on the star's stored aperture-scale sky (F-10; the [3F, 4F) annulus is retired for SNR); σ_S² = s·max(S, 0)/g + κ(A)·N_ap·σ_i²·(1 + N_ap/n_i), σ_i and n_i the star's own ring noise and pixel count (F-10): F-6 estimates no sky and no noise. κ(A) = Σ_{i,j∈A} ρ(i − j) / N_ap over the aperture's present pixels, ρ = C/C(0) from the plane's ONE noise read (F-10's detection-noise read on a `Mixed` / `Unknown` plane, reach 2; its owner is unchanged, F-6 only reads it; a given-seed plane runs the same read once, off the plane's one mesh); κ ≡ 1 and no read on a `White` plane (C-7); LN's refits and the probe's `betas` arm pass no correlation (κ ≡ 1, no shot term). s = 1 / the plane's CFA site share on a debayered plane (R 4, G 2, B 4: a flux-preserving interpolation spreads each site's shot noise over 1/share pixels; derived, no number chosen), else 1. A negative S (the star reads below its ring sky) gives a negative finite SNR, which enters the medians. g = EGAIN × `ATH_CSCL` e⁻ per calibrated unit from the header (PA-22; `ATH_CFNM` ignored; raw domain: EGAIN), no camera table; no gain → the shot term is omitted and the frame line's `snrGain` is null. **HFR** = the linear half-signal radius on (v − B_i): the present pixels within 5 × the ring width (the F the star's ring was read at), taken by distance until their sum reaches half the star's F-5 flux, interpolated linearly by the last pixel's share; NaN without a ring or when that circle holds less than half (so HFR ≤ 5F). **Populations (R11-5).** Every accepted fit carries SNR and HFR, saturated and extended ones included (finite: a saturated star's S is its clipped pixels' sum and its HFR reads against the unclipped model flux); NaN only without a ring (B_i missing, counted in `snr_missing`) or, HFR, under half the signal inside 5F; `snr_median` / `hfr_median` are medians over the fits in the frame statistic (neither `saturated` nor `extended`) with finite values (the flagged stars would lift the frame SNR +10…+24 %). Additive (R11-7): `StarFit.snr` / `.hfr` are not persisted (like `peak5`); `.athf`, `ChannelMeasurement`, the DB, the weights, LN and `MEASURE_VERSION` are unchanged. Lab: the generator writes EGAIN and `ATH_CSCL` from its own gain; the truth SNR (`snr_ap`) is the noiseless stamp summed in the same aperture over σ from the generator's gain, read noise and sky, with N_sky the star's ring (centres in [10F_t, 12F_t] outside every other truth star's 3F_t disc; 299 of the 301 v2 truth files moved, only `snr_ap`). **As judged** (lab cycle `t11-f6` at 1224718a, athenaeum-lab 8532f01; 12706d6c's probe output is byte-identical on the five Phase A inputs): row 6 worst 0.97 % on the 50 bar cells (`neb0.1`; `sharp/*` −0.90…+0.51 %), `n_no_gain` 0; the three nebula cells −16.54 / −75.51 / −60.65 % (= predicted); noise pull 0.92…1.25 on 50 planes (`resampled` f2.0 1.07); every held bar equals t10c-floor's. Recorded limits (README R-OSP-8): the R/B κ under-read (R11-2, the detection owner's), the nebula flux error 3.6–6× σ_S (R11-3, Plan B), the header gain (R11-6), a flagged-only plane (every SNR / HFR NaN), `Unread` (κ 1 and a warn) | median bias vs the truth SNR (on the ring) ≤ 3 % on 50 cells: the 46 `sharp/*` and `background/` flat, grad10, neb0.1, vig20; `n_no_gain` 0. `neb0.5` / `neb3` / `neb3_4096` are REPORTED with their predicted values (−16.5 / −75.5 / −60.7 % against the white-noise truth: there the white truth is not the star's real error, and any noise SNR misses it; R11-4, owner informed 2026-10-12). **Star SNR noise pull** (new row) on `osc/*`, `osc_pairs/*`, `resampled/*`: the robust std of (S_meas − S0)/σ_S, S0 = the generator's noiseless frame through the same debayer / warp, clipped at sat like the noisy frame (R11-8), within [0.85, 1.30] per plane; row 6 on these Mixed families reported ("white truth on a Mixed plane") |
 | F-7 | Fit background under nebulosity +0.998σ (`background/neb3_4096`) | F-1's rim background | ≤ 0.3σ under nebulosity; within ±0.1σ on flat fields |
-| F-8 | The F1 contradiction (amended 2026-10-20 with Plan A's numbers). F1 (`f1_gc`, the default since the owner's L-24) over-reads on synthetic pairs, more the wider the target: `pairs/main/m4w10` t60 +11.97 % (baseline +11.84 %), slopes +0.1418…+0.4072 %/px² on the 19 `pairs` families, `density_pairs/d600` t3 +4.38 % (after-Plan-A note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md` §5, lab scorecard `t14-final`); the mechanism is the [6F, 8F] median's non-linear response to neighbour light (lab `star-lab/f1v2-findings.txt`). On real data F1 sits on the harness truth (Plan A: pooled median abs(gap) 0.339 %, n 130, lab `t13-real/ln-truth/gap-table.txt`), while psfSel read the other way before Plan A (median gap set 204 mono −6.009 %, run B mono −7.467 %, Horse C11 G −2.758 %; lab `probe-runs-2026-10-07/ln-real-summary.txt`) and has not been read on real data with Plan A's fits. The referee is itself untested where it judges most members: the harness truth's crowded fallback (annulus [5F, 7F], aperture 5F, no growth correction: an F1-like estimator) is validated to FWHM 5 only (`density_pairs/d600` gaps −0.045 / +0.154 / +0.594 %, its t3 soft, 5 of 60 realizations read), yet it judges 50 of 91 set 204 mono and 49 of 82 run B mono members; on the 20 high-ratio members (FWHM ratio ≥ 1.5, all above 5 px, 17 of them more than 0.5 px beyond the validated range) F1 reads LOW (median gap −1.076 % set 204 mono, −1.836 % run B mono) where the synthetic rows read high (baseline research `2026-10-07-star-measurement-baseline.md`, the referee pair); on the set 204 30-member subset the ERP (−3.09 %) and our psfSel at β 4 (−6.51 %) both miss it the same way by more than 3 % (lab `findings.md` §4), so the owner's rule flags that truth. The run B and Horse C11 G truth CSVs are gone (their values survive in `ln-real-members.csv`) | Plan B stages B1–B3 (§5): re-baseline every LN arm on Plan A's fits, synthetic and real, with the ERP a column beside every arm (B1); validate the referee before any real-data verdict: the harness truth in both modes against s_true including FWHM > 5, a growth-corrected crowded mode built in the lab if the fallback over-reads there (R-B3), the synthetic fields' realism against the real members (R-B5), injected pairs on a seeing lever (B2); then the default estimator among F1 as is, psfSel on Plan A's fits and the F1 v2 sky (a candidate only under R-B6), judged at master level (R-B7), the owner's choice with the numbers (B3). No F1 or LN change before B2 closes | the Plan B bars below: the ERP column and the 3 % rule; F-8 referee; field realism; F-8 estimator |
-| F-9 | Two `c` = 1 floors, no measured case at either (amended 2026-10-20, R-B1: F-9 names both). (i) **Measure's fit-call floor**: under 5 qualifying ratios (`CORRECTION_MIN_RATIOS`, `star_measure/photometry.rs`) a plane's `c` is None (= 1) with one `warn!` per plane (built and ruled, `docs/stacking/README.md` R-OSP-7). A plane's weight ∝ c² (PSFSW and PSFSNR both sum `signal`, `stacking/psf_signal.rs`; derived), so a floored plane among undersampled-OSC peers at `c` 1.9–2.7 (after-Plan-A note §4.1) gets 0.14–0.28 of the weight its own `c` would give (1/c², derived), and psfSel's s moves 1 : 1 with its `c`. (ii) **LN F1's growth floor**: 1–4 qualifying pairs (the 5F circle present on both frames) keep their growth factor with a `warn!` (`GROWTH_PAIRS_WARN_BELOW` 5, `stacking/ln/scale.rs`), 0 pairs keep the 2F ratio (factor 1) with a `warn!`: the LN model fixes cycle's owed question "fall back to 1 below 5 pairs?". A member under 20 matched pairs (`MIN_MATCHES`) is excluded first, so (ii) needs ≥ 20 pairs at 2F and < 5 at 5F; set 204 centre crops keep 100 growth pairs at 1500 × 1000 and 18–42 at 600 × 400 (`docs/superpowers/open-items.md`, F1 on small frames); real small sensors, binning and large dithers are unmeasured | B4 (§5): each floor is decided on lab cases that actually reach it. (i) sparse and undersampled planes (crops of set 204 OSC raw planes cut below 5 qualifiers; sparse lab fields); arms: today's `c` = 1, the plane's own median over its 1–4 ratios, the median kept `c` (F-11) of the same channel over the group's other members (a candidate, read from the owner's kept values, not a second estimate). (ii) crops, binned frames, masked-overlap corners; arms: today's factor kept, factor 1. The numbers and the verdict go to the owner (R-B1), which closes the LN cycle's owed question; the product changes only on the owner's word | the Plan B bars below: F-9 |
+| F-8 | The F1 contradiction (amended 2026-10-20 with Plan A's numbers). F1 (`f1_gc`, the default since the owner's L-24) over-reads on synthetic pairs, more the wider the target: `pairs/main/m4w10` t60 +11.97 % (baseline +11.84 %), slopes +0.1418…+0.4072 %/px² on the 19 `pairs` families, `density_pairs/d600` t3 +4.38 % (after-Plan-A note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md` §5, lab scorecard `t14-final`); the mechanism is the [6F, 8F] median's non-linear response to neighbour light (lab `star-lab/f1v2-findings.txt`). On real data F1 sits on the harness truth (Plan A: pooled median abs(gap) 0.339 %, n 130, lab `t13-real/ln-truth/gap-table.txt`), while psfSel read the other way before Plan A (median gap set 204 mono −6.009 %, run B mono −7.467 %, Horse C11 G −2.758 %; lab `probe-runs-2026-10-07/ln-real-summary.txt`) and has not been read on real data with Plan A's fits. The referee is itself untested where it judges most members: the harness truth's crowded fallback (annulus [5F, 7F], aperture 5F, no growth correction: an F1-like estimator) is validated to FWHM 5 only (`density_pairs/d600` gaps −0.045 / +0.154 / +0.594 %, its t3 soft, 5 of 60 realizations read), yet it judges 50 of 91 set 204 mono and 49 of 82 run B mono members; on the 20 high-ratio members (FWHM ratio ≥ 1.5, all above 5 px, 17 of them more than 0.5 px beyond the validated range) F1 reads LOW (median gap −1.076 % set 204 mono, −1.836 % run B mono) where the synthetic rows read high (baseline research `2026-10-07-star-measurement-baseline.md`, the referee pair); on the set 204 30-member subset the ERP (−3.09 %) and our psfSel at β 4 before Plan A (−6.51 %) both miss it the same way by more than 3 % (lab `findings.md` §4), so the owner's rule flags that truth. The run B and Horse C11 G truth CSVs are gone (their values survive in `ln-real-members.csv`) | Plan B stages B1–B3 (§5): re-baseline every LN arm on Plan A's fits, synthetic and real, with the ERP a column beside every arm (B1); validate the referee before any real-data verdict: the harness truth in both modes against s_true including FWHM > 5, a growth-corrected crowded mode built in the lab if the fallback over-reads there (R-B3), the synthetic fields' realism against the real members (R-B5), injected pairs on a seeing lever (B2); then, once B4 has settled `c` (B4 runs before B3, R-B14), the default estimator among F1 as is, psfSel on B4's `c` and the F1 v2 sky (a candidate only under R-B6), judged against the validated truth (R-B11) and at master level (R-B7), the owner's choice with the numbers (B3). No F1 or LN change before B2 closes | the Plan B bars below: the ERP column and the 3 % rule; F-8 referee; field realism; F-8 estimator |
+| F-9 | Two `c` = 1 floors, no measured case at either (amended 2026-10-20, R-B1: F-9 names both). (i) **Measure's fit-call floor**: under 5 qualifying ratios (`CORRECTION_MIN_RATIOS`, `star_measure/photometry.rs`) a plane's `c` is None (= 1) with one `warn!` per plane (built and ruled, `docs/stacking/README.md` R-OSP-7). A plane's weight ∝ c² (PSFSW and PSFSNR both sum `signal`, `stacking/psf_signal.rs`; derived), so a floored plane among undersampled-OSC peers at `c` 1.9–2.7 (after-Plan-A note §4.1) gets 0.14–0.28 of the weight its own `c` would give (1/c², derived), and psfSel's s moves 1 : 1 with its `c`. (ii) **LN F1's growth floor**: 1–4 qualifying pairs (the 5F circle present on both frames) keep their growth factor with a `warn!` (`GROWTH_PAIRS_WARN_BELOW` 5, `stacking/ln/scale.rs`), 0 pairs keep the 2F ratio (factor 1) with a `warn!`: the LN model fixes cycle's owed question "fall back to 1 below 5 pairs?". A member under 20 matched pairs (`MIN_MATCHES`) is excluded first, so (ii) needs ≥ 20 pairs at 2F and < 5 at 5F; set 204 centre crops keep 100 growth pairs at 1500 × 1000 and 18–42 at 600 × 400 (`docs/superpowers/open-items.md`, F1 on small frames); real small sensors, binning and large dithers are unmeasured | B4 (§5): each floor is decided on lab cases that actually reach it. (i) sparse and undersampled planes (crops of set 204 OSC raw planes cut below 5 qualifiers; sparse lab fields); arms: today's `c` = 1, the plane's own median over its 1–4 ratios, the median kept `c` (F-11) of the same channel over the group's other members (a candidate, read from the owner's kept values, not a second estimate; R-B13). (ii) crops, binned frames, masked-overlap corners; arms: today's factor kept, factor 1. The numbers and the verdict go to the owner (R-B1), which closes the LN cycle's owed question; the product changes only on the owner's word | the Plan B bars below: F-9 |
 | F-10 | One background (2026-10-11; research RB1/RB2, design studies D1/D2, the ERP comparison on the trailed frames). One star met five estimates of sky and noise, none owned. On synthetic nebulae the filtered plane's measured σ_f is the nebula's own (σ_f / noise 1.75 / 6.7 / 32.5 / 30.4 on `neb0.1/0.5/3/3_4096`), so the seeds lose stars (recall vs flat 0.92 / 0.69 / 0.40; every `neb3` star below Fisher 100); a sky sample's error grows with its distance from the star (`neb3` p90: fit b 2.6σ < [6, 8]F 4.4σ < [10, 12]F 5.5σ < mesh 10.1σ < plane median 15.3σ); `c` couples 1:1 to its far ring and ≈ 0.1 to the fit's b, so an SNR built on the fit's b would inherit its 0.48σ p90 noise (47 % of the median star over 5F); the field width reads 8.2–8.8 px on M42 against a fitted 1.7–2.4 px (injected stars found 42/60, 43/62, 38/62); the trailed L 0010 / L 0011 hit the seed cap and keep 947 / 786 trail fragments (clean median 2458), `c` 4.48 / 6.89, weight 0.024 / 0.036 of the group max (the ERP: 2e-9 PSF signal weight) | **As built (Task 10b, 2026-10-12; every ruling with its numbers in `docs/stacking/README.md` R-OSP-7b).** **Detection.** σ_f is PROPAGATED: the 128-px mesh's per-cell clipped σ (its noise map) × the plane's filtered-noise gain, K = 6 unchanged; the mesh is the plane's one map, computed once and shared with N* (so on a masked plane N* reads the masked mesh: an absent pixel is not sky; D-1). The gain is 1 on a plane whose caller states its pixels' noise `White` (sensor pixels, raw or calibrated: shot, read and dark noise are per pixel and calibration is per-pixel arithmetic, so every lag-≠0 covariance is 0; C-7), and it is READ once per plane, from the noise's own autocovariance on the 5×5 high-pass residual, on a `Mixed` (debayered, resampled, warped, integrated) or `Unknown` plane (`star_measure::PixelNoise`, default `Unknown`: gain 1 on mixed pixels floods false seeds, a read on white pixels only costs nebula recall; C-10). The stacking Measure stage states `White` for a calibrated mono plane and `Mixed` for a debayered one; integrate and drizzle state `Mixed`. Two knot tests, thresholds from the PSF and the noise: the bounds are a pixel-centred Moffat β 1.5 through the same kernels (plain 0.972, zero-sum 0.935 at F 2.6–8; 0.911 / 0.885 at F 1.2), read at the field's star-width ENVELOPE F_env = F_field + 3.09·s, s the TRUE spread of the stars' widths (E4n: the mirrored lower-half spread of the readable reads in [0.715·F_field, F_field] with the reads' own error e(ν) = √((0.899/ν)² + 0.0208²) removed in quadrature; A2-1…A2-3: half the real stars are broader than the mode); σ_r = √(1 + r² − 2rρ)/ν, z = 3.09; a seed whose plain f(2F)/f(F) exceeds its bound + 3.09σ_r AND whose zero-sum F response is below K is structure and dropped; a seed whose zero-sum ratio exceeds its bound + 3.09σ_r is `extended` (kept as a seed; out of the β sample, `c`'s qualifiers AND the frame statistic — the saturation flag's treatment, P3); a seed whose peak reaches the plateau-clip level (0.9 of Task 8's `SaturationPlane` range, the owned quantity — no third maximum) is exempt, and whether that near-clip class is right is Task 10c's (F-3). The β sample takes only seeds whose verdict fit passes the fit's centre and region tests. **The field width** is the HALF-SAMPLE MODE of the half-maximum reads of every readable candidate (its brightest pixel ≥ 10 σ_rim above the read's own box rim), clamped to [1.5, 24] px, with no saturation test (F25 stands): every contaminant of a read — a clipped core, a blend, a knot, a sky bump — is wider than the PSF while the stars share one width (A5; M42 8.2–8.8 → 1.7–1.95 px). **Trails.** NO per-star streak refusal (a fitted-ecc line at 0.8 refuses 2–32 % of clean real fits; an elongated star is a real star, measured as such; Q1). The fit's centre test is its own half-maximum contour: a fit is the seed's star when the seed lies inside (u/α_x)² + (v/α_y)² ≤ 2^(1/β) − 1 in the fit's axes (a round FWHM-3 star keeps the former 1.5 px; a fixed tolerance refused elongated stars by the back door; A4-2). The trailed verdict is frame-level only, from the refusal structure — a fit cannot contain a star longer than its region: the trail share = (centreMoved + regionTooSmall + centreAtRim) / judged seeds, and a plane with at least 100 judged seeds and a share > 0.5 is trailed — the MAJORITY rule, a physical criterion (Q5, A4-2; the line derived from the clean frames' distribution, median + 5·1.4826·MAD, did not separate the trailed frames from the elongated G 0003, so it was not built). Like F-1's defocused verdict, every fit the plane would accept is refused `trailed`, `c` is None, the weight inputs are empty; measure path only (LN's refits never see it). ecc is reported beside it, never a gate. Frame classes (rendered before any reading): `trailed` (streaks, no measurable PSF: L 0010, L 0011) is the verdict's target; `elongated` (measurable short dashes: G 0003, ecc ≈ 0.65) gets no verdict and no per-star refusal, is measured as is with its ecc reported, and leaves every clean pooled row — rejecting it is frame selection's job (an ecc gate), not measurement's. Recorded miss: hook-shaped trails whose dwell cores fit (`trails/` H 0029, share 0.445) get no verdict (Q6). **Per-star sky (one definition per scale).** The fit keeps its free local b (fixing it at any ring value triples the nebula FWHM scatter and fails 2–4 F-5 cells: rejected). ONE aperture-scale sky B_i per accepted star on R6's geometry (the plain mean over [10F, 12F] outside every seed's 3F disc, F the frame FWHM), computed once and stored with σ_i (the RMS of (v − B_i) over the same pixels) and their count, not persisted; `c`'s growth sums (v − B_i), byte-identical to R6's by construction; Task 11's SNR and HFR read B_i and σ_i, none re-estimates; b − B_i is stored as a diagnostic. LN keeps each side's own ring width: the pair-common width max(F_R, F_T) failed the nebula-pair bar as the per-side width did and added misses of its own (P.3 = C-9). Recorded limits (with SE, not bars): the nebula `c` bias on R6 (`neb3` 0.880, `neb3_4096` 1.129) and its crowded form (density × `neb3` d200 / d600 / d1000: 1.058 / 1.133 / 1.087 as built, 1.058 / 1.135 / 1.069 before); the real halo `c` carries beyond the fitted model on injected stars (+4–6 % on clean frames, 10b-L); LN's psfSel on nebula-sky pairs and warped targets, unchanged by this row (13 of 34 cells over; Plan B's before, C-9); the mesh noise map reads ≈ 6× the true noise on `neb3` (structure inside a cell counts as noise), so heavy-nebula recall stays ≈ 0.54 until a later owner takes it (C-7); the gain read keeps its nebula-texture leak on debayered colour planes (Task 11, C-7) | the F-10 bars below |
 | F-11 | `c` cannot be checked on a real run (2026-10-20, after-Plan-A note §7 (a)): per plane it is neither persisted (`stacking/measure.rs`, `ChannelMeasurement`) nor logged at a level a run keeps (`star_measure`'s `"aperture correction measured"` and LN's `"ln scale: per-side ring"` are `debug`; Measure's `"frame plane measured"` carries no `c`); the one real read (set 204 run 7, LN's own `c`: OSC p0 1.00, p1 1.13, p2 1.12, mono 1.13) came from a debug log | B0 (R-B2): per plane `c`, its SE and its qualifier count as additive `Option`s on `ChannelMeasurement` in the cached `metrics` payload, skipped when None like `beta_own` (camelCase in the payload, from the existing names: `apertureCorrection`, `apertureSe`, `apertureStars`); `MEASURE_VERSION` stays 4, no stage hash moves, an old payload decodes unchanged (the fields None until the set is re-measured); one `info!` per (group, channel) at the end of Measure (planes, `c` min / median / max, planes at floor (i)), the per-plane line staying `debug` (the logging rule); LN's per-side `c`, F1's growth factor and `ln_growth_pairs` go to the cheapest kept place the plan finds, with no new log field name | the Plan B bars below: F-11 |
 | F-12 | `c`'s sample (2026-10-20, after-Plan-A note §7 (b)–(d)): the 64 brightest qualifiers (`CORRECTION_STARS`) with no point-source test. Hot pixels qualify on an uncorrected R plane: raw 0013 p0 `c` 1.334 against 2.097 / 2.074 on 0004 / 0007, 36 of its 64 `c` stars hot pixels, the same stars' 0004 → 0013 ratio 0.617 on p0 against 1.007 / 0.970 on p1 / p2 (R weight × 0.40); stacking meets it on a refused hot-pixel map (no `ATH_CHPX`) or a raw-mode measurement. The brightest are not representative on undersampled R / B: raw 0004 p0 aperture / model 1.57 (top 64) → about 1.2 (rank 500–2000), G flat (1.23 → 1.18); Task 10's RF7: the LN-like ratio over all pairs −4.7 % ± 1.5 %, bright pairs +0.2 %, which `docs/stacking/README.md` R-OSP-7 reads as likely the far ring's additive bias (an estimator artefact, not a profile property, until shown otherwise). The sharp-R ratio on the probe's own β (mosaic 0176 → 0206 p0 0.863 after `c` against about 0.985 on G / B) is unverified at the group β until F-11 | B4 (R-B8): `c`'s qualifiers gain a point-source screen (its design is the controller's), and its sample is stratified across brightness instead of the top 64 (bright stars are not representative); a measured value changes, so `MEASURE_VERSION` 4 → 5, one bump for Plan B, the once-only re-measure of every set named in the release note (the kind of §7's first risk) | the Plan B bars below: F-12 |
@@ -356,22 +366,38 @@ C-6c), the frame statistic's population and weights (C-8, C-8b) and the correcte
 (C-12d: +0.003 ecc on bright round β 2.5 stars at the true width — a later fit-design task's first datum).
 
 **Plan B bars (fixed 2026-10-20, before any Plan B measurement, from the Plan B design read and rulings
-R-B1…R-B10).** "The after note" is `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`; lab paths
-are athenaeum-lab's; the scorecard is `t14-final` (sha256 `ac2c6914…`). §3's rules hold: a missed bar goes to the owner
-with its numbers and is never moved; a bar that cannot be derived here is reported with its reason.
-- **The ERP column (the owner's rule; R-B4).** Every LN table, synthetic and real, prints the ERP beside EVERY arm
-  (`psfOff`, `psfSel`, `f1_2`, `f1_3`, `f1_gc` and the F1 v2 lab port), not on `sLib` rows only as today
-  (`starlab/scorecard.py` `rows_ln`; a lab change). `erp_audit.py` gains an LN freshness audit: each `ln.csv` linked by
-  sha256 to the frames it read, as the star units are (the 24 synthetic `ln.csv` are unaudited today and predate the
-  2026-10-08 header augment of their frames); an `ln.csv` re-runs only where its frames changed. On real data the
-  existing ERP LN is always printed (set 204 30-member subset −3.09 % / −1.92 %/px², Horse C11 G −2.44 % / slope
-  −0.06; lab `findings.md` §4); where none exists (set 204 full mono and OSC, run B mono and OSC, the nebula-sky and
-  the injected pairs) the column reads "not run" until the owner's OK. The realistic-field family below is new frames,
-  so the ERP runs on it.
-- **The 3 % rule (the owner's).** A cell where an arm of ours and the ERP both miss the truth by more than 3 % in the
-  same direction marks that truth cell suspect: it is reported, its truth re-checked (on synthetic frames by B2's
-  harness-truth read of the same cell; on real data by B2's validation of the mode that judges it), and until then it
-  is not the referee for that cell.
+R-B1…R-B10; amended the same day, still before any measurement, by the owner's ERP answer and R-B11…R-B16).** "The
+after note" is `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`; lab paths are athenaeum-lab's;
+the scorecard is `t14-final` (sha256 `ac2c6914…`). §3's rules hold: a missed bar goes to the owner with its numbers and
+is never moved; a bar that cannot be derived here is reported with its reason. A detail tagged (R-B13) is one the
+controller accepted from the first amendment; the plan does not re-open it.
+- **The ERP column (the owner's rule and ERP answer; R-B4).** Every LN table, synthetic and real, prints the ERP
+  beside EVERY arm (`psfOff`, `psfSel`, `f1_2`, `f1_3`, `f1_gc` and the F1 v2 lab port), not on `sLib` rows only as
+  today (`starlab/scorecard.py` `rows_ln`; a lab change). `erp_audit.py` gains an LN freshness audit: each `ln.csv`
+  linked by sha256 to the frames it read, as the star units are (the 24 synthetic `ln.csv` are unaudited today; 5 of
+  them, `truthcheck`, `density_pairs` ×2 and `osc_pairs` ×2, predate the 2026-10-08 header augment of their frames);
+  an `ln.csv` re-runs only where its frames changed. On real data the existing ERP LN is always printed (set 204
+  30-member subset −3.09 % / −1.92 %/px², Horse C11 G −2.44 % / slope −0.06; lab `findings.md` §4). Where none exists
+  the ERP runs ONCE, in B1 (the owner's ERP answer, 2026-10-20): set 204 full mono and OSC and run B mono and OSC from
+  their exported registered members, and the injected pairs, on the dev Mac; the nebula-sky pairs on the runner. New
+  frames get their one run where they are made: the seeing-lever injected pairs and the realistic-field family (B2),
+  the synthetic and the cropped / binned floor-(ii) frames (B4). A cell reads "not run" only until its run has
+  happened; the re-run rule governs every later run.
+- **The 3 % rule (the owner's; R-B12).** It applies to ESTIMATED truths only: the `pointfit` truth column, the
+  harness photometric truth and injected-star truths. A cell where an arm of ours and the ERP both miss such a truth
+  by more than 3 % in the same direction marks that truth cell suspect: it is reported, its truth re-checked (the
+  harness truth by B2's validation of the mode that judges the cell; an injected-star truth by the injected stars' own
+  aperture sum), and until then it is not the referee for that cell. On synthetic frames s_true is a generator input,
+  exact by construction, so the rule flags nothing there: `pairs/main/m4w10` t60 (F1 +11.97 %, the ERP +5.60 %; the
+  after note, row 6) stays evidence.
+- **No-change guards, truth-judged moves (R-B11).** A before-vs-after bar (the re-based LN row within ±0.5 %, R-B7;
+  I.1's inject stability 2 % + 2 SE_c; weights ρ ≥ 0.9) is a NO-CHANGE guard: it binds a stage that does not intend
+  to move that quantity (B0's identity, B1, a neutral B5 swap such as LN's module seeds; ρ also binds B3, since the
+  weights do not read LN's scale, `stacking/weights.rs`). A stage that moves the quantity by design (B3's estimator
+  moves s; B4's `c` moves psfSel's s, the weights and inject row 6) is judged against the validated truth instead:
+  the pooled median abs(gap) not worse than before's, every member printed with its gap before and after, the 3 %
+  rule per cell where the ERP has a column, the before value beside; its before-vs-after number is reported, never a
+  bar.
 
 *F-8 referee (B2; R-B3).*
 - The harness truth (`harness/acceptance/grid-report.py`: F from the half-maximum area of about 100 isolated stars,
@@ -388,8 +414,10 @@ with its numbers and is never moved; a bar that cannot be derived here is report
   member that only a failing mode can judge is reported, never a referee cell.
 - Injected pairs on a seeing lever: pairs of real frames of different seeing carrying stars injected at a known s_inj
   with the frame's own PSF stamp (`inject.py`'s `_fwhm_pass` stamp; a lab change), spanning the real members' FWHM
-  range (set 204 mono 2.64–5.92 px against a 3.385 px reference): truth by construction, no bar of their own; the
-  injected stars' own aperture sum over the injection printed as the check (today 0.95–1.03 on all 18 inject planes).
+  range (set 204 mono 2.64–5.92 px against a 3.385 px reference): s_inj is set by construction, so the referee
+  needs no bar on them (the estimator's bar on them is under *F-8 estimator*; the stamp is an estimate of the frame's
+  PSF, so the 3 % rule applies, R-B12); the injected stars' own aperture sum over the injection printed as the check
+  (today 0.95–1.03 on all 18 inject planes).
 
 *Field realism (B2; R-B5).*
 - `annulusCrowding` (L-26: per member, the median over its pairs of the larger side's fraction of annulus pixels above
@@ -399,70 +427,90 @@ with its numbers and is never moved; a bar that cannot be derived here is report
   0.0016–0.0024; the real `c` comes from F-11 (B0) and B1. Medians are compared, the per-target-FWHM values printed
   (the synthetic wing is a β-2 Moffat at 4 × the core FWHM, so it scales with the seeing, `synth.py`; a real halo does
   not). A family differs when its median lies outside the real members' range (min…max over every real member B1
-  reads).
+  reads; R-B13).
 - If no pair family lies inside that range on both quantities, ONE realistic-field pair family is built: a halo of
   fixed width in pixels sized from the real `c` excess, the real annulus crowding, the real seeing range, a reference
   stacked from the best frames (as the `*mix` families, `ref_nframes` 20), faint stars on the `main` luminosity
   function (fmin 0.05, slope 0.8), cosmic rays and hot pixels. The ERP runs on it; the harness truth is validated on it
   on the referee bars above.
 
-*F-8 estimator (B3; R-B6, R-B7).*
+*F-8 estimator (B3; R-B6, R-B7, R-B11, R-B14).*
+- B3 runs after B4 (R-B14), so every candidate is read on B4's `c` (`MEASURE_VERSION` 5; psfSel's s moves 1 : 1 with
+  `c`, §3 F-9): B1's synthetic rows (the `t14-final` probe outputs, Plan A's `c`) are the before column and one lab
+  cycle at the B4 binary the after column; the real rows are `ln_real` on the three trees at the same binary, B1's
+  beside.
 - Every candidate on the same rows: synthetic s / s_true per cell and the slope on F_t² − F_r² (the 19 `pairs`,
   `density_pairs`, `osc_pairs`, `truthcheck`, the injected pairs, the realistic family if built), the ERP beside; real
   median gap and slope against the validated truth per dataset (set 204 mono and OSC, run B mono and OSC, Horse C11 G),
-  the ERP beside where run.
-- The synthetic bar a new default meets is F-5's psfSel bar at every target: within ±1.2 % on the Moffat and Gaussian
-  pairs, ±2 % on the blur pairs. Keeping F1 as is misses it (+11.97 % at `pairs/main/m4w10` t60); that is the owner's
-  choice, the miss recorded beside B2's field-realism verdict.
+  the ERP beside (B1's runs).
+- The synthetic bars a new default meets, per cell against s_true at every target (R-B16): F-5's psfSel bar on the 19
+  `pairs` (within ±1.2 % on the Moffat and Gaussian pairs, ±2 % on the blur pairs); `truthcheck` within ±0.3 % and
+  `density_pairs` within ±0.8 % (the referee's own normal and crowded bars, on the families that validate those
+  modes); `osc_pairs` within ±2 % per plane; the injected pairs within ±2 % (s / s_inj); the realistic family, if
+  built, within ±2 % (its s_true is a generator input). Keeping F1 as is misses the `pairs` bar (+11.97 % at
+  `pairs/main/m4w10` t60); that is the owner's choice, the miss recorded beside B2's field-realism verdict.
 - The F1 v2 sky is a candidate only if (1) the lab port's pooled median abs(gap) against the validated truth over the
-  real members is below F1's (before, as median gaps, lab `f1v2-findings.txt`: set 204 −1.01 % against F1's
-  −0.64 %, Horse C11 G +0.08 % against −0.13 %; with the L-23 map −0.79 % against −0.22 %) and (2) its sky is robust
-  to cosmic rays: on each of three cosmic-ray seeds its `pairs/main` t60 cell moves by ≤ 0.53 pp (the median sky's
-  worst; the plain mean moved +3.22 pp on one seed of three). Only then is the module ring API change in scope
-  (`ring_sky` taking a caller F, max(F_R, F_T), and the union mask of both fit lists).
+  real members is below F1's (R-B13; the port's B1 run on its 2026-10-06 members, F1's on the same members; before, as
+  median gaps, lab `f1v2-findings.txt`: set 204 −1.01 % against F1's −0.64 %, Horse C11 G +0.08 % against −0.13 %;
+  with the L-23 map −0.79 % against −0.22 %) and (2) its sky is robust to cosmic rays: on each of three cosmic-ray
+  seeds its `pairs/main` t60 cell moves by ≤ 0.53 pp (the median sky's worst; the plain mean moved +3.22 pp on one
+  seed of three). Only then is the module ring API change in scope (`ring_sky` taking a caller F, max(F_R, F_T), and
+  the union mask of both fit lists).
 - Master level (R-B7), for any change of the default: whole groups set 204 mono and OSC, run B mono and OSC, Horse C11
-  L and G, stacked before and after with the reference pinned (`ReferenceMode::Manual`, the before run's pick): master
-  median / MAD / noise / FWHM within 0.1 / 1 / 2 / 1 %; the LN row re-based (R13-4: (s_B / s_A) ÷ (phot_B / phot_A) − 1)
-  within ±0.5 %; weights ρ ≥ 0.9. An estimator change moves s by design, so a miss of the LN row goes to the owner with
-  each member's gap against the validated truth beside it, before and after; the bar is not moved.
+  L and G, stacked with the reference pinned (`ReferenceMode::Manual`, the pick B0 recorded), the before runs being
+  B4's after-runs (R-B16): master median / MAD / noise / FWHM within 0.1 / 1 / 2 / 1 %; weights ρ ≥ 0.9 (a no-change
+  guard). An estimator change moves s by design, so the LN scale is judged against the validated truth (R-B11): per
+  dataset the pooled median abs(gap) of the after-run not worse than the before-run's, every member printed with its
+  gap before and after, the 3 % rule per cell, the re-based LN row (R13-4: (s_B / s_A) ÷ (phot_B / phot_A) − 1)
+  printed beside, not a bar.
 
 *F-9 (B4; R-B1).*
 - A case counts only when the product reaches the floor on it: for (ii) `ln_growth_pairs` 1–4 or the 0-pair warn, with
   ≥ 20 matched pairs; for (i) the "fewer than 5 isolated unsaturated stars" warn. The reference for a crop or a binned
   copy of a real frame is the same plane or pair uncropped (its `c` from ≥ 5 qualifiers, kept by F-11; F1's factor
   from its 100 growth pairs); for a synthetic case, the truth (row 6's captured fraction for (i), s_true for (ii)).
-- Verdict per floor: the arm with the smaller median abs(error) against the reference over the counted cases, when
-  the paired difference exceeds 2 SE; within 2 SE the verdict is "indistinguishable" and today's behaviour stays. A
-  floor no case reaches is reported "not reached", with the lowest count the cases reached. For (i) the floored
-  plane's weight relative to its group's other planes and its psfSel s are printed per case. Each verdict goes to the
-  owner.
+- Verdict per floor (R-B13): the arm with the smaller median abs(error) against the reference over the counted
+  cases, when the paired difference exceeds 2 SE; within 2 SE the verdict is "indistinguishable" and today's
+  behaviour stays. A verdict needs at least 8 counted cases per floor over at least 2 datasets, its SE by bootstrap
+  over the cases (R-B16); below that the verdict is "too few cases", reported with the count, distinct from
+  "indistinguishable". A floor no case reaches is reported "not reached", with the lowest count the cases reached;
+  floor (ii) may close as "not reached in the product" with that proof (`MIN_MATCHES` 20 excludes the member first;
+  R-B13). For (i) the floored plane's weight relative to its group's other planes and its psfSel s are printed per
+  case. Each verdict goes to the owner.
 
 *F-11 (B0; R-B2).*
 - Identity: probe outputs identical (`run_probe --verify`, `probe_parity`), every `.athf` byte-identical, every stage
   hash unchanged, an old payload decodes unchanged (the new fields None). The kept values equal the debug `"aperture
   correction measured"` values plane by plane on one set 204 run and one Horse C11 run. The per-(group, channel)
-  `info!` uses the dictionary's names (`planes`, `count`, `aperture_correction`) and adds only a min / max pair in the
-  `beta_own_min` / `beta_own_max` form, entered in the logging spec's dictionary in the same change.
+  `info!` uses the dictionary's names (`planes`, reused in the Measure sense, the dictionary entry noting the reuse;
+  `count`; `aperture_correction`) and adds only a min / max pair in the `beta_own_min` / `beta_own_max` form, entered
+  in the logging spec's dictionary in B0's change (R-B13).
 
-*F-12 (B4; R-B8).*
+*F-12 (B4; R-B8, R-B11).*
 - The × 0.40 R case: on raw 0013 p0 the 36 hot-pixel `c` stars are refused, and the same stars' 0004 → 0013 ratio on
   p0 lies within 3 % of the mean of p1's and p2's (today 0.617 against 1.007 / 0.970; 3 % is the agreement the same
   real stars reach on G / B after `c`, the after note §4.1).
-- Inject row 6 (`manifests/inject.json`, the frame's own `c`): on the clean mono frames Δ against Plan A's value per
-  frame ≤ 2 % + 2 SE_c (I.1's stability row); on the undersampled OSC planes, where an injected wingless Moffat-4 star
-  reads × `c` (1.81–2.34 today, I.1's recorded limit extended to OSC), row 6 is printed beside its `c`-free ratio and
-  `c` (a lab change) and reported.
-- Set 204 OSC as a whole group (the reference pinned): weights ρ ≥ 0.9 against Plan A's run, each larger mover tied to
-  its cause; the master rows reported.
+- Inject row 6 (`manifests/inject.json`, the frame's own `c`): `c` moves by design, so I.1's stability row (Δ
+  against Plan A's value per frame ≤ 2 % + 2 SE_c) is not the bar here (R-B11); row 6 is judged against the injected
+  flux, its truth: on the clean mono frames the pooled median abs(row 6 − 1) not worse than Plan A's, every frame
+  printed with its `c`-free ratio (model flux / injected flux, which B4 does not move) and its `c`, Plan A's row 6
+  beside; on the undersampled OSC planes, where an injected wingless Moffat-4 star reads × `c` (1.81–2.34 today, I.1's
+  recorded limit extended to OSC), row 6 is printed beside its `c`-free ratio and `c` (a lab change) and reported.
+- Master level: the four master-level groups (set 204 mono and OSC, run B, Horse C11) stacked at the B4 binary with
+  B0's reference picks pinned, against B0's runs; these after-runs are B3's before-runs (R-B16). `c` moves the
+  weights by design, so the weights' ρ against B0's run is reported per group, each larger mover tied to its cause, not
+  a bar (R-B11); the master rows reported.
 - Lab truth: F-5's bars hold (the spread across profile families ≤ 2 % at F 2.6 and F 8.0; psfSel within ±1.2 % /
   ±2 %), and every row 6 cell on the lab families, whose true captured fraction does not depend on brightness and where
-  Plan A's `c` already reads 0.9865–1.0010 (the after note, row 6), stays within 2 SE of its Plan A median: a drop
-  there is the far ring's additive bias on faint stars (R-OSP-7, RF7) entering the sample, an estimator artefact, and
-  a STOP. The qualifiers' growth / model ratios per brightness tercile are printed against truth beside it.
+  row 6 already reads 0.9865–1.0010 (its captured-fraction medians at F 5.0 / 8.0; the after note, row 6), stays
+  within 2 SE of its Plan A median (R-B13): a drop there is the far ring's additive bias on faint stars (R-OSP-7, RF7)
+  entering the sample, an estimator artefact, and a STOP. The qualifiers' growth / model ratios per brightness
+  tercile are printed against truth beside it.
 - Reported: the screen's refusals on the clean lab families counted against truth, per family (a truth star refused is
   the screen's defect); the planes at floor (i) before and after; the sharp-R ratio (mosaic 0176 → 0206 p0) at the
   group β, from F-11.
-- `MEASURE_VERSION` 5 moves every stage hash, so B6 re-reads F-8's master rows on top of B3's after-run.
+- `MEASURE_VERSION` 5 moves every stage hash; B4 lands before B3 (R-B14), so B3's runs start from B4's after-runs and
+  judge the estimator on the final `c`.
 
 *F-13 (B5; R-B9).*
 - P.1 (Plan A plan, row P.1): psfSel, and the default estimator if it is another, on the nebula-sky pairs (`iso/m4`,
@@ -470,9 +518,10 @@ with its numbers and is never moved; a bar that cannot be derived here is report
   flat control on the same star field within ±1.2 % (m4, g) / ±2 % (blur25mix) on `neb0.5`, the same plus 2 SE on
   `neb3`; a cell refused for < 20 matched stars is n/a; before 13 of 34 cells over. P.2: warped targets within their
   unwarped twin's tolerance; before 3 cells at t25 over.
-- Module seeds (if in scope): no synthetic LN cell worse against truth than B3's value beyond 2 SE; F-8's master rows
-  on the real groups; structural pins that LN's stars carry the module's `saturated` flag and that `k` and
-  `unverdicted_clip_range` are gone.
+- Module seeds (if in scope; a neutral swap, so the no-change guards bind it, R-B11): no synthetic LN cell worse
+  against truth than B3's value beyond 2 SE; F-8's master rows on the real groups against B3's after-runs (the master
+  tolerances, the re-based LN row within ±0.5 %, weights ρ ≥ 0.9); structural pins that LN's stars carry the module's
+  `saturated` flag and that `k` and `unverdicted_clip_range` are gone.
 - R11-3: reported with its pulls, or its owner named with a bar of its own declared before it is measured.
 
 **Owned quantities (F-10, 2026-10-11).** Every quantity more than one consumer reads has ONE owner and a truth bar
@@ -642,47 +691,81 @@ clean; push only on the owner's word).
    weight rank correlation ρ ≥ 0.9, every larger change tied to a scorecard row; LN scale within 0.5 %; Measure wall
    ≤ +20 %.
 
-**Plan B — F1 and `c` (amended 2026-10-20; rows F-8, F-9, F-11…F-13, bars in §3's Plan B block).** Seven stages in
-order. In every LN table the ERP is a column beside every arm, never the referee; where no ERP LN exists or the owner
-has not cleared a new run, the column reads "not run". Lab tools are committed in athenaeum-lab only.
+**Plan B — F1 and `c` (amended 2026-10-20; rows F-8, F-9, F-11…F-13, bars in §3's Plan B block).** Seven stages,
+run in the order B0 → B1 → B2 → B4 → B3 → B5 → B6 (R-B14: `c`'s definition lands before B3's master-level run, so
+the estimator is judged on the final `c`). The labels are kept, so a label is not the order; the stages are listed
+below in run order. In every LN table the ERP is a column beside every arm, never the referee; the owner cleared every
+first ERP LN run (2026-10-20), so a cell reads "not run" only until its run has happened. Lab tools are committed in
+athenaeum-lab only. Each stage's *Data* names the machine and volume of its inputs: the dev Mac's `~/.athenaeum-acc`
+holds the three acceptance trees (`tierA-lnB-f1`, `lnB-runB-f1`, `hc11B-f1`, with their `registered/` members), the
+lab grid (`star-lab/grid`, `star-lab-v2`), `star-lab-a/results`, the injected and mono2 frames (`star-lab-inject`,
+`star-lab-mono2`) and the F1 v2 port's runs (`star-lab/f1v2`); the external volumes `/Volumes/bigbase2` (the raw
+frames 0004 / 0007 / 0013) and `/Volumes/bigbase3` (the masters `manifests/inject.json` names) are mounted on the dev
+Mac; the runner alone holds `star-lab-l` (the nebula-sky pairs). A step runs where its data lives, the ERP on the
+machine that holds its frames, and a before / after pair never splits across machines.
 - **B0. `c` kept** (product; F-11). Additive `Option`s on `ChannelMeasurement`, the per-(group, channel) `info!`, LN's
-  per-side `c` and growth factor at a kept place. Data: one set 204 run and one Horse C11 (`hc11B-f1`) run on
-  acceptance working copies, re-measured on a fresh work dir (a cached payload carries no `c`); no ERP. Bar: F-11's
-  identity. Owner: informed (R-B2 rules the placement).
-- **B1. LN re-baseline on Plan A's fits** (lab only). Synthetic: every LN row taken from the `t14-final` scorecard per
-  family × β × arm (no new run), the ERP printed beside every arm, the LN freshness audit; the injected pairs; the
-  nebula-sky pairs (`manifests/t10b-l.json`) re-run on the runner at the current binary (their data lives there,
-  R-B10). Real: `ln_real.py run` / `table` on the three trees (`tierA-lnB-f1` run 5, `lnB-runB-f1` run 6, `hc11B-f1`
-  run 5; the 2026-10-07 wall 2690 s), every arm plus the F1 v2 lab port, after the lab rebuilds `runB-truth.csv` and
-  `hc11G-truth.csv` from `ln-real-members.csv` with a script (sha256 recorded) and checks every reference md5 against
-  `ln-real-plan.json` before use (R-B10); `annulusCrowding` per member printed for B2. ERP: the existing real ERP LN
-  printed; new real runs only on the owner's OK. Bar: none (a baseline); the `f1_gc` ↔ `.athln` parity printed
-  (2026-10-07: median +0.0097 %). Owner: the new real-set ERP runs.
+  per-side `c` and growth factor at a kept place. Then the four master-level groups (set 204 mono and OSC, run B,
+  Horse C11) stacked on acceptance working copies, each re-measured on a fresh work dir (R-B15: no stage hash moves,
+  so a cached payload, which carries no `c`, would be a cache hit), each run's reference pick recorded: these are the
+  before-runs for B4 (R-B16). Data: dev Mac, `~/.athenaeum-acc` (the three trees); no ERP. Bar: F-11's identity.
+  Owner: informed (R-B2 rules the placement).
+- **B1. LN re-baseline on Plan A's fits** (lab only). Synthetic: every LN row per family × β × arm read from the
+  `t14-final` probe outputs (`star-lab-a/results/t14-final`; the scorecard's `.md.gz` holds rendered rows only), no
+  new run, the ERP printed beside every arm, the LN freshness audit; the injected pairs; the nebula-sky pairs
+  (`manifests/t10b-l.json`) re-run on the runner at the current binary (their data lives there, R-B10). Real:
+  `ln_real.py run` / `table` on the three trees (`tierA-lnB-f1` run 5, `lnB-runB-f1` run 6, `hc11B-f1` run 5; the
+  2026-10-07 wall 2690 s), every `ln_scale_probe` arm, after the lab rebuilds `runB-truth.csv` and `hc11G-truth.csv`
+  from `ln-real-members.csv` with a script (sha256 recorded) and checks every reference md5 against
+  `ln-real-plan.json` before use (R-B10); `annulusCrowding` per member printed for B2. F1 v2, its own step and not an
+  `ln_real.py` arm (R-B16): the lab port `star-lab/f1v2/f1core.py` on its 2026-10-06 inputs, the set 204 30-member
+  subset and Horse C11 G's 28 members (member lists and truths in its `log-real-{s204,hc11G}-bauto.txt`; the subset's
+  truth CSV `ln-scale-audit/tierA-mono-all.csv` is not on disk, Horse C11 G's is the rebuilt `hc11G-truth.csv`), its
+  pairs re-dumped by the current probe (`--stars-dir`, Plan A's fits), the 2026-10-06 numbers beside. ERP: the
+  existing real ERP LN printed; a lab step first exports, per dataset, the registered members and the reference the
+  ERP reads from each tree's `registered/` (`~/.athenaeum-acc/erp-ln-s204` is deleted and `~/.athenaeum-acc` holds no
+  ERP export for run B or set 204 OSC), then one ERP LN run each on set 204 full mono and OSC and run B mono and OSC,
+  one on the injected pairs, and one on the nebula-sky pairs on the runner (the owner's ERP answer). Data: dev Mac
+  `~/.athenaeum-acc` (the trees, `star-lab-a/results/t14-final`, `star-lab-inject`, `star-lab/f1v2`, `lnB/truth`);
+  the runner (`star-lab-l`). Bar: none (a baseline); the `f1_gc` ↔ `.athln` parity printed (2026-10-07: median
+  +0.0097 %). Owner: informed with the baseline.
 - **B2. The referee** (lab only; F-8 referee, field realism). The harness truth in both modes against s_true,
   FWHM > 5 included, and the growth-corrected crowded mode if the fallback fails there (R-B3); the field-realism
   comparison and, if it differs, the one realistic-field family with its one ERP run (R-B5); the injected pairs on a
-  seeing lever with the frame's own PSF stamp. Data: the lab grid on this Mac (`pairs`, `density_pairs`, `truthcheck`)
-  and B1's real members. Bar: F-8 referee and field realism, closed before any real-data verdict. Owner: informed with
-  the table (the referee, synthetic truth and the harness truth, is the owner's; a lab fix to the harness truth is
+  seeing lever with the frame's own PSF stamp, with their one ERP run. Data: dev Mac `~/.athenaeum-acc`, the lab grid
+  (`star-lab/grid/{iso,main}` for `pairs`, `star-lab-v2/{density_pairs,truthcheck}`) and B1's real members; the new
+  frames (the seeing-lever pairs from the set 204 mono tree, the realistic family if built) are made there and their
+  ERP runs there. Bar: F-8 referee and field realism, closed before any real-data verdict. Owner: informed with the
+  table (the referee, synthetic truth and the harness truth, is the owner's; a lab fix to the harness truth is
   reported before B3 uses it). Controller: families and seeds.
-- **B3. The LN estimator** (product, or none). Candidates: F1 as is, psfSel on Plan A's fits, the F1 v2 sky under its
-  entry bar (with the module ring API change only then; R-B6). B1 / B2's tables first, then whole groups at master
-  level (R-B7): set 204 mono and OSC, run B, Horse C11, reference pinned, on acceptance clones; no ERP run (the real
-  inputs are unchanged). Bar: F-8 estimator. Owner: the default estimator (L-24 was the owner's), with the numbers;
-  keeping F1 changes nothing in the product.
-- **B4. The `c` floors and `c`'s sample** (product; F-9, F-12). The floor cases (crops, binned frames and
-  masked-overlap corners for (ii); sparse and undersampled planes, crops of set 204 OSC raw planes, for (i)); the
-  point-source screen and the brightness-stratified sample, `MEASURE_VERSION` 5. Data: the lab scorecard, inject OSC
-  raw (`mono2`), the raw frames 0004 / 0007 / 0013, set 204 OSC as a whole group; an ERP LN run only on new synthetic
-  floor-(ii) frames (new frames, the owner's rule). Bar: F-9, F-12. Owner: each floor's verdict (F-9, open since the LN
-  model fixes cycle). Controller: the screen's design.
+- **B4. The `c` floors and `c`'s sample** (product; F-9, F-12; runs before B3, R-B14). The floor cases (crops,
+  binned frames and masked-overlap corners for (ii); sparse and undersampled planes, crops of set 204 OSC raw planes,
+  for (i)); the point-source screen and the brightness-stratified sample, `MEASURE_VERSION` 5; the four master-level
+  groups stacked at the B4 binary with B0's references pinned, against B0's runs (these are B3's before-runs,
+  R-B16). Data: on the dev Mac, the lab scorecard (a lab cycle at the B4 binary), inject OSC raw (`star-lab-mono2`,
+  `star-lab-inject`) and the three trees in `~/.athenaeum-acc`, the raw frames 0004 / 0007 / 0013 on
+  `/Volumes/bigbase2` and their masters on `/Volumes/bigbase3`; the new floor-(ii) frames (synthetic, and crops or
+  binned copies of real frames) are made on the dev Mac with one ERP LN run each there (new frames; the ERP is a
+  column in every LN table). Bar: F-9, F-12. Owner: each floor's verdict (F-9, open since the LN model fixes cycle).
+  Controller: the screen's design.
+- **B3. The LN estimator** (product, or none; after B4, R-B14). Candidates: F1 as is, psfSel on B4's `c`
+  (`MEASURE_VERSION` 5), the F1 v2 sky under its entry bar (with the module ring API change only then; R-B6). B1's
+  synthetic rows (Plan A's `c`) are the before column and one lab cycle at the B4 binary the after column; the real
+  rows are `ln_real` on the three trees at the same binary, B1's beside; B2's referee and realism tables; then whole
+  groups at master level (R-B7): set 204 mono and OSC, run B, Horse C11, reference pinned (B0's picks), on acceptance
+  clones, B4's after-runs the before. ERP: B1's and B2's columns printed, no new run (their frames are unchanged).
+  Data: dev Mac `~/.athenaeum-acc` (the trees, the lab grid, `star-lab-v2`). Bar: F-8 estimator (a move judged
+  against the validated truth, R-B11). Owner: the default estimator (L-24 was the owner's), with the numbers; keeping
+  F1 changes nothing in the product.
 - **B5. LN's own estimates** (product if in scope; F-13). Module seeds for LN if B3 kept a module-fed estimator
-  (retiring `k` and `unverdicted_clip_range`); C-9's nebula sky; R11-3. Data: the runner's nebula-sky pairs; no ERP
-  (none exists there; a first run waits for the owner's OK). Bar: F-13. Owner: R11-3's scope, if B5 names an owner.
+  (retiring `k` and `unverdicted_clip_range`; a neutral swap, so the no-change guards bind it, R-B11); C-9's nebula
+  sky; R11-3. Data: the runner's nebula-sky pairs (`star-lab-l`); the module-seed rows on the dev Mac (a lab cycle,
+  the master-level groups against B3's after-runs). ERP: B1's run on the nebula-sky pairs printed, no new run (the
+  frames are unchanged). Bar: F-13. Owner: R11-3's scope, if B5 names an owner.
 - **B6. Checkpoint and the "after" report.** The full uniform lab run (`lab_cycle`, inject, gates), `ln_real` on the
-  three trees, `grid-report --ln-truth` on stacking runs at master level (B3's groups, reference pinned), B1's baseline
-  beside every after number; the rulings and runs recorded in `docs/stacking/README.md` R-OSP-16; the full
-  `cargo test -p athenaeum-core --all-targets`. Bar: every Plan B bar as judged plus the held bars (F-0…F-7, F-10, the
+  three trees, `grid-report --ln-truth` on stacking runs at master level (B3's groups, reference pinned), B1's
+  baseline beside every after number; the rulings and runs recorded in `docs/stacking/README.md` R-OSP-16; the full
+  `cargo test -p athenaeum-core --all-targets`. Data: dev Mac (the lab run, `ln_real`, the master-level runs, the
+  suite), the runner (the nebula-sky rows). Bar: every Plan B bar as judged plus the held bars (F-0…F-7, F-10, the
   no-regression rule). Owner: the push and the close.
 
 **Plan C — the Analysis switch-over (§4).** `analyzer.rs` onto the module; `read_raw` input and OSC; the trail
