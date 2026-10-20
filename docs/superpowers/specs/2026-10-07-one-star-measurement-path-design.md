@@ -703,7 +703,9 @@ lab grid (`star-lab/grid`, `star-lab-v2`), `star-lab-a/results`, the injected an
 `star-lab-mono2`) and the F1 v2 port's runs (`star-lab/f1v2`); the external volumes `/Volumes/bigbase2` (the raw
 frames 0004 / 0007 / 0013) and `/Volumes/bigbase3` (the masters `manifests/inject.json` names) are mounted on the dev
 Mac; the runner alone holds `star-lab-l` (the nebula-sky pairs). A step runs where its data lives, the ERP on the
-machine that holds its frames, and a before / after pair never splits across machines.
+machine that holds its frames, and a before / after pair never splits across machines. The runner (205 GiB free, no
+acceptance tree, never sees the bigbase volumes) runs the synthetic lab cycles and the ERP on synthetic frames only;
+every step that reads a tree or a bigbase volume runs on the dev Mac (plan review C-2, 2026-10-20).
 - **B0. `c` kept** (product; F-11). Additive `Option`s on `ChannelMeasurement`, the per-(group, channel) `info!`, LN's
   per-side `c` and growth factor at a kept place. Then the four master-level groups (set 204 mono and OSC, run B,
   Horse C11) stacked on acceptance working copies, each re-measured on a fresh work dir (R-B15: no stage hash moves,
@@ -726,25 +728,26 @@ machine that holds its frames, and a before / after pair never splits across mac
   ERP reads from each tree's `registered/` (`~/.athenaeum-acc/erp-ln-s204` is deleted and `~/.athenaeum-acc` holds no
   ERP export for run B or set 204 OSC), then one ERP LN run each on set 204 full mono and OSC and run B mono and OSC,
   one on the injected pairs, and one on the nebula-sky pairs on the runner (the owner's ERP answer). Data: dev Mac
-  `~/.athenaeum-acc` (the trees, `star-lab-a/results/t14-final`, `star-lab-inject`, `star-lab/f1v2`, `lnB/truth`);
-  the runner (`star-lab-l`). Bar: none (a baseline); the `f1_gc` ↔ `.athln` parity printed (2026-10-07: median
+  `~/.athenaeum-acc` (the trees, `star-lab-a/results/t14-final`, `star-lab-inject`, `star-lab/f1v2`, `lnB/truth`; the
+  ERP real-set and injected-pair runs); the runner (`star-lab-l`, the nebula-sky ERP run). Bar: none (a baseline); the `f1_gc` ↔ `.athln` parity printed (2026-10-07: median
   +0.0097 %). Owner: informed with the baseline.
 - **B2. The referee** (lab only; F-8 referee, field realism). The harness truth in both modes against s_true,
   FWHM > 5 included, and the growth-corrected crowded mode if the fallback fails there (R-B3); the field-realism
   comparison and, if it differs, the one realistic-field family with its one ERP run (R-B5); the injected pairs on a
   seeing lever with the frame's own PSF stamp, with their one ERP run. Data: dev Mac `~/.athenaeum-acc`, the lab grid
-  (`star-lab/grid/{iso,main}` for `pairs`, `star-lab-v2/{density_pairs,truthcheck}`) and B1's real members; the new
-  frames (the seeing-lever pairs from the set 204 mono tree, the realistic family if built) are made there and their
-  ERP runs there. Bar: F-8 referee and field realism, closed before any real-data verdict. Owner: informed with the
+  (`star-lab/grid/{iso,main}` for `pairs`, `star-lab-v2/{density_pairs,truthcheck}`) and B1's real members (the synthetic
+  reads: the runner or the dev Mac); the new frames: the seeing-lever pairs (set 204 mono tree, flat and dark on
+  bigbase3) are made and ERP-run on the dev Mac, the realistic family if built on the runner with its ERP run. Bar: F-8 referee and field realism, closed before any real-data verdict. Owner: informed with the
   table (the referee, synthetic truth and the harness truth, is the owner's; a lab fix to the harness truth is
   reported before B3 uses it). Controller: families and seeds.
 - **B4. The `c` floors and `c`'s sample** (product; F-9, F-12; runs before B3, R-B14). The floor cases (crops,
   binned frames and masked-overlap corners for (ii); sparse and undersampled planes, crops of set 204 OSC raw planes,
   for (i)); the point-source screen and the brightness-stratified sample, `MEASURE_VERSION` 5; the four master-level
   groups stacked at the B4 binary with B0's references pinned, against B0's runs (these are B3's before-runs,
-  R-B16). Data: on the dev Mac, the lab scorecard (a lab cycle at the B4 binary), inject OSC raw (`star-lab-mono2`,
-  `star-lab-inject`) and the three trees in `~/.athenaeum-acc`, the raw frames 0004 / 0007 / 0013 on
-  `/Volumes/bigbase2` and their masters on `/Volumes/bigbase3`; the new floor-(ii) frames (synthetic, and crops or
+  R-B16). Data: the lab scorecard (a lab cycle at the B4 binary, synthetic and inject: the runner, once `star-lab-inject` and
+  `t14b/probe` are copied there); on the dev Mac the three trees in `~/.athenaeum-acc` (the floor-(i) crops of set 204 OSC
+  calibrated planes, the floor-(ii) crops and binned copies, the four master-level runs), the Markarian raw frames
+  0004 / 0007 / 0013 on `/Volumes/bigbase2` (the × 0.40 case only) and their masters on `/Volumes/bigbase3`; the new floor-(ii) frames (synthetic, and crops or
   binned copies of real frames) are made on the dev Mac with one ERP LN run each there (new frames; the ERP is a
   column in every LN table). Bar: F-9, F-12. Owner: each floor's verdict (F-9, open since the LN model fixes cycle).
   Controller: the screen's design.
@@ -759,14 +762,14 @@ machine that holds its frames, and a before / after pair never splits across mac
   F1 changes nothing in the product.
 - **B5. LN's own estimates** (product if in scope; F-13). Module seeds for LN if B3 kept a module-fed estimator
   (retiring `k` and `unverdicted_clip_range`; a neutral swap, so the no-change guards bind it, R-B11); C-9's nebula
-  sky; R11-3. Data: the runner's nebula-sky pairs (`star-lab-l`); the module-seed rows on the dev Mac (a lab cycle,
-  the master-level groups against B3's after-runs). ERP: B1's run on the nebula-sky pairs printed, no new run (the
+  sky; R11-3. Data: the runner's nebula-sky pairs (`star-lab-l`); the module-seed rows: a lab cycle on the runner, the
+  master-level groups on the dev Mac against B3's after-runs. ERP: B1's run on the nebula-sky pairs printed, no new run (the
   frames are unchanged). Bar: F-13. Owner: R11-3's scope, if B5 names an owner.
 - **B6. Checkpoint and the "after" report.** The full uniform lab run (`lab_cycle`, inject, gates), `ln_real` on the
   three trees, `grid-report --ln-truth` on stacking runs at master level (B3's groups, reference pinned), B1's
   baseline beside every after number; the rulings and runs recorded in `docs/stacking/README.md` R-OSP-16; the full
-  `cargo test -p athenaeum-core --all-targets`. Data: dev Mac (the lab run, `ln_real`, the master-level runs, the
-  suite), the runner (the nebula-sky rows). Bar: every Plan B bar as judged plus the held bars (F-0…F-7, F-10, the
+  `cargo test -p athenaeum-core --all-targets`. Data: dev Mac (`ln_real`, the master-level runs, the gates, the
+  suite), the runner (the synthetic lab run, the nebula-sky rows). Bar: every Plan B bar as judged plus the held bars (F-0…F-7, F-10, the
   no-regression rule). Owner: the push and the close.
 
 **Plan C — the Analysis switch-over (§4).** `analyzer.rs` onto the module; `read_raw` input and OSC; the trail

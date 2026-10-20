@@ -28,8 +28,9 @@ B6 of the spec (§5, R-B14), every bar fixed in the spec before any measurement.
 - **Data and machines**: the dev Mac's `~/.athenaeum-acc` (the three acceptance trees, the lab grid, `star-lab-v2`,
   `star-lab-a`, the injected and mono2 frames, the F1 v2 port's runs), `/Volumes/bigbase2` and `/Volumes/bigbase3` (the
   raw OSC frames and the inject masters), the runner's `star-lab-l` (the nebula-sky pairs) and its lab data copy. The
-  M4 Max runner runs every lab cycle, every ERP LN run and — if it holds the trees (B0 Step 0a) — the long real-data runs;
-  the dev Mac builds the short probes and keeps the parallel geometry cycle (PB-16, PB-17). Plan B's probe runs, scorecards
+  dev Mac runs every step that reads a tree or `/Volumes/bigbase*` (the master-level runs, `ln_real`, every ERP run on a
+  real or injected frame), the builds and the parallel geometry cycle; the M4 Max runner runs the synthetic lab cycles
+  and the ERP on synthetic frames (PB-16, PB-17). Plan B's probe runs, scorecards
   and clones go under `~/.athenaeum-acc/star-lab-b/<step>/` and `~/.athenaeum-acc/planb-<ds>-<stage>/` on the machine
   that runs the step (ruling PB-16); results are committed in athenaeum-lab under `star-lab/results/plan-b/<stage>/`.
 
@@ -78,13 +79,13 @@ its line; a task may not add, invent or loosen one.
   Every task below opens with its coupling checklist.
 - Lab code is committed in athenaeum-lab (`main`) and pushed (`git push origin main`) after each task's lab step; the
   runner's lab commits may be unsigned (the owner approves per commit). athenaeum is committed on `plan-b` and NOT
-  pushed; the merge into local main and any push happen only on the owner's word (B6).
+  pushed (it reaches the runner as a git bundle through Universe, PB-17); the merge into local main and any push happen only on the owner's word (B6).
 - Commits are authored as `eg013ra1n` / `vilen.sharifov@gmail.com`, every message ending with the trailers
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and
   `Claude-Session: https://claude.ai/code/session_01NDfRyApE6tYi9ZMD7b4g8m`.
 - One heavy job at a time on the dev Mac (16 GB): a cargo build, a probe batch, a scorecard build, a stacking run, an
-  ERP instance, a generator run. The lab runners already wait on `pgrep` and `memory_pressure`; a Plan B cargo build
-  waits the same way (PB-16). Disk: `df -k /Volumes/BigMac` ≥ 100 GiB + the step's peak before every step that writes.
+  ERP instance, a generator run. ONE lock, `~/.athenaeum-acc/HEAVY.lock`, serializes Plan B and the geometry cycle (PB-16); the lab
+  runners also wait on `pgrep` and `memory_pressure`. Disk: `df -k /Volumes/BigMac` ≥ 100 GiB + the step's peak before every step that writes.
 - The results-only disk rule (memory `feedback_lab_results_only_disk_rule.md`): every job deletes its clone once its
   results are committed, except the clones a later stage's comparison still reads (PB-15 names them and when they go);
   a STOP keeps everything as evidence. Never delete `star-lab-a` (the full scorecards) or the three before trees.
@@ -115,9 +116,9 @@ its line; a task may not add, invent or loosen one.
    and re-pinned by B4 if the behaviour changes (`growth_floor_behaviour_matches_the_owner_ruling`).
 5. **A run on a catalog whose cached Measure artifacts carry `measureVersion = 4` after B4 ships `5`** (every user's
    first run after the update). Measure, Register and Normalize re-run once, the Calibrate artifacts are reused, the
-   stage-hash literal tests move by exactly the version and nothing else, and the release note names the ripple (spec
+   stage-hash pins (B0) move by exactly the version and nothing else, and the release note names the ripple (spec
    §7's first risk). Pinned in B4 (`measure_version_five_moves_the_three_fit_reading_subtrees_only`, the existing
-   `calibration_subtree` literal test unchanged).
+   `calibration_subtree` pin unchanged).
 
 ## Plan rulings (where the plan has to be more precise than the spec)
 
@@ -138,13 +139,14 @@ its line; a task may not add, invent or loosen one.
 - **PB-2 LN's kept place.** The cheapest kept place for LN's per-side `c`, F1's growth factor and `ln_growth_pairs` is the
   run summary (`stacking_runs.summary_json`, `stacking::provenance::SummaryFrame` / `SummaryGroup`, DB-visible, read by
   `tier1-extract.py` and the Results panel): `SummaryFrame` gains `ln_growth_factor: Option<f64>`, `ln_growth_pairs:
-  Option<u32>` and `ln_aperture_correction: Option<f64>` (the TARGET side's `c` as the module gave it on the registered
+  Option<usize>` (the MINIMUM over a frame's planes, so an OSC channel at floor (ii) shows) and `ln_aperture_correction: Option<f64>` (the TARGET side's `c` as the module gave it on the registered
   plane, mean across planes like `fwhm_px`; the module measures the target's `c` under both estimators — F1 uses it to
-  order the pairs — so it is `Some` whenever LN ran and `None` only for a frame LN did not normalize); `SummaryGroup`
-  gains `ln_reference_aperture_correction: Option<Vec<f64>>` (the reference's `c` per plane). All `#[serde(default,
-  skip_serializing_if = "Option::is_none")]`, camelCase in the payload, no new log field name: the values already travel
+  order the pairs — so it is `Some` for a frame LN computed in this run; `None` for a frame LN did not normalize and on an LN cache hit,
+  which carries only the scale: `set_ln_summary(…, true)`, run.rs:12937); `SummaryGroup`
+  gains `ln_reference_aperture_correction: Option<Vec<f64>>` (the reference's `c` per plane). All `#[serde(default)]` on plain `Option`s (`null` in the payload: provenance.rs uses no `skip_serializing_if`, and a
+  skipped `ts_rs` `Option` arrives `undefined`), camelCase, no new log field name: the values already travel
   on the `"ln relative scale"` debug (`ln_growth_factor`, `ln_growth_pairs`) and the `"ln scale: per-side ring"` debug
-  (`aperture_correction`); B0 threads them from `ln::scale`'s event struct through `NormalizeOutcome` to
+  (`aperture_correction`); B0 threads them from `ln::scale`'s event struct through `ln::LnFrameOutcome` (ln/mod.rs:354) to
   `run.rs::set_ln_summary`. TS: `src/types/stacking.ts` regenerated (`ts_export.rs` registry unchanged: the two structs
   are already registered). `ChannelMeasurement` is not TS-exported (verified: `ts_export.rs` names `SummaryFrame`, not
   `stacking::measure::ChannelMeasurement`), so its new fields need no TS change.
@@ -154,7 +156,8 @@ its line; a task may not add, invent or loosen one.
   / `measure_probe` outputs equal `~/.athenaeum-acc/star-lab-a/t14b/probe` and `…/t14b/inject-probe` under
   `probe_identity.py --drop-key ms` (Task 14 proved t14-final's outputs equal t14b's: `results/plan-a/final/
   identity-vs-t14b.txt`), and `lab_cycle --prev t14-final` reads noreg 0 moved, max |Δ| 0, the LN rows included
-  (`changed 0` where Plan A read `changed 3220`); (b) the stage-hash literal tests of `stacking/config.rs` unchanged;
+  (`changed 0` where Plan A read `changed 3220`); (b) the three fit-reading stage-hash pins B0 adds to `stacking/config.rs` (the default config at `MEASURE_VERSION` 4; the
+  existing test there is only relative) pass unchanged;
   (c) the gates on B0's fresh set 204 run (`STARLAB_ACC_COPY=<B0's clone> STARLAB_ACC_RUN_ID=<its run>`): 13 / 13, with
   `probe_parity` (the run's `.athf` equal the probe's on the same frames); (d) the kept values equal the debug
   `"aperture correction measured"` values plane by plane on the set 204 and Horse C11 runs (`ATH_ACC_LOG_EXTRA=
@@ -176,11 +179,11 @@ its line; a task may not add, invent or loosen one.
   truth for the subset is the 30 members' rows of `lnB/truth/s204mono-lnBref.csv` (measured on run 5's own reference).
 - **PB-6 The ERP's LN on the real sets (the owner's ERP YES).** Driver: the lab's `erp/run_job.sh` with the LN script
   `~/.athenaeum-acc/star-lab/erp/run_ln.js` (uncommitted, verified present; it reads `ln-job.json` beside it; the
-  parameters are the owner's 2026-10-04 batch) in the `real/run_hc11.sh` pattern: NaN → 0 copies per chunk of ≤ 5 targets
-  (`prep_nan0.py`), deleted after the chunk, memory guard before every launch, one instance at a time, the owner's own
+  parameters are the owner's 2026-10-04 batch) in the `real/run_hc11.sh` pattern (it, `prep_nan0.py` and `run_ln.js` are uncommitted, dev-Mac-only): NaN → 0 copies per
+  chunk of ≤ 5 targets (`prep_nan0.py`), deleted after the chunk, memory guard before every launch, one instance at a time, the owner's own
   interactive instance closed first. Inputs per dataset: the LN reference and the registered members `ln_real.py`'s
   `DATASETS` resolve (`starlab/ln_real.py::reference` / `members`; OSC per plane as the probe's VNG planes, the way
-  `erp_v2.py ln` runs `osc_pairs`), exported by `bin/erp_ln_real.py export <ds>` into `~/.athenaeum-acc/star-lab/real/
+  `star-lab/erp/erp_v2.py ln` runs `osc_pairs`), exported by `bin/erp_ln_real.py export <ds>` into `~/.athenaeum-acc/star-lab/real/
   <ds>/in/`. The `scale` parameter: the value the 30-member set 204 run used, recovered from the owner's batch record
   (`/Volumes/Universe/Development/wbpp/logs/20261004090704_ProcessContainer.xpsm`, memory
   `reference_erp_headless_on_dev_mac.md`) or, if the share is unreachable, Horse C11 G's recorded 1597 with the reason
@@ -210,15 +213,19 @@ its line; a task may not add, invent or loosen one.
   `~/.athenaeum-acc/star-lab/grid/real/m4/`; its ERP LN run once through `erp_v2.py ln` (a new grid family is new frames);
   s_true a generator input. Built ONLY if PB-8's table finds no pair family inside the real range on both quantities.
 - **PB-10 The seeing-lever injected pairs (B2; F-8 referee).** `starlab/inject.py` gains `--stamp empirical`: the
-  injected star's stamp is the frame's own empirical PSF — the normalized median stack of the frame's 50 brightest
-  isolated unsaturated stars in a window of `ceil(3.5·F) + 1` half-width (`_fwhm_pass` gives F), sub-pixel shifted to each
-  injection position by bilinear interpolation — not a Moffat. Six pairs from the set 204 mono tree (`tierA-lnB-f1` run 5):
+  injected star's stamp is the frame's own empirical PSF — the normalized median stack of 50 isolated unsaturated stars
+  sampled ACROSS brightness (never the brightest: memory `feedback_bright_stars_not_representative.md`) in a window of at
+  least `ceil(8·F)` half-width (`c`'s 5F growth radius and F1's [6F, 8F] annulus lie inside it; `_fwhm_pass` gives F), its
+  rim test rejecting a neighbour only, never a halo (the wing is what the pairs test), sub-pixel shifted to each
+  injection position by bilinear interpolation — not a Moffat. The stamp's own 5F growth / model ratio is printed beside
+  the frame's kept `c` (B0) as the realism check. Six pairs from the set 204 mono tree (`tierA-lnB-f1` run 5):
   reference = its LN reference; targets = the registered members nearest FWHM 2.64, 3.0, 3.4, 4.0, 5.0 and 5.92 px (from
   `ln-real-members.csv`), each carrying 300 injected stars at `s_inj 0.8` on the `main` luminosity function; truth = the
   injected list; the injected stars' own aperture sum over the injection printed (the check; today 0.95–1.03). Manifest
-  `manifests/inject-lever.json`; scored by `rows_ln_injected`; their one ERP LN run (new frames) on the dev Mac.
-- **PB-11 The floor cases (B4; F-9).** (i) Crops of the set 204 OSC raw planes (0004 / 0007 / 0013 on `/Volumes/bigbase2`,
-  debayered by `star_probe debayer --pattern RGGB`, then cropped: 600 × 400, 400 × 300, 300 × 200 at four corners and the
+  `manifests/inject-lever.json`; scored by `rows_ln_injected`; their one ERP LN run (new frames) on the dev Mac (the source flat and dark live on `/Volumes/bigbase3`: PB-17).
+- **PB-11 The floor cases (B4; F-9).** (i) Crops of the set 204 OSC CALIBRATED planes in `tierA-lnB-f1` (LDN1272; the raw 0004 / 0007 / 0013 on
+  `/Volumes/bigbase2` are the 2024 Markarian lights, another dataset, kept for B4's × 0.40 case only; debayered by
+  `star_probe debayer --pattern RGGB` if the tree holds them mosaiced, then cropped: 600 × 400, 400 × 300, 300 × 200 at four corners and the
   centre) and sparse lab fields (`density/d200` cropped the same): a case counts when the `"fewer than 5 isolated
   unsaturated stars"` warn fired; the probe gains `--dump-ratios` (the 1–4 growth / model ratios, a diagnostics field on
   `examples/star_probe.rs`, never the product) so arm 2 (the plane's own median over its 1–4 ratios) and arm 3 (the median
@@ -232,33 +239,31 @@ its line; a task may not add, invent or loosen one.
   (ii) cases from `pairs/main` targets cropped the same, truth s_true. The verdict needs ≥ 8 counted cases per floor over
   ≥ 2 datasets (R-B16); the per-case table prints the floored plane's weight relative to its group and its psfSel `s`
   (for (i)). Every new floor-(ii) frame that is a stored pair gets its one ERP LN run on the dev Mac (new frames).
-- **PB-12 The point-source screen (B4; F-12; the controller's design).** A `c` qualifier is refused as a point source
-  when its fitted FWHM (the geometric mean of the axes, the frame statistic's own measure) is below `0.715 · F_field`
-  — the lower-half spread bound the knot tests already use (E4n, spec F-10: no representable star reads narrower than
-  0.715 of the field width; half the real stars are broader than the mode). The refusal is counted in the existing
-  `skipped` tally (a screened candidate, the fit stays accepted) under its own counter `point_source` on the per-plane
-  debug and in `PlaneMeasurement` (the probe's `pointSourceScreened`); no `RefusalReason` (the star is a real fit, only not
-  a `c` qualifier). Cost if wrong: on a sub-floor field (F_field at the 1.5 clamp) the line is 1.07 px and refuses nothing
-  — exactly where R-OSP-15's floor flag already warns; a broad-seeing frame is untouched. Judged on the lab families'
-  truth stars (a truth star refused is the screen's defect, counted per family) and on raw 0013 p0 (the 36 hot pixels).
-- **PB-13 The brightness-stratified sample (B4; F-12).** Over the qualifiers (after every screen, isolated, with a growth
-  curve) sorted by model flux, four strata by the quartiles of log model flux among the qualifiers whose growth flux has
-  SNR ≥ 20 (SNR = growth flux / (σ_i · √(π·(5F)²)), σ_i the star's own ring noise — the ratio's noise ≤ 5 %, so a faint
-  ratio's scatter cannot dominate); 16 per stratum, the brightest of each; a stratum short of 16 gives what it has and the
-  remainder is filled from the next brighter stratum; `c` = the median over the sample; `CORRECTION_STARS` stays 64,
-  `CORRECTION_MIN_RATIOS` 5. The per-tercile growth / model ratios are printed (the spec's reported line). If the lab's
-  row-6 STOP fires (a drop beyond 2 SE of Plan A's median on a lab family), the ONE fix round allowed before the owner is
-  the top-two-quartile sample (32 + 32); a second miss goes to the owner with both tables.
+- **PB-12 The point-source screen (B4; F-12) — REPLACED after the plan review (C-1).** The first design (fitted FWHM <
+  0.715 · F_field) refuses none of raw 0013 p0's 36 hot pixels (the line is 1.090 px at the 1.524 floor; the 36 fit at
+  1.124–1.348) and refuses 6.4–17.6 % of unflagged real fits on the raw planes. New screen: on a DEBAYERED multi-plane
+  frame a `c` candidate with no fit on any sibling plane within 1.5 px is not a point source (the module's `crossFlags`
+  logic; on the existing dumps G 0 of 36 hot pixels vs 21 of 21 real stars have a counterpart, B 0 of 36 vs 20 of 21).
+  Mono planes: no screen (the cosmetic map owns hot pixels). The 6a neighbour share (`seeds.rs:674–700`) already runs and
+  passes all 36, so it is no fallback. Counted in `skipped` under its own counter `point_source` (the per-plane debug
+  line, `PlaneMeasurement`, the probe's `pointSourceScreened`; no `RefusalReason`; the dictionary gains the name, B4's
+  file list). Judged FIRST on the lab truth stars of `osc/*` and `osc_pairs/*` (a refused real star counted per family,
+  bar ≤ 1 % of qualifiers) in B4 Step 0b, before it enters code.
+- **PB-13 The brightness-stratified sample (B4; F-12) — WITHDRAWN as a fixed ruling (I-1, I-2).** The 4 × 16 SNR ≥ 20
+  sample moved nebula `c` +2.43 % / +23.16 % (neb0.5 / neb3) where no B4 bar reads, invented a second per-star SNR beside
+  F-6's `StarFit.snr` and revisited R13b-6 uncited. The sample is settled by B4 Step 0b into the controller's ruling
+  PB-13'; the per-tercile ratio report, `CORRECTION_STARS` 64 and `CORRECTION_MIN_RATIOS` 5 stand unless PB-13' says
+  otherwise. The row-6 STOP keeps ONE fix round (the runner-up sample PB-13' names); a second miss goes to the owner.
 - **PB-14 `MEASURE_VERSION` 5 lands in B4** (R-B8; one bump for Plan B), the constant's history comment extended; the
-  README's policy line (`docs/stacking/README.md` l.1871 "Plan C … is 5") becomes "Plan B 5, Plan C 6"
-  (`star_measure/mod.rs` already says Plan C = 6); the three stage-hash literal tests move; the release note names the
+  README's policy line (`docs/stacking/README.md` l.1872 "Plan C … is 5") becomes "Plan B 5, Plan C 6"
+  (`star_measure/mod.rs` already says Plan C = 6); the three stage-hash pins B0 added move to version 5; the release note names the
   once-only re-measure of every set.
 - **PB-15 Master-level comparisons and what a clone keeps.** Masters: `tier1/tier1-compare.py --numeric` (median / MAD /
   noise / FWHM rows, `--base-db`, every catalog `immutable=1`); weights: `tier1/t13-tools.py weights` (Spearman ρ and the
   rank movers); the LN scale against the validated truth: `bin/ln_truth_run.py` (new: for a clone's run it resolves the
   run's LN reference and registered members, runs `grid-report.photometry` per member and plane with the mode recorded,
   writes `<ds>-truth.csv` with the reference md5 and the file's sha256 — the truth is ALWAYS re-read on the run's own LN
-  reference, since `build_ln_reference` integrates the top-N by weight and a weight change moves its composition, R13-4)
+  reference, since `build_and_write_ln_reference` integrates the top-N by weight and a weight change moves its composition, R13-4)
   and then `ln_real.py`'s table on that truth (`--truth` override), the re-based row (R13-4) printed beside. A clone
   therefore keeps `athenaeum.db`, `logs/`, `stackout/`, `stackwork/*/{registered,ln}` until the comparison that reads it
   has committed its results, and drops `stackwork/*/{calibrated,measured,fits,rej,previews}` right after its own results
@@ -275,31 +280,35 @@ its line; a task may not add, invent or loosen one.
   per stage that changes code: B0, B4, B3 Step 2b / 4, B5) and the suites; each cargo invocation runs only when
   `pgrep -fl 'rustc|cargo'` is empty and `memory_pressure` ≥ 30 % free, waiting up to 20 min then STOP (the
   `run_probe.py` guard's rule, added to `planb.sh build` and used by `lab_cycle.py --wait-quiet`); the two cycles share
-  no target directory, so the constraint is RAM (16 GB), not locks. The built binaries travel to the runner as a bundle
-  (`/Volumes/Universe/athenaeum-runner/git` bundles + the lab head on GitLab; the runner builds its own `target` from the
+  no target directory, but RAM (16 GB) and CPU are shared, so ONE heavy-job lock covers both cycles (I-8):
+  `~/.athenaeum-acc/HEAVY.lock` (`shlock` / `flock`, holder and start time written in it), taken by every cargo build or
+  test of either cycle and every long run or ERP job; long runs are scheduled overnight in `progress.md`'s slot table.
+  The code reaches the runner as a git bundle, no push (`/Volumes/Universe/athenaeum-runner/git` bundles + the lab head on GitLab; the runner builds its own `target` from the
   same commit — the certified bit-for-bit parity of 2026-10-10 — and `--expect-sha` is checked against the runner's own
   build, never the dev Mac's). An ERP instance never runs beside a compile on the same machine.
-- **PB-17 The machine plan (the coordinator's fact of 2026-10-20: the M4 Max runner has the ERP, its agent is live, lab
-  cycles / the ERP / long real-data runs run there; the controller relays — no agent of this plan contacts the runner).**
-  The runner (memory `reference_runner_m4max.md`: 128 GB, the ERP installed, `~/.athenaeum-acc/star-lab-l` the only copy
-  of the nebula-sky pairs, a lab data copy certified bit-for-bit on t09-f4) runs: every lab cycle (`lab_cycle.py`,
-  `gates.py`, `truth_modes.py`, the generator runs — B0's identity cycle, B1's synthetic re-score, B2's both-modes read
-  and realism / lever / realistic family, B4's cycle, B3's, B5's, B6's), every ERP LN run (the real sets, the injected
-  pairs, the lever pairs, the realistic family, the floor-(ii) frames, the nebula-sky pairs), and the long real-data runs
-  (the four master-level groups of B0 → B4 → B3 → B5 and `ln_real`) IF it holds the three acceptance trees (a before /
-  after pair never splits across machines: either every master-level run of Plan B is on the runner or every one is on
-  the dev Mac — decided ONCE by B0 Step 0's answers, recorded in `progress.md`). The dev Mac runs: the builds (PB-16),
-  the suites, the short probe reads whose data exists only here (`/Volumes/bigbase2` / `bigbase3`: B4's raw OSC crops and
-  the × 0.40 case — unless the runner's answer says those frames are reachable there), and the master-level runs only in
-  the fallback. Transport: a step's inputs that live only on the dev Mac (the exported registered members for the ERP
-  real-set runs ≈ 515 planes × ≈ 104 MB ≈ 54 GB; the lever pairs' source frames; B1's `ln_real` dumps for the F1 v2 port)
-  go to the runner through `/Volumes/Universe/athenaeum-runner/acc/planb/<step>/` (`rsync --inplace`), results come back
-  as small files committed to athenaeum-lab from the runner plus a ≤ 30-line verdict on the share. Driving: the controller
-  writes a one-page handoff `/Volumes/Universe/athenaeum-runner/handoffs/planb-<step>.md` (one command, the fixed answers
-  or the judgment it asks for, the hard STOP, the result paths) and relays it to the runner's Remote Control agent
-  (ListAgents by host `SADM-OBE-47e52`, the name changes); the Windows runner has no Python (memory
-  `reference_runner_windows.md`), so no lab tool runs there and Plan B does not use it. Every runner-side fact this plan
-  cannot verify from the dev Mac is a Step 0 question (B0 Step 0), never an assumption.
+- **PB-17 The machine plan (C-2; rulings.md PB-19, settled 2026-10-20 from the runner's own answers and the owner's word).**
+  Facts: the runner (M4 Max, 128 GB, agent `bridge:session_01CCQHmF9YhQtpfqymXJQ98i`) has 205 GiB free, the ERP, no
+  acceptance tree (the three are 95 + 69 + 52 = 216 GB), `star-lab/grid/{iso,main}`, `star-lab-v2/{density_pairs,
+  truthcheck,osc_pairs,erp}`, `star-lab-inject`, `star-lab-mono2` and `star-lab-l` (the nebula-sky pairs, only there); it
+  never sees `/Volumes/bigbase2` / `bigbase3`; Universe is mounted on BOTH machines. The trees' lights link masters on
+  bigbase3 (the stacking plan gate turns a missing master into a rebuild or a `masterFiles` blocker), so no master-level
+  run can run on the runner, even with the trees copied.
+  DEV MAC: every tree- and volume-reading step — the master-level runs of B0 → B4 → B3 → B5 (a before / after pair never
+  splits), `ln_real`, B1's re-dump, B4's floor-(i) / (ii) crops and × 0.40 case, B2's lever inject, the ERP real-set,
+  injected-pair, lever and floor-(ii) runs (the ERP is installed there, as the spec says), the gates (all 13 on a
+  clone: `injection` and `gain` read the raw sources on bigbase2 / 3), the builds (PB-16) and the suites.
+  RUNNER: the synthetic lab cycles only (`lab_cycle.py` incl. `--inject`, whose probe reads only `star-lab-inject`; the
+  `truth_modes.py` read, the generator runs, the l10b cycle) and the ERP on synthetic frames (the nebula-sky pairs, the
+  realistic family), after `star-lab-inject` (5.7 GB) and `star-lab-a/t14b/{probe,inject-probe}` are copied to it over
+  Universe (B0 Step 0a).
+  Driving: the controller alone writes a one-page handoff `/Volumes/Universe/athenaeum-runner/handoffs/planb-<step>.md`
+  (one command, the fixed answers or the judgment asked, the hard STOP, the result paths) and relays it as
+  `SendMessage "bridge:session_<id>"` (the id changes: ask); results come back as small files committed to athenaeum-lab
+  plus a ≤ 30-line verdict on the share. The Windows runner has no Python (memory `reference_runner_windows.md`) and is
+  not used.
+  Wall estimate (I-8): dev Mac heavy ≈ 35–45 h (four stacking runs ≈ 6–8 h per stage × B0 / B4 / B3 / B5, `ln_real` ×3
+  ≈ 45 min each, the ERP real sets ≈ 40 min plus the injected, lever and floor-(ii) pairs, the gates, the floor cases),
+  runner ≈ 8–10 h (the cycles of B0 / B4 / B5 / B6, the both-modes read, l10b); `progress.md` carries the slot table.
 - **PB-18 Owner STOP packages.** Every owner decision (the table below) is delivered as a ≤ 40-line plain-language note
   in Russian (memory `user_russian_dialogue.md`; the tables stay English) with the numbers, the recommended answer first
   (memory `feedback_notify_on_owner_question.md`: PushNotification + AskUserQuestion), and the execution continues on
@@ -309,10 +318,10 @@ its line; a task may not add, invent or loosen one.
 
 | Item | Verified state | Used by |
 | ---- | ---- | ---- |
-| The ERP | installed on the dev Mac (its application bundle present; the lab's `erp/run_job.sh` launches it headless; `~/.athenaeum-acc/star-lab/erp/run_ln.js` + `ln-job.json` present, uncommitted — the LN script must be copied to the runner's `~/.athenaeum-acc/star-lab/erp/` with its `JOB` path rewritten, B0 Step 0 question 4) and on the runner (the coordinator's fact, 2026-10-20) | every ERP LN run (runner, PB-17); the dev Mac's copy is the fallback only |
+| The ERP | installed on the dev Mac (the lab's `erp/run_job.sh` launches it headless; `~/.athenaeum-acc/star-lab/erp/run_ln.js` + `ln-job.json` present, uncommitted) and on the runner | every ERP LN run on a real or injected frame (dev Mac); synthetic frames (nebula-sky pairs, the realistic family): runner (PB-17) |
 | `/Volumes/BigMac` | 440 GiB free; memory 75 % free | every dev-Mac step (floor 100 GiB) |
-| `/Volumes/bigbase2` | mounted, 1187 GiB free (the raw OSC frames 0004 / 0007 / 0013) | B4 (i), F-12 |
-| `/Volumes/bigbase3` | mounted, 6989 GiB free (the inject masters `manifests/inject.json` names) | B4 (i) |
+| `/Volumes/bigbase2` | mounted, 1187 GiB free (the 2024 Markarian raw OSC frames 0004 / 0007 / 0013; the runner never sees it) | B4's × 0.40 case (F-12), the gates |
+| `/Volumes/bigbase3` | mounted, 6989 GiB free (the inject masters `manifests/inject.json` names, the trees' calibration masters; the runner never sees it) | B2's lever inject, the inject-OSC reads, the master-level runs, the gates |
 | `~/.athenaeum-acc/tierA-lnB-f1` (run 5), `lnB-runB-f1` (run 6, project `_projects/ldn1272-test-project`), `hc11B-f1` (run 5) | present with `stackwork/*/{registered,ln,fits,calibrated,runs}` | B0 / B4 / B3 clones; B1 `ln_real`; B2 lever pairs |
 | `~/.athenaeum-acc/lnB/truth/{s204mono,s204osc}-lnBref.csv` | present | B1, B2 |
 | `ln-scale-audit/runB-truth.csv`, `ln-model-fixes-t16/hc11G-truth.csv`, `erp-ln-s204/`, `ln-scale-audit/tierA-warped`, `tierA-baseline`, `starA-s204` | ABSENT | B1 rebuilds the two CSVs (R-B10); PB-5 for the port's inputs |
@@ -320,33 +329,15 @@ its line; a task may not add, invent or loosen one.
 | `~/.athenaeum-acc/star-lab-a/t14b/{probe,inject-probe}` (2.9 GB), `star-lab-a/results/t14-final/scorecard.json.gz` | present; `star-lab-a/t14-final/` holds logs only | B0 identity, B1 synthetic (PB-3, PB-4) |
 | `~/.athenaeum-acc/star-lab-v2/erp/**/ln.csv` (24) | present | B1 ERP column + freshness audit |
 | `~/.athenaeum-acc/star-lab/grid/{iso,main}`, `star-lab-v2/{density_pairs,truthcheck,osc_pairs}` | present | B2 referee, B3 rows |
-| `~/.athenaeum-acc/star-lab-inject`, `star-lab-mono2` | present | B4 inject row 6, (i) cases |
+| `~/.athenaeum-acc/star-lab-inject`, `star-lab-mono2` | present | B4 inject row 6, the × 0.40 / inject-OSC reads (the runner holds copies of both) |
 | `~/.athenaeum-acc/star-lab-l` (nebula-sky pairs) | not on this Mac; the runner only | B1, B5 (runner) |
 | `star-lab/f1v2/{f1core.py,log-real-s204-bauto.txt (31 lines),log-real-hc11G-bauto.txt}` | present in the lab | B1 F1 v2 step |
 | `.superpowers/target-acc` probe binaries | present; sha256 checked against `results/plan-a/final/provenance.txt` before B1 uses them | B1 |
 | Worktree `.claude/worktrees/calib-geometry`, target `.superpowers/target-geom` | present (the parallel cycle) | PB-16 |
-| The M4 Max runner: the ERP, `~/.athenaeum-acc/star-lab-l`, a lab data copy | the coordinator's fact (live agent, the ERP there); everything else below is a B0 Step 0 question | PB-17 |
+| The M4 Max runner (its answers of 2026-10-20) | 205 GiB free; the ERP; no tree; the synthetic lab data above; `star-lab-l`; Universe mounted on both machines | PB-17 |
 
-**The runner questions (B0 Step 0; the controller asks, the answers go to `progress.md` before any runner step).**
-1. `df -k ~` on the runner: free GiB (every runner step keeps the 100 GiB floor; the four master-level runs need ≈ 110 GB
-   beside the trees; the ERP real-set inputs ≈ 54 GB transient).
-2. `ls ~/.athenaeum-acc` on the runner: which of `tierA-lnB-f1`, `lnB-runB-f1`, `hc11B-f1` (with
-   `stackwork/*/{registered,ln,calibrated}` and `athenaeum.db`), `lnB/truth`, `star-lab/grid/{iso,main}`,
-   `star-lab-v2/{density_pairs,truthcheck,osc_pairs,erp}`, `star-lab-a/t14b/{probe,inject-probe}`,
-   `star-lab-a/results/t14-final/scorecard.json.gz`, `star-lab-inject`, `star-lab-mono2`, `star-lab-l` exist there, with
-   `du -sh` per tree — the answer decides the master-level-run machine (PB-17) and what must be transported.
-3. The athenaeum checkout and `~/.athenaeum-target` state there (`git log -1`, the submodule shas, `cargo --version`),
-   and the lab checkout's head (`git log -1` of `~/Documents/Projects/athenaeum-lab`).
-4. The ERP on the runner: the application bundle's path and version (the lab's `erp/run_job.sh` hardcodes the dev Mac's
-   bundle path: a path difference becomes a `RUNNER_ERP_BIN` environment override in `run_job.sh`, B1 Step 2's lab change),
-   whether `~/.athenaeum-acc/star-lab/erp/run_ln.js` exists there (if not, the dev Mac's copy goes over the share with its
-   `JOB` path rewritten to the runner's home), and whether the owner's interactive instance is closed during runs.
-5. Reachability of `/Volumes/bigbase2` and `/Volumes/bigbase3` from the runner (B4's raw OSC frames and the inject masters):
-   not reachable → B4's raw-OSC crops, the × 0.40 case and the inject-OSC probe reads stay on the dev Mac (short probe
-   runs, no stacking).
-6. Whether the Remote Control agent can run a job of several hours unattended (the `run_in_background` + verdict-file
-   route used in Plan A) and the Universe share is mounted there (`ls /Volumes/Universe/athenaeum-runner`).
-
+**Runner facts.** The six questions were answered by the runner on 2026-10-20 (rulings.md PB-19) and are folded into
+PB-17; B0 Step 0a only verifies the mounts and copies the synthetic data the runner's cycles need.
 ## File structure
 
 athenaeum (`crates/athenaeum-core/src/` unless noted):
@@ -355,15 +346,15 @@ athenaeum (`crates/athenaeum-core/src/` unless noted):
 | ---- | ---- |
 | `stacking/measure.rs` (hand edits) | `ChannelMeasurement` + the three `c` `Option`s, copied at the channel build (B0); nothing else |
 | `stacking/run.rs` (hand edits) | the per-(group, channel) `info!` in `measure_group_finish` (B0); `set_ln_summary` carrying the LN kept values (B0) |
-| `stacking/ln/mod.rs`, `stacking/ln/scale.rs` (hand edits) | `NormalizeOutcome` / the scale event struct expose `growth_factor`, `growth_pairs`, the target's `aperture_correction` (B0); module seeds on both sides, `k` and `unverdicted_clip_range` retired (B5, if in scope) |
+| `stacking/ln/mod.rs`, `stacking/ln/scale.rs` (hand edits) | `LnFrameOutcome` / the scale event struct expose `growth_factor`, `growth_pairs`, the target's `aperture_correction` (B0); module seeds on both sides, `k` and `unverdicted_clip_range` retired (B5, if in scope) |
 | `stacking/provenance.rs` | `SummaryFrame` / `SummaryGroup` additive LN fields (B0) |
 | `star_measure/photometry.rs` | the point-source screen, the stratified sample, the tercile report (B4); `ring_sky` caller F + union mask (B3, only if F1 v2 wins) |
 | `star_measure/mod.rs` | `MEASURE_VERSION = 5` with its history line (B4); `PlaneMeasurement.point_source_screened` (B4) |
-| `stacking/config.rs` | the three stage-hash literal tests moved to version 5 (B4) |
+| `stacking/config.rs` | the three fit-reading stage-hash pins at version 4 (B0, tests only); moved to version 5 (B4) |
 | `stacking/integrate.rs` | `LocalNormalizationConfig::default` and the enums' `#[default]` (B3, only on the owner's word) |
 | `stacking/ln/selection.rs`, `stacking/ln/calibration.rs` | the one saturation definition (the module's flag); `k` gone (B5, if in scope) |
 | `examples/star_probe.rs`, `examples/ln_scale_probe.rs` | `--dump-ratios` (B4), `pointSourceScreened` in the diagnostics output (B4); unchanged otherwise |
-| `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md` | the dictionary entry for `aperture_correction_min` / `_max` and the `planes` / `count` senses on the new info (B0) |
+| `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md` | the dictionary entry for `aperture_correction_min` / `_max` and the `planes` / `count` senses on the new info (B0); `point_source` (B4) |
 | `docs/stacking/README.md` | R-OSP-16: every Plan B ruling and acceptance run (each task appends its block; B6 closes it); the version policy line (B4) |
 | `docs/superpowers/open-items.md` | the `c` entry under "Unverified by hand" (l.281) resolved by B0 / B4; the "F1 on small or edge-heavy frames" entry (l.317) closed by B4's F-9 verdict |
 | `src/types/stacking.ts` (generated) | the `SummaryFrame` / `SummaryGroup` fields (B0) |
@@ -404,7 +395,7 @@ athenaeum-lab (`star-lab/` unless noted):
   the full manifest once per task.
 - Runner steps (PB-17): the controller alone talks to the runner's agent; an implementer or lab agent of this plan never
   contacts it. A runner handoff is one page on the share (`/Volumes/Universe/athenaeum-runner/handoffs/planb-<step>.md`:
-  the lab head to pull, the athenaeum commit to build, the ONE command, the fixed answers or the judgment asked, the
+  the lab head to pull, the athenaeum git bundle and commit to build, the ONE command, the fixed answers or the judgment asked, the
   hard STOP, the result paths, the cleanup — the results-only rule applies there too), the verdict comes back as
   `…/handoffs/planb-<step>-verdict.txt` (≤ 30 lines) and as the lab commit; the controller re-gates from the committed
   files. The dev Mac's and the runner's builds of one commit are interchangeable by the certified parity (2026-10-10),
@@ -416,9 +407,9 @@ athenaeum-lab (`star-lab/` unless noted):
 | ---- | ---- | ---- |
 | B0 done | nothing (informed; R-B2 rules the placement) | the four runs' reference picks, the `c` table per group and channel (min / median / max, planes at floor (i)) |
 | B1 done | nothing (informed with the baseline) | the synthetic and real LN tables with the ERP beside every arm, the freshness audit, the `f1_gc` ↔ `.athln` parity line |
-| B2, the referee | the referee rule is the owner's: a harness-truth fix (a growth-corrected crowded mode) is REPORTED before B3 uses it; the field-realism verdict informed | the both-modes table with every cell's gap, the realism table, the lever-pairs row |
+| B2, the referee | the referee rule is the owner's: a harness-truth fix (a growth-corrected crowded mode) is REPORTED with a recommended answer, and B3's real read waits for the owner's word on it; the field-realism verdict informed | the both-modes table with every cell's gap, the realism table, the lever-pairs row |
 | B4, F-9 (i) and (ii) | each floor's verdict: keep today's behaviour, or the arm the numbers favour (the product changes only on the owner's word; R-B1) | the per-case table, the paired difference with its bootstrap SE, "indistinguishable" / "too few cases" / "not reached" as the numbers say, the floored planes' weights |
-| B4, F-12 STOP (if it fires twice) | the sample's design beyond PB-13's one fix round | both row-6 tables, the tercile ratios, the refusals per family |
+| B4, F-12 STOP (if it fires twice) | the sample's design beyond PB-13''s one fix round | both row-6 tables, the tercile ratios, the refusals per family |
 | B3 | the default LN estimator (L-24 was the owner's): F1 as is, psfSel on B4's `c`, or the F1 v2 sky if it entered | the candidates on the same rows, synthetic and real, the ERP beside, every bar per cell, the master-level rows; keeping F1 changes nothing in the product |
 | B5 | R11-3's scope, if B5 names an owner | the pulls and the proposed owner with its bar |
 | B6 | the merge into local main, the push, the close | the after report beside B1's baseline, every Plan B bar as judged, the suites' line |
@@ -443,9 +434,9 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   `Some(m.aperture_stars)` when `m.aperture_correction.is_some()` else `None` for all three), `stacking/run.rs`
   (`measure_group_finish` l.5278: the info line per channel; `set_ln_summary` l.12224: three more parameters),
   `stacking/ln/scale.rs` (the scale event struct `e` at l.834–846 already holds `growth_pairs`, `growth_factor`; expose
-  them and `tgt_outcome.aperture_correction` on the returned sample), `stacking/ln/mod.rs` (`NormalizeOutcome` gains
-  `growth_factor: Option<f64>`, `growth_pairs: Option<u32>`, `target_aperture_correction: Option<f64>`).
-- Modify: `crates/athenaeum-core/src/stacking/provenance.rs` (`SummaryFrame`: `ln_growth_factor`, `ln_growth_pairs`,
+  them and `tgt_outcome.aperture_correction` on the returned sample), `stacking/ln/mod.rs` (`LnFrameOutcome` gains
+  `growth_factor: Option<f64>`, `growth_pairs: Option<usize>`, `target_aperture_correction: Option<f64>`).
+- Modify: `crates/athenaeum-core/src/stacking/config.rs` (tests only: the I-5 pins), `crates/athenaeum-core/src/stacking/provenance.rs` (`SummaryFrame`: `ln_growth_factor`, `ln_growth_pairs`,
   `ln_aperture_correction`; `SummaryGroup`: `ln_reference_aperture_correction`), the logging spec's dictionary (one
   extension paragraph), `src/types/stacking.ts` (regenerated by the existing `ts_export` test / command), `docs/stacking/
   README.md` (the R-OSP-16 block opened), `docs/superpowers/open-items.md` l.281–290 (the `c` entry: "(a) logged / kept"
@@ -457,7 +448,7 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
 **Interfaces.**
 - Produces: `ChannelMeasurement { aperture_correction: Option<f64>, aperture_se: Option<f64>, aperture_stars:
   Option<usize>, … }` (payload keys `apertureCorrection`, `apertureSe`, `apertureStars`); `SummaryFrame { ln_growth_factor:
-  Option<f64>, ln_growth_pairs: Option<u32>, ln_aperture_correction: Option<f64>, … }`; `SummaryGroup {
+  Option<f64>, ln_growth_pairs: Option<usize>, ln_aperture_correction: Option<f64>, … }`; `SummaryGroup {
   ln_reference_aperture_correction: Option<Vec<f64>>, … }`; the info `"measure: aperture correction resolved per channel"`
   with the PB-1 fields; `planb.sh run <ds> <stage>` writing `~/.athenaeum-acc/planb-<ds>-<stage>/` and
   `results/plan-b/<stage>/<ds>/{run.txt,reference-pick.txt,c-table.txt,verdict.txt}`; `ln_truth_run.py <clone> <ds>
@@ -478,13 +469,11 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   carry no bar of their own beyond the identity and the staleness proof.
 
 **Steps.**
-- [ ] **Step 0a — the controller asks the runner (controller, relayed; ≈ 30 min; nothing of Plan B runs on the runner
-  before the answers are in `progress.md`).** The six runner questions above, verbatim, through the runner's Remote
-  Control agent; the answers decide: (A) the master-level-run machine (the runner if question 2 shows the three trees
-  complete there and question 1 leaves ≥ 100 GiB + 110 GB free; else the dev Mac for every master-level run of B0 → B4 →
-  B3 → B5, recorded once); (B) the transport list (what of question 2 is missing and which step needs it); (C) the
-  `run_job.sh` / `run_ln.js` adjustments of B1 Step 2 (question 4); (D) whether B4's raw-OSC reads stay on the dev Mac
-  (question 5). Recorded as ruling PB-19 in `progress.md` and in README R-OSP-16's B0 block.
+- [ ] **Step 0a — the runner's data and the mounts (controller, relayed; ≈ 30 min).** The six runner questions are
+  answered (PB-17). Verify `mount | grep Universe` on both machines; copy over Universe (`rsync --inplace`) to the
+  runner `star-lab-inject` (5.7 GB), `star-lab-a/t14b/{probe,inject-probe}` (2.9 GB) and
+  `star-lab-a/results/t14-final/scorecard.json.gz`; hand it the git bundle of `plan-b` and the lab head (no push). The
+  nebula-sky ERP LN runs through `erp_v2.py` (B1 Step 0). Record in `progress.md` and README R-OSP-16's B0 block.
 - [ ] **Step 0 — lab tools first (lab code; sonnet; ≈ 2.5 h; no build, no run).** `planb.sh` (`build` with the PB-16 wait;
   `clone <ds> <stage>` = `clone-before.sh <tree> ~/.athenaeum-acc/planb-<ds>-<stage>` + the stacking config check through
   `t13-tools.py before` / `make-config` with the reference mode left as stored (Auto for B0) and `ATH_ACC_RERUN_FROM=
@@ -504,18 +493,20 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   `aperture_se: Some(0.004)`, `aperture_stars: Some(64)` serializes with the three camelCase keys and round-trips; the
   string `{"starsDetected":5,"starsFitted":3}` decodes with all three `None`), `channel_without_c_serializes_as_before`
   (the three `None` → the JSON holds none of the three keys; the JSON equals the pre-B0 string of the same struct, a
-  pin). In `stacking/run.rs`'s tests (or `provenance.rs`): `summary_frame_ln_fields_default_none_and_round_trip`,
-  `ln_summary_keeps_growth_pairs_and_factor_for_a_zero_pair_member` (a `NormalizeOutcome` with `growth_pairs: Some(0)`,
+  pin). In `stacking/config.rs`'s tests: `fit_reading_stage_hashes_at_measure_version_four_are_pinned` (the three
+  fit-reading stage hashes of the default config, literals read off today's code once; a pin outside the RED step: the
+  existing test there is only relative, so B4's bump needs this one to move; I-5). In `stacking/run.rs`'s tests (or `provenance.rs`): `summary_frame_ln_fields_default_none_and_round_trip`,
+  `ln_summary_keeps_growth_pairs_and_factor_for_a_zero_pair_member` (a `LnFrameOutcome` with `growth_pairs: Some(0)`,
   `growth_factor: Some(1.0)` lands on the frame row). `group_c_summary_with_every_plane_at_floor_reports_zero_planes`
   (the summary function over members whose `c` are all `None` returns `planes 0`, `count n`, no median — a pure function
   `measure::channel_c_summary(&[Option<(f64, f64, usize)>]) -> ChannelCSummary { planes, count, median: Option<f64>,
   min: Option<f64>, max: Option<f64> }`, so it is testable without a run). Run: `cargo test -p athenaeum-core --lib --
-  stacking::measure --test-threads=4 | grep -E '^test result|FAILED|panicked'` → the new tests FAIL (fields missing).
+  stacking::measure --test-threads=4 | grep -E '^test result|FAILED|panicked'` → the new tests (the pin excepted) FAIL (fields missing).
 - [ ] **Step 2 — the code (rust-engineer sonnet; ≈ 3 h).** The fields, the copy at the channel build, `channel_c_summary`,
   the info line in `measure_group_finish` (one per channel: `plane = p`, `planes`, `count`, `aperture_correction` (the
   median, only when `Some`), `aperture_correction_min`, `aperture_correction_max`), the LN plumbing (`scale.rs` → `mod.rs`
   → `run.rs::set_ln_summary(rc, group, frame, scale, cached, growth_factor, growth_pairs, target_c)`; the reference's `c`
-  per plane from `build_ln_reference`'s prepared reference outcome onto the group row), `provenance.rs`, the TS regen,
+  per plane from `build_and_write_ln_reference`'s prepared reference outcome onto the group row), `provenance.rs`, the TS regen,
   the logging dictionary paragraph (the two new names; `planes` and `count` in their B0 senses on this one event). Hand
   edits only in the never-rustfmt files. Run the Step 1 tests → PASS; `cargo test -p athenaeum-core --lib -- stacking
   --test-threads=4` green; `cargo test -p athenaeum-core --lib -- star_measure --test-threads=4` green. Commit athenaeum
@@ -530,17 +521,16 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   `python3 bin/lab_cycle.py --step b0-ident --prev t14-final --inject --expect-sha <SP>,<LN> --bars none` and
   `probe_identity.py ~/.athenaeum-acc/star-lab-b/b0-ident/probe ~/.athenaeum-acc/star-lab-a/t14b/probe --drop-key ms`,
   the same for `inject-probe`. Fixed answers: identity `files same N diff 0 noref 0` on both; noreg vs t14-final `0 moved,
-  max |Δ| 0`, the LN rows `changed 0`; the stage-hash literal tests unchanged (the suite's Step 2 pass). Any other
+  max |Δ| 0`, the LN rows `changed 0`; the I-5 stage-hash pins unchanged (the suite's Step 2 pass). Any other
   value: STOP, no re-run, report the line.
-- [ ] **Step 5 — the four before-runs (sonnet judgment; ≈ 6–8 h machine time, one at a time: Horse C11 → run B → set
-  204; on the machine PB-19 decided — the runner when it holds the trees, the handoff relayed by the controller; the dev
-  Mac otherwise, in a quiet slot).** For each: `planb.sh clone <ds> b0`, `planb.sh run <ds> b0` (from Measure, fresh work dirs; the reference mode
+- [ ] **Step 5 — the four before-runs (sonnet judgment, ONE agent per dataset; ≈ 6–8 h machine time in all, one at a
+  time under HEAVY.lock: Horse C11 → run B → set 204; the dev Mac, PB-17, overnight slots).** For each: `planb.sh clone <ds> b0`, `planb.sh run <ds> b0` (from Measure, fresh work dirs; the reference mode
   as stored), the staleness proof (`frame plane measured` = included planes; a short count is a STOP: delete the
   clone's `stackwork/*/measured` and re-run, no ruling), `reference-pick`, `c-table`, `c_identity.py` (set 204 and Horse
   C11: `differ 0`), `planb.sh truth <ds> b0` (the truth re-read on each run's own LN reference: `results/plan-b/b0/<ds>/
   truth.csv`), then `strip-light` ONLY after the results commit (`registered`, `ln`, `stackout`, the DB and logs stay —
   PB-15). Set 204's run also arms the gates: `STARLAB_ACC_COPY=~/.athenaeum-acc/planb-s204-b0 STARLAB_ACC_RUN_ID=<run>
-  STARLAB_SCRATCH=<star-lab-b/b0-ident/gates> python3 bin/gates.py` → 13 / 13 (fixed answer; `probe_parity` included).
+  STARLAB_SCRATCH=<star-lab-b/b0-ident/gates> python3 bin/gates.py` → 13 / 13 (fixed answer; `probe_parity` included; all 13 on the dev Mac, PB-17).
   Verdict per dataset ≤ 30 lines. Commit lab: `results(plan-b/b0): the four before-runs - reference picks, the c table
   per group and channel, the truth on each run's own LN reference, gates 13 / 13, c identity 0 differ`.
 - [ ] **Step 6 — docs and the suite (sonnet docs; haiku suite with fixed answers; ≈ 1.5 h).** README R-OSP-16 opened
@@ -584,7 +574,7 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
 (the paths `ln_real.py`'s `DATASETS` name). Consumed by B2 (crowding, the truths), B3 (the before column), B6.
 
 **Bars (verbatim).**
-- l.374–384: "Every LN table, synthetic and real, prints the ERP beside EVERY arm (`psfOff`, `psfSel`, `f1_2`, `f1_3`,
+- l.374–385: "Every LN table, synthetic and real, prints the ERP beside EVERY arm (`psfOff`, `psfSel`, `f1_2`, `f1_3`,
   `f1_gc` and the F1 v2 lab port), not on `sLib` rows only as today (`starlab/scorecard.py` `rows_ln`; a lab change).
   `erp_audit.py` gains an LN freshness audit: each `ln.csv` linked by sha256 to the frames it read, as the star units are
   (the 24 synthetic `ln.csv` are unaudited today; 5 of them, `truthcheck`, `density_pairs` ×2 and `osc_pairs` ×2, predate
@@ -592,7 +582,9 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
   existing ERP LN is always printed (set 204 30-member subset −3.09 % / −1.92 %/px², Horse C11 G −2.44 % / slope −0.06;
   lab `findings.md` §4). Where none exists the ERP runs ONCE, in B1 (the owner's ERP answer, 2026-10-20): set 204 full
   mono and OSC and run B mono and OSC from their exported registered members, and the injected pairs, on the dev Mac; the
-  nebula-sky pairs on the runner."
+  nebula-sky pairs on the runner. New frames get their one run where they are made: the seeing-lever injected pairs
+  and the realistic-field family (B2), the synthetic and the cropped / binned floor-(ii) frames (B4). A cell reads "not
+  run" only until its run has happened; the re-run rule governs every later run."
 - l.386–392 (the 3 % rule) is applied to the real tables as a FLAG column (reported; the truth cells it flags are
   re-checked by B2), never to the synthetic rows.
 - §5 B1 (l.729–731): "Bar: none (a baseline); the `f1_gc` ↔ `.athln` parity printed (2026-10-07: median +0.0097 %).
@@ -617,33 +609,32 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
   Tests: `test_rows_ln_erp.py` (two arms, one ERP file → both rows carry the ERP cell; no ERP file → `—`),
   `test_erp_audit_ln.py` (a fixture manifest history: CURRENT / header-only / STALE / NEW SINCE each once); the
   `RUNNER_ERP_BIN` override in `erp/run_job.sh` and the `JOB` path of `run_ln.js` read from an environment variable
-  (PB-19 (C)). Then, on the runner if its copy of `star-lab-a/t14b/probe` exists (question 2), else on the dev Mac (a
-  python re-score, no heavy job), `planb.sh b1 synth`: `scorecard.py --probe-dir ~/.athenaeum-acc/star-lab-a/t14b/probe --erp-dir
-  ~/.athenaeum-acc/star-lab-v2/erp --rows 6 --out ~/.athenaeum-acc/star-lab-b/b1-synth/` (no probe run; PB-4), the LN
+  (the runner's nebula-sky ERP run). Then, on the dev Mac (a
+  python re-score, no heavy job), `planb.sh b1 synth`: `scorecard.py <manifest> --probe-dir ~/.athenaeum-acc/star-lab-a/t14b/probe --erp-dir
+  ~/.athenaeum-acc/star-lab-v2/erp --rows 6 --json --out <file>` (a positional manifest, `--json` required, `--out` a file:
+  `bin/scorecard.py:57–60`; no probe run; PB-4), the LN
   table per family × β × arm with the ERP beside, the audit (`erp-ln-audit.txt`: expected 19 CURRENT hash-identical, 5
   CURRENT header-only, 0 STALE; any STALE re-runs that family's ERP LN once and is recorded). Commit lab; push.
-- [ ] **Step 3 — `ln_real` on the three trees (sonnet judgment; ≈ 1 h; the 068cf2d6 probe, sha256 checked; on the
-  machine that holds the trees, PB-19 (A)).** `planb.sh
+- [ ] **Step 3 — `ln_real` on the three trees (sonnet judgment; ≈ 1 h; the 068cf2d6 probe, sha256 checked; the dev Mac,
+  PB-17).** `planb.sh
   b1 ln-real` = `ln_real.py run` (every arm; the 2026-10-07 wall 2690 s) → `verify` → `table --gates <the t14-final gates
   summary> --csv ln-real-members.csv` on the five datasets, with `annulus-crowding.csv` (per member, the f1 arm's
   `ln_annulus_crowding`) for B2 and the `f1_gc` ↔ `.athln` parity (`athln_for` on each tree's sidecars: median and max
   |Δ|). The 3 % flag column: a cell where an arm and the ERP (where present) both miss the truth > 3 % the same way.
-- [ ] **Step 4 — the F1 v2 port's real read (sonnet judgment; ≈ 1 h).** `planb.sh b1 f1v2`: the 30 + 28 members (PB-5)
+- [ ] **Step 4 — the F1 v2 port's real read (sonnet judgment; ≈ 1 h; the dev Mac, it reads the trees).** `planb.sh b1 f1v2`: the 30 + 28 members (PB-5)
   re-dumped by `ln_scale_probe --stars-dir` on the trees' own references, `f1core.py`'s V0-gc5 and L3-gc5 on those
   dumps, the gap against the truth rows per member (pooled median |gap|, median gap, slope), the 2026-10-06 numbers
   (set 204 −1.01 % vs −0.64 %; Horse C11 G +0.08 % vs −0.13 %) printed beside with the reference note; the port's
   reproduction of production (`f1_gc` on the same dumps) printed as the parity of this read.
-- [ ] **Step 5 — the ERP's LN on the real sets and the injected pairs (haiku, fixed answers per chunk; ≈ 2 h machine,
-  in chunks; on the RUNNER (PB-17), the handoff relayed by the controller; the owner's instance closed, the memory guard,
-  no compile beside it).** `erp_ln_real.py export <ds>` on the machine that holds the trees (PB-19 (A)) into
-  `/Volumes/Universe/athenaeum-runner/acc/planb/b1/<ds>/in/` when that is the dev Mac (≈ 54 GB transient, `rsync
-  --inplace`, chunk by chunk, each chunk deleted from the share after its ERP run; the frames' sha256 travel with them —
-  the freshness link), then on the runner `run <ds>` (chunks of 5 through `erp/run_job.sh`; each chunk's fixed answer: the
-  done marker, `scale` lines = the chunk's targets, exit 0; otherwise STOP that dataset, no retry with other flags) →
-  `collect <ds>` for `s204-mono`, `s204-osc`, `runB-mono`, `runB-osc`, then the three `inject.json` pairs (`erp_v2.py ln
-  manifests/inject.json` on the runner's `star-lab-inject` copy, or transported the same way). The existing real
-  ERP LN (the 30-member subset, Horse C11 G) is printed from `findings.md` §4 and `ln-math/ext-G-pass2.txt` as the spec
-  says; the new runs are appended as the ERP column of Step 3's table (`planb.sh b1 table`).
+- [ ] **Step 5 — the ERP's LN on the real sets and the injected pairs (sonnet, fixed answers per chunk; ≈ 2 h machine, in
+  chunks; the DEV MAC, where the ERP and the frames are — nothing is transported (C-2); the owner's instance closed, the
+  memory guard under HEAVY.lock, no compile beside it).** `erp_ln_real.py export <ds>` into `~/.athenaeum-acc/star-lab/
+  real/<ds>/in/` (the frames' sha256 travel with them — the freshness link), then `run <ds>` (chunks of 5 through
+  `erp/run_job.sh`; each chunk's fixed answer: the done marker, `scale` lines = the chunk's targets, exit 0; otherwise
+  STOP that dataset, no retry with other flags) → `collect <ds>` for `s204-mono`, `s204-osc`, `runB-mono`, `runB-osc`, then
+  the three `inject.json` pairs (`erp_v2.py ln manifests/inject.json`; their flat and dark are on bigbase3). The existing
+  real ERP LN (the 30-member subset, Horse C11 G) is printed from `findings.md` §4 and `ln-math/ext-G-pass2.txt` as the
+  spec says; the new runs are appended as the ERP column of Step 3's table (`planb.sh b1 table`).
 - [ ] **Step 6 — the baseline package (sonnet; ≈ 1 h).** `results/plan-b/b1/README.md` (one data line per table naming
   machine and volume), the lab commit `results(plan-b/b1): the LN re-baseline on Plan A's fits - the ERP beside every arm,
   the LN freshness audit, the real tables on the rebuilt truths, the first ERP LN runs on the real sets, the injected and
@@ -711,8 +702,8 @@ verdict beside the F1 miss), B4 (the floor truth), B6.
   pin; `truth_modes.py` over the stored `pairs` grid targets (105 + the elongated ones, one unit each) and the rendered
   `density_pairs` / `truthcheck` realizations (the gates' K); output the modes table with the bar per cell by the mode that
   read it. Tests in full. Commit lab; push.
-- [ ] **Step 2 — the both-modes read (sonnet judgment; ≈ 3–5 h machine on the RUNNER (PB-17; `pairs` grid data per
-  question 2, transported through the share if missing — ≈ 13 GB), `STARLAB_JOBS` per the gates' memory rule; the
+- [ ] **Step 2 — the both-modes read (sonnet judgment; ≈ 3–5 h machine on the RUNNER (PB-17: it holds `grid/{iso,main}`, `density_pairs`,
+  `truthcheck`), `STARLAB_JOBS` per the gates' memory rule; the
   handoff relayed by the controller).** `planb.sh b2 modes` → `modes-table.md` + the verdict: every normal cell within ±0.3 %,
   every crowded cell within ±0.8 %, or the list of misses with FWHM. Reading: a crowded miss beyond FWHM 5 → Step 2b; a
   normal miss → the systematic reported, the real members that mode judges flagged in B1's table (a `flag` column).
@@ -733,8 +724,7 @@ verdict beside the F1 miss), B4 (the floor truth), B6.
   binary (the `ln.*` jobs through `run_probe.py` on a quick manifest naming the family; a results run, not quick mode: the
   family is new, nothing to diff).
 - [ ] **Step 4 — the seeing-lever pairs (lab code sonnet ≈ 2 h; inject run ≈ 30 min; the probe LN rows ≈ 15 min; the ERP
-  once ≈ 5 min; the inject run, the rows and the ERP on the RUNNER — the six source frames and the LN reference (≈ 0.8 GB)
-  transported through the share when the set 204 tree is not there, PB-19 (B)).** PB-10: `--stamp empirical`, the six pairs, `run_probe.py manifests/inject-lever.json` (plane 0, β auto
+  once ≈ 5 min; the inject run, the rows and the ERP all on the DEV MAC: the source flat and dark are on bigbase3, PB-17).** PB-10: `--stamp empirical`, the six pairs, `run_probe.py manifests/inject-lever.json` (plane 0, β auto
   and 4), `rows_ln_injected` with the ERP beside (its one run through `erp_v2.py ln manifests/inject-lever.json`), the
   injected stars' own aperture sum printed per pair (the check). The 3 % flag applies (the stamp is an estimate).
 - [ ] **Step 5 — the referee package (sonnet; ≈ 1 h).** `referee-verdict.md`: which mode judges which real member (from
@@ -745,7 +735,8 @@ verdict beside the F1 miss), B4 (the floor truth), B6.
 
 **STOPs.** A crowded cell beyond FWHM 5 outside ±0.8 % → Step 2b (the lab), then the owner's word. A normal cell outside
 ±0.3 % → reported; the members it judges flagged (never a referee cell). A lever pair whose injected aperture sum is
-outside 0.95–1.03 → the stamp is wrong (the controller; a fix round on `inject.py`, never a bar move).
+outside 0.95–1.03 → the stamp is wrong (the controller; a fix round on `inject.py`, never a bar move; a still-missed
+spec bar after that round goes to the owner, §3 doctrine).
 
 **Acceptance.** The modes table complete; the realism verdict; six lever pairs with their rows and ERP; B3's referee
 cells named per real member; the owner informed.
@@ -758,25 +749,25 @@ cells named per real member; the owner informed.
 (not representative on undersampled R / B: 1.57 → ≈ 1.2); both `c = 1` floors have no measured case. `c` moves the
 weights, psfSel's s and the LN reference's composition, so its definition lands before B3 judges the estimator (R-B14).
 
-**Coupling checklist.** Owns `c` (its qualifiers and sample; F-5's definition of the ratio unchanged). Reads: F_field
-(Task 10b; the screen's line 0.715·F_field), the fitted FWHM per star (Task 6b / 9), B_i and σ_i (10b; the strata's SNR),
+**Coupling checklist.** Owns `c` (its qualifiers and sample; F-5's definition of the ratio unchanged). Reads: the
+sibling planes' fits (the screen; the module's `crossFlags` logic), the fitted FWHM per star (Task 6b / 9), `StarFit.snr`
+(F-6: the ONE per-star SNR) and B_i (10b),
 the `saturated` and `extended` flags (8 / 10c / 10b), the growth curve (Task 10). Re-estimates nothing. Rulings revisited:
-R-OSP-7 (floor (i): kept unless the owner rules otherwise after the verdict), the LN cycle's I-2 (floor (ii): the same),
+R13b-6 (`photometry.rs:1017–1019`: no per-stratum cap, revisited by name in Step 0b), R-OSP-7 (floor (i): kept unless the owner rules otherwise after the verdict), the LN cycle's I-2 (floor (ii): the same),
 PA-4 / R-OSP-1 (one bump per plan → 5), I.1 (inject row 6 is REPORTED, R-B17), R-B11 (`c` moves by design: ρ reported,
 the lab row 6 against generator truth is the bar). Propagation: every weight, psfSel's s, Register's and LN's ordering,
 B3's candidates (read on the final `c`), B0's before-runs → B4's after-runs → B3's before.
 
 **Files.**
 - Modify: `crates/athenaeum-core/src/star_measure/photometry.rs` (`aperture_correction` l.994–1110: the point-source
-  screen inside the candidate filter, counted in `screened` and in a new `point_source: usize` returned with the SE;
+  screen (PB-12'; sibling-plane fit lists passed in) inside the candidate filter, counted in `screened` and in a new `point_source: usize` returned with the SE;
   the stratified sample replacing the `candidates.sort_by … for … if ratios.len() == CORRECTION_STARS` loop; the
-  per-tercile growth / model medians on the debug line — reusing `aperture_correction` with a `tercile` field? No new
-  field name is allowed without a dictionary entry: the terciles go to the PROBE's diagnostics output
-  (`apertureTerciles`), not the log), `star_measure/mod.rs` (`MEASURE_VERSION = 5`, the history line; `PlaneMeasurement
+  per-tercile growth / model medians on the debug line go to the PROBE's diagnostics output
+  (`apertureTerciles`), not the log: a new log field name needs a dictionary entry), `star_measure/mod.rs` (`MEASURE_VERSION = 5`, the history line; `PlaneMeasurement
   .point_source_screened`), `stacking/measure.rs` (hand edits: the adapter copies `point_source_screened` onto the
-  reported `PlaneMeasurement` only — not persisted), `stacking/config.rs` (the literal tests), `examples/star_probe.rs`
-  (`--dump-ratios`, `pointSourceScreened`, `apertureTerciles` in the JSON lines), `docs/stacking/README.md` (R-OSP-16 B4
-  block; l.1871 policy line), `RELEASE_NOTES.md` (the re-measure note), `docs/superpowers/open-items.md` (l.281–290 (b)–(d)
+  reported `PlaneMeasurement` only — not persisted), `stacking/config.rs` (the I-5 pins to version 5), `examples/star_probe.rs`
+  (`--dump-ratios`, `pointSourceScreened`, `apertureTerciles` in the JSON lines), the logging spec's dictionary (`point_source`), `docs/stacking/README.md` (R-OSP-16 B4
+  block; l.1872 policy line), `RELEASE_NOTES.md` (the re-measure note), `docs/superpowers/open-items.md` (l.281–290 (b)–(d)
   resolved; l.317–323 closed by the (ii) verdict).
 - Lab: `bin/floor_cases.py` (PB-11; `build-i`, `build-ii`, `run`, `verdict`), `planb.sh b4 <job>` (`cases`, `cases-erp`,
   `cycle`, `inject`, `x040`, `runs`, `compare`, `table`), `bars/planb_b4.py` (the lab-cycle `--bars` module: F-5's bars,
@@ -827,30 +818,41 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   SE) bind the lab cycle; ρ is reported here (B4 moves the weights by design).
 
 **Steps.**
-- [ ] **Step 0 — the floor cases, before any code (lab code sonnet ≈ 3 h; runs sonnet ≈ 2 h at the 068cf2d6 binaries:
-  the raw-OSC (i) crops on the dev Mac (`/Volumes/bigbase2`, PB-19 (D)), the (ii) crops / binned pairs and their ERP LN
-  runs on the RUNNER, the pairs transported through the share when the trees are not there).**
+- [ ] **Step 0 — the floor cases, before any code (lab code sonnet ≈ 3 h; runs sonnet ≈ 2 h at the 068cf2d6 binaries,
+  all on the dev Mac: the (i) crops of set 204 OSC calibrated planes, the (ii) crops / binned pairs from the trees, their
+  ERP LN runs there too).**
   `floor_cases.py build-i` / `build-ii` (PB-11), `run` (the probes on every case; `--dump-ratios` is Step 2's, so arm 2
   of (i) is filled after Step 2 — the (i) cases are BUILT now, their reads completed at the B4 binary), the (ii) arms
   computed offline from the probe lines, each new stored pair's ERP LN run once (`planb.sh b4 cases-erp`). The (ii) read
   does not depend on B4's code (F1's growth is not what B4 changes) and completes here: `floor-ii.md` with the verdict
   by the rule (≥ 8 cases over ≥ 2 datasets; "not reached" with the lowest count if the product never reaches 1–4 pairs
   with ≥ 20 matches). Commit lab; push.
-- [ ] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1.5 h).** `photometry.rs`: `point_source_screen_refuses_a_
-  fit_narrower_than_0715_field_width` (a field of 40 Gaussian stars F 3.2 plus 30 single-pixel spikes fitted at F 1.5 →
-  the spikes are screened: `point_source == 30`, `c` within 1 % of the clean field's), `point_source_screen_refusing_every_
+- [ ] **Step 0b — `c`'s screen and sample, judged on existing frames BEFORE any code (research agent, opus; ≈ 3 h; no
+  product code, no new run: the dumps of `t14b/probe`, `t14b/inject-probe` and `star-lab-v2`, the raw 0004 / 0013
+  planes).** (1) PB-12's screen on the lab truth stars of `osc/*` and `osc_pairs/*` (a refused real star counted per
+  family, bar ≤ 1 % of qualifiers) and on raw 0013 p0's 36 hot pixels; where in the multi-plane pass the sibling fit
+  lists exist for `aperture_correction`. (2) The sample: today's top 64 vs brightness-stratified vs mid-band, reading
+  `StarFit.snr` (no second per-star SNR), R13b-6 revisited by name, every family printed against `c` truth INCLUDING
+  `background/neb*` (the review: a 4 × 16 sample moves neb0.5 +2.43 %, neb3 +23.16 %, sky structure between 5F and the
+  [10F, 12F] ring that σ_i does not measure); a sample that moves any family's `c` AWAY from truth by more than 2 SE vs
+  today is refused; the raw 0004 p0 brightness trend (1.57 → ≈ 1.2) explained, real vs fit bias, before a sample is
+  chosen. Output one page → the controller's rulings PB-12' / PB-13', which Steps 1–2 implement.
+- [ ] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1.5 h; written after Step 0b: the shapes below, names and
+  thresholds per PB-12' / PB-13').** `photometry.rs`: `point_source_screen_refuses_a_candidate_with_no_sibling_plane_fit`
+  (a three-plane field of 40 stars on every plane plus 30 single-pixel spikes on plane 0 only → `point_source == 30`, `c`
+  within 1 % of the clean field's), `point_source_screen_leaves_a_mono_plane_alone`, `point_source_screen_refusing_every_
   star_floors_c_and_warns` (a plane with only spikes → `c = None`, `count 0`, the warn), `stratified_sample_takes_sixteen_
   per_quartile_of_qualifiers_above_snr_20` (a field of 400 stars on a power-law luminosity function → the sample holds
   stars from every quartile, 64 in all, none twice), `stratified_sample_with_six_qualifiers_takes_all_six_once`, and a pin
   `c_on_a_bright_only_field_equals_the_top_sixty_four_median` (a field of exactly 64 equal-flux qualifiers: the stratified
-  sample is the same 64). `config.rs`: `measure_version_five_moves_the_three_fit_reading_subtrees_only` (the three literal
-  tests updated to version 5; `calibration_subtree` unchanged). Run → FAIL where expected; the literal tests FAIL until
-  the bump.
-- [ ] **Step 2 — the code (rust-engineer sonnet; ≈ 4 h).** PB-12, PB-13, PB-14, the probe's `--dump-ratios`,
+  sample is the same 64). `config.rs`: `measure_version_five_moves_the_three_fit_reading_subtrees_only` (B0's three pins
+  re-asserted at version 5, `calibration_subtree` unchanged: it FAILS until the bump because the constant is still 4, so
+  the RED step holds no pin). Run → FAIL where expected.
+- [ ] **Step 2 — the code (rust-engineer sonnet; ≈ 4 h).** PB-12', PB-13', PB-14, the probe's `--dump-ratios`,
   `pointSourceScreened`, `apertureTerciles`. Step 1 green; `cargo test -p athenaeum-core --lib -- star_measure` and `--
   stacking` green. Commit athenaeum: `feat(star-measure): Plan B B4 - the point-source screen and the brightness-stratified
   sample for c; MEASURE_VERSION 5`.
-- [ ] **Step 3 — review (opus; ≈ 1 h)** against PB-12 / PB-13 and the F-12 row; fix round by a fresh sonnet agent.
+- [ ] **Step 3 — review (opus; ≈ 1 h)** against PB-12' / PB-13' and the F-12 row; fix round by a fresh sonnet agent.
 - [ ] **Step 4 — the lab cycle at the B4 binary (sonnet judgment; ≈ 1.5 h; the dev Mac builds in its compile slot, the
   cycle runs on the RUNNER at its own build of the same commit, the handoff relayed).** `planb.sh build`, then
   `lab_cycle.py --step b4-c --prev t14-final --inject --bars bars/planb_b4.py --design results/plan-b/b4/design.json`
@@ -859,18 +861,20 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   family against Plan A's medians (the lab-cycle verdict prints each family's Δ / SE); the wing / halo families' row 6
   against generator truth (m4w5, m4w10, g-w5, halo); the refusals per clean family against truth; the planes at floor
   (i) before / after; inject mono row 6 per frame with the `c`-free ratio, `c`, Plan A's beside (reported); inject OSC
-  row 6 beside `c`-free and `c` (reported). The row-6 STOP → PB-13's one fix round (the top-two-quartile sample; Steps 2–4
-  again on a quick manifest `quick:pairs/main/m4,sharp/*,halo` first, the full manifest once at the end); a second miss →
+  row 6 beside `c`-free and `c` (reported). The row-6 STOP → PB-13's one fix round (the runner-up sample PB-13' names; Steps 2–4
+  again on a quick manifest `quick:pairs/main/m4,pairs/main/m4w5,pairs/main/m4w10,g-w5,sharp/*,halo,background/neb*` first —
+  the families B4's `c` bars read, row 6 on a pair family being the LN scale, plus neb* for the printed `c` — the full
+  manifest once at the end); a second miss →
   the owner (PB-18).
 - [ ] **Step 5 — the × 0.40 R case and floor (i) (sonnet judgment; ≈ 1 h; the dev Mac — `/Volumes/bigbase2` /
-  `bigbase3` — unless PB-19 (D) says the runner reaches them; short probe runs, no stacking).** `planb.sh b4 x040`: `star_probe` on raw 0004
+  `bigbase3` are never reachable from the runner; short probe runs, no stacking).** `planb.sh b4 x040`: `star_probe` on raw 0004
   / 0007 / 0013 (debayered) at the B4 binary; the per-star dumps joined across frames: the 36 hot-pixel stars of 0013 p0
   screened (`pointSourceScreened ≥ 36` and none of the 36 among the qualifiers), the same real stars' 0004 → 0013 ratio
   on p0 within 3 % of the mean of p1's and p2's. `floor_cases.py run --arm2` on the (i) cases (now with `--dump-ratios`),
   arm 3 from B0's payloads, `verdict` → `floor-i.md` (the paired difference, the bootstrap SE, the weights and psfSel s per
   case). The sharp-R ratio (mosaic 0176 → 0206 p0) at the group β from B0's kept `c` (reported).
-- [ ] **Step 6 — the four after-runs (sonnet judgment; ≈ 6–8 h machine, one at a time: Horse C11 → run B → set 204; on
-  the machine PB-19 (A) decided, the same as B0's — never split).**
+- [ ] **Step 6 — the four after-runs (sonnet judgment; ≈ 6–8 h machine, one at a time: Horse C11 → run B → set 204; the
+  dev Mac, as B0's — never split).**
   `planb.sh clone <ds> b4` (from the TREES, not B0's clones: a clone of the before tree keeps its Calibrate artifacts;
   `make-config --ref-out` with the reference pinned to B0's pick, `ReferenceMode::Manual`, `twoPass false`; `ATH_ACC_
   EXPECT_REFERENCE` = B0's pick), `run`, the staleness proof (version 5: every plane measured, registered and normalized
@@ -878,9 +882,8 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   `truth` (`ln_truth_run.py` on the after-run's own LN reference), `compare` (`tier1-compare.py --numeric` vs B0's clone's
   DB: the master rows reported; `t13-tools.py weights` vs B0's run: ρ per group reported with each larger mover's cause —
   `c` before / after on that plane from the payloads; the LN scale against the after-run's truth per member, B0's beside,
-  the re-based row printed). Results committed per dataset before the clone is stripped light (B0's clones stripped
-  light after B4's comparison commits; they stay as B3's reference? No — B3's before IS B4's after-run, so B0's clones
-  are deleted entirely once B4's `compare` is committed, except their `results/plan-b/b0/<ds>/truth.csv`).
+  the re-based row printed). Results committed per dataset before the clone is stripped light (B3's before IS B4's
+  after-run, so B0's clones are deleted entirely once B4's `compare` is committed, except their `results/plan-b/b0/<ds>/truth.csv`).
 - [ ] **Step 7 — the verdict package and docs (opus for the verdict tables; sonnet docs; haiku suite; ≈ 2.5 h).**
   `results/plan-b/b4/verdict.md`: both floor verdicts by the rule, the × 0.40 case, the lab bars, the row-6 reports, the
   master rows and ρ per group. README R-OSP-16 B4 block (the screen's design, the sample, the version bump and its ripple,
@@ -890,12 +893,11 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   only on the owner's word (a follow-up commit with its pin `growth_floor_behaviour_matches_the_owner_ruling` /
   `fit_call_floor_behaviour_matches_the_owner_ruling`).
 
-**STOPs.** The row-6 2-SE drop (Step 4) → PB-13's one fix round, then the owner. A truth star refused by the screen on
-a clean family → the controller (the screen's line is wrong on that family; report, a fix round only if a real star
-reads under 0.715·F_field — then the line is a ruling for the owner, never silently moved). The × 0.40 case missing its
-3 % → the controller (the screen does not catch the hot pixels: the fix round adds the raw-pixel neighbour share, 6a's
-rule, as a second clause — one round). A staleness count short → delete the clone's Measure / Register / LN work, re-run.
-
+**STOPs.** The row-6 2-SE drop (Step 4) → PB-13's one fix round, then the owner. A truth star refused by the screen on a
+clean family → the controller (a fix round on the sibling-plane tolerance only if a real star is refused; the tolerance
+is a ruling for the owner, never silently moved). The × 0.40 case missing its 3 % → the controller (one fix round from
+Step 0b's numbers). After any such round a still-missed spec bar goes to the owner with its numbers (§3 doctrine). A
+staleness count short → delete the clone's Measure / Register / LN work, re-run.
 **Acceptance.** Step 1 tests green; the lab cycle's bars PASS (or the STOP resolved); the × 0.40 case; both floor
 verdicts delivered; four after-runs with their comparisons committed; the suite green; the owner's two verdicts asked.
 
@@ -953,8 +955,8 @@ rule), B6.
   gap before and after, the 3 % rule per cell, the re-based LN row (R13-4 …) printed beside, not a bar."
 
 **Steps.**
-- [ ] **Step 1 — the after column (sonnet; ≈ 1.5 h; no new build: B4's binary; the re-score on the RUNNER (B4's cycle
-  outputs are there), `ln_real` on the machine that holds the trees, PB-19 (A)).** `planb.sh b3 cycle` = B4's `b4-c` cycle
+- [ ] **Step 1 — the after column (sonnet; ≈ 1.5 h; no new build: B4's binary; the re-score where B4's cycle
+  outputs are (the runner's, copied back small), `ln_real` on the dev Mac).** `planb.sh b3 cycle` = B4's `b4-c` cycle
   outputs re-scored for the LN rows with the ERP beside (no probe run; the B4 cycle already produced every LN line at the
   B4 binary), plus `ln_real.py run / table` at the B4 binary on the three trees (≈ 45 min) against B2's referee cells (the
   mode per member, its flag; a flagged cell printed but not counted), B1's beside; `b3_table.py` → `synthetic-table.md`,
@@ -979,10 +981,9 @@ rule), B6.
   updated by name).** `integrate.rs` defaults; the stored-document rule unchanged (a document without the keys decodes as
   today — the existing test re-pinned with the new default named). Commit `feat(ln): Plan B B3 - the default LN estimator
   is <X> (owner, <date>)`.
-- [ ] **Step 5 — master level (only after Step 4; sonnet judgment; ≈ 6–8 h machine, one at a time; on the machine
-  PB-19 (A) decided, the same as B0's and B4's).** `planb.sh clone
-  <ds> b3` (from the trees; the reference pinned to B0's pick; `ATH_ACC_RERUN_FROM=normalize` — Measure and Register are
-  B4's and unchanged: the clone carries B4's artifacts? No: a clone of the TREE carries the LN cycle's artifacts, so the
+- [ ] **Step 5 — master level (only after Step 4; sonnet judgment; ≈ 6–8 h machine, one at a time; the dev Mac,
+  as B0's and B4's).** `planb.sh clone
+  <ds> b3` (from the trees; the reference pinned to B0's pick; `ATH_ACC_RERUN_FROM=measure` — a clone of the TREE carries the LN cycle's artifacts, not B4's, so the
   run is from Measure again at the B4 binary + the new default — the Measure outputs equal B4's by construction (same
   binary for Measure), proven by the `metrics` payload equality per frame against B4's clone (`planb-tools.py
   measure-equal`), then Normalize differs by design), `run`, `truth` (on the after-run's own LN reference), `compare`
@@ -1048,8 +1049,8 @@ algorithm question to the owner), judged on P.1 / P.2.
   by the flag, not by L-14's 0.75 rule, which is gone), then the code; the LN library tests updated by name (the run tests
   pin `psfSignal` on the 192 × 144 field — unchanged); `cargo test -p athenaeum-core --lib -- stacking::ln` green. Commit.
 - [ ] **Step 2 — the swap's guards (sonnet judgment; ≈ 1.5 h lab on the RUNNER + ≈ 6 h machine for the three runs on
-  the PB-19 (A) machine).** `lab_cycle.py
-  --step b5-seeds --prev b3-est` (or `b4-c` if B3 changed no default): every synthetic LN cell within 2 SE of B3's;
+  the dev Mac).** `lab_cycle.py
+  --step b5-seeds --prev b3-est` (`b3-est` exists only if B3 Step 2b ran; else `b4-c`): every synthetic LN cell within 2 SE of B3's;
   `planb.sh clone / run / truth / compare <ds> b5` vs B3's after-runs (master rows, the re-based row ±0.5 %, ρ ≥ 0.9);
   results committed; B3's clones stripped light after the commit.
 - [ ] **Step 3 — C-9, the nebula sky (opus research ≈ 2 h on the l10b tables; sonnet code ≈ 3 h; the runner cycle ≈ 1 h).**
@@ -1090,10 +1091,10 @@ owners), `docs/stacking/README.md` (R-OSP-16 closed: every ruling, every accepta
 rule). Owner: the push and the close."
 
 **Steps.**
-- [ ] **Step 1 — the full uniform lab run (haiku, fixed answers; ≈ 2.5 h; on the RUNNER at its build of the final
+- [ ] **Step 1 — the full uniform lab run (sonnet, bars and a design list; ≈ 2.5 h; on the RUNNER at its build of the final
   commit; the dev Mac builds in its compile slot if the binary is not the last one built).** `lab_cycle.py --step b6-final --prev t14-final --inject --bars bars/planb_b6.py` (every Plan B bar
   as judged + the held F-0…F-7, F-10 bars from Plan A's `bars.py`, cumulative), the gates on B3's (or B4's) set 204 clone
-  run (13 / 13), `probe_identity` against the last stage's probe outputs (same), the runner's l10b cycle at the final
+  run (13 / 13, on the dev Mac: `injection` and `gain` read bigbase2 / 3), `probe_identity` against the last stage's probe outputs (same), the runner's l10b cycle at the final
   binary (the nebula rows; B1's ERP column). Any gate off its fixed value → STOP, the owner task named.
 - [ ] **Step 2 — the real reads (sonnet judgment; ≈ 2 h).** `ln_real.py run / table` at the final binary on the three
   trees against B2's referee cells (B1's beside); `grid-report.py <clone> <project> --ln-truth` on run B's final clone
