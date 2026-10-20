@@ -444,9 +444,8 @@ controller accepted from the first amendment; the plan does not re-open it.
   median gap and slope against the validated truth per dataset (set 204 mono and OSC, run B mono and OSC, Horse C11 G),
   the ERP beside (B1's runs).
 - The synthetic bars a new default meets, per cell against s_true at every target (R-B16): F-5's psfSel bar on the 19
-  `pairs` (within ±1.2 % on the Moffat and Gaussian pairs, ±2 % on the blur pairs); `truthcheck` within ±0.3 % and
-  `density_pairs` within ±0.8 % (the referee's own normal and crowded bars, on the families that validate those
-  modes); `osc_pairs` within ±2 % per plane; the injected pairs within ±2 % (s / s_inj); the realistic family, if
+  `pairs` (within ±1.2 % on the Moffat and Gaussian pairs, ±2 % on the blur pairs); `truthcheck` and `density_pairs`
+  per cell within the referee's own bar for the mode that reads that cell (±0.3 % normal, ±0.8 % crowded; R-B17); `osc_pairs` within ±2 % per plane; the injected pairs within ±2 % (s / s_inj); the realistic family, if
   built, within ±2 % (its s_true is a generator input). Keeping F1 as is misses the `pairs` bar (+11.97 % at
   `pairs/main/m4w10` t60); that is the owner's choice, the miss recorded beside B2's field-realism verdict.
 - The F1 v2 sky is a candidate only if (1) the lab port's pooled median abs(gap) against the validated truth over the
@@ -491,10 +490,12 @@ controller accepted from the first amendment; the plan does not re-open it.
   p0 lies within 3 % of the mean of p1's and p2's (today 0.617 against 1.007 / 0.970; 3 % is the agreement the same
   real stars reach on G / B after `c`, the after note §4.1).
 - Inject row 6 (`manifests/inject.json`, the frame's own `c`): `c` moves by design, so I.1's stability row (Δ
-  against Plan A's value per frame ≤ 2 % + 2 SE_c) is not the bar here (R-B11); row 6 is judged against the injected
-  flux, its truth: on the clean mono frames the pooled median abs(row 6 − 1) not worse than Plan A's, every frame
-  printed with its `c`-free ratio (model flux / injected flux, which B4 does not move) and its `c`, Plan A's row 6
-  beside; on the undersampled OSC planes, where an injected wingless Moffat-4 star reads × `c` (1.81–2.34 today, I.1's
+  against Plan A's value per frame ≤ 2 % + 2 SE_c) is not the bar here (R-B11); row 6 is REPORTED, not a bar (R-B17): the
+  injected star is a wingless Moffat 4 while `c` is measured on real stars with halos (I.1), so a lower `c` would read
+  nearer 1 without being nearer the truth. On the clean mono frames every frame is printed with its row 6, its
+  `c`-free ratio (model flux / injected flux, which B4 does not move), its `c` and Plan A's row 6 beside; B4's `c`
+  bars are the lab row 6 on the families whose generator flux includes a wing or halo (`m4w5`, `m4w10`, `g-w5`,
+  `halo`), against that truth, and the R-B13 STOP; on the undersampled OSC planes, where an injected wingless Moffat-4 star reads × `c` (1.81–2.34 today, I.1's
   recorded limit extended to OSC), row 6 is printed beside its `c`-free ratio and `c` (a lab change) and reported.
 - Master level: the four master-level groups (set 204 mono and OSC, run B, Horse C11) stacked at the B4 binary with
   B0's reference picks pinned, against B0's runs; these after-runs are B3's before-runs (R-B16). `c` moves the
