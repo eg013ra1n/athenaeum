@@ -43,6 +43,10 @@ pub struct CandidateMatchDetails {
     pub focallen: ParameterMatch,
     pub filter: ParameterMatch,
     pub ccd_temp: ParameterMatch,
+    /// Frame size and sub-frame origin (`calibration::geometry`). Always
+    /// `MatchMode::Exact`: the owner's rule (2026-10-20), not a config
+    /// parameter — no setting relaxes it.
+    pub geometry: ParameterMatch,
     pub date_diff_days: i64,
     pub temp_diff: Option<f64>,
     pub exptime_diff: Option<f64>,

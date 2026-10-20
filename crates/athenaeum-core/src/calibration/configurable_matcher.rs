@@ -6,6 +6,7 @@ use crate::calibration::config::{
     CalibrationMatchingConfig, CalibrationTypeConfig, MasterPreference, MatchMode, ParameterConfig,
     ScoringConfig,
 };
+use crate::calibration::geometry::{self, Fit, Geometry, Refusal};
 use crate::calibration::finder::{
     CalibrationCandidate, CandidateMatchDetails, CandidateMode, ParameterMatch,
 };
@@ -419,13 +420,34 @@ pub fn find_calibration_candidates(
     // its place. This is the ONE place both auto-link (OnlyCompatible) and
     // the manual modal (IncludeIncompatible) enumerate candidate sets, so
     // gating it here covers both call sites in api/calibration.rs.
+    // Geometry (owner ruling 2026-10-20): a set's size is its members' agreed
+    // NAXIS1 x NAXIS2, aggregated in this same statement so the loop issues
+    // no per-set size query. The origin is read lazily below, only where it
+    // can decide something (plan ruling R10).
     let query = format!(
-        "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
-         FROM calibration_set
-         WHERE imagetyp IN ('{}', '{}')
-           AND superseded_by_set_id IS NULL
-         ORDER BY date_start DESC",
+        "WITH cand AS (
+             SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+             FROM calibration_set
+             WHERE imagetyp IN ('{}', '{}')
+               AND superseded_by_set_id IS NULL
+         ),
+         geom AS (
+             SELECT csf.set_id,
+                    MIN(f.naxis1) AS w_min, MAX(f.naxis1) AS w_max,
+                    MIN(f.naxis2) AS h_min, MAX(f.naxis2) AS h_max
+             FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             WHERE csf.set_id IN (SELECT id FROM cand)
+             GROUP BY csf.set_id
+         )
+         SELECT cand.id, cand.gain, cand.offset, cand.binning, cand.instrume, cand.exptime,
+                cand.focallen, cand.filter, cand.ccd_temp, cand.temp_min, cand.temp_max,
+                cand.date_start, cand.date_end, cand.telescop, cand.is_master_library,
+                geom.w_min, geom.w_max, geom.h_min, geom.h_max
+         FROM cand
+         LEFT JOIN geom ON geom.set_id = cand.id
+         ORDER BY cand.date_start DESC",
         imagetyp_str, master_imagetyp_str
     );
 
@@ -450,8 +472,17 @@ pub fn find_calibration_candidates(
             row.get::<_, String>(12)?,          // date_end
             row.get::<_, Option<String>>(13)?,  // telescop
             row.get::<_, i32>(14).unwrap_or(0), // is_master_library
+            row.get::<_, Option<i32>>(15)?,     // w_min
+            row.get::<_, Option<i32>>(16)?,     // w_max
+            row.get::<_, Option<i32>>(17)?,     // h_min
+            row.get::<_, Option<i32>>(18)?,     // h_max
         ))
     })?;
+
+    let source_size = geometry::size_of(frame);
+    // Read at most once per call, and only when a candidate needs it.
+    let mut frame_origin: Option<Option<(i32, i32)>> = None;
+    let mut geometry_unknown = 0usize;
 
     for row_result in rows {
         let (
@@ -470,6 +501,10 @@ pub fn find_calibration_candidates(
             date_end,
             telescop,
             is_master_library,
+            w_min,
+            w_max,
+            h_min,
+            h_max,
         ) = row_result?;
 
         let set_temp = match (temp_min, temp_max) {
@@ -518,8 +553,59 @@ pub fn find_calibration_candidates(
         // not an invisibility cloak: auto-link must not offer it, but the manual
         // modal's "Show All" must still list it so the user can pick it by hand.
         // The `OnlyCompatible` gate below is the one and only place it drops out.
-        let passed_hard_filter = match_result.matches && !match_result.skip_matching;
+        let passed_parameters = match_result.matches && !match_result.skip_matching;
+        if mode == CandidateMode::OnlyCompatible && !passed_parameters {
+            continue;
+        }
 
+        // Geometry: a hard requirement for every pair, never a MatchMode
+        // (owner ruling 2026-10-20). After the parameters, so auto-link reads
+        // no origin for a set it drops anyway. The set's origin is read when it
+        // can decide the fit (sizes agree), or - in the manual list - for a
+        // candidate that passes the parameters, so its verdict can show it; a
+        // parameter-refused set is shown only with Show all and its card's
+        // facts line carries the origin from the set detail (R10, review M-3).
+        let (set_size, set_mixed) = geometry::size_from_aggregate(w_min, w_max, h_min, h_max);
+        let sizes_agree = set_size.is_some() && set_size == source_size;
+        let set_origin = if !set_mixed
+            && set_size.is_some()
+            && (sizes_agree || (mode == CandidateMode::IncludeIncompatible && passed_parameters))
+        {
+            geometry::set_origin(conn, set_id)?
+        } else {
+            None
+        };
+        let source_origin = if sizes_agree && set_origin.is_some() {
+            match frame_origin {
+                Some(origin) => origin,
+                None => {
+                    let origin = geometry::origin_for_file(conn, frame.file_id)?;
+                    frame_origin = Some(origin);
+                    origin
+                }
+            }
+        } else {
+            None
+        };
+        let source_geometry = Geometry {
+            size: source_size,
+            origin: source_origin,
+            mixed: false,
+        };
+        let set_geometry = Geometry {
+            size: set_size,
+            origin: set_origin,
+            mixed: set_mixed,
+        };
+        let geometry_fit = geometry::fit(&source_geometry, &set_geometry);
+        if geometry_fit == Fit::Unknown {
+            geometry_unknown += 1;
+        }
+        details.geometry = geometry_detail(&source_geometry, &set_geometry, geometry_fit);
+        // Every geometry refusal fails the hard filter - an origin one too:
+        // auto-link never takes it (G-7). The manual card reads the verdict
+        // instead, where an origin refusal is only a warning.
+        let passed_hard_filter = passed_parameters && !geometry_fit.refused();
         if mode == CandidateMode::OnlyCompatible && !passed_hard_filter {
             continue;
         }
@@ -555,6 +641,15 @@ pub fn find_calibration_candidates(
         } else {
             incompatible.push(candidate);
         }
+    }
+
+    if geometry_unknown > 0 {
+        // Ruling R1: an unrecorded size blocks nothing, but never silently.
+        tracing::warn!(
+            frame_id = frame.id.unwrap_or(-1),
+            count = geometry_unknown,
+            "calibration geometry not recorded on one side; size not compared"
+        );
     }
 
     // Score-sort each group, descending. Every candidate in `compatible`
@@ -607,15 +702,19 @@ const W_SLIGHT: u32 = 1;
 
 /// What a broken rule costs, per calibration type.
 ///
-/// Darks and bias are about the SIGNAL: sensor, then geometry, then the pair
+/// Darks and bias are about the SIGNAL: sensor, then geometry (binning and frame size), then the pair
 /// that sets the level (gain + offset), then exposure — dark current is
 /// linear in time and nothing here scales a dark, so a wrong exposure is
 /// unusable rather than merely worse — then temperature, which errs in
 /// percents. Bias has no exposure to speak of, so it costs nothing there.
 ///
+/// The frame-size weight only ORDERS candidates the manual list shows as refused:
+/// geometry never scores a compatible one, and an origin-only refusal (a warning
+/// verdict, `matched = true`) costs nothing here, so it ranks first among the refused.
+///
 /// Flats are about the OPTICAL PATH: sensor, then the filter (a flat through
 /// Ha is not a flat through L — different vignetting, different dust), then
-/// geometry, then the telescope and focal length that shape the vignetting.
+/// geometry (binning and frame size), then the telescope and focal length that shape the vignetting.
 /// Gain and offset barely matter to a flat, which is normalized by its own
 /// level before it divides anything.
 fn rule_weight(calibration_type: &str, param: &str) -> u32 {
@@ -623,14 +722,14 @@ fn rule_weight(calibration_type: &str, param: &str) -> u32 {
         "flat" | "darkflat" => match param {
             "instrume" => W_DECISIVE,
             "filter" => W_MAJOR,
-            "binning" => W_SERIOUS,
+            "binning" | "geometry" => W_SERIOUS,
             "telescop" | "focallen" => W_NOTABLE,
             "gain" | "offset" => W_MINOR,
             _ => W_SLIGHT,
         },
         "bias" => match param {
             "instrume" => W_DECISIVE,
-            "binning" => W_MAJOR,
+            "binning" | "geometry" => W_MAJOR,
             "gain" | "offset" => W_SERIOUS,
             "exptime" => 0, // a bias has no exposure to match
             "ccd_temp" => W_MINOR,
@@ -639,7 +738,7 @@ fn rule_weight(calibration_type: &str, param: &str) -> u32 {
         // "dark" and anything else the config can name
         _ => match param {
             "instrume" => W_DECISIVE,
-            "binning" => W_MAJOR,
+            "binning" | "geometry" => W_MAJOR,
             "gain" | "offset" => W_SERIOUS,
             "exptime" => W_NOTABLE,
             "ccd_temp" => W_MINOR,
@@ -663,6 +762,7 @@ fn near_miss_penalty(c: &CalibrationCandidate, calibration_type: &str) -> u32 {
     [
         ("instrume", &d.instrume),
         ("binning", &d.binning),
+        ("geometry", &d.geometry),
         ("gain", &d.gain),
         ("offset", &d.offset),
         ("telescop", &d.telescop),
@@ -682,6 +782,24 @@ fn near_miss_penalty(c: &CalibrationCandidate, calibration_type: &str) -> u32 {
         }
     })
     .sum()
+}
+
+/// The geometry verdict as the manual cards render it (`name = "geometry"`).
+/// A size or mixed refusal is a MISMATCH - the card locks (O1). An origin
+/// refusal is a WARNING - the owner's "auto no, manual yes" (G-7): the card
+/// stays selectable with a badge, while `passed_hard_filter` (set by the
+/// caller) still keeps auto-link away from it.
+fn geometry_detail(source: &Geometry, set: &Geometry, fit: Fit) -> ParameterMatch {
+    let origin_only = fit == Fit::Refused(Refusal::Origin);
+    ParameterMatch {
+        matched: !fit.refused() || origin_only,
+        warning: origin_only,
+        mode: MatchMode::Exact,
+        frame_value: source.size.map(|_| source.label()),
+        set_value: (set.size.is_some() || set.mixed).then(|| set.label()),
+        unknown: fit == Fit::Unknown,
+        ..Default::default()
+    }
 }
 
 /// Calculate date difference in days
@@ -2045,5 +2163,189 @@ mod tests {
             vec![MASTER_SET_ID, RAW_SET_ID],
             "default preference must order the master first without dropping the raw set"
         );
+    }
+
+    // ── Geometry (owner ruling 2026-10-20) ──────────────────────────────
+    use crate::calibration::geometry::test_support::{add_members, seed_file, seed_frame};
+
+    const FULL: (i32, i32) = (9576, 6388);
+    const ROI: (i32, i32) = (6384, 4258);
+
+    /// A set that ties with every other one this helper makes on every
+    /// matcher parameter (ASI6200MM, 1x1, gain 100, offset 50, 120 s, −10 °C)
+    /// and has one member of `size` / `origin`.
+    #[allow(clippy::too_many_arguments)]
+    fn tied_set(
+        conn: &Connection,
+        id: i64,
+        imagetyp: &str,
+        filter: Option<&str>,
+        date_start: &str,
+        size: Option<(i32, i32)>,
+        origin: Option<(i32, i32)>,
+        is_master: i32,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset, binning,
+              instrume, filter, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (?1, ?2, 120.0, -10.0, -10.0, -10.0, 100.0, 50.0, '1x1',
+                     'ASI6200MM', ?3, ?4, ?4, ?4, 1, ?5)",
+            params![id, imagetyp, filter, date_start, is_master],
+        )
+        .unwrap();
+        let member = seed_frame(conn, &format!("member-{id}"), imagetyp, size, origin);
+        add_members(conn, id, &[member]);
+        id
+    }
+
+    /// The source those sets are judged against, on a file whose stored
+    /// header records `origin`.
+    fn tied_frame(
+        conn: &Connection,
+        tag: &str,
+        imagetyp: ImageType,
+        filter: Option<&str>,
+        size: Option<(i32, i32)>,
+        origin: Option<(i32, i32)>,
+    ) -> Frame {
+        Frame {
+            file_id: seed_file(conn, tag, origin),
+            instrume: Some("ASI6200MM".to_string()),
+            binning: Some("1x1".to_string()),
+            gain: Some(100.0),
+            offset: Some(50.0),
+            exptime: Some(120.0),
+            ccd_temp: Some(-10.0),
+            filter: filter.map(String::from),
+            imagetyp: Some(imagetyp),
+            focallen: None,
+            telescop: None,
+            naxis1: size.map(|s| s.0),
+            naxis2: size.map(|s| s.1),
+            date_obs: Some(
+                chrono::DateTime::parse_from_rfc3339("2023-08-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            ..light_frame_for_dark()
+        }
+    }
+
+    fn ids(c: &[CalibrationCandidate]) -> Vec<i64> {
+        let mut v: Vec<i64> = c.iter().map(|c| c.set_id).collect();
+        v.sort();
+        v
+    }
+
+    /// The bug of 2026-10-01 (frame set 182 "Horsehead C11"): dark libraries
+    /// that tie on every parameter and differ only in size; the ROI one is a
+    /// day newer, so it out-scored the full frame and auto-link took it.
+    #[test]
+    fn geometry_dark_sets_tied_on_every_parameter_but_size() {
+        let conn = engine_test_db();
+        let full = tied_set(&conn, 1, "Dark", None, "2023-07-27T19:55:06+00:00", Some(FULL), Some((0, 0)), 0);
+        let roi = tied_set(&conn, 2, "Dark", None, "2023-07-28T17:24:40+00:00", Some(ROI), Some((1584, 1064)), 0);
+        let light = tied_frame(&conn, "light", ImageType::Light, None, Some(FULL), Some((0, 0)));
+        let config = CalibrationMatchingConfig::default();
+
+        let all = find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::IncludeIncompatible).unwrap();
+        let by_id = |id: i64| all.iter().find(|c| c.set_id == id).unwrap();
+        assert!(by_id(roi).match_score > by_id(full).match_score, "precondition: the ROI set is the closer one");
+
+        let auto = find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
+        assert_eq!(ids(&auto), vec![full], "auto-link must never take a set of another size");
+
+        let refused = by_id(roi);
+        assert!(!refused.passed_hard_filter);
+        let d = &refused.details;
+        assert!(!d.geometry.matched && !d.geometry.unknown);
+        assert_eq!(d.geometry.frame_value.as_deref(), Some("9576×6388"));
+        assert_eq!(d.geometry.set_value.as_deref(), Some("6384×4258 @ 1584,1064"));
+        assert!(d.instrume.matched && d.binning.matched && d.gain.matched && d.offset.matched && d.exptime.matched,
+            "geometry is the only reason");
+        let verdicts = crate::calibration::manual::verdicts_from_candidate(d);
+        let v = verdicts.iter().find(|v| v.name == "geometry").expect("a geometry verdict");
+        assert_eq!(v.status, crate::models::ParameterStatus::Mismatch);
+        assert!(v.enforced);
+    }
+
+    /// O1: every source → calibration pair the matcher knows.
+    #[test]
+    fn geometry_is_required_for_every_source_calibration_pair() {
+        let pairs: [(&str, &str, &str, ImageType, Option<&str>); 7] = [
+            ("lights", "flat", "Flat", ImageType::Light, Some("L")),
+            ("lights", "dark", "Dark", ImageType::Light, None),
+            ("lights", "bias", "Bias", ImageType::Light, None),
+            ("flats", "darkflat", "DarkFlat", ImageType::Flat, None),
+            ("flats", "dark", "Dark", ImageType::Flat, None),
+            ("flats", "bias", "Bias", ImageType::Flat, None),
+            ("darks", "bias", "Bias", ImageType::Dark, None),
+        ];
+        for (source_type, cal_type, imagetyp, kind, filter) in pairs {
+            let conn = engine_test_db();
+            let full = tied_set(&conn, 1, imagetyp, filter, "2023-07-27T00:00:00+00:00", Some(FULL), None, 0);
+            tied_set(&conn, 2, imagetyp, filter, "2023-07-28T00:00:00+00:00", Some(ROI), None, 0);
+            let source = tied_frame(&conn, "source", kind, filter, Some(FULL), None);
+            let got = find_calibration_candidates(&conn, &source, source_type, cal_type,
+                &CalibrationMatchingConfig::default(), CandidateMode::OnlyCompatible).unwrap();
+            assert_eq!(ids(&got), vec![full], "{source_type} → {cal_type}");
+        }
+    }
+
+    /// O2: same size, another origin — refused only when both sides record
+    /// one. The externally built master recording 0,0 is the dev catalog's
+    /// set 1518 shape. G-7 (owner 2026-10-20, "auto no, manual yes"): auto-link
+    /// never takes it, but its verdict is a WARNING so the manual card stays
+    /// selectable (review M-7: this is the test that pins the owner's answer).
+    #[test]
+    fn geometry_origin_compared_only_when_both_sides_record_it() {
+        let conn = engine_test_db();
+        let centred = tied_set(&conn, 1, "Dark", None, "2023-07-27T00:00:00+00:00", Some(ROI), Some((1584, 1064)), 0);
+        let corner = tied_set(&conn, 2, "MasterDark", None, "2023-07-28T00:00:00+00:00", Some(ROI), Some((0, 0)), 1);
+        let silent = tied_set(&conn, 3, "Dark", None, "2023-07-26T00:00:00+00:00", Some(ROI), None, 0);
+        let config = CalibrationMatchingConfig::default();
+
+        let light = tied_frame(&conn, "roi-light", ImageType::Light, None, Some(ROI), Some((1584, 1064)));
+        let got = find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
+        assert_eq!(ids(&got), vec![centred, silent], "auto-link never takes another origin");
+
+        let all = find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::IncludeIncompatible).unwrap();
+        let c = all.iter().find(|c| c.set_id == corner).unwrap();
+        assert!(!c.passed_hard_filter);
+        let d = &c.details.geometry;
+        assert!(d.matched && d.warning && !d.unknown, "{d:?}");
+        assert_eq!(d.frame_value.as_deref(), Some("6384×4258 @ 1584,1064"));
+        assert_eq!(d.set_value.as_deref(), Some("6384×4258 @ 0,0"));
+        let verdicts = crate::calibration::manual::verdicts_from_candidate(&c.details);
+        let v = verdicts.iter().find(|v| v.name == "geometry").unwrap();
+        assert_eq!(v.status, crate::models::ParameterStatus::Warning, "the manual card stays selectable");
+
+        let quiet = tied_frame(&conn, "quiet-light", ImageType::Light, None, Some(ROI), None);
+        let got = find_calibration_candidates(&conn, &quiet, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
+        assert_eq!(ids(&got), vec![centred, corner, silent]);
+    }
+
+    /// R1 + R12.
+    #[test]
+    fn geometry_unrecorded_blocks_nothing_and_mixed_sizes_fit_nothing() {
+        let conn = engine_test_db();
+        let unrecorded = tied_set(&conn, 1, "Dark", None, "2023-07-27T00:00:00+00:00", None, None, 0);
+        let mixed = tied_set(&conn, 2, "Dark", None, "2023-07-28T00:00:00+00:00", Some(FULL), None, 0);
+        let roi_member = seed_frame(&conn, "mixed-roi", "Dark", Some(ROI), None);
+        add_members(&conn, mixed, &[roi_member]);
+        let config = CalibrationMatchingConfig::default();
+
+        let light = tied_frame(&conn, "light", ImageType::Light, None, Some(FULL), None);
+        let all = find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::IncludeIncompatible).unwrap();
+        let u = all.iter().find(|c| c.set_id == unrecorded).unwrap();
+        assert!(u.passed_hard_filter && u.details.geometry.matched && u.details.geometry.unknown);
+        let m = all.iter().find(|c| c.set_id == mixed).unwrap();
+        assert!(!m.passed_hard_filter);
+        assert_eq!(m.details.geometry.set_value.as_deref(), Some("mixed sizes"));
+
+        let blind = tied_frame(&conn, "blind", ImageType::Light, None, None, None);
+        let got = find_calibration_candidates(&conn, &blind, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
+        assert_eq!(ids(&got), vec![unrecorded], "a frame of unknown size still never takes a mixed set");
     }
 }

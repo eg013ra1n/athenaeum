@@ -16,12 +16,13 @@ use crate::models::{
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 
 /// Build a synthetic `Frame` representing the average parameters of the
 /// supplied light frames so the candidate engine sees the same shape it uses
-/// for auto-link.
+/// for auto-link. It carries the selection's most common size and a
+/// representative file (that size's lowest frame id) for the origin.
 pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Result<Frame> {
     if frame_ids.is_empty() {
         return Err(anyhow!("No frame IDs provided"));
@@ -29,8 +30,8 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
 
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
-        "SELECT instrume, binning, gain, offset, filter, ccd_temp, exptime, focallen, telescop, date_obs
-         FROM frames WHERE id IN ({})",
+        "SELECT instrume, binning, gain, offset, filter, ccd_temp, exptime, focallen, telescop, date_obs, id, file_id, naxis1, naxis2
+         FROM frames WHERE id IN ({}) ORDER BY id",
         placeholders.join(", ")
     );
 
@@ -48,6 +49,7 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
     let mut temps: Vec<f64> = Vec::new();
     let mut exptimes: Vec<f64> = Vec::new();
     let mut earliest_date: Option<String> = None;
+    let mut sized: Vec<(i64, i64, Option<(i32, i32)>)> = Vec::new();
 
     while let Some(row) = rows.next().context("reading frame row")? {
         instrumes.push(row.get(0).ok());
@@ -59,6 +61,12 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
         if let Ok(Some(e)) = row.get::<_, Option<f64>>(6) { exptimes.push(e); }
         focallens.push(row.get(7).ok());
         telescops.push(row.get(8).ok());
+        sized.push((
+            row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, Option<i32>>(12)?
+                .zip(row.get::<_, Option<i32>>(13)?),
+        ));
         if let Ok(Some(d)) = row.get::<_, Option<String>>(9) {
             earliest_date = match earliest_date.take() {
                 Some(prev) if prev <= d => Some(prev),
@@ -66,6 +74,28 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
             };
         }
     }
+
+    // Geometry: the selection's most common size (ties -> the size whose first
+    // frame has the lowest id), and that frame's file as the representative
+    // whose stored header supplies the origin. `manual_assign_calibration`
+    // re-checks every frame, so a minority size is refused there, not here.
+    let mut by_size: HashMap<(i32, i32), (usize, i64, i64)> = HashMap::new(); // count, first frame id, its file id
+    for &(frame_id, file_id, size) in &sized {
+        if let Some(size) = size {
+            let entry = by_size.entry(size).or_insert((0, frame_id, file_id));
+            entry.0 += 1;
+        }
+    }
+    if by_size.len() > 1 {
+        tracing::warn!(
+            count = by_size.len(),
+            "lights in the manual selection differ in frame size; candidates are judged against the most common size"
+        );
+    }
+    let chosen = by_size
+        .into_iter()
+        .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.1 .1.cmp(&a.1 .1)))
+        .map(|(size, (_, _, file_id))| (size, file_id));
 
     let avg_temp = if temps.is_empty() {
         None
@@ -84,7 +114,7 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
 
     Ok(Frame {
         id: None,
-        file_id: 0,
+        file_id: chosen.map(|c| c.1).unwrap_or(0),
         object: None,
         date_obs,
         telescop: most_common_option(&telescops),
@@ -103,8 +133,8 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
         focallen: most_common_f64(&focallens),
         xpixsz: None,
         ypixsz: None,
-        naxis1: None,
-        naxis2: None,
+        naxis1: chosen.map(|c| c.0 .0),
+        naxis2: chosen.map(|c| c.0 .1),
         ra: None,
         dec: None,
         sitelat: None,
@@ -159,6 +189,24 @@ pub fn synthesize_frame_for_set(conn: &Connection, set_id: i64) -> Result<(Frame
     }
     .to_string();
 
+    let set_geometry = crate::calibration::geometry::geometry_for_set(conn, set_id)?;
+    if set_geometry.mixed {
+        tracing::warn!(
+            set_id,
+            "calibration set members differ in frame size; its sub-calibration list cannot judge geometry"
+        );
+    }
+    let representative_file_id: i64 = conn
+        .query_row(
+            "SELECT f.file_id FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             WHERE csf.set_id = ?1 ORDER BY csf.frame_id LIMIT 1",
+            [set_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
     let date_obs = date_start
         .as_ref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -166,7 +214,7 @@ pub fn synthesize_frame_for_set(conn: &Connection, set_id: i64) -> Result<(Frame
 
     let frame = Frame {
         id: None,
-        file_id: 0,
+        file_id: representative_file_id,
         object: None,
         date_obs,
         telescop: None,
@@ -185,8 +233,8 @@ pub fn synthesize_frame_for_set(conn: &Connection, set_id: i64) -> Result<(Frame
         focallen,
         xpixsz: None,
         ypixsz: None,
-        naxis1: None,
-        naxis2: None,
+        naxis1: set_geometry.size.map(|s| s.0),
+        naxis2: set_geometry.size.map(|s| s.1),
         ra: None,
         dec: None,
         sitelat: None,
@@ -241,6 +289,7 @@ pub fn verdicts_from_candidate(details: &CandidateMatchDetails) -> Vec<Parameter
     vec![
         verdict("instrume", &details.instrume),
         verdict("binning", &details.binning),
+        verdict("geometry", &details.geometry),
         verdict("gain", &details.gain),
         verdict("offset", &details.offset),
         verdict("filter", &details.filter),
@@ -360,4 +409,47 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
         .into_iter()
         .max_by_key(|(_, (_, n))| *n)
         .map(|(_, (v, _))| v)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::calibration::geometry::test_support::{add_members, file_id_of, seed_frame, seed_set};
+    use crate::db::schema::init_db;
+
+    const FULL: (i32, i32) = (9576, 6388);
+    const ROI: (i32, i32) = (6384, 4258);
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Review Focus 3: a selection that mixes sizes is judged against its
+    /// most common size; the representative file is that size's lowest frame
+    /// id, whose stored header supplies the origin.
+    #[test]
+    fn synthesized_lights_carry_the_most_common_size() {
+        let conn = db();
+        let a = seed_frame(&conn, "a", "Light", Some(FULL), Some((0, 0)));
+        let b = seed_frame(&conn, "b", "Light", Some(FULL), None);
+        let c = seed_frame(&conn, "c", "Light", Some(ROI), None);
+        let frame = synthesize_frame_for_lights(&conn, &[c, b, a]).unwrap();
+        assert_eq!((frame.naxis1, frame.naxis2), (Some(9576), Some(6388)));
+        assert_eq!(frame.file_id, file_id_of(&conn, a));
+    }
+
+    #[test]
+    fn synthesized_set_frame_carries_the_set_geometry() {
+        let conn = db();
+        let set = seed_set(&conn, "Flat");
+        let m1 = seed_frame(&conn, "f1", "Flat", Some(ROI), Some((1584, 1064)));
+        let m2 = seed_frame(&conn, "f2", "Flat", Some(ROI), None);
+        add_members(&conn, set, &[m2, m1]);
+        let (frame, source_type) = synthesize_frame_for_set(&conn, set).unwrap();
+        assert_eq!(source_type, "flats");
+        assert_eq!((frame.naxis1, frame.naxis2), (Some(6384), Some(4258)));
+        assert_eq!(frame.file_id, file_id_of(&conn, m1), "the lowest frame id's file");
+    }
 }
