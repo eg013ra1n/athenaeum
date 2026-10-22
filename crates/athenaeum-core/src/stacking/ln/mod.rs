@@ -417,9 +417,42 @@ pub struct LnFrameOutcome {
     /// shows on the frame instead of being averaged away. `None` exactly when `growth_factor` is.
     pub growth_pairs: Option<usize>,
     /// The TARGET side's aperture correction `c` as the module gave it on the registered plane
-    /// ([`scale::ScaleResult::target_aperture_correction`]), the MEAN over the channels that measured one, like
-    /// `fwhm_px`. `None` when no channel did.
+    /// ([`scale::ScaleResult::target_aperture_correction`]), the MEAN over the channels, like `fwhm_px`, but only when
+    /// EVERY channel measured one (R-PB0-5, the `beta_own` rule): a target channel at floor (i) makes it `None`.
     pub target_aperture_correction: Option<f64>,
+}
+
+/// What one channel's scale call reported for the run summary (Plan B B0, PB-2): F1's growth factor and pair count and
+/// the TARGET plane's aperture correction `c`, each `None` where the call did not measure it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PlaneReadings {
+    pub growth_factor: Option<f64>,
+    pub growth_pairs: Option<usize>,
+    pub target_aperture_correction: Option<f64>,
+}
+
+/// The frame-level reading of the planes' [`PlaneReadings`] (R-PB0-5, R-PB0-6): one pure fold, so its rules are pinned
+/// without a registered frame.
+/// - `growth_pairs` is the MINIMUM over the planes that report one, so an OSC channel at floor (ii) (`Some(0)`) shows on
+///   the frame instead of being averaged away;
+/// - `growth_factor` is the MEAN over the planes that report one, like `scale`;
+/// - `target_aperture_correction` is the MEAN only when EVERY plane carries a `c` (the rule `beta_own` follows): a target
+///   plane at floor (i) makes it `None`, never a mean over the others that would hide the floor. `None` for no planes.
+pub(crate) fn fold_plane_readings(planes: &[PlaneReadings]) -> PlaneReadings {
+    let mean = |v: Vec<f64>| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    let target_cs: Vec<f64> = planes
+        .iter()
+        .filter_map(|p| p.target_aperture_correction)
+        .collect();
+    PlaneReadings {
+        growth_factor: mean(planes.iter().filter_map(|p| p.growth_factor).collect()),
+        growth_pairs: planes.iter().filter_map(|p| p.growth_pairs).min(),
+        target_aperture_correction: if target_cs.len() == planes.len() {
+            mean(target_cs)
+        } else {
+            None
+        },
+    }
 }
 
 /// The median of ONLY the finite pixels of `plane` (fix round 1, item 7):
@@ -861,10 +894,9 @@ pub fn normalize_frame(
     let mut scales = Vec::with_capacity(channels);
     let mut from_seeds_per_channel = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
-    // Plan B B0 (PB-2): F1's growth factor and pairs and the target side's `c`, per channel; folded into the outcome.
-    let mut growth_factors: Vec<f64> = Vec::new();
-    let mut growth_pairs_min: Option<usize> = None;
-    let mut target_cs: Vec<f64> = Vec::new();
+    // Plan B B0 (PB-2): F1's growth factor and pairs and the target side's `c`, per channel; folded into the outcome by
+    // `fold_plane_readings` once every channel is done.
+    let mut plane_readings: Vec<PlaneReadings> = Vec::with_capacity(channels);
     let (mut samples_total, mut samples_rejected_total) = (0usize, 0usize);
     let (mut samples_shared_total, mut cells_unsupported_total) = (0usize, 0usize);
     let mut warned_no_shared = false;
@@ -1253,12 +1285,11 @@ pub fn normalize_frame(
         fit_ms += scale_result.timings.fit_ms;
         match_ms += scale_result.timings.match_ms;
         matches_total += scale_result.matches;
-        growth_factors.extend(scale_result.growth_factor);
-        growth_pairs_min = match (growth_pairs_min, scale_result.growth_pairs) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        target_cs.extend(scale_result.target_aperture_correction);
+        plane_readings.push(PlaneReadings {
+            growth_factor: scale_result.growth_factor,
+            growth_pairs: scale_result.growth_pairs,
+            target_aperture_correction: scale_result.target_aperture_correction,
+        });
         scales.push(channel_scale);
         from_seeds_per_channel.push(plane_from_seeds);
 
@@ -1342,7 +1373,7 @@ pub fn normalize_frame(
     let write_ms = t.elapsed().as_millis() as u64;
 
     let scale = scales.iter().sum::<f64>() / scales.len().max(1) as f64;
-    let mean_of = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    let folded = fold_plane_readings(&plane_readings);
 
     Ok(LnFrameOutcome {
         sidecar: sidecar.to_path_buf(),
@@ -1363,9 +1394,9 @@ pub fn normalize_frame(
         ln_scale_source: frame_scale_source,
         channel_scales: scales,
         channel_from_seeds: from_seeds_per_channel,
-        growth_factor: mean_of(&growth_factors),
-        growth_pairs: growth_pairs_min,
-        target_aperture_correction: mean_of(&target_cs),
+        growth_factor: folded.growth_factor,
+        growth_pairs: folded.growth_pairs,
+        target_aperture_correction: folded.target_aperture_correction,
     })
 }
 
@@ -1373,6 +1404,65 @@ pub fn normalize_frame(
 mod tests {
     use super::*;
     use crate::stacking::psf_signal::PsfModel;
+
+    /// Plan B B0 review fold (R-PB0-6): the pairs reading is the MINIMUM over the planes, so a plane at floor (ii)
+    /// (`Some(0)`) shows on the frame; a mean (7) or a first-plane read (12) would fail.
+    #[test]
+    fn the_frame_pairs_are_the_minimum_over_the_planes() {
+        let plane = |pairs| PlaneReadings {
+            growth_factor: Some(1.0),
+            growth_pairs: pairs,
+            target_aperture_correction: Some(1.1),
+        };
+        let folded = fold_plane_readings(&[plane(Some(12)), plane(Some(0)), plane(Some(9))]);
+        assert_eq!(folded.growth_pairs, Some(0));
+        // A plane that reports no pair count does not mask the others.
+        let folded = fold_plane_readings(&[plane(None), plane(Some(9)), plane(Some(4))]);
+        assert_eq!(folded.growth_pairs, Some(4));
+        let folded = fold_plane_readings(&[plane(None), plane(None)]);
+        assert_eq!(folded.growth_pairs, None);
+    }
+
+    /// R-PB0-6: the growth factor is the MEAN over the planes that report one (answer (a): the factor stays a mean,
+    /// beside `scale`, itself a mean).
+    #[test]
+    fn the_frame_growth_factor_is_the_mean_over_the_reporting_planes() {
+        let plane = |f| PlaneReadings {
+            growth_factor: f,
+            growth_pairs: Some(10),
+            target_aperture_correction: Some(1.1),
+        };
+        let folded = fold_plane_readings(&[plane(Some(1.0)), plane(Some(1.5)), plane(Some(2.5))]);
+        assert_eq!(folded.growth_factor, Some(5.0 / 3.0));
+        let folded = fold_plane_readings(&[plane(Some(1.0)), plane(None), plane(Some(2.0))]);
+        assert_eq!(folded.growth_factor, Some(1.5));
+        let folded = fold_plane_readings(&[plane(None), plane(None)]);
+        assert_eq!(folded.growth_factor, None);
+    }
+
+    /// R-PB0-5 (M1): the frame's target `c` is the mean only when EVERY channel carries one; a channel at floor (i)
+    /// makes it `None`, so an OSC frame whose B target is at floor never reads as mean(R, G).
+    #[test]
+    fn the_frame_target_c_is_the_mean_only_when_every_channel_carries_one() {
+        let plane = |c| PlaneReadings {
+            growth_factor: Some(1.0),
+            growth_pairs: Some(10),
+            target_aperture_correction: c,
+        };
+        let with_floor = fold_plane_readings(&[plane(Some(1.1)), plane(Some(1.3)), plane(None)]);
+        assert_eq!(with_floor.target_aperture_correction, None);
+        let all = fold_plane_readings(&[plane(Some(1.1)), plane(Some(1.3)), plane(Some(1.2))]);
+        let mean = (1.1 + 1.3 + 1.2) / 3.0;
+        assert_eq!(all.target_aperture_correction, Some(mean));
+        let mono = fold_plane_readings(&[plane(Some(1.17))]);
+        assert_eq!(mono.target_aperture_correction, Some(1.17));
+        let mono_floor = fold_plane_readings(&[plane(None)]);
+        assert_eq!(mono_floor.target_aperture_correction, None);
+        // The growth readings are untouched by a floor target `c`.
+        assert_eq!(with_floor.growth_factor, Some(1.0));
+        assert_eq!(with_floor.growth_pairs, Some(10));
+        assert_eq!(fold_plane_readings(&[]), PlaneReadings::default());
+    }
 
     fn ref_models(reference: &LnReference, scale: u32) -> Vec<BackgroundModel> {
         reference

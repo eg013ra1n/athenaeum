@@ -89,7 +89,7 @@ use crate::stacking::master_cards::{
     WrittenMaster,
 };
 use crate::stacking::measure::{
-    channel_c_summary, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
+    channel_c_inputs, channel_c_summary, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
     measure_frame_with_fits, FrameMeasurement, FramePass1, MeasureOptions,
 };
 use crate::stacking::pass1_artifact::{
@@ -380,10 +380,11 @@ pub(crate) struct RunContext {
     /// sidecars were written under. Absent for a group whose LN never ran,
     /// or one whose calibration could not be measured at all.
     pub(crate) group_seeds_calibration: HashMap<String, ln::SeedsCalibration>,
-    /// Plan B B0 (PB-2): each group's LN reference aperture correction `c` per plane, recorded by stage 6 from the
-    /// prepared reference channels and read by [`push_summary_group`] (`SummaryGroup::ln_reference_aperture_correction`).
-    /// A plane at floor (i) holds `1.0`, the applied value. Absent for a group whose LN never reached the reference.
-    pub(crate) group_ln_reference_c: HashMap<String, Vec<f64>>,
+    /// Plan B B0 (PB-2, R-PB0-7): each group's LN reference aperture correction `c` per plane, recorded by stage 6 from
+    /// the prepared reference channels and read by [`push_summary_group`] (`SummaryGroup::ln_reference_aperture_correction`).
+    /// A plane at floor (i) holds `None` (`null` in the summary), never the applied `1.0`. Absent for a group whose LN
+    /// never reached the reference.
+    pub(crate) group_ln_reference_c: HashMap<String, Vec<Option<f64>>>,
     /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
     /// P-14); a run whose own resolution differs warns once.
     pub(crate) planned_ln_scales: HashMap<String, u32>,
@@ -5641,19 +5642,9 @@ fn measure_group_finish(
             .collect();
         let channels = measured.iter().map(|m| m.channels.len()).max().unwrap_or(0);
         for plane in 0..channels {
-            let kept: Vec<Option<(f64, f64, usize)>> = measured
-                .iter()
-                .filter_map(|m| m.channels.get(plane))
-                .map(|c| {
-                    c.aperture_correction.map(|v| {
-                        (
-                            v,
-                            c.aperture_se.unwrap_or(f64::NAN),
-                            c.aperture_stars.unwrap_or(0),
-                        )
-                    })
-                })
-                .collect();
+            // R-PB0-4: a plane with no `c` and no fit at all is left out, so `count` is the planes where the
+            // "fewer than 5" warn fired.
+            let kept = channel_c_inputs(measured.iter().filter_map(|m| m.channels.get(plane)));
             let c = channel_c_summary(&kept);
             match (c.median, c.min, c.max) {
                 (Some(median), Some(min), Some(max)) => tracing::info!(
@@ -13000,14 +12991,14 @@ fn run_group_normalization(
         rc.group_seeds_calibration
             .insert(group.key.clone(), c.clone());
     }
-    // Plan B B0 (PB-2): the reference's own `c` per plane, read off the prepared channels; a plane at floor (i) reads
-    // 1.0, the value that was applied.
+    // Plan B B0 (PB-2, R-PB0-7): the reference's own `c` per plane, read off the prepared channels; a plane at floor (i)
+    // stays `None` (`null` in the summary), not the 1.0 that was applied.
     rc.group_ln_reference_c.insert(
         group.key.clone(),
         reference_for_detection
             .prepared
             .iter()
-            .map(|p| p.aperture_correction().unwrap_or(1.0))
+            .map(|p| p.aperture_correction())
             .collect(),
     );
 

@@ -285,6 +285,29 @@ pub struct ChannelCSummary {
     pub max: Option<f64>,
 }
 
+/// The inputs of [`channel_c_summary`] for one channel: its plane in each measured member, `Some((c, se, stars))` for a
+/// plane that carries a measured `c`, `None` for a plane at floor (i). A plane with no `c` AND no fit at all
+/// (`stars_fitted == 0`: a defocused, trailed or starless plane, whose verdicts refused every seed before the growth
+/// curve ran, so the "fewer than 5" `warn!` never fired) is left out (R-PB0-4): `count` is the planes where that warn
+/// fired, as PB-1 and the logging dictionary say.
+pub fn channel_c_inputs<'a>(
+    planes: impl IntoIterator<Item = &'a ChannelMeasurement>,
+) -> Vec<Option<(f64, f64, usize)>> {
+    planes
+        .into_iter()
+        .filter(|c| !(c.aperture_correction.is_none() && c.stars_fitted == 0))
+        .map(|c| {
+            c.aperture_correction.map(|v| {
+                (
+                    v,
+                    c.aperture_se.unwrap_or(f64::NAN),
+                    c.aperture_stars.unwrap_or(0),
+                )
+            })
+        })
+        .collect()
+}
+
 /// [`ChannelCSummary`] over one channel's plane in each measured member: `Some((c, se, stars))` for a plane that
 /// carries a measured `c`, `None` for a plane at floor (i). Reads the kept values; it estimates nothing.
 pub fn channel_c_summary(planes: &[Option<(f64, f64, usize)>]) -> ChannelCSummary {
@@ -2999,6 +3022,55 @@ pub(crate) mod tests {
         let even = channel_c_summary(&[Some((1.0, 0.0, 5)), Some((1.5, 0.0, 5))]);
         assert_eq!((even.planes, even.count), (2, 0));
         assert_eq!(even.median, Some(1.25));
+    }
+
+    /// Plan B B0 review fold (R-PB0-4): a plane with no `c` and no fit at all is left out of the per-channel summary,
+    /// because the "fewer than 5" warn never fired on it; a plane at floor (i) (`c` None, stars fitted) stays and is
+    /// counted. One no-fit plane, one floor-(i) plane and two measured planes read `planes 2`, `count 1` over three
+    /// kept entries, not the four the old reading counted (`count 2`).
+    #[test]
+    fn a_plane_with_no_fit_is_left_out_of_the_channel_c_summary() {
+        let no_fit = ChannelMeasurement {
+            stars_detected: 4,
+            stars_fitted: 0,
+            ..Default::default()
+        };
+        let floor_i = ChannelMeasurement {
+            stars_detected: 30,
+            stars_fitted: 3,
+            ..Default::default()
+        };
+        let measured = |c: f64| ChannelMeasurement {
+            stars_detected: 150,
+            stars_fitted: 120,
+            aperture_correction: Some(c),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            ..Default::default()
+        };
+        let planes = [no_fit.clone(), floor_i, measured(1.0), measured(1.5)];
+        let kept = channel_c_inputs(planes.iter());
+        assert_eq!(kept.len(), 3, "the no-fit plane is left out: {kept:?}");
+        assert_eq!(kept[0], None, "the floor-(i) plane stays, in order");
+        assert_eq!(kept[1], Some((1.0, 0.004, 64)));
+        assert_eq!(kept[2], Some((1.5, 0.004, 64)));
+        let s = channel_c_summary(&kept);
+        assert_eq!((s.planes, s.count), (2, 1));
+        assert_eq!(s.median, Some(1.25));
+        assert_eq!((s.min, s.max), (Some(1.0), Some(1.5)));
+
+        // A channel whose every plane has no fit reports nothing at all: `planes 0`, `count 0`.
+        let none = channel_c_summary(&channel_c_inputs([&no_fit, &no_fit]));
+        assert_eq!((none.planes, none.count), (0, 0));
+        assert_eq!(none.median, None);
+
+        // A measured plane is never left out, whatever `stars_fitted` says (a payload decoded without the key).
+        let odd = ChannelMeasurement {
+            stars_fitted: 0,
+            aperture_correction: Some(1.2),
+            ..Default::default()
+        };
+        assert_eq!(channel_c_inputs([&odd]).len(), 1);
     }
 
     /// Plan A Task 4 (F-0): the channel accounts for every seed it detected,

@@ -492,8 +492,9 @@ lnGrowthFactor: number | null,
 lnGrowthPairs: number | null, 
 /**
  * The TARGET side's aperture correction `c` LN's scale call used (`LnFrameOutcome::target_aperture_correction`,
- * the mean over its planes, like `fwhm_px`). `Some` for a frame LN computed in this run whose planes measured a
- * `c`; `None` for a frame LN did not normalize, on an LN cache hit, and in a summary written before B0.
+ * the mean over its planes, like `fwhm_px`, and only when EVERY plane measured one, R-PB0-5). `Some` for a frame
+ * LN computed in this run whose planes all measured a `c`; `None` when any plane is at floor (i), for a frame LN
+ * did not normalize, on an LN cache hit, and in a summary written before B0.
  */
 lnApertureCorrection: number | null, 
 /**
@@ -587,12 +588,13 @@ beta: number | null,
  */
 seedsCalibration: Array<number> | null, lnScalePx: number | null, lnFluxEstimator: LnFluxEstimator | null, lnAperture: LnAperture | null, 
 /**
- * Plan B B0 (PB-2): the LN reference's aperture correction `c` per plane (`PreparedReferenceChannel::
+ * Plan B B0 (PB-2, R-PB0-7): the LN reference's aperture correction `c` per plane (`PreparedReferenceChannel::
  * aperture_correction`), the reference side of `SummaryFrame::ln_aperture_correction`. A plane at floor (i) (no
- * `c`; `c = 1` was applied) reads `1.0`, the applied value. `None` when LN did not run for this group and in a
- * summary written before B0. A plain `Option`, `#[serde(default)]`, see `SummaryFrame::ln_scale`'s own doc.
+ * `c`; `c = 1` was applied) reads `null`, never the applied `1.0`, so a reader of `c_ref / c_tgt` sees the floor.
+ * `None` when LN did not run for this group and in a summary written before B0; a row written as `[1.0, ...]`
+ * still decodes. A plain `Option`, `#[serde(default)]`, see `SummaryFrame::ln_scale`'s own doc.
  */
-lnReferenceApertureCorrection: Array<number> | null, frames: Array<SummaryFrame>, };
+lnReferenceApertureCorrection: Array<number | null> | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 
