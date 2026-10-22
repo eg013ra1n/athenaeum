@@ -1835,6 +1835,31 @@ mod tests {
         assert!(prepare_subtree(&cfg).get("measureVersion").is_none());
     }
 
+    /// PIN, not RED (Plan B B0, I-5; ruling F28): the three fit-reading stage hashes of the default config at
+    /// `MEASURE_VERSION` 4, literals read off the code before B0. `every_fit_reading_stage_hash_follows_measure_version`
+    /// above is only relative (the hash moves when the version moves); this one fixes the values, so B4's bump has a
+    /// number to move from and any other change to these subtrees is loud.
+    #[test]
+    fn fit_reading_stage_hashes_at_measure_version_four_are_pinned() {
+        assert_eq!(MEASURE_VERSION, 4, "the pins below are the version-4 hashes");
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            "e4320e05f86c1550",
+            "measurement"
+        );
+        assert_eq!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            "22155caee721ad23",
+            "registration"
+        );
+        assert_eq!(
+            stage_hash(&normalization_subtree(&cfg), &[], &[]),
+            "209f262fd5e90fec",
+            "normalization"
+        );
+    }
+
     /// PIN, not RED (ruling F28): Plan A's one bump (PA-4).
     #[test]
     fn measure_version_is_four_after_plan_a() {

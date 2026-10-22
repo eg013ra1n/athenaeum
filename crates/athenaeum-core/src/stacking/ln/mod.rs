@@ -409,6 +409,17 @@ pub struct LnFrameOutcome {
     /// compared detection against detection and has nothing to say about
     /// the seeds path's own bias.
     pub channel_from_seeds: Vec<bool>,
+    /// Plan B B0 (PB-2), kept on the run summary: F1's growth-curve factor ([`scale::ScaleResult::growth_factor`]),
+    /// the MEAN over the channels that report one, like `scale`. `None` unless the growth-curve aperture ran.
+    pub growth_factor: Option<f64>,
+    /// F1's pair count ([`scale::ScaleResult::growth_pairs`]), the MINIMUM over the channels that report one, so an
+    /// OSC channel at floor (ii) (`Some(0)`: no pair had its outer circle on both frames, the 2 x FWHM ratio kept)
+    /// shows on the frame instead of being averaged away. `None` exactly when `growth_factor` is.
+    pub growth_pairs: Option<usize>,
+    /// The TARGET side's aperture correction `c` as the module gave it on the registered plane
+    /// ([`scale::ScaleResult::target_aperture_correction`]), the MEAN over the channels that measured one, like
+    /// `fwhm_px`. `None` when no channel did.
+    pub target_aperture_correction: Option<f64>,
 }
 
 /// The median of ONLY the finite pixels of `plane` (fix round 1, item 7):
@@ -850,6 +861,10 @@ pub fn normalize_frame(
     let mut scales = Vec::with_capacity(channels);
     let mut from_seeds_per_channel = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
+    // Plan B B0 (PB-2): F1's growth factor and pairs and the target side's `c`, per channel; folded into the outcome.
+    let mut growth_factors: Vec<f64> = Vec::new();
+    let mut growth_pairs_min: Option<usize> = None;
+    let mut target_cs: Vec<f64> = Vec::new();
     let (mut samples_total, mut samples_rejected_total) = (0usize, 0usize);
     let (mut samples_shared_total, mut cells_unsupported_total) = (0usize, 0usize);
     let mut warned_no_shared = false;
@@ -1238,6 +1253,12 @@ pub fn normalize_frame(
         fit_ms += scale_result.timings.fit_ms;
         match_ms += scale_result.timings.match_ms;
         matches_total += scale_result.matches;
+        growth_factors.extend(scale_result.growth_factor);
+        growth_pairs_min = match (growth_pairs_min, scale_result.growth_pairs) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        target_cs.extend(scale_result.target_aperture_correction);
         scales.push(channel_scale);
         from_seeds_per_channel.push(plane_from_seeds);
 
@@ -1321,6 +1342,7 @@ pub fn normalize_frame(
     let write_ms = t.elapsed().as_millis() as u64;
 
     let scale = scales.iter().sum::<f64>() / scales.len().max(1) as f64;
+    let mean_of = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
 
     Ok(LnFrameOutcome {
         sidecar: sidecar.to_path_buf(),
@@ -1341,6 +1363,9 @@ pub fn normalize_frame(
         ln_scale_source: frame_scale_source,
         channel_scales: scales,
         channel_from_seeds: from_seeds_per_channel,
+        growth_factor: mean_of(&growth_factors),
+        growth_pairs: growth_pairs_min,
+        target_aperture_correction: mean_of(&target_cs),
     })
 }
 

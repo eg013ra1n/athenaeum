@@ -89,8 +89,8 @@ use crate::stacking::master_cards::{
     WrittenMaster,
 };
 use crate::stacking::measure::{
-    check_pass1_head, measure_frame_pass1, measure_frame_pass2, measure_frame_with_fits,
-    FrameMeasurement, FramePass1, MeasureOptions,
+    channel_c_summary, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
+    measure_frame_with_fits, FrameMeasurement, FramePass1, MeasureOptions,
 };
 use crate::stacking::pass1_artifact::{
     read_pass1, read_pass1_head, write_pass1, Pass1ArtifactError, Pass1Head, PASS1_ARTIFACT_KIND,
@@ -380,6 +380,10 @@ pub(crate) struct RunContext {
     /// sidecars were written under. Absent for a group whose LN never ran,
     /// or one whose calibration could not be measured at all.
     pub(crate) group_seeds_calibration: HashMap<String, ln::SeedsCalibration>,
+    /// Plan B B0 (PB-2): each group's LN reference aperture correction `c` per plane, recorded by stage 6 from the
+    /// prepared reference channels and read by [`push_summary_group`] (`SummaryGroup::ln_reference_aperture_correction`).
+    /// A plane at floor (i) holds `1.0`, the applied value. Absent for a group whose LN never reached the reference.
+    pub(crate) group_ln_reference_c: HashMap<String, Vec<f64>>,
     /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
     /// P-14); a run whose own resolution differs warns once.
     pub(crate) planned_ln_scales: HashMap<String, u32>,
@@ -1145,6 +1149,7 @@ pub(crate) fn start_stacking_with_solver(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        group_ln_reference_c: HashMap::new(),
         planned_ln_scales,
         drizzle_attempted: 0,
         crop_items: Vec::new(),
@@ -3544,6 +3549,13 @@ pub(crate) struct MeasuredFrame {
     /// Whether stage 6 REUSED an existing `ln` artifact for this frame
     /// rather than normalizing it fresh. Feeds `SummaryFrame::cached_ln`.
     cached_ln: bool,
+    /// Plan B B0 (PB-2): F1's growth-curve factor, its pair count (the minimum over the planes) and the target side's
+    /// `c` (the mean over the planes) from this run's own `normalize_frame`; `None` until [`set_ln_summary`] sets
+    /// them, for a frame LN did not normalize, and on an LN cache hit. Feed `SummaryFrame::ln_growth_factor`,
+    /// `ln_growth_pairs` and `ln_aperture_correction`.
+    ln_growth_factor: Option<f64>,
+    ln_growth_pairs: Option<usize>,
+    ln_aperture_correction: Option<f64>,
 }
 
 /// Stage 3's per-group summary beyond the per-frame [`MeasuredFrame`] list
@@ -5117,6 +5129,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5134,6 +5149,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5166,6 +5184,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         };
@@ -5188,6 +5209,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5219,6 +5243,9 @@ fn measure_group_prepare(
                     cached_metrics: false,
                     ln_scale: None,
                     cached_ln: false,
+                    ln_growth_factor: None,
+                    ln_growth_pairs: None,
+                    ln_aperture_correction: None,
                 });
                 continue;
             }
@@ -5242,6 +5269,9 @@ fn measure_group_prepare(
                     cached_metrics: false,
                     ln_scale: None,
                     cached_ln: false,
+                    ln_growth_factor: None,
+                    ln_growth_pairs: None,
+                    ln_aperture_correction: None,
                 });
                 continue;
             }
@@ -5265,6 +5295,9 @@ fn measure_group_prepare(
             cached_metrics: false,
             ln_scale: None,
             cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
         });
         to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
     }
@@ -5595,6 +5628,55 @@ fn measure_group_finish(
             beta,
             "stacking group beta resolved"
         );
+    }
+
+    // Plan B B0 (PB-1, F-11): the aperture correction `c` each channel of the group resolved, one info per channel after
+    // the fan-out, beside the group β line. Over every MEASURED member (fresh or reused), never narrowed to `included`,
+    // as the group β is. A `metrics` row reused from before B0 carries no `c` and reads as a plane at floor here; the
+    // before-runs measure on fresh work dirs.
+    {
+        let measured: Vec<&FrameMeasurement> = entries
+            .iter()
+            .filter_map(|e| e.measurement.as_ref())
+            .collect();
+        let channels = measured.iter().map(|m| m.channels.len()).max().unwrap_or(0);
+        for plane in 0..channels {
+            let kept: Vec<Option<(f64, f64, usize)>> = measured
+                .iter()
+                .filter_map(|m| m.channels.get(plane))
+                .map(|c| {
+                    c.aperture_correction.map(|v| {
+                        (
+                            v,
+                            c.aperture_se.unwrap_or(f64::NAN),
+                            c.aperture_stars.unwrap_or(0),
+                        )
+                    })
+                })
+                .collect();
+            let c = channel_c_summary(&kept);
+            match (c.median, c.min, c.max) {
+                (Some(median), Some(min), Some(max)) => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    aperture_correction = median,
+                    aperture_correction_min = min,
+                    aperture_correction_max = max,
+                    "measure: aperture correction resolved per channel"
+                ),
+                _ => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    "measure: aperture correction resolved per channel"
+                ),
+            }
+        }
     }
 
     {
@@ -9617,6 +9699,9 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
         ),
         ln_scale: entry.ln_scale,
         cached_ln: entry.cached_ln,
+        ln_growth_factor: entry.ln_growth_factor,
+        ln_growth_pairs: entry.ln_growth_pairs,
+        ln_aperture_correction: entry.ln_aperture_correction,
         // Task 11b: the frame's own β, where the two-pass Measure read one (mean across channels, as `fwhm_px`).
         beta_own: m.and_then(|meas| {
             let own: Vec<f64> = meas.channels.iter().filter_map(|c| c.beta_own).collect();
@@ -9755,6 +9840,9 @@ fn push_summary_group(
         .get(&group.key)
         .map(|c| c.k.clone());
 
+    // Plan B B0 (PB-2): the LN reference's `c` per plane, `None` for a group whose LN never reached its reference.
+    let ln_reference_aperture_correction = rc.group_ln_reference_c.get(&group.key).cloned();
+
     // Spec 2026-10-04 §8: the estimator rides the summary whenever LN ran
     // for the group; the aperture only under the common aperture.
     let ln_local = rc.config.normalization.local;
@@ -9784,6 +9872,7 @@ fn push_summary_group(
         ln_scale_px,
         ln_flux_estimator,
         ln_aperture,
+        ln_reference_aperture_correction,
         frames,
     });
 }
@@ -12221,19 +12310,49 @@ struct LnArtifactPayload {
 /// `frame_id` (a no-op if either lookup misses, which never happens for a
 /// frame [`run_group_normalization`] itself just fanned `normalize_frame`
 /// out over or found a fresh `ln` artifact for).
+///
+/// Plan B B0 (PB-2): also keeps F1's `growth_factor` and `growth_pairs` and the target side's `target_c` (all from this
+/// run's own [`ln::LnFrameOutcome`]; `None` for a frame LN did not normalize and on an LN cache hit, which carries only
+/// the scale).
+#[allow(clippy::too_many_arguments)]
 fn set_ln_summary(
     rc: &mut RunContext,
     group_key: &str,
     frame_id: i64,
     ln_scale: Option<f64>,
     cached: bool,
+    growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
+    target_c: Option<f64>,
 ) {
     if let Some(entries) = rc.measured.get_mut(group_key) {
         if let Some(e) = entries.iter_mut().find(|e| e.frame.frame_id == frame_id) {
-            e.ln_scale = ln_scale;
-            e.cached_ln = cached;
+            apply_ln_summary(
+                e,
+                ln_scale,
+                cached,
+                growth_factor,
+                growth_pairs,
+                target_c,
+            );
         }
     }
+}
+
+/// [`set_ln_summary`]'s write onto one frame's entry, apart from the run so a test reaches it.
+fn apply_ln_summary(
+    entry: &mut MeasuredFrame,
+    ln_scale: Option<f64>,
+    cached: bool,
+    growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
+    target_c: Option<f64>,
+) {
+    entry.ln_scale = ln_scale;
+    entry.cached_ln = cached;
+    entry.ln_growth_factor = growth_factor;
+    entry.ln_growth_pairs = growth_pairs;
+    entry.ln_aperture_correction = target_c;
 }
 
 /// Stage 6 proper (spec §5.2, M2 Task 5): resolves/caches `group`'s LN
@@ -12881,6 +13000,16 @@ fn run_group_normalization(
         rc.group_seeds_calibration
             .insert(group.key.clone(), c.clone());
     }
+    // Plan B B0 (PB-2): the reference's own `c` per plane, read off the prepared channels; a plane at floor (i) reads
+    // 1.0, the value that was applied.
+    rc.group_ln_reference_c.insert(
+        group.key.clone(),
+        reference_for_detection
+            .prepared
+            .iter()
+            .map(|p| p.aperture_correction().unwrap_or(1.0))
+            .collect(),
+    );
 
     let mut needs_normalize: Vec<usize> = Vec::new();
     // M2 Task 7 (fix round 1, item 3): every member this function itself
@@ -12934,7 +13063,16 @@ fn run_group_normalization(
                     let row_path = existing.as_ref().and_then(|row| row.path.as_deref());
                     match row_path.map(|p| LnFrameGrids::read(Path::new(p))) {
                         Some(Ok(grids)) => {
-                            set_ln_summary(rc, &group.key, m.frame_id, Some(payload.scale), true);
+                            set_ln_summary(
+                                rc,
+                                &group.key,
+                                m.frame_id,
+                                Some(payload.scale),
+                                true,
+                                None,
+                                None,
+                                None,
+                            );
                             sidecar_grids.insert(m.frame_id, grids);
                         }
                         Some(Err(e)) => {
@@ -12980,7 +13118,7 @@ fn run_group_normalization(
                 .as_ref()
                 .is_some_and(|row| row.config_hash == *frame_hash)
         {
-            set_ln_summary(rc, &group.key, m.frame_id, None, true);
+            set_ln_summary(rc, &group.key, m.frame_id, None, true, None, None, None);
             low_overlap += 1;
         } else {
             needs_normalize.push(i);
@@ -13243,7 +13381,16 @@ fn run_group_normalization(
                         if outcome.ln_scale_source == "seeds" {
                             seeds_sourced_count += 1;
                         }
-                        set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
+                        set_ln_summary(
+                            rc,
+                            &group.key,
+                            frame_id,
+                            Some(outcome.scale),
+                            false,
+                            outcome.growth_factor,
+                            outcome.growth_pairs,
+                            outcome.target_aperture_correction,
+                        );
                         sidecar_grids.insert(frame_id, grids);
                     }
                     Err(e) => {
@@ -13283,7 +13430,7 @@ fn run_group_normalization(
                     overlap = fraction,
                     "ln: frame keeps global normalization (little overlap with the LN reference)"
                 );
-                set_ln_summary(rc, &group.key, frame_id, None, false);
+                set_ln_summary(rc, &group.key, frame_id, None, false, None, None, None);
                 low_overlap += 1;
             }
             Some(Err(e)) => {
@@ -14596,6 +14743,7 @@ pub(crate) fn test_context(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        group_ln_reference_c: HashMap::new(),
         planned_ln_scales: HashMap::new(),
         drizzle_attempted: 0,
         crop_items: Vec::new(),
@@ -14688,6 +14836,9 @@ mod tests {
             cached_metrics: false,
             ln_scale: None,
             cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
         };
         let frame = |flags: &[bool]| FrameMeasurement {
             width: 64,
@@ -14707,6 +14858,135 @@ mod tests {
         json.as_object_mut().unwrap().remove("fieldWidthAtFloor");
         let back: SummaryFrame = serde_json::from_value(json).unwrap();
         assert!(!back.field_width_at_floor);
+    }
+
+    /// A frame nothing has measured yet, for the summary-row tests of Plan B B0.
+    fn bare_measured_frame(frame_id: i64) -> MeasuredFrame {
+        use crate::stacking::groups::GroupFrame;
+        MeasuredFrame {
+            frame: GroupFrame {
+                frame_id,
+                file_id: frame_id,
+                filename: "f.fits".into(),
+                path: "/f.fits".into(),
+                size: 1,
+                modified_at: "2026-01-01".into(),
+                exposure_s: Some(60.0),
+                date_obs: None,
+                width: 64,
+                height: 48,
+                pixel_scale_arcsec: None,
+                scale_source: None,
+            },
+            calibrated: None,
+            planes: 1,
+            measurement: None,
+            weight: None,
+            included: true,
+            reason: None,
+            registration: None,
+            cached_calibrated: false,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
+        }
+    }
+
+    /// Plan B B0 (PB-2): the run summary keeps LN's growth factor, its pair count and the target side's `c`. A frame LN
+    /// did not compute (or an LN cache hit) reads `null` for all three; a summary written before B0, which has no such
+    /// keys, decodes with `None`; values survive the round trip.
+    #[test]
+    fn summary_frame_ln_fields_default_none_and_round_trip() {
+        let bare = summary_frame_for(&bare_measured_frame(1), None);
+        assert_eq!(
+            (
+                bare.ln_growth_factor,
+                bare.ln_growth_pairs,
+                bare.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
+        let mut json = serde_json::to_value(&bare).unwrap();
+        for key in ["lnGrowthFactor", "lnGrowthPairs", "lnApertureCorrection"] {
+            let removed = json.as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                removed,
+                Some(serde_json::Value::Null),
+                "{key} is null in the payload, never skipped"
+            );
+        }
+        let old: SummaryFrame = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (
+                old.ln_growth_factor,
+                old.ln_growth_pairs,
+                old.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
+
+        let mut entry = bare_measured_frame(2);
+        entry.ln_growth_factor = Some(1.02);
+        entry.ln_growth_pairs = Some(17);
+        entry.ln_aperture_correction = Some(1.11);
+        let json = serde_json::to_value(summary_frame_for(&entry, None)).unwrap();
+        assert_eq!(json["lnGrowthFactor"], serde_json::json!(1.02));
+        assert_eq!(json["lnGrowthPairs"], serde_json::json!(17));
+        assert_eq!(json["lnApertureCorrection"], serde_json::json!(1.11));
+        let back: SummaryFrame = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (
+                back.ln_growth_factor,
+                back.ln_growth_pairs,
+                back.ln_aperture_correction
+            ),
+            (Some(1.02), Some(17), Some(1.11))
+        );
+    }
+
+    /// Plan B B0 (PB-2, F1's floor (ii)): a member whose growth curve had no pair on both frames reports
+    /// `growth_pairs: Some(0)` with the kept ratio (`growth_factor: Some(1.0)`); both land on its row as they are, not
+    /// as an absent value. A frame LN did not normalize, and an LN cache hit, leave all three `None`.
+    #[test]
+    fn ln_summary_keeps_growth_pairs_and_factor_for_a_zero_pair_member() {
+        let outcome = ln::LnFrameOutcome {
+            scale: 0.98,
+            growth_pairs: Some(0),
+            growth_factor: Some(1.0),
+            target_aperture_correction: Some(1.12),
+            ..Default::default()
+        };
+        let mut entry = bare_measured_frame(3);
+        apply_ln_summary(
+            &mut entry,
+            Some(outcome.scale),
+            false,
+            outcome.growth_factor,
+            outcome.growth_pairs,
+            outcome.target_aperture_correction,
+        );
+        let row = summary_frame_for(&entry, None);
+        assert_eq!(row.ln_scale, Some(0.98));
+        assert_eq!(row.ln_growth_pairs, Some(0));
+        assert_eq!(row.ln_growth_factor, Some(1.0));
+        assert_eq!(row.ln_aperture_correction, Some(1.12));
+
+        // An LN cache hit carries only the scale; a frame LN did not normalize carries nothing.
+        let mut cached = bare_measured_frame(4);
+        apply_ln_summary(&mut cached, Some(0.97), true, None, None, None);
+        let row = summary_frame_for(&cached, None);
+        assert_eq!((row.ln_scale, row.cached_ln), (Some(0.97), true));
+        assert_eq!(
+            (
+                row.ln_growth_factor,
+                row.ln_growth_pairs,
+                row.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
     }
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
@@ -29241,6 +29521,9 @@ mod tests {
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             })
             .collect();
         rc.measured.insert(group.key.clone(), entries);
@@ -29357,6 +29640,9 @@ mod tests {
                         cached_metrics: false,
                         ln_scale: None,
                         cached_ln: false,
+                        ln_growth_factor: None,
+                        ln_growth_pairs: None,
+                        ln_aperture_correction: None,
                     }
                 })
                 .collect();

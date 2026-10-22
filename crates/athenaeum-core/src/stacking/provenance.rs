@@ -132,6 +132,22 @@ pub struct SummaryFrame {
     /// `ln_scale`'s own doc.
     #[serde(default)]
     pub cached_ln: bool,
+    /// Plan B B0 (PB-2): F1's growth-curve factor for this frame (`LnFrameOutcome::growth_factor`, the mean over its
+    /// planes). `Some` only for a frame LN computed in THIS run under the growth-curve aperture; `None` for a frame LN
+    /// did not normalize, on an LN cache hit (the cached row carries only the scale), under another estimator, and in a
+    /// summary written before B0. A plain `Option` (`null` in the payload; a skipped `ts_rs` `Option` would arrive
+    /// `undefined`), `#[serde(default)]`, see `ln_scale`'s own doc.
+    #[serde(default)]
+    pub ln_growth_factor: Option<f64>,
+    /// F1's pair count for this frame (`LnFrameOutcome::growth_pairs`), the MINIMUM over its planes so a plane at
+    /// floor (ii) (`Some(0)`, the 2 x FWHM ratio kept) shows. `Some` exactly when `ln_growth_factor` is.
+    #[serde(default)]
+    pub ln_growth_pairs: Option<usize>,
+    /// The TARGET side's aperture correction `c` LN's scale call used (`LnFrameOutcome::target_aperture_correction`,
+    /// the mean over its planes, like `fwhm_px`). `Some` for a frame LN computed in this run whose planes measured a
+    /// `c`; `None` for a frame LN did not normalize, on an LN cache hit, and in a summary written before B0.
+    #[serde(default)]
+    pub ln_aperture_correction: Option<f64>,
     /// The frame's own β (Plan A Task 11b, owner decision R11b-12; mean across channels like `fwhm_px`): F-4's
     /// per-frame estimate, a diagnostic beside the group β every member was fitted at (`SummaryGroup::beta`). `None`
     /// when the frame was not measured, under `Moffat4`, and in a summary written before Task 11b. `#[serde(default)]`,
@@ -247,6 +263,12 @@ pub struct SummaryGroup {
     // `commonAperture`.
     #[serde(default)]
     pub ln_aperture: Option<crate::stacking::integrate::LnAperture>,
+    /// Plan B B0 (PB-2): the LN reference's aperture correction `c` per plane (`PreparedReferenceChannel::
+    /// aperture_correction`), the reference side of `SummaryFrame::ln_aperture_correction`. A plane at floor (i) (no
+    /// `c`; `c = 1` was applied) reads `1.0`, the applied value. `None` when LN did not run for this group and in a
+    /// summary written before B0. A plain `Option`, `#[serde(default)]`, see `SummaryFrame::ln_scale`'s own doc.
+    #[serde(default)]
+    pub ln_reference_aperture_correction: Option<Vec<f64>>,
     pub frames: Vec<SummaryFrame>,
 }
 
@@ -293,6 +315,44 @@ pub struct RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan B B0 (PB-2): the LN reference's `c` per plane rides the group row as a plain `Option` (`null` in the
+    /// payload); a summary written before B0, which has no such key, decodes with `None`, and the values survive the
+    /// round trip.
+    #[test]
+    fn summary_group_ln_reference_c_defaults_none_and_round_trips() {
+        let mut group = serde_json::json!({
+            "key": "g",
+            "frameCount": 3,
+            "includedCount": 3,
+            "masterPath": null,
+            "rejectionLowPath": null,
+            "rejectionHighPath": null,
+            "stats": null,
+            "normalizationReferenceFrameId": null,
+            "frames": [],
+        });
+        let old: SummaryGroup = serde_json::from_value(group.clone()).unwrap();
+        assert_eq!(old.ln_reference_aperture_correction, None);
+        let bare = serde_json::to_value(&old).unwrap();
+        assert_eq!(
+            bare["lnReferenceApertureCorrection"],
+            serde_json::Value::Null,
+            "null in the payload, never skipped"
+        );
+        group["lnReferenceApertureCorrection"] = serde_json::json!([1.11, 1.09, 1.14]);
+        let with_c: SummaryGroup = serde_json::from_value(group).unwrap();
+        assert_eq!(
+            with_c.ln_reference_aperture_correction,
+            Some(vec![1.11, 1.09, 1.14])
+        );
+        let back: SummaryGroup =
+            serde_json::from_value(serde_json::to_value(&with_c).unwrap()).unwrap();
+        assert_eq!(
+            back.ln_reference_aperture_correction,
+            Some(vec![1.11, 1.09, 1.14])
+        );
+    }
 
     /// Plan 6b-2 C1: a `summary_json` written before 6b-2 (`"setId": 5`, no
     /// `projectId`) still decodes, with no project.

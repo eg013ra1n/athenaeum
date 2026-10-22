@@ -215,6 +215,22 @@ pub struct ChannelMeasurement {
     /// so unflagged payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub field_width_at_floor: bool,
+    /// The plane's aperture correction `c` (F-5, Plan A Task 10; kept here by Plan B B0, PB-1 / R-B2): the median
+    /// growth-curve ratio over its isolated unsaturated stars, copied from the star-measurement module's report at the
+    /// one place the channel is built. It scales the stars' signals one to one and so enters the weights as `c^2`.
+    /// `None` at floor (i) (fewer than 5 ratios: `c = 1` was applied and one `warn!` fired) and in a payload written
+    /// before B0; then never serialized, so those payloads stay byte-identical. Not in any stage hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_correction: Option<f64>,
+    /// The standard error of [`Self::aperture_correction`] as the median of its ratios
+    /// (`1.2533 * 1.4826 * MAD / sqrt(n)`, Plan A Task 13b). `Some` exactly when `aperture_correction` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_se: Option<f64>,
+    /// The qualifying stars [`Self::aperture_correction`] is the median over (at most 64, at least 5). `Some` exactly
+    /// when `aperture_correction` is: a plane at floor (i) keeps no count, though the module still reports the few
+    /// ratios it found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_stars: Option<usize>,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -250,6 +266,46 @@ impl ChannelMeasurement {
             location: self.location as f32,
             scale: self.scale as f32,
         }
+    }
+}
+
+/// One channel's aperture corrections over a group's measured members (Plan B B0, PB-1): what the per-(group, channel)
+/// `"measure: aperture correction resolved per channel"` info reports. A pure summary, so it is testable without a run.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChannelCSummary {
+    /// The planes of this channel that carry a measured `c`.
+    pub planes: usize,
+    /// The planes of this channel at floor (i): no `c` (the "fewer than 5" `warn!` fired on each).
+    pub count: usize,
+    /// The median of the measured planes' `c` (the mean of the two middle values over an even number); `None` when
+    /// `planes` is 0.
+    pub median: Option<f64>,
+    /// The lowest and the highest measured `c`; `None` when `planes` is 0.
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// [`ChannelCSummary`] over one channel's plane in each measured member: `Some((c, se, stars))` for a plane that
+/// carries a measured `c`, `None` for a plane at floor (i). Reads the kept values; it estimates nothing.
+pub fn channel_c_summary(planes: &[Option<(f64, f64, usize)>]) -> ChannelCSummary {
+    let mut c: Vec<f64> = planes.iter().flatten().map(|&(c, _, _)| c).collect();
+    let measured = c.len();
+    let count = planes.len() - measured;
+    if c.is_empty() {
+        return ChannelCSummary {
+            planes: 0,
+            count,
+            ..ChannelCSummary::default()
+        };
+    }
+    // `median_f64` sorts in place (`total_cmp`), so the extremes are the ends.
+    let median = super::groups::median_f64(&mut c);
+    ChannelCSummary {
+        planes: measured,
+        count,
+        median: Some(median),
+        min: c.first().copied(),
+        max: c.last().copied(),
     }
 }
 
@@ -1131,6 +1187,12 @@ fn adapter_tail(
         beta_own: None,
         beta_own_at_cap: false,
         field_width_at_floor: m.field_width.at_floor(),
+        // Plan B B0 (PB-1): the module's report, kept as it is. A plane at floor (i) has `c = None` and keeps none of the
+        // three (the module still reports the few ratios it found in `aperture_stars`; they are not a count of anything
+        // `c` rests on).
+        aperture_correction: m.aperture_correction,
+        aperture_se: m.aperture_correction.and(m.aperture_se),
+        aperture_stars: m.aperture_correction.map(|_| m.aperture_stars),
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -2816,6 +2878,129 @@ pub(crate) mod tests {
         assert_eq!(c.noise_source, NoiseSource::Mrs);
     }
 
+    /// Plan B B0 (PB-1, F-11): `c`, its standard error and its star count ride the `metrics` payload under the probe's
+    /// spellings, and a payload written before B0 decodes with all three `None`.
+    #[test]
+    fn channel_c_fields_round_trip_and_an_old_payload_decodes() {
+        let c = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            aperture_correction: Some(1.17),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["apertureCorrection"], serde_json::json!(1.17));
+        assert_eq!(json["apertureSe"], serde_json::json!(0.004));
+        assert_eq!(json["apertureStars"], serde_json::json!(64));
+        let back: ChannelMeasurement = serde_json::from_value(json).unwrap();
+        assert_eq!(back, c);
+        let old: ChannelMeasurement =
+            serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
+        assert_eq!(
+            (old.aperture_correction, old.aperture_se, old.aperture_stars),
+            (None, None, None)
+        );
+    }
+
+    /// Plan B B0 (PB-1; a pin, not RED): a channel without `c` serializes to the bytes it serialized to before B0, so
+    /// every stored `metrics` payload and every cache comparison is unchanged. The literal is the pre-B0 string of
+    /// this struct, read off the code before the three fields existed.
+    #[test]
+    fn channel_without_c_serializes_as_before() {
+        let c = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            fwhm_px: 2.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        for key in ["apertureCorrection", "apertureSe", "apertureStars"] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+        assert_eq!(
+            json,
+            "{\"starsDetected\":5,\"starsFitted\":3,\"starsRefused\":0,\"refusedByReason\":{},\"starsUnsaturated\":0,\"beta\":0.0,\"fwhmPx\":2.5,\"eccentricity\":0.0,\"tflux\":0.0,\"tmeanFlux\":0.0,\"meanFluxRejected\":0,\"mStar\":0.0,\"nStar\":0.0,\"noise\":0.0,\"noiseSource\":\"mrs\",\"median\":0.0,\"mad\":0.0,\"medianMeanDev\":0.0,\"snrWeight\":0.0,\"noiseScaleLow\":0.0,\"noiseScaleHigh\":0.0,\"location\":0.0,\"scale\":0.0,\"psfSignalWeight\":0.0,\"psfSnr\":0.0}"
+        );
+    }
+
+    /// Plan B B0 (PB-1): the channel build copies the plane's reported `c`, its standard error and its qualifying-star
+    /// count; a plane at floor (i) (fewer than 5 ratios, `c = None`) keeps none of the three, though the module still
+    /// reports the ratios it did find.
+    #[test]
+    fn the_channel_copies_the_planes_c_and_a_plane_at_floor_keeps_none_of_the_three() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let p = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast);
+        assert!(
+            p.aperture_correction.is_some(),
+            "the 150-star field measures a c: {:?}",
+            p.channel
+        );
+        assert_eq!(p.channel.aperture_correction, p.aperture_correction);
+        assert_eq!(p.channel.aperture_se, p.aperture_se);
+        assert_eq!(p.channel.aperture_stars, Some(p.aperture_stars));
+        assert!(p.channel.aperture_stars.unwrap() >= 5);
+
+        // Four isolated stars: fewer than 5 ratios, so no `c`, yet the module reports how many it found.
+        let mut sparse = crate::test_support::gaussian_field(
+            w,
+            h,
+            &[
+                (100.0, 100.0, 0.2),
+                (300.0, 120.0, 0.25),
+                (500.0, 300.0, 0.2),
+                (650.0, 400.0, 0.3),
+            ],
+            1.8,
+            0.08,
+        );
+        crate::test_support::add_noise(&mut sparse, 0.002, 107);
+        let q = measure_plane_with_seeds(&sparse, w, h, &opts, None, SeedOverride::Fast);
+        assert_eq!(q.aperture_correction, None, "{:?}", q.channel);
+        assert!(
+            q.aperture_stars > 0,
+            "the module still counts the ratios it found"
+        );
+        assert_eq!(
+            (
+                q.channel.aperture_correction,
+                q.channel.aperture_se,
+                q.channel.aperture_stars
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// Plan B B0 (PB-1): the per-(group, channel) summary of the planes' `c`. `planes` counts the planes that carry a
+    /// measured `c`; `count` the planes at floor (i); the median and the extremes are over the measured planes only.
+    #[test]
+    fn group_c_summary_with_every_plane_at_floor_reports_zero_planes() {
+        let all_floor = channel_c_summary(&[None, None, None]);
+        assert_eq!((all_floor.planes, all_floor.count), (0, 3));
+        assert_eq!(
+            (all_floor.median, all_floor.min, all_floor.max),
+            (None, None, None)
+        );
+        assert_eq!(channel_c_summary(&[]), ChannelCSummary::default());
+
+        let mixed = channel_c_summary(&[
+            Some((1.10, 0.004, 64)),
+            None,
+            Some((1.30, 0.005, 60)),
+            Some((1.20, 0.006, 58)),
+            None,
+        ]);
+        assert_eq!((mixed.planes, mixed.count), (3, 2));
+        assert_eq!(mixed.median, Some(1.20));
+        assert_eq!((mixed.min, mixed.max), (Some(1.10), Some(1.30)));
+
+        let even = channel_c_summary(&[Some((1.0, 0.0, 5)), Some((1.5, 0.0, 5))]);
+        assert_eq!((even.planes, even.count), (2, 0));
+        assert_eq!(even.median, Some(1.25));
+    }
+
     /// Plan A Task 4 (F-0): the channel accounts for every seed it detected,
     /// its per-reason counts sum to `stars_refused`, the two keys reach the
     /// `metrics` payload, and a payload written before the task decodes with
@@ -2966,11 +3151,18 @@ pub(crate) mod tests {
         // attribution.txt) was from fwhm_px 4.121806182224867, eccentricity 0.09524602087103608, tflux
         // 569.0781285580445, tmean_flux 11.823163448679521, psf_signal_weight 0.0014687684228686841, psf_snr
         // 0.0021537136857493117.
+        // Plan B B0 (PB-1): the three kept `c` fields. `c` and its standard error are fit-derived, so they are pinned
+        // to a few ulp and taken out of the Debug string like the other aggregates; the star count is exact.
+        let c = m.aperture_correction.take().expect("the fixture measures a c");
+        assert_ulp_close(c, 1.114_389_798_286_524_7, "aperture_correction");
+        let se = m.aperture_se.take().expect("c carries its standard error");
+        assert_ulp_close(se, 0.004_260_518_989_208_477, "aperture_se");
+        assert_eq!(m.aperture_stars.take(), Some(64), "aperture_stars");
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3067,11 +3259,18 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             assert_ulp_close(*got, want, what);
             *got = want;
         }
+        // Plan B B0 (PB-1): the three kept `c` fields. `c` and its standard error are fit-derived, so they are pinned
+        // to a few ulp and taken out of the Debug string like the other aggregates; the star count is exact.
+        let c = m.aperture_correction.take().expect("the fixture measures a c");
+        assert_ulp_close(c, 1.113_576_222_145_095_6, "aperture_correction");
+        let se = m.aperture_se.take().expect("c carries its standard error");
+        assert_ulp_close(se, 0.004_317_218_926_747_388, "aperture_se");
+        assert_eq!(m.aperture_stars.take(), Some(64), "aperture_stars");
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
