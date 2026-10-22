@@ -1161,10 +1161,7 @@ pub(crate) fn detect_with(
             sub,
         )
     };
-    match pool {
-        Some(p) => p.install(run),
-        None => run(),
-    }
+    super::install_in_span(pool, run)
 }
 
 #[allow(clippy::too_many_arguments)]

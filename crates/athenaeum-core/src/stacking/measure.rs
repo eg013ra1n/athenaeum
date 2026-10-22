@@ -219,7 +219,10 @@ pub struct ChannelMeasurement {
     /// growth-curve ratio over its isolated unsaturated stars, copied from the star-measurement module's report at the
     /// one place the channel is built. It scales the stars' signals one to one and so enters the weights as `c^2`.
     /// `None` at floor (i) (fewer than 5 ratios: `c = 1` was applied and one `warn!` fired) and in a payload written
-    /// before B0; then never serialized, so those payloads stay byte-identical. Not in any stage hash.
+    /// before B0; then never serialized, so those payloads stay byte-identical. A plane with no fit at all
+    /// (`stars_fitted == 0`) is `None` too but is NOT floor (i): the fewer-than-5-ratios `warn!` did not fire (the
+    /// module's separate "no fits on the plane" one did), and the summary leaves it out of the per-channel count
+    /// (R-PB0-4). Not in any stage hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction: Option<f64>,
     /// The standard error of [`Self::aperture_correction`] as the median of its ratios
@@ -1016,10 +1019,9 @@ fn adapter_head(
                 // parallel call left in this function, routed like its
                 // three siblings (`background_residual`, `noise_mrs`,
                 // `fit_stars`) above/below.
-                SeedPrefilter::Median3 => Some(match pool {
-                    Some(p) => p.install(|| prefilter::median3(scaled_ref, w, h)),
-                    None => prefilter::median3(scaled_ref, w, h),
-                }),
+                SeedPrefilter::Median3 => Some(sm::install_in_span(pool, || {
+                    prefilter::median3(scaled_ref, w, h)
+                })),
             };
             let detect_data: &[f32] = detect_on.as_deref().unwrap_or(scaled_ref);
             // Noise-relative levels, not the detector's default rank budget:
@@ -1125,10 +1127,9 @@ fn adapter_head(
                 upper_limit: opts.structure.upper_limit * ADU_SCALE,
                 ..opts.structure
             };
-            let mut seeds = match pool {
-                Some(pl) => pl.install(|| structure::detect_structures(scaled_ref, w, h, &p)),
-                None => structure::detect_structures(scaled_ref, w, h, &p),
-            };
+            let mut seeds = sm::install_in_span(pool, || {
+                structure::detect_structures(scaled_ref, w, h, &p)
+            });
             // Brightest first already, so the cap keeps the brightest.
             seeds.truncate(opts.max_stars.max(8));
             seeds
@@ -3677,6 +3678,51 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             frame.channels[0].timings.fit_ms,
             "{measured}"
         );
+    }
+
+    /// Plan B B0 (ruling R-PB0-13): the current tracing span is thread-local, and a pass-2 plane's fit runs on an
+    /// image-pool thread (`pool.install` from a caller that is not a pool worker), so before `install_in_span` its
+    /// `star_measure` events (`"ring sky measured"`, `"aperture correction measured"`) were recorded under no span.
+    /// Pass 2 of a synthetic field on a 2-thread pool: both events name their frame and plane. The capture is a
+    /// thread-local default, so the pool's threads install the same dispatcher when they start (a server has one
+    /// global subscriber and needs no such step).
+    #[test]
+    fn star_measure_events_keep_their_frame_and_plane_span_across_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = moffat_member(3.0, 11);
+        let path = write(dir.path(), "pool_span.fits", &[plane.as_slice()], 480, 400);
+        let opts = MeasureOptions::default();
+        let cancel = AtomicBool::new(false);
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .start_handler(move |_| {
+                        // The guard is leaked on purpose: the pool thread keeps the capture until it exits.
+                        std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            let pass1 = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let beta = pass1.beta_own()[0];
+            measure_frame_pass2(&path, pass1, &[beta], &opts, Some(&pool), &cancel).unwrap();
+        });
+        for msg in ["ring sky measured", "aperture correction measured"] {
+            let lines: Vec<&str> = logs.lines().filter(|l| l.contains(msg)).collect();
+            assert!(!lines.is_empty(), "no {msg:?} line in:\n{logs}");
+            for l in lines {
+                assert!(
+                    l.contains("measure_frame_pass2{path="),
+                    "{msg:?} lost its frame span: {l}"
+                );
+                assert!(
+                    l.contains("measure_plane{plane=0}"),
+                    "{msg:?} lost its plane span: {l}"
+                );
+            }
+        }
     }
 
     /// Plan A Task 13b (13-P): each plane logs its sub-step profile at debug, `"frame plane substeps"` (the plane-wide

@@ -45,6 +45,26 @@ pub use population::{Population, PopulationReport};
 pub use seeds::{DetectionReport, FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 pub use substeps::{Step, SubSteps};
 
+/// Run `f` on `pool` (or inline when there is none) with the CALLER's current tracing span entered on whichever thread
+/// runs it. `ThreadPool::install` runs `f` on a pool thread when the caller is not a worker of that pool, and tracing's
+/// current span is thread-local, so a bare `install` records every event inside `f` under no span (Plan B B0, ruling
+/// R-PB0-13: the Measure stage's `"ring sky measured"` and `"aperture correction measured"` carried neither their frame
+/// nor their plane). `Span::current()` is `Span::none()` when no span is enabled (an info filter), and `in_scope` of it
+/// is then a no-op. The span covers `f`'s own thread only: an event emitted from a `par_iter` leaf inside `f` runs on
+/// another worker and stays unspanned (none is emitted from a leaf today). Nothing numeric moves.
+pub(crate) fn install_in_span<R: Send>(
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    match pool {
+        Some(p) => {
+            let span = tracing::Span::current();
+            p.install(move || span.in_scope(f))
+        }
+        None => f(),
+    }
+}
+
 /// The spatial correlation of a plane's pixel noise (Task 10b A1c, ruling C-10): a fact of the pixels' provenance, so
 /// the caller states it. Sensor pixels (raw or calibrated, Plan C's CFA super-pixel plane) carry white noise: every
 /// lag-≠0 covariance is 0 and the detection noise's gain is 1 by derivation, nothing read from the plane. A debayered,
@@ -835,10 +855,7 @@ pub fn plane_beta(
             None,
         )
     };
-    let sample = match pool {
-        Some(p) => p.install(call),
-        None => call(),
-    };
+    let sample = install_in_span(pool, call);
     (sample.beta, sample.source)
 }
 
@@ -1071,10 +1088,7 @@ fn prepare_head(
             let _s = sub.span(Step::Mesh);
             domain::background_mesh(working, w, h, mask, want_noise)
         };
-        match pool {
-            Some(p) => p.install(build),
-            None => build(),
-        }
+        install_in_span(pool, build)
     });
     let mesh_ms = t.elapsed().as_millis() as u64;
     let (noise, mut timings) = match opts.noise {
@@ -1099,10 +1113,7 @@ fn prepare_head(
             let _s = sub.span(Step::SatPlane);
             saturation_plane(working, mask, &noise, &sky, &opts.domain, opts.colour)
         };
-        match pool {
-            Some(p) => p.install(build),
-            None => build(),
-        }
+        install_in_span(pool, build)
     };
     // A width the caller's detector measured (Task 6b, Task 6a review M3) stands in for the module's own, which is
     // then not computed for given seeds; one that is not a positive number is refused loudly and the module's own is
@@ -1253,10 +1264,7 @@ fn prepare_passes(
         )
     };
     // Already inside this `install`: the pass's own pool param gets `None` (perf tier 1 Task 2).
-    let (fit_field, mut passes) = match pool {
-        Some(p) => p.install(pass_call),
-        None => pass_call(),
-    };
+    let (fit_field, mut passes) = install_in_span(pool, pass_call);
     // The plane's near-clip floor (Task 10c, R10c-10) comes from the plane's own verdicts, so clause 3 is re-read here,
     // before the cross-plane rule; level and fit are untouched.
     let mut saturation = saturation;
@@ -1371,13 +1379,10 @@ fn finish_working(
             &extended,
         )
     };
-    let mut outcome = match pool {
-        // Already inside this `install` — `fit_stars`'s own pool param gets
-        // `None` so it does not nest a second, pointless `install` inside
-        // this one (perf tier 1 Task 2).
-        Some(p) => p.install(fit_call),
-        None => fit_call(),
-    };
+    // Already inside this `install` — `fit_stars`'s own pool param gets
+    // `None` so it does not nest a second, pointless `install` inside
+    // this one (perf tier 1 Task 2).
+    let mut outcome = install_in_span(pool, fit_call);
     timings.fit_ms = (verdict_time + t.elapsed()).as_millis() as u64;
     let mut refused = std::mem::take(&mut outcome.refused);
     refused.not_selected = seeds.len() - fit_seeds.len();
@@ -1584,10 +1589,7 @@ fn measure_budget(
             &extended,
         )
     };
-    let mut outcome = match pool {
-        Some(p) => p.install(fit_call),
-        None => fit_call(),
-    };
+    let mut outcome = install_in_span(pool, fit_call);
     // The candidate selection's wall is part of `fit_ms` (M-5), so the timings sum covers it.
     timings.fit_ms = (select_time + verdict_time + t.elapsed()).as_millis() as u64;
     // R12-4: the trim over the accepted fits, each in its SEED's cell.

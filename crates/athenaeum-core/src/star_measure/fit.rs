@@ -1466,10 +1466,7 @@ pub(super) fn seed_passes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// The frame β sample's pixel-integrated fits on the measure path (F-4 as revised by the owner's ruling E5,
@@ -1501,10 +1498,7 @@ pub(super) fn sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Q7 under E5 (a caller that ran no verdict, [`super::beta::frame_beta`]): for each of `seeds` (the caller's
@@ -1533,10 +1527,7 @@ pub(super) fn own_sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// [`integrated_beta`] on the region `scratch.px` holds (gathered for `reg`), in stamp coordinates from `reg`'s rim
@@ -1799,10 +1790,7 @@ fn fit_all_outcomes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Fit every seed with the chosen model. `Auto` resolves the continuous frame β from its own sample — the bounded
@@ -2427,7 +2415,7 @@ fn snr_and_hfr(
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
-    let mut body = || {
+    let body = || {
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
@@ -2444,10 +2432,7 @@ fn snr_and_hfr(
             f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
         })
     };
-    match pool {
-        Some(p) => p.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body);
 }
 
 /// LN's pair-common ring arm (Task 10b, ruling B3) without a second fit: every fit of `outcome` (a fit call's result

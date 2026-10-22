@@ -658,7 +658,9 @@ impl<'a> LnReferenceForDetection<'a> {
         }
         let prepared = sanitized_planes
             .iter()
-            .map(|plane| {
+            .enumerate()
+            .map(|(p, plane)| {
+                let _plane_span = tracing::debug_span!("ln_reference_plane", plane = p).entered();
                 scale::PreparedReferenceChannel::build(
                     plane,
                     reference.width,
@@ -695,7 +697,8 @@ impl<'a> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
         let mut prepared = Vec::with_capacity(reference.planes.len());
-        for plane in &reference.planes {
+        for (p, plane) in reference.planes.iter().enumerate() {
+            let _plane_span = tracing::debug_span!("ln_reference_plane", plane = p).entered();
             let finite: Vec<bool> = plane.iter().map(|v| v.is_finite()).collect();
             let sanitized: Cow<'a, [f32]> = if finite.iter().all(|&f| f) {
                 Cow::Borrowed(plane.as_slice())
@@ -2027,6 +2030,59 @@ mod tests {
                 l.contains("ln_seeds_calibration") && l.contains("ln_plane{frame_id=7 plane=0}"),
                 "{l}"
             );
+        }
+    }
+
+    /// Plan B B0 (ruling R-PB0-13): the LN reference build's own star events name their plane
+    /// (`ln_reference_plane{plane}`), on the image pool as well (`install_in_span` carries the span across the hop).
+    /// The capture is a thread-local default, so the pool's threads install the same dispatcher when they start.
+    #[test]
+    fn the_reference_build_events_carry_their_plane_across_the_pool() {
+        use crate::stacking::test_fixtures::synthetic_star_field;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![synthetic_star_field(W, H, &stars, 4.2, 0.002, 11)],
+            frames_used: Vec::new(),
+        };
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .start_handler(move |_| {
+                        // The guard is leaked on purpose: the pool thread keeps the capture until it exits.
+                        std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            let _ = LnReferenceForDetection::build(
+                &reference,
+                PsfModel::Moffat4,
+                200,
+                Some(&pool),
+                None,
+            );
+        });
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("aperture correction measured"))
+            .collect();
+        assert!(!lines.is_empty(), "no reference c event in:\n{logs}");
+        for l in lines {
+            assert!(l.contains("ln_reference_plane{plane=0}"), "{l}");
         }
     }
 

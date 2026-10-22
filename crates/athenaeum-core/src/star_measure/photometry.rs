@@ -850,7 +850,7 @@ pub(crate) fn ring_skies(
         return (None, kept.len());
     };
     let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring);
-    let mut body = || {
+    let body = || {
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(sub, super::Step::RingSky);
             if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
@@ -860,10 +860,7 @@ pub(crate) fn ring_skies(
             }
         })
     };
-    match pool {
-        Some(p) => p.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body);
     let missing = kept.iter().filter(|(_, f)| f.sky_ring_n == 0).count();
     tracing::debug!(
         count = kept.len(),

@@ -12744,22 +12744,30 @@ fn run_group_normalization(
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
     };
-    let reference_for_detection = if grid_mode {
-        LnReferenceForDetection::build_masked(
-            &ln_reference,
-            reference_psf,
-            measure_opts.max_stars,
-            Some(&rc.ctx.image_pool),
-            Some(ref_frames_saturation),
-        )
-    } else {
-        LnReferenceForDetection::build(
-            &ln_reference,
-            reference_psf,
-            measure_opts.max_stars,
-            Some(&rc.ctx.image_pool),
-            Some(ref_frames_saturation),
-        )
+
+    // Plan B B0 (ruling R-PB0-13): the reference's own detection and fit run under `ln_reference{group_key}` (and, per
+    // plane, `ln_reference_plane{plane}`), so their `star_measure` events name the group and plane instead of
+    // landing spanless between the Measure stage's lines and the first `ln_plane`.
+    let reference_for_detection = {
+        let _reference_span =
+            tracing::debug_span!("ln_reference", group_key = %group.key).entered();
+        if grid_mode {
+            LnReferenceForDetection::build_masked(
+                &ln_reference,
+                reference_psf,
+                measure_opts.max_stars,
+                Some(&rc.ctx.image_pool),
+                Some(ref_frames_saturation),
+            )
+        } else {
+            LnReferenceForDetection::build(
+                &ln_reference,
+                reference_psf,
+                measure_opts.max_stars,
+                Some(&rc.ctx.image_pool),
+                Some(ref_frames_saturation),
+            )
+        }
     };
 
     // Perf tier C Task 2 (spec §2.2.3): resolve each member's per-plane
