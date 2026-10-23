@@ -16804,6 +16804,137 @@ mod tests {
             .collect()
     }
 
+    /// Plan B B4 floor (i) (R-PB4-5), the run wiring: a plane stored at the fit-call floor (a fit, no `c`) takes its
+    /// group channel's median kept `c` in `measure_group_finish`, on the cached path, BEFORE `compute_weights` -
+    /// `tflux` scales by it, `psf_signal_weight` by its square, and the frame's weight reads the scaled value. The
+    /// stored `metrics` artifact keeps the module's values. (The pure rule is pinned by `substitute_group_c`'s tests.)
+    #[test]
+    fn measure_folds_a_floored_member_to_the_group_channel_median_c_before_the_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let run = || {
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Measure).unwrap();
+            rc
+        };
+        let rc1 = run();
+        drop(rc1);
+        let rows = metrics_by_frame(&fixture.conn, fixture.set_id);
+        let mut ids: Vec<i64> = rows.keys().copied().collect();
+        ids.sort_unstable();
+        let floored_id = ids[0];
+        // This fixture's Gaussian stars measure no `c`, so the stored rows are set by hand: three peers carry a `c`
+        // (the cached path reads the payload as is), the first member is at floor (i): a fit ran, no `c`.
+        let peer_c = [1.10, 1.30, 1.20];
+        let median = 1.20;
+        let store = |frame_id: i64, c: Option<f64>| {
+            let (hash, mut m, _) = rows[&frame_id].clone();
+            assert!(m.channels[0].stars_fitted > 0);
+            m.channels[0].aperture_correction = c;
+            let payload = serde_json::to_string(&m).unwrap();
+            upsert_artifact(
+                &fixture.conn,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some(&payload),
+                },
+            )
+            .unwrap();
+            m
+        };
+        let stored = store(floored_id, None);
+        for (id, c) in ids[1..].iter().zip(peer_c) {
+            store(*id, Some(c));
+        }
+
+        let rc2 = run();
+        let entries = &rc2.measured[&group_key];
+        let floored = entries
+            .iter()
+            .find(|e| e.frame.frame_id == floored_id)
+            .and_then(|e| e.measurement.as_ref())
+            .expect("the floored member is measured");
+        let ch = &floored.channels[0];
+        assert!(entries.iter().all(|e| e.cached_metrics), "the cached path");
+        assert_eq!(ch.aperture_correction, None);
+        assert_eq!(ch.aperture_correction_group, Some(median));
+        assert!((ch.tflux - stored.channels[0].tflux * median).abs() <= 1e-9 * ch.tflux.abs());
+        assert!(
+            (ch.psf_signal_weight - stored.channels[0].psf_signal_weight * median * median).abs()
+                <= 1e-9 * ch.psf_signal_weight.abs()
+        );
+        for e in entries.iter().filter(|e| e.frame.frame_id != floored_id) {
+            let c = &e.measurement.as_ref().unwrap().channels[0];
+            assert_eq!(
+                c.aperture_correction_group, None,
+                "a measured plane is not substituted"
+            );
+        }
+        // `compute_weights` read the stand-in: the weight is the scaled value, not the stored one.
+        let w = entries
+            .iter()
+            .find(|e| e.frame.frame_id == floored_id)
+            .and_then(|e| e.weight.as_ref())
+            .expect("a weight");
+        assert!(
+            (w.channels[0] - ch.psf_signal_weight).abs() <= 1e-9 * ch.psf_signal_weight.abs(),
+            "{:?}",
+            w.channels
+        );
+        // The artifact keeps the module's values.
+        let after = metrics_by_frame(&fixture.conn, fixture.set_id);
+        assert_eq!(
+            after[&floored_id].1.channels[0].aperture_correction_group,
+            None
+        );
+        assert_eq!(
+            after[&floored_id].1.channels[0].tflux,
+            stored.channels[0].tflux
+        );
+    }
+
     /// Plan A Task 11b (owner decision R11b-12): the cache follows the group β. An unchanged group β is a cache hit
     /// (no row rewritten); a group β that moves — here two members' stored own βs set below every other's, so the
     /// lower median of four moves (one member's cannot: this fixture's Gaussian stars read one own β on every frame)

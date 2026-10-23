@@ -237,7 +237,7 @@ pub struct ChannelMeasurement {
     /// Plan B B4 (R-PB4-5): the group channel's median kept `c` a plane at floor (i) took as its stand-in, set by the
     /// group fold ([`ChannelMeasurement::take_group_c`]) after the plane was measured and persisted: `tflux`,
     /// `tmean_flux` carry it once, `psf_signal_weight`, `psf_snr` twice. `aperture_correction` itself stays `None`
-    /// (the module's measurement as kept). In memory only: never in a `metrics` payload (the fold re-derives it every
+    /// (the module's measurement as kept). In memory only: never in the `metrics` artifact (the fold re-derives it every
     /// run), so `None` and never serialized wherever the fold did not substitute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction_group: Option<f64>,
@@ -471,7 +471,7 @@ pub struct PlaneMeasurement {
     /// `apertureSe`). Reported, not persisted.
     pub aperture_se: Option<f64>,
     /// The `c` candidates the point-source screen refused (Plan B B4, PB-12': no seed of another plane within
-    /// 1.5 px of their fitted centre; the probe's `pointSourceScreened`); 0 on a single plane. Copied from the module's
+    /// `max(1.5, 0.5 F)` px of their fitted centre (F the field FWHM, R-PB4-2); the probe's `pointSourceScreened`); 0 on a single plane. Copied from the module's
     /// report here, at the one place the reported plane is built. Reported, not persisted.
     pub point_source_screened: usize,
     /// The `c` candidates under SNR 20 (or with none), after the point-source screen (PB-13'; the probe's

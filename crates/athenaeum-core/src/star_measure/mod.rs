@@ -449,7 +449,7 @@ pub struct PlaneMeasurement {
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
     /// The `c` candidates the point-source screen refused (Plan B B4, PB-12'): no seed of another plane within
-    /// [`photometry::POINT_SOURCE_MATCH_PX`] of their fitted centre. 0 on a single plane and wherever no screen runs.
+    /// `max(`[`photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of their fitted centre (R-PB4-2). 0 on a single plane and wherever no screen runs.
     /// Reported, not persisted.
     pub point_source_screened: usize,
     /// The `c` candidates under [`photometry::CORRECTION_MIN_SNR`] (or with no SNR; PB-13'), after the point-source

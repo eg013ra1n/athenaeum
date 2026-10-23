@@ -1854,7 +1854,7 @@ pub(super) struct Correction<'a> {
     /// fits alone and `c` is the median of the 64 brightest qualifying fits of (a). `None` = every fit counts, as before.
     pub(super) population: Option<super::population::PopulationView<'a>>,
     /// Every OTHER plane's seeds on an image of more than one plane (Plan B B4, PB-12'): a `c` candidate with none of
-    /// them within [`super::photometry::POINT_SOURCE_MATCH_PX`] of its fitted centre is screened out. `None` = no screen
+    /// them within `max(`[`super::photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of its fitted centre (R-PB4-2) is screened out. `None` = no screen
     /// (one plane, LN's refits, every caller but the stacking halves).
     pub(super) siblings: Option<&'a [Seed]>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
