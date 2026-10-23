@@ -412,6 +412,107 @@ pub fn get_light_frame_parameters(
     })
 }
 
+/// Refuse a manual pick whose set does not fit every frame's SIZE (owner
+/// ruling 2026-10-20: frame size is not a parameter the user can relax; plan
+/// ruling R11). Checked for every frame before anything is written. Another
+/// recorded sub-frame origin at the same size is the user's call (G-7, "auto
+/// no, manual yes"): accepted, with one warning.
+fn refuse_unfit_assignment(
+    conn: &rusqlite::Connection,
+    frame_ids: &[i64],
+    calibration_set_id: i64,
+    calibration_type: &str,
+) -> Result<(), ApiError> {
+    use crate::calibration::geometry::{fit, geometry_for_frame, geometry_for_set, Fit, Refusal};
+    let set = geometry_for_set(conn, calibration_set_id)?;
+    let mut refused = Vec::new();
+    let mut other_origin = Vec::new();
+    for &frame_id in frame_ids {
+        let frame = geometry_for_frame(conn, frame_id)?;
+        match fit(&frame, &set) {
+            Fit::Refused(Refusal::Origin) => other_origin.push(frame),
+            Fit::Refused(_) => refused.push(frame),
+            Fit::Fits | Fit::Unknown => {}
+        }
+    }
+    let Some(first) = refused.first() else {
+        if let Some(first) = other_origin.first() {
+            tracing::warn!(
+                set_id = calibration_set_id,
+                count = other_origin.len(),
+                calibration_type,
+                source_geometry = %first.label(),
+                set_geometry = %set.label(),
+                "manual calibration accepted at another sub-frame origin"
+            );
+        }
+        return Ok(());
+    };
+    tracing::warn!(
+        set_id = calibration_set_id,
+        count = refused.len(),
+        calibration_type,
+        source_geometry = %first.label(),
+        set_geometry = %set.label(),
+        "manual calibration refused: the set does not fit the frame size"
+    );
+    Err(ApiError::Invalid(format!(
+        "{calibration_type} set #{calibration_set_id} is {}, but {} of the {} frames {} {} — a calibration set must match the frame size",
+        set.label(),
+        refused.len(),
+        frame_ids.len(),
+        if refused.len() == 1 { "is" } else { "are" },
+        first.label()
+    )))
+}
+
+/// [`refuse_unfit_assignment`] for a calibration set's own sub-calibration.
+fn refuse_unfit_subcalibration(
+    conn: &rusqlite::Connection,
+    source_set_id: i64,
+    calibration_set_id: i64,
+    calibration_type: &str,
+) -> Result<(), ApiError> {
+    use crate::calibration::geometry::{fit, geometry_for_set, Fit, Refusal};
+    let source = geometry_for_set(conn, source_set_id)?;
+    let set = geometry_for_set(conn, calibration_set_id)?;
+    match fit(&source, &set) {
+        Fit::Fits | Fit::Unknown => return Ok(()),
+        Fit::Refused(Refusal::Origin) => {
+            // G-7: the user's call — accepted, with one warning.
+            tracing::warn!(
+                source_set_id,
+                set_id = calibration_set_id,
+                calibration_type,
+                source_geometry = %source.label(),
+                set_geometry = %set.label(),
+                "manual sub-calibration accepted at another sub-frame origin"
+            );
+            return Ok(());
+        }
+        Fit::Refused(_) => {}
+    }
+    let source_imagetyp: String = conn.query_row(
+        "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+        [source_set_id],
+        |r| r.get(0),
+    )?;
+    tracing::warn!(
+        source_set_id,
+        set_id = calibration_set_id,
+        calibration_type,
+        source_geometry = %source.label(),
+        set_geometry = %set.label(),
+        "manual sub-calibration refused: the set does not fit the frame size"
+    );
+    Err(ApiError::Invalid(format!(
+        "{calibration_type} set #{calibration_set_id} is {}, but {} set #{source_set_id} is {} — a calibration set must match the frame size",
+        set.label(),
+        source_imagetyp.to_lowercase(),
+        source.label()
+    )))
+}
+
 /// Get calibration sets with match scores for manual selection.
 ///
 /// Routes through the same `find_calibration_candidates` engine that auto-link
@@ -536,6 +637,7 @@ pub fn get_calibration_sets_for_manual_selection(
 }
 
 /// Manually assign a calibration set to light frames.
+/// Refuses a set of another frame size (owner ruling 2026-10-20); a set of the same size at another recorded sub-frame origin is accepted with a warning (G-7).
 pub fn manual_assign_calibration(
     ctx: &ServiceContext,
     frame_ids: Vec<i64>,
@@ -559,6 +661,8 @@ pub fn manual_assign_calibration(
             calibration_type
         )));
     }
+
+    refuse_unfit_assignment(&conn, &frame_ids, calibration_set_id, &calibration_type)?;
 
     let mut assigned_count = 0;
 
@@ -1072,6 +1176,7 @@ pub fn get_subcalibration_sets_for_manual_selection(
 }
 
 /// Manually assign a sub-calibration set to a calibration set.
+/// Refuses a set of another frame size (owner ruling 2026-10-20); a set of the same size at another recorded sub-frame origin is accepted with a warning (G-7).
 pub fn manual_assign_subcalibration(
     ctx: &ServiceContext,
     source_set_id: i64,
@@ -1091,6 +1196,8 @@ pub fn manual_assign_subcalibration(
             calibration_type
         )));
     }
+
+    refuse_unfit_subcalibration(&conn, source_set_id, calibration_set_id, &calibration_type)?;
 
     // Create the calibration link with source_type = 'calibration_set'
     let link = CalibrationLink {
@@ -1885,5 +1992,151 @@ mod tests {
             with_warning.iter().any(|l| l.contains("|Dark|")),
             "auto-link picked the matching master dark: {with_warning:?}"
         );
+    }
+
+    // ── Geometry (owner ruling 2026-10-20, plan ruling R11) ─────────────
+    use crate::calibration::geometry::test_support as geo;
+
+    fn geo_ctx() -> (tempfile::TempDir, ServiceContext) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        (tmp, ctx)
+    }
+
+    fn link_count(ctx: &ServiceContext) -> i64 {
+        db(ctx)
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM calibration_set_to_frames", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn manual_assign_refuses_a_set_of_another_size() {
+        let (_tmp, ctx) = geo_ctx();
+        let (a, b, set) = {
+            let conn = db(&ctx).unwrap().conn();
+            let a = geo::seed_frame(&conn, "a", "Light", Some((9576, 6388)), None);
+            let b = geo::seed_frame(&conn, "b", "Light", Some((9576, 6388)), None);
+            let set = geo::seed_set(&conn, "MasterDark");
+            let m = geo::seed_frame(
+                &conn,
+                "m",
+                "MasterDark",
+                Some((6384, 4258)),
+                Some((1584, 1064)),
+            );
+            geo::add_members(&conn, set, &[m]);
+            (a, b, set)
+        };
+        let err = manual_assign_calibration(&ctx, vec![a, b], set, "Dark".to_string()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Dark set #{set} is 6384×4258 @ 1584,1064, but 2 of the 2 frames are 9576×6388 — a calibration set must match the frame size")
+        );
+        assert_eq!(link_count(&ctx), 0, "nothing is written");
+    }
+
+    /// Review Focus 3.
+    #[test]
+    fn manual_assign_refuses_when_one_frame_misfits_and_writes_nothing() {
+        let (_tmp, ctx) = geo_ctx();
+        let (a, b, set) = {
+            let conn = db(&ctx).unwrap().conn();
+            let a = geo::seed_frame(&conn, "a", "Light", Some((9576, 6388)), None);
+            let b = geo::seed_frame(&conn, "b", "Light", Some((6384, 4258)), None);
+            let set = geo::seed_set(&conn, "Flat");
+            let m = geo::seed_frame(&conn, "m", "Flat", Some((9576, 6388)), None);
+            geo::add_members(&conn, set, &[m]);
+            (a, b, set)
+        };
+        let err = manual_assign_calibration(&ctx, vec![a, b], set, "Flat".to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("1 of the 2 frames is 6384×4258"),
+            "{err}"
+        );
+        assert_eq!(link_count(&ctx), 0);
+        assert_eq!(
+            manual_assign_calibration(&ctx, vec![a], set, "Flat".to_string()).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn manual_subcalibration_refuses_a_set_of_another_size() {
+        let (_tmp, ctx) = geo_ctx();
+        let (flat, roi_dark, full_dark) = {
+            let conn = db(&ctx).unwrap().conn();
+            let flat = geo::seed_set(&conn, "Flat");
+            let f = geo::seed_frame(&conn, "f", "Flat", Some((9576, 6388)), None);
+            geo::add_members(&conn, flat, &[f]);
+            let roi_dark = geo::seed_set(&conn, "Dark");
+            let d1 = geo::seed_frame(&conn, "d1", "Dark", Some((6384, 4258)), None);
+            geo::add_members(&conn, roi_dark, &[d1]);
+            let full_dark = geo::seed_set(&conn, "Dark");
+            let d2 = geo::seed_frame(&conn, "d2", "Dark", Some((9576, 6388)), None);
+            geo::add_members(&conn, full_dark, &[d2]);
+            (flat, roi_dark, full_dark)
+        };
+        let err =
+            manual_assign_subcalibration(&ctx, flat, roi_dark, "Dark".to_string()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Dark set #{roi_dark} is 6384×4258, but flat set #{flat} is 9576×6388 — a calibration set must match the frame size")
+        );
+        assert_eq!(link_count(&ctx), 0);
+        manual_assign_subcalibration(&ctx, flat, full_dark, "Dark".to_string()).unwrap();
+        assert_eq!(link_count(&ctx), 1);
+    }
+
+    /// G-7 (owner 2026-10-20, "auto no, manual yes"): the same size at another
+    /// recorded origin — a manual assignment is accepted, logged once.
+    #[test]
+    fn manual_assign_accepts_another_origin_with_a_warning() {
+        let (_tmp, ctx) = geo_ctx();
+        let (a, set) = {
+            let conn = db(&ctx).unwrap().conn();
+            let a = geo::seed_frame(&conn, "a", "Light", Some((6384, 4258)), Some((1584, 1064)));
+            let set = geo::seed_set(&conn, "MasterDark");
+            let m = geo::seed_frame(&conn, "m", "MasterDark", Some((6384, 4258)), Some((0, 0)));
+            geo::add_members(&conn, set, &[m]);
+            (a, set)
+        };
+        let (assigned, warns) = geo::count_warns(
+            "manual calibration accepted at another sub-frame origin",
+            || manual_assign_calibration(&ctx, vec![a], set, "Dark".to_string()),
+        );
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 1);
+        let manual: i64 = db(&ctx).unwrap().conn().query_row(
+            "SELECT is_manual_override FROM calibration_set_to_frames WHERE source_id = ?1 AND calibration_set_id = ?2",
+            rusqlite::params![a, set],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(manual, 1);
+    }
+
+    #[test]
+    fn manual_subcalibration_accepts_another_origin_with_a_warning() {
+        let (_tmp, ctx) = geo_ctx();
+        let (flat, dark) = {
+            let conn = db(&ctx).unwrap().conn();
+            let flat = geo::seed_set(&conn, "Flat");
+            let f = geo::seed_frame(&conn, "f", "Flat", Some((6384, 4258)), Some((1584, 1064)));
+            geo::add_members(&conn, flat, &[f]);
+            let dark = geo::seed_set(&conn, "Dark");
+            let d = geo::seed_frame(&conn, "d", "Dark", Some((6384, 4258)), Some((0, 0)));
+            geo::add_members(&conn, dark, &[d]);
+            (flat, dark)
+        };
+        let (done, warns) = geo::count_warns(
+            "manual sub-calibration accepted at another sub-frame origin",
+            || manual_assign_subcalibration(&ctx, flat, dark, "Dark".to_string()),
+        );
+        done.unwrap();
+        assert_eq!(warns, 1);
+        assert_eq!(link_count(&ctx), 1);
     }
 }
