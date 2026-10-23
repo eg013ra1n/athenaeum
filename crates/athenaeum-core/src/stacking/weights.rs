@@ -865,6 +865,7 @@ mod tests {
                     aperture_correction: None,
                     aperture_se: None,
                     aperture_stars: None,
+                    aperture_correction_group: None,
                     fwhm_px: fwhm,
                     eccentricity: ecc,
                     tflux: 1.0,

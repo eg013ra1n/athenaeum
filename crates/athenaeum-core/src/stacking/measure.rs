@@ -234,6 +234,13 @@ pub struct ChannelMeasurement {
     /// ratios it found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_stars: Option<usize>,
+    /// Plan B B4 (R-PB4-5): the group channel's median kept `c` a plane at floor (i) took as its stand-in, set by the
+    /// group fold ([`ChannelMeasurement::take_group_c`]) after the plane was measured and persisted: `tflux`,
+    /// `tmean_flux` carry it once, `psf_signal_weight`, `psf_snr` twice. `aperture_correction` itself stays `None`
+    /// (the module's measurement as kept). In memory only: never in a `metrics` payload (the fold re-derives it every
+    /// run), so `None` and never serialized wherever the fold did not substitute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_correction_group: Option<f64>,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -270,6 +277,44 @@ impl ChannelMeasurement {
             scale: self.scale as f32,
         }
     }
+}
+
+impl ChannelMeasurement {
+    /// A plane at floor (i) (R-PB0-4): no `c` although the fitter ran (`stars_fitted > 0`), so the module's "fewer than
+    /// 5" warn fired on it. A plane with no fit at all is not.
+    pub fn at_floor(&self) -> bool {
+        self.aperture_correction.is_none() && self.stars_fitted > 0
+    }
+
+    /// Plan B B4 (R-PB4-5): take the group channel's median kept `c` `m` as this plane's stand-in. `tflux` and
+    /// `tmean_flux` scale by `m`, `psf_signal_weight` (TFlux x TMeanFlux) and `psf_snr` (TFlux squared) by `m * m` -
+    /// exactly the effect of `c`, no refit. `aperture_correction` stays `None`; `m` is recorded in
+    /// `aperture_correction_group`.
+    pub fn take_group_c(&mut self, m: f64) {
+        self.tflux *= m;
+        self.tmean_flux *= m;
+        self.psf_signal_weight *= m * m;
+        self.psf_snr *= m * m;
+        self.aperture_correction_group = Some(m);
+    }
+}
+
+/// Plan B B4 (R-PB4-5), one channel of a group: when at least two planes carry a measured `c`, every plane at floor (i)
+/// takes the median of those `c`s ([`ChannelMeasurement::take_group_c`]). Returns `Some((m, planes substituted))`, or
+/// `None` when nothing was substituted (under two peers, or no plane at floor). Pure: the caller logs.
+pub fn substitute_group_c(planes: &mut [&mut ChannelMeasurement]) -> Option<(f64, usize)> {
+    let kept = channel_c_inputs(planes.iter().map(|p| &**p));
+    let summary = channel_c_summary(&kept);
+    let m = summary.median?;
+    if summary.planes < 2 || !m.is_finite() || m <= 0.0 {
+        return None;
+    }
+    let mut n = 0;
+    for p in planes.iter_mut().filter(|p| p.at_floor()) {
+        p.take_group_c(m);
+        n += 1;
+    }
+    (n > 0).then_some((m, n))
 }
 
 /// One channel's aperture corrections over a group's measured members (Plan B B0, PB-1): what the per-(group, channel)
@@ -1248,6 +1293,7 @@ fn adapter_tail(
         aperture_correction: m.aperture_correction,
         aperture_se: m.aperture_correction.and(m.aperture_se),
         aperture_stars: m.aperture_correction.map(|_| m.aperture_stars),
+        aperture_correction_group: None,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -3031,6 +3077,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan B B4 floor (i), the owner ruling R-PB4-5: a plane at Measure's fit-call floor (no `c`, stars fitted) takes
+    /// the group channel's median kept `c` when at least two peers carry one. `tflux` / `tmean_flux` scale by it,
+    /// `psf_signal_weight` / `psf_snr` by its square; `aperture_correction` stays `None`, the record sits in
+    /// `aperture_correction_group`; peers, a one-peer group and a no-fit plane are untouched; two peers give their mean.
+    #[test]
+    fn fit_call_floor_behaviour_matches_the_owner_ruling() {
+        let peer = |c: f64| ChannelMeasurement {
+            stars_detected: 150,
+            stars_fitted: 120,
+            aperture_correction: Some(c),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            tflux: 10.0 * c,
+            tmean_flux: 2.0 * c,
+            psf_signal_weight: 7.0 * c,
+            psf_snr: 9.0 * c,
+            ..Default::default()
+        };
+        let floored = || ChannelMeasurement {
+            stars_detected: 60,
+            stars_fitted: 40,
+            tflux: 10.0,
+            tmean_flux: 2.0,
+            psf_signal_weight: 7.0,
+            psf_snr: 9.0,
+            ..Default::default()
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs();
+
+        let mut planes = vec![peer(1.10), peer(1.30), floored(), peer(1.20)];
+        let peers_before = [planes[0].clone(), planes[1].clone(), planes[3].clone()];
+        let m = substitute_group_c(planes.iter_mut().collect::<Vec<_>>().as_mut_slice());
+        assert_eq!(m.map(|(m, n)| (near(m, 1.2), n)), Some((true, 1)));
+        let f = &planes[2];
+        assert!(near(f.tflux, 12.0) && near(f.tmean_flux, 2.4), "{f:?}");
+        assert!(near(f.psf_signal_weight, 7.0 * 1.44), "{f:?}");
+        assert!(near(f.psf_snr, 9.0 * 1.44), "{f:?}");
+        assert_eq!(f.aperture_correction, None);
+        assert_eq!(f.aperture_correction_group, Some(1.2));
+        assert_eq!(planes[0], peers_before[0]);
+        assert_eq!(planes[1], peers_before[1]);
+        assert_eq!(planes[3], peers_before[2]);
+
+        // One peer: untouched, whatever sits at floor.
+        let mut one = vec![peer(1.3), floored()];
+        let before = one.clone();
+        assert_eq!(
+            substitute_group_c(one.iter_mut().collect::<Vec<_>>().as_mut_slice()),
+            None
+        );
+        assert_eq!(one, before);
+
+        // A plane with no fit at all is not at floor (i): untouched, and never counted.
+        let no_fit = ChannelMeasurement {
+            stars_detected: 4,
+            stars_fitted: 0,
+            tflux: 5.0,
+            ..Default::default()
+        };
+        let mut nf = vec![peer(1.1), peer(1.3), no_fit.clone()];
+        assert_eq!(
+            substitute_group_c(nf.iter_mut().collect::<Vec<_>>().as_mut_slice()),
+            None
+        );
+        assert_eq!(nf[2], no_fit);
+
+        // Two peers: their mean.
+        let mut two = vec![peer(1.0), peer(1.5), floored()];
+        let got = substitute_group_c(two.iter_mut().collect::<Vec<_>>().as_mut_slice());
+        assert!(near(got.unwrap().0, 1.25));
+        assert_eq!(two[2].aperture_correction_group, Some(1.25));
+    }
+
     /// Plan B B0 (PB-1): the per-(group, channel) summary of the planes' `c`. `planes` counts the planes that carry a
     /// measured `c`; `count` the planes at floor (i); the median and the extremes are over the measured planes only.
     #[test]
@@ -3269,7 +3388,7 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3377,7 +3496,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \

@@ -89,7 +89,7 @@ use crate::stacking::master_cards::{
     WrittenMaster,
 };
 use crate::stacking::measure::{
-    channel_c_inputs, channel_c_summary, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
+    channel_c_inputs, channel_c_summary, substitute_group_c, ChannelMeasurement, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
     measure_frame_with_fits, FrameMeasurement, FramePass1, MeasureOptions,
 };
 use crate::stacking::pass1_artifact::{
@@ -5503,6 +5503,87 @@ fn measure_group_finish(
         }
     }
 
+    // Plan B B0 (PB-1, F-11): the aperture correction `c` each channel of the group resolved, one info per channel after
+    // the fan-out, beside the group β line. Over every MEASURED member (fresh or reused), never narrowed to `included`,
+    // as the group β is. A `metrics` row reused from before B0 carries no `c` and reads as a plane at floor here; the
+    // before-runs measure on fresh work dirs.
+    {
+        let channels = entries
+            .iter()
+            .filter_map(|e| e.measurement.as_ref())
+            .map(|m| m.channels.len())
+            .max()
+            .unwrap_or(0);
+        for plane in 0..channels {
+            // R-PB0-4: a plane with no `c` and no fit at all is left out, so `count` is the planes where the
+            // "fewer than 5" warn fired.
+            let kept = channel_c_inputs(
+                entries
+                    .iter()
+                    .filter_map(|e| e.measurement.as_ref())
+                    .filter_map(|m| m.channels.get(plane)),
+            );
+            let c = channel_c_summary(&kept);
+            match (c.median, c.min, c.max) {
+                (Some(median), Some(min), Some(max)) => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    aperture_correction = median,
+                    aperture_correction_min = min,
+                    aperture_correction_max = max,
+                    "measure: aperture correction resolved per channel"
+                ),
+                _ => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    "measure: aperture correction resolved per channel"
+                ),
+            }
+            // Plan B B4 floor (i), R-PB4-5: a plane at the fit-call floor takes this median (before the weights, so
+            // `compute_weights` and the run summary read the stand-in). The planes were persisted before this point
+            // and the `metrics` payload keeps the module's values; the fold re-derives the median every run.
+            let mut at_plane: Vec<&mut ChannelMeasurement> = entries
+                .iter_mut()
+                .filter_map(|e| e.measurement.as_mut())
+                .filter_map(|m| m.channels.get_mut(plane))
+                .collect();
+            if let Some((m, count)) = substitute_group_c(&mut at_plane) {
+                tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    count,
+                    aperture_correction = m,
+                    "measure: floored planes took the group channel's median aperture correction"
+                );
+                for e in entries.iter() {
+                    let took = e
+                        .measurement
+                        .as_ref()
+                        .and_then(|m| m.channels.get(plane))
+                        .and_then(|c| c.aperture_correction_group);
+                    if let Some(aperture_correction) = took {
+                        tracing::debug!(
+                            run_id = rc.run_id,
+                            group_key = %group.key,
+                            frame_id = e.frame.frame_id,
+                            plane,
+                            aperture_correction,
+                            "measure: floored plane took the group channel's median aperture correction"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+
     // Carry-forward: a non-finite location/scale in any channel excludes
     // the frame from weighing entirely, rather than failing the group.
     let mut weigh_indices: Vec<usize> = Vec::new();
@@ -5629,45 +5710,6 @@ fn measure_group_finish(
             beta,
             "stacking group beta resolved"
         );
-    }
-
-    // Plan B B0 (PB-1, F-11): the aperture correction `c` each channel of the group resolved, one info per channel after
-    // the fan-out, beside the group β line. Over every MEASURED member (fresh or reused), never narrowed to `included`,
-    // as the group β is. A `metrics` row reused from before B0 carries no `c` and reads as a plane at floor here; the
-    // before-runs measure on fresh work dirs.
-    {
-        let measured: Vec<&FrameMeasurement> = entries
-            .iter()
-            .filter_map(|e| e.measurement.as_ref())
-            .collect();
-        let channels = measured.iter().map(|m| m.channels.len()).max().unwrap_or(0);
-        for plane in 0..channels {
-            // R-PB0-4: a plane with no `c` and no fit at all is left out, so `count` is the planes where the
-            // "fewer than 5" warn fired.
-            let kept = channel_c_inputs(measured.iter().filter_map(|m| m.channels.get(plane)));
-            let c = channel_c_summary(&kept);
-            match (c.median, c.min, c.max) {
-                (Some(median), Some(min), Some(max)) => tracing::info!(
-                    run_id = rc.run_id,
-                    group_key = %group.key,
-                    plane,
-                    planes = c.planes,
-                    count = c.count,
-                    aperture_correction = median,
-                    aperture_correction_min = min,
-                    aperture_correction_max = max,
-                    "measure: aperture correction resolved per channel"
-                ),
-                _ => tracing::info!(
-                    run_id = rc.run_id,
-                    group_key = %group.key,
-                    plane,
-                    planes = c.planes,
-                    count = c.count,
-                    "measure: aperture correction resolved per channel"
-                ),
-            }
-        }
     }
 
     {
