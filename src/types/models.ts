@@ -162,7 +162,13 @@ export type ReconcileSummary = { changed: boolean, nights: number, sessions: num
 
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
 
-export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, 
+export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, 
+/**
+ * Sub-frame origin (`XORGSUBF`, `YORGSUBF`) from the lowest-frame-id
+ * member's stored header; `None` unless that header records both
+ * (`calibration::geometry::set_origin`).
+ */
+xorgsubf: number | null, yorgsubf: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, 
 /**
  * Set when this raw set has been superseded by a built master.
  */
@@ -335,7 +341,9 @@ export type ParameterStatus = "match" | "warning" | "mismatch" | "unknown";
 export type ParameterVerdict = { 
 /**
  * Canonical parameter name: `instrume`, `binning`, `gain`, `offset`,
- * `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`.
+ * `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`, `geometry`
+ * (`geometry` is the frame size + sub-frame origin — always enforced,
+ * never a config parameter).
  */
 name: string, 
 /**
@@ -352,7 +360,12 @@ export type CalibrationSetParameters = { set_id: number, imagetyp: string, instr
 
 export type CalibrationFilterGroup = { filter: string | null, filter_display: string, exptime: number | null, light_frames: Array<LightFrameWithCalibration>, flat_sets: Array<CalibrationSetWithFrameCount>, dark_sets: Array<CalibrationSetWithFrameCount>, bias_sets: Array<CalibrationSetWithFrameCount>, has_warnings: boolean, frame_count: number, };
 
-export type LightFrameWithCalibration = { frame_id: number, file_id: number, filename: string, file_path: string, date_obs: string | null, exptime: number | null, telescop: string | null, focallen: number | null, xpixsz: number | null, binning: string | null, ccd_temp: number | null, swcreate: string | null, gain: number | null, offset: number | null, rotation: number | null, objctra: string | null, objctdec: string | null, ra: number | null, dec: number | null, 
+export type LightFrameWithCalibration = { frame_id: number, file_id: number, filename: string, file_path: string, date_obs: string | null, exptime: number | null, telescop: string | null, focallen: number | null, xpixsz: number | null, binning: string | null, 
+/**
+ * Stored frame size (NAXIS1 × NAXIS2, after binning) — what the
+ * calibration tables badge each set's size against.
+ */
+naxis1: number | null, naxis2: number | null, ccd_temp: number | null, swcreate: string | null, gain: number | null, offset: number | null, rotation: number | null, objctra: string | null, objctdec: string | null, ra: number | null, dec: number | null, 
 /**
  * True when a `plate_solves` row exists for this frame, i.e. the WCS
  * was computed by Athenaeum's plate solver (vs. read from the FITS

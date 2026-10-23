@@ -366,6 +366,8 @@ pub fn load_set_with_score(
                 is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
                 naxis1: row.get(16)?,
                 naxis2: row.get(17)?,
+                xorgsubf: None,
+                yorgsubf: None,
                 bayerpat: row.get(18)?,
                 swcreate: row.get(19)?,
                 xpixsz: row.get(20)?,
@@ -377,6 +379,13 @@ pub fn load_set_with_score(
             })
         })
         .ok();
+    let set_opt = match set_opt {
+        Some(mut s) => {
+            crate::calibration::geometry::fill_set_origin(conn, &mut s)?;
+            Some(s)
+        }
+        None => None,
+    };
 
     Ok(set_opt.map(|set| CalibrationSetWithScore {
         set,
@@ -451,5 +460,30 @@ mod geometry_tests {
         assert_eq!(source_type, "flats");
         assert_eq!((frame.naxis1, frame.naxis2), (Some(6384), Some(4258)));
         assert_eq!(frame.file_id, file_id_of(&conn, m1), "the lowest frame id's file");
+    }
+
+    /// R3: a candidate's set detail carries its origin when known.
+    #[test]
+    fn set_detail_carries_the_origin() {
+        let conn = db();
+        let set = seed_set(&conn, "Dark");
+        let m = seed_frame(&conn, "o", "Dark", Some(ROI), Some((1584, 1064)));
+        add_members(&conn, set, &[m]);
+        let candidate = crate::calibration::finder::CalibrationCandidate {
+            set_id: set,
+            imagetyp: ImageType::Dark,
+            match_score: 0.0,
+            date_diff_days: 0,
+            temp_diff: None,
+            date_warning: false,
+            temp_warning: false,
+            is_master: false,
+            passed_hard_filter: false,
+            details: CandidateMatchDetails::default(),
+            warnings: Vec::new(),
+        };
+        let swc = load_set_with_score(&conn, &candidate).unwrap().unwrap();
+        assert_eq!((swc.set.naxis1, swc.set.naxis2), (Some(6384), Some(4258)));
+        assert_eq!((swc.set.xorgsubf, swc.set.yorgsubf), (Some(1584), Some(1064)));
     }
 }

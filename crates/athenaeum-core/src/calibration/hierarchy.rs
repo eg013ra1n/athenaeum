@@ -158,7 +158,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
          LIMIT 1"
     )?;
 
-    let set = stmt.query_row([set_id], |row| {
+    let mut set = stmt.query_row([set_id], |row| {
         let imagetyp_str: String = row.get(1)?;
         Ok(CalibrationSetDetail {
             id: Some(row.get(0)?),
@@ -180,6 +180,8 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
             naxis1: row.get(16)?,
             naxis2: row.get(17)?,
+            xorgsubf: None,
+            yorgsubf: None,
             bayerpat: row.get(18)?,
             swcreate: row.get(19)?,
             xpixsz: row.get(20)?,
@@ -190,6 +192,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             superseded_by_set_id: row.get(25)?,
         })
     })?;
+    geometry::fill_set_origin(conn, &mut set)?;
 
     Ok(set)
 }

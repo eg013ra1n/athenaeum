@@ -114,7 +114,7 @@ fn query_camera_calibration_sets(
 
     let mut stmt = conn.prepare(&query)?;
 
-    let sets = stmt
+    let mut sets = stmt
         .query_map([instrume], |row| {
             let imagetyp_str: String = row.get(1)?;
             let imagetyp = ImageType::from_str(&imagetyp_str)
@@ -151,6 +151,8 @@ fn query_camera_calibration_sets(
                 // Extended fields from frame metadata
                 naxis1: row.get(15)?,
                 naxis2: row.get(16)?,
+                xorgsubf: None,
+                yorgsubf: None,
                 bayerpat: row.get(17)?,
                 swcreate: row.get(18)?,
                 xpixsz: row.get(19)?,
@@ -162,6 +164,9 @@ fn query_camera_calibration_sets(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    for s in &mut sets {
+        crate::calibration::geometry::fill_set_origin(conn, s)?;
+    }
 
     Ok(sets)
 }

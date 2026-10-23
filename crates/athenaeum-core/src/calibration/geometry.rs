@@ -210,6 +210,42 @@ pub fn set_origin(conn: &Connection, set_id: i64) -> rusqlite::Result<Option<(i3
     }
 }
 
+/// Fill `detail.xorgsubf` / `yorgsubf` from [`set_origin`].
+pub fn fill_set_origin(
+    conn: &Connection,
+    detail: &mut crate::models::CalibrationSetDetail,
+) -> rusqlite::Result<()> {
+    if let Some(id) = detail.id {
+        let origin = set_origin(conn, id)?;
+        detail.xorgsubf = origin.map(|o| o.0);
+        detail.yorgsubf = origin.map(|o| o.1);
+    }
+    Ok(())
+}
+
+/// The calibration hierarchy's origin warning for one set (ruling G-7): the
+/// set and the first of `light_frame_ids` whose size equals the set's and
+/// whose recorded sub-frame origin differs. `None` when the set records no
+/// origin (then no light header is read) or every light agrees. A size misfit
+/// is not reported here — the readiness gate blocks it (Task 6).
+pub fn origin_mismatch_for_lights(
+    conn: &Connection,
+    set_id: i64,
+    light_frame_ids: &[i64],
+) -> rusqlite::Result<Option<(Geometry, Geometry)>> {
+    let set = geometry_for_set(conn, set_id)?;
+    if set.mixed || set.size.is_none() || set.origin.is_none() {
+        return Ok(None);
+    }
+    for &frame_id in light_frame_ids {
+        let mut light = LazyFrameGeometry::load(conn, frame_id)?;
+        if light.fit(conn, &set)? == Fit::Refused(Refusal::Origin) {
+            return Ok(Some((set, light.geometry())));
+        }
+    }
+    Ok(None)
+}
+
 /// A set's agreed size, origin, and whether its members disagree.
 pub fn geometry_for_set(conn: &Connection, set_id: i64) -> rusqlite::Result<Geometry> {
     let (w_min, w_max, h_min, h_max): (Option<i32>, Option<i32>, Option<i32>, Option<i32>) = conn

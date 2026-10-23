@@ -391,6 +391,11 @@ pub struct CalibrationSetDetail {
     // Extended fields from frame metadata
     pub naxis1: Option<i32>,     // Image width
     pub naxis2: Option<i32>,     // Image height
+    /// Sub-frame origin (`XORGSUBF`, `YORGSUBF`) from the lowest-frame-id
+    /// member's stored header; `None` unless that header records both
+    /// (`calibration::geometry::set_origin`).
+    pub xorgsubf: Option<i32>,
+    pub yorgsubf: Option<i32>,
     pub bayerpat: Option<String>, // Bayer pattern (e.g., "RGGB") or None for mono
     pub swcreate: Option<String>, // Software that created the file
     pub xpixsz: Option<f64>,     // Pixel size in microns
@@ -539,7 +544,7 @@ pub struct CalibrationSetWithLinks {
 /// Warning about calibration quality
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationWarning {
-    pub warning_type: String,  // 'date' or 'temperature'
+    pub warning_type: String,  // 'date', 'temperature' or 'geometry' (another sub-frame origin, G-7)
     pub message: String,
     pub calibration_type: String,  // 'Dark', 'Flat', 'Bias', 'DarkFlat'
     pub set_id: i64,
@@ -694,7 +699,9 @@ pub enum ParameterStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ParameterVerdict {
     /// Canonical parameter name: `instrume`, `binning`, `gain`, `offset`,
-    /// `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`.
+    /// `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`, `geometry`
+    /// (`geometry` is the frame size + sub-frame origin — always enforced,
+    /// never a config parameter).
     pub name: String,
     /// The user's config takes this parameter into account (`MatchMode` is not
     /// `Ignore`). A boolean rather than the mode itself: the mode's TS type
@@ -788,6 +795,10 @@ pub struct LightFrameWithCalibration {
     pub focallen: Option<f64>,
     pub xpixsz: Option<f64>,
     pub binning: Option<String>,
+    /// Stored frame size (NAXIS1 × NAXIS2, after binning) — what the
+    /// calibration tables badge each set's size against.
+    pub naxis1: Option<i32>,
+    pub naxis2: Option<i32>,
     pub ccd_temp: Option<f64>,
     pub swcreate: Option<String>,
     pub gain: Option<f64>,
