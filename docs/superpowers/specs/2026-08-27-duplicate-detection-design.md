@@ -116,17 +116,17 @@ Three independent causes, all verified against the raw XISF bytes:
 1. **The file misreports itself.** `Pane_2_Sii.xisf` genuinely contains
    `<FITSKeyword name="FILTER" value="'H'"/>` and the Ha stack's `DATE-OBS`.
    The downstream processing program propagates the *reference* image's FITS keywords through
-   ImageIntegration and PixelMath, so an Sii integration inherits Ha's
+   its integration and pixel-math processes, so an Sii integration inherits Ha's
    keywords. No parser can correct a file that states the wrong filter.
 2. **Our XISF parser discards the `comment` attribute.** The downstream processing program writes
-   history as `value="" comment="ImageIntegration.rejectedHigh_32: 105348"`;
+   history as `value="" comment="<integration history entry>: 105348"`;
    `fits_parser/mod.rs` matches only `b"name"` and `b"value"` and its `_ => {}`
    arm drops the rest, collapsing 364 HISTORY records to empty strings.
    Including `comment` separates **4 of the 30** groups. Real defect, but not a
    fix for this problem — see §6.
 3. **For the remaining 26 there is nothing to separate.** `Pane_2_Sii.xisf` and
    `Pane_2_Sii_f.xisf` share all 364 FITSKeywords, all 21 `<Property>`
-   elements, geometry, sampleFormat and location. Only the pixels differ — DBE
+   elements, geometry, sampleFormat and location. Only the pixels differ — background extraction
    and linear fit change data without touching metadata. XISF's optional
    `checksum` attribute, which would have given content identity for free, is
    absent (the downstream processing program does not write it).

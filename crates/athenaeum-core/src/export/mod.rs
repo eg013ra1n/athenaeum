@@ -1,4 +1,4 @@
-//! Export module for organizing frames into PixInsight WBPP folder structure
+//! Export module for organizing frames into WBPP folder structure
 
 // Calibrated-light generation (resolve → calibrate → cosmetic → debayer →
 // write). Render-gated: it streams pixels through `integration` and hands the

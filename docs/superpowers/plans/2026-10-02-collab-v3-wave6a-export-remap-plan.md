@@ -788,7 +788,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("two.xisf");
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<xisf version="1.0" xmlns="<identifier>">
+<xisf version="1.0" xmlns="<XISF namespace URI>">
   <Image geometry="2:2:1" sampleFormat="UInt8" location="attachment:{POS}:{SIZE}">
     <FITSKeyword name="FILTER" value="'Red'" comment=""/>
   </Image>

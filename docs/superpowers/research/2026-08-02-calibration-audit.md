@@ -205,20 +205,19 @@ traversal; full Tauri↔Axum parity; StrictMode-safe listener pattern and
 ## Industry research: bad pixels and NaN (basis for the C2/I1 policy)
 
 Researched 2026-08-02 against the FITS standard, the ERP (GPL-era
-ImageIntegration sources + ImageCalibration documentation), a second open-source stacker's docs, and a third stacker
+integration-process sources + calibration-process documentation), a second open-source stacker's docs, and a third stacker
 (already covered in `2026-07-04-calibration-math-research.md` §9):
 
 - **FITS standard:** for BITPIX −32/−64, IEEE NaN *is* the undefined-pixel
   marker (BLANK forbidden); readers must treat NaN as missing data.
   (STScI FITS standard §6.3 / users-guide "IEEE Floating Point Data".)
-- **ERP ImageIntegration** (verified in GPL-era source:
-  `ImageIntegrationInstance.cpp`, `IntegrationRejectionEngine.cpp`,
-  `ImageIntegrationParameters.cpp`): **range rejection runs before statistical
+- **The ERP's integration process** (verified in GPL-era source: the
+  integration-instance, rejection-engine and parameters sources): **range rejection runs before statistical
   rejection**, per pixel, excluding out-of-range samples from the stack and
   counting them into rejection maps and the console report. `rangeClipLow` is
   **enabled by default with `rangeLow = 0.0`** — i.e. ≤0 samples are excluded
   per pixel out of the box. Integration never aborts on a bad sample.
-- **ERP ImageCalibration:** the flat denominator is floored —
+- **The ERP's calibration process:** the flat denominator is floored —
   `max(0.00002, flat)` in normalized [0,1] units — so division by zero is
   structurally impossible; invalid output pixels produce a counted warning, not
   an abort. Optional output pedestal guards against clipping negatives.

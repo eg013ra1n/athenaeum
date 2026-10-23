@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (`athenaeum-core`, Tauri commands, Axum routes), `fits_writer::{writer, xisf_writer}`, rustafits' XISF reader, React/TS.
 
-**Spec:** `docs/backlog-v0.6.5.md` items 1 and 1b (the trace and the WBPP contract read from `BPP-Helper.js` / `BPP-StackEngine.js` on 2026-09-18). This plan carries the design decisions below; there is no separate spec.
+**Spec:** `docs/backlog-v0.6.5.md` items 1 and 1b (the trace and the WBPP contract read from the ERP's batch-preprocessing helper and stack-engine scripts on 2026-09-18). This plan carries the design decisions below; there is no separate spec.
 
 ## Design decisions (rulings)
 

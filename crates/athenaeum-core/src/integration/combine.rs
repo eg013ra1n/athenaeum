@@ -1,6 +1,6 @@
 //! Per-pixel robust integration recipes — the reference's two-axis model
 //! (Combination × Rejection). Spec:
-//! `docs/superpowers/specs/2026-07-06-master-integration-pi-model-design.md`.
+//! `docs/superpowers/specs/2026-07-06-master-integration-model-design.md`.
 //!
 //! An [`IntegrationRecipe`] pairs a [`Combination`] (Average or Median of the
 //! surviving samples) with a [`Rejection`] algorithm that decides which

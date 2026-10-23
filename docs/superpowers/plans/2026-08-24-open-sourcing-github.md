@@ -1074,7 +1074,7 @@ engine — the export is WBPP folder and keyword organization. Replace the
 
 ```markdown
 Export for WBPP: files are organized into the folder hierarchy and keyword
-layout the downstream processing program's WeightedBatchPreprocessing expects, with symlinks instead of
+layout the downstream processing program's weighted batch preprocessing expects, with symlinks instead of
 copies where the platform supports them.
 ```
 

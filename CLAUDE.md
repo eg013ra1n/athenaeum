@@ -135,5 +135,5 @@ useEffect(() => {
 ## Reference
 
 
-- [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)
+- [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · the XISF 1.0 specification · [xxHash](https://xxhash.com/)
 - 2025-11-17 modular-refactor map: `crates/athenaeum-tauri/REFACTORING.md`

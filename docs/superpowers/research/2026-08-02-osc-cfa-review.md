@@ -20,7 +20,7 @@ real Bayer-metadata defects on outputs, plus zero CFA-specific math tests.
 ## Industry norms (researched)
 
 - Calibrate in the CFA domain, debayer after — standard. We comply.
-- **Per-channel flat scaling for OSC**: ERP ImageCalibration computes 3
+- **Per-channel flat scaling for OSC**: the ERP's calibration process computes 3
   separate CFA flat scaling factors (single factor "causes a color shift" —
   their wording; WBPP enables it for OSC); the open-source stacker's `equalize_cfa` equalizes the
   master flat's channel means "to avoid tinting". The ERP notes the effect is

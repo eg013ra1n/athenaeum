@@ -437,8 +437,8 @@ pub fn find_duplicate_folders(
     // The comparison key below is the header key's full triple — fingerprint,
     // size AND filename (`DuplicateKey::group_extra`) — not the fingerprint
     // alone. A processed derivative keeps its source's header verbatim (our
-    // XISF parser drops PixInsight's `comment` history), so on fingerprint
-    // alone a folder of `*_GraXpert.xisf` outputs reads as a near-perfect copy
+    // XISF parser drops the ERP's `comment` history), so on fingerprint
+    // alone a folder of `*_GradRemoved.xisf` outputs reads as a near-perfect copy
     // of the folder it was processed from.
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.id, f.path, fh.header_fingerprint, f.size, f.filename
@@ -1404,9 +1404,9 @@ mod tests {
     /// A folder of processed outputs must not read as a copy of the folder it
     /// was processed FROM.
     ///
-    /// GraXpert/ABE outputs keep `IMAGETYP = 'Light'` and `is_master = 0`, and
+    /// Gradient-removal/background-extraction outputs keep `IMAGETYP = 'Light'` and `is_master = 0`, and
     /// carry their source's header verbatim (our XISF parser drops
-    /// PixInsight's `comment` history), so on the fingerprint alone every file
+    /// the ERP's `comment` history), so on the fingerprint alone every file
     /// in `processed/` matches its counterpart in `raw/` and the pair scores
     /// 100 % similar — with different bytes on every side. The filename half
     /// of the key separates them; same rule as the Duplicates view.
@@ -1418,8 +1418,8 @@ mod tests {
         for (id, path, header) in [
             (1i64, "/vol/raw/Lum_001.xisf", "HDR-0"),
             (2, "/vol/raw/Lum_002.xisf", "HDR-1"),
-            (3, "/vol/processed/Lum_001_GraXpert.xisf", "HDR-0"),
-            (4, "/vol/processed/Lum_002_GraXpert.xisf", "HDR-1"),
+            (3, "/vol/processed/Lum_001_GradRemoved.xisf", "HDR-0"),
+            (4, "/vol/processed/Lum_002_GradRemoved.xisf", "HDR-1"),
         ] {
             let filename = path.rsplit('/').next().unwrap();
             conn.execute(

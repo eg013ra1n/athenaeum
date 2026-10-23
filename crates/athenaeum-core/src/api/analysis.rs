@@ -558,7 +558,7 @@ pub async fn get_frame_star_metrics(
 
 // ========== Flat Contour Plot ==========
 //
-// PixInsight FlatContourPlot v1.3.1 port. Reads a flat (or master flat) at
+// Port of the ERP's flat-contour-plot script v1.3.1. Reads a flat (or master flat) at
 // `file_id`, resamples + clips + Gaussian-blurs + quantizes per the user's
 // opts, and returns the band-per-pixel buffer (as base64-LE bytes) plus
 // the per-band central values for the legend strip on the frontend.

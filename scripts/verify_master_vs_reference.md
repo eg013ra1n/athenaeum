@@ -1,11 +1,11 @@
-# Golden comparison: Athenaeum master vs. Siril master
+# Golden comparison: Athenaeum master vs. open-source-stacker master
 
-Dev-only, owner-run procedure — **not part of CI** (Siril isn't installed in
+Dev-only, owner-run procedure — **not part of CI** (the open-source stacker isn't installed in
 CI, and this needs a real raw calibration set on disk). This is the spec §10
 "golden reference test" in its manual form: it verifies the Phase 2 Plan A
 integration engine (`crates/athenaeum-core/src/integration/`) produces the
 same result, pixel-for-pixel within a small tolerance, as an independently
-implemented reference stacker (Siril) applying the equivalent recipe.
+implemented open-source reference stacker applying the equivalent recipe.
 
 Design background: `docs/superpowers/specs/2026-07-04-phase2-calibration-library-design.md`
 §9 ("Bias / Dark / DarkFlat" recipe: average combine, no normalization, no
@@ -23,14 +23,14 @@ chain.
   sigma-clip 3σ/3σ over the plain-median fallback — see
   `api::masters::resolve_combine`). Fewer than 15 frames exercises a
   different code path and isn't a like-for-like comparison.
-- [Siril](https://siril.org/) installed, ≥ 1.2 (has the `w` — Winsorized —
+- The open-source stacker installed, ≥ 1.2 (has the `w` — Winsorized —
   rejection type in `stack`).
-- Python 3 + `astropy` + `numpy` (`pip install astropy numpy`) for the
+- Python 3 + a Python astronomy library + `numpy` (`pip install <astronomy-library> numpy`) for the
   comparison script below.
-- **Siril preference check before stacking**: open Siril → Preferences →
+- **Stacker preference check before stacking**: open the stacker → Preferences →
   make sure no "normalize to 0–1" / 16-bit rescale option is enabled for FITS
   output. Athenaeum's masters keep the input ADU scale verbatim (spec §9
-  policy 2, no rescale) — if Siril silently rescales its output, the
+  policy 2, no rescale) — if the stacker silently rescales its output, the
   comparison below will report a huge (bogus) diff that has nothing to do
   with the combine/rejection math.
 
@@ -44,31 +44,31 @@ chain.
    and visible under the Masters tab / provenance panel:
    `<LibraryRoot>/<Camera>/MasterDark/master_dark_<exptime>s_<temp>C_g<gain>_bin<binning>_<date>.fits`.
 
-## Step 2 — Build the same master in Siril
+## Step 2 — Build the same master in the open-source stacker
 
 Using the **same raw frames** the Athenaeum set was built from (find them via
 the raw set's file list in Equipment, or `master_provenance.member_frame_uuids`
 if the raw set has since been archived — restore first if so):
 
 ```bash
-siril-cli -s - <<'EOF'
+<stacker-cli> -s - <<'EOF'
 cd /path/to/raw/darks
 convert dark -out=../process
 cd ../process
-stack dark rej w 3 3 -nonorm -out=master_dark_siril
+stack dark rej w 3 3 -nonorm -out=master_dark_ref
 EOF
 ```
 
-- `convert dark -out=../process` ingests the raw FITS frames into a Siril
+- `convert dark -out=../process` ingests the raw FITS frames into a stacker
   sequence named `dark_00001.fit`, `dark_00002.fit`, ….
 - `stack dark rej w 3 3 -nonorm` — `rej w 3 3` selects Winsorized sigma-clip
   with low/high sigma 3.0/3.0 (matches Athenaeum's Auto recipe for N ≥ 15);
-  `-nonorm` disables Siril's per-frame normalization, matching Athenaeum's
+  `-nonorm` disables the stacker's per-frame normalization, matching Athenaeum's
   "no normalization" policy for bias/dark/darkflat masters.
-- Result: `process/master_dark_siril.fit` (or `.fits` depending on your
-  Siril build's default extension).
+- Result: `process/master_dark_ref.fit` (or `.fits` depending on your
+  stacker build's default extension).
 
-If Siril's GUI is preferred over `siril-cli`, the equivalent manual steps are
+If the stacker's GUI is preferred over `<stacker-cli>`, the equivalent manual steps are
 Scripts-free: File → Conversion (or drag the raw frames into the Conversion
 tab) → convert into a sequence → Stacking tab → Rejection: Winsorized,
 σ low/high = 3.000/3.000 → Normalization: **None** → Stack.
@@ -77,9 +77,9 @@ tab) → convert into a sequence → Stacking tab → Rejection: Winsorized,
 
 ```python
 #!/usr/bin/env python3
-"""Dev-only: diff an Athenaeum master against a Siril-built master of the
+"""Dev-only: diff an Athenaeum master against a stacker-built master of the
 same raw set. Not CI — run manually per this doc.
-Usage: python3 compare_masters.py <athenaeum_master.fits> <siril_master.fit>"""
+Usage: python3 compare_masters.py <athenaeum_master.fits> <reference_master.fit>"""
 import sys
 import numpy as np
 from astropy.io import fits
@@ -89,7 +89,7 @@ b = fits.getdata(sys.argv[2]).astype(np.float64)
 assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"
 diff = np.abs(a - b)
 p50, p999 = np.percentile(diff, [50, 99.9])
-print(f"Athenaeum mean: {a.mean():.4f} ADU   Siril mean: {b.mean():.4f} ADU")
+print(f"Athenaeum mean: {a.mean():.4f} ADU   Reference mean: {b.mean():.4f} ADU")
 print(f"median |diff| = {p50:.4f} ADU   99.9th pct |diff| = {p999:.4f} ADU")
 print("PASS" if p50 <= 1.0 else "FAIL", "— acceptance: median |diff| ≲ 1 ADU")
 ```
@@ -104,7 +104,7 @@ pass/fail gate — only the median is.
 Owner-filled after each run. Add a row per verification pass (e.g. once per
 minor release, or whenever the integration engine changes).
 
-| Date | Camera / set (N frames) | Athenaeum master | Siril master | median \|diff\| (ADU) | 99.9pct \|diff\| (ADU) | Result | Notes |
+| Date | Camera / set (N frames) | Athenaeum master | Reference master | median \|diff\| (ADU) | 99.9pct \|diff\| (ADU) | Result | Notes |
 | ---- | ------------------------ | ----------------- | -------------- | ---------------------- | ----------------------- | ------ | ----- |
 |      |                           |                    |                 |                         |                          |        |       |
 
@@ -152,7 +152,7 @@ land, the following Phase 2 roadmap checkboxes are DONE and can be ticked:
 Not done (deliberately out of scope for Plan A): **B5 in-app light
 calibration** (Plan B / milestone M2b) and the matcher/export integration
 test item (matcher exclusion of superseded sets is pinned by
-`matcher_excludes_superseded_sets`, but the roadmap's specific "WBPP/Siril
+`matcher_excludes_superseded_sets`, but the roadmap's specific "WBPP/open-source-stacker
 export consumes library masters" end-to-end test was not added this plan —
 worth a follow-up check before M2b).
 

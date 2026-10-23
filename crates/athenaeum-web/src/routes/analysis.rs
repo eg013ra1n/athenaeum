@@ -158,7 +158,7 @@ pub async fn get_frame_star_metrics(
     api::get_frame_star_metrics(&state.ctx, args.frame_id).await.map(Json).map_err(api_err)
 }
 
-// ── Flat contour plot (PixInsight FlatContourPlot port) ──────────────────────
+// ── Flat contour plot (port of the ERP's flat-contour-plot script) ──────────────────────
 
 /// POST /api/compute_flat_contour_plot
 #[tracing::instrument(skip_all, err(Debug), level = "debug")]

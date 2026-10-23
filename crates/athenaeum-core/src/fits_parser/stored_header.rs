@@ -190,7 +190,7 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     //   3. CROTA1 — alt WCS axis rotation (sky frame)
     //   4. POSANGLE — sky position angle
     //   5. PA — generic position angle (sky frame)
-    //   6. OBJCTROT — planned target rotation (NINA / PI, sky frame)
+    //   6. OBJCTROT — planned target rotation (NINA / the ERP, sky frame)
     //   7. ROTATANG — mechanical rotator angle (instrument frame, fallback)
     //   8. APTS_ROT — APT mechanical rotator angle (instrument frame)
     let parse_f = |k: &str| get(k).and_then(|s| s.parse::<f64>().ok());

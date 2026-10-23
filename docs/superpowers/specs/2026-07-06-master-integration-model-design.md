@@ -2,7 +2,7 @@
 
 Owner request (B5 UI round follow-up): restructure master-build integration
 around the ERP's two-axis model — **Combination** × **Rejection
-algorithm** — matching the ImageIntegration panel's mental model, and add
+algorithm** — matching the ERP's integration-panel mental model, and add
 the two missing practical rejection algorithms. Builds on Phase 2
 (`integration/combine.rs`, `api/masters.rs` recipes, `CreateMasterDialog`).
 

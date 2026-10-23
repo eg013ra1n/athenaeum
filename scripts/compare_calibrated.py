@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two calibrated frames (Athenaeum FITS vs WBPP/Siril XISF or FITS).
+"""Compare two calibrated frames (Athenaeum FITS vs WBPP/open-source-stacker XISF or FITS).
 
 Usage: compare_calibrated.py <a.fits|a.xisf> <b.fits|b.xisf>
 
@@ -145,7 +145,7 @@ def main():
     if "xisf_xml" in meta_b:
         for kw in re.findall(r'<FITSKeyword name="(PEDESTAL|CALSTAT|IMAGETYP|EXPOSURE|EXPTIME)" value="([^"]*)"[^/]*/>', meta_b["xisf_xml"]):
             print(f"  {kw[0]} = {kw[1]}")
-        for prop in re.findall(r'<Property id="(PixInsight:[^"]*)"[^>]*value="([^"]{0,60})"', meta_b["xisf_xml"])[:10]:
+        for prop in re.findall(r'<Property id="([A-Za-z]+:[^"]*)"[^>]*value="([^"]{0,60})"', meta_b["xisf_xml"])[:10]:
             print(f"  {prop[0]} = {prop[1]}")
     else:
         for k in ("CALSTAT", "ATH_CSCL", "ATH_CFNM", "ATH_CVER", "ATH_CDRK", "ATH_CFLT", "ATH_CBIA", "PEDESTAL", "BZERO", "BSCALE"):

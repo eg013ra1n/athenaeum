@@ -1,6 +1,6 @@
 //! File organizer for export operations
 //!
-//! Creates folder structures and copies/symlinks files for PixInsight WBPP.
+//! Creates folder structures and copies/symlinks files for the WBPP folder structure.
 //!
 //! The folder hierarchy encodes the calibration pipeline — parent folder's
 //! frames calibrate child folder's frames. WBPP reads this via "Grouping
@@ -535,7 +535,7 @@ fn generate_one(
     match *batch {}
 }
 
-/// Organize files for PixInsight WBPP export
+/// Organize files for WBPP export
 ///
 /// Creates a nested folder structure where parent calibrates child,
 /// matching WBPP's "Grouping Keywords with Pre" feature. The hierarchy itself is

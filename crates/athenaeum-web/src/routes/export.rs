@@ -313,7 +313,7 @@ fn get_export_readiness_core(
     api_get_export_readiness(ctx, args.set_id)
 }
 
-/// Export a frame set to PixInsight WBPP folder structure.
+/// Export a frame set to WBPP folder structure.
 ///
 /// Emits SSE progress events via the broadcast channel while the file
 /// organizer runs.  The DB lock is released before the (potentially long)

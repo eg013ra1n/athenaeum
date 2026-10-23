@@ -236,7 +236,13 @@ export's own destination tree. There is still no token-templating engine here
   - **Normalize master flat** (default ON) + its **statistic** — central-third
     mean (Athenaeum) or full-frame trimmed mean — and, nested under the
     statistic it refines, **per-channel CFA flat scaling** (default ON,
-    unavailable in the trimmed mode, which is measured whole-frame).
+    unavailable in the trimmed mode, which is measured whole-frame). The trimmed
+    mode is `FlatNormMode::TrimmedMeanWhole` in Rust, with the trim fraction
+    `TRIMMED_MEAN_TAIL_FRACTION`; its stored / wire string is the pre-rename one
+    (`#[serde(rename)]` in `models.rs`, the new spelling accepted as an alias) so
+    saved configs, the DB column, the frontend preference and an older build all
+    keep working — the frontend compares against `FLAT_NORM_TRIMMED_MEAN_WHOLE`
+    (`src/types/flat-norm.ts`), never a literal.
   - **Hot-pixel correction** (default ON) — replaces hot pixels detected from
     the applied master dark (median + 10·1.4826·MAD threshold) with a
     neighbourhood median before debayering; honestly skipped when no dark

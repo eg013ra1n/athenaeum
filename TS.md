@@ -201,7 +201,7 @@ Sources
 [1] xxHash - Extremely fast non-cryptographic hash algorithm https://xxhash.com
 [2] The Filename Template Editor and Text Template Editor https://helpx.adobe.com/lightroom-classic/help/filename-template-editor-text-template.html
 [3] How to find photos in a catalog in Lightroom Classic https://helpx.adobe.com/lightroom-classic/help/finding-photos-catalog.html
-[4] XISF Version 1.0 Specification https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html
+[4] XISF Version 1.0 Specification
 [5] File Checksums - Duplicate File Detective https://www.duplicatedetective.com/content/static/help/html/filechecksums.html
 [6] Metadata basics and actions in Lightroom Classic https://helpx.adobe.com/lightroom-classic/help/metadata-basics-actions.html
 [7] FITS File Header Definitions - Diffraction Limited https://cdn.diffractionlimited.com/help/maximdl/FITS_File_Header_Definitions.htm

@@ -1790,7 +1790,7 @@ git commit -m "feat(fits): typed keyword vocabulary (SBFITSEXT/NINA/WBPP canonic
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-02-roadmap.md` (tick Phase 1 checkboxes)
-- Create: `<identifier>` (optional dev tool)
+- Create: `scripts/verify_fits_reference_reader.py` (optional dev tool)
 
 - [ ] **Step 1: Full gates**
 
@@ -1804,9 +1804,9 @@ Expected: all green.
 ```python
 #!/usr/bin/env python3
 """Dev-only: validate an athenaeum-written FITS against a Python astronomy library (reference impl).
-Usage: python3 <identifier> <file.fits>"""
+Usage: python3 scripts/verify_fits_reference_reader.py <file.fits>"""
 import sys
-from <identifier>.io import fits
+from <python-astronomy-library>.io import fits
 with fits.open(sys.argv[1]) as hdul:
     hdul.verify('exception')
     print("OK:", repr(hdul[0].header))

@@ -23,6 +23,7 @@ import type {
   WeightMode,
 } from '../../types/stacking';
 import type { FlatNormMode } from '../../types/models';
+import { FLAT_NORM_TRIMMED_MEAN_WHOLE } from '../../types/flat-norm';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
 /** Backend pipeline stages, in execution order. `'masters'` (stage 0.5, owner
@@ -160,7 +161,7 @@ export function normalizePsfModelLabel(v: PsfModel): string {
 export function flatNormModeLabel(v: FlatNormMode): string {
   switch (v) {
     case 'centralThird': return 'central third';
-    case 'pixinsightTrimmed': return 'trimmed';
+    case FLAT_NORM_TRIMMED_MEAN_WHOLE: return 'trimmed';
   }
 }
 

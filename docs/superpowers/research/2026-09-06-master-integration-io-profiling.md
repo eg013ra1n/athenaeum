@@ -134,7 +134,7 @@ Each candidate explanation was checked before the pattern was blamed:
 ## 6. External validation
 
 The reference implementation most owners compare against exposes exactly this
-lever to the user rather than hardcoding it: ImageIntegration has a per-file
+lever to the user rather than hardcoding it: the ERP's integration process has a per-file
 **buffer size** and a total **stack size**, community guidance is that they be
 "specified less than physical RAM", that the process "will break the image
 into sets of rows and process each set as needed", and that leaving them small

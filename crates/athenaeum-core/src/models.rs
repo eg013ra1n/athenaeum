@@ -1218,14 +1218,14 @@ pub struct CatalogMeta {
 ///   the OSC debayer stage, with the cards that record them.
 pub const LIGHT_CAL_ENGINE_VERSION: i64 = 3;
 
-/// Fraction of pixels discarded from EACH tail by the PixInsight-compatible
-/// trimmed mean (`FlatNormMode::PixinsightTrimmed`). Matches PixInsight
-/// ImageCalibration's `flatScaleClippingFactor = 0.05`, identified empirically
-/// against PI's own arithmetic to 1.7e-6 relative (spec §2). The trim indices
-/// are `lo = floor(n * PI_TRIM_FRACTION)`, `hi = n − floor(n * PI_TRIM_FRACTION)`
+/// Fraction of pixels discarded from EACH tail by the whole-frame trimmed mean
+/// (`FlatNormMode::TrimmedMeanWhole`). Matches the ERP's image-calibration flat
+/// scale clipping factor of 0.05, identified empirically against the ERP's own
+/// arithmetic to 1.7e-6 relative (spec §2). The trim indices
+/// are `lo = floor(n * TRIMMED_MEAN_TAIL_FRACTION)`, `hi = n − floor(n * TRIMMED_MEAN_TAIL_FRACTION)`
 /// and the statistic is the f64 mean of `sorted[lo..hi]` — exactness is the
 /// point, so this lives in exactly one place.
-pub const PI_TRIM_FRACTION: f64 = 0.05;
+pub const TRIMMED_MEAN_TAIL_FRACTION: f64 = 0.05;
 
 /// Which statistic normalizes the master flat when normalization is ON
 /// (spec §2, "Normalization statistic is selectable"). Applies only when
@@ -1238,10 +1238,17 @@ pub enum FlatNormMode {
     /// the master's `ATH_FNRM` card and recomputed on the fly when absent.
     #[default]
     CentralThird,
-    /// PixInsight-compatible: a two-sided trimmed mean over the WHOLE frame,
-    /// discarding [`PI_TRIM_FRACTION`] of the pixels from each tail. Always
-    /// computed from the flat file — the `ATH_FNRM` card is ignored.
-    PixinsightTrimmed,
+    /// ERP-compatible: a two-sided trimmed mean over the WHOLE frame,
+    /// discarding [`TRIMMED_MEAN_TAIL_FRACTION`] of the pixels from each tail.
+    /// Always computed from the flat file — the `ATH_FNRM` card is ignored.
+    ///
+    /// Wire/storage compatibility: the persisted string stays the pre-rename
+    /// one (stacking configs in the catalog, the `flat_norm_mode` DB column,
+    /// the frontend's saved preference, the sync request), so an older app
+    /// version still reads what this one writes. The new name
+    /// (`trimmedMeanWhole`) is accepted on read as an alias.
+    #[serde(rename = "pixinsightTrimmed", alias = "trimmedMeanWhole")]
+    TrimmedMeanWhole,
 }
 
 impl FlatNormMode {
@@ -1252,7 +1259,7 @@ impl FlatNormMode {
     pub fn as_wire_str(self) -> &'static str {
         match self {
             FlatNormMode::CentralThird => "centralThird",
-            FlatNormMode::PixinsightTrimmed => "pixinsightTrimmed",
+            FlatNormMode::TrimmedMeanWhole => "pixinsightTrimmed",
         }
     }
 }
@@ -1271,10 +1278,10 @@ pub enum BiasFallback {
 }
 
 /// serde default for [`LightCalParams::trim_fraction`] — the current per-tail
-/// discard fraction ([`PI_TRIM_FRACTION`] = 0.05), so an omitted wire field or a
+/// discard fraction ([`TRIMMED_MEAN_TAIL_FRACTION`] = 0.05), so an omitted wire field or a
 /// stored `'{}'` decodes to today's behavior.
 fn default_trim_fraction() -> f64 {
-    PI_TRIM_FRACTION
+    TRIMMED_MEAN_TAIL_FRACTION
 }
 
 /// serde default for [`LightCalParams::cfa_flat_scaling`] — ON, so an omitted
@@ -1294,9 +1301,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LightCalParams {
-    /// Per-tail discard fraction for the `pixinsightTrimmed` statistic
-    /// (default [`PI_TRIM_FRACTION`] = 0.05). Only meaningful when the flat is
-    /// normalized in `pixinsightTrimmed` mode; stamped as `ATH_CTRM` then.
+    /// Per-tail discard fraction for the `TrimmedMeanWhole` statistic
+    /// (default [`TRIMMED_MEAN_TAIL_FRACTION`] = 0.05). Only meaningful when the flat is
+    /// normalized in `TrimmedMeanWhole` mode; stamped as `ATH_CTRM` then.
     #[serde(default = "default_trim_fraction")]
     pub trim_fraction: f64,
     /// DN added to the output AFTER the scale divide (`out += pedestal_dn /
@@ -1313,7 +1320,7 @@ pub struct LightCalParams {
     /// pattern: a mono light has no channels to separate, so the flag is
     /// inert there and the frame is calibrated exactly as before.
     ///
-    /// Ignored in [`FlatNormMode::PixinsightTrimmed`], which is a
+    /// Ignored in [`FlatNormMode::TrimmedMeanWhole`], which is a
     /// tool-parity statistic over the whole frame — splitting it per channel
     /// would no longer be the statistic it promises. That combination logs a
     /// `debug!` and normalizes globally.
@@ -1324,7 +1331,7 @@ pub struct LightCalParams {
 impl Default for LightCalParams {
     fn default() -> Self {
         Self {
-            trim_fraction: PI_TRIM_FRACTION,
+            trim_fraction: TRIMMED_MEAN_TAIL_FRACTION,
             pedestal_dn: 0.0,
             bias_fallback: BiasFallback::SubtractBias,
             cfa_flat_scaling: true,

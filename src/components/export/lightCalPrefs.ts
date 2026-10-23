@@ -9,6 +9,7 @@
 // absent (private mode, quota) or hold a blob written by an older build.
 
 import type { FlatNormMode, LightCalParams, BiasFallback } from '../../types/models';
+import { FLAT_NORM_TRIMMED_MEAN_WHOLE } from '../../types/flat-norm';
 
 /** localStorage key for the "Normalize master flat" preference (default ON). */
 export const LIGHTCAL_FLATNORM_KEY = 'athenaeum.lightcal.flatNorm';
@@ -83,12 +84,12 @@ export function readFlatNormPref(): boolean {
 }
 
 /** Read the persisted flat-normalization statistic (default centralThird when
- *  unset/corrupt — any value other than the exact 'pixinsightTrimmed' token
+ *  unset/corrupt — any value other than the exact trimmed-mean wire token
  *  falls back to the default). */
 export function readFlatNormModePref(): FlatNormMode {
   try {
-    return localStorage.getItem(LIGHTCAL_FLATNORM_MODE_KEY) === 'pixinsightTrimmed'
-      ? 'pixinsightTrimmed'
+    return localStorage.getItem(LIGHTCAL_FLATNORM_MODE_KEY) === FLAT_NORM_TRIMMED_MEAN_WHOLE
+      ? FLAT_NORM_TRIMMED_MEAN_WHOLE
       : 'centralThird';
   } catch (err) {
     console.warn('[lightCalPrefs] read flat-norm mode failed:', err);

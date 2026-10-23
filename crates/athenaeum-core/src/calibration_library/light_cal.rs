@@ -55,12 +55,12 @@ use crate::integration::IntegrationError;
 use crate::models::FileFormat;
 
 // The shared light-calibration data types + consts (LIGHT_CAL_ENGINE_VERSION,
-// PI_TRIM_FRACTION, FlatNormMode, BiasFallback, LightCalParams) live in
+// TRIMMED_MEAN_TAIL_FRACTION, FlatNormMode, BiasFallback, LightCalParams) live in
 // `crate::models` so ungated consumers (scanner, export) compile with
 // `--no-default-features`. They are re-exported here so
 // this engine and its render-gated callers keep using the `light_cal::` paths.
 pub use crate::models::{
-    BiasFallback, FlatNormMode, LightCalParams, LIGHT_CAL_ENGINE_VERSION, PI_TRIM_FRACTION,
+    BiasFallback, FlatNormMode, LightCalParams, LIGHT_CAL_ENGINE_VERSION, TRIMMED_MEAN_TAIL_FRACTION,
 };
 
 /// Divisor that normalizes a 16-bit source's counts to roughly `[0, 1]`
@@ -132,7 +132,7 @@ pub struct LightCalInputs {
     /// can never disagree about what was applied.
     pub cfa_geometry: Option<CfaGeometry>,
     /// Advanced per-run parameters (spec §2). The engine acts on
-    /// `trim_fraction` (feeds `pixinsightTrimmed` normalization) and
+    /// `trim_fraction` (feeds `TrimmedMeanWhole` normalization) and
     /// `pedestal_dn` (added after the scale divide); `bias_fallback` is enforced
     /// by the orchestration layer BEFORE the engine runs, so the engine is
     /// agnostic to it.
@@ -211,7 +211,7 @@ pub struct LightCalOutcome {
     /// else `None`. `Some` implies [`LightCalOutcome::cfa_scaling_applied`].
     pub flat_channel_divisors: Option<[f64; 3]>,
     /// Whether per-channel scaling was ACTUALLY applied — not merely requested.
-    /// `false` for a mono light, a `pixinsightTrimmed` run, a flat whose channel
+    /// `false` for a mono light, a `TrimmedMeanWhole` run, a flat whose channel
     /// constants came back degenerate, or the toggle simply being off. This is
     /// what the tracking row records.
     pub cfa_scaling_applied: bool,
@@ -633,7 +633,7 @@ fn calibrate_light_compute_inner(
 /// 1. [`LightCalParams::cfa_flat_scaling`] is on (default),
 /// 2. the LIGHT declares a mosaic phase (`cfa` is `Some` — mono lights have no
 ///    channels to separate),
-/// 3. the mode is [`FlatNormMode::CentralThird`] — `pixinsightTrimmed` is a
+/// 3. the mode is [`FlatNormMode::CentralThird`] — `TrimmedMeanWhole` is a
 ///    whole-frame tool-parity statistic and is left alone (`debug!`),
 /// 4. the three constants hold up as divisors, resolved in this order:
 ///    a. the master flat's stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards — all
@@ -670,10 +670,10 @@ pub fn resolve_flat_norm_divisor(
         // of frames and says nothing about this run.
         return global();
     };
-    if mode == FlatNormMode::PixinsightTrimmed {
+    if mode == FlatNormMode::TrimmedMeanWhole {
         tracing::debug!(
             path = %flat_path.display(),
-            "per-channel flat scaling ignored in pixinsightTrimmed mode (whole-frame statistic)"
+            "per-channel flat scaling ignored in trimmed-mean-whole mode (whole-frame statistic)"
         );
         return global();
     }
@@ -775,14 +775,14 @@ fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 
 /// - [`FlatNormMode::CentralThird`] (default, Athenaeum convention): read the
 ///   `ATH_FNRM` card an Athenaeum-built master stamps, or — for a flat imported
 ///   without it — recompute the central-third mean on the fly.
-/// - [`FlatNormMode::PixinsightTrimmed`] (whole-frame parity statistic): a
+/// - [`FlatNormMode::TrimmedMeanWhole`] (whole-frame parity statistic): a
 ///   two-sided trimmed mean over the WHOLE frame (`trim_fraction` per tail, default
-///   [`PI_TRIM_FRACTION`]). ALWAYS computed from the flat file; the `ATH_FNRM`
+///   [`TRIMMED_MEAN_TAIL_FRACTION`]). ALWAYS computed from the flat file; the `ATH_FNRM`
 ///   card is ignored.
 ///
-/// `trim_fraction` is only consulted in `PixinsightTrimmed` mode (the
+/// `trim_fraction` is only consulted in `TrimmedMeanWhole` mode (the
 /// central-third path never trims); callers in central-third mode may pass
-/// [`PI_TRIM_FRACTION`].
+/// [`TRIMMED_MEAN_TAIL_FRACTION`].
 ///
 /// Whatever the mode, the resolved constant must be finite and strictly
 /// positive to serve as a divisor — anything else is
@@ -811,13 +811,13 @@ pub fn flat_norm_constant(
                 mean
             }
         }
-        FlatNormMode::PixinsightTrimmed => {
+        FlatNormMode::TrimmedMeanWhole => {
             // Whole-frame parity: the card's meaning (central-third) does not
             // match this statistic, so it is deliberately ignored — always
             // computed from the flat's pixels.
             let (_w, _h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
             let mean = two_sided_trimmed_mean(&data, trim_fraction);
-            tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, trim_fraction, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
+            tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, trim_fraction, "flat normalization from full-frame trimmed mean");
             mean
         }
     };
@@ -931,7 +931,7 @@ pub fn flat_corner_ratio(
 /// Two-sided trimmed mean over the whole plane, discarding exactly
 /// `trim_fraction` of the pixels from EACH tail (a common two-sided clipping
 /// convention for flat normalization, spec §2; `trim_fraction` defaults to
-/// [`PI_TRIM_FRACTION`], the advanced param exposes it). Sorts a copy (total
+/// [`TRIMMED_MEAN_TAIL_FRACTION`], the advanced param exposes it). Sorts a copy (total
 /// order, NaN-tolerant) and averages the surviving middle in f64:
 /// `lo = floor(n·f)`, `hi = n − floor(n·f)`, mean over `sorted[lo..hi]`.
 ///
@@ -1457,13 +1457,13 @@ mod tests {
         let expected = central_third_mean(&fdata, w, h);
         assert!(expected > 100.0, "central-third mean must reflect the gradient");
 
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-9, "recomputed {got}, want central-third mean {expected}");
 
         // And when the card IS present it takes precedence over recomputation,
         // even with identical pixel data (value differs from the mean above).
         let flat_carded = write_fill(dir.path(), "flat_carded.fits", w, h, fill, &[fnrm_card(999.0)]);
-        let carded = flat_norm_constant(&flat_carded, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
+        let carded = flat_norm_constant(&flat_carded, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((carded - 999.0).abs() < 1e-9, "ATH_FNRM card must win over recomputation, got {carded}");
     }
 
@@ -1472,14 +1472,14 @@ mod tests {
         // 1000 distinct values 0..=999 → trim floor(1000*0.05)=50 from each
         // tail → mean of sorted[50..950] = mean(50..=949) = (50+949)/2 = 499.5.
         let vals: Vec<f32> = (0..1000).map(|i| i as f32).collect();
-        let m = two_sided_trimmed_mean(&vals, PI_TRIM_FRACTION);
+        let m = two_sided_trimmed_mean(&vals, TRIMMED_MEAN_TAIL_FRACTION);
         assert!((m - 499.5).abs() < 1e-9, "trimmed mean {m}, want 499.5");
 
         // Order-independent: shuffling the input must not change the statistic
         // (the fn sorts internally).
         let mut rev: Vec<f32> = vals.clone();
         rev.reverse();
-        assert!((two_sided_trimmed_mean(&rev, PI_TRIM_FRACTION) - 499.5).abs() < 1e-9);
+        assert!((two_sided_trimmed_mean(&rev, TRIMMED_MEAN_TAIL_FRACTION) - 499.5).abs() < 1e-9);
     }
 
     #[test]
@@ -1507,7 +1507,7 @@ mod tests {
             let i = (y * w + x) as f32;
             i * i
         }, &[]);
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, 0.10).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::TrimmedMeanWhole, 0.10).unwrap();
         assert!((got - expected).abs() < 1e-2, "engine trim-0.10 path {got} vs formula {expected}");
     }
 
@@ -1541,18 +1541,18 @@ mod tests {
     }
 
     #[test]
-    fn pixinsight_trimmed_mode_ignores_fnrm_card() {
+    fn trimmed_mean_whole_mode_ignores_fnrm_card() {
         // A 40x25 = 1000-pixel plane of the distinct values 0..=999, stamped
-        // with a BOGUS ATH_FNRM card. PixinsightTrimmed must IGNORE the card and
+        // with a BOGUS ATH_FNRM card. TrimmedMeanWhole must IGNORE the card and
         // return the trimmed mean 499.5; CentralThird must read the card (999.0).
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (40usize, 25usize);
         let flat = write_fill(dir.path(), "flat_trim.fits", w, h, |x, y| (y * w + x) as f32, &[fnrm_card(999.0)]);
 
-        let trimmed = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, PI_TRIM_FRACTION).unwrap();
+        let trimmed = flat_norm_constant(&flat, dir.path(), FlatNormMode::TrimmedMeanWhole, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((trimmed - 499.5).abs() < 1e-6, "trimmed {trimmed}, want 499.5 (card ignored)");
 
-        let central = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
+        let central = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((central - 999.0).abs() < 1e-9, "central-third must read the card verbatim, got {central}");
     }
 
@@ -1580,12 +1580,12 @@ mod tests {
             }
         }
         assert!(data.iter().all(|v| v.is_finite()), "fixture must be NaN-free");
-        let expected = two_sided_trimmed_mean(&data, PI_TRIM_FRACTION);
+        let expected = two_sided_trimmed_mean(&data, TRIMMED_MEAN_TAIL_FRACTION);
         // Sanity: the trimmed mean sits strictly inside the value range.
         let (mn, mx) = data.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!((mn as f64) < expected && expected < (mx as f64), "trimmed mean {expected} outside ({mn},{mx})");
 
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, PI_TRIM_FRACTION).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::TrimmedMeanWhole, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-3, "engine path {got} vs direct formula {expected}");
     }
 
@@ -1703,7 +1703,7 @@ mod tests {
         }
         let expected = central_third_mean(&fdata, w, h);
 
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-9, "bogus card must fall through to recompute: {got} vs {expected}");
     }
 
@@ -1715,7 +1715,7 @@ mod tests {
         // by it is meaningless, so the run fails loudly instead of silently
         // producing Inf.
         let flat = write_plane(dir.path(), "flat_dead.fits", w, h, 0.0, &[]);
-        let r = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION);
+        let r = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION);
         assert!(matches!(r, Err(IntegrationError::BadInput(_))), "expected BadInput, got {r:?}");
     }
 
@@ -2045,11 +2045,11 @@ mod tests {
         assert_eq!(outputs[0][0], expect_px(1000.0, None, Some(2000.0), 2000.0));
     }
 
-    /// `pixinsightTrimmed` is a whole-frame parity statistic — per-channel
+    /// `TrimmedMeanWhole` is a whole-frame parity statistic — per-channel
     /// scaling is ignored there, so the output matches the toggle-off run
     /// bit-for-bit and the row records that nothing per-channel was applied.
     #[test]
-    fn pixinsight_trimmed_mode_ignores_per_channel_scaling() {
+    fn trimmed_mean_whole_mode_ignores_per_channel_scaling() {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (6usize, 6usize);
         let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
@@ -2067,18 +2067,18 @@ mod tests {
                 true,
                 out.clone(),
             );
-            cfg.flat_norm_mode = FlatNormMode::PixinsightTrimmed;
+            cfg.flat_norm_mode = FlatNormMode::TrimmedMeanWhole;
             cfg.params.cfa_flat_scaling = on;
             cfg.cfa_geometry = Some(rggb_geom());
             let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
             assert!(
                 !outcome.cfa_scaling_applied,
-                "pixinsightTrimmed must stay whole-frame (toggle = {on})"
+                "TrimmedMeanWhole must stay whole-frame (toggle = {on})"
             );
             let (_, _, data) = read_all(&out, dir.path());
             outputs.push(data);
         }
-        assert_eq!(outputs[0], outputs[1], "the toggle must not change PI-mode output");
+        assert_eq!(outputs[0], outputs[1], "the toggle must not change trimmed-mean-mode output");
     }
 
     /// A degenerate channel constant (the flat has no pixels of one colour at

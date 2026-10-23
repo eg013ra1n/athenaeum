@@ -62,15 +62,15 @@ pub struct LightCalCardInputs {
     pub flat_norm_divisor: f64,
     /// The `[R, G, B]` constants when the flat was normalized per CFA channel
     /// → `ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB` plus `ATH_CCFA = T`. `None` (mono
-    /// light, toggle off, `pixinsightTrimmed`, or degenerate constants) stamps
+    /// light, toggle off, `TrimmedMeanWhole`, or degenerate constants) stamps
     /// none of the four, so a globally-normalized output's header is byte-for-
     /// byte what it was before per-channel scaling existed.
     pub flat_channel_divisors: Option<[f64; 3]>,
     /// Output pedestal in DN (advanced param, spec §2). Stamped as `ATH_CPED`
     /// ALWAYS — even when 0 — so the value that produced this file is on record.
     pub pedestal_dn: f64,
-    /// Per-tail trim fraction, `Some` only when the `pixinsightTrimmed`
-    /// statistic was actually used (normalization on + PI mode + a flat
+    /// Per-tail trim fraction, `Some` only when the `TrimmedMeanWhole`
+    /// statistic was actually used (normalization on + TrimmedMeanWhole mode + a flat
     /// applied); stamped as `ATH_CTRM` then, omitted otherwise.
     pub trim_fraction: Option<f64>,
 }
@@ -184,7 +184,7 @@ pub fn build_light_cal_cards(
         }
     }
 
-    // The per-tail trim fraction is provenance only in pixinsightTrimmed mode —
+    // The per-tail trim fraction is provenance only in TrimmedMeanWhole mode —
     // stamped only when that statistic was actually used (spec §2).
     if let Some(trim) = inputs.trim_fraction {
         b = b.custom(
@@ -340,7 +340,7 @@ mod tests {
             Some(CardValue::Integer(v)) if v == crate::models::LIGHT_CAL_ENGINE_VERSION
         ));
 
-        // ATH_CPED is stamped ALWAYS (0.0 here); ATH_CTRM only in PI mode (absent).
+        // ATH_CPED is stamped ALWAYS (0.0 here); ATH_CTRM only in TrimmedMeanWhole mode (absent).
         let ped = find("ATH_CPED").expect("ATH_CPED card always present");
         assert!(matches!(ped.value, Some(CardValue::Real(v)) if v.abs() < 1e-9));
         assert!(find("ATH_CTRM").is_none(), "trim_fraction None -> no ATH_CTRM card");
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn pedestal_and_trim_cards() {
-        // Non-zero pedestal + PI-mode trim → both cards present with their values.
+        // Non-zero pedestal + TrimmedMeanWhole-mode trim → both cards present with their values.
         let mut inputs = base_inputs();
         inputs.pedestal_dn = 200.0;
         inputs.trim_fraction = Some(0.1);
@@ -407,7 +407,7 @@ mod tests {
 
         let ped = find("ATH_CPED").expect("ATH_CPED card");
         assert!(matches!(ped.value, Some(CardValue::Real(v)) if (v - 200.0).abs() < 1e-9));
-        let trm = find("ATH_CTRM").expect("ATH_CTRM card in PI mode");
+        let trm = find("ATH_CTRM").expect("ATH_CTRM card in TrimmedMeanWhole mode");
         assert!(matches!(trm.value, Some(CardValue::Real(v)) if (v - 0.1).abs() < 1e-9));
 
         // Both must render cleanly (short comments, well under the fixed-card

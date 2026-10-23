@@ -115,7 +115,7 @@ let cat_quads: Vec<QuadLookup> = if let (Some((ra0,dec0)), Some(scale)) =
 - [ ] **Step 3** — pass `local_quad_center = hints.ra.zip(hints.dec)` from
   `solve_cascade` stage 1 (hinted) only; `None` for the scale-cleared/blind
   stages and the FOV-ladder rungs (those keep global-index behaviour).
-- [ ] **Step 4 — bench gate**: `<identifier>=1` full bench.
+- [ ] **Step 4 — bench gate**: `<external-solver bench skip env var>=1` full bench.
   **Acceptance:** the 13 currently-correct frames stay correct (Δpos<30",
   Δscl<2%), 0 panics, 0 false positives; M51 and/or M78 newly correct.
   If any of the 13 regress → iterate on `max_stars`/`group_size`/cone radius

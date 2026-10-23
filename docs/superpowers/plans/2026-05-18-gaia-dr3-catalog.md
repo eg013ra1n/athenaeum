@@ -98,7 +98,7 @@
 
 ## Task 9: Bench closure (after Task 8)
 
-- [ ] `BENCH_SOLVER_BACKEND=<identifier> <identifier>=1 cargo test --release -p athenaeum-core --test <identifier> -- --ignored --nocapture` (Gaia now auto-selected by `with_catalog_dir`).
+- [ ] `BENCH_SOLVER_BACKEND=<external-solver backend value> <external-solver bench skip env var>=1 cargo test --release -p athenaeum-core --test <external-solver bench test> -- --ignored --nocapture` (Gaia now auto-selected by `with_catalog_dir`).
 - [ ] **Success = M78 AND `_DSC5767` now solve** (Δpos within tol of cached truth), 0 false positives/panics. This validates the entire plate-solver rewrite premise. Record outcome; update auto-memory.
 
 ## Risks

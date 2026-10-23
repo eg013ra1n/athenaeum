@@ -427,7 +427,7 @@ pub fn resolve_generation_cached(
         pedestal_dn: opts.params.pedestal_dn,
         trim_fraction: if flat_applied
             && opts.flat_norm
-            && opts.flat_norm_mode == FlatNormMode::PixinsightTrimmed
+            && opts.flat_norm_mode == FlatNormMode::TrimmedMeanWhole
         {
             Some(opts.params.trim_fraction)
         } else {

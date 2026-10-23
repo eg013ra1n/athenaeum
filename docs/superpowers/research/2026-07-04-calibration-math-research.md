@@ -69,7 +69,7 @@ produce ~1/K-scaled output instead of ADU-scale output.
 
 ### 3. Dark optimization model and algorithm — HIGH (9-0)
 
-The ERP (Juan Conejero, primary source): the uncalibrated light is modeled as
+The ERP (its authors, primary source): the uncalibrated light is modeled as
 `I = I0 + k·D + B`, where B is the bias pedestal and D the bias-separated
 (thermal-only) master dark; optimization estimates the single multiplicative
 scalar k. k is found by golden-section search (1/1000 fractional accuracy)
@@ -81,7 +81,7 @@ equivalent pair: noise-minimizing auto coefficient, or exposure-ratio coefficien
 both require the dark to be bias-subtracted first.
 
 - Sources: the ERP's forum thread 8529 ("Dark frame optimization algorithm",
-  Conejero, verbatim quotes); the open-source stacker's calibration docs; its `calibrate -opt`.
+  its authors, verbatim quotes); the open-source stacker's calibration docs; its `calibrate -opt`.
 
 ### 4. Dark optimization decision rule for modern CMOS — HIGH (6-0)
 
@@ -113,7 +113,7 @@ all three calibration masters (dark, flat, offset/bias) is per-pixel **MEDIAN**
 ### 6. Raw vs calibrated master darks — two valid conventions, do not mix — HIGH (6-0)
 
 The ERP integrates dark frames **RAW** (bias still included) and defers bias
-subtraction of the master dark to calibration time inside ImageCalibration
+subtraction of the master dark to calibration time inside the ERP's calibration process
 (because dark optimization must rescale only the thermal component); WBPP still
 defaults to this ("Calibrate Master Darks" handled internally). The third stacker
 instead produces **CALIBRATED** master darks and dark-flats (master offset
@@ -157,9 +157,9 @@ CCD-era ERP alternative is master bias + dark-optimized scaled master dark
 **Safest engine default: use a dark-flat if the user supplies one (always
 correct, near-zero cost), else synthetic/real bias.**
 
-- Sources: the open-source stacker blog "Enough with dark flats" (lead dev Cyril Richard); its
+- Sources: the open-source stacker blog "Enough with dark flats" (by the open-source stacker's lead developer); its
   synthetic-biases tutorial + 1.5.x command docs; the ERP master-frames
-  tutorial; corroborated by Adam Block.
+  tutorial; corroborated by a well-known astrophotography educator.
 - Note: a related claim narrowing the exceptions to *exactly* two cases was
   refuted 0-3 as too strong.
 

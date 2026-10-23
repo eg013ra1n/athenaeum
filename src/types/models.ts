@@ -504,19 +504,19 @@ export type MergeLogEntry = { id: number, frames_set_id: number, occurred_at: st
 export type FlatContourOpts = { 
 /**
  * Resampling factor in percent. Final width/height are
- * `original * resolution_pct / 100`. PI range: 5..=100.
+ * `original * resolution_pct / 100`. ERP range: 5..=100.
  */
 resolutionPct: number, 
 /**
- * Gaussian blur sigma in pixels (post-resample). PI range: 0..=10.
+ * Gaussian blur sigma in pixels (post-resample). ERP range: 0..=10.
  */
 sigmaPx: number, 
 /**
- * Number of discrete contour bands. PI range: 4..=20 (default 15).
+ * Number of discrete contour bands. ERP range: 4..=20 (default 15).
  */
 contours: number, 
 /**
- * Boundary-emphasis strength as a percentage. PI range: 0..=200,
+ * Boundary-emphasis strength as a percentage. ERP range: 0..=200,
  * default 50. Higher values darken the band boundaries more.
  */
 gradientPct: number, };
@@ -763,9 +763,9 @@ export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 
 export type LightCalParams = { 
 /**
- * Per-tail discard fraction for the `pixinsightTrimmed` statistic
- * (default [`PI_TRIM_FRACTION`] = 0.05). Only meaningful when the flat is
- * normalized in `pixinsightTrimmed` mode; stamped as `ATH_CTRM` then.
+ * Per-tail discard fraction for the `TrimmedMeanWhole` statistic
+ * (default [`TRIMMED_MEAN_TAIL_FRACTION`] = 0.05). Only meaningful when the flat is
+ * normalized in `TrimmedMeanWhole` mode; stamped as `ATH_CTRM` then.
  */
 trimFraction: number, 
 /**
@@ -785,7 +785,7 @@ biasFallback: BiasFallback,
  * pattern: a mono light has no channels to separate, so the flag is
  * inert there and the frame is calibrated exactly as before.
  *
- * Ignored in [`FlatNormMode::PixinsightTrimmed`], which is a
+ * Ignored in [`FlatNormMode::TrimmedMeanWhole`], which is a
  * tool-parity statistic over the whole frame — splitting it per channel
  * would no longer be the statistic it promises. That combination logs a
  * `debug!` and normalizes globally.
