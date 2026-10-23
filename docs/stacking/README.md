@@ -1869,7 +1869,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   `measurement_subtree`, `registration_subtree` and `normalization_subtree` (helpers `*_with_measure_version`).
   `calibration_subtree` and the prepare subtree do not carry it, so a bump never recalibrates.
 - **Policy.** ONE bump per merged plan that changes what a fit accepts or measures, never one per task. Plan A is 4;
-  Plan C (the Analysis switch) is 5. `AnalysisConfig::config_hash` is Plan C's.
+  Plan B is 5 (B4: `c`'s point-source screen and SNR floor, R-OSP-16 B4); Plan C (the Analysis switch) is 6.
+  `AnalysisConfig::config_hash` is Plan C's. The `MEASURE_VERSION` doc in `star_measure/mod.rs` states the same.
 - **Risk.** The first run after Plan A re-measures, re-registers (mono) and re-normalizes every set; the `calib`
   column of the stage-hash golden literals is unchanged, every other column moved
   (`stage_hashes_are_pinned_to_golden_literals`). Task 11b adds a once-only ripple of its own: every `Auto` set
@@ -2569,9 +2570,14 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       code layout, not work: on the mono frame (5 rotations) base reads 1 740-1 761 ms, round 3 1 856-1 879, round 4
       1 726-1 835, and round 4 with a five-line timer added inside `aperture_correction` 1 659-1 721 - faster than base
       while doing the same work; the `c` computation itself times 5.4-5.7 ms. Nothing to fix.
-    - **Fallbacks.** Fewer than 5 ratios: `c = 1`, `aperture_correction = None`, ONE `warn!` per plane. No fit on the
-      plane (defocused verdict, starless): `None`, `debug!` only. A CFA-masked plane (Plan C, no production caller today)
-      gets `c = 1` by these rules: **a Plan C carry**.
+    - **Fallbacks.** Fewer than 5 ratios (floor (i)): the module's `c = 1`, `aperture_correction = None`, ONE `warn!` per
+      plane. In a stacking group (Plan B B4, R-PB4-5, R-OSP-16 B4) such a plane then takes the group channel's median kept
+      `c` in the weights when at least 2 peers carry one (`tflux`, `tmean_flux` × m; `psf_signal_weight`, `psf_snr` × m²;
+      recorded in `aperture_correction_group`), in `measure_group_finish` only; under 2 peers `c = 1` stays; the module, the
+      `.athf` fits and the `metrics` payload keep `None`. No fit on the plane (defocused verdict, starless): `None`,
+      `debug!` only, never substituted. A CFA-masked plane (Plan C, no production caller today) gets `c = 1` by these
+      rules: **a Plan C carry**. Plan B B4 also narrows the qualifying stars: on a 3-plane colour image the point-source
+      screen (PB-12', R-PB4-2), and on every plane `StarFit.snr` ≥ 20 (PB-13'); the top 64 by model flux stands.
     - **Surfaces.** `FluxCorrection::{FromPlane (default), Given(f64)}` on `FitStarsOptions` (LN: `FromPlane` on each
       side), with `full_scale` and the borrowed `footprint` (round 4; `FitStarsOptions<'a>`), and
       `star_measure::fit_stars_with_model` (`fit_stars_at` with β from a `PsfModel`, LN's reference side); `FitOutcome` and both `PlaneMeasurement`s carry `aperture_correction` and `aperture_stars` (the qualifying
@@ -3933,6 +3939,110 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     family represents real OSC crowding; no mono family reaches set 204 / run B crowding (max 0.0597 against 0.0753 / 0.0849). (4) Lab hygiene (B6):
     `planb.sh truth` exits 4 on refusals only; `ln_truth_run --far` prints an intercept beyond 2 SE without a usability rule (moot: nothing reads).
     No product code changed in B2 (B0's core line, 4105 / 0 / 20, stands); lab suites at bbc6a29: star-lab 1335 OK, harness 349 OK (2 skipped).
+  - **R-OSP-16 - Plan B B4: `c`'s screen and sample, the two floor verdicts, `MEASURE_VERSION` 5 (Task B4; branch `plan-b`, code
+    21c151a0 + review fix 71a4a738 + floor (i) 13aee664; plan `### Task B4`; lab `star-lab/results/plan-b/b4/`, its `verdict.md` the
+    package, lab e3e85ec). `c` moves by design (R-B11); on the three real trees nothing moved.**
+    *The point-source screen (PB-12', R-PB4-2, R-PB4-3).* On a debayered colour image (adapter colour, exactly 3 planes) a `c`
+    candidate (after `in_statistic`, a finite model and the clip screen) with no SEED of another plane within
+    max(`POINT_SOURCE_MATCH_PX` = 1.5 px, 0.5 × the plane's field FWHM) of its fitted centre leaves the list before the sort. The
+    siblings are the other planes' `prep.seeds`, gathered after `cross_plane_flags` in both multi-plane entries and handed to the
+    correction through `finish_plane`: a sibling's at-β fits do not exist yet when a plane's `c` is computed, so PB-12's "no fit on
+    any sibling" was not buildable, and the seeds refuse the same stars in the dumps. Mono, one-plane images and LN's per-plane refits
+    are not screened. The radius grows with F because the R–G / G–B centroid offset (atmospheric dispersion, lateral colour) scales
+    with the sampling as the seeing does (the review's Important 1); set 204 OSC (F ≈ 1.3–1.6 px) stays at 1.5 px. Logged
+    `point_source` on the debug `"aperture correction measured"` line and on the under-5 warn (`skipped` stays the clip count);
+    `PlaneMeasurement.point_source_screened` (reported, not persisted); probe `pointSourceScreened`; dictionary `point_source`.
+    *The sample (PB-13').* `c` = the median of the 64 brightest candidates by model flux (ties by seed index; R13b-6 stands) among those
+    passing the screen with `StarFit.snr` ≥ `CORRECTION_MIN_SNR` = 20 (NaN fails); no strata; `CORRECTION_MIN_RATIOS` stays 5. `star_snr`
+    runs before `aperture_correction` in `fit_at_width` and `correct_at_ring` (it never reads `c`); HFR stays after. Logged `below_snr`
+    beside `point_source`; probe `apertureBelowSnr`, `apertureTerciles` (the terciles of the ≤ 64 sample, never read) and
+    `--dump-ratios`; dictionary `below_snr`. F-12 asked for a brightness-stratified sample; Step 0b (opus, existing frames only)
+    refused it: on 344 lab planes with truth every stratified or mid-band option moved some family's `c` away from truth by more
+    than 2 SE (4 × 16 brightest per quartile 47 planes, rank-spread 74, mid-band 85, no cap 33), the top 64 at SNR ≥ 20 after the
+    screen 0. Lab truth is brightness-flat to < 1 % at SNR ≥ 20; the raw 0004 p0 trend (aperture / model 1.57 → about 1.2) is a
+    β-bound fit bias (the fitted FWHM grows with faintness, β at the 1.5 floor), not a profile property. Step 0b's screen reads: lab
+    truth 0 of 15 715 refused at SNR ≥ 20, raw real stars 0 of 6620, 0013 p0 hot pixels 35 / 35, set 204 OSC ≤ 0.15 % per plane.
+    *`MEASURE_VERSION` 5 and its ripple.* 4 → 5, Plan B's one bump (R-OSP-1's policy). `"measureVersion"` moves the three fit-reading
+    stage hashes (`measurement_subtree`, `registration_subtree`, `normalization_subtree`; pin
+    `measure_version_five_moves_the_three_fit_reading_subtrees_only`); `calibration_subtree` is unchanged; the `plan.rs` goldens are
+    re-recorded. The first stack after the upgrade re-measures, re-registers and re-normalizes every set once and never re-calibrates.
+    R-PB0-8's condition (B0 reaches main only with version 5) is met.
+    *Floor (i): the product change (R-PB4-5, 13aee664).* At the end of Measure for a group (after pass 2, BEFORE the weights), per
+    channel, m = the median kept `c` over the group's members carrying one (`channel_c_summary`'s median, the value of the per-channel
+    info). Every member plane at floor (i) (`aperture_correction` None AND `stars_fitted` > 0, R-PB0-4) is rescaled when at least 2
+    peers carry `c`: `tflux`, `tmean_flux` × m; `psf_signal_weight`, `psf_snr` × m² (exactly `c`'s effect, no refit). Under 2 peers c = 1
+    stays and the module's warn is the record. `aperture_correction` / `_se` / `_stars` stay None; the additive
+    `ChannelMeasurement.aperture_correction_group: Option<f64>` records m. The substitution lives in the fold (`measure_group_finish`;
+    `take_group_c`, `at_floor`), never in `aperture_correction`, the `.athf` fits or the `metrics` payload, and m is re-derived from the
+    group's current members every run, cache hits included. Logs: info `"measure: floored planes took the group channel's median
+    aperture correction"` (`count`, `aperture_correction`) per (group, channel) with a substituted plane, and the per-plane debug; no
+    new field name. LN is untouched (F1's scale is `c`-free). `MEASURE_VERSION` stays 5, no stage hash moves; pin
+    `fit_call_floor_behaviour_matches_the_owner_ruling`.
+    *Floor (ii): kept (R-PB4-6).* Not reached in the product; the code stays as built (1–4 growth pairs keep the factor with a warn,
+    0 pairs factor 1 with a warn), nothing removed. The LN model fixes cycle's owed question ("fall back to 1 below 5 pairs?") closes
+    as moot. Pins: `a_growth_curve_over_a_few_pairs_reports_the_count_and_keeps_c`, `a_growth_curve_without_a_qualifying_pair_keeps_c_one`.
+    *The verdicts and the numbers (`verdict.md`; every value copied from the lab files).* Both floors by the rule (R-B13 / R-B16);
+    the owner's STOP (PB-18) delegated to fable:
+
+    | floor | counted | median abs(error): c = 1 / own 1–4 ratios / group's median kept c | paired difference | verdict |
+    | ---- | ---- | ---- | ---- | ---- |
+    | (i) Measure's fit-call floor | 183 planes, 2 datasets (lab-d200, s204-osc) | 19.079 % / 14.726 % / 2.540 % | c = 1 − arm 3 +16.539 ± 0.654 %; own − arm 3 +12.185 ± 1.020 % | favours arm 3 → R-PB4-5 |
+    | (ii) LN F1's growth floor | 0 of 504 cases / 72 windows | — | — | not reached (lowest 14 growth pairs) → R-PB4-6 |
+
+    Floor (ii): 193 cases excluded by `MIN_MATCHES` 20 first, 294 kept ≥ 20 selected pairs with ≥ 14 growth pairs; fewer than 5 of
+    ≥ 20 needs ≥ 75 % of the matched stars within 5F of an edge, which no crop, 2 × 2 binning or masked corner produced. Floor (i):
+    a floored R plane (f28889) weighs 0.303 of its group at c = 1 and 0.888 at its reference `c`, psfSel's s 0.586 / 1.064 (arm 3) /
+    1.003 (uncropped); on the after-run DBs a random member sits |c / median − 1| p50 / p90 8.2 / 21.8 % (set 204 OSC p0), 8.2 / 18.5 % (run B p0), 1.5 / 5 %
+    (p1), 2.2 / 7.5 % (p2), 2.4–2.8 / 11.5 % (mono), 1.4–2.2 / 6 % (Horse C11), where c = 1 errs by 45 % (R), 16 % (G / B), 12 % (mono).
+    *The × 0.40 R case (raw 0004 → 0013, debayered).* X1 PASS: 0013 p0 `pointSourceScreened` 1984 (bar ≥ 36), 0 hot pixels among
+    the product's 33 qualifiers. X2 as written MISSED (R signal ratio 0.9208 against the G / B mean 0.9531, −3.39 % vs 3 %), and
+    R-PB4-4 re-reads it on `c`: R's `c` ratio 0.8615 against the G / B mean 0.8601, +0.17 % (2 SE 7.86 %) PASS; the −3.39 % is the
+    c-free model-flux part (−3.56 %: R at the β 1.5 floor, F 1.43 → 1.47 against G 1.76 → 2.04), out of any `c`'s reach; Plan A's
+    hot-pixel sample reads 0.634, −26.3 %. Sharp R at the group β 2.2436 (calibrated 0176 → 0206): B4's `c` equals B0's kept `c`
+    (p0 1.934 / 1.210), signal ratio p0 0.6801 against 0.9695 / 0.9761 on G / B (reported).
+    *The lab cycle (runner, `b4-c2` at 71a4a738; lab db9003e, d04546b).* 1041 / 1041 probes and 109 / 109 inject outputs proven,
+    73 403 scorecard rows. BAR PASS: F5.1 spread +0.76 % (f2.6) / +1.41 % (f8.0) against ≤ 2 %; psfSel blur pairs +1.72 / +1.19 %
+    against ± 2 %, 60 Moffat / Gaussian and wing cells 0 miss against ± 1.2 %; R13 0 of 130 row-6 cells beyond 2 SE of Plan A; `halo`
+    0.9984 (Plan A 0.9984); the screen refused 0 truth stars on the 10 clean colour families and screened nothing on mono; floor (i)
+    planes 0 of 396 before and after. noreg FAILED first on 11 analysis-mode row-6 cells (mono plane 0: density/d5, spikes/c0010/m4/
+    f12.0 ± clean, spikes/b/m4/f12.0/clean): R-PB4-7 accepts them as PB-13' on the shared `aperture_correction` (the SNR floor runs on
+    every plane), mirroring the measure path's set-aside cells (d5 +0.55 % on both; pooled analysis-mode median 0.9980, mean |bias|
+    0.0124 before and after); with that design entry the re-diff on the stored scorecards PASSES (0 moved); cumulative vs t01c 0 moved;
+    same-star WORSE bins none. The inject per-frame row-6 table printed 0 frames (a lab reader gap, fixed in lab 5b01e0a after the
+    probe dirs were deleted), so B4's table is not printed; the inject scorecard is proven and judged by noreg.
+    *Master level (the after-runs at 71a4a738 against B0's, picks pinned to B0's, R-B11).*
+
+    | tree | staleness: measured / registered / normalized | weights ρ per group | movers | spec §8 summary | LN vs truth, re-based |
+    | ---- | ---- | ---- | ---- | ---- | ---- |
+    | Horse C11 (69845) | 106 / 101 / 101 | G 1.0000, L 1.0000 | 0 | 6 / 6 PASS | +0.00 % |
+    | run B (123) | 386 / 184 / 184 | mono 1.0000, OSC 0.9999 | 0 | 6 / 6 PASS | +0.00 % |
+    | set 204 (28949) | 407 / 197 / 197 | mono 1.0000, OSC 0.9999 | 0 | 6 / 6 PASS | ± 0.00 % (B0 within 0.01 %) |
+
+    Master median / MAD / noise within 0.05 %, FWHM within 0.36 % (set 204 OSC drizzle 2× p0, a measured-β difference), rejected
+    fractions identical; set 204's absolute drizzle level 3 / 4 and coverage 2 / 4 read as at the base. The `c` tables equal B0's,
+    at_floor 0 everywhere: no real plane reaches floor (i), and the screen and the SNR floor leave the 64-star samples unchanged.
+    Floor (i) proof at 13aee664 (lab dcde2e0): the set 204 re-run against the B4 after-run, ρ 1.0000, 0 movers, 0 substitution lines.
+    *Rulings.*
+    - PB-12': the point-source screen (sibling seeds, colour only); PB-13': the top 64 by model flux at SNR ≥ 20, no strata.
+    - R-PB4-1: B4 Step 0's runs use the B0 build (identity proven, R-PB1-1).
+    - R-PB4-2: the screen's radius is max(1.5 px, 0.5 × the field FWHM).
+    - R-PB4-3: the screen only on a 3-plane colour image; `StarFit::snr`'s doc (read before `c`); `apertureTerciles` stays the sample's.
+    - R-PB4-4: the × 0.40 bar reads the `c` ratio within max(3 %, 2 SE) of the G / B mean; the signal and c-free ratios are reported.
+    - R-PB4-5: a floor-(i) plane takes its group channel's median kept `c` in the fold (≥ 2 peers), never in the payload.
+    - R-PB4-6: floor (ii) not reached in the product; the code stays; the LN question closes.
+    - R-PB4-7: the 11 analysis-mode row-6 moves are PB-13' by design; design.json sets aside analysis-mode row 6.
+    *Open items carried.* (1) Plan C: on raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of
+    the bright stars from `c`'s sample frame-dependently and `c` follows by ± 20 % (R-PB4-4); the group-β path is not shown to share it.
+    (2) Plan C: the crowded-field `c` bias on density/d5, +0.8 % (R-PB4-7). (3) Plan C: a seeing-conditioned stand-in for floor (i)
+    (nearest peers by `fwhm_px`), unmeasured; the stand-in's R error is seeing-sized (p90 22 %). (4) PB-13''s known limits: OSC R / B
+    `c` +4–7 % above truth on 44 / 48 lab rows whatever the sample; cost if wrong about 8 % over-correction of faint stars on β-bound
+    undersampled R. (5) The `metrics` payload shows a floored plane's module `c` (None) while its weight is substituted; an additive
+    per-frame field would make it visible (optional). (6) If B3 adopts psfSel, LN's own floor (i) takes the same m through
+    `FluxCorrection::Given` (a B3 / B5 line). (7) The ERP's 15 "no file" units are Task 14b's families (14 `spikes/*`,
+    `under/gauss/f1.5/i0`), a Plan A debt; B3's tables are unaffected. (8) Lab hygiene (B6): the harness flake
+    `test_planb_b2 …lock_that_stays_held_exits_75…` (full suite only); the runner's stray `star-lab/true/` profile file.
+    *Suites.* `cargo test -p athenaeum-core --all-targets --no-fail-fast` at 13aee664: 28 binaries 4115 passed / 0 failed / 20 ignored
+    (B0's 4105 + 10). Lab at the tools commit: star-lab 1408 OK, harness 388 with that one flake.
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and

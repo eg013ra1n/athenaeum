@@ -831,7 +831,7 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   SE) bind the lab cycle; ρ is reported here (B4 moves the weights by design).
 
 **Steps.**
-- [ ] **Step 0 — the floor cases, before any code (lab code sonnet ≈ 3 h; runs sonnet ≈ 2 h at the 068cf2d6 binaries,
+- [x] **Step 0 — the floor cases, before any code (lab code sonnet ≈ 3 h; runs sonnet ≈ 2 h at the 068cf2d6 binaries,
   all on the dev Mac: the (i) crops of set 204 OSC calibrated planes, the (ii) crops / binned pairs from the trees, their
   ERP LN runs there too).**
   `floor_cases.py build-i` / `build-ii` (PB-11), `run` (the probes on every case; `--dump-ratios` is Step 2's, so arm 2
@@ -840,7 +840,7 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   does not depend on B4's code (F1's growth is not what B4 changes) and completes here: `floor-ii.md` with the verdict
   by the rule (≥ 8 cases over ≥ 2 datasets; "not reached" with the lowest count if the product never reaches 1–4 pairs
   with ≥ 20 matches). Commit lab; push.
-- [ ] **Step 0b — `c`'s screen and sample, judged on existing frames BEFORE any code (research agent, opus; ≈ 3 h; no
+- [x] **Step 0b — `c`'s screen and sample, judged on existing frames BEFORE any code (research agent, opus; ≈ 3 h; no
   product code, no new run: the dumps of `t14b/probe`, `t14b/inject-probe` and `star-lab-v2`, the raw 0004 / 0013
   planes).** (1) PB-12's screen on the lab truth stars of `osc/*` and `osc_pairs/*` (a refused real star counted per
   family, bar ≤ 1 % of qualifiers) and on raw 0013 p0's 36 hot pixels; where in the multi-plane pass the sibling fit
@@ -850,7 +850,7 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   [10F, 12F] ring that σ_i does not measure); a sample that moves any family's `c` AWAY from truth by more than 2 SE vs
   today is refused; the raw 0004 p0 brightness trend (1.57 → ≈ 1.2) explained, real vs fit bias, before a sample is
   chosen. Output one page → the controller's rulings PB-12' / PB-13', which Steps 1–2 implement.
-- [ ] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1.5 h; written after Step 0b: the shapes below, names and
+- [x] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1.5 h; written after Step 0b: the shapes below, names and
   thresholds per PB-12' / PB-13').** `photometry.rs`: `point_source_screen_refuses_a_candidate_with_no_sibling_plane_fit`
   (a three-plane field of 40 stars on every plane plus 30 single-pixel spikes on plane 0 only → `point_source == 30`, `c`
   within 1 % of the clean field's), `point_source_screen_leaves_a_mono_plane_alone`, `point_source_screen_refusing_every_
@@ -861,12 +861,12 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   sample is the same 64). `config.rs`: `measure_version_five_moves_the_three_fit_reading_subtrees_only` (B0's three pins
   re-asserted at version 5, `calibration_subtree` unchanged: it FAILS until the bump because the constant is still 4, so
   the RED step holds no pin). Run → FAIL where expected.
-- [ ] **Step 2 — the code (rust-engineer sonnet; ≈ 4 h).** PB-12', PB-13', PB-14, the probe's `--dump-ratios`,
+- [x] **Step 2 — the code (rust-engineer sonnet; ≈ 4 h).** PB-12', PB-13', PB-14, the probe's `--dump-ratios`,
   `pointSourceScreened`, `apertureTerciles`. Step 1 green; `cargo test -p athenaeum-core --lib -- star_measure` and `--
   stacking` green. Commit athenaeum: `feat(star-measure): Plan B B4 - the point-source screen and the brightness-stratified
   sample for c; MEASURE_VERSION 5`.
-- [ ] **Step 3 — review (opus; ≈ 1 h)** against PB-12' / PB-13' and the F-12 row; fix round by a fresh sonnet agent.
-- [ ] **Step 4 — the lab cycle at the B4 binary (sonnet judgment; ≈ 1.5 h; the dev Mac builds in its compile slot, the
+- [x] **Step 3 — review (opus; ≈ 1 h)** against PB-12' / PB-13' and the F-12 row; fix round by a fresh sonnet agent.
+- [x] **Step 4 — the lab cycle at the B4 binary (sonnet judgment; ≈ 1.5 h; the dev Mac builds in its compile slot, the
   cycle runs on the RUNNER at its own build of the same commit, the handoff relayed).** `planb.sh build`, then
   `lab_cycle.py --step b4-c --prev t14-final --inject --bars bars/planb_b4.py --design results/plan-b/b4/design.json`
   (the design list: every LN row and every `c`-reading row the task changes by design — row 6 on inject OSC, the weights
@@ -879,14 +879,14 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   the families B4's `c` bars read, row 6 on a pair family being the LN scale, plus neb* for the printed `c` — the full
   manifest once at the end); a second miss →
   the owner (PB-18).
-- [ ] **Step 5 — the × 0.40 R case and floor (i) (sonnet judgment; ≈ 1 h; the dev Mac — `/Volumes/bigbase2` /
+- [x] **Step 5 — the × 0.40 R case and floor (i) (sonnet judgment; ≈ 1 h; the dev Mac — `/Volumes/bigbase2` /
   `bigbase3` are never reachable from the runner; short probe runs, no stacking).** `planb.sh b4 x040`: `star_probe` on raw 0004
   / 0007 / 0013 (debayered) at the B4 binary; the per-star dumps joined across frames: the 36 hot-pixel stars of 0013 p0
   screened (`pointSourceScreened ≥ 36` and none of the 36 among the qualifiers), the same real stars' 0004 → 0013 ratio
   on p0 within 3 % of the mean of p1's and p2's. `floor_cases.py run --arm2` on the (i) cases (now with `--dump-ratios`),
   arm 3 from B0's payloads, `verdict` → `floor-i.md` (the paired difference, the bootstrap SE, the weights and psfSel s per
   case). The sharp-R ratio (mosaic 0176 → 0206 p0) at the group β from B0's kept `c` (reported).
-- [ ] **Step 6 — the four after-runs (sonnet judgment; ≈ 6–8 h machine, one at a time: Horse C11 → run B → set 204; the
+- [x] **Step 6 — the four after-runs (sonnet judgment; ≈ 6–8 h machine, one at a time: Horse C11 → run B → set 204; the
   dev Mac, as B0's — never split).**
   `planb.sh clone <ds> b4` (from the TREES, not B0's clones: a clone of the before tree keeps its Calibrate artifacts;
   `make-config --ref-out` with the reference pinned to B0's pick, `ReferenceMode::Manual`, `twoPass false`; `ATH_ACC_
@@ -897,7 +897,7 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   `c` before / after on that plane from the payloads; the LN scale against the after-run's truth per member, B0's beside,
   the re-based row printed). Results committed per dataset before the clone is stripped light (B3's before IS B4's
   after-run, so B0's clones are deleted entirely once B4's `compare` is committed, except their `results/plan-b/b0/<ds>/truth.csv`).
-- [ ] **Step 7 — the verdict package and docs (opus for the verdict tables; sonnet docs; haiku suite; ≈ 2.5 h).**
+- [x] **Step 7 — the verdict package and docs (opus for the verdict tables; sonnet docs; haiku suite; ≈ 2.5 h).**
   `results/plan-b/b4/verdict.md`: both floor verdicts by the rule, the × 0.40 case, the lab bars, the row-6 reports, the
   master rows and ρ per group. README R-OSP-16 B4 block (the screen's design, the sample, the version bump and its ripple,
   every number), the policy line, `RELEASE_NOTES.md`, open-items. `cargo test -p athenaeum-core --all-targets` green.
@@ -905,6 +905,11 @@ x040.md, inject-row6.md, lab-cycle verdict, runs/<ds>/…, weights-rho.md, maste
   `results(plan-b/b4): …`; push lab. The owner's STOP: the two F-9 verdicts (PB-18); the product's floor behaviour changes
   only on the owner's word (a follow-up commit with its pin `growth_floor_behaviour_matches_the_owner_ruling` /
   `fit_call_floor_behaviour_matches_the_owner_ruling`).
+  *As it ran:* the owner delegated both verdicts to fable (R-PB4-5 adopted in 13aee664 with its pin; R-PB4-6 keeps the code,
+  the existing pins). Lab e3e85ec (`results/plan-b/b4/verdict.md`); the README R-OSP-16 B4 block, the R-OSP-1 policy line (Plan B 5,
+  Plan C 6), the R-OSP-7 fallbacks, spec F-9 / F-12 and open-items in athenaeum. The suite is the controller's at 13aee664
+  (`--all-targets` 4115 / 0 / 20). `RELEASE_NOTES.md` holds only the last release, so the re-measure note went to open-items'
+  "Release notes owed at the next tag", where the LN cycle's lines wait.
 
 **STOPs.** The row-6 2-SE drop (Step 4) → PB-13's one fix round, then the owner. A truth star refused by the screen on a
 clean family → the controller (a fix round on the sibling-plane tolerance only if a real star is refused; the tolerance
