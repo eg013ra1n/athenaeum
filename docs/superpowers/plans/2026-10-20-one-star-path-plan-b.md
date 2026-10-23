@@ -1069,27 +1069,38 @@ algorithm question to the owner), judged on P.1 / P.2.
 - l.526–527: "R11-3: reported with its pulls, or its owner named with a bar of its own declared before it is measured."
 
 **Steps.**
-- [ ] **Step 0 — scope (controller; 10 min).** From B3's verdict: module-fed default (psfSel or the F1 v2 arm through the
+- [x] **Step 0 — scope (controller; 10 min).** From B3's verdict: module-fed default (psfSel or the F1 v2 arm through the
   module ring) → Steps 1–4; F1 as is → Steps 1–2 skipped, `k` and `unverdicted_clip_range` kept and recorded beside LN's
   other screens (the spec's l.562–564), Steps 3–4 run.
+  *As it ran:* the F1 branch (B3 kept F1 as is, not module-fed; R-PB3-1): Steps 1–2 skipped; `k` and `unverdicted_clip_range`
+  kept, recorded in the spec's owned-quantities rows and sentence; Steps 3–4 at B4's binary (B3 ran none, so "B3's" reads B4's).
 - [ ] **Step 1 — module seeds (rust-engineer sonnet code ≈ 5 h; opus review; the failing tests first).** The three pins
   above written first (`ln_stars_carry_the_module_saturated_flag` on a fixture pair with one clipped star: it is excluded
   by the flag, not by L-14's 0.75 rule, which is gone), then the code; the LN library tests updated by name (the run tests
   pin `psfSignal` on the 192 × 144 field — unchanged); `cargo test -p athenaeum-core --lib -- stacking::ln` green. Commit.
+  *SKIPPED (B3 kept F1, R-PB3-1): no module seeds; the three pins are not written; `k` and `unverdicted_clip_range` stay.*
 - [ ] **Step 2 — the swap's guards (sonnet judgment; ≈ 1.5 h lab on the RUNNER + ≈ 6 h machine for the three runs on
   the dev Mac).** `lab_cycle.py
   --step b5-seeds --prev b3-est` (`b3-est` exists only if B3 Step 2b ran; else `b4-c`): every synthetic LN cell within 2 SE of B3's;
   `planb.sh clone / run / truth / compare <ds> b5` vs B3's after-runs (master rows, the re-based row ±0.5 %, ρ ≥ 0.9);
   results committed; B3's clones stripped light after the commit.
-- [ ] **Step 3 — C-9, the nebula sky (opus research ≈ 2 h on the l10b tables; sonnet code ≈ 3 h; the runner cycle ≈ 1 h).**
+  *SKIPPED (B3 kept F1, R-PB3-1): no swap, so no guards; no B5 runs or clones.*
+- [x] **Step 3 — C-9, the nebula sky (opus research ≈ 2 h on the l10b tables; sonnet code ≈ 3 h; the runner cycle ≈ 1 h).**
   The research names the change in `ln/background.rs` from the `p1-table.txt` cells (the per-side ring on nebula: which
   cells, which sign, the sub-10F structure share) with a prediction per cell BEFORE the cycle; the runner handoff
   `planb-b5-l10b.md`: the l10b cycle at the B5 binary, P.1 / P.2 per cell, B1's ERP column printed (no new run: the
   frames are unchanged). A miss on P.1 under the change → reverted, recorded (never tuned).
-- [ ] **Step 4 — R11-3 and the package (opus ≈ 1 h; sonnet docs).** R11-3's pulls (`neb0.5` 3.63, `neb3` 6.04) re-read at
+  *As it ran — no change (R-PB5-1):* the research (opus) put C-9 outside `ln/background.rs` and proposed F1's annulus mean; fable
+  ruled it the F1 v2 study's L1-gc5, measured out on the real members (set 204 mono 30 of 30 worse, −0.40 pp); no code, no revert. The
+  l10b cycle ran once at the B5 binary as the P.1 / P.2 table (runner, lab 6324185): `B5 L10B: PASS`, F1 = B1 bit for bit, 4 of 34
+  over (R-PB5-2; 4, not 5); psfSel 13 → 15 of 34 at B4's `c`, checked by `planb.sh b5 ctable` (lab 75f4fcd) → R-PB5-3.
+- [x] **Step 4 — R11-3 and the package (opus ≈ 1 h; sonnet docs).** R11-3's pulls (`neb0.5` 3.63, `neb3` 6.04) re-read at
   the B5 binary; its owner named only with a bar declared before measuring (a new row in a later plan), else "a recorded
   limit" — the owner decides the scope (PB-18). README R-OSP-16 B5 block; the owned-quantities table (`seeds`,
   `saturated`: LN a consumer; `unverdicted_clip_range` gone or kept with its reason). The suite green. Commits.
+  *As it ran:* R11-3 re-read at 32f61897 (the 13aee664 code) on the dev Mac: 3.64 / 5.98, SAME (lab a03ce38); the owner's word
+  (PB-18): a recorded limit. Package lab ff6070e (`results/plan-b/b5/verdict.md`); README R-OSP-16 B5, spec F-13 and the
+  owned-quantities rows / sentence, open-items. No code changed, so no suite run (B4's core line stands).
 
 **STOPs.** A synthetic LN cell worse than B3's beyond 2 SE, or a master row / re-based row / ρ miss → the swap is
 reverted (a neutral swap that is not neutral is a defect), the controller re-audits the seeds' difference (R-B11's

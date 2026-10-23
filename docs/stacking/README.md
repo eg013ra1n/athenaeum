@@ -2826,7 +2826,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `neb0.5` m4 / g +1.5…+3.8 pp; shifted / warped t25 ≈ +1.9 pp against ±1.2) equal the 10b-L before cell for cell:
       10b does not touch LN's per-side sky, the error lives in LN's own tile sky on nebula (`ln/background.rs`, Plan
       B) and in sub-10F nebula structure (B5). A recorded limit, reported to the owner; the P.1 / P.2 tables are Plan
-      B's before. No switch to K7.
+      B's before. No switch to K7. (Plan B B5, R-OSP-16 B5: the cause is not `ln/background.rs`; psfSel's cells are
+      `c`'s on nebula sky, owner F-10 / B.3, and F1's own four are its median sky's limit, R-PB5-1 / -3.)
     - **Phase C - the joint cycle `t10b-onebg` (runner; athenaeum-lab `star-lab/results/plan-a/t10b-onebg/`).** First
       run at 6a1addc6 (lab 895136a): STOPs on D.1 `neb3` (→ C-7, A1b), P.1 / P.2 (→ C-9) and row 7 (→ C-8b). Second at
       7fd911ab (lab 07cd2cb): STOP-A, resampled mono planes flooded (→ C-10, A1c); STOP-B, row 7 on the base's stars
@@ -3057,7 +3058,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - **R11-3 the structure term: not in F-6.** F-6 is the noise SNR on σ_i. The RB4 structure term breaks 4 clean
       cells (−7…−25 %) and its c = 0.8 is circular (fitted on the two nebulae it is judged on). Recorded for Plan B /
       the later nebula-photometry owner: on nebula sky the real flux error is 3.6–6× σ_S (pull `neb0.5` 3.63, `neb3`
-      6.04: the local sky mismatch under the disc, the annulus method's own limit).
+      6.04: the local sky mismatch under the disc, the annulus method's own limit). Plan B B5 (owner, 2026-10-23): a
+      recorded limit with no owner, re-read 3.64 / 5.98 at the B5 binary (R-OSP-16 B5).
     - **R11-4 the bar.** Row 6 median bias ≤ 3 % on 50 cells: the 46 `sharp/*` and `background/` flat, grad10, neb0.1,
       vig20. `neb0.5` / `neb3` / `neb3_4096` are REPORTED with their predicted values (−16.5 / −75.5 / −60.7 % against
       the white truth): there the white-noise truth is not the star's real error, and any noise SNR misses it. Spec
@@ -3134,7 +3136,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       HFR definition holds everywhere. The small-frame stack cost (+9.5 pp, not split between the per-star SNR / HFR
       and the given-seed noise read on Mixed planes) goes to Task 12's cost bars.
     - **Carries.** **The detection owner (a later item):** R11-2's R / B κ under-read (fixing it moves colour seeds).
-      **Plan B / the later nebula-photometry owner:** R11-3's structure term (the nebula flux error 3.6–6× σ_S).
+      **Plan B / the later nebula-photometry owner:** R11-3's structure term (the nebula flux error 3.6–6× σ_S); Plan
+      B B5 kept it a recorded limit with no owner (R-OSP-16 B5).
       **Plan C:** the later readers of `snr` / `hfr` (the analyzer's star metrics and `median_snr`, the `star_metrics`
       columns, the collab gate's `median_snr` rules and the hub's mirror, the Analysis and frame-info views; listed in
       plan Task 11's Outcome).
@@ -4117,6 +4120,74 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     only and the cycle read 0 floor-(i) planes; unverified). (5) B1's item (1), Horse C11 G parity max 1.226 %, was not examined in B3: B6.
     (6) B4's item (6) binds only if psfSel is ever the default. No product code changed in B3 (B4's core line, 4115 / 0 / 20, stands); lab
     suites at 9f74ee5: star-lab 1436 OK, harness 403 OK (2 skipped).
+  - **R-OSP-16 - Plan B B5: LN's own estimates - the F1 branch, C-9 no change, R11-3 and B4's `c` on nebula recorded (Task B5; branch
+    `plan-b`, no product code: the code stays 13aee664; plan `### Task B5`; lab `star-lab/results/plan-b/b5/`, its `verdict.md` the package,
+    lab ff6070e). Rulings R-PB5-1 / -2 / -3 (fable) and the owner's word on R11-3. Nothing in the product moved.**
+    *The results (every value copied from the lab files).* `l10b-{verdict.txt, p1p2-table.md, cells.json, provenance.txt}`: the nebula-sky
+    P.1 / P.2 table at the B5 binary (the runner's own build of 32f61897 = the 13aee664 code; 60 frames sha256-equal, 174 / 174 outputs proven;
+    the ERP column is B1's committed `ln.csv`, no ERP run; lab 6324185). `r11-{verdict.txt, pull.txt, provenance.txt}`: R11-3's pulls (dev Mac,
+    the build equal to B4's b4f record, 6 / 6 proven; lab a03ce38). `ctable-{verdict.txt, table.md, cells.json}`: Measure's `c` per l10b plane
+    at B1 and B5 against the truth's `c*` (runner, lab 75f4fcd). Tools: lab 4994f54 (`planb.sh b5 l10b / r11 / clean`, `b5_l10b.py`,
+    `r11_pull.py`, `l10b_report.py --arm`) and a49b1e0 (`bin/b5_c_table.py`, `planb.sh b5 ctable`).
+    *The scope (Step 0, the F1 branch).* B3 kept F1 as is (R-PB3-1), which is not module-fed, so Steps 1–2 (module seeds and their guards)
+    were skipped and LN keeps its seeds path: `register::detect::detect_stars` on the integrated reference, Measure's fits on the target, the
+    seeds calibration `k` (C-14) between them, F1's own a·F circles and [6F, 8F] sky. `k` and `unverdicted_clip_range` are kept, recorded beside
+    LN's other screens (Register's 0.95, L-14's 0.75, L-23's map) in the spec's owned-quantities table: `k` still corrects the seeds-path
+    mismatch (+0.666 % median, +1.401 % max against detection), and LN's refits still run on a path without a saturation verdict, so they
+    still need the clip screen. Retiring both is R-B9's module-seeds swap, in scope only for a module-fed default. Steps 3–4 ran at B4's
+    binary; B5's "B3's after-runs" read B4's (B3 ran none).
+    *C-9, the nebula sky: no code change (R-PB5-1).* The research put the cause outside `ln/background.rs`: the tile grid enters only the
+    selection and the log-only L-26, and psfOff (no selection, no tile σ) misses the same cells. psfSel's misses are `c`'s; F1's scale with
+    the aperture area (neb0.5 g t60: 4F² −0.87, 9F² −1.34, 25F² −3.06 pp), a median sky on structured nebula when the two sides'
+    noise-to-structure differs. Its proposal, the [6F, 8F] annulus MEAN, is the F1 v2 study's L1-gc5, measured out on the real members: set 204
+    mono 30 of 30 worse, −0.40 pp median (SE 0.03), median |gap| 0.64 → 1.04 %; Horse C11 G +0.21 pp, 0.20 → 0.25 %, a wash. The cosmic-ray
+    cell does not separate the estimators: F1 as shipped moves −1.42 / −0.14 / −1.29 pp on `pairs/main/m4w10` t60 and −2.36 / −1.71 / −2.52
+    on `pairs/main/m4` t60 against ±0.53 (the mean +0.23 / +2.46 / +3.13 there); the 5F growth circle is the fragile part, recorded, not
+    proposed. A 3σ-clipped mean is a wash on real data. The plan's C-9 STOP is void (no change).
+    *The P.1 / P.2 table at the B5 binary (R-PB5-2): `B5 L10B: PASS`, 0 worse, 0 lost.* F1, the default and the one judged, reads D5 = D1
+    bit for bit in all 34 cells (B4's `c` does not reach it); neb3 m4 t60 and neb3 g t60 are n/a in both (6 / 11 matched stars, < 20). Over
+    the F-13 bar (±1.2 pp m4 / g, ±2 pp b25mix, plus 2 SE on neb3), 4 of 34 at both binaries, all at t60:
+
+    | cell | F1 Δ against flat, pp (SE) | bar |
+    | ---- | ---- | ---- |
+    | P.1 neb0.5 m4 t60 | −1.67 (0.20) | 1.20 |
+    | P.1 neb0.5 g t60 | −3.07 (0.20) | 1.20 |
+    | P.2 shift m4 t60 | −1.59 (0.12) | 1.20 |
+    | P.2 warp m4 t60 | −2.18 (0.12) | 1.20 |
+
+    R-PB5-1 / -2 quote 5 of 34: the research's fifth cell, neb0.5 g t45, is −1.193 against 1.20 (rounded to −1.20 there), inside. psfSel,
+    printed with its owner and never judged: 15 of 34 over (13 at B1), worst neb3 g t45 −15.89 and neb3 b25mix t25 −12.28 pp; B4's `c` took
+    neb3 m4 t25 +0.26 → +6.14 (SE 0.17, bar 1.46) and neb3 g t25 +1.18 → −2.57 pp (SE 0.14, bar 1.58) over, every other cell ≤ 0.15 pp. The
+    "not worse" rule (|D5| − |D1| ≤ 2·√(SE5² + SE1²), the tools' choice) is moot at D5 = D1.
+    *R11-3 at the B5 binary.* Pulls `background/neb0.5` 3.64 (n 457) and `background/neb3` 5.98 (n 301) against the Task 11 record 3.63 /
+    6.04: SAME within ±0.25. The pull is reconstructed (robust std of (apSum − S0) / (apSum / snr) over unflagged measure stars, S0 the true
+    star flux in the same aperture; nothing committed produced the record) and reads 3.64 / 5.98 on Plan A's t14b outputs too, so "the same"
+    is at a re-run's precision. The owner's word (2026-10-23, PB-18): a recorded limit, no owner and no bar in Plan B; re-opened only by a
+    master-level miss on a real nebula, with an owner and a bar declared before measuring (the ERP has no per-star flux error either; RB4's
+    structure term broke 4 clean cells, −7…−25 %).
+    *B4's `c` on the nebula sky (R-PB5-3; the owner chose "check, then fable").* Measure's frame `c`, the weight path (`tmean_flux`,
+    `psf_signal_weight`, `psf_snr`), on the 60 l10b planes: 59 same, 1 closer (neb3/m4/t1 −3.72 → −0.78 %), 0 farther; median |c − c*|
+    0.36 → 0.36 % (neb3 5.10 → 4.85 %). psfSel's move is LN's own per-side `c`: its s is `rf.signal / tf.signal` (`ln/scale.rs` l.606–617)
+    on LN's refits, whose `c` is `photometry::aperture_correction` on LN's fit list with `siblings: None` (`fit.rs` l.2406: the point-source
+    screen does not run, only B4's SNR floor and the brightest 64 act); neb3 g t25's Measure pair is unchanged (−1.61 %) while psfSel moved
+    3.75 pp. psfSel is `LnFluxEstimator::PsfSignal`, reachable as Normalize → "Star flux" → "PSF signal" (non-default; the default
+    CommonAperture is F1).
+    *Rulings.*
+    - R-PB5-1: F1's [6F, 8F] annulus sky stays the median; no C-9 code change; F1's P.1 limit recorded with its numbers. Cost if wrong: F1
+      keeps −1.6…−3.1 pp on single-frame nebula t60 cells; the real nebula set (Horse C11 G) reads 0.20 % median |gap|, no master-level loss
+      is known; a later real nebula miss re-opens it with a per-side, structure-aware estimator, never a plain or clipped mean.
+    - R-PB5-2: P.1 is judged on F1's 34 cells against B1's (not worse beyond 2 SE); psfSel's count is printed with its owner (F-10 / B.3; it is
+      LN's non-default "PSF signal", its `c` from `star_measure`), never a STOP for an LN change. The controller's note: 4 of 34, not 5. Cost
+      if wrong: an F1 nebula regression is caught only at 2 SE on single-frame cells; the real guard (`ln_real`) stays the arbiter.
+    - R-PB5-3: (a) a recorded limit, no code change, `MEASURE_VERSION` stays 5; `planb.sh b5 ctable` is the standing check for any later `c`
+      change. Cost if wrong: a user who picks PSF signal on a deep-nebula field gets a ≈ 4–6 % LN scale error on some pairs (13 of 34 cells
+      before B4).
+    *Open items carried.* (1) B6 hygiene: a `cRef` / `cTgt` per-side field on `ln_scale_probe`'s per-arm line
+    (`ReferenceFits::aperture_correction`, `target_aperture_correction`), so LN's own `c` is read, not inferred; the runner's B5 l-probe can
+    be cleaned, the numbers being committed. (2) PSF signal on deep nebula, 15 of 34 l10b cells over, owner F-10 / B.3; if it is ever to be
+    supported there, the measured lever is the pair-common ring (neb3 g t45 −15.88 → −8.42), not a Measure-side screen: recorded, not
+    proposed. (3) B1's Horse C11 G parity max 1.226 %: B6. No product code changed in B5 (B4's core line, 4115 / 0 / 20, stands); lab
+    suites at a49b1e0: star-lab 1462 OK, harness 415 OK.
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
