@@ -377,7 +377,7 @@ A deeper mag-13 index returns 2–3× more candidate hash matches per lookup tha
 If `FOCALLEN` and `XPIXSZ` are present in the frame metadata, the solver computes the expected pixel scale in arcsec/px:
 
 ```text
-expected_scale = atan(xpixsz_mm × xbinning / focallen_mm) × (180/π) × 3600
+expected_scale = atan(xpixsz_mm / focallen_mm) × (180/π) × 3600   # XPIXSZ already includes binning (plate_solve/hints.rs)
 ```
 
 Each hash-match candidate has an implied scale from `catalog_quad.longest_dist_deg × 3600 / image_quad.longest_dist`. Candidates whose implied scale disagrees with `expected_scale` by more than **±5 %** (`filter_scale_tolerance = 0.05`) are discarded.

@@ -2191,6 +2191,20 @@ from the minors fix wave: an unknown-kind row stays visible; a toggle failure ra
 dialog rather than a banner; the tinted checkbox renders. The artfrom.space guide still
 describes the old tab name.
 
+### Carried from the memory cleanup (2026-10-23) — older cycles' residue
+
+Owed checks and follow-ups that lived only in the per-cycle memory notes. Each may already be done; delete a line when it is confirmed or found stale.
+
+- **Dependency update (2026-07-28):** tray start-at-login toggle plus a reboot (macOS); Windows keychain-token continuity after an update (no forced re-login); icon click-through (35 redrawn lucide glyphs); web static-serve; the first Docker image build since the `zune-jpeg` patch and the cmake/nasm toolchain were removed. Follow-up queue: a PROSAC rand-mapping tripwire test (nothing in solvemyastro catches an adoption-path regression); `corpus_bench` re-freeze (un-runnable since the tier cutover); a `toml_edit` byte-diff test; the `noUncheckedIndexedAccess` owner decision; a cross-version zip fixture. (carried from memory 2026-10-23; may already be done)
+- **Perseus 0.5.1 local library (2026-07-27):** live smokes: browser blink walk, send and delete dialogs, scheduler mode flips, an SMB capture root, the free-space chips. Perseus UI v2 backlog: `api_delete` resolves rows through an `all_outbound(5000)` window, so an aged-out fail-open orphan is possible. (carried from memory 2026-10-23; may already be done)
+- **Mirror hierarchy (2026-07-27):** a Windows receiver, and a changed-file re-send landing as `_2` with the original intact. Deferred: logging-spec dictionary entries for `value`/`layout`/`mirror_hierarchy`; spec and end-user sentences on the batch-slug / mirror-dir seam and on a device rename moving the tree root. (carried from memory 2026-10-23; may already be done)
+- **iroh transport hardening (2026-07-15):** multi-PC dev-build smoke after the shared-node change (one node id per process, no relay kick) and after the reported-addresses change; live canary `ATHENAEUM_TEST_RELAY=https://test-relay.artfrom.space:8443 cargo test -p athenaeum-core same_key_second_endpoint_evicts -- --ignored`. (carried from memory 2026-10-23; may already be done)
+- **Sync security audit (2026-07-11):** the Windows owner-only ACL on the device-key path (`account/keys.rs`, `icacls`) was never run on Windows. An empty `Want` confirms a package, so a paired peer can drive delete-after-confirm retention to remove sources it never stored (inside the existing trust boundary; retention is Perseus-only now). (carried from memory 2026-10-23; may already be done)
+- **Transfer smoke-fix cycle (2026-07-20):** the V1–V4 two-instance smokes; the first-contact stall (the sender's connect gate refuses the receiver's blob dial-back before refreshing the authorized set, so every first device-pair contact eats a 60 s backoff). (carried from memory 2026-10-23; may already be done)
+- **0.5.1 real-data smoke pass (2026-08-03):** still owner-only: the DB-hygiene plate-solve panic check (needs the star catalog and a forced panic). Questions the pass raised: readiness counts a light with a flat but no dark as `missing` (0 ready) although the run would calibrate it flat-only (`CALSTAT='F'`); r2d2 logs a context-free `ERROR "database is locked"` twice at startup while `init_db` holds its DDL; an external header edit does not mark an existing calibrated output stale. (carried from memory 2026-10-23; may already be done)
+- **DB hygiene fast-follows (2026-08-03):** sequential `process_file` savepoint parity (the C3 window is bounded to one scan cycle, not closed); `rebuild_duplicate_groups_cache` silently substituting `Utc::now()` (use `parse_stored_ts`); ratify `field`/`raw` in the logging spec dictionary; web per-frame `catch_unwind` parity outside plate-solve. (carried from memory 2026-10-23; may already be done)
+- **Docs site (artfrom-space):** a fresh screenshot for the landing page's "03 · Calibrate" step (the old one showed the removed Calibrate Lights dialog and was dropped). (carried from memory 2026-10-23; may already be done)
+
 ### Shipped in v0.5.0-beta.1, still unconfirmed
 
 Transfers v2 and the batch model (U1–U8, two instances), D3 multi-source distribution
@@ -2250,6 +2264,10 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
   whether `ComputeQueueEntry` growing a subject id (enough to join an existing
   progress stream) is sufficient on its own; whether the per-feature widgets
   fold into it or stay as they are.
+
+- **Perseus 0.5.1 library — four decisions to ratify:** cross-directory Library selection; the in-flight gate that blocks a divert while a sibling is Delivered or Waiting; the chip naming the original batch after a re-send; out-of-band deletions are re-detected only on restart, and byte-identical mtime-preserving re-copies never. (carried from memory 2026-10-23; may already be done)
+- **`formatTimestamp` seconds** (wave 5.5 ruling R31): the helper is documented as HH:MM but the owner's date rule says always seconds; only the Exchange Received table opts into seconds. Make seconds the default, or keep the exception? (carried from memory 2026-10-23; may already be done)
+- **Master-hash pass off the scan thread:** the "Verifying master duplicates" pass still reads shortlisted masters on the scan thread; moving it off is the owner's call (2026-09-17 triage). (carried from memory 2026-10-23; may already be done)
 
 ---
 
