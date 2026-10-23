@@ -47,7 +47,7 @@ Verified against `main` v0.2.1 on 2026-07-02; all line refs re-checked today.
 
 **Change:**
 - Replace all three with `cells_mutex.lock().unwrap_or_else(|e| e.into_inner())` — the guarded data is a diagnostics `Vec<CellTrace>` push; recovering a poisoned lock is strictly better than cascading panics across the rayon pool. Grep the rest of the crate for `.lock().unwrap()` while there (`rg '\.lock\(\)\.unwrap\(\)' src/`) and apply the same treatment to any diagnostics-path hit.
-- Reword the two doc lines to "quad-based pattern matching (nearest-neighbour quad descriptors)" — no behavioural change. Grep both submodules case-insensitively for the name to catch stragglers — **audit found one more: `solvemyastro/README.md:12` ("tycho dir")**; `solvemyastro/docs/astap-comparison.html` is local-only/gitignored and out of scope.
+- Reword the two doc lines to "quad-based pattern matching (nearest-neighbour quad descriptors)" — no behavioural change. Grep both submodules case-insensitively for the name to catch stragglers — **audit found one more: `solvemyastro/README.md:12` ("tycho dir")**; `solvemyastro/docs/<identifier>` is local-only/gitignored and out of scope.
 
 **Optional rider (T3b) — rustafits S3 input hardening:** `formats/fits.rs:99` accepts `NAXIS3 > 3` while downstream assumes 1 or 3 channels (June audit S3, the only malformed-input item among S3–S7). While in the file: reject `NAXIS3 ∉ {1, 3}` with a clear error. The remaining June rustafits items stay deferred by design: S4 (`detection.rs:38` saturation gate dead for float domain) and S5 (`analysis/mod.rs:1211` fixed `init_sigma`) belong with the stacking-era analysis precision work; S7 (fast-detect coverage on dense fields) with the centroid-refinement work.
 
@@ -159,7 +159,7 @@ Folded into T6 last bullet — listed separately in the roadmap; keep as one che
 
 ## T12 — Rewrite stale `docs/export/README.md`
 
-The Siril script pipeline it documents (script generator, cli_runner, execution modes) **does not exist in the codebase** — audit note: it appears to have never been implemented (aspirational doc; zero code hits for `cli_runner`/`script_generator`, `export/` = data_collector, file_organizer, models only). Rewrite around the current WBPP folder/keyword export (`WbppExportConfig`, `export/models.rs:701`). Doc-only; prevents future work being planned against nonexistent code.
+The script pipeline for a second open-source stacker that it documents (script generator, cli_runner, execution modes) **does not exist in the codebase** — audit note: it appears to have never been implemented (aspirational doc; zero code hits for `cli_runner`/`script_generator`, `export/` = data_collector, file_organizer, models only). Rewrite around the current WBPP folder/keyword export (`WbppExportConfig`, `export/models.rs:701`). Doc-only; prevents future work being planned against nonexistent code.
 
 **Effort:** ~1 hour.
 

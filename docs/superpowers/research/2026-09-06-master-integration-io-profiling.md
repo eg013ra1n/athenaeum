@@ -152,9 +152,9 @@ Two things follow, and both match what was measured here:
    permanently in favour of memory we are not short of.
 
 Sources:
-- [Buffer / Stack option — image integration (PixInsight Forum)](https://pixinsight.com/forum/index.php?threads/buffer-stack-option-image-integration.10735/)
-- [Pixinsight buffer and stack size weirdness (Cloudy Nights)](https://www.cloudynights.com/forums/topic/614715-pixinsight-buffer-and-stack-size-weirdness/)
-- [Where is the bottleneck with integration speed (Cloudy Nights)](https://www.cloudynights.com/topic/788344-where-is-the-bottleneck-with-integration-speed-on-pixinsight/page-2)
+- Buffer / Stack option — image integration (the ERP's forum)
+- Buffer and stack size weirdness in the ERP (Cloudy Nights thread)
+- Where is the bottleneck with integration speed (Cloudy Nights thread)
 
 ## 7. What the measurements rule *out* as a fix
 

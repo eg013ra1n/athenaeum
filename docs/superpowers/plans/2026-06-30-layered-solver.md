@@ -39,7 +39,7 @@ athenaeum-core (`plate_solve/`); rayon; `corpus_bench`.
 - Verify (`NR` count) uses the **full union**; quad-match uses **base + fallback**.
 - `catalog_mag_limit` stays 19.0 (`service.rs:141`) — the solver caps cones at
   mag 19 regardless of tier depth.
-- Don't name ASTAP in code/comments.
+- Don't name the external plate solver in code/comments.
 
 ## Deviations applied at execution (2026-06-30)
 

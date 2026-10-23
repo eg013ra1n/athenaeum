@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Every file Athenaeum writes for the user — a built calibration master, a calibrated light on export or send, a stacking master — is written in the container the user chose, FITS or XISF, and an XISF master is accepted by PixInsight's WBPP as a master.
+**Goal:** Every file Athenaeum writes for the user — a built calibration master, a calibrated light on export or send, a stacking master — is written in the container the user chose, FITS or XISF, and an XISF master is accepted by the downstream processing program's WBPP as a master.
 
 **Architecture:** One `OutputFormat` enum (`fits_writer`) shared by every writer; one dispatcher `write_image_f32` that branches on it; the XISF writer takes its `bounds` from the caller because a calibration master is raw ADU while a calibrated light and a stacking master are unit-scaled. The master format is a settings key read at build time; the calibrated-light format is a sixth field of `CalibratedLightOptions`, so it travels the same road the other five already do (export, send, summary). The stacking run's own intermediates stay FITS.
 
@@ -19,7 +19,7 @@
 - **R5 — the calibrated-light format is a field of `CalibratedLightOptions`** (`format`, `#[serde(default)]`), resolved by `CalibratedLightOptions::resolve` like the other five host arguments, chosen on the Export tab and the Send dialog (remembered in `lightCalPrefs`). `calibrated_output_filename` takes it, so export placement, send `rel_path`s and the run all name the file through the one rule.
 - **R6 — the stacking run's intermediates stay FITS.** `PlaneReader` (and the Measure/Register readers behind it) are FITS-only; stage 1 sets `calibration_opts.format = Fits` explicitly, with the comment saying why, and the Stacking → Calibrate panel says "Intermediate calibrated frames are always FITS" instead of showing a radio. XISF intermediates are a follow-up of their own (a `PlaneReader` XISF arm), listed in the backlog, not in this plan. **Open for the owner:** if the working folder's `calibrated/` tree is meant to be handed to WBPP directly, say so and the follow-up moves up.
 - **R7 — the CFA mosaic stays FITS.** It is a run-internal artifact (`keep_mosaic`, never on the wire).
-- **R8 — acceptance is external.** The one check that proves the contract is opening an Athenaeum XISF master in PixInsight and running WBPP with it; it is an owner smoke recorded in `docs/superpowers/open-items.md`, not a unit test.
+- **R8 — acceptance is external.** The one check that proves the contract is opening an Athenaeum XISF master in the downstream processing program and running WBPP with it; it is an owner smoke recorded in `docs/superpowers/open-items.md`, not a unit test.
 
 ## Global Constraints
 
@@ -710,13 +710,13 @@ git commit -m "export ui: choose FITS or XISF for calibrated lights; the run's i
 - [x] **Step 1: Build one real master as XISF** on the dev catalog: set `calibration.master_format = xisf` in Settings, build a master dark from a real raw set (Coverage → Create master), then:
   - `sqlite3` the dev DB: `SELECT path, format FROM files WHERE id = (SELECT file_id FROM frames WHERE is_master = 1 ORDER BY id DESC LIMIT 1);` → `.xisf`, `XISF`.
   - `head -c 4096 <path> | strings | grep -o 'bounds="[^"]*"\|imageType="[^"]*"'` → `bounds="0:65535"`, `imageType="MasterDark"`.
-  - Export the linked frame set in **Calibrated lights** mode with format FITS, then compare one output against the same export made before this plan (a saved copy): `integrate_probe`-free check — read both with `examples/measure_probe.rs` or `python`+`astropy` and assert median difference `< 1e-3` (an XISF master must calibrate identically to its FITS twin).
+  - Export the linked frame set in **Calibrated lights** mode with format FITS, then compare one output against the same export made before this plan (a saved copy): `integrate_probe`-free check — read both with `examples/measure_probe.rs` or `python` with a Python astronomy library and assert median difference `< 1e-3` (an XISF master must calibrate identically to its FITS twin).
 - [x] **Step 2: Rebuild that master** — the file keeps `.xisf`; flip the setting back to `fits`, rebuild again — still `.xisf` (R4).
 - [x] **Step 3: Export calibrated lights as XISF** — the tree holds `c_*.xisf`, each starts with `XISF0100`, `bounds="0:1"`, `imageType="Light"`.
 - [x] **Step 3b: A mixed-container stacking run (owner requirement 2026-09-18: the stacker takes FITS and XISF side by side at every stage).** On a small real set (20 best LDN 1272 mono frames): convert half of the lights to XISF through `fits_writer::write_image_f32(…, Xisf, XisfBounds::Adu16)` from a throwaway `examples/` probe (read with `astroimage::ImageConverter::read_raw`, write the same cards), place them in a scan root beside the FITS half, rescan, build the master dark as XISF (the setting from Task 4) and the flat as FITS, then run the Stacking tab end to end. Pass: every frame calibrates (`stacking_artifacts` has a `calibrated` row per light, none excluded for "calibration failed"), the master light's median and MAD match the all-FITS run of the same 20 frames within 0.1 %, and the run log shows no `warn!` about a frame's container. This is the first end-to-end proof; stage 1 is the only stage that ever reads a source, and it funnels every container into `c_*.fits`.
 - [x] **Step 4: Record the owner smokes** in `docs/superpowers/open-items.md`:
-  - Open an Athenaeum XISF master dark, flat and dark flat in PixInsight; run WBPP with them added as masters: each must be listed as a master (no "must be in XISF format" refusal, the dark flat under DARK with the flat's exposure), and a light calibrated by WBPP with the Athenaeum master must match one calibrated by Athenaeum within noise.
-  - Load a `c_*.xisf` calibrated light in PixInsight and in WBPP's calibrated-lights mode.
+  - Open an Athenaeum XISF master dark, flat and dark flat in the downstream processing program; run WBPP with them added as masters: each must be listed as a master (no "must be in XISF format" refusal, the dark flat under DARK with the flat's exposure), and a light calibrated by WBPP with the Athenaeum master must match one calibrated by Athenaeum within noise.
+  - Load a `c_*.xisf` calibrated light in the downstream processing program and in WBPP's calibrated-lights mode.
 - [x] **Step 5: Backlog** — mark items 1 and 1b shipped with the commit range, add "XISF intermediates in the stacking run (`PlaneReader` XISF arm)" as the R6 follow-up.
 - [x] **Step 6: Commit**
 

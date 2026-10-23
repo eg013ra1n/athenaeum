@@ -1,7 +1,7 @@
-# Master Integration — PixInsight-Model Recipes — Design — 2026-07-06
+# Master Integration — ERP-Model Recipes — Design — 2026-07-06
 
 Owner request (B5 UI round follow-up): restructure master-build integration
-around PixInsight's two-axis model — **Combination** × **Rejection
+around the ERP's two-axis model — **Combination** × **Rejection
 algorithm** — matching the ImageIntegration panel's mental model, and add
 the two missing practical rejection algorithms. Builds on Phase 2
 (`integration/combine.rs`, `api/masters.rs` recipes, `CreateMasterDialog`).
@@ -23,9 +23,9 @@ Rejection = None
           | LinearFitClip    { sigma_low, sigma_high }   // NEW
 ```
 
-- `Average` = mean of surviving samples (PI terminology for our `Mean`).
+- `Average` = mean of surviving samples (the ERP's terminology for our `Mean`).
 - Rejection runs per pixel stack first; combination applies to survivors.
-  Every rejection composes with either combination (PI semantics).
+  Every rejection composes with either combination (the ERP's semantics).
 - Equivalences with the legacy flat enum: `Mean` = Average+None; `Median` =
   Median+None; `WinsorizedSigmaClip{..}` = Average+WinsorizedSigma;
   `PercentileClip{..}` = Average+PercentileClip.
@@ -39,10 +39,10 @@ iteration cap to bound worst-case):
 - `LinearFitClip`: sort the stack; least-squares fit a line over
   (index, value); residual dispersion = mean absolute deviation of
   residuals; reject samples with residual `< −sigma_low·d` or
-  `> +sigma_high·d`; refit and repeat until stable. PI-recommended for
+  `> +sigma_high·d`; refit and repeat until stable. ERP-recommended for
   larger sets with drifting illumination.
 
-**Defaults** (PI panel values): sigma 4.0 / 3.0; linear fit 5.0 / 3.5;
+**Defaults** (ERP panel values): sigma 4.0 / 3.0; linear fit 5.0 / 3.5;
 percentile 0.2 / 0.1 (dialog defaults; Auto keeps its own tuned values
 below).
 
@@ -74,7 +74,7 @@ Replaces the single combine dropdown:
 - **Rejection algorithm** (hidden when Auto): No rejection | Percentile
   clipping | Sigma clipping | Winsorized sigma clipping | Linear fit
   clipping — with the matching parameter inputs shown underneath
-  (percentile low/high; sigma low/high; linear-fit low/high), PI defaults
+  (percentile low/high; sigma low/high; linear-fit low/high), ERP defaults
   pre-filled, persisted per last use.
 - Preview/`formatCombine` strings switch to "Average · Winsorized sigma
   (3.0/3.0)" style; Auto's description keeps showing the resolved recipe.

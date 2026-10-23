@@ -13,23 +13,23 @@ calibration read path (debayer lives only in analysis/preview, provably walled
 off); all combining/rejection is strictly per-(x,y); 1-channel input is
 enforced at the reader; outputs are genuine 1-channel mosaics; the light-cal
 Bayer copy-through works. The problems are (a) one norm gap — flat
-normalization is a global channel-mixed scalar where PixInsight/Siril use
+normalization is a global channel-mixed scalar where the ERP and a second open-source stacker use
 per-CFA-channel handling to avoid tinting OSC lights — and (b) a cluster of
 real Bayer-metadata defects on outputs, plus zero CFA-specific math tests.
 
 ## Industry norms (researched)
 
 - Calibrate in the CFA domain, debayer after — standard. We comply.
-- **Per-channel flat scaling for OSC**: PixInsight ImageCalibration computes 3
+- **Per-channel flat scaling for OSC**: ERP ImageCalibration computes 3
   separate CFA flat scaling factors (single factor "causes a color shift" —
-  their wording; WBPP enables it for OSC); Siril's `equalize_cfa` equalizes the
-  master flat's channel means "to avoid tinting". PI notes the effect is
+  their wording; WBPP enables it for OSC); the open-source stacker's `equalize_cfa` equalizes the
+  master flat's channel means "to avoid tinting". The ERP notes the effect is
   "mainly cosmetic" (later color calibration removes casts) — a parity gap,
   not corruption.
 - **Bayer cards on master files are a real interop requirement**: documented
   WBPP breakage when a master flat lacks BAYERPAT (CFA mismatch / treated as
   mono). `ROWORDER` also matters — CFA pattern interpretation is row-order
-  dependent (PI's FITS default is BOTTOM-UP).
+  dependent (the ERP's FITS default is BOTTOM-UP).
 
 ## Key findings (verified by hand where marked ✓)
 
@@ -43,10 +43,10 @@ real Bayer-metadata defects on outputs, plus zero CFA-specific math tests.
    spec explicitly lists it; `orientation.rs` knows about ROWORDER flips for
    display but calibration outputs drop the declaration.
 3. XISF files carrying only the native `<ColorFilterArray>` element (no
-   BAYERPAT FITSKeyword) are treated as MONO end-to-end — PixInsight-written
+   BAYERPAT FITSKeyword) are treated as MONO end-to-end — downstream-program-written
    XISF is the obvious exposure.
 4. Global-only flat normalization: ATH_FNRM (build), CentralThird recompute
-   and PixinsightTrimmed (light-cal), AND the per-frame flat-integration
+   and the full-frame trimmed mean (light-cal), AND the per-frame flat-integration
    scales are all channel-mixed scalars → OSC lights carry a flat-color cast;
    cross-frame color drift in sky flats blends untracked. Central-third pixel
    COUNTS are balanced (G exactly 50%, R−B skew <0.1%) — it is a level blend,
@@ -77,8 +77,8 @@ sampling balance; `frames.bayerpat` live (export OSC detection uses it).
 
 ## Ratified direction (this review, owner-vetoable at plan review)
 
-PI-style **per-CFA-channel flat scaling at light-cal time** (option, default ON
-when the light carries a Bayer pattern; CentralThird mode v1, PixinsightTrimmed
+ERP-style **per-CFA-channel flat scaling at light-cal time** (option, default ON
+when the light carries a Bayer pattern; CentralThird mode v1, the full-frame trimmed mean
 stays global with a documented follow-up), per-channel constants stamped on
 CFA master flats at build; masters emit real offsets + ROWORDER with a
 deterministic member-consensus rule; XISF ColorFilterArray support; advisory
@@ -107,7 +107,7 @@ channel-geometry unit level through three end-to-end tests that assert the
 cards on files actually written to disk.
 
 **Deferred, all recorded** in the companion audit's "Deferred follow-ups":
-`pixinsightTrimmed` per-channel variant; the Flat Analysis contour plot on CFA
+the full-frame trimmed-mean per-channel variant; the Flat Analysis contour plot on CFA
 data (display-only); a matcher-level `bayerpat` parameter; whether a mono flat
 on OSC lights should ever hard block (currently advisory); a per-batch divisor
 memo (perf only); phase-class canonicalization, so `GRBG` at (0, 0) and

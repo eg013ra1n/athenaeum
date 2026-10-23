@@ -20,13 +20,13 @@ Bump rustafits dependency and integrate v0.7.3 additions: 4 new AnalysisConfig f
 - Trail detection is two-stage (Rayleigh + PSF-fit ecc > 0.55)
 - `stars_detected` now means "before measure cap"
 - Statistics use fit-residual-weighted sigma-clipped medians
-- FWHM R^2 0.972 to 0.995 vs PI, Ecc R^2 0.916 to 0.943
+- FWHM R^2 0.972 to 0.995 vs the ERP, Ecc R^2 0.916 to 0.943
 - MRS layers library default changed from 1 to 4
 
 ## Design Decisions
 
 1. **Expose all 4 new config fields** (measure_cap, fit_max_iter, fit_tolerance, fit_max_rejects) in AnalysisConfig and settings UI
-2. **Update mrs_layers default to 4** to match library and PixInsight
+2. **Update mrs_layers default to 4** to match library and the ERP
 3. **Add trail tooltip hint** distinguishing directional trails (high R^2) from guiding issues (low R^2)
 4. **No version tracking** in DB -- config_hash handles staleness
 5. **No DB schema changes** -- fit_residual is per-star (not stored), no new frame-level fields

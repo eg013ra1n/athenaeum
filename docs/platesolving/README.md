@@ -473,7 +473,7 @@ Debug-mode timings are ~10× slower due to unoptimised `nalgebra` LSQ routines.
 
 ### Accuracy
 
-#### Sparse field — Lemmon reference (cross-check against known astrometry.net solve)
+#### Sparse field — Lemmon reference (cross-check against a known solve from an external plate solver)
 
 | Metric | Phase 1–3 (mag 11) | **Phase 4 + mag 13** |
 | ---- | ---- | ---- |

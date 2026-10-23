@@ -4,11 +4,11 @@
 
 The export feature organizes a frame set's light frames and their **already-linked**
 calibration frames (flat/dark/bias/darkflat) into a nested folder tree on disk, sized
-for PixInsight's WBPP (Weighted Batch Preprocessing) process to consume via its
+for the downstream processing program's WBPP (Weighted Batch Preprocessing) process to consume via its
 "Grouping Keywords with Pre" option. Athenaeum copies or symlinks files into the
 right folders and stops there — it does **not** create master calibration frames,
-does not run PixInsight, and does not generate any external tool's scripts. All of
-that (master creation, registration, stacking) is done in PixInsight after export.
+does not run the downstream processing program, and does not generate any external tool's scripts. All of
+that (master creation, registration, stacking) is done in the downstream processing program after export.
 
 This is the whole of the *frame-set* export. There is no script generator, no CLI
 runner, no execution-mode selector, and no template-token engine (`{OBJECT}`,
@@ -23,13 +23,13 @@ described here; the last three are the collab project export.
 
 ## What this doc replaces
 
-The previous version of this file described a Siril script pipeline (branch
+The previous version of this file described a script pipeline for a second open-source stacker (branch
 folders, `00_create_masters.ssf` / `01_calibrate_lights.ssf` / `02_register_and_stack.ssf`,
 `generate_scripts` / `direct_execution` modes, an `AtheneumScoring` reference-frame
-mode, a Siril CLI runner with a 30-second timeout workaround, exposure-time
+mode, a CLI runner for that stacker with a 30-second timeout workaround, exposure-time
 clustering with absolute/relative tolerance, etc.). None of that exists in the
 codebase — zero hits for `script_generator`, `cli_runner`, `folder_structures`,
-or any Siril invocation anywhere in `crates/`. It described a feature that was
+or any invocation of that stacker anywhere in `crates/`. It described a feature that was
 planned but never built. This rewrite documents only what `crates/athenaeum-core/src/export/`,
 `commands/export.rs`, `routes/export.rs`, and `ExportTab.tsx` actually do.
 
@@ -66,7 +66,7 @@ Mono: BAYERPAT is NULL or empty
 ```
 Source: `CameraType::from_bayerpat`, `crates/athenaeum-core/src/export/models.rs:22`.
 OSC and Mono frames land in different `ExportGroup`s (different `group_key`,
-`models.rs:165`) because they can't be stacked together in PixInsight.
+`models.rs:165`) because they can't be stacked together in the downstream processing program.
 
 ## Folder structure it produces
 
@@ -177,7 +177,7 @@ Athenaeum never acts on this plan — no code creates master files. The plan is
 exposed through `ExportData.master_plan` (from `get_export_preview` /
 `get_calibration_route`) purely as data; the only field the shipped UI currently
 renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
-`commands/export.rs:394`). PixInsight/WBPP creates the actual masters after the
+`commands/export.rs:394`). The downstream processing program's WBPP creates the actual masters after the
 files are organized on disk.
 
 ## Export modes

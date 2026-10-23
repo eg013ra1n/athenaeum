@@ -217,7 +217,7 @@ and passes through untouched.
    dims/channels correct (mono NAXIS=2 and RGB NAXIS3=3 both).
 3. Edge cases: 68/69-char boundary, NaN pixels, non-ASCII rejection, 9-char keyword
    rejection, reserved-keyword rejection, comment-overflow rejection.
-4. Optional dev-only validation script (not CI): `astropy.io.fits.open(...).verify('exception')`
+4. Optional dev-only validation script (not CI): `<identifier>.io.fits.open(...).verify('exception')`
    against a generated file, documented in the module docs as the reference-implementation
    cross-check.
 

@@ -618,7 +618,7 @@ athenaeum/
 │       └── plate_solve_real.rs       # Level 3 tests
 └── test-data/
     ├── fits/                         # git-lfs
-    ├── reference/                    # PixInsight WCS JSONs
+    ├── reference/                    # the ERP's WCS JSONs
     └── catalogs/
         └── test-mini-tycho2/
 ```

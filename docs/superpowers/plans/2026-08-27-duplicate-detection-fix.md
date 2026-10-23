@@ -329,7 +329,7 @@ impl DuplicateKey {
 
     /// Which files this key may consider at all.
     ///
-    /// The header key takes raw sub-frames and nothing else. A PixInsight
+    /// The header key takes raw sub-frames and nothing else. A downstream-program
     /// master carries the FITS keywords of whichever image was the
     /// integration REFERENCE, so `Pane_2_Sii.xisf` genuinely states
     /// `FILTER = 'H'`; and `Pane_2_Sii.xisf` / `Pane_2_Sii_f.xisf` share all
@@ -493,7 +493,7 @@ one side and 548 more were copied without -p.
 
 Group on fits_header.header_fingerprint instead: written at scan time for
 relinking, indexed, 100% populated, mtime-independent. Restricted to raw
-sub-frames -- masters measure 0/30 precision because PixInsight propagates
+sub-frames -- masters measure 0/30 precision because the downstream processing program propagates
 the reference image's FITS keywords, so two filters can share a header.
 
 The header join crosses two tables with no UNIQUE(file_id), so the count is
@@ -1249,7 +1249,7 @@ Under `## Release notes owed at the next tag`:
 Under `## Standing decisions — do not re-flag these`:
 
 ```markdown
-| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | PixInsight writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
+| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | The downstream processing program writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
 | **The three-part sampling hash is not a better default key than the header.** | Any "just use `compute_xxhash`" proposal | It IS `files.content_hash`, so the proposal is the existing `Content` branch. Measured: identical answer to the header key on raw frames (40/40 vs 80/80 against full SHA-256) for 61.4 GiB of reads and ~19 min; and on masters it is wrong in the DELETING direction — three of thirty groups are `..._DBE_WCS.xisf` / `_f.xisf` pairs differing by 3-4 bytes at 0.5-0.9 MiB, past the first sample and nowhere near the middle or end. Spec §2.5. |
 ```
 
@@ -1296,7 +1296,7 @@ fn set_strong_hash(conn: &Connection, id: i64, hash: &str) {
     .unwrap();
 }
 
-/// Two masters with the same header (PixInsight copies the reference image's
+/// Two masters with the same header (the downstream processing program copies the reference image's
 /// keywords) but different bytes must NOT group; two with the same bytes must.
 /// This is the whole point of the Master key: the header shortlists, the bytes
 /// decide.
@@ -1506,7 +1506,7 @@ In `DuplicateKey` (`operations.rs`), add the variant and extend all five `match 
 ```rust
     /// Full-file hash (`files.strong_hash`) over masters and processed files.
     ///
-    /// Their headers are shared by construction — PixInsight propagates the
+    /// Their headers are shared by construction — the downstream processing program propagates the
     /// integration reference's FITS keywords, so `Pane_2_Sii.xisf` states
     /// `FILTER = 'H'` — which makes the header useless as a verdict and
     /// excellent as a filter. [`crate::duplicates::backfill::fill_master_strong_hashes`]
@@ -1542,7 +1542,7 @@ In `crates/athenaeum-core/src/duplicates/mod.rs`, beside `compute_xxhash`:
 /// and is documented as lossy. Sampling is not merely lossy here, it is
 /// hopeless: measured over 20 000 trials, a sampling scheme's chance of
 /// noticing a changed pixel equals the fraction of the file it reads, and the
-/// real divergence between two PixInsight masters is ONE Float32 pixel — 4
+/// real divergence between two downstream-program masters is ONE Float32 pixel — 4
 /// bytes in 77 MiB. Spending more of the budget on more, smaller samples makes
 /// it strictly worse. So masters are decided by reading everything.
 ///
@@ -1795,7 +1795,7 @@ git add crates/athenaeum-core/src/db/schema.rs crates/athenaeum-core/src/db/oper
         crates/athenaeum-web/src/routes/duplicates.rs
 git commit -m "feat(duplicates): decide master duplicates by full-file hash
 
-A master's header is shared by construction -- PixInsight propagates the
+A master's header is shared by construction -- the downstream processing program propagates the
 integration reference's FITS keywords, so Pane_2_Sii.xisf states FILTER='H'
 -- which measures 0/30 precision, and no sampling scheme repairs it:
 detection tracks coverage linearly and the real divergence is one Float32

@@ -93,11 +93,11 @@ See **"Catalog Data Flow (detailed)"** section below for the complete data flow 
 - Triangle: 2 invariant ratios → high false match rate
 - Quad: 5 invariant ratios → dramatically fewer false matches
 - Hash table: O(1) lookup vs O(N²) brute force comparison
-- Proven in tetra3 (ESA), astrometry.net, ASTAP
+- Proven in tetra3 (ESA), an external plate solver and a second external solver
 
 ### Pattern encoding — two approaches to evaluate
 
-**Approach A: Distance ratios (astrometry.net style)**
+**Approach A: Distance ratios (external-solver style)**
 1. Select 4 stars from star list (brightest first, breadth-first)
 2. Compute all 6 pairwise distances
 3. Normalize by the longest distance → 5 ratios in [0, 1]
@@ -148,7 +148,7 @@ Quantization bin size determines the tradeoff between missed matches and false c
 
 ### Licensing constraints
 
-Gaia DR3 is licensed **CC BY-NC 3.0 IGO** — free for non-commercial use with attribution, but commercial redistribution is restricted. PixInsight (commercial) works around this by having users download Gaia catalogs separately rather than shipping them. We follow the same approach.
+Gaia DR3 is licensed **CC BY-NC 3.0 IGO** — free for non-commercial use with attribution, but commercial redistribution is restricted. The ERP (commercial) works around this by having users download Gaia catalogs separately rather than shipping them. We follow the same approach.
 
 ### Three-tier catalog strategy
 
@@ -845,19 +845,19 @@ Test set: 10–20 real FITS files covering edge cases:
 | Low SNR | Faint stars, high noise |
 | Near celestial pole | RA wrap-around, projection singularity |
 
-Each file has **ground truth WCS from PixInsight ImageSolver** (Gaia DR3, with distortion correction, thin plate splines + surface simplifiers). PixInsight achieves < 0.03 px accuracy — this is the gold standard reference.
+Each file has **ground truth WCS from the ERP's image solver** (Gaia DR3, with distortion correction, thin plate splines + surface simplifiers). The ERP achieves < 0.03 px accuracy — this is the gold standard reference.
 
 **Pass criteria:**
 
 | Metric | Threshold |
 | ---- | ---- |
-| Center RA/Dec difference vs PixInsight | < 30 arcsec |
+| Center RA/Dec difference vs the ERP | < 30 arcsec |
 | Pixel scale difference | < 1% |
 | Rotation difference | < 0.5° |
 | RMS residual | < 1.0 px |
 | Solve time (hint-based) | < 2 seconds |
 
-**Storage:** FITS files in git-lfs or separate test data repo (50–200 MB each). PixInsight reference WCS stored as JSON sidecar per file. CI downloads on PR to main, not on every commit.
+**Storage:** FITS files in git-lfs or separate test data repo (50–200 MB each). The ERP's reference WCS stored as JSON sidecar per file. CI downloads on PR to main, not on every commit.
 
 ### Level 4: Catalog tests (Athenaeum)
 
@@ -935,7 +935,7 @@ fn bench_full_solve(c: &mut Criterion) {
 | Trigger | Tests | Duration |
 | ---- | ---- | ---- |
 | Every commit | Level 1 + Level 2 (synthetic + hardcoded Orion) | < 30 sec |
-| PR to main | + Level 3 (real FITS, PixInsight reference) | ~ 5 min |
+| PR to main | + Level 3 (real FITS, ERP reference) | ~ 5 min |
 | Nightly | + Full benchmark suite, performance regression detection | ~ 15 min |
 
 ### Development sequence
@@ -951,7 +951,7 @@ fn bench_full_solve(c: &mut Criterion) {
 | 2a | Athenaeum | Catalog binary format writer + reader | Level 4: mini catalog |
 | 2b | Athenaeum | CatalogEngine (cone search, memmap) | Level 4: search + edge cases |
 | 2c | Athenaeum | PlateSolveService (orchestration) | Level 3: first real FITS solve |
-| **M2** | Both | **Milestone: Level 3 passes — real images solve against PixInsight reference** | Level 3 |
+| **M2** | Both | **Milestone: Level 3 passes — real images solve against ERP reference** | Level 3 |
 | 3a | rustafits | SIP distortion in TransformFitter | Level 1: synthetic distortion recovery |
 | 3b | Both | Wide-field FITS test cases | Level 3: corner residuals < 0.5 px |
 | **M3** | Both | **Milestone: wide-field with distortion correction** | Level 3 |
@@ -964,11 +964,11 @@ fn bench_full_solve(c: &mut Criterion) {
 
 ## References
 
-- Lang et al. 2010 — "Astrometry.net: Blind Astrometric Calibration" (arXiv:0910.2233)
+- Lang et al. 2010 — blind astrometric calibration (arXiv:0910.2233)
 - Brown et al. 2017 — "TETRA: Star Identification with Hash Tables" (tetra3 algorithm)
 - tetra3rs — Rust implementation (github.com/ssmichael1/tetra3rs)
-- Siril plate solver — Triangle matching + SIP (gitlab.com/free-astro/siril)
+- A second open-source stacker's plate solver — Triangle matching + SIP
 - SIP Convention — Harvard/STScI distortion standard (fits.gsfc.nasa.gov/registry/sip.html)
 - Gaia DR3 — ESA star catalog (cosmos.esa.int/web/gaia/dr3)
 - Calabretta & Greisen 2002 — "Representations of Celestial Coordinates in FITS" (WCS standard)
-- PixInsight ImageSolver — Thin plate splines + surface simplifiers for distortion modeling
+- The ERP's image solver — Thin plate splines + surface simplifiers for distortion modeling

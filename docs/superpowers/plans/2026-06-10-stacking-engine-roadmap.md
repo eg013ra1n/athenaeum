@@ -1,6 +1,6 @@
 # Stacking Engine Roadmap — 2026-06-10
 
-**Goal:** Path from the current registration foundation (`feature/stacking-prep`) to PixInsight-class image integration: sub-pixel-registered, normalized, rejection-combined stacks from calibrated full-resolution data.
+**Goal:** Path from the current registration foundation (`feature/stacking-prep`) to ERP-class image integration: sub-pixel-registered, normalized, rejection-combined stacks from calibrated full-resolution data.
 
 ## Where we actually stand (audit verdict)
 
@@ -38,7 +38,7 @@ Expose flux-linear full-resolution data from the image layer:
 ## Phase C — normalization
 
 - Global: per-frame background (sigma-clipped median) offset + scale matching to reference. Required for any rejection to be meaningful.
-- Later: local normalization (gradient-aware, tiled background model) — PixInsight's LN is a separate large feature; explicitly deferred.
+- Later: local normalization (gradient-aware, tiled background model) — the ERP's LN is a separate large feature; explicitly deferred.
 
 ## Phase D — integration
 
