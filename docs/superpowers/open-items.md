@@ -270,6 +270,7 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **`.deb`/`.rpm` installs are refused by the updater by rule — deferred, not a bug.** | `crates/athenaeum-core/src/updates/manifest.rs::platform_supported` | A package-manager install falls back to nothing rather than being handed the AppImage entry and choking on `dpkg -i` after a 100 MB download. The updater plugin itself can install over a `.deb`, so a `linux-x86_64-deb` manifest key plus a `.deb` build/sign leg is a real, scoped follow-up (spec §8 "Out of scope"), pending its own task. |
 | **An unset `FILTER` is a frame state, not a camera property — there is no "OSC" filter convention.** | `collab::filters::match_filter`, `collab::gate`, the hub dictionary, any "map empty FILTER to an OSC canonical" proposal | Owner ruling 2026-09-28. OSC cameras shoot with or without a filter, and mono cameras without a wheel shoot without one too, so an empty `FILTER` cannot be inferred to mean anything from `BAYERPAT`. It is one more unmapped raw name for the spec §6.2 mapping flow (`filter_mappings (instrume, filter_raw) → canonical`, the normaliser, the publish-flow modal), where the PUBLISHER picks the canonical — `L`, `None`, whatever the project offers. A hub-side special case for `channel = "osc"` was proposed on 2026-09-28 and withdrawn the same day. |
 | **Injected OSC captured fraction ~2× is a scorecard artefact.** | Star-measurement scorecard Row 6 on inject frames, OSC families | Row 6 divides the measured flux (fitted FWTM flux × the plane's aperture correction `c`, taken from the frame's real stars) by an injected Moffat-β-4 star with no wing; on undersampled OSC planes `c` is 1.9–2.7, so injected stars read ×`c` (the c-free model / truth is 0.95–1.02). I.1 extended; `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-14-report-capfrac.md`. |
+| **Set 204 mono's OFFSET-200 dark on OFFSET-30 lights is the owner's deliberate link, not a product finding.** | The set 204 mono tree (`tierA-lnB-f1`, LDN1272, 180 s): its 208 dark links carry `is_manual_override = 1` (2026-08-28); any "warn on an OFFSET mismatch" proposal | Owner 2026-10-23: the offset was unlinked in the settings on purpose, there were no other lights. The lab consequence stays: about 170-206 ADU over-subtracted, so the lever gate is the six-source pooled free fit (R-PB2-8, `docs/stacking/README.md` R-OSP-16 B2); LN scale and `c` are local-sky-subtracted and stand; absolute-sky quantities of that tree (SNR, noise rows) carry the level error. |
 
 ---
 
@@ -277,27 +278,6 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
-
-### Set 204 mono: an OFFSET-200 dark on OFFSET-30 lights, and nothing stops it (2026-10-23)
-
-Product finding of Plan B B2 Step 4 (the lever-gate verdict; `docs/stacking/README.md` R-OSP-16 B2, R-PB2-8). The second instance of the Horse C11 pattern
-(a master dark whose pedestal does not match the lights). The owner's call; nothing was built.
-
-- What: the set 204 mono tree (`tierA-lnB-f1`, LDN1272, 180 s) was dark-subtracted with the master dark
-  `master_dark_180s_-10C_g100_bin1x1_2025-04-12_2.fits` (OFFSET 200, median 201 ADU) on OFFSET-30 lights (raw median 561 ADU): about 170-206 ADU
-  over-subtracted (calibrated sky 360 ADU where the photon level is about 530). Every ATR2600M dark and bias in both catalogs is OFFSET 200; all 216
-  set 204 lights and their master flat are OFFSET 30.
-- Evidence: the lab's gain self-check refused all six lever sources (each source's c = 0 ratio 1.34-1.60); the six sources pooled give a free fit
-  of 1.067 (span 0.66) and an intercept of 198 ADU removed. The camera gain holds.
-- How the link was made (checked 2026-10-23 in the tree's catalog, read-only): a MANUAL override — the 208 dark links to the OFFSET-200
-  180 s gain-100 set carry `is_manual_override = 1` (2026-08-28), while an OFFSET-30 180 s gain-100 dark set existed and was auto-linked to 685
-  other frames. The default matcher (offset `Exact`, `calibration/config.rs`) would not have made it. A manual override is not checked against
-  the lights' OFFSET, and no plan-gate or run check names a dark whose pedestal differs from the lights' (the 28 manual links to an OFFSET-50
-  dark in the same tree look like the Horsehead C11 case).
-- Effect: Plan B's numbers (LN scale, `c`) are local-sky-subtracted and blind to the pedestal, so they stand. Absolute-sky quantities of that tree (SNR,
-  noise rows, the ERP's noise estimates) carry about +170 ADU of level error.
-- If wanted: an advisory warning (never a change of auto-link picks: calibration warnings are not gates), next to the Export tab's pedestal warning
-  below; it would cover the Horse C11 case too.
 
 ### The Measure aperture correction `c` on undersampled OSC planes (2026-10-20)
 

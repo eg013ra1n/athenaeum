@@ -3915,9 +3915,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     | 3F circle | +0.18 | +1.24 | +0.52 | +1.03 | +2.54 | +2.90 | +0.79 |
 
     The PSF-signal arm reads 2-8 % low at every dF and is flagged (3 % rule) on 4 of 6 pairs (5 at beta 4); the circles stay inside -0.8 to +2.9 %.
-    **PRODUCT FINDING (the owner's call, no guard built).** The set 204 mono tree was calibrated with an OFFSET-200 master dark on OFFSET-30 lights
-    (170-206 ADU over-subtracted, 198 by the pooled fit; the camera gain holds, free fit 1.067): the Horse C11 pattern again.
-    Plan B is blind to it (LN scale and `c` are local-sky-subtracted); the lever gate became the six-source pooled free fit. Entry in `open-items.md`.
+    **Not a product finding (owner, 2026-10-23: the offset unlinked in the settings on purpose, no other lights).** The set 204 mono tree was calibrated
+    with an OFFSET-200 master dark on OFFSET-30 lights (170-206 ADU over-subtracted, 198 by the pooled fit; the camera gain holds, free fit 1.067).
+    Plan B is blind to it (LN scale and `c` are local-sky-subtracted); the lever gate became the six-source pooled free fit. Standing decision in `open-items.md`.
     *Rulings.*
     - R-PB2-1: the tool is right; B3 counts normal-mode rows only (interim, superseded by R-PB2-2 and R-PB2-6).
     - R-PB2-2: the growth-corrected crowded mode is dead and pinned OFF; the referee is the normal mode plus a far read.
@@ -3928,7 +3928,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       flagged `crowded-dF` and never counted, refusals n/a; B3 decides on the referee-free pairwise and slope comparisons; no further referee round.
     - R-PB2-7: mono fields are realistic, OSC fields are not; Step 3b not triggered; B3 reads the referee-free comparisons.
     - R-PB2-8: the lever gain gate is the free fit pooled over the six sources (bounds 0.9-1.1 unchanged), the pedestal recorded; pixels and s_inj untouched.
-    *Open items carried.* (1) The OFFSET mismatch above: a MANUAL dark override (`is_manual_override = 1`, 2026-08-28; the default matcher's offset `Exact` would not have linked it); whether a manual override should warn on an OFFSET mismatch is the owner's call. (2) The halo's dependence on F (seeing-scaled
+    *Open items carried.* (1) The OFFSET mismatch above: a MANUAL dark override (`is_manual_override = 1`, 2026-08-28), the owner's deliberate link (2026-10-23) - closed, nothing to build. (2) The halo's dependence on F (seeing-scaled
     wing against a fixed-pixel optical halo) cannot be sized on real pairs; the candidate cause of the F1 size gap, unmeasured. (3) No synthetic OSC
     family represents real OSC crowding; no mono family reaches set 204 / run B crowding (max 0.0597 against 0.0753 / 0.0849). (4) Lab hygiene (B6):
     `planb.sh truth` exits 4 on refusals only; `ln_truth_run --far` prints an intercept beyond 2 SE without a usability rule (moot: nothing reads).

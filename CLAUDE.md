@@ -5,7 +5,7 @@ Guidance for Claude Code working in the Athenaeum repo.
 ## Project Overview
 
 Athenaeum is a desktop + web app for astrophotographers to manage FITS/XISF image files and their metadata catalog (frame-set clustering by sky coordinates, calibration matching, ZIP archive, plate-solving, export templates). Tauri 2 desktop shell, Axum/SSE web server, shared `athenaeum-core` library, SQLite catalog, React/TS frontend.
-Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP".
+Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP". The rule covers a program used as a comparison or a reference; crediting a format's author (XISF) or a fetch permission is neither and stays.
 
 ## Workspace Layout
 
