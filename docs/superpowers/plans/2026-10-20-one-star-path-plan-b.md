@@ -595,19 +595,19 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
   Owner: informed with the baseline."
 
 **Steps.**
-- [ ] **Step 0 — the runner first (sonnet; a Remote Control handoff; ≈ 1 h machine).** `planb-b1-l10b.md`: on the runner,
+- [x] **Step 0 — the runner first (sonnet; a Remote Control handoff; ≈ 1 h machine).** `planb-b1-l10b.md`: on the runner,
   at athenaeum 068cf2d6 + the lab head, `lab_cycle.py --step b1-l10b --manifest t10b-l --prev <the l10b a1c step>
   --bars none` (the nebula-sky pairs at the current binary: the 15 `l10b/pairs/*` families × t25 / t45 / t60), then the
   ERP LN once on those pairs (`erp_v2.py ln manifests/t10b-l.json --families l10b/pairs`), the audit, the table with the
   ERP beside every arm (after Step 2's lab change lands — the runner pulls the lab head first), the results committed
   from the runner (`results/plan-b/b1/l10b-ln-table.md`, the small `ln.csv` copies). A ≤ 30-line verdict on the share.
-- [ ] **Step 1 — the truth CSVs (lab code; sonnet; ≈ 1.5 h).** `ln_truth_rebuild.py`: from `ln-real-members.csv` the
+- [x] **Step 1 — the truth CSVs (lab code; sonnet; ≈ 1.5 h).** `ln_truth_rebuild.py`: from `ln-real-members.csv` the
   rows of `runB-mono`, `runB-osc`, `hc11-G` into the two CSVs in the exact column layout `ln_real.truth_rows` reads
   (the test pins it on the s204 CSV: rebuilding s204 from the members CSV reproduces `s204mono-lnBref.csv` row for row);
   sha256 of each output recorded in `results/plan-b/b1/truth-rebuild.txt`; then every dataset's reference md5 against
   `ln-real-plan.json` (`ln_real.py check-truth` + the md5 of each `reference.fits` of the three trees: `a3fe9d04…`,
   `e034aa6d…`, `8871ab3b…`, `712cd2fe…`, `e60b93f4…`) — a mismatch is a STOP (the tree changed; nothing runs). Commit lab.
-- [ ] **Step 2 — the ERP beside every arm and the LN audit (lab code; sonnet; ≈ 2.5 h).** `rows_ln`: the `erp` cell for
+- [x] **Step 2 — the ERP beside every arm and the LN audit (lab code; sonnet; ≈ 2.5 h).** `rows_ln`: the `erp` cell for
   every key in `vals` (the ERP's s against the same `s_true`); `rows_ln_injected`: the same when `<family>/ln.csv` exists;
   `erp_audit.py`'s `ln` section (the three-step link of the star units applied to the LN inputs: reference + targets).
   Tests: `test_rows_ln_erp.py` (two arms, one ERP file → both rows carry the ERP cell; no ERP file → `—`),
@@ -619,18 +619,18 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
   `bin/scorecard.py:57–60`; no probe run; PB-4), the LN
   table per family × β × arm with the ERP beside, the audit (`erp-ln-audit.txt`: expected 19 CURRENT hash-identical, 5
   CURRENT header-only, 0 STALE; any STALE re-runs that family's ERP LN once and is recorded). Commit lab; push.
-- [ ] **Step 3 — `ln_real` on the three trees (sonnet judgment; ≈ 1 h; the 068cf2d6 probe, sha256 checked; the dev Mac,
+- [x] **Step 3 — `ln_real` on the three trees (sonnet judgment; ≈ 1 h; the 068cf2d6 probe, sha256 checked; the dev Mac,
   PB-17).** `planb.sh
   b1 ln-real` = `ln_real.py run` (every arm; the 2026-10-07 wall 2690 s) → `verify` → `table --gates <the t14-final gates
   summary> --csv ln-real-members.csv` on the five datasets, with `annulus-crowding.csv` (per member, the f1 arm's
   `ln_annulus_crowding`) for B2 and the `f1_gc` ↔ `.athln` parity (`athln_for` on each tree's sidecars: median and max
   |Δ|). The 3 % flag column: a cell where an arm and the ERP (where present) both miss the truth > 3 % the same way.
-- [ ] **Step 4 — the F1 v2 port's real read (sonnet judgment; ≈ 1 h; the dev Mac, it reads the trees).** `planb.sh b1 f1v2`: the 30 + 28 members (PB-5)
+- [x] **Step 4 — the F1 v2 port's real read (sonnet judgment; ≈ 1 h; the dev Mac, it reads the trees).** `planb.sh b1 f1v2`: the 30 + 28 members (PB-5)
   re-dumped by `ln_scale_probe --stars-dir` on the trees' own references, `f1core.py`'s V0-gc5 and L3-gc5 on those
   dumps, the gap against the truth rows per member (pooled median |gap|, median gap, slope), the 2026-10-06 numbers
   (set 204 −1.01 % vs −0.64 %; Horse C11 G +0.08 % vs −0.13 %) printed beside with the reference note; the port's
   reproduction of production (`f1_gc` on the same dumps) printed as the parity of this read.
-- [ ] **Step 5 — the ERP's LN on the real sets and the injected pairs (sonnet, fixed answers per chunk; ≈ 2 h machine, in
+- [x] **Step 5 — the ERP's LN on the real sets and the injected pairs (sonnet, fixed answers per chunk; ≈ 2 h machine, in
   chunks; the DEV MAC, where the ERP and the frames are — nothing is transported (C-2); the owner's instance closed, the
   memory guard under HEAVY.lock, no compile beside it).** `erp_ln_real.py export <ds>` into `~/.athenaeum-acc/star-lab/
   real/<ds>/in/` (the frames' sha256 travel with them — the freshness link), then `run <ds>` (chunks of 5 through
@@ -639,7 +639,7 @@ rebuilt truth CSVs also at `~/.athenaeum-acc/ln-scale-audit/runB-truth.csv` and 
   the three `inject.json` pairs (`erp_v2.py ln manifests/inject.json`; their flat and dark are on bigbase3). The existing
   real ERP LN (the 30-member subset, Horse C11 G) is printed from `findings.md` §4 and `ln-math/ext-G-pass2.txt` as the
   spec says; the new runs are appended as the ERP column of Step 3's table (`planb.sh b1 table`).
-- [ ] **Step 6 — the baseline package (sonnet; ≈ 1 h).** `results/plan-b/b1/README.md` (one data line per table naming
+- [x] **Step 6 — the baseline package (sonnet; ≈ 1 h).** `results/plan-b/b1/README.md` (one data line per table naming
   machine and volume), the lab commit `results(plan-b/b1): the LN re-baseline on Plan A's fits - the ERP beside every arm,
   the LN freshness audit, the real tables on the rebuilt truths, the first ERP LN runs on the real sets, the injected and
   the nebula-sky pairs, the F1 v2 port's own read`; push. README R-OSP-16 B1 block in athenaeum (one commit).

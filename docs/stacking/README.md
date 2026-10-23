@@ -3829,6 +3829,51 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     `install_in_span` if B4 wants it, out of B0's scope. (4) `planb.sh truth` exits 4 on refusals only (R-PB0-14): print the count, exit 0 (B6).
     *Suites (B0 Step 6, 2026-10-23, at 20697493):* `cargo test -p athenaeum-core --all-targets --no-fail-fast` 28 binaries 4105 passed /
     0 failed / 20 ignored (Plan A's 4091 + 14 new; no flake this run); `tsc --noEmit` clean after the `stacking.ts` regeneration. B0 closed.
+  - **R-OSP-16 - Plan B B1: the LN re-baseline on Plan A's fits, the ERP beside every arm (Task B1; branch `plan-b`, no product code; plan
+    `### Task B1`; lab `star-lab/results/plan-b/b1/`, its `README.md` names the machine and volume of every table). A baseline: no bar.**
+    *Runs* (all at the B0 build, 20697493; dev Mac data on BigMac unless noted). Lab: truth rebuild + ERP-beside code 6c848ed, synthetic table and
+    audit fa7785a, l10b on the runner 5a10fe5, Steps 3-5 tools 9385e6c, ln_real + F1 v2 read 685cb7f, ERP on the real sets + inject e428e5d,
+    package 7d31ece. `ln_real`: 23 run / 23 proven, 543 member-planes, 2077.5 s. ERP LN on the real sets: 515 member-planes, 0 refusals, scale
+    1597 from the owner's batch record (8 instances, all 1597). Gap = s / truth - 1, pooled median / median |.|, %:
+
+    | table (n) | f1_gc | f1_3 | f1_2 | psfSel | psfOff | ERP |
+    | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+    | synthetic, 24 families, beta auto (133) | +1.274 / 1.274 | +1.007 / 1.014 | +0.954 / 1.209 | +0.038 / 0.203 | +0.137 / 0.287 | +0.430 / 1.533 |
+    | l10b nebula-sky, 15 groups, beta auto (43) | +0.345 / 0.624 | +0.195 / 0.266 | +0.164 / 0.339 | +0.238 / 0.687 | +0.166 / 0.543 | -0.239 / 1.772 |
+
+    The l10b a1c (earlier-binary) columns equal ours in every pooled row; 2 of 45 ERP members refused (neb3/g t3 at 36 stars, neb3/m4 t3 at 19).
+    *Real sets* (f1_gc median gap / median |.|; ERP median gap and slope in %/px2; the 3 % flag = an arm and the ERP both miss truth by more
+    than 3 % the same way; `.athln` parity = the probe's f1_gc over the run's sidecar):
+
+    | set (n) | f1_gc | ERP gap / slope | 3 % flags | parity median / max |
+    | ---- | ---- | ---- | ---- | ---- |
+    | set 204 mono (91) | -0.108 / 0.280 | -2.78 / -0.29 | 39 of 91 | +0.0077 / 0.194 |
+    | set 204 OSC (39) | -0.179 / 0.433 | +4.45 / -0.60 | 2 of 39 | +0.0034 / 0.236 |
+    | run B mono (82) | +0.092 / 0.327 | -3.64 / -0.30 | 52 of 82 | +0.0057 / 0.236 |
+    | run B OSC (303) | -0.166 / 0.389 | +3.54 / -0.63 | 15 of 303 | +0.0051 / 0.212 |
+    | Horse C11 G (28) | -0.114 / 0.296 | not re-run (2026-10-06: -2.44 / -0.06) | 0 of 0 | -0.0465 / 1.226 |
+
+    Pooled parity n 543: median +0.0050 % (2026-10-07: +0.0097), max 1.226 %. The flags are `psfSel` / `psfOff` only, never f1_gc, f1_2, f1_3
+    or sLib; carried to B2, not resolved here. F1 v2 port, real read on 58 re-dumped members (median gap, 2026-10-06 beside, never a bar): set 204
+    V0-gc5 -0.05 % (-0.64), L3-gc5 -0.68 (-1.01); Horse C11 G V0-gc5 -0.11 (-0.13), L3-gc5 +0.12 (+0.08); the port against f1_gc on the same
+    dumps at most 0.10 %. Injected pairs: the ERP's LN is the whole-frame ratio 1.02-1.27 against s_inj 0.8, our arms read 0.79-0.80.
+    *Audit and truth.* LN freshness audit: 24 `ln.csv` on disk, 24 audited, 19 CURRENT hash-identical + 5 header-only, 0 STALE (first run audited
+    21: the family filter took exact names, `erp_v2` takes `/` prefixes); l10b 15 / 15 CURRENT. Truth: s204's two CSVs rebuild byte for byte, run B
+    (82 + 303) and Horse C11 G (28) rebuilt with recorded sha256, the five reference md5s equal the pins; `check-truth` NOT RUN.
+    *Rulings.*
+    - R-PB1-2: `ln_real.py check-truth` is not run (its three input trees were deleted before Plan B); the rebuild's byte-identity and the md5s stand.
+    - R-PB1-3: an ERP member refusal is a recorded cell ("ERP refused (N stars)"), not a failed run; any other missing scale stays a failure.
+    - R-PB1-4: the injected pairs' ERP LN runs at scale 1597 (full 6248x4176 frames), `ATH_ERP_LN_SCALE`; the synthetic default 512 is unchanged.
+    - R-PB1-5: on the injected pairs the ERP's scale is a whole-frame quantity, printed with that label, never compared with s_inj or flagged.
+    - The ERP's real-set gaps are a column, not a referee (owner rule). Context (B2, R-PB2-2): the real cells' truth is not yet refereed (normal
+      mode plus a per-cell far read), so every gap above is "against the truth rows as they stand".
+    *Open items carried.* (1) Horse C11 G parity max 1.226 % (range -0.395 .. +1.226, median -0.0465) is 5x the other trees' 0.19-0.24 %: B3 looks
+    at it. (2) The ERP's gap (mono -2.8 / -3.6 %, OSC +4.4 / +3.5 %, slope -0.3 to -0.6 %/px2) and its mono / OSC sign flip: cause not
+    investigated, B6's report. (3) `ln-real-verdict.txt` predates the ERP runs and only the heavy `planb.sh b1 ln-real` rewrites it: it carries a
+    dated note pointing to `ln-real-table.md`; B6 hygiene is `planb.sh b1 table` regenerating it. (4) Lab hygiene (B6): `planb.sh b1 audit`
+    exits 0 on an UNAUDITED file (the coverage line is informational; `l10b_b1.py audit-gate` reads only the summary line); `planb.sh truth`
+    exits 4 on refusals only (R-PB0-14); the ERP writes a stray display-profile file under `star-lab/true/` on the runner (its working
+    directory at launch): `run_job.sh` should `cd` to a scratch directory first.
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
