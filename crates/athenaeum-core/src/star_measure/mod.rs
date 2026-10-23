@@ -947,11 +947,11 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
 }
 
 /// Every plane's sibling seeds (Plan B B4, PB-12'): entry `q` is the seeds ([`PlanePrep`]'s own, all of them) of every
-/// plane but `q`, in plane order, for [`finish_plane`]'s `siblings`. `None` for every plane of an image of fewer than two
-/// planes: no sibling, no screen. Gather them after [`cross_plane_flags`] and before the first plane is finished (a
+/// plane but `q`, in plane order, for [`finish_plane`]'s `siblings`. `None` for every plane unless the image has exactly
+/// three (R-PB4-3: the screen is the colour image's, PB-12'): no sibling, no screen. Gather them after [`cross_plane_flags`] and before the first plane is finished (a
 /// finished plane's prep is consumed).
 pub fn sibling_seeds(planes: &[PlanePrep]) -> Vec<Option<Vec<Seed>>> {
-    if planes.len() < 2 {
+    if planes.len() != 3 {
         return planes.iter().map(|_| None).collect();
     }
     (0..planes.len())

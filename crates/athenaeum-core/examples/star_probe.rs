@@ -26,8 +26,8 @@
 //!                          median over, brightest by model flux first - the 1 to 4 of a plane at floor (i) too; null without
 //!                          the flag. A diagnostics field, never the product). Every measure and analysis-mode frame line also
 //!                          carries `pointSourceScreened` (the `c` candidates the point-source screen refused), `apertureBelowSnr`
-//!                          (those under SNR 20 after it) and `apertureTerciles` (the sample's median ratio per model-flux
-//!                          third, brightest first; reported, never read)
+//!                          (those under SNR 20 after it) and `apertureTerciles` (the median ratio per model-flux third of
+//!                          the <= 64 `c` sample, brightest first; reported, never read)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -272,9 +272,9 @@ fn n_or_null(v: f64) -> Value {
     }
 }
 
-/// `apertureTerciles` (Plan B B4, PB-13'): the median growth / model ratio of the sample's brightest, middle and faintest
-/// third by model flux (`ratios` is brightest first); null under three ratios. Reported, never read - it shows whether the
-/// faint end of the sample departs from the bright end, which `c` does not use.
+/// `apertureTerciles` (Plan B B4, PB-13'): the terciles of the <= 64 `c` sample - the median growth / model ratio of its
+/// brightest, middle and faintest third by model flux (`ratios` is brightest first); null under three ratios. Reported,
+/// never read.
 fn aperture_terciles(ratios: &[sm::ApertureRatio]) -> Value {
     let n = ratios.len();
     if n < 3 {

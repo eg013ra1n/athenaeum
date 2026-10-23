@@ -273,7 +273,8 @@ pub struct StarFit {
     #[serde(skip)]
     pub sky_ring_n: u32,
     /// The star's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]): `S / sigma_S` over the star's own ring
-    /// sky and noise, computed after the aperture correction (`signal`) and again when a ring is re-read
+    /// sky and noise. It reads neither `signal` nor `c` and is read BEFORE `c` (the SNR floor of the correction's sample:
+    /// `snr_pass` runs before `aperture_correction` inside `ring_and_correction`), and again when a ring is re-read
     /// ([`super::correct_at_ring`]). Every accepted fit carries one, saturated and extended included (R11-5); NaN
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
