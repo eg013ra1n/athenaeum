@@ -425,6 +425,16 @@ pub struct PlaneMeasurement {
     /// The standard error of `aperture_correction` as the median of its ratios (Plan A Task 13b; the probe's
     /// `apertureSe`). Reported, not persisted.
     pub aperture_se: Option<f64>,
+    /// The `c` candidates the point-source screen refused (Plan B B4, PB-12': no seed of another plane within
+    /// 1.5 px of their fitted centre; the probe's `pointSourceScreened`); 0 on a single plane. Copied from the module's
+    /// report here, at the one place the reported plane is built. Reported, not persisted.
+    pub point_source_screened: usize,
+    /// The `c` candidates under SNR 20 (or with none), after the point-source screen (PB-13'; the probe's
+    /// `apertureBelowSnr`). Reported, not persisted.
+    pub aperture_below_snr: usize,
+    /// The growth / model ratios `c` is the median over, brightest first (the probe's `--dump-ratios`). Reported, not
+    /// persisted.
+    pub aperture_ratios: Vec<sm::ApertureRatio>,
     /// What the two populations did on the plane (Plan A Task 13b; the probe's selection counts). `None` = every seed
     /// was fitted. Reported, not persisted.
     pub population: Option<sm::PopulationReport>,
@@ -688,6 +698,8 @@ pub fn measure_planes_diagnosed<'a, E>(
         *wall += t.elapsed();
     }
     sm::cross_plane_flags(&mut preps);
+    // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered before the loop below consumes the preps.
+    let siblings = sm::sibling_seeds(&preps);
     let mut out: Vec<Option<MeasuredPlane>> = (0..n_planes).map(|_| None).collect();
     for p in (0..n_planes).rev() {
         let t = Instant::now();
@@ -701,7 +713,15 @@ pub fn measure_planes_diagnosed<'a, E>(
             _ => unreachable!("one head and one prep per plane, taken last to first"),
         };
         let verdict_ms = prep.verdict_time().as_millis() as u64;
-        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        let m = sm::finish_plane(
+            &data,
+            w,
+            h,
+            &head.module_opts,
+            prep,
+            siblings[p].as_deref(),
+            pool,
+        );
         drop(data);
         let (measurement, seeds, diagnostics) = adapter_tail(head, m);
         walls[p] += t.elapsed();
@@ -852,6 +872,9 @@ pub fn measure_planes_pass2<'a, E>(
         heads.len(),
         "one β per plane (checked by measure_frame_pass2)"
     );
+    // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered from the preps (cross-plane flags applied in the first
+    // pass; the seeds do not move) before the loop below consumes them.
+    let siblings = sm::sibling_seeds(&preps);
     let mut out = Vec::with_capacity(heads.len());
     for (p, (mut head, prep)) in heads.into_iter().zip(preps).enumerate() {
         let t = Instant::now();
@@ -859,7 +882,15 @@ pub fn measure_planes_pass2<'a, E>(
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
         head.module_opts.psf_model = PsfModel::Fixed(betas[p]);
         let verdict_ms = prep.verdict_time().as_millis() as u64;
-        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        let m = sm::finish_plane(
+            &data,
+            w,
+            h,
+            &head.module_opts,
+            prep,
+            siblings[p].as_deref(),
+            pool,
+        );
         drop(data);
         let (mut measurement, seeds, diagnostics) = adapter_tail(head, m);
         measurement.channel.beta_own = Some(beta_own[p]);
@@ -1267,6 +1298,9 @@ fn adapter_tail(
             aperture_correction: m.aperture_correction,
             aperture_stars: m.aperture_stars,
             aperture_se: m.aperture_se,
+            point_source_screened: m.point_source_screened,
+            aperture_below_snr: m.aperture_below_snr,
+            aperture_ratios: m.aperture_ratios,
             population: m.population,
             ring_sky_missing: m.ring_sky_missing,
             clip_floor: m.clip_floor,
