@@ -3928,7 +3928,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       flagged `crowded-dF` and never counted, refusals n/a; B3 decides on the referee-free pairwise and slope comparisons; no further referee round.
     - R-PB2-7: mono fields are realistic, OSC fields are not; Step 3b not triggered; B3 reads the referee-free comparisons.
     - R-PB2-8: the lever gain gate is the free fit pooled over the six sources (bounds 0.9-1.1 unchanged), the pedestal recorded; pixels and s_inj untouched.
-    *Open items carried.* (1) The OFFSET mismatch above (an advisory warning, how the link was made not investigated; the owner). (2) The halo's dependence on F (seeing-scaled
+    *Open items carried.* (1) The OFFSET mismatch above: a MANUAL dark override (`is_manual_override = 1`, 2026-08-28; the default matcher's offset `Exact` would not have linked it); whether a manual override should warn on an OFFSET mismatch is the owner's call. (2) The halo's dependence on F (seeing-scaled
     wing against a fixed-pixel optical halo) cannot be sized on real pairs; the candidate cause of the F1 size gap, unmeasured. (3) No synthetic OSC
     family represents real OSC crowding; no mono family reaches set 204 / run B crowding (max 0.0597 against 0.0753 / 0.0849). (4) Lab hygiene (B6):
     `planb.sh truth` exits 4 on refusals only; `ln_truth_run --far` prints an intercept beyond 2 SE without a usability rule (moot: nothing reads).

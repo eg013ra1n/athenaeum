@@ -289,8 +289,11 @@ Product finding of Plan B B2 Step 4 (the lever-gate verdict; `docs/stacking/READ
   set 204 lights and their master flat are OFFSET 30.
 - Evidence: the lab's gain self-check refused all six lever sources (each source's c = 0 ratio 1.34-1.60); the six sources pooled give a free fit
   of 1.067 (span 0.66) and an intercept of 198 ADU removed. The camera gain holds.
-- Not investigated: how the link was made. The default calibration config matches offset `Exact` (`calibration/config.rs`), so this was a manual link
-  or a config with offset relaxed. No plan-gate or run check names a dark whose pedestal differs from the lights'.
+- How the link was made (checked 2026-10-23 in the tree's catalog, read-only): a MANUAL override — the 208 dark links to the OFFSET-200
+  180 s gain-100 set carry `is_manual_override = 1` (2026-08-28), while an OFFSET-30 180 s gain-100 dark set existed and was auto-linked to 685
+  other frames. The default matcher (offset `Exact`, `calibration/config.rs`) would not have made it. A manual override is not checked against
+  the lights' OFFSET, and no plan-gate or run check names a dark whose pedestal differs from the lights' (the 28 manual links to an OFFSET-50
+  dark in the same tree look like the Horsehead C11 case).
 - Effect: Plan B's numbers (LN scale, `c`) are local-sky-subtracted and blind to the pedestal, so they stand. Absolute-sky quantities of that tree (SNR,
   noise rows, the ERP's noise estimates) carry about +170 ADU of level error.
 - If wanted: an advisory warning (never a change of auto-link picks: calibration warnings are not gates), next to the Export tab's pedestal warning
