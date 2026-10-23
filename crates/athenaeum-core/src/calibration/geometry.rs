@@ -223,27 +223,82 @@ pub fn fill_set_origin(
     Ok(())
 }
 
+/// Lights seen by one hierarchy view: each light's size is read once and its
+/// stored header at most once, however many sets compare against it (review
+/// I-1). Filled lazily, so a view whose sets record no origin reads nothing.
+#[derive(Debug, Default)]
+pub struct LightGeometryCache {
+    lights: HashMap<i64, LazyFrameGeometry>,
+    /// Stored-header reads this cache has made (a pin for the tests).
+    pub origin_reads: usize,
+}
+
+impl LightGeometryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn fit(
+        &mut self,
+        conn: &Connection,
+        frame_id: i64,
+        set: &Geometry,
+    ) -> rusqlite::Result<(Fit, Geometry)> {
+        let light = match self.lights.entry(frame_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(LazyFrameGeometry::load(conn, frame_id)?)
+            }
+        };
+        let had_origin = light.origin.is_some();
+        let verdict = light.fit(conn, set)?;
+        if !had_origin && light.origin.is_some() {
+            self.origin_reads += 1;
+        }
+        Ok((verdict, light.geometry()))
+    }
+}
+
 /// The calibration hierarchy's origin warning for one set (ruling G-7): the
 /// set and the first of `light_frame_ids` whose size equals the set's and
-/// whose recorded sub-frame origin differs. `None` when the set records no
-/// origin (then no light header is read) or every light agrees. A size misfit
-/// is not reported here — the readiness gate blocks it (Task 6).
+/// whose recorded sub-frame origin differs. `set` is the set's geometry as
+/// the caller already holds it. `None` when the set records no origin (then no
+/// light header is read) or every light agrees. A size misfit is not reported
+/// here — the readiness gate blocks it (Task 6).
 pub fn origin_mismatch_for_lights(
     conn: &Connection,
-    set_id: i64,
+    set: Geometry,
     light_frame_ids: &[i64],
+    cache: &mut LightGeometryCache,
 ) -> rusqlite::Result<Option<(Geometry, Geometry)>> {
-    let set = geometry_for_set(conn, set_id)?;
     if set.mixed || set.size.is_none() || set.origin.is_none() {
         return Ok(None);
     }
     for &frame_id in light_frame_ids {
-        let mut light = LazyFrameGeometry::load(conn, frame_id)?;
-        if light.fit(conn, &set)? == Fit::Refused(Refusal::Origin) {
-            return Ok(Some((set, light.geometry())));
+        let (verdict, light) = cache.fit(conn, frame_id, &set)?;
+        if verdict == Fit::Refused(Refusal::Origin) {
+            return Ok(Some((set, light)));
         }
     }
     Ok(None)
+}
+
+/// A set's agreed size and whether its members disagree — the aggregate
+/// part of [`geometry_for_set`], no header read.
+pub fn size_for_set(
+    conn: &Connection,
+    set_id: i64,
+) -> rusqlite::Result<(Option<(i32, i32)>, bool)> {
+    let (w_min, w_max, h_min, h_max): (Option<i32>, Option<i32>, Option<i32>, Option<i32>) = conn
+        .query_row(
+        "SELECT MIN(f.naxis1), MAX(f.naxis1), MIN(f.naxis2), MAX(f.naxis2)
+             FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             WHERE csf.set_id = ?1",
+        params![set_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(size_from_aggregate(w_min, w_max, h_min, h_max))
 }
 
 /// A set's agreed size, origin, and whether its members disagree.
@@ -791,5 +846,39 @@ mod tests {
         assert_eq!(light.geometry(), g(Some(ROI), Some((1584, 1064))));
         assert_eq!(light.report_label(Refusal::Origin), "6384×4258 @ 1584,1064");
         assert_eq!(light.report_label(Refusal::Size), "6384×4258");
+    }
+
+    /// Review T5-r2 I-1: N agreeing lights against three same-size sets that
+    /// record an origin cost N stored-header reads, not 3N; a set that records
+    /// no origin reads none.
+    #[test]
+    fn light_cache_reads_each_header_once_across_sets() {
+        let conn = db();
+        let lights: Vec<i64> = (0..5)
+            .map(|i| seed_frame(&conn, &format!("l{i}"), "Light", Some(ROI), Some((7, 9))))
+            .collect();
+        let mut cache = LightGeometryCache::new();
+        for _ in 0..3 {
+            let set = g(Some(ROI), Some((7, 9)));
+            assert_eq!(
+                origin_mismatch_for_lights(&conn, set, &lights, &mut cache).unwrap(),
+                None
+            );
+        }
+        assert_eq!(cache.origin_reads, lights.len());
+        let none = g(Some(ROI), None);
+        origin_mismatch_for_lights(&conn, none, &lights, &mut cache).unwrap();
+        assert_eq!(
+            cache.origin_reads,
+            lights.len(),
+            "no origin on the set, no read"
+        );
+        // The first mismatching light is the one named.
+        let other = g(Some(ROI), Some((0, 0)));
+        let (set, light) = origin_mismatch_for_lights(&conn, other, &lights, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!((set, light), (other, g(Some(ROI), Some((7, 9)))));
+        assert_eq!(cache.origin_reads, lights.len(), "served from the cache");
     }
 }

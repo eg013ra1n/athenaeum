@@ -423,15 +423,17 @@ fn refuse_unfit_assignment(
     calibration_set_id: i64,
     calibration_type: &str,
 ) -> Result<(), ApiError> {
-    use crate::calibration::geometry::{fit, geometry_for_frame, geometry_for_set, Fit, Refusal};
+    use crate::calibration::geometry::{geometry_for_set, Fit, LazyFrameGeometry, Refusal};
     let set = geometry_for_set(conn, calibration_set_id)?;
     let mut refused = Vec::new();
     let mut other_origin = Vec::new();
     for &frame_id in frame_ids {
-        let frame = geometry_for_frame(conn, frame_id)?;
-        match fit(&frame, &set) {
-            Fit::Refused(Refusal::Origin) => other_origin.push(frame),
-            Fit::Refused(_) => refused.push(frame),
+        // Reads the frame's header only when the size agrees and the set
+        // records an origin.
+        let mut frame = LazyFrameGeometry::load(conn, frame_id)?;
+        match frame.fit(conn, &set)? {
+            Fit::Refused(Refusal::Origin) => other_origin.push(frame.geometry()),
+            Fit::Refused(_) => refused.push(frame.geometry()),
             Fit::Fits | Fit::Unknown => {}
         }
     }
@@ -2036,6 +2038,42 @@ mod tests {
             err.to_string(),
             format!("Dark set #{set} is 6384×4258 @ 1584,1064, but 2 of the 2 frames are 9576×6388 — a calibration set must match the frame size")
         );
+        assert_eq!(link_count(&ctx), 0, "nothing is written");
+    }
+
+    /// R1 (review T5-r2 M-5): a size one side never recorded blocks nothing.
+    /// Pin — passes with and without the M-3 change.
+    #[test]
+    fn manual_assign_accepts_an_unknown_geometry() {
+        let (_tmp, ctx) = geo_ctx();
+        let (a, set) = {
+            let conn = db(&ctx).unwrap().conn();
+            let a = geo::seed_frame(&conn, "a", "Light", None, None);
+            let set = geo::seed_set(&conn, "MasterDark");
+            let m = geo::seed_frame(&conn, "m", "MasterDark", Some((6384, 4258)), Some((0, 0)));
+            geo::add_members(&conn, set, &[m]);
+            (a, set)
+        };
+        manual_assign_calibration(&ctx, vec![a], set, "Dark".to_string()).unwrap();
+        assert_eq!(link_count(&ctx), 1);
+    }
+
+    /// A set whose members disagree on size fits nothing, manual or not.
+    /// Pin — the Mixed refusal predates this fix.
+    #[test]
+    fn manual_assign_refuses_a_mixed_set() {
+        let (_tmp, ctx) = geo_ctx();
+        let (a, set) = {
+            let conn = db(&ctx).unwrap().conn();
+            let a = geo::seed_frame(&conn, "a", "Light", Some((6384, 4258)), None);
+            let set = geo::seed_set(&conn, "Flat");
+            let m1 = geo::seed_frame(&conn, "m1", "Flat", Some((6384, 4258)), None);
+            let m2 = geo::seed_frame(&conn, "m2", "Flat", Some((9576, 6388)), None);
+            geo::add_members(&conn, set, &[m1, m2]);
+            (a, set)
+        };
+        let err = manual_assign_calibration(&ctx, vec![a], set, "Flat".to_string()).unwrap_err();
+        assert!(err.to_string().contains("mixed sizes"), "{err}");
         assert_eq!(link_count(&ctx), 0, "nothing is written");
     }
 

@@ -1111,12 +1111,28 @@ fn get_calibration_warnings_for_group(
 /// then simply shows no origin warning.
 fn push_origin_warning(
     conn: &Connection,
+    set: &CalibrationSetDetail,
     set_id: i64,
     frame_ids: &[i64],
     calibration_type: &str,
+    cache: &mut crate::calibration::geometry::LightGeometryCache,
     warnings: &mut Vec<CalibrationWarning>,
 ) {
-    match crate::calibration::geometry::origin_mismatch_for_lights(conn, set_id, frame_ids) {
+    use crate::calibration::geometry::{origin_mismatch_for_lights, size_for_set, Geometry};
+    // The origin is the one costly part and `get_calibration_set_detail`
+    // already parsed it; only the cheap size aggregate is read again.
+    let origin = set.xorgsubf.zip(set.yorgsubf);
+    let geometry = if origin.is_none() {
+        Ok(Geometry::default())
+    } else {
+        size_for_set(conn, set_id).map(|(size, mixed)| Geometry {
+            size,
+            origin: if mixed { None } else { origin },
+            mixed,
+        })
+    };
+    let result = geometry.and_then(|g| origin_mismatch_for_lights(conn, g, frame_ids, cache));
+    match result {
         Ok(Some((set, light))) => warnings.push(CalibrationWarning {
             warning_type: "geometry".to_string(),
             message: format!(
@@ -1133,6 +1149,18 @@ fn push_origin_warning(
             %error,
             "sub-frame origin check failed; the hierarchy shows no origin warning for this set"
         ),
+    }
+}
+
+/// `get_calibration_set_detail` for a hierarchy row: a failure is logged and
+/// the row is left out (never silently).
+fn set_detail_or_log(conn: &Connection, set_id: i64) -> Option<CalibrationSetDetail> {
+    match get_calibration_set_detail(conn, set_id) {
+        Ok(detail) => Some(detail),
+        Err(error) => {
+            tracing::warn!(set_id, %error, "calibration set detail failed; the hierarchy omits this set");
+            None
+        }
     }
 }
 
@@ -1196,6 +1224,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
     conn: &Connection,
     frame_set_id: i64,
 ) -> Result<CalibrationHierarchyView> {
+    // One light cache for the whole view: a light's header is read at most
+    // once however many sets compare against it (review I-1).
+    let mut light_cache = crate::calibration::geometry::LightGeometryCache::new();
     // Step 1: Get all LIGHT frames in the frame set with metadata
     let mut stmt = conn.prepare(
         "SELECT
@@ -1508,10 +1539,18 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     let flat_sets: Vec<CalibrationSetWithFrameCount> = flat_set_frames
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
-                            let set = get_calibration_set_detail(conn, set_id).ok()?;
+                            let set = set_detail_or_log(conn, set_id)?;
                             let mut warnings =
                                 get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Flat");
-                            push_origin_warning(conn, set_id, &frame_ids, "Flat", &mut warnings);
+                            push_origin_warning(
+                                conn,
+                                &set,
+                                set_id,
+                                &frame_ids,
+                                "Flat",
+                                &mut light_cache,
+                                &mut warnings,
+                            );
                             let sub_calibration =
                                 get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
@@ -1528,10 +1567,18 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     let dark_sets: Vec<CalibrationSetWithFrameCount> = dark_set_frames
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
-                            let set = get_calibration_set_detail(conn, set_id).ok()?;
+                            let set = set_detail_or_log(conn, set_id)?;
                             let mut warnings =
                                 get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Dark");
-                            push_origin_warning(conn, set_id, &frame_ids, "Dark", &mut warnings);
+                            push_origin_warning(
+                                conn,
+                                &set,
+                                set_id,
+                                &frame_ids,
+                                "Dark",
+                                &mut light_cache,
+                                &mut warnings,
+                            );
                             let sub_calibration =
                                 get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
@@ -1549,10 +1596,18 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     let bias_sets: Vec<CalibrationSetWithFrameCount> = bias_set_frames
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
-                            let set = get_calibration_set_detail(conn, set_id).ok()?;
+                            let set = set_detail_or_log(conn, set_id)?;
                             let mut warnings =
                                 get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Bias");
-                            push_origin_warning(conn, set_id, &frame_ids, "Bias", &mut warnings);
+                            push_origin_warning(
+                                conn,
+                                &set,
+                                set_id,
+                                &frame_ids,
+                                "Bias",
+                                &mut light_cache,
+                                &mut warnings,
+                            );
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
@@ -2179,5 +2234,50 @@ mod night_grouping_tests {
             "Dark set #500 is 6384×4258 @ 0,0, a light using it is 6384×4258 @ 1584,1064 — another sub-frame origin"
         );
         assert_eq!((w.calibration_type.as_str(), w.set_id), ("Dark", 500));
+    }
+
+    /// Review T5-r2 M-5: lights at the SAME origin as the set raise no
+    /// `geometry` warning (the negative case of the origin warning).
+    #[test]
+    fn hierarchy_view_no_origin_warning_when_lights_agree() {
+        use crate::calibration::geometry::test_support::{
+            add_members, fits_header_text, seed_frame,
+        };
+        let conn = db();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'Horsehead')",
+            [],
+        )
+        .unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[(10, "2025-10-18T18:00:00Z")],
+        );
+        conn.execute(
+            "UPDATE frames SET naxis1 = 6384, naxis2 = 4258 WHERE id = 10",
+            [],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(&conn, 10, &fits_header_text(Some((1584, 1064)))).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'MasterDark', '2025-10-18')", []).unwrap();
+        let m = seed_frame(
+            &conn,
+            "dark",
+            "MasterDark",
+            Some((6384, 4258)),
+            Some((1584, 1064)),
+        );
+        add_members(&conn, 500, &[m]);
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at, is_manual_override)
+             VALUES (10, 'frame', 500, 'Dark', '2025-10-18T00:00:00Z', 1)", []).unwrap();
+
+        let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
+        let dark = &view.date_groups[0].camera_groups[0].filter_groups[0].dark_sets[0];
+        assert!(dark.warnings.iter().all(|w| w.warning_type != "geometry"));
     }
 }
