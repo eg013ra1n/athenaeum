@@ -973,32 +973,41 @@ rule), B6.
   gap before and after, the 3 % rule per cell, the re-based LN row (R13-4 …) printed beside, not a bar."
 
 **Steps.**
-- [ ] **Step 1 — the after column (sonnet; ≈ 1.5 h; no new build: B4's binary; the re-score where B4's cycle
+- [x] **Step 1 — the after column (sonnet; ≈ 1.5 h; no new build: B4's binary; the re-score where B4's cycle
   outputs are (the runner's, copied back small), `ln_real` on the dev Mac).** `planb.sh b3 cycle` = B4's `b4-c` cycle
   outputs re-scored for the LN rows with the ERP beside (no probe run; the B4 cycle already produced every LN line at the
   B4 binary), plus `ln_real.py run / table` at the B4 binary on the three trees (≈ 45 min) against B2's referee cells (the
   mode per member, its flag; a flagged cell printed but not counted), B1's beside; `b3_table.py` → `synthetic-table.md`,
   `real-table.md` with every bar per cell for every candidate (F1 as is, psfSel on B4's `c`; the F1 v2 port's column from
   Step 2 if it enters).
-- [ ] **Step 2 — the F1 v2 entry test (sonnet; ≈ 1.5 h).** `entry_test.py`: (1) the port's pooled median |gap| vs F1's on
+  *As it ran:* tools lab 9f74ee5; the before rows on the dev Mac (lab aedfe27), the after side on the runner from `b4-c2`'s
+  scorecards, no probe re-run (lab fd54b5f); `ln_real` on the B4 after-run clones `planb-<ds>-b4`, not the three trees (B2's
+  referee cells sit on B0's pinned references), Horse C11 L added: 885 member-planes, 767 counted (lab b1af182).
+- [x] **Step 2 — the F1 v2 entry test (sonnet; ≈ 1.5 h).** `entry_test.py`: (1) the port's pooled median |gap| vs F1's on
   B1 Step 4's members and dumps (re-dumped at the B4 binary for consistency: `c` only orders the pairs under F1, so the
   port's numbers should not move — the Δ printed); (2) three cosmic-ray seeds on `pairs/main/m4w10` t60 (`synth.py` with
   the f1v2 cosmic-ray generator, seeds 1–3), the port's L3-gc5 cell per seed, the move ≤ 0.53 pp each. Both pass → the
   module ring API change is in scope: Step 2b. Either fails → the candidate is out, recorded with its numbers.
+  *As it ran:* OUT on both (lab d3bd6f2): (1) the port 0.582 % against F1's 0.296 % over 58 members (Δ 0.0000 pp both);
+  (2) moves +1.35 / +0.13 / +0.64 pp against ±0.53 (`synth.py` has no `--cosmic-rays`: the f1v2 generator on the rendered cell).
 - [ ] **Step 2b — the F1 v2 sky through the module (only if Step 2 passes; rust-engineer sonnet code ≈ 4 h; opus review;
   a lab cycle sonnet ≈ 1.5 h).** `ring_sky(…, caller_f: Option<f64>, union_mask: Option<&SeedMask>)`, the LN arm, the probe
   arm `f1_v2`, tests (`ring_sky_at_a_caller_f_with_a_union_mask_equals_the_port_on_a_fixture` within 0.01 %; the default
   call byte-identical, a pin), the lab cycle at the new binary on a quick manifest (`quick:pairs/main/*,pairs/iso/*`) then
   full; the candidate's column added to both tables.
-- [ ] **Step 3 — the owner's package (opus; ≈ 1 h).** `verdict.md`: the candidates on the same rows, every bar per cell,
+  *SKIPPED (R-PB3-1): the entry test is OUT (Step 2); `ring_sky` and the probe are unchanged.*
+- [x] **Step 3 — the owner's package (opus; ≈ 1 h).** `verdict.md`: the candidates on the same rows, every bar per cell,
   the real tables, B2's realism verdict beside F1's `pairs` miss, the recommended default with one paragraph of why
   (memory `feedback_owner_questions_astrophotographer_language.md`: plain meaning and the effect on the master first).
   README R-OSP-16 B3 block (the tables' location, the entry test). PB-18 STOP: the owner chooses. Keeping F1 → Steps 4–5
   are skipped and the product is unchanged.
+  *As it ran:* the owner's STOP delegated to fable: F1 as is stays the default (R-PB3-1; R-PB3-2 on B1's columns). Lab
+  7e291fb (`results/plan-b/b3/verdict.md`, B5's branch included); README R-OSP-16 B3, spec F-8, open-items (the Plan C items).
 - [ ] **Step 4 — the default change (only on the owner's word; rust-engineer sonnet ≈ 1 h; the literal and decode tests
   updated by name).** `integrate.rs` defaults; the stored-document rule unchanged (a document without the keys decodes as
   today — the existing test re-pinned with the new default named). Commit `feat(ln): Plan B B3 - the default LN estimator
   is <X> (owner, <date>)`.
+  *SKIPPED (R-PB3-1): F1 as is stays the default; `integrate.rs` is untouched.*
 - [ ] **Step 5 — master level (only after Step 4; sonnet judgment; ≈ 6–8 h machine, one at a time; the dev Mac,
   as B0's and B4's).** `planb.sh clone
   <ds> b3` (from the trees; the reference pinned to B0's pick; `ATH_ACC_RERUN_FROM=measure` — a clone of the TREE carries the LN cycle's artifacts, not B4's, so the
@@ -1008,6 +1017,7 @@ rule), B6.
   vs B4's after-run (the master rows 0.1 / 1 / 2 / 1 %; ρ ≥ 0.9 the guard; the LN scale against the validated truth:
   pooled median |gap| not worse, every member with before / after, the 3 % flag, the re-based row beside). Results
   committed per dataset; B4's clones stripped light after the comparison commit; B3's kept for B6.
+  *SKIPPED (R-PB3-1): no default change, so no master-level run; B4's after-runs stand as B3's.*
 
 **STOPs.** A master row outside its tolerance or ρ < 0.9 under the new default → the owner with the numbers (never
 tuned); the default is reverted on the owner's word. A pooled median |gap| worse than before's → the same. The F1 v2

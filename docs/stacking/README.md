@@ -1734,6 +1734,10 @@ the new model through the normal cache invalidation (below).
     (the PSF-flux ratio) is overturned for the default path; the owner
     accepted that masters may differ from the ERP by a few percent in level
     where F1 is measurably closer to the truth.
+  - **Kept by Plan B B3 (2026-10-23, R-PB3-1; R-OSP-16 B3).** Re-read
+    against B2's referee on Plan A's fits and B4's `c`, F1 as is stays the
+    default (767 real cells: median |gap| 0.40 % against psfSel's 1.32 %);
+    the F1 v2 sky is out by its entry test. Nothing in the product changed.
   - **Stored documents.** A document without `fluxEstimator` or `aperture`
     reads the defaults and runs F1, so its sets re-normalize once (the default
     config's hash moved); a document naming `psfSignal` keeps it.
@@ -4038,11 +4042,81 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     `c` +4–7 % above truth on 44 / 48 lab rows whatever the sample; cost if wrong about 8 % over-correction of faint stars on β-bound
     undersampled R. (5) The `metrics` payload shows a floored plane's module `c` (None) while its weight is substituted; an additive
     per-frame field would make it visible (optional). (6) If B3 adopts psfSel, LN's own floor (i) takes the same m through
-    `FluxCorrection::Given` (a B3 / B5 line). (7) The ERP's 15 "no file" units are Task 14b's families (14 `spikes/*`,
+    `FluxCorrection::Given` (a B3 / B5 line); B3 kept F1 (R-PB3-1), so it binds only if psfSel is ever the default. (7) The ERP's 15 "no file" units are Task 14b's families (14 `spikes/*`,
     `under/gauss/f1.5/i0`), a Plan A debt; B3's tables are unaffected. (8) Lab hygiene (B6): the harness flake
     `test_planb_b2 …lock_that_stays_held_exits_75…` (full suite only); the runner's stray `star-lab/true/` profile file.
     *Suites.* `cargo test -p athenaeum-core --all-targets --no-fail-fast` at 13aee664: 28 binaries 4115 passed / 0 failed / 20 ignored
     (B0's 4105 + 10). Lab at the tools commit: star-lab 1408 OK, harness 388 with that one flake.
+  - **R-OSP-16 - Plan B B3: the LN estimator stays F1 as is (Task B3; branch `plan-b`, no product code: the code stays 13aee664; plan
+    `### Task B3`; lab `star-lab/results/plan-b/b3/`, its `verdict.md` the package, lab 7e291fb). The owner's choice (PB-18), delegated to
+    fable: R-PB3-1. Nothing in the product moved.**
+    *The tables (every value copied from the lab files).* `synthetic-table.md` (133 cells, 28 slope rows, 21 injected rows; after = the B4
+    binary's cycle `b4-c2` re-scored on the runner, no probe run, lab fd54b5f; before = B1's rows at Plan A's `c`, lab aedfe27);
+    `real-table.md` + `real-members.csv` (`ln_real` at the B4 binary on the B4 after-run clones `planb-<ds>-b4`, the LN reference pinned to
+    B0's pick, the reference B2's referee cells were measured on, so not the plan's "three trees", whose references differ; Horse C11 L
+    added; 885 member-planes, 34 / 34 proven, 767 counted, 117 crowded-dF never counted; lab b1af182); `entry-test.md` + `entry/` (lab
+    d3bd6f2); `verdict-inputs.md` (lab ddd7da7). Lab tools 9f74ee5 (`b3_table.py`, `f1v2/entry_test.py`, `planb.sh b3 <job>`).
+    *The candidates, on the same rows, β auto.* F1 as is (`f1_gc`, L-24's default; Measure's `c` does not enter it), psfSel on B4's `c`
+    (its s moves 1 : 1 with `c`, F-9), and the F1 v2 sky (port L3-gc5) only under its entry test. Synthetic, cells within their bar, after
+    (before = after in every class verdict: B4's `c` moved none):
+
+    | class (bar) | F1 as is | psfSel on B4's `c` |
+    | ---- | ---- | ---- |
+    | 19 `pairs`, Moffat / Gaussian (± 1.2 %) | 24 / 70, worst +11.97 % (`pairs/main/m4w10` t60) | 70 / 70, worst 1.06 % |
+    | 19 `pairs`, blur (± 2 %) | 27 / 35, worst 11.14 % (`pairs/main/m4mix` t60) | 35 / 35, worst 1.72 % |
+    | `truthcheck` / `density_pairs` (the reading mode's ± 0.3 / ± 0.8 %) | 2 / 4, 1 / 6 (d600 t3 4.38 %) | 4 / 4, 6 / 6 |
+    | `osc_pairs` (± 2 % per plane; unrepresentative, R-PB2-7) | 14 / 18 | 17 / 18 |
+    | injected pairs (± 2 % of s / s_inj) | 14 / 14 | 6 / 7 (star-lab-mono2 OSC p1 −2.36 %) |
+
+    Real, counted cells against B2's referee (median abs(gap) / slope in %/px of ΔF, the referee's own ceiling being ± 1 %/px), and the
+    referee-free pairwise psfSel / F1 − 1 over every member-plane (median / slope):
+
+    | dataset (counted) | F1 as is | psfSel on B4's `c` | pairwise |
+    | ---- | ---- | ---- | ---- |
+    | set 204 mono (31) | 1.17 % / +0.871 | 1.79 % / +0.722 | −0.50 % / −2.281 |
+    | set 204 OSC (315) | 0.39 % / +0.273 | 1.46 % / −4.573 | −0.76 % / −4.853 |
+    | run B mono (27) | 0.65 % / +0.263 | 3.72 % / −3.911 | −6.82 % / −3.186 |
+    | run B OSC (303) | 0.40 % / +0.652 | 1.28 % / −4.281 | −0.70 % / −4.932 |
+    | Horse C11 G (28) | 0.25 % / −0.163 | 2.02 % / +0.635 | +2.03 % / +0.802 |
+    | Horse C11 L (63) | 0.17 % / −0.140 | 0.41 % / +0.432 | +0.15 % / +0.932 |
+    | pooled (767) | 0.40 % / +0.121; 4 cells over 3 % | 1.32 % / −0.812; 167 cells over 3 % | — |
+
+    On members 1–2 px worse than the reference psfSel reads −6.65 / −7.13 / −5.34 % (set 204 OSC / run B mono / run B OSC), F1 −0.5 … +0.3 %. The seeing
+    lever (B2, truth by construction, s_inj 0.8): F1's 2F circle −0.84 … +2.01 %, +0.76 %/px, none flagged; PSF signal −2.2 … −7.8 %,
+    −1.54 %/px, 4 of 6 flagged. B1's columns printed beside are another reference (set 204 mono: the tree's F 3.385 px against B0's pick,
+    ≈ 5.1 px) and another truth (B1's `phot`), never a before → after (R-PB3-2): set 204 mono F1 0.21 % there against 1.17 % here is not a
+    move. That referee is thin (n_std 10–11 on every counted cell, SE median 1.19 % against allowances of 0.05–0.78 %), so its "23 / 31
+    outside" is printed, not read; the sound mono referees read F1 −0.56 % (run B, SE 0.53 %), −0.08 / −0.02 % (Horse C11 G / L). On OSC,
+    F1's four 3 % cells (plane 2, ΔF ≈ −1.25) and −0.8 % plane-2 medians are shared by psfSel (pairwise −0.90 / −0.65 %): the plane or the
+    referee, not the estimator. Horse C11 L f70062 p0 has a referee cell and no scale (the verdict line's 768 counted against 767).
+    *The F1 v2 entry test: OUT (recorded, not a STOP).* (1) The port's pooled median abs(gap) over 58 real members 0.582 % against F1's
+    0.296 % (re-dumped at the B4 binary; both 0.0000 pp from B1's read); (2) the cosmic-ray cell `main/m4w10` t60 moves +1.351 / +0.132 /
+    +0.637 pp on seeds 1–3 against ± 0.53. Step 2b skipped: `ring_sky` takes no caller F or union mask.
+    *The decision.* F1 as is stays the default (`LocalNormalizationConfig::default`, `fluxEstimator: commonAperture`, `aperture:
+    growthCurve`; L-24 stands, PSF signal stays a choice). Steps 4–5 skipped: `integrate.rs` untouched, no masters run, B3's after-runs are
+    B4's. Recorded beside R-PB2-7: "F1 misses the synthetic `pairs` bar (24 / 70, +11.97 % at `pairs/main/m4w10` t60) and is kept: on 767
+    real counted cells it reads median |gap| 0.40 % with every dataset's slope inside the referee's ±1 %/px ceiling, while psfSel, exact on
+    synthetic, reads 1.32 % with −3.9…−4.6 %/px on real OSC and run B mono and −2…−8 % on the lever."
+    *B5's branch.* F1 as is is not module-fed: its seeds are `register::detect::detect_stars` on the integrated reference and Measure's fits
+    (or detection) on the target, the mismatch corrected by the seeds calibration `k` (C-14, `stacking/ln/calibration.rs`), and its flux
+    reads its own a·F circles and [6F, 8F] sky, not the module's ring or `c`. B5 Step 0 therefore takes the "F1 as is" branch: Steps 1–2
+    (module seeds and their guards) are skipped, `k` and `unverdicted_clip_range` are kept and recorded beside LN's other screens (Register's
+    0.95, L-14's 0.75, L-23's map); Steps 3 (C-9, the nebula sky; P.1 reads psfSel and F1) and 4 (R11-3, the package) run, against B4's
+    after-runs wherever B5 names B3's.
+    *Rulings.*
+    - R-PB3-1: F1 as is stays the default; psfSel on B4's `c` is rejected; F1 v2 is out by its entry test. Cost if wrong: F1 over-reads the
+      LN scale of members worse than the reference by ≤ ≈ 0.8–0.9 %/px of ΔF (the lever's +0.76), on the lowest-weight members; psfSel
+      instead would have put its −5 … −7 % on ΔF > 1 px members into every OSC and run B master.
+    - R-PB3-2: B1's before columns are another reference and another truth, never a before → after of the estimator; the set 204 mono referee
+      (n 10–11) sets no level. Cost if wrong: a real ≈ 1 % F1 under-read on crowded set 204 mono goes unflagged; psfSel is worse there (−1.79 %).
+    *Open items carried.* (1) Plan C: F1's synthetic-vs-real size gap, the halo's scaling with F (B2's item 2); a synthetic family with a
+    fixed-pixel halo would settle it. (2) Plan C: psfSel is no default candidate again until it passes the lever pairs (abs(gap) ≤ 3 %,
+    abs(slope) ≤ 1 %/px). (3) The set 204 mono referee at n 10: recorded only. (4) The tools' concerns, open: the lever pairs and the
+    realistic family have no B4-binary row (the lever reads the B0 build; `c` on calibrated set 204 is unchanged by B4, so identical by
+    construction; the family was never built); the `b4-c2` probes are 71a4a738's, not the 13aee664 binary's (floor (i) is stacking-fold
+    only and the cycle read 0 floor-(i) planes; unverified). (5) B1's item (1), Horse C11 G parity max 1.226 %, was not examined in B3: B6.
+    (6) B4's item (6) binds only if psfSel is ever the default. No product code changed in B3 (B4's core line, 4115 / 0 / 20, stands); lab
+    suites at 9f74ee5: star-lab 1436 OK, harness 403 OK (2 skipped).
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
