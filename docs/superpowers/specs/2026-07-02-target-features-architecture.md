@@ -12,7 +12,7 @@ The pillars interlock: **masters library** feeds calibration for both export pip
 
 - Clustering (`clustering/`): seed-and-grow single-link on RA/Dec, threshold `grouping.threshold.value` (default 3°). Depending on tile spacing vs threshold, mosaic panels today either merge into one oversized frame set or land as unrelated per-tile sets — both wrong for the mosaic model.
 - Per-frame RA/Dec (+ plate-solve refinement), rotation, focal length; raw headers in `fits_header` — enough to compute tile footprints.
-- WBPP export (`export/file_organizer.rs`) builds keyword-nested folders and **already has grouping-keyword infrastructure**: `WbppExportConfig { keyword_order: ["CAMERA","BIAS","DARKS","FLAT"] }` + `WbppSetupInstructions`/`WbppKeywordInstruction { pre_checked }` (`export/models.rs:691-741`) — but only pre-processing (calibration-chain) keywords; no tile/post-processing keyword. (Note: the Siril script pipeline described in `docs/export/README.md` has been removed from the codebase; that doc is stale — see `../plans/2026-07-02-platform-parity-audit.md`.)
+- WBPP export (`export/file_organizer.rs`) builds keyword-nested folders and **already has grouping-keyword infrastructure**: `WbppExportConfig { keyword_order: ["CAMERA","BIAS","DARKS","FLAT"] }` + `WbppSetupInstructions`/`WbppKeywordInstruction { pre_checked }` (`export/models.rs:691-741`) — but only pre-processing (calibration-chain) keywords; no tile/post-processing keyword. (Note: the script pipeline for a second open-source stacker described in `docs/export/README.md` has been removed from the codebase; that doc is stale — see `../plans/2026-07-02-platform-parity-audit.md`.)
 - No parent/child in `frames_set`; no OBJECT panel-token parsing.
 
 ### Design
@@ -51,7 +51,7 @@ Auto-suggest, user confirms (like auto_merge today); manual "group as mosaic / a
 ### What exists
 
 - Master *consumption* is complete: `ImageType::Master*` parsing, `frames.is_master`, `calibration_set.is_master_library` (1 master = 1 set, `scan_integration.rs`), `MasterPreference` in the configurable matcher, manual linking includes masters, hierarchy builder skips sub-calibration for masters (`docs/masters/masters.md`).
-- Master *creation* exists only externally: export generates Siril scripts (`00_create_masters.ssf`).
+- Master *creation* exists only externally: export generates scripts for a second open-source stacker (`00_create_masters.ssf`).
 - **The app has no FITS write capability at all** (reader is hand-rolled; rustafits is render-oriented). This is the enabling gap.
 
 ### Design

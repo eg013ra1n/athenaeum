@@ -164,7 +164,7 @@ New module `crates/athenaeum-core/src/calibration_library/cosmetic.rs`:
   against the reference `_c_d.xisf` — this isolates debayer math from
   calibration. Acceptance: no pattern/channel-assignment errors (these show
   as checkerboard/color swaps), median |diff| ≈ 0, small p99.9 residual on
-  interior pixels; bitwise equality with PI is NOT expected (implementation
+  interior pixels; bitwise equality with the ERP is NOT expected (implementation
   freedom in gradient thresholds). Synthetic fixtures (constant channels,
   ramps) pin the kernel in unit tests. Per the repo rule, neither code nor
   comments name the reference implementation.

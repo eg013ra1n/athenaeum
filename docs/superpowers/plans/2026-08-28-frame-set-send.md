@@ -2000,7 +2000,7 @@ Replace the single export button with a two-button row:
 ```tsx
           <div className="flex gap-3">
             <button onClick={() => { void handleExport(); }} disabled={!canExport}
-              title={blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
+              title={blocker ?? (outputDir ? 'Export to WBPP folder structure' : 'Pick an output folder first')}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${canExport ? 'bg-accent hover:bg-accent-hover text-white' : 'bg-surface-hover cursor-not-allowed text-content-muted'}`}>
               {exporting ? (<><Loader2 className="animate-spin" size={20} /> Exporting…</>) : (<><Play size={20} /> Export to WBPP</>)}
             </button>

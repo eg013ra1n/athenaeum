@@ -370,7 +370,7 @@ it stays out until a measurement demands it.
 - **Raising `compute.max_concurrent`** stays out: more builds on one spindle
   multiply seeks, and above 1 the batch's bias/darkflat → dark → flat ordering
   is already documented as best-effort.
-- A stray `PixInsight's` in a doc comment at `light_cal.rs:714` violates the
+- A stray third-party program name in a doc comment at `light_cal.rs:714` violates the
   repo rule against naming other codebases in code and comments. Fix it in
   passing when that file is touched.
 

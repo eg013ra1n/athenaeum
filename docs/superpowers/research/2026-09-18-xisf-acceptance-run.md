@@ -112,12 +112,12 @@ container into `c_*.fits`.
 ## 7. Owed to the owner
 
 - Open `acc-xisf/library/ATR2600M/MasterDark/master_dark_180s_-10C_g100_bin1x1_2025-04-12.xisf`
-  in PixInsight; add it to WBPP as a master dark — it must be listed as a
+  in the downstream processing program; add it to WBPP as a master dark — it must be listed as a
   master (no "must be in XISF format" refusal), under DARK with exposure
   180 s. A light calibrated by WBPP with it should match Athenaeum's
   `export/C/…/c_*.xisf` of the same frame within noise.
 - Open one `export/C/ACC pure 20/camera_atr2600m/lights/c_*.xisf` in
-  PixInsight (a calibrated light; `bounds="0:1"`).
+  the downstream processing program (a calibrated light; `bounds="0:1"`).
 - The dark-flat case (`imageType="MasterDark"` on a `'Master Dark Flat'`
   keyword) was pinned by the unit test only — no raw dark-flat set with a
   linked flat was at hand in the copy; build one when a set exists and

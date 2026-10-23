@@ -4,7 +4,7 @@
 
 **Goal:** Add a Gaia DR3 (G ≤ 16) all-sky star catalog so the plate solver can solve the deep-catalog holdouts (M78, `_DSC5767`) that Tycho-2 physically cannot.
 
-**Architecture:** New `crates/athenaeum-core/src/catalog/gaia.rs` mirroring the proven `tycho2.rs` pipeline, but acquiring data via the ESA Gaia **TAP async** service tiled by `source_id` range (HEALPix level 3 = 768 resumable jobs, server-side `phot_g_mean_mag < 16` + 5-column projection). Streams each tile into an on-disk per-HEALPix-6 binner (300M stars ≈ 4.2 GB — must NOT be held in RAM, unlike Tycho-2's 2.5 M), then sorts each pixel file by magnitude into the existing `StarRecord` format at `catalogs/gaia_dr3/`. `CatalogEngine::with_catalog_dir` already auto-discovers `gaia_dr3/` and `cone_search` already prefers it (epoch 2016.0) — **zero solver changes, no quad index** (the per-trial astap backend builds quads on the fly).
+**Architecture:** New `crates/athenaeum-core/src/catalog/gaia.rs` mirroring the proven `tycho2.rs` pipeline, but acquiring data via the ESA Gaia **TAP async** service tiled by `source_id` range (HEALPix level 3 = 768 resumable jobs, server-side `phot_g_mean_mag < 16` + 5-column projection). Streams each tile into an on-disk per-HEALPix-6 binner (300M stars ≈ 4.2 GB — must NOT be held in RAM, unlike Tycho-2's 2.5 M), then sorts each pixel file by magnitude into the existing `StarRecord` format at `catalogs/gaia_dr3/`. `CatalogEngine::with_catalog_dir` already auto-discovers `gaia_dr3/` and `cone_search` already prefers it (epoch 2016.0) — **zero solver changes, no quad index** (the per-trial external-solver backend builds quads on the fly).
 
 **Tech stack:** Rust, `reqwest` (already used by tycho2), `cdshealpix` (already a dep), the existing `catalog::binary_format::StarRecord` / `write_catalog_to_healpix`.
 
@@ -12,7 +12,7 @@
 
 ## Context & verified facts
 
-- **Why:** M78/`_DSC5767` are NOT solver bugs (proven 2026-05-18: not saturation, not parity; ASTAP itself fails M78 with shallow V50, solves only with deep D50). They need Gaia-depth faint stars. See auto-memory `project_m78_dsc5767_catalog_depth.md`.
+- **Why:** M78/`_DSC5767` are NOT solver bugs (proven 2026-05-18: not saturation, not parity; an external plate solver itself fails M78 with shallow V50, solves only with deep D50). They need Gaia-depth faint stars. See auto-memory `project_m78_dsc5767_catalog_depth.md`.
 - **Seam (verified, `catalog/mod.rs`):** `with_catalog_dir` sets `gaia_path` iff `catalog_dir/gaia_dr3/` exists; `cone_search` prefers Gaia (epoch **2016.0**, returns `"gaia_dr3"`) over Tycho-2. No other wiring needed.
 - **On-disk contract (verified):** `catalog/healpix.rs` depth 6 (49,152 pixels), files `healpix_NNNNNN.bin`, records 14 bytes `[ra f32, dec f32, mag×1000 u16, pmra 0.01mas/yr i16, pmdec 0.01mas/yr i16]`, **sorted by mag ascending per pixel**. `StarRecord::from_values(ra:f32,dec:f32,mag:f32,pmra_mas_yr:f64,pmdec_mas_yr:f64)`. `write_catalog_to_healpix(&[StarRecord], &Path)` bins+sorts+writes (holds all in RAM — unusable as-is for 300M; see Task 4).
 - **Gaia facts (verified via ESA docs):** TAP async `https://gea.esac.esa.int/tap-server/tap/async`, anon cap 3M rows/job. Columns `ra,dec` (deg, ICRS @ **J2016.0**), `phot_g_mean_mag` (Vega), `pmra` (mas/yr, **includes cos δ — same convention as Tycho-2 pmRA\***), `pmdec` (mas/yr). `source_id` encodes HEALPix: level-n index = `source_id / (2^35 · 4^(12−n))`; **level-3 ⇒ divisor `2^53`, 768 tiles**, tile `t` ⇔ `source_id ∈ [t·2^53, (t+1)·2^53 − 1]`, ≈390k rows/tile at G≤16 (well under 3M). No magnitude partition in the bulk repo (why TAP-tiled, not bulk-download). No reputable pre-built G≤16 DR3 subset exists.
@@ -22,7 +22,7 @@
 
 - **Tasks 1–7 (code + unit tests):** doable now; fully testable without network via mocked CSV.
 - **Task 8 (the real all-sky ingest):** a **multi-hour/overnight** 768-job TAP run the user triggers on their machine — not executed in-session.
-- **Task 9 (bench closure):** only after Task 8's data exists — re-run the astap-backend bench; success = M78 **and** `_DSC5767` now solve on `gaia_dr3`.
+- **Task 9 (bench closure):** only after Task 8's data exists — re-run the external-solver-backend bench; success = M78 **and** `_DSC5767` now solve on `gaia_dr3`.
 
 ---
 
@@ -98,7 +98,7 @@
 
 ## Task 9: Bench closure (after Task 8)
 
-- [ ] `BENCH_SOLVER_BACKEND=astap BENCH_SKIP_ASTAP=1 cargo test --release -p athenaeum-core --test bench_astap_vs_athenaeum -- --ignored --nocapture` (Gaia now auto-selected by `with_catalog_dir`).
+- [ ] `BENCH_SOLVER_BACKEND=<identifier> <identifier>=1 cargo test --release -p athenaeum-core --test <identifier> -- --ignored --nocapture` (Gaia now auto-selected by `with_catalog_dir`).
 - [ ] **Success = M78 AND `_DSC5767` now solve** (Δpos within tol of cached truth), 0 false positives/panics. This validates the entire plate-solver rewrite premise. Record outcome; update auto-memory.
 
 ## Risks
@@ -111,4 +111,4 @@
 ## Verification
 - Unit: `cargo test -p athenaeum-core --lib catalog::gaia` (tile math, ADQL, CSV parse, binner parity, PM convention).
 - Build: `cargo check -p athenaeum-tauri -p athenaeum-web` (two-backends sync).
-- Closure (post-ingest): the astap-backend bench gains M78 + `_DSC5767`.
+- Closure (post-ingest): the external-solver-backend bench gains M78 + `_DSC5767`.

@@ -31,7 +31,7 @@ with `bounds="0:65535"` and the `imageType` attribute WBPP reads as
 authoritative (a dark flat as `MasterDark`), registered through the scanner's
 own XISF parser; a rebuild keeps the file's container. On real data the XISF
 master, the lights calibrated with it and a mixed FITS+XISF stack are
-bit-identical to their FITS twins. Owed: the PixInsight/WBPP open (open-items).
+bit-identical to their FITS twins. Owed: the downstream processing program's WBPP open (open-items).
 
 
 **Owner's ask.** A setting in the Calibration settings that picks the container
@@ -77,7 +77,7 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   `OutputPanel.tsx:19-22`.
 
 **What WBPP actually requires — read from its own source, 2026-09-18**
-(`/Applications/PixInsight/src/scripts/BatchPreprocessing/BPP-Helper.js`,
+(`<the ERP's install path>/src/scripts/BatchPreprocessing/BPP-Helper.js`,
 `BPP-StackEngine.js`, the version installed on the owner's Mac):
 
 - **The container is not optional.** `BPP-StackEngine.js:724-728` rejects any
@@ -99,7 +99,7 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
 - **XISF properties override the keywords** (`:866-877`): after the FITS
   keywords, WBPP calls `getXISFProperty("PCL:Image:Type",
   info[0].imageType)` — that is the `<Image imageType="…">` attribute as
-  PixInsight's reader exposes it (`pjsr/ImageType.jsh`: `MasterBias = 5`,
+  the ERP's reader exposes it (`pjsr/ImageType.jsh`: `MasterBias = 5`,
   `MasterDark = 6`, `MasterFlat = 7`) — and it sets BOTH `imageType` and
   `isMaster`. So the attribute is the authoritative channel: write
   `imageType="MasterBias" | "MasterDark" | "MasterFlat"`, and for a dark flat
@@ -118,7 +118,7 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   stamps `bounds="0:65535"` — rustafits' reader then returns `v/65535·65535
   = v`, exactly the ADU the light-calibration engine expects, and the file
   states its true range instead of pretending to be unit-scaled. Owner smoke
-  owed: open one such master in PixInsight and run WBPP with it — the one
+  owed: open one such master in the downstream processing program and run WBPP with it — the one
   check that proves the whole contract.
 
 **Proposal.** New setting `calibration.master_format` (`settings/mod.rs` beside

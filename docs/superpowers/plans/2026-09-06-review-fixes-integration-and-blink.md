@@ -16,7 +16,7 @@
 - Real logic in `athenaeum-core`; hosts stay thin.
 - Never swallow an error: log before degrading.
 - Logging: message = short stable phrase, data in snake_case fields; canonical field names only.
-- Never name another codebase in code or comments (no "PixInsight", "ASTAP", …).
+- Never name another codebase in code or comments (no names of other processing programs, stackers or solvers).
 - Pixel maths untouched: nothing in `combine_pixel`, `BandPlanes::decode*`, the flat two-pass order, or any header card changes. `cargo test --workspace` must stay green; the pixel fingerprint `a4f6bb5158714175` pins the `I16Be` path.
 - Progress payload shape (`MasterBuildProgressEvent`, snake_case, no `rename_all`) is unchanged: `set_id, stage, current, total, percent, bytes_done, bytes_total`.
 - Commit as the repository owner (`eg013ra1n` / their email is already the configured git user). No AI co-author trailer — owner rule.

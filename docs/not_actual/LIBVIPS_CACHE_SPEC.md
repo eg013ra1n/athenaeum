@@ -42,9 +42,9 @@ High-performance image caching system for Athenaeum using LibVIPS for FITS image
 
 ## AutoSTF Algorithm
 
-### PixInsight-Compatible Screen Transfer Function
+### ERP-Compatible Screen Transfer Function
 
-The AutoSTF implementation follows PixInsight's algorithm for automatic histogram stretching:
+The AutoSTF implementation follows the ERP's algorithm for automatic histogram stretching:
 
 1. **Statistics Calculation**
    - Calculate median (m) and MAD (Median Absolute Deviation)
@@ -231,7 +231,7 @@ interface AutoSTFResult {
 - Test parallel processing efficiency
 
 ### Quality Tests
-- Compare AutoSTF with PixInsight
+- Compare AutoSTF with the ERP
 - Verify color preservation
 - Test edge cases (saturated, very dark images)
 
@@ -251,6 +251,6 @@ interface AutoSTFResult {
 ## References
 
 - [LibVIPS Documentation](https://www.libvips.org/API/current/)
-- [PixInsight AutoSTF](https://pixinsight.com/doc/tools/AutoHistogram/AutoHistogram.html)
+- The ERP's AutoSTF documentation
 - [libjpeg-turbo](https://libjpeg-turbo.org/)
 - [FITS Standard](https://fits.gsfc.nasa.gov/fits_standard.html)

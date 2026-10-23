@@ -254,7 +254,7 @@ if diff <= warning_threshold  ->  ACCEPT clean (no warning)
 
 ## 5. WBPP Folder Hierarchy
 
-PixInsight's Weighted Batch Pre-Processing (WBPP) reads a folder tree where **parent directories calibrate their children**. Athenaeum exports files into this nested structure so WBPP can automatically associate calibration frames.
+The downstream processing program's Weighted Batch Pre-Processing (WBPP) reads a folder tree where **parent directories calibrate their children**. Athenaeum exports files into this nested structure so WBPP can automatically associate calibration frames.
 
 ### Full Folder Tree
 

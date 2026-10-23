@@ -1618,7 +1618,7 @@ pub enum CombineMethod {
     Median,
     /// Iterative winsorized sigma clipping, then mean of survivors.
     WinsorizedSigmaClip { sigma_low: f64, sigma_high: f64 },
-    /// PixInsight-style percentile clipping around the median:
+    /// ERP-style percentile clipping around the median:
     /// reject x when (m - x) > low*m or (x - m) > high*m.
     PercentileClip { low: f64, high: f64 },
 }
@@ -1694,7 +1694,7 @@ Expected: FAIL — module missing.
 
 ```rust
 //! Per-pixel robust combination. Algorithms per spec §9 / research findings
-//! 5 & 7: winsorized sigma clip (PixInsight master recipe) and percentile
+//! 5 & 7: winsorized sigma clip (the ERP's master recipe) and percentile
 //! clip (sky flats / small sets), plus plain mean/median.
 
 use serde::{Deserialize, Serialize};
@@ -1787,7 +1787,7 @@ pub fn combine_pixel(values: &mut [f32], method: CombineMethod) -> (f32, usize) 
 }
 ```
 
-(The 1.134 factor is the standard winsorized-σ correction for the 1.5σ clamp; the winsorized estimate feeds a plain σ-rejection over the ORIGINAL samples — matching the shape of PixInsight's Winsorized Sigma Clipping.)
+(The 1.134 factor is the standard winsorized-σ correction for the 1.5σ clamp; the winsorized estimate feeds a plain σ-rejection over the ORIGINAL samples — matching the shape of the ERP's Winsorized Sigma Clipping.)
 
 - [ ] **Step 4: Run tests**
 
@@ -1857,7 +1857,7 @@ pub fn integrate_flat(
 ) -> Result<IntegrationOutput, IntegrationError>;
 
 /// Central-third mean over a full-resolution buffer (shared helper — the same
-/// region rule as Siril: x,y in [dim/3, 2*dim/3)).
+/// region rule as a second open-source stacker: x,y in [dim/3, 2*dim/3)).
 pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64;
 ```
 
@@ -4344,7 +4344,7 @@ git commit -m "feat(ui): Coverage tab — per-set Create Master + batch Create a
 
 - [ ] **Step 1: CLAUDE.md section** — add after the "AmneziaWG"-style feature sections a concise block covering: what the Calibration Library root is (one per catalog, `scan_roots.kind`), the direct-registration invariant (rows identical to scanner ingestion — pinned by test), the relink/supersede semantics (`superseded_by_set_id`, matcher exclusion), the raw-master-dark convention + no-dark-scaling policy pointer to spec §9, the `ATH_FNRM` keyword, the compute queue (`compute.max_concurrent`, analysis rides it too), and the archive-of-originals layout. Point to the spec + research docs.
 
-- [ ] **Step 2: `scripts/verify_master_vs_reference.md`** — documented manual procedure (NOT CI): pick a real 15+-frame dark set → build the master in Athenaeum → build the same master in Siril (`calibrate`-free `stack` with winsorized rejection) → compare with a 10-line Python/astropy snippet (include it verbatim in the doc: load both, `numpy.percentile(|a-b|, [50, 99.9])`, assert median diff ≲ 1 ADU) → record results in the doc's log table. This is the spec §10 golden test in its owner-run form (Siril isn't available in CI).
+- [ ] **Step 2: `scripts/verify_master_vs_reference.md`** — documented manual procedure (NOT CI): pick a real 15+-frame dark set → build the master in Athenaeum → build the same master in the open-source stacker (`calibrate`-free `stack` with winsorized rejection) → compare with a 10-line Python astronomy-library snippet (include it verbatim in the doc: load both, `numpy.percentile(|a-b|, [50, 99.9])`, assert median diff ≲ 1 ADU) → record results in the doc's log table. This is the spec §10 golden test in its owner-run form (the open-source stacker isn't available in CI).
 
 - [ ] **Step 3: Final verification (whole plan)**
 

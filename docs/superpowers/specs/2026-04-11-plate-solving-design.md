@@ -40,7 +40,7 @@ rustafits/src/platesolving/
 ├── mod.rs              — public re-exports
 ├── types.rs            — CatalogStar, StarMatch, SolveHints, ProjectedStar, configs
 ├── pattern_matcher.rs  — QuadHasher trait + PatternMatcher orchestrator
-├── quad_distance.rs    — Approach A: astrometry.net 5 distance ratios
+├── quad_distance.rs    — Approach A: external-solver 5 distance ratios
 ├── quad_interior.rs    — Approach B: tetra3 2 barycentric coordinates
 ├── ransac.rs           — RANSAC outlier rejection
 ├── transform.rs        — TransformFitter (affine, projective, SIP)
@@ -84,7 +84,7 @@ pub trait QuadHasher: Send + Sync {
 }
 ```
 
-- `QuadDistanceHasher` — astrometry.net style: 6 pairwise distances → 5 normalized ratios → hash key
+- `QuadDistanceHasher` — external-solver style: 6 pairwise distances → 5 normalized ratios → hash key
 - `QuadInteriorHasher` — tetra3 style: 3-star enclosing triangle + 1 interior point → 2 barycentric coords → hash key
 
 `PatternMatcher` accepts a `Box<dyn QuadHasher>` and orchestrates: build hash table from catalog stars → generate quads from image stars → hash lookup → candidate transforms → verification.
@@ -476,7 +476,7 @@ Using existing test files in `rustafits/tests/`:
 | `mono.fits` | Monochrome |
 | `test.xisf` | XISF format |
 
-Each file needs a PixInsight ground-truth WCS sidecar (JSON with reference RA/Dec, pixel scale, rotation).
+Each file needs an ERP ground-truth WCS sidecar (JSON with reference RA/Dec, pixel scale, rotation).
 
 Pass criteria: center RA/Dec within 30", pixel scale within 1%, rotation within 0.5°, RMS < 1.0 px, solve time < 2s (hint-based).
 

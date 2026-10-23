@@ -8,8 +8,8 @@ its provenance, so the implementation never has to guess and never has to read
 another product's source. Nothing here is copied code; it is the mathematics
 and the conventions, described in our own words.
 
-Provenance classes used below: **[code]** read from the open-source PixInsight
-Class Library (PCL, GitLab mirror `gitlab.com/pixinsight/PCL`; the
+Provenance classes used below: **[code]** read from the open-source class library of the ERP
+(public mirror; the
 ImageIntegration/Drizzle modules at their last open commit `fd570d58`,
 2024-06-21); **[doc]** official documentation or tutorials; **[forum]** posts by
 the vendor's staff; **[log]** the owner's WBPP 3.0.1 run on LDN 1272

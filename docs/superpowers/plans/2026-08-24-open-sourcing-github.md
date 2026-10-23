@@ -1074,7 +1074,7 @@ engine — the export is WBPP folder and keyword organization. Replace the
 
 ```markdown
 Export for WBPP: files are organized into the folder hierarchy and keyword
-layout PixInsight's WeightedBatchPreprocessing expects, with symlinks instead of
+layout the downstream processing program's WeightedBatchPreprocessing expects, with symlinks instead of
 copies where the platform supports them.
 ```
 
@@ -1089,7 +1089,7 @@ Build master darks, flats, bias and dark-flats in-app from a matched raw
 calibration set — no external stacker. Masters register into the catalog exactly
 as a scanned file would, every consumer relinks onto them automatically, and the
 originals can be archived in the same step. Calibrated lights are written as
-32-bit float FITS that WBPP or Siril consume with their own calibration step
+32-bit float FITS that WBPP or a second open-source stacker consume with their own calibration step
 disabled.
 
 ### Plate Solving
