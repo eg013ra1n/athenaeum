@@ -576,6 +576,13 @@ pub fn build_complete_hierarchy(
                 }
 
                 Some(set_id)
+            } else if let Some(master_set_id) = flat_masters.best_master {
+                // Every raw group was refused (another sub-frame origin). A master
+                // is never stranded (2026-08-02 audit C1), and that now holds for
+                // the geometry refusal too; `best_master` already passed the
+                // matcher's size / origin gate.
+                tracing::debug!(frame_id, set_id = master_set_id, pattern = ?flat_pattern, "every flat group refused by frame geometry, falling back to compatible master flat");
+                Some(master_set_id)
             } else {
                 tracing::warn!(frame_id, "flat pattern selection returned no match");
                 None
@@ -1712,6 +1719,80 @@ mod geometry_tests {
         assert_eq!(h.flat_sets.len(), 1, "{:?}", h.missing_calibration);
         assert_eq!(members(&conn, h.flat_sets[0].set.id.unwrap()), vec![20, 21]);
         assert_eq!(set_rows_holding(&conn, &[10, 11, 30, 31]), 0, "no set row for a refused group");
+    }
+
+    /// A master flat set for the light (ASI6200MM / Ha / gain 100 / offset 30 /
+    /// 1x1 / 448 mm) whose single member frame records `size` and `origin`.
+    fn master_flat_set(conn: &Connection, set_id: i64, member: i64, size: (i32, i32), origin: Option<(i32, i32)>) {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, filter, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, focallen, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (?1, 'MasterFlat', 2.0, 'Ha', -10.0, -10.0, -10.0, 100.0, 30.0,
+                     '1x1', 'ASI6200MM', 448.0, '2025-09-25', '2025-09-25T00:00:00+00:00',
+                     '2025-09-25T00:10:00+00:00', 1, 1)",
+            params![set_id],
+        )
+        .unwrap();
+        raw_frame(conn, member, "MasterFlat", "2025-09-25T00:00:00+00:00", size, origin);
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)", params![set_id, member]).unwrap();
+    }
+
+    fn prefer_raw_flats(conn: &Connection) {
+        let mut config = CalibrationMatchingConfig::default();
+        config.master_preferences.insert("flat".to_string(), crate::calibration::config::MasterPreference::PreferFrameset);
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('calibration.matching_config', ?1)",
+            params![config.to_json().unwrap()],
+        )
+        .unwrap();
+    }
+
+    /// Review I-1: every raw flat group is at another origin and refused; the
+    /// master that fits (ranked below the raw set) is taken, never stranded.
+    /// `best_master` is already origin-gated by the matcher, so it cannot be a misfit.
+    #[test]
+    fn flat_falls_back_to_the_master_when_every_raw_group_is_refused() {
+        let conn = db();
+        prefer_raw_flats(&conn);
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 10, "Flat", "2025-09-30T23:00:00+00:00", ROI, Some((0, 0)));
+        raw_frame(&conn, 11, "Flat", "2025-09-30T23:01:00+00:00", ROI, Some((0, 0)));
+        master_flat_set(&conn, 500, 501, ROI, Some((1584, 1064)));
+        // A compatible raw set (origin unrecorded, so the matcher admits it) that
+        // PreferFrameset ranks above the master: the master is not `top_master`.
+        // Its frames are gone from grouping's view, which sees only 10/11.
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, filter, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, focallen, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (400, 'Flat', 2.0, 'Ha', -10.0, -10.0, -10.0, 100.0, 30.0,
+                     '1x1', 'ASI6200MM', 448.0, '2025-09-30', '2025-09-30T23:00:00+00:00',
+                     '2025-09-30T23:01:00+00:00', 1, 0)",
+            [],
+        )
+        .unwrap();
+        raw_frame(&conn, 402, "Flat", "2025-09-30T23:00:00+00:00", ROI, None);
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (400, 402)", []).unwrap();
+
+        let h = hierarchy_for(&conn, 1);
+        assert_eq!(h.flat_sets.len(), 1, "{:?}", h.missing_calibration);
+        assert_eq!(h.flat_sets[0].set.id, Some(500));
+        assert_eq!(set_rows_holding(&conn, &[10, 11]), 0, "no set row for the refused group");
+    }
+
+    /// The same refused raw group with no master at all: no flat, no set row (G-8).
+    #[test]
+    fn flat_refused_group_without_a_master_leaves_no_flat_and_no_set_row() {
+        let conn = db();
+        prefer_raw_flats(&conn);
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 10, "Flat", "2025-09-30T23:00:00+00:00", ROI, Some((0, 0)));
+        raw_frame(&conn, 11, "Flat", "2025-09-30T23:01:00+00:00", ROI, Some((0, 0)));
+
+        let h = hierarchy_for(&conn, 1);
+        assert!(h.flat_sets.is_empty(), "{:?}", h.flat_sets.len());
+        assert_eq!(set_rows_holding(&conn, &[10, 11]), 0, "no set row for the refused group");
     }
 
     /// On-demand dark creation groups only frames of the light's size, so the
