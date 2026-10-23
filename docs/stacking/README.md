@@ -3760,6 +3760,73 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     9.46 vs 9.47). **Open item (pre-existing):** the mono Measure peak is 8.82-8.83 planes (`measure_probe`, `0058`), the same at
     69b4710b, against `MEASURE_PLANES_RESIDENT = 8` (fitted on an OSC frame): the working-set estimate is about 10 % low for
     mono frames (`docs/superpowers/open-items.md`).
+
+  - **R-OSP-16 - Plan B: the Measure aperture correction `c` is kept, and the four before-runs (Task B0; branch `plan-b`, code
+    c04ef5df + review fold 4566d628 + span fix 20697493; plan `docs/superpowers/plans/2026-10-20-one-star-path-plan-b.md` `### Task B0`;
+    lab `star-lab/results/plan-b/b0/`). Later Plan B blocks append here; B6 closes it.**
+    *Placement (additive: no measured value, hash or `.athf` moves).* `ChannelMeasurement` keeps `aperture_correction`, `aperture_se`,
+    `aperture_stars` (`Option`, skip-if-None; payload `apertureCorrection` / `apertureSe` / `apertureStars`), copied from the module's
+    report at the one channel build: all three or none. Floor (i) (under 5 ratios, `c = 1` applied) keeps none; a plane with no fit
+    (`stars_fitted == 0`) keeps none and is NOT floor (i) (R-PB0-4). `MEASURE_VERSION` stays 4, no stage hash moves (the three fit-reading
+    hashes of the default config are pinned in `config.rs`), an old payload decodes with `None`. One info per (group, channel),
+    `"measure: aperture correction resolved per channel"` (`measure_group_finish`, pure `measure::channel_c_summary`): `plane`, `planes`
+    (planes with a measured `c`), `count` (floor (i) planes), `aperture_correction` (median), `aperture_correction_min` / `_max` (new
+    dictionary names); the per-plane line stays `debug`. LN, on the run summary: `SummaryFrame.ln_growth_factor` (mean),
+    `ln_growth_pairs` (MINIMUM over planes, so a floor-(ii) channel shows), `ln_aperture_correction` (target `c`; `Some` only when every
+    target channel has it; pure `ln::fold_plane_readings`); `SummaryGroup.ln_reference_aperture_correction: Option<Vec<Option<f64>>>`
+    (`null` at floor (i)). Plain `Option`s (`null` in the payload), `src/types/stacking.ts` regenerated; an LN cache hit leaves them `null`.
+    *Identity chain (PB-3: no pre-B0 run of a real set exists, so each link has its own fixed answer).* (a) Runner lab identity at
+    4566d628 (`b0-ident`, lab cdaa835) and at 20697493 (`b0-ident2`, lab ce9c5af): probes 1041 / 1041 proven, 73 403 scorecard rows /
+    0 missing, noreg vs t14-final 0 moved, cumulative vs t01c 0, inject 109 / 109 (3 328 / 0); `probe_identity` vs t14b: probe 1033 same,
+    inject 109 same, 0 diff; channel-c 396 / 396 and 33 / 33, differ 0. (b) The three stage-hash pins pass unchanged. (c) Set 204 gates
+    13 / 13 (`probe_parity`: 20 010 fits, 0 mismatches). (d) The kept values equal the debug `"aperture correction measured"` values
+    plane by plane (`c_identity`): Horse C11 106 / 106, run B 386 / 386, set 204 407 / 407, differ 0, 0 unkeyed.
+    *The four before-runs (B4's baseline).* Fresh acceptance clones re-measured from Measure (R-B15), reference mode as stored (R-PB0-1),
+    staleness proven (`frame plane measured` = included planes: 106 / 386 / 407); lab commits 9fc40db, 55b7b64, 9368902 (lab main
+    05500b9). Their LN reference md5s differ from the old trees' (pre-Plan A): B4 compares against THESE. One pick per run row:
+    - Horse C11 (set 182): manual 69845, SAME as the old run; LN reference md5 G 7da6f7a1e8c2f639a9a2e8ce66c0396c, L a51e3c819654f0918b0c181008d6f13e.
+    - Run B: manual 123, SAME; LN reference md5 mono 83d6efb4cf09d03f9a03271764c7fc2a, OSC f92ca7da8fd9ab52689fe4c86744d1d0.
+    - Set 204: auto (twoPass) 28949, MOVED (old 28934; cause not established); LN reference md5 mono e0774e3502e6eee3c49800434bc4208e, OSC d96186f2b2230591d3bc27c81b10066e.
+
+    | group | channel | planes | median | min | max | at floor | no fit |
+    | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+    | Horse C11 G | 0 | 30 | 1.273 | 1.179 | 1.366 | 0 | 0 |
+    | Horse C11 L | 0 | 76 | 1.288 | 1.215 | 1.427 | 0 | 2 |
+    | run B mono L | 0 | 83 | 1.130 | 1.015 | 1.349 | 0 | 0 |
+    | run B OSC | 0 / 1 / 2 | 101 each | 1.823 / 1.194 / 1.217 | 1.215 / 1.142 / 1.130 | 2.277 / 1.484 / 1.410 | 0 | 0 |
+    | set 204 mono | 0 | 92 | 1.132 | 1.010 | 1.349 | 0 | 0 |
+    | set 204 OSC | 0 / 1 / 2 | 105 each | 1.815 / 1.193 / 1.214 | 1.176 / 1.103 / 1.117 | 2.277 / 1.485 / 1.410 | 0 | 0 |
+
+    The two Horse C11 L no-fit planes are the trailed frames 69990 / 69996. The OSC red channel's large `c` (median 1.8, max 2.28, against
+    about 1.2 on G / B) is the undersampled-plane `c` of B4's F-9 / F-12. Truth re-read on each run's own LN reference: 101, 385 / 386
+    (h152 plane 0, 9 stars) and 399 / 407 (8 mono plane-0 refusals of 4-9 stars) member-planes; the refusals are accepted (R-PB0-14).
+    *The span fix (R-PB0-13, 20697493).* The first Horse C11 run failed `c_identity` (`planes 106 equal 2 differ 104`) though the payload
+    equalled the log on 106 / 106 planes: the log lines had no span. The tracing span is thread-local and `ThreadPool::install` runs its
+    closure on an image-pool thread when the caller is not a worker, so the Measure stage's per-plane `star_measure` events (ring sky,
+    aperture correction, seeds, fit and verdict lines, two warns) were unattributed. `star_measure::install_in_span` enters the caller's
+    span on the pool thread at all 17 `install` sites; the LN reference build gets `ln_reference{group_key}` / `ln_reference_plane{plane}`.
+    Logging only (the probe has no pool; the runner identity was repeated at 20697493). An event from a `par_iter` leaf is spanless again.
+    *Rulings.*
+    - R-PB0-1: the reference mode stays as stored (set 204 auto; run B and Horse C11 manual); B4 compares the recorded pick.
+    - R-PB0-2: `planb.sh truth` takes the HEAVY.lock.
+    - R-PB0-3: the identity drops the three channel `c` keys and checks `channel.X == top-level X` (`--drop-path`, `--check-channel-c`).
+    - R-PB0-4: a plane with `c = None` and `stars_fitted == 0` is left out of the summary; `count` is the planes whose under-5 warn fired.
+    - R-PB0-5: `SummaryFrame.ln_aperture_correction` is `Some` only when every target channel carries `c`.
+    - R-PB0-6: the per-frame LN fold is one pure, pinned function (pairs MINIMUM, factor mean).
+    - R-PB0-7: `ln_reference_aperture_correction` is `Option<Vec<Option<f64>>>`, `null` at floor (i); old `[1.0, ...]` rows still decode.
+    - R-PB0-8: B0 must not reach main without B4's `MEASURE_VERSION` 5 (one merge, at B6); see the open items below.
+    - R-PB0-9 (amended by R-PB0-13): `c_identity` leaves out only lines under a non-empty span list without `measure_frame*`; spanless fails.
+    - R-PB0-10: B0's identity lives at `star-lab-a/b0-ident*`; `--bars` is omitted; `--prev t14-final`; the runner fast-forwards from a bundle.
+    - R-PB0-11: every Plan B `lab_cycle` passes `--design results/plan-b/<stage>/design.json` (B0's is `[]`; cumulative union: Plan A's 701).
+    - R-PB0-12: an identity across machines also drops `options.analysis.batch_concurrency` (a runtime knob outside the config hash).
+    - R-PB0-13: fix the log's attribution, not the copy site: `install_in_span` plus the `ln_reference` spans; no by-value join.
+    - R-PB0-14: a truth run whose every bad row is the harness's own "only N usable stars" refusal is accepted; any other bad row is a STOP.
+    - R-PB1-1: B1 uses the B0 build in `target-acc` (identity proven); its sha256 check reads B0's build record.
+    *Open items carried.* (1) R-PB0-8: a pre-B0 cached `metrics` row carries no `c` and would log `planes 0`, so B0 stays off main until
+    B4's `MEASURE_VERSION` 5 (`docs/superpowers/open-items.md`). (2) Scorecard format (B4): B1 adds an `erp` cell to every LN row, so a noreg
+    against a scorecard built before it (t14-final) lists every LN row `changed`; re-score `b0-ident2`'s probe with the new scorecard
+    (`--reuse-probe`) for a same-format `--prev`. (3) `integrate.rs` has the same pool hop (the master's `c` line lacks `integrate_group`):
+    `install_in_span` if B4 wants it, out of B0's scope. (4) `planb.sh truth` exits 4 on refusals only (R-PB0-14): print the count, exit 0 (B6).
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
@@ -3777,7 +3844,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   - *Open items.*
     - The VNG per-plane widths and the resampling broadening (out of scope).
     - The injected OSC captured fraction, 1.81–2.34: explained, a scorecard / truth artefact (I.1 extended, sized by the Measure aperture correction `c`).
-    - The Measure aperture correction `c` on undersampled OSC planes: not persisted or logged, hot pixels feed it on an uncorrected R plane, one `c` per plane overstates faint stars (note section 7; first Plan B item: log `c` per plane).
+    - The Measure aperture correction `c` on undersampled OSC planes: not persisted or logged, hot pixels feed it on an uncorrected R plane, one `c` per plane overstates faint stars (note section 7; first Plan B item: log `c` per plane - done by B0, R-OSP-16).
     - R-OSP-15's two silent limits and three recorded limits, with their owners.
     - `MEASURE_PLANES_RESIDENT` (8 against 8.82 mono).
     - The ERP refresh for Task 14b's 15 new units.

@@ -140,10 +140,10 @@ its line; a task may not add, invent or loosen one.
   run summary (`stacking_runs.summary_json`, `stacking::provenance::SummaryFrame` / `SummaryGroup`, DB-visible, read by
   `tier1-extract.py` and the Results panel): `SummaryFrame` gains `ln_growth_factor: Option<f64>`, `ln_growth_pairs:
   Option<usize>` (the MINIMUM over a frame's planes, so an OSC channel at floor (ii) shows) and `ln_aperture_correction: Option<f64>` (the TARGET side's `c` as the module gave it on the registered
-  plane, mean across planes like `fwhm_px`; the module measures the target's `c` under both estimators — F1 uses it to
+  plane, mean across planes like `fwhm_px`, `Some` only when every target channel carries `c` (R-PB0-5); the module measures the target's `c` under both estimators — F1 uses it to
   order the pairs — so it is `Some` for a frame LN computed in this run; `None` for a frame LN did not normalize and on an LN cache hit,
   which carries only the scale: `set_ln_summary(…, true)`, run.rs:12937); `SummaryGroup`
-  gains `ln_reference_aperture_correction: Option<Vec<f64>>` (the reference's `c` per plane). All `#[serde(default)]` on plain `Option`s (`null` in the payload: provenance.rs uses no `skip_serializing_if`, and a
+  gains `ln_reference_aperture_correction: Option<Vec<Option<f64>>>` (the reference's `c` per plane, `null` at floor (i); R-PB0-7). All `#[serde(default)]` on plain `Option`s (`null` in the payload: provenance.rs uses no `skip_serializing_if`, and a
   skipped `ts_rs` `Option` arrives `undefined`), camelCase, no new log field name: the values already travel
   on the `"ln relative scale"` debug (`ln_growth_factor`, `ln_growth_pairs`) and the `"ln scale: per-side ring"` debug
   (`aperture_correction`); B0 threads them from `ln::scale`'s event struct through `ln::LnFrameOutcome` (ln/mod.rs:354) to
@@ -449,7 +449,7 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
 - Produces: `ChannelMeasurement { aperture_correction: Option<f64>, aperture_se: Option<f64>, aperture_stars:
   Option<usize>, … }` (payload keys `apertureCorrection`, `apertureSe`, `apertureStars`); `SummaryFrame { ln_growth_factor:
   Option<f64>, ln_growth_pairs: Option<usize>, ln_aperture_correction: Option<f64>, … }`; `SummaryGroup {
-  ln_reference_aperture_correction: Option<Vec<f64>>, … }`; the info `"measure: aperture correction resolved per channel"`
+  ln_reference_aperture_correction: Option<Vec<Option<f64>>>, … }`; the info `"measure: aperture correction resolved per channel"`
   with the PB-1 fields; `planb.sh run <ds> <stage>` writing `~/.athenaeum-acc/planb-<ds>-<stage>/` and
   `results/plan-b/<stage>/<ds>/{run.txt,reference-pick.txt,c-table.txt,verdict.txt}`; `ln_truth_run.py <clone> <ds>
   --out <csv>` (columns `member,plane,ratio,se,n,mode,ref_md5`).
@@ -469,12 +469,12 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   carry no bar of their own beyond the identity and the staleness proof.
 
 **Steps.**
-- [ ] **Step 0a — the runner's data and the mounts (controller, relayed; ≈ 30 min).** The six runner questions are
+- [x] **Step 0a — the runner's data and the mounts (controller, relayed; ≈ 30 min).** The six runner questions are
   answered (PB-17). Verify `mount | grep Universe` on both machines; copy over Universe (`rsync --inplace`) to the
   runner `star-lab-inject` (5.7 GB), `star-lab-a/t14b/{probe,inject-probe}` (2.9 GB) and
   `star-lab-a/results/t14-final/scorecard.json.gz`; hand it the git bundle of `plan-b` and the lab head (no push). The
   nebula-sky ERP LN runs through `erp_v2.py` (B1 Step 0). Record in `progress.md` and README R-OSP-16's B0 block.
-- [ ] **Step 0 — lab tools first (lab code; sonnet; ≈ 2.5 h; no build, no run).** `planb.sh` (`build` with the PB-16 wait;
+- [x] **Step 0 — lab tools first (lab code; sonnet; ≈ 2.5 h; no build, no run).** `planb.sh` (`build` with the PB-16 wait;
   `clone <ds> <stage>` = `clone-before.sh <tree> ~/.athenaeum-acc/planb-<ds>-<stage>` + the stacking config check through
   `t13-tools.py before` / `make-config` with the reference mode left as stored (Auto for B0) and `ATH_ACC_RERUN_FROM=
   measure`; `run` = `tier1-run.sh` / `project-run.sh` with `ATH_ACC_LOG_EXTRA=athenaeum_core::star_measure=debug`, then
@@ -488,7 +488,7 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   that differs → exit 1), `test_ln_truth_run.py` (a synthetic reference / member pair through `grid_report.photometry`
   gives ratio 0.8 ± SE, mode recorded; a missing registered file is named). Commit lab: `feat(planb): B0 tools - the
   stage driver, the c identity join, the truth re-read on a run's own LN reference`; push `origin main`.
-- [ ] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1 h).** In `stacking/measure.rs`'s tests:
+- [x] **Step 1 — the failing tests (rust-engineer sonnet; ≈ 1 h).** In `stacking/measure.rs`'s tests:
   `channel_c_fields_round_trip_and_an_old_payload_decodes` (a `ChannelMeasurement` with `aperture_correction: Some(1.17)`,
   `aperture_se: Some(0.004)`, `aperture_stars: Some(64)` serializes with the three camelCase keys and round-trips; the
   string `{"starsDetected":5,"starsFitted":3}` decodes with all three `None`), `channel_without_c_serializes_as_before`
@@ -502,7 +502,7 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   `measure::channel_c_summary(&[Option<(f64, f64, usize)>]) -> ChannelCSummary { planes, count, median: Option<f64>,
   min: Option<f64>, max: Option<f64> }`, so it is testable without a run). Run: `cargo test -p athenaeum-core --lib --
   stacking::measure --test-threads=4 | grep -E '^test result|FAILED|panicked'` → the new tests (the pin excepted) FAIL (fields missing).
-- [ ] **Step 2 — the code (rust-engineer sonnet; ≈ 3 h).** The fields, the copy at the channel build, `channel_c_summary`,
+- [x] **Step 2 — the code (rust-engineer sonnet; ≈ 3 h).** The fields, the copy at the channel build, `channel_c_summary`,
   the info line in `measure_group_finish` (one per channel: `plane = p`, `planes`, `count`, `aperture_correction` (the
   median, only when `Some`), `aperture_correction_min`, `aperture_correction_max`), the LN plumbing (`scale.rs` → `mod.rs`
   → `run.rs::set_ln_summary(rc, group, frame, scale, cached, growth_factor, growth_pairs, target_c)`; the reference's `c`
@@ -512,9 +512,9 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   --test-threads=4` green; `cargo test -p athenaeum-core --lib -- star_measure --test-threads=4` green. Commit athenaeum
   (`plan-b`): `feat(measure): Plan B B0 - c, its SE and count kept per plane (additive), one info per group and
   channel; LN's growth factor, pairs and per-side c on the run summary`.
-- [ ] **Step 3 — review (opus; ≈ 1 h)** of `git diff 068cf2d6..HEAD -- crates/ src/ docs/` against this task, PB-1, PB-2
+- [x] **Step 3 — review (opus; ≈ 1 h)** of `git diff 068cf2d6..HEAD -- crates/ src/ docs/` against this task, PB-1, PB-2
   and the logging rule; fixes by a fresh sonnet agent with a handoff; the reviewer's re-read.
-- [ ] **Step 4 — the lab identity (haiku, fixed answers; ≈ 1.5 h; the RUNNER, PB-17; the handoff relayed by the
+- [x] **Step 4 — the lab identity (haiku, fixed answers; ≈ 1.5 h; the RUNNER, PB-17; the handoff relayed by the
   controller; the dev Mac only builds).** On the dev Mac `planb.sh build` (waits for a quiet machine; builds the three
   probes release into `target-acc`; records the sha256s — the dev Mac's proof that the commit builds); on the runner the
   same commit built into its own target (`--expect-sha` = the runner's binaries), then
@@ -523,7 +523,11 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   the same for `inject-probe`. Fixed answers: identity `files same N diff 0 noref 0` on both; noreg vs t14-final `0 moved,
   max |Δ| 0`, the LN rows `changed 0`; the I-5 stage-hash pins unchanged (the suite's Step 2 pass). Any other
   value: STOP, no re-run, report the line.
-- [ ] **Step 5 — the four before-runs (sonnet judgment, ONE agent per dataset; ≈ 6–8 h machine time in all, one at a
+  As it ran (R-PB0-10..12; the runner, steps `b0-ident` at 4566d628 and `b0-ident2` at 20697493): `heavy_lock.py run --holder <who> -- python3
+  bin/lab_cycle.py --step b0-ident --prev t14-final --inject --wait-quiet --design <lab>/star-lab/results/plan-b/b0/design.json` (no `--bars`, no
+  `--expect-sha`; design `[]`), then `probe_identity.py $A/b0-ident/{probe,inject-probe} $A/t14b/{probe,inject-probe} --drop-key ms --drop-path
+  channel.apertureCorrection,channel.apertureSe,channel.apertureStars,options.analysis.batch_concurrency --check-channel-c` (`A=~/.athenaeum-acc/star-lab-a`).
+- [x] **Step 5 — the four before-runs (sonnet judgment, ONE agent per dataset; ≈ 6–8 h machine time in all, one at a
   time under HEAVY.lock: Horse C11 → run B → set 204; the dev Mac, PB-17, overnight slots).** For each: `planb.sh clone <ds> b0`, `planb.sh run <ds> b0` (from Measure, fresh work dirs; the reference mode
   as stored), the staleness proof (`frame plane measured` = included planes; a short count is a STOP: delete the
   clone's `stackwork/*/measured` and re-run, no ruling), `reference-pick`, `c-table`, `c_identity.py` (set 204 and Horse

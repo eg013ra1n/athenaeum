@@ -282,10 +282,12 @@ review; what is missing is a human running the flow on real data.
 
 Product findings of the Plan A closing diagnostic (note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`, section 7; first Plan B item). Weights and LN read `c`.
 
-- (a) `c` is neither persisted (`stacking/measure.rs:339`) nor logged at the level a run keeps, so real runs cannot be checked. First Plan B item: log `c` per plane.
+- (a) RESOLVED by Plan B B0 (commits c04ef5df, 4566d628, 20697493; `docs/stacking/README.md` R-OSP-16): `c`, its SE and its star count are kept per plane in the `metrics` payload (`apertureCorrection` / `apertureSe` / `apertureStars`), one info per (group, channel) at a kept level, LN's growth factor, pairs and per-side `c` on the run summary; the four before-runs' `c` tables are recorded there.
+- Dependency (R-PB0-8): B0 must not reach main without B4's `MEASURE_VERSION` 5 (one merge, at B6); a pre-B0 cached `metrics` row carries no `c` and would log `planes 0`.
 - (b) Hot pixels feed `c` on an uncorrected R plane: raw 0013 p0 `c` 1.334 vs 2.097 / 2.074 (0004 / 0007); 36 of its 64 `c` stars are hot pixels; the same stars' 0004 → 0013 ratio 0.617 vs 1.007 / 0.970 on p1 / p2 (R weight ×0.40). Stacking is exposed only on a refused hot-pixel map (no `ATH_CHPX`) or a raw-mode measurement.
 - (c) Sharp R, probe path (own β): mosaic 0176 → 0206 p0 ratio 0.863 after `c` vs ~0.985 on G / B (~×0.77 R weight); the product fits at the group β (2.24 on set 204 OSC), so unverified there until (a).
 - (d) Brightness dependence on undersampled R / B: real-star aperture / model 1.57 (top 64) → ~1.2 (rank 500–2000) on raw 0004 p0; G flat (1.23 → 1.18). One `c` per plane overstates fainter stars there.
+- (b)-(d) now belong to Plan B Task B4 (the point-source screen, the stratified sample, F-9 / F-12), judged against the B0 before-runs.
 - Set 204 run 7 LN's own `c` (log `ln scale: per-side ring`): OSC p0 1.00, p1 1.13, p2 1.12, mono 1.13, benign.
 
 ### LN model fixes (2026-10-04 … 2026-10-06)
