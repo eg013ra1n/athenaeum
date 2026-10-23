@@ -111,6 +111,8 @@ pub fn find_flat_groups_for_light_frame(
     // When the date is unknown, search across all candidate flats (no date
     // window) and skip date-based scoring/timing later.
     let frame_date_opt: Option<DateTime<Utc>> = light_frame.date_obs;
+    // Frame geometry (owner ruling 2026-10-20): only flats of the light's size.
+    let size = crate::calibration::geometry::size_of(light_frame);
 
     tracing::debug!(
         frame_id = light_frame.id.unwrap_or(-1),
@@ -121,6 +123,8 @@ pub fn find_flat_groups_for_light_frame(
         focal_length = ?focal_length,
         date = ?frame_date_opt,
         max_age_days,
+        width = ?size.map(|s| s.0),
+        height = ?size.map(|s| s.1),
         "finding flats for light frame"
     );
 
@@ -164,6 +168,7 @@ pub fn find_flat_groups_for_light_frame(
         focallen_threshold,
         time_cluster_minutes,
         date_range,
+        size,
     ).map_err(|e| {
         tracing::error!(
             frame_id = light_frame.id.unwrap_or(-1),
@@ -174,6 +179,8 @@ pub fn find_flat_groups_for_light_frame(
             focal_length = ?focal_length,
             date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
             date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+            width = ?size.map(|s| s.0),
+            height = ?size.map(|s| s.1),
             error = %e,
             "detect_flat_groups failed"
         );

@@ -13,6 +13,7 @@ use crate::calibration::dark_bias_groups::{
     detect_dark_groups, detect_bias_groups,
     create_dark_calibration_set, create_bias_calibration_set,
 };
+use crate::calibration::geometry::{self, Geometry, LinkSource};
 use crate::db::calibration_links::insert_calibration_link;
 use crate::models::{
     CalibrationTolerance, Frame, CalibrationLink, CalibrationWarning,
@@ -121,6 +122,27 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
     Ok(frame)
 }
 
+/// The geometry of the light a hierarchy is built for. The size and origin
+/// come from the catalog row; a frame handed in that has no row (an unsaved
+/// frame) is judged on its own recorded size and no origin, with a warning
+/// - never an error that would stop Find Calibration.
+fn light_geometry_of(conn: &Connection, light_frame: &Frame, frame_id: i64) -> Result<Geometry> {
+    match geometry::geometry_for_frame(conn, frame_id) {
+        Ok(g) => Ok(g),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            tracing::warn!(
+                frame_id,
+                "light frame has no catalog row; judging its geometry from the frame as given, no origin"
+            );
+            Ok(Geometry {
+                size: geometry::size_of(light_frame),
+                ..Geometry::default()
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Get calibration set detail by ID
 fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
     let mut stmt = conn.prepare(
@@ -196,13 +218,14 @@ pub fn find_calibration_for_flat_set(
 
     // Get a representative frame from the flat set to use for matching
     let mut stmt = conn.prepare(
-        "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"
+        "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 ORDER BY frame_id LIMIT 1"
     )?;
 
     let frame_id: i64 = stmt.query_row([flat_set_id], |row| row.get(0))
         .context("Flat set has no frames")?;
 
     let frame = get_frame_by_id(conn, frame_id)?;
+    let frame_geometry = geometry::geometry_for_frame(conn, frame_id)?;
 
     // Load configurable matching config
     let config = load_config(conn);
@@ -214,7 +237,7 @@ pub fn find_calibration_for_flat_set(
         tracing::debug!(set_id = flat_set_id, "no existing calibration sets found for flat via config matcher, trying on-demand creation");
 
         // Try to create Dark on-demand (fallback to old behavior)
-        if let Some(created_dark_id) = try_create_dark_for_frame(conn, &frame)? {
+        if let Some(created_dark_id) = try_create_dark_for_frame(conn, &frame, &frame_geometry)? {
             tracing::debug!(set_id = created_dark_id, flat_set_id, "created dark set for flat");
 
             // Re-query using configurable matcher
@@ -224,7 +247,7 @@ pub fn find_calibration_for_flat_set(
 
     if candidates.is_empty() {
         // Try to create Bias on-demand as last resort
-        if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame)? {
+        if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, &frame_geometry)? {
             tracing::debug!(set_id = created_bias_id, flat_set_id, "created bias set for flat");
 
             // Re-query using configurable matcher
@@ -259,13 +282,14 @@ pub fn find_calibration_for_dark_set(
 
     // Get a representative frame from the dark set
     let mut stmt = conn.prepare(
-        "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"
+        "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 ORDER BY frame_id LIMIT 1"
     )?;
 
     let frame_id: i64 = stmt.query_row([dark_set_id], |row| row.get(0))
         .context("Dark set has no frames")?;
 
     let frame = get_frame_by_id(conn, frame_id)?;
+    let frame_geometry = geometry::geometry_for_frame(conn, frame_id)?;
 
     // Load configurable matching config
     let config = load_config(conn);
@@ -280,7 +304,7 @@ pub fn find_calibration_for_dark_set(
                 tracing::debug!(set_id = dark_set_id, "no existing bias sets found for dark, trying on-demand creation");
 
                 // Try to create Bias on-demand
-                if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame)? {
+                if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, &frame_geometry)? {
                     tracing::debug!(set_id = created_bias_id, dark_set_id, "created bias set for dark");
 
                     // Re-query using configurable matcher
@@ -370,6 +394,9 @@ pub fn build_complete_hierarchy(
     temp_weight: f64,
 ) -> Result<CalibrationHierarchy> {
     let frame_id = light_frame.id.context("Frame must have an ID")?;
+    // One stored-header read per light per Find Calibration, used by the flat
+    // path and the dark path below.
+    let light_geometry = light_geometry_of(conn, light_frame, frame_id)?;
 
     let mut flat_sets_with_links = Vec::new();
     let mut dark_sets_with_links = Vec::new();
@@ -456,13 +483,51 @@ pub fn build_complete_hierarchy(
             // Pass light frame date for temporal proximity calculation
             let light_frame_date = light_frame.date_obs;
 
-            let selected_match = apply_pattern_selection(
-                flat_matches,
-                &pattern,
-                light_frame_date,
-            );
+            // Owner ruling 2026-10-20: the grouping already gathered only flats
+            // of the light's size. The chosen GROUP is judged before any set row
+            // is written (ruling G-8): another sub-frame origin makes way for the
+            // next group and leaves nothing behind. A reused set (an existing one,
+            // or the master that superseded this lineage) can differ from its
+            // group, so it is re-checked too - its call wrote nothing.
+            let mut remaining = flat_matches;
+            let selected = loop {
+                let Some(flat_match) = apply_pattern_selection(remaining.clone(), &pattern, light_frame_date) else {
+                    break None;
+                };
+                let group_geometry = geometry::geometry_for_frames(conn, &flat_match.group.frame_ids)?;
+                let fitting_set = if geometry::fit(&light_geometry, &group_geometry).refused() {
+                    tracing::warn!(
+                        frame_id,
+                        count = flat_match.group.frame_count,
+                        source_geometry = %light_geometry.label(),
+                        set_geometry = %group_geometry.label(),
+                        "flat group does not fit the light's frame geometry; trying the next"
+                    );
+                    None
+                } else {
+                    // Find/reuse calibration set from the flat group (don't modify existing sets)
+                    let set_id = create_flat_calibration_set(conn, &flat_match.group, false, focallen_tolerance)?;
+                    let set_geometry = geometry::geometry_for_set(conn, set_id)?;
+                    if geometry::fit(&light_geometry, &set_geometry).refused() {
+                        tracing::warn!(
+                            frame_id,
+                            set_id,
+                            source_geometry = %light_geometry.label(),
+                            set_geometry = %set_geometry.label(),
+                            "reused flat set does not fit the light's frame geometry; trying the next"
+                        );
+                        None
+                    } else {
+                        Some(set_id)
+                    }
+                };
+                match fitting_set {
+                    Some(set_id) => break Some((flat_match, set_id)),
+                    None => remaining.retain(|m| m.group.frame_ids != flat_match.group.frame_ids),
+                }
+            };
 
-            if let Some(flat_match) = selected_match {
+            if let Some((flat_match, set_id)) = selected {
                 tracing::debug!(
                     frame_id,
                     age_days = flat_match.age_days,
@@ -470,9 +535,6 @@ pub fn build_complete_hierarchy(
                     count = flat_match.group.frame_count,
                     "pattern selected flat match"
                 );
-
-                // Find/reuse calibration set from the flat group (don't modify existing sets)
-                let set_id = create_flat_calibration_set(conn, &flat_match.group, false, focallen_tolerance)?;
 
                 // Add age warning if needed (only if threshold is reasonable)
                 // Use config directly for consistency with UI
@@ -628,7 +690,7 @@ pub fn build_complete_hierarchy(
         if ranked_darks.is_empty() {
             tracing::debug!(frame_id, "no existing dark sets found for light frame, trying on-demand creation");
 
-            if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame)? {
+            if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame, &light_geometry)? {
                 tracing::debug!(set_id = created_dark_id, frame_id, "created dark set for light frame");
 
                 // Re-query using configurable matcher
@@ -727,6 +789,21 @@ pub fn store_calibration_hierarchy(
     conn: &Connection,
     hierarchy: &CalibrationHierarchy,
 ) -> Result<()> {
+    // Plan ruling R9 (G-2, G-7): before writing this run's links, drop every
+    // AUTOMATIC link of the light - and of the flat and dark sets it now uses -
+    // whose set does not fit: another frame size, mixed sizes, or another
+    // recorded sub-frame origin (auto never keeps one). Find Calibration is the
+    // only path that can clear an automatic link (the picker's deselect clears
+    // manual ones only), and an upsert replaces a link only when a new candidate
+    // of the SAME type is found; a geometry-stale automatic link would otherwise
+    // block the gate forever. Manual links are the user's and stay (R2).
+    let light_geometry = geometry::geometry_for_frame(conn, hierarchy.light_frame_id)?;
+    geometry::prune_unfit_auto_links(conn, LinkSource::Frame(hierarchy.light_frame_id), &light_geometry)?;
+    for set_id in hierarchy.flat_sets.iter().chain(hierarchy.dark_sets.iter()).filter_map(|s| s.set.id) {
+        let set_geometry = geometry::geometry_for_set(conn, set_id)?;
+        geometry::prune_unfit_auto_links(conn, LinkSource::Set(set_id), &set_geometry)?;
+    }
+
     // Store Flat set links
     for flat_set_with_links in &hierarchy.flat_sets {
         if let Some(set_id) = flat_set_with_links.set.id {
@@ -799,6 +876,7 @@ pub fn store_calibration_hierarchy(
 fn try_create_dark_for_frame(
     conn: &Connection,
     frame: &Frame,
+    source: &Geometry,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {
@@ -868,6 +946,7 @@ fn try_create_dark_for_frame(
         time_cluster_minutes,
         Some((start_date, end_date)),
         dark_temp_threshold,
+        geometry::size_of(frame),
     )?;
 
     if dark_groups.is_empty() {
@@ -875,8 +954,34 @@ fn try_create_dark_for_frame(
         return Ok(None);
     }
 
-    // Select best group (first one - they're sorted newest first)
-    let best_group = &dark_groups[0];
+    // Ruling G-8 (review I-2): judge each group before any set row is written
+    // - newest first, the first one that fits the source's geometry. The
+    // grouping already filtered by size; this catches another sub-frame
+    // origin, which auto-link never takes (G-7).
+    let mut chosen = None;
+    for group in &dark_groups {
+        let group_geometry = geometry::geometry_for_frames(conn, &group.frame_ids)?;
+        if geometry::fit(source, &group_geometry).refused() {
+            tracing::warn!(
+                frame_id = frame.id.unwrap_or(-1),
+                count = group.frame_count,
+                source_geometry = %source.label(),
+                set_geometry = %group_geometry.label(),
+                "dark group does not fit the frame geometry; trying the next"
+            );
+            continue;
+        }
+        chosen = Some(group);
+        break;
+    }
+    let Some(best_group) = chosen else {
+        tracing::warn!(
+            frame_id = frame.id.unwrap_or(-1),
+            count = dark_groups.len(),
+            "no dark group fits the frame geometry; none created on demand"
+        );
+        return Ok(None);
+    };
     tracing::debug!(
         frame_id = frame.id.unwrap_or(-1),
         count = best_group.frame_count,
@@ -896,6 +1001,7 @@ fn try_create_dark_for_frame(
 fn try_create_bias_for_frame(
     conn: &Connection,
     frame: &Frame,
+    source: &Geometry,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {
@@ -958,6 +1064,7 @@ fn try_create_bias_for_frame(
         time_cluster_minutes,
         Some((start_date, end_date)),
         bias_temp_threshold,
+        geometry::size_of(frame),
     )?;
 
     if bias_groups.is_empty() {
@@ -965,8 +1072,34 @@ fn try_create_bias_for_frame(
         return Ok(None);
     }
 
-    // Select best group (first one - they're sorted newest first)
-    let best_group = &bias_groups[0];
+    // Ruling G-8 (review I-2): judge each group before any set row is written
+    // - newest first, the first one that fits the source's geometry. The
+    // grouping already filtered by size; this catches another sub-frame
+    // origin, which auto-link never takes (G-7).
+    let mut chosen = None;
+    for group in &bias_groups {
+        let group_geometry = geometry::geometry_for_frames(conn, &group.frame_ids)?;
+        if geometry::fit(source, &group_geometry).refused() {
+            tracing::warn!(
+                frame_id = frame.id.unwrap_or(-1),
+                count = group.frame_count,
+                source_geometry = %source.label(),
+                set_geometry = %group_geometry.label(),
+                "bias group does not fit the frame geometry; trying the next"
+            );
+            continue;
+        }
+        chosen = Some(group);
+        break;
+    }
+    let Some(best_group) = chosen else {
+        tracing::warn!(
+            frame_id = frame.id.unwrap_or(-1),
+            count = bias_groups.len(),
+            "no bias group fits the frame geometry; none created on demand"
+        );
+        return Ok(None);
+    };
     tracing::debug!(
         frame_id = frame.id.unwrap_or(-1),
         count = best_group.frame_count,
@@ -1493,5 +1626,221 @@ mod tests {
             !crate::models::is_mono_with_ambiguous_filter(&frame.bayerpat, &frame.filter),
             "a frame that declares a CFA pattern must never be classified as filter-ambiguous mono"
         );
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::calibration::geometry::test_support::fits_header_text;
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+
+    const FULL: (i32, i32) = (9576, 6388);
+    const ROI: (i32, i32) = (6384, 4258);
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// One file + frame (`id` = file id) with every parameter the matcher and
+    /// the groupers compare, a size, and a stored header recording `origin`.
+    fn raw_frame(conn: &Connection, id: i64, imagetyp: &str, date_obs: &str, size: (i32, i32), origin: Option<(i32, i32)>) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            params![id, format!("/geom/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, date_obs, instrume, exptime, filter, gain, offset,
+                                 binning, xbinning, ybinning, ccd_temp, focallen, imagetyp, is_master,
+                                 naxis1, naxis2)
+             VALUES (?1, ?1, ?2, 'ASI6200MM', 2.0, 'Ha', 100.0, 30.0, '1x1', 1, 1, -10.0, 448.0,
+                     ?3, 0, ?4, ?5)",
+            params![id, date_obs, imagetyp, size.0, size.1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header) VALUES (?1, ?2)",
+            params![id, fits_header_text(origin)],
+        )
+        .unwrap();
+    }
+
+    fn members(conn: &Connection, set_id: i64) -> Vec<i64> {
+        let mut stmt = conn.prepare("SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 ORDER BY frame_id").unwrap();
+        stmt.query_map([set_id], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<i64>>>().unwrap()
+    }
+
+    fn hierarchy_for(conn: &Connection, light_id: i64) -> CalibrationHierarchy {
+        let light = get_frame_by_id(conn, light_id).unwrap();
+        build_complete_hierarchy(conn, &light, &CalibrationTolerance::default(), Some("automatic"),
+            None, None, 30, 30, 0.3).unwrap()
+    }
+
+    /// How many `calibration_set_frames` rows hold any of `frame_ids` — 0 means
+    /// no set was ever written for them (ruling G-8, review I-2).
+    fn set_rows_holding(conn: &Connection, frame_ids: &[i64]) -> i64 {
+        let list = frame_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id IN ({list})"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The flat pattern path: the nearest flats of another size never become
+    /// candidates (grouping filter), and the nearest flats at another origin
+    /// are judged as a GROUP and refused before any set is written for them —
+    /// the next group is taken (review I-2).
+    #[test]
+    fn flat_pattern_path_takes_the_nearest_group_that_fits() {
+        let conn = db();
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 30, "Flat", "2025-09-30T23:30:00+00:00", FULL, Some((0, 0)));
+        raw_frame(&conn, 31, "Flat", "2025-09-30T23:31:00+00:00", FULL, Some((0, 0)));
+        raw_frame(&conn, 10, "Flat", "2025-09-30T23:00:00+00:00", ROI, Some((0, 0)));
+        raw_frame(&conn, 11, "Flat", "2025-09-30T23:01:00+00:00", ROI, Some((0, 0)));
+        raw_frame(&conn, 20, "Flat", "2025-09-29T23:00:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 21, "Flat", "2025-09-29T23:01:00+00:00", ROI, Some((1584, 1064)));
+
+        let h = hierarchy_for(&conn, 1);
+        assert_eq!(h.flat_sets.len(), 1, "{:?}", h.missing_calibration);
+        assert_eq!(members(&conn, h.flat_sets[0].set.id.unwrap()), vec![20, 21]);
+        assert_eq!(set_rows_holding(&conn, &[10, 11, 30, 31]), 0, "no set row for a refused group");
+    }
+
+    /// On-demand dark creation groups only frames of the light's size, so the
+    /// newer ROI darks never become the light's dark.
+    #[test]
+    fn on_demand_dark_is_built_from_frames_of_the_lights_size() {
+        let conn = db();
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", FULL, None);
+        raw_frame(&conn, 40, "Dark", "2025-09-25T22:00:00+00:00", FULL, None);
+        raw_frame(&conn, 41, "Dark", "2025-09-25T22:01:00+00:00", FULL, None);
+        raw_frame(&conn, 50, "Dark", "2025-09-28T22:00:00+00:00", ROI, None);
+        raw_frame(&conn, 51, "Dark", "2025-09-28T22:01:00+00:00", ROI, None);
+
+        let h = hierarchy_for(&conn, 1);
+        assert_eq!(h.dark_sets.len(), 1, "{:?}", h.missing_calibration);
+        assert_eq!(members(&conn, h.dark_sets[0].set.id.unwrap()), vec![40, 41]);
+    }
+
+    /// Review I-2 on the on-demand path: the newest dark group is the light's
+    /// size but at another recorded origin — it is judged first and skipped,
+    /// and no set row is ever written for it; the older group that fits is built.
+    #[test]
+    fn on_demand_dark_skips_a_group_at_another_origin_without_writing_it() {
+        let conn = db();
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", ROI, Some((1584, 1064)));
+        // The dark clustering gap is 30 days: the fitting group sits months before
+        // the newer, refused one so they stay two groups.
+        raw_frame(&conn, 60, "Dark", "2025-06-20T22:00:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 61, "Dark", "2025-06-20T22:01:00+00:00", ROI, Some((1584, 1064)));
+        raw_frame(&conn, 70, "Dark", "2025-09-28T22:00:00+00:00", ROI, Some((0, 0)));
+        raw_frame(&conn, 71, "Dark", "2025-09-28T22:01:00+00:00", ROI, Some((0, 0)));
+
+        let h = hierarchy_for(&conn, 1);
+        assert_eq!(h.dark_sets.len(), 1, "{:?}", h.missing_calibration);
+        assert_eq!(members(&conn, h.dark_sets[0].set.id.unwrap()), vec![60, 61]);
+        assert_eq!(set_rows_holding(&conn, &[70, 71]), 0, "no set row for a refused group");
+    }
+
+    fn set_with_member_at(
+        conn: &Connection,
+        set_id: i64,
+        imagetyp: &str,
+        member: i64,
+        size: (i32, i32),
+        origin: Option<(i32, i32)>,
+    ) {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, date_start, date_end, frame_count)
+             VALUES (?1, ?2, '2025-09-25', '2025-09-25T22:00:00+00:00', '2025-09-25T22:00:00+00:00', 1)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        raw_frame(conn, member, imagetyp, "2025-09-25T22:00:00+00:00", size, origin);
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)", params![set_id, member]).unwrap();
+    }
+
+    fn set_with_member(conn: &Connection, set_id: i64, imagetyp: &str, member: i64, size: (i32, i32)) {
+        set_with_member_at(conn, set_id, imagetyp, member, size, None);
+    }
+
+    fn link(conn: &Connection, source_type: &str, source_id: i64, set_id: i64, cal_type: &str, manual: bool) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at, is_manual_override)
+             VALUES (?1, ?2, ?3, ?4, '2025-09-25T00:00:00Z', ?5)",
+            params![source_id, source_type, set_id, cal_type, manual as i32],
+        )
+        .unwrap();
+    }
+
+    fn links_of(conn: &Connection, source_type: &str, source_id: i64) -> Vec<(String, i64, bool)> {
+        let mut stmt = conn.prepare(
+            "SELECT calibration_type, calibration_set_id, is_manual_override FROM calibration_set_to_frames
+             WHERE source_type = ?1 AND source_id = ?2 ORDER BY calibration_type").unwrap();
+        stmt.query_map(params![source_type, source_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i32>(2)? == 1)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    /// Plan ruling R9 (Review Focus 2): storing a hierarchy drops every
+    /// AUTOMATIC link of the light — and of the flat set it now uses — whose
+    /// set does not fit; manual links stay for the gate to name.
+    #[test]
+    fn store_prunes_unfit_auto_links_and_keeps_manual_ones() {
+        let conn = db();
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", FULL, None);
+        set_with_member(&conn, 200, "Dark", 60, ROI);
+        set_with_member(&conn, 201, "Flat", 61, ROI);
+        set_with_member(&conn, 202, "Bias", 62, FULL);
+        set_with_member(&conn, 300, "Flat", 63, FULL);
+        link(&conn, "frame", 1, 200, "Dark", false);
+        link(&conn, "frame", 1, 201, "Flat", true);
+        link(&conn, "frame", 1, 202, "Bias", false);
+        link(&conn, "calibration_set", 300, 200, "Dark", false);
+
+        let h = CalibrationHierarchy {
+            light_frame_id: 1,
+            flat_sets: vec![CalibrationSetWithLinks { set: get_calibration_set_by_id(&conn, 300).unwrap(), sub_calibration: Vec::new() }],
+            dark_sets: Vec::new(),
+            missing_calibration: Vec::new(),
+            warnings: Vec::new(),
+        };
+        store_calibration_hierarchy(&conn, &h).unwrap();
+
+        assert_eq!(links_of(&conn, "frame", 1), vec![
+            ("Bias".to_string(), 202, false),
+            ("Flat".to_string(), 201, true),
+        ], "the auto ROI dark is gone; the manual ROI flat stays (and wins over the auto flat 300)");
+        assert!(links_of(&conn, "calibration_set", 300).is_empty(), "flat 300's auto ROI dark sub-link is gone");
+    }
+
+    /// G-2 + G-7: the same size at another recorded origin — an AUTOMATIC link
+    /// to it is removed (auto never keeps one), a MANUAL one stays.
+    #[test]
+    fn store_prunes_an_auto_link_at_another_origin_and_keeps_a_manual_one() {
+        let conn = db();
+        raw_frame(&conn, 1, "Light", "2025-10-01T00:00:00+00:00", ROI, Some((1584, 1064)));
+        set_with_member_at(&conn, 210, "Dark", 64, ROI, Some((0, 0)));
+        set_with_member_at(&conn, 211, "Flat", 65, ROI, Some((0, 0)));
+        link(&conn, "frame", 1, 210, "Dark", false);
+        link(&conn, "frame", 1, 211, "Flat", true);
+
+        let h = CalibrationHierarchy {
+            light_frame_id: 1,
+            flat_sets: Vec::new(),
+            dark_sets: Vec::new(),
+            missing_calibration: Vec::new(),
+            warnings: Vec::new(),
+        };
+        store_calibration_hierarchy(&conn, &h).unwrap();
+        assert_eq!(links_of(&conn, "frame", 1), vec![("Flat".to_string(), 211, true)]);
     }
 }

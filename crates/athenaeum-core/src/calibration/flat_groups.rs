@@ -78,6 +78,7 @@ pub struct FlatGroup {
 /// * `focallen_threshold` - Optional threshold for focal length matching (from config)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
+/// * `size` - The light's NAXIS1×NAXIS2; only flats of that size (or of no recorded size, ruling R1) are gathered
 ///
 /// # Returns
 /// Vector of FlatGroup objects, sorted by start_time (newest first)
@@ -91,6 +92,7 @@ pub fn detect_flat_groups(
     focallen_threshold: Option<f64>,
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    size: Option<(i32, i32)>,
 ) -> Result<Vec<FlatGroup>> {
     // Build query with parameter matching
     let mut query = format!(
@@ -114,6 +116,16 @@ pub fn detect_flat_groups(
     if gain.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND gain = ?{}", param_count));
+    }
+
+    // Frame geometry (owner ruling 2026-10-20): only flats the size of the
+    // light are candidates. A frame that records no size is not excluded
+    // (ruling R1); the matcher re-checks the set it lands in.
+    if size.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis1 IS NULL OR naxis1 = ?{})", param_count));
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis2 IS NULL OR naxis2 = ?{})", param_count));
     }
 
     // Focal length parameter (range match if threshold provided, else exact)
@@ -154,6 +166,8 @@ pub fn detect_flat_groups(
         focallen_threshold = ?focallen_threshold,
         date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
         date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+        width = ?size.map(|s| s.0),
+        height = ?size.map(|s| s.1),
         "executing flat search query"
     );
 
@@ -173,6 +187,13 @@ pub fn detect_flat_groups(
 
     if let Some(g) = gain {
         stmt.raw_bind_parameter(param_idx, g)?;
+        param_idx += 1;
+    }
+
+    if let Some((w, h)) = size {
+        stmt.raw_bind_parameter(param_idx, w)?;
+        param_idx += 1;
+        stmt.raw_bind_parameter(param_idx, h)?;
         param_idx += 1;
     }
 
@@ -698,7 +719,7 @@ mod tests {
         ).unwrap();
 
         let groups = detect_flat_groups(
-            &conn, "ASI2600MC", None, "1x1", Some(56.0), None, None, 30, None,
+            &conn, "ASI2600MC", None, "1x1", Some(56.0), None, None, 30, None, None,
         ).unwrap();
 
         assert_eq!(groups.len(), 1, "seeded flat must form one group");

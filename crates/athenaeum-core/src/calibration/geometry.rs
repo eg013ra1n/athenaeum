@@ -331,6 +331,70 @@ impl LazyFrameGeometry {
     }
 }
 
+/// Whose links [`prune_unfit_auto_links`] sweeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSource {
+    Frame(i64),
+    Set(i64),
+}
+
+/// Delete every AUTOMATIC link of `source` whose set does not fit
+/// `geometry` - size, mixed or origin (plan ruling R9, G-2, G-7); manual
+/// links are never touched. Each removal is logged. Returns how many were
+/// removed.
+pub fn prune_unfit_auto_links(
+    conn: &Connection,
+    source: LinkSource,
+    geometry: &Geometry,
+) -> rusqlite::Result<usize> {
+    let (source_type, source_id) = match source {
+        LinkSource::Frame(id) => ("frame", id),
+        LinkSource::Set(id) => ("calibration_set", id),
+    };
+    let links: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, calibration_set_id, calibration_type FROM calibration_set_to_frames
+             WHERE source_type = ?1 AND source_id = ?2 AND is_manual_override = 0
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![source_type, source_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut removed = 0;
+    for (link_id, set_id, calibration_type) in links {
+        let set = geometry_for_set(conn, set_id)?;
+        if !fit(geometry, &set).refused() {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM calibration_set_to_frames WHERE id = ?1",
+            params![link_id],
+        )?;
+        removed += 1;
+        match source {
+            LinkSource::Frame(frame_id) => tracing::warn!(
+                frame_id,
+                set_id,
+                calibration_type = %calibration_type,
+                source_geometry = %geometry.label(),
+                set_geometry = %set.label(),
+                "automatic calibration link removed: the set does not fit the frame geometry"
+            ),
+            LinkSource::Set(source_set_id) => tracing::warn!(
+                source_set_id,
+                set_id,
+                calibration_type = %calibration_type,
+                source_geometry = %geometry.label(),
+                set_geometry = %set.label(),
+                "automatic calibration link removed: the set does not fit the frame geometry"
+            ),
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use rusqlite::{params, Connection};

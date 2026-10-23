@@ -110,6 +110,7 @@ pub struct BiasGroup {
 /// * `_focal_length` - Not used for Dark matching (sensor-only calibration)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
+/// * `size` - The source's NAXIS1×NAXIS2; only frames of that size (or of no recorded size, R1) are gathered
 ///
 /// # Returns
 /// Vector of DarkGroup objects, sorted by start_time (newest first)
@@ -125,6 +126,7 @@ pub fn detect_dark_groups(
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     temp_threshold: Option<f64>,
+    size: Option<(i32, i32)>,
 ) -> Result<Vec<DarkGroup>> {
     // Gain and offset are REQUIRED for Dark matching - return empty if not provided
     let gain_val = match gain {
@@ -162,6 +164,16 @@ pub fn detect_dark_groups(
 
     // Focal length is NOT checked for Dark frames (sensor-only calibration)
 
+    // Frame geometry (owner ruling 2026-10-20): only frames the size of the
+    // source can form its dark. A frame that records no size is not excluded
+    // (ruling R1); the matcher re-checks the set it lands in.
+    if size.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis1 IS NULL OR naxis1 = ?{})", param_count));
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis2 IS NULL OR naxis2 = ?{})", param_count));
+    }
+
     // Date range filter (optional)
     if date_range.is_some() {
         param_count += 1;
@@ -180,11 +192,13 @@ pub fn detect_dark_groups(
         exptime = ?exptime,
         date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
         date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+        width = ?size.map(|s| s.0),
+        height = ?size.map(|s| s.1),
         "executing dark search query"
     );
 
     // Execute query with parameter binding
-    let frames = execute_dark_query(conn, &query, instrume, binning, gain_val, offset_val, exptime, date_range)?;
+    let frames = execute_dark_query(conn, &query, instrume, binning, gain_val, offset_val, exptime, date_range, size)?;
 
     tracing::debug!(count = frames.len(), "dark search query found frames");
 
@@ -217,6 +231,7 @@ pub fn detect_dark_groups(
 /// * `_focal_length` - Not used for Bias matching (sensor-only calibration)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
+/// * `size` - The source's NAXIS1×NAXIS2; only frames of that size (or of no recorded size, R1) are gathered
 ///
 /// # Returns
 /// Vector of BiasGroup objects, sorted by start_time (newest first)
@@ -231,6 +246,7 @@ pub fn detect_bias_groups(
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     temp_threshold: Option<f64>,
+    size: Option<(i32, i32)>,
 ) -> Result<Vec<BiasGroup>> {
     // Gain and offset are REQUIRED for Bias matching - return empty if not provided
     let gain_val = match gain {
@@ -261,6 +277,16 @@ pub fn detect_bias_groups(
 
     let mut param_count = 4;
 
+    // Frame geometry (owner ruling 2026-10-20): only frames the size of the
+    // source can form its bias. A frame that records no size is not excluded
+    // (ruling R1); the matcher re-checks the set it lands in.
+    if size.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis1 IS NULL OR naxis1 = ?{})", param_count));
+        param_count += 1;
+        query.push_str(&format!(" AND (naxis2 IS NULL OR naxis2 = ?{})", param_count));
+    }
+
     // Date range filter (optional)
     if date_range.is_some() {
         param_count += 1;
@@ -276,13 +302,15 @@ pub fn detect_bias_groups(
         binning,
         gain = gain_val,
         offset = offset_val,
+        width = ?size.map(|s| s.0),
+        height = ?size.map(|s| s.1),
         date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
         date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
         "executing bias search query"
     );
 
     // Execute query with parameter binding
-    let frames = execute_bias_query(conn, &query, instrume, binning, gain_val, offset_val, date_range)?;
+    let frames = execute_bias_query(conn, &query, instrume, binning, gain_val, offset_val, date_range, size)?;
 
     tracing::debug!(count = frames.len(), "bias search query found frames");
 
@@ -314,6 +342,7 @@ fn execute_dark_query(
     offset: f64,  // REQUIRED
     exptime: Option<f64>,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    size: Option<(i32, i32)>,
 ) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(query)?;
 
@@ -331,6 +360,13 @@ fn execute_dark_query(
 
     if let Some(e) = exptime {
         stmt.raw_bind_parameter(param_idx, e)?;
+        param_idx += 1;
+    }
+
+    if let Some((w, h)) = size {
+        stmt.raw_bind_parameter(param_idx, w)?;
+        param_idx += 1;
+        stmt.raw_bind_parameter(param_idx, h)?;
         param_idx += 1;
     }
 
@@ -362,6 +398,7 @@ fn execute_bias_query(
     gain: f64,    // REQUIRED
     offset: f64,  // REQUIRED
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    size: Option<(i32, i32)>,
 ) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(query)?;
 
@@ -376,6 +413,13 @@ fn execute_bias_query(
     param_idx += 1;
     stmt.raw_bind_parameter(param_idx, offset)?;
     param_idx += 1;
+
+    if let Some((w, h)) = size {
+        stmt.raw_bind_parameter(param_idx, w)?;
+        param_idx += 1;
+        stmt.raw_bind_parameter(param_idx, h)?;
+        param_idx += 1;
+    }
 
     // focal_length is NOT used for Bias matching (sensor-only calibration)
 
@@ -1524,7 +1568,7 @@ mod tests {
         // placeholders above — the exposure clause is appended by
         // `detect_dark_groups`, not by this hand-built base query.
         let frames = execute_dark_query(
-            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None, None,
+            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None, None, None,
         ).unwrap();
 
         assert_eq!(frames.len(), 1, "seeded dark must be found");
@@ -1548,7 +1592,7 @@ mod tests {
             crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
         );
         let frames = execute_bias_query(
-            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None,
+            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None, None,
         ).unwrap();
 
         assert_eq!(frames.len(), 1, "seeded bias must be found");
@@ -1571,13 +1615,13 @@ mod tests {
         seed_cfa_calibration_frame(&conn, 311, "Bias", 0.0);
 
         let dark_groups = detect_dark_groups(
-            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), Some(300.0), None, 30, None, None,
+            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), Some(300.0), None, 30, None, None, None,
         ).unwrap();
         assert_eq!(dark_groups.len(), 1, "seeded dark must form one group");
         assert_eq!(dark_groups[0].frame_ids, vec![310]);
 
         let bias_groups = detect_bias_groups(
-            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), None, 30, None, None,
+            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), None, 30, None, None, None,
         ).unwrap();
         assert_eq!(bias_groups.len(), 1, "seeded bias must form one group");
         assert_eq!(bias_groups[0].frame_ids, vec![311]);
@@ -1597,5 +1641,57 @@ mod tests {
         assert!(g.avg_temp.is_none());
         assert!(g.temp_min.is_none());
         assert!(g.temp_max.is_none());
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+
+    fn raw(conn: &Connection, id: i64, imagetyp: &str, date_obs: &str, size: Option<(i32, i32)>) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+            params![id, format!("/raw/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, binning, xbinning, ybinning,
+                                 gain, offset, exptime, ccd_temp, date_obs, naxis1, naxis2)
+             VALUES (?1, ?1, ?2, 'ASI6200MM', '1x1', 1, 1, 100.0, 50.0, 120.0, -10.0, ?3, ?4, ?5)",
+            params![id, imagetyp, date_obs, size.map(|s| s.0), size.map(|s| s.1)],
+        )
+        .unwrap();
+    }
+
+    /// Owner ruling 2026-10-20: on-demand grouping only gathers frames of the
+    /// source's size; a frame that records no size is not excluded (R1).
+    #[test]
+    fn grouping_keeps_only_frames_of_the_source_size() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (imagetyp, base) in [("Dark", 10), ("Bias", 20)] {
+            raw(&conn, base, imagetyp, "2023-07-27T20:00:00+00:00", Some((9576, 6388)));
+            raw(&conn, base + 1, imagetyp, "2023-07-27T20:01:00+00:00", Some((6384, 4258)));
+            raw(&conn, base + 2, imagetyp, "2023-07-27T20:02:00+00:00", None);
+        }
+        let ids = |g: &[Vec<i64>]| {
+            let mut v: Vec<i64> = g.concat();
+            v.sort();
+            v
+        };
+
+        let darks = detect_dark_groups(&conn, "ASI6200MM", "1x1", Some(100.0), Some(50.0), Some(120.0),
+            None, 30, None, None, Some((9576, 6388))).unwrap();
+        assert_eq!(ids(&darks.iter().map(|g| g.frame_ids.clone()).collect::<Vec<_>>()), vec![10, 12]);
+        let all = detect_dark_groups(&conn, "ASI6200MM", "1x1", Some(100.0), Some(50.0), Some(120.0),
+            None, 30, None, None, None).unwrap();
+        assert_eq!(ids(&all.iter().map(|g| g.frame_ids.clone()).collect::<Vec<_>>()), vec![10, 11, 12]);
+
+        let bias = detect_bias_groups(&conn, "ASI6200MM", "1x1", Some(100.0), Some(50.0),
+            None, 30, None, None, Some((6384, 4258))).unwrap();
+        assert_eq!(ids(&bias.iter().map(|g| g.frame_ids.clone()).collect::<Vec<_>>()), vec![21, 22]);
     }
 }
