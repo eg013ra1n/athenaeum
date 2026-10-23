@@ -3874,6 +3874,65 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     exits 0 on an UNAUDITED file (the coverage line is informational; `l10b_b1.py audit-gate` reads only the summary line); `planb.sh truth`
     exits 4 on refusals only (R-PB0-14); the ERP writes a stray display-profile file under `star-lab/true/` on the runner (its working
     directory at launch): `run_job.sh` should `cd` to a scratch directory first.
+  - **R-OSP-16 - Plan B B2: the referee, measured; the field realism; the seeing-lever pairs (Task B2; branch `plan-b`, no product code; plan
+    `### Task B2`; lab `star-lab/results/plan-b/b2/`, its `referee-verdict.md` is B3's input; lab package commit 03e300d). A measurement: no bar moved.**
+    *Both-modes read (Steps 1-2; lab 8ca5ebd merged at 05500b9, read on the runner at 39c82ca).* The harness truth with its mode forced
+    (`force_mode`, default byte-identical) over 115 cells x 2 modes: normal 29 read / 19 miss / 86 n/a, crowded 73 / 12 / 42; no crowded miss
+    beyond FWHM 5 because nothing beyond 5 reads (the 14F / 9F isolation on 50-px grids, not a defect). The tool is right (truthcheck t4 and
+    d600 t3 equal the 2026-10-07 gates digit for digit). 28 of the 31 misses are resolution limits (one-unit stored cells, SE 0.5-1.9 % against
+    +-0.3 %); the three `iso/m4w10` crowded cells (t25 -1.32, t35 +0.93, t45 +2.06 %) are a real curve-of-growth bias proportional to dF.
+    *WO-7: the growth-corrected crowded mode is measured out (Step 2b).* Built (`crowded_growth`: r_ap 5F, annulus [9F, 11F], c = flux(5F) /
+    flux(8F) per frame; the sparse winged family `truthcheck_w10`; planb-b2b a70f01e) and read on the runner (WO-3, e44bf6f, 120 cells): the
+    corrected mode reads 78 cells with 60 misses against the plain mode's 73 with 12 (iso/m4w10 t45 +15.6 %, d600 t3 +7.3 %), adds +1.5 to
+    +3.7 % on resolved core cells and on `truthcheck_w10` only equals the normal mode. That family also shows the NORMAL mode biased on winged
+    stars, proportional to dF (t1..t5 at dF -1 / 0 / +1.5 / +3 / +4.5: -1.01 / -0.31 / +0.86 / +1.57 / +2.86 %, k 0.6-1.0 %/px). The option is
+    pinned OFF (the code stays, default byte-identical), its drivers are retired, WO-4 (its real re-read) is cancelled, and it is never re-proposed.
+    *The far read (WO-5 e791b2d, WO-5b bf917bb, WO-6 621d2ac).* The same bright stars read again at twice the radii; a seeing-scaled wing makes
+    Delta (x2 minus x1) opposite to dF. The runner validation was withdrawn (R-PB2-3: 28F isolation, 126 px, does not fit the 120-px lattice).
+    Validated instead by unit renders on a 300-px lattice against the enclosed-flux algebra: x1 / x2 / Delta within max(0.15 %, 3 SE) at four
+    FWHM pairs (x1 -0.84 / +0.83 / +1.23 / +1.43 % against -0.88 / +0.89 / +1.23 / +1.40), five mutations (ring, aperture, isolation, peak,
+    growth radius) each fail the suite. **Real data (WO-6, standard rows asserted identical to B0): UNREADABLE.** Far n per member is 2-4 and
+    no member reads at both scales with n >= 10, so k_far is n/a everywhere and every counted cell takes the w10 ceiling allowance:
+
+    | set (B0 before-run) | rows | std (normal, counted) | crowded-dF (flagged) | n/a | far n median | members n >= 10 | abs(dF) median / max (px) |
+    | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+    | set 204 (mono 31 + OSC 315 counted) | 407 | 346 | 53 | 8 | 2 | 0 | 0.60 / 2.48 |
+    | run B (mono 27 + OSC 303) | 386 | 330 | 55 | 1 | 4 | 0 | 0.67 / 1.93 |
+    | Horse C11 (G 28 + L 64) | 101 | 92 | 9 | 0 | 2 | 0 | 0.80 / 2.90 |
+
+    *Field realism (Step 3; `realism_table`, lab f10585a, opus verdict).* Mono is realistic: 19 of 22 families inside the real range on both
+    quantities like-for-like (crowding 0.0053-0.0989, c - 1 0.0096-0.3661), e.g. pairs/main/m4 0.0597 / 0.2302. OSC is not: 0 of 6 `osc_pairs`
+    plane-rows inside (crowding 4-13x too sparse; plane-0 c - 1 0.20 against a real median 0.82). Step 3b is NOT triggered. Beside it, F1's
+    synthetic over-read (+1.27 % pooled, +2.06 % on realistic mono targets, +1.9 % at the real abs(dF)) sits on realistic fields; the real
+    f1_gc gaps are -0.18 to +0.09 %, at most about 0.9 % with the whole allowance granted: the synthetic size does not carry over.
+    *The seeing-lever pairs (Step 4; lab bbc6a29, dev Mac).* Six pairs on set 204 mono, s_inj 0.8, empirical B-spline stamp; injected aperture
+    sums 0.997-1.005 (gate 0.95-1.03), 12 / 12 probe outputs proven by the B0 build, the ERP's whole-frame scale beside (R-PB1-5). Gap %, beta auto:
+
+    | dF (pair) | -0.742 (f264) | -0.400 (f300) | -0.097 (f340) | +0.760 (f400) | +1.597 (f500) | +2.532 (f592) | slope %/px |
+    | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+    | PSF signal | -4.19 | -2.53 | -2.16 | -6.61 | -6.25 | -7.76 | -1.54 |
+    | 2F circle | -0.84 | +0.54 | -0.54 | +0.32 | +2.01 | +1.60 | +0.76 |
+    | 3F circle | +0.18 | +1.24 | +0.52 | +1.03 | +2.54 | +2.90 | +0.79 |
+
+    The PSF-signal arm reads 2-8 % low at every dF and is flagged (3 % rule) on 4 of 6 pairs (5 at beta 4); the circles stay inside -0.8 to +2.9 %.
+    **PRODUCT FINDING (the owner's call, no guard built).** The set 204 mono tree was calibrated with an OFFSET-200 master dark on OFFSET-30 lights
+    (170-206 ADU over-subtracted, 198 by the pooled fit; the camera gain holds, free fit 1.067): the Horse C11 pattern again.
+    Plan B is blind to it (LN scale and `c` are local-sky-subtracted); the lever gate became the six-source pooled free fit. Entry in `open-items.md`.
+    *Rulings.*
+    - R-PB2-1: the tool is right; B3 counts normal-mode rows only (interim, superseded by R-PB2-2 and R-PB2-6).
+    - R-PB2-2: the growth-corrected crowded mode is dead and pinned OFF; the referee is the normal mode plus a far read.
+    - R-PB2-3: the runner validation of the far read is withdrawn; unit renders against the algebra; k_far is per dataset, an allowance, not a per-member band.
+    - R-PB2-4: the empirical stamp defaults to the cubic B-spline (bilinear fails the 1 % width test: +7.1 / +4.3 / +1.7 % wide).
+    - R-PB2-5: lever placement is >= 8F from real peaks of >= 20 sigma (12F from every peak placed 1-19 of 300 stars at FWHM >= 3.4).
+    - R-PB2-6: the far read is unreadable on the real sets: the referee is the normal-mode truth with the ceiling allowance 1 %/px x abs(dF) per cell, crowded rows
+      flagged `crowded-dF` and never counted, refusals n/a; B3 decides on the referee-free pairwise and slope comparisons; no further referee round.
+    - R-PB2-7: mono fields are realistic, OSC fields are not; Step 3b not triggered; B3 reads the referee-free comparisons.
+    - R-PB2-8: the lever gain gate is the free fit pooled over the six sources (bounds 0.9-1.1 unchanged), the pedestal recorded; pixels and s_inj untouched.
+    *Open items carried.* (1) The OFFSET mismatch above (an advisory warning, how the link was made not investigated; the owner). (2) The halo's dependence on F (seeing-scaled
+    wing against a fixed-pixel optical halo) cannot be sized on real pairs; the candidate cause of the F1 size gap, unmeasured. (3) No synthetic OSC
+    family represents real OSC crowding; no mono family reaches set 204 / run B crowding (max 0.0597 against 0.0753 / 0.0849). (4) Lab hygiene (B6):
+    `planb.sh truth` exits 4 on refusals only; `ln_truth_run --far` prints an intercept beyond 2 SE without a usability rule (moot: nothing reads).
+    No product code changed in B2 (B0's core line, 4105 / 0 / 20, stands); lab suites at bbc6a29: star-lab 1335 OK, harness 349 OK (2 skipped).
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and

@@ -702,40 +702,49 @@ verdict beside the F1 miss), B4 (the floor truth), B6.
   truth is validated on it on the referee bars above."
 
 **Steps.**
-- [ ] **Step 1 — the forced mode and the modes tool (lab code; sonnet; ≈ 2.5 h).** `force_mode` (PB-7) with its identity
+- [x] **Step 1 — the forced mode and the modes tool (lab code; sonnet; ≈ 2.5 h).** `force_mode` (PB-7) with its identity
   pin; `truth_modes.py` over the stored `pairs` grid targets (105 + the elongated ones, one unit each) and the rendered
   `density_pairs` / `truthcheck` realizations (the gates' K); output the modes table with the bar per cell by the mode that
   read it. Tests in full. Commit lab; push.
-- [ ] **Step 2 — the both-modes read (sonnet judgment; ≈ 3–5 h machine on the RUNNER (PB-17: it holds `grid/{iso,main}`, `density_pairs`,
+- [x] **Step 2 — the both-modes read (sonnet judgment; ≈ 3–5 h machine on the RUNNER (PB-17: it holds `grid/{iso,main}`, `density_pairs`,
   `truthcheck`), `STARLAB_JOBS` per the gates' memory rule; the
   handoff relayed by the controller).** `planb.sh b2 modes` → `modes-table.md` + the verdict: every normal cell within ±0.3 %,
   every crowded cell within ±0.8 %, or the list of misses with FWHM. Reading: a crowded miss beyond FWHM 5 → Step 2b; a
   normal miss → the systematic reported, the real members that mode judges flagged in B1's table (a `flag` column).
-- [ ] **Step 2b — the growth-corrected crowded mode (only if Step 2 misses; lab code opus design + sonnet code; ≈ 4 h).**
+- [x] **Step 2b — the growth-corrected crowded mode (only if Step 2 misses; lab code opus design + sonnet code; ≈ 4 h).**
   `grid-report.py`: option `crowded_growth` — in the crowded mode the curve-of-growth correction c = median flux(5F) /
   flux(8F) per frame over the same stars with an annulus [9F, 11F] (the crowded isolation 9F keeps the 8F circle clean of
   other candidates), applied as the normal mode applies its 3F / 8F ratio; the default stays OFF, the option recorded;
   the SAME cells re-read with the option on, the same bars; the validation table beside the old. Reported to the owner
   before B3 (the referee rule is the owner's; PB-18) — an information package with a recommended answer, not a menu.
-- [ ] **Step 3 — field realism (sonnet table; opus verdict; ≈ 1.5 h).** `realism_table.py`: the 19 `pairs`, `density_pairs`,
+  *As it ran (R-PB2-1, R-PB2-2; MEASURED OUT):* built (WO-1/2) and read (WO-3): 60 of 78 read cells missed against the plain mode's 12 of 73;
+  `crowded_growth` pinned OFF, drivers retired, WO-4 cancelled, never re-proposed. The referee became the normal mode plus a far read
+  (WO-5/5b/6), unreadable on the real sets (R-PB2-6): the ceiling allowance 1 %/px x abs(dF). README R-OSP-16 B2.
+- [x] **Step 3 — field realism (sonnet table; opus verdict; ≈ 1.5 h).** `realism_table.py`: the 19 `pairs`, `density_pairs`,
   `osc_pairs`, `truthcheck` families' `annulusCrowding` medians and halo `c` excess medians (per target FWHM printed)
   against the real members' min…max (set 204 mono, set 204 OSC per plane, run B mono and OSC, Horse C11 G — from B1's
   `annulus-crowding.csv` and B0's `c-table`). Verdict: the families inside on both; if none → Step 3b.
+  *As it ran (R-PB2-7):* mono realistic (19 of 22 families inside on both), OSC not (0 of 6 plane-rows); Step 3b not triggered.
 - [ ] **Step 3b — the realistic family (only if Step 3 says so; lab code sonnet; generator run ≈ 1 h and the ERP once
   ≈ 10 min, both on the RUNNER; the family's frames stay there and are the runner's copy of record).**
   PB-9: build, verify determinism (two renders equal), its ERP LN run (`erp_v2.py ln` on the new grid family), the harness
   truth validated on it in both modes on the referee bars (Step 2's tool on the new family), its LN rows at the 068cf2d6
   binary (the `ln.*` jobs through `run_probe.py` on a quick manifest naming the family; a results run, not quick mode: the
   family is new, nothing to diff).
-- [ ] **Step 4 — the seeing-lever pairs (lab code sonnet ≈ 2 h; inject run ≈ 30 min; the probe LN rows ≈ 15 min; the ERP
+  *NOT TRIGGERED (R-PB2-7): the plan's rule asks for one realistic pair family, and 18 of 19 `pairs` families are inside the mono range.*
+- [x] **Step 4 — the seeing-lever pairs (lab code sonnet ≈ 2 h; inject run ≈ 30 min; the probe LN rows ≈ 15 min; the ERP
   once ≈ 5 min; the inject run, the rows and the ERP all on the DEV MAC: the source flat and dark are on bigbase3, PB-17).** PB-10: `--stamp empirical`, the six pairs, `run_probe.py manifests/inject-lever.json` (plane 0, β auto
   and 4), `rows_ln_injected` with the ERP beside (its one run through `erp_v2.py ln manifests/inject-lever.json`), the
   injected stars' own aperture sum printed per pair (the check). The 3 % flag applies (the stamp is an estimate).
-- [ ] **Step 5 — the referee package (sonnet; ≈ 1 h).** `referee-verdict.md`: which mode judges which real member (from
+  *As it ran (R-PB2-4, R-PB2-5, R-PB2-8):* B-spline stamp (bilinear failed the 1 % width test), placement >= 8F from real peaks >= 20 sigma, and the
+  gain gate became the free fit pooled over the six sources (the OFFSET-200 dark on OFFSET-30 lights, PRODUCT FINDING); six pairs, sums 0.997-1.005.
+- [x] **Step 5 — the referee package (sonnet; ≈ 1 h).** `referee-verdict.md`: which mode judges which real member (from
   B1's table), each cell's flag, the realism verdict beside the F1 `pairs` miss (the spec's "the miss recorded beside B2's
   field-realism verdict"), the lever row. Lab commit `results(plan-b/b2): the referee in both modes on every cell, the
   realism table, the seeing-lever pairs`; push. README R-OSP-16 B2 block. The owner informed (PB-18); a crowded-mode fix
   waits for the owner's word before B3's real read uses it.
+  *As it ran:* lab 03e300d (referee-verdict.md); the README block and the OFFSET entry in `docs/superpowers/open-items.md` in athenaeum. No crowded-mode fix
+  exists to wait on (R-PB2-2).
 
 **STOPs.** A crowded cell beyond FWHM 5 outside ±0.8 % → Step 2b (the lab), then the owner's word. A normal cell outside
 ±0.3 % → reported; the members it judges flagged (never a referee cell). A lever pair whose injected aperture sum is

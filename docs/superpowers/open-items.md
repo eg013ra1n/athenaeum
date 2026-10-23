@@ -278,6 +278,24 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Set 204 mono: an OFFSET-200 dark on OFFSET-30 lights, and nothing stops it (2026-10-23)
+
+Product finding of Plan B B2 Step 4 (the lever-gate verdict; `docs/stacking/README.md` R-OSP-16 B2, R-PB2-8). The second instance of the Horse C11 pattern
+(a master dark whose pedestal does not match the lights). The owner's call; nothing was built.
+
+- What: the set 204 mono tree (`tierA-lnB-f1`, LDN1272, 180 s) was dark-subtracted with the master dark
+  `master_dark_180s_-10C_g100_bin1x1_2025-04-12_2.fits` (OFFSET 200, median 201 ADU) on OFFSET-30 lights (raw median 561 ADU): about 170-206 ADU
+  over-subtracted (calibrated sky 360 ADU where the photon level is about 530). Every ATR2600M dark and bias in both catalogs is OFFSET 200; all 216
+  set 204 lights and their master flat are OFFSET 30.
+- Evidence: the lab's gain self-check refused all six lever sources (each source's c = 0 ratio 1.34-1.60); the six sources pooled give a free fit
+  of 1.067 (span 0.66) and an intercept of 198 ADU removed. The camera gain holds.
+- Not investigated: how the link was made. The default calibration config matches offset `Exact` (`calibration/config.rs`), so this was a manual link
+  or a config with offset relaxed. No plan-gate or run check names a dark whose pedestal differs from the lights'.
+- Effect: Plan B's numbers (LN scale, `c`) are local-sky-subtracted and blind to the pedestal, so they stand. Absolute-sky quantities of that tree (SNR,
+  noise rows, the ERP's noise estimates) carry about +170 ADU of level error.
+- If wanted: an advisory warning (never a change of auto-link picks: calibration warnings are not gates), next to the Export tab's pedestal warning
+  below; it would cover the Horse C11 case too.
+
 ### The Measure aperture correction `c` on undersampled OSC planes (2026-10-20)
 
 Product findings of the Plan A closing diagnostic (note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`, section 7; first Plan B item). Weights and LN read `c`.
