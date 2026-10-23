@@ -1130,24 +1130,28 @@ owners), `docs/stacking/README.md` (R-OSP-16 closed: every ruling, every accepta
 rule). Owner: the push and the close."
 
 **Steps.**
-- [ ] **Step 1 — the full uniform lab run (sonnet, bars and a design list; ≈ 2.5 h; on the RUNNER at its build of the final
+- [x] **Step 1 — the full uniform lab run (sonnet, bars and a design list; ≈ 2.5 h; on the RUNNER at its build of the final
   commit; the dev Mac builds in its compile slot if the binary is not the last one built).** `lab_cycle.py --step b6-final --prev t14-final --inject --bars bars/planb_b6.py` (every Plan B bar
   as judged + the held F-0…F-7, F-10 bars from Plan A's `bars.py`, cumulative), the gates on B3's (or B4's) set 204 clone
   run (13 / 13, on the dev Mac: `injection` and `gain` read bigbase2 / 3), `probe_identity` against the last stage's probe outputs (same), the runner's l10b cycle at the final
   binary (the nebula rows; B1's ERP column). Any gate off its fixed value → STOP, the owner task named.
-- [ ] **Step 2 — the real reads (sonnet judgment; ≈ 2 h).** `ln_real.py run / table` at the final binary on the three
+  *As it ran:* at 5103310e: runner `b6 cycle` PASS (every bar; lab 2366176), scorecard identity b4-c2 vs b6-final moved 0 / max |delta| 0 (d44e3bb), runner `b6 l10b` PASS (e63c4fc); dev-Mac `b6 gates` 13 / 13 on planb-s204-b6 at r2 (8569c8b; r1 11 / 13 = R-PB6-2, a lab registry defect, fixed).
+- [x] **Step 2 — the real reads (sonnet judgment; ≈ 2 h).** `ln_real.py run / table` at the final binary on the three
   trees against B2's referee cells (B1's beside); `grid-report.py <clone> <project> --ln-truth` on run B's final clone
   (the project path) and `ln_truth_run.py` + `ln_real` on the set runs — the LN scale beside the photometric truth at
   master level, reference pinned; the master rows of the final clones against B4's / B3's as the stage order says.
-- [ ] **Step 3 — the suites (haiku, fixed answers; ≈ 45 min).** `cargo test -p athenaeum-core --all-targets --test-threads=4`
+  *As it ran:* `b6 ln-real` PASS, 23 / 23 trees, every F1 gap equal to B1 (ec97596); `b6 ln-truth` PASS on all three trees (R-PB6-1 withdrawn: B4's after-runs ran at 71a4a738), measure-equal to B4, weights rho 1.0000, masters 1.000000 (8e9f305).
+- [x] **Step 3 — the suites (haiku, fixed answers; ≈ 45 min).** `cargo test -p athenaeum-core --all-targets --test-threads=4`
   → 0 failed (the documented flakes by name); `cargo test -p athenaeum-web`, `npm run test` (vitest) green; `cargo check
   --no-default-features` green.
-- [ ] **Step 4 — the after report and the close (opus for the report; sonnet docs; Fable for the final whole-branch
+  *As it ran:* core all targets 4116 / 0 / 20 = runner 3684 / 0 / 19 (three QUIC network modules skipped, the runner box fails them) + dev Mac `--lib` network modules 432 / 0 / 1; web 51 / 0; `--no-default-features` check Finished; vitest 898 / 0.
+- [x] **Step 4 — the after report and the close (opus for the report; sonnet docs; Fable for the final whole-branch
   review).** The report beside B1's baseline: one data line per table (machine, volume), every bar with its verdict, the
   owned-quantities table (below), the recorded limits with their owners, what Plan C needs. README R-OSP-16 closed; the
   open-items ledger; `CLAUDE.md`. The lab's `results/plan-b/README.md`. The final review's fixes folded. The owner's STOP
   (PB-18): the merge into local main (`git merge --ff-only plan-b` after the owner's word, or a squash as Plan A did),
   the push.
+  *As it ran:* after report `docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` (2bb0961e); fable review READY (0 / 0 / 4 minor, folded at 5103310e); README R-OSP-16 B6 block, open-items, CLAUDE.md and the lab index (5c498d2) written. The merge and the push are left to the owner's word (PB-18).
 
 **Acceptance.** Every bar in the after report with its verdict and its before value; suites green; R-OSP-16 complete; the
 owner's word on the merge and push.
@@ -1176,13 +1180,13 @@ owner's word on the merge and push.
 | §7 the first-run ripple (`MEASURE_VERSION`) | B4 Step 7 (the release note), Review Focus 5 |
 | rulings.md R-B1…R-B17, the owner's ERP YES | cited per task; PB-1…PB-18 where the plan is more precise |
 
-## Owned quantities at close (to be filled by B6's report; the owner column as the spec's table says)
+## Owned quantities at close (filled at B6 from the after report's section 7; the owner column as the spec's table says)
 
-| Quantity | Owner | Consumers | Truth bar | Propagation list |
-| ---- | ---- | ---- | ---- | ---- |
-| `c` (with SE, count, the screen's count) | Task 10 (F-5) → B4 (qualifiers and sample) | PSFSW / PSFSNR, psfSel, Register's and LN's ordering, the kept payload (B0) | F-5; F-12 (B4); F-11 identity (B0) | weights, LN reference composition, psfSel s, inject row 6 (reported) |
-| the LN scale s | the default estimator (B3, the owner's) | Normalize, the masters | F-8 estimator (B3) | the master level rows |
-| the referee (harness truth, both modes) | B2 (the owner's rule) | every real-data LN verdict | F-8 referee (B2) | B3, B4, B6 |
-| seeds (LN's sides) | 10b → B5 (if in scope) | LN's pairs | F-13 | `k` retired |
-| `saturated` (LN's one definition) | 8 / 10c → B5 (if in scope) | LN's selection | F-13 | `unverdicted_clip_range` retired |
-| LN's aperture-scale sky | F1: LN's own [6F, 8F] median; psfSel: the module's B_i; F1 v2: the module ring at a caller F | the LN scale | F-8 | B3's choice |
+| Quantity | Owner | Consumers | Truth bar | Propagation list | B6's after value |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| `c` (with SE, count, the screen's count) | Task 10 (F-5) → B4 (qualifiers and sample) | PSFSW / PSFSNR, psfSel, Register's and LN's ordering, the kept payload (B0) | F-5; F-12 (B4); F-11 identity (B0) | weights, LN reference composition, psfSel s, inject row 6 (reported) | F5.1 +0.76 / +1.41 %; F5.2 / F5.3 miss 0 of 60; R13 0 of 130; halo 0.9984; floor (i) 0 of 396 planes; c-table median \|c - c*\| 0.36 %; real weights rho 1.0000 on all three trees |
+| the LN scale s | the default estimator (B3, the owner's) | Normalize, the masters | F-8 estimator (B3) | the master level rows | F1 gap per tree equal to B1 (medians -0.108 / -0.179 / +0.092 / -0.166 / -0.114 %); masters 1.000000 against B4 on all three trees |
+| the referee (harness truth, both modes) | B2 (the owner's rule) | every real-data LN verdict | F-8 referee (B2) | B3, B4, B6 | B6's referee summary equal to B3's; F1 median \|gap\| 0.39 % (s204-osc), 0.40 % (runB-osc) |
+| seeds (LN's sides) | 10b → B5 (if in scope) | LN's pairs | F-13 | `k` retired | B5 took the F1 branch: out of scope; `k` kept (it retires only with module seeds under a module-fed default); l10b F1 4 of 34 |
+| `saturated` (LN's one definition) | 8 / 10c → B5 (if in scope) | LN's selection | F-13 | `unverdicted_clip_range` retired | B5: out of scope; `unverdicted_clip_range` kept beside Register's 0.95, L-14's 0.75 and L-23's map; unchanged |
+| LN's aperture-scale sky | F1: LN's own [6F, 8F] median; psfSel: the module's B_i; F1 v2: the module ring at a caller F | the LN scale | F-8 | B3's choice | F1 stays (C-9: no change, R-PB5-1); 4 of 34 nebula-sky cells over the F-13 bar, a recorded limit |

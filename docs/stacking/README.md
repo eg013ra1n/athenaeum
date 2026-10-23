@@ -3881,12 +3881,12 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - The ERP's real-set gaps are a column, not a referee (owner rule). Context (B2, R-PB2-2): the real cells' truth is not yet refereed (normal
       mode plus a per-cell far read), so every gap above is "against the truth rows as they stand".
     *Open items carried.* (1) Horse C11 G parity max 1.226 % (range -0.395 .. +1.226, median -0.0465) is 5x the other trees' 0.19-0.24 %: B3 looks
-    at it. (2) The ERP's gap (mono -2.8 / -3.6 %, OSC +4.4 / +3.5 %, slope -0.3 to -0.6 %/px2) and its mono / OSC sign flip: cause not
-    investigated, B6's report. (3) `ln-real-verdict.txt` predates the ERP runs and only the heavy `planb.sh b1 ln-real` rewrites it: it carries a
-    dated note pointing to `ln-real-table.md`; B6 hygiene is `planb.sh b1 table` regenerating it. (4) Lab hygiene (B6): `planb.sh b1 audit`
+    at it. [B6: closed, verdict (a), a probe re-computation artefact.] (2) The ERP's gap (mono -2.8 / -3.6 %, OSC +4.4 / +3.5 %, slope -0.3 to -0.6 %/px2) and its mono / OSC sign flip: cause not
+    investigated, B6's report. [B6: a recorded limit, not investigated; the ERP is a column, never the referee.] (3) `ln-real-verdict.txt` predates the ERP runs and only the heavy `planb.sh b1 ln-real` rewrites it: it carries a
+    dated note pointing to `ln-real-table.md`; B6 hygiene is `planb.sh b1 table` regenerating it. [B6: stays stale with its dated NOTE; `b1 table` refreshed the rest (e428e5d).] (4) Lab hygiene (B6): `planb.sh b1 audit`
     exits 0 on an UNAUDITED file (the coverage line is informational; `l10b_b1.py audit-gate` reads only the summary line); `planb.sh truth`
     exits 4 on refusals only (R-PB0-14); the ERP writes a stray display-profile file under `star-lab/true/` on the runner (its working
-    directory at launch): `run_job.sh` should `cd` to a scratch directory first.
+    directory at launch): `run_job.sh` should `cd` to a scratch directory first. [B6: all settled, lab 4e4e757 / fc0a3e2 / ecddc4f, see the B6 block.]
   - **R-OSP-16 - Plan B B2: the referee, measured; the field realism; the seeing-lever pairs (Task B2; branch `plan-b`, no product code; plan
     `### Task B2`; lab `star-lab/results/plan-b/b2/`, its `referee-verdict.md` is B3's input; lab package commit 03e300d). A measurement: no bar moved.**
     *Both-modes read (Steps 1-2; lab 8ca5ebd merged at 05500b9, read on the runner at 39c82ca).* The harness truth with its mode forced
@@ -4188,6 +4188,29 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     supported there, the measured lever is the pair-common ring (neb3 g t45 −15.88 → −8.42), not a Measure-side screen: recorded, not
     proposed. (3) B1's Horse C11 G parity max 1.226 %: B6. No product code changed in B5 (B4's core line, 4115 / 0 / 20, stands); lab
     suites at a49b1e0: star-lab 1462 OK, harness 415 OK.
+  - **R-OSP-16 - Plan B B6: the checkpoint, Plan B closed (Task B6; branch `plan-b`, final sha 5103310e; lab `star-lab/results/plan-b/b6/`, its
+    `after-table.md` the package, lab 60a5fc3; index `star-lab/results/plan-b/README.md`). Rulings R-PB6-1 (withdrawn) and R-PB6-2.**
+    After report: `docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` (every bar as judged, the owned quantities at close,
+    the recorded limits with owners, what Plan C needs). Nothing in the product moved after 13aee664 except the fold below.
+    *The runs (every value from the lab files).*
+    - `b6 cycle` (runner, 5103310e): `B6 CYCLE: PASS (every bar)` - probe 1041/1041, inject 109/109, noreg and cumulative moved 0, B4 bars equal, F-11 PASS, HELD PASS (lab 2366176).
+    - Scorecard identity b4-c2 vs b6-final (runner): moved 0, max |delta| 0 over 73 403 rows (lab d44e3bb).
+    - `b6 l10b` (runner): `B6 L10B: PASS` - 60 frames, 174/174, same as B5, F1 4/34, psfSel 15/34 (lab e63c4fc).
+    - `b6 gates` (dev Mac, planb-s204-b6): `B6 GATES: PASS (13 / 13)` - determinism 185/185, probe_parity 0 mismatches over 200 100 fields (lab 8569c8b; r1 11/13 was R-PB6-2).
+    - `b6 ln-real` (dev Mac): `B6 LN-REAL: PASS (a read)` - 23/23 trees, every tree's F1 gap equal to B1 (lab ec97596).
+    - `b6 ln-truth` (dev Mac, all three trees): `B6 LN-TRUTH: PASS` - measure-equal to B4's after-runs (durationMs ignored), weights rho 1.0000, 0 movers, masters ratio 1.000000 (lab 8e9f305).
+    - `b6 report`: the after-table (lab 60a5fc3). Build record: star_probe and measure_probe byte-identical to b4f; ln_scale_probe differs by the `cRef` / `cTgt` keys.
+    *Rulings.*
+    - R-PB6-1 WITHDRAWN: it proposed ln-truth on run B only, reading s204 / hc11 from B4's after-runs by binary equivalence. Its premise was false:
+      B4's hc11 / runB / s204 after-runs ran at 71a4a738, before floor (i) (13aee664); only b4f ran at 13aee664. ln-truth ran all three at 5103310e (the plan as written), B4's after-runs the comparator. Caught before any run.
+    - R-PB6-2: the determinism gate's 185/186 was a lab registry defect (`truthcheck_w10`, B2's in-memory-only family, never in the v2 manifest), not a regeneration miss; fixed in the lab, 13/13 after.
+    *Product.* hygiene 4437eda8: `ln_scale_probe` prints LN's own per-side `c` (`cRef` = `aperture_correction()`, `cTgt` = `target_aperture_correction`); no product behavior.
+    Review fold 5103310e: the screen-radius phrase, the "metrics artifact" phrase, and a run test pinning floor (i)'s wiring (`measure_folds_a_floored_member_to_the_group_channel_median_c_before_the_weights`).
+    *Review.* The final whole-branch review (fable, at 4437eda8, before the runs): READY, 0 critical / 0 important / 4 minor, 51 targeted tests passed; minors 1-3 folded at 5103310e, the 4th deliberate.
+    *Suites.* Core all targets 4116 passed / 0 failed / 20 ignored (runner 3684 / 0 / 19 with the three network modules skipped + dev Mac `--lib` network modules 432 / 0 / 1; the runner box fails the localhost-QUIC tests, an environment item); web 51 / 0; `--no-default-features` check Finished; vitest 82 files / 898 tests; lab star-lab 1491 OK, harness 439 OK.
+    *Lab hygiene, settled.* exits_75 flake deterministic and `star-lab/true/` gitignored (lab 4e4e757); `planb.sh truth` refusal exit (lab fc0a3e2); `planb.sh b1 audit` stops (exit 4) on an UNAUDITED file, B6 stage labels fixed (lab ecddc4f); the `ln_truth_run --far` intercept rule is moot (nothing reads it); B1's `ln-real-verdict.txt` stays stale with its dated NOTE (only the heavy `b1 ln-real` rewrites it; `b1 table` refreshed the rest in e428e5d).
+    *B1 open items at close.* (1) Horse C11 G parity 1.226 %: closed, verdict (a), a probe re-computation artefact (the `.athln` side is the 2026-10-06 before-run's measurement, f70055: 384 matches vs the probe's 523; hc11's members are the noisy ones, per-star sigma 0.042-0.049 vs 0.009-0.018); B6's hc11 ln-truth row agrees. (2) The ERP's real-set gap and mono / OSC sign flip: not investigated, a recorded limit (the ERP is a column, never the referee; our F1 meets truth on those sets).
+    **R-OSP-16 CLOSED (2026-10-24): Plan B complete; merge / push on the owner's word.**
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and
