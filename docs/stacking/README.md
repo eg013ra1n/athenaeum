@@ -3827,6 +3827,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     against a scorecard built before it (t14-final) lists every LN row `changed`; re-score `b0-ident2`'s probe with the new scorecard
     (`--reuse-probe`) for a same-format `--prev`. (3) `integrate.rs` has the same pool hop (the master's `c` line lacks `integrate_group`):
     `install_in_span` if B4 wants it, out of B0's scope. (4) `planb.sh truth` exits 4 on refusals only (R-PB0-14): print the count, exit 0 (B6).
+    *Suites (B0 Step 6, 2026-10-23, at 20697493):* `cargo test -p athenaeum-core --all-targets --no-fail-fast` 28 binaries 4105 passed /
+    0 failed / 20 ignored (Plan A's 4091 + 14 new; no flake this run); `tsc --noEmit` clean after the `stacking.ts` regeneration. B0 closed.
 - **Plan A closed (Task 14, 2026-10-20).** Note: `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`,
   every Plan A bar against its baseline cell in `2026-10-07-star-measurement-baseline.md`.
   - *The run.* One uniform lab run at c10be63b (`star_probe` 695bb4935f67; lab cf07135) wrote v2 1041, inject 109 and

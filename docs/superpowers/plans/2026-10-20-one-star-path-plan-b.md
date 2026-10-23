@@ -537,7 +537,7 @@ Propagation: the kept `c` feeds B2's halo excess, B4's arm 3 and floor count, B3
   STARLAB_SCRATCH=<star-lab-b/b0-ident/gates> python3 bin/gates.py` → 13 / 13 (fixed answer; `probe_parity` included; all 13 on the dev Mac, PB-17).
   Verdict per dataset ≤ 30 lines. Commit lab: `results(plan-b/b0): the four before-runs - reference picks, the c table
   per group and channel, the truth on each run's own LN reference, gates 13 / 13, c identity 0 differ`.
-- [ ] **Step 6 — docs and the suite (sonnet docs; haiku suite with fixed answers; ≈ 1.5 h).** README R-OSP-16 opened
+- [x] **Step 6 — docs and the suite (sonnet docs; haiku suite with fixed answers; ≈ 1.5 h).** README R-OSP-16 opened
   with B0's block (the placement, the chain, the four picks, the `c` table); the open-items entry; `cargo test -p
   athenaeum-core --all-targets --test-threads=4 | grep -E '^test result|FAILED|panicked'` → 0 failed (the two documented
   flakes skipped by name as Task 14b did). Commit athenaeum: `docs(stacking): R-OSP-16 B0 - c kept per plane, the
