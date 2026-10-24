@@ -1067,8 +1067,24 @@ pub struct FrameAnalysis {
     #[serde(default)]
     pub stars_refused: Option<i64>,
     /// Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
-    #[serde(default)]
+    /// An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
+    #[serde(default, deserialize_with = "lenient_frame_verdict")]
     pub frame_verdict: Option<FrameVerdict>,
+}
+
+/// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.
+fn lenient_frame_verdict<'de, D>(deserializer: D) -> Result<Option<FrameVerdict>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text: Option<String> = Option::deserialize(deserializer)?;
+    Ok(text.and_then(|t| {
+        let parsed = FrameVerdict::parse(&t);
+        if parsed.is_none() {
+            tracing::warn!(frame_verdict = %t, "unknown frame verdict read as none");
+        }
+        parsed
+    }))
 }
 
 /// The frame-level verdict of the star measurement (PC-13), stored as its snake_case text.
@@ -1381,5 +1397,32 @@ impl Default for LightCalParams {
             bias_fallback: BiasFallback::SubtractBias,
             cfa_flat_scaling: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_verdict_tests {
+    use super::*;
+
+    /// C6 review m8: an unknown verdict text reads `None` (with a `warn!`) and the rest of the row decodes.
+    #[test]
+    fn an_unknown_frame_verdict_reads_none_and_keeps_the_row() {
+        let row = |verdict: serde_json::Value| {
+            serde_json::json!({
+                "id": null, "frame_id": 1, "file_id": 1, "stars_detected": 300, "median_fwhm": 3.0,
+                "median_eccentricity": 0.3, "median_snr": 20.0, "median_hfr": 1.8, "frame_snr": 30.0,
+                "snr_weight": 1.0, "psf_signal": 50.0, "background": 100.0, "noise": 5.0,
+                "detection_threshold": 170.0, "width": 4, "height": 4, "source_channels": 1,
+                "trail_r_squared": 0.1, "possibly_trailed": false, "median_beta": null, "quality_score": null,
+                "config_hash": "h", "analyzed_at": "2026-01-01T00:00:00Z", "frame_verdict": verdict
+            })
+        };
+        let known: FrameAnalysis = serde_json::from_value(row(serde_json::json!("trailed"))).unwrap();
+        assert_eq!(known.frame_verdict, Some(FrameVerdict::Trailed));
+        let unknown: FrameAnalysis = serde_json::from_value(row(serde_json::json!("from_the_future"))).unwrap();
+        assert_eq!(unknown.frame_verdict, None);
+        assert_eq!(unknown.stars_detected, 300);
+        let null: FrameAnalysis = serde_json::from_value(row(serde_json::Value::Null)).unwrap();
+        assert_eq!(null.frame_verdict, None);
     }
 }

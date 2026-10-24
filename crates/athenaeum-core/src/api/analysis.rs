@@ -123,6 +123,12 @@ pub fn reset_analysis_config(ctx: &ServiceContext) -> Result<AnalysisConfig, Api
 
 // ========== Frame-set analysis ==========
 
+/// A stored analysis is stale when it was written under another config, or carries no `measure_version` (a row
+/// written between C5 and C6 keeps the current hash but the gate never trusts it, so it heals on the next batch).
+fn row_is_stale(existing: &FrameAnalysis, config_hash: &str) -> bool {
+    existing.config_hash.as_deref() != Some(config_hash) || existing.measure_version.is_none()
+}
+
 /// Analyze all LIGHT frames in a frame set.
 ///
 /// Uses rayon par_iter inside pool.install() for natural work-stealing
@@ -254,7 +260,7 @@ pub fn analyze_frame_set(
                 .into_iter()
                 .filter(|(frame_id, _, _)| {
                     match db_analysis::get_frame_analysis(&conn, *frame_id) {
-                        Ok(Some(existing)) => existing.config_hash.as_deref() != Some(&config_hash),
+                        Ok(Some(existing)) => row_is_stale(&existing, &config_hash),
                         _ => true,
                     }
                 })
@@ -499,7 +505,10 @@ pub async fn get_frame_star_metrics(
 
     // Check if we have fresh analysis data with stars
     if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
-        if existing.config_hash.as_deref() == Some(&current_hash) {
+        // `measure_version` None is a pre-C6 row: stale like a hash mismatch (same rule as the batch).
+        if existing.config_hash.as_deref() == Some(&current_hash)
+            && existing.measure_version.is_some()
+        {
             if let Ok(stars) = db_analysis::get_star_metrics_by_frame_id(&conn, frame_id) {
                 // A trailed / defocused / no-stars frame stores no star (PC-6), so its verdict also makes the row
                 // servable as it is.
@@ -609,57 +618,101 @@ mod tests {
     use super::*;
     use crate::models::{FrameAnalysis, FrameVerdict};
 
+    /// Seeds frame 1 (file absent on disk, so a re-analysis fails) with a trailed-verdict row; `tweak` edits the row
+    /// before it is stored, and receives the current config hash.
+    fn seed_verdict_row(ctx: &ServiceContext, tweak: impl FnOnce(&mut FrameAnalysis)) -> i64 {
+        let handle = db(ctx).unwrap();
+        let conn = handle.conn();
+        conn.execute(
+            "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+             VALUES (1,'/nowhere/t.fits','t.fits',0,'2025-01-01','FITS','2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id,file_id) VALUES (1,1)", []).unwrap();
+        let hash = config::load_config(&conn).config_hash();
+        let mut a = FrameAnalysis {
+            id: None,
+            frame_id: 1,
+            file_id: 1,
+            stars_detected: 400,
+            median_fwhm: 0.0,
+            median_eccentricity: 0.0,
+            median_snr: 0.0,
+            median_hfr: 0.0,
+            frame_snr: 30.0,
+            snr_weight: 0.0,
+            psf_signal: 0.0,
+            background: 100.0,
+            noise: 5.0,
+            detection_threshold: 6.0,
+            width: 600,
+            height: 450,
+            source_channels: 1,
+            trail_r_squared: 0.0,
+            possibly_trailed: true,
+            median_beta: None,
+            quality_score: None,
+            config_hash: Some(hash),
+            analyzed_at: "2026-10-24T00:00:00Z".into(),
+            measure_version: Some(crate::star_measure::MEASURE_VERSION),
+            stars_refused: Some(25),
+            frame_verdict: Some(FrameVerdict::Trailed),
+        };
+        tweak(&mut a);
+        db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
+        1
+    }
+
     /// C5 review I1: a trailed / defocused / no-stars frame stores no `StarMetric`, so its verdict alone makes a fresh
     /// row servable. The file does not exist: a re-analysis would fail, so an `Ok` proves none ran.
     #[tokio::test]
     async fn a_fresh_row_with_a_verdict_and_no_stars_is_served_without_reanalysis() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
-        let frame_id = {
-            let handle = db(&ctx).unwrap();
-            let conn = handle.conn();
-            conn.execute(
-                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
-                 VALUES (1,'/nowhere/t.fits','t.fits',0,'2025-01-01','FITS','2025-01-01')",
-                [],
-            )
-            .unwrap();
-            conn.execute("INSERT INTO frames (id,file_id) VALUES (1,1)", []).unwrap();
-            let hash = config::load_config(&conn).config_hash();
-            let a = FrameAnalysis {
-                id: None,
-                frame_id: 1,
-                file_id: 1,
-                stars_detected: 400,
-                median_fwhm: 0.0,
-                median_eccentricity: 0.0,
-                median_snr: 0.0,
-                median_hfr: 0.0,
-                frame_snr: 30.0,
-                snr_weight: 0.0,
-                psf_signal: 0.0,
-                background: 100.0,
-                noise: 5.0,
-                detection_threshold: 6.0,
-                width: 600,
-                height: 450,
-                source_channels: 1,
-                trail_r_squared: 0.0,
-                possibly_trailed: true,
-                median_beta: None,
-                quality_score: None,
-                config_hash: Some(hash),
-                analyzed_at: "2026-10-24T00:00:00Z".into(),
-                measure_version: Some(crate::star_measure::MEASURE_VERSION),
-                stars_refused: Some(25),
-                frame_verdict: Some(FrameVerdict::Trailed),
-            };
-            db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
-            1
-        };
+        let frame_id = seed_verdict_row(&ctx, |_| {});
         let r = get_frame_star_metrics(&ctx, frame_id).await.expect("served from the stored row");
         assert!(r.stars.is_empty());
         assert_eq!(r.metrics.frame_verdict, Some(FrameVerdict::Trailed));
         assert_eq!((r.image_width, r.image_height), (600, 450));
+    }
+
+    /// C6 review m6: a STALE row (another config hash) that carries a verdict is not served; the re-analysis is
+    /// attempted, and with the file absent it fails.
+    #[tokio::test]
+    async fn a_stale_row_with_a_verdict_is_reanalyzed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let frame_id = seed_verdict_row(&ctx, |a| a.config_hash = Some("another-hash".into()));
+        let r = get_frame_star_metrics(&ctx, frame_id).await;
+        assert!(r.is_err(), "a stale row must be recomputed, not served");
+    }
+
+    /// C6 review m7, batch rule: current hash + `measure_version` None is stale; current hash + current version is not.
+    #[test]
+    fn the_batch_treats_a_legacy_version_row_as_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        seed_verdict_row(&ctx, |_| {});
+        let handle = db(&ctx).unwrap();
+        let conn = handle.conn();
+        let hash = config::load_config(&conn).config_hash();
+        let mut a = db_analysis::get_frame_analysis(&conn, 1).unwrap().unwrap();
+        assert!(!row_is_stale(&a, &hash));
+        a.measure_version = None;
+        assert!(row_is_stale(&a, &hash));
+        a.measure_version = Some(crate::star_measure::MEASURE_VERSION);
+        assert!(row_is_stale(&a, "another-hash"));
+    }
+
+    /// C6 review m7: a row with the current hash but no `measure_version` (written between C5 and C6) is stale in the
+    /// on-demand path.
+    #[tokio::test]
+    async fn a_row_with_the_current_hash_but_no_measure_version_is_reanalyzed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let frame_id = seed_verdict_row(&ctx, |a| a.measure_version = None);
+        let r = get_frame_star_metrics(&ctx, frame_id).await;
+        assert!(r.is_err(), "a legacy-version row must be recomputed, not served");
     }
 }

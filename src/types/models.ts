@@ -408,6 +408,7 @@ measure_version: number | null,
 stars_refused: number | null, 
 /**
  * Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
+ * An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
  */
 frame_verdict: FrameVerdict | null, };
 

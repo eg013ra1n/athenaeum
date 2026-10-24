@@ -117,7 +117,7 @@ pub struct FitDiagnostics {
     pub seed: usize,
     /// The seed's position in the plane's native pixels (the handed seed list's `x`, `y`): `seed` is an index into a list
     /// the caller may not hold (the CFA path hands its own), so the lab matches refusals by position. Set where the
-    /// record is made, so every fit-function caller sees it; NaN only on a `NotSelected` record of no list.
+    /// record is made, so every fit-function caller sees it; always set (a `NotSelected` record takes the seed's position too).
     pub x: f64,
     /// See [`FitDiagnostics::x`].
     pub y: f64,

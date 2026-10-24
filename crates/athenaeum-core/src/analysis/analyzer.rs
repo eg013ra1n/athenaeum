@@ -467,6 +467,19 @@ mod tests {
         assert!(a.stars_refused.unwrap() > 0, "a trailed frame's fits are refused: {:?}", a.stars_refused);
     }
 
+    /// C6 review m5: with `max_stars` below the seed count the budget leaves seeds `not_selected` (and may trim);
+    /// `stars_refused` is the refusal reasons alone, so neither leaks into it.
+    #[test]
+    fn stars_refused_leaves_the_budgets_not_selected_out() {
+        let frame = mono_frame(120, 640, 480, 1000.0, 11);
+        let config = AnalysisConfig { max_stars: 20, ..cfg() };
+        let pm = measure_raw_frame(&frame, &config, None);
+        assert!(pm.refused.not_selected > 0, "premise: the budget left seeds unselected: {:?}", pm.refused);
+        let (a, _) = map_measurement(&pm, &frame, &config, "h");
+        assert_eq!(a.stars_refused, Some(pm.refused.total() as i64));
+        assert_eq!(a.stars_refused, Some(pm.refused.by_reason.values().sum::<usize>() as i64));
+    }
+
     #[test]
     fn a_non_finite_star_snr_or_hfr_maps_to_none() {
         let frame = mono_frame(60, 512, 384, 1000.0, 13);

@@ -3045,6 +3045,9 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
     current["measure_version"] = serde_json::json!(5);
     current["stars_refused"] = serde_json::json!(17);
     current["frame_verdict"] = serde_json::json!("defocused");
+    // A verdict a newer build wrote (C6 review m8): the verdict reads None, the rest of the row is kept.
+    let mut future = current.clone();
+    future["frame_verdict"] = serde_json::json!("some_future_verdict");
     for (uuid, summary, want) in [
         ("an-old", legacy, (None, None, None)),
         (
@@ -3052,6 +3055,7 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
             current,
             (Some(5u32), Some(17i64), Some(crate::models::FrameVerdict::Defocused)),
         ),
+        ("a-future", future, (Some(5u32), Some(17i64), None)),
     ] {
         let tmp = TempDir::new().unwrap();
         let (pkg_dir, announce) = build_package_with_analysis(tmp.path(), uuid, summary);

@@ -4,8 +4,8 @@
 //! (G1 + G2, ruling R-PC-3: the fit reads green only, so R / B sky, chromatic focus and R / B hot pixels cannot move a
 //! seed; the sum's noise is white); every seed is mapped to native pixels, and those the matched filter flagged
 //! extended (knots, R-PC-8) are handed to the fit flagged: fitted, and kept out of the frame statistic as on the mono
-//! path; the fit runs on the native mosaic with the green-site mask; the plane's sky and noise are read from one green phase. `c` = 1 here (no qualifier, the B4 carry):
-//! Analysis star fluxes on an OSC frame are uncorrected, a recorded limit.
+//! path; the fit runs on the native mosaic with the green-site mask; the plane's sky and noise are read from one
+//! green phase. `c` = 1 here (no qualifier, the B4 carry): Analysis star fluxes on an OSC frame are uncorrected, a recorded limit.
 //!
 //! Positions are in FILE row order (the pattern addresses that order, see `input::RawPlanes`): the caller flips them
 //! for display.

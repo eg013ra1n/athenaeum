@@ -636,6 +636,12 @@ pub fn input_gate_reason(
             "Stars are trails the measurement could not fit — nothing to match".to_string(),
         );
     }
+    if matches!(
+        a.frame_verdict,
+        Some(crate::models::FrameVerdict::Defocused | crate::models::FrameVerdict::NoStars)
+    ) {
+        return None;
+    }
     if a.median_eccentricity >= config.input_max_eccentricity
         && a.trail_r_squared >= config.input_min_trail_r2
     {
@@ -907,10 +913,10 @@ mod tests {
     fn the_input_gate_never_refuses_defocused_or_no_stars() {
         use crate::models::FrameVerdict;
         let cur = Some(crate::star_measure::MEASURE_VERSION);
-        // Even with the pair's numbers over the thresholds: these verdicts carry zeros, but the gate never reads them.
+        // The rows carry numbers far over the pair's thresholds: the verdict alone decides, and these two never refuse.
         let conn = gate_conn(&[
-            (0.0, 0.0, cur, Some(FrameVerdict::Defocused)),
-            (0.0, 0.0, cur, Some(FrameVerdict::NoStars)),
+            (0.95, 0.9, cur, Some(FrameVerdict::Defocused)),
+            (0.95, 0.9, cur, Some(FrameVerdict::NoStars)),
         ]);
         let cfg = PlateSolveConfig::default();
         assert!(input_gate_reason(&conn, 1, &cfg).is_none());
