@@ -16,7 +16,7 @@ resettable, and the defaults come from one Rust command.
 | Kind | What it is | Rust side | Frontend hook |
 | ---- | ---- | ---- | ---- |
 | **KV** | One scalar with a default, stored as a string under one key in `settings` | `settings/mod.rs` — a `keys::` constant, a `defaults::` constant, **and a pair in `defaults::all()`**; read in Rust through `SettingsManager` | `useSettingField(section, field, key, codec)` |
-| **Typed config** | A group of values that travels together as one JSON document | Its own struct with `Default`, plus `get_*` / `set_*` / `reset_*` on BOTH hosts (`AnalysisConfig`, `PlateSolveConfig`, `CalibrationMatchingConfig`, `LoggingConfig`, `StackingConfig`) | `useAutosaveDocument<D>({ load, save, resetAll?, defaults })` |
+| **Typed config** | A group of values that travels together as one JSON document | Its own struct with `Default`, plus `get_*` / `set_*` / `reset_*` on BOTH hosts (`AnalysisConfig`, `PlateSolveConfig`, `CalibrationMatchingConfig`, `LoggingConfig`, `StackingConfig` — whose global trio is `get/set/reset_stacking_defaults`; Logging has no reset) | `useAutosaveDocument<D>({ load, save, resetAll?, defaults })` |
 
 A KV key with its own command (`set_blink_threads`, `set_integration_band_budget`,
 `set_sync_upload_limit`) stays KV — pass `write` / `read` overrides to the hook.

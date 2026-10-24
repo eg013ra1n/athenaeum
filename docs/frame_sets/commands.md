@@ -1,5 +1,10 @@
 # Frame Sets Commands API Reference
 
+> **Historical (2025).** Written for the v2.0 frame-set design; parts no longer match the
+> code (removed commands, night matching by date overlap, the old file layout). The current
+> reference is [README.md](./README.md), reviewed against the code on 2026-10-24 — check the
+> code before relying on anything below.
+
 ## Overview
 
 This document provides complete API documentation for all Tauri commands related to frame set operations.

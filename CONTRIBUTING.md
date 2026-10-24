@@ -59,15 +59,17 @@ in snake_case fields: `info!(root_id, new = 12, "scan finished")`, never
 
 ## Before you open a pull request
 
-Run the three gates:
+Run the gates:
 
 ```bash
-cargo build --workspace
-cargo test -p athenaeum-core
+cargo test --workspace
 npx tsc --noEmit
+npm test
 ```
 
-CI runs exactly these on Ubuntu. Clippy is not a gate.
+CI runs the first two on Ubuntu and Windows (skipping two timing-bound transfer
+tests on its smaller runners); `npm test`, the frontend suite, is a local check.
+Clippy is not a gate.
 
 ## Commits and branches
 

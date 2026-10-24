@@ -80,7 +80,7 @@ xxHash XXH3_64-based file hashing for fast duplicate identification across large
 Pre-built releases are available at [artfrom.space/releases/download](https://artfrom.space/releases/download):
 
 - **Windows**: MSI installer, EXE (NSIS)
-- **macOS**: DMG (universal binary -- Apple Silicon + Intel)
+- **macOS**: DMG, one build for Apple Silicon and one for Intel
 - **Linux**: AppImage, DEB
 - **Docker**: `docker pull eg013ra1n/athenaeum` (web build for NAS and home servers)
 
@@ -139,13 +139,14 @@ database lives in the OS application-data directory on desktop, and in `/data`
 ### Checks
 
 ```bash
-cargo build --workspace
-cargo test -p athenaeum-core
+cargo test --workspace
 npx tsc --noEmit
+npm test
 ```
 
-These three are what CI runs. See [CONTRIBUTING.md](./CONTRIBUTING.md) before
-opening a pull request.
+CI runs the first two on Ubuntu and Windows; `npm test` (the frontend suite)
+is a local check. See [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a
+pull request.
 
 ## Project Structure
 
@@ -206,7 +207,7 @@ Athenaeum runs on two backends over one shared library. `athenaeum-core` holds
 everything that is not transport: the SQLite catalog, FITS/XISF parsing,
 frame-set clustering, calibration matching, master creation, stacking,
 archiving, export and peer-to-peer transfers. The desktop shell is **Tauri 2**,
-exposing 259 commands across 24 domain modules over Tauri's IPC; the web build is an **Axum**
+exposing 306 commands across 24 domain modules over Tauri's IPC; the web build is an **Axum**
 server whose routes mirror those commands one-for-one and stream progress over
 SSE. The React frontend reaches whichever is active through a single `api`
 object, so no component knows which host it is running under.

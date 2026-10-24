@@ -2,138 +2,96 @@
 
 ## Overview
 
-Frame sets are hierarchical collections of astronomical image frames organized by observation night and instrument. This documentation covers the complete implementation including architecture, algorithms, commands, and edge cases.
+Frame sets are collections of LIGHT frames grouped by sky position, with each set holding its frames in a derived hierarchy of imaging nights and sessions. Frame sets are global (not per project). This page is the entry point: the commands, the grouping and night rules, the UI flow and where the code lives.
+
+Code map:
+
+| Concern | Where |
+| ---- | ---- |
+| Workflows shared by both hosts | `crates/athenaeum-core/src/api/frame_sets.rs` (`auto_generate_frame_sets`, `merge_frame_sets`, `recalculate_frame_set_nights`, `reconcile_frame_set_nights`, `set_frame_set_attestation`) |
+| Sky clustering | `crates/athenaeum-core/src/clustering/` |
+| Nights and sessions | `crates/athenaeum-core/src/sessions/` (`detect_sessions`, `rederive_for_frame_set`, `reconcile_for_frame_set`) |
+| Set metadata | `crates/athenaeum-core/src/frames_set_metadata.rs` |
+| Tauri commands | `crates/athenaeum-tauri/src/commands/frame_sets.rs`, registered in `invoke_handler![]` in `crates/athenaeum-tauri/src/lib.rs` |
+| Axum mirror | `crates/athenaeum-web/src/routes/frame_sets.rs`, registered in `build_router` |
+| Frontend | `src/pages/Objects.tsx` (set list, route `/objects`), `src/pages/FrameSetDetail.tsx` (route `objects/:id`), `src/pages/ExcludedFrames.tsx` (route `/excluded`), `src/components/SelectionDialog.tsx`, `src/components/FrameSetHistoryTab.tsx` |
 
 ## Documentation Structure
 
-### [architecture.md](./architecture.md)
-**Database schema and structural design**
+The four pages below are the original 2025-01 write-up of this subsystem. They have not been re-reviewed against the code in the 2026-10-24 pass that rewrote this page, so where one disagrees with this page or the code, this page and the code win.
 
-- Complete database schema with all tables and relationships
-- Hierarchical structure (frame_set → imaging_night → session → frames)
-- Cascade deletion behavior and referential integrity
-- Schema evolution and migration strategy
-- Performance considerations and query optimization
-
-**Read this if you need to:**
-- Understand the database structure
-- Design new queries or operations
-- Debug data integrity issues
-- Plan schema migrations
-
----
-
-### [algorithms.md](./algorithms.md)
-**Core algorithms and computational logic**
-
-- Night matching algorithm (calendar date + time overlap)
-- Time range union calculation
-- Merge algorithm with deduplication
-- Split algorithm with validation
-- Metadata calculation (spherical mean coordinates)
-- Session detection (time-based grouping)
-- Performance characteristics and complexity analysis
-
-**Read this if you need to:**
-- Understand how merge/split operations work
-- Debug coordinate calculation issues
-- Optimize performance
-- Implement similar algorithms
-
----
-
-### [commands.md](./commands.md)
-**Complete API reference for Tauri commands**
-
-- All frame set query commands
-- Frame set creation commands (auto, custom, selection)
-- Modification commands (rename, recalculate)
-- Merge and split commands with full examples
-- TypeScript interface definitions
-- Error handling patterns
-- Migration guide from v1.0 to v2.0
-
-**Read this if you need to:**
-- Call frame set commands from frontend
-- Understand command parameters and return types
-- Handle errors gracefully
-- Migrate existing code to new schema
-
----
-
-### [edge_cases.md](./edge_cases.md)
-**Edge cases, boundary conditions, and special scenarios**
-
-- Merge edge cases (empty sets, identical sets, partial overlap, etc.)
-- Split edge cases (splitting all items, non-existent items, etc.)
-- Metadata calculation edge cases (missing data, coordinate boundaries)
-- Session detection edge cases (same timestamp, out of order)
-- Deduplication edge cases (triple duplicates, no duplicates)
-- Transaction and concurrency considerations
-- Validation edge cases
-
-**Read this if you need to:**
-- Understand how the system handles unusual inputs
-- Debug unexpected behavior
-- Write comprehensive tests
-- Ensure robustness
+- [architecture.md](./architecture.md) - database schema and structural design.
+- [algorithms.md](./algorithms.md) - merge, split, metadata and session-detection algorithms.
+- [commands.md](./commands.md) - API reference for the frame-set commands.
+- [edge_cases.md](./edge_cases.md) - edge cases and boundary conditions.
 
 ---
 
 ## Quick Start
 
+The frontend never imports Tauri directly; every call goes through `api.invoke` (`src/api/`). Argument casing follows the command: most take camelCase keys (`framesSetId`, `sourceId`); `create_frame_set_from_selection` is declared `rename_all = "snake_case"` and takes `frame_ids`.
+
 ### Creating Frame Sets
 
 **Auto-generate from LIGHT frames:**
 ```typescript
-const result = await invoke('auto_generate_frame_sets', { projectId: 1 });
-console.log(`Created ${result.sets_created} sets`);
+const result = await api.invoke<AutoGenerateResult>('auto_generate_frame_sets', {
+  projectId: 1,          // required by the command, ignored (frame sets are global)
+  thresholdDeg: null,    // optional override; null = use the persisted grouping threshold
+});
+// result.sets_created, result.frames_clustered, result.frames_excluded,
+// result.frames_already_in_sets, result.exclusion_reasons
 ```
+The result is snake_case on the wire (the struct deliberately has no camelCase rename; `AutoGenerateResult` in `src/types/helpers.ts` mirrors it).
 
-**Create custom from sessions:**
+**Create a custom set from a selection of frames:**
 ```typescript
-const setId = await invoke('create_custom_frames_set', {
-  name: "M31 October 2024",
-  sessionIds: [12, 15, 18]
+const setId = await api.invoke<number>('create_frame_set_from_selection', {
+  name: 'M31 Core',
+  frame_ids: [101, 102, 103],
+  description: null,     // accepted, not stored
 });
 ```
-
-**Create from map selection:**
-```typescript
-const setId = await invoke('create_frame_set_from_selection', {
-  name: "M31 Core",
-  frameIds: [101, 102, 103]
-});
-```
+The new set is custom (`is_custom = 1`). It needs at least one frame.
 
 ### Merging Frame Sets
 
-**Drag and drop merge:**
 ```typescript
-const merged = await invoke('merge_frame_sets', {
-  sourceId: 42,  // Dragged set (will be deleted)
-  targetId: 43   // Drop target (will be updated)
+const merged = await api.invoke<FrameSetDetail>('merge_frame_sets', {
+  sourceId: 42,  // dragged set: deleted after the merge
+  targetId: 43,  // drop target: receives the nights, marked custom
 });
 ```
 
 ### Splitting Frame Sets
 
-**Check if split is valid:**
 ```typescript
-const canSplit = await invoke('can_split', {
+const newSet = await api.invoke<FrameSetDetail>('split_frame_set', {
   sourceSetId: 42,
-  selection: { type: "nights", ids: [10, 11] }
+  selection: { type: 'nights', ids: [10, 11] },   // or 'sessions' / 'frames'
+  newName: 'M31 Widefield - Split 1',
 });
 ```
+There is no separate pre-check command. `split_frame_set` itself refuses a selection that would leave the source empty (all nights, all sessions or all frames) and a selection that resolves to no frames.
 
-**Perform split:**
-```typescript
-const newSet = await invoke('split_frame_set', {
-  sourceSetId: 42,
-  selection: { type: "nights", ids: [10, 11] },
-  newName: "M31 Widefield - Split 1"
-});
-```
+### Other Commands
+
+| Command | Arguments | Notes |
+| ---- | ---- | ---- |
+| `get_frames_sets` | `projectId` | Every set with `member_count`; the project id is ignored |
+| `get_frame_set_detail` | `framesSetId` | Set plus its nights and sessions |
+| `rename_frames_set` | `framesSetId`, `newName` | |
+| `delete_frames_set` | `framesSetId` | |
+| `delete_auto_generated_frame_sets` | none | Deletes every set with `is_custom = 0`; returns the count |
+| `mark_frame_set_custom` | `framesSetId` | One-way auto to custom |
+| `archive_frame_set` | `framesSetId` | Moves the set to the Archive tab (see `docs/archive/README.md`) |
+| `recalculate_frame_set_nights` | `framesSetId` | Force re-derive of nights and sessions; returns the detail |
+| `reconcile_frame_set_nights` | `framesSetId` | Cheap, idempotent check run on every detail-page open; rewrites only on drift; returns `{ changed, nights, sessions }`; skips archived sets |
+| `set_frame_set_attestation` | `framesSetId`, `attested` | The user's word that the lights are calibrated externally |
+| `find_new_frames_for_set` | `framesSetId`, `scanFirst` | Unassigned LIGHT frames within the grouping threshold of the set |
+| `auto_merge_new_frames_for_set` | `framesSetId`, `frameIds`, `source` | Attaches candidates and writes a merge-log entry |
+| `get_frame_set_merge_log` | see `commands/frame_sets.rs` | Feeds the History tab |
+| `get_excluded_frames_count`, `get_excluded_frames_with_metadata`, `remove_files_from_excluded` | | The Excluded Frames page |
 
 ## Key Concepts
 
@@ -141,285 +99,101 @@ const newSet = await invoke('split_frame_set', {
 
 ```
 frames_set
-  ├─ date_obs_start, date_obs_end
-  ├─ objctra, objctdec (average coordinates)
-  ├─ total_exp_time (sum)
-  │
-  └─> imaging_nights (1 to N)
-       ├─ start_time, end_time
-       │
-       └─> sessions (1 to N)
-            ├─ instrume (camera)
-            ├─ frame_count, total_exp_time
-            │
-            └─> session_members (N)
-                 └─> frames (1)
+  |- date_obs_start, date_obs_end
+  |- objctra, objctdec (spherical-mean centre)
+  |- total_exp_time (sum)
+  |
+  '-> imaging_nights (1 to N)       frames_set_id, start_time, end_time
+       |
+       '-> sessions (1 to N)        imaging_night_id, instrume, frame_count, total_exp_time
+            |
+            '-> session_members     (session_id, frame_id) primary key
+                 '-> frames (1)
 ```
 
-### Night Matching
+`frames_set` is created with `id`, `name`, `is_custom`, `date_obs_start`, `date_obs_end`, `objctra`, `objctdec`, `total_exp_time`; later migrations in `db/schema.rs` add `flat_pattern`, `avg_rotation`, `min_rotation`, `max_rotation`, `is_archived`, `archived_at`, `archive_operation_id`, `calibrated_externally`, `attested_at` (and sync columns). `imaging_nights`, `sessions` and `session_members` cascade on delete from the set.
 
-Two nights match if **BOTH**:
-1. Same calendar date (accounting for multi-day observations)
-2. Overlapping time ranges
+### Grouping by sky position (auto-generate)
 
-Example:
-```
-Night A: 2024-10-25 01:00 → 03:33
-Night B: 2024-10-24 19:34 → 2024-10-25 04:44
-→ MATCH (both include Oct 25, times overlap)
-```
+`auto_generate_frame_sets` takes every LIGHT frame that is not yet a member of any set and clusters it (`clustering::cluster_frames`):
+
+1. Frames without a usable position, or that are not LIGHT, are excluded (not clustered) with a reason; they are stored in `excluded_frames` (cleared and rewritten on each run) and surface on the Excluded Frames page. Numeric `ra`/`dec` are preferred; the sexagesimal `objctra`/`objctdec` are used when the numeric pair is missing or has a zero leg. A position that is all zeros is treated as missing.
+2. Frames are sorted by RA, then Dec, then DATE-OBS.
+3. Seed-and-grow, single link: the first unassigned frame seeds a cluster; every unassigned frame within the threshold (great-circle distance) of the cluster's running centre joins, the centre is recomputed as the spherical mean after each join, and the scan repeats until no frame is added. The next unassigned frame seeds the next cluster.
+4. Each cluster is named by a strict-majority `OBJECT` value, else `Unknown @ RA=..., Dec=...`.
+
+The pass is single-threaded and O(n^2) typical, O(n^3) worst case (documented in the function's header comment, which names a spatial index as the next step if that is ever hit).
+
+The threshold comes from settings `grouping.threshold.value` (default `3.0`) and `grouping.threshold.unit` (default `deg`; `arcsec`, `arcmin`, `deg` accepted). The Objects page passes `thresholdDeg` only when the value typed there differs from the persisted one. Changing the setting does not regroup existing sets. Details: `docs/catalog/README.md` and the Settings registry (`src/settings/registry.ts`).
+
+After a set is created, nights and sessions are detected for it, and a `project-set-match` event is emitted when the set's centre falls inside one of the user's collaboration projects (a suggestion, never an auto-link).
+
+### Nights and sessions are derived
+
+A night is derived data with one definition, the gap rule: `sessions::detect_sessions` sorts the frames that have a `DATE-OBS` by time and starts a new night whenever the gap between consecutive frames exceeds `session_gap_threshold_hours` (default `6.0`; whole hours are used). Within a night, frames are grouped into sessions by `INSTRUME` (`Unknown` when absent).
+
+Nights are never stitched from stored rows by calendar date or time overlap; that stored one night as two rows after a merge. Instead `sessions::rederive_for_frame_set` deletes the set's night rows (sessions and members cascade), runs the gap rule over the whole current membership and writes the rows back. A member with no `DATE-OBS` cannot be placed by the gap rule and is kept on a stable fallback night so a recalculation never loses a frame. `reconcile_frame_set_nights` compares the stored rows with a fresh derivation and writes only on a difference. Rule and history: `docs/catalog/README.md`.
+
+### Merge
+
+`merge_frame_sets` (one transaction): every night of the source is reassigned to the target, the target's nights and sessions are re-derived from the union of both memberships, the target's metadata is refreshed and it is marked custom, and the source set is deleted. A set cannot be merged into itself.
+
+The UI offers this as a mouse-driven drag of one set card onto another on the Objects page, with a confirmation dialog; it also offers suggested merges after an auto-generate run.
+
+### Split
+
+`split_frame_set` moves the selected nights, sessions or frames into a new custom set (nights and sessions of the new set come from `detect_sessions` over the moved frames), deletes the selected rows from the source, refreshes the source's metadata and marks the source custom. In the UI the split dialog on the detail page sends a `frames` selection.
 
 ### Metadata Calculation
 
-Frame set metadata is calculated from member frames:
+Set metadata is calculated from member frames (`frames_set_metadata`):
 
-- **date_obs_start:** Earliest frame observation
-- **date_obs_end:** Latest frame observation
-- **objctra, objctdec:** Spherical mean of coordinates
-- **total_exp_time:** Sum of all exposure times
+- **date_obs_start / date_obs_end:** earliest and latest frame DATE-OBS
+- **objctra, objctdec:** spherical mean of the member coordinates
+- **total_exp_time:** sum of exposure times
+- rotation: circular mean plus min/max of the member rotations
 
-**Why Spherical Mean?**
-Simple averaging fails near RA boundaries:
-```
-Frames: RA=359°, RA=1°
-Simple average: 180° ✗ (wrong!)
-Spherical mean: 0° ✓ (correct!)
-```
+**Why spherical mean?** Simple averaging fails near the RA wrap: RA 359 and RA 1 average to 180 degrees, while the spherical mean is 0.
 
-### Frame Uniqueness
+### Custom vs auto-generated
 
-Within a frame set, each frame should appear only once. The system ensures this through:
-- Deduplication after merge
-- Split validation
-- Unique constraints on session_members (session_id, frame_id)
-
-## Schema Changes (v2.0)
-
-### What Changed
-
-**Removed:**
-- `project_id` from `frames_set` (sets now independent)
-- `date_obs` from `frames_set` (replaced with range)
-
-**Added:**
-- `date_obs_start` to `frames_set`
-- `date_obs_end` to `frames_set`
-
-### Migration
-
-Old code:
-```typescript
-// v1.0
-const set: FramesSet = {
-  date_obs: "2024-10-25",
-  project_id: 1
-};
-```
-
-New code:
-```typescript
-// v2.0
-const set: FramesSet = {
-  date_obs_start: "2024-10-25T00:00:00Z",
-  date_obs_end: "2024-10-26T05:00:00Z"
-  // No project_id
-};
-```
-
-## Design Decisions
-
-### Why Three Levels?
-
-**Frame Set** → Logical collection (e.g., "M31 Widefield")
-**Imaging Night** → Observing session (important for weather, conditions)
-**Session** → Instrument grouping (important for calibration)
-
-This mirrors real-world astrophotography organization:
-- Multiple nights contribute to a target
-- Multiple instruments on same night
-- Frames organized for efficient processing
-
-### Why Deduplication?
-
-After merging, frames might exist in multiple sessions. Deduplication ensures:
-- Each frame counted once for statistics
-- No double-processing in workflows
-- Clear data ownership
-
-### Why Mark as Custom?
-
-Operations like merge and split transform the frame set:
-- No longer auto-generated
-- User has modified organization
-- Should not be re-auto-generated
-
-## Testing Strategy
-
-### Unit Tests
-
-Test algorithms in isolation:
-- Night matching logic
-- Spherical mean calculation
-- Time range union
-- Deduplication
-
-### Integration Tests
-
-Test database operations:
-- Merge with various overlap scenarios
-- Split with different selection types
-- Metadata recalculation
-- Cascade deletion
-
-### End-to-End Tests
-
-Test complete workflows:
-- Auto-generate → merge → split
-- Custom creation → split → recalculate
-- Map selection → merge into existing
-
-## Performance Guidelines
-
-### Query Optimization
-
-**Fast Queries:**
-- Get frame set list (single JOIN with COUNT)
-- Get metadata (direct table lookup)
-- Count frames (indexed JOIN)
-
-**Slow Queries:**
-- Get complete detail (hierarchical, 3-4 queries)
-- Large frame sets (>10,000 frames)
-
-**Recommendations:**
-- Use pagination for large lists
-- Cache frame set metadata
-- Lazy-load detail views
-
-### Operation Performance
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Auto-generate | 1-5s | Depends on frame count |
-| Custom create | 0.5-2s | Depends on session count |
-| Merge | 1-3s | Depends on overlap |
-| Split | 0.5-2s | Depends on selection size |
-| Recalculate | 0.1-1s | Depends on frame count |
+`is_custom = 0` marks a set that auto-generate created. Merge, split, `create_frame_set_from_selection` and `mark_frame_set_custom` make a set custom. `delete_auto_generated_frame_sets` (the Objects page's "delete auto-generated sets" action) removes only non-custom sets, so user-shaped sets survive. Auto-generate itself only ever considers frames that are in no set.
 
 ## Troubleshooting
 
 ### Frame Set Appears Empty
 
-**Check:**
-1. Does it have imaging_nights? (`SELECT * FROM imaging_nights WHERE frames_set_id = ?`)
-2. Do nights have sessions? (`SELECT * FROM sessions WHERE imaging_night_id = ?`)
-3. Do sessions have frames? (`SELECT * FROM session_members WHERE session_id = ?`)
+1. Does it have nights? `SELECT * FROM imaging_nights WHERE frames_set_id = ?`
+2. Do nights have sessions? `SELECT * FROM sessions WHERE imaging_night_id = ?`
+3. Do sessions have members? `SELECT * FROM session_members WHERE session_id = ?`
 
-**Common Causes:**
-- Cascade deletion of parent records
-- Failed transaction during creation
-- Deleted sessions without cleanup
+Try `recalculate_frame_set_nights` first: it rebuilds the night, session and member rows from the set's membership and refreshes the metadata. Rows are removed by cascade when a parent night, session or frame is deleted.
 
 ### Coordinates Are Wrong
 
-**Check:**
-1. Do frames have coordinates? (`SELECT ra, dec, objctra, objctdec FROM frames`)
-2. Are coordinates near RA boundaries? (Spherical mean handles this)
-3. Mixed formats? (System handles both decimal and sexagesimal)
+1. Do frames have coordinates? `SELECT ra, dec, objctra, objctdec FROM frames`
+2. Frames with missing or all-zero coordinates are excluded from clustering and listed on the Excluded Frames page.
+3. The set centre is the spherical mean of the members, so one mislocated frame pulls it; check with the detail page.
 
-**Common Causes:**
-- Frames without WCS/plate solving
-- Incorrect FITS header values
-- Parser errors in sexagesimal strings
+### Nights Look Split or Merged Wrongly
 
-### Merge Creates Duplicates
+Nights follow `session_gap_threshold_hours` (Settings, General). Run `recalculate_frame_set_nights` after changing it; the reconcile on page open also repairs drift on its own.
 
-**This shouldn't happen!** Deduplication runs automatically.
+### Frames Missing from Every Set
 
-**If it does:**
-1. Check `deduplicate_session_members_in_set` ran
-2. Verify session_members PRIMARY KEY constraint exists
-3. Check for concurrent modifications
-4. Run `recalculate_frame_set_metadata` to clean up
-
-### Split Leaves Orphans
-
-**Orphan sessions/nights are automatically deleted** via CASCADE.
-
-**If they persist:**
-1. Check FK constraints are properly defined
-2. Verify CASCADE is enabled
-3. May need manual cleanup: `DELETE FROM imaging_nights WHERE frames_set_id NOT IN (SELECT id FROM frames_set)`
-
-## Future Enhancements
-
-### Potential Features
-
-1. **Undo/Redo for Merge/Split**
-   - Store operation history
-   - Allow rollback of recent changes
-
-2. **Merge Preview**
-   - Show what would happen before committing
-   - Dry-run mode
-
-3. **Bulk Operations**
-   - Merge multiple sources into one target
-   - Split multiple selections simultaneously
-
-4. **Smart Auto-Merge**
-   - Detect related frame sets
-   - Suggest merges based on coordinates/names
-
-5. **Frame Set Templates**
-   - Save organization patterns
-   - Apply to new data
-
-### Optimization Opportunities
-
-1. **Caching**
-   - Cache frame set metadata in memory
-   - Invalidate on updates
-   - Faster list rendering
-
-2. **Batch Operations**
-   - Batch deduplication across multiple sets
-   - Batch metadata recalculation
-   - Transaction optimization
-
-3. **Parallel Processing**
-   - Parallelize coordinate calculations
-   - Concurrent session detection
-   - Multi-threaded DBSCAN clustering
+Open the Excluded Frames page. Frames that are not LIGHT, or that lack usable coordinates, are listed with the reason; fix the metadata there and run auto-generate again.
 
 ## Contributing
 
-### Adding New Operations
+### Adding or Changing an Operation
 
-1. **Define Algorithm** (algorithms.md)
-2. **Add Database Operations** (operations.rs)
-3. **Implement Command** (commands.rs)
-4. **Register Command** (lib.rs)
-5. **Document API** (commands.md)
-6. **Document Edge Cases** (edge_cases.md)
-7. **Write Tests**
-8. **Update Migration Guide**
+Follow "Adding a Tauri Command" in the repo `CLAUDE.md`:
 
-### Documentation Standards
-
-- Keep documentation in sync with code
-- Add examples for every command
-- Document all edge cases
-- Explain "why" not just "what"
-- Update performance characteristics
-- Version all breaking changes
-
-## Support
-
-For issues, questions, or contributions:
-- GitHub Issues: [athenaeum/issues](https://github.com/user/athenaeum/issues)
-- Documentation: `docs/frame_sets/`
-- Source Code: `src-tauri/src/`
+1. Logic in `crates/athenaeum-core/src/api/frame_sets.rs` (reusing `clustering/`, `sessions/`, `frames_set_metadata.rs`).
+2. Tauri wrapper in `crates/athenaeum-tauri/src/commands/frame_sets.rs` with `#[tracing::instrument(skip_all, err)]`, registered in `invoke_handler![]`.
+3. Axum mirror in `crates/athenaeum-web/src/routes/frame_sets.rs`, registered in `build_router`.
+4. Frontend call through `api.invoke('command_name', { ... })`; model types through the `ts_export.rs` registry.
+5. Update this page.
 
 ## License
 
@@ -427,6 +201,4 @@ See repository root for license information.
 
 ---
 
-**Last Updated:** 2025-01-14
-**Version:** 2.0
-**Status:** Complete Implementation
+Last reviewed 2026-10-24 against the code

@@ -124,7 +124,7 @@ useEffect(() => {
 
 **Transfers / collab** — row = transfer, attempt = counter; the wire is frozen and append-only (golden pins); `failed` = local-fatal only; the collab runtime loop never awaits hub HTTP or a catalog write, and every read-then-write catalog transaction is `BEGIN IMMEDIATE`; retention is Perseus-only. `docs/transfers/README.md`.
 
-**Plate solving** — `solvemyastro` is the sole solver; the input and acceptance gates have no Settings UI. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
+**Plate solving** — `solvemyastro` is the sole solver; the input gate has a Settings section (Plate Solving → Input Gate), the acceptance gate has none. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
 **Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 5); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
 

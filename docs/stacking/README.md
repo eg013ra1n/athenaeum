@@ -21,7 +21,9 @@ build/rebuild whatever the export-readiness gate found missing, including the
 pre-calibration master a missing flat master's rebuild reads, dependency
 order bias/darkflat → dark → flat, so a run never blocks on a master it can
 build itself) → `Calibrate` (reuses the calibrated-lights export engine
-verbatim) → `Measure` → `Reference` (one frame for the whole set — highest
+verbatim) → `Measure` (the shared `star_measure` path, `MEASURE_VERSION` 5,
+the aperture correction `c` kept per plane — see "One star-measurement
+path, Plan A" and R-OSP-16) → `Reference` (one frame for the whole set — highest
 weight, or the user's pinned choice via `set_frame_set_reference`; this
 frame REGISTERS every group — since ruling R-M3-17 (2026-09-10) it no
 longer anchors normalization, which every group instead picks sky-
@@ -58,7 +60,8 @@ filter/binning/exposure cluster; camera and native geometry are display
 facts only, `PlanGroup.cameras`/`instrume`, never keys), the resolved
 config + its hash, the reference, folder/space state, and ordered blockers
 (`code` ∈ `masters | links | masterFiles | reference | folders | space |
-frames | unsupported`) — reusing the calibrated-export readiness gate
+frames | unsupported`; a project plan adds `grid` while the project's grid
+is unconfirmed) — reusing the calibrated-export readiness gate
 (`ExportReadiness`) for the masters/links checks, so the two features can
 never disagree about what "ready to calibrate" means. A blocking `code` at
 the front of the list stops `start_stacking` cold; anything past it is
@@ -79,8 +82,10 @@ Progress rides `stacking-progress` (per stage/group/frame, throttled 300 ms)
 and exactly one `stacking-complete` fires from the run's single exit path
 regardless of success/cancel/failure/panic.
 
-**19 commands** (`api/stacking.rs` + `commands/stacking.rs` +
-`routes/stacking.rs`, all mirrored on both hosts): `get_stacking_plan`,
+**26 commands** (`api/stacking.rs` + `commands/stacking.rs` +
+`routes/stacking.rs`, all mirrored on both hosts) — the frame-set path's 19
+listed here plus the seven project-path twins (`*_project_stacking_*`, see
+"Commands (D12)" under the project path): `get_stacking_plan`,
 `start_stacking`, `cancel_stacking`, `get_stacking_runs`, `get_stacking_run`,
 `get_stacking_config`, `set_stacking_config`, `get_stacking_presets` (Default
 / Fast preview / Maximum quality, a single Rust source of truth so the tab
@@ -131,7 +136,7 @@ the set having light frames.
 global config defaults (`get/set/reset_stacking_defaults`, the same
 `StackingConfig` tree a set can override) and the working/output folders
 (`get/set_stacking_paths` — `stacking::paths`, on-disk layout
-`<working_dir>/<set_slug>/{calibrated,registered,ln,runs,rej,previews}/…` —
+`<working_dir>/<set_slug>/{calibrated,measured,registered,ln,runs,rej,previews}/…` —
 `previews/run-<id>/<group>_<kind>_<step>.jpg` is the M4d master-light
 thumbnail cache (`step` = the RESOLVED render step, `thumbnail | preview |
 full`, never the caller's raw `maxPx`), swept only by `CleanupWhat::All`;

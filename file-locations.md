@@ -2,6 +2,10 @@
 
 App identifier: `com.vsharifov.athenaeum`
 
+Debug builds (`npm run tauri dev`) keep their data under `com.vsharifov.athenaeum.dev`
+instead, so development never touches the release catalog; `ATHENAEUM_APP_DATA_DIR`
+overrides both (`athenaeum_core::paths::app_data_dir_name`).
+
 ---
 
 ## macOS

@@ -35,27 +35,27 @@ planned but never built. This rewrite documents only what `crates/athenaeum-core
 
 ## How it works (data flow)
 
-1. **`collect_export_data`** (`data_collector.rs:21`) takes a `frame_set_id` and:
+1. **`collect_export_data`** (`data_collector.rs`) takes a `frame_set_id` and:
    - Loads every LIGHT frame reachable through
-     `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs:192`).
-   - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs:734`).
+     `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs`).
+   - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs`).
      `camera_type` is `Osc` if `BAYERPAT` is a non-empty string, else `Mono`
-     (`CameraType::from_bayerpat`, `models.rs:22`).
+     (`CameraType::from_bayerpat`, `models.rs`).
    - Within each group, further splits frames into `CalibrationSubgroup`s by the
      **combination of calibration-set IDs already linked to each frame**
-     (`build_calibration_subgroups`, `data_collector.rs:791`).
+     (`build_calibration_subgroups`, `data_collector.rs`).
    - Builds a `MasterCreationPlan` — a topologically-sorted, informational list of
      which master calibration files *would* need to be created and in what order
-     (`build_master_creation_plan`, `data_collector.rs:881`).
+     (`build_master_creation_plan`, `data_collector.rs`).
 2. **Calibration links are read, not computed.** `get_frame_calibration_links`
-   (`data_collector.rs:485`) and friends query the `calibration_set_to_frames`
+   (`data_collector.rs`) and friends query the `calibration_set_to_frames`
    table directly. Export does **not** call `calibration/configurable_matcher.rs`
    or `calibration/hierarchy.rs` — those run earlier, when the user runs
    calibration matching from the Calibration page, and persist rows into
    `calibration_set_to_frames`. If a frame set has no calibration links yet,
    export will show it with missing-calibration warnings but will not try to
    find or create matches itself.
-3. **`organize_files_wbpp`** (`file_organizer.rs:112`) walks the same groups/subgroups
+3. **`organize_files_wbpp`** (`file_organizer.rs`) walks the same groups/subgroups
    and copies or symlinks files into the folder tree described below.
 
 ## Camera type detection
@@ -64,15 +64,15 @@ planned but never built. This rewrite documents only what `crates/athenaeum-core
 OSC (One-Shot Color): BAYERPAT is a non-empty string (e.g. RGGB, BGGR)
 Mono: BAYERPAT is NULL or empty
 ```
-Source: `CameraType::from_bayerpat`, `crates/athenaeum-core/src/export/models.rs:22`.
+Source: `CameraType::from_bayerpat`, `crates/athenaeum-core/src/export/models.rs`.
 OSC and Mono frames land in different `ExportGroup`s (different `group_key`,
-`models.rs:165`) because they can't be stacked together in the downstream processing program.
+`models.rs`) because they can't be stacked together in the downstream processing program.
 
 ## Folder structure it produces
 
 `organize_files_wbpp` and `build_folder_preview` (used for the UI's folder-tree
 preview) both build the same shape — verified they use identical set-ID-keyed
-logic (`file_organizer.rs:186-328` vs. `data_collector.rs:1503-1747`):
+logic (`file_organizer.rs` vs. `data_collector.rs`):
 
 ```
 <output_dir>/
@@ -89,21 +89,21 @@ The **Calibrated lights** mode (see "Export modes" below) uses the same
 `<output_dir>/<frame set name>/camera_<x>/` root but skips the `BIAS_`/`DARKS_`/`FLAT_`
 levels entirely — calibration is already applied, not linked, so only `lights/` exists.
 
-- The frame-set folder name uses `sanitize_display_folder_name` (`models.rs:242`) —
+- The frame-set folder name uses `sanitize_display_folder_name` (`models.rs`) —
   keeps spaces/case, replaces `: / \ * ? " < > |` with `_`, collapses repeats.
-- The `camera_` folder name uses `sanitize_folder_name` (`models.rs:229`) — lowercases
+- The `camera_` folder name uses `sanitize_folder_name` (`models.rs`) — lowercases
   and strips everything but alphanumerics (e.g. `"ZWO ASI2600MM Pro"` → `zwoasi2600mmpro`).
 - **Missing calibration levels collapse.** If a subgroup has no dark and no
   darkflat linked, there is no `DARKS_*` folder at all — the tree goes straight
   from `BIAS_*` (or `camera_*` if no bias either) to `FLAT_*`/`lights/`
-  (`file_organizer.rs:253-288`).
+  (`file_organizer.rs`).
 - A flat's *own* dark/darkflat/bias (`flat.dark`, `flat.dark_flat`, `flat.bias` on
   `CalibrationSetInfo`) are folded into the same `BIAS_*`/`DARKS_*` folders as the
   light's own bias/dark, deduplicated by set ID via a shared `HashSet<i64>`
   (`organized_set_ids` in `file_organizer.rs`, `counted_sets` in `data_collector.rs`)
   so a calibration set already placed once isn't copied twice.
 - `copy_or_link` skips a file if the destination path already exists
-  (`file_organizer.rs:356-359`) — re-running an export into the same output
+  (`file_organizer.rs`) — re-running an export into the same output
   directory does not overwrite or duplicate files already placed there.
 
 ## Copy vs. symlink, and the platform caveat
@@ -118,10 +118,10 @@ the caller — there is no config default; the frontend decides it per platform:
 | Web/Docker | No (hidden) | Always copies — output dir is also constrained to `ATHENAEUM_EXPORT_DIR` (`crates/athenaeum-web/src/main.rs`) |
 
 Source: `symlinksAvailable = isTauri && !isWindows` and the two
-`symlinkUnavailableReason` strings, `src/components/export/ExportTab.tsx:176-185`.
+`symlinkUnavailableReason` strings, `src/components/export/ExportTab.tsx`.
 
 **The Rust side does have a Windows symlink branch** — `copy_or_link`
-(`file_organizer.rs:356-379`) has both `#[cfg(unix)]` (`std::os::unix::fs::symlink`)
+(`file_organizer.rs`) has both `#[cfg(unix)]` (`std::os::unix::fs::symlink`)
 and `#[cfg(windows)]` (`std::os::windows::fs::symlink_file`) arms. But because the
 frontend never surfaces the toggle on Windows, that branch is currently
 unreachable except by calling `export_to_wbpp` (Tauri) / `POST /api/export_to_wbpp`
@@ -143,19 +143,19 @@ stays in place next to the catalog's original files.
 
 ## WBPP keyword-order config — stored, but not applied to the layout
 
-`WbppExportConfig` (`models.rs:701`) has one field, `keyword_order: Vec<String>`,
-default `["CAMERA", "BIAS", "DARKS", "FLAT"]`. It's persisted under the
+`WbppExportConfig` (`models.rs`) has two fields: `export_mode` and `keyword_order: Vec<String>`, the latter
+defaulting to `["CAMERA", "BIAS", "DARKS", "FLAT"]`. It's persisted under the
 `export.wbpp_config` settings key via `get_wbpp_export_config` /
 `set_wbpp_export_config` / `reset_wbpp_export_config`.
 
 **It does not currently change what `organize_files_wbpp` does.** Both consumers
-of `WbppExportConfig` take it as `_config` (`file_organizer.rs:116`) or
-`_config` (`data_collector.rs:1503`) — the parameter is accepted but unused; the
+of `WbppExportConfig` take it as `_config` (`file_organizer.rs`) or
+`_config` (`data_collector.rs`) — the parameter is accepted but unused; the
 nesting order (`CAMERA` → `BIAS` → `DARKS` → `FLAT` → `lights`) is hardcoded.
 The only place `keywordOrder` is actually read is the frontend's "WBPP Setup
-Guide" (`ExportTab.tsx:66-110`), which uses it to render the setup instructions
+Guide" (`ExportTab.tsx`), which uses it to render the setup instructions
 and the example-structure text shown to the user. There's also no UI to edit
-`keyword_order` today — `useWbppConfig`'s `save`/`reset` (`useExportData.ts:212-230`)
+`keyword_order` today — `useWbppConfig`'s `save`/`reset` (`useExportData.ts`)
 are exported but unused; `ExportTab.tsx` only reads the config, it never calls
 `save`/`reset`. In practice this means: the setting exists and round-trips
 through the DB, but changing it (via a raw API call) would make the on-screen
@@ -163,13 +163,13 @@ setup guide describe an order the folder organizer doesn't actually build.
 
 ## Master creation plan — informational only
 
-`MasterCreationPlan` / `MasterInfo` (`models.rs:184-224`) are built by
-`build_master_creation_plan` (`data_collector.rs:881`): a topological sort over
+`MasterCreationPlan` / `MasterInfo` (`models.rs`) are built by
+`build_master_creation_plan` (`data_collector.rs`): a topological sort over
 the unique calibration sets referenced by the export, with a suggested
 `output_name` (e.g. `master_flat_38.fit`) and which sub-calibrations to apply
 (`apply_bias` / `apply_dark` / `apply_darkflat`). For flats, `apply_dark` is only
 set if the dark's average exposure time is within 30% of the flat's
-(`FLAT_DARK_EXPOSURE_TOLERANCE = 0.30`, `data_collector.rs:1047`); otherwise the
+(`FLAT_DARK_EXPOSURE_TOLERANCE = 0.30`, `data_collector.rs`); otherwise the
 flat falls back to bias-only, matching the calibration hierarchy's normal
 Flat → DarkFlat → Dark(±30%) → Bias fallback chain.
 
@@ -177,7 +177,7 @@ Athenaeum never acts on this plan — no code creates master files. The plan is
 exposed through `ExportData.master_plan` (from `get_export_preview` /
 `get_calibration_route`) purely as data; the only field the shipped UI currently
 renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
-`commands/export.rs:394`). The downstream processing program's WBPP creates the actual masters after the
+`commands/export.rs`). The downstream processing program's WBPP creates the actual masters after the
 files are organized on disk.
 
 ## Export modes
@@ -390,13 +390,14 @@ aren't imported by any page.
 | `get_exportable_frame_sets` | List frame sets with light-frame counts, for a picker | No (hook exists, unused) — `ExportTab` gets `frameSetId` as a prop from the frame set detail page, it doesn't pick from a list |
 | `get_calibration_route` | `ExportData` reshaped into a UI calibration tree | No (hook exists, unused) |
 | `get_export_summary` | The enhanced summary `ExportTab` actually renders (equipment, filter groups, folder preview, warnings) | Yes |
+| `get_export_readiness` | The mode-less `ExportReadiness` counts behind the one readiness gate (`check_mode_ready`) for export and send | Yes |
 | `export_to_wbpp` | Run the organizer: copy/symlink files into the WBPP tree, emit progress | Yes |
 | `cancel_export` | Set the cooperative cancel flag for a running export | Yes (via `useExportProgress`) |
 | `get_export_dir` (web only, no Tauri equivalent) | Return the server-configured `ATHENAEUM_EXPORT_DIR`, or null | Yes, web mode only — desktop uses a native folder picker instead |
 
 Progress/completion events (both backends emit the same names — Tauri via
 `app_handle.emit`, web via `SseProgressEmitter` over SSE): `export-progress`
-(`phase: "collecting" | "copying"`, with `current`/`total`/`percent`/`current_file`)
+(`phase: "collecting" | "copying" | "calibrating" | "complete"`, with `current`/`total`/`percent`/`current_file`)
 and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress`
 (`src/hooks/useExportProgress.ts`) listens for both and calls `notify()` on
 `export-complete` with `kind: 'export'`.
@@ -411,7 +412,7 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
   above), the collapsible WBPP Setup Guide, and the Export button.
 - `src/components/export/ExportSummary.tsx` — renders the `ExportSummary` payload
   (`get_export_summary`): cameras/telescopes/date range, per-filter-group
-  breakdown (exposure groups from `build_exposure_groups`, `data_collector.rs:1323`
+  breakdown (exposure groups from `build_exposure_groups`, `data_collector.rs`
   — an exact/rounded-to-0.1s tally for display, not a configurable clustering
   tolerance), calibration detail, and the folder-structure preview tree.
 - `src/components/export/WarningsPanel.tsx` — renders `DetailedWarning`s
@@ -445,7 +446,7 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
 
 | File | Purpose |
 | ---- | ---- |
-| `crates/athenaeum-core/src/export/mod.rs` | Re-exports `data_collector` and `file_organizer` |
+| `crates/athenaeum-core/src/export/mod.rs` | Declares `calibrated_generator` (render-gated), `data_collector`, `file_organizer`, `filter_header`, `frame_set_queries`, `models`, `project_collector`, `project_organizer` |
 | `crates/athenaeum-core/src/export/models.rs` | All export data structures, incl. `WbppExportConfig` |
 | `crates/athenaeum-core/src/export/data_collector.rs` | Reads the catalog + existing calibration links, builds `ExportData`/`ExportSummary` |
 | `crates/athenaeum-core/src/export/file_organizer.rs` | Builds the folder tree, copies or symlinks files, emits progress |

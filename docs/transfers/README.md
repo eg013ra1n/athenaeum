@@ -131,7 +131,7 @@ column — four new commands (`get_collab_filter_mapping_sheet`,
   — the app never moves an attested original (A1).
 
 - **Gate blockers (§7.1, `GateReport.blockers`)** — one per cause present,
-  in this order, each with the action `GateBlockers.tsx` (§7.2) offers:
+  in this order, each with the action `ReasonGroupAction.tsx` (§7.2) offers:
 
   | `kind` | From failures | Action |
   | ---- | ---- | ---- |
