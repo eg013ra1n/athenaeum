@@ -741,13 +741,14 @@ impl FitTrace {
     fn record(
         self,
         seed: usize,
+        at: &Seed,
         outcome: Outcome,
         verdict: Option<SaturationVerdict>,
     ) -> FitDiagnostics {
         FitDiagnostics {
             seed,
-            x: f64::NAN,
-            y: f64::NAN,
+            x: at.x,
+            y: at.y,
             outcome,
             region_radius: self.region_radius,
             background_start: self.background_start,
@@ -2299,7 +2300,7 @@ fn fit_at_width(
         .into_iter()
         .zip(outcomes)
         .enumerate()
-        .map(|(seed, (trace, outcome))| trace.record(seed, outcome, verdict_of(seed)))
+        .map(|(seed, (trace, outcome))| trace.record(seed, &seeds[seed], outcome, verdict_of(seed)))
         .collect();
     let verdict_fit_failed = passes.map_or(0, |v| {
         v.iter()

@@ -12,11 +12,11 @@ use anyhow::Result;
 use super::cfa;
 use super::config::{AnalysisConfig, AnalysisPsfModel};
 use super::input::{read_raw_frame, RawFrame, RawPlanes};
-use crate::star_measure::frame::finite_median;
 use super::trail::trail_r_squared;
 use crate::models::{FrameAnalysis, StarMetric};
 use crate::star_measure::{
-    self, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, SeedSpec, StarFit,
+    self, frame::finite_median, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, SeedSpec,
+    StarFit,
 };
 
 /// Measure a raw frame (PC-4, PC-5): mono -> `measure_plane`; a Bayer mosaic -> [`cfa::measure_green_sites`]; a
@@ -86,14 +86,9 @@ fn finite_or_zero(x: f64) -> f64 {
 }
 
 /// `stars_detected` (R-PC-5 / R-PC-8), one rule for every layout: the matched filter's seeds not flagged `extended`.
-/// The module's own detection fills `detected`; given seeds (the CFA path) leave it empty and `seeds` counts them.
+/// `seeds` is the detection's seed count on the module's own sources and the handed count on the CFA path.
 fn point_like_seeds(pm: &PlaneMeasurement) -> i64 {
-    let found = if pm.detected.is_empty() {
-        pm.seeds
-    } else {
-        pm.detected.len()
-    };
-    found.saturating_sub(pm.extended_seeds) as i64
+    pm.seeds.saturating_sub(pm.extended_seeds) as i64
 }
 
 /// Write a measurement into the Analysis rows (spec 4.2 with PC-6..PC-9).
@@ -359,10 +354,14 @@ mod tests {
             let (plain, knotted) = (make(name, false), make(name, true));
             let pm = measure_raw_frame(&knotted, &cfg(), None);
             assert!(pm.extended_seeds >= 1, "{name}: the knot is flagged extended");
-            let found = if pm.detected.is_empty() { pm.seeds } else { pm.detected.len() };
+            if name == "cfa" {
+                assert!(pm.detected.is_empty(), "{name}: handed seeds leave `detected` empty");
+            } else {
+                assert_eq!(pm.detected.len(), pm.seeds, "{name}");
+            }
             let (a, _) = analyze_raw_frame(&plain, &cfg(), None, "h");
             let (b, _) = analyze_raw_frame(&knotted, &cfg(), None, "h");
-            assert_eq!(b.stars_detected, (found - pm.extended_seeds) as i64, "{name}");
+            assert_eq!(b.stars_detected, (pm.seeds - pm.extended_seeds) as i64, "{name}");
             assert_eq!(b.stars_detected, a.stars_detected, "{name}: the knot is not counted");
             assert!(b.stars_detected >= 30, "{name}: {}", b.stars_detected);
         }

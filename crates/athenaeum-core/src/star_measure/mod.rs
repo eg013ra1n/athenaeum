@@ -1469,13 +1469,11 @@ fn finish_working(
         expected_prefix(opts.mode, seeds.len(), population.is_some()),
         "prepared plane's record count disagrees with opts.mode"
     );
-    let extended_seeds = extended_flags(detection.as_ref(), opts, seeds.len())
-        .iter()
-        .filter(|&&e| e)
-        .count();
+    let flags = extended_flags(detection.as_ref(), opts, seeds.len());
+    let extended_seeds = flags.iter().filter(|&&e| e).count();
     let (fit_seeds, extended) = fit_inputs(
         &seeds,
-        extended_flags(detection.as_ref(), opts, seeds.len()),
+        flags,
         population.as_ref(),
         prefix,
     );
@@ -1558,16 +1556,11 @@ fn finish_working(
         diagnostics = by_seed
             .into_iter()
             .enumerate()
-            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed)))
+            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed, &seeds[seed])))
             .collect();
     }
     // The fits' signals already carry the plane's aperture correction (F-5: measured after the duplicate drop, inside
     // the fit call), so the totals read the corrected flux. The frame statistic reads population (a) alone.
-    for d in &mut diagnostics {
-        if let Some(s) = seeds.get(d.seed) {
-            (d.x, d.y) = (s.x, s.y);
-        }
-    }
     let frame = match &population {
         None => FrameAggregates::of_timed(&outcome.fits, Some(&sub)),
         Some(_) => {
@@ -1819,17 +1812,11 @@ fn measure_budget(
         by_seed
             .into_iter()
             .enumerate()
-            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed)))
+            .map(|(seed, d)| d.unwrap_or_else(|| not_selected_record(seed, &seeds[seed])))
             .collect()
     } else {
         Vec::new()
     };
-    let mut diagnostics = diagnostics;
-    for d in &mut diagnostics {
-        if let Some(s) = seeds.get(d.seed) {
-            (d.x, d.y) = (s.x, s.y);
-        }
-    }
     let frame = FrameAggregates::of_timed(&stars, Some(&steps));
     let snr_missing = stars.iter().filter(|f| f.snr.is_nan()).count();
     let ring_sky_missing = stars.iter().filter(|f| f.sky_ring_n == 0).count();
@@ -1893,11 +1880,11 @@ fn measure_budget(
 }
 
 /// A seed the budget never fitted: the "not reached" values of [`FitDiagnostics`].
-fn not_selected_record(seed: usize) -> FitDiagnostics {
+fn not_selected_record(seed: usize, at: &Seed) -> FitDiagnostics {
     FitDiagnostics {
         seed,
-        x: f64::NAN,
-        y: f64::NAN,
+        x: at.x,
+        y: at.y,
         outcome: Outcome::NotSelected,
         region_radius: 0,
         background_start: f64::NAN,
@@ -2567,6 +2554,36 @@ mod tests {
         assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
     }
 
+    /// Run `f`, returning its result and every WARN event as its `name=value` fields.
+    fn warn_log<T>(f: impl FnOnce() -> T) -> (T, Vec<Vec<(String, String)>>) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+        struct Count(Arc<Mutex<Vec<Vec<(String, String)>>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                if *e.metadata().level() == tracing::Level::WARN {
+                    let mut v = Fields(Vec::new());
+                    e.record(&mut v);
+                    self.0.lock().unwrap().push(v.0);
+                }
+            }
+        }
+        let n = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry().with(Count(n.clone()));
+        let out = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let log = n.lock().unwrap().clone();
+        (out, log)
+    }
+
     /// C3 r3 (R-PC-8): the P3 test on GIVEN seeds. The matched filter's seeds and flags are handed in as
     /// `SeedSpec::Given` + `given_extended`: the blob is fitted and flagged, not a qualifier, out of the statistic, as with
     /// the module's own seeds. Without the flags the same seeds make the blob a 31st qualifier (the premise, RED before
@@ -2611,11 +2628,12 @@ mod tests {
                 None,
             )
         };
-        let (flagged, bare, short) = (
-            given(flags.clone()),
-            given(Vec::new()),
-            given(vec![true; 3]),
-        );
+        let (flagged, bare) = (given(flags.clone()), given(Vec::new()));
+        let (short, log) = warn_log(|| given(vec![true; 3]));
+        assert_eq!(log.len(), 1, "one mismatch warn per plane: {log:?}");
+        let field = |k: &str| log[0].iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(field("count"), Some(own.detected.len().to_string()));
+        assert_eq!(field("given_flags").as_deref(), Some("3"));
         assert_eq!(bare.aperture_stars, 31, "premise: unflagged, the blob qualifies");
         assert_eq!(short.aperture_stars, 31, "a length mismatch reads all false");
         assert_eq!(flagged.aperture_stars, 30, "the flagged blob is not a qualifier");
@@ -4456,6 +4474,28 @@ mod tests {
                 threshold: seeds::DEFAULT_THRESHOLD,
             },
             ..Default::default()
+        }
+    }
+
+    /// C5 r2 m5: under `Mode::Budget` the records are re-indexed to the detected seeds, and each keeps the position of
+    /// the seed it names (the position is set where the record is made, not patched after the remap).
+    #[test]
+    fn budget_records_carry_the_position_of_their_seed() {
+        let stars = uniform(800, 1024, 1024, 11);
+        let data = noisy_field(&stars, 11);
+        let opts = MeasureOptions {
+            diagnostics: true,
+            ..budget_opts(500)
+        };
+        let m = measure_plane(&data, 1024, 1024, &opts, None);
+        assert_eq!(m.diagnostics.len(), m.detected.len());
+        assert!(
+            m.diagnostics.iter().any(|d| d.outcome == Outcome::NotSelected),
+            "premise: the budget leaves seeds unselected"
+        );
+        for (i, d) in m.diagnostics.iter().enumerate() {
+            assert_eq!(d.seed, i);
+            assert_eq!((d.x, d.y), (m.detected[d.seed].x, m.detected[d.seed].y), "record {i}");
         }
     }
 

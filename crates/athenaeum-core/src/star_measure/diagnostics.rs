@@ -116,8 +116,10 @@ pub struct FitDiagnostics {
     /// The seed's index in the seed list the fitter was handed (the probe's seed line `i`).
     pub seed: usize,
     /// The seed's position in the plane's native pixels (the handed seed list's `x`, `y`): `seed` is an index into a list
-    /// the caller may not hold (the CFA path hands its own), so the lab matches refusals by position.
+    /// the caller may not hold (the CFA path hands its own), so the lab matches refusals by position. Set where the
+    /// record is made, so every fit-function caller sees it; NaN only on a `NotSelected` record of no list.
     pub x: f64,
+    /// See [`FitDiagnostics::x`].
     pub y: f64,
     pub outcome: Outcome,
     /// The sampling region's radius, px (the square is `(2r+1)²`).

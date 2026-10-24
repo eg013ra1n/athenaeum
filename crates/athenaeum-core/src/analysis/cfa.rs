@@ -2,9 +2,9 @@
 //!
 //! A Bayer mosaic is measured on its green sites. Detection runs on the 2x2 sum of the two green sites of each block
 //! (G1 + G2, ruling R-PC-3: the fit reads green only, so R / B sky, chromatic focus and R / B hot pixels cannot move a
-//! seed; the sum's noise is white); the seeds the matched filter flagged extended are dropped (as the mono path keeps
-//! knots out of the statistic) and the rest are mapped to native pixels; the fit runs on the native mosaic with the
-//! green-site mask; the plane's sky and noise are read from one green phase. `c` = 1 here (no qualifier, the B4 carry):
+//! seed; the sum's noise is white); every seed is mapped to native pixels, and those the matched filter flagged
+//! extended (knots, R-PC-8) are handed to the fit flagged: fitted, and kept out of the frame statistic as on the mono
+//! path; the fit runs on the native mosaic with the green-site mask; the plane's sky and noise are read from one green phase. `c` = 1 here (no qualifier, the B4 carry):
 //! Analysis star fluxes on an OSC frame are uncorrected, a recorded limit.
 //!
 //! Positions are in FILE row order (the pattern addresses that order, see `input::RawPlanes`): the caller flips them
@@ -183,8 +183,7 @@ pub fn measure_green_sites(
         sky: Some(sky),
         given_extended,
     };
-    let pm = star_measure::measure_plane(mosaic, w, h, &opts, pool);
-    pm
+    star_measure::measure_plane(mosaic, w, h, &opts, pool)
 }
 
 #[cfg(test)]
