@@ -21,7 +21,7 @@ build/rebuild whatever the export-readiness gate found missing, including the
 pre-calibration master a missing flat master's rebuild reads, dependency
 order bias/darkflat → dark → flat, so a run never blocks on a master it can
 build itself) → `Calibrate` (reuses the calibrated-lights export engine
-verbatim) → `Measure` (the shared `star_measure` path, `MEASURE_VERSION` 5,
+verbatim) → `Measure` (the shared `star_measure` path, `MEASURE_VERSION` 6,
 the aperture correction `c` kept per plane — see "One star-measurement
 path, Plan A" and R-OSP-16) → `Reference` (one frame for the whole set — highest
 weight, or the user's pinned choice via `set_frame_set_reference`; this
@@ -3739,7 +3739,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     has some present cell, a mask that thins the windows. The R/B-site CFA mask (no median cell at all) is NOT silent: it falls
     back to the first pass on d with one warn, and `at_floor` still fires on d. No production caller sets a mask today. Callers
     of given seeds (`field_width_of`: Peak / Structure seeds, LN refits, Plan C sites) carry `fieldWidthAtFloor` WITHOUT a
-    warn - the warn lives only in the detection path. Owner of the limits: Plan C's per-site table.
+    warn - the warn lives only in the detection path. Owner of the limits: Plan C's per-site table (R-OSP-17).
     *Three recorded limits, with owners.* (a) Events inside a broad star's fit window: lab L3 completeness deficits against the
     twin (`spikes/a` -1.54, `b` -5.88, `c0000` -1.49, `c0010` -4.17 pp), identical under `off` (the bar is pass1 >= off; about
     one star: centreMoved / donut) - owner: a later fit-robustness cycle. (b) Half-sample-mode fragility on trail, flat-top
@@ -4239,6 +4239,125 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - The ERP refresh for Task 14b's 15 new units.
     - F1's over-read and the nebula-sky LN pairs go to Plan B; the Analysis switch (`analysis-mode`, 0.500 s per m42
       frame) goes to Plan C.
+- **R-OSP-17 - Plan C: the Analysis tab on the one star path, `MEASURE_VERSION` 6 (Tasks C0-C10; branch `plan-c` from `main` 4255a3f5,
+  plan `docs/superpowers/plans/2026-10-24-one-star-path-plan-c.md`, ledger `.superpowers/sdd/2026-10-24-plan-c/progress.md`, rulings
+  `.superpowers/sdd/2026-10-24-plan-c/rulings.md`; spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md` §4; lab
+  `star-lab/results/plan-c/`).** The Analysis tab, Blink's star overlay and the plate-solve input gate read the stacking Measure's
+  `star_measure` module instead of the legacy `ImageAnalyzer`; the rustafits analyzer stays in rustafits, unused by the app (owner
+  2026-10-24, option A; its switch is the owner's rustafits track). Plan C is the Analysis switch only; Plan B's `c` items and the rest go to
+  Plan D (`docs/superpowers/open-items.md`). Code: C1 6f0dcc8d / e93c7e92 (`star_measure` seams), C2 0043b7b2 / a1b79699 (raw input),
+  C3 65ad923d / 3d756181 (the CFA green-site path), C4 3d8a745f (trail R²), C5 d66f7f88 / 056c2772 / 6ee0d9f5 (the analyzer switch, the config,
+  the probe arms), BUMP (rustafits 1.6) 08446186 / 2764e12b, C6 595ef880 / eaa1d88a / ec928042 / 127226cb (persistence, compatibility, gate trust,
+  frame meta), C7 62e24c48 / 365cc9f9 (the gate), C8 4497f5d5 / 0c59fad1 (frontend), C9 0b3a281b / 0872d6e5 / d811c054 / 16c0a2ec / 41ca7bad (app look fixes, Blend), rustafits #7 follow-up 47c33f73.
+  *Planned rulings PC-1 … PC-15 (one line each; evidence: the plan and the task reports under the ledger folder).*
+  - PC-1 `MEASURE_VERSION` stays 5 unless a stacking-path number moves - **SUPERSEDED by R-PC-10**: the Blend refusal moves what a fit
+    accepts, so 5 → 6 (Plan C's one bump, R-OSP-1's policy; `AnalysisConfig::config_hash` folds it; Analysis rows store the version that
+    measured them). Evidence: R-PC-10, `c9-report.md`.
+  - PC-2 raw input scales: an integer FITS takes its full scale from BITPIX/BZERO, XISF UInt16 / Float32 take 65535, a float FITS with
+    maximum ≤ 1 is ×65535, `clip` = DATAMAX else the full scale, gain = EGAIN else none (the SNR omits its shot term, stated). Amended by
+    R-PC-2. Evidence: `task-C2-report-r1.md`.
+  - PC-3 BITPIX 16 / BZERO 0 is read signed; a file with > 1 % negatives is reported, never guessed. Amended by R-PC-1 / R-PC-1a. Evidence:
+    C0 census (`star-lab/results/plan-c/before/census.tsv`).
+  - PC-4 a Bayer mosaic is measured on its green sites: detection on a 2×2 super-pixel sum, seeds mapped to native pixels (offset 0.5, pinned
+    at seed level), fit on the native mosaic with the green-site mask, sky and noise from one green phase, `c` = 1 (Analysis star fluxes on
+    OSC are uncorrected, a recorded limit). Detection source amended by R-PC-3. Evidence: `task-C3-report-r1.md`, `task-C3-review-r1.md`.
+  - PC-5 a debayered 3-plane file is measured on its G plane (`colour: true`, `PixelNoise::Mixed`, `cfa_site_share: Some(0.5)`); R-OSP-15's
+    silent limit 1 (no field-width median on a debayered plane) stays recorded. Evidence: `analysis/analyzer.rs`.
+  - PC-6 a frame the module judges trailed or defocused has no measured star; `possibly_trailed` = the trailed verdict; trail R² = the Rayleigh
+    R² over the measured stars' canonical θ, stored for compatibility. Evidence: `task-C4-report-r1.md`.
+  - PC-7 a frame with no fit in its statistic writes 0.0 for `median_fwhm` / `median_eccentricity` / `median_snr` / `median_hfr`. Evidence:
+    `analysis::analyzer::map_measurement`.
+  - PC-8 `star_metrics.snr` / `hfr` are nullable; a NaN is stored NULL (`Option<f64>`). Evidence: `task-C6-report-r1.md`.
+  - PC-9 `median_beta` is NULL under Moffat 4 and the fitted β under Auto when its source is `Fitted`. Evidence: `analysis/analyzer.rs`.
+  - PC-10 Settings → Analysis keeps `detection_threshold` (σ, default 6.0, range 2-20), `psf_model` (`moffat4` default, `auto`), `max_stars`
+    (default 500; `measure_cap` folds in) and `batch_concurrency`; the detection sigma, star-area, saturation fraction, MRS layers, PSF-fit knobs
+    and Trail Threshold settings are removed. Evidence: `task-C5-report-r1.md` (the config), `task-C8-report-r1.md` (the panel).
+  - PC-11 `frame_snr` is background / noise, a ratio: no "dB" label anywhere, the per-filter stacked value is √Σ frame_snr². Evidence:
+    `task-C8-review-r1.md` (I1, I2).
+  - PC-12 the gate's ecc AND R² pair stays only if C7 measures it refusing a hopeless frame the verdict lets through without refusing a
+    solvable one. **Ruled REMOVE** (C7D): no pair on 95 frames; the gate is the verdict alone; the two settings and the stale-default
+    migration go. Evidence: lab `star-lab/results/plan-c/c7/verdict.txt`, `task-C7D-report-r1.md`.
+  - PC-13 the frame verdict is stored (`frame_analysis.frame_verdict`: `trailed` / `defocused` / `no_stars` / NULL); the input gate refuses
+    a current row whose verdict is `trailed` on that alone; `defocused` and `no_stars` never refuse. Evidence: `task-C6-report-r1.md`,
+    `plate_solve/service.rs::input_gate_reason`.
+  - PC-14 every frame's solve wall time and outcome recorded in C7; the hopeless frames the gate still lets through are listed with their
+    numbers and go to Plan D, no rule invented (see "C7" below). Evidence: lab `star-lab/results/plan-c/c7/gate-frames.tsv`.
+  - PC-15 the Verdict column replaces Trail R² (Analysis table, Blink frame panel, Black Hole section, CSV; the R² chart metric goes) and
+    "Reject trailed" becomes "Reject unusable frames" (any verdict, or a legacy row by its old `possibly_trailed` until re-measured); the
+    stored threshold key `trail` keeps its name. Evidence: `task-C8-report-r1.md`, `task-C8-report-r2.md`.
+  *Rulings made during execution, R-PC-1 … R-PC-11.*
+  - R-PC-1 (owner, «Сдвиг +32768», amends PC-3): BITPIX 16 / BZERO 0 with > 1 % of the finite stored values negative is read as BZERO 32768
+    with one `warn!` per file naming the path; otherwise signed. The corpus's only such file is `singles/_DSC5767.fit` (99.8 % negative).
+    **R-PC-1a** (after rustafits 1.6): the rule lives in the 1.6 reader; a standard signed file has its negatives clamped to 0, Analysis logs
+    one `warn!` when the read plane's maximum exceeds 32767. Evidence: C0 census, `task-C5-review-r1.md` (I3, M4).
+  - R-PC-2 (amends PC-2): 8-bit FITS is read in its own ADU (full scale 255); a BITPIX 32 FITS takes the float rule; DATAMAX is scaled ×65535
+    only when the plane was scaled and 0 < DATAMAX ≤ 1. Evidence: `task-C2-review-r1.md` (I1, I2, M1, M2).
+  - R-PC-3 (amends PC-4's detection source): a mosaic's seeds come from the matched filter on the sum of its TWO GREEN sites (G1 + G2), not
+    R + G + G + B; offset 0.5 and the ×2 map stay; the SNR cost (6-22 %) sits at the faint end the 500-star budget never reaches. Evidence:
+    `task-C3-review-r1.md` Q3.
+  - R-PC-4: `RawPlanes::Cfa`'s pattern carries the file's XBAYROFF / YBAYROFF folded in (mod 2). Evidence: `task-C3-review-r1.md` (I3); the
+    reader's own fold since rustafits #7 (47c33f73: the FITS fold lives in `processing::cfa`, `analysis/input.rs` folds XISF only).
+  - R-PC-5 / R-PC-8: `stars_detected` = the matched filter's point-like seeds (not flagged `extended`), one rule for every layout (3-9× the
+    legacy counts, a release note); on a mosaic the extended-flagged seeds are HANDED to the fit flagged, fitted and kept out of the frame
+    statistic, the mono path's P3 treatment. Evidence: `task-C5-review-r1.md` Q2, truth check 2.
+  - R-PC-6 / R-PC-7 (bar definitions): "injected stars above the threshold" = Fisher SNR ON THE MEASURED PLANE ≥ the threshold (CFA: the green
+    `fisher_snr` / √2); stars the injector flags `edge` are outside the completeness set. Evidence: lab `star-lab/results/plan-c/c5-r2/`.
+  - R-PC-9 (recorded limit): at native F < 3 px the mosaic's sum plane is under the width floor (1.5 super-px); the structure test drops
+    17-20 % of the seeds and takes isolated ≤ 0.90 F stars with them. **R-PC-9a (owner, «Записать как ограничение»): C5's raw-mode completeness
+    bar is a RECORDED MISS** - 6 of 10 entries short by 1-3 of 45-60 stars, all in R-PC-9's cells; 0206 / 0013 / 0004 / 0015 pass; the FWHM bar
+    passes 10 / 10; no Plan D item. Evidence: lab 8fa3ff8 `star-lab/results/plan-c/c5-r2/` (`raw-bars-misses.txt`), `task-C5L-report-r2.md`.
+  - R-PC-10 (owner at the C9 app look, «я бы сделал отказ от blend»): an otherwise-accepted fit is refused `Blend` when another seed of the
+    plane's detection lies inside the fit's half-maximum ellipse and at least 0.5 `F_field` from the fit's own seed; applied before the duplicate
+    drop in the shared fit path (every mode), declared last in `RefusalReason`; `MEASURE_VERSION` 5 → 6. Evidence: owner screenshot (two stars,
+    one elongated ellipse); lab `doubles/f4.0` FWHM 4.457 vs truth 4.062; 16c0a2ec / 41ca7bad, `task-C9B-review-r1.md`.
+    **R-PC-10a (owner, «Оставляем Blend как есть, близкие неразделённые пары - в Plan D»):** ships as built; it refuses resolved pairs (both
+    seeded, ~1.7 F); close pairs whose companion is no seed (95 of 132 on `doubles/f4.0`, FWHM bias +7…+14 % at 0.5-1.25 F) are a recorded
+    limit for Plan D (a second-peak test in the fit residual). Evidence: lab 425db82 `star-lab/results/plan-c/c9b/`, `task-C9BL-report-r1.md`.
+  - R-PC-11 (controller 2026-10-25, amends C10 Step 1's identity bar): C10 runs on the dev Mac (owner 2026-10-24); R-PC-10 moved the stacking
+    path, so "moved 0, max |Δ| 0 vs b6-final" is void. The bars: (a) the full cycle at the plan-c head, `--prev t14-final`, every truth bar of
+    `planb_b6.py` PASS, every moved scorecard row in a family whose frames carry ≥ 1 `Blend` refusal (a move without one = STOP); (b) LN at
+    master level on hc11 / runB / s204 against the B6 clones, the b3 compare bars, measure-equal REPORTED (Blend refusals per group), never a
+    STOP; (c) gates 13 / 13 on the s204 c10 clone; (d) raw-mode bars at v6, no entry below its C5L r2 count except by a `Blend` refusal.
+    Evidence: `rulings.md` R-PC-11; the B4 comparator clones were deleted 2026-10-25 (owner), B6's stand in.
+  *`fieldWidthAtFloor` per site (R-OSP-15's per-site table; code read at the plan-c head).* `FieldWidth::at_floor()` is read by two things only:
+  the detection warn (`star_measure/seeds.rs`, "field width at the clamp floor") and the stacking channel flag
+  (`stacking/measure.rs`, `field_width_at_floor: m.field_width.at_floor()`); no Analysis consumer reads it (`ChannelMeasurement::at_floor` is a
+  different notion: `c` not measured).
+
+  | call site | field width from | warn | flag |
+  | ---- | ---- | ---- | ---- |
+  | stacking Measure, every detected plane (`seeds::detect` via `detect_on`) | the matched filter's own half-sample mode | one per plane | `channel.fieldWidthAtFloor` |
+  | Analysis mono plane (`measure_plane`, `SeedSpec::MatchedFilter`, White) | the same detection path | one per plane | none read |
+  | Analysis debayered G plane (Mixed noise) | the same path, no median (silent limit 1, PC-5) | only when the pool itself lands under the floor | none read |
+  | Analysis CFA path (`analysis/cfa.rs`, `seeds::detect` on the G1 + G2 sum) | the detection, in SUPER-PIXEL units | yes, in super-pixel units | no: the native fit is handed `2 × fwhm_px`, which cannot read under 1.607, so the handed width carries no flag (C3-review Q2 / M1; mapping the floor to native units would shrink the fit box, a flag field would move the stored `PlanePrep` bytes) |
+  | given seeds without a width (`measure_plane` `SeedSpec::Given` / `None` through `seeds::field_width_of`; LN refits via `fit_stars_at`; Peak / Structure seeds) | `field_width_of`, the same rule on the given seeds | no (the warn lives only in the detection path) | carried by a caller that reads it, without a warn |
+
+  *C3-review notes (`task-C3-review-r1.md`), all recorded, none a code change.* **M2** the ×2 width of the CFA path reads wide because of the
+  2×2 box blur (a Gaussian estimate √(F² + 8 ln2/3): +6 % at F 4, +10 % at F 3); it is read only by the box radius ⌈2F⌉, the start width of an
+  unreadable star and the merged-pair bar 1.3 F, all tolerant - recorded, no fix. **M3** `c` is None on a mosaic by construction (a
+  qualifier needs no absent pixel within 5F, which a checkerboard mask never allows), so `photometry.rs` raises its one `warn!` per OSC plane on
+  every Analysis frame - expected, not a fault. **M7** the noise from one green phase leaves out the G1 / G2 sky imbalance (the fit's single
+  background sees a checkerboard of two green skies) and on the phase the noise mesh spans 256 native px; only `sigma` feeds the fit (saturation,
+  the SNR) - raw-corpus limits; `green_sum` reads `BayerPattern::None` as the GRBG phase without the warn `green_mask` gives. (I1 knots → R-PC-8,
+  I2 → `native_seed` pinned at seed level, I3 → R-PC-4, all folded by `3d756181`.)
+  *C7 (plate-solve gate; lab 28130b2).* 95 frames (trails 7, m101 30, singles 38, the first 20 of m42), one frame per batch: 86 solvable, 9 hopeless;
+  4 of the 9 carry `frame_verdict = trailed` and fail in 0.8-1.3 s on the solver's own refusal; STOP check passed (no solvable frame carries the
+  verdict). No (ecc, R²) pair refuses a candidate without refusing a solvable frame (`ldn621`, ecc 0.883 / R² 0.865, solves) → REMOVE. Let
+  through, 455 s of solve wall (Plan D, PC-14): M101 `…_020058_0002` (89.1 s, ecc 0.767), `…_020531_0004` (86.0 s, 0.798), `…_021623_0009`
+  (80.1 s, 0.384), `_VSH8902.xisf` (122.8 s; no Analysis row, no IMAGETYP), H 0029 (77.0 s, tracking jumps, point-like fake stars).
+  *Lab lines.* C0 before (lab 73cdce2; athenaeum 78e37a87): 152 files, the BITPIX census, 147 images × 2 arms read (5 XISF the probe could not read
+  then); C5L (lab b69a28a / 4ce220f, r2 8fa3ff8): raw-mode bars, r1 MISS, r2 MISS 6/10 by 1-3 stars (R-PC-9a), FWHM bar 10/10; C7D (lab 28130b2): the
+  gate data above; C9L (lab c54afc9, athenaeum 0c59fad1): `PLANC CORPUS: PASS` - 152 images × 2 arms, 304 / 304 read, FWHM new / legacy 0.996
+  (m101), 1.019 (m42), 1.006 (singles), 0.999 (trails), ecc ratios 1.019-1.099, 27 outliers each explained, legacy drift only `_DSC5767.fit` (the
+  XBAYROFF fold); C9BL (lab 425db82): Blend - synthetic judgement STOP (4.356 → 4.353 vs truth 4.062), corpus PASS (ratios 1.000, no verdict
+  change, Blend ≤ 3 % of fits), isolated families identical.
+  *Cost (C9).* `PLANC COST: MET` - m42 measure median 0.387 s per frame (p90 0.409) against the 0.6 s bar; OSC singles 0.279 s; Blink m42 call
+  0.404 s (measure 0.387 + read / persist 0.018, warm cache); after Blend (C9BL) 0.385 s. Dev profile: rustafits at opt-level 2 (d811c054) took the
+  dev Analysis from 6.82 to 0.36 s per 3124×2088 frame.
+  *The app (C9).* Owner, `npm run tauri dev` on the dev catalog: «в целом все устраивает»; startup rebuilt `star_metrics` (510 501 stars, 2.25 s, no
+  orphans); keep BOTH the Verdict and Refused columns; Blink ellipses sized by brightness (0b3a281b); the settings reset button beside its label
+  (0872d6e5).
+  - C10 runs: (filled after the runs)
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
