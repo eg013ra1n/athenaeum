@@ -1,7 +1,6 @@
 .git/
 .github/
 .claude/
-.continue/
 .vscode/
 node_modules/
 dist/

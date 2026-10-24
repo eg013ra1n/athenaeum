@@ -6,7 +6,7 @@
 Three defences, added 2026-09-05 after wind-shaken frames were found being
 "solved" at 16-193x their true pixel scale and written into the catalog
 (measured on the owner's real files; spec-less, the reasoning lives in the
-commits and in `docs/backlog-v0.5.5.md` item 5).
+commits and in this file).
 
 - **Shape reaches the fast path** (`rustafits`): `detect_fast` used to build
   every `FastStar` with `eccentricity: 0.0` — shape was computed only by the

@@ -16,17 +16,6 @@ Code map:
 | Axum mirror | `crates/athenaeum-web/src/routes/frame_sets.rs`, registered in `build_router` |
 | Frontend | `src/pages/Objects.tsx` (set list, route `/objects`), `src/pages/FrameSetDetail.tsx` (route `objects/:id`), `src/pages/ExcludedFrames.tsx` (route `/excluded`), `src/components/SelectionDialog.tsx`, `src/components/FrameSetHistoryTab.tsx` |
 
-## Documentation Structure
-
-The four pages below are the original 2025-01 write-up of this subsystem. They have not been re-reviewed against the code in the 2026-10-24 pass that rewrote this page, so where one disagrees with this page or the code, this page and the code win.
-
-- [architecture.md](./architecture.md) - database schema and structural design.
-- [algorithms.md](./algorithms.md) - merge, split, metadata and session-detection algorithms.
-- [commands.md](./commands.md) - API reference for the frame-set commands.
-- [edge_cases.md](./edge_cases.md) - edge cases and boundary conditions.
-
----
-
 ## Quick Start
 
 The frontend never imports Tauri directly; every call goes through `api.invoke` (`src/api/`). Argument casing follows the command: most take camelCase keys (`framesSetId`, `sourceId`); `create_frame_set_from_selection` is declared `rename_all = "snake_case"` and takes `frame_ids`.
