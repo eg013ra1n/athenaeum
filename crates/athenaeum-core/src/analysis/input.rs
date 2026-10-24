@@ -23,7 +23,10 @@ const UNIT_SCALE: f32 = 65535.0;
 /// Share of negative stored values above which a BITPIX 16 / BZERO 0 file is read with the 32768 offset (R-PC-1).
 const OFFSET_NEGATIVE_SHARE: f64 = 0.01;
 
-/// The pixel planes of a raw frame, in the file's ADU.
+/// The pixel planes of a raw frame, in the file's ADU, in FILE row order: `flip_vertical` is NOT applied. The reader
+/// never adjusts `bayer_pattern` for ROWORDER or a flip (fits.rs / xisf.rs pass the BAYERPAT / XISF pattern through
+/// unchanged), so a CFA `pattern` addresses the file's row order; a consumer that flips an even-height mosaic must
+/// swap the pattern itself (RGGB becomes GBRG).
 #[derive(Debug, Clone)]
 pub enum RawPlanes {
     Mono(Vec<f32>),
@@ -43,6 +46,7 @@ pub struct RawFrame {
     pub w: usize,
     pub h: usize,
     pub domain: Domain,
+    /// The file is bottom-up (no `ROWORDER = TOP-DOWN`); the planes are still in file row order.
     pub flip_vertical: bool,
     pub channels: usize,
 }
@@ -102,8 +106,8 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
     let (w, h, channels) = (meta.width, meta.height, meta.channels);
     let n = w * h * channels;
 
-    // (samples, full scale, factor applied to float samples (for DATAMAX), in plane units)
-    let (mut samples, full_scale, datamax_factor): (Vec<f32>, f64, f64) = match pixels {
+    // (samples, full scale, whether the plane was scaled by 65535 from a unit range)
+    let (mut samples, full_scale, scaled): (Vec<f32>, f64, bool) = match pixels {
         PixelData::Uint16(v) => {
             if v.len() != n {
                 bail!(
@@ -113,14 +117,19 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
                 );
             }
             match (facts.bitpix, facts.bzero == 0.0 && facts.bscale == 1.0) {
-                (Some(16), true) => read_bitpix16_bzero0(path, &v),
-                // The reader scales 8-bit samples by 256 into the u16 plane.
+                (Some(16), true) => {
+                    let (s, full) = read_bitpix16_bzero0(path, &v);
+                    (s, full, false)
+                }
+                // The reader scales 8-bit samples by 256 into the u16 plane: undo it, the plane is in file ADU (R-PC-2).
                 (Some(8), _) => (
-                    v.iter().map(|&x| f32::from(x)).collect(),
-                    255.0 * 256.0,
-                    1.0,
+                    v.iter().map(|&x| f32::from(x) / 256.0).collect(),
+                    255.0,
+                    false,
                 ),
-                _ => (v.iter().map(|&x| f32::from(x)).collect(), 65535.0, 1.0),
+                // BITPIX 16 with BSCALE != 1 or BZERO not in {0, 32768} arrives clamped to [0, 65535] by the reader:
+                // negatives are lost and the 1 % rule cannot run.
+                _ => (v.iter().map(|&x| f32::from(x)).collect(), 65535.0, false),
             }
         }
         PixelData::Float32(mut v) => {
@@ -131,46 +140,36 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
                     v.len()
                 );
             }
+            let max = v
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
             if xisf {
-                // The reader's contract: Float32 XISF is already x65535.
-                (v, 65535.0, 1.0)
+                // The reader's contract: Float32 XISF is already x65535 (UInt8 is x257 and UInt32 is >> 16 by the
+                // reader, so a DATAMAX in file units is off by that factor for them; only the samples are rescaled).
+                (v, finite_max_full_scale(path, max), true)
             } else if facts.bitpix == Some(32) {
-                let full = if facts.bzero == 2_147_483_648.0 {
-                    4_294_967_295.0
-                } else {
-                    2_147_483_647.0
-                };
-                (v, full, 1.0)
-            } else {
-                let max = v
-                    .iter()
-                    .copied()
-                    .filter(|x| x.is_finite())
-                    .fold(f32::NEG_INFINITY, f32::max);
-                if max <= 1.0 {
-                    for x in v.iter_mut() {
-                        *x *= UNIT_SCALE;
-                    }
-                    (v, 65535.0, f64::from(UNIT_SCALE))
-                } else if f64::from(max) > 65535.0 {
-                    tracing::warn!(path = %path.display(), finite_max = f64::from(max), "float file above 65535 ADU, full scale follows its maximum");
-                    let full = f64::from(max);
-                    (v, full, 1.0)
-                } else {
-                    (v, 65535.0, 1.0)
+                // Integer FITS wider than 16 bits takes the float rule without the unit range (R-PC-2).
+                (v, finite_max_full_scale(path, max), false)
+            } else if max <= 1.0 {
+                for x in v.iter_mut() {
+                    *x *= UNIT_SCALE;
                 }
+                (v, 65535.0, true)
+            } else {
+                (v, finite_max_full_scale(path, max), false)
             }
         }
     };
-    // An XISF Float32 file in unit range states DATAMAX in the same unit.
-    let datamax_factor = if xisf && facts.datamax.is_some_and(|d| d > 0.0 && d <= 1.0) {
-        f64::from(UNIT_SCALE)
-    } else {
-        datamax_factor
-    };
 
+    // DATAMAX is in the unit of the file: x65535 only when the plane was scaled from a unit range and DATAMAX is one.
+    let factor = match facts.datamax {
+        Some(d) if scaled && d > 0.0 && d <= 1.0 => f64::from(UNIT_SCALE),
+        _ => 1.0,
+    };
     let clip = match facts.datamax {
-        Some(d) if d.is_finite() && d > 0.0 => d * datamax_factor,
+        Some(d) if d.is_finite() && d > 0.0 => (d * factor).min(full_scale),
         _ => full_scale,
     };
     let gain_e_per_adu = facts.egain.filter(|g| g.is_finite() && *g > 0.0);
@@ -206,9 +205,19 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
     })
 }
 
+/// Full scale of a float-valued plane: 65535 when its finite maximum fits, else that maximum with one `warn!`.
+fn finite_max_full_scale(path: &Path, max: f32) -> f64 {
+    if f64::from(max) > 65535.0 {
+        tracing::warn!(path = %path.display(), finite_max = f64::from(max), "float file above 65535 ADU, full scale follows its maximum");
+        f64::from(max)
+    } else {
+        65535.0
+    }
+}
+
 /// BITPIX 16 / BZERO 0: the `u16` is the stored bit pattern. Signed (full scale 32767) unless more than 1 % of the
 /// values are negative, then stored + 32768 (full scale 65535), one `warn!` per file (R-PC-1).
-fn read_bitpix16_bzero0(path: &Path, bits: &[u16]) -> (Vec<f32>, f64, f64) {
+fn read_bitpix16_bzero0(path: &Path, bits: &[u16]) -> (Vec<f32>, f64) {
     let negative = bits.iter().filter(|&&b| (b as i16) < 0).count();
     let share = if bits.is_empty() {
         0.0
@@ -222,14 +231,9 @@ fn read_bitpix16_bzero0(path: &Path, bits: &[u16]) -> (Vec<f32>, f64, f64) {
                 .map(|&b| f32::from(b as i16) + 32768.0)
                 .collect(),
             65535.0,
-            1.0,
         )
     } else {
-        (
-            bits.iter().map(|&b| f32::from(b as i16)).collect(),
-            32767.0,
-            1.0,
-        )
+        (bits.iter().map(|&b| f32::from(b as i16)).collect(), 32767.0)
     }
 }
 
@@ -237,12 +241,19 @@ fn read_bitpix16_bzero0(path: &Path, bits: &[u16]) -> (Vec<f32>, f64, f64) {
 mod tests {
     use super::*;
     use crate::fits_writer::{write_xisf_f32, Card, CardValue};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
 
-    fn warns<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        struct Count(Arc<AtomicUsize>);
+    /// Run `f`, returning its result and every WARN event as its `name=value` fields.
+    fn warn_log<T>(f: impl FnOnce() -> T) -> (T, Vec<Vec<(String, String)>>) {
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+        struct Count(Arc<Mutex<Vec<Vec<(String, String)>>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
             fn on_event(
                 &self,
@@ -250,17 +261,25 @@ mod tests {
                 _: tracing_subscriber::layer::Context<'_, S>,
             ) {
                 if *e.metadata().level() == tracing::Level::WARN {
-                    self.0.fetch_add(1, Ordering::SeqCst);
+                    let mut v = Fields(Vec::new());
+                    e.record(&mut v);
+                    self.0.lock().unwrap().push(v.0);
                 }
             }
         }
-        let n = Arc::new(AtomicUsize::new(0));
+        let n = Arc::new(Mutex::new(Vec::new()));
         let sub = tracing_subscriber::registry().with(Count(n.clone()));
         let out = tracing::subscriber::with_default(sub, || {
             tracing::callsite::rebuild_interest_cache();
             f()
         });
-        (out, n.load(Ordering::SeqCst))
+        let log = n.lock().unwrap().clone();
+        (out, log)
+    }
+
+    fn warns<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let (out, log) = warn_log(f);
+        (out, log.len())
     }
 
     fn card(key: &str, val: &str) -> String {
@@ -354,8 +373,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.fits");
         write_fits(&p, 16, &[3, 1], &[], &be16(&[-30000, 0, 32767]));
-        let (f, n) = warns(|| read_raw_frame(&p).unwrap());
-        assert_eq!(n, 1);
+        let (f, log) = warn_log(|| read_raw_frame(&p).unwrap());
+        assert_eq!(log.len(), 1);
+        let field = |k: &str| log[0].iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert!(
+            field("path").is_some_and(|v| v.contains("a.fits")),
+            "{log:?}"
+        );
+        let share: f64 = field("negative_share")
+            .expect("negative_share")
+            .parse()
+            .unwrap();
+        assert!((share - 1.0 / 3.0).abs() < 1e-9, "share {share}");
         assert_eq!(mono(&f), &[2768.0, 32768.0, 65535.0]);
         assert_eq!(raw(&f).1, 65535.0);
     }
@@ -399,11 +428,19 @@ mod tests {
             &p,
             16,
             &[2, 2],
-            &[("DATAMAX", "60000".into()), ("EGAIN", "0.8".into())],
+            &[
+                ("BZERO", "32768".into()),
+                ("DATAMAX", "60000".into()),
+                ("EGAIN", "0.8".into()),
+            ],
             &v,
         );
-        let (clip, _, gain) = raw(&read_raw_frame(&p).unwrap());
-        assert_eq!((clip, gain), (60000.0, Some(0.8)));
+        let (clip, full, gain) = raw(&read_raw_frame(&p).unwrap());
+        assert_eq!((clip, full, gain), (60000.0, 65535.0, Some(0.8)));
+        // A DATAMAX above full scale is capped at it.
+        write_fits(&p, 16, &[2, 2], &[("DATAMAX", "60000".into())], &v);
+        let (clip, full, _) = raw(&read_raw_frame(&p).unwrap());
+        assert_eq!((clip, full), (32767.0, 32767.0));
         write_fits(&p, 16, &[2, 2], &[], &v);
         let (clip, full, gain) = raw(&read_raw_frame(&p).unwrap());
         assert_eq!((clip, full, gain), (32767.0, 32767.0, None));
@@ -448,6 +485,65 @@ mod tests {
     }
 
     #[test]
+    fn an_8bit_fits_reads_in_its_own_adu() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.fits");
+        write_fits(
+            &p,
+            8,
+            &[2, 2],
+            &[("DATAMAX", "250".into())],
+            &[0, 10, 200, 255],
+        );
+        let f = read_raw_frame(&p).unwrap();
+        assert_eq!(mono(&f), &[0.0, 10.0, 200.0, 255.0]);
+        let (clip, full, _) = raw(&f);
+        assert_eq!((clip, full), (250.0, 255.0));
+    }
+
+    #[test]
+    fn bitpix32_holding_16bit_data_takes_full_scale_65535() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.fits");
+        let be32 = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_be_bytes()).collect() };
+        write_fits(&p, 32, &[2, 2], &[], &be32(&[-100, 1000, 30000, 64535]));
+        let (f, n) = warns(|| read_raw_frame(&p).unwrap());
+        assert_eq!(mono(&f), &[-100.0, 1000.0, 30000.0, 64535.0]);
+        let (clip, full, _) = raw(&f);
+        assert_eq!((clip, full, n), (65535.0, 65535.0, 0));
+        write_fits(&p, 32, &[2, 2], &[], &be32(&[-100, 1000, 30000, 70000]));
+        let (f, n) = warns(|| read_raw_frame(&p).unwrap());
+        let (clip, full, _) = raw(&f);
+        assert_eq!((clip, full, n), (70000.0, 70000.0, 1));
+    }
+
+    #[test]
+    fn datamax_scales_only_a_unit_range_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.fits");
+        // An ADU-written float file with DATAMAX 65535 is not scaled again.
+        write_fits(
+            &p,
+            -32,
+            &[2, 2],
+            &[("DATAMAX", "65535".into())],
+            &bef32(&[0.0, 10.0, 500.0, 42000.0]),
+        );
+        let (clip, full, _) = raw(&read_raw_frame(&p).unwrap());
+        assert_eq!((clip, full), (65535.0, 65535.0));
+        // A unit-range plane with an ADU DATAMAX is capped at full scale.
+        write_fits(
+            &p,
+            -32,
+            &[2, 2],
+            &[("DATAMAX", "65535".into())],
+            &bef32(&[0.0, 0.2, 0.5, 0.8]),
+        );
+        let (clip, full, _) = raw(&read_raw_frame(&p).unwrap());
+        assert_eq!((clip, full), (65535.0, 65535.0));
+    }
+
+    #[test]
     fn a_bayer_frame_reads_as_cfa_with_its_layout() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.fits");
@@ -460,10 +556,11 @@ mod tests {
         );
         let f = read_raw_frame(&p).unwrap();
         assert_eq!(f.channels, 1);
+        assert!(f.flip_vertical, "no ROWORDER means bottom-up");
         match &f.planes {
             RawPlanes::Cfa { mosaic, pattern } => {
                 assert_eq!(*pattern, BayerPattern::Rggb);
-                assert_eq!(mosaic.len(), 8);
+                assert_eq!(mosaic, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
             }
             other => panic!("expected Cfa, got {other:?}"),
         }
