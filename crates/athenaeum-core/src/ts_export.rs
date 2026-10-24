@@ -140,6 +140,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::ExcludedFrameEntry,
             crate::models::ExcludedFrameRow,
             crate::models::FrameAnalysis,
+            crate::models::FrameVerdict,
             crate::models::CalibrationMetadataEdits,
             crate::models::StarMetric,
             crate::models::StarMetricsResponse,

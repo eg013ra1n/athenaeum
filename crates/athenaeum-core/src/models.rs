@@ -1059,6 +1059,49 @@ pub struct FrameAnalysis {
     pub quality_score: Option<f64>,
     pub config_hash: Option<String>,
     pub analyzed_at: String,
+    /// The star-measurement version that wrote the row (`star_measure::MEASURE_VERSION`); `None` = a legacy row.
+    #[serde(default)]
+    pub measure_version: Option<u32>,
+    /// Candidates the measurement refused: the sum of the refusal counts (the budget's not-selected / trimmed excluded).
+    /// `None` = a legacy row.
+    #[serde(default)]
+    pub stars_refused: Option<i64>,
+    /// Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
+    #[serde(default)]
+    pub frame_verdict: Option<FrameVerdict>,
+}
+
+/// The frame-level verdict of the star measurement (PC-13), stored as its snake_case text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameVerdict {
+    /// The module judged the stars trails.
+    Trailed,
+    /// The module judged the stars defocused (donuts).
+    Defocused,
+    /// Neither, and no fit in the frame statistic: clouds, an empty or a fully saturated frame.
+    NoStars,
+}
+
+impl FrameVerdict {
+    /// The stored text (`frame_analysis.frame_verdict`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameVerdict::Trailed => "trailed",
+            FrameVerdict::Defocused => "defocused",
+            FrameVerdict::NoStars => "no_stars",
+        }
+    }
+
+    /// Parse the stored text; `None` for an unknown one (a row written by a newer build).
+    pub fn parse(text: &str) -> Option<FrameVerdict> {
+        match text {
+            "trailed" => Some(FrameVerdict::Trailed),
+            "defocused" => Some(FrameVerdict::Defocused),
+            "no_stars" => Some(FrameVerdict::NoStars),
+            _ => None,
+        }
+    }
 }
 
 /// Individual star detection result with position, shape, and quality metrics.
@@ -1075,8 +1118,10 @@ pub struct StarMetric {
     pub fwhm_x: f64,
     pub fwhm_y: f64,
     pub eccentricity: f64,
-    pub snr: f64,
-    pub hfr: f64,
+    /// `None` = the fit's SNR was not finite (PC-8).
+    pub snr: Option<f64>,
+    /// `None` = the fit's HFR was not finite (PC-8).
+    pub hfr: Option<f64>,
     pub theta: f64,
     pub beta: Option<f64>,
     pub fit_method: String,

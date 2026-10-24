@@ -583,6 +583,9 @@ mod tests {
             quality_score: None,
             config_hash: None,
             analyzed_at: "2026-07-13T00:00:00Z".to_string(),
+            measure_version: None,
+            stars_refused: None,
+            frame_verdict: None,
         }
     }
 

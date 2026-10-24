@@ -396,11 +396,34 @@ export type ExcludedFrameEntry = { file_id: number, path: string, filename: stri
 
 export type ExcludedFrameRow = { file: File, frame: Frame, hasDuplicate: boolean, reason: string, excludedAt: string, };
 
-export type FrameAnalysis = { id: number | null, frame_id: number, file_id: number, stars_detected: number, median_fwhm: number, median_eccentricity: number, median_snr: number, median_hfr: number, frame_snr: number, snr_weight: number, psf_signal: number, background: number, noise: number, detection_threshold: number, width: number, height: number, source_channels: number, trail_r_squared: number, possibly_trailed: boolean, median_beta: number | null, quality_score: number | null, config_hash: string | null, analyzed_at: string, };
+export type FrameAnalysis = { id: number | null, frame_id: number, file_id: number, stars_detected: number, median_fwhm: number, median_eccentricity: number, median_snr: number, median_hfr: number, frame_snr: number, snr_weight: number, psf_signal: number, background: number, noise: number, detection_threshold: number, width: number, height: number, source_channels: number, trail_r_squared: number, possibly_trailed: boolean, median_beta: number | null, quality_score: number | null, config_hash: string | null, analyzed_at: string, 
+/**
+ * The star-measurement version that wrote the row (`star_measure::MEASURE_VERSION`); `None` = a legacy row.
+ */
+measure_version: number | null, 
+/**
+ * Candidates the measurement refused: the sum of the refusal counts (the budget's not-selected / trimmed excluded).
+ * `None` = a legacy row.
+ */
+stars_refused: number | null, 
+/**
+ * Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
+ */
+frame_verdict: FrameVerdict | null, };
+
+export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 
 export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
 
-export type StarMetric = { id: number | null, frame_analysis_id: number, x: number, y: number, peak: number, flux: number, fwhm: number, fwhm_x: number, fwhm_y: number, eccentricity: number, snr: number, hfr: number, theta: number, beta: number | null, fit_method: string, fit_residual: number, };
+export type StarMetric = { id: number | null, frame_analysis_id: number, x: number, y: number, peak: number, flux: number, fwhm: number, fwhm_x: number, fwhm_y: number, eccentricity: number, 
+/**
+ * `None` = the fit's SNR was not finite (PC-8).
+ */
+snr: number | null, 
+/**
+ * `None` = the fit's HFR was not finite (PC-8).
+ */
+hfr: number | null, theta: number, beta: number | null, fit_method: string, fit_residual: number, };
 
 export type StarMetricsResponse = { stars: Array<StarMetric>, metrics: FrameAnalysis, image_width: number, image_height: number, 
 /**

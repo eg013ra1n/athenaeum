@@ -3000,3 +3000,78 @@ fn col_to_string(v: rusqlite::types::ValueRef) -> Option<String> {
         ValueRef::Blob(_) => None,
     }
 }
+
+/// A one-frame package whose manifest carries `analysis` (the sender's `FrameAnalysis` summary).
+fn build_package_with_analysis(
+    root: &Path,
+    frame_uuid: &str,
+    analysis: serde_json::Value,
+) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join("src-analysis");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("A_0001.fits");
+    write_fits(&src);
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: "A_0001.fits".to_string(),
+        byte_size: std::fs::metadata(&src).unwrap().len(),
+        xxh3: package::xxh3_full_file(&src).unwrap(),
+        frame_meta: serde_json::to_value(fixture_frame(frame_uuid, "M31", "2026-01-16T10:00:00.000Z")).unwrap(),
+        analysis: Some(analysis),
+        app_version: "test".to_string(),
+        project: None,
+    };
+    let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir, announce)
+}
+
+/// Both directions of the sync package: a summary written before C6 (no `measure_version`, `stars_refused`,
+/// `frame_verdict`) ingests and reads `None`; one carrying them keeps them.
+#[test]
+fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
+    let legacy = serde_json::json!({
+        "id": null, "frame_id": 1, "file_id": 1, "stars_detected": 300, "median_fwhm": 3.0,
+        "median_eccentricity": 0.3, "median_snr": 20.0, "median_hfr": 1.8, "frame_snr": 30.0, "snr_weight": 1.0,
+        "psf_signal": 50.0, "background": 100.0, "noise": 5.0, "detection_threshold": 170.0, "width": 4, "height": 4,
+        "source_channels": 1, "trail_r_squared": 0.1, "possibly_trailed": false, "median_beta": null,
+        "quality_score": null, "config_hash": "old", "analyzed_at": "2026-01-01T00:00:00Z"
+    });
+    let mut current = legacy.clone();
+    current["measure_version"] = serde_json::json!(5);
+    current["stars_refused"] = serde_json::json!(17);
+    current["frame_verdict"] = serde_json::json!("defocused");
+    for (uuid, summary, want) in [
+        ("an-old", legacy, (None, None, None)),
+        (
+            "a-new",
+            current,
+            (Some(5u32), Some(17i64), Some(crate::models::FrameVerdict::Defocused)),
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (pkg_dir, announce) = build_package_with_analysis(tmp.path(), uuid, summary);
+        let conn = catalog_conn();
+        ingest_package(
+            IngestConn::Borrowed(&conn),
+            &tmp.path().join("incoming"),
+            &pkg_dir,
+            &announce,
+            PEER_HEX,
+            &announce.package_id.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let frame_id: i64 = conn.query_row("SELECT id FROM frames LIMIT 1", [], |r| r.get(0)).unwrap();
+        let a = crate::db::analysis::get_frame_analysis(&conn, frame_id)
+            .unwrap()
+            .expect("the analysis rode along");
+        assert_eq!((a.stars_detected, a.median_fwhm), (300, 3.0), "{uuid}");
+        assert_eq!((a.measure_version, a.stars_refused, a.frame_verdict), want, "{uuid}");
+    }
+}

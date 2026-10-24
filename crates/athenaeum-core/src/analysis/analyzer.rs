@@ -13,10 +13,10 @@ use super::cfa;
 use super::config::{AnalysisConfig, AnalysisPsfModel};
 use super::input::{read_raw_frame, RawFrame, RawPlanes};
 use super::trail::trail_r_squared;
-use crate::models::{FrameAnalysis, StarMetric};
+use crate::models::{FrameAnalysis, FrameVerdict, StarMetric};
 use crate::star_measure::{
     self, frame::finite_median, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, SeedSpec,
-    StarFit,
+    StarFit, MEASURE_VERSION,
 };
 
 /// Measure a raw frame (PC-4, PC-5): mono -> `measure_plane`; a Bayer mosaic -> [`cfa::measure_green_sites`]; a
@@ -95,8 +95,9 @@ fn point_like_seeds(pm: &PlaneMeasurement) -> i64 {
 ///
 /// Medians come from the module's frame aggregates and read 0.0 when the frame has no fit in its statistic (PC-7);
 /// `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's fitted beta under
-/// `Auto` and NULL otherwise (PC-9). `snr` / `hfr` of a star are numbers here (a NaN writes 0.0 until C6 makes them
-/// nullable).
+/// `Auto` and NULL otherwise (PC-9). A star's non-finite `snr` / `hfr` is `None` (PC-8). The row carries the
+/// measurement version, the refusal count and the frame verdict (PC-13): trailed / defocused as the module judged, else
+/// no_stars when no fit stands in the frame statistic, else none.
 pub fn map_measurement(
     pm: &PlaneMeasurement,
     frame: &RawFrame,
@@ -117,8 +118,8 @@ pub fn map_measurement(
             fwhm_x: f.fwhm_x,
             fwhm_y: f.fwhm_y,
             eccentricity: f.eccentricity(),
-            snr: finite_or_zero(f.snr),
-            hfr: finite_or_zero(f.hfr),
+            snr: f.snr.is_finite().then_some(f.snr),
+            hfr: f.hfr.is_finite().then_some(f.hfr),
             theta: f.theta,
             beta: Some(f.beta),
             fit_method: "moffat".to_string(),
@@ -149,6 +150,16 @@ pub fn map_measurement(
         _ => None,
     };
 
+    let frame_verdict = if pm.trailed {
+        Some(FrameVerdict::Trailed)
+    } else if pm.defocused {
+        Some(FrameVerdict::Defocused)
+    } else if stat.is_empty() {
+        Some(FrameVerdict::NoStars)
+    } else {
+        None
+    };
+
     let analysis = FrameAnalysis {
         id: None,
         frame_id: 0,
@@ -173,6 +184,9 @@ pub fn map_measurement(
         quality_score: None,
         config_hash: Some(config_hash.to_string()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),
+        measure_version: Some(MEASURE_VERSION),
+        stars_refused: Some(pm.refused.total() as i64),
+        frame_verdict,
     };
     (analysis, stars)
 }
@@ -418,6 +432,73 @@ mod tests {
             (0.0, 0.0, 0.0, 0.0)
         );
         assert_eq!(a.trail_r_squared, 0.0);
+    }
+
+    fn mono(p: Vec<f32>, w: usize, h: usize) -> RawFrame {
+        RawFrame {
+            planes: RawPlanes::Mono(p),
+            w,
+            h,
+            domain: RAW,
+            flip_vertical: false,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn the_analyzer_fills_measure_version_and_stars_refused() {
+        let scaled = |p: Vec<f32>| p.iter().map(|v| v * 65535.0).collect::<Vec<f32>>();
+        let noise = {
+            let mut n = vec![1000.0f32; 400 * 300];
+            add_noise(&mut n, 10.0, 3);
+            mono(n, 400, 300)
+        };
+        let trailed = mono(scaled(crate::test_support::trailed_field(600, 450, 9)), 600, 450);
+        let clean = mono_frame(120, 640, 480, 1000.0, 11);
+        for frame in [&noise, &trailed, &clean] {
+            let pm = measure_raw_frame(frame, &cfg(), None);
+            let (a, _) = map_measurement(&pm, frame, &cfg(), "h");
+            assert_eq!(a.measure_version, Some(MEASURE_VERSION));
+            // The sum of the refusal reasons; the budget's not-selected / trimmed are not in it.
+            assert_eq!(a.stars_refused, Some(pm.refused.by_reason.values().sum::<usize>() as i64));
+        }
+        let pm = measure_raw_frame(&trailed, &cfg(), None);
+        let (a, _) = map_measurement(&pm, &trailed, &cfg(), "h");
+        assert!(a.stars_refused.unwrap() > 0, "a trailed frame's fits are refused: {:?}", a.stars_refused);
+    }
+
+    #[test]
+    fn a_non_finite_star_snr_or_hfr_maps_to_none() {
+        let frame = mono_frame(60, 512, 384, 1000.0, 13);
+        let mut pm = measure_raw_frame(&frame, &cfg(), None);
+        assert!(pm.stars.len() >= 3);
+        pm.stars[0].snr = f64::NAN;
+        pm.stars[1].hfr = f64::INFINITY;
+        let (_, stars) = map_measurement(&pm, &frame, &cfg(), "h");
+        assert_eq!((stars[0].snr, stars[0].hfr.is_some()), (None, true));
+        assert_eq!((stars[1].hfr, stars[1].snr.is_some()), (None, true));
+        assert!(stars[2].snr.is_some() && stars[2].hfr.is_some());
+    }
+
+    #[test]
+    fn the_analyzer_records_the_frame_verdict() {
+        let (w, h) = (400, 300);
+        let mut n = vec![1000.0f32; w * h];
+        add_noise(&mut n, 10.0, 3);
+        let donut: Vec<f32> = crate::test_support::donut_field(400, 200, 5)
+            .iter()
+            .map(|v| v * 65535.0)
+            .collect();
+        let trailed: Vec<f32> = crate::test_support::trailed_field(600, 450, 9)
+            .iter()
+            .map(|v| v * 65535.0)
+            .collect();
+        let verdict = |f: RawFrame| analyze_raw_frame(&f, &cfg(), None, "h").0;
+        let t = verdict(mono(trailed, 600, 450));
+        assert_eq!((t.frame_verdict, t.possibly_trailed), (Some(FrameVerdict::Trailed), true));
+        assert_eq!(verdict(mono(donut, 400, 200)).frame_verdict, Some(FrameVerdict::Defocused));
+        assert_eq!(verdict(mono(n, w, h)).frame_verdict, Some(FrameVerdict::NoStars));
+        assert_eq!(verdict(mono_frame(120, 640, 480, 1000.0, 11)).frame_verdict, None);
     }
 
     #[test]

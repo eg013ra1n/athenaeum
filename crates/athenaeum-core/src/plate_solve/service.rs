@@ -603,16 +603,17 @@ pub(crate) fn blind_gate_ok(
 
 /// Why this frame should not be sent to the solver at all, or `None`.
 ///
-/// Reads the frame's own analysis, when it has one: a frame whose stars are
-/// streaks has nothing for the solver to match, and letting it through costs
-/// minutes per frame while the autoFOV ladder is walked to its end. Both
-/// thresholds must be crossed — measured on real files (2026-09-05), frames
-/// that solve correctly sit at eccentricity 0.62–0.72 with trail R² 0.30–0.57,
-/// and hopeless ones at 0.90–0.96 with 0.73–0.93, so either test alone would
-/// refuse frames that are perfectly solvable.
+/// Reads the frame's own analysis, when it has one and the current measurement wrote it (`measure_version` equal to
+/// `star_measure::MEASURE_VERSION`; a legacy row is not trusted and never refuses). A frame whose stars are streaks has
+/// nothing for the solver to match, and letting it through costs minutes per frame while the autoFOV ladder is walked
+/// to its end. The measurement's own verdict decides first (PC-13): `trailed` refuses on that alone, and `defocused` /
+/// `no_stars` never refuse (the solver's minimum-star refusal is fast). Then the old pair — both thresholds must be
+/// crossed; measured on real files (2026-09-05), frames that solve correctly sit at eccentricity 0.62–0.72 with trail
+/// R² 0.30–0.57, and hopeless ones at 0.90–0.96 with 0.73–0.93, so either test alone would refuse frames that are
+/// perfectly solvable (C7 decides the pair's fate, PC-12).
 ///
-/// A frame with no analysis is never refused here — the answer is unknown,
-/// and the solver's own detection cut is the backstop.
+/// A frame with no analysis is never refused here — the answer is unknown, and the solver's own detection cut is the
+/// backstop.
 pub fn input_gate_reason(
     conn: &Connection,
     frame_id: i64,
@@ -622,6 +623,19 @@ pub fn input_gate_reason(
         return None;
     }
     let a = crate::db::analysis::get_frame_analysis(conn, frame_id).ok()??;
+    if a.measure_version != Some(crate::star_measure::MEASURE_VERSION) {
+        tracing::debug!(
+            frame_id,
+            measure_version = ?a.measure_version,
+            "input gate: the frame's analysis predates the current measurement"
+        );
+        return None;
+    }
+    if a.frame_verdict == Some(crate::models::FrameVerdict::Trailed) {
+        return Some(
+            "Stars are trails the measurement could not fit — nothing to match".to_string(),
+        );
+    }
     if a.median_eccentricity >= config.input_max_eccentricity
         && a.trail_r_squared >= config.input_min_trail_r2
     {
@@ -771,6 +785,9 @@ mod tests {
                 quality_score: None,
                 config_hash: Some("t".into()),
                 analyzed_at: "2026-09-05T00:00:00Z".into(),
+                measure_version: Some(crate::star_measure::MEASURE_VERSION),
+                stars_refused: None,
+                frame_verdict: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         };
@@ -799,6 +816,105 @@ mod tests {
 
         let off = PlateSolveConfig { input_gate_enabled: false, ..cfg.clone() };
         assert!(input_gate_reason(&conn, 1, &off).is_none(), "the gate can be turned off");
+    }
+
+    /// One `frame_analysis` row for the gate tests: (eccentricity, trail R², measure version, verdict).
+    fn gate_conn(
+        rows: &[(f64, f64, Option<u32>, Option<crate::models::FrameVerdict>)],
+    ) -> rusqlite::Connection {
+        use crate::models::FrameAnalysis;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        for (i, (ecc, trail, version, verdict)) in rows.iter().enumerate() {
+            let fid = i as i64 + 1;
+            conn.execute(
+                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+                 VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",
+                rusqlite::params![fid, format!("/x/{fid}.fits"), format!("{fid}.fits")],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id,file_id) VALUES (?1,?1)", [fid]).unwrap();
+            let a = FrameAnalysis {
+                id: None,
+                frame_id: fid,
+                file_id: fid,
+                stars_detected: 2000,
+                median_fwhm: 4.0,
+                median_eccentricity: *ecc,
+                median_snr: 30.0,
+                median_hfr: 2.0,
+                frame_snr: 30.0,
+                snr_weight: 1.0,
+                psf_signal: 100.0,
+                background: 100.0,
+                noise: 5.0,
+                detection_threshold: 5.0,
+                width: 4144,
+                height: 2822,
+                source_channels: 1,
+                trail_r_squared: *trail,
+                possibly_trailed: false,
+                median_beta: None,
+                quality_score: None,
+                config_hash: Some("t".into()),
+                analyzed_at: "2026-09-05T00:00:00Z".into(),
+                measure_version: *version,
+                stars_refused: None,
+                frame_verdict: *verdict,
+            };
+            crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn the_input_gate_ignores_a_legacy_row() {
+        let conn = gate_conn(&[(0.95, 0.9, None, None)]);
+        assert!(input_gate_reason(&conn, 1, &PlateSolveConfig::default()).is_none());
+    }
+
+    #[test]
+    fn the_input_gate_ignores_a_row_of_another_version() {
+        let cur = crate::star_measure::MEASURE_VERSION;
+        let conn = gate_conn(&[(0.95, 0.9, Some(cur + 1), Some(crate::models::FrameVerdict::Trailed))]);
+        assert!(input_gate_reason(&conn, 1, &PlateSolveConfig::default()).is_none());
+    }
+
+    #[test]
+    fn the_input_gate_refuses_a_trailed_verdict() {
+        use crate::models::FrameVerdict;
+        let cur = Some(crate::star_measure::MEASURE_VERSION);
+        let conn = gate_conn(&[(0.0, 0.0, cur, Some(FrameVerdict::Trailed))]);
+        let why = input_gate_reason(&conn, 1, &PlateSolveConfig::default()).expect("refused on the verdict alone");
+        assert!(why.contains("trails the measurement could not fit"), "{why}");
+    }
+
+    #[test]
+    fn the_input_gate_refuses_a_current_row_by_the_pair() {
+        let cur = Some(crate::star_measure::MEASURE_VERSION);
+        let conn = gate_conn(&[(0.95, 0.9, cur, None)]);
+        assert!(input_gate_reason(&conn, 1, &PlateSolveConfig::default()).is_some());
+    }
+
+    #[test]
+    fn the_input_gate_passes_an_elongated_measured_frame() {
+        let cur = Some(crate::star_measure::MEASURE_VERSION);
+        let conn = gate_conn(&[(0.73, 0.57, cur, None)]);
+        assert!(input_gate_reason(&conn, 1, &PlateSolveConfig::default()).is_none());
+    }
+
+    #[test]
+    fn the_input_gate_never_refuses_defocused_or_no_stars() {
+        use crate::models::FrameVerdict;
+        let cur = Some(crate::star_measure::MEASURE_VERSION);
+        // Even with the pair's numbers over the thresholds: these verdicts carry zeros, but the gate never reads them.
+        let conn = gate_conn(&[
+            (0.0, 0.0, cur, Some(FrameVerdict::Defocused)),
+            (0.0, 0.0, cur, Some(FrameVerdict::NoStars)),
+        ]);
+        let cfg = PlateSolveConfig::default();
+        assert!(input_gate_reason(&conn, 1, &cfg).is_none());
+        assert!(input_gate_reason(&conn, 2, &cfg).is_none());
     }
 
     /// A solve whose recovered scale contradicts the frame's own optics is a

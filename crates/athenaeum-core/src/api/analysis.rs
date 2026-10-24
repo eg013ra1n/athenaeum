@@ -501,7 +501,9 @@ pub async fn get_frame_star_metrics(
     if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
         if existing.config_hash.as_deref() == Some(&current_hash) {
             if let Ok(stars) = db_analysis::get_star_metrics_by_frame_id(&conn, frame_id) {
-                if !stars.is_empty() {
+                // A trailed / defocused / no-stars frame stores no star (PC-6), so its verdict also makes the row
+                // servable as it is.
+                if !stars.is_empty() || existing.frame_verdict.is_some() {
                     return Ok(StarMetricsResponse {
                         image_width: existing.width,
                         image_height: existing.height,
@@ -600,4 +602,64 @@ pub async fn compute_flat_contour_plot(
         contours: result.contours,
         pixels_b64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{FrameAnalysis, FrameVerdict};
+
+    /// C5 review I1: a trailed / defocused / no-stars frame stores no `StarMetric`, so its verdict alone makes a fresh
+    /// row servable. The file does not exist: a re-analysis would fail, so an `Ok` proves none ran.
+    #[tokio::test]
+    async fn a_fresh_row_with_a_verdict_and_no_stars_is_served_without_reanalysis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let frame_id = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            conn.execute(
+                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+                 VALUES (1,'/nowhere/t.fits','t.fits',0,'2025-01-01','FITS','2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id,file_id) VALUES (1,1)", []).unwrap();
+            let hash = config::load_config(&conn).config_hash();
+            let a = FrameAnalysis {
+                id: None,
+                frame_id: 1,
+                file_id: 1,
+                stars_detected: 400,
+                median_fwhm: 0.0,
+                median_eccentricity: 0.0,
+                median_snr: 0.0,
+                median_hfr: 0.0,
+                frame_snr: 30.0,
+                snr_weight: 0.0,
+                psf_signal: 0.0,
+                background: 100.0,
+                noise: 5.0,
+                detection_threshold: 6.0,
+                width: 600,
+                height: 450,
+                source_channels: 1,
+                trail_r_squared: 0.0,
+                possibly_trailed: true,
+                median_beta: None,
+                quality_score: None,
+                config_hash: Some(hash),
+                analyzed_at: "2026-10-24T00:00:00Z".into(),
+                measure_version: Some(crate::star_measure::MEASURE_VERSION),
+                stars_refused: Some(25),
+                frame_verdict: Some(FrameVerdict::Trailed),
+            };
+            db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
+            1
+        };
+        let r = get_frame_star_metrics(&ctx, frame_id).await.expect("served from the stored row");
+        assert!(r.stars.is_empty());
+        assert_eq!(r.metrics.frame_verdict, Some(FrameVerdict::Trailed));
+        assert_eq!((r.image_width, r.image_height), (600, 450));
+    }
 }

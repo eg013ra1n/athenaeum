@@ -18,7 +18,8 @@ psf_model: AnalysisPsfModel,
 max_stars: number, 
 /**
  * Concurrent frames during batch analysis. Default: auto (cores/3, min 2).
- * Higher values increase throughput but use more memory (~200MB per concurrent frame).
+ * Higher values increase throughput but use more memory (several hundred MB per concurrent 36 MP frame: a plane
+ * is 4 bytes a pixel and the measurement copies it; a debayered file keeps only its G plane while measured).
  */
 batch_concurrency: number, };
 

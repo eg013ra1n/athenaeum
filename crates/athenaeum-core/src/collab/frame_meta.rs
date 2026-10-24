@@ -133,6 +133,10 @@ pub fn build_frame_meta(conn: &Connection, frame_id: i64) -> Result<FrameMeta> {
         meta.insert("medianSnr".into(), json!(a.median_snr));
         meta.insert("snrWeight".into(), json!(a.snr_weight));
         meta.insert("frameSnr".into(), json!(a.frame_snr));
+        // Append-only (PC-13 / C6): present only when the row says which measurement wrote it.
+        if let Some(v) = a.measure_version {
+            meta.insert("measureVersion".into(), json!(v));
+        }
     }
     if let Some(s) = &solve {
         let mut wcs = Map::new();
@@ -375,6 +379,10 @@ mod tests {
     }
 
     fn seed_analysis(conn: &Connection, frame_id: i64) {
+        seed_analysis_version(conn, frame_id, None);
+    }
+
+    fn seed_analysis_version(conn: &Connection, frame_id: i64, measure_version: Option<u32>) {
         upsert_frame_analysis(
             conn,
             &FrameAnalysis {
@@ -401,6 +409,9 @@ mod tests {
                 quality_score: None,
                 config_hash: None,
                 analyzed_at: "2026-09-24T02:05:00Z".to_string(),
+                measure_version,
+                stars_refused: None,
+                frame_verdict: None,
             },
         )
         .unwrap();
@@ -492,6 +503,26 @@ mod tests {
             .meta
             .get("bayerpat")
             .is_none());
+    }
+
+    /// C6: the meta says which measurement wrote the analysis, only when it is known (append-only on the wire).
+    #[test]
+    fn frame_meta_carries_measure_version_when_known() {
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        seed_analysis_version(&conn, frame_id, Some(5));
+        let m = build_frame_meta(&conn, frame_id).unwrap();
+        assert_eq!(m.meta.get("measureVersion"), Some(&serde_json::json!(5)));
+    }
+
+    #[test]
+    fn frame_meta_omits_it_for_a_legacy_row() {
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        seed_analysis(&conn, frame_id);
+        let m = build_frame_meta(&conn, frame_id).unwrap();
+        assert!(m.meta.get("starsDetected").is_some(), "premise: the analysis is in the meta");
+        assert!(m.meta.get("measureVersion").is_none());
     }
 
     #[test]
