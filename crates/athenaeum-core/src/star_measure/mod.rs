@@ -497,15 +497,16 @@ pub struct PlaneMeasurement {
 }
 
 /// Whether `mask` is a mask of some other plane (its length is not `w·h`), with one `warn!` when it is: the module's
-/// entry points ([`measure_plane`], [`fit_stars_at`], [`fit_stars_with_model`]) measure nothing then, instead of
-/// indexing past the mask's end (Plan A 6a review minor 2). `None` never mismatches.
+/// entry points ([`measure_plane`], [`prepare_plane`], [`finish_plane`], [`plane_beta`], [`fit_stars_at`],
+/// [`fit_stars_with_model`], [`correct_at_ring`]) measure nothing then, instead of indexing past the mask's end (Plan A
+/// 6a review minor 2; `prepare_plane` through the shared `prepare_working`). `None` never mismatches.
 fn mask_mismatch(mask: Option<&[bool]>, w: usize, h: usize) -> bool {
     match mask {
         Some(m) if m.len() != w * h => {
             tracing::warn!(
                 mask_len = m.len(),
-                w,
-                h,
+                width = w,
+                height = h,
                 "the pixel mask does not match the plane; nothing is measured"
             );
             true
@@ -848,6 +849,17 @@ pub fn finish_plane(
     siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
+    let unmasked;
+    let opts = if mask_mismatch(opts.mask.as_deref(), w, h) {
+        // `prep` of such options holds no seeds (see `prepare_working`); the mask is dropped, never indexed.
+        unmasked = MeasureOptions {
+            mask: None,
+            ..opts.clone()
+        };
+        &unmasked
+    } else {
+        opts
+    };
     let working = {
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
@@ -872,6 +884,16 @@ pub fn plane_beta(
     prep: &PlanePrep,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> (f64, BetaSource) {
+    let unmasked;
+    let opts = if mask_mismatch(opts.mask.as_deref(), w, h) {
+        unmasked = MeasureOptions {
+            mask: None,
+            ..opts.clone()
+        };
+        &unmasked
+    } else {
+        opts
+    };
     let working = {
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
@@ -1028,6 +1050,16 @@ fn prepare_working(
     pool: Option<&Arc<rayon::ThreadPool>>,
     sub: SubSteps,
 ) -> PlanePrep {
+    if mask_mismatch(opts.mask.as_deref(), w, h) {
+        // As `measure_plane`: no seed source, no mask, the plane's noise and sky only.
+        let bare = MeasureOptions {
+            seeds: SeedSpec::None,
+            mask: None,
+            mode: Mode::All,
+            ..opts.clone()
+        };
+        return prepare_working(plane, working, w, h, &bare, pool, sub);
+    }
     let head = prepare_head(plane, working, w, h, opts, pool, sub);
     // Plan A Task 13b: the two populations are chosen from the detection alone, BEFORE the verdict pass, which then runs
     // over the fitted seeds only (R12-2's order).
@@ -1940,6 +1972,9 @@ pub fn correct_at_ring(
     opts: &FitStarsOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
+    if mask_mismatch(opts.mask.as_deref(), w, h) {
+        return;
+    }
     let correction = fit::Correction {
         ring_fwhm: Some(ring_fwhm),
         ..opts.correction()
@@ -3731,6 +3766,66 @@ mod tests {
             assert_eq!(out.seeds, 0);
             assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
             assert!(logs.contains("mask_len"), "{logs}");
+            let opts = FitStarsOptions {
+                mask: Some(short.clone()),
+                ..Default::default()
+            };
+            let mut out = None;
+            let logs = crate::stacking::solve::tests::captured_logs(|| {
+                out = Some(fit_stars_with_model(
+                    &data,
+                    64,
+                    64,
+                    &seeds,
+                    PsfModel::Moffat4,
+                    &opts,
+                    None,
+                ));
+            });
+            let out = out.unwrap();
+            assert!(out.fits.is_empty());
+            assert_eq!(out.seeds, 0);
+            assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
+            // The halves of `measure_plane` take the same options: nothing is measured, one warning per entry.
+            let mo = MeasureOptions {
+                seeds: SeedSpec::Given(seeds.clone()),
+                mask: Some(short.clone()),
+                ..Default::default()
+            };
+            let mut prep = None;
+            let logs = crate::stacking::solve::tests::captured_logs(|| {
+                prep = Some(prepare_plane(&data, 64, 64, &mo, None));
+            });
+            let prep = prep.unwrap();
+            assert!(prep.seeds.is_empty());
+            assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
+            let mut pm = None;
+            let logs = crate::stacking::solve::tests::captured_logs(|| {
+                pm = Some(finish_plane(&data, 64, 64, &mo, prep, None, None));
+            });
+            assert!(pm.unwrap().stars.is_empty());
+            assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
+        }
+
+        /// A trailed plane reads trailed through the matched filter alone (no handed-in seeds), keeping no star: the
+        /// pin `test_support::trailed_field` stands on for its readers.
+        #[test]
+        fn a_trailed_field_reads_trailed() {
+            let data = crate::test_support::trailed_field(540, 420, 42);
+            let pm = measure_plane(
+                &data,
+                540,
+                420,
+                &MeasureOptions {
+                    seeds: SeedSpec::MatchedFilter {
+                        threshold: seeds::DEFAULT_THRESHOLD,
+                    },
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(pm.trailed, "share {}, seeds {}", pm.trail_share, pm.seeds);
+            assert!(pm.stars.is_empty());
         }
 
         /// 6a review minor 1: one pixel inside the star's aperture raised by 10^4 ADU. Masked, the star reads exactly as
@@ -3764,10 +3859,16 @@ mod tests {
             let (s_clean, snr_clean) = fit(&clean, Some(&mask));
             let (s_masked, snr_masked) = fit(&hot, Some(&mask));
             assert!(((s_masked - s_clean) / s_clean).abs() < 1e-9, "{s_masked} vs {s_clean}");
-            assert!(((snr_masked - snr_clean) / snr_clean).abs() < 1e-9, "{snr_masked} vs {snr_clean}");
+            assert!(
+                ((snr_masked - snr_clean) / snr_clean).abs() < 1e-9,
+                "{snr_masked} vs {snr_clean}"
+            );
             let (s_open, snr_open) = fit(&hot, None);
             assert!(((s_open - s_clean) / s_clean).abs() > 0.01, "{s_open} vs {s_clean}");
-            assert!(((snr_open - snr_clean) / snr_clean).abs() > 0.01, "{snr_open} vs {snr_clean}");
+            assert!(
+                ((snr_open - snr_clean) / snr_clean).abs() > 0.01,
+                "{snr_open} vs {snr_clean}"
+            );
         }
 
         /// A sky the caller measured is the plane's sky as handed in, not re-sampled.

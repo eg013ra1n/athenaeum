@@ -614,7 +614,6 @@ pub(crate) fn trail_plane_fixture(
 /// A trailed plane for the frame verdict: 5 round stars among 120 trails of 20 px ([`trail_plane_fixture`]'s mix), so
 /// `measure_plane` reads it `trailed` and keeps no star. Needs a plane of at least 540 x 420 (125 grid slots).
 #[cfg(feature = "render")]
-#[allow(dead_code)] // C5 / C6 are its readers
 pub(crate) fn trailed_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
     trail_plane_fixture(w, h, 5, 120, seed).0
 }
@@ -624,18 +623,6 @@ pub(crate) fn trailed_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
 /// it `defocused` and keeps no star. Needs room for at least 8 donuts (a 330 x 100 plane holds exactly 8).
 #[cfg(feature = "render")]
 pub(crate) fn donut_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
-    const N: usize = 2000;
-    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
-    let (r_in, r_out) = (2.4f64, 6.0f64);
-    // The annulus as 2000 equal-area samples about the origin (a sunflower lattice).
-    let ring: Vec<(f64, f64)> = (0..N)
-        .map(|k| {
-            let t = (k as f64 + 0.5) / N as f64;
-            let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
-            let (s, c) = (k as f64 * golden).sin_cos();
-            (r * c, r * s)
-        })
-        .collect();
     let mut data = vec![0.05f32; w * h];
     let cols = (w.saturating_sub(60)) / 35 + 1;
     let rows = (h.saturating_sub(60)) / 35 + 1;
@@ -645,19 +632,39 @@ pub(crate) fn donut_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
         cols * rows
     );
     for i in 0..cols * rows {
-        let (cx, cy) = (30 + 35 * (i % cols), 30 + 35 * (i / cols));
-        for y in cy - 12..=cy + 12 {
-            for x in cx - 12..=cx + 12 {
-                let mut acc = 0.0f64;
-                for &(ux, uy) in &ring {
-                    let d2 =
-                        (x as f64 - cx as f64 - ux).powi(2) + (y as f64 - cy as f64 - uy).powi(2);
-                    acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
-                }
-                data[y * w + x] += (0.3 * acc / N as f64) as f32;
-            }
-        }
+        add_donut_gain(&mut data, w, 30 + 35 * (i % cols), 30 + 35 * (i / cols), 1.0);
     }
     add_noise(&mut data, 0.002, seed);
     data
+}
+
+/// A deterministic 2000-point sunflower lattice over the annulus `r_in ≤ r ≤ r_out` about `(cx, cy)`: point `k`
+/// at the radius enclosing the area fraction `(k + ½)/2000` of the annulus, turned by the golden angle per point,
+/// so the points sample the annulus uniformly by area.
+pub(crate) fn ring_samples(cx: f64, cy: f64, r_in: f64, r_out: f64) -> Vec<(f64, f64)> {
+    const N: usize = 2000;
+    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+    (0..N)
+        .map(|k| {
+            let t = (k as f64 + 0.5) / N as f64;
+            let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
+            let (s, c) = (k as f64 * golden).sin_cos();
+            (cx + r * c, cy + r * s)
+        })
+        .collect()
+}
+
+/// [`add_donut`] with its amplitude scaled by `gain`.
+pub(crate) fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f64) {
+    let ring = ring_samples(cx as f64, cy as f64, 2.4, 6.0);
+    for y in cy - 12..=cy + 12 {
+        for x in cx - 12..=cx + 12 {
+            let mut acc = 0.0f64;
+            for &(ux, uy) in &ring {
+                let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
+                acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
+            }
+            data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
+        }
+    }
 }

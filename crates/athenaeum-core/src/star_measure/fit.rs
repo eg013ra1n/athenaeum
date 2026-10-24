@@ -2537,7 +2537,9 @@ pub(super) fn correct_at_ring(
 mod tests {
     use super::*;
     use crate::star_measure::{fit_stars_at, FitStarsOptions};
-    use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
+    use crate::test_support::{
+        add_donut_gain, add_noise, gaussian_field, moffat_field, ring_samples, MoffatStar,
+    };
 
     fn round(x: f64, y: f64, amp: f64) -> MoffatStar {
         MoffatStar {
@@ -2931,13 +2933,20 @@ mod tests {
 
     /// An INDEPENDENT rescan oracle: the full `(2r+1)²` square's median and maximum, never calling
     /// `region_median`/`push_finite_row`.
-    fn pin_rescan_square(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<(f64, f64)> {
+    fn pin_rescan_square(
+        data: &[f32],
+        mask: Option<&[bool]>,
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r: i64,
+    ) -> Option<(f64, f64)> {
         let mut v: Vec<f32> = Vec::new();
         for y in cy - r..=cy + r {
             let row = y as usize * w;
             for x in cx - r..=cx + r {
                 let p = data[row + x as usize];
-                if p.is_finite() {
+                if p.is_finite() && mask.map_or(true, |m| m[row + x as usize]) {
                     v.push(p);
                 }
             }
@@ -2950,13 +2959,21 @@ mod tests {
     }
 
     /// The oracle's rim: every pixel of the square whose Chebyshev distance from the centre is exactly `r`.
-    fn pin_rescan_rim(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<f64> {
+    fn pin_rescan_rim(
+        data: &[f32],
+        mask: Option<&[bool]>,
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r: i64,
+    ) -> Option<f64> {
         let mut v: Vec<f32> = Vec::new();
         for y in cy - r..=cy + r {
             for x in cx - r..=cx + r {
                 if (x - cx).abs().max((y - cy).abs()) == r {
-                    let p = data[y as usize * w + x as usize];
-                    if p.is_finite() {
+                    let i = y as usize * w + x as usize;
+                    let p = data[i];
+                    if p.is_finite() && mask.map_or(true, |m| m[i]) {
                         v.push(p);
                     }
                 }
@@ -2971,6 +2988,7 @@ mod tests {
     /// PA-12's growth over the oracle: the stopping radius, its rim median, and every square median visited.
     fn pin_rescan_grow_region(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         cx: i64,
         cy: i64,
@@ -2982,10 +3000,11 @@ mod tests {
         let mut r = r_start;
         let mut max = f64::NEG_INFINITY;
         loop {
-            let (m, square_max) = pin_rescan_square(data, w, cx, cy, r).expect("a present square");
+            let (m, square_max) =
+                pin_rescan_square(data, mask, w, cx, cy, r).expect("a present square");
             max = max.max(square_max);
             seq.push(m);
-            let s = pin_rescan_rim(data, w, cx, cy, r).unwrap_or(m);
+            let s = pin_rescan_rim(data, mask, w, cx, cy, r).unwrap_or(m);
             if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
                 return (r, s, seq);
             }
@@ -2997,6 +3016,7 @@ mod tests {
     /// (incremental) `region_median` — `grow_region` itself returns only the radius and the rim median.
     fn incremental_grow_region_with_seq(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         cx: i64,
         cy: i64,
@@ -3009,15 +3029,15 @@ mod tests {
         let mut seq = Vec::new();
         let mut r = r_start;
         let (mut m, mut max) =
-            region_median(data, None, w, cx, cy, None, r, &mut scratch).expect("a present square");
+            region_median(data, mask, w, cx, cy, None, r, &mut scratch).expect("a present square");
         seq.push(m);
         loop {
-            let s = rim_median(data, None, w, cx, cy, r, &mut rim).unwrap_or(m);
+            let s = rim_median(data, mask, w, cx, cy, r, &mut rim).unwrap_or(m);
             if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
                 return (r, s, seq);
             }
             let (m_next, max_next) =
-                region_median(data, None, w, cx, cy, Some(r), r + 1, &mut scratch).expect("grows");
+                region_median(data, mask, w, cx, cy, Some(r), r + 1, &mut scratch).expect("grows");
             r += 1;
             m = m_next;
             max = max.max(max_next);
@@ -3025,20 +3045,22 @@ mod tests {
         }
     }
 
-    /// The three agree bit for bit, and the visited square medians are the first of Task 5's recorded literals.
-    fn assert_growth_matches(
+    /// The three agree bit for bit, under `mask` when given; returns the stopping radius, its rim median and the
+    /// visited square medians.
+    fn assert_growth_agrees(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         (cx, cy): (i64, i64),
         (r_start, r_max): (i64, i64),
-        task5_medians: &[f64],
-    ) -> (i64, f64) {
+    ) -> (i64, f64, Vec<f64>) {
         let p = FitParams::default();
-        let (r_ref, s_ref, seq_ref) = pin_rescan_grow_region(data, w, cx, cy, r_start, r_max, &p);
+        let (r_ref, s_ref, seq_ref) =
+            pin_rescan_grow_region(data, mask, w, cx, cy, r_start, r_max, &p);
         let (r_seq, s_seq, seq_new) =
-            incremental_grow_region_with_seq(data, w, cx, cy, r_start, r_max, &p);
+            incremental_grow_region_with_seq(data, mask, w, cx, cy, r_start, r_max, &p);
         let mut scratch = FitScratch::default();
-        let (r_prod, s_prod) = grow_region(data, None, w, cx, cy, r_start, r_max, &p, &mut scratch);
+        let (r_prod, s_prod) = grow_region(data, mask, w, cx, cy, r_start, r_max, &p, &mut scratch);
         assert_eq!(
             (r_prod, s_prod.to_bits()),
             (r_seq, s_seq.to_bits()),
@@ -3057,6 +3079,19 @@ mod tests {
                 "median sequence: {seq_ref:?} vs {seq_new:?}"
             );
         }
+        (r_prod, s_prod, seq_new)
+    }
+
+    /// [`assert_growth_agrees`] without a mask, and the visited square medians are the first of Task 5's recorded
+    /// literals.
+    fn assert_growth_matches(
+        data: &[f32],
+        w: usize,
+        centre: (i64, i64),
+        range: (i64, i64),
+        task5_medians: &[f64],
+    ) -> (i64, f64) {
+        let (r_prod, s_prod, seq_new) = assert_growth_agrees(data, None, w, centre, range);
         let n = seq_new.len().min(task5_medians.len());
         assert!(
             n > 1,
@@ -3151,71 +3186,9 @@ mod tests {
         let mask: Vec<bool> = (0..120 * 120).map(|i| (i % 120 + i / 120) % 2 == 0).collect();
         let (cx, cy) = (15i64, 13i64);
         let to_border = cx.min(cy).min(120 - 1 - cx).min(120 - 1 - cy);
-        let p = FitParams::default();
-        let present = |x: i64, y: i64| {
-            let i = y as usize * 120 + x as usize;
-            data[i].is_finite() && mask[i]
-        };
-        let median_of = |mut v: Vec<f32>| (!v.is_empty()).then(|| median_in_place(&mut v) as f64);
-        // The oracle: every square and rim rebuilt from scratch, masked pixels left out.
-        let square = |r: i64| {
-            let v: Vec<f32> = (cy - r..=cy + r)
-                .flat_map(|y| (cx - r..=cx + r).map(move |x| (x, y)))
-                .filter(|&(x, y)| present(x, y))
-                .map(|(x, y)| data[y as usize * 120 + x as usize])
-                .collect();
-            let max = v.iter().fold(f64::NEG_INFINITY, |m, &p| m.max(p as f64));
-            (median_of(v).expect("a present square"), max)
-        };
-        let rim = |r: i64| {
-            median_of(
-                (cy - r..=cy + r)
-                    .flat_map(|y| (cx - r..=cx + r).map(move |x| (x, y)))
-                    .filter(|&(x, y)| (x - cx).abs().max((y - cy).abs()) == r && present(x, y))
-                    .map(|(x, y)| data[y as usize * 120 + x as usize])
-                    .collect(),
-            )
-        };
-        let (r_start, r_max) = (3i64, to_border);
-        let mut seq_ref = Vec::new();
-        let mut r = r_start;
-        let mut max = f64::NEG_INFINITY;
-        let (r_ref, s_ref) = loop {
-            let (m, square_max) = square(r);
-            max = max.max(square_max);
-            seq_ref.push(m);
-            let s = rim(r).unwrap_or(m);
-            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
-                break (r, s);
-            }
-            r += 1;
-        };
-        // The incremental sequence through the real `region_median` / `rim_median`.
-        let (mut scratch, mut rimbuf) = (Vec::new(), Vec::new());
-        let mut seq_new = Vec::new();
-        let mut r = r_start;
-        let (mut m, mut max) =
-            region_median(&data, Some(&mask), 120, cx, cy, None, r, &mut scratch).unwrap();
-        seq_new.push(m);
-        let (r_seq, s_seq) = loop {
-            let s = rim_median(&data, Some(&mask), 120, cx, cy, r, &mut rimbuf).unwrap_or(m);
-            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
-                break (r, s);
-            }
-            let (m_next, max_next) =
-                region_median(&data, Some(&mask), 120, cx, cy, Some(r), r + 1, &mut scratch).unwrap();
-            r += 1;
-            m = m_next;
-            max = max.max(max_next);
-            seq_new.push(m);
-        };
-        let mut fs = FitScratch::default();
-        let (r_prod, s_prod) = grow_region(&data, Some(&mask), 120, cx, cy, r_start, r_max, &p, &mut fs);
-        assert!(seq_ref.len() > 2, "the growth visits several squares: {seq_ref:?}");
-        assert_eq!((r_ref, s_ref.to_bits()), (r_seq, s_seq.to_bits()), "oracle vs sequence");
-        assert_eq!((r_prod, s_prod.to_bits()), (r_seq, s_seq.to_bits()), "production vs sequence");
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&seq_ref), bits(&seq_new), "{seq_ref:?} vs {seq_new:?}");
+        assert!(to_border >= 3, "fixture must leave room to grow");
+        let (_, _, seq) = assert_growth_agrees(&data, Some(&mask), 120, (cx, cy), (3, to_border));
+        assert!(seq.len() > 2, "the growth visits several squares: {seq:?}");
     }
 
     #[test]
@@ -3590,22 +3563,6 @@ mod tests {
         (out, d)
     }
 
-    /// A deterministic 2000-point sunflower lattice over the annulus `r_in ≤ r ≤ r_out` about `(cx, cy)`: point `k`
-    /// at the radius enclosing the area fraction `(k + ½)/2000` of the annulus, turned by the golden angle per point,
-    /// so the points sample the annulus uniformly by area.
-    fn ring_samples(cx: f64, cy: f64, r_in: f64, r_out: f64) -> Vec<(f64, f64)> {
-        const N: usize = 2000;
-        let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
-        (0..N)
-            .map(|k| {
-                let t = (k as f64 + 0.5) / N as f64;
-                let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
-                let (s, c) = (k as f64 * golden).sin_cos();
-                (cx + r * c, cy + r * s)
-            })
-            .collect()
-    }
-
     #[test]
     fn broad_stars_fit_inside_a_region_that_scales_with_their_own_width() {
         // FWHM 14 at β 4: α = 14 / (2√(2^{1/4} − 1)) = 16.09; half-FWTM = 14.2 px — the D1 cause-1 regime
@@ -3673,21 +3630,6 @@ mod tests {
     /// `donut_is_refused_with_its_reason` renders one, over the 25×25 pixels about it only.
     fn add_donut(data: &mut [f32], w: usize, cx: usize, cy: usize) {
         add_donut_gain(data, w, cx, cy, 1.0);
-    }
-
-    /// [`add_donut`] with its amplitude scaled by `gain`.
-    fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f64) {
-        let ring = ring_samples(cx as f64, cy as f64, 2.4, 6.0);
-        for y in cy - 12..=cy + 12 {
-            for x in cx - 12..=cx + 12 {
-                let mut acc = 0.0f64;
-                for &(ux, uy) in &ring {
-                    let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
-                    acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
-                }
-                data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
-            }
-        }
     }
 
     /// Owner ruling 2026-10-08: a plane whose readable seeds are mostly donuts is defocused. Eight donuts and two
