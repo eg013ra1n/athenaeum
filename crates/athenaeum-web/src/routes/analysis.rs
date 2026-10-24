@@ -7,7 +7,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
-use athenaeum_core::analysis::config::AnalysisConfig;
+use athenaeum_core::analysis::config::{AnalysisConfig, AnalysisPsfModel};
 use athenaeum_core::api::analysis as api;
 use athenaeum_core::flat_analysis::FlatContourOpts;
 use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse};
@@ -231,6 +231,8 @@ mod analysis_config_tests {
 
         let mut cfg = AnalysisConfig::default();
         cfg.max_stars = 750;
+        cfg.detection_threshold = 7.5;
+        cfg.psf_model = AnalysisPsfModel::Auto;
 
         let _ = set_analysis_config(State(state.clone()), Json(SetAnalysisConfigArgs { config: cfg }))
             .await
@@ -241,6 +243,40 @@ mod analysis_config_tests {
             .unwrap()
             .0;
         assert_eq!(resp.max_stars, 750);
+        assert_eq!(resp.detection_threshold, 7.5);
+        assert_eq!(resp.psf_model, AnalysisPsfModel::Auto);
+    }
+
+    /// A threshold outside 2..20 is refused by the route's validation, and the stored config stays.
+    #[tokio::test]
+    async fn set_analysis_config_refuses_a_threshold_out_of_range() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = AnalysisConfig::default();
+        cfg.detection_threshold = 25.0;
+        let r = set_analysis_config(State(state.clone()), Json(SetAnalysisConfigArgs { config: cfg })).await;
+        assert!(r.is_err(), "a threshold of 25 must be refused");
+
+        let resp = get_analysis_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.detection_threshold, 6.0);
+    }
+
+    /// An old stored-shape body (the removed keys) still decodes, with the new fields at their defaults.
+    #[test]
+    fn an_old_shape_config_body_decodes_with_new_defaults() {
+        let body = serde_json::json!({"config": {"detection_sigma": 5.0, "min_star_area": 5, "max_star_area": 2000,
+            "saturation_fraction": 0.95, "max_stars": 800, "trail_threshold": 0.4, "mrs_layers": 0,
+            "measure_cap": 2000, "fit_max_iter": 25, "fit_tolerance": 0.0001, "fit_max_rejects": 5,
+            "batch_concurrency": 3}});
+        let args: SetAnalysisConfigArgs = serde_json::from_value(body).unwrap();
+        assert_eq!(args.config.max_stars, 800);
+        assert_eq!(args.config.detection_threshold, 6.0);
+        assert_eq!(args.config.psf_model, AnalysisPsfModel::Moffat4);
     }
 
     /// Pins the fix: the handler now requires the `{ "config": ... }`

@@ -266,12 +266,8 @@ pub fn analyze_frame_set(
 
     let total = frames_to_analyze.len();
 
-    // Build analyzer ONCE with shared rayon pool — reused across all frames.
+    // One shared rayon pool for every frame.
     let pool = Arc::clone(&ctx.image_pool);
-    let img_analyzer = Arc::new(analyzer::build_analyzer(
-        &analysis_config,
-        Some(Arc::clone(&pool)),
-    ));
     let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
     let cancel_flag_worker = Arc::clone(&cancel_flag);
@@ -306,7 +302,7 @@ pub fn analyze_frame_set(
                     break;
                 };
 
-                let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
+                let result = match analyzer::analyze_frame(&path, &analysis_config, Some(&pool), &config_hash) {
                     Ok((mut analysis, stars, _flip)) => {
                         analysis.frame_id = frame_id;
                         analysis.file_id = file_id;
@@ -523,12 +519,11 @@ pub async fn get_frame_star_metrics(
     let _ = db_handle;
 
     let pool = Arc::clone(&ctx.image_pool);
-    let img_analyzer = analyzer::build_analyzer(&analysis_config, Some(Arc::clone(&pool)));
     let config_hash = current_hash.clone();
     let path_owned = path.clone();
 
     let (mut analysis, mut stars, flip_vertical) = tokio::task::spawn_blocking(move || {
-        analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
+        analyzer::analyze_frame(&path_owned, &analysis_config, Some(&pool), &config_hash)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?

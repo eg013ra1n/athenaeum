@@ -372,6 +372,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::plate_solve::object_fill::AutofindStatus,
         ]))),
         ("analysis-config.ts", js_safe_ints(format!("{HEADER}{}", decls![
+            crate::analysis::config::AnalysisPsfModel,
             crate::analysis::config::AnalysisConfig,
             crate::rustafits_processor::AnnotationSettings,
         ]))),

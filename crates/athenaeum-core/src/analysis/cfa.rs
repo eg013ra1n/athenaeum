@@ -107,7 +107,8 @@ pub fn green_phase(
 
 /// Measure a Bayer mosaic on its green sites (PC-4); `base` carries the domain, PSF model, threshold
 /// ([`SeedSpec::MatchedFilter`], else the default), detection cap, fit parameters and mode. `aperture_correction` of the
-/// result is `None` (`c` = 1).
+/// result is `None` (`c` = 1). `PlaneMeasurement::detected` holds every seed the green-sum matched filter found, knots
+/// included, mapped to native pixels (the fit ran on the given seeds without the knots).
 ///
 /// # Panics
 /// When `mosaic.len() != w * h` (the reader guarantees it).
@@ -156,6 +157,7 @@ pub fn measure_green_sites(
     );
     // Knots (ruling A3) stay out, as on the mono path: `SeedSpec::Given` carries no `extended` flag, so a flagged seed
     // would enter the budget and the frame statistic. Then native pixels, `native_seed`.
+    let detected_native: Vec<Seed> = found.iter().map(native_seed).collect();
     let native: Vec<Seed> = found
         .iter()
         .zip(&report.extended)
@@ -184,7 +186,11 @@ pub fn measure_green_sites(
         mode: base.mode,
         sky: Some(sky),
     };
-    star_measure::measure_plane(mosaic, w, h, &opts, pool)
+    let mut pm = star_measure::measure_plane(mosaic, w, h, &opts, pool);
+    // Given seeds leave `detected` empty; the matched filter's seeds, knots included, in native pixels are what the
+    // Analysis `stars_detected` counts (C5).
+    pm.detected = detected_native;
+    pm
 }
 
 #[cfg(test)]
@@ -502,8 +508,14 @@ mod tests {
         );
         assert!(!a.stars.is_empty());
         assert!(
-            !b.detected.iter().any(|s| near(s.x, s.y)),
-            "a knot seed was handed to the fit"
+            b.detected.iter().any(|s| near(s.x, s.y)),
+            "the knot is among the detected seeds (it counts in stars_detected)"
+        );
+        assert!(
+            b.seeds < b.detected.len(),
+            "a knot seed was handed to the fit: {} of {} seeds",
+            b.seeds,
+            b.detected.len()
         );
         assert!(
             !b.stars.iter().any(|s| near(s.x, s.y)),
