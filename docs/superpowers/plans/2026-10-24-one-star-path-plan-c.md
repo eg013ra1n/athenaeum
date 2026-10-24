@@ -125,7 +125,7 @@ Recorded in `.superpowers/sdd/2026-10-24-plan-c/rulings.md` at C0 and in `docs/s
 | ---- | ---- |
 | PC-1 | `MEASURE_VERSION` stays 5 unless a stacking-path number moves. The policy bumps it for a plan that changes what a fit accepts or measures; Plan C changes nothing on an unmasked plane, and a bump would re-measure every user's frame sets for no change. C10's scorecard identity decides; the README line "Plan C = 6" (l.1881) and the `MEASURE_VERSION` doc comment are corrected. Analysis rows store the version that measured them; `AnalysisConfig::config_hash` folds it. |
 | PC-2 | Raw input scales (spec l.133 "Plan C settles it"): an integer FITS takes its full scale from BITPIX/BZERO (255 / 65535 / 4294967295 for the unsigned conventions, the signed maximum otherwise); XISF UInt16 and XISF Float32 (already ×65535 by the reader's contract) take 65535; a float FITS whose finite maximum is ≤ 1.0 is multiplied by 65535 and takes 65535, any other float FITS keeps its values and takes 65535, or its maximum with a `warn!` when that is larger. `clip` = DATAMAX when positive, else the full scale; the gain = EGAIN, else none (the SNR omits its shot term and says so). |
-| PC-3 | BITPIX 16 with BZERO 0 is read signed (the FITS standard). A file of that kind with more than 1 % of its finite pixels negative under the signed reading is reported (an error naming the header, the frame counted failed), never guessed. C0's corpus census sets the record; a real camera file in that class is a STOP to the owner before C5 ships. |
+| PC-3 | BITPIX 16 with BZERO 0 is read signed (the FITS standard), full scale 32767. **Amended by R-PC-1 (owner, 2026-10-24):** when more than 1 % of the finite stored values are negative, the file is read as if BZERO were 32768 (stored + 32768, full scale 65535) with one `warn!` per file. Evidence: C0's census, the corpus's only such file `singles/_DSC5767.fit` (written by the ERP, 3 planes): 99.8 % negative, offset reading sky 3855 ADU and stars to 65535, while the rustafits bit-pattern reading puts the stars below the sky. |
 | PC-4 | A Bayer mosaic is measured on its green sites: detection on the 2×2 super-pixel sum (R + G + G + B), seeds mapped to native pixels (the offset pinned by C3's test), the fit on the native mosaic with the green-site mask, the plane sky and noise read from one green phase (owner task C3). `c` = 1 there (no qualifier; the B4 carry): Analysis star fluxes on OSC are uncorrected, a recorded limit. |
 | PC-5 | A 3-plane (debayered) file is measured on its G plane with `colour: true`, `PixelNoise::Mixed`, `cfa_site_share: Some(0.5)`; `source_channels` = the file's channel count. R-OSP-15's silent limit 1 (no field-width median on a debayered plane) stays recorded, not fixed. |
 | PC-6 | A frame the module judges trailed or defocused has no measured star: its medians follow PC-7 and its trail R² is 0. `possibly_trailed` = the module's trailed verdict (kept in the struct and the wire for older apps and the collab gate). Trail R² is the Rayleigh R² over the measured stars' canonical θ (C4), stored for compatibility and read only by the gate pair if C7 keeps it; the legacy flag rule and its suppressions are not ported. |
@@ -253,11 +253,11 @@ SNR shot term read. Reads C0's census.
   `i16` (PC-3).
 
 - [ ] **Step 1: write the failing tests.**
-  - `bitpix16_bzero0_reads_signed`: pixels −5, 0, 1000 written as big-endian `i16` → planes −5.0, 0.0, 1000.0;
-    `Domain::RawAdu { full_scale: 32767.0, .. }`.
+  - `bitpix16_bzero0_reads_signed`: 1000 pixels, 5 of them −5 and the rest positive (≤ 1 % negative), written as
+    big-endian `i16` → read as stored; `Domain::RawAdu { full_scale: 32767.0, .. }`.
   - `bitpix16_bzero32768_reads_unsigned`: stored −32768 + 40000 → 40000.0; full scale 65535.
-  - `bitpix16_bzero0_holding_unsigned_data_is_reported`: half the pixels above 32767 as `u16` → `Err` whose message
-    names "BITPIX 16" and "BZERO 0".
+  - `bitpix16_bzero0_holding_offset_data_reads_with_the_32768_offset` (R-PC-1): stored −30000 / 0 / 32767 with more
+    than 1 % negative → 2768 / 32768 / 65535, full scale 65535, one `warn!` with `path` and `negative_share`.
   - `a_unit_float_fits_is_scaled_to_adu`: BITPIX −32, maximum 0.8 → planes ×65535, full scale 65535.
   - `an_adu_float_fits_keeps_its_values`: maximum 42000 → unchanged, full scale 65535; maximum 70000 → full scale 70000
     with one `warn!`.
@@ -266,16 +266,15 @@ SNR shot term read. Reads C0's census.
   - `xisf_uint16_and_float32_read_at_full_scale_65535`.
   - `a_bayer_frame_reads_as_cfa_with_its_layout` (BAYERPAT RGGB, NAXIS 2) and `a_three_plane_frame_reads_as_rgb`
     (NAXIS3 3, `channels` 3).
-  - Real-data pin, `#[ignore]`, `STAR_TEST_DIR` env: `dsc5767_reads_signed` (`singles/_DSC5767.fit`: `Rgb`, minimum
-    and maximum equal to the census row's signed reading).
+  - Real-data pin, `#[ignore]`, `STAR_TEST_DIR` env: `dsc5767_reads_with_the_32768_offset` (`singles/_DSC5767.fit`:
+    `Rgb`, G plane median within 1 ADU of 3855, maximum 65535).
 - [ ] **Step 2:** run; expect FAIL (module missing).
 - [ ] **Step 3:** implement `read_raw_frame` with PC-2 and PC-3; log a reported file once at `warn!` with `path`.
 - [ ] **Step 4:** run the tests, the ignored pin with `STAR_TEST_DIR="$HOME/Pictures/star test"`, and
   `cargo check -p athenaeum-core --no-default-features`.
 - [ ] **Step 5:** commit `feat(analysis): raw frame input with the signed BITPIX 16 rule (Plan C C2)`.
 
-**Acceptance:** all tests pass; the census's BITPIX 16 / BZERO 0 files read as the census predicts (a STOP to the owner if
-a real camera file is reported, PC-3).
+**Acceptance:** all tests pass; `_DSC5767.fit` reads with the offset (R-PC-1).
 
 ---
 
