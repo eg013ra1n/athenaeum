@@ -99,6 +99,17 @@ fn finite_or_zero(x: f64) -> f64 {
     }
 }
 
+/// `stars_detected` (R-PC-5 / R-PC-8), one rule for every layout: the matched filter's seeds not flagged `extended`.
+/// The module's own detection fills `detected`; given seeds (the CFA path) leave it empty and `seeds` counts them.
+fn point_like_seeds(pm: &PlaneMeasurement) -> i64 {
+    let found = if pm.detected.is_empty() {
+        pm.seeds
+    } else {
+        pm.detected.len()
+    };
+    found.saturating_sub(pm.extended_seeds) as i64
+}
+
 /// Write a measurement into the Analysis rows (spec 4.2 with PC-6..PC-9).
 ///
 /// Medians come from the module's frame aggregates and read 0.0 when the frame has no fit in its statistic (PC-7);
@@ -161,7 +172,7 @@ pub fn map_measurement(
         id: None,
         frame_id: 0,
         file_id: 0,
-        stars_detected: pm.detected.len() as i64,
+        stars_detected: point_like_seeds(pm),
         median_fwhm: finite_or_zero(median_fwhm),
         median_eccentricity: finite_or_zero(pm.frame.eccentricity.unwrap_or(0.0)),
         median_snr: finite_or_zero(pm.frame.snr_median.unwrap_or(0.0)),

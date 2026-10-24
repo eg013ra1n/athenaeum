@@ -107,8 +107,9 @@ pub fn green_phase(
 
 /// Measure a Bayer mosaic on its green sites (PC-4); `base` carries the domain, PSF model, threshold
 /// ([`SeedSpec::MatchedFilter`], else the default), detection cap, fit parameters and mode. `aperture_correction` of the
-/// result is `None` (`c` = 1). `PlaneMeasurement::detected` holds every seed the green-sum matched filter found, knots
-/// included, mapped to native pixels (the fit ran on the given seeds without the knots).
+/// result is `None` (`c` = 1). Every seed the green-sum matched filter found is handed to the fit in native pixels with
+/// its `extended` flag (R-PC-8); `PlaneMeasurement::detected` stays empty (given seeds), `seeds` / `extended_seeds`
+/// count them.
 ///
 /// # Panics
 /// When `mosaic.len() != w * h` (the reader guarantees it).
@@ -155,15 +156,10 @@ pub fn measure_green_sites(
         pool,
         PixelNoise::White,
     );
-    // Knots (ruling A3) stay out, as on the mono path: `SeedSpec::Given` carries no `extended` flag, so a flagged seed
-    // would enter the budget and the frame statistic. Then native pixels, `native_seed`.
-    let detected_native: Vec<Seed> = found.iter().map(native_seed).collect();
-    let native: Vec<Seed> = found
-        .iter()
-        .zip(&report.extended)
-        .filter(|(_, &extended)| !extended)
-        .map(|(s, _)| native_seed(s))
-        .collect();
+    // Knots (ruling A3, amended by R-PC-8) ride with their flag: `SeedSpec::Given` + `given_extended` fits them like the
+    // mono path and keeps them out of `c`'s qualifiers and the frame statistic. Then native pixels, `native_seed`.
+    let native: Vec<Seed> = found.iter().map(native_seed).collect();
+    let given_extended = report.extended;
     let field_width = FieldWidth {
         fwhm_px: 2.0 * width.fwhm_px,
         from_stars: width.from_stars,
@@ -185,11 +181,9 @@ pub fn measure_green_sites(
         cfa_site_share: None,
         mode: base.mode,
         sky: Some(sky),
+        given_extended,
     };
-    let mut pm = star_measure::measure_plane(mosaic, w, h, &opts, pool);
-    // Given seeds leave `detected` empty; the matched filter's seeds, knots included, in native pixels are what the
-    // Analysis `stars_detected` counts (C5).
-    pm.detected = detected_native;
+    let pm = star_measure::measure_plane(mosaic, w, h, &opts, pool);
     pm
 }
 
@@ -359,7 +353,7 @@ mod tests {
         assert!(!ma.stars.is_empty());
         // Seeds come from the two green sites only (R-PC-3), so R / B never reach a seed, the fit, the sky or the noise:
         // the accepted fits are identical bit for bit.
-        assert_eq!(ma.detected, mb.detected);
+        assert_eq!(ma.seeds, mb.seeds);
         assert_eq!(ma.field_width, mb.field_width);
         assert_eq!(ma.stars, mb.stars);
     }
@@ -382,11 +376,11 @@ mod tests {
         // A pin: the green-only seeds never see the site, so no seed was even attempted there (not merely refused
         // `NarrowerThanPixel`).
         assert!(
-            !pm.detected
+            !native_seeds(&m, 128, 128, p)
+                .0
                 .iter()
                 .any(|s| (s.x - hx as f64).hypot(s.y - hy as f64) < 3.0),
-            "a seed at the hot red site: {:?}",
-            pm.detected
+            "a seed at the hot red site"
         );
     }
 
@@ -466,8 +460,8 @@ mod tests {
         }
     }
 
-    /// I1: a knot (an extended blob, ruling A3) is flagged by the matched filter on the green sum and never becomes a
-    /// seed, a fit or part of the frame statistic.
+    /// I1 / R-PC-8: a knot (an extended blob, ruling A3) is flagged by the matched filter on the green sum, HANDED to the
+    /// fit flagged and fitted (as on the mono path), and never enters the frame statistic.
     #[test]
     fn a_knot_does_not_enter_the_cfa_statistic() {
         use crate::test_support::gaussian_field;
@@ -507,25 +501,68 @@ mod tests {
             measure_green_sites(&knotted, w, h, p, &base(), None),
         );
         assert!(!a.stars.is_empty());
+        assert!(b.detected.is_empty(), "given seeds leave `detected` empty");
+        assert_eq!(b.seeds, seeds.len(), "every seed is handed to the fit");
+        assert_eq!(b.extended_seeds, extended.iter().filter(|&&e| e).count());
+        assert!(b.extended_seeds >= 1);
+        let knot = b
+            .stars
+            .iter()
+            .find(|s| near(s.x, s.y))
+            .expect("the knot is handed and fitted");
         assert!(
-            b.detected.iter().any(|s| near(s.x, s.y)),
-            "the knot is among the detected seeds (it counts in stars_detected)"
+            knot.flags.contains(crate::star_measure::StarFlags::EXTENDED),
+            "{:?}",
+            knot.flags
         );
-        assert!(
-            b.seeds < b.detected.len(),
-            "a knot seed was handed to the fit: {} of {} seeds",
-            b.seeds,
-            b.detected.len()
-        );
-        assert!(
-            !b.stars.iter().any(|s| near(s.x, s.y)),
-            "a knot is among the accepted fits"
-        );
-        assert_eq!(a.stars.len(), b.stars.len());
         let (fa, fb) = (a.frame.fwhm_px.unwrap(), b.frame.fwhm_px.unwrap());
         assert!(
             (fb / fa - 1.0).abs() < 0.01,
             "frame FWHM {fb} vs {fa} without the knot"
+        );
+    }
+
+    /// R-PC-8: a bright broad star (1.3 F at SNR 300, the injector's rung that the significance test flags) among F-width
+    /// stars is fitted and flagged `extended`; the frame statistic is within 1 % of the run without it.
+    #[test]
+    fn a_bright_broad_star_on_a_mosaic_is_fitted_and_flagged() {
+        let p = BayerPattern::Rggb;
+        let (w, h) = (400, 300);
+        let mut stars = Vec::new();
+        for j in 0..3 {
+            for i in 0..5 {
+                stars.push(star(
+                    50.0 + 80.0 * f64::from(i),
+                    50.0 + 80.0 * f64::from(j) + 3.3,
+                    700.0,
+                    4.0,
+                ));
+            }
+        }
+        let plain = mosaic(p, w, h, &stars, 5);
+        let broad = (90.3, 94.8);
+        stars.push(star(broad.0, broad.1, 20000.0, 1.3 * 4.0));
+        let with = mosaic(p, w, h, &stars, 5);
+        let near = |x: f64, y: f64| (x - broad.0).hypot(y - broad.1) < 4.0;
+        let (a, b) = (
+            measure_green_sites(&plain, w, h, p, &base(), None),
+            measure_green_sites(&with, w, h, p, &base(), None),
+        );
+        let star_b = b
+            .stars
+            .iter()
+            .find(|s| near(s.x, s.y))
+            .expect("the broad star is in pm.stars");
+        assert!(
+            star_b.flags.extended(),
+            "premise: the significance test flags it ({:?}, extended seeds {})",
+            star_b.flags,
+            b.extended_seeds
+        );
+        let (fa, fb) = (a.frame.fwhm_px.unwrap(), b.frame.fwhm_px.unwrap());
+        assert!(
+            (fb / fa - 1.0).abs() < 0.01,
+            "frame FWHM {fb} vs {fa} without it"
         );
     }
 

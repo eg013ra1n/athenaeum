@@ -230,6 +230,35 @@ pub struct MeasureOptions {
     /// reads one phase of the mosaic and hands it in). `Some` = used as is and the plane is not sampled for it;
     /// `None` (the default) = [`domain::sky_level`] on the native plane.
     pub sky: Option<SkyLevel>,
+    /// The knot flags of [`SeedSpec::Given`] seeds (Plan C C3 r3): `given_extended[i]` marks given seed `i` extended,
+    /// which is fitted and kept out of `c`'s qualifiers and the frame statistic exactly as the matched filter's own
+    /// flagged seeds are (ruling P3). Empty = all false; a length other than the seeds' = a `warn!` and all false.
+    /// Ignored for the module's own seed sources, whose detection report carries the flags.
+    pub given_extended: Vec<bool>,
+}
+
+/// The ONE `extended` slice of a plane (Plan C C3 r3): the matched filter's flags, else the given seeds' own
+/// ([`MeasureOptions::given_extended`]), else empty (= all false).
+fn extended_flags<'a>(
+    detection: Option<&'a DetectionReport>,
+    opts: &'a MeasureOptions,
+    seeds: usize,
+) -> &'a [bool] {
+    if let Some(d) = detection {
+        return d.extended.as_slice();
+    }
+    if opts.given_extended.is_empty() || !matches!(opts.seeds, SeedSpec::Given(_)) {
+        return &[];
+    }
+    if opts.given_extended.len() != seeds {
+        tracing::warn!(
+            seeds,
+            flags = opts.given_extended.len(),
+            "measure: given_extended does not match the given seeds; every seed is read as point-like"
+        );
+        return &[];
+    }
+    opts.given_extended.as_slice()
 }
 
 /// What [`measure_plane`] fits (Plan A Task 12, spec D-3): `All` fits every seed (the stacking Measure's path,
@@ -290,6 +319,7 @@ impl Default for MeasureOptions {
             cfa_site_share: None,
             mode: Mode::All,
             sky: None,
+            given_extended: Vec::new(),
         }
     }
 }
@@ -417,6 +447,9 @@ pub struct PlaneMeasurement {
     pub sky: SkyLevel,
     /// Seeds handed to the fitter.
     pub seeds: usize,
+    /// How many of the plane's seeds carry the `extended` flag (the matched filter's, or [`MeasureOptions::given_extended`]):
+    /// the knots, fitted and kept out of the statistic. Over all the plane's seeds, not just the fitted ones.
+    pub extended_seeds: usize,
     /// The seeds the module's own matched filter found ([`SeedSpec::MatchedFilter`]); empty for given seeds, which
     /// the caller already holds (Task 7: the stacking adapter returns them to the lab's probe).
     pub detected: Vec<Seed>,
@@ -608,11 +641,10 @@ fn pass_seeds<'a>(
 /// The seeds a fit call runs on and their knot flags: all of them (borrowed, no copy) or the population's `fitted`.
 fn fit_inputs<'a>(
     seeds: &'a [Seed],
-    detection: Option<&'a DetectionReport>,
+    extended: &'a [bool],
     population: Option<&Population>,
     prefix: Option<usize>,
 ) -> (Cow<'a, [Seed]>, Cow<'a, [bool]>) {
-    let extended = detection.map_or(&[][..], |d| d.extended.as_slice());
     match population {
         None => match prefix {
             // `Mode::Brightest`: the first k seeds (still borrowed, no copy) and their knot flags.
@@ -911,7 +943,7 @@ pub fn plane_beta(
     );
     let (fit_seeds, extended) = fit_inputs(
         &prep.seeds,
-        prep.detection.as_ref(),
+        extended_flags(prep.detection.as_ref(), opts, prep.seeds.len()),
         prep.population.as_ref(),
         prefix,
     );
@@ -1076,7 +1108,7 @@ fn prepare_working(
         Mode::Brightest { k } => Some(k),
         _ => None,
     };
-    let (pass_seeds, _) = fit_inputs(&head.seeds, None, population.as_ref(), prefix);
+    let (pass_seeds, _) = fit_inputs(&head.seeds, &[], population.as_ref(), prefix);
     let passes = prepare_passes(
         working,
         w,
@@ -1437,7 +1469,16 @@ fn finish_working(
         expected_prefix(opts.mode, seeds.len(), population.is_some()),
         "prepared plane's record count disagrees with opts.mode"
     );
-    let (fit_seeds, extended) = fit_inputs(&seeds, detection.as_ref(), population.as_ref(), prefix);
+    let extended_seeds = extended_flags(detection.as_ref(), opts, seeds.len())
+        .iter()
+        .filter(|&&e| e)
+        .count();
+    let (fit_seeds, extended) = fit_inputs(
+        &seeds,
+        extended_flags(detection.as_ref(), opts, seeds.len()),
+        population.as_ref(),
+        prefix,
+    );
     let (in_statistic, _) = population
         .as_ref()
         .map_or((Vec::new(), Vec::new()), Population::fit_flags);
@@ -1569,6 +1610,7 @@ fn finish_working(
         noise,
         sky,
         seeds: seeds.len(),
+        extended_seeds,
         detected: if detected { seeds } else { Vec::new() },
         field_width,
         refused,
@@ -1638,14 +1680,20 @@ fn measure_budget(
     // The shared stratified rank (Task 13b): by the detection's filter SNR, the knot-flagged and pre-fit saturated seeds
     // last; the seeds of a plane without a detection report rank by detector order.
     let pre = population::pre_saturated(working, opts.mask.as_deref(), w, h, &seeds, &saturation);
+    let all_extended = extended_flags(detection.as_ref(), opts, seeds.len());
     let (brightness, skip): (Vec<f64>, Vec<bool>) = match detection.as_ref() {
         Some(d) => (
             d.filter_snr.clone(),
             (0..seeds.len())
-                .map(|i| pre[i] || d.extended.get(i).copied().unwrap_or(false))
+                .map(|i| pre[i] || all_extended.get(i).copied().unwrap_or(false))
                 .collect(),
         ),
-        None => (budget::rank_brightness(seeds.len()), pre),
+        None => (
+            budget::rank_brightness(seeds.len()),
+            (0..seeds.len())
+                .map(|i| pre[i] || all_extended.get(i).copied().unwrap_or(false))
+                .collect(),
+        ),
     };
     let (candidates, _counts) = budget::select_candidates(&seeds, &brightness, &skip, w, h, budget);
     let select_time = select_t.elapsed();
@@ -1654,12 +1702,15 @@ fn measure_budget(
         .map(|s| budget::cell_of(s.x, s.y, w, h))
         .collect();
     let sub: Vec<Seed> = candidates.iter().map(|&i| seeds[i]).collect();
-    let extended: Vec<bool> = detection.as_ref().map_or(Vec::new(), |d| {
+    let extended_seeds = all_extended.iter().filter(|&&e| e).count();
+    let extended: Vec<bool> = if all_extended.is_empty() {
+        Vec::new()
+    } else {
         candidates
             .iter()
-            .map(|&i| d.extended.get(i).copied().unwrap_or(false))
+            .map(|&i| all_extended.get(i).copied().unwrap_or(false))
             .collect()
-    });
+    };
     let prepared = prepare_passes(working, w, h, opts, pool, &sub, field_width, saturation);
     let Passes {
         fit_field,
@@ -1796,6 +1847,7 @@ fn measure_budget(
         noise,
         sky,
         seeds: seeds.len(),
+        extended_seeds,
         detected: if detected { seeds } else { Vec::new() },
         field_width,
         refused,
@@ -2499,6 +2551,71 @@ mod tests {
             .iter()
             .find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0)
             .expect("the blob is seeded and fitted");
+        assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
+    }
+
+    /// C3 r3 (R-PC-8): the P3 test on GIVEN seeds. The matched filter's seeds and flags are handed in as
+    /// `SeedSpec::Given` + `given_extended`: the blob is fitted and flagged, not a qualifier, out of the statistic, as with
+    /// the module's own seeds. Without the flags the same seeds make the blob a 31st qualifier (the premise, RED before
+    /// the seam), and a flag vector of the wrong length is read as all false.
+    #[test]
+    fn given_seeds_carry_their_extended_flags() {
+        use crate::test_support::{add_noise, gaussian_field};
+        let stars = grid30(5.0);
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        let f = 2.0 * 5.0 * (2f64.powf(0.25) - 1.0).sqrt();
+        let g = gaussian_field(480, 400, &[(95.3, 94.8, 0.05)], 3.0 * f / 2.354_820_045, 0.0);
+        for (d, b) in data.iter_mut().zip(g) {
+            *d += b;
+        }
+        add_noise(&mut data, 0.002, 35);
+        let own = measure_plane(
+            &data,
+            480,
+            400,
+            &MeasureOptions {
+                seeds: SeedSpec::MatchedFilter {
+                    threshold: DEFAULT_THRESHOLD,
+                },
+                psf_model: PsfModel::Fixed(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let flags = own.detection.as_ref().unwrap().extended.clone();
+        assert!(flags.iter().any(|&e| e), "premise: the filter flags the blob");
+        let given = |extended: Vec<bool>| {
+            measure_plane(
+                &data,
+                480,
+                400,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(own.detected.clone()),
+                    given_extended: extended,
+                    psf_model: PsfModel::Fixed(4.0),
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        let (flagged, bare, short) = (
+            given(flags.clone()),
+            given(Vec::new()),
+            given(vec![true; 3]),
+        );
+        assert_eq!(bare.aperture_stars, 31, "premise: unflagged, the blob qualifies");
+        assert_eq!(short.aperture_stars, 31, "a length mismatch reads all false");
+        assert_eq!(flagged.aperture_stars, 30, "the flagged blob is not a qualifier");
+        assert_eq!(flagged.extended_seeds, flags.iter().filter(|&&e| e).count());
+        assert_eq!(own.extended_seeds, flagged.extended_seeds);
+        assert!(flagged.detected.is_empty() && flagged.detection.is_none());
+        let (fo, fg) = (own.frame.fwhm_px.unwrap(), flagged.frame.fwhm_px.unwrap());
+        assert!((fg / fo - 1.0).abs() < 0.005, "frame FWHM {fg} vs {fo} with own seeds");
+        let blob = flagged
+            .stars
+            .iter()
+            .find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0)
+            .expect("the blob is fitted");
         assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
     }
 

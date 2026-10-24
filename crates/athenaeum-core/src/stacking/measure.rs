@@ -1022,6 +1022,7 @@ fn module_options(
         cfa_site_share,
         mode,
         sky: None,
+        given_extended: Vec::new(),
     }
 }
 
