@@ -252,8 +252,8 @@ fn extended_flags<'a>(
     }
     if opts.given_extended.len() != seeds {
         tracing::warn!(
-            seeds,
-            flags = opts.given_extended.len(),
+            count = seeds,
+            given_flags = opts.given_extended.len(),
             "measure: given_extended does not match the given seeds; every seed is read as point-like"
         );
         return &[];
@@ -1563,6 +1563,11 @@ fn finish_working(
     }
     // The fits' signals already carry the plane's aperture correction (F-5: measured after the duplicate drop, inside
     // the fit call), so the totals read the corrected flux. The frame statistic reads population (a) alone.
+    for d in &mut diagnostics {
+        if let Some(s) = seeds.get(d.seed) {
+            (d.x, d.y) = (s.x, s.y);
+        }
+    }
     let frame = match &population {
         None => FrameAggregates::of_timed(&outcome.fits, Some(&sub)),
         Some(_) => {
@@ -1819,6 +1824,12 @@ fn measure_budget(
     } else {
         Vec::new()
     };
+    let mut diagnostics = diagnostics;
+    for d in &mut diagnostics {
+        if let Some(s) = seeds.get(d.seed) {
+            (d.x, d.y) = (s.x, s.y);
+        }
+    }
     let frame = FrameAggregates::of_timed(&stars, Some(&steps));
     let snr_missing = stars.iter().filter(|f| f.snr.is_nan()).count();
     let ring_sky_missing = stars.iter().filter(|f| f.sky_ring_n == 0).count();
@@ -1885,6 +1896,8 @@ fn measure_budget(
 fn not_selected_record(seed: usize) -> FitDiagnostics {
     FitDiagnostics {
         seed,
+        x: f64::NAN,
+        y: f64::NAN,
         outcome: Outcome::NotSelected,
         region_radius: 0,
         background_start: f64::NAN,

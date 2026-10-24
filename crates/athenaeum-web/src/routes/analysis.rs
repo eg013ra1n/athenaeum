@@ -7,7 +7,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
-use athenaeum_core::analysis::config::{AnalysisConfig, AnalysisPsfModel};
+use athenaeum_core::analysis::config::AnalysisConfig;
 use athenaeum_core::api::analysis as api;
 use athenaeum_core::flat_analysis::FlatContourOpts;
 use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse};
@@ -172,6 +172,7 @@ pub async fn compute_flat_contour_plot(
 #[cfg(test)]
 mod analysis_config_tests {
     use super::*;
+    use athenaeum_core::analysis::config::AnalysisPsfModel;
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
     use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};

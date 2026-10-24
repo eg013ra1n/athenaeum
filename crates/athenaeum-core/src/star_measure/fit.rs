@@ -746,6 +746,8 @@ impl FitTrace {
     ) -> FitDiagnostics {
         FitDiagnostics {
             seed,
+            x: f64::NAN,
+            y: f64::NAN,
             outcome,
             region_radius: self.region_radius,
             background_start: self.background_start,

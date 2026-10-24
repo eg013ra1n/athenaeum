@@ -12,6 +12,7 @@ use anyhow::Result;
 use super::cfa;
 use super::config::{AnalysisConfig, AnalysisPsfModel};
 use super::input::{read_raw_frame, RawFrame, RawPlanes};
+use crate::star_measure::frame::finite_median;
 use super::trail::trail_r_squared;
 use crate::models::{FrameAnalysis, StarMetric};
 use crate::star_measure::{
@@ -75,21 +76,6 @@ pub fn measure_raw_frame_with(
     }
 }
 
-/// The median of a slice (the mean of the two middle values for an even count); 0.0 for an empty one.
-fn median(mut v: Vec<f64>) -> f64 {
-    v.retain(|x| x.is_finite());
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
-}
-
 /// A non-finite number written as 0.0, so no column of a row is NaN.
 fn finite_or_zero(x: f64) -> f64 {
     if x.is_finite() {
@@ -150,8 +136,8 @@ pub fn map_measurement(
     let noise = finite_or_zero(pm.noise.sigma);
     let frame_snr = if noise > 0.0 { background / noise } else { 0.0 };
     let (snr_weight, psf_signal) = if noise > 0.0 && !stat.is_empty() {
-        let flux = median(stat.iter().map(|f| f.signal).collect());
-        let amp = median(stat.iter().map(|f| f.amplitude).collect());
+        let flux = finite_median(stat.iter().map(|f| f.signal)).unwrap_or(0.0);
+        let amp = finite_median(stat.iter().map(|f| f.amplitude)).unwrap_or(0.0);
         let w = if background > 0.0 {
             flux * flux / (noise * noise * background)
         } else {
@@ -215,7 +201,8 @@ pub fn analyze_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     config_hash: &str,
 ) -> Result<(FrameAnalysis, Vec<StarMetric>, bool)> {
-    let frame = read_raw_frame(Path::new(path))?;
+    let mut frame = read_raw_frame(Path::new(path))?;
+    frame.drop_unmeasured_planes();
     let (analysis, stars) = analyze_raw_frame(&frame, config, pool, config_hash);
     Ok((analysis, stars, frame.flip_vertical))
 }
@@ -323,6 +310,61 @@ mod tests {
         for s in &stars {
             assert!(s.fwhm_x >= s.fwhm_y && s.eccentricity >= 0.0 && s.eccentricity < 1.0);
             assert!(s.x.is_finite() && s.y.is_finite() && s.peak > 0.0 && s.flux > 0.0);
+        }
+    }
+
+    /// R-PC-5 / R-PC-8: `stars_detected` counts the matched filter's point-like seeds. A 3F Gaussian knot is a seed the
+    /// module flags `extended`: it is fitted but is not counted, in every layout (mono, a mosaic's green sites, a
+    /// debayered file's G plane), so the count with the knot equals the count without it.
+    #[test]
+    fn stars_detected_leaves_knots_out_in_every_layout() {
+        use crate::test_support::gaussian_field;
+        let (w, h) = (320, 240);
+        let stars = grid_stars(40, w, h, 3.5, 21);
+        let knot = (160.3, 120.8);
+        let g = gaussian_field(w, h, &[(knot.0, knot.1, 400.0)], 3.0 * 3.5 / 2.354_820_045, 0.0);
+        let plane = |with_knot: bool, seed: u64| {
+            let mut p = moffat_field(w, h, &stars, 4.0, 1000.0);
+            if with_knot {
+                for (d, b) in p.iter_mut().zip(&g) {
+                    *d += b;
+                }
+            }
+            add_noise(&mut p, 6.0, seed);
+            p
+        };
+        let frame = |planes: RawPlanes, channels| RawFrame {
+            planes,
+            w,
+            h,
+            domain: RAW,
+            flip_vertical: false,
+            channels,
+        };
+        let make = |name: &str, k: bool| match name {
+            "mono" => frame(RawPlanes::Mono(plane(k, 5)), 1),
+            "cfa" => frame(
+                RawPlanes::Cfa {
+                    mosaic: plane(k, 5),
+                    pattern: BayerPattern::Rggb,
+                },
+                1,
+            ),
+            _ => frame(
+                RawPlanes::Rgb([plane(false, 3), plane(k, 5), plane(false, 4)]),
+                3,
+            ),
+        };
+        for name in ["mono", "cfa", "rgb"] {
+            let (plain, knotted) = (make(name, false), make(name, true));
+            let pm = measure_raw_frame(&knotted, &cfg(), None);
+            assert!(pm.extended_seeds >= 1, "{name}: the knot is flagged extended");
+            let found = if pm.detected.is_empty() { pm.seeds } else { pm.detected.len() };
+            let (a, _) = analyze_raw_frame(&plain, &cfg(), None, "h");
+            let (b, _) = analyze_raw_frame(&knotted, &cfg(), None, "h");
+            assert_eq!(b.stars_detected, (found - pm.extended_seeds) as i64, "{name}");
+            assert_eq!(b.stars_detected, a.stars_detected, "{name}: the knot is not counted");
+            assert!(b.stars_detected >= 30, "{name}: {}", b.stars_detected);
         }
     }
 

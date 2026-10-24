@@ -50,6 +50,17 @@ pub struct RawFrame {
     pub channels: usize,
 }
 
+impl RawFrame {
+    /// A debayered file is measured on its G plane alone: free R and B (about two thirds of the frame's memory) once the
+    /// read is done. A no-op for mono and mosaic frames; the measurement never reads the emptied planes.
+    pub fn drop_unmeasured_planes(&mut self) {
+        if let RawPlanes::Rgb(planes) = &mut self.planes {
+            planes[0] = Vec::new();
+            planes[2] = Vec::new();
+        }
+    }
+}
+
 /// The header facts the domain needs.
 #[derive(Debug, Default)]
 struct HeaderFacts {
@@ -259,7 +270,12 @@ fn finite_max_full_scale(path: &Path, max: f32) -> f64 {
 fn read_bitpix16_bzero0(path: &Path, plane: &[u16]) -> (Vec<f32>, f64) {
     let max = plane.iter().copied().max().unwrap_or(0);
     let full = if max > 32767 { 65535.0 } else { 32767.0 };
-    tracing::debug!(path = %path.display(), plane_max = max, full_scale = full, "BITPIX 16 / BZERO 0 full scale chosen");
+    if max > 32767 {
+        // Only the 32768 offset can produce a value above 32767 from a BZERO 0 file (R-PC-1a).
+        tracing::warn!(path = %path.display(), plane_max = max, "BITPIX 16 / BZERO 0 file read with the 32768 offset");
+    } else {
+        tracing::debug!(path = %path.display(), plane_max = max, full_scale = full, "BITPIX 16 / BZERO 0 full scale chosen");
+    }
     (plane.iter().map(|&x| f32::from(x)).collect(), full)
 }
 
@@ -399,9 +415,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.fits");
         write_fits(&p, 16, &[3, 1], &[], &be16(&[-30000, 0, 32767]));
-        let f = read_raw_frame(&p).unwrap();
+        let (f, log) = warn_log(|| read_raw_frame(&p).unwrap());
         assert_eq!(mono(&f), &[2768.0, 32768.0, 65535.0]);
         assert_eq!(raw(&f).1, 65535.0);
+        assert_eq!(log.len(), 1, "one warn per offset-read file: {log:?}");
+        assert!(
+            log[0].iter().any(|(k, v)| k == "path" && v.contains("a.fits")),
+            "the warn names the path: {:?}",
+            log[0]
+        );
+        assert!(log[0].iter().any(|(k, v)| k == "plane_max" && v == "65535"));
     }
 
     #[test]

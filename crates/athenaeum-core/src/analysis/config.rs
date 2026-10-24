@@ -44,7 +44,7 @@ pub struct AnalysisConfig {
     #[serde(default = "default_max_stars")]
     pub max_stars: u32,
     /// Concurrent frames during batch analysis. Default: auto (cores/3, min 2).
-    /// Higher values increase throughput but use more memory (~200MB per concurrent frame).
+    /// Higher values increase throughput but use more memory (several hundred MB per concurrent 36 MP frame: a plane is 4 bytes a pixel and the measurement copies it; a debayered file keeps only its G plane while measured).
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
 }
@@ -123,7 +123,11 @@ pub fn load_config(conn: &rusqlite::Connection) -> AnalysisConfig {
             );
             AnalysisConfig::default()
         }),
-        _ => AnalysisConfig::default(),
+        Ok(None) => AnalysisConfig::default(),
+        Err(e) => {
+            tracing::warn!(key = "analysis.config", error = %e, "analysis config could not be read; using the default");
+            AnalysisConfig::default()
+        }
     }
 }
 

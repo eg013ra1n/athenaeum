@@ -348,7 +348,7 @@ fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
         Outcome::Trimmed => "trimmed",
     };
     let mut line = json!({
-        "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "reason": reason,
+        "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "x": n_or_null(d.x), "y": n_or_null(d.y), "reason": reason,
         "regionRadius": d.region_radius, "backgroundStart": n_or_null(d.background_start / ADU_SCALE as f64),
         "widthStart": n_or_null(d.width_start), "growthSteps": d.growth_steps, "iterations": d.iterations,
         "converged": d.converged, "verdict": verdict_json(d.verdict),
@@ -1185,9 +1185,21 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
     if let (Some(c), sm::Domain::RawAdu { clip, .. }) = (a.clip, &mut frame.domain) {
         *clip = c;
     }
-    let budget = a.budget.unwrap_or(sm::budget::DEFAULT_BUDGET);
-    let psf_model = a.psf.unwrap_or(sm::budget::ANALYSIS_PSF_MODEL);
-    let threshold = a.seed_threshold.unwrap_or(sm::DEFAULT_THRESHOLD);
+    let defaults = AnalysisConfig::default();
+    let budget = a.budget.unwrap_or(defaults.max_stars as usize);
+    let psf_model = match a.psf {
+        None => match defaults.psf_model {
+            AnalysisPsfModel::Moffat4 => PsfModel::Moffat4,
+            AnalysisPsfModel::Auto => PsfModel::Auto,
+        },
+        Some(m @ (PsfModel::Moffat4 | PsfModel::Auto)) => m,
+        Some(_) => {
+            return Err(
+                "the analysis-mode path fits moffat4 or auto: --psf moffat4|auto".into(),
+            )
+        }
+    };
+    let threshold = a.seed_threshold.unwrap_or(defaults.detection_threshold);
     let config = AnalysisConfig {
         detection_threshold: threshold,
         psf_model: match psf_model {
@@ -1227,7 +1239,7 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
             "seedSource": "matchedFilter", "seedThreshold": threshold,
             "psfModel": match psf_model { PsfModel::Moffat4 => "moffat4", _ => "auto" },
             "budget": budget, "clip": clip, "fullScale": full_scale, "gainEPerAdu": gain,
-            "maxStars": 24576,
+            "maxStars": sm::MeasureOptions::default().max_stars,
         },
         "channels": frame.channels,
         "cfa": matches!(frame.planes, RawPlanes::Cfa { .. }),
@@ -1637,7 +1649,19 @@ mod tests {
         assert!(lines
             .iter()
             .filter(|v| v["kind"] == "refused")
-            .all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
+            .all(|v| v["reason"].is_string()
+                && v["regionRadius"].is_u64()
+                && v["x"].is_number()
+                && v["y"].is_number()));
+        let edge = lines
+            .iter()
+            .find(|v| v["kind"] == "refused" && v["reason"] == "outsideImage")
+            .unwrap();
+        assert!(
+            (edge["x"].as_f64().unwrap() - 232.0).abs() < 2.0
+                && (edge["y"].as_f64().unwrap() - 160.0).abs() < 2.0,
+            "the refused line names the seed's native position: {edge}"
+        );
     }
 
     /// Plan A Task 6b round 1 (ruling R3): the betas arm starts from the measure path's field width, so at the measure's

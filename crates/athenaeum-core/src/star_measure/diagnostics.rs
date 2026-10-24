@@ -115,6 +115,10 @@ pub enum Outcome {
 pub struct FitDiagnostics {
     /// The seed's index in the seed list the fitter was handed (the probe's seed line `i`).
     pub seed: usize,
+    /// The seed's position in the plane's native pixels (the handed seed list's `x`, `y`): `seed` is an index into a list
+    /// the caller may not hold (the CFA path hands its own), so the lab matches refusals by position.
+    pub x: f64,
+    pub y: f64,
     pub outcome: Outcome,
     /// The sampling region's radius, px (the square is `(2r+1)²`).
     pub region_radius: u16,
