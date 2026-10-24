@@ -415,8 +415,8 @@ mod tests {
         );
     }
 
-    /// Today's (pre-C6) `frame_analysis` and `star_metrics`, with one row each and two stars. Only the two tables: the
-    /// foreign keys are not enforced on a bare connection.
+    /// Today's (pre-C6) `frame_analysis` and `star_metrics`, with one row each and two stars. Only the two tables, without the
+    /// star table's foreign key; the rebuild adds it and the bundled build enforces it.
     fn old_catalog() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -467,6 +467,31 @@ mod tests {
         // A second init is a no-op.
         init_db(&conn).unwrap();
         assert_eq!(counts(&conn), (1, 2));
+    }
+
+    /// An orphan star row (its analysis deleted with enforcement off) must not make the catalog unopenable once the
+    /// rebuilt table carries the foreign key and enforcement is ON.
+    #[test]
+    fn star_metrics_rebuild_survives_an_orphan_row_under_foreign_keys() {
+        let conn = old_catalog();
+        conn.execute(
+            "INSERT INTO star_metrics (frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y, eccentricity, snr,
+                hfr, theta, beta, fit_method, fit_residual)
+             VALUES (99, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 0.0, NULL, 'gaussian', 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(get_star_metrics(&conn, 1).unwrap().len(), 2);
+        assert_eq!(get_star_metrics(&conn, 99).unwrap().len(), 0, "the orphan is gone");
+        assert_eq!(counts(&conn), (1, 2));
+        // The retired ids are not reused: the next star gets an id above the orphan's.
+        let mut s = star(1);
+        s.snr = None;
+        upsert_star_metrics(&conn, 1, &[s]).unwrap();
+        let max: i64 = conn.query_row("SELECT MAX(id) FROM star_metrics", [], |r| r.get(0)).unwrap();
+        assert!(max >= 4, "AUTOINCREMENT high-water mark carried, got {max}");
     }
 
     #[test]

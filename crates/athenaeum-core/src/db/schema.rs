@@ -2052,8 +2052,34 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if snr_not_null == 1 {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
+        let started = std::time::Instant::now();
+        let rebuilt = (|| -> Result<i64> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            // Desktop and web may share one catalog: re-probe under the write lock.
+            let still_not_null: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(\"notnull\"), 0) FROM pragma_table_info('star_metrics') WHERE name = 'snr'",
+            [],
+            |row| row.get(0),
+        )?;
+            if still_not_null != 1 {
+                return Ok(0);
+            }
+            // Rows whose analysis is gone (deleted with enforcement off) would violate the new foreign key.
+            let orphans: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM star_metrics WHERE frame_analysis_id NOT IN (SELECT id FROM frame_analysis)",
+            [],
+            |row| row.get(0),
+        )?;
+            if orphans > 0 {
+                tracing::warn!(
+                    count = orphans,
+                    "schema: star_metrics rebuild drops orphan star rows"
+                );
+            }
+            tx.execute_batch(
             "CREATE TABLE star_metrics_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 frame_analysis_id INTEGER NOT NULL,
@@ -2079,13 +2105,30 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             ) SELECT
                 id, frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
                 eccentricity, snr, hfr, theta, beta, fit_method, fit_residual
-            FROM star_metrics;
+            FROM star_metrics
+            WHERE frame_analysis_id IN (SELECT id FROM frame_analysis);
+            -- Carry the AUTOINCREMENT high-water mark: the rename leaves the new table without the old one's
+            -- sqlite_sequence row, and retired ids would otherwise be reused.
+            UPDATE sqlite_sequence
+               SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'star_metrics'), 0))
+             WHERE name = 'star_metrics_new';
             DROP TABLE star_metrics;
             ALTER TABLE star_metrics_new RENAME TO star_metrics;
             CREATE INDEX IF NOT EXISTS idx_star_metrics_analysis_id ON star_metrics(frame_analysis_id);",
         )?;
-        tx.commit()?;
-        tracing::info!("schema: star_metrics rebuilt with nullable snr / hfr");
+            let kept: i64 =
+                tx.query_row("SELECT COUNT(*) FROM star_metrics", [], |row| row.get(0))?;
+            tx.commit()?;
+            Ok(kept)
+        })();
+        let kept = rebuilt.inspect_err(|e| {
+            tracing::error!(error = %e, "schema: star_metrics rebuild failed");
+        })?;
+        tracing::info!(
+            count = kept,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "schema: star_metrics rebuilt with nullable snr / hfr"
+        );
     }
 
     // Calibration set originals table - stores original metadata values before custom edits
