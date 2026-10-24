@@ -606,11 +606,10 @@ pub(crate) fn blind_gate_ok(
 /// Reads the frame's own analysis, when it has one and the current measurement wrote it (`measure_version` equal to
 /// `star_measure::MEASURE_VERSION`; a legacy row is not trusted and never refuses). A frame whose stars are streaks has
 /// nothing for the solver to match, and letting it through costs minutes per frame while the autoFOV ladder is walked
-/// to its end. The measurement's own verdict decides first (PC-13): `trailed` refuses on that alone, and `defocused` /
-/// `no_stars` never refuse (the solver's minimum-star refusal is fast). Then the old pair — both thresholds must be
-/// crossed; measured on real files (2026-09-05), frames that solve correctly sit at eccentricity 0.62–0.72 with trail
-/// R² 0.30–0.57, and hopeless ones at 0.90–0.96 with 0.73–0.93, so either test alone would refuse frames that are
-/// perfectly solvable (C7 decides the pair's fate, PC-12).
+/// to its end. The measurement's own verdict decides, and alone (PC-13, PC-12 REMOVE): `trailed` refuses; every other
+/// row — `defocused`, `no_stars`, a measured frame of any eccentricity or trail R² — passes (the solver's
+/// minimum-star refusal is fast). The former eccentricity / trail-R² pair refused no hopeless frame the verdict lets
+/// through without also refusing a solvable one (`docs/platesolving/input-and-acceptance-gates.md`).
 ///
 /// A frame with no analysis is never refused here — the answer is unknown, and the solver's own detection cut is the
 /// backstop.
@@ -635,20 +634,6 @@ pub fn input_gate_reason(
         return Some(
             "Stars are trails the measurement could not fit — nothing to match".to_string(),
         );
-    }
-    if matches!(
-        a.frame_verdict,
-        Some(crate::models::FrameVerdict::Defocused | crate::models::FrameVerdict::NoStars)
-    ) {
-        return None;
-    }
-    if a.median_eccentricity >= config.input_max_eccentricity
-        && a.trail_r_squared >= config.input_min_trail_r2
-    {
-        return Some(format!(
-            "Stars are trailed (eccentricity {:.2}, trail R² {:.2}) — nothing to match",
-            a.median_eccentricity, a.trail_r_squared
-        ));
     }
     None
 }
@@ -747,10 +732,10 @@ mod tests {
         assert!(blind_gate_ok(GateStage::ScaleCleared, &real, &cfg));
     }
 
-    /// The input gate refuses a frame whose own analysis says its stars are
-    /// streaks — and refuses nothing else. The numbers are the measured ones:
-    /// frames that solve correctly sit at 0.62–0.72 eccentricity with trail
-    /// R² 0.30–0.57; hopeless ones at 0.90–0.96 with 0.73–0.93.
+    /// The input gate refuses a frame whose own analysis carries the `trailed` verdict — and refuses nothing else,
+    /// whatever the eccentricity / trail R² (the pair was removed, Plan C C7). The numbers are the 2026-09-05 ones:
+    /// frames that solve correctly sit at 0.62–0.72 eccentricity with trail R² 0.30–0.57; hopeless ones at
+    /// 0.90–0.96 with 0.73–0.93.
     #[test]
     fn input_gate_refuses_trailed_frames_and_passes_the_rest() {
         use crate::db::schema::init_db;
@@ -759,7 +744,7 @@ mod tests {
         init_db(&conn).unwrap();
         let cfg = PlateSolveConfig::default();
 
-        let seed = |fid: i64, ecc: f64, trail: f64| {
+        let seed = |fid: i64, ecc: f64, trail: f64, verdict: Option<crate::models::FrameVerdict>| {
             conn.execute(
                 "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
                  VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",
@@ -793,17 +778,19 @@ mod tests {
                 analyzed_at: "2026-09-05T00:00:00Z".into(),
                 measure_version: Some(crate::star_measure::MEASURE_VERSION),
                 stars_refused: None,
-                frame_verdict: None,
+                frame_verdict: verdict,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         };
 
-        seed(1, 0.96, 0.73); // wind-shaken: refused
-        seed(2, 0.72, 0.57); // trailed but solvable: passed
-        seed(3, 0.62, 0.30); // the doubled frame, solves in 0.3 s: passed
-        seed(4, 0.91, 0.40); // elongated optics, not a tracking failure: passed
+        seed(1, 0.96, 0.73, Some(crate::models::FrameVerdict::Trailed)); // wind-shaken: refused on the verdict
+        seed(2, 0.72, 0.57, None); // trailed but solvable: passed
+        seed(3, 0.62, 0.30, None); // the doubled frame, solves in 0.3 s: passed
+        seed(4, 0.91, 0.40, None); // elongated optics, not a tracking failure: passed
+        seed(5, 0.96, 0.73, None); // the same numbers WITHOUT the verdict: passed (the pair is gone)
 
         assert!(input_gate_reason(&conn, 1, &cfg).is_some(), "streaks are refused");
+        assert!(input_gate_reason(&conn, 5, &cfg).is_none(), "numbers alone never refuse");
         assert!(input_gate_reason(&conn, 2, &cfg).is_none(), "a solvable trail passes");
         assert!(input_gate_reason(&conn, 3, &cfg).is_none(), "the doubled frame passes");
         assert!(
@@ -896,13 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn the_input_gate_refuses_a_current_row_by_the_pair() {
-        let cur = Some(crate::star_measure::MEASURE_VERSION);
-        let conn = gate_conn(&[(0.95, 0.9, cur, None)]);
-        assert!(input_gate_reason(&conn, 1, &PlateSolveConfig::default()).is_some());
-    }
-
-    #[test]
     fn the_input_gate_passes_an_elongated_measured_frame() {
         let cur = Some(crate::star_measure::MEASURE_VERSION);
         let conn = gate_conn(&[(0.73, 0.57, cur, None)]);
@@ -913,7 +893,7 @@ mod tests {
     fn the_input_gate_never_refuses_defocused_or_no_stars() {
         use crate::models::FrameVerdict;
         let cur = Some(crate::star_measure::MEASURE_VERSION);
-        // The rows carry numbers far over the pair's thresholds: the verdict alone decides, and these two never refuse.
+        // The rows carry the old pair's hopeless numbers: the verdict alone decides, and these two never refuse.
         let conn = gate_conn(&[
             (0.95, 0.9, cur, Some(FrameVerdict::Defocused)),
             (0.95, 0.9, cur, Some(FrameVerdict::NoStars)),

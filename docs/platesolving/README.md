@@ -308,7 +308,7 @@ The batch driver is `plate_solve_batch` in the Tauri command and its Axum mirror
 
 ### 1. Load and gate (calling thread, holds the DB)
 
-Per frame: `load_frame_with_path`, then the **input gate** `service::input_gate_reason`: when `input_gate_enabled` and the frame has a stored analysis whose `median_eccentricity >= input_max_eccentricity` AND `trail_r_squared >= input_min_trail_r2`, the frame is refused ("Stars are trailed ...") and never reaches the solver. A frame without an analysis is never refused here.
+Per frame: `load_frame_with_path`, then the **input gate** `service::input_gate_reason`: when `input_gate_enabled` and the frame has a stored analysis of the current `measure_version` whose `frame_verdict` is `trailed`, the frame is refused ("Stars are trails the measurement could not fit ...") and never reaches the solver. The verdict alone decides (Plan C C7; the eccentricity / trail-R² pair was removed, `input-and-acceptance-gates.md`). A frame without an analysis is never refused here.
 
 ### 2. Hints
 
@@ -591,8 +591,6 @@ Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-so
 | `blind_scale_sanity_min`, `blind_scale_sanity_max` | 0.05, 60.0 | Recovered pixel scale must lie in this arcsec/px range |
 | `blind_scale_header_tol` | 8.0 | When the header implies a scale, the recovered scale must be within this factor of it |
 | `input_gate_enabled` | `true` | Refuse trailed frames before solving |
-| `input_max_eccentricity` | 0.85 | Input gate: median star eccentricity threshold (both this and the next must be crossed) |
-| `input_min_trail_r2` | 0.65 | Input gate: trail-fit R² threshold |
 | `camera_defaults` | empty | `INSTRUME` or `TELESCOP` to pixel size in micrometres; used to derive focal length when the header has no `XPIXSZ` |
 | `bright_cache_path` | none | Unread since 2026-09-10; kept so a stored config still round-trips. The solver resolves its catalog layers itself |
 
@@ -600,7 +598,7 @@ The Settings -> Plate Solving tab (`src/components/plate-solve/PlateSolveSetting
 
 - `plateSolving.catalog` ("Star Catalog"): the tier list, a recommendation from the library's fields of view, and the download.
 - `plateSolving.solver` ("Solver Parameters"): `base_verification_tolerance_arcsec`, `sip_order`, `autofind_tolerance_deg`, `batch_concurrency`.
-- `plateSolving.inputGate` ("Input Gate"): `input_gate_enabled`, `input_max_eccentricity`, `input_min_trail_r2`.
+- `plateSolving.inputGate` ("Input Gate"): `input_gate_enabled` (the two number fields left the config in Plan C C7; their controls leave the panel in C8).
 
 The `blind_*` fields and `camera_defaults` have no controls; they live only in the stored JSON. `solver_config_hash` covers the recipe version, `sip_order`, the tolerance and every `blind_*` field (the inputs of a cached stacking solve) and ignores the rest.
 
