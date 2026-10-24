@@ -27,7 +27,7 @@ semver = "1"
 # more — rustafits's JPEG encoder moved to pure-Rust libjpeg-turbo-rs — so the
 # gate is now about compile time, binary size and unused subsystems, not about
 # cmake/nasm.
-rustafits = { path = "../../rustafits", features = ["debug-pipeline"], optional = true }
+rustafits = { path = "../../rustafits", default-features = false, features = ["debug-pipeline"], optional = true }
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro", optional = true }

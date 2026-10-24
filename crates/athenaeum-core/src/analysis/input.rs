@@ -4,9 +4,9 @@
 //! planes as `f32` in the file's own ADU, and the [`star_measure::Domain::RawAdu`] the module's saturation test and
 //! SNR shot term read (`clip`, `full_scale`, `gain_e_per_adu`). Rulings PC-2 / PC-3 (amended by R-PC-1).
 //!
-//! The reader stores BITPIX 16 / BZERO 0 as the plain byte-swapped bit pattern in a `u16`; this module reinterprets
-//! it as `i16` (the FITS standard) unless more than 1 % of the values are negative, in which case the file is an
-//! offset-written unsigned one and is read as if BZERO were 32768 (R-PC-1).
+//! BITPIX 16 / BZERO 0 (R-PC-1): the rule lives in the rustafits 1.6 reader. More than 1 % negative samples means an
+//! offset-written unsigned file and the reader returns `stored + 32768`; otherwise negatives clamp to 0. This module
+//! only picks the full scale of the plane it is handed.
 
 use std::path::Path;
 
@@ -20,8 +20,6 @@ use crate::star_measure::Domain;
 
 /// ADU scale of a unit-range float file and of the XISF reader's float contract.
 const UNIT_SCALE: f32 = 65535.0;
-/// Share of negative stored values above which a BITPIX 16 / BZERO 0 file is read with the 32768 offset (R-PC-1).
-const OFFSET_NEGATIVE_SHARE: f64 = 0.01;
 
 /// The pixel planes of a raw frame, in the file's ADU, in FILE row order: `flip_vertical` is NOT applied. The reader
 /// never adjusts `bayer_pattern` for ROWORDER or a flip (fits.rs / xisf.rs pass the BAYERPAT / XISF pattern through
@@ -256,26 +254,13 @@ fn finite_max_full_scale(path: &Path, max: f32) -> f64 {
     }
 }
 
-/// BITPIX 16 / BZERO 0: the `u16` is the stored bit pattern. Signed (full scale 32767) unless more than 1 % of the
-/// values are negative, then stored + 32768 (full scale 65535), one `warn!` per file (R-PC-1).
-fn read_bitpix16_bzero0(path: &Path, bits: &[u16]) -> (Vec<f32>, f64) {
-    let negative = bits.iter().filter(|&&b| (b as i16) < 0).count();
-    let share = if bits.is_empty() {
-        0.0
-    } else {
-        negative as f64 / bits.len() as f64
-    };
-    if share > OFFSET_NEGATIVE_SHARE {
-        tracing::warn!(path = %path.display(), negative_share = share, "BITPIX 16 / BZERO 0 file read with the 32768 offset");
-        (
-            bits.iter()
-                .map(|&b| f32::from(b as i16) + 32768.0)
-                .collect(),
-            65535.0,
-        )
-    } else {
-        (bits.iter().map(|&b| f32::from(b as i16)).collect(), 32767.0)
-    }
+/// BITPIX 16 / BZERO 0: the rustafits 1.6 reader already applied the R-PC-1 rule (offset or clamp). Full scale is
+/// 65535 when the plane's maximum exceeds 32767, else 32767.
+fn read_bitpix16_bzero0(path: &Path, plane: &[u16]) -> (Vec<f32>, f64) {
+    let max = plane.iter().copied().max().unwrap_or(0);
+    let full = if max > 32767 { 65535.0 } else { 32767.0 };
+    tracing::debug!(path = %path.display(), plane_max = max, full_scale = full, "BITPIX 16 / BZERO 0 full scale chosen");
+    (plane.iter().map(|&x| f32::from(x)).collect(), full)
 }
 
 #[cfg(test)]
@@ -384,9 +369,9 @@ mod tests {
             *x = -5;
         }
         write_fits(&p, 16, &[40, 25], &[], &be16(&v));
-        let (f, n) = warns(|| read_raw_frame(&p).unwrap());
-        assert_eq!(n, 0);
-        assert_eq!(mono(&f)[0], -5.0);
+        let f = read_raw_frame(&p).unwrap();
+        // The 1.6 reader clamps the few negatives to 0.
+        assert_eq!(mono(&f)[0], 0.0);
         assert_eq!(mono(&f)[10], 100.0);
         let (clip, full, gain) = raw(&f);
         assert_eq!((clip, full, gain), (32767.0, 32767.0, None));
@@ -414,18 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.fits");
         write_fits(&p, 16, &[3, 1], &[], &be16(&[-30000, 0, 32767]));
-        let (f, log) = warn_log(|| read_raw_frame(&p).unwrap());
-        assert_eq!(log.len(), 1);
-        let field = |k: &str| log[0].iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        assert!(
-            field("path").is_some_and(|v| v.contains("a.fits")),
-            "{log:?}"
-        );
-        let share: f64 = field("negative_share")
-            .expect("negative_share")
-            .parse()
-            .unwrap();
-        assert!((share - 1.0 / 3.0).abs() < 1e-9, "share {share}");
+        let f = read_raw_frame(&p).unwrap();
         assert_eq!(mono(&f), &[2768.0, 32768.0, 65535.0]);
         assert_eq!(raw(&f).1, 65535.0);
     }
