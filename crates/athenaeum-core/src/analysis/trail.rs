@@ -1,6 +1,6 @@
 //! Trail R²: the Rayleigh statistic of the measured stars' canonical angles.
 //!
-//! Stored for compatibility and read only by the plate-solve gate pair (PC-6).
+//! Stored for wire / sync compatibility (PC-6); nothing reads it since C7 removed the plate-solve gate pair (PC-12).
 //! The legacy flag rule and its suppressions are not ported.
 
 /// Fewer measured angles than this read 0.0.

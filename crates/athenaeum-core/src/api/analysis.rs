@@ -125,6 +125,8 @@ pub fn reset_analysis_config(ctx: &ServiceContext) -> Result<AnalysisConfig, Api
 
 /// A stored analysis is stale when it was written under another config, or carries no `measure_version` (a row
 /// written between C5 and C6 keeps the current hash but the gate never trusts it, so it heals on the next batch).
+/// A row of an older `MEASURE_VERSION` is stale only because `AnalysisConfig::config_hash` folds the version: keep it
+/// folded there, or compare the version here.
 fn row_is_stale(existing: &FrameAnalysis, config_hash: &str) -> bool {
     existing.config_hash.as_deref() != Some(config_hash) || existing.measure_version.is_none()
 }
