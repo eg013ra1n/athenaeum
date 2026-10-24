@@ -3140,6 +3140,84 @@ mod tests {
         );
     }
 
+    /// Plan C C1 (6a review minor 1): the near-border growth pin under a checkerboard mask. The independent rescan
+    /// oracle (masked pixels absent), the incremental `region_median` / `rim_median` sequence and the production
+    /// `grow_region` agree bit for bit.
+    #[test]
+    fn pin_rescan_sampling_radius_with_a_mask() {
+        let stars = [round(15.3, 12.7, 0.5)];
+        let mut data = moffat_field(120, 120, &stars, 3.0, 0.04);
+        add_noise(&mut data, 0.008, 43);
+        let mask: Vec<bool> = (0..120 * 120).map(|i| (i % 120 + i / 120) % 2 == 0).collect();
+        let (cx, cy) = (15i64, 13i64);
+        let to_border = cx.min(cy).min(120 - 1 - cx).min(120 - 1 - cy);
+        let p = FitParams::default();
+        let present = |x: i64, y: i64| {
+            let i = y as usize * 120 + x as usize;
+            data[i].is_finite() && mask[i]
+        };
+        let median_of = |mut v: Vec<f32>| (!v.is_empty()).then(|| median_in_place(&mut v) as f64);
+        // The oracle: every square and rim rebuilt from scratch, masked pixels left out.
+        let square = |r: i64| {
+            let v: Vec<f32> = (cy - r..=cy + r)
+                .flat_map(|y| (cx - r..=cx + r).map(move |x| (x, y)))
+                .filter(|&(x, y)| present(x, y))
+                .map(|(x, y)| data[y as usize * 120 + x as usize])
+                .collect();
+            let max = v.iter().fold(f64::NEG_INFINITY, |m, &p| m.max(p as f64));
+            (median_of(v).expect("a present square"), max)
+        };
+        let rim = |r: i64| {
+            median_of(
+                (cy - r..=cy + r)
+                    .flat_map(|y| (cx - r..=cx + r).map(move |x| (x, y)))
+                    .filter(|&(x, y)| (x - cx).abs().max((y - cy).abs()) == r && present(x, y))
+                    .map(|(x, y)| data[y as usize * 120 + x as usize])
+                    .collect(),
+            )
+        };
+        let (r_start, r_max) = (3i64, to_border);
+        let mut seq_ref = Vec::new();
+        let mut r = r_start;
+        let mut max = f64::NEG_INFINITY;
+        let (r_ref, s_ref) = loop {
+            let (m, square_max) = square(r);
+            max = max.max(square_max);
+            seq_ref.push(m);
+            let s = rim(r).unwrap_or(m);
+            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
+                break (r, s);
+            }
+            r += 1;
+        };
+        // The incremental sequence through the real `region_median` / `rim_median`.
+        let (mut scratch, mut rimbuf) = (Vec::new(), Vec::new());
+        let mut seq_new = Vec::new();
+        let mut r = r_start;
+        let (mut m, mut max) =
+            region_median(&data, Some(&mask), 120, cx, cy, None, r, &mut scratch).unwrap();
+        seq_new.push(m);
+        let (r_seq, s_seq) = loop {
+            let s = rim_median(&data, Some(&mask), 120, cx, cy, r, &mut rimbuf).unwrap_or(m);
+            if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
+                break (r, s);
+            }
+            let (m_next, max_next) =
+                region_median(&data, Some(&mask), 120, cx, cy, Some(r), r + 1, &mut scratch).unwrap();
+            r += 1;
+            m = m_next;
+            max = max.max(max_next);
+            seq_new.push(m);
+        };
+        let mut fs = FitScratch::default();
+        let (r_prod, s_prod) = grow_region(&data, Some(&mask), 120, cx, cy, r_start, r_max, &p, &mut fs);
+        assert!(seq_ref.len() > 2, "the growth visits several squares: {seq_ref:?}");
+        assert_eq!((r_ref, s_ref.to_bits()), (r_seq, s_seq.to_bits()), "oracle vs sequence");
+        assert_eq!((r_prod, s_prod.to_bits()), (r_seq, s_seq.to_bits()), "production vs sequence");
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&seq_ref), bits(&seq_new), "{seq_ref:?} vs {seq_new:?}");
+    }
+
     #[test]
     fn psf_model_serde_names() {
         assert_eq!(serde_json::to_string(&PsfModel::Auto).unwrap(), "\"auto\"");

@@ -1021,6 +1021,7 @@ fn module_options(
         pixel_noise,
         cfa_site_share,
         mode,
+        sky: None,
     }
 }
 

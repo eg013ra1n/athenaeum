@@ -63,6 +63,10 @@ const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 ///
 /// The narrow fields decide it: at a field width clamped to 1.5 px the filtered noise has the most maxima per area.
 pub const DEFAULT_THRESHOLD: f64 = 6.0;
+/// The range a caller's matched-filter threshold (σ) is clamped to (ruling R-OSP-2; stacking's
+/// `MIN_SEED_THRESHOLD` / `MAX_SEED_THRESHOLD` are these, Plan C C1).
+pub const MIN_THRESHOLD: f64 = 2.0;
+pub const MAX_THRESHOLD: f64 = 20.0;
 
 /// The first pass's kernel FWHM, px, and the field width when no candidate's half-maximum width reads.
 const FIRST_PASS_FWHM_PX: f64 = 3.0;

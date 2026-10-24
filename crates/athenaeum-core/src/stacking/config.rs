@@ -785,8 +785,8 @@ fn clamp_detection_sigma(value: f64) -> f64 {
 }
 
 /// [`MeasurementConfig::seed_threshold`]'s range (ruling R-OSP-2).
-pub const MIN_SEED_THRESHOLD: f64 = 2.0;
-pub const MAX_SEED_THRESHOLD: f64 = 20.0;
+pub const MIN_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MIN_THRESHOLD;
+pub const MAX_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MAX_THRESHOLD;
 
 /// [`MeasurementConfig::seed_threshold`] into [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`], warning when it
 /// moves. `!(x >= MIN)` so a NaN clamps too.

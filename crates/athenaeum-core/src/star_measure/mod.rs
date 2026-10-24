@@ -226,6 +226,10 @@ pub struct MeasureOptions {
     /// Measure's `fitStars`) or, for probes and the lab, a [`Mode::Population`] / [`Mode::Budget`] subset
     /// (the Analysis mode's budget: [`budget`]).
     pub mode: Mode,
+    /// A sky statistic the caller already measured, in the plane's NATIVE units (Plan C C1: the CFA green-site path
+    /// reads one phase of the mosaic and hands it in). `Some` = used as is and the plane is not sampled for it;
+    /// `None` (the default) = [`domain::sky_level`] on the native plane.
+    pub sky: Option<SkyLevel>,
 }
 
 /// What [`measure_plane`] fits (Plan A Task 12, spec D-3): `All` fits every seed (the stacking Measure's path,
@@ -285,6 +289,7 @@ impl Default for MeasureOptions {
             pixel_noise: PixelNoise::Unknown,
             cfa_site_share: None,
             mode: Mode::All,
+            sky: None,
         }
     }
 }
@@ -491,6 +496,24 @@ pub struct PlaneMeasurement {
     pub sub_steps: SubSteps,
 }
 
+/// Whether `mask` is a mask of some other plane (its length is not `w·h`), with one `warn!` when it is: the module's
+/// entry points ([`measure_plane`], [`fit_stars_at`], [`fit_stars_with_model`]) measure nothing then, instead of
+/// indexing past the mask's end (Plan A 6a review minor 2). `None` never mismatches.
+fn mask_mismatch(mask: Option<&[bool]>, w: usize, h: usize) -> bool {
+    match mask {
+        Some(m) if m.len() != w * h => {
+            tracing::warn!(
+                mask_len = m.len(),
+                w,
+                h,
+                "the pixel mask does not match the plane; nothing is measured"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Measure one plane: the noise model (unless `opts.noise` carries one), the seeds (the matched filter, or the given
 /// ones and their field width), the sky statistic on the native plane, then the fits on the working-unit copy — each
 /// seed's saturation verdict first (F-3, Task 8: seeds → field width → verdicts → β sample → fits at β, the plane's
@@ -504,6 +527,16 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
+    if mask_mismatch(opts.mask.as_deref(), w, h) {
+        // Nothing is measured: no seed source, no mask, the plane's noise and sky only (never a panic on `m[i]`).
+        let bare = MeasureOptions {
+            seeds: SeedSpec::None,
+            mask: None,
+            mode: Mode::All,
+            ..opts.clone()
+        };
+        return measure_plane(plane, w, h, &bare, pool);
+    }
     let sub = SubSteps::default();
     let working = {
         let _s = sub.span(Step::WorkCopy);
@@ -1147,7 +1180,10 @@ fn prepare_head(
     // saturation inputs precede detection too, whose knot tests read the plateau-clip clause's range (Task 10b).
     let sky = {
         let _s = sub.span(Step::SkyLevel);
-        domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator)
+        match opts.sky {
+            Some(given) => given,
+            None => domain::sky_level(plane, w, h, &opts.domain, opts.scale_estimator),
+        }
     };
     let saturation = {
         let submitted = Instant::now();
@@ -1830,6 +1866,12 @@ pub fn fit_stars_at(
     opts: &FitStarsOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
+    let bad_mask = mask_mismatch(opts.mask.as_deref(), w, h);
+    let (seeds, mask) = if bad_mask {
+        (&[][..], None)
+    } else {
+        (seeds, opts.mask.as_deref())
+    };
     fit::fit_stars_with_beta_diagnosed(
         plane,
         w,
@@ -1837,7 +1879,7 @@ pub fn fit_stars_at(
         seeds,
         beta,
         &opts.fit,
-        opts.mask.as_deref(),
+        mask,
         opts.field_width,
         pool,
         opts.diagnostics,
@@ -1859,6 +1901,12 @@ pub fn fit_stars_with_model(
     opts: &FitStarsOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
+    let bad_mask = mask_mismatch(opts.mask.as_deref(), w, h);
+    let (seeds, mask) = if bad_mask {
+        (&[][..], None)
+    } else {
+        (seeds, opts.mask.as_deref())
+    };
     fit::fit_stars_diagnosed(
         plane,
         w,
@@ -1866,7 +1914,7 @@ pub fn fit_stars_with_model(
         seeds,
         model,
         &opts.fit,
-        opts.mask.as_deref(),
+        mask,
         opts.field_width,
         pool,
         opts.diagnostics,
@@ -3485,87 +3533,7 @@ mod tests {
     /// [`fit::TRAIL_REFUSAL_SHARE`] marks the plane trailed. No per-star streak refusal exists.
     mod trailed {
         use super::*;
-        use crate::test_support::add_noise;
-
-        /// A horizontal trail `len` px long centred at (x, y): Gaussian points of FWHM 2.6 every 0.25 px (peak ≈ 11·amp).
-        fn trail(points: &mut Vec<(f64, f64, f64)>, x: f64, y: f64, len: f64, amp: f64) {
-            let n = (len / 0.25) as usize + 1;
-            points.extend((0..n).map(|k| (x - len / 2.0 + k as f64 * 0.25, y, amp)));
-        }
-
-        /// 20-px trails (amplitude 0.018 per point) at `trails` and round β-4 Moffat stars of FWHM 2.6 and peak 0.2 at
-        /// `round`, on sky 0.05 with noise 0.002; one seed (peak 0.2) at every position, the round ones first.
-        fn fixture(
-            w: usize,
-            h: usize,
-            round: &[(f64, f64)],
-            trails: &[(f64, f64)],
-            seed: u64,
-        ) -> (Vec<f32>, Vec<Seed>) {
-            use crate::test_support::gaussian_field;
-            let mut points = Vec::new();
-            for &(x, y) in trails {
-                trail(&mut points, x, y, 20.0, 0.018);
-            }
-            let mut data = gaussian_field(w, h, &points, 2.6 / 2.354_820_045, 0.05);
-            let a = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
-            let stars: Vec<MoffatStar> = round
-                .iter()
-                .map(|&(x, y)| MoffatStar {
-                    x,
-                    y,
-                    amp: 0.2,
-                    alpha_x: a,
-                    alpha_y: a,
-                    theta: 0.0,
-                })
-                .collect();
-            for (d, m) in data.iter_mut().zip(moffat_field(w, h, &stars, 4.0, 0.0)) {
-                *d += m;
-            }
-            add_noise(&mut data, 0.002, seed);
-            let seeds = round
-                .iter()
-                .chain(trails)
-                .map(|&(x, y)| Seed {
-                    x,
-                    y,
-                    peak: 0.2,
-                    flux: 1.0,
-                })
-                .collect();
-            (data, seeds)
-        }
-
-        /// [`fixture`] on a 40-px grid from (30, 30) with a 30-px margin on every side: 13 columns on a 540-px plane (the
-        /// previous version of these tests), as many as fit on a narrower one. Of the `round + trails` grid slots in order,
-        /// every `(round + trails) / round`-th holds a round star (`round` of them), the rest trails.
-        fn trail_plane_fixture(
-            w: usize,
-            h: usize,
-            round: usize,
-            trails: usize,
-            seed: u64,
-        ) -> (Vec<f32>, Vec<Seed>) {
-            let n = round + trails;
-            let cols = 13.min((w - 60) / 40 + 1);
-            assert!(
-                30 + 40 * ((n - 1) / cols) <= h - 30,
-                "{n} slots of {cols} columns do not fit {w} x {h}"
-            );
-            let at = |i: usize| {
-                (
-                    30.0 + 40.0 * (i % cols) as f64,
-                    30.0 + 40.0 * (i / cols) as f64,
-                )
-            };
-            let stride = n / round;
-            let is_round = |i: usize| i % stride == 0 && i / stride < round;
-            let round_at: Vec<(f64, f64)> = (0..n).filter(|&i| is_round(i)).map(at).collect();
-            let trails_at: Vec<(f64, f64)> = (0..n).filter(|&i| !is_round(i)).map(at).collect();
-            assert_eq!((round_at.len(), trails_at.len()), (round, trails));
-            fixture(w, h, &round_at, &trails_at, seed)
-        }
+        use crate::test_support::{add_noise, trail_plane_fixture};
 
         /// 120 trails and 5 round stars: 125 judged seeds, the trails' fits end centreMoved / regionTooSmall / centreAtRim above the
         /// derived share → the plane is trailed, keeps no star, `c` is None. No `Streak` reason exists.
@@ -3690,6 +3658,159 @@ mod tests {
                 Some(off.fits.len())
             );
             assert_eq!(on.refused.accounted(0), seeds.len());
+        }
+    }
+
+    /// Plan C C1: the module's seams for a masked, hand-skied plane (the CFA green-site path's inputs).
+    mod plan_c_seams {
+        use super::*;
+        use crate::test_support::{add_noise, donut_field};
+
+        /// One 64 x 64 plane with a single star at its centre, in the module's working units.
+        fn one_star_plane() -> (Vec<f32>, Vec<Seed>) {
+            let stars = [MoffatStar {
+                x: 32.0,
+                y: 32.0,
+                amp: 0.3,
+                alpha_x: 3.0,
+                alpha_y: 3.0,
+                theta: 0.0,
+            }];
+            let mut unit = moffat_field(64, 64, &stars, 4.0, 0.05);
+            add_noise(&mut unit, 0.002, 7);
+            (unit.iter().map(|v| v * ADU_SCALE).collect(), seeds_of(&stars))
+        }
+
+        /// 6a review minor 2: a mask whose length is not `w * h` made `m[i]` panic in the fit, the field width and
+        /// the half-maximum width; the entry points now measure nothing and say so once.
+        #[test]
+        fn a_mask_of_the_wrong_length_measures_nothing_and_warns() {
+            let (data, seeds) = one_star_plane();
+            let short = vec![true; 64 * 64 - 1];
+            for spec in [
+                SeedSpec::MatchedFilter { threshold: 6.0 },
+                SeedSpec::Given(seeds.clone()),
+            ] {
+                let mut pm = None;
+                let logs = crate::stacking::solve::tests::captured_logs(|| {
+                    pm = Some(measure_plane(
+                        &data,
+                        64,
+                        64,
+                        &MeasureOptions {
+                            seeds: spec.clone(),
+                            mask: Some(short.clone()),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+                });
+                let pm = pm.unwrap();
+                assert!(pm.stars.is_empty(), "{spec:?}");
+                assert_eq!(pm.seeds, 0, "{spec:?}");
+                assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
+                assert!(logs.contains("mask_len"), "{logs}");
+            }
+            let mut out = None;
+            let logs = crate::stacking::solve::tests::captured_logs(|| {
+                out = Some(fit_stars_at(
+                    &data,
+                    64,
+                    64,
+                    &seeds,
+                    4.0,
+                    &FitStarsOptions {
+                        mask: Some(short.clone()),
+                        ..Default::default()
+                    },
+                    None,
+                ));
+            });
+            let out = out.unwrap();
+            assert!(out.fits.is_empty());
+            assert_eq!(out.seeds, 0);
+            assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
+            assert!(logs.contains("mask_len"), "{logs}");
+        }
+
+        /// 6a review minor 1: one pixel inside the star's aperture raised by 10^4 ADU. Masked, the star reads exactly as
+        /// the same mask on the clean plane (the pixel is absent from the fit's region and from the aperture the SNR
+        /// reads); unmasked, the pixel moves the star by more than 1 %. `signal` is the fitted model's flux, so the
+        /// aperture path itself is pinned through `snr`.
+        #[test]
+        fn a_masked_bright_pixel_inside_the_aperture_moves_signal_only_when_unmasked() {
+            let (clean, seeds) = one_star_plane();
+            let mut hot = clean.clone();
+            let pixel = 33 * 64 + 34;
+            hot[pixel] += 1.0e4;
+            let mut mask = vec![true; 64 * 64];
+            mask[pixel] = false;
+            let fit = |data: &[f32], mask: Option<&Vec<bool>>| {
+                let out = fit_stars_at(
+                    data,
+                    64,
+                    64,
+                    &seeds,
+                    4.0,
+                    &FitStarsOptions {
+                        mask: mask.cloned(),
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert_eq!(out.fits.len(), 1, "{:?}", out.refused);
+                (out.fits[0].signal, out.fits[0].snr)
+            };
+            let (s_clean, snr_clean) = fit(&clean, Some(&mask));
+            let (s_masked, snr_masked) = fit(&hot, Some(&mask));
+            assert!(((s_masked - s_clean) / s_clean).abs() < 1e-9, "{s_masked} vs {s_clean}");
+            assert!(((snr_masked - snr_clean) / snr_clean).abs() < 1e-9, "{snr_masked} vs {snr_clean}");
+            let (s_open, snr_open) = fit(&hot, None);
+            assert!(((s_open - s_clean) / s_clean).abs() > 0.01, "{s_open} vs {s_clean}");
+            assert!(((snr_open - snr_clean) / snr_clean).abs() > 0.01, "{snr_open} vs {snr_clean}");
+        }
+
+        /// A sky the caller measured is the plane's sky as handed in, not re-sampled.
+        #[test]
+        fn a_handed_in_sky_is_used_as_is() {
+            let (data, seeds) = one_star_plane();
+            let own = measure_plane(&data, 64, 64, &MeasureOptions::default(), None).sky;
+            let given = SkyLevel {
+                median: 1234.5,
+                ..own
+            };
+            let pm = measure_plane(
+                &data,
+                64,
+                64,
+                &MeasureOptions {
+                    seeds: SeedSpec::Given(seeds),
+                    sky: Some(given),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert_eq!(pm.sky, given);
+            assert_ne!(own.median, 1234.5);
+        }
+
+        /// A pin of the shared `donut_field` fixture (it cannot fail before the fixture exists): annular stars read
+        /// `defocused`, and no star is kept.
+        #[test]
+        fn a_donut_field_reads_defocused() {
+            let data = donut_field(330, 100, 5);
+            let pm = measure_plane(
+                &data,
+                330,
+                100,
+                &MeasureOptions {
+                    seeds: SeedSpec::MatchedFilter { threshold: 6.0 },
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(pm.defocused, "{:?}", pm.refused);
+            assert!(pm.stars.is_empty());
         }
     }
 
