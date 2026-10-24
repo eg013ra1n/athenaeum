@@ -224,23 +224,12 @@ contain forward slashes.
 
 ## Known flaky test
 
-- `collab_v3_live_e2e_tests::unmapped_filter_then_mapped_and_an_attested_set`
-  failed once at the plain mono light's live landing (plan 6b-2 acceptance
-  run); it passed alone and on a full re-run, so it is load-timing, like the
-  other collab live tests.
 - `stacking::run::tests::local_normalization_sidecars_are_cached_on_the_second_run`
   failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
   (2026-09-18, 2431 passed alongside it) and passed twice in isolation and in
   both CI jobs of the same commit. Not investigated; if it fails again, look
   at what the two runs share on disk (the LN sidecar cache under a tempdir)
   and at the parallel test load, not at the LN maths.
-- `api::collab::tests::publish::landing_free_bytes_is_bounded_by_the_collaboration_root`
-  failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
-  (2026-10-02) and passed alone twice and in a second full run. It compares two
-  successive free-space readings of the volume for equality, so another test
-  writing or freeing disk between the two reads breaks it. Not fixed; if it
-  fails again, replace the equality with a tolerance (or read the free space
-  once), not a change to the landing code.
 - `collab_pool` `concurrent_gets_for_an_unreachable_provider_share_one_dial`
   failed once in a full `cargo test -p athenaeum-core --all-targets` on the dev
   Mac (2026-10-02, during plan 6b-1 Task 3) and passed alone. Not

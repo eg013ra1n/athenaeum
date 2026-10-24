@@ -1032,8 +1032,8 @@ async fn a_stop_is_observed_while_starting_and_while_the_stream_opens() {
         let t0 = Instant::now();
         shutdown(&w.b.ctx).await;
         assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "stop took {:?}",
+            t0.elapsed() < crate::api::collab_live::runtime::STOP_BOUND,
+            "stop took {:?}: it hit the bound (the stop was never observed)",
             t0.elapsed()
         );
     }
@@ -1052,8 +1052,8 @@ async fn a_stop_is_observed_while_starting_and_while_the_stream_opens() {
     let t0 = Instant::now();
     shutdown(&w.b.ctx).await;
     assert!(
-        t0.elapsed() < Duration::from_secs(1),
-        "stop took {:?}",
+        t0.elapsed() < crate::api::collab_live::runtime::STOP_BOUND,
+        "stop took {:?}: it hit the bound (the stop was never observed)",
         t0.elapsed()
     );
     held.abort();

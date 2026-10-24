@@ -8301,6 +8301,7 @@ mod tests {
                 peer: None,
                 project: None,
                 package_id: None,
+                exclude_collab_landings: false,
                 limit: 1000,
             })
             .unwrap()
