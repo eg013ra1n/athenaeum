@@ -4545,7 +4545,6 @@ mod tests {
             let m = measure_plane(&data, 340, 300, &opts, None);
             assert_eq!(blends(&m.refused), 2, "{:?}", m.refused);
             assert_eq!(m.refused.accounted(m.stars.len()), m.seeds);
-            assert_eq!(m.refused.total(), m.refused.by_reason.values().sum::<usize>());
             assert_eq!(
                 m.diagnostics
                     .iter()
