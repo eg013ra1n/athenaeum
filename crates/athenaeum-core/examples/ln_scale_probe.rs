@@ -1285,6 +1285,8 @@ fn scale_arms(
                 "growthPairs": r.growth_pairs,
                 "annulusCrowding": r.annulus_crowding,
                 "terciles": terciles(&diag),
+                "cRef": prepared.aperture_correction(),
+                "cTgt": r.target_aperture_correction,
             }),
             Err(e) => {
                 eprintln!("arm {}: {e}", arm.name);

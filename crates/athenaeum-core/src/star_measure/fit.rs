@@ -273,7 +273,8 @@ pub struct StarFit {
     #[serde(skip)]
     pub sky_ring_n: u32,
     /// The star's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]): `S / sigma_S` over the star's own ring
-    /// sky and noise, computed after the aperture correction (`signal`) and again when a ring is re-read
+    /// sky and noise. It reads neither `signal` nor `c` and is read BEFORE `c` (the SNR floor of the correction's sample:
+    /// `snr_pass` runs before `aperture_correction` inside `ring_and_correction`), and again when a ring is re-read
     /// ([`super::correct_at_ring`]). Every accepted fit carries one, saturated and extended included (R11-5); NaN
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
@@ -358,6 +359,9 @@ pub struct FitOutcome {
     /// The standard error of the median `aperture_correction` is, from the ratios' MAD (`1.2533 * 1.4826 * MAD /
     /// sqrt(n)`); `None` where `c` was not measured on the plane's own ratios.
     pub aperture_se: Option<f64>,
+    /// What the plane's own `aperture_correction` screened out (the point-source and SNR counts) and the ratios it took
+    /// its median over (Plan B B4, PB-12' / PB-13'); empty for a caller's `c` and where no ratio was read.
+    pub aperture_screens: super::photometry::ApertureScreens,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present ring pixels, or no ring width on
     /// the plane); their `sky_ring` and `sky_ring_sigma` are NaN and `sky_ring_n` 0.
     pub ring_sky_missing: usize,
@@ -1466,10 +1470,7 @@ pub(super) fn seed_passes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// The frame β sample's pixel-integrated fits on the measure path (F-4 as revised by the owner's ruling E5,
@@ -1501,10 +1502,7 @@ pub(super) fn sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Q7 under E5 (a caller that ran no verdict, [`super::beta::frame_beta`]): for each of `seeds` (the caller's
@@ -1533,10 +1531,7 @@ pub(super) fn own_sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// [`integrated_beta`] on the region `scratch.px` holds (gathered for `reg`), in stamp coordinates from `reg`'s rim
@@ -1799,10 +1794,7 @@ fn fit_all_outcomes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Fit every seed with the chosen model. `Auto` resolves the continuous frame β from its own sample — the bounded
@@ -1861,6 +1853,10 @@ pub(super) struct Correction<'a> {
     /// Population (a) among the fit call's seeds (Plan A Task 13b, [`super::population`]): the ring width reads its
     /// fits alone and `c` is the median of the 64 brightest qualifying fits of (a). `None` = every fit counts, as before.
     pub(super) population: Option<super::population::PopulationView<'a>>,
+    /// Every OTHER plane's seeds on an image of more than one plane (Plan B B4, PB-12'): a `c` candidate with none of
+    /// them within `max(`[`super::photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of its fitted centre (R-PB4-2) is screened out. `None` = no screen
+    /// (one plane, LN's refits, every caller but the stacking halves).
+    pub(super) siblings: Option<&'a [Seed]>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
@@ -2241,10 +2237,10 @@ fn fit_at_width(
             f.flags |= StarFlags::EXTENDED;
         }
     }
-    // F-10 (Task 10b, ruling B2) then F-5 (Task 10): every kept fit's ring sky B_i and σ_i, then the aperture
-    // correction from them, after the duplicate drop and before any total reads `signal`; neither moves a fit, `c`
-    // only every kept fit's flux.
-    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm) =
+    // F-10 (Task 10b, ruling B2) then F-6 and F-5 (Task 10, Plan B B4): every kept fit's ring sky B_i and σ_i, then its
+    // SNR (the `c` sample's floor reads it), then the aperture correction from them, after the duplicate drop and
+    // before any total reads `signal`; none moves a fit, `c` only every kept fit's flux.
+    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm, screens) =
         ring_and_correction(
             data,
             mask,
@@ -2261,8 +2257,8 @@ fn fit_at_width(
             f.signal *= c;
         }
     }
-    // F-6 (Task 11): every kept fit's SNR and HFR, from the stored ring and the corrected `signal`.
-    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, &correction, pool);
+    // F-6 (Task 11): every kept fit's HFR, from the stored ring and the corrected `signal` (its SNR is read before `c`).
+    hfr_pass(data, mask, w, h, &mut kept, ring_fwhm, &correction, pool);
     let mut refused = RefusalCounts::default();
     for o in &outcomes {
         if let Outcome::Refused(reason) = *o {
@@ -2331,6 +2327,7 @@ fn fit_at_width(
         aperture_correction,
         aperture_stars,
         aperture_se,
+        aperture_screens: screens,
         ring_sky_missing,
         fit_seeds,
         ring_fwhm,
@@ -2339,8 +2336,10 @@ fn fit_at_width(
 
 /// Every kept fit's ring sky (Task 10b, F-10, ruling B2: [`super::photometry::ring_skies`] at `correction.ring_fwhm`,
 /// else the plane's own frame FWHM), then the aperture correction from the stored B_i (F-5,
-/// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Returns
-/// `(c, qualifiers, ring_sky_missing, ring_fwhm)`; no `signal` is touched. One body for the fit call and for a later re-read at
+/// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Every fit's
+/// SNR is read between the two (Plan B B4: the `c` sample's floor, [`super::photometry::CORRECTION_MIN_SNR`], reads it;
+/// the SNR reads the ring sky and the pixels, never `c` or `signal`). Returns
+/// `(c, qualifiers, se, ring_sky_missing, ring_fwhm, screens)`; no `signal` is touched. One body for the fit call and for a later re-read at
 /// another ring width ([`correct_at_ring`]).
 #[allow(clippy::too_many_arguments)]
 fn ring_and_correction(
@@ -2353,7 +2352,14 @@ fn ring_and_correction(
     field_fwhm: f64,
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (Option<f64>, usize, Option<f64>, usize, Option<f64>) {
+) -> (
+    Option<f64>,
+    usize,
+    Option<f64>,
+    usize,
+    Option<f64>,
+    super::photometry::ApertureScreens,
+) {
     // R12-5: a budgeted call fits a subset; the discs and the isolation read every detected seed.
     let (all_seeds, own) = match correction.neighbours {
         Some(n) => (n.seeds, Some(n.of_fit)),
@@ -2387,8 +2393,14 @@ fn ring_and_correction(
         }
         super::FluxCorrection::FromPlane => None,
     };
-    let (c, stars, se) = match given {
-        Some(c) => (Some(c), 0, None),
+    snr_pass(data, mask, w, h, kept, correction, pool);
+    let (c, stars, se, screens) = match given {
+        Some(c) => (
+            Some(c),
+            0,
+            None,
+            super::photometry::ApertureScreens::default(),
+        ),
         None => {
             let _s = super::substeps::span(correction.timers, super::Step::ApertureC);
             super::photometry::aperture_correction(
@@ -2405,29 +2417,28 @@ fn ring_and_correction(
                 correction.full_scale,
                 correction.footprint,
                 correction.population,
+                correction.siblings,
             )
         }
     };
-    (c, stars, se, missing, ring_fwhm)
+    (c, stars, se, missing, ring_fwhm, screens)
 }
 
-/// Every kept fit's aperture SNR and half-flux radius (F-6, Task 11, [`super::photometry::star_snr`] and
-/// [`super::photometry::hfr`]) from its stored ring sky and noise and its (aperture-corrected) `signal`, at the ring
-/// width `ring_fwhm` the rings were read at (`None` = no ring anywhere: every fit reads NaN, both). `correction`
-/// carries the plane's gain and noise correlation (default: no gain, white). Neither value is read by anything else in
-/// the fit; nothing the fit measured moves. `pool` as the fit's.
+/// Every kept fit's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]) from its stored ring sky and noise
+/// and the pixels about its fitted centre: it reads neither `signal` nor `c`, so it is read BEFORE the aperture
+/// correction (Plan B B4, PB-13': the `c` sample's floor reads it). `correction` carries the plane's gain and noise
+/// correlation (default: no gain, white). Nothing the fit measured moves. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
-fn snr_and_hfr(
+fn snr_pass(
     data: &[f32],
     mask: Option<&[bool]>,
     w: usize,
     h: usize,
     kept: &mut [(usize, StarFit)],
-    ring_fwhm: Option<f64>,
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
-    let mut body = || {
+    let body = || {
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
@@ -2441,13 +2452,34 @@ fn snr_and_hfr(
                 &correction.noise,
             )
             .0;
+        })
+    };
+    super::install_in_span(pool, body);
+}
+
+/// Every kept fit's half-flux radius (F-6, Task 11, [`super::photometry::hfr`]) from its stored ring sky and its
+/// (aperture-corrected) `signal`, at the ring width `ring_fwhm` the rings were read at (`None` = no ring anywhere:
+/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. `pool` as the
+/// fit's.
+#[allow(clippy::too_many_arguments)]
+fn hfr_pass(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    kept: &mut [(usize, StarFit)],
+    ring_fwhm: Option<f64>,
+    correction: &Correction<'_>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    let body = || {
+        let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
+        kept.par_iter_mut().for_each(|(_, f)| {
+            let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
             f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
         })
     };
-    match pool {
-        Some(p) => p.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body);
 }
 
 /// LN's pair-common ring arm (Task 10b, ruling B3) without a second fit: every fit of `outcome` (a fit call's result
@@ -2473,7 +2505,7 @@ pub(super) fn correct_at_ring(
         .copied()
         .zip(outcome.fits.drain(..))
         .collect();
-    let (c, stars, se, missing, ring_fwhm) = ring_and_correction(
+    let (c, stars, se, missing, ring_fwhm, screens) = ring_and_correction(
         data,
         mask,
         w,
@@ -2490,12 +2522,13 @@ pub(super) fn correct_at_ring(
             f.signal *= c;
         }
     }
-    // F-6 (Task 11): B_i and `signal` moved, so the SNR and HFR are read again.
-    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, correction, pool);
+    // F-6 (Task 11): B_i and `signal` moved, so the HFR is read again (the SNR, read from the new B_i, is already in).
+    hfr_pass(data, mask, w, h, &mut kept, ring_fwhm, correction, pool);
     outcome.fits = kept.into_iter().map(|(_, f)| f).collect();
     outcome.aperture_correction = c;
     outcome.aperture_stars = stars;
     outcome.aperture_se = se;
+    outcome.aperture_screens = screens;
     outcome.ring_sky_missing = missing;
     outcome.ring_fwhm = ring_fwhm;
 }

@@ -22,6 +22,12 @@
 //!       [--fit-stars K]   (fast measurement, FM-2: the measure path fits the first K seeds in detection order only, the
 //!                          rest keep their detection record as `notSelected`; unclamped, the lab's K may sit below the product's floor;
 //!                          a `--config` document is replayed as stored, its `fitStars` too, never clamped by `resolve_config`)
+//!       [--dump-ratios]   (Plan B B4: the measure frame line adds `apertureRatios`, the growth / model ratios `c` is the
+//!                          median over, brightest by model flux first - the 1 to 4 of a plane at floor (i) too; null without
+//!                          the flag. A diagnostics field, never the product). Every measure and analysis-mode frame line also
+//!                          carries `pointSourceScreened` (the `c` candidates the point-source screen refused), `apertureBelowSnr`
+//!                          (those under SNR 20 after it) and `apertureTerciles` (the median ratio per model-flux third of
+//!                          the <= 64 `c` sample, brightest first; reported, never read)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -266,6 +272,31 @@ fn n_or_null(v: f64) -> Value {
     }
 }
 
+/// `apertureTerciles` (Plan B B4, PB-13'): the terciles of the <= 64 `c` sample - the median growth / model ratio of its
+/// brightest, middle and faintest third by model flux (`ratios` is brightest first); null under three ratios. Reported,
+/// never read.
+fn aperture_terciles(ratios: &[sm::ApertureRatio]) -> Value {
+    let n = ratios.len();
+    if n < 3 {
+        return Value::Null;
+    }
+    let third = |lo: usize, hi: usize| -> Value {
+        let mut v: Vec<f64> = ratios[lo..hi].iter().map(|r| r.ratio).collect();
+        v.sort_by(f64::total_cmp);
+        let m = v.len();
+        n_or_null(if m % 2 == 1 {
+            v[m / 2]
+        } else {
+            0.5 * (v[m / 2 - 1] + v[m / 2])
+        })
+    };
+    json!([
+        third(0, n / 3),
+        third(n / 3, 2 * n / 3),
+        third(2 * n / 3, n)
+    ])
+}
+
 fn fit_line(path: &str, plane: usize, beta: Option<f64>, f: &StarFit) -> Value {
     let s = ADU_SCALE as f64;
     json!({
@@ -399,6 +430,8 @@ struct MeasureArgs {
     psf: Option<PsfModel>,
     /// `--fit-stars` (the measure path): fit the first K seeds only (`Mode::Brightest`).
     fit_stars: Option<usize>,
+    /// `--dump-ratios` (the measure path, Plan B B4): the frame line carries `apertureRatios`.
+    dump_ratios: bool,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -422,10 +455,15 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         budget: None,
         psf: None,
         fit_stars: None,
+        dump_ratios: false,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
             a.diagnostics = true;
+            continue;
+        }
+        if k == "--dump-ratios" {
+            a.dump_ratios = true;
             continue;
         }
         let mut v = || {
@@ -835,6 +873,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
                         "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
                         "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
+                        "pointSourceScreened": pm.point_source_screened, "apertureBelowSnr": pm.aperture_below_snr,
+                        "apertureTerciles": aperture_terciles(&pm.aperture_ratios),
+                        "apertureRatios": a.dump_ratios.then(|| pm.aperture_ratios.iter().map(|r| n_or_null(r.ratio)).collect::<Vec<_>>()),
                         "ringSkyMissing": pm.ring_sky_missing,
                         "clipFloor": pm.clip_floor.map(n_or_null), "clipEvidence": pm.clip_evidence,
                         "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share),
@@ -1156,6 +1197,8 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
             "starsUnsaturated": pm.frame.stars_unsaturated, "mostlySaturated": mostly_saturated,
             "verdictFitFailed": pm.verdict_fit_failed, "colour": colour,
             "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
+            "pointSourceScreened": pm.point_source_screened, "apertureBelowSnr": pm.aperture_below_snr,
+            "apertureTerciles": aperture_terciles(&pm.aperture_ratios),
             "ringSkyMissing": pm.ring_sky_missing,
             "clipFloor": pm.clip_floor.map(n_or_null), "clipEvidence": pm.clip_evidence,
             "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share), "defocused": pm.defocused,
@@ -1372,6 +1415,7 @@ mod tests {
             budget: None,
             psf: None,
             fit_stars: None,
+            dump_ratios: false,
         }
     }
 

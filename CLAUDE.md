@@ -5,7 +5,7 @@ Guidance for Claude Code working in the Athenaeum repo.
 ## Project Overview
 
 Athenaeum is a desktop + web app for astrophotographers to manage FITS/XISF image files and their metadata catalog (frame-set clustering by sky coordinates, calibration matching, ZIP archive, plate-solving, export templates). Tauri 2 desktop shell, Axum/SSE web server, shared `athenaeum-core` library, SQLite catalog, React/TS frontend.
-Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP".
+Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP". The rule covers a program used as a comparison or a reference; crediting a format's author (XISF) or a fetch permission is neither and stays.
 
 ## Workspace Layout
 
@@ -126,7 +126,7 @@ useEffect(() => {
 
 **Plate solving** — `solvemyastro` is the sole solver; the input and acceptance gates have no Settings UI. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
-**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
+**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 5); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
 
 **In-app updates** — core owns the check, `tauri-plugin-updater` owns install (Rust-side only); `install_update`'s `version_comparator` is the one place that normalizes the three version forms. `docs/updates/README.md`.
 

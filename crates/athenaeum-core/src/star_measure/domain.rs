@@ -275,10 +275,7 @@ pub(crate) fn noise_model_timed(
             None => background_residual(working, w, h),
         }
     };
-    let bg = match pool {
-        Some(p) => p.install(residual),
-        None => residual(),
-    };
+    let bg = super::install_in_span(pool, residual);
     let background_ms = t.elapsed().as_millis() as u64;
     let (m_star, n_star) = match bg {
         Some(v) => v,
@@ -292,16 +289,10 @@ pub(crate) fn noise_model_timed(
         }
     };
     let t = Instant::now();
-    let mrs = match pool {
-        Some(p) => p.install(|| {
-            let _s = substeps::span(sub, Step::Mrs);
-            noise_mrs(working, w, h)
-        }),
-        None => {
-            let _s = substeps::span(sub, Step::Mrs);
-            noise_mrs(working, w, h)
-        }
-    };
+    let mrs = super::install_in_span(pool, || {
+        let _s = substeps::span(sub, Step::Mrs);
+        noise_mrs(working, w, h)
+    });
     let (sigma, source) = match mrs {
         Some(n) => (n as f64, NoiseSource::Mrs),
         None if n_star.is_finite() && n_star > 0.0 => {

@@ -89,8 +89,8 @@ use crate::stacking::master_cards::{
     WrittenMaster,
 };
 use crate::stacking::measure::{
-    check_pass1_head, measure_frame_pass1, measure_frame_pass2, measure_frame_with_fits,
-    FrameMeasurement, FramePass1, MeasureOptions,
+    channel_c_inputs, channel_c_summary, substitute_group_c, ChannelMeasurement, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
+    measure_frame_with_fits, FrameMeasurement, FramePass1, MeasureOptions,
 };
 use crate::stacking::pass1_artifact::{
     read_pass1, read_pass1_head, write_pass1, Pass1ArtifactError, Pass1Head, PASS1_ARTIFACT_KIND,
@@ -380,6 +380,11 @@ pub(crate) struct RunContext {
     /// sidecars were written under. Absent for a group whose LN never ran,
     /// or one whose calibration could not be measured at all.
     pub(crate) group_seeds_calibration: HashMap<String, ln::SeedsCalibration>,
+    /// Plan B B0 (PB-2, R-PB0-7): each group's LN reference aperture correction `c` per plane, recorded by stage 6 from
+    /// the prepared reference channels and read by [`push_summary_group`] (`SummaryGroup::ln_reference_aperture_correction`).
+    /// A plane at floor (i) holds `None` (`null` in the summary), never the applied `1.0`. Absent for a group whose LN
+    /// never reached the reference.
+    pub(crate) group_ln_reference_c: HashMap<String, Vec<Option<f64>>>,
     /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
     /// P-14); a run whose own resolution differs warns once.
     pub(crate) planned_ln_scales: HashMap<String, u32>,
@@ -1145,6 +1150,7 @@ pub(crate) fn start_stacking_with_solver(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        group_ln_reference_c: HashMap::new(),
         planned_ln_scales,
         drizzle_attempted: 0,
         crop_items: Vec::new(),
@@ -3544,6 +3550,13 @@ pub(crate) struct MeasuredFrame {
     /// Whether stage 6 REUSED an existing `ln` artifact for this frame
     /// rather than normalizing it fresh. Feeds `SummaryFrame::cached_ln`.
     cached_ln: bool,
+    /// Plan B B0 (PB-2): F1's growth-curve factor, its pair count (the minimum over the planes) and the target side's
+    /// `c` (the mean over the planes) from this run's own `normalize_frame`; `None` until [`set_ln_summary`] sets
+    /// them, for a frame LN did not normalize, and on an LN cache hit. Feed `SummaryFrame::ln_growth_factor`,
+    /// `ln_growth_pairs` and `ln_aperture_correction`.
+    ln_growth_factor: Option<f64>,
+    ln_growth_pairs: Option<usize>,
+    ln_aperture_correction: Option<f64>,
 }
 
 /// Stage 3's per-group summary beyond the per-frame [`MeasuredFrame`] list
@@ -5117,6 +5130,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5134,6 +5150,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5166,6 +5185,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         };
@@ -5188,6 +5210,9 @@ fn measure_group_prepare(
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             });
             continue;
         }
@@ -5219,6 +5244,9 @@ fn measure_group_prepare(
                     cached_metrics: false,
                     ln_scale: None,
                     cached_ln: false,
+                    ln_growth_factor: None,
+                    ln_growth_pairs: None,
+                    ln_aperture_correction: None,
                 });
                 continue;
             }
@@ -5242,6 +5270,9 @@ fn measure_group_prepare(
                     cached_metrics: false,
                     ln_scale: None,
                     cached_ln: false,
+                    ln_growth_factor: None,
+                    ln_growth_pairs: None,
+                    ln_aperture_correction: None,
                 });
                 continue;
             }
@@ -5265,6 +5296,9 @@ fn measure_group_prepare(
             cached_metrics: false,
             ln_scale: None,
             cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
         });
         to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
     }
@@ -5468,6 +5502,87 @@ fn measure_group_finish(
             }
         }
     }
+
+    // Plan B B0 (PB-1, F-11): the aperture correction `c` each channel of the group resolved, one info per channel after
+    // the fan-out, beside the group β line. Over every MEASURED member (fresh or reused), never narrowed to `included`,
+    // as the group β is. A `metrics` row reused from before B0 carries no `c` and reads as a plane at floor here; the
+    // before-runs measure on fresh work dirs.
+    {
+        let channels = entries
+            .iter()
+            .filter_map(|e| e.measurement.as_ref())
+            .map(|m| m.channels.len())
+            .max()
+            .unwrap_or(0);
+        for plane in 0..channels {
+            // R-PB0-4: a plane with no `c` and no fit at all is left out, so `count` is the planes where the
+            // "fewer than 5" warn fired.
+            let kept = channel_c_inputs(
+                entries
+                    .iter()
+                    .filter_map(|e| e.measurement.as_ref())
+                    .filter_map(|m| m.channels.get(plane)),
+            );
+            let c = channel_c_summary(&kept);
+            match (c.median, c.min, c.max) {
+                (Some(median), Some(min), Some(max)) => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    aperture_correction = median,
+                    aperture_correction_min = min,
+                    aperture_correction_max = max,
+                    "measure: aperture correction resolved per channel"
+                ),
+                _ => tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    planes = c.planes,
+                    count = c.count,
+                    "measure: aperture correction resolved per channel"
+                ),
+            }
+            // Plan B B4 floor (i), R-PB4-5: a plane at the fit-call floor takes this median (before the weights, so
+            // `compute_weights` and the run summary read the stand-in). The planes were persisted before this point
+            // and the `metrics` payload keeps the module's values; the fold re-derives the median every run.
+            let mut at_plane: Vec<&mut ChannelMeasurement> = entries
+                .iter_mut()
+                .filter_map(|e| e.measurement.as_mut())
+                .filter_map(|m| m.channels.get_mut(plane))
+                .collect();
+            if let Some((m, count)) = substitute_group_c(&mut at_plane) {
+                tracing::info!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    plane,
+                    count,
+                    aperture_correction = m,
+                    "measure: floored planes took the group channel's median aperture correction"
+                );
+                for e in entries.iter() {
+                    let took = e
+                        .measurement
+                        .as_ref()
+                        .and_then(|m| m.channels.get(plane))
+                        .and_then(|c| c.aperture_correction_group);
+                    if let Some(aperture_correction) = took {
+                        tracing::debug!(
+                            run_id = rc.run_id,
+                            group_key = %group.key,
+                            frame_id = e.frame.frame_id,
+                            plane,
+                            aperture_correction,
+                            "measure: floored plane took the group channel's median aperture correction"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
 
     // Carry-forward: a non-finite location/scale in any channel excludes
     // the frame from weighing entirely, rather than failing the group.
@@ -9617,6 +9732,9 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
         ),
         ln_scale: entry.ln_scale,
         cached_ln: entry.cached_ln,
+        ln_growth_factor: entry.ln_growth_factor,
+        ln_growth_pairs: entry.ln_growth_pairs,
+        ln_aperture_correction: entry.ln_aperture_correction,
         // Task 11b: the frame's own β, where the two-pass Measure read one (mean across channels, as `fwhm_px`).
         beta_own: m.and_then(|meas| {
             let own: Vec<f64> = meas.channels.iter().filter_map(|c| c.beta_own).collect();
@@ -9755,6 +9873,9 @@ fn push_summary_group(
         .get(&group.key)
         .map(|c| c.k.clone());
 
+    // Plan B B0 (PB-2): the LN reference's `c` per plane, `None` for a group whose LN never reached its reference.
+    let ln_reference_aperture_correction = rc.group_ln_reference_c.get(&group.key).cloned();
+
     // Spec 2026-10-04 §8: the estimator rides the summary whenever LN ran
     // for the group; the aperture only under the common aperture.
     let ln_local = rc.config.normalization.local;
@@ -9784,6 +9905,7 @@ fn push_summary_group(
         ln_scale_px,
         ln_flux_estimator,
         ln_aperture,
+        ln_reference_aperture_correction,
         frames,
     });
 }
@@ -12221,19 +12343,49 @@ struct LnArtifactPayload {
 /// `frame_id` (a no-op if either lookup misses, which never happens for a
 /// frame [`run_group_normalization`] itself just fanned `normalize_frame`
 /// out over or found a fresh `ln` artifact for).
+///
+/// Plan B B0 (PB-2): also keeps F1's `growth_factor` and `growth_pairs` and the target side's `target_c` (all from this
+/// run's own [`ln::LnFrameOutcome`]; `None` for a frame LN did not normalize and on an LN cache hit, which carries only
+/// the scale).
+#[allow(clippy::too_many_arguments)]
 fn set_ln_summary(
     rc: &mut RunContext,
     group_key: &str,
     frame_id: i64,
     ln_scale: Option<f64>,
     cached: bool,
+    growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
+    target_c: Option<f64>,
 ) {
     if let Some(entries) = rc.measured.get_mut(group_key) {
         if let Some(e) = entries.iter_mut().find(|e| e.frame.frame_id == frame_id) {
-            e.ln_scale = ln_scale;
-            e.cached_ln = cached;
+            apply_ln_summary(
+                e,
+                ln_scale,
+                cached,
+                growth_factor,
+                growth_pairs,
+                target_c,
+            );
         }
     }
+}
+
+/// [`set_ln_summary`]'s write onto one frame's entry, apart from the run so a test reaches it.
+fn apply_ln_summary(
+    entry: &mut MeasuredFrame,
+    ln_scale: Option<f64>,
+    cached: bool,
+    growth_factor: Option<f64>,
+    growth_pairs: Option<usize>,
+    target_c: Option<f64>,
+) {
+    entry.ln_scale = ln_scale;
+    entry.cached_ln = cached;
+    entry.ln_growth_factor = growth_factor;
+    entry.ln_growth_pairs = growth_pairs;
+    entry.ln_aperture_correction = target_c;
 }
 
 /// Stage 6 proper (spec §5.2, M2 Task 5): resolves/caches `group`'s LN
@@ -12634,22 +12786,30 @@ fn run_group_normalization(
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
     };
-    let reference_for_detection = if grid_mode {
-        LnReferenceForDetection::build_masked(
-            &ln_reference,
-            reference_psf,
-            measure_opts.max_stars,
-            Some(&rc.ctx.image_pool),
-            Some(ref_frames_saturation),
-        )
-    } else {
-        LnReferenceForDetection::build(
-            &ln_reference,
-            reference_psf,
-            measure_opts.max_stars,
-            Some(&rc.ctx.image_pool),
-            Some(ref_frames_saturation),
-        )
+
+    // Plan B B0 (ruling R-PB0-13): the reference's own detection and fit run under `ln_reference{group_key}` (and, per
+    // plane, `ln_reference_plane{plane}`), so their `star_measure` events name the group and plane instead of
+    // landing spanless between the Measure stage's lines and the first `ln_plane`.
+    let reference_for_detection = {
+        let _reference_span =
+            tracing::debug_span!("ln_reference", group_key = %group.key).entered();
+        if grid_mode {
+            LnReferenceForDetection::build_masked(
+                &ln_reference,
+                reference_psf,
+                measure_opts.max_stars,
+                Some(&rc.ctx.image_pool),
+                Some(ref_frames_saturation),
+            )
+        } else {
+            LnReferenceForDetection::build(
+                &ln_reference,
+                reference_psf,
+                measure_opts.max_stars,
+                Some(&rc.ctx.image_pool),
+                Some(ref_frames_saturation),
+            )
+        }
     };
 
     // Perf tier C Task 2 (spec §2.2.3): resolve each member's per-plane
@@ -12881,6 +13041,16 @@ fn run_group_normalization(
         rc.group_seeds_calibration
             .insert(group.key.clone(), c.clone());
     }
+    // Plan B B0 (PB-2, R-PB0-7): the reference's own `c` per plane, read off the prepared channels; a plane at floor (i)
+    // stays `None` (`null` in the summary), not the 1.0 that was applied.
+    rc.group_ln_reference_c.insert(
+        group.key.clone(),
+        reference_for_detection
+            .prepared
+            .iter()
+            .map(|p| p.aperture_correction())
+            .collect(),
+    );
 
     let mut needs_normalize: Vec<usize> = Vec::new();
     // M2 Task 7 (fix round 1, item 3): every member this function itself
@@ -12934,7 +13104,16 @@ fn run_group_normalization(
                     let row_path = existing.as_ref().and_then(|row| row.path.as_deref());
                     match row_path.map(|p| LnFrameGrids::read(Path::new(p))) {
                         Some(Ok(grids)) => {
-                            set_ln_summary(rc, &group.key, m.frame_id, Some(payload.scale), true);
+                            set_ln_summary(
+                                rc,
+                                &group.key,
+                                m.frame_id,
+                                Some(payload.scale),
+                                true,
+                                None,
+                                None,
+                                None,
+                            );
                             sidecar_grids.insert(m.frame_id, grids);
                         }
                         Some(Err(e)) => {
@@ -12980,7 +13159,7 @@ fn run_group_normalization(
                 .as_ref()
                 .is_some_and(|row| row.config_hash == *frame_hash)
         {
-            set_ln_summary(rc, &group.key, m.frame_id, None, true);
+            set_ln_summary(rc, &group.key, m.frame_id, None, true, None, None, None);
             low_overlap += 1;
         } else {
             needs_normalize.push(i);
@@ -13243,7 +13422,16 @@ fn run_group_normalization(
                         if outcome.ln_scale_source == "seeds" {
                             seeds_sourced_count += 1;
                         }
-                        set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
+                        set_ln_summary(
+                            rc,
+                            &group.key,
+                            frame_id,
+                            Some(outcome.scale),
+                            false,
+                            outcome.growth_factor,
+                            outcome.growth_pairs,
+                            outcome.target_aperture_correction,
+                        );
                         sidecar_grids.insert(frame_id, grids);
                     }
                     Err(e) => {
@@ -13283,7 +13471,7 @@ fn run_group_normalization(
                     overlap = fraction,
                     "ln: frame keeps global normalization (little overlap with the LN reference)"
                 );
-                set_ln_summary(rc, &group.key, frame_id, None, false);
+                set_ln_summary(rc, &group.key, frame_id, None, false, None, None, None);
                 low_overlap += 1;
             }
             Some(Err(e)) => {
@@ -14596,6 +14784,7 @@ pub(crate) fn test_context(
         reference_height: 0,
         group_geometry: HashMap::new(),
         group_seeds_calibration: HashMap::new(),
+        group_ln_reference_c: HashMap::new(),
         planned_ln_scales: HashMap::new(),
         drizzle_attempted: 0,
         crop_items: Vec::new(),
@@ -14688,6 +14877,9 @@ mod tests {
             cached_metrics: false,
             ln_scale: None,
             cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
         };
         let frame = |flags: &[bool]| FrameMeasurement {
             width: 64,
@@ -14707,6 +14899,135 @@ mod tests {
         json.as_object_mut().unwrap().remove("fieldWidthAtFloor");
         let back: SummaryFrame = serde_json::from_value(json).unwrap();
         assert!(!back.field_width_at_floor);
+    }
+
+    /// A frame nothing has measured yet, for the summary-row tests of Plan B B0.
+    fn bare_measured_frame(frame_id: i64) -> MeasuredFrame {
+        use crate::stacking::groups::GroupFrame;
+        MeasuredFrame {
+            frame: GroupFrame {
+                frame_id,
+                file_id: frame_id,
+                filename: "f.fits".into(),
+                path: "/f.fits".into(),
+                size: 1,
+                modified_at: "2026-01-01".into(),
+                exposure_s: Some(60.0),
+                date_obs: None,
+                width: 64,
+                height: 48,
+                pixel_scale_arcsec: None,
+                scale_source: None,
+            },
+            calibrated: None,
+            planes: 1,
+            measurement: None,
+            weight: None,
+            included: true,
+            reason: None,
+            registration: None,
+            cached_calibrated: false,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
+        }
+    }
+
+    /// Plan B B0 (PB-2): the run summary keeps LN's growth factor, its pair count and the target side's `c`. A frame LN
+    /// did not compute (or an LN cache hit) reads `null` for all three; a summary written before B0, which has no such
+    /// keys, decodes with `None`; values survive the round trip.
+    #[test]
+    fn summary_frame_ln_fields_default_none_and_round_trip() {
+        let bare = summary_frame_for(&bare_measured_frame(1), None);
+        assert_eq!(
+            (
+                bare.ln_growth_factor,
+                bare.ln_growth_pairs,
+                bare.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
+        let mut json = serde_json::to_value(&bare).unwrap();
+        for key in ["lnGrowthFactor", "lnGrowthPairs", "lnApertureCorrection"] {
+            let removed = json.as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                removed,
+                Some(serde_json::Value::Null),
+                "{key} is null in the payload, never skipped"
+            );
+        }
+        let old: SummaryFrame = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (
+                old.ln_growth_factor,
+                old.ln_growth_pairs,
+                old.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
+
+        let mut entry = bare_measured_frame(2);
+        entry.ln_growth_factor = Some(1.02);
+        entry.ln_growth_pairs = Some(17);
+        entry.ln_aperture_correction = Some(1.11);
+        let json = serde_json::to_value(summary_frame_for(&entry, None)).unwrap();
+        assert_eq!(json["lnGrowthFactor"], serde_json::json!(1.02));
+        assert_eq!(json["lnGrowthPairs"], serde_json::json!(17));
+        assert_eq!(json["lnApertureCorrection"], serde_json::json!(1.11));
+        let back: SummaryFrame = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (
+                back.ln_growth_factor,
+                back.ln_growth_pairs,
+                back.ln_aperture_correction
+            ),
+            (Some(1.02), Some(17), Some(1.11))
+        );
+    }
+
+    /// Plan B B0 (PB-2, F1's floor (ii)): a member whose growth curve had no pair on both frames reports
+    /// `growth_pairs: Some(0)` with the kept ratio (`growth_factor: Some(1.0)`); both land on its row as they are, not
+    /// as an absent value. A frame LN did not normalize, and an LN cache hit, leave all three `None`.
+    #[test]
+    fn ln_summary_keeps_growth_pairs_and_factor_for_a_zero_pair_member() {
+        let outcome = ln::LnFrameOutcome {
+            scale: 0.98,
+            growth_pairs: Some(0),
+            growth_factor: Some(1.0),
+            target_aperture_correction: Some(1.12),
+            ..Default::default()
+        };
+        let mut entry = bare_measured_frame(3);
+        apply_ln_summary(
+            &mut entry,
+            Some(outcome.scale),
+            false,
+            outcome.growth_factor,
+            outcome.growth_pairs,
+            outcome.target_aperture_correction,
+        );
+        let row = summary_frame_for(&entry, None);
+        assert_eq!(row.ln_scale, Some(0.98));
+        assert_eq!(row.ln_growth_pairs, Some(0));
+        assert_eq!(row.ln_growth_factor, Some(1.0));
+        assert_eq!(row.ln_aperture_correction, Some(1.12));
+
+        // An LN cache hit carries only the scale; a frame LN did not normalize carries nothing.
+        let mut cached = bare_measured_frame(4);
+        apply_ln_summary(&mut cached, Some(0.97), true, None, None, None);
+        let row = summary_frame_for(&cached, None);
+        assert_eq!((row.ln_scale, row.cached_ln), (Some(0.97), true));
+        assert_eq!(
+            (
+                row.ln_growth_factor,
+                row.ln_growth_pairs,
+                row.ln_aperture_correction
+            ),
+            (None, None, None)
+        );
     }
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
@@ -16481,6 +16802,137 @@ mod tests {
                 (a.frame_id.unwrap(), (a.config_hash, m, a.created_at))
             })
             .collect()
+    }
+
+    /// Plan B B4 floor (i) (R-PB4-5), the run wiring: a plane stored at the fit-call floor (a fit, no `c`) takes its
+    /// group channel's median kept `c` in `measure_group_finish`, on the cached path, BEFORE `compute_weights` -
+    /// `tflux` scales by it, `psf_signal_weight` by its square, and the frame's weight reads the scaled value. The
+    /// stored `metrics` artifact keeps the module's values. (The pure rule is pinned by `substitute_group_c`'s tests.)
+    #[test]
+    fn measure_folds_a_floored_member_to_the_group_channel_median_c_before_the_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let run = || {
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Measure).unwrap();
+            rc
+        };
+        let rc1 = run();
+        drop(rc1);
+        let rows = metrics_by_frame(&fixture.conn, fixture.set_id);
+        let mut ids: Vec<i64> = rows.keys().copied().collect();
+        ids.sort_unstable();
+        let floored_id = ids[0];
+        // This fixture's Gaussian stars measure no `c`, so the stored rows are set by hand: three peers carry a `c`
+        // (the cached path reads the payload as is), the first member is at floor (i): a fit ran, no `c`.
+        let peer_c = [1.10, 1.30, 1.20];
+        let median = 1.20;
+        let store = |frame_id: i64, c: Option<f64>| {
+            let (hash, mut m, _) = rows[&frame_id].clone();
+            assert!(m.channels[0].stars_fitted > 0);
+            m.channels[0].aperture_correction = c;
+            let payload = serde_json::to_string(&m).unwrap();
+            upsert_artifact(
+                &fixture.conn,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some(&payload),
+                },
+            )
+            .unwrap();
+            m
+        };
+        let stored = store(floored_id, None);
+        for (id, c) in ids[1..].iter().zip(peer_c) {
+            store(*id, Some(c));
+        }
+
+        let rc2 = run();
+        let entries = &rc2.measured[&group_key];
+        let floored = entries
+            .iter()
+            .find(|e| e.frame.frame_id == floored_id)
+            .and_then(|e| e.measurement.as_ref())
+            .expect("the floored member is measured");
+        let ch = &floored.channels[0];
+        assert!(entries.iter().all(|e| e.cached_metrics), "the cached path");
+        assert_eq!(ch.aperture_correction, None);
+        assert_eq!(ch.aperture_correction_group, Some(median));
+        assert!((ch.tflux - stored.channels[0].tflux * median).abs() <= 1e-9 * ch.tflux.abs());
+        assert!(
+            (ch.psf_signal_weight - stored.channels[0].psf_signal_weight * median * median).abs()
+                <= 1e-9 * ch.psf_signal_weight.abs()
+        );
+        for e in entries.iter().filter(|e| e.frame.frame_id != floored_id) {
+            let c = &e.measurement.as_ref().unwrap().channels[0];
+            assert_eq!(
+                c.aperture_correction_group, None,
+                "a measured plane is not substituted"
+            );
+        }
+        // `compute_weights` read the stand-in: the weight is the scaled value, not the stored one.
+        let w = entries
+            .iter()
+            .find(|e| e.frame.frame_id == floored_id)
+            .and_then(|e| e.weight.as_ref())
+            .expect("a weight");
+        assert!(
+            (w.channels[0] - ch.psf_signal_weight).abs() <= 1e-9 * ch.psf_signal_weight.abs(),
+            "{:?}",
+            w.channels
+        );
+        // The artifact keeps the module's values.
+        let after = metrics_by_frame(&fixture.conn, fixture.set_id);
+        assert_eq!(
+            after[&floored_id].1.channels[0].aperture_correction_group,
+            None
+        );
+        assert_eq!(
+            after[&floored_id].1.channels[0].tflux,
+            stored.channels[0].tflux
+        );
     }
 
     /// Plan A Task 11b (owner decision R11b-12): the cache follows the group β. An unchanged group β is a cache hit
@@ -29241,6 +29693,9 @@ mod tests {
                 cached_metrics: false,
                 ln_scale: None,
                 cached_ln: false,
+                ln_growth_factor: None,
+                ln_growth_pairs: None,
+                ln_aperture_correction: None,
             })
             .collect();
         rc.measured.insert(group.key.clone(), entries);
@@ -29357,6 +29812,9 @@ mod tests {
                         cached_metrics: false,
                         ln_scale: None,
                         cached_ln: false,
+                        ln_growth_factor: None,
+                        ln_growth_pairs: None,
+                        ln_aperture_correction: None,
                     }
                 })
                 .collect();

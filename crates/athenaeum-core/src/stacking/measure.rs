@@ -215,6 +215,32 @@ pub struct ChannelMeasurement {
     /// so unflagged payloads stay byte-identical.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub field_width_at_floor: bool,
+    /// The plane's aperture correction `c` (F-5, Plan A Task 10; kept here by Plan B B0, PB-1 / R-B2): the median
+    /// growth-curve ratio over its isolated unsaturated stars, copied from the star-measurement module's report at the
+    /// one place the channel is built. It scales the stars' signals one to one and so enters the weights as `c^2`.
+    /// `None` at floor (i) (fewer than 5 ratios: `c = 1` was applied and one `warn!` fired) and in a payload written
+    /// before B0; then never serialized, so those payloads stay byte-identical. A plane with no fit at all
+    /// (`stars_fitted == 0`) is `None` too but is NOT floor (i): the fewer-than-5-ratios `warn!` did not fire (the
+    /// module's separate "no fits on the plane" one did), and the summary leaves it out of the per-channel count
+    /// (R-PB0-4). Not in any stage hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_correction: Option<f64>,
+    /// The standard error of [`Self::aperture_correction`] as the median of its ratios
+    /// (`1.2533 * 1.4826 * MAD / sqrt(n)`, Plan A Task 13b). `Some` exactly when `aperture_correction` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_se: Option<f64>,
+    /// The qualifying stars [`Self::aperture_correction`] is the median over (at most 64, at least 5). `Some` exactly
+    /// when `aperture_correction` is: a plane at floor (i) keeps no count, though the module still reports the few
+    /// ratios it found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_stars: Option<usize>,
+    /// Plan B B4 (R-PB4-5): the group channel's median kept `c` a plane at floor (i) took as its stand-in, set by the
+    /// group fold ([`ChannelMeasurement::take_group_c`]) after the plane was measured and persisted: `tflux`,
+    /// `tmean_flux` carry it once, `psf_signal_weight`, `psf_snr` twice. `aperture_correction` itself stays `None`
+    /// (the module's measurement as kept). In memory only: never in the `metrics` artifact (the fold re-derives it every
+    /// run), so `None` and never serialized wherever the fold did not substitute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_correction_group: Option<f64>,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -250,6 +276,107 @@ impl ChannelMeasurement {
             location: self.location as f32,
             scale: self.scale as f32,
         }
+    }
+}
+
+impl ChannelMeasurement {
+    /// A plane at floor (i) (R-PB0-4): no `c` although the fitter ran (`stars_fitted > 0`), so the module's "fewer than
+    /// 5" warn fired on it. A plane with no fit at all is not.
+    pub fn at_floor(&self) -> bool {
+        self.aperture_correction.is_none() && self.stars_fitted > 0
+    }
+
+    /// Plan B B4 (R-PB4-5): take the group channel's median kept `c` `m` as this plane's stand-in. `tflux` and
+    /// `tmean_flux` scale by `m`, `psf_signal_weight` (TFlux x TMeanFlux) and `psf_snr` (TFlux squared) by `m * m` -
+    /// exactly the effect of `c`, no refit. `aperture_correction` stays `None`; `m` is recorded in
+    /// `aperture_correction_group`.
+    pub fn take_group_c(&mut self, m: f64) {
+        self.tflux *= m;
+        self.tmean_flux *= m;
+        self.psf_signal_weight *= m * m;
+        self.psf_snr *= m * m;
+        self.aperture_correction_group = Some(m);
+    }
+}
+
+/// Plan B B4 (R-PB4-5), one channel of a group: when at least two planes carry a measured `c`, every plane at floor (i)
+/// takes the median of those `c`s ([`ChannelMeasurement::take_group_c`]). Returns `Some((m, planes substituted))`, or
+/// `None` when nothing was substituted (under two peers, or no plane at floor). Pure: the caller logs.
+pub fn substitute_group_c(planes: &mut [&mut ChannelMeasurement]) -> Option<(f64, usize)> {
+    let kept = channel_c_inputs(planes.iter().map(|p| &**p));
+    let summary = channel_c_summary(&kept);
+    let m = summary.median?;
+    if summary.planes < 2 || !m.is_finite() || m <= 0.0 {
+        return None;
+    }
+    let mut n = 0;
+    for p in planes.iter_mut().filter(|p| p.at_floor()) {
+        p.take_group_c(m);
+        n += 1;
+    }
+    (n > 0).then_some((m, n))
+}
+
+/// One channel's aperture corrections over a group's measured members (Plan B B0, PB-1): what the per-(group, channel)
+/// `"measure: aperture correction resolved per channel"` info reports. A pure summary, so it is testable without a run.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChannelCSummary {
+    /// The planes of this channel that carry a measured `c`.
+    pub planes: usize,
+    /// The planes of this channel at floor (i): no `c` (the "fewer than 5" `warn!` fired on each).
+    pub count: usize,
+    /// The median of the measured planes' `c` (the mean of the two middle values over an even number); `None` when
+    /// `planes` is 0.
+    pub median: Option<f64>,
+    /// The lowest and the highest measured `c`; `None` when `planes` is 0.
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// The inputs of [`channel_c_summary`] for one channel: its plane in each measured member, `Some((c, se, stars))` for a
+/// plane that carries a measured `c`, `None` for a plane at floor (i). A plane with no `c` AND no fit at all
+/// (`stars_fitted == 0`: a defocused, trailed or starless plane, whose verdicts refused every seed before the growth
+/// curve ran, so the "fewer than 5" `warn!` never fired) is left out (R-PB0-4): `count` is the planes where that warn
+/// fired, as PB-1 and the logging dictionary say.
+pub fn channel_c_inputs<'a>(
+    planes: impl IntoIterator<Item = &'a ChannelMeasurement>,
+) -> Vec<Option<(f64, f64, usize)>> {
+    planes
+        .into_iter()
+        .filter(|c| !(c.aperture_correction.is_none() && c.stars_fitted == 0))
+        .map(|c| {
+            c.aperture_correction.map(|v| {
+                (
+                    v,
+                    c.aperture_se.unwrap_or(f64::NAN),
+                    c.aperture_stars.unwrap_or(0),
+                )
+            })
+        })
+        .collect()
+}
+
+/// [`ChannelCSummary`] over one channel's plane in each measured member: `Some((c, se, stars))` for a plane that
+/// carries a measured `c`, `None` for a plane at floor (i). Reads the kept values; it estimates nothing.
+pub fn channel_c_summary(planes: &[Option<(f64, f64, usize)>]) -> ChannelCSummary {
+    let mut c: Vec<f64> = planes.iter().flatten().map(|&(c, _, _)| c).collect();
+    let measured = c.len();
+    let count = planes.len() - measured;
+    if c.is_empty() {
+        return ChannelCSummary {
+            planes: 0,
+            count,
+            ..ChannelCSummary::default()
+        };
+    }
+    // `median_f64` sorts in place (`total_cmp`), so the extremes are the ends.
+    let median = super::groups::median_f64(&mut c);
+    ChannelCSummary {
+        planes: measured,
+        count,
+        median: Some(median),
+        min: c.first().copied(),
+        max: c.last().copied(),
     }
 }
 
@@ -343,6 +470,16 @@ pub struct PlaneMeasurement {
     /// The standard error of `aperture_correction` as the median of its ratios (Plan A Task 13b; the probe's
     /// `apertureSe`). Reported, not persisted.
     pub aperture_se: Option<f64>,
+    /// The `c` candidates the point-source screen refused (Plan B B4, PB-12': no seed of another plane within
+    /// `max(1.5, 0.5 F)` px of their fitted centre (F the field FWHM, R-PB4-2); the probe's `pointSourceScreened`); 0 on a single plane. Copied from the module's
+    /// report here, at the one place the reported plane is built. Reported, not persisted.
+    pub point_source_screened: usize,
+    /// The `c` candidates under SNR 20 (or with none), after the point-source screen (PB-13'; the probe's
+    /// `apertureBelowSnr`). Reported, not persisted.
+    pub aperture_below_snr: usize,
+    /// The growth / model ratios `c` is the median over, brightest first (the probe's `--dump-ratios`). Reported, not
+    /// persisted.
+    pub aperture_ratios: Vec<sm::ApertureRatio>,
     /// What the two populations did on the plane (Plan A Task 13b; the probe's selection counts). `None` = every seed
     /// was fitted. Reported, not persisted.
     pub population: Option<sm::PopulationReport>,
@@ -606,6 +743,8 @@ pub fn measure_planes_diagnosed<'a, E>(
         *wall += t.elapsed();
     }
     sm::cross_plane_flags(&mut preps);
+    // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered before the loop below consumes the preps.
+    let siblings = sm::sibling_seeds(&preps);
     let mut out: Vec<Option<MeasuredPlane>> = (0..n_planes).map(|_| None).collect();
     for p in (0..n_planes).rev() {
         let t = Instant::now();
@@ -619,7 +758,15 @@ pub fn measure_planes_diagnosed<'a, E>(
             _ => unreachable!("one head and one prep per plane, taken last to first"),
         };
         let verdict_ms = prep.verdict_time().as_millis() as u64;
-        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        let m = sm::finish_plane(
+            &data,
+            w,
+            h,
+            &head.module_opts,
+            prep,
+            siblings[p].as_deref(),
+            pool,
+        );
         drop(data);
         let (measurement, seeds, diagnostics) = adapter_tail(head, m);
         walls[p] += t.elapsed();
@@ -770,6 +917,9 @@ pub fn measure_planes_pass2<'a, E>(
         heads.len(),
         "one β per plane (checked by measure_frame_pass2)"
     );
+    // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered from the preps (cross-plane flags applied in the first
+    // pass; the seeds do not move) before the loop below consumes them.
+    let siblings = sm::sibling_seeds(&preps);
     let mut out = Vec::with_capacity(heads.len());
     for (p, (mut head, prep)) in heads.into_iter().zip(preps).enumerate() {
         let t = Instant::now();
@@ -777,7 +927,15 @@ pub fn measure_planes_pass2<'a, E>(
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
         head.module_opts.psf_model = PsfModel::Fixed(betas[p]);
         let verdict_ms = prep.verdict_time().as_millis() as u64;
-        let m = sm::finish_plane(&data, w, h, &head.module_opts, prep, pool);
+        let m = sm::finish_plane(
+            &data,
+            w,
+            h,
+            &head.module_opts,
+            prep,
+            siblings[p].as_deref(),
+            pool,
+        );
         drop(data);
         let (mut measurement, seeds, diagnostics) = adapter_tail(head, m);
         measurement.channel.beta_own = Some(beta_own[p]);
@@ -937,10 +1095,9 @@ fn adapter_head(
                 // parallel call left in this function, routed like its
                 // three siblings (`background_residual`, `noise_mrs`,
                 // `fit_stars`) above/below.
-                SeedPrefilter::Median3 => Some(match pool {
-                    Some(p) => p.install(|| prefilter::median3(scaled_ref, w, h)),
-                    None => prefilter::median3(scaled_ref, w, h),
-                }),
+                SeedPrefilter::Median3 => Some(sm::install_in_span(pool, || {
+                    prefilter::median3(scaled_ref, w, h)
+                })),
             };
             let detect_data: &[f32] = detect_on.as_deref().unwrap_or(scaled_ref);
             // Noise-relative levels, not the detector's default rank budget:
@@ -1046,10 +1203,9 @@ fn adapter_head(
                 upper_limit: opts.structure.upper_limit * ADU_SCALE,
                 ..opts.structure
             };
-            let mut seeds = match pool {
-                Some(pl) => pl.install(|| structure::detect_structures(scaled_ref, w, h, &p)),
-                None => structure::detect_structures(scaled_ref, w, h, &p),
-            };
+            let mut seeds = sm::install_in_span(pool, || {
+                structure::detect_structures(scaled_ref, w, h, &p)
+            });
             // Brightest first already, so the cap keeps the brightest.
             seeds.truncate(opts.max_stars.max(8));
             seeds
@@ -1131,6 +1287,13 @@ fn adapter_tail(
         beta_own: None,
         beta_own_at_cap: false,
         field_width_at_floor: m.field_width.at_floor(),
+        // Plan B B0 (PB-1): the module's report, kept as it is. A plane at floor (i) has `c = None` and keeps none of the
+        // three (the module still reports the few ratios it found in `aperture_stars`; they are not a count of anything
+        // `c` rests on).
+        aperture_correction: m.aperture_correction,
+        aperture_se: m.aperture_correction.and(m.aperture_se),
+        aperture_stars: m.aperture_correction.map(|_| m.aperture_stars),
+        aperture_correction_group: None,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -1181,6 +1344,9 @@ fn adapter_tail(
             aperture_correction: m.aperture_correction,
             aperture_stars: m.aperture_stars,
             aperture_se: m.aperture_se,
+            point_source_screened: m.point_source_screened,
+            aperture_below_snr: m.aperture_below_snr,
+            aperture_ratios: m.aperture_ratios,
             population: m.population,
             ring_sky_missing: m.ring_sky_missing,
             clip_floor: m.clip_floor,
@@ -2816,6 +2982,251 @@ pub(crate) mod tests {
         assert_eq!(c.noise_source, NoiseSource::Mrs);
     }
 
+    /// Plan B B0 (PB-1, F-11): `c`, its standard error and its star count ride the `metrics` payload under the probe's
+    /// spellings, and a payload written before B0 decodes with all three `None`.
+    #[test]
+    fn channel_c_fields_round_trip_and_an_old_payload_decodes() {
+        let c = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            aperture_correction: Some(1.17),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["apertureCorrection"], serde_json::json!(1.17));
+        assert_eq!(json["apertureSe"], serde_json::json!(0.004));
+        assert_eq!(json["apertureStars"], serde_json::json!(64));
+        let back: ChannelMeasurement = serde_json::from_value(json).unwrap();
+        assert_eq!(back, c);
+        let old: ChannelMeasurement =
+            serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
+        assert_eq!(
+            (old.aperture_correction, old.aperture_se, old.aperture_stars),
+            (None, None, None)
+        );
+    }
+
+    /// Plan B B0 (PB-1; a pin, not RED): a channel without `c` serializes to the bytes it serialized to before B0, so
+    /// every stored `metrics` payload and every cache comparison is unchanged. The literal is the pre-B0 string of
+    /// this struct, read off the code before the three fields existed.
+    #[test]
+    fn channel_without_c_serializes_as_before() {
+        let c = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            fwhm_px: 2.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        for key in ["apertureCorrection", "apertureSe", "apertureStars"] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+        assert_eq!(
+            json,
+            "{\"starsDetected\":5,\"starsFitted\":3,\"starsRefused\":0,\"refusedByReason\":{},\"starsUnsaturated\":0,\"beta\":0.0,\"fwhmPx\":2.5,\"eccentricity\":0.0,\"tflux\":0.0,\"tmeanFlux\":0.0,\"meanFluxRejected\":0,\"mStar\":0.0,\"nStar\":0.0,\"noise\":0.0,\"noiseSource\":\"mrs\",\"median\":0.0,\"mad\":0.0,\"medianMeanDev\":0.0,\"snrWeight\":0.0,\"noiseScaleLow\":0.0,\"noiseScaleHigh\":0.0,\"location\":0.0,\"scale\":0.0,\"psfSignalWeight\":0.0,\"psfSnr\":0.0}"
+        );
+    }
+
+    /// Plan B B0 (PB-1): the channel build copies the plane's reported `c`, its standard error and its qualifying-star
+    /// count; a plane at floor (i) (fewer than 5 ratios, `c = None`) keeps none of the three, though the module still
+    /// reports the ratios it did find.
+    #[test]
+    fn the_channel_copies_the_planes_c_and_a_plane_at_floor_keeps_none_of_the_three() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let p = measure_plane_with_seeds(&data, w, h, &opts, None, SeedOverride::Fast);
+        assert!(
+            p.aperture_correction.is_some(),
+            "the 150-star field measures a c: {:?}",
+            p.channel
+        );
+        assert_eq!(p.channel.aperture_correction, p.aperture_correction);
+        assert_eq!(p.channel.aperture_se, p.aperture_se);
+        assert_eq!(p.channel.aperture_stars, Some(p.aperture_stars));
+        assert!(p.channel.aperture_stars.unwrap() >= 5);
+
+        // Four isolated stars: fewer than 5 ratios, so no `c`, yet the module reports how many it found.
+        let mut sparse = crate::test_support::gaussian_field(
+            w,
+            h,
+            &[
+                (100.0, 100.0, 0.2),
+                (300.0, 120.0, 0.25),
+                (500.0, 300.0, 0.2),
+                (650.0, 400.0, 0.3),
+            ],
+            1.8,
+            0.08,
+        );
+        crate::test_support::add_noise(&mut sparse, 0.002, 107);
+        let q = measure_plane_with_seeds(&sparse, w, h, &opts, None, SeedOverride::Fast);
+        assert_eq!(q.aperture_correction, None, "{:?}", q.channel);
+        assert!(
+            q.aperture_stars > 0,
+            "the module still counts the ratios it found"
+        );
+        assert_eq!(
+            (
+                q.channel.aperture_correction,
+                q.channel.aperture_se,
+                q.channel.aperture_stars
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// Plan B B4 floor (i), the owner ruling R-PB4-5: a plane at Measure's fit-call floor (no `c`, stars fitted) takes
+    /// the group channel's median kept `c` when at least two peers carry one. `tflux` / `tmean_flux` scale by it,
+    /// `psf_signal_weight` / `psf_snr` by its square; `aperture_correction` stays `None`, the record sits in
+    /// `aperture_correction_group`; peers, a one-peer group and a no-fit plane are untouched; two peers give their mean.
+    #[test]
+    fn fit_call_floor_behaviour_matches_the_owner_ruling() {
+        let peer = |c: f64| ChannelMeasurement {
+            stars_detected: 150,
+            stars_fitted: 120,
+            aperture_correction: Some(c),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            tflux: 10.0 * c,
+            tmean_flux: 2.0 * c,
+            psf_signal_weight: 7.0 * c,
+            psf_snr: 9.0 * c,
+            ..Default::default()
+        };
+        let floored = || ChannelMeasurement {
+            stars_detected: 60,
+            stars_fitted: 40,
+            tflux: 10.0,
+            tmean_flux: 2.0,
+            psf_signal_weight: 7.0,
+            psf_snr: 9.0,
+            ..Default::default()
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs();
+
+        let mut planes = vec![peer(1.10), peer(1.30), floored(), peer(1.20)];
+        let peers_before = [planes[0].clone(), planes[1].clone(), planes[3].clone()];
+        let m = substitute_group_c(planes.iter_mut().collect::<Vec<_>>().as_mut_slice());
+        assert_eq!(m.map(|(m, n)| (near(m, 1.2), n)), Some((true, 1)));
+        let f = &planes[2];
+        assert!(near(f.tflux, 12.0) && near(f.tmean_flux, 2.4), "{f:?}");
+        assert!(near(f.psf_signal_weight, 7.0 * 1.44), "{f:?}");
+        assert!(near(f.psf_snr, 9.0 * 1.44), "{f:?}");
+        assert_eq!(f.aperture_correction, None);
+        assert_eq!(f.aperture_correction_group, Some(1.2));
+        assert_eq!(planes[0], peers_before[0]);
+        assert_eq!(planes[1], peers_before[1]);
+        assert_eq!(planes[3], peers_before[2]);
+
+        // One peer: untouched, whatever sits at floor.
+        let mut one = vec![peer(1.3), floored()];
+        let before = one.clone();
+        assert_eq!(
+            substitute_group_c(one.iter_mut().collect::<Vec<_>>().as_mut_slice()),
+            None
+        );
+        assert_eq!(one, before);
+
+        // A plane with no fit at all is not at floor (i): untouched, and never counted.
+        let no_fit = ChannelMeasurement {
+            stars_detected: 4,
+            stars_fitted: 0,
+            tflux: 5.0,
+            ..Default::default()
+        };
+        let mut nf = vec![peer(1.1), peer(1.3), no_fit.clone()];
+        assert_eq!(
+            substitute_group_c(nf.iter_mut().collect::<Vec<_>>().as_mut_slice()),
+            None
+        );
+        assert_eq!(nf[2], no_fit);
+
+        // Two peers: their mean.
+        let mut two = vec![peer(1.0), peer(1.5), floored()];
+        let got = substitute_group_c(two.iter_mut().collect::<Vec<_>>().as_mut_slice());
+        assert!(near(got.unwrap().0, 1.25));
+        assert_eq!(two[2].aperture_correction_group, Some(1.25));
+    }
+
+    /// Plan B B0 (PB-1): the per-(group, channel) summary of the planes' `c`. `planes` counts the planes that carry a
+    /// measured `c`; `count` the planes at floor (i); the median and the extremes are over the measured planes only.
+    #[test]
+    fn group_c_summary_with_every_plane_at_floor_reports_zero_planes() {
+        let all_floor = channel_c_summary(&[None, None, None]);
+        assert_eq!((all_floor.planes, all_floor.count), (0, 3));
+        assert_eq!(
+            (all_floor.median, all_floor.min, all_floor.max),
+            (None, None, None)
+        );
+        assert_eq!(channel_c_summary(&[]), ChannelCSummary::default());
+
+        let mixed = channel_c_summary(&[
+            Some((1.10, 0.004, 64)),
+            None,
+            Some((1.30, 0.005, 60)),
+            Some((1.20, 0.006, 58)),
+            None,
+        ]);
+        assert_eq!((mixed.planes, mixed.count), (3, 2));
+        assert_eq!(mixed.median, Some(1.20));
+        assert_eq!((mixed.min, mixed.max), (Some(1.10), Some(1.30)));
+
+        let even = channel_c_summary(&[Some((1.0, 0.0, 5)), Some((1.5, 0.0, 5))]);
+        assert_eq!((even.planes, even.count), (2, 0));
+        assert_eq!(even.median, Some(1.25));
+    }
+
+    /// Plan B B0 review fold (R-PB0-4): a plane with no `c` and no fit at all is left out of the per-channel summary,
+    /// because the "fewer than 5" warn never fired on it; a plane at floor (i) (`c` None, stars fitted) stays and is
+    /// counted. One no-fit plane, one floor-(i) plane and two measured planes read `planes 2`, `count 1` over three
+    /// kept entries, not the four the old reading counted (`count 2`).
+    #[test]
+    fn a_plane_with_no_fit_is_left_out_of_the_channel_c_summary() {
+        let no_fit = ChannelMeasurement {
+            stars_detected: 4,
+            stars_fitted: 0,
+            ..Default::default()
+        };
+        let floor_i = ChannelMeasurement {
+            stars_detected: 30,
+            stars_fitted: 3,
+            ..Default::default()
+        };
+        let measured = |c: f64| ChannelMeasurement {
+            stars_detected: 150,
+            stars_fitted: 120,
+            aperture_correction: Some(c),
+            aperture_se: Some(0.004),
+            aperture_stars: Some(64),
+            ..Default::default()
+        };
+        let planes = [no_fit.clone(), floor_i, measured(1.0), measured(1.5)];
+        let kept = channel_c_inputs(planes.iter());
+        assert_eq!(kept.len(), 3, "the no-fit plane is left out: {kept:?}");
+        assert_eq!(kept[0], None, "the floor-(i) plane stays, in order");
+        assert_eq!(kept[1], Some((1.0, 0.004, 64)));
+        assert_eq!(kept[2], Some((1.5, 0.004, 64)));
+        let s = channel_c_summary(&kept);
+        assert_eq!((s.planes, s.count), (2, 1));
+        assert_eq!(s.median, Some(1.25));
+        assert_eq!((s.min, s.max), (Some(1.0), Some(1.5)));
+
+        // A channel whose every plane has no fit reports nothing at all: `planes 0`, `count 0`.
+        let none = channel_c_summary(&channel_c_inputs([&no_fit, &no_fit]));
+        assert_eq!((none.planes, none.count), (0, 0));
+        assert_eq!(none.median, None);
+
+        // A measured plane is never left out, whatever `stars_fitted` says (a payload decoded without the key).
+        let odd = ChannelMeasurement {
+            stars_fitted: 0,
+            aperture_correction: Some(1.2),
+            ..Default::default()
+        };
+        assert_eq!(channel_c_inputs([&odd]).len(), 1);
+    }
+
     /// Plan A Task 4 (F-0): the channel accounts for every seed it detected,
     /// its per-reason counts sum to `stars_refused`, the two keys reach the
     /// `metrics` payload, and a payload written before the task decodes with
@@ -2966,11 +3377,18 @@ pub(crate) mod tests {
         // attribution.txt) was from fwhm_px 4.121806182224867, eccentricity 0.09524602087103608, tflux
         // 569.0781285580445, tmean_flux 11.823163448679521, psf_signal_weight 0.0014687684228686841, psf_snr
         // 0.0021537136857493117.
+        // Plan B B0 (PB-1): the three kept `c` fields. `c` and its standard error are fit-derived, so they are pinned
+        // to a few ulp and taken out of the Debug string like the other aggregates; the star count is exact.
+        let c = m.aperture_correction.take().expect("the fixture measures a c");
+        assert_ulp_close(c, 1.114_389_798_286_524_7, "aperture_correction");
+        let se = m.aperture_se.take().expect("c carries its standard error");
+        assert_ulp_close(se, 0.004_260_518_989_208_477, "aperture_se");
+        assert_eq!(m.aperture_stars.take(), Some(64), "aperture_stars");
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3067,11 +3485,18 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             assert_ulp_close(*got, want, what);
             *got = want;
         }
+        // Plan B B0 (PB-1): the three kept `c` fields. `c` and its standard error are fit-derived, so they are pinned
+        // to a few ulp and taken out of the Debug string like the other aggregates; the star count is exact.
+        let c = m.aperture_correction.take().expect("the fixture measures a c");
+        assert_ulp_close(c, 1.113_576_222_145_095_6, "aperture_correction");
+        let se = m.aperture_se.take().expect("c carries its standard error");
+        assert_ulp_close(se, 0.004_317_218_926_747_388, "aperture_se");
+        assert_eq!(m.aperture_stars.take(), Some(64), "aperture_stars");
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3406,6 +3831,51 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             frame.channels[0].timings.fit_ms,
             "{measured}"
         );
+    }
+
+    /// Plan B B0 (ruling R-PB0-13): the current tracing span is thread-local, and a pass-2 plane's fit runs on an
+    /// image-pool thread (`pool.install` from a caller that is not a pool worker), so before `install_in_span` its
+    /// `star_measure` events (`"ring sky measured"`, `"aperture correction measured"`) were recorded under no span.
+    /// Pass 2 of a synthetic field on a 2-thread pool: both events name their frame and plane. The capture is a
+    /// thread-local default, so the pool's threads install the same dispatcher when they start (a server has one
+    /// global subscriber and needs no such step).
+    #[test]
+    fn star_measure_events_keep_their_frame_and_plane_span_across_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = moffat_member(3.0, 11);
+        let path = write(dir.path(), "pool_span.fits", &[plane.as_slice()], 480, 400);
+        let opts = MeasureOptions::default();
+        let cancel = AtomicBool::new(false);
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .start_handler(move |_| {
+                        // The guard is leaked on purpose: the pool thread keeps the capture until it exits.
+                        std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            let pass1 = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
+            let beta = pass1.beta_own()[0];
+            measure_frame_pass2(&path, pass1, &[beta], &opts, Some(&pool), &cancel).unwrap();
+        });
+        for msg in ["ring sky measured", "aperture correction measured"] {
+            let lines: Vec<&str> = logs.lines().filter(|l| l.contains(msg)).collect();
+            assert!(!lines.is_empty(), "no {msg:?} line in:\n{logs}");
+            for l in lines {
+                assert!(
+                    l.contains("measure_frame_pass2{path="),
+                    "{msg:?} lost its frame span: {l}"
+                );
+                assert!(
+                    l.contains("measure_plane{plane=0}"),
+                    "{msg:?} lost its plane span: {l}"
+                );
+            }
+        }
     }
 
     /// Plan A Task 13b (13-P): each plane logs its sub-step profile at debug, `"frame plane substeps"` (the plane-wide

@@ -39,11 +39,32 @@ pub use domain::{
 pub use fit::{fwtm_from_alpha, FitOutcome, FitParams, PsfModel, Seed, StarFit, StarFlags};
 pub use frame::{frame_shape, signal_totals, FrameAggregates, SignalTotals, RCR_LIMIT};
 pub use photometry::{
-    hfr, model_flux_in_fwtm, star_snr, ApertureNoise, SaturationPlane, SaturationVerdict, SnrTerms,
+    hfr, model_flux_in_fwtm, star_snr, ApertureNoise, ApertureRatio, ApertureScreens,
+    SaturationPlane, SaturationVerdict, SnrTerms,
 };
 pub use population::{Population, PopulationReport};
 pub use seeds::{DetectionReport, FieldWidth, MatchedFilter, DEFAULT_THRESHOLD};
 pub use substeps::{Step, SubSteps};
+
+/// Run `f` on `pool` (or inline when there is none) with the CALLER's current tracing span entered on whichever thread
+/// runs it. `ThreadPool::install` runs `f` on a pool thread when the caller is not a worker of that pool, and tracing's
+/// current span is thread-local, so a bare `install` records every event inside `f` under no span (Plan B B0, ruling
+/// R-PB0-13: the Measure stage's `"ring sky measured"` and `"aperture correction measured"` carried neither their frame
+/// nor their plane). `Span::current()` is `Span::none()` when no span is enabled (an info filter), and `in_scope` of it
+/// is then a no-op. The span covers `f`'s own thread only: an event emitted from a `par_iter` leaf inside `f` runs on
+/// another worker and stays unspanned (none is emitted from a leaf today). Nothing numeric moves.
+pub(crate) fn install_in_span<R: Send>(
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    match pool {
+        Some(p) => {
+            let span = tracing::Span::current();
+            p.install(move || span.in_scope(f))
+        }
+        None => f(),
+    }
+}
 
 /// The spatial correlation of a plane's pixel noise (Task 10b A1c, ruling C-10): a fact of the pixels' provenance, so
 /// the caller states it. Sensor pixels (raw or calibrated, Plan C's CFA super-pixel plane) carry white noise: every
@@ -145,11 +166,16 @@ impl SnrNoise {
 /// all. (Versions 1-3 were `PSF_FIT_VERSION`, formerly in `stacking::psf_signal`.)
 /// 4 = Plan A, the one star-measurement path (this module, F-0…F-7; ruling
 /// R-OSP-1, spec §4.4).
+/// 5 = Plan B, the aperture correction `c` kept per plane (B0) and measured on
+/// point sources of SNR 20 and over only (B4: the cross-plane point-source
+/// screen PB-12' and the SNR floor PB-13' on the `c` candidates, every fit's
+/// SNR read before `c`); `c` and so every flux, weight and LN scale built on it
+/// moves, hence every stage hash that reads a fit.
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
 /// measures, never one per task; Plan C = 6. `AnalysisConfig::config_hash`
 /// is Plan C's.
-pub const MEASURE_VERSION: u32 = 4;
+pub const MEASURE_VERSION: u32 = 5;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -351,6 +377,7 @@ impl FitStarsOptions<'_> {
             noise: self.aperture_noise,
             neighbours: None,
             population: None,
+            siblings: None,
             timers: None,
         }
     }
@@ -421,6 +448,16 @@ pub struct PlaneMeasurement {
     pub aperture_stars: usize,
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
+    /// The `c` candidates the point-source screen refused (Plan B B4, PB-12'): no seed of another plane within
+    /// `max(`[`photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of their fitted centre (R-PB4-2). 0 on a single plane and wherever no screen runs.
+    /// Reported, not persisted.
+    pub point_source_screened: usize,
+    /// The `c` candidates under [`photometry::CORRECTION_MIN_SNR`] (or with no SNR; PB-13'), after the point-source
+    /// screen. Reported, not persisted.
+    pub aperture_below_snr: usize,
+    /// The growth / model ratios `aperture_correction` is the median over, brightest by model flux first (the probe's
+    /// `--dump-ratios`); the 1 to 4 of a plane at floor (i) too. Reported, never read.
+    pub aperture_ratios: Vec<ApertureRatio>,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present pixels in their `[10F, 12F]`
     /// ring outside every seed's `3F` disc, or no frame FWHM on the plane).
     pub ring_sky_missing: usize,
@@ -475,7 +512,7 @@ pub fn measure_plane(
     match opts.mode {
         Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
-            finish_working(&working, w, h, opts, prep, pool)
+            finish_working(&working, w, h, opts, prep, None, pool)
         }
         Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
     }
@@ -765,20 +802,24 @@ pub fn prepare_plane(
 }
 
 /// [`measure_plane`]'s second half: β and the fits at β from `prep`'s records (cross-plane flags included), the frame
-/// aggregates, on a fresh working-unit copy of the same `plane` (the same bytes the first half read).
+/// aggregates, on a fresh working-unit copy of the same `plane` (the same bytes the first half read). `siblings` (Plan B
+/// B4, PB-12'): on an image of more than one plane the plane's entry of [`sibling_seeds`] (every OTHER plane's seeds,
+/// gathered after [`cross_plane_flags`]), which the aperture correction's point-source screen reads; `None` = no screen
+/// (one plane).
 pub fn finish_plane(
     plane: &[f32],
     w: usize,
     h: usize,
     opts: &MeasureOptions,
     prep: PlanePrep,
+    siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let working = {
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
     };
-    finish_working(&working, w, h, opts, prep, pool)
+    finish_working(&working, w, h, opts, prep, siblings, pool)
 }
 
 /// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
@@ -835,10 +876,7 @@ pub fn plane_beta(
             None,
         )
     };
-    let sample = match pool {
-        Some(p) => p.install(call),
-        None => call(),
-    };
+    let sample = install_in_span(pool, call);
     (sample.beta, sample.source)
 }
 
@@ -906,6 +944,28 @@ pub fn cross_plane_flags(planes: &mut [PlanePrep]) {
         }
         prep.cross_flags += n;
     }
+}
+
+/// Every plane's sibling seeds (Plan B B4, PB-12'): entry `q` is the seeds ([`PlanePrep`]'s own, all of them) of every
+/// plane but `q`, in plane order, for [`finish_plane`]'s `siblings`. `None` for every plane unless the image has exactly
+/// three (R-PB4-3: the screen is the colour image's, PB-12'): no sibling, no screen. Gather them after [`cross_plane_flags`] and before the first plane is finished (a
+/// finished plane's prep is consumed).
+pub fn sibling_seeds(planes: &[PlanePrep]) -> Vec<Option<Vec<Seed>>> {
+    if planes.len() != 3 {
+        return planes.iter().map(|_| None).collect();
+    }
+    (0..planes.len())
+        .map(|q| {
+            Some(
+                planes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(p, _)| p != q)
+                    .flat_map(|(_, prep)| prep.seeds.iter().copied())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// What [`prepare_head`] measures before any seed is fitted: the noise model, the sky, the saturation plane, the seeds
@@ -1071,10 +1131,7 @@ fn prepare_head(
             let _s = sub.span(Step::Mesh);
             domain::background_mesh(working, w, h, mask, want_noise)
         };
-        match pool {
-            Some(p) => p.install(build),
-            None => build(),
-        }
+        install_in_span(pool, build)
     });
     let mesh_ms = t.elapsed().as_millis() as u64;
     let (noise, mut timings) = match opts.noise {
@@ -1099,10 +1156,7 @@ fn prepare_head(
             let _s = sub.span(Step::SatPlane);
             saturation_plane(working, mask, &noise, &sky, &opts.domain, opts.colour)
         };
-        match pool {
-            Some(p) => p.install(build),
-            None => build(),
-        }
+        install_in_span(pool, build)
     };
     // A width the caller's detector measured (Task 6b, Task 6a review M3) stands in for the module's own, which is
     // then not computed for given seeds; one that is not a positive number is refused loudly and the module's own is
@@ -1253,10 +1307,7 @@ fn prepare_passes(
         )
     };
     // Already inside this `install`: the pass's own pool param gets `None` (perf tier 1 Task 2).
-    let (fit_field, mut passes) = match pool {
-        Some(p) => p.install(pass_call),
-        None => pass_call(),
-    };
+    let (fit_field, mut passes) = install_in_span(pool, pass_call);
     // The plane's near-clip floor (Task 10c, R10c-10) comes from the plane's own verdicts, so clause 3 is re-read here,
     // before the cross-plane rule; level and fit are untouched.
     let mut saturation = saturation;
@@ -1289,6 +1340,7 @@ fn finish_working(
     h: usize,
     opts: &MeasureOptions,
     prep: PlanePrep,
+    siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let PlanePrep {
@@ -1361,6 +1413,7 @@ fn finish_working(
                 population: population.as_ref().map(|_| population::PopulationView {
                     statistic: &in_statistic,
                 }),
+                siblings,
                 timers: Some(&sub),
                 ..Default::default()
             },
@@ -1371,13 +1424,10 @@ fn finish_working(
             &extended,
         )
     };
-    let mut outcome = match pool {
-        // Already inside this `install` — `fit_stars`'s own pool param gets
-        // `None` so it does not nest a second, pointless `install` inside
-        // this one (perf tier 1 Task 2).
-        Some(p) => p.install(fit_call),
-        None => fit_call(),
-    };
+    // Already inside this `install` — `fit_stars`'s own pool param gets
+    // `None` so it does not nest a second, pointless `install` inside
+    // this one (perf tier 1 Task 2).
+    let mut outcome = install_in_span(pool, fit_call);
     timings.fit_ms = (verdict_time + t.elapsed()).as_millis() as u64;
     let mut refused = std::mem::take(&mut outcome.refused);
     refused.not_selected = seeds.len() - fit_seeds.len();
@@ -1464,6 +1514,9 @@ fn finish_working(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        point_source_screened: outcome.aperture_screens.point_source,
+        aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing: outcome.ring_sky_missing,
         clip_floor: saturation
             .clip_floor
@@ -1584,10 +1637,7 @@ fn measure_budget(
             &extended,
         )
     };
-    let mut outcome = match pool {
-        Some(p) => p.install(fit_call),
-        None => fit_call(),
-    };
+    let mut outcome = install_in_span(pool, fit_call);
     // The candidate selection's wall is part of `fit_ms` (M-5), so the timings sum covers it.
     timings.fit_ms = (select_time + verdict_time + t.elapsed()).as_millis() as u64;
     // R12-4: the trim over the accepted fits, each in its SEED's cell.
@@ -1691,6 +1741,9 @@ fn measure_budget(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        point_source_screened: outcome.aperture_screens.point_source,
+        aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing,
         clip_floor: saturation
             .clip_floor
@@ -4520,10 +4573,10 @@ mod tests {
             assert_eq!(beta.0.to_bits(), beta_all.0.to_bits(), "list {list}");
             assert_eq!(beta.1, beta_all.1, "list {list}");
         }
-        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None);
+        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None, None);
         let opts = population_opts(300, 100_000);
         let prep = prepare_plane(&data, 1024, 1024, &opts, None);
-        let m = finish_plane(&data, 1024, 1024, &opts, prep, None);
+        let m = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
         assert_eq!(m.refused.not_selected, 0);
         assert_eq!(m.stars.len(), m_all.stars.len());
         for (a, b) in m.stars.iter().zip(&m_all.stars) {
@@ -4597,7 +4650,7 @@ mod tests {
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
         assert!(back.population.is_none(), "the selection is not stored");
         for (p, prep) in planes.iter().zip(preps) {
-            let m = finish_plane(p, 1024, 1024, &opts, prep, None);
+            let m = finish_plane(p, 1024, 1024, &opts, prep, None, None);
             let r = m.population.unwrap();
             assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
         }
@@ -4630,7 +4683,7 @@ mod tests {
             assert_eq!(format!("{b:?}"), format!("{a:?}"), "measure_plane, k {k}");
             let prep = prepare_plane(&data, 1024, 1024, &opts, None);
             assert_eq!(prep.passes.len(), prep.seeds.len(), "k {k}: a full prefix");
-            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None);
+            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
             c.timings = a.timings;
             assert_eq!(format!("{c:?}"), format!("{a:?}"), "halves, k {k}");
         }
@@ -4691,8 +4744,8 @@ mod tests {
         assert_eq!(prep.seeds.len(), all.seeds);
         let bytes = postcard::to_stdvec(&prep).unwrap();
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
-        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None);
-        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None);
+        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
+        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None, None);
         stored.timings = direct.timings;
         direct.timings = stored.timings;
         assert_eq!(format!("{stored:?}"), format!("{direct:?}"));

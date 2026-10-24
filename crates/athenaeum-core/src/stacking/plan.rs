@@ -8132,13 +8132,14 @@ mod tests {
         // 2026-10-08 one star-measurement path Plan A Task 3 (R-OSP-1): MEASURE_VERSION 4 replaces the old fit-version constant (3) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-08 one star-measurement path Plan A Task 7 (R-OSP-2): `measurement.seedSource` (matchedFilter) and `seedThreshold` join the measurement subtree (hand edit) - meas moves on every line, and reg, ln and (custom) follow; calib, ln_ref and ln_cal are UNCHANGED.
         // 2026-10-13 one star-measurement path Plan A Task 11b (owner decision R11b-12): under `Auto` (all four lines) the measurement hash folds the group beta (`measure_beta:1.500000` here) - meas, reg and ln move on every line; calib, ln_ref and ln_cal are UNCHANGED (Moffat4 would not move).
+        // 2026-10-23 Plan B B4 (PB-14): MEASURE_VERSION 5 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=478536aa8678edba ln_ref=2676a6e017eebe13 ln=2f19f183b2f12b77 ln_cal=f6195d69cd7bbaee",
-                "fastPreview: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=b61848004bf0ab46 ln_ref=2676a6e017eebe13 ln=715484427a4950be ln_cal=f6195d69cd7bbaee",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=60d6857040956328 ln_ref=1237e3e6fdf2cf1c ln=e81ae122b7b28658 ln_cal=6bb6c12538e4e622",
-                "custom: calib=2b725e5e99c87f49 meas=f9ce75e901d7ba19 reg=cde510750fb8539c ln_ref=1237e3e6fdf2cf1c ln=f380eb5216cb7300 ln_cal=6bb6c12538e4e622",
+                "default: calib=f3cf4be2b2178358 meas=e960949ec80c8d01 reg=78cd4711f281626f ln_ref=e521a3dbebf4aea6 ln=98d08a5307c382ee ln_cal=2075209c0bf9f1f2",
+                "fastPreview: calib=f3cf4be2b2178358 meas=e960949ec80c8d01 reg=068986e1b75a9c20 ln_ref=e521a3dbebf4aea6 ln=474549e4c9c4cbc6 ln_cal=2075209c0bf9f1f2",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=e960949ec80c8d01 reg=b596fdbae5880f8d ln_ref=fab08ea95af7ba8b ln=60944182062ec7a5 ln_cal=22f3c6cbd993d695",
+                "custom: calib=2b725e5e99c87f49 meas=f8c231c619725737 reg=142cb4a38ac74584 ln_ref=fab08ea95af7ba8b ln=e0895da4560928b7 ln_cal=22f3c6cbd993d695",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8207,9 +8208,9 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "7107c326cd4b34c0");
-        assert_eq!(reg, "478536aa8678edba");
-        assert_eq!(ln, "2f19f183b2f12b77");
+        assert_eq!(meas, "e960949ec80c8d01");
+        assert_eq!(reg, "78cd4711f281626f");
+        assert_eq!(ln, "98d08a5307c382ee");
     }
 
     #[test]
@@ -8280,8 +8281,8 @@ mod tests {
             pass1_hash_for(&cfg, calib),
             "a pure function of its inputs"
         );
-        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4).
-        assert_eq!(key, "3c734a7e6da780d3");
+        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3).
+        assert_eq!(key, "50aca72a1f8efde0");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over
