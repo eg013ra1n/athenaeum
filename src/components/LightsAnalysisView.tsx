@@ -14,7 +14,8 @@ import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { stackedFrameSnr } from './analysis/stackedSnr';
-import { isUnusable, verdictLabel } from './analysis/unusable';
+import { rowVerdict } from './analysis/unusable';
+import { computeRejectedFrameIds } from './analysis/rejection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
@@ -441,48 +442,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
 
   // Compute rejected frame IDs from thresholds
   const rejectedFrameIds = useMemo(() => {
-    const rejected = new Set<number>();
     // When in arcsec mode, the user enters thresholds in arcsec — convert back to pixels for comparison
     const ps = (useArcsec && plateScale) ? plateScale : null;
-    const rawFwhm = parseFloat(thresholds.fwhm);
-    const fwhmThreshold = ps ? rawFwhm / ps : rawFwhm;
-    const eccThreshold = parseFloat(thresholds.eccentricity);
-    const snrThreshold = parseFloat(thresholds.frame_snr);
-    const snrWtThreshold = parseFloat(thresholds.snr_weight);
-    const rejectUnusable = thresholds.trail === 'true';
-
-    for (const frame of displayedFrames) {
-      const a = analysisData.get(frame.frame_id);
-      if (!a) continue;
-
-      // FWHM > threshold = rejected (worse)
-      if (!isNaN(fwhmThreshold) && a.median_fwhm > fwhmThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Eccentricity > threshold = rejected (worse)
-      if (!isNaN(eccThreshold) && a.median_eccentricity > eccThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Frame SNR < threshold = rejected (worse)
-      if (!isNaN(snrThreshold) && a.frame_snr < snrThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // SNR Weight < threshold = rejected (worse)
-      if (!isNaN(snrWtThreshold) && a.snr_weight < snrWtThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Reject unusable frames: any verdict, or a legacy row by its old trailed flag (PC-15)
-      if (rejectUnusable && isUnusable(a)) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-    }
-
-    return rejected;
+    return computeRejectedFrameIds(displayedFrames.map(f => f.frame_id), analysisData, thresholds, ps);
   }, [thresholds, displayedFrames, analysisData, useArcsec, plateScale]);
 
   // Auto-select rejected frames when thresholds change (only if reject mode is active)
@@ -546,7 +508,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         a ? a.frame_snr.toFixed(1) : '',
         a ? a.psf_signal.toFixed(1) : '',
         a ? a.snr_weight.toFixed(1) : '',
-        a ? verdictLabel(a.frame_verdict) : '',
+        a ? rowVerdict(a).label : '',
       ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
     });
 

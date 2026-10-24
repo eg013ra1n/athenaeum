@@ -486,9 +486,12 @@ export function AnalysisSettingsPanel() {
                   setRejectionDefaults(next);
                   commitRejection(next, fwhmUnit);
                 }}
-                label="Reject unusable frames"
+                label={fieldMeta('analysis.rejection', 'trailed').label}
               />
             </div>
+            {fieldMeta('analysis.rejection', 'trailed').help && (
+              <p className="text-xs text-content-muted mt-1">{fieldMeta('analysis.rejection', 'trailed').help}</p>
+            )}
           </div>
         </div>
         {hasAnyThreshold && (

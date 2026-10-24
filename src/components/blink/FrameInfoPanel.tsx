@@ -1,6 +1,6 @@
 import React, { memo, useState } from "react";
 import type { FrameInfoPanelProps } from "./types";
-import { verdictLabel, verdictTooltip, verdictClass } from "../analysis/unusable";
+import { rowVerdict } from "../analysis/unusable";
 
 function formatDate(dateStr: string | null | undefined): string {
   if (!dateStr) return "-";
@@ -80,14 +80,10 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
               <InfoRow label="PSF Signal (ADU)" value={metrics.psf_signal.toFixed(1)} />
               <InfoRow
                 label="Verdict"
-                value={
-                  <span
-                    className={verdictClass(metrics.frame_verdict)}
-                    title={verdictTooltip(metrics.frame_verdict)}
-                  >
-                    {verdictLabel(metrics.frame_verdict)}
-                  </span>
-                }
+                value={(() => {
+                  const v = rowVerdict(metrics);
+                  return <span className={v.className} title={v.tooltip}>{v.label}</span>;
+                })()}
               />
               <InfoRow
                 label="Refused"

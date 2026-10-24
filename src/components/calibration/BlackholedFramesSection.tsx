@@ -4,7 +4,7 @@ import { api } from '../../api';
 import { ConfirmDialog } from '../ConfirmDialog';
 import type { FrameAnalysis } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
-import { verdictLabel, verdictTooltip, verdictClass } from '../analysis/unusable';
+import { rowVerdict } from '../analysis/unusable';
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-';
@@ -168,10 +168,10 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
                   <td className="px-1.5 py-1 text-sm text-center bg-orange/5">
                     {analysis ? (
                       <span
-                        className={verdictClass(analysis.frame_verdict)}
-                        title={verdictTooltip(analysis.frame_verdict)}
+                        className={rowVerdict(analysis).className}
+                        title={rowVerdict(analysis).tooltip}
                       >
-                        {verdictLabel(analysis.frame_verdict)}
+                        {rowVerdict(analysis).label}
                       </span>
                     ) : '-'}
                   </td>

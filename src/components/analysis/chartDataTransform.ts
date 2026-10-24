@@ -58,7 +58,6 @@ export const METRIC_REGISTRY: Record<string, MetricDefinition> = {
   frame_snr: {
     key: 'frame_snr',
     label: 'Frame SNR',
-    unit: 'dB',
     precision: 1,
     hint: 'higher is better',
     accessor: (_f, a) => a?.frame_snr ?? null,

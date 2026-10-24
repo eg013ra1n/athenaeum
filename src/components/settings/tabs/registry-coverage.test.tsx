@@ -113,7 +113,7 @@ function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<u
       // `defaults.analysis`/`defaults.plateSolve` directly (for the
       // per-field reset affordance's default label) — a `kv`-only response
       // leaves those `undefined` and crashes the panel's render the moment
-      // it tries `defaults?.analysis.detection_sigma`. Real fixtures for
+      // it dereferences `defaults?.analysis`. Real fixtures for
       // every typed field the response carries, mirroring `SettingsDefaults`.
       return Promise.resolve({
         kv: {},

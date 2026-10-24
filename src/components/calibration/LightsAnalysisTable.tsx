@@ -3,7 +3,7 @@ import { FolderOpen, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 import { SHORT } from '../collab/contributorState';
-import { verdictLabel, verdictSeverity, verdictTooltip, verdictClass } from '../analysis/unusable';
+import { rowVerdict } from '../analysis/unusable';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'verdict' | 'refused' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
@@ -257,7 +257,7 @@ export function LightsAnalysisTable({
           comparison = (aAnalysis?.snr_weight ?? -1) - (bAnalysis?.snr_weight ?? -1);
           break;
         case 'verdict':
-          comparison = (aAnalysis ? verdictSeverity(aAnalysis.frame_verdict) : -1) - (bAnalysis ? verdictSeverity(bAnalysis.frame_verdict) : -1);
+          comparison = (aAnalysis ? rowVerdict(aAnalysis).rank : -1) - (bAnalysis ? rowVerdict(bAnalysis).rank : -1);
           break;
         case 'refused':
           comparison = (aAnalysis?.stars_refused ?? -1) - (bAnalysis?.stars_refused ?? -1);
@@ -462,10 +462,10 @@ export function LightsAnalysisTable({
                 <td className="px-1.5 py-1 text-sm text-center bg-orange/5">
                   {analysis ? (
                     <span
-                      className={verdictClass(analysis.frame_verdict)}
-                      title={verdictTooltip(analysis.frame_verdict)}
+                      className={rowVerdict(analysis).className}
+                      title={rowVerdict(analysis).tooltip}
                     >
-                      {verdictLabel(analysis.frame_verdict)}
+                      {rowVerdict(analysis).label}
                     </span>
                   ) : '-'}
                 </td>
