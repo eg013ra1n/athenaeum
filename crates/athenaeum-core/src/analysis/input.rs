@@ -25,7 +25,8 @@ const OFFSET_NEGATIVE_SHARE: f64 = 0.01;
 
 /// The pixel planes of a raw frame, in the file's ADU, in FILE row order: `flip_vertical` is NOT applied. The reader
 /// never adjusts `bayer_pattern` for ROWORDER or a flip (fits.rs / xisf.rs pass the BAYERPAT / XISF pattern through
-/// unchanged), so a CFA `pattern` addresses the file's row order; a consumer that flips an even-height mosaic must
+/// unchanged), so a CFA `pattern` addresses the file's row order, with the file's XBAYROFF / YBAYROFF already folded in
+/// ([`fold_bayer_offsets`], R-PC-4); a consumer that flips an even-height mosaic must
 /// swap the pattern itself (RGGB becomes GBRG).
 #[derive(Debug, Clone)]
 pub enum RawPlanes {
@@ -59,6 +60,42 @@ struct HeaderFacts {
     bscale: f64,
     datamax: Option<f64>,
     egain: Option<f64>,
+    xbayroff: i64,
+    ybayroff: i64,
+}
+
+/// A header offset as an integer; absent or unreadable is 0.
+fn offset(v: Option<f64>) -> i64 {
+    v.filter(|x| x.is_finite()).map_or(0, |x| x.round() as i64)
+}
+
+/// The pattern with the file's `XBAYROFF` / `YBAYROFF` folded in (R-PC-4), the repo's convention
+/// (`integration/cfa.rs` `cfa_channel_at`): offsets mod 2, an odd x offset swaps the columns of the 2x2 cell, an odd y
+/// offset swaps its rows. The reader never reads the offsets, so without this an odd sum flips the green parity.
+pub fn fold_bayer_offsets(pattern: BayerPattern, xoff: i64, yoff: i64) -> BayerPattern {
+    use BayerPattern::{Bggr, Gbrg, Grbg, None, Rggb};
+    let swap_cols = |p| match p {
+        Rggb => Grbg,
+        Grbg => Rggb,
+        Bggr => Gbrg,
+        Gbrg => Bggr,
+        None => None,
+    };
+    let swap_rows = |p| match p {
+        Rggb => Gbrg,
+        Gbrg => Rggb,
+        Bggr => Grbg,
+        Grbg => Bggr,
+        None => None,
+    };
+    let mut p = pattern;
+    if xoff.rem_euclid(2) == 1 {
+        p = swap_cols(p);
+    }
+    if yoff.rem_euclid(2) == 1 {
+        p = swap_rows(p);
+    }
+    p
 }
 
 fn num(map: &std::collections::HashMap<String, String>, key: &str) -> Option<f64> {
@@ -77,6 +114,8 @@ fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
             bscale: 1.0,
             datamax: num(&map, "DATAMAX"),
             egain: num(&map, "EGAIN"),
+            xbayroff: offset(num(&map, "XBAYROFF")),
+            ybayroff: offset(num(&map, "YBAYROFF")),
         })
     } else {
         let h = FitsHeader::from_path(path)?;
@@ -86,6 +125,8 @@ fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
             bscale: h.get_f64("BSCALE").unwrap_or(1.0),
             datamax: h.get_f64("DATAMAX"),
             egain: h.get_f64("EGAIN"),
+            xbayroff: offset(h.get_f64("XBAYROFF")),
+            ybayroff: offset(h.get_f64("YBAYROFF")),
         })
     }
 }
@@ -184,7 +225,7 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
             BayerPattern::None => RawPlanes::Mono(std::mem::take(&mut samples)),
             pattern => RawPlanes::Cfa {
                 mosaic: std::mem::take(&mut samples),
-                pattern,
+                pattern: fold_bayer_offsets(pattern, facts.xbayroff, facts.ybayroff),
             },
         },
         3 => {
@@ -561,6 +602,38 @@ mod tests {
             RawPlanes::Cfa { mosaic, pattern } => {
                 assert_eq!(*pattern, BayerPattern::Rggb);
                 assert_eq!(mosaic, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+            }
+            other => panic!("expected Cfa, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bayer_offsets_fold_into_the_pattern() {
+        use BayerPattern::{Bggr, Gbrg, Grbg, Rggb};
+        assert_eq!(fold_bayer_offsets(Rggb, 0, 0), Rggb);
+        assert_eq!(fold_bayer_offsets(Rggb, 1, 0), Grbg);
+        assert_eq!(fold_bayer_offsets(Rggb, 0, 1), Gbrg);
+        assert_eq!(fold_bayer_offsets(Rggb, 1, 1), Bggr);
+        assert_eq!(fold_bayer_offsets(Rggb, 3, -1), Bggr);
+        assert_eq!(fold_bayer_offsets(Rggb, 2, -2), Rggb);
+        assert_eq!(fold_bayer_offsets(Bggr, 1, 0), Gbrg);
+        assert_eq!(fold_bayer_offsets(Gbrg, 0, 1), Rggb);
+        // From a file: RGGB shifted one column puts green at (0, 0), so the folded pattern's green mask (x + y even)
+        // picks the true green sites, which the unfolded RGGB mask (x + y odd) would miss.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.fits");
+        write_fits(
+            &p,
+            16,
+            &[4, 2],
+            &[("BAYERPAT", "'RGGB    '".into()), ("XBAYROFF", "1".into())],
+            &be16(&[1, 2, 3, 4, 5, 6, 7, 8]),
+        );
+        match read_raw_frame(&p).unwrap().planes {
+            RawPlanes::Cfa { pattern, .. } => {
+                assert_eq!(pattern, Grbg);
+                let m = crate::analysis::cfa::green_mask(4, 2, pattern);
+                assert_eq!(m, [true, false, true, false, false, true, false, true]);
             }
             other => panic!("expected Cfa, got {other:?}"),
         }
