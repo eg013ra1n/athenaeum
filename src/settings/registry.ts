@@ -375,7 +375,8 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       },
       {
         id: 'maxRadius',
-        label: 'Max Radius (px)',
+        label: 'Max Radius (image px)',
+        help: 'Upper limit of an ellipse radius in image pixels, so zooming never shrinks an ellipse relative to its star',
         keywords: ['blink.annotation_config'],
       },
     ],

@@ -154,7 +154,7 @@ export function StarAnnotationSection() {
           {numberField('fwhm_warn', 'FWHM Warn (ratio >)', 0.5, 10, 0.1)}
           {numberField('ellipse_scale', 'Ellipse Scale (×FWHM)', 0.5, 4, 0.1)}
           {numberField('min_radius', 'Min Radius (px)', 1, 30, 1)}
-          {numberField('max_radius', 'Max Radius (px)', 10, 200, 5)}
+          {numberField('max_radius', 'Max Radius (image px)', 10, 200, 5)}
         </div>
       </div>
     </SettingsSection>

@@ -18,6 +18,52 @@ export interface OverlayTransform {
   /** Whether the display image was vertically flipped during processing.
    *  Mirrors rustafits ProcessedImage.flip_vertical. */
   flipVertical: boolean;
+  /** The frame's sky sigma (`FrameAnalysis.noise`), in the same working units as
+   *  `StarMetric.peak`. Missing or <= 0 falls back to the FWHM-only radius. */
+  noise?: number | null;
+}
+
+/** Signal-to-noise level (in frame sigmas) at which the brightness radius ends. */
+const BRIGHTNESS_RADIUS_K = 3;
+const DEFAULT_BETA = 2.5;
+
+/** Radius (image px) at which a Moffat profile of the given FWHM drops to `k` sigma,
+ *  or 0 when the star never reaches that level (R <= 1) or the inputs are unusable. */
+function brightnessRadius(fwhm: number, ratio: number, beta: number): number {
+  if (!(ratio > 1) || !(fwhm > 0)) return 0;
+  const alpha = fwhm / (2 * Math.sqrt(Math.pow(2, 1 / beta) - 1));
+  return alpha * Math.sqrt(Math.pow(ratio, 1 / beta) - 1);
+}
+
+/**
+ * Ellipse semi-axes of one star in CANVAS px.
+ *
+ * Image-px semi-axis = max(ellipse_scale * fwhm_axis, brightness radius), where the
+ * brightness radius is where the star's Moffat profile falls to 3x the frame noise.
+ * The upper clamp `max_radius` is applied in image px (so zooming never shrinks an
+ * ellipse relative to its star); the lower clamp `min_radius` stays in canvas px.
+ */
+export function starSemiAxes(
+  star: Pick<StarMetric, "peak" | "fwhm_x" | "fwhm_y" | "beta">,
+  noise: number | null | undefined,
+  settings: Pick<AnnotationSettings, "ellipse_scale" | "min_radius" | "max_radius">,
+  scaleX: number,
+  scaleY: number = scaleX,
+): { a: number; b: number } {
+  const ellipseScale = settings.ellipse_scale ?? 1.2;
+  let ratio = 0;
+  if (
+    typeof noise === "number" && Number.isFinite(noise) && noise > 0 &&
+    Number.isFinite(star.peak) && star.peak > 0
+  ) {
+    ratio = star.peak / (BRIGHTNESS_RADIUS_K * noise);
+  }
+  const beta = Math.min(10, Math.max(1.5, star.beta ?? DEFAULT_BETA));
+  const axis = (fwhm: number, scale: number): number => {
+    const imagePx = Math.max(ellipseScale * fwhm, brightnessRadius(fwhm, ratio, beta));
+    return Math.max(settings.min_radius, Math.min(settings.max_radius, imagePx) * scale);
+  };
+  return { a: axis(star.fwhm_x, scaleX), b: axis(star.fwhm_y, scaleY) };
 }
 
 /** Compute color for a star based on annotation settings color scheme.
@@ -52,11 +98,10 @@ function starColor(star: StarMetric, settings: AnnotationSettings): string {
  * Mirrors the coordinate transform in rustafits annotate.rs compute_annotations():
  *   scale_x = output_width / result.width
  *   x_out   = star.x * scale_x
- *   semi_a  = (fwhm_x * scale_x * ellipse_scale).clamp(min_radius, max_radius)
  *
  * In the canvas context, "output" space is the rendered image rectangle
- * (offsetX..offsetX+renderWidth, offsetY..offsetY+renderHeight), and
- * min_radius/max_radius are in canvas pixels (not scaled by analysis ratio).
+ * (offsetX..offsetX+renderWidth, offsetY..offsetY+renderHeight). Semi-axes come
+ * from `starSemiAxes`: min_radius is in canvas px, max_radius in image px.
  */
 export function drawStarOverlay(
   ctx: CanvasRenderingContext2D,
@@ -77,13 +122,8 @@ export function drawStarOverlay(
       ? transform.offsetY + transform.renderHeight - 1 - star.y * scaleY
       : transform.offsetY + star.y * scaleY;
 
-    // Semi-axes: match rustafits — fwhm * scale * ellipse_scale, clamped to
-    // fixed canvas-pixel limits (min_radius / max_radius are canvas pixels).
-    const ellipseScale = settings.ellipse_scale ?? 1.2;
-    const rawA = star.fwhm_x * scaleX * ellipseScale;
-    const rawB = star.fwhm_y * scaleY * ellipseScale;
-    const semiMajor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawA));
-    const semiMinor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawB));
+    // Semi-axes: sized by the star's brightness (see starSemiAxes).
+    const { a: semiMajor, b: semiMinor } = starSemiAxes(star, transform.noise, settings, scaleX, scaleY);
 
     if (semiMajor < 0.5 || semiMinor < 0.5) continue;
 
