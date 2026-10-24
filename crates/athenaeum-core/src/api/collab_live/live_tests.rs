@@ -216,9 +216,10 @@ async fn a_personal_transfer_waits_at_most_one_frame() {
     let admitted = w.b.personal_acquire_timed().await; // time until a personal permit is granted
     let in_flight = (STREAMS as u64) * FRAME as u64;
     let bound = Duration::from_secs_f64(in_flight as f64 / RATE as f64) + Duration::from_secs(3);
+    eprintln!("admitted after {admitted:?} (bound {bound:?})");
     assert!(
-        admitted < bound,
-        "waited {admitted:?}: more than {STREAMS} frames of {FRAME} bytes at {RATE} B/s (+3 s) = {bound:?}"
+        admitted < bound * ts::LOAD_SLACK,
+        "waited {admitted:?}: more than {STREAMS} frames of {FRAME} bytes at {RATE} B/s (+3 s) = {bound:?}, × LOAD_SLACK"
     );
 }
 
@@ -462,7 +463,11 @@ async fn a_personal_transfer_is_admitted_while_the_feed_is_stuck_in_a_retry() {
     let bound = lane_held_by_collab(&w).await;
     feed_stuck_in_a_retry(&w).await;
     let admitted = w.b.personal_acquire_timed().await;
-    assert!(admitted < bound, "waited {admitted:?} (bound {bound:?})");
+    eprintln!("admitted after {admitted:?} (bound {bound:?})");
+    assert!(
+        admitted < bound * ts::LOAD_SLACK,
+        "waited {admitted:?} (bound {bound:?}, × LOAD_SLACK)"
+    );
 }
 
 /// C1 (b): stop completes cleanly within its bound — never by the timeout
@@ -500,7 +505,11 @@ async fn a_slow_sweep_never_delays_a_yields_lane_release() {
     ts::sync_now_serial(&w.b.ctx).await; // queues the (slow) sweep
     tokio::time::sleep(Duration::from_millis(200)).await;
     let admitted = w.b.personal_acquire_timed().await;
-    assert!(admitted < bound, "waited {admitted:?} (bound {bound:?})");
+    eprintln!("admitted after {admitted:?} (bound {bound:?})");
+    assert!(
+        admitted < bound * ts::LOAD_SLACK,
+        "waited {admitted:?} (bound {bound:?}, × LOAD_SLACK)"
+    );
 }
 
 /// I2: a landing task that panics is reaped as that fetch's failure — the

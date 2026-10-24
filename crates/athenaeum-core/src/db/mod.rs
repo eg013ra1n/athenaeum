@@ -242,7 +242,7 @@ mod tests {
         let db = Database::new_for_test_with_pool(
             dir.path().join("pool.db"),
             1,
-            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(2), // opening the one connection counts against it too
         )
         .unwrap();
         let held = db.try_conn().expect("the one connection");

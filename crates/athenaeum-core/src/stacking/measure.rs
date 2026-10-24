@@ -3521,14 +3521,16 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
     /// where ln β trades against α and the problem is ill-conditioned: a 1-ulp
     /// `exp`/`powf` difference can flip one LM accept/reject step and move a
     /// solve's β by far more than an ulp (the review's focus 4). The tolerance
-    /// is kept at 1e-12 on purpose; the Windows and Linux runners are the
-    /// check before the main push (an owner push item), and a measured spread
-    /// there is what would loosen it.
+    /// was kept at 1e-12 until the Windows and Linux runners measured the
+    /// spread: on x86_64 (2026-10-24, GitHub ubuntu and windows runners) β
+    /// moved by 1.02e-12 and 1.05e-12 and eccentricity by 5.09e-12 against
+    /// the aarch64 pins. 1e-10 leaves 20× room over that and is still ten
+    /// significant digits.
     fn assert_ulp_close(got: f64, want: f64, what: &str) {
         let rel = ((got - want) / want).abs();
         assert!(
-            rel <= 1e-12,
-            "{what}: got {got:?}, pinned {want:?} (relative {rel:.3e} > 1e-12)"
+            rel <= 1e-10,
+            "{what}: got {got:?}, pinned {want:?} (relative {rel:.3e} > 1e-10)"
         );
     }
 
