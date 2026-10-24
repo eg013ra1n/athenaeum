@@ -57,11 +57,18 @@ value, a default or render code. Two consumers read it: the search index
 | ---- | ---- |
 | General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.dataLocations` `general.logging` |
 | Blink | `blink.viewer` `blink.flatContour` `blink.annotations` |
-| Analysis | `analysis.detection` `analysis.measurement` `analysis.psf` `analysis.batch` `analysis.rejection` |
+| Analysis | `analysis.detection` `analysis.measurement` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
 | Calibration | `calibration.matching` `calibration.memory` `calibration.masterFormat` |
 | Stacking | `stacking.pipeline` `stacking.folders` `stacking.compute` |
 | Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.collabStreams` `transfers.storage` |
+
+`analysis.*` (Plan C, PC-10 / PC-15) carries `AnalysisConfig`'s four fields only: `detection_threshold` (σ of the
+matched filter, 2.0–20.0), `max_stars` (the measurement budget), `psf_model` (`moffat4` default / `auto`, a `<select>`
+under `analysis.measurement`) and `batch_concurrency`; the old detection / PSF-fit / trail-threshold fields and the
+`analysis.psf` section are gone. `analysis.rejection`'s `trailed` field reads "Reject unusable frames" (the stored
+threshold key stays `trail`). `plateSolving.inputGate` is the one switch `input_gate_enabled` — a frame whose own
+analysis marks it Trailed is refused before solving; the eccentricity / R² pair was removed with C7.
 
 `stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",
 `StackingComputeSection`, `SettingNumber` with `intCodec(0, 1048576)`, generic `get_setting` / `set_setting`, default

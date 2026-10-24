@@ -219,7 +219,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                     <>
                       <span className={`font-bold ${fwhmColor(analysis.median_fwhm)}`}>{analysis.median_fwhm.toFixed(2)}px</span>
                       <span className={`font-bold ${eccColor(analysis.median_eccentricity)}`}>{analysis.median_eccentricity.toFixed(2)}</span>
-                      <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}dB</span>
+                      <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}</span>
                     </>
                   )}
                   {frame.badge && (

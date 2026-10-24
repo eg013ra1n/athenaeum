@@ -388,38 +388,16 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     title: 'Star Detection Parameters',
     fields: [
       {
-        id: 'detectionSigma',
-        label: 'Detection Sigma',
-        help: 'Threshold in sigma above background (1.0-20.0)',
-        keywords: ['detection_sigma'],
+        id: 'detectionThreshold',
+        label: 'Detection Threshold',
+        help: 'Stars are seeded where the matched filter stands this many sigma above the noise (2.0-20.0)',
+        keywords: ['detection_threshold', 'sigma'],
       },
       {
         id: 'maxStars',
         label: 'Max Stars',
-        help: 'Keep brightest N stars (10-2000)',
-        keywords: ['max_stars'],
-      },
-      {
-        id: 'minStarArea',
-        label: 'Min Star Area (px)',
-        keywords: ['min_star_area'],
-      },
-      {
-        id: 'maxStarArea',
-        label: 'Max Star Area (px)',
-        keywords: ['max_star_area'],
-      },
-      {
-        id: 'saturationFraction',
-        label: 'Saturation Fraction',
-        help: 'Reject saturated stars (0.5-1.0)',
-        keywords: ['saturation_fraction'],
-      },
-      {
-        id: 'trailThreshold',
-        label: 'Trail Threshold (R²)',
-        help: 'R² threshold for trail detection. Higher = less sensitive. (0.0-1.0)',
-        keywords: ['trail_threshold'],
+        help: 'Good, unsaturated stars measured per frame, spread over the field (10-2000)',
+        keywords: ['max_stars', 'budget'],
       },
     ],
   },
@@ -429,41 +407,10 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     title: 'Measurement Method',
     fields: [
       {
-        id: 'mrsLayers',
-        label: 'MRS Wavelet Layers',
-        help: 'MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. 0 = off (range 0-10).',
-        keywords: ['mrs_layers'],
-      },
-    ],
-  },
-  {
-    id: 'analysis.psf',
-    tab: 'analysis',
-    title: 'PSF Fitting',
-    fields: [
-      {
-        id: 'measureCap',
-        label: 'Measure Cap',
-        help: 'Max stars to PSF-fit. 0 = measure all.',
-        keywords: ['measure_cap'],
-      },
-      {
-        id: 'fitMaxIter',
-        label: 'Fit Max Iterations',
-        help: 'LM max iterations. Increase for accuracy, decrease for speed.',
-        keywords: ['fit_max_iter'],
-      },
-      {
-        id: 'fitTolerance',
-        label: 'Fit Tolerance',
-        help: 'LM convergence tolerance. Lower = tighter convergence.',
-        keywords: ['fit_tolerance'],
-      },
-      {
-        id: 'fitMaxRejects',
-        label: 'Fit Max Rejects',
-        help: 'LM consecutive reject bailout.',
-        keywords: ['fit_max_rejects'],
+        id: 'psfModel',
+        label: 'PSF Model',
+        help: 'Moffat 4 fixes the profile shape (default). Auto fits the frame\'s own beta.',
+        keywords: ['psf_model', 'moffat', 'beta', 'auto'],
       },
     ],
   },
@@ -505,7 +452,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       },
       {
         id: 'frameSnr',
-        label: 'Frame SNR (dB) <',
+        label: 'Frame SNR <',
         keywords: ['analysis.rejection_defaults'],
       },
       {
@@ -515,8 +462,8 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       },
       {
         id: 'trailed',
-        label: 'Trailed',
-        help: 'Reject trailed frames.',
+        label: 'Reject unusable frames',
+        help: 'Frames the star measurement marks Trailed, Defocused or No stars',
         keywords: ['analysis.rejection_defaults', 'trail'],
       },
     ],
@@ -579,25 +526,12 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     id: 'plateSolving.inputGate',
     tab: 'plate_solving',
     title: 'Input Gate',
-    description:
-      'A frame is refused when its own analysis reports a median star eccentricity of at least the first value and a trail-fit R² of at least the second — both, never either alone.',
     fields: [
       {
         id: 'inputGateEnabled',
         label: 'Refuse trailed frames before solving',
+        help: 'A frame whose own analysis marks it Trailed is refused before solving',
         keywords: ['input_gate_enabled'],
-      },
-      {
-        id: 'maxEccentricity',
-        label: 'Max Median Eccentricity',
-        help: 'How elongated the average star may be before the frame is a candidate for refusal.',
-        keywords: ['input_max_eccentricity'],
-      },
-      {
-        id: 'minTrailR2',
-        label: 'Min Trail R²',
-        help: 'How well the elongation lines up along one direction — high means a tracking failure rather than soft seeing.',
-        keywords: ['input_min_trail_r2'],
       },
     ],
   },

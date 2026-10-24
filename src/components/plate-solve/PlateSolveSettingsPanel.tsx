@@ -559,51 +559,9 @@ export function PlateSolveSettingsPanel() {
             onReset={() => resetField('input_gate_enabled')}
           />
         </div>
-        <p className="mt-2 mb-4 text-xs text-content-muted">
-          A frame is refused when its own analysis reports a median star
-          eccentricity of at least the first value <strong>and</strong> a trail-fit
-          R&sup2; of at least the second &mdash; both, never either alone. Measured on
-          real frames: ones that solve correctly sit at eccentricity
-          0.62&ndash;0.72 with R&sup2; 0.30&ndash;0.57, hopeless ones at
-          0.90&ndash;0.96 with 0.73&ndash;0.93. Loosening these lets more frames
-          attempt a solve. Tightening them will <em>not</em> reliably catch more
-          trailed frames &mdash; the analysis under-reports eccentricity on exactly
-          those frames, so it rates many of them as round.
+        <p className="mt-2 text-xs text-content-muted">
+          {fieldMeta('plateSolving.inputGate', 'inputGateEnabled').help}
         </p>
-        <div
-          className={`grid grid-cols-1 gap-4 md:grid-cols-2 ${
-            config.input_gate_enabled ? '' : 'opacity-50'
-          }`}
-        >
-          <DocNumberField
-            section="plateSolving.inputGate"
-            field="maxEccentricity"
-            value={config.input_max_eccentricity}
-            codec={floatCodec(0, 1)}
-            min={0}
-            max={1}
-            step={0.01}
-            disabled={!config.input_gate_enabled}
-            onCommit={(n) => patch({ input_max_eccentricity: n })}
-            isDefault={isDefault('input_max_eccentricity')}
-            defaultValue={defaults?.plateSolve?.input_max_eccentricity ?? config.input_max_eccentricity}
-            onReset={() => resetField('input_max_eccentricity')}
-          />
-          <DocNumberField
-            section="plateSolving.inputGate"
-            field="minTrailR2"
-            value={config.input_min_trail_r2}
-            codec={floatCodec(0, 1)}
-            min={0}
-            max={1}
-            step={0.01}
-            disabled={!config.input_gate_enabled}
-            onCommit={(n) => patch({ input_min_trail_r2: n })}
-            isDefault={isDefault('input_min_trail_r2')}
-            defaultValue={defaults?.plateSolve?.input_min_trail_r2 ?? config.input_min_trail_r2}
-            onReset={() => resetField('input_min_trail_r2')}
-          />
-        </div>
       </SettingsSection>
     </div>
   );

@@ -1,7 +1,7 @@
 // Settings redesign (spec 2026-09-18 §4/§5/§6, plan Task D1): every
 // `AnalysisConfig` field commits through `useAutosaveDocument` — no Save
-// button, no "settings saved" banner. Five registered sections
-// (`analysis.detection/measurement/psf/batch/rejection`); `onResetAll` on
+// button, no "settings saved" banner. Four registered sections
+// (`analysis.detection/measurement/batch/rejection`); `onResetAll` on
 // the first calls the document's whole-config `resetAll` (see that option's
 // own comment for why the reset special-cases `batch_concurrency`).
 //
@@ -14,7 +14,7 @@
 // threshold sub-fields the JSON blob packs together.
 import { useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
 import { api } from '../../api';
-import type { AnalysisConfig } from '../../types/analysis-config';
+import type { AnalysisConfig, AnalysisPsfModel } from '../../types/analysis-config';
 import { THRESHOLD_FIELDS, EMPTY_THRESHOLDS, type RejectionThresholds, type ThresholdFieldKey } from '../calibration/RejectionThresholdBar';
 import { useAutosaveDocument } from '../../hooks/useAutosaveDocument';
 import { useSettingField } from '../../hooks/useSettingField';
@@ -26,6 +26,11 @@ import { Checkbox } from '../settings/Checkbox';
 import { ResetButton, SavedTick } from '../settings/ResetButton';
 
 export type FwhmUnit = 'px' | 'arcsec';
+
+const PSF_MODEL_LABELS: Record<AnalysisPsfModel, string> = {
+  moffat4: 'Moffat 4',
+  auto: 'Auto',
+};
 
 export const FWHM_UNIT_SETTING_KEY = 'analysis.fwhm_default_unit';
 const REJECTION_DEFAULTS_KEY = 'analysis.rejection_defaults';
@@ -296,28 +301,28 @@ export function AnalysisSettingsPanel() {
       {/* Star Detection Parameters — also carries the whole-panel reset:
           `SettingsSection`'s own confirm dialog names this section
           ("Star Detection Parameters") since its copy comes from the
-          registry, which this task does not touch — the reset itself does
-          reset the whole Analysis configuration (every section below),
-          not just this one. */}
+          registry — the reset itself does reset the whole Analysis
+          configuration (every section below), not just this one. */}
       <SettingsSection
         id="analysis.detection"
         onResetAll={resetAll}
         resetScopeLabel="This resets the whole Analysis configuration back to its default."
         actions={<SavedTick savedAt={savedAt} />}
       >
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <DocNumberField
             section="analysis.detection"
-            field="detectionSigma"
-            value={config.detection_sigma}
-            codec={floatCodec(1, 20)}
-            min={1}
+            field="detectionThreshold"
+            value={config.detection_threshold}
+            codec={floatCodec(2, 20)}
+            min={2}
             max={20}
             step={0.5}
-            onCommit={(n) => patch({ detection_sigma: n })}
-            isDefault={isDefault('detection_sigma')}
-            defaultValue={defaults?.analysis?.detection_sigma ?? config.detection_sigma}
-            onReset={() => resetField('detection_sigma')}
+            unit="σ"
+            onCommit={(n) => patch({ detection_threshold: n })}
+            isDefault={isDefault('detection_threshold')}
+            defaultValue={defaults?.analysis?.detection_threshold ?? config.detection_threshold}
+            onReset={() => resetField('detection_threshold')}
           />
           <DocNumberField
             section="analysis.detection"
@@ -332,131 +337,33 @@ export function AnalysisSettingsPanel() {
             defaultValue={defaults?.analysis?.max_stars ?? config.max_stars}
             onReset={() => resetField('max_stars')}
           />
-          <DocNumberField
-            section="analysis.detection"
-            field="minStarArea"
-            value={config.min_star_area}
-            codec={intCodec(1, 100000)}
-            min={1}
-            step={1}
-            onCommit={(n) => patch({ min_star_area: n })}
-            isDefault={isDefault('min_star_area')}
-            defaultValue={defaults?.analysis?.min_star_area ?? config.min_star_area}
-            onReset={() => resetField('min_star_area')}
-          />
-          <DocNumberField
-            section="analysis.detection"
-            field="maxStarArea"
-            value={config.max_star_area}
-            codec={intCodec(1, 100000)}
-            min={1}
-            step={10}
-            onCommit={(n) => patch({ max_star_area: n })}
-            isDefault={isDefault('max_star_area')}
-            defaultValue={defaults?.analysis?.max_star_area ?? config.max_star_area}
-            onReset={() => resetField('max_star_area')}
-          />
-          <DocNumberField
-            section="analysis.detection"
-            field="saturationFraction"
-            value={config.saturation_fraction}
-            codec={floatCodec(0.5, 1.0)}
-            min={0.5}
-            max={1.0}
-            step={0.01}
-            onCommit={(n) => patch({ saturation_fraction: n })}
-            isDefault={isDefault('saturation_fraction')}
-            defaultValue={defaults?.analysis?.saturation_fraction ?? config.saturation_fraction}
-            onReset={() => resetField('saturation_fraction')}
-          />
-          <DocNumberField
-            section="analysis.detection"
-            field="trailThreshold"
-            value={config.trail_threshold}
-            codec={floatCodec(0, 1)}
-            min={0}
-            max={1}
-            step={0.05}
-            onCommit={(n) => patch({ trail_threshold: n })}
-            isDefault={isDefault('trail_threshold')}
-            defaultValue={defaults?.analysis?.trail_threshold ?? config.trail_threshold}
-            onReset={() => resetField('trail_threshold')}
-          />
         </div>
       </SettingsSection>
 
       {/* Measurement Method */}
       <SettingsSection id="analysis.measurement" actions={<SavedTick savedAt={savedAt} />}>
-        <DocNumberField
-          section="analysis.measurement"
-          field="mrsLayers"
-          value={config.mrs_layers}
-          codec={intCodec(0, 10)}
-          min={0}
-          max={10}
-          step={1}
-          onCommit={(n) => patch({ mrs_layers: n })}
-          isDefault={isDefault('mrs_layers')}
-          defaultValue={defaults?.analysis?.mrs_layers ?? config.mrs_layers}
-          onReset={() => resetField('mrs_layers')}
-        />
-      </SettingsSection>
-
-      {/* PSF Fitting */}
-      <SettingsSection id="analysis.psf" actions={<SavedTick savedAt={savedAt} />}>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <DocNumberField
-            section="analysis.psf"
-            field="measureCap"
-            value={config.measure_cap}
-            codec={intCodec(0, 100000)}
-            min={0}
-            max={100000}
-            step={100}
-            onCommit={(n) => patch({ measure_cap: n })}
-            isDefault={isDefault('measure_cap')}
-            defaultValue={defaults?.analysis?.measure_cap ?? config.measure_cap}
-            onReset={() => resetField('measure_cap')}
-          />
-          <DocNumberField
-            section="analysis.psf"
-            field="fitMaxIter"
-            value={config.fit_max_iter}
-            codec={intCodec(1, 200)}
-            min={1}
-            max={200}
-            step={5}
-            onCommit={(n) => patch({ fit_max_iter: n })}
-            isDefault={isDefault('fit_max_iter')}
-            defaultValue={defaults?.analysis?.fit_max_iter ?? config.fit_max_iter}
-            onReset={() => resetField('fit_max_iter')}
-          />
-          <DocNumberField
-            section="analysis.psf"
-            field="fitTolerance"
-            value={config.fit_tolerance}
-            codec={floatCodec(1e-8, 1e-2)}
-            min={1e-8}
-            max={0.01}
-            step={0.0001}
-            onCommit={(n) => patch({ fit_tolerance: n })}
-            isDefault={isDefault('fit_tolerance')}
-            defaultValue={defaults?.analysis?.fit_tolerance ?? config.fit_tolerance}
-            onReset={() => resetField('fit_tolerance')}
-          />
-          <DocNumberField
-            section="analysis.psf"
-            field="fitMaxRejects"
-            value={config.fit_max_rejects}
-            codec={intCodec(1, 100)}
-            min={1}
-            max={100}
-            step={1}
-            onCommit={(n) => patch({ fit_max_rejects: n })}
-            isDefault={isDefault('fit_max_rejects')}
-            defaultValue={defaults?.analysis?.fit_max_rejects ?? config.fit_max_rejects}
-            onReset={() => resetField('fit_max_rejects')}
-          />
+        <div>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <label className="block text-xs text-content-secondary">
+              {fieldMeta('analysis.measurement', 'psfModel').label}
+            </label>
+            <ResetButton
+              visible={!isDefault('psf_model')}
+              defaultLabel={PSF_MODEL_LABELS[defaults?.analysis?.psf_model ?? config.psf_model]}
+              onReset={() => resetField('psf_model')}
+            />
+          </div>
+          <select
+            value={config.psf_model}
+            onChange={(e) => patch({ psf_model: e.target.value as AnalysisPsfModel })}
+            className="w-full sm:w-64 bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+          >
+            <option value="moffat4">{PSF_MODEL_LABELS.moffat4}</option>
+            <option value="auto">{PSF_MODEL_LABELS.auto}</option>
+          </select>
+          {fieldMeta('analysis.measurement', 'psfModel').help && (
+            <p className="text-xs text-content-muted mt-1">{fieldMeta('analysis.measurement', 'psfModel').help}</p>
+          )}
         </div>
       </SettingsSection>
 
@@ -579,7 +486,7 @@ export function AnalysisSettingsPanel() {
                   setRejectionDefaults(next);
                   commitRejection(next, fwhmUnit);
                 }}
-                label="Reject trailed frames"
+                label="Reject unusable frames"
               />
             </div>
           </div>

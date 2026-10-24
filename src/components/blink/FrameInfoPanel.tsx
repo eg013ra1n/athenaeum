@@ -1,6 +1,6 @@
 import React, { memo, useState } from "react";
-import { AlertTriangle } from "lucide-react";
 import type { FrameInfoPanelProps } from "./types";
+import { verdictLabel, verdictTooltip, verdictClass } from "../analysis/unusable";
 
 function formatDate(dateStr: string | null | undefined): string {
   if (!dateStr) return "-";
@@ -75,28 +75,32 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
               {plateScale && (
                 <InfoRow label={'HFR (")'} value={(metrics.median_hfr * plateScale).toFixed(2)} />
               )}
-              <InfoRow label="Frame SNR (dB)" value={metrics.frame_snr.toFixed(1)} />
+              <InfoRow label="Frame SNR" value={metrics.frame_snr.toFixed(1)} />
               <InfoRow label="SNR Weight" value={metrics.snr_weight.toFixed(1)} />
               <InfoRow label="PSF Signal (ADU)" value={metrics.psf_signal.toFixed(1)} />
               <InfoRow
-                label="Trail R²"
+                label="Verdict"
                 value={
-                  <span className="flex items-center gap-1">
-                    {metrics.trail_r_squared.toFixed(3)}
-                    {metrics.possibly_trailed && (
-                      <span title={metrics.trail_r_squared >= 0.3
-                        ? "Directional trail detected (RA drift)"
-                        : "Guiding issue (wind/vibration)"
-                      }>
-                        <AlertTriangle size={12} className="text-warning" />
-                      </span>
-                    )}
+                  <span
+                    className={verdictClass(metrics.frame_verdict)}
+                    title={verdictTooltip(metrics.frame_verdict)}
+                  >
+                    {verdictLabel(metrics.frame_verdict)}
                   </span>
                 }
               />
-              {metrics.median_beta != null && (
-                <InfoRow label="Moffat β" value={metrics.median_beta.toFixed(2)} />
-              )}
+              <InfoRow
+                label="Refused"
+                value={metrics.stars_refused != null ? metrics.stars_refused.toString() : "\u2014"}
+              />
+              <InfoRow
+                label="Detection threshold (σ)"
+                value={metrics.measure_version != null ? metrics.detection_threshold.toFixed(1) : "\u2014"}
+              />
+              <InfoRow
+                label="Moffat β"
+                value={metrics.median_beta != null ? metrics.median_beta.toFixed(2) : "\u2014"}
+              />
             </div>
           ) : (
             <p className="text-xs text-content-muted py-2">No analysis data</p>

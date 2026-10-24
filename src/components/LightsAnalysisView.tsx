@@ -13,6 +13,8 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/Ligh
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
+import { stackedFrameSnr } from './analysis/stackedSnr';
+import { isUnusable, verdictLabel } from './analysis/unusable';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
@@ -168,27 +170,20 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     [allFramesRaw, blackholedFileIds]
   );
 
-  // Compute stacked SNR per filter group: convert dB→linear, sqrt(sum(linear²)), back to dB
+  // Compute stacked SNR per filter group: sqrt(sum(frame_snr²)), a plain ratio (PC-11)
   const filterSnrMap = useMemo(() => {
     if (analysisData.size === 0) return undefined;
     const map = new Map<string, number>();
     const allKeys = viewMode === 'by-night' ? dateTree.framesByKey : mergedTree.framesByKey;
     for (const [key, frames] of allKeys) {
-      let sumSq = 0;
-      let count = 0;
+      const values: number[] = [];
       for (const f of frames) {
         if (blackholedFileIds.has(f.file_id)) continue;
         const a = analysisData.get(f.frame_id);
-        if (a) {
-          const linear = Math.pow(10, a.frame_snr / 20);
-          sumSq += linear * linear;
-          count++;
-        }
+        if (a) values.push(a.frame_snr);
       }
-      if (count > 0) {
-        const stackedLinear = Math.sqrt(sumSq);
-        map.set(key, 20 * Math.log10(stackedLinear));
-      }
+      const stacked = stackedFrameSnr(values);
+      if (stacked !== undefined) map.set(key, stacked);
     }
     return map.size > 0 ? map : undefined;
   }, [analysisData, viewMode, dateTree.framesByKey, mergedTree.framesByKey, blackholedFileIds]);
@@ -452,9 +447,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     const rawFwhm = parseFloat(thresholds.fwhm);
     const fwhmThreshold = ps ? rawFwhm / ps : rawFwhm;
     const eccThreshold = parseFloat(thresholds.eccentricity);
-    const snrDbThreshold = parseFloat(thresholds.frame_snr);
+    const snrThreshold = parseFloat(thresholds.frame_snr);
     const snrWtThreshold = parseFloat(thresholds.snr_weight);
-    const rejectTrailed = thresholds.trail === 'true';
+    const rejectUnusable = thresholds.trail === 'true';
 
     for (const frame of displayedFrames) {
       const a = analysisData.get(frame.frame_id);
@@ -471,7 +466,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         continue;
       }
       // Frame SNR < threshold = rejected (worse)
-      if (!isNaN(snrDbThreshold) && a.frame_snr < snrDbThreshold) {
+      if (!isNaN(snrThreshold) && a.frame_snr < snrThreshold) {
         rejected.add(frame.frame_id);
         continue;
       }
@@ -480,8 +475,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         rejected.add(frame.frame_id);
         continue;
       }
-      // Reject frames flagged as trailed
-      if (rejectTrailed && a.possibly_trailed) {
+      // Reject unusable frames: any verdict, or a legacy row by its old trailed flag (PC-15)
+      if (rejectUnusable && isUnusable(a)) {
         rejected.add(frame.frame_id);
         continue;
       }
@@ -535,7 +530,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   }, [selectedFrameIds, allFrames]);
 
   const handleExportCsv = useCallback(() => {
-    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR (dB)', 'PSF Signal (ADU)', 'SNR Weight', 'Trail R\u00B2'];
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR', 'PSF Signal (ADU)', 'SNR Weight', 'Verdict'];
     const rows = displayedFrames.map(frame => {
       const a = analysisData.get(frame.frame_id);
       return [
@@ -551,7 +546,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         a ? a.frame_snr.toFixed(1) : '',
         a ? a.psf_signal.toFixed(1) : '',
         a ? a.snr_weight.toFixed(1) : '',
-        a ? a.trail_r_squared.toFixed(4) : '',
+        a ? verdictLabel(a.frame_verdict) : '',
       ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
     });
 

@@ -59,8 +59,6 @@ const PLATE_SOLVE_CONFIG_FIXTURE: PlateSolveConfig = {
   blind_scale_sanity_max: 60.0,
   blind_scale_header_tol: 8.0,
   input_gate_enabled: true,
-  input_max_eccentricity: 0.85,
-  input_min_trail_r2: 0.65,
   camera_defaults: {},
   bright_cache_path: null,
 } as unknown as PlateSolveConfig;
@@ -69,17 +67,9 @@ const PLATE_SOLVE_CONFIG_FIXTURE: PlateSolveConfig = {
 // a full fixture so `get_analysis_config` resolves to something every
 // `DocNumberField` can format.
 const ANALYSIS_CONFIG_FIXTURE: AnalysisConfig = {
-  detection_sigma: 5.0,
-  min_star_area: 5,
-  max_star_area: 2000,
-  saturation_fraction: 0.95,
+  detection_threshold: 6.0,
+  psf_model: 'moffat4',
   max_stars: 500,
-  trail_threshold: 0.5,
-  mrs_layers: 0,
-  measure_cap: 2000,
-  fit_max_iter: 25,
-  fit_tolerance: 1e-4,
-  fit_max_rejects: 5,
   batch_concurrency: 0,
 };
 

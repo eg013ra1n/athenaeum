@@ -28,17 +28,9 @@ vi.mock('../../contexts/NotificationContext', () => ({
 }));
 
 const ANALYSIS_CONFIG_FIXTURE: AnalysisConfig = {
-  detection_sigma: 5.0,
-  min_star_area: 5,
-  max_star_area: 2000,
-  saturation_fraction: 0.95,
+  detection_threshold: 6.0,
+  psf_model: 'moffat4',
   max_stars: 500,
-  trail_threshold: 0.5,
-  mrs_layers: 0,
-  measure_cap: 2000,
-  fit_max_iter: 25,
-  fit_tolerance: 1e-4,
-  fit_max_rejects: 5,
   batch_concurrency: 0,
 };
 
@@ -160,5 +152,37 @@ describe('AnalysisSettingsPanel', () => {
     const calls = setAnalysisConfigCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0][1]).toEqual({ config: { ...ANALYSIS_CONFIG_FIXTURE, batch_concurrency: 3 } });
+  });
+
+  it('commits the Detection Threshold in sigma on blur', async () => {
+    await renderPanel();
+    const input = screen.getByDisplayValue('6');
+
+    fireEvent.change(input, { target: { value: '8.5' } });
+    fireEvent.blur(input);
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    const calls = setAnalysisConfigCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({ config: { ...ANALYSIS_CONFIG_FIXTURE, detection_threshold: 8.5 } });
+  });
+
+  it('switches the PSF model to Auto at once and offers no removed field', async () => {
+    await renderPanel();
+    expect(screen.queryByText('Detection Sigma')).not.toBeInTheDocument();
+    expect(screen.queryByText('Trail Threshold (R²)')).not.toBeInTheDocument();
+    expect(screen.queryByText('Fit Max Iterations')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByDisplayValue('Moffat 4'), { target: { value: 'auto' } });
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    const calls = setAnalysisConfigCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({ config: { ...ANALYSIS_CONFIG_FIXTURE, psf_model: 'auto' } });
+  });
+
+  it('words the rejection default as Reject unusable frames', async () => {
+    await renderPanel();
+    expect(screen.getByRole('checkbox', { name: 'Reject unusable frames' })).toBeInTheDocument();
   });
 });

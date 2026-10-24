@@ -1,10 +1,11 @@
 import { useState, useMemo, useCallback, useRef } from 'react';
-import { FolderOpen, AlertTriangle, Star } from 'lucide-react';
+import { FolderOpen, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 import { SHORT } from '../collab/contributorState';
+import { verdictLabel, verdictSeverity, verdictTooltip, verdictClass } from '../analysis/unusable';
 
-type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'wcs' | 'reference';
+type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'verdict' | 'refused' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -203,7 +204,6 @@ export function LightsAnalysisTable({
       frame_snr: sumA(a => a.frame_snr) / n,
       psf_signal: sumA(a => a.psf_signal) / n,
       snr_weight: sumA(a => a.snr_weight) / n,
-      trail: sumA(a => a.trail_r_squared) / n,
       beta: betaAvg,
     };
   }, [frames, analysisData]);
@@ -256,8 +256,11 @@ export function LightsAnalysisTable({
         case 'snr_weight':
           comparison = (aAnalysis?.snr_weight ?? -1) - (bAnalysis?.snr_weight ?? -1);
           break;
-        case 'trail':
-          comparison = (aAnalysis?.trail_r_squared ?? -1) - (bAnalysis?.trail_r_squared ?? -1);
+        case 'verdict':
+          comparison = (aAnalysis ? verdictSeverity(aAnalysis.frame_verdict) : -1) - (bAnalysis ? verdictSeverity(bAnalysis.frame_verdict) : -1);
+          break;
+        case 'refused':
+          comparison = (aAnalysis?.stars_refused ?? -1) - (bAnalysis?.stars_refused ?? -1);
           break;
         case 'beta':
           comparison = (aAnalysis?.median_beta ?? -1) - (bAnalysis?.median_beta ?? -1);
@@ -347,7 +350,7 @@ export function LightsAnalysisTable({
               <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="frame_snr" label="Frame SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} unit="dB" />
+              <SortableHeader field="frame_snr" label="Frame SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} unit="ADU" />
@@ -355,9 +358,12 @@ export function LightsAnalysisTable({
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_weight.toFixed(1) : undefined} />
             </th>
-            {/* Tracking group — orange tint */}
+            {/* Measurement outcome group — orange tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10">
-              <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.trail.toFixed(3) : undefined} />
+              <SortableHeader field="refused" label="Refused" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+            </th>
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10">
+              <SortableHeader field="verdict" label="Verdict" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             {/* Beta column — only shown when Moffat data exists */}
             {hasBeta && (
@@ -449,26 +455,24 @@ export function LightsAnalysisTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.snr_weight.toFixed(1) : '-'}
                 </td>
-                {/* Tracking group — orange tint */}
+                {/* Measurement outcome group — orange tint */}
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-orange/5">
+                  {analysis ? (analysis.stars_refused ?? '\u2014') : '-'}
+                </td>
+                <td className="px-1.5 py-1 text-sm text-center bg-orange/5">
                   {analysis ? (
-                    <span className="inline-flex items-center gap-1">
-                      {analysis.trail_r_squared.toFixed(3)}
-                      {analysis.possibly_trailed && (
-                        <span title={analysis.trail_r_squared >= 0.3
-                          ? "Directional trail detected (RA drift)"
-                          : "Guiding issue (wind/vibration)"
-                        }>
-                          <AlertTriangle size={14} className="text-warning" />
-                        </span>
-                      )}
+                    <span
+                      className={verdictClass(analysis.frame_verdict)}
+                      title={verdictTooltip(analysis.frame_verdict)}
+                    >
+                      {verdictLabel(analysis.frame_verdict)}
                     </span>
                   ) : '-'}
                 </td>
                 {/* Beta column — only shown when Moffat data exists */}
                 {hasBeta && (
                   <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
-                    {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
+                    {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '\u2014'}
                   </td>
                 )}
                 <td className="w-16 px-1.5 py-1 text-center">

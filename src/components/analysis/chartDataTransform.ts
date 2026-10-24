@@ -99,13 +99,6 @@ export const METRIC_REGISTRY: Record<string, MetricDefinition> = {
     precision: 2,
     accessor: (_f, a) => a?.noise ?? null,
   },
-  trail_r_squared: {
-    key: 'trail_r_squared',
-    label: 'Trail R²',
-    precision: 3,
-    hint: 'lower is better',
-    accessor: (_f, a) => a?.trail_r_squared ?? null,
-  },
   median_beta: {
     key: 'median_beta',
     label: 'Moffat β',
