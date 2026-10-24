@@ -49,7 +49,7 @@ athenaeum-core = { path = "../athenaeum-core", default-features = false }
 # (no cmake/nasm), so this stays cross-compilable to arm64 with nothing but the
 # Rust toolchain. The lib target is named `astroimage` (rustafits's `[lib] name`),
 # so `preview.rs` says `use astroimage::…`.
-rustafits = { path = "../../rustafits", optional = true }
+rustafits = { path = "../../rustafits", default-features = false, optional = true }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
