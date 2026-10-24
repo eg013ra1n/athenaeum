@@ -22,10 +22,10 @@ use crate::star_measure::Domain;
 const UNIT_SCALE: f32 = 65535.0;
 
 /// The pixel planes of a raw frame, in the file's ADU, in FILE row order: `flip_vertical` is NOT applied. The reader
-/// never adjusts `bayer_pattern` for ROWORDER or a flip (fits.rs / xisf.rs pass the BAYERPAT / XISF pattern through
-/// unchanged), so a CFA `pattern` addresses the file's row order, with the file's XBAYROFF / YBAYROFF already folded in
-/// (R-PC-4: by the rustafits FITS reader, by [`fold_bayer_offsets`] for XISF); a consumer that flips an even-height mosaic must
-/// swap the pattern itself (RGGB becomes GBRG).
+/// never adjusts `bayer_pattern` for ROWORDER or a flip, so a CFA `pattern` addresses the file's row order, with the
+/// file's XBAYROFF / YBAYROFF folded in (R-PC-4): the rustafits FITS reader folds them, its XISF reader passes the
+/// pattern through and [`fold_bayer_offsets`] folds them here. A consumer that flips an even-height mosaic must swap
+/// the pattern itself (RGGB becomes GBRG).
 #[derive(Debug, Clone)]
 pub enum RawPlanes {
     Mono(Vec<f32>),
@@ -603,6 +603,23 @@ mod tests {
                 assert_eq!(*pattern, BayerPattern::Rggb);
                 assert_eq!(mosaic, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
             }
+            other => panic!("expected Cfa, got {other:?}"),
+        }
+    }
+
+    /// XISF is the one format the app folds itself (the rustafits XISF reader passes the pattern through): an RGGB
+    /// mosaic with `XBAYROFF = 1` reads as GRBG, as the FITS file above does.
+    #[test]
+    fn an_xisf_mosaic_folds_its_bayer_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.xisf");
+        let cards = vec![
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+        ];
+        write_xisf_f32(&p, 4, 2, 1, &[0.1; 8], &cards).unwrap();
+        match read_raw_frame(&p).unwrap().planes {
+            RawPlanes::Cfa { pattern, .. } => assert_eq!(pattern, BayerPattern::Grbg),
             other => panic!("expected Cfa, got {other:?}"),
         }
     }

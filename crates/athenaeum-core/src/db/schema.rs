@@ -2108,7 +2108,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             FROM star_metrics
             WHERE frame_analysis_id IN (SELECT id FROM frame_analysis);
             -- Carry the AUTOINCREMENT high-water mark: the rename leaves the new table without the old one's
-            -- sqlite_sequence row, and retired ids would otherwise be reused.
+            -- sqlite_sequence row, and retired ids would otherwise be reused. The new table has a row only once a copy
+            -- landed, so seed it first (nothing kept: every row an orphan, or an emptied table).
+            INSERT INTO sqlite_sequence (name, seq)
+                SELECT 'star_metrics_new', 0
+                WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'star_metrics_new');
             UPDATE sqlite_sequence
                SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'star_metrics'), 0))
              WHERE name = 'star_metrics_new';

@@ -494,6 +494,20 @@ mod tests {
         assert!(max >= 4, "AUTOINCREMENT high-water mark carried, got {max}");
     }
 
+    /// Every star an orphan: nothing is copied, and the high-water mark still survives the rebuild.
+    #[test]
+    fn star_metrics_rebuild_keeps_the_high_water_mark_when_nothing_is_kept() {
+        let conn = old_catalog();
+        conn.execute("DELETE FROM frame_analysis", []).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(counts(&conn), (0, 0));
+        let seq: i64 = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'star_metrics'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seq, 2, "the old table's high-water mark");
+    }
+
     #[test]
     fn star_metrics_rebuild_keeps_rows_and_accepts_null_snr() {
         let conn = old_catalog();

@@ -505,10 +505,7 @@ pub async fn get_frame_star_metrics(
 
     // Check if we have fresh analysis data with stars
     if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
-        // `measure_version` None is a pre-C6 row: stale like a hash mismatch (same rule as the batch).
-        if existing.config_hash.as_deref() == Some(&current_hash)
-            && existing.measure_version.is_some()
-        {
+        if !row_is_stale(&existing, &current_hash) {
             if let Ok(stars) = db_analysis::get_star_metrics_by_frame_id(&conn, frame_id) {
                 // A trailed / defocused / no-stars frame stores no star (PC-6), so its verdict also makes the row
                 // servable as it is.
