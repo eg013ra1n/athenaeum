@@ -51,11 +51,17 @@ pub enum RefusalReason {
     /// accepted is refused with this reason. The per-seed refusals keep theirs; there is no per-star streak refusal.
     /// Declared last so every earlier reason keeps its `Ord` position.
     Trailed,
+    /// Another seed of the plane's detection (any seed the detector produced or the caller gave, fitted or not, other
+    /// than the fit's own) lies inside the fit's half-maximum ellipse and at least [`super::fit::BLEND_SEED_GUARD`]
+    /// `· F_field` from the fit's own seed: the fit is two stars (Plan C R-PC-10). Both fits of a merged pair are
+    /// refused. Not a containment refusal, so not in the trailed share. Declared last so every earlier reason keeps its
+    /// `Ord` position.
+    Blend,
 }
 
 impl RefusalReason {
     /// Every reason, in declaration (and `Ord`) order.
-    pub const ALL: [RefusalReason; 14] = [
+    pub const ALL: [RefusalReason; 15] = [
         RefusalReason::OutsideImage,
         RefusalReason::TooFewPixels,
         RefusalReason::Donut,
@@ -70,6 +76,7 @@ impl RefusalReason {
         RefusalReason::Defocused,
         RefusalReason::MostlySaturated,
         RefusalReason::Trailed,
+        RefusalReason::Blend,
     ];
 
     /// The serialized (camelCase) name: the key of `ChannelMeasurement::refused_by_reason` and the `reason` of a
@@ -90,6 +97,7 @@ impl RefusalReason {
             RefusalReason::Defocused => "defocused",
             RefusalReason::MostlySaturated => "mostlySaturated",
             RefusalReason::Trailed => "trailed",
+            RefusalReason::Blend => "blend",
         }
     }
 }

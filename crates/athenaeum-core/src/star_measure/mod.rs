@@ -171,11 +171,15 @@ impl SnrNoise {
 /// screen PB-12' and the SNR floor PB-13' on the `c` candidates, every fit's
 /// SNR read before `c`); `c` and so every flux, weight and LN scale built on it
 /// moves, hence every stage hash that reads a fit.
+/// 6 = Plan C, the `Blend` refusal (R-PC-10: an accepted fit with another
+/// seed of the plane inside its half-maximum contour, at least 0.5 F from its
+/// own seed, is refused): what a fit accepts moves, so every Analysis row and
+/// every stage hash that reads a fit recomputes.
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
 /// measures, never one per task; Plan C = 6. `AnalysisConfig::config_hash`
 /// is Plan C's.
-pub const MEASURE_VERSION: u32 = 5;
+pub const MEASURE_VERSION: u32 = 6;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:

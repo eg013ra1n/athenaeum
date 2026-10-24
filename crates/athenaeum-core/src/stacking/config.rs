@@ -1868,23 +1868,21 @@ mod tests {
         );
     }
 
-    /// Plan B B4 (PB-14, I-5; ruling F28): the one bump of Plan B. `MEASURE_VERSION` is 5, the three fit-reading stage
+    /// Plan B B4 (PB-14, I-5; ruling F28): the one bump of Plan B. At `MEASURE_VERSION` 5 the three fit-reading stage
     /// hashes of the default config (measurement, registration, normalization) are the values below and are not the
     /// version-4 ones, and the calibration subtree - which carries no measure version - hashes as it did before the bump
-    /// (a bump must not recalibrate). RED until the constant moves.
+    /// (a bump must not recalibrate). A historical pin since Plan C's bump (6), read at version 5.
     #[test]
     fn measure_version_five_moves_the_three_fit_reading_subtrees_only() {
         let cfg = StackingConfig::default();
         assert_eq!(
             (
-                MEASURE_VERSION,
-                stage_hash(&measurement_subtree(&cfg), &[], &[]),
-                stage_hash(&registration_subtree(&cfg), &[], &[]),
-                stage_hash(&normalization_subtree(&cfg), &[], &[]),
+                stage_hash(&measurement_subtree_with_measure_version(&cfg, 5), &[], &[]),
+                stage_hash(&registration_subtree_with_measure_version(&cfg, 5), &[], &[]),
+                stage_hash(&normalization_subtree_with_measure_version(&cfg, 5), &[], &[]),
                 stage_hash(&calibration_subtree(&cfg), &[], &[]),
             ),
             (
-                5,
                 "0d5c198c7abb7132".to_string(),
                 "71627dbef71e5f50".to_string(),
                 "d1f5adda37fa2f11".to_string(),
@@ -1896,17 +1894,17 @@ mod tests {
             (
                 "measurement",
                 measurement_subtree_with_measure_version(&cfg, 4),
-                measurement_subtree(&cfg),
+                measurement_subtree_with_measure_version(&cfg, 5),
             ),
             (
                 "registration",
                 registration_subtree_with_measure_version(&cfg, 4),
-                registration_subtree(&cfg),
+                registration_subtree_with_measure_version(&cfg, 5),
             ),
             (
                 "normalization",
                 normalization_subtree_with_measure_version(&cfg, 4),
-                normalization_subtree(&cfg),
+                normalization_subtree_with_measure_version(&cfg, 5),
             ),
         ] {
             assert_ne!(
@@ -1917,10 +1915,59 @@ mod tests {
         }
     }
 
-    /// PIN, not RED (ruling F28): Plan B's one bump (PB-14); Plan A's was 4 (PA-4), Plan C's will be 6.
+    /// Plan C R-PC-10 (the Blend refusal; ruling F28): the one bump of Plan C. `MEASURE_VERSION` is 6, the three
+    /// fit-reading stage hashes of the default config are the values below and are not the version-5 ones, and the
+    /// calibration subtree hashes as it did before the bump (a bump must not recalibrate).
     #[test]
-    fn measure_version_is_five_after_plan_b() {
-        assert_eq!(MEASURE_VERSION, 5, "Plan B's one bump (PB-14)");
+    fn measure_version_six_moves_the_three_fit_reading_subtrees_only() {
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            (
+                MEASURE_VERSION,
+                stage_hash(&measurement_subtree(&cfg), &[], &[]),
+                stage_hash(&registration_subtree(&cfg), &[], &[]),
+                stage_hash(&normalization_subtree(&cfg), &[], &[]),
+                stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            ),
+            (
+                6,
+                "92ce74a473b23d1e".to_string(),
+                "40084109c5bdfb9a".to_string(),
+                "babef50774a4c396".to_string(),
+                "9653a478603091dc".to_string(),
+            ),
+            "version, measurement, registration, normalization, calibration"
+        );
+        for (name, v5, v6) in [
+            (
+                "measurement",
+                measurement_subtree_with_measure_version(&cfg, 5),
+                measurement_subtree(&cfg),
+            ),
+            (
+                "registration",
+                registration_subtree_with_measure_version(&cfg, 5),
+                registration_subtree(&cfg),
+            ),
+            (
+                "normalization",
+                normalization_subtree_with_measure_version(&cfg, 5),
+                normalization_subtree(&cfg),
+            ),
+        ] {
+            assert_ne!(
+                stage_hash(&v5, &[], &[]),
+                stage_hash(&v6, &[], &[]),
+                "{name} moved with the bump"
+            );
+        }
+    }
+
+    /// PIN, not RED (ruling F28): Plan C's one bump (R-PC-10, the Blend refusal); Plan A's was 4 (PA-4), Plan B's 5
+    /// (PB-14).
+    #[test]
+    fn measure_version_is_six_after_plan_c() {
+        assert_eq!(MEASURE_VERSION, 6, "Plan C's one bump (R-PC-10)");
     }
 
     /// M4c Task 3: the large-scale filter's two integers are clamped to the
