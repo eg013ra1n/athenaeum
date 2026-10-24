@@ -24,7 +24,7 @@ const UNIT_SCALE: f32 = 65535.0;
 /// The pixel planes of a raw frame, in the file's ADU, in FILE row order: `flip_vertical` is NOT applied. The reader
 /// never adjusts `bayer_pattern` for ROWORDER or a flip (fits.rs / xisf.rs pass the BAYERPAT / XISF pattern through
 /// unchanged), so a CFA `pattern` addresses the file's row order, with the file's XBAYROFF / YBAYROFF already folded in
-/// ([`fold_bayer_offsets`], R-PC-4); a consumer that flips an even-height mosaic must
+/// (R-PC-4: by the rustafits FITS reader, by [`fold_bayer_offsets`] for XISF); a consumer that flips an even-height mosaic must
 /// swap the pattern itself (RGGB becomes GBRG).
 #[derive(Debug, Clone)]
 pub enum RawPlanes {
@@ -80,7 +80,8 @@ fn offset(v: Option<f64>) -> i64 {
 
 /// The pattern with the file's `XBAYROFF` / `YBAYROFF` folded in (R-PC-4), the repo's convention
 /// (`integration/cfa.rs` `cfa_channel_at`): offsets mod 2, an odd x offset swaps the columns of the 2x2 cell, an odd y
-/// offset swaps its rows. The reader never reads the offsets, so without this an odd sum flips the green parity.
+/// offset swaps its rows. The rustafits FITS reader folds them itself (rustafits issue #7), its XISF reader does not:
+/// applied to XISF only, where without it an odd offset flips the green parity.
 pub fn fold_bayer_offsets(pattern: BayerPattern, xoff: i64, yoff: i64) -> BayerPattern {
     use BayerPattern::{Bggr, Gbrg, Grbg, None, Rggb};
     let swap_cols = |p| match p {
@@ -134,8 +135,10 @@ fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
             bscale: h.get_f64("BSCALE").unwrap_or(1.0),
             datamax: h.get_f64("DATAMAX"),
             egain: h.get_f64("EGAIN"),
-            xbayroff: offset(h.get_f64("XBAYROFF")),
-            ybayroff: offset(h.get_f64("YBAYROFF")),
+            // The rustafits FITS reader folds XBAYROFF / YBAYROFF into `bayer_pattern` (issue #7): folding again
+            // would undo it.
+            xbayroff: 0,
+            ybayroff: 0,
         })
     }
 }
@@ -629,7 +632,7 @@ mod tests {
         match read_raw_frame(&p).unwrap().planes {
             RawPlanes::Cfa { pattern, .. } => {
                 assert_eq!(pattern, Grbg);
-                let m = crate::analysis::cfa::green_mask(4, 2, pattern);
+                let m = astroimage::processing::cfa::green_mask(4, 2, pattern);
                 assert_eq!(m, [true, false, true, false, false, true, false, true]);
             }
             other => panic!("expected Cfa, got {other:?}"),

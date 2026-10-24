@@ -12,8 +12,9 @@
 
 use std::sync::Arc;
 
+use astroimage::processing::cfa::{green_mask, green_phase, green_sum};
 use astroimage::BayerPattern;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::star_measure::FieldWidth;
 use crate::star_measure::{
@@ -36,73 +37,6 @@ pub fn native_seed(s: &Seed) -> Seed {
         peak: s.peak / 2.0,
         flux: s.flux,
     }
-}
-
-/// `true` where the mosaic pixel `(x, y)` is a green site. RGGB and BGGR carry green where `x + y` is odd, GRBG and
-/// GBRG where it is even. `BayerPattern::None` is not a mosaic: every pixel is marked present (with one `warn!`).
-pub fn green_mask(w: usize, h: usize, pattern: BayerPattern) -> Vec<bool> {
-    let green_parity = match pattern {
-        BayerPattern::Rggb | BayerPattern::Bggr => 1,
-        BayerPattern::Grbg | BayerPattern::Gbrg => 0,
-        BayerPattern::None => {
-            warn!(
-                width = w,
-                height = h,
-                "green mask: no Bayer pattern; every pixel kept"
-            );
-            return vec![true; w * h];
-        }
-    };
-    (0..w * h)
-        .map(|i| (i % w + i / w) % 2 == green_parity)
-        .collect()
-}
-
-/// The 2x2 sum of the two green sites (G1 + G2) of each block, `(w / 2) x (h / 2)`; an odd last row or column is left
-/// out. Their centroid is the block centre, so the plane is a super-pixel plane for the 0.5 offset. `BayerPattern::None`
-/// is read as the GRBG / GBRG phase (the caller never passes it: [`green_mask`] warns for it).
-pub fn green_sum(
-    mosaic: &[f32],
-    w: usize,
-    h: usize,
-    pattern: BayerPattern,
-) -> (Vec<f32>, usize, usize) {
-    // (dx, dy) of the two greens in a block: (1, 0) + (0, 1) for RGGB / BGGR, (0, 0) + (1, 1) for GRBG / GBRG.
-    let ((ax, ay), (bx, by)) = match pattern {
-        BayerPattern::Rggb | BayerPattern::Bggr => ((1, 0), (0, 1)),
-        _ => ((0, 0), (1, 1)),
-    };
-    let (sw, sh) = (w / 2, h / 2);
-    let mut out = Vec::with_capacity(sw * sh);
-    for j in 0..sh {
-        for i in 0..sw {
-            out.push(mosaic[(2 * j + ay) * w + 2 * i + ax] + mosaic[(2 * j + by) * w + 2 * i + bx]);
-        }
-    }
-    (out, sw, sh)
-}
-
-/// The green sites of one phase, `(w / 2) x (h / 2)`: the green pixel of each 2x2 block (the one at `(1, 0)` of an
-/// RGGB / BGGR block, at `(0, 0)` of a GRBG / GBRG block). A subsample of the mosaic with white noise, read for the
-/// plane's sky and noise.
-pub fn green_phase(
-    mosaic: &[f32],
-    w: usize,
-    h: usize,
-    pattern: BayerPattern,
-) -> (Vec<f32>, usize, usize) {
-    let dx = match pattern {
-        BayerPattern::Rggb | BayerPattern::Bggr => 1,
-        _ => 0,
-    };
-    let (sw, sh) = (w / 2, h / 2);
-    let mut out = Vec::with_capacity(sw * sh);
-    for j in 0..sh {
-        for i in 0..sw {
-            out.push(mosaic[2 * j * w + 2 * i + dx]);
-        }
-    }
-    (out, sw, sh)
 }
 
 /// Measure a Bayer mosaic on its green sites (PC-4); `base` carries the domain, PSF model, threshold
