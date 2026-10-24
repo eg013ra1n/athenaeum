@@ -148,7 +148,7 @@ function DocNumberField({
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex items-center gap-1 mb-1">
         <label className="block text-sm font-medium text-content-secondary">{meta.label}</label>
         <ResetButton visible={!isDefault} defaultLabel={String(defaultValue)} onReset={onReset} disabled={disabled} />
       </div>

@@ -124,7 +124,7 @@ function DocNumberField({
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex items-center gap-1 mb-1">
         <label className="block text-xs text-content-secondary">
           {meta.label}
           {unit && <span className="text-content-muted"> ({unit})</span>}
@@ -343,7 +343,7 @@ export function AnalysisSettingsPanel() {
       {/* Measurement Method */}
       <SettingsSection id="analysis.measurement" actions={<SavedTick savedAt={savedAt} />}>
         <div>
-          <div className="flex items-center justify-between gap-2 mb-1">
+          <div className="flex items-center gap-1 mb-1">
             <label className="block text-xs text-content-secondary">
               {fieldMeta('analysis.measurement', 'psfModel').label}
             </label>
@@ -370,7 +370,7 @@ export function AnalysisSettingsPanel() {
       {/* Batch Processing */}
       <SettingsSection id="analysis.batch" actions={<SavedTick savedAt={savedAt} />}>
         <div>
-          <div className="flex items-center justify-between gap-2 mb-1">
+          <div className="flex items-center gap-1 mb-1">
             <label className="block text-xs text-content-secondary">
               {fieldMeta('analysis.batch', 'concurrentFrames').label}
             </label>

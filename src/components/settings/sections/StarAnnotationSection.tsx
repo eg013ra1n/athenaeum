@@ -50,7 +50,7 @@ interface NumberRowProps {
 function NumberRow({ label, min, max, step, value, onChange, isDefault, defaultValue, onReset }: NumberRowProps) {
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex items-center gap-1 mb-1">
         <label className="block text-xs text-content-secondary">{label}</label>
         <ResetButton visible={!isDefault} defaultLabel={String(defaultValue)} onReset={onReset} />
       </div>
