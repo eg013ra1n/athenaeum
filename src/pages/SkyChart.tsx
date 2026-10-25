@@ -1302,15 +1302,15 @@ export default function SkyChart() {
   return (
     <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex items-center justify-between">
+      <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         {/* Left: Title */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <HistoryNav />
-          <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
+          <h2 className="text-2xl font-bold text-content whitespace-nowrap">Sky Chart</h2>
         </div>
 
         {/* Right: Controls */}
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 min-w-0">
           {/* T2-10/T2-13/T2-16 — visible kbd hint, distinct active label,
               focus ring for keyboard nav. */}
           <button
@@ -1349,13 +1349,13 @@ export default function SkyChart() {
 
           {/* T2-12/T2-16/T2-17 — visible label, focus ring, no-name
               fallback in the option list. */}
-          <label htmlFor="skychart-jump-to" className="text-xs text-content-muted">Jump to:</label>
+          <label htmlFor="skychart-jump-to" className="text-xs text-content-muted whitespace-nowrap">Jump to:</label>
           <select
             id="skychart-jump-to"
             value={selectedTarget}
             onChange={(e) => handleTargetCenter(e.target.value)}
             disabled={!mapReady || loading}
-            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
+            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent w-56 max-w-full"
           >
             <option value="">Select a target…</option>
             {locations
