@@ -57,10 +57,10 @@ A **quad index pack** is a precomputed table of catalog quads (`quads.smaq`, for
 
 | Pack | Fields served | Size (zip) | Needs on the build side |
 | ---- | ---- | ---- | ---- |
-| `base` | about 1.1 to 54 degrees (35 mm lenses to about 1000 mm on APS-C) | about 147 MB | `tier_500` |
-| `narrow` | about 0.55 to 1.1 degrees (to about 2000 mm on APS-C) | about 236 MB | `tier_500` + `tier_2000` |
+| `base` | about 1.3 to 54 degrees (35 mm lenses to about 1000 mm on APS-C) | about 147 MB | `tier_500` |
+| `narrow` | about 0.65 to 1.3 degrees (to about 2000 mm on APS-C) | about 236 MB | `tier_500` + `tier_2000` |
 
-Packs are optional. With none installed the solver behaves exactly as before.
+Packs are optional. With none installed the solver behaves exactly as before. The lower figure is the manifest's `min_fov_deg` (`QuadIndex::min_fov_deg`: four times the pack's smallest quad, 1.296 and 0.648 degrees as published); the solvemyastro spec table quotes the band edges, about 1.1 and 0.55.
 
 **Layout.** Same server directory as the tiers (base URL `catalog_base_url()`, default `https://artfrom.space/catalogs/`, override `ATHENAEUM_CATALOG_BASE_URL`): `index_manifest.json`, `index_base.zip` + `index_base.zip.sha256`, `index_narrow.zip` + `index_narrow.zip.sha256`; each zip holds `<dir>/quads.smaq` (for example `base/quads.smaq`). Locally: `<app-data>/catalogs/smac_index/<dir>/quads.smaq`, with the manifest cached as `<app-data>/catalogs/smac_index/manifest.json` (same cache and short-timeout fetch policy as the tier manifest). The manifest model is `catalog::manifest::IndexManifest { version, format, catalog_epoch, packs: [IndexManifestPack { name, zip, sha256, dir, size_bytes, min_fov_deg }] }`; `format` must equal `solvemyastro::index::FORMAT_VERSION`, otherwise the pack is shown as incompatible and a download is refused with "update Athenaeum".
 
@@ -75,7 +75,7 @@ Packs are optional. With none installed the solver behaves exactly as before.
 | scale only | yes, whole sky, scale hint divided by 5 to multiplied by 5 |
 | none | yes, whole sky, 0.1 to 120 arcsec/px |
 
-A solve found through the index logs `path = "index"` at `info` ("solve succeeded"). If the index finds nothing, the spiral runs where the index did not look. Fields narrower than about 0.5 degrees are not covered by either pack: blind they fail fast, with a position hint they solve through the spiral.
+A solve found through the index logs `path = "index"` at `info` ("solve succeeded"). If the index finds nothing, the spiral runs where the index did not look. Fields narrower than about 0.65 degrees are not served by either pack: blind they fail fast, with a position hint they solve through the spiral.
 
 **Recipe and identity.** `SOLVE_RECIPE_VERSION` is 2 (solvemyastro 0.2.0 changed verification and the search), so SOLVED stacking solves cached under recipe 1 are solved again. `stacking::solve::solver_identity` appends `|index:<index_identity>` when any pack is installed (`{config hash}:{catalog identity}|index:{identity}`); with none the form is unchanged. Installing, replacing or removing a pack therefore re-solves the stacking caches, which is intended: the same frame can now take a different path to its solution.
 
