@@ -201,7 +201,7 @@ export default function LibraryTab({
           groupRowExtra={
             <Button
               onClick={() => setExportOpen(true)}
-              title="Organize the project's frames into a WBPP folder tree"
+              title="Organize the project's frames into a PixInsight WBPP folder tree"
             >
               <FolderOutput size={12} />
               Export for WBPP
