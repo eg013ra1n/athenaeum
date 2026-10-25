@@ -45,6 +45,8 @@ Where the size rule holds: the candidate engine (`configurable_matcher::find_cal
 
 **Cost of the header read** (review t3fix-t4-t5 M-5). The size is a column and costs nothing; the origin is one stored-header parse per set. The manual candidate list and the Equipment page (`query_camera_calibration_sets` / `load_set_with_score`) parse one header per set — O(sets), acceptable at catalog scale. The hierarchy view, the readiness pass and the matcher read a set's origin lazily (only when sizes agree) and a light's through a shared cache, so a light's header is parsed at most once per view / pass; the collab gate re-runs the pass per light with a fresh set cache (bounded, about 7 parses per light).
 
+**Acceptance (2026-10-25, owner: accepted).** On a copy of the owner's catalog (frame set 182, Horsehead C11, 164 ASI6200MM lights at 9576×6388), through the release web host: the manual candidate list refuses all 20 ROI darks (6384×4258, 4784×3194 — 1843/1844 among them) on size and offers only full-frame sets; Find Calibration links 164/164 with no link of another size; the plan's `geometryMismatches` / `geometryWarnings` are empty; Calibrate runs all 164 lights with no geometry error. The production catalog no longer held the bug's state (the owner had re-linked set 182 by hand to full-frame darks), so the up-front refusal of an existing misfit link is covered by tests only. The same runs showed set 182's darks are offset-50 masters on OFFSET-1 lights (the 2026-10-02 diagnosis): with them the R/G/B masters are 99.9 % zero; without darks, and with flats rebuilt without pre-calibration, the set stacks cleanly.
+
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Catalog rules
 
