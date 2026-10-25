@@ -4250,7 +4250,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   C3 65ad923d / 3d756181 (the CFA green-site path), C4 3d8a745f (trail R²), C5 d66f7f88 / 056c2772 / 6ee0d9f5 (the analyzer switch, the config,
   the probe arms), BUMP (rustafits 1.6) 08446186 / 2764e12b, C6 595ef880 / eaa1d88a / ec928042 / 127226cb (persistence, compatibility, gate trust,
   frame meta), C7 62e24c48 / 365cc9f9 (the gate), C8 4497f5d5 / 0c59fad1 (frontend), C9 0b3a281b / 0872d6e5 / d811c054 / 16c0a2ec / 41ca7bad (app look fixes, Blend), rustafits #7 follow-up 47c33f73, C10B 16c8e2aa
-  (Blend on the Analysis path only, `MEASURE_VERSION` 7; R-PC-10b). Final code sha **16c8e2aa**.
+  (Blend on the Analysis path only, `MEASURE_VERSION` 7; R-PC-10b). Final code sha **16c8e2aa** (the runs' sha); 331f00f3 after it folds the C10B review's two doc-comment minors (no code change).
   *Planned rulings PC-1 … PC-15 (one line each; evidence: the plan and the task reports under the ledger folder).*
   - PC-1 `MEASURE_VERSION` stays 5 unless a stacking-path number moves - **SUPERSEDED by R-PC-10**: the Blend refusal moves what a fit
     accepts, so 5 → 6 (Plan C's one bump, R-OSP-1's policy; `AnalysisConfig::config_hash` folds it; Analysis rows store the version that
@@ -4394,6 +4394,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (4197 / 0 / 17 at 41ca7bad; the dev Mac runs the network modules too, no split); at 41ca7bad: `cargo test -p athenaeum-web` 53 / 0,
       `cargo check -p athenaeum-core --no-default-features` Finished, vitest 88 files / 930 passed. Lab (C10T): star-lab 1556 OK, harness
       468 OK (2 skipped).
+    - Merged tree (plan-c 1dd61560 = local main after the fast-forward; dev Mac, single runs): core all targets 4201 / 0 / 17, web 53 / 0,
+      `--no-default-features` check Finished, vitest 88 files / 930 passed.
     - After note: `docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md`.
   - **R-OSP-17 CLOSED (2026-10-25): Plan C complete; merge into local main; push on the owner's word.**
 
