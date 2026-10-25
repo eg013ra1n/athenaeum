@@ -173,13 +173,17 @@ impl SnrNoise {
 /// moves, hence every stage hash that reads a fit.
 /// 6 = Plan C, the `Blend` refusal (R-PC-10: an accepted fit with another
 /// seed of the plane inside its half-maximum contour, at least 0.5 F from its
-/// own seed, is refused): what a fit accepts moves, so every Analysis row and
-/// every stage hash that reads a fit recomputes.
+/// own seed, is refused) on every path (16c0a2ec): burnt, its stacking
+/// artifacts carry Blend numbers.
+/// 7 = Plan C final: the `Blend` refusal on the Analysis path only (R-PC-10b:
+/// [`Mode::Budget`]; the stacking Measure, LN's refits and registration fit as
+/// at 5): what the Analysis path accepts moves, so every Analysis row and every
+/// stage hash that reads a fit recomputes.
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
-/// measures, never one per task; Plan C = 6. `AnalysisConfig::config_hash`
-/// is Plan C's.
-pub const MEASURE_VERSION: u32 = 6;
+/// measures, never one per task; Plan C = 7 (6 is burnt, never released).
+/// `AnalysisConfig::config_hash` is Plan C's.
+pub const MEASURE_VERSION: u32 = 7;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -418,6 +422,8 @@ impl FitStarsOptions<'_> {
             population: None,
             siblings: None,
             timers: None,
+            // R-PC-10b: LN's refits and every other `fit_stars_at` caller fit as at `MEASURE_VERSION` 5.
+            blend_refusal: false,
         }
     }
 }
@@ -1749,6 +1755,8 @@ fn measure_budget(
                     of_fit: &candidates,
                 }),
                 timers: Some(&steps),
+                // R-PC-10b: the Blend refusal is the Analysis path's alone.
+                blend_refusal: true,
                 ..Default::default()
             },
             None,
@@ -4471,6 +4479,60 @@ mod tests {
         data
     }
 
+    /// R-PC-10b: the Blend refusal is the Analysis path's alone. One plane with a close pair (a bright star and a
+    /// companion of a fifth of its amplitude 1.0 F out, both seeded): the stacking Measure's `Mode::All` fits both
+    /// stars and refuses none as `Blend`; `Mode::Budget` refuses the companion.
+    #[test]
+    fn mode_all_never_refuses_blend_mode_budget_does() {
+        let alpha = 4.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+        let star = |x: f64, y: f64| MoffatStar {
+            x,
+            y,
+            amp: 0.3,
+            alpha_x: alpha,
+            alpha_y: alpha,
+            theta: 0.0,
+        };
+        let mut stars: Vec<MoffatStar> = (0..30)
+            .map(|i| star(40.0 + 50.0 * (i % 6) as f64, 40.0 + 50.0 * (i / 6) as f64))
+            .collect();
+        let bright = |x: f64, y: f64, amp: f64| MoffatStar {
+            amp,
+            ..star(x, y)
+        };
+        stars.push(bright(115.0, 65.0, 1.0));
+        stars.push(bright(115.0 + 4.0, 65.0, 0.2));
+        let mut data = moffat_field(340, 300, &stars, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, 9);
+        let run = |mode: Mode| {
+            let opts = MeasureOptions {
+                mode,
+                seeds: SeedSpec::Given(seeds_of(&stars)),
+                ..Default::default()
+            };
+            measure_plane(&data, 340, 300, &opts, None)
+        };
+        let blends = |m: &PlaneMeasurement| {
+            m.refused
+                .by_reason
+                .get(&RefusalReason::Blend)
+                .copied()
+                .unwrap_or(0)
+        };
+        let near_pair = |m: &PlaneMeasurement| {
+            m.stars
+                .iter()
+                .filter(|f| (f.x - 117.0).abs() < 4.5 && (f.y - 65.0).abs() < 2.0)
+                .count()
+        };
+        let all = run(Mode::All);
+        assert_eq!(blends(&all), 0, "{:?}", all.refused);
+        assert_eq!((all.stars.len(), near_pair(&all)), (32, 2), "both stars of the pair are fitted");
+        let budget = run(Mode::Budget { budget: 500 });
+        assert_eq!(blends(&budget), 1, "{:?}", budget.refused);
+        assert_eq!((budget.stars.len(), near_pair(&budget)), (31, 1), "the companion is refused");
+    }
+
     fn budget_opts(budget: usize) -> MeasureOptions {
         MeasureOptions {
             mode: Mode::Budget { budget },
@@ -4636,12 +4698,19 @@ mod tests {
 
     /// R12-2 / R12-3: a budget no smaller than the seed count selects every seed and trims nothing. The measurement is then
     /// `Mode::All`'s bit for bit (Debug text, so NaN fields compare; the wall-clock timings set equal), on given and
-    /// matched-filter seeds, under both PSF models.
+    /// matched-filter seeds, under both PSF models. The fields hold no close pair (the stars of the random one are kept
+    /// 24 px apart): `Mode::Budget` alone refuses `Blend` (R-PC-10b), so a pair is the one place the two differ.
     #[test]
     fn a_budget_at_or_above_the_seed_count_is_mode_all_bit_for_bit() {
         let (fixture, fw, fh) = crate::test_support::fixture_field(7, 1.0, 0.002);
         let given = test_seeds_of(&fixture, fw, fh);
-        let noisy = noisy_field(&uniform(300, 1024, 1024, 9), 9);
+        let mut apart: Vec<MoffatStar> = Vec::new();
+        for s in uniform(300, 1024, 1024, 9) {
+            if apart.iter().all(|t| (t.x - s.x).hypot(t.y - s.y) > 24.0) {
+                apart.push(s);
+            }
+        }
+        let noisy = noisy_field(&apart, 9);
         for (plane, w, h, spec) in [
             (&fixture, fw, fh, SeedSpec::Given(given)),
             (
@@ -4672,6 +4741,11 @@ mod tests {
                     None,
                 );
                 let r = b.budget.take().expect("a budget report");
+                assert_eq!(
+                    b.refused.by_reason.get(&RefusalReason::Blend),
+                    None,
+                    "premise: no close pair on the field"
+                );
                 assert_eq!(
                     (r.not_selected, r.trimmed, r.candidates, r.kept),
                     (0, 0, a.seeds, a.stars.len())

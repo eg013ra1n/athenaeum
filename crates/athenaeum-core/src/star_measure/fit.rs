@@ -1727,12 +1727,6 @@ fn canonical_theta(theta: f64) -> f64 {
 /// fit's own seed is a second local maximum of the same core, never a second star.
 pub const BLEND_SEED_GUARD: f64 = 0.5;
 
-#[cfg(test)]
-thread_local! {
-    /// Tests only: switches the blend rule off on this thread, so a test can compare a plane against the rule's "before".
-    pub(super) static BLEND_RULE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The blend refusal (Plan C R-PC-10), run on the accepted fits before the duplicate drop: a fit is refused
 /// [`RefusalReason::Blend`] when another seed of the plane's detection lies inside its half-maximum ellipse (centre
 /// `(x, y)`, semi-axes `fwhm_x / 2`, `fwhm_y / 2` turned by `theta`, [`inside_half_max`]) and at least
@@ -1740,19 +1734,17 @@ thread_local! {
 /// call was handed a subset of them (the budget's candidates, a population, a brightest prefix: every detected seed,
 /// fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
 /// fit's own seed (`of_fit[i]`, else `i`) never counts. A refused fit leaves `accepted` (the order of the rest is
-/// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set.
+/// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set. Runs only when
+/// the call's [`Correction::blend_refusal`] is set (the Analysis budget path, R-PC-10b).
 fn refuse_blends(
     accepted: &mut Vec<(usize, StarFit)>,
     outcomes: &mut [Outcome],
     seeds: &[Seed],
     neighbours: Option<Neighbours<'_>>,
     field_fwhm: f64,
+    enabled: bool,
 ) {
-    #[cfg(test)]
-    if BLEND_RULE_OFF.with(|c| c.get()) {
-        return;
-    }
-    if accepted.is_empty() {
+    if !enabled || accepted.is_empty() {
         return;
     }
     let (plane, of_fit): (&[Seed], Option<&[usize]>) = match neighbours {
@@ -1922,6 +1914,10 @@ pub(super) struct Correction<'a> {
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
+    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b): `true` only on the Analysis budget path
+    /// ([`super::Mode::Budget`]); the stacking Measure, LN's refits and registration leave it `false` and fit as at
+    /// `MEASURE_VERSION` 5.
+    pub(super) blend_refusal: bool,
 }
 
 /// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
@@ -2288,14 +2284,16 @@ fn fit_at_width(
             traces.push(trace);
         }
     }
-    // Plan C R-PC-10: a fit with another seed of the plane inside its half-maximum contour is two stars, refused
-    // `Blend` before the duplicate drop (a fit the plane verdicts refused never reaches it).
+    // Plan C R-PC-10 / R-PC-10b: on the Analysis path (`correction.blend_refusal`), a fit with another seed of the
+    // plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit the plane
+    // verdicts refused never reaches it). The stacking, LN and registration fits do not run the rule.
     refuse_blends(
         &mut accepted,
         &mut outcomes,
         seeds,
         correction.neighbours,
         field.fwhm_px,
+        correction.blend_refusal,
     );
     let mut kept = dedupe(accepted);
     for (star, &(seed, _)) in kept.iter().enumerate() {
@@ -4358,12 +4356,46 @@ mod tests {
                 .copied()
                 .unwrap_or(0)
         }
-        /// `f` with the rule switched off on this thread: the "before" a no-pair comparison reads.
-        fn without_rule<T>(f: impl FnOnce() -> T) -> T {
-            BLEND_RULE_OFF.with(|c| c.set(true));
-            let r = f();
-            BLEND_RULE_OFF.with(|c| c.set(false));
-            r
+        /// The measure path's call as the Analysis budget path makes it (verdicts on, `blend_refusal` set when
+        /// `blend`), the seeds and the field width handed in: the shared shape of every test here.
+        fn fit_blend(
+            data: &[f32],
+            w: usize,
+            h: usize,
+            seeds: &[Seed],
+            blend: bool,
+            trail_verdict: bool,
+        ) -> FitOutcome {
+            fit_stars_with_beta_diagnosed(
+                data,
+                w,
+                h,
+                seeds,
+                4.0,
+                &FitParams::default(),
+                None,
+                Some(F),
+                None,
+                true,
+                true,
+                trail_verdict,
+                Correction {
+                    blend_refusal: blend,
+                    ..Default::default()
+                },
+            )
+        }
+        /// [`fit_blend`] with the rule on, the diagnostics split out as `fit_with` returns them.
+        fn fit_with(
+            data: &[f32],
+            w: usize,
+            h: usize,
+            seeds: &[Seed],
+            _field: f64,
+        ) -> (FitOutcome, Vec<FitDiagnostics>) {
+            let out = fit_blend(data, w, h, seeds, true, false);
+            let d = out.diagnostics.clone();
+            (out, d)
         }
 
         #[test]
@@ -4474,6 +4506,7 @@ mod tests {
                     false,
                     Correction {
                         neighbours,
+                        blend_refusal: true,
                         ..Default::default()
                     },
                     &[],
@@ -4488,24 +4521,19 @@ mod tests {
             assert_eq!((with.fits.len(), blends(&with.refused)), (0, 1), "{:?}", with.refused);
         }
 
-        /// No pair on the plane: the rule changes nothing (fits, their order, the frame statistic, the refusals).
+        /// No pair on the plane: the rule changes nothing (fits, their order, the refusals), flag set or not.
         #[test]
         fn a_field_with_no_pairs_is_byte_identical_to_the_rule_off() {
             let mut data = moffat_field(480, 400, &crate::star_measure::tests::grid30(alpha_of(F)), 4.0, 0.05);
             add_noise(&mut data, 0.002, 8);
-            let opts = MeasureOptions {
-                seeds: SeedSpec::MatchedFilter {
-                    threshold: seeds::DEFAULT_THRESHOLD,
-                },
-                ..Default::default()
-            };
-            let on = measure_plane(&data, 480, 400, &opts, None);
-            let off = without_rule(|| measure_plane(&data, 480, 400, &opts, None));
-            assert!(on.stars.len() >= 25, "premise: {} stars", on.stars.len());
+            let seeds = crate::star_measure::tests::seeds_of(&crate::star_measure::tests::grid30(alpha_of(F)));
+            let on = fit_blend(&data, 480, 400, &seeds, true, true);
+            let off = fit_blend(&data, 480, 400, &seeds, false, true);
+            assert!(on.fits.len() >= 25, "premise: {} stars", on.fits.len());
             assert_eq!(blends(&on.refused), 0);
-            assert_eq!(format!("{:?}", on.stars), format!("{:?}", off.stars));
-            assert_eq!(format!("{:?}", on.frame), format!("{:?}", off.frame));
+            assert_eq!(format!("{:?}", on.fits), format!("{:?}", off.fits));
             assert_eq!(on.refused, off.refused);
+            assert_eq!(on.aperture_correction, off.aperture_correction);
         }
 
         /// A trailed plane keeps its verdict: every fit it would accept is refused `Trailed`, none `Blend`, exactly as
@@ -4513,17 +4541,35 @@ mod tests {
         #[test]
         fn a_trailed_plane_still_gets_the_trailed_verdict() {
             let (data, seeds) = trail_plane_fixture(540, 420, 5, 120, 42);
-            let opts = MeasureOptions {
-                seeds: SeedSpec::Given(seeds),
-                ..Default::default()
-            };
-            let on = measure_plane(&data, 540, 420, &opts, None);
-            let off = without_rule(|| measure_plane(&data, 540, 420, &opts, None));
+            let on = fit_blend(&data, 540, 420, &seeds, true, true);
+            let off = fit_blend(&data, 540, 420, &seeds, false, true);
             assert!(on.trailed);
-            assert!(on.stars.is_empty());
+            assert!(on.fits.is_empty());
             assert_eq!(blends(&on.refused), 0);
             assert_eq!(on.refused, off.refused);
             assert_eq!(on.trail_share, off.trail_share);
+        }
+
+        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule -
+        /// the pair of `two_equal_stars_closer_than_their_contour_are_both_refused_blend` keeps both its fits.
+        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule. The
+        /// plane is the second arm of `a_faint_companion_inside_the_contour_refuses_the_bright_star_blend`'s kind: a
+        /// faint companion (0.2 of the bright amplitude) 1.0 F out, whose seed lies inside the bright fit's contour.
+        /// The default keeps both fits; the same call with the flag set refuses the companion's `Blend`.
+        #[test]
+        fn the_default_correction_keeps_both_stars_of_a_close_pair() {
+            let stars = [star(60.0, 60.0, 1.0), star(60.0 + F, 60.0, 0.2)];
+            let data = plane(120, 120, &stars, 6);
+            let seeds = seeds_from(&stars, 4.0);
+            let off = fit_blend(&data, 120, 120, &seeds, false, false);
+            assert_eq!(off.fits.len(), 2, "{:?}", off.refused);
+            assert_eq!(blends(&off.refused), 0, "{:?}", off.refused);
+            assert!(off
+                .diagnostics
+                .iter()
+                .all(|d| matches!(d.outcome, Outcome::Accepted { .. })));
+            let on = fit_blend(&data, 120, 120, &seeds, true, false);
+            assert_eq!((on.fits.len(), blends(&on.refused)), (1, 1), "{:?}", on.refused);
         }
 
         /// `Mode::Budget`: a blended candidate's refusal is counted like any other, so the F-0 identity and
