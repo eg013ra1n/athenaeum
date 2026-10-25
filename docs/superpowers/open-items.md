@@ -471,6 +471,34 @@ mockup in the dev harness (`npm run ui:harness`, spec
   Screen Recording permission. On the owner's data: all six tabs, the frame panel, the member panel
   and one dialog, compared with the harness for font rendering and layout.
 
+### Hub — the test hub, production and the production gate (checked 2026-10-25)
+
+Read-only check on the VPS (`psql SELECT`, unauthenticated route probes). The per-wave entries below no longer
+list hub deploys: everything through hub `main` is on the test hub.
+
+- **Test hub** (`test-hub.artfrom.space`): migrations up to **0027** (applied 2026-09-29), binary of 2026-09-30
+  20:46 = hub `main` including `b485578` (holder-device-names). Collab v1–v3 waves 0–3, the contributor path
+  (migration 0026, the `None` dictionary entry) and the observability goals (0027) are all live there; the
+  collab v3 routes answer 401, not 404; `feed epoch` is in its journal; host-wide nginx worker sizing
+  (`worker_rlimit_nofile 16384`, `worker_connections 4096`) is applied. Data: 3 projects, 188 project frames,
+  9 devices. The collab-v2 wave-1 check `project_members WHERE is_coordinator AND cardinality(gov_caps) <> 6`
+  returns 0.
+- **Owed — push hub `main`.** Local `main` is one commit ahead of `origin/main` (`b485578`; the branch
+  `holder-device-names` itself is pushed). On the owner's word.
+- **Production** (`projects.artfrom.space`): migrations up to **0011** (2026-07-18), binary of 2026-07-18; no
+  collab v3 (`/me/project-versions` and `/me/events` answer 404). 3 projects, 27 devices.
+- **Production gate.** Do not deploy collab v3 (hub `main`, migrations 0012–0027) to production until an app
+  release ships the collab v3 client: one that (a) treats `409 collab_api_outdated` as "update required"
+  instead of a raw unexpected-status error and (b) reads `pendingFrames`, not the deprecated
+  `pendingAnnouncements` (the hub keeps the alias, so `/me/projects` still decodes for old apps). The last
+  release, v0.6.4 (2026-09-17), has neither; `main` is past it by 906 commits. After the deploy, v0.6.4
+  clients get `409 collab_api_outdated` on every collaboration call — the compat gate as designed.
+  Preflight (2026-10-25): production `package_announcements` holds **0** rows, so migration 0022 (which
+  refuses on a non-empty table) will run. The deploy itself is the owner-initiated production procedure:
+  hub `main`, `deploy_athenaeum_hub.yml -e @~/.config/athenaeum-hub/smtp.yml`, health + journal.
+- **Repo hygiene.** `Documents/Projects/athenaeum-hub-portal/` is a STALE copy of the portal (still the
+  free-text threshold editor); the deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
+
 ### Collab observability wave 1 + 2 (2026-09-30)
 
 Backend (wave 1: the exchange meter, sessions, member summary) and frontend (wave 2: the six-tab project
@@ -504,8 +532,8 @@ Added by the smoke-fixes cycle (2026-09-30, `docs/superpowers/plans/2026-09-30-c
 - a moderator who is not coordinator sees Moderation, Exclude and Restore, and no false approval line;
 - a member coming online shows within about 2 s without reopening the page.
 
-The hub fix (`holder-device-names`, commit `b485578`) is deployed to the TEST hub only; fast-forwarded into the
-hub's local `main` on 2026-10-25, not pushed and not on the production hub.
+The hub fix (`holder-device-names`, `b485578`) is on the test hub; hub `main` push and production: see the hub
+state entry above.
 
 Deferred, not built this cycle: Ask to exclude (hub mechanism, publisher side) and per-frame Download /
 Stop keeping in the Library tab (core want/unwant override on top of the replication policy, plus replica
@@ -513,10 +541,9 @@ deletion with the last-copy warning).
 
 ### Collab v3 wave 3 — owner smoke (2026-09-28)
 
-The owner's first hands-on pass over wave 3 (app on local `main`, portal +
-hub on the hub's local `main`; nothing pushed, the test hub NOT redeployed).
-Three findings; two fixed, one is a decided model gap that needs its own
-cycle.
+The owner's first hands-on pass over wave 3. Three findings; two fixed, one
+a model gap since built as the contributor path. All of it is merged and on
+the test hub; what is owed below is hands-on checks there.
 
 - **FIXED — "Save as new version" with an untouched draft minted a version.**
   Portal `ThresholdEditor` disables Save while the parsed draft equals the
@@ -525,9 +552,8 @@ cycle.
   identical to the current version` by jsonb equality and mints nothing
   (`tests/thresholds.rs::identical_rules_are_refused`). Hub `f2c1385`.
   - The FULL hub suite ran green on 2026-09-28 (`DATABASE_URL=… cargo test`
-    in `athenaeum-hub`, exit 0; the earlier run had been cancelled after
-    `thresholds`, `rules_registry`, `feed_publish`, `collab_flow`). Owed: the
-    test-hub deploy and a portal click-through: open Admin → Quality
+    in `athenaeum-hub`, exit 0). Owed: a portal click-through on the test
+    hub: open Admin → Quality
     thresholds untouched → Save disabled with the hint; edit a value → Save
     enabled → v+1; post the same rules from a second tab → the `Error: rules
     are identical…` note.
@@ -535,9 +561,9 @@ cycle.
   reject".** The fixed operand word in the portal editor is now `trailed`
   (same hub commit); the app's project page renders that rule as `Reject
   trailed frames` instead of `not_trailed — reject when true` (app
-  `f34cf13d`). Owed: a look at both.
-- **DECIDED, NOT BUILT — OSC frames (any frame without a `FILTER` header)
-  cannot be published: `filter "" is not in the project dictionary`.** Root
+  `f34cf13d`). Owed: a look at both on the test hub.
+- **BUILT as the contributor path (below) — OSC frames (any frame without a `FILTER` header)
+  could not be published: `filter "" is not in the project dictionary`.** Root
   cause: the spec §6.2 mapping mechanism — `filter_mappings (instrume,
   filter_raw) → canonical` per account, the normaliser, the publish-flow modal
   listing every unmapped raw name with a Select — was deferred by wave 2
@@ -578,9 +604,10 @@ cycle.
   a blocker list with actions above the gate table + the frame set's
   Project block/column + the auto-publish switch for every member; two
   plans follow (hub+portal, app).
-  Hub+portal plan DONE on branch `contributor-path-hub` (`2aae815`): full hub
-  suite + portal suite green; OWED: merge on the owner's word, test-hub
-  deploy, the portal click-through of acceptance step 1.
+  Hub+portal plan DONE (`contributor-path-hub`, `2aae815`), merged into hub
+  `main` and live on the test hub (migration 0026). OWED: the portal
+  click-through of acceptance step 1 (the dictionary editor, the two
+  `PUT /dictionary` refusals) on the test hub.
   - Follow-up (final review of the hub branch, 2026-09-28): "remap them
     first" names a control neither the portal nor the app has — the
     coordinator remap (`PATCH …/frames/{uuid}` `filterCanonical`) has no UI;
@@ -595,10 +622,10 @@ cycle.
     `set_own_version` writes the winner's content identity against the
     loser's old path. Needs per-project uniqueness (schema change, its own
     cycle).
-  App plan DONE on branch `contributor-path-app` (`73cc81bb` after the final review + fix wave; trailers added by rebase): core suite
-  (all targets) + no-default-features check + frontend suite green; OWED:
-  merge on the owner's word, the acceptance smoke of spec §13 steps 2–8
-  against the test hub once the hub plan is deployed.
+  App plan DONE (`contributor-path-app`, `73cc81bb`), merged into `main`:
+  core suite (all targets) + no-default-features check + frontend suite
+  green. OWED: the acceptance smoke of spec §13 steps 2–8 against the test
+  hub.
   - Final-review fix wave (2026-09-29), informational, do not re-flag:
     `meta.calibration` goes stale after an attested↔generated transition
     (versions carry no meta) — informational (F8); a version post could
@@ -608,13 +635,9 @@ cycle.
   - The attestation confirm does not repeat the §6.5 debayered-RGB caveat
     (the help line does).
 - Parked (app final re-review 2026-09-29, rulings in the SDD ledger): the I2 identical-bytes `landed_path` move is not gated on `w.staged == w.target` (only reachable in the C1c race; add the gate when next in that code); the project page's mount effect passes `tab === 'contribute'` where `activeTab` is the rendered tab (a stored, unavailable tab loads without chips until a publish/mapping save); the removal-site `was_external_recipe` skip has no isolating test; the lookup-error warn text says "a files row still references it".
-- **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
-  STALE copy of the portal (still the free-text threshold editor); the
-  deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
-
 ### Collab v3 wave 3 — the app on the live exchange (2026-09-25 → 27)
 
-App branch `collab-v3-wave3` (not merged, not pushed). The app follows the hub
+Merged into `main` (app branch `collab-v3-wave3`). The app follows the hub
 live: one event stream per device, presence beats, claims through an outbox
 with a digest, a deterministic scheduler, a serve check per request, a
 per-frame local storage state machine, the two-class receive gate, the collab
@@ -627,8 +650,8 @@ proof: `api::collab_v3_live_e2e_tests` (three instances, relay disabled, the
 §12 latency table, A5, A6, the one-copy disk ledger — measured numbers in
 the transfers reference).
 
-- **Owed — three-machine acceptance on the test hub + test relay** (after the
-  hub wave-3 test-hub deploy owed below, and this branch on all three):
+- **Owed — three-machine acceptance on the test hub + test relay** (the test
+  hub already runs wave 3; the app from `main` on all three):
   1. Three machines: A a `send` contributor, B a `send_receive` processor, C
      the `send_receive` coordinator; one project; all three on the test hub
      and the test relay.
@@ -669,9 +692,8 @@ the transfers reference).
   "Publish from this device"; Settings → Transfers → Collaboration streams.
 - **Owed — Windows**: a rename over an open served file; `trash::delete` on
   the shell API; UNC network-volume detection (sweeps every 5 min).
-- **Owed — hub deploy + one-week soak** (spec §15, with the hub section
-  below): at least three real devices on the test hub; the hourly digest
-  checks all match.
+- **Owed — the one-week soak** (spec §15): at least three real devices on
+  the test hub; the hourly digest checks all match.
 - **Follow-ups from the final fix (owner-visible, not fixed)**:
   - The catalog pool is 8 connections. Catalog writes now run off the live
     runtime's loop (final fix A-I2), but several blocking writers can each
@@ -717,34 +739,18 @@ the transfers reference).
 
 ### Collab v3 wave 3 — hub live exchange (2026-09-25)
 
-Hub branch `collab-v3-wave3`, merged to local main only; astronet commit on
-`main`, not deployed. The hub now pushes (SSE `/api/v1/me/events`), keeps
-presence live, holds durable device-owned claims with a digest, versions by
-compare-and-set, and propagates revocation (spec
+In hub `main` and on the test hub. The hub pushes (SSE `/api/v1/me/events`),
+keeps presence live, holds durable device-owned claims with a digest,
+versions by compare-and-set, and propagates revocation (spec
 `docs/superpowers/specs/2026-09-25-collab-v3-live-exchange-design.md`, plan
 `docs/superpowers/plans/2026-09-25-collab-v3-wave3-hub-live-exchange-plan.md`).
 
-- **Owed — test-hub deploy (owner's word).** Run `ansible-playbook
-  deploy_athenaeum_hub.yml -e hub_target=athenaeum_hub_test -e
-  hub_artifact_ref=collab-v3-wave3 -e @~/.config/athenaeum-hub/smtp.yml`. It
-  converges the unit (StateDirectory, LimitNOFILE), the events location in
-  the write-once vhost, nginx worker sizing (HOST-WIDE, the production hub
-  included) and runs the 2 s first-byte probe. astronet commit bd65477
-  (local main, not pushed). Post-deploy:
-  - `SELECT max(version) FROM _sqlx_migrations` → 23;
-  - `ls /var/lib/athenaeum-hub-test/feed-marks.json` (appears within 60 s);
-  - `journalctl -u athenaeum-hub-test | grep 'feed epoch'`.
 - **Owed — the load check on the test hub (P30).** The in-process harness
   (`tests/load_check.rs`) passed locally with the numbers in its commit. A
-  run against the deployed test hub needs 100 device tokens minted there.
-- **Owed — the one-week soak** (spec §15), with at least three real devices
-  on the test hub once app wave 3 lands: the hourly digest checks all match.
-- **Expected, do not re-flag:**
-  - The desktop app on local main (wave 2) gets `409 collab_api_outdated`
-    from a wave-3 hub on `/me/project-versions`, per-frame holders, holder
-    reports and versions, until app wave 3 (branch `collab-v3-wave3`,
-    above) is merged.
-  - The released app never called these routes.
+  run against the test hub needs 100 device tokens minted there.
+- The one-week soak is listed once, under the app entry above.
+- **Do not re-flag:** the released app (v0.6.4) never called the wave-3
+  routes.
 
 ### Collab v3 wave 2 — the app on the per-frame model (2026-09-24)
 
@@ -765,9 +771,8 @@ and a one-copy disk ledger).
   three-machine acceptance, the click-through and the relevant decisions are
   re-listed under "Collab v3 wave 3 — the app on the live exchange". What
   follows is kept for the record.
-- **Owed — three-machine acceptance** (after the wave-1 test-hub deploy owed below;
-  run the wave-3 one instead once that branch lands):
-  1. Deploy nothing new to the hub; the test hub runs wave 1 after its owed deploy.
+- **Three-machine acceptance — replaced by the wave-3 one above**, kept for the record:
+  1. (Dropped: the test hub now runs wave 3.)
   2. Three machines: this Mac, a second account's device, and the Linux runner or a
      VM. Test relay. One project with `requireApproval`.
   3. Walk the §15 subset:
@@ -860,30 +865,14 @@ holders" section).
   §11)"`); the row deleted, 0022 re-run, success — `project_frames` present, `package_announcements`
   gone. Full hub suite green at `6761b09` (202/0), portal suite green at `ac704d5` (214/0), tsc +
   build clean, hub release build 0 warnings.
-- **Owed**: test-hub deploy of `collab-v3-wave1`
-  (`ansible-playbook deploy_athenaeum_hub.yml -e hub_target=athenaeum_hub_test -e
-  hub_artifact_ref=collab-v3-wave1 -e @~/.config/athenaeum-hub/smtp.yml`) and, after it lands,
-  three checks against the test DB/host: `SELECT count(*) FROM project_frames;` comes back
-  non-negative (table exists, migration applied); `curl` the retired
-  `POST https://test-hub.artfrom.space/api/v1/projects/{id}/announcements` (any body) answers
-  `409 {"error":"collab_api_outdated"}`; `curl -H "Authorization: Bearer <deviceToken>"
-  https://test-hub.artfrom.space/api/v1/me/project-versions` answers `200` with `[]` (no
-  memberships) or a `[{projectId,version}, …]` list, never an error.
-- **Do NOT re-flag**: the desktop app talking to a wave-1-or-later hub and getting
-  `409 collab_api_outdated` on every collaboration call is EXPECTED until the app's own wave 2
-  client ships — it is the compat gate working as designed (spec §11), not a hub regression.
-- **PROD deploy is gated on an app release, on top of the test-hub check above.** The hub's
-  final-review wave (2026-09-24) found the CURRENT app has no handling for `409
-  collab_api_outdated` at all — it surfaces to the user as a plain "unexpected status 409" — and
-  the shipped app's `MyProjectWire` requires `pendingAnnouncements` with no serde default — the
-  field collab v3 renamed to `pendingFrames` this same wave. The hub
-  side of that second gap is already closed (`pendingAnnouncements` kept as a deprecated alias of
-  `pendingFrames`, same value, so `/me/projects` still decodes against an app on the old wire
-  shape) — this note is the reminder that the APP side is not: do not deploy `collab-v3-wave1` (or
-  later) to PROD until an app release ships that (a) treats `collab_api_outdated` as an actionable
-  "update required" signal rather than a raw unexpected-status error and (b) reads `pendingFrames`
-  instead of the now-deprecated `pendingAnnouncements`. The test-hub deploy in the "Owed" bullet
-  above is unaffected by this gate — only PROD is held.
+- **On the test hub** (`project_frames` holds 188 rows on 2026-10-25). Owed: one authenticated
+  `GET /api/v1/me/project-versions` with a device token answers `200` with a list, never an error;
+  the retired `POST …/projects/{id}/announcements` answers `409 {"error":"collab_api_outdated"}`.
+- **Do NOT re-flag**: an app older than the collab v3 client getting `409 collab_api_outdated` on
+  every collaboration call from a wave-1-or-later hub is the compat gate as designed (spec §11),
+  not a hub regression.
+- **Production gate**: see the hub state entry above (no production deploy before an app release
+  with the collab v3 client).
 
 ### Collab v3 wave 0 (2026-09-23)
 
@@ -893,8 +882,7 @@ threshold editor (dropdowns for metric/op, unit-aware value parsing), the hub's
 `collab_rules.rs` metric registry gating `POST /projects/{id}/thresholds`, the door fields
 in Admin and the members & roles editor.
 
-- **Owed**: portal click-through on the test hub after deploy
-  (`hub_artifact_ref=collab-v3-wave0`) — Admin → Quality thresholds: add a rule, type `0.6`
+- **Owed**: portal click-through on the test hub — Admin → Quality thresholds: add a rule, type `0.6`
   into eccentricity, save, see v1 (not v2 — the current version is filtered out) under
   "Previous versions"; grant a member `thresholds.edit` ALONE (no `members.manage`), sign in
   as them, see the editor and neither the queue nor the roster nor settings, AND confirm the
@@ -902,9 +890,8 @@ in Admin and the members & roles editor.
   page gate and the entry links both admit any of `members.manage`/`invites.manage`/
   `thresholds.edit`, not `members.manage` alone); change the door from Admin; Members &
   roles: change a role and a capability; zero console errors. Not run locally.
-- **Owed**: test-hub deploy of `collab-v3-wave0` and the post-deploy check that
-  `POST /projects/{id}/thresholds` with `{"metricKey":"fwhm"}` answers 400
-  `unknown metric "fwhm"`.
+- **Owed**: on the test hub, `POST /projects/{id}/thresholds` with `{"metricKey":"fwhm"}` answers
+  400 `unknown metric "fwhm"`.
 - **Do NOT re-flag**: `zero_point` is deliberately absent from all three registry copies
   (hub `collab_rules.rs`, portal `metrics.ts`, app `collab/gate.rs::METRIC_REGISTRY`) until
   wave 3 (spec §6.3).
