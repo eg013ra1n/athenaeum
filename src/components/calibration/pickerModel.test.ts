@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { describeDifference, geometryLabel, geometryRefuses, geometryWarns, originChoiceNote, sizeCellState } from './pickerModel';
+import { describeDifference, geometryLabel, geometryRefuses, geometryWarns, originChoiceNote, originNotesFor, sizeCellState, writtenSubSlot, type SlotKind } from './pickerModel';
 
 const verdict = (status: ParameterVerdict['status']): ParameterVerdict => ({
   name: 'geometry', enforced: true, status,
@@ -46,5 +46,26 @@ describe('geometry in the picker', () => {
     );
     expect(originChoiceNote(cand('match'))).toBeNull();
     expect(originChoiceNote(cand('mismatch'))).toBeNull();
+  });
+  it('a set subject writes one slot, and only that slot is named (G-7)', () => {
+    const cand = (id: number) =>
+      ({ set: { id }, parameters: [verdict('warning')] }) as unknown as CalibrationSetWithScore;
+    const none = { flat: null, darkflat: null, dark: null, bias: null } as Record<SlotKind, number | null>;
+    const candidates = {
+      flat: [], darkflat: [cand(7)], dark: [cand(9)], bias: [],
+    } as Record<SlotKind, CalibrationSetWithScore[]>;
+    const slots: SlotKind[] = ['darkflat', 'dark', 'bias'];
+    const picks = { darkflat: 7, dark: 9, bias: null };
+    expect(writtenSubSlot(picks)).toBe('darkflat');
+    expect(writtenSubSlot({ darkflat: null, dark: 9 })).toBe('dark');
+    expect(writtenSubSlot({ darkflat: null, dark: null })).toBeNull();
+    // dark #9 is chosen too but the save never writes it: no note for it
+    const notes = originNotesFor('set', slots, picks, none, candidates);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('Set #7');
+    // lights write every chosen slot
+    expect(originNotesFor('lights', slots, picks, none, candidates)).toHaveLength(2);
+    // an unchanged link is not "newly chosen"
+    expect(originNotesFor('set', slots, picks, { ...none, darkflat: 7 }, candidates)).toEqual([]);
   });
 });

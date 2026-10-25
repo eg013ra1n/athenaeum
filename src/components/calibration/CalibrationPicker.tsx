@@ -10,7 +10,7 @@ import {
   EMPTY_FILTER,
   exposuresOf,
   filterIsActive,
-  originChoiceNote,
+  originNotesFor,
   slotsFor,
   SLOT_LABEL,
   type CandidateFilter,
@@ -106,13 +106,13 @@ export function CalibrationPicker({
   // G-7: a set at another recorded sub-frame origin may be chosen by hand;
   // what is newly chosen and carries that warning is told after the save.
   const originNotes = (): string[] =>
-    slots.flatMap(k => {
-      const chosen = selectedIn(k);
-      if (chosen === null || chosen === current[k]) return [];
-      const c = candidates[k].find(x => x.set.id === chosen);
-      const note = c ? originChoiceNote(c) : null;
-      return note ? [`${SLOT_LABEL[k]}: ${note}`] : [];
-    });
+    originNotesFor(
+      subject.kind,
+      slots,
+      Object.fromEntries(slots.map(k => [k, selectedIn(k)])),
+      current,
+      candidates,
+    );
 
   const handleApply = async () => {
     if (subject.kind === 'lights') {
@@ -135,7 +135,7 @@ export function CalibrationPicker({
       if (notes.length > 0) {
         notify({
           title: 'Calibration at another sub-frame origin',
-          detail: notes.join('\n'),
+          detail: notes.join('; '),
           kind: 'merge',
           tone: 'warning',
         });

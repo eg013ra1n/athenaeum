@@ -9,6 +9,7 @@ import {
   requirementFromLights,
   requirementFromSet,
   slotsFor,
+  writtenSubSlot,
   type PickerSubject,
   type Requirement,
   type SlotKind,
@@ -170,17 +171,13 @@ export async function saveSubCalibration(
     sourceSetId: setId,
     calibrationType: null,
   });
-  // A flat takes ONE of dark flat / dark / bias — the fallback chain, in
-  // order — so the first chosen slot wins and the rest are left cleared.
-  for (const slot of ['darkflat', 'dark', 'bias'] as SlotKind[]) {
-    const chosen = picks[slot];
-    if (chosen) {
-      await api.invoke('manual_assign_subcalibration', {
-        sourceSetId: setId,
-        calibrationSetId: chosen,
-        calibrationType: WIRE_TYPE[slot],
-      });
-      return;
-    }
+  // The slot written is the first chosen one (`writtenSubSlot`).
+  const slot = writtenSubSlot(picks);
+  if (slot) {
+    await api.invoke('manual_assign_subcalibration', {
+      sourceSetId: setId,
+      calibrationSetId: picks[slot],
+      calibrationType: WIRE_TYPE[slot],
+    });
   }
 }

@@ -309,7 +309,7 @@ export function CalibrationHierarchyView({
         if (originNotes.length > 0) {
           notify({
             title: 'Calibration at another sub-frame origin',
-            detail: originNotes.join('\n'),
+            detail: originNotes.join('; '),
             kind: 'generic',
             tone: 'warning',
           });

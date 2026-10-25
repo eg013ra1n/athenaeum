@@ -1,7 +1,7 @@
 // src/components/calibration/CalibrationTableView.tsx
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ExternalLink, Hammer } from 'lucide-react';
+import { AlertTriangle, ExternalLink, Hammer } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   CalibrationFilterGroup,
@@ -570,7 +570,7 @@ function SizeCell({ row }: { row: { size: string | null; sizeKey: string | null;
   return (
     <td className="px-1.5 py-1 text-sm whitespace-nowrap">
       <MatchBadge label={title} value={row.size} matches={matches} />
-      {row.originWarning && <span className="ml-1 text-warning" title={row.originWarning}>⚠</span>}
+      {row.originWarning && <AlertTriangle size={12} className="ml-1 inline text-warning" aria-label={row.originWarning} />}
     </td>
   );
 }

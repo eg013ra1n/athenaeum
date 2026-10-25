@@ -258,3 +258,34 @@ export function originChoiceNote(candidate: CalibrationSetWithScore): string | n
   if (!verdict) return null;
   return `Set #${candidate.set.id} is ${verdict.setValue ?? '—'}, the frames are ${verdict.frameValue ?? '—'} — another sub-frame origin`;
 }
+
+/** The one slot a sub-calibration save writes: a flat takes ONE of dark flat /
+ *  dark / bias — the fallback chain, in order — so the first chosen slot wins
+ *  and the rest are left cleared. */
+export function writtenSubSlot(picks: Partial<Record<SlotKind, number | null>>): SlotKind | null {
+  for (const slot of ['darkflat', 'dark', 'bias'] as SlotKind[]) {
+    if (picks[slot]) return slot;
+  }
+  return null;
+}
+
+/** One sentence per newly chosen set at another recorded sub-frame origin
+ *  (G-7), naming only links the save really writes: every slot for lights,
+ *  the single slot `writtenSubSlot` assigns for a calibration set. */
+export function originNotesFor(
+  subjectKind: PickerSubject['kind'],
+  slots: SlotKind[],
+  selected: Partial<Record<SlotKind, number | null>>,
+  current: Record<SlotKind, number | null>,
+  candidates: Record<SlotKind, CalibrationSetWithScore[]>,
+): string[] {
+  const written = subjectKind === 'set' ? writtenSubSlot(selected) : null;
+  return slots.flatMap(k => {
+    if (subjectKind === 'set' && k !== written) return [];
+    const chosen = selected[k] ?? null;
+    if (chosen === null || chosen === current[k]) return [];
+    const c = candidates[k].find(x => x.set.id === chosen);
+    const note = c ? originChoiceNote(c) : null;
+    return note ? [`${SLOT_LABEL[k]}: ${note}`] : [];
+  });
+}
