@@ -17,6 +17,8 @@ Fully configurable via UI (Settings → Calibration Matching). Stored as a singl
 
 **Per-pair parameters** (each `Exact` / `Warning` / `Ignore`): `instrume`, `binning`, `gain`, `offset`, `exptime`, `focallen`, `filter` (Lights→Flat only), `ccd_temp`. Defaults reproduce the original hardcoded behavior — see the `Default` impls in `calibration/config.rs` for the matrix.
 
+**Geometry is not a parameter** (2026-10-20): a set of another frame size (NAXIS1×NAXIS2, after binning) never calibrates — auto-link, the manual list, manual assignment, the readiness and stacking-plan gates all ask `calibration::geometry::fit`. Another sub-frame origin at the same size (`XORGSUBF`/`YORGSUBF` from the stored header, compared only when both record it): auto-link never, by hand with a warning (owner, G-7). In-app masters stamp their members' agreed origin (G-5). Reference: `docs/catalog/README.md` → Calibration geometry.
+
 **Key files**:
 
 - `crates/athenaeum-core/src/calibration/config.rs` — `CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`.

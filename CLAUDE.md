@@ -112,7 +112,7 @@ useEffect(() => {
 
 **Catalog** — schema in `db/schema.rs::init_db()`; frame sets are global; a night is the grouping unit and nights are derived, never stitched; scanner re-parse is non-destructive and `frames.override = 1` is never undone by it; FITS parsing is hand-rolled; the three duplicate hashes are not interchangeable. `docs/catalog/README.md`.
 
-**Calibration matching** — one `CalibrationMatchingConfig` JSON (`calibration.matching_config`) drives matching via `calibration/configurable_matcher.rs`; per-pair parameters are `Exact`/`Warning`/`Ignore`. `docs/calibration/matching.md`.
+**Calibration matching** — one `CalibrationMatchingConfig` JSON (`calibration.matching_config`) drives matching via `calibration/configurable_matcher.rs`; per-pair parameters are `Exact`/`Warning`/`Ignore`; frame size (and, by hand only, sub-frame origin) is a hard rule, never a parameter (`calibration::geometry`). `docs/calibration/matching.md`.
 
 **Archive** — WIP → soft-archived → zipped; the planner ZIPs only `is_archived = 1 AND archived_at IS NULL`; restore never overwrites. `docs/archive/README.md`.
 

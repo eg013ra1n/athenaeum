@@ -68,6 +68,8 @@ Re-running auto-match at 16:14 linked all 16 flat sets of the frame set to the R
 180 s → 1285; flat pre-calibration 1.0 s → 1269, 0.5 s → 1297, bias → 1328. Pick by set
 id, not by date: 2022-06-30 holds both full-frame and 4784×3194 sets.
 
+**Status (2026-10-20).** Fixed on branch `calib-geometry` (plan `docs/superpowers/plans/2026-10-20-calibration-geometry-plan.md`). This entry stays until the owner-catalog acceptance (plan Task 9) passes on frame set 182.
+
 **Acceptance:** frame set 182 stacks end to end on the owner's catalog after a fresh
 auto-match, with no manual re-link.
 
