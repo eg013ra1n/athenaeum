@@ -726,14 +726,23 @@ fn get_frame_set_info(conn: &Connection, frame_set_id: i64) -> Result<(String, O
 /// Get all light frames from a frame set via the hierarchy
 fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<Vec<ExportFrame>> {
     // First get all frame IDs using a simpler query (proven pattern from calibration_links.rs)
-    let mut id_stmt = conn.prepare(
-        "SELECT DISTINCT sm.frame_id
+    //
+    // A light whose file is in the Black Hole is rejected, so it is not
+    // exported, sent, or counted ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`] —
+    // the stacking plan's own light source uses the same fragment). Ordered
+    // by capture time so the export's grouping, and the example file names the
+    // folder preview shows, come out the same on every load.
+    let mut id_stmt = conn.prepare(&format!(
+        "SELECT DISTINCT sm.frame_id, f.date_obs
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
          JOIN imaging_nights n ON s.imaging_night_id = n.id
          JOIN frames f ON sm.frame_id = f.id
-         WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'"
-    )?;
+         WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
+           AND {not_blackholed}
+         ORDER BY f.date_obs, sm.frame_id",
+        not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
 
     let frame_ids: Vec<i64> = id_stmt
         .query_map([frame_set_id], |row| row.get(0))?
@@ -3538,5 +3547,51 @@ mod export_mode_tests {
             collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithMasters, None).unwrap();
         let dark = masters.filter_groups[0].dark_info.as_ref().unwrap();
         assert_eq!((dark.set_id, dark.frame_count), (master, 1));
+    }
+
+    /// A light in the Black Hole is rejected: the export (every mode), the
+    /// frame-set send that shares `collect_export_data`, and the readiness
+    /// total all leave it out — the same rule the stacking plan uses
+    /// (`db::FRAME_NOT_IN_BLACK_HOLE_SQL`). Restoring it brings it back.
+    /// Release blocker 2026-10-25: set 182's export counted all 164 lights
+    /// with 25 in the Black Hole.
+    #[test]
+    fn a_blackholed_light_is_not_exported_or_counted() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        for f in [10, 11, 12] {
+            seed_light(&conn, f, session, Some("Ha"));
+        }
+        let dark = seed_master_set(&conn, 200, "Dark");
+        for f in [10, 11, 12] {
+            add_link(&conn, f, dark, "Dark");
+        }
+        let file_id = 11 + 2_000_000;
+        crate::db::add_to_black_hole(&conn, file_id, "light", "/test/light_11.fits").unwrap();
+
+        let data = collect_export_data(&conn, 1).unwrap();
+        let lights = lights_by_id(&data);
+        assert_eq!(lights.len(), 2, "{:?}", lights.keys());
+        assert!(!lights.contains_key(&11));
+        let placed: Vec<i64> = crate::export::file_organizer::compute_wbpp_placements(&data)
+            .into_iter()
+            .map(|p| p.frame_id)
+            .collect();
+        assert!(!placed.contains(&11), "not placed: {placed:?}");
+
+        let readiness = crate::api::lights::compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(readiness.total, 2, "the readiness total leaves it out");
+        assert_eq!(readiness.file_counts.lights_only, 2);
+
+        let cfg = WbppExportConfig::default();
+        let summary =
+            collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithMasters, None).unwrap();
+        assert_eq!(summary.total_files, 2 + 1, "two lights and the master");
+
+        crate::db::remove_from_black_hole(&conn, file_id).unwrap();
+        let data = collect_export_data(&conn, 1).unwrap();
+        assert_eq!(lights_by_id(&data).len(), 3, "a restored light is exported again");
+        let readiness = crate::api::lights::compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(readiness.total, 3);
     }
 }

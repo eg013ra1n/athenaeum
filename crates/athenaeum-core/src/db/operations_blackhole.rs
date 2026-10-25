@@ -9,6 +9,18 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// The one SQL test for "this frame's file is not in the Black Hole", for a
+/// query that aliases `frames` as `f`. The Black Hole is how a user rejects a
+/// light (Blink, the Analysis table's "Reject unusable frames"), so every
+/// reader of a frame set's lights that decides what gets USED — the stacking
+/// plan and run (`stacking::groups::load_group_members`), the export and the
+/// frame-set send (`export::collect_export_data`), the export readiness count
+/// (`api::lights::load_light_members`) — splices this one fragment in rather
+/// than spelling its own. Restoring the file brings the light back to all of
+/// them. (Transfer dedup and collab keep their own Black Hole rules.)
+pub const FRAME_NOT_IN_BLACK_HOLE_SQL: &str =
+    "NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.file_id)";
+
 /// Progress event payload for `bulk-move-to-black-hole-progress`.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]

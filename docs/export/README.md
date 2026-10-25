@@ -37,7 +37,10 @@ planned but never built. This rewrite documents only what `crates/athenaeum-core
 
 1. **`collect_export_data`** (`data_collector.rs`) takes a `frame_set_id` and:
    - Loads every LIGHT frame reachable through
-     `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs`).
+     `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs`),
+     in capture order. **A light whose file is in the Black Hole is not exported**, sent, or counted by readiness:
+     the query splices `db::FRAME_NOT_IN_BLACK_HOLE_SQL`, the same fragment as the stacking plan's light source
+     (2026-10-25; set 182 exported its 25 rejected lights before).
    - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs`).
      `camera_type` is `Osc` if `BAYERPAT` is a non-empty string, else `Mono`
      (`CameraType::from_bayerpat`, `models.rs`).

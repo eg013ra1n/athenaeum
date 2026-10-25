@@ -301,9 +301,11 @@ pub fn pedestal_run_sentence(
 /// LIGHT members (frame_id, filename) of a frame set, mirroring the
 /// membership join used elsewhere in the calibration layer
 /// (`db::calibration_links::get_calibration_groups_for_frame_set`), plus a
-/// `files` join for the filename.
+/// `files` join for the filename. A light whose file is in the Black Hole is
+/// not a member here ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`]): the
+/// readiness total counts what the export lands, and the export leaves it out.
 fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String)>, ApiError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT sm.frame_id, fi.filename
          FROM session_members sm
          JOIN sessions s ON s.id = sm.session_id
@@ -311,8 +313,10 @@ fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String
          JOIN frames f ON f.id = sm.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
+           AND {not_blackholed}
          ORDER BY sm.frame_id",
-    )?;
+        not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
     let rows = stmt
         .query_map(params![set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;

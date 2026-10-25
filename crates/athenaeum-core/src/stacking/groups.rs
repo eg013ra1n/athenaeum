@@ -317,7 +317,7 @@ struct LightMember {
 }
 
 fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<LightMember>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT f.id, fi.id, fi.filename, fi.path, fi.size, fi.modified_at,
                 f.instrume, f.filter, f.xbinning, f.naxis1, f.naxis2, f.exptime, f.date_obs, f.bayerpat,
                 f.focallen, f.xpixsz
@@ -327,9 +327,10 @@ fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<Light
          JOIN frames f ON f.id = sm.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
-           AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fi.id)
+           AND {not_blackholed}
          ORDER BY f.date_obs, f.id",
-    )?;
+        not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
     let rows = stmt
         .query_map(params![frames_set_id], |r| {
             Ok(LightMember {
