@@ -2,6 +2,7 @@
 // block of the plate-solve settings (both show a byte size and an elapsed
 // download timer in the same style).
 
+// Decimal units (1 MB = 10^6 bytes), the same the download progress lines use.
 export function formatSize(bytes: number): string {
   if (bytes === 0) return '—';
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;

@@ -128,8 +128,8 @@ describe('QuadIndexBlock', () => {
     act(() => {
       progressCb!({
         phase: 'downloading',
-        current: 40 * 1048576,
-        total: 147 * 1048576,
+        current: 40e6,
+        total: 147e6,
         percent: 27,
         packName: 'base',
         packIndex: 0,

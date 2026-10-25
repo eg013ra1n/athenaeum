@@ -19,7 +19,7 @@ export function getIndexStatusText(progress: IndexDownloadProgress | null): stri
     case 'pack':
       return `${label}Preparing pack…`;
     case 'downloading':
-      return `${label}Downloading · ${(progress.current / 1048576).toFixed(0)} / ${(progress.total / 1048576).toFixed(0)} MB`;
+      return `${label}Downloading · ${(progress.current / 1e6).toFixed(0)} / ${(progress.total / 1e6).toFixed(0)} MB`;
     case 'verifying':
       return `${label}Verifying integrity…`;
     case 'extracting':

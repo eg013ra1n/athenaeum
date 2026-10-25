@@ -40,7 +40,7 @@ function getDownloadStatusText(progress: CatalogDownloadProgress | null): string
     case 'tier':
       return `${tierLabel}Preparing tier…`;
     case 'downloading':
-      return `${tierLabel}Downloading · ${(progress.current / 1048576).toFixed(0)} / ${(progress.total / 1048576).toFixed(0)} MB`;
+      return `${tierLabel}Downloading · ${(progress.current / 1e6).toFixed(0)} / ${(progress.total / 1e6).toFixed(0)} MB`;
     case 'verifying':
       return `${tierLabel}Verifying integrity…`;
     case 'extracting':
