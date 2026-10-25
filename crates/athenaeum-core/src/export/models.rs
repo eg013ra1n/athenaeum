@@ -678,6 +678,10 @@ pub struct ExportSummary {
     pub telescopes: Vec<String>,
     /// Date range of sessions (start, end)
     pub date_range: Option<(String, String)>,
+    /// Imaging nights the exported lights were shot on — the catalog's night
+    /// (`imaging_nights`, noon-to-noon, derived), not the days in the span:
+    /// three nights a year apart are 3, and a night that crosses midnight is 1.
+    pub night_count: i64,
     /// Filter groups with full breakdown
     pub filter_groups: Vec<FilterGroupSummary>,
     /// Folder structure preview

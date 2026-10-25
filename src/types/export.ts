@@ -500,6 +500,12 @@ telescopes: Array<string>,
  */
 dateRange: [string, string] | null, 
 /**
+ * Imaging nights the exported lights were shot on — the catalog's night
+ * (`imaging_nights`, noon-to-noon, derived), not the days in the span:
+ * three nights a year apart are 3, and a night that crosses midnight is 1.
+ */
+nightCount: number, 
+/**
  * Filter groups with full breakdown
  */
 filterGroups: Array<FilterGroupSummary>, 

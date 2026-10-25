@@ -414,7 +414,10 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
   preview), the output-directory picker, the symlink toggle (platform-gated, see
   above), the collapsible WBPP Setup Guide, and the Export button.
 - `src/components/export/ExportSummary.tsx` — renders the `ExportSummary` payload
-  (`get_export_summary`): cameras/telescopes/date range, per-filter-group
+  (`get_export_summary`): cameras/telescopes/date range and the night count
+  (`nightCount`: DISTINCT `imaging_nights` of the exported lights, the catalog's
+  night — never the days in the span; the "Sessions" line read "380 nights" for
+  a year-long set before 2026-10-25), per-filter-group
   breakdown (exposure groups from `build_exposure_groups`, `data_collector.rs`
   — an exact/rounded-to-0.1s tally for display, not a configurable clustering
   tolerance), calibration detail, and the folder-structure preview tree.

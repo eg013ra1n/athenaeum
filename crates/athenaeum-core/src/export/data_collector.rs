@@ -1729,11 +1729,13 @@ pub fn collect_export_summary(
     }
 
     // Collect equipment info from all frames
-    let (cameras, telescopes, date_range) = collect_equipment_info(conn, frame_set_id)?;
+    let EquipmentInfo { cameras, telescopes, date_range, night_count } =
+        collect_equipment_info(conn, frame_set_id)?;
     tracing::debug!(
         frame_set_id,
         cameras = cameras.len(),
         telescopes = telescopes.len(),
+        night_count,
         "equipment info collected"
     );
 
@@ -1776,6 +1778,7 @@ pub fn collect_export_summary(
         cameras,
         telescopes,
         date_range,
+        night_count,
         filter_groups,
         folder_preview,
         warnings,
@@ -1784,61 +1787,58 @@ pub fn collect_export_summary(
     })
 }
 
-/// Collect unique equipment (cameras, telescopes) and date range from a frame set
-fn collect_equipment_info(
-    conn: &Connection,
-    frame_set_id: i64,
-) -> Result<(Vec<String>, Vec<String>, Option<(String, String)>)> {
-    // Get unique cameras
-    let mut cameras_stmt = conn.prepare(
-        "SELECT DISTINCT f.instrume
-         FROM frames f
+/// What the summary's "Equipment Used" header shows.
+struct EquipmentInfo {
+    cameras: Vec<String>,
+    telescopes: Vec<String>,
+    date_range: Option<(String, String)>,
+    night_count: i64,
+}
+
+/// Cameras, telescopes, the capture span and the night count of the lights
+/// the export lands — the frame set's light members minus the Black Hole
+/// ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`], the same rule as
+/// `get_light_frames_for_frame_set`). The night count is the catalog's own
+/// grouping unit: the DISTINCT `imaging_nights` rows those lights belong to,
+/// never the days between the first and last frame.
+fn collect_equipment_info(conn: &Connection, frame_set_id: i64) -> Result<EquipmentInfo> {
+    // The exported lights' membership rows, shared by every read below.
+    let members = format!(
+        "FROM frames f
          JOIN session_members sm ON f.id = sm.frame_id
          JOIN sessions s ON sm.session_id = s.id
          JOIN imaging_nights n ON s.imaging_night_id = n.id
-         WHERE n.frames_set_id = ?1 AND f.instrume IS NOT NULL
-         ORDER BY f.instrume",
+         WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
+           AND {not_blackholed}",
+        not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    );
+
+    let distinct = |column: &str| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {column} {members} AND {column} IS NOT NULL ORDER BY {column}"
+        ))?;
+        let rows = stmt
+            .query_map([frame_set_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    };
+    let cameras = distinct("f.instrume")?;
+    let telescopes = distinct("f.telescop")?;
+
+    let (date_range, night_count) = conn.query_row(
+        &format!(
+            "SELECT MIN(f.date_obs), MAX(f.date_obs), COUNT(DISTINCT n.id) {members}"
+        ),
+        [frame_set_id],
+        |row| {
+            let min: Option<String> = row.get(0)?;
+            let max: Option<String> = row.get(1)?;
+            let nights: i64 = row.get(2)?;
+            Ok((min.zip(max), nights))
+        },
     )?;
-    let cameras: Vec<String> = cameras_stmt
-        .query_map([frame_set_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
 
-    // Get unique telescopes
-    let mut telescopes_stmt = conn.prepare(
-        "SELECT DISTINCT f.telescop
-         FROM frames f
-         JOIN session_members sm ON f.id = sm.frame_id
-         JOIN sessions s ON sm.session_id = s.id
-         JOIN imaging_nights n ON s.imaging_night_id = n.id
-         WHERE n.frames_set_id = ?1 AND f.telescop IS NOT NULL
-         ORDER BY f.telescop",
-    )?;
-    let telescopes: Vec<String> = telescopes_stmt
-        .query_map([frame_set_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Get date range
-    let date_range: Option<(String, String)> = conn
-        .query_row(
-            "SELECT MIN(f.date_obs), MAX(f.date_obs)
-             FROM frames f
-             JOIN session_members sm ON f.id = sm.frame_id
-             JOIN sessions s ON sm.session_id = s.id
-             JOIN imaging_nights n ON s.imaging_night_id = n.id
-             WHERE n.frames_set_id = ?1 AND f.date_obs IS NOT NULL",
-            [frame_set_id],
-            |row| {
-                let min: Option<String> = row.get(0)?;
-                let max: Option<String> = row.get(1)?;
-                Ok(min.and_then(|m| max.map(|x| (m, x))))
-            },
-        )
-        .ok()
-        .flatten();
-
-    Ok((cameras, telescopes, date_range))
+    Ok(EquipmentInfo { cameras, telescopes, date_range, night_count })
 }
 
 /// Build filter group summaries from export data
@@ -3593,5 +3593,59 @@ mod export_mode_tests {
         assert_eq!(lights_by_id(&data).len(), 3, "a restored light is exported again");
         let readiness = crate::api::lights::compute_export_readiness(&conn, 1).unwrap();
         assert_eq!(readiness.total, 3);
+    }
+
+    /// The "Sessions" line counts the catalog's nights — DISTINCT
+    /// `imaging_nights` of the exported lights — never the days in the span:
+    /// three nights a year apart are 3 (the tab read "380 nights" for a
+    /// year-long set). A night whose only light is in the Black Hole is not
+    /// exported, so it is neither counted nor stretches the span.
+    #[test]
+    fn export_summary_counts_imaging_nights_not_days() {
+        let conn = mem();
+        let s1 = seed_frame_set(&conn, 1); // night 2026-07-05
+        seed_light(&conn, 10, s1, Some("Ha"));
+        seed_light(&conn, 11, s1, Some("Ha"));
+        let night = |start: &str, frame_id: i64, date_obs: &str| {
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) VALUES (1, ?1, ?1)",
+                params![start],
+            )
+            .unwrap();
+            let night_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
+                params![night_id],
+            )
+            .unwrap();
+            let session = conn.last_insert_rowid();
+            seed_light(&conn, frame_id, session, Some("Ha"));
+            conn.execute(
+                "UPDATE frames SET date_obs = ?2 WHERE id = ?1",
+                params![frame_id, date_obs],
+            )
+            .unwrap();
+        };
+        night("2026-09-01T20:00:00Z", 12, "2026-09-01T23:59:00Z");
+        night("2027-07-20T20:00:00Z", 13, "2027-07-21T01:00:00Z");
+        night("2027-08-01T20:00:00Z", 14, "2027-08-02T01:00:00Z");
+        crate::db::add_to_black_hole(&conn, 14 + 2_000_000, "light", "/test/light_14.fits")
+            .unwrap();
+
+        let summary = collect_export_summary(
+            &conn,
+            1,
+            &WbppExportConfig::default(),
+            ExportMode::LightsOnly,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.night_count, 3, "three nights, not the days between them");
+        assert_eq!(
+            summary.date_range,
+            Some(("2026-07-05T20:30:00Z".to_string(), "2027-07-21T01:00:00Z".to_string())),
+            "the blackholed light does not stretch the span"
+        );
+        assert_eq!(summary.cameras, vec!["TestCam".to_string()]);
     }
 }

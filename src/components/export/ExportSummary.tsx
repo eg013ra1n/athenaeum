@@ -41,6 +41,7 @@ export function ExportSummary({ summary }: ExportSummaryProps) {
         cameras={summary.cameras}
         telescopes={summary.telescopes}
         dateRange={summary.dateRange}
+        nightCount={summary.nightCount}
       />
 
       {/* Filter Group Cards */}
