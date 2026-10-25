@@ -271,6 +271,8 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | ---- | ---- | ---- |
 | **Missing files are not orphans.** No pass anywhere may delete catalog rows because a path is absent from disk. | Scanner, any "garbage collect" proposal | Astro archives live on detachable storage. A file absent during a scan usually means the volume is not mounted, not that it was deleted. Auto-cleaning destroys the catalog the first time someone scans without the archive drive. If explicitly asked for, it is a manual opt-in operation with a preview — never part of scanning. |
 | **A file in the Black Hole still counts as present** for transfer dedup, on both the pre-handshake Offer/Want path and at ingest. | `sync/responder.rs`, `sync/ingest.rs`, `find_files_by_content_hashes` | The bin is still the file being on the machine, so calling it a duplicate is honest. To re-receive, the user purges the Black Hole first — the hard delete drops the `files` row and dedup wants it again. An audit proposed excluding blackholed rows from the "have" set; rejected. |
+| **A frame set's Black Hole lights are not part of it** for stacking, export, send and every count. | `db::FRAME_NOT_IN_BLACK_HOLE_SQL` and its users | The bin is how a user rejects a light; the transfer-dedup row above is a different question (presence, not membership). Restoring the file brings the light back. |
+| **Analysis rows measured before Plan C carry no stale marker.** | Analysis table, Blink | Owner, 2026-10-25: "Пометка не нужна". The release notes ask the user to Re-Analyze once; Blink refreshes a stale row it opens. |
 | **One physical camera per scan root.** | Anything that would disambiguate two cameras sharing an `INSTRUME` label | Athenaeum does not read camera serials, and the owner already separates identical bodies by folder. Serial numbers, readout mode and other hardware fingerprinting are not needed — the scan-root path is the answer. |
 | **Flats are shot after the session.** An equidistant tie-break prefers `FlatTiming::After`. | `flat_matcher.rs::apply_pattern_selection` and any flat tie-break | A post-session flat captures the optical state the lights were actually taken under: dust drift and dewing accumulated during the night. Do not reverse this to "prefer before" on the strength of literature that assumes a different workflow. |
 | **The sampling xxHash used to verify a cross-volume move is intentional.** | `duplicates::compute_xxhash`, `file_op/executor.rs` | It reads first/middle/last 512 KB, so corruption in the unsampled remainder passes verification before the source is deleted. Speed was chosen over exhaustive verification; `verify_byte_identical` exists for callers that want the full check. Flagged as a bug in the 2026-06-10 audit and confirmed intentional. |
@@ -304,9 +306,6 @@ reports). Full core suite 4261/0, vitest 979/979 after the last fix. Owed on the
   2.49 vs √8 = 2.83). Re-stack LDN 1272 and read the figure (expected roughly 10–15× for 208 frames); runs stored
   before v0.7.0 show "SNR gain —".
 - **Export night count** (set 109 → 3 nights) and the deterministic folder preview, in the desktop app.
-- **Analysis rows predating Plan C** carry no stale mark; a set mixes old and new rows until Re-Analyze (owner call:
-  a stale marker, or the release-note line alone).
-- **Emptied duplicate sets 145 and 203** keep a stale date range and coordinates (owner call: prune or keep).
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
