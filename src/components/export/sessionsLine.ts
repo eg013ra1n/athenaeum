@@ -6,7 +6,7 @@
  */
 export function formatSessions(dateRange: [string, string], nightCount: number): string {
   const span = formatDateRange(dateRange);
-  if (nightCount <= 0) return span;
+  if (!(nightCount > 0)) return span;
   return `${span} (${nightCount} night${nightCount === 1 ? '' : 's'})`;
 }
 
