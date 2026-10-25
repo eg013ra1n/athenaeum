@@ -72,7 +72,7 @@ export function SettingSelect<T extends string>({
         value={value}
         disabled={disabled}
         onChange={(e) => void setValue(e.target.value as T)}
-        className="w-full sm:w-64 bg-surface-hover border border-border rounded-lg px-3 py-2 text-content focus:outline-none focus:border-accent disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full sm:w-auto sm:min-w-64 sm:max-w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-content focus:outline-none focus:border-accent disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>
