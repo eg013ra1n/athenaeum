@@ -1220,6 +1220,62 @@ fn landed_total(i: &ts::Instance) -> u64 {
         .sum()
 }
 
+/// What `from`'s node metered as served to `to` (`FlowDirection::Send`).
+fn served_to(
+    from: &ts::Instance,
+    to: &ts::Instance,
+) -> Option<crate::collab::live::meter::FlowView> {
+    let device = to.device();
+    from.node
+        .exchange_meter()
+        .snapshot(Instant::now())
+        .into_iter()
+        .find(|f| {
+            f.direction == crate::collab::live::meter::FlowDirection::Send && f.device == device
+        })
+}
+
+/// The baseline of a "nothing fetched again" test, taken once the first
+/// fetch has settled on both sides: every landing reported by B's
+/// coalesced `collab-frames-landed` bursts (a burst held back by its 1 s
+/// window used to be counted on one side of the baseline or the other by
+/// race), and every serve A metered toward B finished. Returns (landed,
+/// bytes A served to B, when).
+async fn settled_fetch_baseline(
+    a: &ts::Instance,
+    b: &ts::Instance,
+    frames: usize,
+) -> (u64, i64, Instant) {
+    ts::wait_until("every landing reported", Duration::from_secs(5), || {
+        landed_total(b) == frames as u64
+    })
+    .await;
+    let min_bytes = (frames * ts::FETCH_FRAME_BYTES) as i64;
+    ts::wait_until("every serve to b finished", Duration::from_secs(5), || {
+        served_to(a, b).is_some_and(|f| f.in_flight.is_empty() && f.bytes_session >= min_bytes)
+    })
+    .await;
+    let landed = landed_total(b);
+    assert_eq!(landed, frames as u64, "each frame landed exactly once");
+    (
+        landed,
+        served_to(a, b).unwrap().bytes_session,
+        Instant::now(),
+    )
+}
+
+/// A served B nothing more since the baseline. The meter drops a flow idle
+/// for `IDLE_DROP`; a vanished flow is accepted only after that long.
+fn assert_nothing_served_again(a: &ts::Instance, b: &ts::Instance, served: i64, since: Instant) {
+    match served_to(a, b) {
+        Some(f) => assert_eq!(f.bytes_session, served, "a served b nothing again: {f:?}"),
+        None => assert!(
+            since.elapsed() > crate::collab::live::meter::IDLE_DROP,
+            "a's flow to b vanished while fresh"
+        ),
+    }
+}
+
 /// B's folder moved or copied elsewhere (`copy`: the old one stays), with
 /// its store, and the new place designated — every replica must be
 /// re-adopted where the new folder holds it (final fix B-I1).
@@ -1232,7 +1288,7 @@ async fn readopted_after_relocation(copy: bool) {
             .await;
     }
     let old_root = w.b.root.clone();
-    let landed = landed_total(&w.b);
+    let (landed, served, since) = settled_fetch_baseline(&w.a, &w.b, uuids.len()).await;
     let choices =
         w.b.events
             .payloads(crate::api::collab_live::COLLAB_DELETION_CHOICE_EVENT)
@@ -1303,6 +1359,7 @@ async fn readopted_after_relocation(copy: bool) {
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(landed_total(&w.b), landed, "no frame was fetched again");
+    assert_nothing_served_again(&w.a, &w.b, served, since);
     assert_eq!(
         w.b.events
             .payloads(crate::api::collab_live::COLLAB_DELETION_CHOICE_EVENT)
@@ -1355,7 +1412,7 @@ async fn a_folder_copied_then_deleted_keeps_serving_from_its_new_place() {
         w.b.wait_state(u, LocalState::Held, Duration::from_secs(30))
             .await;
     }
-    let landed = landed_total(&w.b);
+    let (landed, served, since) = settled_fetch_baseline(&w.a, &w.b, uuids.len()).await;
     let old_root = w.b.root.clone();
     crate::api::scan_roots::clear_collaboration_dir(&w.b.ctx)
         .await
@@ -1426,6 +1483,7 @@ async fn a_folder_copied_then_deleted_keeps_serving_from_its_new_place() {
         assert_eq!(w.c.file_bytes(u), w.b.file_bytes(u));
     }
     assert_eq!(landed_total(&w.b), landed, "nothing fetched again on b");
+    assert_nothing_served_again(&w.a, &w.b, served, since);
     assert_eq!(
         frame_files(&new_root).len(),
         uuids.len(),
