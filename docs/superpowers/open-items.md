@@ -487,31 +487,17 @@ mockup in the dev harness (`npm run ui:harness`, spec
   Screen Recording permission. On the owner's data: all six tabs, the frame panel, the member panel
   and one dialog, compared with the harness for font rendering and layout.
 
-### Hub — the test hub, production and the production gate (checked 2026-10-25)
+### Hub — test hub and production (2026-10-26)
 
-Read-only check on the VPS (`psql SELECT`, unauthenticated route probes). The per-wave entries below no longer
-list hub deploys: everything through hub `main` is on the test hub.
-
-- **Test hub** (`test-hub.artfrom.space`): migrations up to **0027** (applied 2026-09-29), binary of 2026-09-30
-  20:46 = hub `main` including `b485578` (holder-device-names). Collab v1–v3 waves 0–3, the contributor path
-  (migration 0026, the `None` dictionary entry) and the observability goals (0027) are all live there; the
-  collab v3 routes answer 401, not 404; `feed epoch` is in its journal; host-wide nginx worker sizing
-  (`worker_rlimit_nofile 16384`, `worker_connections 4096`) is applied. Data: 3 projects, 188 project frames,
-  9 devices. The collab-v2 wave-1 check `project_members WHERE is_coordinator AND cardinality(gov_caps) <> 6`
-  returns 0.
-- **Owed — push hub `main`.** Local `main` is one commit ahead of `origin/main` (`b485578`; the branch
-  `holder-device-names` itself is pushed). On the owner's word.
-- **Production** (`projects.artfrom.space`): migrations up to **0011** (2026-07-18), binary of 2026-07-18; no
-  collab v3 (`/me/project-versions` and `/me/events` answer 404). 3 projects, 27 devices.
-- **Production gate.** Do not deploy collab v3 (hub `main`, migrations 0012–0027) to production until an app
-  release ships the collab v3 client: one that (a) treats `409 collab_api_outdated` as "update required"
-  instead of a raw unexpected-status error and (b) reads `pendingFrames`, not the deprecated
-  `pendingAnnouncements` (the hub keeps the alias, so `/me/projects` still decodes for old apps). The last
-  release, v0.6.4 (2026-09-17), has neither; `main` is past it by 906 commits. After the deploy, v0.6.4
-  clients get `409 collab_api_outdated` on every collaboration call — the compat gate as designed.
-  Preflight (2026-10-25): production `package_announcements` holds **0** rows, so migration 0022 (which
-  refuses on a non-empty table) will run. The deploy itself is the owner-initiated production procedure:
-  hub `main`, `deploy_athenaeum_hub.yml -e @~/.config/athenaeum-hub/smtp.yml`, health + journal.
+- **Both hubs run hub `main` `515b604`** (migrations up to 0027: collab v1–v3, the contributor path, the observability
+  goals). Production (`projects.artfrom.space`) was deployed 2026-10-25 with app v0.7.0: preflight
+  `package_announcements` = 0, no join requests; after the deploy health ok, the v3 routes answer 401, the portal
+  shell loads, migrations 27, `feed epoch` in the journal, no errors in the first 15 minutes. v0.6.4 clients get
+  `409 collab_api_outdated` ("update required") on collaboration calls — the compat gate as designed.
+- **Owed — one collaboration smoke from a v0.7.0 install against production** (sign in, open a project, publish one
+  frame, see it received on a second device).
+- **Hub CI runner disk.** The linux runner (62 GB) filled twice from the hub test target; hub `515b604` builds tests
+  without debuginfo or incremental state. Watch the next few hub pipelines' disk use.
 - **Repo hygiene.** `Documents/Projects/athenaeum-hub-portal/` is a STALE copy of the portal (still the
   free-text threshold editor); the deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
 
@@ -887,8 +873,7 @@ holders" section).
 - **Do NOT re-flag**: an app older than the collab v3 client getting `409 collab_api_outdated` on
   every collaboration call from a wave-1-or-later hub is the compat gate as designed (spec §11),
   not a hub regression.
-- **Production gate**: see the hub state entry above (no production deploy before an app release
-  with the collab v3 client).
+- **Production** runs this since 2026-10-25 (see the hub entry above).
 
 ### Collab v3 wave 0 (2026-09-23)
 
@@ -2345,48 +2330,6 @@ Known gap: republishing an `own_missing` frame that regenerates identical bytes 
 
 ## Release notes owed at the next tag
 
-(The v0.5.1–v0.6.1 lines were paid at their own tags — the Blink full-resolution debayer,
-the cache limit, the plate-solve gate controls, the master-deletion un-supersede, the
-scan-error reveal and **Check again** at v0.5.6; the **Lights + calibration sets** raw
-originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.6.2.)
+Nothing owed: everything listed here up to v0.7.0 was paid in the v0.7.0 notes (2026-10-26). A cycle that
+lands adds its user-facing lines here, in engineering wording; the next release translates them for users.
 
-- **Externally calibrated frame sets stack without masters.** A frame set marked as calibrated elsewhere is now stacked as it is: its lights are used, or converted to the app's unit domain, instead of being calibrated, and no master is asked for or built. Already-debayered attested lights group as colour.
-- **Publishing now has a review step: Calibrate → review in Blink → Publish.** Auto-publish is off for every project (migrated to Manual); Auto-calibrate and Fully automatic are opt-in per project.
-- **Scanning: the master-verification step is visible and the content index
-  yields.** A scan that ingests masters used to spend minutes under
-  "Building duplicate cache…" with no progress — that time was the app
-  reading every candidate master in full to tell true duplicates apart, at
-  the drive's or the share's speed. It is now its own step, **Verifying
-  master duplicates**, counting files and naming the one being read. And the
-  background content index no longer competes with a scan for the same
-  volume: it pauses while a scan runs and resumes when it ends.
-
-- **Local normalization is rebuilt, so every LN set re-normalizes once.** The first stack after the upgrade rebuilds the LN reference, re-measures the seeds calibration and rewrites every sidecar; the plan shows Normalize as stale once and cached afterwards. A set with LN off sees nothing but the pedestal warning. Normalize takes a little longer (+20 s on a 2-minute stage in the test set).
-- **The LN background follows structure larger than the scale and treats smaller structure as signal.** The halo-shaped holes around bright stars are gone (Horse C11: the ring that read +4.1 % against +12.2 % without LN now agrees with the no-LN stack to within 0.07 points). Sky near bright structures moves by up to the old error.
-- **The LN scale is derived from the image** (short side ÷ Grid size, default 4, snapped to 256 … 8192), shown as "Resolved scale". Large sensors get a larger default (a short side above 5120 px resolves above 1024; 3584 – 5120 px stays at 1024). A stored scale of 1024 becomes Auto; any other stored value stays fixed.
-- **The LN master's star signal rises with the new default scale estimator (common aperture, growth curve):** +4.3 % on set 204 mono and +6.9 % on run B mono against the previous PSF-signal estimator with the new star selection; OSC colour balance moves by up to 0.6 %; master SNR rises (+0.3 % set 204, +1.9 % run B). PSF signal stays selectable under Star flux; a stored document that names it keeps it.
-- **Stars for the LN scale are selected** (not saturated, peak SNR at least 40, the 500 brightest pairs).
-- **Stacking re-measures every frame set once; the star-flux correction no longer reads hot pixels.** The per-plane aperture correction behind every frame weight and star flux now takes only real point sources at SNR 20 and above: on a colour (OSC) frame a candidate that has no counterpart in the other colour planes, such as a hot pixel, is left out, so hot pixels no longer bias the red plane's correction (an uncorrected raw frame read its red weight at about 0.4 of the right value). A frame plane with too few usable stars for its own correction now takes the median correction of its group's other frames for its weight, instead of none (it weighed about 0.3 of its peers on an undersampled red plane). The first stack after the upgrade re-measures, re-registers and re-normalizes every set once (calibration is not redone); on the test sets the weights and the masters did not change.
-- **A warning when a light has a flat but no dark or bias:** in the stacking plan, the Export tab (Calibrated lights) and the run summary, with OFFSET/GAIN and, in the run, the flat's darkest corner. Advisory only: it never blocks or changes a link.
-
-- **Plan C: Analysis, Blink and the plate-solve gate now use the stacking star measurement.**
-  - **Colour (OSC) frames are measured on their green pixels.** Widths (FWHM) of OSC frames change in their own right (the C9 corpus: −10 … −27 % against the old figures on the mosaic frames); a debayered frame is measured on its G plane.
-  - **Every Analysis number is re-measured once** (measurement version 7). Legacy rows recompute on the next analysis; the first start after the update rebuilds the per-star table (`star_metrics`) - seconds to a minute on a large catalog.
-  - **The first stack after the update re-measures, re-registers and re-normalizes every cached frame set once** (calibration is not redone): the measurement version moved, the stacking numbers did not (on the three test trees the weights and the masters are identical).
-  - **`stars_detected` is 3–9× deeper** (point-like matched-filter seeds, knots not counted). The collab `stars_detected` rules and the hub frame meta need re-tuning.
-  - **`detection_threshold` is now σ of the matched filter** (default 6.0); legacy rows hold ADU.
-  - **Review stored thresholds.** The numbers moved: the Analysis rejection defaults, the frame-set `max_fwhm_px` / `max_eccentricity`, and the collab project rules on `fwhm_arcsec`, `eccentricity`, `median_snr`, `snr_weight` and `frame_snr`.
-  - **A Verdict column (Trailed / Defocused / No stars) replaces Trail R²**, in the Analysis table, Blink's frame panel, the Black Hole section and the CSV export; the R² chart metric is gone. A "Refused" count column stays.
-  - **"Reject unusable frames" replaces "Reject trailed":** it rejects any frame with a verdict, and a legacy row by its old trailed flag until it is re-measured.
-  - **Removed settings:** Detection Sigma, Min / Max Star Area, Saturation Fraction, Trail Threshold, MRS layers, the PSF fit knobs, and Plate Solving's Max Median Eccentricity / Min Trail R². A stored value is ignored.
-  - **The plate-solve gate refuses a Trailed frame before solving** (the verdict alone; an old stored 0.85 / 0.65 pair is ignored). It stays quiet on a frame until the frame is re-analysed.
-  - **Frame SNR is a ratio**, not decibels: every "dB" label is gone, and the per-filter stacked SNR is the quadrature sum.
-  - **16-bit FITS written with `BZERO` 0 are read with the right offset** (rustafits 1.6), and OSC FITS files with an odd `XBAYROFF` / `YBAYROFF` now preview and measure in the right CFA phase (rustafits #7).
-  - **Round-star eccentricity floor 0.27 → 0.12 at F 2.6** (an F 2.6 figure, not generalized): well-sampled round stars read rounder; the Blink ellipse colours (0.5 / 0.6) may need a second look.
-  - **Blended star pairs are refused in the Analysis tab and Blink** (an extra `Blend` entry in the Refused count): two stars inside one fit's half-maximum contour no longer inflate a FWHM; close pairs with no second detection are not caught. Stacking does not refuse them, so the Analysis tab may list up to about 2 % fewer stars than the stack measures.
-  - **Blink star ellipses are sized by brightness**, and the settings reset icon now sits beside its label.
-
-- **Calibration library: a Size column and Gain / Bin / Size filters** on the dark and flat library pages (raw and master).
-- **Calibration coverage: select several light groups** (Shift for a range, Cmd/Ctrl for one) and re-assign them in one go;
-  **Unlink** removes calibration links from the selected groups or from the whole frame set; **Calibrated externally** is a switch
-  in the toolbar that locks the tab's calibration controls while it is on.
