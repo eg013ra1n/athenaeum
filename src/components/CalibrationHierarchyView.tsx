@@ -450,6 +450,13 @@ export function CalibrationHierarchyView({
             {/* Toolbar */}
             {frameSetId && frameSetName && (
               <div className="flex items-start gap-2 flex-wrap flex-shrink-0">
+                <AttestationToggle
+                  framesSetId={frameSetId}
+                  calibratedExternally={calibratedExternally}
+                  linkedCalibrationSets={linkedCalibrationSets}
+                  onChanged={() => onAttestationChanged?.()}
+                />
+                <div aria-hidden className="h-7 w-px bg-border mx-1 flex-shrink-0" />
                 <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
                   <CalibrationFinderButton
                     frameSetId={frameSetId}
@@ -467,12 +474,6 @@ export function CalibrationHierarchyView({
                   allFrameIds={allLightFrameIds}
                   disabled={calibratedExternally}
                   onUnlinked={() => { onCalibrationComplete?.(); onRefresh?.(); }}
-                />
-                <AttestationToggle
-                  framesSetId={frameSetId}
-                  calibratedExternally={calibratedExternally}
-                  linkedCalibrationSets={linkedCalibrationSets}
-                  onChanged={() => onAttestationChanged?.()}
                 />
                 <button
                   onClick={() => setReassignMode(v => !v)}
