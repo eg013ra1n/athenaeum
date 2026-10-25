@@ -9,7 +9,8 @@ type SortField = 'date' | 'fwhm' | 'ecc' | 'snr';
 type SortDir = 'asc' | 'desc';
 
 interface ReassignFramePanelProps {
-  lightRow: LightRow | null;
+  /** The selected light groups; their frames are listed together. */
+  lightRows: LightRow[];
   analysisData?: Map<number, FrameAnalysis>;
   onManualCalibration: (frameIds: number[]) => void;
   onBlink?: (frameIds: number[]) => void;
@@ -28,7 +29,7 @@ function formatDateTime(dateStr: string | null): string {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export function ReassignFramePanel({
-  lightRow,
+  lightRows,
   analysisData,
   onManualCalibration,
   onBlink,
@@ -36,13 +37,14 @@ export function ReassignFramePanel({
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const lastClickedIndexRef = useRef<number | null>(null);
 
-  // Reset selection when lightRow changes
+  // Reset selection when the set of groups changes
+  const groupsKey = lightRows.map(r => r.rowKey).join('|');
   useEffect(() => {
     setSelectedIds(new Set());
     lastClickedIndexRef.current = null;
-  }, [lightRow?.rowKey]);
+  }, [groupsKey]);
 
-  const frames: EnrichedLightFrame[] = lightRow?.frames ?? [];
+  const frames: EnrichedLightFrame[] = useMemo(() => lightRows.flatMap(r => r.frames), [lightRows]);
 
   // Sort state
   const [sortField, setSortField] = useState<SortField>('date');
@@ -138,7 +140,7 @@ export function ReassignFramePanel({
 
   // ── Empty state ────────────────────────────────────────────────────────────
 
-  if (!lightRow) {
+  if (lightRows.length === 0) {
     return (
       <div className="flex flex-col h-full border-l border-border/40 bg-surface">
         <div className="px-3 py-2 border-b border-border/40 bg-surface-elevated flex-shrink-0">
@@ -148,7 +150,7 @@ export function ReassignFramePanel({
         </div>
         <div className="flex-1 flex items-center justify-center">
           <p className="text-xs text-content-muted italic text-center px-4">
-            Click a light row to see individual frames
+            Click a light row to see individual frames · Shift or Cmd/Ctrl-click to add groups
           </p>
         </div>
       </div>
@@ -157,10 +159,12 @@ export function ReassignFramePanel({
 
   // ── Frame group label ──────────────────────────────────────────────────────
 
-  const groupLabel = [
-    lightRow.filter ?? 'No filter',
-    lightRow.exptime != null ? `${lightRow.exptime}s` : null,
-  ].filter(Boolean).join(' · ');
+  const groupLabel = lightRows.length === 1
+    ? [
+        lightRows[0].filter ?? 'No filter',
+        lightRows[0].exptime != null ? `${lightRows[0].exptime}s` : null,
+      ].filter(Boolean).join(' · ')
+    : `${lightRows.length} groups · ${frames.length} frames`;
 
   return (
     <div className="flex flex-col h-full border-l border-border/40 bg-surface min-w-0">

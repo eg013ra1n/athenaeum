@@ -10,7 +10,9 @@ import type { ManualPick } from './calibration/CalibrationPicker';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
-import { CalibrationTableView } from './calibration/CalibrationTableView';
+import { CalibrationTableView, type LightSelection } from './calibration/CalibrationTableView';
+import { UnlinkCalibrationButton } from './calibration/UnlinkCalibrationButton';
+import { AttestationToggle } from './calibration/AttestationToggle';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
@@ -41,6 +43,12 @@ interface CalibrationHierarchyViewProps {
   highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
   /** Called once the highlight has been forwarded to the table view. */
   onHighlightConsumed?: () => void;
+  /** The frame set's "calibrated by an external tool" flag: ON locks every
+   *  calibration control on this tab. */
+  calibratedExternally?: boolean;
+  /** Linked calibration sets — words the confirm when turning the flag ON. */
+  linkedCalibrationSets?: number;
+  onAttestationChanged?: () => void;
 }
 
 export function CalibrationHierarchyView({
@@ -58,9 +66,19 @@ export function CalibrationHierarchyView({
   onCreateCustomSet,
   highlightCalSet,
   onHighlightConsumed,
+  calibratedExternally = false,
+  linkedCalibrationSets = 0,
+  onAttestationChanged,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
+  // An externally calibrated set takes no calibration here: leave Re-assign.
+  useEffect(() => {
+    if (calibratedExternally) setReassignMode(false);
+  }, [calibratedExternally]);
+
+  // Light groups selected in the table — the Unlink button's scope.
+  const [lightSelection, setLightSelection] = useState<LightSelection>({ groupCount: 0, frameIds: [] });
 
   const { notify } = useNotifications();
 
@@ -160,6 +178,8 @@ export function CalibrationHierarchyView({
     () => allFramesRaw.filter(f => !blackholedFileIds.has(f.file_id)),
     [allFramesRaw, blackholedFileIds]
   );
+  // Every non-Black-Hole light of the frame set: Unlink's scope when nothing is selected.
+  const allLightFrameIds = useMemo(() => allFrames.map(f => f.frame_id), [allFrames]);
   const blackholedFrames = useMemo(
     () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
     [allFramesRaw, blackholedFileIds]
@@ -435,14 +455,29 @@ export function CalibrationHierarchyView({
                     frameSetId={frameSetId}
                     frameSetName={frameSetName}
                     onComplete={() => { onCalibrationComplete?.(); onRefresh?.(); }}
+                    disabled={calibratedExternally}
                   />
                   <span className="text-[10px] text-content-muted leading-tight">
                     {data.calibrated_frames}/{data.total_frames}
                   </span>
                 </div>
+                <UnlinkCalibrationButton
+                  selectedFrameIds={lightSelection.frameIds}
+                  selectedGroupCount={lightSelection.groupCount}
+                  allFrameIds={allLightFrameIds}
+                  disabled={calibratedExternally}
+                  onUnlinked={() => { onCalibrationComplete?.(); onRefresh?.(); }}
+                />
+                <AttestationToggle
+                  framesSetId={frameSetId}
+                  calibratedExternally={calibratedExternally}
+                  linkedCalibrationSets={linkedCalibrationSets}
+                  onChanged={() => onAttestationChanged?.()}
+                />
                 <button
                   onClick={() => setReassignMode(v => !v)}
-                  className={`h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium rounded-lg transition-colors ${
+                  disabled={calibratedExternally}
+                  className={`h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                     reassignMode
                       ? 'bg-accent text-white hover:brightness-90'
                       : 'bg-surface-elevated text-content-secondary hover:text-content hover:bg-surface-hover border border-border/50'
@@ -454,13 +489,19 @@ export function CalibrationHierarchyView({
                 </button>
                 <button
                   onClick={() => setBatchDialogIds(rawCalSetIds)}
-                  disabled={rawCalSetIds.length === 0}
+                  disabled={rawCalSetIds.length === 0 || calibratedExternally}
                   className="h-7 inline-flex items-center px-3 bg-surface-hover hover:brightness-110 text-content text-sm rounded disabled:opacity-50 transition-colors"
                   title="Integrate every raw calibration set used by this object into masters"
                 >
                   Create all masters ({rawCalSetIds.length})
                 </button>
               </div>
+            )}
+            {calibratedExternally && (
+              <p className="text-xs text-warning flex-shrink-0">
+                Calibrated by an external tool: the lights are taken as they are, linked calibration sets are ignored, and
+                nothing here calibrates them again. Switch it off to change calibration.
+              </p>
             )}
 
             <CalibrationTableView
@@ -475,6 +516,8 @@ export function CalibrationHierarchyView({
               onHighlightConsumed={onHighlightConsumed}
               onCreateMaster={(setId) => setBatchDialogIds([setId])}
               buildStateBySet={buildStateBySet}
+              onLightSelectionChange={setLightSelection}
+              locked={calibratedExternally}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

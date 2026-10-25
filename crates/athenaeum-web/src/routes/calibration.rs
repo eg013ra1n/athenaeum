@@ -287,6 +287,13 @@ pub struct ClearManualCalibrationOverrideArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UnlinkCalibrationForFramesArgs {
+    pub frame_ids: Vec<i64>,
+    pub calibration_types: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetSubcalibrationSetsArgs {
     pub set_id: i64,
     pub calibration_type: String,
@@ -399,6 +406,21 @@ pub async fn clear_manual_calibration_override(
     Json(args): Json<ClearManualCalibrationOverrideArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
     api::clear_manual_calibration_override(&state.ctx, args.frame_ids, args.calibration_type)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/unlink_calibration_for_frames
+///
+/// Remove every calibration link of the given types (auto and manual) from
+/// light frames. Mirrors `athenaeum-tauri`'s command of the same name; both
+/// call `athenaeum_core::api::calibration::unlink_calibration_for_frames`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn unlink_calibration_for_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<UnlinkCalibrationForFramesArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    api::unlink_calibration_for_frames(&state.ctx, args.frame_ids, args.calibration_types)
         .map(Json)
         .map_err(api_err)
 }

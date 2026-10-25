@@ -185,6 +185,17 @@ pub async fn clear_manual_calibration_override(
     api::clear_manual_calibration_override(&state.ctx, frame_ids, calibration_type).map_err(|e| e.to_string())
 }
 
+/// Remove every calibration link of the given types (auto and manual) from light frames
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn unlink_calibration_for_frames(
+    frame_ids: Vec<i64>,
+    calibration_types: Vec<String>, // "Flat", "Dark", "Bias"
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    api::unlink_calibration_for_frames(&state.ctx, frame_ids, calibration_types).map_err(|e| e.to_string())
+}
+
 // ========== Refresh Calibration Library Command ==========
 
 /// Refresh calibration library for a specific camera

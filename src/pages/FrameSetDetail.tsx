@@ -9,7 +9,6 @@ import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import FrameSetProjectBlock from '../components/collab/FrameSetProjectBlock';
-import { AttestationToggle } from '../components/calibration/AttestationToggle';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { HistoryNav } from '../components/HistoryNav';
@@ -1043,12 +1042,6 @@ export default function FrameSetDetail() {
             />
           ) : activeTab === 'calibration' ? (
             <div className="flex flex-col gap-3 h-full min-h-0">
-              <AttestationToggle
-                framesSetId={parseInt(id!)}
-                calibratedExternally={detail.frames_set?.calibrated_externally ?? false}
-                linkedCalibrationSets={linkedCalibrationSetsCount}
-                onChanged={refreshAfterCollabChange}
-              />
               <div className="flex-1 min-h-0">
                 <CalibrationHierarchyViewComponent
                   data={calibrationHierarchy}
@@ -1064,6 +1057,9 @@ export default function FrameSetDetail() {
                   onCreateCustomSet={handleOpenCreateDialog}
                   highlightCalSet={pendingHighlightCalSet}
                   onHighlightConsumed={() => setPendingHighlightCalSet(null)}
+                  calibratedExternally={detail.frames_set?.calibrated_externally ?? false}
+                  linkedCalibrationSets={linkedCalibrationSetsCount}
+                  onAttestationChanged={refreshAfterCollabChange}
                 />
               </div>
             </div>

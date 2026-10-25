@@ -751,6 +751,55 @@ pub fn clear_manual_calibration_override(
     Ok(deleted)
 }
 
+/// Remove every calibration link of the given types (auto-matched and manual)
+/// from these light frames. Find Calibration can link the auto-matched ones
+/// again; a removed manual choice is gone. Flat sets' own pre-calibration is
+/// not touched.
+pub fn unlink_calibration_for_frames(
+    ctx: &ServiceContext,
+    frame_ids: Vec<i64>,
+    calibration_types: Vec<String>,
+) -> Result<usize, ApiError> {
+    use crate::db::calibration_links::unlink_calibration;
+
+    if frame_ids.is_empty() {
+        return Err(ApiError::Invalid("No frame IDs provided".to_string()));
+    }
+    if calibration_types.is_empty() {
+        return Err(ApiError::Invalid("No calibration types provided".to_string()));
+    }
+    let valid_types = ["Flat", "Dark", "Bias", "DarkFlat"];
+    if let Some(bad) = calibration_types.iter().find(|t| !valid_types.contains(&t.as_str())) {
+        tracing::warn!(calibration_type = %bad, "unlink refused: invalid calibration type");
+        return Err(ApiError::Invalid(format!("Invalid calibration type: {bad}")));
+    }
+
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let deleted = unlink_calibration(&conn, &frame_ids, &calibration_types)?;
+
+    tracing::info!(
+        count = deleted,
+        frames = frame_ids.len(),
+        types = ?calibration_types,
+        "unlinked calibration from frames"
+    );
+
+    // Auto-publish trigger, as for the manual assign / clear: a light without
+    // its calibration can change gate eligibility.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    {
+        match crate::db::calibration_links::frame_set_ids_for_frames(&conn, &frame_ids) {
+            Ok(set_ids) => crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids),
+            Err(error) => {
+                tracing::warn!(%error, "auto-publish: failed to resolve frame sets for unlinked calibration");
+            }
+        }
+    }
+
+    Ok(deleted)
+}
+
 fn most_common_option(values: &[Option<String>]) -> Option<String> {
     let mut counts: HashMap<&String, usize> = HashMap::new();
     for v in values.iter().flatten() {

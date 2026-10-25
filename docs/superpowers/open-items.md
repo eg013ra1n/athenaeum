@@ -2370,3 +2370,8 @@ originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.
   - **Round-star eccentricity floor 0.27 → 0.12 at F 2.6** (an F 2.6 figure, not generalized): well-sampled round stars read rounder; the Blink ellipse colours (0.5 / 0.6) may need a second look.
   - **Blended star pairs are refused in the Analysis tab and Blink** (an extra `Blend` entry in the Refused count): two stars inside one fit's half-maximum contour no longer inflate a FWHM; close pairs with no second detection are not caught. Stacking does not refuse them, so the Analysis tab may list up to about 2 % fewer stars than the stack measures.
   - **Blink star ellipses are sized by brightness**, and the settings reset icon now sits beside its label.
+
+- **Calibration library: a Size column and Gain / Bin / Size filters** on the dark and flat library pages (raw and master).
+- **Calibration coverage: select several light groups** (Shift for a range, Cmd/Ctrl for one) and re-assign them in one go;
+  **Unlink** removes calibration links from the selected groups or from the whole frame set; **Calibrated externally** is a switch
+  in the toolbar that locks the tab's calibration controls while it is on.

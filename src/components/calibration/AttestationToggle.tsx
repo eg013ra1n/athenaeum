@@ -1,6 +1,6 @@
 import { useState } from 'react';
+import { Lock } from 'lucide-react';
 import { api } from '../../api';
-import { Checkbox } from '../settings/Checkbox';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { useNotifications } from '../../contexts/NotificationContext';
 
@@ -11,14 +11,17 @@ interface AttestationToggleProps {
    *  only to word the confirm shown when turning attestation ON. */
   linkedCalibrationSets: number;
   onChanged: () => void;
+  disabled?: boolean;
 }
 
 /**
- * Spec 2026-09-28 §6.2 — the attestation checkbox on the Calibration tab.
- * Turning it ON with linked calibration sets confirms first (those masters
- * are ignored by projects once attested); turning it OFF needs no confirm.
+ * Spec 2026-09-28 §6.2 — the attestation switch in the Calibration tab's
+ * toolbar. ON locks the tab's calibration controls (the lights are taken as
+ * they are; linked sets stay but are ignored); OFF clears the flag and gives
+ * them back. Turning it ON with linked calibration sets confirms first;
+ * turning it OFF needs no confirm.
  */
-export function AttestationToggle({ framesSetId, calibratedExternally, linkedCalibrationSets, onChanged }: AttestationToggleProps) {
+export function AttestationToggle({ framesSetId, calibratedExternally, linkedCalibrationSets, onChanged, disabled }: AttestationToggleProps) {
   const { notify } = useNotifications();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -51,13 +54,30 @@ export function AttestationToggle({ framesSetId, calibratedExternally, linkedCal
 
   return (
     <>
-      <Checkbox
-        checked={calibratedExternally}
-        onChange={handleChange}
-        disabled={busy}
-        label="Calibrated by an external tool"
-        description="The lights of this set are already calibrated (dark and flat applied) as single-channel frames — mono or CFA, not debayered RGB. Collaboration projects take them as they are; nothing in the app calibrates them again."
-      />
+      <button
+        type="button"
+        role="switch"
+        aria-checked={calibratedExternally}
+        onClick={() => handleChange(!calibratedExternally)}
+        disabled={busy || disabled}
+        className={`h-7 inline-flex items-center gap-2 px-3 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+          calibratedExternally
+            ? 'bg-warning-muted text-warning border-warning/50'
+            : 'bg-surface-elevated text-content-secondary hover:text-content hover:bg-surface-hover border-border/50'
+        }`}
+        title="The lights of this set are already calibrated (dark and flat applied) as single-channel frames — mono or CFA, not debayered RGB. Collaboration projects take them as they are; nothing in the app calibrates them again."
+      >
+        <span
+          aria-hidden
+          className={`relative inline-block h-3.5 w-6 rounded-full transition-colors ${calibratedExternally ? 'bg-warning' : 'bg-border'}`}
+        >
+          <span
+            className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-surface transition-all ${calibratedExternally ? 'left-3' : 'left-0.5'}`}
+          />
+        </span>
+        {calibratedExternally && <Lock size={11} />}
+        Calibrated externally
+      </button>
       <ConfirmDialog
         isOpen={confirmOpen}
         title="Attest external calibration?"

@@ -7,10 +7,11 @@ import { CalibrationProcessModal } from './CalibrationProcessModal';
 interface CalibrationFinderButtonProps {
   frameSetId: number;
   frameSetName: string | null;
+  disabled?: boolean;
   onComplete?: (stats: ProcessingStats) => void;
 }
 
-export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }: CalibrationFinderButtonProps) {
+export function CalibrationFinderButton({ frameSetId, frameSetName, disabled, onComplete }: CalibrationFinderButtonProps) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [showProcessModal, setShowProcessModal] = useState(false);
   const [stats, setStats] = useState<ProcessingStats | null>(null);
@@ -59,7 +60,7 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
     <>
       <button
         onClick={handleFindCalibration}
-        disabled={isProcessing}
+        disabled={isProcessing || disabled}
         className="h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
         title="Find and link calibration data for this frame set"
       >

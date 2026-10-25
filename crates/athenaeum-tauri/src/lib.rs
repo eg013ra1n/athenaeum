@@ -357,6 +357,7 @@ pub fn run() {
             commands::get_calibration_sets_for_manual_selection,
             commands::manual_assign_calibration,
             commands::clear_manual_calibration_override,
+            commands::unlink_calibration_for_frames,
             commands::get_calibration_set_parameters,
             commands::get_subcalibration_sets_for_manual_selection,
             commands::manual_assign_subcalibration,

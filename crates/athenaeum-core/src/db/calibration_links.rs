@@ -233,6 +233,39 @@ pub fn clear_manual_override(
     conn.execute(&sql, param_refs.as_slice())
 }
 
+/// Delete every link of the given types on these light frames, auto-matched
+/// and manual alike, in one IMMEDIATE transaction. Flat sets' own
+/// pre-calibration links (`source_type = 'calibration_set'`) are never
+/// touched. Returns the number of links removed.
+pub fn unlink_calibration(
+    conn: &Connection,
+    frame_ids: &[i64],
+    calibration_types: &[String],
+) -> Result<usize> {
+    if frame_ids.is_empty() || calibration_types.is_empty() {
+        return Ok(0);
+    }
+
+    let type_placeholders: Vec<String> = (0..calibration_types.len()).map(|_| "?".to_string()).collect();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut deleted = 0;
+    // Stay well under SQLite's bound-parameter limit on a large frame set.
+    for chunk in frame_ids.chunks(900) {
+        let frame_placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_type = 'frame' AND source_id IN ({}) AND calibration_type IN ({})",
+            frame_placeholders.join(", "),
+            type_placeholders.join(", ")
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        params.extend(calibration_types.iter().map(|t| t as &dyn rusqlite::ToSql));
+        deleted += tx.execute(&sql, params.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 /// Get sub-calibration details for a calibration set
 /// Returns the linked sub-calibrations (e.g., Flat→Dark/Bias, Dark→Bias) with full set details
 /// Warnings are calculated dynamically based on date and temperature differences
@@ -1988,6 +2021,78 @@ mod tests {
             (set_a, 1),
             "manual pick must survive the auto upsert"
         );
+    }
+
+    #[test]
+    fn unlink_calibration_removes_auto_and_manual_links_of_the_chosen_types() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        insert_test_calibration_set(&conn, 20);
+        insert_test_calibration_set(&conn, 30);
+        insert_manual_link(&conn, 1, 10, "Dark");
+        let auto_flat = CalibrationLink {
+            id: None,
+            source_id: 1,
+            source_type: "frame".to_string(),
+            calibration_set_id: 20,
+            calibration_type: "Flat".to_string(),
+            matched_at: Utc::now().to_rfc3339(),
+            match_score: Some(0.9),
+            date_warning: false,
+            temp_warning: false,
+            is_manual_override: false,
+        };
+        insert_calibration_link(&conn, &auto_flat).unwrap();
+        insert_manual_link(&conn, 1, 30, "Bias");
+        insert_manual_link(&conn, 2, 10, "Dark");
+
+        let types = vec!["Flat".to_string(), "Dark".to_string()];
+        assert_eq!(unlink_calibration(&conn, &[1], &types).unwrap(), 2);
+
+        let left = get_links_for_frame(&conn, 1).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].calibration_type, "Bias");
+        // Another frame's link is not in scope.
+        assert_eq!(get_links_for_frame(&conn, 2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unlink_calibration_never_touches_a_flat_sets_pre_calibration() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        // A flat set (id 1) pre-calibrated by dark set 10: same source id as
+        // light frame 1, but source_type 'calibration_set'.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, is_manual_override)
+             VALUES (1, 'calibration_set', 10, 'Dark', 1)",
+            [],
+        )
+        .unwrap();
+        insert_manual_link(&conn, 1, 10, "Dark");
+
+        assert_eq!(unlink_calibration(&conn, &[1], &["Dark".to_string()]).unwrap(), 1);
+        let pre_cal: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames WHERE source_type = 'calibration_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre_cal, 1);
+    }
+
+    #[test]
+    fn unlink_calibration_spans_more_frames_than_one_chunk() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        let ids: Vec<i64> = (1..=2000).collect();
+        for id in &ids {
+            insert_manual_link(&conn, *id, 10, "Dark");
+        }
+        assert_eq!(unlink_calibration(&conn, &ids, &["Dark".to_string()]).unwrap(), 2000);
+        assert_eq!(unlink_calibration(&conn, &[], &["Dark".to_string()]).unwrap(), 0);
+        assert_eq!(unlink_calibration(&conn, &[1], &[]).unwrap(), 0);
     }
 
     #[test]

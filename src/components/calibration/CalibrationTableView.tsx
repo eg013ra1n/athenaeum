@@ -12,6 +12,7 @@ import type {
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
 import { geometryLabel, sizeCellState } from './pickerModel';
 import { ReassignFramePanel } from './ReassignFramePanel';
+import { nextLightSelection, type SelectionModifiers } from './lightSelection';
 import { stackedFrameSnr } from '../analysis/stackedSnr';
 import type { BuildState } from '../../hooks/useMasterBuilds';
 
@@ -39,6 +40,17 @@ interface CalibrationTableViewProps {
   /** Live build state (phase, plus stage/percent while building) per source
    *  set id, from `useMasterBuildContext().buildStates`. */
   buildStateBySet?: Record<number, BuildState>;
+  /** Told whenever the selected light groups change (the Unlink button's scope). */
+  onLightSelectionChange?: (selection: LightSelection) => void;
+  /** The frame set is calibrated by an external tool: nothing here may change
+   *  calibration (no master builds), and the tables read as inactive. */
+  locked?: boolean;
+}
+
+/** The light groups currently selected in the table and their frames. */
+export interface LightSelection {
+  groupCount: number;
+  frameIds: number[];
 }
 
 // ── Section colors (per spec) ──────────────────────────────────────────────
@@ -808,7 +820,7 @@ type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDa
 function LightsTable({
   rows,
   highlightedRowKeys,
-  selectedRowKey,
+  selectedRowKeys,
   onRowClick,
   onFlatClick,
   onDarkClick,
@@ -816,8 +828,9 @@ function LightsTable({
 }: {
   rows: LightRow[];
   highlightedRowKeys: Set<string>;
-  selectedRowKey?: string | null;
-  onRowClick: (row: LightRow) => void;
+  selectedRowKeys?: Set<string>;
+  /** `orderedKeys` is the displayed (sorted) order, for Shift ranges. */
+  onRowClick: (row: LightRow, orderedKeys: string[], mods: SelectionModifiers) => void;
   onFlatClick: (flatSetId: number) => void;
   onDarkClick: (darkSetId: number) => void;
   compact?: boolean;
@@ -844,6 +857,7 @@ function LightsTable({
   }
 
   const thProps = { sortField, sortDir, onSort: handleSort };
+  const orderedKeys = sorted.map(r => r.rowKey);
 
   return (
     <div>
@@ -869,7 +883,7 @@ function LightsTable({
         <tbody>
           {sorted.map(row => {
             const highlighted = highlightedRowKeys.has(row.rowKey);
-            const isSelected = selectedRowKey === row.rowKey;
+            const isSelected = selectedRowKeys?.has(row.rowKey) ?? false;
             const rowBg =
               isSelected ? 'bg-warning/20 ring-1 ring-inset ring-warning/40' :
               highlighted ? 'bg-accent/20' :
@@ -879,8 +893,9 @@ function LightsTable({
             return (
               <tr
                 key={row.rowKey}
-                onClick={() => onRowClick(row)}
-                className={`border-b border-border/20 cursor-pointer hover:bg-surface-hover/50 transition-colors ${rowBg}`}
+                onClick={e => onRowClick(row, orderedKeys, { shift: e.shiftKey, toggle: e.metaKey || e.ctrlKey })}
+                title="Click to select · Shift-click for a range · Cmd/Ctrl-click to add or remove one"
+                className={`border-b border-border/20 cursor-pointer select-none hover:bg-surface-hover/50 transition-colors ${rowBg}`}
                 style={{ height: 28 }}
               >
                 <td className="px-1.5 py-1">
@@ -1327,10 +1342,14 @@ export function CalibrationTableView({
   reassignMode = false,
   highlightCalSet,
   onHighlightConsumed,
-  onCreateMaster,
+  onCreateMaster: onCreateMasterProp,
   buildStateBySet,
+  onLightSelectionChange,
+  locked = false,
 }: CalibrationTableViewProps) {
   const navigate = useNavigate();
+  // Building a master changes calibration: not offered while locked.
+  const onCreateMaster = locked ? undefined : onCreateMasterProp;
 
   // Cross-page jump: open the matching camera + tab on the Equipment page,
   // with the row scrolled into view, highlighted, and auto-expanded.
@@ -1348,8 +1367,10 @@ export function CalibrationTableView({
     [navigate]
   );
 
-  // Selected light row for reassign mode
-  const [selectedLightRow, setSelectedLightRow] = useState<LightRow | null>(null);
+  // Selected light groups for reassign mode (the panel shows their frames)
+  const [selectedLightKeys, setSelectedLightKeys] = useState<Set<string>>(new Set());
+  // Last group clicked without Shift: the anchor of a Shift range.
+  const selectionAnchorRef = useRef<string | null>(null);
 
   // Horizontal split (left tables / right panel) for reassign mode
   const [hSplitPct, setHSplitPct] = useState(60);
@@ -1407,35 +1428,45 @@ export function CalibrationTableView({
   // only when nothing is selected yet, so it never overrides a manual pick.
   const prevReassignModeRef = useRef(reassignMode);
   useEffect(() => {
-    if (reassignMode && !prevReassignModeRef.current && !selectedLightRow && highlightedLightKeys.size > 0) {
-      const key = [...highlightedLightKeys][0];
-      const row = lightRows.find(r => r.rowKey === key);
-      if (row) setSelectedLightRow(row);
+    if (reassignMode && !prevReassignModeRef.current && selectedLightKeys.size === 0 && highlightedLightKeys.size > 0) {
+      const known = new Set(lightRows.map(r => r.rowKey));
+      setSelectedLightKeys(new Set([...highlightedLightKeys].filter(k => known.has(k))));
     }
     prevReassignModeRef.current = reassignMode;
-  }, [reassignMode, highlightedLightKeys, lightRows, selectedLightRow]);
+  }, [reassignMode, highlightedLightKeys, lightRows, selectedLightKeys]);
 
-  // Click a light row: highlight it + flat + dark; in reassign mode also select it
-  const handleLightRowClick = useCallback((row: LightRow) => {
-    if (reassignMode) {
-      // In reassign mode: toggle selected row for the right panel
-      setSelectedLightRow(prev => prev?.rowKey === row.rowKey ? null : row);
-      setHighlightedLightKeys(new Set([row.rowKey]));
-      setHighlightedFlatIds(row.flatSetId != null ? new Set([row.flatSetId]) : new Set());
-      setHighlightedDarkIds(row.darkSetId != null ? new Set([row.darkSetId]) : new Set());
-      setHighlightedBiasIds(new Set());
-      return;
-    }
-    // Toggle: if this row is already the only highlighted one, clear
-    if (highlightedLightKeys.size === 1 && highlightedLightKeys.has(row.rowKey)) {
+  // Click a light row: select it (Shift = range, Cmd/Ctrl = toggle one) and
+  // highlight the flats + darks the selected groups use. In reassign mode the
+  // selection also fills the right panel.
+  const handleLightRowClick = useCallback((row: LightRow, orderedKeys: string[], mods: SelectionModifiers) => {
+    const prev = reassignMode ? selectedLightKeys : highlightedLightKeys;
+    const next = nextLightSelection(prev, orderedKeys, row.rowKey, selectionAnchorRef.current, mods);
+    if (!mods.shift) selectionAnchorRef.current = row.rowKey;
+    if (next.size === 0 && !reassignMode) {
       clearHighlights();
       return;
     }
-    setHighlightedLightKeys(new Set([row.rowKey]));
-    setHighlightedFlatIds(row.flatSetId != null ? new Set([row.flatSetId]) : new Set());
-    setHighlightedDarkIds(row.darkSetId != null ? new Set([row.darkSetId]) : new Set());
+    const rows = lightRows.filter(r => next.has(r.rowKey));
+    if (reassignMode) setSelectedLightKeys(next);
+    setHighlightedLightKeys(next);
+    setHighlightedFlatIds(new Set(rows.flatMap(r => (r.flatSetId != null ? [r.flatSetId] : []))));
+    setHighlightedDarkIds(new Set(rows.flatMap(r => (r.darkSetId != null ? [r.darkSetId] : []))));
     setHighlightedBiasIds(new Set());
-  }, [reassignMode, highlightedLightKeys, clearHighlights]);
+  }, [reassignMode, selectedLightKeys, highlightedLightKeys, lightRows, clearHighlights]);
+
+  // The selected groups, in table-derivation order; a key whose row vanished
+  // (its links changed, so its group key did) simply drops out.
+  const selectionKeys = reassignMode ? selectedLightKeys : highlightedLightKeys;
+  const selectedLightRows = useMemo(
+    () => lightRows.filter(r => selectionKeys.has(r.rowKey)),
+    [lightRows, selectionKeys]
+  );
+  useEffect(() => {
+    onLightSelectionChange?.({
+      groupCount: selectedLightRows.length,
+      frameIds: selectedLightRows.flatMap(r => r.allFrameIds),
+    });
+  }, [selectedLightRows, onLightSelectionChange]);
 
   // Click flat set ID (from light row or cross-ref): scroll to and highlight flat row
   const handleFlatClick = useCallback((flatSetId: number) => {
@@ -1607,7 +1638,11 @@ export function CalibrationTableView({
 
   // The vertical-split tables block (shared between normal and reassign mode)
   const tablesBlock = (
-    <div ref={containerRef} className="flex flex-col h-full overflow-hidden border border-border/40 bg-surface">
+    <div
+      ref={containerRef}
+      aria-disabled={locked || undefined}
+      className={`flex flex-col h-full overflow-hidden border border-border/40 bg-surface ${locked ? 'opacity-60' : ''}`}
+    >
       {/* Top: Lights */}
       <div style={{ height: `${splitPct}%` }} className="flex flex-col min-h-0">
         <div ref={lightsSectionRef}>
@@ -1617,7 +1652,7 @@ export function CalibrationTableView({
           <LightsTable
             rows={lightRows}
             highlightedRowKeys={highlightedLightKeys}
-            selectedRowKey={reassignMode ? selectedLightRow?.rowKey : null}
+            selectedRowKeys={reassignMode ? selectedLightKeys : undefined}
             onRowClick={handleLightRowClick}
             onFlatClick={handleFlatClick}
             onDarkClick={handleDarkClick}
@@ -1697,7 +1732,7 @@ export function CalibrationTableView({
         {/* Right: frame selection panel */}
         <div style={{ width: `${100 - hSplitPct}%` }} className="flex flex-col min-w-0 min-h-0 h-full">
           <ReassignFramePanel
-            lightRow={selectedLightRow}
+            lightRows={selectedLightRows}
             analysisData={analysisData}
             onManualCalibration={onManualCalibration ?? (() => {})}
             onBlink={onBlink}
