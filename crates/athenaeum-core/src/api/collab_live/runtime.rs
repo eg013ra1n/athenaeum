@@ -1010,6 +1010,34 @@ struct Burst {
     last: HashMap<String, Instant>,
 }
 
+impl Burst {
+    /// The counts due at `now` — a project's first burst fires at once,
+    /// later ones once [`LANDED_BURST`] has passed since its last — removed
+    /// and stamped as last-emitted.
+    fn due(&mut self, now: Instant) -> Vec<CollabFramesLanded> {
+        let ready: Vec<String> = self
+            .counts
+            .keys()
+            .filter(|p| self.last.get(*p).is_none_or(|t| now >= *t + LANDED_BURST))
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for p in ready {
+            if let Some(counts) = self.counts.remove(&p) {
+                self.last.insert(p, now);
+                out.push(counts);
+            }
+        }
+        out
+    }
+
+    /// Every count still held back, window or not: a stopping runtime
+    /// never drops a "N frames arrived".
+    fn drain(&mut self) -> Vec<CollabFramesLanded> {
+        self.counts.drain().map(|(_, c)| c).collect()
+    }
+}
+
 /// Per-project throttle for [`COLLAB_PEERS_CHANGED_EVENT`]: at most one
 /// emission per project per [`LANDED_BURST`], mirroring [`Burst`] — a
 /// project noted inside the window is not dropped, it flushes once the
@@ -1062,6 +1090,11 @@ impl PeerBurst {
     /// The earliest scheduled emission, for the loop's `deadline()`.
     fn next_deadline(&self) -> Option<Instant> {
         self.due_at.values().min().copied()
+    }
+
+    /// Every scheduled emission, window or not (a stopping runtime).
+    fn drain(&mut self) -> Vec<String> {
+        self.due_at.drain().map(|(p, _)| p).collect()
     }
 }
 
@@ -1124,6 +1157,20 @@ impl SyncBurst {
             .filter(|(_, t)| **t <= now)
             .map(|(p, _)| p.clone())
             .collect();
+        self.take(ready, now)
+    }
+
+    /// Every scheduled payload, window or not (a stopping runtime).
+    fn drain(&mut self, now: Instant) -> Vec<crate::api::collab_live::CollabProjectSynced> {
+        let all: Vec<String> = self.due_at.keys().cloned().collect();
+        self.take(all, now)
+    }
+
+    fn take(
+        &mut self,
+        ready: Vec<String>,
+        now: Instant,
+    ) -> Vec<crate::api::collab_live::CollabProjectSynced> {
         let mut out = Vec::new();
         for pid in ready {
             self.due_at.remove(&pid);
@@ -1730,6 +1777,9 @@ impl Runtime {
         };
         let (stop, remount, restart) = (stop, remount, restart);
         let sign_out = stop.as_ref().is_some_and(|(s, _)| *s);
+        // Before anything stops: what the bursts hold back reaches the UI
+        // now, not never (a remount used to drop it with the runtime).
+        self.flush_all_bursts();
         self.shared.running.store(false, Ordering::SeqCst);
         if remount || restart {
             // Final fix A-I3: nothing is advertised as served while no
@@ -2165,23 +2215,31 @@ impl Runtime {
 
     /// Emit each project's landed burst at most once per [`LANDED_BURST`].
     fn flush_bursts(&mut self, now: Instant) {
-        let due: Vec<String> = self
-            .burst
-            .counts
-            .keys()
-            .filter(|p| {
-                self.burst
-                    .last
-                    .get(*p)
-                    .is_none_or(|t| now >= *t + LANDED_BURST)
-            })
-            .cloned()
-            .collect();
-        for p in due {
-            if let Some(counts) = self.burst.counts.remove(&p) {
-                self.emit(COLLAB_FRAMES_LANDED_EVENT, &counts);
-                self.burst.last.insert(p, now);
-            }
+        for counts in self.burst.due(now) {
+            self.emit(COLLAB_FRAMES_LANDED_EVENT, &counts);
+        }
+    }
+
+    /// A stopping runtime (stop, sign-out, remount, restart) emits every
+    /// landed / peers / synced burst still held back by its window — the
+    /// same events the timer would have sent, only earlier — so no "N
+    /// frames arrived" is dropped with the runtime.
+    fn flush_all_bursts(&mut self) {
+        let now = Instant::now();
+        let landed = self.burst.drain();
+        let peers = self.peer_burst.drain();
+        let synced = self.sync_burst.drain(now);
+        for counts in landed {
+            self.emit(COLLAB_FRAMES_LANDED_EVENT, &counts);
+        }
+        for p in peers {
+            self.emit(
+                COLLAB_PEERS_CHANGED_EVENT,
+                &CollabPeersChanged { project_id: p },
+            );
+        }
+        for item in synced {
+            self.emit(COLLAB_PROJECT_SYNCED_EVENT, &item);
         }
     }
 
@@ -2402,6 +2460,64 @@ mod tests {
             vec!["p2".to_string()],
             "p2's own first change is not held back by p1's window"
         );
+    }
+
+    /// The landed burst: a project's first count fires at once, the ones
+    /// inside the window are held back (and folded together) until it ends —
+    /// and a stopping runtime's `drain` releases them regardless, so a
+    /// remount never drops a "N frames arrived" (task 6, v0.7.0).
+    #[test]
+    fn landed_burst_holds_back_inside_the_window_and_drain_releases_it() {
+        let mut b = Burst::default();
+        let t0 = Instant::now();
+        b.counts
+            .entry("p1".into())
+            .or_insert_with(|| blank("p1"))
+            .landed += 1;
+        let first = b.due(t0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].landed, 1, "the first landing fires at once");
+        for i in 1..=11u64 {
+            b.counts
+                .entry("p1".into())
+                .or_insert_with(|| blank("p1"))
+                .landed += 1;
+            assert!(
+                b.due(t0 + Duration::from_millis(50 * i)).is_empty(),
+                "held back inside the window"
+            );
+        }
+        let drained = b.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].project_id, "p1");
+        assert_eq!(drained[0].landed, 11, "the held-back landings, all of them");
+        assert!(b.drain().is_empty(), "nothing left after a drain");
+        assert!(b.due(t0 + LANDED_BURST).is_empty(), "and nothing due later");
+    }
+
+    /// A stopping runtime drains the peers / synced bursts held back by
+    /// their windows too (task 6, v0.7.0).
+    #[test]
+    fn peer_and_sync_bursts_drain_what_their_window_holds_back() {
+        let t0 = Instant::now();
+        let mut peers = PeerBurst::default();
+        peers.note("p1", t0);
+        assert_eq!(peers.due(t0), vec!["p1".to_string()]);
+        peers.note("p1", t0 + Duration::from_millis(100));
+        assert!(peers.due(t0 + Duration::from_millis(100)).is_empty());
+        assert_eq!(peers.drain(), vec!["p1".to_string()]);
+        assert!(peers.next_deadline().is_none(), "nothing left pending");
+
+        let mut sync = SyncBurst::default();
+        let at = chrono::Utc::now();
+        sync.note(rep("p1", true, 0), at, t0);
+        assert_eq!(sync.due(t0).len(), 1);
+        sync.note(rep("p1", false, 2), at, t0 + Duration::from_millis(100));
+        assert!(sync.due(t0 + Duration::from_millis(100)).is_empty());
+        let drained = sync.drain(t0 + Duration::from_millis(100));
+        assert_eq!(drained.len(), 1);
+        assert!(!drained[0].ok && drained[0].changed, "{drained:?}");
+        assert!(sync.next_deadline().is_none(), "nothing left pending");
     }
 
     fn rep(pid: &str, ok: bool, rows: usize) -> crate::api::collab_live::feed::SyncReport {
