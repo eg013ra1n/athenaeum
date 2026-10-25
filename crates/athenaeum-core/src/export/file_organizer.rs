@@ -125,6 +125,37 @@ pub struct WbppPlacement {
     /// Where this placement's bytes come from — copied, or calibrated into
     /// place. See [`PlacementSource`].
     pub source: PlacementSource,
+    /// The role this file plays at its level — what the folder preview counts
+    /// ("← 80 darks, 30 flat darks"), read off the same walk that placed it.
+    pub kind: PlacementKind,
+}
+
+/// The role a placed file plays in the WBPP hierarchy. A flat's own dark is
+/// a `FlatDark`, not a `Dark`: both land in the `DARKS_*` folder, and the
+/// preview names them apart so its count matches what it lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlacementKind {
+    Light,
+    Flat,
+    Dark,
+    FlatDark,
+    DarkFlat,
+    Bias,
+}
+
+impl PlacementKind {
+    /// The preview's noun for `n` files of this kind ("1 dark", "80 darks").
+    pub fn noun(self, n: usize) -> &'static str {
+        let one = n == 1;
+        match self {
+            PlacementKind::Light => if one { "light" } else { "lights" },
+            PlacementKind::Flat => if one { "flat" } else { "flats" },
+            PlacementKind::Dark => if one { "dark" } else { "darks" },
+            PlacementKind::FlatDark => if one { "flat dark" } else { "flat darks" },
+            PlacementKind::DarkFlat => if one { "darkflat" } else { "darkflats" },
+            PlacementKind::Bias => "bias",
+        }
+    }
 }
 
 /// Where a placement's bytes come from.
@@ -203,17 +234,17 @@ fn push_subgroup_placements(
     if let Some(bias_info) = bias {
         dir.push(format!("BIAS_{}", bias_info.set_id));
         if organized_set_ids.insert(bias_info.set_id) {
-            place_at(&bias_info.frames, &dir, out);
+            place_at(&bias_info.frames, &dir, PlacementKind::Bias, out);
         }
         if let Some(fb) = flat_bias {
             if fb.set_id != bias_info.set_id && organized_set_ids.insert(fb.set_id) {
-                place_at(&fb.frames, &dir, out);
+                place_at(&fb.frames, &dir, PlacementKind::Bias, out);
             }
         }
     } else if let Some(fb) = flat_bias {
         dir.push(format!("BIAS_{}", fb.set_id));
         if organized_set_ids.insert(fb.set_id) {
-            place_at(&fb.frames, &dir, out);
+            place_at(&fb.frames, &dir, PlacementKind::Bias, out);
         }
     }
 
@@ -228,27 +259,27 @@ fn push_subgroup_placements(
 
         if let Some(dark_info) = dark {
             if organized_set_ids.insert(dark_info.set_id) {
-                place_at(&dark_info.frames, &dir, out);
+                place_at(&dark_info.frames, &dir, PlacementKind::Dark, out);
             }
             if let Some(ref dark_bias) = dark_info.bias {
                 if organized_set_ids.insert(dark_bias.set_id)
                     && bias.is_none()
                     && flat_bias.is_none()
                 {
-                    place_at(&dark_bias.frames, &dir, out);
+                    place_at(&dark_bias.frames, &dir, PlacementKind::Bias, out);
                 }
             }
         }
 
         if let Some(fd) = flat_dark {
             if organized_set_ids.insert(fd.set_id) {
-                place_at(&fd.frames, &dir, out);
+                place_at(&fd.frames, &dir, PlacementKind::FlatDark, out);
             }
         }
 
         if let Some(df_info) = dark_flat {
             if organized_set_ids.insert(df_info.set_id) {
-                place_at(&df_info.frames, &dir, out);
+                place_at(&df_info.frames, &dir, PlacementKind::DarkFlat, out);
             }
         }
     }
@@ -257,19 +288,20 @@ fn push_subgroup_placements(
     if let Some(flat_info) = flat {
         dir.push(format!("FLAT_{}", flat_info.set_id));
         if organized_set_ids.insert(flat_info.set_id) {
-            place_at(&flat_info.frames, &dir, out);
+            place_at(&flat_info.frames, &dir, PlacementKind::Flat, out);
         }
     }
 
     // Innermost: lights/ (always placed, never deduped).
     dir.push("lights".to_string());
-    place_at(&subgroup.frames, &dir, out);
+    place_at(&subgroup.frames, &dir, PlacementKind::Light, out);
 }
 
 /// Record one placement per frame under the forward-slash directory `dir`.
 fn place_at(
     frames: &[crate::export::models::ExportFrame],
     dir: &[String],
+    kind: PlacementKind,
     out: &mut Vec<WbppPlacement>,
 ) {
     let rel_dir = dir.join("/");
@@ -279,6 +311,7 @@ fn place_at(
             file_path: f.file_path.clone(),
             filename: f.filename.clone(),
             rel_dir: rel_dir.clone(),
+            kind,
             source: match f.debayer_calibrated {
                 None => PlacementSource::Copy,
                 Some(debayer) => PlacementSource::CalibrateLight {

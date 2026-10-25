@@ -906,7 +906,7 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
          JOIN files fi ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON f.id = csf.frame_id
          WHERE csf.set_id = ?1
-         ORDER BY f.date_obs ASC",
+         ORDER BY f.date_obs ASC, f.id ASC",
     )?;
 
     let frames = stmt
@@ -1351,22 +1351,34 @@ fn build_calibration_subgroups(
         frame_links.insert(frame.frame_id, links);
     }
 
-    // Group frames by subgroup key (combination of calibration set IDs)
-    let mut subgroup_map: HashMap<String, Vec<&ExportFrame>> = HashMap::new();
+    // Group frames by subgroup key (combination of calibration set IDs), in
+    // the order each key is first met. `frames` arrives in capture order
+    // (`get_light_frames_for_frame_set`), so subgroup 1 is the one whose
+    // first light was shot first. The order is load-bearing, not cosmetic:
+    // the organizer places a calibration set shared by two subgroups under
+    // the FIRST one only, so a hash-ordered walk moved those files between
+    // branches — and the folder preview's camera and FLAT folders — from one
+    // load to the next.
+    let mut subgroup_order: Vec<(String, Vec<&ExportFrame>)> = Vec::new();
+    let mut subgroup_index_by_key: HashMap<String, usize> = HashMap::new();
     for frame in frames {
         if let Some(links) = frame_links.get(&frame.frame_id) {
             let key = links.subgroup_key();
-            subgroup_map.entry(key).or_default().push(*frame);
+            let idx = *subgroup_index_by_key.entry(key.clone()).or_insert_with(|| {
+                subgroup_order.push((key, Vec::new()));
+                subgroup_order.len() - 1
+            });
+            subgroup_order[idx].1.push(*frame);
         }
     }
 
-    let subgroup_count = subgroup_map.len();
+    let subgroup_count = subgroup_order.len();
     tracing::debug!(count = subgroup_count, "calibration subgroups found");
 
     let mut subgroups = Vec::new();
     let mut subgroup_index = 1;
 
-    for (subgroup_key, subgroup_frames) in subgroup_map {
+    for (subgroup_key, subgroup_frames) in subgroup_order {
         // Get the calibration links from the first frame (all frames in subgroup share the same links)
         let first_frame = subgroup_frames.first().unwrap();
         let links = frame_links.get(&first_frame.frame_id).unwrap();
@@ -1421,9 +1433,6 @@ fn build_calibration_subgroups(
 
         subgroup_index += 1;
     }
-
-    // Sort subgroups by display name
-    subgroups.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
     Ok(subgroups)
 }
@@ -2097,250 +2106,77 @@ fn build_calibration_chain_string(subgroup: Option<&CalibrationSubgroup>) -> Str
 
 /// Build folder preview structure matching the new WBPP hierarchy
 ///
-/// The preview mirrors the actual export: BIAS → DARKS → FLAT → lights nesting,
-/// with missing calibration levels collapsed.
+/// The preview mirrors the actual export by construction: BIAS → DARKS → FLAT →
+/// lights nesting, with missing calibration levels collapsed.
 fn build_folder_preview(export_data: &ExportData, _config: &WbppExportConfig) -> Result<FolderPreview> {
-    use crate::export::models::{sanitize_display_folder_name, sanitize_folder_name};
+    use crate::export::file_organizer::{compute_wbpp_placements, PlacementKind};
+    use crate::export::models::sanitize_display_folder_name;
 
-    let root_name = sanitize_display_folder_name(&export_data.frame_set_name);
+    // The preview IS the placement list the export copies from
+    // (`compute_wbpp_placements`), folded into a tree — so every file shows
+    // in the one folder it really lands in, a folder's "← N …" counts what it
+    // lists, and the order is the walk's own (groups by name, subgroups by
+    // first capture). It used to rebuild the hierarchy by hand from a
+    // hash-ordered camera map: cameras and FLAT folders reordered per load,
+    // a second subgroup's files were dropped on merge, and DARKS_1679 said
+    // "← 80 darks" over 80 darks and a flat's own 30 (2026-10-25).
+    #[derive(Default)]
+    struct Dir {
+        /// Files directly in this folder, by role, in first-placed order.
+        files: Vec<(PlacementKind, Vec<String>)>,
+        /// Sub-folders in first-placed order.
+        subdirs: Vec<(String, Dir)>,
+    }
 
-    let mut root_children: Vec<FolderNode> = Vec::new();
-    let mut total_files = 0;
-
-    // Group by camera
-    let mut cameras_map: HashMap<String, Vec<(&ExportGroup, &CalibrationSubgroup)>> = HashMap::new();
-    for group in &export_data.groups {
-        for subgroup in &group.subgroups {
-            let camera_name = subgroup
-                .frames
-                .first()
-                .and_then(|f| f.instrume.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            cameras_map.entry(camera_name).or_default().push((group, subgroup));
+    fn into_node(name: String, dir: Dir) -> FolderNode {
+        let mut children = Vec::new();
+        let mut parts = Vec::new();
+        let mut direct = 0usize;
+        for (kind, names) in dir.files {
+            let n = names.len();
+            direct += n;
+            parts.push(format!("{} {}", n, kind.noun(n)));
+            if let Some(first) = names.first() {
+                children.push(make_file_node(first));
+            }
+            if n > 1 {
+                children.push(make_ellipsis_node(kind.noun(1), n as i32));
+            }
+        }
+        children.extend(dir.subdirs.into_iter().map(|(n, d)| into_node(n, d)));
+        FolderNode {
+            name,
+            node_type: FolderNodeType::Folder,
+            file_count: (direct > 0).then_some(direct as i32),
+            description: (!parts.is_empty()).then(|| format!("← {}", parts.join(", "))),
+            children,
         }
     }
 
-    for (camera, group_subgroups) in &cameras_map {
-        let camera_folder_name = format!("camera_{}", sanitize_folder_name(camera));
-
-        // Track organized set IDs to avoid counting duplicates across subgroups
-        let mut counted_sets: HashSet<i64> = HashSet::new();
-
-        // Build the camera's children by processing each subgroup
-        // Each subgroup creates its own nested hierarchy path
-        let mut camera_children: Vec<FolderNode> = Vec::new();
-
-        for (_group, subgroup) in group_subgroups {
-            // Resolve calibration sets (same logic as file_organizer)
-            let bias: Option<&CalibrationSetInfo> = subgroup
-                .bias
-                .as_ref()
-                .or_else(|| subgroup.dark.as_ref().and_then(|d| d.bias.as_deref()));
-            let dark: Option<&CalibrationSetInfo> = subgroup.dark.as_ref();
-            let flat: Option<&CalibrationSetInfo> = subgroup.flat.as_ref();
-            let dark_flat: Option<&CalibrationSetInfo> =
-                flat.and_then(|f| f.dark_flat.as_deref());
-            let flat_dark: Option<&CalibrationSetInfo> =
-                flat.and_then(|f| f.dark.as_deref());
-            let flat_bias: Option<&CalibrationSetInfo> =
-                flat.and_then(|f| f.bias.as_deref());
-
-            // Build nested tree from outermost to innermost
-            // We construct the tree bottom-up, then attach it to camera_children
-
-            // Lights node (innermost)
-            let lights_count = subgroup.frames.len() as i32;
-            let example_light = subgroup
-                .frames
-                .first()
-                .map(|f| f.filename.clone())
-                .unwrap_or_else(|| "light_001.fits".to_string());
-            let mut lights_children = vec![make_file_node(&example_light)];
-            if lights_count > 1 {
-                lights_children.push(make_ellipsis_node("light", lights_count));
-            }
-            total_files += lights_count;
-
-            let lights_node = FolderNode {
-                name: "lights".to_string(),
-                node_type: FolderNodeType::Folder,
-                file_count: Some(lights_count),
-                description: Some(format!("← {} lights", lights_count)),
-                children: lights_children,
+    let placements = compute_wbpp_placements(export_data);
+    let mut root = Dir::default();
+    for p in &placements {
+        let mut dir = &mut root;
+        for segment in p.rel_dir.split('/').filter(|s| !s.is_empty()) {
+            let idx = match dir.subdirs.iter().position(|(n, _)| n == segment) {
+                Some(i) => i,
+                None => {
+                    dir.subdirs.push((segment.to_string(), Dir::default()));
+                    dir.subdirs.len() - 1
+                }
             };
-
-            // Current innermost content starts with lights
-            let mut innermost_content = vec![lights_node];
-
-            // FLAT level
-            if let Some(flat_info) = flat {
-                let flat_folder = format!("FLAT_{}", flat_info.set_id);
-                let mut flat_children: Vec<FolderNode> = Vec::new();
-
-                if counted_sets.insert(flat_info.set_id) {
-                    let fc = flat_info.frame_count;
-                    if fc > 0 {
-                        let example = flat_info.frames.first().map(|f| f.filename.clone())
-                            .unwrap_or_else(|| "flat_001.fits".to_string());
-                        flat_children.push(make_file_node(&example));
-                        if fc > 1 {
-                            flat_children.push(make_ellipsis_node("flat", fc));
-                        }
-                        total_files += fc;
-                    }
-                }
-
-                flat_children.extend(innermost_content);
-
-                innermost_content = vec![FolderNode {
-                    name: flat_folder,
-                    node_type: FolderNodeType::Folder,
-                    file_count: None,
-                    description: Some(format!("← {} flats", flat_info.frame_count)),
-                    children: flat_children,
-                }];
-            }
-
-            // DARKS level
-            let has_darks = dark.is_some() || dark_flat.is_some() || flat_dark.is_some();
-            if has_darks {
-                let darks_set_id = dark
-                    .map(|d| d.set_id)
-                    .or_else(|| flat_dark.map(|d| d.set_id))
-                    .or_else(|| dark_flat.map(|df| df.set_id))
-                    .unwrap_or(0);
-                let darks_folder = format!("DARKS_{}", darks_set_id);
-                let mut darks_children: Vec<FolderNode> = Vec::new();
-
-                // Dark frames
-                if let Some(dark_info) = dark {
-                    if counted_sets.insert(dark_info.set_id) {
-                        let dc = dark_info.frame_count;
-                        if dc > 0 {
-                            let example = dark_info.frames.first().map(|f| f.filename.clone())
-                                .unwrap_or_else(|| "dark_001.fits".to_string());
-                            darks_children.push(make_file_node(&example));
-                            if dc > 1 {
-                                darks_children.push(make_ellipsis_node("dark", dc));
-                            }
-                            total_files += dc;
-                        }
-                    }
-                }
-
-                // Flat's own dark
-                if let Some(fd) = flat_dark {
-                    if counted_sets.insert(fd.set_id) {
-                        let fdc = fd.frame_count;
-                        if fdc > 0 {
-                            let example = fd.frames.first().map(|f| f.filename.clone())
-                                .unwrap_or_else(|| "dark_001.fits".to_string());
-                            darks_children.push(make_file_node(&example));
-                            if fdc > 1 {
-                                darks_children.push(make_ellipsis_node("dark", fdc));
-                            }
-                            total_files += fdc;
-                        }
-                    }
-                }
-
-                // Darkflat frames
-                if let Some(df_info) = dark_flat {
-                    if counted_sets.insert(df_info.set_id) {
-                        let dfc = df_info.frame_count;
-                        if dfc > 0 {
-                            let example = df_info.frames.first().map(|f| f.filename.clone())
-                                .unwrap_or_else(|| "darkflat_001.fits".to_string());
-                            darks_children.push(make_file_node(&example));
-                            if dfc > 1 {
-                                darks_children.push(make_ellipsis_node("darkflat", dfc));
-                            }
-                            total_files += dfc;
-                        }
-                    }
-                }
-
-                darks_children.extend(innermost_content);
-
-                let mut darks_desc_parts = Vec::new();
-                if let Some(d) = dark { darks_desc_parts.push(format!("{} darks", d.frame_count)); }
-                if let Some(df) = dark_flat { darks_desc_parts.push(format!("{} darkflats", df.frame_count)); }
-
-                innermost_content = vec![FolderNode {
-                    name: darks_folder,
-                    node_type: FolderNodeType::Folder,
-                    file_count: None,
-                    description: Some(format!("← {}", darks_desc_parts.join(", "))),
-                    children: darks_children,
-                }];
-            }
-
-            // BIAS level
-            let effective_bias = bias.or(flat_bias);
-            if let Some(bias_info) = effective_bias {
-                let bias_folder = format!("BIAS_{}", bias_info.set_id);
-                let mut bias_children: Vec<FolderNode> = Vec::new();
-
-                if counted_sets.insert(bias_info.set_id) {
-                    let bc = bias_info.frame_count;
-                    if bc > 0 {
-                        let example = bias_info.frames.first().map(|f| f.filename.clone())
-                            .unwrap_or_else(|| "bias_001.fits".to_string());
-                        bias_children.push(make_file_node(&example));
-                        if bc > 1 {
-                            bias_children.push(make_ellipsis_node("bias", bc));
-                        }
-                        total_files += bc;
-                    }
-                }
-
-                // Also count flat's own bias if different
-                if let (Some(fb), Some(b)) = (flat_bias, bias) {
-                    if fb.set_id != b.set_id && counted_sets.insert(fb.set_id) {
-                        let fbc = fb.frame_count;
-                        if fbc > 0 {
-                            total_files += fbc;
-                        }
-                    }
-                }
-
-                bias_children.extend(innermost_content);
-
-                innermost_content = vec![FolderNode {
-                    name: bias_folder,
-                    node_type: FolderNodeType::Folder,
-                    file_count: None,
-                    description: Some(format!("← {} bias", bias_info.frame_count)),
-                    children: bias_children,
-                }];
-            }
-
-            // Add the built hierarchy to camera children
-            // Check if we already have a node with the same name to merge subgroups
-            // that share the same calibration path into one tree
-            for node in innermost_content {
-                if let Some(existing) = camera_children.iter_mut().find(|n| n.name == node.name) {
-                    // Merge children into existing node
-                    merge_folder_children(existing, node);
-                } else {
-                    camera_children.push(node);
-                }
-            }
+            dir = &mut dir.subdirs[idx].1;
         }
-
-        root_children.push(FolderNode {
-            name: camera_folder_name,
-            node_type: FolderNodeType::Folder,
-            file_count: None,
-            description: None,
-            children: camera_children,
-        });
+        match dir.files.iter_mut().find(|(k, _)| *k == p.kind) {
+            Some((_, names)) => names.push(p.filename.clone()),
+            None => dir.files.push((p.kind, vec![p.filename.clone()])),
+        }
     }
 
     Ok(FolderPreview {
-        root_name,
-        structure: root_children,
-        total_files,
+        root_name: sanitize_display_folder_name(&export_data.frame_set_name),
+        structure: root.subdirs.into_iter().map(|(n, d)| into_node(n, d)).collect(),
+        total_files: placements.len() as i32,
         estimated_size: format_bytes_human(0), // Will be calculated separately
     })
 }
@@ -2364,21 +2200,6 @@ fn make_ellipsis_node(frame_type: &str, total_count: i32) -> FolderNode {
         file_count: Some(total_count),
         description: None,
         children: vec![],
-    }
-}
-
-/// Merge children from source node into target node (for combining subgroups)
-fn merge_folder_children(target: &mut FolderNode, source: FolderNode) {
-    for child in source.children {
-        if child.node_type == FolderNodeType::Folder {
-            // Try to merge with existing folder of same name
-            if let Some(existing) = target.children.iter_mut().find(|n| n.name == child.name && n.node_type == FolderNodeType::Folder) {
-                merge_folder_children(existing, child);
-            } else {
-                target.children.push(child);
-            }
-        }
-        // Skip file/ellipsis nodes during merge to avoid duplicates
     }
 }
 
@@ -3647,5 +3468,98 @@ mod export_mode_tests {
             "the blackholed light does not stretch the span"
         );
         assert_eq!(summary.cameras, vec!["TestCam".to_string()]);
+    }
+
+    /// The folder preview is the export's own placement list folded into a
+    /// tree: each folder's "← N …" counts exactly the files it lists, a
+    /// flat's own dark is named apart from the lights' darks, a second
+    /// subgroup's flat dark is not dropped, and two loads give the same tree
+    /// — subgroups follow capture order, not a hash. (DARKS_1679 read "← 80
+    /// darks" over 80 darks and 30 flat darks, and cameras / FLAT folders
+    /// reordered per load, 2026-10-25.)
+    #[test]
+    fn folder_preview_is_the_placements_in_capture_order() {
+        use crate::export::file_organizer::compute_wbpp_placements;
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        for f in [10, 11, 12] {
+            seed_light(&conn, f, session, Some("Ha"));
+        }
+        // Light 12 was shot first, so its subgroup (flat 210) is placed first.
+        conn.execute("UPDATE frames SET date_obs = '2026-07-05T20:00:00Z' WHERE id = 12", [])
+            .unwrap();
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        let flat_a = seed_raw_set(&conn, 200, "Flat", 2);
+        let flat_b = seed_raw_set(&conn, 210, "Flat", 2);
+        let flat_dark_a = seed_raw_set(&conn, 300, "Dark", 3);
+        let flat_dark_b = seed_raw_set(&conn, 310, "Dark", 4);
+        for f in [10, 11, 12] {
+            add_link(&conn, f, dark, "Dark");
+        }
+        add_link(&conn, 10, flat_a, "Flat");
+        add_link(&conn, 11, flat_a, "Flat");
+        add_link(&conn, 12, flat_b, "Flat");
+        for (flat, flat_dark) in [(flat_a, flat_dark_a), (flat_b, flat_dark_b)] {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type)
+                 VALUES (?1, 'calibration_set', ?2, 'Dark')",
+                params![flat, flat_dark],
+            )
+            .unwrap();
+        }
+
+        let cfg = WbppExportConfig::default();
+        let summary = || {
+            collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithCalibrationSets, None)
+                .unwrap()
+                .folder_preview
+        };
+        let preview = summary();
+        assert_eq!(
+            serde_json::to_value(&preview).unwrap(),
+            serde_json::to_value(summary()).unwrap(),
+            "two loads, one tree"
+        );
+
+        let camera = &preview.structure[0];
+        let darks = &camera.children.iter().find(|n| n.name == "DARKS_100").unwrap();
+        assert_eq!(
+            darks.description.as_deref(),
+            Some("← 2 darks, 7 flat darks"),
+            "the label counts what the folder lists"
+        );
+        let flats: Vec<&str> = darks
+            .children
+            .iter()
+            .filter(|n| n.node_type == FolderNodeType::Folder)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(flats, vec!["FLAT_210", "FLAT_200"], "capture order");
+
+        // Every folder's count equals the placements at its path.
+        let data = {
+            let mut d = collect_export_data(&conn, 1).unwrap();
+            apply_export_mode(&conn, &mut d, ExportMode::RawWithCalibrationSets, None).unwrap();
+            d
+        };
+        let mut per_dir: HashMap<String, i32> = HashMap::new();
+        for p in compute_wbpp_placements(&data) {
+            *per_dir.entry(p.rel_dir).or_default() += 1;
+        }
+        fn walk(nodes: &[FolderNode], prefix: &str, out: &mut HashMap<String, i32>) {
+            for n in nodes.iter().filter(|n| n.node_type == FolderNodeType::Folder) {
+                let path =
+                    if prefix.is_empty() { n.name.clone() } else { format!("{prefix}/{}", n.name) };
+                if let Some(c) = n.file_count {
+                    out.insert(path.clone(), c);
+                }
+                walk(&n.children, &path, out);
+            }
+        }
+        let mut shown = HashMap::new();
+        walk(&preview.structure, "", &mut shown);
+        assert_eq!(shown, per_dir);
+        assert_eq!(preview.total_files, 3 + 2 + 2 + 2 + 3 + 4);
     }
 }

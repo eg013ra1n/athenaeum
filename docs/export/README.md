@@ -73,9 +73,17 @@ OSC and Mono frames land in different `ExportGroup`s (different `group_key`,
 
 ## Folder structure it produces
 
-`organize_files_wbpp` and `build_folder_preview` (used for the UI's folder-tree
-preview) both build the same shape — verified they use identical set-ID-keyed
-logic (`file_organizer.rs` vs. `data_collector.rs`):
+`organize_files_wbpp` places what `compute_wbpp_placements` (`file_organizer.rs`)
+returns, and `build_folder_preview` (`data_collector.rs`, the UI's folder tree) is
+that same placement list folded into a tree — the same shape by construction.
+Each placement carries a `PlacementKind` (light, flat, dark, flat dark, darkflat,
+bias), so a folder's `← N …` label counts exactly the files it lists ("← 80 darks,
+30 flat darks"); a folder whose set was already placed under an earlier branch
+lists nothing and has no label. Subgroups are walked in capture order (the first
+light of each), groups by name, so the tree and the export are identical on every
+load. (2026-10-25: the preview was rebuilt by hand from a hash-ordered camera
+map — folders reordered per load, a merged subgroup's files were dropped, and
+DARKS_1679 read "← 80 darks" over 80 darks and 30 flat darks.)
 
 ```
 <output_dir>/
@@ -103,8 +111,9 @@ levels entirely — calibration is already applied, not linked, so only `lights/
 - A flat's *own* dark/darkflat/bias (`flat.dark`, `flat.dark_flat`, `flat.bias` on
   `CalibrationSetInfo`) are folded into the same `BIAS_*`/`DARKS_*` folders as the
   light's own bias/dark, deduplicated by set ID via a shared `HashSet<i64>`
-  (`organized_set_ids` in `file_organizer.rs`, `counted_sets` in `data_collector.rs`)
-  so a calibration set already placed once isn't copied twice.
+  (`organized_set_ids` in `file_organizer.rs`) so a calibration set already
+  placed once isn't copied twice — under the FIRST subgroup that names it, which
+  is why the walk order is fixed.
 - `copy_or_link` skips a file if the destination path already exists
   (`file_organizer.rs`) — re-running an export into the same output
   directory does not overwrite or duplicate files already placed there.
