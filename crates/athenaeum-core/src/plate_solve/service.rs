@@ -100,7 +100,7 @@ pub fn solve_frame_tiered(
         Some(b) => solvemyastro::Caches::tiered(cache, b),
         None => solvemyastro::Caches::deep_only(cache),
     };
-    solve_frame_with_hints(frame, file_path, &hints, &caches, config, None)
+    solve_frame_with_hints(frame, file_path, &hints, &caches, &[], config, None)
 }
 
 /// Layered variant of [`solve_frame`] — solves against an additive density-tier
@@ -115,7 +115,7 @@ pub fn solve_frame_layered(
 ) -> Result<SolveResult> {
     let hints = extract_hints(frame, Some(conn));
     let caches = solvemyastro::Caches::layered(layers);
-    solve_frame_with_hints(frame, file_path, &hints, &caches, config, None)
+    solve_frame_with_hints(frame, file_path, &hints, &caches, &[], config, None)
 }
 
 /// Solve a single frame using pre-extracted hints and the `solvemyastro`
@@ -127,11 +127,18 @@ pub fn solve_frame_layered(
 /// additive density-tier stack, or `Caches::deep_only`/`tiered` for the legacy
 /// deep(+bright) path. The caller builds it (the tier stack is opened via
 /// [`crate::plate_solve::discover_layers`]).
+///
+/// `indexes` are the installed quad-index packs
+/// ([`crate::plate_solve::open_index_packs`]). With none this is exactly the
+/// spiral search; with packs, a frame lacking a position or a scale hint is
+/// looked up in the index first (`solvemyastro::solve_with_index`). Fully
+/// hinted frames never use it.
 pub fn solve_frame_with_hints(
     frame: &Frame,
     file_path: &str,
     hints: &SolveHints,
     caches: &solvemyastro::Caches<'_>,
+    indexes: &[&solvemyastro::QuadIndex],
     config: &PlateSolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveResult> {
@@ -169,10 +176,11 @@ pub fn solve_frame_with_hints(
     // Propagate the solver error verbatim (no lossy context wrapper) so the
     // structured `solvemyastro::SolveFailure` stays at the top of the chain
     // and `plate_solve::failure::describe_solve_failure` can downcast it.
-    let solution = solvemyastro::solve(
+    let solution = solvemyastro::solve_with_index(
         std::path::Path::new(file_path),
         &sma_hints,
         caches,
+        indexes,
         &sma_cfg,
         cancel,
     )?;

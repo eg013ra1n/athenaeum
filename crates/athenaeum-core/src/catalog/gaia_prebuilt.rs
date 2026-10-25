@@ -59,22 +59,7 @@ pub fn load_or_fetch_manifest(app_data: &Path) -> Result<Manifest> {
         }
     }
     let url = format!("{}manifest.json", catalog_base_url());
-    // The manifest is tiny; use short timeouts so status checks fail fast when the
-    // catalog host is unreachable (big tier downloads keep `http_client()`).
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .user_agent("athenaeum-catalog-ingest (astrophotography catalog builder)")
-        .build()
-        .context("build manifest HTTP client")?;
-    let bytes = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("fetch manifest {url}"))?
-        .error_for_status()
-        .with_context(|| format!("manifest HTTP error {url}"))?
-        .bytes()
-        .context("read manifest body")?;
+    let bytes = fetch_small(&url, "manifest")?;
     let manifest = Manifest::from_json_slice(&bytes)
         .with_context(|| format!("parse manifest from {url}"))?;
     if let Some(parent) = cache.parent() {
@@ -82,6 +67,27 @@ pub fn load_or_fetch_manifest(app_data: &Path) -> Result<Manifest> {
     }
     let _ = std::fs::write(&cache, &bytes); // best-effort cache
     Ok(manifest)
+}
+
+/// GET a small file (a manifest) with short timeouts, so status checks fail
+/// fast when the catalog host is unreachable (big downloads keep
+/// `http_client()`). `what` names the file in error messages.
+pub(crate) fn fetch_small(url: &str, what: &str) -> Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .user_agent("athenaeum-catalog-ingest (astrophotography catalog builder)")
+        .build()
+        .with_context(|| format!("build {what} HTTP client"))?;
+    let bytes = client
+        .get(url)
+        .send()
+        .with_context(|| format!("fetch {what} {url}"))?
+        .error_for_status()
+        .with_context(|| format!("{what} HTTP error {url}"))?
+        .bytes()
+        .with_context(|| format!("read {what} body"))?;
+    Ok(bytes.to_vec())
 }
 
 /// Progress for the prebuilt path.
@@ -165,14 +171,7 @@ pub fn download_catalog_layers(
         let zip_path = app_data.join(&tier.zip);
         let part_path = app_data.join(format!("{}.part", tier.zip));
 
-        let expected_sha: Option<String> = client
-            .get(&sha_url)
-            .send()
-            .ok()
-            .filter(|r| r.status().is_success())
-            .and_then(|r| r.text().ok())
-            .map(|s| s.split_whitespace().next().unwrap_or("").to_lowercase())
-            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        let expected_sha = fetch_expected_sha(&client, &sha_url);
         if expected_sha.is_none() {
             tracing::warn!(sha_url, "no .sha256 sidecar, skipping integrity check");
         }
@@ -204,11 +203,24 @@ pub fn download_catalog_layers(
 /// `app_data` — no directory-traversal characters (`/`, `\`, `..`, `:`).
 /// Applied to server-supplied manifest `zip`, `sha256`, and `dir` fields before
 /// touching the filesystem or making network requests.
-fn is_safe_filename(s: &str) -> bool {
+pub(crate) fn is_safe_filename(s: &str) -> bool {
     !s.contains('/') && !s.contains('\\') && !s.contains("..") && !s.contains(':')
 }
 
-fn http_client() -> Result<reqwest::blocking::Client> {
+/// Fetch a `<hex>  <name>` SHA-256 sidecar and return the lowercase digest, or
+/// `None` when it is absent or malformed (the caller then skips the check).
+pub(crate) fn fetch_expected_sha(client: &reqwest::blocking::Client, sha_url: &str) -> Option<String> {
+    client
+        .get(sha_url)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.text().ok())
+        .map(|s| s.split_whitespace().next().unwrap_or("").to_lowercase())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(1800))
         .connect_timeout(Duration::from_secs(30))
@@ -231,7 +243,7 @@ fn smac_present(dir: &Path) -> bool {
 
 /// Stream the archive to `part_path`, resuming via HTTP Range if a partial
 /// file is already present.
-fn download_resumable(
+pub(crate) fn download_resumable(
     client: &reqwest::blocking::Client,
     url: &str,
     part_path: &Path,
@@ -299,7 +311,7 @@ fn download_resumable(
     Ok(())
 }
 
-fn sha256_file(path: &Path, cancel: &Arc<AtomicBool>) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path, cancel: &Arc<AtomicBool>) -> Result<String> {
     let mut f = BufReader::new(File::open(path).context("open archive for checksum")?);
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
@@ -327,8 +339,22 @@ fn extract_tier_zip(
     cancel: &Arc<AtomicBool>,
     progress: &dyn Fn(GaiaPrebuiltProgress),
 ) -> Result<()> {
-    let file = File::open(zip_path).context("open tier archive")?;
-    let mut zip = zip::ZipArchive::new(BufReader::new(file)).context("read tier zip")?;
+    extract_zip_file(zip_path, dest_root, "stars.smac", cancel, progress)
+}
+
+/// Extract every `<dir>/<file_name>` entry of `zip_path` into
+/// `dest_root/<dir>/<file_name>`, preserving the `<dir>/` prefix. Entries
+/// with any other file name, or no directory prefix, are skipped.
+/// Zip-slip-safe: rejects `..`, absolute, or drive-prefixed components.
+pub(crate) fn extract_zip_file(
+    zip_path: &Path,
+    dest_root: &Path,
+    file_name: &str,
+    cancel: &Arc<AtomicBool>,
+    progress: &dyn Fn(GaiaPrebuiltProgress),
+) -> Result<()> {
+    let file = File::open(zip_path).context("open archive")?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file)).context("read zip")?;
     let total = zip.len();
     let mut done = 0usize;
     for i in 0..total {
@@ -344,21 +370,21 @@ fn extract_tier_zip(
         if comps.is_empty()
             || comps.iter().any(|c| *c == ".." || c.contains(':'))
             || raw.starts_with('/')
-            || comps.last() != Some(&"stars.smac")
+            || comps.last() != Some(&file_name)
             || comps.len() < 2
         {
             continue;
         }
-        // dest_root / tier_<d> / stars.smac  (join only the safe components)
+        // dest_root / <dir> / <file_name>  (join only the safe components)
         let mut dest = dest_root.to_path_buf();
         for c in &comps {
             dest.push(c);
         }
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).context("create tier dir")?;
+            std::fs::create_dir_all(parent).context("create extraction dir")?;
         }
-        let mut out = File::create(&dest).context("create stars.smac")?;
-        std::io::copy(&mut entry, &mut out).context("extract stars.smac")?;
+        let mut out = File::create(&dest).with_context(|| format!("create {file_name}"))?;
+        std::io::copy(&mut entry, &mut out).with_context(|| format!("extract {file_name}"))?;
         done += 1;
         progress(GaiaPrebuiltProgress::Extracting { done, total });
     }
@@ -433,14 +459,16 @@ pub fn tier_status(app_data: &Path) -> Vec<TierStatus> {
     }
 }
 
+/// Serializes tests that mutate the process-global `ATHENAEUM_CATALOG_BASE_URL`,
+/// which would otherwise race under cargo's parallel test threads (shared with
+/// `index_prebuilt`'s tests). Ignore poisoning from an unrelated panicking
+/// test — we only need exclusion.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes tests that mutate the process-global `ATHENAEUM_CATALOG_BASE_URL`,
-    /// which would otherwise race under cargo's parallel test threads. Ignore
-    /// poisoning from an unrelated panicking test — we only need exclusion.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn base_url_default_and_override() {
@@ -510,6 +538,43 @@ mod tests {
         extract_tier_zip(&zip_path, &dest, &Arc::new(AtomicBool::new(false)), &|_| {}).unwrap();
         assert_eq!(std::fs::read(dest.join("tier_500").join("stars.smac")).unwrap(), b"SMACDATA");
         assert!(!tmp.path().join("evil.smac").exists(), "zip-slip entry must be rejected");
+    }
+
+    #[test]
+    fn extract_zip_file_takes_the_named_file_and_is_zipslip_safe() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("index_base.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let o = SimpleFileOptions::default();
+            zw.start_file("base/quads.smaq", o).unwrap();
+            zw.write_all(b"QUADS").unwrap();
+            zw.start_file("base/stars.smac", o).unwrap(); // other file name: skipped
+            zw.write_all(b"STARS").unwrap();
+            zw.start_file("quads.smaq", o).unwrap(); // no directory prefix: skipped
+            zw.write_all(b"BARE").unwrap();
+            zw.start_file("../evil/quads.smaq", o).unwrap(); // zip-slip attempt
+            zw.write_all(b"nope").unwrap();
+            zw.start_file("/abs/quads.smaq", o).unwrap(); // absolute: rejected
+            zw.write_all(b"nope").unwrap();
+            zw.finish().unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let dest = tmp.path().join("smac_index");
+        extract_zip_file(&zip_path, &dest, "quads.smaq", &cancel, &|_| {}).unwrap();
+        assert_eq!(std::fs::read(dest.join("base").join("quads.smaq")).unwrap(), b"QUADS");
+        assert!(!dest.join("base").join("stars.smac").exists());
+        assert!(!dest.join("quads.smaq").exists());
+        assert!(!tmp.path().join("evil").exists(), "zip-slip entry must be rejected");
+        assert!(!dest.join("abs").exists(), "absolute entry must be rejected");
+        // The same archive read as a tier archive yields only the stars file.
+        let tier_dest = tmp.path().join("tiers");
+        extract_tier_zip(&zip_path, &tier_dest, &cancel, &|_| {}).unwrap();
+        assert_eq!(std::fs::read(tier_dest.join("base").join("stars.smac")).unwrap(), b"STARS");
+        assert!(!tier_dest.join("base").join("quads.smaq").exists());
     }
 
     #[test]

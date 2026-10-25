@@ -17,13 +17,15 @@ The solver is `solvemyastro`, a git submodule (`solvemyastro/` at the repo root,
  plate_solve_batch(frame_ids)                        (Tauri command / Axum route)
    |
    |- load config (plate_solve.config), open the tier stack once
-   |  (plate_solve::open_catalog_layers)
+   |  (plate_solve::open_catalog_layers) and the quad-index packs
+   |  (plate_solve::open_index_packs)
    |- per frame, on the calling thread:
    |     input gate  (service::input_gate_reason, from the stored analysis)
    |     hints       (hints::extract_hints + apply_object_name_fallback)
    |- worker pool (batch_concurrency), per frame:
    |     service::solve_frame_with_hints
-   |       -> solvemyastro::solve(file, hints, Caches::layered, SolveConfig)
+   |       -> solvemyastro::solve_with_index(file, hints, Caches::layered,
+   |                                         quad-index packs, SolveConfig)
    |            star detection, streak cut, autoFOV ladder, quad match,
    |            affine seed, verification, refit, SIP fit
    |       -> SolveResult (WCS + SIP, inliers, rms, scale, derived focal length)
@@ -48,6 +50,36 @@ The `solver` cargo feature of `athenaeum-core` (on by default) pulls in `solvemy
 - `catalog_identity(app_data_dir)` is a stat-only fingerprint (tier directory name, `stars.smac` size and mtime) used in the hash of a cached stacking solve.
 
 Inside `solvemyastro` (`Caches::Layered`), quad matching uses the base layer with fallback to the full union, and verification uses the full union. The Settings tab shows one row per tier from the published manifest, recommends a tier from the narrowest field of view among the library's light frames (`get_frame_fov_summary`, `plate_solve::frame_fov_summary`) and downloads the chosen tier plus every lower one not yet installed (`download_catalog_layers`). The design is in `docs/superpowers/specs/2026-06-29-tiered-additive-star-catalog-design.md` and `docs/superpowers/plans/2026-06-30-layered-solver.md`.
+
+### Quad index packs
+
+A **quad index pack** is a precomputed table of catalog quads (`quads.smaq`, format version 3, built by `solvemyastro` from the density tiers; spec in `solvemyastro/QUAD_INDEX.md`). It makes blind and scale-free solves fast: an image quad is looked up directly, one match gives a full WCS hypothesis, and the search costs the same anywhere on the sky (a 3 degree M42 frame solved blind: 11 s without, 1.6 s with both packs). Two packs are published:
+
+| Pack | Fields served | Size (zip) | Needs on the build side |
+| ---- | ---- | ---- | ---- |
+| `base` | about 1.1 to 54 degrees (35 mm lenses to about 1000 mm on APS-C) | about 147 MB | `tier_500` |
+| `narrow` | about 0.55 to 1.1 degrees (to about 2000 mm on APS-C) | about 236 MB | `tier_500` + `tier_2000` |
+
+Packs are optional. With none installed the solver behaves exactly as before.
+
+**Layout.** Same server directory as the tiers (base URL `catalog_base_url()`, default `https://artfrom.space/catalogs/`, override `ATHENAEUM_CATALOG_BASE_URL`): `index_manifest.json`, `index_base.zip` + `index_base.zip.sha256`, `index_narrow.zip` + `index_narrow.zip.sha256`; each zip holds `<dir>/quads.smaq` (for example `base/quads.smaq`). Locally: `<app-data>/catalogs/smac_index/<dir>/quads.smaq`, with the manifest cached as `<app-data>/catalogs/smac_index/manifest.json` (same cache and short-timeout fetch policy as the tier manifest). The manifest model is `catalog::manifest::IndexManifest { version, format, catalog_epoch, packs: [IndexManifestPack { name, zip, sha256, dir, size_bytes, min_fov_deg }] }`; `format` must equal `solvemyastro::index::FORMAT_VERSION`, otherwise the pack is shown as incompatible and a download is refused with "update Athenaeum".
+
+**Code.** `catalog/index_prebuilt.rs` mirrors `gaia_prebuilt.rs` and shares its helpers (resumable Range download, SHA-256 sidecar, `extract_zip_file` with its zip-slip checks, `is_safe_filename`): `index_status` merges the manifest with what the solver can open (without a manifest it lists the installed directories), and `download_index_packs(app_data, names, ..)` does download, verify, extract, then confirms `QuadIndex::open` succeeds (a pack that does not open is deleted and the download fails). `plate_solve::layers` has `index_root`, `discover_index_packs` (directories holding `quads.smaq`, by name), `open_index_packs` (a pack that fails to open is logged at `warn` and skipped, so it never fails a solve) and `index_identity` (stat only: `name:size:mtime` per pack, comma-joined, empty with none). The hosts open the packs once per batch, next to the catalog layers, and pass them to `service::solve_frame_with_hints`, which calls `solvemyastro::solve_with_index`; the stacking `CatalogSolver` does the same lazily on its first solve. The legacy `solve_frame` and `solve_frame_layered` helpers pass no packs.
+
+**When the index is used** (decided inside `solve_with_index`, from the hints):
+
+| Hints | Index used? |
+| ---- | ---- |
+| position and scale | no, the spiral exactly as before |
+| position only | yes, matches far from the hint are dropped |
+| scale only | yes, whole sky, scale hint divided by 5 to multiplied by 5 |
+| none | yes, whole sky, 0.1 to 120 arcsec/px |
+
+A solve found through the index logs `path = "index"` at `info` ("solve succeeded"). If the index finds nothing, the spiral runs where the index did not look. Fields narrower than about 0.5 degrees are not covered by either pack: blind they fail fast, with a position hint they solve through the spiral.
+
+**Recipe and identity.** `SOLVE_RECIPE_VERSION` is 2 (solvemyastro 0.2.0 changed verification and the search), so SOLVED stacking solves cached under recipe 1 are solved again. `stacking::solve::solver_identity` appends `|index:<index_identity>` when any pack is installed (`{config hash}:{catalog identity}|index:{identity}`); with none the form is unchanged. Installing, replacing or removing a pack therefore re-solves the stacking caches, which is intended: the same frame can now take a different path to its solution.
+
+**Publishing.** `catalog-builder publish-index --tiers <dir with tier_500 and tier_2000> --out <dir>` builds `base` (depths 2 to 7, 10 stars and 8 quads per cell) and `narrow` (depth 8, 10 stars and 4 quads per cell) and writes `<out>/publish/{index_base.zip, index_base.zip.sha256, index_narrow.zip, index_narrow.zip.sha256, index_manifest.json}` (the sidecar text is `"<hex>  <zip>\n"`, as for the tiers). `--packs-dir <dir>` skips the build and packages already-built `<dir>/base/quads.smaq` and `<dir>/narrow/quads.smaq`. Upload the files next to the tier files.
 
 ### Code organisation
 
@@ -642,7 +674,7 @@ The `blind_*` fields and `camera_defaults` have no controls; they live only in t
 
 ## Tauri Commands
 
-All 13 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored in `crates/athenaeum-web/src/routes/plate_solve.rs`.
+All 15 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored in `crates/athenaeum-web/src/routes/plate_solve.rs`.
 
 | Command | Purpose |
 | ---- | ---- |
@@ -657,6 +689,8 @@ All 13 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored 
 | `get_catalog_status()` | One entry per catalog tier, merged with the on-disk install state |
 | `get_frame_fov_summary()` | Narrowest computable field of view among the light frames (the tier recommendation input) |
 | `download_catalog_layers(target_density)` | Download the chosen tier and every lower one not yet installed; emits `catalog-download-progress` |
+| `get_index_status()` | One entry per quad-index pack (`name`, `dir`, `installed`, `compatible`, `sizeBytes`, `minFovDeg`, `error`), merged with the on-disk state; the installed packs alone when no manifest is reachable |
+| `download_index_packs(names)` | Download and install the named packs (`base`, `narrow`) not yet installed; emits `index-download-progress` (`phase` `pack` / `downloading` / `verifying` / `extracting` / `complete` / `error`, `current`, `total`, `percent`, `packName`, `packIndex`, `nPacks`, `message` on error) |
 
 ## Debug & Diagnostic Tools
 
@@ -734,6 +768,11 @@ _History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Ga
 SIP distortion fitting and the Gaia catalog, listed here as planned while the quad-index solver was current, are implemented: the solver fits SIP and the `plate_solves` SIP columns are filled.
 
 ## Changelog
+
+### 2026-10 — Quad index packs
+
+- `solvemyastro` 0.2.0 and its precomputed quad index: optional `base` and `narrow` packs, downloaded from Settings -> Plate Solving (`get_index_status`, `download_index_packs`), used by every solve that lacks a position or a scale hint. See [Quad index packs](#quad-index-packs).
+- `SOLVE_RECIPE_VERSION` 1 -> 2; the stacking solver identity carries the installed packs.
 
 ### 2026-10 — Document brought back in line with the code
 

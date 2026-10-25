@@ -141,6 +141,87 @@ pub fn catalog_identity(app_data_dir: &Path) -> Result<String, CatalogOpenError>
     Ok(parts.join(","))
 }
 
+/// `<app-data>/catalogs/smac_index`, where the hosts install the quad-index
+/// packs (`<pack>/quads.smaq`, one directory per pack).
+pub fn index_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("catalogs").join("smac_index")
+}
+
+/// Pack directories under `root` that hold a `quads.smaq`, sorted by name.
+/// Whether the file opens is for [`open_index_packs`] to find out.
+pub fn discover_index_packs(root: &Path) -> Vec<PathBuf> {
+    let mut packs: Vec<(String, PathBuf)> = match std::fs::read_dir(root) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if e.path().join(solvemyastro::index::INDEX_FILE).is_file() {
+                    Some((name, e.path()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    packs.sort_by(|a, b| a.0.cmp(&b.0));
+    packs.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Open every installed quad-index pack under [`index_root`]. A pack that
+/// cannot be opened (a format the solver no longer reads, a damaged file) is
+/// logged and skipped: a missing pack only costs the blind-solve speed-up, so
+/// it never fails a solve. Opens fresh on each call; the mmap is cheap.
+pub fn open_index_packs(app_data_dir: &Path) -> Vec<Arc<solvemyastro::QuadIndex>> {
+    let root = index_root(app_data_dir);
+    let mut packs = Vec::new();
+    for dir in discover_index_packs(&root) {
+        match solvemyastro::QuadIndex::open(&dir) {
+            Ok(ix) => packs.push(Arc::new(ix)),
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "quad index pack unavailable, solving without it");
+            }
+        }
+    }
+    tracing::debug!(count = packs.len(), path = %root.display(), "opened quad index packs");
+    packs
+}
+
+/// The installed quad-index packs' identity, for a cached solve's hash: each
+/// pack's directory name with its `quads.smaq` size and mtime in seconds,
+/// comma-joined in name order. Stat only, no read. Empty when no pack is
+/// installed, so a hash with no packs carries nothing extra.
+pub fn index_identity(app_data_dir: &Path) -> String {
+    let mut parts = Vec::new();
+    for dir in discover_index_packs(&index_root(app_data_dir)) {
+        let file = dir.join(solvemyastro::index::INDEX_FILE);
+        let meta = match std::fs::metadata(&file) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %file.display(), error = %e, "quad index pack unreadable for its identity");
+                continue;
+            }
+        };
+        let mtime = match meta.modified().map(|t| t.duration_since(UNIX_EPOCH)) {
+            Ok(Ok(d)) => d.as_secs(),
+            Ok(Err(e)) => {
+                tracing::warn!(path = %file.display(), error = %e, "quad index pack mtime unavailable");
+                0
+            }
+            Err(e) => {
+                tracing::warn!(path = %file.display(), error = %e, "quad index pack mtime unavailable");
+                0
+            }
+        };
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        parts.push(format!("{name}:{}:{mtime}", meta.len()));
+    }
+    parts.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +320,48 @@ mod tests {
             Err(e) => panic!("expected Open, got {e:?}"),
             Ok(_) => panic!("a one-byte stars.smac must not open"),
         }
+    }
+
+    #[test]
+    fn index_packs_are_discovered_by_name_and_identified_by_stat() {
+        let app = tempfile::tempdir().unwrap();
+        let root = index_root(app.path());
+        assert_eq!(root, app.path().join("catalogs").join("smac_index"));
+        assert!(discover_index_packs(&root).is_empty());
+        assert_eq!(index_identity(app.path()), "", "no packs, no identity");
+        for (pack, bytes) in [("narrow", &b"yy"[..]), ("base", &b"x"[..])] {
+            std::fs::create_dir_all(root.join(pack)).unwrap();
+            std::fs::write(root.join(pack).join("quads.smaq"), bytes).unwrap();
+        }
+        // A dir without quads.smaq, and a stray file, are ignored.
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("manifest.json"), b"{}").unwrap();
+        let names: Vec<_> = discover_index_packs(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["base", "narrow"]);
+        let id = index_identity(app.path());
+        let parts: Vec<&str> = id.split(',').collect();
+        assert_eq!(parts.len(), 2, "{id}");
+        assert!(parts[0].starts_with("base:1:"), "{id}");
+        assert!(parts[1].starts_with("narrow:2:"), "{id}");
+        std::fs::write(root.join("base").join("quads.smaq"), b"xyz").unwrap();
+        let moved = index_identity(app.path());
+        assert_ne!(moved, id, "a replaced pack moves the identity");
+        assert!(moved.starts_with("base:3:"), "{moved}");
+    }
+
+    #[test]
+    fn open_index_packs_skips_a_pack_that_does_not_open() {
+        let app = tempfile::tempdir().unwrap();
+        assert!(open_index_packs(app.path()).is_empty());
+        let root = index_root(app.path());
+        std::fs::create_dir_all(root.join("aaa_bad")).unwrap();
+        std::fs::write(root.join("aaa_bad").join("quads.smaq"), b"not an index").unwrap();
+        crate::catalog::index_prebuilt::build_tiny_index_for_tests(&root.join("base"));
+        let packs = open_index_packs(app.path());
+        assert_eq!(packs.len(), 1, "the damaged pack is skipped, the good one opens");
+        assert!(packs[0].min_fov_deg() > 0.0);
     }
 }

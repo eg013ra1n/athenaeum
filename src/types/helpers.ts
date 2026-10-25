@@ -460,6 +460,35 @@ export interface CatalogDownloadProgress {
   nTiers: number;
 }
 
+/** One quad-index pack (`get_index_status`; camelCase on the wire). */
+export interface IndexStatusInfo {
+  name: string;
+  dir: string;
+  /** The pack's file is on disk and the solver opens it. */
+  installed: boolean;
+  /** The pack's format is one this build reads. */
+  compatible: boolean;
+  /** Archive size; null when no manifest is reachable. */
+  sizeBytes: number | null;
+  /** Smallest field of view (degrees) the pack serves. */
+  minFovDeg: number;
+  /** Why an installed file does not open, when it does not. */
+  error: string | null;
+}
+
+/** Payload of the `index-download-progress` event. */
+export interface IndexDownloadProgress {
+  phase: 'pack' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error';
+  current: number;
+  total: number;
+  percent: number;
+  packName: string;
+  packIndex: number;
+  nPacks: number;
+  /** The failure text, on phase === 'error' only. */
+  message?: string;
+}
+
 export interface AutofindProgressEvent {
   frame_id: number;
   current: number;

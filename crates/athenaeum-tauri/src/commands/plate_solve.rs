@@ -40,6 +40,20 @@ pub(super) fn resolve_layer_caches(
     })
 }
 
+/// Open the installed quad-index packs under `<app-data>/catalogs/smac_index`
+/// (empty when none are installed; a pack that does not open is skipped with a
+/// warning). Opened once per batch, like the catalog layers.
+pub(super) fn resolve_index_packs(state: &AppState) -> Vec<Arc<solvemyastro::QuadIndex>> {
+    let Some(db) = state.ctx.db.get() else {
+        return Vec::new();
+    };
+    let db_path = db.path().to_path_buf();
+    match db_path.parent() {
+        Some(parent) => athenaeum_core::plate_solve::open_index_packs(parent),
+        None => Vec::new(),
+    }
+}
+
 /// Lazy-load the DSO catalog once and cache it in the ServiceContext.
 fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
     {
@@ -131,11 +145,12 @@ pub async fn plate_solve_batch(
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
     // ── Phase 1: load everything on the main thread (holds DB lock) ──
-    let (ps_config, layer_caches, dso, cancel_flag, work_items) = {
+    let (ps_config, layer_caches, index_packs, dso, cancel_flag, work_items) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let ps_config = Arc::new(config::load_config(&conn));
         let layer_caches = resolve_layer_caches(&state)?;
+        let index_packs = resolve_index_packs(&state);
         let dso = get_dso_catalog(&state);
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
@@ -213,7 +228,7 @@ pub async fn plate_solve_batch(
             }
         }
 
-        (ps_config, layer_caches, dso, cancel_flag, work_items)
+        (ps_config, layer_caches, index_packs, dso, cancel_flag, work_items)
     };
 
     let total = work_items.len();
@@ -289,12 +304,15 @@ pub async fn plate_solve_batch(
                             let layer_refs: Vec<&solvemyastro::StarCache> =
                                 layer_caches.iter().map(|a| a.as_ref()).collect();
                             let caches = solvemyastro::Caches::layered(&layer_refs);
+                            let index_refs: Vec<&solvemyastro::QuadIndex> =
+                                index_packs.iter().map(|a| a.as_ref()).collect();
                             let solve = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 service::solve_frame_with_hints(
                                     &frame,
                                     &file_path,
                                     &hints,
                                     &caches,
+                                    &index_refs,
                                     ps_config_arc.as_ref(),
                                     Some(cancel_worker.as_ref()),
                                 )
@@ -825,4 +843,62 @@ pub async fn download_catalog_layers(
     .map_err(|e| format!("download task panicked: {e}"))?;
 
     result.map(|p| p.display().to_string()).map_err(|e| e.to_string())
+}
+
+// ========== Quad Index Packs ==========
+
+/// One row per declared quad-index pack (`base`, `narrow`), merged with the
+/// on-disk installed state; the installed packs alone when no manifest is
+/// reachable. The packs speed up blind and scale-free solves.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_index_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<athenaeum_core::catalog::index_prebuilt::IndexStatusInfo>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let app_data = db.path().to_path_buf().parent()
+        .ok_or("Cannot determine app data directory")?.to_path_buf();
+    // index_status does blocking file I/O + (first run) a blocking manifest fetch;
+    // run it off the async runtime so the IPC call returns instead of stalling.
+    let rows = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::index_prebuilt::index_status(&app_data)
+    })
+    .await
+    .map_err(|e| format!("index status task failed: {e}"))?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Download and install the named quad-index packs; progress rides the
+/// `index-download-progress` event. Already-installed packs are skipped.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn download_index_packs(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    names: Vec<String>,
+) -> Result<String, String> {
+    use athenaeum_core::catalog::index_prebuilt::{self, IndexProgressMapper};
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let app_data_dir = db.path().to_path_buf().parent()
+        .ok_or("Cannot determine app data directory")?.to_path_buf();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mapper = Arc::new(IndexProgressMapper::new());
+    let (app_clone, mapper_clone) = (app.clone(), mapper.clone());
+
+    let result = tokio::task::spawn_blocking(move || {
+        index_prebuilt::download_index_packs(&app_data_dir, &names, cancel_flag, &|progress| {
+            let _ = app_clone.emit("index-download-progress", mapper_clone.map(progress));
+        })
+    })
+    .await
+    .map_err(|e| format!("download task panicked: {e}"))?;
+
+    match result {
+        Ok(p) => Ok(p.display().to_string()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = app.emit("index-download-progress", mapper.error(msg.clone()));
+            Err(msg)
+        }
+    }
 }

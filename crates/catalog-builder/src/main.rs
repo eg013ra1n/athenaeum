@@ -12,6 +12,10 @@
 //!                `tier_<density>/stars.smac` (500/2000/5000/8000 stars/deg²).
 //!   4. Publish — per-tier zip + sha256 + manifest.json into `--out/publish/`.
 //!
+//! A second mode, `catalog-builder publish-index --tiers <dir> --out <dir>`,
+//! builds the quad-index packs (`base`, `narrow`) from the built tiers and
+//! packages them into `--out/publish/` (see `--help` of that mode).
+//!
 //! This crate is build/dev tooling only — never shipped in the app or Docker.
 //!
 //! Quick start (full build):
@@ -38,6 +42,7 @@ use athenaeum_core::catalog::gaia_bulk::{
 
 mod layers;
 mod publish;
+mod publish_index;
 mod tiers;
 
 /// Gaia DR3 reference epoch (J2016.0). Stored in the cache header for PM
@@ -132,7 +137,8 @@ fn print_help() {
         "catalog-builder — build & publish the Athenaeum density-tier star catalogs\n\
 \n\
 USAGE:\n  \
-  catalog-builder --gaia-dir <dir> --out <dir> [options]\n\
+  catalog-builder --gaia-dir <dir> --out <dir> [options]\n  \
+  catalog-builder publish-index --tiers <dir> --out <dir>   (quad-index packs; see publish-index --help)\n\
 \n\
 PATHS:\n  \
   --gaia-dir <dir>   Bulk Gaia `.csv.gz` location (download target / existing copy). Required.\n  \
@@ -252,6 +258,11 @@ fn bin_dir_ready(bins_dir: &Path) -> bool {
 // ────────────────────────────────── main ───────────────────────────────────
 
 fn main() -> Result<()> {
+    // `catalog-builder publish-index ...` builds & packages the quad-index
+    // packs from already-built tiers; it is a separate mode.
+    if std::env::args().nth(1).as_deref() == Some("publish-index") {
+        return publish_index::run(std::env::args().skip(2));
+    }
     let cfg = match Config::from_args()? {
         Some(c) => c,
         None => return Ok(()), // --help

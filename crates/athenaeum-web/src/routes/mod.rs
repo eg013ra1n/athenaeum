@@ -233,6 +233,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
         .route("/api/get_frame_fov_summary", post(plate_solve::get_frame_fov_summary))
         .route("/api/download_catalog_layers", post(plate_solve::download_catalog_layers))
+        .route("/api/get_index_status", post(plate_solve::get_index_status))
+        .route("/api/download_index_packs", post(plate_solve::download_index_packs))
         // Registration (persisted reference frame)
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))

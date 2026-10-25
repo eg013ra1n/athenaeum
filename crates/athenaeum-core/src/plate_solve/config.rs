@@ -218,7 +218,11 @@ pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
 /// moves every cached solve's hash. A cached failure or refusal needs no
 /// bump: one written by another app version is tried once more anyway
 /// (review I7, `stacking::solve::cached_outcome_holds`).
-pub const SOLVE_RECIPE_VERSION: u32 = 1;
+///
+/// 2: solvemyastro 0.2.0 changed the verification and the search (the quad
+/// index, the bright-star completeness gate), so a SOLVED solve cached under
+/// version 1 is solved again.
+pub const SOLVE_RECIPE_VERSION: u32 = 2;
 
 /// What a cached solve depends on (plan 6b-2 C14): the recipe, the SIP
 /// order, and every acceptance-gate field. Not the batch concurrency, the
@@ -335,11 +339,11 @@ mod tests {
         let cfg = PlateSolveConfig::default();
         assert_eq!(
             serde_json::to_string(&solver_config_value(&cfg)).unwrap(),
-            r#"{"baseVerificationToleranceArcsec":8.0,"blindGateEnabled":true,"blindInlierFloor":6,"blindMinInlierRatio":0.04,"blindRmsMaxPxMult":2.5,"blindScaleHeaderTol":8.0,"blindScaleSanityMax":60.0,"blindScaleSanityMin":0.05,"recipe":1,"sipOrder":3}"#
+            r#"{"baseVerificationToleranceArcsec":8.0,"blindGateEnabled":true,"blindInlierFloor":6,"blindMinInlierRatio":0.04,"blindRmsMaxPxMult":2.5,"blindScaleHeaderTol":8.0,"blindScaleSanityMax":60.0,"blindScaleSanityMin":0.05,"recipe":2,"sipOrder":3}"#
         );
         let h = solver_config_hash(&cfg);
         assert_eq!(h.len(), 16);
-        assert_eq!(h, "b1516bcd97659ab0");
+        assert_eq!(h, "91087005893f31a2");
         let mut same = cfg.clone();
         same.batch_concurrency = 4;
         same.autofind_tolerance_deg = 2.0;

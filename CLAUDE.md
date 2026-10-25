@@ -77,7 +77,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 `athenaeum-core` (`crates/athenaeum-core/src/`, canonical list in `lib.rs`): `models`, `coordinates`, `paths`, `disk`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `registration`, `catalog`, `services` (`ServiceContext` + `ProgressEmitter`), `events`, `logging`, `rustafits_processor`, `integration`, `star_measure`, `stacking`, `sync`, `sharing`, `collab`, `updates`, `ts_export`, `api/` (command-facing layer both hosts call), and more. `integration`, `star_measure` (`render`) and `stacking` (`render + solver`) are feature-gated: `cargo check --no-default-features` does not compile them.
 
-Tauri commands: 307 in 24 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
+Tauri commands: 309 in 24 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
 
 ## Adding a Tauri Command
 

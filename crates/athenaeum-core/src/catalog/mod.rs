@@ -3,6 +3,7 @@ pub mod gaia;
 pub mod gaia_bulk;
 pub mod gaia_prebuilt;
 pub mod healpix;
+pub mod index_prebuilt;
 pub mod manifest;
 
 use std::path::Path;

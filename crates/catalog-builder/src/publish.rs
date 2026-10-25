@@ -19,7 +19,7 @@ fn min_fov_for(density: u32) -> f64 {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut h = Sha256::new();
     let mut f = BufReader::new(File::open(path)?);
     let mut buf = vec![0u8; 1 << 20];
@@ -35,22 +35,36 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Zip `out_dir/tier_<d>/stars.smac` as `tier_<d>/stars.smac` into the archive
-/// (Stored — dense binary; `large_file` for >4 GB tiers).
-fn zip_tier(out_dir: &Path, density: u32, zip_path: &Path) -> Result<()> {
-    let smac = out_dir.join(format!("tier_{density}")).join("stars.smac");
+/// Zip `src` as the single entry `entry_name` into `zip_path` (Stored —
+/// dense binary; `large_file` for >4 GB files).
+pub(crate) fn zip_file(src: &Path, entry_name: &str, zip_path: &Path) -> Result<()> {
     let zf = BufWriter::new(File::create(zip_path)?);
     let mut zw = ZipWriter::new(zf);
     let opts = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Stored)
         .large_file(true);
-    zw.start_file(format!("tier_{density}/stars.smac"), opts)?;
+    zw.start_file(entry_name, opts)?;
     let mut f = BufReader::new(
-        File::open(&smac).with_context(|| format!("open {}", smac.display()))?,
+        File::open(src).with_context(|| format!("open {}", src.display()))?,
     );
     io::copy(&mut f, &mut zw)?;
     zw.finish()?;
     Ok(())
+}
+
+/// Write the `"<hex>  <zip name>\n"` SHA-256 sidecar for `zip_path` next to it
+/// (`<zip name>.sha256`); returns the sidecar's file name.
+pub(crate) fn write_sha256_sidecar(pub_dir: &Path, zip_name: &str, zip_path: &Path) -> Result<String> {
+    let sha_name = format!("{zip_name}.sha256");
+    let digest = sha256_file(zip_path)?;
+    fs::write(pub_dir.join(&sha_name), format!("{digest}  {zip_name}\n"))?;
+    Ok(sha_name)
+}
+
+/// Zip `out_dir/tier_<d>/stars.smac` as `tier_<d>/stars.smac` into the archive.
+fn zip_tier(out_dir: &Path, density: u32, zip_path: &Path) -> Result<()> {
+    let smac = out_dir.join(format!("tier_{density}")).join("stars.smac");
+    zip_file(&smac, &format!("tier_{density}/stars.smac"), zip_path)
 }
 
 /// Write `out_dir/publish/{manifest.json, tier_<d>.zip, tier_<d>.zip.sha256}`
@@ -62,12 +76,10 @@ pub fn package_publish(out_dir: &Path, tiers: &[(u32, usize)], epoch: f64) -> Re
     let mut manifest_tiers = Vec::new();
     for (density, _count) in tiers {
         let zip_name = format!("tier_{density}.zip");
-        let sha_name = format!("{zip_name}.sha256");
         let zip_path = pub_dir.join(&zip_name);
 
         zip_tier(out_dir, *density, &zip_path)?;
-        let digest = sha256_file(&zip_path)?;
-        fs::write(pub_dir.join(&sha_name), format!("{digest}  {zip_name}\n"))?;
+        let sha_name = write_sha256_sidecar(&pub_dir, &zip_name, &zip_path)?;
 
         manifest_tiers.push(ManifestTier {
             density: *density,

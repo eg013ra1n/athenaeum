@@ -421,6 +421,8 @@ pub fn run() {
             commands::get_catalog_status,
             commands::get_frame_fov_summary,
             commands::download_catalog_layers,
+            commands::get_index_status,
+            commands::download_index_packs,
             commands_rustafits::read_fits_image_rustafits,
             // Archive commands
             commands::get_archive_settings,

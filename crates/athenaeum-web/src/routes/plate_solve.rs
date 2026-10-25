@@ -69,6 +69,20 @@ fn resolve_layer_caches(
     })
 }
 
+/// Open the installed quad-index packs under `<app-data>/catalogs/smac_index`
+/// (empty when none are installed; a pack that does not open is skipped with a
+/// warning). Opened once per batch, like the catalog layers.
+fn resolve_index_packs(state: &WebAppState) -> Vec<Arc<solvemyastro::QuadIndex>> {
+    let Some(db) = state.ctx.db.get() else {
+        return Vec::new();
+    };
+    let db_path = db.path();
+    match std::path::Path::new(&db_path).parent() {
+        Some(parent) => athenaeum_core::plate_solve::open_index_packs(parent),
+        None => Vec::new(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameIdArgs {
@@ -162,6 +176,7 @@ pub async fn plate_solve_batch(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let ps_config = Arc::new(config::load_config(&db.conn()));
     let layer_caches = resolve_layer_caches(&state)?;
+    let index_packs = resolve_index_packs(&state);
     let dso = get_dso_catalog(&state);
     let event_tx = state.event_tx.clone();
 
@@ -306,11 +321,14 @@ pub async fn plate_solve_batch(
                                     let layer_refs: Vec<&solvemyastro::StarCache> =
                                         layer_caches.iter().map(|a| a.as_ref()).collect();
                                     let caches = solvemyastro::Caches::layered(&layer_refs);
+                                    let index_refs: Vec<&solvemyastro::QuadIndex> =
+                                        index_packs.iter().map(|a| a.as_ref()).collect();
                                     match service::solve_frame_with_hints(
                                         &frame,
                                         &file_path,
                                         &hints,
                                         &caches,
+                                        &index_refs,
                                         ps_config.as_ref(),
                                         Some(cancel_flag.as_ref()),
                                     ) {
@@ -929,6 +947,75 @@ pub async fn download_catalog_layers(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(result.display().to_string()))
+}
+
+/// One row per declared quad-index pack (`base`, `narrow`), merged with the
+/// on-disk installed state. Mirror of the Tauri command.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_index_status(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<athenaeum_core::catalog::index_prebuilt::IndexStatusInfo>>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "DB not initialized".to_string(),
+    ))?;
+    let app_data = db.path().to_path_buf().parent()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".to_string()))?
+        .to_path_buf();
+    let rows = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::index_prebuilt::index_status(&app_data)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("index status task failed: {e}")))?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexPackNamesArgs {
+    names: Vec<String>,
+}
+
+/// Download and install the named quad-index packs; progress rides the
+/// `index-download-progress` SSE event. Mirror of the Tauri command.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn download_index_packs(
+    State(state): State<WebAppState>,
+    Json(args): Json<IndexPackNamesArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    use athenaeum_core::catalog::index_prebuilt::{self, IndexProgressMapper};
+    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let app_data_dir = db.path().to_path_buf().parent()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
+        .to_path_buf();
+
+    let event_tx = state.event_tx.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mapper = Arc::new(IndexProgressMapper::new());
+    let (tx_progress, mapper_progress) = (event_tx.clone(), mapper.clone());
+
+    let result = tokio::task::spawn_blocking(move || {
+        index_prebuilt::download_index_packs(&app_data_dir, &args.names, cancel_flag, &|progress| {
+            let _ = tx_progress.send(SseEvent {
+                event_name: "index-download-progress".into(),
+                data: serde_json::to_value(mapper_progress.map(progress)).unwrap_or_default(),
+            });
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download task panicked: {e}")))?;
+
+    match result {
+        Ok(p) => Ok(Json(p.display().to_string())),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = event_tx.send(SseEvent {
+                event_name: "index-download-progress".into(),
+                data: serde_json::to_value(mapper.error(msg.clone())).unwrap_or_default(),
+            });
+            Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
+        }
+    }
 }
 
 #[cfg(test)]

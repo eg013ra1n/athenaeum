@@ -294,6 +294,17 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Quad index packs (2026-10-25)
+
+Code-complete with green gates; no human has downloaded a pack from a real host or solved through one in the app. The packs are not published yet
+(`catalog-builder publish-index`, then upload next to the tier files), so this needs them on `artfrom.space/catalogs/` or a local static host via
+`ATHENAEUM_CATALOG_BASE_URL`. Reference: `docs/platesolving/README.md` → Quad index packs.
+
+- **Download both packs** from Settings → Plate Solving (`base`, then `narrow`): progress runs, a re-run is a no-op, the rows show installed.
+- **Blind-solve a frame with no coordinates** (strip RA/Dec and the focal length, or use a frame the catalog has no position for) and look for
+  `path = "index"` in the "solve succeeded" log line (`athenaeum-logs`).
+- Installing a pack changes the stacking solver identity: a project's cached SOLVED frames are solved again once (expected).
+
 ### Calibration geometry — the screens (2026-10-25)
 
 The data path was accepted on the owner's catalog copy (`docs/catalog/README.md` → Calibration geometry). Not yet seen by a human

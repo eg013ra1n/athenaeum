@@ -10,7 +10,8 @@ pub mod storage;
 pub use config::PlateSolveConfig;
 pub use failure::{describe_solve_failure, SolveFailureInfo};
 pub use layers::{
-    catalog_identity, catalog_root, discover_layers, open_catalog_layers, CatalogOpenError,
+    catalog_identity, catalog_root, discover_index_packs, discover_layers, index_identity,
+    index_root, open_catalog_layers, open_index_packs, CatalogOpenError,
 };
 pub use service::{
     solve_frame, solve_frame_layered, solve_frame_with_hints, store_result, SolveResult,

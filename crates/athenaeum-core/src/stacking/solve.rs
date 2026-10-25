@@ -281,6 +281,7 @@ pub trait FrameSolver: Send + Sync {
 pub fn solve_with(
     request: &SolveRequest,
     caches: &solvemyastro::Caches<'_>,
+    indexes: &[&solvemyastro::QuadIndex],
     config: &PlateSolveConfig,
     cancel: &AtomicBool,
 ) -> SolveOutcome {
@@ -301,6 +302,7 @@ pub fn solve_with(
             &path,
             &request.hints,
             caches,
+            indexes,
             config,
             Some(cancel),
         )
@@ -492,16 +494,22 @@ fn remove_copy(copy: &Path) {
 
 /// The production solver's identity (plan 6b-3 D14 shares it with the plan):
 /// the stored plate-solve config's hash and the installed catalog's stat-only
-/// identity under `app_data`. `Err` when no catalog is installed.
+/// identity under `app_data`, plus the installed quad-index packs' identity
+/// when there are any (`|index:…`), so installing or replacing a pack solves
+/// the cached frames again. With no pack the form is just
+/// `{config}:{catalog}`. `Err` when no catalog is installed.
 pub(crate) fn solver_identity(
     app_data: &Path,
     config: &PlateSolveConfig,
 ) -> Result<String, String> {
     let catalog = crate::plate_solve::catalog_identity(app_data).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{}:{catalog}",
-        crate::plate_solve::config::solver_config_hash(config)
-    ))
+    let index = crate::plate_solve::index_identity(app_data);
+    let config_hash = crate::plate_solve::config::solver_config_hash(config);
+    Ok(if index.is_empty() {
+        format!("{config_hash}:{catalog}")
+    } else {
+        format!("{config_hash}:{catalog}|index:{index}")
+    })
 }
 
 /// Whether a [`solver_identity`] error says no catalog is installed (the
@@ -535,6 +543,9 @@ pub struct CatalogSolver {
     ctx: Arc<ServiceContext>,
     prepared: OnceLock<Result<Prepared, String>>,
     layers: OnceLock<Result<Vec<Arc<solvemyastro::StarCache>>, String>>,
+    /// The installed quad-index packs, mapped by the first `solve`. A pack
+    /// that does not open is skipped (see `open_index_packs`).
+    indexes: OnceLock<Vec<Arc<solvemyastro::QuadIndex>>>,
 }
 
 struct Prepared {
@@ -549,6 +560,7 @@ impl CatalogSolver {
             ctx,
             prepared: OnceLock::new(),
             layers: OnceLock::new(),
+            indexes: OnceLock::new(),
         }
     }
 
@@ -613,8 +625,12 @@ impl FrameSolver for CatalogSolver {
         };
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
+        let packs = self
+            .indexes
+            .get_or_init(|| crate::plate_solve::open_index_packs(&prepared.app_data));
+        let index_refs: Vec<&solvemyastro::QuadIndex> = packs.iter().map(|p| p.as_ref()).collect();
         solve_in_domains(request, request.scratch_dir.as_deref(), cancel, &mut |r| {
-            solve_with(r, &caches, &prepared.config, cancel)
+            solve_with(r, &caches, &index_refs, &prepared.config, cancel)
         })
     }
 }
@@ -958,6 +974,8 @@ pub(crate) mod tests {
             .expect("the .dev star catalog");
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
+        let packs = crate::plate_solve::open_index_packs(Path::new(&app_data));
+        let index_refs: Vec<&solvemyastro::QuadIndex> = packs.iter().map(|p| p.as_ref()).collect();
         let scratch = tempfile::tempdir().unwrap();
         let go = AtomicBool::new(false);
         let rows: Vec<(String, String, String, String)> = {
@@ -1044,7 +1062,7 @@ pub(crate) mod tests {
             let request = SolveRequest::for_frame(handle as i64 + 1, &path, &meta, target);
             let mut attempts: Vec<String> = Vec::new();
             let outcome = solve_in_domains(&request, Some(scratch.path()), &go, &mut |r| {
-                let o = solve_with(r, &caches, &config, &go);
+                let o = solve_with(r, &caches, &index_refs, &config, &go);
                 let which = if r.path == path {
                     "original"
                 } else {
@@ -1122,6 +1140,8 @@ pub(crate) mod tests {
             .expect("the .dev star catalog");
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
+        let packs = crate::plate_solve::open_index_packs(Path::new(&app_data));
+        let index_refs: Vec<&solvemyastro::QuadIndex> = packs.iter().map(|p| p.as_ref()).collect();
         let config = PlateSolveConfig::default();
         let scratch = tempfile::tempdir().unwrap();
         let go = AtomicBool::new(false);
@@ -1143,7 +1163,7 @@ pub(crate) mod tests {
             scratch_dir: Some(scratch.path().to_path_buf()),
         };
         let outcome = solve_in_domains(&request, Some(scratch.path()), &go, &mut |r| {
-            solve_with(r, &caches, &config, &go)
+            solve_with(r, &caches, &index_refs, &config, &go)
         });
         let SolveOutcome::Solved(record) = outcome else {
             panic!("the grid master did not solve: {outcome:?}");
@@ -1492,6 +1512,28 @@ pub(crate) mod tests {
             SolveOutcome::Unavailable(t) => assert!(t.contains("source unreadable"), "{t}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The quad-index packs are part of the solver's identity: with none the
+    /// form is unchanged, an installed pack appends `|index:…`, and replacing
+    /// the pack moves it, so installing a pack re-solves the cached frames.
+    #[test]
+    fn the_solver_identity_follows_the_installed_index_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let without = crate::stacking::test_fixtures::install_stand_in_catalog(dir.path());
+        assert!(!without.contains("|index:"), "{without}");
+        let pack = crate::plate_solve::index_root(dir.path()).join("base");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("quads.smaq"), b"x").unwrap();
+        let config = PlateSolveConfig::default();
+        let with = solver_identity(dir.path(), &config).unwrap();
+        assert!(with.starts_with(&format!("{without}|index:base:1:")), "{with}");
+        std::fs::write(pack.join("quads.smaq"), b"xyz").unwrap();
+        let replaced = solver_identity(dir.path(), &config).unwrap();
+        assert_ne!(replaced, with, "a replaced pack moves the identity");
+        assert!(replaced.contains("|index:base:3:"), "{replaced}");
+        std::fs::remove_file(pack.join("quads.smaq")).unwrap();
+        assert_eq!(solver_identity(dir.path(), &config).unwrap(), without);
     }
 
     /// Plan 6b-3 D14: the plan reads the solver's identity from the catalog
