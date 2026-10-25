@@ -1,54 +1,25 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type AnalysisPsfModel = "moffat4" | "auto";
+
 export type AnalysisConfig = { 
 /**
- * Detection threshold in sigma above background. Default: 5.0
+ * Matched-filter detection threshold in sigma. Default: 6.0 (range 2.0 to 20.0)
  */
-detection_sigma: number, 
+detection_threshold: number, 
 /**
- * Minimum connected-component area in pixels. Default: 5
+ * The PSF model of the fit. Default: moffat4
  */
-min_star_area: number, 
+psf_model: AnalysisPsfModel, 
 /**
- * Maximum connected-component area in pixels. Default: 2000
- */
-max_star_area: number, 
-/**
- * Reject stars with peak > this fraction of saturation. Default: 0.95
- */
-saturation_fraction: number, 
-/**
- * Keep only the brightest N stars. Default: 500
+ * The measurement budget N: the brightest good stars kept. Default: 500
  */
 max_stars: number, 
 /**
- * R² threshold for trail detection. Default: 0.5 (range 0.0-1.0)
- */
-trail_threshold: number, 
-/**
- * MRS wavelet noise estimation layers. Default: 0 (disabled)
- */
-mrs_layers: number, 
-/**
- * Max stars to PSF-fit. 0 = measure all. Default: 2000
- */
-measure_cap: number, 
-/**
- * LM max iterations for measurement pass. Default: 25
- */
-fit_max_iter: number, 
-/**
- * LM convergence tolerance for measurement pass. Default: 1e-4
- */
-fit_tolerance: number, 
-/**
- * LM consecutive reject bailout. Default: 5
- */
-fit_max_rejects: number, 
-/**
  * Concurrent frames during batch analysis. Default: auto (cores/3, min 2).
- * Higher values increase throughput but use more memory (~200MB per concurrent frame).
+ * Higher values increase throughput but use more memory (several hundred MB per concurrent 36 MP frame: a plane
+ * is 4 bytes a pixel and the measurement copies it; a debayered file keeps only its G plane while measured).
  */
 batch_concurrency: number, };
 

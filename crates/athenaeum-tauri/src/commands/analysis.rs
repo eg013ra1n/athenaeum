@@ -96,7 +96,7 @@ pub async fn get_frame_star_metrics(
 
 // ========== Flat Contour Plot ==========
 //
-// PixInsight FlatContourPlot v1.3.1 port — see
+// Port of the ERP's flat-contour-plot script v1.3.1 — see
 // `athenaeum_core::api::analysis::compute_flat_contour_plot` for the
 // business logic.
 

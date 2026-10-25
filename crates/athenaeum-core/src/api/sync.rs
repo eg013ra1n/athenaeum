@@ -8539,6 +8539,9 @@ mod tests {
                 quality_score: Some(0.9),
                 config_hash: Some("cfg".to_string()),
                 analyzed_at: "2026-07-06T00:00:00Z".to_string(),
+                measure_version: None,
+                stars_refused: None,
+                frame_verdict: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         }

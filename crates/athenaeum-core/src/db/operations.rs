@@ -171,7 +171,7 @@ pub enum DuplicateKey {
     Content,
     /// Full-file hash (`files.strong_hash`) over masters and processed files.
     ///
-    /// Their headers are shared by construction — PixInsight propagates the
+    /// Their headers are shared by construction — the ERP propagates the
     /// integration reference's FITS keywords, so `Pane_2_Sii.xisf` states
     /// `FILTER = 'H'` — which makes the header useless as a verdict and
     /// excellent as a filter. [`crate::duplicates::backfill::fill_master_strong_hashes`]
@@ -215,11 +215,11 @@ impl DuplicateKey {
     ///
     /// The header key adds `files.filename`, because the header fingerprint
     /// does NOT separate a processed derivative from the frame it was made
-    /// from. A GraXpert- or ABE-processed XISF keeps `IMAGETYP = 'Light'` and
+    /// from. A gradient-removal- or background-extraction-processed XISF keeps `IMAGETYP = 'Light'` and
     /// `is_master = 0`, so the eligibility allowlist admits it, and it carries
-    /// its source's header verbatim: PixInsight writes processing history into
+    /// its source's header verbatim: the ERP writes processing history into
     /// the `comment` attribute, which our XISF parser drops (spec §2.4 cause
-    /// 2), so the stored blob of `Lum.xisf` and `Lum_GraXpert.xisf` is
+    /// 2), so the stored blob of `Lum.xisf` and `Lum_GradRemoved.xisf` is
     /// identical and their sizes match. Measured on the owner's production
     /// catalog, that pair was offered as a duplicate with DIFFERENT bytes on
     /// each side — the one shape this feature must never produce.
@@ -260,7 +260,7 @@ impl DuplicateKey {
 
     /// Which files this key may consider at all.
     ///
-    /// The header key takes raw sub-frames and nothing else. A PixInsight
+    /// The header key takes raw sub-frames and nothing else. An ERP
     /// master carries the FITS keywords of whichever image was the
     /// integration REFERENCE, so `Pane_2_Sii.xisf` genuinely states
     /// `FILTER = 'H'`; and `Pane_2_Sii.xisf` / `Pane_2_Sii_f.xisf` share all
@@ -8021,7 +8021,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Two masters with the same header (PixInsight copies the reference image's
+    /// Two masters with the same header (the ERP copies the reference image's
     /// keywords) but different bytes must NOT group; two with the same bytes must.
     /// This is the whole point of the Master key: the header shortlists, the bytes
     /// decide.
@@ -8382,12 +8382,12 @@ mod tests {
 
     /// A processed derivative is NOT a copy of the frame it was made from.
     ///
-    /// Verified on the owner's production catalog: a GraXpert/ABE output keeps
+    /// Verified on the owner's production catalog: a gradient-removal/background-extraction output keeps
     /// `IMAGETYP = 'Light'` and `is_master = 0`, so the eligibility allowlist
-    /// admits it, and it carries its source's header verbatim — PixInsight
+    /// admits it, and it carries its source's header verbatim — the ERP
     /// writes processing history into the XISF `comment` attribute and our
     /// parser drops it (spec §2.4 cause 2), so `Lum.xisf` and
-    /// `Lum_GraXpert.xisf` share a fingerprint AND a size while their bytes
+    /// `Lum_GradRemoved.xisf` share a fingerprint AND a size while their bytes
     /// differ. Before the filename joined the key, the view offered that pair
     /// for deletion.
     ///
@@ -8399,7 +8399,7 @@ mod tests {
         crate::db::schema::init_db(&conn).unwrap();
         seed_dup_root(&conn, "/vol", 1);
 
-        // Source and its GraXpert output: same header blob, same size,
+        // Source and its gradient-removed output: same header blob, same size,
         // different bytes on disk. Only the name says so.
         seed_dup_file(
             &conn,
@@ -8413,7 +8413,7 @@ mod tests {
         seed_dup_file(
             &conn,
             2,
-            "/vol/a/Lum_GraXpert.xisf",
+            "/vol/a/Lum_GradRemoved.xisf",
             "2024-01-01T00:10:00+00:00",
             "HDR-LUM",
             "Light",
@@ -8462,8 +8462,8 @@ mod tests {
         for (id, path) in [
             (1i64, "/vol/a/Lum.xisf"),
             (2, "/vol/b/Lum.xisf"),
-            (3, "/vol/a/Lum_GraXpert.xisf"),
-            (4, "/vol/b/Lum_GraXpert.xisf"),
+            (3, "/vol/a/Lum_GradRemoved.xisf"),
+            (4, "/vol/b/Lum_GradRemoved.xisf"),
         ] {
             seed_dup_file(
                 &conn,
@@ -8532,7 +8532,7 @@ mod tests {
             identity(&live),
             vec![
                 (format!("{fingerprint}|Lum.xisf"), vec![1, 2]),
-                (format!("{fingerprint}|Lum_GraXpert.xisf"), vec![3, 4]),
+                (format!("{fingerprint}|Lum_GradRemoved.xisf"), vec![3, 4]),
             ],
             "the header key's content_hash is the composite fingerprint|filename"
         );

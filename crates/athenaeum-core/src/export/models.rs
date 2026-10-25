@@ -1043,6 +1043,38 @@ mod tests {
         assert_eq!(round, partial);
     }
 
+    /// The whole-frame trimmed-mean mode was renamed in code; the persisted /
+    /// over-the-wire string is deliberately unchanged, so a stacking config,
+    /// a `flat_norm_mode` column value, a saved frontend preference or a
+    /// request from an older build still reads — and what this build writes is
+    /// still readable by an older one. The new spelling is accepted as an alias.
+    #[test]
+    fn flat_norm_mode_old_wire_string_still_reads_and_is_still_written() {
+        let old: FlatNormMode = serde_json::from_str(r#""pixinsightTrimmed""#).unwrap();
+        assert_eq!(old, FlatNormMode::TrimmedMeanWhole);
+        let alias: FlatNormMode = serde_json::from_str(r#""trimmedMeanWhole""#).unwrap();
+        assert_eq!(alias, FlatNormMode::TrimmedMeanWhole);
+        let central: FlatNormMode = serde_json::from_str(r#""centralThird""#).unwrap();
+        assert_eq!(central, FlatNormMode::CentralThird);
+
+        // Written form == the stored/wire string, for both modes.
+        for mode in [FlatNormMode::CentralThird, FlatNormMode::TrimmedMeanWhole] {
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{}\"", mode.as_wire_str())
+            );
+        }
+        assert_eq!(FlatNormMode::TrimmedMeanWhole.as_wire_str(), "pixinsightTrimmed");
+
+        // Inside the real option payload an old client sends.
+        let opts: CalibratedLightOptions =
+            serde_json::from_str(r#"{"flatNormMode": "pixinsightTrimmed"}"#).unwrap();
+        assert_eq!(opts.flat_norm_mode, FlatNormMode::TrimmedMeanWhole);
+        let round: CalibratedLightOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(round, opts);
+    }
+
     #[test]
     fn calibrated_output_filename_takes_the_container() {
         use crate::fits_writer::OutputFormat;

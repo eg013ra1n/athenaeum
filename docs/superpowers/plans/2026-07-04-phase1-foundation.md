@@ -1790,7 +1790,7 @@ git commit -m "feat(fits): typed keyword vocabulary (SBFITSEXT/NINA/WBPP canonic
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-02-roadmap.md` (tick Phase 1 checkboxes)
-- Create: `scripts/verify_fits_astropy.py` (optional dev tool)
+- Create: `scripts/verify_fits_reference_reader.py` (optional dev tool)
 
 - [ ] **Step 1: Full gates**
 
@@ -1799,14 +1799,14 @@ cargo build --workspace && cargo test --workspace && npx tsc --noEmit
 ```
 Expected: all green.
 
-- [ ] **Step 2: Optional astropy cross-check script**
+- [ ] **Step 2: Optional Python-astronomy-library cross-check script**
 
 ```python
 #!/usr/bin/env python3
-"""Dev-only: validate an athenaeum-written FITS against astropy (reference impl).
-Usage: python3 scripts/verify_fits_astropy.py <file.fits>"""
+"""Dev-only: validate an athenaeum-written FITS against a Python astronomy library (reference impl).
+Usage: python3 scripts/verify_fits_reference_reader.py <file.fits>"""
 import sys
-from astropy.io import fits
+from <python-astronomy-library>.io import fits
 with fits.open(sys.argv[1]) as hdul:
     hdul.verify('exception')
     print("OK:", repr(hdul[0].header))
@@ -1818,7 +1818,7 @@ with fits.open(sys.argv[1]) as hdul:
 
 ```bash
 git add -A docs/ scripts/
-git commit -m "docs(roadmap): Phase 1 foundation complete; astropy verification dev script"
+git commit -m "docs(roadmap): Phase 1 foundation complete; Python-astronomy-library verification dev script"
 ```
 
 Release (owner runs per standard workflow, not part of this plan): EN release notes → version bump ×5 → ff-merge `0.2.4` to `main` → tag `v0.2.4`.

@@ -29,6 +29,7 @@ import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
 import type { ArchivedFrameSetSummary } from '../types/helpers';
+import { stackedFrameSnr } from '../components/analysis/stackedSnr';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
@@ -333,7 +334,7 @@ export default function FrameSetDetail() {
   }, [calibrationHierarchy]);
   const { blackholedFileIds } = useBlackholeEvents(allFileIds);
 
-  // Compute stacked SNR per filter group for calibration tab tree: dB→linear, sqrt(sum(linear²)), back to dB
+  // Compute stacked SNR per filter group for calibration tab tree: sqrt(sum(frame_snr²)), a plain ratio (PC-11)
   const calibrationFilterSnrMap = useMemo(() => {
     if (!calibrationHierarchy || analysisData.size === 0) return undefined;
     const dateTree = buildCameraFilterTree(calibrationHierarchy);
@@ -342,21 +343,14 @@ export default function FrameSetDetail() {
     for (const tree of [dateTree, mergedTree]) {
       for (const [key, frames] of tree.framesByKey) {
         if (map.has(key)) continue;
-        let sumSq = 0;
-        let count = 0;
+        const values: number[] = [];
         for (const f of frames) {
           if (blackholedFileIds.has(f.file_id)) continue;
           const a = analysisData.get(f.frame_id);
-          if (a) {
-            const linear = Math.pow(10, a.frame_snr / 20);
-            sumSq += linear * linear;
-            count++;
-          }
+          if (a) values.push(a.frame_snr);
         }
-        if (count > 0) {
-          const stackedLinear = Math.sqrt(sumSq);
-          map.set(key, 20 * Math.log10(stackedLinear));
-        }
+        const stacked = stackedFrameSnr(values);
+        if (stacked !== undefined) map.set(key, stacked);
       }
     }
     return map.size > 0 ? map : undefined;

@@ -71,6 +71,73 @@ id, not by date: 2022-06-30 holds both full-frame and 4784×3194 sets.
 **Acceptance:** frame set 182 stacks end to end on the owner's catalog after a fresh
 auto-match, with no manual re-link.
 
+## Plan D — carried from Plans B and C
+
+Plan C took the Analysis switch only (owner, 2026-10-24); what it measured and did not fix is here. **Plan D starts by checking the first `c` item on the
+calibrated path.** References: `docs/stacking/README.md` R-OSP-16 (Plan B) and R-OSP-17 (Plan C), the after-Plan-B report
+`docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` §6, and the Plan C after note
+`docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md` §9.
+
+**Owner question (unanswered).** solvemyastro on rustafits with `default-features = false`: `clap` is still in the build. Is the branch on GitHub for the owner to merge?
+
+**Owner question (carried from Plan B).** Move the three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) to the runner so real-data runs
+leave the 16 GB dev Mac; gates reading bigbase2 / 3 stay on the dev Mac unless the runner gets those volumes. (Plan C's C10 ran on the dev Mac, R-PC-11.)
+
+**The Measure aperture correction `c` (Plan B B4, measured, not fixed).**
+- On raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of the bright stars from `c`'s sample frame-dependently and `c`
+  follows by ±20 % (R-PB4-4; the group-β path not shown to share it). The first Plan D check.
+- The crowded-field `c` bias, +0.8 % on density/d5 (R-PB4-7).
+- A seeing-conditioned stand-in for floor (i), nearest peers by `fwhm_px` (R-PB4-5's concern: the stand-in's R error is seeing-sized, p90 22 %).
+- OSC R / B `c` +4–7 % above truth on 44 / 48 lab rows whatever the sample (PB-13').
+
+**LN and the ERP (Plan B B3 / B5, measured, not fixed).**
+- **F1's synthetic-vs-real size gap.** F1 over-reads synthetic pairs (+11.97 % at `pairs/main/m4w10` t60; ≈ +1.9 % at the real |ΔF| on realistic mono fields) but reads
+  real members −0.2…+0.1 %. The candidate cause is the halo's scaling with F (a seeing-scaled wing against a fixed-pixel optical halo; B2's open item 2),
+  unmeasurable on real pairs; a synthetic family with a fixed-pixel halo would settle it (F1's fixed-pixel-halo family).
+- **psfSel is no default candidate until it passes the seeing-lever pairs** (|gap| ≤ 3 %, |slope| ≤ 1 %/px). Today it reads −2…−8 % there at −1.54 %/px, and
+  −3.9…−4.6 %/px of ΔF on real OSC and run B mono.
+- **PSF signal on deep nebula: 15 of 34 l10b cells over the bar, owner F-10 / B.3** (13 before B4's `c`; worst `neb3` g t45 −15.89, `neb3` b25mix t25 −12.28 pp). It is
+  the non-default Normalize → "Star flux" → "PSF signal", whose per-side `c` is the `star_measure` module's on nebula sky. If it is ever to be supported there, the
+  measured lever is the pair-common ring (`neb3` g t45 −15.88 → −8.42), not a Measure-side screen. `planb.sh b5 ctable` (lab) is the standing check for any later `c` change.
+- A real nebula miss re-opens F1's sky, with a per-side, structure-aware sky, never a plain or clipped mean (R-PB5-1).
+- The ERP's real-set gap and mono / OSC sign flip (B1 open item 2; median gap s204-mono −2.96, runB-mono −2.13, s204-osc +4.44, runB-osc +3.54 %): not investigated; to be
+  explained only if the comparison is wanted (the ERP is a column, never the referee). The ERP has never run Task 14b's 15 new units: refresh before an ERP column is read on them.
+
+**The stacking weight (Plan C C10, measured, not fixed; `task-C10F-verdict-r1.md` in the Plan C ledger folder, R-PC-10b).**
+- **The weight hangs on saturated stars' `tflux`.** `tflux` sums `signal` over every accepted fit, saturated included (`star_measure/frame.rs`), and the weight is
+  ∝ tflux · tmean_flux / (σ · m_star) (`stacking/psf_signal.rs`); saturated stars hold 53–64 % of a frame's accepted signal (C10F probe, s204 clone). Refusing a
+  few of them re-ranks the weights against seeing: at C10 r1 (Blend on the stacking path) 4–7 refusals among hc11 L's 500 brightest took 25–31 % of `tflux`, the
+  sharpest frames (FWHM 5.6–6.5 px against 8) were demoted (69860 rank 72 → 35) because good seeing resolves the field's saturated giant, weights ρ 0.891, master
+  noise +1.59 %. A pre-Plan-C fragility, not Blend's: any change to which bright stars a frame accepts moves its weight this way. Bar for a fix: R-PC-11 (b)'s
+  ln-truth at master level on hc11 / runB / s204 (lab `star-lab/results/plan-c/c10-r1-v6/` is the failing case).
+- **Blend on the stack** (R-PC-10b): the stacking Measure, LN's refits and registration fit without the `Blend` refusal, so the stack keeps the blends' 0.1–0.4 %
+  FWHM and crowded-field ecc bias. The seam is one bool (`fit::Correction::blend_refusal`); turning it on for stacking waits for the weight item above.
+
+**Analysis measurement (Plan C, recorded limits).**
+- **Close unresolved pairs** (R-PC-10a): the `Blend` refusal catches resolved pairs (both seeded, ~1.7 F); a close pair whose companion is no seed (95 of 132 on
+  `doubles/f4.0`, FWHM bias +7…+14 % at 0.5–1.25 F, `doubles/f4.0` 4.353 vs truth 4.062) stays in the statistic. The lever: a residual second-peak test in the fit.
+- **The mild-trail class.** `ldn621` (elongated, ecc 0.88, no verdict) is measured and solves; frames like it carry neither a verdict nor a refusal.
+- **Near-starless frames** report a FWHM without a No stars verdict (m82 `0008` in the C9 corpus).
+- **8 files without IMAGETYP never get an Analysis row** (the singles: `_VSH8902.xisf`, `_DSC2522.xisf`, `_DSC5767.fit`, the `*_P.fit`, two `Light_Pane*.xisf`): the
+  frame-set generation leaves them out (the C7D sandbox excluded 8 files), so the gate can never see them.
+- Not an item: C5's raw-mode completeness miss (R-PC-9a, the owner's word), nor the OSC Analysis star flux at `c` = 1 (PC-4).
+
+**Plate solving: hopeless frames the gate still lets through** (PC-14, Plan C C7; lab `star-lab/results/plan-c/c7/gate-frames.tsv`, serial run on a loaded dev Mac, so the
+relative sizes are safe and the exact seconds are not). The verdict gate saves only the 4 trailed frames' 4.2 s; these cost 455 s and carry no verdict:
+
+| frame | outcome | solve wall | ecc / R² |
+| ---- | ---- | ---- | ---- |
+| M101 `…_020058_0002.fit` | no catalog quads matched, full ladder (14 rungs, 5 retries) | 89.1 s | 0.767 / 0.601 |
+| M101 `…_020531_0004.fit` | no catalog quads matched | 86.0 s | 0.798 / 0.574 |
+| M101 `…_021623_0009.fit` | 1 of 6 needed matches | 80.1 s | 0.384 / 0.099 |
+| `_VSH8902.xisf` (no Analysis row: no IMAGETYP) | matched, no fit (18 rungs) | 122.8 s | none |
+| H 0029 (2025-09-14_04-14-30) | matched, no fit (16 rungs): the tracking-jump class, point-like fake stars | 77.0 s | 0.678 / 0.000 |
+
+The three M101 frames are one night (2023-06-18, ASI6200 at 1960 mm, ~1300–1500 detections, `stars_refused` 317–524) and look point-like by the numbers. No (ecc, R²) pair
+separates them from the solvable frames (`ldn621` decides the corner), so no rule is proposed; Plan D needs a new signal.
+
+---
+
 ## Windows: fixed pending the final measurement; non-core surface still unmeasured
 
 `docs/superpowers/specs/2026-09-07-windows-test-failures-design.md` §10 has the
@@ -222,25 +289,23 @@ contain forward slashes.
 
 ---
 
+### The GitHub runners' first full run (2026-10-24)
+
+- **rustafits bit pins on x86_64.** `the_legacy_entry_points_are_output_identical_to_1_3_0`,
+  `the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before` and
+  `fit_moffat_2d_is_byte_identical_to_before` were recorded on aarch64 and miss
+  by 1 ulp on the x86_64 runners (libm). CI skips them by name; at the next
+  rustafits release gate them with `#[cfg(target_arch = "aarch64")]` (or record
+  per-arch pins) and drop the three `--skip`s from `.github/workflows/ci.yml`.
+
 ## Known flaky test
 
-- `collab_v3_live_e2e_tests::unmapped_filter_then_mapped_and_an_attested_set`
-  failed once at the plain mono light's live landing (plan 6b-2 acceptance
-  run); it passed alone and on a full re-run, so it is load-timing, like the
-  other collab live tests.
 - `stacking::run::tests::local_normalization_sidecars_are_cached_on_the_second_run`
   failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
   (2026-09-18, 2431 passed alongside it) and passed twice in isolation and in
   both CI jobs of the same commit. Not investigated; if it fails again, look
   at what the two runs share on disk (the LN sidecar cache under a tempdir)
   and at the parallel test load, not at the LN maths.
-- `api::collab::tests::publish::landing_free_bytes_is_bounded_by_the_collaboration_root`
-  failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
-  (2026-10-02) and passed alone twice and in a second full run. It compares two
-  successive free-space readings of the volume for equality, so another test
-  writing or freeing disk between the two reads breaks it. Not fixed; if it
-  fails again, replace the equality with a tolerance (or read the free space
-  once), not a change to the landing code.
 - `collab_pool` `concurrent_gets_for_an_unreachable_provider_share_one_dial`
   failed once in a full `cargo test -p athenaeum-core --all-targets` on the dev
   Mac (2026-10-02, during plan 6b-1 Task 3) and passed alone. Not
@@ -263,13 +328,14 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **The preview stretch is scale-adaptive.** | rustafits `stretch.rs` / `pipeline.rs` | The midtones parameter adapts to the normalized median, so `[0,1]` float FITS render almost identically to the same data in u16 ADU despite the hardcoded `max_input = 65536.0` — pinned by `unit_range_floats_stretch_like_u16`. A "missing float normalization" finding was raised and retracted. The real float bug was NaN poisoning the sample statistics, and it is fixed. |
 | **The Folders deep-link token is deliberately not monotonic** (raise → consume → lower → re-arm). | Folders workspace deep-linking | Monotonicity was the replay bug. Restoring it reintroduces it. |
 | **The calibration-set empty-prune trigger and `prune_orphaned_calibration_sets` are deliberately not identical.** | `db/schema.rs` | The per-row trigger exempts master-library sets because a master legitimately loses and regains its sole member during a re-import and the trigger fires inside that window. The whole-table prune runs only at quiescent points, where a member-less unreferenced master really is garbage. Both doc comments say so at length. |
-| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | PixInsight writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Processed **Light**-derivatives are a different case and the reason this is not free: a GraXpert/ABE output keeps `IMAGETYP = 'Light'` and `is_master = 0`, so the header key admits it and the erased history makes it identical to its source — they are shielded by the header key's `files.filename` component (spec D8), not by the master exclusion. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
+| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | The downstream processing program writes history as `value="" comment="<integration history entry>: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Processed **Light**-derivatives are a different case and the reason this is not free: an output of an external gradient-removal tool keeps `IMAGETYP = 'Light'` and `is_master = 0`, so the header key admits it and the erased history makes it identical to its source — they are shielded by the header key's `files.filename` component (spec D8), not by the master exclusion. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
 | **The three-part sampling hash is not a better default key than the header.** | Any "just use `compute_xxhash`" proposal | It IS `files.content_hash`, so the proposal is the existing `Content` branch. Measured: identical answer to the header key on raw frames (40/40 vs 80/80 against full SHA-256) for 61.4 GiB of reads and ~19 min; and on masters it is wrong in the DELETING direction — three of thirty groups are `..._DBE_WCS.xisf` / `_f.xisf` pairs differing by 3-4 bytes at 0.5-0.9 MiB, past the first sample and nowhere near the middle or end. Spec §2.5. |
-| **The duplicate-cache rebuild is not the slow part of a scan, and it does not run when nothing changed.** | Any "Phase 4 is quadratic / runs on every monitor poll" proposal | Measured 2026-09-17 on the owner's 40,456-file production catalog: both `rebuild_duplicate_groups_cache` calls plus the O(folders²) folder pass total ~3.6 s (711 folders); a scan with nothing new or modified returns at `new_files.is_empty()` before Phase 4. The minutes the UI showed as "Building duplicate cache…" were the master strong-hash pass reading shortlisted masters in full over an 11.7 MB/s SMB share (now its own `"hashing"` phase with per-file progress), and a 15-minute "nothing new" scan was the content-index job saturating the same share (it now yields to active scans). `docs/backlog-v0.5.6.md` item 9 has the numbers. |
+| **The duplicate-cache rebuild is not the slow part of a scan, and it does not run when nothing changed.** | Any "Phase 4 is quadratic / runs on every monitor poll" proposal | Measured 2026-09-17 on the owner's 40,456-file production catalog: both `rebuild_duplicate_groups_cache` calls plus the O(folders²) folder pass total ~3.6 s (711 folders); a scan with nothing new or modified returns at `new_files.is_empty()` before Phase 4. The minutes the UI showed as "Building duplicate cache…" were the master strong-hash pass reading shortlisted masters in full over an 11.7 MB/s SMB share (now its own `"hashing"` phase with per-file progress), and a 15-minute "nothing new" scan was the content-index job saturating the same share (it now yields to active scans). `docs/superpowers/research/2026-09-17-duplicate-cache-scan-measurement.md` has the numbers. |
 | **An offline scan root logs `scan root offline (path does not exist)` from `check_scan_root_overlap` — it is not a symlink problem.** | The WARN pair at startup for a root on an unmounted share | Verified 2026-09-17: `/Volumes/Universe` is an SMB mount with no symlink anywhere in the chain; `canonicalize()` fails with `NotFound` exactly while the share is not mounted, the check falls back to the stored path (correct), and the line appears twice because both transfer folders are validated against every root. The message now names the `NotFound` case as "offline" so it is not read as damage. |
 | **`.deb`/`.rpm` installs are refused by the updater by rule — deferred, not a bug.** | `crates/athenaeum-core/src/updates/manifest.rs::platform_supported` | A package-manager install falls back to nothing rather than being handed the AppImage entry and choking on `dpkg -i` after a 100 MB download. The updater plugin itself can install over a `.deb`, so a `linux-x86_64-deb` manifest key plus a `.deb` build/sign leg is a real, scoped follow-up (spec §8 "Out of scope"), pending its own task. |
 | **An unset `FILTER` is a frame state, not a camera property — there is no "OSC" filter convention.** | `collab::filters::match_filter`, `collab::gate`, the hub dictionary, any "map empty FILTER to an OSC canonical" proposal | Owner ruling 2026-09-28. OSC cameras shoot with or without a filter, and mono cameras without a wheel shoot without one too, so an empty `FILTER` cannot be inferred to mean anything from `BAYERPAT`. It is one more unmapped raw name for the spec §6.2 mapping flow (`filter_mappings (instrume, filter_raw) → canonical`, the normaliser, the publish-flow modal), where the PUBLISHER picks the canonical — `L`, `None`, whatever the project offers. A hub-side special case for `channel = "osc"` was proposed on 2026-09-28 and withdrawn the same day. |
 | **Injected OSC captured fraction ~2× is a scorecard artefact.** | Star-measurement scorecard Row 6 on inject frames, OSC families | Row 6 divides the measured flux (fitted FWTM flux × the plane's aperture correction `c`, taken from the frame's real stars) by an injected Moffat-β-4 star with no wing; on undersampled OSC planes `c` is 1.9–2.7, so injected stars read ×`c` (the c-free model / truth is 0.95–1.02). I.1 extended; `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-14-report-capfrac.md`. |
+| **Set 204 mono's OFFSET-200 dark on OFFSET-30 lights is the owner's deliberate link, not a product finding.** | The set 204 mono tree (`tierA-lnB-f1`, LDN1272, 180 s): its 208 dark links carry `is_manual_override = 1` (2026-08-28); any "warn on an OFFSET mismatch" proposal | Owner 2026-10-23: the offset was unlinked in the settings on purpose, there were no other lights. The lab consequence stays: about 170-206 ADU over-subtracted, so the lever gate is the six-source pooled free fit (R-PB2-8, `docs/stacking/README.md` R-OSP-16 B2); LN scale and `c` are local-sky-subtracted and stand; absolute-sky quantities of that tree (SNR, noise rows) carry the level error. |
 
 ---
 
@@ -278,14 +344,36 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Plan C — the Analysis tab on the one star path (2026-10-24)
+
+Branch `plan-c` (reference `docs/stacking/README.md` R-OSP-17; plan `docs/superpowers/plans/2026-10-24-one-star-path-plan-c.md`). The owner looked at the app at C9
+(`npm run tauri dev`, dev catalog, 2026-10-24: «в целом все устраивает» - Settings → Analysis, the Verdict and Refused columns, Blink's ellipses, the reset button).
+Not yet seen by a human:
+
+- **The 3 XISF outliers of the C9 corpus comparison** (the lab renderer is FITS-only, so their stretched JPGs were never looked at): open them in Blink and read the
+  ellipses against the stars.
+- **A `flip_vertical` OSC frame's Blink overlay.** Analysis positions on a mosaic are in FILE row order (C3 review M6); the display flip is C5's. Check that a flipped
+  OSC frame's ellipses sit on its stars.
+- **The first start after the update rebuilds `star_metrics`** (every `star_metrics` row is rewritten to the nullable `snr` / `hfr`). On the dev catalog 510 501 stars took 2.25 s with no
+  orphans; the production catalog (~40 000 files) has not been tried - expect seconds to a minute.
+- **The plate-solve input gate stays quiet until a frame's Analysis row is re-measured at `MEASURE_VERSION` 7** (`plate_solve/service.rs::input_gate_reason`: a row
+  from an older version refuses nothing). After re-analysing a set with a trailed frame, check that the gate refuses it before solving, with the "Stars are trails" line.
+- **The Blink HTTP cost after Blend.** The m42 measure fell 0.387 → 0.385 s (C9BL) but the web host's Blink call (0.404 s at C9, before Blend) was not re-timed.
+
 ### The Measure aperture correction `c` on undersampled OSC planes (2026-10-20)
 
 Product findings of the Plan A closing diagnostic (note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`, section 7; first Plan B item). Weights and LN read `c`.
 
-- (a) `c` is neither persisted (`stacking/measure.rs:339`) nor logged at the level a run keeps, so real runs cannot be checked. First Plan B item: log `c` per plane.
+- (a) RESOLVED by Plan B B0 (commits c04ef5df, 4566d628, 20697493; `docs/stacking/README.md` R-OSP-16): `c`, its SE and its star count are kept per plane in the `metrics` payload (`apertureCorrection` / `apertureSe` / `apertureStars`), one info per (group, channel) at a kept level, LN's growth factor, pairs and per-side `c` on the run summary; the four before-runs' `c` tables are recorded there.
+- Dependency (R-PB0-8): met on `plan-b` by B4 (21c151a0: `MEASURE_VERSION` 5); B0 must not reach main without it, and the one merge is the owner's word.
 - (b) Hot pixels feed `c` on an uncorrected R plane: raw 0013 p0 `c` 1.334 vs 2.097 / 2.074 (0004 / 0007); 36 of its 64 `c` stars are hot pixels; the same stars' 0004 → 0013 ratio 0.617 vs 1.007 / 0.970 on p1 / p2 (R weight ×0.40). Stacking is exposed only on a refused hot-pixel map (no `ATH_CHPX`) or a raw-mode measurement.
 - (c) Sharp R, probe path (own β): mosaic 0176 → 0206 p0 ratio 0.863 after `c` vs ~0.985 on G / B (~×0.77 R weight); the product fits at the group β (2.24 on set 204 OSC), so unverified there until (a).
 - (d) Brightness dependence on undersampled R / B: real-star aperture / model 1.57 (top 64) → ~1.2 (rank 500–2000) on raw 0004 p0; G flat (1.23 → 1.18). One `c` per plane overstates fainter stars there.
+- (b)-(d) RESOLVED by Plan B B4 (athenaeum 21c151a0, 71a4a738, 13aee664; `docs/stacking/README.md` R-OSP-16 B4; lab `star-lab/results/plan-b/b4/verdict.md`): (b) the cross-plane point-source screen refuses the hot pixels (0013 p0 screened 1984, 0 hot among its 33 qualifiers; R's `c` ratio 0004 → 0013 0.8615 vs the G / B mean 0.8601, +0.17 %, R-PB4-4); (c) at the group β B4's `c` equals B0's kept `c` (0176 p0 1.934); (d) the brightness trend is a β-bound fit bias, so the sample stays the top 64 by model flux, now at `StarFit.snr` ≥ 20 (PB-13'; every stratified sample moved a lab family away from truth). Both `c = 1` floors judged: floor (i) takes the group channel's median kept `c` (R-PB4-5), floor (ii) is not reached in the product (R-PB4-6). Master level on the three real trees: weights ρ 1.0000, nothing moved.
+- Plan C items from B4 (measured, not fixed): moved to **Plan D** below (Plan C took only the Analysis switch).
+- Plan A debt: the ERP has never run Task 14b's 15 new units. (The Plan B lab hygiene is RESOLVED at B6: lab 4e4e757, fc0a3e2, ecddc4f; `docs/stacking/README.md` R-OSP-16 B6.)
+- Plan B close (B6, 2026-10-24; `docs/stacking/README.md` R-OSP-16 B6). B1 open item 1 (hc11-G parity 1.226 %) is RESOLVED: a probe re-computation artefact (the `.athln` side is the 2026-10-06 before-run's measurement, 384 matches vs the probe's 523; hc11's members are the noisy ones). B1 open item 2 (the ERP's real-set gap and mono / OSC sign flip) stays a recorded limit, not investigated (the ERP is a column, never the referee).
+- **Runner environment (owed to the runner):** the runner box fails the localhost-QUIC tests (`sharing::iroh` 65, `api::collab_live` 45, `collab_v3_live_e2e` 10: "sync control send ... timed out"; `iroh_roundtrip_two_endpoints_localhost` alone too, 31 s on an idle machine). The dev Mac passes them 432 / 0. Not Plan B (no sharing or collab code touched); likely the macOS Local Network permission.
 - Set 204 run 7 LN's own `c` (log `ln scale: per-side ring`): OSC p0 1.00, p1 1.13, p2 1.12, mono 1.13, benign.
 
 ### LN model fixes (2026-10-04 … 2026-10-06)
@@ -320,6 +408,10 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
   - The limiting factor on a small field is the shared star selection, not the aperture rule.
   - A member excluded for this reason now reads "N of M matched stars fit the common aperture inside the frame (< 20); PSF signal may keep this frame", and the run adds one group warning.
   - Still not measured: real small sensors, heavy binning, and large dither offsets. A per-frame fallback would mix two estimators in one group.
+  - **The owed `c = 1` floor question ("fall back to 1 below 5 growth pairs?") is CLOSED as moot** (Plan B B4, R-PB4-6, 2026-10-23): over 504 cases (set 204 and run B mono crops down to 200 × 150, 2 × 2 binned, masked corners, synthetic pairs) 193 were excluded by `MIN_MATCHES` 20 first and the 294 others kept at least 14 growth pairs, so the floor is not reached in the product; the code stays as built (1–4 pairs keep the factor with a warn, 0 pairs factor 1 with a warn), the warns being the detector for the unmeasured cases above.
+- **The LN estimator, Plan B B3 (2026-10-23; R-PB3-1 / R-PB3-2; `docs/stacking/README.md` R-OSP-16 B3; lab `star-lab/results/plan-b/b3/verdict.md`).** F1 as is stays the default; psfSel on Measure's `c` is rejected; the F1 v2 sky (the masked far-annulus item above, port L3-gc5) is out by its entry test (real 0.582 % against F1's 0.296 %; a cosmic-ray move of 1.35 pp against ±0.53). Nothing changed in the product, so no release line. The measured, not fixed items (F1's synthetic-vs-real size gap, psfSel's entry rule) moved to **Plan D** below; recorded only:
+  - **The set 204 mono referee at n 10–11** (SE median 1.19 %, above its allowance on every counted cell): recorded only; it sets no level (R-PB3-2).
+- **LN's own estimates, Plan B B5 (2026-10-23; R-PB5-1 / -2 / -3 and the owner's word on R11-3; `docs/stacking/README.md` R-OSP-16 B5; lab `star-lab/results/plan-b/b5/verdict.md`).** The F1 branch (module seeds out of scope, `k` and `unverdicted_clip_range` kept); C-9 no change (the proposed annulus mean is measured out); F1 reads B1's 34 nebula-sky cells bit for bit, 4 over the F-13 bar, its recorded limit; R11-3 a recorded limit (3.64 / 5.98). Nothing changed in the product, so no release line. The measured, not fixed item (PSF signal on deep nebula) moved to **Plan D** below.
 
 ### Collab wave 6b-3 — project stacking on the grid (2026-10-03)
 
@@ -955,7 +1047,7 @@ external tool can prove is owed to the owner (files kept in
 
 - **WBPP accepts the master.** Open
   `acc-xisf/library/ATR2600M/MasterDark/master_dark_180s_-10C_g100_bin1x1_2025-04-12.xisf`
-  in PixInsight; add it to WBPP as a master dark — it must be listed as a
+  in the downstream processing program; add it to WBPP as a master dark — it must be listed as a
   master (no "must be in XISF format" refusal), under DARK, 180 s. A light
   WBPP calibrates with it should match Athenaeum's
   `acc-xisf/export/C/ACC pure 20/camera_atr2600m/lights/c_*.xisf` of the
@@ -1687,26 +1779,14 @@ plus the owner's own confirmation in the desktop dev build, 2026-09-08.
 
 ### Plate-solve input-gate controls (2026-09-07)
 
-Backlog v0.5.6 item 1. Frontend-only: `PlateSolveSettingsPanel.tsx` grew a
-**Batch Concurrency** field in Solver Parameters and an **Input Gate** section
-(`input_gate_enabled` toggle, `input_max_eccentricity`, `input_min_trail_r2`,
-the two numbers disabled while the toggle is off). No Rust change — the three
-commands already round-tripped the whole struct, which is why the fields
-persisted without controls. Gate run: `npx tsc --noEmit` clean. There are no
-frontend tests in this repo to add to.
+Backlog v0.5.6 item 1: `PlateSolveSettingsPanel.tsx` grew a **Batch Concurrency** field and an **Input Gate** section. Plan C C7 (2026-10-24) removed
+the two number fields (`input_max_eccentricity`, `input_min_trail_r2`) and the 0.85 / 0.65 defaults: the gate is the `trailed` verdict alone
+(`docs/platesolving/input-and-acceptance-gates.md`), so the old "tightening will not catch more trailed frames" copy is gone with them.
 
-- The whole acceptance check is by hand: the toggle and both numbers survive
-  Save → restart; **Reset to Defaults** puts back 0.85 / 0.65 / on; the three
-  fields that were already on the tab still save; and a frame the gate
-  previously refused attempts a solve again once the toggle is off.
-- The copy states the measured reference ranges and says plainly that tightening
-  will **not** catch more trailed frames (backlog item 4: the full analysis path
-  under-reports eccentricity on exactly those). Worth reading once on screen —
-  it is the sentence the retracted v0.5.5 release note got wrong.
-- Owner decision, 2026-09-07: the acceptance-gate group
-  (`blind_*`, 7 fields) stays unexposed. It is what stopped v0.5.5's false
-  16–193x solutions from reaching the catalog. If it ever surfaces it belongs
-  behind an "Advanced" disclosure naming the failure it prevents.
+- Still by hand: the `input_gate_enabled` toggle survives Save → restart and **Reset to Defaults** puts it back on; a frame the gate refused attempts a
+  solve again once the toggle is off. (The gate stays quiet on a frame until its Analysis row is re-measured at `MEASURE_VERSION` 7.)
+- Owner decision, 2026-09-07: the acceptance-gate group (`blind_*`, 7 fields) stays unexposed. It is what stopped v0.5.5's false 16–193x solutions from
+  reaching the catalog. If it ever surfaces it belongs behind an "Advanced" disclosure naming the failure it prevents.
 
 ### Integration throughput (2026-09-06)
 
@@ -2043,7 +2123,7 @@ production catalog the view returned 0 groups while holding 2 750
   `scan_roots.find_duplicates`, so it can hash a few masters the view would
   never offer. Order of magnitude is the check, not the exact number.
 - A processed derivative is not offered as a copy of its source: `Lum.xisf` and
-  `Lum_GraXpert.xisf` (same header, same size, different bytes) must NOT be a
+  its processed output (same header, same size, different bytes) must NOT be a
   group, and `Find duplicate folders` must not score a folder of processed
   outputs as similar to the folder it came from.
 - Run a scan: the post-scan rebuild fills `duplicate_groups` with
@@ -2188,6 +2268,20 @@ from the minors fix wave: an unknown-kind row stays visible; a toggle failure ra
 dialog rather than a banner; the tinted checkbox renders. The artfrom.space guide still
 describes the old tab name.
 
+### Carried from the memory cleanup (2026-10-23) — older cycles' residue
+
+Owed checks and follow-ups that lived only in the per-cycle memory notes. Each may already be done; delete a line when it is confirmed or found stale.
+
+- **Dependency update (2026-07-28):** tray start-at-login toggle plus a reboot (macOS); Windows keychain-token continuity after an update (no forced re-login); icon click-through (35 redrawn lucide glyphs); web static-serve; the first Docker image build since the `zune-jpeg` patch and the cmake/nasm toolchain were removed. Follow-up queue: a PROSAC rand-mapping tripwire test (nothing in solvemyastro catches an adoption-path regression); `corpus_bench` re-freeze (un-runnable since the tier cutover); a `toml_edit` byte-diff test; the `noUncheckedIndexedAccess` owner decision; a cross-version zip fixture. (carried from memory 2026-10-23; may already be done)
+- **Perseus 0.5.1 local library (2026-07-27):** live smokes: browser blink walk, send and delete dialogs, scheduler mode flips, an SMB capture root, the free-space chips. Perseus UI v2 backlog: `api_delete` resolves rows through an `all_outbound(5000)` window, so an aged-out fail-open orphan is possible. (carried from memory 2026-10-23; may already be done)
+- **Mirror hierarchy (2026-07-27):** a Windows receiver, and a changed-file re-send landing as `_2` with the original intact. Deferred: logging-spec dictionary entries for `value`/`layout`/`mirror_hierarchy`; spec and end-user sentences on the batch-slug / mirror-dir seam and on a device rename moving the tree root. (carried from memory 2026-10-23; may already be done)
+- **iroh transport hardening (2026-07-15):** multi-PC dev-build smoke after the shared-node change (one node id per process, no relay kick) and after the reported-addresses change; live canary `ATHENAEUM_TEST_RELAY=https://test-relay.artfrom.space:8443 cargo test -p athenaeum-core same_key_second_endpoint_evicts -- --ignored`. (carried from memory 2026-10-23; may already be done)
+- **Sync security audit (2026-07-11):** the Windows owner-only ACL on the device-key path (`account/keys.rs`, `icacls`) was never run on Windows. An empty `Want` confirms a package, so a paired peer can drive delete-after-confirm retention to remove sources it never stored (inside the existing trust boundary; retention is Perseus-only now). (carried from memory 2026-10-23; may already be done)
+- **Transfer smoke-fix cycle (2026-07-20):** the V1–V4 two-instance smokes; the first-contact stall (the sender's connect gate refuses the receiver's blob dial-back before refreshing the authorized set, so every first device-pair contact eats a 60 s backoff). (carried from memory 2026-10-23; may already be done)
+- **0.5.1 real-data smoke pass (2026-08-03):** still owner-only: the DB-hygiene plate-solve panic check (needs the star catalog and a forced panic). Questions the pass raised: readiness counts a light with a flat but no dark as `missing` (0 ready) although the run would calibrate it flat-only (`CALSTAT='F'`); r2d2 logs a context-free `ERROR "database is locked"` twice at startup while `init_db` holds its DDL; an external header edit does not mark an existing calibrated output stale. (carried from memory 2026-10-23; may already be done)
+- **DB hygiene fast-follows (2026-08-03):** sequential `process_file` savepoint parity (the C3 window is bounded to one scan cycle, not closed); `rebuild_duplicate_groups_cache` silently substituting `Utc::now()` (use `parse_stored_ts`); ratify `field`/`raw` in the logging spec dictionary; web per-frame `catch_unwind` parity outside plate-solve. (carried from memory 2026-10-23; may already be done)
+- **Docs site (artfrom-space):** a fresh screenshot for the landing page's "03 · Calibrate" step (the old one showed the removed Calibrate Lights dialog and was dropped). (carried from memory 2026-10-23; may already be done)
+
 ### Shipped in v0.5.0-beta.1, still unconfirmed
 
 Transfers v2 and the batch model (U1–U8, two instances), D3 multi-source distribution
@@ -2207,6 +2301,14 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 - **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
 
+### Analysis follow-ups (Plan C C9, 2026-10-24)
+
+- **`reconcile_frame_set_nights` "database is locked" ERRORs during Analysis batches.** Two were logged in the C9 dev run, both while an Analysis batch persisted rows: a pre-existing
+  class (a read-then-write on the nights contending with the batch's writes), not Plan C's. Fix is its own cycle: take the `BEGIN IMMEDIATE` discipline the catalog rules
+  already ask for, or retry the reconcile after the batch.
+- **The Blink ellipse colour thresholds against the new eccentricity scale.** `DEFAULT_ANNOTATION_SETTINGS` (`src/types/helpers.ts`) colours by `ecc_good` 0.5 / `ecc_warn` 0.6, chosen on the
+  legacy numbers; the module's eccentricity reads +5–10 % on the same frames (C9L ratios 1.050 / 1.099 / 1.074), so more stars land in the warn colour. Re-pick on a look at the corpus.
+
 ---
 
 ## Awaiting a call from the owner
@@ -2225,20 +2327,8 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
   Settings card, with the full-hash confirm unchanged as the safety net. A
   mismatch (WCS written into one copy, parser drift between versions) costs a
   re-transfer, never a loss. A protocol cycle of its own; proposed: defer.
-- **The full analysis path under-reports eccentricity on trailed frames**
-  (full detail: `docs/backlog-v0.5.6.md` item 4). The full detector's shape
-  stamp (`1.5 × field FWHM`) is self-reinforcing on a streak's small-FWHM
-  bright head — measured 0.56 where the fast path (stamp follows the star's
-  own size, `2 × HFD`) sees 0.88 on the same real frame. Consequence: the
-  Analysis table rates a badly-trailed frame well, and the plate-solve input
-  gate (which reads this number) misses it — plate-solving itself is not
-  fooled, it re-measures shape at its own scale. Not the maths that's open:
-  changing the stamp changes `median_eccentricity` for every frame already
-  catalogued, so the open call is the re-analysis story (bulk re-analysis pass
-  vs. the two measurements coexisting for a while). Branch
-  `feature/star-detection-fix` exists in both repos, **not pushed**.
-- **One place to watch what the app is doing** (full detail:
-  `docs/backlog-v0.5.6.md` item 5). Progress today is scattered per feature:
+- **One place to watch what the app is doing** (raised by the owner
+  2026-09-06). Progress today is scattered per feature:
   the sidebar `ComputeQueueIndicator` lists `running`/`queued` only, no
   stage/percent; a master build's stage and percent render nowhere but a 10px
   table cell on the Coverage tab; Analysis, transfers, scan, export and
@@ -2247,6 +2337,10 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
   whether `ComputeQueueEntry` growing a subject id (enough to join an existing
   progress stream) is sufficient on its own; whether the per-feature widgets
   fold into it or stay as they are.
+
+- **Perseus 0.5.1 library — four decisions to ratify:** cross-directory Library selection; the in-flight gate that blocks a divert while a sibling is Delivered or Waiting; the chip naming the original batch after a re-send; out-of-band deletions are re-detected only on restart, and byte-identical mtime-preserving re-copies never. (carried from memory 2026-10-23; may already be done)
+- **`formatTimestamp` seconds** (wave 5.5 ruling R31): the helper is documented as HH:MM but the owner's date rule says always seconds; only the Exchange Received table opts into seconds. Make seconds the default, or keep the exception? (carried from memory 2026-10-23; may already be done)
+- **Master-hash pass off the scan thread:** the "Verifying master duplicates" pass still reads shortlisted masters on the scan thread; moving it off is the owner's call (2026-09-17 triage). (carried from memory 2026-10-23; may already be done)
 
 ---
 
@@ -2295,4 +2389,22 @@ originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.
 - **The LN scale is derived from the image** (short side ÷ Grid size, default 4, snapped to 256 … 8192), shown as "Resolved scale". Large sensors get a larger default (a short side above 5120 px resolves above 1024; 3584 – 5120 px stays at 1024). A stored scale of 1024 becomes Auto; any other stored value stays fixed.
 - **The LN master's star signal rises with the new default scale estimator (common aperture, growth curve):** +4.3 % on set 204 mono and +6.9 % on run B mono against the previous PSF-signal estimator with the new star selection; OSC colour balance moves by up to 0.6 %; master SNR rises (+0.3 % set 204, +1.9 % run B). PSF signal stays selectable under Star flux; a stored document that names it keeps it.
 - **Stars for the LN scale are selected** (not saturated, peak SNR at least 40, the 500 brightest pairs).
+- **Stacking re-measures every frame set once; the star-flux correction no longer reads hot pixels.** The per-plane aperture correction behind every frame weight and star flux now takes only real point sources at SNR 20 and above: on a colour (OSC) frame a candidate that has no counterpart in the other colour planes, such as a hot pixel, is left out, so hot pixels no longer bias the red plane's correction (an uncorrected raw frame read its red weight at about 0.4 of the right value). A frame plane with too few usable stars for its own correction now takes the median correction of its group's other frames for its weight, instead of none (it weighed about 0.3 of its peers on an undersampled red plane). The first stack after the upgrade re-measures, re-registers and re-normalizes every set once (calibration is not redone); on the test sets the weights and the masters did not change.
 - **A warning when a light has a flat but no dark or bias:** in the stacking plan, the Export tab (Calibrated lights) and the run summary, with OFFSET/GAIN and, in the run, the flat's darkest corner. Advisory only: it never blocks or changes a link.
+
+- **Plan C: Analysis, Blink and the plate-solve gate now use the stacking star measurement.**
+  - **Colour (OSC) frames are measured on their green pixels.** Widths (FWHM) of OSC frames change in their own right (the C9 corpus: −10 … −27 % against the old figures on the mosaic frames); a debayered frame is measured on its G plane.
+  - **Every Analysis number is re-measured once** (measurement version 7). Legacy rows recompute on the next analysis; the first start after the update rebuilds the per-star table (`star_metrics`) - seconds to a minute on a large catalog.
+  - **The first stack after the update re-measures, re-registers and re-normalizes every cached frame set once** (calibration is not redone): the measurement version moved, the stacking numbers did not (on the three test trees the weights and the masters are identical).
+  - **`stars_detected` is 3–9× deeper** (point-like matched-filter seeds, knots not counted). The collab `stars_detected` rules and the hub frame meta need re-tuning.
+  - **`detection_threshold` is now σ of the matched filter** (default 6.0); legacy rows hold ADU.
+  - **Review stored thresholds.** The numbers moved: the Analysis rejection defaults, the frame-set `max_fwhm_px` / `max_eccentricity`, and the collab project rules on `fwhm_arcsec`, `eccentricity`, `median_snr`, `snr_weight` and `frame_snr`.
+  - **A Verdict column (Trailed / Defocused / No stars) replaces Trail R²**, in the Analysis table, Blink's frame panel, the Black Hole section and the CSV export; the R² chart metric is gone. A "Refused" count column stays.
+  - **"Reject unusable frames" replaces "Reject trailed":** it rejects any frame with a verdict, and a legacy row by its old trailed flag until it is re-measured.
+  - **Removed settings:** Detection Sigma, Min / Max Star Area, Saturation Fraction, Trail Threshold, MRS layers, the PSF fit knobs, and Plate Solving's Max Median Eccentricity / Min Trail R². A stored value is ignored.
+  - **The plate-solve gate refuses a Trailed frame before solving** (the verdict alone; an old stored 0.85 / 0.65 pair is ignored). It stays quiet on a frame until the frame is re-analysed.
+  - **Frame SNR is a ratio**, not decibels: every "dB" label is gone, and the per-filter stacked SNR is the quadrature sum.
+  - **16-bit FITS written with `BZERO` 0 are read with the right offset** (rustafits 1.6), and OSC FITS files with an odd `XBAYROFF` / `YBAYROFF` now preview and measure in the right CFA phase (rustafits #7).
+  - **Round-star eccentricity floor 0.27 → 0.12 at F 2.6** (an F 2.6 figure, not generalized): well-sampled round stars read rounder; the Blink ellipse colours (0.5 / 0.6) may need a second look.
+  - **Blended star pairs are refused in the Analysis tab and Blink** (an extra `Blend` entry in the Refused count): two stars inside one fit's half-maximum contour no longer inflate a FWHM; close pairs with no second detection are not caught. Stacking does not refuse them, so the Analysis tab may list up to about 2 % fewer stars than the stack measures.
+  - **Blink star ellipses are sized by brightness**, and the settings reset icon now sits beside its label.

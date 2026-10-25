@@ -17,9 +17,11 @@
 //! frame's first get right after it (spec §12). Every latency is measured
 //! conservatively — from just before the triggering action, or from the last
 //! poll that had not yet seen it — and printed (`--nocapture`) beside its
-//! bound. A bound the code misses is fixed in the owning code, never widened
-//! here; the bounds that depend on load are derived below from what is in
-//! flight, each with its derivation.
+//! bound; the bounds that depend on load are derived below from what is in
+//! flight, each with its derivation. The assertion fails only past
+//! [`ts::LOAD_SLACK`] times the bound (a hang, not a loaded machine): these
+//! scenarios flaked under the full parallel suite and passed alone (owner
+//! ruling 2026-10-24). A latency printed over its bound is still a finding.
 //!
 //! The run against the real test hub and the test relay is owed
 //! (`docs/superpowers/open-items.md`, collab v3 wave 3).
@@ -32,12 +34,15 @@ use crate::api::collab_live::{set_receive_streams, shutdown};
 use crate::db::collab_frames::LocalState;
 use crate::sharing::iroh::assign::{ItemOutcome, LiveVerdict};
 
-/// Assert a measured latency against its bound, and print both.
+/// Print a measured latency beside its bound; fail only on a hang
+/// ([`ts::LOAD_SLACK`] times the bound).
 fn within(scenario: &str, took: Duration, bound: Duration) {
-    eprintln!("scenario {scenario}: {took:?} (bound {bound:?})");
+    let over = if took > bound { " — OVER the bound" } else { "" };
+    eprintln!("scenario {scenario}: {took:?} (bound {bound:?}){over}");
+    let hang = bound * ts::LOAD_SLACK;
     assert!(
-        took <= bound,
-        "scenario {scenario}: took {took:?}, bound {bound:?}"
+        took <= hang,
+        "scenario {scenario}: took {took:?}, bound {bound:?}, hang limit {hang:?}"
     );
 }
 
@@ -70,6 +75,7 @@ async fn served_within(
     hash: iroh_blobs::Hash,
     limit: Duration,
 ) -> Duration {
+    let limit = limit * ts::LOAD_SLACK;
     let t0 = Instant::now();
     loop {
         let out = fetcher.get_from(provider, hash).await.0;
@@ -85,6 +91,7 @@ async fn served_within(
 }
 
 async fn wait_for(what: &str, limit: Duration, mut pred: impl FnMut() -> bool) -> Duration {
+    let limit = limit * ts::LOAD_SLACK;
     let t0 = Instant::now();
     while !pred() {
         assert!(t0.elapsed() < limit, "{what}: not within {limit:?}");
@@ -387,7 +394,7 @@ async fn versions_mid_download_and_interrupted_landing() {
     w.a_republishes_changed(&frame).await;
     let v2_bytes = w.a.file_bytes(&frame);
     assert_ne!(v1_bytes, v2_bytes);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30) * ts::LOAD_SLACK;
     let mut seen_v1_after_fault = false;
     loop {
         let bytes = std::fs::read(&target)

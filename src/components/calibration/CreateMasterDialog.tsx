@@ -12,7 +12,7 @@ interface CreateMasterDialogProps {
 }
 
 // Two-axis integration recipe (spec §4): Combination × Rejection algorithm,
-// matching PixInsight's ImageIntegration mental model.
+// matching the ERP's integration mental model.
 type CombinationChoice = 'auto' | Combination;   // 'auto' | 'average' | 'median'
 // The five rejection algorithms this dialog offers. `Rejection` also carries
 // the three stacking-side M4c algorithms (min/max, ESD, RCR — spec §6.3),
@@ -32,7 +32,7 @@ interface RejectionParams {
   linearFit: { low: number; high: number };
 }
 
-// PixInsight panel defaults (spec §1/§4). Percentile uses the dialog default
+// The ERP's integration-panel defaults (spec §1/§4). Percentile uses the dialog default
 // 0.2/0.1 — Auto keeps its own tuned 0.2/0.02 server-side (spec §2), not here.
 const DEFAULT_PARAMS: RejectionParams = {
   percentile: { low: 0.2, high: 0.1 },

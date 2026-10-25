@@ -11,6 +11,7 @@ import type {
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
 import { ReassignFramePanel } from './ReassignFramePanel';
+import { stackedFrameSnr } from '../analysis/stackedSnr';
 import type { BuildState } from '../../hooks/useMasterBuilds';
 
 type CalSetKind = 'Flat' | 'Dark' | 'Bias';
@@ -140,7 +141,7 @@ export interface LightRow {
   allFrameIds: number[];
   avgFwhm: number | null;
   avgEcc: number | null;
-  avgSnr: number | null;
+  stackedSnr: number | null;
   totalIntegration: number | null;
   // for sorting
   sortTemp: number | null;
@@ -364,23 +365,22 @@ function deriveTableData(
         // Compute metrics from analysis data
         let avgFwhm: number | null = null;
         let avgEcc: number | null = null;
-        let avgSnr: number | null = null;
+        let stackedSnr: number | null = null;
         if (analysisData) {
           let fwhmSum = 0, fwhmCount = 0;
           let eccSum = 0, eccCount = 0;
-          let snrSumSq = 0, snrCount = 0;
+          const snrValues: number[] = [];
           for (const f of groupFrames) {
             const a = analysisData.get(f.frame_id);
             if (a) {
               fwhmSum += a.median_fwhm; fwhmCount++;
               eccSum += a.median_eccentricity; eccCount++;
-              const linear = Math.pow(10, a.frame_snr / 20);
-              snrSumSq += linear * linear; snrCount++;
+              snrValues.push(a.frame_snr);
             }
           }
           if (fwhmCount > 0) avgFwhm = fwhmSum / fwhmCount;
           if (eccCount > 0) avgEcc = eccSum / eccCount;
-          if (snrCount > 0) avgSnr = 20 * Math.log10(Math.sqrt(snrSumSq));
+          stackedSnr = stackedFrameSnr(snrValues) ?? null;
         }
 
         lightRows.push({
@@ -402,7 +402,7 @@ function deriveTableData(
           allFrameIds: groupFrames.map(f => f.frame_id),
           avgFwhm,
           avgEcc,
-          avgSnr,
+          stackedSnr,
           totalIntegration: fg.exptime != null ? groupFrames.length * fg.exptime : null,
           sortTemp: temps.filter((t): t is number => t != null).reduce((a, b) => a + b, 0) / (temps.filter(t => t != null).length || 1) || null,
           sortDate: dates[0] ?? null,
@@ -749,7 +749,7 @@ function CreateMasterCell({
 
 // ── Lights Table ───────────────────────────────────────────────────────────
 
-type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDate' | 'camera' | 'focallen' | 'flatSetId' | 'darkSetId' | 'avgFwhm' | 'avgEcc' | 'avgSnr' | 'totalIntegration';
+type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDate' | 'camera' | 'focallen' | 'flatSetId' | 'darkSetId' | 'avgFwhm' | 'avgEcc' | 'stackedSnr' | 'totalIntegration';
 
 function LightsTable({
   rows,
@@ -808,7 +808,7 @@ function LightsTable({
             <SortTh field="darkSetId" label="Dark" {...thProps} />
             {!compact && <SortTh field="avgFwhm" label="FWHM" {...thProps} />}
             {!compact && <SortTh field="avgEcc" label="Ecc" {...thProps} />}
-            {!compact && <SortTh field="avgSnr" label="SNR" {...thProps} />}
+            {!compact && <SortTh field="stackedSnr" label="SNR" {...thProps} />}
             {!compact && <SortTh field="totalIntegration" label="Total" {...thProps} />}
           </tr>
         </thead>
@@ -873,7 +873,7 @@ function LightsTable({
                 )}
                 {!compact && (
                   <td className="px-1.5 py-1 text-sm text-content-secondary">
-                    {row.avgSnr != null ? row.avgSnr.toFixed(1) : '—'}
+                    {row.stackedSnr != null ? row.stackedSnr.toFixed(1) : '—'}
                   </td>
                 )}
                 {!compact && (

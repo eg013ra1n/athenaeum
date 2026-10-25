@@ -8132,13 +8132,16 @@ mod tests {
         // 2026-10-08 one star-measurement path Plan A Task 3 (R-OSP-1): MEASURE_VERSION 4 replaces the old fit-version constant (3) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-08 one star-measurement path Plan A Task 7 (R-OSP-2): `measurement.seedSource` (matchedFilter) and `seedThreshold` join the measurement subtree (hand edit) - meas moves on every line, and reg, ln and (custom) follow; calib, ln_ref and ln_cal are UNCHANGED.
         // 2026-10-13 one star-measurement path Plan A Task 11b (owner decision R11b-12): under `Auto` (all four lines) the measurement hash folds the group beta (`measure_beta:1.500000` here) - meas, reg and ln move on every line; calib, ln_ref and ln_cal are UNCHANGED (Moffat4 would not move).
+        // 2026-10-23 Plan B B4 (PB-14): MEASURE_VERSION 5 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
+        // 2026-10-24 Plan C R-PC-10 (the Blend refusal): MEASURE_VERSION 6 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
+        // 2026-10-25 Plan C R-PC-10b (the Blend refusal on the Analysis path only): MEASURE_VERSION 7 (6 is burnt) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=478536aa8678edba ln_ref=2676a6e017eebe13 ln=2f19f183b2f12b77 ln_cal=f6195d69cd7bbaee",
-                "fastPreview: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=b61848004bf0ab46 ln_ref=2676a6e017eebe13 ln=715484427a4950be ln_cal=f6195d69cd7bbaee",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=7107c326cd4b34c0 reg=60d6857040956328 ln_ref=1237e3e6fdf2cf1c ln=e81ae122b7b28658 ln_cal=6bb6c12538e4e622",
-                "custom: calib=2b725e5e99c87f49 meas=f9ce75e901d7ba19 reg=cde510750fb8539c ln_ref=1237e3e6fdf2cf1c ln=f380eb5216cb7300 ln_cal=6bb6c12538e4e622",
+                "default: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=93c65ea07388f9ec ln_ref=aff429c43dcfed70 ln=affdd0e2d03f312e ln_cal=dc6eb80c40566822",
+                "fastPreview: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=529c0fc0ef53468e ln_ref=aff429c43dcfed70 ln=681b1c1ce68acb23 ln_cal=dc6eb80c40566822",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=40a78afaaecb67fb ln_ref=f4bc014c4d50642f ln=204d6c10b503fdde ln_cal=9d19e1d00d1d1701",
+                "custom: calib=2b725e5e99c87f49 meas=eede4c78d0df187b reg=d218f72dbbd4563a ln_ref=f4bc014c4d50642f ln=903548a039a9babd ln_cal=9d19e1d00d1d1701",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8207,9 +8210,9 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "7107c326cd4b34c0");
-        assert_eq!(reg, "478536aa8678edba");
-        assert_eq!(ln, "2f19f183b2f12b77");
+        assert_eq!(meas, "daf887f63aba01de");
+        assert_eq!(reg, "93c65ea07388f9ec");
+        assert_eq!(ln, "affdd0e2d03f312e");
     }
 
     #[test]
@@ -8280,8 +8283,8 @@ mod tests {
             pass1_hash_for(&cfg, calib),
             "a pure function of its inputs"
         );
-        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4).
-        assert_eq!(key, "3c734a7e6da780d3");
+        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f).
+        assert_eq!(key, "5020355fd05d9c71");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over

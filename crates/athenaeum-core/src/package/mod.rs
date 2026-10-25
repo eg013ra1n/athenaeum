@@ -141,7 +141,7 @@ pub fn validate_package_id(package_id: &str) -> Result<()> {
 ///
 /// Deliberately distinct from [`crate::duplicates::compute_xxhash`], which
 /// SAMPLES (first/middle/last 512 KB) for fast move-verify and the transfer
-/// dedup pre-check. Sampling cannot decide identity: two PixInsight masters
+/// dedup pre-check. Sampling cannot decide identity: two ERP-produced masters
 /// differ by ONE Float32 pixel — 4 bytes in 77 MiB — and a sampling scheme's
 /// chance of noticing tracks the fraction of the file it reads (spec
 /// `2026-08-27-duplicate-detection-design.md` §2.5). A manifest must catch

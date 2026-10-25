@@ -1938,6 +1938,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             quality_score REAL,
             config_hash TEXT,
             analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            measure_version INTEGER,
+            stars_refused INTEGER,
+            frame_verdict TEXT,
             FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
             UNIQUE(frame_id)
@@ -1967,8 +1970,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             fwhm_x REAL NOT NULL,
             fwhm_y REAL NOT NULL,
             eccentricity REAL NOT NULL,
-            snr REAL NOT NULL,
-            hfr REAL NOT NULL,
+            snr REAL,
+            hfr REAL,
             theta REAL NOT NULL,
             beta REAL,
             fit_method TEXT NOT NULL,
@@ -2020,6 +2023,116 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             "ALTER TABLE frame_analysis RENAME COLUMN snr_db TO frame_snr",
             [],
         )?;
+    }
+
+    // Plan C C6: the measurement version, the refusal count and the frame verdict (NULL = a legacy row).
+    for (column, ddl) in [
+        ("measure_version", "INTEGER"),
+        ("stars_refused", "INTEGER"),
+        ("frame_verdict", "TEXT"),
+    ] {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if has == 0 {
+            conn.execute(
+                &format!("ALTER TABLE frame_analysis ADD COLUMN {column} {ddl}"),
+                [],
+            )?;
+        }
+    }
+
+    // Plan C C6 (PC-8): `star_metrics.snr` / `hfr` become nullable. SQLite cannot drop NOT NULL, so the table is rebuilt
+    // in one transaction when `snr` still carries it.
+    let snr_not_null: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(\"notnull\"), 0) FROM pragma_table_info('star_metrics') WHERE name = 'snr'",
+        [],
+        |row| row.get(0),
+    )?;
+    if snr_not_null == 1 {
+        let started = std::time::Instant::now();
+        let rebuilt = (|| -> Result<i64> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            // Desktop and web may share one catalog: re-probe under the write lock.
+            let still_not_null: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(\"notnull\"), 0) FROM pragma_table_info('star_metrics') WHERE name = 'snr'",
+            [],
+            |row| row.get(0),
+        )?;
+            if still_not_null != 1 {
+                return Ok(0);
+            }
+            // Rows whose analysis is gone (deleted with enforcement off) would violate the new foreign key.
+            let orphans: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM star_metrics WHERE frame_analysis_id NOT IN (SELECT id FROM frame_analysis)",
+            [],
+            |row| row.get(0),
+        )?;
+            if orphans > 0 {
+                tracing::warn!(
+                    count = orphans,
+                    "schema: star_metrics rebuild drops orphan star rows"
+                );
+            }
+            tx.execute_batch(
+            "CREATE TABLE star_metrics_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_analysis_id INTEGER NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                peak REAL NOT NULL,
+                flux REAL NOT NULL,
+                fwhm REAL NOT NULL,
+                fwhm_x REAL NOT NULL,
+                fwhm_y REAL NOT NULL,
+                eccentricity REAL NOT NULL,
+                snr REAL,
+                hfr REAL,
+                theta REAL NOT NULL,
+                beta REAL,
+                fit_method TEXT NOT NULL,
+                fit_residual REAL NOT NULL,
+                FOREIGN KEY (frame_analysis_id) REFERENCES frame_analysis(id) ON DELETE CASCADE
+            );
+            INSERT INTO star_metrics_new (
+                id, frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
+                eccentricity, snr, hfr, theta, beta, fit_method, fit_residual
+            ) SELECT
+                id, frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
+                eccentricity, snr, hfr, theta, beta, fit_method, fit_residual
+            FROM star_metrics
+            WHERE frame_analysis_id IN (SELECT id FROM frame_analysis);
+            -- Carry the AUTOINCREMENT high-water mark: the rename leaves the new table without the old one's
+            -- sqlite_sequence row, and retired ids would otherwise be reused. The new table has a row only once a copy
+            -- landed, so seed it first (nothing kept: every row an orphan, or an emptied table).
+            INSERT INTO sqlite_sequence (name, seq)
+                SELECT 'star_metrics_new', 0
+                WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'star_metrics_new');
+            UPDATE sqlite_sequence
+               SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'star_metrics'), 0))
+             WHERE name = 'star_metrics_new';
+            DROP TABLE star_metrics;
+            ALTER TABLE star_metrics_new RENAME TO star_metrics;
+            CREATE INDEX IF NOT EXISTS idx_star_metrics_analysis_id ON star_metrics(frame_analysis_id);",
+        )?;
+            let kept: i64 =
+                tx.query_row("SELECT COUNT(*) FROM star_metrics", [], |row| row.get(0))?;
+            tx.commit()?;
+            Ok(kept)
+        })();
+        let kept = rebuilt.inspect_err(|e| {
+            tracing::error!(error = %e, "schema: star_metrics rebuild failed");
+        })?;
+        tracing::info!(
+            count = kept,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "schema: star_metrics rebuilt with nullable snr / hfr"
+        );
     }
 
     // Calibration set originals table - stores original metadata values before custom edits

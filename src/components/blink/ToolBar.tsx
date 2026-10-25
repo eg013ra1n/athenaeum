@@ -131,7 +131,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
 
         {/* Flat contour plot — toggle. Only enabled for FLAT / MASTERFLAT
             frames. When active, the main canvas shows the contour plot
-            (PixInsight FlatContourPlot v1.3.1 port) instead of the FITS
+            (port of the ERP's flat-contour-plot script v1.3.1) instead of the FITS
             preview. Settings live in Settings → General → Flat Contour Plot. */}
         <button
           onClick={onShowContourPlot}

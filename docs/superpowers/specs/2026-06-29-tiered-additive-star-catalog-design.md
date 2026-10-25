@@ -18,7 +18,7 @@ used as a fast quad-matching first try. Two problems:
 2. **All-or-nothing download.** Users fetch one large catalog regardless of their
    rig's field of view.
 
-ASTAP's modern databases solve exactly this by being **density-limited, not
+An external plate solver's modern databases solve exactly this by being **density-limited, not
 magnitude-limited**: sorted to a target stars/deg², going as deep as `G≈21` in
 star-poor sky and capping star-rich sky. The user wants the same idea, made
 **additive**: download a sparse base, then download *only the extra stars* needed
@@ -50,8 +50,8 @@ failure (we chose proactive-only).
   | +Δ2 | 5 000 | 4 200 | 0.2° |
   | +Δ3 | 8 000 | 6 720 | 0.15° |
 
-  (Density values follow ASTAP's tested FOV mapping; **our code uses its own
-  naming** — `tier_<density>` — not ASTAP's letters.)
+  (Density values follow that solver's tested FOV mapping; **our code uses its own
+  naming** — `tier_<density>` — not that solver's letters.)
 
 - **Each layer is a disjoint per-cell magnitude band.** Records are mag-sorted
   ascending within a cell, so each star has a deterministic *rank*; layers are

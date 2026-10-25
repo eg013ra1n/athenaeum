@@ -43,7 +43,7 @@ notify({
   only — never on `*-progress` (high-frequency). Use `dedupeKey` (e.g. an
   operation id) when the handler can fire more than once.
 - **Tauri/SSE listener pattern (required, StrictMode-safe).** `api.listen` is
-  async; React 18 StrictMode double-mounts in dev. If you `await` the unlisten
+  async; React StrictMode double-mounts in dev. If you `await` the unlisten
   into a variable, the cleanup can run before it resolves → a **leaked second
   listener** (double events). Always use the cancelled-flag form:
 
@@ -82,7 +82,7 @@ there: core ends that run `refused` with the same code, and the row below notifi
 | `done`, all counts zero | silent | none |
 | `cancelled` | "Stopped in {title}" (info, history only: `toast: false`) | `?tab=mine` |
 | `refused` for lack of free space (`collab_no_space:<needed>:<free>`, decimal bytes, `needed` incl. the 1 GB reserve; §16.1 N41) | "Not enough free space to calibrate in {title}" (warning, `hasErrors`; detail: "Not enough free space for the calibrated frames: X GB needed (incl. 1 GB reserve), Y GB free on the Collaboration folder's disk."). Toasts for a manual AND an auto run; an auto run carries `dedupeKey` `collab-no-space-{projectId}-{local YYYY-MM-DD}`, and a repeated key drops the toast and the history entry alike, so a worker refused on every scan notifies once a day per project | `?tab=mine` |
-| `refused`, any other reason | "{Device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8; a nameless device reads "Another device of this account publishes {title}"); "Not published in {title}" with "This hub needs a newer Athenaeum — update to publish." for an outdated build (`collab_api_outdated…`), otherwise with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
+| `refused`, any other reason | "{Device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8; a nameless device reads "Another device of this account publishes {title}"); "Not published in {title} — this hub needs a newer Athenaeum" (detail "This hub needs a newer Athenaeum — update to publish.") for an outdated build (`collab_api_outdated…`), otherwise with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
 | `failed` | "Publishing failed in {title}" + the error, `hasErrors` | `?tab=mine` |
 
 The `segment` URL parameter is handled like `tab` (applied, then removed from the URL).
@@ -104,7 +104,7 @@ Toasts show titles only, so the failure reason is part of the Live pill's title.
 
 One global system: `notify()` from `useNotifications()` (`src/contexts/NotificationContext.tsx`) — never ad-hoc toasts or banners. Fields: `title`, `detail`, `kind` (`NotificationKind` — adding one means the union AND the icon map in `NotificationPanel.tsx`), `tone`, `hasErrors`, `link`, `toast` (`false` = history entry only), `dedupeKey`. History and the dedupe set persist to `localStorage`. Backend events become notifications in the existing completion handler of the relevant hook (`useScanProgress`, `useExportProgress`, `useAnalysisProgress`, …), on **discrete outcomes only — never on `*-progress`**. Timestamps via `formatTimestamp` (`src/utils/dateFormatting.ts`). Full contract: `docs/frontend/notifications.md`.
 
-**Tauri/SSE listener pattern (required, StrictMode-safe).** `api.listen` is async and React 18 StrictMode double-mounts in dev; awaiting the unlisten into a variable lets the cleanup run before it resolves → a leaked second listener. Always:
+**Tauri/SSE listener pattern (required, StrictMode-safe).** `api.listen` is async and React StrictMode double-mounts in dev; awaiting the unlisten into a variable lets the cleanup run before it resolves → a leaked second listener. Always:
 
 ```ts
 useEffect(() => {

@@ -1,9 +1,10 @@
 import { useState, useCallback, useMemo } from 'react';
-import { ChevronDown, ChevronRight, RotateCw, Eye, AlertTriangle } from 'lucide-react';
+import { ChevronDown, ChevronRight, RotateCw, Eye } from 'lucide-react';
 import { api } from '../../api';
 import { ConfirmDialog } from '../ConfirmDialog';
 import type { FrameAnalysis } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
+import { rowVerdict } from '../analysis/unusable';
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-';
@@ -131,7 +132,7 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
               <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10 text-xs font-semibold text-content-secondary">PSF Signal</th>
               <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10 text-xs font-semibold text-content-secondary">SNR Weight</th>
               {/* Tracking group — orange tint */}
-              <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10 text-xs font-semibold text-content-secondary">Trail R²</th>
+              <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10 text-xs font-semibold text-content-secondary">Verdict</th>
               {/* Beta column — only shown when Moffat data exists */}
               {hasBeta && (
                 <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10 text-xs font-semibold text-content-secondary">Moffat β</th>
@@ -163,26 +164,21 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
                   <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">{analysis ? analysis.frame_snr.toFixed(1) : '-'}</td>
                   <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">{analysis ? analysis.psf_signal.toFixed(1) : '-'}</td>
                   <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">{analysis ? analysis.snr_weight.toFixed(1) : '-'}</td>
-                  {/* Tracking group — orange tint */}
-                  <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-orange/5">
+                  {/* Measurement outcome group — orange tint */}
+                  <td className="px-1.5 py-1 text-sm text-center bg-orange/5">
                     {analysis ? (
-                      <span className="inline-flex items-center gap-1">
-                        {analysis.trail_r_squared.toFixed(3)}
-                        {analysis.possibly_trailed && (
-                          <span title={analysis.trail_r_squared >= 0.3
-                            ? "Directional trail detected (RA drift)"
-                            : "Guiding issue (wind/vibration)"
-                          }>
-                            <AlertTriangle size={14} className="text-warning" />
-                          </span>
-                        )}
+                      <span
+                        className={rowVerdict(analysis).className}
+                        title={rowVerdict(analysis).tooltip}
+                      >
+                        {rowVerdict(analysis).label}
                       </span>
                     ) : '-'}
                   </td>
                   {/* Beta column — only shown when Moffat data exists */}
                   {hasBeta && (
                     <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
-                      {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
+                      {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '\u2014'}
                     </td>
                   )}
                   {/* Action */}

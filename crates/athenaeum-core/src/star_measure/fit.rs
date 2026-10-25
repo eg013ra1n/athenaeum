@@ -273,7 +273,8 @@ pub struct StarFit {
     #[serde(skip)]
     pub sky_ring_n: u32,
     /// The star's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]): `S / sigma_S` over the star's own ring
-    /// sky and noise, computed after the aperture correction (`signal`) and again when a ring is re-read
+    /// sky and noise. It reads neither `signal` nor `c` and is read BEFORE `c` (the SNR floor of the correction's sample:
+    /// `snr_pass` runs before `aperture_correction` inside `ring_and_correction`), and again when a ring is re-read
     /// ([`super::correct_at_ring`]). Every accepted fit carries one, saturated and extended included (R11-5); NaN
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
@@ -358,6 +359,9 @@ pub struct FitOutcome {
     /// The standard error of the median `aperture_correction` is, from the ratios' MAD (`1.2533 * 1.4826 * MAD /
     /// sqrt(n)`); `None` where `c` was not measured on the plane's own ratios.
     pub aperture_se: Option<f64>,
+    /// What the plane's own `aperture_correction` screened out (the point-source and SNR counts) and the ratios it took
+    /// its median over (Plan B B4, PB-12' / PB-13'); empty for a caller's `c` and where no ratio was read.
+    pub aperture_screens: super::photometry::ApertureScreens,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present ring pixels, or no ring width on
     /// the plane); their `sky_ring` and `sky_ring_sigma` are NaN and `sky_ring_n` 0.
     pub ring_sky_missing: usize,
@@ -737,11 +741,14 @@ impl FitTrace {
     fn record(
         self,
         seed: usize,
+        at: &Seed,
         outcome: Outcome,
         verdict: Option<SaturationVerdict>,
     ) -> FitDiagnostics {
         FitDiagnostics {
             seed,
+            x: at.x,
+            y: at.y,
             outcome,
             region_radius: self.region_radius,
             background_start: self.background_start,
@@ -1466,10 +1473,7 @@ pub(super) fn seed_passes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// The frame β sample's pixel-integrated fits on the measure path (F-4 as revised by the owner's ruling E5,
@@ -1501,10 +1505,7 @@ pub(super) fn sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Q7 under E5 (a caller that ran no verdict, [`super::beta::frame_beta`]): for each of `seeds` (the caller's
@@ -1533,10 +1534,7 @@ pub(super) fn own_sample_fits(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// [`integrated_beta`] on the region `scratch.px` holds (gathered for `reg`), in stamp coordinates from `reg`'s rim
@@ -1725,6 +1723,57 @@ fn canonical_theta(theta: f64) -> f64 {
     }
 }
 
+/// The blend rule's guard (Plan C R-PC-10), in field widths: a seed closer than `BLEND_SEED_GUARD · F_field` to the
+/// fit's own seed is a second local maximum of the same core, never a second star.
+pub const BLEND_SEED_GUARD: f64 = 0.5;
+
+/// The blend refusal (Plan C R-PC-10), run on the accepted fits before the duplicate drop: a fit is refused
+/// [`RefusalReason::Blend`] when another seed of the plane's detection lies inside its half-maximum ellipse (centre
+/// `(x, y)`, semi-axes `fwhm_x / 2`, `fwhm_y / 2` turned by `theta`, [`inside_half_max`]) and at least
+/// [`BLEND_SEED_GUARD`]` · field_fwhm` from the fit's own seed. The plane's seeds are `neighbours.seeds` when the fit
+/// call was handed a subset of them (the budget's candidates, the only caller that sets the flag since R-PC-10b: every
+/// detected seed, fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
+/// fit's own seed (`of_fit[i]`, else `i`) never counts. A refused fit leaves `accepted` (the order of the rest is
+/// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set. Runs only when
+/// the call's [`Correction::blend_refusal`] is set (the Analysis budget path, R-PC-10b).
+fn refuse_blends(
+    accepted: &mut Vec<(usize, StarFit)>,
+    outcomes: &mut [Outcome],
+    seeds: &[Seed],
+    neighbours: Option<Neighbours<'_>>,
+    field_fwhm: f64,
+    enabled: bool,
+) {
+    if !enabled || accepted.is_empty() {
+        return;
+    }
+    let (plane, of_fit): (&[Seed], Option<&[usize]>) = match neighbours {
+        Some(n) => (n.seeds, Some(n.of_fit)),
+        None => (seeds, None),
+    };
+    let points: Vec<(f64, f64)> = plane.iter().map(|s| (s.x, s.y)).collect();
+    let tree = crate::geometry::kdtree::KdTree2::build(&points);
+    let guard = BLEND_SEED_GUARD * field_fwhm;
+    accepted.retain(|(i, f)| {
+        let own_index = of_fit.map_or(*i, |v| v[*i]);
+        let own = &seeds[*i];
+        let (semi_x, semi_y) = (0.5 * f.fwhm_x, 0.5 * f.fwhm_y);
+        let blend = tree
+            .within(f.x, f.y, semi_x.max(semi_y))
+            .into_iter()
+            .any(|(j, _)| {
+                let s = &plane[j];
+                j != own_index
+                    && inside_half_max(s.x - f.x, s.y - f.y, semi_x, semi_y, f.theta)
+                    && (s.x - own.x).hypot(s.y - own.y) >= guard
+            });
+        if blend {
+            outcomes[*i] = Outcome::Refused(RefusalReason::Blend);
+        }
+        !blend
+    });
+}
+
 /// Drop every fit that has a brighter accepted fit within ±1 px. Each fit
 /// travels with its seed index, which the comparison never reads: the stable
 /// sort orders the pairs exactly as it orders the bare fits, so the kept
@@ -1799,10 +1848,7 @@ fn fit_all_outcomes(
             })
             .collect()
     };
-    match pool {
-        Some(pl) => pl.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body)
 }
 
 /// Fit every seed with the chosen model. `Auto` resolves the continuous frame β from its own sample — the bounded
@@ -1861,9 +1907,17 @@ pub(super) struct Correction<'a> {
     /// Population (a) among the fit call's seeds (Plan A Task 13b, [`super::population`]): the ring width reads its
     /// fits alone and `c` is the median of the 64 brightest qualifying fits of (a). `None` = every fit counts, as before.
     pub(super) population: Option<super::population::PopulationView<'a>>,
+    /// Every OTHER plane's seeds on an image of more than one plane (Plan B B4, PB-12'): a `c` candidate with none of
+    /// them within `max(`[`super::photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of its fitted centre (R-PB4-2) is screened out. `None` = no screen
+    /// (one plane, LN's refits, every caller but the stacking halves).
+    pub(super) siblings: Option<&'a [Seed]>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
+    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b): `true` only on the Analysis budget path
+    /// ([`super::Mode::Budget`]); the stacking Measure, LN's refits and registration leave it `false` and fit as at
+    /// `MEASURE_VERSION` 5.
+    pub(super) blend_refusal: bool,
 }
 
 /// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
@@ -2230,6 +2284,17 @@ fn fit_at_width(
             traces.push(trace);
         }
     }
+    // Plan C R-PC-10 / R-PC-10b: on the Analysis path (`correction.blend_refusal`), a fit with another seed of the
+    // plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit the plane
+    // verdicts refused never reaches it). The stacking, LN and registration fits do not run the rule.
+    refuse_blends(
+        &mut accepted,
+        &mut outcomes,
+        seeds,
+        correction.neighbours,
+        field.fwhm_px,
+        correction.blend_refusal,
+    );
     let mut kept = dedupe(accepted);
     for (star, &(seed, _)) in kept.iter().enumerate() {
         outcomes[seed] = Outcome::Accepted { star };
@@ -2241,10 +2306,10 @@ fn fit_at_width(
             f.flags |= StarFlags::EXTENDED;
         }
     }
-    // F-10 (Task 10b, ruling B2) then F-5 (Task 10): every kept fit's ring sky B_i and σ_i, then the aperture
-    // correction from them, after the duplicate drop and before any total reads `signal`; neither moves a fit, `c`
-    // only every kept fit's flux.
-    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm) =
+    // F-10 (Task 10b, ruling B2) then F-6 and F-5 (Task 10, Plan B B4): every kept fit's ring sky B_i and σ_i, then its
+    // SNR (the `c` sample's floor reads it), then the aperture correction from them, after the duplicate drop and
+    // before any total reads `signal`; none moves a fit, `c` only every kept fit's flux.
+    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm, screens) =
         ring_and_correction(
             data,
             mask,
@@ -2261,8 +2326,8 @@ fn fit_at_width(
             f.signal *= c;
         }
     }
-    // F-6 (Task 11): every kept fit's SNR and HFR, from the stored ring and the corrected `signal`.
-    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, &correction, pool);
+    // F-6 (Task 11): every kept fit's HFR, from the stored ring and the corrected `signal` (its SNR is read before `c`).
+    hfr_pass(data, mask, w, h, &mut kept, ring_fwhm, &correction, pool);
     let mut refused = RefusalCounts::default();
     for o in &outcomes {
         if let Outcome::Refused(reason) = *o {
@@ -2301,7 +2366,7 @@ fn fit_at_width(
         .into_iter()
         .zip(outcomes)
         .enumerate()
-        .map(|(seed, (trace, outcome))| trace.record(seed, outcome, verdict_of(seed)))
+        .map(|(seed, (trace, outcome))| trace.record(seed, &seeds[seed], outcome, verdict_of(seed)))
         .collect();
     let verdict_fit_failed = passes.map_or(0, |v| {
         v.iter()
@@ -2331,6 +2396,7 @@ fn fit_at_width(
         aperture_correction,
         aperture_stars,
         aperture_se,
+        aperture_screens: screens,
         ring_sky_missing,
         fit_seeds,
         ring_fwhm,
@@ -2339,8 +2405,10 @@ fn fit_at_width(
 
 /// Every kept fit's ring sky (Task 10b, F-10, ruling B2: [`super::photometry::ring_skies`] at `correction.ring_fwhm`,
 /// else the plane's own frame FWHM), then the aperture correction from the stored B_i (F-5,
-/// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Returns
-/// `(c, qualifiers, ring_sky_missing, ring_fwhm)`; no `signal` is touched. One body for the fit call and for a later re-read at
+/// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Every fit's
+/// SNR is read between the two (Plan B B4: the `c` sample's floor, [`super::photometry::CORRECTION_MIN_SNR`], reads it;
+/// the SNR reads the ring sky and the pixels, never `c` or `signal`). Returns
+/// `(c, qualifiers, se, ring_sky_missing, ring_fwhm, screens)`; no `signal` is touched. One body for the fit call and for a later re-read at
 /// another ring width ([`correct_at_ring`]).
 #[allow(clippy::too_many_arguments)]
 fn ring_and_correction(
@@ -2353,7 +2421,14 @@ fn ring_and_correction(
     field_fwhm: f64,
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (Option<f64>, usize, Option<f64>, usize, Option<f64>) {
+) -> (
+    Option<f64>,
+    usize,
+    Option<f64>,
+    usize,
+    Option<f64>,
+    super::photometry::ApertureScreens,
+) {
     // R12-5: a budgeted call fits a subset; the discs and the isolation read every detected seed.
     let (all_seeds, own) = match correction.neighbours {
         Some(n) => (n.seeds, Some(n.of_fit)),
@@ -2387,8 +2462,14 @@ fn ring_and_correction(
         }
         super::FluxCorrection::FromPlane => None,
     };
-    let (c, stars, se) = match given {
-        Some(c) => (Some(c), 0, None),
+    snr_pass(data, mask, w, h, kept, correction, pool);
+    let (c, stars, se, screens) = match given {
+        Some(c) => (
+            Some(c),
+            0,
+            None,
+            super::photometry::ApertureScreens::default(),
+        ),
         None => {
             let _s = super::substeps::span(correction.timers, super::Step::ApertureC);
             super::photometry::aperture_correction(
@@ -2405,29 +2486,28 @@ fn ring_and_correction(
                 correction.full_scale,
                 correction.footprint,
                 correction.population,
+                correction.siblings,
             )
         }
     };
-    (c, stars, se, missing, ring_fwhm)
+    (c, stars, se, missing, ring_fwhm, screens)
 }
 
-/// Every kept fit's aperture SNR and half-flux radius (F-6, Task 11, [`super::photometry::star_snr`] and
-/// [`super::photometry::hfr`]) from its stored ring sky and noise and its (aperture-corrected) `signal`, at the ring
-/// width `ring_fwhm` the rings were read at (`None` = no ring anywhere: every fit reads NaN, both). `correction`
-/// carries the plane's gain and noise correlation (default: no gain, white). Neither value is read by anything else in
-/// the fit; nothing the fit measured moves. `pool` as the fit's.
+/// Every kept fit's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]) from its stored ring sky and noise
+/// and the pixels about its fitted centre: it reads neither `signal` nor `c`, so it is read BEFORE the aperture
+/// correction (Plan B B4, PB-13': the `c` sample's floor reads it). `correction` carries the plane's gain and noise
+/// correlation (default: no gain, white). Nothing the fit measured moves. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
-fn snr_and_hfr(
+fn snr_pass(
     data: &[f32],
     mask: Option<&[bool]>,
     w: usize,
     h: usize,
     kept: &mut [(usize, StarFit)],
-    ring_fwhm: Option<f64>,
     correction: &Correction<'_>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
-    let mut body = || {
+    let body = || {
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
@@ -2441,13 +2521,34 @@ fn snr_and_hfr(
                 &correction.noise,
             )
             .0;
+        })
+    };
+    super::install_in_span(pool, body);
+}
+
+/// Every kept fit's half-flux radius (F-6, Task 11, [`super::photometry::hfr`]) from its stored ring sky and its
+/// (aperture-corrected) `signal`, at the ring width `ring_fwhm` the rings were read at (`None` = no ring anywhere:
+/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. `pool` as the
+/// fit's.
+#[allow(clippy::too_many_arguments)]
+fn hfr_pass(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    kept: &mut [(usize, StarFit)],
+    ring_fwhm: Option<f64>,
+    correction: &Correction<'_>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    let body = || {
+        let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
+        kept.par_iter_mut().for_each(|(_, f)| {
+            let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
             f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
         })
     };
-    match pool {
-        Some(p) => p.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body);
 }
 
 /// LN's pair-common ring arm (Task 10b, ruling B3) without a second fit: every fit of `outcome` (a fit call's result
@@ -2473,7 +2574,7 @@ pub(super) fn correct_at_ring(
         .copied()
         .zip(outcome.fits.drain(..))
         .collect();
-    let (c, stars, se, missing, ring_fwhm) = ring_and_correction(
+    let (c, stars, se, missing, ring_fwhm, screens) = ring_and_correction(
         data,
         mask,
         w,
@@ -2490,12 +2591,13 @@ pub(super) fn correct_at_ring(
             f.signal *= c;
         }
     }
-    // F-6 (Task 11): B_i and `signal` moved, so the SNR and HFR are read again.
-    snr_and_hfr(data, mask, w, h, &mut kept, ring_fwhm, correction, pool);
+    // F-6 (Task 11): B_i and `signal` moved, so the HFR is read again (the SNR, read from the new B_i, is already in).
+    hfr_pass(data, mask, w, h, &mut kept, ring_fwhm, correction, pool);
     outcome.fits = kept.into_iter().map(|(_, f)| f).collect();
     outcome.aperture_correction = c;
     outcome.aperture_stars = stars;
     outcome.aperture_se = se;
+    outcome.aperture_screens = screens;
     outcome.ring_sky_missing = missing;
     outcome.ring_fwhm = ring_fwhm;
 }
@@ -2504,7 +2606,9 @@ pub(super) fn correct_at_ring(
 mod tests {
     use super::*;
     use crate::star_measure::{fit_stars_at, FitStarsOptions};
-    use crate::test_support::{add_noise, gaussian_field, moffat_field, MoffatStar};
+    use crate::test_support::{
+        add_donut_gain, add_noise, gaussian_field, moffat_field, ring_samples, MoffatStar,
+    };
 
     fn round(x: f64, y: f64, amp: f64) -> MoffatStar {
         MoffatStar {
@@ -2898,13 +3002,20 @@ mod tests {
 
     /// An INDEPENDENT rescan oracle: the full `(2r+1)²` square's median and maximum, never calling
     /// `region_median`/`push_finite_row`.
-    fn pin_rescan_square(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<(f64, f64)> {
+    fn pin_rescan_square(
+        data: &[f32],
+        mask: Option<&[bool]>,
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r: i64,
+    ) -> Option<(f64, f64)> {
         let mut v: Vec<f32> = Vec::new();
         for y in cy - r..=cy + r {
             let row = y as usize * w;
             for x in cx - r..=cx + r {
                 let p = data[row + x as usize];
-                if p.is_finite() {
+                if p.is_finite() && mask.map_or(true, |m| m[row + x as usize]) {
                     v.push(p);
                 }
             }
@@ -2917,13 +3028,21 @@ mod tests {
     }
 
     /// The oracle's rim: every pixel of the square whose Chebyshev distance from the centre is exactly `r`.
-    fn pin_rescan_rim(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<f64> {
+    fn pin_rescan_rim(
+        data: &[f32],
+        mask: Option<&[bool]>,
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r: i64,
+    ) -> Option<f64> {
         let mut v: Vec<f32> = Vec::new();
         for y in cy - r..=cy + r {
             for x in cx - r..=cx + r {
                 if (x - cx).abs().max((y - cy).abs()) == r {
-                    let p = data[y as usize * w + x as usize];
-                    if p.is_finite() {
+                    let i = y as usize * w + x as usize;
+                    let p = data[i];
+                    if p.is_finite() && mask.map_or(true, |m| m[i]) {
                         v.push(p);
                     }
                 }
@@ -2938,6 +3057,7 @@ mod tests {
     /// PA-12's growth over the oracle: the stopping radius, its rim median, and every square median visited.
     fn pin_rescan_grow_region(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         cx: i64,
         cy: i64,
@@ -2949,10 +3069,11 @@ mod tests {
         let mut r = r_start;
         let mut max = f64::NEG_INFINITY;
         loop {
-            let (m, square_max) = pin_rescan_square(data, w, cx, cy, r).expect("a present square");
+            let (m, square_max) =
+                pin_rescan_square(data, mask, w, cx, cy, r).expect("a present square");
             max = max.max(square_max);
             seq.push(m);
-            let s = pin_rescan_rim(data, w, cx, cy, r).unwrap_or(m);
+            let s = pin_rescan_rim(data, mask, w, cx, cy, r).unwrap_or(m);
             if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
                 return (r, s, seq);
             }
@@ -2964,6 +3085,7 @@ mod tests {
     /// (incremental) `region_median` — `grow_region` itself returns only the radius and the rim median.
     fn incremental_grow_region_with_seq(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         cx: i64,
         cy: i64,
@@ -2976,15 +3098,15 @@ mod tests {
         let mut seq = Vec::new();
         let mut r = r_start;
         let (mut m, mut max) =
-            region_median(data, None, w, cx, cy, None, r, &mut scratch).expect("a present square");
+            region_median(data, mask, w, cx, cy, None, r, &mut scratch).expect("a present square");
         seq.push(m);
         loop {
-            let s = rim_median(data, None, w, cx, cy, r, &mut rim).unwrap_or(m);
+            let s = rim_median(data, mask, w, cx, cy, r, &mut rim).unwrap_or(m);
             if r + 1 > r_max || !(m - s > p.region_growth_contrast * (max - s)) {
                 return (r, s, seq);
             }
             let (m_next, max_next) =
-                region_median(data, None, w, cx, cy, Some(r), r + 1, &mut scratch).expect("grows");
+                region_median(data, mask, w, cx, cy, Some(r), r + 1, &mut scratch).expect("grows");
             r += 1;
             m = m_next;
             max = max.max(max_next);
@@ -2992,20 +3114,22 @@ mod tests {
         }
     }
 
-    /// The three agree bit for bit, and the visited square medians are the first of Task 5's recorded literals.
-    fn assert_growth_matches(
+    /// The three agree bit for bit, under `mask` when given; returns the stopping radius, its rim median and the
+    /// visited square medians.
+    fn assert_growth_agrees(
         data: &[f32],
+        mask: Option<&[bool]>,
         w: usize,
         (cx, cy): (i64, i64),
         (r_start, r_max): (i64, i64),
-        task5_medians: &[f64],
-    ) -> (i64, f64) {
+    ) -> (i64, f64, Vec<f64>) {
         let p = FitParams::default();
-        let (r_ref, s_ref, seq_ref) = pin_rescan_grow_region(data, w, cx, cy, r_start, r_max, &p);
+        let (r_ref, s_ref, seq_ref) =
+            pin_rescan_grow_region(data, mask, w, cx, cy, r_start, r_max, &p);
         let (r_seq, s_seq, seq_new) =
-            incremental_grow_region_with_seq(data, w, cx, cy, r_start, r_max, &p);
+            incremental_grow_region_with_seq(data, mask, w, cx, cy, r_start, r_max, &p);
         let mut scratch = FitScratch::default();
-        let (r_prod, s_prod) = grow_region(data, None, w, cx, cy, r_start, r_max, &p, &mut scratch);
+        let (r_prod, s_prod) = grow_region(data, mask, w, cx, cy, r_start, r_max, &p, &mut scratch);
         assert_eq!(
             (r_prod, s_prod.to_bits()),
             (r_seq, s_seq.to_bits()),
@@ -3024,6 +3148,19 @@ mod tests {
                 "median sequence: {seq_ref:?} vs {seq_new:?}"
             );
         }
+        (r_prod, s_prod, seq_new)
+    }
+
+    /// [`assert_growth_agrees`] without a mask, and the visited square medians are the first of Task 5's recorded
+    /// literals.
+    fn assert_growth_matches(
+        data: &[f32],
+        w: usize,
+        centre: (i64, i64),
+        range: (i64, i64),
+        task5_medians: &[f64],
+    ) -> (i64, f64) {
+        let (r_prod, s_prod, seq_new) = assert_growth_agrees(data, None, w, centre, range);
         let n = seq_new.len().min(task5_medians.len());
         assert!(
             n > 1,
@@ -3105,6 +3242,22 @@ mod tests {
             (R_BORDER, S_BORDER.to_bits()),
             "r {r}, s {s:?}"
         );
+    }
+
+    /// Plan C C1 (6a review minor 1): the near-border growth pin under a checkerboard mask. The independent rescan
+    /// oracle (masked pixels absent), the incremental `region_median` / `rim_median` sequence and the production
+    /// `grow_region` agree bit for bit.
+    #[test]
+    fn pin_rescan_sampling_radius_with_a_mask() {
+        let stars = [round(15.3, 12.7, 0.5)];
+        let mut data = moffat_field(120, 120, &stars, 3.0, 0.04);
+        add_noise(&mut data, 0.008, 43);
+        let mask: Vec<bool> = (0..120 * 120).map(|i| (i % 120 + i / 120) % 2 == 0).collect();
+        let (cx, cy) = (15i64, 13i64);
+        let to_border = cx.min(cy).min(120 - 1 - cx).min(120 - 1 - cy);
+        assert!(to_border >= 3, "fixture must leave room to grow");
+        let (_, _, seq) = assert_growth_agrees(&data, Some(&mask), 120, (cx, cy), (3, to_border));
+        assert!(seq.len() > 2, "the growth visits several squares: {seq:?}");
     }
 
     #[test]
@@ -3479,22 +3632,6 @@ mod tests {
         (out, d)
     }
 
-    /// A deterministic 2000-point sunflower lattice over the annulus `r_in ≤ r ≤ r_out` about `(cx, cy)`: point `k`
-    /// at the radius enclosing the area fraction `(k + ½)/2000` of the annulus, turned by the golden angle per point,
-    /// so the points sample the annulus uniformly by area.
-    fn ring_samples(cx: f64, cy: f64, r_in: f64, r_out: f64) -> Vec<(f64, f64)> {
-        const N: usize = 2000;
-        let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
-        (0..N)
-            .map(|k| {
-                let t = (k as f64 + 0.5) / N as f64;
-                let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
-                let (s, c) = (k as f64 * golden).sin_cos();
-                (cx + r * c, cy + r * s)
-            })
-            .collect()
-    }
-
     #[test]
     fn broad_stars_fit_inside_a_region_that_scales_with_their_own_width() {
         // FWHM 14 at β 4: α = 14 / (2√(2^{1/4} − 1)) = 16.09; half-FWTM = 14.2 px — the D1 cause-1 regime
@@ -3562,21 +3699,6 @@ mod tests {
     /// `donut_is_refused_with_its_reason` renders one, over the 25×25 pixels about it only.
     fn add_donut(data: &mut [f32], w: usize, cx: usize, cy: usize) {
         add_donut_gain(data, w, cx, cy, 1.0);
-    }
-
-    /// [`add_donut`] with its amplitude scaled by `gain`.
-    fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f64) {
-        let ring = ring_samples(cx as f64, cy as f64, 2.4, 6.0);
-        for y in cy - 12..=cy + 12 {
-            for x in cx - 12..=cx + 12 {
-                let mut acc = 0.0f64;
-                for &(ux, uy) in &ring {
-                    let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
-                    acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
-                }
-                data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
-            }
-        }
     }
 
     /// Owner ruling 2026-10-08: a plane whose readable seeds are mostly donuts is defocused. Eight donuts and two
@@ -4204,5 +4326,277 @@ mod tests {
             .stars
             .iter()
             .all(|f| f.background.is_finite() && f.fwhm().is_finite()));
+    }
+
+    /// Plan C R-PC-10: an otherwise-accepted fit with another seed of the plane inside its half-maximum contour, at
+    /// least `0.5·F_field` from its own seed, is refused `Blend` (both fits of a merged pair), before the duplicate drop.
+    mod blend {
+        use super::*;
+        use crate::star_measure::Mode;
+        use crate::test_support::trail_plane_fixture;
+
+        /// The field width of every fixture here, px.
+        const F: f64 = 4.0;
+
+        fn alpha_of(fwhm: f64) -> f64 {
+            fwhm / (2.0 * (2f64.powf(0.25) - 1.0).sqrt())
+        }
+        fn star(x: f64, y: f64, amp: f64) -> MoffatStar {
+            one(x, y, amp, alpha_of(F))
+        }
+        fn plane(w: usize, h: usize, stars: &[MoffatStar], noise_seed: u64) -> Vec<f32> {
+            let mut data = moffat_field(w, h, stars, 4.0, 0.05);
+            add_noise(&mut data, 0.002, noise_seed);
+            data
+        }
+        fn blends(refused: &RefusalCounts) -> usize {
+            refused
+                .by_reason
+                .get(&RefusalReason::Blend)
+                .copied()
+                .unwrap_or(0)
+        }
+        /// The measure path's call as the Analysis budget path makes it (verdicts on, `blend_refusal` set when
+        /// `blend`), the seeds and the field width handed in: the shared shape of every test here.
+        fn fit_blend(
+            data: &[f32],
+            w: usize,
+            h: usize,
+            seeds: &[Seed],
+            blend: bool,
+            trail_verdict: bool,
+        ) -> FitOutcome {
+            fit_stars_with_beta_diagnosed(
+                data,
+                w,
+                h,
+                seeds,
+                4.0,
+                &FitParams::default(),
+                None,
+                Some(F),
+                None,
+                true,
+                true,
+                trail_verdict,
+                Correction {
+                    blend_refusal: blend,
+                    ..Default::default()
+                },
+            )
+        }
+        /// [`fit_blend`] with the rule on, the diagnostics split out as `fit_with` returns them.
+        fn fit_with(
+            data: &[f32],
+            w: usize,
+            h: usize,
+            seeds: &[Seed],
+            _field: f64,
+        ) -> (FitOutcome, Vec<FitDiagnostics>) {
+            let out = fit_blend(data, w, h, seeds, true, false);
+            let d = out.diagnostics.clone();
+            (out, d)
+        }
+
+        #[test]
+        fn two_equal_stars_closer_than_their_contour_are_both_refused_blend() {
+            let stars = [star(60.0, 60.0, 0.5), star(60.0 + 1.2 * F, 60.0, 0.5)];
+            let data = plane(120, 120, &stars, 3);
+            let (out, d) = fit_with(&data, 120, 120, &seeds_from(&stars, 4.0), F);
+            assert_eq!(
+                (d[0].outcome, d[1].outcome),
+                (
+                    Outcome::Refused(RefusalReason::Blend),
+                    Outcome::Refused(RefusalReason::Blend)
+                ),
+                "{:?}",
+                out.fits
+            );
+            assert!(out.fits.is_empty(), "{:?}", out.fits);
+            assert_eq!(blends(&out.refused), 2);
+            assert_eq!(out.refused.accounted(out.fits.len()), 2);
+        }
+
+        #[test]
+        fn the_same_pair_four_widths_apart_is_two_accepted_stars_of_the_true_width() {
+            let stars = [star(52.0, 60.0, 0.5), star(52.0 + 4.0 * F, 60.0, 0.5)];
+            let data = plane(120, 120, &stars, 4);
+            let (out, d) = fit_with(&data, 120, 120, &seeds_from(&stars, 4.0), F);
+            assert!(d.iter().all(|r| matches!(r.outcome, Outcome::Accepted { .. })), "{d:?}");
+            assert_eq!(out.fits.len(), 2);
+            for f in &out.fits {
+                for v in [f.fwhm_x, f.fwhm_y] {
+                    assert!((v / F - 1.0).abs() < 0.02, "FWHM {v} against {F}: {f:?}");
+                }
+            }
+        }
+
+        /// The guard: a second seed 0.3 F from an isolated star's own seed lies inside its contour but is a second
+        /// maximum of the same core, so neither fit is a blend; the duplicate drop keeps one.
+        #[test]
+        fn a_second_seed_on_the_same_core_is_not_a_blend() {
+            let s = star(60.0, 60.0, 0.5);
+            let data = plane(120, 120, &[s], 5);
+            let near = Seed {
+                x: s.x + 0.3 * F,
+                ..seed(&s)
+            };
+            let (out, d) = fit_with(&data, 120, 120, &[seed(&s), near], F);
+            assert_eq!(blends(&out.refused), 0, "{d:?}");
+            assert_eq!(out.fits.len(), 1);
+            assert_eq!(
+                out.refused.by_reason.get(&RefusalReason::Duplicate).copied(),
+                Some(1)
+            );
+        }
+
+        /// A faint companion (amplitude 0.2 of the bright star's 1.0). At 0.6 F it lies inside the bright fit's contour:
+        /// the bright star is refused `Blend` (and the companion's own fit too). At 1.0 F the rule as written does not
+        /// reach it — the bright fit reads FWHM about 4.8 × 4.0 at centre +0.3 px, so the companion's seed is ~3.7 px
+        /// out on a 2.4 px semi-axis — and the bright star is accepted while the companion's broad fit, whose contour
+        /// holds the bright seed, is refused `Blend`. The second arm pins that known limit (report C9B r1, Concerns).
+        #[test]
+        fn a_faint_companion_inside_the_contour_refuses_the_bright_star_blend() {
+            let run = |sep: f64| {
+                let stars = [star(60.0, 60.0, 1.0), star(60.0 + sep * F, 60.0, 0.2)];
+                let data = plane(120, 120, &stars, 6);
+                fit_with(&data, 120, 120, &seeds_from(&stars, 4.0), F)
+            };
+            let (out, d) = run(0.6);
+            assert_eq!(d[0].outcome, Outcome::Refused(RefusalReason::Blend), "{d:?}");
+            assert!(out.fits.is_empty(), "{:?}", out.fits);
+            let (out, d) = run(1.0);
+            assert_eq!(
+                (d[0].outcome, d[1].outcome),
+                (
+                    Outcome::Accepted { star: 0 },
+                    Outcome::Refused(RefusalReason::Blend)
+                ),
+                "{:?}",
+                out.fits
+            );
+            assert!(out.fits[0].fwhm_x > 1.1 * F, "the limit's bias: {:?}", out.fits[0]);
+        }
+
+        /// "Any seed the detector produced": a fit call handed one seed of the pair (the budget's candidate) reads the
+        /// other through its neighbours and refuses the fit; without them the same fit is accepted.
+        #[test]
+        fn a_seed_the_fit_call_was_not_handed_still_makes_a_blend() {
+            let stars = [star(60.0, 60.0, 0.5), star(60.0 + 1.2 * F, 60.0, 0.5)];
+            let data = plane(120, 120, &stars, 7);
+            let all = seeds_from(&stars, 4.0);
+            let field = FieldWidth {
+                fwhm_px: F,
+                from_stars: 0,
+            };
+            let call = |neighbours: Option<Neighbours<'_>>| {
+                fit_at_width(
+                    &data,
+                    120,
+                    120,
+                    &all[..1],
+                    4.0,
+                    &FitParams::default(),
+                    None,
+                    field,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    Correction {
+                        neighbours,
+                        blend_refusal: true,
+                        ..Default::default()
+                    },
+                    &[],
+                )
+            };
+            let alone = call(None);
+            assert_eq!((alone.fits.len(), blends(&alone.refused)), (1, 0), "{:?}", alone.refused);
+            let with = call(Some(Neighbours {
+                seeds: &all,
+                of_fit: &[0],
+            }));
+            assert_eq!((with.fits.len(), blends(&with.refused)), (0, 1), "{:?}", with.refused);
+        }
+
+        /// No pair on the plane: the rule changes nothing (fits, their order, the refusals), flag set or not.
+        #[test]
+        fn a_field_with_no_pairs_is_byte_identical_to_the_rule_off() {
+            let mut data = moffat_field(480, 400, &crate::star_measure::tests::grid30(alpha_of(F)), 4.0, 0.05);
+            add_noise(&mut data, 0.002, 8);
+            let seeds = crate::star_measure::tests::seeds_of(&crate::star_measure::tests::grid30(alpha_of(F)));
+            let on = fit_blend(&data, 480, 400, &seeds, true, true);
+            let off = fit_blend(&data, 480, 400, &seeds, false, true);
+            assert!(on.fits.len() >= 25, "premise: {} stars", on.fits.len());
+            assert_eq!(blends(&on.refused), 0);
+            assert_eq!(format!("{:?}", on.fits), format!("{:?}", off.fits));
+            assert_eq!(on.refused, off.refused);
+            assert_eq!(on.aperture_correction, off.aperture_correction);
+        }
+
+        /// A trailed plane keeps its verdict: every fit it would accept is refused `Trailed`, none `Blend`, exactly as
+        /// with the rule off.
+        #[test]
+        fn a_trailed_plane_still_gets_the_trailed_verdict() {
+            let (data, seeds) = trail_plane_fixture(540, 420, 5, 120, 42);
+            let on = fit_blend(&data, 540, 420, &seeds, true, true);
+            let off = fit_blend(&data, 540, 420, &seeds, false, true);
+            assert!(on.trailed);
+            assert!(on.fits.is_empty());
+            assert_eq!(blends(&on.refused), 0);
+            assert_eq!(on.refused, off.refused);
+            assert_eq!(on.trail_share, off.trail_share);
+        }
+
+        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule. The
+        /// plane is the second arm of `a_faint_companion_inside_the_contour_refuses_the_bright_star_blend`'s kind: a
+        /// faint companion (0.2 of the bright amplitude) 1.0 F out, whose seed lies inside the bright fit's contour.
+        /// The default keeps both fits; the same call with the flag set refuses the companion's `Blend`.
+        #[test]
+        fn the_default_correction_keeps_both_stars_of_a_close_pair() {
+            let stars = [star(60.0, 60.0, 1.0), star(60.0 + F, 60.0, 0.2)];
+            let data = plane(120, 120, &stars, 6);
+            let seeds = seeds_from(&stars, 4.0);
+            let off = fit_blend(&data, 120, 120, &seeds, false, false);
+            assert_eq!(off.fits.len(), 2, "{:?}", off.refused);
+            assert_eq!(blends(&off.refused), 0, "{:?}", off.refused);
+            assert!(off
+                .diagnostics
+                .iter()
+                .all(|d| matches!(d.outcome, Outcome::Accepted { .. })));
+            let on = fit_blend(&data, 120, 120, &seeds, true, false);
+            assert_eq!((on.fits.len(), blends(&on.refused)), (1, 1), "{:?}", on.refused);
+        }
+
+        /// `Mode::Budget`: a blended candidate's refusal is counted like any other, so the F-0 identity and
+        /// `refused.total()` (the Analysis row's `stars_refused`) hold.
+        #[test]
+        fn budget_mode_counts_a_blended_candidates_refusal() {
+            let mut stars: Vec<MoffatStar> = (0..30)
+                .map(|i| star(40.0 + 50.0 * (i % 6) as f64, 40.0 + 50.0 * (i / 6) as f64, 0.3))
+                .collect();
+            stars.push(star(115.0, 65.0, 0.3));
+            stars.push(star(115.0 + 1.2 * F, 65.0, 0.3));
+            let data = plane(340, 300, &stars, 9);
+            let opts = MeasureOptions {
+                mode: Mode::Budget { budget: 500 },
+                seeds: SeedSpec::Given(crate::star_measure::tests::seeds_of(&stars)),
+                diagnostics: true,
+                ..Default::default()
+            };
+            let m = measure_plane(&data, 340, 300, &opts, None);
+            assert_eq!(blends(&m.refused), 2, "{:?}", m.refused);
+            assert_eq!(m.refused.accounted(m.stars.len()), m.seeds);
+            assert_eq!(
+                m.diagnostics
+                    .iter()
+                    .filter(|d| d.outcome == Outcome::Refused(RefusalReason::Blend))
+                    .map(|d| d.seed)
+                    .collect::<Vec<_>>(),
+                vec![30, 31]
+            );
+        }
     }
 }

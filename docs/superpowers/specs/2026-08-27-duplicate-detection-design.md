@@ -115,21 +115,21 @@ Three independent causes, all verified against the raw XISF bytes:
 
 1. **The file misreports itself.** `Pane_2_Sii.xisf` genuinely contains
    `<FITSKeyword name="FILTER" value="'H'"/>` and the Ha stack's `DATE-OBS`.
-   PixInsight propagates the *reference* image's FITS keywords through
-   ImageIntegration and PixelMath, so an Sii integration inherits Ha's
+   The downstream processing program propagates the *reference* image's FITS keywords through
+   its integration and pixel-math processes, so an Sii integration inherits Ha's
    keywords. No parser can correct a file that states the wrong filter.
-2. **Our XISF parser discards the `comment` attribute.** PixInsight writes
-   history as `value="" comment="ImageIntegration.rejectedHigh_32: 105348"`;
+2. **Our XISF parser discards the `comment` attribute.** The downstream processing program writes
+   history as `value="" comment="<integration history entry>: 105348"`;
    `fits_parser/mod.rs` matches only `b"name"` and `b"value"` and its `_ => {}`
    arm drops the rest, collapsing 364 HISTORY records to empty strings.
    Including `comment` separates **4 of the 30** groups. Real defect, but not a
    fix for this problem — see §6.
 3. **For the remaining 26 there is nothing to separate.** `Pane_2_Sii.xisf` and
    `Pane_2_Sii_f.xisf` share all 364 FITSKeywords, all 21 `<Property>`
-   elements, geometry, sampleFormat and location. Only the pixels differ — DBE
+   elements, geometry, sampleFormat and location. Only the pixels differ — background extraction
    and linear fit change data without touching metadata. XISF's optional
    `checksum` attribute, which would have given content identity for free, is
-   absent (PixInsight does not write it).
+   absent (the downstream processing program does not write it).
 
 Cause 3 is decisive: **no header-level key of any completeness can separate
 these files.** Only the bytes can — see §2.6 for why that is affordable here.
@@ -222,7 +222,7 @@ This is what D3 buys: masters shortlisted by header, decided by bytes.
 | D4 | The two keys become an enum, not a bool | `duplicate_groups.hash_type` needs a third value; a `DuplicateKey` enum makes the cache mapping explicit instead of leaving `use_content_hash: bool` to mean three things. |
 | D5 | The duplicate cache tables are dropped and recreated to widen their CHECK | They are derived data — `duplicate_groups`/`duplicate_group_files` hold nothing that cannot be recomputed, so a drop is correct and costs a single recompute, where the 12-step SQLite ALTER recipe costs a rebuild. |
 | D6 | `deep verify` stays advisory | Owner decision. The button, progress, cancel and mismatch filtering already exist and already remove mismatched files from a group before the card renders; it simply does not gate the Move button. Not changed here. |
-| D8 | The header key takes a third component, `files.filename` | The fingerprint does not separate a processed Light-derivative from its source: a GraXpert/ABE output keeps `IMAGETYP = 'Light'` and `is_master = 0`, and §2.4 cause 2 erases the processing history from the stored blob, so the two share header AND size while their bytes differ — verified as an offered duplicate pair on the owner's catalog. A byte-identical copy keeps its name across drives; a processing step renames its output. A renamed true copy becomes a deliberate miss. §4. |
+| D8 | The header key takes a third component, `files.filename` | The fingerprint does not separate a processed Light-derivative from its source: an output of an external gradient-removal tool keeps `IMAGETYP = 'Light'` and `is_master = 0`, and §2.4 cause 2 erases the processing history from the stored blob, so the two share header AND size while their bytes differ — verified as an offered duplicate pair on the owner's catalog. A byte-identical copy keeps its name across drives; a processing step renames its output. A renamed true copy becomes a deliberate miss. §4. |
 | D7 | Folder similarity moves to the same key | `find_duplicate_folders` groups by `metadata_hash` too, so it is blind in exactly the same way. Same substitution, same test shape. |
 
 ## 4. The key
@@ -252,10 +252,10 @@ direction on 3 of 30 master groups, which is why it is not the default.
 
 `Header` groups on the filename as well, because the fingerprint does not
 separate a processed derivative from the frame it was made from. A
-GraXpert/ABE-processed XISF keeps `IMAGETYP = 'Light'` and `is_master = 0`, so
+gradient-removal-processed XISF keeps `IMAGETYP = 'Light'` and `is_master = 0`, so
 the allowlist admits it, and it carries its source's header verbatim — the
 parser defect of §2.4 cause 2 collapses the processing history to empty
-`HISTORY =` lines — so `Lum.xisf` and `Lum_GraXpert.xisf` share a fingerprint
+`HISTORY =` lines — so `Lum.xisf` and its processed output share a fingerprint
 and a size while their bytes differ. Measured on the owner's production
 catalog, that pair was offered as a duplicate. The filename is the signal the
 header lost: a byte-identical copy keeps its name when it travels between
@@ -293,12 +293,12 @@ duplicate detection *now*, but not for the reason first written here: masters
 are kept off the header key by D3, and processed **Light**-derivatives — which
 D3 does not touch, because they are `IMAGETYP = 'Light'`, `is_master = 0` — are
 kept out of each other's groups by D8's filename component instead. Without
-D8 the erased history is what makes `Lum.xisf` and `Lum_GraXpert.xisf`
+D8 the erased history is what makes `Lum.xisf` and its processed output
 indistinguishable to the header key.
 
 It matters elsewhere: the stored blob is what the metadata pane's per-field
 revert and light calibration's Bayer copy-through read, and for a
-PixInsight-written XISF the entire processing history is currently erased.
+downstream-program-written XISF the entire processing history is currently erased.
 
 Fixing it also carries a hazard worth stating before anyone tries: changing the
 blob changes the fingerprint, so a file re-scanned after the fix stops matching

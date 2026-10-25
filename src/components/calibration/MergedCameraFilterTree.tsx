@@ -10,7 +10,7 @@ interface MergedCameraFilterTreeProps {
   className?: string;
   /** Text shown in header when items are checked (e.g. "3 groups · 42 frames") */
   checkedLabel?: string;
-  /** Stacked SNR per filter key (dB), displayed next to filter label */
+  /** Stacked SNR per filter key (a ratio, √Σ frame SNR²), displayed next to filter label */
   filterSnrMap?: Map<string, number>;
   /** Optional footer rendered inside the tree container with a top border separator */
   footer?: React.ReactNode;
@@ -231,7 +231,7 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
                             {filter.label}
                             {filterSnrMap?.has(filter.key) && (
                               <span className="text-[10px] text-content-muted ml-1" title="Stacked SNR (optimal weighting)">
-                                {filterSnrMap.get(filter.key)!.toFixed(1)} dB
+                                {filterSnrMap.get(filter.key)!.toFixed(1)}
                               </span>
                             )}
                           </span>

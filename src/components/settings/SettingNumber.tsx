@@ -77,7 +77,7 @@ export function SettingNumber({
 
   return (
     <div>
-      <div className={`flex items-center justify-between gap-2 mb-1 ${highlighted ? 'ring-1 ring-accent/60 rounded' : ''}`}>
+      <div className={`flex items-center gap-1 mb-1 ${highlighted ? 'ring-1 ring-accent/60 rounded' : ''}`}>
         <label className="text-sm text-content-secondary">
           {meta.label}
           {unit && <span className="text-content-muted"> ({unit})</span>}

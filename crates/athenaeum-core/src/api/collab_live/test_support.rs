@@ -529,7 +529,7 @@ pub(crate) async fn run_one_live_cancel_once_moving(
     let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
     let blobs = store.blobs().clone();
     let mut run = drive_live(store, dialer, vec![item], opts, async move {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30) * LOAD_SLACK;
         loop {
             let moved = blobs
                 .observe(hash)
@@ -541,7 +541,7 @@ pub(crate) async fn run_one_live_cancel_once_moving(
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no byte of the frame arrived within 30 s"
+                "no byte of the frame arrived within 30 s × LOAD_SLACK"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1266,11 +1266,19 @@ async fn live_instance(
     }
 }
 
+/// Every wall-clock limit a collab live test names is multiplied by this
+/// before its deadline is set, so a wait fails only on a hang, never because a
+/// full parallel suite loads the machine (owner ruling 2026-10-24: these waits
+/// flaked under the full suite and passed alone). A latency a test measures is
+/// still printed beside its own bound.
+pub(crate) const LOAD_SLACK: u32 = 4;
+
 pub(crate) async fn wait_until(
     what: &str,
     within: std::time::Duration,
     mut pred: impl FnMut() -> bool,
 ) {
+    let within = within * LOAD_SLACK;
     let deadline = std::time::Instant::now() + within;
     loop {
         if pred() {
@@ -1382,6 +1390,7 @@ impl Instance {
     }
 
     pub(crate) async fn wait_fetch_started(&self, uuid: &str, within: std::time::Duration) {
+        let within = within * LOAD_SLACK;
         let deadline = std::time::Instant::now() + within;
         while !self.fetching(uuid).await {
             assert!(
@@ -1393,6 +1402,7 @@ impl Instance {
     }
 
     pub(crate) async fn wait_any_fetch_started(&self, within: std::time::Duration) {
+        let within = within * LOAD_SLACK;
         let deadline = std::time::Instant::now() + within;
         loop {
             let rows = crate::db::collab_frames::list_for_project(
@@ -1926,6 +1936,7 @@ impl Instance {
         within: Duration,
         pred: impl Fn(&Sighting) -> bool,
     ) -> Instant {
+        let within = within * LOAD_SLACK;
         let deadline = Instant::now() + within;
         loop {
             let all = sightings(&self.node_key());
@@ -1975,6 +1986,7 @@ impl Instance {
     }
 
     async fn wait_seen(&self, device: &str, seen: bool, within: Duration) -> Instant {
+        let within = within * LOAD_SLACK;
         let deadline = Instant::now() + within;
         loop {
             if self.sees_provider(device) == seen {
@@ -2008,6 +2020,7 @@ impl Instance {
         state: LocalState,
         within: Duration,
     ) -> Instant {
+        let within = within * LOAD_SLACK;
         let deadline = Instant::now() + within;
         let mut not_yet = Instant::now();
         loop {

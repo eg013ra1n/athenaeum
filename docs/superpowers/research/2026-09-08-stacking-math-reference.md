@@ -8,9 +8,9 @@ its provenance, so the implementation never has to guess and never has to read
 another product's source. Nothing here is copied code; it is the mathematics
 and the conventions, described in our own words.
 
-Provenance classes used below: **[code]** read from the open-source PixInsight
-Class Library (PCL, GitLab mirror `gitlab.com/pixinsight/PCL`; the
-ImageIntegration/Drizzle modules at their last open commit `fd570d58`,
+Provenance classes used below: **[code]** read from the open-source class library of the ERP
+(public mirror; the
+integration and drizzle modules at their last open commit `fd570d58`,
 2024-06-21); **[doc]** official documentation or tutorials; **[forum]** posts by
 the vendor's staff; **[log]** the owner's WBPP 3.0.1 run on LDN 1272
 (`~/Pictures/Calibration Test/LDN1272-Output/logs/20260908121336.log`);
@@ -24,7 +24,7 @@ code or comments. Cite the papers there; cite this document.
 
 ## 1. Frame quality: PSF Signal Weight and PSF SNR
 
-Reference: Conejero, Radice, Sartori, *Image Weighting* (official doc);
+Reference: the ERP's authors, *Image Weighting* (official doc);
 `PSFSignalEstimator` [code].
 
 ### 1.1 Quantities
@@ -118,7 +118,7 @@ for correctness.
   0.050 | accepted`); filters off by default.
 - Best reference frame (auto) = highest PSF Signal Weight across the whole
   set; both cameras' groups were registered onto that one frame [log].
-- ImageIntegration itself excludes frames whose normalized weight
+- The ERP's integration process itself excludes frames whose normalized weight
   (per channel, divided by the maximum) is below `minWeight = 0.005` [code].
 
 ---
@@ -183,7 +183,7 @@ symmetric high side. Classic weight `w = (noiseScale / σ_n)²`.
 
 ## 3. Integration: rejection, normalization, weights
 
-Reference: ImageIntegration module [code], its documentation [doc], and the
+Reference: the ERP's integration module [code], its documentation [doc], and the
 WBPP log [log].
 
 ### 3.1 Vendor defaults (for parity, not as our defaults)

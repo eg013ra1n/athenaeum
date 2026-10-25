@@ -310,6 +310,10 @@ pub struct ScaleResult {
     /// `c` was taken over (up to `aperture::GROWTH_PAIRS`); `Some` exactly
     /// when `growth_factor` is. It moves no scale and no hash.
     pub growth_pairs: Option<usize>,
+    /// Plan B B0 (PB-2), kept for the run summary: the TARGET plane's aperture correction `c` as the ring geometry of
+    /// this call left it (`FitOutcome::aperture_correction`, measured under both flux estimators). `None` when the
+    /// target plane measured none (floor (i): fewer than 5 ratios, `c = 1` was applied). It moves no scale and no hash.
+    pub target_aperture_correction: Option<f64>,
     /// Spec §10 / L-26, log-only: the median over the ratio's pairs of the
     /// larger of the two sides' fractions of present sky-annulus pixels above
     /// the annulus median + 3 sigma. `Some` exactly when `aperture_px` is;
@@ -344,6 +348,7 @@ impl PartialEq for ScaleResult {
             && self.common_fwhm_px == other.common_fwhm_px
             && self.growth_factor == other.growth_factor
             && self.growth_pairs == other.growth_pairs
+            && self.target_aperture_correction == other.target_aperture_correction
             // Bit-equal so a NaN ("no usable sigma") equals itself.
             && self.annulus_crowding.map(f64::to_bits) == other.annulus_crowding.map(f64::to_bits)
     }
@@ -1212,6 +1217,13 @@ impl PreparedReferenceChannel {
     pub fn default_beta(&self) -> f64 {
         self.beta
     }
+
+    /// The reference plane's own aperture correction `c` (`FitOutcome::aperture_correction`), as fitted at
+    /// [`Self::default_beta`]: `None` at floor (i). Read-only; a pair-common ring corrects a COPY of the reference's
+    /// fits per target and never changes this (Plan B B0, PB-2).
+    pub fn aperture_correction(&self) -> Option<f64> {
+        self.outcome.aperture_correction
+    }
 }
 
 /// Global relative scale `s = RCR_loc(z_k)`, `z_k = flux_ref,k / flux_tgt,k`
@@ -1451,6 +1463,8 @@ fn relative_scale_against_core(
         growth_pairs,
         annulus_crowding,
     } = measured_sample(&ref_fits, &tgt_outcome.fits, &pairs, inputs)?;
+    // Plan B B0 (PB-2): the target's `c` the ring geometry above left, kept for the run summary.
+    let target_aperture_correction = tgt_outcome.aperture_correction;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -1497,6 +1511,7 @@ fn relative_scale_against_core(
             common_fwhm_px,
             growth_factor,
             growth_pairs,
+            target_aperture_correction,
             annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,
@@ -1956,6 +1971,8 @@ fn relative_scale_from_seeds_core(
     } = measured_sample(&ref_fits, &tgt_outcome.fits, &pairs, inputs)?;
     // The pre-selection valid-pair count, as `measured_sample` defines it.
     breakdown.matched = matches;
+    // Plan B B0 (PB-2): the target's `c` the ring geometry above left, kept for the run summary.
+    let target_aperture_correction = tgt_outcome.aperture_correction;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -2002,6 +2019,7 @@ fn relative_scale_from_seeds_core(
             common_fwhm_px,
             growth_factor,
             growth_pairs,
+            target_aperture_correction,
             annulus_crowding,
             timings: ScaleTimings {
                 detect_ms,

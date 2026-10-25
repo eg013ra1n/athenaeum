@@ -409,6 +409,50 @@ pub struct LnFrameOutcome {
     /// compared detection against detection and has nothing to say about
     /// the seeds path's own bias.
     pub channel_from_seeds: Vec<bool>,
+    /// Plan B B0 (PB-2), kept on the run summary: F1's growth-curve factor ([`scale::ScaleResult::growth_factor`]),
+    /// the MEAN over the channels that report one, like `scale`. `None` unless the growth-curve aperture ran.
+    pub growth_factor: Option<f64>,
+    /// F1's pair count ([`scale::ScaleResult::growth_pairs`]), the MINIMUM over the channels that report one, so an
+    /// OSC channel at floor (ii) (`Some(0)`: no pair had its outer circle on both frames, the 2 x FWHM ratio kept)
+    /// shows on the frame instead of being averaged away. `None` exactly when `growth_factor` is.
+    pub growth_pairs: Option<usize>,
+    /// The TARGET side's aperture correction `c` as the module gave it on the registered plane
+    /// ([`scale::ScaleResult::target_aperture_correction`]), the MEAN over the channels, like `fwhm_px`, but only when
+    /// EVERY channel measured one (R-PB0-5, the `beta_own` rule): a target channel at floor (i) makes it `None`.
+    pub target_aperture_correction: Option<f64>,
+}
+
+/// What one channel's scale call reported for the run summary (Plan B B0, PB-2): F1's growth factor and pair count and
+/// the TARGET plane's aperture correction `c`, each `None` where the call did not measure it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PlaneReadings {
+    pub growth_factor: Option<f64>,
+    pub growth_pairs: Option<usize>,
+    pub target_aperture_correction: Option<f64>,
+}
+
+/// The frame-level reading of the planes' [`PlaneReadings`] (R-PB0-5, R-PB0-6): one pure fold, so its rules are pinned
+/// without a registered frame.
+/// - `growth_pairs` is the MINIMUM over the planes that report one, so an OSC channel at floor (ii) (`Some(0)`) shows on
+///   the frame instead of being averaged away;
+/// - `growth_factor` is the MEAN over the planes that report one, like `scale`;
+/// - `target_aperture_correction` is the MEAN only when EVERY plane carries a `c` (the rule `beta_own` follows): a target
+///   plane at floor (i) makes it `None`, never a mean over the others that would hide the floor. `None` for no planes.
+pub(crate) fn fold_plane_readings(planes: &[PlaneReadings]) -> PlaneReadings {
+    let mean = |v: Vec<f64>| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    let target_cs: Vec<f64> = planes
+        .iter()
+        .filter_map(|p| p.target_aperture_correction)
+        .collect();
+    PlaneReadings {
+        growth_factor: mean(planes.iter().filter_map(|p| p.growth_factor).collect()),
+        growth_pairs: planes.iter().filter_map(|p| p.growth_pairs).min(),
+        target_aperture_correction: if target_cs.len() == planes.len() {
+            mean(target_cs)
+        } else {
+            None
+        },
+    }
 }
 
 /// The median of ONLY the finite pixels of `plane` (fix round 1, item 7):
@@ -614,7 +658,9 @@ impl<'a> LnReferenceForDetection<'a> {
         }
         let prepared = sanitized_planes
             .iter()
-            .map(|plane| {
+            .enumerate()
+            .map(|(p, plane)| {
+                let _plane_span = tracing::debug_span!("ln_reference_plane", plane = p).entered();
                 scale::PreparedReferenceChannel::build(
                     plane,
                     reference.width,
@@ -651,7 +697,8 @@ impl<'a> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
         let mut prepared = Vec::with_capacity(reference.planes.len());
-        for plane in &reference.planes {
+        for (p, plane) in reference.planes.iter().enumerate() {
+            let _plane_span = tracing::debug_span!("ln_reference_plane", plane = p).entered();
             let finite: Vec<bool> = plane.iter().map(|v| v.is_finite()).collect();
             let sanitized: Cow<'a, [f32]> = if finite.iter().all(|&f| f) {
                 Cow::Borrowed(plane.as_slice())
@@ -850,6 +897,9 @@ pub fn normalize_frame(
     let mut scales = Vec::with_capacity(channels);
     let mut from_seeds_per_channel = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
+    // Plan B B0 (PB-2): F1's growth factor and pairs and the target side's `c`, per channel; folded into the outcome by
+    // `fold_plane_readings` once every channel is done.
+    let mut plane_readings: Vec<PlaneReadings> = Vec::with_capacity(channels);
     let (mut samples_total, mut samples_rejected_total) = (0usize, 0usize);
     let (mut samples_shared_total, mut cells_unsupported_total) = (0usize, 0usize);
     let mut warned_no_shared = false;
@@ -1238,6 +1288,11 @@ pub fn normalize_frame(
         fit_ms += scale_result.timings.fit_ms;
         match_ms += scale_result.timings.match_ms;
         matches_total += scale_result.matches;
+        plane_readings.push(PlaneReadings {
+            growth_factor: scale_result.growth_factor,
+            growth_pairs: scale_result.growth_pairs,
+            target_aperture_correction: scale_result.target_aperture_correction,
+        });
         scales.push(channel_scale);
         from_seeds_per_channel.push(plane_from_seeds);
 
@@ -1321,6 +1376,7 @@ pub fn normalize_frame(
     let write_ms = t.elapsed().as_millis() as u64;
 
     let scale = scales.iter().sum::<f64>() / scales.len().max(1) as f64;
+    let folded = fold_plane_readings(&plane_readings);
 
     Ok(LnFrameOutcome {
         sidecar: sidecar.to_path_buf(),
@@ -1341,6 +1397,9 @@ pub fn normalize_frame(
         ln_scale_source: frame_scale_source,
         channel_scales: scales,
         channel_from_seeds: from_seeds_per_channel,
+        growth_factor: folded.growth_factor,
+        growth_pairs: folded.growth_pairs,
+        target_aperture_correction: folded.target_aperture_correction,
     })
 }
 
@@ -1348,6 +1407,65 @@ pub fn normalize_frame(
 mod tests {
     use super::*;
     use crate::stacking::psf_signal::PsfModel;
+
+    /// Plan B B0 review fold (R-PB0-6): the pairs reading is the MINIMUM over the planes, so a plane at floor (ii)
+    /// (`Some(0)`) shows on the frame; a mean (7) or a first-plane read (12) would fail.
+    #[test]
+    fn the_frame_pairs_are_the_minimum_over_the_planes() {
+        let plane = |pairs| PlaneReadings {
+            growth_factor: Some(1.0),
+            growth_pairs: pairs,
+            target_aperture_correction: Some(1.1),
+        };
+        let folded = fold_plane_readings(&[plane(Some(12)), plane(Some(0)), plane(Some(9))]);
+        assert_eq!(folded.growth_pairs, Some(0));
+        // A plane that reports no pair count does not mask the others.
+        let folded = fold_plane_readings(&[plane(None), plane(Some(9)), plane(Some(4))]);
+        assert_eq!(folded.growth_pairs, Some(4));
+        let folded = fold_plane_readings(&[plane(None), plane(None)]);
+        assert_eq!(folded.growth_pairs, None);
+    }
+
+    /// R-PB0-6: the growth factor is the MEAN over the planes that report one (answer (a): the factor stays a mean,
+    /// beside `scale`, itself a mean).
+    #[test]
+    fn the_frame_growth_factor_is_the_mean_over_the_reporting_planes() {
+        let plane = |f| PlaneReadings {
+            growth_factor: f,
+            growth_pairs: Some(10),
+            target_aperture_correction: Some(1.1),
+        };
+        let folded = fold_plane_readings(&[plane(Some(1.0)), plane(Some(1.5)), plane(Some(2.5))]);
+        assert_eq!(folded.growth_factor, Some(5.0 / 3.0));
+        let folded = fold_plane_readings(&[plane(Some(1.0)), plane(None), plane(Some(2.0))]);
+        assert_eq!(folded.growth_factor, Some(1.5));
+        let folded = fold_plane_readings(&[plane(None), plane(None)]);
+        assert_eq!(folded.growth_factor, None);
+    }
+
+    /// R-PB0-5 (M1): the frame's target `c` is the mean only when EVERY channel carries one; a channel at floor (i)
+    /// makes it `None`, so an OSC frame whose B target is at floor never reads as mean(R, G).
+    #[test]
+    fn the_frame_target_c_is_the_mean_only_when_every_channel_carries_one() {
+        let plane = |c| PlaneReadings {
+            growth_factor: Some(1.0),
+            growth_pairs: Some(10),
+            target_aperture_correction: c,
+        };
+        let with_floor = fold_plane_readings(&[plane(Some(1.1)), plane(Some(1.3)), plane(None)]);
+        assert_eq!(with_floor.target_aperture_correction, None);
+        let all = fold_plane_readings(&[plane(Some(1.1)), plane(Some(1.3)), plane(Some(1.2))]);
+        let mean = (1.1 + 1.3 + 1.2) / 3.0;
+        assert_eq!(all.target_aperture_correction, Some(mean));
+        let mono = fold_plane_readings(&[plane(Some(1.17))]);
+        assert_eq!(mono.target_aperture_correction, Some(1.17));
+        let mono_floor = fold_plane_readings(&[plane(None)]);
+        assert_eq!(mono_floor.target_aperture_correction, None);
+        // The growth readings are untouched by a floor target `c`.
+        assert_eq!(with_floor.growth_factor, Some(1.0));
+        assert_eq!(with_floor.growth_pairs, Some(10));
+        assert_eq!(fold_plane_readings(&[]), PlaneReadings::default());
+    }
 
     fn ref_models(reference: &LnReference, scale: u32) -> Vec<BackgroundModel> {
         reference
@@ -1912,6 +2030,59 @@ mod tests {
                 l.contains("ln_seeds_calibration") && l.contains("ln_plane{frame_id=7 plane=0}"),
                 "{l}"
             );
+        }
+    }
+
+    /// Plan B B0 (ruling R-PB0-13): the LN reference build's own star events name their plane
+    /// (`ln_reference_plane{plane}`), on the image pool as well (`install_in_span` carries the span across the hop).
+    /// The capture is a thread-local default, so the pool's threads install the same dispatcher when they start.
+    #[test]
+    fn the_reference_build_events_carry_their_plane_across_the_pool() {
+        use crate::stacking::test_fixtures::synthetic_star_field;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![synthetic_star_field(W, H, &stars, 4.2, 0.002, 11)],
+            frames_used: Vec::new(),
+        };
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .start_handler(move |_| {
+                        // The guard is leaked on purpose: the pool thread keeps the capture until it exits.
+                        std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            let _ = LnReferenceForDetection::build(
+                &reference,
+                PsfModel::Moffat4,
+                200,
+                Some(&pool),
+                None,
+            );
+        });
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("aperture correction measured"))
+            .collect();
+        assert!(!lines.is_empty(), "no reference c event in:\n{logs}");
+        for l in lines {
+            assert!(l.contains("ln_reference_plane{plane=0}"), "{l}");
         }
     }
 

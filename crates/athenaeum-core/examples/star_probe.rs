@@ -22,6 +22,12 @@
 //!       [--fit-stars K]   (fast measurement, FM-2: the measure path fits the first K seeds in detection order only, the
 //!                          rest keep their detection record as `notSelected`; unclamped, the lab's K may sit below the product's floor;
 //!                          a `--config` document is replayed as stored, its `fitStars` too, never clamped by `resolve_config`)
+//!       [--dump-ratios]   (Plan B B4: the measure frame line adds `apertureRatios`, the growth / model ratios `c` is the
+//!                          median over, brightest by model flux first - the 1 to 4 of a plane at floor (i) too; null without
+//!                          the flag. A diagnostics field, never the product). Every measure and analysis-mode frame line also
+//!                          carries `pointSourceScreened` (the `c` candidates the point-source screen refused), `apertureBelowSnr`
+//!                          (those under SNR 20 after it) and `apertureTerciles` (the median ratio per model-flux third of
+//!                          the <= 64 `c` sample, brightest first; reported, never read)
 //!   star_probe debayer <mosaic.fits> --pattern RGGB --out <rgb.fits>
 //!   star_probe warp <image.fits> --shift dx,dy --rotate deg --out <image.fits>
 //!   star_probe dump-fits <fits artifact> --out <file.jsonl>
@@ -147,9 +153,10 @@ use std::time::Instant;
 
 use astroimage::processing::vng::vng_debayer_f32;
 use astroimage::BayerPattern;
-use athenaeum_core::analysis::analyzer::{analyze_frame, build_analyzer};
-use athenaeum_core::analysis::config::AnalysisConfig;
-use athenaeum_core::fits_parser::FitsHeader;
+use athenaeum_core::analysis::analyzer::{map_measurement, measure_raw_frame_with};
+use athenaeum_core::analysis::config::{AnalysisConfig, AnalysisPsfModel};
+use athenaeum_core::analysis::input::{read_raw_frame, RawPlanes};
+use athenaeum_core::models::{FrameAnalysis, StarMetric};
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::geometry::{Linear, LinearKind};
 use athenaeum_core::integration::plane_reader::PlaneReader;
@@ -266,6 +273,31 @@ fn n_or_null(v: f64) -> Value {
     }
 }
 
+/// `apertureTerciles` (Plan B B4, PB-13'): the terciles of the <= 64 `c` sample - the median growth / model ratio of its
+/// brightest, middle and faintest third by model flux (`ratios` is brightest first); null under three ratios. Reported,
+/// never read.
+fn aperture_terciles(ratios: &[sm::ApertureRatio]) -> Value {
+    let n = ratios.len();
+    if n < 3 {
+        return Value::Null;
+    }
+    let third = |lo: usize, hi: usize| -> Value {
+        let mut v: Vec<f64> = ratios[lo..hi].iter().map(|r| r.ratio).collect();
+        v.sort_by(f64::total_cmp);
+        let m = v.len();
+        n_or_null(if m % 2 == 1 {
+            v[m / 2]
+        } else {
+            0.5 * (v[m / 2 - 1] + v[m / 2])
+        })
+    };
+    json!([
+        third(0, n / 3),
+        third(n / 3, 2 * n / 3),
+        third(2 * n / 3, n)
+    ])
+}
+
 fn fit_line(path: &str, plane: usize, beta: Option<f64>, f: &StarFit) -> Value {
     let s = ADU_SCALE as f64;
     json!({
@@ -316,7 +348,7 @@ fn refused_line(path: &str, plane: usize, d: &FitDiagnostics) -> Option<Value> {
         Outcome::Trimmed => "trimmed",
     };
     let mut line = json!({
-        "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "reason": reason,
+        "kind": "refused", "path": path, "plane": plane, "seed": d.seed, "x": n_or_null(d.x), "y": n_or_null(d.y), "reason": reason,
         "regionRadius": d.region_radius, "backgroundStart": n_or_null(d.background_start / ADU_SCALE as f64),
         "widthStart": n_or_null(d.width_start), "growthSteps": d.growth_steps, "iterations": d.iterations,
         "converged": d.converged, "verdict": verdict_json(d.verdict),
@@ -399,6 +431,8 @@ struct MeasureArgs {
     psf: Option<PsfModel>,
     /// `--fit-stars` (the measure path): fit the first K seeds only (`Mode::Brightest`).
     fit_stars: Option<usize>,
+    /// `--dump-ratios` (the measure path, Plan B B4): the frame line carries `apertureRatios`.
+    dump_ratios: bool,
 }
 
 fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
@@ -422,10 +456,15 @@ fn parse_measure(mut it: impl Iterator<Item = String>) -> MeasureArgs {
         budget: None,
         psf: None,
         fit_stars: None,
+        dump_ratios: false,
     };
     while let Some(k) = it.next() {
         if k == "--diagnostics" {
             a.diagnostics = true;
+            continue;
+        }
+        if k == "--dump-ratios" {
+            a.dump_ratios = true;
             continue;
         }
         let mut v = || {
@@ -585,6 +624,13 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     let paths = resolve_paths(&a.paths)?;
     if paths.iter().any(|p| p == "analysis-mode") {
         return cmd_analysis_mode(a, &paths);
+    }
+    let is_xisf = a
+        .image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
+    if is_xisf && paths.iter().all(|p| p == "analysis") {
+        return cmd_legacy_xisf(a);
     }
     let (mut planes, mut w, mut h) = read_planes(&a.image);
     let raw_max = planes
@@ -835,6 +881,9 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
                         "starsUnsaturated": pm.channel.stars_unsaturated, "mostlySaturated": mostly_saturated,
                         "verdictFitFailed": pm.verdict_fit_failed, "crossFlags": pm.cross_flags, "colour": colour,
                         "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
+                        "pointSourceScreened": pm.point_source_screened, "apertureBelowSnr": pm.aperture_below_snr,
+                        "apertureTerciles": aperture_terciles(&pm.aperture_ratios),
+                        "apertureRatios": a.dump_ratios.then(|| pm.aperture_ratios.iter().map(|r| n_or_null(r.ratio)).collect::<Vec<_>>()),
                         "ringSkyMissing": pm.ring_sky_missing,
                         "clipFloor": pm.clip_floor.map(n_or_null), "clipEvidence": pm.clip_evidence,
                         "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share),
@@ -927,31 +976,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
     }
 
     if want("analysis") {
-        let t = Instant::now();
-        let analyzer = build_analyzer(&AnalysisConfig::default(), None);
         let img = a.image.to_str().expect("checked before File::create");
-        match analyze_frame(img, &analyzer, "star_probe") {
-            Ok((fa, stars, flip)) => {
-                for s in &stars {
-                    emit(
-                        json!({"kind": "star", "path": "analysis", "plane": 0, "beta": s.beta,
-                                "x": s.x, "y": s.y, "peak": s.peak, "flux": s.flux, "fwhm": s.fwhm,
-                                "fwhmX": s.fwhm_x, "fwhmY": s.fwhm_y, "ecc": s.eccentricity,
-                                "thetaDeg": s.theta.to_degrees(), "snr": s.snr, "hfr": s.hfr,
-                                "fitMethod": s.fit_method, "residual": s.fit_residual}),
-                    );
-                }
-                emit(
-                    json!({"kind": "frame", "path": "analysis", "plane": 0, "beta": null, "seeds": null,
-                            "fits": stars.len(), "statistic": "clipped weighted median over e <= 0.8",
-                            "frameFwhm": fa.median_fwhm, "frameEcc": fa.median_eccentricity,
-                            "frame": fa, "flipVertical": flip,
-                            "options": { "analysis": AnalysisConfig::default() }, "conversion": "none", "domain": domain,
-                            "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
-                );
-            }
-            Err(e) => return Err(format!("analysis: {e:#}")),
-        }
+        run_legacy_analysis(img, domain, non_finite, &mut emit)?;
     }
     // Debug-only (feature `lm-counters`): the Moffat LM solves this process ran, by free-parameter count.
     #[cfg(feature = "lm-counters")]
@@ -976,53 +1002,167 @@ fn lm_counters_line() -> Value {
     json!({"kind": "lmCounters", "fixedBeta": one(&c[0]), "freeBeta": one(&c[1])})
 }
 
-/// The raw file's clip level, full scale and gain for `Domain::RawAdu` (R12-7): `full_scale` = `2^bits - 1` from BITPIX /
-/// BZERO for the two unsigned conventions only (8 bit with BZERO 0, 16 / 32 bit with BZERO `2^(bits-1)`); ANY OTHER
-/// BZERO (signed, or an offset-only file) gives the signed max `2^(bits-1) - 1`, which an offset-only file's stored range
-/// does not match (`--clip` overrides the clip, not the full scale); a float file has none, so `--clip` stands in for
-/// it. `clip` = `--clip`, else DATAMAX when positive, else `full_scale`; the gain = the header's `EGAIN` (e- per ADU),
-/// else `None`.
-fn raw_scales(image: &Path, clip_arg: Option<f64>) -> Result<(f64, f64, Option<f64>), String> {
-    let header = FitsHeader::from_path(image).map_err(|e| format!("{}: {e:#}", image.display()))?;
-    let bitpix = header
-        .get_i32("BITPIX")
-        .ok_or_else(|| format!("{}: no BITPIX", image.display()))?;
-    let bzero = header.get_f64("BZERO").unwrap_or(0.0);
-    let full_scale = match bitpix {
-        8 => Some(if bzero == 0.0 { 255.0 } else { 127.0 }),
-        16 => Some(if bzero == 32768.0 { 65535.0 } else { 32767.0 }),
-        32 => Some(if bzero == 2_147_483_648.0 {
-            4_294_967_295.0
-        } else {
-            2_147_483_647.0
-        }),
-        _ => None,
-    };
-    let full_scale = match (full_scale, clip_arg) {
-        (Some(f), _) => f,
-        (None, Some(c)) => c,
-        (None, None) => {
-            return Err(format!(
-                "the analysis-mode path needs --clip for a float file (BITPIX {bitpix} has no full scale): {}",
-                image.display()
-            ))
-        }
-    };
-    let clip = clip_arg
-        .or_else(|| {
-            header
-                .get_f64("DATAMAX")
-                .filter(|d| d.is_finite() && *d > 0.0)
-        })
-        .unwrap_or(full_scale);
-    let gain = header
-        .get_f64("EGAIN")
-        .filter(|g| g.is_finite() && *g > 0.0);
-    Ok((clip, full_scale, gain))
+/// The `legacy-analysis` arm's configuration as the Analysis tab had it before Plan C (the legacy builder chain's
+/// inputs), kept here so its output cannot change when the product's `AnalysisConfig` does. `batch_concurrency` is the
+/// old config's machine-dependent default, as its frame line has always carried it.
+fn legacy_config_json() -> Value {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    json!({
+        "detection_sigma": 5.0, "min_star_area": 5, "max_star_area": 2000, "saturation_fraction": 0.95,
+        "max_stars": 500, "trail_threshold": 0.5, "mrs_layers": 0, "measure_cap": 2000, "fit_max_iter": 25,
+        "fit_tolerance": 1e-4, "fit_max_rejects": 5,
+        "batch_concurrency": (cores / 3).max(2).min(16) as u32,
+    })
 }
 
-/// The analysis-mode path (Task 12, R12-7): `measure_plane` under `Mode::Budget` on the raw file. Every refusal is an
-/// `Err` before the output file is created.
+/// The pre-Plan-C Analysis tab: `astroimage::ImageAnalyzer` with the legacy defaults, moved verbatim from
+/// `analysis/analyzer.rs`. Reads FITS and XISF alike (rustafits on the path).
+fn legacy_analyze(path: &str) -> Result<(FrameAnalysis, Vec<StarMetric>, bool), String> {
+    use astroimage::{ImageAnalyzer, ImageConverter};
+    let analyzer = ImageAnalyzer::new()
+        .with_detection_sigma(5.0f64 as f32)
+        .with_min_star_area(5usize)
+        .with_max_star_area(2000usize)
+        .with_saturation_fraction(0.95f64 as f32)
+        .with_max_stars(500usize)
+        .with_trail_threshold(0.5f64 as f32)
+        .with_mrs_layers(0usize)
+        .with_measure_cap(2000usize)
+        .with_fit_max_iter(25usize)
+        .with_fit_tolerance(1e-4)
+        .with_fit_max_rejects(5usize);
+    let (meta, pixels) = ImageConverter::read_raw(path).map_err(|e| format!("{e:#}"))?;
+    let flip_vertical = meta.flip_vertical;
+    let result = analyzer
+        .analyze_raw(&meta, &pixels)
+        .map_err(|e| format!("{e:#}"))?;
+    let stars: Vec<StarMetric> = result
+        .stars
+        .iter()
+        .map(|s| StarMetric {
+            id: None,
+            frame_analysis_id: 0,
+            x: s.x as f64,
+            y: s.y as f64,
+            peak: s.peak as f64,
+            flux: s.flux as f64,
+            fwhm: s.fwhm as f64,
+            fwhm_x: s.fwhm_x as f64,
+            fwhm_y: s.fwhm_y as f64,
+            eccentricity: s.eccentricity as f64,
+            snr: Some(s.snr as f64),
+            hfr: Some(s.hfr as f64),
+            theta: s.theta as f64,
+            beta: s.beta.map(|v| v as f64),
+            fit_method: format!("{:?}", s.fit_method),
+            fit_residual: s.fit_residual as f64,
+        })
+        .collect();
+    let analysis = FrameAnalysis {
+        id: None,
+        frame_id: 0,
+        file_id: 0,
+        stars_detected: result.stars_detected as i64,
+        median_fwhm: result.median_fwhm as f64,
+        median_eccentricity: result.median_eccentricity as f64,
+        median_snr: result.median_snr as f64,
+        median_hfr: result.median_hfr as f64,
+        frame_snr: result.frame_snr as f64,
+        snr_weight: result.snr_weight as f64,
+        psf_signal: result.psf_signal as f64,
+        background: result.background as f64,
+        noise: result.noise as f64,
+        detection_threshold: result.detection_threshold as f64,
+        width: result.width as i64,
+        height: result.height as i64,
+        source_channels: result.source_channels as i64,
+        trail_r_squared: result.trail_r_squared as f64,
+        possibly_trailed: result.possibly_trailed,
+        median_beta: result.median_beta.map(|v| v as f64),
+        quality_score: None,
+        config_hash: Some("star_probe".to_string()),
+        analyzed_at: chrono::Utc::now().to_rfc3339(),
+        measure_version: None,
+        stars_refused: None,
+        frame_verdict: None,
+    };
+    Ok((analysis, stars, flip_vertical))
+}
+
+/// The `legacy-analysis` arm's star and frame lines (JSONL `path: "analysis"`).
+fn run_legacy_analysis(
+    img: &str,
+    domain: &str,
+    non_finite: usize,
+    emit: &mut dyn FnMut(Value),
+) -> Result<(), String> {
+    let t = Instant::now();
+    match legacy_analyze(img) {
+        Ok((fa, stars, flip)) => {
+            for s in &stars {
+                emit(
+                    json!({"kind": "star", "path": "analysis", "plane": 0, "beta": s.beta,
+                            "x": s.x, "y": s.y, "peak": s.peak, "flux": s.flux, "fwhm": s.fwhm,
+                            "fwhmX": s.fwhm_x, "fwhmY": s.fwhm_y, "ecc": s.eccentricity,
+                            "thetaDeg": s.theta.to_degrees(), "snr": s.snr, "hfr": s.hfr,
+                            "fitMethod": s.fit_method, "residual": s.fit_residual}),
+                );
+            }
+            emit(
+                json!({"kind": "frame", "path": "analysis", "plane": 0, "beta": null, "seeds": null,
+                        "fits": stars.len(), "statistic": "clipped weighted median over e <= 0.8",
+                        "frameFwhm": fa.median_fwhm, "frameEcc": fa.median_eccentricity,
+                        "frame": fa, "flipVertical": flip,
+                        "options": { "analysis": legacy_config_json() }, "conversion": "none", "domain": domain,
+                        "nonFinite": non_finite, "wallMs": t.elapsed().as_millis() as u64}),
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("analysis: {e}")),
+    }
+}
+
+/// `legacy-analysis` on an XISF: the FITS front-end (`PlaneReader`) cannot open it, so the file is read through
+/// rustafits and only the finite count and the raw-domain check are taken from the pixels. Runs alone.
+fn cmd_legacy_xisf(a: MeasureArgs) -> Result<(), String> {
+    if a.rect.is_some() || a.debayer.is_some() {
+        return Err(
+            "the analysis path takes the file as the Analysis tab does: no --rect, no --debayer".into(),
+        );
+    }
+    let img = a
+        .image
+        .to_str()
+        .ok_or_else(|| "non-UTF-8 path".to_string())?;
+    let (_, pixels) =
+        astroimage::ImageConverter::read_raw(img).map_err(|e| format!("{img}: {e:#}"))?;
+    let (non_finite, raw_max) = match &pixels {
+        astroimage::PixelData::Uint16(v) => (0, v.iter().copied().max().unwrap_or(0) as f32),
+        astroimage::PixelData::Float32(v) => (
+            v.iter().filter(|x| !x.is_finite()).count(),
+            v.iter().copied().filter(|x| x.is_finite()).fold(f32::MIN, f32::max),
+        ),
+    };
+    if !analysis_domain_ok(raw_max) {
+        return Err(format!(
+            "the analysis path takes a raw-domain file (16-bit or ADU float), as the Analysis tab does; \
+             {} is in [0, 1] (use its .u16.fits sibling)",
+            a.image.display()
+        ));
+    }
+    let file = std::fs::File::create(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
+    let mut out = BufWriter::new(file);
+    let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
+    run_legacy_analysis(img, a.domain.as_str(), non_finite, &mut emit)?;
+    out.flush().map_err(|e| format!("flush: {e}"))
+}
+
+/// The analysis-mode path (Task 12, R12-7; Plan C C5): the product itself. The file is read with `read_raw_frame` (the
+/// Analysis tab's raw input rules), measured with `measure_raw_frame` (mono, a Bayer mosaic's green sites or a
+/// debayered file's G plane) and its star / refusal / frame lines come from the `PlaneMeasurement`; the frame line adds
+/// `"product"`, the `FrameAnalysis` row. Every refusal is an `Err` before the output file is created.
 fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
     if paths.len() != 1 {
         return Err("the analysis-mode path runs alone: no other --paths name beside it".into());
@@ -1044,141 +1184,158 @@ fn cmd_analysis_mode(a: MeasureArgs, paths: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
-    let (planes, w, h) = read_planes(&a.image);
-    let raw_max = planes
-        .iter()
-        .flatten()
-        .filter(|v| v.is_finite())
-        .fold(f32::MIN, |m, &v| m.max(v));
-    if !analysis_domain_ok(raw_max) {
+    let mut frame = read_raw_frame(&a.image).map_err(|e| format!("{e:#}"))?;
+    if let (Some(c), sm::Domain::RawAdu { clip, .. }) = (a.clip, &mut frame.domain) {
+        *clip = c;
+    }
+    let defaults = AnalysisConfig::default();
+    let budget = a.budget.unwrap_or(defaults.max_stars as usize);
+    let psf_model = match a.psf {
+        None => match defaults.psf_model {
+            AnalysisPsfModel::Moffat4 => PsfModel::Moffat4,
+            AnalysisPsfModel::Auto => PsfModel::Auto,
+        },
+        Some(m @ (PsfModel::Moffat4 | PsfModel::Auto)) => m,
+        Some(_) => {
+            return Err(
+                "the analysis-mode path fits moffat4 or auto: --psf moffat4|auto".into(),
+            )
+        }
+    };
+    let threshold = a.seed_threshold.unwrap_or(defaults.detection_threshold);
+    let config = AnalysisConfig {
+        detection_threshold: threshold,
+        psf_model: match psf_model {
+            PsfModel::Moffat4 => AnalysisPsfModel::Moffat4,
+            _ => AnalysisPsfModel::Auto,
+        },
+        max_stars: u32::try_from(budget).unwrap_or(u32::MAX),
+        batch_concurrency: 1,
+    };
+    let (plane, p, colour): (&[f32], usize, bool) = match &frame.planes {
+        RawPlanes::Mono(m) => (m, 0, false),
+        RawPlanes::Cfa { mosaic, .. } => (mosaic, 0, false),
+        RawPlanes::Rgb(r) => (&r[1], 1, true),
+    };
+    if a.plane.is_some_and(|q| q != p) {
         return Err(format!(
-            "the analysis-mode path takes a raw-domain file (16-bit or ADU float), as the Analysis tab does; \
-             {} is in [0, 1] (use its .u16.fits sibling)",
-            a.image.display()
+            "plane {}: the analysis-mode path measures plane {p} of this file only",
+            a.plane.unwrap_or(0)
         ));
     }
-    let (clip, full_scale, gain) = raw_scales(&a.image, a.clip)?;
-    let budget = a.budget.unwrap_or(sm::budget::DEFAULT_BUDGET);
-    let psf_model = a.psf.unwrap_or(sm::budget::ANALYSIS_PSF_MODEL);
-    let threshold = a.seed_threshold.unwrap_or(sm::DEFAULT_THRESHOLD);
-    let colour = planes.len() == 3;
-    let pixel_noise = a.pixel_noise.unwrap_or(match planes.len() {
-        1 => PixelNoise::White,
-        3 => PixelNoise::Mixed,
-        _ => PixelNoise::Unknown,
-    });
-    let selected: Vec<usize> = match a.plane {
-        Some(p) if p < planes.len() => vec![p],
-        Some(p) => return Err(format!("plane {p} of {}", planes.len())),
-        None => (0..planes.len()).collect(),
-    };
-    let non_finite: usize = planes.iter().flatten().filter(|v| !v.is_finite()).count();
-    let opts = sm::MeasureOptions {
-        domain: sm::Domain::RawAdu {
+    let (clip, full_scale, gain) = match frame.domain {
+        sm::Domain::RawAdu {
             clip,
             full_scale,
-            gain_e_per_adu: gain,
-        },
-        psf_model,
-        seeds: sm::SeedSpec::MatchedFilter { threshold },
-        diagnostics: a.diagnostics,
-        colour,
-        pixel_noise,
-        mode: sm::Mode::Budget { budget },
-        ..Default::default()
+            gain_e_per_adu,
+        } => (clip, full_scale, gain_e_per_adu),
+        sm::Domain::Calibrated { .. } => die("read_raw_frame returned a calibrated domain"),
     };
+    let pixel_noise = if colour {
+        PixelNoise::Mixed
+    } else {
+        PixelNoise::White
+    };
+    let non_finite: usize = plane.iter().filter(|v| !v.is_finite()).count();
     let options = json!({
         "measure": {
             "seedSource": "matchedFilter", "seedThreshold": threshold,
             "psfModel": match psf_model { PsfModel::Moffat4 => "moffat4", _ => "auto" },
             "budget": budget, "clip": clip, "fullScale": full_scale, "gainEPerAdu": gain,
-            "maxStars": opts.max_stars,
+            "maxStars": sm::MeasureOptions::default().max_stars,
         },
-        "rawMax": raw_max,
+        "channels": frame.channels,
+        "cfa": matches!(frame.planes, RawPlanes::Cfa { .. }),
     });
     let file = std::fs::File::create(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
     let mut out = BufWriter::new(file);
     let mut emit = |v: Value| writeln!(out, "{v}").unwrap_or_else(|e| die(format!("write: {e}")));
     let s = ADU_SCALE as f64;
     let domain = a.domain.as_str();
-    for &p in &selected {
-        let t = Instant::now();
-        let pm = sm::measure_plane(&planes[p], w, h, &opts, None);
-        let wall = t.elapsed().as_millis() as u64;
-        let mut star_seed: Vec<Option<&FitDiagnostics>> = vec![None; pm.stars.len()];
-        for d in &pm.diagnostics {
-            if let Outcome::Accepted { star } = d.outcome {
-                star_seed[star] = Some(d);
-            }
+    let t = Instant::now();
+    let pm = measure_raw_frame_with(&frame, &config, None, a.diagnostics);
+    let wall = t.elapsed().as_millis() as u64;
+    let (product, _) = map_measurement(&pm, &frame, &config, "star_probe");
+    let mut star_seed: Vec<Option<&FitDiagnostics>> = vec![None; pm.stars.len()];
+    for d in &pm.diagnostics {
+        if let Outcome::Accepted { star } = d.outcome {
+            star_seed[star] = Some(d);
         }
-        let filter_snr = |i: usize| {
-            pm.detection
-                .as_ref()
-                .and_then(|d| d.filter_snr.get(i).copied())
-        };
-        for (k, f) in pm.stars.iter().enumerate() {
-            let mut line = fit_line("analysis-mode", p, None, f);
-            // The plane is already in ADU: the aperture sum reads it as it is.
-            let (_, ap) = star_snr(&planes[p], w, h, f, None, None, &ApertureNoise::WHITE);
+    }
+    let filter_snr = |i: usize| {
+        pm.detection
+            .as_ref()
+            .and_then(|d| d.filter_snr.get(i).copied())
+    };
+    let is_cfa = matches!(frame.planes, RawPlanes::Cfa { .. });
+    for (k, f) in pm.stars.iter().enumerate() {
+        let mut line = fit_line("analysis-mode", p, None, f);
+        // The plane is already in ADU: the aperture sum reads it as it is (not on a mosaic: its sites are not one colour).
+        if !is_cfa {
+            let (_, ap) = star_snr(plane, frame.w, frame.h, f, None, None, &ApertureNoise::WHITE);
             if let Some(obj) = line.as_object_mut() {
                 obj.insert("apSum".into(), n_or_null(ap.s / s));
                 obj.insert("apN".into(), json!(ap.n_ap));
             }
-            if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
-                obj.insert("seed".into(), json!(d.seed));
-                if let Some(v) = filter_snr(d.seed) {
-                    obj.insert("filterSnr".into(), n_or_null(v));
-                }
-                obj.insert("verdict".into(), verdict_json(d.verdict));
-                if let Some(b) = d.sample_beta {
-                    obj.insert("sampleBeta".into(), n_or_null(b));
-                }
+        }
+        if let (Some(d), Some(obj)) = (star_seed[k], line.as_object_mut()) {
+            obj.insert("seed".into(), json!(d.seed));
+            if let Some(v) = filter_snr(d.seed) {
+                obj.insert("filterSnr".into(), n_or_null(v));
             }
+            obj.insert("verdict".into(), verdict_json(d.verdict));
+            if let Some(b) = d.sample_beta {
+                obj.insert("sampleBeta".into(), n_or_null(b));
+            }
+        }
+        emit(line)
+    }
+    for d in &pm.diagnostics {
+        if let Some(line) = refused_line("analysis-mode", p, d) {
             emit(line)
         }
-        for d in &pm.diagnostics {
-            if let Some(line) = refused_line("analysis-mode", p, d) {
-                emit(line)
-            }
-        }
-        let mostly_saturated = pm
-            .refused
-            .by_reason
-            .get(&RefusalReason::MostlySaturated)
-            .copied()
-            .unwrap_or(0);
-        emit(json!({
-            "kind": "frame", "path": "analysis-mode", "plane": p,
-            "beta": pm.beta, "betaSource": pm.beta_source.name(), "betaSample": pm.beta_source.sample(),
-            "seeds": pm.seeds, "fits": pm.stars.len(), "refused": refused_counts(&pm.refused),
-            "budget": pm.budget,
-            "statistic": "residual-weighted mean over the kept fits neither saturated nor extended",
-            "starsUnsaturated": pm.frame.stars_unsaturated, "mostlySaturated": mostly_saturated,
-            "verdictFitFailed": pm.verdict_fit_failed, "colour": colour,
-            "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
-            "ringSkyMissing": pm.ring_sky_missing,
-            "clipFloor": pm.clip_floor.map(n_or_null), "clipEvidence": pm.clip_evidence,
-            "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share), "defocused": pm.defocused,
-            "frameFwhm": pm.frame.fwhm_px.unwrap_or(0.0), "frameEcc": pm.frame.eccentricity.unwrap_or(0.0),
-            "sigmaF": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f / s)),
-            "sigmaFMeasured": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f_measured / s)),
-            "noiseGain": pm.detection.as_ref().map(|d| n_or_null(d.noise_gain)),
-            "pixelNoise": pixel_noise.as_str(),
-            "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
-            "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
-            "fieldWidth": n_or_null(pm.field_width.fwhm_px),
-            "fieldWidthAtFloor": pm.field_width.at_floor(),
-            "fieldWidthSpread": pm.detection.as_ref().map(|d| n_or_null(d.envelope.spread_px)),
-            "fieldWidthEnvelope": pm.detection.as_ref().map(|d| n_or_null(d.envelope.fwhm_px)),
-            "snrGain": pm.snr_gain.map(|g| n_or_null(g * s)), "snrMissing": pm.snr_missing,
-            "snrMedian": pm.frame.snr_median.map(n_or_null), "snrNoise": pm.snr_noise.as_str(),
-            "shotSpread": pm.shot_spread, "hfrMedian": pm.frame.hfr_median.map(n_or_null),
-            "timings": {"backgroundMs": pm.timings.background_ms, "noiseMs": pm.timings.noise_ms,
-                        "detectMs": pm.timings.detect_ms, "fitMs": pm.timings.fit_ms},
-            "options": options, "conversion": "none", "domain": domain,
-            "nonFinite": non_finite, "wallMs": wall,
-        }));
     }
+    let mostly_saturated = pm
+        .refused
+        .by_reason
+        .get(&RefusalReason::MostlySaturated)
+        .copied()
+        .unwrap_or(0);
+    emit(json!({
+        "kind": "frame", "path": "analysis-mode", "plane": p,
+        "beta": pm.beta, "betaSource": pm.beta_source.name(), "betaSample": pm.beta_source.sample(),
+        "seeds": pm.seeds, "fits": pm.stars.len(), "refused": refused_counts(&pm.refused),
+        "budget": pm.budget,
+        "statistic": "residual-weighted mean over the kept fits neither saturated nor extended",
+        "starsUnsaturated": pm.frame.stars_unsaturated, "mostlySaturated": mostly_saturated,
+        "verdictFitFailed": pm.verdict_fit_failed, "colour": colour,
+        "apertureCorrection": pm.aperture_correction, "apertureStars": pm.aperture_stars,
+        "pointSourceScreened": pm.point_source_screened, "apertureBelowSnr": pm.aperture_below_snr,
+        "apertureTerciles": aperture_terciles(&pm.aperture_ratios),
+        "ringSkyMissing": pm.ring_sky_missing,
+        "clipFloor": pm.clip_floor.map(n_or_null), "clipEvidence": pm.clip_evidence,
+        "trailed": pm.trailed, "trailShare": n_or_null(pm.trail_share), "defocused": pm.defocused,
+        "frameFwhm": pm.frame.fwhm_px.unwrap_or(0.0), "frameEcc": pm.frame.eccentricity.unwrap_or(0.0),
+        "sigmaF": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f / s)),
+        "sigmaFMeasured": pm.detection.as_ref().map(|d| n_or_null(d.sigma_f_measured / s)),
+        "noiseGain": pm.detection.as_ref().map(|d| n_or_null(d.noise_gain)),
+        "pixelNoise": pixel_noise.as_str(),
+        "structureDropped": pm.detection.as_ref().map(|d| d.structure_dropped),
+        "extendedSeeds": pm.detection.as_ref().map(|d| d.extended.iter().filter(|&&e| e).count()),
+        "fieldWidth": n_or_null(pm.field_width.fwhm_px),
+        "fieldWidthAtFloor": pm.field_width.at_floor(),
+        "fieldWidthSpread": pm.detection.as_ref().map(|d| n_or_null(d.envelope.spread_px)),
+        "fieldWidthEnvelope": pm.detection.as_ref().map(|d| n_or_null(d.envelope.fwhm_px)),
+        "snrGain": pm.snr_gain.map(|g| n_or_null(g * s)), "snrMissing": pm.snr_missing,
+        "snrMedian": pm.frame.snr_median.map(n_or_null), "snrNoise": pm.snr_noise.as_str(),
+        "shotSpread": pm.shot_spread, "hfrMedian": pm.frame.hfr_median.map(n_or_null),
+        "timings": {"backgroundMs": pm.timings.background_ms, "noiseMs": pm.timings.noise_ms,
+                    "detectMs": pm.timings.detect_ms, "fitMs": pm.timings.fit_ms},
+        "detected": pm.detected.len(),
+        "product": product,
+        "options": options, "conversion": "none", "domain": domain,
+        "nonFinite": non_finite, "wallMs": wall,
+    }));
     out.flush().map_err(|e| format!("flush: {e}"))
 }
 
@@ -1372,6 +1529,7 @@ mod tests {
             budget: None,
             psf: None,
             fit_stars: None,
+            dump_ratios: false,
         }
     }
 
@@ -1494,7 +1652,19 @@ mod tests {
         assert!(lines
             .iter()
             .filter(|v| v["kind"] == "refused")
-            .all(|v| v["reason"].is_string() && v["regionRadius"].is_u64()));
+            .all(|v| v["reason"].is_string()
+                && v["regionRadius"].is_u64()
+                && v["x"].is_number()
+                && v["y"].is_number()));
+        let edge = lines
+            .iter()
+            .find(|v| v["kind"] == "refused" && v["reason"] == "outsideImage")
+            .unwrap();
+        assert!(
+            (edge["x"].as_f64().unwrap() - 232.0).abs() < 2.0
+                && (edge["y"].as_f64().unwrap() - 160.0).abs() < 2.0,
+            "the refused line names the seed's native position: {edge}"
+        );
     }
 
     /// Plan A Task 6b round 1 (ruling R3): the betas arm starts from the measure path's field width, so at the measure's
@@ -1885,20 +2055,15 @@ mod tests {
         assert!(f["beta"].as_f64().unwrap().is_finite());
     }
 
-    /// R12-7: the analysis-mode path runs alone, on a raw-domain file, with the matched filter, and a float file needs
-    /// `--clip`. Each refusal is an `Err` before any output file exists.
+    /// R12-7: the analysis-mode path runs alone, on the raw domain, with the matched filter. Each refusal is an `Err`
+    /// before any output file exists (the input's scale is `read_raw_frame`'s, C2).
     #[test]
     fn analysis_mode_is_refused_before_any_output_when_its_input_is_not_the_analysis_tabs() {
         let d = tempfile::tempdir().unwrap();
         let field = gaussian_field(128, 128, 0, true);
         let raw: Vec<f32> = field.iter().map(|v| (v * 65535.0).round()).collect();
-        let (ri, ui, out) = (
-            d.path().join("r.fits"),
-            d.path().join("u.fits"),
-            d.path().join("o.jsonl"),
-        );
+        let (ri, out) = (d.path().join("r.fits"), d.path().join("o.jsonl"));
         write_fits_f32(&ri, 128, 128, 1, &raw, &[]).unwrap();
-        write_fits_f32(&ui, 128, 128, 1, &field, &[]).unwrap();
         let a = || amode_args(ri.clone(), out.clone(), 16);
         for (args, want) in [
             (
@@ -1915,7 +2080,6 @@ mod tests {
                 },
                 "raw",
             ),
-            (amode_args(ui.clone(), out.clone(), 16), "raw-domain"),
             (
                 MeasureArgs {
                     seeds: Some(SeedChoice::Peak),
@@ -1923,7 +2087,6 @@ mod tests {
                 },
                 "matched filter",
             ),
-            (MeasureArgs { clip: None, ..a() }, "--clip"),
         ] {
             let err = cmd_measure(args).unwrap_err();
             assert!(err.contains(want), "{err}");
@@ -1997,90 +2160,5 @@ mod tests {
             );
             assert!(!out.exists(), "no output file for a refused invocation");
         }
-    }
-
-    /// A header-only FITS (the header is all `raw_scales` reads).
-    fn header_file(dir: &Path, name: &str, cards: &[String]) -> PathBuf {
-        let mut text = String::new();
-        for c in cards {
-            text.push_str(&format!("{c:<80}"));
-        }
-        text.push_str(&format!("{:<80}", "END"));
-        while text.len() % 2880 != 0 {
-            text.push(' ');
-        }
-        let p = dir.join(name);
-        std::fs::write(&p, text).unwrap();
-        p
-    }
-
-    fn raw_header(bitpix: i32, extra: &[(&str, &str)]) -> Vec<String> {
-        let mut v = vec![
-            format!("{:<8}= {:>20}", "SIMPLE", "T"),
-            format!("{:<8}= {:>20}", "BITPIX", bitpix),
-            format!("{:<8}= {:>20}", "NAXIS", 0),
-        ];
-        v.extend(extra.iter().map(|(k, val)| format!("{k:<8}= {val:>20}")));
-        v
-    }
-
-    /// M-3 / M-4: `raw_scales` from a header: full scale from BITPIX / BZERO (an offset-only BZERO falls to the signed
-    /// max, as documented), clip = `--clip` > positive DATAMAX > full scale, gain = a positive EGAIN, a float file
-    /// needs `--clip`. New test over existing behaviour (green at a7ac7659).
-    #[test]
-    fn raw_scales_reads_full_scale_clip_and_gain_from_the_header() {
-        let d = tempfile::tempdir().unwrap();
-        let h = |name: &str, bitpix, extra: &[(&str, &str)]| {
-            header_file(d.path(), name, &raw_header(bitpix, extra))
-        };
-        let u16f = h(
-            "a.fits",
-            16,
-            &[("BZERO", "32768"), ("DATAMAX", "60000"), ("EGAIN", "0.8")],
-        );
-        assert_eq!(
-            raw_scales(&u16f, None).unwrap(),
-            (60000.0, 65535.0, Some(0.8))
-        );
-        assert_eq!(
-            raw_scales(&u16f, Some(50000.0)).unwrap().0,
-            50000.0,
-            "--clip beats DATAMAX"
-        );
-        let plain = h(
-            "b.fits",
-            16,
-            &[("BZERO", "32768"), ("DATAMAX", "0"), ("EGAIN", "-1")],
-        );
-        assert_eq!(
-            raw_scales(&plain, None).unwrap(),
-            (65535.0, 65535.0, None),
-            "DATAMAX 0 and EGAIN <= 0 are unset"
-        );
-        assert_eq!(
-            raw_scales(&h("c.fits", 16, &[]), None).unwrap().1,
-            32767.0,
-            "signed 16-bit"
-        );
-        assert_eq!(
-            raw_scales(&h("d.fits", 16, &[("BZERO", "1000")]), None)
-                .unwrap()
-                .1,
-            32767.0,
-            "offset-only BZERO"
-        );
-        assert_eq!(raw_scales(&h("e.fits", 8, &[]), None).unwrap().1, 255.0);
-        assert_eq!(
-            raw_scales(&h("f.fits", 8, &[("BZERO", "-128")]), None)
-                .unwrap()
-                .1,
-            127.0
-        );
-        let fl = h("g.fits", -32, &[]);
-        assert!(raw_scales(&fl, None).unwrap_err().contains("--clip"));
-        assert_eq!(
-            raw_scales(&fl, Some(4095.0)).unwrap(),
-            (4095.0, 4095.0, None)
-        );
     }
 }

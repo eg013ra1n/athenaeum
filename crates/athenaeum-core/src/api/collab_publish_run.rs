@@ -747,7 +747,7 @@ mod tests {
         let catalog = crate::db::Database::new_for_test_with_pool(
             tmp.path().join("pool.db"),
             1,
-            Duration::from_millis(50),
+            Duration::from_secs(2), // opening the one connection counts against it too
         )
         .unwrap();
         let rec = Arc::new(Recorder::default());

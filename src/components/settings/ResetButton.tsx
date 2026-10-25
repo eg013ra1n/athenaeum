@@ -1,5 +1,5 @@
 // Settings redesign (spec 2026-09-18 §4/§5): the reset affordance and the
-// "saved" feedback every field component shows next to its control —
+// "saved" feedback every field component shows next to its label —
 // grouped in one file since both live in the same header-row corner and
 // share the "quiet feedback" idea (spec §5: a successful write is quiet, a
 // reset is a normal write through the same commit path).
@@ -28,7 +28,7 @@ export function ResetButton({ visible, defaultLabel, onReset, disabled }: ResetB
       disabled={disabled}
       title={`Reset to default (${defaultLabel})`}
       aria-label={`Reset to default (${defaultLabel})`}
-      className="shrink-0 p-1 rounded text-content-muted hover:text-content hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+      className="shrink-0 -my-1 p-1 rounded text-content-muted hover:text-content hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
     >
       <RotateCcw size={14} />
     </button>

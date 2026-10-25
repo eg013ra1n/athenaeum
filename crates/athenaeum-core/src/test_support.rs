@@ -525,3 +525,146 @@ pub(crate) fn width_spread_field_beta(beta: f64) -> (Vec<f32>, Vec<SpreadStar>, 
     );
     (data, stars, SIGMA)
 }
+
+// --- Plan C C1: the trailed / defocused plane fixtures, shared with C5 / C6 (moved from `star_measure/mod.rs`'s
+// `trailed` tests, and the donut field the defocused verdict reads) ---
+
+/// A horizontal trail `len` px long centred at (x, y): Gaussian points of FWHM 2.6 every 0.25 px (peak ≈ 11·amp).
+#[cfg(feature = "render")]
+pub(crate) fn trail_points(points: &mut Vec<(f64, f64, f64)>, x: f64, y: f64, len: f64, amp: f64) {
+    let n = (len / 0.25) as usize + 1;
+    points.extend((0..n).map(|k| (x - len / 2.0 + k as f64 * 0.25, y, amp)));
+}
+
+/// 20-px trails (amplitude 0.018 per point) at `trails` and round β-4 Moffat stars of FWHM 2.6 and peak 0.2 at
+/// `round`, on sky 0.05 with noise 0.002; one seed (peak 0.2) at every position, the round ones first.
+#[cfg(feature = "render")]
+fn trail_fixture(
+    w: usize,
+    h: usize,
+    round: &[(f64, f64)],
+    trails: &[(f64, f64)],
+    seed: u64,
+) -> (Vec<f32>, Vec<crate::star_measure::Seed>) {
+    let mut points = Vec::new();
+    for &(x, y) in trails {
+        trail_points(&mut points, x, y, 20.0, 0.018);
+    }
+    let mut data = gaussian_field(w, h, &points, 2.6 / 2.354_820_045, 0.05);
+    let a = 2.6 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+    let stars: Vec<MoffatStar> = round
+        .iter()
+        .map(|&(x, y)| MoffatStar {
+            x,
+            y,
+            amp: 0.2,
+            alpha_x: a,
+            alpha_y: a,
+            theta: 0.0,
+        })
+        .collect();
+    for (d, m) in data.iter_mut().zip(moffat_field(w, h, &stars, 4.0, 0.0)) {
+        *d += m;
+    }
+    add_noise(&mut data, 0.002, seed);
+    let seeds = round
+        .iter()
+        .chain(trails)
+        .map(|&(x, y)| crate::star_measure::Seed {
+            x,
+            y,
+            peak: 0.2,
+            flux: 1.0,
+        })
+        .collect();
+    (data, seeds)
+}
+
+/// [`trail_fixture`] on a 40-px grid from (30, 30) with a 30-px margin on every side: 13 columns on a 540-px plane (the
+/// previous version of these tests), as many as fit on a narrower one. Of the `round + trails` grid slots in order,
+/// every `(round + trails) / round`-th holds a round star (`round` of them), the rest trails.
+#[cfg(feature = "render")]
+pub(crate) fn trail_plane_fixture(
+    w: usize,
+    h: usize,
+    round: usize,
+    trails: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<crate::star_measure::Seed>) {
+    let n = round + trails;
+    let cols = 13.min((w - 60) / 40 + 1);
+    assert!(
+        30 + 40 * ((n - 1) / cols) <= h - 30,
+        "{n} slots of {cols} columns do not fit {w} x {h}"
+    );
+    let at = |i: usize| {
+        (
+            30.0 + 40.0 * (i % cols) as f64,
+            30.0 + 40.0 * (i / cols) as f64,
+        )
+    };
+    let stride = n / round;
+    let is_round = |i: usize| i % stride == 0 && i / stride < round;
+    let round_at: Vec<(f64, f64)> = (0..n).filter(|&i| is_round(i)).map(at).collect();
+    let trails_at: Vec<(f64, f64)> = (0..n).filter(|&i| !is_round(i)).map(at).collect();
+    assert_eq!((round_at.len(), trails_at.len()), (round, trails));
+    trail_fixture(w, h, &round_at, &trails_at, seed)
+}
+
+/// A trailed plane for the frame verdict: 5 round stars among 120 trails of 20 px ([`trail_plane_fixture`]'s mix), so
+/// `measure_plane` reads it `trailed` and keeps no star. Needs a plane of at least 540 x 420 (125 grid slots).
+#[cfg(feature = "render")]
+pub(crate) fn trailed_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
+    trail_plane_fixture(w, h, 5, 120, seed).0
+}
+
+/// A defocused plane for the frame verdict: annular stars (outer radius 6, obstruction 2.4, blurred by a Gaussian of
+/// sigma 1.1) on a 35-px grid from (30, 30) with a 30-px margin, on sky 0.05 with noise 0.002. `measure_plane` reads
+/// it `defocused` and keeps no star. Needs room for at least 8 donuts (a 330 x 100 plane holds exactly 8).
+#[cfg(feature = "render")]
+pub(crate) fn donut_field(w: usize, h: usize, seed: u64) -> Vec<f32> {
+    let mut data = vec![0.05f32; w * h];
+    let cols = (w.saturating_sub(60)) / 35 + 1;
+    let rows = (h.saturating_sub(60)) / 35 + 1;
+    assert!(
+        cols * rows >= 8,
+        "{w} x {h} holds {} donuts, 8 needed",
+        cols * rows
+    );
+    for i in 0..cols * rows {
+        add_donut_gain(&mut data, w, 30 + 35 * (i % cols), 30 + 35 * (i / cols), 1.0);
+    }
+    add_noise(&mut data, 0.002, seed);
+    data
+}
+
+/// A deterministic 2000-point sunflower lattice over the annulus `r_in ≤ r ≤ r_out` about `(cx, cy)`: point `k`
+/// at the radius enclosing the area fraction `(k + ½)/2000` of the annulus, turned by the golden angle per point,
+/// so the points sample the annulus uniformly by area.
+pub(crate) fn ring_samples(cx: f64, cy: f64, r_in: f64, r_out: f64) -> Vec<(f64, f64)> {
+    const N: usize = 2000;
+    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+    (0..N)
+        .map(|k| {
+            let t = (k as f64 + 0.5) / N as f64;
+            let r = (r_in * r_in + t * (r_out * r_out - r_in * r_in)).sqrt();
+            let (s, c) = (k as f64 * golden).sin_cos();
+            (cx + r * c, cy + r * s)
+        })
+        .collect()
+}
+
+/// [`add_donut`] with its amplitude scaled by `gain`.
+pub(crate) fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f64) {
+    let ring = ring_samples(cx as f64, cy as f64, 2.4, 6.0);
+    for y in cy - 12..=cy + 12 {
+        for x in cx - 12..=cx + 12 {
+            let mut acc = 0.0f64;
+            for &(ux, uy) in &ring {
+                let d2 = (x as f64 - ux).powi(2) + (y as f64 - uy).powi(2);
+                acc += (-d2 / (2.0 * 1.1 * 1.1)).exp();
+            }
+            data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
+        }
+    }
+}

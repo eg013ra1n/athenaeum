@@ -1,67 +1,67 @@
 # Plate Solving
 
-Athenaeum's plate solver is a **truly blind** all-sky astrometric solver. It determines precise sky coordinates for any FITS image without requiring the user to provide any coordinate hints — the FITS header does not need to contain RA/DEC, OBJECT, or any other positional information.
+Athenaeum's plate solver determines sky coordinates and a full WCS (with SIP distortion) for a FITS/XISF image. It can solve blind: the only hard input is the image itself. Anything the frame knows about where it points (RA/Dec, OBJECT, FOCALLEN and XPIXSZ, DATE-OBS) is passed to the solver as a hint that narrows and speeds up the search, never as a requirement.
 
-The only inputs the solver strictly requires are the image pixels themselves. Focal length and pixel size (from `FOCALLEN` and `XPIXSZ` FITS keywords) are used as a consistency filter to reject false matches but are not required for the match itself to succeed.
+The solver is `solvemyastro`, a git submodule (`solvemyastro/` at the repo root, its own crate) that matches detected stars against tiered Gaia-derived catalog layers. Athenaeum wraps it in `crates/athenaeum-core/src/plate_solve/`.
 
-This document describes the current implementation — architecture, pipeline, inputs, and outputs.
+> **Status of this document.** Current: Architecture Overview, Per-Frame Pipeline, Database Storage, Configuration, Key Source Files, Tauri Commands, the "frame-set clustering" failure mode, "Not Yet Implemented" and the 2026-10 changelog entry. Kept as history of the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Gaia layers): Pre-Built All-Sky Quad Index, Tiered Star Cache (the legacy deep + bright pair), the Per-Frame Pipeline of the Quad-Index Solver (with its Performance and Accuracy), Debug & Diagnostic Tools, the dense-field failure mode and the older changelog entries. Every file, type and tool named only in those history sections no longer exists. The input and acceptance gates are specified in [`input-and-acceptance-gates.md`](./input-and-acceptance-gates.md).
 
 ## Architecture Overview
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│                  One-time setup                         │
-│                                                         │
-│  Tycho-2 catalog (49,152 HEALpix files, 192 MB)         │
-│            │                                            │
-│            ▼                                            │
-│  index_builder::IndexBuilder::build()                   │
-│            │                                            │
-│            ▼                                            │
-│  quad_index.bin  (~46 MB, ~860 K quads, 12 sec build)   │
-└─────────────────────────────────────────────────────────┘
+ Settings -> Plate Solving: download catalog tiers
+        |  catalog::gaia_prebuilt::download_catalog_layers
+        v
+ <app-data>/catalogs/smac_gaia/tier_<density>/stars.smac   (additive tiers)
 
-┌─────────────────────────────────────────────────────────┐
-│                  Per-frame solve                        │
-│                                                         │
-│  FITS file ─▶ ImageAnalyzer (star detection)            │
-│                    │                                    │
-│                    ▼                                    │
-│               (x, y, flux) for top 500 stars            │
-│                    │                                    │
-│                    ▼                                    │
-│  pattern_matcher::build_quads() — nearest-neighbor      │
-│                    │                                    │
-│                    ▼                                    │
-│  Hash lookup in QuadIndex (O(1) per image quad)         │
-│                    │                                    │
-│                    ▼                                    │
-│  Scale filter (if FL + PIXSZ known)                     │
-│                    │                                    │
-│                    ▼                                    │
-│  Per-candidate: try all 24 star permutations,           │
-│  fit similarity transform, keep best                    │
-│                    │                                    │
-│                    ▼                                    │
-│  Verify: cone-search catalog, project through WCS,      │
-│  count image stars within tolerance                     │
-│                    │                                    │
-│                    ▼                                    │
-│  WcsSolution + SolveResult ─▶ plate_solves + frames     │
-└─────────────────────────────────────────────────────────┘
+ plate_solve_batch(frame_ids)                        (Tauri command / Axum route)
+   |
+   |- load config (plate_solve.config), open the tier stack once
+   |  (plate_solve::open_catalog_layers)
+   |- per frame, on the calling thread:
+   |     input gate  (service::input_gate_reason, from the stored analysis)
+   |     hints       (hints::extract_hints + apply_object_name_fallback)
+   |- worker pool (batch_concurrency), per frame:
+   |     service::solve_frame_with_hints
+   |       -> solvemyastro::solve(file, hints, Caches::layered, SolveConfig)
+   |            star detection, streak cut, autoFOV ladder, quad match,
+   |            affine seed, verification, refit, SIP fit
+   |       -> SolveResult (WCS + SIP, inliers, rms, scale, derived focal length)
+   |- back on the calling thread, one transaction:
+         service::store_result
+           -> acceptance gate (service::acceptance_refusal / blind_gate_ok)
+           -> plate_solves row  (storage::insert_plate_solve)
+           -> frames write-back (storage::update_frame_from_solve)
+           -> frames.object label from the nearest DSO, if empty
 ```
 
-## Two-Layer Code Organisation
+A solve is refused or fails at one of three places, each with its own reason shown in the UI: the **input gate** (trailed stars, before any solver work), the **solver** (a `solvemyastro::SolveFailure`, translated by `plate_solve::failure::describe_solve_failure` into a stable code and a message), and the **acceptance gate** (`REJECTED_LOW_CONFIDENCE`, nothing written).
 
-Plate solving is split across two crates, matching the workspace's general split between pure algorithms and application logic:
+The `solver` cargo feature of `athenaeum-core` (on by default) pulls in `solvemyastro`; `cargo check --no-default-features` does not compile plate solving.
 
-| Layer | Crate | Module | Role |
-| ---- | ---- | ---- | ---- |
-| Pure algorithms | `rustafits` | `src/platesolving/` | Quad generation, distance-ratio hashing, affine fitting, WCS math. No I/O, no database, no catalogs. |
-| Orchestration | `athenaeum-core` | `src/plate_solve/` and `src/catalog/` | Catalog I/O, quad index build/load, solve pipeline, database storage. |
-| Frontend | `src/components/plate-solve/` | — | React components, hooks, Tauri command invocation. |
+### The catalog layers
+
+`solvemyastro` reads memory-mapped `stars.smac` caches organised as an **additive stack of density tiers** (disjoint magnitude bands, base to deepest) under `<app-data>/catalogs/smac_gaia/tier_<density>/`. `plate_solve::layers`:
+
+- `discover_layers(root)` lists the `tier_<density>/` directories that hold a `stars.smac`, ascending by density. With no tiers but a bare `stars.smac` directly under the root, that single cache is a one-layer fallback (old installs keep solving). With neither, it returns nothing.
+- `open_catalog_layers(app_data_dir)` opens each layer as a `solvemyastro::StarCache`. It is the one opener: both hosts and the stacking project path call it. A missing catalog is `CatalogOpenError::NotInstalled`; the hosts turn it into "download the catalog from Settings -> Plate Solving".
+- `catalog_identity(app_data_dir)` is a stat-only fingerprint (tier directory name, `stars.smac` size and mtime) used in the hash of a cached stacking solve.
+
+Inside `solvemyastro` (`Caches::Layered`), quad matching uses the base layer with fallback to the full union, and verification uses the full union. The Settings tab shows one row per tier from the published manifest, recommends a tier from the narrowest field of view among the library's light frames (`get_frame_fov_summary`, `plate_solve::frame_fov_summary`) and downloads the chosen tier plus every lower one not yet installed (`download_catalog_layers`). The design is in `docs/superpowers/specs/2026-06-29-tiered-additive-star-catalog-design.md` and `docs/superpowers/plans/2026-06-30-layered-solver.md`.
+
+### Code organisation
+
+| Layer | Location | Role |
+| ---- | ---- | ---- |
+| Solver | `solvemyastro/` (submodule) | Detection-to-WCS pipeline, star caches, SIP fit, structured failures. |
+| Image types and detection | `rustafits` (`astroimage`) | FITS/XISF decode and fast star detection; `astroimage::platesolving` supplies the `SolveHints` and `WcsSolution` types the app-side API uses. |
+| Orchestration | `crates/athenaeum-core/src/plate_solve/` | Hints, config, catalog layers, the solve adapter, the gates, storage, DSO lookup. |
+| Commands | `crates/athenaeum-tauri/src/commands/plate_solve.rs`, `crates/athenaeum-web/src/routes/plate_solve.rs` | Batch driver, progress events, persistence. |
+| Frontend | `src/components/plate-solve/` | Settings panel and batch panel. |
 
 ## Pre-Built All-Sky Quad Index
+
+_History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Gaia layers); kept for the record._ `index_builder::IndexBuilder`, `QuadEntry`, `quad_index.bin`, `catalog/tycho2.rs` and `plate_solve/quad_index.rs` no longer exist.
 
 Blind solving works because the solver has a pre-computed, memory-mapped index of every nearest-neighbor quad in the catalog, organised by a scale-invariant hash. A single hash lookup can find candidate matches anywhere on the sky — no trial positions, no sweeps.
 
@@ -126,12 +126,11 @@ Verified star counts within a 1.7° cone around three reference sky regions (cov
 | Galactic centre | 785 | 1,684 | 1,857 | 1,872 | 1,873 |
 
 Rule of thumb: if bright stars in your image saturate (common for 180 s+ OSC exposures of dense fields), you need a deeper index because the detector's top-N is shifted down into the mag 9–13 range that the old mag-11 index did not cover.
-
 ## Tiered Star Cache (Bright + Deep, 2026-05)
 
-> Applies to the `solvemyastro` Gaia-DR3 pipeline that has replaced the legacy Tycho-2 `CatalogEngine` + `QuadIndex` flow in `solve_frame_with_hints`. The older sections above describe the original blind-index design and remain accurate for the Tycho-2 path; the parts that refer to a single `CatalogEngine` are superseded for the Gaia pipeline by the two-cache model below.
+_History: the legacy deep + bright cache pair of the `solvemyastro` Gaia pipeline (2026-05), superseded by the additive density-tier stack described in Architecture Overview. `solvemyastro::Caches::Legacy`, `Caches::deep_only`/`tiered` and `service::solve_frame_tiered` still exist, but the hosts and the stacking solve open the tier stack (`open_catalog_layers`) and pass `Caches::layered`. `PlateSolveConfig::bright_cache_path` is unread, and `require_bright_cache` and `ServiceContext::bright_cache` (named below) were retired. The measurements and the on-disk audit below describe the `smac_gaia` / `smac_gaia_bright` caches of that period._
 
-The hot path now consults **two on-disk star caches**, not one:
+At that time the hot path consulted **two on-disk star caches**, not one:
 
 | Cache | Convention path | Depth | Size | Used by |
 | ---- | ---- | ---- | ---- | ---- |
@@ -303,8 +302,44 @@ Takeaways:
   and even then it weakens verification everywhere (verify is always deep) and
   breaks long-focal-length / sparse-sky solves. Deep is the load-bearing
   catalog; bright is a speed optimization on top of it.
-
 ## Per-Frame Pipeline
+
+The batch driver is `plate_solve_batch` in the Tauri command and its Axum mirror. Core exposes `service::solve_frame`, `solve_frame_tiered`, `solve_frame_layered` (single-frame conveniences, mostly for tests and tools) and `solve_frame_with_hints`, the hot path both hosts and the stacking solve call. There is no single-frame solve command.
+
+### 1. Load and gate (calling thread, holds the DB)
+
+Per frame: `load_frame_with_path`, then the **input gate** `service::input_gate_reason`: when `input_gate_enabled` and the frame has a stored analysis of the current `measure_version` whose `frame_verdict` is `trailed`, the frame is refused ("Stars are trails the measurement could not fit ...") and never reaches the solver. The verdict alone decides (Plan C C7; the eccentricity / trail-R² pair was removed, `input-and-acceptance-gates.md`). A frame without an analysis is never refused here.
+
+### 2. Hints
+
+`hints::extract_hints(frame, conn)` builds a `SolveHints` (RA, Dec, FOV, pixel scale, epoch). Position priority: sexagesimal `objctra`/`objctdec` (the planned target), then numeric `ra`/`dec`, then the stored FITS-header WCS (`CRVAL1`/`CRVAL2`), then a nearby solved frame in the same directory. Sentinel positions (NULL, exact 0/0, `00:00:00`) are rejected. FOV and pixel scale always come from `focallen`, `xpixsz` and `naxis1`; `XPIXSZ` is already the effective pitch of the saved image, so binning is not applied again. If the header gave no usable position at all, `hints::apply_object_name_fallback` resolves the frame's OBJECT against the bundled DSO catalog (`plate_solve/dso_lookup.rs`) and uses the object's centre; a recorded position always wins. `service::solve_frame_with_hints` adds the real per-frame epoch (`observation_epoch`, from `date_obs`) so catalog proper motions are propagated to the shooting date.
+
+### 3. Solve
+
+`solve_frame_with_hints` calls `solvemyastro::solve(file, hints, Caches::layered(..), SolveConfig, cancel)` with a `SolveConfig` whose recipe is fixed in code: `quad_tolerance` 0.007, `catalog_mag_limit` 19.0, `fit_sip` true, `sip_order` from `PlateSolveConfig`. Changing any of those recipe constants, the gate or the catalog layering means bumping `config::SOLVE_RECIPE_VERSION`. The solver (see `solvemyastro/src/orchestrate.rs`) detects stars with `astroimage`'s fast detector, ranks them by SNR and drops streaks (eccentricity above 0.8), refuses a frame whose detections are almost all streaks (`looks_trailed`), then walks an autoFOV ladder (a hinted scale gives a short ladder around it; blind, it runs from 9.5 deg down to 0.38 deg in steps of 1/1.5) and a square-spiral search of sky cells, around the hinted position (default search radius 10 deg) or the whole sky. In each cell it cones the catalog, projects it, builds quads, matches and fits an affine, seeds a WCS, counts inliers, refits and fits SIP. The solver itself never emits a solution below 6 inliers (`MIN_ABSOLUTE_INLIERS`).
+
+The `SolveResult` carries the WCS with its SIP polynomials, `matched_stars`, `total_detected`, the RMS residual in pixels and arcseconds, pixel scale, field rotation, solve time, `catalog_used` and `algorithm_used` (both reported by the solver), `inlier_ratio` (the solver's own), and:
+
+- `expected_catalog_stars_in_fov`, counted by a cone of G <= 12 around the solved centre (the base layer, for a tier stack).
+- `derived_focallen_mm`, inverted from the solved pixel scale and `XPIXSZ` (or the `camera_defaults` entry for the frame's `INSTRUME`/`TELESCOP` when `XPIXSZ` is missing). `focallen_corrected` is set when the header had no focal length, or when the derived value differs from it by more than 2 %, which means the header scale hint was wrong.
+
+A failure is returned as the solver's own error so `describe_solve_failure` can downcast the structured `SolveFailure`. Each frame is wrapped in `catch_unwind`: a panic becomes a per-frame failure and the batch continues. A cancel flag (`cancel_plate_solve`) is passed to the solver.
+
+### 4. Acceptance gate and persistence (calling thread, one transaction)
+
+`service::store_result` first runs `acceptance_refusal` (only when `blind_gate_enabled`), which applies `blind_gate_ok`. A solve is refused when any of these holds:
+
+- the RMS residual exceeds `blind_rms_max_px_mult` times the adaptive pixel tolerance, `clamp(base_verification_tolerance_arcsec / pixel_scale_arcsec, 4, 20)` px (`adaptive_tol_px`);
+- the inlier count is below `blind_inlier_floor`;
+- the field is dense (`expected_catalog_stars_in_fov > 100`) and `inlier_ratio` is below `blind_min_inlier_ratio` (the primary false-positive discriminator; sparse fields are exempt);
+- the recovered pixel scale is outside `blind_scale_sanity_min`..`blind_scale_sanity_max` arcsec/px;
+- the header declares a pixel scale (from `focallen` and `xpixsz`) and the recovered scale differs from it by more than the factor `blind_scale_header_tol`.
+
+A refusal writes nothing and reaches the UI as a failure with code `REJECTED_LOW_CONFIDENCE`. The same pure check, `acceptance_refusal`, judges a frame in the stacking project path (`stacking::solve`), which also calls `solve_frame_with_hints` and `open_catalog_layers`; see `docs/stacking/README.md`. An accepted solve is written to `plate_solves` and the `frames` summary columns (see Database Storage), and, through `plate_solve::dso_lookup::DsoCatalog::find_best`, the nearest named object labels `frames.object` when it is empty.
+
+## Per-Frame Pipeline of the Quad-Index Solver (History)
+
+_History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Gaia layers); kept for the record._ `CatalogEngine`, `QuadIndex`, `try_solve_pass`, `required_inliers`, `retry_passes`, `use_fast_detection` and `max_image_stars` no longer exist, and the numbers below were measured on that solver. The current flow is the Per-Frame Pipeline above.
 
 The solver entry point is `athenaeum_core::plate_solve::service::solve_frame()`.
 
@@ -377,7 +412,7 @@ A deeper mag-13 index returns 2–3× more candidate hash matches per lookup tha
 If `FOCALLEN` and `XPIXSZ` are present in the frame metadata, the solver computes the expected pixel scale in arcsec/px:
 
 ```text
-expected_scale = atan(xpixsz_mm × xbinning / focallen_mm) × (180/π) × 3600
+expected_scale = atan(xpixsz_mm / focallen_mm) × (180/π) × 3600   # XPIXSZ already includes binning (plate_solve/hints.rs)
 ```
 
 Each hash-match candidate has an implied scale from `catalog_quad.longest_dist_deg × 3600 / image_quad.longest_dist`. Candidates whose implied scale disagrees with `expected_scale` by more than **±5 %** (`filter_scale_tolerance = 0.05`) are discarded.
@@ -473,7 +508,7 @@ Debug-mode timings are ~10× slower due to unoptimised `nalgebra` LSQ routines.
 
 ### Accuracy
 
-#### Sparse field — Lemmon reference (cross-check against known astrometry.net solve)
+#### Sparse field — Lemmon reference (cross-check against a known solve from an external plate solver)
 
 | Metric | Phase 1–3 (mag 11) | **Phase 4 + mag 13** |
 | ---- | ---- | ---- |
@@ -495,77 +530,77 @@ Before Phase 4 / mag-13: 0 of 4 solved. After:
 All 4 pin to Barnard 150 (RA 312.85°, Dec +60.15°) at 1.887 "/px, rotation 271.5°.
 
 This precision (sub-arcminute, half-percent scale) is appropriate for coordinate recovery and frame-set clustering. A precise WCS refinement phase using Gaia DR3 — with SIP distortion correction for sub-pixel stacking accuracy — is planned as a follow-up.
-
 ## Database Storage
 
-Successful solves are persisted to two places in the SQLite database.
+Accepted solves are persisted to two places in the SQLite database.
 
 ### `plate_solves` table (full WCS)
 
-Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-solving updates in place (`UNIQUE(frame_id)`).
+Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-solving replaces it (`UNIQUE(frame_id)`, `insert_plate_solve`). The row is built from the `SolveResult` by `service::record_from_result` and read back as `storage::PlateSolveRecord` (`get_plate_solve`; `PlateSolveRecord::to_solution` rebuilds the WCS and its SIP tables).
 
-| Column | Type | Populated by the blind solver? | Notes |
-| ---- | ---- | ---- | ---- |
-| `id` | `INTEGER PRIMARY KEY` | auto | — |
-| `frame_id` | `INTEGER NOT NULL UNIQUE` | yes | FK to `frames(id)` with `ON DELETE CASCADE` |
-| `crpix1`, `crpix2` | `REAL NOT NULL` | yes | Reference pixel (always image centre) |
-| `crval1`, `crval2` | `REAL NOT NULL` | yes | RA, Dec at reference pixel, degrees |
-| `cd1_1`, `cd1_2`, `cd2_1`, `cd2_2` | `REAL NOT NULL` | yes | CD matrix in degrees/pixel |
-| `sip_order` | `INTEGER` | **no** (NULL) | Reserved for future precise-WCS refinement |
-| `sip_a_coeffs`, `sip_b_coeffs` | `TEXT` | **no** (NULL) | Reserved for SIP forward polynomials (JSON) |
-| `sip_ap_coeffs`, `sip_bp_coeffs` | `TEXT` | **no** (NULL) | Reserved for SIP reverse polynomials |
-| `matched_stars` | `INTEGER NOT NULL` | yes | Verification inlier count |
-| `total_detected` | `INTEGER NOT NULL` | yes | Total stars from star detection |
-| `rms_residual_px` | `REAL NOT NULL` | yes | RMS of inlier residuals in pixels |
-| `rms_residual_arcsec` | `REAL NOT NULL` | yes | `rms_residual_px × pixel_scale_arcsec` |
-| `pixel_scale_arcsec` | `REAL NOT NULL` | yes | Derived from the CD matrix |
-| `field_rotation_deg` | `REAL NOT NULL` | yes | Position angle of the Y axis, N through E |
-| `solve_time_ms` | `INTEGER NOT NULL` | yes | End-to-end wall time |
-| `catalog_used` | `TEXT NOT NULL` | yes | `"tycho2"` today; `"gaia_dr3"` once that's added |
-| `algorithm_used` | `TEXT NOT NULL` | yes | `"blind_index"` today |
-| `solved_at` | `TEXT NOT NULL` | yes | ISO 8601 UTC timestamp |
-| `expected_catalog_stars_in_fov` | `INTEGER` | yes (Phase 4.3) | Count from the verify cone search. Nullable on rows written before the migration. |
-| `inlier_ratio` | `REAL` | yes (Phase 4.3) | `matched_stars / expected_catalog_stars_in_fov`. Nullable on pre-Phase-4 rows. |
-
-The SIP columns are intentionally unused today. They stay in the schema so the precise-WCS refinement stage can fill them without a migration.
-
-The Phase 4.3 columns were added via an idempotent `ALTER TABLE ADD COLUMN` migration (`schema.rs`) — existing rows retain `NULL` values; the schema migration is non-destructive.
+| Column | Type | Notes |
+| ---- | ---- | ---- |
+| `id` | `INTEGER PRIMARY KEY` | auto |
+| `frame_id` | `INTEGER NOT NULL UNIQUE` | FK to `frames(id)` with `ON DELETE CASCADE` |
+| `crpix1`, `crpix2` | `REAL NOT NULL` | Reference pixel |
+| `crval1`, `crval2` | `REAL NOT NULL` | RA, Dec at the reference pixel, degrees |
+| `cd1_1`, `cd1_2`, `cd2_1`, `cd2_2` | `REAL NOT NULL` | CD matrix in degrees/pixel |
+| `sip_order` | `INTEGER` | Order of the fitted SIP polynomial; NULL when no SIP was fitted |
+| `sip_a_coeffs`, `sip_b_coeffs` | `TEXT` | SIP forward polynomials, JSON triangular arrays |
+| `sip_ap_coeffs`, `sip_bp_coeffs` | `TEXT` | SIP reverse polynomials, same encoding |
+| `matched_stars` | `INTEGER NOT NULL` | Inlier count |
+| `total_detected` | `INTEGER NOT NULL` | Stars the solver detected |
+| `rms_residual_px`, `rms_residual_arcsec` | `REAL NOT NULL` | RMS of the inlier residuals |
+| `pixel_scale_arcsec` | `REAL NOT NULL` | Solved pixel scale |
+| `field_rotation_deg` | `REAL NOT NULL` | Field rotation, N through E |
+| `solve_time_ms` | `INTEGER NOT NULL` | Wall time of `solve_frame_with_hints` |
+| `catalog_used`, `algorithm_used` | `TEXT NOT NULL` | As reported by `solvemyastro` |
+| `solved_at` | `TEXT NOT NULL` | UTC timestamp, `%Y-%m-%d %H:%M:%S` |
+| `expected_catalog_stars_in_fov` | `INTEGER` | Catalog stars (G <= 12) in the solved field. Nullable: rows written before the column was added by the idempotent `ALTER TABLE` migration in `schema.rs` keep NULL |
+| `inlier_ratio` | `REAL` | The solver's inlier ratio; nullable for the same reason |
 
 ### `frames` table (summary coordinates)
 
-The solver also updates the frame record directly via `update_frame_from_solve()` so that downstream features (clustering, spatial queries, calendar, sky atlas) can work from `frames` alone without joining `plate_solves`.
+`storage::update_frame_from_solve` updates the frame row so that clustering, spatial queries, the calendar and the sky atlas can work from `frames` alone. It sets `override = 1`, so the scanner's non-destructive re-parse does not revert it.
 
 | Frame column | Updated | Format |
 | ---- | ---- | ---- |
-| `ra` | yes | Decimal degrees (f64) |
-| `dec` | yes | Decimal degrees (f64) |
+| `ra`, `dec` | yes | Decimal degrees (f64) |
 | `rotation` | yes | Decimal degrees, N through E |
 | `objctra` | yes | Sexagesimal `HH:MM:SS.s` via `coordinates::format_ra_sexagesimal()` |
-| `objctdec` | yes | Sexagesimal `±DD:MM:SS.s` via `coordinates::format_dec_sexagesimal()` |
-| `focallen` | yes, **only if it was NULL** | mm, derived as `206265 × (xpixsz_mm) / pixel_scale_arcsec` |
+| `objctdec` | yes | Sexagesimal `+DD:MM:SS.s` via `coordinates::format_dec_sexagesimal()` |
+| `focallen` | yes, when a derived value exists | Written when the frame had NULL; overwritten only when `focallen_corrected` is set (the header value was proven wrong) |
+| `object` | only when empty | The nearest DSO designation, via `update_frame_object_if_missing` (also sets `override = 1`) |
 
-Coordinate format rules follow the project-wide convention so new solved values are indistinguishable from values that originally came from FITS headers.
+`delete_plate_solve_for_frame` removes the `plate_solves` row (used by the metadata pane's "Revert WCS to FITS header" action so a stale solve does not outlive the cleared frame columns).
 
 ## Configuration
 
-`PlateSolveConfig` lives in `crates/athenaeum-core/src/plate_solve/config.rs` and is persisted in the `settings` table under the key `plate_solve.config`. All fields have `#[serde(default)]`, so old configs migrate cleanly.
+`PlateSolveConfig` lives in `crates/athenaeum-core/src/plate_solve/config.rs` and is persisted as JSON in the `settings` table under the key `plate_solve.config`. Every field is `#[serde(default)]` and unknown keys are ignored, so configs written by older versions (which carried `max_image_stars`, `min_matched_stars`, `verification_tolerance_px`, `index_mag_limit`, `hash_tolerance`, `use_fast_detection`, `retry_passes`, `min_inlier_ratio` and others) still load. `load_config` also normalises a stored `blind_inlier_floor` of 12, the pre-2026-05 default, to the current default.
 
 | Field | Default | Meaning |
 | ---- | ---- | ---- |
-| `max_image_stars` | 300 | Legacy; `retry_passes` now drives per-pass cap |
-| `min_matched_stars` | 6 | **Absolute floor** for the density gate — never accept below this even if density is tiny (was 15 before Phase 4) |
-| `verification_tolerance_px` | 10.0 | Legacy; superseded by `base_verification_tolerance_arcsec` |
-| `index_mag_limit` | **13.0** | Faintest magnitude included when building the index (was 11.0; raised 2026-04) |
-| `hash_tolerance` | 0.005 | Quantisation bin size for distance-ratio keys |
-| `sip_order` | 3 | Reserved for the future refinement stage |
-| `use_fast_detection` | `true` | Skip Moffat PSF fit during detection |
-| `autofind_tolerance_deg` | 0.5 | DSO-labelling tolerance (unrelated to solving) |
-| `batch_concurrency` | 0 | 0 = auto (`cores/3`, clamped 2–8) |
-| `min_inlier_ratio` | 0.10 | **Density-aware gate**: dense fields (>100 FOV stars) require `round(min_ratio × effective_density)` inliers, floored at 20 |
-| `retry_passes` | `[50, 150, 300, 600]` | Progressive star-count passes; first passing pass wins |
-| `base_verification_tolerance_arcsec` | 8.0 | Adaptive pixel tolerance is `clamp(base/pixel_scale, 4, 20) px` |
+| `sip_order` | 3 | SIP polynomial order passed to the solver |
+| `base_verification_tolerance_arcsec` | 8.0 | Per-frame pixel tolerance is `clamp(base / pixel_scale_arcsec, 4, 20)` px; scales the RMS ceiling of the acceptance gate |
+| `autofind_tolerance_deg` | 0.5 | Maximum distance for the "Autofind object from coordinates" DSO label; unrelated to solving |
+| `batch_concurrency` | 0 | Batch workers; 0 = auto, `(cores / 3).clamp(2, 8)` |
+| `blind_gate_enabled` | `true` | Master switch of the acceptance gate (`store_result` and the stacking solve) |
+| `blind_rms_max_px_mult` | 2.5 | Refuse when `rms_residual_px` exceeds this multiple of the adaptive pixel tolerance |
+| `blind_min_inlier_ratio` | 0.04 | Minimum `inlier_ratio`, applied to dense fields only (more than 100 catalog stars in the field) |
+| `blind_inlier_floor` | 6 | Absolute inlier floor, equal to the solver's own minimum; a backstop, not a discriminator |
+| `blind_scale_sanity_min`, `blind_scale_sanity_max` | 0.05, 60.0 | Recovered pixel scale must lie in this arcsec/px range |
+| `blind_scale_header_tol` | 8.0 | When the header implies a scale, the recovered scale must be within this factor of it |
+| `input_gate_enabled` | `true` | Refuse trailed frames before solving |
+| `camera_defaults` | empty | `INSTRUME` or `TELESCOP` to pixel size in micrometres; used to derive focal length when the header has no `XPIXSZ` |
+| `bright_cache_path` | none | Unread since 2026-09-10; kept so a stored config still round-trips. The solver resolves its catalog layers itself |
 
-`index_mag_limit` and `hash_tolerance` only take effect when the user rebuilds the quad index. The Settings → Plate Solving tab has an inline `at mag ≤ [N]` field next to the **Rebuild Quad Index** button; clicking rebuild auto-saves the config first, so whatever the user types is persisted and used for the rebuild immediately.
+The Settings -> Plate Solving tab (`src/components/plate-solve/PlateSolveSettingsPanel.tsx`, hosted by `src/components/settings/tabs/PlateSolvingTab.tsx`) renders three registered sections from `src/settings/registry.ts`:
+
+- `plateSolving.catalog` ("Star Catalog"): the tier list, a recommendation from the library's fields of view, and the download.
+- `plateSolving.solver` ("Solver Parameters"): `base_verification_tolerance_arcsec`, `sip_order`, `autofind_tolerance_deg`, `batch_concurrency`.
+- `plateSolving.inputGate` ("Input Gate"): `input_gate_enabled` (the two number fields left the config in Plan C C7; their controls leave the panel in C8).
+
+The `blind_*` fields and `camera_defaults` have no controls; they live only in the stored JSON. `solver_config_hash` covers the recipe version, `sip_order`, the tolerance and every `blind_*` field (the inputs of a cached stacking solve) and ignores the rest.
 
 ## Key Source Files
 
@@ -573,59 +608,59 @@ Coordinate format rules follow the project-wide convention so new solved values 
 
 | Path | Role |
 | ---- | ---- |
-| `rustafits/src/platesolving/pattern_matcher.rs` | `build_quads()`, `Quad`, `AffineTransform`, `fit_affine_from_centers()` |
-| `rustafits/src/platesolving/projection.rs` | Gnomonic TAN projection (`sky_to_tangent`, `tangent_to_sky`) |
-| `rustafits/src/platesolving/proper_motion.rs` | Linear proper-motion propagation for catalog stars |
-| `rustafits/src/platesolving/wcs.rs` | `WcsSolution` + `pixel_to_sky`, `sky_to_pixel`, `to_fits_headers` |
-| `rustafits/src/platesolving/transform.rs` | Affine / projective / SIP fitting (used later by precise WCS) |
-| `rustafits/src/platesolving/ransac.rs` | RANSAC over individual star matches (reserved for refinement) |
-| `crates/athenaeum-core/src/catalog/binary_format.rs` | 14-byte HEALpix star record format |
-| `crates/athenaeum-core/src/catalog/healpix.rs` | `cdshealpix` wrapper: pixel lookup, cone search, neighbor walk |
-| `crates/athenaeum-core/src/catalog/mod.rs` | `CatalogEngine::cone_search()` and `load_region()` |
-| `crates/athenaeum-core/src/catalog/tycho2.rs` | Downloads and parses the Tycho-2 catalog from CDS |
-| `crates/athenaeum-core/src/plate_solve/index_builder.rs` | Builds the all-sky `quad_index.bin` |
-| `crates/athenaeum-core/src/plate_solve/quad_index.rs` | Loads and queries the index |
-| `crates/athenaeum-core/src/plate_solve/service.rs` | `solve_frame()`, `store_result()`, `try_solve_pass()`, `required_inliers()`, `adaptive_tol_px()` — the solve pipeline (+ Phase 4 helpers) |
-| `crates/athenaeum-core/src/plate_solve/hints.rs` | Metadata extraction: pixel scale (binning-aware), FOV, obs epoch |
-| `crates/athenaeum-core/src/plate_solve/storage.rs` | `plate_solves` (incl. `expected_catalog_stars_in_fov` / `inlier_ratio`) and `frames` DB writes |
-| `crates/athenaeum-core/src/plate_solve/config.rs` | `PlateSolveConfig` serde type (incl. `retry_passes`, `min_inlier_ratio`, `base_verification_tolerance_arcsec`) |
-| `crates/athenaeum-core/examples/debug_plate_solve.rs` | Variant-sweep bench against a single frame |
-| `crates/athenaeum-core/examples/debug_plate_solve_viz.rs` | Visualised detection + solve, writes PNGs |
-| `crates/athenaeum-core/examples/rebuild_quad_index.rs` | Rebuild `quad_index.bin` at an arbitrary magnitude limit |
+| `solvemyastro/` (submodule) | The solver: `orchestrate.rs` (blind and hinted search), `cache.rs` (`StarCache`, `.smac` format), `select.rs`, `quad.rs`, `verify.rs`, `refine.rs`, `sip.rs`, `wcs.rs`, `diag.rs` (`SolveFailure`, `FailureClass`) |
+| `crates/athenaeum-core/src/plate_solve/service.rs` | `solve_frame`, `solve_frame_tiered`, `solve_frame_layered`, `solve_frame_with_hints`, `store_result`, `acceptance_refusal`, `blind_gate_ok`, `input_gate_reason`, `adaptive_tol_px`, `record_from_result` |
+| `crates/athenaeum-core/src/plate_solve/layers.rs` | `discover_layers`, `open_catalog_layers`, `catalog_root`, `catalog_identity`, `CatalogOpenError` |
+| `crates/athenaeum-core/src/plate_solve/hints.rs` | `extract_hints`, `apply_object_name_fallback`, `fov_from_optics`, `frame_fov_summary` |
+| `crates/athenaeum-core/src/plate_solve/config.rs` | `PlateSolveConfig`, `load_config`/`save_config`, `SOLVE_RECIPE_VERSION`, `solver_config_hash` |
+| `crates/athenaeum-core/src/plate_solve/failure.rs` | `describe_solve_failure`: solver failure class to a stable code and a user message |
+| `crates/athenaeum-core/src/plate_solve/storage.rs` | `PlateSolveRecord`, `insert_plate_solve`, `get_plate_solve`, `delete_plate_solve`, `update_frame_from_solve`, `update_frame_object_if_missing` |
+| `crates/athenaeum-core/src/plate_solve/dso_lookup.rs` | Bundled DSO catalog: name resolution and nearest-object lookup |
+| `crates/athenaeum-core/src/plate_solve/object_fill.rs` | The "Autofind object from coordinates" batch |
+| `crates/athenaeum-core/src/catalog/gaia_prebuilt.rs` | Catalog tier download and `tier_status`; `catalog/manifest.rs` the published manifest |
+| `crates/athenaeum-core/src/stacking/solve.rs` | The stacking project path's solve, sharing the gate and the opener |
 
 ### Tauri/Web
 
-| Path | Commands |
+| Path | Role |
 | ---- | ---- |
-| `crates/athenaeum-tauri/src/commands/plate_solve.rs` | `plate_solve_frame`, `plate_solve_batch`, `cancel_plate_solve`, `get_plate_solve_config`, `set_plate_solve_config`, `reset_plate_solve_config`, `get_plate_solve_result`, `get_catalog_status`, `download_tycho2_catalog`, `get_quad_index_status`, `build_quad_index` |
-| `crates/athenaeum-web/src/routes/plate_solve.rs` | Mirrors all Tauri commands over HTTP with SSE for progress |
+| `crates/athenaeum-tauri/src/commands/plate_solve.rs` | The 13 commands below, the batch driver and its events |
+| `crates/athenaeum-web/src/routes/plate_solve.rs` | Mirrors every command over HTTP, with SSE for progress |
 
 ### Frontend
 
 | Path | Role |
 | ---- | ---- |
 | `src/types/plate-solve.ts` | Typed mirrors of the Rust config / result / progress structs |
-| `src/hooks/usePlateSolveProgress.ts` | Batch-solve queue, listens to `plate-solve-progress` events |
-| `src/components/plate-solve/PlateSolveSettingsPanel.tsx` | Settings tab: catalog download, quad-index build, solver parameters |
-| `src/components/plate-solve/PlateSolveBatchPanel.tsx` | Batch "Plate Solve Selected / All" buttons for the FileManager missing-metadata tab |
-| `src/pages/Settings.tsx` | Hosts the plate solving settings tab |
-| `src/pages/FileManager.tsx` | Hosts the batch panel on the missing-metadata tab |
+| `src/hooks/usePlateSolveQueue.ts` | Batch-solve queue |
+| `src/components/plate-solve/PlateSolveSettingsPanel.tsx` | Settings: catalog tiers and download, solver parameters, input gate |
+| `src/components/plate-solve/cameraPresets.ts` | Tier recommendation from the narrowest field of view |
+| `src/components/plate-solve/PlateSolveBatchPanel.tsx` | Batch "Plate Solve Selected / All" buttons |
+| `src/components/plate-solve/PlateSolveIndexMissingModal.tsx` | Offers the catalog download when a batch is refused because no tier is installed |
+| `src/components/plate-solve/FillObjectsPanel.tsx` | Autofind-object batch panel |
+| `src/settings/registry.ts` | The Plate Solving sections (`plateSolving.catalog`, `.solver`, `.inputGate`) |
 
 ## Tauri Commands
 
+All 13 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored in `crates/athenaeum-web/src/routes/plate_solve.rs`.
+
 | Command | Purpose |
 | ---- | ---- |
-| `plate_solve_frame(frame_id)` | Solve a single frame and store the result |
-| `plate_solve_batch(frame_ids)` | Solve a list of frames sequentially with progress events |
-| `cancel_plate_solve()` | Cancel the current batch |
-| `get_plate_solve_result(frame_id)` | Fetch a stored solve record |
-| `get_plate_solve_config()` / `set_plate_solve_config(config)` / `reset_plate_solve_config()` | Settings CRUD |
-| `get_catalog_status()` | List installed catalogs (Tycho-2 today) |
-| `download_tycho2_catalog()` | Download + convert Tycho-2 (~160 MB over HTTP, emits `catalog-download-progress`) |
-| `get_quad_index_status()` | Check if `quad_index.bin` exists and read its header |
-| `build_quad_index()` | Build the all-sky quad index from an installed catalog (emits `quad-index-progress`) |
+| `get_plate_solve_config()` / `set_plate_solve_config(config)` / `reset_plate_solve_config()` | Settings CRUD for `PlateSolveConfig` |
+| `plate_solve_batch(frame_ids)` | Gate, solve and persist a list of frames; emits `plate-solve-progress` per frame and `plate-solve-complete` at the end |
+| `cancel_plate_solve()` | Set the cancel flag of the running batch |
+| `autofind_objects_from_coordinates(frame_ids)` | Label frames that have coordinates but no object from the DSO catalog; emits `autofind-objects-progress` and `autofind-objects-complete` |
+| `cancel_autofind_objects()` | Cancel that batch |
+| `resolve_object_name(name)` | Does the DSO catalog know this name (the metadata editor asks while typing) |
+| `get_plate_solve_result(frame_id)` | Fetch a stored `plate_solves` row |
+| `delete_plate_solve_for_frame(frame_id)` | Delete the stored row |
+| `get_catalog_status()` | One entry per catalog tier, merged with the on-disk install state |
+| `get_frame_fov_summary()` | Narrowest computable field of view among the light frames (the tier recommendation input) |
+| `download_catalog_layers(target_density)` | Download the chosen tier and every lower one not yet installed; emits `catalog-download-progress` |
 
 ## Debug & Diagnostic Tools
+
+_History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Gaia layers); kept for the record._ `debug_plate_solve.rs`, `debug_plate_solve_viz.rs` and `rebuild_quad_index.rs` are gone from `crates/athenaeum-core/examples/`; to diagnose a failure today read the structured failure code and the `solve` logs (`docs/logging/README.md`).
 
 Two standalone example binaries live under `crates/athenaeum-core/examples/` for diagnosing solve failures against real user frames. They all read the installed Tycho-2 catalog + quad index via the shared `ATHENAEUM_DB_PATH` / `ATHENAEUM_CATALOG` env vars (defaults to the macOS app-data dir).
 
@@ -671,10 +706,11 @@ cargo run --release -p athenaeum-core --example rebuild_quad_index -- 11.0 quad_
 ```
 
 Progress is printed every 5 % of pixels read. Expect ~40 s on an M1 at mag 13, ~12 s at mag 11.
-
 ## Known Failure Modes
 
-### Long-exposure dense-field frames
+### Long-exposure dense-field frames (quad-index solver)
+
+_History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Gaia layers); kept for the record._
 
 **Symptom:** frame fails with `best candidate has <N> inliers at RA=<correct> Dec=<correct> (required <M>, density <D> detected / <E> catalog in FOV) — dense field; consider rebuilding the quad index with a higher magnitude limit`.
 
@@ -692,15 +728,16 @@ Progress is printed every 5 % of pixels read. Expect ~40 s on an M1 at mag 13, ~
 
 ## What Is NOT Yet Implemented
 
-These items are explicitly out of scope for the current blind solver and are planned as follow-up work:
+- **Auto re-cluster solved frames into the correct frame sets** — see Known Failure Modes above.
+- **Gate controls in Settings** — the acceptance gate's `blind_*` fields and `camera_defaults` have no Settings UI (the input gate and the solver parameters do); see Configuration.
 
-- **SIP distortion correction** — `sip_*` columns in `plate_solves` are reserved and always NULL for blind-solve results.
-- **Gaia DR3 catalog** — the code treats `catalog_used` as dynamic, but only `tycho2` is currently wired up.
-- **Sub-arcsecond precise refinement** — for stacking / registration accuracy, a second pass using Gaia DR3 and full WCS+SIP fitting is planned. The current blind solver intentionally stops at similarity-level accuracy.
-- **Auto-build on first use** — the user must explicitly click "Build Quad Index" the first time after downloading the catalog.
-- **Auto re-cluster solved frames into correct frame sets** — see Known Failure Modes above.
+SIP distortion fitting and the Gaia catalog, listed here as planned while the quad-index solver was current, are implemented: the solver fits SIP and the `plate_solves` SIP columns are filled.
 
 ## Changelog
+
+### 2026-10 — Document brought back in line with the code
+
+- Rewrote Architecture Overview, Per-Frame Pipeline, Database Storage, Configuration, Key Source Files and Tauri Commands from the code; the retired quad-index sections are kept and marked as history.
 
 ### 2026-10 — Shared acceptance gate and catalog opener (stacking project path)
 
@@ -762,5 +799,4 @@ Verified: 6 unit tests in `service::tests`, 5 integration tests in `blind_index_
 
 ### Plate solving
 
-`solvemyastro` (submodule) is the sole solver, driven from `crates/athenaeum-core/src/plate_solve/`. Three defences (2026-09-05) against wind-shaken frames being "solved" at a wrong scale: rustafits measures eccentricity on every fast detection, the solver drops streaks before quad selection and refuses a frame the cut emptied (`looks_trailed`), and `plate_solve/service.rs` has an analysis-based input gate (`median_eccentricity` AND `trail_r_squared`, both required) plus an acceptance gate fed the header pixel scale. **Neither gate has a Settings UI** — both live in the stored `plate_solve.config` JSON; `PlateSolveSettingsPanel.tsx` renders only three fields. Known gap, its own cycle: the full analysis under-reports eccentricity on trailed frames. **Object-name fallback** (`plate_solve::hints::apply_object_name_fallback`): a header without usable RA/Dec resolves OBJECT against the bundled DSO catalog; a recorded position always wins; `resolve_object_name` on both hosts. Reference: `docs/platesolving/README.md` (pipeline) and `docs/platesolving/input-and-acceptance-gates.md` (the gates).
-
+`solvemyastro` (submodule) is the sole solver, driven from `crates/athenaeum-core/src/plate_solve/`. Three defences (2026-09-05) against wind-shaken frames being "solved" at a wrong scale: rustafits measures eccentricity on every fast detection, the solver drops streaks before quad selection and refuses a frame the cut emptied (`looks_trailed`), and `plate_solve/service.rs` has an analysis-based input gate (`median_eccentricity` AND `trail_r_squared`, both required) plus an acceptance gate fed the header pixel scale. **Only the input gate has a Settings section** (`plateSolving.inputGate`); the acceptance gate's `blind_*` fields live only in the stored `plate_solve.config` JSON. Known gap, its own cycle: the full analysis under-reports eccentricity on trailed frames. **Object-name fallback** (`plate_solve::hints::apply_object_name_fallback`): a header without usable RA/Dec resolves OBJECT against the bundled DSO catalog; a recorded position always wins; `resolve_object_name` on both hosts. Reference: `docs/platesolving/README.md` (pipeline) and `docs/platesolving/input-and-acceptance-gates.md` (the gates).

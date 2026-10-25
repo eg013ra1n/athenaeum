@@ -51,11 +51,18 @@ pub enum RefusalReason {
     /// accepted is refused with this reason. The per-seed refusals keep theirs; there is no per-star streak refusal.
     /// Declared last so every earlier reason keeps its `Ord` position.
     Trailed,
+    /// Another seed of the plane's detection (any seed the detector produced or the caller gave, fitted or not, other
+    /// than the fit's own) lies inside the fit's half-maximum ellipse and at least [`super::fit::BLEND_SEED_GUARD`]
+    /// `· F_field` from the fit's own seed: the fit is two stars (Plan C R-PC-10). Both fits of a merged pair are
+    /// refused. Not a containment refusal, so not in the trailed share. Analysis path only (`Mode::Budget`, R-PC-10b): the
+    /// stacking Measure, LN's refits and registration never produce it. Declared last so every earlier reason keeps its
+    /// `Ord` position.
+    Blend,
 }
 
 impl RefusalReason {
     /// Every reason, in declaration (and `Ord`) order.
-    pub const ALL: [RefusalReason; 14] = [
+    pub const ALL: [RefusalReason; 15] = [
         RefusalReason::OutsideImage,
         RefusalReason::TooFewPixels,
         RefusalReason::Donut,
@@ -70,6 +77,7 @@ impl RefusalReason {
         RefusalReason::Defocused,
         RefusalReason::MostlySaturated,
         RefusalReason::Trailed,
+        RefusalReason::Blend,
     ];
 
     /// The serialized (camelCase) name: the key of `ChannelMeasurement::refused_by_reason` and the `reason` of a
@@ -90,6 +98,7 @@ impl RefusalReason {
             RefusalReason::Defocused => "defocused",
             RefusalReason::MostlySaturated => "mostlySaturated",
             RefusalReason::Trailed => "trailed",
+            RefusalReason::Blend => "blend",
         }
     }
 }
@@ -115,6 +124,12 @@ pub enum Outcome {
 pub struct FitDiagnostics {
     /// The seed's index in the seed list the fitter was handed (the probe's seed line `i`).
     pub seed: usize,
+    /// The seed's position in the plane's native pixels (the handed seed list's `x`, `y`): `seed` is an index into a list
+    /// the caller may not hold (the CFA path hands its own), so the lab matches refusals by position. Set where the
+    /// record is made, so every fit-function caller sees it; always set (a `NotSelected` record takes the seed's position too).
+    pub x: f64,
+    /// See [`FitDiagnostics::x`].
+    pub y: f64,
     pub outcome: Outcome,
     /// The sampling region's radius, px (the square is `(2r+1)²`).
     pub region_radius: u16,

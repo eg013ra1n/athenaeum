@@ -478,6 +478,26 @@ lnScale: number | null,
  */
 cachedLn: boolean, 
 /**
+ * Plan B B0 (PB-2): F1's growth-curve factor for this frame (`LnFrameOutcome::growth_factor`, the mean over its
+ * planes). `Some` only for a frame LN computed in THIS run under the growth-curve aperture; `None` for a frame LN
+ * did not normalize, on an LN cache hit (the cached row carries only the scale), under another estimator, and in a
+ * summary written before B0. A plain `Option` (`null` in the payload; a skipped `ts_rs` `Option` would arrive
+ * `undefined`), `#[serde(default)]`, see `ln_scale`'s own doc.
+ */
+lnGrowthFactor: number | null, 
+/**
+ * F1's pair count for this frame (`LnFrameOutcome::growth_pairs`), the MINIMUM over its planes so a plane at
+ * floor (ii) (`Some(0)`, the 2 x FWHM ratio kept) shows. `Some` exactly when `ln_growth_factor` is.
+ */
+lnGrowthPairs: number | null, 
+/**
+ * The TARGET side's aperture correction `c` LN's scale call used (`LnFrameOutcome::target_aperture_correction`,
+ * the mean over its planes, like `fwhm_px`, and only when EVERY plane measured one, R-PB0-5). `Some` for a frame
+ * LN computed in this run whose planes all measured a `c`; `None` when any plane is at floor (i), for a frame LN
+ * did not normalize, on an LN cache hit, and in a summary written before B0.
+ */
+lnApertureCorrection: number | null, 
+/**
  * The frame's own β (Plan A Task 11b, owner decision R11b-12; mean across channels like `fwhm_px`): F-4's
  * per-frame estimate, a diagnostic beside the group β every member was fitted at (`SummaryGroup::beta`). `None`
  * when the frame was not measured, under `Moffat4`, and in a summary written before Task 11b. `#[serde(default)]`,
@@ -566,7 +586,15 @@ beta: number | null,
  * `#[serde(default)]`, see [`SummaryFrame::ln_scale`]'s own doc for
  * the convention.
  */
-seedsCalibration: Array<number> | null, lnScalePx: number | null, lnFluxEstimator: LnFluxEstimator | null, lnAperture: LnAperture | null, frames: Array<SummaryFrame>, };
+seedsCalibration: Array<number> | null, lnScalePx: number | null, lnFluxEstimator: LnFluxEstimator | null, lnAperture: LnAperture | null, 
+/**
+ * Plan B B0 (PB-2, R-PB0-7): the LN reference's aperture correction `c` per plane (`PreparedReferenceChannel::
+ * aperture_correction`), the reference side of `SummaryFrame::ln_aperture_correction`. A plane at floor (i) (no
+ * `c`; `c = 1` was applied) reads `null`, never the applied `1.0`, so a reader of `c_ref / c_tgt` sees the floor.
+ * `None` when LN did not run for this group and in a summary written before B0; a row written as `[1.0, ...]`
+ * still decodes. A plain `Option`, `#[serde(default)]`, see `SummaryFrame::ln_scale`'s own doc.
+ */
+lnReferenceApertureCorrection: Array<number | null> | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 

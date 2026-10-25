@@ -50,7 +50,7 @@ pub enum Step {
     RingSky,
     /// The aperture correction `c`.
     ApertureC,
-    /// `snr_and_hfr`.
+    /// `snr_pass` (before `c`) and `hfr_pass` (after it).
     SnrHfr,
 }
 

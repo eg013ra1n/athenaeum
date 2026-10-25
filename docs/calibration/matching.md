@@ -15,7 +15,7 @@ Fully configurable via UI (Settings → Calibration Matching). Stored as a singl
 - Flats → DarkFlat, Dark, Bias (fallback chain DarkFlat → Dark → Bias)
 - Darks → Bias (when "BIAS for Dark Optimization" is on)
 
-**Per-pair parameters** (each `Exact` / `Warning` / `Ignore`): `instrume`, `binning`, `gain`, `offset`, `exptime`, `focallen`, `filter` (Lights→Flat only), `ccd_temp`. Defaults reproduce the original hardcoded behavior — see `config.rs::default_*` for the matrix.
+**Per-pair parameters** (each `Exact` / `Warning` / `Ignore`): `instrume`, `binning`, `gain`, `offset`, `exptime`, `focallen`, `filter` (Lights→Flat only), `ccd_temp`. Defaults reproduce the original hardcoded behavior — see the `Default` impls in `calibration/config.rs` for the matrix.
 
 **Key files**:
 

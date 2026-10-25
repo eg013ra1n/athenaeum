@@ -1,12 +1,12 @@
-//! Flat-frame contour analysis — port of PixInsight's FlatContourPlot v1.3.1
-//! script (Mike Schuster, 2012-2021), translated to Rust.
+//! Flat-frame contour analysis — port of the ERP's flat-contour-plot script
+//! v1.3.1, translated to Rust.
 //!
-//! Pipeline (faithful to the PJSR script — see the user's reference):
+//! Pipeline (faithful to the ERP's script — see the user's reference):
 //!   1. Read raw pixels, coerce to single-channel f32.
 //!   2. Resample to `resolution_pct%` of the original dimensions (block-mean).
 //!   3. Gather sorted samples; take `minQ = sample[0.01 N]` and
 //!      `maxQ = sample[0.99 N]`. Refuse if image is too small or too uniform
-//!      (PI bails at < 128×128 or `maxQ == minQ`).
+//!      (the ERP's script bails at < 128×128 or `maxQ == minQ`).
 //!   4. Rescale: `pixel = clamp((pixel - minQ) / (maxQ - minQ), 0, 1)` —
 //!      maps the percentile-clipped flat to the full `[0, 1]` working range.
 //!   5. Gaussian blur with `sigma_px` (separable, *normalized* kernel,
@@ -18,7 +18,7 @@
 //!           levels `0, 1/c, 2/c, …, 1`.
 //!        b. Map `[0, 1]` → `[minTone, maxTone] = [0.05, 0.95]` so the bands
 //!           don't go pure black or pure white.
-//!   7. Compute the gradient magnitude of the *quantized* image using PI's
+//!   7. Compute the gradient magnitude of the *quantized* image using the ERP's
 //!      two 3×3 derivative-of-Gaussian (σ = 0.5) kernels, then rescale to
 //!      `[0, 1]`.
 //!   8. Boundary emphasis:
@@ -40,13 +40,13 @@ use astroimage::{ImageConverter, ImageMetadata, PixelData};
 #[serde(rename_all = "camelCase")]
 pub struct FlatContourOpts {
     /// Resampling factor in percent. Final width/height are
-    /// `original * resolution_pct / 100`. PI range: 5..=100.
+    /// `original * resolution_pct / 100`. ERP range: 5..=100.
     pub resolution_pct: u32,
-    /// Gaussian blur sigma in pixels (post-resample). PI range: 0..=10.
+    /// Gaussian blur sigma in pixels (post-resample). ERP range: 0..=10.
     pub sigma_px: f32,
-    /// Number of discrete contour bands. PI range: 4..=20 (default 15).
+    /// Number of discrete contour bands. ERP range: 4..=20 (default 15).
     pub contours: u32,
-    /// Boundary-emphasis strength as a percentage. PI range: 0..=200,
+    /// Boundary-emphasis strength as a percentage. ERP range: 0..=200,
     /// default 50. Higher values darken the band boundaries more.
     pub gradient_pct: u32,
 }
@@ -188,7 +188,7 @@ pub fn compute_flat_contour_plot(
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Pull a single luminance channel out of the raw FITS pixels. RGB takes
-/// the green plane (PI's default for flat analysis).
+/// the green plane (the ERP's default for flat analysis).
 fn to_mono_f32(meta: &ImageMetadata, pixels: &PixelData) -> Vec<f32> {
     let n = meta.width * meta.height;
     let channels = meta.channels.max(1);
@@ -368,12 +368,12 @@ fn gaussian_blur_inplace(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
-/// Compute the gradient-magnitude image using PI's two 3×3 derivative-of-
+/// Compute the gradient-magnitude image using the ERP's two 3×3 derivative-of-
 /// Gaussian (σ = 0.5) kernels with mirror borders. Output length matches
 /// input length.
 fn compute_gradient_magnitude(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    // Derivative-of-Gaussian (sigma = 0.5) — copied verbatim from PI's
-    // FlatContourPlot script. They sum to zero (zero DC) so a uniform
+    // Derivative-of-Gaussian (sigma = 0.5) — copied verbatim from the ERP's
+    // flat-contour-plot script. They sum to zero (zero DC) so a uniform
     // region has gradient = 0.
     const KX: [f32; 9] = [
          0.0496902,  0.40062,   0.0496902,

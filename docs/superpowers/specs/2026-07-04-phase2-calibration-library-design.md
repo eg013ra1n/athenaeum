@@ -271,7 +271,7 @@ into explicit v1 policies + empirical Plan B gates.
   bias → synthetic constant bias (user-set ADU, finding 8) → none + warning**
   (scaled-dark pre-calibration deliberately omitted along with dark scaling);
   per-frame multiplicative normalization to the frame's **central-third mean**
-  (Siril convention, findings 2, 7); rejection = percentile clipping
+  (a second open-source stacker's convention, findings 2, 7); rejection = percentile clipping
   (low 0.2 / high 0.02) for N < 15, Winsorized 3σ for N ≥ 15 (finding 7).
   The master flat is therefore stored **illumination-only** (already calibrated);
   its normalization constant N (central-third mean) is stamped as `ATH_FNRM` so
@@ -300,9 +300,9 @@ gate before the calibrated export ships):**
    Gate: narrowband dataset through WBPP decides whether an auto-pedestal is
    needed and how WBPP expects `PEDESTAL` to be encoded.
 2. **Output scale:** v1 keeps the input ADU scale (no rescale). Gate: feed real
-   calibrated frames to WBPP and Siril; if PixInsight requires [0,1]
+   calibrated frames to WBPP and the open-source stacker; if the ERP requires [0,1]
    normalization, add rescale-on-export + document the FITS input hints.
-3. **OSC flat normalization:** global constant in v1 (matches Siril); calibration
+3. **OSC flat normalization:** global constant in v1 (matches the open-source stacker); calibration
    happens on the mosaiced CFA (debayer stays downstream), `BAYERPAT`/`XBAYROFF`/
    `YBAYROFF` cards copied through verbatim. Gate: compare per-CFA-plane vs
    global normalization for color-balance shift; promote per-plane to an
@@ -320,7 +320,7 @@ calibration if ever added (finding 9) — out of scope v1 (Non-goals).
 - **Combiners:** unit tests on synthetic frames with exact expected outputs
   (outliers rejected by sigma-clip; mean/median agreement on clean data).
 - **Golden reference test:** small real calibration set → our master vs a
-  Siril-built master (primary reference — its formulas are verified from source
+  open-source-stacker-built master (primary reference — its formulas are verified from source
   in the research doc) and a WBPP-built master (secondary), per-pixel diff within
   a documented tolerance.
 - **Registration-path equivalence:** rows from direct registration ==
@@ -332,7 +332,7 @@ calibration if ever added (finding 9) — out of scope v1 (Non-goals).
 - **Archive of a calibration set:** extends the existing archive suite
   (cancel / resume / restore / conflict).
 - **Headers:** round-trip through both readers; consolidation rules (mean temp,
-  midpoint date, span keywords); astropy verification script (Phase 1 precedent).
+  midpoint date, span keywords); Python-astronomy-library verification script (Phase 1 precedent).
 - All new commands built on `core::api` + ts-rs registry from day one (Phase 1
   convention) — web parity included.
 
@@ -349,7 +349,7 @@ rejection, `format_card` re-validation. Lands at the start of Plan A.
 - **Plan B — Calibrated export (milestone M2b):** Calibrated variant in ExportTab;
   partial-calibration application; CALSTAT/PEDESTAL; **empirical interop gates
   from §9** (pedestal behavior, f32 scale, OSC normalization, WBPP
-  debayer-only recipe) resolved with real WBPP/Siril runs before release. Proof:
+  debayer-only recipe) resolved with real WBPP/open-source-stacker runs before release. Proof:
   a batch of lights calibrated in-app → WBPP consumes them with calibration
   disabled, straight to registration/normalization.
 

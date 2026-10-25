@@ -1,4 +1,4 @@
-use crate::models::{FrameAnalysis, StarMetric};
+use crate::models::{FrameAnalysis, FrameVerdict, StarMetric};
 use rusqlite::{params, Connection, Result};
 
 /// Insert or replace frame analysis results (keyed by frame_id via UNIQUE constraint).
@@ -9,8 +9,9 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
             background, noise, detection_threshold, width, height,
             source_channels, trail_r_squared, possibly_trailed,
-            median_beta, quality_score, config_hash, analyzed_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            median_beta, quality_score, config_hash, analyzed_at,
+            measure_version, stars_refused, frame_verdict
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             a.frame_id,
             a.file_id,
@@ -34,6 +35,9 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             a.quality_score,
             a.config_hash,
             a.analyzed_at,
+            a.measure_version,
+            a.stars_refused,
+            a.frame_verdict.map(FrameVerdict::as_str),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -46,7 +50,8 @@ pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<Fra
                 median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
-                median_beta, quality_score, config_hash, analyzed_at
+                median_beta, quality_score, config_hash, analyzed_at,
+                measure_version, stars_refused, frame_verdict
          FROM frame_analysis WHERE frame_id = ?1",
     )?;
 
@@ -73,7 +78,8 @@ pub fn get_frame_analyses_by_ids(
                 median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
-                median_beta, quality_score, config_hash, analyzed_at
+                median_beta, quality_score, config_hash, analyzed_at,
+                measure_version, stars_refused, frame_verdict
          FROM frame_analysis WHERE frame_id IN ({})",
         placeholders.join(", ")
     );
@@ -102,7 +108,8 @@ pub fn get_frame_analyses_for_frame_set(
                 fa.median_snr, fa.median_hfr, fa.frame_snr, fa.snr_weight, fa.psf_signal,
                 fa.background, fa.noise, fa.detection_threshold, fa.width, fa.height,
                 fa.source_channels, fa.trail_r_squared, fa.possibly_trailed,
-                fa.median_beta, fa.quality_score, fa.config_hash, fa.analyzed_at
+                fa.median_beta, fa.quality_score, fa.config_hash, fa.analyzed_at,
+                fa.measure_version, fa.stars_refused, fa.frame_verdict
          FROM frame_analysis fa
          INNER JOIN session_members sm ON sm.frame_id = fa.frame_id
          INNER JOIN sessions s ON s.id = sm.session_id
@@ -234,6 +241,16 @@ pub fn get_star_metrics_by_frame_id(conn: &Connection, frame_id: i64) -> Result<
     Ok(results)
 }
 
+/// The stored verdict text; an unknown one (a newer build's) reads as none, with a warning.
+fn verdict_of(text: Option<String>) -> Option<FrameVerdict> {
+    let text = text?;
+    let v = FrameVerdict::parse(&text);
+    if v.is_none() {
+        tracing::warn!(frame_verdict = %text, "frame_analysis: unknown frame_verdict text read as none");
+    }
+    v
+}
+
 fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
     Ok(FrameAnalysis {
         id: row.get(0)?,
@@ -259,6 +276,9 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         quality_score: row.get(20)?,
         config_hash: row.get(21)?,
         analyzed_at: row.get(22)?,
+        measure_version: row.get(23)?,
+        stars_refused: row.get(24)?,
+        frame_verdict: verdict_of(row.get::<_, Option<String>>(25)?),
     })
 }
 
@@ -316,6 +336,9 @@ mod tests {
             quality_score: Some(0.9),
             config_hash: None,
             analyzed_at: "2026-01-01T00:00:00Z".into(),
+            measure_version: None,
+            stars_refused: None,
+            frame_verdict: None,
         }
     }
 
@@ -331,8 +354,8 @@ mod tests {
             fwhm_x: 3.0,
             fwhm_y: 3.0,
             eccentricity: 0.2,
-            snr: 30.0,
-            hfr: 1.5,
+            snr: Some(30.0),
+            hfr: Some(1.5),
             theta: 0.0,
             beta: None,
             fit_method: "gaussian".into(),
@@ -390,5 +413,164 @@ mod tests {
             (0, 0),
             "dropping the persist transaction must undo analyses and stars alike"
         );
+    }
+
+    /// Today's (pre-C6) `frame_analysis` and `star_metrics`, with one row each and two stars. Only the two tables, without the
+    /// star table's foreign key; the rebuild adds it and the bundled build enforces it.
+    fn old_catalog() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE frame_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, frame_id INTEGER NOT NULL, file_id INTEGER NOT NULL,
+                stars_detected INTEGER NOT NULL, median_fwhm REAL NOT NULL, median_eccentricity REAL NOT NULL,
+                median_snr REAL NOT NULL, median_hfr REAL NOT NULL, frame_snr REAL NOT NULL,
+                snr_weight REAL NOT NULL, psf_signal REAL NOT NULL, background REAL NOT NULL, noise REAL NOT NULL,
+                detection_threshold REAL NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+                source_channels INTEGER NOT NULL, trail_r_squared REAL NOT NULL DEFAULT 0.0,
+                possibly_trailed INTEGER NOT NULL DEFAULT 0, median_beta REAL, quality_score REAL, config_hash TEXT,
+                analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(frame_id));
+            CREATE TABLE star_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, frame_analysis_id INTEGER NOT NULL, x REAL NOT NULL,
+                y REAL NOT NULL, peak REAL NOT NULL, flux REAL NOT NULL, fwhm REAL NOT NULL, fwhm_x REAL NOT NULL,
+                fwhm_y REAL NOT NULL, eccentricity REAL NOT NULL, snr REAL NOT NULL, hfr REAL NOT NULL,
+                theta REAL NOT NULL, beta REAL, fit_method TEXT NOT NULL, fit_residual REAL NOT NULL);
+            CREATE INDEX idx_star_metrics_analysis_id ON star_metrics(frame_analysis_id);
+            INSERT INTO frame_analysis (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity,
+                median_snr, median_hfr, frame_snr, snr_weight, psf_signal, background, noise, detection_threshold,
+                width, height, source_channels, trail_r_squared, possibly_trailed, median_beta, quality_score,
+                config_hash, analyzed_at)
+            VALUES (7, 7, 42, 3.1, 0.4, 12.0, 1.8, 25.0, 1.0, 100.0, 500.0, 5.0, 20.0, 4096, 4096, 1, 0.1, 1, NULL,
+                0.9, 'old', '2026-01-01T00:00:00Z');
+            INSERT INTO star_metrics (frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y, eccentricity, snr,
+                hfr, theta, beta, fit_method, fit_residual)
+            VALUES (1, 10.0, 20.0, 1000.0, 5000.0, 3.0, 3.0, 3.0, 0.2, 30.0, 1.5, 0.0, NULL, 'gaussian', 0.01),
+                   (1, 11.0, 21.0, 900.0, 4000.0, 3.2, 3.2, 3.2, 0.3, 25.0, 1.6, 0.1, 4.0, 'moffat', 0.02);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_adds_measure_version_and_stars_refused_and_keeps_rows() {
+        let conn = old_catalog();
+        init_db(&conn).unwrap();
+        let a = get_frame_analysis(&conn, 7).unwrap().expect("the row survives");
+        assert_eq!((a.measure_version, a.stars_refused, a.frame_verdict), (None, None, None));
+        let want = analysis(7, 7);
+        assert_eq!(
+            (a.stars_detected, a.median_fwhm, a.median_eccentricity, a.median_snr, a.median_hfr),
+            (42, 3.1, 0.4, 12.0, 1.8)
+        );
+        assert_eq!((a.frame_snr, a.background, a.noise), (want.frame_snr, want.background, want.noise));
+        assert_eq!((a.width, a.trail_r_squared, a.possibly_trailed), (4096, 0.1, true));
+        assert_eq!((a.quality_score, a.config_hash.as_deref()), (Some(0.9), Some("old")));
+        // A second init is a no-op.
+        init_db(&conn).unwrap();
+        assert_eq!(counts(&conn), (1, 2));
+    }
+
+    /// An orphan star row (its analysis deleted with enforcement off) must not make the catalog unopenable once the
+    /// rebuilt table carries the foreign key and enforcement is ON.
+    #[test]
+    fn star_metrics_rebuild_survives_an_orphan_row_under_foreign_keys() {
+        let conn = old_catalog();
+        conn.execute(
+            "INSERT INTO star_metrics (frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y, eccentricity, snr,
+                hfr, theta, beta, fit_method, fit_residual)
+             VALUES (99, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 0.0, NULL, 'gaussian', 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(get_star_metrics(&conn, 1).unwrap().len(), 2);
+        assert_eq!(get_star_metrics(&conn, 99).unwrap().len(), 0, "the orphan is gone");
+        assert_eq!(counts(&conn), (1, 2));
+        // The retired ids are not reused: the next star gets an id above the orphan's.
+        let mut s = star(1);
+        s.snr = None;
+        upsert_star_metrics(&conn, 1, &[s]).unwrap();
+        let max: i64 = conn.query_row("SELECT MAX(id) FROM star_metrics", [], |r| r.get(0)).unwrap();
+        assert!(max >= 4, "AUTOINCREMENT high-water mark carried, got {max}");
+    }
+
+    /// Every star an orphan: nothing is copied, and the high-water mark still survives the rebuild.
+    #[test]
+    fn star_metrics_rebuild_keeps_the_high_water_mark_when_nothing_is_kept() {
+        let conn = old_catalog();
+        conn.execute("DELETE FROM frame_analysis", []).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(counts(&conn), (0, 0));
+        let seq: i64 = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'star_metrics'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seq, 2, "the old table's high-water mark");
+    }
+
+    #[test]
+    fn star_metrics_rebuild_keeps_rows_and_accepts_null_snr() {
+        let conn = old_catalog();
+        init_db(&conn).unwrap();
+        let stars = get_star_metrics(&conn, 1).unwrap();
+        assert_eq!(stars.len(), 2);
+        assert_eq!((stars[0].snr, stars[0].hfr, stars[0].fit_method.as_str()), (Some(30.0), Some(1.5), "gaussian"));
+        assert_eq!((stars[1].beta, stars[1].x, stars[1].fit_residual), (Some(4.0), 11.0, 0.02));
+        let mut s = star(1);
+        s.snr = None;
+        s.hfr = None;
+        // The upsert replaces the analysis's stars: one row with NULL snr / hfr.
+        upsert_star_metrics(&conn, 1, &[s]).unwrap();
+        let back = get_star_metrics(&conn, 1).unwrap();
+        assert_eq!((back[0].snr, back[0].hfr), (None, None));
+        // A second init neither rebuilds nor loses anything, and the index is present.
+        init_db(&conn).unwrap();
+        assert_eq!(counts(&conn), (1, 1));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_star_metrics_analysis_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn frame_analysis_round_trips_measure_version_stars_refused_and_verdict() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
+        let mut a = analysis(frame_id, file_id);
+        a.measure_version = Some(5);
+        a.stars_refused = Some(17);
+        a.frame_verdict = Some(FrameVerdict::NoStars);
+        upsert_frame_analysis(&conn, &a).unwrap();
+        let back = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
+        assert_eq!((back.measure_version, back.stars_refused, back.frame_verdict), (Some(5), Some(17), Some(FrameVerdict::NoStars)));
+        let text: String = conn
+            .query_row("SELECT frame_verdict FROM frame_analysis", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "no_stars");
+        let by_ids = get_frame_analyses_by_ids(&conn, &[frame_id]).unwrap();
+        assert_eq!(by_ids[0].frame_verdict, Some(FrameVerdict::NoStars));
+    }
+
+    #[test]
+    fn an_old_frame_analysis_json_decodes_with_none_and_an_unknown_key_decodes() {
+        let mut v = serde_json::to_value(analysis(1, 1)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ["measureVersion", "measure_version", "starsRefused", "stars_refused", "frameVerdict", "frame_verdict"] {
+            o.remove(k);
+        }
+        let old: FrameAnalysis = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!((old.measure_version, old.stars_refused, old.frame_verdict), (None, None, None));
+        v.as_object_mut().unwrap().insert("someFutureKey".into(), serde_json::json!(1));
+        serde_json::from_value::<FrameAnalysis>(v).expect("an unknown key decodes");
+        // The new keys round-trip through the wire form.
+        let mut a = analysis(1, 1);
+        a.frame_verdict = Some(FrameVerdict::Trailed);
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(serde_json::from_value::<FrameAnalysis>(j).unwrap().frame_verdict, Some(FrameVerdict::Trailed));
     }
 }

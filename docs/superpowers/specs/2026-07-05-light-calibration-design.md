@@ -2,7 +2,7 @@
 
 Roadmap item B5 ("calibration stage 2", core deliverable): apply master
 darks/biases and flats to LIGHT frames, producing calibrated f32 FITS that
-WBPP/Siril consume with their own calibration step disabled. Builds directly
+WBPP/a second open-source stacker consume with their own calibration step disabled. Builds directly
 on Phase 2 (master library, `integration/` engine, ComputeQueue) and the
 calibration math research (`../research/2026-07-04-calibration-math-research.md`).
 
@@ -51,13 +51,13 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   - `centralThird` (default, Athenaeum convention) — the flat's
     central-third mean; reads the master's `ATH_FNRM` card, recomputing it
     on the fly when absent.
-  - `pixinsightTrimmed` (PixInsight-compatible) — **two-sided trimmed mean
+  - `TrimmedMeanWhole` (ERP-compatible) — **two-sided trimmed mean
     over the whole frame, discarding 5% of pixels from EACH tail** of the
-    distribution (PI's `flatScaleClippingFactor = 0.05` semantics,
-    identified empirically against ImageCalibration's own arithmetic to
+    distribution (the ERP's `flatScaleClippingFactor = 0.05` semantics,
+    identified empirically against the ERP's calibration-process arithmetic to
     1.7e-6 relative — see the acceptance-verdict note below). Always
     computed from the flat file; the `ATH_FNRM` card is ignored in this
-    mode. Use for byte-parity with PI-calibrated frames.
+    mode. Use for byte-parity with ERP-calibrated frames.
   The mode applies only when normalization is ON; it is recorded in the
   tracking row (`flat_norm_mode`) and a mode mismatch makes a flat-applied
   frame *stale*. Masters keep stamping `ATH_FNRM` as central-third at build
@@ -66,7 +66,7 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   section in the dialog, defaults = current behavior, all recorded in the
   tracking row and compared for staleness; each stamped as a card):
   - `trim_fraction` (default 0.05) — the per-tail discard fraction of the
-    `pixinsightTrimmed` statistic; card `ATH_CTRM`. Only meaningful in PI
+    `TrimmedMeanWhole` statistic; card `ATH_CTRM`. Only meaningful in ERP
     mode.
   - `pedestal_dn` (default 0 = off) — DN added to the output AFTER the
     scale divide (`out += pedestal_dn / 65535`), for consumers that clip
@@ -83,7 +83,7 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   - flat only → `L / F_norm`, `CALSTAT='F'`
   - nothing linked → frame is reported "not calibrated", no output written.
 - Output: 32-bit float, **negatives preserved** (no clamping — f32 carries
-  them losslessly; PI/Siril tolerate negative floats), **no pedestal** in v1.
+  them losslessly; the ERP and the open-source stacker tolerate negative floats), **no pedestal** in v1.
 - Numeric scale: normalized to [0,1] by dividing by the source bit-depth
   maximum (65535 for 16-bit sources), recorded as `ATH_CSCL`. Verifying that
   WBPP consumes this correctly with calibration disabled is an acceptance
@@ -91,23 +91,23 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
 
   **Acceptance verdict (2026-07-06, owner's Tadpoles/ASI294MM data,
   `scripts/compare_calibrated.py`):** PASSED. Same 60s light calibrated by
-  Athenaeum vs PixInsight ImageCalibration with the same masters: correlation
+  Athenaeum vs the ERP's calibration process with the same masters: correlation
   0.999884, 0.3% rms residual, zero offset. The single systematic difference
   is a global gain of 0.939 — a flat-normalization *convention*: Athenaeum
-  divides the flat by its central-third mean (`ATH_FNRM`), PI by a whole-frame
+  divides the flat by its central-third mean (`ATH_FNRM`), the ERP by a whole-frame
   statistic; ~10% corner vignetting puts the full-frame mean ~6% below the
   central-third mean. Irrelevant for integration (WBPP normalizes frames).
-  Also observed: PI clips negatives to 0 in its output; our
+  Also observed: the ERP clips negatives to 0 in its output; our
   negatives-preserved f32 is consumed without issue.
 
-  **Follow-up (2026-07-06):** with `FlatNormMode::PixinsightTrimmed` the
+  **Follow-up (2026-07-06):** with `FlatNormMode::TrimmedMeanWhole` the
   gain difference vanishes — same 60s pair: gain 1.000299, median(B/A)
   0.999955, 0.3% rms residual (the noise floor of two independently
-  stacked master flats). PI parity confirmed end-to-end.
+  stacked master flats). ERP parity confirmed end-to-end.
 - OSC/CFA: calibrated **un-debayered** (CFA mosaic preserved), `BAYERPAT` /
   `XBAYROFF`/`YBAYROFF` copied through. Global flat normalization (the single
   `ATH_FNRM`) preserves channel ratios; per-CFA-plane normalization is
-  explicitly not done (research open question #3 — global matches PI default
+  explicitly not done (research open question #3 — global matches the ERP default
   behavior for our purposes).
 
 ## 3. Output location and layout
@@ -176,9 +176,9 @@ New table `light_calibrations`:
 | `dark_set_id` / `flat_set_id` / `bias_set_id` | INTEGER NULL, FK→calibration_set (no action) | what was actually applied |
 | `calstat` | TEXT NOT NULL | honest applied-state flags |
 | `flat_norm_applied` | INTEGER NOT NULL | 1 = normalization divisor applied, 0 = plain flat division |
-| `flat_norm_mode` | TEXT NOT NULL DEFAULT 'centralThird' | statistic used when normalizing: 'centralThird' \| 'pixinsightTrimmed' |
+| `flat_norm_mode` | TEXT NOT NULL DEFAULT 'centralThird' | statistic used when normalizing: 'centralThird' \| the `TrimmedMeanWhole` mode's wire string (kept from before the rename) |
 | `cal_params` | TEXT NOT NULL DEFAULT '{}' | JSON of the Advanced parameters actually applied (`trim_fraction`, `pedestal_dn`, `bias_fallback`); any difference vs the requested run's params → *stale* |
-| `cfa_scaling_applied` | INTEGER NULL | 1 = the flat was normalized per CFA channel, 0 = one global scalar. What HAPPENED, not what was requested: `cal_params.cfa_flat_scaling` is satisfied globally for a mono light, a `pixinsightTrimmed` run, or degenerate channel constants. NULL = a row written before the feature, read as 0 |
+| `cfa_scaling_applied` | INTEGER NULL | 1 = the flat was normalized per CFA channel, 0 = one global scalar. What HAPPENED, not what was requested: `cal_params.cfa_flat_scaling` is satisfied globally for a mono light, a `TrimmedMeanWhole` run, or degenerate channel constants. NULL = a row written before the feature, read as 0 |
 | `output_hash` | TEXT NOT NULL | xxh3 of the written file |
 | `engine_version` | INTEGER NOT NULL | bump on math changes → everything becomes stale |
 | `created_at` | TEXT NOT NULL | |
@@ -190,7 +190,7 @@ Frame status is **derived**, not stored:
   referenced master's `master_provenance.created_at` is newer than
   `created_at`, or `engine_version` is older, or `cfa_scaling_applied`
   differs from the requested `cfa_flat_scaling` where per-channel scaling
-  could have acted (flat applied + normalization on + not `pixinsightTrimmed`
+  could have acted (flat applied + normalization on + not `TrimmedMeanWhole`
   + the frame declares a pattern) → *stale*
 - `calstat` lacks a type the frame now has a link for → *partial* (a special
   case of stale; the readiness dialog offers re-calibration)
@@ -286,7 +286,7 @@ UI:
   missing links (which type is missing); scope selector; "Normalize master
   flat" toggle (default ON, last choice remembered) with a statistic
   selector shown when ON — "Central third mean (Athenaeum)" |
-  "Full-frame trimmed mean (PixInsight-compatible)", default centralThird,
+  "Full-frame trimmed mean (ERP-compatible)", default centralThird,
   last choice remembered; start.
 - Progress via the existing sidebar ComputeQueue indicator; completion via
   `notify()` with a new `calibration` NotificationKind (union + icon map).

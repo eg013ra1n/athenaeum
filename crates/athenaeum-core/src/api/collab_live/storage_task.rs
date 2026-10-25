@@ -598,6 +598,14 @@ impl StorageEngine {
             }
         };
         match row {
+            // A parked frame waits for its retry one GC interval later,
+            // whatever the watcher reports: re-seeding now would re-tag the
+            // store entry that still names the previous file (B-I1). The
+            // retry re-checks the file's size and bytes itself. Windows raises
+            // a signal for a file that was only read (2026-10-24).
+            Some(row) if row.awaiting_gc => {
+                tracing::debug!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path_str, "parked frame's file signalled; its retry decides");
+            }
             Some(row) if checked_state(row.local_state) => self.recheck(&row, now, ev).await,
             Some(row)
                 if matches!(
@@ -2807,6 +2815,32 @@ mod tests {
                 "{uuid}: served from its new path, the previous folder deleted"
             );
         }
+    }
+
+    /// Windows runner (2026-10-24): a watcher signal for a parked frame's
+    /// file — Windows raises one for a file that was only read — re-seeded it
+    /// at once over the complete store entry that still names the previous
+    /// folder, the one thing parking exists to prevent. A parked frame waits
+    /// for its retry, whatever the watcher reports.
+    #[tokio::test]
+    async fn a_touched_parked_frame_still_waits_for_the_gc() {
+        let _gate = gc_gate();
+        let rig = ts::landed_rig(2).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
+        let prev = rig._tmp.path().join("previous-collab");
+        recorded_in_a_previous_folder(&rig, &prev, true);
+        let mut eng = rig.engine();
+        eng.sweep(&Holders(0)).await;
+        let (pid, uuid, path) = &rig.frames[0];
+        assert!(row(&rig.ctx, pid, uuid).awaiting_gc, "parked by the sweep");
+        let retry_at = eng.next_parked_retry.expect("a parked retry is scheduled");
+        eng.on_signal(FsSignal::Touched(path.clone()), Instant::now());
+        let ev = eng.tick(retry_at, &Holders(0)).await;
+        let r = row(&rig.ctx, pid, uuid);
+        assert!(
+            r.awaiting_gc && r.local_state == LocalState::Wanted,
+            "still parked after a touch: {r:?}, {ev:?}"
+        );
     }
 
     /// Final fix B-I1: a MOVED Collaboration folder (the previous files are

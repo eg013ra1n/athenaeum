@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
-rustafits = { path = "../../rustafits" }
+rustafits = { path = "../../rustafits", default-features = false }
 base64 = "0.23"
 tauri-plugin-updater = "2"
 solvemyastro = { path = "../../solvemyastro" }

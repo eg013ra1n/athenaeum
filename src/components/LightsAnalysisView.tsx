@@ -13,6 +13,9 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/Ligh
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
+import { stackedFrameSnr } from './analysis/stackedSnr';
+import { rowVerdict } from './analysis/unusable';
+import { computeRejectedFrameIds } from './analysis/rejection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
@@ -168,27 +171,20 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     [allFramesRaw, blackholedFileIds]
   );
 
-  // Compute stacked SNR per filter group: convert dB→linear, sqrt(sum(linear²)), back to dB
+  // Compute stacked SNR per filter group: sqrt(sum(frame_snr²)), a plain ratio (PC-11)
   const filterSnrMap = useMemo(() => {
     if (analysisData.size === 0) return undefined;
     const map = new Map<string, number>();
     const allKeys = viewMode === 'by-night' ? dateTree.framesByKey : mergedTree.framesByKey;
     for (const [key, frames] of allKeys) {
-      let sumSq = 0;
-      let count = 0;
+      const values: number[] = [];
       for (const f of frames) {
         if (blackholedFileIds.has(f.file_id)) continue;
         const a = analysisData.get(f.frame_id);
-        if (a) {
-          const linear = Math.pow(10, a.frame_snr / 20);
-          sumSq += linear * linear;
-          count++;
-        }
+        if (a) values.push(a.frame_snr);
       }
-      if (count > 0) {
-        const stackedLinear = Math.sqrt(sumSq);
-        map.set(key, 20 * Math.log10(stackedLinear));
-      }
+      const stacked = stackedFrameSnr(values);
+      if (stacked !== undefined) map.set(key, stacked);
     }
     return map.size > 0 ? map : undefined;
   }, [analysisData, viewMode, dateTree.framesByKey, mergedTree.framesByKey, blackholedFileIds]);
@@ -446,48 +442,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
 
   // Compute rejected frame IDs from thresholds
   const rejectedFrameIds = useMemo(() => {
-    const rejected = new Set<number>();
     // When in arcsec mode, the user enters thresholds in arcsec — convert back to pixels for comparison
     const ps = (useArcsec && plateScale) ? plateScale : null;
-    const rawFwhm = parseFloat(thresholds.fwhm);
-    const fwhmThreshold = ps ? rawFwhm / ps : rawFwhm;
-    const eccThreshold = parseFloat(thresholds.eccentricity);
-    const snrDbThreshold = parseFloat(thresholds.frame_snr);
-    const snrWtThreshold = parseFloat(thresholds.snr_weight);
-    const rejectTrailed = thresholds.trail === 'true';
-
-    for (const frame of displayedFrames) {
-      const a = analysisData.get(frame.frame_id);
-      if (!a) continue;
-
-      // FWHM > threshold = rejected (worse)
-      if (!isNaN(fwhmThreshold) && a.median_fwhm > fwhmThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Eccentricity > threshold = rejected (worse)
-      if (!isNaN(eccThreshold) && a.median_eccentricity > eccThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Frame SNR < threshold = rejected (worse)
-      if (!isNaN(snrDbThreshold) && a.frame_snr < snrDbThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // SNR Weight < threshold = rejected (worse)
-      if (!isNaN(snrWtThreshold) && a.snr_weight < snrWtThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-      // Reject frames flagged as trailed
-      if (rejectTrailed && a.possibly_trailed) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
-    }
-
-    return rejected;
+    return computeRejectedFrameIds(displayedFrames.map(f => f.frame_id), analysisData, thresholds, ps);
   }, [thresholds, displayedFrames, analysisData, useArcsec, plateScale]);
 
   // Auto-select rejected frames when thresholds change (only if reject mode is active)
@@ -535,7 +492,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   }, [selectedFrameIds, allFrames]);
 
   const handleExportCsv = useCallback(() => {
-    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR (dB)', 'PSF Signal (ADU)', 'SNR Weight', 'Trail R\u00B2'];
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR', 'PSF Signal (ADU)', 'SNR Weight', 'Verdict'];
     const rows = displayedFrames.map(frame => {
       const a = analysisData.get(frame.frame_id);
       return [
@@ -551,7 +508,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         a ? a.frame_snr.toFixed(1) : '',
         a ? a.psf_signal.toFixed(1) : '',
         a ? a.snr_weight.toFixed(1) : '',
-        a ? a.trail_r_squared.toFixed(4) : '',
+        a ? rowVerdict(a).label : '',
       ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
     });
 

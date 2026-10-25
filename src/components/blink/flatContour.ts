@@ -4,19 +4,19 @@
 // The backend (`compute_flat_contour_plot`) returns the final 8-bit grayscale
 // display image plus the percentile bounds and band count needed to label the
 // legend strip in original-flat units. This module:
-//   1. Calls the backend with the user's settings (or PI defaults).
+//   1. Calls the backend with the user's settings (or the ERP's defaults).
 //   2. Decodes the base64 pixel buffer into a small canvas.
 //   3. Draws a legend strip to the right of it (contours+1 swatches, labelled).
 //   4. Returns a `data:image/png;base64,…` URL of the composite.
 //
-// PixInsight FlatContourPlot v1.3.1 reference; settings persist in the app's
-// settings store (`flat_contour.*` keys). Defaults match PI exactly.
+// The ERP's flat-contour-plot script v1.3.1 is the reference; settings persist in the app's
+// settings store (`flat_contour.*` keys). Defaults match the ERP's exactly.
 
 import { api } from '../../api';
 import type { FlatContourOpts } from '../../types/models';
 import type { FlatContourPlot } from '../../types/helpers';
 
-/** PixInsight FlatContourPlot v1.3.1 defaults — used when no settings
+/** The ERP's flat-contour-plot script v1.3.1 defaults — used when no settings
  *  override is provided. */
 export const FLAT_CONTOUR_DEFAULTS: FlatContourOpts = {
   resolutionPct: 50,
@@ -33,8 +33,8 @@ export const FLAT_CONTOUR_SETTING_KEYS = {
   gradientPct: 'flat_contour.gradient_pct',
 };
 
-/** Reads each `flat_contour.*` setting from the backend; falls back to the
- *  PI defaults for any key that isn't set yet. */
+/** Reads each `flat_contour.*` setting from the backend; falls back to
+ *  the ERP's defaults for any key that isn't set yet. */
 export async function loadFlatContourOpts(): Promise<FlatContourOpts> {
   const [r, s, c, g] = await Promise.all([
     safeGetNumber(FLAT_CONTOUR_SETTING_KEYS.resolutionPct, FLAT_CONTOUR_DEFAULTS.resolutionPct),
@@ -123,7 +123,7 @@ export function composeFlatContourDataUrl(result: FlatContourPlot): string {
   }
   pctx.putImageData(img, 0, 0);
 
-  // ── legend strip (PixInsight layout: contours+1 swatches, top = max) ─
+  // ── legend strip (the ERP's layout: contours+1 swatches, top = max) ─
   // Sized so the labels actually fit. Width is computed from font size +
   // the longest label text (using ctx.measureText), not from image width —
   // image-width-based sizing was clipping the decimal portion of labels
@@ -144,7 +144,7 @@ export function composeFlatContourDataUrl(result: FlatContourPlot): string {
   // Measure the widest label so the legend canvas is sized accordingly.
   // The widest label is whichever of `minQuantile` / `maxQuantile` produces
   // a longer string. A trailing " ADU" suffix is added so the unit is
-  // unambiguous (PI shows normalized 0..1 values; Athenaeum reads raw
+  // unambiguous (the ERP shows normalized 0..1 values; Athenaeum reads raw
   // 16-bit ADU counts directly, so a flat at half-well is ~32768 here).
   const labelOf = (v: number) => `${v.toFixed(decimals)} ADU`;
   const measureCtx = document.createElement('canvas').getContext('2d');

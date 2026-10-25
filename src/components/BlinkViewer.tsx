@@ -361,6 +361,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       imageWidth: metricsResponse.image_width,
       imageHeight: metricsResponse.image_height,
       flipVertical: metricsResponse.flip_vertical,
+      noise: metricsResponse.metrics?.noise,
     });
   }, []);
 

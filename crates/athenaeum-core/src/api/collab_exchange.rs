@@ -2385,7 +2385,8 @@ mod tests {
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
-        let err = export_project_for_wbpp(&ctx, "p-1", "/tmp/x", false, None)
+        let out = tmp.path().join("x");
+        let err = export_project_for_wbpp(&ctx, "p-1", &out.to_string_lossy(), false, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");

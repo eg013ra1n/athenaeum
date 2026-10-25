@@ -5,7 +5,7 @@ Guidance for Claude Code working in the Athenaeum repo.
 ## Project Overview
 
 Athenaeum is a desktop + web app for astrophotographers to manage FITS/XISF image files and their metadata catalog (frame-set clustering by sky coordinates, calibration matching, ZIP archive, plate-solving, export templates). Tauri 2 desktop shell, Axum/SSE web server, shared `athenaeum-core` library, SQLite catalog, React/TS frontend.
-Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP".
+Never name another code base you consult (another solver, stacker or processing program) anywhere in this repository — code, comments, function names, docs, commit messages; the comparison program is "the ERP". The rule covers a program used as a comparison or a reference; crediting a format's author (XISF) or a fetch permission is neither and stays.
 
 ## Workspace Layout
 
@@ -124,9 +124,9 @@ useEffect(() => {
 
 **Transfers / collab** — row = transfer, attempt = counter; the wire is frozen and append-only (golden pins); `failed` = local-fatal only; the collab runtime loop never awaits hub HTTP or a catalog write, and every read-then-write catalog transaction is `BEGIN IMMEDIATE`; retention is Perseus-only. `docs/transfers/README.md`.
 
-**Plate solving** — `solvemyastro` is the sole solver; the input and acceptance gates have no Settings UI. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
+**Plate solving** — `solvemyastro` is the sole solver; the input gate has a Settings section (Plate Solving → Input Gate), the acceptance gate has none. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
-**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
+**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 7); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
 
 **In-app updates** — core owns the check, `tauri-plugin-updater` owns install (Rust-side only); `install_update`'s `version_comparator` is the one place that normalizes the three version forms. `docs/updates/README.md`.
 
@@ -135,5 +135,4 @@ useEffect(() => {
 ## Reference
 
 
-- [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)
-- 2025-11-17 modular-refactor map: `crates/athenaeum-tauri/REFACTORING.md`
+- [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · the XISF 1.0 specification · [xxHash](https://xxhash.com/)

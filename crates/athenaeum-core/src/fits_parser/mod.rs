@@ -493,7 +493,7 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
     // 3. CROTA1    — FITS WCS alt-axis rotation (sky frame)
     // 4. POSANGLE  — Sky position angle (sky frame)
     // 5. PA        — Generic position angle (sky frame)
-    // 6. OBJCTROT  — Planned target rotation (NINA/PixInsight, sky frame)
+    // 6. OBJCTROT  — Planned target rotation (NINA/the ERP, sky frame)
     // 7. ROTATANG  — Mechanical rotator angle (instrument frame, fallback)
     // 8. APTS_ROT  — APT mechanical rotator angle (instrument frame, fallback)
     let rotation = header.get_f64("CROTA2")
@@ -847,7 +847,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     // 3. CROTA1    — FITS WCS alt-axis rotation (sky frame)
     // 4. POSANGLE  — Mount/plate-solve software, sky position angle
     // 5. PA        — Generic position angle (sky frame, east of north)
-    // 6. OBJCTROT  — Planned target rotation (NINA/PixInsight, sky frame)
+    // 6. OBJCTROT  — Planned target rotation (NINA/the ERP, sky frame)
     // 7. ROTATANG  — Mechanical rotator angle (instrument frame; only
     //                a meaningful sky angle when the rotator is zeroed
     //                to true sky east-of-north, which is rarely true).

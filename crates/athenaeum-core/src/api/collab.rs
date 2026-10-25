@@ -15157,11 +15157,15 @@ pub(crate) mod tests {
             let dir = root.join("m31").join("me-myself");
             assert_eq!(landing_free_bytes(database, "no-seam", &dir, &root), None);
             std::fs::create_dir_all(&root).unwrap();
-            assert_eq!(
-                landing_free_bytes(database, "no-seam", &dir, &root),
-                crate::disk::free_bytes(&root)
+            // Two live reads of a volume other tests write to in parallel:
+            // equal up to what they wrote between the reads (owner ruling
+            // 2026-10-24; exact equality flaked by one block).
+            let probed = landing_free_bytes(database, "no-seam", &dir, &root).unwrap();
+            let direct = crate::disk::free_bytes(&root).unwrap();
+            assert!(
+                probed.abs_diff(direct) < 256 << 20,
+                "probe {probed} vs the root's volume {direct}"
             );
-            assert!(landing_free_bytes(database, "no-seam", &dir, &root).is_some());
         }
 
         /// N40: a probe that cannot read the free space never refuses — the

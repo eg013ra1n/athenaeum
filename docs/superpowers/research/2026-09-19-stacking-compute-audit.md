@@ -127,7 +127,7 @@ The three call sites run the SAME detector (`rustafits/src/analysis/adaptive_det
   every tap of every pixel (`convolution.rs:318-333`), allocating 12 fresh 104 MB buffers per plane
   — while the vectorised `convolve_row_neon`/AVX2 sibling in the same file goes unused by this path.
 
-**What the field does** (§4): published source extractors are one-pass mesh-background →
+**What the field does** (§4): published source-extraction programs are one-pass mesh-background →
 matched-filter → label → peak pipelines at ≈ 50 Mpx/s; one photometry library won 10–400× by separable
 box filters instead of footprint filters; a batched-fitting library's CPU baseline is ≈ 1.8×10⁴ fits/s/core on
 fixed 5×5 stamps with analytic Jacobians; a common open stacker warm-starts its PSF fit (rotation off, then on) and
@@ -271,7 +271,7 @@ serial phase outright.
 
 ## 4. Literature cross-check (one line each)
 
-- **Source extractors**: one pass, 64² mesh background, matched filter, label, peak;
+- **Source-extraction programs**: one pass, 64² mesh background, matched filter, label, peak;
   ≈ 50 Mpx/s and 10 k sources/s on one 3 GHz core; a flexible C++ rewrite cost 10×.
 - **Photometry library**: 10–400× from separable box filters; cutout/moment work vectorised across stars.
 - **Batched GPU fitter**: fixed 5×5 stamps, analytic Jacobian, one block per fit; ≈ 1.8×10⁴ fits/s per CPU

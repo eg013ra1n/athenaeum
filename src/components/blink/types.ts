@@ -87,7 +87,7 @@ export interface ToolBarProps {
   showHelp: boolean;
   onToggleHelp: () => void;
 
-  // Flat contour plot — toggle (PixInsight FlatContourPlot port).
+  // Flat contour plot — toggle (port of the ERP's flat-contour-plot script).
   // Enabled only when the current frame is a FLAT or MASTERFLAT.
   // `contourActive` controls the "pressed" visual state of the button.
   canShowContour: boolean;

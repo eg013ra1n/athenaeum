@@ -58,7 +58,6 @@ export const METRIC_REGISTRY: Record<string, MetricDefinition> = {
   frame_snr: {
     key: 'frame_snr',
     label: 'Frame SNR',
-    unit: 'dB',
     precision: 1,
     hint: 'higher is better',
     accessor: (_f, a) => a?.frame_snr ?? null,
@@ -98,13 +97,6 @@ export const METRIC_REGISTRY: Record<string, MetricDefinition> = {
     unit: 'ADU',
     precision: 2,
     accessor: (_f, a) => a?.noise ?? null,
-  },
-  trail_r_squared: {
-    key: 'trail_r_squared',
-    label: 'Trail R²',
-    precision: 3,
-    hint: 'lower is better',
-    accessor: (_f, a) => a?.trail_r_squared ?? null,
   },
   median_beta: {
     key: 'median_beta',

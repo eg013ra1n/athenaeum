@@ -134,7 +134,7 @@ Each candidate explanation was checked before the pattern was blamed:
 ## 6. External validation
 
 The reference implementation most owners compare against exposes exactly this
-lever to the user rather than hardcoding it: ImageIntegration has a per-file
+lever to the user rather than hardcoding it: the ERP's integration process has a per-file
 **buffer size** and a total **stack size**, community guidance is that they be
 "specified less than physical RAM", that the process "will break the image
 into sets of rows and process each set as needed", and that leaving them small
@@ -152,9 +152,9 @@ Two things follow, and both match what was measured here:
    permanently in favour of memory we are not short of.
 
 Sources:
-- [Buffer / Stack option — image integration (PixInsight Forum)](https://pixinsight.com/forum/index.php?threads/buffer-stack-option-image-integration.10735/)
-- [Pixinsight buffer and stack size weirdness (Cloudy Nights)](https://www.cloudynights.com/forums/topic/614715-pixinsight-buffer-and-stack-size-weirdness/)
-- [Where is the bottleneck with integration speed (Cloudy Nights)](https://www.cloudynights.com/topic/788344-where-is-the-bottleneck-with-integration-speed-on-pixinsight/page-2)
+- Buffer / Stack option — image integration (the ERP's forum)
+- Buffer and stack size weirdness in the ERP (Cloudy Nights thread)
+- Where is the bottleneck with integration speed (Cloudy Nights thread)
 
 ## 7. What the measurements rule *out* as a fix
 

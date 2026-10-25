@@ -13,13 +13,13 @@
 //! analysis command's inline `detect_flip_vertical`, and its Axum mirror)
 //! with the same logic in each. This module is the single source of truth.
 //! After step 1 of the plan it is **not yet wired into any of those call
-//! sites** — it exists so we can validate its output against PixInsight on
+//! sites** — it exists so we can validate its output against the ERP on
 //! a few sample files before flipping the convention switch.
 //!
 //! # The convention
 //!
-//! The astronomical-software convention (PixInsight, ds9, Siril,
-//! AstroImageJ) treats FITS files as **bottom-up** by default and flips for
+//! The astronomical-software convention (the ERP and the common FITS
+//! viewers and stackers) treats FITS files as **bottom-up** by default and flips for
 //! screen display. Specifically:
 //!
 //! | `ROWORDER`           | What it means                              | Flip for display? |

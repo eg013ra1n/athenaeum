@@ -5,7 +5,7 @@
 
 **Goal:** Match image quads against catalog quads that are **built per solve
 at the frame's own scale/region from the same star set and grouping mode as
-the image** — the way ASTAP does — instead of against one fixed
+the image** — the way an external plate solver does — instead of against one fixed
 HEALPix-depth-6 global index. This is the evidence-backed fix for the frames
 where detection is provably fine but the matcher gets 0 inliers at the true
 position even with correct scale + depth-match (M51 galaxy-dominated, M78
@@ -19,7 +19,7 @@ produce a `Vec<QuadLookup>` from a fresh cone read instead of from
 `index.lookup_with_tolerance`. Nothing downstream changes. Gated to the
 **position-hinted** path (M51/M78 have OBJCTRA/OBJCTDEC); the prebuilt global
 index stays for the blind/no-position path. Regression surface is therefore
-only the hinted frames, fully covered by the ASTAP-oracle bench.
+only the hinted frames, fully covered by the external-solver-oracle bench.
 
 **Tech stack:** existing `CatalogEngine::cone_search` (region read,
 proper-motion to epoch), `GnomonicProjection::sky_to_tangent` (sky→tangent),
@@ -71,7 +71,7 @@ pub fn local_catalog_quads(
 
 - [ ] **Step 2 — read + project + build**
   1. `let (stars, _) = catalog.cone_search(ra0, dec0, (0.6*fov_diag_deg).min(89.0), mag_limit, obs_epoch)?;`
-  2. Sort by `mag` ascending; truncate to `max_stars` (brightest-N, ASTAP-style depth match).
+  2. Sort by `mag` ascending; truncate to `max_stars` (brightest-N, external-solver-style depth match).
   3. Project each to tangent plane: `let (xi, eta) = GnomonicProjection::sky_to_tangent(s.ra, s.dec, ra0, dec0);`
      store `positions: Vec<(f64,f64)>` in **arcsec** (`xi.to_degrees()*3600.0`, same for eta) so `longest_dist` is in a real angular unit. Keep a parallel `radec: Vec<(f32,f32)>`.
   4. `let quads = build_quads_multi(&positions, positions.len(), group_size);` — identical builder/grouping to the image side.
@@ -115,7 +115,7 @@ let cat_quads: Vec<QuadLookup> = if let (Some((ra0,dec0)), Some(scale)) =
 - [ ] **Step 3** — pass `local_quad_center = hints.ra.zip(hints.dec)` from
   `solve_cascade` stage 1 (hinted) only; `None` for the scale-cleared/blind
   stages and the FOV-ladder rungs (those keep global-index behaviour).
-- [ ] **Step 4 — bench gate**: `BENCH_SKIP_ASTAP=1` full bench.
+- [ ] **Step 4 — bench gate**: `<external-solver bench skip env var>=1` full bench.
   **Acceptance:** the 13 currently-correct frames stay correct (Δpos<30",
   Δscl<2%), 0 panics, 0 false positives; M51 and/or M78 newly correct.
   If any of the 13 regress → iterate on `max_stars`/`group_size`/cone radius
@@ -125,7 +125,7 @@ let cat_quads: Vec<QuadLookup> = if let (Some((ra0,dec0)), Some(scale)) =
 ### Task 3: verify + finalize
 
 - [ ] `cargo test -p athenaeum-core --lib` + `-p rustafits --lib` green.
-- [ ] Full ASTAP-oracle bench: record final N/16, confirm no regression vs
+- [ ] Full external-solver-oracle bench: record final N/16, confirm no regression vs
   the committed `875d72d4` 13/16 baseline.
 - [ ] `detection_audit` unaffected (no detector change in this project).
 - [ ] Update auto-memory only if a durable, non-obvious convention emerged.
@@ -151,6 +151,6 @@ let cat_quads: Vec<QuadLookup> = if let (Some((ra0,dec0)), Some(scale)) =
 
 - Blind/no-position path (keeps the global index + FOV ladder unchanged).
 - `_DSC5767` (headerless, no position to read a cone at — would need the
-  ASTAP spiral; separate project).
+  the external plate solver's spiral; separate project).
 - Any detector change (detection is proven adequate by `detection_audit`).
 - Gaia / multi-scale prebuilt index (superseded by per-trial construction).

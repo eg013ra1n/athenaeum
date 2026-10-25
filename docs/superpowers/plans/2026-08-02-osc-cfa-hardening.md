@@ -4,7 +4,7 @@
 
 **Goal:** Close every finding of the 2026-08-02 OSC/CFA review (`docs/superpowers/research/2026-08-02-osc-cfa-review.md`): Bayer metadata becomes trustworthy on every output, per-CFA-channel flat scaling reaches tool parity, CFA incompatibilities become visible, and the CFA path gets real mosaic tests.
 
-**Architecture:** Three packages. P1 — Bayer metadata integrity (parse offsets/ROWORDER into the catalog, stop fabricating values, deterministic member-consensus master cards, XISF `<ColorFilterArray>` support, warn on every silent drop, fix the blob↔frames drift). P2 — per-CFA-channel flat scaling (channel math utils, per-channel constants stamped on CFA master flats, a light-cal scaling mode default-ON for CFA lights, PI-parity). P3 — advisory compatibility warnings + end-to-end CFA tests + doc truth-ups.
+**Architecture:** Three packages. P1 — Bayer metadata integrity (parse offsets/ROWORDER into the catalog, stop fabricating values, deterministic member-consensus master cards, XISF `<ColorFilterArray>` support, warn on every silent drop, fix the blob↔frames drift). P2 — per-CFA-channel flat scaling (channel math utils, per-channel constants stamped on CFA master flats, a light-cal scaling mode default-ON for CFA lights, ERP-parity). P3 — advisory compatibility warnings + end-to-end CFA tests + doc truth-ups.
 
 **Tech Stack:** Rust (athenaeum-core + thin Tauri/Axum wrappers), rusqlite, React/TS dialog toggle.
 
@@ -18,7 +18,7 @@
 - Commit as `eg013ra1n <vilen.sharifov@gmail.com>`, one commit per task, on the active version branch. Never Claude as author/co-author.
 - Gates per task: named `cargo test -p athenaeum-core --lib <module>` filters; full gates before merge: `cargo build --workspace`, `cargo test -p athenaeum-core --lib`, `npx tsc --noEmit`.
 - Schema changes: guarded `ALTER TABLE` + `column_exists` pattern only (mirror `bayerpat`, `db/schema.rs:1026-1038`).
-- Design decision (ratified by tool parity, owner-vetoable): per-channel flat scaling defaults **ON** when the light carries a Bayer pattern; CentralThird mode only in v1 (PixinsightTrimmed stays global — documented follow-up). Compatibility checks are **advisory, never blocking**.
+- Design decision (ratified by tool parity, owner-vetoable): per-channel flat scaling defaults **ON** when the light carries a Bayer pattern; CentralThird mode only in v1 (the full-frame trimmed-mean mode stays global — documented follow-up). Compatibility checks are **advisory, never blocking**.
 - Line numbers below are from HEAD 0581b5e4 — locate by content if drifted.
 
 ---
@@ -267,8 +267,8 @@ Both arms bit-exact via an independent f64 helper (follow the module's `expect_p
   3. degenerate channel (≤ 0/non-finite after recompute) → `warn!` + fall back to Global for the whole frame (never mixed-mode within a frame).
   Pixel loop: `let k = match &divisor { Global(k) => *k, PerChannel { geom, k } => k[cfa_channel_at(x, y, *geom) as usize] };` — the existing `FLAT_DENOM_FLOOR` branch operates on `band_bufs[fi][idx] as f64 / k` unchanged. NOTE: the loop is indexed by flat `idx` within a band — derive `(x, y)` as `(idx % w, y0 + idx / w)` with the band's global row offset, exactly like the precal row-index handling (see the pinned `multi_band_precal_uses_global_row_index` pattern).
 - [ ] **Step 3: Cards + row + staleness.** Per-channel mode stamps ATH_CFNR/ATH_CFNG/ATH_CFNB (applied constants), ATH_CCFA logical T, and keeps ATH_CFNM (global-equivalent mean of k) for continuity. Row: `cfa_scaling_applied` 0/1. `derive_status`: mismatch between the row's flag and the current `cfa_flat_scaling` param counts as *stale* ONLY when a flat was applied AND the frame has a bayerpat (mirror the existing flat-norm-toggle arm — no engine-version bump). Tests for the staleness arm both ways + the mono-frame exemption.
-- [ ] **Step 4: PixinsightTrimmed stays global** — in that mode `cfa_flat_scaling` is ignored with a `debug!`; document on the param.
-- [ ] **Step 5: UI.** `CalibrateLightsDialog.tsx`: checkbox "Per-channel CFA flat scaling" (default checked, help text "applies to color (CFA) lights; mono lights are unaffected"), disabled when flat-norm mode is PixInsight-trimmed; param flows through the existing start call. TS type updated; `npx tsc --noEmit` clean.
+- [ ] **Step 4: the full-frame trimmed-mean mode stays global** — in that mode `cfa_flat_scaling` is ignored with a `debug!`; document on the param.
+- [ ] **Step 5: UI.** `CalibrateLightsDialog.tsx`: checkbox "Per-channel CFA flat scaling" (default checked, help text "applies to color (CFA) lights; mono lights are unaffected"), disabled when flat-norm mode is the ERP-compatible trimmed mean; param flows through the existing start call. TS type updated; `npx tsc --noEmit` clean.
 - [ ] **Step 6:** `cargo test -p athenaeum-core --lib light_cal lights light_calibrations` green + tsc; commit — `feat(lights): per-CFA-channel flat scaling, default on for color lights`
 
 ---
@@ -297,7 +297,7 @@ Both arms bit-exact via an independent f64 helper (follow the module's `expect_p
 
 - [ ] **Step 1: E2E CFA batch:** (a) full light-cal run on an RGGB fixture asserting the OUTPUT FITS carries BAYERPAT/XBAYROFF/YBAYROFF/ROWORDER cards verbatim from the source (closes the "no end-to-end Bayer pin" gap); (b) master flat build from mosaic subs → written file carries consensus Bayer cards with REAL offset values (pin the integers, not `.is_some()`); (c) XISF ColorFilterArray source → calibrated output carries BAYERPAT.
 - [ ] **Step 2: CLAUDE.md:** rewrite the B5 OSC sentence: un-debayered CFA path; BAYERPAT/XBAYROFF/YBAYROFF/ROWORDER copied through; per-CFA-channel flat scaling option (default on for color lights, CentralThird mode; global scalar otherwise); masters carry consensus Bayer cards + per-channel ATH_FNR/G/B.
-- [ ] **Step 3: Audit-doc bookkeeping:** dictionary note for any new log fields introduced by this cycle; deferred list additions: PixinsightTrimmed per-channel variant; Flat Analysis contour plot on CFA (display-only); matcher-level bayerpat parameter (needs set-level denormalization); mono-flat-on-OSC hard-block decision (currently advisory).
+- [ ] **Step 3: Audit-doc bookkeeping:** dictionary note for any new log fields introduced by this cycle; deferred list additions: full-frame trimmed-mean per-channel variant; Flat Analysis contour plot on CFA (display-only); matcher-level bayerpat parameter (needs set-level denormalization); mono-flat-on-OSC hard-block decision (currently advisory).
 - [ ] **Step 4:** full gates (`cargo build --workspace`, `cargo test -p athenaeum-core --lib`, `npx tsc --noEmit`); commit — `test(calibration): end-to-end CFA coverage; docs truth-up`
 
 ---

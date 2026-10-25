@@ -1,6 +1,6 @@
 //! Per-pixel robust integration recipes — the reference's two-axis model
 //! (Combination × Rejection). Spec:
-//! `docs/superpowers/specs/2026-07-06-master-integration-pi-model-design.md`.
+//! `docs/superpowers/specs/2026-07-06-master-integration-model-design.md`.
 //!
 //! An [`IntegrationRecipe`] pairs a [`Combination`] (Average or Median of the
 //! surviving samples) with a [`Rejection`] algorithm that decides which
@@ -1197,7 +1197,7 @@ enum WindowMedian {
 /// exact zero all take the full selection, unchanged. Not a numeric change: the bracket,
 /// the bisection, the sign sum and every returned bit are as before
 /// (`medfit_line_windowed_median_matches_the_full_selection_bit_for_bit`).
-/// `diag_medfit_windowed_median_cost` (release, M4 Max): new/old per call
+/// Measured by a release-build benchmark (M4 Max, since removed): new/old per call
 /// 0.74–0.85 cold and 0.61–0.73 warm over `m` = 20–208 (`m` = 105: 0.75–0.76
 /// cold, 0.65 warm). Measured on the same benchmark and NOT kept — do not
 /// re-propose:
@@ -2512,75 +2512,6 @@ mod tests {
         assert!(kept <= 194, "all six outliers rejected at 5.0/3.5, kept {kept}");
     }
 
-    /// The single least-squares line fit `medfit_line` replaces, copied from
-    /// the pre-Task-3 `reject_linear_fit`'s LS block (`git show
-    /// d6361615:crates/athenaeum-core/src/integration/combine.rs`),
-    /// generalized from the per-iteration inline computation to a standalone
-    /// `&[f64] -> (f64, f64)` function for this cost-ratio benchmark (fix
-    /// round 1 review, ruling R-M4a-16, finding 1).
-    fn old_least_squares_line(values: &[f64]) -> (f64, f64) {
-        let k = values.len();
-        let kf = k as f64;
-        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
-        for (i, &y) in values.iter().enumerate() {
-            let x = i as f64;
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            sxy += x * y;
-        }
-        let denom = kf * sxx - sx * sx;
-        if denom.abs() <= f64::EPSILON {
-            return (sy / kf, 0.0);
-        }
-        let b = (kf * sxy - sx * sy) / denom;
-        let a = (sy - b * sx) / kf;
-        (a, b)
-    }
-
-    /// Cost of one cold (no warm start) `medfit_line` call relative to one
-    /// `old_least_squares_line` call, at n = 20 (the `RejectionChoice::Auto`
-    /// threshold) and n = 200 (a typical real stack) — ruling R-M4a-16,
-    /// finding 1: the review measured 13-44x against the brief's 5-10x bar
-    /// before `select_nth_unstable_by` replaced the per-bracket sort. Not
-    /// run by default (timing tests are flaky under CI/parallel load) — run
-    /// with `-- --ignored --nocapture` and read the printed ratios.
-    #[test]
-    #[ignore]
-    fn medfit_cost_relative_to_least_squares() {
-        use std::time::Instant;
-        for &n in &[20usize, 200usize] {
-            let mut rng = SplitMix64(0x9E37_79B9 ^ n as u64);
-            // A real per-pixel stack, in the shape `reject_linear_fit`
-            // actually hands `medfit_line`: SORTED ascending (`sort_asc`
-            // runs before every call in production), a baseline plus
-            // per-frame read noise.
-            let mut values: Vec<f64> =
-                (0..n).map(|_| 100.0 + 5.0 * next_gaussian(&mut rng)).collect();
-            values.sort_by(|p, q| p.partial_cmp(q).unwrap());
-
-            let iters = 20_000u32;
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                std::hint::black_box(old_least_squares_line(std::hint::black_box(&values)));
-            }
-            let old_elapsed = t0.elapsed();
-
-            let t1 = Instant::now();
-            for _ in 0..iters {
-                std::hint::black_box(medfit_line(std::hint::black_box(&values), None));
-            }
-            let new_elapsed = t1.elapsed();
-
-            let old_ns = old_elapsed.as_secs_f64() * 1e9 / iters as f64;
-            let new_ns = new_elapsed.as_secs_f64() * 1e9 / iters as f64;
-            eprintln!(
-                "n={n}: old={old_ns:.1} ns/call new={new_ns:.1} ns/call ratio={:.2}x",
-                new_ns / old_ns
-            );
-        }
-    }
-
     // ── Perf tier A Task 9 (I1-I5): exact-rewrite pins ──────────────────────
     //
     // Oracles below are the pre-Task-9 `medfit_line`/`reject_linear_fit`
@@ -2591,8 +2522,7 @@ mod tests {
 
     thread_local! {
         // 13c 4d: the oracle's residual scratch, reused across calls like
-        // the production function's own, so `diag_medfit_windowed_median_cost`
-        // does not time an allocation per call the production path never pays.
+        // the production function's own.
         static ORACLE_RESIDUAL_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
     }
 
@@ -3010,68 +2940,6 @@ mod tests {
         }
     }
 
-    /// 13c 4d: cost of one `medfit_line` call (windowed residual median)
-    /// against one [`medfit_line_oracle`] call (the full selection on every
-    /// evaluation — today's kernel before 4d), cold and warm, at the stack
-    /// sizes the real sets integrate. Inputs are the production shape — a
-    /// sorted Gaussian stack with two high outliers — drawn from a pool of
-    /// 256 seeded stacks per `m` so the branch predictor cannot learn one
-    /// stack. Cold is the first call on the `m`-stack (no seed); warm is
-    /// the call `reject_linear_fit` makes next: the `m − 2` survivors seeded
-    /// with the cold slope. 50 000 calls per cell, old and new interleaved
-    /// over 5 rounds, the per-cell minimum reported. Not run by default
-    /// (timing): `cargo test --release -p athenaeum-core --lib --
-    /// --ignored diag_medfit_windowed_median_cost --nocapture`.
-    #[test]
-    #[ignore]
-    fn diag_medfit_windowed_median_cost() {
-        use std::time::Instant;
-        const ITERS: usize = 50_000;
-        const POOL: usize = 256;
-        eprintln!("medfit_line cost per call (ns), new = windowed median, old = full selection");
-        eprintln!("| m | cold new | cold old | cold new/old | warm new | warm old | warm new/old |");
-        eprintln!("| ---- | ---- | ---- | ---- | ---- | ---- | ---- |");
-        for &m in &[20usize, 30, 74, 105, 164, 208] {
-            let mut rng = SplitMix64(0x13C4_D000 ^ m as u64);
-            let pool: Vec<(Vec<f64>, Vec<f64>, f64)> = (0..POOL)
-                .map(|_| {
-                    let mut full: Vec<f64> = (0..m).map(|_| 100.0 + 5.0 * next_gaussian(&mut rng)).collect();
-                    full[0] = 200.0 + 10.0 * rng.next_f64();
-                    full[1] = 180.0 + 10.0 * rng.next_f64();
-                    full.sort_by(|p, q| p.partial_cmp(q).unwrap());
-                    let cold_b = medfit_line_oracle(&full, None).1;
-                    let survivors = full[..m - 2].to_vec();
-                    (full, survivors, cold_b)
-                })
-                .collect();
-            let time = |f: &dyn Fn(&[f64], Option<f64>) -> (f64, f64), warm: bool| -> f64 {
-                let t = Instant::now();
-                for it in 0..ITERS {
-                    let (full, survivors, cold_b) = &pool[it % POOL];
-                    let out = if warm {
-                        f(std::hint::black_box(survivors), Some(*cold_b))
-                    } else {
-                        f(std::hint::black_box(full), None)
-                    };
-                    std::hint::black_box(out);
-                }
-                t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
-            };
-            let (mut cn, mut co, mut wn, mut wo) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
-            for _ in 0..5 {
-                co = co.min(time(&medfit_line_oracle, false));
-                cn = cn.min(time(&medfit_line, false));
-                wo = wo.min(time(&medfit_line_oracle, true));
-                wn = wn.min(time(&medfit_line, true));
-            }
-            eprintln!(
-                "| {m} | {cn:.0} | {co:.0} | {:.3} | {wn:.0} | {wo:.0} | {:.3} |",
-                cn / co,
-                wn / wo
-            );
-        }
-    }
-
     /// I1/I2 transitively, through `reject_linear_fit`: bit-identical
     /// survivor count AND the exact same VALUES surviving, over 500 seeded
     /// random `f32` stacks with a planted contaminated tail (so the
@@ -3394,70 +3262,6 @@ mod tests {
             }
         }
         assert!(gave_up > 0 && answered > 0, "gave up {gave_up}, answered {answered}");
-    }
-
-    /// S1: cost of one `medfit_line` call on the vector kernel against the
-    /// scalar kernel, cold and warm — the pool and protocol of
-    /// [`diag_medfit_windowed_median_cost`] (sorted Gaussian stacks with two
-    /// high outliers, 256 per `m`, 50 000 calls per cell, 5 interleaved
-    /// rounds, the per-cell minimum). Not run by default (timing):
-    /// `cargo test --release -p athenaeum-core --lib -- --ignored
-    /// diag_medfit_vector_kernel_cost --nocapture`.
-    #[test]
-    #[ignore]
-    fn diag_medfit_vector_kernel_cost() {
-        use std::time::Instant;
-        const ITERS: usize = 50_000;
-        const POOL: usize = 256;
-        let ks = kernels();
-        assert_eq!(ks.len(), 2, "no vector kernel on this CPU");
-        let (scalar, vector) = (ks[0], ks[1]);
-        eprintln!("medfit_line cost per call (ns), vector vs scalar kernel");
-        eprintln!(
-            "| m | cold vector | cold scalar | cold v/s | warm vector | warm scalar | warm v/s |"
-        );
-        eprintln!("| ---- | ---- | ---- | ---- | ---- | ---- | ---- |");
-        for &m in &[20usize, 30, 74, 92, 105, 164, 208, 260] {
-            let mut rng = SplitMix64(0x13C4_D000 ^ m as u64);
-            let pool: Vec<(Vec<f64>, Vec<f64>, f64)> = (0..POOL)
-                .map(|_| {
-                    let mut full: Vec<f64> = (0..m)
-                        .map(|_| 100.0 + 5.0 * next_gaussian(&mut rng))
-                        .collect();
-                    full[0] = 200.0 + 10.0 * rng.next_f64();
-                    full[1] = 180.0 + 10.0 * rng.next_f64();
-                    full.sort_by(|p, q| p.partial_cmp(q).unwrap());
-                    let cold_b = medfit_line_oracle(&full, None).1;
-                    let survivors = full[..m - 2].to_vec();
-                    (full, survivors, cold_b)
-                })
-                .collect();
-            let time = |kernel: Kernel, warm: bool| -> f64 {
-                let t = Instant::now();
-                for it in 0..ITERS {
-                    let (full, survivors, cold_b) = &pool[it % POOL];
-                    let out = if warm {
-                        medfit_line_with(std::hint::black_box(survivors), Some(*cold_b), kernel)
-                    } else {
-                        medfit_line_with(std::hint::black_box(full), None, kernel)
-                    };
-                    std::hint::black_box(out);
-                }
-                t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
-            };
-            let (mut cv, mut cs, mut wv, mut ws) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
-            for _ in 0..5 {
-                cs = cs.min(time(scalar, false));
-                cv = cv.min(time(vector, false));
-                ws = ws.min(time(scalar, true));
-                wv = wv.min(time(vector, true));
-            }
-            eprintln!(
-                "| {m} | {cv:.0} | {cs:.0} | {:.3} | {wv:.0} | {ws:.0} | {:.3} |",
-                cv / cs,
-                wv / ws
-            );
-        }
     }
 
     /// Perf tier C, C4/I7: the rejection loop stops on the FIRST iteration

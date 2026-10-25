@@ -31,7 +31,7 @@ with `bounds="0:65535"` and the `imageType` attribute WBPP reads as
 authoritative (a dark flat as `MasterDark`), registered through the scanner's
 own XISF parser; a rebuild keeps the file's container. On real data the XISF
 master, the lights calibrated with it and a mixed FITS+XISF stack are
-bit-identical to their FITS twins. Owed: the PixInsight/WBPP open (open-items).
+bit-identical to their FITS twins. Owed: the downstream processing program's WBPP open (open-items).
 
 
 **Owner's ask.** A setting in the Calibration settings that picks the container
@@ -77,14 +77,14 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   `OutputPanel.tsx:19-22`.
 
 **What WBPP actually requires — read from its own source, 2026-09-18**
-(`/Applications/PixInsight/src/scripts/BatchPreprocessing/BPP-Helper.js`,
-`BPP-StackEngine.js`, the version installed on the owner's Mac):
+(the ERP's batch-preprocessing helper script and stack-engine script, the version
+installed on the owner's Mac):
 
-- **The container is not optional.** `BPP-StackEngine.js:724-728` rejects any
+- **The container is not optional.** the stack-engine script (lines 724-728) rejects any
   master whose extension is not `.xisf`: *"master calibration files must be
   in XISF format"*. A FITS master is refused outright, whatever its header
   says — this is why the FITS masters Athenaeum writes today cannot feed WBPP.
-- **Master detection** (`BPP-Helper.js:639-641`, `:734-741`): `isMaster` is
+- **Master detection** (the helper script, lines 639-641 and 734-741): `isMaster` is
   true when the `IMAGETYP` value contains the substring `master`
   (case-insensitive); optionally also when the file PATH contains `master`
   (`isMasterFromPath`, behind the "detect master including full path"
@@ -97,10 +97,11 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   for `master_darkflat_…` that is **FLAT**, i.e. a master dark flat would be
   ingested as a master flat. Must be prevented (next point).
 - **XISF properties override the keywords** (`:866-877`): after the FITS
-  keywords, WBPP calls `getXISFProperty("PCL:Image:Type",
-  info[0].imageType)` — that is the `<Image imageType="…">` attribute as
-  PixInsight's reader exposes it (`pjsr/ImageType.jsh`: `MasterBias = 5`,
-  `MasterDark = 6`, `MasterFlat = 7`) — and it sets BOTH `imageType` and
+  keywords, WBPP calls its XISF-property getter on the `<vendor-prefixed property id>`
+  for the image type (falling back to `info[0].imageType`) — that is the
+  `<Image imageType="…">` attribute as the ERP's reader exposes it (the ERP's
+  image-type constants: `MasterBias = 5`, `MasterDark = 6`,
+  `MasterFlat = 7`) — and it sets BOTH `imageType` and
   `isMaster`. So the attribute is the authoritative channel: write
   `imageType="MasterBias" | "MasterDark" | "MasterFlat"`, and for a dark flat
   `imageType="MasterDark"` (WBPP treats dark flats as darks matched by
@@ -108,7 +109,7 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   scanner.
 - **Matching keys it reads from the keywords**: `EXPTIME`/`EXPOSURE` (a
   master dark is matched at `MIN_EXPOSURE_TOLERANCE = 0.01` s,
-  `BPP-Global.js:89`), `XBINNING`/`BINNING`/`CCDBINX`, `FILTER`/`INSFLNAM`
+  the globals script, line 89), `XBINNING`/`BINNING`/`CCDBINX`, `FILTER`/`INSFLNAM`
   (flats), `BAYERPAT`, `DATE-OBS`, `XPIXSZ`, `FOCALLEN`; group matching adds
   the image SIZE. `build_master_cards` already stamps `IMAGETYP`, `INSTRUME`,
   `EXPTIME`, `CCD-TEMP`, `XBINNING`, `FILTER`, `GAIN`/`OFFSET` (its tests pin
@@ -118,7 +119,7 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   stamps `bounds="0:65535"` — rustafits' reader then returns `v/65535·65535
   = v`, exactly the ADU the light-calibration engine expects, and the file
   states its true range instead of pretending to be unit-scaled. Owner smoke
-  owed: open one such master in PixInsight and run WBPP with it — the one
+  owed: open one such master in the downstream processing program and run WBPP with it — the one
   check that proves the whole contract.
 
 **Proposal.** New setting `calibration.master_format` (`settings/mod.rs` beside

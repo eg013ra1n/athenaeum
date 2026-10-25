@@ -158,7 +158,7 @@ pub async fn get_frame_star_metrics(
     api::get_frame_star_metrics(&state.ctx, args.frame_id).await.map(Json).map_err(api_err)
 }
 
-// ── Flat contour plot (PixInsight FlatContourPlot port) ──────────────────────
+// ── Flat contour plot (port of the ERP's flat-contour-plot script) ──────────────────────
 
 /// POST /api/compute_flat_contour_plot
 #[tracing::instrument(skip_all, err(Debug), level = "debug")]
@@ -172,6 +172,7 @@ pub async fn compute_flat_contour_plot(
 #[cfg(test)]
 mod analysis_config_tests {
     use super::*;
+    use athenaeum_core::analysis::config::AnalysisPsfModel;
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
     use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
@@ -231,6 +232,8 @@ mod analysis_config_tests {
 
         let mut cfg = AnalysisConfig::default();
         cfg.max_stars = 750;
+        cfg.detection_threshold = 7.5;
+        cfg.psf_model = AnalysisPsfModel::Auto;
 
         let _ = set_analysis_config(State(state.clone()), Json(SetAnalysisConfigArgs { config: cfg }))
             .await
@@ -241,6 +244,40 @@ mod analysis_config_tests {
             .unwrap()
             .0;
         assert_eq!(resp.max_stars, 750);
+        assert_eq!(resp.detection_threshold, 7.5);
+        assert_eq!(resp.psf_model, AnalysisPsfModel::Auto);
+    }
+
+    /// A threshold outside 2..20 is refused by the route's validation, and the stored config stays.
+    #[tokio::test]
+    async fn set_analysis_config_refuses_a_threshold_out_of_range() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = AnalysisConfig::default();
+        cfg.detection_threshold = 25.0;
+        let r = set_analysis_config(State(state.clone()), Json(SetAnalysisConfigArgs { config: cfg })).await;
+        assert!(r.is_err(), "a threshold of 25 must be refused");
+
+        let resp = get_analysis_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.detection_threshold, 6.0);
+    }
+
+    /// An old stored-shape body (the removed keys) still decodes, with the new fields at their defaults.
+    #[test]
+    fn an_old_shape_config_body_decodes_with_new_defaults() {
+        let body = serde_json::json!({"config": {"detection_sigma": 5.0, "min_star_area": 5, "max_star_area": 2000,
+            "saturation_fraction": 0.95, "max_stars": 800, "trail_threshold": 0.4, "mrs_layers": 0,
+            "measure_cap": 2000, "fit_max_iter": 25, "fit_tolerance": 0.0001, "fit_max_rejects": 5,
+            "batch_concurrency": 3}});
+        let args: SetAnalysisConfigArgs = serde_json::from_value(body).unwrap();
+        assert_eq!(args.config.max_stars, 800);
+        assert_eq!(args.config.detection_threshold, 6.0);
+        assert_eq!(args.config.psf_model, AnalysisPsfModel::Moffat4);
     }
 
     /// Pins the fix: the handler now requires the `{ "config": ... }`

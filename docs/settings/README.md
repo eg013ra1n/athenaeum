@@ -16,7 +16,7 @@ resettable, and the defaults come from one Rust command.
 | Kind | What it is | Rust side | Frontend hook |
 | ---- | ---- | ---- | ---- |
 | **KV** | One scalar with a default, stored as a string under one key in `settings` | `settings/mod.rs` — a `keys::` constant, a `defaults::` constant, **and a pair in `defaults::all()`**; read in Rust through `SettingsManager` | `useSettingField(section, field, key, codec)` |
-| **Typed config** | A group of values that travels together as one JSON document | Its own struct with `Default`, plus `get_*` / `set_*` / `reset_*` on BOTH hosts (`AnalysisConfig`, `PlateSolveConfig`, `CalibrationMatchingConfig`, `LoggingConfig`, `StackingConfig`) | `useAutosaveDocument<D>({ load, save, resetAll?, defaults })` |
+| **Typed config** | A group of values that travels together as one JSON document | Its own struct with `Default`, plus `get_*` / `set_*` / `reset_*` on BOTH hosts (`AnalysisConfig`, `PlateSolveConfig`, `CalibrationMatchingConfig`, `LoggingConfig`, `StackingConfig` — whose global trio is `get/set/reset_stacking_defaults`; Logging has no reset) | `useAutosaveDocument<D>({ load, save, resetAll?, defaults })` |
 
 A KV key with its own command (`set_blink_threads`, `set_integration_band_budget`,
 `set_sync_upload_limit`) stays KV — pass `write` / `read` overrides to the hook.
@@ -57,11 +57,18 @@ value, a default or render code. Two consumers read it: the search index
 | ---- | ---- |
 | General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.dataLocations` `general.logging` |
 | Blink | `blink.viewer` `blink.flatContour` `blink.annotations` |
-| Analysis | `analysis.detection` `analysis.measurement` `analysis.psf` `analysis.batch` `analysis.rejection` |
+| Analysis | `analysis.detection` `analysis.measurement` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
 | Calibration | `calibration.matching` `calibration.memory` `calibration.masterFormat` |
 | Stacking | `stacking.pipeline` `stacking.folders` `stacking.compute` |
 | Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.collabStreams` `transfers.storage` |
+
+`analysis.*` (Plan C, PC-10 / PC-15) carries `AnalysisConfig`'s four fields only: `detection_threshold` (σ of the
+matched filter, 2.0–20.0), `max_stars` (the measurement budget), `psf_model` (`moffat4` default / `auto`, a `<select>`
+under `analysis.measurement`) and `batch_concurrency`; the old detection / PSF-fit / trail-threshold fields and the
+`analysis.psf` section are gone. `analysis.rejection`'s `trailed` field reads "Reject unusable frames" (the stored
+threshold key stays `trail`). `plateSolving.inputGate` is the one switch `input_gate_enabled` — a frame whose own
+analysis marks it Trailed is refused before solving; the eccentricity / R² pair was removed with C7.
 
 `stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",
 `StackingComputeSection`, `SettingNumber` with `intCodec(0, 1048576)`, generic `get_setting` / `set_setting`, default

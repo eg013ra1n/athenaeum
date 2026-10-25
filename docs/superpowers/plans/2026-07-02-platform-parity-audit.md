@@ -44,12 +44,12 @@ The web backend is a real peer, not a demo: shared `athenaeum-core` logic, the *
 - Path sandboxing via `ATHENAEUM_ALLOWED_PATHS` **is** enforced, but only in `routes/scan_roots.rs` and `routes/files.rs`; docker defaults `Dockerfile:101` = `/astro-files,/exports`.
 - Acceptable for the current "LAN/home Docker" story, but must be stated in README/docs, and **pillar C must not widen exposure**: the Syncthing design keeps sync out-of-process (good); never bind athenaeum-web beyond localhost/LAN without adding auth. Cheap interim hardening: optional `ATHENAEUM_API_KEY` env → require header when set.
 
-### [STALE DOC] Siril export has been removed from the codebase
+### [STALE DOC] Export for a second open-source stacker has been removed from the codebase
 
-`crates/athenaeum-core/src/export/` now contains only `data_collector`, `file_organizer`, `models`, `mod` — zero `siril` matches in `crates/` or `src/`. `docs/export/README.md` still documents the full Siril script pipeline (scripts, cli_runner, execution modes) — **rewrite it**; it misleads any future work (and misled the June-era mosaic analysis).
+`crates/athenaeum-core/src/export/` now contains only `data_collector`, `file_organizer`, `models`, `mod` — zero matches for that stacker's name in `crates/` or `src/`. `docs/export/README.md` still documents the full script pipeline for that stacker (scripts, cli_runner, execution modes) — **rewrite it**; it misleads any future work (and misled the June-era mosaic analysis).
 
 Corollary discovered while verifying: **WBPP grouping-keyword infrastructure already exists** — `WbppExportConfig { keyword_order: ["CAMERA","BIAS","DARKS","FLAT"] }` builds keyword-nested folders and `WbppSetupInstructions`/`WbppKeywordInstruction { pre_checked }` model the WBPP-side setup (`export/models.rs:691-741`). The mosaic export task shrinks to: add a `PANEL` keyword level with `pre_checked: false` (post-processing grouping) fed from `tile_label`. Architecture spec and roadmap updated accordingly.
 
 ## 3. Actions taken from this audit
 
-All actionable findings landed in the Phase 0 plan (`2026-07-02-phase0-hygiene.md`): **T11** LIKE-on-paths fix, **T12** `docs/export/README.md` rewrite, **T13** optional `ATHENAEUM_API_KEY` auth, **T14** web `relink_scan_root` path-input variant; symlink-export and Windows-coverage risks recorded there as watch items. Mosaic export sections updated in `../specs/2026-07-02-target-features-architecture.md` and roadmap P3 (Siril per-tile bullet dropped; keyword work rescoped onto `WbppExportConfig`).
+All actionable findings landed in the Phase 0 plan (`2026-07-02-phase0-hygiene.md`): **T11** LIKE-on-paths fix, **T12** `docs/export/README.md` rewrite, **T13** optional `ATHENAEUM_API_KEY` auth, **T14** web `relink_scan_root` path-input variant; symlink-export and Windows-coverage risks recorded there as watch items. Mosaic export sections updated in `../specs/2026-07-02-target-features-architecture.md` and roadmap P3 (the per-tile bullet for that stacker dropped; keyword work rescoped onto `WbppExportConfig`).

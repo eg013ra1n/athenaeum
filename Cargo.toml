@@ -25,6 +25,12 @@ opt-level = 2
 [profile.dev.package.solvemyastro]
 opt-level = 3
 
+# rustafits is a workspace member too: the FITS / XISF reader, the CFA green-site
+# helpers the Analysis path uses, and the render pipeline run at opt-level 0 in
+# `tauri dev` without this.
+[profile.dev.package.rustafits]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

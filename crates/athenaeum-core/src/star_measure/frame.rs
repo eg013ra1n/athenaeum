@@ -116,7 +116,7 @@ pub struct FrameAggregates {
 
 /// The median of the finite values of `it` (the mean of the two middle values for an even count); `None` when there
 /// is none.
-fn finite_median(it: impl Iterator<Item = f64>) -> Option<f64> {
+pub(crate) fn finite_median(it: impl Iterator<Item = f64>) -> Option<f64> {
     let mut v: Vec<f64> = it.filter(|x| x.is_finite()).collect();
     if v.is_empty() {
         return None;

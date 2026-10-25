@@ -1,6 +1,6 @@
 //! Export-related Tauri commands
 //!
-//! Commands for exporting frame sets to PixInsight WBPP folder structure.
+//! Commands for exporting frame sets to WBPP folder structure.
 
 use crate::commands::{AppState, ExportHandle};
 use crate::export::{
@@ -160,9 +160,9 @@ pub async fn get_export_readiness(
         .map_err(|e| e.to_string())
 }
 
-/// Export a frame set to PixInsight WBPP folder structure
+/// Export a frame set to WBPP folder structure
 ///
-/// Creates a folder structure optimized for PixInsight's Weighted Batch Preprocessing (WBPP):
+/// Creates a folder structure optimized for the ERP's Weighted Batch Preprocessing (WBPP):
 /// ```text
 /// output/
 /// └── camera_{name}/

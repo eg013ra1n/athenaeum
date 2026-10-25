@@ -33,7 +33,7 @@ package each tier dir into `tier_<density>.zip` + `.sha256` plus a `manifest.jso
   `read_records_until_mag(&[u8], mag_limit) -> Vec<StarRecord>` (mag-sorted).
 - `build_cache(records: IntoIterator<Item = solvemyastro::StarRecord>, out_dir: &Path, catalog_epoch: f64, progress: impl Fn(BuildProgress)) -> Result<usize>`.
 - Error rule: never swallow silently — log to stderr before continuing/returning.
-- Don't name ASTAP in code/comments; use `tier_<density>` naming.
+- Don't name the external plate solver in code/comments; use `tier_<density>` naming.
 
 ## File Structure
 

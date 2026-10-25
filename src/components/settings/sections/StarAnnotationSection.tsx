@@ -50,7 +50,7 @@ interface NumberRowProps {
 function NumberRow({ label, min, max, step, value, onChange, isDefault, defaultValue, onReset }: NumberRowProps) {
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex items-center gap-1 mb-1">
         <label className="block text-xs text-content-secondary">{label}</label>
         <ResetButton visible={!isDefault} defaultLabel={String(defaultValue)} onReset={onReset} />
       </div>
@@ -154,7 +154,7 @@ export function StarAnnotationSection() {
           {numberField('fwhm_warn', 'FWHM Warn (ratio >)', 0.5, 10, 0.1)}
           {numberField('ellipse_scale', 'Ellipse Scale (×FWHM)', 0.5, 4, 0.1)}
           {numberField('min_radius', 'Min Radius (px)', 1, 30, 1)}
-          {numberField('max_radius', 'Max Radius (px)', 10, 200, 5)}
+          {numberField('max_radius', 'Max Radius (image px)', 10, 200, 5)}
         </div>
       </div>
     </SettingsSection>

@@ -334,7 +334,7 @@ carries the identity transform and its own absolute WCS.
 
 ## 7. Deferred (Phases 5–6)
 
-The "exceed-PixInsight *absolute*" levers, not required for registration (which
+The "exceed-the-ERP *absolute*" levers, not required for registration (which
 is relative): a **catalog record v2** (f64 RA/Dec end-to-end + per-star σ for
 inverse-variance weighting + BP−RP colour + de-clipped PM) needing a Gaia
 rebuild + re-host, and **DCR correction** (a new astrometry module computing

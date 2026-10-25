@@ -192,6 +192,7 @@ fn history_for(agent: &Agent, filename: &str) -> Vec<HistoryRow> {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .expect("search history")
@@ -266,6 +267,7 @@ async fn two_fixtures_are_enqueued_once_and_confirmed() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 10,
         })
         .unwrap();

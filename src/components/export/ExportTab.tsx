@@ -44,6 +44,7 @@ import type {
   FlatNormMode,
   LightCalParams,
 } from '../../types/models';
+import { FLAT_NORM_TRIMMED_MEAN_WHOLE } from '../../types/flat-norm';
 
 interface ExportTabProps {
   frameSetId: number;
@@ -594,8 +595,8 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                         <input
                           type="radio"
                           name="export-flatnorm-mode"
-                          checked={flatNormMode === 'pixinsightTrimmed'}
-                          onChange={() => handleFlatNormModeChange('pixinsightTrimmed')}
+                          checked={flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE}
+                          onChange={() => handleFlatNormModeChange(FLAT_NORM_TRIMMED_MEAN_WHOLE)}
                           className="w-3.5 h-3.5 text-accent border-border focus:ring-accent"
                         />
                         Full-frame trimmed mean ({trimPercentLabel} per tail)
@@ -606,15 +607,15 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                           the trimmed mode, which is measured whole-frame. */}
                       <label
                         className={`flex items-center gap-2 text-xs pt-1 ${
-                          flatNormMode === 'pixinsightTrimmed'
+                          flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE
                             ? 'text-content-muted cursor-not-allowed'
                             : 'text-content-secondary cursor-pointer'
                         }`}
                       >
                         <input
                           type="checkbox"
-                          checked={params.cfaFlatScaling && flatNormMode !== 'pixinsightTrimmed'}
-                          disabled={flatNormMode === 'pixinsightTrimmed'}
+                          checked={params.cfaFlatScaling && flatNormMode !== FLAT_NORM_TRIMMED_MEAN_WHOLE}
+                          disabled={flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE}
                           onChange={e =>
                             updateParams(prev => ({ ...prev, cfaFlatScaling: e.target.checked }))
                           }
@@ -623,7 +624,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                         Per-channel CFA flat scaling
                       </label>
                       <p className="text-[11px] text-content-muted ml-6">
-                        {flatNormMode === 'pixinsightTrimmed'
+                        {flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE
                           ? 'Not available with the full-frame trimmed mean — that statistic is measured across all channels at once.'
                           : 'Applies to color (CFA) lights; mono lights are unaffected.'}
                       </p>
@@ -684,7 +685,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                   {advancedOpen && (
                     <div className="mt-3 ml-1 space-y-3">
                       {/* The trim fraction only exists in the trimmed statistic. */}
-                      {flatNorm && flatNormMode === 'pixinsightTrimmed' && (
+                      {flatNorm && flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE && (
                         <div>
                           <label htmlFor="export-trim-fraction" className="block text-xs text-content-secondary mb-1">
                             Flat trim fraction (per tail)

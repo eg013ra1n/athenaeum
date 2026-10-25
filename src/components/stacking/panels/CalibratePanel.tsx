@@ -6,6 +6,7 @@
 
 import { Checkbox } from '../../settings/Checkbox';
 import type { StackingConfig, StackingPlan } from '../../../types/stacking';
+import { FLAT_NORM_TRIMMED_MEAN_WHOLE } from '../../../types/flat-norm';
 
 export interface CalibratePanelProps {
   config: StackingConfig;
@@ -74,9 +75,9 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
                 <input
                   type="radio"
                   name="stacking-flatnorm-mode"
-                  checked={cal.flatNormMode === 'pixinsightTrimmed'}
+                  checked={cal.flatNormMode === FLAT_NORM_TRIMMED_MEAN_WHOLE}
                   disabled={disabled}
-                  onChange={() => patchCalibration({ flatNormMode: 'pixinsightTrimmed' })}
+                  onChange={() => patchCalibration({ flatNormMode: FLAT_NORM_TRIMMED_MEAN_WHOLE })}
                   className="w-3.5 h-3.5 text-accent border-border focus:ring-accent disabled:opacity-50"
                 />
                 Full-frame trimmed mean

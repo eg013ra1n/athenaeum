@@ -615,6 +615,40 @@ pub const CORRECTION_ISOLATION_PER_FIELD_FWHM: f64 = 6.0;
 pub const CORRECTION_STARS: usize = 64;
 /// Fewer ratios than this: no correction (`c = 1`, `aperture_correction: None`, one `warn!` per plane).
 pub const CORRECTION_MIN_RATIOS: usize = 5;
+/// A candidate whose [`StarFit::snr`] is below this (or NaN) does not enter the aperture correction's sample (Plan B B4,
+/// PB-13'): the faint end's growth / model ratio departs from the bright end's by an additive growth bias and by the fit
+/// bias of a β-bound plane, neither of which is the aperture's captured fraction.
+pub const CORRECTION_MIN_SNR: f64 = 20.0;
+/// On an image of more than one plane a candidate with no seed of another plane within this many px of its fitted centre
+/// is not a point source of the sky (a hot pixel the debayer left on one plane) and does not enter the aperture
+/// correction (Plan B B4, PB-12'; the cross-plane rule's 1 px, [`super::CROSS_PLANE_MATCH_PX`], widened by the fit's own
+/// centre scatter). This is the floor of the radius; see [`POINT_SOURCE_MATCH_PER_FIELD_FWHM`] for its growth with the FWHM.
+pub const POINT_SOURCE_MATCH_PX: f64 = 1.5;
+/// The point-source screen's radius also grows with the sampling (R-PB4-2): `max(POINT_SOURCE_MATCH_PX, this * field
+/// FWHM)`. The R-G / G-B centroid offset of atmospheric dispersion and lateral colour scales with the seeing FWHM as the
+/// fit's centre scatter does, while 1.5 px is fixed; on a fine-sampled image at low altitude a fixed radius would refuse
+/// the real stars of the red or blue plane.
+pub const POINT_SOURCE_MATCH_PER_FIELD_FWHM: f64 = 0.5;
+
+/// One growth / model ratio of the aperture correction's sample: the candidate's [`model_flux_in_fwtm`] (the sort key)
+/// and its [`growth_curve`] flux over it. Reported (the probe's `--dump-ratios`), never read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApertureRatio {
+    pub model: f64,
+    pub ratio: f64,
+}
+
+/// What [`aperture_correction`] left out of its candidates and the ratios it took the median over, brightest first
+/// (Plan B B4, PB-12' / PB-13'). `point_source` counts the clip-screened candidates with no seed of another plane within
+/// [`POINT_SOURCE_MATCH_PX`] (0 where no screen runs: one plane, LN's refits), `below_snr` those of the rest under
+/// [`CORRECTION_MIN_SNR`]. The ratios are those of floor (i) too (1 to 4 of them); empty where no ratio was read.
+/// Reported, not persisted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApertureScreens {
+    pub point_source: usize,
+    pub below_snr: usize,
+    pub ratios: Vec<ApertureRatio>,
+}
 
 /// The fitted Moffat's flux inside its own FWTM ellipse (F-5): the analytic integral
 /// `A·π·αx·αy/(β−1)·(1 − 10^{(1−β)/β})` of the model, no pixel read — the same fraction `1 − 10^{(1−β)/β}` of the
@@ -850,7 +884,7 @@ pub(crate) fn ring_skies(
         return (None, kept.len());
     };
     let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring);
-    let mut body = || {
+    let body = || {
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(sub, super::Step::RingSky);
             if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
@@ -860,10 +894,7 @@ pub(crate) fn ring_skies(
             }
         })
     };
-    match pool {
-        Some(p) => p.install(body),
-        None => body(),
-    }
+    super::install_in_span(pool, body);
     let missing = kept.iter().filter(|(_, f)| f.sky_ring_n == 0).count();
     tracing::debug!(
         count = kept.len(),
@@ -981,15 +1012,24 @@ pub(crate) fn unverdicted_clip_range(
 /// clause: `saturation`'s [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the
 /// caller's `full_scale`), has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm`
 /// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
-/// `footprint`, no absent pixel within `5F`). Returns `(c, ratios)`: `c` is `None` with no fit at all (`debug!`) or
-/// with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
-/// per-plane events count the screened candidates (`skipped`). `own[k]` (Task 12, the budget fits a subset of `seeds`) is
+/// `footprint`, no absent pixel within `5F`). Returns `(c, n, se, screens)`: `c` is `None` with no fit at all (`debug!`)
+/// or with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
+/// per-plane events count the clip-screened candidates (`skipped`) beside the two Plan B B4 screens (`point_source`,
+/// `below_snr`). `own[k]` (Task 12, the budget fits a subset of `seeds`) is
 /// the index into `seeds` of fit seed `k`, the one the isolation test skips; `None` = the identity.
 ///
 /// `population` (Plan A Task 13b, R13b-6): only fits of population (a) are candidates (its screens, the ring's `F` = (a)'s
 /// FWHM) and `c` is the median of the 64 brightest of them by model flux (ties by seed index); there is no per-stratum
 /// cap (the faint strata's ratios are a fit-bias, not noise). The third return value is the median's standard error, `1.2533 * 1.4826 * MAD / sqrt(n)`, printed in the debug line and
 /// reported on the frame line (`None` when `c` was not measured).
+///
+/// Plan B B4 (PB-12', PB-13'), two more screens on the candidates, after the clip screen and before the sort. (1) The
+/// point-source screen, only where `siblings` is `Some` (an image of more than one plane: every OTHER plane's seeds, the
+/// caller gathered them after the cross-plane flags): a candidate with no sibling seed within
+/// `max(`[`POINT_SOURCE_MATCH_PX`]`, `[`POINT_SOURCE_MATCH_PER_FIELD_FWHM`]` * field_fwhm)` of its fitted centre is a defect of one plane, not a star, and leaves the list (`point_source`). One plane, LN's
+/// refits: `None`, no screen. (2) The SNR floor: a candidate whose [`StarFit::snr`] is under [`CORRECTION_MIN_SNR`], or
+/// NaN, leaves the list (`below_snr`); the caller computes every fit's SNR before this call (it reads the ring sky, never
+/// `c`). `c` is then the median of the 64 brightest of the rest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -1005,13 +1045,14 @@ pub(crate) fn aperture_correction(
     full_scale: Option<f64>,
     footprint: Option<&[bool]>,
     population: Option<super::population::PopulationView<'_>>,
-) -> (Option<f64>, usize, Option<f64>) {
+    siblings: Option<&[Seed]>,
+) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
             count = seeds.len(),
             "aperture correction: no fits on the plane; none measured"
         );
-        return (None, 0, None);
+        return (None, 0, None, ApertureScreens::default());
     }
     let clip_range = saturation.map_or_else(
         || unverdicted_clip_range(data, mask, w, h, full_scale),
@@ -1019,7 +1060,9 @@ pub(crate) fn aperture_correction(
     );
     let r_iso = CORRECTION_ISOLATION_PER_FIELD_FWHM * field_fwhm;
     let mut ratios: Vec<f64> = Vec::new();
+    let mut taken: Vec<ApertureRatio> = Vec::new();
     let mut screened = 0usize;
+    let mut screens = ApertureScreens::default();
     if let Some(f_ring) = ring_fwhm.filter(|f| f.is_finite() && *f > 0.0) {
         if r_iso.is_finite() && r_iso > 0.0 {
             // Every seed by its `r_iso` cell: a seed within `r_iso` of a centre lies in the 3×3 cells about it.
@@ -1057,6 +1100,37 @@ pub(crate) fn aperture_correction(
                 screened += usize::from(clipped);
                 !clipped
             });
+            // PB-12': a candidate with no seed of another plane at its position is one plane's defect, not a star.
+            if let Some(siblings) = siblings {
+                let m = if field_fwhm.is_finite() && field_fwhm > 0.0 {
+                    POINT_SOURCE_MATCH_PX.max(POINT_SOURCE_MATCH_PER_FIELD_FWHM * field_fwhm)
+                } else {
+                    POINT_SOURCE_MATCH_PX
+                };
+                let cell = |x: f64, y: f64| ((x / m).floor() as i64, (y / m).floor() as i64);
+                let mut by_cell: HashMap<(i64, i64), Vec<(f64, f64)>> = HashMap::new();
+                for s in siblings {
+                    by_cell.entry(cell(s.x, s.y)).or_default().push((s.x, s.y));
+                }
+                candidates.retain(|&(_, f, _)| {
+                    let (cx, cy) = cell(f.x, f.y);
+                    let has_counterpart = (cx - 1..=cx + 1).any(|gx| {
+                        (cy - 1..=cy + 1).any(|gy| {
+                            by_cell.get(&(gx, gy)).is_some_and(|at| {
+                                at.iter().any(|&(sx, sy)| (sx - f.x).hypot(sy - f.y) <= m)
+                            })
+                        })
+                    });
+                    screens.point_source += usize::from(!has_counterpart);
+                    has_counterpart
+                });
+            }
+            // PB-13': the faint end's ratios are a growth / fit bias, not the captured fraction (NaN fails).
+            candidates.retain(|&(_, f, _)| {
+                let bright = f.snr >= CORRECTION_MIN_SNR;
+                screens.below_snr += usize::from(!bright);
+                bright
+            });
             candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
             let mut inside = Vec::new();
             for (seed, f, model) in candidates {
@@ -1079,19 +1153,26 @@ pub(crate) fn aperture_correction(
                     &mut inside,
                 ) {
                     ratios.push(growth / model);
+                    taken.push(ApertureRatio {
+                        model,
+                        ratio: growth / model,
+                    });
                 }
             }
         }
     }
     let n = ratios.len();
+    screens.ratios = taken;
     if n < CORRECTION_MIN_RATIOS {
         tracing::warn!(
             count = n,
             skipped = screened,
+            point_source = screens.point_source,
+            below_snr = screens.below_snr,
             fwhm_px = ring_fwhm,
             "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
         );
-        return (None, n, None);
+        return (None, n, None, screens);
     }
     let c = super::robust::median_f64(&mut ratios);
     // The median's standard error from the ratios' own spread (population (a) reports it; the rule is the same for any
@@ -1102,12 +1183,14 @@ pub(crate) fn aperture_correction(
     tracing::debug!(
         count = n,
         skipped = screened,
+        point_source = screens.point_source,
+        below_snr = screens.below_snr,
         aperture_correction = c,
         aperture_se = se,
         fwhm_px = ring_fwhm,
         "aperture correction measured"
     );
-    (Some(c), n, Some(se))
+    (Some(c), n, Some(se), screens)
 }
 
 /// The aperture SNR's radius per star FWHM (PA-11's aperture, unchanged): `r_ap = max(1.5 * fwhm, 3)` px about the
@@ -2033,7 +2116,9 @@ mod tests {
     fn captured_flux_spread_across_profiles_is_within_two_percent() {
         // the same field as Gaussian (σ 2.123 → FWHM 5), Moffat 2.5, 4, 10 at equal total flux; (max − min)/min of the four medians ≤ 2 %
         // F-5 round 4: on the isolated-star field (`isolated_grid30`, 140 px apart).
-        let total = 1.0f64;
+        // Plan B B4 (PB-13'): the stars must clear the SNR floor (20) or `c` floors at 1 and the medians measure the fit alone;
+        // the planes carry noise 0.002 (a noiseless compact profile has no ring sigma and reads SNR NaN), the total flux is 10 (peak about 0.3, as test 1's), and the medians are read as fractions of it.
+        let total = 10.0f64;
         let (_, w, h, range_at) = isolated_grid30(1.0);
         let mut meds = Vec::new();
         for (beta, alpha) in [
@@ -2055,7 +2140,8 @@ mod tests {
                 amp: 1.5 * amp,
                 ..stars[0]
             });
-            let data = moffat_field(w, h, &field, beta, 0.05);
+            let mut data = moffat_field(w, h, &field, beta, 0.05);
+            add_noise(&mut data, 0.002, 17);
             let m = measure_plane(
                 &data,
                 w,
@@ -2066,7 +2152,9 @@ mod tests {
                 },
                 None,
             );
-            meds.push(median(m.stars.iter().map(|f| f.signal / ADU_SCALE as f64)));
+            meds.push(median(
+                m.stars.iter().map(|f| f.signal / ADU_SCALE as f64 / total),
+            ));
         }
         let sigma = 5.0 / 2.354_820_045;
         let gstars: Vec<(f64, f64, f64)> = isolated_grid30(1.0)
@@ -2083,7 +2171,8 @@ mod tests {
         // the range-setting star (see test 1), rendered, not seeded
         let mut gfield = gstars.clone();
         gfield.push((range_at.0, range_at.1, 1.5 * gstars[0].2));
-        let g = gaussian_field(w, h, &gfield, sigma, 0.05);
+        let mut g = gaussian_field(w, h, &gfield, sigma, 0.05);
+        add_noise(&mut g, 0.002, 17);
         let m = measure_plane(
             &g,
             w,
@@ -2104,13 +2193,15 @@ mod tests {
             },
             None,
         );
-        meds.push(median(m.stars.iter().map(|f| f.signal / ADU_SCALE as f64)));
+        meds.push(median(
+            m.stars.iter().map(|f| f.signal / ADU_SCALE as f64 / total),
+        ));
         let (lo, hi) = (
             meds.iter().cloned().fold(f64::INFINITY, f64::min),
             meds.iter().cloned().fold(0.0, f64::max),
         );
         assert!((hi - lo) / lo < 0.02, "{meds:?}");
-        assert!(meds.iter().all(|m| (m - total).abs() < 0.01), "{meds:?}");
+        assert!(meds.iter().all(|m| (m - 1.0).abs() < 0.01), "{meds:?}");
     }
 
     #[test]
@@ -3051,5 +3142,454 @@ mod snr_hfr_tests {
             "kappa read {} vs analytic {analytic}",
             mt.kappa
         );
+    }
+}
+
+/// Plan B B4 (PB-12', PB-13'): the point-source screen and the SNR-floored sample of the aperture correction `c`, on
+/// synthetic planes whose stars (Moffat β 4, α 5: FWHM 4.35 px) sit on a 100-px lattice, far enough apart that every
+/// star is isolated and its `12F` disc lies inside the plane.
+#[cfg(test)]
+mod b4_tests {
+    use super::*;
+    use crate::star_measure::tests::seeds_of;
+    use crate::star_measure::{
+        cross_plane_flags, finish_plane, measure_plane, prepare_plane, sibling_seeds,
+        MeasureOptions, PlaneMeasurement, PsfModel, SeedSpec,
+    };
+    use crate::test_support::{add_noise, moffat_field, MoffatStar};
+
+    const PITCH: f64 = 100.0;
+    const MARGIN: f64 = 80.0;
+    const SIGMA: f32 = 0.002;
+
+    fn star(x: f64, y: f64, amp: f64) -> MoffatStar {
+        MoffatStar {
+            x,
+            y,
+            amp,
+            alpha_x: 5.0,
+            alpha_y: 5.0,
+            theta: 0.0,
+        }
+    }
+
+    /// Lattice node `(i, j)`, the sub-pixel offset varying from node to node.
+    fn node(i: usize, j: usize) -> (f64, f64) {
+        (
+            MARGIN + i as f64 * PITCH + 0.13 * ((i + 2 * j) % 5) as f64,
+            MARGIN + j as f64 * PITCH + 0.21 * ((2 * i + j) % 4) as f64,
+        )
+    }
+
+    fn size(cols: usize, rows: usize) -> (usize, usize) {
+        (
+            (2.0 * MARGIN + (cols - 1) as f64 * PITCH) as usize + 1,
+            (2.0 * MARGIN + (rows - 1) as f64 * PITCH) as usize + 1,
+        )
+    }
+
+    /// The first `n` nodes of a `cols`-wide lattice, row by row.
+    fn lattice(cols: usize, n: usize) -> Vec<(f64, f64)> {
+        (0..n).map(|k| node(k % cols, k / cols)).collect()
+    }
+
+    /// Hot pixels between horizontally adjacent nodes of a 8-wide lattice: 50 px from every star.
+    fn hot_pixels(n: usize) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|k| {
+                let (a, b) = (node(k % 7, k / 7), node(k % 7 + 1, k / 7));
+                (0.5 * (a.0 + b.0), a.1)
+            })
+            .collect()
+    }
+
+    /// `stars` plus one unseeded star 1.5x the brightest at `range_at` (it sets the plane's clip range: F-3's verdict
+    /// flags a fit above it), on sky 0.05 with Gaussian noise `SIGMA`.
+    fn render(
+        w: usize,
+        h: usize,
+        stars: &[MoffatStar],
+        range_at: (f64, f64),
+        noise_seed: u64,
+    ) -> Vec<f32> {
+        let mut field = stars.to_vec();
+        field.push(star(range_at.0, range_at.1, 0.45));
+        let mut data = moffat_field(w, h, &field, 4.0, 0.05);
+        add_noise(&mut data, SIGMA, noise_seed);
+        data
+    }
+
+    /// Adds `f(r)` at every pixel within `reach` px of `(x, y)`.
+    fn add_radial(
+        data: &mut [f32],
+        w: usize,
+        h: usize,
+        (x, y): (f64, f64),
+        reach: f64,
+        f: impl Fn(f64) -> f64,
+    ) {
+        for py in (y - reach).ceil().max(0.0) as usize..=((y + reach).floor() as usize).min(h - 1) {
+            for px in
+                (x - reach).ceil().max(0.0) as usize..=((x + reach).floor() as usize).min(w - 1)
+            {
+                let r = (px as f64 - x).hypot(py as f64 - y);
+                if r <= reach {
+                    data[py * w + px] += f(r) as f32;
+                }
+            }
+        }
+    }
+
+    /// A hot pixel the debayer spread over its neighbours: a Gaussian of sigma 0.65 px (FWHM 1.5 px).
+    fn add_hot_pixel(data: &mut [f32], w: usize, h: usize, at: (f64, f64), amp: f64) {
+        add_radial(data, w, h, at, 4.0, |r| {
+            amp * (-r * r / (2.0 * 0.65 * 0.65)).exp()
+        });
+    }
+
+    /// Light the fit's stamp does not hold and the star's far ring does not see: a Gaussian annulus (radius 14 px,
+    /// sigma 3 px) of peak `amp`, inside the growth aperture's 5F. It lifts `growth / model` of a faint star by an
+    /// additive amount, as the faint end of a real plane is lifted.
+    fn add_annulus(data: &mut [f32], w: usize, h: usize, at: (f64, f64), amp: f64) {
+        add_radial(data, w, h, at, 26.0, |r| {
+            amp * (-(r - 14.0) * (r - 14.0) / (2.0 * 9.0)).exp()
+        });
+    }
+
+    fn opts(seeds: Vec<Seed>, colour: bool) -> MeasureOptions {
+        MeasureOptions {
+            seeds: SeedSpec::Given(seeds),
+            psf_model: PsfModel::Fixed(4.0),
+            colour,
+            ..Default::default()
+        }
+    }
+
+    fn hot_seeds(at: &[(f64, f64)], amp: f64) -> Vec<Seed> {
+        at.iter()
+            .map(|&(x, y)| Seed {
+                x,
+                y,
+                peak: amp,
+                flux: 1.0,
+            })
+            .collect()
+    }
+
+    fn measure_one(w: usize, h: usize, data: &[f32], seeds: Vec<Seed>) -> PlaneMeasurement {
+        measure_plane(data, w, h, &opts(seeds, false), None)
+    }
+
+    /// One image of three planes through the stacking halves, as the adapter runs them: every plane prepared, the
+    /// cross-plane rule, each plane's siblings' seeds, every plane finished.
+    fn measure_three(
+        w: usize,
+        h: usize,
+        planes: &[Vec<f32>],
+        seeds: &[Vec<Seed>],
+    ) -> Vec<PlaneMeasurement> {
+        let o: Vec<MeasureOptions> = seeds.iter().map(|s| opts(s.clone(), true)).collect();
+        let mut preps: Vec<_> = planes
+            .iter()
+            .zip(&o)
+            .map(|(p, o)| prepare_plane(p, w, h, o, None))
+            .collect();
+        cross_plane_flags(&mut preps);
+        let siblings = sibling_seeds(&preps);
+        planes
+            .iter()
+            .zip(&o)
+            .zip(preps)
+            .zip(&siblings)
+            .map(|(((p, o), prep), sib)| finish_plane(p, w, h, o, prep, sib.as_deref(), None))
+            .collect()
+    }
+
+    /// 40 stars on every plane of an 8 x 5 lattice and 30 hot pixels on plane 0 alone, the planes `(clean, spiked)`.
+    fn three_planes(spiked: bool) -> (usize, usize, Vec<Vec<f32>>, Vec<Vec<Seed>>) {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let stars: Vec<MoffatStar> = nodes.iter().map(|&(x, y)| star(x, y, 0.3)).collect();
+        let hot = hot_pixels(30);
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let mut planes = Vec::new();
+        let mut seeds = Vec::new();
+        for p in 0..3u64 {
+            let mut data = render(w, h, &stars, range_at, 11 + p);
+            let mut s = seeds_of(&stars);
+            if spiked && p == 0 {
+                for &at in &hot {
+                    add_hot_pixel(&mut data, w, h, at, 0.2);
+                }
+                s.extend(hot_seeds(&hot, 0.2));
+            }
+            planes.push(data);
+            seeds.push(s);
+        }
+        (w, h, planes, seeds)
+    }
+
+    #[test]
+    fn point_source_screen_refuses_a_candidate_with_no_sibling_plane_fit() {
+        let (w, h, planes, seeds) = three_planes(true);
+        let m = measure_three(w, h, &planes, &seeds);
+        let (w, h, clean_planes, clean_seeds) = three_planes(false);
+        let clean = measure_three(w, h, &clean_planes, &clean_seeds);
+        assert_eq!(
+            m[0].point_source_screened, 30,
+            "the 30 hot pixels of plane 0"
+        );
+        assert_eq!(
+            m[0].aperture_stars, 40,
+            "the 40 stars, none of the hot pixels, are the sample"
+        );
+        assert_eq!(
+            (m[1].point_source_screened, m[2].point_source_screened),
+            (0, 0),
+            "every star of planes 1 and 2 has its counterpart"
+        );
+        assert_eq!(clean[0].point_source_screened, 0);
+        let (c, clean_c) = (
+            m[0].aperture_correction.expect("a c on the spiked plane"),
+            clean[0]
+                .aperture_correction
+                .expect("a c on the clean plane"),
+        );
+        assert!(
+            (c / clean_c - 1.0).abs() < 0.01,
+            "c {c} against the clean field's {clean_c}"
+        );
+    }
+
+    /// Three planes of 40 stars of Moffat alpha `alpha`; plane 0's stars (and seeds) sit `dx` px off the others'.
+    fn offset_planes(alpha: f64, dx: f64) -> (usize, usize, Vec<Vec<f32>>, Vec<Vec<Seed>>) {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let mk = |shift: f64| -> Vec<MoffatStar> {
+            nodes
+                .iter()
+                .map(|&(x, y)| MoffatStar {
+                    alpha_x: alpha,
+                    alpha_y: alpha,
+                    ..star(x + shift, y, 0.3)
+                })
+                .collect()
+        };
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let (mut planes, mut seeds) = (Vec::new(), Vec::new());
+        for p in 0..3u64 {
+            let stars = mk(if p == 0 { dx } else { 0.0 });
+            let mut field = stars.clone();
+            field.push(MoffatStar {
+                alpha_x: alpha,
+                alpha_y: alpha,
+                ..star(range_at.0, range_at.1, 0.45)
+            });
+            let mut data = moffat_field(w, h, &field, 4.0, 0.05);
+            add_noise(&mut data, SIGMA, 11 + p);
+            planes.push(data);
+            seeds.push(seeds_of(&stars));
+        }
+        (w, h, planes, seeds)
+    }
+
+    #[test]
+    fn point_source_screen_radius_grows_with_the_field_fwhm() {
+        // FWHM 8 px (alpha 9.2): radius 4 px, the 2.5 px dispersion offset is no hot pixel.
+        let (w, h, planes, seeds) = offset_planes(9.2, 2.5);
+        let wide = measure_three(w, h, &planes, &seeds);
+        assert_eq!(wide[0].point_source_screened, 0, "FWHM 8: radius 4 px");
+        assert!(wide[0].aperture_stars >= 15, "{}", wide[0].aperture_stars);
+        // FWHM 2 px (alpha 2.3): radius stays 1.5 px, the same offset is screened.
+        let (w, h, planes, seeds) = offset_planes(2.3, 2.5);
+        let narrow = measure_three(w, h, &planes, &seeds);
+        assert!(
+            narrow[0].point_source_screened >= 20,
+            "FWHM 2: radius 1.5 px: {}",
+            narrow[0].point_source_screened
+        );
+    }
+
+    #[test]
+    fn point_source_screen_leaves_a_two_plane_image_alone() {
+        let (w, h, planes, seeds) = three_planes(true);
+        let o: Vec<MeasureOptions> = seeds[..2].iter().map(|s| opts(s.clone(), true)).collect();
+        let mut preps: Vec<_> = planes[..2]
+            .iter()
+            .zip(&o)
+            .map(|(p, o)| prepare_plane(p, w, h, o, None))
+            .collect();
+        cross_plane_flags(&mut preps);
+        assert_eq!(sibling_seeds(&preps), vec![None, None]);
+    }
+
+    #[test]
+    fn point_source_screen_leaves_a_mono_plane_alone() {
+        let (w, h, planes, seeds) = three_planes(true);
+        let m = measure_one(w, h, &planes[0], seeds[0].clone());
+        assert_eq!(
+            m.point_source_screened, 0,
+            "one plane: no sibling, no screen"
+        );
+        assert!(
+            m.aperture_stars > 40,
+            "the hot pixels stay in the sample: {}",
+            m.aperture_stars
+        );
+        // The stacking halves of one plane hand no siblings either.
+        let o = opts(seeds[0].clone(), false);
+        let mut preps = vec![prepare_plane(&planes[0], w, h, &o, None)];
+        cross_plane_flags(&mut preps);
+        assert_eq!(sibling_seeds(&preps), vec![None]);
+        let again = finish_plane(&planes[0], w, h, &o, preps.remove(0), None, None);
+        assert_eq!(
+            (again.point_source_screened, again.aperture_stars),
+            (0, m.aperture_stars)
+        );
+    }
+
+    #[test]
+    fn point_source_screen_refusing_every_star_floors_c_and_warns() {
+        // Plane 0 holds the hot pixels alone; planes 1 and 2 hold the stars, nothing within 1.5 px of a hot pixel.
+        let (w, h, mut planes, mut seeds) = three_planes(false);
+        let hot = hot_pixels(30);
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let mut only = render(w, h, &[], range_at, 11);
+        for &at in &hot {
+            add_hot_pixel(&mut only, w, h, at, 0.2);
+        }
+        planes[0] = only;
+        seeds[0] = hot_seeds(&hot, 0.2);
+        let (m, text) =
+            crate::stacking::telemetry::capture_logs(|| measure_three(w, h, &planes, &seeds));
+        assert!(
+            m[0].stars.len() >= 20,
+            "the fixture's hot pixels are fitted: {}",
+            m[0].stars.len()
+        );
+        assert_eq!(m[0].aperture_correction, None, "floor (i): c = 1");
+        assert_eq!(m[0].aperture_stars, 0);
+        assert!(
+            m[0].point_source_screened >= 20,
+            "{}",
+            m[0].point_source_screened
+        );
+        assert_eq!(
+            m[0].aperture_below_snr, 0,
+            "the screen comes first: nothing is left for the floor"
+        );
+        let warn = text
+            .lines()
+            .find(|l| l.contains("fewer than 5 isolated unsaturated stars"))
+            .unwrap_or_else(|| panic!("the floor-(i) warn:\n{text}"));
+        assert!(
+            warn.contains(&format!("point_source={}", m[0].point_source_screened)),
+            "{warn}"
+        );
+        assert!(m[1].aperture_correction.is_some() && m[2].aperture_correction.is_some());
+    }
+
+    /// 70 stars of a 10 x 7 lattice, 30 bright (0.3) and 40 faint (0.01, SNR about 10), each faint one on an annulus of
+    /// additive light, and a copy of the field holding the 30 bright stars alone, the same noise.
+    fn bright_and_faint(n_bright: usize, n_faint: usize) -> (usize, usize, Vec<f32>, Vec<Seed>) {
+        let (cols, n) = (10, n_bright + n_faint);
+        let (w, h) = size(cols, n.div_ceil(cols));
+        let nodes = lattice(cols, n);
+        // Interleaved: node k is bright when k mod 7 < 3 (30 of 70), else faint; for other counts the first n_bright
+        // of the nodes in that order.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&k| (k % 7 >= 3, k));
+        let bright_nodes: Vec<usize> = order[..n_bright].to_vec();
+        let mut stars = Vec::new();
+        for (k, &(x, y)) in nodes.iter().enumerate() {
+            stars.push(star(
+                x,
+                y,
+                if bright_nodes.contains(&k) { 0.3 } else { 0.01 },
+            ));
+        }
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let mut data = render(w, h, &stars, range_at, 21);
+        for (k, &(x, y)) in nodes.iter().enumerate() {
+            if !bright_nodes.contains(&k) {
+                add_annulus(&mut data, w, h, (x, y), 0.002);
+            }
+        }
+        (w, h, data, seeds_of(&stars))
+    }
+
+    #[test]
+    fn c_sample_skips_candidates_below_snr_twenty() {
+        let (w, h, data, seeds) = bright_and_faint(30, 40);
+        let m = measure_one(w, h, &data, seeds);
+        assert_eq!(m.aperture_below_snr, 40, "the 40 faint stars");
+        assert_eq!(m.aperture_stars, 30, "the 30 bright stars are the sample");
+        assert!(
+            m.aperture_ratios.iter().all(|r| r.ratio < 2.0),
+            "no faint star's lifted ratio in the sample: {:?}",
+            m.aperture_ratios
+        );
+        // The bright-only field: the same 30 stars, the same noise, no faint star at all.
+        let (bw, bh, bdata, bseeds) = {
+            let (w, h) = size(10, 7);
+            let nodes = lattice(10, 70);
+            let bright: Vec<MoffatStar> = nodes
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| k % 7 < 3)
+                .map(|(_, &(x, y))| star(x, y, 0.3))
+                .collect();
+            let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+            (w, h, render(w, h, &bright, range_at, 21), seeds_of(&bright))
+        };
+        let only = measure_one(bw, bh, &bdata, bseeds);
+        assert_eq!(only.aperture_below_snr, 0);
+        let (c, c_only) = (
+            m.aperture_correction.expect("c"),
+            only.aperture_correction.expect("the bright-only c"),
+        );
+        assert!(
+            (c / c_only - 1.0).abs() < 0.005,
+            "c {c} against the bright-only median {c_only}"
+        );
+    }
+
+    #[test]
+    fn c_sample_with_six_candidates_above_snr_twenty_takes_all_six_once() {
+        let (w, h, data, seeds) = bright_and_faint(6, 26);
+        let m = measure_one(w, h, &data, seeds);
+        assert_eq!(m.aperture_below_snr, 26);
+        assert_eq!(m.aperture_stars, 6);
+        assert_eq!(m.aperture_ratios.len(), 6);
+        assert!(
+            m.aperture_ratios
+                .windows(2)
+                .all(|p| p[0].model > p[1].model),
+            "brightest first, each once: {:?}",
+            m.aperture_ratios
+        );
+        assert!(
+            m.aperture_stars >= CORRECTION_MIN_RATIOS && m.aperture_correction.is_some(),
+            "six is enough for a c"
+        );
+    }
+
+    /// A pin (ruling F28, true before and after B4): a field of exactly 64 equal-flux qualifiers, every one above SNR 20
+    /// and with a counterpart, is the sample whole, and `c` is the median of its 64 ratios.
+    #[test]
+    fn c_on_a_bright_only_field_equals_the_top_sixty_four_median() {
+        let (w, h) = size(8, 8);
+        let stars: Vec<MoffatStar> = lattice(8, 64)
+            .iter()
+            .map(|&(x, y)| star(x, y, 0.3))
+            .collect();
+        let data = render(w, h, &stars, (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0), 31);
+        let m = measure_one(w, h, &data, seeds_of(&stars));
+        assert_eq!(m.aperture_stars, CORRECTION_STARS);
+        assert_eq!(m.aperture_ratios.len(), CORRECTION_STARS);
+        assert_eq!((m.point_source_screened, m.aperture_below_snr), (0, 0));
+        let mut ratios: Vec<f64> = m.aperture_ratios.iter().map(|r| r.ratio).collect();
+        let median = crate::star_measure::robust::median_f64(&mut ratios);
+        assert_eq!(m.aperture_correction, Some(median));
     }
 }
