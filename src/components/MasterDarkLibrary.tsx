@@ -3,7 +3,7 @@ import { api } from '../api';
 import { ArrowLeft, Pencil } from "lucide-react";
 import { CalibrationSetDetail } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
-import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
+import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode, matchesLibraryFilters } from "./DarkLibraryFilters";
 import BulkEditMetadataModal from "./BulkEditMetadataModal";
 
 interface MasterDarkLibraryProps {
@@ -75,47 +75,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
 
   // Apply filters to sets
   const filteredSets = useMemo(() => {
-    return sets.filter(set => {
-      // Type filter
-      if (filters.type !== null && set.imagetyp !== filters.type) {
-        return false;
-      }
-
-      // Exposure filter
-      if (filters.exposure !== null && set.exptime !== filters.exposure) {
-        return false;
-      }
-
-      // Temperature band filter
-      if (filters.tempBand !== null) {
-        const temp = set.ccd_temp;
-        const match = filters.tempBand.match(/(-?\d+) to (-?\d+)/);
-        if (match) {
-          const min = parseInt(match[1]);
-          const max = parseInt(match[2]);
-          if (temp < min || temp >= max) {
-            return false;
-          }
-        }
-      }
-
-      // Date range filter
-      if (filters.dateFrom !== null) {
-        const setDate = set.date_start.split('T')[0];
-        if (setDate < filters.dateFrom) {
-          return false;
-        }
-      }
-
-      if (filters.dateTo !== null) {
-        const setDate = set.date_end.split('T')[0];
-        if (setDate > filters.dateTo) {
-          return false;
-        }
-      }
-
-      return true;
-    });
+    return sets.filter(set => matchesLibraryFilters(set, filters));
   }, [sets, filters]);
 
   return (

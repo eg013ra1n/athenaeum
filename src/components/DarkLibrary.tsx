@@ -3,7 +3,7 @@ import { api } from '../api';
 import { ArrowLeft } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
-import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
+import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode, matchesLibraryFilters } from "./DarkLibraryFilters";
 import { CalibrationPicker } from "./calibration/CalibrationPicker";
 
 export interface LibraryStats {
@@ -98,60 +98,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
 
   // Apply user filters to sets
   const filteredSets = useMemo(() => {
-    return tabFilteredSets.filter(set => {
-      // Type filter (from user selection) - darks mode only
-      if (filters.type !== null && set.imagetyp !== filters.type) {
-        return false;
-      }
-
-      // Optical filter (for flats)
-      if (filters.filter !== null && set.filter !== filters.filter) {
-        return false;
-      }
-
-      // Exposure filter (exact match - darks mode)
-      if (filters.exposure !== null && set.exptime !== filters.exposure) {
-        return false;
-      }
-
-      // Exposure range filter (flats mode)
-      if (filters.expFrom !== null && set.exptime !== null && set.exptime < filters.expFrom) {
-        return false;
-      }
-      if (filters.expTo !== null && set.exptime !== null && set.exptime > filters.expTo) {
-        return false;
-      }
-
-      // Temperature band filter
-      if (filters.tempBand !== null) {
-        const temp = set.ccd_temp;
-        const match = filters.tempBand.match(/(-?\d+) to (-?\d+)/);
-        if (match) {
-          const min = parseInt(match[1]);
-          const max = parseInt(match[2]);
-          if (temp < min || temp >= max) {
-            return false;
-          }
-        }
-      }
-
-      // Date range filter
-      if (filters.dateFrom !== null) {
-        const setDate = set.date_start.split('T')[0];
-        if (setDate < filters.dateFrom) {
-          return false;
-        }
-      }
-
-      if (filters.dateTo !== null) {
-        const setDate = set.date_end.split('T')[0];
-        if (setDate > filters.dateTo) {
-          return false;
-        }
-      }
-
-      return true;
-    });
+    return tabFilteredSets.filter(set => matchesLibraryFilters(set, filters));
   }, [tabFilteredSets, filters]);
 
   // Report stats to parent when filtered sets change

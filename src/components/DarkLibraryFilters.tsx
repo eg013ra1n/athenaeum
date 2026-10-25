@@ -14,6 +14,10 @@ export interface FilterState {
   expTo: number | null;
   dateFrom: string | null;
   dateTo: string | null;
+  gain: number | null;
+  binning: string | null;
+  /** `sizeKey` spelling, e.g. `9576×6388`. */
+  size: string | null;
 }
 
 interface DarkLibraryFiltersProps {
@@ -33,7 +37,42 @@ export const emptyFilters: FilterState = {
   expTo: null,
   dateFrom: null,
   dateTo: null,
+  gain: null,
+  binning: null,
+  size: null,
 };
+
+/** A set's frame size as `9576×6388`, or null when it records none. */
+export function sizeKey(set: Pick<CalibrationSetDetail, 'naxis1' | 'naxis2'>): string | null {
+  return set.naxis1 != null && set.naxis2 != null ? `${set.naxis1}×${set.naxis2}` : null;
+}
+
+/** The one predicate behind every calibration-library page: a filter left at
+ *  null passes, so a mode that never shows a control never narrows by it. */
+export function matchesLibraryFilters(set: CalibrationSetDetail, filters: FilterState): boolean {
+  if (filters.type !== null && set.imagetyp !== filters.type) return false;
+  if (filters.filter !== null && set.filter !== filters.filter) return false;
+  if (filters.exposure !== null && set.exptime !== filters.exposure) return false;
+  if (filters.expFrom !== null && set.exptime !== null && set.exptime < filters.expFrom) return false;
+  if (filters.expTo !== null && set.exptime !== null && set.exptime > filters.expTo) return false;
+  if (filters.gain !== null && set.gain !== filters.gain) return false;
+  if (filters.binning !== null && set.binning !== filters.binning) return false;
+  if (filters.size !== null && sizeKey(set) !== filters.size) return false;
+
+  if (filters.tempBand !== null) {
+    const match = filters.tempBand.match(/(-?\d+) to (-?\d+)/);
+    if (match) {
+      const min = parseInt(match[1]);
+      const max = parseInt(match[2]);
+      if (set.ccd_temp < min || set.ccd_temp >= max) return false;
+    }
+  }
+
+  if (filters.dateFrom !== null && set.date_start.split('T')[0] < filters.dateFrom) return false;
+  if (filters.dateTo !== null && set.date_end.split('T')[0] > filters.dateTo) return false;
+
+  return true;
+}
 
 export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode, actions }: DarkLibraryFiltersProps) {
   // Extract unique values from sets
@@ -41,6 +80,11 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
     const types = Array.from(new Set(sets.map(s => s.imagetyp))).sort();
     const exposures = Array.from(new Set(sets.map(s => s.exptime).filter((e): e is number => e !== null))).sort((a, b) => a - b);
     const opticalFilters = Array.from(new Set(sets.map(s => s.filter).filter((f): f is string => f !== null && f !== ""))).sort();
+    const gains = Array.from(new Set(sets.map(s => s.gain).filter((g): g is number => g !== null))).sort((a, b) => a - b);
+    const binnings = Array.from(new Set(sets.map(s => s.binning).filter((b): b is string => b !== null && b !== ""))).sort();
+    // Largest frame first: the full sensor, then the sub-frames.
+    const area = (k: string) => k.split('×').reduce((p, n) => p * Number(n), 1);
+    const sizes = Array.from(new Set(sets.map(sizeKey).filter((k): k is string => k !== null))).sort((a, b) => area(b) - area(a));
 
     // Generate temperature bands (5°C steps)
     const temps = sets.map(s => s.ccd_temp).filter(t => t !== null && t !== undefined);
@@ -61,14 +105,14 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
     const minExp = exposures.length > 0 ? Math.min(...exposures) : 0;
     const maxExp = exposures.length > 0 ? Math.max(...exposures) : 0;
 
-    return { types, exposures, tempBands, opticalFilters, minDate, maxDate, minExp, maxExp };
+    return { types, exposures, tempBands, opticalFilters, gains, binnings, sizes, minDate, maxDate, minExp, maxExp };
   }, [sets]);
 
   const handleSelectChange = (field: keyof FilterState, value: string) => {
     let newValue: any = value === "" ? null : value;
 
     // Convert to number for numeric fields
-    if ((field === "exposure" || field === "expFrom" || field === "expTo") && value !== "") {
+    if ((field === "exposure" || field === "expFrom" || field === "expTo" || field === "gain") && value !== "") {
       newValue = parseFloat(value);
     }
 
@@ -205,6 +249,55 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
             <span className="text-xs text-content-muted">s</span>
           </div>
         </>
+      )}
+
+      {/* Gain, Binning, Size - both modes */}
+      {uniqueValues.gains.length > 0 && (
+        <div className="flex items-center">
+          <span className={labelClass}>Gain:</span>
+          <select
+            value={filters.gain?.toString() || ""}
+            onChange={(e) => handleSelectChange("gain", e.target.value)}
+            className={selectClass}
+          >
+            <option value="">All</option>
+            {uniqueValues.gains.map(g => (
+              <option key={g} value={g}>{g}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {uniqueValues.binnings.length > 0 && (
+        <div className="flex items-center">
+          <span className={labelClass}>Bin:</span>
+          <select
+            value={filters.binning || ""}
+            onChange={(e) => handleSelectChange("binning", e.target.value)}
+            className={selectClass}
+          >
+            <option value="">All</option>
+            {uniqueValues.binnings.map(b => (
+              <option key={b} value={b}>{b}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {uniqueValues.sizes.length > 0 && (
+        <div className="flex items-center">
+          <span className={labelClass}>Size:</span>
+          <select
+            value={filters.size || ""}
+            onChange={(e) => handleSelectChange("size", e.target.value)}
+            className={selectClass}
+          >
+            <option value="">All</option>
+            {uniqueValues.sizes.map(k => (
+              <option key={k} value={k}>{k}</option>
+            ))}
+          </select>
+        </div>
       )}
 
       {/* Date Range - both modes */}

@@ -10,6 +10,7 @@ import { describeRecipeJson } from '../utils/recipeFormat';
 import BlinkViewer from "./BlinkViewer";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ArchiveProgress } from "./archive/ArchiveProgress";
+import { geometryLabel } from "./calibration/pickerModel";
 
 const CONSUMER_INITIAL_VISIBLE = 8;
 
@@ -28,7 +29,7 @@ interface CalibrationSetTableProps {
   buildingSetIds?: number[];
 }
 
-type SortField = "id" | "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
+type SortField = "id" | "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "size" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
 export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration, customMetadataSetIds = [], highlightSetId, onCreateMaster, buildingSetIds }: CalibrationSetTableProps) {
@@ -250,8 +251,13 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
 
   // Sort sets
   const sortedSets = [...sets].sort((a, b) => {
-    let aVal: any = a[sortField];
-    let bVal: any = b[sortField];
+    // Size sorts by pixel count; every other field by its own value.
+    const valueOf = (s: CalibrationSetDetail): any =>
+      sortField === "size"
+        ? (s.naxis1 != null && s.naxis2 != null ? s.naxis1 * s.naxis2 : null)
+        : s[sortField];
+    let aVal: any = valueOf(a);
+    let bVal: any = valueOf(b);
 
     // Handle null values
     if (aVal === null || aVal === undefined) return 1;
@@ -376,6 +382,15 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
               >
                 Binning
                 <SortIcon field="binning" />
+              </button>
+            </th>
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+              <button
+                onClick={() => handleSort("size")}
+                className="flex items-center gap-1 hover:text-content transition-colors"
+              >
+                Size
+                <SortIcon field="size" />
               </button>
             </th>
             <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
@@ -526,6 +541,11 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     {set.binning || "N/A"}
                   </td>
 
+                  {/* Size (+ sub-frame origin when the set records one) */}
+                  <td className="px-4 py-1 text-sm text-content whitespace-nowrap">
+                    {geometryLabel(set) ?? "—"}
+                  </td>
+
                   {/* Date Range */}
                   <td className="px-4 py-1 text-sm">
                     <div className="flex flex-col">
@@ -605,14 +625,8 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     key={`${rowId}-expanded`}
                     className="bg-surface border-t border-border"
                   >
-                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-1">
+                    <td colSpan={showFilterColumn ? 12 : 11} className="px-4 py-1">
                       <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
-                        <div>
-                          <span className="text-content-muted">Resolution:</span>
-                          <span className="ml-2 text-content">
-                            {set.naxis1 && set.naxis2 ? `${set.naxis1} × ${set.naxis2}` : "—"}
-                          </span>
-                        </div>
                         <div>
                           <span className="text-content-muted">Bayer:</span>
                           <span className="ml-2 text-content">
