@@ -1283,8 +1283,11 @@ fn get_calibration_hierarchy_with_cache(
     frame_set_id: i64,
     light_cache: &mut crate::calibration::geometry::LightGeometryCache,
 ) -> Result<CalibrationHierarchyView> {
-    // Step 1: Get all LIGHT frames in the frame set with metadata
-    let mut stmt = conn.prepare(
+    // Step 1: Get all LIGHT frames in the frame set with metadata. A light in
+    // the Black Hole stays in the tree (the page lists it apart) but is left
+    // out of the header's totals: it is a rejected light, not stacked or
+    // exported (`super::FRAME_NOT_IN_BLACK_HOLE_SQL`, column `in_use`).
+    let mut stmt = conn.prepare(&format!(
         "SELECT
             f.id,
             f.file_id,
@@ -1312,7 +1315,8 @@ fn get_calibration_hierarchy_with_cache(
             n.start_time as night_start,
             n.end_time as night_end,
             f.naxis1,
-            f.naxis2
+            f.naxis2,
+            {not_blackholed} AS in_use
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          LEFT JOIN plate_solves ps ON ps.frame_id = f.id
@@ -1321,7 +1325,8 @@ fn get_calibration_hierarchy_with_cache(
          JOIN imaging_nights n ON n.id = s.imaging_night_id
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
          ORDER BY n.start_time DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs",
-    )?;
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
 
     // Collect raw frame data
     struct RawFrame {
@@ -1352,6 +1357,8 @@ fn get_calibration_hierarchy_with_cache(
         night_end: String,
         naxis1: Option<i32>,
         naxis2: Option<i32>,
+        /// Not in the Black Hole: counted in the totals.
+        in_use: bool,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1384,11 +1391,12 @@ fn get_calibration_hierarchy_with_cache(
                 night_end: row.get(24)?,
                 naxis1: row.get(25)?,
                 naxis2: row.get(26)?,
+                in_use: row.get(27)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
 
-    let total_frames = frames.len();
+    let total_frames = frames.iter().filter(|f| f.in_use).count();
 
     // Step 2: Build hierarchy using nested HashMaps
     // night -> camera -> filter -> frames
@@ -1533,7 +1541,9 @@ fn get_calibration_hierarchy_with_cache(
                         // Track if we have calibration
                         let has_any_calibration =
                             status.has_flats || status.has_darks || status.has_bias;
-                        if has_any_calibration {
+                        if !raw_frame.in_use {
+                            // Blackholed: listed, not counted.
+                        } else if has_any_calibration {
                             calibrated_frames += 1;
                         } else {
                             uncalibrated_frames += 1;
@@ -2263,6 +2273,43 @@ mod night_grouping_tests {
         assert!(super::frame_set_ids_for_frames(&conn, &[999])
             .unwrap()
             .is_empty());
+    }
+
+    /// The set header's frames / calibrated / uncalibrated leave out a light
+    /// in the Black Hole (a rejected light, not stacked or exported); the
+    /// tree still carries it so the page can list it apart.
+    #[test]
+    fn hierarchy_totals_leave_out_a_blackholed_light() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'Horsehead')", [])
+            .unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[
+                (10, "2025-10-18T18:00:00Z"),
+                (11, "2025-10-18T18:05:00Z"),
+                (12, "2025-10-18T18:10:00Z"),
+            ],
+        );
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+             VALUES (12, 'test', '2026-01-01T00:00:00Z', '/t/12.fits')",
+            [],
+        )
+        .unwrap();
+
+        let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
+        assert_eq!(view.total_frames, 2);
+        assert_eq!(view.calibrated_frames + view.uncalibrated_frames, 2);
+        let listed: usize = view.date_groups[0].camera_groups[0]
+            .filter_groups
+            .iter()
+            .map(|g| g.light_frames.len())
+            .sum();
+        assert_eq!(listed, 3, "the blackholed light is still listed");
     }
 
     /// R3: the hierarchy view carries each light's size and each set's

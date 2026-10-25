@@ -141,9 +141,16 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
 - **objctra, objctdec:** spherical mean of the member coordinates
 - **total_exp_time:** sum of exposure times. The stored column is refreshed by merge / re-derive only, so the
   listing (`get_frames_sets_by_project`, which feeds the Objects cards, the table and the set header) reads the
-  members' live sum instead (`db::FRAME_SET_MEMBER_EXPOSURE_SQL`) — the same membership its frame count reads. A set
+  members' live sum instead (`db::frame_set_member_exposure_sql`) — the same membership its frame count reads. A set
   emptied another way showed "0 frames · 1.7 h" before 2026-10-25 ("LDN 621", "Unlocated Frames M4" on the dev
   catalog: their frames were re-ingested under new ids into another set); seven sets there carried a stale sum.
+- **A light in the Black Hole is a rejected light** and is left out of every light count and exposure a frame set
+  shows: the listing's count and hours (Objects cards and table), the export picker
+  (`export::get_exportable_frame_sets`), the set header's frames / calibrated / uncalibrated
+  (`CalibrationHierarchyView` totals; the hierarchy still carries the blackholed lights so the page can list them
+  apart) and the Stacking tab's frame list — the same `db::FRAME_NOT_IN_BLACK_HOLE_SQL` predicate stacking, export,
+  the send and the readiness count use. Set 182 (164 lights, 25 blackholed) reads 139 everywhere. Restoring the
+  file brings the light back.
 - rotation: circular mean plus min/max of the member rotations
 
 **Why spherical mean?** Simple averaging fails near the RA wrap: RA 359 and RA 1 average to 180 degrees, while the spherical mean is 0.

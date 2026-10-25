@@ -359,7 +359,9 @@ export default function FrameSetDetail() {
   // read straight off `detail.nights` — the same tree every other tab on
   // this page ultimately derives its frame lists from — rather than a
   // second fetch. Same imagetyp+format filter `handleBlink` above already
-  // uses (a stacking run only ever reads FITS/XISF light frames).
+  // uses (a stacking run only ever reads FITS/XISF light frames). A light in
+  // the Black Hole is left out: it is a rejected light the plan and the run
+  // never use, so listing it as "Included" would contradict them.
   const stackingLightFrames = useMemo(() => {
     if (!detail) return [];
     const out: { frameId: number; filename: string }[] = [];
@@ -369,7 +371,8 @@ export default function FrameSetDetail() {
           if (
             fw.frame?.imagetyp === 'Light' &&
             fw.frame.id != null &&
-            (fw.file.format === 'FITS' || fw.file.format === 'XISF')
+            (fw.file.format === 'FITS' || fw.file.format === 'XISF') &&
+            !(fw.file.id != null && blackholedFileIds.has(fw.file.id))
           ) {
             out.push({ frameId: fw.frame.id, filename: fw.file.filename });
           }
@@ -377,7 +380,7 @@ export default function FrameSetDetail() {
       }
     }
     return out;
-  }, [detail]);
+  }, [detail, blackholedFileIds]);
 
   // Frame id → contributor state for the lights table's "Project" column
   // (spec §8.1–§8.2). Only the first link's frame list is used — a set is

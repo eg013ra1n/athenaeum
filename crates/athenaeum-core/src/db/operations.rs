@@ -2659,29 +2659,44 @@ pub fn create_frames_set(
 /// Frames M4" with 0 frames and 1.7 h / 2.5 h (2026-10-25). Reading the sum
 /// from the same membership the frame count reads means the two can never
 /// disagree.
-pub(crate) const FRAME_SET_MEMBER_EXPOSURE_SQL: &str = "(SELECT SUM(mf.exptime) FROM frames mf
-      WHERE mf.id IN (SELECT msm.frame_id FROM session_members msm
-                      JOIN sessions ms ON ms.id = msm.session_id
-                      JOIN imaging_nights mn ON mn.id = ms.imaging_night_id
-                      WHERE mn.frames_set_id = fs.id))";
+///
+/// A light in the Black Hole is a rejected light: it is neither counted nor
+/// summed here ([`super::FRAME_NOT_IN_BLACK_HOLE_SQL`]), so the hours agree
+/// with what stacking and export use. Restoring the file brings it back.
+pub(crate) fn frame_set_member_exposure_sql() -> String {
+    format!(
+        "(SELECT SUM(f.exptime) FROM frames f
+          WHERE f.id IN (SELECT msm.frame_id FROM session_members msm
+                         JOIN sessions ms ON ms.id = msm.session_id
+                         JOIN imaging_nights mn ON mn.id = ms.imaging_night_id
+                         WHERE mn.frames_set_id = fs.id)
+            AND {not_blackholed})",
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    )
+}
 
-/// Get all frames sets with member counts. `total_exp_time` is the members'
-/// live sum ([`FRAME_SET_MEMBER_EXPOSURE_SQL`]), not the stored aggregate.
+/// Get all frames sets with member counts. The count and `total_exp_time`
+/// cover the members outside the Black Hole only — the lights stacking and
+/// export use ([`super::FRAME_NOT_IN_BLACK_HOLE_SQL`]); the exposure is the
+/// members' live sum ([`frame_set_member_exposure_sql`]), not the stored
+/// aggregate.
 pub fn get_frames_sets_by_project(
     conn: &Connection,
     _project_id: i64, // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, {exposure}, fs.flat_pattern,
-                COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
+                COUNT(DISTINCT f.id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
                 fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at, fs.calibrated_externally, fs.attested_at
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
          LEFT JOIN session_members sm ON s.id = sm.session_id
+         LEFT JOIN frames f ON f.id = sm.frame_id AND {not_blackholed}
          GROUP BY fs.id
          ORDER BY fs.date_obs_start DESC, fs.name ASC",
-        exposure = FRAME_SET_MEMBER_EXPOSURE_SQL,
+        exposure = frame_set_member_exposure_sql(),
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
     ))?;
 
     let sets = stmt.query_map(params![], |row| {

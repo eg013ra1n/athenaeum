@@ -28,7 +28,10 @@ pub struct ExportableFrameSet {
 /// Get a list of available frame sets for export
 pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFrameSet>> {
     // Exposure summed from the members like the frame count beside it
-    // (`db::FRAME_SET_MEMBER_EXPOSURE_SQL`), never the stored aggregate.
+    // (`db::frame_set_member_exposure_sql`), never the stored aggregate. The
+    // count, the exposure and the filter list leave out a light in the Black
+    // Hole (`db::FRAME_NOT_IN_BLACK_HOLE_SQL`): it is not exported, so the
+    // picker does not offer it.
     let mut stmt = conn
         .prepare(&format!(
             "SELECT fs.id, fs.name, {exposure},
@@ -36,7 +39,8 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
                      JOIN frames f ON sm.frame_id = f.id
-                     WHERE i.frames_set_id = fs.id AND f.imagetyp = 'Light') as frame_count,
+                     WHERE i.frames_set_id = fs.id AND f.imagetyp = 'Light'
+                       AND {not_blackholed}) as frame_count,
                     (SELECT f.object FROM session_members sm
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
@@ -47,10 +51,12 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
                      JOIN frames f ON sm.frame_id = f.id
-                     WHERE i.frames_set_id = fs.id AND f.filter IS NOT NULL) as filters
+                     WHERE i.frames_set_id = fs.id AND f.filter IS NOT NULL
+                       AND {not_blackholed}) as filters
              FROM frames_set fs
              ORDER BY fs.id DESC",
-            exposure = crate::db::FRAME_SET_MEMBER_EXPOSURE_SQL,
+            exposure = crate::db::frame_set_member_exposure_sql(),
+            not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
         ))?;
 
     let frame_sets = stmt
@@ -399,6 +405,41 @@ mod tests {    use super::*;
             params![frame_id, set_id, cal_type],
         )
         .unwrap();
+    }
+
+    /// A light in the Black Hole is a rejected light: the export picker and
+    /// the frame-set listing (Objects cards, table, set header) neither count
+    /// it nor sum its hours, like stacking and export (set 182 read 164 lights
+    /// with 25 blackholed; it now reads 139). Restoring it brings it back.
+    #[test]
+    fn a_blackholed_light_is_not_counted_or_summed_by_the_picker_or_the_listing() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        seed_light(&conn, 11, session, Some("Ha"));
+        seed_light(&conn, 12, session, Some("OIII"));
+        for frame_id in [11_i64, 12] {
+            conn.execute(
+                "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+                 VALUES (?1, 'test', '2026-07-06T00:00:00Z', '/test')",
+                params![frame_id + 2_000_000],
+            )
+            .unwrap();
+        }
+
+        let picker = &get_exportable_frame_sets(&conn).unwrap()[0];
+        assert_eq!(picker.frame_count, 1);
+        assert_eq!(picker.total_exposure_seconds, 300.0);
+        assert_eq!(picker.filters, vec!["Ha".to_string()], "OIII is all blackholed");
+        let (set, count) = &crate::db::get_frames_sets_by_project(&conn, 1).unwrap()[0];
+        assert_eq!(*count, 1);
+        assert_eq!(set.total_exp_time, Some(300.0));
+
+        conn.execute("DELETE FROM black_hole", []).unwrap();
+        let picker = &get_exportable_frame_sets(&conn).unwrap()[0];
+        assert_eq!((picker.frame_count, picker.total_exposure_seconds), (3, 900.0));
+        let (set, count) = &crate::db::get_frames_sets_by_project(&conn, 1).unwrap()[0];
+        assert_eq!((*count, set.total_exp_time), (3, Some(900.0)));
     }
 
     #[test]
