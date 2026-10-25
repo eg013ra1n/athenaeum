@@ -27,9 +27,11 @@ pub struct ExportableFrameSet {
 
 /// Get a list of available frame sets for export
 pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFrameSet>> {
+    // Exposure summed from the members like the frame count beside it
+    // (`db::FRAME_SET_MEMBER_EXPOSURE_SQL`), never the stored aggregate.
     let mut stmt = conn
-        .prepare(
-            "SELECT fs.id, fs.name, fs.total_exp_time,
+        .prepare(&format!(
+            "SELECT fs.id, fs.name, {exposure},
                     (SELECT COUNT(*) FROM session_members sm
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
@@ -48,7 +50,8 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
                      WHERE i.frames_set_id = fs.id AND f.filter IS NOT NULL) as filters
              FROM frames_set fs
              ORDER BY fs.id DESC",
-        )?;
+            exposure = crate::db::FRAME_SET_MEMBER_EXPOSURE_SQL,
+        ))?;
 
     let frame_sets = stmt
         .query_map([], |row| {

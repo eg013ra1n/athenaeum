@@ -2648,13 +2648,31 @@ pub fn create_frames_set(
     Ok(conn.last_insert_rowid())
 }
 
-/// Get all frames sets with member counts
+/// A frame set's total exposure (seconds), summed over its member frames at
+/// read time — for a query that aliases `frames_set` as `fs`. NULL for a set
+/// with no members, like `frames_set_metadata` stores it.
+///
+/// The stored `frames_set.total_exp_time` is written by the merge / re-derive
+/// paths only, so a set that loses members any other way (its frames were
+/// re-ingested under new ids after a scan root was removed and re-added)
+/// kept its old hours: the Objects page showed "LDN 621" and "Unlocated
+/// Frames M4" with 0 frames and 1.7 h / 2.5 h (2026-10-25). Reading the sum
+/// from the same membership the frame count reads means the two can never
+/// disagree.
+pub(crate) const FRAME_SET_MEMBER_EXPOSURE_SQL: &str = "(SELECT SUM(mf.exptime) FROM frames mf
+      WHERE mf.id IN (SELECT msm.frame_id FROM session_members msm
+                      JOIN sessions ms ON ms.id = msm.session_id
+                      JOIN imaging_nights mn ON mn.id = ms.imaging_night_id
+                      WHERE mn.frames_set_id = fs.id))";
+
+/// Get all frames sets with member counts. `total_exp_time` is the members'
+/// live sum ([`FRAME_SET_MEMBER_EXPOSURE_SQL`]), not the stored aggregate.
 pub fn get_frames_sets_by_project(
     conn: &Connection,
     _project_id: i64, // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
-    let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
+    let mut stmt = conn.prepare(&format!(
+        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, {exposure}, fs.flat_pattern,
                 COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
                 fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at, fs.calibrated_externally, fs.attested_at
          FROM frames_set fs
@@ -2662,8 +2680,9 @@ pub fn get_frames_sets_by_project(
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
          LEFT JOIN session_members sm ON s.id = sm.session_id
          GROUP BY fs.id
-         ORDER BY fs.date_obs_start DESC, fs.name ASC"
-    )?;
+         ORDER BY fs.date_obs_start DESC, fs.name ASC",
+        exposure = FRAME_SET_MEMBER_EXPOSURE_SQL,
+    ))?;
 
     let sets = stmt.query_map(params![], |row| {
         let set = crate::models::FramesSet {
@@ -8540,5 +8559,85 @@ mod tests {
             live[0].content_hash, live[1].content_hash,
             "the two name-groups must carry DISTINCT content_hash values"
         );
+    }
+}
+
+#[cfg(test)]
+mod frames_set_listing_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::Connection;
+
+    /// A set whose members are gone shows 0 frames AND no exposure: the
+    /// listing sums the members it counts, never the stored aggregate a
+    /// removal path did not refresh. Real case 2026-10-25: "LDN 621" and
+    /// "Unlocated Frames M4" kept 6120 s / 8820 s after their frames were
+    /// re-ingested under new ids into another set.
+    #[test]
+    fn listing_exposure_follows_the_members_not_the_stored_aggregate() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name, total_exp_time) VALUES (1, 'emptied', 6120.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name, total_exp_time) VALUES (2, 'live', 6120.0)",
+            [],
+        )
+        .unwrap();
+        for set in [1, 2] {
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+                 VALUES (?1, '2025-06-28T23:00:00Z', '2025-06-29T02:00:00Z')",
+                [set],
+            )
+            .unwrap();
+            let night = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')",
+                [night],
+            )
+            .unwrap();
+        }
+        // Set 2 keeps two 180 s lights; set 1's session is empty.
+        let session_2: i64 = conn
+            .query_row(
+                "SELECT s.id FROM sessions s JOIN imaging_nights n ON n.id = s.imaging_night_id
+                 WHERE n.frames_set_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'l.fits', 0, '2025-06-29T00:00:00Z', 'FITS')",
+                [format!("/l/{i}.fits")],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, exptime) VALUES (?1, 'Light', 180.0)",
+                [file_id],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                [session_2, frame_id],
+            )
+            .unwrap();
+        }
+
+        let sets = get_frames_sets_by_project(&conn, 1).unwrap();
+        let by_id = |id: i64| sets.iter().find(|(s, _)| s.id == Some(id)).unwrap();
+        let (emptied, emptied_count) = by_id(1);
+        assert_eq!(*emptied_count, 0);
+        assert_eq!(emptied.total_exp_time, None, "no members, no exposure");
+        let (live, live_count) = by_id(2);
+        assert_eq!(*live_count, 2);
+        assert_eq!(live.total_exp_time, Some(360.0), "the members' sum, not the stored 6120");
     }
 }
