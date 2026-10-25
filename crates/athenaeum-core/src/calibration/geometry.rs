@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::models::{FileFormat, Frame};
@@ -486,6 +487,90 @@ pub fn prune_unfit_auto_links(
     Ok(removed)
 }
 
+/// One calibration link whose set does not fit the frames it would
+/// calibrate — the readiness gate's geometry tally (`ExportReadiness`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryMismatch {
+    /// The link type: `Dark` / `Flat` / `Bias` for a light's link,
+    /// `DarkFlat` / `Dark` / `Bias` for a flat set's pre-calibration link.
+    pub calibration_type: String,
+    pub calibration_set_id: i64,
+    /// `Geometry::label` of the linked set.
+    pub calibration_geometry: String,
+    /// The flat set whose pre-calibration link this is; `None` for a light's.
+    pub source_set_id: Option<i64>,
+    /// `Geometry::label` of the lights (or of that flat set).
+    pub source_geometry: String,
+    /// In-scope lights carrying this link; `0` for a pre-calibration link.
+    pub light_count: i64,
+}
+
+fn type_word(calibration_type: &str) -> &'static str {
+    match calibration_type {
+        "Dark" => "dark",
+        "Flat" => "flat",
+        "Bias" => "bias",
+        "DarkFlat" => "dark flat",
+        _ => "calibration",
+    }
+}
+
+/// The parts both geometry sentences share: the first three entries, then
+/// `+N more`.
+fn mismatch_parts(mismatches: &[GeometryMismatch]) -> String {
+    let parts: Vec<String> = mismatches
+        .iter()
+        .take(3)
+        .map(|m| match m.source_set_id {
+            None => format!(
+                "{} set #{} is {}, {} light{} {} {}",
+                type_word(&m.calibration_type),
+                m.calibration_set_id,
+                m.calibration_geometry,
+                m.light_count,
+                if m.light_count == 1 { "" } else { "s" },
+                if m.light_count == 1 { "is" } else { "are" },
+                m.source_geometry
+            ),
+            Some(source_set_id) => format!(
+                "flat set #{source_set_id} is {}, its {} #{} is {}",
+                m.source_geometry,
+                type_word(&m.calibration_type),
+                m.calibration_set_id,
+                m.calibration_geometry
+            ),
+        })
+        .collect();
+    let more = if mismatches.len() > 3 {
+        format!("; +{} more", mismatches.len() - 3)
+    } else {
+        String::new()
+    };
+    format!("{}{more}", parts.join("; "))
+}
+
+/// The blocker sentence for a non-empty size / mixed mismatch list. The
+/// Export tab mirrors it verbatim
+/// (`src/components/export/modeBlocker.ts::geometryMismatchSentence`); the
+/// collab verdict classifies it by "does not fit the frame size".
+pub fn mismatch_sentence(mismatches: &[GeometryMismatch]) -> String {
+    format!(
+        "Calibration does not fit the frame size — {}; re-link with Find Calibration",
+        mismatch_parts(mismatches)
+    )
+}
+
+/// The advisory sentence for links at another recorded sub-frame origin
+/// (G-7: a manual choice the owner allows). Never a blocker; mirrored
+/// verbatim by `src/components/export/modeBlocker.ts::geometryOriginSentence`.
+pub fn origin_sentence(mismatches: &[GeometryMismatch]) -> String {
+    format!(
+        "Calibration at another sub-frame origin — {}",
+        mismatch_parts(mismatches)
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use rusqlite::{params, Connection};
@@ -880,5 +965,55 @@ mod tests {
             .unwrap();
         assert_eq!((set, light), (other, g(Some(ROI), Some((7, 9)))));
         assert_eq!(cache.origin_reads, lights.len(), "served from the cache");
+    }
+
+    fn mm(
+        t: &str,
+        id: i64,
+        cal: &str,
+        src_set: Option<i64>,
+        src: &str,
+        n: i64,
+    ) -> GeometryMismatch {
+        GeometryMismatch {
+            calibration_type: t.to_string(),
+            calibration_set_id: id,
+            calibration_geometry: cal.to_string(),
+            source_set_id: src_set,
+            source_geometry: src.to_string(),
+            light_count: n,
+        }
+    }
+
+    #[test]
+    fn mismatch_sentence_vectors() {
+        assert_eq!(
+            mismatch_sentence(&[
+                mm("Dark", 1843, "6384×4258", None, "9576×6388", 151),
+                mm("Dark", 1267, "6384×4258 @ 1584,1064", Some(558), "9576×6388", 0),
+            ]),
+            "Calibration does not fit the frame size — dark set #1843 is 6384×4258, 151 lights are 9576×6388; flat set #558 is 9576×6388, its dark #1267 is 6384×4258 @ 1584,1064; re-link with Find Calibration"
+        );
+        assert_eq!(
+            mismatch_sentence(&[
+                mm("Flat", 1, "mixed sizes", None, "9576×6388", 1),
+                mm("Bias", 2, "6384×4258", None, "9576×6388", 2),
+                mm("DarkFlat", 3, "6384×4258", Some(9), "9576×6388", 0),
+                mm("Dark", 4, "6384×4258", None, "9576×6388", 3),
+            ]),
+            "Calibration does not fit the frame size — flat set #1 is mixed sizes, 1 light is 9576×6388; bias set #2 is 6384×4258, 2 lights are 9576×6388; flat set #9 is 9576×6388, its dark flat #3 is 6384×4258; +1 more; re-link with Find Calibration"
+        );
+    }
+
+    /// G-7: the advisory sentence for links at another recorded origin.
+    #[test]
+    fn origin_sentence_vectors() {
+        assert_eq!(
+            origin_sentence(&[
+                mm("Dark", 1518, "6384×4258 @ 0,0", None, "6384×4258 @ 1584,1064", 151),
+                mm("Bias", 7, "6384×4258 @ 0,0", Some(558), "6384×4258 @ 1584,1064", 0),
+            ]),
+            "Calibration at another sub-frame origin — dark set #1518 is 6384×4258 @ 0,0, 151 lights are 6384×4258 @ 1584,1064; flat set #558 is 6384×4258 @ 1584,1064, its bias #7 is 6384×4258 @ 0,0"
+        );
     }
 }

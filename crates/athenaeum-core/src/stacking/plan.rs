@@ -2211,6 +2211,16 @@ fn frame_set_inputs(
                 ),
             });
         }
+        // Geometry (owner ruling 2026-10-20, R2): the readiness gate's own
+        // tally, so the plan and the export can never disagree.
+        if !readiness.geometry_mismatches.is_empty() {
+            blockers.push(PlanBlocker {
+                code: "links".to_string(),
+                message: crate::calibration::geometry::mismatch_sentence(
+                    &readiness.geometry_mismatches,
+                ),
+            });
+        }
         if !readiness.masters_unrebuildable.is_empty() {
             let n = readiness.masters_unrebuildable.len();
             // Every unrebuildable reason is archival ("archived — restore
@@ -2237,6 +2247,15 @@ fn frame_set_inputs(
         }
         masters_to_build
     };
+    // G-7: links at another recorded sub-frame origin (a manual choice) are
+    // a WARNING on the plan, never a blocker. Empty for an attested set.
+    let warnings = if readiness.geometry_warnings.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::calibration::geometry::origin_sentence(
+            &readiness.geometry_warnings,
+        )]
+    };
     Ok(SubjectInputs {
         cfg,
         hash,
@@ -2246,7 +2265,7 @@ fn frame_set_inputs(
         readiness,
         masters_to_build,
         blockers,
-        warnings: Vec::new(),
+        warnings,
         project: None,
     })
 }
@@ -3999,6 +4018,90 @@ mod tests {
             "{:?}",
             plan.blockers
         );
+    }
+
+    /// Owner ruling 2026-10-20 (calibration geometry, R2): lights linked to
+    /// masters of another size are blocked up front under `links`, naming the
+    /// set and both sizes — the run used to be admitted and die in Masters or
+    /// Calibrate.
+    #[test]
+    fn plan_blocks_masters_of_another_size_under_links() {
+        let f = test_fixtures::frame_set("Horsehead C11");
+        let ids: Vec<i64> = THREE_TIMES
+            .iter()
+            .enumerate()
+            .map(|(i, t)| test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t)).0)
+            .collect();
+        // `light_spec` lights are 64×48; these masters are 32×24.
+        let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 32, 24);
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
+        let links: Vec<&PlanBlocker> = plan.blockers.iter().filter(|b| b.code == "links").collect();
+        assert_eq!(links.len(), 1, "{:?}", plan.blockers);
+        assert_eq!(
+            links[0].message,
+            format!(
+                "Calibration does not fit the frame size — dark set #{dark_set} is 32×24, 3 lights are 64×48; \
+                 flat set #{flat_set} is 32×24, 3 lights are 64×48; re-link with Find Calibration"
+            )
+        );
+    }
+
+    /// G-7: masters of the lights' size at another recorded sub-frame origin
+    /// (a manual choice) are a plan WARNING, never a `links` blocker.
+    #[test]
+    fn plan_warns_on_masters_at_another_origin() {
+        use crate::calibration::geometry::test_support::fits_header_text;
+        let f = test_fixtures::frame_set("Horsehead C11");
+        let ids: Vec<i64> = THREE_TIMES
+            .iter()
+            .enumerate()
+            .map(|(i, t)| test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t)).0)
+            .collect();
+        let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        // A newer stored header wins (`origin_for_file` reads the newest row).
+        let file_of =
+            |sql: &str, id: i64| -> i64 { f.conn.query_row(sql, [id], |r| r.get(0)).unwrap() };
+        for &id in &ids {
+            let file_id = file_of("SELECT file_id FROM frames WHERE id = ?1", id);
+            crate::db::insert_fits_header(&f.conn, file_id, &fits_header_text(Some((1584, 1064))))
+                .unwrap();
+        }
+        for set in [dark_set, flat_set] {
+            let file_id = file_of(
+                "SELECT f.file_id FROM calibration_set_frames csf JOIN frames f ON f.id = csf.frame_id
+                 WHERE csf.set_id = ?1",
+                set,
+            );
+            crate::db::insert_fits_header(&f.conn, file_id, &fits_header_text(Some((0, 0))))
+                .unwrap();
+        }
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().all(|b| b.code != "links"),
+            "{:?}",
+            plan.blockers
+        );
+        let expected = format!(
+            "Calibration at another sub-frame origin — dark set #{dark_set} is 64×48 @ 0,0, 3 lights are 64×48 @ 1584,1064; \
+             flat set #{flat_set} is 64×48 @ 0,0, 3 lights are 64×48 @ 1584,1064"
+        );
+        assert!(plan.warnings.contains(&expected), "{:?}", plan.warnings);
     }
 
     /// Owner decision 2026-09-10: groups are camera-agnostic — two lights

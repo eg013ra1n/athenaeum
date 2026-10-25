@@ -178,6 +178,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::masters::BatchSkip,
             crate::api::masters::DeleteMasterResult,
             crate::export::models::ExportFileCounts,
+            crate::calibration::geometry::GeometryMismatch,
             crate::api::lights::ExportReadiness,
             crate::api::lights::FlatNormMode,
             crate::api::lights::LightCalParams,

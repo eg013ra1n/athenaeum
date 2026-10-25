@@ -23,16 +23,20 @@
 //! `api/calibration.rs` inner-fn precedent); the public handler is a thin
 //! `ctx` → `conn` wrapper.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
+use crate::calibration::geometry::{
+    self, Fit, Geometry, GeometryMismatch, LazyFrameGeometry, Refusal,
+};
 use crate::calibration_library::light_resolve::{link_set_id, resolve_master};
 use crate::db::calibration_links::get_links_for_frame;
 use crate::export::models::{ExportData, ExportFileCounts, ExportMode};
+use crate::models::CalibrationLink;
 use crate::services::ServiceContext;
 
 // Re-export the flat-normalization statistic + advanced-parameter types so the
@@ -132,6 +136,20 @@ pub struct ExportReadiness {
     // warning. Never a blocker; empty for an attested set.
     #[serde(default)]
     pub calibration_warnings: Vec<String>,
+    /// Calibration links whose set does not fit the frames it would calibrate
+    /// in SIZE (owner ruling 2026-10-20; rulings R2, R8): a light's dark and
+    /// flat (its bias only when no dark resolved), and every pre-calibration
+    /// link of a flat set the run builds or rebuilds. Blocks the
+    /// calibrated-lights mode and the stacking plan (`links`), never the raw
+    /// modes (R6). Empty for an attested set.
+    #[serde(default)]
+    pub geometry_mismatches: Vec<GeometryMismatch>,
+    /// The same links at the same size but another recorded sub-frame origin
+    /// (G-7 — auto-link never makes one, so it is a manual choice). Advisory:
+    /// the Export tab lists it, the stacking plan warns, nothing blocks.
+    /// Empty for an attested set.
+    #[serde(default)]
+    pub geometry_warnings: Vec<GeometryMismatch>,
 }
 
 // ── Pedestal warning (spec 2026-10-04 §5) ──────────────────────────────────
@@ -357,6 +375,13 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
                 if n == 1 { "has" } else { "have" }
             ))
         }
+        // Geometry (owner ruling 2026-10-20): a link whose set does not fit
+        // the frames' size is a linking problem; after the unlinked-lights arm
+        // and before the missing-file one, mirrored by the Export tab. Only
+        // the SIZE list blocks; `geometry_warnings` never reaches this verdict.
+        ExportMode::CalibratedLights if !r.geometry_mismatches.is_empty() => Err(
+            crate::calibration::geometry::mismatch_sentence(&r.geometry_mismatches),
+        ),
         // C-2: a set IS a built master, but its FILE is gone (archived or
         // moved) — a different failure mode than the two blockers above, and
         // one `open_generation` would otherwise only discover partway through
@@ -478,6 +503,8 @@ pub(crate) fn readiness_from_data(
     // keeps the same distinct-by-path dedup the old `BTreeSet<PathBuf>` gave
     // (two different master sets never share one on-disk file).
     let mut master_paths: BTreeMap<PathBuf, i64> = BTreeMap::new();
+    // The links this loop read, kept for the geometry pass (review I-3).
+    let mut linked: Vec<LinkedLight> = Vec::new();
     for &frame_id in light_frame_ids {
         let links = get_links_for_frame(conn, frame_id)?;
         if links.is_empty() {
@@ -511,6 +538,11 @@ pub(crate) fn readiness_from_data(
                 }
             }
         }
+        linked.push(LinkedLight {
+            frame_id,
+            dark_resolved: dark.is_some(),
+            links,
+        });
     }
     // Review fix #2: name which file is missing, not just how many — the send
     // path already does this (`api::sync_prepare::open_generation`'s
@@ -580,6 +612,20 @@ pub(crate) fn readiness_from_data(
         }
     }
     let missing_master_files = missing_masters.len() as i64;
+
+    // Geometry (owner ruling 2026-10-20; R2, R8, G-7). An attested set's
+    // lights are copied as they are (R3, wave 6 §13): no calibration applies,
+    // so nothing about its links is judged.
+    let attested = crate::db::collab::frames_set_attested(conn, set_id).unwrap_or_else(|e| {
+        tracing::warn!(set_id, error = %e, "attestation read failed; treated as not attested");
+        false
+    });
+    let geometry = if attested {
+        GeometryTally::default()
+    } else {
+        let missing_master_ids: Vec<i64> = missing_masters.values().copied().collect();
+        geometry_tally(conn, &linked, &missing_master_ids)?
+    };
 
     // Plan 5b Task 8 (extended by Task 8b to cover the transitive
     // pre-calibration masters above too): which of those missing masters
@@ -663,12 +709,10 @@ pub(crate) fn readiness_from_data(
         masters_rebuildable = masters_rebuildable.len(),
         masters_unrebuildable = masters_unrebuildable.len(),
         missing_raw_calibration_files,
+        geometry_mismatches = geometry.mismatches.len(),
+        geometry_warnings = geometry.warnings.len(),
         "export readiness computed"
     );
-    let attested = crate::db::collab::frames_set_attested(conn, set_id).unwrap_or_else(|e| {
-        tracing::warn!(set_id, error = %e, "attestation read failed; treated as not attested");
-        false
-    });
     let calibration_warnings = if attested {
         Vec::new()
     } else {
@@ -697,7 +741,193 @@ pub(crate) fn readiness_from_data(
         masters_unrebuildable,
         attested,
         calibration_warnings,
+        geometry_mismatches: geometry.mismatches,
+        geometry_warnings: geometry.warnings,
     })
+}
+
+/// One linked light as the readiness pass's first loop saw it — the geometry
+/// pass reuses these links instead of reading them again (review I-3).
+struct LinkedLight {
+    frame_id: i64,
+    links: Vec<CalibrationLink>,
+    /// A Dark link resolved to a master: the fact the missing-master-file
+    /// pass keys the bias on (review fix #1). The geometry pass keys on the
+    /// same one (review I-4) — a Dark link to a set with no master leaves the
+    /// engine reading the bias, so the bias is judged.
+    dark_resolved: bool,
+}
+
+/// What the geometry pass found.
+#[derive(Default)]
+struct GeometryTally {
+    /// Size or mixed refusals — blockers.
+    mismatches: Vec<GeometryMismatch>,
+    /// Another recorded sub-frame origin at the same size — advisory (G-7).
+    warnings: Vec<GeometryMismatch>,
+}
+
+fn cached_set_geometry(
+    conn: &Connection,
+    cache: &mut HashMap<i64, Geometry>,
+    set_id: i64,
+) -> Result<Geometry, ApiError> {
+    if let Some(g) = cache.get(&set_id) {
+        return Ok(*g);
+    }
+    let g = geometry::geometry_for_set(conn, set_id)?;
+    cache.insert(set_id, g);
+    Ok(g)
+}
+
+/// The geometry pass of the readiness gate (owner ruling 2026-10-20; rulings
+/// R2, R8, G-7). Set geometry is read once per set; a light's stored header
+/// is parsed only when a linked set of its size records an origin (review
+/// I-3, ruling R10). A side that records no size blocks nothing (R1): counted
+/// and logged once.
+fn geometry_tally(
+    conn: &Connection,
+    linked: &[LinkedLight],
+    missing_master_ids: &[i64],
+) -> Result<GeometryTally, ApiError> {
+    let mut sets: HashMap<i64, Geometry> = HashMap::new();
+    let mut unknown = 0usize;
+
+    // (origin only?, calibration type, set id, light label) -> (set label, light count)
+    let mut light_links: BTreeMap<(bool, String, i64, String), (String, i64)> = BTreeMap::new();
+    let mut flats_to_build: BTreeSet<i64> = BTreeSet::new();
+    let mut raw_flat: HashMap<i64, bool> = HashMap::new();
+    for light in linked {
+        let mut frame = LazyFrameGeometry::load(conn, light.frame_id)?;
+        // The links the engine resolves (`light_resolve::resolve_frame_inputs`):
+        // dark and flat always, the bias only without a resolved dark (R8).
+        for (calibration_type, applies) in [
+            ("Dark", true),
+            ("Flat", true),
+            ("Bias", !light.dark_resolved),
+        ] {
+            if !applies {
+                continue;
+            }
+            let Some(set_id) = link_set_id(&light.links, calibration_type) else {
+                continue;
+            };
+            let set = cached_set_geometry(conn, &mut sets, set_id)?;
+            match frame.fit(conn, &set)? {
+                Fit::Refused(refusal) => {
+                    let key = (
+                        refusal == Refusal::Origin,
+                        calibration_type.to_string(),
+                        set_id,
+                        frame.report_label(refusal),
+                    );
+                    light_links.entry(key).or_insert((set.label(), 0)).1 += 1;
+                }
+                Fit::Unknown => unknown += 1,
+                Fit::Fits => {}
+            }
+            if calibration_type == "Flat" {
+                let is_raw = match raw_flat.get(&set_id) {
+                    Some(v) => *v,
+                    None => {
+                        let v: bool = conn.query_row(
+                            "SELECT imagetyp = 'Flat' AND is_master_library = 0 FROM calibration_set WHERE id = ?1",
+                            params![set_id],
+                            |r| r.get(0),
+                        )?;
+                        raw_flat.insert(set_id, v);
+                        v
+                    }
+                };
+                if is_raw {
+                    flats_to_build.insert(set_id);
+                }
+            }
+        }
+    }
+    // Flats stage 0.5 rebuilds: the provenance source of every missing master flat.
+    for &master_set_id in missing_master_ids {
+        let imagetyp: String = conn.query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            params![master_set_id],
+            |r| r.get(0),
+        )?;
+        if imagetyp != "MasterFlat" {
+            continue;
+        }
+        match crate::db::master_provenance::get(conn, master_set_id) {
+            Ok(Some(p)) => {
+                if let Some(source_set_id) = p.source_set_id {
+                    flats_to_build.insert(source_set_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                master_set_id,
+                %error,
+                "master provenance unreadable; its flat's pre-calibration geometry is not checked"
+            ),
+        }
+    }
+
+    let mut tally = GeometryTally::default();
+    for (
+        (origin_only, calibration_type, calibration_set_id, source_geometry),
+        (calibration_geometry, light_count),
+    ) in light_links
+    {
+        let m = GeometryMismatch {
+            calibration_type,
+            calibration_set_id,
+            calibration_geometry,
+            source_set_id: None,
+            source_geometry,
+            light_count,
+        };
+        if origin_only {
+            tally.warnings.push(m);
+        } else {
+            tally.mismatches.push(m);
+        }
+    }
+    for flat_set_id in flats_to_build {
+        let flat = cached_set_geometry(conn, &mut sets, flat_set_id)?;
+        for link in crate::db::calibration_links::get_links_for_calibration_set(conn, flat_set_id)?
+        {
+            if !matches!(link.calibration_type.as_str(), "DarkFlat" | "Dark" | "Bias") {
+                continue;
+            }
+            let set = cached_set_geometry(conn, &mut sets, link.calibration_set_id)?;
+            let refusal = match geometry::fit(&flat, &set) {
+                Fit::Refused(refusal) => refusal,
+                Fit::Unknown => {
+                    unknown += 1;
+                    continue;
+                }
+                Fit::Fits => continue,
+            };
+            let m = GeometryMismatch {
+                calibration_type: link.calibration_type.clone(),
+                calibration_set_id: link.calibration_set_id,
+                calibration_geometry: set.label(),
+                source_set_id: Some(flat_set_id),
+                source_geometry: flat.label(),
+                light_count: 0,
+            };
+            if refusal == Refusal::Origin {
+                tally.warnings.push(m);
+            } else {
+                tally.mismatches.push(m);
+            }
+        }
+    }
+    if unknown > 0 {
+        tracing::warn!(
+            count = unknown,
+            "calibration geometry not recorded on one side; size not compared"
+        );
+    }
+    Ok(tally)
 }
 
 /// Ruling R-T6-6: filter `data`'s export groups down to only the LIGHT
@@ -1039,6 +1269,210 @@ mod tests {
         seed_set(conn, 100, "MasterDark", true);
         seed_set(conn, 101, "MasterFlat", true);
         seed_set(conn, 102, "MasterBias", true);
+    }
+
+    // ── Geometry (owner ruling 2026-10-20, rulings R2/R8) ───────────────
+    fn set_light_size(conn: &Connection, frame_id: i64, size: (i32, i32)) {
+        conn.execute(
+            "UPDATE frames SET naxis1 = ?1, naxis2 = ?2 WHERE id = ?3",
+            params![size.0, size.1, frame_id],
+        )
+        .unwrap();
+    }
+
+    fn give_member(conn: &Connection, set_id: i64, tag: &str, imagetyp: &str, size: (i32, i32)) {
+        use crate::calibration::geometry::test_support::{add_members, seed_frame};
+        let m = seed_frame(conn, tag, imagetyp, Some(size), None);
+        add_members(conn, set_id, &[m]);
+    }
+
+    /// The owner's case: 151 lights manually linked to a ROI master dark.
+    /// Readiness names it, the calibrated mode refuses with the sentence, the
+    /// raw modes do not (R6).
+    #[test]
+    fn readiness_names_a_manual_misfit() {
+        use crate::calibration::geometry::GeometryMismatch;
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_size(&conn, 1, (9576, 6388));
+        seed_masters(&conn);
+        give_member(&conn, 100, "dark100", "MasterDark", (6384, 4258));
+        give_member(&conn, 101, "flat101", "MasterFlat", (9576, 6388));
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        conn.execute(
+            "UPDATE calibration_set_to_frames SET is_manual_override = 1 WHERE calibration_set_id = 100",
+            [],
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.geometry_mismatches,
+            vec![GeometryMismatch {
+                calibration_type: "Dark".to_string(),
+                calibration_set_id: 100,
+                calibration_geometry: "6384×4258".to_string(),
+                source_set_id: None,
+                source_geometry: "9576×6388".to_string(),
+                light_count: 1,
+            }]
+        );
+        assert!(r.geometry_warnings.is_empty());
+        // The member files (`/geometry/dark100.fits`, …) are not on disk, so
+        // `missing_master_files` is 2 and the rebuildability classifiers warn;
+        // the geometry sentence still wins because its arm comes BEFORE the
+        // missing-file arm (review M-5). A later reorder of the arms is not a
+        // geometry regression — re-read this test before "fixing" it.
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
+            "Calibration does not fit the frame size — dark set #100 is 6384×4258, 1 light is 9576×6388; re-link with Find Calibration"
+        );
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+        ] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
+    }
+
+    /// R8 (review I-4): the bias is judged exactly when no dark RESOLVED for
+    /// the light — the fact the missing-master-file pass keys on — not when no
+    /// Dark link exists; a set that records no size blocks nothing (R1).
+    #[test]
+    fn readiness_judges_the_bias_only_without_a_resolved_dark() {
+        use crate::calibration::geometry::test_support::{add_members, seed_frame};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        for id in 1..=3 {
+            seed_light(&conn, id, session);
+            set_light_size(&conn, id, (9576, 6388));
+        }
+        seed_masters(&conn); // 100 dark, 101 flat, 102 bias (all is_master_library = 1)
+                             // Dark 100 resolves (a member file row) but records no size: Unknown.
+        let d = seed_frame(&conn, "dark100", "MasterDark", None, None);
+        add_members(&conn, 100, &[d]);
+        give_member(&conn, 102, "bias102", "MasterBias", (6384, 4258));
+        seed_set(&conn, 103, "Dark", false); // raw, no master: the engine reads the bias
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 102, "Bias");
+        add_link(&conn, 2, 102, "Bias");
+        add_link(&conn, 3, 103, "Dark");
+        add_link(&conn, 3, 102, "Bias");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.geometry_mismatches.len(),
+            1,
+            "{:?}",
+            r.geometry_mismatches
+        );
+        assert_eq!(
+            (
+                r.geometry_mismatches[0].calibration_set_id,
+                r.geometry_mismatches[0].light_count
+            ),
+            (102, 2),
+            "lights 2 (no dark) and 3 (a dark link that resolves to no master) read the bias; light 1's resolved dark skips it"
+        );
+    }
+
+    /// G-7 (owner 2026-10-20, "auto no, manual yes"): a manual link at another
+    /// recorded origin, same size, is a WARNING — never a blocker.
+    #[test]
+    fn readiness_reports_an_origin_misfit_as_a_warning() {
+        use crate::calibration::geometry::test_support::{
+            add_members, fits_header_text, seed_frame,
+        };
+        use crate::calibration::geometry::GeometryMismatch;
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_size(&conn, 1, (6384, 4258));
+        crate::db::insert_fits_header(&conn, 1_000_001, &fits_header_text(Some((1584, 1064))))
+            .unwrap();
+        seed_masters(&conn);
+        let m = seed_frame(
+            &conn,
+            "dark100",
+            "MasterDark",
+            Some((6384, 4258)),
+            Some((0, 0)),
+        );
+        add_members(&conn, 100, &[m]);
+        add_link(&conn, 1, 100, "Dark");
+        conn.execute(
+            "UPDATE calibration_set_to_frames SET is_manual_override = 1 WHERE calibration_set_id = 100",
+            [],
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(
+            r.geometry_mismatches.is_empty(),
+            "{:?}",
+            r.geometry_mismatches
+        );
+        assert_eq!(
+            r.geometry_warnings,
+            vec![GeometryMismatch {
+                calibration_type: "Dark".to_string(),
+                calibration_set_id: 100,
+                calibration_geometry: "6384×4258 @ 0,0".to_string(),
+                source_set_id: None,
+                source_geometry: "6384×4258 @ 1584,1064".to_string(),
+                light_count: 1,
+            }]
+        );
+        // Advisory: the gate's verdict is what it is without the warning (here
+        // the missing master file answers — the member path is not on disk).
+        let without = ExportReadiness {
+            geometry_warnings: Vec::new(),
+            ..r.clone()
+        };
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights),
+            check_mode_ready(&without, ExportMode::CalibratedLights)
+        );
+    }
+
+    /// R2/R8: a raw flat the run will build is judged against EVERY
+    /// pre-calibration link it carries.
+    #[test]
+    fn readiness_names_a_flat_precal_misfit() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_size(&conn, 1, (9576, 6388));
+        seed_set(&conn, 200, "Flat", false);
+        give_member(&conn, 200, "flat200", "Flat", (9576, 6388));
+        seed_set(&conn, 300, "MasterDark", true);
+        give_member(&conn, 300, "dark300", "MasterDark", (6384, 4258));
+        seed_set(&conn, 301, "MasterBias", true);
+        give_member(&conn, 301, "bias301", "MasterBias", (9576, 6388));
+        add_link(&conn, 1, 200, "Flat");
+        add_set_link(&conn, 200, 300, "Dark");
+        add_set_link(&conn, 200, 301, "Bias");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.geometry_mismatches.len(),
+            1,
+            "{:?}",
+            r.geometry_mismatches
+        );
+        let m = &r.geometry_mismatches[0];
+        assert_eq!(
+            (
+                m.calibration_type.as_str(),
+                m.calibration_set_id,
+                m.source_set_id,
+                m.light_count
+            ),
+            ("Dark", 300, Some(200), 0)
+        );
     }
 
     // ── Pedestal warning (spec 2026-10-04 §5) ───────────────────────────────
@@ -1470,6 +1904,8 @@ mod tests {
             masters_unrebuildable: vec![],
             attested: false,
             calibration_warnings: Vec::new(),
+            geometry_mismatches: Vec::new(),
+            geometry_warnings: Vec::new(),
         };
         for mode in [
             ExportMode::LightsOnly,

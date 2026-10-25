@@ -18,6 +18,8 @@ function frame(id: number): EnrichedLightFrame {
     telescop: null,
     focallen: 500,
     xpixsz: null,
+    naxis1: null,
+    naxis2: null,
     binning: '1x1',
     ccd_temp: null,
     swcreate: null,

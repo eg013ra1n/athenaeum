@@ -40,6 +40,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
+use crate::calibration::geometry::{self, Fit, Refusal};
 use crate::calibration_library::headers::{
     build_master_cards, load_header_inputs, measure_flat_channel_norms,
 };
@@ -377,7 +378,9 @@ pub(crate) struct PrecalSelection {
 /// (DarkFlat → exposure-matched Dark(±0.5s) → Bias), skipping raw
 /// (non-master) links with a warning (and recording them as
 /// `raw_candidates`). Falls back to the recipe's synthetic bias, then to
-/// `PrecalChoice::None` + warning.
+/// `PrecalChoice::None` + warning. A linked master of another size is refused
+/// (plan ruling R7), not skipped; the same size at another recorded sub-frame
+/// origin is used with a warning (G-7).
 ///
 /// Called by `preview_master_build` (description + raw-candidate surfacing)
 /// AND inside the build thread (so a just-built darkflat master — earlier in
@@ -436,6 +439,49 @@ pub(crate) fn select_flat_precal(
                     continue;
                 }
             }
+        }
+        // Geometry (owner ruling 2026-10-20; plan ruling R7, G-7): a
+        // pre-calibration master of another size can never calibrate these
+        // flats — refused here, at selection, naming both (the engine's own
+        // guard refuses the same build later, after reading every flat). The
+        // same size at another recorded sub-frame origin is a manual choice
+        // (auto-link never makes it): used as linked, with a warning.
+        let flat_geometry = geometry::geometry_for_set(conn, set_id)?;
+        let precal_geometry = geometry::geometry_for_set(conn, precal_set)?;
+        match geometry::fit(&flat_geometry, &precal_geometry) {
+            Fit::Refused(Refusal::Origin) => {
+                tracing::warn!(
+                    source_set_id = set_id,
+                    master_set_id = precal_set,
+                    calibration_type = cal_type,
+                    source_geometry = %flat_geometry.label(),
+                    set_geometry = %precal_geometry.label(),
+                    "flat pre-calibration at another sub-frame origin; used as linked"
+                );
+                warnings.push(format!(
+                    "linked {} master #{precal_set} is {}, the flats are {} — another sub-frame origin, used as linked",
+                    cal_type.to_lowercase(),
+                    precal_geometry.label(),
+                    flat_geometry.label()
+                ));
+            }
+            Fit::Refused(_) => {
+                tracing::warn!(
+                    source_set_id = set_id,
+                    master_set_id = precal_set,
+                    calibration_type = cal_type,
+                    source_geometry = %flat_geometry.label(),
+                    set_geometry = %precal_geometry.label(),
+                    "flat pre-calibration refused: the master does not fit the frame size"
+                );
+                return Err(ApiError::Invalid(format!(
+                    "linked {} master #{precal_set} is {}, the flats are {} — re-link the flats' pre-calibration",
+                    cal_type.to_lowercase(),
+                    precal_geometry.label(),
+                    flat_geometry.label()
+                )));
+            }
+            Fit::Fits | Fit::Unknown => {}
         }
         let path: String = conn.query_row(
             "SELECT fi.path FROM calibration_set_frames csf
@@ -3081,6 +3127,82 @@ mod tests {
             rusqlite::params![flat_set, precal_set, cal_type],
         )
         .unwrap();
+    }
+
+    /// Plan ruling R7: a linked pre-calibration master of another size is
+    /// refused at selection — not skipped to the next link.
+    #[test]
+    fn precal_master_of_another_size_is_refused_not_skipped() {
+        use crate::calibration::geometry::test_support::{add_members, seed_frame};
+        let conn = test_conn();
+        let flat = seed_flat_set(&conn, 1.0);
+        let member = seed_frame(&conn, "flat-member", "Flat", Some((9576, 6388)), None);
+        add_members(&conn, flat, &[member]);
+        let dark = seed_precal_set(&conn, "MasterDark", 1, Some(1.0));
+        conn.execute(
+            "UPDATE frames SET naxis1 = 6384, naxis2 = 4258
+             WHERE id IN (SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1)",
+            [dark],
+        )
+        .unwrap();
+        link(&conn, flat, dark, "Dark");
+        let bias = seed_precal_set(&conn, "MasterBias", 1, None);
+        link(&conn, flat, bias, "Bias");
+
+        let msg = match select_flat_precal(&conn, flat, Some(1.0), None) {
+            Ok(_) => panic!("a misfit pre-calibration must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            msg,
+            format!("linked dark master #{dark} is 6384×4258, the flats are 9576×6388 — re-link the flats' pre-calibration")
+        );
+    }
+
+    /// G-7: a pre-calibration master of the same size at another recorded
+    /// origin is used as linked, with a warning — never refused.
+    #[test]
+    fn precal_master_at_another_origin_is_used_with_a_warning() {
+        use crate::calibration::geometry::test_support::{
+            add_members, fits_header_text, seed_frame,
+        };
+        let conn = test_conn();
+        let flat = seed_flat_set(&conn, 1.0);
+        let member = seed_frame(
+            &conn,
+            "flat-member",
+            "Flat",
+            Some((6384, 4258)),
+            Some((1584, 1064)),
+        );
+        add_members(&conn, flat, &[member]);
+        let dark = seed_precal_set(&conn, "MasterDark", 1, Some(1.0));
+        let dark_file: i64 = conn
+            .query_row(
+                "SELECT f.file_id FROM calibration_set_frames csf JOIN frames f ON f.id = csf.frame_id
+                 WHERE csf.set_id = ?1",
+                [dark],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE frames SET naxis1 = 6384, naxis2 = 4258 WHERE file_id = ?1",
+            [dark_file],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(&conn, dark_file, &fits_header_text(Some((0, 0)))).unwrap();
+        link(&conn, flat, dark, "Dark");
+
+        let sel = select_flat_precal(&conn, flat, Some(1.0), None)
+            .expect("another origin is not a refusal");
+        assert!(matches!(&sel.choice, PrecalChoice::Master { set_id, .. } if *set_id == dark));
+        assert!(
+            sel.warnings
+                .iter()
+                .any(|w| w.contains("another sub-frame origin")),
+            "{:?}",
+            sel.warnings
+        );
     }
 
     #[test]

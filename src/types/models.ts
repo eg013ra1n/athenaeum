@@ -717,6 +717,29 @@ export type DeleteMasterResult = { masterSetId: number, restoredRawSetId: number
 
 export type ExportFileCounts = { lightsOnly: number, rawWithCalibrationSets: number, rawWithMasters: number, calibratedLights: number, };
 
+export type GeometryMismatch = { 
+/**
+ * The link type: `Dark` / `Flat` / `Bias` for a light's link,
+ * `DarkFlat` / `Dark` / `Bias` for a flat set's pre-calibration link.
+ */
+calibrationType: string, calibrationSetId: number, 
+/**
+ * `Geometry::label` of the linked set.
+ */
+calibrationGeometry: string, 
+/**
+ * The flat set whose pre-calibration link this is; `None` for a light's.
+ */
+sourceSetId: number | null, 
+/**
+ * `Geometry::label` of the lights (or of that flat set).
+ */
+sourceGeometry: string, 
+/**
+ * In-scope lights carrying this link; `0` for a pre-calibration link.
+ */
+lightCount: number, };
+
 export type ExportReadiness = { total: number, 
 /**
  * LIGHT members with ZERO calibration links of any type. Nothing could be
@@ -794,7 +817,23 @@ mastersUnrebuildable: Array<[number, string]>,
  * R3 (wave 6 §13): the set is attested "calibrated by an external
  * tool" — the calibrated-lights mode copies its lights as they are.
  */
-attested: boolean, calibrationWarnings: Array<string>, };
+attested: boolean, calibrationWarnings: Array<string>, 
+/**
+ * Calibration links whose set does not fit the frames it would calibrate
+ * in SIZE (owner ruling 2026-10-20; rulings R2, R8): a light's dark and
+ * flat (its bias only when no dark resolved), and every pre-calibration
+ * link of a flat set the run builds or rebuilds. Blocks the
+ * calibrated-lights mode and the stacking plan (`links`), never the raw
+ * modes (R6). Empty for an attested set.
+ */
+geometryMismatches: Array<GeometryMismatch>, 
+/**
+ * The same links at the same size but another recorded sub-frame origin
+ * (G-7 — auto-link never makes one, so it is a manual choice). Advisory:
+ * the Export tab lists it, the stacking plan warns, nothing blocks.
+ * Empty for an attested set.
+ */
+geometryWarnings: Array<GeometryMismatch>, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

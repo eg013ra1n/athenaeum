@@ -400,6 +400,8 @@ fn is_calibration_reason(f: &str) -> bool {
         || f.contains("Build masters first")
         // CalibratedLights, C-2: "{n} master file(s) missing on disk — restore from archive first".
         || f.contains("missing on disk")
+        // CalibratedLights: "Calibration does not fit the frame size — …" (geometry, 2026-10-20).
+        || f.contains("does not fit the frame size")
         // Not a check_mode_ready arm: frame_cal_verdict's own wrapping when
         // readiness_from_data/collect_export_data itself errored.
         || f.starts_with("could not verify calibration")
@@ -910,8 +912,10 @@ mod tests {
             masters_unrebuildable: vec![],
             attested: false,
             calibration_warnings: Vec::new(),
+            geometry_mismatches: Vec::new(),
+            geometry_warnings: Vec::new(),
         };
-        // The three ways `check_mode_ready` refuses `CalibratedLights`
+        // The four ways `check_mode_ready` refuses `CalibratedLights`
         // (`api/lights.rs::check_mode_ready_truth_table` exercises the same
         // three against the readiness struct itself), each paired with the
         // ONE blocker kind its sentence must land under — `is_build_masters_reason`
@@ -943,6 +947,21 @@ mod tests {
                     ..ready.clone()
                 },
                 "buildMasters",
+            ),
+            (
+                // Geometry (2026-10-20): a link problem, offered with attest.
+                ExportReadiness {
+                    geometry_mismatches: vec![crate::calibration::geometry::GeometryMismatch {
+                        calibration_type: "Dark".to_string(),
+                        calibration_set_id: 1843,
+                        calibration_geometry: "6384×4258".to_string(),
+                        source_set_id: None,
+                        source_geometry: "9576×6388".to_string(),
+                        light_count: 1,
+                    }],
+                    ..ready.clone()
+                },
+                "linkCalibration",
             ),
         ];
         for (r, expected_kind) in &scenarios {

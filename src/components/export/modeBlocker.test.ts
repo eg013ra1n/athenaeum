@@ -16,6 +16,8 @@ const ready: ExportReadiness = {
   mastersUnrebuildable: [],
   attested: false,
   calibrationWarnings: [],
+  geometryMismatches: [],
+  geometryWarnings: [],
 };
 
 describe('modeBlocker', () => {
