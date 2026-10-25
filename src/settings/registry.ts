@@ -294,30 +294,30 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     tab: 'blink',
     title: 'Flat Contour Plot',
     description:
-      "Defaults for the per-flat contour plot rendered in Blink (toolbar mountain icon). Values match PixInsight's FlatContourPlot v1.3.1 so the visual matches that script at default settings.",
+      "Defaults for the per-flat contour plot rendered in Blink (toolbar mountain icon). Defaults follow the reference flat-contour script (v1.3.1), so the plot matches it at default settings.",
     fields: [
       {
         id: 'resolutionPct',
         label: 'Resolution (%)',
-        help: 'Resampling factor. Lower = faster, less detail. PI default: 50.',
+        help: 'Resampling factor. Lower = faster, less detail. Default: 50.',
         keywords: ['flat_contour.resolution_pct'],
       },
       {
         id: 'sigmaPx',
         label: 'Sigma (px)',
-        help: 'Gaussian noise-reduction sigma. PI default: 1.0.',
+        help: 'Gaussian noise-reduction sigma. Default: 1.0.',
         keywords: ['flat_contour.sigma_px'],
       },
       {
         id: 'contours',
         label: 'Contours',
-        help: 'Number of discrete bands. PI default: 15.',
+        help: 'Number of discrete bands. Default: 15.',
         keywords: ['flat_contour.contours'],
       },
       {
         id: 'gradientPct',
         label: 'Gradient (%)',
-        help: 'Boundary-emphasis strength. Higher darkens band edges more. PI default: 50.',
+        help: 'Boundary-emphasis strength. Higher darkens band edges more. Default: 50.',
         keywords: ['flat_contour.gradient_pct'],
       },
     ],

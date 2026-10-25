@@ -183,7 +183,7 @@ export default function ProjectExportDialog({
         )}
       >
         <p className="mb-3 text-[11.5px] text-content-faint">
-          Organizes every contributor’s frames into a PixInsight WBPP folder tree — one subtree per
+          Organizes every contributor’s frames into a WBPP folder tree — one subtree per
           publisher under the project title.
         </p>
 

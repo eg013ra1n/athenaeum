@@ -476,7 +476,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
           <section className="bg-surface-elevated rounded-lg p-4">
             <h3 className="text-lg font-medium mb-1">Export Mode</h3>
             <p className="text-sm text-content-muted mb-3">
-              Choose what lands on disk for PixInsight WBPP.
+              Choose what lands on disk for the WBPP layout.
             </p>
             {readinessLoading && (
               <p className="flex items-center gap-2 text-sm text-content-muted mb-3">
@@ -858,7 +858,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                     To enable automatic grouping in WBPP, add these <strong>Grouping Keywords</strong> in <strong>exactly this order</strong>:
                   </p>
                   <ol className="list-decimal list-inside space-y-1 text-xs">
-                    <li>Open WBPP in PixInsight</li>
+                    <li>Open the WBPP batch preprocessing tool</li>
                     <li>Check <strong>Grouping Keywords</strong></li>
                     {wbppKeywords.map(kw => (
                       <li key={kw.keyword}>
@@ -898,7 +898,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               the other ships it to another node. Same readiness gate. */}
           <div className="flex gap-3">
             <button onClick={() => { void handleExport(); }} disabled={!canExport}
-              title={readinessFailedTooltip ?? blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
+              title={readinessFailedTooltip ?? blocker ?? (outputDir ? 'Export to the WBPP folder structure' : 'Pick an output folder first')}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${canExport ? 'bg-accent hover:bg-accent-hover text-white' : 'bg-surface-hover cursor-not-allowed text-content-muted'}`}>
               {exporting ? (<><Loader2 className="animate-spin" size={20} /> Exporting…</>) : (<><Play size={20} /> Export to WBPP</>)}
             </button>

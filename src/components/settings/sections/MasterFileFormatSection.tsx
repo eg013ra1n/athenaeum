@@ -6,7 +6,7 @@ import { enumCodec } from '../../../settings/codecs';
 
 const FORMAT_OPTIONS = [
   { value: 'fits', label: 'FITS — float32, the format every tool reads' },
-  { value: 'xisf', label: 'XISF — what WBPP requires for master calibration files' },
+  { value: 'xisf', label: 'XISF — the container the WBPP layout reads for master calibration files' },
 ] as const;
 
 const formatCodec = enumCodec(['fits', 'xisf'] as const);
