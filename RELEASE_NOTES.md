@@ -1,71 +1,74 @@
-*Athenaeum v0.6.4: the application updates itself — a new version is offered inside the app with its release notes, downloaded on your click, verified, installed and restarted, on macOS, Windows and Linux.*
+*Athenaeum v0.7.0: shoot one target together with friends, stack faster, and see at a glance which frames to throw away.*
 
-This is the first release that can be received without visiting the download
-page. It is also, by necessity, the last one you install by hand: a copy of
-v0.6.3 or older knows nothing about the new mechanism, so this one comes from
-the download page as before, and every release after it arrives through the
-app. Underneath it is the release machinery that v0.6.4-beta.1 rebuilt and
-exercised — every download is verified before it is announced, and now every
-update is signed before it is offered.
+This update arrives inside the app: click **Download and install** when it is offered. If you take part in
+a collaboration project, update soon — older versions show **Update required** on every project.
 
 ## What's New
 
-- **Updates inside the application.** At launch Athenaeum checks for a newer
-  version (this is the existing *Automatically check for updates on startup* setting,
-  on by default). If there is one you get a toast, a bell entry and an
-  **Update available** dialog with the full release notes. Nothing is
-  downloaded until you click **Download and install**; a progress bar shows
-  the bytes, and when the package is in place you choose **Restart now** or
-  **Later**. On macOS the application bundle is replaced, on Linux the
-  AppImage, on Windows the installer runs by itself and relaunches the app.
-  Every package is checked against a signature the build produced; a package
-  that fails that check is refused before anything is touched, and the
-  download page stays one click away as the fallback.
-- **What's new, once.** The first launch of a new version opens a **What's
-  new** dialog with that version's own notes. It appears once per version;
-  **About → View release notes** shows the same text again at any time, and
-  works offline.
-- **Docker installs are told too.** The web UI runs the same check and shows
-  the same notes, with the `docker pull vsharifov/athenaeum:<version>` line
-  and a copy button in place of an install button — the image itself is
-  still pulled by whoever runs the container.
-- **A soft guard before restarting.** If a stacking run, a master build or a
-  transfer is in progress, the dialog says so before you restart. It never
-  blocks you; it just makes sure nothing is cancelled by surprise.
+### Collaboration projects, rebuilt
 
-## Changes
+- **Share frames as soon as they are ready.** Calibrate your night, look through it in Blink, and publish
+  the frames you want to share. Everyone else in the project receives them within seconds.
+- **See the whole project on one page:** how much you have contributed, how close each filter is to the
+  project's goal, who is online, and what is being exchanged right now.
+- **Choose how hands-off you want to be.** Publish by hand (the default), let the app calibrate for you, or
+  make it fully automatic.
+- **Different filter names are no longer a problem.** If your filter is called "Ha" and the project's is
+  "H-alpha", map it once and the app remembers. Frames without a filter name can be shared too.
+- **Already calibrated somewhere else?** Mark the frame set **Calibrated externally** and share it as it is.
+- **For coordinators:** approve or reject frames in batches, set a frame aside and bring it back, and fix a
+  member's filter names yourself.
+- **Export the whole project** for stacking, sorted into one folder per filter.
 
-- **Signed updates.** Every updater package is signed at build time and its
-  signature is published beside it. The application carries the matching
-  public key and refuses anything that does not verify. The release pipeline
-  verifies the same signatures itself, from the public addresses, before the
-  update feed moves — a release that fails that check never becomes the one
-  the app offers.
-- **Two update channels.** The stable channel is the default; *Check for beta
-  updates* in Settings switches the check to the beta feed. A beta is never
-  offered to a stable install.
-- **Linux package installs stay manual.** An install from the `.deb` (or a
-  distribution package) is not updated in place — the app opens the
-  download page instead. The AppImage updates itself. Package-manager
-  updates are a scoped follow-up.
-- **The release machinery from v0.6.4-beta.1**, now behind a stable release
-  for the first time: every installer, both Docker architectures and the
-  release post are fetched back from their public addresses, and the macOS
-  disk images pass the same Gatekeeper check a new Mac performs, before
-  anything is announced or the version-less *latest* links move. Every
-  release keeps a permanent download folder of its own. One naming scheme
-  for every download across all three operating systems
-  (`athenaeum-0.6.4-macos-arm64.dmg`: product, version, system, processor
-  architecture — `x64` and `arm64` everywhere); the previous link spellings
-  keep working until v0.7.0. The download page and this post are generated
-  from the release notes, so the site cannot describe a release differently
-  from the release.
+### Stacking
+
+- **Noticeably faster** — up to a quarter less time for the same result.
+- **Local normalization sets its own scale** to fit your image — one setting less to guess.
+- **Frame sets calibrated elsewhere** stack without asking for darks or flats.
+- **A heads-up when a light has a flat but no dark or bias**, before you stack.
+
+### Choosing your best frames
+
+- **A plain verdict for every frame:** *Trailed*, *Defocused* or *No stars*. Tick **Unusable** in Frame
+  Analysis and reject them all at once.
+- **Star measurements you can trust everywhere.** Frame Analysis, Blink and stacking now measure stars the
+  same way, so their numbers agree.
+
+### Plate solving
+
+- **Much faster solves without coordinates.** Download the quad index packs in **Settings → Plate Solving**
+  once, and frames with no position in their header solve in a second or two.
+
+### Calibration
+
+- **Fewer wrong matches.** Darks and flats of a different frame size are never linked to your lights.
+- **Fix links faster:** select several groups on the Calibration Coverage tab and re-assign or unlink them
+  together.
+- **Find the right master quickly** with the new Size column and Gain, Bin and Size filters.
+- **Masters can be saved as XISF** as well as FITS.
+
+### Settings
+
+- **Simpler and searchable.** Every change saves by itself — there is no Save button — and a search box
+  finds any setting.
+
+## Good to know after updating
+
+- **Click Re-Analyze on your frame sets once** to measure them the new way; until then a set shows its old
+  numbers. The first stack of each set also takes a little longer once. Nothing is calibrated twice.
+- **Numbers shift slightly.** Star sizes on colour cameras read smaller and star counts higher than before,
+  so take a quick look at your rejection limits.
+- **Collaboration projects start in manual mode.** Nothing is published until you choose to.
 
 ## Bug Fixes
 
-- No application code changed between v0.6.3 and v0.6.4 apart from the
-  update mechanism above. Two things around it were fixed along the way:
-  the macOS disk images were being notarized twice per release, and the
-  slowest database tests on Windows were running with a stricter disk-sync
-  setting than the application itself uses, turning a one-second test into
-  a minute.
+- **Frames you moved to the Black Hole are now left out** of stacks, exports and frame sets sent to another
+  device. Before, some of them could still end up in the result — if you stacked or exported a set after
+  rejecting frames, run it again.
+- The stacking results show a realistic SNR gain; it used to read far too high.
+- The Export tab counts imaging nights correctly, and its folder preview no longer reshuffles.
+- Frame set cards show the right total exposure.
+- Colour cameras: hot pixels no longer make some frames count less than they should in the stack.
+- Some 16-bit FITS files and colour frames with an unusual Bayer layout now open with the right brightness
+  and colours.
+- A stack no longer fails to save its aligned frames when the reference frame has a very long file name.
