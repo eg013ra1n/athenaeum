@@ -1731,8 +1731,8 @@ pub const BLEND_SEED_GUARD: f64 = 0.5;
 /// [`RefusalReason::Blend`] when another seed of the plane's detection lies inside its half-maximum ellipse (centre
 /// `(x, y)`, semi-axes `fwhm_x / 2`, `fwhm_y / 2` turned by `theta`, [`inside_half_max`]) and at least
 /// [`BLEND_SEED_GUARD`]` · field_fwhm` from the fit's own seed. The plane's seeds are `neighbours.seeds` when the fit
-/// call was handed a subset of them (the budget's candidates, a population, a brightest prefix: every detected seed,
-/// fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
+/// call was handed a subset of them (the budget's candidates, the only caller that sets the flag since R-PC-10b: every
+/// detected seed, fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
 /// fit's own seed (`of_fit[i]`, else `i`) never counts. A refused fit leaves `accepted` (the order of the rest is
 /// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set. Runs only when
 /// the call's [`Correction::blend_refusal`] is set (the Analysis budget path, R-PC-10b).
@@ -4550,8 +4550,6 @@ mod tests {
             assert_eq!(on.trail_share, off.trail_share);
         }
 
-        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule -
-        /// the pair of `two_equal_stars_closer_than_their_contour_are_both_refused_blend` keeps both its fits.
         /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule. The
         /// plane is the second arm of `a_faint_companion_inside_the_contour_refuses_the_bright_star_blend`'s kind: a
         /// faint companion (0.2 of the bright amplitude) 1.0 F out, whose seed lies inside the bright fit's contour.
