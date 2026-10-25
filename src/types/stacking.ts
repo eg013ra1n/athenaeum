@@ -693,8 +693,18 @@ masterNoise: Array<number>, masterLocation: Array<number>, masterScale: Array<nu
  */
 bestSubNoise: Array<number>, masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>, 
 /**
- * `master_psf_snr / best_sub_psf_snr`; `0.0` (with a warn) when the
- * best sub's own PSF SNR is not positive.
+ * How many times the master's star SNR beats the best sub's, per
+ * plane — an SNR (amplitude) factor, `√(PSF SNR master / PSF SNR best
+ * sub)`, since PSF SNR is TFlux²/σ² (a power ratio). The two PSF SNRs
+ * are a PAIRED measurement ([`paired_snr_gain`]): the best sub read
+ * through the same registration warp the master was built from, both
+ * measured with the same options on the same rectangle — a smoothing
+ * interpolation lowers a warped image's noise, so a raw sub against
+ * the master over-states the gain (2026-10-25: set 109 read 751.98×
+ * and 777.33× for 208 and 160 frames; the ratio was a power ratio of a
+ * warped master over a raw sub). They are not `master_psf_snr` /
+ * `best_sub_psf_snr` above, which stay each image's own measurement.
+ * `0.0` (with a warn) when the pair cannot be measured.
  */
 snrGain: Array<number>, masterFwhmPx: Array<number>, masterEccentricity: Array<number>, 
 /**
