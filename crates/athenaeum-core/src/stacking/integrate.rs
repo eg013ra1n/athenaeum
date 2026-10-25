@@ -542,8 +542,18 @@ pub struct GroupStats {
     pub best_sub_noise: Vec<f64>,
     pub master_psf_snr: Vec<f64>,
     pub best_sub_psf_snr: Vec<f64>,
-    /// `master_psf_snr / best_sub_psf_snr`; `0.0` (with a warn) when the
-    /// best sub's own PSF SNR is not positive.
+    /// How many times the master's star SNR beats the best sub's, per
+    /// plane — an SNR (amplitude) factor, `√(PSF SNR master / PSF SNR best
+    /// sub)`, since PSF SNR is TFlux²/σ² (a power ratio). The two PSF SNRs
+    /// are a PAIRED measurement ([`paired_snr_gain`]): the best sub read
+    /// through the same registration warp the master was built from, both
+    /// measured with the same options on the same rectangle — a smoothing
+    /// interpolation lowers a warped image's noise, so a raw sub against
+    /// the master over-states the gain (2026-10-25: set 109 read 751.98×
+    /// and 777.33× for 208 and 160 frames; the ratio was a power ratio of a
+    /// warped master over a raw sub). They are not `master_psf_snr` /
+    /// `best_sub_psf_snr` above, which stay each image's own measurement.
+    /// `0.0` (with a warn) when the pair cannot be measured.
     pub snr_gain: Vec<f64>,
     pub master_fwhm_px: Vec<f64>,
     pub master_eccentricity: Vec<f64>,
@@ -675,6 +685,149 @@ pub(crate) struct CoverageOptions {
     pub count: bool,
     /// Leave every plane's uncovered pixels NaN (a project's LN reference).
     pub empty_as_nan: bool,
+}
+
+/// [`GroupStats::snr_gain`], per plane: `√(PSF SNR master / PSF SNR best
+/// sub)` from a paired measurement.
+///
+/// PSF SNR is `TFlux² / σ²`, a power ratio, so the gain in SNR is its square
+/// root. And the two must be measured alike: the master is an average of
+/// WARPED frames, and the registration interpolation (the default cubic
+/// B-spline smooths, `1/6 4/6 1/6`) lowers the noise of every frame it
+/// resamples — the best sub's own measurement, taken on its raw pixels
+/// before registration, has none of that. So the best sub is read here
+/// through the very source [`integrate_planes`] read it from
+/// ([`materialized_frame`]: its registered artifact or the on-the-fly warp),
+/// and both images are measured with `measure` (the master's options) on
+/// one rectangle: the largest one inside `base` (the master's own
+/// statistics rectangle) where both are finite — a warped frame is NaN
+/// outside its footprint, and TFlux sums over the stars in the rectangle,
+/// so the areas must match.
+///
+/// One frame plane resident at a time (plus its crop). `0.0` for every
+/// plane, with a warn, when the common rectangle is under
+/// [`MIN_STATS_RECT_PX`]; `0.0` for a plane whose pair has no usable PSF SNR.
+fn paired_snr_gain(
+    input: &GroupInput<'_>,
+    best: &StackFrame,
+    master: &[f32],
+    base: crate::stacking::crop::CropRect,
+    measure: &MeasureOptions,
+    pool: &Arc<rayon::ThreadPool>,
+    cancel: &AtomicBool,
+) -> Result<Vec<f64>, IntegrationError> {
+    use crate::integration::banded::BandPlanes;
+    use crate::integration::source::FrameSource;
+    use crate::stacking::crop::{crop_plane, largest_covered_rect, CropRect};
+
+    let (w, h, channels) = (input.width, input.height, input.channels);
+    let plane_len = w * h;
+    let mut src = RegisteredSource::open_materialized(
+        &[materialized_frame(best)],
+        w,
+        h,
+        0,
+        input.interpolation,
+        input.clamping,
+    )?
+    .with_pool(Arc::clone(pool));
+    let mut band = BandPlanes::new(&src);
+    let mut plane = vec![0f32; plane_len];
+    let mut rect: Option<CropRect> = None;
+    let mut sub_planes: Vec<Vec<f32>> = Vec::with_capacity(channels);
+    for p in 0..channels {
+        if cancel.load(Ordering::Relaxed) {
+            warn!(plane = p, "group integration cancelled");
+            return Err(IntegrationError::Cancelled);
+        }
+        src.set_plane(p)?;
+        src.read_band_with_progress(0, h, &mut band, 1, &|_: u64| {}, cancel)?;
+        band.decode_frame_into(0, &mut plane);
+        if p == 0 {
+            let mut both = vec![f32::NAN; plane_len];
+            for y in base.y0..(base.y0 + base.height).min(h) {
+                for x in base.x0..(base.x0 + base.width).min(w) {
+                    let k = y * w + x;
+                    if plane[k].is_finite() && master[k].is_finite() {
+                        both[k] = 1.0;
+                    }
+                }
+            }
+            rect = largest_covered_rect(&both, w, h, 1)
+                .filter(|r| r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX);
+            if rect.is_none() {
+                warn!(
+                    frame_id = best.frame_id,
+                    "snr_gain not measured: the best sub and the master share no usable rectangle; reporting 0.0"
+                );
+                return Ok(vec![0.0; channels]);
+            }
+        }
+        let r = rect.expect("set on plane 0");
+        sub_planes.push(crop_plane(&plane, w, r));
+    }
+    drop(plane);
+    drop(band);
+    drop(src);
+    let r = rect.expect("channels >= 1");
+
+    let measure_pair = |planes: &(dyn Fn(usize) -> Vec<f32> + Sync)| {
+        pool.install(|| {
+            measure_planes_diagnosed(
+                channels,
+                r.width,
+                r.height,
+                measure,
+                None,
+                SeedOverride::Fast,
+                false,
+                // Both images are resampled: mixed pixels (ruling C-10).
+                crate::star_measure::PixelNoise::Mixed,
+                None,
+                |p| {
+                    if cancel.load(Ordering::Relaxed) {
+                        warn!(plane = p, "group integration cancelled");
+                        return Err(IntegrationError::Cancelled);
+                    }
+                    Ok(Cow::Owned(planes(p)))
+                },
+            )
+        })
+    };
+    let master_m =
+        measure_pair(&|p| crop_plane(&master[p * plane_len..(p + 1) * plane_len], w, r))?;
+    let sub_m = measure_pair(&|p| sub_planes[p].clone())?;
+
+    Ok(master_m
+        .iter()
+        .zip(sub_m.iter())
+        .enumerate()
+        .map(|(p, (m, s))| {
+            let (master_snr, sub_snr) = (m.measurement.channel.psf_snr, s.measurement.channel.psf_snr);
+            let gain = if sub_snr > 0.0 { (master_snr / sub_snr).sqrt() } else { f64::NAN };
+            debug!(
+                plane = p,
+                frame_id = best.frame_id,
+                master_psf_snr = master_snr,
+                best_sub_psf_snr = sub_snr,
+                crop_x0 = r.x0,
+                crop_y0 = r.y0,
+                crop_width = r.width,
+                crop_height = r.height,
+                snr_gain = gain,
+                "snr gain measured"
+            );
+            if gain.is_finite() {
+                gain
+            } else {
+                warn!(
+                    plane = p,
+                    "snr_gain is not finite (the paired best sub has no usable PSF SNR); reporting 0.0"
+                );
+                0.0
+            }
+        })
+        .collect())
 }
 
 /// How [`integrate_planes`] reads one frame: its materialized registered
@@ -1627,27 +1780,25 @@ pub fn integrate_group(
         let best_ch = &frames[best_idx].measurement.channels[p];
         best_sub_noise.push(best_ch.noise);
         best_sub_psf_snr.push(best_ch.psf_snr);
-        let gain = if best_ch.psf_snr > 0.0 {
-            cm.psf_snr / best_ch.psf_snr
-        } else {
-            f64::NAN
-        };
-        let gain = if gain.is_finite() {
-            gain
-        } else {
-            warn!(
-                plane = p,
-                "snr_gain is not finite (the best sub has no usable PSF SNR); reporting 0.0"
-            );
-            0.0
-        };
-        snr_gain.push(gain);
         debug!(
             plane = p,
             duration_ms = measured.wall_ms,
             "master plane measured"
         );
     }
+
+    snr_gain.extend(paired_snr_gain(
+        input,
+        &frames[best_idx],
+        &data,
+        measure_rect.unwrap_or(crate::stacking::crop::CropRect::full(
+            input.width,
+            input.height,
+        )),
+        &master_measure,
+        pool,
+        cancel,
+    )?);
 
     let rejected_fraction_per_frame: Vec<f64> = (0..included_count)
         .map(|k| {
@@ -2351,6 +2502,117 @@ mod tests {
         }
     }
 
+    /// The SNR gain is an SNR factor, measured like for like (2026-10-25:
+    /// set 109 read 751.98× for 208 frames). Eight equal frames — same
+    /// noise, same weight, sub-pixel dithers — integrated through the
+    /// smoothing cubic B-spline the registration defaults to: averaging N
+    /// equal frames raises the SNR by √N, and the gain must land there. The
+    /// old figure (a PSF SNR ratio, i.e. a power ratio, of the warped
+    /// master over the raw best sub) is far past even N here.
+    #[test]
+    fn snr_gain_of_n_equal_frames_is_about_root_n() {
+        const FW: usize = 400;
+        const FH: usize = 300;
+        const BG: f32 = 0.08;
+        const NOISE: f32 = 0.01;
+        let stars: Vec<(f64, f64, f64)> = (0..3)
+            .flat_map(|j| {
+                (0..4).map(move |i| (50.0 + i as f64 * 100.0, 50.0 + j as f64 * 100.0, 0.25))
+            })
+            .collect();
+        let shifts: [(f64, f64); 8] = [
+            (0.0, 0.0),
+            (0.5, 0.5),
+            (1.3, -0.7),
+            (-2.25, 1.6),
+            (0.8, 2.4),
+            (-1.1, -1.9),
+            (2.7, 0.35),
+            (-0.45, -2.6),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let frames: Vec<StackFrame> = shifts
+            .iter()
+            .enumerate()
+            .map(|(i, &(dx, dy))| {
+                let shifted: Vec<(f64, f64, f64)> =
+                    stars.iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+                let mut data = gaussian_field(FW, FH, &shifted, 1.8, BG);
+                add_noise(&mut data, NOISE, 700 + i as u64);
+                let path = dir.path().join(format!("n{i}.fits"));
+                write_fits_f32(&path, FW, FH, 1, &data, &[]).unwrap();
+                let map = if i == 0 {
+                    identity_map()
+                } else {
+                    shift_map(dx, dy)
+                };
+                let measurement = measure_frame(
+                    &path,
+                    &MeasureOptions::default(),
+                    None,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                StackFrame {
+                    path,
+                    map,
+                    measurement,
+                    weight: weight(1.0, 1),
+                    exposure_s: 60.0,
+                    date_obs: None,
+                    frame_id: 910_000 + i as i64,
+                    registered_path: None,
+                }
+            })
+            .collect();
+
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: FW,
+            height: FH,
+            channels: 1,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+            stats_on_covered: false,
+        };
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
+        };
+        let out = integrate_group(
+            &input,
+            &MeasureOptions::default(),
+            &pool(),
+            &AtomicBool::new(false),
+            &progress,
+            io(40_000_000),
+        )
+        .unwrap();
+        assert_eq!(out.stats.included, 8);
+        let gain = out.stats.snr_gain[0];
+        let root_n = 8f64.sqrt();
+        let old = out.stats.master_psf_snr[0] / out.stats.best_sub_psf_snr[0];
+        assert!(
+            gain > 0.75 * root_n && gain < 1.25 * root_n,
+            "gain {gain}, √N {root_n} (the old power ratio of the warped master over the raw sub: {old})"
+        );
+        assert!(old > 8.0, "the old figure overshot even N: {old}");
+    }
+
     const SHIFTED_EXPOSURES: [f64; 3] = [60.0, 90.0, 120.0];
     const SHIFTED_WEIGHTS: [f64; 3] = [1.0, 0.8, 0.6];
 
@@ -2537,18 +2799,14 @@ mod tests {
             "snr_gain {}",
             out.stats.snr_gain[0]
         );
-        // `psf_snr` is already TFlux²/σ_N² (PSFSNR_NUM·TFlux² over
-        // PSFSNR_DEN·σ_N² — see `psf_signal::psf_snr`), so for N
-        // near-equally-weighted, near-equal-noise frames the natural
-        // ceiling on `snr_gain` is N itself (noise variance drops by N,
-        // and gain is a ratio of variances), not √N — measured 3.14 on
-        // this fixture (weights 1.0/0.8/0.6, effective N ≈ 2.9), just
-        // over the N=3 ceiling from the master's own fit noise. The
-        // sanity check is against an unbounded/runaway gain, not a tight
-        // theoretical bound.
+        // `snr_gain` is an SNR factor (the square root of the paired PSF
+        // SNR ratio, `paired_snr_gain`), so three frames cannot lift it
+        // much past √3 ≈ 1.73 — the margin is the fit noise of a 12-star
+        // fixture. `snr_gain_of_n_equal_frames_is_about_root_n` pins the
+        // value itself.
         assert!(
-            out.stats.snr_gain[0] < 3.5,
-            "gain {} — a 3-frame stack cannot run away past its own frame count",
+            out.stats.snr_gain[0] < 2.0,
+            "gain {} — a 3-frame stack cannot run away past √3",
             out.stats.snr_gain[0]
         );
 
