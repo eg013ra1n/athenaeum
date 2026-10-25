@@ -1641,7 +1641,7 @@ export function CalibrationTableView({
     <div
       ref={containerRef}
       aria-disabled={locked || undefined}
-      className={`flex flex-col h-full overflow-hidden border border-border/40 bg-surface ${locked ? 'opacity-60' : ''}`}
+      className={`flex flex-col h-full overflow-hidden rounded-lg border border-border/50 bg-surface ${locked ? 'opacity-60' : ''}`}
     >
       {/* Top: Lights */}
       <div style={{ height: `${splitPct}%` }} className="flex flex-col min-h-0">

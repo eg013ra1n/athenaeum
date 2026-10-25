@@ -142,7 +142,7 @@ export function ReassignFramePanel({
 
   if (lightRows.length === 0) {
     return (
-      <div className="flex flex-col h-full border-l border-border/40 bg-surface">
+      <div className="flex flex-col h-full overflow-hidden rounded-lg border border-border/50 bg-surface">
         <div className="px-3 py-2 border-b border-border/40 bg-surface-elevated flex-shrink-0">
           <span className="text-xs font-semibold uppercase tracking-wider text-content-muted">
             Re-assign Frames
@@ -167,7 +167,7 @@ export function ReassignFramePanel({
     : `${lightRows.length} groups · ${frames.length} frames`;
 
   return (
-    <div className="flex flex-col h-full border-l border-border/40 bg-surface min-w-0">
+    <div className="flex flex-col h-full overflow-hidden rounded-lg border border-border/50 bg-surface min-w-0">
       {/* Header */}
       <div className="px-3 py-2 border-b border-border/40 bg-surface-elevated flex-shrink-0 flex items-center justify-between gap-2">
         <div className="min-w-0">

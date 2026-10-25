@@ -365,7 +365,7 @@ export function CalibrationHierarchyView({
           {/* Left Panel — Find Calibration + Tree */}
           <div className="w-80 flex-shrink-0 flex flex-col">
             {/* View Mode Toggle */}
-            <div className="flex mb-1 rounded-lg border border-border/50 overflow-hidden">
+            <div className="flex h-7 mb-2 flex-shrink-0 rounded-lg border border-border/50 overflow-hidden">
               <button
                 onClick={() => handleViewModeChange('by-night')}
                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 text-xs font-medium transition-colors ${
@@ -449,7 +449,7 @@ export function CalibrationHierarchyView({
           <div className="flex-1 min-w-0 flex flex-col gap-2">
             {/* Toolbar */}
             {frameSetId && frameSetName && (
-              <div className="flex items-start gap-2 flex-wrap flex-shrink-0">
+              <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
                 <AttestationToggle
                   framesSetId={frameSetId}
                   calibratedExternally={calibratedExternally}
@@ -457,17 +457,12 @@ export function CalibrationHierarchyView({
                   onChanged={() => onAttestationChanged?.()}
                 />
                 <div aria-hidden className="h-7 w-px bg-border mx-1 flex-shrink-0" />
-                <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-                  <CalibrationFinderButton
-                    frameSetId={frameSetId}
-                    frameSetName={frameSetName}
-                    onComplete={() => { onCalibrationComplete?.(); onRefresh?.(); }}
-                    disabled={calibratedExternally}
-                  />
-                  <span className="text-[10px] text-content-muted leading-tight">
-                    {data.calibrated_frames}/{data.total_frames}
-                  </span>
-                </div>
+                <CalibrationFinderButton
+                  frameSetId={frameSetId}
+                  frameSetName={frameSetName}
+                  onComplete={() => { onCalibrationComplete?.(); onRefresh?.(); }}
+                  disabled={calibratedExternally}
+                />
                 <UnlinkCalibrationButton
                   selectedFrameIds={lightSelection.frameIds}
                   selectedGroupCount={lightSelection.groupCount}
@@ -505,21 +500,23 @@ export function CalibrationHierarchyView({
               </p>
             )}
 
-            <CalibrationTableView
-              data={data}
-              allFrames={allFrames}
-              visibleFrameIds={visibleFrameIds}
-              analysisData={analysisData}
-              onManualCalibration={openManualCalibrationForFrameIds}
-              onBlink={onBlink}
-              reassignMode={reassignMode}
-              highlightCalSet={highlightCalSet}
-              onHighlightConsumed={onHighlightConsumed}
-              onCreateMaster={(setId) => setBatchDialogIds([setId])}
-              buildStateBySet={buildStateBySet}
-              onLightSelectionChange={setLightSelection}
-              locked={calibratedExternally}
-            />
+            <div className="flex-1 min-h-0">
+              <CalibrationTableView
+                data={data}
+                allFrames={allFrames}
+                visibleFrameIds={visibleFrameIds}
+                analysisData={analysisData}
+                onManualCalibration={openManualCalibrationForFrameIds}
+                onBlink={onBlink}
+                reassignMode={reassignMode}
+                highlightCalSet={highlightCalSet}
+                onHighlightConsumed={onHighlightConsumed}
+                onCreateMaster={(setId) => setBatchDialogIds([setId])}
+                buildStateBySet={buildStateBySet}
+                onLightSelectionChange={setLightSelection}
+                locked={calibratedExternally}
+              />
+            </div>
             <BlackholedFramesSection frames={blackholedFrames} />
 
             {/* Action bar: when tree groups are checked */}
