@@ -971,20 +971,20 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
               origVal !== VARIES &&
               !valuesMatch;
             // Three-column row layout:
-            //   - Left (140px): label only.
+            //   - Left (up to 110px): label only.
             //   - Middle (1fr): current value (and original when overridden).
-            //     `break-all` lets long timestamps and sexagesimal RA/DEC
-            //     wrap if the column gets squeezed instead of truncating
-            //     with an ellipsis.
-            //   - Right (320px fixed): checkbox + input + revert. Capped
+            //     `break-words` wraps at spaces and only splits a word that is
+            //     wider than the column (long timestamps, sexagesimal RA/DEC),
+            //     so "Horsehead Nebula" and "(varies)" never break mid-word.
+            //   - Right (9 to 18rem): checkbox + input + revert. Capped
             //     width so short numeric values (gain=56, offset=30) don't
-            //     get a half-screen-wide input box, and so the middle
-            //     column always has room to display the current value.
+            //     get a half-screen-wide input box, and floored middle
+            //     column (5.5rem) so the current value always has room.
             return (
-              <div key={f.key as string} className="grid grid-cols-[140px_1fr_320px] gap-3 items-center">
+              <div key={f.key as string} className="grid grid-cols-[minmax(0,110px)_minmax(5.5rem,1fr)_minmax(9rem,18rem)] gap-3 items-center">
                 <label className="text-xs font-mono text-content-muted">{f.label}</label>
                 <div
-                  className={`text-xs font-mono break-all min-w-0 ${cv === VARIES ? 'text-amber-400' : 'text-content/80'}`}
+                  className={`text-xs font-mono break-words min-w-0 ${cv === VARIES ? 'text-amber-400' : 'text-content/80'}`}
                   title={displayCurrent + (showRevert ? `  ·  original: ${displayOriginal}` : '')}
                 >
                   {displayCurrent}
