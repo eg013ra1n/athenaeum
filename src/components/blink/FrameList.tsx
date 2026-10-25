@@ -1,4 +1,4 @@
-import React, { memo, useMemo } from "react";
+import React, { memo, useEffect, useMemo, useRef } from "react";
 import {
   Loader2,
   CheckSquare,
@@ -66,6 +66,16 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   hideLocate = false,
 }) {
   const navigate = useNavigate();
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Keep the frame on the canvas in view: arrow keys and Space move
+  // `currentIndex` without touching the list, so a long list would scroll away
+  // from the current row. `nearest` leaves the list still when the row is
+  // already visible.
+  useEffect(() => {
+    const row = scrollRef.current?.querySelector<HTMLElement>(`[data-frame-index="${currentIndex}"]`);
+    row?.scrollIntoView?.({ block: 'nearest' });
+  }, [currentIndex, sortField, sortDirection]);
 
   // Compute sorted display order (array of original indices)
   const sortedIndices = useMemo(() => {
@@ -161,7 +171,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
       </div>
 
       {/* Scrollable frame list */}
-      <div className="flex-1 overflow-y-auto select-none">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto select-none">
         {sortedIndices.map((index) => {
             const frame = frames[index];
             const isSelected = selectedFrames.has(index);
@@ -194,6 +204,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
             return (
               <div
                 key={frame.key ?? frame.file.id ?? index}
+                data-frame-index={index}
                 onClick={(e) => onFrameClick(index, e)}
                 className={rowClasses}
                 title={frame.file.filename}
