@@ -304,16 +304,7 @@ pub fn size_for_set(
 
 /// A set's agreed size, origin, and whether its members disagree.
 pub fn geometry_for_set(conn: &Connection, set_id: i64) -> rusqlite::Result<Geometry> {
-    let (w_min, w_max, h_min, h_max): (Option<i32>, Option<i32>, Option<i32>, Option<i32>) = conn
-        .query_row(
-        "SELECT MIN(f.naxis1), MAX(f.naxis1), MIN(f.naxis2), MAX(f.naxis2)
-             FROM calibration_set_frames csf
-             JOIN frames f ON f.id = csf.frame_id
-             WHERE csf.set_id = ?1",
-        params![set_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
-    let (size, mixed) = size_from_aggregate(w_min, w_max, h_min, h_max);
+    let (size, mixed) = size_for_set(conn, set_id)?;
     let origin = if mixed {
         None
     } else {

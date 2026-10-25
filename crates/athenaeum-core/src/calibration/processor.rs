@@ -224,6 +224,9 @@ pub fn process_frame_set(
 
     let mut stats = ProcessingStats::new();
     let total_frames = frames.len();
+    // Candidate comparisons that met an unrecorded size are tallied by the
+    // matcher; this call reports them once at the end.
+    let _ = crate::calibration::configurable_matcher::take_geometry_unknown_tally();
 
     // Process each frame
     for (index, frame) in frames.iter().enumerate() {
@@ -274,6 +277,16 @@ pub fn process_frame_set(
                 "processing frame set: progress"
             );
         }
+    }
+
+    let geometry_unknown = crate::calibration::configurable_matcher::take_geometry_unknown_tally();
+    if geometry_unknown > 0 {
+        // Ruling R1: an unrecorded size blocks nothing, but never silently.
+        tracing::warn!(
+            frame_set_id,
+            count = geometry_unknown,
+            "calibration geometry not recorded on one side; size not compared"
+        );
     }
 
     Ok(stats)

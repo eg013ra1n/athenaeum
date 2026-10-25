@@ -252,7 +252,7 @@ pub fn get_sub_calibration_details(
 
     for link in links {
         // Get the full details of the linked calibration set
-        if let Ok(set_detail) = get_calibration_set_detail(conn, link.calibration_set_id) {
+        if let Some(set_detail) = set_detail_or_log(conn, link.calibration_set_id) {
             // Calculate date warning dynamically
             let date_warning = calculate_sub_calibration_date_warning(
                 &parent_set,
@@ -582,19 +582,19 @@ pub fn get_calibration_groups_for_frame_set(
 
     for ((flat_set_id, dark_set_id, bias_set_id), frame_ids_in_group) in groups_map {
         let flat_set_detail = if let Some(set_id) = flat_set_id {
-            get_calibration_set_detail(conn, set_id).ok()
+            set_detail_or_log(conn, set_id)
         } else {
             None
         };
 
         let dark_set_detail = if let Some(set_id) = dark_set_id {
-            get_calibration_set_detail(conn, set_id).ok()
+            set_detail_or_log(conn, set_id)
         } else {
             None
         };
 
         let bias_set_detail = if let Some(set_id) = bias_set_id {
-            get_calibration_set_detail(conn, set_id).ok()
+            set_detail_or_log(conn, set_id)
         } else {
             None
         };
@@ -1158,8 +1158,20 @@ fn set_detail_or_log(conn: &Connection, set_id: i64) -> Option<CalibrationSetDet
     match get_calibration_set_detail(conn, set_id) {
         Ok(detail) => Some(detail),
         Err(error) => {
-            tracing::warn!(set_id, %error, "calibration set detail failed; the hierarchy omits this set");
+            tracing::warn!(set_id, %error, "calibration set detail failed; the set is left out");
             None
+        }
+    }
+}
+
+/// `get_sub_calibration_details` for a hierarchy row: a failure is logged and
+/// the row shows no sub-calibrations (never silently).
+fn sub_details_or_log(conn: &Connection, set_id: i64) -> Vec<SubCalibrationDetail> {
+    match get_sub_calibration_details(conn, set_id) {
+        Ok(details) => details,
+        Err(error) => {
+            tracing::warn!(set_id, %error, "sub-calibration details failed; the hierarchy shows none for this set");
+            Vec::new()
         }
     }
 }
@@ -1227,6 +1239,17 @@ pub fn get_calibration_hierarchy_for_frame_set(
     // One light cache for the whole view: a light's header is read at most
     // once however many sets compare against it (review I-1).
     let mut light_cache = crate::calibration::geometry::LightGeometryCache::new();
+    get_calibration_hierarchy_with_cache(conn, frame_set_id, &mut light_cache)
+}
+
+/// [`get_calibration_hierarchy_for_frame_set`] over a caller-owned light
+/// geometry cache, so a test can observe that the flat, dark and bias sets
+/// of the whole view share one (review t5fix-t6 M-3).
+fn get_calibration_hierarchy_with_cache(
+    conn: &Connection,
+    frame_set_id: i64,
+    light_cache: &mut crate::calibration::geometry::LightGeometryCache,
+) -> Result<CalibrationHierarchyView> {
     // Step 1: Get all LIGHT frames in the frame set with metadata
     let mut stmt = conn.prepare(
         "SELECT
@@ -1548,11 +1571,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
                                 set_id,
                                 &frame_ids,
                                 "Flat",
-                                &mut light_cache,
+                                light_cache,
                                 &mut warnings,
                             );
-                            let sub_calibration =
-                                get_sub_calibration_details(conn, set_id).unwrap_or_default();
+                            let sub_calibration = sub_details_or_log(conn, set_id);
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
@@ -1576,11 +1598,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
                                 set_id,
                                 &frame_ids,
                                 "Dark",
-                                &mut light_cache,
+                                light_cache,
                                 &mut warnings,
                             );
-                            let sub_calibration =
-                                get_sub_calibration_details(conn, set_id).unwrap_or_default();
+                            let sub_calibration = sub_details_or_log(conn, set_id);
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
@@ -1605,7 +1626,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
                                 set_id,
                                 &frame_ids,
                                 "Bias",
-                                &mut light_cache,
+                                light_cache,
                                 &mut warnings,
                             );
                             Some(CalibrationSetWithFrameCount {
@@ -2300,6 +2321,82 @@ mod night_grouping_tests {
         assert!(
             !view.date_groups[0].camera_groups[0].filter_groups[0].has_warnings,
             "no origin warning, no roll-up badge"
+        );
+    }
+
+    /// Review t5fix-t6 M-3: the flat, dark and bias sets of one view compare
+    /// against ONE light cache - a light's stored header is parsed once, not
+    /// once per calibration type.
+    #[test]
+    fn hierarchy_shares_one_origin_cache_across_flat_dark_bias() {
+        use crate::calibration::geometry::test_support::{
+            add_members, fits_header_text, seed_frame,
+        };
+        let conn = db();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'Horsehead')",
+            [],
+        )
+        .unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[(10, "2025-10-18T18:00:00Z")],
+        );
+        conn.execute(
+            "UPDATE frames SET naxis1 = 6384, naxis2 = 4258 WHERE id = 10",
+            [],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(&conn, 10, &fits_header_text(Some((1584, 1064)))).unwrap();
+        for (set_id, imagetyp, cal_type) in [
+            (500, "MasterDark", "Dark"),
+            (501, "MasterFlat", "Flat"),
+            (502, "MasterBias", "Bias"),
+        ] {
+            conn.execute(
+                "INSERT INTO calibration_set (id, imagetyp, date) VALUES (?1, ?2, '2025-10-18')",
+                rusqlite::params![set_id, imagetyp],
+            )
+            .unwrap();
+            let m = seed_frame(
+                &conn,
+                &format!("m{set_id}"),
+                imagetyp,
+                Some((6384, 4258)),
+                Some((0, 0)),
+            );
+            add_members(&conn, set_id, &[m]);
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, matched_at, is_manual_override)
+                 VALUES (10, 'frame', ?1, ?2, '2025-10-18T00:00:00Z', 1)",
+                rusqlite::params![set_id, cal_type],
+            )
+            .unwrap();
+        }
+
+        let mut cache = crate::calibration::geometry::LightGeometryCache::new();
+        let view = get_calibration_hierarchy_with_cache(&conn, 1, &mut cache).unwrap();
+        let fg = &view.date_groups[0].camera_groups[0].filter_groups[0];
+        for (name, sets) in [
+            ("flat", &fg.flat_sets),
+            ("dark", &fg.dark_sets),
+            ("bias", &fg.bias_sets),
+        ] {
+            assert!(
+                sets[0]
+                    .warnings
+                    .iter()
+                    .any(|w| w.warning_type == "geometry"),
+                "{name} set shows the origin warning"
+            );
+        }
+        assert_eq!(
+            cache.origin_reads, 1,
+            "three sets, one light: its header is parsed once"
         );
     }
 }

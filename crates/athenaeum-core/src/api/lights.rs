@@ -1338,6 +1338,37 @@ mod tests {
         }
     }
 
+    /// R3 (wave 6 §13): an attested set's lights are copied as they are, so
+    /// even a size-misfit manual link yields neither a blocker nor a warning
+    /// (review t5fix-t6 M-3). The same fixture unattested is the control.
+    #[test]
+    fn readiness_judges_no_geometry_for_an_attested_set() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_size(&conn, 1, (9576, 6388));
+        seed_masters(&conn);
+        give_member(&conn, 100, "dark100", "MasterDark", (6384, 4258));
+        add_link(&conn, 1, 100, "Dark");
+
+        let control = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(control.geometry_mismatches.len(), 1, "the fixture misfits");
+
+        conn.execute(
+            "UPDATE frames_set SET calibrated_externally = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(r.attested);
+        assert!(
+            r.geometry_mismatches.is_empty(),
+            "{:?}",
+            r.geometry_mismatches
+        );
+        assert!(r.geometry_warnings.is_empty(), "{:?}", r.geometry_warnings);
+    }
+
     /// R8 (review I-4): the bias is judged exactly when no dark RESOLVED for
     /// the light — the fact the missing-master-file pass keys on — not when no
     /// Dark link exists; a set that records no size blocks nothing (R1).
@@ -1457,6 +1488,56 @@ mod tests {
         add_set_link(&conn, 200, 301, "Bias");
 
         let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.geometry_mismatches.len(),
+            1,
+            "{:?}",
+            r.geometry_mismatches
+        );
+        let m = &r.geometry_mismatches[0];
+        assert_eq!(
+            (
+                m.calibration_type.as_str(),
+                m.calibration_set_id,
+                m.source_set_id,
+                m.light_count
+            ),
+            ("Dark", 300, Some(200), 0)
+        );
+    }
+
+    /// R8 (review t5fix-t6 M-3): a MISSING master flat is rebuilt from its
+    /// raw source set, so that source's pre-calibration links are judged too -
+    /// the rebuild branch of the geometry pass (the light's own flat fits).
+    #[test]
+    fn readiness_names_a_misfit_precal_of_a_missing_master_flats_source() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_size(&conn, 1, (9576, 6388));
+        seed_masters(&conn); // 101 = the master flat; its member file is not on disk
+        give_member(&conn, 101, "flat101", "MasterFlat", (9576, 6388));
+        add_link(&conn, 1, 101, "Flat");
+        seed_set(&conn, 200, "Flat", false); // the raw source the master was built from
+        give_member(&conn, 200, "flat200", "Flat", (9576, 6388));
+        seed_set(&conn, 300, "MasterDark", true);
+        give_member(&conn, 300, "dark300", "MasterDark", (6384, 4258));
+        add_set_link(&conn, 200, 300, "Dark");
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 101,
+                source_set_id: Some(200),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "h".to_string(),
+                created_at: "2026-07-05T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(r.missing_master_files >= 1, "the master flat is missing");
         assert_eq!(
             r.geometry_mismatches.len(),
             1,

@@ -361,6 +361,20 @@ pub fn find_calibration_sets(
     )
 }
 
+thread_local! {
+    /// Candidates compared with an unrecorded size, summed over the
+    /// `find_calibration_candidates` calls of this thread since the last
+    /// [`take_geometry_unknown_tally`]. A sync Find Calibration run stays on
+    /// one thread, so it can reset the tally at its start and read it at its end.
+    static GEOMETRY_UNKNOWN_TALLY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Return and reset this thread's tally of candidates whose size was not
+/// recorded on one side (see `GEOMETRY_UNKNOWN_TALLY`).
+pub fn take_geometry_unknown_tally() -> usize {
+    GEOMETRY_UNKNOWN_TALLY.with(|t| t.replace(0))
+}
+
 /// Unified candidate engine used by both auto-link and the manual modal.
 ///
 /// Always queries both regular and master sets so the manual modal can show
@@ -645,11 +659,15 @@ pub fn find_calibration_candidates(
 
     if geometry_unknown > 0 {
         // Ruling R1: an unrecorded size blocks nothing, but never silently.
-        tracing::warn!(
+        // One `debug!` per light x type here; the Find Calibration call
+        // (`processor::process_frame_set`) emits ONE `warn!` summary from the
+        // tally (review t2-t3 M-2).
+        tracing::debug!(
             frame_id = frame.id.unwrap_or(-1),
             count = geometry_unknown,
             "calibration geometry not recorded on one side; size not compared"
         );
+        GEOMETRY_UNKNOWN_TALLY.with(|t| t.set(t.get() + geometry_unknown));
     }
 
     // Score-sort each group, descending. Every candidate in `compatible`
@@ -2347,5 +2365,27 @@ mod tests {
         let blind = tied_frame(&conn, "blind", ImageType::Light, None, None, None);
         let got = find_calibration_candidates(&conn, &blind, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
         assert_eq!(ids(&got), vec![unrecorded], "a frame of unknown size still never takes a mixed set");
+    }
+
+    /// Review t2-t3 M-2: the candidate engine logs an unrecorded size at
+    /// `debug!` per call and adds it to the thread's tally, which the Find
+    /// Calibration call (`process_frame_set`) reports in ONE `warn!`.
+    #[test]
+    fn geometry_unrecorded_is_tallied_not_warned_per_call() {
+        const MESSAGE: &str = "calibration geometry not recorded on one side; size not compared";
+        let conn = engine_test_db();
+        tied_set(&conn, 1, "Dark", None, "2023-07-27T00:00:00+00:00", None, None, 0);
+        let config = CalibrationMatchingConfig::default();
+        let light = tied_frame(&conn, "light", ImageType::Light, None, Some(FULL), None);
+
+        let _ = take_geometry_unknown_tally();
+        let (_, warns) = crate::calibration::geometry::test_support::count_warns(MESSAGE, || {
+            for _ in 0..3 {
+                find_calibration_candidates(&conn, &light, "lights", "dark", &config, CandidateMode::OnlyCompatible).unwrap();
+            }
+        });
+        assert_eq!(warns, 0, "no warn per light x type call");
+        assert_eq!(take_geometry_unknown_tally(), 3, "one unrecorded comparison per call");
+        assert_eq!(take_geometry_unknown_tally(), 0, "taking resets the tally");
     }
 }

@@ -236,11 +236,17 @@ fn members_origin(conn: &Connection, set_id: i64) -> Result<Option<(i32, i32)>> 
         .collect::<rusqlite::Result<_>>()?;
     let mut origins = Vec::with_capacity(file_ids.len());
     for &file_id in &file_ids {
-        origins.push(crate::calibration::geometry::origin_for_file(conn, file_id)?);
+        origins.push(crate::calibration::geometry::origin_for_file(
+            conn, file_id,
+        )?);
     }
     let recorded: Vec<(i32, i32)> = origins.iter().flatten().copied().collect();
     if recorded.is_empty() {
-        debug!(set_id, count = file_ids.len(), "no member records a sub-frame origin; master origin not stamped");
+        debug!(
+            set_id,
+            count = file_ids.len(),
+            "no member records a sub-frame origin; master origin not stamped"
+        );
         return Ok(None);
     }
     let first = recorded[0];
@@ -479,12 +485,18 @@ pub fn build_master_cards(
     // calibration-geometry origin rule can judge this master like a raw set.
     if let Some((x, y)) = inputs.origin {
         b = b.custom(
-            Card::new("XORGSUBF", crate::fits_writer::CardValue::Integer(i64::from(x)))?
-                .with_comment("Subframe X position"),
+            Card::new(
+                "XORGSUBF",
+                crate::fits_writer::CardValue::Integer(i64::from(x)),
+            )?
+            .with_comment("Subframe X position"),
         );
         b = b.custom(
-            Card::new("YORGSUBF", crate::fits_writer::CardValue::Integer(i64::from(y)))?
-                .with_comment("Subframe Y position"),
+            Card::new(
+                "YORGSUBF",
+                crate::fits_writer::CardValue::Integer(i64::from(y)),
+            )?
+            .with_comment("Subframe Y position"),
         );
     }
     b = b
@@ -684,7 +696,11 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(file_ids.len(), origins.len(), "fixture must cover every member");
+        assert_eq!(
+            file_ids.len(),
+            origins.len(),
+            "fixture must cover every member"
+        );
         for (file_id, origin) in file_ids.into_iter().zip(origins) {
             crate::db::insert_fits_header(
                 conn,
@@ -711,18 +727,25 @@ mod tests {
     /// G-5: members that disagree, or some that record none - no stamp, one warn.
     #[test]
     fn master_origin_is_not_stamped_when_members_disagree_or_some_record_none() {
-        for origins in [[Some((1584, 1064)), Some((0, 0))], [Some((1584, 1064)), None]] {
+        for origins in [
+            [Some((1584, 1064)), Some((0, 0))],
+            [Some((1584, 1064)), None],
+        ] {
             let conn = Connection::open_in_memory().unwrap();
             let set_id = seed(&conn);
             stamp_member_origins(&conn, set_id, &origins);
-            let (inputs, warns) = crate::calibration::geometry::test_support::count_warns(
-                NOT_STAMPED,
-                || load_header_inputs(&conn, set_id).unwrap(),
-            );
+            let (inputs, warns) =
+                crate::calibration::geometry::test_support::count_warns(NOT_STAMPED, || {
+                    load_header_inputs(&conn, set_id).unwrap()
+                });
             assert_eq!(inputs.origin, None, "{origins:?}");
             assert_eq!(warns, 1, "{origins:?}");
-            let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", None, None).unwrap();
-            assert!(!has_card(&cards, "XORGSUBF") && !has_card(&cards, "YORGSUBF"), "{origins:?}");
+            let cards =
+                build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", None, None).unwrap();
+            assert!(
+                !has_card(&cards, "XORGSUBF") && !has_card(&cards, "YORGSUBF"),
+                "{origins:?}"
+            );
         }
     }
 
@@ -732,10 +755,10 @@ mod tests {
     fn master_origin_absent_when_no_member_records_one() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);
-        let (inputs, warns) = crate::calibration::geometry::test_support::count_warns(
-            NOT_STAMPED,
-            || load_header_inputs(&conn, set_id).unwrap(),
-        );
+        let (inputs, warns) =
+            crate::calibration::geometry::test_support::count_warns(NOT_STAMPED, || {
+                load_header_inputs(&conn, set_id).unwrap()
+            });
         assert_eq!(inputs.origin, None);
         assert_eq!(warns, 0);
         assert!(!has_card(&cards_for(&conn, set_id), "XORGSUBF"));
