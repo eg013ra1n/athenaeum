@@ -348,12 +348,12 @@ export default function BlackHole() {
     <div className="p-6 h-full flex flex-col">
       {/* Header */}
       <div className="mb-4 flex-shrink-0">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <div className="flex items-center gap-2 shrink-0">
             <HistoryNav />
             <div>
               <h2 className="text-3xl font-bold">Black Hole</h2>
-              <p className="text-content-muted mt-1">
+              <p className="text-content-muted mt-1 whitespace-nowrap">
                 {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
                 {selectionCount > 0 && (
                   <span className="text-warning ml-2">• {selectionCount} selected</span>
@@ -362,7 +362,7 @@ export default function BlackHole() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 [&_button]:whitespace-nowrap">
             {/* Action Buttons */}
             <button
               onClick={handleSelectAll}
