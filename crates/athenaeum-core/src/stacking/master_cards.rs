@@ -1244,6 +1244,7 @@ mod tests {
             master_psf_snr: vec![0.0; 3],
             best_sub_psf_snr: vec![0.0; 3],
             snr_gain: vec![0.0; 3],
+            snr_gain_version: crate::stacking::integrate::SNR_GAIN_VERSION,
             master_fwhm_px: vec![0.0; 3],
             master_eccentricity: vec![0.0; 3],
             weighted_exposure_s: 0.0,

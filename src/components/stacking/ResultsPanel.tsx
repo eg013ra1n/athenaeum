@@ -20,6 +20,7 @@ import type {
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
 import { ProvenanceModal } from './ProvenanceModal';
 import { formatBytes } from './formatBytes';
+import { snrGainLabel } from './snrGain';
 
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
@@ -237,6 +238,7 @@ function MasterCard({
   drizzleConfigEnabled: boolean;
 }) {
   const stats = parseGroupStats(group.statsJson);
+  const snrGain = stats ? snrGainLabel(stats) : null;
   const dstats = drizzleSummary?.drizzle ?? null;
 
   // M4d final review, Important #1 part 3: fetch the master's own thumbnail
@@ -300,7 +302,7 @@ function MasterCard({
           {' · '}
           {stats.masterNoise.length > 0 ? `noise ${stats.masterNoise[0].toExponential(3)}` : 'noise —'}
           {' · '}
-          {stats.snrGain.length > 0 ? `SNR gain ${stats.snrGain[0].toFixed(2)}×` : 'SNR gain —'}
+          <span title={snrGain?.title}>{snrGain?.text}</span>
           {/* M4c Task 3: only when the large-scale second pass actually
            *  ran — `null` means it was off, or it was asked for and could
            *  not run (the run's warnings say so), and a "0.000%" line

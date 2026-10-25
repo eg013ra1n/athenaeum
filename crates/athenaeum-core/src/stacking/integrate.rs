@@ -496,6 +496,12 @@ pub struct GroupInput<'a> {
     pub stats_on_covered: bool,
 }
 
+/// [`GroupStats::snr_gain_version`] of a gain measured now: `1` = the paired
+/// SNR factor `√(PSF SNR master / PSF SNR best sub)` (v0.7.0). Absent (`0`)
+/// = the pre-v0.7.0 unpaired power ratio. Bump it when the formula changes
+/// again, and teach `src/components/stacking/snrGain.ts` the new value.
+pub const SNR_GAIN_VERSION: u32 = 1;
+
 /// The smallest covered rectangle (per side, px) a grid master's statistics
 /// are measured on (plan 6b-3 D4 refinement). The noise and PSF estimators
 /// need a real image: B3-spline smoothing reflects two samples past an edge
@@ -555,6 +561,13 @@ pub struct GroupStats {
     /// `best_sub_psf_snr` above, which stay each image's own measurement.
     /// `0.0` (with a warn) when the pair cannot be measured.
     pub snr_gain: Vec<f64>,
+    /// Which formula [`Self::snr_gain`] was measured with:
+    /// [`SNR_GAIN_VERSION`] for the paired SNR factor above. A stats document
+    /// stored before v0.7.0 has no such key and reads `0`: its `snr_gain` is
+    /// the old unpaired power ratio (set 109's 751.98×), so the Results panel
+    /// shows "—" for it instead of passing it off as the same metric.
+    #[serde(default)]
+    pub snr_gain_version: u32,
     pub master_fwhm_px: Vec<f64>,
     pub master_eccentricity: Vec<f64>,
     /// `Σ exposure_i · weight_i` over included frames, `weight_i` the mean
@@ -1870,6 +1883,7 @@ pub fn integrate_group(
             master_psf_snr,
             best_sub_psf_snr,
             snr_gain,
+            snr_gain_version: SNR_GAIN_VERSION,
             master_fwhm_px,
             master_eccentricity,
             weighted_exposure_s,
@@ -2502,6 +2516,30 @@ mod tests {
         }
     }
 
+    /// A stats document stored before v0.7.0 has no `snrGainVersion` key: it
+    /// reads `0`, so its old power-ratio `snrGain` is told apart from a gain
+    /// measured now (the Results panel shows "—" for it). A current document
+    /// round-trips its version.
+    #[test]
+    fn a_pre_v070_stats_document_reads_snr_gain_version_0() {
+        let legacy = r#"{"frames":208,"included":208,"droppedBelowMinWeight":0,"recipe":"r",
+            "rejectedLowFraction":0.0,"rejectedHighFraction":0.0,"rejectedFractionPerFrame":[],
+            "masterNoise":[0.001],"masterLocation":[0.1],"masterScale":[0.01],"bestSubNoise":[0.01],
+            "masterPsfSnr":[5305.74],"bestSubPsfSnr":[7.0557],"snrGain":[751.98],
+            "masterFwhmPx":[2.5],"masterEccentricity":[0.4],"weightedExposureS":1.0,
+            "totalExposureS":1.0,"readMs":0,"combineMs":0,"bytesRead":0,"lnFrames":0}"#;
+        let old: GroupStats = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.snr_gain_version, 0);
+        assert_eq!(old.snr_gain, vec![751.98]);
+
+        let mut now = old;
+        now.snr_gain_version = SNR_GAIN_VERSION;
+        let json = serde_json::to_string(&now).unwrap();
+        assert!(json.contains(r#""snrGainVersion":1"#), "{json}");
+        let back: GroupStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.snr_gain_version, SNR_GAIN_VERSION);
+    }
+
     /// The SNR gain is an SNR factor, measured like for like (2026-10-25:
     /// set 109 read 751.98× for 208 frames). Eight equal frames — same
     /// noise, same weight, sub-pixel dithers — integrated through the
@@ -2603,6 +2641,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.stats.included, 8);
+        assert_eq!(out.stats.snr_gain_version, SNR_GAIN_VERSION);
         let gain = out.stats.snr_gain[0];
         let root_n = 8f64.sqrt();
         let old = out.stats.master_psf_snr[0] / out.stats.best_sub_psf_snr[0];

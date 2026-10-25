@@ -706,7 +706,15 @@ bestSubNoise: Array<number>, masterPsfSnr: Array<number>, bestSubPsfSnr: Array<n
  * `best_sub_psf_snr` above, which stay each image's own measurement.
  * `0.0` (with a warn) when the pair cannot be measured.
  */
-snrGain: Array<number>, masterFwhmPx: Array<number>, masterEccentricity: Array<number>, 
+snrGain: Array<number>, 
+/**
+ * Which formula [`Self::snr_gain`] was measured with:
+ * [`SNR_GAIN_VERSION`] for the paired SNR factor above. A stats document
+ * stored before v0.7.0 has no such key and reads `0`: its `snr_gain` is
+ * the old unpaired power ratio (set 109's 751.98×), so the Results panel
+ * shows "—" for it instead of passing it off as the same metric.
+ */
+snrGainVersion: number, masterFwhmPx: Array<number>, masterEccentricity: Array<number>, 
 /**
  * `Σ exposure_i · weight_i` over included frames, `weight_i` the mean
  * over planes of frame i's normalized weight (`FrameWeight::normalized_mean`).
