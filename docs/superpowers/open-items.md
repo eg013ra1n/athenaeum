@@ -296,9 +296,10 @@ review; what is missing is a human running the flow on real data.
 
 ### Quad index packs (2026-10-25)
 
-Code-complete with green gates; no human has downloaded a pack from a real host or solved through one in the app. The packs are not published yet
-(`catalog-builder publish-index`, then upload next to the tier files), so this needs them on `artfrom.space/catalogs/` or a local static host via
-`ATHENAEUM_CATALOG_BASE_URL`. Reference: `docs/platesolving/README.md` → Quad index packs.
+The packs are published on `artfrom.space/catalogs/` (`index_manifest.json`, `index_base.zip`, `index_narrow.zip`). Checked 2026-10-25 without a
+human at the screen: the web build's Quad Index block downloaded both packs from the real host (files byte-identical to the build), and a blind solve
+through `plate_solve::service::solve_frame_with_hints` with the installed packs matched the solve without them (M82 0.4 s vs 3.2 s, an M42 frame 1.5 s
+vs 3.1 s). Owed: the desktop build seen by the owner. Reference: `docs/platesolving/README.md` → Quad index packs.
 
 - **Download both packs** from Settings → Plate Solving (`base`, then `narrow`): progress runs, a re-run is a no-op, the rows show installed.
 - **Blind-solve a frame with no coordinates** (strip RA/Dec and the focal length, or use a frame the catalog has no position for) and look for
