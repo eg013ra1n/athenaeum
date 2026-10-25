@@ -47,6 +47,7 @@ export interface BlinkViewerProps {
 /** Props for the ToolBar component */
 export interface ToolBarProps {
   // Playback
+  /** The current frame's position in the frame list's sort order (what the arrow keys and Prev / Next step through). */
   currentIndex: number;
   totalFrames: number;
   isPlaying: boolean;

@@ -59,6 +59,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         <button
           onClick={onPrevious}
           disabled={currentIndex === 0}
+          title="Previous frame (↑)"
           className="p-2 rounded bg-surface-elevated hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           <ChevronLeft className="text-content" size={20} />
@@ -78,6 +79,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         <button
           onClick={onNext}
           disabled={currentIndex === totalFrames - 1}
+          title="Next frame (↓)"
           className="p-2 rounded bg-surface-elevated hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           <ChevronRight className="text-content" size={20} />

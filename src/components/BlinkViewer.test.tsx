@@ -258,3 +258,50 @@ describe('BlinkViewer — existing callers', () => {
     expect(await screen.findByText(/Blackhole \(1\)/)).toBeInTheDocument();
   });
 });
+
+describe('BlinkViewer — frame navigation keys', () => {
+  // Raw catalog frames (no project image ref) with a capture time, so the Time sort orders them.
+  const raw = (i: number, dateObs: string): BlinkFrame => entry(i, {
+    imageRef: undefined, key: undefined,
+    file: { id: 10 + i, path: `/r/r_${i}.fits`, filename: `r_${i}.fits`, format: 'FITS' } as CatalogFile,
+    frame: { id: 100 + i, date_obs: dateObs } as Frame,
+  });
+  const three = () => [raw(1, '2025-01-01T01:00:00'), raw(2, '2025-01-01T02:00:00'), raw(3, '2025-01-01T03:00:00')];
+  const counter = () => screen.getByText(/^\/ \d+$/).parentElement!.textContent;
+
+  it('the arrow keys step frames while every image is still caching; left / right set the speed', async () => {
+    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_blink_threads_max') return 2;
+      if (cmd === 'get_setting') return '';
+      if (cmd === 'get_blackholed_file_ids') return [];
+      if (cmd === 'read_fits_image_rustafits' || cmd === 'get_frame_preview') return new Promise(() => {}); // never cached
+      return null;
+    });
+    renderBlink({ frames: three() });
+    await waitFor(() => expect(invoked('read_fits_image_rustafits').length).toBeGreaterThan(0));
+    expect(counter()).toBe('1 / 3');
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(counter()).toBe('1 / 3');
+    expect(screen.getByText('3 FPS')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(counter()).toBe('3 / 3');
+    fireEvent.keyDown(window, { key: 'ArrowUp' });
+    expect(counter()).toBe('2 / 3');
+    expect(screen.getByTitle('Next frame (↓)')).toBeEnabled();
+  });
+
+  it('the counter and Prev / Next follow the frame list order, not the order the frames came in', async () => {
+    renderBlink({ frames: three() });
+    expect(counter()).toBe('1 / 3');
+    fireEvent.click(screen.getByRole('button', { name: /^Time/ })); // newest first: r_3, r_2, r_1
+    // r_1 is current and now last in the list: the counter says so and Next is the end.
+    expect(counter()).toBe('3 / 3');
+    expect(screen.getByTitle('Next frame (↓)')).toBeDisabled();
+    expect(screen.getByTitle('Previous frame (↑)')).toBeEnabled();
+    fireEvent.click(screen.getByTitle('Previous frame (↑)'));
+    expect(counter()).toBe('2 / 3');
+  });
+});

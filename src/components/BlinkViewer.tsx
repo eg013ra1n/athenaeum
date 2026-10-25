@@ -1073,7 +1073,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       {/* HEADER — toolbar + (project mode) context strip, measured for the canvas height */}
       <div ref={headerRef}>
         <ToolBar
-          currentIndex={currentIndex}
+          currentIndex={sortedPositionOf.get(currentIndex) ?? currentIndex}
           totalFrames={fitsFrames.length}
           isPlaying={isPlaying}
           blinkSpeed={blinkSpeed}
