@@ -291,6 +291,23 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 ## Unverified by hand
 
+### v0.7.0 pre-release fixes (2026-10-25)
+
+Found while capturing the docs screenshots; ledger `.superpowers/sdd/2026-10-25-v070-ui-fixes/` (brief + five task
+reports). Full core suite 4261/0, vitest 979/979 after the last fix. Owed on the owner's catalog:
+
+- **Black Hole exclusion.** Stack and export a set with blackholed lights (Horsehead C11, 25 of 164): the plan, the
+  Objects card, the export picker and the export all read 139, nothing blackholed lands on disk. A frame-set selection
+  send with a blackholed light skips it and says so. (Before 8ac8a09a / f3ffa775 such lights were stacked and
+  exported.)
+- **SNR gain on real data.** The new √(paired PSF SNR ratio) is checked only on synthetic frames (8 equal frames →
+  2.49 vs √8 = 2.83). Re-stack LDN 1272 and read the figure (expected roughly 10–15× for 208 frames); runs stored
+  before v0.7.0 show "SNR gain —".
+- **Export night count** (set 109 → 3 nights) and the deterministic folder preview, in the desktop app.
+- **Analysis rows predating Plan C** carry no stale mark; a set mixes old and new rows until Re-Analyze (owner call:
+  a stale marker, or the release-note line alone).
+- **Emptied duplicate sets 145 and 203** keep a stale date range and coordinates (owner call: prune or keep).
+
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
