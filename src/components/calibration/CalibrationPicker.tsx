@@ -9,6 +9,7 @@ import {
   camerasOf,
   EMPTY_FILTER,
   exposuresOf,
+  formatSeconds,
   filterIsActive,
   originNotesFor,
   slotsFor,
@@ -299,7 +300,7 @@ export function CalibrationPicker({
                 <option value="">Any exposure</option>
                 {exposures.map(e => (
                   <option key={e} value={String(e)}>
-                    {e} s
+                    {formatSeconds(e)}
                   </option>
                 ))}
               </select>

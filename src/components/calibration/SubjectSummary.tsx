@@ -1,8 +1,8 @@
-import { isoDay, type CandidateFilter, type Requirement } from './pickerModel';
+import { formatSeconds, isoDay, type CandidateFilter, type Requirement } from './pickerModel';
 
 function fmtExposure(v: number | null): string | null {
   if (v == null) return null;
-  return Number.isInteger(v) ? `${v} s` : `${v.toFixed(3)} s`;
+  return formatSeconds(v);
 }
 
 /**

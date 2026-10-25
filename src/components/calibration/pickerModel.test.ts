@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { describeDifference, geometryLabel, geometryRefuses, geometryWarns, originChoiceNote, originNotesFor, sizeCellState, writtenSubSlot, type SlotKind } from './pickerModel';
+import { describeDifference, formatSeconds, tidyNumbers, geometryLabel, geometryRefuses, geometryWarns, originChoiceNote, originNotesFor, sizeCellState, writtenSubSlot, type SlotKind } from './pickerModel';
 
 const verdict = (status: ParameterVerdict['status']): ParameterVerdict => ({
   name: 'geometry', enforced: true, status,
@@ -67,5 +67,18 @@ describe('geometry in the picker', () => {
     expect(originNotesFor('lights', slots, picks, none, candidates)).toHaveLength(2);
     // an unchanged link is not "newly chosen"
     expect(originNotesFor('set', slots, picks, { ...none, darkflat: 7 }, candidates)).toEqual([]);
+  });
+});
+
+describe('exposure and parameter numbers read like a person writes them', () => {
+  it('formatSeconds drops float32 noise and trailing zeros', () => {
+    expect(formatSeconds(6.71999979019165)).toBe('6.72 s');
+    expect(formatSeconds(180)).toBe('180 s');
+    expect(formatSeconds(0.5)).toBe('0.5 s');
+  });
+  it('tidyNumbers rounds long decimals inside a value string only', () => {
+    expect(tidyNumbers('6.71999979019165')).toBe('6.72');
+    expect(tidyNumbers('9576×6388')).toBe('9576×6388');
+    expect(tidyNumbers('-9.8')).toBe('-9.8');
   });
 });

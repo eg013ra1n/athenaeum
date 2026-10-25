@@ -142,6 +142,18 @@ export function applyFilter(
   });
 }
 
+/** Seconds as a person reads them: at most three decimals, none trailing —
+ *  `6.72 s`, never the `6.71999979019165 s` a float32 header round-trips to. */
+export function formatSeconds(v: number): string {
+  return `${Number(v.toFixed(3))} s`;
+}
+
+/** Round every long decimal inside a value string the engine hands back
+ *  (`"6.71999979019165"`, `"180 → 6.71999979019165"`) to three places. */
+export function tidyNumbers(value: string): string {
+  return value.replace(/-?\d+\.\d{4,}/g, m => String(Number(Number(m).toFixed(3))));
+}
+
 /** `2025-09-13` — the date part of an ISO stamp, for the date inputs. */
 export function isoDay(value: string | null | undefined): string {
   return value ? value.slice(0, 10) : '';
@@ -200,11 +212,11 @@ export function describeDifference(p: ParameterVerdict): {
     }
     return p.setValue == null
       ? { label, change: `${p.frameValue} → the set declares none`, limit: null }
-      : { label, change: `the frames declare none → ${p.setValue}`, limit: null };
+      : { label, change: `the frames declare none → ${tidyNumbers(p.setValue)}`, limit: null };
   }
   return {
     label,
-    change: `${p.frameValue ?? '—'} → ${p.setValue ?? '—'}`,
+    change: `${tidyNumbers(p.frameValue ?? '—')} → ${tidyNumbers(p.setValue ?? '—')}`,
     limit: p.matchingThreshold != null ? `limit ${p.matchingThreshold}` : null,
   };
 }

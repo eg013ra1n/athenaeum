@@ -1,6 +1,6 @@
 import { Check, Layers } from 'lucide-react';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { blockersOf, describeDifference, geometryLabel, geometryRefuses, geometryWarns } from './pickerModel';
+import { blockersOf, describeDifference, formatSeconds, geometryLabel, geometryRefuses, geometryWarns } from './pickerModel';
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -34,7 +34,7 @@ function spanLabel(start: string | null, end: string | null): string {
 /** The facts that identify a set at a glance — never the ones that differ. */
 function identityFacts(set: CalibrationSetWithScore['set']): string[] {
   const facts = [set.instrume || 'Unknown camera'];
-  if (set.exptime != null) facts.push(`${set.exptime} s`);
+  if (set.exptime != null) facts.push(formatSeconds(set.exptime));
   if (set.ccd_temp != null) facts.push(`${set.ccd_temp.toFixed(1)} °C`);
   if (set.filter) facts.push(set.filter);
   if (set.binning) facts.push(set.binning);
