@@ -80,7 +80,7 @@ export function GroupsTable({ groups }: GroupsTableProps) {
             const farRatio = isFarFromReference(g.scaleRatioToReference) ? g.scaleRatioToReference : null;
             return (
               <tr key={g.key} className="border-b border-border/50 last:border-0">
-                <td className="py-1.5 px-2 text-content font-mono">{g.key}</td>
+                <td className="py-1.5 px-2 text-content font-mono">{g.key.split('__').map((part, i) => (<span key={i}>{i > 0 && <>__<wbr /></>}{part}</span>))}</td>
                 <td className="py-1.5 px-2 text-content-secondary">{g.cameras.length > 0 ? g.cameras.join(' + ') : '—'}</td>
                 <td className="py-1.5 px-2 text-content-secondary">{g.colorMode === 'osc' ? 'OSC' : 'Mono'}</td>
                 <td className="py-1.5 px-2 text-content-secondary">{g.filter ?? '—'}</td>
@@ -94,8 +94,11 @@ export function GroupsTable({ groups }: GroupsTableProps) {
                 <td className="py-1.5 px-2 text-content-secondary tabular-nums">{formatExposureToken(g.exposureS)}</td>
                 <td className="py-1.5 px-2 text-content-secondary tabular-nums">{g.includedCount}/{g.frameCount}</td>
                 <td className="py-1.5 px-2 text-content-secondary tabular-nums">{formatExposure(g.totalExposureS)}</td>
-                <td className="py-1.5 px-2 text-content-muted tabular-nums">
-                  {g.calibratedCached} calibrated · {g.metricsCached} metrics
+                <td
+                  className="py-1.5 px-2 text-content-muted tabular-nums whitespace-nowrap"
+                  title={`${g.calibratedCached} calibrated frames and ${g.metricsCached} frame measurements cached`}
+                >
+                  {g.calibratedCached} cal · {g.metricsCached} meas
                 </td>
               </tr>
             );
