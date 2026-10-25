@@ -294,6 +294,18 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Calibration geometry — the screens (2026-10-25)
+
+The data path was accepted on the owner's catalog copy (`docs/catalog/README.md` → Calibration geometry). Not yet seen by a human
+(the desktop build started clean on the dev catalog; nobody looked at the screen):
+
+- **The Size column** in the calibration tables and the hierarchy, in compact mode too — is the table still readable at its width?
+- **The picker**: a set of another size is locked (the linked one stays clickable to deselect), another sub-frame origin is
+  selectable with a warning badge; after a hand-chosen origin misfit a warning notification names only the link written.
+- **The Export tab and the Calibrate panel** show the geometry blocker / origin warning lines.
+- **Owner question (review M-4):** an origin-misfit candidate is hidden by the default "Only sets that fit" filter (reachable by
+  unchecking it, as the plan's G-7 visibility rule says). Keep, or show it by default?
+
 ### Plan C — the Analysis tab on the one star path (2026-10-24)
 
 Branch `plan-c` (reference `docs/stacking/README.md` R-OSP-17; plan `docs/superpowers/plans/2026-10-24-one-star-path-plan-c.md`). The owner looked at the app at C9
