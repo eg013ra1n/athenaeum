@@ -3219,6 +3219,10 @@ pub(crate) fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, St
     }
 }
 
+/// The ineligible reason a frame-set selection send gives a light in the Black
+/// Hole (shown as "N × in the Black Hole" by the send notification).
+const BLACK_HOLE_SKIP_REASON: &str = "in the Black Hole";
+
 /// Resolve a frame-id selection into payload entries — the catalog-lookup half
 /// of a send: which requested ids are real frames, where each one's file sits,
 /// and the package `rel_path` it gets under the chosen layout (§D2). Ids with no
@@ -3277,13 +3281,42 @@ fn selection_entries(
         None => RelPathLayout::SourceRelative(ancestor.clone()),
     };
 
+    // A frame-set (Object page) send leaves out a light in the Black Hole: it
+    // is a rejected light, so the export and the whole-set send never place it
+    // (`db::FRAME_NOT_IN_BLACK_HOLE_SQL`), and a hand-picked one would land at
+    // the package root with no WBPP folder. It is reported as ineligible, so
+    // the notification says how many were skipped. A browser send (no frame
+    // set) ships what the user picked: the Black Hole is still the file being
+    // on this machine (owner ruling 2026-07-22).
+    let blackholed: HashSet<i64> = if frame_set_id.is_some() {
+        let light_file_ids: Vec<i64> = rows
+            .iter()
+            .filter(|(_, _, frame)| matches!(frame.imagetyp, Some(crate::models::ImageType::Light)))
+            .map(|(file_id, _, _)| *file_id)
+            .collect();
+        crate::db::get_blackholed_file_ids(conn, &light_file_ids)
+            .map_err(|e| ApiError::Internal(format!("Black Hole probe for selection: {e:#}")))?
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     // Per-directory used-filename sets for collision suffixing (§D2).
     let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
     let mut resolved: HashSet<i64> = HashSet::new();
     let mut entries = Vec::with_capacity(rows.len());
-    for (_file_id, file, frame) in &rows {
+    let mut ineligible: Vec<IneligibleFrame> = Vec::new();
+    for (file_id, file, frame) in &rows {
         let Some(frame_id) = frame.id else { continue };
         resolved.insert(frame_id);
+        if matches!(frame.imagetyp, Some(crate::models::ImageType::Light)) && blackholed.contains(file_id) {
+            ineligible.push(IneligibleFrame {
+                frame_id,
+                reason: BLACK_HOLE_SKIP_REASON.to_string(),
+            });
+            continue;
+        }
         // A hand-picked master is labeled honestly. The test is the CATALOG's own
         // master signal, not the header alone: the scanner sets `frames.is_master`
         // from `imagetyp.is_master() || filename_is_master` (`fits_parser/mod.rs`),
@@ -3306,14 +3339,15 @@ fn selection_entries(
     }
 
     // Requested ids that never resolved to a catalog row at all.
-    let ineligible = requested
-        .iter()
-        .filter(|id| !resolved.contains(id))
-        .map(|id| IneligibleFrame {
-            frame_id: *id,
-            reason: "frame not found in catalog".to_string(),
-        })
-        .collect();
+    ineligible.extend(
+        requested
+            .iter()
+            .filter(|id| !resolved.contains(id))
+            .map(|id| IneligibleFrame {
+                frame_id: *id,
+                reason: "frame not found in catalog".to_string(),
+            }),
+    );
 
     Ok(SelectionInput {
         entries,
@@ -10436,6 +10470,68 @@ mod tests {
             vec!["camera_X/DARKS_5/D_0.fits"],
             "a generated payload banks nothing"
         );
+    }
+
+    /// A frame-set (Object page) selection send leaves out a hand-picked light
+    /// in the Black Hole and reports it — the export never places it, so it
+    /// would have landed at the package root. A browser send (no frame set)
+    /// still ships it: the Black Hole is the file being on this machine.
+    #[test]
+    fn frame_set_selection_send_skips_a_blackholed_light_and_says_so() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'Horsehead')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (1, 1, '2025-10-18T18:00:00Z', '2025-10-18T23:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'CamA')",
+            [],
+        )
+        .unwrap();
+        for id in [10_i64, 11] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2025-10-19T00:00:00Z', 'FITS')",
+                rusqlite::params![id, format!("/l/L_{id}.fits"), format!("L_{id}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, instrume, filter, exptime, date_obs)
+                 VALUES (?1, ?1, 'Light', 'CamA', 'L', 180.0, '2025-10-18T19:00:00Z')",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (1, ?1)",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+             VALUES (11, 'blink', '2025-10-20T00:00:00Z', '/l/L_11.fits')",
+            [],
+        )
+        .unwrap();
+
+        let input = selection_entries(&conn, &[10, 11], Some(1)).unwrap();
+        assert_eq!(input.total, 2);
+        assert_eq!(
+            input.entries.iter().map(|e| e.frame_id).collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(input.ineligible.len(), 1);
+        assert_eq!(input.ineligible[0].frame_id, 11);
+        assert_eq!(input.ineligible[0].reason, BLACK_HOLE_SKIP_REASON);
+
+        let browser = selection_entries(&conn, &[10, 11], None).unwrap();
+        assert_eq!(browser.entries.len(), 2, "a browser send ships what was picked");
+        assert!(browser.ineligible.is_empty());
     }
 
     /// `selection_entries`' kind classification — the one behavior change on the
