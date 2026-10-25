@@ -341,6 +341,55 @@ mod tests {
         );
     }
 
+    /// R-PC-10b: the green-site Analysis path (`Mode::Budget`, through `measure_plane`) keeps the Blend refusal. A
+    /// resolved pair (1.75 F apart, both seeded on the green sum) has a fit refused `Blend` on every layout, and
+    /// neither star of it is an accepted fit; the same mosaic under `Mode::All` (the stacking Measure's mode) refuses
+    /// none as `Blend`. (The pair's other fit is refused `RegionTooSmall`: the merged blob outgrows the region.)
+    #[test]
+    fn the_green_site_analysis_path_still_refuses_a_resolved_pair_blend() {
+        use crate::star_measure::RefusalReason;
+        let pair = [(180.0, 150.0), (187.0, 150.0)];
+        for p in LAYOUTS {
+            let mut stars = field_stars((100.3, 80.7), 256, 256, 11);
+            stars.retain(|s| {
+                pair.iter()
+                    .all(|&(px, py)| (s.x - px).hypot(s.y - py) > 25.0)
+            });
+            for &(x, y) in &pair {
+                stars.push(star(x, y, 700.0, 4.0));
+            }
+            let m = mosaic(p, 256, 256, &stars, 5);
+            let blends = |pm: &PlaneMeasurement| {
+                pm.refused
+                    .by_reason
+                    .get(&RefusalReason::Blend)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let near_pair = |pm: &PlaneMeasurement| {
+                pm.stars
+                    .iter()
+                    .filter(|f| (f.x - 183.5).abs() < 8.0 && (f.y - 150.0).abs() < 4.0)
+                    .count()
+            };
+            let budget = measure_green_sites(&m, 256, 256, p, &base(), None);
+            assert!(blends(&budget) >= 1, "{p:?}: {:?}", budget.refused);
+            assert_eq!(near_pair(&budget), 0, "{p:?}: {:?}", budget.stars);
+            let all = measure_green_sites(
+                &m,
+                256,
+                256,
+                p,
+                &MeasureOptions {
+                    mode: Mode::All,
+                    ..base()
+                },
+                None,
+            );
+            assert_eq!(blends(&all), 0, "{p:?}: {:?}", all.refused);
+        }
+    }
+
     /// The detection source of `measure_green_sites`: seeds on the G1 + G2 sum, in native pixels.
     fn native_seeds(m: &[f32], w: usize, h: usize, p: BayerPattern) -> (Vec<Seed>, Vec<bool>) {
         let b = base();

@@ -196,7 +196,7 @@ mod tests {
         };
         assert_eq!(
             base.config_hash(),
-            "c4dced62e5e9236f9577694766adaaf07db3073eb59e57f64e571e9a7cbbd852",
+            "a92eb6a7d30f0947f76c741be142c23fb07cb2cb48fefa801f7ff2162ef1398a",
             "the default config's hash at MEASURE_VERSION {}",
             star_measure::MEASURE_VERSION
         );
