@@ -126,7 +126,7 @@ useEffect(() => {
 
 **Plate solving** — `solvemyastro` is the sole solver; the input gate has a Settings section (Plate Solving → Input Gate), the acceptance gate has none. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
-**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 5); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
+**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 7); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
 
 **In-app updates** — core owns the check, `tauri-plugin-updater` owns install (Rust-side only); `install_update`'s `version_comparator` is the one place that normalizes the three version forms. `docs/updates/README.md`.
 
