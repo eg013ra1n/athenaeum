@@ -149,8 +149,8 @@ export function RoleInspector(props: RoleInspectorProps) {
           {meta.switches.watch && (
             <SwitchRow title="Watch for new files" checked={root.monitor_enabled} onChange={props.onToggleMonitor}
               description={props.kind === 'calibration_library'
-                ? 'Imports masters dropped in from outside. The interval is global — Settings → Scanning.'
-                : 'Re-scan this folder periodically in the background. The interval is global — Settings → Scanning.'} />
+                ? 'Imports masters dropped in from outside. The interval is global — Settings → General → Monitoring.'
+                : 'Re-scan this folder periodically in the background. The interval is global — Settings → General → Monitoring.'} />
           )}
           {meta.switches.duplicates && (
             <SwitchRow title="Include in duplicate detection" checked={root.find_duplicates} onChange={props.onToggleDuplicates}

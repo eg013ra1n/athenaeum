@@ -153,7 +153,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
       {!offline && (
         <Section title="Behavior">
           <SwitchRow title="Watch for new files" checked={root.monitor_enabled} onChange={props.onToggleMonitor}
-            description="Re-scan this folder periodically in the background. The interval is global — Settings → Scanning." />
+            description="Re-scan this folder periodically in the background. The interval is global — Settings → General → Monitoring." />
           <SwitchRow title="Include in duplicate detection" checked={root.find_duplicates} onChange={props.onToggleDuplicates}
             description="Files here are content-hashed and compared against every other folder with this enabled." />
           <SwitchRow title="Treat camera as unique to this folder" checked={root.unique_camera} onChange={props.onToggleUniqueCamera}

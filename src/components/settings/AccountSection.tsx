@@ -601,11 +601,6 @@ export default function AccountSection() {
     // SIGNED OUT — sign-in flow.
     content = (
       <div className="space-y-4 max-w-md">
-        <p className="text-sm text-content-muted">
-          Sign in to link this device to your account for syncing between machines. The app is
-          fully usable without an account.
-        </p>
-
         {step === 'email' ? (
           <form onSubmit={handleSendCode} className="space-y-3">
             <div>

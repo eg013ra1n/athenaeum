@@ -32,7 +32,7 @@ export default function Projects() {
 
       {signedOut && (
         <p className="text-sm text-content-muted">
-          Sign in (Settings → Account) to see your collaboration projects.
+          Sign in (Settings → Transfers → Account) to see your collaboration projects.
         </p>
       )}
       {!signedOut && projects.length === 0 && (
