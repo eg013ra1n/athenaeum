@@ -771,8 +771,8 @@ export default function FrameSetDetail() {
     <div className="p-4 pt-3 h-full flex flex-col">
       {/* Frame Set Header */}
       <div className="bg-surface-elevated rounded-lg p-3 mb-2 border border-border flex-shrink-0">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <div className="flex items-center gap-3 whitespace-nowrap">
             <HistoryNav fallback="/objects" className="pr-3 mr-1 border-r border-border" />
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
@@ -804,7 +804,7 @@ export default function FrameSetDetail() {
               </div>
             )}
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3 [&_button]:whitespace-nowrap">
             {/* Single contextual action button: depends on the frame set state.
                 stage / wip (is_archived=0) → Find new images
                 in archive, not yet zipped → Move and ZIP
@@ -919,7 +919,7 @@ export default function FrameSetDetail() {
               <Users size={14} />
               Publish as project
             </button>
-            <div className="flex items-center gap-1.5 text-sm text-content-muted">
+            <div className="flex items-center gap-1.5 text-sm text-content-muted whitespace-nowrap">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
               <span>·</span>
               <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
