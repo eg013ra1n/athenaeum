@@ -288,6 +288,15 @@ pub fn set_slug(name: &str) -> String {
 /// `api::lights::load_light_members`'s join (`session_members → sessions →
 /// imaging_nights(frames_set_id) → frames(imagetyp = 'Light') → files`) plus
 /// the six extra columns groups need that the lights export path does not.
+///
+/// A light whose file sits in the Black Hole is not a member here: the
+/// Black Hole is how a user rejects a light (Blink, the Analysis table's
+/// "Reject unusable frames"), and the frame-set views already list such a
+/// light apart from the active ones. This join is the one light source of a
+/// frame set's stacking plan AND its run ([`frame_source`]), so the plan's
+/// counts and the frames the run reads cannot disagree. Restoring the file
+/// from the Black Hole brings the light back. (Transfer dedup still counts a
+/// blackholed file as present — a different question, not this one.)
 struct LightMember {
     frame_id: i64,
     file_id: i64,
@@ -318,6 +327,7 @@ fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<Light
          JOIN frames f ON f.id = sm.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
+           AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fi.id)
          ORDER BY f.date_obs, f.id",
     )?;
     let rows = stmt

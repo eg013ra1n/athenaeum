@@ -4020,6 +4020,53 @@ mod tests {
         );
     }
 
+    /// A light in the Black Hole is rejected: the plan does not count it and
+    /// the run's frame source (`frame_source`, what `stacking::run` reads)
+    /// does not carry it. Restoring it brings it back to both. Release
+    /// blocker 2026-10-25: set 182's plan counted all 164 lights with 25 in
+    /// the Black Hole, and its run 8 stacked 11 of them.
+    #[test]
+    fn a_blackholed_light_is_neither_planned_nor_stacked() {
+        use crate::stacking::groups::frame_source;
+        let f = test_fixtures::frame_set("Horsehead C11");
+        let ids: Vec<i64> = THREE_TIMES
+            .iter()
+            .chain(["2025-01-01T00:15:00"].iter())
+            .enumerate()
+            .map(|(i, t)| test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t)).0)
+            .collect();
+        let rejected = ids[1];
+        let (file_id, path): (i64, String) = f
+            .conn
+            .query_row(
+                "SELECT fi.id, fi.path FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+                [rejected],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        crate::db::add_to_black_hole(&f.conn, file_id, "light", &path).unwrap();
+
+        let settings = SettingsManager::new();
+        let subject = StackSubject::FrameSet(f.set_id);
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, &subject, None).unwrap();
+        assert_eq!(plan.included_count, 3, "the blackholed light is not counted");
+        let planned: usize = plan.groups.iter().map(|g| g.frame_count).sum();
+        assert_eq!(planned, 3, "the groups do not carry it either");
+
+        let (groups, origins) = frame_source(&f.conn, &subject, &plan.config).unwrap();
+        let run_frames: Vec<i64> = groups
+            .iter()
+            .flat_map(|g| g.frames.iter().map(|fr| fr.frame_id))
+            .collect();
+        assert_eq!(run_frames.len(), 3, "{run_frames:?}");
+        assert!(!run_frames.contains(&rejected));
+        assert!(!origins.contains_key(&rejected));
+
+        crate::db::remove_from_black_hole(&f.conn, file_id).unwrap();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, &subject, None).unwrap();
+        assert_eq!(plan.included_count, 4, "a restored light is planned again");
+    }
+
     /// Owner ruling 2026-10-20 (calibration geometry, R2): lights linked to
     /// masters of another size are blocked up front under `links`, naming the
     /// set and both sizes — the run used to be admitted and die in Masters or
