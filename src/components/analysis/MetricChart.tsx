@@ -108,8 +108,12 @@ function CustomDot({ cx, cy, payload, fill, dotShape, series, isSelected, isReje
 
   const baseR = 5;
   const r = isSelected ? baseR + 1 : baseR;
-  const opacity = isSelected ? 1 : 0.55;
-  const effectiveFill = isRejected ? '#bf616a' : fill;
+  // A frame the thresholds reject is a red RING around a faint dot of its own
+  // series colour. A solid red fill collided with the R filter, whose series
+  // colour is the same red: a rejected L frame and an ordinary R frame looked
+  // alike.
+  const opacity = isSelected ? 1 : isRejected ? 0.3 : 0.55;
+  const effectiveFill = fill;
 
   const handleEnter = () => onHover({ point: payload, series, cx, cy });
   const handleLeave = () => onHover(null);
@@ -117,8 +121,8 @@ function CustomDot({ cx, cy, payload, fill, dotShape, series, isSelected, isReje
   const common = {
     fill: effectiveFill,
     fillOpacity: opacity,
-    stroke: isSelected ? '#eceff4' : 'none',
-    strokeWidth: isSelected ? 1.5 : 0,
+    stroke: isRejected ? '#bf616a' : isSelected ? '#eceff4' : 'none',
+    strokeWidth: isRejected ? 2 : isSelected ? 1.5 : 0,
     onMouseEnter: handleEnter,
     onMouseLeave: handleLeave,
     style: { cursor: clickable ? ('pointer' as const) : ('default' as const) },
