@@ -21,7 +21,7 @@ build/rebuild whatever the export-readiness gate found missing, including the
 pre-calibration master a missing flat master's rebuild reads, dependency
 order bias/darkflat → dark → flat, so a run never blocks on a master it can
 build itself) → `Calibrate` (reuses the calibrated-lights export engine
-verbatim) → `Measure` (the shared `star_measure` path, `MEASURE_VERSION` 6,
+verbatim) → `Measure` (the shared `star_measure` path, `MEASURE_VERSION` 7,
 the aperture correction `c` kept per plane — see "One star-measurement
 path, Plan A" and R-OSP-16) → `Reference` (one frame for the whole set — highest
 weight, or the user's pinned choice via `set_frame_set_reference`; this
@@ -1878,7 +1878,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   `measurement_subtree`, `registration_subtree` and `normalization_subtree` (helpers `*_with_measure_version`).
   `calibration_subtree` and the prepare subtree do not carry it, so a bump never recalibrates.
 - **Policy.** ONE bump per merged plan that changes what a fit accepts or measures, never one per task. Plan A is 4;
-  Plan B is 5 (B4: `c`'s point-source screen and SNR floor, R-OSP-16 B4); Plan C (the Analysis switch) is 6.
+  Plan B is 5 (B4: `c`'s point-source screen and SNR floor, R-OSP-16 B4); Plan C (the Analysis switch) is 7 (6, Blend on every
+  path, was burnt by R-PC-10b: its stacking artifacts carry Blend numbers, never released).
   `AnalysisConfig::config_hash` is Plan C's. The `MEASURE_VERSION` doc in `star_measure/mod.rs` states the same.
 - **Risk.** The first run after Plan A re-measures, re-registers (mono) and re-normalizes every set; the `calib`
   column of the stage-hash golden literals is unchanged, every other column moved
@@ -4239,7 +4240,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - The ERP refresh for Task 14b's 15 new units.
     - F1's over-read and the nebula-sky LN pairs go to Plan B; the Analysis switch (`analysis-mode`, 0.500 s per m42
       frame) goes to Plan C.
-- **R-OSP-17 - Plan C: the Analysis tab on the one star path, `MEASURE_VERSION` 6 (Tasks C0-C10; branch `plan-c` from `main` 4255a3f5,
+- **R-OSP-17 - Plan C: the Analysis tab on the one star path, `MEASURE_VERSION` 7 (Tasks C0-C10; branch `plan-c` from `main` 4255a3f5,
   plan `docs/superpowers/plans/2026-10-24-one-star-path-plan-c.md`, ledger `.superpowers/sdd/2026-10-24-plan-c/progress.md`, rulings
   `.superpowers/sdd/2026-10-24-plan-c/rulings.md`; spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md` §4; lab
   `star-lab/results/plan-c/`).** The Analysis tab, Blink's star overlay and the plate-solve input gate read the stacking Measure's
@@ -4248,11 +4249,13 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   Plan D (`docs/superpowers/open-items.md`). Code: C1 6f0dcc8d / e93c7e92 (`star_measure` seams), C2 0043b7b2 / a1b79699 (raw input),
   C3 65ad923d / 3d756181 (the CFA green-site path), C4 3d8a745f (trail R²), C5 d66f7f88 / 056c2772 / 6ee0d9f5 (the analyzer switch, the config,
   the probe arms), BUMP (rustafits 1.6) 08446186 / 2764e12b, C6 595ef880 / eaa1d88a / ec928042 / 127226cb (persistence, compatibility, gate trust,
-  frame meta), C7 62e24c48 / 365cc9f9 (the gate), C8 4497f5d5 / 0c59fad1 (frontend), C9 0b3a281b / 0872d6e5 / d811c054 / 16c0a2ec / 41ca7bad (app look fixes, Blend), rustafits #7 follow-up 47c33f73.
+  frame meta), C7 62e24c48 / 365cc9f9 (the gate), C8 4497f5d5 / 0c59fad1 (frontend), C9 0b3a281b / 0872d6e5 / d811c054 / 16c0a2ec / 41ca7bad (app look fixes, Blend), rustafits #7 follow-up 47c33f73, C10B 16c8e2aa
+  (Blend on the Analysis path only, `MEASURE_VERSION` 7; R-PC-10b). Final code sha **16c8e2aa**.
   *Planned rulings PC-1 … PC-15 (one line each; evidence: the plan and the task reports under the ledger folder).*
   - PC-1 `MEASURE_VERSION` stays 5 unless a stacking-path number moves - **SUPERSEDED by R-PC-10**: the Blend refusal moves what a fit
     accepts, so 5 → 6 (Plan C's one bump, R-OSP-1's policy; `AnalysisConfig::config_hash` folds it; Analysis rows store the version that
-    measured them). Evidence: R-PC-10, `c9-report.md`.
+    measured them); **then by R-PC-10b**: 6 → 7 (6 burnt), the stacking path back to v5's numbers, every Analysis row recomputes. Evidence:
+    R-PC-10, R-PC-10b, `c9-report.md`, `task-C10F-verdict-r1.md`.
   - PC-2 raw input scales: an integer FITS takes its full scale from BITPIX/BZERO, XISF UInt16 / Float32 take 65535, a float FITS with
     maximum ≤ 1 is ×65535, `clip` = DATAMAX else the full scale, gain = EGAIN else none (the SNR omits its shot term, stated). Amended by
     R-PC-2. Evidence: `task-C2-report-r1.md`.
@@ -4308,7 +4311,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     passes 10 / 10; no Plan D item. Evidence: lab 8fa3ff8 `star-lab/results/plan-c/c5-r2/` (`raw-bars-misses.txt`), `task-C5L-report-r2.md`.
   - R-PC-10 (owner at the C9 app look, «я бы сделал отказ от blend»): an otherwise-accepted fit is refused `Blend` when another seed of the
     plane's detection lies inside the fit's half-maximum ellipse and at least 0.5 `F_field` from the fit's own seed; applied before the duplicate
-    drop in the shared fit path (every mode), declared last in `RefusalReason`; `MEASURE_VERSION` 5 → 6. Evidence: owner screenshot (two stars,
+    drop in the shared fit path (every mode - **SUPERSEDED by R-PC-10b**: the Analysis path only), declared last in `RefusalReason`;
+    `MEASURE_VERSION` 5 → 6 (burnt, now 7). Evidence: owner screenshot (two stars,
     one elongated ellipse); lab `doubles/f4.0` FWHM 4.457 vs truth 4.062; 16c0a2ec / 41ca7bad, `task-C9B-review-r1.md`.
     **R-PC-10a (owner, «Оставляем Blend как есть, близкие неразделённые пары - в Plan D»):** ships as built; it refuses resolved pairs (both
     seeded, ~1.7 F); close pairs whose companion is no seed (95 of 132 on `doubles/f4.0`, FWHM bias +7…+14 % at 0.5-1.25 F) are a recorded
@@ -4318,7 +4322,19 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     `planb_b6.py` PASS, every moved scorecard row in a family whose frames carry ≥ 1 `Blend` refusal (a move without one = STOP); (b) LN at
     master level on hc11 / runB / s204 against the B6 clones, the b3 compare bars, measure-equal REPORTED (Blend refusals per group), never a
     STOP; (c) gates 13 / 13 on the s204 c10 clone; (d) raw-mode bars at v6, no entry below its C5L r2 count except by a `Blend` refusal.
-    Evidence: `rulings.md` R-PC-11; the B4 comparator clones were deleted 2026-10-25 (owner), B6's stand in.
+    Evidence: `rulings.md` R-PC-11; the B4 comparator clones were deleted 2026-10-25 (owner), B6's stand in. After R-PC-10b the identity is
+    back: (a)'s "moved rows in Blend families" clause is void again (r2 read moved 0), (b)'s comparison expected EQUAL to B6.
+  - R-PC-10b (fable C10F verdict B, 2026-10-25; the controller checked the call path; owner informed at wake; supersedes R-PC-10's "every
+    mode"): the `Blend` refusal applies on the Analysis path only (`Mode::Budget`: the Analysis tab, Blink, the CFA green-site path through
+    `measure_plane`); the stacking Measure (`Mode::All` / `Brightest`), LN's refits and registration (`fit_stars` / `fit_stars_with_beta`) fit
+    as at v5, byte-identical to B6. `fit::Correction` carries `blend_refusal` (default false), set only by `measure_budget`.
+    `MEASURE_VERSION` 6 → 7: 6 is burnt (every v6 stacking artifact since 16c0a2ec carries Blend numbers under the v6 hash); 7 re-measures
+    each cached tree once to v5-identical numbers and recomputes every Analysis row. Why: C10 r1's ln-truth FAILED - Blend refuses ~1.6 % of
+    stacking fits (resolved pairs, not a misfire), but `tflux` sums every accepted fit, saturated included, and saturated stars hold 53-64 % of
+    a frame's accepted signal, so a few saturated refusals re-rank the weights against seeing (hc11: the sharpest frames demoted, weights ρ
+    0.891, master noise +1.59 %); head and B6 equidistant from the photometric truth. Cost, recorded: stacking keeps the blends' 0.1-0.4 %
+    FWHM / crowded-field ecc bias until Plan D; the Analysis star list is up to 2.3 % shorter than the stack's. Evidence:
+    `task-C10F-verdict-r1.md`, lab 67f13ad (`star-lab/results/plan-c/c10-r1-v6/`), 16c8e2aa, `task-C10B-report-r1.md`.
   *`fieldWidthAtFloor` per site (R-OSP-15's per-site table; code read at the plan-c head).* `FieldWidth::at_floor()` is read by two things only:
   the detection warn (`star_measure/seeds.rs`, "field width at the clamp floor") and the stacking channel flag
   (`stacking/measure.rs`, `field_width_at_floor: m.field_width.at_floor()`); no Analysis consumer reads it (`ChannelMeasurement::at_floor` is a
@@ -4357,7 +4373,29 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   *The app (C9).* Owner, `npm run tauri dev` on the dev catalog: «в целом все устраивает»; startup rebuilt `star_metrics` (510 501 stars, 2.25 s, no
   orphans); keep BOTH the Verdict and Refused columns; Blink ellipses sized by brightness (0b3a281b); the settings reset button beside its label
   (0872d6e5).
-  - C10 runs: (filled after the runs)
+  - C10 runs (dev Mac, R-PC-11; `planc.sh c10 build|cycle|inject-raw|ln-truth|gates|report`, lab tools 9ccf343, every run with
+    `PLANB_GUARD_SUBMODULES=all` for someone else's `solvemyastro` fixture commit). Final review C10R (fable, before the runs, at 41ca7bad):
+    READY, 0 critical / 0 important / 5 minor; m1-m4 folded in e2ae53ff, m5 is this entry.
+    - **r1 at 41ca7bad (`MEASURE_VERSION` 6, Blend on every path): FAIL** (lab 67f13ad, kept as `star-lab/results/plan-c/c10-r1-v6/` at
+      804c771). Build PASS; cycle PASS under R-PC-11 (a) (probe 1041 / 1041, inject 109 / 109, 73 437 scorecard rows; noreg vs t14-final
+      moved 1012 rows in 14 families, every one with Blend refusals; isolated families unmoved; cumulative vs t01c moved 0; B1 coverage
+      100 %, 156 planes); inject-raw PASS; gates 13 / 13; **ln-truth FAIL**: hc11 weights ρ 0.891 < 0.9 with 19 unexplained movers, one L
+      master plane median −2.48 % / MAD −4.09 %, GROUPS WORSE 1; runB OSC plane 2 MAD −1.17 %; s204 masters within, GROUPS WORSE 3. Blend
+      refusals on the stacking path: hc11 391 in 37 frames, runB 68 361 in 184, s204 72 951 in 197 (C9BL had never measured stacking's
+      all-stars mode on a real tree). → C10F verdict B → R-PC-10b.
+    - **r2 at 16c8e2aa (`MEASURE_VERSION` 7): every bar PASS** (lab 05e46a8, `star-lab/results/plan-c/c10/`, index `after-table.md`:
+      `C10 REPORT: COMPLETE`, all jobs PASS). Build PASS (star_probe 24ae9644375f); cycle PASS (probe 1041 / 1041, inject 109 / 109, 73 437
+      scorecard rows, noreg vs t14-final **moved 0**, cumulative vs t01c moved 0, Plan B's B4 bars as at B6, B1 coverage 100 %, 156 planes, 0
+      below; Blend refusals only in the analysis-mode rows, 100 in 6 of 183 families); inject-raw PASS (10 entries, none below C5L r2, refused
+      Blend 0, FWHM bar 10 / 10; the completeness bar is R-PC-9a's recorded miss, unchanged); ln-truth PASS, **EQUAL to B6** on hc11 / runB /
+      s204 (measure-equal 0 of 106 / 184 / 197 differ, Blend 0, weights ρ 1.0000, movers 0, masters PASS, GROUPS WORSE 0); gates 13 / 13 on
+      the s204 c10 clone.
+    - Suites (controller, dev Mac, single runs): core all targets `--no-fail-fast` **4201 passed / 0 failed / 17 ignored** at 16c8e2aa
+      (4197 / 0 / 17 at 41ca7bad; the dev Mac runs the network modules too, no split); at 41ca7bad: `cargo test -p athenaeum-web` 53 / 0,
+      `cargo check -p athenaeum-core --no-default-features` Finished, vitest 88 files / 930 passed. Lab (C10T): star-lab 1556 OK, harness
+      468 OK (2 skipped).
+    - After note: `docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md`.
+  - **R-OSP-17 CLOSED (2026-10-25): Plan C complete; merge into local main; push on the owner's word.**
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
