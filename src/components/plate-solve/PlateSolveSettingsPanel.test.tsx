@@ -48,6 +48,8 @@ function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<u
       return Promise.resolve(PLATE_SOLVE_CONFIG_FIXTURE);
     case 'get_catalog_status':
       return Promise.resolve([]);
+    case 'get_index_status':
+      return Promise.resolve([]);
     case 'set_plate_solve_config':
       return Promise.resolve(undefined);
     default:

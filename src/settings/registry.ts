@@ -490,6 +490,12 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         help: 'Downloads the selected tier and every lower one not yet installed.',
         keywords: ['download_catalog_layers'],
       },
+      {
+        id: 'quadIndex',
+        label: 'Quad Index',
+        help: 'Downloadable quad-index packs that make blind and scale-free solves fast: a frame with no coordinates or no pixel scale is looked up directly instead of searching the sky. Base serves fields from about 1.3° up to 54°; Narrow (optional) extends that down to about 0.65° for long focal lengths. Frames with both coordinates and scale solve from the star catalog alone.',
+        keywords: ['quad index', 'index pack', 'blind solve', 'scale-free', 'base', 'narrow', 'download_index_packs', 'get_index_status'],
+      },
     ],
   },
   {

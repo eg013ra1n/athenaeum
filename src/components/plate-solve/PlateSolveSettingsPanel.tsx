@@ -4,13 +4,17 @@
 // (`plateSolving.catalog/solver/inputGate`); `onResetAll` on the first
 // (`plateSolving.catalog`) calls the document's whole-config `resetAll`.
 // The Star Catalog section's download UI is unchanged — it's an action,
-// not a setting (spec §5).
+// not a setting (spec §5). The same section also carries the Quad Index block
+// (`QuadIndexBlock`, state in `useIndexPacks`): downloadable quad-index packs
+// for blind / scale-free solves, listed below the Catalog Tiers table.
 import { useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
 import { CheckCircle, Download, Info } from 'lucide-react';
 import { api } from '../../api';
 import type { PlateSolveConfig, FovSummary } from '../../types/plate-solve';
 import type { CatalogStatusInfo, CatalogDownloadProgress } from '../../types/helpers';
 import { buildTierRows, recommendFromFov } from './cameraPresets';
+import { formatSize, formatElapsed } from './downloadFormat';
+import { QuadIndexBlock } from './QuadIndexBlock';
 import { useAutosaveDocument } from '../../hooks/useAutosaveDocument';
 import { useSettingsDefaults } from '../../settings/SettingsDefaultsContext';
 import { fieldMeta } from '../../settings/registry';
@@ -24,23 +28,6 @@ function formatStarCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
   return String(n);
-}
-
-function formatSize(bytes: number): string {
-  if (bytes === 0) return '—';
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
-  return `${Math.round(bytes / 1024)} KB`;
-}
-
-function formatElapsed(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${String(sec).padStart(2, '0')}s`;
-  return `${sec}s`;
 }
 
 function getDownloadStatusText(progress: CatalogDownloadProgress | null): string {
@@ -482,6 +469,8 @@ export function PlateSolveSettingsPanel() {
                 Recommended catalog tiers installed and up to date.
               </p>
             ) : null}
+
+            <QuadIndexBlock />
           </div>
         )}
       </SettingsSection>
