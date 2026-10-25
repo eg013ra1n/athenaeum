@@ -18,7 +18,7 @@ import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 import type { ExportLightCalPrefs } from '../../hooks/useExportProgress';
 import { ExportSummary } from './ExportSummary';
 import { WarningsPanel } from './WarningsPanel';
-import { modeBlocker } from './modeBlocker';
+import { geometryOriginSentence, modeBlocker } from './modeBlocker';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import {
@@ -562,7 +562,15 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                 choices carry over unchanged. */}
             {exportMode === 'calibratedLights' && (
               <div className="mt-3 pt-3 border-t border-border space-y-3">
-                <CalibrationWarnings warnings={readiness?.calibrationWarnings ?? []} />
+                <CalibrationWarnings
+                  warnings={[
+                    ...(readiness?.calibrationWarnings ?? []),
+                    // G-7: another sub-frame origin is advisory, never a blocker.
+                    ...(readiness && readiness.geometryWarnings.length > 0
+                      ? [geometryOriginSentence(readiness.geometryWarnings)]
+                      : []),
+                  ]}
+                />
                 {/* Flat normalization, with its statistic nested under it: the
                     statistic only means something while normalization runs. */}
                 <div>

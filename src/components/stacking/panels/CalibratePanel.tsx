@@ -43,6 +43,18 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
               <span className="text-content-secondary tabular-nums">{readiness.missingMasterFiles}</span>{' '}
               master file(s) missing on disk
             </li>
+            {readiness.geometryMismatches.length > 0 && (
+              <li className="text-warning">
+                <span className="tabular-nums">{readiness.geometryMismatches.length}</span>{' '}
+                calibration link(s) do not fit the frame size
+              </li>
+            )}
+            {readiness.geometryWarnings.length > 0 && (
+              <li className="text-warning">
+                <span className="tabular-nums">{readiness.geometryWarnings.length}</span>{' '}
+                calibration link(s) at another sub-frame origin (chosen by hand)
+              </li>
+            )}
           </ul>
         ) : (
           <p className="text-xs text-content-muted">No plan loaded yet.</p>

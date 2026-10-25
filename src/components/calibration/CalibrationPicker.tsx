@@ -10,6 +10,7 @@ import {
   EMPTY_FILTER,
   exposuresOf,
   filterIsActive,
+  originChoiceNote,
   slotsFor,
   SLOT_LABEL,
   type CandidateFilter,
@@ -50,7 +51,15 @@ export function CalibrationPicker({
   onClose,
 }: {
   subject: PickerSubject;
-  onApplyLights?: (flat: ManualPick, dark: ManualPick, bias: ManualPick) => void;
+  /** `originNotes`: one sentence per newly chosen set at another recorded
+   *  sub-frame origin (G-7: allowed by hand, with a visible warning) — the
+   *  caller shows them once the assignment succeeded. */
+  onApplyLights?: (
+    flat: ManualPick,
+    dark: ManualPick,
+    bias: ManualPick,
+    originNotes: string[],
+  ) => void;
   /** Called after a successful save so the opener can refresh. */
   onApplied?: () => void;
   onClose: () => void;
@@ -94,15 +103,28 @@ export function CalibrationPicker({
 
   const hasChanges = slots.some(k => selectedIn(k) !== current[k]);
 
+  // G-7: a set at another recorded sub-frame origin may be chosen by hand;
+  // what is newly chosen and carries that warning is told after the save.
+  const originNotes = (): string[] =>
+    slots.flatMap(k => {
+      const chosen = selectedIn(k);
+      if (chosen === null || chosen === current[k]) return [];
+      const c = candidates[k].find(x => x.set.id === chosen);
+      const note = c ? originChoiceNote(c) : null;
+      return note ? [`${SLOT_LABEL[k]}: ${note}`] : [];
+    });
+
   const handleApply = async () => {
     if (subject.kind === 'lights') {
       onApplyLights?.(
         pick(selectedIn('flat'), current.flat),
         pick(selectedIn('dark'), current.dark),
         pick(selectedIn('bias'), current.bias),
+        originNotes(),
       );
       return;
     }
+    const notes = originNotes();
     setSaving(true);
     try {
       await saveSubCalibration(subject.setId, {
@@ -110,6 +132,14 @@ export function CalibrationPicker({
         dark: selectedIn('dark'),
         bias: selectedIn('bias'),
       });
+      if (notes.length > 0) {
+        notify({
+          title: 'Calibration at another sub-frame origin',
+          detail: notes.join('\n'),
+          kind: 'merge',
+          tone: 'warning',
+        });
+      }
       onApplied?.();
       onClose();
     } catch (e) {

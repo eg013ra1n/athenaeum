@@ -10,6 +10,7 @@ import type {
   FrameAnalysis,
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
+import { geometryLabel, sizeCellState } from './pickerModel';
 import { ReassignFramePanel } from './ReassignFramePanel';
 import { stackedFrameSnr } from '../analysis/stackedSnr';
 import type { BuildState } from '../../hooks/useMasterBuilds';
@@ -157,6 +158,13 @@ interface FlatRow {
   frameCount: number;
   dateRange: string;
   camera: string | null;
+  /** The set's frame size (+ origin when known), and its comparison key. */
+  size: string | null;
+  sizeKey: string | null;
+  /** The lights' size using this set — what `sizeKey` is judged against. */
+  cameraSize: string | null;
+  /** G-7: the core's sentence when linked at another recorded sub-frame origin. */
+  originWarning: string | null;
   focallen: number | null;
   subCalSetId: number | null;
   subCalType: 'Dark' | 'DarkFlat' | 'Bias' | null;
@@ -183,6 +191,13 @@ interface DarkRow {
   frameCount: number;
   dateRange: string;
   camera: string | null;
+  /** The set's frame size (+ origin when known), and its comparison key. */
+  size: string | null;
+  sizeKey: string | null;
+  /** The lights' size using this set — what `sizeKey` is judged against. */
+  cameraSize: string | null;
+  /** G-7: the core's sentence when linked at another recorded sub-frame origin. */
+  originWarning: string | null;
   biasSetId: number | null;
   gain: number | null;
   offset: number | null;
@@ -202,6 +217,13 @@ interface BiasRow {
   frameCount: number;
   dateRange: string;
   camera: string | null;
+  /** The set's frame size (+ origin when known), and its comparison key. */
+  size: string | null;
+  sizeKey: string | null;
+  /** The lights' size using this set — what `sizeKey` is judged against. */
+  cameraSize: string | null;
+  /** G-7: the core's sentence when linked at another recorded sub-frame origin. */
+  originWarning: string | null;
   gain: number | null;
   offset: number | null;
   isMaster: boolean;
@@ -271,12 +293,19 @@ function deriveTableData(
   for (const f of allFrames) frameById.set(f.frame_id, f);
 
   // Derive camera reference (gain/binning/offset) from linked light frames
-  function linkedCameraParams(lightFrameIds: number[]): { cameraGain: number | null; cameraBinning: string | null; cameraOffset: number | null } {
+  function linkedCameraParams(lightFrameIds: number[]): { cameraGain: number | null; cameraBinning: string | null; cameraOffset: number | null; cameraSize: string | null } {
     for (const id of lightFrameIds) {
       const f = frameById.get(id);
-      if (f) return { cameraGain: f.gain, cameraBinning: f.binning, cameraOffset: f.offset };
+      if (f) {
+        return {
+          cameraGain: f.gain,
+          cameraBinning: f.binning,
+          cameraOffset: f.offset,
+          cameraSize: f.naxis1 != null && f.naxis2 != null ? `${f.naxis1}×${f.naxis2}` : null,
+        };
+      }
     }
-    return { cameraGain: null, cameraBinning: null, cameraOffset: null };
+    return { cameraGain: null, cameraBinning: null, cameraOffset: null, cameraSize: null };
   }
 
   // Deduplicated flat/dark/bias sets
@@ -429,6 +458,10 @@ function deriveTableData(
       frameCount: s.frame_count,
       dateRange: formatSetDateRange(s.date_start, s.date_end),
       camera: s.instrume,
+      size: geometryLabel(s),
+      sizeKey: s.naxis1 != null && s.naxis2 != null ? `${s.naxis1}×${s.naxis2}` : null,
+      // G-7: the core flags a link at another recorded sub-frame origin.
+      originWarning: set.warnings.find(w => w.warning_type === 'geometry')?.message ?? null,
       focallen: s.focallen,
       subCalSetId: subCal?.set.id ?? null,
       // CalibrationLink.calibration_type is a plain `string` on the wire
@@ -459,6 +492,10 @@ function deriveTableData(
       frameCount: s.frame_count,
       dateRange: formatSetDateRange(s.date_start, s.date_end),
       camera: s.instrume,
+      size: geometryLabel(s),
+      sizeKey: s.naxis1 != null && s.naxis2 != null ? `${s.naxis1}×${s.naxis2}` : null,
+      // G-7: the core flags a link at another recorded sub-frame origin.
+      originWarning: set.warnings.find(w => w.warning_type === 'geometry')?.message ?? null,
       biasSetId: biasSubCal?.set.id ?? null,
       gain: s.gain,
       offset: s.offset,
@@ -482,6 +519,10 @@ function deriveTableData(
       frameCount: s.frame_count,
       dateRange: formatSetDateRange(s.date_start, s.date_end),
       camera: s.instrume,
+      size: geometryLabel(s),
+      sizeKey: s.naxis1 != null && s.naxis2 != null ? `${s.naxis1}×${s.naxis2}` : null,
+      // G-7: the core flags a link at another recorded sub-frame origin.
+      originWarning: set.warnings.find(w => w.warning_type === 'geometry')?.message ?? null,
       gain: s.gain,
       offset: s.offset,
       isMaster: s.is_master,
@@ -518,6 +559,19 @@ function MatchBadge({
     <span className={`text-sm ${cls}`} title={label}>
       {typeof value === 'number' ? value : value}
     </span>
+  );
+}
+
+/** The set's frame size, badged against the lights that use it; a warning
+ *  (with the core's sentence on hover) when it is linked at another recorded
+ *  sub-frame origin (G-7). */
+function SizeCell({ row }: { row: { size: string | null; sizeKey: string | null; cameraSize: string | null; originWarning: string | null } }) {
+  const { matches, title } = sizeCellState(row);
+  return (
+    <td className="px-1.5 py-1 text-sm whitespace-nowrap">
+      <MatchBadge label={title} value={row.size} matches={matches} />
+      {row.originWarning && <span className="ml-1 text-warning" title={row.originWarning}>⚠</span>}
+    </td>
   );
 }
 
@@ -938,6 +992,7 @@ function FlatsTable({
             <SortTh field="frameCount" label="Frames" {...thProps} />
             <SortTh field="sortDate" label="Date Range" {...thProps} />
             <SortTh field="camera" label="Camera" {...thProps} />
+            <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">Size</th>
             <SortTh field="focallen" label="FL" {...thProps} />
             <SortTh field="subCalSetId" label="SubCal" {...thProps} />
             {!compact && <SortTh field="gain" label="G" {...thProps} />}
@@ -981,6 +1036,7 @@ function FlatsTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
+                <SizeCell row={row} />
                 <td className="px-1.5 py-1 text-sm text-content-secondary">{row.focallen != null ? `${row.focallen}mm` : '—'}</td>
                 <td className="px-1.5 py-1 text-sm">
                   {row.subCalSetId != null ? (
@@ -1068,6 +1124,7 @@ function DarksTable({
             <SortTh field="frameCount" label="Frames" {...thProps} />
             <SortTh field="sortDate" label="Date Range" {...thProps} />
             <SortTh field="camera" label="Camera" {...thProps} />
+            <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">Size</th>
             <SortTh field="biasSetId" label="Bias" {...thProps} />
             {!compact && <SortTh field="gain" label="G" {...thProps} />}
             {!compact && <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">B</th>}
@@ -1107,6 +1164,7 @@ function DarksTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
+                <SizeCell row={row} />
                 <td className="px-1.5 py-1 text-sm">
                   {row.biasSetId != null ? (
                     <SetIdBadge
@@ -1189,6 +1247,7 @@ function BiasTable({
             <SortTh field="frameCount" label="Frames" {...thProps} />
             <SortTh field="sortDate" label="Date Range" {...thProps} />
             <SortTh field="camera" label="Camera" {...thProps} />
+            <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">Size</th>
             {!compact && <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">B</th>}
             {!compact && <SortTh field="gain" label="G" {...thProps} />}
             {!compact && <SortTh field="offset" label="O" {...thProps} />}
@@ -1223,6 +1282,7 @@ function BiasTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
+                <SizeCell row={row} />
                 {/* Bias renders B, G, O — the reverse of Flats/Darks. Pre-existing
                     inconsistency, deliberately preserved (see MatchCells). */}
                 {!compact && <MatchCells row={row} order="bgo" />}

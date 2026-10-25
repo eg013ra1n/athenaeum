@@ -1618,6 +1618,19 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         })
                         .collect();
 
+                    // G-7: a link at another sub-frame origin is something the
+                    // owner must see at group level too, not only on the set's
+                    // row — the roll-up badge includes the `geometry` warning.
+                    if !group_has_warnings
+                        && flat_sets
+                            .iter()
+                            .chain(&dark_sets)
+                            .chain(&bias_sets)
+                            .any(|s| s.warnings.iter().any(|w| w.warning_type == "geometry"))
+                    {
+                        group_has_warnings = true;
+                    }
+
                     if group_has_warnings {
                         camera_has_warnings = true;
                     }
@@ -2234,6 +2247,11 @@ mod night_grouping_tests {
             "Dark set #500 is 6384×4258 @ 0,0, a light using it is 6384×4258 @ 1584,1064 — another sub-frame origin"
         );
         assert_eq!((w.calibration_type.as_str(), w.set_id), ("Dark", 500));
+        // The roll-up badge (group, camera, night) includes the origin warning.
+        let camera = &view.date_groups[0].camera_groups[0];
+        assert!(camera.filter_groups[0].has_warnings, "group badge");
+        assert!(camera.has_warnings, "camera badge");
+        assert!(view.date_groups[0].has_warnings, "night badge");
     }
 
     /// Review T5-r2 M-5: lights at the SAME origin as the set raise no
@@ -2279,5 +2297,9 @@ mod night_grouping_tests {
         let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
         let dark = &view.date_groups[0].camera_groups[0].filter_groups[0].dark_sets[0];
         assert!(dark.warnings.iter().all(|w| w.warning_type != "geometry"));
+        assert!(
+            !view.date_groups[0].camera_groups[0].filter_groups[0].has_warnings,
+            "no origin warning, no roll-up badge"
+        );
     }
 }

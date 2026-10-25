@@ -1,6 +1,6 @@
 import { Check, Layers } from 'lucide-react';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { blockersOf, describeDifference } from './pickerModel';
+import { blockersOf, describeDifference, geometryLabel, geometryRefuses, geometryWarns } from './pickerModel';
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -38,6 +38,8 @@ function identityFacts(set: CalibrationSetWithScore['set']): string[] {
   if (set.ccd_temp != null) facts.push(`${set.ccd_temp.toFixed(1)} °C`);
   if (set.filter) facts.push(set.filter);
   if (set.binning) facts.push(set.binning);
+  const size = geometryLabel(set);
+  if (size) facts.push(size);
   return facts;
 }
 
@@ -62,19 +64,32 @@ export function CandidateCard({
   onSelect: () => void;
 }) {
   const { set, match_score, compatible, parameters } = candidate;
-  const differences: ParameterVerdict[] = blockersOf(parameters);
+  // A set of another frame size can never calibrate these frames (owner
+  // ruling 2026-10-20) — but the one linked now stays clickable, so the user
+  // can deselect it and clear the stale choice.
+  const locked = geometryRefuses(parameters) && !selected;
+  // The same size at another recorded sub-frame origin: never auto-linked,
+  // allowed by hand with a warning (G-7) — selectable, badged.
+  const otherOrigin = geometryWarns(parameters);
+  const originVerdict = parameters.find(p => p.name === 'geometry' && p.status === 'warning');
+  const differences: ParameterVerdict[] = [
+    ...blockersOf(parameters),
+    ...(originVerdict ? [originVerdict] : []),
+  ];
   const percent = Math.round(match_score * 100);
 
   return (
     <button
       type="button"
-      onClick={onSelect}
+      onClick={locked ? undefined : onSelect}
+      disabled={locked}
+      title={locked ? 'Another frame size — this set cannot calibrate these frames' : undefined}
       aria-pressed={selected}
       className={`w-full text-left rounded-lg border px-3 py-2 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
         selected
           ? 'border-accent bg-accent/10'
           : 'border-border bg-surface-elevated/40 hover:bg-surface-hover'
-      }`}
+      }${locked ? ' opacity-60 cursor-not-allowed' : ''}`}
     >
       {/* Which set: its nights, and how much material it carries. */}
       <div className="flex items-baseline gap-2">
@@ -90,6 +105,14 @@ export function CandidateCard({
           </span>
         )}
         <span className="ml-auto flex items-baseline gap-2">
+          {otherOrigin && (
+            <span
+              className="rounded bg-warning-muted px-1.5 py-0.5 text-xs font-medium text-warning"
+              title="Same frame size, another sub-frame origin — never linked automatically; allowed by hand"
+            >
+              Another sub-frame origin
+            </span>
+          )}
           {isCurrent && (
             <span className="rounded bg-info-muted px-1.5 py-0.5 text-xs font-medium text-info">
               Linked now
@@ -120,7 +143,7 @@ export function CandidateCard({
             return (
               <span key={p.name} className="inline-flex items-baseline gap-1.5 text-xs">
                 <span className={unknown ? 'text-content-muted' : 'text-warning'}>
-                  {unknown ? '?' : '✕'}
+                  {p.status === 'warning' ? '⚠' : unknown ? '?' : '✕'}
                 </span>
                 <span className="text-content-muted">{d.label}</span>
                 <span className={unknown ? 'text-content-muted' : 'text-warning'}>{d.change}</span>

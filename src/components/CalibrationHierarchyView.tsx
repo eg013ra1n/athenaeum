@@ -240,7 +240,7 @@ export function CalibrationHierarchyView({
   // Each slot arrives as a ManualPick: `null` = untouched (skip), `'clear'` =
   // explicitly deselected (clear that type's link), a number = assign it.
   const handleManualCalibrationApply = useCallback(
-    async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick) => {
+    async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick, originNotes: string[] = []) => {
       // `clear_manual_calibration_override` deletes MANUAL links only, so a
       // deselect aimed at an auto-matched link deletes nothing and the backend
       // keeps the link. Say so (audit I6) instead of blanking the slot locally
@@ -304,6 +304,17 @@ export function CalibrationHierarchyView({
           });
         }
 
+        // G-7: a set at another recorded sub-frame origin is allowed by hand —
+        // with a visible warning once the assignment went through.
+        if (originNotes.length > 0) {
+          notify({
+            title: 'Calibration at another sub-frame origin',
+            detail: originNotes.join('\n'),
+            kind: 'generic',
+            tone: 'warning',
+          });
+        }
+
         setManualModalOpen(false);
 
         if (onRefresh) {
@@ -311,6 +322,14 @@ export function CalibrationHierarchyView({
         }
       } catch (error) {
         console.error('Failed to apply manual calibration:', error);
+        // G-4: a refused assignment (e.g. another frame size) must not vanish.
+        notify({
+          title: 'Could not apply the calibration',
+          detail: String(error),
+          kind: 'generic',
+          tone: 'warning',
+          hasErrors: true,
+        });
       }
     },
     [manualModalFrameIds, manualModalCurrentFlat, manualModalCurrentDark, manualModalCurrentBias, onRefresh, notify]

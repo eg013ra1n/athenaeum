@@ -1,4 +1,5 @@
 import type {
+  CalibrationSetDetail,
   CalibrationSetParameters,
   CalibrationSetWithScore,
   LightFrameParameters,
@@ -159,6 +160,7 @@ const PARAM_LABEL: Record<string, string> = {
   ccd_temp: 'Temperature',
   focallen: 'Focal length',
   telescop: 'Telescope',
+  geometry: 'Frame size',
 };
 
 /**
@@ -185,6 +187,10 @@ export function describeDifference(p: ParameterVerdict): {
   limit: string | null;
 } {
   const label = PARAM_LABEL[p.name] ?? p.name;
+  // G-7: a geometry `warning` is the same size at another recorded origin.
+  if (p.name === 'geometry' && p.status === 'warning') {
+    return { label: 'Sub-frame origin', change: `${p.frameValue ?? '—'} → ${p.setValue ?? '—'}`, limit: null };
+  }
   if (p.status === 'unknown') {
     // Three shapes, and each is a different thing to do about it: the set is
     // missing the value (fill it in), the frames are (the header never had
@@ -201,4 +207,54 @@ export function describeDifference(p: ParameterVerdict): {
     change: `${p.frameValue ?? '—'} → ${p.setValue ?? '—'}`,
     limit: p.matchingThreshold != null ? `limit ${p.matchingThreshold}` : null,
   };
+}
+
+// ── Frame geometry (size + sub-frame origin) ─────────────────────────────────
+
+/** `9576×6388`, or `6384×4258 @ 1584,1064` when the set records its
+ *  sub-frame origin — the core's `Geometry::label` spelling. Null when the
+ *  set records no size. */
+export function geometryLabel(
+  set: Pick<CalibrationSetDetail, 'naxis1' | 'naxis2' | 'xorgsubf' | 'yorgsubf'>,
+): string | null {
+  if (set.naxis1 == null || set.naxis2 == null) return null;
+  const size = `${set.naxis1}×${set.naxis2}`;
+  return set.xorgsubf != null && set.yorgsubf != null
+    ? `${size} @ ${set.xorgsubf},${set.yorgsubf}`
+    : size;
+}
+
+/** The frame-size rule is not the user's to relax (owner ruling 2026-10-20):
+ *  a set of another size (or of mixed sizes) can never be chosen. */
+export function geometryRefuses(parameters: ParameterVerdict[]): boolean {
+  return parameters.some(p => p.name === 'geometry' && p.status === 'mismatch');
+}
+
+/** The same size at another recorded sub-frame origin: auto-link never takes
+ *  it, a person may — with a warning (owner, G-7: "auto no, manual yes"). */
+export function geometryWarns(parameters: ParameterVerdict[]): boolean {
+  return parameters.some(p => p.name === 'geometry' && p.status === 'warning');
+}
+
+/** The calibration hierarchy's Size cell: green when the set's size is the
+ *  lights', warning on another size or (G-7) another recorded origin, muted
+ *  when either size is unknown. `title` is what the cell says on hover. */
+export function sizeCellState(row: {
+  size: string | null;
+  sizeKey: string | null;
+  cameraSize: string | null;
+  originWarning: string | null;
+}): { matches: boolean | null; title: string } {
+  if (row.originWarning != null) return { matches: false, title: row.originWarning };
+  const matches = row.cameraSize != null && row.sizeKey != null ? row.sizeKey === row.cameraSize : null;
+  return { matches, title: 'Frame size' };
+}
+
+/** The sentence a person sees after choosing a set at another recorded
+ *  sub-frame origin by hand (G-7: allowed, with a visible warning); null for
+ *  any other candidate. */
+export function originChoiceNote(candidate: CalibrationSetWithScore): string | null {
+  const verdict = candidate.parameters.find(p => p.name === 'geometry' && p.status === 'warning');
+  if (!verdict) return null;
+  return `Set #${candidate.set.id} is ${verdict.setValue ?? '—'}, the frames are ${verdict.frameValue ?? '—'} — another sub-frame origin`;
 }
