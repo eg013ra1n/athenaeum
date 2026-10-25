@@ -65,7 +65,7 @@ export function AttestationToggle({ framesSetId, calibratedExternally, linkedCal
             ? 'bg-warning-muted text-warning border-warning/50'
             : 'bg-surface-elevated text-content-secondary hover:text-content hover:bg-surface-hover border-border/50'
         }`}
-        title="The lights of this set are already calibrated (dark and flat applied) as single-channel frames — mono or CFA, not debayered RGB. Collaboration projects take them as they are; nothing in the app calibrates them again."
+        title="The lights of this set are already calibrated (dark and flat applied). Mono, raw-mosaic (CFA) and already-debayered RGB lights are all accepted: a mosaic is debayered at stacking (debayer on), RGB lights stack as colour. Stacking and collaboration projects take the lights as they are — no masters are asked for and nothing in the app calibrates them again."
       >
         <span
           aria-hidden
