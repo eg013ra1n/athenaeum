@@ -309,6 +309,35 @@ impl HipsStore {
         Ok((tiles, bytes))
     }
 
+    /// Removes `.{file}.{pid}.{n}.part` files another process left behind
+    /// (a quit or crash mid-write). Files of this process are in flight and
+    /// stay. A failure warns once per file and never fails the caller.
+    pub fn sweep_stale_parts(&self) {
+        let own = std::process::id();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(path = %dir.display(), error = %e, "hips stale part file not removed");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let Ok(ty) = entry.file_type() else { continue };
+                if ty.is_dir() {
+                    stack.push(entry.path());
+                } else if ty.is_file() && part_file_pid(&entry.file_name().to_string_lossy()).is_some_and(|p| p != own) {
+                    let path = entry.path();
+                    if let Err(e) = fs::remove_file(&path) {
+                        tracing::warn!(path = %path.display(), error = %e, "hips stale part file not removed");
+                    }
+                }
+            }
+        }
+    }
+
     /// Renames the store to a sibling tombstone (`<root>.clearing-<pid>-<n>`),
     /// which is O(1): the survey's store is empty from that moment. `None`
     /// when there is no store. [`HipsStore::clear`] the returned store to size
@@ -334,6 +363,15 @@ impl HipsStore {
             Err(e) => Err(e).with_context(|| format!("remove {}", self.root.display())),
         }
     }
+}
+
+/// The pid embedded in a `.{file}.{pid}.{n}.part` name, if it is one.
+fn part_file_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".part")?;
+    let (rest, n) = rest.rsplit_once('.')?;
+    let (_, pid) = rest.rsplit_once('.')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -498,6 +536,30 @@ mod tests {
         assert!(TileFormat::Jpeg.matches(JPEG));
         assert!(!TileFormat::Jpeg.matches(b"<html>"));
         assert!(TileFormat::Png.matches(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]));
+    }
+
+    #[test]
+    fn sweep_removes_other_pids_part_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HipsStore::new(dir.path(), &DSS_COLOR);
+        store.write(3, 7, JPEG).unwrap();
+        let tiles = dir.path().join("hips/dss-color/Norder3/Dir0");
+        let own = std::process::id();
+        let other = own.wrapping_add(1);
+        let stale = tiles.join(format!(".Npix7.jpg.{other}.4.part"));
+        let live = tiles.join(format!(".Npix8.jpg.{own}.5.part"));
+        let not_part = tiles.join(".Npix9.jpg.notapid.1.part");
+        for f in [&stale, &live, &not_part] {
+            fs::write(f, b"half").unwrap();
+        }
+        store.sweep_stale_parts();
+        assert!(!stale.exists(), "another process's part file is swept");
+        assert!(live.exists(), "this process's part file is kept");
+        assert!(not_part.exists(), "a name that is not a part file is kept");
+        assert_eq!(store.read(3, 7).unwrap(), CachedTile::Image(JPEG.to_vec()));
+        HipsStore::new(dir.path(), &DSS_COLOR).sweep_stale_parts();
+        // A store that does not exist is not an error.
+        HipsStore::new(&dir.path().join("nowhere"), &DSS_COLOR).sweep_stale_parts();
     }
 
     #[test]

@@ -504,6 +504,28 @@ mod offline_pack {
             }
             *slot = Some(LivePack { survey_id: survey.id.to_string(), cancel: cancel.clone(), latest: latest.clone() });
         }
+        let release_claim = || {
+            let mut slot = pack_slot().lock().unwrap();
+            if slot.as_ref().is_some_and(|l| Arc::ptr_eq(&l.cancel, &cancel)) {
+                *slot = None;
+            }
+        };
+        // A Clear between the first check and the claim moved the store aside
+        // with its `properties`: read them again now that no Clear can run.
+        match store.read_properties() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                validated().lock().unwrap().remove(survey.id);
+                if let Err(e) = ensure_properties(&store, survey, true) {
+                    release_claim();
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                release_claim();
+                return Err(e.into());
+            }
+        }
 
         let thread_initial = initial.clone();
         let thread_cancel = cancel.clone();
@@ -528,10 +550,7 @@ mod offline_pack {
             });
         });
         if let Err(e) = spawned {
-            let mut slot = pack_slot().lock().unwrap();
-            if slot.as_ref().is_some_and(|l| Arc::ptr_eq(&l.cancel, &cancel)) {
-                *slot = None;
-            }
+            release_claim();
             tracing::error!(survey_id = survey.id, error = %e, "hips pack thread failed to start");
             return Err(ApiError::Internal(format!("could not start the pack thread: {e}")));
         }

@@ -507,6 +507,8 @@ pub fn run_pack(
     cancel: &AtomicBool,
     on_progress: &(dyn Fn(&PackProgress) + Sync),
 ) -> PackProgress {
+    // Once per run, before any worker writes: part files a quit left behind.
+    store.sweep_stale_parts();
     let todo: Vec<(u8, u64)> = tiles.iter().copied().filter(|&(o, n)| !store.has(o, n)).collect();
     let selection = initial.selection.clone();
     let survey_id = selection.as_ref().map(|s| s.survey_id.clone()).unwrap_or_default();
