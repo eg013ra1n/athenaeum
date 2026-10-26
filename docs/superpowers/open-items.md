@@ -21,6 +21,15 @@ and the reproduction passes on the owner's catalog.
 
 None open.
 
+## Sky Chart offline pack (HiPS phase 2, #18) — owed live acceptance
+
+Code, tests and reviews are done (plan `plans/2026-10-26-hips-offline-pack.md`, reference `docs/skychart/README.md` → Offline pack). Not yet run by hand, desktop, dev DB, live CDS — the only bulk fetch allowed, never from automation:
+- Order-3 pack with Messier + locations on, NGC/IC off: the estimate before start is within 30 % of what lands on disk.
+- Cancel at ≈ 30 %, quit, relaunch: Settings shows Resume with the same selection; Resume finishes with 0 failed.
+- Online off + network off: the chart shows the whole sky; zoomed on M 31 and on one of your frame sets the detail is sharp (order 5–6); outside the cones on a Retina window the coarse sky shows, not black; no `hips tile fetched` line in the log.
+- A busy wait: the "Survey busy, waiting N s" line clears once the wait ends (`Run::settle` has no test of its own).
+- Web build with `ATHENAEUM_API_KEY`: the pack starts and its progress streams over SSE.
+
 ## Plan D — carried from Plans B and C
 
 Plan C took the Analysis switch only (owner, 2026-10-24); what it measured and did not fix is here. **Plan D starts by checking the first `c` item on the
