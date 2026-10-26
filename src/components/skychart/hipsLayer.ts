@@ -3,9 +3,10 @@
  * canvas, inside the persistent chart host, so stars, lines, footprints and
  * markers stay on top.
  *
- * Each tile is drawn as a mesh of affine-textured triangles projected
- * through d3-celestial's own projection (mirrored longitude, roll and
- * clipping included). Tiles come through `api.invoke('get_hips_tile')`;
+ * Each tile is drawn as a mesh of textured triangles projected through
+ * d3-celestial's own projection (mirrored longitude, roll and clipping
+ * included): with WebGL (`hipsGl.ts`) when the webview has it, else on a 2D
+ * canvas as affine-clipped triangles. Tiles come through `api.invoke('get_hips_tile')`;
  * the core serves them from the local store or the survey's master.
  *
  * Tile orientation (measured on DSS colored, issue #18): pixel column c and
@@ -15,6 +16,7 @@
 
 import { api } from '../../api';
 import { chartHost, chartSize, onChartRedraw } from './celestialHost';
+import { GlTileRenderer, MeshPoint, createGlRenderer } from './hipsGl';
 import {
   angularDistance, cellCap, sphCoo, tilePixelSize, visibleCells,
 } from './healpix';
@@ -43,13 +45,16 @@ const MAX_BITMAPS = 150;
 const MAX_ABSENT = 5000;
 /** A failed tile is retried after this long. */
 const RETRY_MS = 30_000;
-/** Largest distance, device px, the drawn mesh may stray from the true projection. */
+/** Largest distance, device px, the drawn mesh may stray from the true projection (2D canvas). */
 const MESH_TOLERANCE_PX = 1;
+/** The same with WebGL, where a finer mesh costs the GPU: twice the cells per side of the 2D mesh. */
+const GL_MESH_TOLERANCE_PX = 0.25;
 const MAX_MESH = 16;
 /**
- * While the chart moves (a redraw less than this long ago) every tile is
- * one cell, a few px off but as cheap as two triangles; this long after the
- * last redraw the view is repainted once at `MESH_TOLERANCE_PX`.
+ * 2D canvas only: while the chart moves (a redraw less than this long ago)
+ * every tile is one cell, a few px off but as cheap as two triangles; this
+ * long after the last redraw the view is repainted once at
+ * `MESH_TOLERANCE_PX`. WebGL draws the fine mesh at every frame.
  */
 const SETTLE_MS = 150;
 /** Cell fractions where a one-cell tile is compared with the projection: edge midpoints, center, quarter points. */
@@ -67,6 +72,8 @@ let survey: HipsSurveyRef | null = null;
 let generation = 0;
 let opacity = 1;
 let layerCanvas: HTMLCanvasElement | null = null;
+/** WebGL renderer of `layerCanvas`; null when the canvas fell back to 2D. */
+let glRenderer: GlTileRenderer | null = null;
 let unsubscribe: (() => void) | null = null;
 let frame = 0;
 let statusListener: ((s: HipsLayerStatus) => void) | null = null;
@@ -91,6 +98,8 @@ export function setHipsSurvey(next: HipsSurveyRef | null): void {
   generation++;
   survey = next;
   if (!next) {
+    glRenderer?.dispose();
+    glRenderer = null;
     layerCanvas?.remove();
     layerCanvas = null;
     unsubscribe?.();
@@ -126,10 +135,11 @@ function scheduleRepaint(): void {
 let lastRedraw = -Infinity;
 let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
-/** A chart redraw: a coarse repaint now, a fine one once the chart has been still for `SETTLE_MS`. */
+/** A chart redraw: a repaint now; on a 2D canvas a coarse one, then a fine one once the chart has been still for `SETTLE_MS`. */
 function onRedraw(): void {
   lastRedraw = performance.now();
   scheduleRepaint();
+  if (glRenderer) return;
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = setTimeout(() => {
     settleTimer = null;
@@ -147,6 +157,8 @@ function ensureCanvas(): HTMLCanvasElement | null {
     Object.assign(layerCanvas.style, {
       position: 'absolute', top: '0', left: '0', pointerEvents: 'none',
     });
+    glRenderer = createGlRenderer(layerCanvas, scheduleRepaint);
+    if (!glRenderer) console.info('[SkyChart] HiPS layer draws on a 2D canvas (no WebGL)');
   }
   // Under the chart canvas: d3-celestial's canvas is position:relative with
   // z-index 0, so a preceding absolutely positioned sibling paints below it.
@@ -173,7 +185,6 @@ function paint(): void {
   const C = window.Celestial;
   const s = survey;
   if (!s || !C?.mapProjection) return;
-  const moving = performance.now() - lastRedraw < SETTLE_MS;
   const canvas = ensureCanvas();
   if (!canvas) return;
   const { width, height } = chartSize();
@@ -184,11 +195,18 @@ function paint(): void {
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
   }
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const gl = glRenderer;
+  if (gl?.lost) return;
+  const ctx = gl ? null : canvas.getContext('2d');
+  if (!gl && !ctx) return;
+  const moving = !gl && performance.now() - lastRedraw < SETTLE_MS;
+  if (gl) {
+    gl.begin(canvas.width, canvas.height);
+  } else if (ctx) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
 
   const projection = C.mapProjection;
   const scale: number = projection.scale();
@@ -211,6 +229,15 @@ function paint(): void {
     return p && Number.isFinite(p[0]) && Number.isFinite(p[1]) ? [p[0] * dpr, p[1] * dpr] : null;
   };
 
+  const draw = (bmp: ImageBitmap, o: number, n: number) => {
+    if (gl) {
+      const mesh = meshSize(o, n, project, GL_MESH_TOLERANCE_PX);
+      triangles += gl.drawTile(bmp, mesh, meshPoints(o, n, mesh, project), opacity);
+    } else if (ctx) {
+      drawTile(ctx, bmp, o, n, project, moving);
+    }
+  };
+
   // Ancestors first (a stand-in while the wanted tile loads), then the wanted tiles on top.
   const drawnAncestors = new Set<Key>();
   let drawn = 0;
@@ -222,7 +249,7 @@ function paint(): void {
       if (bmp) {
         if (!drawnAncestors.has(k)) {
           drawnAncestors.add(k);
-          drawTile(ctx, bmp, ao, an, project, moving);
+          draw(bmp, ao, an);
         }
         break;
       }
@@ -234,16 +261,18 @@ function paint(): void {
     if (bmp) {
       bitmaps.delete(k);
       bitmaps.set(k, bmp);
-      drawTile(ctx, bmp, o, n, project, moving);
+      draw(bmp, o, n);
       drawn++;
     } else if (absent.has(k)) {
       drawn++;
     }
   }
 
-  // Opacity is a black veil over opaque tiles: blending each grown
-  // triangle at partial alpha would light up the seams between them.
-  if (opacity < 1) {
+  // Opacity on a 2D canvas is a black veil over opaque tiles: blending each
+  // grown triangle at partial alpha would light up the seams between them.
+  // WebGL scales the tile colour instead.
+  if (gl) gl.retain(new Set(bitmaps.values()));
+  if (ctx && opacity < 1) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1 - opacity;
     ctx.fillStyle = '#000';
@@ -330,7 +359,7 @@ type TileProjector = (lon: number, lat: number) => [number, number] | null;
  * as one cell) needs 3. A tile with a point that does not project gets
  * `MAX_MESH`.
  */
-export function meshSize(order: number, npix: number, project: TileProjector): number {
+export function meshSize(order: number, npix: number, project: TileProjector, tolerancePx = MESH_TOLERANCE_PX): number {
   const at = (dx: number, dy: number) => {
     const [lon, lat] = sphCoo(order, npix, Math.min(dx, 1 - 1e-12), Math.min(dy, 1 - 1e-12));
     return project(lon, lat);
@@ -349,7 +378,19 @@ export function meshSize(order: number, npix: number, project: TileProjector): n
       : [0, 1].map((k) => p11[k] + (1 - s) * (p01[k] - p11[k]) + (1 - t) * (p10[k] - p11[k]));
     error = Math.max(error, Math.hypot(drawn[0] - truth[0], drawn[1] - truth[1]));
   }
-  return Math.min(MAX_MESH, Math.max(1, Math.ceil(Math.sqrt(error / MESH_TOLERANCE_PX))));
+  return Math.min(MAX_MESH, Math.max(1, Math.ceil(Math.sqrt(error / tolerancePx))));
+}
+
+/** The (n + 1)² projected mesh points of a tile; point (a, b) is the cell fraction dx = a / n, dy = b / n. */
+function meshPoints(order: number, npix: number, n: number, project: TileProjector): MeshPoint[] {
+  const pts: MeshPoint[] = [];
+  for (let a = 0; a <= n; a++) {
+    for (let b = 0; b <= n; b++) {
+      const [lon, lat] = sphCoo(order, npix, Math.min(a / n, 1 - 1e-12), Math.min(b / n, 1 - 1e-12));
+      pts.push(project(lon, lat));
+    }
+  }
+  return pts;
 }
 
 /**
@@ -366,15 +407,7 @@ function drawTile(
 ): void {
   const n = moving ? 1 : meshSize(order, npix, project);
   const w = bmp.width;
-  const pts: Array<[number, number] | null> = [];
-  for (let a = 0; a <= n; a++) {
-    for (let b = 0; b <= n; b++) {
-      const dx = Math.min(a / n, 1 - 1e-12);
-      const dy = Math.min(b / n, 1 - 1e-12);
-      const [lon, lat] = sphCoo(order, npix, dx, dy);
-      pts.push(project(lon, lat));
-    }
-  }
+  const pts = meshPoints(order, npix, n, project);
   const at = (a: number, b: number) => pts[a * (n + 1) + b];
   const tex = (a: number, b: number): [number, number] => [(b / n) * w, (a / n) * w];
   for (let a = 0; a < n; a++) {

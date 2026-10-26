@@ -101,12 +101,21 @@ A sky survey image drawn under the chart. Phase 1 (this cycle): DSS colored, fet
 - **Layer.** `hipsLayer.ts` draws on a canvas inserted *before* the d3-celestial canvas in the host, so it paints below it. While a survey is on, `setSkyBackdrop(true)` makes the chart's sky disc transparent and hides the Milky Way, through `Celestial.apply` with the current size.
 - **Geometry.** `healpix.ts` is a port of cdshealpix 0.9.1 `nested::sph_coo`, pinned by `healpix.golden.json`. The core test `hips::golden` regenerates the file with `HIPS_GOLDEN_WRITE=1`; the TS test checks it to 1e-12 rad.
 - **Visible tiles.** A cap walk from order 0. The order is the smallest whose tile pixel is ≤ one device pixel at the view center, capped at the survey's max (≤ 6).
-- **Drawing.** Each tile is a mesh of affine-textured triangles drawn through `Celestial.mapProjection`, grown 0.5 px against seams. Vertices beyond 90° from the center are dropped.
-  - **Mesh size** (`meshSize`) follows each tile's own bend. The tile drawn as one cell is compared with the projection at 9 probe points; that error falls with the square of the cell size, so n = ⌈√(error / 1 px)⌉, capped at 16 (also for a tile with a point that does not project). A 12° view at M 31 needs 2–4 cells per tile, ≈ 600 triangles, every tile within 1.5 px (`hipsLayer.test.ts`).
-  - **While the chart moves** (a redraw less than 150 ms ago) every tile is one cell: a few px off, invisible in motion, and as cheap as before the fix. One fine repaint follows 150 ms after the last redraw.
-  - **Cost** (headless Chromium, 30 pan frames at 12°, tile-layer JS): before the fix 28 ms at DPR 1 / 3.5 s at DPR 2 (software rasterization); a screen-sized mesh at every frame, briefly shipped in `7d2da893`, 749 ms at DPR 1 and a slow UI on a real machine; now 24 ms / 3.0 s, plus one fine repaint after a stop (3 ms at DPR 1).
-  - **Split along the anti-diagonal** (dx + dy = const). At z = ±2/3 (|Dec| ≈ 41.8°) HEALPix turns from its equatorial to its polar projection, a kink in the tile's (dx, dy) that runs along that diagonal in every tile it crosses.
+- **Drawing.** Each tile is a mesh of textured triangles projected through `Celestial.mapProjection` on the CPU. Vertices beyond 90° from the center are dropped.
+  - **WebGL (`hipsGl.ts`)** when the webview has it: one texture per tile bitmap (deleted with the bitmap), the mesh drawn as one `drawArrays` per tile, opacity as a colour scale. The fine mesh (0.25 px tolerance) is drawn at every frame, so panning shows no bend and nothing snaps after a stop.
+  - **2D canvas fallback** when `getContext('webgl')` fails (logged once): affine-clipped triangles, grown 0.5 px against seams; a black veil for opacity, since blending each grown triangle at partial alpha would light up the seams between them. While the chart moves (a redraw less than 150 ms ago) every tile is one cell; one fine repaint (1 px tolerance) follows 150 ms after the last redraw.
+  - **Mesh size** (`meshSize`) follows each tile's own bend. The tile drawn as one cell is compared with the projection at 9 probe points; that error falls with the square of the cell size, so n = ⌈√(error / tolerance)⌉, capped at 16 (also for a tile with a point that does not project). At 1 px a 12° view at M 31 needs 2–4 cells per tile, ≈ 600 triangles, every tile within 1.5 px (`hipsLayer.test.ts`); WebGL's 0.25 px doubles the cells per side.
+  - **Split along the anti-diagonal** (dx + dy = const), in both paths. At z = ±2/3 (|Dec| ≈ 41.8°) HEALPix turns from its equatorial to its polar projection, a kink in the tile's (dx, dy) that runs along that diagonal in every tile it crosses.
   - **Fixed 2026-10-26.** The mesh used to be one cell per 4° of tile, split along dx = dy. On the order-4 tile under M 31 (a 12° view at DPR 1) that bent the image by up to 98 px. M 110 sat 0.3° from its place while M 31 and M 32 looked right, so a correctly sized frame-set box looked half the size of the galaxy. Error by cells per side on that tile, old split / new split: 1 → 98 / 4.3 px, 4 → 26 / 0.28 px, 16 → 6.5 / 0.02 px. At DPR 3 the chart picks order 6, whose tiles are small enough that the bend was hidden.
+  - **Cost** (headless Chromium with software WebGL, 30 pan frames at 12°, tile-layer JS per frame):
+
+    | Build | DPR 1 | DPR 2 |
+    | ---- | ---- | ---- |
+    | Before the mesh fix (2D, 2 triangles per tile, bent) | 0.9 ms | 117 ms |
+    | Screen-sized 2D mesh at every frame (`7d2da893`, slow on a real machine) | 25 ms | — |
+    | 2D, one cell while moving + fine repaint after a stop (`308f7b55`, bends while dragging) | 0.8 ms | 99 ms |
+    | WebGL, fine mesh at every frame (≈ 1150 triangles at DPR 1) | 3.0 ms | 3.9 ms |
+
 - **Tile orientation (measured, #18).** Column c and row r from the top-left of a W-px JPEG tile sit at `dx = (r + 0.5) / W`, `dy = (c + 0.5) / W`.
   - It was found by scoring all 8 square symmetries on two real tiles, the Pleiades (order 3, npix 7) and Orion (order 2, npix 89). Only this mapping puts every catalogue star on a bright peak.
   - The HEALPix port used for the search agrees with an independent HEALPix implementation to 4 mas.
