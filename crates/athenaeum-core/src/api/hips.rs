@@ -186,6 +186,38 @@ fn while_pack_idle<T>(_survey_id: &str, f: impl FnOnce() -> T) -> Option<T> {
     Some(f())
 }
 
+/// A rename refused because something holds a handle below the folder
+/// (`PermissionDenied`; on Windows also ERROR_SHARING_VIOLATION, os error 32).
+fn is_busy_folder(e: &anyhow::Error) -> bool {
+    e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|io| {
+        io.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && io.raw_os_error() == Some(32))
+    })
+}
+
+/// Removes tombstones (`<root>.clearing-*`) a crashed Clear left behind.
+/// Best effort: a failure is logged and never fails the Clear.
+fn sweep_tombstones(store: &HipsStore) {
+    let (Some(dir), Some(name)) = (store.root().parent(), store.root().file_name()) else { return };
+    let prefix = format!("{}.clearing-", name.to_string_lossy());
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "hips tombstone sweep: cannot list the folder");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "hips stale tombstone not removed");
+        }
+    }
+}
+
 /// Deletes a survey's whole tile store; returns the tile bytes it held.
 /// Refused while a pack of that survey runs: the store would be half-written.
 ///
@@ -195,11 +227,25 @@ fn while_pack_idle<T>(_survey_id: &str, f: impl FnOnce() -> T) -> Option<T> {
 pub fn clear_hips_cache(ctx: &ServiceContext, survey_id: &str) -> Result<u64, ApiError> {
     let survey = find_survey(survey_id)?;
     let store = HipsStore::new(&app_data_dir(ctx)?, survey);
-    let moved = while_pack_idle(survey.id, || store.move_aside()).ok_or_else(|| {
+    sweep_tombstones(&store);
+    let moved = while_pack_idle(survey.id, || {
+        let moved = store.move_aside()?;
+        // Under the pack lock: a start in between cannot skip the properties fetch.
+        validated().lock().unwrap().remove(survey.id);
+        Ok::<_, anyhow::Error>(moved)
+    })
+    .ok_or_else(|| {
         tracing::warn!(survey_id = survey.id, "hips cache clear refused while a pack runs");
         ApiError::Conflict("a sky pack download is running".into())
-    })??;
-    validated().lock().unwrap().remove(survey.id);
+    })?
+    .map_err(|e| {
+        tracing::error!(survey_id = survey.id, error = %format!("{e:#}"), "hips cache move aside failed");
+        if is_busy_folder(&e) {
+            ApiError::Conflict("Some sky tiles are in use; try again in a moment".into())
+        } else {
+            ApiError::from(e)
+        }
+    })?;
     let bytes = match moved {
         Some(tomb) => tomb.clear().map_err(|e| {
             tracing::error!(survey_id = survey.id, error = %format!("{e:#}"), "hips cache removal failed");
@@ -401,6 +447,11 @@ mod offline_pack {
         }
         tracing::error!(survey_id, "hips pack panicked");
         let mut failed = latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if matches!(failed.state, PackState::Done | PackState::Cancelled | PackState::Failed) {
+            // The run had already finished (pack.json written, slot free): a new
+            // run may own the store now, so this late panic rewrites nothing.
+            return;
+        }
         failed.state = PackState::Failed;
         failed.waiting_s = None;
         failed.error = Some("internal error".into());
@@ -639,6 +690,30 @@ mod offline_pack {
             assert_eq!((stored.state, stored.fetched), (PackState::Failed, 4));
             // A run that does not panic emits nothing here.
             run_catching_panic("dss-color", &store, &latest, &|_| panic!("unexpected"), || {});
+        }
+
+        #[test]
+        fn a_late_panic_after_a_terminal_state_rewrites_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = HipsStore::new(dir.path(), &DSS_COLOR);
+            let mut done = PackProgress::new(sky_only(0), 12);
+            done.state = PackState::Done;
+            let latest = Mutex::new(done);
+            run_catching_panic("dss-color", &store, &latest, &|_| panic!("must not emit"), || panic!("late"));
+            assert_eq!(pack::stored_status(&store).state, PackState::Idle, "pack.json is not written");
+        }
+
+        #[test]
+        fn clear_sweeps_stale_tombstones_and_keeps_other_surveys() {
+            let (_dir, ctx) = test_ctx();
+            let root = app_data_dir(&ctx).unwrap().join("hips");
+            let stale = root.join("dss-color.clearing-1-0");
+            let other = root.join("other.clearing-1-0");
+            std::fs::create_dir_all(&stale).unwrap();
+            std::fs::create_dir_all(&other).unwrap();
+            clear_hips_cache(&ctx, "dss-color").unwrap();
+            assert!(!stale.exists());
+            assert!(other.exists());
         }
 
         /// Run first inside `pack_slot_rules`: it reads the process-wide slot.
