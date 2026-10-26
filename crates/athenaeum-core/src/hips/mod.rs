@@ -68,6 +68,9 @@ pub struct HipsSurvey {
     pub format: TileFormat,
     /// The survey's deepest order (`hips_order`).
     pub max_order: u8,
+    /// Typical size of one tile in bytes; used for estimates when the
+    /// survey's own `properties` have not been stored yet.
+    pub approx_tile_bytes: u64,
     /// Shown until the survey's own `properties` have been read.
     pub fallback_attribution: &'static str,
     pub fallback_license: &'static str,
@@ -81,6 +84,7 @@ pub const DSS_COLOR: HipsSurvey = HipsSurvey {
     base_url: "https://alasky.cds.unistra.fr/DSS/DSSColor",
     format: TileFormat::Jpeg,
     max_order: 9,
+    approx_tile_bytes: 67_000,
     fallback_attribution: "Digitized Sky Survey - STScI/NASA, Colored & Healpixed by CDS",
     fallback_license: "ODbL-1.0",
 };
@@ -324,11 +328,40 @@ fn client() -> Result<&'static reqwest::blocking::Client> {
     Ok(CLIENT.get_or_init(|| c))
 }
 
+/// The survey's master answered 429 or 503: it is busy, not broken.
+/// Callers detect it with `err.downcast_ref::<ServerBusy>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerBusy {
+    /// The `Retry-After` delta-seconds, when the server sent one. An
+    /// HTTP-date form is not honoured and reads as `None`.
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for ServerBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(d) => write!(f, "survey server busy, retry after {} s", d.as_secs()),
+            None => write!(f, "survey server busy"),
+        }
+    }
+}
+
+impl std::error::Error for ServerBusy {}
+
 fn get_bounded(url: &str, cap: u64) -> Result<Option<Vec<u8>>> {
     let resp = client()?.get(url).send().with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(anyhow::Error::new(ServerBusy { retry_after }).context(format!("GET {url}: HTTP {status}")));
     }
     if !status.is_success() {
         bail!("GET {url}: HTTP {status}");
@@ -358,7 +391,7 @@ pub fn fetch_tile(survey: &HipsSurvey, order: u8, npix: u64) -> Result<FetchedTi
     fetch_tile_from(survey.base_url, survey.format, order, npix)
 }
 
-fn fetch_tile_from(base_url: &str, format: TileFormat, order: u8, npix: u64) -> Result<FetchedTile> {
+pub(crate) fn fetch_tile_from(base_url: &str, format: TileFormat, order: u8, npix: u64) -> Result<FetchedTile> {
     let rel = tile_rel_path(order, npix, format);
     let url = format!("{base_url}/{}", rel.to_string_lossy().replace('\\', "/"));
     match get_bounded(&url, MAX_TILE_BYTES)? {
@@ -473,6 +506,55 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A one-shot local HTTP server answering the first request with a
+    /// status line and extra header lines.
+    fn serve_status(status: &str, extra_headers: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = format!("HTTP/1.1 {status}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        std::thread::spawn(move || {
+            if let Some(stream) = listener.incoming().next() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).unwrap();
+                stream.write_all(head.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn busy_of(err: &anyhow::Error) -> Option<&ServerBusy> {
+        err.downcast_ref::<ServerBusy>()
+    }
+
+    #[test]
+    fn busy_429_carries_retry_after() {
+        let base = serve_status("429 Too Many Requests", "Retry-After: 7\r\n");
+        let err = fetch_tile_from(&base, TileFormat::Jpeg, 3, 7).unwrap_err();
+        assert_eq!(busy_of(&err).unwrap().retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn busy_503_without_header() {
+        let base = serve_status("503 Service Unavailable", "");
+        let err = fetch_tile_from(&base, TileFormat::Jpeg, 3, 7).unwrap_err();
+        assert_eq!(busy_of(&err).unwrap().retry_after, None);
+    }
+
+    #[test]
+    fn retry_after_http_date_is_ignored() {
+        let base = serve_status("503 Service Unavailable", "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n");
+        let err = fetch_tile_from(&base, TileFormat::Jpeg, 3, 7).unwrap_err();
+        assert_eq!(busy_of(&err).unwrap().retry_after, None);
+    }
+
+    #[test]
+    fn other_5xx_is_not_busy() {
+        let base = serve_status("500 Internal Server Error", "");
+        let err = fetch_tile_from(&base, TileFormat::Jpeg, 3, 7).unwrap_err();
+        assert!(busy_of(&err).is_none());
     }
 
     #[test]
