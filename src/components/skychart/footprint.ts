@@ -32,14 +32,21 @@ export function inverseGnomonic(xiRad: number, etaRad: number, ra0Deg: number, d
 }
 
 /**
- * Sky corners of a fovW × fovH field (degrees) centered on (ra, dec), rotated
- * by the position angle. The half-sizes are tangent-plane offsets (tan of the
- * half angle), so the box is exact at any declination including the poles.
+ * Sky corners of a fovW × fovH field (degrees) centered on (ra, dec). The
+ * half-sizes are tangent-plane offsets (tan of the half angle), so the box
+ * is exact at any declination including the poles.
+ *
+ * `rotationDeg` is the catalog's `frames.rotation`: CROTA2, or the plate
+ * solve's `field_rotation_deg` = atan2(−CD1_2, CD2_2). In that convention the
+ * image's +Y axis points at position angle −rotation (north through east):
+ * the +Y column of the CD matrix is (CD1_2, CD2_2) in (east, north). The
+ * corners are (−W, −H), (+W, −H), (+W, +H), (−W, +H) in image axes.
  */
-export function footprintCorners(ra: number, dec: number, fovW: number, fovH: number, paDeg: number): LonLat[] {
+export function footprintCorners(ra: number, dec: number, fovW: number, fovH: number, rotationDeg: number): LonLat[] {
   const halfW = Math.tan((fovW / 2) * RAD);
   const halfH = Math.tan((fovH / 2) * RAD);
-  const pa = paDeg * RAD;
+  // Position angle of the image's +Y axis.
+  const pa = -rotationDeg * RAD;
   const offsets: Point[] = [[-halfW, -halfH], [halfW, -halfH], [halfW, halfH], [-halfW, halfH]];
   return offsets.map(([dxi, deta]) => {
     const xi = dxi * Math.cos(pa) + deta * Math.sin(pa);

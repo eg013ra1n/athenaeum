@@ -27,6 +27,29 @@ describe('footprintCorners', () => {
     }
   });
 
+  it('turns the image +Y axis to position angle −rotation (CROTA2 / atan2(−CD1_2, CD2_2))', () => {
+    // Position angle (north through east) of b seen from a, degrees in [0, 360).
+    const pa = (a: LonLat, b: LonLat) => {
+      const [ra1, d1] = [a[0] * DEG, a[1] * DEG];
+      const [ra2, d2] = [b[0] * DEG, b[1] * DEG];
+      const y = Math.sin(ra2 - ra1) * Math.cos(d2);
+      const x = Math.cos(d1) * Math.sin(d2) - Math.sin(d1) * Math.cos(d2) * Math.cos(ra2 - ra1);
+      return ((Math.atan2(y, x) / DEG) + 360) % 360;
+    };
+    const center: LonLat = [10.67, 41.1];
+    for (const [rotation, expected] of [[0, 0], [283.5, 76.5], [30, 330], [90, 270]]) {
+      // A box 1e-6° wide: corners 2 and 3 (the +Y edge) sit on the +Y axis.
+      const c = footprintCorners(center[0], center[1], 1e-6, 1, rotation);
+      const top: LonLat = [(c[2][0] + c[3][0]) / 2, (c[2][1] + c[3][1]) / 2];
+      const diff = ((pa(center, top) - expected + 540) % 360) - 180;
+      expect(Math.abs(diff)).toBeLessThan(1e-3);
+    }
+    // A CD matrix whose +Y column points east, (CD1_2, CD2_2) = (+s, 0), has
+    // field rotation atan2(−s, 0) = 270°; the box's +Y edge must lie east.
+    const east = footprintCorners(0, 0, 2, 1, 270);
+    expect((east[2][0] + east[3][0]) / 2).toBeGreaterThan(0);
+  });
+
   it('inverse gnomonic of the origin is the center', () => {
     expect(inverseGnomonic(0, 0, 10, 20)).toEqual([10, 20]);
   });

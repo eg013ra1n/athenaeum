@@ -70,6 +70,8 @@ One routine, `projectFootprint`, used for every redraw:
 
 A box with only some corners beyond the hemisphere is drawn; the globe clip path trims it.
 
+**Rotation convention (fixed 2026-10-26).** `frames.rotation` is CROTA2, or the plate solve's `field_rotation_deg` = atan2(−CD1_2, CD2_2). In that convention the image's +Y axis points at position angle **−rotation** (north through east), because the +Y column of the CD matrix is (CD1_2, CD2_2) in (east, north). Until this fix the box applied +rotation, a mirrored tilt: wrong by 2 × (rotation mod 90°), e.g. 27° for M 31 at 283.5°. It became visible once the DSS background showed the real sky under the box. Mirroring (det CD > 0) does not change a rectangle, only the +Y direction matters. Pinned by `footprint.test.ts`.
+
 ## HiPS sky background (#18)
 
 A sky survey image drawn under the chart. Phase 1 (this cycle): DSS colored, fetched on demand and kept locally. Phase 2 (offline pack download) and phase 3 (NSNS, gated on the author's agreement) are in #18.
