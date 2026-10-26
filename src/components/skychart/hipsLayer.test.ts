@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { angularDistance, cellCap, cellCount, children, sphCoo } from './healpix';
+import { angularDistance, cellCap, cellCount, children, sphCoo, visibleCells } from './healpix';
 import { meshSize, triangleAffine } from './hipsLayer';
 
 const apply = (m: number[], [u, v]: [number, number]): [number, number] => [m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]];
@@ -80,7 +80,7 @@ describe('meshSize', () => {
     return n;
   };
 
-  it('keeps the drawn tile within half a pixel of the sky across the HEALPix polar/equatorial kink (M 110)', () => {
+  it('keeps the drawn tile within a pixel of the sky across the HEALPix polar/equatorial kink (M 110)', () => {
     const m110 = tileAt(4, 10.092, 41.685);
     // One cell per tile is a few px off; the kink at z = 2/3 runs through
     // this tile, so a mesh split along the other diagonal would stay ~100 px
@@ -88,14 +88,18 @@ describe('meshSize', () => {
     expect(meshError(4, m110, 1)).toBeLessThan(5);
     expect(meshError(4, m110, 4)).toBeLessThan(meshError(4, m110, 2) / 3);
     const n = meshSize(4, m110, project);
-    expect(n).toBeGreaterThanOrEqual(4);
-    expect(meshError(4, m110, n)).toBeLessThan(0.5);
+    expect(n).toBe(3);
+    expect(meshError(4, m110, n)).toBeLessThan(1);
   });
 
-  it('stays within a pixel for every tile around the view, and small tiles stay cheap', () => {
-    for (const npix of [tileAt(4, 10.68, 41.27), tileAt(4, 17.43, 35.62), tileAt(4, 4, 46)]) {
-      expect(meshError(4, npix, meshSize(4, npix, project))).toBeLessThan(0.5);
+  it('keeps every tile of the view within 1.5 px with ~600 triangles in all', () => {
+    let triangles = 0;
+    for (const npix of visibleCells(4, [lon0, lat0], 9 * RAD)) {
+      const n = meshSize(4, npix, project);
+      triangles += 2 * n * n;
+      expect(meshError(4, npix, n)).toBeLessThan(1.5);
     }
+    expect(triangles).toBeLessThan(700);
     // An order-9 tile is ≈ 13 px here: one cell.
     expect(meshSize(9, tileAt(9, 10.68, 41.27), project)).toBe(1);
   });

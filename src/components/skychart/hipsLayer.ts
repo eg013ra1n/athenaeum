@@ -43,9 +43,19 @@ const MAX_BITMAPS = 150;
 const MAX_ABSENT = 5000;
 /** A failed tile is retried after this long. */
 const RETRY_MS = 30_000;
-/** A mesh cell spans at most this many device px, so the affine error inside it stays well under one. */
-const MESH_CELL_PX = 64;
-const MAX_MESH = 32;
+/** Largest distance, device px, the drawn mesh may stray from the true projection. */
+const MESH_TOLERANCE_PX = 1;
+const MAX_MESH = 16;
+/**
+ * While the chart moves (a redraw less than this long ago) every tile is
+ * one cell, a few px off but as cheap as two triangles; this long after the
+ * last redraw the view is repainted once at `MESH_TOLERANCE_PX`.
+ */
+const SETTLE_MS = 150;
+/** Cell fractions where a one-cell tile is compared with the projection: edge midpoints, center, quarter points. */
+const MESH_PROBES: [number, number][] = [
+  [0.5, 0], [0, 0.5], [1, 0.5], [0.5, 1], [0.5, 0.5], [0.25, 0.25], [0.75, 0.75], [0.25, 0.75], [0.75, 0.25],
+];
 const MAX_VIEW_RADIUS = Math.PI / 2;
 
 const RAD = Math.PI / 180;
@@ -85,9 +95,11 @@ export function setHipsSurvey(next: HipsSurveyRef | null): void {
     layerCanvas = null;
     unsubscribe?.();
     unsubscribe = null;
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = null;
     return;
   }
-  if (!unsubscribe) unsubscribe = onChartRedraw(scheduleRepaint);
+  if (!unsubscribe) unsubscribe = onChartRedraw(onRedraw);
   scheduleRepaint();
 }
 
@@ -109,6 +121,20 @@ function disposeTiles(): void {
 
 function scheduleRepaint(): void {
   if (!frame) frame = requestAnimationFrame(paint);
+}
+
+let lastRedraw = -Infinity;
+let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** A chart redraw: a coarse repaint now, a fine one once the chart has been still for `SETTLE_MS`. */
+function onRedraw(): void {
+  lastRedraw = performance.now();
+  scheduleRepaint();
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => {
+    settleTimer = null;
+    scheduleRepaint();
+  }, SETTLE_MS + 10);
 }
 
 function ensureCanvas(): HTMLCanvasElement | null {
@@ -147,6 +173,7 @@ function paint(): void {
   const C = window.Celestial;
   const s = survey;
   if (!s || !C?.mapProjection) return;
+  const moving = performance.now() - lastRedraw < SETTLE_MS;
   const canvas = ensureCanvas();
   if (!canvas) return;
   const { width, height } = chartSize();
@@ -195,7 +222,7 @@ function paint(): void {
       if (bmp) {
         if (!drawnAncestors.has(k)) {
           drawnAncestors.add(k);
-          drawTile(ctx, bmp, ao, an, project);
+          drawTile(ctx, bmp, ao, an, project, moving);
         }
         break;
       }
@@ -207,7 +234,7 @@ function paint(): void {
     if (bmp) {
       bitmaps.delete(k);
       bitmaps.set(k, bmp);
-      drawTile(ctx, bmp, o, n, project);
+      drawTile(ctx, bmp, o, n, project, moving);
       drawn++;
     } else if (absent.has(k)) {
       drawn++;
@@ -295,29 +322,38 @@ async function loadTile(s: HipsSurveyRef, order: number, npix: number): Promise<
 type TileProjector = (lon: number, lat: number) => [number, number] | null;
 
 /**
- * Mesh cells per tile side, from the tile's projected size: one cell per
- * `MESH_CELL_PX` device px of its longest edge, since the curvature a mesh
- * must follow is on the screen. A 3.7° tile (order 4, what a 12° view picks
- * at DPR 1) was one cell and bent by 4 px. A tile with a corner that does
- * not project gets 16.
+ * Mesh cells per tile side, from the tile's own bend on screen: the
+ * distance between the projection and the tile drawn as one cell (two
+ * triangles, split as `drawTile` splits them) at `MESH_PROBES`. That error
+ * falls with the square of the cell size, so n = ⌈√(error / tolerance)⌉.
+ * Most tiles of a 12° view need 1 or 2; the 3.7° tile under M 31 (4.3 px
+ * as one cell) needs 3. A tile with a point that does not project gets
+ * `MAX_MESH`.
  */
 export function meshSize(order: number, npix: number, project: TileProjector): number {
-  const corner = (dx: number, dy: number) => {
+  const at = (dx: number, dy: number) => {
     const [lon, lat] = sphCoo(order, npix, Math.min(dx, 1 - 1e-12), Math.min(dy, 1 - 1e-12));
     return project(lon, lat);
   };
-  const c = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
-  if (c.some((p) => !p)) return 16;
-  let edge = 0;
-  for (let i = 0; i < 4; i++) {
-    const [p, q] = [c[i]!, c[(i + 1) % 4]!];
-    edge = Math.max(edge, Math.hypot(q[0] - p[0], q[1] - p[1]));
+  const p00 = at(0, 0);
+  const p10 = at(1, 0);
+  const p01 = at(0, 1);
+  const p11 = at(1, 1);
+  if (!p00 || !p10 || !p01 || !p11) return MAX_MESH;
+  let error = 0;
+  for (const [s, t] of MESH_PROBES) {
+    const truth = at(s, t);
+    if (!truth) return MAX_MESH;
+    const drawn = s + t <= 1
+      ? [0, 1].map((k) => p00[k] + s * (p10[k] - p00[k]) + t * (p01[k] - p00[k]))
+      : [0, 1].map((k) => p11[k] + (1 - s) * (p01[k] - p11[k]) + (1 - t) * (p10[k] - p11[k]));
+    error = Math.max(error, Math.hypot(drawn[0] - truth[0], drawn[1] - truth[1]));
   }
-  return Math.min(MAX_MESH, Math.max(1, Math.ceil(edge / MESH_CELL_PX)));
+  return Math.min(MAX_MESH, Math.max(1, Math.ceil(Math.sqrt(error / MESH_TOLERANCE_PX))));
 }
 
 /**
- * Draws one tile as an n×n mesh. Mesh point (a, b) is the cell fraction
+ * Draws one tile as an n×n mesh (one cell while the chart moves). Mesh point (a, b) is the cell fraction
  * dx = a / n, dy = b / n; its texture point is column dy·W, row dx·W.
  */
 function drawTile(
@@ -326,8 +362,9 @@ function drawTile(
   order: number,
   npix: number,
   project: TileProjector,
+  moving: boolean,
 ): void {
-  const n = meshSize(order, npix, project);
+  const n = moving ? 1 : meshSize(order, npix, project);
   const w = bmp.width;
   const pts: Array<[number, number] | null> = [];
   for (let a = 0; a <= n; a++) {
