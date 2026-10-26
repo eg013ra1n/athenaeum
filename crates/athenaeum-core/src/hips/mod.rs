@@ -537,7 +537,23 @@ mod golden {
             &std::fs::read_to_string(FIXTURE).expect("golden fixture missing; run with HIPS_GOLDEN_WRITE=1"),
         )
         .unwrap();
-        assert_eq!(stored, now, "cdshealpix moved; regenerate with HIPS_GOLDEN_WRITE=1 and re-run the TS test");
+        // lon/lat go through the platform libm (macOS arm64 differs from the
+        // Linux that wrote the fixture by up to 4 ulp), so they are compared
+        // to 1e-12 rad, the tolerance the TS test holds the port to.
+        let rows = |v: &serde_json::Value| v["rows"].as_array().cloned().unwrap_or_default();
+        let (stored_rows, now_rows) = (rows(&stored), rows(&now));
+        assert_eq!(stored_rows.len(), now_rows.len(), "cdshealpix moved; regenerate with HIPS_GOLDEN_WRITE=1");
+        for (s, n) in stored_rows.iter().zip(&now_rows) {
+            let (s, n) = (s.as_array().unwrap(), n.as_array().unwrap());
+            assert_eq!(s[..4], n[..4], "golden inputs moved; regenerate with HIPS_GOLDEN_WRITE=1");
+            for i in 4..6 {
+                let (a, b) = (s[i].as_f64().unwrap(), n[i].as_f64().unwrap());
+                assert!(
+                    (a - b).abs() <= 1e-12,
+                    "cdshealpix moved at {s:?} vs {n:?}; regenerate with HIPS_GOLDEN_WRITE=1 and re-run the TS test"
+                );
+            }
+        }
     }
 }
 
