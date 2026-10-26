@@ -76,7 +76,7 @@ A box with only some corners beyond the hemisphere is drawn; the globe clip path
 
 ## HiPS sky background (#18)
 
-A sky survey image drawn under the chart. Phase 1 (this cycle): DSS colored, fetched on demand and kept locally. Phase 2 (offline pack download) and phase 3 (NSNS, gated on the author's agreement) are in #18.
+A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on demand and kept locally. Phase 2: the offline pack, below. Phase 3 (NSNS DR0.2, gated on Stefan Ziegenbalg's written agreement) is in #18.
 
 **Rights (ruling).**
 - Tiles are never redistributed: not in the installer, the Docker image, the repo, artfrom.space, the hub or Perseus.
@@ -138,6 +138,23 @@ A sky survey image drawn under the chart. Phase 1 (this cycle): DSS colored, fet
 | 6 | 6.4″ | ≈ 3.6–4.5 GB |
 
 Browsing can never store more than the whole sky to order 6.
+
+**Offline pack (phase 2, owner ruling 2026-10-26 on #18).** A user can download the sky ahead of time in Settings → General → Sky background, so the chart works in the field without internet. The chart only links there ("Download for offline…" in its credit strip).
+- **What a pack covers** (`hips/pack.rs::pack_tiles`): the whole sky at orders `0..=k`, plus, around each chosen region, the cone coverage at orders `k+1..=6`. The renderer falls back to ancestors only, so a detail region needs every order above k, not order 6 alone.
+  - k is selectable 0–5 (default **4**, 26″/px, the chart's narrowest-view pixel on a 1× screen). A whole-sky order 6 is never a pack (3.6–4.5 GB); browsing still caches it.
+  - Regions (checkboxes): **imaging locations** (default on; every location the chart draws, radius = half the FOV diagonal + 1°, or 2° without a FOV), **Messier** (on; 108 objects, 3°), **NGC/IC brighter than 10ᵐ** (off; 491 objects, 3°, ≈ 0.6 GB at order 6). Every catalog object was ruled out: the chart's 15 809 DSOs at 2–3° cover 88–98 % of the sky.
+  - Cone coverage goes through `catalog::healpix::cone_pixels_at`, the one wrapper around cdshealpix's knife-edge panic near |Dec| ≈ 41.8° (M 31 sits there).
+- **Estimate** (`estimate_hips_pack`, never touches the network): tiles total / already stored (images and `.absent` markers) / missing; size per tile from the stored `properties` (`hips_estsize` KB × 1024 / `hips_nb_tiles`), else the preset's `approx_tile_bytes` (67 000); free space from `disk::free_bytes`. A start whose missing tiles plus a 512 MiB reserve do not fit is refused; nothing missing skips the check.
+- **Runner** (`run_pack`): 4 workers over one deduplicated tile list; tiles already stored are counted `present` without network. An explicit pack runs with `skychart.hips_online` off (the toggle governs browsing only), and fetches and validates `properties` first.
+  - **Busy survey** (429 / 503, `hips::ServerBusy`): wait `Retry-After` seconds clamped to [5 s, 300 s] (the clamp is applied before any arithmetic: a header of `u64::MAX` seconds is real input), else back off 5 s → 300 s; a tile still busy after 6 waits is `failed`. 4 such tiles in a row (≈ 5 min of solid 429/503) stop the run as `failed` ("survey busy"); a fetched tile or a 404 resets the streak.
+  - **Network down**: 20 consecutive plain errors (connection, HTTP 5xx other than 503, a non-image body, a write error) stop the run as `failed`, finished tiles kept.
+  - **Cancel** finishes the requests in flight and keeps every finished tile; sleeps are ≤ 200 ms steps, so a cancel lands within about a second even in a 300 s wait.
+  - **Progress**: `PackProgress` (state, selection, total, present, fetched, absent, failed, bytes, `waiting_s`, error) is emitted as `hips-download-progress` at most every 250 ms plus once at the end, and a busy wait is shown while it lasts.
+- **One pack per process** (`api/hips.rs`, a static slot beside `validated()`, not a `ServiceContext` field: that struct has 26 literal construction sites, and one pack at a time is the rule anyway). A start claims the slot under its mutex before spawning; a guard frees it on every exit, a panic included (the panic is written and emitted as `failed` unless the run had already ended). A slot whose run reached a terminal state counts as free.
+- **`<store>/pack.json`** holds the last `PackProgress`, written at the start (`running`) and the end (the final counts). `get_hips_pack_status` returns the live run, else that file (a stored `running` after a restart reads `interrupted`, with its selection, so Settings offers Resume), else `idle`; an unreadable file is a warning and `idle`.
+- **Clear** is refused while a pack of that survey runs. Under the slot lock it renames the store to a sibling tombstone (`<id>.clearing-<pid>-<n>`) and sizes and deletes it after the lock is released; tombstones a crash left behind (other pids) are swept by the next Clear. On Windows a rename refused for an open file reads "Some sky tiles are in use; try again in a moment".
+- **Build gate**: the pack (`hips::pack` and its four commands) is `cfg(all(feature = "render", feature = "solver"))`, the gate of the DSO catalog and `catalog::healpix` it uses; tile serving (phase 1) stays ungated.
+- **Commands** (both hosts): `estimate_hips_pack { selection }`, `start_hips_pack { selection }` (returns at once), `cancel_hips_pack` (NotFound once the run ended; the UI ignores it), `get_hips_pack_status { surveyId }`.
 
 **Acceptance, phase 1 (2026-10-26, live CDS through the session's proxy, `athenaeum-web` serving the built frontend, headless Chromium 1600 × 900).**
 
