@@ -186,19 +186,25 @@ fn while_pack_idle<T>(_survey_id: &str, f: impl FnOnce() -> T) -> Option<T> {
     Some(f())
 }
 
-/// A rename refused because something holds a handle below the folder
-/// (`PermissionDenied`; on Windows also ERROR_SHARING_VIOLATION, os error 32).
+/// A rename refused because something holds a handle below the folder. Only
+/// Windows refuses a rename for an open file (`PermissionDenied`, or
+/// ERROR_SHARING_VIOLATION, os error 32); elsewhere a refusal is a real
+/// permission problem that waiting will not fix.
 fn is_busy_folder(e: &anyhow::Error) -> bool {
-    e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|io| {
-        io.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && io.raw_os_error() == Some(32))
-    })
+    cfg!(windows)
+        && e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|io| {
+            io.kind() == std::io::ErrorKind::PermissionDenied || io.raw_os_error() == Some(32)
+        })
 }
 
 /// Removes tombstones (`<root>.clearing-*`) a crashed Clear left behind.
+/// This process's own tombstones are skipped: a concurrent Clear may still be
+/// sizing one, and a later launch sweeps them.
 /// Best effort: a failure is logged and never fails the Clear.
 fn sweep_tombstones(store: &HipsStore) {
     let (Some(dir), Some(name)) = (store.root().parent(), store.root().file_name()) else { return };
     let prefix = format!("{}.clearing-", name.to_string_lossy());
+    let own = format!("{prefix}{}-", std::process::id());
     let entries = match std::fs::read_dir(dir) {
         Ok(it) => it,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -208,7 +214,8 @@ fn sweep_tombstones(store: &HipsStore) {
         }
     };
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with(&prefix) || file_name.starts_with(&own) {
             continue;
         }
         let path = entry.path();
