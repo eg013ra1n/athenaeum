@@ -1,7 +1,10 @@
 // Sky Chart HiPS background routes (issue #18). Thin mirrors of
 // `commands/hips.rs` in the Tauri shell; logic in `athenaeum_core::api::hips`.
 
+use std::sync::Arc;
+
 use athenaeum_core::api::hips as api;
+use athenaeum_core::hips::pack::{PackProgress, PackSelection};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -11,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::api_err;
+use crate::events::SseProgressEmitter;
 use crate::WebAppState;
 
 fn panicked(what: &str, e: tokio::task::JoinError) -> (StatusCode, String) {
@@ -79,6 +83,64 @@ pub async fn clear_hips_cache(
     tokio::task::spawn_blocking(move || api::clear_hips_cache(&ctx, &args.survey_id))
         .await
         .map_err(|e| panicked("HiPS cache", e))?
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+pub struct HipsPackArgs {
+    pub selection: PackSelection,
+}
+
+/// `POST /api/estimate_hips_pack`
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn estimate_hips_pack(
+    State(state): State<WebAppState>,
+    Json(args): Json<HipsPackArgs>,
+) -> Result<Json<api::HipsPackEstimate>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::estimate_hips_pack(&ctx, &args.selection))
+        .await
+        .map_err(|e| panicked("HiPS pack estimate", e))?
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// `POST /api/start_hips_pack` — progress goes out as SSE `hips-download-progress`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn start_hips_pack(
+    State(state): State<WebAppState>,
+    Json(args): Json<HipsPackArgs>,
+) -> Result<Json<PackProgress>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    tokio::task::spawn_blocking(move || api::start_hips_pack(ctx, emitter, args.selection))
+        .await
+        .map_err(|e| panicked("HiPS pack start", e))?
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// `POST /api/cancel_hips_pack`
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cancel_hips_pack() -> Result<Json<()>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(api::cancel_hips_pack)
+        .await
+        .map_err(|e| panicked("HiPS pack cancel", e))?
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// `POST /api/get_hips_pack_status`
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_hips_pack_status(
+    State(state): State<WebAppState>,
+    Json(args): Json<HipsSurveyArgs>,
+) -> Result<Json<PackProgress>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::get_hips_pack_status(&ctx, &args.survey_id))
+        .await
+        .map_err(|e| panicked("HiPS pack status", e))?
         .map(Json)
         .map_err(api_err)
 }

@@ -198,6 +198,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_hips_surveys", post(hips::get_hips_surveys))
         .route("/api/get_hips_tile", post(hips::get_hips_tile))
         .route("/api/clear_hips_cache", post(hips::clear_hips_cache))
+        .route("/api/estimate_hips_pack", post(hips::estimate_hips_pack))
+        .route("/api/start_hips_pack", post(hips::start_hips_pack))
+        .route("/api/cancel_hips_pack", post(hips::cancel_hips_pack))
+        .route("/api/get_hips_pack_status", post(hips::get_hips_pack_status))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
         .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))
