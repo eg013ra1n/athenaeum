@@ -76,6 +76,17 @@ describe('useHipsPack', () => {
     expect(estimateCalls()[1][1].selection.skyOrder).toBe(5);
   });
 
+  it('refresh re-reads the status and estimates again (after Clear)', async () => {
+    wire(status());
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    const statusCalls = () => invokeMock.mock.calls.filter((c) => c[0] === 'get_hips_pack_status').length;
+    const before = statusCalls();
+    await act(async () => { await result.current.refresh(); });
+    await waitFor(() => expect(estimateCalls().length).toBe(2));
+    expect(statusCalls()).toBe(before + 1);
+  });
+
   it('ignores progress for another survey', async () => {
     wire(status());
     const { result } = renderHook(() => useHipsPack(SURVEY));

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { angularDistance, cellCap, cellCount, children, sphCoo, visibleCells } from './healpix';
-import { ancestorsToRequest, meshSize, triangleAffine, type TileStates } from './hipsLayer';
+import { ancestorsToRequest, evictionVictims, meshSize, triangleAffine, type TileStates } from './hipsLayer';
 
 const apply = (m: number[], [u, v]: [number, number]): [number, number] => [m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]];
 
@@ -150,5 +150,20 @@ describe('ancestorsToRequest', () => {
 
   it('has nothing above order 0', () => {
     expect(ancestorsToRequest([[0, 3]], states({ failed: ['0/3'] }))).toEqual([]);
+  });
+});
+
+describe('evictionVictims', () => {
+  it('drops the oldest beyond the cap', () => {
+    expect(evictionVictims(['a', 'b', 'c', 'd'], 2, new Set())).toEqual(['a', 'b']);
+  });
+
+  it('never drops a kept key (a wanted tile or a drawn stand-in ancestor)', () => {
+    expect(evictionVictims(['anc', 'b', 'c', 'd'], 2, new Set(['anc']))).toEqual(['b', 'c']);
+  });
+
+  it('drops nothing at or under the cap, or when everything is kept', () => {
+    expect(evictionVictims(['a', 'b'], 2, new Set())).toEqual([]);
+    expect(evictionVictims(['a', 'b', 'c'], 1, new Set(['a', 'b', 'c']))).toEqual([]);
   });
 });

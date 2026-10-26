@@ -123,7 +123,7 @@ A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on deman
   - Up to 6 requests in flight, nearest the view center first.
   - At most 150 decoded bitmaps (LRU, `close()` on evict, never one in view).
   - Absent tiles are kept in a set of up to 5000 entries.
-  - Cached ancestors are drawn under tiles still loading.
+  - Cached ancestors are drawn under tiles still loading. A tile the store refuses (offline and not stored) asks for its nearest ancestor not known to fail, one order per failure, at the back of the queue; an ancestor drawn as a stand-in is kept from eviction and refreshed in the LRU, so the offline pack's order-k sky shows under finer views instead of black.
   - A survey change disposes everything and drops late responses.
 - **Opacity.** The opacity slider draws a black veil of `1 − opacity` over opaque tiles: blending each grown triangle at partial alpha would light up the seams between them.
 - **Settings.** `skychart.background` (`none` | survey id) and `skychart.background_opacity` are written by the chart's controls; `skychart.hips_online` is a KV setting with its default in `defaults::all()`.

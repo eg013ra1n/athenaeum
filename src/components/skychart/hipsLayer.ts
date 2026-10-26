@@ -85,6 +85,8 @@ const failedAt = new Map<Key, number>();
 const inFlight = new Set<Key>();
 let queue: Array<[number, number]> = [];
 let wanted: Array<[number, number]> = [];
+/** Ancestors the last paint drew as stand-ins; `evict()` keeps them. */
+let shownAncestors = new Set<Key>();
 let wantedOrder = 0;
 
 export function setHipsStatusListener(fn: ((s: HipsLayerStatus) => void) | null): void {
@@ -126,6 +128,7 @@ function disposeTiles(): void {
   inFlight.clear();
   queue = [];
   wanted = [];
+  shownAncestors = new Set();
 }
 
 function scheduleRepaint(): void {
@@ -249,12 +252,15 @@ function paint(): void {
       if (bmp) {
         if (!drawnAncestors.has(k)) {
           drawnAncestors.add(k);
+          bitmaps.delete(k);
+          bitmaps.set(k, bmp);
           draw(bmp, ao, an);
         }
         break;
       }
     }
   }
+  shownAncestors = drawnAncestors;
   for (const [o, n] of wanted) {
     const k = keyOf(o, n);
     const bmp = bitmaps.get(k);
@@ -391,14 +397,30 @@ function pump(): void {
 
 /** Drops the least recently drawn bitmaps beyond the cap, never one in the current view. */
 function evict(): void {
-  if (bitmaps.size <= MAX_BITMAPS) return;
   const keep = new Set(wanted.map(([o, n]) => keyOf(o, n)));
-  for (const [k, b] of bitmaps) {
-    if (bitmaps.size <= MAX_BITMAPS) break;
-    if (keep.has(k)) continue;
-    b.close();
+  for (const k of shownAncestors) keep.add(k);
+  for (const k of evictionVictims([...bitmaps.keys()], MAX_BITMAPS, keep)) {
+    bitmaps.get(k)?.close();
     bitmaps.delete(k);
   }
+}
+
+/**
+ * The keys to drop, oldest first, to bring `keys` (least recently drawn
+ * first) down to `cap`. A key in `keep` (a wanted tile, or an ancestor drawn
+ * as a stand-in by the last paint) is never dropped: losing a stand-in would
+ * re-request it on the next paint and loop.
+ */
+export function evictionVictims(keys: Key[], cap: number, keep: Set<Key>): Key[] {
+  const victims: Key[] = [];
+  let size = keys.length;
+  for (const k of keys) {
+    if (size <= cap) break;
+    if (keep.has(k)) continue;
+    victims.push(k);
+    size--;
+  }
+  return victims;
 }
 
 async function loadTile(s: HipsSurveyRef, order: number, npix: number): Promise<ImageBitmap | null> {
