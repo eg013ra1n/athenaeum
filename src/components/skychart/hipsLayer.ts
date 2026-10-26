@@ -286,11 +286,71 @@ function paint(): void {
     const t = failedAt.get(k);
     return t === undefined || Date.now() - t > RETRY_MS;
   });
+  // Offline (or a refused fetch) the fine tile is not stored: ask for the
+  // stored coarse ancestor too, behind the wanted tiles.
+  queue.push(...ancestorsToRequest(wanted, {
+    loaded: (k) => bitmaps.has(k),
+    failed: (k) => {
+      const t = failedAt.get(k);
+      return t !== undefined && Date.now() - t <= RETRY_MS;
+    },
+    everFailed: (k) => failedAt.has(k),
+    absent: (k) => absent.has(k),
+    busy: (k) => inFlight.has(k),
+  }));
   pump();
   statusListener?.({
     drawn, wanted: wanted.length, loading: inFlight.size + queue.length, failed: failedAt.size,
     paintMs: performance.now() - started, triangles,
   });
+}
+
+/** What `ancestorsToRequest` needs to know about a tile key. */
+export interface TileStates {
+  loaded: (k: Key) => boolean;
+  /** Failed and not yet due for a retry. */
+  failed: (k: Key) => boolean;
+  /** Has failed at some point, retry due or not: the trigger for asking for an ancestor. */
+  everFailed: (k: Key) => boolean;
+  absent: (k: Key) => boolean;
+  /** Being fetched right now. */
+  busy: (k: Key) => boolean;
+}
+
+/**
+ * For each wanted tile whose fetch failed (the store answered an error, e.g.
+ * "not cached and online fetching is off") and that has no loaded ancestor:
+ * its nearest ancestor that is neither failed nor absent, up to order 0. A
+ * tile still loading or merely not asked for yet requests nothing, so
+ * browsing online costs no extra requests. Deduplicated: siblings share one
+ * parent. An ancestor that is already being fetched ends the walk.
+ */
+export function ancestorsToRequest(
+  wantedTiles: Array<[number, number]>,
+  states: TileStates,
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  const seen = new Set<Key>();
+  for (const [o, n] of wantedTiles) {
+    const k = keyOf(o, n);
+    if (states.loaded(k) || !states.everFailed(k)) continue;
+    let standIn = false;
+    for (let ao = o - 1, an = n >> 2; ao >= 0; ao--, an >>= 2) {
+      if (states.loaded(keyOf(ao, an))) standIn = true;
+    }
+    if (standIn) continue;
+    for (let ao = o - 1, an = n >> 2; ao >= 0; ao--, an >>= 2) {
+      const ak = keyOf(ao, an);
+      if (states.busy(ak)) break;
+      if (states.failed(ak) || states.absent(ak)) continue;
+      if (!seen.has(ak)) {
+        seen.add(ak);
+        out.push([ao, an]);
+      }
+      break;
+    }
+  }
+  return out;
 }
 
 function pump(): void {

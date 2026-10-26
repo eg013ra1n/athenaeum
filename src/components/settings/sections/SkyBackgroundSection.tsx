@@ -1,7 +1,7 @@
 // General tab, "Sky background" (issue #18): the online switch for the Sky
 // Chart's HiPS background, and per survey its credit, license, the space its
 // stored tiles take, and Clear. Clear is an action, not a setting.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { api } from '../../../api';
 import type { HipsSurveyInfo } from '../../../types/models';
@@ -23,8 +23,18 @@ function formatBytes(n: number): string {
 const ORDER_PIXEL_SIZE = ['412″', '206″', '103″', '51″', '26″', '13″'];
 const ORDERS = [0, 1, 2, 3, 4, 5];
 
-function PackControls({ survey, onFinished }: { survey: HipsSurveyInfo; onFinished: () => void }) {
-  const { selection, setSelection, estimate, progress, start, cancel } = useHipsPack(survey.id, onFinished);
+function PackControls({ survey, onFinished, refreshToken }: {
+  survey: HipsSurveyInfo;
+  onFinished: () => void;
+  /** Changes when the survey's store was cleared: the status and the estimate are read again. */
+  refreshToken: number;
+}) {
+  const { selection, setSelection, estimate, progress, start, cancel, refresh } = useHipsPack(survey.id, onFinished);
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  useEffect(() => {
+    if (refreshToken > 0) void refreshRef.current();
+  }, [refreshToken]);
   const meta = fieldMeta('general.skyBackground', 'pack');
   const state = progress?.state ?? 'idle';
   const active = state === 'running' || state === 'cancelling';
@@ -125,6 +135,7 @@ export function SkyBackgroundSection() {
   const { notify } = useNotifications();
   const [surveys, setSurveys] = useState<HipsSurveyInfo[] | null>(null);
   const [clearing, setClearing] = useState<HipsSurveyInfo | null>(null);
+  const [cleared, setCleared] = useState<{ id: string; n: number } | null>(null);
 
   const load = useCallback(() => {
     api.invoke<HipsSurveyInfo[]>('get_hips_surveys')
@@ -146,6 +157,7 @@ export function SkyBackgroundSection() {
       notify({ kind: 'generic', tone: 'warning', title: 'Sky tiles not cleared', detail: `${s.label}: ${err}` });
     }
     load();
+    setCleared((c) => ({ id: s.id, n: (c?.n ?? 0) + 1 }));
   };
 
   const meta = fieldMeta('general.skyBackground', 'surveys');
@@ -195,7 +207,7 @@ export function SkyBackgroundSection() {
                     Clear
                   </button>
                   </div>
-                  <PackControls survey={s} onFinished={load} />
+                  <PackControls survey={s} onFinished={load} refreshToken={cleared?.id === s.id ? cleared.n : 0} />
                 </li>
               ))}
             </ul>

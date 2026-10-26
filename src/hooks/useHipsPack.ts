@@ -19,6 +19,8 @@ export interface HipsPack {
   progress: PackProgress | null;
   start: () => Promise<void>;
   cancel: () => Promise<void>;
+  /** Reads the run status again and re-estimates (the store changed under us, e.g. after Clear). */
+  refresh: () => Promise<void>;
 }
 
 export function useHipsPack(surveyId: string, onFinished?: () => void): HipsPack {
@@ -140,5 +142,16 @@ export function useHipsPack(surveyId: string, onFinished?: () => void): HipsPack
     }
   }, [surveyId]);
 
-  return { selection, setSelection, estimate, progress, start, cancel };
+  const refresh = useCallback(async () => {
+    eventSeenRef.current = false;
+    try {
+      const status = await api.invoke<PackProgress>('get_hips_pack_status', { surveyId });
+      if (!eventSeenRef.current) setProgress(status);
+    } catch (err) {
+      console.error('[HipsPack] get_hips_pack_status on refresh failed:', err);
+    }
+    setEstimateTick((t) => t + 1);
+  }, [surveyId]);
+
+  return { selection, setSelection, estimate, progress, start, cancel, refresh };
 }

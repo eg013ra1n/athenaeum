@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { angularDistance, cellCap, cellCount, children, sphCoo, visibleCells } from './healpix';
-import { meshSize, triangleAffine } from './hipsLayer';
+import { ancestorsToRequest, meshSize, triangleAffine, type TileStates } from './hipsLayer';
 
 const apply = (m: number[], [u, v]: [number, number]): [number, number] => [m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]];
 
@@ -106,5 +106,49 @@ describe('meshSize', () => {
 
   it('gives a tile with a corner that does not project a fixed mesh', () => {
     expect(meshSize(4, 0, () => null)).toBe(16);
+  });
+});
+
+describe('ancestorsToRequest', () => {
+  const states = (over: { loaded?: string[]; failed?: string[]; absent?: string[]; busy?: string[] } = {}): TileStates => {
+    const has = (l?: string[]) => (k: string) => (l ?? []).includes(k);
+    return {
+      loaded: has(over.loaded), failed: has(over.failed), everFailed: has(over.failed),
+      absent: has(over.absent), busy: has(over.busy),
+    };
+  };
+
+  it('asks for the nearest ancestor of a failed wanted tile', () => {
+    // Order 6 tile 4100 fails offline; order 5 (1025) is not stored either; order 4 (256) is.
+    expect(ancestorsToRequest([[6, 4100]], states({ failed: ['6/4100', '5/1025'] }))).toEqual([[4, 256]]);
+  });
+
+  it('asks for the parent when only the wanted tile failed', () => {
+    expect(ancestorsToRequest([[6, 4100]], states({ failed: ['6/4100'] }))).toEqual([[5, 1025]]);
+  });
+
+  it('walks past absent ancestors up to order 0', () => {
+    const f = ancestorsToRequest([[3, 70]], states({ failed: ['3/70'], absent: ['2/17', '1/4'] }));
+    expect(f).toEqual([[0, 1]]);
+  });
+
+  it('does not ask for an ancestor of a tile that is still loading', () => {
+    expect(ancestorsToRequest([[6, 4100]], states({ busy: ['6/4100'] }))).toEqual([]);
+    expect(ancestorsToRequest([[6, 4100]], states())).toEqual([]);
+  });
+
+  it('asks for nothing when an ancestor is loaded or already on its way', () => {
+    expect(ancestorsToRequest([[6, 4100]], states({ failed: ['6/4100'], loaded: ['4/256'] }))).toEqual([]);
+    expect(ancestorsToRequest([[6, 4100]], states({ failed: ['6/4100'], busy: ['5/1025'] }))).toEqual([]);
+  });
+
+  it('asks once for the parent shared by failed siblings', () => {
+    const failed = ['6/4100', '6/4101', '6/4102', '6/4103'];
+    const wanted: Array<[number, number]> = [[6, 4100], [6, 4101], [6, 4102], [6, 4103]];
+    expect(ancestorsToRequest(wanted, states({ failed }))).toEqual([[5, 1025]]);
+  });
+
+  it('has nothing above order 0', () => {
+    expect(ancestorsToRequest([[0, 3]], states({ failed: ['0/3'] }))).toEqual([]);
   });
 });
