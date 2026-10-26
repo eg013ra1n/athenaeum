@@ -376,7 +376,7 @@ function pump(): void {
         failedAt.delete(k);
         if (bmp) {
           bitmaps.set(k, bmp);
-          evict();
+          evict(k);
         } else {
           absent.add(k);
           if (absent.size > MAX_ABSENT) absent.delete(absent.values().next().value!);
@@ -395,10 +395,15 @@ function pump(): void {
   }
 }
 
-/** Drops the least recently drawn bitmaps beyond the cap, never one in the current view. */
-function evict(): void {
+/**
+ * Drops the least recently drawn bitmaps beyond the cap, never one in the
+ * current view, a stand-in the last paint drew, or the tile that just loaded
+ * (an ancestor requested as a stand-in is not drawn until the next paint).
+ */
+function evict(justLoaded: Key): void {
   const keep = new Set(wanted.map(([o, n]) => keyOf(o, n)));
   for (const k of shownAncestors) keep.add(k);
+  keep.add(justLoaded);
   for (const k of evictionVictims([...bitmaps.keys()], MAX_BITMAPS, keep)) {
     bitmaps.get(k)?.close();
     bitmaps.delete(k);
@@ -407,9 +412,9 @@ function evict(): void {
 
 /**
  * The keys to drop, oldest first, to bring `keys` (least recently drawn
- * first) down to `cap`. A key in `keep` (a wanted tile, or an ancestor drawn
- * as a stand-in by the last paint) is never dropped: losing a stand-in would
- * re-request it on the next paint and loop.
+ * first) down to `cap`. A key in `keep` (a wanted tile, an ancestor drawn as a
+ * stand-in by the last paint, or the tile that just loaded) is never dropped:
+ * losing a stand-in would re-request it on the next paint and loop.
  */
 export function evictionVictims(keys: Key[], cap: number, keep: Set<Key>): Key[] {
   const victims: Key[] = [];

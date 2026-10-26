@@ -162,6 +162,13 @@ describe('evictionVictims', () => {
     expect(evictionVictims(['anc', 'b', 'c', 'd'], 2, new Set(['anc']))).toEqual(['b', 'c']);
   });
 
+  it('a just-loaded stand-in ancestor survives a full view of kept wanted tiles', () => {
+    const wanted = Array.from({ length: 150 }, (_, i) => `6/${i}`);
+    const keys = [...wanted, '5/0'];
+    expect(evictionVictims(keys, 150, new Set([...wanted, '5/0']))).toEqual([]);
+    expect(evictionVictims(keys, 150, new Set(wanted))).toEqual(['5/0']);
+  });
+
   it('drops nothing at or under the cap, or when everything is kept', () => {
     expect(evictionVictims(['a', 'b'], 2, new Set())).toEqual([]);
     expect(evictionVictims(['a', 'b', 'c'], 1, new Set(['a', 'b', 'c']))).toEqual([]);
