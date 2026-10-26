@@ -1,15 +1,20 @@
 //! Offline pack selection (issue #18, phase 2): turns "whole sky to order k
 //! plus detail around chosen regions" into the deduplicated list of tiles to
-//! download. Pure computation, no I/O; the runner lives beside it.
+//! download (pure computation, no I/O), and runs that list into the
+//! [`HipsStore`] on worker threads.
 //!
 //! The renderer falls back to *ancestors only*, so a detail region covers
 //! every order from `k + 1` up to [`super::DISPLAY_MAX_ORDER`]: a gap between
 //! k and the deepest order would show the coarse sky.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::DISPLAY_MAX_ORDER;
+use super::{FetchedTile, HipsStore, ServerBusy, TileFormat, DISPLAY_MAX_ORDER};
 use crate::models::ImagingLocation;
 use crate::plate_solve::dso_lookup::DsoCatalog;
 
@@ -136,6 +141,388 @@ pub fn pack_tiles(sky_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)
     Ok(tiles)
 }
 
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
+
+/// Where a pack stands. Serialised lowercase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+pub enum PackState {
+    #[default]
+    Idle,
+    Running,
+    Cancelling,
+    Done,
+    Cancelled,
+    Failed,
+    /// The app quit or crashed while a pack ran; Resume continues it.
+    Interrupted,
+}
+
+impl PackState {
+    /// The serialised word, for log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackState::Idle => "idle",
+            PackState::Running => "running",
+            PackState::Cancelling => "cancelling",
+            PackState::Done => "done",
+            PackState::Cancelled => "cancelled",
+            PackState::Failed => "failed",
+            PackState::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// A snapshot of a pack run. Done when `present + fetched + absent + failed
+/// == total`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PackProgress {
+    pub state: PackState,
+    pub selection: Option<PackSelection>,
+    pub total: u64,
+    /// Tiles already on disk when the run started.
+    pub present: u64,
+    pub fetched: u64,
+    /// Tiles the master answered 404 for (no coverage).
+    pub absent: u64,
+    pub failed: u64,
+    pub bytes_fetched: u64,
+    /// Seconds the survey asked us to wait, while at least one worker waits.
+    pub waiting_s: Option<u32>,
+    pub error: Option<String>,
+}
+
+impl PackProgress {
+    /// The `initial` of [`run_pack`]: a running pack of `total` tiles.
+    pub fn new(selection: PackSelection, total: u64) -> Self {
+        PackProgress { state: PackState::Running, selection: Some(selection), total, ..Default::default() }
+    }
+}
+
+/// `<store>/pack.json`: what survives a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackFile {
+    pub selection: Option<PackSelection>,
+    pub state: PackState,
+}
+
+/// Runner tuning. Tests pass millisecond durations.
+#[derive(Debug, Clone)]
+pub struct PackRunConfig {
+    pub workers: usize,
+    /// Longest wait for a busy survey, whatever `Retry-After` says.
+    pub busy_cap: Duration,
+    /// First wait when the survey sent no `Retry-After`; doubles per wait.
+    pub backoff_start: Duration,
+    /// A tile still busy after this many waits counts as failed.
+    pub max_busy_waits: u32,
+    /// This many request errors in a row stop the run as `Failed`.
+    pub max_consecutive_errors: u32,
+}
+
+impl Default for PackRunConfig {
+    fn default() -> Self {
+        PackRunConfig {
+            workers: 4,
+            busy_cap: Duration::from_secs(300),
+            backoff_start: Duration::from_secs(5),
+            max_busy_waits: 6,
+            max_consecutive_errors: 20,
+        }
+    }
+}
+
+/// Progress callbacks are throttled to this interval (4 per second).
+const EMIT_INTERVAL: Duration = Duration::from_millis(250);
+/// A wait checks the cancel flag at least this often.
+const SLEEP_STEP: Duration = Duration::from_millis(200);
+
+/// What the store says about a pack that was running when the app died. The
+/// caller asks only when no run is live in this process.
+pub fn interrupted_status(store: &HipsStore) -> Option<PackProgress> {
+    match store.read_pack_state() {
+        Ok(Some(PackFile { selection, state: PackState::Running })) => {
+            Some(PackProgress { state: PackState::Interrupted, selection, ..Default::default() })
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(path = %store.root().display(), error = %format!("{e:#}"), "hips pack state unreadable");
+            None
+        }
+    }
+}
+
+/// How long to wait before retrying a busy tile. The cap is applied to the
+/// server's value before any arithmetic: `Retry-After: u64::MAX` is a valid
+/// `Duration`.
+fn busy_wait(retry_after: Option<Duration>, waits_so_far: u32, cfg: &PackRunConfig) -> Duration {
+    match retry_after {
+        Some(d) => d.min(cfg.busy_cap),
+        None => cfg
+            .backoff_start
+            .checked_mul(1u32 << waits_so_far.min(20))
+            .map_or(cfg.busy_cap, |d| d.min(cfg.busy_cap)),
+    }
+}
+
+enum Outcome {
+    Image(u64),
+    Absent,
+    /// Still busy after the allowed waits. Not a network error.
+    Busy(anyhow::Error),
+    /// A request or store error; counts toward the consecutive-error stop.
+    Error(anyhow::Error),
+    /// Cancel or stop arrived while waiting; the tile is left for a resume.
+    Halted,
+}
+
+struct Shared {
+    progress: PackProgress,
+    consecutive_errors: u32,
+    last_emit: Instant,
+    waiting_workers: u32,
+    wait_s: u32,
+}
+
+struct Run<'a> {
+    store: &'a HipsStore,
+    base_url: &'a str,
+    format: TileFormat,
+    todo: &'a [(u8, u64)],
+    cfg: &'a PackRunConfig,
+    cancel: &'a AtomicBool,
+    on_progress: &'a (dyn Fn(&PackProgress) + Sync),
+    survey_id: String,
+    next: AtomicUsize,
+    /// Set by the run itself when it gives up (too many errors).
+    stop: AtomicBool,
+    shared: Mutex<Shared>,
+}
+
+impl Run<'_> {
+    fn halted(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Mutates the shared progress and emits it when the throttle allows.
+    /// `on_progress` runs under the lock, so calls are ordered; it must not
+    /// call back into the run.
+    fn update(&self, f: impl FnOnce(&mut Shared)) {
+        let mut s = self.lock();
+        f(&mut s);
+        s.progress.waiting_s = (s.waiting_workers > 0).then_some(s.wait_s);
+        if s.last_emit.elapsed() >= EMIT_INTERVAL {
+            s.last_emit = Instant::now();
+            (self.on_progress)(&s.progress);
+        }
+    }
+
+    /// Sleeps in steps, watching the flags. True when it was cut short.
+    fn sleep(&self, total: Duration) -> bool {
+        let deadline = Instant::now().checked_add(total).unwrap_or_else(|| Instant::now() + self.cfg.busy_cap);
+        loop {
+            if self.halted() {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            std::thread::sleep(left.min(SLEEP_STEP));
+        }
+    }
+
+    fn process(&self, order: u8, npix: u64) -> Outcome {
+        let mut waits = 0u32;
+        let fetched = loop {
+            match super::fetch_tile_from(self.base_url, self.format, order, npix) {
+                Ok(t) => break t,
+                Err(e) => {
+                    let Some(busy) = e.downcast_ref::<ServerBusy>().copied() else {
+                        return Outcome::Error(e);
+                    };
+                    if waits >= self.cfg.max_busy_waits {
+                        return Outcome::Busy(e);
+                    }
+                    let wait = busy_wait(busy.retry_after, waits, self.cfg);
+                    waits += 1;
+                    tracing::debug!(
+                        survey_id = %self.survey_id,
+                        hips_order = order,
+                        npix,
+                        retry_after_s = wait.as_secs(),
+                        "hips survey busy"
+                    );
+                    self.update(|s| {
+                        s.waiting_workers += 1;
+                        s.wait_s = u32::try_from(wait.as_millis().div_ceil(1000)).unwrap_or(u32::MAX);
+                    });
+                    let cut = self.sleep(wait);
+                    self.update(|s| s.waiting_workers -= 1);
+                    if cut {
+                        return Outcome::Halted;
+                    }
+                }
+            }
+        };
+        match fetched {
+            FetchedTile::Image(bytes) => match self.store.write(order, npix, &bytes) {
+                Ok(()) => Outcome::Image(bytes.len() as u64),
+                Err(e) => Outcome::Error(e),
+            },
+            FetchedTile::Absent => match self.store.mark_absent(order, npix) {
+                Ok(()) => Outcome::Absent,
+                Err(e) => Outcome::Error(e),
+            },
+        }
+    }
+
+    fn worker(&self) {
+        while !self.halted() {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(order, npix)) = self.todo.get(i) else { return };
+            match self.process(order, npix) {
+                Outcome::Image(n) => self.update(|s| {
+                    s.progress.fetched += 1;
+                    s.progress.bytes_fetched += n;
+                    s.consecutive_errors = 0;
+                }),
+                Outcome::Absent => self.update(|s| {
+                    s.progress.absent += 1;
+                    s.consecutive_errors = 0;
+                }),
+                Outcome::Busy(e) => {
+                    self.warn_failed(order, npix, &e);
+                    self.update(|s| s.progress.failed += 1);
+                }
+                Outcome::Error(e) => {
+                    self.warn_failed(order, npix, &e);
+                    let msg = format!("{e:#}");
+                    self.update(|s| {
+                        s.progress.failed += 1;
+                        s.consecutive_errors += 1;
+                        if s.consecutive_errors >= self.cfg.max_consecutive_errors {
+                            s.progress.error =
+                                Some(format!("{} requests failed in a row; last: {msg}", s.consecutive_errors));
+                            self.stop.store(true, Ordering::Relaxed);
+                        }
+                    });
+                }
+                Outcome::Halted => return,
+            }
+        }
+    }
+
+    fn warn_failed(&self, order: u8, npix: u64, e: &anyhow::Error) {
+        tracing::warn!(
+            survey_id = %self.survey_id,
+            hips_order = order,
+            npix,
+            error = %format!("{e:#}"),
+            "hips pack tile failed"
+        );
+    }
+}
+
+/// Downloads every tile of `tiles` that the store lacks. Synchronous: the
+/// caller owns the thread. `initial` carries the selection (and state
+/// `Running`); `total` is taken from `tiles`.
+///
+/// Tiles already stored count as `present` without any request. A `429`/`503`
+/// makes the tile wait and retry (see [`PackRunConfig`]); a 404 is recorded as
+/// absent. Cancel finishes the requests in flight and ends `Cancelled`;
+/// `max_consecutive_errors` request errors in a row end `Failed`. Finished
+/// tiles are kept either way, so a later run only fetches the rest.
+/// `<store>/pack.json` holds `running` while the run lives and the end state
+/// afterwards.
+pub fn run_pack(
+    store: &HipsStore,
+    base_url: &str,
+    format: TileFormat,
+    tiles: &[(u8, u64)],
+    initial: PackProgress,
+    cfg: &PackRunConfig,
+    cancel: &AtomicBool,
+    on_progress: &(dyn Fn(&PackProgress) + Sync),
+) -> PackProgress {
+    let todo: Vec<(u8, u64)> = tiles.iter().copied().filter(|&(o, n)| !store.has(o, n)).collect();
+    let selection = initial.selection.clone();
+    let survey_id = selection.as_ref().map(|s| s.survey_id.clone()).unwrap_or_default();
+    let mut progress = initial;
+    progress.state = PackState::Running;
+    progress.total = tiles.len() as u64;
+    progress.present = (tiles.len() - todo.len()) as u64;
+
+    tracing::info!(survey_id = %survey_id, tiles_total = progress.total, "hips pack started");
+    write_pack_file(store, &selection, PackState::Running);
+    (on_progress)(&progress);
+
+    let run = Run {
+        store,
+        base_url,
+        format,
+        todo: &todo,
+        cfg,
+        cancel,
+        on_progress,
+        survey_id,
+        next: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
+        shared: Mutex::new(Shared {
+            progress,
+            consecutive_errors: 0,
+            last_emit: Instant::now(),
+            waiting_workers: 0,
+            wait_s: 0,
+        }),
+    };
+    let workers = cfg.workers.clamp(1, todo.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| run.worker());
+        }
+    });
+
+    let mut s = run.lock();
+    let p = &mut s.progress;
+    p.waiting_s = None;
+    let unfinished = p.present + p.fetched + p.absent + p.failed < p.total;
+    p.state = if run.stop.load(Ordering::Relaxed) {
+        PackState::Failed
+    } else if unfinished && cancel.load(Ordering::Relaxed) {
+        PackState::Cancelled
+    } else {
+        PackState::Done
+    };
+    tracing::info!(
+        survey_id = %run.survey_id,
+        pack_state = p.state.as_str(),
+        tiles_fetched = p.fetched,
+        tiles_absent = p.absent,
+        tiles_failed = p.failed,
+        bytes = p.bytes_fetched,
+        "hips pack finished"
+    );
+    write_pack_file(store, &selection, p.state);
+    (on_progress)(p);
+    p.clone()
+}
+
+fn write_pack_file(store: &HipsStore, selection: &Option<PackSelection>, state: PackState) {
+    let file = PackFile { selection: selection.clone(), state };
+    if let Err(e) = store.write_pack_state(&file) {
+        tracing::warn!(pack_state = state.as_str(), error = %format!("{e:#}"), "hips pack state not saved");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +640,390 @@ mod tests {
             let t = pack_tiles(4, &[r]).unwrap();
             assert!(t.len() > pack_tiles(4, &[]).unwrap().len(), "dec {dec}");
         }
+    }
+
+    // ---- runner -----------------------------------------------------------
+
+    use crate::hips::DSS_COLOR;
+    use std::collections::{HashMap, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+
+    #[derive(Clone)]
+    struct Resp {
+        status: u16,
+        headers: &'static str,
+        body: Vec<u8>,
+    }
+
+    fn ok() -> Resp {
+        Resp { status: 200, headers: "", body: JPEG.to_vec() }
+    }
+
+    fn status(status: u16, headers: &'static str) -> Resp {
+        Resp { status, headers, body: Vec::new() }
+    }
+
+    fn url_path(order: u8, npix: u64) -> String {
+        format!("/{}", crate::hips::tile_rel_path(order, npix, TileFormat::Jpeg).to_string_lossy())
+    }
+
+    /// A local HTTP server with a queue of responses per path. A queue pops
+    /// until one response is left, which then repeats; an unknown path gets
+    /// `default`. `on_response(n)` runs before the n-th response (1-based) is
+    /// written.
+    struct TestServer {
+        base: String,
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        hits: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestServer {
+        fn start(
+            routes: Vec<(String, Vec<Resp>)>,
+            default: Resp,
+            on_response: impl Fn(usize) + Send + Sync + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits = Arc::new(Mutex::new(Vec::new()));
+            let queues: Arc<Mutex<HashMap<String, VecDeque<Resp>>>> =
+                Arc::new(Mutex::new(routes.into_iter().map(|(p, q)| (p, q.into())).collect()));
+            let counter = Arc::new(AtomicUsize::new(0));
+            let on_response = Arc::new(on_response);
+            let (stop2, hits2) = (stop.clone(), hits.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop2.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let (queues, hits, counter, on_response, default) =
+                        (queues.clone(), hits2.clone(), counter.clone(), on_response.clone(), default.clone());
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                        hits.lock().unwrap().push(path.clone());
+                        let resp = match queues.lock().unwrap().get_mut(&path) {
+                            Some(q) if q.len() > 1 => q.pop_front().unwrap(),
+                            Some(q) => q.front().cloned().unwrap_or(default),
+                            None => default,
+                        };
+                        on_response(counter.fetch_add(1, Ordering::SeqCst) + 1);
+                        let head = format!(
+                            "HTTP/1.1 {} X\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            resp.status,
+                            resp.headers,
+                            resp.body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&resp.body);
+                    });
+                }
+            });
+            TestServer { base: format!("http://{addr}"), addr, stop, hits }
+        }
+
+        /// Answers every tile with a JPEG.
+        fn all_ok() -> Self {
+            Self::start(Vec::new(), ok(), |_| {})
+        }
+
+        fn hits_for(&self, path: &str) -> usize {
+            self.hits.lock().unwrap().iter().filter(|p| p.as_str() == path).count()
+        }
+
+        fn total_hits(&self) -> usize {
+            self.hits.lock().unwrap().len()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+        }
+    }
+
+    fn quick_cfg() -> PackRunConfig {
+        PackRunConfig {
+            workers: 4,
+            busy_cap: Duration::from_millis(50),
+            backoff_start: Duration::from_millis(1),
+            max_busy_waits: 6,
+            max_consecutive_errors: 20,
+        }
+    }
+
+    fn tiles_of(n: u64) -> Vec<(u8, u64)> {
+        (0..n).map(|i| (3u8, i)).collect()
+    }
+
+    fn run(
+        store: &HipsStore,
+        base: &str,
+        tiles: &[(u8, u64)],
+        cfg: &PackRunConfig,
+        cancel: &AtomicBool,
+    ) -> PackProgress {
+        let initial = PackProgress::new(PackSelection::default(), tiles.len() as u64);
+        run_pack(store, base, TileFormat::Jpeg, tiles, initial, cfg, cancel, &|_| {})
+    }
+
+    fn new_store() -> (tempfile::TempDir, HipsStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HipsStore::new(dir.path(), &DSS_COLOR);
+        (dir, store)
+    }
+
+    fn assert_accounted(p: &PackProgress) {
+        assert_eq!(p.present + p.fetched + p.absent + p.failed, p.total, "{p:?}");
+    }
+
+    #[test]
+    fn fetches_missing_and_skips_present() {
+        let (_d, store) = new_store();
+        let server = TestServer::all_ok();
+        let tiles = tiles_of(10);
+        for &(o, n) in &tiles[..3] {
+            store.write(o, n, JPEG).unwrap();
+        }
+        let p = run(&store, &server.base, &tiles, &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done, "{p:?}");
+        assert_eq!((p.total, p.present, p.fetched, p.absent, p.failed), (10, 3, 7, 0, 0));
+        assert_eq!(p.bytes_fetched, 7 * JPEG.len() as u64);
+        assert_accounted(&p);
+        for &(o, n) in &tiles {
+            assert!(store.has(o, n), "tile {n}");
+        }
+        assert_eq!(server.total_hits(), 7, "stored tiles must not touch the network");
+        assert_eq!(store.read(3, 8).unwrap(), crate::hips::CachedTile::Image(JPEG.to_vec()));
+    }
+
+    #[test]
+    fn records_404_as_absent() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(vec![(url_path(3, 1), vec![status(404, "")])], ok(), |_| {});
+        let p = run(&store, &server.base, &tiles_of(3), &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done);
+        assert_eq!((p.fetched, p.absent, p.failed), (2, 1, 0));
+        assert_eq!(store.read(3, 1).unwrap(), crate::hips::CachedTile::Absent);
+        // A rerun does not ask again.
+        let before = server.total_hits();
+        let p2 = run(&store, &server.base, &tiles_of(3), &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!((p2.present, p2.fetched), (3, 0));
+        assert_eq!(server.total_hits(), before);
+    }
+
+    #[test]
+    fn cancel_keeps_finished_tiles() {
+        let (_d, store) = new_store();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        let server = TestServer::start(Vec::new(), ok(), move |n| {
+            if n == 3 {
+                c2.store(true, Ordering::SeqCst);
+            }
+        });
+        let tiles = tiles_of(40);
+        let cfg = PackRunConfig { workers: 2, ..quick_cfg() };
+        let p = run(&store, &server.base, &tiles, &cfg, &cancel);
+        assert_eq!(p.state, PackState::Cancelled, "{p:?}");
+        assert!(p.fetched >= 3 && p.fetched < 40, "{p:?}");
+        assert_eq!(store.read_pack_state().unwrap().unwrap().state, PackState::Cancelled);
+
+        // Resume: what was finished is present, the rest is fetched.
+        let p2 = run(&store, &server.base, &tiles, &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p2.state, PackState::Done);
+        assert!(p2.present >= 3, "{p2:?}");
+        assert_eq!(p2.present, p.fetched + p.absent);
+        assert_accounted(&p2);
+    }
+
+    #[test]
+    fn busy_then_ok() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(
+            vec![(url_path(3, 0), vec![status(429, "Retry-After: 0\r\n"), ok()])],
+            ok(),
+            |_| {},
+        );
+        let p = run(&store, &server.base, &tiles_of(1), &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done);
+        assert_eq!((p.fetched, p.failed), (1, 0), "{p:?}");
+        assert_eq!(server.hits_for(&url_path(3, 0)), 2);
+        assert!(p.waiting_s.is_none());
+    }
+
+    #[test]
+    fn busy_forever_fails_tile_after_max_waits() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(Vec::new(), status(503, ""), |_| {});
+        // One busy-failed tile must not count as a network error.
+        let cfg = PackRunConfig { max_consecutive_errors: 1, ..quick_cfg() };
+        let p = run(&store, &server.base, &tiles_of(2), &cfg, &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done, "{p:?}");
+        assert_eq!((p.fetched, p.failed), (0, 2));
+        assert!(p.error.is_none());
+        // 1 first attempt + 6 retries per tile.
+        assert_eq!(server.total_hits(), 2 * 7);
+        assert!(!store.has(3, 0));
+    }
+
+    #[test]
+    fn retry_after_is_capped_before_arithmetic() {
+        let cfg = quick_cfg();
+        assert_eq!(busy_wait(Some(Duration::from_secs(u64::MAX)), 0, &cfg), cfg.busy_cap);
+        assert_eq!(busy_wait(Some(Duration::from_millis(7)), 3, &cfg), Duration::from_millis(7));
+        assert_eq!(busy_wait(Some(Duration::ZERO), 3, &cfg), Duration::ZERO);
+        // No header: 1, 2, 4 ... ms, capped at 50 ms, never overflowing.
+        assert_eq!(busy_wait(None, 0, &cfg), Duration::from_millis(1));
+        assert_eq!(busy_wait(None, 2, &cfg), Duration::from_millis(4));
+        assert_eq!(busy_wait(None, 30, &cfg), cfg.busy_cap);
+        let real = PackRunConfig::default();
+        assert_eq!(busy_wait(None, 0, &real), Duration::from_secs(5));
+        assert_eq!(busy_wait(None, 5, &real), Duration::from_secs(160));
+        assert_eq!(busy_wait(None, 6, &real), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn huge_retry_after_header_waits_only_the_cap() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(
+            vec![(url_path(3, 0), vec![status(429, "Retry-After: 18446744073709551615\r\n"), ok()])],
+            ok(),
+            |_| {},
+        );
+        let t = Instant::now();
+        let p = run(&store, &server.base, &tiles_of(1), &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!((p.fetched, p.failed), (1, 0), "{p:?}");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn cancel_during_a_busy_wait_returns_promptly() {
+        let (_d, store) = new_store();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        let server = TestServer::start(Vec::new(), status(429, "Retry-After: 3600\r\n"), move |_| {
+            c2.store(true, Ordering::SeqCst);
+        });
+        // The real 300 s cap: only the cancel can end the wait.
+        let cfg = PackRunConfig { busy_cap: Duration::from_secs(300), ..quick_cfg() };
+        let t = Instant::now();
+        let p = run(&store, &server.base, &tiles_of(4), &cfg, &cancel);
+        assert_eq!(p.state, PackState::Cancelled, "{p:?}");
+        assert_eq!(p.failed, 0);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn offline_stops_after_consecutive_errors() {
+        let (_d, store) = new_store();
+        // Bind a port, then close it: connections are refused.
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let base = format!("http://{addr}");
+        let tiles = tiles_of(200);
+        store.write(3, 199, JPEG).unwrap();
+        let p = run(&store, &base, &tiles, &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Failed, "{p:?}");
+        assert!(p.failed >= 20 && p.failed < 20 + 4 + 1, "{p:?}");
+        assert!(p.failed < 100, "the run must stop, not fail every tile: {p:?}");
+        let err = p.error.as_deref().unwrap();
+        assert!(err.contains("in a row") && err.contains(&addr.to_string()), "{err}");
+        assert_eq!(store.read_pack_state().unwrap().unwrap().state, PackState::Failed);
+        assert!(store.has(3, 199), "finished tiles are kept");
+    }
+
+    #[test]
+    fn a_success_resets_the_error_streak() {
+        let (_d, store) = new_store();
+        // Odd tiles answer 500, even tiles are fine: never 2 errors in a row.
+        let routes = (0..20u64).filter(|n| n % 2 == 1).map(|n| (url_path(3, n), vec![status(500, "")])).collect();
+        let server = TestServer::start(routes, ok(), |_| {});
+        let cfg = PackRunConfig { workers: 1, max_consecutive_errors: 2, ..quick_cfg() };
+        let p = run(&store, &server.base, &tiles_of(20), &cfg, &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done, "{p:?}");
+        assert_eq!((p.fetched, p.failed), (10, 10));
+    }
+
+    #[test]
+    fn interrupted_after_restart() {
+        let (_d, store) = new_store();
+        assert!(interrupted_status(&store).is_none());
+        let selection = PackSelection { sky_order: 3, around_ngc_ic: true, ..PackSelection::default() };
+        store
+            .write_pack_state(&PackFile { selection: Some(selection.clone()), state: PackState::Running })
+            .unwrap();
+        let p = interrupted_status(&store).unwrap();
+        assert_eq!(p.state, PackState::Interrupted);
+        let got = p.selection.unwrap();
+        assert_eq!((got.sky_order, got.around_ngc_ic, got.survey_id), (3, true, selection.survey_id));
+        // A finished pack is not interrupted.
+        store.write_pack_state(&PackFile { selection: None, state: PackState::Done }).unwrap();
+        assert!(interrupted_status(&store).is_none());
+    }
+
+    #[test]
+    fn pack_json_says_running_during_the_run_and_the_end_state_after() {
+        let (_d, store) = new_store();
+        let server = TestServer::all_ok();
+        let seen = Mutex::new(Vec::new());
+        let initial = PackProgress::new(PackSelection::default(), 5);
+        let p = run_pack(
+            &store,
+            &server.base,
+            TileFormat::Jpeg,
+            &tiles_of(5),
+            initial,
+            &quick_cfg(),
+            &AtomicBool::new(false),
+            &|q| seen.lock().unwrap().push((q.state, store.read_pack_state().unwrap().unwrap().state)),
+        );
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.first().unwrap(), &(PackState::Running, PackState::Running));
+        assert_eq!(seen.last().unwrap(), &(PackState::Done, PackState::Done));
+        assert_eq!(p.state, PackState::Done);
+        assert!(interrupted_status(&store).is_none());
+    }
+
+    #[test]
+    fn progress_callbacks_are_throttled_with_a_final_one() {
+        let (_d, store) = new_store();
+        let server = TestServer::all_ok();
+        let calls = AtomicUsize::new(0);
+        let finals = AtomicUsize::new(0);
+        let initial = PackProgress::new(PackSelection::default(), 60);
+        run_pack(
+            &store,
+            &server.base,
+            TileFormat::Jpeg,
+            &tiles_of(60),
+            initial,
+            &quick_cfg(),
+            &AtomicBool::new(false),
+            &|q| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if q.state == PackState::Done {
+                    finals.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+        assert_eq!(finals.load(Ordering::SeqCst), 1);
+        // 60 local tiles finish well inside a second: the start, at most a
+        // few throttled ones, and the final.
+        let n = calls.load(Ordering::SeqCst);
+        assert!((2..=6).contains(&n), "{n} callbacks");
     }
 }

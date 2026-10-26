@@ -244,6 +244,27 @@ impl HipsStore {
         write_atomic(&self.absent_path(order, npix), b"")
     }
 
+    /// True when the store holds this tile as an image or as an `.absent`
+    /// marker. Checks the files exist; reads no bytes.
+    pub fn has(&self, order: u8, npix: u64) -> bool {
+        self.tile_path(order, npix).is_file() || self.absent_path(order, npix).is_file()
+    }
+
+    /// The last pack's selection and state (`<store>/pack.json`).
+    pub fn read_pack_state(&self) -> Result<Option<pack::PackFile>> {
+        let path = self.root.join("pack.json");
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn write_pack_state(&self, file: &pack::PackFile) -> Result<()> {
+        let bytes = serde_json::to_vec(file).context("serialise pack.json")?;
+        write_atomic(&self.root.join("pack.json"), &bytes)
+    }
+
     pub fn read_properties(&self) -> Result<Option<Properties>> {
         let path = self.root.join("properties");
         match fs::read_to_string(&path) {
