@@ -17,7 +17,7 @@
 - Detail groups (checkboxes): **imaging locations** (default on), **Messier** (default on, 108 objects), **NGC/IC brighter than 10ᵐ** (default off, 491 objects in `resources/dsos.json`).
 - Radii: an imaging location uses half the diagonal of its `fov_width × fov_height` **+ 1°**, or **2°** when it has no FOV. A catalog object uses **3°**.
 - **4** parallel requests. User-Agent is the existing `Athenaeum/<version> (+https://artfrom.space)`.
-- `429` / `503`: wait `Retry-After` seconds (capped at **300 s**), else exponential backoff **5 s → 300 s**. A tile that is still busy after **6** waits counts as failed. **20 consecutive** network errors (not 404, not busy) stop the run as `failed`.
+- `429` / `503`: wait `Retry-After` seconds (capped at **300 s**), else exponential backoff **5 s → 300 s**. A tile that is still busy after **6** waits counts as failed. **20 consecutive** network errors (not 404, not busy) stop the run as `failed`. **4 consecutive** busy-failed tiles (a fetched tile or a 404 resets the count) also stop it as `failed` ("survey busy"); a `Retry-After` shorter than the 5 s backoff start waits the backoff start.
 - One pack at a time per process. A second start → `ApiError::Conflict`.
 - An explicit pack works with `skychart.hips_online` off. The toggle stays the on-demand switch only.
 - Progress event name **`hips-download-progress`**, at most **4 per second**, plus a final one on every terminal state.

@@ -322,7 +322,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let n = PART_COUNTER.fetch_add(1, Ordering::Relaxed);
     let file_name = path.file_name().context("tile path has no file name")?.to_string_lossy();
     let part = dir.join(format!(".{file_name}.{}.{n}.part", std::process::id()));
-    fs::write(&part, bytes).with_context(|| format!("write {}", part.display()))?;
+    if let Err(e) = fs::write(&part, bytes) {
+        // A full disk leaves a partial file behind.
+        let _ = fs::remove_file(&part);
+        return Err(e).with_context(|| format!("write {}", part.display()));
+    }
     if let Err(e) = fs::rename(&part, path) {
         let _ = fs::remove_file(&part);
         return Err(e).with_context(|| format!("rename into {}", path.display()));

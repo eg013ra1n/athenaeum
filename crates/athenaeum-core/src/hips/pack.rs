@@ -222,6 +222,10 @@ pub struct PackRunConfig {
     pub max_busy_waits: u32,
     /// This many request errors in a row stop the run as `Failed`.
     pub max_consecutive_errors: u32,
+    /// This many tiles in a row that exhausted `max_busy_waits` stop the run
+    /// as `Failed` ("survey busy"). A fetched tile or a 404 resets the count;
+    /// busy tiles never count toward `max_consecutive_errors`.
+    pub max_consecutive_busy_failures: u32,
 }
 
 impl Default for PackRunConfig {
@@ -232,6 +236,7 @@ impl Default for PackRunConfig {
             backoff_start: Duration::from_secs(5),
             max_busy_waits: 6,
             max_consecutive_errors: 20,
+            max_consecutive_busy_failures: 4,
         }
     }
 }
@@ -258,10 +263,11 @@ pub fn interrupted_status(store: &HipsStore) -> Option<PackProgress> {
 
 /// How long to wait before retrying a busy tile. The cap is applied to the
 /// server's value before any arithmetic: `Retry-After: u64::MAX` is a valid
-/// `Duration`.
+/// `Duration`. The server's value is floored at `backoff_start`, so
+/// `Retry-After: 0` never turns into a request loop.
 fn busy_wait(retry_after: Option<Duration>, waits_so_far: u32, cfg: &PackRunConfig) -> Duration {
     match retry_after {
-        Some(d) => d.min(cfg.busy_cap),
+        Some(d) => d.min(cfg.busy_cap).max(cfg.backoff_start),
         None => cfg
             .backoff_start
             .checked_mul(1u32 << waits_so_far.min(20))
@@ -283,7 +289,11 @@ enum Outcome {
 struct Shared {
     progress: PackProgress,
     consecutive_errors: u32,
+    /// Tiles in a row that stayed busy through all their waits.
+    consecutive_busy_failures: u32,
     last_emit: Instant,
+    /// A change the throttle held back; the next flush emits it.
+    dirty: bool,
     waiting_workers: u32,
     wait_s: u32,
 }
@@ -321,7 +331,34 @@ impl Run<'_> {
         s.progress.waiting_s = (s.waiting_workers > 0).then_some(s.wait_s);
         if s.last_emit.elapsed() >= EMIT_INTERVAL {
             s.last_emit = Instant::now();
+            s.dirty = false;
             (self.on_progress)(&s.progress);
+        } else {
+            s.dirty = true;
+        }
+    }
+
+    /// Emits a change the throttle held back, once the interval has passed.
+    /// Returns true when nothing is left to emit.
+    fn flush_if_due(&self) -> bool {
+        let mut s = self.lock();
+        if !s.dirty {
+            return true;
+        }
+        if s.last_emit.elapsed() < EMIT_INTERVAL {
+            return false;
+        }
+        s.last_emit = Instant::now();
+        s.dirty = false;
+        (self.on_progress)(&s.progress);
+        true
+    }
+
+    /// Waits (at most one throttle interval) until the held-back change is
+    /// emitted, so the end of a busy wait reaches the UI too.
+    fn settle(&self) {
+        while !self.halted() && !self.flush_if_due() {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -332,6 +369,7 @@ impl Run<'_> {
             if self.halted() {
                 return true;
             }
+            self.flush_if_due();
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return false;
@@ -370,6 +408,10 @@ impl Run<'_> {
                     if cut {
                         return Outcome::Halted;
                     }
+                    if wait >= EMIT_INTERVAL {
+                        // A shorter wait is invisible to the UI anyway.
+                        self.settle();
+                    }
                 }
             }
         };
@@ -394,14 +436,24 @@ impl Run<'_> {
                     s.progress.fetched += 1;
                     s.progress.bytes_fetched += n;
                     s.consecutive_errors = 0;
+                    s.consecutive_busy_failures = 0;
                 }),
                 Outcome::Absent => self.update(|s| {
                     s.progress.absent += 1;
                     s.consecutive_errors = 0;
+                    s.consecutive_busy_failures = 0;
                 }),
                 Outcome::Busy(e) => {
                     self.warn_failed(order, npix, &e);
-                    self.update(|s| s.progress.failed += 1);
+                    let msg = format!("{e:#}");
+                    self.update(|s| {
+                        s.progress.failed += 1;
+                        s.consecutive_busy_failures += 1;
+                        if s.consecutive_busy_failures >= self.cfg.max_consecutive_busy_failures {
+                            s.progress.error = Some(format!("survey busy: {msg}"));
+                            self.stop.store(true, Ordering::Relaxed);
+                        }
+                    });
                 }
                 Outcome::Error(e) => {
                     self.warn_failed(order, npix, &e);
@@ -439,7 +491,8 @@ impl Run<'_> {
 /// Tiles already stored count as `present` without any request. A `429`/`503`
 /// makes the tile wait and retry (see [`PackRunConfig`]); a 404 is recorded as
 /// absent. Cancel finishes the requests in flight and ends `Cancelled`;
-/// `max_consecutive_errors` request errors in a row end `Failed`. Finished
+/// `max_consecutive_errors` request errors in a row, or
+/// `max_consecutive_busy_failures` busy tiles in a row, end `Failed`. Finished
 /// tiles are kept either way, so a later run only fetches the rest.
 /// `<store>/pack.json` holds `running` while the run lives and the end state
 /// afterwards.
@@ -479,7 +532,9 @@ pub fn run_pack(
         shared: Mutex::new(Shared {
             progress,
             consecutive_errors: 0,
+            consecutive_busy_failures: 0,
             last_emit: Instant::now(),
+            dirty: false,
             waiting_workers: 0,
             wait_s: 0,
         }),
@@ -668,6 +723,11 @@ mod tests {
         Resp { status, headers, body: Vec::new() }
     }
 
+    /// Status 0: the server reads the request and closes without answering.
+    fn hang_up() -> Resp {
+        status(0, "")
+    }
+
     fn url_path(order: u8, npix: u64) -> String {
         format!("/{}", crate::hips::tile_rel_path(order, npix, TileFormat::Jpeg).to_string_lossy())
     }
@@ -712,6 +772,9 @@ mod tests {
                         let req = String::from_utf8_lossy(&buf[..n]);
                         let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
                         hits.lock().unwrap().push(path.clone());
+                        if default.status == 0 {
+                            return; // hang up: drop the stream unanswered
+                        }
                         let resp = match queues.lock().unwrap().get_mut(&path) {
                             Some(q) if q.len() > 1 => q.pop_front().unwrap(),
                             Some(q) => q.front().cloned().unwrap_or(default),
@@ -760,6 +823,7 @@ mod tests {
             backoff_start: Duration::from_millis(1),
             max_busy_waits: 6,
             max_consecutive_errors: 20,
+            max_consecutive_busy_failures: 4,
         }
     }
 
@@ -883,7 +947,9 @@ mod tests {
         let cfg = quick_cfg();
         assert_eq!(busy_wait(Some(Duration::from_secs(u64::MAX)), 0, &cfg), cfg.busy_cap);
         assert_eq!(busy_wait(Some(Duration::from_millis(7)), 3, &cfg), Duration::from_millis(7));
-        assert_eq!(busy_wait(Some(Duration::ZERO), 3, &cfg), Duration::ZERO);
+        // A zero or tiny Retry-After is floored at the backoff start.
+        assert_eq!(busy_wait(Some(Duration::ZERO), 3, &cfg), cfg.backoff_start);
+        assert_eq!(busy_wait(Some(Duration::ZERO), 0, &PackRunConfig::default()), Duration::from_secs(5));
         // No header: 1, 2, 4 ... ms, capped at 50 ms, never overflowing.
         assert_eq!(busy_wait(None, 0, &cfg), Duration::from_millis(1));
         assert_eq!(busy_wait(None, 2, &cfg), Duration::from_millis(4));
@@ -912,36 +978,99 @@ mod tests {
     fn cancel_during_a_busy_wait_returns_promptly() {
         let (_d, store) = new_store();
         let cancel = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Vec::new(), status(429, "Retry-After: 60\r\n"), |_| {});
+        // The real cap: only the cancel can end the 60 s waits.
+        let cfg = PackRunConfig { busy_cap: Duration::from_secs(300), ..quick_cfg() };
         let c2 = cancel.clone();
-        let server = TestServer::start(Vec::new(), status(429, "Retry-After: 3600\r\n"), move |_| {
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
             c2.store(true, Ordering::SeqCst);
         });
-        // The real 300 s cap: only the cancel can end the wait.
-        let cfg = PackRunConfig { busy_cap: Duration::from_secs(300), ..quick_cfg() };
         let t = Instant::now();
         let p = run(&store, &server.base, &tiles_of(4), &cfg, &cancel);
+        let elapsed = t.elapsed();
+        canceller.join().unwrap();
         assert_eq!(p.state, PackState::Cancelled, "{p:?}");
         assert_eq!(p.failed, 0);
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(elapsed >= Duration::from_millis(250), "the cancel must arrive during the wait: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(server.total_hits() >= 1, "the workers were waiting on a 429");
+    }
+
+    #[test]
+    fn a_busy_wait_reaches_the_ui_while_it_lasts() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(
+            vec![(url_path(3, 0), vec![status(429, "Retry-After: 1\r\n"), ok()])],
+            ok(),
+            |_| {},
+        );
+        let cfg = PackRunConfig { busy_cap: Duration::from_secs(2), ..quick_cfg() };
+        let seen = Mutex::new(Vec::new());
+        let t = Instant::now();
+        let initial = PackProgress::new(PackSelection::default(), 1);
+        let p = run_pack(
+            &store,
+            &server.base,
+            TileFormat::Jpeg,
+            &tiles_of(1),
+            initial,
+            &cfg,
+            &AtomicBool::new(false),
+            &|q| seen.lock().unwrap().push((t.elapsed(), q.state, q.waiting_s)),
+        );
+        assert_eq!((p.fetched, p.failed), (1, 0), "{p:?}");
+        let seen = seen.into_inner().unwrap();
+        // The 429 comes ~ms after the start, inside the first throttle
+        // interval; the held-back update must still be shown within about one
+        // interval plus one sleep step.
+        let shown = seen.iter().find(|(_, _, w)| *w == Some(1)).expect("waiting_s never shown");
+        assert!(shown.0 < Duration::from_millis(800), "{:?}", seen);
+        // And the end of the wait is shown while the run is still running.
+        assert!(
+            seen.iter().any(|(at, st, w)| *st == PackState::Running && w.is_none() && *at > shown.0),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_survey_outage_stops_the_run() {
+        let (_d, store) = new_store();
+        let server = TestServer::start(Vec::new(), status(503, ""), |_| {});
+        let p = run(&store, &server.base, &tiles_of(40), &quick_cfg(), &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Failed, "{p:?}");
+        let err = p.error.as_deref().unwrap();
+        assert!(err.starts_with("survey busy: "), "{err}");
+        assert!(p.failed >= 4 && p.failed < 12, "the run must stop, not fail every tile: {p:?}");
+        assert_eq!(store.read_pack_state().unwrap().unwrap().state, PackState::Failed);
+    }
+
+    #[test]
+    fn a_success_resets_the_busy_streak() {
+        let (_d, store) = new_store();
+        // Odd tiles stay busy, even tiles are fine: never 2 busy tiles in a row.
+        let routes = (0..20u64).filter(|n| n % 2 == 1).map(|n| (url_path(3, n), vec![status(503, "")])).collect();
+        let server = TestServer::start(routes, ok(), |_| {});
+        let cfg = PackRunConfig { workers: 1, max_consecutive_busy_failures: 2, ..quick_cfg() };
+        let p = run(&store, &server.base, &tiles_of(20), &cfg, &AtomicBool::new(false));
+        assert_eq!(p.state, PackState::Done, "{p:?}");
+        assert_eq!((p.fetched, p.failed), (10, 10));
     }
 
     #[test]
     fn offline_stops_after_consecutive_errors() {
         let (_d, store) = new_store();
-        // Bind a port, then close it: connections are refused.
-        let addr = {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
-        let base = format!("http://{addr}");
+        // The server accepts and hangs up without answering: a plain request
+        // error on every tile, with no freed-port race.
+        let server = TestServer::start(Vec::new(), hang_up(), |_| {});
         let tiles = tiles_of(200);
         store.write(3, 199, JPEG).unwrap();
-        let p = run(&store, &base, &tiles, &quick_cfg(), &AtomicBool::new(false));
+        let p = run(&store, &server.base, &tiles, &quick_cfg(), &AtomicBool::new(false));
         assert_eq!(p.state, PackState::Failed, "{p:?}");
         assert!(p.failed >= 20 && p.failed < 20 + 4 + 1, "{p:?}");
         assert!(p.failed < 100, "the run must stop, not fail every tile: {p:?}");
         let err = p.error.as_deref().unwrap();
-        assert!(err.contains("in a row") && err.contains(&addr.to_string()), "{err}");
+        assert!(err.contains("in a row") && err.contains(&server.addr.to_string()), "{err}");
         assert_eq!(store.read_pack_state().unwrap().unwrap().state, PackState::Failed);
         assert!(store.has(3, 199), "finished tiles are kept");
     }
@@ -1005,6 +1134,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let finals = AtomicUsize::new(0);
         let initial = PackProgress::new(PackSelection::default(), 60);
+        let t = Instant::now();
         run_pack(
             &store,
             &server.base,
@@ -1021,9 +1151,10 @@ mod tests {
             },
         );
         assert_eq!(finals.load(Ordering::SeqCst), 1);
-        // 60 local tiles finish well inside a second: the start, at most a
-        // few throttled ones, and the final.
+        // The start and the final, plus at most one per throttle interval
+        // that passed (a loaded machine may take longer than a second).
+        let elapsed = t.elapsed();
         let n = calls.load(Ordering::SeqCst);
-        assert!((2..=6).contains(&n), "{n} callbacks");
+        assert!(n >= 2 && n as u128 <= 3 + elapsed.as_millis() / 250, "{n} callbacks in {elapsed:?}");
     }
 }
