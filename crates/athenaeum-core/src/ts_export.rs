@@ -104,6 +104,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::RelinkResult,
             crate::models::OrphanedFile,
             crate::models::ImagingLocation,
+            crate::api::hips::HipsSurveyInfo,
             crate::models::CalibrationLink,
             crate::models::FrameCalibrationStatus,
             crate::models::CalibrationHierarchy,

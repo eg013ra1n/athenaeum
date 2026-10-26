@@ -51,6 +51,8 @@ pub mod catalog;
 // plate_solve + registration consume both astroimage and solvemyastro.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod plate_solve;
+// HiPS sky-survey tiles for the Sky Chart background. Ungated: fs + reqwest only.
+pub mod hips;
 pub mod services;
 pub mod archive;
 pub mod file_op;

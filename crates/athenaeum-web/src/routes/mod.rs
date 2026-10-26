@@ -25,6 +25,7 @@ mod calibration;
 mod duplicates;
 mod export;
 mod spatial;
+mod hips;
 mod calendar;
 mod updates;
 mod images;
@@ -192,6 +193,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Spatial
         .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
+        // Sky Chart HiPS background
+        .route("/api/get_hips_surveys", post(hips::get_hips_surveys))
+        .route("/api/get_hips_tile", post(hips::get_hips_tile))
+        .route("/api/clear_hips_cache", post(hips::clear_hips_cache))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
         .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))

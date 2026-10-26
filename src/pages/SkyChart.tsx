@@ -8,6 +8,7 @@ import { useSvgOverlay } from '../hooks/useSvgOverlay';
 import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
+import { useSkyBackground } from '../hooks/useSkyBackground';
 import { SelectionDialog } from '../components/SelectionDialog';
 import { DateRangeFilter, DateParts, toISODateRange } from '../components/DateRangeFilter';
 import {
@@ -62,6 +63,7 @@ export default function SkyChart() {
   const emptySelectionTimerRef = useRef<number | undefined>(undefined);
 
   const navigate = useNavigate();
+  const sky = useSkyBackground(mapReady);
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Attach the chart host before any other effect runs: useSvgOverlay looks
@@ -391,6 +393,35 @@ export default function SkyChart() {
 
           <div className="w-px h-6 bg-border" />
 
+          <select
+            value={sky.background}
+            onChange={(e) => sky.chooseBackground(e.target.value)}
+            disabled={!mapReady || sky.surveys.length === 0}
+            title="Sky survey image drawn under the chart"
+            aria-label="Sky background"
+            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
+          >
+            <option value="none">Background: None</option>
+            {sky.surveys.map((s) => (
+              <option key={s.id} value={s.id}>Background: {s.label}</option>
+            ))}
+          </select>
+          {sky.survey && (
+            <input
+              type="range"
+              min={0.1}
+              max={1}
+              step={0.05}
+              value={sky.opacity}
+              onChange={(e) => sky.chooseOpacity(parseFloat(e.target.value))}
+              title={`Background opacity ${Math.round(sky.opacity * 100)} %`}
+              aria-label="Background opacity"
+              className="w-24 accent-accent"
+            />
+          )}
+
+          <div className="w-px h-6 bg-border" />
+
           <DateRangeFilter
             dateFrom={dateFrom}
             dateTo={dateTo}
@@ -438,6 +469,23 @@ export default function SkyChart() {
         {emptySelectionHint && (
           <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 bg-surface-elevated border border-border text-content-secondary text-xs px-3 py-1.5 rounded shadow">
             No frames in this region.
+          </div>
+        )}
+        {/* Survey credit (always shown while a survey is drawn) and tile status. */}
+        {sky.survey && (
+          <div className="absolute bottom-1 left-2 right-2 z-10 flex items-end justify-between gap-4 pointer-events-none text-[10px] leading-tight text-content-muted">
+            <span className="bg-surface/70 px-1.5 py-0.5 rounded pointer-events-auto">
+              {sky.survey.label}: {sky.survey.attribution} · {sky.survey.license}
+            </span>
+            <span className="bg-surface/70 px-1.5 py-0.5 rounded">
+              {!sky.survey.online
+                ? 'Offline: cached tiles only'
+                : sky.status && sky.status.loading > 0
+                  ? `Loading sky tiles… ${sky.status.drawn}/${sky.status.wanted}`
+                  : sky.status && sky.status.failed > 0
+                    ? `${sky.status.failed} sky tiles unavailable`
+                    : ''}
+            </span>
           </div>
         )}
         {!loading && !error && locations.length === 0 && (

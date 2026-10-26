@@ -191,6 +191,27 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     ],
   },
   {
+    id: 'general.skyBackground',
+    tab: 'general',
+    title: 'Sky background',
+    description:
+      'Sky survey images drawn under the Sky Chart. Tiles are fetched from the survey as you browse and kept on this computer; they are never shared.',
+    fields: [
+      {
+        id: 'online',
+        label: 'Fetch sky tiles while browsing',
+        help: 'Off: the Sky Chart draws only tiles already on this computer and never contacts the survey.',
+        keywords: ['skychart.hips_online', 'hips', 'dss', 'survey', 'offline', 'network', 'sky chart'],
+      },
+      {
+        id: 'surveys',
+        label: 'Surveys on this computer',
+        help: 'Credit, license and the space the stored tiles take. Clear deletes a survey\'s tiles.',
+        keywords: ['hips', 'dss colored', 'cache', 'tiles', 'clear', 'attribution', 'license'],
+      },
+    ],
+  },
+  {
     id: 'general.dataLocations',
     tab: 'general',
     title: 'Data file locations',

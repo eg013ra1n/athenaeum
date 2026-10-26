@@ -178,6 +178,25 @@ export function resizeChart(width: number, height: number, force = false): void 
   if (view) applyView({ fovDeg: view.fovDeg });
 }
 
+let backdropTransparent = false;
+
+/**
+ * With a sky survey drawn under the chart, the chart's own black sky disc
+ * and Milky Way must go: both are painted before the stars and would hide
+ * or veil the survey. `apply` re-applies the config d3-celestial last
+ * stored, so the current size goes with it.
+ */
+export function setSkyBackdrop(transparent: boolean): void {
+  if (!displayed || transparent === backdropTransparent) return;
+  backdropTransparent = transparent;
+  window.Celestial.apply({
+    background: { opacity: transparent ? 0 : 1 },
+    mw: { show: !transparent },
+    width: size.width,
+    projectionRatio: size.width / size.height,
+  });
+}
+
 /** Swaps the star catalog; the view is untouched. */
 export function setStarLimit(limit: number): void {
   if (!displayed || limit === starLimit) return;

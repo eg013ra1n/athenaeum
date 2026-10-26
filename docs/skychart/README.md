@@ -70,6 +70,74 @@ One routine, `projectFootprint`, used for every redraw:
 
 A box with only some corners beyond the hemisphere is drawn; the globe clip path trims it.
 
+## HiPS sky background (#18)
+
+A sky survey image drawn under the chart. Phase 1 (this cycle): DSS colored, fetched on demand and kept locally. Phase 2 (offline pack download) and phase 3 (NSNS, gated on the author's agreement) are in #18.
+
+**Rights (ruling).**
+- Tiles are never redistributed: not in the installer, the Docker image, the repo, artfrom.space, the hub or Perseus.
+- Every install fetches its own tiles from the survey's master URL into a private store.
+- The survey's `obs_copyright` and license are shown on the chart whenever it is drawn, and in Settings → General → Sky background.
+- DSS colored is `hips_status = public master clonableOnce`: a copy only from the master, never from a mirror.
+
+**Core (`athenaeum-core/src/hips/`, `api/hips.rs`).**
+- **Presets.** `SURVEYS` is the only source of survey URLs; there is no arbitrary-URL setting.
+- **Store.** `<app_data>/hips/<survey-id>/` holds the standard layout `Norder{k}/Dir{(npix/10000)*10000}/Npix{n}.{jpg|png}` and the survey's original `properties`.
+  - A 404 from the master leaves a zero-byte `Npix{n}.absent` marker, so that tile is never asked for again.
+  - Writes are atomic (`.part` + rename).
+  - A cached file without the format's signature is deleted and fetched again.
+- **Fetch.**
+  - `get_hips_tile` serves the store first.
+  - A missing tile is fetched only when `skychart.hips_online` (default `true`) is on, after the survey's `properties` were read and validated: equatorial frame, 512 px tiles, the preset's format, order ≥ 6.
+  - The HTTP client identifies as `Athenaeum/<version> (+https://artfrom.space)`, with a 10 s connect and 20 s total timeout and a 4 MB cap per tile.
+  - A failed fetch is an error and is not remembered; the chart retries after 30 s.
+- **Commands.** `get_hips_surveys`, `get_hips_tile` (bytes as `tauri::ipc::Response` / an `image/*` POST body; an empty payload means no coverage) and `clear_hips_cache` exist on both hosts.
+
+**Frontend.**
+- **Layer.** `hipsLayer.ts` draws on a canvas inserted *before* the d3-celestial canvas in the host, so it paints below it. While a survey is on, `setSkyBackdrop(true)` makes the chart's sky disc transparent and hides the Milky Way, through `Celestial.apply` with the current size.
+- **Geometry.** `healpix.ts` is a port of cdshealpix 0.9.1 `nested::sph_coo`, pinned by `healpix.golden.json`. The core test `hips::golden` regenerates the file with `HIPS_GOLDEN_WRITE=1`; the TS test checks it to 1e-12 rad.
+- **Visible tiles.** A cap walk from order 0. The order is the smallest whose tile pixel is ≤ one device pixel at the view center, capped at the survey's max (≤ 6).
+- **Drawing.** Each tile is a mesh of about 4° cells drawn as affine-textured triangles through `Celestial.mapProjection`, grown 0.5 px against seams. Vertices beyond 90° from the center are dropped.
+- **Tile orientation (measured, #18).** Column c and row r from the top-left of a W-px JPEG tile sit at `dx = (r + 0.5) / W`, `dy = (c + 0.5) / W`.
+  - It was found by scoring all 8 square symmetries on two real tiles, the Pleiades (order 3, npix 7) and Orion (order 2, npix 89). Only this mapping puts every catalogue star on a bright peak.
+  - The HEALPix port used for the search agrees with an independent HEALPix implementation to 4 mas.
+- **Loading.**
+  - Up to 6 requests in flight, nearest the view center first.
+  - At most 150 decoded bitmaps (LRU, `close()` on evict, never one in view).
+  - Absent tiles are kept in a set of up to 5000 entries.
+  - Cached ancestors are drawn under tiles still loading.
+  - A survey change disposes everything and drops late responses.
+- **Opacity.** The opacity slider draws a black veil of `1 − opacity` over opaque tiles: blending each grown triangle at partial alpha would light up the seams between them.
+- **Settings.** `skychart.background` (`none` | survey id) and `skychart.background_opacity` are written by the chart's controls; `skychart.hips_online` is a KV setting with its default in `defaults::all()`.
+
+**Sizes (DSS colored, live `hips_estsize` / tiles, ≈ 67 KB per tile).**
+
+| Order | Pixel | Whole sky |
+| ---- | ---- | ---- |
+| 3 | 51″ | ≈ 55–70 MB |
+| 4 | 26″ | ≈ 0.22–0.28 GB |
+| 5 | 13″ | ≈ 0.9–1.1 GB |
+| 6 | 6.4″ | ≈ 3.6–4.5 GB |
+
+Browsing can never store more than the whole sky to order 6.
+
+**Acceptance, phase 1 (2026-10-26, live CDS through the session's proxy, `athenaeum-web` serving the built frontend, headless Chromium 1600 × 900).**
+
+| Check | Result |
+| ---- | ---- |
+| `get_hips_tile` 3/7 first request | 200 `image/jpeg`, 43 360 B in 1.3 s, bytes identical to a direct download |
+| Same tile again | 2 ms, from the store |
+| No API key (key set) | 401 |
+| Unknown survey / order 7 / npix 768 at order 3 | 404 / 400 / 400 |
+| Online off: cached tile / uncached tile | 200 / 404, no request leaves |
+| `clear_hips_cache` | the store is gone; `"hips cache cleared"` logs `survey_id`, `bytes` |
+| Chart at the Pleiades (12°), DSS colored on | 22 tile requests, 23 tiles stored (873 KB), the survey's Pleiades on the chart's own star marks, credit line shown |
+| Leave the page and come back | the layer is still there, no new tile requests for the same view |
+| HEALPix TS port vs cdshealpix golden vectors (728 points, orders 0–6) | ≤ 1e-12 rad |
+| Tile-layer JS per frame (profiler, 15 pans) | ≈ 1 ms at 12°, ≈ 19 ms at 180°; the rest of a headless frame is software rasterization |
+
+The desktop host was not compiled in this environment (no webkit2gtk); its three wrappers follow the existing byte-returning commands (`get_master_light_preview`).
+
 ## Acceptance (#19, 2026-10-26, web build + mock API, headless Chromium 1600 × 900)
 
 | Check | Before | After |

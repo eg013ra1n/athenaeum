@@ -180,6 +180,28 @@ export type OrphanedFile = { id: number, path: string, filename: string, size: n
 
 export type ImagingLocation = { id: number, ra: number, dec: number, objectName: string | null, frameCount: number, totalExposure: number, filters: Array<string>, dateRange: [string, string], frameSetId: number | null, fovWidth: number | null, fovHeight: number | null, locationType: string, cameras: string | null, focalLengths: string | null, isCustom: boolean, rotation: number | null, };
 
+export type HipsSurveyInfo = { id: string, label: string, 
+/**
+ * `image/jpeg` or `image/png`.
+ */
+mime: string, 
+/**
+ * Deepest order the chart may request (the survey's, capped at 6).
+ */
+maxOrder: number, tileWidth: number, 
+/**
+ * The survey's `obs_copyright`, or the preset's until `properties` were read.
+ */
+attribution: string, attributionUrl: string | null, 
+/**
+ * `hips_license`, or the preset's.
+ */
+license: string, 
+/**
+ * Online fetching is on (`skychart.hips_online`).
+ */
+online: boolean, cachedTiles: number, cachedBytes: number, };
+
 export type CalibrationLink = { id: number | null, source_id: number, source_type: string, calibration_set_id: number, calibration_type: string, matched_at: string, match_score: number | null, date_warning: boolean, temp_warning: boolean, is_manual_override: boolean, };
 
 export type FrameCalibrationStatus = { frame_id: number, has_flats: boolean, has_darks: boolean, has_bias: boolean, has_darkflats: boolean, flats_warning: boolean, darks_warning: boolean, bias_warning: boolean, flat_set_id: number | null, dark_set_id: number | null, bias_set_id: number | null, darkflat_set_id: number | null, };

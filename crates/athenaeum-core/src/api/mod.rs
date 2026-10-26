@@ -11,6 +11,8 @@ pub mod scan_roots;
 pub mod spatial;
 // Calendar month aggregation. Ungated: db/models/coordinates only.
 pub mod calendar;
+// Sky Chart HiPS background (survey list, tiles, cache). Ungated: hips + settings only.
+pub mod hips;
 // Frame-set workflows (auto-generate clustering + session detection + the
 // collab project-match suggestion). Gated ONLY because it calls
 // `api::collab::find_matching_projects` and `api::collab` is render+solver-gated
