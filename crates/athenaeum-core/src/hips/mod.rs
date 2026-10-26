@@ -8,6 +8,8 @@
 //! "HiPS"). A tile is addressed only by validated numbers (survey id,
 //! order, npix), so no frontend path ever reaches the filesystem.
 
+pub mod pack;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;

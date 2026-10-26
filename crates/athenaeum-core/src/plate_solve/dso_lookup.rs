@@ -198,6 +198,11 @@ impl DsoCatalog {
         self.entries.len()
     }
 
+    /// Every entry, in file order.
+    pub fn entries(&self) -> &[Dso] {
+        &self.entries
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
