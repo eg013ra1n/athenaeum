@@ -43,8 +43,9 @@ const MAX_BITMAPS = 150;
 const MAX_ABSENT = 5000;
 /** A failed tile is retried after this long. */
 const RETRY_MS = 30_000;
-/** Mesh cells per tile side: about one per 4° of tile. */
-const DEG_PER_MESH_CELL = 4;
+/** A mesh cell spans at most this many device px, so the affine error inside it stays well under one. */
+const MESH_CELL_PX = 64;
+const MAX_MESH = 32;
 const MAX_VIEW_RADIUS = Math.PI / 2;
 
 const RAD = Math.PI / 180;
@@ -291,6 +292,30 @@ async function loadTile(s: HipsSurveyRef, order: number, npix: number): Promise<
   return createImageBitmap(new Blob([bytes as BlobPart], { type: s.mime }));
 }
 
+type TileProjector = (lon: number, lat: number) => [number, number] | null;
+
+/**
+ * Mesh cells per tile side, from the tile's projected size: one cell per
+ * `MESH_CELL_PX` device px of its longest edge, since the curvature a mesh
+ * must follow is on the screen. A 3.7° tile (order 4, what a 12° view picks
+ * at DPR 1) was one cell and bent by 4 px. A tile with a corner that does
+ * not project gets 16.
+ */
+export function meshSize(order: number, npix: number, project: TileProjector): number {
+  const corner = (dx: number, dy: number) => {
+    const [lon, lat] = sphCoo(order, npix, Math.min(dx, 1 - 1e-12), Math.min(dy, 1 - 1e-12));
+    return project(lon, lat);
+  };
+  const c = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
+  if (c.some((p) => !p)) return 16;
+  let edge = 0;
+  for (let i = 0; i < 4; i++) {
+    const [p, q] = [c[i]!, c[(i + 1) % 4]!];
+    edge = Math.max(edge, Math.hypot(q[0] - p[0], q[1] - p[1]));
+  }
+  return Math.min(MAX_MESH, Math.max(1, Math.ceil(edge / MESH_CELL_PX)));
+}
+
 /**
  * Draws one tile as an n×n mesh. Mesh point (a, b) is the cell fraction
  * dx = a / n, dy = b / n; its texture point is column dy·W, row dx·W.
@@ -300,10 +325,9 @@ function drawTile(
   bmp: ImageBitmap,
   order: number,
   npix: number,
-  project: (lon: number, lat: number) => [number, number] | null,
+  project: TileProjector,
 ): void {
-  const tileDeg = (tilePixelSize(order, 1) / RAD);
-  const n = Math.min(16, Math.max(1, Math.ceil(tileDeg / DEG_PER_MESH_CELL)));
+  const n = meshSize(order, npix, project);
   const w = bmp.width;
   const pts: Array<[number, number] | null> = [];
   for (let a = 0; a <= n; a++) {
@@ -322,8 +346,13 @@ function drawTile(
       const p10 = at(a + 1, b);
       const p01 = at(a, b + 1);
       const p11 = at(a + 1, b + 1);
-      if (p00 && p10 && p11) drawTriangle(ctx, bmp, [p00, p10, p11], [tex(a, b), tex(a + 1, b), tex(a + 1, b + 1)]);
-      if (p00 && p11 && p01) drawTriangle(ctx, bmp, [p00, p11, p01], [tex(a, b), tex(a + 1, b + 1), tex(a, b + 1)]);
+      // Split along the anti-diagonal: at z = ±2/3 HEALPix turns from the
+      // equatorial to the polar projection, a kink that runs along
+      // dx + dy = const in every tile it crosses (M 31 and M 110 sit on it).
+      // Splitting along dx = dy instead bent the image across the kink by up
+      // to 98 px on a 3.7° tile.
+      if (p00 && p10 && p01) drawTriangle(ctx, bmp, [p00, p10, p01], [tex(a, b), tex(a + 1, b), tex(a, b + 1)]);
+      if (p11 && p01 && p10) drawTriangle(ctx, bmp, [p11, p01, p10], [tex(a + 1, b + 1), tex(a, b + 1), tex(a + 1, b)]);
     }
   }
 }
