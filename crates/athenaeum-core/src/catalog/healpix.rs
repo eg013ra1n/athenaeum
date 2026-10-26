@@ -18,12 +18,23 @@ pub fn sky_to_pixel(ra_deg: f64, dec_deg: f64) -> u64 {
     nested::hash(HEALPIX_DEPTH, lon_rad, lat_rad)
 }
 
-/// Find all HEALpix pixels that overlap with a cone (circle on the sky).
+/// Find all HEALpix pixels at `HEALPIX_DEPTH` that overlap with a cone
+/// (circle on the sky).
 ///
 /// `ra_deg`, `dec_deg`: cone center in degrees.
 /// `radius_deg`: cone radius in degrees.
 /// Returns a sorted, deduplicated list of pixel IDs.
 pub fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
+    cone_pixels_at(HEALPIX_DEPTH, ra_deg, dec_deg, radius_deg)
+}
+
+/// Find all HEALpix pixels at `depth` that overlap with a cone (circle on
+/// the sky). Panic-safe: see the guards below.
+///
+/// `ra_deg`, `dec_deg`: cone center in degrees.
+/// `radius_deg`: cone radius in degrees.
+/// Returns a sorted, deduplicated list of pixel IDs.
+pub fn cone_pixels_at(depth: u8, ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
     // `cdshealpix::cone_coverage_approx` asserts on its inputs: a non-finite
     // or out-of-domain centre/radius panics. The plate-solve verifier can
     // hand us a degenerate seed WCS (huge/NaN implied pixel scale → absurd
@@ -55,7 +66,7 @@ pub fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64
         let lat_rad = dec_deg.to_radians();
         let radius_rad = r_deg.to_radians();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            nested::cone_coverage_approx(HEALPIX_DEPTH, lon_rad, lat_rad, radius_rad)
+            nested::cone_coverage_approx(depth, lon_rad, lat_rad, radius_rad)
         }))
         .ok()
         .map(|bmoc| bmoc.flat_iter().collect())

@@ -107,36 +107,6 @@ pub fn catalog_regions(cat: &DsoCatalog, messier: bool, ngc_ic: bool) -> Vec<Pac
         .collect()
 }
 
-/// Cells of `order` that touch the cone, or `None` when the region is not a
-/// usable cone.
-///
-/// `cdshealpix` asserts on a knife-edge case: a cone whose centre latitude
-/// +/- radius straddles the base-cell boundary at +/-41.81 degrees can panic
-/// (M 31 is such a field). The radius is only ever nudged *up*, so a retry
-/// still covers the whole cone.
-fn cone_cells(order: u8, region: &PackRegion) -> Option<Vec<u64>> {
-    if !region.ra_deg.is_finite()
-        || !region.dec_deg.is_finite()
-        || !region.radius_deg.is_finite()
-        || region.radius_deg <= 0.0
-    {
-        return None;
-    }
-    let lon = region.ra_deg.rem_euclid(360.0).to_radians();
-    let lat = region.dec_deg.clamp(-90.0, 90.0).to_radians();
-    let radius = region.radius_deg.min(90.0);
-    for nudge in [1.0, 1.0001, 1.001, 1.01, 1.05] {
-        let radius_rad = (radius * nudge).to_radians();
-        let cells = std::panic::catch_unwind(|| {
-            cdshealpix::nested::cone_coverage_approx(order, lon, lat, radius_rad).to_flat_array()
-        });
-        if let Ok(cells) = cells {
-            return Some(cells.into_vec());
-        }
-    }
-    None
-}
-
 /// The tiles of a pack as `(order, npix)`, sorted ascending and deduplicated:
 /// every tile of orders `0..=sky_order`, then for each region the cone
 /// coverage at orders `sky_order + 1..=6`.
@@ -149,16 +119,16 @@ pub fn pack_tiles(sky_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)
     }
     for region in regions {
         for order in sky_order + 1..=DISPLAY_MAX_ORDER {
-            match cone_cells(order, region) {
-                Some(cells) => tiles.extend(cells.into_iter().map(|npix| (order, npix))),
-                None => tracing::warn!(
-                    ra_deg = region.ra_deg,
-                    dec_deg = region.dec_deg,
-                    radius_deg = region.radius_deg,
+            tiles.extend(
+                crate::catalog::healpix::cone_pixels_at(
                     order,
-                    "pack_region_skipped"
-                ),
-            }
+                    region.ra_deg.rem_euclid(360.0),
+                    region.dec_deg.clamp(-90.0, 90.0),
+                    region.radius_deg,
+                )
+                .into_iter()
+                .map(|npix| (order, npix)),
+            );
         }
     }
     tiles.sort_unstable();
