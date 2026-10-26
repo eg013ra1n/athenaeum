@@ -165,6 +165,10 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
 - **Where it runs.** Set creation, merge, split and "Recalculate nights" store it.
 - **The refresh button beside the coordinates** on the object page (`recompute_frame_set_coordinates`, both hosts) re-applies it to the stored center and rotation only. It exists because a plate solve run does not touch the set's stored pointing. Nights, dates and hours are untouched; the info log is `"frame set coordinates recomputed"` with `frame_set_id`, `count` and `solved_only`.
 - **The Sky Chart** computes it live for every set, so the map is right before anyone presses refresh.
+- **Field of view (Sky Chart only, 2026-10-26).** The footprint's width and height are the **median over the same lights** (`set_pointing`), one per light from `api::spatial::frame_fov`:
+  - solved light: from its CD matrix, `2·atan(NAXISn · |CD column n| / 2)` per axis;
+  - otherwise from the header, `2·atan(XPIXSZ · NAXISn / (2 · FOCALLEN))`.
+  - Before this the box used header averages over every light, Black Hole included (AVG of FOCALLEN, XPIXSZ, NAXIS). A wrong or reducer-less FOCALLEN, an XPIXSZ written before binning or a second rig in the set gave a box of the wrong size under a correct center and rotation; the DSS background made it visible on M 31.
 
 **Why spherical mean?** Simple averaging fails near the RA wrap: RA 359 and RA 1 average to 180 degrees, while the spherical mean is 0.
 

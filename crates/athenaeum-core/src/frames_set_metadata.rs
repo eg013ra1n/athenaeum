@@ -35,6 +35,9 @@ pub struct FramePointing {
     /// image center and `rotation` is atan2(−CD1_2, CD2_2).
     pub solved: bool,
     pub in_black_hole: bool,
+    /// Field of view (width, height) in degrees: from the solve's CD matrix
+    /// when solved, else from the header (`api::spatial::frame_fov`).
+    pub fov: Option<(f64, f64)>,
 }
 
 /// A set's center and rotation.
@@ -47,6 +50,8 @@ pub struct SetPointing {
     pub max_rotation: Option<f64>,
     pub frames: usize,
     pub solved: bool,
+    /// Median field of view (width, height) in degrees over the same lights.
+    pub fov: Option<(f64, f64)>,
 }
 
 /// The one rule for a set's center and rotation, shared by the stored
@@ -59,7 +64,9 @@ pub struct SetPointing {
 ///   program in another sign convention (a header 76.1° beside a solve's
 ///   283.5° for the same framing averages to ~0°);
 /// - the center is the spherical mean (no RA wrap at 0h), the rotation the
-///   circular mean, and min / max are the extreme circular deviations from it.
+///   circular mean, and min / max are the extreme circular deviations from it;
+/// - the field of view is the median width and height over the same lights
+///   (a solved light's comes from its CD matrix, not FOCALLEN / XPIXSZ).
 pub fn set_pointing(frames: &[FramePointing]) -> Option<SetPointing> {
     let kept: Vec<&FramePointing> = frames.iter().filter(|f| !f.in_black_hole).collect();
     let kept: Vec<&FramePointing> = if kept.is_empty() { frames.iter().collect() } else { kept };
@@ -72,7 +79,18 @@ pub fn set_pointing(frames: &[FramePointing]) -> Option<SetPointing> {
         Some((a, lo, hi)) => (Some(a), Some(lo), Some(hi)),
         None => (None, None, None),
     };
-    Some(SetPointing { ra, dec, avg_rotation, min_rotation, max_rotation, frames: used.len(), solved: solved_used })
+    let fovs: Vec<(f64, f64)> = used.iter().filter_map(|f| f.fov).collect();
+    let fov = median(fovs.iter().map(|f| f.0).collect()).zip(median(fovs.iter().map(|f| f.1).collect()));
+    Some(SetPointing { ra, dec, avg_rotation, min_rotation, max_rotation, frames: used.len(), solved: solved_used, fov })
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 { (values[mid - 1] + values[mid]) / 2.0 } else { values[mid] })
 }
 
 fn norm360(deg: f64) -> f64 {
@@ -279,7 +297,7 @@ fn metadata_from_frames(frames: &[Frame], flags: &HashMap<i64, (bool, bool)>) ->
         .filter_map(|f| {
             let (ra, dec) = frame_coords(f)?;
             let (solved, in_black_hole) = f.id.and_then(|id| flags.get(&id).copied()).unwrap_or((false, false));
-            Some(FramePointing { ra, dec, rotation: f.rotation, solved, in_black_hole })
+            Some(FramePointing { ra, dec, rotation: f.rotation, solved, in_black_hole, fov: None })
         })
         .collect();
     let pointing = set_pointing(&pointings);
@@ -403,7 +421,7 @@ mod tests {
     }
 
     fn fp(ra: f64, dec: f64, rotation: Option<f64>, solved: bool, in_black_hole: bool) -> FramePointing {
-        FramePointing { ra, dec, rotation, solved, in_black_hole }
+        FramePointing { ra, dec, rotation, solved, in_black_hole, fov: None }
     }
 
     #[test]
@@ -429,6 +447,25 @@ mod tests {
         let all = set_pointing(&[fp(10.0, 0.0, None, false, true), fp(12.0, 0.0, None, false, true)]).unwrap();
         assert_eq!(all.frames, 2);
         assert!((all.ra - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_is_the_median_over_the_pointing_lights() {
+        let with = |fov: (f64, f64), solved: bool, bh: bool| FramePointing { fov: Some(fov), ..fp(10.0, 41.0, None, solved, bh) };
+        // An unsolved light with a wrong header FOCALLEN, a Black Hole light from
+        // another rig, and three solved lights (one binned 2×2 by mistake).
+        let p = set_pointing(&[
+            with((1.2, 0.8), false, false),
+            with((0.5, 0.3), true, true),
+            with((3.10, 2.07), true, false),
+            with((3.11, 2.08), true, false),
+            with((1.55, 1.04), true, false),
+        ])
+        .unwrap();
+        assert_eq!(p.fov, Some((3.10, 2.07)));
+        let even = set_pointing(&[with((2.0, 1.0), true, false), with((3.0, 2.0), true, false)]).unwrap();
+        assert_eq!(even.fov, Some((2.5, 1.5)));
+        assert_eq!(set_pointing(&[fp(1.0, 1.0, None, true, false)]).unwrap().fov, None);
     }
 
     #[test]
