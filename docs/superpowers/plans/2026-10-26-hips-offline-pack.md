@@ -70,7 +70,7 @@
   - `pub struct PackRegion { pub ra_deg: f64, pub dec_deg: f64, pub radius_deg: f64 }`
 - Produces: `pub fn location_regions(locs: &[ImagingLocation]) -> Vec<PackRegion>`, using the radius rule from Global Constraints. Every location (frame set or cluster) the chart draws is included.
 - Produces: `pub fn catalog_regions(cat: &DsoCatalog, messier: bool, ngc_ic: bool) -> Vec<PackRegion>`. Messier means the designation starts with `"M "`. NGC/IC means the first word is `NGC` or `IC` and `magnitude <= Some(10.0)`. Radius 3°.
-- Produces: `pub fn pack_tiles(sky_order: u8, regions: &[PackRegion]) -> Vec<(u8, u64)>`. It returns, sorted ascending by (order, npix) and deduplicated: every tile of orders `0..=sky_order`, then for each region `cdshealpix::nested::cone_coverage_approx(o, ra.to_radians(), dec.to_radians(), radius.to_radians()).to_flat_array()` for `o in sky_order+1..=6`.
+- Produces: `pub fn pack_tiles(sky_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)>>`. It returns, sorted ascending by (order, npix) and deduplicated: every tile of orders `0..=sky_order`, then for each region `cdshealpix::nested::cone_coverage_approx(o, ra.to_radians(), dec.to_radians(), radius.to_radians()).to_flat_array()` for `o in sky_order+1..=6`.
 - Errors: `sky_order > 5` → `bail!("whole-sky pack order must be 0–5")`. This becomes `ApiError::Invalid` in Task 4.
 
 - [ ] **Step 1: Write failing tests** in `pack.rs`:
