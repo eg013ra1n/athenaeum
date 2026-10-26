@@ -91,7 +91,7 @@ export function ObjectsTableView({
 
   const formatRotation = (avg: number | null, min: number | null, max: number | null) => {
     if (avg == null) return '-';
-    if (min != null && max != null && Math.abs(max - min) >= 1) {
+    if (min != null && max != null && ((max - min + 360) % 360) >= 1) {
       return `${min.toFixed(0)}° – ${max.toFixed(0)}°`;
     }
     return `${avg.toFixed(0)}°`;

@@ -44,52 +44,6 @@ export interface CoordinateTransformAPI {
 }
 
 /**
- * Get projection scaling factors to account for CSS stretching of the canvas.
- * d3-celestial sets canvas.width and canvas.height (buffer dimensions) to
- * projectionWidth * dpr and projectionHeight * dpr respectively.
- * Dividing by dpr gives the logical projection dimensions, which we compare
- * against the CSS display dimensions to get the scaling factors.
- * This works for any projection type without needing to know the aspect ratio.
- */
-function getCanvasScaling(): { scaleX: number; scaleY: number } {
-  const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
-  if (!canvas) {
-    return { scaleX: 1, scaleY: 1 };
-  }
-
-  const displayRect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-
-  // Read projection dimensions directly from the canvas buffer
-  // d3-celestial sets canvas.width = projWidth * dpr, canvas.height = projHeight * dpr
-  const projectionWidth = canvas.width / dpr;
-  const projectionHeight = canvas.height / dpr;
-
-  return {
-    scaleX: displayRect.width / projectionWidth,
-    scaleY: displayRect.height / projectionHeight
-  };
-}
-
-/**
- * Convert display coordinates to projection coordinates
- * Divides by scaling factors to account for aspect ratio differences
- */
-function scaleDisplayToCanvas(x: number, y: number): [number, number] {
-  const scaling = getCanvasScaling();
-  return [x / scaling.scaleX, y / scaling.scaleY];
-}
-
-/**
- * Convert projection coordinates to display coordinates
- * Multiplies by scaling factors to account for aspect ratio differences
- */
-function scaleCanvasToDisplay(x: number, y: number): [number, number] {
-  const scaling = getCanvasScaling();
-  return [x * scaling.scaleX, y * scaling.scaleY];
-}
-
-/**
  * Custom hook for coordinate transformation
  * Provides utilities for converting between pixel and sky coordinates
  */
@@ -118,11 +72,9 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         return null;
       }
 
-      // Convert display coordinates to projection space, accounting for aspect ratio
-      const [canvasX, canvasY] = scaleDisplayToCanvas(x, y);
-
-      // Convert pixel coordinates to sky coordinates
-      const result = projection.invert([canvasX, canvasY]);
+      // The canvas is sized natively to its container, so display pixels
+      // are projection pixels.
+      const result = projection.invert([x, y]);
       if (!result || !Array.isArray(result) || result.length < 2) {
         console.warn('Invalid projection result:', result);
         return null;
@@ -175,12 +127,7 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         console.warn('Invalid projection result:', result);
         return null;
       }
-      const [canvasX, canvasY] = result;
-
-      // Convert to display coordinates (pass-through on HiDPI displays)
-      const [x, y] = scaleCanvasToDisplay(canvasX, canvasY);
-
-      return [x, y];
+      return [result[0], result[1]];
     } catch (err) {
       console.error('Error converting sky to pixel coordinates:', err);
       return null;

@@ -66,6 +66,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 | Master calibration library | `docs/masters/README.md` |
 | Archive | `docs/archive/README.md` |
 | Dual-pane file browser | `docs/file-browser/README.md` |
+| Sky Chart (persistent chart host, view model, d3-celestial patches) | `docs/skychart/README.md` |
 | Transfers / personal sync / Perseus / collab | `docs/transfers/README.md` |
 | Plate solving · input and acceptance gates | `docs/platesolving/README.md` · `docs/platesolving/input-and-acceptance-gates.md` |
 | Stacking (M1–M4d, perf tiers, every ruling and acceptance run) | `docs/stacking/README.md` |
@@ -77,7 +78,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 `athenaeum-core` (`crates/athenaeum-core/src/`, canonical list in `lib.rs`): `models`, `coordinates`, `paths`, `disk`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `registration`, `catalog`, `services` (`ServiceContext` + `ProgressEmitter`), `events`, `logging`, `rustafits_processor`, `integration`, `star_measure`, `stacking`, `sync`, `sharing`, `collab`, `updates`, `ts_export`, `api/` (command-facing layer both hosts call), and more. `integration`, `star_measure` (`render`) and `stacking` (`render + solver`) are feature-gated: `cargo check --no-default-features` does not compile them.
 
-Tauri commands: 309 in 24 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
+Tauri commands: 313 in 25 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
 
 ## Adding a Tauri Command
 

@@ -90,7 +90,7 @@ export default function ShootCalendar() {
   // Navigation handlers for panel
   const handleNavigateToSkyChart = useCallback(
     (ra: number, dec: number) => {
-      navigate(`/skychart?ra=${ra}&dec=${dec}&zoom=800`);
+      navigate(`/skychart?ra=${ra}&dec=${dec}&fov=60`);
     },
     [navigate]
   );

@@ -381,6 +381,18 @@ pub async fn merge_frame_sets(
     Ok(Json(detail))
 }
 
+/// Recompute this set's center and rotation from its lights. Mirrors the
+/// Tauri command.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn recompute_frame_set_coordinates(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<athenaeum_core::api::frame_sets::FrameSetPointingUpdate>, (StatusCode, String)> {
+    athenaeum_core::api::frame_sets::recompute_frame_set_coordinates(&state.ctx, args.frames_set_id)
+        .map(Json)
+        .map_err(db_err)
+}
+
 /// Re-derive this set's nights and sessions from its member frames — the
 /// repair for a set an older merge left with one night stored as two rows.
 /// Mirrors the Tauri command.

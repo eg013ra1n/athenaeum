@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary, FrameSetProjectStatus } from '../types/models';
+import { ArrowLeft, MapPin, RotateCw, RefreshCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary, FrameSetProjectStatus, FrameSetPointingUpdate } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -145,6 +145,7 @@ export default function FrameSetDetail() {
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
   const [recalcNightsBusy, setRecalcNightsBusy] = useState(false);
+  const [pointingBusy, setPointingBusy] = useState(false);
 
   // Archive state
   const [showArchiveDialog, setShowArchiveDialog] = useState(false);
@@ -204,6 +205,31 @@ export default function FrameSetDetail() {
       });
     } finally {
       setFindNewBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // Refresh the set's center and rotation from its lights: Black Hole lights
+  // left out, Athenaeum-solved lights preferred (a header's mount
+  // coordinates and another program's rotation sign no longer mix in).
+  const handleRecomputeCoordinates = useCallback(async () => {
+    if (!id) return;
+    setPointingBusy(true);
+    try {
+      await api.invoke<FrameSetPointingUpdate>('recompute_frame_set_coordinates', {
+        framesSetId: parseInt(id),
+      });
+      await loadData();
+    } catch (e) {
+      console.error('[FrameSetDetail] recompute_frame_set_coordinates failed:', e);
+      notify({
+        title: 'Coordinates not refreshed',
+        detail: String(e),
+        kind: 'generic',
+        tone: 'warning',
+      });
+    } finally {
+      setPointingBusy(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -799,13 +825,24 @@ export default function FrameSetDetail() {
                 <RotateCw size={16} />
                 <span className="font-mono text-sm">
                   {detail.frames_set.min_rotation != null && detail.frames_set.max_rotation != null &&
-                   Math.abs(detail.frames_set.max_rotation - detail.frames_set.min_rotation) >= 1
+                   // circular spread: 359.5° – 0.5° is a 1° range, not 359°
+                   ((detail.frames_set.max_rotation - detail.frames_set.min_rotation + 360) % 360) >= 1
                     ? `${detail.frames_set.min_rotation.toFixed(1)}° – ${detail.frames_set.max_rotation.toFixed(1)}°`
                     : `${detail.frames_set.avg_rotation.toFixed(1)}°`
                   }
                 </span>
               </div>
             )}
+            <button
+              type="button"
+              onClick={handleRecomputeCoordinates}
+              disabled={pointingBusy}
+              title="Refresh the center and rotation from this set's lights: lights in the Black Hole are left out, and lights plate-solved by Athenaeum are preferred over header coordinates"
+              aria-label="Refresh coordinates"
+              className="p-1 rounded text-content-muted hover:text-content hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw size={14} className={pointingBusy ? 'animate-spin' : ''} />
+            </button>
           </div>
           <div className="flex flex-wrap items-center gap-3 [&_button]:whitespace-nowrap">
             {/* Single contextual action button: depends on the frame set state.

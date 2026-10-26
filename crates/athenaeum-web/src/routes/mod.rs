@@ -25,6 +25,7 @@ mod calibration;
 mod duplicates;
 mod export;
 mod spatial;
+mod hips;
 mod calendar;
 mod updates;
 mod images;
@@ -127,6 +128,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/find_new_frames_for_set", post(frame_sets::find_new_frames_for_set))
         .route("/api/auto_merge_new_frames_for_set", post(frame_sets::auto_merge_new_frames_for_set))
         .route("/api/recalculate_frame_set_nights", post(frame_sets::recalculate_frame_set_nights))
+        .route("/api/recompute_frame_set_coordinates", post(frame_sets::recompute_frame_set_coordinates))
         .route("/api/reconcile_frame_set_nights", post(frame_sets::reconcile_frame_set_nights))
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         .route("/api/set_frame_set_attestation", post(frame_sets::set_frame_set_attestation))
@@ -192,6 +194,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Spatial
         .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
+        // Sky Chart HiPS background
+        .route("/api/get_hips_surveys", post(hips::get_hips_surveys))
+        .route("/api/get_hips_tile", post(hips::get_hips_tile))
+        .route("/api/clear_hips_cache", post(hips::clear_hips_cache))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
         .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))

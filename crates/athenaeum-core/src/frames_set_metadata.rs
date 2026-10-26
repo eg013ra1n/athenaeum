@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use rusqlite::Connection;
 use chrono::{DateTime, Utc};
@@ -16,6 +18,116 @@ pub struct FrameSetMetadata {
     pub avg_rotation: Option<f64>,
     pub min_rotation: Option<f64>,
     pub max_rotation: Option<f64>,
+    /// Lights the center and rotation were taken from ([`set_pointing`]).
+    pub pointing_frames: usize,
+    /// True when those lights are all plate-solved by Athenaeum.
+    pub pointing_solved: bool,
+}
+
+/// What one light contributes to its set's center and rotation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramePointing {
+    pub ra: f64,
+    pub dec: f64,
+    /// `frames.rotation` (CROTA2 convention, see `docs/skychart/README.md`).
+    pub rotation: Option<f64>,
+    /// Athenaeum solved it (a `plate_solves` row exists): `ra`/`dec` are the
+    /// image center and `rotation` is atan2(−CD1_2, CD2_2).
+    pub solved: bool,
+    pub in_black_hole: bool,
+    /// Field of view (width, height) in degrees: from the solve's CD matrix
+    /// when solved, else from the header (`api::spatial::frame_fov`).
+    pub fov: Option<(f64, f64)>,
+}
+
+/// A set's center and rotation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetPointing {
+    pub ra: f64,
+    pub dec: f64,
+    pub avg_rotation: Option<f64>,
+    pub min_rotation: Option<f64>,
+    pub max_rotation: Option<f64>,
+    pub frames: usize,
+    pub solved: bool,
+    /// Median field of view (width, height) in degrees over the same lights.
+    pub fov: Option<(f64, f64)>,
+}
+
+/// The one rule for a set's center and rotation, shared by the stored
+/// frame-set metadata and the Sky Chart:
+/// - lights in the Black Hole are rejected and left out (all of them are used
+///   only when every light is in the Black Hole);
+/// - when any remaining light is plate-solved by Athenaeum, only the solved
+///   ones count: an unsolved light carries the mount's or the target's
+///   coordinates from its header, and its rotation may come from another
+///   program in another sign convention (a header 76.1° beside a solve's
+///   283.5° for the same framing averages to ~0°);
+/// - the center is the spherical mean (no RA wrap at 0h), the rotation the
+///   circular mean, and min / max are the extreme circular deviations from it;
+/// - the field of view is the median width and height over the same lights
+///   (a solved light's comes from its CD matrix, not FOCALLEN / XPIXSZ).
+pub fn set_pointing(frames: &[FramePointing]) -> Option<SetPointing> {
+    let kept: Vec<&FramePointing> = frames.iter().filter(|f| !f.in_black_hole).collect();
+    let kept: Vec<&FramePointing> = if kept.is_empty() { frames.iter().collect() } else { kept };
+    let solved: Vec<&FramePointing> = kept.iter().copied().filter(|f| f.solved).collect();
+    let (used, solved_used) = if solved.is_empty() { (kept, false) } else { (solved, true) };
+    let coords: Vec<(f64, f64)> = used.iter().map(|f| (f.ra, f.dec)).collect();
+    let (ra, dec) = spherical_mean(&coords).ok()?;
+    let rotations: Vec<f64> = used.iter().filter_map(|f| f.rotation).collect();
+    let (avg_rotation, min_rotation, max_rotation) = match rotation_stats(&rotations) {
+        Some((a, lo, hi)) => (Some(a), Some(lo), Some(hi)),
+        None => (None, None, None),
+    };
+    let fovs: Vec<(f64, f64)> = used.iter().filter_map(|f| f.fov).collect();
+    let fov = median(fovs.iter().map(|f| f.0).collect()).zip(median(fovs.iter().map(|f| f.1).collect()));
+    Some(SetPointing { ra, dec, avg_rotation, min_rotation, max_rotation, frames: used.len(), solved: solved_used, fov })
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 { (values[mid - 1] + values[mid]) / 2.0 } else { values[mid] })
+}
+
+fn norm360(deg: f64) -> f64 {
+    deg.rem_euclid(360.0)
+}
+
+/// Circular mean, and the smallest / largest circular deviation from it, of
+/// angles in degrees; all three in [0, 360). `None` for no angles or angles
+/// that cancel out.
+pub fn rotation_stats(rotations: &[f64]) -> Option<(f64, f64, f64)> {
+    if rotations.is_empty() {
+        return None;
+    }
+    let sum_sin: f64 = rotations.iter().map(|r| r.to_radians().sin()).sum();
+    let sum_cos: f64 = rotations.iter().map(|r| r.to_radians().cos()).sum();
+    if sum_sin.hypot(sum_cos) < 1e-9 * rotations.len() as f64 {
+        return None;
+    }
+    let mean = norm360(sum_sin.atan2(sum_cos).to_degrees());
+    let deviation = |r: f64| norm360(r - mean + 180.0) - 180.0;
+    let lo = rotations.iter().map(|&r| deviation(r)).fold(f64::INFINITY, f64::min);
+    let hi = rotations.iter().map(|&r| deviation(r)).fold(f64::NEG_INFINITY, f64::max);
+    Some((mean, norm360(mean + lo), norm360(mean + hi)))
+}
+
+/// A frame's coordinates: the numeric RA/Dec, else its sexagesimal header pair.
+fn frame_coords(f: &Frame) -> Option<(f64, f64)> {
+    if let (Some(ra), Some(dec)) = (f.ra, f.dec) {
+        return Some((ra, dec));
+    }
+    if let (Some(ref ra_str), Some(ref dec_str)) = (&f.objctra, &f.objctdec) {
+        use crate::coordinates::{parse_ra_sexagesimal, parse_dec_sexagesimal};
+        if let (Ok(ra), Ok(dec)) = (parse_ra_sexagesimal(ra_str), parse_dec_sexagesimal(dec_str)) {
+            return Some((ra, dec));
+        }
+    }
+    None
 }
 
 /// Calculate frame set metadata from a list of frame IDs
@@ -33,6 +145,8 @@ pub fn calculate_metadata_from_frame_ids(
             avg_rotation: None,
             min_rotation: None,
             max_rotation: None,
+            pointing_frames: 0,
+            pointing_solved: false,
         });
     }
 
@@ -109,11 +223,30 @@ pub fn calculate_metadata_from_frame_ids(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    calculate_metadata_from_frames(&frames)
+    // Which lights are solved by Athenaeum and which are in the Black Hole.
+    let flag_query = format!(
+        "SELECT fr.id,
+                EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = fr.id),
+                EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fr.file_id)
+         FROM frames fr WHERE fr.id IN ({})",
+        placeholders
+    );
+    let mut flag_stmt = conn.prepare(&flag_query)?;
+    let flags: HashMap<i64, (bool, bool)> = flag_stmt
+        .query_map(&params[..], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+        .collect::<Result<_, _>>()?;
+
+    metadata_from_frames(&frames, &flags)
 }
 
-/// Calculate frame set metadata from a list of frames
+/// Calculate frame set metadata from a list of frames. With no solve or
+/// Black Hole information every frame counts as an unsolved, kept light.
 pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetadata> {
+    metadata_from_frames(frames, &HashMap::new())
+}
+
+/// `flags`: frame id → (solved by Athenaeum, in the Black Hole).
+fn metadata_from_frames(frames: &[Frame], flags: &HashMap<i64, (bool, bool)>) -> Result<FrameSetMetadata> {
     if frames.is_empty() {
         return Ok(FrameSetMetadata {
             date_obs_start: None,
@@ -124,6 +257,8 @@ pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetada
             avg_rotation: None,
             min_rotation: None,
             max_rotation: None,
+            pointing_frames: 0,
+            pointing_solved: false,
         });
     }
 
@@ -156,61 +291,27 @@ pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetada
         (None, None)
     };
 
-    // Calculate average coordinates using spherical mean
-    let coords: Vec<(f64, f64)> = frames
+    // Center and rotation: the one rule (`set_pointing`).
+    let pointings: Vec<FramePointing> = frames
         .iter()
         .filter_map(|f| {
-            // Try numeric coordinates first
-            if let (Some(ra), Some(dec)) = (f.ra, f.dec) {
-                return Some((ra, dec));
-            }
-            // Try parsing sexagesimal coordinates
-            if let (Some(ref ra_str), Some(ref dec_str)) = (&f.objctra, &f.objctdec) {
-                use crate::coordinates::{parse_ra_sexagesimal, parse_dec_sexagesimal};
-                if let (Ok(ra), Ok(dec)) = (
-                    parse_ra_sexagesimal(ra_str),
-                    parse_dec_sexagesimal(dec_str),
-                ) {
-                    return Some((ra, dec));
-                }
-            }
-            None
+            let (ra, dec) = frame_coords(f)?;
+            let (solved, in_black_hole) = f.id.and_then(|id| flags.get(&id).copied()).unwrap_or((false, false));
+            Some(FramePointing { ra, dec, rotation: f.rotation, solved, in_black_hole, fov: None })
         })
         .collect();
-
-    let (objctra, objctdec) = if !coords.is_empty() {
-        match spherical_mean(&coords) {
-            Ok((ra_deg, dec_deg)) => {
-                let ra_str = format_ra_sexagesimal(ra_deg);
-                let dec_str = format_dec_sexagesimal(dec_deg);
-                (Some(ra_str), Some(dec_str))
-            }
-            Err(_) => (None, None),
-        }
-    } else {
-        (None, None)
+    let pointing = set_pointing(&pointings);
+    let (objctra, objctdec) = match pointing {
+        Some(p) => (Some(format_ra_sexagesimal(p.ra)), Some(format_dec_sexagesimal(p.dec))),
+        None => (None, None),
     };
-
-    // Calculate rotation stats (circular mean for avg, simple min/max for range)
-    let rotations: Vec<f64> = frames
-        .iter()
-        .filter_map(|f| f.rotation)
-        .collect();
-
-    let (avg_rotation, min_rotation, max_rotation) = if !rotations.is_empty() {
-        let min_rot = rotations.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_rot = rotations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-        // Circular mean via atan2(mean_sin, mean_cos)
-        let sum_sin: f64 = rotations.iter().map(|r| r.to_radians().sin()).sum();
-        let sum_cos: f64 = rotations.iter().map(|r| r.to_radians().cos()).sum();
-        let avg_rot = sum_sin.atan2(sum_cos).to_degrees();
-        // Normalize to 0..360
-        let avg_rot = if avg_rot < 0.0 { avg_rot + 360.0 } else { avg_rot };
-
-        (Some(avg_rot), Some(min_rot), Some(max_rot))
-    } else {
-        (None, None, None)
+    let (avg_rotation, min_rotation, max_rotation) = match pointing {
+        Some(p) => (p.avg_rotation, p.min_rotation, p.max_rotation),
+        // No coordinates at all: rotation still from every frame that has one.
+        None => match rotation_stats(&frames.iter().filter_map(|f| f.rotation).collect::<Vec<_>>()) {
+            Some((a, lo, hi)) => (Some(a), Some(lo), Some(hi)),
+            None => (None, None, None),
+        },
     };
 
     Ok(FrameSetMetadata {
@@ -222,6 +323,8 @@ pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetada
         avg_rotation,
         min_rotation,
         max_rotation,
+        pointing_frames: pointing.map_or(0, |p| p.frames),
+        pointing_solved: pointing.is_some_and(|p| p.solved),
     })
 }
 
@@ -316,4 +419,77 @@ mod tests {
         assert!(result.objctra.is_some());
         assert!(result.objctdec.is_some());
     }
+
+    fn fp(ra: f64, dec: f64, rotation: Option<f64>, solved: bool, in_black_hole: bool) -> FramePointing {
+        FramePointing { ra, dec, rotation, solved, in_black_hole, fov: None }
+    }
+
+    #[test]
+    fn solved_lights_win_over_header_coordinates() {
+        // Two solved lights near M 31 and an unsolved one with the mount's
+        // coordinates half a degree off and a header rotation of the other sign.
+        let p = set_pointing(&[
+            fp(10.67, 41.10, Some(283.5), true, false),
+            fp(10.68, 41.11, Some(283.4), true, false),
+            fp(11.20, 40.60, Some(76.1), false, false),
+        ])
+        .unwrap();
+        assert!(p.solved);
+        assert_eq!(p.frames, 2);
+        assert!((p.ra - 10.675).abs() < 1e-3 && (p.dec - 41.105).abs() < 1e-3);
+        assert!((p.avg_rotation.unwrap() - 283.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn black_hole_lights_are_left_out_unless_all_are_there() {
+        let p = set_pointing(&[fp(10.0, 0.0, None, true, false), fp(50.0, 0.0, None, true, true)]).unwrap();
+        assert!((p.ra - 10.0).abs() < 1e-9 && p.frames == 1);
+        let all = set_pointing(&[fp(10.0, 0.0, None, false, true), fp(12.0, 0.0, None, false, true)]).unwrap();
+        assert_eq!(all.frames, 2);
+        assert!((all.ra - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_is_the_median_over_the_pointing_lights() {
+        let with = |fov: (f64, f64), solved: bool, bh: bool| FramePointing { fov: Some(fov), ..fp(10.0, 41.0, None, solved, bh) };
+        // An unsolved light with a wrong header FOCALLEN, a Black Hole light from
+        // another rig, and three solved lights (one binned 2×2 by mistake).
+        let p = set_pointing(&[
+            with((1.2, 0.8), false, false),
+            with((0.5, 0.3), true, true),
+            with((3.10, 2.07), true, false),
+            with((3.11, 2.08), true, false),
+            with((1.55, 1.04), true, false),
+        ])
+        .unwrap();
+        assert_eq!(p.fov, Some((3.10, 2.07)));
+        let even = set_pointing(&[with((2.0, 1.0), true, false), with((3.0, 2.0), true, false)]).unwrap();
+        assert_eq!(even.fov, Some((2.5, 1.5)));
+        assert_eq!(set_pointing(&[fp(1.0, 1.0, None, true, false)]).unwrap().fov, None);
+    }
+
+    #[test]
+    fn unsolved_sets_still_get_a_center() {
+        let p = set_pointing(&[fp(83.8, -5.4, Some(10.0), false, false)]).unwrap();
+        assert!(!p.solved);
+        assert_eq!(p.frames, 1);
+    }
+
+    #[test]
+    fn the_center_does_not_wrap_at_0h() {
+        let p = set_pointing(&[fp(359.9, 20.0, None, true, false), fp(0.1, 20.0, None, true, false)]).unwrap();
+        assert!(p.ra < 0.01 || p.ra > 359.99, "{}", p.ra);
+    }
+
+    #[test]
+    fn rotation_range_is_circular() {
+        let (avg, lo, hi) = rotation_stats(&[359.0, 1.0, 0.5]).unwrap();
+        assert!(avg < 0.5 || avg > 359.9, "{avg}");
+        assert!((lo - 359.0).abs() < 1e-9 && (hi - 1.0).abs() < 1e-9, "{lo} {hi}");
+        let (_, lo, hi) = rotation_stats(&[283.5, 283.4, 283.6]).unwrap();
+        assert!((lo - 283.4).abs() < 1e-9 && (hi - 283.6).abs() < 1e-9);
+        assert!(rotation_stats(&[]).is_none());
+        assert!(rotation_stats(&[0.0, 180.0]).is_none(), "opposite angles have no mean");
+    }
 }
+

@@ -82,6 +82,64 @@ fn refresh_frame_set_metadata(
     Ok(())
 }
 
+/// A frame set's center and rotation after "refresh coordinates".
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSetPointingUpdate {
+    pub objctra: Option<String>,
+    pub objctdec: Option<String>,
+    pub avg_rotation: Option<f64>,
+    pub min_rotation: Option<f64>,
+    pub max_rotation: Option<f64>,
+    /// Lights the values were taken from.
+    pub lights_used: u32,
+    /// True when those lights are all plate-solved by Athenaeum.
+    pub solved: bool,
+}
+
+/// Recompute a frame set's center and rotation from its lights by the one
+/// rule (`frames_set_metadata::set_pointing`: Black Hole lights left out,
+/// Athenaeum-solved lights preferred) and store them. Nights, sessions,
+/// dates and hours are untouched.
+pub fn recompute_frame_set_coordinates(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<FrameSetPointingUpdate> {
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
+    let conn = db.conn();
+    let m = crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, &conn)?;
+    let updated = db::update_frames_set_pointing(
+        &conn,
+        frames_set_id,
+        m.objctra.as_deref(),
+        m.objctdec.as_deref(),
+        m.avg_rotation,
+        m.min_rotation,
+        m.max_rotation,
+    )?;
+    if updated == 0 {
+        return Err(anyhow!("frame set {frames_set_id} not found"));
+    }
+    tracing::info!(
+        frame_set_id = frames_set_id,
+        count = m.pointing_frames,
+        solved_only = m.pointing_solved,
+        "frame set coordinates recomputed"
+    );
+    Ok(FrameSetPointingUpdate {
+        objctra: m.objctra,
+        objctdec: m.objctdec,
+        avg_rotation: m.avg_rotation,
+        min_rotation: m.min_rotation,
+        max_rotation: m.max_rotation,
+        lights_used: m.pointing_frames as u32,
+        solved: m.pointing_solved,
+    })
+}
+
 /// Re-derive one frame set's nights and sessions from its member frames and
 /// refresh its aggregate metadata — the manual "Recalculate nights" action,
 /// which repairs a set an older merge left with one night stored as two rows.

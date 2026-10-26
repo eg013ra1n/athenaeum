@@ -160,6 +160,16 @@ export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNight
 
 export type ReconcileSummary = { changed: boolean, nights: number, sessions: number, };
 
+export type FrameSetPointingUpdate = { objctra: string | null, objctdec: string | null, avgRotation: number | null, minRotation: number | null, maxRotation: number | null, 
+/**
+ * Lights the values were taken from.
+ */
+lightsUsed: number, 
+/**
+ * True when those lights are all plate-solved by Athenaeum.
+ */
+solved: boolean, };
+
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
 
 export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, 
@@ -179,6 +189,28 @@ export type RelinkResult = { files_matched: number, files_new: number, files_orp
 export type OrphanedFile = { id: number, path: string, filename: string, size: number, modified_at: string, has_frame: boolean, object: string | null, date_obs: string | null, };
 
 export type ImagingLocation = { id: number, ra: number, dec: number, objectName: string | null, frameCount: number, totalExposure: number, filters: Array<string>, dateRange: [string, string], frameSetId: number | null, fovWidth: number | null, fovHeight: number | null, locationType: string, cameras: string | null, focalLengths: string | null, isCustom: boolean, rotation: number | null, };
+
+export type HipsSurveyInfo = { id: string, label: string, 
+/**
+ * `image/jpeg` or `image/png`.
+ */
+mime: string, 
+/**
+ * Deepest order the chart may request (the survey's, capped at 6).
+ */
+maxOrder: number, tileWidth: number, 
+/**
+ * The survey's `obs_copyright`, or the preset's until `properties` were read.
+ */
+attribution: string, attributionUrl: string | null, 
+/**
+ * `hips_license`, or the preset's.
+ */
+license: string, 
+/**
+ * Online fetching is on (`skychart.hips_online`).
+ */
+online: boolean, cachedTiles: number, cachedBytes: number, };
 
 export type CalibrationLink = { id: number | null, source_id: number, source_type: string, calibration_set_id: number, calibration_type: string, matched_at: string, match_score: number | null, date_warning: boolean, temp_warning: boolean, is_manual_override: boolean, };
 
