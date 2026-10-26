@@ -8,6 +8,8 @@
 //! "HiPS"). A tile is addressed only by validated numbers (survey id,
 //! order, npix), so no frontend path ever reaches the filesystem.
 
+// The pack needs the DSO catalog and the HEALPix cones (solver + render).
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod pack;
 
 use std::collections::BTreeMap;
@@ -250,8 +252,9 @@ impl HipsStore {
         self.tile_path(order, npix).is_file() || self.absent_path(order, npix).is_file()
     }
 
-    /// The last pack's selection and state (`<store>/pack.json`).
-    pub fn read_pack_state(&self) -> Result<Option<pack::PackFile>> {
+    /// The last pack snapshot (`<store>/pack.json`).
+    #[cfg(all(feature = "render", feature = "solver"))]
+    pub fn read_pack_state(&self) -> Result<Option<pack::PackProgress>> {
         let path = self.root.join("pack.json");
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?)),
@@ -260,7 +263,8 @@ impl HipsStore {
         }
     }
 
-    pub fn write_pack_state(&self, file: &pack::PackFile) -> Result<()> {
+    #[cfg(all(feature = "render", feature = "solver"))]
+    pub fn write_pack_state(&self, file: &pack::PackProgress) -> Result<()> {
         let bytes = serde_json::to_vec(file).context("serialise pack.json")?;
         write_atomic(&self.root.join("pack.json"), &bytes)
     }
@@ -303,6 +307,22 @@ impl HipsStore {
             }
         }
         Ok((tiles, bytes))
+    }
+
+    /// Renames the store to a sibling tombstone (`<root>.clearing-<pid>-<n>`),
+    /// which is O(1): the survey's store is empty from that moment. `None`
+    /// when there is no store. [`HipsStore::clear`] the returned store to size
+    /// and delete it.
+    pub fn move_aside(&self) -> Result<Option<HipsStore>> {
+        let n = PART_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut name = self.root.file_name().context("store path has no name")?.to_os_string();
+        name.push(format!(".clearing-{}-{n}", std::process::id()));
+        let tomb = self.root.with_file_name(name);
+        match fs::rename(&self.root, &tomb) {
+            Ok(()) => Ok(Some(HipsStore { root: tomb, format: self.format })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("move {} aside", self.root.display())),
+        }
     }
 
     /// Deletes the whole store; returns the tile bytes it held.
@@ -506,8 +526,12 @@ mod tests {
 
         store.write_properties("hips_frame = equatorial\n").unwrap();
         assert_eq!(store.read_properties().unwrap().unwrap().get("hips_frame"), Some("equatorial"));
-        assert_eq!(store.clear().unwrap(), JPEG.len() as u64);
-        assert!(!store.root().exists());
+        let tomb = store.move_aside().unwrap().unwrap();
+        assert!(!store.root().exists(), "the store is empty the moment it is moved aside");
+        assert_ne!(tomb.root(), store.root());
+        assert_eq!(tomb.clear().unwrap(), JPEG.len() as u64);
+        assert!(!tomb.root().exists());
+        assert!(store.move_aside().unwrap().is_none());
         assert_eq!(store.clear().unwrap(), 0);
     }
 

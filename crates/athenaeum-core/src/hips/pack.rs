@@ -177,8 +177,11 @@ impl PackState {
 
 /// A snapshot of a pack run. Done when `present + fetched + absent + failed
 /// == total`.
+///
+/// Also what `<store>/pack.json` holds. Every field defaults, so a file an
+/// older build wrote (selection and state only) still parses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct PackProgress {
     pub state: PackState,
     pub selection: Option<PackSelection>,
@@ -200,14 +203,6 @@ impl PackProgress {
     pub fn new(selection: PackSelection, total: u64) -> Self {
         PackProgress { state: PackState::Running, selection: Some(selection), total, ..Default::default() }
     }
-}
-
-/// `<store>/pack.json`: what survives a restart.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PackFile {
-    pub selection: Option<PackSelection>,
-    pub state: PackState,
 }
 
 /// Runner tuning. Tests pass millisecond durations.
@@ -246,17 +241,23 @@ const EMIT_INTERVAL: Duration = Duration::from_millis(250);
 /// A wait checks the cancel flag at least this often.
 const SLEEP_STEP: Duration = Duration::from_millis(200);
 
-/// What the store says about a pack that was running when the app died. The
-/// caller asks only when no run is live in this process.
-pub fn interrupted_status(store: &HipsStore) -> Option<PackProgress> {
+/// What the store says when no run is live in this process: the last snapshot
+/// in `pack.json` (counts included), `Interrupted` if it still says `Running`
+/// (the app died mid-run), else `Idle`. Reads the file once; an unreadable
+/// file is logged and counts as `Idle`, never an error that sticks.
+pub fn stored_status(store: &HipsStore) -> PackProgress {
     match store.read_pack_state() {
-        Ok(Some(PackFile { selection, state: PackState::Running })) => {
-            Some(PackProgress { state: PackState::Interrupted, selection, ..Default::default() })
+        Ok(Some(mut p)) => {
+            if matches!(p.state, PackState::Running | PackState::Cancelling) {
+                p.state = PackState::Interrupted;
+            }
+            p.waiting_s = None;
+            p
         }
-        Ok(_) => None,
+        Ok(None) => PackProgress::default(),
         Err(e) => {
             tracing::warn!(path = %store.root().display(), error = %format!("{e:#}"), "hips pack state unreadable");
-            None
+            PackProgress::default()
         }
     }
 }
@@ -515,7 +516,7 @@ pub fn run_pack(
     progress.present = (tiles.len() - todo.len()) as u64;
 
     tracing::info!(survey_id = %survey_id, tiles_total = progress.total, "hips pack started");
-    write_pack_file(store, &selection, PackState::Running);
+    write_pack_file(store, &progress);
     (on_progress)(&progress);
 
     let run = Run {
@@ -566,15 +567,14 @@ pub fn run_pack(
         bytes = p.bytes_fetched,
         "hips pack finished"
     );
-    write_pack_file(store, &selection, p.state);
+    write_pack_file(store, p);
     (on_progress)(p);
     p.clone()
 }
 
-fn write_pack_file(store: &HipsStore, selection: &Option<PackSelection>, state: PackState) {
-    let file = PackFile { selection: selection.clone(), state };
-    if let Err(e) = store.write_pack_state(&file) {
-        tracing::warn!(pack_state = state.as_str(), error = %format!("{e:#}"), "hips pack state not saved");
+fn write_pack_file(store: &HipsStore, progress: &PackProgress) {
+    if let Err(e) = store.write_pack_state(progress) {
+        tracing::warn!(pack_state = progress.state.as_str(), error = %format!("{e:#}"), "hips pack state not saved");
     }
 }
 
@@ -1090,18 +1090,34 @@ mod tests {
     #[test]
     fn interrupted_after_restart() {
         let (_d, store) = new_store();
-        assert!(interrupted_status(&store).is_none());
+        assert_eq!(stored_status(&store).state, PackState::Idle);
         let selection = PackSelection { sky_order: 3, around_ngc_ic: true, ..PackSelection::default() };
-        store
-            .write_pack_state(&PackFile { selection: Some(selection.clone()), state: PackState::Running })
-            .unwrap();
-        let p = interrupted_status(&store).unwrap();
+        let running = PackProgress { fetched: 7, total: 20, ..PackProgress::new(selection.clone(), 20) };
+        store.write_pack_state(&running).unwrap();
+        let p = stored_status(&store);
         assert_eq!(p.state, PackState::Interrupted);
+        assert_eq!((p.fetched, p.total), (7, 20), "counts survive the restart");
         let got = p.selection.unwrap();
         assert_eq!((got.sky_order, got.around_ngc_ic, got.survey_id), (3, true, selection.survey_id));
-        // A finished pack is not interrupted.
-        store.write_pack_state(&PackFile { selection: None, state: PackState::Done }).unwrap();
-        assert!(interrupted_status(&store).is_none());
+        // A finished pack is not interrupted and keeps its counts.
+        store
+            .write_pack_state(&PackProgress { state: PackState::Done, fetched: 20, total: 20, ..Default::default() })
+            .unwrap();
+        let p = stored_status(&store);
+        assert_eq!((p.state, p.fetched), (PackState::Done, 20));
+    }
+
+    #[test]
+    fn pack_json_of_an_older_build_and_a_corrupt_one() {
+        let (_d, store) = new_store();
+        std::fs::create_dir_all(store.root()).unwrap();
+        // The first build wrote selection and state only.
+        std::fs::write(store.root().join("pack.json"), br#"{"selection":null,"state":"failed"}"#).unwrap();
+        let p = stored_status(&store);
+        assert_eq!((p.state, p.fetched, p.total), (PackState::Failed, 0, 0));
+        // A corrupt file reads as idle, not as an error.
+        std::fs::write(store.root().join("pack.json"), b"{not json").unwrap();
+        assert_eq!(stored_status(&store).state, PackState::Idle);
     }
 
     #[test]
@@ -1124,7 +1140,8 @@ mod tests {
         assert_eq!(seen.first().unwrap(), &(PackState::Running, PackState::Running));
         assert_eq!(seen.last().unwrap(), &(PackState::Done, PackState::Done));
         assert_eq!(p.state, PackState::Done);
-        assert!(interrupted_status(&store).is_none());
+        let stored = stored_status(&store);
+        assert_eq!((stored.state, stored.fetched), (PackState::Done, 5), "pack.json keeps the counts");
     }
 
     #[test]

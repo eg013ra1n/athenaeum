@@ -37,7 +37,13 @@ pub(crate) fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCat
     if let Some(cat) = ctx.dso_catalog.read().ok()?.as_ref() {
         return Some(cat.clone());
     }
-    let loaded = std::sync::Arc::new(DsoCatalog::load().ok()?);
+    let loaded = match DsoCatalog::load() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "dso catalog load failed");
+            return None;
+        }
+    };
     if let Ok(mut guard) = ctx.dso_catalog.write() {
         *guard = Some(loaded.clone());
     }
