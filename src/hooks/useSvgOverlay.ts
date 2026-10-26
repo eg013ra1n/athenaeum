@@ -20,87 +20,52 @@ export interface SVGOverlayAPI {
 
 /**
  * Custom hook for SVG overlay management
- * Creates and manages transparent SVG layer above d3-celestial canvas
+ * Creates and manages transparent SVG layer above d3-celestial canvas.
+ * The container must be in the document when the effect runs (the Sky
+ * Chart attaches its persistent host in a layout effect); the overlay is
+ * created once and reused, since it lives in that persistent host.
  */
 export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [enabled, setEnabled] = useState(false);
 
   useEffect(() => {
-    // Create SVG overlay layer
     const container = document.getElementById(config.containerId);
     if (!container) {
-      console.warn(`Container with id "${config.containerId}" not found, will retry`);
-      // Retry after a short delay if container not found yet
-      const timer = setTimeout(() => {
-        const retryContainer = document.getElementById(config.containerId);
-        if (retryContainer) {
-          console.log(`Container found on retry: ${config.containerId}`);
-          // Create the overlay
-          const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-          svg.setAttribute('class', 'selection-overlay');
-          svg.setAttribute('preserveAspectRatio', 'none');
-          svg.style.position = 'absolute';
-          svg.style.top = '0';
-          svg.style.left = '0';
-          svg.style.width = '100%';
-          svg.style.height = '100%';
-          svg.style.pointerEvents = 'none';
-          svg.style.zIndex = '10';
-
-          if (getComputedStyle(retryContainer).position === 'static') {
-            retryContainer.style.position = 'relative';
-          }
-
-          retryContainer.appendChild(svg);
-          svgRef.current = svg;
-        }
-      }, 100);
-      return () => clearTimeout(timer);
-    }
-
-    console.log(`SVG overlay container found: ${config.containerId}`);
-
-    // Check if SVG already exists
-    let svg = container.querySelector('.selection-overlay') as SVGSVGElement;
-    if (svg) {
-      console.log('SVG overlay already exists, reusing');
-      svgRef.current = svg;
+      console.error(`[useSvgOverlay] container "${config.containerId}" not found`);
       return;
     }
 
-    // Ensure container has relative positioning for absolute SVG overlay
-    if (getComputedStyle(container).position === 'static') {
-      container.style.position = 'relative';
+    let svg = container.querySelector('.selection-overlay') as SVGSVGElement | null;
+    if (!svg) {
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+      svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', 'selection-overlay');
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.style.position = 'absolute';
+      svg.style.top = '0';
+      svg.style.left = '0';
+      svg.style.width = '100%';
+      svg.style.height = '100%';
+      svg.style.pointerEvents = config.pointerEvents || 'none';
+      svg.style.zIndex = '10';
+      container.appendChild(svg);
     }
-
-    // Create new SVG overlay
-    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('class', 'selection-overlay');
-    svg.setAttribute('preserveAspectRatio', 'none');
-    svg.style.position = 'absolute';
-    svg.style.top = '0';
-    svg.style.left = '0';
-    svg.style.width = '100%';
-    svg.style.height = '100%';
-    svg.style.pointerEvents = config.pointerEvents || 'none';
-    svg.style.zIndex = '10';
-
-    container.appendChild(svg);
     svgRef.current = svg;
 
-    // Cleanup function
     return () => {
-      // Don't remove SVG on unmount - it should persist
-      // Just clear event listeners
-      if (svgRef.current) {
-        svgRef.current.onmousedown = null;
-        svgRef.current.onmousemove = null;
-        svgRef.current.onmouseup = null;
-        svgRef.current.onclick = null;
+      // The SVG persists with its container; only drop the listeners.
+      const el = svgRef.current;
+      if (el) {
+        el.onmousedown = null;
+        el.onmousemove = null;
+        el.onmouseup = null;
+        el.onclick = null;
       }
     };
-  }, [config.containerId]);
+  }, [config.containerId, config.pointerEvents]);
 
   const getSvg = () => svgRef.current;
 

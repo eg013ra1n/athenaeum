@@ -1,6 +1,6 @@
 /**
- * Utility functions for handling Aitoff projection boundaries
- * The Aitoff projection is elliptical - pixels outside the ellipse are invalid
+ * Utility functions for handling the chart's projection boundary
+ * Pixels outside the projected sky (pixelToSky returns null) are invalid
  */
 
 /**
@@ -17,7 +17,7 @@ export function isPixelInProjection(
 
 /**
  * Clamp a rectangle so ALL corners and edges remain within the projection
- * Ensures the entire rectangle stays within the valid Aitoff projection area
+ * Ensures the entire rectangle stays within the valid projection area
  *
  * @param currentX - Target x coordinate for opposite corner
  * @param currentY - Target y coordinate for opposite corner

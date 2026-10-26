@@ -66,6 +66,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 | Master calibration library | `docs/masters/README.md` |
 | Archive | `docs/archive/README.md` |
 | Dual-pane file browser | `docs/file-browser/README.md` |
+| Sky Chart (persistent chart host, view model, d3-celestial patches) | `docs/skychart/README.md` |
 | Transfers / personal sync / Perseus / collab | `docs/transfers/README.md` |
 | Plate solving · input and acceptance gates | `docs/platesolving/README.md` · `docs/platesolving/input-and-acceptance-gates.md` |
 | Stacking (M1–M4d, perf tiers, every ruling and acceptance run) | `docs/stacking/README.md` |

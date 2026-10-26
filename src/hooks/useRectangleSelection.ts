@@ -46,7 +46,6 @@ interface RectangleState {
   startPixel: [number, number] | null;
   currentPixel: [number, number] | null;
   isDrawing: boolean;
-  hasShownBoundaryWarning: boolean;
 }
 
 /**
@@ -62,8 +61,7 @@ export function useRectangleSelection(
   const stateRef = useRef<RectangleState>({
     startPixel: null,
     currentPixel: null,
-    isDrawing: false,
-    hasShownBoundaryWarning: false
+    isDrawing: false
   });
 
   const rectangleElementRef = useRef<SVGRectElement | null>(null);
@@ -87,11 +85,8 @@ export function useRectangleSelection(
       return;
     }
 
-    console.log('Rectangle selection started, SVG element:', svg);
-
     // Enable overlay for interaction
     svgOverlay.enable();
-    console.log('SVG overlay enabled');
 
     // Clear any previous rectangle
     svgOverlay.clear();
@@ -100,15 +95,12 @@ export function useRectangleSelection(
     stateRef.current = {
       startPixel: null,
       currentPixel: null,
-      isDrawing: false,
-      hasShownBoundaryWarning: false
+      isDrawing: false
     };
 
     // Attach mouse handlers for rectangle drawing
-    console.log('Attaching mouse handlers to SVG');
     mouseEvents.attachMouseHandlers(svg, {
       onMouseDown: (x: number, y: number) => {
-        console.log('Rectangle onMouseDown at:', x, y);
         const state = stateRef.current;
         state.startPixel = [x, y];
         state.currentPixel = [x, y];
@@ -127,7 +119,6 @@ export function useRectangleSelection(
 
         svg.appendChild(rect);
         rectangleElementRef.current = rect;
-        console.log('Rectangle element created at:', x, y);
       },
 
       onMouseMove: (x: number, y: number) => {
@@ -164,12 +155,6 @@ export function useRectangleSelection(
           fillColor = 'rgba(16, 185, 129, 0.15)';
         }
 
-        // Show warning if clamped to boundary
-        if (isClamped && !state.hasShownBoundaryWarning) {
-          console.log('⚠️ Selection clamped to celestial map boundary');
-          state.hasShownBoundaryWarning = true;
-        }
-
         // Calculate rectangle position (top-left corner)
         const startX = Math.min(state.startPixel[0], clampedX);
         const startY = Math.min(state.startPixel[1], clampedY);
@@ -199,7 +184,6 @@ export function useRectangleSelection(
         const height = Math.abs(state.currentPixel[1] - state.startPixel[1]);
 
         if (width < MIN_SELECTION_SIZE || height < MIN_SELECTION_SIZE) {
-          console.log('⚠️ Selection too small, ignoring (minimum 10×10 pixels)');
           // Clear the rectangle visual
           svgOverlay.clear();
           rectangleElementRef.current = null;
@@ -214,8 +198,6 @@ export function useRectangleSelection(
           x2: Math.max(state.startPixel[0], state.currentPixel[0]),
           y2: Math.max(state.startPixel[1], state.currentPixel[1])
         };
-
-        console.log('📐 Pixel rectangle:', pixelRect);
 
         // Convert to sky bounds using multi-point sampling
         const skyBounds = calculateSkyBounds(
@@ -232,8 +214,6 @@ export function useRectangleSelection(
           return;
         }
 
-        console.log('✅ Sky bounds:', skyBounds);
-
         // Query backend for candidate frames in the sky bounding box.
         // T2-18 — surface a loading state to the host so it can show a
         // spinner during slow queries.
@@ -249,8 +229,6 @@ export function useRectangleSelection(
             }
           });
 
-          console.log(`📦 Got ${candidates.count} candidate frames from bounding box`);
-
           // Pixel-space verification: project each candidate's RA/Dec to screen
           // and check if it falls inside the drawn rectangle.
           const verified: { id: number; exposure: number }[] = [];
@@ -263,7 +241,6 @@ export function useRectangleSelection(
               verified.push({ id: c.id, exposure: c.exposure });
             }
           }
-          console.log(`🎯 Verified ${verified.length} frames in pixel rectangle (from ${candidates.count} candidates)`);
 
           const totalExposure = verified.reduce((sum, f) => sum + f.exposure, 0);
           const result: SelectionResult = {
@@ -304,8 +281,7 @@ export function useRectangleSelection(
     stateRef.current = {
       startPixel: null,
       currentPixel: null,
-      isDrawing: false,
-      hasShownBoundaryWarning: false
+      isDrawing: false
     };
 
     rectangleElementRef.current = null;
