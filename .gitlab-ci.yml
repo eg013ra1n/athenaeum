@@ -580,29 +580,31 @@ deploy:
     - . .gitlab/ci/scripts/artifact_names.sh
     - export VERSION="${CI_COMMIT_TAG#v}"
     # One staging dir laid out exactly like the server: <subdir>/<final name>.
+    # The linux runner keeps target/ between jobs (warm cache), so an older release's bundles sit beside this
+    # one's: every copy below names this VERSION, never a bare glob (v0.7.0's deploy picked up 0.6.4 DMGs).
     - rm -rf release_stage && mkdir -p release_stage/windows release_stage/macos release_stage/linux release_stage/perseus
-    - cp target/release/bundle/msi/*.msi                          "release_stage/windows/$(artifact_name athenaeum windows x64 msi)"
-    - cp target/release/bundle/nsis/*.exe                         "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup)"
-    - cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg     "release_stage/macos/$(artifact_name athenaeum macos arm64 dmg)"
-    - cp target/x86_64-apple-darwin/release/bundle/dmg/*.dmg      "release_stage/macos/$(artifact_name athenaeum macos x64 dmg)"
-    - cp target/release/bundle/appimage/*.AppImage                "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage)"
-    - cp target/release/bundle/deb/*.deb                          "release_stage/linux/$(artifact_name athenaeum linux x64 deb)"
-    - cp target/aarch64-apple-darwin/release/bundle/perseus-*-macos-arm64.dmg "release_stage/perseus/$(artifact_name perseus macos arm64 dmg)"
-    - cp target/x86_64-apple-darwin/release/bundle/perseus-*-macos-x64.dmg    "release_stage/perseus/$(artifact_name perseus macos x64 dmg)"
-    - cp crates/perseus/packaging/windows/perseus-*-setup.exe     "release_stage/perseus/$(artifact_name perseus windows x64 exe setup)"
-    - cp target/debian/perseus_*_amd64.deb                        "release_stage/perseus/$(artifact_name perseus linux x64 deb)"
-    - cp target/debian/perseus-*-linux-amd64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux x64 tar.gz)"
-    - cp target/debian/perseus-headless_*_arm64.deb               "release_stage/perseus/$(artifact_name perseus linux arm64 deb)"
-    - cp target/debian/perseus-*-linux-arm64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux arm64 tar.gz)"
+    - cp target/release/bundle/msi/*_${VERSION}_*.msi              "release_stage/windows/$(artifact_name athenaeum windows x64 msi)"
+    - cp target/release/bundle/nsis/*_${VERSION}_*.exe             "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup)"
+    - cp target/aarch64-apple-darwin/release/bundle/dmg/*_${VERSION}_*.dmg "release_stage/macos/$(artifact_name athenaeum macos arm64 dmg)"
+    - cp target/x86_64-apple-darwin/release/bundle/dmg/*_${VERSION}_*.dmg  "release_stage/macos/$(artifact_name athenaeum macos x64 dmg)"
+    - cp target/release/bundle/appimage/*_${VERSION}_*.AppImage    "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage)"
+    - cp target/release/bundle/deb/*_${VERSION}_*.deb              "release_stage/linux/$(artifact_name athenaeum linux x64 deb)"
+    - cp target/aarch64-apple-darwin/release/bundle/perseus-${VERSION}-macos-arm64.dmg "release_stage/perseus/$(artifact_name perseus macos arm64 dmg)"
+    - cp target/x86_64-apple-darwin/release/bundle/perseus-${VERSION}-macos-x64.dmg    "release_stage/perseus/$(artifact_name perseus macos x64 dmg)"
+    - cp crates/perseus/packaging/windows/perseus-${VERSION}-*-setup.exe "release_stage/perseus/$(artifact_name perseus windows x64 exe setup)"
+    - cp target/debian/perseus_${VERSION}-*_amd64.deb              "release_stage/perseus/$(artifact_name perseus linux x64 deb)"
+    - cp target/debian/perseus-${VERSION}-linux-amd64.tar.gz       "release_stage/perseus/$(artifact_name perseus linux x64 tar.gz)"
+    - cp target/debian/perseus-headless_${VERSION}-*_arm64.deb     "release_stage/perseus/$(artifact_name perseus linux arm64 deb)"
+    - cp target/debian/perseus-${VERSION}-linux-arm64.tar.gz       "release_stage/perseus/$(artifact_name perseus linux arm64 tar.gz)"
     # Updater artifacts (in-app updates spec §3.4/§3.5): the macOS app
     # archives and every signature, beside the installers they belong to.
     - cp target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz     "release_stage/macos/$(artifact_name athenaeum macos arm64 app.tar.gz)"
     - cp target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig "release_stage/macos/$(artifact_name athenaeum macos arm64 app.tar.gz).sig"
     - cp target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz      "release_stage/macos/$(artifact_name athenaeum macos x64 app.tar.gz)"
     - cp target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig  "release_stage/macos/$(artifact_name athenaeum macos x64 app.tar.gz).sig"
-    - cp target/release/bundle/nsis/*.exe.sig                              "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup).sig"
-    - cp target/release/bundle/msi/*.msi.sig                               "release_stage/windows/$(artifact_name athenaeum windows x64 msi).sig"
-    - cp target/release/bundle/appimage/*.AppImage.sig                     "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage).sig"
+    - cp target/release/bundle/nsis/*_${VERSION}_*.exe.sig                  "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup).sig"
+    - cp target/release/bundle/msi/*_${VERSION}_*.msi.sig                   "release_stage/windows/$(artifact_name athenaeum windows x64 msi).sig"
+    - cp target/release/bundle/appimage/*_${VERSION}_*.AppImage.sig         "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage).sig"
     # Every inventory line must now exist — a glob that matched nothing above fails here, not on the server.
     - |
       while read -r product os arch ext variant subdir filename alias; do
