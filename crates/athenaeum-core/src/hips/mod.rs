@@ -555,6 +555,7 @@ mod tests {
         let base = serve_status("500 Internal Server Error", "");
         let err = fetch_tile_from(&base, TileFormat::Jpeg, 3, 7).unwrap_err();
         assert!(busy_of(&err).is_none());
+        assert!(format!("{err:#}").contains("HTTP 500"), "{err:#}");
     }
 
     #[test]
