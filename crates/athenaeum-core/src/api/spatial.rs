@@ -222,9 +222,22 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
         })
         .map_err(|e| anyhow!("Failed to query imaging locations: {}", e))?;
 
-    let result: Vec<ImagingLocation> = locations
+    let mut result: Vec<ImagingLocation> = locations
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("Failed to collect results: {}", e))?;
+
+    // A frame set's center and rotation by the same rule as its stored
+    // metadata (`frames_set_metadata::set_pointing`): Black Hole lights left
+    // out, Athenaeum-solved lights preferred, spherical / circular means. The
+    // SQL averages above only stand in for a set this pass cannot place.
+    let pointings = frame_set_pointings(conn)?;
+    for loc in result.iter_mut() {
+        if let Some(p) = loc.frame_set_id.and_then(|id| pointings.get(&id)) {
+            loc.ra = p.ra;
+            loc.dec = p.dec;
+            loc.rotation = p.avg_rotation;
+        }
+    }
 
     tracing::debug!(
         count = result.len(),
@@ -240,6 +253,46 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
     );
 
     Ok(result)
+}
+
+/// Center and rotation of every frame set with located lights.
+fn frame_set_pointings(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<i64, crate::frames_set_metadata::SetPointing>> {
+    use crate::frames_set_metadata::{set_pointing, FramePointing};
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT ino.frames_set_id, fr.id, fr.ra, fr.dec, fr.rotation,
+                    EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = fr.id),
+                    EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fr.file_id)
+             FROM frames fr
+             JOIN session_members sm ON sm.frame_id = fr.id
+             JOIN sessions s ON s.id = sm.session_id
+             JOIN imaging_nights ino ON ino.id = s.imaging_night_id
+             WHERE fr.ra IS NOT NULL AND fr.dec IS NOT NULL AND fr.imagetyp = 'Light'",
+        )
+        .map_err(|e| anyhow!("Failed to prepare frame-set pointing query: {}", e))?;
+    let mut by_set: std::collections::HashMap<i64, Vec<FramePointing>> = std::collections::HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            FramePointing {
+                ra: row.get(2)?,
+                dec: row.get(3)?,
+                rotation: row.get(4)?,
+                solved: row.get(5)?,
+                in_black_hole: row.get(6)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (set_id, p) = row?;
+        by_set.entry(set_id).or_default().push(p);
+    }
+    Ok(by_set
+        .into_iter()
+        .filter_map(|(id, frames)| set_pointing(&frames).map(|p| (id, p)))
+        .collect())
 }
 
 /// Query candidate frames within a rectangular region of the sky
@@ -381,6 +434,63 @@ mod tests {
         assert_eq!(loc.object_name.as_deref(), Some("M31"));
         assert!((loc.ra - 10.01).abs() < 1e-6, "ra averaged: {}", loc.ra);
         assert!(loc.fov_width.is_some(), "FOV computed from sensor metadata");
+    }
+
+    /// A frame set's center and rotation on the chart follow the stored
+    /// metadata's rule: Black Hole lights out, Athenaeum-solved lights win
+    /// over a header's mount coordinates and its other-sign rotation.
+    #[test]
+    fn frame_set_location_prefers_solved_lights_outside_the_black_hole() {
+        let conn = test_db();
+        // Two solved lights on M 31, an unsolved one with the mount's
+        // coordinates 0.6° off and a header rotation of the other sign, and a
+        // solved one in the Black Hole far away.
+        insert_light(&conn, 1, "M31", "2026-03-05T22:10:00", 10.67, 41.10, 300.0);
+        insert_light(&conn, 2, "M31", "2026-03-05T22:20:00", 10.68, 41.11, 300.0);
+        insert_light(&conn, 3, "M31", "2026-03-05T22:30:00", 11.30, 40.60, 300.0);
+        insert_light(&conn, 4, "M31", "2026-03-05T22:40:00", 20.00, 30.00, 300.0);
+        for (id, rot) in [(1, 283.5), (2, 283.4), (3, 76.1), (4, 283.5)] {
+            conn.execute("UPDATE frames SET rotation = ?1 WHERE id = ?2", params![rot, id]).unwrap();
+        }
+        for id in [1, 2, 4] {
+            conn.execute(
+                "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                     matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                     field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at)
+                 VALUES (?1, 0, 0, 0, 0, 1, 0, 0, 1, 10, 10, 0.1, 0.1, 1.0, 0, 1, 't', 't', '2026-03-06')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path) VALUES (4, 'test', '2026-03-06', '/x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (1, 1, 'a', 'b')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'TestCam')", []).unwrap();
+        for id in 1..=4 {
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (1, ?1)", [id]).unwrap();
+        }
+
+        let locations = get_imaging_locations(&conn).unwrap();
+        let set = locations.iter().find(|l| l.frame_set_id == Some(1)).expect("the set is located");
+        assert!((set.ra - 10.675).abs() < 1e-3, "ra from the solved lights: {}", set.ra);
+        assert!((set.dec - 41.105).abs() < 1e-3, "dec from the solved lights: {}", set.dec);
+        let rot = set.rotation.unwrap();
+        assert!((rot - 283.45).abs() < 1e-6, "rotation from the solved lights only: {rot}");
+
+        // The stored metadata reads the same.
+        let m = crate::frames_set_metadata::calculate_metadata_for_frame_set(1, &conn).unwrap();
+        assert!(m.pointing_solved);
+        assert_eq!(m.pointing_frames, 2);
+        assert!((m.avg_rotation.unwrap() - 283.45).abs() < 1e-6);
+        assert!((m.min_rotation.unwrap() - 283.4).abs() < 1e-9 && (m.max_rotation.unwrap() - 283.5).abs() < 1e-9);
     }
 
     #[test]

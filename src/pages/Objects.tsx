@@ -1206,7 +1206,7 @@ export default function Objects() {
                   <span className="flex items-center gap-0.5 font-mono">
                     <RotateCw size={10} />
                     {frames_set.min_rotation != null && frames_set.max_rotation != null &&
-                     Math.abs(frames_set.max_rotation - frames_set.min_rotation) >= 1
+                     ((frames_set.max_rotation - frames_set.min_rotation + 360) % 360) >= 1
                       ? `${frames_set.min_rotation.toFixed(0)}°–${frames_set.max_rotation.toFixed(0)}°`
                       : `${frames_set.avg_rotation.toFixed(0)}°`
                     }

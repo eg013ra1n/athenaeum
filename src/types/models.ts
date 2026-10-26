@@ -160,6 +160,16 @@ export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNight
 
 export type ReconcileSummary = { changed: boolean, nights: number, sessions: number, };
 
+export type FrameSetPointingUpdate = { objctra: string | null, objctdec: string | null, avgRotation: number | null, minRotation: number | null, maxRotation: number | null, 
+/**
+ * Lights the values were taken from.
+ */
+lightsUsed: number, 
+/**
+ * True when those lights are all plate-solved by Athenaeum.
+ */
+solved: boolean, };
+
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
 
 export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, 

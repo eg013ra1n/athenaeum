@@ -138,7 +138,7 @@ The UI offers this as a mouse-driven drag of one set card onto another on the Ob
 Set metadata is calculated from member frames (`frames_set_metadata`):
 
 - **date_obs_start / date_obs_end:** earliest and latest frame DATE-OBS
-- **objctra, objctdec:** spherical mean of the member coordinates
+- **objctra, objctdec and rotation (the set's pointing):** one rule, `frames_set_metadata::set_pointing`, shared with the Sky Chart (`api::spatial::get_imaging_locations`) — see **Pointing** below
 - **total_exp_time:** sum of exposure times. The stored column is refreshed by merge / re-derive only, so the
   listing (`get_frames_sets_by_project`, which feeds the Objects cards, the table and the set header) reads the
   members' live sum instead (`db::frame_set_member_exposure_sql`) — the same membership its frame count reads. A set
@@ -151,7 +151,20 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
   apart) and the Stacking tab's frame list — the same `db::FRAME_NOT_IN_BLACK_HOLE_SQL` predicate stacking, export,
   the send and the readiness count use. Set 182 (164 lights, 25 blackholed) reads 139 everywhere. Restoring the
   file brings the light back.
-- rotation: circular mean plus min/max of the member rotations
+
+### Pointing: center and rotation (2026-10-26)
+
+- **Which lights.**
+  - Lights in the Black Hole are left out; all of them count only when every light is there.
+  - When any remaining light has an Athenaeum plate solve (a `plate_solves` row), **only the solved lights count**.
+    - A solved light's `ra`/`dec` is the image center: the solver's CRPIX is the image center.
+    - Its `rotation` is atan2(−CD1_2, CD2_2).
+- **Why solved lights only.** An unsolved light carries the mount's or the target's header coordinates, and a rotation from another program, possibly in the other sign convention.
+  - An M 31 set on the dev catalog showed `76.1° – 283.5°`: a header 76.1° beside the solve's 283.5° for the same framing. The two averaged to ≈ 0°, and the Sky Chart drew the box unrotated.
+- **Math.** The center is the spherical mean. The rotation is the circular mean; min / max are the extreme circular deviations from it, so 359° and 1° read `359° – 1°`, not `1° – 359°`. The UI tests the spread circularly too.
+- **Where it runs.** Set creation, merge, split and "Recalculate nights" store it.
+- **The refresh button beside the coordinates** on the object page (`recompute_frame_set_coordinates`, both hosts) re-applies it to the stored center and rotation only. It exists because a plate solve run does not touch the set's stored pointing. Nights, dates and hours are untouched; the info log is `"frame set coordinates recomputed"` with `frame_set_id`, `count` and `solved_only`.
+- **The Sky Chart** computes it live for every set, so the map is right before anyone presses refresh.
 
 **Why spherical mean?** Simple averaging fails near the RA wrap: RA 359 and RA 1 average to 180 degrees, while the spherical mean is 0.
 

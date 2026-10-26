@@ -146,6 +146,19 @@ pub async fn merge_frame_sets(
     get_frame_set_detail(target_id, state).await
 }
 
+/// Recompute this set's center and rotation from its lights (Black Hole
+/// lights left out, Athenaeum-solved lights preferred) — the refresh button
+/// beside the coordinates on the object page.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn recompute_frame_set_coordinates(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::api::frame_sets::FrameSetPointingUpdate, String> {
+    athenaeum_core::api::frame_sets::recompute_frame_set_coordinates(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
+}
+
 /// Re-derive this set's nights and sessions from its member frames — the
 /// repair for a set an older merge left with one night stored as two rows.
 #[tauri::command]

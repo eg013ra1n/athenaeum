@@ -302,6 +302,7 @@ pub fn run() {
             commands::find_new_frames_for_set,
             commands::auto_merge_new_frames_for_set,
             commands::recalculate_frame_set_nights,
+            commands::recompute_frame_set_coordinates,
             commands::reconcile_frame_set_nights,
             commands::get_frame_set_merge_log,
             commands::set_frame_set_attestation,

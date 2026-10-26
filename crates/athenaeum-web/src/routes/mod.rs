@@ -128,6 +128,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/find_new_frames_for_set", post(frame_sets::find_new_frames_for_set))
         .route("/api/auto_merge_new_frames_for_set", post(frame_sets::auto_merge_new_frames_for_set))
         .route("/api/recalculate_frame_set_nights", post(frame_sets::recalculate_frame_set_nights))
+        .route("/api/recompute_frame_set_coordinates", post(frame_sets::recompute_frame_set_coordinates))
         .route("/api/reconcile_frame_set_nights", post(frame_sets::reconcile_frame_set_nights))
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         .route("/api/set_frame_set_attestation", post(frame_sets::set_frame_set_attestation))

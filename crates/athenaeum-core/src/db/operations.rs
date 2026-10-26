@@ -2789,6 +2789,26 @@ pub fn update_frames_set_metadata(
     Ok(())
 }
 
+/// Write only a frame set's center and rotation (the "refresh coordinates"
+/// action); dates, hours and the custom flag stay as they are. Returns the
+/// rows updated (0 for an unknown set).
+pub fn update_frames_set_pointing(
+    conn: &Connection,
+    id: i64,
+    objctra: Option<&str>,
+    objctdec: Option<&str>,
+    avg_rotation: Option<f64>,
+    min_rotation: Option<f64>,
+    max_rotation: Option<f64>,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE frames_set
+         SET objctra = ?1, objctdec = ?2, avg_rotation = ?3, min_rotation = ?4, max_rotation = ?5
+         WHERE id = ?6",
+        params![objctra, objctdec, avg_rotation, min_rotation, max_rotation, id],
+    )
+}
+
 /// Set the archived status of a frames_set
 pub fn set_frame_set_archived(conn: &Connection, id: i64, archived: bool) -> Result<()> {
     let archived_int = if archived { 1 } else { 0 };
