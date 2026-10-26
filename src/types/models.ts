@@ -212,6 +212,43 @@ license: string,
  */
 online: boolean, cachedTiles: number, cachedBytes: number, };
 
+export type HipsPackEstimate = { total: number, 
+/**
+ * Tiles already stored (images or 404 markers).
+ */
+present: number, missing: number, bytesPerTile: number, 
+/**
+ * `missing * bytes_per_tile`.
+ */
+estimatedBytes: number, freeBytes: number | null, 
+/**
+ * The download plus a 512 MiB reserve fits the free space (true when the
+ * free space is unknown).
+ */
+fits: boolean, };
+
+export type PackSelection = { surveyId: string, 
+/**
+ * Whole-sky order, 0..=5.
+ */
+skyOrder: number, aroundLocations: boolean, aroundMessier: boolean, aroundNgcIc: boolean, };
+
+export type PackState = "idle" | "running" | "cancelling" | "done" | "cancelled" | "failed" | "interrupted";
+
+export type PackProgress = { state: PackState, selection: PackSelection | null, total: number, 
+/**
+ * Tiles already on disk when the run started.
+ */
+present: number, fetched: number, 
+/**
+ * Tiles the master answered 404 for (no coverage).
+ */
+absent: number, failed: number, bytesFetched: number, 
+/**
+ * Seconds the survey asked us to wait, while at least one worker waits.
+ */
+waitingS: number | null, error: string | null, };
+
 export type CalibrationLink = { id: number | null, source_id: number, source_type: string, calibration_set_id: number, calibration_type: string, matched_at: string, match_score: number | null, date_warning: boolean, temp_warning: boolean, is_manual_override: boolean, };
 
 export type FrameCalibrationStatus = { frame_id: number, has_flats: boolean, has_darks: boolean, has_bias: boolean, has_darkflats: boolean, flats_warning: boolean, darks_warning: boolean, bias_warning: boolean, flat_set_id: number | null, dark_set_id: number | null, bias_set_id: number | null, darkflat_set_id: number | null, };

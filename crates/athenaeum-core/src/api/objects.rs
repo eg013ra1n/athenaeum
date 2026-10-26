@@ -33,7 +33,7 @@ pub fn resolve_object_name(ctx: &ServiceContext, name: String) -> Option<Resolve
 ///
 /// Mirrors how the plate-solve batch obtains it: parsed once (~3 MB of JSON)
 /// and shared, never per call.
-fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
+pub(crate) fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
     if let Some(cat) = ctx.dso_catalog.read().ok()?.as_ref() {
         return Some(cat.clone());
     }
