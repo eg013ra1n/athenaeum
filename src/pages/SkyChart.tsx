@@ -64,6 +64,15 @@ export default function SkyChart() {
 
   const navigate = useNavigate();
   const sky = useSkyBackground(mapReady);
+  const skyStatusText = !sky.survey
+    ? ''
+    : !sky.survey.online
+      ? 'Offline: cached tiles only'
+      : sky.status && sky.status.loading > 0
+        ? `Loading sky tiles… ${sky.status.drawn}/${sky.status.wanted}`
+        : sky.status && sky.status.failed > 0
+          ? `${sky.status.failed} sky tiles unavailable`
+          : '';
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Attach the chart host before any other effect runs: useSvgOverlay looks
@@ -477,14 +486,15 @@ export default function SkyChart() {
             <span className="bg-surface/70 px-1.5 py-0.5 rounded pointer-events-auto">
               {sky.survey.label}: {sky.survey.attribution} · {sky.survey.license}
             </span>
-            <span className="bg-surface/70 px-1.5 py-0.5 rounded">
-              {!sky.survey.online
-                ? 'Offline: cached tiles only'
-                : sky.status && sky.status.loading > 0
-                  ? `Loading sky tiles… ${sky.status.drawn}/${sky.status.wanted}`
-                  : sky.status && sky.status.failed > 0
-                    ? `${sky.status.failed} sky tiles unavailable`
-                    : ''}
+            <span className="bg-surface/70 px-1.5 py-0.5 rounded pointer-events-auto">
+              {skyStatusText}
+              {skyStatusText && ' · '}
+              <button
+                onClick={() => navigate('/settings?tab=general&section=general.skyBackground')}
+                className="text-accent hover:underline"
+              >
+                Download for offline…
+              </button>
             </span>
           </div>
         )}
