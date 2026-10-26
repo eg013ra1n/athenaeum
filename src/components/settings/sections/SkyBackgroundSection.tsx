@@ -9,6 +9,7 @@ import { useHipsPack } from '../../../hooks/useHipsPack';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import { fieldMeta } from '../../../settings/registry';
 import { ConfirmDialog } from '../../ConfirmDialog';
+import { Checkbox } from '../Checkbox';
 import { SettingsSection } from '../SettingsSection';
 import { SettingToggle } from '../SettingToggle';
 
@@ -32,18 +33,23 @@ function PackControls({ survey, onFinished }: { survey: HipsSurveyInfo; onFinish
   const blocked = estimate === null || !estimate.fits || nothingToDo;
   const done = progress ? progress.present + progress.fetched + progress.absent + progress.failed : 0;
   const pct = progress && progress.total > 0 ? Math.min(100, (done / progress.total) * 100) : 0;
+  const saved = progress?.selection;
+  const sameSelection = saved != null
+    && saved.surveyId === selection.surveyId
+    && saved.skyOrder === selection.skyOrder
+    && saved.aroundLocations === selection.aroundLocations
+    && saved.aroundMessier === selection.aroundMessier
+    && saved.aroundNgcIc === selection.aroundNgcIc;
   const showProgress = progress !== null && state !== 'idle' && progress.total > 0;
 
   const checkbox = (key: 'aroundLocations' | 'aroundMessier' | 'aroundNgcIc', label: string) => (
-    <label className="flex items-center gap-2 text-xs text-content-secondary">
-      <input
-        type="checkbox"
-        checked={selection[key]}
-        disabled={active}
-        onChange={(e) => setSelection({ ...selection, [key]: e.target.checked })}
-      />
-      {label}
-    </label>
+    <Checkbox
+      size="sm"
+      checked={selection[key]}
+      disabled={active}
+      onChange={(checked) => setSelection({ ...selection, [key]: checked })}
+      label={label}
+    />
   );
 
   return (
@@ -53,7 +59,7 @@ function PackControls({ survey, onFinished }: { survey: HipsSurveyInfo; onFinish
         <p className="text-xs text-content-muted">{meta.help}</p>
       </div>
       <label className="flex items-center gap-2 text-xs text-content-secondary">
-        Whole sky, order
+        Whole sky detail
         <select
           value={selection.skyOrder}
           disabled={active}
@@ -71,12 +77,12 @@ function PackControls({ survey, onFinished }: { survey: HipsSurveyInfo; onFinish
         {checkbox('aroundNgcIc', 'Detail around NGC/IC brighter than 10ᵐ')}
       </div>
       {estimate && (
-        <p className={`text-xs ${estimate.fits ? 'text-content-muted' : 'text-error'}`}>
+        <p className={`text-xs ${estimate.fits || nothingToDo ? 'text-content-muted' : 'text-error'}`}>
           {nothingToDo
             ? 'Everything selected is already on this computer.'
             : `${estimate.missing.toLocaleString()} tiles to download, about ${formatBytes(estimate.estimatedBytes)}${
                 estimate.freeBytes === null ? '' : `; ${formatBytes(estimate.freeBytes)} free`
-              }`}
+              }${estimate.fits ? '' : ' — not enough space (512 MB is kept free)'}`}
         </p>
       )}
       {showProgress && (
@@ -107,7 +113,7 @@ function PackControls({ survey, onFinished }: { survey: HipsSurveyInfo; onFinish
             disabled={blocked}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-surface-hover text-content-secondary hover:text-content disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {resumable ? 'Resume' : 'Download'}
+            {resumable && sameSelection ? 'Resume' : 'Download'}
           </button>
         )}
       </div>

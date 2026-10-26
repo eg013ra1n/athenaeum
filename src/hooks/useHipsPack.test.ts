@@ -45,6 +45,9 @@ function wire(statusReply: PackProgress) {
   }) as never);
 }
 
+const defaultSel = () => (
+  { surveyId: SURVEY, skyOrder: 4, aroundLocations: true, aroundMessier: true, aroundNgcIc: false });
+
 const estimateCalls = () => invokeMock.mock.calls.filter((c) => c[0] === 'estimate_hips_pack');
 
 describe('useHipsPack', () => {
@@ -101,21 +104,114 @@ describe('useHipsPack', () => {
     await waitFor(() => expect(estimateCalls().length).toBe(2));
   });
 
-  it('cancel shows cancelling locally and survives a NotFound from the backend', async () => {
-    wire(status({ state: 'running', selection: { surveyId: SURVEY, skyOrder: 4, aroundLocations: true, aroundMessier: true, aroundNgcIc: false }, total: 9 }));
+  it('cancel shows cancelling locally until the terminal event', async () => {
+    const sel = { surveyId: SURVEY, skyOrder: 4, aroundLocations: true, aroundMessier: true, aroundNgcIc: false };
+    wire(status({ state: 'running', selection: sel, total: 9 }));
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(result.current.progress?.state).toBe('running'));
+    await act(async () => { await result.current.cancel(); });
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'cancel_hips_pack')).toBe(true);
+    expect(result.current.progress?.state).toBe('cancelling');
+    act(() => handlers['hips-download-progress'](status({ state: 'running', selection: sel, total: 9 })));
+    expect(result.current.progress?.state).toBe('cancelling');
+    act(() => handlers['hips-download-progress'](status({ state: 'cancelled', selection: sel, total: 9 })));
+    expect(result.current.progress?.state).toBe('cancelled');
+  });
+
+  it('cancel answered NotFound re-reads the status and never sticks on cancelling', async () => {
+    const sel = { surveyId: SURVEY, skyOrder: 4, aroundLocations: true, aroundMessier: true, aroundNgcIc: false };
+    let statusCalls = 0;
+    wire(status());
     invokeMock.mockImplementation(((cmd: string) => {
       if (cmd === 'cancel_hips_pack') return Promise.reject('not found');
-      if (cmd === 'get_hips_pack_status') return Promise.resolve(status({ state: 'running', selection: { surveyId: SURVEY, skyOrder: 4, aroundLocations: true, aroundMessier: true, aroundNgcIc: false }, total: 9 }));
+      if (cmd === 'get_hips_pack_status') {
+        statusCalls += 1;
+        return Promise.resolve(status({ state: statusCalls === 1 ? 'running' : 'cancelled', selection: sel, total: 9 }));
+      }
       return Promise.resolve(ESTIMATE);
     }) as never);
     const { result } = renderHook(() => useHipsPack(SURVEY));
     await waitFor(() => expect(result.current.progress?.state).toBe('running'));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
     await act(async () => { await result.current.cancel(); });
-    expect(result.current.progress?.state).toBe('cancelling');
-    act(() => handlers['hips-download-progress'](status({ state: 'running', selection: result.current.selection, total: 9 })));
-    expect(result.current.progress?.state).toBe('cancelling');
-    act(() => handlers['hips-download-progress'](status({ state: 'cancelled', selection: result.current.selection, total: 9 })));
+    expect(statusCalls).toBe(2);
     expect(result.current.progress?.state).toBe('cancelled');
+    // A later running event is not rewritten to "cancelling" either.
+    act(() => handlers['hips-download-progress'](status({ state: 'running', selection: sel, total: 9 })));
+    expect(result.current.progress?.state).toBe('running');
+    await waitFor(() => expect(estimateCalls().length).toBe(2));
+  });
+
+  it('a start response that arrives after a failed event does not rewind it', async () => {
+    wire(status());
+    let resolveStart: (p: PackProgress) => void = () => {};
+    const base = invokeMock.getMockImplementation() as (cmd: string) => Promise<unknown>;
+    invokeMock.mockImplementation(((cmd: string) => {
+      if (cmd === 'start_hips_pack') return new Promise<PackProgress>((r) => { resolveStart = r; });
+      return base(cmd);
+    }) as never);
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    const sel = result.current.selection;
+    let started: Promise<void> = Promise.resolve();
+    act(() => { started = result.current.start(); });
+    act(() => handlers['hips-download-progress'](status({ state: 'failed', selection: sel, error: 'offline' })));
+    expect(result.current.progress?.state).toBe('failed');
+    await act(async () => {
+      resolveStart(status({ state: 'running', selection: sel, total: 5 }));
+      await started;
+    });
+    expect(result.current.progress?.state).toBe('failed');
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a start response with no event in between is applied', async () => {
+    wire(status());
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    const sel = result.current.selection;
+    const base = invokeMock.getMockImplementation() as (cmd: string) => Promise<unknown>;
+    invokeMock.mockImplementation(((cmd: string) => (
+      cmd === 'start_hips_pack' ? Promise.resolve(status({ state: 'running', selection: sel, total: 5 })) : base(cmd)
+    )) as never);
+    await act(async () => { await result.current.start(); });
+    expect(result.current.progress?.state).toBe('running');
+  });
+
+  it('a mount status read that resolves after a terminal event does not rewind it', async () => {
+    wire(status());
+    let resolveStatus: (p: PackProgress) => void = () => {};
+    const base = invokeMock.getMockImplementation() as (cmd: string) => Promise<unknown>;
+    invokeMock.mockImplementation(((cmd: string) => (
+      cmd === 'get_hips_pack_status' ? new Promise<PackProgress>((r) => { resolveStatus = r; }) : base(cmd)
+    )) as never);
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(handlers['hips-download-progress']).toBeDefined());
+    const sel = defaultSel();
+    act(() => handlers['hips-download-progress'](status({ state: 'done', selection: sel, total: 5 })));
+    await act(async () => { resolveStatus(status({ state: 'running', selection: sel, total: 5 })); });
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    expect(result.current.progress?.state).toBe('done');
+  });
+
+  it('a remount with a stored failed status raises no notification', async () => {
+    const sel = defaultSel();
+    wire(status({ state: 'failed', selection: sel, total: 5, error: 'disk full' }));
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(result.current.progress?.state).toBe('failed'));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    expect(result.current.progress?.error).toBe('disk full');
+    expect(notifyMock).not.toHaveBeenCalled();
+  });
+
+  it('start after a restored interrupted status sends the restored selection', async () => {
+    const selection = { surveyId: SURVEY, skyOrder: 2, aroundLocations: false, aroundMessier: true, aroundNgcIc: true };
+    wire(status({ state: 'interrupted', selection, total: 100, present: 40 }));
+    const { result } = renderHook(() => useHipsPack(SURVEY));
+    await waitFor(() => expect(estimateCalls().length).toBe(1));
+    await act(async () => { await result.current.start(); });
+    const call = invokeMock.mock.calls.find((c) => c[0] === 'start_hips_pack');
+    expect(call?.[1]).toEqual({ selection });
   });
 
   it('listener is registered once under StrictMode double mount', async () => {
