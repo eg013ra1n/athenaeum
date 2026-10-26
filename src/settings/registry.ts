@@ -209,6 +209,12 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         help: 'Credit, license and the space the stored tiles take. Clear deletes a survey\'s tiles.',
         keywords: ['hips', 'dss colored', 'cache', 'tiles', 'clear', 'attribution', 'license'],
       },
+      {
+        id: 'pack',
+        label: 'Offline pack',
+        help: 'Download the sky ahead of time for use without internet. Tiles stay on this computer.',
+        keywords: ['offline', 'download', 'pack', 'hips', 'messier', 'ngc', 'field'],
+      },
     ],
   },
   {
