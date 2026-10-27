@@ -95,8 +95,9 @@ pub struct BatchArgs {
     pub frame_ids: Vec<i64>,
 }
 
+// snake_case on the wire, like the Tauri command: the UI reads `frame_id`,
+// `matched_stars`, `total_time_ms`, ...
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct PlateSolveProgressEvent {
     frame_id: i64,
     current: usize,
@@ -113,7 +114,6 @@ struct PlateSolveProgressEvent {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct PlateSolveCompleteEvent {
     solved: usize,
     failed: usize,
@@ -209,6 +209,7 @@ pub async fn plate_solve_batch(
                         work_items.push(WorkItem::LoadFailed {
                             frame_id: *frame_id,
                             error: reason,
+                            filename: Some(file_name_of(&file_path)),
                         });
                         continue;
                     }
@@ -239,6 +240,7 @@ pub async fn plate_solve_batch(
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: msg,
+                        filename: None,
                     });
                 }
                 Err(e) => {
@@ -247,6 +249,7 @@ pub async fn plate_solve_batch(
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: msg,
+                        filename: None,
                     });
                 }
             }
@@ -292,14 +295,11 @@ pub async fn plate_solve_batch(
                             let Some(item) = work.lock().unwrap().next() else { break };
 
                             let outcome = match item {
-                                WorkItem::LoadFailed { frame_id, error } => {
-                                    WorkResult::Failed { frame_id, error, code: None, filename: None }
+                                WorkItem::LoadFailed { frame_id, error, filename } => {
+                                    WorkResult::Failed { frame_id, error, code: None, filename }
                                 }
                                 WorkItem::Ready { frame_id, frame, file_path, hints } => {
-                                    let filename = std::path::Path::new(&file_path)
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| file_path.clone());
+                                    let filename = file_name_of(&file_path);
 
                                     let done_so_far = completed.load(Ordering::Relaxed);
                                     let _ = event_tx.send(SseEvent {
@@ -515,6 +515,14 @@ pub async fn plate_solve_batch(
     Ok(Json(()))
 }
 
+/// The frame's file name for UI labels (the full path when it has none).
+fn file_name_of(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string())
+}
+
 /// Work item passed from the main (DB) thread to parallel workers.
 enum WorkItem {
     Ready {
@@ -526,6 +534,8 @@ enum WorkItem {
     LoadFailed {
         frame_id: i64,
         error: String,
+        /// Known when the frame loaded but was refused before solving.
+        filename: Option<String>,
     },
 }
 

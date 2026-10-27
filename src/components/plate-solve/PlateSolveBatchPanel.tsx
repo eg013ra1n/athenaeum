@@ -1,7 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle, Loader2, ScanSearch, XCircle } from 'lucide-react';
 import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressContext';
-import { useSmoothedPercent } from '../../hooks/useSmoothedPercent';
 
 export interface PlateSolveBatchPanelProps {
   /** All frame IDs shown in the current coordinates-missing list. Optional when the panel is driven imperatively. */
@@ -50,7 +49,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   const isActive = myBatch != null && !myBatch.isComplete;
   const isCancelling = myBatch?.isCancelling ?? false;
   const progress = myBatch?.progress ?? null;
-  const currentFrameId = myBatch?.currentFrameId ?? null;
+  const currentFilename = myBatch?.currentFilename ?? null;
   const completedSummary = myBatch?.isComplete ? myBatch.summary : null;
   const completedError = myBatch?.isComplete ? myBatch.errorMessage : null;
   const frameStatuses = myBatch?.frameStatuses ?? new Map();
@@ -84,9 +83,6 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
     [enqueuePlateSolve],
   );
 
-  // Show numeric frame id while solving; parents can enrich later.
-  const currentLabel = currentFrameId != null ? `Frame #${currentFrameId}` : null;
-
   const solvedCount = Array.from(frameStatuses.values()).filter(
     (s) => s.kind === 'solved',
   ).length;
@@ -109,12 +105,10 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
     }
   }
 
-  const progressFraction =
-    progress && progress.total > 0 ? progress.current / progress.total : 0;
-  const smoothedPercent = useSmoothedPercent(
-    progressFraction * 100,
-    progress?.total ?? 0,
-  );
+  // Frames finished out of the batch, nothing estimated: several workers
+  // solve at once and a frame takes from under a second to minutes.
+  const percent =
+    progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
 
   return (
     <div className="space-y-3">
@@ -163,11 +157,11 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
           <div className="flex items-center justify-between gap-3 text-sm">
             <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
               <Loader2 size={14} className="animate-spin flex-shrink-0 text-violet-400" />
-              <span className="truncate">
+              <span className="truncate" title={currentFilename ?? undefined}>
                 {isCancelling
                   ? 'Cancelling...'
-                  : currentLabel
-                  ? `Solving ${currentLabel}`
+                  : currentFilename
+                  ? `Solving ${currentFilename}`
                   : 'Preparing...'}
               </span>
             </div>
@@ -189,8 +183,8 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
 
           <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">
             <div
-              className="h-full rounded-full bg-violet-500 transition-[width] duration-100 ease-linear"
-              style={{ width: `${smoothedPercent}%` }}
+              className="h-full rounded-full bg-violet-500 transition-[width] duration-300 ease-out"
+              style={{ width: `${percent}%` }}
             />
           </div>
 

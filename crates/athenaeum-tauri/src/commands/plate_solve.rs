@@ -184,6 +184,7 @@ pub async fn plate_solve_batch(
                         work_items.push(WorkItem::LoadFailed {
                             frame_id: *frame_id,
                             error: reason,
+                            filename: Some(file_name_of(&file_path)),
                         });
                         continue;
                     }
@@ -215,6 +216,7 @@ pub async fn plate_solve_batch(
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: e,
+                        filename: None,
                     });
                 }
                 Err(e) => {
@@ -223,6 +225,7 @@ pub async fn plate_solve_batch(
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: e,
+                        filename: None,
                     });
                 }
             }
@@ -266,14 +269,11 @@ pub async fn plate_solve_batch(
                     tracing::trace!(cancelled = cancel_worker.load(Ordering::Relaxed), "plate solve worker picked a frame");
 
                     let outcome = match item {
-                        WorkItem::LoadFailed { frame_id, error } => {
-                            WorkResult::Failed { frame_id, error, code: None, filename: None }
+                        WorkItem::LoadFailed { frame_id, error, filename } => {
+                            WorkResult::Failed { frame_id, error, code: None, filename }
                         }
                         WorkItem::Ready { frame_id, frame, file_path, hints } => {
-                            let filename = std::path::Path::new(&file_path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| file_path.clone());
+                            let filename = file_name_of(&file_path);
 
                             // Emit "solving" as the worker picks up the frame
                             // so the UI shows forward progress even on slow solves.
@@ -491,6 +491,14 @@ pub async fn plate_solve_batch(
     Ok(())
 }
 
+/// The frame's file name for UI labels (the full path when it has none).
+fn file_name_of(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string())
+}
+
 /// Work item passed from the main (DB) thread to parallel workers.
 enum WorkItem {
     Ready {
@@ -502,6 +510,8 @@ enum WorkItem {
     LoadFailed {
         frame_id: i64,
         error: String,
+        /// Known when the frame loaded but was refused before solving.
+        filename: Option<String>,
     },
 }
 

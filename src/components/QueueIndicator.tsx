@@ -6,14 +6,12 @@ export interface QueueIndicatorProps {
   icon: LucideIcon;
   active: boolean;
   label: string; // already-resolved display name
-  percent: number; // 0-100, already smoothed if the caller smooths
+  percent: number; // 0-100
   current?: number;
   total?: number;
   queueLength: number;
   cancelTitle: string;
   onCancelAll: () => void;
-  /** 'linear' = plate-solve's JS-smoothed bar; 'smooth' = default CSS transition */
-  barTransition?: 'smooth' | 'linear';
 }
 
 export function QueueIndicator({
@@ -27,14 +25,11 @@ export function QueueIndicator({
   queueLength,
   cancelTitle,
   onCancelAll,
-  barTransition = 'smooth',
 }: QueueIndicatorProps) {
   if (!active) return null;
 
   const pendingCount = queueLength > 1 ? queueLength - 1 : 0;
   const hasProgress = current !== undefined && total !== undefined;
-  const barTransitionClass =
-    barTransition === 'linear' ? 'transition-[width] duration-100 ease-linear' : 'transition-all duration-300';
 
   if (collapsed) {
     return (
@@ -51,7 +46,7 @@ export function QueueIndicator({
           )}
         </div>
         <div className="w-full bg-surface-hover rounded-full h-1">
-          <div className={`bg-accent h-1 rounded-full ${barTransitionClass}`} style={{ width: `${percent}%` }} />
+          <div className="bg-accent h-1 rounded-full transition-all duration-300" style={{ width: `${percent}%` }} />
         </div>
       </div>
     );
@@ -74,7 +69,7 @@ export function QueueIndicator({
           </button>
         </div>
         <div className="w-full bg-surface-hover rounded-full h-1.5 mb-1">
-          <div className={`bg-accent h-1.5 rounded-full ${barTransitionClass}`} style={{ width: `${percent}%` }} />
+          <div className="bg-accent h-1.5 rounded-full transition-all duration-300" style={{ width: `${percent}%` }} />
         </div>
         <div className="flex items-center justify-between text-[10px] text-content-muted">
           <span>{hasProgress ? `${current}/${total}` : 'Starting...'}</span>

@@ -31,7 +31,8 @@ export interface ActivePlateSolveBatch {
   label: string;
   frameIds: number[];
   progress: { current: number; total: number } | null;
-  currentFrameId: number | null;
+  /** File name of the frame a worker most recently picked up. */
+  currentFilename: string | null;
   frameStatuses: Map<number, FrameSolveStatus>;
   isComplete: boolean;
   isCancelling: boolean;
@@ -68,6 +69,8 @@ export function usePlateSolveQueue() {
   // Backend only runs one plate-solve batch at a time (cancel handle key = 0),
   // so every incoming progress event belongs to the currently-running batch.
   const currentBatchIdRef = useRef<number | null>(null);
+  // Resolves the running batch's wait for `plate-solve-complete`.
+  const completeResolveRef = useRef<(() => void) | null>(null);
 
   /** Mark a batch as completed-with-failure and stash the reason so the panel
    *  banner can show *why* every frame failed. */
@@ -141,8 +144,16 @@ export function usePlateSolveQueue() {
       }
     }
 
+    // The desktop command returns once the batch is done; the web route returns
+    // at once and solves in the background. Both end the batch with
+    // `plate-solve-complete`, so the queue advances on that event, not on the
+    // response — advancing early would drop every later progress event.
+    const completed = new Promise<void>((resolve) => {
+      completeResolveRef.current = resolve;
+    });
     try {
       await api.invoke<void>('plate_solve_batch', { frameIds: next.frameIds });
+      await completed;
     } catch (err) {
       console.error(`Plate solve batch ${next.batchId} failed:`, err);
       const message = String(err);
@@ -156,6 +167,7 @@ export function usePlateSolveQueue() {
       failBatch(next.batchId, next.frameIds.length, message);
     }
 
+    completeResolveRef.current = null;
     processingRef.current = false;
     currentBatchIdRef.current = null;
     setQueue(q => q.slice(1));
@@ -202,11 +214,18 @@ export function usePlateSolveQueue() {
                 filename: payload.filename,
               });
             }
+            // Workers run in parallel and a "solving" event carries the count
+            // read before it started, so it can arrive after a newer "solved"
+            // one: never let the counter step back.
+            const current = Math.max(entry.progress?.current ?? 0, payload.current);
             const updated = new Map(prev);
             updated.set(batchId, {
               ...entry,
-              progress: { current: payload.current, total: payload.total },
-              currentFrameId: payload.frame_id,
+              progress: { current, total: payload.total },
+              currentFilename:
+                payload.status === 'solving'
+                  ? payload.filename ?? entry.currentFilename
+                  : entry.currentFilename,
               frameStatuses,
             });
             return updated;
@@ -250,6 +269,7 @@ export function usePlateSolveQueue() {
             hasErrors: payload.failed > 0,
             tone: payload.failed > 0 ? 'warning' : 'success',
           });
+          completeResolveRef.current?.();
         },
       )
       .then((fn) => { if (cancelled) fn(); else unlistenComplete = fn; })
@@ -277,7 +297,7 @@ export function usePlateSolveQueue() {
           label: resolvedLabel,
           frameIds,
           progress: null,
-          currentFrameId: null,
+          currentFilename: null,
           frameStatuses,
           isComplete: false,
           isCancelling: false,
