@@ -5,8 +5,9 @@
 //! (a 4 KiB buffer streams a whole entry at a few MiB/s over a share). `bytes_read` is counted below
 //! the buffer, so it is what the file system was asked for, not what the caller consumed.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,10 +22,12 @@ pub const EXTRACT_BUF_BYTES: usize = 1024 * 1024;
 
 const FITS_BLOCK: usize = 2880;
 const FITS_CARD: usize = 80;
-/// A FITS header with no END card in this many blocks is not a header.
-const MAX_FITS_HEADER_BLOCKS: usize = 200;
-/// An XISF header declaring more than this is refused rather than allocated.
-const MAX_XISF_HEADER_BYTES: usize = 16 * 1024 * 1024;
+/// The disk parser reads a FITS header until END or EOF with no cap; the zip pass keeps a safety cap
+/// of the same size as the XISF one so a header with no END cannot grow without bound.
+const MAX_FITS_HEADER_BYTES: usize = 64 * 1024 * 1024;
+/// An XISF header declaring more than this is refused rather than allocated (the disk parser's cap,
+/// `fits_parser::xisf_prelude_header_len`).
+const MAX_XISF_HEADER_BYTES: usize = 64 * 1024 * 1024;
 const FRAME_EXTENSIONS: [&str; 4] = ["fits", "fit", "fts", "xisf"];
 
 /// One non-skipped entry of a zip's directory.
@@ -47,7 +50,7 @@ pub struct ZipEntryInfo {
 pub struct ZipListing {
     pub entries: Vec<ZipEntryInfo>,
     /// Entries that are not listed, with why: `"unsafe name"`, `"appledouble"`, `"nested zip"`,
-    /// `"encrypted"`, `"unreadable"`. Directories are not entries and are not reported.
+    /// `"encrypted"`, `"unsupported method"` (neither stored nor deflated), `"unreadable"`. Directories are not entries and are not reported.
     pub skipped: Vec<(String, &'static str)>,
     /// Bytes pulled from the zip file for this listing.
     pub bytes_read: u64,
@@ -91,17 +94,26 @@ fn open_archive(zip: &Path, buf_bytes: usize) -> Result<(Archive, Arc<AtomicU64>
     Ok((archive, bytes))
 }
 
-/// `true` when `name` can be joined under a directory without leaving it: not empty, no NUL, not
-/// absolute (`/x`, `\x`, `C:x`), and no `..` component (split on both `/` and `\`).
+/// Windows device names: a component whose stem (up to the first dot) is one of these, in any case
+/// and with any extension, opens a device instead of a file.
+fn is_reserved_device_stem(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// `true` when `name` can be joined under a directory without leaving it or naming something other
+/// than a plain file on any platform we build for: not empty, no NUL, no `:` (drive letters and NTFS
+/// alternate streams), not absolute (`/x`, `\x`), no `..` component (split on both `/` and `\`), no
+/// Windows device name as a component stem (`aux.fits`), no component ending in `.` or space.
 pub fn is_safe_entry_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('\0') || name.starts_with('/') || name.starts_with('\\') {
+    if name.is_empty() || name.contains('\0') || name.contains(':') || name.starts_with('/') || name.starts_with('\\') {
         return false;
     }
-    let b = name.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        return false;
-    }
-    !name.split(['/', '\\']).any(|c| c == "..")
+    !name.split(['/', '\\']).any(|c| c == ".." || c.ends_with('.') || c.ends_with(' ') || is_reserved_device_stem(c))
 }
 
 fn last_component(name: &str) -> &str {
@@ -142,6 +154,19 @@ fn to_naive(dt: zip::DateTime) -> Option<NaiveDateTime> {
     )
 }
 
+/// Decoded entry name -> index. Entries are opened by index because `ZipArchive::by_name` matches the
+/// raw stored bytes, which differ from the decoded name whenever the UTF-8 flag is clear and a byte
+/// is >= 0x80 (CP437). The first entry wins when a zip repeats a name.
+fn index_by_name(archive: &Archive) -> HashMap<String, usize> {
+    let mut map = HashMap::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        if let Some(name) = archive.name_for_index(index) {
+            map.entry(name.to_string()).or_insert(index);
+        }
+    }
+    map
+}
+
 /// Read the zip's directory through a 4 KiB buffer. Reads the central directory plus each listed
 /// entry's local header (to place its data); no entry data.
 pub fn list_entries(zip: &Path) -> Result<ZipListing> {
@@ -168,6 +193,11 @@ pub fn list_entries(zip: &Path) -> Result<ZipListing> {
                 if f.encrypted() {
                     tracing::debug!(zip_path = %zip.display(), zip_entry = %name, "zip entry skipped");
                     skipped.push((name, "encrypted"));
+                    continue;
+                }
+                if !matches!(f.compression(), zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated) {
+                    tracing::debug!(zip_path = %zip.display(), zip_entry = %name, "zip entry skipped");
+                    skipped.push((name, "unsupported method"));
                     continue;
                 }
                 ZipEntryInfo {
@@ -212,28 +242,60 @@ fn read_header_bytes(entry: &mut impl Read, name: &str) -> Result<Vec<u8>> {
         entry.read_exact(&mut out[16..]).with_context(|| format!("{name}: XISF header truncated"))?;
         return Ok(out);
     }
+    // Same end-of-header rule as `FitsHeader::parse_from_reader`: block by block, a short final block
+    // counts, and the header ends at the first card whose 8-byte keyword field is END.
     let mut out = Vec::with_capacity(FITS_BLOCK * 4);
     let mut block = [0u8; FITS_BLOCK];
-    for _ in 0..MAX_FITS_HEADER_BLOCKS {
-        entry.read_exact(&mut block).with_context(|| format!("{name}: header ended without END"))?;
-        out.extend_from_slice(&block);
-        if block.chunks(FITS_CARD).any(|card| card.starts_with(b"END") && card[3..].iter().all(|&b| b == b' ')) {
+    while out.len() < MAX_FITS_HEADER_BYTES {
+        let n = read_up_to(entry, &mut block).with_context(|| format!("{name}: header unreadable"))?;
+        if n == 0 {
+            bail!("{name}: no END card before the end of the entry");
+        }
+        out.extend_from_slice(&block[..n]);
+        if block[..n].chunks_exact(FITS_CARD).any(is_end_card) {
             return Ok(out);
         }
+        if n < FITS_BLOCK {
+            bail!("{name}: no END card before the end of the entry");
+        }
     }
-    bail!("{name}: no END card in {MAX_FITS_HEADER_BLOCKS} blocks")
+    bail!("{name}: no END card in {MAX_FITS_HEADER_BYTES} bytes")
+}
+
+/// `true` when the card's keyword field (its first 8 bytes) is END after trimming and upper-casing:
+/// exactly the check `fits_parser::fits_header_reader` makes, so ` END`, `end` and `END   text` all end it.
+fn is_end_card(card: &[u8]) -> bool {
+    String::from_utf8_lossy(card).get(0..8).unwrap_or("").trim().to_uppercase() == "END"
+}
+
+/// Fill `buf` from `r` until it is full or `r` ends; returns the bytes read.
+fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match r.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 /// Header bytes of several entries through one open of the zip and a 4 KiB buffer. A bad entry is an
 /// `Err` in its own slot; the zip failing to open is the outer `Err`. Returns the bytes read.
 pub fn read_headers(zip: &Path, entries: &[&str]) -> Result<(Vec<(String, Result<Vec<u8>>)>, u64)> {
     let (mut archive, counter) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let names = index_by_name(&archive);
     let mut out = Vec::with_capacity(entries.len());
     for &name in entries {
-        let header = archive
-            .by_name(name)
-            .with_context(|| format!("open entry {name} of {}", zip.display()))
-            .and_then(|mut f| read_header_bytes(&mut f, name));
+        let header = match names.get(name) {
+            None => Err(anyhow!("entry {name} not found in {}", zip.display())),
+            Some(&index) => archive
+                .by_index(index)
+                .with_context(|| format!("open entry {name} of {}", zip.display()))
+                .and_then(|mut f| read_header_bytes(&mut f, name)),
+        };
         out.push((name.to_string(), header));
     }
     Ok((out, counter.load(Ordering::Relaxed)))
@@ -246,11 +308,16 @@ pub fn read_entry_header(zip: &Path, entry: &str) -> Result<(Vec<u8>, u64)> {
     Ok((header?, bytes_read))
 }
 
-/// The file an extraction writes into before it renames onto `dest`: `<dest file name>.partial`.
-/// (Appended to the whole name, not swapped for the extension, so `L.fit` and `L.fits` never share one.)
+static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh file for an extraction to write into before it renames onto `dest`:
+/// `<dest file name>.<pid>-<n>.partial` next to `dest`. Appended to the whole name (not swapped for the
+/// extension, so `L.fit` and `L.fits` never collide) and unique per call, so two extractions to one
+/// `dest` never share a partial.
 pub fn partial_path(dest: &Path) -> PathBuf {
+    let n = PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(".partial");
+    name.push(format!(".{}-{n}.partial", std::process::id()));
     dest.with_file_name(name)
 }
 
@@ -274,9 +341,11 @@ impl Drop for PartialGuard {
 
 /// Extract `entry` to `dest` through a 1 MiB buffer.
 ///
-/// The bytes go to `<dest>.partial` and the file is renamed onto `dest` only after the zip reader's
-/// CRC32 check passed (and, with `expected_crc`, the catalog's CRC32 matched the zip's). On any error
-/// or on cancel the partial file is deleted and `dest` is not touched. `on_bytes` is called with the
+/// The bytes go to a unique `<dest file name>.<pid>-<n>.partial` beside `dest` (see `partial_path`;
+/// created with `create_new`, so no other call can hold it) and the file is renamed onto `dest` only after the zip reader's
+/// CRC32 check passed (and, with `expected_crc`, the catalog's CRC32 matched the zip's); an existing
+/// `dest` is replaced by that rename. On any error or on cancel the partial file is deleted and `dest`
+/// is not touched. `on_bytes` is called with the
 /// size of each chunk written (a delta, not a running total). `cancel` is checked before each chunk.
 pub fn extract_entry(
     zip: &Path,
@@ -287,8 +356,11 @@ pub fn extract_entry(
     on_bytes: &mut dyn FnMut(u64),
 ) -> Result<Extracted> {
     let (mut archive, _) = open_archive(zip, EXTRACT_BUF_BYTES)?;
+    let index = *index_by_name(&archive)
+        .get(entry)
+        .ok_or_else(|| anyhow!("entry {entry} not found in {}", zip.display()))?;
     let mut file = archive
-        .by_name(entry)
+        .by_index(index)
         .with_context(|| format!("open entry {entry} of {}", zip.display()))?;
     if let Some(expected) = expected_crc {
         if file.crc32() != expected {
@@ -303,8 +375,13 @@ pub fn extract_entry(
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let partial = partial_path(dest);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .with_context(|| format!("create {}", partial.display()))?;
+    // Armed only once this call owns the file.
     let mut guard = PartialGuard { path: partial.clone(), armed: true };
-    let mut out = File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
 
     let mut hasher = Xxh3::new();
     let mut buf = vec![0u8; EXTRACT_BUF_BYTES];
@@ -474,10 +551,12 @@ mod reader_tests {
 
     #[test]
     fn safe_names_predicate() {
-        for ok in ["a.fits", "a/b/c.fit", "a..b/c.fits", "..a/b", "dir/.hidden.fits"] {
+        for ok in ["a.fits", "a/b/c.fit", "a..b/c.fits", "..a/b", "dir/.hidden.fits", "console.fits", "com10.fits", "com0.fit", "lpt.fits", "NGC 7000 Ha/L_001.fits"] {
             assert!(is_safe_entry_name(ok), "{ok}");
         }
-        for bad in ["", "/a", "\\a", "../a", "a/..", "a/../b", "a\\..\\b", "C:/a", "a\0b"] {
+        for bad in ["", "/a", "\\a", "../a", "a/..", "a/../b", "a\\..\\b", "C:/a", "a\0b",
+            "sub/x:y.fits", "a:b", "aux.fits", "AUX", "sub/Con.fit", "nul.tar.gz", "COM1.fits", "lpt9.xisf", "x/prn .fits",
+            "dir./a.fits", "a/b.", "dir /a.fits", ".. /x.fits", "../x", "a/. /b.fits"] {
             assert!(!is_safe_entry_name(bad), "{bad:?}");
         }
     }
@@ -496,9 +575,21 @@ mod reader_tests {
             let (header, bytes_read) = read_entry_header(&zip, "Lights/L_001.fits").unwrap();
             assert_eq!(header, file[..3 * FITS_BLOCK], "{compression:?}");
             assert!(bytes_read <= 64 * 1024, "{compression:?}: header read pulled {bytes_read} bytes");
+            // Floor: the counter must see at least the compressed bytes that hold the header.
+            let span = match compression {
+                ArchiveCompression::Store => (3 * FITS_BLOCK) as u64,
+                ArchiveCompression::Deflate => {
+                    let alone = dir.join("alone");
+                    std::fs::create_dir_all(&alone).unwrap();
+                    let z = make_zip(&alone, &[("h.fits", file[..3 * FITS_BLOCK].to_vec())], compression);
+                    list_entries(&z).unwrap().entries[0].compressed_size
+                }
+            };
+            assert!(bytes_read >= span, "{compression:?}: counted {bytes_read} bytes, the header alone spans {span}");
 
             let listing = list_entries(&zip).unwrap();
             assert!(listing.bytes_read <= 64 * 1024, "{compression:?}: listing pulled {} bytes", listing.bytes_read);
+            assert!(listing.bytes_read > 0);
         }
     }
 
@@ -527,7 +618,8 @@ mod reader_tests {
     fn header_without_end_card_is_refused() {
         let tmp = TempDir::new().unwrap();
         let mut file = Vec::new();
-        for _ in 0..(MAX_FITS_HEADER_BLOCKS + 2) * (FITS_BLOCK / 80) {
+        // Longer than the old 200-block cap: it ends at the end of the entry, not at a block count.
+        for _ in 0..202 * (FITS_BLOCK / 80) {
             file.extend(card("COMMENT never ends"));
         }
         let zip = make_zip(tmp.path(), &[("a.fits", file)], ArchiveCompression::Store);
@@ -547,6 +639,16 @@ mod reader_tests {
             assert_eq!(header.len(), 16 + 5000);
             assert_eq!(header, file[..16 + 5000]);
         }
+    }
+
+    /// No `*.partial` file is left beside `dest`.
+    fn assert_no_partials(dest: &Path) {
+        let Ok(rd) = std::fs::read_dir(dest.parent().unwrap()) else { return };
+        let left: Vec<_> = rd
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".partial"))
+            .collect();
+        assert!(left.is_empty(), "partial files left: {left:?}");
     }
 
     fn never() -> AtomicBool {
@@ -576,7 +678,7 @@ mod reader_tests {
             assert_eq!(seen, bytes.len() as u64);
             assert!(chunks >= 1);
             assert_eq!(x.strong_hash, crate::package::xxh3_full_file(&dest).unwrap());
-            assert!(!partial_path(&dest).exists());
+            assert_no_partials(&dest);
         }
     }
 
@@ -590,7 +692,7 @@ mod reader_tests {
         let err = extract_entry(&zip, "a.fits", Some(crc ^ 1), &dest, &never(), &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("changed since it was cataloged"), "{err}");
         assert!(!dest.exists());
-        assert!(!partial_path(&dest).exists());
+        assert_no_partials(&dest);
     }
 
     #[test]
@@ -608,7 +710,7 @@ mod reader_tests {
         let err = extract_entry(&zip, "a.fits", None, &dest, &never(), &mut |_| {}).unwrap_err();
         assert!(format!("{err:#}").to_lowercase().contains("checksum"), "{err:#}");
         assert!(!dest.exists());
-        assert!(!partial_path(&dest).exists());
+        assert_no_partials(&dest);
     }
 
     #[test]
@@ -622,7 +724,8 @@ mod reader_tests {
         let cancel = AtomicBool::new(true);
         let err = extract_entry(&zip, "a.fits", None, &dest, &cancel, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
-        assert!(!dest.exists() && !partial_path(&dest).exists());
+        assert!(!dest.exists());
+        assert_no_partials(&dest);
 
         // Cancelled inside the entry: after the first chunk the file is partly written.
         let dest = tmp.path().join("mid/a.fits");
@@ -635,7 +738,8 @@ mod reader_tests {
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
         assert!(seen > 0 && seen < bytes.len() as u64, "cancel must stop mid-entry, saw {seen}");
-        assert!(!dest.exists() && !partial_path(&dest).exists());
+        assert!(!dest.exists());
+        assert_no_partials(&dest);
     }
 
     #[test]
@@ -646,6 +750,151 @@ mod reader_tests {
         let dest = tmp.path().join("o/x.fits");
         assert!(extract_entry(&zip, "nope.fits", None, &dest, &never(), &mut |_| {}).is_err());
         assert!(extract_entry(&tmp.path().join("gone.zip"), "a.fits", None, &dest, &never(), &mut |_| {}).is_err());
-        assert!(!dest.exists() && !partial_path(&dest).exists());
+        assert!(!dest.exists());
+        assert_no_partials(&dest);
+    }
+
+    /// Patch every occurrence of `from` in the zip file bytes (local and central headers) to `to`.
+    fn patch_all(zip: &Path, from: &[u8], to: &[u8]) -> usize {
+        assert_eq!(from.len(), to.len());
+        let mut raw = std::fs::read(zip).unwrap();
+        let mut hits = 0;
+        let mut i = 0;
+        while i + from.len() <= raw.len() {
+            if &raw[i..i + from.len()] == from {
+                raw[i..i + from.len()].copy_from_slice(to);
+                hits += 1;
+                i += from.len();
+            } else {
+                i += 1;
+            }
+        }
+        std::fs::write(zip, raw).unwrap();
+        hits
+    }
+
+    #[test]
+    fn cp437_named_entry_is_listed_read_and_extracted_by_its_decoded_name() {
+        for compression in [ArchiveCompression::Store, ArchiveCompression::Deflate] {
+            let tmp = TempDir::new().unwrap();
+            let fits = minimal_fits_bytes(tmp.path());
+            let zip = make_zip(tmp.path(), &[("Lights/aXb.fits", fits.clone()), ("plain.fits", fits.clone())], compression);
+            // ASCII name keeps the UTF-8 flag clear; 0x84 then decodes as CP437 'ä'.
+            assert_eq!(patch_all(&zip, b"Lights/aXb.fits", b"Lights/a\x84b.fits"), 2, "local + central header");
+
+            let listing = list_entries(&zip).unwrap();
+            let name = "Lights/a\u{e4}b.fits";
+            assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
+            let e = listing.entries.iter().find(|e| e.path == name).unwrap_or_else(|| panic!("{:?}", listing.entries));
+            assert!(e.is_frame);
+
+            let (header, _) = read_entry_header(&zip, name).unwrap();
+            assert_eq!(header, fits);
+            let (many, _) = read_headers(&zip, &["plain.fits", name]).unwrap();
+            assert!(many.iter().all(|(_, r)| r.is_ok()));
+
+            let dest = tmp.path().join("out/a.fits");
+            let x = extract_entry(&zip, name, Some(e.crc32), &dest, &never(), &mut |_| {}).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), fits);
+            assert_eq!(x.bytes, fits.len() as u64);
+        }
+    }
+
+    #[test]
+    fn entries_with_an_undecodable_method_are_skipped_with_a_reason() {
+        let tmp = TempDir::new().unwrap();
+        let fits = minimal_fits_bytes(tmp.path());
+        let zip = make_zip(tmp.path(), &[("bz.fits", fits.clone()), ("ok.fits", fits)], ArchiveCompression::Store);
+        // Method 12 (bzip2), which this build does not decode: central header method at +10, local at +8.
+        let mut raw = std::fs::read(&zip).unwrap();
+        let name_at = |raw: &[u8], sig: &[u8; 4], name: &[u8]| {
+            raw.windows(4).enumerate().find(|(i, w)| w == sig && raw[*i..].windows(name.len()).take(80).any(|n| n == name)).unwrap().0
+        };
+        for (sig, off) in [(b"PK\x01\x02", 10usize), (b"PK\x03\x04", 8usize)] {
+            let at = name_at(&raw, sig, b"bz.fits");
+            raw[at + off] = 12;
+            raw[at + off + 1] = 0;
+        }
+        std::fs::write(&zip, raw).unwrap();
+
+        let listing = list_entries(&zip).unwrap();
+        let kept: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(kept, vec!["ok.fits"]);
+        assert_eq!(listing.skipped, vec![("bz.fits".to_string(), "unsupported method")]);
+    }
+
+    #[test]
+    fn concurrent_extractions_to_one_dest_use_separate_partials() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("o/a.fits");
+        let (p1, p2) = (partial_path(&dest), partial_path(&dest));
+        assert_ne!(p1, p2);
+        assert!(p1.to_string_lossy().ends_with(".partial") && p2.to_string_lossy().ends_with(".partial"));
+
+        let bytes = fits_with_header_blocks(1, 3 * 1024 * 1024);
+        let zip = make_zip(tmp.path(), &[("a.fits", bytes.clone())], ArchiveCompression::Store);
+        // B is cancelled mid-entry while A runs to the end: B's cleanup must not touch A's file.
+        let cancel_b = AtomicBool::new(false);
+        let (ra, rb) = std::thread::scope(|s| {
+            let a = s.spawn(|| extract_entry(&zip, "a.fits", None, &dest, &never(), &mut |_| {}));
+            let b = s.spawn(|| {
+                extract_entry(&zip, "a.fits", None, &dest, &cancel_b, &mut |_| {
+                    cancel_b.store(true, Ordering::Relaxed);
+                })
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(ra.is_ok(), "{ra:?}");
+        assert!(rb.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert_no_partials(&dest);
+    }
+
+    /// A FITS file built from raw card images (80 bytes each), padded to whole blocks with spaces,
+    /// then `tail` bytes; or, with `short_final`, cut right after the last card.
+    fn fits_from_cards(cards: &[Vec<u8>], short_final: bool, tail: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = cards.iter().flatten().copied().collect();
+        if !short_final {
+            while out.len() % FITS_BLOCK != 0 {
+                out.push(b' ');
+            }
+        }
+        out.extend_from_slice(tail);
+        out
+    }
+
+    #[test]
+    fn end_of_header_rule_matches_the_disk_parser() {
+        use crate::fits_parser::fits_header_reader::FitsHeader;
+        let base = || vec![card("SIMPLE  =                    T"), card("OBJECT  = 'M 31    '"), card("EXPTIME =                300.0")];
+        let with_end = |end: Vec<u8>| {
+            let mut c = base();
+            c.push(end);
+            c
+        };
+        // ' END' (leading space), lowercase, END followed by text, plain END; the last one cut short.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("leading space", fits_from_cards(&with_end(card(" END")), false, &noise(5000))),
+            ("lowercase", fits_from_cards(&with_end(card("end")), false, &noise(5000))),
+            ("END with text", fits_from_cards(&with_end(card("END      trailing words")), false, &noise(5000))),
+            ("short final block", fits_from_cards(&with_end(card("END")), true, &[])),
+            ("short final block, ' END'", fits_from_cards(&with_end(card(" END")), true, &[])),
+        ];
+        for (label, file) in cases {
+            for compression in [ArchiveCompression::Store, ArchiveCompression::Deflate] {
+                let tmp = TempDir::new().unwrap();
+                let disk = tmp.path().join("d.fits");
+                std::fs::write(&disk, &file).unwrap();
+                let from_disk = FitsHeader::from_path(&disk).unwrap_or_else(|e| panic!("{label}: disk parser: {e:#}"));
+
+                let zip = make_zip(tmp.path(), &[("a.fits", file.clone())], compression);
+                let (header, _) = read_entry_header(&zip, "a.fits").unwrap_or_else(|e| panic!("{label} {compression:?}: {e:#}"));
+                assert!(header.len() <= FITS_BLOCK.max(file.len()), "{label}: {} bytes", header.len());
+                let from_zip = FitsHeader::from_bytes(&header).unwrap_or_else(|e| panic!("{label}: from_bytes: {e:#}"));
+                assert_eq!(from_zip.to_header_text(), from_disk.to_header_text(), "{label} {compression:?}");
+                assert_eq!(from_zip.get_str("OBJECT"), Some("M 31".to_string()), "{label}");
+                assert_eq!(from_zip.get_f64("EXPTIME"), Some(300.0), "{label}");
+            }
+        }
     }
 }
