@@ -639,7 +639,8 @@ fn backfill_zip_archives(conn: &Connection) -> rusqlite::Result<()> {
             "SELECT aof.target_zip_path, MIN(aof.operation_id), COUNT(DISTINCT f.id)
              FROM archive_operation_files aof
              JOIN files f ON f.id = aof.file_id
-             WHERE f.archived_in_operation IS NOT NULL
+                  AND f.archived_in_operation = aof.operation_id
+                  AND f.archive_zip_path = aof.target_zip_path
              GROUP BY aof.target_zip_path",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -651,10 +652,13 @@ fn backfill_zip_archives(conn: &Connection) -> rusqlite::Result<()> {
     for (path, op_id, entries) in &zips {
         let (size, modified_at) = match std::fs::metadata(path) {
             Ok(md) => {
-                let modified = md
-                    .modified()
-                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
-                    .unwrap_or_default();
+                let modified = match md.modified() {
+                    Ok(t) => chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339(),
+                    Err(e) => {
+                        tracing::debug!(zip_path = %path, error = %e, "zip backfill: modified time unavailable, left empty");
+                        String::new()
+                    }
+                };
                 (md.len() as i64, modified)
             }
             Err(e) => {
@@ -669,7 +673,7 @@ fn backfill_zip_archives(conn: &Connection) -> rusqlite::Result<()> {
             rusqlite::params![path, size, modified_at, entries, now, op_id],
         )?;
     }
-    tracing::info!(zips = zips.len(), "zip_archives backfilled from archive operations");
+    tracing::info!(count = zips.len(), "zip_archives backfilled from archive operations");
     Ok(())
 }
 
@@ -5685,7 +5689,7 @@ mod zip_schema_tests {
             "INSERT INTO archive_operation_files
              (operation_id, file_id, source_path, target_zip_path, target_path_in_zip,
               expected_hash, disposition, frame_role, file_size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'aabb', 'archive', 'light', 10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'aabb', 'move', 'light', 10)",
             rusqlite::params![op, id, format!("/data/{entry}-{id}"), zip, entry],
         )
         .unwrap();
@@ -5707,7 +5711,7 @@ mod zip_schema_tests {
             "INSERT INTO archive_operation_files
              (operation_id, file_id, source_path, target_zip_path, target_path_in_zip,
               expected_hash, disposition, frame_role, file_size_bytes)
-             VALUES (2, NULL, '/data/x.fits', '/nonexistent/arch/NotDone.zip', 'x.fits', 'aa', 'archive', 'light', 1)",
+             VALUES (2, NULL, '/data/x.fits', '/nonexistent/arch/NotDone.zip', 'x.fits', 'aa', 'move', 'light', 1)",
             [],
         )
         .unwrap();
@@ -5741,6 +5745,46 @@ mod zip_schema_tests {
             .query_row("SELECT COUNT(*) FROM zip_archives", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn backfill_keys_on_the_operation_that_archived_the_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("DELETE FROM zip_archives", []).unwrap();
+        insert_op(&conn, 1);
+        insert_op(&conn, 2);
+        // Archived in op 1 into zip A; op 1 was later superseded and the file
+        // re-archived in op 2 into zip B. The op-1 operation row is kept.
+        insert_archived_file(&conn, 1, 1, "/nonexistent/arch/A.zip", "L1.fits");
+        conn.execute(
+            "INSERT INTO archive_operation_files
+             (operation_id, file_id, source_path, target_zip_path, target_path_in_zip,
+              expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (2, 1, '/data/L1.fits-1', '/nonexistent/arch/B.zip', 'L1.fits', 'aabb', 'move', 'light', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE files SET archived_in_operation = 2, archive_zip_path = '/nonexistent/arch/B.zip' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let rows: Vec<(String, i64, Option<i64>)> = conn
+            .prepare("SELECT path, frame_entries, created_by_operation FROM zip_archives ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("/nonexistent/arch/B.zip".to_string(), 1, Some(2))],
+            "{rows:?}"
+        );
     }
 
     #[test]
