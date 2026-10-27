@@ -79,7 +79,7 @@ pub(crate) fn path_has_root_prefix(path: &str, root: &str) -> bool {
 /// roots), the longest (most specific) match wins. Not under any known
 /// scan root, or under one that's available -> `Ok(None)` (today's
 /// behavior, unaffected by this guard).
-fn path_under_unavailable_scan_root(
+pub(crate) fn path_under_unavailable_scan_root(
     conn: &Connection,
     path: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -143,10 +143,76 @@ pub struct ScanCompleteEvent {
 /// contents are store data, never frames, so neither walker descends into it.
 const APP_METADATA_DIR: &str = ".athenaeum";
 
-/// `walkdir` `filter_entry` predicate: true for an `.athenaeum` directory below
-/// the walk root, which is then skipped with everything under it.
+/// Directories the app writes its own temporary copies into: Move and ZIP's staging
+/// (`<archive root>/.athenaeum_staging`) and Restore's extraction temp
+/// (`.athenaeum_restore_temp`). An archive root may sit inside a scan root, so neither
+/// walker descends into them (their frames and zips are never cataloged).
+const APP_TEMP_DIRS: [&str; 2] = [".athenaeum_staging", ".athenaeum_restore_temp"];
+
+/// `walkdir` `filter_entry` predicate: true for an app-owned directory (`.athenaeum`, the
+/// staging or the restore temp directory) below the walk root, which is then skipped with
+/// everything under it.
 fn is_app_metadata_dir(entry: &walkdir::DirEntry) -> bool {
-    entry.depth() > 0 && entry.file_type().is_dir() && entry.file_name() == APP_METADATA_DIR
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && (entry.file_name() == APP_METADATA_DIR || APP_TEMP_DIRS.iter().any(|d| entry.file_name() == *d))
+}
+
+/// Whether `path` is a `.zip` file (any case): the walkers collect these beside the frame files.
+pub(crate) fn is_zip_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+/// What the zip pass of a walker did, summed over its zips.
+#[derive(Default)]
+struct ZipPass {
+    /// Frame ids of freshly inserted rows with their image type (calibration-set creation).
+    inserted: Vec<(i64, ImageType)>,
+    files_inserted: usize,
+    adopted: usize,
+    errors: Vec<String>,
+    cancelled: bool,
+}
+
+impl ZipPass {
+    /// A row was inserted or adopted: the duplicate caches have something new to rebuild from.
+    fn changed_catalog(&self) -> bool {
+        self.files_inserted + self.adopted > 0
+    }
+}
+
+/// Run `zip_store::scan::scan_zip` over each zip, one at a time, after the frame files.
+/// `on_zip(index, total, zip)` is called before each zip (progress); `is_cancelled` is checked
+/// between zips. A zip that cannot be read is an error line and the next zip still runs.
+fn run_zip_pass(
+    conn: &Connection,
+    zips: &[PathBuf],
+    root_id: i64,
+    unique_camera: bool,
+    is_cancelled: &dyn Fn() -> bool,
+    on_zip: &mut dyn FnMut(usize, usize, &Path),
+) -> ZipPass {
+    let mut pass = ZipPass::default();
+    for (idx, zip) in zips.iter().enumerate() {
+        if is_cancelled() {
+            pass.cancelled = true;
+            break;
+        }
+        on_zip(idx, zips.len(), zip);
+        match crate::zip_store::scan::scan_zip(conn, zip, root_id, unique_camera) {
+            Ok(outcome) => {
+                pass.files_inserted += outcome.files_inserted;
+                pass.adopted += outcome.adopted;
+                pass.inserted.extend(outcome.inserted);
+                pass.errors.extend(outcome.errors);
+            }
+            Err(e) => {
+                tracing::error!(root_id, zip_path = %zip.display(), error = %format!("{e:#}"), "zip scan failed");
+                pass.errors.push(format!("{}: {e:#}", zip.display()));
+            }
+        }
+    }
+    pass
 }
 
 /// Scan a directory for FITS/XISF files
@@ -175,16 +241,23 @@ pub fn scan_directory(
     // Find all FITS/XISF files. max_depth caps recursion in case follow_links
     // hits a pathological symlink loop (walkdir's loop detection isn't
     // bulletproof on every filesystem); 64 is well past any realistic archive.
-    let files: Vec<PathBuf> = WalkDir::new(root_path)
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut zips: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root_path)
         .follow_links(true)
         .max_depth(64)
         .into_iter()
         .filter_entry(|e| !is_app_metadata_dir(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| is_frame_file(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .collect();
+    {
+        if is_frame_file(entry.path()) {
+            files.push(entry.path().to_path_buf());
+        } else if is_zip_file(entry.path()) {
+            zips.push(entry.path().to_path_buf());
+        }
+    }
+    zips.sort();
 
     result.files_found = files.len();
 
@@ -340,6 +413,40 @@ pub fn scan_directory(
                     .unwrap()
                     .push(format!("{}: {}", file_path.display(), e));
             }
+        }
+    }
+
+    // Zips: read after the frame files; their frames join the calibration-set creation below.
+    let zip_pass = run_zip_pass(
+        conn,
+        &zips,
+        root_id,
+        unique_camera,
+        &|| false,
+        &mut |idx, total, zip| {
+            if let Some(ref cb) = progress_callback {
+                cb(ScanProgress {
+                    current: idx + 1,
+                    total,
+                    current_file: zip.file_name().map(|n| n.to_string_lossy().to_string()),
+                });
+            }
+        },
+    );
+    *processed.lock().unwrap() += zip_pass.files_inserted + zip_pass.adopted;
+    errors.lock().unwrap().extend(zip_pass.errors.iter().cloned());
+    for (frame_id, imagetyp) in zip_pass.inserted {
+        match imagetyp {
+            ImageType::Light => lights_count += 1,
+            ImageType::Flat => flat_frame_ids.push(frame_id),
+            ImageType::Dark => dark_frame_ids.push(frame_id),
+            ImageType::Bias => bias_frame_ids.push(frame_id),
+            ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
+            ImageType::MasterDark => master_dark_ids.push(frame_id),
+            ImageType::MasterFlat => master_flat_ids.push(frame_id),
+            ImageType::MasterBias => master_bias_ids.push(frame_id),
+            ImageType::MasterDarkFlat => master_darkflat_ids.push(frame_id),
+            _ => {}
         }
     }
 
@@ -503,86 +610,59 @@ fn process_file(
     if let Some(ref header) = header_text {
         let fingerprint = crate::fingerprint::compute_header_fingerprint(header);
 
-        let existing_file: Option<(i64, String)> = conn.query_row(
-            "SELECT f.id, f.path FROM files f
-             INNER JOIN fits_header fh ON f.id = fh.file_id
-             WHERE fh.header_fingerprint = ?1 AND f.path != ?2",
-            rusqlite::params![fingerprint, current_path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+        // The shared lookup: a duplicate (old path still there) or an offline old root falls
+        // through to the new-file handling below; a disk file never matches a zip-resident row.
+        if let Some((file_id, old_path)) =
+            crate::zip_store::scan::find_moved_row(conn, &fingerprint, &current_path, false)?
+        {
+            tracing::debug!(
+                root_id,
+                old_path = %old_path,
+                path = %current_path,
+                file_id,
+                "moved file detected"
+            );
 
-        if let Some((file_id, old_path)) = existing_file {
-            if std::path::Path::new(&old_path).exists() {
-                tracing::debug!(
-                    root_id,
-                    old_path = %old_path,
-                    path = %current_path,
-                    "duplicate file detected (identical header)"
-                );
-            } else if let Some(offline_root) = path_under_unavailable_scan_root(conn, &old_path)? {
-                // Old path is missing, but that's because its owning scan
-                // root is currently offline (unmounted volume), not because
-                // the file was moved. Fall through to duplicate/new-file
-                // handling below instead of flipping the still-valid
-                // original's path.
-                tracing::warn!(
-                    root_id,
-                    old_path = %old_path,
-                    path = %current_path,
-                    offline_root = %offline_root,
-                    file_id,
-                    "skipping move-detection: old path's scan root is unavailable"
-                );
-            } else {
-                tracing::debug!(
-                    root_id,
-                    old_path = %old_path,
-                    path = %current_path,
-                    file_id,
-                    "moved file detected"
-                );
+            conn.execute(
+                "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
+                rusqlite::params![current_path, modified_dt.to_rfc3339(), file_id],
+            )?;
 
-                conn.execute(
-                    "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
-                    rusqlite::params![current_path, modified_dt.to_rfc3339(), file_id],
-                )?;
-
-                let raw_instrume: Option<String> = conn.query_row(
-                    "SELECT instrume FROM frames WHERE file_id = ?1",
-                    rusqlite::params![file_id],
-                    |row| row.get(0),
-                ).optional()?.flatten();
-                let base_instrume = raw_instrume.as_ref().map(|i| {
-                    if let Some(pos) = i.rfind(" N") {
-                        let suffix = &i[pos + 2..];
-                        if suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty() {
-                            return i[..pos].to_string();
-                        }
+            let raw_instrume: Option<String> = conn.query_row(
+                "SELECT instrume FROM frames WHERE file_id = ?1",
+                rusqlite::params![file_id],
+                |row| row.get(0),
+            ).optional()?.flatten();
+            let base_instrume = raw_instrume.as_ref().map(|i| {
+                if let Some(pos) = i.rfind(" N") {
+                    let suffix = &i[pos + 2..];
+                    if suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty() {
+                        return i[..pos].to_string();
                     }
-                    i.clone()
-                });
-                let new_instrume = if unique_camera {
-                    base_instrume.map(|i| format!("{} N{}", i, root_id))
-                } else {
-                    base_instrume
-                };
-                conn.execute(
-                    "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
-                    rusqlite::params![new_instrume, file_id],
-                ).map_err(|e| {
-                    tracing::error!(
-                        root_id,
-                        file_id,
-                        old_path = %old_path,
-                        path = %current_path,
-                        error = %e,
-                        "failed to update frame instrume after move"
-                    );
-                    e
-                })?;
+                }
+                i.clone()
+            });
+            let new_instrume = if unique_camera {
+                base_instrume.map(|i| format!("{} N{}", i, root_id))
+            } else {
+                base_instrume
+            };
+            conn.execute(
+                "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
+                rusqlite::params![new_instrume, file_id],
+            ).map_err(|e| {
+                tracing::error!(
+                    root_id,
+                    file_id,
+                    old_path = %old_path,
+                    path = %current_path,
+                    error = %e,
+                    "failed to update frame instrume after move"
+                );
+                e
+            })?;
 
-                return Ok(None);
-            }
+            return Ok(None);
         }
     }
 
@@ -1052,6 +1132,39 @@ fn reparse_and_update_in_place(
         }
     };
 
+    apply_parsed_in_place(
+        conn,
+        file_id,
+        size,
+        &modified_dt,
+        &format,
+        &frame,
+        header_text.as_deref(),
+        unique_camera,
+        root_id,
+        path,
+        warn_override_skip,
+    )
+}
+
+/// The write half of an in-place re-parse, for a frame already parsed: refresh the existing
+/// `files` / `frames` / `fits_header` rows of `file_id` in one savepoint, keeping their ids.
+/// `path` only labels logs (a zip entry passes its virtual path). Shared by the disk re-parse and
+/// the zip pass (a known entry whose CRC changed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_parsed_in_place(
+    conn: &Connection,
+    file_id: i64,
+    size: i64,
+    modified_dt: &chrono::DateTime<Utc>,
+    format: &FileFormat,
+    frame: &Frame,
+    header_text: Option<&str>,
+    unique_camera: bool,
+    root_id: i64,
+    path: &Path,
+    warn_override_skip: bool,
+) -> anyhow::Result<()> {
     let new_instrume = if unique_camera {
         frame.instrume.as_ref().map(|i| {
             // Strip a previous " N<digits>" suffix before re-applying so we
@@ -1141,11 +1254,11 @@ fn reparse_and_update_in_place(
         conn,
         file_id,
         size,
-        &modified_dt,
-        &format,
-        &frame,
+        modified_dt,
+        format,
+        frame,
         new_instrume.as_deref(),
-        header_text.as_deref(),
+        header_text,
         frame_count,
         user_override,
     );
@@ -1548,6 +1661,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     emit_progress(emitter, root_id, 0, 0, None, "discovery");
 
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut zips: Vec<PathBuf> = Vec::new();
     let mut discovery_count = 0usize;
 
     for entry in WalkDir::new(root_path)
@@ -1576,6 +1690,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     "discovery",
                 );
             }
+        } else if is_zip_file(entry.path()) {
+            // Read after the frame files (see the zip pass below); cheap to carry.
+            zips.push(entry.path().to_path_buf());
         }
 
         // Check for cancellation during discovery
@@ -1588,7 +1705,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     result.files_found = files.len();
-    tracing::info!(count = files.len(), stage = "discovery", "file discovery complete");
+    zips.sort();
+    tracing::info!(count = files.len(), zips = zips.len(), stage = "discovery", "file discovery complete");
 
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1627,7 +1745,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         }
     }
 
-    if files.is_empty() {
+    // A root holding only zips still runs the zip pass below.
+    if files.is_empty() && zips.is_empty() {
         // Emit progress showing discovery complete with 0 files
         emit_progress(emitter, root_id, 0, 0, None, "processing");
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1737,7 +1856,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         return result;
     }
 
-    if new_files.is_empty() {
+    if new_files.is_empty() && zips.is_empty() {
         // Emit progress showing all files were checked (even if all skipped)
         // This ensures frontend always sees at least one progress event
         emit_progress(
@@ -1943,13 +2062,15 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         if let Some(ref header) = file_result.header {
             let fingerprint = crate::fingerprint::compute_header_fingerprint(header);
 
-            let existing_file: Option<(i64, String)> = match conn.query_row(
-                "SELECT f.id, f.path FROM files f
-                 INNER JOIN fits_header fh ON f.id = fh.file_id
-                 WHERE fh.header_fingerprint = ?1 AND f.path != ?2",
-                rusqlite::params![fingerprint, file_result.file.path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional() {
+            // The shared lookup: a duplicate (old path still there) or an offline old root
+            // falls through to the normal insert/reparse handling below; a disk file never
+            // matches a zip-resident row.
+            let existing_file: Option<(i64, String)> = match crate::zip_store::scan::find_moved_row(
+                conn,
+                &fingerprint,
+                &file_result.file.path,
+                false,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(
@@ -1967,95 +2088,56 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             };
 
             if let Some((file_id, old_path)) = existing_file {
-                let old_path_missing = !std::path::Path::new(&old_path).exists();
-                // Only consult the volume guard when we'd otherwise treat
-                // this as a move — same "old path missing" branch as before.
-                let guard_blocking_root: Option<String> = if old_path_missing {
-                    match path_under_unavailable_scan_root(conn, &old_path) {
-                        Ok(root) => root,
-                        Err(e) => {
-                            tracing::error!(
-                                root_id,
-                                old_path = %old_path,
-                                error = %e,
-                                "move-detection volume guard check failed"
-                            );
-                            result.errors.push(format!(
-                                "{}: move-detection volume guard check failed: {}",
-                                old_path, e
-                            ));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(offline_root) = guard_blocking_root {
-                    // Old path is missing, but only because its owning scan
-                    // root is currently offline (unmounted volume). Fall
-                    // through to the normal insert/reparse handling below
-                    // instead of flipping the still-valid original's path.
-                    tracing::warn!(
+                // Old file no longer exists - this is a MOVE, update path
+                if let Err(e) = conn.execute(
+                    "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
+                    rusqlite::params![
+                        file_result.file.path,
+                        file_result.file.modified_at.to_rfc3339(),
+                        file_id
+                    ],
+                ) {
+                    tracing::error!(
                         root_id,
+                        file_id,
                         old_path = %old_path,
                         path = %file_result.file.path,
-                        offline_root = %offline_root,
-                        file_id,
-                        "skipping move-detection: old path's scan root is unavailable"
+                        error = %e,
+                        "failed to update files.path after move"
                     );
-                } else if old_path_missing {
-                    // Old file no longer exists - this is a MOVE, update path
-                    if let Err(e) = conn.execute(
-                        "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
-                        rusqlite::params![
-                            file_result.file.path,
-                            file_result.file.modified_at.to_rfc3339(),
-                            file_id
-                        ],
-                    ) {
-                        tracing::error!(
-                            root_id,
-                            file_id,
-                            old_path = %old_path,
-                            path = %file_result.file.path,
-                            error = %e,
-                            "failed to update files.path after move"
-                        );
-                        result.errors.push(format!(
-                            "file_id={}: failed to update path for moved file '{}' -> '{}': {}",
-                            file_id, old_path, file_result.file.path, e
-                        ));
-                    }
-
-                    // Update INSTRUME based on destination root's unique_camera setting
-                    // file_result.frame.instrume has the raw FITS header value (no suffix)
-                    let new_instrume = if unique_camera {
-                        file_result.frame.instrume.as_ref()
-                            .map(|i| format!("{} N{}", i, root_id))
-                    } else {
-                        file_result.frame.instrume.clone()
-                    };
-                    if let Err(e) = conn.execute(
-                        "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
-                        rusqlite::params![new_instrume, file_id],
-                    ) {
-                        tracing::error!(
-                            root_id,
-                            file_id,
-                            old_path = %old_path,
-                            path = %file_result.file.path,
-                            error = %e,
-                            "failed to update frame instrume after move"
-                        );
-                        result.errors.push(format!(
-                            "file_id={}: failed to update instrume for moved file '{}' -> '{}': {}",
-                            file_id, old_path, file_result.file.path, e
-                        ));
-                    }
-
-                    continue; // Skip insert, file was moved
+                    result.errors.push(format!(
+                        "file_id={}: failed to update path for moved file '{}' -> '{}': {}",
+                        file_id, old_path, file_result.file.path, e
+                    ));
                 }
+
+                // Update INSTRUME based on destination root's unique_camera setting
+                // file_result.frame.instrume has the raw FITS header value (no suffix)
+                let new_instrume = if unique_camera {
+                    file_result.frame.instrume.as_ref()
+                        .map(|i| format!("{} N{}", i, root_id))
+                } else {
+                    file_result.frame.instrume.clone()
+                };
+                if let Err(e) = conn.execute(
+                    "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
+                    rusqlite::params![new_instrume, file_id],
+                ) {
+                    tracing::error!(
+                        root_id,
+                        file_id,
+                        old_path = %old_path,
+                        path = %file_result.file.path,
+                        error = %e,
+                        "failed to update frame instrume after move"
+                    );
+                    result.errors.push(format!(
+                        "file_id={}: failed to update instrume for moved file '{}' -> '{}': {}",
+                        file_id, old_path, file_result.file.path, e
+                    ));
+                }
+
+                continue; // Skip insert, file was moved
             }
         }
 
@@ -2239,6 +2321,48 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
     result.errors.extend(phase1_errors);
+
+    // Phase 2b: zips, one at a time after the parallel frame pass (their frames join the
+    // calibration-set creation below). Zip-resident rows are NOT added to `new_file_ids`: they
+    // have no file on disk, so personal-sync auto mode must never see them.
+    let zip_pass = run_zip_pass(
+        conn,
+        &zips,
+        root_id,
+        unique_camera,
+        &|| cancel_flag.load(Ordering::SeqCst),
+        &mut |idx, total, zip| {
+            emit_progress(
+                emitter,
+                root_id,
+                idx + 1,
+                total,
+                zip.file_name().map(|n| n.to_string_lossy().to_string()),
+                "zips",
+            );
+        },
+    );
+    if zip_pass.cancelled {
+        result.cancelled = true;
+    }
+    let zips_changed_catalog = zip_pass.changed_catalog();
+    result.files_processed += zip_pass.files_inserted;
+    result.errors.extend(zip_pass.errors.iter().cloned());
+    for (frame_id, imagetyp) in zip_pass.inserted {
+        match imagetyp {
+            ImageType::Light => lights_count += 1,
+            ImageType::Flat => flat_frame_ids.push(frame_id),
+            ImageType::Dark => dark_frame_ids.push(frame_id),
+            ImageType::Bias => bias_frame_ids.push(frame_id),
+            ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
+            ImageType::MasterDark => master_dark_ids.push(frame_id),
+            ImageType::MasterFlat => master_flat_ids.push(frame_id),
+            ImageType::MasterBias => master_bias_ids.push(frame_id),
+            ImageType::MasterDarkFlat => master_darkflat_ids.push(frame_id),
+            _ => {}
+        }
+    }
+
     result.lights_count = lights_count;
     result.flats_count = flat_frame_ids.len();
     result.darks_count = dark_frame_ids.len();
@@ -2295,37 +2419,40 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         // network share — so the pass reports as its own `"hashing"` phase
         // (per file, with the path) and `"caching"` names only the rebuild
         // that follows. Neither runs on a scan that found nothing new or
-        // changed: that scan returned above, at `new_files.is_empty()`.
+        // changed: no frame file to process and no zip that added or adopted
+        // a row (the guard below).
         //
         // Masters are shortlisted by header and decided by bytes: hash the
         // shortlist before the caches are rebuilt. Bounded by the shortlist,
         // not by the master population (61 files / 7.5 GiB vs 381 / 89.4 GiB
         // on the owner's catalog), and a scan has just read the whole library
         // anyway.
-        crate::duplicates::backfill::fill_master_strong_hashes(conn, emitter, &cancel_flag, root_id);
+        if total_new > 0 || zips_changed_catalog {
+            crate::duplicates::backfill::fill_master_strong_hashes(conn, emitter, &cancel_flag, root_id);
 
-        emit_progress(
-            emitter,
-            root_id,
-            result.files_processed,
-            result.files_processed,
-            None,
-            "caching",
-        );
+            emit_progress(
+                emitter,
+                root_id,
+                result.files_processed,
+                result.files_processed,
+                None,
+                "caching",
+            );
 
-        // Rebuild the duplicate groups cache under the default (header) key.
-        if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {
-            result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
-        }
-        // …and under the master key, which the hashes above have just made
-        // computable. Both halves of the default view are cached together.
-        if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Master) {
-            result.errors.push(format!("Failed to rebuild master duplicate cache: {}", e));
-        }
+            // Rebuild the duplicate groups cache under the default (header) key.
+            if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {
+                result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
+            }
+            // …and under the master key, which the hashes above have just made
+            // computable. Both halves of the default view are cached together.
+            if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Master) {
+                result.errors.push(format!("Failed to rebuild master duplicate cache: {}", e));
+            }
 
-        // Rebuild folder similarity cache (threshold 70%)
-        if let Err(e) = rebuild_folder_similarity_cache(conn, 70.0) {
-            result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
+            // Rebuild folder similarity cache (threshold 70%)
+            if let Err(e) = rebuild_folder_similarity_cache(conn, 70.0) {
+                result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
+            }
         }
     }
 
@@ -3199,6 +3326,72 @@ mod moved_file_guard_tests {
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total_files, 1, "no duplicate row should be inserted for a genuine move");
+    }
+
+    /// A zip-resident row (Move and ZIP's, markers set, original path gone) must
+    /// not be taken over by a disk file with the same header — a manually
+    /// unzipped copy is a new row and a duplicate, and the archived row keeps
+    /// its zip markers. Both walkers.
+    #[test]
+    fn disk_copy_of_a_zip_resident_frame_never_takes_over_the_row() {
+        for parallel in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("scan");
+            std::fs::create_dir_all(&root).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+
+            let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+            // The archived row: its original location (under a root that is online) no longer holds the file.
+            let original = root.join("Lights").join("L_001.fits");
+            let zip = tmp.path().join("archive.zip");
+            seed_fake_old_row(&conn, 900, original.to_str().unwrap(), &header_text);
+            conn.execute(
+                "UPDATE files SET archive_zip_path = ?1, archive_path_in_zip = 'Lights/L_001.fits' WHERE id = 900",
+                params![zip.to_str().unwrap()],
+            )
+            .unwrap();
+
+            let copy = root.join("unzipped").join("L_001.fits");
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::copy(MONO_FIXTURE, &copy).unwrap();
+
+            if parallel {
+                scan_directory_parallel(
+                    &root,
+                    1,
+                    &conn,
+                    &crate::events::NullEmitter,
+                    Arc::new(AtomicBool::new(false)),
+                    false,
+                );
+            } else {
+                scan_directory(&root, &conn, None, false, 1);
+            }
+
+            let (path, zip_col, entry_col): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT path, archive_zip_path, archive_path_in_zip FROM files WHERE id = 900",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(path, original.to_str().unwrap(), "parallel={parallel}: the archived row keeps its path");
+            assert_eq!(zip_col.as_deref(), zip.to_str(), "parallel={parallel}: and its zip markers");
+            assert_eq!(entry_col.as_deref(), Some("Lights/L_001.fits"));
+            let copy_row: (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT id, archive_zip_path FROM files WHERE path = ?1",
+                    params![copy.to_str().unwrap()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_ne!(copy_row.0, 900, "parallel={parallel}: the disk copy is a new row");
+            assert_eq!(copy_row.1, None);
+            let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+            assert_eq!(total, 2, "parallel={parallel}");
+        }
     }
 
     // -- helper unit tests (also cover Site 2, which isn't independently
@@ -4248,5 +4441,209 @@ mod app_metadata_dir_tests {
             )
             .unwrap();
         assert_eq!(under_store, 0, "nothing under .athenaeum/ is cataloged");
+    }
+
+    /// An archive root may sit inside a scan root: Move and ZIP's staging copies and
+    /// Restore's temp copies (frames and zips alike) are never cataloged.
+    #[test]
+    fn scanner_prunes_archive_staging_and_restore_temp() {
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        let root = TempDir::new().unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&root.path().join("L_001.fits"));
+        for dir in [".athenaeum_staging", ".athenaeum_restore_temp"] {
+            let hidden = root.path().join(dir).join("op_7").join("Lights");
+            std::fs::create_dir_all(&hidden).unwrap();
+            crate::archive::restore::tests::write_minimal_fits(&hidden.join("L_002.fits"));
+            make_zip(
+                &root.path().join(dir).join("op_7"),
+                "inner.zip",
+                &[("L_003.fits", light(3))],
+                crate::archive::models::ArchiveCompression::Store,
+            );
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.path().to_str().unwrap()]).unwrap();
+
+        let parallel = scan_directory_parallel(
+            root.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        );
+        assert_eq!(parallel.files_found, 1, "the batch walker prunes both directories");
+        let sequential = scan_directory(root.path(), &conn, None, false, 1);
+        assert_eq!(sequential.files_found, 1, "the sequential walker prunes both directories");
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files, 1, "only the real frame is cataloged");
+        let zips: i64 = conn.query_row("SELECT COUNT(*) FROM zip_archives", [], |r| r.get(0)).unwrap();
+        assert_eq!(zips, 0, "no zip under a pruned directory is read");
+    }
+}
+
+/// The zip pass inside both walkers: `.zip` files are collected beside the frame files, read after
+/// them, and reported as the `"zips"` progress phase.
+#[cfg(test)]
+mod zip_pass_tests {
+    use super::*;
+    use crate::archive::models::ArchiveCompression;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use crate::zip_store::scan::test_support::{fits_bytes_typed, light, make_zip};
+    use rusqlite::params;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    fn fresh_db(root: &Path) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", params![root.to_str().unwrap()]).unwrap();
+        conn
+    }
+
+    fn run_scan(parallel: bool, root: &Path, conn: &Connection) -> ScanResult {
+        if parallel {
+            scan_directory_parallel(root, 1, conn, &NullEmitter, Arc::new(AtomicBool::new(false)), false)
+        } else {
+            scan_directory(root, conn, None, false, 1)
+        }
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn both_walkers_catalog_frames_inside_zips_and_skip_an_unchanged_zip() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            std::fs::write(root.path().join("L_001.fits"), light(1)).unwrap();
+            std::fs::create_dir_all(root.path().join("night")).unwrap();
+            make_zip(
+                &root.path().join("night"),
+                "n.zip",
+                &[("Lights/L_010.fits", light(10)), ("Lights/L_011.fits", light(11)), ("notes.txt", b"hello".to_vec())],
+                ArchiveCompression::Deflate,
+            );
+            let first = run_scan(parallel, root.path(), &conn);
+            assert!(first.errors.is_empty(), "parallel={parallel}: {:?}", first.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3, "parallel={parallel}");
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+            assert_eq!(first.lights_count, 3, "parallel={parallel}: zip lights count with the disk light");
+            assert_eq!(first.files_processed, 3, "parallel={parallel}");
+            assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 2);
+
+            let second = run_scan(parallel, root.path(), &conn);
+            assert!(second.errors.is_empty(), "parallel={parallel}: {:?}", second.errors);
+            assert_eq!(second.files_processed, 0, "parallel={parallel}: nothing new on a rescan");
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
+        }
+    }
+
+    #[test]
+    fn a_root_holding_only_zips_is_scanned() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            make_zip(
+                root.path(),
+                "only.zip",
+                &[
+                    ("F_001.fits", fits_bytes_typed("Flat", &["SEQNUM  =                    1".to_string()])),
+                    ("L_001.fits", light(2)),
+                ],
+                ArchiveCompression::Store,
+            );
+            let result = run_scan(parallel, root.path(), &conn);
+            assert_eq!(result.files_found, 0, "parallel={parallel}: files_found counts frame files on disk");
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "parallel={parallel}");
+            assert_eq!(result.lights_count, 1, "parallel={parallel}");
+            assert_eq!(result.flats_count, 1, "parallel={parallel}: zip calibration frames feed set creation");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_zip_is_reported_and_does_not_stop_the_scan() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            std::fs::write(root.path().join("L_001.fits"), light(1)).unwrap();
+            std::fs::write(root.path().join("bad.zip"), b"this is not a zip archive").unwrap();
+            let result = run_scan(parallel, root.path(), &conn);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}");
+            assert!(
+                result.errors.iter().any(|e| e.contains("bad.zip")),
+                "parallel={parallel}: the unreadable zip is named in the scan errors: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn zip_rows_do_not_enter_personal_sync_new_file_ids() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        std::fs::write(root.path().join("L_001.fits"), light(1)).unwrap();
+        make_zip(root.path(), "n.zip", &[("L_010.fits", light(10))], ArchiveCompression::Store);
+        let result = run_scan(true, root.path(), &conn);
+        let disk_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE archive_zip_path IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(result.new_file_ids, vec![disk_id], "zip-resident files stay ineligible for sync");
+    }
+
+    struct Recorder(Mutex<Vec<(String, serde_json::Value)>>);
+    impl ProgressEmitter for Recorder {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event_name.to_string(), payload));
+        }
+    }
+
+    #[test]
+    fn the_zip_pass_reports_the_zips_phase_per_zip_with_its_name() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        make_zip(root.path(), "alpha.zip", &[("L_001.fits", light(1))], ArchiveCompression::Store);
+        make_zip(root.path(), "beta.zip", &[("L_002.fits", light(2))], ArchiveCompression::Store);
+        let rec = Recorder(Mutex::new(Vec::new()));
+        scan_directory_parallel(root.path(), 1, &conn, &rec, Arc::new(AtomicBool::new(false)), false);
+        let events = rec.0.lock().unwrap();
+        let zips: Vec<(String, u64, u64)> = events
+            .iter()
+            .filter(|(name, p)| name == "scan-progress" && p["phase"] == "zips")
+            .map(|(_, p)| (p["current_file"].as_str().unwrap_or("").to_string(), p["current"].as_u64().unwrap(), p["total"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(zips.len(), 2, "{zips:?}");
+        assert_eq!(zips[0], ("alpha.zip".to_string(), 1, 2));
+        assert_eq!(zips[1], ("beta.zip".to_string(), 2, 2));
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_between_zips() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        make_zip(root.path(), "alpha.zip", &[("L_001.fits", light(1))], ArchiveCompression::Store);
+        make_zip(root.path(), "beta.zip", &[("L_002.fits", light(2))], ArchiveCompression::Store);
+
+        struct CancelOnFirstZip(Arc<AtomicBool>);
+        impl ProgressEmitter for CancelOnFirstZip {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                if event_name == "scan-progress" && payload["phase"] == "zips" {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_directory_parallel(root.path(), 1, &conn, &CancelOnFirstZip(cancel.clone()), cancel, false);
+        assert!(result.cancelled);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM zip_archives"),
+            1,
+            "the zip in flight finishes; the next one is not started"
+        );
     }
 }

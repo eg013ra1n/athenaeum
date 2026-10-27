@@ -6,6 +6,8 @@ const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
   discovery: { label: 'Discovering files...', icon: FolderSearch },
   processing: { label: 'Processing files', icon: Loader2 },
   inserting: { label: 'Saving to database', icon: Database },
+  // Zip archives are read after the frame files, one zip at a time (name in `current_file`).
+  zips: { label: 'Reading zip archives', icon: FolderSearch },
   calibrating: { label: 'Creating calibration sets', icon: Sparkles },
   // The master-hash pass reads every header-shortlisted master in full —
   // minutes over a network share — so it has its own phase with a per-file

@@ -4,3 +4,4 @@
 //! extracts one entry to a local file. Zips are read-only here.
 
 pub mod reader;
+pub mod scan;
