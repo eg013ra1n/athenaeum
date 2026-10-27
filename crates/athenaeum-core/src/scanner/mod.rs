@@ -170,14 +170,22 @@ struct ZipPass {
     inserted: Vec<(i64, ImageType)>,
     files_inserted: usize,
     adopted: usize,
+    /// Known entries re-parsed in place (their CRC changed).
+    updated: usize,
     errors: Vec<String>,
     cancelled: bool,
 }
 
 impl ZipPass {
-    /// A row was inserted or adopted: the duplicate caches have something new to rebuild from.
+    /// A row was inserted, adopted or re-parsed in place: the duplicate caches have something new
+    /// to rebuild from.
     fn changed_catalog(&self) -> bool {
-        self.files_inserted + self.adopted > 0
+        self.files_inserted + self.adopted + self.updated > 0
+    }
+
+    /// Rows this pass wrote, for `ScanResult::files_processed`.
+    fn rows_written(&self) -> usize {
+        self.files_inserted + self.adopted + self.updated
     }
 }
 
@@ -203,6 +211,7 @@ fn run_zip_pass(
             Ok(outcome) => {
                 pass.files_inserted += outcome.files_inserted;
                 pass.adopted += outcome.adopted;
+                pass.updated += outcome.updated;
                 pass.inserted.extend(outcome.inserted);
                 pass.errors.extend(outcome.errors);
             }
@@ -331,7 +340,8 @@ pub fn scan_directory(
         let existing = conn
             .query_row(
                 "SELECT id, size, modified_at,
-                        EXISTS(SELECT 1 FROM frames WHERE file_id = files.id)
+                        EXISTS(SELECT 1 FROM frames WHERE file_id = files.id),
+                        (archive_zip_path IS NOT NULL AND archived_in_operation IS NOT NULL)
                  FROM files WHERE path = ?1",
                 rusqlite::params![path_str],
                 |row| {
@@ -340,11 +350,29 @@ pub fn scan_directory(
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
             .ok();
-        if let Some((file_id, db_size, db_modified, has_frame)) = existing {
+        if let Some((file_id, db_size, db_modified, has_frame, zip_resident_ours)) = existing {
+            // A file at the original path of a frame Move and ZIP put into a zip: the user
+            // unzipped it by hand. Never re-parsed into the zip-resident row.
+            if zip_resident_ours {
+                match crate::zip_store::scan::reconcile_hand_restored_row(conn, file_id, file_path) {
+                    Ok(crate::zip_store::scan::HandRestore::BecameDiskRow) => {
+                        *processed.lock().unwrap() += 1;
+                    }
+                    Ok(_) => {
+                        *skipped.lock().unwrap() += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!(root_id, file_id, path = %file_path.display(), error = %format!("{e:#}"), "hand-restored archive row check failed");
+                        errors.lock().unwrap().push(format!("{}: {e:#}", file_path.display()));
+                    }
+                }
+                continue;
+            }
             let on_disk = std::fs::metadata(file_path).ok().map(|m| {
                 let size = m.len() as i64;
                 let modified = m
@@ -433,7 +461,7 @@ pub fn scan_directory(
             }
         },
     );
-    *processed.lock().unwrap() += zip_pass.files_inserted + zip_pass.adopted;
+    *processed.lock().unwrap() += zip_pass.rows_written();
     errors.lock().unwrap().extend(zip_pass.errors.iter().cloned());
     for (frame_id, imagetyp) in zip_pass.inserted {
         match imagetyp {
@@ -1706,7 +1734,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     result.files_found = files.len();
     zips.sort();
-    tracing::info!(count = files.len(), zips = zips.len(), stage = "discovery", "file discovery complete");
+    tracing::info!(count = files.len(), stage = "discovery", "file discovery complete");
+    tracing::debug!(count = zips.len(), stage = "discovery", "zip files found");
 
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1764,11 +1793,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // `SELECT id FROM files` (N+1) query. `has_frame` is the C3 guard: a
     // files row with no frames row is never "unchanged" (see below).
     tracing::debug!(root_id, "building existing files map from DB");
-    let existing_files: std::collections::HashMap<String, (i64, i64, String, bool)> = {
+    let existing_files: std::collections::HashMap<String, (i64, i64, String, bool, bool)> = {
         let mut map = std::collections::HashMap::new();
         match conn.prepare(
             "SELECT f.path, f.id, f.size, f.modified_at,
-                    EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id)
+                    EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id),
+                    (f.archive_zip_path IS NOT NULL AND f.archived_in_operation IS NOT NULL)
              FROM files f",
         ) {
             Ok(mut stmt) => {
@@ -1779,11 +1809,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, bool>(4)?,
+                        row.get::<_, bool>(5)?,
                     ))
                 }) {
                     Ok(rows) => {
                         for entry in rows.flatten() {
-                            map.insert(entry.0, (entry.1, entry.2, entry.3, entry.4));
+                            map.insert(entry.0, (entry.1, entry.2, entry.3, entry.4, entry.5));
                         }
                     }
                     Err(e) => {
@@ -1811,7 +1842,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             let path_str = p.to_string_lossy().to_string();
             match existing_files.get(&path_str) {
                 None => true,
-                Some((db_id, db_size, db_modified, has_frame)) => {
+                Some((db_id, db_size, db_modified, has_frame, zip_resident_ours)) => {
                     match std::fs::metadata(p) {
                         Ok(meta) => {
                             let on_disk_size = meta.len() as i64;
@@ -1824,9 +1855,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                             // frame_count == 0 self-heal in
                             // reparse_and_update_in_place can recreate the
                             // frame (audit C3).
+                            // A zip-resident row of Move and ZIP is never "unchanged" while a disk
+                            // file sits at its path: the write loop decides what that file is.
                             let unchanged = on_disk_size == *db_size
                                 && on_disk_modified.as_deref() == Some(db_modified.as_str())
-                                && *has_frame;
+                                && *has_frame
+                                && !*zip_resident_ours;
                             if unchanged {
                                 false
                             } else {
@@ -2055,6 +2089,24 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     "stacking artifact (ATH_REG/ATH_STK) — never cataloged"
                 );
                 continue;
+            }
+        }
+
+        // A disk file at the original path of a frame Move and ZIP put into a zip (the user unzipped
+        // it by hand): decided before any move detection, and never re-parsed into the zip row.
+        if let Some(&row_id) = modified_files_by_path.get(&file_result.file.path) {
+            match crate::zip_store::scan::reconcile_hand_restored_row(conn, row_id, Path::new(&file_result.file.path)) {
+                Ok(crate::zip_store::scan::HandRestore::NotApplicable) => {}
+                Ok(crate::zip_store::scan::HandRestore::BecameDiskRow) => {
+                    result.files_processed += 1;
+                    continue;
+                }
+                Ok(crate::zip_store::scan::HandRestore::Differs) => continue,
+                Err(e) => {
+                    tracing::error!(root_id, file_id = row_id, path = %file_result.file.path, error = %format!("{e:#}"), "hand-restored archive row check failed");
+                    result.errors.push(format!("{}: {e:#}", file_result.file.path));
+                    continue;
+                }
             }
         }
 
@@ -2342,11 +2394,13 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             );
         },
     );
-    if zip_pass.cancelled {
-        result.cancelled = true;
-    }
+    // A cancel during the zips phase is reported at the end, after the steps below ran for what
+    // this scan has already committed: the disk rows are committed and every finished zip has its
+    // stat recorded, so a next scan sees all of it as unchanged and would never create the
+    // calibration sets or rebuild the caches for it.
+    let cancelled_in_zip_pass = zip_pass.cancelled;
     let zips_changed_catalog = zip_pass.changed_catalog();
-    result.files_processed += zip_pass.files_inserted;
+    result.files_processed += zip_pass.rows_written();
     result.errors.extend(zip_pass.errors.iter().cloned());
     for (frame_id, imagetyp) in zip_pass.inserted {
         match imagetyp {
@@ -2370,7 +2424,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     result.darkflats_count = darkflat_frame_ids.len();
     result.new_file_ids = new_file_ids;
 
-    // Skip calibration and caching phases if cancelled
+    // Skip calibration and caching phases if cancelled (a cancel before this point returned already)
     if !result.cancelled {
         // Phase 3: Create calibration sets
         let has_calibration_frames = !flat_frame_ids.is_empty()
@@ -2454,6 +2508,10 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
             }
         }
+    }
+
+    if cancelled_in_zip_pass {
+        result.cancelled = true;
     }
 
     // Emit completion
@@ -4645,5 +4703,128 @@ mod zip_pass_tests {
             1,
             "the zip in flight finishes; the next one is not started"
         );
+    }
+
+    /// A frame Move and ZIP put into `root/zips/n.zip`: a zip-resident row of ours whose
+    /// `files.path` is the original disk path `root/L_001.fits` (nothing is there). Returns the row id.
+    fn archived_by_move_and_zip(conn: &Connection, root: &Path, bytes: &[u8]) -> i64 {
+        std::fs::create_dir_all(root.join("zips")).unwrap();
+        let zip = make_zip(&root.join("zips"), "n.zip", &[("Lights/L_001.fits", bytes.to_vec())], ArchiveCompression::Store);
+        crate::zip_store::scan::scan_zip(conn, &zip, 1, false).unwrap();
+        let id: i64 = conn.query_row("SELECT id FROM files", [], |r| r.get(0)).unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute(
+            "UPDATE files SET path = ?1, archived_in_operation = 77 WHERE id = ?2",
+            params![root.join("L_001.fits").to_str().unwrap(), id],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_frame_unzipped_by_hand_to_its_original_path_becomes_a_disk_row_again() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            let bytes = light(5);
+            let id = archived_by_move_and_zip(&conn, root.path(), &bytes);
+            let frame_id: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", params![id], |r| r.get(0)).unwrap();
+            std::fs::write(root.path().join("L_001.fits"), &bytes).unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}: no second row");
+            let (zip_col, entry, crc, size): (Option<String>, Option<String>, Option<i64>, i64) = conn
+                .query_row(
+                    "SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32, size FROM files WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!((zip_col, entry, crc), (None, None, None), "parallel={parallel}: zip markers cleared");
+            assert_eq!(size, bytes.len() as i64, "parallel={parallel}: size from the disk file");
+            let frame_after: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", params![id], |r| r.get(0)).unwrap();
+            assert_eq!(frame_after, frame_id, "parallel={parallel}: metadata and ids are kept");
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM zip_released_entries WHERE entry_path = 'Lights/L_001.fits'"),
+                1,
+                "parallel={parallel}: the zip entry is released"
+            );
+
+            // A second scan changes nothing and does not bring the entry back from the zip.
+            let again = run_scan(parallel, root.path(), &conn);
+            assert!(again.errors.is_empty(), "{:?}", again.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}");
+        }
+    }
+
+    #[test]
+    fn a_different_file_at_the_original_path_of_an_archived_frame_leaves_the_row_alone() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            let id = archived_by_move_and_zip(&conn, root.path(), &light(5));
+            let before: (String, String, Option<i64>) = conn
+                .query_row("SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1", params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap();
+            // A different frame (other header) was copied to the old path.
+            std::fs::write(root.path().join("L_001.fits"), light(99)).unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}: nothing is inserted at the taken path");
+            let after: (String, String, Option<i64>) = conn
+                .query_row("SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1", params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(after, before, "parallel={parallel}: the row stays zip-resident");
+            let fp_rows: i64 = count(&conn, "SELECT COUNT(*) FROM fits_header");
+            assert_eq!(fp_rows, 1, "parallel={parallel}");
+            let header: String = conn.query_row("SELECT header FROM fits_header WHERE file_id = ?1", params![id], |r| r.get(0)).unwrap();
+            assert!(
+                header.contains(&format!("SEQNUM  = {:>20}", 5)) && !header.contains(&format!("SEQNUM  = {:>20}", 99)),
+                "parallel={parallel}: nothing was re-parsed into the row: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_zips_phase_still_creates_calibration_sets_for_the_disk_frames() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        std::fs::write(
+            root.path().join("F_001.fits"),
+            fits_bytes_typed("Flat", &["SEQNUM  =                    1".to_string()]),
+        )
+        .unwrap();
+        make_zip(root.path(), "alpha.zip", &[("L_001.fits", light(1))], ArchiveCompression::Store);
+        make_zip(root.path(), "beta.zip", &[("L_002.fits", light(2))], ArchiveCompression::Store);
+
+        struct CancelOnFirstZip(Arc<AtomicBool>);
+        impl ProgressEmitter for CancelOnFirstZip {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                if event_name == "scan-progress" && payload["phase"] == "zips" {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_directory_parallel(root.path(), 1, &conn, &CancelOnFirstZip(cancel.clone()), cancel, false);
+        assert!(result.cancelled, "the cancel is still reported");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 1, "the second zip was not started");
+        assert_eq!(result.flats_count, 1);
+        assert!(result.calibration_sets_created >= 1, "the committed flat gets its set: {}", result.calibration_sets_created);
+        assert!(count(&conn, "SELECT COUNT(*) FROM calibration_set") >= 1);
+    }
+
+    #[test]
+    fn an_in_place_reparse_of_a_zip_entry_counts_as_a_catalog_change() {
+        let pass = ZipPass { updated: 1, ..Default::default() };
+        assert!(pass.changed_catalog());
+        assert_eq!(pass.rows_written(), 1);
+        assert!(!ZipPass::default().changed_catalog());
     }
 }

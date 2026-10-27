@@ -50,7 +50,7 @@ pub struct ZipEntryInfo {
 pub struct ZipListing {
     pub entries: Vec<ZipEntryInfo>,
     /// Entries that are not listed, with why: `"unsafe name"`, `"appledouble"`, `"nested zip"`,
-    /// `"encrypted"`, `"unsupported method"` (neither stored nor deflated), `"unreadable"`. Directories are not entries and are not reported.
+    /// `"backslash name"` (a `\` in the name), `"encrypted"`, `"unsupported method"` (neither stored nor deflated), `"unreadable"`. Directories are not entries and are not reported.
     pub skipped: Vec<(String, &'static str)>,
     /// Bytes pulled from the zip file for this listing.
     pub bytes_read: u64,
@@ -142,6 +142,12 @@ fn skip_reason_for_name(name: &str) -> Option<&'static str> {
     }
     if has_extension(name, &["zip"]) {
         return Some("nested zip");
+    }
+    // Older Windows zip tools write `\` as the separator. The catalog and the unpack target both
+    // split entry paths on `/` only, so such a name would be one odd file name on macOS and a
+    // folder tree on Windows: skip it rather than give it two shapes.
+    if name.contains('\\') {
+        return Some("backslash name");
     }
     None
 }
@@ -529,6 +535,7 @@ mod reader_tests {
             "inner.zip",
             "C:evil.fits",
             "..\\w.fits",
+            "Lights\\L_001.fits",
         ];
         let mut files: Vec<(&str, Vec<u8>)> = hostile.iter().map(|n| (*n, fits.clone())).collect();
         files.push(("good.fits", fits.clone()));
@@ -547,6 +554,8 @@ mod reader_tests {
         assert_eq!(reason("__MACOSX/._L.fit"), "appledouble");
         assert_eq!(reason("._L.fit"), "appledouble");
         assert_eq!(reason("inner.zip"), "nested zip");
+        assert_eq!(reason("Lights\\L_001.fits"), "backslash name");
+        assert_eq!(reason("..\\w.fits"), "unsafe name", "the unsafe check comes first");
     }
 
     #[test]

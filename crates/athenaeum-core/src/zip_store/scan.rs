@@ -5,12 +5,18 @@
 //! directory, then the entries not yet owned by a row, through one 4 KiB-buffered header pass. A new
 //! entry either takes over a catalog row that moved into the zip ([`find_moved_row`]) or becomes a
 //! new row with a virtual path. Rows of entries that vanished from a changed zip are left alone:
-//! nothing here deletes.
+//! nothing here deletes a frame row.
+//!
+//! A zip that was moved or renamed outside the app keeps its identity: when its entries are adopted
+//! from a zip that is gone, the gone zip's `zip_archives` row (created-by operation, released
+//! entries) moves to the new path and the old row is dropped once no row points at it.
 
 use crate::db::{insert_file, insert_fits_header, insert_frame, SavepointGuard};
 use crate::fits_parser::stored_header::parse_stored_header_keys;
-use crate::fits_parser::{calibrated_light_identity, parse_fits_header_bytes, parse_xisf_header_bytes};
-use crate::models::{File, FileFormat, ImageType};
+use crate::fits_parser::{
+    calibrated_light_identity, extract_xisf_header, parse_fits_header_bytes, parse_fits_with_header, parse_xisf_header_bytes,
+};
+use crate::models::{File, FileFormat, Frame, ImageType};
 use crate::scanner::{path_to_utf8, path_under_unavailable_scan_root};
 use crate::zip_store::reader::{self, ZipEntryInfo};
 use anyhow::{Context, Result};
@@ -30,6 +36,8 @@ pub struct ZipScanOutcome {
     pub inserted: Vec<(i64, ImageType)>,
     /// Catalog rows that took over a moved frame instead of being inserted.
     pub adopted: usize,
+    /// Known entries re-parsed in place because their CRC changed.
+    pub updated: usize,
     /// Bytes pulled from the zip file (directory + entry headers).
     pub bytes_read: u64,
     /// Rows inserted, whether or not the frame has an image type.
@@ -48,16 +56,48 @@ pub fn virtual_path(zip: &Path, entry: &str) -> String {
     out
 }
 
+/// Whether the row found by fingerprint has really moved away from `old_location` (the row's file,
+/// or for a zip-resident row its zip): `false` when the old location is still there (the new file
+/// is a duplicate) or sits under an unavailable scan root (an unmounted volume).
+fn old_location_is_gone(conn: &Connection, file_id: i64, old_path: &str, old_location: &str, new_path: &str) -> Result<bool> {
+    if Path::new(old_location).exists() {
+        tracing::debug!(
+            old_path = %old_path,
+            path = %new_path,
+            file_id,
+            "duplicate file detected (identical header)"
+        );
+        return Ok(false);
+    }
+    if let Some(offline_root) = path_under_unavailable_scan_root(conn, old_location)? {
+        // The old location is missing only because its scan root is offline (unmounted volume): not a
+        // move. Falling through keeps the still-valid original untouched.
+        tracing::warn!(
+            old_path = %old_path,
+            path = %new_path,
+            offline_root = %offline_root,
+            file_id,
+            "skipping move-detection: old path's scan root is unavailable"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// The row a new file at `new_path` with this header fingerprint should take over, if any: the
 /// scanner's moved-file rule, shared by the disk walkers (`for_zip_entry = false`) and the zip pass
 /// (`true`).
 ///
-/// Same query for both: a row with the fingerprint at another path (first row wins). A disk file
-/// never matches a zip-resident row (`archive_zip_path IS NULL`), so a manually unzipped copy of an
-/// archived frame is a new row, not a takeover. The row is a move only when its old location is
-/// gone: for a disk row its file, for a zip-resident row (zip entries only) its zip. If the old
-/// location is still there the new file is a duplicate; if it sits under an unavailable scan root
-/// (unmounted volume) it is not a move either. Both return `None`.
+/// A row with the fingerprint at another path. A disk file never matches a zip-resident row
+/// (`archive_zip_path IS NULL`), so a manually unzipped copy of an archived frame is a new row, not
+/// a takeover; for a disk file the first row wins, as it always did. The row is a move only when its
+/// old location is gone: for a disk row its file, for a zip-resident row (zip entries only) its
+/// zip. If the old location is still there the new file is a duplicate; if it sits under an
+/// unavailable scan root (unmounted volume) it is not a move either. Both give `None`.
+///
+/// A zip entry looks at every row with the fingerprint, in id order, and takes the first one whose
+/// old location is gone: a backup copy that is still present must not hide the row of the zip that
+/// was just renamed.
 ///
 /// Returns the row's id and its `files.path`.
 pub(crate) fn find_moved_row(
@@ -66,46 +106,117 @@ pub(crate) fn find_moved_row(
     new_path: &str,
     for_zip_entry: bool,
 ) -> Result<Option<(i64, String)>> {
-    let disk_only = if for_zip_entry { "" } else { " AND f.archive_zip_path IS NULL" };
-    let sql = format!(
-        "SELECT f.id, f.path, f.archive_zip_path FROM files f
-         INNER JOIN fits_header fh ON f.id = fh.file_id
-         WHERE fh.header_fingerprint = ?1 AND f.path != ?2{disk_only}"
-    );
-    let found: Option<(i64, String, Option<String>)> = conn
-        .query_row(&sql, params![fingerprint, new_path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    if for_zip_entry {
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.path, f.archive_zip_path FROM files f
+             INNER JOIN fits_header fh ON f.id = fh.file_id
+             WHERE fh.header_fingerprint = ?1 AND f.path != ?2
+             ORDER BY f.id",
+        )?;
+        let candidates = stmt
+            .query_map(params![fingerprint, new_path], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (file_id, old_path, row_zip) in candidates {
+            let old_location = row_zip.unwrap_or_else(|| old_path.clone());
+            if old_location_is_gone(conn, file_id, &old_path, &old_location, new_path)? {
+                return Ok(Some((file_id, old_path)));
+            }
+        }
+        return Ok(None);
+    }
+
+    let found: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT f.id, f.path FROM files f
+             INNER JOIN fits_header fh ON f.id = fh.file_id
+             WHERE fh.header_fingerprint = ?1 AND f.path != ?2 AND f.archive_zip_path IS NULL",
+            params![fingerprint, new_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .optional()?;
-    let Some((file_id, old_path, row_zip)) = found else {
+    let Some((file_id, old_path)) = found else {
         return Ok(None);
     };
-    // What has to be gone for this to be a move: the row's file, or (a zip-resident row) its zip.
-    let old_location = match row_zip {
-        Some(zip) if for_zip_entry => zip,
-        _ => old_path.clone(),
-    };
-    if Path::new(&old_location).exists() {
-        tracing::debug!(
-            old_path = %old_path,
-            path = %new_path,
-            file_id,
-            "duplicate file detected (identical header)"
-        );
-        return Ok(None);
+    if old_location_is_gone(conn, file_id, &old_path, &old_path, new_path)? {
+        Ok(Some((file_id, old_path)))
+    } else {
+        Ok(None)
     }
-    if let Some(offline_root) = path_under_unavailable_scan_root(conn, &old_location)? {
-        // The old location is missing only because its scan root is offline (unmounted volume): not a
-        // move. Falling through keeps the still-valid original untouched.
+}
+
+/// What [`reconcile_hand_restored_row`] found at a disk path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HandRestore {
+    /// The row at this path is not a zip-resident row of Move and ZIP: the caller carries on as usual.
+    NotApplicable,
+    /// The frame was unzipped by hand to its original path: the row is a disk row again.
+    BecameDiskRow,
+    /// A different file sits at the original path of an archived frame: the row is untouched.
+    Differs,
+}
+
+/// A disk file turned up at the path (`files.path`, the restore target) of a zip-resident row that
+/// Move and ZIP wrote (`archived_in_operation` set), i.e. the user unzipped the frame by hand.
+///
+/// If the file's header fingerprint equals the row's, the row becomes a disk row: zip markers and CRC
+/// cleared, size and mtime from the file, the entry recorded in `zip_released_entries` so a later
+/// scan of the zip does not add it again; metadata, ids and every junction row stay. If the
+/// fingerprint differs, the row is left exactly as it is, nothing is parsed into it, and the
+/// mismatch is a warning (once per scan, as the walker meets the path once).
+pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path: &Path) -> Result<HandRestore> {
+    let row: Option<(Option<String>, Option<String>, bool)> = conn
+        .query_row(
+            "SELECT archive_zip_path, archive_path_in_zip, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
+            params![file_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((Some(zip_path), entry, true)) = row else {
+        return Ok(HandRestore::NotApplicable);
+    };
+
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let header = if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xisf")) {
+        extract_xisf_header(path)
+    } else {
+        parse_fits_with_header(path, file_id).map(|(_, h)| h)
+    }
+    .with_context(|| format!("read the header of {}", path.display()))?;
+    let disk_fingerprint = crate::fingerprint::compute_header_fingerprint(&header);
+    let stored_fingerprint: Option<String> = conn
+        .query_row("SELECT header_fingerprint FROM fits_header WHERE file_id = ?1", params![file_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+
+    if stored_fingerprint.as_deref() != Some(disk_fingerprint.as_str()) {
         tracing::warn!(
-            old_path = %old_path,
-            old_location = %old_location,
-            path = %new_path,
-            offline_root = %offline_root,
             file_id,
-            "skipping move-detection: old path's scan root is unavailable"
+            path = %path.display(),
+            zip_path = %zip_path,
+            "a different file sits at the original path of an archived frame — the catalog row is left as it is"
         );
-        return Ok(None);
+        return Ok(HandRestore::Differs);
     }
-    Ok(Some((file_id, old_path)))
+
+    let modified: DateTime<Utc> = DateTime::from(metadata.modified().with_context(|| format!("mtime of {}", path.display()))?);
+    let sp = SavepointGuard::new(conn, "scan_hand_restored")?;
+    conn.execute(
+        "UPDATE files SET archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL,
+                size = ?1, modified_at = ?2 WHERE id = ?3",
+        params![metadata.len() as i64, modified.to_rfc3339(), file_id],
+    )?;
+    if let Some(entry) = entry {
+        conn.execute(
+            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
+             SELECT id, ?1 FROM zip_archives WHERE path = ?2",
+            params![entry, zip_path],
+        )?;
+    }
+    sp.commit()?;
+    tracing::info!(file_id, path = %path.display(), zip_path = %zip_path, "archived frame unzipped by hand — the row is a disk row again");
+    Ok(HandRestore::BecameDiskRow)
 }
 
 /// `INSTRUME` as stored for a frame living under `root_id`: the base name (any previous
@@ -131,14 +242,34 @@ enum EntryOutcome {
     /// Calibrated light or stacking artifact: never cataloged.
     Skipped,
     Inserted { frame_id: i64, imagetyp: Option<ImageType> },
-    Adopted,
+    /// A row took over this entry; `from_zip` is the zip the row was resident in before (a zip that is gone).
+    Adopted { from_zip: Option<String> },
     Updated,
 }
 
-/// Catalog one entry whose header bytes were read. `known_id` is the row that already owns the
-/// entry (its CRC changed), or `None` for an entry no row owns.
+/// An entry whose header is parsed and that no row took over yet: it is inserted unless the zip's
+/// released entries (including those of the zip it was moved from) name it.
+struct ParsedEntry {
+    vpath: String,
+    filename: String,
+    format: FileFormat,
+    frame: Frame,
+    header: String,
+    modified: DateTime<Utc>,
+    size: i64,
+    crc: i64,
+}
+
+enum Staged {
+    Done(EntryOutcome),
+    Pending(Box<ParsedEntry>),
+}
+
+/// First half of cataloging one entry whose header bytes were read: parse it, apply the never-cataloged
+/// rules, re-parse a known entry in place (`known_id`: the row that already owns the entry, its CRC
+/// changed), and let a moved catalog row adopt it. What is left is [`Staged::Pending`].
 #[allow(clippy::too_many_arguments)]
-fn catalog_entry(
+fn stage_entry(
     conn: &Connection,
     zip: &Path,
     zip_str: &str,
@@ -148,10 +279,10 @@ fn catalog_entry(
     zip_modified: DateTime<Utc>,
     root_id: i64,
     unique_camera: bool,
-) -> Result<EntryOutcome> {
+) -> Result<Staged> {
     let vpath = virtual_path(zip, &entry.path);
     let format = if entry.path.to_ascii_lowercase().ends_with(".xisf") { FileFormat::XISF } else { FileFormat::FITS };
-    let (mut frame, header) = match format {
+    let (frame, header) = match format {
         FileFormat::FITS => parse_fits_header_bytes(header_bytes, 0, Path::new(&vpath)),
         FileFormat::XISF => parse_xisf_header_bytes(header_bytes, 0, Path::new(&vpath)),
     }?;
@@ -177,18 +308,18 @@ fn catalog_entry(
         )?;
         conn.execute("UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2", params![crc, file_id])?;
         sp.commit()?;
-        return Ok(EntryOutcome::Updated);
+        return Ok(Staged::Done(EntryOutcome::Updated));
     }
 
     // Never cataloged, the same rules as a disk file (`process_file`).
     let keys = parse_stored_header_keys(format.clone(), &header);
     if calibrated_light_identity(&keys).is_some() {
         tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "calibrated artifact (CALSTAT+ATH_CSRC) — never cataloged");
-        return Ok(EntryOutcome::Skipped);
+        return Ok(Staged::Done(EntryOutcome::Skipped));
     }
     if keys.contains_key("ATH_REG") || keys.contains_key("ATH_STK") {
         tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "stacking artifact (ATH_REG/ATH_STK) — never cataloged");
-        return Ok(EntryOutcome::Skipped);
+        return Ok(Staged::Done(EntryOutcome::Skipped));
     }
 
     let filename = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
@@ -206,10 +337,10 @@ fn catalog_entry(
         // A row of Move and ZIP's own keeps its original `files.path` (the restore target) and
         // its camera suffix: only its zip markers follow the zip. Any other row becomes a foreign
         // zip-resident row.
-        let ours: bool = conn.query_row(
-            "SELECT archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
+        let (from_zip, ours): (Option<String>, bool) = conn.query_row(
+            "SELECT archive_zip_path, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
             params![file_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if ours {
             conn.execute(
@@ -237,10 +368,15 @@ fn catalog_entry(
             })?;
         }
         sp.commit()?;
-        return Ok(EntryOutcome::Adopted);
+        return Ok(Staged::Done(EntryOutcome::Adopted { from_zip }));
     }
 
-    // A new row: files + frames + fits_header all commit or none do.
+    Ok(Staged::Pending(Box::new(ParsedEntry { vpath, filename, format, frame, header, modified, size, crc })))
+}
+
+/// Second half: insert a new row (files + frames + fits_header all commit or none do).
+fn insert_entry(conn: &Connection, zip_str: &str, entry: &ZipEntryInfo, parsed: ParsedEntry, root_id: i64, unique_camera: bool) -> Result<EntryOutcome> {
+    let ParsedEntry { vpath, filename, format, mut frame, header, modified, size, crc } = parsed;
     let sp = SavepointGuard::new(conn, "scan_zip_entry")?;
     let file = File {
         id: None,
@@ -274,15 +410,103 @@ fn catalog_entry(
     Ok(EntryOutcome::Inserted { frame_id, imagetyp: frame.imagetyp.clone() })
 }
 
+/// Running totals of one [`scan_zip`].
+struct Tally {
+    outcome: ZipScanOutcome,
+    /// Frames the zip holds now that a row owns after this scan.
+    cataloged: usize,
+    /// Zips that are gone and supplied at least one adopted row, in the order they were met.
+    gone_zips: Vec<String>,
+    /// An entry could not be read or parsed: the zip's stat is not recorded, so the next scan retries it.
+    entry_failed: bool,
+}
+
+impl Tally {
+    fn record(&mut self, done: EntryOutcome) {
+        match done {
+            EntryOutcome::Skipped => {}
+            EntryOutcome::Inserted { frame_id, imagetyp } => {
+                self.cataloged += 1;
+                self.outcome.files_inserted += 1;
+                if let Some(t) = imagetyp {
+                    self.outcome.inserted.push((frame_id, t));
+                }
+            }
+            EntryOutcome::Adopted { from_zip } => {
+                self.cataloged += 1;
+                self.outcome.adopted += 1;
+                if let Some(g) = from_zip {
+                    if !self.gone_zips.contains(&g) {
+                        self.gone_zips.push(g);
+                    }
+                }
+            }
+            EntryOutcome::Updated => {
+                self.cataloged += 1;
+                self.outcome.updated += 1;
+            }
+        }
+    }
+}
+
+fn released_entries_of(conn: &Connection, zip_path: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.entry_path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id WHERE z.path = ?1",
+    )?;
+    let rows = stmt.query_map(params![zip_path], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+/// The zip at `new_zip_id` took over rows from `gone`, a zip that no longer exists: move `gone`'s
+/// identity along. Its released entries are copied to the new zip, its `created_by_operation` is
+/// carried (unless the new row has its own), its black-hole record follows, and the old
+/// `zip_archives` row is deleted once no `files` row points at its path any more (rows of entries
+/// the new zip does not hold stay pointed at it, and stay missing).
+fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gone: &str) -> Result<()> {
+    if gone == new_zip_path {
+        return Ok(());
+    }
+    let old: Option<(i64, Option<i64>)> = conn
+        .query_row("SELECT id, created_by_operation FROM zip_archives WHERE path = ?1", params![gone], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((old_id, old_operation)) = old else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
+         SELECT ?1, entry_path FROM zip_released_entries WHERE zip_id = ?2",
+        params![new_zip_id, old_id],
+    )?;
+    if let Some(op) = old_operation {
+        conn.execute(
+            "UPDATE zip_archives SET created_by_operation = ?1 WHERE id = ?2 AND created_by_operation IS NULL",
+            params![op, new_zip_id],
+        )?;
+    }
+    let still_referenced: i64 =
+        conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1", params![gone], |r| r.get(0))?;
+    if still_referenced == 0 {
+        conn.execute("UPDATE OR IGNORE black_hole_zips SET zip_id = ?1 WHERE zip_id = ?2", params![new_zip_id, old_id])?;
+        conn.execute("DELETE FROM zip_archives WHERE id = ?1", params![old_id])?;
+    }
+    tracing::debug!(zip_id = new_zip_id, old_path = %gone, path = %new_zip_path, "zip identity moved to the zip's new location");
+    Ok(())
+}
+
 /// Catalog the frames inside one zip. The zip's stat is compared first; an unchanged zip is not
 /// opened. Otherwise: read the directory; entries already owned by a row (`archive_zip_path` +
 /// `archive_path_in_zip`) are known, and re-parsed in place only when their CRC changed; entries
 /// in `zip_released_entries` are skipped; the rest go through one header pass and are adopted by a
-/// moved row or inserted. The whole zip is one transaction (one savepoint per entry inside it).
+/// moved row or inserted. All adoptions are decided before the first insert, because an adoption
+/// from a zip that is gone also brings that zip's released entries (frames the user unpacked), which
+/// must not come back as new rows. The whole zip is one transaction (one savepoint per entry inside it).
 ///
 /// A bad entry is reported in [`ZipScanOutcome::errors`] and the rest of the zip is still
-/// cataloged; a zip that cannot be opened is an `Err` and leaves no `zip_archives` row, so the
-/// next scan retries it.
+/// cataloged, but the zip's stat is then recorded as size 0, so the next scan reads it again, as a
+/// disk file that failed is retried. A zip that cannot be opened is an `Err` and leaves no
+/// `zip_archives` row, so the next scan retries it.
 pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool) -> Result<ZipScanOutcome> {
     let zip_str = path_to_utf8(zip)?;
     let meta = std::fs::metadata(zip).with_context(|| format!("stat {}", zip.display()))?;
@@ -304,7 +528,12 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     }
 
     let listing = reader::list_entries(zip).with_context(|| format!("read the directory of {}", zip.display()))?;
-    let mut outcome = ZipScanOutcome { bytes_read: listing.bytes_read, ..Default::default() };
+    let mut tally = Tally {
+        outcome: ZipScanOutcome { bytes_read: listing.bytes_read, ..Default::default() },
+        cataloged: 0,
+        gone_zips: Vec::new(),
+        entry_failed: false,
+    };
 
     // Entries a row already owns: row id and the CRC recorded for it (NULL for rows that predate it).
     let mut known: HashMap<String, (i64, Option<i64>)> = HashMap::new();
@@ -319,17 +548,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             known.insert(entry, (id, crc));
         }
     }
-    let released: HashSet<String> = match &known_zip {
-        Some((zip_id, _, _)) => {
-            let mut stmt = conn.prepare("SELECT entry_path FROM zip_released_entries WHERE zip_id = ?1")?;
-            let rows = stmt.query_map(params![zip_id], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<HashSet<_>>>()?
-        }
+    let mut released: HashSet<String> = match &known_zip {
+        Some(_) => released_entries_of(conn, &zip_str)?,
         None => HashSet::new(),
     };
 
-    // Frames the zip holds now that a row owns after this scan; starts with the untouched known ones.
-    let mut cataloged = 0usize;
     let mut to_read: Vec<(&ZipEntryInfo, Option<i64>)> = Vec::new();
     for entry in listing.entries.iter().filter(|e| e.is_frame) {
         if released.contains(&entry.path) {
@@ -337,7 +560,7 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         }
         match known.get(&entry.path) {
             Some((id, Some(crc))) if *crc != i64::from(entry.crc32) => to_read.push((entry, Some(*id))),
-            Some(_) => cataloged += 1,
+            Some(_) => tally.cataloged += 1,
             None => to_read.push((entry, None)),
         }
     }
@@ -349,61 +572,80 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     } else {
         let (headers, header_bytes) =
             reader::read_headers(zip, &names).with_context(|| format!("read entry headers of {}", zip.display()))?;
-        outcome.bytes_read += header_bytes;
+        tally.outcome.bytes_read += header_bytes;
         headers
     };
 
     let outer = SavepointGuard::new(conn, "scan_zip")?;
+    // Pass 1: parse, update known entries, let moved rows adopt entries.
+    let mut pending: Vec<(&ZipEntryInfo, Box<ParsedEntry>)> = Vec::new();
     for ((entry, known_id), (_, header)) in to_read.iter().zip(headers) {
-        let vpath = virtual_path(zip, &entry.path);
-        let result = match header {
-            Ok(bytes) => catalog_entry(conn, zip, &zip_str, entry, *known_id, &bytes, zip_modified, root_id, unique_camera),
+        let staged = match header {
+            Ok(bytes) => {
+                stage_entry(conn, zip, &zip_str, entry, *known_id, &bytes, zip_modified, root_id, unique_camera)
+            }
             Err(e) => Err(e),
         };
-        match result {
-            Ok(EntryOutcome::Skipped) => {}
-            Ok(EntryOutcome::Inserted { frame_id, imagetyp }) => {
-                cataloged += 1;
-                outcome.files_inserted += 1;
-                if let Some(t) = imagetyp {
-                    outcome.inserted.push((frame_id, t));
-                }
-            }
-            Ok(EntryOutcome::Adopted) => {
-                cataloged += 1;
-                outcome.adopted += 1;
-            }
-            Ok(EntryOutcome::Updated) => cataloged += 1,
+        match staged {
+            Ok(Staged::Done(done)) => tally.record(done),
+            Ok(Staged::Pending(parsed)) => pending.push((entry, parsed)),
             Err(e) => {
                 tracing::warn!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, error = %format!("{e:#}"), "zip entry not cataloged");
-                outcome.errors.push(format!("{vpath}: {e:#}"));
+                tally.outcome.errors.push(format!("{}: {e:#}", virtual_path(zip, &entry.path)));
+                tally.entry_failed = true;
                 if known_id.is_some() {
-                    cataloged += 1;
+                    tally.cataloged += 1;
                 }
             }
         }
     }
 
+    // Entries the user unpacked from a zip that was then moved are released there, not here.
+    for gone in &tally.gone_zips {
+        released.extend(released_entries_of(conn, gone)?);
+    }
+
+    // Pass 2: whatever no row adopted is a new row, unless it was unpacked by the user.
+    for (entry, parsed) in pending {
+        if released.contains(&entry.path) {
+            tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "released entry not re-added");
+            continue;
+        }
+        match insert_entry(conn, &zip_str, entry, *parsed, root_id, unique_camera) {
+            Ok(done) => tally.record(done),
+            Err(e) => {
+                tracing::warn!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, error = %format!("{e:#}"), "zip entry not cataloged");
+                tally.outcome.errors.push(format!("{}: {e:#}", virtual_path(zip, &entry.path)));
+                tally.entry_failed = true;
+            }
+        }
+    }
+
+    // A zip with a failed entry keeps no stat: size 0 never equals a real zip, so the next scan reads it again.
+    let (recorded_size, recorded_modified) = if tally.entry_failed { (0, String::new()) } else { (size, modified_str) };
     conn.execute(
         "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET size = excluded.size, modified_at = excluded.modified_at,
                 frame_entries = excluded.frame_entries, scanned_at = excluded.scanned_at",
-        params![zip_str, size, modified_str, cataloged as i64, Utc::now().to_rfc3339()],
+        params![zip_str, recorded_size, recorded_modified, tally.cataloged as i64, Utc::now().to_rfc3339()],
     )?;
-    outcome.zip_id = conn.query_row("SELECT id FROM zip_archives WHERE path = ?1", params![zip_str], |r| r.get(0))?;
+    tally.outcome.zip_id = conn.query_row("SELECT id FROM zip_archives WHERE path = ?1", params![zip_str], |r| r.get(0))?;
+    for gone in &tally.gone_zips {
+        move_zip_identity(conn, tally.outcome.zip_id, &zip_str, gone)?;
+    }
     outer.commit()?;
 
     tracing::info!(
         root_id,
         zip_path = %zip.display(),
-        frames = cataloged,
-        inserted = outcome.files_inserted,
-        adopted = outcome.adopted,
-        bytes_read = outcome.bytes_read,
+        count = tally.cataloged,
+        new = tally.outcome.files_inserted,
+        updated = tally.outcome.adopted + tally.outcome.updated,
+        bytes_read = tally.outcome.bytes_read,
         "zip scanned"
     );
-    Ok(outcome)
+    Ok(tally.outcome)
 }
 
 #[cfg(test)]
@@ -631,6 +873,7 @@ mod scan_tests {
         let changed = fits_bytes(&["SEQNUM  =                    1".to_string(), "FILTER  = 'Ha      '".to_string()]);
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", changed)], ArchiveCompression::Store);
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.updated, 1, "an in-place re-parse is counted");
         assert!(outcome.inserted.is_empty(), "an in-place update inserts nothing");
         assert_eq!(id_of(&conn, &vpath), id);
         let (filter, fid): (Option<String>, i64) = conn
@@ -657,7 +900,14 @@ mod scan_tests {
             ],
             ArchiveCompression::Deflate,
         );
+        // The listing filter is what keeps them out: both are named, with their reason. Without the
+        // filter they are `.fits` frames of 120 zero bytes, which fail to parse and land in `errors`.
+        let listing = list_entries(&zip).unwrap();
+        let reasons: Vec<(&str, &str)> = listing.skipped.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+        assert!(reasons.contains(&("__MACOSX/Lights/._L_001.fits", "appledouble")), "{reasons:?}");
+        assert!(reasons.contains(&("Lights/._L_001.fits", "appledouble")), "{reasons:?}");
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.inserted.len(), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE path LIKE '%._L_001%'"), 0);
@@ -942,5 +1192,203 @@ mod scan_tests {
         assert_eq!(frames, 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
         assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged, "the next scan skips it by stat");
+    }
+
+    fn zip_archive_count(conn: &Connection) -> i64 {
+        count(conn, "SELECT COUNT(*) FROM zip_archives")
+    }
+
+    /// An `archive_operations` row for `created_by_operation` to point at.
+    fn insert_operation(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO archive_operations (archive_root_path, compression, status, started_at)
+             VALUES ('/archive', 'store', 'completed', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_zip_renamed_and_renamed_back_keeps_one_identity_and_its_operation() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let a = make_zip(
+            tmp.path(),
+            "a.zip",
+            &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&conn, &a, 1, false).unwrap();
+        let op = insert_operation(&conn);
+        conn.execute("UPDATE zip_archives SET created_by_operation = ?1", params![op]).unwrap();
+        let id1 = id_of(&conn, &virtual_path(&a, "Lights/L_001.fits"));
+
+        // Renamed in Finder: A -> B.
+        let b = tmp.path().join("b.zip");
+        std::fs::rename(&a, &b).unwrap();
+        let outcome = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 2);
+        assert_eq!(zip_archive_count(&conn), 1, "the old zip's row moved, it is not left behind as a ghost");
+        let (path, op_b): (String, Option<i64>) = conn
+            .query_row("SELECT path, created_by_operation FROM zip_archives", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(path, b.to_str().unwrap());
+        assert_eq!(op_b, Some(op), "the zip is still recognised as one of ours");
+
+        // ... and back: B -> A.
+        std::fs::rename(&b, &a).unwrap();
+        let outcome = scan_zip(&conn, &a, 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged, "a stale row must not make the zip look unchanged");
+        assert_eq!(outcome.adopted, 2);
+        assert_eq!(zip_archive_count(&conn), 1);
+        let (path, op_a): (String, Option<i64>) = conn
+            .query_row("SELECT path, created_by_operation FROM zip_archives", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(path, a.to_str().unwrap());
+        assert_eq!(op_a, Some(op));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(id_of(&conn, &virtual_path(&a, "Lights/L_001.fits")), id1);
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM files WHERE archive_zip_path = '{}'", a.to_str().unwrap())),
+            2,
+            "every row points at A again"
+        );
+    }
+
+    #[test]
+    fn an_entry_unpacked_before_the_zip_was_moved_is_not_added_again() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let a = make_zip(tmp.path(), "a.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let first = scan_zip(&conn, &a, 1, false).unwrap();
+        // The user unpacked L_001 to disk through the app: a disk row, a released entry.
+        let unpacked = tmp.path().join("unpacked").join("L_001.fits");
+        std::fs::create_dir_all(unpacked.parent().unwrap()).unwrap();
+        std::fs::write(&unpacked, light(1)).unwrap();
+        let id1 = id_of(&conn, &virtual_path(&a, "L_001.fits"));
+        conn.execute(
+            "UPDATE files SET path = ?1, archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL WHERE id = ?2",
+            params![unpacked.to_str().unwrap(), id1],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L_001.fits')", params![first.zip_id]).unwrap();
+
+        let b = tmp.path().join("b.zip");
+        std::fs::rename(&a, &b).unwrap();
+        let outcome = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1, "L_002 follows the zip");
+        assert!(outcome.inserted.is_empty(), "L_001 was unpacked: it is not a new entry of the moved zip");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(zip_archive_count(&conn), 1);
+        let released: i64 = count(
+            &conn,
+            "SELECT COUNT(*) FROM zip_released_entries r JOIN zip_archives z ON z.id = r.zip_id WHERE r.entry_path = 'L_001.fits'",
+        );
+        assert_eq!(released, 1, "the released entry belongs to the zip's new row");
+        // And it stays released on the next change of the zip.
+        let b = make_zip(
+            tmp.path(),
+            "b.zip",
+            &[("L_001.fits", light(1)), ("L_002.fits", light(2)), ("L_003.fits", light(3))],
+            ArchiveCompression::Store,
+        );
+        let again = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(again.inserted.len(), 1, "only L_003");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
+    }
+
+    #[test]
+    fn the_old_zip_row_stays_while_a_row_still_points_at_it() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let a = make_zip(tmp.path(), "a.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        scan_zip(&conn, &a, 1, false).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        // The new zip holds only one of the two frames.
+        let b = make_zip(tmp.path(), "b.zip", &[("L_001.fits", light(1))], ArchiveCompression::Store);
+        let outcome = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_eq!(zip_archive_count(&conn), 2, "L_002 still belongs to the missing a.zip");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM files WHERE archive_zip_path = '{}'", a.to_str().unwrap())),
+            1
+        );
+    }
+
+    #[test]
+    fn a_backup_copy_of_the_zip_does_not_hide_the_row_of_the_renamed_one() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("backup")).unwrap();
+        let entries = [("L_001.fits", light(1)), ("L_002.fits", light(2))];
+        // The backup is scanned first, so its rows have the lower ids.
+        let backup = make_zip(&tmp.path().join("backup"), "night.zip", &entries, ArchiveCompression::Store);
+        scan_zip(&conn, &backup, 1, false).unwrap();
+        let night = make_zip(tmp.path(), "night.zip", &entries, ArchiveCompression::Store);
+        let dup = scan_zip(&conn, &night, 1, false).unwrap();
+        assert_eq!(dup.inserted.len(), 2, "while the backup exists, the second copy is a duplicate");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 4);
+
+        let moved = tmp.path().join("moved.zip");
+        std::fs::rename(&night, &moved).unwrap();
+        let outcome = scan_zip(&conn, &moved, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 2, "the rows of the zip that is gone are taken, not the backup's");
+        assert!(outcome.inserted.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 4, "no third copy");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM files WHERE archive_zip_path = '{}'", backup.to_str().unwrap())),
+            2,
+            "the backup's rows are untouched"
+        );
+    }
+
+    #[test]
+    fn a_failed_entry_leaves_the_zip_unrecorded_so_the_next_scan_retries_it() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(
+            tmp.path(),
+            "n.zip",
+            &[("Bad.fits", b"this is not a fits file at all".to_vec()), ("L_001.fits", light(1))],
+            ArchiveCompression::Store,
+        );
+        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(first.errors.len(), 1);
+        let (size, modified): (i64, String) =
+            conn.query_row("SELECT size, modified_at FROM zip_archives", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((size, modified.as_str()), (0, ""), "no real stat is recorded");
+
+        let second = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!second.skipped_unchanged, "the zip is read again");
+        assert_eq!(second.errors.len(), 1, "and the entry is reported again");
+        assert!(second.inserted.is_empty(), "L_001 is known and not duplicated");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
+
+        // A clean zip records its stat as before.
+        let clean = make_zip(tmp.path(), "clean.zip", &[("L_009.fits", light(9))], ArchiveCompression::Store);
+        scan_zip(&conn, &clean, 1, false).unwrap();
+        let size: i64 = conn
+            .query_row("SELECT size FROM zip_archives WHERE path = ?1", params![clean.to_str().unwrap()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(size, std::fs::metadata(&clean).unwrap().len() as i64);
+    }
+
+    #[test]
+    fn backslash_named_entries_are_not_cataloged() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(
+            tmp.path(),
+            "win.zip",
+            &[("Lights\\L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+            ArchiveCompression::Store,
+        );
+        let listing = list_entries(&zip).unwrap();
+        assert!(listing.skipped.iter().any(|(n, r)| n == "Lights\\L_001.fits" && *r == "backslash name"), "{:?}", listing.skipped);
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.inserted.len(), 1);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
     }
 }
