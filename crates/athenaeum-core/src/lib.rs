@@ -74,6 +74,8 @@ pub(crate) mod test_support;
 #[cfg(feature = "render")]
 pub mod integration;
 pub mod calibration_library;
+// ZIP archives in the catalog: the one module that opens a zip (directory, headers, extraction).
+pub mod zip_store;
 // Personal-sync transport layer (Stage I). Transport-agnostic trait +
 // in-process mock; ungated so the headless agent build includes it. No
 // render/solver deps.
