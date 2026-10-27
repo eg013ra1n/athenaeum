@@ -87,6 +87,11 @@ function tooltip(loc: ImagingLocation, hasFov: boolean): string {
   return `${type} ${name}\nFrames: ${loc.frameCount}\nExposure: ${hours}h\nFilters: ${loc.filters.join(', ')}${cameras}${focal}${dates}${fov}`;
 }
 
+/** d3-celestial's canvas, where its zoom behaviour listens; the HiPS layer's canvas precedes it in the host. */
+function chartCanvas(): HTMLCanvasElement | null {
+  return chartHost().querySelector('canvas:not(.hips-layer)');
+}
+
 /** The overlay SVG and its marker group, created on first use. */
 function layerGroup(): any {
   const d3 = window.d3;
@@ -207,11 +212,38 @@ export function setFootprints(locations: ImagingLocation[]): void {
         if (d.loc.frameSetId != null) handlers?.openFrameSet(d.loc.frameSetId);
       });
 
+      // A drag that starts on a footprint pans the chart: the press is
+      // re-dispatched on the canvas, where d3-celestial's zoom behaviour
+      // listens. Left alone it starts a text selection over the overlay,
+      // which froze the desktop webview for seconds.
+      g.on('mousedown', () => {
+        const evt = d3.event as MouseEvent | undefined;
+        const canvas = chartCanvas();
+        if (!canvas || !evt || evt.button !== 0) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        canvas.dispatchEvent(new MouseEvent('mousedown', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: evt.buttons,
+          clientX: evt.clientX,
+          clientY: evt.clientY,
+          screenX: evt.screenX,
+          screenY: evt.screenY,
+          ctrlKey: evt.ctrlKey,
+          shiftKey: evt.shiftKey,
+          altKey: evt.altKey,
+          metaKey: evt.metaKey,
+        }));
+      });
+
       // Wheel over a footprint still zooms: re-dispatch on the canvas, where
       // d3-celestial's zoom behaviour listens (d3 v3 puts the event on d3.event).
       g.on('wheel', () => {
         const evt = d3.event as WheelEvent | undefined;
-        const canvas = chartHost().querySelector('canvas');
+        const canvas = chartCanvas();
         if (!canvas || !evt) return;
         evt.preventDefault();
         evt.stopPropagation();
