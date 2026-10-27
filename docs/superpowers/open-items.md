@@ -24,11 +24,10 @@ None open.
 ## Sky Chart offline pack (HiPS phase 2, #18) — owed live acceptance
 
 Code, tests and reviews are done (plan `plans/2026-10-26-hips-offline-pack.md`, reference `docs/skychart/README.md` → Offline pack). Not yet run by hand, desktop, dev DB, live CDS — the only bulk fetch allowed, never from automation:
-- Order-3 pack with Messier + locations on, NGC/IC off: the estimate before start is within 30 % of what lands on disk.
+- The estimate before start is within 30 % of what lands on disk. Measured 2026-10-27, owner ruling owed: order 4 + Messier + locations (dev app) estimated 685 MB from `properties`, 840 MB landed (+23 %); a whole-sky order 3 on an empty store (web) estimated 68.3 MB from `approx_tile_bytes`, 44.1 MB landed (−35 %, an over-estimate, so the disk check stays on the safe side).
 - Cancel at ≈ 30 %, quit, relaunch: Settings shows Resume with the same selection; Resume finishes with 0 failed.
-- Online off + network off: the chart shows the whole sky; zoomed on M 31 and on one of your frame sets the detail is sharp (order 5–6); outside the cones on a Retina window the coarse sky shows, not black; no `hips tile fetched` line in the log.
-- A busy wait: the "Survey busy, waiting N s" line clears once the wait ends (`Run::settle` has no test of its own).
-- Web build with `ATHENAEUM_API_KEY`: the pack starts and its progress streams over SSE.
+- Online off + network off: the chart shows the whole sky; zoomed on M 31 and on one of your frame sets the detail is sharp (order 5–6); outside the cones on a Retina window the coarse sky shows, not black; no new file under `<app_data>/hips/` afterwards (`hips tile fetched` is a debug line, not in the log file at the default level).
+- A busy wait: the "Survey busy, waiting N s" line clears once the wait ends (`Run::settle` has no test of its own). Needs a real 429/503 from CDS; cannot be provoked.
 
 ## Plan D — carried from Plans B and C
 
