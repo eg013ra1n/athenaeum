@@ -9,8 +9,35 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 pub use calibrated_light::{calibrated_light_identity, CalibratedIdentity, MasterRef};
 pub use fits_header_reader::FitsHeader; // Task 14: reachable for round-trip tests (fits_header_reader itself stays pub(crate))
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
 use std::path::Path;
+
+/// Length of the XISF XML header declared by the 16-byte prelude (8-byte signature, u32 LE
+/// header length, 4 reserved bytes). Shared by the disk reader and the zip byte entry point.
+fn xisf_prelude_header_len(prelude: &[u8; 16]) -> Result<usize> {
+    if &prelude[..8] != b"XISF0100" {
+        anyhow::bail!("Not a valid XISF file: bad signature");
+    }
+    let header_length = u32::from_le_bytes([prelude[8], prelude[9], prelude[10], prelude[11]]) as usize;
+    // Safety cap at 64MB
+    if header_length > 64 * 1024 * 1024 {
+        anyhow::bail!("XISF header too large: {} bytes", header_length);
+    }
+    Ok(header_length)
+}
+
+/// The XML bytes of an in-memory XISF header: the 16-byte prelude followed by the XML
+/// (exactly what `zip_store::reader::read_headers` returns for an `.xisf` entry).
+fn xisf_xml_from_bytes(bytes: &[u8]) -> Result<&[u8]> {
+    let prelude: &[u8; 16] = bytes
+        .get(..16)
+        .and_then(|p| p.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("XISF header truncated: {} bytes, prelude needs 16", bytes.len()))?;
+    let len = xisf_prelude_header_len(prelude)?;
+    bytes
+        .get(16..16 + len)
+        .ok_or_else(|| anyhow::anyhow!("XISF header truncated: declares {} bytes, {} present", len, bytes.len() - 16))
+}
 
 /// Read the XISF XML header bytes from a file.
 /// Parses the 16-byte binary header (8-byte signature + 4-byte header length + 4 reserved)
@@ -20,23 +47,10 @@ pub(crate) fn read_xisf_header(path: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
     let mut buf_reader = BufReader::new(file);
 
-    let mut sig = [0u8; 8];
-    buf_reader.read_exact(&mut sig)?;
-    if &sig != b"XISF0100" {
-        anyhow::bail!("Not a valid XISF file: bad signature");
-    }
+    let mut prelude = [0u8; 16];
+    buf_reader.read_exact(&mut prelude)?;
+    let header_length = xisf_prelude_header_len(&prelude)?;
 
-    let mut len_bytes = [0u8; 4];
-    buf_reader.read_exact(&mut len_bytes)?;
-    let header_length = u32::from_le_bytes(len_bytes) as usize;
-
-    // Safety cap at 64MB
-    if header_length > 64 * 1024 * 1024 {
-        anyhow::bail!("XISF header too large: {} bytes", header_length);
-    }
-
-    // Skip 4 reserved bytes, then read header_length bytes
-    buf_reader.seek(SeekFrom::Current(4))?;
     let mut content = vec![0u8; header_length];
     buf_reader.read_exact(&mut content)?;
     Ok(content)
@@ -141,18 +155,48 @@ pub fn extract_fits_header(path: &Path) -> Result<String> {
 pub fn parse_fits_with_header(path: &Path, file_id: i64) -> Result<(Frame, String)> {
     tracing::debug!(path = %path.display(), "parsing FITS (combined)");
     let header = FitsHeader::from_path(path)?;
+    frame_and_text_from_fits_header(&header, file_id, path)
+}
+
+/// Parse the header blocks of a FITS file held in memory (through the END card, as
+/// `zip_store::reader::read_headers` returns them). `display_path` is the catalog path of the
+/// frame: it drives the file-name heuristics exactly as a disk path does. Same header parser
+/// (`FitsHeader::parse_from_reader`) and same frame assembly as `parse_fits_with_header`.
+pub fn parse_fits_header_bytes(bytes: &[u8], file_id: i64, display_path: &Path) -> Result<(Frame, String)> {
+    tracing::debug!(path = %display_path.display(), "parsing FITS header bytes");
+    let header = FitsHeader::from_bytes(bytes)?;
+    frame_and_text_from_fits_header(&header, file_id, display_path)
+}
+
+fn frame_and_text_from_fits_header(header: &FitsHeader, file_id: i64, path: &Path) -> Result<(Frame, String)> {
     let header_text = header.to_header_text();
-    let frame = build_frame_from_header(&header, file_id, path)?;
+    let frame = build_frame_from_header(header, file_id, path)?;
+    Ok((frame, header_text))
+}
+
+/// Parse an XISF header held in memory: the 16-byte prelude plus the XML, as
+/// `zip_store::reader::read_headers` returns it for an `.xisf` entry. Returns the frame and the
+/// same header text `extract_xisf_header` gives for a disk file.
+pub fn parse_xisf_header_bytes(bytes: &[u8], file_id: i64, display_path: &Path) -> Result<(Frame, String)> {
+    tracing::debug!(path = %display_path.display(), "parsing XISF header bytes");
+    let xml = xisf_xml_from_bytes(bytes)?;
+    let frame = parse_xisf_xml(xml, file_id, display_path)?;
+    let header_text = xisf_header_text(xml, display_path)?;
     Ok((frame, header_text))
 }
 
 /// Extract full XISF header as text
 pub fn extract_xisf_header(path: &Path) -> Result<String> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
     tracing::debug!(path = %path.display(), "opening XISF for header");
     let content = read_xisf_header(path)?;
+    xisf_header_text(&content, path)
+}
+
+/// Header text of an XISF XML block (`NAME = value` lines). `path` only labels logs and the
+/// no-keywords fallback text.
+fn xisf_header_text(content: &[u8], path: &Path) -> Result<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
 
     // Find the XML section
     let xml_start = content.windows(5)
@@ -578,13 +622,18 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
 
 /// Parse XISF file metadata
 pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-    use std::collections::HashMap;
-
     tracing::debug!(path = %path.display(), "opening XISF for parsing");
 
     let content = read_xisf_header(path)?;
+    parse_xisf_xml(&content, file_id, path)
+}
+
+/// `Frame` from an XISF XML block. `path` is the disk path or the virtual catalog path of a
+/// zip-resident frame; it only drives logging and the file-name heuristics.
+fn parse_xisf_xml(content: &[u8], file_id: i64, path: &Path) -> Result<Frame> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    use std::collections::HashMap;
 
     // Find the XML section - it starts after "<?xml"
     let xml_start = content.windows(5)
@@ -1351,5 +1400,212 @@ mod tests {
 
         let frame = parse_xisf(&path, 1).unwrap();
         assert_eq!(frame.bayerpat, None);
+    }
+}
+
+#[cfg(test)]
+mod from_bytes_tests {
+    use super::*;
+    use crate::archive::models::ArchiveCompression;
+    use crate::archive::zip_writer::{build_zip, ZipEntry};
+    use crate::fingerprint::compute_header_fingerprint;
+    use crate::fits_writer::{write_xisf_f32, Card, CardValue};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn card(s: &str) -> [u8; 80] {
+        let mut out = [b' '; 80];
+        out[..s.len()].copy_from_slice(s.as_bytes());
+        out
+    }
+
+    /// A FITS file with a real-looking light header, one data block of zeros after it.
+    /// `extra_blocks` extra header blocks of COMMENT cards push END into a later block.
+    fn write_light_fits(path: &Path, extra_blocks: usize) -> usize {
+        let mut cards: Vec<[u8; 80]> = vec![
+            card("SIMPLE  =                    T"),
+            card("BITPIX  =                   16"),
+            card("NAXIS   =                    2"),
+            card("NAXIS1  =                    4"),
+            card("NAXIS2  =                    2"),
+            card("OBJECT  = 'M33     '"),
+            card("TELESCOP= 'RC8     '"),
+            card("INSTRUME= 'ASI2600MM'"),
+            card("IMAGETYP= 'Light   '"),
+            card("FILTER  = 'Ha      '"),
+            card("EXPTIME =                300.0"),
+            card("GAIN    =                  100"),
+            card("OFFSET  =                   50"),
+            card("XBINNING=                    1"),
+            card("YBINNING=                    1"),
+            card("CCD-TEMP=                -10.0"),
+            card("DATE-OBS= '2024-01-15T20:30:45.123'"),
+            card("RA      =              23.4621"),
+            card("DEC     =              30.6599"),
+        ];
+        for i in 0..extra_blocks * 36 {
+            cards.push(card(&format!("COMMENT filler {i}")));
+        }
+        cards.push(card("END"));
+        let mut header: Vec<u8> = cards.iter().flat_map(|c| c.iter().copied()).collect();
+        while header.len() % 2880 != 0 {
+            header.push(b' ');
+        }
+        let header_len = header.len();
+        let mut file = header;
+        file.extend_from_slice(&[0u8; 2880]);
+        std::fs::write(path, file).unwrap();
+        header_len
+    }
+
+    fn assert_same(a: &(Frame, String), b: &(Frame, String)) {
+        assert_eq!(a.1, b.1, "header text differs");
+        assert_eq!(compute_header_fingerprint(&a.1), compute_header_fingerprint(&b.1));
+        assert_eq!(serde_json::to_value(&a.0).unwrap(), serde_json::to_value(&b.0).unwrap());
+    }
+
+    #[test]
+    fn fits_bytes_and_disk_parse_give_identical_frame_header_and_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        for extra_blocks in [0, 2] {
+            let p = dir.path().join(format!("L_{extra_blocks}.fits"));
+            let header_len = write_light_fits(&p, extra_blocks);
+            let disk = parse_fits_with_header(&p, 7).unwrap();
+            let all = std::fs::read(&p).unwrap();
+            // Exactly what zip_store::reader::read_headers hands over: the blocks through END.
+            let from_bytes = parse_fits_header_bytes(&all[..header_len], 7, &p).unwrap();
+            assert_same(&disk, &from_bytes);
+            // Bytes past END (a caller that passes the whole file) change nothing.
+            assert_same(&disk, &parse_fits_header_bytes(&all, 7, &p).unwrap());
+            assert_eq!(disk.0.object.as_deref(), Some("M33"));
+            assert_eq!(disk.0.filter.as_deref(), Some("Ha"));
+        }
+    }
+
+    #[test]
+    fn fits_bytes_without_end_are_refused() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("L.fits");
+        write_light_fits(&p, 0);
+        let all = std::fs::read(&p).unwrap();
+        let err = parse_fits_header_bytes(&all[..80 * 15], 1, &p).unwrap_err();
+        assert!(err.to_string().contains("END"), "{err}");
+        assert!(parse_fits_header_bytes(&[], 1, &p).is_err());
+    }
+
+    #[test]
+    fn display_path_drives_the_master_filename_heuristic() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("x.fits");
+        let header_len = write_light_fits(&p, 0);
+        let all = std::fs::read(&p).unwrap();
+        let plain = Path::new("/nas/night.zip/Lights/L_001.fits");
+        let master = Path::new("/nas/night.zip/masterDark_300s.fits");
+        assert!(!parse_fits_header_bytes(&all[..header_len], 1, plain).unwrap().0.is_master);
+        assert!(parse_fits_header_bytes(&all[..header_len], 1, master).unwrap().0.is_master);
+    }
+
+    fn xisf_cards() -> Vec<Card> {
+        vec![
+            Card::new("OBJECT", CardValue::Str("M33".into())).unwrap(),
+            Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+            Card::new("FILTER", CardValue::Str("OIII".into())).unwrap(),
+            Card::new("EXPTIME", CardValue::Real(180.0)).unwrap(),
+            Card::new("GAIN", CardValue::Real(100.0)).unwrap(),
+            Card::new("XBINNING", CardValue::Integer(1)).unwrap(),
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+        ]
+    }
+
+    /// The prelude plus the XML, as `read_headers` returns an `.xisf` entry.
+    fn xisf_header_bytes(path: &Path) -> Vec<u8> {
+        let all = std::fs::read(path).unwrap();
+        let len = u32::from_le_bytes([all[8], all[9], all[10], all[11]]) as usize;
+        all[..16 + len].to_vec()
+    }
+
+    #[test]
+    fn xisf_bytes_and_disk_parse_give_identical_frame_header_and_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("L.xisf");
+        write_xisf_f32(&p, 4, 2, 1, &[0.1; 8], &xisf_cards()).unwrap();
+        let disk = (parse_xisf(&p, 9).unwrap(), extract_xisf_header(&p).unwrap());
+        let bytes = xisf_header_bytes(&p);
+        let from_bytes = parse_xisf_header_bytes(&bytes, 9, &p).unwrap();
+        assert_same(&disk, &from_bytes);
+        assert_eq!(from_bytes.0.filter.as_deref(), Some("OIII"));
+        assert_eq!(from_bytes.0.bayerpat.as_deref(), Some("RGGB"));
+        // The whole file works too: the length in the prelude bounds the XML.
+        let all = std::fs::read(&p).unwrap();
+        assert_same(&disk, &parse_xisf_header_bytes(&all, 9, &p).unwrap());
+    }
+
+    #[test]
+    fn xisf_fallback_text_and_master_heuristic_use_the_display_path() {
+        // Hand-built header with no FITSKeyword element: the writer always emits ROWORDER.
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xisf version=\"1.0\" xmlns=\"http://www.pixinsight.com/xisf\">\
+<Image geometry=\"2:2:1\" sampleFormat=\"Float32\" colorSpace=\"Gray\" location=\"attachment:4096:16\"/></xisf>";
+        let mut bytes = b"XISF0100".to_vec();
+        bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(xml.as_bytes());
+
+        let display = Path::new("/nas/night.zip/Masters/master_flat.xisf");
+        let (frame, text) = parse_xisf_header_bytes(&bytes, 1, display).unwrap();
+        assert!(text.contains("/nas/night.zip/Masters/master_flat.xisf"), "{text}");
+        assert!(frame.is_master);
+        let plain = Path::new("/nas/night.zip/Lights/L_001.xisf");
+        assert!(!parse_xisf_header_bytes(&bytes, 1, plain).unwrap().0.is_master);
+    }
+
+    #[test]
+    fn xisf_bytes_with_a_bad_prelude_are_refused() {
+        let p = Path::new("/z.zip/a.xisf");
+        assert!(parse_xisf_header_bytes(&[], 1, p).is_err());
+        assert!(parse_xisf_header_bytes(b"XISF0100", 1, p).is_err());
+        let mut bad_sig = vec![0u8; 32];
+        bad_sig[..8].copy_from_slice(b"NOTXISF1");
+        assert!(parse_xisf_header_bytes(&bad_sig, 1, p).unwrap_err().to_string().contains("signature"));
+        let mut huge = vec![0u8; 16];
+        huge[..8].copy_from_slice(b"XISF0100");
+        huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_xisf_header_bytes(&huge, 1, p).unwrap_err().to_string().contains("too large"));
+        let mut short = vec![0u8; 20];
+        short[..8].copy_from_slice(b"XISF0100");
+        short[8..12].copy_from_slice(&100u32.to_le_bytes());
+        assert!(parse_xisf_header_bytes(&short, 1, p).unwrap_err().to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn zip_header_pass_output_parses_to_the_disk_result() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let fits = src.join("L_001.fits");
+        write_light_fits(&fits, 1);
+        let xisf = src.join("L_002.xisf");
+        write_xisf_f32(&xisf, 4, 2, 1, &[0.1; 8], &xisf_cards()).unwrap();
+        let zip: PathBuf = dir.path().join("night.zip");
+        build_zip(
+            &zip,
+            &[
+                ZipEntry { source_path: fits.clone(), path_in_zip: "Lights/L_001.fits".into() },
+                ZipEntry { source_path: xisf.clone(), path_in_zip: "Lights/L_002.xisf".into() },
+            ],
+            ArchiveCompression::Deflate,
+        )
+        .unwrap();
+
+        let (headers, _) =
+            crate::zip_store::reader::read_headers(&zip, &["Lights/L_001.fits", "Lights/L_002.xisf"]).unwrap();
+        let virt = |e: &str| PathBuf::from(format!("{}{}{}", zip.display(), std::path::MAIN_SEPARATOR, e));
+
+        let fits_bytes = headers[0].1.as_ref().unwrap();
+        let from_zip = parse_fits_header_bytes(fits_bytes, 3, &virt("Lights/L_001.fits")).unwrap();
+        assert_same(&parse_fits_with_header(&fits, 3).unwrap(), &from_zip);
+
+        let xisf_bytes = headers[1].1.as_ref().unwrap();
+        let from_zip = parse_xisf_header_bytes(xisf_bytes, 4, &virt("Lights/L_002.xisf")).unwrap();
+        assert_same(&(parse_xisf(&xisf, 4).unwrap(), extract_xisf_header(&xisf).unwrap()), &from_zip);
     }
 }

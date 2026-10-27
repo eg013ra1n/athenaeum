@@ -124,11 +124,17 @@ impl FitsHeader {
         }
     }
 
-    /// Parse header from raw bytes (used by tests and in-memory data).
-    #[cfg(test)]
-    pub(crate) fn parse_header(data: &[u8]) -> Result<Self> {
+    /// Parse header from raw bytes: the header blocks of a FITS file through the END card
+    /// (the zip header pass hands over exactly that). Same parser as `from_path`.
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(data);
         Self::parse_from_reader(&mut cursor)
+    }
+
+    /// Test alias of `from_bytes`.
+    #[cfg(test)]
+    pub(crate) fn parse_header(data: &[u8]) -> Result<Self> {
+        Self::from_bytes(data)
     }
 
     /// Get keyword value as a trimmed string.
