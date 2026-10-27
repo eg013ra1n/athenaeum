@@ -398,29 +398,6 @@ pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Permanently delete all files in black hole (send all to void)
-pub fn send_all_to_void(conn: &Connection) -> Result<usize> {
-    // Get all file IDs in black hole
-    let mut stmt = conn.prepare("SELECT file_id FROM black_hole")?;
-    let file_ids: Vec<i64> = stmt
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let count = file_ids.len();
-
-    // Delete each file. One file's failure must not stop the batch — but it is
-    // never silent: after the catalog-first ordering a disk-unlink failure
-    // leaves the file orphaned on disk, so it gets its own error line.
-    for file_id in file_ids {
-        if let Err(e) = send_to_void(conn, file_id) {
-            tracing::error!(file_id, error = %e,
-                "send_all_to_void: file removed from catalog but disk delete failed; file remains on disk");
-        }
-    }
-
-    Ok(count)
-}
-
 /// Find folders with high similarity (many duplicate files)
 pub fn find_duplicate_folders(
     conn: &Connection,

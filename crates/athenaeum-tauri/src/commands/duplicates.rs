@@ -146,16 +146,6 @@ pub async fn send_to_void(file_id: i64, state: State<'_, AppState>) -> Result<()
     db::send_to_void(&conn, file_id).map_err(|e| e.to_string())
 }
 
-/// Permanently delete all files in black hole (send all to void)
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::send_all_to_void(&conn).map_err(|e| e.to_string())
-}
-
 /// Get folders with high duplicate file similarity
 /// Always computes fresh since folder similarity depends on current file state
 /// and can't easily filter out black_hole files from cached data

@@ -250,21 +250,6 @@ pub async fn send_to_void(
     Ok(Json(()))
 }
 
-/// Permanently delete all files currently in the black hole.
-///
-/// WARNING: this is irreversible.  Returns the number of files deleted.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn send_all_to_void(
-    State(state): State<WebAppState>,
-    Json(_): Json<serde_json::Value>,
-) -> Result<Json<usize>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let n = athenaeum_core::db::send_all_to_void(&conn).map_err(db_err)?;
-    Ok(Json(n))
-}
-
 // ── Scan root flags ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

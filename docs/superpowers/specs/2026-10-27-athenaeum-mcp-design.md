@@ -49,7 +49,7 @@ one build pass for the other.
 
 - **The MCP does something the UI would refuse.** It calls the same core paths with the same gates (path policy, plate
   solve input gate, the Black Hole's own checks). It never routes around a gate.
-- **Permanent deletion.** `send_to_void` / `send_all_to_void` are never MCP tools. Emptying the Black Hole stays a
+- **Permanent deletion.** `send_to_void` is never an MCP tool. Emptying the Black Hole stays a
   human action in the UI.
 - **A silent apply.** Nothing changes without the user's own click or answer in a channel the model cannot speak for
   (§6.4), and an apply that changed less than the plan says so, item by item.

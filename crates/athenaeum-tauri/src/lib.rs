@@ -325,7 +325,6 @@ pub fn run() {
             commands::get_blackholed_file_ids,
             commands::restore_from_black_hole,
             commands::send_to_void,
-            commands::send_all_to_void,
             commands::get_duplicate_folders,
             commands::verify_files_byte_identical,
             commands::verify_duplicate_pair,

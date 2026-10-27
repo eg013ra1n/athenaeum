@@ -173,7 +173,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_blackholed_file_ids", post(duplicates::get_blackholed_file_ids))
         .route("/api/restore_from_black_hole", post(duplicates::restore_from_black_hole))
         .route("/api/send_to_void", post(duplicates::send_to_void))
-        .route("/api/send_all_to_void", post(duplicates::send_all_to_void))
         .route("/api/get_duplicate_folders", post(duplicates::get_duplicate_folders))
         .route("/api/set_scan_root_duplicates_flag", post(duplicates::set_scan_root_duplicates_flag))
         .route("/api/set_scan_root_unique_camera_flag", post(duplicates::set_scan_root_unique_camera_flag))
