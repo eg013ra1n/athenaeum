@@ -623,6 +623,56 @@ pub(crate) fn downgrade_stacking_tables_to_legacy(conn: &Connection) {
     // that already got them would look like — harmless.
 }
 
+/// One `zip_archives` row per zip our Move and ZIP wrote, for catalogs that
+/// predate the table. Runs only while `zip_archives` is empty, so it never
+/// re-creates a row the app later removed. The stat comes from disk when the
+/// zip is reachable; otherwise `size = 0, modified_at = ''` so the next scan
+/// re-reads the zip. Best-effort per zip: a failed stat is logged and the row
+/// still gets the placeholder stat.
+fn backfill_zip_archives(conn: &Connection) -> rusqlite::Result<()> {
+    let existing: i64 = conn.query_row("SELECT COUNT(*) FROM zip_archives", [], |r| r.get(0))?;
+    if existing > 0 {
+        return Ok(());
+    }
+    let zips: Vec<(String, i64, i64)> = conn
+        .prepare(
+            "SELECT aof.target_zip_path, MIN(aof.operation_id), COUNT(DISTINCT f.id)
+             FROM archive_operation_files aof
+             JOIN files f ON f.id = aof.file_id
+             WHERE f.archived_in_operation IS NOT NULL
+             GROUP BY aof.target_zip_path",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if zips.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for (path, op_id, entries) in &zips {
+        let (size, modified_at) = match std::fs::metadata(path) {
+            Ok(md) => {
+                let modified = md
+                    .modified()
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                    .unwrap_or_default();
+                (md.len() as i64, modified)
+            }
+            Err(e) => {
+                tracing::debug!(zip_path = %path, error = %e, "zip backfill: zip not reachable, stat left empty");
+                (0, String::new())
+            }
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO zip_archives
+                (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![path, size, modified_at, entries, now, op_id],
+        )?;
+    }
+    tracing::info!(zips = zips.len(), "zip_archives backfilled from archive operations");
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -2463,6 +2513,54 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ---- ZIP archives in the catalog ----
+    //
+    // Placed after the archive_operations rebuild above: that rebuild drops and
+    // renames the table `zip_archives.created_by_operation` references.
+    //
+    // `created_by_operation` is ON DELETE SET NULL (not a bare reference): an
+    // archive operation row is removed by the frames_set cascade, and a bare FK
+    // would make that delete fail while a zip row still points at the operation.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS zip_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            size INTEGER NOT NULL,
+            modified_at TEXT NOT NULL,
+            frame_entries INTEGER NOT NULL DEFAULT 0,
+            scanned_at TEXT NOT NULL,
+            created_by_operation INTEGER NULL REFERENCES archive_operations(id) ON DELETE SET NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS zip_released_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zip_id INTEGER NOT NULL REFERENCES zip_archives(id) ON DELETE CASCADE,
+            entry_path TEXT NOT NULL,
+            UNIQUE(zip_id, entry_path)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS black_hole_zips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zip_id INTEGER NOT NULL UNIQUE REFERENCES zip_archives(id) ON DELETE CASCADE,
+            from_where TEXT NOT NULL,
+            moved_at TEXT NOT NULL,
+            original_path TEXT NOT NULL
+        )",
+        [],
+    )?;
+    if !column_exists(conn, "files", "archive_entry_crc32")? {
+        conn.execute("ALTER TABLE files ADD COLUMN archive_entry_crc32 INTEGER", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_archive_zip_path ON files(archive_zip_path)",
+        [],
+    )?;
+    backfill_zip_archives(conn)?;
+
     // ---- Collaboration Stage 1: catalog identity (Phase 1) ----
     conn.execute(
         "CREATE TABLE IF NOT EXISTS catalog_meta (
@@ -3256,6 +3354,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_file_op_steps_op_file_id ON file_operation_steps(operation_file_id)",
         "CREATE INDEX IF NOT EXISTS idx_project_link_intents_frames_set ON project_link_intents(frames_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_project_links_frames_set ON project_links(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_zip_archives_created_by_operation ON zip_archives(created_by_operation)",
     ] {
         conn.execute(stmt, [])?;
     }
@@ -5531,6 +5630,160 @@ mod archive_schema_tests {
             joined, 1,
             "parent and both children must survive the rebuild joinable"
         );
+    }
+}
+
+#[cfg(test)]
+mod zip_schema_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn init_db_creates_zip_tables_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        for t in ["zip_archives", "zip_released_entries", "black_hole_zips"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{t}");
+        }
+        assert!(column_exists(&conn, "files", "archive_entry_crc32").unwrap());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_files_archive_zip_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    fn insert_op(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO archive_operations (id, archive_root_path, compression, status, started_at)
+             VALUES (?1, '/arch', 'store', 'completed', '2026-01-01T00:00:00Z')",
+            [id],
+        )
+        .unwrap();
+    }
+
+    fn insert_archived_file(conn: &Connection, id: i64, op: i64, zip: &str, entry: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (?1, ?2, ?3, 10, '2026-01-01T00:00:00Z', 'FITS', ?4, ?5, ?6)",
+            rusqlite::params![id, format!("/data/{entry}-{id}"), entry, op, zip, entry],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_operation_files
+             (operation_id, file_id, source_path, target_zip_path, target_path_in_zip,
+              expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'aabb', 'archive', 'light', 10)",
+            rusqlite::params![op, id, format!("/data/{entry}-{id}"), zip, entry],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn backfill_creates_one_zip_archive_row_per_existing_archive_zip() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A catalog from before this feature: archived rows, no zip_archives rows.
+        conn.execute("DELETE FROM zip_archives", []).unwrap();
+        insert_op(&conn, 1);
+        insert_op(&conn, 2);
+        insert_archived_file(&conn, 1, 1, "/nonexistent/arch/M31.zip", "L1.fits");
+        insert_archived_file(&conn, 2, 1, "/nonexistent/arch/M31.zip", "L2.fits");
+        insert_archived_file(&conn, 3, 2, "/nonexistent/arch/M42.zip", "L3.fits");
+        // An operation file whose row was never marked archived makes no zip row.
+        conn.execute(
+            "INSERT INTO archive_operation_files
+             (operation_id, file_id, source_path, target_zip_path, target_path_in_zip,
+              expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (2, NULL, '/data/x.fits', '/nonexistent/arch/NotDone.zip', 'x.fits', 'aa', 'archive', 'light', 1)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let rows: Vec<(String, i64, String, i64, Option<i64>)> = conn
+            .prepare(
+                "SELECT path, size, modified_at, frame_entries, created_by_operation
+                 FROM zip_archives ORDER BY path",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, "/nonexistent/arch/M31.zip");
+        assert_eq!(rows[0].1, 0);
+        assert_eq!(rows[0].2, "");
+        assert_eq!(rows[0].3, 2);
+        assert_eq!(rows[0].4, Some(1));
+        assert_eq!(rows[1].0, "/nonexistent/arch/M42.zip");
+        assert_eq!(rows[1].4, Some(2));
+
+        // Idempotent: a third init does not duplicate.
+        init_db(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM zip_archives", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn backfill_stats_a_zip_that_exists_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("M31.zip");
+        std::fs::write(&zip, b"0123456789").unwrap();
+        let zip_s = zip.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_op(&conn, 1);
+        insert_archived_file(&conn, 1, 1, &zip_s, "L1.fits");
+        init_db(&conn).unwrap();
+
+        let (size, modified): (i64, String) = conn
+            .query_row(
+                "SELECT size, modified_at FROM zip_archives WHERE path = ?1",
+                [&zip_s],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 10);
+        assert!(!modified.is_empty());
+    }
+
+    #[test]
+    fn deleting_an_archive_operation_does_not_fail_on_its_zip_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_op(&conn, 1);
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, scanned_at, created_by_operation)
+             VALUES ('/a.zip', 1, 'm', 's', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM archive_operations WHERE id = 1", [])
+            .unwrap();
+        let op: Option<i64> = conn
+            .query_row("SELECT created_by_operation FROM zip_archives", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(op, None);
     }
 }
 
