@@ -1540,8 +1540,6 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
     root_id: i64,
     emitter: &E,
 ) -> Result<Vec<OrphanedFile>, ApiError> {
-    use rayon::prelude::*;
-
     // Emit initial "verifying" phase progress
     crate::scanner::emit_progress(emitter, root_id, 0, 0, None, "verifying");
 
@@ -1559,49 +1557,57 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
             )
             .map_err(|e| ApiError::Internal(format!("Failed to get scan root: {}", e)))?;
 
-        // Get all files under this scan root, excluding files known to live
-        // inside an archive zip (`archived_in_operation IS NOT NULL`). Their
-        // on-disk paths intentionally don't exist post-archive — flagging
-        // them as "missing" would fill the missing_files table with false
-        // positives the user has to manually clear.
+        // Get all files under this scan root. A row inside a zip is checked
+        // through its zip (`zip_store::presence`): present when the zip exists
+        // and lists the entry, missing otherwise (never deleted).
         // Use LEFT JOIN instead of subqueries to avoid N+1 query problem.
         let (pred, values) = crate::db::scan_root_prefix_predicate("f.path", &[path.clone()]);
         let sql = format!(
             "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
                         CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
                         fr.object,
-                        fr.date_obs
+                        fr.date_obs,
+                        f.archive_zip_path,
+                        f.archive_path_in_zip
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE ({pred}) AND f.archived_in_operation IS NULL"
+                 WHERE ({pred})"
         );
         let mut stmt = conn.prepare(&sql)?;
 
-        let result: Vec<OrphanedFile> = stmt
+        let result: Vec<(OrphanedFile, Option<String>, Option<String>)> = stmt
             .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-                Ok(OrphanedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    filename: row.get(2)?,
-                    size: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    has_frame: row.get::<_, i64>(5)? != 0,
-                    object: row.get(6).ok(),
-                    date_obs: row.get(7).ok(),
-                })
+                Ok((
+                    OrphanedFile {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        filename: row.get(2)?,
+                        size: row.get(3)?,
+                        modified_at: row.get(4)?,
+                        has_frame: row.get::<_, i64>(5)? != 0,
+                        object: row.get(6).ok(),
+                        date_obs: row.get(7).ok(),
+                    },
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         result
     };
 
-    // Filter to only files that don't exist on disk - done in parallel
-    // This is done OUTSIDE the lock since filesystem checks can be slow
+    // Filter to only files that are not present. Done OUTSIDE the lock since
+    // filesystem checks can be slow; disk rows in parallel, each zip's
+    // directory read once.
     let total_files = files.len();
-
-    // Use parallel iteration for filesystem checks (I/O bound operations)
+    let present = crate::zip_store::presence::present_flags(&files, |(f, zip, entry)| {
+        (f.path.as_str(), zip.as_deref(), entry.as_deref())
+    });
     let missing_files: Vec<OrphanedFile> = files
-        .into_par_iter()
-        .filter(|file| !Path::new(&file.path).exists())
+        .into_iter()
+        .zip(present)
+        .filter(|(_, present)| !present)
+        .map(|((f, _, _), _)| f)
         .collect();
 
     // Emit final progress

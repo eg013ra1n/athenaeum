@@ -1,8 +1,6 @@
 // Missing files route handlers — mirrors athenaeum-tauri/src/commands/missing_files.rs
 
 use axum::{extract::State, http::StatusCode, Json};
-use rayon::prelude::*;
-use std::path::Path;
 
 use crate::WebAppState;
 
@@ -104,9 +102,8 @@ pub async fn check_missing_files_in_scan_root(
             )
             .map_err(|e| db_err(format!("Failed to get scan root: {}", e)))?;
 
-        // Exclude files known to be inside an archive zip — their on-disk
-        // paths intentionally don't exist post-archive, so the existence
-        // check below would falsely flag them as missing.
+        // A row inside a zip is checked through its zip (present when the zip
+        // exists and lists the entry), not by its virtual path.
         // Scoped separator-strict via the shared core predicate (mirrors
         // `api::scan_roots::check_missing_files_in_scan_root`): `LIKE '<root>%'`
         // had no separator boundary and treated `_`/`%` in an ordinary folder
@@ -117,25 +114,30 @@ pub async fn check_missing_files_in_scan_root(
         let sql = format!(
             "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
                         CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
-                        fr.object, fr.date_obs
+                        fr.object, fr.date_obs,
+                        f.archive_zip_path, f.archive_path_in_zip
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE ({pred}) AND f.archived_in_operation IS NULL"
+                 WHERE ({pred})"
         );
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
             .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-                Ok(OrphanedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    filename: row.get(2)?,
-                    size: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    has_frame: row.get::<_, i64>(5)? != 0,
-                    object: row.get(6).ok(),
-                    date_obs: row.get(7).ok(),
-                })
+                Ok((
+                    OrphanedFile {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        filename: row.get(2)?,
+                        size: row.get(3)?,
+                        modified_at: row.get(4)?,
+                        has_frame: row.get::<_, i64>(5)? != 0,
+                        object: row.get(6).ok(),
+                        date_obs: row.get(7).ok(),
+                    },
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
@@ -143,10 +145,16 @@ pub async fn check_missing_files_in_scan_root(
         rows
     };
 
-    // Filter to only files that don't exist on disk — done in parallel outside the lock
+    // Filter to the rows that are not present — outside the lock; disk rows in
+    // parallel, each zip's directory read once.
+    let present = athenaeum_core::zip_store::presence::present_flags(&files, |(f, zip, entry)| {
+        (f.path.as_str(), zip.as_deref(), entry.as_deref())
+    });
     let missing_files: Vec<OrphanedFile> = files
-        .into_par_iter()
-        .filter(|file| !Path::new(&file.path).exists())
+        .into_iter()
+        .zip(present)
+        .filter(|(_, present)| !present)
+        .map(|((f, _, _), _)| f)
         .collect();
 
     Ok(Json(missing_files))
@@ -197,33 +205,34 @@ pub async fn recheck_missing_files(
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Pull `archived_in_operation` alongside the path so we can drop
-        // rows for files that have since been moved into an archive zip.
+        // Pull the zip columns alongside the path: a row inside a zip is found
+        // when its zip lists the entry, otherwise when its file is on disk.
         let mut stmt = conn
             .prepare(
-                "SELECT mf.id, mf.file_id, f.path, f.archived_in_operation
+                "SELECT mf.id, mf.file_id, f.path, f.archive_zip_path, f.archive_path_in_zip
                  FROM missing_files mf
                  JOIN files f ON f.id = mf.file_id
                  WHERE mf.scan_root_id = ?1",
             )
             .map_err(db_err)?;
 
-        let files: Vec<(i64, i64, String, Option<i64>)> = stmt
-            .query_map([root_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        let files: Vec<(i64, i64, String, Option<String>, Option<String>)> = stmt
+            .query_map([root_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
 
-        // "Found" means archived (catalog says it's in a zip) OR present on disk.
+        let present =
+            athenaeum_core::zip_store::presence::present_flags(&files, |(_, _, path, zip, entry)| {
+                (path.as_str(), zip.as_deref(), entry.as_deref())
+            });
         let found_mf_ids: Vec<i64> = files
-            .par_iter()
-            .filter_map(|(mf_id, _file_id, path, archived_op)| {
-                if archived_op.is_some() || Path::new(path).exists() {
-                    Some(*mf_id)
-                } else {
-                    None
-                }
-            })
+            .iter()
+            .zip(present)
+            .filter(|(_, present)| *present)
+            .map(|((mf_id, ..), _)| *mf_id)
             .collect();
 
         if !found_mf_ids.is_empty() {
