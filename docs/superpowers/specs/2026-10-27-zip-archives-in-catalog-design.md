@@ -1,6 +1,6 @@
 # ZIP archives in the catalog — design
 
-Date: 2026-10-27. Status: draft for owner approval.
+Date: 2026-10-27. Status: approved by the owner 2026-10-27; phase 0 measured (§12).
 
 ## 1. Intent
 
@@ -154,7 +154,10 @@ their zip".
     a new row with its virtual path.
 - The calibrated-light skip rule (`CALSTAT` + `ATH_CSRC`) applies to zip entries too.
 - Entries that disappeared from a changed zip: their rows become missing, never deleted.
-- Reads go through a large buffer (1–4 MB) so SMB does not see many tiny requests.
+- The header pass reads through a small buffer (about 4 KiB): each entry costs about two buffer fills, so a large
+  buffer multiplies the bytes read (measured: 0.06% of the zip at 4 KiB, 9% at 1 MiB). Extraction (§7.4) uses a large
+  buffer (about 1 MiB). Opening a zip with the `zip` crate costs one read per entry (about 0.5 ms each on the LAN).
+  Measurements: `docs/superpowers/research/2026-10-27-zip-probe-measurement.md`.
 - During a scan zip-resident rows get no `content_hash` and are not part of the master full-hash pass (both would read
   whole entries over the network). The content-index job (`duplicates/backfill.rs:152`, which selects every
   `content_hash IS NULL` row and opens its path) skips zip-resident rows. Both `strong_hash` and `content_hash` are
@@ -342,11 +345,13 @@ the "no whole-zip read" anti-goal can be checked from the logs.
 A throwaway probe in core `examples/` (lab tools rule: probes stay in core examples) against a real zip on the owner's
 SMB share: central-directory read time, header reads for every frame entry (time and bytes), one full entry extraction
 (time, MB/s), for one Stored and one Deflate zip. The numbers go into the plan and set the acceptance bars below.
+Done 2026-10-27: `docs/superpowers/research/2026-10-27-zip-probe-measurement.md`.
 
 ## 13. Acceptance
 
 - A foreign Deflate zip of a full night (lights + calibration) on the owner's NAS is cataloged with total network reads
-  under 1% of the zip's size; its lights form the expected frame set, the calibration matches, the set shows in Objects
+  of at most 64 KiB per entry plus the central directory, and under 0.5% of the zip's size (phase 0 measured
+  0.05–0.07%); its lights form the expected frame set, the calibration matches, the set shows in Objects
   with the zip chip.
 - A rescan of the unchanged zip reads nothing but its `stat` (the log shows no `bytes_read` for it).
 - A frame present both on disk and in the zip shows as a duplicate pair.
@@ -354,6 +359,7 @@ SMB share: central-directory read time, header reads for every frame entry (time
   zip-resident, with analysis and plate-solve results intact, and the set's frame count is unchanged.
 - The zip opens in the file browser, shows its structure and frame metadata, refuses single-entry delete; moving the
   zip keeps its frames present; Void of the zip deletes it and its rows after the count confirmation.
+- Extraction runs at no less than half the share's sequential read rate (phase 0: 70–100%).
 - Preview, plate solve, analysis, a stack and a WBPP export (copy and link mode) run on the zipped set; the export in
   link mode produces copies; the cache shrinks back to the limit afterwards.
 - Permanent unpack moves the rows to disk with metadata intact; a rescan of the kept zip does not re-add them.
