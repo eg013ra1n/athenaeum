@@ -502,7 +502,7 @@ impl GenerationBatch {
                 &opts,
                 &scratch_dir,
                 &mut divisors,
-                &|p| masters.map(p),
+                masters,
             ) {
                 Ok(spec) => {
                     specs.insert(frame_id, spec);
@@ -759,7 +759,7 @@ pub fn organize_files_wbpp(
                 let placed = match zip {
                     // A frame inside a zip is extracted (or reused from the cache) and copied from there.
                     // The pin keeps the cache file until the copy is done.
-                    Some(ctx) if in_zip && !dest.exists() => {
+                    Some(ctx) if in_zip && (is_link(&dest) || !dest.exists()) => {
                         emit_progress(files_organized as usize, Some(&filename), "extracting", true);
                         match crate::zip_store::materialize::materialize_one_cancellable(
                             ctx,
@@ -767,7 +767,11 @@ pub fn organize_files_wbpp(
                             cancel_flag,
                         ) {
                             Ok((local, _pin)) => {
-                                let copied = copy_or_link(&local.to_string_lossy(), &dest, false);
+                                // A link left at the destination by an earlier link-mode export (dead or
+                                // alive) is removed first: `fs::copy` would write THROUGH it, into
+                                // whatever it points at, which can be a scan root.
+                                let copied = remove_link(&dest)
+                                    .and_then(|()| copy_or_link(&local.to_string_lossy(), &dest, false));
                                 if copied.is_ok() && use_symlinks {
                                     zip_copied += 1;
                                 }
@@ -957,8 +961,27 @@ fn remove_stale_sibling(
     }
 }
 
+/// True when `path` itself is a symbolic link, dead or alive (`exists()` follows links, this does not).
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Removes a symbolic link at `path`, dead or alive; a regular file or nothing is left alone.
+fn remove_link(path: &Path) -> Result<()> {
+    if is_link(path) {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove the old link {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Copy file or create symlink
 fn copy_or_link(source: &str, dest: &PathBuf, use_symlinks: bool) -> Result<()> {
+    // A dead link at the destination is not "an existing file" (`exists()` follows it): leave it and
+    // `fs::copy` writes through it, `symlink` fails with EEXIST. A live link keeps the skip below.
+    if is_link(dest) && !dest.exists() {
+        remove_link(dest)?;
+    }
     // Skip if destination already exists
     if dest.exists() {
         return Ok(());
@@ -1973,6 +1996,62 @@ mod tests {
             std::fs::read(out2.path().join("Set/camera_asi/lights/L_zip.fits")).unwrap(),
             b"zip-bytes"
         );
+    }
+
+    /// An earlier link-mode export left dead links in the folder (the originals went into a zip). A
+    /// re-export, in either mode, replaces them with real files and writes nothing at the link targets.
+    #[cfg(unix)]
+    #[test]
+    fn re_export_never_writes_through_a_dead_link_at_the_destination() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        for use_symlinks in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = zip_ctx(tmp.path());
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let disk = src.join("L_disk.fits");
+            let zipped = src.join("L_zip.fits");
+            std::fs::write(&disk, b"disk-bytes").unwrap();
+            std::fs::write(&zipped, b"zip-bytes").unwrap();
+            let virtual_path = {
+                let conn = ctx.db.get().unwrap().conn();
+                add_file_row(&conn, 1, &disk);
+                add_file_row(&conn, 2, &zipped);
+                zip_files(&conn, &[2], &tmp.path().join("night.zip"), Shape::Foreign).remove(0)
+            };
+            let mut a = frame(1, "L_disk.fits", "ASI");
+            a.file_path = disk.to_string_lossy().into_owned();
+            let mut b = frame(2, "L_zip.fits", "ASI");
+            b.file_path = virtual_path;
+            let data = export_data("Set", vec![subgroup(vec![a, b], None, None, None)]);
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+
+            // The scan root's old spellings, where the dead links point.
+            let scan_root = tmp.path().join("scan_root");
+            std::fs::create_dir_all(&scan_root).unwrap();
+            let gone_zip = scan_root.join("L_zip.fits");
+            let gone_disk = scan_root.join("L_disk.fits");
+            let out = tempfile::tempdir().unwrap();
+            let lights = out.path().join("Set/camera_asi/lights");
+            std::fs::create_dir_all(&lights).unwrap();
+            std::os::unix::fs::symlink(&gone_zip, lights.join("L_zip.fits")).unwrap();
+            std::os::unix::fs::symlink(&gone_disk, lights.join("L_disk.fits")).unwrap();
+
+            let result = organize_files_wbpp(
+                out.path(), &data, use_symlinks, &WbppExportConfig::default(), None, 1, &cancel, None, None, Some(&ctx),
+            )
+            .unwrap();
+            assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(!gone_zip.exists(), "nothing is written at the zip link's target (symlinks={use_symlinks})");
+            assert!(!gone_disk.exists(), "nothing is written at the disk link's target (symlinks={use_symlinks})");
+            let landed = std::fs::symlink_metadata(lights.join("L_zip.fits")).unwrap();
+            assert!(!landed.file_type().is_symlink(), "a zip frame is a real file");
+            assert_eq!(std::fs::read(lights.join("L_zip.fits")).unwrap(), b"zip-bytes");
+            let disk_dest = std::fs::symlink_metadata(lights.join("L_disk.fits")).unwrap();
+            assert_eq!(disk_dest.file_type().is_symlink(), use_symlinks);
+            assert_eq!(std::fs::read(lights.join("L_disk.fits")).unwrap(), b"disk-bytes");
+        }
     }
 
     /// A zip whose share is gone costs the export that one frame (a warning naming it), never the run.

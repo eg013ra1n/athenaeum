@@ -3465,6 +3465,24 @@ pub(crate) fn plan_selection_package(
             });
             continue;
         }
+        // A calibrated light generated at send time reads its masters; one inside a zip is not read by a
+        // send (v1). Say so now, naming the master, instead of failing the whole package at prepare.
+        if entry.generate {
+            match crate::calibration_library::light_resolve::zip_resident_inputs(conn, entry.frame_id) {
+                Ok(inside) if inside.is_empty() => {}
+                Ok(inside) => {
+                    ineligible.push(IneligibleFrame {
+                        frame_id: entry.frame_id,
+                        reason: crate::calibration_library::light_resolve::zip_inputs_sentence(&inside),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    // The prepare step reads the same thing again and reports the real problem.
+                    tracing::warn!(frame_id = entry.frame_id, error = %format!("{e:#}"), "sync selection: cannot read where this light's inputs live");
+                }
+            }
+        }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -10446,6 +10464,86 @@ mod tests {
         assert_eq!(planned.ineligible.len(), 1);
         assert_eq!(planned.ineligible[0].frame_id, 11);
         assert_eq!(planned.ineligible[0].reason, "inside a zip \u{2014} unpack it first");
+    }
+
+    /// A calibrated-lights send whose MASTER sits inside a zip is refused at plan time, naming the master,
+    /// instead of failing the whole package at prepare; the same light linked to a master on disk is planned.
+    #[test]
+    fn plan_marks_a_generate_entry_ineligible_when_its_master_is_in_a_zip() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::package::PayloadKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+
+        let light = tmp.path().join("L_10.fits");
+        let dark = tmp.path().join("master_dark.fits");
+        for p in [&light, &dark] {
+            write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
+        }
+        let insert = |file_id: i64, frame_id: i64, path: &std::path::Path, imagetyp: &str, master: i64| {
+            let meta = std::fs::metadata(path).unwrap();
+            let mtime: chrono::DateTime<chrono::Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy(), meta.len() as i64, mtime.to_rfc3339()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, uuid, is_master) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![frame_id, file_id, imagetyp, format!("uuid-{frame_id}"), master],
+            )
+            .unwrap();
+        };
+        insert(1, 10, &light, "Light", 0);
+        insert(2, 30, &dark, "MasterDark", 1);
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (100, 'MasterDark', '2026-07-05', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 30)", []).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (10, 'frame', 100, 'Dark', '2026-07-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let plan = |conn: &rusqlite::Connection| {
+            let input = SelectionInput {
+                entries: vec![PayloadEntry {
+                    frame_id: 10,
+                    source_path: light.clone(),
+                    rel_path: "camera_X/lights/c_L_10.fits".into(),
+                    kind: PayloadKind::CalibratedLight,
+                    generate: true,
+                }],
+                ineligible: Vec::new(),
+                ancestor: None,
+                total: 1,
+            };
+            plan_selection_package(
+                conn,
+                "ab".repeat(32).as_str(),
+                &tmp.path().join("packages"),
+                input,
+                None,
+                None,
+                Some(CalibratedLightOptions::default()),
+            )
+            .unwrap()
+        };
+
+        let on_disk = plan(&conn);
+        assert_eq!(on_disk.eligible, vec![10], "{:?}", on_disk.ineligible);
+
+        zip_files(&conn, &[2], &tmp.path().join("masters.zip"), Shape::Foreign);
+        let zipped = plan(&conn);
+        assert!(zipped.eligible.is_empty());
+        assert_eq!(zipped.ineligible.len(), 1);
+        assert_eq!(zipped.ineligible[0].frame_id, 10);
+        assert_eq!(zipped.ineligible[0].reason, "the dark master is inside a zip \u{2014} unpack it first");
     }
 
     /// An entry the composer marked `generate` is planned as work, not as a

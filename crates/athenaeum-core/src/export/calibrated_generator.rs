@@ -386,26 +386,28 @@ pub fn resolve_generation_cached(
     scratch_dir: &Path,
     divisors: &mut DivisorCache,
 ) -> anyhow::Result<GenerationSpec> {
-    resolve_generation_mapped(conn, frame_id, opts, scratch_dir, divisors, &|path| Ok(PathBuf::from(path)))
+    resolve_generation_mapped(conn, frame_id, opts, scratch_dir, divisors, &ZipMasters::none())
 }
 
-/// [`resolve_generation_cached`] for masters that may sit inside a zip. `local` turns a master's CATALOG path
-/// into the file the engine and the flat-normalization read can open (the extracted cache file for a
+/// [`resolve_generation_cached`] for masters that may sit inside a zip. `masters` turns a master's CATALOG
+/// path into the file the engine and the flat-normalization read can open (the extracted cache file for a
 /// zip-resident row, the path itself otherwise); the plan's `inputs` carry the local paths while the header
-/// cards keep naming the catalog master. An `Err` from `local` skips this frame with that reason (the zip is
-/// not reachable, the extraction was cancelled).
+/// cards keep naming the catalog master. A master that could not be extracted skips this frame with that
+/// reason (the zip is not reachable, the extraction was cancelled).
 ///
 /// The LIGHT itself is not mapped: its `light_path` stays the catalog path and a caller about to calibrate a
 /// zip-resident light swaps it through [`GenerationSpec::with_light_path`] after extracting that one frame.
-/// Resolving needs only its bit depth, which a zip entry gives from its header bytes (no extraction).
+/// Resolving needs only its bit depth, which a zip entry gives from its header bytes (no extraction): the
+/// depth `masters` read ahead of the catalog borrow, or, for a light it did not read, one read here.
 pub fn resolve_generation_mapped(
     conn: &Connection,
     frame_id: i64,
     opts: &CalibratedLightOptions,
     scratch_dir: &Path,
     divisors: &mut DivisorCache,
-    local: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    masters: &ZipMasters,
 ) -> anyhow::Result<GenerationSpec> {
+    let local = |path: &str| masters.map(path);
     let resolved = resolve_frame_inputs(conn, frame_id, opts.flat_norm)?;
 
     check_applicable(&resolved, opts)?;
@@ -435,7 +437,7 @@ pub fn resolve_generation_mapped(
     };
     let flat_norm_divisor = divisor.global_value();
 
-    let scale_divisor = scale_divisor_for_bitpix(light_bitpix(conn, &resolved.light_path)?);
+    let scale_divisor = scale_divisor_for_bitpix(light_bitpix(conn, &resolved.light_path, masters)?);
 
     let card_inputs = LightCalCardInputs {
         source_uuid: resolved.source_uuid.clone().unwrap_or_default(),
@@ -514,10 +516,14 @@ pub fn resolve_generation_mapped(
 }
 
 /// The light's source bit depth for the output scale. A zip-resident light is read from its entry's header
-/// bytes (nothing is extracted); an unreachable zip fails the frame with the cause. A disk light keeps
-/// [`probe_bitpix`]'s answer, `None` (and the historic default divisor) for anything it cannot read.
-fn light_bitpix(conn: &Connection, light_path: &Path) -> anyhow::Result<Option<i32>> {
+/// bytes (nothing is extracted): the answer `masters` read ahead of the catalog borrow when it has one, else
+/// one read here; an unreachable zip fails the frame with the cause. A disk light keeps [`probe_bitpix`]'s
+/// answer, `None` (and the historic default divisor) for anything it cannot read.
+fn light_bitpix(conn: &Connection, light_path: &Path, masters: &ZipMasters) -> anyhow::Result<Option<i32>> {
     let catalog_path = light_path.to_string_lossy();
+    if let Some(read) = masters.light_depths.get(catalog_path.as_ref()) {
+        return read.clone().map_err(anyhow::Error::msg);
+    }
     match crate::zip_store::presence::zip_markers(conn, &catalog_path) {
         Some((zip, entry)) => {
             let (header, _) = crate::zip_store::reader::read_entry_header(Path::new(&zip), &entry)
@@ -528,17 +534,28 @@ fn light_bitpix(conn: &Connection, light_path: &Path) -> anyhow::Result<Option<i
     }
 }
 
+/// A zip-resident light whose entry header is read ahead of the catalog borrow.
+struct ZipLight {
+    catalog_path: String,
+    zip: String,
+    entry: String,
+}
+
 /// The master calibration files of a run that live inside a zip, extracted into the zip cache BEFORE the
 /// catalog phase (a connection is never held across an extraction) and kept pinned until the value drops.
 /// Masters are shared across the lights of a set, so this is a handful of files for the whole run.
 ///
-/// [`ZipMasters::map`] is the `local` mapper [`resolve_generation_mapped`] takes. A master that could not be
+/// [`resolve_generation_mapped`] takes the whole value: [`ZipMasters::map`] gives the readable file of a
+/// master, and the lights' bit depths are read here too, one zip open per zip. A master that could not be
 /// extracted is remembered with its reason, so the lights that need it are skipped one by one (each run's
 /// per-frame policy) instead of the whole run failing.
 #[derive(Default)]
 pub struct ZipMasters {
     /// catalog path -> the extracted file, or why it could not be extracted.
     local: HashMap<String, std::result::Result<PathBuf, String>>,
+    /// catalog path of a zip-resident LIGHT -> its bit depth read from the entry header, or why that failed.
+    /// Read one zip open per zip, ahead of the catalog borrow (see [`ZipMasters::read_light_depths`]).
+    light_depths: HashMap<String, std::result::Result<Option<i32>, String>>,
     pins: Vec<crate::zip_store::cache::Pinned>,
 }
 
@@ -558,8 +575,9 @@ impl ZipMasters {
         progress: &mut dyn FnMut(usize, usize, &str),
     ) -> anyhow::Result<Self> {
         let Some(db) = ctx.db.get() else { return Ok(Self::none()) };
-        let resident: Vec<String> = {
+        let (resident, zip_lights): (Vec<String>, Vec<ZipLight>) = {
             let conn = db.conn();
+            let zip_lights = Self::zip_lights_of(&conn, frame_ids);
             let mut paths: Vec<String> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for &frame_id in frame_ids {
@@ -571,9 +589,11 @@ impl ZipMasters {
             }
             let resident = crate::zip_store::presence::zip_resident_paths(&conn, &paths);
             paths.retain(|p| resident.contains(p));
-            paths
+            (paths, zip_lights)
         };
         let mut out = Self::none();
+        // The lights' bit depths, one open per zip, with no catalog connection held.
+        out.read_light_depths(zip_lights);
         for (i, path) in resident.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
@@ -592,6 +612,59 @@ impl ZipMasters {
             }
         }
         Ok(out)
+    }
+
+    /// The zip-resident lights among `frame_ids`, from the catalog alone (no zip is touched).
+    fn zip_lights_of(conn: &Connection, frame_ids: &[i64]) -> Vec<ZipLight> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &frame_id in frame_ids {
+            let path: Option<String> = conn
+                .query_row(
+                    "SELECT fi.path FROM frames fr JOIN files fi ON fi.id = fr.file_id WHERE fr.id = ?1",
+                    [frame_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(path) = path else { continue };
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if let Some((zip, entry)) = crate::zip_store::presence::zip_markers(conn, &path) {
+                out.push(ZipLight { catalog_path: path, zip, entry });
+            }
+        }
+        out
+    }
+
+    /// Reads the entry headers of `lights` for their bit depth, ONE `read_headers` call (one open of the
+    /// central directory) per zip instead of one per light. A zip that cannot be opened, or an entry that
+    /// cannot be read, is remembered per light with its reason, so that light alone is skipped later.
+    fn read_light_depths(&mut self, lights: Vec<ZipLight>) {
+        let mut by_zip: std::collections::BTreeMap<String, Vec<ZipLight>> = std::collections::BTreeMap::new();
+        for light in lights {
+            by_zip.entry(light.zip.clone()).or_default().push(light);
+        }
+        for (zip, group) in by_zip {
+            let entries: Vec<&str> = group.iter().map(|l| l.entry.as_str()).collect();
+            match crate::zip_store::reader::read_headers(Path::new(&zip), &entries) {
+                Ok((headers, _)) => {
+                    for (light, (_, header)) in group.iter().zip(headers) {
+                        let depth = match header {
+                            Ok(bytes) => Ok(crate::integration::banded::probe_bitpix_from_header(&bytes)),
+                            Err(e) => Err(format!("{}: inside {zip}, which is not reachable: {e:#}", light.catalog_path)),
+                        };
+                        self.light_depths.insert(light.catalog_path.clone(), depth);
+                    }
+                }
+                Err(e) => {
+                    for light in group {
+                        let why = format!("{}: inside {zip}, which is not reachable: {e:#}", light.catalog_path);
+                        self.light_depths.insert(light.catalog_path, Err(why));
+                    }
+                }
+            }
+        }
     }
 
     /// The file a resolve may read for `catalog_path`: the extracted copy of a zip master, the path itself
@@ -1473,6 +1546,55 @@ mod tests {
         std::fs::remove_file(dir.path().join("night.zip")).unwrap();
         let err = resolve_generation(&conn, 1, &opts, dir.path()).err().expect("an unreachable zip fails the frame");
         assert!(format!("{err:#}").contains("not reachable") || format!("{err:#}").contains("night.zip"), "{err:#}");
+    }
+
+    /// The bit depths of a night's zip lights are read ahead of the catalog borrow with ONE open of the zip
+    /// (not one per light), and the resolve then opens nothing; an unreachable zip fails each of its lights
+    /// with the cause, without a panic or a silent default scale.
+    #[test]
+    fn zip_light_depths_are_read_with_one_open_per_zip() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let dir = tempfile::tempdir().unwrap();
+        let dark = write_plane(&dir.path().join("dark.fits"), spiky_dark);
+        let conn = seed_db();
+        seed_master_set(&conn, 10, "Dark", &dark);
+        let ids = [1i64, 2, 3];
+        for id in ids {
+            let light = write_u16_plane(&dir.path().join(format!("light_{id}.fits")), 1000);
+            seed_light(&conn, id, &light, None, None);
+            add_link(&conn, id, 10, "Dark");
+        }
+        let zip = dir.path().join("night.zip");
+        let file_ids: Vec<i64> = ids.iter().map(|id| id + 2_000_000).collect();
+        zip_files(&conn, &file_ids, &zip, Shape::Foreign);
+
+        let mut masters = ZipMasters::none();
+        let lights = ZipMasters::zip_lights_of(&conn, &ids);
+        assert_eq!(lights.len(), 3);
+        let before = crate::zip_store::reader::test_hooks::opens_of(&zip);
+        masters.read_light_depths(lights);
+        assert_eq!(crate::zip_store::reader::test_hooks::opens_of(&zip) - before, 1, "one open for the zip");
+
+        let opts = CalibratedLightOptions::default();
+        let mut divisors = DivisorCache::new();
+        for id in ids {
+            let spec = resolve_generation_mapped(&conn, id, &opts, dir.path(), &mut divisors, &masters).unwrap();
+            assert_eq!(spec.inputs.scale_divisor, 65535.0, "light {id}");
+        }
+        assert_eq!(
+            crate::zip_store::reader::test_hooks::opens_of(&zip) - before,
+            1,
+            "the resolves read the depths from the batch, not from the zip"
+        );
+
+        // A zip that cannot be opened fails each of its lights with the cause.
+        std::fs::remove_file(&zip).unwrap();
+        let mut gone = ZipMasters::none();
+        gone.read_light_depths(ZipMasters::zip_lights_of(&conn, &ids));
+        let err = resolve_generation_mapped(&conn, 2, &opts, dir.path(), &mut divisors, &gone)
+            .err()
+            .expect("an unreachable zip fails the frame");
+        assert!(format!("{err:#}").contains("not reachable"), "{err:#}");
     }
 
     #[test]

@@ -2106,7 +2106,7 @@ fn resolve_calibrate_job(
                 &calibration_opts,
                 scratch,
                 rc.memo.divisors_mut(),
-                &|p| zip_masters.map(p),
+                &zip_masters,
             )
             .map_err(|e| format!("{e:#}")),
             // A project frame is prepared, never calibrated (spec §5.1).

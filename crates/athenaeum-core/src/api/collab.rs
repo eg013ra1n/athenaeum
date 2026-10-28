@@ -5559,12 +5559,9 @@ async fn run_publish(
             let fid = cand.frame_id;
             let (recipe, osc, external): (String, bool, Option<(std::path::PathBuf, String)>) =
                 if cand.attested {
-                    // An attested light inside a zip is hashed and stat'd in place by the generation phase,
-                    // which a zip entry cannot give: hold it back with the unpack reason (v1).
-                    if let Some(reason) = zip_inputs_hold(&conn, fid, true) {
-                        held_back.push(held(fid, &cand.filename, reason));
-                        continue;
-                    }
+                    // An attested light inside a zip needs no hold here: its recipe is the catalog's size and
+                    // mtime, so an already-published one is `Unchanged`. The hold sits below, on the frames that
+                    // would actually be sent.
                     let row: rusqlite::Result<(String, i64, String)> = conn.query_row(
                         "SELECT fi.path, fi.size, fi.modified_at FROM frames f \
                          JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
@@ -5596,10 +5593,6 @@ async fn run_publish(
                         }
                     }
                 } else {
-                    if let Some(reason) = zip_inputs_hold(&conn, fid, false) {
-                        held_back.push(held(fid, &cand.filename, reason));
-                        continue;
-                    }
                     let resolved =
                         match crate::calibration_library::light_resolve::resolve_frame_inputs(
                             &conn,
@@ -5609,11 +5602,10 @@ async fn run_publish(
                             Ok(r) => r,
                             Err(e) => {
                                 tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: cannot resolve this light");
-                                held_back.push(held(
-                                    fid,
-                                    &cand.filename,
-                                    format!("cannot calibrate: {e:#}"),
-                                ));
+                                // A light or master inside a zip is the better reason when one is the cause.
+                                let reason = zip_inputs_hold(&conn, fid, false)
+                                    .unwrap_or_else(|| format!("cannot calibrate: {e:#}"));
+                                held_back.push(held(fid, &cand.filename, reason));
                                 continue;
                             }
                         };
@@ -5626,11 +5618,10 @@ async fn run_publish(
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: recipe hash failed");
-                            held_back.push(held(
-                                fid,
-                                &cand.filename,
-                                format!("cannot read the calibration inputs: {e:#}"),
-                            ));
+                            let reason = zip_inputs_hold(&conn, fid, false).unwrap_or_else(|| {
+                                format!("cannot read the calibration inputs: {e:#}")
+                            });
+                            held_back.push(held(fid, &cand.filename, reason));
                             continue;
                         }
                     };
@@ -5724,6 +5715,13 @@ async fn run_publish(
                         continue;
                     }
                 }
+            }
+            // A frame that would be sent from inside a zip waits for an unpack (spec 7.9: v1 does not send
+            // from a zip). Only here, on New / Update / Adopt: an `Unchanged` one sends nothing and was
+            // skipped above, so a published light zipped since is not held back on every run.
+            if let Some(reason) = zip_inputs_hold(&conn, fid, external.is_some()) {
+                held_back.push(held(fid, &cand.filename, reason));
+                continue;
             }
             split.push((cand, kind, osc, external));
         }
@@ -14010,6 +14008,111 @@ pub(crate) mod tests {
                     "{light:?} mtime changed"
                 );
             }
+        }
+
+        use crate::zip_store::test_support::Shape;
+
+        /// Puts the catalog file behind `path` into a zip (the disk file is gone). `Foreign`: its row now holds
+        /// the virtual path. `Own`: Move and ZIP, the row keeps its path.
+        fn zip_catalog_file(
+            fx: &PubFx,
+            path: &Path,
+            zip_name: &str,
+            shape: crate::zip_store::test_support::Shape,
+        ) {
+            let conn = fx.conn();
+            let file_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE path = ?1",
+                    [path.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::zip_store::test_support::zip_files(
+                &conn,
+                &[file_id],
+                &fx.tmp.path().join(zip_name),
+                shape,
+            );
+        }
+
+        /// Zip plan Task 9 (fix round 2): a NEW light that would be sent from inside a zip is held back with
+        /// the unpack reason, attested or not; a NEW light whose master is zipped likewise names the master.
+        #[tokio::test]
+        async fn a_new_zipped_light_or_master_is_held_back_with_the_unpack_reason() {
+            // Attested light.
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            zip_catalog_file(&fx, &fx.lights[0], "lights.zip", Shape::Foreign);
+            let cal = calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(cal.held_back.len(), 1, "{:?}", cal.held_back);
+            assert!(
+                cal.held_back[0].reasons[0].contains("the light is inside a zip"),
+                "{:?}",
+                cal.held_back
+            );
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(res.announced, 0, "{res:?}");
+
+            // Generated light, zipped master.
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            zip_catalog_file(&fx, &fx.master, "master.zip", Shape::Foreign);
+            let cal = calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(cal.held_back.len(), 1, "{:?}", cal.held_back);
+            assert!(
+                cal.held_back[0].reasons[0].contains("master is inside a zip"),
+                "{:?}",
+                cal.held_back
+            );
+        }
+
+        /// Zip plan Task 9 (fix round 2): what was published and has not changed sends nothing, so zipping
+        /// it afterwards must not hold it back on every run — an attested light zipped since, and a disk
+        /// light whose master was zipped since by Move and ZIP (its path unchanged, identified by its banked hash,
+        /// never stat'd).
+        #[tokio::test]
+        async fn an_unchanged_published_frame_is_not_held_back_when_it_was_zipped_since() {
+            // Attested light.
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(
+                publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap().announced,
+                1
+            );
+            zip_catalog_file(&fx, &fx.lights[0], "lights.zip", Shape::Foreign);
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!((res.announced, res.updated, res.unchanged), (0, 0, 1), "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+
+            // Generated light, master zipped afterwards.
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            // The master's hash is banked (the scanner does it), so its recipe identity needs no stat.
+            fx.conn()
+                .execute(
+                    "UPDATE files SET strong_hash = 'abc123' WHERE path = ?1",
+                    [fx.master.to_string_lossy()],
+                )
+                .unwrap();
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(
+                publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap().announced,
+                1
+            );
+            zip_catalog_file(&fx, &fx.master, "master.zip", Shape::Own { operation: 7 });
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!((res.announced, res.updated, res.unchanged), (0, 0, 1), "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
         }
 
         /// F5: the recipe is `external:<size>:<modified_at>` — unchanged
