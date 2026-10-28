@@ -45,3 +45,15 @@ limitBytes: number, };
 
 export type ExtractionEstimate = { files: number, bytes: number, };
 
+export type UnpackTarget = { "kind": "frameSet", id: number, } | { "kind": "calibrationSet", id: number, };
+
+export type UnpackOutcome = { 
+/**
+ * Entries extracted to the target folder.
+ */
+unpacked: number, 
+/**
+ * Frames whose identical file was already at the target; nothing was written.
+ */
+adopted: number, conflicts: Array<string>, };
+

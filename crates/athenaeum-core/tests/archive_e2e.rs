@@ -290,3 +290,64 @@ fn unarchive_to_the_original_path_rewrites_a_repointed_row_path() {
     assert_eq!(zip_col, None);
     assert_eq!(std::fs::read(&original).unwrap(), first);
 }
+
+#[test]
+fn unarchive_after_deleting_two_restored_files_extracts_exactly_those_two() {
+    let arch = TempDir::new().unwrap();
+    let scan = TempDir::new().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).unwrap();
+    conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.path().to_str().unwrap()]).unwrap();
+    conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+    conn.execute(
+        "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+    let mut lights = Vec::new();
+    for i in 0..4i64 {
+        let p = scan.path().join(format!("M31/L_{i:03}.fits"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("light-bytes-{i}")).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 14, '2025-10-12', 'FITS')",
+            params![1000 + i, p.to_str().unwrap(), format!("L_{i:03}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (?1, ?2, 'M31', 'T', 'C', 'Light')",
+            params![10000 + i, 1000 + i],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [10000 + i]).unwrap();
+        lights.push(p);
+    }
+
+    let plan = build_plan(
+        &conn,
+        1,
+        arch.path(),
+        &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+        ArchiveCompression::Store,
+    )
+    .unwrap();
+    let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+    // Unarchive, keeping the zip.
+    let first = run_restore(&conn, op_id, scan.path(), false, true, &cancel, &NullEmitter).unwrap();
+    assert_eq!(first.extracted, 4);
+    assert!(!first.has_conflicts());
+
+    // Two restored files are deleted; Unarchive again extracts exactly those two.
+    std::fs::remove_file(&lights[1]).unwrap();
+    std::fs::remove_file(&lights[3]).unwrap();
+    let second = run_restore(&conn, op_id, scan.path(), false, true, &cancel, &NullEmitter).unwrap();
+    assert_eq!(second.extracted, 2);
+    assert!(!second.has_conflicts());
+    for (i, p) in lights.iter().enumerate() {
+        assert_eq!(std::fs::read(p).unwrap(), format!("light-bytes-{i}").as_bytes());
+    }
+}

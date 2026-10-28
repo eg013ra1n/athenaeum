@@ -367,6 +367,10 @@ pub struct RestoreConflict {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RestoreOutcome {
     pub conflicts: Vec<RestoreConflict>,
+    /// Entries this run extracted from their zips (targets that were missing); files already in place
+    /// are not counted.
+    #[serde(default)]
+    pub extracted: usize,
 }
 
 impl RestoreOutcome {
@@ -415,6 +419,7 @@ mod tests {
                 expected_hash: "aaaa".into(),
                 actual_hash: Some("bbbb".into()),
             }],
+            ..Default::default()
         };
         assert!(dirty.has_conflicts());
     }

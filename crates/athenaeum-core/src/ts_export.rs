@@ -327,6 +327,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::archive::models::ArchiveOperationSummary,
             crate::zip_store::cache::ZipCacheStatus,
             crate::zip_store::materialize::ExtractionEstimate,
+            crate::api::zip::UnpackTarget,
+            crate::api::zip::UnpackOutcome,
         ]))),
         ("export.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::export::models::CameraType,

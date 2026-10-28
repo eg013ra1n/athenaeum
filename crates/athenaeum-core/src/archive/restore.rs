@@ -1,22 +1,27 @@
-//! Restore: extract zip(s) into a temp dir, then copy only the *missing*
-//! files to their final locations. Files already in place at the catalog's
-//! recorded source path are left alone — this preserves both copy-disposition
-//! calibrations (whose originals were never deleted) and any user edits made
-//! after the archive ran.
+//! Restore: extract only the *missing* files from the zip(s) straight to their
+//! final locations. Files already in place at the catalog's recorded source
+//! path are left alone — this preserves both copy-disposition calibrations
+//! (whose originals were never deleted) and any user edits made after the
+//! archive ran. There is no temp tree: an entry is extracted only when its
+//! target is free, through `zip_store::place::place_entry`, which never
+//! replaces a file.
 //!
-//! Stages:
-//! - extract:        every entry of every zip → temp dir, hash-verified
-//!                   against the plan's expected_hash.
-//! - reconcile:      per-file decide whether to skip (already on disk) or
-//!                   restore (copy temp → target). "Already on disk" is
-//!                   hash-verified against the same expected_hash before
-//!                   being trusted — see CONFLICT handling below. Target is
-//!                   either the original source_path (preserves layout) or
+//! Stages (per file, in one pass):
+//! - reconcile:      decide whether to skip (already on disk) or restore.
+//!                   "Already on disk" is hash-verified against the plan's
+//!                   expected_hash before being trusted — see CONFLICT
+//!                   handling below. Target is either the original
+//!                   source_path (preserves layout) or
 //!                   `<picked>/<path-in-zip>` for an alternate target.
+//! - extract:        a missing target is extracted from its zip and the
+//!                   placed file is hash-verified against expected_hash; a
+//!                   mismatch removes what this run placed and is a conflict.
 //! - update_catalog: clear archive markers for restored files; rewrite
 //!                   `files.path` only when the restore target differs from
-//!                   the original.
-//! - cleanup:        delete temp dir, optionally delete zips.
+//!                   the original. With `keep_zip_after_restore` each
+//!                   restored entry is recorded in `zip_released_entries`.
+//! - cleanup:        optionally delete zips — never one that still has
+//!                   catalog rows living in it.
 //!
 //! CONFLICT handling: a file sitting at `source_path` is only ever trusted
 //! as "already restored" if it hashes to the plan's `expected_hash`. Any
@@ -37,12 +42,12 @@ use crate::archive::db as adb;
 use crate::archive::models::{ArchiveOperationFile, ArchiveStage, RestoreConflict, RestoreOutcome, StepStatus};
 use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
+use crate::zip_store::place::{place_entry, record_released_entry, PlaceOutcome};
+use crate::zip_store::reader::extract_entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,13 +71,6 @@ enum RestoreTargetMode<'a> {
     /// Each file restores to `<root>/<path-in-zip>`. Used when the user
     /// explicitly picked a scan root or custom folder.
     UnderRoot(&'a Path),
-}
-
-/// Compute the temp directory used during a restore.
-fn restore_temp_dir(archive_root: &Path, operation_id: i64) -> PathBuf {
-    archive_root
-        .join(".athenaeum_restore_temp")
-        .join(format!("op_{}", operation_id))
 }
 
 /// Decide whether `target_root_path` represents "restore to original" or
@@ -113,7 +111,7 @@ pub fn run_restore(
     }
 
     // Pre-flight: every zip referenced in the plan must exist on disk before
-    // we touch the temp dir. Catches the case where the user moved or deleted
+    // we write anything. Catches the case where the user moved or deleted
     // zip files outside the app, and gives them a clear list of what's missing.
     let unique_zip_paths: HashSet<&str> = files.iter().map(|f| f.target_zip_path.as_str()).collect();
     let mut missing: Vec<&str> = unique_zip_paths
@@ -131,29 +129,10 @@ pub fn run_restore(
         );
     }
 
-    let archive_root = Path::new(&op.archive_root_path);
-    let temp_dir = restore_temp_dir(archive_root, operation_id);
-    // Always start with a clean temp dir; previous runs may have left files behind.
-    if temp_dir.exists() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-    std::fs::create_dir_all(&temp_dir)
-        .with_context(|| format!("create temp dir {}", temp_dir.display()))?;
-
     let mode = classify_target(target_root_path, &files);
 
-    // From here on, ANY error path needs to clean the temp dir. Wrap the rest
-    // of the work and intercept Err to cleanup before propagating.
-    let result =
-        run_restore_inner(conn, operation_id, &op, &files, total, &temp_dir, mode,
-                          overwrite_existing, keep_zip_after_restore, cancel, emitter);
-    match result {
-        Ok(outcome) => Ok(outcome),
-        Err(e) => {
-            cleanup_temp(&temp_dir);
-            Err(e)
-        }
-    }
+    run_restore_inner(conn, operation_id, &op, &files, total, mode,
+                      overwrite_existing, keep_zip_after_restore, cancel, emitter)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,7 +142,6 @@ fn run_restore_inner(
     op: &crate::archive::models::ArchiveOperation,
     files: &[crate::archive::models::ArchiveOperationFile],
     total: usize,
-    temp_dir: &Path,
     mode: RestoreTargetMode<'_>,
     overwrite_existing: bool,
     keep_zip_after_restore: bool,
@@ -182,76 +160,18 @@ fn run_restore_inner(
         emit_event(emitter, "archive-progress", &prog);
     };
 
-    // Stage: extract -----------------------------------------------------------
-    // Extract every entry into the temp dir, verifying the hash against the plan.
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut temp_paths: Vec<PathBuf> = Vec::with_capacity(total);
-
-    for (idx, f) in files.iter().enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            cleanup_temp(&temp_dir);
-            anyhow::bail!("restore cancelled");
-        }
-
-        let temp_path = temp_dir.join(&f.target_path_in_zip);
-        if let Some(parent) = temp_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
-        }
-
-        let zip_file = File::open(&f.target_zip_path)
-            .with_context(|| format!("open zip {}", f.target_zip_path))?;
-        let mut archive = zip::ZipArchive::new(BufReader::new(zip_file))
-            .with_context(|| format!("parse zip {}", f.target_zip_path))?;
-        let mut entry = archive
-            .by_name(&f.target_path_in_zip)
-            .with_context(|| format!("entry not found in zip: {}", f.target_path_in_zip))?;
-
-        let mut out = File::create(&temp_path)
-            .with_context(|| format!("create temp file {}", temp_path.display()))?;
-        loop {
-            let n = entry.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-        }
-        drop(out);
-        drop(entry);
-
-        // Verify hash against plan immediately — catches corrupt zips before
-        // we proceed to the reconcile step.
-        let actual = compute_xxhash(&temp_path)
-            .with_context(|| format!("hash {}", temp_path.display()))?;
-        if actual != f.expected_hash {
-            cleanup_temp(&temp_dir);
-            anyhow::bail!(
-                "zip integrity check failed for {}: expected {} got {}",
-                f.target_path_in_zip, f.expected_hash, actual,
-            );
-        }
-        temp_paths.push(temp_path);
-
-        emit(
-            emitter,
-            "extract",
-            idx + 1,
-            total,
-            format!("Extracting {}/{}", idx + 1, total),
-        );
-    }
-
-    // Stage: reconcile ---------------------------------------------------------
-    // For each file: skip if already on disk at source_path; else copy temp → target.
-    // We track which files actually got restored so the catalog phase only
-    // touches those rows.
+    // Stage: reconcile + extract -------------------------------------------------
+    // For each file: skip if already on disk at source_path; else extract the
+    // entry straight to the target (only entries whose target is missing are
+    // read from their zip). We track which files actually got restored so the
+    // catalog phase only touches those rows.
     let mut restored: Vec<(&crate::archive::models::ArchiveOperationFile, PathBuf)> =
         Vec::with_capacity(total);
     let mut conflicts: Vec<RestoreConflict> = Vec::new();
+    let mut extracted = 0usize;
 
-    for (idx, (f, temp_path)) in files.iter().zip(temp_paths.iter()).enumerate() {
+    for (idx, f) in files.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
-            cleanup_temp(&temp_dir);
             anyhow::bail!("restore cancelled");
         }
 
@@ -422,13 +342,100 @@ fn run_restore_inner(
             continue;
         }
 
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
+        // The target is free (or `overwrite_existing` asks for a replacement): extract the entry there.
+        emit(
+            emitter,
+            "extract",
+            idx + 1,
+            total,
+            format!("Extracting {}/{}", idx + 1, total),
+        );
+        let placed = if overwrite_existing {
+            // The caller asked to replace whatever is at the target: the extraction renames atomically onto it.
+            extract_entry(
+                Path::new(&f.target_zip_path), &f.target_path_in_zip, None, &dest, cancel.as_ref(), &mut |_| {},
+            )
+            .with_context(|| format!("extract {} from {}", f.target_path_in_zip, f.target_zip_path))?;
+            PlaceOutcome::Placed
+        } else {
+            place_entry(Path::new(&f.target_zip_path), &f.target_path_in_zip, None, &dest, cancel.as_ref())
+                .with_context(|| format!("extract {} from {}", f.target_path_in_zip, f.target_zip_path))?
+        };
+        let we_placed = placed == PlaceOutcome::Placed;
+        if let PlaceOutcome::Conflict(reason) = &placed {
+            // A file appeared at the target after the check above and it is not the frame's own bytes.
+            let msg = format!("restore conflict: {reason}");
+            tracing::error!(
+                operation_id,
+                file_id = f.file_id.unwrap_or(-1),
+                src = %f.source_path,
+                dest = %dest.display(),
+                "restore conflict: a different file took the target while it was being restored, leaving frame set archived pending resolution"
+            );
+            record_conflict_step(conn, operation_id, f, None, &msg)?;
+            conflicts.push(RestoreConflict {
+                file_id: f.file_id,
+                source_path: f.source_path.clone(),
+                expected_hash: f.expected_hash.clone(),
+                actual_hash: None,
+            });
+            emit(
+                emitter,
+                "reconcile",
+                idx + 1,
+                total,
+                format!("CONFLICT — a different file took the target, left untouched: {}", dest.display()),
+            );
+            continue;
         }
-        std::fs::copy(temp_path, &dest)
-            .with_context(|| format!("copy {} -> {}", temp_path.display(), dest.display()))?;
 
+        // Verify the placed file against the plan with the function that produced expected_hash: catches
+        // a corrupt zip. What this run placed is removed again; a file that was already there is not ours.
+        let verdict = compute_xxhash(&dest);
+        let ok = matches!(&verdict, Ok(h) if *h == f.expected_hash);
+        if !ok {
+            let actual = verdict.as_ref().ok().cloned();
+            let msg = match &verdict {
+                Ok(h) => format!(
+                    "restore conflict: extracted file does not match archived hash for {} (expected {}, got {})",
+                    f.target_path_in_zip, f.expected_hash, h,
+                ),
+                Err(e) => format!("restore conflict: could not hash {}: {:#}", dest.display(), e),
+            };
+            tracing::error!(
+                operation_id,
+                file_id = f.file_id.unwrap_or(-1),
+                src = %f.source_path,
+                dest = %dest.display(),
+                expected_hash = %f.expected_hash,
+                actual_hash = actual.as_deref().unwrap_or(""),
+                "restore conflict: extracted file failed the integrity check, leaving frame set archived pending resolution"
+            );
+            if we_placed || overwrite_existing {
+                if let Err(e) = std::fs::remove_file(&dest) {
+                    tracing::warn!(dest = %dest.display(), error = %e, "could not remove the file that failed the integrity check");
+                }
+            }
+            record_conflict_step(conn, operation_id, f, actual.as_deref(), &msg)?;
+            conflicts.push(RestoreConflict {
+                file_id: f.file_id,
+                source_path: f.source_path.clone(),
+                expected_hash: f.expected_hash.clone(),
+                actual_hash: actual,
+            });
+            emit(
+                emitter,
+                "reconcile",
+                idx + 1,
+                total,
+                format!("CONFLICT — extracted file failed the integrity check: {}", f.target_path_in_zip),
+            );
+            continue;
+        }
+
+        if we_placed {
+            extracted += 1;
+        }
         restored.push((f, dest));
         emit(
             emitter,
@@ -477,6 +484,11 @@ fn run_restore_inner(
             let path_changed = new_path.to_str() != Some(current_path.as_deref().unwrap_or(f.source_path.as_str()));
             let path_arg = if path_changed { new_path.to_str() } else { None };
             adb::unmark_file_archived(conn, file_id, path_arg, Some(&new_mtime), Some(new_size))?;
+        }
+        if keep_zip_after_restore {
+            // The entry now lives on disk: a later scan of the kept zip must not catalog it again.
+            record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id))
+                .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
         }
         catalog_done += 1;
         emit(
@@ -582,8 +594,6 @@ fn run_restore_inner(
     }
 
     // Stage: cleanup -----------------------------------------------------------
-    cleanup_temp(temp_dir);
-
     if keep_zip_after_restore {
         // Caller explicitly asked to keep the zip(s); nothing to do.
     } else if !conflicts.is_empty() {
@@ -620,8 +630,31 @@ fn run_restore_inner(
         };
         let cleanup_total = zip_paths.len();
         for (idx, zp) in zip_paths.iter().enumerate() {
+            // This operation's markers are cleared by now. Any row still pointing into the zip (a frame
+            // added to the zip by hand and cataloged from it, or one adopted from it) lives only there.
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1",
+                rusqlite::params![zp],
+                |r| r.get(0),
+            )?;
+            if remaining > 0 {
+                tracing::warn!(
+                    operation_id,
+                    zip_path = %zp,
+                    count = remaining,
+                    "keeping the zip after restore: catalog rows still live in it"
+                );
+                emit(
+                    emitter,
+                    "cleanup",
+                    idx + 1,
+                    cleanup_total,
+                    format!("Keeping zip {}/{} — {} catalog frame(s) still live in it", idx + 1, cleanup_total, remaining),
+                );
+                continue;
+            }
             if let Err(e) = std::fs::remove_file(zp) {
-                tracing::warn!(operation_id, path = %zp, error = %e, "failed to remove zip after restore; file left in place");
+                tracing::warn!(operation_id, zip_path = %zp, error = %e, "failed to remove zip after restore; file left in place");
             }
             emit(
                 emitter,
@@ -633,7 +666,7 @@ fn run_restore_inner(
         }
     }
 
-    Ok(RestoreOutcome { conflicts })
+    Ok(RestoreOutcome { conflicts, extracted })
 }
 
 /// Record a restore reconcile conflict as a Failed step, reusing the same
@@ -651,16 +684,6 @@ fn record_conflict_step(
     let step_id = adb::insert_step(conn, operation_id, Some(f.id), ArchiveStage::VerifyRestore)?;
     adb::update_step(conn, step_id, StepStatus::Failed, actual_hash, Some(message))?;
     Ok(())
-}
-
-fn cleanup_temp(temp_dir: &Path) {
-    if temp_dir.exists() {
-        // No `operation_id` field needed: the temp dir is
-        // `.athenaeum_restore_temp/op_<id>`, so the id already travels in `path`.
-        if let Err(e) = std::fs::remove_dir_all(temp_dir) {
-            tracing::warn!(path = %temp_dir.display(), error = %e, "failed to remove restore temp dir");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -805,8 +828,7 @@ pub(crate) mod tests {
         assert!(archived_at.is_none());
 
         // Temp dir gone.
-        let temp = restore_temp_dir(arch.path(), op_id);
-        assert!(!temp.exists());
+        assert!(!arch.path().join(".athenaeum_restore_temp").exists(), "restore leaves no temp tree");
     }
 
     /// Reconcile bug-fix: archive with a copy-disposition dark, then restore.
@@ -1412,9 +1434,9 @@ pub(crate) mod tests {
         ).unwrap();
         assert!(archived_at.is_some(), "frame set should still be marked archived");
 
-        // Temp dir must NOT have been created since the bail happened first.
-        let temp = restore_temp_dir(arch.path(), op_id);
-        assert!(!temp.exists(), "temp dir should not exist after preflight bail");
+        // Nothing is written before the preflight bail.
+        assert!(!arch.path().join(".athenaeum_restore_temp").exists());
+        assert!(std::fs::read_dir(restore_target.path()).unwrap().next().is_none(), "nothing extracted");
     }
 
     /// Pins the M33 data-loss bug: archive (move) → restore → monitor scan
@@ -1574,5 +1596,156 @@ pub(crate) mod tests {
             header.push(b' ');
         }
         std::fs::write(path, header).unwrap();
+    }
+
+    // ---- extraction straight to the target (no temp tree) -------------------------------------
+
+    /// A frame set of `n` lights archived (moved) into zips under `arch`; returns the originals' paths.
+    fn archived_lights(n: usize) -> (TempDir, TempDir, Connection, i64, Vec<PathBuf>) {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let p = scan.path().join(format!("M31/L_{i:03}.fits"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("light-content-{i}")).unwrap();
+            let (fid, frid) = (1000 + i as i64, 10000 + i as i64);
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 16, '2025-10-12', 'FITS')",
+                params![fid, p.to_str().unwrap(), format!("L_{i:03}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (?1, ?2, 'M31', 'T', 'C', 'Light')",
+                params![frid, fid],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [frid]).unwrap();
+            paths.push(p);
+        }
+        let plan = build_plan(
+            &conn,
+            1,
+            arch.path(),
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        )
+        .unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        run_operation(&conn, op_id, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        for p in &paths {
+            assert!(!p.exists(), "the archive moved {}", p.display());
+        }
+        (arch, scan, conn, op_id, paths)
+    }
+
+    fn restore(conn: &Connection, op_id: i64, root: &Path, overwrite: bool, keep_zip: bool) -> RestoreOutcome {
+        run_restore(conn, op_id, root, overwrite, keep_zip, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap()
+    }
+
+    #[test]
+    fn restore_extracts_only_the_missing_entries_and_records_released_ones_for_a_kept_zip() {
+        let (arch, scan, conn, op_id, paths) = archived_lights(3);
+        let first = restore(&conn, op_id, scan.path(), false, true);
+        assert_eq!(first.extracted, 3);
+        assert!(!arch.path().join(".athenaeum_restore_temp").exists(), "no temp tree is made");
+        assert_eq!(zip_count(arch.path()), 1, "the zip is kept");
+        let released: i64 = conn
+            .query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(released, 3, "each restored entry is recorded for the kept zip");
+
+        // Two files are deleted again; the next restore extracts exactly those two.
+        std::fs::remove_file(&paths[0]).unwrap();
+        std::fs::remove_file(&paths[2]).unwrap();
+        let untouched_mtime = std::fs::metadata(&paths[1]).unwrap().modified().unwrap();
+        let second = restore(&conn, op_id, scan.path(), false, true);
+        assert_eq!(second.extracted, 2);
+        assert!(!second.has_conflicts());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"light-content-0");
+        assert_eq!(std::fs::read(&paths[2]).unwrap(), b"light-content-2");
+        assert_eq!(std::fs::metadata(&paths[1]).unwrap().modified().unwrap(), untouched_mtime);
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0)).unwrap(),
+            3,
+            "recording is idempotent"
+        );
+    }
+
+    #[test]
+    fn unarchive_keeps_a_zip_that_a_catalog_row_still_lives_in() {
+        let (arch, scan, conn, op_id, paths) = archived_lights(2);
+        let zip: String = conn
+            .query_row("SELECT archive_zip_path FROM files WHERE id = 1000", [], |r| r.get(0))
+            .unwrap();
+        // A frame added to the zip by hand and cataloged from it (a foreign row of the same zip).
+        let vpath = format!("{zip}{}Hand{}X.fits", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (7000, ?1, 'X.fits', 5, '2025-10-12', 'FITS', ?2, 'Hand/X.fits')",
+            params![vpath, zip],
+        )
+        .unwrap();
+
+        let outcome = restore(&conn, op_id, scan.path(), false, false);
+        assert!(!outcome.has_conflicts());
+        for p in &paths {
+            assert!(p.exists());
+        }
+        assert!(Path::new(&zip).is_file(), "the zip with a live catalog row is not deleted");
+        assert_eq!(zip_count(arch.path()), 1);
+        let still: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1", [&zip], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 1);
+        assert!(!frame_set_archived(&conn), "the frame set itself is restored");
+    }
+
+    #[test]
+    fn an_extracted_file_that_fails_the_integrity_check_is_removed_and_reported() {
+        let (arch, scan, conn, op_id, paths) = archived_lights(2);
+        conn.execute(
+            "UPDATE archive_operation_files SET expected_hash = '0000000000000000' WHERE source_path = ?1",
+            [paths[0].to_str().unwrap()],
+        )
+        .unwrap();
+        let outcome = restore(&conn, op_id, scan.path(), false, false);
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.extracted, 1);
+        assert!(!paths[0].exists(), "what this run placed is taken back");
+        assert!(paths[1].exists());
+        assert_eq!(zip_count(arch.path()), 1, "a conflict keeps the zip");
+        assert!(frame_set_archived(&conn), "the frame set stays archived");
+    }
+
+    #[test]
+    fn restore_with_overwrite_replaces_a_different_file_at_the_target() {
+        let (_arch, scan, conn, op_id, paths) = archived_lights(1);
+        std::fs::create_dir_all(paths[0].parent().unwrap()).unwrap();
+        std::fs::write(&paths[0], b"a newer capture").unwrap();
+        let outcome = restore(&conn, op_id, scan.path(), true, false);
+        assert!(!outcome.has_conflicts());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"light-content-0");
+    }
+
+    #[test]
+    fn restore_never_replaces_a_different_file_without_overwrite() {
+        let (arch, scan, conn, op_id, paths) = archived_lights(1);
+        std::fs::create_dir_all(paths[0].parent().unwrap()).unwrap();
+        std::fs::write(&paths[0], b"a newer capture").unwrap();
+        let outcome = restore(&conn, op_id, scan.path(), false, false);
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"a newer capture");
+        assert_eq!(zip_count(arch.path()), 1);
     }
 }

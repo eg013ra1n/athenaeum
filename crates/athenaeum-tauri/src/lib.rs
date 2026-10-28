@@ -416,6 +416,8 @@ pub fn run() {
             commands::archive_calibration_originals,
             commands::restore_calibration_originals,
             commands::clear_stale_archive_markers,
+            // Zip commands
+            commands::unpack_zip_frames,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

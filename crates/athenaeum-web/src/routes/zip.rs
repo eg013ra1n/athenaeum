@@ -1,0 +1,54 @@
+// Zip routes that change the catalog — mirrors `athenaeum-tauri/src/commands/zip.rs`.
+//
+// Thin wrappers only: extraction + policy construction + handler call + error mapping. Business logic
+// lives in `athenaeum_core::api::zip`.
+
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+
+use athenaeum_core::api::zip as api;
+
+use crate::events::SseProgressEmitter;
+use crate::routes::api_err;
+use crate::routes::scan_roots::allowed_roots_policy;
+use crate::WebAppState;
+
+pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnpackZipFramesArgs {
+    pub target: UnpackTarget,
+    pub dest_dir: String,
+}
+
+/// POST /api/unpack_zip_frames
+///
+/// Extraction and catalog writes run under `spawn_blocking`; the destination folder is checked against
+/// the host's allowed roots inside the shared handler.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn unpack_zip_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<UnpackZipFramesArgs>,
+) -> Result<Json<UnpackOutcome>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        api::unpack_zip_frames(
+            &ctx,
+            &policy,
+            args.target,
+            &PathBuf::from(args.dest_dir),
+            &emitter,
+            &AtomicBool::new(false),
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unpack task panicked: {}", e)))?
+    .map_err(api_err)?;
+    Ok(Json(outcome))
+}

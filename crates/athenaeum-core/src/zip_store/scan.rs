@@ -158,7 +158,7 @@ pub(crate) enum HandRestore {
 }
 
 /// CRC32 of a whole file, read in 1 MiB chunks.
-fn file_crc32(path: &Path) -> Result<u32> {
+pub(crate) fn file_crc32(path: &Path) -> Result<u32> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = crc32fast::Hasher::new();
@@ -405,11 +405,19 @@ fn stage_entry(
             // old zip in `files.path`: the path follows the zip like the markers do.
             if let (Some(fz), Some(fe)) = (&from_zip, &from_entry) {
                 if current_path == virtual_path(Path::new(fz), fe) {
-                    conn.execute(
+                    let moved = conn.execute(
                         "UPDATE files SET path = ?1 WHERE id = ?2
                            AND NOT EXISTS (SELECT 1 FROM files WHERE path = ?1)",
                         params![vpath, file_id],
                     )?;
+                    if moved == 0 {
+                        tracing::warn!(
+                            file_id,
+                            path = %vpath,
+                            zip_path = %zip_str,
+                            "another catalog row owns the zip entry's path — the archived row keeps its old virtual path"
+                        );
+                    }
                 }
             }
             conn.execute(

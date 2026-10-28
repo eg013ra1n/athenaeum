@@ -39,6 +39,7 @@ mod plate_solve;
 mod registration;
 mod archive;
 mod masters;
+mod zip;
 mod stacking;
 pub(crate) mod sync;
 mod account;
@@ -309,6 +310,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
         .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
+        .route("/api/unpack_zip_frames", post(zip::unpack_zip_frames))
         // Personal sync (Stage I, task A7)
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))

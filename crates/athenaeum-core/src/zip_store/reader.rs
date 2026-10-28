@@ -378,6 +378,15 @@ pub fn partial_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+/// `<dest file name>.<pid>-<n>.staged` next to `dest`: where a placement extracts to before the name is
+/// published with a hard link (see `place::place_entry`). Unique per call, like [`partial_path`].
+pub(crate) fn staged_path(dest: &Path) -> PathBuf {
+    let n = PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{n}.staged", std::process::id()));
+    dest.with_file_name(name)
+}
+
 /// Removes the partial file unless the extraction finished.
 struct PartialGuard {
     path: PathBuf,

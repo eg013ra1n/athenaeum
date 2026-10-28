@@ -1,0 +1,606 @@
+//! Zip commands that change the catalog: the permanent unpack of foreign zip-resident frames.
+//!
+//! `unpack_zip_frames` moves the frames of a frame set or calibration set out of the foreign zips
+//! they were cataloged from and onto disk under a chosen folder. The rows stay (same `files.id`, same
+//! frame, analysis and plate-solve rows): only the path and the zip markers change. The zip is never
+//! written to or deleted; each unpacked entry is recorded in `zip_released_entries` so a later scan of
+//! the zip does not catalog it again. Frames that Move and ZIP wrote (`archived_in_operation` set) are
+//! restored with Unarchive, not here.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::api::{db, ApiError, PathPolicy};
+use crate::events::{emit_event, ProgressEmitter};
+use crate::services::ServiceContext;
+use crate::zip_store::place::{place_entry, record_released_entry, PlaceOutcome};
+use crate::zip_store::reader::{entry_crc32_map, is_safe_entry_name};
+
+/// The set whose zip-resident frames are unpacked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UnpackTarget {
+    /// Every light of the frame set, plus the calibration frames it reaches.
+    FrameSet { id: i64 },
+    /// The member frames of one calibration set.
+    CalibrationSet { id: i64 },
+}
+
+/// What an unpack did. Frames that were not moved are listed in `conflicts`, each as `"<what>: <why>"`;
+/// their rows are untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UnpackOutcome {
+    /// Entries extracted to the target folder.
+    pub unpacked: usize,
+    /// Frames whose identical file was already at the target; nothing was written.
+    pub adopted: usize,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UnpackProgress {
+    current: usize,
+    total: usize,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct UnpackFinished {
+    operation_id: i64,
+    outcome: &'static str,
+    kind: &'static str,
+    unpacked: usize,
+    adopted: usize,
+    conflicts: usize,
+}
+
+/// A zip-resident row that is a candidate for unpacking.
+struct ZipRow {
+    id: i64,
+    zip: String,
+    entry: String,
+    crc: Option<u32>,
+    /// Move and ZIP's own row (`archived_in_operation` set): Unarchive handles it.
+    ours: bool,
+}
+
+fn file_ids_of(conn: &Connection, target: UnpackTarget) -> Result<Vec<i64>, ApiError> {
+    let mut ids: Vec<i64> = Vec::new();
+    match target {
+        UnpackTarget::FrameSet { id } => {
+            let exists: Option<i64> =
+                conn.query_row("SELECT id FROM frames_set WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+            if exists.is_none() {
+                return Err(ApiError::NotFound(format!("frame set {id} not found")));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let lights = crate::archive::planner::collect_light_files(conn, id)?;
+            for (file_id, _, _) in lights {
+                if seen.insert(file_id) {
+                    ids.push(file_id);
+                }
+            }
+            use crate::archive::models::FrameRole;
+            for role in [FrameRole::Flat, FrameRole::Dark, FrameRole::Bias, FrameRole::Darkflat] {
+                for (file_id, _, _, _) in crate::archive::planner::collect_calibration_files(conn, id, role)? {
+                    if seen.insert(file_id) {
+                        ids.push(file_id);
+                    }
+                }
+            }
+        }
+        UnpackTarget::CalibrationSet { id } => {
+            let exists: Option<i64> =
+                conn.query_row("SELECT id FROM calibration_set WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+            if exists.is_none() {
+                return Err(ApiError::NotFound(format!("calibration set {id} not found")));
+            }
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT fi.id FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 ORDER BY fi.id",
+            )?;
+            let rows = stmt.query_map(params![id], |r| r.get::<_, i64>(0))?;
+            for r in rows {
+                ids.push(r?);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// The zip-resident rows among `file_ids`, in the order given (disk rows are not candidates).
+fn zip_rows(conn: &Connection, file_ids: &[i64]) -> Result<Vec<ZipRow>, ApiError> {
+    let mut stmt = conn.prepare(
+        "SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32, archived_in_operation IS NOT NULL
+         FROM files WHERE id = ?1 AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL",
+    )?;
+    let mut out = Vec::new();
+    for &id in file_ids {
+        let row = stmt
+            .query_row(params![id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, bool>(3)?))
+            })
+            .optional()?;
+        if let Some((zip, entry, crc, ours)) = row {
+            out.push(ZipRow { id, zip, entry, crc: crc.and_then(|c| u32::try_from(c).ok()), ours });
+        }
+    }
+    Ok(out)
+}
+
+/// Checks `dest_dir` against the host's path policy. A folder that does not exist yet is checked through
+/// its canonical parent; the placement itself keeps the spelling the caller gave (catalog paths must
+/// match what the scanner would produce).
+fn check_dest_dir(dest_dir: &Path, policy: &PathPolicy) -> Result<(), ApiError> {
+    if !dest_dir.is_absolute() {
+        return Err(ApiError::Invalid(format!("{} is not an absolute folder path", dest_dir.display())));
+    }
+    if dest_dir.exists() {
+        if !dest_dir.is_dir() {
+            return Err(ApiError::Invalid(format!("{} is not a folder", dest_dir.display())));
+        }
+        let canonical = dest_dir
+            .canonicalize()
+            .map_err(|e| ApiError::Invalid(format!("cannot resolve {}: {e}", dest_dir.display())))?;
+        policy.check(&canonical)
+    } else {
+        crate::api::files::resolve_mkdir_target(&dest_dir.to_string_lossy(), policy).map(|_| ())
+    }
+}
+
+/// Where `entry` goes under `dest_dir`: the entry path, component by component. `None` for an unsafe name
+/// or a result that is not under `dest_dir`.
+fn dest_for_entry(dest_dir: &Path, entry: &str) -> Option<PathBuf> {
+    if !is_safe_entry_name(entry) {
+        return None;
+    }
+    let dest = crate::archive::path_layout::dest_under_root(dest_dir, entry);
+    (dest != dest_dir && dest.starts_with(dest_dir)).then_some(dest)
+}
+
+/// Moves the zip-resident frames of `target` out of their foreign zips into `dest_dir/<entry path>`.
+///
+/// Per frame: the entry is placed without replacing anything ([`place_entry`]); an identical file already
+/// there is adopted, a different one is a conflict and the row stays put. A placed or adopted frame gets
+/// one transaction: `files.path` = the new path, `filename`, `modified_at` and `size` from the file, zip
+/// markers and CRC cleared, entry recorded as released. Cancel between frames leaves the frames already
+/// moved moved. `Err` only for a bad request, a database failure or a cancel.
+pub fn unpack_zip_frames(
+    ctx: &ServiceContext,
+    policy: &PathPolicy,
+    target: UnpackTarget,
+    dest_dir: &Path,
+    emitter: &dyn ProgressEmitter,
+    cancel: &AtomicBool,
+) -> Result<UnpackOutcome, ApiError> {
+    check_dest_dir(dest_dir, policy)?;
+    let database = db(ctx)?;
+    let conn = database.conn();
+    let file_ids = file_ids_of(&conn, target)?;
+    let result = unpack_file_ids(&conn, &file_ids, dest_dir, emitter, cancel);
+    let (outcome, label) = match &result {
+        Ok(o) if o.conflicts.is_empty() => (o.clone(), "completed"),
+        Ok(o) => (o.clone(), "completed_with_conflicts"),
+        Err(e) => {
+            tracing::error!(error = %e, "zip unpack failed");
+            (UnpackOutcome::default(), if cancel.load(Ordering::Relaxed) { "cancelled" } else { "failed" })
+        }
+    };
+    emit_event(
+        emitter,
+        "archive-finished",
+        &UnpackFinished {
+            operation_id: 0,
+            outcome: label,
+            kind: "unpack",
+            unpacked: outcome.unpacked,
+            adopted: outcome.adopted,
+            conflicts: outcome.conflicts.len(),
+        },
+    );
+    result
+}
+
+/// The unpack proper, over the given catalog rows.
+pub(crate) fn unpack_file_ids(
+    conn: &Connection,
+    file_ids: &[i64],
+    dest_dir: &Path,
+    emitter: &dyn ProgressEmitter,
+    cancel: &AtomicBool,
+) -> Result<UnpackOutcome, ApiError> {
+    let rows = zip_rows(conn, file_ids)?;
+    let total = rows.len();
+    let mut outcome = UnpackOutcome::default();
+
+    // One directory read per zip; rows grouped by zip (BTreeMap: stable order).
+    let mut by_zip: BTreeMap<String, Vec<ZipRow>> = BTreeMap::new();
+    for row in rows {
+        by_zip.entry(row.zip.clone()).or_default().push(row);
+    }
+
+    let mut done = 0usize;
+    let conflict = |outcome: &mut UnpackOutcome, what: &str, why: String| {
+        tracing::warn!(zip_entry = %what, error = %why, "zip frame not unpacked");
+        outcome.conflicts.push(format!("{what}: {why}"));
+    };
+    for (zip, rows) in by_zip {
+        let zip_path = Path::new(&zip);
+        let crcs = match zip_path.try_exists() {
+            Ok(true) => match entry_crc32_map(zip_path) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    tracing::warn!(zip_path = %zip, error = %format!("{e:#}"), "zip directory unreadable");
+                    for row in &rows {
+                        conflict(&mut outcome, &row.entry, format!("{zip} cannot be read: {e:#}"));
+                    }
+                    None
+                }
+            },
+            _ => {
+                tracing::warn!(zip_path = %zip, "zip not reachable, its frames stay in it");
+                for row in &rows {
+                    conflict(&mut outcome, &row.entry, format!("{zip} is not reachable"));
+                }
+                None
+            }
+        };
+        let Some(crcs) = crcs else {
+            done += rows.len();
+            continue;
+        };
+
+        for row in rows {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ApiError::Internal("unpack cancelled".into()));
+            }
+            done += 1;
+            emit_event(
+                emitter,
+                "zip-unpack-progress",
+                &UnpackProgress { current: done, total, message: format!("Unpacking {}/{}", done, total) },
+            );
+            if row.ours {
+                conflict(&mut outcome, &row.entry, "this frame was archived by Move and ZIP — use Unarchive".into());
+                continue;
+            }
+            let Some(dest) = dest_for_entry(dest_dir, &row.entry) else {
+                conflict(&mut outcome, &row.entry, "refused: the entry name is not safe to unpack".into());
+                continue;
+            };
+            let Some(&zip_crc) = crcs.get(&row.entry) else {
+                conflict(&mut outcome, &row.entry, format!("not found in {zip}"));
+                continue;
+            };
+            let dest_str = dest.to_string_lossy().into_owned();
+            let owner: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM files WHERE path = ?1 AND id != ?2",
+                    params![dest_str, row.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if owner.is_some() {
+                conflict(&mut outcome, &row.entry, format!("another catalog frame owns {dest_str}"));
+                continue;
+            }
+
+            let placed = match place_entry(zip_path, &row.entry, Some(row.crc.unwrap_or(zip_crc)), &dest, cancel) {
+                Ok(p) => p,
+                Err(e) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(ApiError::Internal("unpack cancelled".into()));
+                    }
+                    conflict(&mut outcome, &row.entry, format!("{e:#}"));
+                    continue;
+                }
+            };
+            let we_placed = placed == PlaceOutcome::Placed;
+            if let PlaceOutcome::Conflict(reason) = placed {
+                conflict(&mut outcome, &row.entry, reason);
+                continue;
+            }
+
+            match repoint_row(conn, &row, &dest) {
+                Ok(true) => {
+                    if we_placed {
+                        outcome.unpacked += 1;
+                    } else {
+                        outcome.adopted += 1;
+                    }
+                }
+                Ok(false) => {
+                    remove_placed(&dest, we_placed);
+                    conflict(&mut outcome, &row.entry, "the catalog row changed while it was being unpacked".into());
+                }
+                Err(e) => {
+                    tracing::error!(file_id = row.id, zip_path = %zip, zip_entry = %row.entry, error = %format!("{e:#}"), "could not move the catalog row to the unpacked file");
+                    remove_placed(&dest, we_placed);
+                    conflict(&mut outcome, &row.entry, format!("the catalog could not be updated: {e:#}"));
+                }
+            }
+        }
+    }
+    tracing::info!(
+        unpacked = outcome.unpacked,
+        adopted = outcome.adopted,
+        conflicts = outcome.conflicts.len(),
+        "zip frames unpacked"
+    );
+    Ok(outcome)
+}
+
+/// Takes back a file this call put on disk when its row could not follow.
+fn remove_placed(dest: &Path, we_placed: bool) {
+    if we_placed {
+        if let Err(e) = std::fs::remove_file(dest) {
+            tracing::warn!(path = %dest.display(), error = %e, "could not remove the unpacked file after a failed catalog update");
+        }
+    }
+}
+
+/// One transaction: the row becomes a disk row at `dest`. `false` when the row no longer has the zip
+/// markers it was read with.
+fn repoint_row(conn: &Connection, row: &ZipRow, dest: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let meta = std::fs::metadata(dest).with_context(|| format!("stat {}", dest.display()))?;
+    let modified = chrono::DateTime::<chrono::Utc>::from(
+        meta.modified().with_context(|| format!("modified time of {}", dest.display()))?,
+    )
+    .to_rfc3339();
+    let filename = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE files SET path = ?1, filename = ?2, modified_at = ?3, size = ?4,
+                archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL
+         WHERE id = ?5 AND archive_zip_path = ?6 AND archive_path_in_zip = ?7 AND archived_in_operation IS NULL",
+        params![dest.to_string_lossy(), filename, modified, meta.len() as i64, row.id, row.zip, row.entry],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    record_released_entry(&tx, &row.zip, &row.entry, None)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::models::ArchiveCompression;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use crate::zip_store::scan::scan_zip;
+    use crate::zip_store::scan::test_support::{light, make_zip};
+    use tempfile::TempDir;
+
+    fn catalog(root: &Path) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+        conn
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn file_id(conn: &Connection, entry_suffix: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM files WHERE archive_path_in_zip = ?1 OR path LIKE ?2",
+            params![entry_suffix, format!("%{entry_suffix}")],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Scans a zip of two lights into the catalog and gives the rows frame-set membership.
+    fn two_light_zip(tmp: &Path) -> (Connection, PathBuf, Vec<i64>) {
+        let conn = catalog(tmp);
+        let zip = make_zip(
+            tmp,
+            "night.zip",
+            &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for id in &ids {
+            let frame: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", [id], |r| r.get(0)).unwrap();
+            conn.execute("UPDATE frames SET imagetyp = 'Light' WHERE id = ?1", [frame]).unwrap();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [frame]).unwrap();
+        }
+        (conn, zip, ids)
+    }
+
+    fn run(conn: &Connection, ids: &[i64], dest: &Path) -> UnpackOutcome {
+        unpack_file_ids(conn, ids, dest, &NullEmitter, &AtomicBool::new(false)).unwrap()
+    }
+
+    #[test]
+    fn unpack_moves_rows_to_disk_with_metadata_intact() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        let before: Vec<(i64, i64)> = ids
+            .iter()
+            .map(|id| (*id, conn.query_row("SELECT id FROM frames WHERE file_id = ?1", [id], |r| r.get(0)).unwrap()))
+            .collect();
+        let headers = count(&conn, "SELECT COUNT(*) FROM fits_header");
+
+        // Through the public entry point: the frame set resolves to its two lights.
+        let ctx_free = file_ids_of(&conn, UnpackTarget::FrameSet { id: 1 }).unwrap();
+        assert_eq!(ctx_free.len(), 2);
+        let outcome = run(&conn, &ctx_free, out.path());
+        assert_eq!(outcome, UnpackOutcome { unpacked: 2, adopted: 0, conflicts: vec![] });
+
+        let l1 = out.path().join("Lights").join("L_001.fits");
+        assert_eq!(std::fs::read(&l1).unwrap(), light(1));
+        for (id, frame) in before {
+            let (path, name, size, zip_col, entry, crc): (String, String, i64, Option<String>, Option<String>, Option<i64>) = conn
+                .query_row(
+                    "SELECT path, filename, size, archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .unwrap();
+            assert!(path.starts_with(out.path().to_str().unwrap()), "{path}");
+            assert_eq!(std::fs::metadata(&path).unwrap().len() as i64, size);
+            assert!(name.starts_with("L_00"));
+            assert!(zip_col.is_none() && entry.is_none() && crc.is_none(), "zip markers cleared");
+            let same_frame: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", [id], |r| r.get(0)).unwrap();
+            assert_eq!(same_frame, frame, "the frame row is the same row");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM session_members"), 2, "set membership survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM fits_header"), headers, "header rows survive");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+        assert!(zip.is_file(), "the zip is never touched");
+
+        // A rescan of the zip adds nothing and takes nothing back.
+        let rescan = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(rescan.inserted.is_empty(), "released entries are not cataloged again");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
+    }
+
+    #[test]
+    fn unpack_adopts_an_identical_existing_file_and_reports_a_different_one_as_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        std::fs::create_dir_all(out.path().join("Lights")).unwrap();
+        std::fs::write(out.path().join("Lights/L_001.fits"), light(1)).unwrap();
+        std::fs::write(out.path().join("Lights/L_002.fits"), b"a different capture").unwrap();
+
+        let outcome = run(&conn, &ids, out.path());
+        assert_eq!(outcome.unpacked, 0);
+        assert_eq!(outcome.adopted, 1);
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert!(outcome.conflicts[0].contains("L_002.fits"));
+        assert_eq!(std::fs::read(out.path().join("Lights/L_002.fits")).unwrap(), b"a different capture");
+
+        let adopted_path: String = conn
+            .query_row("SELECT path FROM files WHERE id = ?1", [file_id(&conn, "L_001.fits")], |r| r.get(0))
+            .unwrap();
+        assert_eq!(Path::new(&adopted_path), out.path().join("Lights").join("L_001.fits"));
+        let untouched: (Option<String>, String) = conn
+            .query_row(
+                "SELECT archive_zip_path, path FROM files WHERE archive_path_in_zip = 'Lights/L_002.fits'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(untouched.0.is_some(), "the conflicted row stays zip-resident");
+        assert!(untouched.1.contains("night.zip"));
+    }
+
+    #[test]
+    fn unpack_never_writes_outside_the_target() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        // Force hostile entry names into the rows (the zip itself has no such entry: they must be refused
+        // by name before anything is looked up).
+        conn.execute("UPDATE files SET archive_path_in_zip = '../evil.fits' WHERE id = ?1", [ids[0]]).unwrap();
+        conn.execute("UPDATE files SET archive_path_in_zip = '/abs/evil.fits' WHERE id = ?1", [ids[1]]).unwrap();
+        let base = TempDir::new().unwrap();
+        let out = base.path().join("target");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let outcome = run(&conn, &ids, &out);
+        assert_eq!(outcome.unpacked + outcome.adopted, 0);
+        assert_eq!(outcome.conflicts.len(), 2);
+        assert!(outcome.conflicts.iter().all(|c| c.contains("not safe")), "{:?}", outcome.conflicts);
+        assert!(!base.path().join("evil.fits").exists());
+        assert!(!Path::new("/abs/evil.fits").exists());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        assert!(zip.is_file());
+    }
+
+    #[test]
+    fn our_own_rows_are_left_for_unarchive() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        // Mark one row as Move and ZIP's own.
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("UPDATE files SET archived_in_operation = 5 WHERE id = ?1", [ids[0]]).unwrap();
+        let out = TempDir::new().unwrap();
+        let outcome = run(&conn, &ids, out.path());
+        assert_eq!(outcome.unpacked, 1);
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert!(outcome.conflicts[0].contains("Unarchive"), "{:?}", outcome.conflicts);
+        let still: Option<String> = conn
+            .query_row("SELECT archive_zip_path FROM files WHERE id = ?1", [ids[0]], |r| r.get(0))
+            .unwrap();
+        assert!(still.is_some());
+    }
+
+    #[test]
+    fn a_missing_zip_leaves_every_row_and_reports_it() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        std::fs::remove_file(&zip).unwrap();
+        let out = TempDir::new().unwrap();
+        let outcome = run(&conn, &ids, out.path());
+        assert_eq!(outcome.unpacked, 0);
+        assert_eq!(outcome.conflicts.len(), 2);
+        assert!(outcome.conflicts.iter().all(|c| c.contains("not reachable")));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+    }
+
+    #[test]
+    fn a_cancel_between_frames_keeps_the_moved_rows_moved() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+
+        struct CancelAfterFirst<'a> {
+            cancel: &'a AtomicBool,
+        }
+        impl ProgressEmitter for CancelAfterFirst<'_> {
+            fn emit_json(&self, name: &str, payload: serde_json::Value) {
+                // The second frame's progress event arrives after the first was fully moved.
+                if name == "zip-unpack-progress" && payload["current"] == 2 {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let err = unpack_file_ids(&conn, &ids, out.path(), &CancelAfterFirst { cancel: &cancel }, &cancel).unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NULL"), 1, "the first stays moved");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
+    }
+
+    #[test]
+    fn the_destination_folder_is_checked_by_the_path_policy() {
+        let allowed = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![crate::test_support::canonical_path(allowed.path())]);
+        assert!(check_dest_dir(allowed.path(), &policy).is_ok());
+        assert!(check_dest_dir(&allowed.path().join("new/sub"), &policy).is_err(), "parent of a new folder must exist");
+        assert!(check_dest_dir(&allowed.path().join("new"), &policy).is_ok());
+        assert!(matches!(check_dest_dir(elsewhere.path(), &policy), Err(ApiError::Forbidden(_))));
+        assert!(matches!(check_dest_dir(Path::new("relative/dir"), &PathPolicy::AllowAll), Err(ApiError::Invalid(_))));
+    }
+}

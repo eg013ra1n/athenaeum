@@ -607,7 +607,7 @@ fn load_all_scan_roots(conn: &Connection) -> Result<Vec<String>> {
 }
 
 /// Light frames in the set: (file_id, path, size).
-fn collect_light_files(conn: &Connection, frames_set_id: i64) -> Result<Vec<(i64, String, i64)>> {
+pub(crate) fn collect_light_files(conn: &Connection, frames_set_id: i64) -> Result<Vec<(i64, String, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT fi.id, fi.path, fi.size
          FROM files fi
@@ -633,7 +633,7 @@ fn collect_light_files(conn: &Connection, frames_set_id: i64) -> Result<Vec<(i64
 /// `SELECT DISTINCT`: the conservative answer wins if a file is reachable both
 /// as a library master and as a plain set member. `build_plan` uses it to
 /// refuse a Move (see the loop in `build_plan`).
-fn collect_calibration_files(
+pub(crate) fn collect_calibration_files(
     conn: &Connection,
     frames_set_id: i64,
     role: FrameRole,

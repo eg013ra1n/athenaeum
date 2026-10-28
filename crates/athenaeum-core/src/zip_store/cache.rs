@@ -314,9 +314,10 @@ impl ZipCache {
     }
 }
 
-/// The process id embedded in a partial's name (`<name>.<pid>-<n>.partial`, see `reader::partial_path`).
+/// The process id embedded in a partial's or staged file's name (`<name>.<pid>-<n>.partial`, see
+/// `reader::partial_path`; `<name>.<pid>-<n>.staged`, see `reader::staged_path`).
 fn partial_pid(file_name: &str) -> Option<u32> {
-    let stem = file_name.strip_suffix(".partial")?;
+    let stem = file_name.strip_suffix(".partial").or_else(|| file_name.strip_suffix(".staged"))?;
     let tail = stem.rsplit('.').next()?;
     tail.split_once('-')?.0.parse().ok()
 }
@@ -370,6 +371,31 @@ fn sweep_partials(dir: &Path) {
                 Err(e) => {
                     tracing::warn!(path = %f.path().display(), error = %e, "could not remove a stale partial extraction");
                 }
+            }
+        }
+    }
+}
+
+/// Removes the leftovers of a dead process beside one file that is about to be placed: the `*.partial`
+/// and `*.staged` files named after `dest` (`<dest file name>.<pid>-<n>.partial|staged`). Unlike
+/// [`sweep_partials`] this process's own id counts as alive: another placement in this process may be
+/// writing its own staging file right now.
+pub(crate) fn sweep_stale_beside(dest: &Path) {
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else { return };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for f in rd.flatten() {
+        let fname = f.file_name().to_string_lossy().into_owned();
+        if !fname.starts_with(&prefix) || !(fname.ends_with(".partial") || fname.ends_with(".staged")) {
+            continue;
+        }
+        if partial_pid(&fname).is_some_and(pid_alive) {
+            continue;
+        }
+        match std::fs::remove_file(f.path()) {
+            Ok(()) => tracing::debug!(path = %f.path().display(), "removed a stale partial extraction"),
+            Err(e) => {
+                tracing::warn!(path = %f.path().display(), error = %e, "could not remove a stale partial extraction");
             }
         }
     }
