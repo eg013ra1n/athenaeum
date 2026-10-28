@@ -753,7 +753,7 @@ function provenanceBasename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-function MasterProvenanceBlock({ setId }: { setId: number }) {
+export function MasterProvenanceBlock({ setId }: { setId: number }) {
   const [prov, setProv] = useState<MasterProvenanceInfo | null | 'loading'>('loading');
   const [archiveOpId, setArchiveOpId] = useState<number | null>(null);
   const [archiveStartError, setArchiveStartError] = useState<string | null>(null);
@@ -924,6 +924,12 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
             )}
             {restoreStartError && <div className="text-error mt-1">{restoreStartError}</div>}
           </>
+        ) : prov.sourceFramesInForeignZip && prov.sourceFramesOnDisk ? (
+          // The originals already sit in a zip Athenaeum did not write: archiving them again would move
+          // files that are not ours to move. They can be unpacked from the frame set page instead.
+          <span className="text-content" title="The source frames are inside a zip file that Athenaeum did not create">
+            in a zip file
+          </span>
         ) : prov.sourceFramesOnDisk && prov.sourceSetId != null ? (
           archiveOpId != null ? (
             <div className="mt-1 max-w-xs" onClick={e => e.stopPropagation()}>

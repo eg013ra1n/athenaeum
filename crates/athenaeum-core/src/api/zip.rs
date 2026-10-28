@@ -551,6 +551,38 @@ pub fn get_zip_cache_status(ctx: &ServiceContext) -> Result<crate::zip_store::ca
     })
 }
 
+/// What a batch would extract from zips: the zip-resident rows among the named files that are not in the
+/// cache yet, and their total size. The batch is named by file ids, by frame ids (the plate-solve queue
+/// holds those), and/or by a frame set (its lights plus the calibration frames it reaches, the files an
+/// export copies). Feeds the "From zip: N files, X GB" line of the batch dialogs.
+pub fn estimate_zip_extraction(
+    ctx: &ServiceContext,
+    file_ids: &[i64],
+    frame_ids: &[i64],
+    frame_set_id: Option<i64>,
+) -> Result<crate::zip_store::materialize::ExtractionEstimate, ApiError> {
+    // Bind the cache and read the configured limit first, so "cached" means the same as at run time.
+    zip_cache_ready(ctx)?;
+    let mut ids: Vec<i64> = file_ids.to_vec();
+    if !frame_ids.is_empty() || frame_set_id.is_some() {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        let mut by_frame = conn.prepare("SELECT file_id FROM frames WHERE id = ?1")?;
+        for &frame_id in frame_ids {
+            if let Some(file_id) = by_frame.query_row(params![frame_id], |r| r.get::<_, i64>(0)).optional()? {
+                ids.push(file_id);
+            }
+        }
+        if let Some(id) = frame_set_id {
+            ids.extend(file_ids_of(&conn, UnpackTarget::FrameSet { id })?);
+        }
+    }
+    crate::zip_store::materialize::estimate_extraction(ctx, &ids).map_err(|e| {
+        tracing::error!(error = %e, "zip extraction estimate failed");
+        ApiError::from(e)
+    })
+}
+
 /// Removes every cached extraction nothing is using, then returns the new status.
 pub fn clear_zip_cache(ctx: &ServiceContext) -> Result<crate::zip_store::cache::ZipCacheStatus, ApiError> {
     let cache = zip_cache_ready(ctx)?;
@@ -933,12 +965,60 @@ mod tests {
     #[test]
     fn cache_status_and_clear_work_from_the_catalog_directory() {
         let (_tmp, ctx, _zip) = listing_fixture(&[("a.fits", light(1))]);
+        // A non-default value proves the setting is what gets read into the cache.
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            ctx.settings
+                .persist_setting(&conn, crate::settings::keys::ARCHIVE_ZIP_CACHE_LIMIT_GB, "7")
+                .unwrap();
+        }
         let status = get_zip_cache_status(&ctx).unwrap();
         assert_eq!(status.bytes, 0);
         assert_eq!(status.entries, 0);
-        assert_eq!(status.limit_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(status.limit_bytes, 7 * 1024 * 1024 * 1024);
         let after = clear_zip_cache(&ctx).unwrap();
         assert_eq!(after.bytes, 0);
+    }
+
+    #[test]
+    fn estimate_names_the_batch_by_file_ids_frame_ids_or_a_frame_set() {
+        let (_tmp, ctx, _zip) = listing_fixture(&[("a.fits", light(1)), ("b.fits", light(2))]);
+        let size = light(1).len() as u64;
+        let (file_ids, frame_ids) = {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+            conn.execute(
+                "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+            let rows: Vec<(i64, i64)> = conn
+                .prepare("SELECT file_id, id FROM frames ORDER BY file_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for (_, frame) in &rows {
+                conn.execute("UPDATE frames SET imagetyp = 'Light' WHERE id = ?1", [frame]).unwrap();
+                conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [frame]).unwrap();
+            }
+            (rows.iter().map(|r| r.0).collect::<Vec<_>>(), rows.iter().map(|r| r.1).collect::<Vec<_>>())
+        };
+        let want = crate::zip_store::materialize::ExtractionEstimate { files: 2, bytes: 2 * size };
+        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &[], None).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &[], &frame_ids, None).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &[], &[], Some(1)).unwrap(), want);
+        // The same file named twice is counted once.
+        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &frame_ids, Some(1)).unwrap(), want);
+        assert_eq!(
+            estimate_zip_extraction(&ctx, &[], &[], None).unwrap(),
+            crate::zip_store::materialize::ExtractionEstimate::default()
+        );
+        assert!(matches!(estimate_zip_extraction(&ctx, &[], &[], Some(99)), Err(ApiError::NotFound(_))));
     }
 
     #[test]

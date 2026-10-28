@@ -47,6 +47,10 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
     api.listen<FinishedEvent>('archive-finished', (payload) => {
       if (cancelled) return;
       if (payload.operation_id !== operationId) return;
+      // An unpack (`kind: "unpack"`, operation 0) is not an archive operation: its dialog owns its own
+      // notification, keyed per run. Handling it here would key it `archive-finished-0-unpack` and swallow
+      // every unpack after the first.
+      if (payload.kind === 'unpack') return;
       setFinished(payload);
       onFinished?.(payload.outcome);
       const verb =

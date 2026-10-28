@@ -18,6 +18,7 @@ use crate::WebAppState;
 
 pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
+pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,4 +106,31 @@ pub async fn clear_zip_cache(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip cache clear task panicked: {}", e)))?
         .map_err(api_err)?;
     Ok(Json(status))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateZipExtractionArgs {
+    #[serde(default)]
+    pub file_ids: Vec<i64>,
+    #[serde(default)]
+    pub frame_ids: Vec<i64>,
+    #[serde(default)]
+    pub frame_set_id: Option<i64>,
+}
+
+/// POST /api/estimate_zip_extraction
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn estimate_zip_extraction(
+    State(state): State<WebAppState>,
+    Json(args): Json<EstimateZipExtractionArgs>,
+) -> Result<Json<ExtractionEstimate>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let estimate = tokio::task::spawn_blocking(move || {
+        api::estimate_zip_extraction(&ctx, &args.file_ids, &args.frame_ids, args.frame_set_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip extraction estimate task panicked: {}", e)))?
+    .map_err(api_err)?;
+    Ok(Json(estimate))
 }

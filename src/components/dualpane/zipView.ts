@@ -16,6 +16,10 @@ export interface ZipLocation {
 /** The status-line reason shown while the active pane is inside a zip. */
 export const ZIP_READ_ONLY_NOTE = 'Inside a zip — only the whole zip can be moved or removed';
 
+/** Why Send does nothing for frames inside a zip: the reason the backend gives for a zip frame, with a way out. */
+export const ZIP_SEND_TITLE = 'Nothing sent: the frames are inside a zip';
+export const ZIP_SEND_DETAIL = 'Inside a zip \u2014 unpack it first (frame set page, Unpack from zip).';
+
 /** Shown when a Move would land in a pane that is inside a zip. */
 export const ZIP_DEST_NOTE = 'The other pane is inside a zip — open a folder there to move files into it';
 
@@ -47,16 +51,27 @@ export function zipUpLabel(zip: ZipLocation, folder: string): string {
   return parent === '' ? getBasename(zip.path) : `${getBasename(zip.path)}/${parent}`;
 }
 
-/** A virtual path split into the zip it lives in and the folder holding the entry. `null` when the path has
- *  no `.zip` component followed by an entry. The caller must confirm the zip really exists: a real folder
- *  named `x.zip` looks the same. */
+/** Every way a virtual path splits into a zip and the folder holding the entry, one per `.zip` component
+ *  that is followed by an entry, leftmost first. Only the caller can tell which one is a real zip (a real
+ *  folder named `x.zip` looks the same), so it tries them in order until `list_zip_entries` succeeds. */
+export function zipCandidates(path: string): { zipPath: string; innerDir: string }[] {
+  const out: { zipPath: string; innerDir: string }[] = [];
+  const re = /\.zip(?=[/\\])/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(path)) !== null) {
+    const end = m.index + m[0].length;
+    const zipPath = path.slice(0, end);
+    const entry = path.slice(end + 1).split(/[/\\]/).filter(Boolean);
+    if (entry.length === 0) continue;
+    entry.pop();
+    out.push({ zipPath, innerDir: entry.join('/') });
+  }
+  return out;
+}
+
+/** The leftmost split of a virtual path (see [`zipCandidates`]), or `null` when it has none. */
 export function findZipInPath(path: string): { zipPath: string; innerDir: string } | null {
-  const m = /^(.*?\.zip)[/\\](.+)$/i.exec(path);
-  if (!m) return null;
-  const entry = m[2].split(/[/\\]/).filter(Boolean);
-  if (entry.length === 0) return null;
-  entry.pop();
-  return { zipPath: m[1], innerDir: entry.join('/') };
+  return zipCandidates(path)[0] ?? null;
 }
 
 /** Frame-count line of a zip row. */

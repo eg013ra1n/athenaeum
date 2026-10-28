@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findZipInPath, innerParent, zipCrumbs, zipLocationLabel, zipUpLabel } from './zipView';
+import { findZipInPath, innerParent, zipCandidates, zipCrumbs, zipLocationLabel, zipUpLabel } from './zipView';
 
 describe('zipView helpers', () => {
   it('splits a virtual path into the zip and the entry folder', () => {
@@ -20,5 +20,16 @@ describe('zipView helpers', () => {
     expect(zipUpLabel(z, '/a')).toBe('night.zip/Lights');
     expect(zipUpLabel({ path: z.path, innerDir: 'Lights' }, '/a')).toBe('night.zip');
     expect(zipUpLabel({ path: z.path, innerDir: '' }, '/a')).toBe('/a');
+  });
+});
+
+describe('zipCandidates', () => {
+  it('offers every .zip component, leftmost first, so a folder named x.zip does not hide the real zip', () => {
+    expect(zipCandidates('/a/old.zip/night.zip/L/x.fits')).toEqual([
+      { zipPath: '/a/old.zip', innerDir: 'night.zip/L' },
+      { zipPath: '/a/old.zip/night.zip', innerDir: 'L' },
+    ]);
+    expect(zipCandidates('/a/b/L.fits')).toEqual([]);
+    expect(zipCandidates('/a/night.zip')).toEqual([]);
   });
 });

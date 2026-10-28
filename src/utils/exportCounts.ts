@@ -22,3 +22,9 @@ export function limitWarnings(
 ): { shown: string[]; more: number } {
   return { shown: warnings.slice(0, limit), more: Math.max(0, warnings.length - limit) };
 }
+
+/** "From zip: 12 copied" — frames that were extracted out of zips and copied (a zip frame is never linked).
+ *  `null` when the export had none. */
+export function zipCopiedText(zipCopied: number | null | undefined): string | null {
+  return zipCopied != null && zipCopied > 0 ? `From zip: ${zipCopied} copied` : null;
+}

@@ -211,6 +211,21 @@ pub async fn get_blackholed_file_ids(
     Ok(Json(blackholed))
 }
 
+/// Of the given file IDs, the ones excluded only because their zip is in the Black Hole (no entry of their own).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_zip_blackholed_file_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetBlackholedFileIdsArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    let ids =
+        athenaeum_core::db::get_zip_blackholed_file_ids(&conn, &args.file_ids).map_err(db_err)?;
+
+    Ok(Json(ids))
+}
+
 /// Restore a file from the black hole (removes it from the `black_hole` table;
 /// does not move the file on disk).
 #[tracing::instrument(skip_all, err(Debug))]

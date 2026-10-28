@@ -146,6 +146,8 @@ export interface AutoGenerateResult {
 export interface FramesSetWithCount {
   frames_set: FramesSet;
   member_count: number;
+  /** Members (counted in `member_count`) whose file lives inside a zip. */
+  zip_member_count: number;
 }
 
 // Missing file record with status from the database

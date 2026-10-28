@@ -338,7 +338,13 @@ export default function BlackHole() {
           : '') +
         '\n\nThis action cannot be undone!',
       async () => {
-        const idsArray = Array.from(selectedIds);
+        // Voiding a zip deletes its frames' catalog rows. A frame of a zip voided in this same run is
+        // therefore left out: voiding it afterwards would fail with "Query returned no rows".
+        const voidedZipPaths = new Set(zips.filter((z) => selectedZipIds.has(z.id)).map((z) => z.zipPath));
+        const idsArray = Array.from(selectedIds).filter((fileId) => {
+          const zipOfFrame = entries.find((e) => e.file_id === fileId)?.archive_zip_path;
+          return !(zipOfFrame != null && voidedZipPaths.has(zipOfFrame));
+        });
         const zipIds = Array.from(selectedZipIds);
         const total = idsArray.length + zipIds.length;
         setProgress({ current: 0, total, action: 'void' });
@@ -378,7 +384,7 @@ export default function BlackHole() {
       },
       true
     );
-  }, [selectedIds, selectedZipIds, zips]);
+  }, [selectedIds, selectedZipIds, zips, entries]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -654,7 +660,7 @@ export default function BlackHole() {
                               {entry.filename}
                             </span>
 
-                            {findZipInPath(entry.original_path) && (
+                            {(entry.archive_zip_path != null || findZipInPath(entry.original_path)) && (
                               <Chip tone="info" title="A frame inside a zip: only the whole zip can be deleted">in zip</Chip>
                             )}
 

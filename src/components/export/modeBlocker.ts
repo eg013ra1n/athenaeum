@@ -74,3 +74,16 @@ export function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null
   }
   return null;
 }
+
+/** The real reason behind a "master file(s) missing on disk" blocker when the masters are not missing at
+ *  all but sit in a zip that is in the Black Hole (owner ruling A: not used until restored). The frozen
+ *  blocker sentence stays as it is (the backend and the collab gate say the same words); this line goes
+ *  next to it. `null` when the blocker is something else or no master is in a Black Hole zip. */
+export function modeBlockerReason(r: ExportReadiness, mode: ExportMode): string | null {
+  const blocker = modeBlocker(r, mode);
+  if (blocker === null || r.blackHoleZipMasters <= 0 || !blocker.includes('master file(s) missing on disk')) return null;
+  const n = r.blackHoleZipMasters;
+  return n === 1
+    ? '1 master is in a zip that is in the Black Hole \u2014 restore it first'
+    : `${n} masters are in zips that are in the Black Hole \u2014 restore them first`;
+}

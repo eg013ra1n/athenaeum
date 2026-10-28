@@ -17,6 +17,7 @@ use super::AppState;
 
 pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
+pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
 /// Move the zip-resident frames of a frame set or calibration set out of their foreign zips into
 /// `dest_dir`, keeping every catalog row. Progress arrives as `zip-unpack-progress`; the end as
@@ -85,4 +86,29 @@ pub async fn clear_zip_cache(state: State<'_, AppState>) -> Result<ZipCacheStatu
         .await
         .map_err(|e| format!("Zip cache clear task panicked: {}", e))?
         .map_err(|e| e.to_string())
+}
+
+/// How many of the named frames would be extracted from zips (not cached yet) and their total size. The
+/// batch is named by file ids, frame ids and/or a frame set (lights + calibration frames). Reads the
+/// catalog and the zips' state only (`spawn_blocking`); extracts nothing.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn estimate_zip_extraction(
+    state: State<'_, AppState>,
+    file_ids: Option<Vec<i64>>,
+    frame_ids: Option<Vec<i64>>,
+    frame_set_id: Option<i64>,
+) -> Result<ExtractionEstimate, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        api::estimate_zip_extraction(
+            &ctx,
+            &file_ids.unwrap_or_default(),
+            &frame_ids.unwrap_or_default(),
+            frame_set_id,
+        )
+    })
+    .await
+    .map_err(|e| format!("Zip extraction estimate task panicked: {}", e))?
+    .map_err(|e| e.to_string())
 }

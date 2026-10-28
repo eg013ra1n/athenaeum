@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ExportReadiness, GeometryMismatch } from '../../types/models';
-import { geometryMismatchSentence, geometryOriginSentence, modeBlocker } from './modeBlocker';
+import { geometryMismatchSentence, geometryOriginSentence, modeBlocker, modeBlockerReason } from './modeBlocker';
 
 const ready: ExportReadiness = {
   total: 4,
@@ -79,5 +79,20 @@ describe('geometry blocker', () => {
     ])).toBe('Calibration at another sub-frame origin — dark set #1518 is 6384×4258 @ 0,0, 151 lights are 6384×4258 @ 1584,1064; flat set #558 is 6384×4258 @ 1584,1064, its bias #7 is 6384×4258 @ 0,0');
     const warn = [mm('Dark', 1518, '6384×4258 @ 0,0', null, '6384×4258 @ 1584,1064', 1)];
     expect(modeBlocker({ ...ready, geometryWarnings: warn }, 'calibratedLights')).toBeNull();
+  });
+});
+
+describe('modeBlockerReason', () => {
+  it('names the Black Hole next to the frozen missing-master sentence', () => {
+    const r = { ...ready, blackHoleZipMasters: 1 };
+    expect(modeBlocker(r, 'rawWithMasters')).toBe('1 master file(s) missing on disk — restore from archive first');
+    expect(modeBlockerReason(r, 'rawWithMasters')).toBe('1 master is in a zip that is in the Black Hole — restore it first');
+    expect(modeBlockerReason({ ...r, blackHoleZipMasters: 3 }, 'rawWithMasters')).toBe('3 masters are in zips that are in the Black Hole — restore them first');
+  });
+  it('says nothing when the blocker is something else or nothing blocks', () => {
+    expect(modeBlockerReason(ready, 'rawWithMasters')).toBeNull();
+    expect(modeBlockerReason({ ...ready, blackHoleZipMasters: 1 }, 'lightsOnly')).toBeNull();
+    const other = { ...ready, blackHoleZipMasters: 1, rawSetsWithoutMaster: 1, rawSetIdsWithoutMaster: [7] };
+    expect(modeBlockerReason(other, 'rawWithMasters')).toBeNull();
   });
 });

@@ -108,6 +108,9 @@ export interface FrameListProps {
   currentIndex: number;
   selectedFrames: Set<number>;
   blackholedFileIds: Set<number>;
+  /** Files that are rejected only because their zip is in the Black Hole (ruling A): shown like Black Hole
+   *  frames, but Restore does nothing for them — the whole zip is restored from the Black Hole page. */
+  zipBlackholedFileIds?: Set<number>;
   loadingIndices: Set<number>;
   analysisMap: Map<number, FrameAnalysis>;
   sortField: SortField;

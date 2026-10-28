@@ -43,6 +43,12 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
               <span className="text-content-secondary tabular-nums">{readiness.missingMasterFiles}</span>{' '}
               master file(s) missing on disk
             </li>
+            {readiness.blackHoleZipMasters > 0 && (
+              <li className="text-warning">
+                <span className="tabular-nums">{readiness.blackHoleZipMasters}</span>{' '}
+                master{readiness.blackHoleZipMasters === 1 ? '' : 's'} in a zip that is in the Black Hole {'\u2014'} restore it first
+              </li>
+            )}
             {readiness.geometryMismatches.length > 0 && (
               <li className="text-warning">
                 <span className="tabular-nums">{readiness.geometryMismatches.length}</span>{' '}

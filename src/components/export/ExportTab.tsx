@@ -18,8 +18,10 @@ import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 import type { ExportLightCalPrefs } from '../../hooks/useExportProgress';
 import { ExportSummary } from './ExportSummary';
 import { WarningsPanel } from './WarningsPanel';
-import { geometryOriginSentence, modeBlocker } from './modeBlocker';
+import { geometryOriginSentence, modeBlocker, modeBlockerReason } from './modeBlocker';
 import { FolderBrowserModal } from '../FolderBrowserModal';
+import { ZipExtractionLine } from '../zip/ZipExtractionLine';
+import { ZIP_COPIED_NOT_LINKED } from '../../utils/zipChips';
 import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import {
   readFlatNormPref,
@@ -277,6 +279,8 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // errored) keeps both gates closed so we never fire an operation the backend
   // will hard-error on.
   const blocker = readiness ? modeBlocker(readiness, exportMode) : null;
+  const blockerReason = readiness ? modeBlockerReason(readiness, exportMode) : null;
+  const blockerText = blocker && blockerReason ? `${blocker} (${blockerReason})` : blocker;
   const modeReady = readiness !== null && blocker === null;
   // A failed fetch also closes both gates (readiness === null above), but a
   // `blocker` of null then reads as "nothing wrong" — show the actual reason
@@ -525,6 +529,9 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                       {reason && (
                         <span className="mt-1 flex items-center gap-2 text-xs text-error">
                           <AlertTriangle size={12} /> {reason}
+                          {readiness && modeBlockerReason(readiness, opt.value) && (
+                            <span className="text-content-secondary">({modeBlockerReason(readiness, opt.value)})</span>
+                          )}
                           <button
                             type="button"
                             className="underline hover:no-underline text-content-secondary"
@@ -846,6 +853,10 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               ) : symlinkUnavailableReason ? (
                 <p className="text-xs text-content-muted">{symlinkUnavailableReason}</p>
               ) : null}
+              {useSymlinks && symlinksAvailable && (
+                <p className="-mt-2 text-xs text-content-muted">{ZIP_COPIED_NOT_LINKED}</p>
+              )}
+              <ZipExtractionLine scope={{ frameSetId }} refreshKey={exporting ? 1 : 0} />
 
               {/* WBPP setup guide — collapsible because most users only
                   need it once, but the summary is right there. */}
@@ -898,12 +909,12 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               the other ships it to another node. Same readiness gate. */}
           <div className="flex gap-3">
             <button onClick={() => { void handleExport(); }} disabled={!canExport}
-              title={readinessFailedTooltip ?? blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
+              title={readinessFailedTooltip ?? blockerText ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${canExport ? 'bg-accent hover:bg-accent-hover text-white' : 'bg-surface-hover cursor-not-allowed text-content-muted'}`}>
               {exporting ? (<><Loader2 className="animate-spin" size={20} /> Exporting…</>) : (<><Play size={20} /> Export to WBPP</>)}
             </button>
             <button onClick={() => setSendOpen(true)} disabled={!canSend}
-              title={readinessFailedTooltip ?? blocker ?? 'Send this frame set to another Athenaeum node'}
+              title={readinessFailedTooltip ?? blockerText ?? 'Send this frame set to another Athenaeum node'}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 border ${canSend ? 'border-accent text-accent hover:bg-accent/10' : 'border-border cursor-not-allowed text-content-muted'}`}>
               <Send size={20} /> Send to node…
             </button>

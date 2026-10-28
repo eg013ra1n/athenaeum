@@ -4,6 +4,8 @@ import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 import { SHORT } from '../collab/contributorState';
 import { rowVerdict } from '../analysis/unusable';
+import { Chip } from '../ui';
+import { isInZip, revealRequest } from '../../utils/zipChips';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'verdict' | 'refused' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
@@ -138,12 +140,15 @@ export function LightsAnalysisTable({
     }
   };
 
-  const handleReveal = useCallback((e: React.MouseEvent, path: string) => {
+  const handleReveal = useCallback((e: React.MouseEvent, frame: EnrichedLightFrame) => {
     e.stopPropagation();
     navigate('/files', {
-      state: { reveal: { path, token: Date.now() } },
+      state: { reveal: revealRequest(frame.file_path, frame) },
     });
   }, [navigate]);
+  // A frame set archived by Move and ZIP has no files at its old paths, but its frames can still be
+  // located: inside the zip.
+  const showLocateColumn = !hideLocateColumn || frames.some(isInZip);
 
   // Range-select anchor: the frame last clicked without Shift. Kept as an id and
   // resolved against the current sort order at click time, so a re-sort between
@@ -379,7 +384,7 @@ export function LightsAnalysisTable({
                 <SortableHeader field="reference" label="Reference" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
               </th>
             )}
-            {!hideLocateColumn && (
+            {showLocateColumn && (
               <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
                 Locate
               </th>
@@ -418,6 +423,9 @@ export function LightsAnalysisTable({
                 </td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary">
                   {formatDateTime(frame.date_obs)}
+                  {isInZip(frame) && (
+                    <Chip tone="info" className="ml-1.5 align-middle font-sans" title={`Inside ${frame.archive_zip_path}`}>zip</Chip>
+                  )}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
                   {frame.camera}
@@ -517,15 +525,17 @@ export function LightsAnalysisTable({
                     )}
                   </td>
                 )}
-                {!hideLocateColumn && (
+                {showLocateColumn && (
                   <td className="w-12 px-1.5 py-1 text-center">
-                    <button
-                      onClick={e => handleReveal(e, frame.file_path)}
-                      className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                      title="Locate in file browser"
-                    >
-                      <FolderOpen size={14} />
-                    </button>
+                    {(!hideLocateColumn || isInZip(frame)) && (
+                      <button
+                        onClick={e => handleReveal(e, frame)}
+                        className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
+                        title={isInZip(frame) ? 'Locate in the zip' : 'Locate in file browser'}
+                      >
+                        <FolderOpen size={14} />
+                      </button>
+                    )}
                   </td>
                 )}
                 {showProjectColumn && (() => {

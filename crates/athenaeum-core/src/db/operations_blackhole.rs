@@ -331,13 +331,13 @@ pub fn get_black_hole_files(
     filter_by_source: Option<String>,
 ) -> Result<Vec<BlackHoleEntry>> {
     let query = if filter_by_source.is_some() {
-        "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size
+        "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size, f.archive_zip_path
          FROM black_hole bh
          JOIN files f ON bh.file_id = f.id
          WHERE bh.from_where = ?1
          ORDER BY bh.moved_at DESC"
     } else {
-        "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size
+        "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size, f.archive_zip_path
          FROM black_hole bh
          JOIN files f ON bh.file_id = f.id
          ORDER BY bh.moved_at DESC"
@@ -363,6 +363,7 @@ pub fn get_black_hole_files(
             from_where: row.get(4)?,
             moved_at,
             file_size: row.get(6)?,
+            archive_zip_path: row.get(7)?,
         })
     })?;
 
@@ -402,6 +403,36 @@ pub fn get_blackholed_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<Ve
         let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
             row.get::<_, i64>(0)
         })?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
+/// Of `file_ids`, the files that are excluded from use ONLY because the zip they live in is in the Black
+/// Hole (owner ruling A): they have no `black_hole` row of their own, so Restore on the file does nothing;
+/// the whole zip is restored from the Black Hole page. Blink shows them as rejected beside the files
+/// [`get_blackholed_file_ids`] returns.
+pub fn get_zip_blackholed_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    if file_ids.is_empty() {
+        return Ok(out);
+    }
+    let mut ids = file_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    for chunk in ids.chunks(crate::db::MAX_BIND_PARAMS) {
+        let placeholders: String = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT f.id FROM files f
+             JOIN zip_archives za ON za.path = f.archive_zip_path
+             JOIN black_hole_zips bhz ON bhz.zip_id = za.id
+             WHERE f.id IN ({placeholders})
+               AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| row.get::<_, i64>(0))?;
         for r in rows {
             out.push(r?);
         }
@@ -1909,6 +1940,29 @@ mod tests {
         restore_zip_from_black_hole(&conn, id).unwrap();
         assert_eq!(usable_frames(&conn), 4);
         assert_eq!(set_member_count(&conn, set), 2);
+    }
+
+    #[test]
+    fn zip_blackholed_ids_name_only_frames_excluded_by_their_zip() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let other = scanned_zip(&conn, tmp.path(), "other.zip", 10);
+        let mut all = file_ids_in(&conn, &zip);
+        all.extend(file_ids_in(&conn, &other));
+        assert!(get_zip_blackholed_file_ids(&conn, &all).unwrap().is_empty());
+
+        // A frame rejected on its own is a file-level Black Hole entry, not a zip one.
+        let own = file_ids_in(&conn, &other)[0];
+        add_to_black_hole(&conn, own, "blink", "/x").unwrap();
+        add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        let mut got = get_zip_blackholed_file_ids(&conn, &all).unwrap();
+        got.sort_unstable();
+        let mut want = file_ids_in(&conn, &zip);
+        want.sort_unstable();
+        assert_eq!(got, want, "the zip's frames, not the individually rejected frame");
+        assert_eq!(get_blackholed_file_ids(&conn, &all).unwrap(), vec![own]);
+        assert!(get_zip_blackholed_file_ids(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]

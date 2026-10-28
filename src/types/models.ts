@@ -129,7 +129,12 @@ failed: Array<[number, string]>, };
 
 export type BulkMoveProgressEvent = { current: number, total: number, percent: number, currentFile: string | null, };
 
-export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, };
+export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, 
+/**
+ * The zip the file lives in (`files.archive_zip_path`, ours or foreign), `None` for a disk file. A
+ * frame of a zip can be restored but not voided on its own: only the whole zip can be deleted.
+ */
+archive_zip_path: string | null, };
 
 export type BlackHoleZipEntry = { 
 /**
@@ -463,7 +468,19 @@ naxis1: number | null, naxis2: number | null, ccd_temp: number | null, swcreate:
  * was computed by Athenaeum's plate solver (vs. read from the FITS
  * header). Drives the Original/Athenaeum WCS badge.
  */
-plate_solved: boolean, calibration_status: FrameCalibrationStatus, };
+plate_solved: boolean, calibration_status: FrameCalibrationStatus, 
+/**
+ * The zip this light's file lives in (`files.archive_zip_path`), ours or foreign.
+ */
+archive_zip_path: string | null, 
+/**
+ * The entry inside that zip (`files.archive_path_in_zip`).
+ */
+archive_path_in_zip: string | null, 
+/**
+ * Set for a file Move and ZIP archived itself (Unarchive restores it); `None` for a foreign zip's frame.
+ */
+archived_in_operation: number | null, };
 
 export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, 
 /**
@@ -799,7 +816,12 @@ archiveZipPath: string | null,
  * The UI uses this to hide the restore button and show an actionable
  * warning instead of letting the user kick off a restore doomed to fail.
  */
-archiveZipMissing: boolean, };
+archiveZipMissing: boolean, 
+/**
+ * Any source file lives in a zip Athenaeum did not write (a foreign zip's cataloged frame). Such
+ * originals are not "ours to archive": the UI hides "Archive originals to zip" for them.
+ */
+sourceFramesInForeignZip: boolean, };
 
 export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<BatchSkip>, };
 

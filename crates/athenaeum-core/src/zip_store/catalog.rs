@@ -32,6 +32,9 @@ pub struct ZipListItem {
     /// The Move and ZIP operation that wrote this zip, when it is one of ours (the browser warns that
     /// removing it removes the only copy of an archived frame set).
     pub created_by_operation: Option<i64>,
+    /// The zip is in the Black Hole (owner ruling A: it stays listed and readable, but its frames are not
+    /// used). The browser marks the row so a second F8 is not mistaken for a new move.
+    pub in_black_hole: bool,
 }
 
 /// Runs `f` inside a savepoint: nested inside the caller's transaction when there is one, a transaction of
@@ -235,7 +238,8 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     let hi = crate::db::path_prefix_upper(&prefix);
     let depth = dir.matches(sep.as_str()).count() as i64 + 1;
     let mut stmt = conn.prepare(
-        "SELECT z.path, z.size, z.modified_at, z.frame_entries, z.created_by_operation FROM zip_archives z
+        "SELECT z.path, z.size, z.modified_at, z.frame_entries, z.created_by_operation,
+                EXISTS (SELECT 1 FROM black_hole_zips bhz WHERE bhz.zip_id = z.id) FROM zip_archives z
          WHERE z.path >= ?1 AND (?2 IS NULL OR z.path < ?2)
            AND (LENGTH(z.path) - LENGTH(REPLACE(z.path, ?3, ''))) = ?4
            AND z.frame_entries > 0
@@ -252,11 +256,12 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<i64>>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(rows.len());
-    for (path, mut size, modified_at, frame_entries, created_by_operation) in rows {
+    for (path, mut size, modified_at, frame_entries, created_by_operation, in_black_hole) in rows {
         if size == 0 && modified_at.is_empty() {
             size = match std::fs::metadata(&path) {
                 Ok(m) => i64::try_from(m.len()).unwrap_or(i64::MAX),
@@ -266,7 +271,7 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
                 }
             };
         }
-        out.push(ZipListItem { path, size, frame_entries, created_by_operation });
+        out.push(ZipListItem { path, size, frame_entries, created_by_operation, in_black_hole });
     }
     Ok(out)
 }
@@ -565,6 +570,7 @@ mod tests {
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert_eq!(listed[0].path, with_frames.to_string_lossy());
         assert_eq!(listed[0].frame_entries, 2);
+        assert!(!listed[0].in_black_hole);
         assert_eq!(listed[0].size, std::fs::metadata(&with_frames).unwrap().len() as i64);
         let in_deep = zips_in_directory(&conn, deep.to_str().unwrap(), None).unwrap();
         assert_eq!(in_deep.len(), 1);
@@ -574,6 +580,11 @@ mod tests {
         // The camera filter: the fixture frames are INSTRUME 'C'.
         assert_eq!(zips_in_directory(&conn, tmp.path().to_str().unwrap(), Some("C")).unwrap().len(), 1);
         assert!(zips_in_directory(&conn, tmp.path().to_str().unwrap(), Some("Other")).unwrap().is_empty());
+        // A zip in the Black Hole stays listed and is marked.
+        crate::db::add_zip_to_black_hole(&conn, &with_frames.to_string_lossy(), "files").unwrap();
+        let marked = zips_in_directory(&conn, tmp.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].in_black_hole);
     }
 
     #[test]

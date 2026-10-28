@@ -2726,6 +2726,23 @@ pub fn get_frames_sets_by_project(
     sets.collect()
 }
 
+/// Per frames set: how many of the members counted by [`get_frames_sets_by_project`] live inside a zip
+/// (`files.archive_zip_path` set, ours or foreign). Sets with none are absent from the map.
+pub fn get_frames_set_zip_member_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT in_tbl.frames_set_id, COUNT(DISTINCT f.id)
+         FROM imaging_nights in_tbl
+         JOIN sessions s ON in_tbl.id = s.imaging_night_id
+         JOIN session_members sm ON s.id = sm.session_id
+         JOIN frames f ON f.id = sm.frame_id AND {not_blackholed}
+         JOIN files zf ON zf.id = f.file_id AND zf.archive_zip_path IS NOT NULL
+         GROUP BY in_tbl.frames_set_id",
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)))?;
+    rows.collect()
+}
+
 /// Get all frame IDs that are already members of any frames_set
 pub fn get_all_frames_set_member_ids(conn: &Connection) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
@@ -8745,5 +8762,52 @@ mod frames_set_listing_tests {
         let (live, live_count) = by_id(2);
         assert_eq!(*live_count, 2);
         assert_eq!(live.total_exp_time, Some(360.0), "the members' sum, not the stored 6120");
+    }
+
+    /// The zip chip of the Objects page: a member counts when its file row has a zip marker; a zip frame
+    /// the Black Hole excludes is not counted (the same rule as the member count beside it).
+    #[test]
+    fn zip_member_counts_cover_zip_resident_members_outside_the_black_hole() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'set')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (1, '2025-06-28T23:00:00Z', '2025-06-29T02:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')", [night]).unwrap();
+        let session = conn.last_insert_rowid();
+        // Three lights: one on disk, two in a zip; one of the zip lights is in the Black Hole.
+        let mut file_ids = Vec::new();
+        for i in 0..3 {
+            let zip = if i == 0 { None } else { Some("/z/night.zip") };
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+                 VALUES (?1, 'l.fits', 0, '2025-06-29T00:00:00Z', 'FITS', ?2, ?3)",
+                rusqlite::params![format!("/z/{i}.fits"), zip, zip.map(|_| format!("L/{i}.fits"))],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id, imagetyp, exptime) VALUES (?1, 'Light', 180.0)", [file_id])
+                .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, frame_id])
+                .unwrap();
+            file_ids.push(file_id);
+        }
+        let counts = get_frames_set_zip_member_counts(&conn).unwrap();
+        assert_eq!(counts.get(&1), Some(&2));
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path) VALUES (?1, 'test', '2025-06-30T00:00:00Z', '/z/2.fits')",
+            [file_ids[2]],
+        )
+        .unwrap();
+        let counts = get_frames_set_zip_member_counts(&conn).unwrap();
+        assert_eq!(counts.get(&1), Some(&1), "a Black Hole frame is not counted");
+        let sets = get_frames_sets_by_project(&conn, 1).unwrap();
+        assert_eq!(sets[0].1, 2, "the member count agrees: one disk frame + one zip frame");
     }
 }

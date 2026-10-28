@@ -18,6 +18,7 @@ import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
+import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { ResultsPanel } from './ResultsPanel';
 import { stableStringify, withoutPaths, type BoardStage } from './stageSummary';
 import {
@@ -335,6 +336,13 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     if (lastOutcomeRunId == null) return;
     void refetchPlan(draftConfigRef.current ?? undefined);
   }, [lastOutcomeRunId, refetchPlan]);
+
+  // The lights the plan includes: what a run would extract from zips before it can read them. Masters
+  // are not counted (they are read once, whole).
+  const zipScope = useMemo(() => {
+    const excluded = new Set(excludedFrameIds);
+    return { frameIds: lightFrames.map((f) => f.frameId).filter((id) => !excluded.has(id)) };
+  }, [lightFrames, excludedFrameIds]);
 
   // The most recent user-originated write still waiting to go out — set by
   // the persist effect below when it schedules the 500 ms timer, read by
@@ -923,6 +931,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
           <span className="text-content-muted shrink-0">
             {freeLabel} · estimate {formatGB(plan.estimateBytes)}
           </span>
+          <ZipExtractionLine scope={zipScope} refreshKey={lastOutcomeRunId ?? 0} className="shrink-0" />
         </div>
 
         <div className="flex items-center gap-2 shrink-0">

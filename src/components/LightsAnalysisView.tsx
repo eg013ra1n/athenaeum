@@ -17,6 +17,7 @@ import { stackedFrameSnr } from './analysis/stackedSnr';
 import { rowVerdict } from './analysis/unusable';
 import { computeRejectedFrameIds } from './analysis/rejection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
+import { ZipExtractionLine } from './zip/ZipExtractionLine';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
@@ -270,6 +271,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
       loadAnalysisData();
     }
   }, [currentAnalysis?.isComplete, loadAnalysisData]);
+
+  // The lights Analyze and Plate solve would read: what they would extract from zips first.
+  const zipScope = useMemo(() => ({ frameIds: allFrames.map((f) => f.frame_id) }), [allFrames]);
 
   // Plate scale from first frame with optics data (arcsec/pixel)
   const plateScale = useMemo(() => {
@@ -833,6 +837,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             hideTriggerButtons
             onSolveComplete={() => onRefresh?.()}
           />
+
+          {/* Analyze and Plate solve read the frames: those inside zips are extracted first. */}
+          <ZipExtractionLine scope={zipScope} refreshKey={currentAnalysis?.isComplete ? 1 : 0} className="flex-shrink-0" />
 
           {csvExportedMsg && (
             <div className="inline-flex items-center gap-1 text-xs text-green-400 flex-shrink-0">

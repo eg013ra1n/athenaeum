@@ -1,5 +1,6 @@
 import { Loader2, FolderOutput, Check, AlertCircle, X, XCircle } from 'lucide-react';
 import { useExportProgressContext } from '../contexts/ExportProgressContext';
+import { zipCopiedText } from '../utils/exportCounts';
 
 const phaseConfig: Record<string, { label: string }> = {
   collecting: { label: 'Collecting export data...' },
@@ -53,6 +54,7 @@ export function ExportProgressIndicator() {
           {result.success ? (
             <div className="text-xs text-content-secondary space-y-0.5">
               <div>Files organized: {result.filesOrganized}</div>
+              {zipCopiedText(result.zipCopied) && <div>{zipCopiedText(result.zipCopied)}</div>}
               <div className="truncate text-content-muted" title={result.outputDir}>
                 {result.outputDir}
               </div>

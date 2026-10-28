@@ -112,6 +112,19 @@ pub async fn get_blackholed_file_ids(
     db::get_blackholed_file_ids(&conn, &file_ids).map_err(|e| e.to_string())
 }
 
+/// Of these file IDs, the ones excluded only because their zip is in the Black Hole (no entry of their own).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_zip_blackholed_file_ids(
+    file_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_zip_blackholed_file_ids(&conn, &file_ids).map_err(|e| e.to_string())
+}
+
 /// Restore a file from the black hole
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

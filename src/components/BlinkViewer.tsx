@@ -89,6 +89,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [isBlackholing, setIsBlackholing] = useState(false);
   const [blackholeError, setBlackholeError] = useState<string | null>(null);
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
+  // Frames rejected only because their zip is in the Black Hole (owner ruling A): rejected like the rest,
+  // but only the whole zip can be restored.
+  const [zipBlackholedFileIds, setZipBlackholedFileIds] = useState<Set<number>>(new Set());
 
   // Annotation state
   const [showAnnotations, setShowAnnotations] = useState(false);
@@ -237,7 +240,15 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     }).length;
   }, [selectedFrames, fitsFrames, blackholedFileIds]);
 
-  const nonBlackholedInSelectionCount = selectionCount - blackholedInSelectionCount;
+  const zipBlackholedInSelectionCount = useMemo(() => {
+    return Array.from(selectedFrames).filter((index) => {
+      const id = fitsFrames[index]?.file?.id;
+      return id != null && zipBlackholedFileIds.has(id) && !blackholedFileIds.has(id);
+    }).length;
+  }, [selectedFrames, fitsFrames, zipBlackholedFileIds, blackholedFileIds]);
+
+  // A frame whose zip is in the Black Hole is already rejected: neither button acts on it.
+  const nonBlackholedInSelectionCount = selectionCount - blackholedInSelectionCount - zipBlackholedInSelectionCount;
 
   // Load image from backend
   const loadImage = useCallback(async (index: number) => {
@@ -766,8 +777,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       const ids = frames.map((f) => f.file.id).filter((id): id is number => id != null);
       if (ids.length === 0) return;
       try {
-        const blackholed = await api.invoke<number[]>('get_blackholed_file_ids', { fileIds: ids });
+        const [blackholed, inBlackHoleZip] = await Promise.all([
+          api.invoke<number[]>('get_blackholed_file_ids', { fileIds: ids }),
+          api.invoke<number[]>('get_zip_blackholed_file_ids', { fileIds: ids }),
+        ]);
         setBlackholedFileIds(new Set(blackholed));
+        setZipBlackholedFileIds(new Set(inBlackHoleZip));
       } catch (err) {
         console.error('Failed to check blackhole status:', err);
       }
@@ -1011,6 +1026,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       // duplicate record. Matches the `nonBlackholedInSelectionCount` shown on the
       // toolbar button and confirm dialog. Mirrors handleRestoreSelected's filter.
       if (blackholedFileIds.has(frame.file.id)) continue;
+      // A frame whose zip is in the Black Hole is already rejected; the zip's Restore brings it back.
+      if (zipBlackholedFileIds.has(frame.file.id)) continue;
       try {
         await api.invoke('move_to_black_hole', { fileId: frame.file.id, fromWhere: sourceType });
         blackholedIds.push(frame.file.id);
@@ -1029,7 +1046,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     if (errors.length > 0) setBlackholeError(`${errors.length} error(s): ${errors[0]}`);
     setIsBlackholing(false);
     setShowBlackholeConfirm(false);
-  }, [selectedFrames, fitsFrames, blackholedFileIds, sourceType, onFramesRemoved]);
+  }, [selectedFrames, fitsFrames, blackholedFileIds, zipBlackholedFileIds, sourceType, onFramesRemoved]);
 
   const handleRestoreSelected = useCallback(async () => {
     const toRestore = Array.from(selectedFrames)
@@ -1214,6 +1231,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               currentIndex={currentIndex}
               selectedFrames={selectedFrames}
               blackholedFileIds={blackholedFileIds}
+              zipBlackholedFileIds={zipBlackholedFileIds}
               loadingIndices={loadingIndices}
               analysisMap={analysisMap}
               sortField={sortField}

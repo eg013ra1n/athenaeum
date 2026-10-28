@@ -3,7 +3,7 @@ import { Folder, FolderOutput, Loader2 } from 'lucide-react';
 import { api, type UnlistenFn } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
-import { exportCountsText, limitWarnings } from '../../utils/exportCounts';
+import { exportCountsText, limitWarnings, zipCopiedText } from '../../utils/exportCounts';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { Button, DialogShell, TextInput } from '../ui';
 import { Checkbox } from '../settings/Checkbox';
@@ -260,6 +260,9 @@ export default function ProjectExportDialog({
             </p>
             {exportCountsText(result) && (
               <p className="mt-0.5 text-[11.5px] text-content-faint">{exportCountsText(result)}</p>
+            )}
+            {zipCopiedText(result.zipCopied) && (
+              <p className="mt-0.5 text-[11.5px] text-content-faint">{zipCopiedText(result.zipCopied)}</p>
             )}
             <p className="mt-0.5 break-all text-[11.5px] text-content-faint">{result.outputDir}</p>
             {result.warnings.length > 0 && (

@@ -1316,7 +1316,10 @@ fn get_calibration_hierarchy_with_cache(
             n.end_time as night_end,
             f.naxis1,
             f.naxis2,
-            {not_blackholed} AS in_use
+            {not_blackholed} AS in_use,
+            fi.archive_zip_path,
+            fi.archive_path_in_zip,
+            fi.archived_in_operation
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          LEFT JOIN plate_solves ps ON ps.frame_id = f.id
@@ -1359,6 +1362,9 @@ fn get_calibration_hierarchy_with_cache(
         naxis2: Option<i32>,
         /// Not in the Black Hole: counted in the totals.
         in_use: bool,
+        archive_zip_path: Option<String>,
+        archive_path_in_zip: Option<String>,
+        archived_in_operation: Option<i64>,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1392,6 +1398,9 @@ fn get_calibration_hierarchy_with_cache(
                 naxis1: row.get(25)?,
                 naxis2: row.get(26)?,
                 in_use: row.get(27)?,
+                archive_zip_path: row.get(28)?,
+                archive_path_in_zip: row.get(29)?,
+                archived_in_operation: row.get(30)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1598,6 +1607,9 @@ fn get_calibration_hierarchy_with_cache(
                             dec: raw_frame.dec,
                             plate_solved: raw_frame.plate_solved,
                             calibration_status: status,
+                            archive_zip_path: raw_frame.archive_zip_path.clone(),
+                            archive_path_in_zip: raw_frame.archive_path_in_zip.clone(),
+                            archived_in_operation: raw_frame.archived_in_operation,
                         });
                     }
 

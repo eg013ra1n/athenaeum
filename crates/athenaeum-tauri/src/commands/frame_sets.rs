@@ -38,10 +38,12 @@ pub async fn get_frames_sets(
     let conn = db.conn();
 
     let sets = db::get_frames_sets_by_project(&conn, project_id).map_err(|e| e.to_string())?;
+    let zip_counts = db::get_frames_set_zip_member_counts(&conn).map_err(|e| e.to_string())?;
 
     Ok(sets
         .into_iter()
         .map(|(set, count)| FramesSetWithCount {
+            zip_member_count: set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
             frames_set: set,
             member_count: count,
         })
@@ -667,6 +669,8 @@ pub use athenaeum_core::api::frame_sets::AutoGenerateResult;
 pub struct FramesSetWithCount {
     pub frames_set: FramesSet,
     pub member_count: usize,
+    /// Members (counted in `member_count`) whose file lives inside a zip.
+    pub zip_member_count: usize,
 }
 
 /// Archive a frame set (move to Archive tab)

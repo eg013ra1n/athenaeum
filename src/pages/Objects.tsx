@@ -4,6 +4,8 @@ import { api } from '../api';
 import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, RotateCcw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive } from 'lucide-react';
 import type { AutoGenerateResult, FramesSetWithCount } from '../types/helpers';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Chip } from '../components/ui';
+import { zipChipLabel } from '../utils/zipChips';
 import {
   ObjectsFilterPanel,
   ObjectsFilterState,
@@ -1093,7 +1095,7 @@ export default function Objects() {
         />
       ) : (
         <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
-          {filteredFrameSets.map(({ frames_set, member_count }) => (
+          {filteredFrameSets.map(({ frames_set, member_count, zip_member_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}
@@ -1220,7 +1222,12 @@ export default function Objects() {
                   <Clock size={12} />
                   {formatExposureTime(frames_set.total_exp_time)}
                 </span>
-                <span className="text-content-muted">
+                <span className="flex items-center gap-1.5 text-content-muted">
+                  {zipChipLabel(zip_member_count, member_count) && (
+                    <Chip tone="info" title="Frames of this object are inside zip files">
+                      {zipChipLabel(zip_member_count, member_count)}
+                    </Chip>
+                  )}
                   {member_count} frame{member_count !== 1 ? 's' : ''}
                 </span>
               </div>

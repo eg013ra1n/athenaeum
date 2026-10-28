@@ -31,10 +31,12 @@ function frameFile(path: string, filename: string) {
 }
 
 let createdByOperation: number | null = null;
+let inBlackHole = false;
 
 beforeEach(() => {
   notifyMock.mockReset();
   createdByOperation = null;
+  inBlackHole = false;
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { innerDir?: string }) => {
@@ -43,7 +45,7 @@ beforeEach(() => {
         return Promise.resolve({
           subdirectories: [],
           files: [],
-          zips: [{ path: ZIP, size: 1_000_000, frameEntries: 3, createdByOperation }],
+          zips: [{ path: ZIP, size: 1_000_000, frameEntries: 3, createdByOperation, inBlackHole }],
         });
       case 'list_zip_entries':
         return Promise.resolve(
@@ -87,6 +89,9 @@ describe('DualPaneFileBrowser — zips', () => {
     fireEvent.click(screen.getAllByText('top.fits')[0]);
     for (const key of ['F8', 'F2', 'F7', 'F6']) fireEvent.keyDown(window, { key });
     for (const cmd of MUTATIONS) expect(calls(cmd)).toHaveLength(0);
+    // The plain-file prompts (Black Hole confirm, Rename, New folder, Move) are the local `Modal`, a
+    // full-screen overlay with no dialog role: without the in-zip guards one of them would be on screen.
+    expect(document.querySelector('.fixed.inset-0')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByTestId('zip-note')).toHaveTextContent('Inside a zip');
     const blocked = screen.getAllByTitle(/Inside a zip/).filter((el) => el.tagName === 'BUTTON');
@@ -163,5 +168,55 @@ describe('DualPaneFileBrowser — zips', () => {
     render(<DualPaneFileBrowser scanRoots={roots} reveal={{ path: '/astro/x.zip/a.fits', token: 1 }} />);
     await waitFor(() => expect(calls('get_directory_contents').some(([, a]) => (a as { directoryPath: string }).directoryPath === '/astro/x.zip')).toBe(true));
     expect(screen.queryByTestId('zip-note')).toBeNull();
+  });
+
+  it('marks a zip that is in the Black Hole and does not move it a second time', async () => {
+    inBlackHole = true;
+    render(<DualPaneFileBrowser scanRoots={roots} />);
+    expect((await screen.findAllByText('Black Hole')).length).toBeGreaterThan(0);
+    fireEvent.click((await screen.findAllByText('night.zip'))[0]);
+    fireEvent.keyDown(window, { key: 'F8' });
+    await waitFor(() => expect(notifyMock).toHaveBeenCalled());
+    expect(notifyMock.mock.calls[0][0].title).toBe('That zip is already in the Black Hole');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(calls('move_zip_to_black_hole')).toHaveLength(0);
+  });
+
+  it('reveals a file of one of our own zips by the zip the caller names, selecting its original path', async () => {
+    const ORIGINAL = '/astro/M31/Lights/L_001.fits';
+    const base = vi.mocked(api.invoke).getMockImplementation()!;
+    vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { innerDir?: string }) =>
+      cmd === 'list_zip_entries'
+        ? Promise.resolve({ subdirectories: [], files: [frameFile(ORIGINAL, 'L_001.fits')], otherEntries: [] })
+        : base(cmd, args as never)) as never);
+    render(<DualPaneFileBrowser scanRoots={roots} reveal={{ path: ORIGINAL, token: 1, zip: { zipPath: ZIP, innerDir: 'Lights' } }} />);
+    await waitFor(() => expect(calls('list_zip_entries')).not.toHaveLength(0));
+    expect(calls('list_zip_entries')[0][1]).toEqual({ zipPath: ZIP, innerDir: 'Lights' });
+    const row = (await screen.findAllByText('L_001.fits'))[0].closest('button');
+    await waitFor(() => expect(row).toHaveClass('bg-accent/30'));
+    expect(screen.getByTestId('zip-note')).toBeInTheDocument();
+  });
+
+  it('tries the next .zip component when the leftmost one is a folder', async () => {
+    const base = vi.mocked(api.invoke).getMockImplementation()!;
+    vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { zipPath?: string; innerDir?: string }) =>
+      cmd === 'list_zip_entries' && args?.zipPath === '/astro/old.zip'
+        ? Promise.reject('not a zip')
+        : base(cmd, args as never)) as never);
+    render(<DualPaneFileBrowser scanRoots={roots} reveal={{ path: '/astro/old.zip/night.zip/Lights/L_001.fits', token: 1 }} />);
+    await waitFor(() => expect(calls('list_zip_entries').length).toBe(2));
+    expect(calls('list_zip_entries')[0][1]).toEqual({ zipPath: '/astro/old.zip', innerDir: 'night.zip/Lights' });
+    expect(calls('list_zip_entries')[1][1]).toEqual({ zipPath: '/astro/old.zip/night.zip', innerDir: 'Lights' });
+    await waitFor(() => expect(screen.getByTestId('zip-note')).toBeInTheDocument());
+  });
+
+  it('Send on a zip row or inside a zip says the frames are inside a zip', async () => {
+    render(<DualPaneFileBrowser scanRoots={roots} />);
+    fireEvent.click((await screen.findAllByText('night.zip'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^Send/ }));
+    await waitFor(() => expect(notifyMock).toHaveBeenCalled());
+    expect(notifyMock.mock.calls[0][0].title).toBe('Nothing sent: the frames are inside a zip');
+    expect(notifyMock.mock.calls[0][0].detail).toContain('unpack it first');
+    expect(calls('resolve_frame_ids_for_paths')).toHaveLength(0);
   });
 });

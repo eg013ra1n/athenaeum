@@ -68,7 +68,12 @@ frameEntries: number,
  * The Move and ZIP operation that wrote this zip, when it is one of ours (the browser warns that
  * removing it removes the only copy of an archived frame set).
  */
-createdByOperation: number | null, };
+createdByOperation: number | null, 
+/**
+ * The zip is in the Black Hole (owner ruling A: it stays listed and readable, but its frames are not
+ * used). The browser marks the row so a second F8 is not mistaken for a new move.
+ */
+inBlackHole: boolean, };
 
 export type ZipDirListing = { 
 /**

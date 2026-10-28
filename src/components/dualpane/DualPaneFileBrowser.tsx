@@ -71,7 +71,9 @@ import MetadataPane from './MetadataPane';
 import {
   ZIP_DEST_NOTE,
   ZIP_READ_ONLY_NOTE,
-  findZipInPath,
+  ZIP_SEND_DETAIL,
+  ZIP_SEND_TITLE,
+  zipCandidates,
   innerParent,
   zipCrumbs,
   zipFramesLabel,
@@ -161,6 +163,9 @@ const LS_RIGHT_SORT = 'dualpane.sortDir.right';
 export interface DualPaneRevealRequest {
   path: string;
   token: number;
+  /** The zip and inner folder to open when the file lives in one. Needed for a file Move and ZIP archived:
+   *  its `path` is still the original disk path, so nothing in it names the zip. */
+  zip?: { zipPath: string; innerDir: string };
 }
 
 /** When set on the dual-pane, the LEFT pane scopes its scan roots and
@@ -736,7 +741,19 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
 
     const selectedFiles = listing.files.filter((f) => active.selection.has(f.file.path));
     const selectedDirs = listing.subdirectories.filter((s) => active.selection.has(s));
-    const selectedZips = (listing.zips ?? []).filter((z) => active.selection.has(z.path));
+    const pickedZips = (listing.zips ?? []).filter((z) => active.selection.has(z.path));
+    // A zip already in the Black Hole is not moved again (the row carries a Black Hole chip).
+    const selectedZips = pickedZips.filter((z) => !z.inBlackHole);
+    const alreadyInBlackHole = pickedZips.length - selectedZips.length;
+    if (alreadyInBlackHole > 0) {
+      notify({
+        title: alreadyInBlackHole === 1 ? 'That zip is already in the Black Hole' : `${alreadyInBlackHole} zips are already in the Black Hole`,
+        detail: 'Restore it from the Black Hole page.',
+        kind: 'files',
+        tone: 'info',
+      });
+      if (selectedFiles.length === 0 && selectedZips.length === 0) return;
+    }
 
     if (selectedFiles.length === 0 && selectedZips.length === 0) {
       // User selected only directories — Black Hole holds files only, so
@@ -762,7 +779,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       skippedDirs: selectedDirs.length,
       zips: selectedZips,
     });
-  }, [listings, state.activePane, state.panes]);
+  }, [listings, state.activePane, state.panes, notify]);
 
   const performDelete = useCallback(async () => {
     if (!confirmDelete) return;
@@ -890,23 +907,25 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
   }, [renameState, refreshBoth, state.activePane]);
 
-  /** Navigate `pane` to `path` and select it. A virtual path under a zip opens the zip at the entry's folder;
-   *  anything else (or a `.zip` folder that is not a zip) opens the parent folder on disk. */
-  const revealPath = useCallback(async (pane: PaneId, path: string) => {
-    const inZip = findZipInPath(path);
-    if (inZip) {
+  /** Navigate `pane` to `path` and select it. A file inside a zip opens the zip at the entry's folder: the
+   *  caller names the zip (`zip`), or a virtual path is split at each `.zip` component, leftmost first,
+   *  until one of them is a readable zip (an outer folder may itself be called `x.zip`). Anything else, or
+   *  a path with no readable zip, opens the parent folder on disk. */
+  const revealPath = useCallback(async (pane: PaneId, path: string, zip?: { zipPath: string; innerDir: string }) => {
+    const candidates = zip ? [zip] : zipCandidates(path);
+    for (const candidate of candidates) {
       try {
-        await api.invoke<ZipDirListing>('list_zip_entries', { zipPath: inZip.zipPath, innerDir: inZip.innerDir });
+        await api.invoke<ZipDirListing>('list_zip_entries', { zipPath: candidate.zipPath, innerDir: candidate.innerDir });
         dispatch({
           type: 'set_location',
           pane,
-          cwd: getParentPath(inZip.zipPath),
-          zip: { path: inZip.zipPath, innerDir: inZip.innerDir },
+          cwd: getParentPath(candidate.zipPath),
+          zip: { path: candidate.zipPath, innerDir: candidate.innerDir },
           select: path,
         });
         return;
       } catch (e) {
-        console.warn(`reveal: "${inZip.zipPath}" is not a readable zip; showing the folder instead`, e);
+        console.warn(`reveal: "${candidate.zipPath}" is not a readable zip; trying the next candidate`, e);
       }
     }
     const parent = getParentPath(path);
@@ -921,7 +940,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   useEffect(() => {
     if (!reveal) return;
     dispatch({ type: 'set_active', pane: 'left' });
-    void revealPath('left', reveal.path);
+    void revealPath('left', reveal.path, reveal.zip);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reveal?.token]);
 
@@ -1027,8 +1046,16 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
    *  the async resolve is in flight. */
   const openSend = useCallback(async () => {
     if (sendResolving) return;
-    const paths = [...state.panes[state.activePane].selection];
-    if (paths.length === 0) return;
+    const active = state.panes[state.activePane];
+    if (active.selection.size === 0) return;
+    // Frames inside a zip (an inner folder, or a zip row) are not sent: the sender reads files on disk.
+    // Say so instead of "No cataloged frames"; a mixed selection sends its disk part.
+    const zipRows = new Set((listings[state.activePane]?.zips ?? []).map((z) => z.path));
+    const paths = active.zip ? [] : [...active.selection].filter((p) => !zipRows.has(p));
+    if (paths.length === 0) {
+      notify({ title: ZIP_SEND_TITLE, detail: ZIP_SEND_DETAIL, kind: 'sync', tone: 'info' });
+      return;
+    }
     setSendResolving(true);
     try {
       const frameIds = await api.invoke<number[]>('resolve_frame_ids_for_paths', { paths });
@@ -1069,7 +1096,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     } finally {
       setSendResolving(false);
     }
-  }, [sendResolving, state.activePane, state.panes, notify]);
+  }, [sendResolving, state.activePane, state.panes, listings, notify]);
 
   /** Activate the row at `path` — folders, zips and the parent row navigate, files no-op (Phase 2). */
   const activatePath = useCallback((path: string) => {
@@ -2176,6 +2203,9 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
               <FileArchive size={14} className={isSel ? 'text-accent' : 'text-info'} />
               <span className="truncate font-mono">{getBasename(z.path)}</span>
               <Chip tone="info">{zipFramesLabel(z.frameEntries)}</Chip>
+              {z.inBlackHole && (
+                <Chip tone="err" title="In the Black Hole: its frames are not used until it is restored">Black Hole</Chip>
+              )}
               {z.createdByOperation != null && (
                 <Chip tone="mute" title="Written by Move and ZIP">archive</Chip>
               )}

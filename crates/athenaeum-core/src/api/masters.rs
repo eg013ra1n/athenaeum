@@ -152,6 +152,9 @@ pub struct MasterProvenanceInfo {
     /// The UI uses this to hide the restore button and show an actionable
     /// warning instead of letting the user kick off a restore doomed to fail.
     pub archive_zip_missing: bool,
+    /// Any source file lives in a zip Athenaeum did not write (a foreign zip's cataloged frame). Such
+    /// originals are not "ours to archive": the UI hides "Archive originals to zip" for them.
+    pub source_frames_in_foreign_zip: bool,
 }
 
 /// Result of [`start_master_builds_batch`]: which sets were actually
@@ -2799,6 +2802,7 @@ pub fn get_master_provenance(
         archive_operation_id,
         archive_zip_path,
         archive_zip_missing,
+        source_frames_in_foreign_zip,
     ) = if let Some(src_id) = prov.source_set_id {
         let archived_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM calibration_set_frames csf
@@ -2852,15 +2856,26 @@ pub fn get_master_provenance(
             .map(|p| !Path::new(p).exists())
             .unwrap_or(false);
 
+        // A source file inside a zip that Move and ZIP did not write (no operation marker).
+        let foreign_zip_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 AND fi.archive_zip_path IS NOT NULL AND fi.archived_in_operation IS NULL",
+            [src_id],
+            |r| r.get(0),
+        )?;
+
         (
             archived_count > 0,
             source_frames_on_disk,
             archive_operation_id,
             archive_zip_path,
             archive_zip_missing,
+            foreign_zip_count > 0,
         )
     } else {
-        (false, false, None, None, false)
+        (false, false, None, None, false, false)
     };
 
     Ok(Some(MasterProvenanceInfo {
@@ -2875,6 +2890,7 @@ pub fn get_master_provenance(
         archive_operation_id,
         archive_zip_path,
         archive_zip_missing,
+        source_frames_in_foreign_zip,
     }))
 }
 
@@ -3840,6 +3856,58 @@ mod tests {
                 archived_word || err.to_string().contains("missing on disk and in zip files"),
                 "{err}"
             );
+        }
+    }
+
+    /// A master built from frames of a foreign zip: the provenance says so, so the UI does not offer
+    /// "Archive originals to zip" for files that are not ours to move. Disk and own-zip sources are not flagged.
+    #[test]
+    fn provenance_flags_originals_in_a_foreign_zip_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        // (zip path, archive operation, expected flag): a disk source, a foreign zip's frame, one of ours.
+        let cases: [(Option<&str>, Option<i64>, bool); 3] =
+            [(None, None, false), (Some("/z/night.zip"), None, true), (Some("/z/ours.zip"), Some(4), false)];
+        for (i, (zip, op, want)) in cases.into_iter().enumerate() {
+            let src = 100 + i as i64;
+            let master = 200 + i as i64;
+            {
+                let database = ctx.db.get().unwrap();
+                let conn = database.conn();
+                conn.execute(
+                    "INSERT INTO calibration_set (id, imagetyp, date, frame_count) VALUES (?1, 'Dark', '2026-06-28', 1)",
+                    [src],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (?1, 'MasterDark', '2026-06-28', 1)",
+                    [master],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
+                     VALUES (?1, 'd.fits', 4, '2026-06-28', 'FITS', ?2, ?3, ?4)",
+                    rusqlite::params![format!("/p/{i}/d.fits"), op, zip, zip.map(|_| "Darks/d.fits")],
+                )
+                .unwrap();
+                let file_id = conn.last_insert_rowid();
+                conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')", [file_id]).unwrap();
+                let frame_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    rusqlite::params![src, frame_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO master_provenance
+                        (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+                     VALUES (?1, ?2, '{}', '[]', 'abc', '2026-06-28T00:00:00Z')",
+                    rusqlite::params![master, src],
+                )
+                .unwrap();
+            }
+            let prov = get_master_provenance(&ctx, master).unwrap().unwrap();
+            assert_eq!(prov.source_frames_in_foreign_zip, want, "case {i}");
         }
     }
 

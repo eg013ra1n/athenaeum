@@ -244,6 +244,9 @@ pub struct BlackHoleEntry {
     pub from_where: String,
     pub moved_at: DateTime<Utc>,
     pub file_size: i64,
+    /// The zip the file lives in (`files.archive_zip_path`, ours or foreign), `None` for a disk file. A
+    /// frame of a zip can be restored but not voided on its own: only the whole zip can be deleted.
+    pub archive_zip_path: Option<String>,
 }
 
 /// Folder similarity result for duplicate detection
@@ -816,6 +819,12 @@ pub struct LightFrameWithCalibration {
     /// header). Drives the Original/Athenaeum WCS badge.
     pub plate_solved: bool,
     pub calibration_status: FrameCalibrationStatus,
+    /// The zip this light's file lives in (`files.archive_zip_path`), ours or foreign.
+    pub archive_zip_path: Option<String>,
+    /// The entry inside that zip (`files.archive_path_in_zip`).
+    pub archive_path_in_zip: Option<String>,
+    /// Set for a file Move and ZIP archived itself (Unarchive restores it); `None` for a foreign zip's frame.
+    pub archived_in_operation: Option<i64>,
 }
 
 // ========== Calendar View Structures ==========
