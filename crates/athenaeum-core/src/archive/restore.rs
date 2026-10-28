@@ -369,9 +369,16 @@ fn run_restore_inner(
             }
         }
 
-        // The catalog update writes `files.path = dest`, which is UNIQUE: if another row already
+        // The path the catalog row will point at: the verified file itself when one is adopted (it may
+        // sit at the original path while `dest` is under another root), otherwise `dest`.
+        let record_path: PathBuf = match (adopt_existing, existing) {
+            (true, Some(e)) => e.to_path_buf(),
+            _ => dest.clone(),
+        };
+
+        // The catalog update writes `files.path = record_path`, which is UNIQUE: if another row already
         // owns it, copying would leave a file on disk and fail the catalog step. Check first.
-        if let (Some(file_id), Some(dest_str)) = (f.file_id, dest.to_str()) {
+        if let (Some(file_id), Some(dest_str)) = (f.file_id, record_path.to_str()) {
             let owner: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM files WHERE path = ?1 AND id != ?2",
@@ -382,13 +389,13 @@ fn run_restore_inner(
             if let Some(owner_id) = owner {
                 let msg = format!(
                     "restore conflict: another catalog frame owns this path ({}, file {})",
-                    dest.display(), owner_id,
+                    record_path.display(), owner_id,
                 );
                 tracing::error!(
                     operation_id,
                     file_id,
                     owner_file_id = owner_id,
-                    dest = %dest.display(),
+                    dest = %record_path.display(),
                     "restore conflict: another catalog frame owns the destination path, leaving frame set archived pending resolution"
                 );
                 record_conflict_step(conn, operation_id, f, None, &msg)?;
@@ -403,15 +410,15 @@ fn run_restore_inner(
                     "reconcile",
                     idx + 1,
                     total,
-                    format!("CONFLICT — another catalog frame owns this path, nothing copied: {}", dest.display()),
+                    format!("CONFLICT — another catalog frame owns this path, nothing copied: {}", record_path.display()),
                 );
                 continue;
             }
         }
 
         if adopt_existing {
-            // Nothing to copy: the catalog update below points the row at `dest`.
-            restored.push((f, dest));
+            // Nothing to copy: the catalog update below points the row at the verified file.
+            restored.push((f, record_path));
             continue;
         }
 
@@ -1200,6 +1207,39 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(path, dest.to_str().unwrap(), "files.path follows the adopted file");
+        assert!(zip.is_none() && op_col.is_none(), "markers cleared");
+    }
+
+    /// Restoring under another root while the frame's own bytes already sit at its original path (put
+    /// back by hand): that verified file is adopted where it is. The restore succeeds, `files.path` is
+    /// the original path, markers are cleared, and nothing is copied to the destination.
+    #[test]
+    fn under_root_restore_adopts_the_frames_own_bytes_at_the_original_path() {
+        let base = TempDir::new().unwrap();
+        let arch = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let scan = base.path().join("x/rootA");
+        let other = base.path().join("y/rootB");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (op_id, original, file_id) = archive_two_roots(&conn, arch.path(), &scan, &other);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"first-frame").unwrap();
+        let dest = target.path().join("rootA/M31/L_001.fits");
+        assert_ne!(dest, original);
+
+        let outcome = run_restore(&conn, op_id, target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+        assert!(!dest.exists(), "nothing is copied next to a verified file");
+        assert_eq!(std::fs::read(&original).unwrap(), b"first-frame");
+        let (path, zip, op_col): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT path, archive_zip_path, archived_in_operation FROM files WHERE id = ?1",
+                [file_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(path, original.to_str().unwrap(), "files.path is the verified file's path");
         assert!(zip.is_none() && op_col.is_none(), "markers cleared");
     }
 

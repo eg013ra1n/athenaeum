@@ -120,7 +120,18 @@ struct Job {
 impl Job {
     /// The cache file is there and has the entry's size. A file of another size is a crashed or damaged
     /// leftover, never served: it is extracted again.
-    fn cached(&self) -> bool {
+    fn cached(&self, cache: &ZipCache) -> bool {
+        if cache.is_poisoned(&self.key) {
+            // A file that failed its check and could not be removed then: retry the removal, and never serve it.
+            match std::fs::remove_file(&self.dest) {
+                Ok(()) => cache.unpoison(&self.key),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => cache.unpoison(&self.key),
+                Err(e) => {
+                    tracing::warn!(path = %self.dest.display(), error = %e, "could not remove a cache file that failed its check");
+                }
+            }
+            return false;
+        }
         match std::fs::metadata(&self.dest) {
             Ok(m) => m.is_file() && i64::try_from(m.len()).is_ok_and(|len| len == self.row.size),
             Err(_) => false,
@@ -251,7 +262,16 @@ fn verify_extraction(ctx: &ServiceContext, job: &Job) -> std::result::Result<boo
             None
         })
     };
-    let Some(expected) = expected else { return Ok(false) };
+    let Some(expected) = expected else {
+        tracing::warn!(
+            file_id = job.row.id,
+            operation_id = op,
+            zip_path = %job.row.zip,
+            zip_entry = %job.row.entry,
+            "an archived entry has no plan row to verify against"
+        );
+        return Ok(false);
+    };
     let actual = crate::duplicates::compute_xxhash(&job.dest).map_err(|e| {
         tracing::warn!(file_id = job.row.id, error = %e, "could not hash an extracted zip entry");
         format!("{} could not be checked after extraction from {}: {e:#}", job.file_name, job.zip_name)
@@ -276,7 +296,10 @@ fn verify_extraction(ctx: &ServiceContext, job: &Job) -> std::result::Result<boo
 fn bank_after_extraction(ctx: &ServiceContext, job: &Job, strong_hash: &str, verified: bool) {
     let Some(db) = ctx.db.get() else { return };
     let conn = db.conn();
-    if let Some(crc) = job.learned_crc {
+    // A row of ours without a plan row has nothing to verify against: the directory's CRC32 would only
+    // pin whatever the zip holds today.
+    let trust_directory = verified || job.row.archived_in_operation.is_none();
+    if let Some(crc) = job.learned_crc.filter(|_| trust_directory) {
         if let Err(e) = conn.execute(
             "UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2 AND archive_entry_crc32 IS NULL",
             rusqlite::params![i64::from(crc), job.row.id],
@@ -320,7 +343,7 @@ fn fetch(ctx: &ServiceContext, job: &Job, cancel: &AtomicBool) -> Result<PathBuf
     let mut cache_hit = true;
     let mut bytes_read = 0u64;
     let result = cache.run_once(&job.key, || {
-        if job.cached() {
+        if job.cached(cache) {
             cache.touch(&job.key);
             return Ok(job.dest.clone());
         }
@@ -335,10 +358,12 @@ fn fetch(ctx: &ServiceContext, job: &Job, cancel: &AtomicBool) -> Result<PathBuf
                         // Never leave bytes that failed the check where a later call would take them as a hit.
                         if let Err(e) = std::fs::remove_file(&job.dest) {
                             tracing::warn!(path = %job.dest.display(), error = %e, "could not remove a cache file that failed its check");
+                            cache.poison(&job.key);
                         }
                         return Err(msg);
                     }
                 };
+                cache.unpoison(&job.key);
                 bank_after_extraction(ctx, job, &done.strong_hash, verified);
                 cache.touch(&job.key);
                 Ok(job.dest.clone())
@@ -400,13 +425,13 @@ pub fn materialize_paths(
         }
     }
 
-    let total = jobs.iter().filter(|j| !j.cached()).count();
+    let total = jobs.iter().filter(|j| !j.cached(&ctx.zip_cache)).count();
     let mut current = 0usize;
     for job in &jobs {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("extraction cancelled");
         }
-        if !job.cached() {
+        if !job.cached(&ctx.zip_cache) {
             current += 1;
             crate::events::emit_event(
                 emitter,
@@ -442,7 +467,7 @@ pub fn estimate_extraction(ctx: &ServiceContext, file_ids: &[i64]) -> Result<Ext
     for row in rows {
         let size = row.size.max(0) as u64;
         match resolve(&mut facts, &ctx.zip_cache, row) {
-            Ok(job) if job.cached() => {}
+            Ok(job) if job.cached(&ctx.zip_cache) => {}
             _ => {
                 estimate.files += 1;
                 estimate.bytes += size;
@@ -781,6 +806,49 @@ mod materialize_tests {
         assert!(row_col(&f, id, "archive_entry_crc32").is_none(), "no CRC32 is recorded from a failed check");
         // Asking again fails the same way (a stale file would have become a silent hit).
         assert!(mat(&f.ctx, &paths).is_err());
+    }
+
+    #[test]
+    fn a_row_of_ours_without_a_plan_row_is_not_backfilled_from_the_directory() {
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("M31.zip", &[("L_001.fits", light(1))]);
+        let id = make_ours(&f, &paths[0], "0000000000000000");
+        f.ctx.db.get().unwrap().conn().execute("DELETE FROM archive_operation_files", []).unwrap();
+        assert!(row_col(&f, id, "archived_in_operation").is_some());
+        let m = mat(&f.ctx, &paths).unwrap();
+        assert!(m.local(&paths[0]).is_file(), "the entry is still served");
+        assert!(row_col(&f, id, "archive_entry_crc32").is_none(), "nothing verifies the entry, so its CRC32 is not pinned");
+        let conn = f.ctx.db.get().unwrap().conn();
+        let strong: Option<String> = conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert!(strong.is_none(), "no hash is banked either");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_poisoned_key_is_never_a_hit_and_its_file_is_removed_once_possible() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("M31.zip", &[("L_001.fits", light(1))]);
+        let job = {
+            let conn = f.ctx.db.get().unwrap().conn();
+            let values = [rusqlite::types::Value::Text(paths[0].clone())];
+            let row = query_rows(&conn, "path", &values).unwrap().remove(0);
+            resolve(&mut ZipFacts::default(), &f.ctx.zip_cache, row).unwrap()
+        };
+        let cache = &f.ctx.zip_cache;
+        drop(mat(&f.ctx, &paths).unwrap());
+        assert!(job.cached(cache), "a good extraction is a hit");
+        cache.poison(&job.key);
+        let key_dir = job.dest.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(!job.cached(cache), "a poisoned key is not a hit while its file cannot be removed");
+        assert!(cache.is_poisoned(&job.key));
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!job.cached(cache), "the retry removes the file and still reports a miss");
+        assert!(!job.dest.exists());
+        assert!(!cache.is_poisoned(&job.key), "once the file is gone the key is clean again");
+        drop(mat(&f.ctx, &paths).unwrap());
+        assert!(job.cached(cache), "a fresh verified extraction is a hit again");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -40,6 +40,8 @@ struct Inner {
     dir: OnceLock<PathBuf>,
     /// key → number of live pins.
     pins: Mutex<HashMap<String, usize>>,
+    /// Keys whose file failed its check and could not be removed: never served until it is gone.
+    poisoned: Mutex<HashSet<String>>,
     in_flight: Mutex<HashMap<String, InFlight>>,
     limit_bytes: AtomicU64,
     /// Extractions that really ran (a test hook: a cache hit does not count).
@@ -112,6 +114,7 @@ impl ZipCache {
             inner: Arc::new(Inner {
                 dir: cell,
                 pins: Mutex::new(HashMap::new()),
+                poisoned: Mutex::new(HashSet::new()),
                 in_flight: Mutex::new(HashMap::new()),
                 limit_bytes: AtomicU64::new(DEFAULT_LIMIT_BYTES),
                 extractions: AtomicU64::new(0),
@@ -162,6 +165,19 @@ impl ZipCache {
         if let Err(e) = self.key_dir(key).map_err(std::io::Error::other).and_then(|d| touch_dir(&d)) {
             tracing::warn!(zip_cache_key = key, error = %e, "could not refresh the zip cache entry's use time");
         }
+    }
+
+    /// Marks `key` as holding bytes that failed their check: it is never a hit until [`Self::unpoison`].
+    pub(crate) fn poison(&self, key: &str) {
+        self.inner.poisoned.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string());
+    }
+
+    pub(crate) fn unpoison(&self, key: &str) {
+        self.inner.poisoned.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+    }
+
+    pub(crate) fn is_poisoned(&self, key: &str) -> bool {
+        self.inner.poisoned.lock().unwrap_or_else(|p| p.into_inner()).contains(key)
     }
 
     /// Pins `key` until the returned guard is dropped.
@@ -334,8 +350,9 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// Removes `*.partial` files left by a process that died mid-extraction. A partial whose embedded process
-/// id is still running (this process included) belongs to a live extraction and is left alone; a name
-/// without a readable pid is stale.
+/// id is still running belongs to a live extraction and is left alone; a name without a readable pid is
+/// stale. This process's own id counts as dead: a bind happens before its first extraction, so a partial
+/// carrying it was left by an earlier run that had the same id (a container's pid 1).
 fn sweep_partials(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for key_dir in rd.flatten() {
@@ -345,7 +362,7 @@ fn sweep_partials(dir: &Path) {
             if !name.ends_with(".partial") {
                 continue;
             }
-            if partial_pid(&name).is_some_and(pid_alive) {
+            if partial_pid(&name).is_some_and(|pid| pid != std::process::id() && pid_alive(pid)) {
                 continue;
             }
             match std::fs::remove_file(f.path()) {
@@ -461,7 +478,10 @@ mod cache_tests {
         std::fs::create_dir_all(dir.join("k1")).unwrap();
         std::fs::write(dir.join("k1").join("L.fits"), b"done").unwrap();
         let dead = format!("L.fits.{}-0.partial", dead_pid());
-        let live = format!("L.fits.{}-1.partial", std::process::id());
+        // A live process other than this one: the parent (the test runner's launcher).
+        let live = format!("L.fits.{}-1.partial", std::os::unix::process::parent_id());
+        let own = format!("L.fits.{}-2.partial", std::process::id());
+        std::fs::write(dir.join("k1").join(&own), b"left by an earlier run with this pid").unwrap();
         std::fs::write(dir.join("k1").join(&dead), b"half").unwrap();
         std::fs::write(dir.join("k1").join(&live), b"in flight").unwrap();
         std::fs::write(dir.join("k1").join("M.fits.junk.partial"), b"no pid").unwrap();
@@ -469,6 +489,7 @@ mod cache_tests {
         assert!(dir.join("k1").join("L.fits").exists());
         assert!(!dir.join("k1").join(&dead).exists(), "a dead process's partial is removed");
         assert!(dir.join("k1").join(&live).exists(), "a live process's partial is left alone");
+        assert!(!dir.join("k1").join(&own).exists(), "a partial carrying this process's id is stale at bind");
         assert!(!dir.join("k1").join("M.fits.junk.partial").exists(), "a partial with no readable pid is stale");
         assert_eq!(cache.status().unwrap().entries, 1);
     }
