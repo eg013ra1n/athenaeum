@@ -376,23 +376,32 @@ fn sweep_partials(dir: &Path) {
     }
 }
 
-/// The process id of a temp file named exactly `<prefix><digits>-<digits>.partial|staged` (the prefix is
-/// `<dest file name>.`), else `None`. A pid is judged on this machine only: on a folder shared by two hosts
-/// one can sweep the other's live temp file, which makes that placement fail cleanly (the rename finds no
-/// source) and loses nothing.
-fn own_temp_pid(file_name: &str, prefix: &str) -> Option<u32> {
-    let rest = file_name.strip_prefix(prefix)?;
-    let stem = rest.strip_suffix(".partial").or_else(|| rest.strip_suffix(".staged"))?;
-    let (pid, n) = stem.split_once('-')?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(pid) || !digits(n) {
-        return None;
+/// The process ids carried by a temp file named exactly `<prefix><pid>-<n>.partial|staged`, or the nested
+/// `<prefix><pid>-<n>.staged.<pid>-<m>.partial` (a staging file is itself extracted through a `.partial`,
+/// so a crash during the write leaves the nested name); the prefix is `<dest file name>.`. `None` for any
+/// other name. A pid is judged on this machine only: on a folder shared by two hosts one can sweep the
+/// other's live temp file, which makes that placement fail cleanly (the rename finds no source) and loses
+/// nothing.
+fn own_temp_pids(file_name: &str, prefix: &str) -> Option<Vec<u32>> {
+    fn pid_n(s: &str) -> Option<u32> {
+        let (pid, n) = s.split_once('-')?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(pid) || !digits(n) {
+            return None;
+        }
+        pid.parse().ok()
     }
-    pid.parse().ok()
+    let rest = file_name.strip_prefix(prefix)?;
+    if let Some((staged, partial)) = rest.split_once(".staged.") {
+        let inner = partial.strip_suffix(".partial")?;
+        return Some(vec![pid_n(staged)?, pid_n(inner)?]);
+    }
+    let stem = rest.strip_suffix(".partial").or_else(|| rest.strip_suffix(".staged"))?;
+    Some(vec![pid_n(stem)?])
 }
 
 /// Removes the leftovers of a dead process beside one file that is about to be placed: the `*.partial`
-/// and `*.staged` files named after `dest` (`<dest file name>.<pid>-<n>.partial|staged`). Unlike
+/// and `*.staged` files named after `dest` (`<dest file name>.<pid>-<n>.partial|staged`, and the nested `….staged.<pid>-<m>.partial`). Unlike
 /// [`sweep_partials`] this process's own id counts as alive: another placement in this process may be
 /// writing its own staging file right now.
 pub(crate) fn sweep_stale_beside(dest: &Path) {
@@ -403,8 +412,8 @@ pub(crate) fn sweep_stale_beside(dest: &Path) {
         let fname = f.file_name().to_string_lossy().into_owned();
         // Only names of exactly our pattern: a user's own `L.fits.partial` or a sync tool's
         // `L.fits.a1b2c3.partial` is never ours to delete.
-        let Some(pid) = own_temp_pid(&fname, &prefix) else { continue };
-        if pid_alive(pid) {
+        let Some(pids) = own_temp_pids(&fname, &prefix) else { continue };
+        if pids.into_iter().any(pid_alive) {
             continue;
         }
         match std::fs::remove_file(f.path()) {

@@ -211,7 +211,9 @@ mod tests {
         let zip = make_zip(tmp.path(), &[("L1.fits", b"light-one")]);
         let dest = tmp.path().join("longer.fits");
         std::fs::write(&dest, b"light-one-and-a-tail").unwrap();
-        let outcome = place_entry(&zip, "L1.fits", None, &dest, &AtomicBool::new(false)).unwrap();
+        // The catalog's CRC is that of the file's own bytes, so only the length tells it from the entry.
+        let crc_of_the_file = file_crc32(&dest).unwrap();
+        let outcome = place_entry(&zip, "L1.fits", Some(crc_of_the_file), &dest, &AtomicBool::new(false)).unwrap();
         assert!(matches!(outcome, PlaceOutcome::Conflict(_)), "{outcome:?}");
         assert_eq!(std::fs::read(&dest).unwrap(), b"light-one-and-a-tail");
     }
@@ -226,13 +228,19 @@ mod tests {
         let sync_tool = out.join("L_001.fits.a1b2c3.partial");
         let half_pattern = out.join("L_001.fits.2147483632-x.partial");
         let ours_dead = out.join("L_001.fits.2147483632-7.partial");
-        for p in [&users, &sync_tool, &half_pattern, &ours_dead] {
+        let nested_dead = out.join("L_001.fits.2147483632-8.staged.2147483632-9.partial");
+        let nested_live = out.join(format!("L_001.fits.2147483632-10.staged.{}-11.partial", std::process::id()));
+        let nested_foreign = out.join("L_001.fits.2147483632-8.staged.partial");
+        for p in [&users, &sync_tool, &half_pattern, &ours_dead, &nested_dead, &nested_live, &nested_foreign] {
             std::fs::write(p, b"keep me").unwrap();
         }
         let dest = out.join("L_001.fits");
         assert_eq!(place_entry(&zip, "L_001.fits", None, &dest, &AtomicBool::new(false)).unwrap(), PlaceOutcome::Placed);
         assert!(users.exists() && sync_tool.exists() && half_pattern.exists(), "foreign names are never removed");
         assert!(!ours_dead.exists(), "a dead process's file of our pattern goes");
+        assert!(!nested_dead.exists(), "the nested crash leftover of a dead process goes");
+        assert!(nested_live.exists(), "a nested name with a live pid is kept");
+        assert!(nested_foreign.exists(), "a nested-looking foreign name is kept");
     }
 
     #[test]
