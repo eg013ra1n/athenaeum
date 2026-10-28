@@ -54,7 +54,9 @@ impl PartialZip {
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            crate::zip_store::fs::sync_best_effort(&File::open(parent)?, parent)
+        }
         _ => Ok(()),
     }
 }
@@ -159,7 +161,7 @@ pub fn build_zip_partial(
     let mut out = zw.finish().context("failed to finalize zip")?;
     out.flush().context("failed to flush zip")?;
     let file = out.into_inner().map_err(|e| e.into_error()).context("failed to flush zip")?;
-    file.sync_all().with_context(|| format!("failed to sync {}", partial.path.display()))?;
+    crate::zip_store::fs::sync_best_effort(&file, &partial.path).with_context(|| format!("failed to sync {}", partial.path.display()))?;
     Ok(partial)
 }
 

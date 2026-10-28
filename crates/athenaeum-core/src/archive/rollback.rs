@@ -285,7 +285,7 @@ fn restore_from_staging(staged: &Path, target: &Path) -> Result<()> {
         let mut src = std::fs::File::open(staged)?;
         let mut dst = std::fs::File::create(&temp)?;
         std::io::copy(&mut src, &mut dst)?;
-        dst.sync_all()
+        crate::zip_store::fs::sync_best_effort(&dst, &temp)
     };
     if let Err(e) = write() {
         if let Err(re) = std::fs::remove_file(&temp) {

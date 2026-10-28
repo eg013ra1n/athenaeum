@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub mod catalog;
+pub(crate) mod fs;
 pub mod materialize;
 pub mod place;
 pub mod presence;

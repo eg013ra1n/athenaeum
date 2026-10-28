@@ -507,7 +507,7 @@ pub fn extract_entry(
     out.flush().with_context(|| format!("flush {}", partial.display()))?;
     // The data must be on disk before the rename publishes the name: after a crash a renamed but
     // unflushed file would otherwise be served as a complete cache hit.
-    out.sync_all().with_context(|| format!("sync {}", partial.display()))?;
+    crate::zip_store::fs::sync_best_effort(&out, &partial).with_context(|| format!("sync {}", partial.display()))?;
     drop(out);
     std::fs::rename(&partial, dest).with_context(|| format!("rename {} to {}", partial.display(), dest.display()))?;
     guard.armed = false;
