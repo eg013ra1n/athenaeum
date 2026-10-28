@@ -30,8 +30,8 @@ pub struct ArchiveProgress {
 }
 
 /// Sentinel error type used to propagate "user cancelled" up the call stack.
-/// The caller (run_operation) catches this, sets status=Cancelled, and lets
-/// rollback take over. We use the message string rather than a bespoke type
+/// The caller (run_operation) catches this, leaves the status as the phase
+/// wrote it, and lets rollback take over. We use the message string rather than a bespoke type
 /// to keep it inside `anyhow::Error`.
 const CANCEL_MSG: &str = "__archive_cancelled__";
 
@@ -49,8 +49,9 @@ pub fn was_cancelled(err: &anyhow::Error) -> bool {
 /// Run the full forward operation (stages 2-7).
 ///
 /// On success: status=Completed, frame set marked archived, files marked archived.
-/// On cancel: status=Cancelled, then rollback is invoked by the caller (commands layer).
-/// On error: status=Failed, then rollback is invoked by the caller.
+/// On cancel or error: the status is left as the running phase set it (no Failed/Cancelled is written),
+/// the error is kept on the row, and the caller invokes rollback, which ends it at `rolled_back`. A refused
+/// rollback leaves the phase status, so the operation stays listed as unfinished (Resume / Roll back).
 pub fn run_operation(
     conn: &Connection,
     operation_id: i64,
@@ -115,7 +116,7 @@ pub fn run_operation_standalone(
 }
 
 /// Shared tail of the two standalone entry points: status bookkeeping on
-/// error (cancelled/failed + inner rollback), then the terminal event, then
+/// error (the error is kept on the row, then the inner rollback; no Failed/Cancelled status is written), then the terminal event, then
 /// the original result so callers can still see the error (already logged
 /// here — dropping it at the call site is fine).
 pub(crate) fn finish_forward_operation(
@@ -884,9 +885,9 @@ mod tests {
         );
 
         // The row lands on `rolled_back`, not `cancelled`: the cancel branch
-        // stamps `Cancelled` and then runs the same rollback the failure branch
+        // writes no status of its own and runs the same rollback the failure branch
         // does (restore sources, delete partial zips), and rollback stamps
-        // `RolledBack` last. That ordering is the point — a cancelled operation
+        // `RolledBack` last (a refused rollback would leave the phase status). That ordering is the point — a cancelled operation
         // must not leave partial work behind — so this pins the terminal state
         // rather than the transient one.
         let status: String = conn

@@ -11,7 +11,7 @@
 //! when complete, and the executor records a `zip_publish` step right after that rename. Rollback
 //! removes (a) the operation's stale partials beside its targets and (b) a target zip only when a
 //! `zip_publish` step says this operation put it there. It refuses to start while a zip it would
-//! delete may hold the only copy of a frame (a moved source that is neither on disk nor in staging).
+//! delete may hold the only copy of a frame (a moved source that is neither intact on disk nor in staging).
 //!
 //! Residual, accepted: a failure in a later phase, after the rename, rolls back by deleting the NEW zip;
 //! when the build replaced an old zip (Overwrite), that old file was already replaced by the user's own
@@ -110,16 +110,23 @@ pub fn rollback_operation(
         .map(|f| f.target_zip_path.as_str())
         .collect();
 
-    // Before anything is touched: a zip this rollback would delete (or rows it would unmark) must not
-    // be the only copy of a frame. Every moved source has to be on disk or restorable from staging.
-    // Gone from both (staging cleaned after the sources were deleted, the archive drive unplugged) means
-    // the zip is the only copy: refuse, change nothing, and leave the status as it is.
-    let lost: Vec<&str> = files
+    // The files this rollback restores: a move file whose DeleteSource step exists in any status, or
+    // whose source is gone while a zip of this operation stands.
+    let to_restore: Vec<&crate::archive::models::ArchiveOperationFile> = files
         .iter()
         .filter(|f| f.disposition == "move")
-        .filter(|f| !published_zips.is_empty() || deleted_file_ids.contains(&f.id))
+        .filter(|f| deleted_file_ids.contains(&f.id) || (!published_zips.is_empty() && !Path::new(&f.source_path).exists()))
+        .collect();
+
+    // Before anything is touched: a zip this rollback would delete (or rows it would unmark) must not
+    // be the only copy of a frame. Every such file has to be intact at its source (the catalog hash
+    // matches) or restorable from staging. Gone from both (staging cleaned after the sources were
+    // deleted, the archive drive unplugged, a truncated leftover of an earlier failed restore) means
+    // the zip is the only copy: refuse, change nothing, and leave the status as it is.
+    let lost: Vec<&str> = to_restore
+        .iter()
         .filter(|f| {
-            !Path::new(&f.source_path).exists()
+            !source_matches(f)
                 && !staging::staging_file_path(&archive_root, operation_id, &f.target_path_in_zip).exists()
         })
         .map(|f| f.source_path.as_str())
@@ -130,10 +137,10 @@ pub fn rollback_operation(
             lost = lost.len(),
             first = lost[0],
             status = %op.status,
-            "rollback refused: moved sources are neither on disk nor in staging, the zip holds the only copy"
+            "rollback refused: moved sources are neither intact on disk nor in staging, the zip holds the only copy"
         );
         anyhow::bail!(
-            "cannot roll back: {} moved source file(s) (first: {}) are neither on disk nor in staging, so the archive \
+            "cannot roll back: {} moved source file(s) (first: {}) are neither intact on disk nor in staging, so the archive \
              zip may hold their only copy; nothing was changed. Reconnect the archive folder or resume the operation instead",
             lost.len(),
             lost[0]
@@ -151,13 +158,6 @@ pub fn rollback_operation(
     // DeleteSource step is *not* the same as "a source was deleted": a
     // copy-disposition calibration gets that step too, with nothing removed
     // from disk (see `executor::delete_sources_phase`).
-    // The same test the pre-flight used: a move file whose DeleteSource step exists in any status, or
-    // whose source is gone while a zip of this operation stands.
-    let to_restore: Vec<&crate::archive::models::ArchiveOperationFile> = files
-        .iter()
-        .filter(|f| f.disposition == "move")
-        .filter(|f| deleted_file_ids.contains(&f.id) || (!published_zips.is_empty() && !Path::new(&f.source_path).exists()))
-        .collect();
     let total = to_restore.len();
     let mut restored = 0usize;
     for f in to_restore {
@@ -173,13 +173,10 @@ pub fn rollback_operation(
         let staged = staging::staging_file_path(&archive_root, operation_id, &f.target_path_in_zip);
         let target = Path::new(&f.source_path);
 
-        if !target.exists() && staged.exists() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("rollback: create dir {}", parent.display()))?;
-            }
-            std::fs::copy(&staged, target)
-                .with_context(|| format!("rollback: copy {} -> {}", staged.display(), target.display()))?;
+        // An existing source is trusted only when it hashes to the catalog's value: a copy that failed or
+        // was killed halfway leaves a truncated file at the path, which must not count as restored.
+        if !source_matches(f) && staged.exists() {
+            restore_from_staging(&staged, target)?;
         }
 
         // Mark a restore_source step as Done so resume understands progress.
@@ -245,6 +242,56 @@ pub fn rollback_operation(
     }
 
     adb::update_operation_status(conn, operation_id, ArchiveStatus::RolledBack, None)?;
+    Ok(())
+}
+
+/// True when a file exists at the operation file's source path and hashes (the SAMPLED
+/// `compute_xxhash`, the one `expected_hash` was made with) to the catalog's value.
+fn source_matches(f: &crate::archive::models::ArchiveOperationFile) -> bool {
+    let source = Path::new(&f.source_path);
+    if !source.exists() {
+        return false;
+    }
+    match crate::duplicates::compute_xxhash(source) {
+        Ok(h) => h == f.expected_hash,
+        Err(e) => {
+            tracing::warn!(path = %source.display(), error = %e, "rollback: existing source could not be hashed; treated as not restored");
+            false
+        }
+    }
+}
+
+/// Copies the staged file onto `target` through a sibling temp: write, fsync, rename. A failure (or a
+/// kill) leaves `target` as it was and at worst a stray `.partial` beside it, never a truncated file
+/// at the source path. The temp is removed on error.
+fn restore_from_staging(staged: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("rollback: create dir {}", parent.display()))?;
+    }
+    let temp = crate::zip_store::reader::partial_path(target);
+    let write = || -> std::io::Result<()> {
+        let mut src = std::fs::File::open(staged)?;
+        let mut dst = std::fs::File::create(&temp)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()
+    };
+    if let Err(e) = write() {
+        if let Err(re) = std::fs::remove_file(&temp) {
+            if re.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %temp.display(), error = %re, "rollback: could not remove the temp copy");
+            }
+        }
+        return Err(anyhow::Error::new(e)
+            .context(format!("rollback: copy {} -> {}", staged.display(), target.display())));
+    }
+    if let Err(e) = std::fs::rename(&temp, target) {
+        if let Err(re) = std::fs::remove_file(&temp) {
+            tracing::warn!(path = %temp.display(), error = %re, "rollback: could not remove the temp copy");
+        }
+        return Err(anyhow::Error::new(e)
+            .context(format!("rollback: rename {} -> {}", temp.display(), target.display())));
+    }
     Ok(())
 }
 
@@ -705,7 +752,7 @@ mod tests {
         std::fs::rename(arch.path(), &offline).unwrap();
 
         let err = rollback_operation(&conn, op_id, &NullEmitter).unwrap_err();
-        assert!(format!("{err:#}").contains("neither on disk nor in staging"), "{err:#}");
+        assert!(format!("{err:#}").contains("neither intact on disk nor in staging"), "{err:#}");
         assert_eq!(archived_row_count(&conn), 3, "nothing is unmarked");
         assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "deleting_sources");
 
@@ -892,5 +939,90 @@ mod tests {
         assert!(scan.path().join("M31/L_001.fits").exists());
         assert_eq!(archived_row_count(&conn), 0);
         assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    /// Rewrites each source with 2 MiB of distinct content and sets the row's expected hash to the
+    /// SAMPLED catalog hash of it (files this large make a truncation visible to that hash).
+    fn make_sources_large(conn: &Connection, op_id: i64) -> std::collections::HashMap<String, Vec<u8>> {
+        let mut contents = std::collections::HashMap::new();
+        for (i, f) in adb::list_operation_files(conn, op_id).unwrap().iter().enumerate() {
+            let bytes: Vec<u8> = (0..2 * 1024 * 1024usize).map(|n| ((n * 31 + i * 7) % 251) as u8).collect();
+            std::fs::write(&f.source_path, &bytes).unwrap();
+            let h = crate::duplicates::compute_xxhash(Path::new(&f.source_path)).unwrap();
+            conn.execute("UPDATE archive_operation_files SET expected_hash = ?1 WHERE id = ?2", params![h, f.id]).unwrap();
+            let name = Path::new(&f.source_path).file_name().unwrap().to_str().unwrap().to_string();
+            contents.insert(name, bytes);
+        }
+        contents
+    }
+
+    fn leftover_temps(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".partial")).collect()
+    }
+
+    #[test]
+    fn a_truncated_leftover_at_a_deleted_sources_path_is_replaced_by_the_staged_bytes() {
+        // A restore that died halfway (ENOSPC, kill) used to leave a truncated file that a second
+        // rollback trusted before it deleted the zip and staging.
+        let (conn, arch, scan, op_id) = fixture();
+        let contents = make_sources_large(&conn, op_id);
+        run_through_zip(&conn, &arch, op_id);
+        delete_sources(&conn, op_id);
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::RollingBack, None).unwrap();
+        let l2 = scan.path().join("M31/L_002.fits");
+        std::fs::write(&l2, &contents["L_002.fits"][..1000]).unwrap();
+        let zip = target_zip(&conn, op_id);
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        for name in ["L_001", "L_002", "L_003"] {
+            let p = scan.path().join(format!("M31/{name}.fits"));
+            assert!(std::fs::read(&p).unwrap() == contents[&format!("{name}.fits")], "{} holds the full staged bytes", p.display());
+        }
+        assert!(!Path::new(&zip).exists());
+        assert!(!crate::archive::staging::staging_dir(arch.path(), op_id).exists());
+        assert!(leftover_temps(&scan.path().join("M31")).is_empty(), "no temp copy is left beside the sources");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn a_source_that_matches_its_catalog_hash_is_not_copied_again() {
+        let (conn, arch, scan, op_id) = fixture();
+        let contents = make_sources_large(&conn, op_id);
+        let files = run_through_zip(&conn, &arch, op_id);
+        // L_001 was never removed but has a DeleteSource step; its staged copy is deliberately different,
+        // so a re-copy would show.
+        let keep = files.iter().find(|f| f.source_path.ends_with("L_001.fits")).unwrap();
+        let sid = adb::insert_step(&conn, op_id, Some(keep.id), ArchiveStage::DeleteSource).unwrap();
+        adb::update_step(&conn, sid, StepStatus::Done, None, None).unwrap();
+        let staged = crate::archive::staging::staging_file_path(arch.path(), op_id, &keep.target_path_in_zip);
+        std::fs::write(&staged, b"tampered staging copy").unwrap();
+        for f in files.iter().filter(|f| f.id != keep.id) {
+            std::fs::remove_file(&f.source_path).unwrap();
+            let sid = adb::insert_step(&conn, op_id, Some(f.id), ArchiveStage::DeleteSource).unwrap();
+            adb::update_step(&conn, sid, StepStatus::Done, None, None).unwrap();
+        }
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(std::fs::read(scan.path().join("M31/L_001.fits")).unwrap() == contents["L_001.fits"], "the intact source is kept");
+        assert!(std::fs::read(scan.path().join("M31/L_002.fits")).unwrap() == contents["L_002.fits"]);
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn a_truncated_source_with_no_staged_copy_refuses_the_rollback() {
+        let (conn, arch, scan, op_id) = fixture();
+        let contents = make_sources_large(&conn, op_id);
+        run_through_zip(&conn, &arch, op_id);
+        delete_sources(&conn, op_id);
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::RollingBack, None).unwrap();
+        std::fs::write(scan.path().join("M31/L_002.fits"), &contents["L_002.fits"][..1000]).unwrap();
+        crate::archive::staging::cleanup_staging(arch.path(), op_id).unwrap();
+        let zip = target_zip(&conn, op_id);
+
+        assert!(rollback_operation(&conn, op_id, &NullEmitter).is_err());
+        assert!(Path::new(&zip).exists(), "the zip holds the only full copy and stays");
+        assert_eq!(std::fs::read(scan.path().join("M31/L_002.fits")).unwrap().len(), 1000, "nothing was changed");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolling_back");
     }
 }
