@@ -87,6 +87,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::BulkMoveResult,
             crate::db::BulkMoveProgressEvent,
             crate::models::BlackHoleEntry,
+            crate::db::BlackHoleZipEntry,
             crate::models::FolderSimilarity,
             crate::scanner::ScanProgressEvent,
             crate::scanner::ScanCompleteEvent,

@@ -129,6 +129,24 @@ pub fn run_restore(
         );
     }
 
+    // A zip in the Black Hole stays present but is not read by Unarchive until it is restored.
+    let mut black_holed: Vec<&str> = Vec::new();
+    for zip in &unique_zip_paths {
+        if crate::db::zip_is_in_black_hole(conn, zip)? {
+            black_holed.push(zip);
+        }
+    }
+    if !black_holed.is_empty() {
+        black_holed.sort();
+        let msg = black_holed
+            .iter()
+            .map(|z| crate::db::zip_in_black_hole_message(z))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::warn!(operation_id, zips = black_holed.len(), "unarchive refused: zip is in the Black Hole");
+        anyhow::bail!(msg);
+    }
+
     let mode = classify_target(target_root_path, &files);
 
     run_restore_inner(conn, operation_id, &op, &files, total, mode,
@@ -1710,6 +1728,28 @@ pub(crate) mod tests {
 
     fn restore(conn: &Connection, op_id: i64, root: &Path, overwrite: bool, keep_zip: bool) -> RestoreOutcome {
         run_restore(conn, op_id, root, overwrite, keep_zip, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap()
+    }
+
+    #[test]
+    fn unarchive_refuses_a_zip_in_the_black_hole_until_it_is_restored() {
+        let (_arch, scan, conn, op_id, paths) = archived_lights(2);
+        let zip: String = conn
+            .query_row("SELECT target_zip_path FROM archive_operation_files WHERE operation_id = ?1 LIMIT 1", [op_id], |r| r.get(0))
+            .unwrap();
+        let bh = crate::db::add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+
+        let err = run_restore(&conn, op_id, scan.path(), false, true, &Arc::new(AtomicBool::new(false)), &NullEmitter)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is in the Black Hole \u{2014} restore it first"), "{err}");
+        assert!(err.contains(Path::new(&zip).file_name().unwrap().to_str().unwrap()), "{err}");
+        for p in &paths {
+            assert!(!p.exists(), "nothing was extracted");
+        }
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        let out = restore(&conn, op_id, scan.path(), false, true);
+        assert_eq!(out.extracted, 2);
     }
 
     #[test]

@@ -259,6 +259,16 @@ pub(crate) fn unpack_file_ids(
     };
     for (zip, rows) in by_zip {
         let zip_path = Path::new(&zip);
+        // A zip in the Black Hole stays present but its frames are not moved out until it is restored.
+        if crate::db::zip_is_in_black_hole(conn, &zip)? {
+            let why = crate::db::zip_in_black_hole_message(&zip);
+            tracing::warn!(zip_path = %zip, "zip unpack refused: zip is in the Black Hole");
+            for row in &rows {
+                conflict(&mut outcome, &row.entry, why.clone());
+            }
+            done += rows.len();
+            continue;
+        }
         let crcs = match zip_path.try_exists() {
             Ok(true) => match entry_crc32_map(zip_path) {
                 Ok(map) => Some(map),
@@ -581,6 +591,30 @@ mod tests {
 
     fn run(conn: &Connection, ids: &[i64], dest: &Path) -> UnpackOutcome {
         unpack_file_ids(conn, ids, dest, &NullEmitter, &AtomicBool::new(false)).unwrap()
+    }
+
+    #[test]
+    fn unpack_refuses_a_zip_in_the_black_hole_until_it_is_restored() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let zip_s = zip.to_string_lossy().into_owned();
+        let bh = crate::db::add_zip_to_black_hole(&conn, &zip_s, "files").unwrap();
+        let out = TempDir::new().unwrap();
+
+        let refused = run(&conn, &ids, out.path());
+        assert_eq!(refused.unpacked, 0);
+        assert_eq!(refused.conflicts.len(), 2);
+        assert!(
+            refused.conflicts.iter().all(|c| c.ends_with("night.zip is in the Black Hole \u{2014} restore it first")),
+            "{:?}",
+            refused.conflicts
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0, "nothing was written");
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        let ok = run(&conn, &ids, out.path());
+        assert_eq!(ok.unpacked, 2);
     }
 
     #[test]

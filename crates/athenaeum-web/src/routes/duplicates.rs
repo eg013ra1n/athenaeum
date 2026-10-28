@@ -250,6 +250,113 @@ pub async fn send_to_void(
     Ok(Json(()))
 }
 
+// ── Zips in the black hole ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveZipToBlackHoleArgs {
+    pub zip_path: String,
+    pub from_where: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdArgs {
+    pub id: i64,
+}
+
+/// Send a whole zip to the black hole (mirrors the Tauri `move_zip_to_black_hole`). The zip path is
+/// checked against the host's allowed roots; it must also be a zip the catalog knows.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn move_zip_to_black_hole(
+    State(state): State<WebAppState>,
+    Json(args): Json<MoveZipToBlackHoleArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let policy = crate::routes::scan_roots::allowed_roots_policy(&state.allowed_paths);
+    let zip = std::path::Path::new(&args.zip_path);
+    let candidate = zip.canonicalize().unwrap_or_else(|_| zip.to_path_buf());
+    policy.check(&candidate).map_err(crate::routes::api_err)?;
+
+    let ctx = state.ctx.clone();
+    let id = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        athenaeum_core::db::add_zip_to_black_hole(&conn, &args.zip_path, &args.from_where).map_err(db_err)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "zip_id": id, "action": "zip-blackholed" }),
+    });
+    Ok(Json(id))
+}
+
+/// List the zips currently in the black hole.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_black_hole_zips(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<athenaeum_core::db::BlackHoleZipEntry>>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        athenaeum_core::db::get_black_hole_zips(&conn).map_err(db_err)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+    Ok(Json(entries))
+}
+
+/// Restore a zip from the black hole (removes only its black-hole row).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn restore_zip_from_black_hole(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let id = args.id;
+    tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        athenaeum_core::db::restore_zip_from_black_hole(&conn, id).map_err(db_err)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "zip_id": id, "action": "zip-restored" }),
+    });
+    Ok(Json(()))
+}
+
+/// Permanently delete a zip in the black hole: every catalog row living in it, then the zip file.
+///
+/// WARNING: irreversible. Returns the number of catalog rows deleted.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn send_zip_to_void(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let id = args.id;
+    let rows = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        athenaeum_core::db::send_zip_to_void(&conn, id).map_err(db_err)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "zip_id": id, "action": "zip-voided" }),
+    });
+    Ok(Json(rows))
+}
+
 // ── Scan root flags ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

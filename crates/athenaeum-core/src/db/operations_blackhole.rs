@@ -4,7 +4,7 @@ use crate::events::{emit_event, ProgressEmitter};
 use crate::models::{BlackHoleEntry, BulkMoveResult, FolderSimilarity};
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -71,6 +71,45 @@ fn unregister_master_if_any(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The file name of a zip path, for messages.
+fn zip_display_name(zip: &str) -> String {
+    std::path::Path::new(zip)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| zip.to_string())
+}
+
+/// The refusal for a frame that lives inside a zip. Such a row is not a file of its own: a foreign row's
+/// `files.path` is virtual, and one of our rows keeps its ORIGINAL path, which may now hold a different
+/// capture. Only the whole zip goes to the Black Hole or the Void.
+fn zip_resident_refusal(zip: &str) -> String {
+    format!("this frame is inside {}; only the whole zip can be removed", zip_display_name(zip))
+}
+
+/// The zip a file row lives in (`files.archive_zip_path`), `None` for a disk file or an unknown id.
+fn zip_of_file(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+    let zip: Option<Option<String>> = conn
+        .query_row("SELECT archive_zip_path FROM files WHERE id = ?1", params![file_id], |r| r.get(0))
+        .optional()?;
+    Ok(zip.flatten())
+}
+
+/// Whether the zip at `zip_path` (a `zip_archives` path) sits in the Black Hole. A zip in the Black Hole
+/// is still present (its frames show and materialize reads them), but it cannot be unarchived or unpacked
+/// until it is restored.
+pub fn zip_is_in_black_hole(conn: &Connection, zip_path: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM black_hole_zips bz JOIN zip_archives z ON z.id = bz.zip_id WHERE z.path = ?1)",
+        params![zip_path],
+        |r| r.get(0),
+    )?)
+}
+
+/// The refusal for a zip that is in the Black Hole (Unarchive, unpack).
+pub fn zip_in_black_hole_message(zip_path: &str) -> String {
+    format!("{} is in the Black Hole \u{2014} restore it first", zip_display_name(zip_path))
+}
+
 /// Add a file to the black hole (soft delete).
 ///
 /// Idempotent: a `UNIQUE(file_id)` index guarantees one row per file, and
@@ -90,6 +129,12 @@ pub fn add_to_black_hole(
     from_where: &str,
     original_path: &str,
 ) -> Result<i64> {
+    if let Some(zip) = zip_of_file(conn, file_id)? {
+        let msg = zip_resident_refusal(&zip);
+        tracing::warn!(file_id, zip_path = %zip, "black hole refused a zip-resident frame");
+        anyhow::bail!(msg);
+    }
+
     // One atomic unit: the master-unregister sequence (6 statements, doc
     // contract: "runs in the CALLER's transaction") plus the black-hole
     // insert. Without this, a failure mid-unregister left the calibration
@@ -151,14 +196,14 @@ pub fn bulk_move_to_black_hole(
     let mut last_emit = Instant::now();
 
     for (idx, file_id) in file_ids.iter().enumerate() {
-        // Resolve the file's current path (for black_hole.original_path).
-        let path: rusqlite::Result<String> = conn.query_row(
-            "SELECT path FROM files WHERE id = ?1",
+        // Resolve the file's current path (for black_hole.original_path) and the zip it lives in.
+        let row: rusqlite::Result<(String, Option<String>)> = conn.query_row(
+            "SELECT path, archive_zip_path FROM files WHERE id = ?1",
             params![file_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         );
 
-        let path = match path {
+        let (path, zip) = match row {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(file_id, error = %e, "bulk_move_to_black_hole: file not found");
@@ -166,6 +211,13 @@ pub fn bulk_move_to_black_hole(
                 continue;
             }
         };
+
+        // A frame inside a zip is not a file of its own: refuse it, keep the batch going.
+        if let Some(zip) = zip {
+            tracing::warn!(file_id, zip_path = %zip, "bulk_move_to_black_hole: zip-resident frame refused");
+            failed.push((*file_id, zip_resident_refusal(&zip)));
+            continue;
+        }
 
         // Per-file savepoint: a file that fails mid-sequence (e.g. its
         // master-unregister dies on statement 4 of 6) must contribute ZERO
@@ -366,11 +418,19 @@ pub fn remove_from_black_hole(conn: &Connection, file_id: i64) -> Result<()> {
 /// (retention, the Void UI) can surface it but cannot undo it.
 pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     // Get file path before deletion
-    let path: String = conn.query_row(
-        "SELECT path FROM files WHERE id = ?1",
+    let (path, zip): (String, Option<String>) = conn.query_row(
+        "SELECT path, archive_zip_path FROM files WHERE id = ?1",
         params![file_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+
+    // A zip-resident row's `path` is virtual (foreign) or the ORIGINAL path of an archived frame, where a
+    // different capture may now sit: unlinking it would destroy a file this row does not describe.
+    if let Some(zip) = zip {
+        let msg = zip_resident_refusal(&zip);
+        tracing::warn!(file_id, zip_path = %zip, "send_to_void refused a zip-resident frame");
+        anyhow::bail!(msg);
+    }
 
     // Catalog first, disk second (same stance as api::masters::delete_master):
     // the benign crash leftover is an orphan file on disk — which a later
@@ -396,6 +456,132 @@ pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One zip in the Black Hole, for the Black Hole page.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BlackHoleZipEntry {
+    /// The `black_hole_zips` row id (what restore and Void take).
+    pub id: i64,
+    /// The zip's CURRENT path (`zip_archives.path`, which follows a rename).
+    pub zip_path: String,
+    pub size: i64,
+    /// Frame entries the catalog holds for this zip.
+    pub frame_entries: i64,
+    /// The Move and ZIP operation that wrote this zip, when it is one of ours.
+    pub archive_operation_id: Option<i64>,
+    pub from_where: String,
+    pub moved_at: String,
+}
+
+/// Send a whole zip to the Black Hole (soft delete). Everything is keyed on `zip_archives.id`;
+/// `black_hole_zips.original_path` is written for display history only and is never read for logic (it does
+/// not follow a rename).
+///
+/// The zip must be a catalog zip (a `zip_archives` row), else this is an error. Adding a zip twice is an
+/// idempotent no-op that returns the existing row id (the first `from_where` is kept).
+///
+/// The zip stays PRESENT, like a file in the Black Hole: its frames keep showing and `materialize` still
+/// reads them. Unarchive and unpack refuse it until it is restored.
+pub fn add_zip_to_black_hole(conn: &Connection, zip_path: &str, from_where: &str) -> Result<i64> {
+    let zip_id: Option<i64> = conn
+        .query_row("SELECT id FROM zip_archives WHERE path = ?1", params![zip_path], |r| r.get(0))
+        .optional()?;
+    let Some(zip_id) = zip_id else {
+        tracing::warn!(zip_path, "black hole refused an unknown zip");
+        anyhow::bail!("{} is not a zip in the catalog", zip_display_name(zip_path));
+    };
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO black_hole_zips (zip_id, from_where, moved_at, original_path)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![zip_id, from_where, now, zip_path],
+    )?;
+    Ok(conn.query_row("SELECT id FROM black_hole_zips WHERE zip_id = ?1", params![zip_id], |r| r.get(0))?)
+}
+
+/// The zips in the Black Hole, newest first. A zip whose stored size is the retry sentinel (0) shows its
+/// live size when it can be statted.
+pub fn get_black_hole_zips(conn: &Connection) -> Result<Vec<BlackHoleZipEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT bz.id, z.path, z.size, z.frame_entries, z.created_by_operation, bz.from_where, bz.moved_at
+         FROM black_hole_zips bz JOIN zip_archives z ON z.id = bz.zip_id
+         ORDER BY bz.moved_at DESC, bz.id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(BlackHoleZipEntry {
+            id: r.get(0)?,
+            zip_path: r.get(1)?,
+            size: r.get(2)?,
+            frame_entries: r.get(3)?,
+            archive_operation_id: r.get(4)?,
+            from_where: r.get(5)?,
+            moved_at: r.get(6)?,
+        })
+    })?;
+    let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+    for e in &mut out {
+        if e.size <= 0 {
+            if let Ok(meta) = std::fs::metadata(&e.zip_path) {
+                e.size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Take a zip out of the Black Hole. Removes only the `black_hole_zips` row; idempotent.
+pub fn restore_zip_from_black_hole(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM black_hole_zips WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Permanently delete a zip in the Black Hole (Send to Void): every catalog row living in it (foreign AND
+/// ours), the `zip_archives` row (cascading its released entries and the Black Hole row), then the zip file.
+/// Returns the number of `files` rows deleted.
+///
+/// Catalog first, disk second, like [`send_to_void`]: one savepoint holds `unregister_master_if_any` per
+/// row, the rows' own Black Hole entries, the `files` deletes and the `zip_archives` delete. After the
+/// commit the zip file is removed if it exists; an unlink failure arrives with the catalog already gone,
+/// is logged at `error!` and returned. Only the zip is unlinked — never the original path of one of our
+/// rows, which may hold a different capture now.
+pub fn send_zip_to_void(conn: &Connection, id: i64) -> Result<usize> {
+    let found: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT z.id, z.path FROM black_hole_zips bz JOIN zip_archives z ON z.id = bz.zip_id WHERE bz.id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((zip_id, zip_path)) = found else {
+        anyhow::bail!("zip {id} is not in the Black Hole");
+    };
+
+    let sp = crate::db::SavepointGuard::new(conn, "send_zip_to_void")?;
+    let file_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM files WHERE archive_zip_path = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![zip_path], |r| r.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for file_id in &file_ids {
+        unregister_master_if_any(conn, *file_id)?;
+        conn.execute("DELETE FROM black_hole WHERE file_id = ?1", params![file_id])?;
+        // files delete cascades to frames, frame_tags, etc.
+        conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    }
+    conn.execute("DELETE FROM zip_archives WHERE id = ?1", params![zip_id])?;
+    sp.commit()?;
+
+    if std::path::Path::new(&zip_path).exists() {
+        if let Err(e) = std::fs::remove_file(&zip_path) {
+            tracing::error!(zip_path = %zip_path, error = %e,
+                "send_zip_to_void: catalog rows removed but the zip could not be deleted; it remains on disk");
+            return Err(e.into());
+        }
+    }
+    tracing::info!(zip_path = %zip_path, rows = file_ids.len(), "zip sent to void");
+    Ok(file_ids.len())
 }
 
 /// Find folders with high similarity (many duplicate files)
@@ -1438,5 +1624,198 @@ mod tests {
             sims.is_empty(),
             "a processed folder is not a copy of its source, got {sims:#?}"
         );
+    }
+
+    // ── zips in the Black Hole ───────────────────────────────────────────────
+
+    use crate::archive::models::ArchiveCompression;
+    use crate::zip_store::scan::scan_zip;
+    use crate::zip_store::scan::test_support::{light, make_zip};
+    use tempfile::TempDir;
+
+    fn zip_catalog(root: &std::path::Path) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+        conn
+    }
+
+    /// Scans a two-light zip named `name` into `conn`; returns its path string.
+    fn scanned_zip(conn: &Connection, dir: &std::path::Path, name: &str, seed: u32) -> String {
+        let zip = make_zip(
+            dir,
+            name,
+            &[("Lights/L_001.fits", light(seed)), ("Lights/L_002.fits", light(seed + 1))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(conn, &zip, 1, false).unwrap();
+        zip.to_string_lossy().into_owned()
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn file_ids_in(conn: &Connection, zip: &str) -> Vec<i64> {
+        conn.prepare("SELECT id FROM files WHERE archive_zip_path = ?1 ORDER BY id")
+            .unwrap()
+            .query_map([zip], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn single_zip_resident_row_is_refused_by_black_hole() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let id = file_ids_in(&conn, &zip)[0];
+        let err = add_to_black_hole(&conn, id, "light", "/x").unwrap_err().to_string();
+        assert_eq!(err, "this frame is inside night.zip; only the whole zip can be removed");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole"), 0);
+    }
+
+    #[test]
+    fn bulk_move_reports_zip_rows_as_failures_and_moves_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (900, '/tmp/plain.fits', 'plain.fits', 10, '2024-01-01T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let zipped = file_ids_in(&conn, &zip);
+        let result = bulk_move_to_black_hole(&conn, &[zipped[0], 900, zipped[1]], "duplicates", None).unwrap();
+        assert_eq!(result.moved, 1);
+        assert_eq!(result.failed.len(), 2);
+        for (_, why) in &result.failed {
+            assert_eq!(why, "this frame is inside night.zip; only the whole zip can be removed");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole WHERE file_id = 900"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole"), 1);
+    }
+
+    #[test]
+    fn send_to_void_never_unlinks_the_original_path_of_a_zip_resident_row() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let id = file_ids_in(&conn, &zip)[0];
+        // One of OUR rows: files.path is the original path, where a different capture now sits.
+        let original = tmp.path().join("L_001.fits");
+        std::fs::write(&original, b"a different capture").unwrap();
+        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![original.to_str().unwrap(), id]).unwrap();
+        let err = send_to_void(&conn, id).unwrap_err().to_string();
+        assert!(err.contains("only the whole zip can be removed"), "{err}");
+        assert_eq!(std::fs::read(&original).unwrap(), b"a different capture");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM files WHERE id = {id}")), 1);
+    }
+
+    #[test]
+    fn zip_goes_to_the_black_hole_stays_present_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let frames_before = count(&conn, "SELECT COUNT(*) FROM frames");
+
+        let id = add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        assert_eq!(add_zip_to_black_hole(&conn, &zip, "other").unwrap(), id, "adding twice returns the same row");
+        assert!(zip_is_in_black_hole(&conn, &zip).unwrap());
+
+        // Ruling 2: presence. Frames and rows stay; nothing is flagged as black-holed per file.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), frames_before);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole_zips"), 1);
+
+        let listed = get_black_hole_zips(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].zip_path, zip);
+        assert_eq!(listed[0].frame_entries, 2);
+        assert_eq!(listed[0].from_where, "files", "the first from_where is kept");
+        assert!(listed[0].size > 0);
+    }
+
+    #[test]
+    fn unknown_zip_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let err = add_zip_to_black_hole(&conn, "/nowhere/ghost.zip", "files").unwrap_err().to_string();
+        assert_eq!(err, "ghost.zip is not a zip in the catalog");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole_zips"), 0);
+    }
+
+    #[test]
+    fn zip_follows_a_rename_because_it_is_keyed_on_zip_id() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        let renamed = tmp.path().join("renamed.zip").to_string_lossy().into_owned();
+        crate::zip_store::catalog::rename_zip(&conn, &zip, &renamed).unwrap();
+        assert!(zip_is_in_black_hole(&conn, &renamed).unwrap());
+        assert!(!zip_is_in_black_hole(&conn, &zip).unwrap());
+        assert_eq!(get_black_hole_zips(&conn).unwrap()[0].zip_path, renamed);
+    }
+
+    #[test]
+    fn restore_of_a_zip_from_black_hole_removes_only_the_black_hole_row() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let id = add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        let rows = count(&conn, "SELECT COUNT(*) FROM files");
+        restore_zip_from_black_hole(&conn, id).unwrap();
+        restore_zip_from_black_hole(&conn, id).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole_zips"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), rows);
+        assert!(std::path::Path::new(&zip).exists());
+        assert!(!zip_is_in_black_hole(&conn, &zip).unwrap());
+    }
+
+    #[test]
+    fn void_of_a_zip_deletes_the_zip_and_all_its_rows() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let sibling = scanned_zip(&conn, tmp.path(), "other.zip", 10);
+
+        // One of OUR rows: its original path holds a different capture that must survive.
+        let ours = file_ids_in(&conn, &zip)[0];
+        let original = tmp.path().join("L_001.fits");
+        std::fs::write(&original, b"a different capture").unwrap();
+        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![original.to_str().unwrap(), ours]).unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) SELECT id, 'Lights/L_001.fits' FROM zip_archives WHERE path = ?1", [&zip]).unwrap();
+
+        let id = add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        let sibling_rows = file_ids_in(&conn, &sibling);
+        assert_eq!(send_zip_to_void(&conn, id).unwrap(), 2);
+
+        assert!(!std::path::Path::new(&zip).exists(), "the zip file is gone");
+        assert!(file_ids_in(&conn, &zip).is_empty());
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM zip_archives WHERE path = '{zip}'")), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole_zips"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+        assert_eq!(std::fs::read(&original).unwrap(), b"a different capture", "an original path is never unlinked");
+
+        assert!(std::path::Path::new(&sibling).exists(), "a sibling zip is untouched");
+        assert_eq!(file_ids_in(&conn, &sibling), sibling_rows);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2);
+    }
+
+    #[test]
+    fn void_of_a_zip_not_in_the_black_hole_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let err = send_zip_to_void(&conn, 77).unwrap_err().to_string();
+        assert!(err.contains("not in the Black Hole"), "{err}");
+        assert!(std::path::Path::new(&zip).exists());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
     }
 }

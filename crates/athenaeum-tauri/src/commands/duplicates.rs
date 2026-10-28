@@ -146,6 +146,98 @@ pub async fn send_to_void(file_id: i64, state: State<'_, AppState>) -> Result<()
     db::send_to_void(&conn, file_id).map_err(|e| e.to_string())
 }
 
+/// Send a whole zip to the Black Hole. The zip stays present (its frames keep showing); Unarchive and
+/// unpack refuse it until it is restored. Returns the Black Hole row id.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn move_zip_to_black_hole(
+    zip_path: String,
+    from_where: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<i64, String> {
+    let ctx = state.ctx.clone();
+    let id = tokio::task::spawn_blocking(move || {
+        // AllowAll on the desktop host; the path must be a catalog zip, which the db function checks.
+        let db = ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        db::add_zip_to_black_hole(&conn, &zip_path, &from_where).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Black Hole task panicked: {}", e))??;
+
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "zip_id": id,
+        "action": "zip-blackholed"
+    }));
+    Ok(id)
+}
+
+/// Get all zips in the black hole
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_black_hole_zips(
+    state: State<'_, AppState>,
+) -> Result<Vec<db::BlackHoleZipEntry>, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        db::get_black_hole_zips(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Black Hole task panicked: {}", e))?
+}
+
+/// Restore a zip from the black hole (removes only its Black Hole row)
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn restore_zip_from_black_hole(
+    id: i64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        db::restore_zip_from_black_hole(&conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Black Hole task panicked: {}", e))??;
+
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "zip_id": id,
+        "action": "zip-restored"
+    }));
+    Ok(())
+}
+
+/// Permanently delete a zip in the Black Hole: every catalog row living in it, then the zip file.
+/// Returns the number of catalog rows deleted.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn send_zip_to_void(
+    id: i64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<usize, String> {
+    let ctx = state.ctx.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        db::send_zip_to_void(&conn, id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Black Hole task panicked: {}", e))??;
+
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "zip_id": id,
+        "action": "zip-voided"
+    }));
+    Ok(rows)
+}
+
 /// Get folders with high duplicate file similarity
 /// Always computes fresh since folder similarity depends on current file state
 /// and can't easily filter out black_hole files from cached data
