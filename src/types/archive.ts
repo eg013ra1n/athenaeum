@@ -1,6 +1,8 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+import type { FileWithFrame } from './models';
+
 export type ArchiveDisposition = "move" | "copy" | "skip";
 
 export type ArchiveCompression = "store" | "deflate";
@@ -56,4 +58,32 @@ unpacked: number,
  * Frames whose identical file was already at the target; nothing was written.
  */
 adopted: number, conflicts: Array<string>, };
+
+export type ZipListItem = { path: string, size: number, 
+/**
+ * Frame entries the catalog holds for this zip.
+ */
+frameEntries: number, };
+
+export type ZipDirListing = { 
+/**
+ * Sub-folders of the listed folder, each as the full entry path of the folder (`/`-separated, no leading
+ * or trailing `/`): pass one back as the inner folder to open it.
+ */
+subdirectories: Array<string>, 
+/**
+ * Cataloged frames at this level, with their frame metadata.
+ */
+files: Array<FileWithFrame>, 
+/**
+ * Entries at this level the catalog does not hold as frames (other files, names the scan skipped,
+ * names that are unsafe to unpack). They are listed by name and size only; nothing opens them.
+ */
+otherEntries: Array<ZipOtherEntry>, };
+
+export type ZipOtherEntry = { 
+/**
+ * The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
+ */
+name: string, size: number, };
 

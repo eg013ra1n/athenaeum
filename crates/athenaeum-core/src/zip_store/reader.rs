@@ -196,6 +196,29 @@ pub fn list_entry_names(zip: &Path) -> Result<HashSet<String>> {
     Ok(names)
 }
 
+/// Every non-directory entry of the zip's central directory with its uncompressed size, in directory order,
+/// unfiltered like [`list_entry_names`] (the first entry wins when a name repeats). The browser's tree of a
+/// zip is built from this: it must show the names our own Move and ZIP writes (`:`, trailing space, device
+/// names) and the names a hostile zip carries, and it never opens any of them.
+pub fn list_raw_entries(zip: &Path) -> Result<Vec<(String, u64)>> {
+    let (mut archive, _) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let mut seen = HashSet::with_capacity(archive.len());
+    let mut out = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let Some(name) = archive.name_for_index(index).map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with('/') || name.ends_with('\\') || !seen.insert(name.clone()) {
+            continue;
+        }
+        let file = archive.by_index_raw(index).with_context(|| format!("open entry {name} of {}", zip.display()))?;
+        if !file.is_dir() {
+            out.push((name, file.size()));
+        }
+    }
+    Ok(out)
+}
+
 /// The CRC32 the zip's directory records for `entry` (a decoded name, unfiltered like
 /// [`list_entry_names`]); `None` when the zip holds no such entry. Reads the directory only.
 pub fn entry_crc32(zip: &Path, entry: &str) -> Result<Option<u32>> {

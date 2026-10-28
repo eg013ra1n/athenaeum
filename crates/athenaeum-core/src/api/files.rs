@@ -35,6 +35,9 @@ use crate::services::ServiceContext;
 pub struct DirectoryContents {
     pub subdirectories: Vec<String>,
     pub files: Vec<FileWithFrame>,
+    /// Zip files directly in the directory that hold cataloged frames. A zip is one item in the browser;
+    /// `list_zip_entries` opens it.
+    pub zips: Vec<crate::zip_store::catalog::ZipListItem>,
 }
 
 /// One catalog search hit. Returns enough data for the UI to navigate the
@@ -291,9 +294,15 @@ pub fn get_directory_contents(
 
     subdirectories.sort();
 
+    let zips = crate::zip_store::catalog::zips_in_directory(&conn, &directory_path, None).map_err(|e| {
+        tracing::error!(path = %directory_path, error = %e, "zip listing failed");
+        ApiError::Internal(format!("Could not list zips: {e}"))
+    })?;
+
     Ok(DirectoryContents {
         subdirectories,
         files: files_in_dir,
+        zips,
     })
 }
 
@@ -506,9 +515,15 @@ pub fn get_camera_directory_contents(
 
     subdirectories.sort();
 
+    let zips = crate::zip_store::catalog::zips_in_directory(&conn, &directory_path, Some(instrume.as_str())).map_err(|e| {
+        tracing::error!(path = %directory_path, error = %e, "zip listing failed");
+        ApiError::Internal(format!("Could not list zips: {e}"))
+    })?;
+
     Ok(DirectoryContents {
         subdirectories,
         files: files_in_dir,
+        zips,
     })
 }
 
@@ -952,29 +967,54 @@ pub fn rename_path(
     }
 
     let is_dir = old.is_dir();
+    let old_str = old.to_string_lossy().to_string();
+    let new_str = new.to_string_lossy().to_string();
+    // A zip's catalog row at the new name (a zip deleted outside the app, never rescanned) would make the
+    // hot-sync fail after the file was already renamed; refuse before touching the disk.
+    if !is_dir && crate::zip_store::catalog::is_known_zip(&conn, &old_str).map_err(zip_catalog_err)? {
+        let taken = !is_same_file_case_variant(&old, &new)
+            && crate::zip_store::catalog::is_known_zip(&conn, &new_str).map_err(zip_catalog_err)?;
+        if taken {
+            return Err(ApiError::Conflict(format!(
+                "the catalog already holds a zip named {}",
+                new.display()
+            )));
+        }
+    }
     std::fs::rename(&old, &new).map_err(|e| {
         tracing::error!(src = %old.display(), dest = %new.display(), error = %e, "rename failed");
         ApiError::Internal(e.to_string())
     })?;
 
-    // Hot-sync catalog rows. Fatal on failure — see RULE-2 FLAG doc above.
-    let old_str = old.to_string_lossy().to_string();
-    let new_str = new.to_string_lossy().to_string();
+    // Hot-sync catalog rows. Fatal on failure — see RULE-2 FLAG doc above. One transaction, so a zip's rows
+    // and its frames' virtual paths never end up half renamed.
+    let tx = conn.unchecked_transaction()?;
     if is_dir {
         // Recursively rewire every catalog row under the renamed folder via
         // the SUBSTR-based prefix swap (REPLACE is unsafe — see
         // `rename_files_path_prefix` doc).
         let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
-        let updated = crate::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new)?;
-        tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
+        let updated = crate::db::rename_files_path_prefix(&tx, &prefix_old, &prefix_new)?;
+        // The swap above already moved the virtual paths of the frames inside zips; the zips' own rows and
+        // markers follow here, and a virtual path is rewritten only where it still has the old spelling.
+        let zips = crate::zip_store::catalog::rename_zip_prefix(&tx, &prefix_old, &prefix_new).map_err(zip_catalog_err)?;
+        tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
     } else {
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
             rusqlite::params![&new_str, &new_name, &old_str],
         )?;
-        tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
+        let zips = crate::zip_store::catalog::rename_zip(&tx, &old_str, &new_str).map_err(zip_catalog_err)?;
+        tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
     }
+    tx.commit()?;
     Ok(())
+}
+
+/// A zip bookkeeping failure at an API boundary: logged, then surfaced.
+fn zip_catalog_err(e: anyhow::Error) -> ApiError {
+    tracing::error!(error = %e, "zip catalog update failed");
+    ApiError::Internal(format!("Zip catalog update failed: {e}"))
 }
 
 /// Web-only: no Tauri command by this name (desktop uses a native
@@ -1612,5 +1652,194 @@ mod verify_pair_tests {
         std::fs::remove_file(tmp.path().join("astro").join("night.zip")).unwrap();
         let err = super::verify_duplicate_pair(&ctx, disk, zipped).unwrap_err().to_string();
         assert!(err.contains("not reachable"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod zip_whole_file_tests {
+    use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+
+    use super::*;
+    use crate::archive::models::ArchiveCompression;
+    use crate::zip_store::presence::{row_is_present, ZipPresence};
+    use crate::zip_store::scan::scan_zip;
+    use crate::zip_store::scan::test_support::{light, make_zip};
+    use crate::zip_store::test_support::{zip_files, Shape};
+
+    /// A context whose catalog has one scan root, `<tmp>/astro`.
+    fn fixture() -> (tempfile::TempDir, ServiceContext, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        ctx.db
+            .get()
+            .unwrap()
+            .conn()
+            .execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()])
+            .unwrap();
+        (tmp, ctx, root)
+    }
+
+    fn scan_into(ctx: &ServiceContext, dir: &Path, name: &str, seed: u32) -> PathBuf {
+        let zip = make_zip(
+            dir,
+            name,
+            &[("Lights/L_001.fits", light(seed)), ("Lights/L_002.fits", light(seed + 1))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&ctx.db.get().unwrap().conn(), &zip, 1, false).unwrap();
+        zip
+    }
+
+    /// `(path, archive_zip_path, archive_path_in_zip, present)` of every row, by path.
+    fn rows(ctx: &ServiceContext) -> Vec<(String, Option<String>, Option<String>, bool)> {
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        let raw: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT path, archive_zip_path, archive_path_in_zip FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut presence = ZipPresence::new();
+        raw.into_iter()
+            .map(|(p, z, e)| {
+                let present = row_is_present(&mut presence, &p, z.as_deref(), e.as_deref());
+                (p, z, e, present)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn directory_listing_shows_zips_with_frames_only() {
+        let (_tmp, ctx, root) = fixture();
+        let zip = scan_into(&ctx, &root, "night.zip", 1);
+        // A zip holding no frame (a plain archive of notes) is not a catalog item.
+        let notes = make_zip(&root, "notes.zip", &[("readme.txt", b"hi".to_vec())], ArchiveCompression::Store);
+        scan_zip(&ctx.db.get().unwrap().conn(), &notes, 1, false).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        scan_into(&ctx, &sub, "deeper.zip", 10);
+
+        let top = get_directory_contents(&ctx, root.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(top.zips.len(), 1, "{:?}", top.zips);
+        assert_eq!(top.zips[0].path, zip.to_string_lossy());
+        assert_eq!(top.zips[0].frame_entries, 2);
+        assert_eq!(top.zips[0].size, std::fs::metadata(&zip).unwrap().len() as i64);
+        assert!(top.files.is_empty(), "the frames inside the zip are not entries of the folder");
+        assert_eq!(top.subdirectories, vec![sub.to_string_lossy().into_owned()]);
+
+        let inner = get_directory_contents(&ctx, sub.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(inner.zips.len(), 1);
+
+        let by_camera = get_camera_directory_contents(
+            &ctx,
+            root.to_string_lossy().into_owned(),
+            "C".into(),
+            vec![sub.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(by_camera.zips.len(), 1);
+        let other_camera = get_camera_directory_contents(&ctx, root.to_string_lossy().into_owned(), "Zzz".into(), vec![]).unwrap();
+        assert!(other_camera.zips.is_empty());
+    }
+
+    #[test]
+    fn renaming_a_zip_keeps_its_frames_present() {
+        let (_tmp, ctx, root) = fixture();
+        let zip = scan_into(&ctx, &root, "night.zip", 1);
+        assert!(rows(&ctx).iter().all(|r| r.3));
+
+        rename_path(&ctx, zip.to_string_lossy().into_owned(), "renamed.zip".into(), &PathPolicy::AllowAll).unwrap();
+
+        let new_zip = root.join("renamed.zip").to_string_lossy().into_owned();
+        let after = rows(&ctx);
+        assert_eq!(after.len(), 2);
+        for (path, zip_col, _entry, present) in &after {
+            assert!(path.starts_with(&format!("{new_zip}{MAIN_SEPARATOR}")), "{path}");
+            assert_eq!(zip_col.as_deref(), Some(new_zip.as_str()));
+            assert!(present, "{path} must still be present");
+        }
+        let listed = get_directory_contents(&ctx, root.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(listed.zips.len(), 1);
+        assert_eq!(listed.zips[0].path, new_zip);
+    }
+
+    #[test]
+    fn renaming_a_zip_onto_a_catalog_row_without_a_file_is_refused_before_the_disk_moves() {
+        let (_tmp, ctx, root) = fixture();
+        let a = scan_into(&ctx, &root, "a.zip", 1);
+        let b = scan_into(&ctx, &root, "b.zip", 10);
+        std::fs::remove_file(&b).unwrap();
+        let err = rename_path(&ctx, a.to_string_lossy().into_owned(), "b.zip".into(), &PathPolicy::AllowAll).unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err}");
+        assert!(a.exists(), "the file was not renamed");
+        assert!(rows(&ctx).iter().filter(|r| r.0.contains("a.zip")).all(|r| r.3));
+    }
+
+    #[test]
+    fn renaming_a_folder_moves_foreign_and_our_zip_paths() {
+        let (_tmp, ctx, root) = fixture();
+        let old_dir = root.join("Old");
+        std::fs::create_dir(&old_dir).unwrap();
+        let foreign = scan_into(&ctx, &old_dir, "foreign.zip", 1);
+
+        // One of our zips: a disk frame in Old/, zipped by Move and ZIP (the row keeps its original path).
+        let original = old_dir.join("ours_L.fits");
+        std::fs::write(&original, light(50)).unwrap();
+        let ours = old_dir.join("ours.zip");
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, ?1, 'ours_L.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                [original.to_str().unwrap()],
+            )
+            .unwrap();
+            zip_files(&conn, &[900], &ours, Shape::Own { operation: 4 });
+            conn.execute(
+                "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+                 VALUES (?1, ?2, 't', 1, 't')",
+                rusqlite::params![ours.to_str().unwrap(), std::fs::metadata(&ours).unwrap().len() as i64],
+            )
+            .unwrap();
+        }
+
+        rename_path(&ctx, old_dir.to_string_lossy().into_owned(), "New".into(), &PathPolicy::AllowAll).unwrap();
+
+        let new_dir = root.join("New");
+        let new_foreign = new_dir.join("foreign.zip").to_string_lossy().into_owned();
+        let new_ours = new_dir.join("ours.zip").to_string_lossy().into_owned();
+        let after = rows(&ctx);
+        let sep = MAIN_SEPARATOR;
+        // Foreign rows: virtual path under the new zip, exactly once.
+        for entry in ["L_001.fits", "L_002.fits"] {
+            let want = format!("{new_foreign}{sep}Lights{sep}{entry}");
+            let row = after.iter().find(|r| r.0 == want).unwrap_or_else(|| panic!("{want} missing in {after:?}"));
+            assert_eq!(row.1.as_deref(), Some(new_foreign.as_str()));
+            assert!(row.3);
+        }
+        // Our row: files.path follows the folder as before, archive_zip_path follows the zip.
+        let want_path = new_dir.join("ours_L.fits").to_string_lossy().into_owned();
+        let row = after.iter().find(|r| r.0 == want_path).unwrap_or_else(|| panic!("{want_path} missing in {after:?}"));
+        assert_eq!(row.1.as_deref(), Some(new_ours.as_str()));
+        assert!(row.3, "our row is present: its entry is in the renamed zip");
+        assert_eq!(after.len(), 3, "no row doubled or lost: {after:?}");
+        assert!(!after.iter().any(|r| r.0.contains("NewNew") || r.0.matches("foreign.zip").count() > 1), "{after:?}");
+
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        let conn_zips: Vec<String> = conn
+            .prepare("SELECT path FROM zip_archives ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(conn_zips, vec![new_foreign, new_ours]);
+        assert!(foreign.parent().unwrap().ends_with("Old"), "the fixture zip lived in Old");
     }
 }

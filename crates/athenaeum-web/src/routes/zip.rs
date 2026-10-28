@@ -16,7 +16,7 @@ use crate::routes::api_err;
 use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget};
+pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,4 +51,31 @@ pub async fn unpack_zip_frames(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unpack task panicked: {}", e)))?
     .map_err(api_err)?;
     Ok(Json(outcome))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListZipEntriesArgs {
+    pub zip_path: String,
+    #[serde(default)]
+    pub inner_dir: String,
+}
+
+/// POST /api/list_zip_entries
+///
+/// The zip path is checked against the host's allowed roots inside the shared handler; the zip's directory
+/// is read under `spawn_blocking`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_zip_entries(
+    State(state): State<WebAppState>,
+    Json(args): Json<ListZipEntriesArgs>,
+) -> Result<Json<ZipDirListing>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let listing =
+        tokio::task::spawn_blocking(move || api::list_zip_entries(&ctx, &policy, &args.zip_path, &args.inner_dir))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip listing task panicked: {}", e)))?
+            .map_err(api_err)?;
+    Ok(Json(listing))
 }

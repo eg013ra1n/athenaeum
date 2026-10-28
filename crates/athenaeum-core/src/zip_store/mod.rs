@@ -6,6 +6,7 @@
 //! without ever replacing a file. Zips are read-only here.
 
 pub mod cache;
+pub mod catalog;
 pub mod materialize;
 pub mod place;
 pub mod presence;

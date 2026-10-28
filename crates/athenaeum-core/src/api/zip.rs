@@ -18,7 +18,7 @@ use crate::api::{db, ApiError, PathPolicy};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::services::ServiceContext;
 use crate::zip_store::place::{place_entry, record_released_entry, PlaceOutcome};
-use crate::zip_store::reader::{entry_crc32_map, is_safe_entry_name};
+use crate::zip_store::reader::{entry_crc32_map, is_safe_entry_name, list_raw_entries};
 
 /// The set whose zip-resident frames are unpacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -402,6 +402,121 @@ fn repoint_row(conn: &Connection, row: &ZipRow, dest: &Path) -> anyhow::Result<b
     Ok(true)
 }
 
+/// One level of a zip, for the browser's zip view.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ZipDirListing {
+    /// Sub-folders of the listed folder, each as the full entry path of the folder (`/`-separated, no leading
+    /// or trailing `/`): pass one back as the inner folder to open it.
+    pub subdirectories: Vec<String>,
+    /// Cataloged frames at this level, with their frame metadata.
+    pub files: Vec<crate::models::FileWithFrame>,
+    /// Entries at this level the catalog does not hold as frames (other files, names the scan skipped,
+    /// names that are unsafe to unpack). They are listed by name and size only; nothing opens them.
+    pub other_entries: Vec<ZipOtherEntry>,
+}
+
+/// An entry of a zip that is not a cataloged frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ZipOtherEntry {
+    /// The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
+    pub name: String,
+    pub size: i64,
+}
+
+/// `true` for a stored name that cannot be placed in a tree: absolute, or with a `..` component.
+fn is_untreeable_name(name: &str) -> bool {
+    name.starts_with('/') || name.starts_with('\\') || name.split(['/', '\\']).any(|c| c == "..")
+}
+
+/// Lists one level of `zip_path` under `inner_dir` (`""` is the top).
+///
+/// The tree comes from the zip's central directory, read live and unfiltered ([`list_raw_entries`]), so the
+/// names our own Move and ZIP writes (`:`, trailing space, device names) appear like any other. Catalog rows
+/// are joined by the entry they were cataloged under (`archive_zip_path` + `archive_path_in_zip`, ours and
+/// foreign) or by the virtual path under the zip. A zip is a whole file in the browser: this reads the
+/// directory and never opens or modifies an entry.
+pub fn list_zip_entries(
+    ctx: &ServiceContext,
+    policy: &PathPolicy,
+    zip_path: &str,
+    inner_dir: &str,
+) -> Result<ZipDirListing, ApiError> {
+    let zip = Path::new(zip_path);
+    let candidate = zip.canonicalize().unwrap_or_else(|_| zip.to_path_buf());
+    policy.check(&candidate)?;
+
+    // The zip is read before the catalog lock is taken: a share can be slow.
+    let raw = match list_raw_entries(zip) {
+        Ok(raw) => raw,
+        Err(e) if !zip.exists() => {
+            tracing::warn!(zip_path, error = %e, "zip listing: the zip is not reachable");
+            return Err(ApiError::NotFound(format!("{zip_path} is not reachable")));
+        }
+        Err(e) => {
+            tracing::error!(zip_path, error = %e, "zip listing failed");
+            return Err(ApiError::Internal(format!("Could not read {zip_path}: {e:#}")));
+        }
+    };
+    let rows = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        crate::zip_store::catalog::rows_of_zip(&conn, zip_path).map_err(|e| {
+            tracing::error!(zip_path, error = %e, "zip listing: catalog read failed");
+            ApiError::Internal(format!("Could not read the catalog rows of {zip_path}: {e:#}"))
+        })?
+    };
+
+    // Entry path -> row.
+    let virtual_prefix = format!("{zip_path}{}", std::path::MAIN_SEPARATOR);
+    let mut by_entry: BTreeMap<String, crate::models::FileWithFrame> = BTreeMap::new();
+    for (file, frame) in rows {
+        let entry = match (file.archive_zip_path.as_deref(), file.archive_path_in_zip.as_deref()) {
+            (Some(z), Some(e)) if z == zip_path => e.to_string(),
+            _ => match file.path.strip_prefix(&virtual_prefix) {
+                Some(rest) => rest.replace(std::path::MAIN_SEPARATOR, "/"),
+                None => continue,
+            },
+        };
+        by_entry.entry(entry).or_insert(crate::models::FileWithFrame { file, frame });
+    }
+
+    let inner = inner_dir.replace('\\', "/").split('/').filter(|c| !c.is_empty()).collect::<Vec<_>>().join("/");
+    let prefix = if inner.is_empty() { String::new() } else { format!("{inner}/") };
+
+    let mut subdirectories: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+    let mut other_entries = Vec::new();
+    let to_i64 = |size: u64| i64::try_from(size).unwrap_or(i64::MAX);
+    for (name, size) in raw {
+        if is_untreeable_name(&name) {
+            if inner.is_empty() {
+                other_entries.push(ZipOtherEntry { name, size: to_i64(size) });
+            }
+            continue;
+        }
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        if rest.is_empty() {
+            continue;
+        }
+        match rest.split_once('/') {
+            Some((first, _)) if !first.is_empty() => {
+                subdirectories.insert(format!("{prefix}{first}"));
+            }
+            // "a//b": an empty folder name has no folder to open.
+            Some(_) => other_entries.push(ZipOtherEntry { name: rest.to_string(), size: to_i64(size) }),
+            None => match by_entry.remove(&name) {
+                Some(row) => files.push(row),
+                None => other_entries.push(ZipOtherEntry { name: rest.to_string(), size: to_i64(size) }),
+            },
+        }
+    }
+    files.sort_by(|a, b| a.file.filename.cmp(&b.file.filename));
+    other_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ZipDirListing { subdirectories: subdirectories.into_iter().collect(), files, other_entries })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +768,111 @@ mod tests {
         assert!(check_dest_dir(&allowed.path().join("new"), &policy).is_ok());
         assert!(matches!(check_dest_dir(elsewhere.path(), &policy), Err(ApiError::Forbidden(_))));
         assert!(matches!(check_dest_dir(Path::new("relative/dir"), &PathPolicy::AllowAll), Err(ApiError::Invalid(_))));
+    }
+
+    /// A catalog with a scan root and one zip scanned into it; the context owns the catalog file.
+    fn listing_fixture(entries: &[(&str, Vec<u8>)]) -> (TempDir, ServiceContext, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let zip = make_zip(&root, "night.zip", entries, ArchiveCompression::Store);
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+            scan_zip(&conn, &zip, 1, false).unwrap();
+        }
+        (tmp, ctx, zip)
+    }
+
+    #[test]
+    fn list_zip_entries_returns_one_level_with_catalog_metadata() {
+        let (_tmp, ctx, zip) = listing_fixture(&[
+            ("Lights/L_001.fits", light(1)),
+            ("Lights/L_002.fits", light(2)),
+            ("Lights/Ha/L_003.fits", light(3)),
+            ("notes.txt", b"hello".to_vec()),
+            ("top.fits", light(4)),
+        ]);
+        let zip_s = zip.to_string_lossy().into_owned();
+
+        let top = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "").unwrap();
+        assert_eq!(top.subdirectories, vec!["Lights".to_string()]);
+        let names: Vec<_> = top.files.iter().map(|f| f.file.filename.as_str()).collect();
+        assert_eq!(names, vec!["top.fits"]);
+        assert_eq!(top.other_entries, vec![ZipOtherEntry { name: "notes.txt".into(), size: 5 }]);
+
+        let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
+        assert_eq!(lights.subdirectories, vec!["Lights/Ha".to_string()]);
+        let names: Vec<_> = lights.files.iter().map(|f| f.file.filename.as_str()).collect();
+        assert_eq!(names, vec!["L_001.fits", "L_002.fits"]);
+        assert!(lights.files.iter().all(|f| f.frame.is_some() && f.file.archive_zip_path.as_deref() == Some(zip_s.as_str())));
+        assert!(lights.other_entries.is_empty());
+
+        // Slashes at either end and a backslash spelling name the same folder.
+        let ha = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "/Lights\\Ha/").unwrap();
+        assert_eq!(ha.files.len(), 1);
+        assert_eq!(ha.files[0].file.filename, "L_003.fits");
+
+        // Nothing in a folder that does not exist.
+        let none = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Darks").unwrap();
+        assert!(none.subdirectories.is_empty() && none.files.is_empty() && none.other_entries.is_empty());
+    }
+
+    #[test]
+    fn list_zip_entries_shows_the_names_our_layout_writes_and_never_opens_unsafe_ones() {
+        let (_tmp, ctx, zip) = listing_fixture(&[
+            ("Lights/ok.fits", light(1)),
+            ("Lights/M31: Core.fits", light(2)),
+            ("Lights/trailing .fits ", light(3)),
+            ("Lights/Aux.fits", light(4)),
+            ("../escape.fits", light(5)),
+            ("/absolute.fits", light(6)),
+        ]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        // The scan cataloged only the safe name; the others are not frames of the catalog.
+        let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
+        let files: Vec<_> = lights.files.iter().map(|f| f.file.filename.as_str()).collect();
+        assert_eq!(files, vec!["ok.fits"]);
+        let others: Vec<_> = lights.other_entries.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(others, vec!["Aux.fits", "M31: Core.fits", "trailing .fits "], "{others:?}");
+
+        // Our own layout's rows with such names are listed as cataloged files: mark one the way Move and ZIP does.
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
+                 VALUES ('/orig/M31: Core.fits', 'M31: Core.fits', 1, '2026-01-01T00:00:00Z', 'FITS', 9, ?1, 'Lights/M31: Core.fits')",
+                [&zip_s],
+            )
+            .unwrap();
+        }
+        let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
+        let files: Vec<_> = lights.files.iter().map(|f| f.file.filename.as_str()).collect();
+        assert_eq!(files, vec!["M31: Core.fits", "ok.fits"]);
+        let others: Vec<_> = lights.other_entries.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(others, vec!["Aux.fits", "trailing .fits "]);
+
+        // Names that cannot sit in a tree appear once, at the top, and open nothing.
+        let top = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "").unwrap();
+        let top_others: Vec<_> = top.other_entries.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(top_others, vec!["../escape.fits", "/absolute.fits"]);
+        assert_eq!(top.subdirectories, vec!["Lights".to_string()]);
+    }
+
+    #[test]
+    fn list_zip_entries_checks_the_path_policy_and_the_zip() {
+        let (tmp, ctx, zip) = listing_fixture(&[("a.fits", light(1))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let elsewhere = TempDir::new().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![crate::test_support::canonical_path(elsewhere.path())]);
+        assert!(matches!(list_zip_entries(&ctx, &policy, &zip_s, ""), Err(ApiError::Forbidden(_))));
+        let missing = tmp.path().join("astro").join("gone.zip");
+        assert!(matches!(
+            list_zip_entries(&ctx, &PathPolicy::AllowAll, &missing.to_string_lossy(), ""),
+            Err(ApiError::NotFound(_))
+        ));
     }
 }

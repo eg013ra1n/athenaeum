@@ -517,6 +517,16 @@ fn sync_catalog_path(conn: &Connection, f: &FileOperationFile, new_path: &Path) 
         }
     }
 
+    // 3. A moved zip: its row, its frames' markers and the virtual paths of its foreign frames follow the
+    //    file. A zip is no `files` row, so steps 1-2 never saw it. The check is one indexed lookup; a file
+    //    that is not a known zip costs nothing more.
+    if crate::zip_store::catalog::is_known_zip(conn, &f.source_path)? {
+        let moved = crate::zip_store::catalog::rename_zip(conn, &f.source_path, &new_path_str)
+            .with_context(|| format!("catalog update for the moved zip {}", f.source_path))?;
+        tracing::info!(src = %f.source_path, dest = %new_path_str, zips = moved, "move hot-synced a zip");
+        return Ok(());
+    }
+
     if updated_by_path == 0 && f.catalog_file_id.is_none() {
         // Both mechanisms missing together is the path-spelling-drift
         // signature (sidecar/non-catalog files are expected misses — only
@@ -711,5 +721,49 @@ mod tests {
             .query_row("SELECT path FROM files WHERE id = ?1", [file_id], |r| r.get(0))
             .unwrap();
         assert_eq!(path, dest_dir.join("frame.fits").to_string_lossy());
+    }
+
+    #[test]
+    fn moving_a_zip_with_file_op_keeps_its_frames_present() {
+        use crate::archive::models::ArchiveCompression;
+        use crate::zip_store::presence::{row_is_present, ZipPresence};
+        use crate::zip_store::scan::scan_zip;
+        use crate::zip_store::scan::test_support::{light, make_zip};
+
+        let scan_root = TempDir::new().unwrap();
+        let conn = setup_with_scan_root(scan_root.path());
+        let zip = make_zip(
+            scan_root.path(),
+            "night.zip",
+            &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        let dest_dir = scan_root.path().join("organized");
+        fs::create_dir(&dest_dir).unwrap();
+
+        let plan = build_move_plan(&conn, vec![zip.clone()], dest_dir.clone()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, plan.operation_id, &cancel, &NullEmitter).unwrap();
+
+        let new_zip = dest_dir.join("night.zip");
+        assert!(new_zip.exists() && !zip.exists());
+        let new_zip_s = new_zip.to_string_lossy().into_owned();
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT path, archive_zip_path, archive_path_in_zip FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut presence = ZipPresence::new();
+        for (path, zip_col, entry) in &rows {
+            assert!(path.starts_with(&new_zip_s), "{path}");
+            assert_eq!(zip_col.as_deref(), Some(new_zip_s.as_str()));
+            assert!(row_is_present(&mut presence, path, zip_col.as_deref(), entry.as_deref()), "{path} present");
+        }
+        let zip_row: String = conn.query_row("SELECT path FROM zip_archives", [], |r| r.get(0)).unwrap();
+        assert_eq!(zip_row, new_zip_s);
     }
 }

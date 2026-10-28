@@ -1467,6 +1467,16 @@ pub fn relink_scan_root(
         ApiError::Internal(format!("Relinking failed: {}", e))
     })?;
 
+    // Zips are whole files: each one that stands at the same place under the new root takes its frames'
+    // rows along (they were left out of the fingerprint match above).
+    match crate::zip_store::catalog::relink_zips(&conn, &old_path, &new_path) {
+        Ok(zips) => tracing::info!(root_id, zips, "relink moved zips"),
+        Err(e) => {
+            tracing::error!(root_id, path = %new_path, error = %e, "relinking zips failed");
+            return Err(ApiError::Internal(format!("Relinking zips failed: {e:#}")));
+        }
+    }
+
     // Update scan root path if all files were matched
     if result.files_orphaned == 0 || result.files_matched > 0 {
         conn.execute(
@@ -3603,6 +3613,58 @@ mod switch_library_tests {
         let got =
             crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
         assert_eq!(got.as_deref(), Some("/gone/rootX/masters"));
+    }
+
+    #[test]
+    fn relink_scan_root_follows_zips_that_exist_at_the_new_location() {
+        use crate::archive::models::ArchiveCompression;
+        use crate::zip_store::scan::scan_zip;
+        use crate::zip_store::scan::test_support::{light, make_zip};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old_root = tmp.path().join("oldroot");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let new_root = crate::test_support::canonical_path(std::path::Path::new(&mkdirs(&tmp, "newroot")));
+        let root_id: i64;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute("INSERT INTO scan_roots (path) VALUES (?1)", [old_root.to_str().unwrap()]).unwrap();
+            root_id = conn.query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+            for (name, seed) in [("present.zip", 1u32), ("absent.zip", 10)] {
+                let zip = make_zip(
+                    &old_root,
+                    name,
+                    &[("Lights/L_001.fits", light(seed)), ("Lights/L_002.fits", light(seed + 1))],
+                    ArchiveCompression::Store,
+                );
+                scan_zip(&conn, &zip, root_id, false).unwrap();
+            }
+        }
+        std::fs::copy(old_root.join("present.zip"), new_root.join("present.zip")).unwrap();
+
+        let result = relink_scan_root(&ctx, root_id, new_root.to_string_lossy().into_owned(), &PathPolicy::AllowAll).unwrap();
+        assert_eq!(result.files_orphaned, 0, "zip-resident rows are never orphans");
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let moved = new_root.join("present.zip").to_string_lossy().into_owned();
+        let stayed = old_root.join("absent.zip").to_string_lossy().into_owned();
+        let zips: Vec<String> = conn
+            .prepare("SELECT path FROM zip_archives ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(zips.contains(&moved) && zips.contains(&stayed), "{zips:?}");
+        let on_moved: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1 AND path LIKE ?2", [&moved, &format!("{moved}%")], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on_moved, 2);
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 4, "nothing was deleted");
     }
 
     // ── Switch-failure demote (Task 2 fix round, closes the #8 residual) ──

@@ -311,6 +311,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
         .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
         .route("/api/unpack_zip_frames", post(zip::unpack_zip_frames))
+        .route("/api/list_zip_entries", post(zip::list_zip_entries))
         // Personal sync (Stage I, task A7)
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
