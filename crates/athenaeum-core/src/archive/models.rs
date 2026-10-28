@@ -62,6 +62,9 @@ pub enum ArchiveStage {
     Copy,
     VerifyCopy,
     ZipAdd,
+    /// Recorded the moment this operation's rename of a built zip onto its target path succeeded.
+    /// Rollback deletes a target zip only when this step exists for it.
+    ZipPublish,
     VerifyZip,
     DeleteSource,
     Finalize,
@@ -80,6 +83,7 @@ impl ArchiveStage {
             ArchiveStage::Copy => "copy",
             ArchiveStage::VerifyCopy => "verify_copy",
             ArchiveStage::ZipAdd => "zip_add",
+            ArchiveStage::ZipPublish => "zip_publish",
             ArchiveStage::VerifyZip => "verify_zip",
             ArchiveStage::DeleteSource => "delete_source",
             ArchiveStage::Finalize => "finalize",

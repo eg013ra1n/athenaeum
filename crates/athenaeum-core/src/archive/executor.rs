@@ -6,7 +6,7 @@ use crate::archive::models::{
 };
 use crate::archive::staging;
 use crate::archive::zip_reader::verify_zip_contents;
-use crate::archive::zip_writer::{build_zip_with_progress, ZipEntry};
+use crate::archive::zip_writer::{build_zip_partial, sweep_stale_partials_beside, ZipEntry};
 use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
 use anyhow::{Context, Result};
@@ -294,6 +294,9 @@ fn zip_phase(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create zip dir {}", parent.display()))?;
         }
+        // A build that died with its process left a partial of a dead pid here: the resumed run must
+        // not leave it behind next to the zip it is about to publish.
+        sweep_stale_partials_beside(&zip_path, false);
 
         // Build the zip from staging files.
         let entries: Vec<ZipEntry> = group.iter().map(|f| ZipEntry {
@@ -301,7 +304,7 @@ fn zip_phase(
             path_in_zip: f.target_path_in_zip.clone(),
         }).collect();
 
-        // Insert one InProgress step per file in this group; flip them to Done after zip succeeds.
+        // Insert one InProgress step per file in this group; flip them to Done once the zip is in place.
         let mut step_ids = Vec::new();
         for f in group {
             if existing.contains(&f.id) {
@@ -340,8 +343,21 @@ fn zip_phase(
             });
         };
 
-        match build_zip_with_progress(&zip_path, &entries, compression, Some(&progress_cb)) {
-            Ok(_) => {
+        // The zip is built in a partial beside the target and verified there; only a complete, verified zip
+        // is renamed onto the target. Until the rename the target (an old zip being overwritten) is
+        // untouched, and any failure before it removes the partial and leaves the target as it was.
+        let expected: Vec<String> = group.iter().map(|f| f.target_path_in_zip.clone()).collect();
+        let built = (|| -> Result<()> {
+            let partial = build_zip_partial(&zip_path, &entries, compression, Some(&progress_cb))?;
+            verify_zip_contents(partial.path(), &expected)
+                .context("the built zip failed verification, so it was not moved into place")?;
+            partial.publish(&zip_path)
+        })();
+        match built {
+            Ok(()) => {
+                // The rename is done: from here rollback may remove the target. Recorded before anything else.
+                let pid = adb::insert_step(conn, operation_id, Some(group[0].id), ArchiveStage::ZipPublish)?;
+                adb::update_step(conn, pid, StepStatus::Done, None, None)?;
                 for sid in step_ids.into_iter().flatten() {
                     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
                 }
@@ -349,6 +365,7 @@ fn zip_phase(
             }
             Err(e) => {
                 let msg = format!("{:#}", e);
+                tracing::error!(operation_id, zip_path = %zip_path_str, error = %msg, "zip build failed; the target is untouched");
                 for sid in step_ids.into_iter().flatten() {
                     adb::update_step(conn, sid, StepStatus::Failed, None, Some(&msg))?;
                 }
@@ -633,6 +650,45 @@ fn existing_done_steps(
         .query_map(rusqlite::params![operation_id, stage.as_str()], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows.into_iter().collect())
+}
+
+/// Single forward phases for the tests of other archive modules (rollback), so they can stop an
+/// operation exactly where an interruption would.
+#[cfg(test)]
+pub(crate) mod test_phases {
+    use super::*;
+
+    pub(crate) fn copy_only(
+        conn: &Connection,
+        op: i64,
+        files: &[ArchiveOperationFile],
+        root: &Path,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        copy_phase(conn, op, files, root, cancel, &crate::events::NullEmitter)?;
+        verify_copy_phase(conn, op, files, root, cancel, &crate::events::NullEmitter)
+    }
+
+    pub(crate) fn zip_only(
+        conn: &Connection,
+        op: i64,
+        files: &[ArchiveOperationFile],
+        root: &Path,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        zip_phase(conn, op, files, root, ArchiveCompression::Store, cancel, &crate::events::NullEmitter)
+    }
+
+    pub(crate) fn copy_and_zip(
+        conn: &Connection,
+        op: i64,
+        files: &[ArchiveOperationFile],
+        root: &Path,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        copy_only(conn, op, files, root, cancel)?;
+        zip_only(conn, op, files, root, cancel)
+    }
 }
 
 #[cfg(test)]
@@ -1024,5 +1080,48 @@ mod tests {
         let err = run_operation_standalone(&conn, op_id, &cancel, &NullEmitter).unwrap_err();
         assert!(format!("{err:#}").contains("cataloged"), "{err:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"zip bytes that must survive");
+    }
+
+    #[test]
+    fn overwrite_replaces_an_old_zip_through_a_partial_and_records_the_rename() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let target: String = conn
+            .query_row("SELECT target_zip_path FROM archive_operation_files WHERE operation_id = ?1 LIMIT 1", [op_id], |r| r.get(0))
+            .unwrap();
+        std::fs::write(&target, b"old zip, no cataloged frames in it").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        let zr = zip::ZipArchive::new(std::fs::File::open(&target).unwrap()).unwrap();
+        assert_eq!(zr.len(), 2, "the new zip replaced the old bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(Path::new(&target).parent().unwrap()).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let published: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM archive_operation_steps WHERE operation_id = ?1 AND stage = 'zip_publish' AND status = 'done'",
+            [op_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(published, 1, "one publish step per zip, recorded after the rename");
+    }
+
+    #[test]
+    fn a_refused_zip_records_no_publish_step() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let target: String = conn
+            .query_row("SELECT target_zip_path FROM archive_operation_files WHERE operation_id = ?1 LIMIT 1", [op_id], |r| r.get(0))
+            .unwrap();
+        std::fs::write(&target, b"zip bytes that must survive").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (900, ?1, 'X.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'X.fits')",
+            params![format!("{target}!/X.fits"), target],
+        ).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _ = run_operation_standalone(&conn, op_id, &cancel, &NullEmitter);
+        let steps: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM archive_operation_steps WHERE operation_id = ?1 AND stage IN ('zip_publish', 'zip_add')",
+            [op_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(steps, 0);
     }
 }

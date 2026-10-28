@@ -6,12 +6,19 @@
 //! - During `deleting_sources` or `finalizing`: some sources already deleted;
 //!   restore each deleted source from staging back to its original path,
 //!   then delete the zip(s) + staging dir, then unmark catalog rows.
+//!
+//! The zip model: a zip is built in a `<zip>.<pid>-<n>.partial` beside its target and renamed onto it
+//! when complete, and the executor records a `zip_publish` step right after that rename. Rollback
+//! removes (a) the operation's stale partials beside its targets and (b) a target zip only when a
+//! `zip_publish` step says this operation put it there. It refuses to start while a zip it would
+//! delete may hold the only copy of a frame (a moved source that is neither on disk nor in staging).
 
 use crate::archive::db as adb;
 use crate::archive::models::{
     ArchiveStage, ArchiveStatus, StepStatus,
 };
 use crate::archive::staging;
+use crate::archive::zip_writer::sweep_stale_partials_beside;
 use crate::events::{emit_event, ProgressEmitter};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -79,8 +86,51 @@ pub fn rollback_operation(
         tracing::error!(operation_id, "rollback of a completed operation refused");
         anyhow::bail!("a completed operation cannot be rolled back; use Unarchive");
     }
+    // A rolled-back operation's zips are gone or belong to a later operation at the same path: its step
+    // log names a zip it no longer owns. (`rolling_back` stays allowed: re-running an interrupted rollback.)
+    if op.status == ArchiveStatus::RolledBack.as_str() {
+        tracing::error!(operation_id, "rollback of an already rolled-back operation refused");
+        anyhow::bail!("this operation is already rolled back");
+    }
     let archive_root = PathBuf::from(&op.archive_root_path);
     let files = adb::list_operation_files(conn, operation_id)?;
+    let deleted_file_ids = file_ids_with_done_step(conn, operation_id, ArchiveStage::DeleteSource)?;
+    let published = file_ids_with_done_step(conn, operation_id, ArchiveStage::ZipPublish)?;
+    let published_zips: HashSet<&str> = files
+        .iter()
+        .filter(|f| published.contains(&f.id))
+        .map(|f| f.target_zip_path.as_str())
+        .collect();
+
+    // Before anything is touched: a zip this rollback would delete (or rows it would unmark) must not
+    // be the only copy of a frame. Every moved source has to be on disk or restorable from staging.
+    // Gone from both (staging cleaned after the sources were deleted, the archive drive unplugged) means
+    // the zip is the only copy: refuse, change nothing, and leave the status as it is.
+    let lost: Vec<&str> = files
+        .iter()
+        .filter(|f| f.disposition == "move")
+        .filter(|f| !published_zips.is_empty() || deleted_file_ids.contains(&f.id))
+        .filter(|f| {
+            !Path::new(&f.source_path).exists()
+                && !staging::staging_file_path(&archive_root, operation_id, &f.target_path_in_zip).exists()
+        })
+        .map(|f| f.source_path.as_str())
+        .collect();
+    if !lost.is_empty() {
+        tracing::error!(
+            operation_id,
+            lost = lost.len(),
+            first = lost[0],
+            status = %op.status,
+            "rollback refused: moved sources are neither on disk nor in staging, the zip holds the only copy"
+        );
+        anyhow::bail!(
+            "cannot roll back: {} moved source file(s) (first: {}) are neither on disk nor in staging, so the archive \
+             zip may hold their only copy; nothing was changed. Reconnect the archive folder or resume the operation instead",
+            lost.len(),
+            lost[0]
+        );
+    }
 
     adb::update_operation_status(conn, operation_id, ArchiveStatus::RollingBack, None)?;
 
@@ -93,7 +143,6 @@ pub fn rollback_operation(
     // DeleteSource step is *not* the same as "a source was deleted": a
     // copy-disposition calibration gets that step too, with nothing removed
     // from disk (see `executor::delete_sources_phase`).
-    let deleted_file_ids = file_ids_with_done_step(conn, operation_id, ArchiveStage::DeleteSource)?;
     let total = files
         .iter()
         .filter(|f| deleted_file_ids.contains(&f.id) && f.disposition == "move")
@@ -132,26 +181,28 @@ pub fn rollback_operation(
         adb::update_step(conn, sid, StepStatus::Done, None, None)?;
     }
 
-    // 2. Delete the zip files this operation wrote (whether partially or fully written).
+    // 2. Delete the zips this operation put in place, and its partials.
     //
-    // Provenance is the step log: `zip_phase` records a ZipAdd step for every file of a zip before it
-    // opens the zip for writing, and refuses a protected target before recording any. So a zip with no
-    // ZipAdd step of this operation is not ours (a pre-existing zip the user chose to overwrite and the
-    // operation never reached, or one a refusal protected) and stays exactly as it was. What the
-    // catalog says about the path is no part of the test: stale rows may point at a zip we did write.
-    let zip_written = file_ids_with_step(conn, operation_id, ArchiveStage::ZipAdd)?;
+    // Provenance is the step log. The executor builds a zip in a partial beside the target and, right
+    // after renaming it onto the target, records a `zip_publish` step. So: this operation's partials
+    // beside each target always go (a build killed with its process leaves one); the target goes only
+    // when a `zip_publish` step says this operation's rename put it there. Any other zip at the path --
+    // an old one the user chose to overwrite and the operation never replaced, or one a refusal
+    // protected -- stays exactly as it was. What the catalog says about the path is no part of the test.
+    // (A crash between the rename and the step leaves the new zip in place: logged, never deleted.)
     let mut seen_zips: HashSet<String> = HashSet::new();
     for f in &files {
         if !seen_zips.insert(f.target_zip_path.clone()) {
             continue;
         }
-        let wrote_it = files
-            .iter()
-            .any(|g| g.target_zip_path == f.target_zip_path && zip_written.contains(&g.id));
         let zp = Path::new(&f.target_zip_path);
-        if !wrote_it {
+        let swept = sweep_stale_partials_beside(zp, true);
+        if swept > 0 {
+            tracing::info!(operation_id, path = %zp.display(), swept, "removed partial zips during rollback");
+        }
+        if !published_zips.contains(f.target_zip_path.as_str()) {
             if zp.exists() {
-                tracing::warn!(operation_id, path = %zp.display(), "zip was not written by this operation; left in place during rollback");
+                tracing::warn!(operation_id, path = %zp.display(), "zip was not put in place by this operation; left as it is during rollback");
             }
             continue;
         }
@@ -163,7 +214,7 @@ pub fn rollback_operation(
                     operation_id,
                     path = %zp.display(),
                     error = %e,
-                    "failed to remove partial zip during rollback"
+                    "failed to remove the zip this operation published during rollback"
                 );
             }
         }
@@ -191,31 +242,18 @@ pub fn rollback_operation(
     Ok(())
 }
 
+/// Files with a Done step of `stage`.
 fn file_ids_with_done_step(
     conn: &Connection,
     operation_id: i64,
     stage: ArchiveStage,
 ) -> Result<HashSet<i64>> {
-    file_ids_with_step_where(conn, operation_id, stage, "AND status = 'done'")
-}
-
-/// Files with a step of `stage` in any status.
-fn file_ids_with_step(conn: &Connection, operation_id: i64, stage: ArchiveStage) -> Result<HashSet<i64>> {
-    file_ids_with_step_where(conn, operation_id, stage, "")
-}
-
-fn file_ids_with_step_where(
-    conn: &Connection,
-    operation_id: i64,
-    stage: ArchiveStage,
-    extra: &str,
-) -> Result<HashSet<i64>> {
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare(
         "SELECT DISTINCT operation_file_id
          FROM archive_operation_steps
-         WHERE operation_id = ?1 AND stage = ?2 {extra}
+         WHERE operation_id = ?1 AND stage = ?2 AND status = 'done'
            AND operation_file_id IS NOT NULL",
-    ))?;
+    )?;
     let rows: Vec<i64> = stmt
         .query_map(rusqlite::params![operation_id, stage.as_str()], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -500,8 +538,38 @@ mod tests {
         assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
     }
 
+    /// Runs the forward phases up to (not including) `delete_sources`, with the zip published.
+    fn run_through_zip(conn: &Connection, arch: &TempDir, op_id: i64) -> Vec<crate::archive::models::ArchiveOperationFile> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let files = adb::list_operation_files(conn, op_id).unwrap();
+        let root = arch.path();
+        crate::archive::staging::ensure_staging_dir(root, op_id).unwrap();
+        crate::archive::executor::test_phases::copy_and_zip(conn, op_id, &files, root, &cancel).unwrap();
+        files
+    }
+
+    /// Registers the rows a finished finalize would have written, so "unmarks nothing" is observable.
+    fn mark_rows_archived(conn: &Connection, op_id: i64) {
+        for f in adb::list_operation_files(conn, op_id).unwrap() {
+            adb::mark_file_archived(conn, f.file_id.unwrap(), op_id, &f.target_zip_path, &f.target_path_in_zip).unwrap();
+        }
+    }
+
+    fn archived_row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0)).unwrap()
+    }
+
+    /// Fake the delete_sources phase: sources gone, a Done DeleteSource step each.
+    fn delete_sources(conn: &Connection, op_id: i64) {
+        for f in adb::list_operation_files(conn, op_id).unwrap() {
+            std::fs::remove_file(&f.source_path).unwrap();
+            let sid = adb::insert_step(conn, op_id, Some(f.id), ArchiveStage::DeleteSource).unwrap();
+            adb::update_step(conn, sid, StepStatus::Done, None, None).unwrap();
+        }
+    }
+
     #[test]
-    fn rollback_removes_the_zip_it_wrote_even_when_stale_rows_point_at_the_path() {
+    fn rollback_leaves_a_zip_whose_rename_this_operation_never_completed_even_with_zip_add_steps_and_stale_rows() {
         let (conn, _arch, _scan, op_id) = fixture();
         let zip = target_zip(&conn, op_id);
         // Stale rows of an earlier zip at this path (the file was missing when the plan was checked).
@@ -510,14 +578,224 @@ mod tests {
              VALUES (900, ?1, 'X.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'X.fits')",
             params![format!("{zip}!/X.fits"), zip],
         ).unwrap();
-        // The operation then wrote the zip (a ZipAdd step exists, still in progress) and failed verifying it.
-        std::fs::write(&zip, b"partial zip").unwrap();
+        // The zip at the path is an older one. The operation's build started (ZipAdd in progress) and failed.
+        std::fs::write(&zip, b"older zip").unwrap();
         let first = adb::list_operation_files(&conn, op_id).unwrap()[0].id;
         let sid = adb::insert_step(&conn, op_id, Some(first), ArchiveStage::ZipAdd).unwrap();
         adb::update_step(&conn, sid, StepStatus::InProgress, None, None).unwrap();
 
         rollback_operation(&conn, op_id, &NullEmitter).unwrap();
-        assert!(!Path::new(&zip).exists(), "the unverified zip this operation wrote is removed");
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip", "no rename of this operation: the zip is not ours to delete");
+    }
+
+    #[test]
+    fn rollback_removes_the_zip_it_published_even_when_stale_rows_point_at_the_path() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (900, ?1, 'X.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'X.fits')",
+            params![format!("{zip}!/X.fits"), zip],
+        ).unwrap();
+        std::fs::write(&zip, b"zip this op renamed into place").unwrap();
+        let first = adb::list_operation_files(&conn, op_id).unwrap()[0].id;
+        let sid = adb::insert_step(&conn, op_id, Some(first), ArchiveStage::ZipPublish).unwrap();
+        adb::update_step(&conn, sid, StepStatus::Done, None, None).unwrap();
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&zip).exists(), "the zip this operation published is removed");
+    }
+
+    #[test]
+    fn rollback_removes_this_operations_partials_and_only_those() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"older zip").unwrap();
+        let own = format!("{zip}.{}-7.partial", std::process::id());
+        let dead = format!("{zip}.2000000000-1.partial"); // no such process
+        #[cfg(unix)]
+        let live = format!("{zip}.{}-3.partial", std::os::unix::process::parent_id());
+        let users = format!("{zip}.partial");
+        let other_name = format!("{zip}x.{}-1.partial", std::process::id());
+        for p in [&own, &dead, &users, &other_name] {
+            std::fs::write(p, b"partial").unwrap();
+        }
+        #[cfg(unix)]
+        std::fs::write(&live, b"partial").unwrap();
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&own).exists(), "this process's partial goes");
+        assert!(!Path::new(&dead).exists(), "a dead process's partial goes");
+        #[cfg(unix)]
+        assert!(Path::new(&live).exists(), "a running process's partial stays");
+        assert!(Path::new(&users).exists(), "a name outside the pattern is not ours");
+        assert!(Path::new(&other_name).exists(), "another zip's partial is not ours");
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip");
+    }
+
+    #[test]
+    fn a_published_zip_is_removed_and_the_sources_come_back() {
+        let (conn, arch, scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        let zip = target_zip(&conn, op_id);
+        assert!(Path::new(&zip).exists());
+        delete_sources(&conn, op_id);
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&zip).exists());
+        assert!(scan.path().join("M31/L_001.fits").exists());
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn rollback_refuses_when_staging_is_gone_after_the_sources_were_deleted() {
+        // Interrupted in Finalizing after cleanup_staging: the zip is the frames' only copy.
+        let (conn, arch, scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        delete_sources(&conn, op_id);
+        mark_rows_archived(&conn, op_id);
+        crate::archive::staging::cleanup_staging(arch.path(), op_id).unwrap();
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::Finalizing, None).unwrap();
+        let zip = target_zip(&conn, op_id);
+        let zip_bytes = std::fs::read(&zip).unwrap();
+        let steps_before: i64 = conn.query_row("SELECT COUNT(*) FROM archive_operation_steps", [], |r| r.get(0)).unwrap();
+
+        let err = rollback_operation(&conn, op_id, &NullEmitter).unwrap_err();
+        assert!(format!("{err:#}").contains("nothing was changed"), "{err:#}");
+        assert_eq!(std::fs::read(&zip).unwrap(), zip_bytes, "the zip is untouched");
+        assert_eq!(archived_row_count(&conn), 3, "no row is unmarked");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "finalizing", "the status is not changed");
+        assert!(!scan.path().join("M31/L_001.fits").exists());
+        let steps_after: i64 = conn.query_row("SELECT COUNT(*) FROM archive_operation_steps", [], |r| r.get(0)).unwrap();
+        assert_eq!(steps_after, steps_before, "no step is written");
+        assert!(adb::list_unfinished_operations(&conn).unwrap().iter().any(|o| o.id == op_id), "still offered for resume");
+    }
+
+    #[test]
+    fn rollback_refuses_when_the_archive_drive_is_offline() {
+        // Sources deleted, the archive folder (staging and zip) is not reachable.
+        let (conn, arch, _scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        delete_sources(&conn, op_id);
+        mark_rows_archived(&conn, op_id);
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::DeletingSources, None).unwrap();
+        let offline = arch.path().with_extension("offline");
+        std::fs::rename(arch.path(), &offline).unwrap();
+
+        let err = rollback_operation(&conn, op_id, &NullEmitter).unwrap_err();
+        assert!(format!("{err:#}").contains("neither on disk nor in staging"), "{err:#}");
+        assert_eq!(archived_row_count(&conn), 3, "nothing is unmarked");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "deleting_sources");
+
+        // The drive comes back: the same rollback now restores everything.
+        std::fs::rename(&offline, arch.path()).unwrap();
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert_eq!(archived_row_count(&conn), 0);
+        assert!(!Path::new(&target_zip(&conn, op_id)).exists());
+    }
+
+    #[test]
+    fn rolling_back_a_rolled_back_operation_leaves_a_later_operations_zip() {
+        let (conn, arch, _scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        let zip = target_zip(&conn, op_id);
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&zip).exists());
+        // A later operation completes a zip at the same path.
+        std::fs::write(&zip, b"later operation's finished zip").unwrap();
+
+        let err = rollback_operation(&conn, op_id, &NullEmitter).unwrap_err();
+        assert!(format!("{err:#}").contains("already rolled back"), "{err:#}");
+        assert_eq!(std::fs::read(&zip).unwrap(), b"later operation's finished zip");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn a_failed_build_leaves_an_existing_zip_byte_identical_through_rollback() {
+        let (conn, arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"older zip that must survive").unwrap();
+        let files = adb::list_operation_files(&conn, op_id).unwrap();
+        crate::archive::staging::ensure_staging_dir(arch.path(), op_id).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The copy phase ran; the staged copy of the last file then vanished before the zip stage.
+        crate::archive::executor::test_phases::copy_only(&conn, op_id, &files, arch.path(), &cancel).unwrap();
+        let last = files.last().unwrap();
+        std::fs::remove_file(crate::archive::staging::staging_file_path(arch.path(), op_id, &last.target_path_in_zip)).unwrap();
+
+        let err = crate::archive::executor::test_phases::zip_only(&conn, op_id, &files, arch.path(), &cancel).unwrap_err();
+        assert!(format!("{err:#}").contains("zip build failed"), "{err:#}");
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip that must survive", "the old zip is untouched by a failed build");
+        assert_no_partials(Path::new(&zip));
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip that must survive");
+        assert_no_partials(Path::new(&zip));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_target_directory_fails_the_build_and_leaves_the_old_zip_byte_identical() {
+        use std::os::unix::fs::PermissionsExt;
+        let (conn, arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"older zip that must survive").unwrap();
+        let dir = Path::new(&zip).parent().unwrap().to_path_buf();
+        let files = adb::list_operation_files(&conn, op_id).unwrap();
+        crate::archive::staging::ensure_staging_dir(arch.path(), op_id).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        crate::archive::executor::test_phases::copy_only(&conn, op_id, &files, arch.path(), &cancel).unwrap();
+
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(dir.join("probe")).is_ok(); // root ignores the mode
+        let result = crate::archive::executor::test_phases::zip_only(&conn, op_id, &files, arch.path(), &cancel);
+        let rolled = rollback_operation(&conn, op_id, &NullEmitter);
+        std::fs::set_permissions(&dir, original).unwrap();
+        let _ = std::fs::remove_file(dir.join("probe"));
+        if writable {
+            return;
+        }
+
+        assert!(result.is_err(), "the partial cannot be created");
+        rolled.unwrap();
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip that must survive");
+    }
+
+    #[test]
+    fn until_the_rename_the_old_zip_is_untouched_and_the_build_sits_in_a_partial() {
+        use crate::archive::zip_writer::{build_zip_with_progress, ZipEntry};
+        let tmp = TempDir::new().unwrap();
+        let zip = tmp.path().join("out.zip");
+        std::fs::write(&zip, b"old zip").unwrap();
+        let mut entries = Vec::new();
+        for i in 0..3 {
+            let src = tmp.path().join(format!("s{i}"));
+            std::fs::write(&src, vec![b'x'; 1000]).unwrap();
+            entries.push(ZipEntry { source_path: src, path_in_zip: format!("e{i}") });
+        }
+        let seen = std::cell::Cell::new(0);
+        build_zip_with_progress(&zip, &entries, ArchiveCompression::Store, Some(&|done, _| {
+            assert_eq!(std::fs::read(&zip).unwrap(), b"old zip", "after entry {done} the target is still the old zip");
+            assert_eq!(partials_beside(&zip).len(), 1, "the build is in one partial");
+            seen.set(done);
+        })).unwrap();
+        assert_eq!(seen.get(), 3);
+        assert_no_partials(Path::new(&zip));
+        assert_eq!(zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap().len(), 3);
+    }
+
+    fn partials_beside(zip: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.", zip.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(zip.parent().unwrap()).unwrap().flatten().map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with(&prefix) && n.ends_with(".partial")
+            })
+            .collect()
+    }
+
+    fn assert_no_partials(zip: &Path) {
+        assert!(partials_beside(zip).is_empty(), "partials left: {:?}", partials_beside(zip));
     }
 
     #[test]

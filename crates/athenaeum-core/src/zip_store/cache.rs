@@ -324,7 +324,7 @@ fn partial_pid(file_name: &str) -> Option<u32> {
 
 /// Whether a process with this id is running. Errs on the side of "alive" when it cannot tell.
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
     // SAFETY: signal 0 only checks that the process exists and may be signalled.
     if unsafe { libc::kill(pid, 0) } == 0 {
@@ -335,7 +335,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // SAFETY: a plain query handle that is closed again right away.
