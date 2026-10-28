@@ -206,6 +206,22 @@ pub fn entry_crc32(zip: &Path, entry: &str) -> Result<Option<u32>> {
     Ok(Some(file.crc32()))
 }
 
+/// The CRC32 the zip's directory records for every entry, by decoded name (unfiltered, first entry wins
+/// when a name repeats). One directory read for the whole zip: callers that need many entries' CRCs ask
+/// once per zip instead of calling [`entry_crc32`] per entry.
+pub fn entry_crc32_map(zip: &Path) -> Result<HashMap<String, u32>> {
+    let (mut archive, _) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let names = index_by_name(&archive);
+    let mut out = HashMap::with_capacity(names.len());
+    for (name, index) in names {
+        let file = archive.by_index_raw(index).with_context(|| format!("open entry {name} of {}", zip.display()))?;
+        if !file.is_dir() {
+            out.insert(name, file.crc32());
+        }
+    }
+    Ok(out)
+}
+
 /// Read the zip's directory through a 4 KiB buffer. Reads the central directory plus each listed
 /// entry's local header (to place its data); no entry data.
 pub fn list_entries(zip: &Path) -> Result<ZipListing> {
@@ -443,6 +459,9 @@ pub fn extract_entry(
         bail!("{entry} in {}: extracted {total} bytes, the directory says {}", zip.display(), file.size());
     }
     out.flush().with_context(|| format!("flush {}", partial.display()))?;
+    // The data must be on disk before the rename publishes the name: after a crash a renamed but
+    // unflushed file would otherwise be served as a complete cache hit.
+    out.sync_all().with_context(|| format!("sync {}", partial.display()))?;
     drop(out);
     std::fs::rename(&partial, dest).with_context(|| format!("rename {} to {}", partial.display(), dest.display()))?;
     guard.armed = false;

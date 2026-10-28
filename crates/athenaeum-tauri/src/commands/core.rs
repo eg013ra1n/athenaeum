@@ -31,8 +31,17 @@ pub async fn initialize_database(
 
     // set() returns Err if already set (race with StrictMode) — that's fine
     let _ = state.ctx.db.set(db);
-    // The zip extraction cache lives beside the catalog (sweeps stale partial files on first bind).
-    state.ctx.zip_cache.bind(&app_dir);
+    // The zip extraction cache lives in the OS cache directory (sweeps dead processes' partial files on
+    // first bind). A cache directory that cannot be resolved falls back to the data tree.
+    match crate::paths::resolve_zip_cache_dir(&app_handle, &app_dir) {
+        Ok(dir) => {
+            state.ctx.zip_cache.bind_dir(&dir);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not resolve the OS cache directory; the zip cache stays beside the catalog");
+            state.ctx.zip_cache.bind(&app_dir);
+        }
+    }
 
     // Apply persisted blink.threads setting to the semaphore
     if let Some(db) = state.ctx.db.get() {

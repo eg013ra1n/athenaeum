@@ -59,8 +59,12 @@ impl std::fmt::Debug for ZipCache {
 
 impl ZipCache {
     /// The cache for an app whose data directory is `app_data_dir` (the DB's parent): `<app data>/zip-cache`,
-    /// or `$ATHENAEUM_ZIP_CACHE` when set. Opening removes stale `*.partial` files: nothing else can be
-    /// writing them yet, so they come from a process that died mid-extraction.
+    /// or `$ATHENAEUM_ZIP_CACHE` when set. This is the web/Docker default; the desktop shell binds the OS
+    /// cache directory instead ([`ZipCache::bind_dir`]). Opening removes the `*.partial` files of
+    /// processes that are no longer running.
+    ///
+    /// `$ATHENAEUM_ZIP_CACHE` is a single-instance location: two running instances sharing one directory
+    /// would ignore each other's pins (one instance's eviction can remove an entry the other is reading).
     pub fn for_app_data(app_data_dir: &Path) -> Self {
         let cache = Self::unbound();
         cache.bind(app_data_dir);
@@ -68,26 +72,32 @@ impl ZipCache {
     }
 
     /// A cache with no directory yet, for a host that builds its `ServiceContext` before it knows the app
-    /// data dir (the desktop shell). [`ZipCache::bind`] gives it one; `materialize_*` binds it from the
-    /// catalog's location if nobody did.
+    /// data dir (the desktop shell). [`ZipCache::bind`] / [`ZipCache::bind_dir`] give it one;
+    /// `materialize_*` binds it from the catalog's location if nobody did.
     pub fn unbound() -> Self {
         Self::build(None)
     }
 
-    /// Gives an unbound cache its directory (see [`ZipCache::for_app_data`]) and sweeps stale partial
-    /// files. A cache that already has a directory keeps it. Returns the directory.
+    /// Gives an unbound cache its directory (see [`ZipCache::for_app_data`]) and sweeps dead processes'
+    /// partial files. A cache that already has a directory keeps it. Returns the directory.
     pub fn bind(&self, app_data_dir: &Path) -> &Path {
+        self.bind_dir(&app_data_dir.join("zip-cache"))
+    }
+
+    /// Like [`ZipCache::bind`] with the default cache directory given directly (the desktop shell passes
+    /// the OS cache directory, which backups skip). `$ATHENAEUM_ZIP_CACHE` still overrides it.
+    pub fn bind_dir(&self, default_dir: &Path) -> &Path {
         self.inner.dir.get_or_init(|| {
             let dir = match std::env::var_os(CACHE_DIR_ENV) {
                 Some(v) if !v.is_empty() => PathBuf::from(v),
-                _ => app_data_dir.join("zip-cache"),
+                _ => default_dir.to_path_buf(),
             };
             sweep_partials(&dir);
             dir
         })
     }
 
-    /// A cache in `dir`, sweeping stale partial files first.
+    /// A cache in `dir`, sweeping dead processes' partial files first.
     pub fn at(dir: PathBuf) -> Self {
         sweep_partials(&dir);
         Self::build(Some(dir))
@@ -288,18 +298,60 @@ impl ZipCache {
     }
 }
 
-/// Removes `*.partial` files left by a process that died mid-extraction.
+/// The process id embedded in a partial's name (`<name>.<pid>-<n>.partial`, see `reader::partial_path`).
+fn partial_pid(file_name: &str) -> Option<u32> {
+    let stem = file_name.strip_suffix(".partial")?;
+    let tail = stem.rsplit('.').next()?;
+    tail.split_once('-')?.0.parse().ok()
+}
+
+/// Whether a process with this id is running. Errs on the side of "alive" when it cannot tell.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: it exists but belongs to someone else. ESRCH: no such process.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a plain query handle that is closed again right away.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // ERROR_INVALID_PARAMETER means no such process; any other failure (access denied) means it exists.
+            return std::io::Error::last_os_error().raw_os_error() != Some(87);
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
+/// Removes `*.partial` files left by a process that died mid-extraction. A partial whose embedded process
+/// id is still running (this process included) belongs to a live extraction and is left alone; a name
+/// without a readable pid is stale.
 fn sweep_partials(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for key_dir in rd.flatten() {
         let Ok(inner) = std::fs::read_dir(key_dir.path()) else { continue };
         for f in inner.flatten() {
-            if f.file_name().to_string_lossy().ends_with(".partial") {
-                match std::fs::remove_file(f.path()) {
-                    Ok(()) => tracing::debug!(path = %f.path().display(), "removed a stale partial extraction"),
-                    Err(e) => {
-                        tracing::warn!(path = %f.path().display(), error = %e, "could not remove a stale partial extraction");
-                    }
+            let name = f.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".partial") {
+                continue;
+            }
+            if partial_pid(&name).is_some_and(pid_alive) {
+                continue;
+            }
+            match std::fs::remove_file(f.path()) {
+                Ok(()) => tracing::debug!(path = %f.path().display(), "removed a stale partial extraction"),
+                Err(e) => {
+                    tracing::warn!(path = %f.path().display(), error = %e, "could not remove a stale partial extraction");
                 }
             }
         }
@@ -392,17 +444,41 @@ mod cache_tests {
         std::fs::File::open(cache.key_dir(key).unwrap()).unwrap().set_modified(t).unwrap();
     }
 
+    /// The id of a process that has already exited.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn opening_removes_stale_partial_files_and_keeps_finished_ones() {
+    fn opening_removes_dead_processes_partials_and_keeps_finished_files_and_live_partials() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("zip-cache");
         std::fs::create_dir_all(dir.join("k1")).unwrap();
         std::fs::write(dir.join("k1").join("L.fits"), b"done").unwrap();
-        std::fs::write(dir.join("k1").join("L.fits.4242-0.partial"), b"half").unwrap();
+        let dead = format!("L.fits.{}-0.partial", dead_pid());
+        let live = format!("L.fits.{}-1.partial", std::process::id());
+        std::fs::write(dir.join("k1").join(&dead), b"half").unwrap();
+        std::fs::write(dir.join("k1").join(&live), b"in flight").unwrap();
+        std::fs::write(dir.join("k1").join("M.fits.junk.partial"), b"no pid").unwrap();
         let cache = ZipCache::at(dir.clone());
         assert!(dir.join("k1").join("L.fits").exists());
-        assert!(!dir.join("k1").join("L.fits.4242-0.partial").exists());
+        assert!(!dir.join("k1").join(&dead).exists(), "a dead process's partial is removed");
+        assert!(dir.join("k1").join(&live).exists(), "a live process's partial is left alone");
+        assert!(!dir.join("k1").join("M.fits.junk.partial").exists(), "a partial with no readable pid is stale");
         assert_eq!(cache.status().unwrap().entries, 1);
+    }
+
+    #[test]
+    fn partial_names_yield_their_pid() {
+        assert_eq!(partial_pid("L.fits.4242-7.partial"), Some(4242));
+        assert_eq!(partial_pid("a.b.c.12-0.partial"), Some(12));
+        assert_eq!(partial_pid("L.fits"), None);
+        assert_eq!(partial_pid("L.fits.partial"), None);
     }
 
     #[test]
@@ -435,6 +511,32 @@ mod cache_tests {
         assert!(!cache.key_dir("new").unwrap().exists());
         drop(pin);
         assert_eq!(cache.status().unwrap().bytes, 100, "release at 100 bytes under a 250 limit evicts nothing");
+    }
+
+    #[test]
+    fn evict_skips_a_pinned_entry_even_when_it_is_the_least_recently_used() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ZipCache::at(tmp.path().join("c"));
+        put(&cache, "old", 100);
+        put(&cache, "mid", 100);
+        put(&cache, "new", 100);
+        set_age(&cache, "old", 300);
+        set_age(&cache, "mid", 200);
+        set_age(&cache, "new", 100);
+        cache.set_limit_bytes(250);
+        let pin = cache.pin("old");
+        assert_eq!(cache.evict().unwrap(), 100, "one entry has to go");
+        assert!(cache.key_dir("old").unwrap().exists(), "the pinned LRU-oldest entry stays");
+        assert!(!cache.key_dir("mid").unwrap().exists(), "the next-oldest unpinned entry goes instead");
+        assert!(cache.key_dir("new").unwrap().exists());
+        // Pinned entries can keep the cache over its limit: nothing else is left to remove.
+        cache.set_limit_bytes(0);
+        let pin2 = cache.pin("new");
+        assert_eq!(cache.evict().unwrap(), 0);
+        assert!(cache.key_dir("old").unwrap().exists() && cache.key_dir("new").unwrap().exists());
+        drop(pin2);
+        drop(pin);
+        assert_eq!(cache.status().unwrap().entries, 0, "released pins let eviction finish");
     }
 
     #[test]

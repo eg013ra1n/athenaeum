@@ -6,7 +6,7 @@
 //! file's path comes back. The returned guard pins the cache files until it is dropped.
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::cache::{Pinned, ZipCache};
-use super::reader::{entry_crc32, extract_entry, is_safe_entry_name};
+use super::reader::{entry_crc32_map, extract_entry, is_safe_entry_name};
 use crate::events::{NullEmitter, ProgressEmitter};
 use crate::services::ServiceContext;
 
@@ -23,6 +23,7 @@ use crate::services::ServiceContext;
 const CHUNK: usize = 400;
 
 /// Catalog path → local path for one `materialize_paths` call. Holds the cache pins.
+#[derive(Debug)]
 pub struct Materialized {
     local: HashMap<String, PathBuf>,
     pins: Pinned,
@@ -66,6 +67,41 @@ struct ZipRow {
     size: i64,
     strong_hash_missing: bool,
     content_hash_missing: bool,
+    /// Set for rows our own Move and ZIP wrote: the operation whose plan holds the entry's `expected_hash`.
+    archived_in_operation: Option<i64>,
+}
+
+/// What is known about the zips of one call, so each zip is statted and its directory read once.
+#[derive(Default)]
+struct ZipFacts {
+    /// zip path → `(size, mtime nanos)`, or `None` when it cannot be reached.
+    stats: HashMap<String, Option<(u64, u128)>>,
+    /// zip path → entry name → CRC32 of its directory, or `None` when the directory cannot be read.
+    crcs: HashMap<String, Option<HashMap<String, u32>>>,
+    /// Directory reads done (a test hook: one per zip, however many rows it holds).
+    directory_reads: usize,
+}
+
+impl ZipFacts {
+    /// The directory CRC32 of `entry`: `Ok(None)` when the zip does not list it, `Err` when the directory
+    /// cannot be read.
+    fn entry_crc(&mut self, zip: &str, entry: &str) -> std::result::Result<Option<u32>, ()> {
+        if !self.crcs.contains_key(zip) {
+            self.directory_reads += 1;
+            let map = match entry_crc32_map(Path::new(zip)) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!(zip_path = %zip, zip_entry = %entry, error = %e, "cannot read the zip directory");
+                    None
+                }
+            };
+            self.crcs.insert(zip.to_string(), map);
+        }
+        match &self.crcs[zip] {
+            Some(map) => Ok(map.get(entry).copied()),
+            None => Err(()),
+        }
+    }
 }
 
 /// A row with its cache location worked out.
@@ -77,16 +113,23 @@ struct Job {
     zip_name: String,
     /// The CRC32 the extraction must match: the catalog's. `None` for a row that never recorded one.
     expected_crc: Option<u32>,
+    /// The CRC32 the zip's directory gave for a row that recorded none (written back after a good extraction).
+    learned_crc: Option<u32>,
 }
 
 impl Job {
+    /// The cache file is there and has the entry's size. A file of another size is a crashed or damaged
+    /// leftover, never served: it is extracted again.
     fn cached(&self) -> bool {
-        self.dest.is_file()
+        match std::fs::metadata(&self.dest) {
+            Ok(m) => m.is_file() && i64::try_from(m.len()).is_ok_and(|len| len == self.row.size),
+            Err(_) => false,
+        }
     }
 }
 
 const ROW_SELECT: &str = "SELECT id, path, archive_zip_path, archive_path_in_zip, archive_entry_crc32, size,
-        strong_hash IS NULL, content_hash IS NULL
+        strong_hash IS NULL, content_hash IS NULL, archived_in_operation
      FROM files
      WHERE archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL";
 
@@ -106,6 +149,7 @@ fn query_rows(conn: &Connection, column: &str, values: &[rusqlite::types::Value]
                 size: r.get(5)?,
                 strong_hash_missing: r.get(6)?,
                 content_hash_missing: r.get(7)?,
+                archived_in_operation: r.get(8)?,
             })
         })?;
         for row in rows {
@@ -133,12 +177,8 @@ fn refresh_limit(ctx: &ServiceContext, conn: &Connection) {
 }
 
 /// `(size, mtime nanos)` of a zip, or the "not reachable" error naming the frame.
-fn zip_identity(
-    stats: &mut HashMap<String, Option<(u64, u128)>>,
-    row: &ZipRow,
-    file_name: &str,
-    zip_name: &str,
-) -> Result<(u64, u128)> {
+fn zip_identity(facts: &mut ZipFacts, row: &ZipRow, file_name: &str, zip_name: &str) -> Result<(u64, u128)> {
+    let stats = &mut facts.stats;
     if !stats.contains_key(&row.zip) {
         let found = match std::fs::metadata(&row.zip) {
             Ok(meta) => {
@@ -156,7 +196,7 @@ fn zip_identity(
 }
 
 /// Works out where `row` lives in the cache. Creates nothing.
-fn resolve(stats: &mut HashMap<String, Option<(u64, u128)>>, cache: &ZipCache, row: ZipRow) -> Result<Job> {
+fn resolve(facts: &mut ZipFacts, cache: &ZipCache, row: ZipRow) -> Result<Job> {
     if !is_safe_entry_name(&row.entry) {
         bail!("{}: the zip entry name {:?} is not a safe name", row.path, row.entry);
     }
@@ -165,17 +205,14 @@ fn resolve(stats: &mut HashMap<String, Option<(u64, u128)>>, cache: &ZipCache, r
         bail!("{}: the zip entry {:?} has no file name", row.path, row.entry);
     }
     let zip_name = Path::new(&row.zip).file_name().map_or_else(|| row.zip.clone(), |n| n.to_string_lossy().into_owned());
-    let (zip_size, zip_mtime) = zip_identity(stats, &row, &file_name, &zip_name)?;
-    let (crc, expected_crc) = match row.crc {
-        Some(c) => (c, Some(c)),
-        // A row that never recorded a CRC32 is keyed by the zip's own.
-        None => match entry_crc32(Path::new(&row.zip), &row.entry) {
-            Ok(Some(c)) => (c, None),
+    let (zip_size, zip_mtime) = zip_identity(facts, &row, &file_name, &zip_name)?;
+    let (crc, expected_crc, learned_crc) = match row.crc {
+        Some(c) => (c, Some(c), None),
+        // A row that never recorded a CRC32 is keyed by the zip's own (one directory read per zip).
+        None => match facts.entry_crc(&row.zip, &row.entry) {
+            Ok(Some(c)) => (c, None, Some(c)),
             Ok(None) => bail!("{file_name} is not listed in {zip_name} any more"),
-            Err(e) => {
-                tracing::warn!(zip_path = %row.zip, zip_entry = %row.entry, error = %e, "cannot read the zip directory");
-                bail!("{file_name} is inside {zip_name}, which is not reachable");
-            }
+            Err(()) => bail!("{file_name} is inside {zip_name}, which is not reachable"),
         },
     };
     let mut hasher = Xxh3::new();
@@ -189,19 +226,73 @@ fn resolve(stats: &mut HashMap<String, Option<(u64, u128)>>, cache: &ZipCache, r
     }
     let key = format!("{:016x}", hasher.digest());
     let dest = cache.key_dir(&key)?.join(&file_name);
-    Ok(Job { row, key, dest, file_name, zip_name, expected_crc })
+    Ok(Job { row, key, dest, file_name, zip_name, expected_crc, learned_crc })
 }
 
-/// Banks the hashes an extraction vouches for. Failures are logged; the extraction itself succeeded.
-fn bank_hashes(ctx: &ServiceContext, job: &Job, strong_hash: &str) {
-    if job.expected_crc.is_none() {
-        // The catalog never recorded this entry's CRC32, so the bytes are not proven to be the cataloged ones.
-        return;
+/// What proves a fresh extraction is the cataloged entry, or an error naming the change. `Ok(true)`: the
+/// catalog's CRC32 matched while extracting, or (a row of our own Move and ZIP without a CRC32) the
+/// cached file hashes to the `expected_hash` the operation's plan recorded. `Ok(false)`: the catalog
+/// holds nothing to compare against.
+fn verify_extraction(ctx: &ServiceContext, job: &Job) -> std::result::Result<bool, String> {
+    if job.expected_crc.is_some() {
+        return Ok(true);
     }
+    let (Some(op), Some(db)) = (job.row.archived_in_operation, ctx.db.get()) else { return Ok(false) };
+    let expected: Option<String> = {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT expected_hash FROM archive_operation_files WHERE operation_id = ?1 AND file_id = ?2 LIMIT 1",
+            rusqlite::params![op, job.row.id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            tracing::warn!(file_id = job.row.id, error = %e, "could not read the archived entry's expected hash");
+            None
+        })
+    };
+    let Some(expected) = expected else { return Ok(false) };
+    let actual = crate::duplicates::compute_xxhash(&job.dest).map_err(|e| {
+        tracing::warn!(file_id = job.row.id, error = %e, "could not hash an extracted zip entry");
+        format!("{} could not be checked after extraction from {}: {e:#}", job.file_name, job.zip_name)
+    })?;
+    if actual == expected {
+        Ok(true)
+    } else {
+        tracing::warn!(
+            file_id = job.row.id,
+            zip_path = %job.row.zip,
+            zip_entry = %job.row.entry,
+            expected_hash = %expected,
+            actual_hash = %actual,
+            "extracted zip entry does not match the hash recorded when it was archived"
+        );
+        Err(format!("{} in {}: entry changed since it was archived", job.file_name, job.zip_name))
+    }
+}
+
+/// Banks the hashes a verified extraction vouches for, and writes back a CRC32 the row lacked. Failures are
+/// logged; the extraction itself succeeded.
+fn bank_after_extraction(ctx: &ServiceContext, job: &Job, strong_hash: &str, verified: bool) {
     let Some(db) = ctx.db.get() else { return };
     let conn = db.conn();
+    if let Some(crc) = job.learned_crc {
+        if let Err(e) = conn.execute(
+            "UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2 AND archive_entry_crc32 IS NULL",
+            rusqlite::params![i64::from(crc), job.row.id],
+        ) {
+            tracing::warn!(file_id = job.row.id, error = %e, "could not record the CRC32 of a zip entry");
+        }
+    }
+    if !verified {
+        // Nothing proves the bytes are the cataloged ones, so no hash is banked.
+        return;
+    }
     if job.row.strong_hash_missing {
-        if let Err(e) = crate::db::bank_strong_hash(&conn, job.row.id, strong_hash) {
+        if let Err(e) = conn.execute(
+            "UPDATE files SET strong_hash = ?1 WHERE id = ?2 AND strong_hash IS NULL",
+            rusqlite::params![strong_hash, job.row.id],
+        ) {
             tracing::warn!(file_id = job.row.id, error = %e, "could not bank the strong hash of an extracted zip entry");
         }
     }
@@ -238,7 +329,17 @@ fn fetch(ctx: &ServiceContext, job: &Job, cancel: &AtomicBool) -> Result<PathBuf
         match extract_entry(Path::new(&job.row.zip), &job.row.entry, job.expected_crc, &job.dest, cancel, &mut |_| {}) {
             Ok(done) => {
                 bytes_read = done.bytes;
-                bank_hashes(ctx, job, &done.strong_hash);
+                let verified = match verify_extraction(ctx, job) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        // Never leave bytes that failed the check where a later call would take them as a hit.
+                        if let Err(e) = std::fs::remove_file(&job.dest) {
+                            tracing::warn!(path = %job.dest.display(), error = %e, "could not remove a cache file that failed its check");
+                        }
+                        return Err(msg);
+                    }
+                };
+                bank_after_extraction(ctx, job, &done.strong_hash, verified);
                 cache.touch(&job.key);
                 Ok(job.dest.clone())
             }
@@ -285,14 +386,14 @@ pub fn materialize_paths(
     let mut local: HashMap<String, PathBuf> = HashMap::new();
     let mut pins = Pinned::empty();
     let mut jobs = Vec::new();
-    let mut stats = HashMap::new();
+    let mut facts = ZipFacts::default();
     for path in &wanted {
         match zip_rows.remove(path.as_str()) {
             None => {
                 local.insert((*path).clone(), PathBuf::from(path.as_str()));
             }
             Some(row) => {
-                let job = resolve(&mut stats, &ctx.zip_cache, row)?;
+                let job = resolve(&mut facts, &ctx.zip_cache, row)?;
                 pins.absorb(ctx.zip_cache.pin(&job.key));
                 jobs.push(job);
             }
@@ -336,11 +437,11 @@ pub fn estimate_extraction(ctx: &ServiceContext, file_ids: &[i64]) -> Result<Ext
     let values: Vec<rusqlite::types::Value> =
         file_ids.iter().filter(|id| seen.insert(**id)).map(|id| rusqlite::types::Value::Integer(*id)).collect();
     let rows = query_rows(&db.conn(), "id", &values)?;
-    let mut stats = HashMap::new();
+    let mut facts = ZipFacts::default();
     let mut estimate = ExtractionEstimate::default();
     for row in rows {
         let size = row.size.max(0) as u64;
-        match resolve(&mut stats, &ctx.zip_cache, row) {
+        match resolve(&mut facts, &ctx.zip_cache, row) {
             Ok(job) if job.cached() => {}
             _ => {
                 estimate.files += 1;
@@ -474,11 +575,17 @@ mod materialize_tests {
     #[test]
     fn concurrent_requests_for_one_entry_extract_once() {
         let f = fixture();
-        let (_zip, paths) = f.catalog_zip("n.zip", &[("Lights/L_001.fits", light(1))]);
-        let handles: Vec<_> = (0..4)
+        // Big enough that the extraction outlasts the threads' start-up, so they really overlap.
+        let mut big = light(1);
+        big.resize(48 * 1024 * 1024 + 2880, 0u8);
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("Lights/L_001.fits", big)]);
+        let threads = 6;
+        let start = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
             .map(|_| {
-                let (ctx, paths) = (f.ctx.clone(), paths.clone());
+                let (ctx, paths, start) = (f.ctx.clone(), paths.clone(), start.clone());
                 std::thread::spawn(move || {
+                    start.wait();
                     let m = mat(&ctx, &paths).unwrap();
                     m.local(&paths[0]).to_path_buf()
                 })
@@ -486,20 +593,34 @@ mod materialize_tests {
             .collect();
         let locals: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert!(locals.iter().all(|l| *l == locals[0]));
-        assert_eq!(f.ctx.zip_cache.extraction_count(), 1);
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 1, "the entry was read from the zip exactly once");
     }
 
     #[test]
     fn eviction_never_removes_a_pinned_entry_and_restores_the_limit_after_release() {
         let f = fixture();
-        let (_zip, paths) = f.catalog_zip("n.zip", &[("a.fits", light(1)), ("b.fits", light(2)), ("c.fits", light(3))]);
+        let (_zip, paths) = f.catalog_zip(
+            "n.zip",
+            &[("a.fits", light(1)), ("b.fits", light(2)), ("c.fits", light(3)), ("d.fits", light(4))],
+        );
         f.ctx.settings.persist_setting(&f.ctx.db.get().unwrap().conn(), "archive.zip_cache_limit_gb", "0").unwrap();
         f.ctx.zip_cache.set_limit_bytes(1);
-        let m = mat(&f.ctx, &paths).unwrap();
+        let m = mat(&f.ctx, &paths[..3]).unwrap();
         assert_eq!(f.ctx.zip_cache.limit_bytes(), 0, "the limit is re-read from the setting on every call");
-        for p in &paths {
-            assert!(m.local(p).is_file(), "every entry is present while held, though the cache is over its limit");
+        let held: Vec<PathBuf> = paths[..3].iter().map(|p| m.local(p).to_path_buf()).collect();
+        for p in &held {
+            assert!(p.is_file(), "every entry is present while held, though the cache is over its limit");
         }
+
+        // An eviction run while the entries are held (what a parallel preview's release triggers).
+        assert_eq!(f.ctx.zip_cache.evict().unwrap(), 0, "eviction removes nothing a live operation holds");
+        // A fourth entry materialized and released evicts itself, not the three held ones.
+        drop(mat(&f.ctx, &paths[3..]).unwrap());
+        for p in &held {
+            assert!(p.is_file(), "a held entry survives another operation's release: {}", p.display());
+        }
+        assert_eq!(f.ctx.zip_cache.status().unwrap().entries, 3, "the released fourth entry was evicted");
+
         drop(m);
         let status = f.ctx.zip_cache.status().unwrap();
         assert!(status.bytes <= status.limit_bytes, "after release the cache is back under the limit: {status:?}");
@@ -541,8 +662,8 @@ mod materialize_tests {
             let conn = f.ctx.db.get().unwrap().conn();
             query_rows(&conn, "path", &[rusqlite::types::Value::Text(paths[0].clone())]).unwrap().remove(0)
         };
-        let mut stats = HashMap::new();
-        let job = resolve(&mut stats, &f.ctx.zip_cache, row).unwrap();
+        let mut facts = ZipFacts::default();
+        let job = resolve(&mut facts, &f.ctx.zip_cache, row).unwrap();
         // The zip was reachable when the job was resolved and is gone when the bytes are read.
         std::fs::remove_file(&zip).unwrap();
         let err = fetch(&f.ctx, &job, &AtomicBool::new(false)).unwrap_err().to_string();
@@ -566,6 +687,119 @@ mod materialize_tests {
         std::fs::write(&disk, &bytes).unwrap();
         assert_eq!(q("strong_hash").unwrap(), crate::package::xxh3_full_file(&disk).unwrap());
         assert_eq!(q("content_hash").unwrap(), crate::duplicates::compute_xxhash(&local).unwrap());
+    }
+
+    #[test]
+    fn cancel_during_extraction_leaves_no_partial_file_and_no_cache_file() {
+        struct CancelOnFirst(Arc<AtomicBool>);
+        impl ProgressEmitter for CancelOnFirst {
+            fn emit_json(&self, _name: &str, _payload: serde_json::Value) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("Lights/L_001.fits", light(1))]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = CancelOnFirst(cancel.clone());
+        let err = materialize_paths(&f.ctx, &paths, &emitter, "evt", &cancel).unwrap_err().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 1, "the extraction started: the partial file existed");
+        assert!(f.cache_files().is_empty(), "no partial or finished file is left: {:?}", f.cache_files());
+    }
+
+    #[test]
+    fn a_cached_file_of_the_wrong_size_is_extracted_again() {
+        let f = fixture();
+        let bytes = light(1);
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("Lights/L_001.fits", bytes.clone())]);
+        let local = mat(&f.ctx, &paths).unwrap().local(&paths[0]).to_path_buf();
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 1);
+        // A crash left a short file under the final name.
+        std::fs::write(&local, &bytes[..100]).unwrap();
+        let again = mat(&f.ctx, &paths).unwrap();
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 2, "a size mismatch is not a hit");
+        assert_eq!(std::fs::read(again.local(&paths[0])).unwrap(), bytes);
+    }
+
+    /// Makes the row of `path` look like one of our own Move and ZIP rows: no recorded CRC32, owned by an
+    /// operation whose plan holds `expected_hash` for it. Returns the file id.
+    fn make_ours(f: &Fixture, path: &str, expected_hash: &str) -> i64 {
+        let conn = f.ctx.db.get().unwrap().conn();
+        conn.execute(
+            "INSERT INTO archive_operations (archive_root_path, compression, status, started_at) VALUES ('/a', 'store', 'completed', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let op = conn.last_insert_rowid();
+        let (id, zip, entry): (i64, String, String) = conn
+            .query_row("SELECT id, archive_zip_path, archive_path_in_zip FROM files WHERE path = ?1", params![path], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO archive_operation_files (operation_id, file_id, source_path, target_zip_path, target_path_in_zip, expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (?1, ?2, '/orig/x.fits', ?3, ?4, ?5, 'move', 'light', 1)",
+            params![op, id, zip, entry, expected_hash],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_entry_crc32 = NULL, archived_in_operation = ?1 WHERE id = ?2", params![op, id]).unwrap();
+        id
+    }
+
+    fn row_col(f: &Fixture, id: i64, col: &str) -> Option<i64> {
+        let conn = f.ctx.db.get().unwrap().conn();
+        conn.query_row(&format!("SELECT {col} FROM files WHERE id = ?1"), params![id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_row_of_ours_without_a_crc_is_verified_by_the_plans_expected_hash_and_backfilled() {
+        let f = fixture();
+        let bytes = light(1);
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("L_001.fits", bytes.clone())]);
+        let reference = f.root().join("reference.fits");
+        std::fs::write(&reference, &bytes).unwrap();
+        let id = make_ours(&f, &paths[0], &crate::duplicates::compute_xxhash(&reference).unwrap());
+        assert!(row_col(&f, id, "archive_entry_crc32").is_none());
+
+        let m = mat(&f.ctx, &paths).unwrap();
+        assert_eq!(std::fs::read(m.local(&paths[0])).unwrap(), bytes);
+        assert!(row_col(&f, id, "archive_entry_crc32").is_some(), "the CRC32 read from the directory is written back");
+        let conn = f.ctx.db.get().unwrap().conn();
+        let strong: Option<String> = conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert!(strong.is_some(), "a verified extraction banks the strong hash");
+    }
+
+    #[test]
+    fn a_row_of_ours_whose_entry_no_longer_matches_the_plan_fails_and_leaves_nothing_cached() {
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("M31.zip", &[("L_001.fits", light(1))]);
+        let id = make_ours(&f, &paths[0], "0000000000000000");
+        let err = mat(&f.ctx, &paths).unwrap_err().to_string();
+        assert!(err.contains("entry changed since it was archived"), "{err}");
+        assert!(err.contains("L_001.fits") && err.contains("M31.zip"), "{err}");
+        assert!(f.cache_files().is_empty(), "the unverified file is not left to be served as a hit: {:?}", f.cache_files());
+        assert!(row_col(&f, id, "archive_entry_crc32").is_none(), "no CRC32 is recorded from a failed check");
+        // Asking again fails the same way (a stale file would have become a silent hit).
+        assert!(mat(&f.ctx, &paths).is_err());
+    }
+
+    #[test]
+    fn rows_without_a_crc_read_each_zips_directory_once() {
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("a.fits", light(1)), ("b.fits", light(2)), ("c.fits", light(3))]);
+        let rows = {
+            let conn = f.ctx.db.get().unwrap().conn();
+            conn.execute("UPDATE files SET archive_entry_crc32 = NULL", []).unwrap();
+            let values: Vec<rusqlite::types::Value> = paths.iter().map(|p| rusqlite::types::Value::Text(p.clone())).collect();
+            query_rows(&conn, "path", &values).unwrap()
+        };
+        assert_eq!(rows.len(), 3);
+        let mut facts = ZipFacts::default();
+        for row in rows {
+            let job = resolve(&mut facts, &f.ctx.zip_cache, row).unwrap();
+            assert!(job.learned_crc.is_some() && job.expected_crc.is_none());
+        }
+        assert_eq!(facts.directory_reads, 1, "one directory read for three rows of one zip");
     }
 
     #[test]
