@@ -37,8 +37,31 @@ impl PartialZip {
         std::fs::rename(&self.path, target)
             .with_context(|| format!("failed to move {} onto {}", self.path.display(), target.display()))?;
         self.armed = false;
+        // The caller records the rename in the catalog database right after this returns, and that
+        // database is usually on another device than the archive. Make the rename durable first: after a
+        // power loss the record must never outlive the rename it vouches for (rollback deletes the target
+        // on the strength of that record). Some network and exFAT mounts refuse to sync a directory; that
+        // must not fail an archive whose zip is already in place.
+        if let Err(e) = sync_parent_dir(target) {
+            tracing::warn!(path = %target.display(), error = %e, "could not sync the folder after publishing a zip");
+        }
         Ok(())
     }
+}
+
+/// fsyncs the directory holding `path`, so a rename into it survives a power loss. Unix only: Windows
+/// has no directory handle to sync, and the call is a no-op there.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl Drop for PartialZip {
@@ -85,12 +108,19 @@ pub fn build_zip_partial(
     compression: ArchiveCompression,
     on_entry: Option<&dyn Fn(usize, usize)>,
 ) -> Result<PartialZip> {
-    let partial_path = crate::zip_store::reader::partial_path(target);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&partial_path)
-        .with_context(|| format!("failed to create zip file {}", partial_path.display()))?;
+    // `create_new` never reuses a file: a leftover of the same name (a crashed run's partial when the
+    // process id repeats, as in a container, and the counter restarts at 0) makes the next name be tried.
+    let mut attempts = 0u32;
+    let (partial_path, file) = loop {
+        let partial_path = crate::zip_store::reader::partial_path(target);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&partial_path) {
+            Ok(file) => break (partial_path, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 1000 => attempts += 1,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to create zip file {}", partial_path.display()));
+            }
+        }
+    };
     let partial = PartialZip { path: partial_path, armed: true };
     let mut zw = ZipWriter::new(BufWriter::new(file));
 
@@ -174,7 +204,7 @@ fn partial_pid(file_name: &str, prefix: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -248,5 +278,40 @@ mod tests {
         let f = File::open(&zip_path).unwrap();
         let zr = zip::ZipArchive::new(BufReader::new(f)).unwrap();
         assert_eq!(zr.len(), 1);
+    }
+
+    /// Creates leftovers named like the next partials of this process, as a crashed run with the same
+    /// pid (a container) and a restarted counter would have left them.
+    pub(crate) fn leave_own_pid_partials_ahead(target: &Path) -> Vec<PathBuf> {
+        let probe = crate::zip_store::reader::partial_path(target);
+        let name = probe.file_name().unwrap().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".partial").unwrap();
+        let (head, n) = stem.rsplit_once('-').unwrap();
+        let n: u64 = n.parse().unwrap();
+        (n..n + 200)
+            .map(|k| {
+                let p = target.with_file_name(format!("{head}-{k}.partial"));
+                std::fs::write(&p, b"leftover of a crashed run").unwrap();
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_leftover_partial_of_the_same_name_does_not_fail_the_build() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.fits");
+        std::fs::write(&src, b"file-a-content").unwrap();
+        let zip_path = tmp.path().join("out.zip");
+        let leftovers = leave_own_pid_partials_ahead(&zip_path);
+
+        build_zip(
+            &zip_path,
+            &[ZipEntry { source_path: src, path_in_zip: "a.fits".into() }],
+            ArchiveCompression::Store,
+        )
+        .unwrap();
+        assert!(zip_path.exists());
+        assert!(leftovers.iter().all(|p| p.exists()), "a leftover that is not ours to reuse is not touched");
     }
 }

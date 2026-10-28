@@ -129,21 +129,7 @@ pub(crate) fn finish_forward_operation(
             tracing::info!(operation_id, "archive operation completed");
             "completed"
         }
-        Err(e) => {
-            let outcome = if was_cancelled(e) {
-                let _ = adb::update_operation_status(conn, operation_id, ArchiveStatus::Cancelled, None);
-                "cancelled"
-            } else {
-                tracing::error!(operation_id, error = ?e, "archive operation failed");
-                let msg = format!("{:#}", e);
-                let _ = adb::update_operation_status(conn, operation_id, ArchiveStatus::Failed, Some(&msg));
-                "failed"
-            };
-            if let Err(rb_err) = crate::archive::rollback::rollback_operation(conn, operation_id, emitter) {
-                tracing::error!(operation_id, error = ?rb_err, "rollback after failed archive operation also failed, operation may be left in an inconsistent state");
-            }
-            outcome
-        }
+        Err(e) => fail_and_roll_back(conn, operation_id, emitter, e),
     };
     emit_event(
         emitter,
@@ -151,6 +137,44 @@ pub(crate) fn finish_forward_operation(
         &serde_json::json!({ "operation_id": operation_id, "outcome": outcome }),
     );
     result
+}
+
+/// The failure path of a forward operation, shared by every worker that runs [`run_operation`]
+/// (`finish_forward_operation`, the calibration-archive worker in `api::masters`): note the error on the
+/// row, then roll back, and return the outcome name for the terminal event (`"cancelled"` / `"failed"`).
+///
+/// The row's status is NOT switched to `failed` / `cancelled` first. A rollback that refuses before it
+/// touches anything (the only copy of a frame would be lost) must leave the operation in the in-progress
+/// status it died in: `list_unfinished_operations` then offers Resume / Roll back again, where a `failed`
+/// row would be invisible to the banner. A rollback that completes ends the row at `rolled_back`, the
+/// terminal state both orderings reached before.
+pub fn fail_and_roll_back(
+    conn: &Connection,
+    operation_id: i64,
+    emitter: &dyn ProgressEmitter,
+    err: &anyhow::Error,
+) -> &'static str {
+    let outcome = if was_cancelled(err) {
+        "cancelled"
+    } else {
+        tracing::error!(operation_id, error = ?err, "archive operation failed");
+        let msg = format!("{:#}", err);
+        if let Err(e) = conn.execute(
+            "UPDATE archive_operations SET error_message = ?1 WHERE id = ?2",
+            rusqlite::params![msg, operation_id],
+        ) {
+            tracing::error!(operation_id, error = ?e, "could not record the failure on the archive operation");
+        }
+        "failed"
+    };
+    if let Err(rb_err) = crate::archive::rollback::rollback_operation(conn, operation_id, emitter) {
+        tracing::error!(
+            operation_id,
+            error = ?rb_err,
+            "rollback after failed archive operation also failed; the operation keeps its in-progress status and can be resumed or rolled back again"
+        );
+    }
+    outcome
 }
 
 /// Stage 2: copy each file into staging. Idempotent per row: if a step exists
@@ -294,9 +318,10 @@ fn zip_phase(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create zip dir {}", parent.display()))?;
         }
-        // A build that died with its process left a partial of a dead pid here: the resumed run must
-        // not leave it behind next to the zip it is about to publish.
-        sweep_stale_partials_beside(&zip_path, false);
+        // A build that died with its process left a partial here: the resumed run must not leave it behind
+        // next to the zip it is about to publish. This process's own id counts as stale too (a container
+        // runs as pid 1 every time, so a crashed run's partial carries the id of the run that resumes).
+        sweep_stale_partials_beside(&zip_path, true);
 
         // Build the zip from staging files.
         let entries: Vec<ZipEntry> = group.iter().map(|f| ZipEntry {
@@ -1123,5 +1148,20 @@ mod tests {
             [op_id], |r| r.get(0),
         ).unwrap();
         assert_eq!(steps, 0);
+    }
+
+    #[test]
+    fn a_resumed_build_clears_leftover_partials_with_this_process_id() {
+        let (conn, arch, _scan, op_id) = run_full_fixture();
+        let files = adb::list_operation_files(&conn, op_id).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        staging::ensure_staging_dir(arch.path(), op_id).unwrap();
+        test_phases::copy_only(&conn, op_id, &files, arch.path(), &cancel).unwrap();
+        let target = PathBuf::from(&files[0].target_zip_path);
+        let leftovers = crate::archive::zip_writer::tests::leave_own_pid_partials_ahead(&target);
+
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+        assert!(target.exists());
+        assert!(leftovers.iter().all(|p| !p.exists()), "the resume removes the crashed run's partials");
     }
 }

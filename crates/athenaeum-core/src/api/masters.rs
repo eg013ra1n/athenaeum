@@ -2517,8 +2517,8 @@ pub fn archive_originals(
     emitter: Arc<dyn ProgressEmitter>,
     calibration_set_id: i64,
 ) -> Result<i64, ApiError> {
-    use crate::archive::models::{ArchiveCompression, ArchiveStatus, ConflictResolution};
-    use crate::archive::{db as adb, executor, planner, rollback};
+    use crate::archive::models::{ArchiveCompression, ConflictResolution};
+    use crate::archive::{executor, planner};
     use crate::services::operation_queue::{OperationKind, QueuedJob};
     use crate::services::ArchiveHandle;
 
@@ -2573,25 +2573,7 @@ pub fn archive_originals(
                     tracing::info!(operation_id = op_id, "calibration archive operation completed");
                     "completed"
                 }
-                Err(e) => {
-                    let outcome = if executor::was_cancelled(&e) {
-                        let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Cancelled, None);
-                        "cancelled"
-                    } else {
-                        tracing::error!(operation_id = op_id, error = ?e, "calibration archive operation failed");
-                        let msg = format!("{:#}", e);
-                        let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Failed, Some(&msg));
-                        "failed"
-                    };
-                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, emitter_for_worker.as_ref()) {
-                        tracing::error!(
-                            operation_id = op_id, error = ?rb_err,
-                            "rollback after failed calibration archive operation also failed, \
-                             operation may be left in an inconsistent state"
-                        );
-                    }
-                    outcome
-                }
+                Err(e) => executor::fail_and_roll_back(&conn, op_id, emitter_for_worker.as_ref(), &e),
             };
             emit_event(
                 emitter_for_worker.as_ref(),

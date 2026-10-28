@@ -12,6 +12,11 @@
 //! removes (a) the operation's stale partials beside its targets and (b) a target zip only when a
 //! `zip_publish` step says this operation put it there. It refuses to start while a zip it would
 //! delete may hold the only copy of a frame (a moved source that is neither on disk nor in staging).
+//!
+//! Residual, accepted: a failure in a later phase, after the rename, rolls back by deleting the NEW zip;
+//! when the build replaced an old zip (Overwrite), that old file was already replaced by the user's own
+//! choice and does not come back (a zip with cataloged frames is refused earlier, so only uncataloged
+//! content is ever overwritten).
 
 use crate::archive::db as adb;
 use crate::archive::models::{
@@ -94,7 +99,10 @@ pub fn rollback_operation(
     }
     let archive_root = PathBuf::from(&op.archive_root_path);
     let files = adb::list_operation_files(conn, operation_id)?;
-    let deleted_file_ids = file_ids_with_done_step(conn, operation_id, ArchiveStage::DeleteSource)?;
+    // A DeleteSource step in ANY status counts: the executor inserts it InProgress before it removes the
+    // source, so a crash (or a failed status write) between the remove and the Done update leaves the
+    // source gone with the step still InProgress. Only the staged copy then has the frame.
+    let deleted_file_ids = file_ids_with_any_step(conn, operation_id, ArchiveStage::DeleteSource)?;
     let published = file_ids_with_done_step(conn, operation_id, ArchiveStage::ZipPublish)?;
     let published_zips: HashSet<&str> = files
         .iter()
@@ -143,18 +151,16 @@ pub fn rollback_operation(
     // DeleteSource step is *not* the same as "a source was deleted": a
     // copy-disposition calibration gets that step too, with nothing removed
     // from disk (see `executor::delete_sources_phase`).
-    let total = files
+    // The same test the pre-flight used: a move file whose DeleteSource step exists in any status, or
+    // whose source is gone while a zip of this operation stands.
+    let to_restore: Vec<&crate::archive::models::ArchiveOperationFile> = files
         .iter()
-        .filter(|f| deleted_file_ids.contains(&f.id) && f.disposition == "move")
-        .count();
+        .filter(|f| f.disposition == "move")
+        .filter(|f| deleted_file_ids.contains(&f.id) || (!published_zips.is_empty() && !Path::new(&f.source_path).exists()))
+        .collect();
+    let total = to_restore.len();
     let mut restored = 0usize;
-    for f in files.iter() {
-        if !deleted_file_ids.contains(&f.id) {
-            continue;
-        }
-        if f.disposition != "move" {
-            continue;
-        }
+    for f in to_restore {
         restored += 1;
         emit_event(emitter, "archive-progress", &RollbackProgress {
             operation_id,
@@ -240,6 +246,23 @@ pub fn rollback_operation(
 
     adb::update_operation_status(conn, operation_id, ArchiveStatus::RolledBack, None)?;
     Ok(())
+}
+
+/// Files with a step of `stage` in any status.
+fn file_ids_with_any_step(
+    conn: &Connection,
+    operation_id: i64,
+    stage: ArchiveStage,
+) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT operation_file_id
+         FROM archive_operation_steps
+         WHERE operation_id = ?1 AND stage = ?2 AND operation_file_id IS NOT NULL",
+    )?;
+    let rows: Vec<i64> = stmt
+        .query_map(rusqlite::params![operation_id, stage.as_str()], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Files with a Done step of `stage`.
@@ -808,5 +831,66 @@ mod tests {
         assert!(format!("{err:#}").contains("use Unarchive"), "{err:#}");
         assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "completed");
         assert_eq!(std::fs::read(&zip).unwrap(), b"finished zip");
+    }
+
+    #[test]
+    fn a_source_removed_before_its_delete_step_was_marked_done_is_restored_from_staging() {
+        // Crash (or a failed status write) between remove_file(source) and the Done update: the step is
+        // still Pending, the source is gone, and staging holds the only copy besides the zip.
+        let (conn, arch, scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        let files = adb::list_operation_files(&conn, op_id).unwrap();
+        for f in &files[..2] {
+            std::fs::remove_file(&f.source_path).unwrap();
+            let sid = adb::insert_step(&conn, op_id, Some(f.id), ArchiveStage::DeleteSource).unwrap();
+            adb::update_step(&conn, sid, StepStatus::Done, None, None).unwrap();
+        }
+        let last = &files[2];
+        std::fs::remove_file(&last.source_path).unwrap();
+        adb::insert_step(&conn, op_id, Some(last.id), ArchiveStage::DeleteSource).unwrap(); // left Pending
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::DeletingSources, None).unwrap();
+        let zip = target_zip(&conn, op_id);
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        for name in ["L_001", "L_002", "L_003"] {
+            let p = scan.path().join(format!("M31/{name}.fits"));
+            assert!(p.exists(), "{} is back", p.display());
+        }
+        assert_eq!(std::fs::read(scan.path().join("M31/L_003.fits")).unwrap(), b"light-3");
+        assert!(!Path::new(&zip).exists(), "the zip goes only after every source is back");
+        assert!(!crate::archive::staging::staging_dir(arch.path(), op_id).exists());
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn a_refused_rollback_after_a_failed_run_leaves_the_operation_listed_as_unfinished() {
+        // The archive drive drops after the sources were deleted: the run fails, the rollback is refused
+        // (the zip and staging are unreachable), and the banner must still offer Resume / Roll back.
+        let (conn, arch, scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        delete_sources(&conn, op_id);
+        mark_rows_archived(&conn, op_id);
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::Finalizing, None).unwrap();
+        let offline = arch.path().with_extension("offline");
+        std::fs::rename(arch.path(), &offline).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = crate::archive::executor::run_operation_standalone(&conn, op_id, &cancel, &NullEmitter).unwrap_err();
+        let op = adb::get_operation(&conn, op_id).unwrap();
+        assert!(
+            adb::list_unfinished_operations(&conn).unwrap().iter().any(|o| o.id == op_id),
+            "status {} is not offered for resume ({err:#})", op.status
+        );
+        assert!(op.error_message.is_some(), "the failure is kept on the row");
+        assert!(!scan.path().join("M31/L_001.fits").exists(), "nothing was changed");
+        assert_eq!(archived_row_count(&conn), 3);
+
+        // The drive comes back; the user rolls back from the banner.
+        let _ = std::fs::remove_dir_all(arch.path());
+        std::fs::rename(&offline, arch.path()).unwrap();
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(scan.path().join("M31/L_001.fits").exists());
+        assert_eq!(archived_row_count(&conn), 0);
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
     }
 }
