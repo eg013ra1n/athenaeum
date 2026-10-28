@@ -519,10 +519,13 @@ pub async fn get_frame_star_metrics(
     // Reads the ROWORDER header, so a zip-resident frame is extracted (or reused from the cache) first.
     // An unreachable zip is an error here: a silent `false` would flip the stored stars the wrong way.
     drop(conn);
-    let (flip_local, flip_pin) = crate::zip_store::materialize::materialize_one(ctx, &path).map_err(|e| {
-        tracing::warn!(frame_id, path = %path, error = %e, "frame is not readable for star metrics");
-        ApiError::Internal(format!("{}: {}", path, e))
-    })?;
+    // `block_in_place`: the extraction is a full entry decompress (possibly over a share); it must not pin an async
+    // worker (both hosts run the multi-thread runtime).
+    let (flip_local, flip_pin) =
+        tokio::task::block_in_place(|| crate::zip_store::materialize::materialize_one(ctx, &path)).map_err(|e| {
+            tracing::warn!(frame_id, path = %path, error = %e, "frame is not readable for star metrics");
+            ApiError::Internal(format!("{}: {}", path, e))
+        })?;
     let flip_vertical = detect_flip_vertical(&flip_local.to_string_lossy());
     let conn = db_handle.conn();
 
@@ -554,11 +557,13 @@ pub async fn get_frame_star_metrics(
     // `flip_pin` (taken above) keeps the cache file of a zip-resident frame alive across the analysis.
     let path_owned = flip_local.to_string_lossy().into_owned();
 
+    // The pin moves into the closure: a dropped handler future (client disconnect) must not release the cache file
+    // while the blocking thread still reads it.
     let analysed = tokio::task::spawn_blocking(move || {
+        let _pin = flip_pin;
         analyzer::analyze_frame(&path_owned, &analysis_config, Some(&pool), &config_hash)
     })
     .await;
-    drop(flip_pin);
     let (mut analysis, mut stars, flip_vertical) = analysed
         .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
         .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
@@ -615,14 +620,17 @@ pub async fn compute_flat_contour_plot(
         .map_err(|e| ApiError::NotFound(format!("File not found (id={}): {}", file_id, e)))?
     };
 
-    let (local, pin) = crate::zip_store::materialize::materialize_one(ctx, &path).map_err(|e| {
-        tracing::warn!(file_id, path = %path, error = %e, "flat is not readable for the contour plot");
-        ApiError::Internal(format!("Flat contour analysis failed: {}: {}", path, e))
-    })?;
+    let (local, pin) =
+        tokio::task::block_in_place(|| crate::zip_store::materialize::materialize_one(ctx, &path)).map_err(|e| {
+            tracing::warn!(file_id, path = %path, error = %e, "flat is not readable for the contour plot");
+            ApiError::Internal(format!("Flat contour analysis failed: {}: {}", path, e))
+        })?;
     let local = local.to_string_lossy().into_owned();
-    let computed =
-        tokio::task::spawn_blocking(move || flat_analysis::compute_flat_contour_plot(&local, opts)).await;
-    drop(pin);
+    let computed = tokio::task::spawn_blocking(move || {
+        let _pin = pin;
+        flat_analysis::compute_flat_contour_plot(&local, opts)
+    })
+    .await;
     let result = computed
         .map_err(|e| ApiError::Internal(format!("Flat contour analysis panicked: {}", e)))?
         .map_err(|e| ApiError::Internal(format!("Flat contour analysis failed: {}", e)))?;
@@ -695,7 +703,7 @@ mod tests {
 
     /// C5 review I1: a trailed / defocused / no-stars frame stores no `StarMetric`, so its verdict alone makes a fresh
     /// row servable. The file does not exist: a re-analysis would fail, so an `Ok` proves none ran.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_fresh_row_with_a_verdict_and_no_stars_is_served_without_reanalysis() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
@@ -708,7 +716,7 @@ mod tests {
 
     /// C6 review m6: a STALE row (another config hash) that carries a verdict is not served; the re-analysis is
     /// attempted, and with the file absent it fails.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_row_with_a_verdict_is_reanalyzed() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
@@ -736,7 +744,7 @@ mod tests {
 
     /// C6 review m7: a row with the current hash but no `measure_version` (written between C5 and C6) is stale in the
     /// on-demand path.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_row_with_the_current_hash_but_no_measure_version_is_reanalyzed() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
@@ -863,7 +871,7 @@ mod tests {
         assert!(db_analysis::get_frame_analysis(&conn, gone_frame).unwrap().is_none(), "the unreachable frame got no row");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn get_frame_star_metrics_and_the_flat_plot_read_a_zip_resident_frame() {
         let rig = zip_rig();
         let (_zip, frame_id) = rig.zipped_light("night", 1);

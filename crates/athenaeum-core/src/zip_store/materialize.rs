@@ -448,6 +448,10 @@ pub fn materialize_paths(
 /// [`materialize_paths`] for one frame: its local path and, for a zip-resident row, the pin that keeps the
 /// cache file until dropped. For callers that apply their own per-frame failure policy.
 pub fn materialize_one(ctx: &ServiceContext, catalog_path: &str) -> Result<(PathBuf, Option<Pinned>)> {
+    // No catalog yet means no zip-resident row can exist: the path is a plain file and passes through.
+    if ctx.db.get().is_none() {
+        return Ok((PathBuf::from(catalog_path), None));
+    }
     let paths = [catalog_path.to_string()];
     let done = materialize_paths(ctx, &paths, &NullEmitter, "", &AtomicBool::new(false))?;
     let local = done.local(catalog_path).to_path_buf();
@@ -459,6 +463,10 @@ pub fn materialize_one(ctx: &ServiceContext, catalog_path: &str) -> Result<(Path
 /// mtime plus the entry's size and CRC32 (so a rewritten zip or a re-cataloged entry changes the key). `Err`
 /// when the zip cannot be reached, which is the same fail-fast a deleted file gives.
 pub fn preview_identity(ctx: &ServiceContext, catalog_path: &str) -> Result<Option<String>> {
+    // No catalog yet: nothing is zip-resident, so the caller keys the plain file.
+    if ctx.db.get().is_none() {
+        return Ok(None);
+    }
     let db = db_of(ctx)?;
     let rows = {
         let conn = db.conn();
@@ -595,6 +603,43 @@ mod materialize_tests {
         // A zip that is gone fails like a deleted file.
         std::fs::remove_file(&zip_a).unwrap();
         assert_eq!(key(&paths_a[0]).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn rewriting_the_zip_changes_the_preview_key() {
+        let f = fixture();
+        let (zip, paths) = f.catalog_zip("a.zip", &[("Lights/L_001.fits", light(1))]);
+        let key = |ctx: &ServiceContext| crate::cache::catalog_preview_cache_key(ctx, &paths[0], "preview").unwrap();
+        let before = key(&f.ctx);
+        // Same zip path, same entry path, different bytes (and a different size): re-cataloged by the scanner.
+        let mut longer = light(2);
+        longer.extend_from_slice(&[7u8; 5760]);
+        let again = make_zip(&f.root(), "a.zip", &[("Lights/L_001.fits", longer)], ArchiveCompression::Deflate);
+        assert_eq!(again, zip);
+        {
+            let conn = f.ctx.db.get().unwrap().conn();
+            scan_zip(&conn, &zip, 1, false).unwrap();
+        }
+        let after = key(&f.ctx);
+        assert_ne!(before, after, "a rewritten zip must not serve the old zip's preview");
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 0, "a key never extracts");
+    }
+
+    #[test]
+    fn a_plain_path_passes_through_without_a_catalog() {
+        let tmp = TempDir::new().unwrap();
+        let mut ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        ctx.db = std::sync::OnceLock::new();
+        let disk = tmp.path().join("plain.fits");
+        std::fs::write(&disk, light(1)).unwrap();
+        let p = disk.to_string_lossy().into_owned();
+        let (local, pin) = materialize_one(&ctx, &p).unwrap();
+        assert_eq!(local, disk);
+        assert!(pin.is_none());
+        assert_eq!(
+            crate::cache::catalog_preview_cache_key(&ctx, &p, "preview").unwrap(),
+            crate::cache::preview_cache_key(&disk, "preview").unwrap()
+        );
     }
 
     #[test]

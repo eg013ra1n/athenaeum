@@ -180,7 +180,14 @@ pub async fn verify_duplicate_pair(
     file_b: i64,
     state: State<'_, AppState>,
 ) -> Result<athenaeum_core::duplicates::VerifyPairResult, String> {
-    athenaeum_core::api::files::verify_duplicate_pair(&state.ctx, file_a, file_b)
+    // Off the async worker: a zip-resident copy is extracted (a full entry decompress) before the compare.
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || athenaeum_core::api::files::verify_duplicate_pair(&ctx, file_a, file_b))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "duplicate verify task panicked");
+            format!("Duplicate verify task panicked: {e}")
+        })?
         .map_err(|e| e.to_string())
 }
 
