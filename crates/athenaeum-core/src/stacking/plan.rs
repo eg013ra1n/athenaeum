@@ -24,7 +24,7 @@ use crate::db::stacking::{
     active_run_for_subject, find_artifact, get_set_config, list_artifacts, list_frame_rows,
     list_runs, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
 };
-use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
+use crate::export::{applied_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
 use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, upsert_registration,
@@ -419,43 +419,29 @@ pub(crate) fn prepare_hash_for_project(
 }
 
 /// Stage 1 (calibration) config-hash for one LIGHT frame (spec §9.3):
-/// `calibration_subtree(cfg)` + the identity of every resolved master path
-/// this frame would actually apply ([`resolved_master_paths`]) + the light's
-/// own `files` identity. Resolves the frame's calibration plan
-/// (`export::resolve_generation_cached`) to learn which masters apply — the
-/// same resolution the calibrate stage itself performs — using the process
-/// temp directory as the flat-norm-divisor scratch space (the same fallback
-/// `api::export`/`api::sync_prepare` use when no run-specific scratch
-/// directory is available; only read when a master flat carries no usable
-/// `ATH_FNRM`/`ATH_FNR*` card, so the common case touches no scratch file at
-/// all).
+/// `calibration_subtree(cfg)` + the identity of every master path this
+/// frame would actually apply ([`applied_master_paths`]: the catalog's links
+/// under the generator's own applicability rules, no file read — so a master
+/// inside a zip needs no extraction to be named) + the light's own `files`
+/// identity.
 ///
-/// `divisors` is the caller's [`DivisorCache`] — a build resolves every
-/// frame in a frame set, and a set overwhelmingly shares one flat per group,
-/// so a fresh cache per call (the original round's mistake) re-reads that
-/// whole flat plane once per frame instead of once per (flat, mosaic phase)
-/// pair. **Callers within this module never call this directly — go through
-/// [`HashMemo::calibration_hash`]**, which also memoizes the RESULT per
-/// frame for the life of one [`build_plan`] call; this function itself does
-/// no memoization of its own.
+/// `_divisors` is kept for the callers' signature: the hash no longer
+/// resolves the flat-normalization divisor (the calibrate stage's own
+/// resolve does, once per (flat, mosaic phase) through the same
+/// [`DivisorCache`]). **Callers within this module never call this
+/// directly — go through [`HashMemo::calibration_hash`]**, which memoizes the
+/// RESULT per frame for the life of one [`build_plan`] call; this function
+/// itself does no memoization of its own.
 pub(crate) fn calibration_hash_for(
     conn: &Connection,
     cfg: &StackingConfig,
     frame: &GroupFrame,
-    divisors: &mut DivisorCache,
+    _divisors: &mut DivisorCache,
 ) -> Result<String, ApiError> {
-    let scratch_dir = std::env::temp_dir();
-    let spec = resolve_generation_cached(
-        conn,
-        frame.frame_id,
-        &cfg.calibration,
-        &scratch_dir,
-        divisors,
-    )?;
-
-    let mut specs = HashMap::with_capacity(1);
-    specs.insert(frame.frame_id, spec);
-    let master_paths = resolved_master_paths(&specs);
+    // The masters are named from the catalog alone: the hash needs their identity, never their pixels or
+    // the flat-normalization divisor (the run's own resolve reads those, through the zip cache for a master
+    // inside a zip). The same applicability rules as the resolve, so a light it would refuse is refused here.
+    let master_paths = applied_master_paths(conn, frame.frame_id, &cfg.calibration)?;
 
     let upstream: Vec<String> = master_paths
         .iter()

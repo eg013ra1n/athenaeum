@@ -3446,6 +3446,18 @@ pub(crate) fn plan_selection_package(
         };
 
         let path = entry.source_path.as_path();
+        // A file inside a zip is not sent in v1 (the wire is frozen; materializing for a send is phase 2):
+        // its row has no file at `path`, which would otherwise read as "missing on disk".
+        if crate::zip_store::presence::markers_say_zip_resident(
+            file.archive_zip_path.as_deref(),
+            file.archive_path_in_zip.as_deref(),
+        ) {
+            ineligible.push(IneligibleFrame {
+                frame_id: entry.frame_id,
+                reason: crate::zip_store::presence::INSIDE_A_ZIP_REASON.to_string(),
+            });
+            continue;
+        }
         if !path.exists() {
             ineligible.push(IneligibleFrame {
                 frame_id: entry.frame_id,
@@ -10373,6 +10385,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(banked, 3);
+    }
+
+    /// A file inside a zip is not sent in v1 (the wire is frozen): its row has no file at the catalog path,
+    /// which used to read "file missing on disk". It is ineligible with the unpack reason, the disk file in the
+    /// same selection is planned as usual, and a genuinely missing file keeps its own reason.
+    #[test]
+    fn sync_selection_marks_zip_resident_files_ineligible_with_the_unpack_reason() {
+        use crate::package::PayloadKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+
+        let on_disk = tmp.path().join("L_disk.fits");
+        let zipped = tmp.path().join("L_zip.fits");
+        for p in [&on_disk, &zipped] {
+            std::fs::write(p, vec![7u8; 128]).unwrap();
+        }
+        for (file_id, frame_id, path) in [(1i64, 10i64, &on_disk), (2, 11, &zipped)] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 128, '2026-07-05T00:00:00Z', 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, uuid) VALUES (?1, ?2, 'Light', ?3)",
+                rusqlite::params![frame_id, file_id, format!("uuid-{frame_id}")],
+            )
+            .unwrap();
+        }
+        let virtual_path = zip_files(&conn, &[2], &tmp.path().join("night.zip"), Shape::Foreign).remove(0);
+        let entry = |frame_id: i64, source: std::path::PathBuf, rel: &str| PayloadEntry {
+            frame_id,
+            source_path: source,
+            rel_path: rel.into(),
+            kind: PayloadKind::RawFrame,
+            generate: false,
+        };
+        let input = SelectionInput {
+            entries: vec![
+                entry(10, on_disk.clone(), "lights/L_disk.fits"),
+                entry(11, std::path::PathBuf::from(&virtual_path), "lights/L_zip.fits"),
+            ],
+            ineligible: Vec::new(),
+            ancestor: None,
+            total: 2,
+        };
+        let planned = plan_selection_package(
+            &conn,
+            "ab".repeat(32).as_str(),
+            &tmp.path().join("packages"),
+            input,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(planned.eligible, vec![10]);
+        assert_eq!(planned.ineligible.len(), 1);
+        assert_eq!(planned.ineligible[0].frame_id, 11);
+        assert_eq!(planned.ineligible[0].reason, "inside a zip \u{2014} unpack it first");
     }
 
     /// An entry the composer marked `generate` is planned as work, not as a

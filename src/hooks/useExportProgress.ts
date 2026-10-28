@@ -83,6 +83,7 @@ export function useExportProgress() {
                 copied: payload.copied,
                 rewritten: payload.rewritten,
                 failed: payload.failed,
+                zipCopied: payload.zipCopied ?? 0,
               },
               progress: null,
             });

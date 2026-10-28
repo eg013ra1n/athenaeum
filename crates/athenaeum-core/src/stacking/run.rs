@@ -41,7 +41,7 @@ use crate::db::stacking::{
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::{
-    execute_generation, resolve_generation_cached, CalibratedLightOptions, GeneratedLight,
+    execute_generation, CalibratedLightOptions, GeneratedLight,
     GenerationSpec,
 };
 use crate::fits_parser::FitsHeader;
@@ -1570,7 +1570,7 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
 /// `RunError::Cancelled`, same as every other stage.
 ///
 /// A rebuilt master's file changes size/mtime on disk, which the stage-1
-/// hash (`calibration_hash_for`) reads straight back via `resolved_master_paths`
+/// hash (`calibration_hash_for`) reads straight back via `applied_master_paths`
 /// — a light whose calibration plan resolves to a master this stage just
 /// rebuilt therefore computes a DIFFERENT stage-1 hash than any previous
 /// run recorded, so its `calibrated` artifact (if any existed) reads as
@@ -1771,6 +1771,8 @@ struct CalibrateJob {
     out: PathBuf,
     mosaic_out: Option<PathBuf>,
     opts: CalibratedLightOptions,
+    /// Keeps the zip-cache files `spec` reads (a zip light, zip masters) from eviction until the job is dropped.
+    _pins: Vec<crate::zip_store::cache::Pinned>,
 }
 
 /// One group's resolved stage-1 work (Task 13c L4a): the jobs left after cache reuse and exclusions, and the
@@ -2065,6 +2067,30 @@ fn resolve_calibrate_job(
     // Skipping the fsync still keeps the write atomic (tmp + rename).
     calibration_opts.skip_fsync = true;
 
+    // Masters inside a zip are extracted BEFORE the catalog borrow below (a connection is never held across
+    // an extraction); the resolve reads them from the cache. The pins ride in the job until its fan-out ends.
+    let zip_masters = if matches!(
+        origin_of(&rc.origins, frame.frame_id),
+        Ok(FrameOrigin::Catalog { attested: false, .. })
+    ) {
+        match crate::export::ZipMasters::extract_for_frames(
+            &rc.ctx,
+            &[frame.frame_id],
+            &rc.cancel,
+            &mut |_, _, _| {},
+        ) {
+            Ok(found) => found,
+            Err(e) => {
+                rc.check_cancel()?;
+                return Ok(CalibrateResolved::Excluded {
+                    reason: format!("calibration failed: {e:#}"),
+                });
+            }
+        }
+    } else {
+        crate::export::ZipMasters::none()
+    };
+    rc.check_cancel()?;
     let spec = {
         let conn = db(&rc.ctx)?.conn();
         // Dispatched by origin like the stage-1 hash above: a frame whose id
@@ -2074,12 +2100,13 @@ fn resolve_calibrate_job(
             Ok(FrameOrigin::Catalog { attested: true, .. }) => {
                 Err("an attested frame is prepared, never calibrated".to_string())
             }
-            Ok(FrameOrigin::Catalog { .. }) => resolve_generation_cached(
+            Ok(FrameOrigin::Catalog { .. }) => crate::export::resolve_generation_mapped(
                 &conn,
                 frame.frame_id,
                 &calibration_opts,
                 scratch,
                 rc.memo.divisors_mut(),
+                &|p| zip_masters.map(p),
             )
             .map_err(|e| format!("{e:#}")),
             // A project frame is prepared, never calibrated (spec §5.1).
@@ -2095,6 +2122,43 @@ fn resolve_calibrate_job(
             return Ok(CalibrateResolved::Excluded {
                 reason: format!("calibration failed: {e}"),
             })
+        }
+    };
+    // A light inside a zip is read from its extracted copy; the pin lives in the job (with the masters')
+    // until the group's fan-out ends.
+    let mut pins = zip_masters.into_pins();
+    let spec = {
+        let light_catalog_path = spec.inputs.light_path.to_string_lossy().into_owned();
+        let in_zip = {
+            let conn = db(&rc.ctx)?.conn();
+            crate::zip_store::presence::is_zip_resident_path(&conn, &light_catalog_path)
+        };
+        if in_zip {
+            match crate::zip_store::materialize::materialize_one_cancellable(
+                &rc.ctx,
+                &light_catalog_path,
+                &rc.cancel,
+            ) {
+                Ok((local, pin)) => {
+                    pins.extend(pin);
+                    spec.with_light_path(local)
+                }
+                Err(e) => {
+                    rc.check_cancel()?;
+                    tracing::error!(
+                        run_id = rc.run_id,
+                        frame_id = frame.frame_id,
+                        path = %light_catalog_path,
+                        error = %format!("{e:#}"),
+                        "light could not be read from its zip"
+                    );
+                    return Ok(CalibrateResolved::Excluded {
+                        reason: format!("calibration failed: cannot read the file: {e:#}"),
+                    });
+                }
+            }
+        } else {
+            spec
         }
     };
 
@@ -2128,6 +2192,7 @@ fn resolve_calibrate_job(
         out,
         mosaic_out,
         opts: calibration_opts,
+        _pins: pins,
     })))
 }
 
@@ -15862,6 +15927,7 @@ mod tests {
             out: dir.path().join(format!("o{id}.fits")),
             mosaic_out: None,
             opts: opts.clone(),
+            _pins: Vec::new(),
         };
         // Two lights share dark A, one uses dark B.
         let jobs = vec![job(1, &dark_a), job(2, &dark_a), job(3, &dark_b)];
@@ -16120,6 +16186,95 @@ mod tests {
             "the fixture's dark has MAD = 0: exactly one refusal warning is expected: {seq_warnings:?}"
         );
     }
+
+    /// Zip plan Task 9: the non-attested Calibrate stage reads lights AND masters out of zips. The same
+    /// frame set calibrated once from disk and once with every light and both masters inside a zip gives
+    /// byte-identical `calibrated` artifacts, no frame is excluded, and the stage-1 hash (which only names
+    /// the masters) resolved for every frame.
+    #[test]
+    fn calibrate_stage_reads_zip_resident_lights_and_masters_like_disk() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        let cfg = StackingConfig::default();
+        let calibrate = |working_dir: &Path| {
+            let layout = WorkingLayout::new(working_dir, &set_slug(SET_NAME));
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
+            let key = plan_groups[0].key.clone();
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                1,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups,
+                layout.clone(),
+                output.path().to_path_buf(),
+                HashMap::new(),
+            );
+            stage_calibrate(&mut rc).unwrap();
+            assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+            let dir = layout.calibrated_dir(&key);
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+                .collect();
+            files.sort();
+            files
+        };
+        let from_disk = calibrate(working.path());
+        assert_eq!(from_disk.len(), 3);
+
+        // Fresh stage-1 state, then every light and both masters go into one zip.
+        fixture.conn.execute("DELETE FROM stacking_artifacts", []).unwrap();
+        let mut file_ids: Vec<i64> = light_ids
+            .iter()
+            .map(|id| fixture.conn.query_row("SELECT file_id FROM frames WHERE id = ?1", [id], |r| r.get(0)).unwrap())
+            .collect();
+        let mut stmt = fixture
+            .conn
+            .prepare(
+                "SELECT DISTINCT fr.file_id FROM calibration_set cs
+                 JOIN calibration_set_frames csf ON csf.set_id = cs.id
+                 JOIN frames fr ON fr.id = csf.frame_id WHERE cs.is_master_library = 1",
+            )
+            .unwrap();
+        let masters: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        drop(stmt);
+        assert_eq!(masters.len(), 2, "a master dark and a master flat");
+        file_ids.extend(masters);
+        let zipped = zip_files(&fixture.conn, &file_ids, &tmp.path().join("night.zip"), Shape::Foreign);
+        assert!(zipped.iter().all(|p| !Path::new(p).exists()));
+
+        let before = ctx.zip_cache.extraction_count();
+        let working2 = tempfile::tempdir().unwrap();
+        let from_zip = calibrate(working2.path());
+        // The pixels are the contract. The headers differ in exactly one place by design: the provenance
+        // cards name the master by its catalog path, which for a zip master is `<zip>/<entry>`.
+        let data_of = |bytes: &[u8]| -> Vec<u8> {
+            let end = bytes
+                .chunks(80)
+                .position(|card| card.starts_with(b"END     "))
+                .expect("an END card");
+            let header_len = ((end + 1) * 80).div_ceil(2880) * 2880;
+            bytes[header_len..].to_vec()
+        };
+        assert_eq!(from_zip.len(), from_disk.len());
+        for ((name_z, bytes_z), (name_d, bytes_d)) in from_zip.iter().zip(&from_disk) {
+            assert_eq!(name_z, name_d);
+            assert!(
+                data_of(bytes_z) == data_of(bytes_d),
+                "{name_z}: a zip-resident night calibrates to the same pixels"
+            );
+        }
+        assert!(ctx.zip_cache.extraction_count() - before >= 5, "three lights and two masters were read out of the zip");
+    }
+
 
     #[test]
     fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {

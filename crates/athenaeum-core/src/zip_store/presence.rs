@@ -133,6 +133,43 @@ pub fn is_zip_resident_path(conn: &rusqlite::Connection, path: &str) -> bool {
     }
 }
 
+/// The ineligibility reason a transfer, personal sync or collab publish gives for a file that lives inside a zip
+/// (spec 7.9): the wire is frozen, so such a file is not sent in v1 and the user is told to unpack it.
+pub const INSIDE_A_ZIP_REASON: &str = "inside a zip \u{2014} unpack it first";
+
+/// `true` when both zip markers of a `files` row are set (the row is zip-resident).
+pub fn markers_say_zip_resident(archive_zip_path: Option<&str>, archive_path_in_zip: Option<&str>) -> bool {
+    archive_zip_path.is_some() && archive_path_in_zip.is_some()
+}
+
+/// Which of `paths` are catalog paths of zip-resident rows (both zip markers set), in one chunked query. A
+/// consumer that must copy instead of link, or refuse, decides per path from the set. A failed read is logged
+/// and treated as "none are zip-resident" for that chunk, the same fallback as [`zip_markers`].
+pub fn zip_resident_paths<S: AsRef<str>>(conn: &rusqlite::Connection, paths: &[S]) -> std::collections::HashSet<String> {
+    const CHUNK: usize = 400;
+    let mut found = HashSet::new();
+    for chunk in paths.chunks(CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let marks = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT path FROM files WHERE path IN ({marks})
+             AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL"
+        );
+        let values: Vec<&str> = chunk.iter().map(AsRef::as_ref).collect();
+        let result = conn.prepare(&sql).and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params_from_iter(values.iter()), |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        });
+        match result {
+            Ok(rows) => found.extend(rows),
+            Err(e) => tracing::warn!(error = %e, "zip presence: cannot read the file rows; treating them as disk files"),
+        }
+    }
+    found
+}
+
 /// One row to check: `(path, archive_zip_path, archive_path_in_zip)`.
 pub type PresenceKey<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
 

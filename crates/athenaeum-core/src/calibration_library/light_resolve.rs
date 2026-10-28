@@ -373,6 +373,64 @@ pub(crate) fn resolve_cfa_geometry(
     }))
 }
 
+/// The catalog paths of the masters a light's calibration READS: dark and flat when linked and built, the bias
+/// only when no dark resolved (the raw-master-dark convention, [`crate::export::calibrated_generator`]'s
+/// `master_paths_read`). Pure catalog reads: a caller about to extract the masters asks here first, before it
+/// holds a connection across slow work.
+pub fn linked_master_paths(conn: &Connection, frame_id: i64) -> anyhow::Result<Vec<String>> {
+    let links = get_links_for_frame(conn, frame_id)?;
+    let resolve = |cal_type: &str| -> anyhow::Result<Option<ResolvedMaster>> {
+        match link_set_id(&links, cal_type) {
+            Some(set_id) => resolve_master(conn, set_id),
+            None => Ok(None),
+        }
+    };
+    let dark = resolve("Dark")?;
+    let flat = resolve("Flat")?;
+    let bias = if dark.is_none() { resolve("Bias")? } else { None };
+    Ok([dark, flat, bias].into_iter().flatten().map(|m| m.path).collect())
+}
+
+/// The refusal sentence for [`zip_resident_inputs`]' answer: "the light is inside a zip — unpack it first",
+/// "the flat master is ...". One spelling for the send, sync and publish refusals.
+pub fn zip_inputs_sentence(inputs: &[(&'static str, String)]) -> String {
+    let what: Vec<String> = inputs
+        .iter()
+        .map(|(role, _)| if *role == "light" { "the light".to_string() } else { format!("the {role} master") })
+        .collect();
+    format!("{} {} {}", what.join(" and "), if what.len() == 1 { "is" } else { "are" }, crate::zip_store::presence::INSIDE_A_ZIP_REASON)
+}
+
+/// What of a light's inputs sits inside a zip: `("light", path)` for the light itself and `("dark"|"flat"|"bias",
+/// path)` for each master the calibration reads. Empty when everything is on disk. Transfers, personal sync and
+/// collab publish do not read from a zip (spec 7.9), so they ask here to refuse such a light with
+/// [`crate::zip_store::presence::INSIDE_A_ZIP_REASON`] instead of failing partway.
+pub fn zip_resident_inputs(conn: &Connection, frame_id: i64) -> anyhow::Result<Vec<(&'static str, String)>> {
+    let light: Option<String> = conn
+        .query_row(
+            "SELECT fi.path FROM frames fr JOIN files fi ON fi.id = fr.file_id WHERE fr.id = ?1",
+            params![frame_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let links = get_links_for_frame(conn, frame_id)?;
+    let mut inputs: Vec<(&'static str, String)> = Vec::new();
+    inputs.extend(light.map(|p| ("light", p)));
+    let mut dark_resolved = false;
+    for (role, cal_type) in [("dark", "Dark"), ("flat", "Flat"), ("bias", "Bias")] {
+        if role == "bias" && dark_resolved {
+            continue;
+        }
+        let Some(set_id) = link_set_id(&links, cal_type) else { continue };
+        let Some(master) = resolve_master(conn, set_id)? else { continue };
+        dark_resolved |= role == "dark";
+        inputs.push((role, master.path));
+    }
+    let paths: Vec<&str> = inputs.iter().map(|(_, p)| p.as_str()).collect();
+    let resident = crate::zip_store::presence::zip_resident_paths(conn, &paths);
+    Ok(inputs.into_iter().filter(|(_, p)| resident.contains(p)).collect())
+}
+
 pub fn resolve_frame_inputs(
     conn: &Connection,
     frame_id: i64,

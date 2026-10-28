@@ -25,6 +25,7 @@ use crate::export::models::{
 };
 use crate::export::project_collector::ProjectExportFrame;
 use crate::fits_writer::header_patch::{commit_tmp, discard_tmp, sibling_tmp};
+use crate::services::ServiceContext;
 
 pub const PROJECT_EXPORT_SENTINEL: i64 = -1;
 pub const EXPORT_RECORD_FILE: &str = ".athenaeum-export.json";
@@ -43,6 +44,9 @@ pub struct ProjectOrganizeResult {
     pub counts: PlaceCounts,
     pub warnings: Vec<String>,
     pub cancelled: bool,
+    /// Frames inside a zip that were copied although the run asked for links (a link into the zip cache
+    /// would dangle once the cache evicts the entry). Included in `counts.copied`.
+    pub zip_copied: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +322,10 @@ fn stale_warning(
     ))
 }
 
+/// `zip` is the context a frame inside a zip is read through (`zip_store::materialize`): such a frame is
+/// extracted into the zip cache and placed from there, copied even in link mode (a link into the cache
+/// dangles after eviction) and counted in [`ProjectOrganizeResult::zip_copied`]. `None` reads every
+/// landed path as a plain disk file.
 pub fn organize_project_export(
     title_dir: &Path,
     project_id: &str,
@@ -325,11 +333,24 @@ pub fn organize_project_export(
     use_symlinks: bool,
     emitter: Option<&dyn ProgressEmitter>,
     cancel_flag: &AtomicBool,
+    zip: Option<&ServiceContext>,
 ) -> Result<ProjectOrganizeResult> {
     let total: usize = publishers.iter().map(|(_, f)| f.len()).sum();
     let mut counts = PlaceCounts::default();
+    let mut zip_copied = 0usize;
     let mut warnings = Vec::new();
     let mut placed: BTreeMap<String, RecordEntry> = BTreeMap::new();
+    // Which landed files live inside a zip: one catalog read for the whole run.
+    let zip_resident: std::collections::HashSet<String> = match zip.and_then(|ctx| ctx.db.get()) {
+        Some(db) => {
+            let paths: Vec<&str> = publishers
+                .iter()
+                .flat_map(|(_, frames)| frames.iter().map(|f| f.landed_path.as_str()))
+                .collect();
+            crate::zip_store::presence::zip_resident_paths(&db.conn(), &paths)
+        }
+        None => std::collections::HashSet::new(),
+    };
     let mut claims = DestClaims::default();
     let mut cancelled = false;
     let mut done = 0usize;
@@ -360,20 +381,48 @@ pub fn organize_project_export(
             fs::create_dir_all(&dest_dir)
                 .with_context(|| format!("create {}", dest_dir.display()))?;
             let dest = dest_dir.join(&name);
-            match place_one(
-                Path::new(&f.landed_path),
-                &dest,
-                &f.filter,
-                f.byte_size,
-                use_symlinks,
-                prev.frames.get(&f.frame_uuid).is_some_and(|e| {
-                    e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
-                }),
-            ) {
+            let in_zip = zip_resident.contains(&f.landed_path);
+            // A frame inside a zip is read from its extracted copy; the pin keeps the cache file until the
+            // placement is done.
+            let (source, _pin) = match zip {
+                Some(ctx) if in_zip => match crate::zip_store::materialize::materialize_one_cancellable(
+                    ctx,
+                    &f.landed_path,
+                    cancel_flag,
+                ) {
+                    Ok((local, pin)) => (Ok(local), pin),
+                    Err(e) => {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            cancelled = true;
+                            break 'outer;
+                        }
+                        (Err(e), None)
+                    }
+                },
+                _ => (Ok(std::path::PathBuf::from(&f.landed_path)), None),
+            };
+            let placement = source.and_then(|src| {
+                place_one(
+                    &src,
+                    &dest,
+                    &f.filter,
+                    f.byte_size,
+                    use_symlinks && !in_zip,
+                    prev.frames.get(&f.frame_uuid).is_some_and(|e| {
+                        e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
+                    }),
+                )
+            });
+            match placement {
                 Ok(p) => {
                     match p {
                         Placed::Linked => counts.linked += 1,
-                        Placed::Copied => counts.copied += 1,
+                        Placed::Copied => {
+                            counts.copied += 1;
+                            if in_zip && use_symlinks {
+                                zip_copied += 1;
+                            }
+                        }
                         Placed::Rewritten => counts.rewritten += 1,
                     }
                     match identity(&dest) {
@@ -463,6 +512,7 @@ pub fn organize_project_export(
         counts,
         warnings,
         cancelled,
+        zip_copied,
     })
 }
 
@@ -499,7 +549,7 @@ mod tests {
         pubs: &[(String, Vec<ProjectExportFrame>)],
         links: bool,
     ) -> ProjectOrganizeResult {
-        organize_project_export(title, "p1", pubs, links, None, &AtomicBool::new(false)).unwrap()
+        organize_project_export(title, "p1", pubs, links, None, &AtomicBool::new(false), None).unwrap()
     }
 
     #[test]
@@ -577,6 +627,46 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    /// A landed frame kept inside a zip is extracted and COPIED in symlink mode (a link into the zip cache
+    /// dangles after eviction): counted in `zip_copied`, byte-identical to the landed file, while the disk
+    /// frame beside it is still linked.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_mode_copies_a_landed_frame_inside_a_zip_and_counts_it() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let (r, rs) = landed(tmp.path(), "r.fits", Some("R"));
+        let (h, hs) = landed(tmp.path(), "h.fits", Some("R"));
+        let h_bytes = std::fs::read(&h).unwrap();
+        let virtual_h = {
+            let conn = ctx.db.get().unwrap().conn();
+            for (id, p) in [(1i64, &r), (2, &h)] {
+                conn.execute(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+                    rusqlite::params![id, p.to_string_lossy(), p.file_name().unwrap().to_string_lossy()],
+                )
+                .unwrap();
+            }
+            zip_files(&conn, &[2], &tmp.path().join("landed.zip"), Shape::Foreign).remove(0)
+        };
+        assert!(!h.exists(), "the landed file moved into the zip");
+        let title = tmp.path().join("T");
+        let pubs = vec![(
+            "Alice".to_string(),
+            vec![frame("u1", &r, rs, "R"), frame("u2", Path::new(&virtual_h), hs, "R")],
+        )];
+        let res = organize_project_export(&title, "p1", &pubs, true, None, &AtomicBool::new(false), Some(&ctx)).unwrap();
+        assert_eq!(res.counts, PlaceCounts { linked: 1, copied: 1, rewritten: 0, failed: 0 }, "{:?}", res.warnings);
+        assert_eq!(res.zip_copied, 1);
+        let rd = title.join("Alice/camera_cama/R/r.fits");
+        assert_eq!(std::fs::read_link(&rd).unwrap(), r, "the disk frame is still linked");
+        let hd = title.join("Alice/camera_cama/R/h.fits");
+        assert!(!std::fs::symlink_metadata(&hd).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&hd).unwrap(), h_bytes);
     }
 
     /// Review Focus 1: a previous export left a SYMLINK to the replica at the
@@ -733,6 +823,7 @@ mod tests {
             false,
             None,
             &flag,
+            None,
         )
         .unwrap();
         assert!(res.cancelled);
@@ -962,6 +1053,7 @@ mod tests {
             false,
             None,
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert_eq!(res.warnings.len(), 1, "{:?}", res.warnings);

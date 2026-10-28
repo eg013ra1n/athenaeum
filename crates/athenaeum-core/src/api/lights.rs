@@ -3017,6 +3017,48 @@ mod tests {
             assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
         }
     }
+
+    /// The same shape as above, but the raw originals went into a zip: they are present while the zip lists
+    /// them, so the sets mode is ready (the export reads them through the zip cache). With the zip gone they
+    /// are missing again, with the same sentence.
+    #[test]
+    fn export_readiness_counts_zip_present_raw_calibration_as_available() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        let raw = seed_raw_set_with_frames(&conn, 200, "Dark", 2);
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 100 WHERE id = ?1",
+            [raw],
+        )
+        .unwrap();
+        add_link(&conn, 1, 100, "Dark");
+        // Real raw files, then into a zip.
+        let file_ids = [5_020_000i64, 5_020_001];
+        for (i, id) in file_ids.iter().enumerate() {
+            let path = tmp.path().join(format!("Dark_200_{i}.fits"));
+            std::fs::write(&path, vec![i as u8; 64]).unwrap();
+            conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![path.to_string_lossy(), id])
+                .unwrap();
+        }
+        let zip = tmp.path().join("darks.zip");
+        zip_files(&conn, &file_ids, &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_raw_calibration_files, 0, "the zip lists both originals");
+        assert!(check_mode_ready(&r, ExportMode::RawWithCalibrationSets).is_ok());
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_raw_calibration_files, 2, "an unreachable zip makes them missing, not deleted");
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::RawWithCalibrationSets).unwrap_err(),
+            "2 raw calibration file(s) missing on disk — restore from archive first"
+        );
+    }
 }
 
 // ── Real-data end-to-end (spec §11: repointed from the retired standalone

@@ -736,6 +736,36 @@ fn open_generation(
         let PrepareSource::Generate { frame_id } = src else {
             continue;
         };
+        // A light or a master inside a zip is not read by a send (v1): refuse it by name before the resolve
+        // fails on a path that is not a file.
+        match crate::calibration_library::light_resolve::zip_resident_inputs(&conn, *frame_id) {
+            Ok(inside) if inside.is_empty() => {}
+            Ok(inside) => {
+                let sentence = crate::calibration_library::light_resolve::zip_inputs_sentence(&inside);
+                tracing::error!(
+                    package_id = id,
+                    frame_id = *frame_id,
+                    rel_path = %record.rel_path,
+                    "prepare: {sentence}"
+                );
+                return Err(PrepareError::Failed {
+                    reason: format!("{}: {sentence}", record.rel_path),
+                    culprit: Some((record.rel_path.clone(), sentence)),
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    package_id = id,
+                    frame_id = *frame_id,
+                    error = %format!("{e:#}"),
+                    "prepare: cannot read where this light's inputs live"
+                );
+                return Err(PrepareError::Failed {
+                    reason: format!("{}: {e:#}", record.rel_path),
+                    culprit: Some((record.rel_path.clone(), format!("{e:#}"))),
+                });
+            }
+        }
         let spec = crate::export::resolve_generation_cached(
             &conn,
             *frame_id,
@@ -1522,6 +1552,49 @@ mod tests {
             !pkg_dir.join(rel).exists(),
             "nothing partial lands when a master is missing"
         );
+    }
+
+    /// A send does not read from a zip (v1): a master dark or the light itself inside one fails the whole
+    /// preparation up front with the unpack reason, naming the file, and nothing lands in the package.
+    #[test]
+    fn stage_records_refuses_a_light_or_master_inside_a_zip_with_the_unpack_reason() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        for (what, which) in [("master", "master_dark.fits"), ("light", "L_10.fits")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+            let light = seed(&ctx, tmp.path());
+            let estimate = std::fs::metadata(&light).unwrap().len();
+            {
+                let conn = ctx.db.get().unwrap().conn();
+                let file_id: i64 = conn
+                    .query_row("SELECT id FROM files WHERE filename = ?1", [which], |r| r.get(0))
+                    .unwrap();
+                zip_files(&conn, &[file_id], &tmp.path().join("night.zip"), Shape::Foreign);
+            }
+            let rel = "camera_testcam/lights/c_L_10.fits";
+            let mut records = vec![generate_record(rel, estimate)];
+            let pkg_dir = tmp.path().join("packages").join("pkg-zip");
+            let err = stage_records(
+                &ctx,
+                0,
+                [0u8; 32],
+                &pkg_dir,
+                &mut records,
+                Some(&CalibratedLightOptions::default()),
+                None,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {what} inside a zip must fail the preparation"));
+            assert!(matches!(err, PrepareError::Failed { .. }), "{}", err.describe());
+            assert!(
+                err.describe().contains("inside a zip \u{2014} unpack it first"),
+                "{what}: {}",
+                err.describe()
+            );
+            assert!(err.describe().contains(rel), "{what}: names the file: {}", err.describe());
+            assert!(!pkg_dir.join(rel).exists(), "{what}: nothing lands in the package");
+        }
     }
 
     /// A plan that generates without options is refused rather than calibrated

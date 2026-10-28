@@ -3734,6 +3734,29 @@ impl Drop for FrameDone<'_> {
     }
 }
 
+/// Why a light cannot be published when it, or a master its calibration reads, sits inside a zip (spec 7.9:
+/// the wire is frozen, so v1 does not send from a zip); `None` when everything is on disk. A failed read is
+/// logged and gives no hold: the caller's own reads then report the real problem.
+/// `light_only` is for an attested light, which is never calibrated: its masters do not matter.
+fn zip_inputs_hold(conn: &rusqlite::Connection, frame_id: i64, light_only: bool) -> Option<String> {
+    match crate::calibration_library::light_resolve::zip_resident_inputs(conn, frame_id) {
+        Ok(mut inside) => {
+            if light_only {
+                inside.retain(|(role, _)| *role == "light");
+            }
+            if inside.is_empty() {
+                None
+            } else {
+                Some(crate::calibration_library::light_resolve::zip_inputs_sentence(&inside))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(frame_id, error = %format!("{e:#}"), "publish: cannot read where this light's inputs live");
+            None
+        }
+    }
+}
+
 fn held(frame_id: i64, filename: &str, reason: String) -> HeldBackFrame {
     HeldBackFrame {
         frame_id,
@@ -4177,6 +4200,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             }
             let fid = plan.cand.frame_id;
             let name = plan.cand.filename.clone();
+            // The split already holds back a light or master inside a zip; this keeps the generation phase
+            // from reading a path that is not a file if one reaches it anyway.
+            if let Some(reason) = zip_inputs_hold(&conn, fid, false) {
+                held_back.push(held(fid, &name, reason));
+                continue;
+            }
             let mut spec = match crate::export::resolve_generation_cached(
                 &conn,
                 fid,
@@ -5530,6 +5559,12 @@ async fn run_publish(
             let fid = cand.frame_id;
             let (recipe, osc, external): (String, bool, Option<(std::path::PathBuf, String)>) =
                 if cand.attested {
+                    // An attested light inside a zip is hashed and stat'd in place by the generation phase,
+                    // which a zip entry cannot give: hold it back with the unpack reason (v1).
+                    if let Some(reason) = zip_inputs_hold(&conn, fid, true) {
+                        held_back.push(held(fid, &cand.filename, reason));
+                        continue;
+                    }
                     let row: rusqlite::Result<(String, i64, String)> = conn.query_row(
                         "SELECT fi.path, fi.size, fi.modified_at FROM frames f \
                          JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
@@ -5561,6 +5596,10 @@ async fn run_publish(
                         }
                     }
                 } else {
+                    if let Some(reason) = zip_inputs_hold(&conn, fid, false) {
+                        held_back.push(held(fid, &cand.filename, reason));
+                        continue;
+                    }
                     let resolved =
                         match crate::calibration_library::light_resolve::resolve_frame_inputs(
                             &conn,

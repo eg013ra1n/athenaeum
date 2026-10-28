@@ -308,6 +308,12 @@ pub fn probe_bitpix(path: &Path) -> Option<i32> {
     probe_fits(path).filter(|(_, i)| i.naxis == 2 && i.naxis3 == 1).map(|(_, i)| i.bitpix)
 }
 
+/// [`probe_bitpix`] over the header bytes of a zip entry (nothing is extracted): the same shape rule, the same
+/// `None` for anything the direct reader would not take (an XISF entry among them).
+pub fn probe_bitpix_from_header(header: &[u8]) -> Option<i32> {
+    fits_info_from_reader(&mut &header[..]).filter(|i| i.naxis == 2 && i.naxis3 == 1).map(|i| i.bitpix)
+}
+
 /// Test-only observation hook (fix round 1, I1 regression pin): records
 /// which thread called `spill_via_read_raw`, keyed by path so a test can
 /// look up its OWN call even if some other test is spilling concurrently in

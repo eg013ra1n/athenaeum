@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use rusqlite::Connection;
 
 use crate::calibration_library::cosmetic::{
@@ -136,6 +137,34 @@ pub struct GenerationSpec {
 }
 
 impl GenerationSpec {
+    /// This plan with its light read from `light_path` instead: the extracted copy of a zip-resident light. The
+    /// output header and every other input are unchanged, so the calibrated file is the one the on-disk frame
+    /// would give.
+    pub fn with_light_path(&self, light_path: PathBuf) -> GenerationSpec {
+        let i = &self.inputs;
+        GenerationSpec {
+            inputs: LightCalInputs {
+                light_path,
+                dark_path: i.dark_path.clone(),
+                bias_path: i.bias_path.clone(),
+                flat_path: i.flat_path.clone(),
+                flat_norm: i.flat_norm,
+                flat_norm_mode: i.flat_norm_mode,
+                cfa_geometry: i.cfa_geometry,
+                params: i.params,
+                scale_divisor: i.scale_divisor,
+                output_path: i.output_path.clone(),
+                cards: Vec::new(),
+                scratch_dir: i.scratch_dir.clone(),
+            },
+            cards: self.cards.clone(),
+            cfa_geometry: self.cfa_geometry,
+            dark_path: self.dark_path.clone(),
+            debayer: self.debayer,
+            format: self.format,
+        }
+    }
+
     /// This frame's output filename. Takes the source filename rather than
     /// reading it back off the plan so a caller placing a frame it already
     /// holds (the export's `ExportFrame`) uses one shared spelling.
@@ -357,19 +386,33 @@ pub fn resolve_generation_cached(
     scratch_dir: &Path,
     divisors: &mut DivisorCache,
 ) -> anyhow::Result<GenerationSpec> {
+    resolve_generation_mapped(conn, frame_id, opts, scratch_dir, divisors, &|path| Ok(PathBuf::from(path)))
+}
+
+/// [`resolve_generation_cached`] for masters that may sit inside a zip. `local` turns a master's CATALOG path
+/// into the file the engine and the flat-normalization read can open (the extracted cache file for a
+/// zip-resident row, the path itself otherwise); the plan's `inputs` carry the local paths while the header
+/// cards keep naming the catalog master. An `Err` from `local` skips this frame with that reason (the zip is
+/// not reachable, the extraction was cancelled).
+///
+/// The LIGHT itself is not mapped: its `light_path` stays the catalog path and a caller about to calibrate a
+/// zip-resident light swaps it through [`GenerationSpec::with_light_path`] after extracting that one frame.
+/// Resolving needs only its bit depth, which a zip entry gives from its header bytes (no extraction).
+pub fn resolve_generation_mapped(
+    conn: &Connection,
+    frame_id: i64,
+    opts: &CalibratedLightOptions,
+    scratch_dir: &Path,
+    divisors: &mut DivisorCache,
+    local: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<GenerationSpec> {
     let resolved = resolve_frame_inputs(conn, frame_id, opts.flat_norm)?;
 
-    if resolved.dark.is_none() && resolved.flat.is_none() && resolved.bias.is_none() {
-        anyhow::bail!("no calibration masters available (dark/flat/bias unbuilt or unlinked)");
-    }
+    check_applicable(&resolved, opts)?;
 
     let dark_applied = resolved.dark.is_some();
     let bias_applied = resolved.dark.is_none() && resolved.bias.is_some();
     let flat_applied = resolved.flat.is_some();
-
-    if bias_applied && opts.params.bias_fallback == BiasFallback::SkipFrame {
-        anyhow::bail!("no dark master (bias fallback disabled)");
-    }
 
     let calstat = compute_calstat(dark_applied, bias_applied, flat_applied);
 
@@ -378,9 +421,10 @@ pub fn resolve_generation_cached(
             // Memoized per (flat, light phase): the miss path can read the
             // whole flat plane, and a set's lights overwhelmingly share one
             // flat and one phase.
+            let flat_local = local(&m.path)?;
             flat_norm_divisor_cached(
                 divisors,
-                &m.path,
+                &flat_local.to_string_lossy(),
                 scratch_dir,
                 opts.flat_norm_mode,
                 &opts.params,
@@ -391,7 +435,7 @@ pub fn resolve_generation_cached(
     };
     let flat_norm_divisor = divisor.global_value();
 
-    let scale_divisor = scale_divisor_for_bitpix(probe_bitpix(&resolved.light_path));
+    let scale_divisor = scale_divisor_for_bitpix(light_bitpix(conn, &resolved.light_path)?);
 
     let card_inputs = LightCalCardInputs {
         source_uuid: resolved.source_uuid.clone().unwrap_or_default(),
@@ -436,11 +480,19 @@ pub fn resolve_generation_cached(
     };
     let cards = build_light_cal_cards(&resolved.source_cards, &card_inputs)?;
 
+    // Only a master the engine reads is mapped (and so extracted): the bias is read only when no dark applies.
+    let dark_local = resolved.dark.as_ref().map(|m| local(&m.path)).transpose()?;
+    let bias_local = if dark_applied || !bias_applied {
+        resolved.bias.as_ref().map(|m| PathBuf::from(&m.path))
+    } else {
+        resolved.bias.as_ref().map(|m| local(&m.path)).transpose()?
+    };
+    let flat_local_path = resolved.flat.as_ref().map(|m| local(&m.path)).transpose()?;
     let inputs = LightCalInputs {
         light_path: resolved.light_path.clone(),
-        dark_path: resolved.dark.as_ref().map(|m| PathBuf::from(&m.path)),
-        bias_path: resolved.bias.as_ref().map(|m| PathBuf::from(&m.path)),
-        flat_path: resolved.flat.as_ref().map(|m| PathBuf::from(&m.path)),
+        dark_path: dark_local,
+        bias_path: bias_local,
+        flat_path: flat_local_path,
         flat_norm: opts.flat_norm,
         flat_norm_mode: opts.flat_norm_mode,
         cfa_geometry: resolved.cfa_geometry,
@@ -459,6 +511,135 @@ pub fn resolve_generation_cached(
         inputs,
         cards,
     })
+}
+
+/// The light's source bit depth for the output scale. A zip-resident light is read from its entry's header
+/// bytes (nothing is extracted); an unreachable zip fails the frame with the cause. A disk light keeps
+/// [`probe_bitpix`]'s answer, `None` (and the historic default divisor) for anything it cannot read.
+fn light_bitpix(conn: &Connection, light_path: &Path) -> anyhow::Result<Option<i32>> {
+    let catalog_path = light_path.to_string_lossy();
+    match crate::zip_store::presence::zip_markers(conn, &catalog_path) {
+        Some((zip, entry)) => {
+            let (header, _) = crate::zip_store::reader::read_entry_header(Path::new(&zip), &entry)
+                .with_context(|| format!("{catalog_path}: inside {zip}, which is not reachable"))?;
+            Ok(crate::integration::banded::probe_bitpix_from_header(&header))
+        }
+        None => Ok(probe_bitpix(light_path)),
+    }
+}
+
+/// The master calibration files of a run that live inside a zip, extracted into the zip cache BEFORE the
+/// catalog phase (a connection is never held across an extraction) and kept pinned until the value drops.
+/// Masters are shared across the lights of a set, so this is a handful of files for the whole run.
+///
+/// [`ZipMasters::map`] is the `local` mapper [`resolve_generation_mapped`] takes. A master that could not be
+/// extracted is remembered with its reason, so the lights that need it are skipped one by one (each run's
+/// per-frame policy) instead of the whole run failing.
+#[derive(Default)]
+pub struct ZipMasters {
+    /// catalog path -> the extracted file, or why it could not be extracted.
+    local: HashMap<String, std::result::Result<PathBuf, String>>,
+    pins: Vec<crate::zip_store::cache::Pinned>,
+}
+
+impl ZipMasters {
+    /// No master is inside a zip: every path maps to itself.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Extracts the zip-resident masters the calibration of `frame_ids` reads (dark and flat, the bias only
+    /// when no dark applies). `progress(current, total, file_name)` is called before each extraction. Stops
+    /// early when `cancel` is set; the caller checks the flag.
+    pub fn extract_for_frames(
+        ctx: &crate::services::ServiceContext,
+        frame_ids: &[i64],
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(usize, usize, &str),
+    ) -> anyhow::Result<Self> {
+        let Some(db) = ctx.db.get() else { return Ok(Self::none()) };
+        let resident: Vec<String> = {
+            let conn = db.conn();
+            let mut paths: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for &frame_id in frame_ids {
+                for path in crate::calibration_library::light_resolve::linked_master_paths(&conn, frame_id)? {
+                    if seen.insert(path.clone()) {
+                        paths.push(path);
+                    }
+                }
+            }
+            let resident = crate::zip_store::presence::zip_resident_paths(&conn, &paths);
+            paths.retain(|p| resident.contains(p));
+            paths
+        };
+        let mut out = Self::none();
+        for (i, path) in resident.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let name = Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+            progress(i, resident.len(), &name);
+            match crate::zip_store::materialize::materialize_one_cancellable(ctx, path, cancel) {
+                Ok((local, pin)) => {
+                    out.local.insert(path.clone(), Ok(local));
+                    out.pins.extend(pin);
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path, error = %format!("{e:#}"), "a master inside a zip could not be extracted");
+                    out.local.insert(path.clone(), Err(format!("{e:#}")));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The file a resolve may read for `catalog_path`: the extracted copy of a zip master, the path itself
+    /// otherwise; an `Err` names why a zip master could not be extracted.
+    pub fn map(&self, catalog_path: &str) -> anyhow::Result<PathBuf> {
+        match self.local.get(catalog_path) {
+            Some(Ok(local)) => Ok(local.clone()),
+            Some(Err(why)) => Err(anyhow::anyhow!("{catalog_path}: {why}")),
+            None => Ok(PathBuf::from(catalog_path)),
+        }
+    }
+
+    /// The cache pins, for a caller that keeps the extracted files alive with something else (a job).
+    pub fn into_pins(self) -> Vec<crate::zip_store::cache::Pinned> {
+        self.pins
+    }
+}
+
+/// Which master files a light's calibration would READ, from the catalog alone: the same applicability rules
+/// as [`resolve_generation_mapped`] (a light with nothing to apply, or only a bias with the bias fallback
+/// disabled, is refused with the same reasons) without reading any file. For a stage-1 hash, which names the
+/// masters but never needs their pixels or their flat-normalization divisor.
+pub fn applied_master_paths(
+    conn: &Connection,
+    frame_id: i64,
+    opts: &CalibratedLightOptions,
+) -> anyhow::Result<std::collections::BTreeSet<PathBuf>> {
+    let resolved = resolve_frame_inputs(conn, frame_id, opts.flat_norm)?;
+    check_applicable(&resolved, opts)?;
+    Ok(master_paths_read(
+        resolved.dark.as_ref().map(|m| Path::new(&m.path)),
+        resolved.flat.as_ref().map(|m| Path::new(&m.path)),
+        resolved.bias.as_ref().map(|m| Path::new(&m.path)),
+    ))
+}
+
+/// The two refusals every calibration shares: nothing to apply, and a bias alone when the fallback is off.
+fn check_applicable(
+    resolved: &crate::calibration_library::light_resolve::ResolvedFrameInputs,
+    opts: &CalibratedLightOptions,
+) -> anyhow::Result<()> {
+    if resolved.dark.is_none() && resolved.flat.is_none() && resolved.bias.is_none() {
+        anyhow::bail!("no calibration masters available (dark/flat/bias unbuilt or unlinked)");
+    }
+    if resolved.dark.is_none() && resolved.bias.is_some() && opts.params.bias_fallback == BiasFallback::SkipFrame {
+        anyhow::bail!("no dark master (bias fallback disabled)");
+    }
+    Ok(())
 }
 
 /// Every DISTINCT master path a resolved batch actually READS — dark and
@@ -1235,6 +1416,63 @@ mod tests {
             paths.contains(&bias),
             "the dark link never resolved — the bias IS read"
         );
+    }
+
+    /// A 16-bit FITS (BZERO 32768) of one constant value, written by hand: the integer depth is what the
+    /// output scale divisor keys on.
+    fn write_u16_plane(path: &Path, value: u16) -> PathBuf {
+        use std::io::Write;
+        let mut header = Vec::new();
+        for line in [
+            format!("{:<80}", "SIMPLE  =                    T"),
+            format!("{:<80}", "BITPIX  =                   16"),
+            format!("{:<80}", "NAXIS   =                    2"),
+            format!("{:<80}", format!("NAXIS1  = {:>20}", W)),
+            format!("{:<80}", format!("NAXIS2  = {:>20}", H)),
+            format!("{:<80}", "BZERO   =              32768.0"),
+            format!("{:<80}", "BSCALE  =                  1.0"),
+            format!("{:<80}", "END"),
+        ] {
+            header.extend_from_slice(line.as_bytes());
+        }
+        header.resize(2880, b' ');
+        let raw = (i32::from(value) - 32768) as i16;
+        let mut data: Vec<u8> = (0..W * H).flat_map(|_| raw.to_be_bytes()).collect();
+        data.resize(data.len().div_ceil(2880) * 2880, 0);
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&header).unwrap();
+        f.write_all(&data).unwrap();
+        path.to_path_buf()
+    }
+
+    /// A light inside a zip resolves with the same output scale as the same file on disk: its bit depth comes
+    /// from the entry's header bytes, nothing is extracted, and the plan keeps the catalog (virtual) path.
+    #[test]
+    fn a_zip_resident_16_bit_light_resolves_with_the_depth_of_its_entry_header() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_u16_plane(&dir.path().join("light_u16.fits"), 1000);
+        let dark = write_plane(&dir.path().join("dark.fits"), spiky_dark);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        add_link(&conn, 1, 10, "Dark");
+        let opts = CalibratedLightOptions::default();
+
+        let on_disk = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert_eq!(on_disk.inputs.scale_divisor, 65535.0, "a 16-bit light divides by 65535");
+
+        let virtual_path = zip_files(&conn, &[1 + 2_000_000], &dir.path().join("night.zip"), Shape::Foreign).remove(0);
+        assert!(!Path::new(&virtual_path).exists());
+        let in_zip = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert_eq!(in_zip.inputs.scale_divisor, 65535.0);
+        assert_eq!(in_zip.inputs.light_path, PathBuf::from(&virtual_path));
+        assert_eq!(in_zip.cards.len(), on_disk.cards.len());
+
+        // With the zip gone the frame fails with the cause instead of a silent default scale.
+        std::fs::remove_file(dir.path().join("night.zip")).unwrap();
+        let err = resolve_generation(&conn, 1, &opts, dir.path()).err().expect("an unreachable zip fails the frame");
+        assert!(format!("{err:#}").contains("not reachable") || format!("{err:#}").contains("night.zip"), "{err:#}");
     }
 
     #[test]

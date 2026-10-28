@@ -153,6 +153,15 @@ parity audit); it does not exist today. Until then, use copy mode (the default)
 for anything that will be moved or shared, and only use symlinks when the export
 stays in place next to the catalog's original files.
 
+### Frames inside a zip (zip plan Task 9)
+
+A catalog row with `archive_zip_path` + `archive_path_in_zip` has no file at its `files.path`; every export reads it through `zip_store::materialize`, never by that path.
+
+- **Copy and link mode.** `organize_files_wbpp` takes the `ServiceContext` as its last argument (`None` in a pure-disk caller): a placement whose `file_path` is zip-resident is extracted (`materialize_one_cancellable`, the run's cancel flag) and COPIED from the cache, one frame at a time, even when `use_symlinks` is set, because a link into the cache dangles once the entry is evicted. Those forced copies are counted: `OrganizeResult.zip_copied` -> `ExportResult.zipCopied` / `ExportCompleteEvent.zipCopied` (0 in a copy run; for the export dialog's "From zip" line). The disk frames beside them are still linked. An unreachable zip is one per-frame warning ("Failed to copy ..."), never a failed export; `export-progress` carries phase `"extracting"` while an entry is read out. The project export (`organize_project_export`) follows the same rule (`ProjectOrganizeResult.zip_copied`); `export_project_for_wbpp` therefore takes `&Arc<ServiceContext>` (its organize step runs in `spawn_blocking`).
+- **Raw calibration originals.** `resolve_raw_calibration_sets` counts an original as present through `catalog_path_is_present` (on disk, or listed by its zip), so `missing_raw_calibration_files` and the "restore from archive first" sentence only fire when the bytes are reachable nowhere. The sentences themselves (`check_mode_ready`, `modeBlocker.ts`, the collab gate's substring match) are unchanged.
+- **Calibrated lights.** See `docs/export/calibrated-lights.md` (masters are extracted BEFORE the catalog borrow, the light per frame).
+- **Transfers, personal sync, collab publish do not read from a zip (spec 7.9, v1).** A zip-resident file is ineligible with `zip_store::presence::INSIDE_A_ZIP_REASON` ("inside a zip - unpack it first") in `plan_selection_package` (instead of "file missing on disk"); a calibrated-lights send or a collab publish/Calibrate whose light or master sits in a zip is refused with the same reason by `light_resolve::zip_resident_inputs` (`open_generation`, the publish split and generation phase).
+
 ## WBPP keyword-order config — stored, but not applied to the layout
 
 `WbppExportConfig` (`models.rs`) has two fields: `export_mode` and `keyword_order: Vec<String>`, the latter

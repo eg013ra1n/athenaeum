@@ -491,6 +491,9 @@ pub fn resolve_raw_calibration_sets(
 ) -> Result<RawSetResolution> {
     let mut out = RawSetResolution::default();
     let mut stat_done: HashSet<i64> = HashSet::new();
+    // An original is there when it is on disk or its zip lists it (`catalog_path_is_present`, the one
+    // presence rule): a zipped original is read through the zip cache, so it never counts as missing.
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
     for group in &mut data.groups {
         for subgroup in &mut group.subgroups {
             for node in [
@@ -501,7 +504,7 @@ pub fn resolve_raw_calibration_sets(
             .into_iter()
             .flatten()
             {
-                resolve_raw_node(conn, node, 0, &mut out, &mut stat_done)?;
+                resolve_raw_node(conn, node, 0, &mut out, &mut stat_done, &mut presence)?;
             }
         }
     }
@@ -520,6 +523,7 @@ fn resolve_raw_node(
     depth: u8,
     out: &mut RawSetResolution,
     stat_done: &mut HashSet<i64>,
+    presence: &mut crate::zip_store::presence::ZipPresence,
 ) -> Result<()> {
     if is_master_set(conn, info.set_id)? {
         match superseded_raw_set(conn, info.set_id)? {
@@ -542,12 +546,16 @@ fn resolve_raw_node(
                 );
                 if stat_done.insert(raw_id) {
                     for frame in &raw.frames {
-                        if std::fs::metadata(&frame.file_path).is_err() {
+                        if !crate::zip_store::presence::catalog_path_is_present(
+                            conn,
+                            presence,
+                            &frame.file_path,
+                        ) {
                             tracing::warn!(
                                 raw_set_id = raw_id,
                                 frame_id = frame.frame_id,
                                 path = %frame.file_path,
-                                "raw calibration original missing on disk"
+                                "raw calibration original missing on disk and in zip files"
                             );
                             out.missing_originals.insert(frame.file_path.clone());
                         }
@@ -572,7 +580,7 @@ fn resolve_raw_node(
     .into_iter()
     .flatten()
     {
-        resolve_raw_node(conn, child, depth + 1, out, stat_done)?;
+        resolve_raw_node(conn, child, depth + 1, out, stat_done, presence)?;
     }
     Ok(())
 }

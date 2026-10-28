@@ -15,7 +15,7 @@ pub mod project_organizer;
 
 #[cfg(feature = "render")]
 pub use calibrated_generator::{
-    execute_generation, resolve_generation, resolve_generation_cached, resolved_master_paths,
+    execute_generation, resolve_generation, resolve_generation_cached, resolve_generation_mapped, resolved_master_paths, applied_master_paths, ZipMasters,
     master_paths_read, spec_master_paths, DivisorCache, GeneratedLight, GenerationSpec,
 };
 // The generator's run options and its output-naming rule live in `models`, not
