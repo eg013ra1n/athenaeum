@@ -9,6 +9,7 @@ const ready: ExportReadiness = {
   rawSetIdsWithoutMaster: [],
   missingMasterFiles: 0,
   missingRawCalibrationFiles: 0,
+  blackHoleZipMasters: 0,
   fileCounts: { lightsOnly: 4, rawWithCalibrationSets: 4, rawWithMasters: 4, calibratedLights: 4 },
   rawSetsBuildable: [],
   rawSetsUnbuildable: [],
@@ -21,6 +22,13 @@ const ready: ExportReadiness = {
 };
 
 describe('modeBlocker', () => {
+  it('a master inside a Black Hole zip blocks rawWithMasters with the missing-master sentence', () => {
+    const r = { ...ready, blackHoleZipMasters: 1 };
+    expect(modeBlocker(r, 'rawWithMasters')).toBe('1 master file(s) missing on disk — restore from archive first');
+    expect(modeBlocker(r, 'lightsOnly')).toBeNull();
+    expect(modeBlocker(r, 'rawWithCalibrationSets')).toBeNull();
+  });
+
   it('an attested set passes calibratedLights without masters', () => {
     const r = { ...ready, rawSetsWithoutMaster: 1, rawSetIdsWithoutMaster: [7], unlinkedLights: 2, missingMasterFiles: 1, attested: true };
     expect(modeBlocker(r, 'calibratedLights')).toBeNull();

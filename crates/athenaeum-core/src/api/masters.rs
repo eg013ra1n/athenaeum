@@ -517,6 +517,32 @@ pub(crate) fn select_flat_precal(
     })
 }
 
+/// Owner ruling A: a pre-calibration master inside a zip that sits in the Black Hole is present but not
+/// used. A flat build (preview and start alike) refuses it, naming the master, rather than calibrate the
+/// flats with a rejected file or silently with something else; restoring the zip lifts the refusal.
+pub(crate) fn refuse_black_hole_precal(
+    conn: &rusqlite::Connection,
+    choice: &PrecalChoice,
+) -> Result<(), ApiError> {
+    let PrecalChoice::Master { set_id, cal_type, .. } = choice else {
+        return Ok(());
+    };
+    if crate::db::calibration_set_in_black_hole_zip(conn, *set_id)
+        .map_err(|e| ApiError::Internal(format!("black hole zip check {set_id}: {e:#}")))?
+    {
+        tracing::warn!(
+            master_set_id = *set_id,
+            calibration_type = %cal_type,
+            "flat pre-calibration refused: the master is inside a zip in the Black Hole"
+        );
+        return Err(ApiError::Invalid(format!(
+            "linked {} master #{set_id} is inside a zip in the Black Hole - restore the zip first",
+            cal_type.to_lowercase()
+        )));
+    }
+    Ok(())
+}
+
 /// Materializes a `PrecalChoice` into engine-ready pixels. The Master arm
 /// reads the ENTIRE precal master into RAM (single file, via the banded
 /// reader in one band) — called ONLY from the build thread, never from
@@ -817,6 +843,7 @@ pub fn preview_master_build(
     // Selection only (pure DB) — preview never loads precal pixels.
     let (flat_precal, warnings, raw_precal_sets) = if is_flat {
         let sel = select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?;
+        refuse_black_hole_precal(&conn, &sel.choice)?;
         let raw_precal_sets = sel
             .raw_candidates
             .into_iter()
@@ -1188,7 +1215,9 @@ fn run_build(
     // already submitted earlier in the same batch (see `plan_batch`/dependency
     // ordering), so there's nothing actionable left to do with it here.
     let precal_choice = if is_flat {
-        select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?.choice
+        let choice = select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?.choice;
+        refuse_black_hole_precal(&conn, &choice)?;
+        choice
     } else {
         PrecalChoice::None
     };
@@ -3282,6 +3311,47 @@ mod tests {
             msg,
             format!("linked dark master #{dark} is 6384×4258, the flats are 9576×6388 — re-link the flats' pre-calibration")
         );
+    }
+
+    /// Owner ruling A: a pre-calibration master inside a zip in the Black Hole is present but not used. A flat
+    /// build refuses it (preview and start share `refuse_black_hole_precal`) and never extracts it; a loose
+    /// master, and the same master after Restore, pass.
+    #[test]
+    fn a_precal_master_in_a_black_hole_zip_is_refused_until_restored() {
+        let conn = test_conn();
+        let flat = seed_flat_set(&conn, 1.0);
+        let dark = seed_precal_set(&conn, "MasterDark", 1, Some(1.0));
+        link(&conn, flat, dark, "Dark");
+        let sel = select_flat_precal(&conn, flat, Some(1.0), None).unwrap();
+        refuse_black_hole_precal(&conn, &sel.choice).expect("a loose master is used");
+
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+             VALUES ('/nas/precal.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE files SET archive_zip_path = '/nas/precal.zip', archive_path_in_zip = 'd.fits'
+             WHERE id IN (SELECT f.file_id FROM calibration_set_frames csf JOIN frames f ON f.id = csf.frame_id
+                          WHERE csf.set_id = ?1)",
+            [dark],
+        )
+        .unwrap();
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/nas/precal.zip", "files").unwrap();
+        let sel = select_flat_precal(&conn, flat, Some(1.0), None).unwrap();
+        assert!(matches!(&sel.choice, PrecalChoice::Master { set_id, .. } if *set_id == dark));
+        let msg = refuse_black_hole_precal(&conn, &sel.choice).unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            format!("linked dark master #{dark} is inside a zip in the Black Hole - restore the zip first")
+        );
+        // A synthetic bias or no pre-calibration is not a master: nothing to refuse.
+        refuse_black_hole_precal(&conn, &PrecalChoice::Synthetic(500.0)).unwrap();
+        refuse_black_hole_precal(&conn, &PrecalChoice::None).unwrap();
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        refuse_black_hole_precal(&conn, &sel.choice).expect("restored: usable again");
     }
 
     /// G-7: a pre-calibration master of the same size at another recorded

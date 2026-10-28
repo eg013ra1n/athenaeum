@@ -869,7 +869,13 @@ missingMasterFiles: number,
  * is not counted: its missing files fail per file in the run, as they
  * always have.
  */
-missingRawCalibrationFiles: number, fileCounts: ExportFileCounts, 
+missingRawCalibrationFiles: number, 
+/**
+ * Master sets in the export tree whose file sits inside a zip in the Black Hole (owner ruling A:
+ * present, not used). Gates the raw-with-masters mode, which places every master in the tree;
+ * the calibrated mode reads the same masters through `missing_master_files`.
+ */
+blackHoleZipMasters: number, fileCounts: ExportFileCounts, 
 /**
  * Plan 5b Task 8 (owner requirement 2026-09-09 — "the pipeline builds
  * its own masters"): the `raw_set_ids_without_master` subset the

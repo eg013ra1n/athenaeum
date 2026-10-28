@@ -427,6 +427,19 @@ fn clear_raw_frames_recursive(conn: &Connection, info: &mut CalibrationSetInfo) 
     Ok(())
 }
 
+/// The master sets in the tree whose file sits inside a zip in the Black Hole (owner ruling A: present,
+/// not used), ascending. The raw-with-masters mode must not place them.
+pub fn black_hole_zip_master_set_ids(conn: &Connection, data: &ExportData) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    for set_id in master_set_ids(conn, data)? {
+        if crate::db::calibration_set_in_black_hole_zip(conn, set_id)? {
+            out.push(set_id);
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// Strict (spec 2026-08-28 D2): every linked set with frames must be a master.
 /// The API-layer gate runs first; this is the backstop that guarantees a
 /// partial export/send can never be written.
@@ -437,6 +450,15 @@ fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Ve
             "{} calibration set(s) have no master — build masters first (sets {:?})",
             raw.len(),
             raw
+        );
+    }
+    // Owner ruling A backstop: the API gate refuses first with the same sentence.
+    let black_hole = black_hole_zip_master_set_ids(conn, data)?;
+    if !black_hole.is_empty() {
+        anyhow::bail!(
+            "{} master file(s) missing on disk — restore from archive first (sets {:?} are inside a zip in the Black Hole)",
+            black_hole.len(),
+            black_hole
         );
     }
     Ok(Vec::new())

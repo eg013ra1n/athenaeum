@@ -8092,6 +8092,50 @@ mod tests {
         assert_eq!(find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().len(), 1);
     }
 
+    /// The cache rebuild and the cached read use the same Black Hole fragment as the live query (r3 spliced
+    /// it into both): a rebuild never counts or lists a file of a Black Hole zip, and a cache built BEFORE
+    /// the zip was rejected stops serving that file at once, without a rebuild. Restore brings it back.
+    #[test]
+    fn duplicate_cache_leaves_out_the_files_of_a_black_hole_zip() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+        seed_dup_file(&conn, 1, "/vol/a/f.fits", "2024-01-01T00:00:00+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 2, "/vol/b/f.fits", "2024-01-01T00:00:01+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 3, "/vol/c/f.fits", "2024-01-01T00:00:02+00:00", "HDR-A", "Flat", 0);
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/vol/c.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_zip_path = '/vol/c.zip' WHERE id = 3", []).unwrap();
+        let key = DuplicateKey::Header;
+        let sizes = |conn: &Connection| -> Vec<usize> {
+            get_cached_duplicates(conn, key).unwrap().iter().map(|g| g.file_paths.len()).collect()
+        };
+
+        // Cache built while nothing is rejected: one group of three.
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![3]);
+
+        // The zip goes to the Black Hole: the stale cache stops serving its file straight away...
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/vol/c.zip", "files").unwrap();
+        assert_eq!(sizes(&conn), vec![2], "the cached read leaves the zip's file out");
+        // ...and a rebuild under the same condition lists two, not three.
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![2], "the rebuild leaves it out too");
+
+        // Only one usable copy of a pair: no group at all, in the rebuild and in the read.
+        conn.execute("DELETE FROM files WHERE id = 2", []).unwrap();
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 0);
+        assert!(get_cached_duplicates(&conn, key).unwrap().is_empty());
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![2], "restored: both copies are listed again");
+    }
+
     /// `strong_hash` for one file — what `fill_master_strong_hashes` would have
     /// written after reading the bytes.
     fn set_strong_hash(conn: &Connection, id: i64, hash: &str) {

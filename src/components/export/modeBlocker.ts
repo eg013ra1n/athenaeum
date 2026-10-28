@@ -51,6 +51,10 @@ export function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null
     const n = r.rawSetsWithoutMaster;
     return `${n} calibration set${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no master — build masters first`;
   }
+  // A master inside a Black Hole zip is present but not used; same sentence as an unusable master file.
+  if (mode === 'rawWithMasters' && r.blackHoleZipMasters > 0) {
+    return `${r.blackHoleZipMasters} master file(s) missing on disk — restore from archive first`;
+  }
   if (mode === 'calibratedLights') {
     // R3: an attested set's lights are copied as they are — no masters needed.
     if (r.attested) return null;
