@@ -284,6 +284,10 @@ fn run_restore_inner(
             None
         };
 
+        // A trusted file already at the destination is adopted: the catalog update writes the row's
+        // path, size and mtime from that verified file (the row may have been re-pointed at its zip's
+        // virtual path, or the file may sit under another root), exactly as if it had just been copied.
+        let mut adopt_existing = false;
         if let Some(existing) = existing {
             // Don't just trust whatever is sitting there — hash it with the SAME function that
             // produced the plan's expected_hash and compare. Anything else (wrong version,
@@ -298,6 +302,7 @@ fn run_restore_inner(
                         total,
                         format!("Already on disk, hash-verified — skipping: {}", existing.display()),
                     );
+                    adopt_existing = true;
                 }
                 Ok(actual) => {
                     let msg = format!(
@@ -359,7 +364,9 @@ fn run_restore_inner(
                     );
                 }
             }
-            continue;
+            if !adopt_existing {
+                continue;
+            }
         }
 
         // The catalog update writes `files.path = dest`, which is UNIQUE: if another row already
@@ -400,6 +407,12 @@ fn run_restore_inner(
                 );
                 continue;
             }
+        }
+
+        if adopt_existing {
+            // Nothing to copy: the catalog update below points the row at `dest`.
+            restored.push((f, dest));
+            continue;
         }
 
         if let Some(parent) = dest.parent() {
@@ -1178,6 +1191,73 @@ pub(crate) mod tests {
         let outcome = run_restore(&conn, op_id, target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
         assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
         assert!(!frame_set_archived(&conn));
+        // The trusted file is adopted: the row now lives at the destination, markers cleared.
+        let (path, zip, op_col): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT path, archive_zip_path, archived_in_operation FROM files WHERE id = 1000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(path, dest.to_str().unwrap(), "files.path follows the adopted file");
+        assert!(zip.is_none() && op_col.is_none(), "markers cleared");
+    }
+
+    /// A row the scanner re-pointed at its zip's virtual path, whose verified bytes sit at the
+    /// original path: the restore moves `files.path` back to the original and takes size and mtime
+    /// from that file.
+    #[test]
+    fn trusted_file_at_the_original_path_repoints_a_row_that_reads_as_zip_resident() {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+        let l1 = scan.path().join("M31/L_001.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        std::fs::write(&l1, b"first-frame").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (1000, ?1, 'L_001.fits', 11, '2025-10-12', 'FITS')",
+            [l1.to_str().unwrap()],
+        ).unwrap();
+        conn.execute("INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (10000, 1000, 'M31', 'T', 'C', 'Light')", []).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        run_operation(&conn, op_id, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(!l1.exists());
+
+        // The scanner re-pointed the row at its virtual path; the same bytes are back at the original path.
+        let (zip, entry): (String, String) = conn
+            .query_row("SELECT archive_zip_path, archive_path_in_zip FROM files WHERE id = 1000", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        conn.execute(
+            "UPDATE files SET path = ?1, size = 99, modified_at = '2000-01-01T00:00:00+00:00' WHERE id = 1000",
+            [crate::zip_store::scan::virtual_path(Path::new(&zip), &entry)],
+        ).unwrap();
+        std::fs::write(&l1, b"first-frame").unwrap();
+
+        let outcome = run_restore(&conn, op_id, scan.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+        let (path, size, mtime, zip_col): (String, i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT path, size, modified_at, archive_zip_path FROM files WHERE id = 1000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(path, l1.to_str().unwrap(), "files.path is the verified file, not the virtual path");
+        assert_eq!(size, 11, "size comes from the file on disk");
+        assert_ne!(mtime, "2000-01-01T00:00:00+00:00", "mtime comes from the file on disk");
+        assert!(zip_col.is_none(), "markers cleared");
+        assert_eq!(std::fs::read(&l1).unwrap(), b"first-frame");
     }
 
     /// The new capture's row still owns the original path (its file was deleted from disk): the
