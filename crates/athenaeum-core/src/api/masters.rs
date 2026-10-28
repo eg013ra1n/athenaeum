@@ -1566,7 +1566,13 @@ fn run_build(
         // Same path the master already lives at — no collision resolution and
         // nothing to claim (the name was claimed by the build that created
         // it): `write_fits_f32` replaces the existing file atomically.
-        BuildTarget::Rebuild { target_path, .. } => {
+        BuildTarget::Rebuild { target_path, master_set_id, .. } => {
+            // The last guard before a write: a zip-resident master's `files.path` is never ours
+            // to create (`zip_resident_master_block`), whatever resolved this target.
+            if let Some(reason) = zip_resident_master_block(&conn, *master_set_id)? {
+                tracing::warn!(master_set_id, %reason, "master rebuild refused: the master lives in a zip");
+                return Err(BuildStepError::Other(reason));
+            }
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -2145,6 +2151,40 @@ pub(crate) fn master_file_path(
         .optional()?)
 }
 
+/// Why master set `master_set_id` can never be a rebuild target because its file lives in a zip, or
+/// `None` when its file row is a plain disk row (or it has none). A rebuild writes AT the row's
+/// `files.path`; for a zip-resident row that path is a virtual path (`<zip>/<entry>`, a foreign zip) or
+/// the original path before the zip (our own Move and ZIP) — neither is a place this code may create
+/// a directory or a file, so a zip-resident master is never rebuilt in place, whether or not its zip
+/// is reachable. Stage 0.5 and the manual Rebuild both ask this before they resolve a target.
+pub(crate) fn zip_resident_master_block(
+    conn: &rusqlite::Connection,
+    master_set_id: i64,
+) -> Result<Option<String>, ApiError> {
+    let markers: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT fi.archive_zip_path, fi.archive_path_in_zip FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE csf.set_id = ?1 LIMIT 1",
+            [master_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(zip), Some(entry))) = markers else {
+        return Ok(None);
+    };
+    let zip_name = Path::new(&zip)
+        .file_name()
+        .map_or_else(|| zip.clone(), |n| n.to_string_lossy().into_owned());
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    Ok(Some(if presence.is_present(&zip, &entry) {
+        format!("master is inside {zip_name} - restore it from the zip before rebuilding")
+    } else {
+        format!("master is inside {zip_name}, which is not reachable")
+    }))
+}
+
 /// Resolve a [`BuildTarget::Rebuild`] for master set `master_set_id`: the
 /// RAW source set id from its `master_provenance` row, the precondition that
 /// every source member frame is still on disk
@@ -2169,6 +2209,10 @@ pub(crate) fn resolve_rebuild_target(
         )
     })?;
 
+    if let Some(reason) = zip_resident_master_block(conn, master_set_id)? {
+        tracing::warn!(master_set_id, %reason, "rebuild refused: the master lives in a zip");
+        return Err(ApiError::Invalid(reason));
+    }
     check_rebuild_source_ready(conn, source_set_id)?;
 
     let (master_file_id, target_path) =
@@ -5153,17 +5197,94 @@ mod tests {
         reader.read_plane(0).unwrap()
     }
 
-    /// The same frames on disk and inside a zip integrate to the same master pixels, and
-    /// the zipped build reads them through the zip cache (the rows stay zip-resident).
+    /// A real raw frame of `kind` with the given pixels (`w` x `h`).
+    fn write_raw_frame_data(
+        path: &std::path::Path,
+        kind: crate::fits_writer::keywords::FrameKind,
+        (w, h): (usize, usize),
+        exptime: f64,
+        data: &[f32],
+    ) {
+        use crate::fits_writer::keywords::HeaderBuilder;
+        let cards = HeaderBuilder::new(kind)
+            .instrume("TestCam")
+            .exptime(exptime)
+            .binning(1, 1)
+            .build()
+            .unwrap();
+        write_fits_f32(path, w, h, 1, data, &cards).unwrap();
+    }
+
+    /// A raw set of `planes.len()` real frames in `dir`, one pixel plane per frame, joined like the
+    /// scanner leaves them. Frame `i` is `<imagetyp><i>.fits`.
+    fn seed_raw_set_with_planes(
+        conn: &Connection,
+        dir: &std::path::Path,
+        (imagetyp, kind): (&str, crate::fits_writer::keywords::FrameKind),
+        size: (usize, usize),
+        exptime: f64,
+        planes: &[Vec<f32>],
+    ) -> i64 {
+        std::fs::create_dir_all(dir).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count, exptime) VALUES (?1, '2026-09-09', ?2, ?3)",
+            rusqlite::params![imagetyp, planes.len() as i64, exptime],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        for (i, plane) in planes.iter().enumerate() {
+            let name = format!("{imagetyp}{i}.fits");
+            let p = dir.join(&name);
+            write_raw_frame_data(&p, kind, size, exptime, plane);
+            let bytes = std::fs::metadata(&p).unwrap().len() as i64;
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, '2026-09-09', 'FITS')",
+                rusqlite::params![p.to_string_lossy(), name, bytes],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime, binning)
+                 VALUES (?1, ?2, 'TestCam', ?3, '1x1')",
+                rusqlite::params![file_id, imagetyp, exptime],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// Frame `i`'s pixels: distinct per frame AND per pixel (a ramp in x, another in y, a different slope
+    /// for every frame), so a frame mapped to another frame's file, one file read twice, or a band placed
+    /// at the wrong rows all change the combined plane.
+    fn ramp_plane(i: usize, (w, h): (usize, usize)) -> Vec<f32> {
+        let slope_x = 0.5 + 0.25 * i as f32;
+        let slope_y = (i as f32 - 2.0) * 0.3;
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| 100.0 + 13.0 * i as f32 + slope_x * x as f32 + slope_y * y as f32))
+            .collect()
+    }
+
+    /// Frames on disk and the same frames inside a zip integrate to the master the data says (the
+    /// per-pixel median of the five distinct ramps, computed here independently), and the zipped
+    /// build reads them through the zip cache (the rows stay zip-resident).
     #[cfg(all(feature = "render", feature = "solver"))]
     #[test]
     fn master_build_from_zip_resident_frames_matches_the_disk_build() {
+        use crate::fits_writer::keywords::FrameKind;
         use crate::zip_store::test_support::{zip_files, Shape};
+        let size = (40usize, 24usize);
         let tmp = tempfile::tempdir().unwrap();
         let library_dir = tmp.path().join("library");
         std::fs::create_dir_all(&library_dir).unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
-        let values = [100.0f32, 140.0, 90.0, 120.0, 105.0];
+        let planes: Vec<Vec<f32>> = (0..5).map(|i| ramp_plane(i, size)).collect();
         let (disk_set, zip_set, zipped_paths) = {
             let conn = database.conn();
             crate::db::set_setting(
@@ -5172,8 +5293,9 @@ mod tests {
                 &library_dir.to_string_lossy(),
             )
             .unwrap();
-            let disk_set = seed_dark_set_with_values(&conn, &tmp.path().join("disk"), &values);
-            let zip_set = seed_dark_set_with_values(&conn, &tmp.path().join("zipped"), &values);
+            let kind = ("Dark", FrameKind::Dark);
+            let disk_set = seed_raw_set_with_planes(&conn, &tmp.path().join("disk"), kind, size, 60.0, &planes);
+            let zip_set = seed_raw_set_with_planes(&conn, &tmp.path().join("zipped"), kind, size, 60.0, &planes);
             let ids: Vec<i64> = conn
                 .prepare(
                     "SELECT fi.id FROM calibration_set_frames csf
@@ -5213,9 +5335,17 @@ mod tests {
         };
         let from_disk = master_pixels(&ctx, build(disk_set));
         let from_zip = master_pixels(&ctx, build(zip_set));
-        assert_eq!(from_disk, from_zip);
-        assert_eq!(from_disk.len(), 64);
-        assert!((from_disk[0] - 105.0).abs() < 1e-3, "median of the five: {}", from_disk[0]);
+        let expected: Vec<f32> = (0..size.0 * size.1)
+            .map(|px| crate::integration::stats::median_of(&planes.iter().map(|p| p[px]).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(from_disk.len(), expected.len());
+        // The data really differs from pixel to pixel, so a mix-up would show.
+        assert!(expected.iter().any(|v| (v - expected[0]).abs() > 1.0));
+        for (name, got) in [("disk", &from_disk), ("zip", &from_zip)] {
+            for (px, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert!((g - e).abs() < 1e-3, "{name} build, pixel {px}: {g} vs {e}");
+            }
+        }
 
         // The frames were read through the cache and the rows still name the zip.
         let still_resident: i64 = db(&ctx)
@@ -5227,7 +5357,259 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(still_resident, values.len() as i64);
+        assert_eq!(still_resident, planes.len() as i64);
+    }
+
+    /// A flat whose pre-calibration master lives in a zip builds the same flat as one whose master is on
+    /// disk: `run_build` extracts the master (rewriting `PrecalChoice::Master`'s path) and subtracts it.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    #[test]
+    fn flat_build_with_its_precal_master_in_a_zip_matches_the_disk_build() {
+        use crate::fits_writer::keywords::FrameKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let size = (40usize, 24usize);
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let dark_planes: Vec<Vec<f32>> = (0..3).map(|i| ramp_plane(i, size)).collect();
+        let flat_planes: Vec<Vec<f32>> = (0..3)
+            .map(|i| ramp_plane(i, size).iter().map(|v| v * 40.0).collect())
+            .collect();
+        let (dark_set, flat_a, flat_b) = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let dark = seed_raw_set_with_planes(&conn, &tmp.path().join("d"), ("Dark", FrameKind::Dark), size, 2.0, &dark_planes);
+            let flat_kind = ("Flat", FrameKind::Flat);
+            let a = seed_raw_set_with_planes(&conn, &tmp.path().join("fa"), flat_kind, size, 2.0, &flat_planes);
+            let b = seed_raw_set_with_planes(&conn, &tmp.path().join("fb"), flat_kind, size, 2.0, &flat_planes);
+            (dark, a, b)
+        };
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe {
+            combine: Some(IntegrationRecipe::median(Rejection::None)),
+            synthetic_bias: None,
+            archive_after: false,
+        };
+        let build = |set_id: i64| {
+            run_build(
+                &ctx,
+                &crate::events::NullEmitter,
+                "0.5.1-test",
+                set_id,
+                &recipe,
+                &Arc::new(AtomicBool::new(false)),
+                BuildTarget::New,
+                Admission::Acquire,
+            )
+            .expect("the build must succeed")
+            .0
+        };
+        let master_dark = build(dark_set);
+        let master_dark_file: i64 = {
+            let h = db(&ctx).unwrap();
+            let conn = h.conn();
+            for flat in [flat_a, flat_b] {
+                conn.execute(
+                    "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type)
+                     VALUES (?1, 'calibration_set', ?2, 'DarkFlat')",
+                    rusqlite::params![flat, master_dark],
+                )
+                .unwrap();
+            }
+            master_file_path(&conn, master_dark).unwrap().unwrap().0
+        };
+        let with_disk_precal = master_pixels(&ctx, build(flat_a));
+        // Now the pre-calibration master goes into a zip and its disk file is gone.
+        {
+            let h = db(&ctx).unwrap();
+            let conn = h.conn();
+            zip_files(&conn, &[master_dark_file], &tmp.path().join("masters.zip"), Shape::Foreign);
+        }
+        let with_zip_precal = master_pixels(&ctx, build(flat_b));
+        assert_eq!(with_disk_precal, with_zip_precal);
+        // The dark was subtracted: a flat with no dark would sit near the raw median (about 40x the ramp).
+        let raw_median: Vec<f32> = (0..size.0 * size.1)
+            .map(|px| crate::integration::stats::median_of(&flat_planes.iter().map(|p| p[px]).collect::<Vec<_>>()))
+            .collect();
+        assert!(
+            with_zip_precal.iter().zip(&raw_median).any(|(a, b)| (a - b).abs() > 1.0),
+            "the pre-calibration master was applied"
+        );
+    }
+
+    /// Cancel while the frames are still being read out of their zip: the build ends `Cancelled`, writes
+    /// no master (not even a partial in the library), supersedes nothing, and leaves no partial extraction
+    /// or pin behind in the zip cache.
+    #[test]
+    fn cancel_during_the_reading_stage_leaves_a_clean_state() {
+        use crate::fits_writer::keywords::FrameKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        struct CancelOnReading(Arc<AtomicBool>);
+        impl ProgressEmitter for CancelOnReading {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                if event_name == "master-build-progress" && payload["stage"] == "reading" {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let size = (40usize, 24usize);
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let planes: Vec<Vec<f32>> = (0..4).map(|i| ramp_plane(i, size)).collect();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let set_id = seed_raw_set_with_planes(&conn, &tmp.path().join("z"), ("Dark", FrameKind::Dark), size, 60.0, &planes);
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM files ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            zip_files(&conn, &ids, &tmp.path().join("darks.zip"), Shape::Foreign);
+            set_id
+        };
+        let ctx = build_test_ctx(database);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+        let err = run_build(
+            &ctx,
+            &CancelOnReading(cancel.clone()),
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &cancel,
+            BuildTarget::New,
+            Admission::Acquire,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BuildStepError::Cancelled), "expected Cancelled");
+        assert!(cancel.load(Ordering::SeqCst), "the cancel came from the reading stage");
+        assert!(
+            std::fs::read_dir(&library_dir).unwrap().next().is_none(),
+            "no master and no partial in the library"
+        );
+        let (superseded, masters): (Option<i64>, i64) = {
+            let h = db(&ctx).unwrap();
+            let conn = h.conn();
+            (
+                conn.query_row("SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1", [set_id], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT COUNT(*) FROM master_provenance", [], |r| r.get(0)).unwrap(),
+            )
+        };
+        assert_eq!(superseded, None, "the source set is not superseded");
+        assert_eq!(masters, 0, "no master was registered");
+        // Nothing half-written and nothing pinned: the cache can be emptied completely.
+        let cache_dir = ctx.zip_cache.dir().unwrap().to_path_buf();
+        let mut partials = Vec::new();
+        let mut stack = vec![cache_dir];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "partial") {
+                    partials.push(p);
+                }
+            }
+        }
+        assert!(partials.is_empty(), "{partials:?}");
+        ctx.zip_cache.clear_unpinned().unwrap();
+        assert_eq!(ctx.zip_cache.status().unwrap().entries, 0, "no pin outlived the failed build");
+    }
+
+    /// A master that lives in a zip is never a rebuild target: with the zip gone (an unmounted share) the
+    /// rebuild is refused, naming the zip, and nothing is created at `<zip>/<entry>` — not a directory,
+    /// not a file — nor where the zip belongs. Covers the resolver and the writer's own last guard.
+    #[test]
+    fn a_zip_resident_master_is_never_rebuilt_in_place() {
+        use crate::fits_writer::keywords::FrameKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let size = (16usize, 8usize);
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let planes: Vec<Vec<f32>> = (0..3).map(|i| ramp_plane(i, size)).collect();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            seed_raw_set_with_planes(&conn, &tmp.path().join("src"), ("Dark", FrameKind::Dark), size, 60.0, &planes)
+        };
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+        let (master_set_id, _) = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::New,
+            Admission::Acquire,
+        )
+        .unwrap();
+        // The sources are still on disk (reachable); only the master moves into a zip, and the zip is lost.
+        let (master_file_id, virtual_path, master_zip) = {
+            let h = db(&ctx).unwrap();
+            let conn = h.conn();
+            let (file_id, _) = master_file_path(&conn, master_set_id).unwrap().unwrap();
+            let zip = tmp.path().join("share").join("masters.zip");
+            std::fs::create_dir_all(zip.parent().unwrap()).unwrap();
+            let paths = zip_files(&conn, &[file_id], &zip, Shape::Foreign);
+            (file_id, paths.into_iter().next().unwrap(), zip)
+        };
+        std::fs::remove_dir_all(master_zip.parent().unwrap()).unwrap();
+
+        let h = db(&ctx).unwrap();
+        let conn = h.conn();
+        assert!(check_rebuild_source_ready(&conn, set_id).is_ok(), "the sources are reachable");
+        let err = resolve_rebuild_target(&conn, master_set_id).err().expect("refused").to_string();
+        assert!(err.contains("masters.zip, which is not reachable"), "{err}");
+        // The writer refuses on its own, whatever resolved the target.
+        drop(conn);
+        let err = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::Rebuild {
+                master_set_id,
+                master_file_id,
+                target_path: PathBuf::from(&virtual_path),
+            },
+            Admission::Acquire,
+        )
+        .unwrap_err();
+        match err {
+            BuildStepError::Other(msg) => assert!(msg.contains("masters.zip, which is not reachable"), "{msg}"),
+            BuildStepError::Cancelled => panic!("expected a refusal, got Cancelled"),
+        }
+        assert!(!std::path::Path::new(&virtual_path).exists(), "nothing at <zip>/<entry>");
+        assert!(!master_zip.exists(), "nothing where the zip belongs");
+        assert!(!master_zip.parent().unwrap().exists(), "the share's folder was not recreated");
     }
 
     /// A zip that lists the frames but cannot be reached at build time fails the build with

@@ -101,33 +101,60 @@ pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> Prepare
 /// `light_resolve::resolve_cfa_geometry`. ROWORDER is not geometry: BAYERPAT
 /// describes the mosaic in file row order.
 pub(crate) fn cfa_geometry_of_file(path: &Path) -> anyhow::Result<Option<CfaGeometry>> {
-    let (bayerpat, xoff, yoff) = if crate::stacking::project_source::is_xisf(path) {
+    let fields = if crate::stacking::project_source::is_xisf(path) {
         let f = crate::fits_parser::parse_xisf(path, 0)?;
         (f.bayerpat, f.xbayroff, f.ybayroff)
     } else {
         let header = crate::fits_parser::FitsHeader::from_path(path)?;
-        let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
-            crate::models::FileFormat::FITS,
-            &header.to_header_text(),
-        );
-        let f = crate::fits_parser::stored_header::cfa_fields_from_keys(&keys);
+        fits_cfa_fields(&header)
+    };
+    Ok(cfa_geometry_from_fields(path, fields))
+}
+
+/// [`cfa_geometry_of_file`] over the header bytes of a zip entry (`label` names it in logs; `is_xisf` picks
+/// the format): the same fields, the same rules, no extraction.
+pub(crate) fn cfa_geometry_of_header_bytes(
+    label: &Path,
+    bytes: &[u8],
+    is_xisf: bool,
+) -> anyhow::Result<Option<CfaGeometry>> {
+    let fields = if is_xisf {
+        let (f, _) = crate::fits_parser::parse_xisf_header_bytes(bytes, 0, label)?;
         (f.bayerpat, f.xbayroff, f.ybayroff)
+    } else {
+        fits_cfa_fields(&crate::fits_parser::FitsHeader::from_bytes(bytes)?)
     };
-    let Some(raw) = bayerpat.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
+    Ok(cfa_geometry_from_fields(label, fields))
+}
+
+fn fits_cfa_fields(
+    header: &crate::fits_parser::FitsHeader,
+) -> (Option<String>, Option<i64>, Option<i64>) {
+    let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
+        crate::models::FileFormat::FITS,
+        &header.to_header_text(),
+    );
+    let f = crate::fits_parser::stored_header::cfa_fields_from_keys(&keys);
+    (f.bayerpat, f.xbayroff, f.ybayroff)
+}
+
+fn cfa_geometry_from_fields(
+    path: &Path,
+    (bayerpat, xoff, yoff): (Option<String>, Option<i64>, Option<i64>),
+) -> Option<CfaGeometry> {
+    let raw = bayerpat.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
     let Some(pattern) = crate::fits_writer::keywords::Bayer::parse(raw) else {
         tracing::warn!(path = %path.display(), bayerpat = %raw, "unrecognized bayer pattern in the file's header; treated as no mosaic");
-        return Ok(None);
+        return None;
     };
     if xoff.is_none() || yoff.is_none() {
         tracing::debug!(path = %path.display(), "cfa phase not declared in the file's header; assumes 0");
     }
-    Ok(Some(CfaGeometry {
+    Some(CfaGeometry {
         pattern,
         xoff: xoff.unwrap_or(0),
         yoff: yoff.unwrap_or(0),
-    }))
+    })
 }
 
 /// A run's frame id to origin map, shared by the plan, `HashMemo` and the run.

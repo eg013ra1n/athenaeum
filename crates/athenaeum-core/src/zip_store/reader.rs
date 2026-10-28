@@ -87,6 +87,8 @@ impl<R: Seek> Seek for Counting<R> {
 type Archive = zip::ZipArchive<BufReader<Counting<File>>>;
 
 fn open_archive(zip: &Path, buf_bytes: usize) -> Result<(Archive, Arc<AtomicU64>)> {
+    #[cfg(test)]
+    test_hooks::note_open(zip);
     let file = File::open(zip).with_context(|| format!("open zip {}", zip.display()))?;
     let bytes = Arc::new(AtomicU64::new(0));
     let reader = BufReader::with_capacity(buf_bytes, Counting { inner: file, bytes: bytes.clone() });
@@ -466,6 +468,29 @@ pub fn extract_entry(
     std::fs::rename(&partial, dest).with_context(|| format!("rename {} to {}", partial.display(), dest.display()))?;
     guard.armed = false;
     Ok(Extracted { bytes: total, strong_hash: format!("{:016x}", hasher.digest()) })
+}
+
+/// Test-only observation: how many times each zip was opened (its directory parsed), keyed by path so
+/// parallel tests, each with its own temp zip, do not see each other.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn opens() -> &'static Mutex<HashMap<PathBuf, u64>> {
+        static OPENS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+        OPENS.get_or_init(Default::default)
+    }
+
+    pub(super) fn note_open(zip: &Path) {
+        *opens().lock().unwrap().entry(zip.to_path_buf()).or_default() += 1;
+    }
+
+    /// Times `zip` has been opened by the reader so far.
+    pub(crate) fn opens_of(zip: &Path) -> u64 {
+        opens().lock().unwrap().get(zip).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

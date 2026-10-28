@@ -98,6 +98,24 @@ pub fn catalog_path_is_present(conn: &rusqlite::Connection, presence: &mut ZipPr
     row_is_present(presence, path, zip.as_deref(), entry.as_deref())
 }
 
+/// `(archive_zip_path, archive_path_in_zip)` of the zip-resident row at catalog `path`; `None` for a disk
+/// row or a path with no row.
+pub fn zip_markers(conn: &rusqlite::Connection, path: &str) -> Option<(String, String)> {
+    match conn.query_row(
+        "SELECT archive_zip_path, archive_path_in_zip FROM files
+         WHERE path = ?1 AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL",
+        [path],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(markers) => Some(markers),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "zip presence: cannot read the file row; treating it as a disk file");
+            None
+        }
+    }
+}
+
 /// `true` when `path` is the catalog path of a zip-resident row (both zip markers set). A plan gate uses
 /// it to leave such a file unprobed: probing needs the bytes, and a gate extracts nothing.
 pub fn is_zip_resident_path(conn: &rusqlite::Connection, path: &str) -> bool {

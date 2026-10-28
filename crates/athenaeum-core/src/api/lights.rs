@@ -1100,6 +1100,11 @@ fn classify_master_rebuildability(
     let Some(source_set_id) = prov.source_set_id else {
         return Ok(Some("no provenance".to_string()));
     };
+    // A master that lives in a zip is never rebuilt in place (its row path is not ours to write):
+    // missing here means its zip is unreachable, and the plan blocks on it.
+    if let Some(reason) = crate::api::masters::zip_resident_master_block(conn, master_set_id)? {
+        return Ok(Some(reason));
+    }
     match crate::api::masters::check_rebuild_source_ready(conn, source_set_id) {
         Ok(()) => Ok(None),
         Err(e) => Ok(Some(e.to_string())),
@@ -2578,6 +2583,51 @@ mod tests {
             "{:?}",
             r.masters_unrebuildable
         );
+    }
+
+    /// A missing master that lives in a zip is never rebuildable, even with its raw sources on disk: a
+    /// rebuild would write at the row's path (`<zip>/<entry>`). It lands in `masters_unrebuildable`
+    /// naming the zip, and a master whose zip is present is simply not missing.
+    #[test]
+    fn a_master_in_a_missing_zip_is_unrebuildable_even_with_reachable_sources() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let master = 400;
+        let master_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master bytes").unwrap();
+        seed_master_with_file(&conn, master, "MasterDark", &master_path);
+        let source = seed_raw_set_real_files(&conn, tmp.path(), 401, "Dark", 3);
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: master,
+                source_set_id: Some(source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, master, "Dark");
+        let zip = tmp.path().join("masters.zip");
+        let paths = zip_files(&conn, &[master * 100 + 8_000_000], &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0, "its zip lists it");
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1);
+        assert!(r.masters_rebuildable.is_empty(), "{:?}", r.masters_rebuildable);
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(master, "master is inside masters.zip, which is not reachable".to_string())]
+        );
+        assert!(!zip.exists() && !std::path::Path::new(&paths[0]).exists());
     }
 
     /// Plan 5b Task 8b (found by the Task 7 acceptance run on the real LDN

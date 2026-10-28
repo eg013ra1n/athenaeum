@@ -765,10 +765,18 @@ pub(crate) fn group_frames_with(
     // different keys for them.
     type BucketKey = (&'static str, String, i64);
     let mut buckets: HashMap<BucketKey, Bucket> = HashMap::new();
+    // An attested set's lights may sit in zips: their shapes come from entry headers, one directory read
+    // per zip (not per frame).
+    let zip_shapes = if attested_debayer_osc.is_some() {
+        crate::stacking::project_source::ZipShapes::load(conn, members.iter().map(|m| m.path.as_str()))
+    } else {
+        Default::default()
+    };
     for m in members {
         let token: &'static str = match attested_debayer_osc {
             Some(debayer_osc) => crate::stacking::project_source::attested_color_token(
                 conn,
+                &zip_shapes,
                 frames_set_id,
                 m.frame_id,
                 color_mode_of(&m.bayerpat) == ColorMode::Osc,

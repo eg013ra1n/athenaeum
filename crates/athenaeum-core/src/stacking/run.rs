@@ -2440,6 +2440,38 @@ struct PrepareRunJob {
     detach: bool,
 }
 
+/// Extracts one zip-resident frame for Prepare on the run's cancel flag. `Ok(Err(excluded))`: the frame
+/// cannot be read (it is excluded, not a failed run); `Err(Cancelled)` when the run was cancelled meanwhile.
+fn extract_for_prepare(
+    rc: &RunContext,
+    frame_id: i64,
+    catalog_path: &Path,
+) -> Result<
+    Result<(PathBuf, Option<crate::zip_store::cache::Pinned>), PrepareResolved>,
+    RunError,
+> {
+    match crate::zip_store::materialize::materialize_one_cancellable(
+        &rc.ctx,
+        &catalog_path.to_string_lossy(),
+        &rc.cancel,
+    ) {
+        Ok(found) => Ok(Ok(found)),
+        Err(e) => {
+            rc.check_cancel()?;
+            tracing::error!(
+                run_id = rc.run_id,
+                frame_id,
+                path = %catalog_path.display(),
+                error = %format!("{e:#}"),
+                "frame could not be read from its zip"
+            );
+            Ok(Err(PrepareResolved::Excluded {
+                reason: format!("cannot read the file: {e:#}"),
+            }))
+        }
+    }
+}
+
 /// Prepare's per-frame RESOLVE phase, on the run thread:
 /// - the identity check (C9's Prepare boundary);
 /// - the stage-1 hash through `rc.memo`;
@@ -2454,7 +2486,9 @@ fn resolve_prepare_job(
     group: &IntegrationGroup,
     frame: &GroupFrame,
 ) -> Result<PrepareResolved, RunError> {
-    use crate::stacking::prepare::{prepare_action, probe_file, PrepareAction, PrepareJob};
+    use crate::stacking::prepare::{
+        prepare_action, probe_file, probe_zip_entry, PrepareAction, PrepareJob,
+    };
     if let Some(reason) = changed_during_run(rc, frame.frame_id)? {
         return Ok(PrepareResolved::Excluded { reason });
     }
@@ -2471,29 +2505,47 @@ fn resolve_prepare_job(
     };
     let mut input =
         crate::stacking::origin::prepare_input(origin_of(&rc.origins, frame.frame_id)?, frame);
-    // A frame inside a zip is extracted into the zip cache first; the pin lives in the job until it ends.
-    // A path with no zip row passes through untouched.
+    // A frame inside a zip is classified from its entry's header bytes, so the plane check and the
+    // freshness lookup below decide BEFORE any extraction; only a frame that needs real work is extracted
+    // (the pin lives in the job until it ends). A path with no zip row passes through untouched.
     let catalog_path = input.path.clone();
-    let (local, pin) = match crate::zip_store::materialize::materialize_one(
-        &rc.ctx,
-        &catalog_path.to_string_lossy(),
-    ) {
-        Ok(found) => found,
-        Err(e) => {
-            tracing::error!(
-                run_id = rc.run_id,
-                frame_id = frame.frame_id,
-                path = %catalog_path.display(),
-                error = %format!("{e:#}"),
-                "frame could not be read from its zip"
-            );
-            return Ok(PrepareResolved::Excluded {
-                reason: format!("cannot read the file: {e:#}"),
-            });
+    let zip_markers = {
+        let conn = db(&rc.ctx)?.conn();
+        crate::zip_store::presence::zip_markers(&conn, &catalog_path.to_string_lossy())
+    };
+    let header_shape = zip_markers.as_ref().and_then(|(zip, entry)| {
+        match probe_zip_entry(Path::new(zip), entry, &catalog_path) {
+            Ok(shape) => Some(shape),
+            Err(e) => {
+                // Not decided here: the extraction below reports the cause in the frame's exclusion.
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id = frame.frame_id,
+                    path = %catalog_path.display(),
+                    error = %format!("{e:#}"),
+                    "zip entry header unreadable; the frame is extracted to be classified"
+                );
+                None
+            }
+        }
+    });
+    let mut pin: Option<crate::zip_store::cache::Pinned> = None;
+    let header_classified = header_shape.is_some();
+    let shape = match header_shape {
+        Some(shape) => shape,
+        None => {
+            if zip_markers.is_some() {
+                match extract_for_prepare(rc, frame.frame_id, &catalog_path)? {
+                    Ok((local, extracted_pin)) => {
+                        input.path = local;
+                        pin = extracted_pin;
+                    }
+                    Err(excluded) => return Ok(excluded),
+                }
+            }
+            probe_file(&input.path)
         }
     };
-    input.path = local;
-    let shape = probe_file(&input.path);
     let action = prepare_action(&shape, cfg.calibration.debayer_osc);
     if let PrepareAction::Unsupported(why) = &action {
         return Ok(PrepareResolved::Excluded {
@@ -2569,6 +2621,16 @@ fn resolve_prepare_job(
     let dir = rc.layout.prepared_dir(&group.key);
     let converted_out = dir.join(format!("p_{stem}.fits"));
     let debayered_out = dir.join(format!("p_{stem}_d.fits"));
+    // A zip frame that needs real work (not Reused above) is extracted only now.
+    if zip_markers.is_some() && pin.is_none() && header_classified {
+        match extract_for_prepare(rc, frame.frame_id, &catalog_path)? {
+            Ok((local, extracted_pin)) => {
+                input.path = local;
+                pin = extracted_pin;
+            }
+            Err(excluded) => return Ok(excluded),
+        }
+    }
     // The replica is sacred: a write destination is never the file Prepare
     // reads. The names live under `prepared/` so this cannot happen; the
     // check is the guard if a layout change ever breaks that.
@@ -2628,8 +2690,14 @@ fn detach_zip_source(job: &PrepareRunJob) -> anyhow::Result<Option<crate::stacki
             .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
     }
     let partial = crate::zip_store::reader::partial_path(dest);
-    std::fs::copy(&job.job.src, &partial)
-        .map_err(|e| anyhow::anyhow!("copying {} out of the zip cache: {e}", job.job.src.display()))?;
+    if let Err(e) = std::fs::copy(&job.job.src, &partial) {
+        // A copy that fails halfway (disk full) leaves its partial; a retry would add another.
+        let _ = std::fs::remove_file(&partial);
+        return Err(anyhow::anyhow!(
+            "copying {} out of the zip cache: {e}",
+            job.job.src.display()
+        ));
+    }
     std::fs::rename(&partial, dest).map_err(|e| {
         let _ = std::fs::remove_file(&partial);
         anyhow::anyhow!("placing {}: {e}", dest.display())
@@ -3082,7 +3150,7 @@ fn warn_flat_only_group(
         // A master flat inside a zip is read from its extracted copy; the pin
         // lives until this flat's divisor and corner ratio are read.
         let (flat_path, _flat_pin) =
-            match crate::zip_store::materialize::materialize_one(&rc.ctx, &m.path) {
+            match crate::zip_store::materialize::materialize_one_cancellable(&rc.ctx, &m.path, &rc.cancel) {
                 Ok(found) => found,
                 Err(e) => {
                     tracing::warn!(
@@ -29602,7 +29670,7 @@ mod tests {
             &PathPolicy::AllowAll,
             "test".to_string(),
             subject.clone(),
-            Some(cfg),
+            Some(cfg.clone()),
             None,
         )
         .expect("an attested zip-resident set starts");
@@ -29638,6 +29706,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resident, light_ids.len() as i64, "the rows stay in the zip");
+
+        // A re-run with every stage-1 artifact fresh extracts NOTHING: freshness is decided from the
+        // entry headers before any entry is read out of the zip.
+        assert!(
+            ctx.zip_cache.extraction_count() >= light_ids.len() as u64,
+            "the first run extracted every light"
+        );
+        ctx.zip_cache.clear_unpinned().unwrap();
+        assert_eq!(ctx.zip_cache.status().unwrap().entries, 0, "the cache is empty before the re-run");
+        let extractions_before = ctx.zip_cache.extraction_count();
+        let again = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            subject.clone(),
+            Some(cfg),
+            None,
+        )
+        .expect("the re-run starts");
+        wait_for_run(&ctx, again.run_id);
+        let rerun_row = crate::db::stacking::get_run(&fixture.conn, again.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rerun_row.status, "done", "{rerun_row:?}");
+        assert_eq!(
+            ctx.zip_cache.extraction_count(),
+            extractions_before,
+            "a re-run with fresh stage-1 artifacts read nothing out of the zip"
+        );
+        assert_eq!(ctx.zip_cache.status().unwrap().entries, 0, "and the cache stays empty");
     }
 
     /// Review I12 on the attested path: a light whose catalog says colour

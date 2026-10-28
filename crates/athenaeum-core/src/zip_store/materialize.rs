@@ -448,12 +448,22 @@ pub fn materialize_paths(
 /// [`materialize_paths`] for one frame: its local path and, for a zip-resident row, the pin that keeps the
 /// cache file until dropped. For callers that apply their own per-frame failure policy.
 pub fn materialize_one(ctx: &ServiceContext, catalog_path: &str) -> Result<(PathBuf, Option<Pinned>)> {
+    materialize_one_cancellable(ctx, catalog_path, &AtomicBool::new(false))
+}
+
+/// [`materialize_one`] that stops when `cancel` is set, between and inside the entry's bytes (so a run's
+/// Cancel does not wait for a large entry from a slow share).
+pub fn materialize_one_cancellable(
+    ctx: &ServiceContext,
+    catalog_path: &str,
+    cancel: &AtomicBool,
+) -> Result<(PathBuf, Option<Pinned>)> {
     // No catalog yet means no zip-resident row can exist: the path is a plain file and passes through.
     if ctx.db.get().is_none() {
         return Ok((PathBuf::from(catalog_path), None));
     }
     let paths = [catalog_path.to_string()];
-    let done = materialize_paths(ctx, &paths, &NullEmitter, "", &AtomicBool::new(false))?;
+    let done = materialize_paths(ctx, &paths, &NullEmitter, "", cancel)?;
     let local = done.local(catalog_path).to_path_buf();
     Ok((local, done.into_pin()))
 }
@@ -816,6 +826,21 @@ mod materialize_tests {
         assert!(err.contains("cancelled"), "{err}");
         assert_eq!(f.ctx.zip_cache.extraction_count(), 1, "the extraction started: the partial file existed");
         assert!(f.cache_files().is_empty(), "no partial or finished file is left: {:?}", f.cache_files());
+    }
+
+    /// A caller's cancel flag reaches the single-frame extraction (the stacking run's Prepare passes its
+    /// own): set already, nothing is read out of the zip and nothing is left in the cache.
+    #[test]
+    fn materialize_one_stops_on_the_callers_cancel_flag() {
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("n.zip", &[("Lights/L_001.fits", light(1))]);
+        let err = materialize_one_cancellable(&f.ctx, &paths[0], &AtomicBool::new(true)).unwrap_err().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 0);
+        assert!(f.cache_files().is_empty(), "{:?}", f.cache_files());
+        // The same call with the flag clear extracts it.
+        let (local, pin) = materialize_one_cancellable(&f.ctx, &paths[0], &AtomicBool::new(false)).unwrap();
+        assert!(local.exists() && pin.is_some());
     }
 
     #[test]

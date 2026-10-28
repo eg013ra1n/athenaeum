@@ -6061,13 +6061,71 @@ mod tests {
             .expect("masterFiles blocker");
         assert_eq!(
             blocker.message,
-            "1 master file(s) missing on disk and in zip files"
+            "1 master file(s) missing on disk and cannot be rebuilt: master is inside master.zip, which is not reachable"
         );
         let rows: i64 = f
             .conn
             .query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0))
             .unwrap();
         assert!(rows > 0, "missing never deletes a row");
+    }
+
+    /// A master that lives in a zip which is gone is NEVER planned for a rebuild, even when its raw
+    /// sources are all on disk: a rebuild would write at the row's path (`<zip>/<entry>`), which is not
+    /// ours to create. The plan blocks, naming the zip, and nothing appears where the zip belongs.
+    #[test]
+    fn a_master_in_a_missing_zip_is_blocked_not_rebuilt_even_with_reachable_sources() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let master_zip = f.dir.path().join("master.zip");
+        let zipped = zip_files(
+            &f.conn,
+            &[master_file_id(&f.conn, dark_set)],
+            &master_zip,
+            Shape::Foreign,
+        );
+        std::fs::remove_file(&master_zip).unwrap();
+        let source_set: i64 = f
+            .conn
+            .query_row(
+                "SELECT source_set_id FROM master_provenance WHERE master_set_id = ?1",
+                [dark_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::api::masters::check_rebuild_source_ready(&f.conn, source_set).is_ok(),
+            "the raw sources are reachable, so only the zip rule can block this master"
+        );
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
+        assert!(plan.masters_to_build.is_empty(), "{:?}", plan.masters_to_build);
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|b| b.code == "masterFiles")
+            .expect("masterFiles blocker");
+        assert!(
+            blocker.message.contains("master is inside master.zip, which is not reachable"),
+            "{}",
+            blocker.message
+        );
+        assert!(!master_zip.exists(), "no directory or file where the zip belongs");
+        assert!(!std::path::Path::new(&zipped[0]).exists(), "nothing at <zip>/<entry>");
     }
 
     #[test]
