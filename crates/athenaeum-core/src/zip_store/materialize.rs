@@ -454,6 +454,23 @@ pub fn materialize_one(ctx: &ServiceContext, catalog_path: &str) -> Result<(Path
     Ok((local, done.into_pin()))
 }
 
+/// What names the bytes behind `catalog_path` for a preview-cache key, without extracting: `Ok(None)` for a
+/// path that is not a zip-resident row (the caller stats the file itself), otherwise the zip's size and
+/// mtime plus the entry's size and CRC32 (so a rewritten zip or a re-cataloged entry changes the key). `Err`
+/// when the zip cannot be reached, which is the same fail-fast a deleted file gives.
+pub fn preview_identity(ctx: &ServiceContext, catalog_path: &str) -> Result<Option<String>> {
+    let db = db_of(ctx)?;
+    let rows = {
+        let conn = db.conn();
+        query_rows(&conn, "path", &[rusqlite::types::Value::Text(catalog_path.to_string())])?
+    };
+    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    let file_name = row.entry.rsplit('/').next().unwrap_or_default().to_string();
+    let zip_name = Path::new(&row.zip).file_name().map_or_else(|| row.zip.clone(), |n| n.to_string_lossy().into_owned());
+    let (zip_size, zip_mtime) = zip_identity(&mut ZipFacts::default(), &row, &file_name, &zip_name)?;
+    Ok(Some(format!("zip:{zip_size}:{zip_mtime}:{}:{}", row.size, row.crc.unwrap_or(0))))
+}
+
 /// The numbers for a plan dialog: how many of these rows are zip-resident and not in the cache, and their
 /// total (uncompressed) size. A zip that cannot be reached counts its rows as not cached.
 pub fn estimate_extraction(ctx: &ServiceContext, file_ids: &[i64]) -> Result<ExtractionEstimate> {
@@ -554,6 +571,30 @@ mod materialize_tests {
         assert!(m.into_pin().is_none());
         assert_eq!(f.ctx.zip_cache.extraction_count(), 0);
         assert!(f.cache_files().is_empty());
+    }
+
+    #[test]
+    fn preview_key_needs_no_extraction_and_separates_zips() {
+        let f = fixture();
+        let (zip_a, paths_a) = f.catalog_zip("a.zip", &[("Lights/L_001.fits", light(1))]);
+        let (_zip_b, paths_b) = f.catalog_zip("b.zip", &[("Lights/L_001.fits", light(1))]);
+        let key = |p: &str| crate::cache::catalog_preview_cache_key(&f.ctx, p, "preview");
+        let (ka, kb) = (key(&paths_a[0]).unwrap(), key(&paths_b[0]).unwrap());
+        assert_ne!(ka, kb, "two zips holding the same entry path and bytes never share a preview key");
+        assert_eq!(ka, key(&paths_a[0]).unwrap(), "the key is stable");
+        assert_ne!(ka, crate::cache::catalog_preview_cache_key(&f.ctx, &paths_a[0], "thumbnail").unwrap());
+        assert_eq!(f.ctx.zip_cache.extraction_count(), 0, "a key never extracts");
+
+        // A disk path (cataloged or not) is keyed as before, by the file's own stat.
+        let disk = f.root().join("plain.fits");
+        std::fs::write(&disk, light(2)).unwrap();
+        let disk_path = disk.to_string_lossy().into_owned();
+        assert_eq!(key(&disk_path).unwrap(), crate::cache::preview_cache_key(&disk, "preview").unwrap());
+        assert!(key("/not/in/the/catalog.fits").is_err());
+
+        // A zip that is gone fails like a deleted file.
+        std::fs::remove_file(&zip_a).unwrap();
+        assert_eq!(key(&paths_a[0]).unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

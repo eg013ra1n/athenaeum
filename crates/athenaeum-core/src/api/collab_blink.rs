@@ -90,12 +90,15 @@ fn member_attested(
     }
 }
 
+/// The catalog path of the frame's raw file. For a zip-resident row that is its catalog path, not an
+/// extracted copy: the renderers (`read_fits_image_bytes`, `render_path_jpeg`) swap it for the cache file
+/// themselves and hold the pin while they read. Present = the file exists, or the zip lists the entry.
 fn raw_path_of(conn: &Connection, fid: i64) -> Result<PathBuf, ApiError> {
-    let raw: String = conn
+    let (raw, zip, entry): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT fi.path FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+            "SELECT fi.path, fi.archive_zip_path, fi.archive_path_in_zip FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
             [fid],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -103,14 +106,11 @@ fn raw_path_of(conn: &Connection, fid: i64) -> Result<PathBuf, ApiError> {
             }
             other => ApiError::Internal(format!("blink: raw path lookup failed: {other}")),
         })?;
-    let raw = PathBuf::from(raw);
-    if !raw.exists() {
-        return Err(ApiError::NotFound(format!(
-            "{} is not on this device",
-            raw.display()
-        )));
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    if !crate::zip_store::presence::row_is_present(&mut presence, &raw, zip.as_deref(), entry.as_deref()) {
+        return Err(ApiError::NotFound(format!("{raw} is not on this device")));
     }
-    Ok(raw)
+    Ok(PathBuf::from(raw))
 }
 
 /// Spec §4.1 steps 2–3 for a frame with no own row: withheld, or its raw in
@@ -704,5 +704,45 @@ mod tests {
         assert!(get_collab_blink_frames(&rig.ctx, &pid, &[r])
             .unwrap()
             .is_empty());
+    }
+
+    /// A zipped light cataloged through `scan_zip`: `(zip, frame id, catalog path)`.
+    fn zipped_frame(conn: &rusqlite::Connection, dir: &std::path::Path) -> (PathBuf, i64, String) {
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [dir.to_str().unwrap()]).unwrap();
+        let zip = make_zip(
+            dir,
+            "night.zip",
+            &[("Lights/L_001.fits", light(1))],
+            crate::archive::models::ArchiveCompression::Deflate,
+        );
+        crate::zip_store::scan::scan_zip(conn, &zip, 1, false).unwrap();
+        let catalog = crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits");
+        let frame: i64 = conn
+            .query_row(
+                "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [&catalog],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (zip, frame, catalog)
+    }
+
+    #[test]
+    fn blink_raw_path_of_resolves_a_zip_resident_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let (zip, frame, catalog) = zipped_frame(&conn, tmp.path());
+        // Present: the zip lists the entry. The catalog path comes back; the renderers extract it.
+        assert_eq!(raw_path_of(&conn, frame).unwrap(), PathBuf::from(&catalog));
+        // The catalog path itself does not exist as a file.
+        assert!(!Path::new(&catalog).exists());
+        // Gone zip: "not on this device", and the row stays.
+        std::fs::remove_file(&zip).unwrap();
+        match raw_path_of(&conn, frame) {
+            Err(ApiError::NotFound(m)) => assert!(m.contains("is not on this device"), "{m}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

@@ -323,7 +323,8 @@ pub async fn plate_solve_batch(
                                     let caches = solvemyastro::Caches::layered(&layer_refs);
                                     let index_refs: Vec<&solvemyastro::QuadIndex> =
                                         index_packs.iter().map(|a| a.as_ref()).collect();
-                                    match service::solve_frame_with_hints(
+                                    match service::solve_catalog_frame_with_hints(
+                                        &ctx,
                                         &frame,
                                         &file_path,
                                         &hints,

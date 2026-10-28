@@ -41,7 +41,7 @@ pub async fn read_fits_image_bytes(
     use std::time::Instant;
 
     let t_start = Instant::now();
-    let path_buf = PathBuf::from(&path);
+    let catalog_path = PathBuf::from(&path);
 
     // ── Step 1: Read settings from DB ──
     let (resolution_str, quality) = {
@@ -90,10 +90,12 @@ pub async fn read_fits_image_bytes(
     // edit/restore invalidates naturally instead of serving a stale JPEG.
     // The stat doubles as the existence check (fail fast for deleted files —
     // including ones that still have a cached entry).
-    let cache_key = match crate::cache::preview_cache_key(&path_buf, &resolution_str) {
+    // A zip-resident frame is keyed by its catalog path plus the zip's and the entry's identity, so a hit
+    // needs no extraction and two zips holding the same entry path never share a key.
+    let cache_key = match athenaeum_core::cache::catalog_preview_cache_key(&state.ctx, &path, &resolution_str) {
         Ok(key) => key,
         Err(e) => {
-            return Err(format!("File not found: {} ({})", path_buf.display(), e));
+            return Err(format!("File not found: {} ({})", catalog_path.display(), e));
         }
     };
 
@@ -104,6 +106,16 @@ pub async fn read_fits_image_bytes(
             return Ok(cached.data.clone());
         }
     }
+
+    // Cache miss: a zip-resident frame is extracted (or reused from the zip cache) now; the pin keeps the
+    // cache file alive until the render below has read it. Any other path comes back untouched.
+    let (path_buf, _zip_pin) = tokio::task::block_in_place(|| {
+        athenaeum_core::zip_store::materialize::materialize_one(&state.ctx, &path)
+    })
+    .map_err(|e| {
+        tracing::warn!(path = %path, error = %e, "preview: frame is not readable");
+        format!("Failed to read {}: {}", catalog_path.display(), e)
+    })?;
 
     // Gate BEFORE permit, never the reverse (see `VNG_GATE`'s doc): a
     // full-resolution colour render waits here holding nothing, so the image

@@ -310,7 +310,20 @@ pub fn analyze_frame_set(
                     break;
                 };
 
-                let result = match analyzer::analyze_frame(&path, &analysis_config, Some(&pool), &config_hash) {
+                // A zip-resident frame is extracted here, per frame, so an unreachable zip fails only its own
+                // frames. The pin keeps the cache file until the frame is measured.
+                let result = match crate::zip_store::materialize::materialize_one(ctx, &path).and_then(
+                    |(local, pin)| {
+                        let measured = analyzer::analyze_frame(
+                            &local.to_string_lossy(),
+                            &analysis_config,
+                            Some(&pool),
+                            &config_hash,
+                        );
+                        drop(pin);
+                        measured
+                    },
+                ) {
                     Ok((mut analysis, stars, _flip)) => {
                         analysis.frame_id = frame_id;
                         analysis.file_id = file_id;
@@ -503,7 +516,15 @@ pub async fn get_frame_star_metrics(
         )
         .map_err(|e| ApiError::NotFound(format!("Frame not found: {}", e)))?;
 
-    let flip_vertical = detect_flip_vertical(&path);
+    // Reads the ROWORDER header, so a zip-resident frame is extracted (or reused from the cache) first.
+    // An unreachable zip is an error here: a silent `false` would flip the stored stars the wrong way.
+    drop(conn);
+    let (flip_local, flip_pin) = crate::zip_store::materialize::materialize_one(ctx, &path).map_err(|e| {
+        tracing::warn!(frame_id, path = %path, error = %e, "frame is not readable for star metrics");
+        ApiError::Internal(format!("{}: {}", path, e))
+    })?;
+    let flip_vertical = detect_flip_vertical(&flip_local.to_string_lossy());
+    let conn = db_handle.conn();
 
     // Check if we have fresh analysis data with stars
     if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
@@ -530,14 +551,17 @@ pub async fn get_frame_star_metrics(
 
     let pool = Arc::clone(&ctx.image_pool);
     let config_hash = current_hash.clone();
-    let path_owned = path.clone();
+    // `flip_pin` (taken above) keeps the cache file of a zip-resident frame alive across the analysis.
+    let path_owned = flip_local.to_string_lossy().into_owned();
 
-    let (mut analysis, mut stars, flip_vertical) = tokio::task::spawn_blocking(move || {
+    let analysed = tokio::task::spawn_blocking(move || {
         analyzer::analyze_frame(&path_owned, &analysis_config, Some(&pool), &config_hash)
     })
-    .await
-    .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
-    .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
+    .await;
+    drop(flip_pin);
+    let (mut analysis, mut stars, flip_vertical) = analysed
+        .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
 
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
@@ -591,11 +615,17 @@ pub async fn compute_flat_contour_plot(
         .map_err(|e| ApiError::NotFound(format!("File not found (id={}): {}", file_id, e)))?
     };
 
-    let result =
-        tokio::task::spawn_blocking(move || flat_analysis::compute_flat_contour_plot(&path, opts))
-            .await
-            .map_err(|e| ApiError::Internal(format!("Flat contour analysis panicked: {}", e)))?
-            .map_err(|e| ApiError::Internal(format!("Flat contour analysis failed: {}", e)))?;
+    let (local, pin) = crate::zip_store::materialize::materialize_one(ctx, &path).map_err(|e| {
+        tracing::warn!(file_id, path = %path, error = %e, "flat is not readable for the contour plot");
+        ApiError::Internal(format!("Flat contour analysis failed: {}: {}", path, e))
+    })?;
+    let local = local.to_string_lossy().into_owned();
+    let computed =
+        tokio::task::spawn_blocking(move || flat_analysis::compute_flat_contour_plot(&local, opts)).await;
+    drop(pin);
+    let result = computed
+        .map_err(|e| ApiError::Internal(format!("Flat contour analysis panicked: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Flat contour analysis failed: {}", e)))?;
 
     let pixels_b64 = STANDARD.encode(&result.pixels);
 
@@ -713,5 +743,139 @@ mod tests {
         let frame_id = seed_verdict_row(&ctx, |a| a.measure_version = None);
         let r = get_frame_star_metrics(&ctx, frame_id).await;
         assert!(r.is_err(), "a legacy-version row must be recomputed, not served");
+    }
+
+    // ---- zip-resident frames (ZIP archives in the catalog, Task 7) ----
+
+    /// A 16-bit light frame (768x512, stars on a grid) as FITS bytes; `seed` varies the header so fingerprints differ.
+    fn star_fits(seed: u64) -> Vec<u8> {
+        let (data, w, h) = crate::test_support::fixture_field(seed, 1.0, 0.002);
+        let mut out = Vec::new();
+        for c in [
+            "SIMPLE  =                    T".to_string(),
+            "BITPIX  =                   16".to_string(),
+            "NAXIS   =                    2".to_string(),
+            format!("NAXIS1  = {w:>20}"),
+            format!("NAXIS2  = {h:>20}"),
+            "BZERO   =                32768".to_string(),
+            "BSCALE  =                    1".to_string(),
+            "OBJECT  = 'M33     '".to_string(),
+            "TELESCOP= 'T       '".to_string(),
+            "INSTRUME= 'C       '".to_string(),
+            "IMAGETYP= 'Light   '".to_string(),
+            format!("SEQNUM  = {seed:>20}"),
+            "END".to_string(),
+        ] {
+            let mut card = vec![b' '; 80];
+            card[..c.len()].copy_from_slice(c.as_bytes());
+            out.extend(card);
+        }
+        while out.len() % 2880 != 0 {
+            out.push(b' ');
+        }
+        for v in data {
+            let u = (v.clamp(0.0, 1.0) * 65535.0).round() as i32;
+            out.extend(((u - 32768) as i16).to_be_bytes());
+        }
+        while out.len() % 2880 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    struct ZipRig {
+        tmp: tempfile::TempDir,
+        ctx: ServiceContext,
+    }
+
+    fn zip_rig() -> ZipRig {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("db")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("astro")).unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("db").join("catalog.db"));
+        {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [tmp.path().join("astro").to_str().unwrap()]).unwrap();
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M33')", []).unwrap();
+            conn.execute(
+                "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2026-07-01', '2026-07-02')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        }
+        ZipRig { tmp, ctx }
+    }
+
+    impl ZipRig {
+        /// Zips one frame as `<name>.zip`, catalogs the zip, puts its frame into the analysed set. Returns (zip, frame id).
+        fn zipped_light(&self, name: &str, seed: u64) -> (std::path::PathBuf, i64) {
+            use crate::zip_store::scan::test_support::make_zip;
+            let zip = make_zip(
+                &self.tmp.path().join("astro"),
+                &format!("{name}.zip"),
+                &[("Lights/L_001.fits", star_fits(seed))],
+                crate::archive::models::ArchiveCompression::Deflate,
+            );
+            let handle = db(&self.ctx).unwrap();
+            let conn = handle.conn();
+            crate::zip_store::scan::scan_zip(&conn, &zip, 1, false).unwrap();
+            let virtual_path = crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits");
+            let frame_id: i64 = conn
+                .query_row(
+                    "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                    [&virtual_path],
+                    |r| r.get(0),
+                )
+                .expect("the zipped light has a frame row");
+            conn.execute("UPDATE frames SET imagetyp = 'Light' WHERE id = ?1", [frame_id]).unwrap();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [frame_id]).unwrap();
+            (zip, frame_id)
+        }
+    }
+
+    #[test]
+    fn analyze_frame_set_measures_a_zip_resident_frame() {
+        let rig = zip_rig();
+        let (_zip, frame_id) = rig.zipped_light("night", 1);
+        let r = analyze_frame_set(&rig.ctx, 1, Some(true), 2, &crate::events::NullEmitter).unwrap();
+        assert_eq!((r.analyzed, r.failed), (1, 0), "errors: {:?}", r.errors);
+        let handle = db(&rig.ctx).unwrap();
+        let row = db_analysis::get_frame_analysis(&handle.conn(), frame_id).unwrap().expect("an analysis row was written");
+        assert_eq!((row.width, row.height), (768, 512));
+        assert!(row.stars_detected > 50, "the stars of the zipped frame were measured, got {}", row.stars_detected);
+        assert!(rig.ctx.zip_cache.extraction_count() >= 1, "the frame was read through the zip cache");
+    }
+
+    #[test]
+    fn analyze_frame_set_reports_unreachable_zip_per_frame_and_finishes_the_rest() {
+        let rig = zip_rig();
+        let (gone_zip, gone_frame) = rig.zipped_light("gone", 1);
+        let (_ok_zip, ok_frame) = rig.zipped_light("here", 2);
+        std::fs::remove_file(&gone_zip).unwrap();
+        let r = analyze_frame_set(&rig.ctx, 1, Some(true), 2, &crate::events::NullEmitter).unwrap();
+        assert_eq!((r.analyzed, r.failed), (1, 1), "errors: {:?}", r.errors);
+        assert!(r.errors[0].contains("gone.zip") && r.errors[0].contains("not reachable"), "{:?}", r.errors);
+        let handle = db(&rig.ctx).unwrap();
+        let conn = handle.conn();
+        assert!(db_analysis::get_frame_analysis(&conn, ok_frame).unwrap().is_some());
+        assert!(db_analysis::get_frame_analysis(&conn, gone_frame).unwrap().is_none(), "the unreachable frame got no row");
+    }
+
+    #[tokio::test]
+    async fn get_frame_star_metrics_and_the_flat_plot_read_a_zip_resident_frame() {
+        let rig = zip_rig();
+        let (_zip, frame_id) = rig.zipped_light("night", 1);
+        let r = get_frame_star_metrics(&rig.ctx, frame_id).await.expect("on-demand analysis through the zip cache");
+        assert_eq!((r.image_width, r.image_height), (768, 512));
+        assert!(!r.stars.is_empty());
+        // The second call is served from the stored row and still reads the ROWORDER header through the cache.
+        let again = get_frame_star_metrics(&rig.ctx, frame_id).await.unwrap();
+        assert_eq!(again.flip_vertical, r.flip_vertical);
+
+        let file_id: i64 = db(&rig.ctx).unwrap().conn().query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap();
+        let plot = compute_flat_contour_plot(&rig.ctx, file_id, FlatContourOpts::default()).await.expect("flat plot through the zip cache");
+        assert_eq!((plot.width > 0, plot.height > 0), (true, true));
     }
 }

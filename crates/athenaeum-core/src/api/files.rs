@@ -1302,21 +1302,21 @@ pub fn verify_duplicate_pair(
     use crate::duplicates::{VerifyMethod, VerifyPairResult};
 
     let db = db(ctx)?;
-    let conn = db.conn();
-
-    let load = |id: i64| -> Result<(String, i64, String, Option<String>), ApiError> {
-        conn.query_row(
-            "SELECT path, size, modified_at, strong_hash FROM files WHERE id = ?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .map_err(|e| {
-            tracing::error!(file_id = id, error = %e, "verify pair: file row not found");
-            ApiError::from(anyhow::anyhow!("file {id} not found: {e}"))
-        })
+    let ((path_a, size_a, mtime_a, hash_a), (path_b, size_b, mtime_b, hash_b)) = {
+        let conn = db.conn();
+        let load = |id: i64| -> Result<(String, i64, String, Option<String>), ApiError> {
+            conn.query_row(
+                "SELECT path, size, modified_at, strong_hash FROM files WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| {
+                tracing::error!(file_id = id, error = %e, "verify pair: file row not found");
+                ApiError::from(anyhow::anyhow!("file {id} not found: {e}"))
+            })
+        };
+        (load(file_a)?, load(file_b)?)
     };
-    let (path_a, size_a, mtime_a, hash_a) = load(file_a)?;
-    let (path_b, size_b, mtime_b, hash_b) = load(file_b)?;
 
     let a_current = crate::duplicates::backfill::disk_matches_row(
         std::path::Path::new(&path_a),
@@ -1345,11 +1345,27 @@ pub fn verify_duplicate_pair(
         }
     }
 
-    let (identical, digest) = crate::duplicates::verify_byte_identical_hashing(
-        std::path::Path::new(&path_a),
-        std::path::Path::new(&path_b),
+    // A zip-resident copy is compared through its extracted cache file; the pins live to the end of the compare.
+    // A zip-resident row is never "current" (no file at its catalog path), so the compare never banks into it
+    // (the extraction itself banks the hash it computed, `zip_store::materialize`).
+    let paths = [path_a.clone(), path_b.clone()];
+    let materialized = crate::zip_store::materialize::materialize_paths(
+        ctx,
+        &paths,
+        &crate::events::NullEmitter,
+        "",
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .map_err(|e| {
+        tracing::error!(file_a, file_b, error = %e, "verify pair: a copy is not readable");
+        ApiError::from(e)
+    })?;
+    let compared = crate::duplicates::verify_byte_identical_hashing(
+        materialized.local(&path_a),
+        materialized.local(&path_b),
+    );
+    drop(materialized);
+    let (identical, digest) = compared.map_err(|e| {
         tracing::error!(file_a, file_b, error = %e, "verify pair: byte compare failed");
         ApiError::from(e)
     })?;
@@ -1358,6 +1374,7 @@ pub fn verify_duplicate_pair(
         // Bank the digest — but only into rows the disk still vouches for
         // (checked BEFORE the read, same stance as the master-hash pass); a
         // stale row is the scanner's to refresh, not ours to overwrite.
+        let conn = db.conn();
         for (id, current) in [(file_a, a_current), (file_b, b_current)] {
             if !current {
                 continue;
@@ -1543,5 +1560,57 @@ mod verify_pair_tests {
         let conn = db.conn();
         assert_eq!(stored_hash(&conn, 1), None);
         assert_eq!(stored_hash(&conn, 2), None);
+    }
+
+    /// A disk file and a zip entry: `(ctx, disk file id, zip-resident file id)`.
+    fn disk_and_zip_copies(disk_body: &[u8], zip_body: &[u8]) -> (tempfile::TempDir, ServiceContext, i64, i64) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("astro")).unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let conn = ctx.db.get().unwrap().conn();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [tmp.path().join("astro").to_str().unwrap()]).unwrap();
+        let disk = tmp.path().join("copy.fits");
+        std::fs::write(&disk, disk_body).unwrap();
+        seed_file(&conn, 1, &disk);
+        let zip = crate::zip_store::scan::test_support::make_zip(
+            &tmp.path().join("astro"),
+            "night.zip",
+            &[("Lights/copy.fits", zip_body.to_vec())],
+            crate::archive::models::ArchiveCompression::Deflate,
+        );
+        crate::zip_store::scan::scan_zip(&conn, &zip, 1, false).unwrap();
+        let zip_file: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                [crate::zip_store::scan::virtual_path(&zip, "Lights/copy.fits")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        (tmp, ctx, 1, zip_file)
+    }
+
+    #[test]
+    fn verify_duplicate_pair_compares_disk_and_zip_copies() {
+        let body = crate::zip_store::scan::test_support::light(7);
+        let (_tmp, ctx, disk, zipped) = disk_and_zip_copies(&body, &body);
+        let r = super::verify_duplicate_pair(&ctx, disk, zipped).unwrap();
+        assert!(r.identical, "a byte-identical disk copy and zip entry verify");
+        assert_eq!(r.method, VerifyMethod::Bytes);
+        assert_eq!(ctx.zip_cache.extraction_count(), 1);
+
+        let other = crate::zip_store::scan::test_support::light(8);
+        let (_tmp2, ctx2, disk2, zipped2) = disk_and_zip_copies(&body, &other);
+        let r = super::verify_duplicate_pair(&ctx2, disk2, zipped2).unwrap();
+        assert!(!r.identical, "different bytes do not verify");
+    }
+
+    #[test]
+    fn verify_duplicate_pair_fails_when_the_zip_is_not_reachable() {
+        let body = crate::zip_store::scan::test_support::light(7);
+        let (tmp, ctx, disk, zipped) = disk_and_zip_copies(&body, &body);
+        std::fs::remove_file(tmp.path().join("astro").join("night.zip")).unwrap();
+        let err = super::verify_duplicate_pair(&ctx, disk, zipped).unwrap_err().to_string();
+        assert!(err.contains("not reachable"), "{err}");
     }
 }
