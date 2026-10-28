@@ -88,15 +88,6 @@ fn identity(p: &Path) -> Option<(u64, i128)> {
     Some((m.len(), ns))
 }
 
-/// `dest` is a plain file (not a link) of `byte_size` bytes whose FILTER already reads `canonical`: what a
-/// copy of the unchanged source would leave there, so there is nothing to place.
-fn dest_is_current(dest: &Path, byte_size: i64, canonical: &str) -> bool {
-    if is_symlink(dest) || !fs::metadata(dest).is_ok_and(|m| m.is_file() && m.len() as i64 == byte_size) {
-        return false;
-    }
-    read_file_filter(dest).is_ok_and(|(_, actual)| !needs_rewrite(actual.as_deref(), canonical))
-}
-
 fn rel_dir(publisher: &str, f: &ProjectExportFrame) -> String {
     let camera = f
         .instrume
@@ -391,19 +382,9 @@ pub fn organize_project_export(
                 .with_context(|| format!("create {}", dest_dir.display()))?;
             let dest = dest_dir.join(&name);
             let in_zip = zip_resident.contains(&f.landed_path);
-            // The export record says this destination is the one written earlier and nobody touched it.
-            let keep_ok = prev.frames.get(&f.frame_uuid).is_some_and(|e| {
-                e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
-            });
-            // A frame inside a zip is immutable, so when the record vouches for the destination and the
-            // destination itself is a plain file of the published size with the canonical FILTER, it is
-            // current as it stands: do not read the entry out of the zip again (a whole night over the
-            // share on a cache miss). Any doubt falls through to the normal path.
-            let current_in_zip = in_zip && keep_ok && dest_is_current(&dest, f.byte_size, &f.filter);
-            // Otherwise it is read from its extracted copy; the pin keeps the cache file until the
+            // A frame inside a zip is read from its extracted copy; the pin keeps the cache file until the
             // placement is done.
             let (source, _pin) = match zip {
-                _ if current_in_zip => (Ok(std::path::PathBuf::new()), None),
                 Some(ctx) if in_zip => match crate::zip_store::materialize::materialize_one_cancellable(
                     ctx,
                     &f.landed_path,
@@ -421,10 +402,16 @@ pub fn organize_project_export(
                 _ => (Ok(std::path::PathBuf::from(&f.landed_path)), None),
             };
             let placement = source.and_then(|src| {
-                if current_in_zip {
-                    return Ok(Placed::Copied);
-                }
-                place_one(&src, &dest, &f.filter, f.byte_size, use_symlinks && !in_zip, keep_ok)
+                place_one(
+                    &src,
+                    &dest,
+                    &f.filter,
+                    f.byte_size,
+                    use_symlinks && !in_zip,
+                    prev.frames.get(&f.frame_uuid).is_some_and(|e| {
+                        e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
+                    }),
+                )
             });
             match placement {
                 Ok(p) => {
@@ -680,48 +667,6 @@ mod tests {
         let hd = title.join("Alice/camera_cama/R/h.fits");
         assert!(!std::fs::symlink_metadata(&hd).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read(&hd).unwrap(), h_bytes);
-    }
-
-    /// A re-export whose record vouches for a landed frame inside a zip reads nothing out of the zip for it;
-    /// a destination edited since is not vouched for, so that frame is extracted again.
-    #[test]
-    fn re_export_of_an_unchanged_zip_frame_extracts_nothing() {
-        use crate::zip_store::test_support::{zip_files, Shape};
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
-        let (h, hs) = landed(tmp.path(), "h.fits", Some("R"));
-        let h_bytes = std::fs::read(&h).unwrap();
-        let virtual_h = {
-            let conn = ctx.db.get().unwrap().conn();
-            conn.execute(
-                "INSERT INTO files (id, path, filename, size, modified_at, format)
-                 VALUES (1, ?1, 'h.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
-                [h.to_string_lossy()],
-            )
-            .unwrap();
-            zip_files(&conn, &[1], &tmp.path().join("landed.zip"), Shape::Foreign).remove(0)
-        };
-        let title = tmp.path().join("T");
-        let pubs = vec![("Alice".to_string(), vec![frame("u1", Path::new(&virtual_h), hs, "R")])];
-        let go = || organize_project_export(&title, "p1", &pubs, false, None, &AtomicBool::new(false), Some(&ctx)).unwrap();
-        let dest = title.join("Alice/camera_cama/R/h.fits");
-
-        let first = go();
-        assert_eq!(first.counts.copied, 1, "{:?}", first.warnings);
-        assert_eq!(ctx.zip_cache.extraction_count(), 1);
-        ctx.zip_cache.clear_unpinned().unwrap();
-
-        let second = go();
-        assert_eq!((second.counts.copied, second.counts.failed), (1, 0), "{:?}", second.warnings);
-        assert_eq!(ctx.zip_cache.extraction_count(), 1, "the unchanged destination was not extracted again");
-        assert_eq!(std::fs::read(&dest).unwrap(), h_bytes);
-
-        // The user replaced the file: the record no longer vouches for it, the frame is extracted and restored.
-        std::fs::write(&dest, b"edited").unwrap();
-        let third = go();
-        assert_eq!(third.counts.failed, 0, "{:?}", third.warnings);
-        assert_eq!(ctx.zip_cache.extraction_count(), 2);
-        assert_eq!(std::fs::read(&dest).unwrap(), h_bytes);
     }
 
     /// Review Focus 1: a previous export left a SYMLINK to the replica at the
