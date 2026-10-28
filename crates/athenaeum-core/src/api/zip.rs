@@ -527,6 +527,40 @@ pub fn list_zip_entries(
     Ok(ZipDirListing { subdirectories: subdirectories.into_iter().collect(), files, other_entries })
 }
 
+/// The extraction cache bound to the catalog's directory (a host that did not bind it yet), with the
+/// configured size limit read into it. A failed settings read is logged and the previous limit stays.
+fn zip_cache_ready(ctx: &ServiceContext) -> Result<&crate::zip_store::cache::ZipCache, ApiError> {
+    let database = db(ctx)?;
+    if let Some(app_data) = database.path().parent() {
+        ctx.zip_cache.bind(app_data);
+    }
+    let conn = database.conn();
+    match ctx.settings.get_archive_zip_cache_limit_bytes(&conn) {
+        Ok(limit) => ctx.zip_cache.set_limit_bytes(limit),
+        Err(e) => tracing::warn!(error = %e, "could not read the zip cache limit; keeping the previous one"),
+    }
+    Ok(&ctx.zip_cache)
+}
+
+/// Size, entry count and limit of the zip extraction cache, for Settings → General → Archive.
+pub fn get_zip_cache_status(ctx: &ServiceContext) -> Result<crate::zip_store::cache::ZipCacheStatus, ApiError> {
+    let cache = zip_cache_ready(ctx)?;
+    cache.status().map_err(|e| {
+        tracing::error!(error = %e, "zip cache status failed");
+        ApiError::from(e)
+    })
+}
+
+/// Removes every cached extraction nothing is using, then returns the new status.
+pub fn clear_zip_cache(ctx: &ServiceContext) -> Result<crate::zip_store::cache::ZipCacheStatus, ApiError> {
+    let cache = zip_cache_ready(ctx)?;
+    cache.clear_unpinned().map_err(|e| {
+        tracing::error!(error = %e, "zip cache clear failed");
+        ApiError::from(e)
+    })?;
+    cache.status().map_err(ApiError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,6 +928,28 @@ mod tests {
         let top_others: Vec<_> = top.other_entries.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(top_others, vec!["../escape.fits", "/absolute.fits"]);
         assert_eq!(top.subdirectories, vec!["Lights".to_string()]);
+    }
+
+    #[test]
+    fn cache_status_and_clear_work_from_the_catalog_directory() {
+        let (_tmp, ctx, _zip) = listing_fixture(&[("a.fits", light(1))]);
+        let status = get_zip_cache_status(&ctx).unwrap();
+        assert_eq!(status.bytes, 0);
+        assert_eq!(status.entries, 0);
+        assert_eq!(status.limit_bytes, 32 * 1024 * 1024 * 1024);
+        let after = clear_zip_cache(&ctx).unwrap();
+        assert_eq!(after.bytes, 0);
+    }
+
+    #[test]
+    fn zip_listing_carries_the_creating_operation() {
+        let (_tmp, ctx, zip) = listing_fixture(&[("a.fits", light(1))]);
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        let dir = zip.parent().unwrap().to_string_lossy().into_owned();
+        let zips = crate::zip_store::catalog::zips_in_directory(&conn, &dir, None).unwrap();
+        assert_eq!(zips.len(), 1);
+        assert_eq!(zips[0].created_by_operation, None, "a foreign zip has no creating operation");
     }
 
     #[test]

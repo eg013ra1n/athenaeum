@@ -28,10 +28,10 @@ import type { AnnotationSettings } from './analysis-config';
 // models.ts TS-ONLY material
 // ============================================================================
 
-export interface BlackholeChangedEvent {
-  file_id: number;
-  action: 'blackholed' | 'restored';
-}
+export type BlackholeChangedEvent =
+  | { file_id: number; action: 'blackholed' | 'restored' }
+  /** A whole zip: `id` is the `black_hole_zips` row (what restore and Void take), `zip_id` the zip. */
+  | { id: number; zip_id: number; action: 'zip-blackholed' | 'zip-restored' | 'zip-voided' };
 
 /** Companion object for the generated `ImageType` string-literal union
  *  (models.rs `ImageType`, serde default variant naming — no rename_all).

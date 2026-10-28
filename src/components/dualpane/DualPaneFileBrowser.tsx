@@ -23,6 +23,7 @@ import {
   Folder,
   FolderPlus,
   File as FileIcon,
+  FileArchive,
   ChevronRight,
   Home,
   ArrowUp,
@@ -48,6 +49,8 @@ import { useNotifications } from '../../contexts/NotificationContext';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri, isMac } from '../../utils/platform';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
+import { Chip } from '../ui';
+import type { ZipDirListing, ZipListItem } from '../../types/archive';
 import { ImageTypeValues } from '../../types/helpers';
 import type { FileWithFrame, Frame } from '../../types/models';
 import type { ScanRootWithAvailability } from '../../types/helpers';
@@ -63,7 +66,18 @@ import {
   readLightCalFormatPref,
 } from '../export/lightCalPrefs';
 import CatalogSearch from './CatalogSearch';
+import { ZipBlackHoleDialog } from './ZipBlackHoleDialog';
 import MetadataPane from './MetadataPane';
+import {
+  ZIP_DEST_NOTE,
+  ZIP_READ_ONLY_NOTE,
+  findZipInPath,
+  innerParent,
+  zipCrumbs,
+  zipFramesLabel,
+  zipUpLabel,
+  type ZipLocation,
+} from './zipView';
 import {
   type CatalogSearchHit,
   type DirectoryListing,
@@ -165,6 +179,18 @@ interface Props {
   leftCameraFilter?: DualPaneCameraFilter;
 }
 
+/** One step "up" from a pane: out of a zip, or to a parent folder. */
+type UpMove = { kind: 'leave' } | { kind: 'inner'; innerDir: string } | { kind: 'cwd'; cwd: string };
+
+/** Every selectable row of a listing in display order: folders, zips, then files. */
+function listingKeys(listing: DirectoryListing): string[] {
+  return [
+    ...listing.subdirectories,
+    ...(listing.zips ?? []).map((z) => z.path),
+    ...listing.files.map((f) => f.file.path),
+  ];
+}
+
 interface State {
   panes: Record<PaneId, PaneState>;
   activePane: PaneId;
@@ -172,6 +198,10 @@ interface State {
 
 type Action =
   | { type: 'set_cwd'; pane: PaneId; cwd: string }
+  /** Enter, move within, or leave (`zip: null`) a zip. `select` becomes the selected row and the cursor. */
+  | { type: 'set_zip'; pane: PaneId; zip: ZipLocation | null; select?: string | null }
+  /** Jump to a folder and (optionally) into a zip in one step, selecting one row. */
+  | { type: 'set_location'; pane: PaneId; cwd: string; zip: ZipLocation | null; select?: string | null }
   | { type: 'set_selection'; pane: PaneId; selection: Set<string>; anchor?: string | null }
   | { type: 'toggle_select'; pane: PaneId; path: string; multi: boolean }
   | { type: 'set_active'; pane: PaneId }
@@ -187,8 +217,30 @@ function reducer(state: State, action: Action): State {
       const next = {
         ...state.panes[action.pane],
         cwd: action.cwd,
+        zip: null,
         selection: new Set<string>(),
         anchor: null,
+        filterText: '',
+      };
+      return { ...state, panes: { ...state.panes, [action.pane]: next } };
+    }
+    case 'set_zip': {
+      const next = {
+        ...state.panes[action.pane],
+        zip: action.zip,
+        selection: new Set<string>(action.select ? [action.select] : []),
+        anchor: action.select ?? null,
+        filterText: '',
+      };
+      return { ...state, panes: { ...state.panes, [action.pane]: next } };
+    }
+    case 'set_location': {
+      const next = {
+        ...state.panes[action.pane],
+        cwd: action.cwd,
+        zip: action.zip,
+        selection: new Set<string>(action.select ? [action.select] : []),
+        anchor: action.select ?? null,
         filterText: '',
       };
       return { ...state, panes: { ...state.panes, [action.pane]: next } };
@@ -301,8 +353,8 @@ function initialState(
   return {
     activePane: 'left',
     panes: {
-      left: { mode: 'files', cwd: left, selection: new Set(), anchor: null, scrollTop: 0, filterText: '', sortDir: leftSort },
-      right: { mode: 'files', cwd: right, selection: new Set(), anchor: null, scrollTop: 0, filterText: '', sortDir: rightSort },
+      left: { mode: 'files', cwd: left, selection: new Set(), anchor: null, scrollTop: 0, filterText: '', sortDir: leftSort, zip: null },
+      right: { mode: 'files', cwd: right, selection: new Set(), anchor: null, scrollTop: 0, filterText: '', sortDir: rightSort, zip: null },
     },
   };
 }
@@ -357,6 +409,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     targets: string[];
     fileIds: number[];
     skippedDirs: number;
+    /** Selected zips: each goes to the Black Hole as one whole file. */
+    zips: ZipListItem[];
   } | null>(null);
   const bulkBlackHole = useBulkMoveToBlackHole();
   const [mkdirState, setMkdirState] = useState<{ destDir: string } | null>(null);
@@ -422,7 +476,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   // transient FS races (e.g. macOS sometimes reports the parent of a
   // just-rmdir'd sibling as briefly inaccessible), then walk up to the
   // nearest existing ancestor, then fall back to any other scan root.
-  const loadListing = useCallback(async (pane: PaneId, cwd: string) => {
+  const loadListing = useCallback(async (pane: PaneId, cwd: string, zip: ZipLocation | null = null) => {
     if (!cwd) {
       setListings(prev => ({ ...prev, [pane]: null }));
       return;
@@ -440,6 +494,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     // uses) so subdirs and files are filtered to this camera. The right
     // pane always uses the unfiltered listing.
     const attempt = async (): Promise<DirectoryListing> => {
+      if (zip) {
+        // Inside a zip the listing is the zip's own directory, one level at a time.
+        const z = await api.invoke<ZipDirListing>('list_zip_entries', { zipPath: zip.path, innerDir: zip.innerDir });
+        return { subdirectories: z.subdirectories, files: z.files, zips: [], otherEntries: z.otherEntries };
+      }
       if (pane === 'left' && leftCameraFilter) {
         return api.invoke<DirectoryListing>('get_camera_directory_contents', {
           directoryPath: cwd,
@@ -471,6 +530,14 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     } catch (e) {
       if (isStale()) return;
       const msg = String(e);
+      if (zip && isMissingMsg(msg)) {
+        // The zip is gone (share unmounted, renamed outside the app): step out to its folder.
+        console.warn(`pane ${pane} zip "${zip.path}" reported missing; leaving the zip`);
+        setErrors(prev => ({ ...prev, [pane]: null }));
+        setLoading(prev => ({ ...prev, [pane]: false }));
+        dispatch({ type: 'set_zip', pane, zip: null, select: zip.path });
+        return;
+      }
       if (isMissingMsg(msg)) {
         // Walk up to the nearest existing ancestor inside the same scan
         // root, then fall back to any other configured scan root. Use
@@ -497,7 +564,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           return;
         }
       }
-      console.error(`get_directory_contents(${cwd}) failed:`, e);
+      console.error(zip ? `list_zip_entries(${zip.path}) failed:` : `get_directory_contents(${cwd}) failed:`, e);
       setErrors(prev => ({ ...prev, [pane]: msg }));
       setListings(prev => ({ ...prev, [pane]: null }));
     } finally {
@@ -510,18 +577,18 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
 
   /** Manual reload trigger — bound to the per-pane Refresh button. */
   const reloadPane = useCallback((pane: PaneId) => {
-    loadListing(pane, state.panes[pane].cwd);
+    loadListing(pane, state.panes[pane].cwd, state.panes[pane].zip);
   }, [loadListing, state.panes]);
 
-  useEffect(() => { loadListing('left', state.panes.left.cwd); }, [state.panes.left.cwd, loadListing]);
-  useEffect(() => { loadListing('right', state.panes.right.cwd); }, [state.panes.right.cwd, loadListing]);
+  useEffect(() => { loadListing('left', state.panes.left.cwd, state.panes.left.zip); }, [state.panes.left.cwd, state.panes.left.zip, loadListing]);
+  useEffect(() => { loadListing('right', state.panes.right.cwd, state.panes.right.zip); }, [state.panes.right.cwd, state.panes.right.zip, loadListing]);
 
   // Force-reload both panes when an operation completes.
   const refreshBoth = useCallback(() => {
     refreshTokenRef.current += 1;
-    loadListing('left', state.panes.left.cwd);
-    loadListing('right', state.panes.right.cwd);
-  }, [loadListing, state.panes.left.cwd, state.panes.right.cwd]);
+    loadListing('left', state.panes.left.cwd, state.panes.left.zip);
+    loadListing('right', state.panes.right.cwd, state.panes.right.zip);
+  }, [loadListing, state.panes.left.cwd, state.panes.left.zip, state.panes.right.cwd, state.panes.right.zip]);
 
   // Subscribe to file-op progress + finished events.
   useEffect(() => {
@@ -622,6 +689,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     const sources = Array.from(active.selection);
     if (sources.length === 0) return;
     if (!inactive.cwd) return;
+    // A zip is read-only: nothing inside it moves, and nothing can be moved into it.
+    if (active.zip || inactive.zip) return;
     setConfirmMove({ count: sources.length, dest: inactive.cwd, sources });
   }, [state.activePane, state.panes]);
 
@@ -660,13 +729,16 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const enqueueDelete = useCallback(() => {
     const active = state.panes[state.activePane];
     if (active.selection.size === 0) return;
+    // Inside a zip only the whole zip can go to the Black Hole, and that is done from its folder.
+    if (active.zip) return;
     const listing = listings[state.activePane];
     if (!listing) return;
 
     const selectedFiles = listing.files.filter((f) => active.selection.has(f.file.path));
     const selectedDirs = listing.subdirectories.filter((s) => active.selection.has(s));
+    const selectedZips = (listing.zips ?? []).filter((z) => active.selection.has(z.path));
 
-    if (selectedFiles.length === 0) {
+    if (selectedFiles.length === 0 && selectedZips.length === 0) {
       // User selected only directories — Black Hole holds files only, so
       // there's nothing to do. Tell them why.
       alert(
@@ -688,16 +760,40 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       targets,
       fileIds,
       skippedDirs: selectedDirs.length,
+      zips: selectedZips,
     });
   }, [listings, state.activePane, state.panes]);
 
   const performDelete = useCallback(async () => {
     if (!confirmDelete) return;
-    const { fileIds } = confirmDelete;
+    const { fileIds, zips } = confirmDelete;
     setConfirmDelete(null);
-    if (fileIds.length === 0) return;
+    if (fileIds.length === 0 && zips.length === 0) return;
+    // Each zip is one whole file; a refusal is shown, never swallowed.
+    if (zips.length > 0) {
+      let moved = 0;
+      const failures: string[] = [];
+      for (const z of zips) {
+        try {
+          await api.invoke('move_zip_to_black_hole', { zipPath: z.path, fromWhere: 'file_browser' });
+          moved += 1;
+        } catch (e) {
+          console.error('move_zip_to_black_hole failed:', e);
+          failures.push(`${getBasename(z.path)}: ${e}`);
+        }
+      }
+      notify({
+        title: failures.length > 0
+          ? `${failures.length} zip${failures.length === 1 ? '' : 's'} not moved to the Black Hole`
+          : `${moved} zip${moved === 1 ? '' : 's'} moved to the Black Hole`,
+        detail: failures.length > 0 ? failures.join('\n') : 'Restore them from the Black Hole page.',
+        kind: 'files',
+        tone: failures.length > 0 ? 'warning' : 'success',
+        hasErrors: failures.length > 0,
+      });
+    }
     try {
-      await bulkBlackHole.start(fileIds, 'file_browser');
+      if (fileIds.length > 0) await bulkBlackHole.start(fileIds, 'file_browser');
       // Drop active-pane selection and refresh both panes — moved files no
       // longer live at their original path and the quarantine folder may
       // be visible in either pane.
@@ -708,12 +804,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       // useBulkMoveToBlackHole already logs and surfaces the error; the
       // inline banner below renders bulkBlackHole.error.
     }
-  }, [confirmDelete, bulkBlackHole, state.activePane, reloadPane]);
+  }, [confirmDelete, bulkBlackHole, state.activePane, reloadPane, notify]);
 
   // Mkdir handler: F7.
   const openMkdir = useCallback(() => {
     const active = state.panes[state.activePane];
-    if (!active.cwd) return;
+    if (!active.cwd || active.zip) return;
     setMkdirState({ destDir: active.cwd });
   }, [state.activePane, state.panes]);
 
@@ -745,7 +841,10 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const revealInOs = useCallback(() => {
     const active = state.panes[state.activePane];
     let target: string | null = null;
-    if (active.anchor && active.anchor !== PARENT_ROW) {
+    if (active.zip) {
+      // Entries have no place on disk; show the zip file itself.
+      target = active.zip.path;
+    } else if (active.anchor && active.anchor !== PARENT_ROW) {
       target = active.anchor;
     } else if (active.selection.size >= 1) {
       target = active.selection.values().next().value ?? null;
@@ -761,7 +860,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const openRename = useCallback(() => {
     const active = state.panes[state.activePane];
     const sel = Array.from(active.selection);
-    if (sel.length !== 1) return;
+    if (sel.length !== 1 || active.zip) return;
     const oldPath = sel[0];
     const sep = oldPath.includes('\\') ? '\\' : '/';
     const oldName = oldPath.split(sep).filter(Boolean).pop() ?? '';
@@ -791,45 +890,46 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
   }, [renameState, refreshBoth, state.activePane]);
 
+  /** Navigate `pane` to `path` and select it. A virtual path under a zip opens the zip at the entry's folder;
+   *  anything else (or a `.zip` folder that is not a zip) opens the parent folder on disk. */
+  const revealPath = useCallback(async (pane: PaneId, path: string) => {
+    const inZip = findZipInPath(path);
+    if (inZip) {
+      try {
+        await api.invoke<ZipDirListing>('list_zip_entries', { zipPath: inZip.zipPath, innerDir: inZip.innerDir });
+        dispatch({
+          type: 'set_location',
+          pane,
+          cwd: getParentPath(inZip.zipPath),
+          zip: { path: inZip.zipPath, innerDir: inZip.innerDir },
+          select: path,
+        });
+        return;
+      } catch (e) {
+        console.warn(`reveal: "${inZip.zipPath}" is not a readable zip; showing the folder instead`, e);
+      }
+    }
+    const parent = getParentPath(path);
+    if (!parent) return;
+    dispatch({ type: 'set_location', pane, cwd: parent, zip: null, select: path });
+  }, []);
+
   // External reveal: caller (e.g. the Missing Metadata page) hands off a file
-  // path; we navigate the LEFT pane to its parent directory and select the
-  // file. Keyed on `reveal.token` so the same path can be revealed twice in
-  // a row by bumping the token.
+  // path; we navigate the LEFT pane to its parent directory (or into its zip)
+  // and select the file. Keyed on `reveal.token` so the same path can be
+  // revealed twice in a row by bumping the token.
   useEffect(() => {
     if (!reveal) return;
-    const parent = getParentPath(reveal.path);
-    if (!parent) return;
     dispatch({ type: 'set_active', pane: 'left' });
-    dispatch({ type: 'set_cwd', pane: 'left', cwd: parent });
-    // Schedule selection so the cwd-change-driven listing load finishes first;
-    // the row render then has the path available to scroll-into-view.
-    window.setTimeout(() => {
-      dispatch({
-        type: 'set_selection',
-        pane: 'left',
-        selection: new Set([reveal.path]),
-        anchor: reveal.path,
-      });
-    }, 0);
+    void revealPath('left', reveal.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reveal?.token]);
 
-  // Catalog search reveal: navigate the active pane to the hit's parent dir,
-  // and select the file.
+  // Catalog search reveal: navigate the active pane to the hit's parent dir
+  // (or into its zip), and select the file.
   const onSearchReveal = useCallback((hit: CatalogSearchHit) => {
-    const parent = getParentPath(hit.path);
-    if (!parent) return;
-    dispatch({ type: 'set_cwd', pane: state.activePane, cwd: parent });
-    // Pre-select the file once the listing loads. We schedule it after the
-    // cwd update so the loadListing effect fires first.
-    window.setTimeout(() => {
-      dispatch({
-        type: 'set_selection',
-        pane: state.activePane,
-        selection: new Set([hit.path]),
-      });
-    }, 0);
-  }, [state.activePane]);
+    void revealPath(state.activePane, hit.path);
+  }, [state.activePane, revealPath]);
 
   /** Apply the per-pane filter + name sort to a raw listing.
    *  Folders and files are sorted independently. The sort is on basename
@@ -853,23 +953,57 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       : raw.files.slice();
     files.sort((a, b) => a.file.filename.toLowerCase().localeCompare(b.file.filename.toLowerCase()) * sortMul);
 
-    return { subdirectories, files };
+    const zips = (raw.zips ?? []).filter((z) => !needle || subBasename(z.path).includes(needle));
+    zips.sort((a, b) => subBasename(a.path).localeCompare(subBasename(b.path)) * sortMul);
+
+    const otherEntries = (raw.otherEntries ?? []).filter((o) => !needle || o.name.toLowerCase().includes(needle));
+    otherEntries.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) * sortMul);
+
+    return { subdirectories, files, zips, otherEntries };
   }, [listings, state.panes]);
+
+  /** Where "up" goes from `pane`: out of a zip (one inner folder, or back to the folder holding it), or to
+   *  the parent folder clamped to the scan root. `null` at the top. */
+  const upMove = useCallback((pane: PaneId): UpMove | null => {
+    const ps = state.panes[pane];
+    if (ps.zip) {
+      const parent = innerParent(ps.zip.innerDir);
+      return parent === null ? { kind: 'leave' } : { kind: 'inner', innerDir: parent };
+    }
+    const parent = getClampedParent(ps.cwd, paneScanRoots(pane).map((r) => r.path));
+    return parent === null ? null : { kind: 'cwd', cwd: parent };
+  }, [state.panes, paneScanRoots]);
+
+  const applyUp = useCallback((pane: PaneId, move: UpMove) => {
+    const ps = state.panes[pane];
+    if (move.kind === 'cwd') {
+      dispatch({ type: 'set_cwd', pane, cwd: move.cwd });
+    } else if (ps.zip) {
+      // Land on the row we came from: the zip, or the inner folder.
+      if (move.kind === 'leave') dispatch({ type: 'set_zip', pane, zip: null, select: ps.zip.path });
+      else dispatch({ type: 'set_zip', pane, zip: { path: ps.zip.path, innerDir: move.innerDir }, select: ps.zip.innerDir });
+    }
+  }, [state.panes]);
+
+  /** The `..` row of a pane: label and target, or `null` at the top. */
+  const upRowOf = useCallback((pane: PaneId): { label: string } | null => {
+    const move = upMove(pane);
+    if (!move) return null;
+    const ps = state.panes[pane];
+    if (move.kind === 'cwd') return { label: move.cwd };
+    return { label: ps.zip ? zipUpLabel(ps.zip, ps.cwd) : ps.cwd };
+  }, [upMove, state.panes]);
 
   // Build the keyboard navigation order for a pane: synthetic parent row
   // (if not at scan root) + visible subdirectories + visible files.
   const keyboardOrder = useCallback((pane: PaneId): string[] => {
     const listing = visibleListing(pane);
     if (!listing) return [];
-    const cwd = state.panes[pane].cwd;
-    const rootPaths = paneScanRoots(pane).map((r) => r.path);
-    const parent = getClampedParent(cwd, rootPaths);
     const order: string[] = [];
-    if (parent !== null) order.push(PARENT_ROW);
-    for (const sub of listing.subdirectories) order.push(sub);
-    for (const f of listing.files) order.push(f.file.path);
+    if (upMove(pane) !== null) order.push(PARENT_ROW);
+    order.push(...listingKeys(listing));
     return order;
-  }, [visibleListing, paneScanRoots, state.panes]);
+  }, [visibleListing, upMove]);
 
   /** Open the blink viewer with the FITS/XISF files currently selected in the
    *  active pane (skipping folders, sidecars, etc). No-op if nothing eligible. */
@@ -937,23 +1071,29 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
   }, [sendResolving, state.activePane, state.panes, notify]);
 
-  /** Activate the row at `path` — folders/parent navigate, files no-op (Phase 2). */
+  /** Activate the row at `path` — folders, zips and the parent row navigate, files no-op (Phase 2). */
   const activatePath = useCallback((path: string) => {
     const active = state.panes[state.activePane];
     if (path === PARENT_ROW) {
-      const rootPaths = paneScanRoots(state.activePane).map((r) => r.path);
-      const parent = getClampedParent(active.cwd, rootPaths);
-      if (parent) dispatch({ type: 'set_cwd', pane: state.activePane, cwd: parent });
+      const move = upMove(state.activePane);
+      if (move) applyUp(state.activePane, move);
       return;
     }
     // Always check the raw listing for membership — even filtered-out folders
     // shouldn't be activatable, but selection clears on filter so this is a
     // belt-and-braces guard. visibleListing captures both filter + sort.
     const listing = visibleListing(state.activePane);
-    if (listing && listing.subdirectories.includes(path)) {
-      dispatch({ type: 'set_cwd', pane: state.activePane, cwd: path });
+    if (!listing) return;
+    if (listing.subdirectories.includes(path)) {
+      if (active.zip) {
+        dispatch({ type: 'set_zip', pane: state.activePane, zip: { path: active.zip.path, innerDir: path } });
+      } else {
+        dispatch({ type: 'set_cwd', pane: state.activePane, cwd: path });
+      }
+    } else if (!active.zip && listing.zips?.some((z) => z.path === path)) {
+      dispatch({ type: 'set_zip', pane: state.activePane, zip: { path, innerDir: '' } });
     }
-  }, [visibleListing, paneScanRoots, state.activePane, state.panes]);
+  }, [visibleListing, upMove, applyUp, state.activePane, state.panes]);
 
   // True when ANY confirm/prompt dialog is open. Pane shortcuts (F-keys,
   // Tab, Cmd+I, Cmd+A, Space, Enter, arrows) are suppressed in
@@ -983,7 +1123,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         if (confirmMove) {
           e.preventDefault();
           void performMove();
-        } else if (confirmDelete) {
+        } else if (confirmDelete && confirmDelete.zips.length === 0) {
           e.preventDefault();
           void performDelete();
         }
@@ -1033,10 +1173,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         const listing = visibleListing(state.activePane);
         if (!listing) return;
         e.preventDefault();
-        const all = new Set<string>([
-          ...listing.subdirectories,
-          ...listing.files.map((f) => f.file.path),
-        ]);
+        const all = new Set<string>(listingKeys(listing));
         dispatch({ type: 'set_selection', pane: state.activePane, selection: all });
       } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && !e.altKey && !e.metaKey) {
         const order = keyboardOrder(state.activePane);
@@ -1085,18 +1222,21 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         // escape its camera-touching roots in filter mode). This used to be
         // Backspace, which is now the app-wide "back one page" shortcut —
         // one key cannot mean both without surprising the user.
-        const active = state.panes[state.activePane];
-        const rootPaths = paneScanRoots(state.activePane).map((r) => r.path);
-        const parent = getClampedParent(active.cwd, rootPaths);
-        if (parent) {
+        const move = upMove(state.activePane);
+        if (move) {
           e.preventDefault();
-          dispatch({ type: 'set_cwd', pane: state.activePane, cwd: parent });
+          applyUp(state.activePane, move);
         }
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, revealInOs, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, paneScanRoots]);
+  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, revealInOs, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, upMove, applyUp]);
+
+  // Zips are read-only: the reason shows in the status line and on the disabled actions.
+  const activeZip = state.panes[state.activePane].zip;
+  const otherZip = state.panes[state.activePane === 'left' ? 'right' : 'left'].zip;
+  const zipNote = activeZip ? ZIP_READ_ONLY_NOTE : otherZip ? ZIP_DEST_NOTE : null;
 
   // Status bar metrics for the active pane.
   const activePaneListing = listings[state.activePane];
@@ -1106,6 +1246,9 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     let bytes = 0;
     for (const f of activePaneListing.files) {
       if (activePaneSelection.has(f.file.path)) bytes += f.file.size;
+    }
+    for (const z of activePaneListing.zips ?? []) {
+      if (activePaneSelection.has(z.path)) bytes += z.size;
     }
     return { count: activePaneSelection.size, bytes };
   }, [activePaneListing, activePaneSelection]);
@@ -1152,10 +1295,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
                 const listing = visibleListing(state.activePane);
                 if (!listing) return;
                 const cur = state.panes[state.activePane].selection;
-                const all = [
-                  ...listing.subdirectories,
-                  ...listing.files.map((f) => f.file.path),
-                ];
+                const all = listingKeys(listing);
                 const inverted = new Set<string>();
                 for (const p of all) {
                   if (!cur.has(p)) inverted.add(p);
@@ -1182,8 +1322,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           variant="accent"
           icon={<Pencil size={12} />}
           label="Rename"
-          title="Rename selected item (F2)"
-          disabled={state.panes[state.activePane].selection.size !== 1}
+          title={activeZip ? ZIP_READ_ONLY_NOTE : 'Rename selected item (F2)'}
+          disabled={state.panes[state.activePane].selection.size !== 1 || !!activeZip}
           onClick={openRename}
         />
         {isTauri && (
@@ -1199,23 +1339,24 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           variant="accent"
           icon={<MoveRight size={12} />}
           label="Move"
-          title="Move active selection to opposite pane's directory (F6)"
-          disabled={state.panes[state.activePane].selection.size === 0}
+          title={zipNote ?? "Move active selection to opposite pane's directory (F6)"}
+          disabled={state.panes[state.activePane].selection.size === 0 || !!zipNote}
           onClick={() => void enqueueMove()}
         />
         <ShortcutButton
           variant="success"
           icon={<FolderPlus size={12} />}
           label="Mkdir"
-          title="Create new directory in active pane (F7)"
+          title={activeZip ? ZIP_READ_ONLY_NOTE : 'Create new directory in active pane (F7)'}
+          disabled={!!activeZip}
           onClick={openMkdir}
         />
         <ShortcutButton
           variant="error"
           icon={<Trash2 size={12} />}
           label="Delete"
-          title="Move active selection to Black Hole (F8)"
-          disabled={state.panes[state.activePane].selection.size === 0}
+          title={activeZip ? ZIP_READ_ONLY_NOTE : 'Move active selection to Black Hole (F8)'}
+          disabled={state.panes[state.activePane].selection.size === 0 || !!activeZip}
           onClick={enqueueDelete}
         />
 
@@ -1281,6 +1422,13 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           onSetFilter={(filterText) => dispatch({ type: 'set_filter', pane: 'left', filterText })}
           onSetSort={(sortDir) => dispatch({ type: 'set_sort', pane: 'left', sortDir })}
           onReload={() => reloadPane('left')}
+          upRow={upRowOf('left')}
+          onUp={() => { const m = upMove('left'); if (m) applyUp('left', m); }}
+          onOpenZip={(path) => dispatch({ type: 'set_zip', pane: 'left', zip: { path, innerDir: '' } })}
+          onZipFolder={(innerDir) => {
+            const z = state.panes.left.zip;
+            if (z) dispatch({ type: 'set_zip', pane: 'left', zip: { path: z.path, innerDir } });
+          }}
           onMetaSaved={refreshBoth}
           onOpenMetadata={(path) => {
             dispatch({ type: 'set_active', pane: 'left' });
@@ -1311,6 +1459,13 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           onSetFilter={(filterText) => dispatch({ type: 'set_filter', pane: 'right', filterText })}
           onSetSort={(sortDir) => dispatch({ type: 'set_sort', pane: 'right', sortDir })}
           onReload={() => reloadPane('right')}
+          upRow={upRowOf('right')}
+          onUp={() => { const m = upMove('right'); if (m) applyUp('right', m); }}
+          onOpenZip={(path) => dispatch({ type: 'set_zip', pane: 'right', zip: { path, innerDir: '' } })}
+          onZipFolder={(innerDir) => {
+            const z = state.panes.right.zip;
+            if (z) dispatch({ type: 'set_zip', pane: 'right', zip: { path: z.path, innerDir } });
+          }}
           onMetaSaved={refreshBoth}
           onOpenMetadata={(path) => {
             dispatch({ type: 'set_active', pane: 'right' });
@@ -1383,6 +1538,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
             ? `${activeSelectionStats.count} selected (${formatBytes(activeSelectionStats.bytes)})`
             : 'No selection'}
           {activePaneListing && ` · ${activePaneListing.files.length} files`}
+          {zipNote && (
+            <span data-testid="zip-note" className="text-warning">
+              {' · '}
+              {zipNote}
+            </span>
+          )}
         </div>
         <div className="font-mono">
           Tab switch · Enter open · Space blink · {isMac ? '⌥↑' : 'Alt+↑'} up · ↑↓ navigate · Shift+click range · ⌘A select all
@@ -1409,7 +1570,16 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           longer trigger a permanent delete — files are moved to the Black
           Hole quarantine where they can be restored from the Black Hole
           page. Selected subdirectories (if any) are skipped. */}
-      {confirmDelete && (
+      {confirmDelete && confirmDelete.zips.length > 0 && (
+        <ZipBlackHoleDialog
+          zips={confirmDelete.zips}
+          fileCount={confirmDelete.count}
+          skippedDirs={confirmDelete.skippedDirs}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => void performDelete()}
+        />
+      )}
+      {confirmDelete && confirmDelete.zips.length === 0 && (
         <Modal
           onClose={() => setConfirmDelete(null)}
           title={`Move ${confirmDelete.count} file${confirmDelete.count === 1 ? '' : 's'} to Black Hole?`}
@@ -1644,6 +1814,13 @@ interface PaneProps {
   onSetFilter: (filterText: string) => void;
   onSetSort: (sortDir: 'asc' | 'desc') => void;
   onReload: () => void;
+  /** The `..` row (label = where it lands), or `null` at the top of the pane. */
+  upRow: { label: string } | null;
+  onUp: () => void;
+  /** Enter a zip listed in this folder. */
+  onOpenZip: (zipPath: string) => void;
+  /** Open an inner folder of the zip this pane is inside. */
+  onZipFolder: (innerDir: string) => void;
   onMetaSaved: () => void;
   /** Double-clicking an image file row in this pane opens the OTHER pane's
    *  metadata editor focused on that file. */
@@ -1669,6 +1846,10 @@ function Pane({
   onSetFilter,
   onSetSort,
   onReload,
+  upRow,
+  onUp,
+  onOpenZip,
+  onZipFolder,
   onMetaSaved,
   onOpenMetadata,
   scanRoots,
@@ -1679,22 +1860,9 @@ function Pane({
     () => findEnclosingScanRoot(state.cwd, scanRoots.map(r => r.path)),
     [state.cwd, scanRoots],
   );
-  const atRoot = !!enclosingRoot && enclosingRoot === state.cwd;
-  const onCwdUp = useCallback(() => {
-    if (atRoot || !enclosingRoot) return;
-    const parent = getParentPath(state.cwd);
-    if (!parent || parent === state.cwd) return;
-    // Don't let parent traversal escape the enclosing scan root.
-    const parentRoot = findEnclosingScanRoot(parent, scanRoots.map(r => r.path));
-    if (parentRoot !== enclosingRoot) return;
-    onCwd(parent);
-  }, [atRoot, enclosingRoot, state.cwd, scanRoots, onCwd]);
+  const atRoot = !upRow;
 
   const isMetadataMode = state.mode === 'metadata';
-  const parentPath = useMemo(
-    () => getClampedParent(state.cwd, scanRoots.map((r) => r.path)),
-    [state.cwd, scanRoots],
-  );
   return (
     <div
       onClick={onActivate}
@@ -1713,10 +1881,10 @@ function Pane({
         {!isMetadataMode ? (
           <>
             <button
-              onClick={onCwdUp}
+              onClick={onUp}
               disabled={!state.cwd || atRoot}
               className="p-1 hover:bg-surface-hover rounded disabled:opacity-50"
-              title={atRoot ? 'At scan root' : 'Up'}
+              title={atRoot ? 'At scan root' : state.zip ? 'Up (inside a zip)' : 'Up'}
             >
               <ArrowUp size={14} />
             </button>
@@ -1742,7 +1910,9 @@ function Pane({
                 </option>
               ))}
             </select>
-            <Breadcrumb path={state.cwd} root={enclosingRoot} onNavigate={onCwd} />
+            <Breadcrumb path={state.cwd} root={enclosingRoot} onNavigate={onCwd}>
+              {state.zip && <ZipCrumbs zip={state.zip} onNavigate={onZipFolder} />}
+            </Breadcrumb>
           </>
         ) : (
           <div className="flex items-center gap-2 text-content font-mono">
@@ -1782,8 +1952,8 @@ function Pane({
           )}
           {state.filterText && rawListing && listing && (
             <span className="text-content-muted whitespace-nowrap">
-              {listing.subdirectories.length + listing.files.length}
-              /{rawListing.subdirectories.length + rawListing.files.length}
+              {listingKeys(listing).length}
+              /{listingKeys(rawListing).length}
             </span>
           )}
           <button
@@ -1815,8 +1985,11 @@ function Pane({
               listing={listing}
               selection={state.selection}
               anchor={state.anchor}
-              parentPath={parentPath}
-              onCwd={onCwd}
+              upRow={upRow}
+              zip={state.zip}
+              onUp={onUp}
+              onOpenFolder={state.zip ? onZipFolder : onCwd}
+              onOpenZip={onOpenZip}
               onToggleSelect={onToggleSelect}
               onSetSelection={onSetSelection}
               onOpenMetadata={onOpenMetadata}
@@ -1836,9 +2009,14 @@ interface FileListProps {
   listing: DirectoryListing;
   selection: Set<string>;
   anchor: string | null;
-  /** When set, renders a synthetic parent-folder row at the top of the list. */
-  parentPath: string | null;
-  onCwd: (cwd: string) => void;
+  /** When set, renders a synthetic `..` row at the top of the list (label = where it lands). */
+  upRow: { label: string } | null;
+  /** Set while the pane is inside a zip (the list is read-only and shows non-frame entries). */
+  zip: ZipLocation | null;
+  onUp: () => void;
+  /** Double-click on a folder row: a disk folder, or an inner folder of the open zip. */
+  onOpenFolder: (path: string) => void;
+  onOpenZip: (zipPath: string) => void;
   onToggleSelect: (path: string, multi: boolean) => void;
   onSetSelection: (selection: Set<string>, anchor?: string | null) => void;
   /** Called when a double-click on an image file row (frame present) is detected. */
@@ -1870,7 +2048,7 @@ function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
   return keys.filter((k) => flags[k]);
 }
 
-function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
+function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpenFolder, onOpenZip, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the focused (anchor) row visible — fires when cursor crosses the
   // viewport edge from arrow-key navigation.
@@ -1884,10 +2062,7 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
   }, [anchor]);
   // Visual order of all rows — folders first, then files. Used by shift+click
   // to compute the inclusive range from the anchor to the clicked path.
-  const orderedPaths: string[] = [
-    ...listing.subdirectories,
-    ...listing.files.map((f) => f.file.path),
-  ];
+  const orderedPaths: string[] = listingKeys(listing);
 
   const handleClick = (e: React.MouseEvent, path: string) => {
     if (e.shiftKey && anchor) {
@@ -1937,12 +2112,12 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
 
   const parentClickRef = useRef<number>(0);
   const onParentClick = () => {
-    if (!parentPath) return;
+    if (!upRow) return;
     const now = Date.now();
     if (now - parentClickRef.current < 400) {
       // Treat as double-click → navigate.
       parentClickRef.current = 0;
-      onCwd(parentPath);
+      onUp();
     } else {
       // First click within window → just focus the row.
       parentClickRef.current = now;
@@ -1952,20 +2127,20 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
 
   return (
     <div ref={listRef} role="listbox" aria-label={`${paneId} pane file list`}>
-      {parentPath && (
+      {upRow && (
         <div data-row-key={PARENT_ROW}>
           <button
             // Manual double-click detection — see onParentClick. React's
             // onDoubleClick races with state-driven re-renders here.
             onClick={onParentClick}
-            title={`Double-click to go up to ${parentPath}`}
+            title={`Double-click to go up to ${upRow.label}`}
             className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
               anchor === PARENT_ROW ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content-muted'
             }`}
           >
             <CornerLeftUp size={14} className={anchor === PARENT_ROW ? 'text-accent' : 'text-content-muted'} />
             <span className="font-mono">..</span>
-            <span className="text-xs text-content-muted truncate">{parentPath}</span>
+            <span className="text-xs text-content-muted truncate">{upRow.label}</span>
           </button>
         </div>
       )}
@@ -1975,13 +2150,36 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
           <div key={subPath} data-row-key={subPath}>
             <button
               onClick={(e) => handleClick(e, subPath)}
-              onDoubleClick={() => onCwd(subPath)}
+              onDoubleClick={() => onOpenFolder(subPath)}
               className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
                 isSel ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
               }`}
             >
               <Folder size={14} className={isSel ? 'text-accent' : 'text-yellow-500'} />
               <span className="truncate font-mono">{getBasename(subPath)}</span>
+            </button>
+          </div>
+        );
+      })}
+      {(listing.zips ?? []).map((z) => {
+        const isSel = selection.has(z.path);
+        return (
+          <div key={z.path} data-row-key={z.path}>
+            <button
+              onClick={(e) => handleClick(e, z.path)}
+              onDoubleClick={() => onOpenZip(z.path)}
+              title="Double-click to open the zip"
+              className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
+                isSel ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
+              }`}
+            >
+              <FileArchive size={14} className={isSel ? 'text-accent' : 'text-info'} />
+              <span className="truncate font-mono">{getBasename(z.path)}</span>
+              <Chip tone="info">{zipFramesLabel(z.frameEntries)}</Chip>
+              {z.createdByOperation != null && (
+                <Chip tone="mute" title="Written by Move and ZIP">archive</Chip>
+              )}
+              <span className="ml-auto text-xs text-content-muted">{formatBytes(z.size)}</span>
             </button>
           </div>
         );
@@ -2023,8 +2221,20 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
           </button>
         );
       })}
-      {listing.subdirectories.length === 0 && listing.files.length === 0 && (
-        <div className="p-3 text-content-muted text-xs italic">Empty directory.</div>
+      {zip && (listing.otherEntries ?? []).map((o) => (
+        <div
+          key={`other:${o.name}`}
+          aria-disabled="true"
+          title="Not a cataloged frame — nothing here opens it"
+          className="w-full flex items-center gap-2 px-2 py-1 text-content-muted opacity-70 cursor-default"
+        >
+          <FileIcon size={14} className="text-content-muted" />
+          <span className="truncate font-mono">{o.name}</span>
+          <span className="ml-auto text-xs">{formatBytes(o.size)}</span>
+        </div>
+      ))}
+      {listingKeys(listing).length === 0 && (listing.otherEntries ?? []).length === 0 && (
+        <div className="p-3 text-content-muted text-xs italic">{zip ? 'Nothing at this level of the zip.' : 'Empty directory.'}</div>
       )}
     </div>
   );
@@ -2038,9 +2248,11 @@ interface BreadcrumbProps {
    *  is empty. */
   root: string | null;
   onNavigate: (cwd: string) => void;
+  /** Extra crumbs after the folder path (the open zip's own path). */
+  children?: ReactNode;
 }
 
-function Breadcrumb({ path, root, onNavigate }: BreadcrumbProps) {
+function Breadcrumb({ path, root, onNavigate, children }: BreadcrumbProps) {
   if (!path || !root) return null;
   const sep = path.includes('\\') ? '\\' : '/';
   // Preserve the absolute prefix: '/' for POSIX, '\\' for UNC shares —
@@ -2081,7 +2293,34 @@ function Breadcrumb({ path, root, onNavigate }: BreadcrumbProps) {
           </button>
         </span>
       ))}
+      {children}
     </nav>
+  );
+}
+
+/** `<zip name>/<inner folder>` as clickable crumbs; the last one is where the pane is. */
+function ZipCrumbs({ zip, onNavigate }: { zip: ZipLocation; onNavigate: (innerDir: string) => void }) {
+  const crumbs = zipCrumbs(zip);
+  return (
+    <>
+      {crumbs.map((c, i) => {
+        const last = i === crumbs.length - 1;
+        return (
+          <span key={c.innerDir} className="flex items-center gap-1 flex-shrink-0">
+            <ChevronRight size={10} />
+            <button
+              onClick={() => onNavigate(c.innerDir)}
+              disabled={last}
+              className={`flex items-center gap-1 truncate max-w-[140px] ${last ? 'text-content cursor-default' : 'hover:text-content'}`}
+              title={i === 0 ? zip.path : c.innerDir}
+            >
+              {i === 0 && <FileArchive size={11} className="flex-shrink-0 text-info" />}
+              {c.name}
+            </button>
+          </span>
+        );
+      })}
+    </>
   );
 }
 

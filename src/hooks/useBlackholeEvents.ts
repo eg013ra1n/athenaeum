@@ -35,27 +35,31 @@ export function useBlackholeEvents(allFileIds: number[]) {
     return () => { cancelled = true; };
   }, [allFileIds]);
 
-  // Listen for blackhole-changed events
+  // Listen for blackhole-changed events (StrictMode-safe listener pattern). Whole-zip actions carry no
+  // file id: they are not file-level changes, so this hook ignores them.
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    (async () => {
-      unlisten = await api.listen<BlackholeChangedEvent>('blackhole-changed', (payload) => {
-        if (payload.action === 'blackholed') {
-          setBlackholedFileIds(prev => {
-            const next = new Set(prev);
-            next.add(payload.file_id);
-            return next;
-          });
-        } else {
-          setBlackholedFileIds(prev => {
-            const next = new Set(prev);
-            next.delete(payload.file_id);
-            return next;
-          });
-        }
-      });
-    })();
-    return () => { unlisten?.(); };
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.listen<BlackholeChangedEvent>('blackhole-changed', (payload) => {
+      if (cancelled || !('file_id' in payload)) return;
+      const fileId = payload.file_id;
+      if (payload.action === 'blackholed') {
+        setBlackholedFileIds(prev => {
+          const next = new Set(prev);
+          next.add(fileId);
+          return next;
+        });
+      } else {
+        setBlackholedFileIds(prev => {
+          const next = new Set(prev);
+          next.delete(fileId);
+          return next;
+        });
+      }
+    })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[useBlackholeEvents] listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
   }, []);
 
   return { blackholedFileIds, isLoaded };

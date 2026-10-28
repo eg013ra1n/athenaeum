@@ -423,6 +423,8 @@ pub fn run() {
             // Zip commands
             commands::unpack_zip_frames,
             commands::list_zip_entries,
+            commands::get_zip_cache_status,
+            commands::clear_zip_cache,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

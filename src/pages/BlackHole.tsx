@@ -1,9 +1,13 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder } from 'lucide-react';
+import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder, FileArchive } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { format } from 'date-fns';
-import type { BlackHoleEntry } from '../types/models';
+import type { BlackHoleEntry, BlackHoleZipEntry } from '../types/models';
+import type { BlackholeChangedEvent } from '../types/helpers';
+import { Chip } from '../components/ui';
+import { findZipInPath } from '../components/dualpane/zipView';
+import { useNotifications } from '../contexts/NotificationContext';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 
@@ -13,6 +17,13 @@ interface FolderGroup {
   totalSize: number;
 }
 
+/** Every distinct refusal text, so a single zip frame's "only the whole zip can be removed" reaches the owner. */
+function refusalLines(errors: string[], max = 5): string {
+  const unique = Array.from(new Set(errors.map((e) => e.replace(/^Error:\s*/, ''))));
+  const shown = unique.slice(0, max).join('\n');
+  return unique.length > max ? `${shown}\n…and ${unique.length - max} more` : shown;
+}
+
 interface ProgressState {
   current: number;
   total: number;
@@ -20,7 +31,11 @@ interface ProgressState {
 }
 
 export default function BlackHole() {
+  const { notify } = useNotifications();
   const [entries, setEntries] = useState<BlackHoleEntry[]>([]);
+  /** Whole zips in the Black Hole (their own rows; restore and Void take the row `id`). */
+  const [zips, setZips] = useState<BlackHoleZipEntry[]>([]);
+  const [selectedZipIds, setSelectedZipIds] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<string | null>(null);
@@ -71,10 +86,15 @@ export default function BlackHole() {
     try {
       setLoading(true);
       setError(null);
-      const result = await api.invoke<BlackHoleEntry[]>('get_black_hole_files', { filter });
+      const [result, zipRows] = await Promise.all([
+        api.invoke<BlackHoleEntry[]>('get_black_hole_files', { filter }),
+        api.invoke<BlackHoleZipEntry[]>('get_black_hole_zips'),
+      ]);
       setEntries(result);
+      setZips(filter ? zipRows.filter((z) => z.fromWhere === filter) : zipRows);
       // Clear selection when reloading
       setSelectedIds(new Set());
+      setSelectedZipIds(new Set());
       setLastSelectedId(null);
     } catch (err) {
       console.error('Failed to load black hole entries:', err);
@@ -86,6 +106,25 @@ export default function BlackHole() {
 
   useEffect(() => {
     loadEntries();
+  }, [filter]);
+
+  // A zip moved, restored or voided elsewhere (the file browser, another window): reload the zip rows.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.listen<BlackholeChangedEvent>('blackhole-changed', (payload) => {
+      if (cancelled || !payload.action.startsWith('zip-')) return;
+      api.invoke<BlackHoleZipEntry[]>('get_black_hole_zips')
+        .then((rows) => {
+          if (cancelled) return;
+          setZips(filter ? rows.filter((z) => z.fromWhere === filter) : rows);
+          setSelectedZipIds(new Set());
+        })
+        .catch((err) => console.error('[BlackHole] reloading zips failed:', err));
+    })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[BlackHole] listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
   }, [filter]);
 
   // Initialize expanded folders when entries change
@@ -117,6 +156,13 @@ export default function BlackHole() {
       }))
       .sort((a, b) => a.path.localeCompare(b.path));
   }, [entries]);
+
+  function describeSelection(files: number, zipCount: number): string {
+    const parts: string[] = [];
+    if (files > 0) parts.push(`${files} file${files !== 1 ? 's' : ''}`);
+    if (zipCount > 0) parts.push(`${zipCount} zip${zipCount !== 1 ? 's' : ''}`);
+    return parts.join(' and ');
+  }
 
   // Get folder path from full file path. Root edges: 'C:\a.fits' → 'C:\',
   // '/a.fits' → '/' (the old `lastSlash > 0` check returned the whole path
@@ -196,12 +242,27 @@ export default function BlackHole() {
   const handleSelectAll = useCallback(() => {
     const allFileIds = entries.map(e => e.file_id);
     setSelectedIds(new Set(allFileIds));
-  }, [entries]);
+    setSelectedZipIds(new Set(zips.map((z) => z.id)));
+  }, [entries, zips]);
 
   const handleClearSelection = useCallback(() => {
     setSelectedIds(new Set());
+    setSelectedZipIds(new Set());
     setLastSelectedId(null);
   }, []);
+
+  const toggleZip = useCallback((id: number) => {
+    setSelectedZipIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleSelectAllZips = useCallback(() => {
+    setSelectedZipIds((prev) => (zips.every((z) => prev.has(z.id)) ? new Set() : new Set(zips.map((z) => z.id))));
+  }, [zips]);
 
   const toggleFolder = useCallback((folderPath: string) => {
     setExpandedFolders(prev => {
@@ -217,69 +278,107 @@ export default function BlackHole() {
 
   // Bulk actions with progress
   const handleRestoreSelected = useCallback(() => {
-    const selectedCount = selectedIds.size;
+    const fileCount = selectedIds.size;
+    const zipCount = selectedZipIds.size;
     showConfirm(
-      'Restore Selected Files',
-      `Restore ${selectedCount} file${selectedCount !== 1 ? 's' : ''} from the black hole?`,
+      'Restore Selected',
+      `Restore ${describeSelection(fileCount, zipCount)} from the black hole?`,
       async () => {
         const idsArray = Array.from(selectedIds);
-        setProgress({ current: 0, total: idsArray.length, action: 'restore' });
+        const zipIds = Array.from(selectedZipIds);
+        const total = idsArray.length + zipIds.length;
+        setProgress({ current: 0, total, action: 'restore' });
 
         let successCount = 0;
         const errors: string[] = [];
+        let done = 0;
 
-        for (let i = 0; i < idsArray.length; i++) {
+        for (const id of zipIds) {
           try {
-            await api.invoke('restore_from_black_hole', { fileId: idsArray[i] });
+            await api.invoke('restore_zip_from_black_hole', { id });
             successCount++;
           } catch (err) {
+            console.error('restore_zip_from_black_hole failed:', err);
             errors.push(String(err));
           }
-          setProgress({ current: i + 1, total: idsArray.length, action: 'restore' });
+          setProgress({ current: ++done, total, action: 'restore' });
+        }
+        for (const fileId of idsArray) {
+          try {
+            await api.invoke('restore_from_black_hole', { fileId });
+            successCount++;
+          } catch (err) {
+            console.error('restore_from_black_hole failed:', err);
+            errors.push(String(err));
+          }
+          setProgress({ current: ++done, total, action: 'restore' });
         }
 
         setProgress(null);
         await loadEntries();
 
         if (errors.length > 0) {
-          showAlert('Restore Complete', `Restored ${successCount} files. ${errors.length} error(s).`, 'warning');
+          showAlert('Restore Complete', `Restored ${successCount} of ${total}. ${errors.length} error(s):\n${refusalLines(errors)}`, 'warning');
+        } else if (zipIds.length > 0) {
+          notify({ title: `${zipIds.length} zip${zipIds.length === 1 ? '' : 's'} restored`, detail: 'Their frames are back in use.', kind: 'files', tone: 'success' });
         }
       }
     );
-  }, [selectedIds]);
+  }, [selectedIds, selectedZipIds, notify]);
 
   const handleVoidSelected = useCallback(() => {
-    const selectedCount = selectedIds.size;
+    const fileCount = selectedIds.size;
+    const zipCount = selectedZipIds.size;
+    const zipFrames = zips.filter((z) => selectedZipIds.has(z.id)).reduce((n, z) => n + z.frameEntries, 0);
     showConfirm(
       'Permanently Delete Selected',
-      `Permanently delete ${selectedCount} file${selectedCount !== 1 ? 's' : ''}?\n\nThis action cannot be undone!`,
+      `Permanently delete ${describeSelection(fileCount, zipCount)}?` +
+        (zipCount > 0
+          ? `\n\nDeleting a zip removes the zip file and its ${zipFrames.toLocaleString()} frame${zipFrames === 1 ? '' : 's'} from the catalog.`
+          : '') +
+        '\n\nThis action cannot be undone!',
       async () => {
         const idsArray = Array.from(selectedIds);
-        setProgress({ current: 0, total: idsArray.length, action: 'void' });
+        const zipIds = Array.from(selectedZipIds);
+        const total = idsArray.length + zipIds.length;
+        setProgress({ current: 0, total, action: 'void' });
 
         let successCount = 0;
         const errors: string[] = [];
+        let done = 0;
 
-        for (let i = 0; i < idsArray.length; i++) {
+        for (const id of zipIds) {
           try {
-            await api.invoke('send_to_void', { fileId: idsArray[i] });
+            await api.invoke('send_zip_to_void', { id });
             successCount++;
           } catch (err) {
+            console.error('send_zip_to_void failed:', err);
             errors.push(String(err));
           }
-          setProgress({ current: i + 1, total: idsArray.length, action: 'void' });
+          setProgress({ current: ++done, total, action: 'void' });
+        }
+        for (const fileId of idsArray) {
+          try {
+            await api.invoke('send_to_void', { fileId });
+            successCount++;
+          } catch (err) {
+            // A single frame inside a zip is refused here with the reason; it is shown below.
+            console.error('send_to_void failed:', err);
+            errors.push(String(err));
+          }
+          setProgress({ current: ++done, total, action: 'void' });
         }
 
         setProgress(null);
         await loadEntries();
 
         if (errors.length > 0) {
-          showAlert('Delete Complete', `Deleted ${successCount} files. ${errors.length} error(s).`, 'warning');
+          showAlert('Delete Complete', `Deleted ${successCount} of ${total}. ${errors.length} error(s):\n${refusalLines(errors)}`, 'warning');
         }
       },
       true
     );
-  }, [selectedIds]);
+  }, [selectedIds, selectedZipIds, zips]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -297,11 +396,13 @@ export default function BlackHole() {
   }, [handleSelectAll]);
 
   // Get unique sources for filter
-  const sources = Array.from(new Set(entries.map(e => e.from_where))).sort();
+  const sources = Array.from(new Set([...entries.map(e => e.from_where), ...zips.map((z) => z.fromWhere)])).sort();
 
   // Calculate totals
-  const totalSize = entries.reduce((acc, e) => acc + e.file_size, 0);
-  const selectionCount = selectedIds.size;
+  const totalSize = entries.reduce((acc, e) => acc + e.file_size, 0) + zips.reduce((acc, z) => acc + z.size, 0);
+  const selectionCount = selectedIds.size + selectedZipIds.size;
+  const allZipsSelected = zips.length > 0 && zips.every((z) => selectedZipIds.has(z.id));
+  const someZipsSelected = zips.some((z) => selectedZipIds.has(z.id));
 
   return (
     <div className="p-6 h-full flex flex-col">
@@ -313,7 +414,8 @@ export default function BlackHole() {
             <div>
               <h2 className="text-3xl font-bold">Black Hole</h2>
               <p className="text-content-muted mt-1 whitespace-nowrap">
-                {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
+                {entries.length} file{entries.length !== 1 ? 's' : ''}
+                {zips.length > 0 && <> • {zips.length} zip{zips.length !== 1 ? 's' : ''}</>} • {formatSize(totalSize)} total
                 {selectionCount > 0 && (
                   <span className="text-warning ml-2">• {selectionCount} selected</span>
                 )}
@@ -325,7 +427,7 @@ export default function BlackHole() {
             {/* Action Buttons */}
             <button
               onClick={handleSelectAll}
-              disabled={entries.length === 0 || progress !== null}
+              disabled={entries.length + zips.length === 0 || progress !== null}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <CheckSquare size={16} />
@@ -408,7 +510,7 @@ export default function BlackHole() {
             <Loader2 className="animate-spin mr-2" size={24} />
             <span className="text-content-muted">Loading...</span>
           </div>
-        ) : entries.length === 0 ? (
+        ) : entries.length === 0 && zips.length === 0 ? (
           <div className="bg-surface-elevated rounded-lg p-12 text-center">
             <RotateCcw className="mx-auto mb-4 text-content-muted" size={64} />
             <p className="text-content-muted text-lg font-semibold mb-2">Black hole is empty</p>
@@ -418,6 +520,67 @@ export default function BlackHole() {
           </div>
         ) : (
           <div className="space-y-2">
+            {zips.length > 0 && (
+              <div className="bg-surface-elevated rounded-lg border border-border overflow-hidden" data-testid="zip-group">
+                <div className="flex items-center gap-3 px-4 py-3 bg-surface-hover">
+                  <FileArchive size={18} className="text-info flex-shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold">Zip archives</div>
+                    <div className="text-xs text-content-muted">
+                      Frames in a zip here stay in the catalog but are left out of stacking, export and masters. Restore puts the zip back in use.
+                    </div>
+                  </div>
+                  <span className="text-content-muted text-sm flex-shrink-0">
+                    {zips.length} zip{zips.length !== 1 ? 's' : ''} • {formatSize(zips.reduce((n, z) => n + z.size, 0))}
+                  </span>
+                  <button
+                    onClick={handleSelectAllZips}
+                    className={`flex-shrink-0 p-1 rounded transition-colors ${
+                      allZipsSelected ? 'text-warning' : someZipsSelected ? 'text-warning/50' : 'text-content-muted hover:text-content-secondary'
+                    }`}
+                    title={allZipsSelected ? 'Deselect all zips' : 'Select all zips'}
+                    aria-label={allZipsSelected ? 'Deselect all zips' : 'Select all zips'}
+                  >
+                    {allZipsSelected ? <CheckSquare size={18} /> : <Square size={18} />}
+                  </button>
+                </div>
+                <div className="divide-y divide-border">
+                  {zips.map((zip) => {
+                    const isSelected = selectedZipIds.has(zip.id);
+                    const name = zip.zipPath.split(/[/\\]/).filter(Boolean).pop() ?? zip.zipPath;
+                    return (
+                      <div
+                        key={zip.id}
+                        className={`flex items-center gap-3 px-4 py-2 transition ${isSelected ? 'bg-warning/20' : 'hover:bg-surface-hover'}`}
+                      >
+                        <button
+                          onClick={() => toggleZip(zip.id)}
+                          aria-label={`${isSelected ? 'Deselect' : 'Select'} ${name}`}
+                          className={`flex-shrink-0 p-0.5 rounded transition-colors ${
+                            isSelected ? 'text-warning' : 'text-content-muted hover:text-content-secondary'
+                          }`}
+                        >
+                          {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                        </button>
+                        <div className="min-w-0 flex-1">
+                          <div className="font-mono text-sm truncate" title={zip.zipPath}>{name}</div>
+                          <div className="text-xs text-content-muted truncate" title={zip.zipPath}>{zip.zipPath}</div>
+                        </div>
+                        <Chip tone="info">{zip.frameEntries.toLocaleString()} frame{zip.frameEntries === 1 ? '' : 's'}</Chip>
+                        {zip.archiveOperationId != null && (
+                          <Chip tone="warn" title="Move and ZIP wrote this archive: it holds the only copy of the frames">only copy</Chip>
+                        )}
+                        <span className="px-2 py-0.5 bg-purple/25 text-purple text-xs rounded flex-shrink-0">{zip.fromWhere}</span>
+                        <span className="text-content-muted text-xs w-20 text-right flex-shrink-0">{formatSize(zip.size)}</span>
+                        <span className="text-content-muted text-xs w-32 text-right flex-shrink-0">
+                          {format(new Date(zip.movedAt), 'MMM d, yyyy')}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             {folderGroups.map((group) => {
               const isExpanded = expandedFolders.has(group.path);
               const allSelected = group.files.every(f => selectedIds.has(f.file_id));
@@ -490,6 +653,10 @@ export default function BlackHole() {
                             <span className="font-mono text-sm truncate flex-1" title={entry.filename}>
                               {entry.filename}
                             </span>
+
+                            {findZipInPath(entry.original_path) && (
+                              <Chip tone="info" title="A frame inside a zip: only the whole zip can be deleted">in zip</Chip>
+                            )}
 
                             {/* Source badge */}
                             <span className="px-2 py-0.5 bg-purple/25 text-purple text-xs rounded flex-shrink-0">

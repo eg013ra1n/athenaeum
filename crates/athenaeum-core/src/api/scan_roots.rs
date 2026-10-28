@@ -1500,7 +1500,8 @@ pub fn relink_scan_root(
         tracing::warn!(root_id, path = %new_path, zips = zips.missing, "relink refused: none of the root's zips is at the new location");
         // Nothing was written (no match, no zip present); dropping the guard rolls the transaction back.
         return Err(ApiError::Invalid(format!(
-            "None of the {} zip(s) of this folder is at the new location; the folder path was not changed",
+            "None of the {} zip(s) of this folder is at the new location; the folder path was not changed. \
+             A folder whose zips are gone for good can only be removed (Remove folder)",
             zips.missing
         )));
     }

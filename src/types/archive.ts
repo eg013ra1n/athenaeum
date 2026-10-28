@@ -63,7 +63,12 @@ export type ZipListItem = { path: string, size: number,
 /**
  * Frame entries the catalog holds for this zip.
  */
-frameEntries: number, };
+frameEntries: number, 
+/**
+ * The Move and ZIP operation that wrote this zip, when it is one of ours (the browser warns that
+ * removing it removes the only copy of an archived frame set).
+ */
+createdByOperation: number | null, };
 
 export type ZipDirListing = { 
 /**

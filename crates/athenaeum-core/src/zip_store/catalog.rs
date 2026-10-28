@@ -29,6 +29,9 @@ pub struct ZipListItem {
     pub size: i64,
     /// Frame entries the catalog holds for this zip.
     pub frame_entries: i64,
+    /// The Move and ZIP operation that wrote this zip, when it is one of ours (the browser warns that
+    /// removing it removes the only copy of an archived frame set).
+    pub created_by_operation: Option<i64>,
 }
 
 /// Runs `f` inside a savepoint: nested inside the caller's transaction when there is one, a transaction of
@@ -232,7 +235,7 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     let hi = crate::db::path_prefix_upper(&prefix);
     let depth = dir.matches(sep.as_str()).count() as i64 + 1;
     let mut stmt = conn.prepare(
-        "SELECT z.path, z.size, z.modified_at, z.frame_entries FROM zip_archives z
+        "SELECT z.path, z.size, z.modified_at, z.frame_entries, z.created_by_operation FROM zip_archives z
          WHERE z.path >= ?1 AND (?2 IS NULL OR z.path < ?2)
            AND (LENGTH(z.path) - LENGTH(REPLACE(z.path, ?3, ''))) = ?4
            AND z.frame_entries > 0
@@ -243,11 +246,17 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     )?;
     let rows = stmt
         .query_map(params![prefix, hi, sep, depth, instrume], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(rows.len());
-    for (path, mut size, modified_at, frame_entries) in rows {
+    for (path, mut size, modified_at, frame_entries, created_by_operation) in rows {
         if size == 0 && modified_at.is_empty() {
             size = match std::fs::metadata(&path) {
                 Ok(m) => i64::try_from(m.len()).unwrap_or(i64::MAX),
@@ -257,7 +266,7 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
                 }
             };
         }
-        out.push(ZipListItem { path, size, frame_entries });
+        out.push(ZipListItem { path, size, frame_entries, created_by_operation });
     }
     Ok(out)
 }

@@ -10,6 +10,7 @@ import { basename, formatBytes } from './format';
 import { ROLE_META, type RoleKind } from './roleMeta';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import type { RelinkResult, ScanRootOverview } from '../../types/models';
+import { RelinkZipsNote } from './RelinkZipsNote';
 
 interface RoleInspectorProps {
   kind: RoleKind;
@@ -120,6 +121,7 @@ export function RoleInspector(props: RoleInspectorProps) {
             <div><p className="text-content-muted text-xs">New files</p><p className="text-lg font-bold text-accent">{relinkResult.files_new}</p></div>
             <div><p className="text-content-muted text-xs">Orphaned</p><p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p></div>
           </div>
+          <RelinkZipsNote result={relinkResult} />
         </div>
       )}
 

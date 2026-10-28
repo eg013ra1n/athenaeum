@@ -188,6 +188,18 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         help: 'FITS files compress poorly; Store is the recommended default.',
         keywords: ['archive.compression', 'store', 'deflate'],
       },
+      {
+        id: 'zipCacheLimitGb',
+        label: 'Zip extraction cache limit (GB)',
+        help: 'Frames inside a zip are unpacked to this cache when something reads them (preview, stacking, export). The oldest unused ones are dropped once the cache passes the limit. It can pass the limit briefly while one job runs.',
+        keywords: ['archive.zip_cache_limit_gb', 'zip', 'cache', 'extraction', 'limit', 'size'],
+      },
+      {
+        id: 'zipCache',
+        label: 'Zip extraction cache on this computer',
+        help: 'Space the unpacked zip frames take. Clear cache deletes the ones nothing is using; they are unpacked again when needed. Zips themselves are never changed.',
+        keywords: ['zip', 'cache', 'clear', 'extraction', 'disk space'],
+      },
     ],
   },
   {

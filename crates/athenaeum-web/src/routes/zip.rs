@@ -17,6 +17,7 @@ use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
+pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,4 +79,30 @@ pub async fn list_zip_entries(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip listing task panicked: {}", e)))?
             .map_err(api_err)?;
     Ok(Json(listing))
+}
+
+/// POST /api/get_zip_cache_status
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_zip_cache_status(
+    State(state): State<WebAppState>,
+) -> Result<Json<ZipCacheStatus>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let status = tokio::task::spawn_blocking(move || api::get_zip_cache_status(&ctx))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip cache status task panicked: {}", e)))?
+        .map_err(api_err)?;
+    Ok(Json(status))
+}
+
+/// POST /api/clear_zip_cache
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn clear_zip_cache(
+    State(state): State<WebAppState>,
+) -> Result<Json<ZipCacheStatus>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let status = tokio::task::spawn_blocking(move || api::clear_zip_cache(&ctx))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip cache clear task panicked: {}", e)))?
+        .map_err(api_err)?;
+    Ok(Json(status))
 }
