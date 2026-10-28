@@ -31,6 +31,8 @@ pub async fn initialize_database(
 
     // set() returns Err if already set (race with StrictMode) — that's fine
     let _ = state.ctx.db.set(db);
+    // The zip extraction cache lives beside the catalog (sweeps stale partial files on first bind).
+    state.ctx.zip_cache.bind(&app_dir);
 
     // Apply persisted blink.threads setting to the semaphore
     if let Some(db) = state.ctx.db.get() {

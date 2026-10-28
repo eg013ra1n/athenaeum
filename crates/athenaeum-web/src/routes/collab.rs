@@ -855,6 +855,7 @@ mod live_surface_tests {
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

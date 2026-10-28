@@ -112,6 +112,9 @@ pub struct ServiceContext {
     /// (held across the async first-bind) serializes concurrent first callers;
     /// the `Option` allows a re-bind after shutdown.
     pub iroh_node: Arc<tokio::sync::Mutex<Option<Arc<crate::sharing::iroh::node::SharedIrohNode>>>>,
+    /// Where zip entries are extracted for consumers that need local bytes
+    /// ([`crate::zip_store::materialize`]). Built from the app data directory at startup.
+    pub zip_cache: Arc<crate::zip_store::cache::ZipCache>,
 }
 
 impl ServiceContext {
@@ -132,6 +135,8 @@ impl ServiceContext {
     /// their own `ServiceContext` inline).
     #[doc(hidden)]
     pub fn new_for_tests(db_path: std::path::PathBuf) -> Self {
+        // Beside the catalog (not `$ATHENAEUM_ZIP_CACHE`), so each test context has its own cache.
+        let zip_cache_dir = db_path.parent().map_or_else(|| std::env::temp_dir(), |p| p.to_path_buf()).join("zip-cache");
         let database = Database::new(db_path).expect("open test catalog db");
         let db = OnceLock::new();
         let _ = db.set(database);
@@ -158,6 +163,7 @@ impl ServiceContext {
             operation_queue: operation_queue::OperationQueue::start(),
             compute_queue: compute_queue::ComputeQueue::new(),
             iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: Arc::new(crate::zip_store::cache::ZipCache::at(zip_cache_dir)),
         }
     }
 }

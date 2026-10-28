@@ -87,6 +87,8 @@ pub fn run() {
                     operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
                     compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
                     iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+                    // The app data dir is only known once the database is initialized (`initialize_database`).
+                    zip_cache: Arc::new(athenaeum_core::zip_store::cache::ZipCache::unbound()),
                 }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),

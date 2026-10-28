@@ -29,3 +29,19 @@ calibration_set_id: number | null, archive_root_path: string, dispositions: Disp
 
 export type ArchiveOperationSummary = { id: number, frames_set_id: number | null, frame_set_name: string | null, status: string, started_at: string, finished_at: string | null, error_message: string | null, };
 
+export type ZipCacheStatus = { 
+/**
+ * Bytes on disk under the cache directory.
+ */
+bytes: number, 
+/**
+ * Cached entries (key directories holding a file).
+ */
+entries: number, 
+/**
+ * The configured size limit.
+ */
+limitBytes: number, };
+
+export type ExtractionEstimate = { files: number, bytes: number, };
+

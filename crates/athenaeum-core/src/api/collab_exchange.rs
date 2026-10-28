@@ -2218,6 +2218,7 @@ pub(crate) mod test_support {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         };
         (tmp, ctx)
     }

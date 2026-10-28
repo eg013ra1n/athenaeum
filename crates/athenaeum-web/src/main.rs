@@ -176,6 +176,11 @@ async fn main() {
 
     // Build ServiceContext
     let settings_mgr = Arc::new(SettingsManager::new());
+    // The zip extraction cache sits beside the catalog (`/data/zip-cache` in Docker).
+    let zip_cache = athenaeum_core::zip_store::cache::ZipCache::unbound();
+    if let Some(app_data) = db.path().parent() {
+        zip_cache.bind(app_data);
+    }
     let db_cell = OnceLock::new();
     let _ = db_cell.set(db);
     let ctx = Arc::new(ServiceContext {
@@ -197,6 +202,7 @@ async fn main() {
         operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
         compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
         iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+        zip_cache: Arc::new(zip_cache),
     });
 
     // SSE broadcast channel

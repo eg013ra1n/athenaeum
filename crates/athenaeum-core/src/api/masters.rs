@@ -3728,6 +3728,7 @@ mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         });
 
         // Pool max_size is 8 — exceed it so, pre-fix, every task grabs one
@@ -3873,6 +3874,7 @@ mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         });
 
         // Archive the raw set's originals for real (plan -> commit -> execute) —
@@ -4182,6 +4184,7 @@ mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         });
 
         // (a) An in-flight build blocks the delete. `active_master_builds` is
@@ -4709,6 +4712,7 @@ mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         })
     }
 
