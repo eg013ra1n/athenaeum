@@ -13,9 +13,7 @@
 
 use crate::db::{insert_file, insert_fits_header, insert_frame, SavepointGuard};
 use crate::fits_parser::stored_header::parse_stored_header_keys;
-use crate::fits_parser::{
-    calibrated_light_identity, extract_xisf_header, parse_fits_header_bytes, parse_fits_with_header, parse_xisf_header_bytes,
-};
+use crate::fits_parser::{calibrated_light_identity, parse_fits_header_bytes, parse_xisf_header_bytes};
 use crate::models::{File, FileFormat, Frame, ImageType};
 use crate::scanner::{path_to_utf8, path_under_unavailable_scan_root};
 use crate::zip_store::reader::{self, ZipEntryInfo};
@@ -153,50 +151,105 @@ pub(crate) enum HandRestore {
     NotApplicable,
     /// The frame was unzipped by hand to its original path: the row is a disk row again.
     BecameDiskRow,
-    /// A different file sits at the original path of an archived frame: the row is untouched.
+    /// The file at the original path of an archived frame is not that frame's bytes. The archived
+    /// row now carries its virtual path (`<zip>/<entry>`), so the path is free: the caller catalogs
+    /// the disk file as a new file.
     Differs,
 }
 
+/// CRC32 of a whole file, read in 1 MiB chunks.
+fn file_crc32(path: &Path) -> Result<u32> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize())
+}
+
+/// Whether the file at `path` holds exactly the bytes of the zip entry the row stands for: the
+/// size equals `files.size` (our rows keep their original size) and the CRC32 equals the one
+/// recorded for the row, or the one in the zip's directory when none is recorded. A zip that
+/// cannot be reached gives `false`: nothing is adopted that cannot be verified.
+fn disk_file_is_the_entry(
+    path: &Path,
+    disk_size: u64,
+    row_size: i64,
+    row_crc: Option<i64>,
+    zip_path: &str,
+    entry: &str,
+) -> bool {
+    if i64::try_from(disk_size).ok() != Some(row_size) {
+        return false;
+    }
+    let expected = match row_crc {
+        Some(crc) => u32::try_from(crc).ok(),
+        None => match reader::entry_crc32(Path::new(zip_path), entry) {
+            Ok(crc) => crc,
+            Err(e) => {
+                tracing::warn!(zip_path = %zip_path, zip_entry = %entry, error = %format!("{e:#}"), "zip directory unreadable — the file at the archived frame's path is not adopted");
+                None
+            }
+        },
+    };
+    let Some(expected) = expected else {
+        return false;
+    };
+    match file_crc32(path) {
+        Ok(actual) => actual == expected,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "could not checksum the file at an archived frame's path — not adopted");
+            false
+        }
+    }
+}
+
 /// A disk file turned up at the path (`files.path`, the restore target) of a zip-resident row that
-/// Move and ZIP wrote (`archived_in_operation` set), i.e. the user unzipped the frame by hand.
+/// Move and ZIP wrote (`archived_in_operation` set), i.e. the user may have unzipped the frame by hand.
 ///
-/// If the file's header fingerprint equals the row's, the row becomes a disk row: zip markers and CRC
-/// cleared, size and mtime from the file, the entry recorded in `zip_released_entries` so a later
-/// scan of the zip does not add it again; metadata, ids and every junction row stay. If the
-/// fingerprint differs, the row is left exactly as it is, nothing is parsed into it, and the
-/// mismatch is a warning (once per scan, as the walker meets the path once).
+/// The file is adopted only when its bytes are the entry's: same size as the row, same CRC32 as the
+/// row's recorded one (or the zip directory's when the row has none). Then the row becomes a disk
+/// row: all four zip columns (zip path, entry, CRC, operation) cleared, size and mtime from the
+/// file, the entry recorded in `zip_released_entries` (the zip gets a placeholder `zip_archives`
+/// row first when it has none) so a later scan of the zip does not add it again; metadata, ids
+/// and every junction row stay.
+///
+/// Anything else (a different frame, a half-written copy, an unverifiable one) is
+/// [`HandRestore::Differs`]: in one savepoint the archived row's `files.path` becomes its virtual
+/// path, which frees the path for the new file. The archive operation still restores the frame to
+/// its `source_path`.
 pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path: &Path) -> Result<HandRestore> {
-    let row: Option<(Option<String>, Option<String>, bool)> = conn
+    let row: Option<(Option<String>, Option<String>, Option<i64>, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT archive_zip_path, archive_path_in_zip, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
+            "SELECT archive_zip_path, archive_path_in_zip, archived_in_operation, size, archive_entry_crc32
+             FROM files WHERE id = ?1",
             params![file_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((Some(zip_path), entry, true)) = row else {
+    let Some((Some(zip_path), Some(entry), Some(operation), row_size, row_crc)) = row else {
         return Ok(HandRestore::NotApplicable);
     };
 
     let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let header = if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xisf")) {
-        extract_xisf_header(path)
-    } else {
-        parse_fits_with_header(path, file_id).map(|(_, h)| h)
-    }
-    .with_context(|| format!("read the header of {}", path.display()))?;
-    let disk_fingerprint = crate::fingerprint::compute_header_fingerprint(&header);
-    let stored_fingerprint: Option<String> = conn
-        .query_row("SELECT header_fingerprint FROM fits_header WHERE file_id = ?1", params![file_id], |r| r.get(0))
-        .optional()?
-        .flatten();
 
-    if stored_fingerprint.as_deref() != Some(disk_fingerprint.as_str()) {
+    if !disk_file_is_the_entry(path, metadata.len(), row_size, row_crc, &zip_path, &entry) {
+        let vpath = virtual_path(Path::new(&zip_path), &entry);
         tracing::warn!(
             file_id,
             path = %path.display(),
             zip_path = %zip_path,
-            "a different file sits at the original path of an archived frame — the catalog row is left as it is"
+            "the file at the original path of an archived frame is not that frame — the archived row moves to its zip path and the file is cataloged as new"
         );
+        let sp = SavepointGuard::new(conn, "scan_hand_restore_differs")?;
+        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![vpath, file_id])?;
+        sp.commit()?;
         return Ok(HandRestore::Differs);
     }
 
@@ -204,16 +257,21 @@ pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path:
     let sp = SavepointGuard::new(conn, "scan_hand_restored")?;
     conn.execute(
         "UPDATE files SET archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL,
-                size = ?1, modified_at = ?2 WHERE id = ?3",
+                archived_in_operation = NULL, size = ?1, modified_at = ?2 WHERE id = ?3",
         params![metadata.len() as i64, modified.to_rfc3339(), file_id],
     )?;
-    if let Some(entry) = entry {
-        conn.execute(
-            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
-             SELECT id, ?1 FROM zip_archives WHERE path = ?2",
-            params![entry, zip_path],
-        )?;
-    }
+    // The zip may have no row yet (Move and ZIP writes it only at its end): a placeholder keeps the
+    // release, with the stat left empty so the next scan reads the zip.
+    conn.execute(
+        "INSERT OR IGNORE INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
+         VALUES (?1, 0, '', (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1), ?2, ?3)",
+        params![zip_path, Utc::now().to_rfc3339(), operation],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
+         SELECT id, ?1 FROM zip_archives WHERE path = ?2",
+        params![entry, zip_path],
+    )?;
     sp.commit()?;
     tracing::info!(file_id, path = %path.display(), zip_path = %zip_path, "archived frame unzipped by hand — the row is a disk row again");
     Ok(HandRestore::BecameDiskRow)
@@ -490,6 +548,10 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     if still_referenced == 0 {
         conn.execute("UPDATE OR IGNORE black_hole_zips SET zip_id = ?1 WHERE zip_id = ?2", params![new_zip_id, old_id])?;
         conn.execute("DELETE FROM zip_archives WHERE id = ?1", params![old_id])?;
+    } else {
+        // Rows still point at the old path: keep its row, but without a real stat, so the zip is read
+        // again if it ever comes back under that name (renamed back) instead of skipped as unchanged.
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = '' WHERE id = ?1", params![old_id])?;
     }
     tracing::debug!(zip_id = new_zip_id, old_path = %gone, path = %new_zip_path, "zip identity moved to the zip's new location");
     Ok(())
@@ -1263,6 +1325,34 @@ mod scan_tests {
             2,
             "every row points at A again"
         );
+    }
+
+    #[test]
+    fn an_old_zip_row_kept_for_rows_that_still_point_at_it_has_no_stat_so_a_rename_back_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let files = [("L_001.fits", light(1)), ("L_002.fits", light(2))];
+        let a = make_zip(tmp.path(), "a.zip", &files, ArchiveCompression::Store);
+        scan_zip(&conn, &a, 1, false).unwrap();
+
+        // A is replaced by B, which holds only L_001: L_002's row still points at A.
+        std::fs::remove_file(&a).unwrap();
+        let b = make_zip(tmp.path(), "b.zip", &files[..1], ArchiveCompression::Store);
+        let outcome = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_eq!(zip_archive_count(&conn), 2, "A's row stays for the row that still points at it");
+        let (size, modified): (i64, String) = conn
+            .query_row("SELECT size, modified_at FROM zip_archives WHERE path = ?1", params![a.to_str().unwrap()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((size, modified.as_str()), (0, ""), "no stat is kept for a zip that is gone");
+
+        // A comes back under its name: it is read, not skipped as unchanged.
+        let a_again = make_zip(tmp.path(), "a.zip", &files, ArchiveCompression::Store);
+        assert_eq!(a_again, a);
+        let outcome = scan_zip(&conn, &a, 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
     }
 
     #[test]

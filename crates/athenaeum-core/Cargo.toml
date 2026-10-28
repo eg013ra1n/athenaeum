@@ -16,6 +16,7 @@ rayon = "1.10"
 walkdir = "2"
 anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1"
 quick-xml = "0.41"
 uuid = { version = "1", features = ["v4", "v5"] }
 # SemVer 2.0 precedence for the update check (moved here from athenaeum-tauri

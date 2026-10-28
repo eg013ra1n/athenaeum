@@ -29,14 +29,16 @@
 //! bytes exist; deleting them would be exactly the data loss this check
 //! exists to prevent. The documented remedy is to rename/remove the
 //! impostor and re-run restore — reconcile is idempotent and will fill
-//! exactly the remaining gaps.
+//! exactly the remaining gaps. When restoring under another folder, only the frame's own
+//! bytes at `source_path` count as "already restored"; a different file there (a newer capture
+//! that reused the name) is not in the way.
 
 use crate::archive::db as adb;
 use crate::archive::models::{ArchiveOperationFile, ArchiveStage, RestoreConflict, RestoreOutcome, StepStatus};
 use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::File;
@@ -254,7 +256,15 @@ fn run_restore_inner(
         }
 
         let original = Path::new(&f.source_path);
-        let already_in_place = original.is_file() && !overwrite_existing;
+        let mut already_in_place = original.is_file() && !overwrite_existing;
+        // Restoring under another folder: a different file at the original path (a newer capture
+        // that reused the name) is not in the way. Only the frame's own bytes there count as restored.
+        if already_in_place
+            && matches!(mode, RestoreTargetMode::UnderRoot(_))
+            && !matches!(compute_xxhash(original), Ok(ref h) if *h == f.expected_hash)
+        {
+            already_in_place = false;
+        }
 
         if already_in_place {
             // Don't just trust whatever is sitting at source_path — hash it
@@ -400,9 +410,14 @@ fn run_restore_inner(
                     .with_context(|| format!("read modified_at for {}", new_path.display()))?
             ).to_rfc3339();
 
-            // Rewrite path only if it differs from the catalog's source_path;
-            // mtime/size are always synced (they're the whole point of this fix).
-            let path_changed = new_path.to_str() != Some(f.source_path.as_str());
+            // Rewrite path only if it differs from the row's current path (normally the
+            // source_path; a zip path when a different file took the original one and the scanner
+            // moved this row to its virtual path); mtime/size are always synced (they're the whole
+            // point of this fix).
+            let current_path: Option<String> = conn
+                .query_row("SELECT path FROM files WHERE id = ?1", rusqlite::params![file_id], |r| r.get(0))
+                .optional()?;
+            let path_changed = new_path.to_str() != Some(current_path.as_deref().unwrap_or(f.source_path.as_str()));
             let path_arg = if path_changed { new_path.to_str() } else { None };
             adb::unmark_file_archived(conn, file_id, path_arg, Some(&new_mtime), Some(new_size))?;
         }

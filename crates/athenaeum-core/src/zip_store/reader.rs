@@ -194,6 +194,18 @@ pub fn list_entry_names(zip: &Path) -> Result<HashSet<String>> {
     Ok(names)
 }
 
+/// The CRC32 the zip's directory records for `entry` (a decoded name, unfiltered like
+/// [`list_entry_names`]); `None` when the zip holds no such entry. Reads the directory only.
+pub fn entry_crc32(zip: &Path, entry: &str) -> Result<Option<u32>> {
+    let (mut archive, _) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let names = index_by_name(&archive);
+    let Some(&index) = names.get(entry) else {
+        return Ok(None);
+    };
+    let file = archive.by_index_raw(index).with_context(|| format!("open entry {entry} of {}", zip.display()))?;
+    Ok(Some(file.crc32()))
+}
+
 /// Read the zip's directory through a 4 KiB buffer. Reads the central directory plus each listed
 /// entry's local header (to place its data); no entry data.
 pub fn list_entries(zip: &Path) -> Result<ZipListing> {

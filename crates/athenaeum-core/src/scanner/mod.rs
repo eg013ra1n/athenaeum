@@ -337,7 +337,7 @@ pub fn scan_directory(
         // the rescan. The previous DELETE-and-reinsert path silently
         // orphaned session memberships any time mtime drifted.
         let path_str = file_path.to_string_lossy().to_string();
-        let existing = conn
+        let mut existing = conn
             .query_row(
                 "SELECT id, size, modified_at,
                         EXISTS(SELECT 1 FROM frames WHERE file_id = files.id),
@@ -355,24 +355,30 @@ pub fn scan_directory(
                 },
             )
             .ok();
-        if let Some((file_id, db_size, db_modified, has_frame, zip_resident_ours)) = existing {
-            // A file at the original path of a frame Move and ZIP put into a zip: the user
-            // unzipped it by hand. Never re-parsed into the zip-resident row.
-            if zip_resident_ours {
-                match crate::zip_store::scan::reconcile_hand_restored_row(conn, file_id, file_path) {
-                    Ok(crate::zip_store::scan::HandRestore::BecameDiskRow) => {
-                        *processed.lock().unwrap() += 1;
-                    }
-                    Ok(_) => {
-                        *skipped.lock().unwrap() += 1;
-                    }
-                    Err(e) => {
-                        tracing::error!(root_id, file_id, path = %file_path.display(), error = %format!("{e:#}"), "hand-restored archive row check failed");
-                        errors.lock().unwrap().push(format!("{}: {e:#}", file_path.display()));
-                    }
+        // A file at the original path of a frame Move and ZIP put into a zip: never re-parsed into
+        // the zip-resident row. Its own bytes (the user unzipped it by hand) turn the row back into a
+        // disk row; any other file leaves the archived row at its zip path and is cataloged as new.
+        if let Some((file_id, _, _, _, true)) = existing {
+            match crate::zip_store::scan::reconcile_hand_restored_row(conn, file_id, file_path) {
+                Ok(crate::zip_store::scan::HandRestore::BecameDiskRow) => {
+                    *processed.lock().unwrap() += 1;
+                    continue;
                 }
-                continue;
+                Ok(crate::zip_store::scan::HandRestore::Differs) => {
+                    existing = None;
+                }
+                Ok(crate::zip_store::scan::HandRestore::NotApplicable) => {
+                    *skipped.lock().unwrap() += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(root_id, file_id, path = %file_path.display(), error = %format!("{e:#}"), "hand-restored archive row check failed");
+                    errors.lock().unwrap().push(format!("{}: {e:#}", file_path.display()));
+                    continue;
+                }
             }
+        }
+        if let Some((file_id, db_size, db_modified, has_frame, _)) = existing {
             let on_disk = std::fs::metadata(file_path).ok().map(|m| {
                 let size = m.len() as i64;
                 let modified = m
@@ -2094,6 +2100,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
         // A disk file at the original path of a frame Move and ZIP put into a zip (the user unzipped
         // it by hand): decided before any move detection, and never re-parsed into the zip row.
+        // Another file at that path: the archived row moved to its zip path, the file is a new one.
+        let mut archived_row_repointed = false;
         if let Some(&row_id) = modified_files_by_path.get(&file_result.file.path) {
             match crate::zip_store::scan::reconcile_hand_restored_row(conn, row_id, Path::new(&file_result.file.path)) {
                 Ok(crate::zip_store::scan::HandRestore::NotApplicable) => {}
@@ -2101,7 +2109,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     result.files_processed += 1;
                     continue;
                 }
-                Ok(crate::zip_store::scan::HandRestore::Differs) => continue,
+                Ok(crate::zip_store::scan::HandRestore::Differs) => archived_row_repointed = true,
                 Err(e) => {
                     tracing::error!(root_id, file_id = row_id, path = %file_result.file.path, error = %format!("{e:#}"), "hand-restored archive row check failed");
                     result.errors.push(format!("{}: {e:#}", file_result.file.path));
@@ -2198,7 +2206,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         // frames.id and therefore every junction-table linkage. The
         // `file_id` is plumbed through from the classification phase, so
         // no per-row SELECT is needed here.
-        if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path) {
+        if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path).filter(|_| !archived_row_repointed) {
             let path_buf = PathBuf::from(&file_result.file.path);
             match reparse_and_update_in_place(
                 &path_buf, file_id, conn, unique_camera, root_id, false,
@@ -4742,6 +4750,11 @@ mod zip_pass_tests {
                 )
                 .unwrap();
             assert_eq!((zip_col, entry, crc), (None, None, None), "parallel={parallel}: zip markers cleared");
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM files WHERE archived_in_operation IS NOT NULL"),
+                0,
+                "parallel={parallel}: the operation link is cleared with the other zip columns"
+            );
             assert_eq!(size, bytes.len() as i64, "parallel={parallel}: size from the disk file");
             let frame_after: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", params![id], |r| r.get(0)).unwrap();
             assert_eq!(frame_after, frame_id, "parallel={parallel}: metadata and ids are kept");
@@ -4758,36 +4771,148 @@ mod zip_pass_tests {
         }
     }
 
+    /// The archived row's zip markers, `files.path` and CRC.
+    fn archived_row_state(conn: &Connection, id: i64) -> (String, Option<String>, Option<String>, Option<i64>) {
+        conn.query_row(
+            "SELECT path, archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    /// A copy at the original path that is not the archived entry's bytes is not adopted: the
+    /// archived row moves to its virtual path (staying zip-resident, header untouched) and the file
+    /// becomes a new row at the original path.
+    fn assert_not_adopted(conn: &Connection, root: &Path, id: i64, parallel: bool, what: &str) {
+        let original = root.join("L_001.fits");
+        let (path, zip_col, entry, _) = archived_row_state(conn, id);
+        let zip_col = zip_col.unwrap_or_else(|| panic!("{what} parallel={parallel}: the row left its zip"));
+        let entry = entry.unwrap();
+        assert_eq!(
+            path,
+            crate::zip_store::scan::virtual_path(Path::new(&zip_col), &entry),
+            "{what} parallel={parallel}: the archived row moved to its virtual path"
+        );
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM files"), 2, "{what} parallel={parallel}: the new file is a row of its own");
+        let (new_id, new_zip): (i64, Option<String>) = conn
+            .query_row("SELECT id, archive_zip_path FROM files WHERE path = ?1", params![original.to_str().unwrap()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap_or_else(|e| panic!("{what} parallel={parallel}: no row at the original path: {e}"));
+        assert_ne!(new_id, id);
+        assert_eq!(new_zip, None, "{what} parallel={parallel}: the new row is a disk row");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM frames WHERE file_id = {new_id}")),
+            1,
+            "{what} parallel={parallel}: the new row has its frame"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM zip_released_entries"),
+            0,
+            "{what} parallel={parallel}: the entry is not released: the zip still holds the only good copy"
+        );
+    }
+
     #[test]
-    fn a_different_file_at_the_original_path_of_an_archived_frame_leaves_the_row_alone() {
+    fn a_different_file_at_the_original_path_of_an_archived_frame_is_cataloged_and_the_row_moves_to_its_zip_path() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
             let conn = fresh_db(root.path());
             let id = archived_by_move_and_zip(&conn, root.path(), &light(5));
-            let before: (String, String, Option<i64>) = conn
-                .query_row("SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1", params![id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .unwrap();
-            // A different frame (other header) was copied to the old path.
+            // A different frame (other header) was written to the old path.
             std::fs::write(root.path().join("L_001.fits"), light(99)).unwrap();
 
             let result = run_scan(parallel, root.path(), &conn);
             assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}: nothing is inserted at the taken path");
-            let after: (String, String, Option<i64>) = conn
-                .query_row("SELECT archive_zip_path, archive_path_in_zip, archive_entry_crc32 FROM files WHERE id = ?1", params![id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .unwrap();
-            assert_eq!(after, before, "parallel={parallel}: the row stays zip-resident");
-            let fp_rows: i64 = count(&conn, "SELECT COUNT(*) FROM fits_header");
-            assert_eq!(fp_rows, 1, "parallel={parallel}");
+            assert_not_adopted(&conn, root.path(), id, parallel, "different frame");
             let header: String = conn.query_row("SELECT header FROM fits_header WHERE file_id = ?1", params![id], |r| r.get(0)).unwrap();
             assert!(
                 header.contains(&format!("SEQNUM  = {:>20}", 5)) && !header.contains(&format!("SEQNUM  = {:>20}", 99)),
-                "parallel={parallel}: nothing was re-parsed into the row: {header}"
+                "parallel={parallel}: nothing was re-parsed into the archived row: {header}"
             );
+
+            // Nothing changes on the next scan.
+            let again = run_scan(parallel, root.path(), &conn);
+            assert!(again.errors.is_empty(), "parallel={parallel}: {:?}", again.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "parallel={parallel}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_altered_copy_with_the_archived_header_is_not_adopted() {
+        // Header identical to the archived frame's; only the bytes differ.
+        let full = {
+            let mut v = light(5);
+            v.extend(std::iter::repeat(7u8).take(5760));
+            v
+        };
+        let truncated = full[..2880 + 2880].to_vec();
+        let mut altered = full.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 0xff;
+        for parallel in [false, true] {
+            for (what, copy) in [("truncated", &truncated), ("altered", &altered)] {
+                let root = TempDir::new().unwrap();
+                let conn = fresh_db(root.path());
+                let id = archived_by_move_and_zip(&conn, root.path(), &full);
+                std::fs::write(root.path().join("L_001.fits"), copy).unwrap();
+
+                let result = run_scan(parallel, root.path(), &conn);
+                assert!(result.errors.is_empty(), "{what} parallel={parallel}: {:?}", result.errors);
+                assert_not_adopted(&conn, root.path(), id, parallel, what);
+                assert!(archived_row_state(&conn, id).3.is_some(), "{what} parallel={parallel}: CRC kept");
+            }
+        }
+    }
+
+    #[test]
+    fn a_byte_identical_copy_is_adopted_when_the_row_has_no_crc_and_a_zip_that_cannot_be_read_adopts_nothing() {
+        for parallel in [false, true] {
+            // No recorded CRC: the zip directory supplies it.
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            let bytes = light(5);
+            let id = archived_by_move_and_zip(&conn, root.path(), &bytes);
+            conn.execute("UPDATE files SET archive_entry_crc32 = NULL WHERE id = ?1", params![id]).unwrap();
+            std::fs::write(root.path().join("L_001.fits"), &bytes).unwrap();
+            let result = run_scan(parallel, root.path(), &conn);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}");
+            assert_eq!(archived_row_state(&conn, id).1, None, "parallel={parallel}: adopted");
+
+            // No recorded CRC and no zip to ask: nothing to verify against, so nothing is adopted.
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            let id = archived_by_move_and_zip(&conn, root.path(), &bytes);
+            conn.execute("UPDATE files SET archive_entry_crc32 = NULL WHERE id = ?1", params![id]).unwrap();
+            std::fs::remove_file(root.path().join("zips/n.zip")).unwrap();
+            std::fs::write(root.path().join("L_001.fits"), &bytes).unwrap();
+            let result = run_scan(parallel, root.path(), &conn);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_not_adopted(&conn, root.path(), id, parallel, "zip unreachable");
+        }
+    }
+
+    #[test]
+    fn releasing_an_entry_of_a_zip_without_a_row_keeps_the_zip_row_and_the_entry_is_not_re_added() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path());
+            let bytes = light(5);
+            let id = archived_by_move_and_zip(&conn, root.path(), &bytes);
+            // Move and ZIP writes no zip_archives row of its own yet.
+            conn.execute("DELETE FROM zip_archives", []).unwrap();
+            std::fs::write(root.path().join("L_001.fits"), &bytes).unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "parallel={parallel}: no duplicate row from the zip");
+            assert_eq!(archived_row_state(&conn, id).1, None);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries WHERE entry_path = 'Lights/L_001.fits'"), 1);
+            let created_by: Option<i64> =
+                conn.query_row("SELECT created_by_operation FROM zip_archives", [], |r| r.get(0)).unwrap();
+            assert_eq!(created_by, Some(77), "parallel={parallel}: the placeholder keeps the operation");
         }
     }
 

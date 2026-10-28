@@ -391,6 +391,7 @@ dependencies = [
  "byteorder",
  "cdshealpix",
  "chrono",
+ "crc32fast",
  "ed25519-dalek",
  "fd-lock",
  "flate2",
