@@ -357,8 +357,11 @@ fn run_restore_inner(
             // The caller asked to replace whatever is at the target, but only with a verified copy: the
             // entry goes to a staging file beside it, is hashed on the way, and is renamed onto the
             // target only when it matches the plan. A mismatch leaves the file that is there untouched.
+            // A run killed during an earlier overwrite left its staging leftovers here; place_entry sweeps
+            // them on the other path.
+            crate::zip_store::cache::sweep_stale_beside(&dest);
             let staged = staged_path(&dest);
-            let extracted_entry = extract_entry(
+            extract_entry(
                 Path::new(&f.target_zip_path), &f.target_path_in_zip, None, &staged, cancel.as_ref(), &mut |_| {},
             )
             .with_context(|| format!("extract {} from {}", f.target_path_in_zip, f.target_zip_path))?;
