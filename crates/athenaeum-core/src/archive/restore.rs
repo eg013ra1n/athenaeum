@@ -256,41 +256,59 @@ fn run_restore_inner(
         }
 
         let original = Path::new(&f.source_path);
+        // Pick the destination path based on mode.
+        let dest = match mode {
+            RestoreTargetMode::Original => original.to_path_buf(),
+            RestoreTargetMode::UnderRoot(root) => {
+                crate::archive::path_layout::dest_under_root(root, &f.target_path_in_zip)
+            }
+        };
         let mut already_in_place = original.is_file() && !overwrite_existing;
         // Restoring under another folder: a different file at the original path (a newer capture
-        // that reused the name) is not in the way. Only the frame's own bytes there count as restored.
+        // that reused the name) is not in the way, because nothing is written there. When the
+        // destination IS the original path the file there is checked like in Original mode.
         if already_in_place
-            && matches!(mode, RestoreTargetMode::UnderRoot(_))
+            && dest != original
             && !matches!(compute_xxhash(original), Ok(ref h) if *h == f.expected_hash)
         {
             already_in_place = false;
         }
 
-        if already_in_place {
-            // Don't just trust whatever is sitting at source_path — hash it
-            // with the SAME function that produced the plan's expected_hash
-            // and compare. Anything else (wrong version, different frame,
-            // half-written copy) is a conflict: leave it alone, don't clear
+        // A file already at the place the frame belongs is trusted only by its hash: the original
+        // path when the frame is "already in place", otherwise the final destination.
+        let existing: Option<&Path> = if already_in_place {
+            Some(original)
+        } else if dest.exists() && !overwrite_existing {
+            Some(dest.as_path())
+        } else {
+            None
+        };
+
+        if let Some(existing) = existing {
+            // Don't just trust whatever is sitting there — hash it with the SAME function that
+            // produced the plan's expected_hash and compare. Anything else (wrong version,
+            // different frame, half-written copy) is a conflict: leave it alone, don't clear
             // its markers, and keep going — see module docs.
-            match compute_xxhash(original) {
+            match compute_xxhash(existing) {
                 Ok(actual) if actual == f.expected_hash => {
                     emit(
                         emitter,
                         "reconcile",
                         idx + 1,
                         total,
-                        format!("Already on disk, hash-verified — skipping: {}", f.source_path),
+                        format!("Already on disk, hash-verified — skipping: {}", existing.display()),
                     );
                 }
                 Ok(actual) => {
                     let msg = format!(
                         "restore conflict: on-disk file does not match archived hash for {} (expected {}, got {})",
-                        f.source_path, f.expected_hash, actual,
+                        existing.display(), f.expected_hash, actual,
                     );
                     tracing::error!(
                         operation_id,
                         file_id = f.file_id.unwrap_or(-1),
                         src = %f.source_path,
+                        dest = %existing.display(),
                         expected_hash = %f.expected_hash,
                         actual_hash = %actual,
                         "restore conflict: on-disk file hash mismatch, leaving frame set archived pending resolution"
@@ -307,7 +325,7 @@ fn run_restore_inner(
                         "reconcile",
                         idx + 1,
                         total,
-                        format!("CONFLICT — on-disk file doesn't match the archive, left untouched: {}", f.source_path),
+                        format!("CONFLICT — on-disk file doesn't match the archive, left untouched: {}", existing.display()),
                     );
                 }
                 Err(e) => {
@@ -315,12 +333,13 @@ fn run_restore_inner(
                     // panic, never fall through to skip-and-clear.
                     let msg = format!(
                         "restore conflict: could not hash on-disk file at {}: {:#}",
-                        f.source_path, e,
+                        existing.display(), e,
                     );
                     tracing::error!(
                         operation_id,
                         file_id = f.file_id.unwrap_or(-1),
                         src = %f.source_path,
+                        dest = %existing.display(),
                         error = %e,
                         "restore conflict: could not verify on-disk file, leaving frame set archived pending resolution"
                     );
@@ -336,33 +355,51 @@ fn run_restore_inner(
                         "reconcile",
                         idx + 1,
                         total,
-                        format!("CONFLICT — could not verify on-disk file, left untouched: {}", f.source_path),
+                        format!("CONFLICT — could not verify on-disk file, left untouched: {}", existing.display()),
                     );
                 }
             }
             continue;
         }
 
-        // Pick the destination path based on mode.
-        let dest = match mode {
-            RestoreTargetMode::Original => original.to_path_buf(),
-            RestoreTargetMode::UnderRoot(root) => {
-                crate::archive::path_layout::dest_under_root(root, &f.target_path_in_zip)
+        // The catalog update writes `files.path = dest`, which is UNIQUE: if another row already
+        // owns it, copying would leave a file on disk and fail the catalog step. Check first.
+        if let (Some(file_id), Some(dest_str)) = (f.file_id, dest.to_str()) {
+            let owner: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM files WHERE path = ?1 AND id != ?2",
+                    rusqlite::params![dest_str, file_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(owner_id) = owner {
+                let msg = format!(
+                    "restore conflict: another catalog frame owns this path ({}, file {})",
+                    dest.display(), owner_id,
+                );
+                tracing::error!(
+                    operation_id,
+                    file_id,
+                    owner_file_id = owner_id,
+                    dest = %dest.display(),
+                    "restore conflict: another catalog frame owns the destination path, leaving frame set archived pending resolution"
+                );
+                record_conflict_step(conn, operation_id, f, None, &msg)?;
+                conflicts.push(RestoreConflict {
+                    file_id: f.file_id,
+                    source_path: f.source_path.clone(),
+                    expected_hash: f.expected_hash.clone(),
+                    actual_hash: None,
+                });
+                emit(
+                    emitter,
+                    "reconcile",
+                    idx + 1,
+                    total,
+                    format!("CONFLICT — another catalog frame owns this path, nothing copied: {}", dest.display()),
+                );
+                continue;
             }
-        };
-
-        if dest.exists() && !overwrite_existing {
-            // The on-disk target is not the original `source_path` (we'd have
-            // taken the skip branch above) but something exists there. Don't
-            // clobber it.
-            emit(
-                emitter,
-                "reconcile",
-                idx + 1,
-                total,
-                format!("Skipping (target exists): {}", dest.display()),
-            );
-            continue;
         }
 
         if let Some(parent) = dest.parent() {
@@ -1019,6 +1056,178 @@ pub(crate) mod tests {
         ).unwrap();
         assert!(archived_at_after.is_none(), "frame set must be unarchived once the healing run has zero conflicts");
         assert_eq!(is_archived_after, 0, "frame set must leave the Archive section once healed");
+    }
+
+    /// Archive a one-frame set (`bytes` at `<scan>/M31/L_001.fits`, scan root id 1) whose plan also
+    /// holds a frame of a second root, so the restore target can be classed `UnderRoot` while the
+    /// destination still equals the original path. Returns (op id, original path of the first frame,
+    /// its file id).
+    fn archive_two_roots(conn: &Connection, arch: &Path, scan: &Path, other: &Path) -> (i64, PathBuf, i64) {
+        let l1 = scan.join("M31/L_001.fits");
+        let l2 = other.join("M31/L_002.fits");
+        for (p, b) in [(&l1, b"first-frame".as_slice()), (&l2, b"second-frame".as_slice())] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b).unwrap();
+        }
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", [other.to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        for (fid, p, name) in [(1000, &l1, "L_001.fits"), (1001, &l2, "L_002.fits")] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 11, '2025-10-12', 'FITS')",
+                params![fid, p.to_str().unwrap(), name],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (?1, ?2, 'M31', 'T', 'C', 'Light')",
+                params![fid * 10, fid],
+            ).unwrap();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [fid * 10]).unwrap();
+        }
+        let plan = build_plan(
+            conn, 1, arch,
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(conn, &plan, ConflictResolution::Overwrite).unwrap();
+        run_operation(conn, op_id, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(!l1.exists() && !l2.exists());
+        (op_id, l1, 1000)
+    }
+
+    fn zip_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "zip")).count()
+    }
+
+    fn frame_set_archived(conn: &Connection) -> bool {
+        let at: Option<String> = conn.query_row("SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0)).unwrap();
+        at.is_some()
+    }
+
+    /// Restoring "into the parent folder" of a scan root while the plan has a frame elsewhere is an
+    /// alternate-root restore whose destination equals the original path. A newer capture there must
+    /// not be replaced by "skipping": conflict, zip kept, set stays archived, the capture untouched.
+    #[test]
+    fn under_root_restore_onto_the_original_path_keeps_a_new_capture_as_a_conflict() {
+        let base = TempDir::new().unwrap();
+        let arch = TempDir::new().unwrap();
+        let scan = base.path().join("x/rootA");
+        let other = base.path().join("y/rootB");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (op_id, original, _) = archive_two_roots(&conn, arch.path(), &scan, &other);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"a newer capture").unwrap();
+
+                let files = adb::list_operation_files(&conn, op_id).unwrap();
+        assert!(matches!(classify_target(&base.path().join("x"), &files), RestoreTargetMode::UnderRoot(_)), "this restore is an alternate-root one");
+        let dest0 = crate::archive::path_layout::dest_under_root(&base.path().join("x"), &files.iter().find(|f| f.source_path == original.to_str().unwrap()).unwrap().target_path_in_zip);
+        assert_eq!(dest0, original, "the destination equals the original path");
+
+        let outcome = run_restore(&conn, op_id, &base.path().join("x"), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert_eq!(std::fs::read(&original).unwrap(), b"a newer capture");
+        assert!(zip_count(arch.path()) > 0, "the zip is kept");
+        assert!(frame_set_archived(&conn));
+        let markers: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert!(markers > 0, "markers stay");
+    }
+
+    /// An unrelated file at the final destination of an alternate-root restore is a conflict, not a
+    /// "Skipping (target exists)" followed by marker clearing and zip removal.
+    #[test]
+    fn under_root_restore_with_an_unrelated_file_at_the_destination_is_a_conflict() {
+        let base = TempDir::new().unwrap();
+        let arch = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let scan = base.path().join("x/rootA");
+        let other = base.path().join("y/rootB");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (op_id, _, file_id) = archive_two_roots(&conn, arch.path(), &scan, &other);
+        let dest = target.path().join("rootA/M31/L_001.fits");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"unrelated").unwrap();
+
+        let outcome = run_restore(&conn, op_id, target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert_eq!(outcome.conflicts[0].file_id, Some(file_id));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"unrelated");
+        assert!(zip_count(arch.path()) > 0, "the zip is kept");
+        assert!(frame_set_archived(&conn));
+        let zip_col: Option<String> = conn.query_row("SELECT archive_zip_path FROM files WHERE id = ?1", [file_id], |r| r.get(0)).unwrap();
+        assert!(zip_col.is_some(), "markers stay");
+    }
+
+    /// A file at the destination that IS the frame (same hash) is still trusted: no conflict.
+    #[test]
+    fn under_root_restore_with_the_frames_own_bytes_at_the_destination_is_not_a_conflict() {
+        let base = TempDir::new().unwrap();
+        let arch = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let scan = base.path().join("x/rootA");
+        let other = base.path().join("y/rootB");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (op_id, _, _) = archive_two_roots(&conn, arch.path(), &scan, &other);
+        let dest = target.path().join("rootA/M31/L_001.fits");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"first-frame").unwrap();
+
+        let outcome = run_restore(&conn, op_id, target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+        assert!(!frame_set_archived(&conn));
+    }
+
+    /// The new capture's row still owns the original path (its file was deleted from disk): the
+    /// restore reports a conflict BEFORE copying, so no file is left behind and the zip stays.
+    #[test]
+    fn restore_onto_a_path_owned_by_another_catalog_row_copies_nothing() {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+        let l1 = scan.path().join("M31/L_001.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        std::fs::write(&l1, b"first-frame").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (1000, ?1, 'L_001.fits', 11, '2025-10-12', 'FITS')",
+            [l1.to_str().unwrap()],
+        ).unwrap();
+        conn.execute("INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (10000, 1000, 'M31', 'T', 'C', 'Light')", []).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        run_operation(&conn, op_id, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert!(!l1.exists());
+
+        // The archived row was re-pointed at its zip; a newer capture's row took the original path,
+        // and its file is gone from disk.
+        let (zip, entry): (String, String) = conn
+            .query_row("SELECT archive_zip_path, archive_path_in_zip FROM files WHERE id = 1000", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        conn.execute("UPDATE files SET path = ?1 WHERE id = 1000", [crate::zip_store::scan::virtual_path(Path::new(&zip), &entry)]).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (2000, ?1, 'L_001.fits', 5, '2025-10-13', 'FITS')",
+            [l1.to_str().unwrap()],
+        ).unwrap();
+
+        let outcome = run_restore(&conn, op_id, scan.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert!(!l1.exists(), "nothing was copied");
+        assert!(zip_count(arch.path()) > 0, "the zip is kept");
+        assert!(frame_set_archived(&conn));
+        let p: String = conn.query_row("SELECT path FROM files WHERE id = 2000", [], |r| r.get(0)).unwrap();
+        assert_eq!(p, l1.to_str().unwrap());
     }
 
     /// Pre-flight check fires when a zip file referenced by the plan no longer

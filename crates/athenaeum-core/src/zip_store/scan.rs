@@ -395,12 +395,23 @@ fn stage_entry(
         // A row of Move and ZIP's own keeps its original `files.path` (the restore target) and
         // its camera suffix: only its zip markers follow the zip. Any other row becomes a foreign
         // zip-resident row.
-        let (from_zip, ours): (Option<String>, bool) = conn.query_row(
-            "SELECT archive_zip_path, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
+        let (from_zip, from_entry, current_path, ours): (Option<String>, Option<String>, String, bool) = conn.query_row(
+            "SELECT archive_zip_path, archive_path_in_zip, path, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
             params![file_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         if ours {
+            // A row re-pointed at its zip entry (a new capture took its original path) names the
+            // old zip in `files.path`: the path follows the zip like the markers do.
+            if let (Some(fz), Some(fe)) = (&from_zip, &from_entry) {
+                if current_path == virtual_path(Path::new(fz), fe) {
+                    conn.execute(
+                        "UPDATE files SET path = ?1 WHERE id = ?2
+                           AND NOT EXISTS (SELECT 1 FROM files WHERE path = ?1)",
+                        params![vpath, file_id],
+                    )?;
+                }
+            }
             conn.execute(
                 "UPDATE files SET archive_zip_path = ?1, archive_path_in_zip = ?2, archive_entry_crc32 = ?3 WHERE id = ?4",
                 params![zip_str, entry.path, crc, file_id],
@@ -1263,6 +1274,40 @@ mod scan_tests {
         assert_eq!(frames, 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
         assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged, "the next scan skips it by stat");
+    }
+
+    #[test]
+    fn a_repointed_row_of_ours_gets_the_new_virtual_path_when_its_zip_moves() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let bytes = light(1);
+        let zip = make_zip(tmp.path(), "ours.zip", &[("Lights/L_001.fits", bytes.clone())], ArchiveCompression::Store);
+        let probe = tmp.path().join("probe.fits");
+        std::fs::write(&probe, &bytes).unwrap();
+        let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+        // A row of ours that a newer capture pushed off its original path: files.path is the virtual path.
+        let old_virtual = virtual_path(&zip, "Lights/L_001.fits");
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (500, ?1, 'L_001.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'Lights/L_001.fits')",
+            params![old_virtual, zip.to_str().unwrap()],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(&conn, 500, &header).unwrap();
+        conn.execute("INSERT INTO frames (file_id) VALUES (500)", []).unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("UPDATE files SET archived_in_operation = 77 WHERE id = 500", []).unwrap();
+
+        let moved = tmp.path().join("moved.zip");
+        std::fs::rename(&zip, &moved).unwrap();
+        let outcome = scan_zip(&conn, &moved, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        let (path, zip_col): (String, String) = conn
+            .query_row("SELECT path, archive_zip_path FROM files WHERE id = 500", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(path, virtual_path(&moved, "Lights/L_001.fits"), "the virtual path follows the zip");
+        assert_eq!(zip_col, moved.to_str().unwrap());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
     }
 
     fn zip_archive_count(conn: &Connection) -> i64 {
