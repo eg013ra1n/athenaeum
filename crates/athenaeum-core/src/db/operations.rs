@@ -2124,9 +2124,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
          FROM files f
          {joins}
          WHERE {usable}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})
          GROUP BY {hash}, f.size{group_extra}
@@ -2135,6 +2133,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
         hash = key.hash_expr("f"),
         joins = key.joins("f"),
         usable = key.hash_is_usable("f"),
+        not_black_holed = super::file_not_in_black_hole_sql("f.id"),
         eligibility = key.eligibility(),
         roots = root_predicate,
         extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
@@ -2382,9 +2381,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
          FROM files f
          {joins}
          WHERE {usable}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})
          GROUP BY {hash}, f.size{group_extra}
@@ -2392,6 +2389,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
         hash = key.hash_expr("f"),
         joins = key.joins("f"),
         usable = key.hash_is_usable("f"),
+        not_black_holed = super::file_not_in_black_hole_sql("f.id"),
         eligibility = key.eligibility(),
         roots = root_predicate,
         extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
@@ -2437,13 +2435,12 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
          FROM files
          {joins}
          WHERE {hash} = ? AND files.size = ?{extra_predicate}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})",
         hash = key.hash_expr("files"),
         joins = key.joins("files"),
+        not_black_holed = super::file_not_in_black_hole_sql("files.id"),
         eligibility = key.eligibility(),
         roots = files_root_predicate,
         extra_predicate = key
@@ -2527,14 +2524,15 @@ pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec
 
     for (group_id, hash, size, _file_count) in groups {
         // Get files for this group, excluding files in black_hole
-        let mut files_stmt = conn.prepare(
+        let mut files_stmt = conn.prepare(&format!(
             "SELECT f.id, f.path
              FROM duplicate_group_files dgf
              JOIN files f ON f.id = dgf.file_id
              WHERE dgf.group_id = ?1
-             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)
+             AND {not_black_holed}
              ORDER BY f.path",
-        )?;
+            not_black_holed = super::file_not_in_black_hole_sql("f.id"),
+        ))?;
 
         let files: Vec<(i64, String)> = files_stmt
             .query_map(params![group_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -8063,6 +8061,35 @@ mod tests {
                 .is_empty(),
             "one survivor is not a duplicate group"
         );
+    }
+
+    /// Owner ruling A (2026-10-28): the files of a zip in the Black Hole are treated like Black Hole files
+    /// by every duplicate query, so the group dissolves and a surviving copy is never offered for
+    /// deletion against a copy that is only "present". Restoring the zip brings the group back.
+    #[test]
+    fn duplicate_groups_leave_out_the_files_of_a_black_hole_zip() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+        seed_dup_file(&conn, 1, "/vol/a/f.fits", "2024-01-01T00:00:00+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 2, "/vol/b/f.fits", "2024-01-01T00:00:01+00:00", "HDR-A", "Flat", 0);
+        assert_eq!(find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().len(), 1);
+
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/vol/b.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_zip_path = '/vol/b.zip' WHERE id = 2", []).unwrap();
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/vol/b.zip", "files").unwrap();
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().is_empty(),
+            "one usable copy is not a duplicate group"
+        );
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert_eq!(find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().len(), 1);
     }
 
     /// `strong_hash` for one file — what `fill_master_strong_hashes` would have

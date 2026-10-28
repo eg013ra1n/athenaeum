@@ -227,8 +227,9 @@ pub fn calculate_metadata_from_frame_ids(
     let flag_query = format!(
         "SELECT fr.id,
                 EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = fr.id),
-                EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fr.file_id)
+                NOT {}
          FROM frames fr WHERE fr.id IN ({})",
+        crate::db::file_not_in_black_hole_sql("fr.file_id"),
         placeholders
     );
     let mut flag_stmt = conn.prepare(&flag_query)?;

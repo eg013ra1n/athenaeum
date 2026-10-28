@@ -572,6 +572,14 @@ pub(crate) fn readiness_from_data(
         ) {
             tracing::warn!(path = %path.display(), "master file missing on disk and in zip files");
             missing_masters.insert(path.clone(), master_set_id);
+        } else if crate::db::calibration_set_in_black_hole_zip(conn, master_set_id)
+            .map_err(|e| ApiError::Internal(format!("black hole zip check {master_set_id}: {e:#}")))?
+        {
+            // Owner ruling A: a master inside a zip in the Black Hole is present but not used. It counts
+            // as missing here (never rebuildable, `classify_master_rebuildability`) so no export, send or
+            // stack consumes it until the zip is restored.
+            tracing::warn!(path = %path.display(), master_set_id, "master is inside a zip in the Black Hole");
+            missing_masters.insert(path.clone(), master_set_id);
         }
     }
 
@@ -1091,6 +1099,12 @@ fn classify_master_rebuildability(
     conn: &Connection,
     master_set_id: i64,
 ) -> Result<Option<String>, ApiError> {
+    // A master in a Black Hole zip is never rebuilt around its zip: restoring the zip is the only way back.
+    if crate::db::calibration_set_in_black_hole_zip(conn, master_set_id)
+        .map_err(|e| ApiError::Internal(format!("black hole zip check {master_set_id}: {e:#}")))?
+    {
+        return Ok(Some("master is inside a zip in the Black Hole - restore the zip first".to_string()));
+    }
     let Some(prov) = crate::db::master_provenance::get(conn, master_set_id).map_err(|e| {
         ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
     })?
@@ -2628,6 +2642,53 @@ mod tests {
             vec![(master, "master is inside masters.zip, which is not reachable".to_string())]
         );
         assert!(!zip.exists() && !std::path::Path::new(&paths[0]).exists());
+    }
+
+    /// Owner ruling A (2026-10-28): a master inside a zip that sits in the Black Hole is present but not
+    /// used. Readiness counts it as a missing master that is never rebuildable, so export, send and
+    /// stacking refuse it; restoring the zip makes it usable again.
+    #[test]
+    fn a_master_in_a_black_hole_zip_is_missing_and_unrebuildable_until_restored() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let master = 400;
+        let master_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master bytes").unwrap();
+        seed_master_with_file(&conn, master, "MasterDark", &master_path);
+        add_link(&conn, 1, master, "Dark");
+        let zip = tmp.path().join("masters.zip");
+        zip_files(&conn, &[master * 100 + 8_000_000], &zip, Shape::Foreign);
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+             VALUES (?1, 10, 'x', 1, 'x')",
+            [zip.to_string_lossy()],
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0, "its zip lists it");
+
+        let id = crate::db::add_zip_to_black_hole(&conn, &zip.to_string_lossy(), "files").unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "present, not used");
+        assert!(r.masters_rebuildable.is_empty(), "{:?}", r.masters_rebuildable);
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(master, "master is inside a zip in the Black Hole - restore the zip first".to_string())]
+        );
+        assert!(check_mode_ready(&r, ExportMode::CalibratedLights).is_err());
+        let registered: i64 = conn
+            .query_row("SELECT is_master_library FROM calibration_set WHERE id = ?1", [master], |r| r.get(0))
+            .unwrap();
+        assert_eq!(registered, 1, "never unregistered");
+
+        crate::db::restore_zip_from_black_hole(&conn, id).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0);
+        assert!(r.masters_unrebuildable.is_empty());
     }
 
     /// Plan 5b Task 8b (found by the Task 7 acceptance run on the real LDN

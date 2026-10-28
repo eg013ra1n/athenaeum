@@ -177,9 +177,15 @@ pub fn build_plan(
     // The lights are the subject of a frame-set archive: with none of them left on disk there is nothing
     // to archive, even though calibration frames still are (they would make a calibration-only zip and
     // mark the set zipped).
-    if skipped_lights > 0 && !by_id.values().any(|c| c.role == FrameRole::Light) {
-        tracing::info!(frames_set_id, "every light of the frame set is already in a zip file; nothing to archive");
-        anyhow::bail!("{ALL_IN_ZIPS}");
+    if !by_id.values().any(|c| c.role == FrameRole::Light) {
+        if skipped_lights > 0 {
+            tracing::info!(frames_set_id, "every light of the frame set is already in a zip file; nothing to archive");
+            anyhow::bail!("{ALL_IN_ZIPS}");
+        }
+        // No light anywhere, on disk or in a zip (every one was voided, say): an empty plan must never
+        // be committed, because running it would mark the set zipped with no zip behind it.
+        tracing::info!(frames_set_id, "the frame set has no lights on disk; nothing to archive");
+        anyhow::bail!("{NO_LIGHTS_ON_DISK}");
     }
 
     // 4. Detect shared calibrations
@@ -744,6 +750,8 @@ fn load_all_scan_roots(conn: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// The refusal for a frame set that has no light files left to archive.
+const NO_LIGHTS_ON_DISK: &str = "nothing to archive \u{2014} the set has no lights on disk";
 /// Reported when every frame the plan would archive already lives inside a zip.
 const ALL_IN_ZIPS: &str = "all frames are already in zip files";
 
@@ -1486,6 +1494,22 @@ mod tests {
         };
         let err = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap_err();
         assert_eq!(format!("{err:#}"), "all frames are already in zip files");
+    }
+
+    #[test]
+    fn move_and_zip_refuses_a_set_with_no_lights_at_all_instead_of_an_empty_plan() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        // Every light was voided with its zip: the set keeps only its dark. An empty plan would be
+        // committed and then mark the set zipped with no zip behind it.
+        conn.execute(
+            "DELETE FROM session_members WHERE frame_id IN (SELECT id FROM frames WHERE file_id IN (1000, 1001))",
+            [],
+        ).unwrap();
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Copy), bias: None, darkflats: None,
+        };
+        let err = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap_err();
+        assert_eq!(format!("{err:#}"), "nothing to archive \u{2014} the set has no lights on disk");
     }
 
     #[test]

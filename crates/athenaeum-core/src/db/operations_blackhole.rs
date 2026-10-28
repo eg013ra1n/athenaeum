@@ -9,6 +9,20 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// The one spelling of "the file with this id is neither in the Black Hole itself nor inside a zip that is".
+/// `$fid` is a SQL expression for a `files.id`; the zip is looked up through `files.archive_zip_path`.
+macro_rules! black_hole_not_exists {
+    ($fid:literal) => {
+        concat!(
+            "(NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = ", $fid, ") \
+             AND NOT EXISTS (SELECT 1 FROM files bzf \
+                 JOIN zip_archives bza ON bza.path = bzf.archive_zip_path \
+                 JOIN black_hole_zips bhz ON bhz.zip_id = bza.id \
+                 WHERE bzf.id = ", $fid, "))"
+        )
+    };
+}
+
 /// The one SQL test for "this frame's file is not in the Black Hole", for a
 /// query that aliases `frames` as `f`. The Black Hole is how a user rejects a
 /// light (Blink, the Analysis table's "Reject unusable frames"), so every
@@ -22,11 +36,36 @@ use std::time::Instant;
 /// A frame inside a zip that sits in the Black Hole (`black_hole_zips`, joined by `zip_archives.id`) is
 /// excluded the same way: its frames stay visible and readable, but are not used until the zip is
 /// restored. A single zip-resident frame can also carry its own `black_hole` row (a rejected light).
-pub const FRAME_NOT_IN_BLACK_HOLE_SQL: &str = "(NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.file_id) \
-     AND NOT EXISTS (SELECT 1 FROM files bzf \
-         JOIN zip_archives bza ON bza.path = bzf.archive_zip_path \
-         JOIN black_hole_zips bhz ON bhz.zip_id = bza.id \
-         WHERE bzf.id = f.file_id))";
+pub const FRAME_NOT_IN_BLACK_HOLE_SQL: &str = black_hole_not_exists!("f.file_id");
+
+/// [`FRAME_NOT_IN_BLACK_HOLE_SQL`] for a query that names the file id differently (`files f` -> `"f.id"`,
+/// `frames fr` -> `"fr.file_id"`). Same text, so a reader that is not about `f.file_id` cannot drift from it.
+pub fn file_not_in_black_hole_sql(file_id_expr: &str) -> String {
+    black_hole_not_exists!("@FID@").replace("@FID@", file_id_expr)
+}
+
+/// "The calibration set has a member file inside a zip that sits in the Black Hole", for a query that names
+/// the set id by `set_id_expr` (`cs.id`, `cand.id`). A master is one file in one set, so a master inside a
+/// Black Hole zip is excluded as a whole; it stays registered (Restore brings it back with its provenance).
+pub fn calibration_set_in_black_hole_zip_sql(set_id_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM calibration_set_frames bcsf \
+             JOIN frames bmf ON bmf.id = bcsf.frame_id \
+             JOIN files bmfi ON bmfi.id = bmf.file_id \
+             JOIN zip_archives bmza ON bmza.path = bmfi.archive_zip_path \
+             JOIN black_hole_zips bmbz ON bmbz.zip_id = bmza.id \
+             WHERE bcsf.set_id = {set_id_expr})"
+    )
+}
+
+/// [`calibration_set_in_black_hole_zip_sql`] for one set id.
+pub fn calibration_set_in_black_hole_zip(conn: &Connection, set_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!("SELECT {}", calibration_set_in_black_hole_zip_sql("?1")),
+        params![set_id],
+        |r| r.get(0),
+    )?)
+}
 
 /// Progress event payload for `bulk-move-to-black-hole-progress`.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
@@ -556,7 +595,7 @@ pub fn restore_zip_from_black_hole(conn: &Connection, id: i64) -> Result<()> {
 ///
 /// Catalog first, disk second, like [`send_to_void`]: one savepoint holds `unregister_master_if_any` per
 /// row, the rows' own Black Hole entries, the `files` deletes and the `zip_archives` delete. After the
-/// commit the zip file is removed if it exists; an unlink failure arrives with the catalog already gone,
+/// commit the zip file is unlinked (the reachability check below has just shown it is there); an unlink failure arrives with the catalog already gone,
 /// is logged at `error!` and returned. Only the zip is unlinked — never the original path of one of our
 /// rows, which may hold a different capture now.
 ///
@@ -2019,6 +2058,10 @@ mod tests {
         let err = send_zip_to_void(&conn, id).unwrap_err().to_string();
         assert!(err.contains("is not reachable"), "{err}");
         assert_eq!(std::fs::read(&zip).unwrap(), b"not the zip");
+        assert_eq!(file_ids_in(&conn, &zip).len(), 2, "size mismatch: rows intact");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole_zips"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2);
         std::fs::write(&zip, real).unwrap();
 
         // A directory at the path.
