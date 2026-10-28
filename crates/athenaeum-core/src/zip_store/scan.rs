@@ -526,6 +526,18 @@ impl Tally {
     }
 }
 
+/// Entry paths the operation that created the zip at `zip_path` recorded for it in its plan (every
+/// disposition). Empty when the zip has no `created_by_operation`.
+fn entries_written_by_creating_operation(conn: &Connection, zip_path: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT aof.target_path_in_zip FROM archive_operation_files aof
+         INNER JOIN zip_archives z ON z.created_by_operation = aof.operation_id
+         WHERE z.path = ?1 AND aof.target_zip_path = ?1",
+    )?;
+    let rows = stmt.query_map(params![zip_path], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
 fn released_entries_of(conn: &Connection, zip_path: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
         "SELECT r.entry_path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id WHERE z.path = ?1",
@@ -634,6 +646,13 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         None => HashSet::new(),
     };
 
+    // Entries the zip's own operation wrote into it. A Copy entry (a library master, copied darks) has no
+    // row by design: it is the original on disk that is cataloged, so it must not become a foreign row.
+    let written_by_operation: HashSet<String> = match &known_zip {
+        Some(_) => entries_written_by_creating_operation(conn, &zip_str)?,
+        None => HashSet::new(),
+    };
+
     let mut to_read: Vec<(&ZipEntryInfo, Option<i64>)> = Vec::new();
     for entry in listing.entries.iter().filter(|e| e.is_frame) {
         if released.contains(&entry.path) {
@@ -642,6 +661,10 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         match known.get(&entry.path) {
             Some((id, Some(crc))) if *crc != i64::from(entry.crc32) => to_read.push((entry, Some(*id))),
             Some(_) => tally.cataloged += 1,
+            None if written_by_operation.contains(&entry.path) => {
+                tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "entry written by the zip's own operation has no row; not cataloged");
+                tally.cataloged += 1;
+            }
             None => to_read.push((entry, None)),
         }
     }
@@ -667,8 +690,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     };
 
     let outer = SavepointGuard::new(conn, "scan_zip")?;
-    // Rows that predate the entry CRC (our archive zips from before it was recorded) learn it from the
-    // directory this scan already read, with no further read of the zip.
+    // FOREIGN rows that predate the entry CRC learn it from the directory this scan already read, with no
+    // further read of the zip. Rows of our own operations never do: their CRC comes only from finalize or
+    // from a materialize that verified the extracted bytes against the expected hash, because a zip that
+    // was replaced since it was archived would otherwise hand its new CRC to the old row and switch the
+    // only check off.
     let crc_by_entry: HashMap<&str, u32> = listing.entries.iter().map(|e| (e.path.as_str(), e.crc32)).collect();
     let mut backfilled = 0usize;
     for (entry, (id, crc)) in &known {
@@ -676,11 +702,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             continue;
         }
         if let Some(listed) = crc_by_entry.get(entry.as_str()) {
-            conn.execute(
-                "UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2 AND archive_entry_crc32 IS NULL",
+            backfilled += conn.execute(
+                "UPDATE files SET archive_entry_crc32 = ?1
+                 WHERE id = ?2 AND archive_entry_crc32 IS NULL AND archived_in_operation IS NULL",
                 params![i64::from(*listed), id],
             )?;
-            backfilled += 1;
         }
     }
     if backfilled > 0 {

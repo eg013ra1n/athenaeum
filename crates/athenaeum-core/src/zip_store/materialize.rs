@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::cache::{Pinned, ZipCache};
-use super::reader::{entry_crc32_map, extract_entry, is_safe_entry_name};
+use super::reader::{entry_crc32_map, extract_entry};
 use crate::events::{NullEmitter, ProgressEmitter};
 use crate::services::ServiceContext;
 
@@ -206,9 +206,44 @@ fn zip_identity(facts: &mut ZipFacts, row: &ZipRow, file_name: &str, zip_name: &
     stats[&row.zip].ok_or_else(|| anyhow!("{file_name} is inside {zip_name}, which is not reachable"))
 }
 
+/// `false` for an entry name that is empty, holds a NUL, is absolute, or has an empty, `.` or `..` component
+/// (split on both separators): joining it under a directory could leave that directory.
+fn is_traversal_free(name: &str) -> bool {
+    if name.is_empty() || name.contains('\0') || name.starts_with('/') || name.starts_with('\\') {
+        return false;
+    }
+    !name.split(['/', '\\']).any(|c| c.is_empty() || c == "." || c == "..")
+}
+
+/// A file name the cache can create on every platform we build for, close to `name`: characters Windows
+/// and macOS refuse become `_`, a trailing space or dot is dropped, a device stem (`Aux`) gets a `_` prefix.
+/// The extension is kept. The cache directory of an entry is unique, so the name needs no uniqueness.
+fn cache_leaf(name: &str) -> String {
+    let mut leaf: String = name
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, ':' | '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    while leaf.ends_with(' ') || leaf.ends_with('.') {
+        leaf.pop();
+    }
+    let stem = leaf.split('.').next().unwrap_or(&leaf).trim_end_matches(' ').to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if device {
+        leaf.insert(0, '_');
+    }
+    if leaf.is_empty() {
+        leaf.push('_');
+    }
+    leaf
+}
+
 /// Works out where `row` lives in the cache. Creates nothing.
 fn resolve(facts: &mut ZipFacts, cache: &ZipCache, row: ZipRow) -> Result<Job> {
-    if !is_safe_entry_name(&row.entry) {
+    // Only a name that could leave the cache directory is refused. A name that is merely unusable as a
+    // FILE name on some platform (`:`, a trailing space or dot, `Aux`) is one our own layout produces
+    // from object and folder names, and its cache file gets a sanitized leaf instead.
+    if !is_traversal_free(&row.entry) {
         bail!("{}: the zip entry name {:?} is not a safe name", row.path, row.entry);
     }
     let file_name = row.entry.rsplit('/').next().unwrap_or_default().to_string();
@@ -236,7 +271,7 @@ fn resolve(facts: &mut ZipFacts, cache: &ZipCache, row: ZipRow) -> Result<Job> {
         hasher.update(&[0]);
     }
     let key = format!("{:016x}", hasher.digest());
-    let dest = cache.key_dir(&key)?.join(&file_name);
+    let dest = cache.key_dir(&key)?.join(cache_leaf(&file_name));
     Ok(Job { row, key, dest, file_name, zip_name, expected_crc, learned_crc })
 }
 
@@ -932,6 +967,74 @@ mod materialize_tests {
         let conn = f.ctx.db.get().unwrap().conn();
         let strong: Option<String> = conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
         assert!(strong.is_none(), "no hash is banked either");
+    }
+
+    #[test]
+    fn a_replaced_zip_does_not_hand_its_crc_to_a_row_of_ours_so_the_entry_is_refused() {
+        let f = fixture();
+        let old = light(1);
+        let (zip, paths) = f.catalog_zip("n.zip", &[("L_001.fits", old.clone())]);
+        let reference = f.root().join("reference.fits");
+        std::fs::write(&reference, &old).unwrap();
+        let id = make_ours(&f, &paths[0], &crate::duplicates::compute_xxhash(&reference).unwrap());
+
+        // The zip is replaced by one whose same-named entry holds other bytes; its stat changes, so the
+        // next scan reads it. That scan must not record the new entry's CRC on our row.
+        let replaced = make_zip(&f.root(), "n.zip", &[("L_001.fits", light(2))], ArchiveCompression::Deflate);
+        assert_eq!(replaced, zip);
+        {
+            let conn = f.ctx.db.get().unwrap().conn();
+            conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+            let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+            assert!(!outcome.skipped_unchanged, "the scan did read the replaced zip");
+        }
+        assert!(row_col(&f, id, "archive_entry_crc32").is_none(), "our row learns its CRC only from a verified extraction");
+
+        let err = mat(&f.ctx, &paths).unwrap_err().to_string();
+        assert!(err.contains("entry changed since it was archived"), "{err}");
+        assert!(f.cache_files().is_empty(), "{:?}", f.cache_files());
+    }
+
+    #[test]
+    fn a_row_of_ours_whose_entry_name_is_only_unsafe_as_a_file_name_still_extracts() {
+        let f = fixture();
+        let bytes = light(1);
+        for entry in ["Aux/M:31 /L_001.fits", "Obj./L_001.fits"] {
+            let zip = make_zip(&f.root(), "odd.zip", &[(entry, bytes.clone())], ArchiveCompression::Deflate);
+            let virtual_path = crate::zip_store::scan::virtual_path(&zip, entry);
+            {
+                let conn = f.ctx.db.get().unwrap().conn();
+                conn.execute("DELETE FROM files", []).unwrap();
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+                     VALUES (?1, 'L_001.fits', ?2, '2025-01-01T00:00:00Z', 'FITS', ?3, ?4)",
+                    params![virtual_path, bytes.len() as i64, zip.to_str().unwrap(), entry],
+                )
+                .unwrap();
+            }
+            let reference = f.root().join("reference.fits");
+            std::fs::write(&reference, &bytes).unwrap();
+            make_ours(&f, &virtual_path, &crate::duplicates::compute_xxhash(&reference).unwrap());
+
+            let paths = vec![virtual_path];
+            let m = mat(&f.ctx, &paths).unwrap_or_else(|e| panic!("{entry}: {e:#}"));
+            let local = m.local(&paths[0]).to_path_buf();
+            assert_eq!(std::fs::read(&local).unwrap(), bytes, "{entry}");
+            assert!(local.extension().is_some_and(|e| e == "fits"), "the extension survives: {local:?}");
+        }
+    }
+
+    #[test]
+    fn traversal_names_are_still_refused_and_the_cache_leaf_is_portable() {
+        for bad in ["", "/abs/L.fits", "a/../b.fits", "a//b.fits", "..\\x.fits", "./x.fits"] {
+            assert!(!is_traversal_free(bad), "{bad:?}");
+        }
+        assert!(is_traversal_free("Aux/M:31 /L 001.fits"));
+        assert_eq!(cache_leaf("L_001.fits"), "L_001.fits");
+        assert_eq!(cache_leaf("Aux.fits"), "_Aux.fits");
+        assert_eq!(cache_leaf("a:b.fits"), "a_b.fits");
+        assert_eq!(cache_leaf("L 001.fits. "), "L 001.fits");
+        assert_eq!(cache_leaf("..."), "_");
     }
 
     #[cfg(unix)]

@@ -285,6 +285,9 @@ fn zip_phase(
             continue;
         }
 
+        // Never truncate a zip that catalog rows live in (checked again here: the plan may be old).
+        crate::archive::planner::ensure_zip_holds_no_cataloged_frames(conn, zip_path_str)?;
+
         // Make sure parent dir exists.
         let zip_path = PathBuf::from(zip_path_str);
         if let Some(parent) = zip_path.parent() {
@@ -538,7 +541,9 @@ fn finalize_phase(
     // Each built zip joins the zip catalog with its real stat, so a later scan of it is skipped as
     // unchanged and its created-by operation is on record.
     for zip_path in crcs_by_zip.keys() {
-        record_built_zip(conn, operation_id, zip_path)?;
+        // Frame entries the operation wrote into this zip: moves and copies alike (copies have no row).
+        let written = files.iter().filter(|f| f.target_zip_path == *zip_path).count();
+        record_built_zip(conn, operation_id, zip_path, written)?;
     }
     if let Some(fs_id) = frames_set_id {
         adb::mark_frame_set_archived(conn, fs_id, operation_id)?;
@@ -577,9 +582,10 @@ fn finalize_phase(
 }
 
 /// Upsert the `zip_archives` row of a zip this operation built: the zip's real size and mtime (in the
-/// format the zip scan writes, so the scan finds them equal), the number of catalog rows living in it
-/// and `created_by_operation`.
-fn record_built_zip(conn: &Connection, operation_id: i64, zip_path: &str) -> Result<()> {
+/// format the zip scan writes, so the scan finds them equal), the number of frame entries the operation
+/// wrote into it (`frame_entries`) and `created_by_operation`. Entries an earlier unpack released from
+/// a zip at this path no longer apply to the zip just built, so they are cleared.
+fn record_built_zip(conn: &Connection, operation_id: i64, zip_path: &str, frame_entries: usize) -> Result<()> {
     let meta = std::fs::metadata(zip_path).map_err(|e| {
         tracing::error!(operation_id, zip_path, error = %e, "stat of the built zip failed");
         anyhow::Error::new(e).context(format!("stat {zip_path}"))
@@ -591,11 +597,22 @@ fn record_built_zip(conn: &Connection, operation_id: i64, zip_path: &str) -> Res
     let modified = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
     conn.execute(
         "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
-         VALUES (?1, ?2, ?3, (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1), ?4, ?5)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET size = excluded.size, modified_at = excluded.modified_at,
                 frame_entries = excluded.frame_entries, scanned_at = excluded.scanned_at,
                 created_by_operation = excluded.created_by_operation",
-        rusqlite::params![zip_path, meta.len() as i64, modified, chrono::Utc::now().to_rfc3339(), operation_id],
+        rusqlite::params![
+            zip_path,
+            meta.len() as i64,
+            modified,
+            frame_entries as i64,
+            chrono::Utc::now().to_rfc3339(),
+            operation_id
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM zip_released_entries WHERE zip_id = (SELECT id FROM zip_archives WHERE path = ?1)",
+        rusqlite::params![zip_path],
     )?;
     Ok(())
 }
@@ -640,14 +657,20 @@ mod tests {
 
     /// End-to-end fixture: real files on disk, planner runs, executor runs to Completion.
     fn run_full_fixture() -> (Connection, TempDir, TempDir, i64) {
+        full_fixture_with(&["M31/L_001.fits", "M31/L_002.fits"])
+    }
+
+    /// [`run_full_fixture`] for lights at `rels` (relative to the scan root). The names may carry `:`, a
+    /// trailing space or a device name in a folder, as object and folder names do.
+    fn full_fixture_with(rels: &[&str]) -> (Connection, TempDir, TempDir, i64) {
         let arch = TempDir::new().unwrap();
         let scan = TempDir::new().unwrap();
 
-        let l1 = scan.path().join("M31/L_001.fits");
-        let l2 = scan.path().join("M31/L_002.fits");
-        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
-        std::fs::write(&l1, b"light-1").unwrap();
-        std::fs::write(&l2, b"light-2").unwrap();
+        let lights: Vec<PathBuf> = rels.iter().map(|r| scan.path().join(r)).collect();
+        for (i, l) in lights.iter().enumerate() {
+            std::fs::create_dir_all(l.parent().unwrap()).unwrap();
+            std::fs::write(l, format!("light-{}", i + 1)).unwrap();
+        }
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -665,7 +688,8 @@ mod tests {
             "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')",
             [],
         ).unwrap();
-        for (file_id, path, frame_id) in [(1000, &l1, 10000), (1001, &l2, 10001)] {
+        for (i, path) in lights.iter().enumerate() {
+            let (file_id, frame_id) = (1000 + i as i64, 10000 + i as i64);
             conn.execute(
                 "INSERT INTO files (id, path, filename, size, modified_at, format)
                  VALUES (?1, ?2, ?3, 7, '2025-10-12', 'FITS')",
@@ -899,5 +923,99 @@ mod tests {
         assert_eq!(after[0].2, before[0].2);
         assert_eq!(after[0].3, 2);
         assert_eq!(after[0].4, Some(op_id), "created_by_operation survives the rescan");
+    }
+
+    #[test]
+    fn a_zip_of_copies_only_is_recorded_with_its_entries_and_a_rescan_adds_no_rows() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        // Copy darks / library masters have no row: the original on disk stays the cataloged frame.
+        conn.execute("UPDATE archive_operation_files SET disposition = 'copy' WHERE operation_id = ?1", [op_id]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        let zips = zip_rows(&conn);
+        assert_eq!(zips.len(), 1);
+        assert_eq!(zips[0].3, 2, "frame_entries counts the entries written, not the rows that own them");
+        let in_zip: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(in_zip, 0, "copies leave the originals where they are");
+        let files_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+        let outcome = crate::zip_store::scan::scan_zip(&conn, Path::new(&zips[0].0), 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.files_inserted, 0, "the copies do not become foreign rows");
+        let files_after: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files_after, files_before);
+        let after = zip_rows(&conn);
+        assert_eq!(after[0].3, 2, "the rescan keeps the entry count");
+        assert_eq!(after[0].4, Some(op_id));
+    }
+
+    #[test]
+    fn entries_with_colon_trailing_space_or_device_names_get_their_crc_and_a_rescan_inserts_nothing() {
+        let (conn, _arch, _scan, op_id) =
+            full_fixture_with(&["M:31/L_001.fits", "Aux/L_002.fits", "Obj /L_003.fits"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        let rows: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT archive_path_in_zip, archive_entry_crc32 FROM files WHERE archived_in_operation = ?1")
+                .unwrap();
+            let r = stmt.query_map([op_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            r
+        };
+        assert_eq!(rows.len(), 3);
+        for needle in ["M:31/", "Aux/", "Obj /"] {
+            let (entry, crc) = rows.iter().find(|(e, _)| e.contains(needle)).unwrap_or_else(|| panic!("{needle} in {rows:?}"));
+            assert!(crc.is_some(), "{entry} has its CRC32 from the built zip's directory");
+        }
+        let zips = zip_rows(&conn);
+        assert_eq!(zips[0].3, 3);
+        let files_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+        let outcome = crate::zip_store::scan::scan_zip(&conn, Path::new(&zips[0].0), 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.files_inserted, 0);
+        let files_after: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files_after, files_before);
+        assert_eq!(zip_rows(&conn)[0].3, 3, "the scan counts the odd names as cataloged");
+    }
+
+    #[test]
+    fn recording_a_rebuilt_zip_clears_the_entries_an_earlier_unpack_released_there() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+        let zip = zip_rows(&conn)[0].0.clone();
+        let zip_id: i64 = conn.query_row("SELECT id FROM zip_archives WHERE path = ?1", [&zip], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'old/L_000.fits')", [zip_id]).unwrap();
+
+        record_built_zip(&conn, op_id, &zip, 2).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM zip_released_entries WHERE zip_id = ?1", [zip_id], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "names released from the old zip at this path do not apply to the new one");
+        assert_eq!(zip_rows(&conn)[0].3, 2);
+    }
+
+    #[test]
+    fn the_executor_refuses_to_truncate_a_zip_that_holds_cataloged_frames() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let target: String = conn
+            .query_row("SELECT target_zip_path FROM archive_operation_files WHERE operation_id = ?1 LIMIT 1", [op_id], |r| r.get(0))
+            .unwrap();
+        std::fs::write(&target, b"zip bytes that must survive").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (900, ?1, 'X.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'X.fits')",
+            params![format!("{target}!/X.fits"), target],
+        ).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The standalone path rolls the failed operation back; that must not remove the zip either.
+        let err = run_operation_standalone(&conn, op_id, &cancel, &NullEmitter).unwrap_err();
+        assert!(format!("{err:#}").contains("cataloged"), "{err:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"zip bytes that must survive");
     }
 }

@@ -131,6 +131,19 @@ pub fn rollback_operation(
     for f in &files {
         if seen_zips.insert(f.target_zip_path.clone()) {
             let zp = Path::new(&f.target_zip_path);
+            // A zip that other catalog rows live in is not this operation's partial output: it was
+            // there before (a plan that is refused for exactly that reason ends up here), and removing
+            // it would take those frames' only copy.
+            let others: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files
+                 WHERE archive_zip_path = ?1 AND (archived_in_operation IS NULL OR archived_in_operation != ?2)",
+                rusqlite::params![f.target_zip_path, operation_id],
+                |r| r.get(0),
+            )?;
+            if others > 0 {
+                tracing::warn!(operation_id, path = %zp.display(), cataloged_frames = others, "zip holds other cataloged frames; left in place during rollback");
+                continue;
+            }
             if zp.exists() {
                 // Best-effort by design — a locked zip (Windows sharing
                 // violation) must not fail the rollback — but never silent.

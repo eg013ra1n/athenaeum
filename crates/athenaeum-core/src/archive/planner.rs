@@ -154,10 +154,14 @@ pub fn build_plan(
     // A frame that already lives inside a zip (a foreign one, or one of ours) is not on disk to move
     // or copy: it is left out of the plan, not an error. Lights and the calibration chain alike.
     let mut skipped_in_zip = 0usize;
+    let mut skipped_lights = 0usize;
     let mut on_disk: HashMap<i64, CandidateFile> = HashMap::with_capacity(by_id.len());
     for (id, c) in by_id {
         if is_zip_resident(conn, id)? {
             skipped_in_zip += 1;
+            if c.role == FrameRole::Light {
+                skipped_lights += 1;
+            }
             tracing::debug!(file_id = id, path = %c.file_path, "frame already in a zip file; left out of the plan");
         } else {
             on_disk.insert(id, c);
@@ -168,6 +172,13 @@ pub fn build_plan(
         tracing::info!(frames_set_id, skipped = skipped_in_zip, remaining = by_id.len(), "frames already in zip files left out of the archive plan");
     }
     if by_id.is_empty() && skipped_in_zip > 0 {
+        anyhow::bail!("{ALL_IN_ZIPS}");
+    }
+    // The lights are the subject of a frame-set archive: with none of them left on disk there is nothing
+    // to archive, even though calibration frames still are (they would make a calibration-only zip and
+    // mark the set zipped).
+    if skipped_lights > 0 && !by_id.values().any(|c| c.role == FrameRole::Light) {
+        tracing::info!(frames_set_id, "every light of the frame set is already in a zip file; nothing to archive");
         anyhow::bail!("{ALL_IN_ZIPS}");
     }
 
@@ -540,6 +551,12 @@ pub fn commit_plan(
     }
     // Overwrite mode keeps paths as-is (existing zip is overwritten when build_zip runs).
 
+    // A zip that holds cataloged frames is never rewritten: the plan left those rows out because they
+    // live in it, and Overwrite would truncate the only copy they have.
+    for z in &zips {
+        ensure_zip_holds_no_cataloged_frames(conn, &z.zip_path)?;
+    }
+
     // The operation row and its file manifest are one unit — a failure
     // part-way through the loop used to leave an operation with a truncated
     // manifest, which the executor would happily run as if complete (audit
@@ -575,6 +592,23 @@ pub fn commit_plan(
 
     sp.commit()?;
     Ok(op_id)
+}
+
+/// Refuses a target zip that catalog rows still live in (`files.archive_zip_path`): the archive would
+/// truncate it. Names the zip so the owner can pick another archive folder or unarchive those frames.
+pub(crate) fn ensure_zip_holds_no_cataloged_frames(conn: &Connection, zip_path: &str) -> Result<()> {
+    // A zip that is not on disk has nothing to truncate; rows pointing at it are missing frames, not a loss.
+    if !Path::new(zip_path).exists() {
+        return Ok(());
+    }
+    let rows: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1", [zip_path], |r| r.get(0))?;
+    if rows > 0 {
+        tracing::error!(zip_path, cataloged_frames = rows, "archive target zip holds cataloged frames; refused");
+        anyhow::bail!(
+            "{zip_path} already holds {rows} cataloged frame(s); it cannot be replaced. Choose a different archive folder or unpack those frames first"
+        );
+    }
+    Ok(())
 }
 
 // --- helpers ---
@@ -1385,6 +1419,47 @@ mod tests {
         };
         let err = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap_err();
         assert_eq!(format!("{err:#}"), "all frames are already in zip files");
+    }
+
+    #[test]
+    fn move_and_zip_bails_when_no_light_is_on_disk_even_if_calibration_frames_are() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        make_zip_resident(&conn, 1000, "/nas/night.zip", "L_001.fits");
+        make_zip_resident(&conn, 1001, "/nas/night.zip", "L_002.fits");
+        // The dark is on disk and would be copied; the lights are the subject, so there is nothing to do.
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Copy), bias: None, darkflats: None,
+        };
+        let err = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap_err();
+        assert_eq!(format!("{err:#}"), "all frames are already in zip files");
+    }
+
+    #[test]
+    fn overwrite_never_truncates_a_zip_that_holds_cataloged_frames() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        // A kept zip at the set's own zip name still holds a cataloged row; the plan skips that row.
+        let predicted = path_layout::zip_filename(
+            Some("M31"), Some("2025-10-12"), Some("2025-10-12"),
+            Some("RedCat 51"), Some("ASI2600MM"), FrameRole::Light,
+        );
+        let kept = arch_dir.path().join(&predicted);
+        std::fs::write(&kept, b"kept zip bytes").unwrap();
+        make_zip_resident(&conn, 1001, kept.to_str().unwrap(), "L_002.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Skip), bias: None, darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.conflicts.len(), 1, "the kept zip is a filename conflict");
+
+        let err = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&predicted) && msg.contains("cataloged"), "{msg}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept zip bytes", "the zip is untouched");
+        let ops: i64 = conn.query_row("SELECT COUNT(*) FROM archive_operations", [], |r| r.get(0)).unwrap();
+        assert_eq!(ops, 0, "nothing was written for the refused plan");
+
+        // A suffixed name does not touch it.
+        commit_plan(&conn, &plan, ConflictResolution::AddSuffix).unwrap();
     }
 
     /// A superseded dark set with two members; returns (conn, set id, the two file ids, dir).
