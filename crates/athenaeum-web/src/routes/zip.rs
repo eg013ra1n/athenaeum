@@ -117,6 +117,10 @@ pub struct EstimateZipExtractionArgs {
     pub frame_ids: Vec<i64>,
     #[serde(default)]
     pub frame_set_id: Option<i64>,
+    #[serde(default)]
+    pub export_mode: Option<athenaeum_core::export::models::ExportMode>,
+    #[serde(default)]
+    pub with_linked_masters: bool,
 }
 
 /// POST /api/estimate_zip_extraction
@@ -127,7 +131,14 @@ pub async fn estimate_zip_extraction(
 ) -> Result<Json<ExtractionEstimate>, (StatusCode, String)> {
     let ctx = state.ctx.clone();
     let estimate = tokio::task::spawn_blocking(move || {
-        api::estimate_zip_extraction(&ctx, &args.file_ids, &args.frame_ids, args.frame_set_id)
+        api::estimate_zip_extraction(
+            &ctx,
+            &args.file_ids,
+            &args.frame_ids,
+            args.frame_set_id,
+            args.export_mode,
+            args.with_linked_masters,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip extraction estimate task panicked: {}", e)))?

@@ -98,6 +98,8 @@ pub async fn estimate_zip_extraction(
     file_ids: Option<Vec<i64>>,
     frame_ids: Option<Vec<i64>>,
     frame_set_id: Option<i64>,
+    export_mode: Option<athenaeum_core::export::models::ExportMode>,
+    with_linked_masters: Option<bool>,
 ) -> Result<ExtractionEstimate, String> {
     let ctx = state.ctx.clone();
     tokio::task::spawn_blocking(move || {
@@ -106,6 +108,8 @@ pub async fn estimate_zip_extraction(
             &file_ids.unwrap_or_default(),
             &frame_ids.unwrap_or_default(),
             frame_set_id,
+            export_mode,
+            with_linked_masters.unwrap_or(false),
         )
     })
     .await

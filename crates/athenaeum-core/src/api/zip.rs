@@ -555,11 +555,18 @@ pub fn get_zip_cache_status(ctx: &ServiceContext) -> Result<crate::zip_store::ca
 /// cache yet, and their total size. The batch is named by file ids, by frame ids (the plate-solve queue
 /// holds those), and/or by a frame set (its lights plus the calibration frames it reaches, the files an
 /// export copies). Feeds the "From zip: N files, X GB" line of the batch dialogs.
+///
+/// `export_mode` narrows the frame-set part to what that export mode reads (lights, plus the raw
+/// originals or the masters, or nothing more): without it the set counts every calibration file it can
+/// reach. `with_linked_masters` adds the masters the named frames' calibration reads (a stacking run
+/// extracts those next to its lights).
 pub fn estimate_zip_extraction(
     ctx: &ServiceContext,
     file_ids: &[i64],
     frame_ids: &[i64],
     frame_set_id: Option<i64>,
+    export_mode: Option<crate::export::models::ExportMode>,
+    with_linked_masters: bool,
 ) -> Result<crate::zip_store::materialize::ExtractionEstimate, ApiError> {
     // Bind the cache and read the configured limit first, so "cached" means the same as at run time.
     zip_cache_ready(ctx)?;
@@ -574,7 +581,41 @@ pub fn estimate_zip_extraction(
             }
         }
         if let Some(id) = frame_set_id {
-            ids.extend(file_ids_of(&conn, UnpackTarget::FrameSet { id })?);
+            match export_mode {
+                None => ids.extend(file_ids_of(&conn, UnpackTarget::FrameSet { id })?),
+                Some(mode) => {
+                    let exists: Option<i64> = conn
+                        .query_row("SELECT id FROM frames_set WHERE id = ?1", params![id], |r| r.get(0))
+                        .optional()?;
+                    if exists.is_none() {
+                        return Err(ApiError::NotFound(format!("frame set {id} not found")));
+                    }
+                    let mode_frames = crate::export::data_collector::export_mode_frame_ids(&conn, id, mode)
+                        .map_err(|e| {
+                            tracing::error!(error = %format!("{e:#}"), frame_set_id = id, "export file list for the zip estimate failed");
+                            ApiError::Internal(format!("export file list: {e:#}"))
+                        })?;
+                    for frame_id in mode_frames {
+                        if let Some(file_id) = by_frame.query_row(params![frame_id], |r| r.get::<_, i64>(0)).optional()? {
+                            ids.push(file_id);
+                        }
+                    }
+                }
+            }
+        }
+        if with_linked_masters {
+            let mut by_path = conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+            for &frame_id in frame_ids {
+                let paths = crate::calibration_library::light_resolve::linked_master_paths(&conn, frame_id).map_err(|e| {
+                    tracing::error!(error = %format!("{e:#}"), frame_id, "linked masters for the zip estimate failed");
+                    ApiError::Internal(format!("linked masters: {e:#}"))
+                })?;
+                for path in paths {
+                    if let Some(file_id) = by_path.query_row(params![path], |r| r.get::<_, i64>(0)).optional()? {
+                        ids.push(file_id);
+                    }
+                }
+            }
         }
     }
     crate::zip_store::materialize::estimate_extraction(ctx, &ids).map_err(|e| {
@@ -1009,16 +1050,74 @@ mod tests {
             (rows.iter().map(|r| r.0).collect::<Vec<_>>(), rows.iter().map(|r| r.1).collect::<Vec<_>>())
         };
         let want = crate::zip_store::materialize::ExtractionEstimate { files: 2, bytes: 2 * size };
-        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &[], None).unwrap(), want);
-        assert_eq!(estimate_zip_extraction(&ctx, &[], &frame_ids, None).unwrap(), want);
-        assert_eq!(estimate_zip_extraction(&ctx, &[], &[], Some(1)).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &[], None, None, false).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &[], &frame_ids, None, None, false).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &[], &[], Some(1), None, false).unwrap(), want);
         // The same file named twice is counted once.
-        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &frame_ids, Some(1)).unwrap(), want);
+        assert_eq!(estimate_zip_extraction(&ctx, &file_ids, &frame_ids, Some(1), None, false).unwrap(), want);
         assert_eq!(
-            estimate_zip_extraction(&ctx, &[], &[], None).unwrap(),
+            estimate_zip_extraction(&ctx, &[], &[], None, None, false).unwrap(),
             crate::zip_store::materialize::ExtractionEstimate::default()
         );
-        assert!(matches!(estimate_zip_extraction(&ctx, &[], &[], Some(99)), Err(ApiError::NotFound(_))));
+        assert!(matches!(estimate_zip_extraction(&ctx, &[], &[], Some(99), None, false), Err(ApiError::NotFound(_))));
+    }
+
+    #[test]
+    fn estimate_counts_the_export_modes_files_and_the_masters_a_run_reads() {
+        let (_tmp, ctx, _zip) =
+            listing_fixture(&[("a.fits", light(1)), ("flat.fits", light(2)), ("dark.fits", light(3))]);
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        let size = light(1).len() as u64;
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        let frame_of = |name: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT fr.id, fi.id FROM frames fr JOIN files fi ON fi.id = fr.file_id WHERE fi.filename = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (light_frame, _) = frame_of("a.fits");
+        let (flat_frame, _) = frame_of("flat.fits");
+        let (dark_frame, _) = frame_of("dark.fits");
+        conn.execute("UPDATE frames SET imagetyp = 'Light' WHERE id = ?1", [light_frame]).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [light_frame]).unwrap();
+        // A master flat and a raw dark set, both linked to the light and both inside the zip.
+        conn.execute("UPDATE frames SET imagetyp = 'Flat', is_master = 1 WHERE id = ?1", [flat_frame]).unwrap();
+        conn.execute("UPDATE frames SET imagetyp = 'Dark' WHERE id = ?1", [dark_frame]).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (200, 'Flat', '2025-10-12', 1)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (100, 'Dark', '2025-10-12', 0)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (200, ?1)", [flat_frame]).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, ?1)", [dark_frame]).unwrap();
+        for (set, kind) in [(200, "Flat"), (100, "Dark")] {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                 VALUES (?1, 'frame', ?2, ?3, '2025-10-12T00:00:00Z')",
+                params![light_frame, set, kind],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        use crate::export::models::ExportMode;
+        let n = |files: u64| crate::zip_store::materialize::ExtractionEstimate { files, bytes: files * size };
+        let ask = |mode: Option<ExportMode>| estimate_zip_extraction(&ctx, &[], &[], Some(1), mode, false).unwrap();
+        assert_eq!(ask(None), n(3), "without a mode the set counts every calibration file it reaches");
+        assert_eq!(ask(Some(ExportMode::LightsOnly)), n(1));
+        assert_eq!(ask(Some(ExportMode::RawWithCalibrationSets)), n(3));
+        assert_eq!(ask(Some(ExportMode::RawWithMasters)), n(2), "the raw dark is not read in masters mode");
+        assert_eq!(ask(Some(ExportMode::CalibratedLights)), n(2));
+        // A stacking run extracts its lights and the masters their calibration reads.
+        let lights_only = estimate_zip_extraction(&ctx, &[], &[light_frame], None, None, false).unwrap();
+        assert_eq!(lights_only, n(1));
+        let with_masters = estimate_zip_extraction(&ctx, &[], &[light_frame], None, None, true).unwrap();
+        assert_eq!(with_masters, n(2), "the light and its master flat (the raw dark is not a master)");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import type { ExtractionEstimate } from '../types/archive';
+import type { ExportMode } from '../types/export';
 
 /** The batch whose zip extraction is estimated: file ids, frame ids and/or a whole frame set (its lights
  *  plus the calibration frames it reaches). */
@@ -8,6 +9,11 @@ export interface ZipExtractionScope {
   fileIds?: number[];
   frameIds?: number[];
   frameSetId?: number | null;
+  /** With `frameSetId`: count only what this export mode reads (lights, plus the raw calibration originals
+   *  or the masters, or nothing more). Without it the set counts every calibration file it can reach. */
+  exportMode?: ExportMode;
+  /** Also count the masters the named frames' calibration reads (a stacking run extracts them). */
+  withLinkedMasters?: boolean;
 }
 
 /** What `scope` would extract from zips (rows not in the cache yet), for the "From zip: N files, X GB" line
@@ -19,10 +25,12 @@ export function useZipExtractionEstimate(scope: ZipExtractionScope | null, refre
   const fileIds = scope?.fileIds;
   const frameIds = scope?.frameIds;
   const frameSetId = scope?.frameSetId ?? null;
+  const exportMode = scope?.exportMode ?? null;
+  const withLinkedMasters = scope?.withLinkedMasters ?? false;
   const empty = (fileIds?.length ?? 0) === 0 && (frameIds?.length ?? 0) === 0 && frameSetId == null;
   const key = useMemo(
-    () => JSON.stringify([fileIds ?? [], frameIds ?? [], frameSetId]),
-    [fileIds, frameIds, frameSetId],
+    () => JSON.stringify([fileIds ?? [], frameIds ?? [], frameSetId, exportMode, withLinkedMasters]),
+    [fileIds, frameIds, frameSetId, exportMode, withLinkedMasters],
   );
 
   useEffect(() => {
@@ -37,6 +45,8 @@ export function useZipExtractionEstimate(scope: ZipExtractionScope | null, refre
           fileIds: fileIds ?? [],
           frameIds: frameIds ?? [],
           frameSetId,
+          exportMode,
+          withLinkedMasters,
         })
         .then((e) => { if (!cancelled) setEstimate(e); })
         .catch((err) => {
@@ -45,7 +55,7 @@ export function useZipExtractionEstimate(scope: ZipExtractionScope | null, refre
         });
     }, 250);
     return () => { cancelled = true; window.clearTimeout(timer); };
-    // `key` stands for the three scope fields; listing them would re-run on every new array identity.
+    // `key` stands for the scope fields; listing them would re-run on every new array identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, empty, refreshKey]);
 

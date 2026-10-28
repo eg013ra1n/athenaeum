@@ -82,17 +82,20 @@ describe('UnpackZipDialog', () => {
     await act(async () => finish({ unpacked: 3, adopted: 0, conflicts: [] }));
   });
 
-  it('keys each run\'s notification on the run, so a second unpack is not swallowed', async () => {
-    for (let i = 0; i < 2; i++) {
-      const { unmount } = renderDialog();
-      // The same event every unpack ends with: operation 0, kind "unpack".
+  it('never passes a dedupe key, so notifications survive a restart that resets the run counter', async () => {
+    // NotificationContext persists seen dedupe keys; a key from a per-launch counter would be dropped after
+    // a restart. Two runs in two "launches" (module reloaded, counter back at 1) must both notify.
+    for (let launch = 0; launch < 2; launch++) {
+      vi.resetModules();
+      const fresh = await import('./UnpackZipDialog');
+      const { unmount } = render(
+        <fresh.UnpackZipDialog target={{ kind: 'frameSet', id: 5 }} frameCount={3} zipCount={1} defaultZipPath="/astro/M31 night.zip" onClose={vi.fn()} onDone={vi.fn()} />,
+      );
       fireEvent.click(screen.getByRole('button', { name: 'Unpack' }));
-      await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(i + 1));
+      await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(launch + 1));
       unmount();
     }
-    const keys = notifyMock.mock.calls.map((c) => c[0].dedupeKey);
-    expect(new Set(keys).size).toBe(2);
-    expect(keys.every((k: string) => k.startsWith('zip-unpack-'))).toBe(true);
+    for (const c of notifyMock.mock.calls) expect(c[0].dedupeKey).toBeUndefined();
   });
 
   it('notifies once for a run whose finished event and result both arrive', async () => {
@@ -111,6 +114,20 @@ describe('UnpackZipDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Unpack' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('outside the allowed folders');
     expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Unpack failed', hasErrors: true }));
+  });
+
+  it('notifies a failed run once, with the reason from the rejected call, not from the bare event', async () => {
+    let fail: (e: unknown) => void = () => {};
+    vi.mocked(api.invoke).mockImplementation((() => new Promise((_, rej) => { fail = rej; })) as never);
+    renderDialog();
+    fireEvent.click(screen.getByRole('button', { name: 'Unpack' }));
+    await screen.findByText('Starting…');
+    // The backend emits the event before the call rejects.
+    act(() => listeners.get('archive-finished')?.({ operation_id: 0, kind: 'unpack', outcome: 'failed' }));
+    expect(notifyMock).not.toHaveBeenCalled();
+    await act(async () => fail('database is locked'));
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock.mock.calls[0][0]).toMatchObject({ title: 'Unpack failed', detail: 'database is locked', hasErrors: true });
   });
 });
 

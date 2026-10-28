@@ -384,6 +384,19 @@ pub fn export_file_counts(conn: &Connection, data: &ExportData) -> Result<Export
     let mut raw_sets = data.clone();
     resolve_raw_calibration_sets(conn, &mut raw_sets)?;
     let raw_with_calibration_sets = compute_wbpp_placements(&raw_sets).len() as i64;
+    let masters_only = masters_only_data(conn, data)?;
+    let raw_with_masters = compute_wbpp_placements(&masters_only).len() as i64;
+    Ok(ExportFileCounts {
+        lights_only: lights,
+        raw_with_calibration_sets,
+        raw_with_masters,
+        calibrated_lights: lights,
+    })
+}
+
+/// A copy of `data` with the frames of every non-master calibration set emptied: what the masters modes
+/// place (the masters, and the lights).
+fn masters_only_data(conn: &Connection, data: &ExportData) -> Result<ExportData> {
     let mut masters_only = data.clone();
     for group in &mut masters_only.groups {
         for subgroup in &mut group.subgroups {
@@ -399,13 +412,34 @@ pub fn export_file_counts(conn: &Connection, data: &ExportData) -> Result<Export
             }
         }
     }
-    let raw_with_masters = compute_wbpp_placements(&masters_only).len() as i64;
-    Ok(ExportFileCounts {
-        lights_only: lights,
-        raw_with_calibration_sets,
-        raw_with_masters,
-        calibrated_lights: lights,
-    })
+    Ok(masters_only)
+}
+
+/// The frame ids `mode` reads from disk (or from a zip) for the frame set: the lights, plus the
+/// calibration frames the mode places. Lights only: none. Raw with calibration sets: the raw originals
+/// behind every built master. Raw with masters and calibrated lights: the master frames only. Feeds the
+/// zip extraction estimate of the Export tab, which must not count raw darks a masters-mode export never
+/// reads.
+pub fn export_mode_frame_ids(conn: &Connection, frame_set_id: i64, mode: ExportMode) -> Result<Vec<i64>> {
+    use crate::export::file_organizer::compute_wbpp_placements;
+    let mut data = collect_export_data(conn, frame_set_id)?;
+    let placed = match mode {
+        ExportMode::LightsOnly => {
+            drop_calibration_nodes(&mut data);
+            data
+        }
+        ExportMode::RawWithCalibrationSets => {
+            resolve_raw_calibration_sets(conn, &mut data)?;
+            data
+        }
+        ExportMode::RawWithMasters | ExportMode::CalibratedLights => masters_only_data(conn, &data)?,
+    };
+    let mut seen = HashSet::new();
+    Ok(compute_wbpp_placements(&placed)
+        .into_iter()
+        .map(|p| p.frame_id)
+        .filter(|id| seen.insert(*id))
+        .collect())
 }
 
 /// Count helper: empty the frames of every non-master set in one subtree.
@@ -2478,7 +2512,7 @@ mod tests {
 mod export_mode_tests {
     use super::{
         apply_export_mode, collect_export_data, collect_export_summary, export_file_counts,
-        raw_sets_without_master, resolve_export_mode,
+        export_mode_frame_ids, raw_sets_without_master, resolve_export_mode,
     };
     use crate::db::schema::init_db;
     use crate::export::models::{
@@ -2931,6 +2965,35 @@ mod export_mode_tests {
             apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters, None).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(serde_json::to_value(&data).unwrap(), before);
+    }
+
+    /// The zip estimate counts what the selected mode reads: no calibration file for lights-only, the raw
+    /// originals for the sets mode, the master frames for the masters modes.
+    #[test]
+    fn export_mode_frame_ids_follow_the_mode() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        add_link(&conn, 10, dark, "Dark");
+        add_link(&conn, 10, flat, "Flat");
+        let light = 10;
+        let raw_dark_frames = [100 * 100 + 6_000_000, 100 * 100 + 1 + 6_000_000];
+        let master_flat_frame = 200 + 4_000_000;
+        let ids = |mode| {
+            let mut v = export_mode_frame_ids(&conn, 1, mode).unwrap();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids(ExportMode::LightsOnly), vec![light]);
+        let mut with_sets = vec![light, raw_dark_frames[0], raw_dark_frames[1], master_flat_frame];
+        with_sets.sort_unstable();
+        assert_eq!(ids(ExportMode::RawWithCalibrationSets), with_sets);
+        // The masters modes read the master flat and never the raw darks (a raw set without a master is a
+        // separate readiness blocker, not a file this mode reads).
+        assert_eq!(ids(ExportMode::RawWithMasters), vec![light, master_flat_frame]);
+        assert_eq!(ids(ExportMode::CalibratedLights), vec![light, master_flat_frame]);
     }
 
     /// Names of every node of one kind in a folder preview, depth-first.

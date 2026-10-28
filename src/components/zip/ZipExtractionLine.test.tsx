@@ -18,14 +18,24 @@ describe('ZipExtractionLine', () => {
     estimate(120, 6.2e9);
     render(<ZipExtractionLine scope={{ frameIds: [1, 2, 3] }} />);
     expect(await screen.findByTestId('zip-extraction-line')).toHaveTextContent('From zip: 120 files, 6.2 GB');
-    expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [1, 2, 3], frameSetId: null });
+    expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [1, 2, 3], frameSetId: null, exportMode: null, withLinkedMasters: false });
   });
 
   it('names a whole frame set by its id', async () => {
     estimate(2, 2e8);
     render(<ZipExtractionLine scope={{ frameSetId: 5 }} />);
     await screen.findByTestId('zip-extraction-line');
-    expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [], frameSetId: 5 });
+    expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [], frameSetId: 5, exportMode: null, withLinkedMasters: false });
+  });
+
+  it('narrows a frame set to the export mode and adds linked masters when asked', async () => {
+    estimate(1, 1e8);
+    render(<ZipExtractionLine scope={{ frameSetId: 5, exportMode: 'rawWithMasters' }} />);
+    await screen.findByTestId('zip-extraction-line');
+    expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [], frameSetId: 5, exportMode: 'rawWithMasters', withLinkedMasters: false });
+    vi.mocked(api.invoke).mockClear();
+    render(<ZipExtractionLine scope={{ frameIds: [7], withLinkedMasters: true }} />);
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('estimate_zip_extraction', { fileIds: [], frameIds: [7], frameSetId: null, exportMode: null, withLinkedMasters: true }));
   });
 
   it('shows nothing when no frame needs extracting, and does not ask for an empty batch', async () => {

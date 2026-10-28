@@ -856,7 +856,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               {useSymlinks && symlinksAvailable && (
                 <p className="-mt-2 text-xs text-content-muted">{ZIP_COPIED_NOT_LINKED}</p>
               )}
-              <ZipExtractionLine scope={{ frameSetId }} refreshKey={exporting ? 1 : 0} />
+              <ZipExtractionLine scope={{ frameSetId, exportMode }} refreshKey={exporting ? 1 : 0} />
 
               {/* WBPP setup guide — collapsible because most users only
                   need it once, but the summary is right there. */}

@@ -24,9 +24,9 @@ interface FinishedPayload {
   conflicts?: number;
 }
 
-/** One id per Unpack click. Every unpack finishes with `archive-finished {operation_id: 0, kind: "unpack"}`,
- *  so the notification is keyed on the click, never on the operation id (which would swallow all but the
- *  first unpack ever made). */
+/** One id per Unpack click, used only to notify once per run (`notifiedRef`). It is never a `dedupeKey`:
+ *  NotificationContext persists seen keys across launches, and this counter restarts at 1 on every launch,
+ *  so a key built from it would swallow the notifications of every unpack after a restart. */
 let unpackRunCounter = 0;
 
 /**
@@ -68,7 +68,6 @@ export function UnpackZipDialog({ target, frameCount, zipCount, defaultZipPath, 
       kind: 'archive',
       tone,
       hasErrors,
-      dedupeKey: `zip-unpack-${run}`,
     });
   }, []);
 
@@ -87,12 +86,13 @@ export function UnpackZipDialog({ target, frameCount, zipCount, defaultZipPath, 
       const run = runRef.current;
       if (run == null) return;
       const counts = { unpacked: p.unpacked ?? 0, adopted: p.adopted ?? 0, conflicts: p.conflicts ?? 0 };
-      const failed = p.outcome === 'failed';
+      // A failed run carries no reason in the event; the rejected invoke notifies with the reason.
+      if (p.outcome === 'failed') return;
       notifyOnce(
         run,
         unpackSummary(counts, p.outcome),
-        failed ? 'warning' : counts.conflicts > 0 ? 'warning' : 'success',
-        failed,
+        counts.conflicts > 0 ? 'warning' : 'success',
+        false,
       );
     })
       .then((fn) => { if (cancelled) fn(); else unlistenFinished = fn; })

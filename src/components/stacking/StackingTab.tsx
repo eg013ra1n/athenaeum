@@ -337,11 +337,11 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     void refetchPlan(draftConfigRef.current ?? undefined);
   }, [lastOutcomeRunId, refetchPlan]);
 
-  // The lights the plan includes: what a run would extract from zips before it can read them. Masters
-  // are not counted (they are read once, whole).
+  // The lights the plan includes, and the masters their calibration reads: what a run would extract from
+  // zips before it can read them.
   const zipScope = useMemo(() => {
     const excluded = new Set(excludedFrameIds);
-    return { frameIds: lightFrames.map((f) => f.frameId).filter((id) => !excluded.has(id)) };
+    return { frameIds: lightFrames.map((f) => f.frameId).filter((id) => !excluded.has(id)), withLinkedMasters: true };
   }, [lightFrames, excludedFrameIds]);
 
   // The most recent user-originated write still waiting to go out — set by
