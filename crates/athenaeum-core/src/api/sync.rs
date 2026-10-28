@@ -3467,6 +3467,8 @@ pub(crate) fn plan_selection_package(
         }
         // A calibrated light generated at send time reads its masters; one inside a zip is not read by a
         // send (v1). Say so now, naming the master, instead of failing the whole package at prepare.
+        // Generation needs the render pipeline, so a build without it has no calibrated light to hold.
+        #[cfg(feature = "render")]
         if entry.generate {
             match crate::calibration_library::light_resolve::zip_resident_inputs(conn, entry.frame_id) {
                 Ok(inside) if inside.is_empty() => {}

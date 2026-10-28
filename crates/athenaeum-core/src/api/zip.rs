@@ -603,6 +603,10 @@ pub fn estimate_zip_extraction(
                 }
             }
         }
+        // Linked masters are resolved by the render-gated light resolver; a build without it stacks nothing.
+        #[cfg(not(feature = "render"))]
+        let _ = with_linked_masters;
+        #[cfg(feature = "render")]
         if with_linked_masters {
             let mut by_path = conn.prepare("SELECT id FROM files WHERE path = ?1")?;
             for &frame_id in frame_ids {

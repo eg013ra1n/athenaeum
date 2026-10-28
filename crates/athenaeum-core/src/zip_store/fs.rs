@@ -32,8 +32,25 @@ fn classify_sync(result: io::Result<()>, path: &Path) -> io::Result<()> {
 }
 
 /// `file.sync_all()` that tolerates file systems without fsync (network shares). `path` is for the log only.
+///
+/// On macOS `sync_all` issues `F_FULLFSYNC`, which an SMB mount refuses with `ENOTSUP` while a plain
+/// `fsync(2)` still flushes to the server, so the plain call is tried before the sync is given up.
 pub(crate) fn sync_best_effort(file: &File, path: &Path) -> io::Result<()> {
-    classify_sync(file.sync_all(), path)
+    let result = file.sync_all();
+    #[cfg(target_os = "macos")]
+    let result = match result {
+        Err(e) if fsync_unsupported(&e) => {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor belongs to `file`, which outlives the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        other => other,
+    };
+    classify_sync(result, path)
 }
 
 #[cfg(test)]
