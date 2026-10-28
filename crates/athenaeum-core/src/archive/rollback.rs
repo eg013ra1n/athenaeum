@@ -73,6 +73,12 @@ pub fn rollback_operation(
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
     let op = adb::get_operation(conn, operation_id)?;
+    // A finished operation has no staging left to restore from: rolling it back would delete its zip
+    // and unmark its rows while the sources are gone. Unarchive is the way back.
+    if op.status == ArchiveStatus::Completed.as_str() {
+        tracing::error!(operation_id, "rollback of a completed operation refused");
+        anyhow::bail!("a completed operation cannot be rolled back; use Unarchive");
+    }
     let archive_root = PathBuf::from(&op.archive_root_path);
     let files = adb::list_operation_files(conn, operation_id)?;
 
@@ -126,35 +132,39 @@ pub fn rollback_operation(
         adb::update_step(conn, sid, StepStatus::Done, None, None)?;
     }
 
-    // 2. Delete any zip files produced by this operation (whether partially or fully written).
+    // 2. Delete the zip files this operation wrote (whether partially or fully written).
+    //
+    // Provenance is the step log: `zip_phase` records a ZipAdd step for every file of a zip before it
+    // opens the zip for writing, and refuses a protected target before recording any. So a zip with no
+    // ZipAdd step of this operation is not ours (a pre-existing zip the user chose to overwrite and the
+    // operation never reached, or one a refusal protected) and stays exactly as it was. What the
+    // catalog says about the path is no part of the test: stale rows may point at a zip we did write.
+    let zip_written = file_ids_with_step(conn, operation_id, ArchiveStage::ZipAdd)?;
     let mut seen_zips: HashSet<String> = HashSet::new();
     for f in &files {
-        if seen_zips.insert(f.target_zip_path.clone()) {
-            let zp = Path::new(&f.target_zip_path);
-            // A zip that other catalog rows live in is not this operation's partial output: it was
-            // there before (a plan that is refused for exactly that reason ends up here), and removing
-            // it would take those frames' only copy.
-            let others: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM files
-                 WHERE archive_zip_path = ?1 AND (archived_in_operation IS NULL OR archived_in_operation != ?2)",
-                rusqlite::params![f.target_zip_path, operation_id],
-                |r| r.get(0),
-            )?;
-            if others > 0 {
-                tracing::warn!(operation_id, path = %zp.display(), cataloged_frames = others, "zip holds other cataloged frames; left in place during rollback");
-                continue;
-            }
+        if !seen_zips.insert(f.target_zip_path.clone()) {
+            continue;
+        }
+        let wrote_it = files
+            .iter()
+            .any(|g| g.target_zip_path == f.target_zip_path && zip_written.contains(&g.id));
+        let zp = Path::new(&f.target_zip_path);
+        if !wrote_it {
             if zp.exists() {
-                // Best-effort by design — a locked zip (Windows sharing
-                // violation) must not fail the rollback — but never silent.
-                if let Err(e) = std::fs::remove_file(zp) {
-                    tracing::warn!(
-                        operation_id,
-                        path = %zp.display(),
-                        error = %e,
-                        "failed to remove partial zip during rollback"
-                    );
-                }
+                tracing::warn!(operation_id, path = %zp.display(), "zip was not written by this operation; left in place during rollback");
+            }
+            continue;
+        }
+        if zp.exists() {
+            // Best-effort by design — a locked zip (Windows sharing
+            // violation) must not fail the rollback — but never silent.
+            if let Err(e) = std::fs::remove_file(zp) {
+                tracing::warn!(
+                    operation_id,
+                    path = %zp.display(),
+                    error = %e,
+                    "failed to remove partial zip during rollback"
+                );
             }
         }
     }
@@ -186,12 +196,26 @@ fn file_ids_with_done_step(
     operation_id: i64,
     stage: ArchiveStage,
 ) -> Result<HashSet<i64>> {
-    let mut stmt = conn.prepare(
+    file_ids_with_step_where(conn, operation_id, stage, "AND status = 'done'")
+}
+
+/// Files with a step of `stage` in any status.
+fn file_ids_with_step(conn: &Connection, operation_id: i64, stage: ArchiveStage) -> Result<HashSet<i64>> {
+    file_ids_with_step_where(conn, operation_id, stage, "")
+}
+
+fn file_ids_with_step_where(
+    conn: &Connection,
+    operation_id: i64,
+    stage: ArchiveStage,
+    extra: &str,
+) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT operation_file_id
          FROM archive_operation_steps
-         WHERE operation_id = ?1 AND stage = ?2 AND status = 'done'
+         WHERE operation_id = ?1 AND stage = ?2 {extra}
            AND operation_file_id IS NOT NULL",
-    )?;
+    ))?;
     let rows: Vec<i64> = stmt
         .query_map(rusqlite::params![operation_id, stage.as_str()], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -456,5 +480,55 @@ mod tests {
         // Staging dir gone
         let staging_dir = crate::archive::staging::staging_dir(arch.path(), op_id);
         assert!(!staging_dir.exists());
+    }
+
+    fn target_zip(conn: &Connection, op_id: i64) -> String {
+        adb::list_operation_files(conn, op_id).unwrap()[0].target_zip_path.clone()
+    }
+
+    #[test]
+    fn rollback_leaves_a_pre_existing_zip_the_operation_never_reached() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        // Overwrite of a zip no row points at; the operation is cancelled before the zip stage.
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"pre-existing zip bytes").unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let _ = run_operation(&conn, op_id, &cancel, &NullEmitter);
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert_eq!(std::fs::read(&zip).unwrap(), b"pre-existing zip bytes", "a cancel leaves things as they were");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn rollback_removes_the_zip_it_wrote_even_when_stale_rows_point_at_the_path() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        // Stale rows of an earlier zip at this path (the file was missing when the plan was checked).
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (900, ?1, 'X.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?2, 'X.fits')",
+            params![format!("{zip}!/X.fits"), zip],
+        ).unwrap();
+        // The operation then wrote the zip (a ZipAdd step exists, still in progress) and failed verifying it.
+        std::fs::write(&zip, b"partial zip").unwrap();
+        let first = adb::list_operation_files(&conn, op_id).unwrap()[0].id;
+        let sid = adb::insert_step(&conn, op_id, Some(first), ArchiveStage::ZipAdd).unwrap();
+        adb::update_step(&conn, sid, StepStatus::InProgress, None, None).unwrap();
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&zip).exists(), "the unverified zip this operation wrote is removed");
+    }
+
+    #[test]
+    fn rollback_of_a_completed_operation_is_refused() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        adb::update_operation_status(&conn, op_id, ArchiveStatus::Completed, None).unwrap();
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"finished zip").unwrap();
+        let err = rollback_operation(&conn, op_id, &NullEmitter).unwrap_err();
+        assert!(format!("{err:#}").contains("use Unarchive"), "{err:#}");
+        assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "completed");
+        assert_eq!(std::fs::read(&zip).unwrap(), b"finished zip");
     }
 }

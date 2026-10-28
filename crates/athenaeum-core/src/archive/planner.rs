@@ -598,10 +598,17 @@ pub fn commit_plan(
 /// truncate it. Names the zip so the owner can pick another archive folder or unarchive those frames.
 pub(crate) fn ensure_zip_holds_no_cataloged_frames(conn: &Connection, zip_path: &str) -> Result<()> {
     // A zip that is not on disk has nothing to truncate; rows pointing at it are missing frames, not a loss.
-    if !Path::new(zip_path).exists() {
+    let target = Path::new(zip_path);
+    if !target.exists() {
         return Ok(());
     }
-    let rows: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1", [zip_path], |r| r.get(0))?;
+    let mut rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1", [zip_path], |r| r.get(0))?;
+    if rows == 0 {
+        // The rows may name this very file under another spelling (a different case on a case-insensitive
+        // volume, a symlinked parent, a typed path): look at the cataloged zips with the same file name.
+        rows = rows_of_the_same_file(conn, target, zip_path)?;
+    }
     if rows > 0 {
         tracing::error!(zip_path, cataloged_frames = rows, "archive target zip holds cataloged frames; refused");
         anyhow::bail!(
@@ -609,6 +616,66 @@ pub(crate) fn ensure_zip_holds_no_cataloged_frames(conn: &Connection, zip_path: 
         );
     }
     Ok(())
+}
+
+/// Catalog rows inside zips that are the same file as `target` although their stored path differs.
+/// Only zips whose file name equals the target's (case-insensitively) are stat-ed; stored paths are not
+/// canonicalized.
+fn rows_of_the_same_file(conn: &Connection, target: &Path, target_str: &str) -> Result<i64> {
+    let Some(name) = target.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
+        return Ok(0);
+    };
+    let Some(identity) = file_identity(target) else {
+        return Ok(0);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT archive_zip_path, COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL GROUP BY archive_zip_path",
+    )?;
+    let candidates = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut total = 0;
+    for (stored, count) in candidates {
+        let stored_path = Path::new(&stored);
+        if stored == target_str
+            || stored_path.file_name().map(|n| n.to_string_lossy().to_lowercase()).as_deref() != Some(name.as_str())
+        {
+            continue;
+        }
+        if file_identity(stored_path) == Some(identity) {
+            total += count;
+        }
+    }
+    Ok(total)
+}
+
+/// What names one file on disk: device and inode (unix), volume serial and file index (windows).
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: `info` is a plain-data out-parameter and the handle stays open for the call.
+    let info = unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) == 0 {
+            return None;
+        }
+        info
+    };
+    Some((u64::from(info.dwVolumeSerialNumber), (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 // --- helpers ---
@@ -1460,6 +1527,32 @@ mod tests {
 
         // A suffixed name does not touch it.
         commit_plan(&conn, &plan, ConflictResolution::AddSuffix).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_refuses_a_zip_that_holds_cataloged_frames_under_another_spelling() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        let predicted = path_layout::zip_filename(
+            Some("M31"), Some("2025-10-12"), Some("2025-10-12"),
+            Some("RedCat 51"), Some("ASI2600MM"), FrameRole::Light,
+        );
+        let kept = arch_dir.path().join(&predicted);
+        std::fs::write(&kept, b"kept zip bytes").unwrap();
+        // The row names the zip through a symlinked parent; the plan's spelling is the real directory.
+        let alias_holder = tempfile::tempdir().unwrap();
+        let alias = alias_holder.path().join("archive-link");
+        std::os::unix::fs::symlink(arch_dir.path(), &alias).unwrap();
+        let aliased = alias.join(&predicted);
+        make_zip_resident(&conn, 1001, aliased.to_str().unwrap(), "L_002.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Skip), bias: None, darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+
+        let msg = format!("{:#}", commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap_err());
+        assert!(msg.contains("cataloged"), "{msg}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept zip bytes");
     }
 
     /// A superseded dark set with two members; returns (conn, set id, the two file ids, dir).

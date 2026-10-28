@@ -941,7 +941,12 @@ mod tests {
         let files_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
 
         conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
-        let outcome = crate::zip_store::scan::scan_zip(&conn, Path::new(&zips[0].0), 1, false).unwrap();
+        // The entries that stay out of the catalog are said once, as a warn, for the changed zip.
+        let (outcome, warns) = crate::calibration::geometry::test_support::count_warns(
+            crate::zip_store::scan::OPERATION_ENTRIES_SKIPPED,
+            || crate::zip_store::scan::scan_zip(&conn, Path::new(&zips[0].0), 1, false).unwrap(),
+        );
+        assert_eq!(warns, 1, "one warn per zip, not one per entry");
         assert!(!outcome.skipped_unchanged);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.files_inserted, 0, "the copies do not become foreign rows");
@@ -952,6 +957,8 @@ mod tests {
         assert_eq!(after[0].4, Some(op_id));
     }
 
+    // Names with `:`, a trailing space or a device name cannot exist as directories on a Windows disk.
+    #[cfg(unix)]
     #[test]
     fn entries_with_colon_trailing_space_or_device_names_get_their_crc_and_a_rescan_inserts_nothing() {
         let (conn, _arch, _scan, op_id) =

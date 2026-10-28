@@ -487,6 +487,10 @@ fn insert_entry(conn: &Connection, zip_str: &str, entry: &ZipEntryInfo, parsed: 
     Ok(EntryOutcome::Inserted { frame_id, imagetyp: frame.imagetyp.clone() })
 }
 
+/// The warn logged once per changed zip whose rowless entries were taken for its operation's own copies.
+pub(crate) const OPERATION_ENTRIES_SKIPPED: &str =
+    "entries without a row in a changed zip taken for its operation's own copies; not cataloged";
+
 /// Running totals of one [`scan_zip`].
 struct Tally {
     outcome: ZipScanOutcome,
@@ -654,6 +658,7 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     };
 
     let mut to_read: Vec<(&ZipEntryInfo, Option<i64>)> = Vec::new();
+    let mut skipped_as_operation_entries = 0usize;
     for entry in listing.entries.iter().filter(|e| e.is_frame) {
         if released.contains(&entry.path) {
             continue;
@@ -662,11 +667,23 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             Some((id, Some(crc))) if *crc != i64::from(entry.crc32) => to_read.push((entry, Some(*id))),
             Some(_) => tally.cataloged += 1,
             None if written_by_operation.contains(&entry.path) => {
-                tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "entry written by the zip's own operation has no row; not cataloged");
+                skipped_as_operation_entries += 1;
                 tally.cataloged += 1;
             }
             None => to_read.push((entry, None)),
         }
+    }
+    if skipped_as_operation_entries > 0 {
+        // The zip's stat changed (it was not skipped as unchanged above) and entries with no row were
+        // taken for the operation's own Copy entries. If the user swapped our zip for another of the same
+        // name, those entries are real frames that stay out of the catalog; say so once per zip.
+        tracing::warn!(
+            root_id,
+            zip_path = %zip.display(),
+            skipped = skipped_as_operation_entries,
+            "{}",
+            OPERATION_ENTRIES_SKIPPED
+        );
     }
 
     // The safety filter keeps NEW entries out of the catalog, but an entry a row already owns is known
