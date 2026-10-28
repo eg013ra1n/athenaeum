@@ -72,6 +72,49 @@ pub fn row_is_present(
     }
 }
 
+/// [`row_is_present`] for a consumer that holds only a catalog path (a resolved master, a landed path):
+/// looks the path's `files` row up for its zip markers. A path with no row, or a disk row, is present
+/// when the file exists.
+pub fn catalog_path_is_present(conn: &rusqlite::Connection, presence: &mut ZipPresence, path: &str) -> bool {
+    let markers: Option<(Option<String>, Option<String>)> = match conn
+        .query_row(
+            "SELECT archive_zip_path, archive_path_in_zip FROM files WHERE path = ?1",
+            [path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        }) {
+        Ok(m) => m,
+        Err(e) => {
+            // Never swallow: a failed lookup falls back to the disk rule, and says so.
+            tracing::warn!(path, error = %e, "zip presence: cannot read the file row; checking the disk");
+            None
+        }
+    };
+    let (zip, entry) = markers.unwrap_or((None, None));
+    row_is_present(presence, path, zip.as_deref(), entry.as_deref())
+}
+
+/// `true` when `path` is the catalog path of a zip-resident row (both zip markers set). A plan gate uses
+/// it to leave such a file unprobed: probing needs the bytes, and a gate extracts nothing.
+pub fn is_zip_resident_path(conn: &rusqlite::Connection, path: &str) -> bool {
+    match conn.query_row(
+        "SELECT 1 FROM files WHERE path = ?1 AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL",
+        [path],
+        |_| Ok(()),
+    ) {
+        Ok(()) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "zip presence: cannot read the file row; treating it as a disk file");
+            false
+        }
+    }
+}
+
 /// One row to check: `(path, archive_zip_path, archive_path_in_zip)`.
 pub type PresenceKey<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
 

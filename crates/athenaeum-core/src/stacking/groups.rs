@@ -768,6 +768,7 @@ pub(crate) fn group_frames_with(
     for m in members {
         let token: &'static str = match attested_debayer_osc {
             Some(debayer_osc) => crate::stacking::project_source::attested_color_token(
+                conn,
                 frames_set_id,
                 m.frame_id,
                 color_mode_of(&m.bayerpat) == ColorMode::Osc,

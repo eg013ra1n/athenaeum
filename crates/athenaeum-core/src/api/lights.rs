@@ -557,10 +557,20 @@ pub(crate) fn readiness_from_data(
     // Owned (not borrowed from `master_paths`) because Plan 5b Task 8b's
     // transitive pass below adds entries the light-link pass above never
     // saw; `BTreeMap` keeps the same distinct-by-path dedup discipline.
+    //
+    // A master is missing only when its bytes are reachable nowhere: not on
+    // disk and, for a zip-resident row, not listed by its zip
+    // (`catalog_path_is_present`, the one presence rule). The blockers built
+    // from this list therefore never fire for a master a stack can extract.
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
     let mut missing_masters: BTreeMap<PathBuf, i64> = BTreeMap::new();
     for (path, &master_set_id) in &master_paths {
-        if std::fs::metadata(path).is_err() {
-            tracing::warn!(path = %path.display(), "master file missing on disk");
+        if !crate::zip_store::presence::catalog_path_is_present(
+            conn,
+            &mut presence,
+            &path.to_string_lossy(),
+        ) {
+            tracing::warn!(path = %path.display(), "master file missing on disk and in zip files");
             missing_masters.insert(path.clone(), master_set_id);
         }
     }
@@ -595,7 +605,7 @@ pub(crate) fn readiness_from_data(
         // call; the rebuildability loop right below already degrades this
         // way, so this pass must too. Degrade to a warning and move on — the
         // flat itself stays the only listed missing master.
-        match precal_master_for_missing_flat(conn, master_set_id) {
+        match precal_master_for_missing_flat(conn, &mut presence, master_set_id) {
             Ok(Some((precal_path, precal_set_id))) => {
                 if !missing_masters.contains_key(&precal_path) {
                     tracing::warn!(
@@ -1031,28 +1041,43 @@ fn classify_raw_set_buildability(
         )));
     }
 
+    // A member is present on disk or, as a zip-resident row, in its zip
+    // (`row_is_present`): a stack extracts those. The "archived — restore
+    // first" answer therefore means the bytes are reachable nowhere.
     let mut stmt = conn.prepare(
-        "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
+        "SELECT fi.path, fi.archived_in_operation, fi.archive_zip_path, fi.archive_path_in_zip
+         FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE csf.set_id = ?1",
     )?;
-    let rows: Vec<(String, Option<i64>)> = stmt
-        .query_map([raw_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    type Member = (String, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Member> = stmt
+        .query_map([raw_set_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let total = rows.len();
-    let missing: Vec<&(String, Option<i64>)> = rows
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    let missing: Vec<&Member> = rows
         .iter()
-        .filter(|(p, _)| !std::path::Path::new(p).exists())
+        .filter(|(p, _, zip, entry)| {
+            !crate::zip_store::presence::row_is_present(
+                &mut presence,
+                p,
+                zip.as_deref(),
+                entry.as_deref(),
+            )
+        })
         .collect();
     if missing.is_empty() {
         return Ok(None);
     }
-    if missing.iter().any(|(_, archived)| archived.is_some()) {
+    if missing.iter().any(|(_, archived, _, _)| archived.is_some()) {
         return Ok(Some("archived — restore first".to_string()));
     }
     Ok(Some(format!(
-        "{} of {total} raw frames missing on disk",
+        "{} of {total} raw frames missing on disk and in zip files",
         missing.len()
     )))
 }
@@ -1097,6 +1122,7 @@ fn classify_master_rebuildability(
 /// caller's to degrade, never propagated further.
 fn precal_master_for_missing_flat(
     conn: &Connection,
+    presence: &mut crate::zip_store::presence::ZipPresence,
     master_set_id: i64,
 ) -> Result<Option<(PathBuf, i64)>, ApiError> {
     let imagetyp: String = conn.query_row(
@@ -1131,7 +1157,11 @@ fn precal_master_for_missing_flat(
         return Ok(None);
     };
     let precal_path = PathBuf::from(precal_path);
-    if std::fs::metadata(&precal_path).is_err() {
+    if !crate::zip_store::presence::catalog_path_is_present(
+        conn,
+        presence,
+        &precal_path.to_string_lossy(),
+    ) {
         Ok(Some((precal_path, precal_set_id)))
     } else {
         Ok(None)
@@ -2300,6 +2330,44 @@ mod tests {
             r.raw_sets_unbuildable[0].1.contains("1 of 3"),
             "{:?}",
             r.raw_sets_unbuildable
+        );
+    }
+
+    /// A raw set whose members sit inside a zip is buildable while the zip lists them (a
+    /// build extracts them); once the zip is gone the same set is unbuildable, and the
+    /// reason names both places the frames were looked for.
+    #[test]
+    fn raw_set_buildability_counts_zip_resident_members_as_present() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
+        )
+        .unwrap();
+        let raw = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
+        add_link(&conn, 1, raw, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        let file_ids: Vec<i64> = (0..3).map(|i| 300 * 100 + i + 7_000_000).collect();
+        let zip = tmp.path().join("darks.zip");
+        zip_files(&conn, &file_ids, &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.raw_sets_buildable, vec![raw], "{:?}", r.raw_sets_unbuildable);
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(r.raw_sets_buildable.is_empty());
+        assert_eq!(
+            r.raw_sets_unbuildable,
+            vec![(raw, "3 of 3 raw frames missing on disk and in zip files".to_string())]
         );
     }
 

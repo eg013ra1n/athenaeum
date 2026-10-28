@@ -357,6 +357,32 @@ fn master_identity(path: &Path) -> String {
     }
 }
 
+/// [`master_identity`] for a catalog master that may live inside a zip: such a row has no file to stat
+/// at its catalog path, so its identity is the entry's cataloged size plus its CRC32 (the entry's
+/// modified time when no CRC32 was recorded yet). A master that changes inside a rewritten zip changes
+/// the stage-1 hash, like a rewritten disk file does. Any other path is [`master_identity`].
+fn master_identity_in(conn: &Connection, path: &Path) -> String {
+    let row: rusqlite::Result<Option<(i64, Option<i64>, String)>> = conn
+        .query_row(
+            "SELECT size, archive_entry_crc32, modified_at FROM files
+             WHERE path = ?1 AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL",
+            [path.to_string_lossy().as_ref()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional();
+    match row {
+        Ok(Some((size, crc, modified_at))) => {
+            let token = crc.map_or_else(|| modified_at, |c| format!("{:08x}", c as u32));
+            format!("{}|{size}|zip:{token}", path.display())
+        }
+        Ok(None) => master_identity(path),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "stacking: master zip markers unreadable while hashing stage 1");
+            master_identity(path)
+        }
+    }
+}
+
 /// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
 /// Prepare subtree and the light's own `files` identity, with no master
 /// upstream, because an attested light is never calibrated.
@@ -431,7 +457,10 @@ pub(crate) fn calibration_hash_for(
     specs.insert(frame.frame_id, spec);
     let master_paths = resolved_master_paths(&specs);
 
-    let upstream: Vec<String> = master_paths.iter().map(|p| master_identity(p)).collect();
+    let upstream: Vec<String> = master_paths
+        .iter()
+        .map(|p| master_identity_in(conn, p))
+        .collect();
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
 
     let sources = [SourceIdentity {
@@ -1410,7 +1439,12 @@ fn resolve_reference(
         return Ok(no_reference_chosen(blockers));
     };
 
-    let on_disk = std::fs::metadata(&path).is_ok();
+    // Reachable = on disk, or listed by the zip a zip-resident row lives in.
+    let on_disk = crate::zip_store::presence::catalog_path_is_present(
+        conn,
+        &mut crate::zip_store::presence::ZipPresence::new(),
+        &path,
+    );
     if !on_disk {
         blockers.push(PlanBlocker {
             code: "reference".to_string(),
@@ -2224,16 +2258,19 @@ fn frame_set_inputs(
         if !readiness.masters_unrebuildable.is_empty() {
             let n = readiness.masters_unrebuildable.len();
             // Every unrebuildable reason is archival ("archived — restore
-            // first") -> the export gate's own C-2 sentence; a mix (or a
+            // first") -> one sentence for the lot; a mix (or a
             // "no provenance"/missing-not-archived reason) names the first
             // reason instead, since "restore from archive" would be actively
-            // wrong advice for those.
+            // wrong advice for those. A master (or a source frame) inside a
+            // zip is not missing while its zip lists it: the readiness split
+            // only reports files reachable nowhere, so the sentence says both
+            // places it looked.
             let all_archival = readiness
                 .masters_unrebuildable
                 .iter()
                 .all(|(_, reason)| reason.contains("archived"));
             let message = if all_archival {
-                format!("{n} master file(s) missing on disk — restore from archive first")
+                format!("{n} master file(s) missing on disk and in zip files")
             } else {
                 format!(
                     "{n} master file(s) missing on disk and cannot be rebuilt: {}",
@@ -2319,6 +2356,13 @@ fn project_inputs(
             .iter()
             .filter(|f| !excluded_set.contains(&f.frame_id))
         {
+            // The gate reads headers and extracts nothing: a zip-resident landed file
+            // (an own frame kept in a zip) is probed by the run after it is extracted,
+            // where an unreadable one is excluded "unsupported file" like any other.
+            if crate::zip_store::presence::is_zip_resident_path(conn, &f.path) {
+                tracing::debug!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, "project frame is inside a zip; probed by the run");
+                continue;
+            }
             let shape = probe_file(Path::new(&f.path));
             match prepare_action(&shape, cfg.calibration.debayer_osc) {
                 PrepareAction::Unsupported(why) => {
@@ -5845,6 +5889,185 @@ mod tests {
             .find(|b| b.code == "masterFiles")
             .expect("masterFiles blocker");
         assert!(blocker.message.contains("no provenance"), "{:?}", blocker);
+    }
+
+    /// The file row behind a master `calibration_set`.
+    fn master_file_id(conn: &Connection, master_set_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT fi.id FROM calibration_set_frames csf
+             JOIN frames fr ON fr.id = csf.frame_id
+             JOIN files fi ON fi.id = fr.file_id
+             WHERE csf.set_id = ?1",
+            [master_set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Masters kept inside a zip are not missing while the zip lists them: no
+    /// `masterFiles` / `masters` blocker, nothing to rebuild, and the stage-1 hash
+    /// follows the entry (its CRC32), not a constant "missing" token.
+    #[test]
+    fn stacking_plan_has_no_master_blocker_when_masters_are_zip_resident() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let settings = SettingsManager::new();
+        let plan_of = || {
+            build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                None,
+            )
+            .unwrap()
+        };
+        let master_ids = [
+            master_file_id(&f.conn, dark_set),
+            master_file_id(&f.conn, flat_set),
+        ];
+        zip_files(
+            &f.conn,
+            &master_ids,
+            &f.dir.path().join("masters.zip"),
+            Shape::Foreign,
+        );
+
+        let plan = plan_of();
+        for code in ["masterFiles", "masters", "links"] {
+            assert!(
+                !plan.blockers.iter().any(|b| b.code == code),
+                "{code} must not block a zip-resident master: {:?}",
+                plan.blockers
+            );
+        }
+        assert!(
+            plan.masters_to_build.is_empty(),
+            "a master the zip lists is not rebuilt: {:?}",
+            plan.masters_to_build
+        );
+        assert_eq!(plan.readiness.missing_master_files, 0);
+        assert!(plan.readiness.masters_unrebuildable.is_empty());
+        // The zip row's identity is its entry's and moves with the entry's CRC32 (a master
+        // rewritten inside its zip is a changed master, not a constant "missing" token).
+        let before = master_identity_in(
+            &f.conn,
+            Path::new(&master_path_of(&f.conn, master_ids[0])),
+        );
+        assert!(before.contains("|zip:"), "{before}");
+        f.conn
+            .execute(
+                "UPDATE files SET archive_entry_crc32 = archive_entry_crc32 + 1 WHERE id = ?1",
+                [master_ids[0]],
+            )
+            .unwrap();
+        let after = master_identity_in(
+            &f.conn,
+            Path::new(&master_path_of(&f.conn, master_ids[0])),
+        );
+        assert_ne!(before, after);
+    }
+
+    fn master_path_of(conn: &Connection, file_id: i64) -> String {
+        conn.query_row("SELECT path FROM files WHERE id = ?1", [file_id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// The zip is gone (an unmounted share) and the master's own source frames are
+    /// archived in a zip that is gone too: the bytes are reachable nowhere, so the
+    /// `masterFiles` blocker stays, with the sentence that names both places.
+    #[test]
+    fn stacking_plan_still_blocks_when_a_master_is_in_a_missing_zip() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        // The master's raw source frames: our own Move and ZIP, zip then lost.
+        let source_set: i64 = f
+            .conn
+            .query_row(
+                "SELECT source_set_id FROM master_provenance WHERE master_set_id = ?1",
+                [dark_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let source_files: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT fr.file_id FROM calibration_set_frames csf
+                 JOIN frames fr ON fr.id = csf.frame_id WHERE csf.set_id = ?1",
+            )
+            .unwrap()
+            .query_map([source_set], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!source_files.is_empty());
+        let source_zip = f.dir.path().join("sources.zip");
+        zip_files(
+            &f.conn,
+            &source_files,
+            &source_zip,
+            Shape::Own { operation: 7 },
+        );
+        // The master itself, in a zip.
+        let master_zip = f.dir.path().join("master.zip");
+        zip_files(
+            &f.conn,
+            &[master_file_id(&f.conn, dark_set)],
+            &master_zip,
+            Shape::Foreign,
+        );
+
+        let settings = SettingsManager::new();
+        let plan_of = || {
+            build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                None,
+            )
+            .unwrap()
+        };
+        let present = plan_of();
+        assert!(
+            !present.blockers.iter().any(|b| b.code == "masterFiles"),
+            "{:?}",
+            present.blockers
+        );
+
+        std::fs::remove_file(&master_zip).unwrap();
+        std::fs::remove_file(&source_zip).unwrap();
+        let plan = plan_of();
+        assert!(plan.masters_to_build.is_empty(), "{:?}", plan.masters_to_build);
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|b| b.code == "masterFiles")
+            .expect("masterFiles blocker");
+        assert_eq!(
+            blocker.message,
+            "1 master file(s) missing on disk and in zip files"
+        );
+        let rows: i64 = f
+            .conn
+            .query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows > 0, "missing never deletes a row");
     }
 
     #[test]

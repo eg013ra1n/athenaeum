@@ -2431,6 +2431,13 @@ struct PrepareRunJob {
     keep_mosaic: bool,
     frame_uuid: Option<String>,
     job: crate::stacking::prepare::PrepareJob,
+    /// Keeps the zip cache file `job.src` names from eviction until the job (and its commit) ends. `None` for
+    /// a frame on disk.
+    _pin: Option<crate::zip_store::cache::Pinned>,
+    /// `job.src` is a zip-cache file and the action would hand that very file on as the stage-1 artifact (a
+    /// float FITS used in place, or a mosaic kept as `calibrated_mosaic`): the cache may evict it, so the
+    /// worker copies it to `copy_to` first and reads that copy instead.
+    detach: bool,
 }
 
 /// Prepare's per-frame RESOLVE phase, on the run thread:
@@ -2462,8 +2469,30 @@ fn resolve_prepare_job(
             }
         }
     };
-    let input =
+    let mut input =
         crate::stacking::origin::prepare_input(origin_of(&rc.origins, frame.frame_id)?, frame);
+    // A frame inside a zip is extracted into the zip cache first; the pin lives in the job until it ends.
+    // A path with no zip row passes through untouched.
+    let catalog_path = input.path.clone();
+    let (local, pin) = match crate::zip_store::materialize::materialize_one(
+        &rc.ctx,
+        &catalog_path.to_string_lossy(),
+    ) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::error!(
+                run_id = rc.run_id,
+                frame_id = frame.frame_id,
+                path = %catalog_path.display(),
+                error = %format!("{e:#}"),
+                "frame could not be read from its zip"
+            );
+            return Ok(PrepareResolved::Excluded {
+                reason: format!("cannot read the file: {e:#}"),
+            });
+        }
+    };
+    input.path = local;
     let shape = probe_file(&input.path);
     let action = prepare_action(&shape, cfg.calibration.debayer_osc);
     if let PrepareAction::Unsupported(why) = &action {
@@ -2555,12 +2584,25 @@ fn resolve_prepare_job(
             reason: "preparation failed: the output path equals the source".to_string(),
         });
     }
+    // The artifact must outlive the cache entry: an in-place read (the file itself becomes the
+    // `calibrated` artifact, or the kept mosaic) is detached into `prepared/` for a zip-extracted frame.
+    let detach = pin.is_some()
+        && matches!(
+            action,
+            PrepareAction::InPlace
+                | PrepareAction::Write {
+                    read: crate::stacking::prepare::PrepareRead::InPlaceFits,
+                    ..
+                }
+        );
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,
         group_key: group.key.clone(),
         hash,
         keep_mosaic,
         frame_uuid: input.frame_uuid,
+        _pin: pin,
+        detach,
         job: PrepareJob {
             src: input.path,
             shape,
@@ -2571,6 +2613,31 @@ fn resolve_prepare_job(
             durability: crate::fits_writer::Durability::Volatile,
         },
     })))
+}
+
+/// For a job whose source is a zip-cache file that Prepare would hand on in place, the job re-pointed at a
+/// copy in `prepared/` (written beside its final name and renamed, so a killed run leaves no half file under
+/// the artifact's name). `None` when the job needs no copy.
+fn detach_zip_source(job: &PrepareRunJob) -> anyhow::Result<Option<crate::stacking::prepare::PrepareJob>> {
+    if !job.detach {
+        return Ok(None);
+    }
+    let dest = &job.job.converted_out;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    let partial = crate::zip_store::reader::partial_path(dest);
+    std::fs::copy(&job.job.src, &partial)
+        .map_err(|e| anyhow::anyhow!("copying {} out of the zip cache: {e}", job.job.src.display()))?;
+    std::fs::rename(&partial, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        anyhow::anyhow!("placing {}: {e}", dest.display())
+    })?;
+    Ok(Some(crate::stacking::prepare::PrepareJob {
+        src: dest.clone(),
+        ..job.job.clone()
+    }))
 }
 
 /// Write one prepared frame's artifact rows (`calibrated`, plus
@@ -2794,18 +2861,24 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
             FanOutLabel::new(rc, Stage::Calibrate, Some(&group.key), "prepare"),
             cancel_ref,
             move |job: &PrepareRunJob| {
-                let out =
-                    crate::stacking::prepare::execute_prepare(&job.job, Some(pool_ref), cancel_ref)
-                        .map_err(|e| {
-                            if matches!(
-                                e.downcast_ref::<IntegrationError>(),
-                                Some(IntegrationError::Cancelled)
-                            ) {
-                                CANCELLED_MARKER.to_string()
-                            } else {
-                                format!("preparation failed: {e:#}")
-                            }
-                        });
+                let out = detach_zip_source(job)
+                    .and_then(|prepared_job| {
+                        crate::stacking::prepare::execute_prepare(
+                            prepared_job.as_ref().unwrap_or(&job.job),
+                            Some(pool_ref),
+                            cancel_ref,
+                        )
+                    })
+                    .map_err(|e| {
+                        if matches!(
+                            e.downcast_ref::<IntegrationError>(),
+                            Some(IntegrationError::Cancelled)
+                        ) {
+                            CANCELLED_MARKER.to_string()
+                        } else {
+                            format!("preparation failed: {e:#}")
+                        }
+                    });
                 ticker_ref.tick(Some(job.frame_id));
                 out
             },
@@ -3006,11 +3079,27 @@ fn warn_flat_only_group(
         if !seen.insert(format!("{}|{phase:?}", m.path)) {
             continue;
         }
+        // A master flat inside a zip is read from its extracted copy; the pin
+        // lives until this flat's divisor and corner ratio are read.
+        let (flat_path, _flat_pin) =
+            match crate::zip_store::materialize::materialize_one(&rc.ctx, &m.path) {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        path = %m.path,
+                        error = %format!("{e:#}"),
+                        "flat corner ratio unreadable; the pedestal warning omits it"
+                    );
+                    continue;
+                }
+            };
+        let flat_local = flat_path.to_string_lossy().into_owned();
         // The corner ratio is corner over centre whatever the light division
         // does, so the divisor is always the generator's resolved constant.
         let divisor = match crate::export::calibrated_generator::flat_norm_divisor_cached(
             rc.memo.divisors_mut(),
-            &m.path,
+            &flat_local,
             scratch,
             cfg.calibration.flat_norm_mode,
             &cfg.calibration.params,
@@ -3028,7 +3117,7 @@ fn warn_flat_only_group(
             }
         };
         match crate::calibration_library::light_cal::flat_corner_ratio(
-            Path::new(&m.path),
+            &flat_path,
             scratch,
             divisor,
         ) {
@@ -29460,6 +29549,95 @@ mod tests {
                 "a three-plane light is used in place"
             );
         }
+    }
+
+    /// Zip task 8: an attested set whose externally debayered lights sit inside a zip stacks
+    /// like the disk set. Their colour comes from the entry headers (`osc__`, no extraction
+    /// at grouping), Prepare extracts each through the zip cache, and a float light that
+    /// would be used in place is copied into `prepared/` instead — the `calibrated`
+    /// artifact never names a cache file the cache may evict.
+    #[test]
+    fn an_attested_zip_resident_set_stacks_with_its_artifacts_off_the_cache() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let (fixture, light_ids, working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &[0.0f32; 4]);
+        make_lights_three_plane(&fixture, &shifts, &[0, 1, 2, 3]);
+        fixture
+            .conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [fixture.set_id],
+            )
+            .unwrap();
+        let file_ids: Vec<i64> = light_ids
+            .iter()
+            .map(|id| {
+                fixture
+                    .conn
+                    .query_row("SELECT file_id FROM frames WHERE id = ?1", [id], |r| r.get(0))
+                    .unwrap()
+            })
+            .collect();
+        let zip = tmp.path().join("lights.zip");
+        let zipped = zip_files(&fixture.conn, &file_ids, &zip, Shape::Foreign);
+        assert!(zipped.iter().all(|p| !Path::new(p).exists()));
+
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let cfg = StackingConfig::default();
+        let (groups, _) = frame_source(&fixture.conn, &subject, &cfg).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(
+            groups[0].key.starts_with("osc__"),
+            "the shape came from the zip headers: {}",
+            groups[0].key
+        );
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            subject.clone(),
+            Some(cfg),
+            None,
+        )
+        .expect("an attested zip-resident set starts");
+        wait_for_run(&ctx, started.run_id);
+        let run_row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_row.status, "done", "{run_row:?}");
+
+        let layout =
+            crate::stacking::paths::subject_layout(&fixture.conn, working.path(), &subject)
+                .unwrap();
+        let calibrated =
+            crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
+                .unwrap();
+        assert_eq!(calibrated.len(), light_ids.len(), "Prepare excluded nothing");
+        for a in &calibrated {
+            let p = PathBuf::from(a.path.as_deref().unwrap());
+            assert!(p.exists(), "{p:?}");
+            assert!(
+                crate::test_support::canonical_path(&p)
+                    .starts_with(crate::test_support::canonical_path(&layout.prepared_root())),
+                "a zip-resident float light is copied into prepared/, not used in place: {p:?}"
+            );
+            assert!(!zipped.contains(&p.to_string_lossy().into_owned()));
+        }
+        let resident: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resident, light_ids.len() as i64, "the rows stay in the zip");
     }
 
     /// Review I12 on the attested path: a light whose catalog says colour

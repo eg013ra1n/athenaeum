@@ -672,13 +672,15 @@ fn load_set_row(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiE
 }
 
 /// Rebuild precondition (Task 13): every member frame of the source set must
-/// still be present on disk — a rebuild re-reads and re-integrates the SAME
-/// raw frames, it can't recombine frames that were archived into a ZIP or
-/// otherwise removed. Pure DB + `Path::exists` — no `ServiceContext`
-/// needed, so it's unit-testable directly (see tests below) the same way
-/// `plan_batch` is. Distinguishes "archived" (actionable: restore first)
-/// from "missing" (the file is just gone) when cheap to do so via
-/// `files.archived_in_operation`.
+/// still be reachable — on disk, or listed by the zip a zip-resident row lives
+/// in (`zip_store::presence::row_is_present`; the build extracts it through
+/// `zip_store::materialize`). A rebuild re-reads and re-integrates the SAME
+/// raw frames, it can't recombine frames that are gone. Pure DB + directory
+/// reads — no `ServiceContext` needed, so it's unit-testable directly (see
+/// tests below) the same way `plan_batch` is. Distinguishes "archived"
+/// (actionable: restore first) from "missing" (the file is just gone) when
+/// cheap to do so via `files.archived_in_operation`; both answers now mean
+/// the bytes are reachable nowhere.
 ///
 /// `pub(crate)`: Plan 5b Task 8's stacking stage 0.5 reuses this SAME check —
 /// both `api::lights::compute_export_readiness` (deciding which missing
@@ -691,13 +693,17 @@ pub(crate) fn check_rebuild_source_ready(
     source_set_id: i64,
 ) -> Result<(), ApiError> {
     let mut stmt = conn.prepare(
-        "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
+        "SELECT fi.path, fi.archived_in_operation, fi.archive_zip_path, fi.archive_path_in_zip
+         FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE csf.set_id = ?1",
     )?;
-    let rows: Vec<(String, Option<i64>)> = stmt
-        .query_map([source_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    type Member = (String, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Member> = stmt
+        .query_map([source_set_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
@@ -706,16 +712,29 @@ pub(crate) fn check_rebuild_source_ready(
             "source calibration set has no member frames on record".into(),
         ));
     }
-    if rows.iter().all(|(p, _)| Path::new(p).exists()) {
+    // A zip-resident member counts as present while its zip lists the entry
+    // (`row_is_present`, the one presence rule): the build extracts it. The
+    // "archived — restore first" answer below therefore fires only when the
+    // bytes are reachable nowhere.
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    let all_present = rows.iter().all(|(p, _, zip, entry)| {
+        crate::zip_store::presence::row_is_present(
+            &mut presence,
+            p,
+            zip.as_deref(),
+            entry.as_deref(),
+        )
+    });
+    if all_present {
         return Ok(());
     }
-    if rows.iter().any(|(_, archived)| archived.is_some()) {
+    if rows.iter().any(|(_, archived, _, _)| archived.is_some()) {
         Err(ApiError::Invalid(
             "originals are archived — restore them first".into(),
         ))
     } else {
         Err(ApiError::Invalid(
-            "original source frames are missing on disk".into(),
+            "original source frames are missing on disk and in zip files".into(),
         ))
     }
 }
@@ -1156,12 +1175,9 @@ fn run_build(
          JOIN files fi ON fi.id = f.file_id
          WHERE csf.set_id = ?1 ORDER BY fi.path",
     )?;
-    let paths: Vec<PathBuf> = stmt
+    let catalog_paths: Vec<String> = stmt
         .query_map([set_id], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     let is_flat = set.imagetyp == "Flat";
@@ -1177,6 +1193,46 @@ fn run_build(
         PrecalChoice::None
     };
     let precal_desc = precal_choice.describe();
+
+    // Zip-resident members (and a zip-resident pre-calibration master) are
+    // extracted into the zip cache in ONE batch before any pixel work; the
+    // pins live in `materialized` until the integration has read every band.
+    // The pooled connection is released around the extraction (it can run for
+    // minutes), then taken again for the I/O policy.
+    drop(conn);
+    let mut wanted: Vec<String> = catalog_paths.clone();
+    if let PrecalChoice::Master { path, .. } = &precal_choice {
+        wanted.push(path.clone());
+    }
+    let materialized = crate::zip_store::materialize::materialize_paths(
+        ctx,
+        &wanted,
+        &ExtractionAsBuildProgress { set_id, inner: emitter },
+        "master-build-progress",
+        cancel_flag.as_ref(),
+    )
+    .map_err(|e| {
+        if cancel_flag.load(Ordering::Relaxed) {
+            BuildStepError::Cancelled
+        } else {
+            tracing::error!(set_id, error = %format!("{e:#}"), "master build: a source frame could not be read from its zip");
+            BuildStepError::Other(format!("{e:#}"))
+        }
+    })?;
+    let paths: Vec<PathBuf> = catalog_paths
+        .iter()
+        .map(|p| materialized.local(p).to_path_buf())
+        .collect();
+    let precal_choice = match precal_choice {
+        PrecalChoice::Master { set_id, imagetyp, cal_type, path } => PrecalChoice::Master {
+            set_id,
+            imagetyp,
+            cal_type,
+            path: materialized.local(&path).to_string_lossy().into_owned(),
+        },
+        other => other,
+    };
+    let conn = db_handle.conn();
 
     // Both I/O knobs, resolved from the machine AND from the storage the
     // frames actually live on — the same set may sit on a local disk today
@@ -1381,6 +1437,8 @@ fn run_build(
     // "master build finished" line itself now runs at the end of the success
     // path (see there) — a build that returns `Cancelled` here never reaches
     // it; `run_master_build_thread` logs "master build cancelled" instead.
+    // Every band is read: the extracted copies may be evicted from here on.
+    drop(materialized);
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
@@ -1396,7 +1454,7 @@ fn run_build(
         for (i, &count) in out.bad_samples_per_frame.iter().enumerate() {
             if count > 0 {
                 tracing::warn!(
-                    set_id, path = %paths[i].display(), count,
+                    set_id, path = %catalog_paths[i], count,
                     "non-finite samples excluded from integration"
                 );
             }
@@ -2150,6 +2208,37 @@ impl Drop for ActiveBuildGuard<'_> {
     }
 }
 
+/// Turns the extraction events of `zip_store::materialize` (`{current, total, message}` on
+/// `master-build-progress`) into the build's own payload with the reserved `"reading"` stage, so the
+/// Masters tab keys them by calibration set like every other build tick. Other events pass through.
+struct ExtractionAsBuildProgress<'a> {
+    set_id: i64,
+    inner: &'a dyn ProgressEmitter,
+}
+
+impl ProgressEmitter for ExtractionAsBuildProgress<'_> {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        if event_name != "master-build-progress" {
+            self.inner.emit_json(event_name, payload);
+            return;
+        }
+        let count = |key: &str| payload.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        emit_event(
+            self.inner,
+            "master-build-progress",
+            &MasterBuildProgressEvent {
+                set_id: self.set_id,
+                stage: "reading",
+                current: count("current"),
+                total: count("total"),
+                percent: 0.0,
+                bytes_done: 0,
+                bytes_total: 0,
+            },
+        );
+    }
+}
+
 /// A [`ProgressEmitter`] adapter that drops `master-build-progress` events
 /// and passes everything else through unchanged (Plan 5b final fix wave,
 /// review finding B1) — see [`build_master_inline`]'s doc comment for why.
@@ -2666,16 +2755,26 @@ pub fn get_master_provenance(
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT fi.path FROM calibration_set_frames csf
+            "SELECT fi.path, fi.archive_zip_path, fi.archive_path_in_zip FROM calibration_set_frames csf
                  JOIN frames f ON f.id = csf.frame_id
                  JOIN files fi ON fi.id = f.file_id
                  WHERE csf.set_id = ?1",
         )?;
-        let paths: Vec<String> = stmt
-            .query_map([src_id], |r| r.get::<_, String>(0))?
+        let members: Vec<(String, Option<String>, Option<String>)> = stmt
+            .query_map([src_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        let source_frames_on_disk =
-            !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
+        // "On disk" for a zip-resident member means its zip lists the entry (a
+        // rebuild extracts it), the same rule `check_rebuild_source_ready` uses.
+        let mut presence = crate::zip_store::presence::ZipPresence::new();
+        let source_frames_on_disk = !members.is_empty()
+            && members.iter().all(|(p, zip, entry)| {
+                crate::zip_store::presence::row_is_present(
+                    &mut presence,
+                    p,
+                    zip.as_deref(),
+                    entry.as_deref(),
+                )
+            });
         drop(stmt);
 
         // Any ONE member's markers — see the field doc comments above for
@@ -3604,6 +3703,48 @@ mod tests {
         let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
         assert!(err.to_string().contains("missing"), "{err}");
         assert!(!err.to_string().contains("archived"), "{err}");
+    }
+
+    /// Originals kept in a zip (a foreign zip's rows, or our own Move and ZIP) count as
+    /// present while the zip lists them; the "archived" / "missing" answers come back
+    /// only once the zip is gone.
+    #[test]
+    fn rebuild_source_ready_accepts_zipped_originals() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        for (shape, archived_word) in [
+            (Shape::Foreign, false),
+            (Shape::Own { operation: 3 }, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = test_conn();
+            let set_id = seed_source_with_files(&conn, dir.path(), 3, false);
+            let file_ids: Vec<i64> = conn
+                .prepare("SELECT id FROM files ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let zip = dir.path().join("originals.zip");
+            zip_files(&conn, &file_ids, &zip, shape);
+
+            assert!(
+                check_rebuild_source_ready(&conn, set_id).is_ok(),
+                "a zip that lists every original is a ready source"
+            );
+
+            std::fs::remove_file(&zip).unwrap();
+            let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
+            assert_eq!(
+                err.to_string().contains("archived"),
+                archived_word,
+                "{err}"
+            );
+            assert!(
+                archived_word || err.to_string().contains("missing on disk and in zip files"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -4955,6 +5096,188 @@ mod tests {
             .unwrap();
         }
         set_id
+    }
+
+    /// A raw Dark set of `values.len()` real FITS sub-frames (one constant per frame) in `dir`.
+    fn seed_dark_set_with_values(conn: &Connection, dir: &std::path::Path, values: &[f32]) -> i64 {
+        std::fs::create_dir_all(dir).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Dark', '2026-09-09', ?1)",
+            [values.len() as i64],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        for (i, value) in values.iter().enumerate() {
+            let p = dir.join(format!("dark{i}.fits"));
+            write_raw_dark_frame(&p, 8, *value);
+            let size = std::fs::metadata(&p).unwrap().len() as i64;
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, '2026-09-09', 'FITS')",
+                rusqlite::params![p.to_string_lossy(), format!("dark{i}.fits"), size],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime, binning)
+                 VALUES (?1, 'Dark', 'TestCam', 60.0, '1x1')",
+                [file_id],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// The pixels of a built master's single plane.
+    fn master_pixels(ctx: &Arc<ServiceContext>, master_set_id: i64) -> Vec<f32> {
+        let path: String = {
+            let db_handle = db(ctx).unwrap();
+            let conn = db_handle.conn();
+            conn.query_row(
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1",
+                [master_set_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let reader = crate::integration::plane_reader::PlaneReader::open(std::path::Path::new(&path)).unwrap();
+        reader.read_plane(0).unwrap()
+    }
+
+    /// The same frames on disk and inside a zip integrate to the same master pixels, and
+    /// the zipped build reads them through the zip cache (the rows stay zip-resident).
+    #[cfg(all(feature = "render", feature = "solver"))]
+    #[test]
+    fn master_build_from_zip_resident_frames_matches_the_disk_build() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let values = [100.0f32, 140.0, 90.0, 120.0, 105.0];
+        let (disk_set, zip_set, zipped_paths) = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let disk_set = seed_dark_set_with_values(&conn, &tmp.path().join("disk"), &values);
+            let zip_set = seed_dark_set_with_values(&conn, &tmp.path().join("zipped"), &values);
+            let ids: Vec<i64> = conn
+                .prepare(
+                    "SELECT fi.id FROM calibration_set_frames csf
+                     JOIN frames f ON f.id = csf.frame_id
+                     JOIN files fi ON fi.id = f.file_id
+                     WHERE csf.set_id = ?1 ORDER BY fi.id",
+                )
+                .unwrap()
+                .query_map([zip_set], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let paths = zip_files(&conn, &ids, &tmp.path().join("darks.zip"), Shape::Foreign);
+            (disk_set, zip_set, paths)
+        };
+        assert!(zipped_paths.iter().all(|p| !std::path::Path::new(p).exists()));
+
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe {
+            combine: Some(IntegrationRecipe::median(Rejection::None)),
+            synthetic_bias: None,
+            archive_after: false,
+        };
+        let build = |set_id: i64| {
+            run_build(
+                &ctx,
+                &crate::events::NullEmitter,
+                "0.5.1-test",
+                set_id,
+                &recipe,
+                &Arc::new(AtomicBool::new(false)),
+                BuildTarget::New,
+                Admission::Acquire,
+            )
+            .expect("the master dark must build")
+            .0
+        };
+        let from_disk = master_pixels(&ctx, build(disk_set));
+        let from_zip = master_pixels(&ctx, build(zip_set));
+        assert_eq!(from_disk, from_zip);
+        assert_eq!(from_disk.len(), 64);
+        assert!((from_disk[0] - 105.0).abs() < 1e-3, "median of the five: {}", from_disk[0]);
+
+        // The frames were read through the cache and the rows still name the zip.
+        let still_resident: i64 = db(&ctx)
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_resident, values.len() as i64);
+    }
+
+    /// A zip that lists the frames but cannot be reached at build time fails the build with
+    /// the frame named, writes no master and leaves the set unsuperseded.
+    #[test]
+    fn master_build_fails_readably_when_the_zip_is_gone() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let (set_id, zip) = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let set_id = seed_dark_set_with_values(&conn, &tmp.path().join("zipped"), &[100.0, 110.0, 120.0]);
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM files ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let zip = tmp.path().join("darks.zip");
+            zip_files(&conn, &ids, &zip, Shape::Foreign);
+            (set_id, zip)
+        };
+        std::fs::remove_file(&zip).unwrap();
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+        let err = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::New,
+            Admission::Acquire,
+        )
+        .unwrap_err();
+        match err {
+            BuildStepError::Other(msg) => assert!(msg.contains("not reachable"), "{msg}"),
+            BuildStepError::Cancelled => panic!("expected a failure, got Cancelled"),
+        }
+        assert!(std::fs::read_dir(&library_dir).unwrap().next().is_none(), "no master was written");
     }
 
     /// R4 (design ruling): a rebuild keeps the container its OWN file
