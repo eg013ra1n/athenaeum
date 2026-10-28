@@ -10,7 +10,7 @@ use crate::archive::shared_calibration::find_shared_calibration_sets;
 use crate::duplicates::compute_xxhash;
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Refuse a plan in which two files map to one in-zip path. The protected
@@ -149,6 +149,26 @@ pub fn build_plan(
                 }
             })
             .or_insert(c);
+    }
+
+    // A frame that already lives inside a zip (a foreign one, or one of ours) is not on disk to move
+    // or copy: it is left out of the plan, not an error. Lights and the calibration chain alike.
+    let mut skipped_in_zip = 0usize;
+    let mut on_disk: HashMap<i64, CandidateFile> = HashMap::with_capacity(by_id.len());
+    for (id, c) in by_id {
+        if is_zip_resident(conn, id)? {
+            skipped_in_zip += 1;
+            tracing::debug!(file_id = id, path = %c.file_path, "frame already in a zip file; left out of the plan");
+        } else {
+            on_disk.insert(id, c);
+        }
+    }
+    let by_id = on_disk;
+    if skipped_in_zip > 0 {
+        tracing::info!(frames_set_id, skipped = skipped_in_zip, remaining = by_id.len(), "frames already in zip files left out of the archive plan");
+    }
+    if by_id.is_empty() && skipped_in_zip > 0 {
+        anyhow::bail!("{ALL_IN_ZIPS}");
     }
 
     // 4. Detect shared calibrations
@@ -342,6 +362,23 @@ pub fn build_calibration_set_plan(
 
     if member_rows.is_empty() {
         anyhow::bail!("calibration set {calibration_set_id} has no member frames on record");
+    }
+
+    // Members already inside a zip (foreign, or ours) are skipped; an unfinished archive operation on
+    // a member that is NOT zip-resident still refuses the plan.
+    let mut zip_resident: HashSet<i64> = HashSet::new();
+    for (file_id, ..) in &member_rows {
+        if is_zip_resident(conn, *file_id)? {
+            zip_resident.insert(*file_id);
+        }
+    }
+    if !zip_resident.is_empty() {
+        tracing::info!(calibration_set_id, skipped = zip_resident.len(), "members already in zip files left out of the archive plan");
+    }
+    let member_rows: Vec<(i64, String, i64, Option<i64>)> =
+        member_rows.into_iter().filter(|(id, ..)| !zip_resident.contains(id)).collect();
+    if member_rows.is_empty() {
+        anyhow::bail!("{ALL_IN_ZIPS}");
     }
 
     let already_archived: Vec<&str> = member_rows.iter()
@@ -604,6 +641,18 @@ fn load_all_scan_roots(conn: &Connection) -> Result<Vec<String>> {
     let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Reported when every frame the plan would archive already lives inside a zip.
+const ALL_IN_ZIPS: &str = "all frames are already in zip files";
+
+/// The row's frame lives inside a zip: a foreign zip's entry, or one of our archive zips.
+fn is_zip_resident(conn: &Connection, file_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT archive_zip_path IS NOT NULL FROM files WHERE id = ?1",
+        [file_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Light frames in the set: (file_id, path, size).
@@ -1288,5 +1337,120 @@ mod tests {
         ).unwrap();
         assert!(archive_zip_path_after.is_none(), "archive markers must be cleared after restore");
         assert!(archived_op_after.is_none());
+    }
+
+    /// Make a catalog row a zip-resident one: the markers (foreign zip: no operation) and the virtual
+    /// path, with no file at that path.
+    fn make_zip_resident(conn: &Connection, file_id: i64, zip: &str, entry: &str) {
+        let vpath = format!("{zip}{}{entry}", std::path::MAIN_SEPARATOR);
+        conn.execute(
+            "UPDATE files SET path = ?1, archive_zip_path = ?2, archive_path_in_zip = ?3 WHERE id = ?4",
+            params![vpath, zip, entry, file_id],
+        ).unwrap();
+    }
+
+    #[test]
+    fn move_and_zip_skips_lights_already_in_a_foreign_zip() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        make_zip_resident(&conn, 1001, "/nas/night.zip", "L_002.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Skip), bias: None, darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.files.len(), 1, "only the light still on disk");
+        assert_eq!(plan.files[0].file_id, Some(1000));
+        assert_eq!(plan.zips[0].file_count, 1);
+    }
+
+    #[test]
+    fn move_and_zip_skips_a_zip_resident_calibration_frame() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        // The only dark is already in a zip: it drops out, the lights stay.
+        make_zip_resident(&conn, 2000, "/nas/darks.zip", "MasterDark.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Copy), bias: None, darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.files.len(), 2);
+        assert!(plan.files.iter().all(|f| f.frame_role == "light"));
+    }
+
+    #[test]
+    fn move_and_zip_with_every_frame_in_zips_reports_all_frames_already_in_zip_files() {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        make_zip_resident(&conn, 1000, "/nas/night.zip", "L_001.fits");
+        make_zip_resident(&conn, 1001, "/nas/night.zip", "L_002.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Skip), bias: None, darkflats: None,
+        };
+        let err = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap_err();
+        assert_eq!(format!("{err:#}"), "all frames are already in zip files");
+    }
+
+    /// A superseded dark set with two members; returns (conn, set id, the two file ids, dir).
+    fn superseded_dark_set() -> (Connection, i64, [i64; 2], TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES (?1)", [dir.path().to_string_lossy()]).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (999, 'MasterDark', '2026-06-28', 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set
+                (imagetyp, date, instrume, gain, exptime, date_start, date_end, superseded_by_set_id)
+             VALUES ('Dark','2026-06-28','Test Cam',100.0,300.0,'2026-06-28T20:00:00Z','2026-06-28T21:00:00Z', 999)",
+            [],
+        ).unwrap();
+        let set = conn.last_insert_rowid();
+        let mut ids = [0i64; 2];
+        for (i, id) in ids.iter_mut().enumerate() {
+            let f = dir.path().join(format!("d{i}.fits"));
+            std::fs::write(&f, format!("data-{i}")).unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1,?2,6,'2026-06-28','FITS')",
+                params![f.to_string_lossy(), format!("d{i}.fits")],
+            ).unwrap();
+            *id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1,'Dark')", [*id]).unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1,?2)", params![set, frame_id]).unwrap();
+        }
+        (conn, set, ids, dir)
+    }
+
+    #[test]
+    fn calibration_plan_skips_a_member_that_is_in_a_zip_and_plans_the_rest() {
+        let (conn, set, ids, dir) = superseded_dark_set();
+        make_zip_resident(&conn, ids[0], "/nas/darks.zip", "d0.fits");
+        let plan = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].file_id, Some(ids[1]));
+        assert_eq!(plan.zips[0].file_count, 1);
+    }
+
+    #[test]
+    fn calibration_plan_with_every_member_in_zips_reports_all_frames_already_in_zip_files() {
+        let (conn, set, ids, dir) = superseded_dark_set();
+        make_zip_resident(&conn, ids[0], "/nas/darks.zip", "d0.fits");
+        make_zip_resident(&conn, ids[1], "/nas/darks.zip", "d1.fits");
+        let err = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap_err();
+        assert_eq!(format!("{err:#}"), "all frames are already in zip files");
+    }
+
+    /// Our own zipped member (operation marker AND zip) is zip-resident too: skipped, not the
+    /// "unfinished operation" refusal.
+    #[test]
+    fn calibration_plan_skips_our_zipped_member_but_still_refuses_an_unfinished_operation() {
+        let (conn, set, ids, dir) = superseded_dark_set();
+        conn.execute("UPDATE files SET archived_in_operation = 5, archive_zip_path = '/arch/x.zip', archive_path_in_zip = 'R/d0.fits' WHERE id = ?1", [ids[0]]).unwrap();
+        let plan = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.files.len(), 1);
+
+        // The other member has an operation marker but is NOT in a zip: refuse.
+        conn.execute("UPDATE files SET archived_in_operation = 6 WHERE id = ?1", [ids[1]]).unwrap();
+        let err = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap_err();
+        assert!(format!("{err:#}").contains("already has archived member"), "{err:#}");
     }
 }

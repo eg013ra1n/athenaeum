@@ -492,6 +492,22 @@ fn finalize_phase(
     let sid = adb::insert_step(conn, operation_id, None, ArchiveStage::Finalize)?;
     adb::update_step(conn, sid, StepStatus::InProgress, None, None)?;
 
+    // The CRC32 the zip's directory holds for each entry: one directory read per built zip, before
+    // any row changes, so a zip that cannot be read fails the finalize with the catalog untouched.
+    // The unfiltered by-name map is used (not the scan listing) because the entries our own layout
+    // writes may carry a `:` or a trailing space that the scan listing leaves out.
+    let mut crcs_by_zip: HashMap<&str, HashMap<String, u32>> = HashMap::new();
+    for f in files {
+        if crcs_by_zip.contains_key(f.target_zip_path.as_str()) {
+            continue;
+        }
+        let crcs = crate::zip_store::reader::entry_crc32_map(Path::new(&f.target_zip_path)).map_err(|e| {
+            tracing::error!(operation_id, zip_path = %f.target_zip_path, error = %format!("{e:#}"), "reading the built zip's directory failed");
+            e.context(format!("read the directory of {}", f.target_zip_path))
+        })?;
+        crcs_by_zip.insert(f.target_zip_path.as_str(), crcs);
+    }
+
     // Mark moved files (one progress tick per moved file)
     for f in files {
         if f.disposition == "move" {
@@ -499,6 +515,15 @@ fn finalize_phase(
                 adb::mark_file_archived(
                     conn, file_id, operation_id, &f.target_zip_path, &f.target_path_in_zip,
                 )?;
+                let crc = crcs_by_zip
+                    .get(f.target_zip_path.as_str())
+                    .and_then(|m| m.get(&f.target_path_in_zip))
+                    .copied()
+                    .ok_or_else(|| {
+                        tracing::error!(operation_id, file_id, zip_path = %f.target_zip_path, zip_entry = %f.target_path_in_zip, "built zip has no entry for a moved file");
+                        anyhow::anyhow!("{} has no entry {}", f.target_zip_path, f.target_path_in_zip)
+                    })?;
+                adb::set_file_entry_crc32(conn, file_id, crc)?;
             }
             done_units += 1;
             emit_event(emitter, "archive-progress", &ArchiveProgress {
@@ -509,6 +534,11 @@ fn finalize_phase(
                 message: format!("Updating catalog ({}/{})", done_units, total_units),
             });
         }
+    }
+    // Each built zip joins the zip catalog with its real stat, so a later scan of it is skipped as
+    // unchanged and its created-by operation is on record.
+    for zip_path in crcs_by_zip.keys() {
+        record_built_zip(conn, operation_id, zip_path)?;
     }
     if let Some(fs_id) = frames_set_id {
         adb::mark_frame_set_archived(conn, fs_id, operation_id)?;
@@ -543,6 +573,30 @@ fn finalize_phase(
         total: total_units,
         message: "Finalized".into(),
     });
+    Ok(())
+}
+
+/// Upsert the `zip_archives` row of a zip this operation built: the zip's real size and mtime (in the
+/// format the zip scan writes, so the scan finds them equal), the number of catalog rows living in it
+/// and `created_by_operation`.
+fn record_built_zip(conn: &Connection, operation_id: i64, zip_path: &str) -> Result<()> {
+    let meta = std::fs::metadata(zip_path).map_err(|e| {
+        tracing::error!(operation_id, zip_path, error = %e, "stat of the built zip failed");
+        anyhow::Error::new(e).context(format!("stat {zip_path}"))
+    })?;
+    let modified = meta.modified().map_err(|e| {
+        tracing::error!(operation_id, zip_path, error = %e, "mtime of the built zip unreadable");
+        anyhow::Error::new(e).context(format!("mtime of {zip_path}"))
+    })?;
+    let modified = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
+    conn.execute(
+        "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
+         VALUES (?1, ?2, ?3, (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1), ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, modified_at = excluded.modified_at,
+                frame_entries = excluded.frame_entries, scanned_at = excluded.scanned_at,
+                created_by_operation = excluded.created_by_operation",
+        rusqlite::params![zip_path, meta.len() as i64, modified, chrono::Utc::now().to_rfc3339(), operation_id],
+    )?;
     Ok(())
 }
 
@@ -765,5 +819,85 @@ mod tests {
             [op_id], |r| r.get(0),
         ).unwrap();
         assert_eq!(before_count, after_count, "copy steps should not be duplicated on resume");
+    }
+
+    /// `(zip path, size, modified_at, frame_entries, created_by_operation)` of every `zip_archives` row.
+    fn zip_rows(conn: &Connection) -> Vec<(String, i64, String, i64, Option<i64>)> {
+        let mut stmt = conn
+            .prepare("SELECT path, size, modified_at, frame_entries, created_by_operation FROM zip_archives ORDER BY path")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn finalize_records_the_zip_and_entry_crcs() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        let zips = zip_rows(&conn);
+        assert_eq!(zips.len(), 1);
+        let (path, size, modified, entries, op) = &zips[0];
+        let meta = std::fs::metadata(path).unwrap();
+        assert_eq!(*size, meta.len() as i64, "the real size, not a sentinel");
+        let expected_modified = chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339();
+        assert_eq!(modified, &expected_modified, "the format the zip scan writes");
+        assert_eq!(*entries, 2);
+        assert_eq!(*op, Some(op_id));
+
+        let crcs = crate::zip_store::reader::entry_crc32_map(Path::new(path)).unwrap();
+        let rows: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT archive_path_in_zip, archive_entry_crc32 FROM files WHERE archived_in_operation = ?1")
+                .unwrap();
+            let r = stmt
+                .query_map([op_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            r
+        };
+        assert_eq!(rows.len(), 2);
+        for (entry, crc) in rows {
+            assert_eq!(crc, Some(i64::from(crcs[&entry])), "{entry}");
+        }
+    }
+
+    #[test]
+    fn rescan_of_our_archive_zip_adds_no_rows() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+        let before = zip_rows(&conn);
+        let zip = PathBuf::from(&before[0].0);
+        let files_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+
+        // The recorded stat equals the zip's: the scan opens nothing.
+        let outcome = crate::zip_store::scan::scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.skipped_unchanged);
+        assert!(outcome.inserted.is_empty());
+        assert_eq!(outcome.files_inserted, 0);
+
+        // Even a scan that does read the zip finds every entry owned by a row, adds none, and leaves
+        // the operation on record and the real stat in place.
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+        let outcome = crate::zip_store::scan::scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
+        assert!(outcome.inserted.is_empty());
+        assert_eq!(outcome.files_inserted, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let files_after: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files_after, files_before);
+        let after = zip_rows(&conn);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1, before[0].1, "the real size is back");
+        assert_eq!(after[0].2, before[0].2);
+        assert_eq!(after[0].3, 2);
+        assert_eq!(after[0].4, Some(op_id), "created_by_operation survives the rescan");
     }
 }

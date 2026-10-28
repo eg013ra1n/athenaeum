@@ -667,6 +667,25 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     };
 
     let outer = SavepointGuard::new(conn, "scan_zip")?;
+    // Rows that predate the entry CRC (our archive zips from before it was recorded) learn it from the
+    // directory this scan already read, with no further read of the zip.
+    let crc_by_entry: HashMap<&str, u32> = listing.entries.iter().map(|e| (e.path.as_str(), e.crc32)).collect();
+    let mut backfilled = 0usize;
+    for (entry, (id, crc)) in &known {
+        if crc.is_some() || released.contains(entry) {
+            continue;
+        }
+        if let Some(listed) = crc_by_entry.get(entry.as_str()) {
+            conn.execute(
+                "UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2 AND archive_entry_crc32 IS NULL",
+                params![i64::from(*listed), id],
+            )?;
+            backfilled += 1;
+        }
+    }
+    if backfilled > 0 {
+        tracing::info!(root_id, zip_path = %zip.display(), count = backfilled, "entry crcs recorded for rows that had none");
+    }
     // Pass 1: parse, update known entries, let moved rows adopt entries.
     let mut pending: Vec<(&ZipEntryInfo, Box<ParsedEntry>)> = Vec::new();
     for ((entry, known_id), (_, header)) in to_read.iter().zip(headers) {
@@ -1316,6 +1335,43 @@ mod scan_tests {
         assert_eq!(path, virtual_path(&moved, "Lights/L_001.fits"), "the virtual path follows the zip");
         assert_eq!(zip_col, moved.to_str().unwrap());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
+    }
+
+    #[test]
+    fn a_scan_that_reads_a_zip_fills_the_entry_crc_of_rows_that_have_none() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(
+            tmp.path(),
+            "ours.zip",
+            &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        let expected: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT archive_path_in_zip, archive_entry_crc32 FROM files ORDER BY archive_path_in_zip")
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            rows
+        };
+        assert_eq!(expected.len(), 2);
+
+        // Rows written before the CRC was recorded: no CRC; the zip's stat is stale so the scan reads it.
+        conn.execute("UPDATE files SET archive_entry_crc32 = NULL", []).unwrap();
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
+        assert_eq!(outcome.files_inserted, 0, "no new rows");
+
+        let after: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT archive_path_in_zip, archive_entry_crc32 FROM files ORDER BY archive_path_in_zip")
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            rows
+        };
+        assert_eq!(after, expected, "the CRCs come back from the directory");
     }
 
     fn zip_archive_count(conn: &Connection) -> i64 {
