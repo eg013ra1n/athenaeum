@@ -131,6 +131,24 @@ export type BulkMoveProgressEvent = { current: number, total: number, percent: n
 
 export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, };
 
+export type BlackHoleZipEntry = { 
+/**
+ * The `black_hole_zips` row id (what restore and Void take).
+ */
+id: number, 
+/**
+ * The zip's CURRENT path (`zip_archives.path`, which follows a rename).
+ */
+zipPath: string, size: number, 
+/**
+ * Frame entries the catalog holds for this zip.
+ */
+frameEntries: number, 
+/**
+ * The Move and ZIP operation that wrote this zip, when it is one of ours.
+ */
+archiveOperationId: number | null, fromWhere: string, movedAt: string, };
+
 export type FolderSimilarity = { folder_a: string, folder_b: string, similarity_percent: number, shared_files: number, shared_size: number, unique_a: number, unique_b: number, shared_file_ids: Array<number>, };
 
 export type ScanProgressEvent = { current: number, total: number, current_file: string | null, percent: number, root_id: number, phase: string, };
@@ -184,7 +202,12 @@ xorgsubf: number | null, yorgsubf: number | null, bayerpat: string | null, swcre
  */
 superseded_by_set_id: number | null, };
 
-export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, };
+export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, 
+/**
+ * Zips of the old root that are not at the new location (their frames stay at the old path and show as
+ * missing). Filled by the scan-root relink; zero for a files-only relink.
+ */
+zips_missing: number, };
 
 export type OrphanedFile = { id: number, path: string, filename: string, size: number, modified_at: string, has_frame: boolean, object: string | null, date_obs: string | null, };
 

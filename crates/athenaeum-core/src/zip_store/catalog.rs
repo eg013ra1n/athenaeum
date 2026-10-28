@@ -132,8 +132,8 @@ pub fn rename_zip_prefix(conn: &Connection, old_prefix: &str, new_prefix: &str) 
 }
 
 /// Before a folder is renamed on disk: the first catalog path that the rename would collide with, if any. A
-/// zip under `old_prefix` whose new path already is a known zip, or a frame row whose renamed path already
-/// exists (stale rows under a folder name that is free on disk), would fail the catalog update after the
+/// zip under `old_prefix` whose new path already is a known zip, or a file row (a zip's frame or a plain
+/// file) whose renamed path already exists (stale rows under a folder name that is free on disk), would fail the catalog update after the
 /// disk rename.
 pub fn rename_prefix_collision(conn: &Connection, old_prefix: &str, new_prefix: &str) -> Result<Option<String>> {
     if old_prefix == new_prefix {
@@ -151,7 +151,7 @@ pub fn rename_prefix_collision(conn: &Connection, old_prefix: &str, new_prefix: 
     let clash = conn
         .query_row(
             "SELECT t.path FROM files f JOIN files t ON t.path = ?1 || SUBSTR(f.path, LENGTH(?2) + 1)
-             WHERE f.archive_zip_path IS NOT NULL AND f.path >= ?2 AND (?3 IS NULL OR f.path < ?3) LIMIT 1",
+             WHERE f.path >= ?2 AND (?3 IS NULL OR f.path < ?3) LIMIT 1",
             params![new_prefix, old_prefix, hi],
             |r| r.get::<_, String>(0),
         )
@@ -520,7 +520,22 @@ mod tests {
             [&stale_zip],
         )
         .unwrap();
-        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), Some(stale_zip));
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), Some(stale_zip.clone()));
+        conn.execute("DELETE FROM zip_archives WHERE path = ?1", [&stale_zip]).unwrap();
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), None);
+
+        // A plain file under the old folder (not in a zip) and a stale plain-file row at the path it would
+        // be renamed to: the folder rename would fail on files.path after the disk rename.
+        let plain_old = format!("{op}L_900.fits");
+        let plain_new = format!("{np}L_900.fits");
+        for p in [&plain_old, &plain_new] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'L_900.fits', 1, 't', 'FITS')",
+                [p],
+            )
+            .unwrap();
+        }
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), Some(plain_new));
     }
 
     #[test]

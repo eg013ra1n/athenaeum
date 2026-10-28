@@ -414,6 +414,9 @@ pub struct RelinkResult {
     pub files_new: usize,
     pub files_orphaned: usize,
     pub orphaned_file_ids: Vec<i64>,
+    /// Zips of the old root that are not at the new location (their frames stay at the old path and show as
+    /// missing). Filled by the scan-root relink; zero for a files-only relink.
+    pub zips_missing: usize,
 }
 
 /// Represents an orphaned file that couldn't be relinked

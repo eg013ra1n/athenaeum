@@ -1461,47 +1461,44 @@ pub fn relink_scan_root(
 
     tracing::info!(root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
 
-    // Files and zips relink together or not at all: a failure leaves no half-moved root.
-    conn.execute_batch("SAVEPOINT relink_root").map_err(|e| {
-        tracing::error!(root_id, error = %e, "failed to open the relink savepoint");
-        ApiError::Internal(format!("Relinking failed: {e}"))
+    // The read half first, with NO transaction open: it reads the fingerprint map and then every header under
+    // the new root, which takes minutes on a large or NAS root. A read snapshot held across that walk (a
+    // deferred SAVEPOINT) turns the first write afterwards into "database is locked" whenever another
+    // connection committed meanwhile, and busy_timeout does not help (see `SavepointGuard`).
+    let mut plan = crate::relinking::plan_relink(&conn, &old_path, &new_path).map_err(|e| {
+        tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
+        ApiError::Internal(format!("Relinking failed: {}", e))
     })?;
-    let relinked = (|| -> Result<(RelinkResult, crate::zip_store::catalog::ZipRelink), ApiError> {
-        let result = crate::relinking::relink_files(&conn, &old_path, &new_path).map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
-            ApiError::Internal(format!("Relinking failed: {}", e))
-        })?;
-        // Zips are whole files: each one that stands at the same place under the new root takes its frames'
-        // rows along (they were left out of the fingerprint match above).
-        let zips = crate::zip_store::catalog::relink_zips(&conn, &old_path, &new_path).map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "relinking zips failed");
-            ApiError::Internal(format!("Relinking zips failed: {e:#}"))
-        })?;
-        Ok((result, zips))
-    })();
-    let (result, zips) = match relinked {
-        Ok(v) => {
-            conn.execute_batch("RELEASE relink_root").map_err(|e| {
-                tracing::error!(root_id, error = %e, "failed to commit the relink");
-                ApiError::Internal(format!("Relinking failed: {e}"))
-            })?;
-            v
-        }
-        Err(e) => {
-            if let Err(rollback) = conn.execute_batch("ROLLBACK TO relink_root; RELEASE relink_root") {
-                tracing::error!(root_id, error = %rollback, "relink rollback failed");
-            }
-            return Err(e);
-        }
+
+    // Then all the writes in one immediate transaction: the file updates, the zips and the root path move
+    // together or not at all, and the write lock is taken before the first read of the zip half.
+    let write_failed = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::error!(root_id, error = %e, "{what}");
+        ApiError::Internal(format!("Relinking failed: {e}"))
     };
+    let tx = crate::db::SavepointGuard::new(&conn, "relink_root")
+        .map_err(|e| write_failed("failed to open the relink transaction", &e))?;
+    crate::relinking::apply_relink(&conn, &plan).map_err(|e| {
+        tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
+        ApiError::Internal(format!("Relinking failed: {}", e))
+    })?;
+    // Zips are whole files: each one that stands at the same place under the new root takes its frames'
+    // rows along (they were left out of the fingerprint match above).
+    let zips = crate::zip_store::catalog::relink_zips(&conn, &old_path, &new_path).map_err(|e| {
+        tracing::error!(root_id, path = %new_path, error = %e, "relinking zips failed");
+        ApiError::Internal(format!("Relinking zips failed: {e:#}"))
+    })?;
     tracing::info!(root_id, moved = zips.moved, present = zips.present, missing = zips.missing, "relink zips");
+    plan.set_zips_missing(zips.missing);
 
     // A root whose files are all gone but whose catalog knows zips that are not at the new location either
     // is the wrong folder: the zips count like files do. (Files that are orphaned are reviewed by the caller.)
+    let result = plan.result();
     let orphaned = result.files_orphaned + zips.missing;
     let matched = result.files_matched + zips.present;
     if old_path != new_path && result.files_orphaned == 0 && matched == 0 && zips.missing > 0 {
         tracing::warn!(root_id, path = %new_path, zips = zips.missing, "relink refused: none of the root's zips is at the new location");
+        // Nothing was written (no match, no zip present); dropping the guard rolls the transaction back.
         return Err(ApiError::Invalid(format!(
             "None of the {} zip(s) of this folder is at the new location; the folder path was not changed",
             zips.missing
@@ -1509,7 +1506,8 @@ pub fn relink_scan_root(
     }
 
     // Update scan root path if all files were matched
-    if orphaned == 0 || matched > 0 {
+    let root_path_moves = orphaned == 0 || matched > 0;
+    if root_path_moves {
         conn.execute(
             "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
             rusqlite::params![new_path, root_id],
@@ -1518,6 +1516,10 @@ pub fn relink_scan_root(
             tracing::error!(root_id, path = %new_path, error = %e, "failed to update scan root path");
             ApiError::Internal(format!("Failed to update scan root path: {}", e))
         })?;
+    }
+    tx.commit().map_err(|e| write_failed("failed to commit the relink", &e))?;
+    let result = plan.into_result();
+    if root_path_moves {
         tracing::info!(root_id, new_path = %new_path, "updated scan root path");
 
         // The calibration library is the only role stored as a SECOND copy
@@ -3677,6 +3679,7 @@ mod switch_library_tests {
 
         let result = relink_scan_root(&ctx, root_id, new_root.to_string_lossy().into_owned(), &PathPolicy::AllowAll).unwrap();
         assert_eq!(result.files_orphaned, 0, "zip-resident rows are never orphans");
+        assert_eq!(result.zips_missing, 1, "absent.zip is reported as missing");
 
         let db = db(&ctx).unwrap();
         let conn = db.conn();
@@ -3759,6 +3762,43 @@ mod switch_library_tests {
         relink_scan_root(&ctx, root_id, new_root.to_string_lossy().into_owned(), &PathPolicy::AllowAll).unwrap();
 
         assert_eq!(root_path(&ctx, root_id), new_root.to_string_lossy());
+    }
+
+    #[test]
+    fn relink_survives_another_connection_committing_during_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old_root = tmp.path().join("oldroot");
+        let root_id = root_with_zips(&ctx, &old_root, &[("a.zip", 1)]);
+        let new_root = crate::test_support::canonical_path(std::path::Path::new(&mkdirs(&tmp, "newroot")));
+        std::fs::copy(old_root.join("a.zip"), new_root.join("a.zip")).unwrap();
+
+        // A content-index job, the monitor or a scan of another root commits while the relink reads headers.
+        let db_path = tmp.path().join("catalog.db");
+        crate::relinking::AFTER_WALK_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let other = rusqlite::Connection::open(&db_path).unwrap();
+                other.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                other.execute("INSERT INTO scan_roots (path) VALUES ('/committed/during/the/walk')", []).unwrap();
+            }));
+        });
+        let result = relink_scan_root(&ctx, root_id, new_root.to_string_lossy().into_owned(), &PathPolicy::AllowAll);
+        crate::relinking::AFTER_WALK_HOOK.with(|h| *h.borrow_mut() = None);
+
+        let result = result.unwrap_or_else(|e| panic!("relink failed after a concurrent commit: {e}"));
+        assert_eq!(result.zips_missing, 0);
+        assert_eq!(root_path(&ctx, root_id), new_root.to_string_lossy(), "the root moved");
+        let db = db(&ctx).unwrap();
+        let other: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM scan_roots WHERE path = '/committed/during/the/walk'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(other, 1, "the concurrent commit really happened");
+        let moved: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM zip_archives WHERE path = ?1", [new_root.join("a.zip").to_string_lossy().as_ref()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, 1);
     }
 
     #[test]

@@ -290,6 +290,9 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
       refreshAll();
     } catch (e) {
       console.error('[FoldersTab] relink failed:', e);
+      // The hook's `error` is set by the same rejection and would paint the "Error loading folders" banner a
+      // third time (wrong noun); the alert and the notification below are the report.
+      clearRootsError();
       const msg = typeof e === 'string' ? e : String(e);
       showAlert('Relink failed', msg);
       notify({ title: 'Relink failed', detail: msg, kind: 'files', tone: 'warning' });

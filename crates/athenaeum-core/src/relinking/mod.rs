@@ -18,13 +18,45 @@ use walkdir::WalkDir;
 /// path. Its zip is relinked as a whole (`zip_store::catalog::relink_zips`).
 const NOT_ZIP_RESIDENT: &str = "NOT (f.archive_zip_path IS NOT NULL AND f.archive_path_in_zip IS NOT NULL)";
 
+/// The outcome of the read half of a relink: what the walk matched, and the path updates that apply it.
+/// Nothing in it has been written.
+#[derive(Debug)]
+pub struct RelinkPlan {
+    result: RelinkResult,
+    /// `(file_id, old_path, new_path, new_filename)` in walk order, so a fingerprint that occurs twice at the
+    /// new location still ends with the last file.
+    updates: Vec<(i64, String, String, String)>,
+}
+
+impl RelinkPlan {
+    /// The statistics the relink reports (matched, new, orphaned files).
+    pub fn result(&self) -> &RelinkResult {
+        &self.result
+    }
+
+    /// Record how many zips of the old root are not at the new location (the zip half of the relink).
+    pub fn set_zips_missing(&mut self, zips_missing: usize) {
+        self.result.zips_missing = zips_missing;
+    }
+
+    /// The statistics, once the plan has been applied.
+    pub fn into_result(self) -> RelinkResult {
+        self.result
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once when the walk of `plan_relink` has finished and before it returns, so a test can
+    /// commit from another connection exactly where a long walk leaves a window.
+    pub(crate) static AFTER_WALK_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Relink files from an old scan root path to a new location
 ///
-/// This function:
-/// 1. Builds a map of fingerprints -> (file_id, old_path) for files under old root
-/// 2. Scans the new directory to find FITS/XISF files
-/// 3. Matches files by their header fingerprints
-/// 4. Updates file paths in the database for matched files
+/// Reads, then writes: [`plan_relink`] (the fingerprint map and the walk, with no transaction needed) and
+/// [`apply_relink`] (the path updates). A caller that must write more in the same transaction (the scan-root
+/// relink) calls the two itself and opens its transaction between them.
 ///
 /// # Arguments
 ///
@@ -40,6 +72,24 @@ pub fn relink_files(
     old_root_path: &str,
     new_root_path: &str,
 ) -> Result<RelinkResult> {
+    let plan = plan_relink(conn, old_root_path, new_root_path)?;
+    apply_relink(conn, &plan)?;
+    Ok(plan.result)
+}
+
+/// The read half of a relink:
+/// 1. Builds a map of fingerprints -> (file_id, old_path) for files under old root
+/// 2. Scans the new directory to find FITS/XISF files
+/// 3. Matches files by their header fingerprints
+///
+/// It writes nothing, and it must be called with no transaction open: the walk reads every header under the
+/// new root (minutes on a large or NAS root), and a read snapshot held across it would make the first write
+/// afterwards fail with "database is locked" whenever another connection committed meanwhile.
+pub fn plan_relink(
+    conn: &Connection,
+    old_root_path: &str,
+    new_root_path: &str,
+) -> Result<RelinkPlan> {
     tracing::info!(src = %old_root_path, dest = %new_root_path, "starting relink");
 
     // Check if paths are the same - run verification mode instead
@@ -48,7 +98,10 @@ pub fn relink_files(
             path = %old_root_path,
             "src and dest identical, running verification instead of relink"
         );
-        return verify_files_at_location(conn, old_root_path);
+        return Ok(RelinkPlan {
+            result: verify_files_at_location(conn, old_root_path)?,
+            updates: Vec::new(),
+        });
     }
 
     // Step 1: Build fingerprint map for files under old root
@@ -98,8 +151,8 @@ pub fn relink_files(
     let mut files_matched = 0;
     let mut files_new = 0;
     let mut matched_file_ids = std::collections::HashSet::new();
-    // The walk reads headers and can take long; the matches are written afterwards in one go, so the
-    // database is not held mid-write while the disk is read.
+    // The walk reads headers and can take long; the matches are written afterwards by `apply_relink`, so the
+    // database is not held while the disk is read.
     let mut path_updates: Vec<(i64, String, String, String)> = Vec::new();
 
     // max_depth caps recursion in case follow_links hits a pathological
@@ -172,15 +225,6 @@ pub fn relink_files(
         }
     }
 
-    for (file_id, old_path, new_path_str, new_filename) in &path_updates {
-        conn.execute(
-            "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
-            params![new_path_str, new_filename, file_id],
-        )
-        .context("Failed to update file path")?;
-        tracing::debug!(file_id = *file_id, src = %old_path, dest = %new_path_str, "matched file to new location");
-    }
-
     // Step 3: Identify orphaned files (in DB but not found in new location)
     let orphaned_file_ids: Vec<i64> = fingerprint_map
         .values()
@@ -197,12 +241,37 @@ pub fn relink_files(
         "relinking complete"
     );
 
-    Ok(RelinkResult {
-        files_matched,
-        files_new,
-        files_orphaned,
-        orphaned_file_ids,
+    #[cfg(test)]
+    AFTER_WALK_HOOK.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook();
+        }
+    });
+
+    Ok(RelinkPlan {
+        result: RelinkResult {
+            files_matched,
+            files_new,
+            files_orphaned,
+            orphaned_file_ids,
+            zips_missing: 0,
+        },
+        updates: path_updates,
     })
+}
+
+/// The write half of a relink: every matched file takes its new path and filename, in walk order. The caller
+/// owns the transaction (see `api::relink_scan_root`).
+pub fn apply_relink(conn: &Connection, plan: &RelinkPlan) -> Result<()> {
+    for (file_id, old_path, new_path_str, new_filename) in &plan.updates {
+        conn.execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
+            params![new_path_str, new_filename, file_id],
+        )
+        .context("Failed to update file path")?;
+        tracing::debug!(file_id = *file_id, src = %old_path, dest = %new_path_str, "matched file to new location");
+    }
+    Ok(())
 }
 
 /// Verify files at a location (used when relinking to same directory)
@@ -269,6 +338,7 @@ fn verify_files_at_location(conn: &Connection, root_path: &str) -> Result<Relink
         files_new: 0, // No new files when verifying same location
         files_orphaned: files_missing,
         orphaned_file_ids: missing_file_ids,
+        zips_missing: 0,
     })
 }
 
@@ -353,9 +423,11 @@ pub fn delete_orphaned_files(conn: &Connection, file_ids: &[i64]) -> Result<usiz
     // Per-file, and per-file-fallible: one file whose unregister fails is
     // dropped from the purge (its row survives, so the lineage is still
     // undoable) rather than aborting the whole batch or being stranded. A failed
-    // LOOKUP is logged and the file treated as ordinary — same stance as the
-    // Black Hole paths: refusing a purge because one SELECT failed is worse than
-    // the stranding this guards against.
+    // MASTER lookup is logged and the file treated as ordinary — same stance as
+    // the Black Hole paths: refusing a purge because one SELECT failed is worse
+    // than the stranding this guards against. A failed ZIP-RESIDENCY lookup is
+    // the opposite: the row may hold frames that live only in a zip, so the
+    // whole purge stops before it deletes anything (fail closed).
     let mut deletable: Vec<i64> = Vec::with_capacity(file_ids.len());
     for &file_id in file_ids {
         // A zip-resident row is never an orphan: its bytes live in a zip, not at its path. Missing never
@@ -762,15 +834,13 @@ mod tests {
                 [],
             )
             .unwrap();
-            // The lookup reads the two zip markers; a `files` without them makes it fail with a DB error.
-            conn.execute_batch(
-                "ALTER TABLE files RENAME TO files_moved;
-                 CREATE VIEW files AS SELECT id, path, filename FROM files_moved;",
-            )
-            .unwrap_or_else(|e| panic!("fixture: {e}"));
+            // `files` stays a real table (the final DELETE would succeed), but the residency lookup reads
+            // a column that is gone, so only that lookup fails.
+            conn.execute_batch("ALTER TABLE files DROP COLUMN archive_path_in_zip")
+                .unwrap_or_else(|e| panic!("fixture: {e}"));
             let err = delete_orphaned_files(&conn, &[1, 2]).unwrap_err();
             assert!(format!("{err:#}").contains("zip-resident"), "{err:#}");
-            let left: i64 = conn.query_row("SELECT COUNT(*) FROM files_moved", [], |r| r.get(0)).unwrap();
+            let left: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
             assert_eq!(left, 2, "nothing was deleted");
         }
     }
