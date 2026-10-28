@@ -530,13 +530,10 @@ fn run_restore_inner(
                 .optional()?;
             let path_changed = new_path.to_str() != Some(current_path.as_deref().unwrap_or(f.source_path.as_str()));
             let path_arg = if path_changed { new_path.to_str() } else { None };
-            adb::unmark_file_archived(conn, file_id, path_arg, Some(&new_mtime), Some(new_size))?;
+            update_restored_row(conn, operation_id, f, Some((file_id, path_arg, &new_mtime, new_size)))?;
+        } else {
+            update_restored_row(conn, operation_id, f, None)?;
         }
-        // The entry now lives on disk: a later scan of the zip (kept for any reason) must not catalog it
-        // again. Written in this step so no later failure can leave a kept zip without its releases;
-        // cleanup drops them again together with a zip it deletes.
-        record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id))
-            .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
         catalog_done += 1;
         emit(
             emitter,
@@ -723,8 +720,29 @@ fn run_restore_inner(
     Ok(RestoreOutcome { conflicts, extracted })
 }
 
+/// The catalog side of one restored entry, in ONE transaction: the row becomes a disk row (when it has
+/// one) and the entry is released from its zip. The entry now lives on disk, so a later scan of the zip
+/// (kept for any reason) must not catalog it again; with the two writes apart, a crash between them would
+/// leave a disk row whose entry is not released, and that scan would add the entry as a foreign duplicate.
+/// Cleanup drops the releases again together with a zip it deletes.
+fn update_restored_row(
+    conn: &Connection,
+    operation_id: i64,
+    f: &ArchiveOperationFile,
+    row: Option<(i64, Option<&str>, &str, i64)>,
+) -> Result<()> {
+    let sp = crate::db::SavepointGuard::new(conn, "restore_release_entry")?;
+    if let Some((file_id, path_arg, new_mtime, new_size)) = row {
+        adb::unmark_file_archived(conn, file_id, path_arg, Some(new_mtime), Some(new_size))?;
+    }
+    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id))
+        .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
+    sp.commit()?;
+    Ok(())
+}
+
 /// Drops the catalog's memory of a zip that was deleted: the entries released from it and its row.
-fn forget_zip(conn: &Connection, zip: &str) -> Result<()> {
+pub(crate) fn forget_zip(conn: &Connection, zip: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM zip_released_entries WHERE zip_id IN (SELECT id FROM zip_archives WHERE path = ?1)",
         rusqlite::params![zip],
@@ -1976,5 +1994,49 @@ pub(crate) mod tests {
         assert_eq!(zip_count(arch.path()), 0, "the clean run deletes the zip");
         assert_eq!(zip_rows(), 0, "no row for a zip that is gone");
         assert_eq!(released_rows(), 0, "no releases for a zip that is gone");
+    }
+
+    /// The row's unmark and the entry's release are one transaction (spec 7.6): a failure of the second
+    /// leaves the row exactly as it was, still marked with its zip, instead of a disk row whose entry a
+    /// later scan of the kept zip would add again.
+    #[test]
+    fn the_unmark_and_the_release_of_a_restored_row_commit_together_or_not_at_all() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip, archive_entry_crc32)
+             VALUES (7, '/orig/L.fits', 'L.fits', 1, '2025-01-01T00:00:00Z', 'FITS', 3, '/a/z.zip', 'L.fits', 99)",
+            [],
+        )
+        .unwrap();
+        let mut f = op_file("/orig/L.fits");
+        f.target_zip_path = "/a/z.zip".into();
+        f.target_path_in_zip = "L.fits".into();
+        conn.execute_batch(
+            "CREATE TRIGGER no_release BEFORE INSERT ON zip_released_entries BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .unwrap();
+
+        let err = update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap_err();
+        assert!(format!("{err:#}").contains("injected"), "{err:#}");
+        let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
+            .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((op, zip.as_deref(), size), (Some(3), Some("/a/z.zip"), 1), "the unmark was undone");
+        assert!(conn.is_autocommit(), "no transaction is left open");
+
+        conn.execute_batch("DROP TRIGGER no_release").unwrap();
+        update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap();
+        let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
+            .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((op, zip, size), (None, None, 5));
+        let released: i64 = conn.query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(released, 1);
     }
 }

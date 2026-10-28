@@ -221,6 +221,17 @@ pub fn rollback_operation(
                 );
             }
         }
+        // Finalize records the zip (`zip_archives`) before the operation completes, so an operation that
+        // died in that window leaves a row for a zip that is now gone. A zip that could not be removed
+        // keeps its row: it is still there. Also covers a rollback re-run after the file was removed.
+        if !zp.exists() {
+            crate::archive::restore::forget_zip(conn, &f.target_zip_path)
+                .with_context(|| format!("forget the rolled-back zip {}", f.target_zip_path))
+                .map_err(|e| {
+                    tracing::error!(operation_id, path = %zp.display(), error = %format!("{e:#}"), "rollback could not drop the zip's catalog row");
+                    e
+                })?;
+        }
     }
 
     // 3. Delete staging dir.
@@ -674,6 +685,58 @@ mod tests {
 
         rollback_operation(&conn, op_id, &NullEmitter).unwrap();
         assert!(!Path::new(&zip).exists(), "the zip this operation published is removed");
+    }
+
+    /// Finalize records the zip before it marks the frame set; an operation that died between the two and is
+    /// rolled back must not leave the catalog listing a zip that no longer exists.
+    #[test]
+    fn rollback_forgets_the_zip_row_and_released_entries_of_the_zip_it_deletes() {
+        let (conn, arch, _scan, op_id) = fixture();
+        run_through_zip(&conn, &arch, op_id);
+        let zip = target_zip(&conn, op_id);
+        assert!(Path::new(&zip).exists());
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
+             VALUES (?1, 10, '2025-01-01T00:00:00Z', 3, '2025-01-01T00:00:00Z', ?2)",
+            params![zip, op_id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) SELECT id, 'x.fits' FROM zip_archives", []).unwrap();
+        // A zip of another operation is not touched.
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES ('/other.zip', 1, '', 1, '')",
+            [],
+        )
+        .unwrap();
+
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert!(!Path::new(&zip).exists(), "the published zip is removed");
+        let rows: Vec<String> = conn
+            .prepare("SELECT path FROM zip_archives")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec!["/other.zip".to_string()], "no row for the deleted zip");
+        let released: i64 = conn.query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(released, 0, "its released entries go with it");
+    }
+
+    #[test]
+    fn rollback_keeps_the_zip_row_of_a_zip_it_did_not_publish() {
+        let (conn, _arch, _scan, op_id) = fixture();
+        let zip = target_zip(&conn, op_id);
+        std::fs::write(&zip, b"older zip").unwrap();
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES (?1, 9, '', 1, '')",
+            params![zip],
+        )
+        .unwrap();
+        rollback_operation(&conn, op_id, &NullEmitter).unwrap();
+        assert_eq!(std::fs::read(&zip).unwrap(), b"older zip");
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM zip_archives", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "a zip the operation never published keeps its row");
     }
 
     #[test]

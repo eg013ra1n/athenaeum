@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+use crate::db::SavepointGuard;
 use crate::models::{File, Frame};
 
 /// One zip in a folder listing.
@@ -38,21 +39,14 @@ pub struct ZipListItem {
 }
 
 /// Runs `f` inside a savepoint: nested inside the caller's transaction when there is one, a transaction of
-/// its own otherwise. Rolled back whole on an error.
+/// its own otherwise (`BEGIN IMMEDIATE`, so the write lock is taken before the first statement and a scan
+/// committing meanwhile cannot make the first write fail on a stale read snapshot). Rolled back whole on an
+/// error.
 fn in_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch("SAVEPOINT zip_catalog_rename")?;
-    match f() {
-        Ok(v) => {
-            conn.execute_batch("RELEASE zip_catalog_rename")?;
-            Ok(v)
-        }
-        Err(e) => {
-            if let Err(rollback) = conn.execute_batch("ROLLBACK TO zip_catalog_rename; RELEASE zip_catalog_rename") {
-                tracing::error!(error = %rollback, "zip rename rollback failed");
-            }
-            Err(e)
-        }
-    }
+    let sp = SavepointGuard::new(conn, "zip_catalog_rename")?;
+    let value = f()?;
+    sp.commit()?;
+    Ok(value)
 }
 
 /// Whether the catalog knows a zip at exactly this path: a `zip_archives` row, or frames marked with it
@@ -633,5 +627,45 @@ mod tests {
         let absent = old_root.path().join("absent.zip").to_string_lossy().into_owned();
         assert!(rows.iter().any(|(p, z)| p.starts_with(&absent) && z.as_deref() == Some(absent.as_str())), "{rows:?}");
         assert_eq!(rows.len(), 4, "no row was deleted");
+    }
+
+    /// A standalone rename takes the write lock before its first statement (the prefix rename reads first),
+    /// and a failure leaves nothing applied; nested in a caller's transaction it only opens a savepoint.
+    #[test]
+    fn the_rename_transaction_holds_the_write_lock_from_its_start_and_nests_in_a_callers_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("catalog.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(std::time::Duration::from_millis(0)).unwrap();
+
+        in_savepoint(&conn, || {
+            let err = other.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert!(err.to_string().contains("locked"), "another writer must wait: {err}");
+            Ok(())
+        })
+        .unwrap();
+        assert!(conn.is_autocommit(), "the transaction is closed again");
+        other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+
+        // A failed body is rolled back whole.
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, '/r')", []).unwrap();
+        let failed: Result<()> = in_savepoint(&conn, || {
+            conn.execute("UPDATE scan_roots SET path = '/changed' WHERE id = 1", [])?;
+            anyhow::bail!("boom")
+        });
+        assert!(failed.is_err());
+        let root: String = conn.query_row("SELECT path FROM scan_roots WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(root, "/r");
+        assert!(conn.is_autocommit());
+
+        // Inside a caller's transaction: the caller decides.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        in_savepoint(&conn, || Ok(conn.execute("UPDATE scan_roots SET path = '/nested' WHERE id = 1", [])?)).unwrap();
+        assert!(!conn.is_autocommit(), "the caller's transaction is still open");
+        conn.execute_batch("ROLLBACK").unwrap();
+        let root: String = conn.query_row("SELECT path FROM scan_roots WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(root, "/r", "the caller rolled the nested work back");
     }
 }

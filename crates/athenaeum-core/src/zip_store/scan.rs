@@ -559,6 +559,19 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     if gone == new_zip_path {
         return Ok(());
     }
+    // The operation that built the zip finds it by this path (Unarchive extracts from it, the scanner
+    // recognises the operation's entries through it). An entry whose row still points at the old zip
+    // stays with it: that zip is not here to extract from either way.
+    let repointed = conn.execute(
+        "UPDATE archive_operation_files SET target_zip_path = ?1
+         WHERE target_zip_path = ?2
+           AND NOT EXISTS (SELECT 1 FROM files f
+                           WHERE f.id = archive_operation_files.file_id AND f.archive_zip_path = ?2)",
+        params![new_zip_path, gone],
+    )?;
+    if repointed > 0 {
+        tracing::info!(src = %gone, dest = %new_zip_path, entries = repointed, "archive operation entries follow the renamed zip");
+    }
     let old: Option<(i64, Option<i64>)> = conn
         .query_row("SELECT id, created_by_operation FROM zip_archives WHERE path = ?1", params![gone], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -752,15 +765,24 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         }
     }
 
-    // Entries the user unpacked from a zip that was then moved are released there, not here.
+    // Entries the user unpacked from a zip that was then moved are released there, not here. Entries the
+    // operation that built that zip copied into it (a library master, copied darks) have no row by design,
+    // exactly as in a zip the catalog already knows: they are not new frames of the renamed zip.
+    let mut written_by_gone_operation: HashSet<String> = HashSet::new();
     for gone in &tally.gone_zips {
         released.extend(released_entries_of(conn, gone)?);
+        written_by_gone_operation.extend(entries_written_by_creating_operation(conn, gone)?);
     }
 
     // Pass 2: whatever no row adopted is a new row, unless it was unpacked by the user.
     for (entry, parsed) in pending {
         if released.contains(&entry.path) {
             tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "released entry not re-added");
+            continue;
+        }
+        if written_by_gone_operation.contains(&entry.path) {
+            tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "entry copied in by the zip's own operation not cataloged");
+            tally.cataloged += 1;
             continue;
         }
         match insert_entry(conn, &zip_str, entry, *parsed, root_id, unique_camera) {
@@ -1547,6 +1569,53 @@ mod scan_tests {
         let again = scan_zip(&conn, &b, 1, false).unwrap();
         assert_eq!(again.inserted.len(), 1, "only L_003");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
+    }
+
+    #[test]
+    fn the_operation_follows_the_entries_the_renamed_zip_holds_and_not_the_ones_it_lost() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let files = [("L_001.fits", light(1)), ("L_002.fits", light(2))];
+        let a = make_zip(tmp.path(), "a.zip", &files, ArchiveCompression::Store);
+        let a_str = a.to_str().unwrap().to_string();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        let op = insert_operation(&conn);
+        // Rows as Move and ZIP leaves them: original path, zip markers, the operation.
+        for (i, (entry, bytes)) in files.iter().enumerate() {
+            let id = 500 + i as i64;
+            let probe = tmp.path().join(format!("probe{i}.fits"));
+            std::fs::write(&probe, bytes).unwrap();
+            let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
+                 VALUES (?1, ?2, ?3, 1, '2025-01-01T00:00:00Z', 'FITS', ?4, ?5, ?3)",
+                params![id, format!("/data/original/{entry}"), entry, op, a_str],
+            )
+            .unwrap();
+            crate::db::insert_fits_header(&conn, id, &header).unwrap();
+            conn.execute("INSERT INTO frames (file_id) VALUES (?1)", params![id]).unwrap();
+            conn.execute(
+                "INSERT INTO archive_operation_files (operation_id, file_id, source_path, target_zip_path, target_path_in_zip, expected_hash, disposition, frame_role, file_size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'h', 'move', 'light', 1)",
+                params![op, id, format!("/data/original/{entry}"), a_str, entry],
+            )
+            .unwrap();
+        }
+        // The zip is replaced by one that holds only L_001.
+        std::fs::remove_file(&a).unwrap();
+        let b = make_zip(tmp.path(), "b.zip", &files[..1], ArchiveCompression::Store);
+        let outcome = scan_zip(&conn, &b, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        let target_of = |entry: &str| -> String {
+            conn.query_row(
+                "SELECT target_zip_path FROM archive_operation_files WHERE target_path_in_zip = ?1",
+                params![entry],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(target_of("L_001.fits"), b.to_str().unwrap(), "the held entry's operation file follows the zip");
+        assert_eq!(target_of("L_002.fits"), a_str, "the lost entry's row still points at the old zip, and so does its operation file");
     }
 
     #[test]

@@ -351,3 +351,130 @@ fn unarchive_after_deleting_two_restored_files_extracts_exactly_those_two() {
         assert_eq!(std::fs::read(p).unwrap(), format!("light-bytes-{i}").as_bytes());
     }
 }
+
+/// A small valid FITS calibration frame (`imagetyp`) whose header depends on `seed`.
+fn calibration_fits(imagetyp: &str, seed: u32) -> Vec<u8> {
+    let seq = format!("SEQNUM  = {seed:>20}");
+    let typ = format!("IMAGETYP= '{imagetyp:<8}'");
+    let mut out = Vec::new();
+    for c in [
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "TELESCOP= 'T       '",
+        "INSTRUME= 'C       '",
+        typ.as_str(),
+        seq.as_str(),
+        "END",
+    ] {
+        out.extend(card(c));
+    }
+    while out.len() % 2880 != 0 {
+        out.push(b' ');
+    }
+    out
+}
+
+/// A Move-and-ZIP zip that holds a moved raw dark and a copied master dark is renamed outside the app and
+/// picked up by the next scan: the operation follows the zip (Unarchive still finds it) and the copied
+/// master is not cataloged as a foreign row of the renamed zip.
+#[test]
+fn a_zip_renamed_outside_the_app_stays_restorable_and_its_copied_entries_stay_rowless() {
+    use athenaeum_core::scanner::scan_directory;
+    use athenaeum_core::zip_store::scan::scan_zip;
+
+    let arch = TempDir::new().unwrap();
+    let scan = TempDir::new().unwrap();
+    let light = scan.path().join("M31/L_001.fits");
+    let light2 = scan.path().join("M31/L_002.fits");
+    let raw_dark = scan.path().join("Cal/Dark_001.fits");
+    let master = scan.path().join("Cal/MasterDark.fits");
+    for p in [&light, &raw_dark, &master] {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    }
+    std::fs::write(&light, light_fits(1)).unwrap();
+    std::fs::write(&light2, light_fits(4)).unwrap();
+    let raw_bytes = calibration_fits("Dark", 2);
+    std::fs::write(&raw_dark, &raw_bytes).unwrap();
+    std::fs::write(&master, calibration_fits("Dark", 3)).unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).unwrap();
+    conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [scan.path().to_str().unwrap()]).unwrap();
+    let result = scan_directory(scan.path(), &conn, None, false, 1);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let ids = |name: &str| -> (i64, i64) {
+        conn.query_row(
+            "SELECT f.id, fr.id FROM files f JOIN frames fr ON fr.file_id = f.id WHERE f.filename = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let (_, light_frame) = ids("L_001.fits");
+    let (_, light2_frame) = ids("L_002.fits");
+    let (raw_file, raw_frame) = ids("Dark_001.fits");
+    let (_, master_frame) = ids("MasterDark.fits");
+    conn.execute("UPDATE frames SET is_master = 1 WHERE id = ?1", [master_frame]).unwrap();
+
+    conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+    conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+    conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+    for f in [light_frame, light2_frame] {
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [f]).unwrap();
+    }
+    // The raw dark belongs to the night's own set; the master to a library set (the archive copies those).
+    conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')", []).unwrap();
+    conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (501, 'Dark', '2025-10-10', 1)", []).unwrap();
+    conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, ?1)", [raw_frame]).unwrap();
+    conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (501, ?1)", [master_frame]).unwrap();
+    for (frame, set) in [(light_frame, 500), (light2_frame, 501)] {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) VALUES (?1, 'frame', ?2, 'Dark', '2025-10-12')",
+            params![frame, set],
+        )
+        .unwrap();
+    }
+
+    let dispositions = Dispositions { flats: None, darks: Some(ArchiveDisposition::Move), bias: None, darkflats: None };
+    let plan = build_plan(&conn, 1, arch.path(), &dispositions, ArchiveCompression::Store).unwrap();
+    let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+    run_operation(&conn, op_id, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
+    assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "completed");
+    assert!(!raw_dark.exists() && master.exists(), "the raw dark moved, the master was copied");
+    let rows_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows_before, 4, "two lights, the raw dark, the master");
+
+    // The user renames the dark zip in Finder; the next scan finds it under its new name.
+    let old_zip: String = conn.query_row("SELECT archive_zip_path FROM files WHERE id = ?1", [raw_file], |r| r.get(0)).unwrap();
+    let copied_in_old: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_operation_files WHERE target_zip_path = ?1 AND disposition = 'copy'", [&old_zip], |r| r.get(0))
+        .unwrap();
+    assert_eq!(copied_in_old, 1, "the master dark shares the zip of the moved raw dark");
+    let renamed = Path::new(&old_zip).with_file_name("renamed_by_finder.zip");
+    std::fs::rename(&old_zip, &renamed).unwrap();
+    let outcome = scan_zip(&conn, &renamed, 1, false).unwrap();
+    assert_eq!(outcome.adopted, 1, "the raw dark's row follows the zip");
+    assert!(outcome.inserted.is_empty(), "the copied master is not a new frame: {:?}", outcome.inserted);
+    let rows_after: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows_after, 4, "no foreign row for the copied master");
+    let stale: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_operation_files WHERE target_zip_path = ?1", [&old_zip], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stale, 0, "the operation's files follow the zip");
+
+    // A second scan of the (unchanged) zip keeps skipping the operation's copy.
+    conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+    let again = scan_zip(&conn, &renamed, 1, false).unwrap();
+    assert!(again.inserted.is_empty(), "{:?}", again.inserted);
+    assert_eq!(conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap(), 4);
+
+    // Unarchive finds the renamed zip.
+    let restore_target = TempDir::new().unwrap();
+    let restored = run_restore(&conn, op_id, restore_target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter)
+        .expect("Unarchive must find the renamed zip");
+    assert!(restored.conflicts.is_empty(), "{:?}", restored.conflicts);
+    let path: String = conn.query_row("SELECT path FROM files WHERE id = ?1", [raw_file], |r| r.get(0)).unwrap();
+    assert!(path.starts_with(restore_target.path().to_str().unwrap()), "{path}");
+    assert_eq!(std::fs::read(&path).unwrap(), raw_bytes);
+}

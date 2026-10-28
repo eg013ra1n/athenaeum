@@ -998,23 +998,25 @@ pub fn rename_path(
     // Hot-sync catalog rows. Fatal on failure — see RULE-2 FLAG doc above. One transaction, so a zip's rows
     // and its frames' virtual paths never end up half renamed.
     let synced = (|| -> Result<(), ApiError> {
-        let tx = conn.unchecked_transaction()?;
+        // BEGIN IMMEDIATE: the collision reads above are outside it, so the write lock is taken before the
+        // first write instead of upgrading a stale read snapshot ("database is locked" after the disk rename).
+        let tx = crate::db::SavepointGuard::new(&conn, "rename_path_catalog")?;
         if is_dir {
             // Recursively rewire every catalog row under the renamed folder via
             // the SUBSTR-based prefix swap (REPLACE is unsafe — see
             // `rename_files_path_prefix` doc).
             let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
-            let updated = crate::db::rename_files_path_prefix(&tx, &prefix_old, &prefix_new)?;
+            let updated = crate::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new)?;
             // The swap above already moved the virtual paths of the frames inside zips; the zips' own rows and
             // markers follow here, and a virtual path is rewritten only where it still has the old spelling.
-            let zips = crate::zip_store::catalog::rename_zip_prefix(&tx, &prefix_old, &prefix_new).map_err(zip_catalog_err)?;
+            let zips = crate::zip_store::catalog::rename_zip_prefix(&conn, &prefix_old, &prefix_new).map_err(zip_catalog_err)?;
             tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
         } else {
-            let updated = tx.execute(
+            let updated = conn.execute(
                 "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
                 rusqlite::params![&new_str, &new_name, &old_str],
             )?;
-            let zips = crate::zip_store::catalog::rename_zip(&tx, &old_str, &new_str).map_err(zip_catalog_err)?;
+            let zips = crate::zip_store::catalog::rename_zip(&conn, &old_str, &new_str).map_err(zip_catalog_err)?;
             tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
         }
         tx.commit()?;
