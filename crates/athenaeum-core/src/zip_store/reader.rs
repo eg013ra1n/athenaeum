@@ -208,6 +208,18 @@ pub fn entry_crc32(zip: &Path, entry: &str) -> Result<Option<u32>> {
     Ok(Some(file.crc32()))
 }
 
+/// The CRC32 and uncompressed size the zip's directory records for `entry`; `None` when there is no such
+/// entry. Reads the directory only.
+pub fn entry_crc32_and_size(zip: &Path, entry: &str) -> Result<Option<(u32, u64)>> {
+    let (mut archive, _) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let names = index_by_name(&archive);
+    let Some(&index) = names.get(entry) else {
+        return Ok(None);
+    };
+    let file = archive.by_index_raw(index).with_context(|| format!("open entry {entry} of {}", zip.display()))?;
+    Ok(Some((file.crc32(), file.size())))
+}
+
 /// The CRC32 the zip's directory records for every entry, by decoded name (unfiltered, first entry wins
 /// when a name repeats). One directory read for the whole zip: callers that need many entries' CRCs ask
 /// once per zip instead of calling [`entry_crc32`] per entry.

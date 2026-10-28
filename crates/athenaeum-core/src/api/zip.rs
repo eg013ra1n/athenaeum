@@ -165,6 +165,32 @@ fn dest_for_entry(dest_dir: &Path, entry: &str) -> Option<PathBuf> {
     (dest != dest_dir && dest.starts_with(dest_dir)).then_some(dest)
 }
 
+/// Creates the folders above `dest` and checks, through symlinks, that they are inside `dest_dir`.
+/// `dest_for_entry` only judges the spelling; a symlinked sub-folder that already exists under `dest_dir`
+/// would send the write elsewhere. The deepest existing folder is checked before anything is created (so
+/// nothing is made outside) and the final parent is checked again.
+fn make_parent_inside(dest_dir: &Path, dest: &Path) -> Result<(), String> {
+    let parent = dest.parent().ok_or_else(|| "refused: no destination folder".to_string())?;
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+    let root = dest_dir.canonicalize().map_err(|e| format!("cannot resolve {}: {e}", dest_dir.display()))?;
+    let outside = || format!("refused: {} is outside the destination", parent.display());
+    let mut existing = parent;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(outside)?;
+    }
+    let real = existing.canonicalize().map_err(|e| format!("cannot resolve {}: {e}", existing.display()))?;
+    if !real.starts_with(&root) {
+        return Err(outside());
+    }
+    std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let real = parent.canonicalize().map_err(|e| format!("cannot resolve {}: {e}", parent.display()))?;
+    if real.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(outside())
+    }
+}
+
 /// Moves the zip-resident frames of `target` out of their foreign zips into `dest_dir/<entry path>`.
 ///
 /// Per frame: the entry is placed without replacing anything ([`place_entry`]); an identical file already
@@ -289,6 +315,11 @@ pub(crate) fn unpack_file_ids(
                 .optional()?;
             if owner.is_some() {
                 conflict(&mut outcome, &row.entry, format!("another catalog frame owns {dest_str}"));
+                continue;
+            }
+
+            if let Err(why) = make_parent_inside(dest_dir, &dest) {
+                conflict(&mut outcome, &row.entry, why);
                 continue;
             }
 
@@ -534,6 +565,26 @@ mod tests {
         assert!(!Path::new("/abs/evil.fits").exists());
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
         assert!(zip.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_subfolder_pointing_outside_refuses_that_entry() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let base = TempDir::new().unwrap();
+        let out = base.path().join("target");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, out.join("Lights")).unwrap();
+
+        let outcome = run(&conn, &ids, &out);
+        assert_eq!(outcome.unpacked + outcome.adopted, 0);
+        assert_eq!(outcome.conflicts.len(), 2);
+        assert!(outcome.conflicts.iter().all(|c| c.contains("outside the destination")), "{:?}", outcome.conflicts);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing is written outside");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
     }
 
     #[test]

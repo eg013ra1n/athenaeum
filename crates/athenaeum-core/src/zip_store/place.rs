@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 
 use super::cache::sweep_stale_beside;
-use super::reader::{entry_crc32, extract_entry, staged_path};
+use super::reader::{entry_crc32_and_size, extract_entry, staged_path};
 use super::scan::file_crc32;
 
 /// What [`place_entry`] did.
@@ -23,7 +23,7 @@ use super::scan::file_crc32;
 pub enum PlaceOutcome {
     /// The entry was extracted to `dest`.
     Placed,
-    /// `dest` already held exactly the entry's bytes (CRC32 equal); nothing was written.
+    /// `dest` already held exactly the entry's bytes (CRC32 and size equal); nothing was written.
     AdoptedExisting,
     /// `dest` holds something else (or something that cannot be checked); it was left untouched.
     Conflict(String),
@@ -54,10 +54,13 @@ fn verdict_on_existing(zip: &Path, entry: &str, expected_crc: Option<u32>, dest:
     if !meta.is_file() {
         return Ok(Some(PlaceOutcome::Conflict(format!("{} exists and is not a regular file", dest.display()))));
     }
-    let expected = match expected_crc {
-        Some(crc) => crc,
-        None => entry_crc32(zip, entry)?.ok_or_else(|| anyhow!("entry {entry} not found in {}", zip.display()))?,
-    };
+    let (dir_crc, entry_size) = entry_crc32_and_size(zip, entry)?
+        .ok_or_else(|| anyhow!("entry {entry} not found in {}", zip.display()))?;
+    let expected = expected_crc.unwrap_or(dir_crc);
+    // The size is the cheap test: a file of another length is not the entry, and is not read.
+    if meta.len() != entry_size {
+        return Ok(Some(PlaceOutcome::Conflict(format!("a different file is already at {}", dest.display()))));
+    }
     match file_crc32(dest) {
         Ok(actual) if actual == expected => Ok(Some(PlaceOutcome::AdoptedExisting)),
         Ok(_) => Ok(Some(PlaceOutcome::Conflict(format!("a different file is already at {}", dest.display())))),
@@ -72,7 +75,7 @@ fn verdict_on_existing(zip: &Path, entry: &str, expected_crc: Option<u32>, dest:
 ///
 /// - `dest` free: the entry is extracted (CRC32-checked against the zip, and against `expected_crc` when
 ///   given) and published at `dest`: [`PlaceOutcome::Placed`].
-/// - `dest` taken by a regular file whose CRC32 equals the entry's (`expected_crc`, else the zip
+/// - `dest` taken by a regular file whose size equals the entry's and whose CRC32 equals the entry's (`expected_crc`, else the zip
 ///   directory's): [`PlaceOutcome::AdoptedExisting`], nothing written.
 /// - `dest` taken by anything else: [`PlaceOutcome::Conflict`] with the reason, `dest` untouched.
 ///
@@ -200,6 +203,36 @@ mod tests {
         assert!(matches!(outcome, PlaceOutcome::Conflict(_)), "{outcome:?}");
         assert_eq!(std::fs::read(&other).unwrap(), b"someone else's capture", "the existing file is untouched");
         assert_eq!(names_beside(tmp.path()), vec!["other.fits", "same.fits", "src", "t.zip"], "no staging file is left");
+    }
+
+    #[test]
+    fn a_file_with_the_entrys_bytes_plus_a_tail_is_not_adopted() {
+        let tmp = TempDir::new().unwrap();
+        let zip = make_zip(tmp.path(), &[("L1.fits", b"light-one")]);
+        let dest = tmp.path().join("longer.fits");
+        std::fs::write(&dest, b"light-one-and-a-tail").unwrap();
+        let outcome = place_entry(&zip, "L1.fits", None, &dest, &AtomicBool::new(false)).unwrap();
+        assert!(matches!(outcome, PlaceOutcome::Conflict(_)), "{outcome:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"light-one-and-a-tail");
+    }
+
+    #[test]
+    fn only_our_own_temp_names_are_swept_beside_the_destination() {
+        let tmp = TempDir::new().unwrap();
+        let zip = make_zip(tmp.path(), &[("L_001.fits", b"light-one")]);
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let users = out.join("L_001.fits.partial");
+        let sync_tool = out.join("L_001.fits.a1b2c3.partial");
+        let half_pattern = out.join("L_001.fits.2147483632-x.partial");
+        let ours_dead = out.join("L_001.fits.2147483632-7.partial");
+        for p in [&users, &sync_tool, &half_pattern, &ours_dead] {
+            std::fs::write(p, b"keep me").unwrap();
+        }
+        let dest = out.join("L_001.fits");
+        assert_eq!(place_entry(&zip, "L_001.fits", None, &dest, &AtomicBool::new(false)).unwrap(), PlaceOutcome::Placed);
+        assert!(users.exists() && sync_tool.exists() && half_pattern.exists(), "foreign names are never removed");
+        assert!(!ours_dead.exists(), "a dead process's file of our pattern goes");
     }
 
     #[test]
