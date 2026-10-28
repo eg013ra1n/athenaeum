@@ -157,17 +157,21 @@ pub async fn move_zip_to_black_hole(
     app_handle: tauri::AppHandle,
 ) -> Result<i64, String> {
     let ctx = state.ctx.clone();
-    let id = tokio::task::spawn_blocking(move || {
+    let (id, zip_id) = tokio::task::spawn_blocking(move || {
         // AllowAll on the desktop host; the path must be a catalog zip, which the db function checks.
         let db = ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        db::add_zip_to_black_hole(&conn, &zip_path, &from_where).map_err(|e| e.to_string())
+        let id = db::add_zip_to_black_hole(&conn, &zip_path, &from_where).map_err(|e| e.to_string())?;
+        let zip_id = db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(|e| e.to_string())?;
+        Ok::<_, String>((id, zip_id))
     })
     .await
     .map_err(|e| format!("Black Hole task panicked: {}", e))??;
 
+    // `id` is the black_hole_zips row, `zip_id` the zip_archives row.
     let _ = app_handle.emit("blackhole-changed", serde_json::json!({
-        "zip_id": id,
+        "id": id,
+        "zip_id": zip_id,
         "action": "zip-blackholed"
     }));
     Ok(id)
@@ -198,16 +202,20 @@ pub async fn restore_zip_from_black_hole(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let ctx = state.ctx.clone();
-    tokio::task::spawn_blocking(move || {
+    let zip_id = tokio::task::spawn_blocking(move || {
         let db = ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        db::restore_zip_from_black_hole(&conn, id).map_err(|e| e.to_string())
+        // Read before the row goes: the event names the zip_archives row.
+        let zip_id = db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(|e| e.to_string())?;
+        db::restore_zip_from_black_hole(&conn, id).map_err(|e| e.to_string())?;
+        Ok::<_, String>(zip_id)
     })
     .await
     .map_err(|e| format!("Black Hole task panicked: {}", e))??;
 
     let _ = app_handle.emit("blackhole-changed", serde_json::json!({
-        "zip_id": id,
+        "id": id,
+        "zip_id": zip_id,
         "action": "zip-restored"
     }));
     Ok(())
@@ -223,16 +231,19 @@ pub async fn send_zip_to_void(
     app_handle: tauri::AppHandle,
 ) -> Result<usize, String> {
     let ctx = state.ctx.clone();
-    let rows = tokio::task::spawn_blocking(move || {
+    let (rows, zip_id) = tokio::task::spawn_blocking(move || {
         let db = ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        db::send_zip_to_void(&conn, id).map_err(|e| e.to_string())
+        let zip_id = db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(|e| e.to_string())?;
+        let rows = db::send_zip_to_void(&conn, id).map_err(|e| e.to_string())?;
+        Ok::<_, String>((rows, zip_id))
     })
     .await
     .map_err(|e| format!("Black Hole task panicked: {}", e))??;
 
     let _ = app_handle.emit("blackhole-changed", serde_json::json!({
-        "zip_id": id,
+        "id": id,
+        "zip_id": zip_id,
         "action": "zip-voided"
     }));
     Ok(rows)
