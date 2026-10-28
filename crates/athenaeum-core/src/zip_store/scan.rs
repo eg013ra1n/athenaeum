@@ -565,6 +565,15 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         }
     }
 
+    // The safety filter keeps NEW entries out of the catalog, but an entry a row already owns is known
+    // whatever its name: our own Move and ZIP entries carry `:` or a trailing space from object names.
+    // Such a row is neither re-added nor left uncounted.
+    for (name, _) in &listing.skipped {
+        if known.contains_key(name) {
+            tally.cataloged += 1;
+        }
+    }
+
     // One open of the zip, 4 KiB buffer, for every header still needed.
     let names: Vec<&str> = to_read.iter().map(|(e, _)| e.path.as_str()).collect();
     let headers = if names.is_empty() {
@@ -1390,5 +1399,39 @@ mod scan_tests {
         assert_eq!(outcome.inserted.len(), 1);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
+    }
+    #[test]
+    fn our_own_rows_with_odd_entry_names_stay_known_and_present() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let odd = "Lights: M33 /L_001.fits";
+        let zip = make_zip(tmp.path(), "n.zip", &[(odd, light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let zip_s = zip.to_str().unwrap().to_string();
+        // The shape a Move/ZIP leaves: the original disk path (gone), the zip and the entry name from the object name.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (700, '/gone/Lights: M33 /L_001.fits', 'L_001.fits', 10, '2026-01-01T00:00:00Z', 'FITS', 7, ?1, ?2)",
+            params![zip_s, odd],
+        )
+        .unwrap();
+
+        let mut presence = crate::zip_store::presence::ZipPresence::new();
+        assert!(
+            crate::zip_store::presence::row_is_present(&mut presence, "/gone/Lights: M33 /L_001.fits", Some(&zip_s), Some(odd)),
+            "the zip lists the entry, the safety filter does not apply to presence"
+        );
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.inserted.len(), 1, "only L_002 is new: {:?}", outcome.inserted);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "the odd entry is not inserted again");
+        let (path, zip_col, entry): (String, Option<String>, Option<String>) = conn
+            .query_row("SELECT path, archive_zip_path, archive_path_in_zip FROM files WHERE id = 700", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((path.as_str(), zip_col.as_deref(), entry.as_deref()), ("/gone/Lights: M33 /L_001.fits", Some(zip_s.as_str()), Some(odd)));
+        let frames: i64 = count(&conn, "SELECT frame_entries FROM zip_archives");
+        assert_eq!(frames, 2, "the known odd entry counts as cataloged");
     }
 }

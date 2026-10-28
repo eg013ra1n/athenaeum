@@ -8,12 +8,12 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::reader::list_entries;
+use super::reader::list_entry_names;
 
-/// Per call, opens each distinct zip's directory once.
+/// Per call, reads each distinct zip's raw directory names once (no safety filter, no local headers).
 #[derive(Debug, Default)]
 pub struct ZipPresence {
-    /// zip path → the entries its directory lists, or `None` when the zip is missing or unreadable.
+    /// zip path → the entry names its directory holds, or `None` when the zip is missing or unreadable.
     cache: HashMap<String, Option<HashSet<String>>>,
 }
 
@@ -48,8 +48,8 @@ impl ZipPresence {
                 return None;
             }
         }
-        match list_entries(path) {
-            Ok(listing) => Some(listing.entries.into_iter().map(|e| e.path).collect()),
+        match list_entry_names(path) {
+            Ok(names) => Some(names),
             Err(e) => {
                 tracing::warn!(zip_path = %zip, error = %e, "zip presence: cannot read the zip directory");
                 None
@@ -214,5 +214,46 @@ mod presence_tests {
         let db = ctx.db.get().unwrap();
         let rows: i64 = db.conn().query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 3, "missing never deletes");
+    }
+    #[test]
+    fn move_shaped_row_follows_the_zip_not_its_original_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let root = tmp.path().join("astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = crate::test_support::canonical_path(&root).to_string_lossy().to_string();
+        let root_id = add_scan_root(&ctx, root_s.clone(), &PathPolicy::AllowAll, None).unwrap().id.unwrap();
+
+        // Entry names as path_layout builds them: not sanitised, so ':' and a trailing space survive.
+        let odd = "Lights: M33 /L_001.fits";
+        let zip = make_zip(Path::new(&root_s), "n.zip", &[odd]);
+        let zip_s = zip.to_string_lossy().to_string();
+        // The row keeps its ORIGINAL disk path (the file is gone from it) plus the operation and the zip.
+        let original = format!("{root_s}{}Lights: M33 {}L_001.fits", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        {
+            let db = ctx.db.get().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format,
+                                        archived_in_operation, archive_zip_path, archive_path_in_zip)
+                     VALUES (?1, 'L_001.fits', 64, '2026-01-01T00:00:00Z', 'FITS', 7, ?2, ?3)",
+                    rusqlite::params![original, zip_s, odd],
+                )
+                .unwrap();
+        }
+        assert!(!Path::new(&original).exists());
+
+        let missing = check_missing_files_in_scan_root(&ctx, root_id, &crate::events::NullEmitter).unwrap();
+        assert!(missing.is_empty(), "the zip holds the entry: {missing:?}");
+
+        // A file appearing at the original path does not matter either way: the zip decides.
+        std::fs::remove_file(&zip).unwrap();
+        std::fs::create_dir_all(Path::new(&original).parent().unwrap()).unwrap();
+        std::fs::write(&original, b"x").unwrap();
+        let missing = check_missing_files_in_scan_root(&ctx, root_id, &crate::events::NullEmitter).unwrap();
+        assert_eq!(missing.len(), 1, "the zip is gone, so the row is missing even though a file sits at its path");
+        let db = ctx.db.get().unwrap();
+        let rows: i64 = db.conn().query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "missing never deletes");
     }
 }

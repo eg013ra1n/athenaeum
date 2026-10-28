@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -171,6 +171,27 @@ fn index_by_name(archive: &Archive) -> HashMap<String, usize> {
         }
     }
     map
+}
+
+/// The decoded names of every non-directory entry in the zip's central directory, unfiltered: the
+/// safety filter of [`list_entries`] does not apply, because this answers "does the zip hold this
+/// entry", never "may it be cataloged or written to disk". Our own Move and ZIP entries can carry
+/// `:` or a trailing space taken from object names, and they must still count as present.
+///
+/// Cost: opening the archive reads the central directory (one tail read plus the directory itself
+/// through the 4 KiB buffer); `name_for_index` is then an in-memory lookup, so there is no
+/// per-entry local-header read, unlike [`list_entries`].
+pub fn list_entry_names(zip: &Path) -> Result<HashSet<String>> {
+    let (archive, _) = open_archive(zip, HEADER_BUF_BYTES)?;
+    let mut names = HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        if let Some(name) = archive.name_for_index(index) {
+            if !name.ends_with('/') && !name.ends_with('\\') {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Read the zip's directory through a 4 KiB buffer. Reads the central directory plus each listed
