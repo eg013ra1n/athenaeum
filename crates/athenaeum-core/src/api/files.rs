@@ -970,8 +970,17 @@ pub fn rename_path(
     let old_str = old.to_string_lossy().to_string();
     let new_str = new.to_string_lossy().to_string();
     // A zip's catalog row at the new name (a zip deleted outside the app, never rescanned) would make the
-    // hot-sync fail after the file was already renamed; refuse before touching the disk.
-    if !is_dir && crate::zip_store::catalog::is_known_zip(&conn, &old_str).map_err(zip_catalog_err)? {
+    // hot-sync fail after the file was already renamed; refuse before touching the disk. The same for a
+    // folder: any zip or frame row under the new folder name that the swap would collide with.
+    if is_dir {
+        let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
+        let clash = crate::zip_store::catalog::rename_prefix_collision(&conn, &prefix_old, &prefix_new)
+            .map_err(zip_catalog_err)?;
+        if let Some(path) = clash {
+            tracing::warn!(src = %old_str, dest = %new_str, path = %path, "folder rename refused: the catalog already holds a path under the new name");
+            return Err(ApiError::Conflict(format!("the catalog already holds {path}")));
+        }
+    } else if crate::zip_store::catalog::is_known_zip(&conn, &old_str).map_err(zip_catalog_err)? {
         let taken = !is_same_file_case_variant(&old, &new)
             && crate::zip_store::catalog::is_known_zip(&conn, &new_str).map_err(zip_catalog_err)?;
         if taken {
@@ -988,27 +997,34 @@ pub fn rename_path(
 
     // Hot-sync catalog rows. Fatal on failure — see RULE-2 FLAG doc above. One transaction, so a zip's rows
     // and its frames' virtual paths never end up half renamed.
-    let tx = conn.unchecked_transaction()?;
-    if is_dir {
-        // Recursively rewire every catalog row under the renamed folder via
-        // the SUBSTR-based prefix swap (REPLACE is unsafe — see
-        // `rename_files_path_prefix` doc).
-        let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
-        let updated = crate::db::rename_files_path_prefix(&tx, &prefix_old, &prefix_new)?;
-        // The swap above already moved the virtual paths of the frames inside zips; the zips' own rows and
-        // markers follow here, and a virtual path is rewritten only where it still has the old spelling.
-        let zips = crate::zip_store::catalog::rename_zip_prefix(&tx, &prefix_old, &prefix_new).map_err(zip_catalog_err)?;
-        tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
-    } else {
-        let updated = tx.execute(
-            "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
-            rusqlite::params![&new_str, &new_name, &old_str],
-        )?;
-        let zips = crate::zip_store::catalog::rename_zip(&tx, &old_str, &new_str).map_err(zip_catalog_err)?;
-        tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
+    let synced = (|| -> Result<(), ApiError> {
+        let tx = conn.unchecked_transaction()?;
+        if is_dir {
+            // Recursively rewire every catalog row under the renamed folder via
+            // the SUBSTR-based prefix swap (REPLACE is unsafe — see
+            // `rename_files_path_prefix` doc).
+            let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
+            let updated = crate::db::rename_files_path_prefix(&tx, &prefix_old, &prefix_new)?;
+            // The swap above already moved the virtual paths of the frames inside zips; the zips' own rows and
+            // markers follow here, and a virtual path is rewritten only where it still has the old spelling.
+            let zips = crate::zip_store::catalog::rename_zip_prefix(&tx, &prefix_old, &prefix_new).map_err(zip_catalog_err)?;
+            tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
+        } else {
+            let updated = tx.execute(
+                "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
+                rusqlite::params![&new_str, &new_name, &old_str],
+            )?;
+            let zips = crate::zip_store::catalog::rename_zip(&tx, &old_str, &new_str).map_err(zip_catalog_err)?;
+            tracing::info!(count = updated, zips, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(e) = &synced {
+        // Recoverable: the transaction rolled back, so renaming back on disk restores consistency.
+        tracing::error!(src = %old_str, dest = %new_str, error = %e, "rename: disk renamed, catalog not updated");
     }
-    tx.commit()?;
-    Ok(())
+    synced
 }
 
 /// A zip bookkeeping failure at an API boundary: logged, then surfaced.
@@ -1841,5 +1857,126 @@ mod zip_whole_file_tests {
             .unwrap();
         assert_eq!(conn_zips, vec![new_foreign, new_ours]);
         assert!(foreign.parent().unwrap().ends_with("Old"), "the fixture zip lived in Old");
+    }
+
+    /// One cataloged frame `<root>/M31/L_001.fits` moved into a zip under `<root>/<archive_dir>` by the real
+    /// Move-and-ZIP pipeline. Returns the operation id and the frame's original path.
+    fn archive_one_frame(ctx: &ServiceContext, root: &Path, archive_dir: &str) -> (i64, PathBuf) {
+        use crate::archive::executor::run_operation;
+        use crate::archive::models::{ConflictResolution, Dispositions};
+        use crate::archive::planner::{build_plan, commit_plan};
+
+        let original = root.join("M31").join("L_001.fits");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"first-frame").unwrap();
+        let arch = root.join(archive_dir);
+        std::fs::create_dir_all(&arch).unwrap();
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (1000, ?1, 'L_001.fits', 11, '2025-10-12', 'FITS')",
+            [original.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp) VALUES (10000, 1000, 'M31', 'T', 'C', 'Light')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+        let plan = build_plan(
+            &conn,
+            1,
+            &arch,
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        )
+        .unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        run_operation(&conn, op_id, &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &crate::events::NullEmitter)
+            .unwrap();
+        assert!(!original.exists(), "the frame moved into the zip");
+        (op_id, original)
+    }
+
+    fn operation_zips(ctx: &ServiceContext, op_id: i64) -> Vec<String> {
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        crate::archive::db::list_operation_files(&conn, op_id).unwrap().into_iter().map(|f| f.target_zip_path).collect()
+    }
+
+    fn restore(ctx: &ServiceContext, op_id: i64, root: &Path) -> anyhow::Result<crate::archive::models::RestoreOutcome> {
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        crate::archive::restore::run_restore(
+            &conn,
+            op_id,
+            root,
+            false,
+            false,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &crate::events::NullEmitter,
+        )
+    }
+
+    #[test]
+    fn a_renamed_move_and_zip_zip_still_unarchives() {
+        let (_tmp, ctx, root) = fixture();
+        let (op_id, original) = archive_one_frame(&ctx, &root, "arch");
+        let zip = PathBuf::from(operation_zips(&ctx, op_id).remove(0));
+
+        rename_path(&ctx, zip.to_string_lossy().into_owned(), "renamed.zip".into(), &PathPolicy::AllowAll).unwrap();
+
+        let renamed = zip.with_file_name("renamed.zip").to_string_lossy().into_owned();
+        assert_eq!(operation_zips(&ctx, op_id), vec![renamed], "the operation names the zip where it is now");
+        restore(&ctx, op_id, &root).expect("the unarchive finds the renamed zip");
+        assert_eq!(std::fs::read(&original).unwrap(), b"first-frame");
+    }
+
+    #[test]
+    fn a_renamed_folder_of_move_and_zip_zips_still_unarchives() {
+        let (_tmp, ctx, root) = fixture();
+        let (op_id, original) = archive_one_frame(&ctx, &root, "arch");
+
+        rename_path(&ctx, root.join("arch").to_string_lossy().into_owned(), "arch2".into(), &PathPolicy::AllowAll).unwrap();
+
+        for z in operation_zips(&ctx, op_id) {
+            assert!(z.contains("arch2") && Path::new(&z).is_file(), "{z}");
+        }
+        restore(&ctx, op_id, &root).expect("the unarchive finds the zips of the renamed folder");
+        assert_eq!(std::fs::read(&original).unwrap(), b"first-frame");
+    }
+
+    #[test]
+    fn renaming_a_folder_onto_stale_catalog_paths_is_refused_before_the_disk_moves() {
+        let (_tmp, ctx, root) = fixture();
+        let old_dir = root.join("Old");
+        std::fs::create_dir(&old_dir).unwrap();
+        scan_into(&ctx, &old_dir, "night.zip", 1);
+        // A zip row under the new folder name whose file is gone (never rescanned).
+        let stale = root.join("New").join("night.zip");
+        ctx.db
+            .get()
+            .unwrap()
+            .conn()
+            .execute(
+                "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES (?1, 1, 't', 1, 't')",
+                [stale.to_str().unwrap()],
+            )
+            .unwrap();
+        let before = rows(&ctx);
+
+        let err = rename_path(&ctx, old_dir.to_string_lossy().into_owned(), "New".into(), &PathPolicy::AllowAll).unwrap_err();
+
+        assert!(matches!(err, ApiError::Conflict(_)), "{err}");
+        assert!(old_dir.is_dir() && !root.join("New").exists(), "the folder was not renamed");
+        assert_eq!(rows(&ctx), before, "the catalog was not touched");
     }
 }

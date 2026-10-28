@@ -98,6 +98,9 @@ pub fn relink_files(
     let mut files_matched = 0;
     let mut files_new = 0;
     let mut matched_file_ids = std::collections::HashSet::new();
+    // The walk reads headers and can take long; the matches are written afterwards in one go, so the
+    // database is not held mid-write while the disk is read.
+    let mut path_updates: Vec<(i64, String, String, String)> = Vec::new();
 
     // max_depth caps recursion in case follow_links hits a pathological
     // symlink loop (walkdir's loop detection isn't bulletproof on every
@@ -160,25 +163,22 @@ pub fn relink_files(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| new_path_str.clone());
 
-            // Update the file path in database
-            conn.execute(
-                "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
-                params![new_path_str, new_filename, file_id],
-            )
-            .context("Failed to update file path")?;
-
-            tracing::debug!(
-                file_id = *file_id,
-                src = %old_path,
-                dest = %new_path_str,
-                "matched file to new location"
-            );
+            path_updates.push((*file_id, old_path.clone(), new_path_str, new_filename));
             files_matched += 1;
             matched_file_ids.insert(*file_id);
         } else {
             // File not in database
             files_new += 1;
         }
+    }
+
+    for (file_id, old_path, new_path_str, new_filename) in &path_updates {
+        conn.execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
+            params![new_path_str, new_filename, file_id],
+        )
+        .context("Failed to update file path")?;
+        tracing::debug!(file_id = *file_id, src = %old_path, dest = %new_path_str, "matched file to new location");
     }
 
     // Step 3: Identify orphaned files (in DB but not found in new location)
@@ -370,7 +370,12 @@ pub fn delete_orphaned_files(conn: &Connection, file_ids: &[i64]) -> Result<usiz
                 continue;
             }
             Ok(false) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(e) => tracing::error!(file_id, error = %e, "zip-residency lookup before orphan purge failed"),
+            Err(e) => {
+                // Fail closed: a row that may be zip-resident is never deleted on a lookup error, and the
+                // purge stops before it deletes anything.
+                tracing::error!(file_id, error = %e, "zip-residency lookup before orphan purge failed; purge aborted");
+                return Err(e).with_context(|| format!("check whether file {file_id} is zip-resident"));
+            }
         }
         match crate::db::master_unregister::master_set_id_for_file(conn, file_id) {
             Ok(Some(master_set_id)) => {
@@ -744,6 +749,29 @@ mod tests {
             assert_eq!(left, 2);
             // And the detail lookup does not list a zip-resident id either.
             assert!(get_orphaned_file_details(&conn, &ids).unwrap().is_empty());
+        }
+
+        #[test]
+        fn delete_orphaned_files_fails_closed_when_the_zip_residency_lookup_fails() {
+            let root = TempDir::new().unwrap();
+            let conn = catalog(root.path());
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (1, '/gone/a.fits', 'a.fits', 1, '2026-01-01T00:00:00Z', 'FITS'),
+                        (2, '/gone/b.fits', 'b.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            // The lookup reads the two zip markers; a `files` without them makes it fail with a DB error.
+            conn.execute_batch(
+                "ALTER TABLE files RENAME TO files_moved;
+                 CREATE VIEW files AS SELECT id, path, filename FROM files_moved;",
+            )
+            .unwrap_or_else(|e| panic!("fixture: {e}"));
+            let err = delete_orphaned_files(&conn, &[1, 2]).unwrap_err();
+            assert!(format!("{err:#}").contains("zip-resident"), "{err:#}");
+            let left: i64 = conn.query_row("SELECT COUNT(*) FROM files_moved", [], |r| r.get(0)).unwrap();
+            assert_eq!(left, 2, "nothing was deleted");
         }
     }
 }

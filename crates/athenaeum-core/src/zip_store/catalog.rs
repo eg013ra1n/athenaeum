@@ -10,6 +10,8 @@
 //! virtual paths through `db::rename_files_path_prefix` (they start with the folder prefix), and a row in
 //! that state no longer matches the old zip's spelling, so it is not touched a second time.
 //! `black_hole_zips` and `zip_released_entries` reference `zip_id`, which does not change.
+//! `archive_operation_files.target_zip_path` names the zip an operation wrote (unarchive extracts from it,
+//! the scanner recognises the operation's entries through it) and moves with the zip.
 
 use std::path::{Path, MAIN_SEPARATOR};
 
@@ -47,9 +49,15 @@ fn in_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T
     }
 }
 
-/// Whether the catalog holds a `zip_archives` row for exactly this path.
+/// Whether the catalog knows a zip at exactly this path: a `zip_archives` row, or frames marked with it
+/// (`files.archive_zip_path`, which a zip can carry without a row of its own).
 pub fn is_known_zip(conn: &Connection, path: &str) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM zip_archives WHERE path = ?1)", [path], |r| r.get(0))?)
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM zip_archives WHERE path = ?1)
+             OR EXISTS(SELECT 1 FROM files WHERE archive_zip_path = ?1)",
+        [path],
+        |r| r.get(0),
+    )?)
 }
 
 /// Moves one zip's bookkeeping from `old_zip` to `new_zip` (full paths). The caller has already moved the
@@ -58,7 +66,15 @@ pub fn rename_zip(conn: &Connection, old_zip: &str, new_zip: &str) -> Result<usi
     if old_zip == new_zip {
         return Ok(0);
     }
-    in_savepoint(conn, || move_one_zip(conn, old_zip, new_zip))
+    in_savepoint(conn, || {
+        let moved = move_one_zip(conn, old_zip, new_zip)?;
+        conn.execute(
+            "UPDATE archive_operation_files SET target_zip_path = ?1 WHERE target_zip_path = ?2",
+            params![new_zip, old_zip],
+        )
+        .with_context(|| format!("repoint the archive operations that wrote {old_zip}"))?;
+        Ok(moved)
+    })
 }
 
 fn move_one_zip(conn: &Connection, old_zip: &str, new_zip: &str) -> Result<usize> {
@@ -103,8 +119,48 @@ pub fn rename_zip_prefix(conn: &Connection, old_prefix: &str, new_prefix: &str) 
             let new = format!("{new_prefix}{rest}");
             renamed += move_one_zip(conn, &old, &new)?;
         }
+        // One range update for every operation file whose zip sat under the folder (the column has no index).
+        let hi = crate::db::path_prefix_upper(old_prefix);
+        conn.execute(
+            "UPDATE archive_operation_files SET target_zip_path = ?1 || SUBSTR(target_zip_path, LENGTH(?2) + 1)
+             WHERE target_zip_path >= ?2 AND (?3 IS NULL OR target_zip_path < ?3)",
+            params![new_prefix, old_prefix, hi],
+        )
+        .with_context(|| format!("repoint the archive operations that wrote zips under {old_prefix}"))?;
         Ok(renamed)
     })
+}
+
+/// Before a folder is renamed on disk: the first catalog path that the rename would collide with, if any. A
+/// zip under `old_prefix` whose new path already is a known zip, or a frame row whose renamed path already
+/// exists (stale rows under a folder name that is free on disk), would fail the catalog update after the
+/// disk rename.
+pub fn rename_prefix_collision(conn: &Connection, old_prefix: &str, new_prefix: &str) -> Result<Option<String>> {
+    if old_prefix == new_prefix {
+        return Ok(None);
+    }
+    for old in zips_under_prefix(conn, old_prefix)? {
+        if let Some(rest) = old.strip_prefix(old_prefix) {
+            let new = format!("{new_prefix}{rest}");
+            if is_known_zip(conn, &new)? {
+                return Ok(Some(new));
+            }
+        }
+    }
+    let hi = crate::db::path_prefix_upper(old_prefix);
+    let clash = conn
+        .query_row(
+            "SELECT t.path FROM files f JOIN files t ON t.path = ?1 || SUBSTR(f.path, LENGTH(?2) + 1)
+             WHERE f.archive_zip_path IS NOT NULL AND f.path >= ?2 AND (?3 IS NULL OR f.path < ?3) LIMIT 1",
+            params![new_prefix, old_prefix, hi],
+            |r| r.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })?;
+    Ok(clash)
 }
 
 /// Every zip path (from `zip_archives`, and from `files.archive_zip_path` for a zip with no row) in the
@@ -122,31 +178,47 @@ fn zips_under_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// What `relink_zips` found, for the wrong-folder check of a relink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZipRelink {
+    /// Zips of the old root that exist at the new location and now carry its path (or already did).
+    pub present: usize,
+    /// Of those, the zips whose catalog rows were moved.
+    pub moved: usize,
+    /// Zips of the old root that are not at the new location; they stay where they were.
+    pub missing: usize,
+}
+
 /// After a scan root was relinked from `old_root` to `new_root`: every zip of the old root that exists at
 /// the same relative place under the new root follows it. A zip that is not there stays where it was (its
-/// frames show as missing); one whose new path the catalog already holds is left alone and logged. Returns
-/// the number of zips moved.
-pub fn relink_zips(conn: &Connection, old_root: &str, new_root: &str) -> Result<usize> {
+/// frames show as missing) and is counted as missing; one whose new path the catalog already holds is left
+/// alone, logged, and counted as present. With the same root twice nothing moves; the zips are only counted.
+/// All or nothing: the caller wraps this in its own savepoint with the file relink.
+pub fn relink_zips(conn: &Connection, old_root: &str, new_root: &str) -> Result<ZipRelink> {
     let sep = if old_root.starts_with('/') { '/' } else { '\\' };
     let old_prefix = format!("{}{sep}", old_root.trim_end_matches(sep));
     let new_prefix = format!("{}{sep}", new_root.trim_end_matches(sep));
-    if old_prefix == new_prefix {
-        return Ok(0);
-    }
-    let mut moved = 0;
+    let same = old_prefix == new_prefix;
+    let mut out = ZipRelink::default();
     for old in zips_under_prefix(conn, &old_prefix)? {
         let Some(rest) = old.strip_prefix(&old_prefix) else { continue };
         let new = format!("{new_prefix}{rest}");
         if !Path::new(&new).is_file() {
+            out.missing += 1;
+            continue;
+        }
+        out.present += 1;
+        if same {
             continue;
         }
         if is_known_zip(conn, &new)? {
             tracing::warn!(src = %old, dest = %new, "relink: the catalog already holds a zip at the new location; left as is");
             continue;
         }
-        moved += rename_zip(conn, &old, &new)?;
+        rename_zip(conn, &old, &new)?;
+        out.moved += 1;
     }
-    Ok(moved)
+    Ok(out)
 }
 
 /// The zips directly in `directory` that hold at least one cataloged frame, ordered by path. With
@@ -338,12 +410,117 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let conn = catalog(tmp.path());
         let a = zip_with_two_lights(&conn, tmp.path(), "a.zip", 1);
-        let b = zip_with_two_lights(&conn, tmp.path(), "b.zip", 10);
+        // b.zip's entries are named differently, so the first two statements of the rename succeed and only
+        // the zip_archives UNIQUE (the third) fails: the savepoint has real work to undo.
+        let b = make_zip(
+            tmp.path(),
+            "b.zip",
+            &[("Lights/B_001.fits", light(10)), ("Lights/B_002.fits", light(11))],
+            ArchiveCompression::Store,
+        );
+        scan_zip(&conn, &b, 1, false).unwrap();
         let before = paths(&conn);
-        // b.zip's row already exists, so the rename of a.zip onto it violates UNIQUE.
         let err = rename_zip(&conn, &a.to_string_lossy(), &b.to_string_lossy());
         assert!(err.is_err());
+        assert!(format!("{:#}", err.unwrap_err()).contains("zip row"), "the zip_archives statement is the one that failed");
         assert_eq!(paths(&conn), before, "the failed rename rolled back whole");
+    }
+
+    fn insert_operation_file(conn: &Connection, zip: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO archive_operations (id, archive_root_path, compression, status, started_at)
+             VALUES (1, '/arch', 'store', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_operation_files (operation_id, source_path, target_zip_path, target_path_in_zip, expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (1, 's', ?1, 'e', 'h', 'move', 'light', 1)",
+            [zip],
+        )
+        .unwrap();
+    }
+
+    fn operation_zips(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT target_zip_path FROM archive_operation_files ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn rename_zip_repoints_the_operation_files_that_name_it() {
+        let tmp = TempDir::new().unwrap();
+        let conn = catalog(tmp.path());
+        let old = zip_with_two_lights(&conn, tmp.path(), "night.zip", 1);
+        let other = zip_with_two_lights(&conn, tmp.path(), "other.zip", 10);
+        let (old_s, other_s) = (old.to_string_lossy().into_owned(), other.to_string_lossy().into_owned());
+        insert_operation_file(&conn, &old_s);
+        insert_operation_file(&conn, &other_s);
+        let new_s = tmp.path().join("renamed.zip").to_string_lossy().into_owned();
+        rename_zip(&conn, &old_s, &new_s).unwrap();
+        assert_eq!(operation_zips(&conn), vec![new_s, other_s], "only the renamed zip's operation files move");
+    }
+
+    #[test]
+    fn rename_zip_prefix_repoints_the_operation_files_under_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        let conn = catalog(tmp.path());
+        for p in ["/data/M31/a.zip", "/data/M31/sub/b.zip", "/data/M31_Ha/c.zip", "/data/m31/d.zip"] {
+            insert_operation_file(&conn, p);
+        }
+        rename_zip_prefix(&conn, "/data/M31/", "/data/N/").unwrap();
+        assert_eq!(
+            operation_zips(&conn),
+            vec!["/data/N/a.zip", "/data/N/sub/b.zip", "/data/M31_Ha/c.zip", "/data/m31/d.zip"]
+        );
+    }
+
+    #[test]
+    fn a_zip_known_only_through_its_frames_is_known_and_renamed() {
+        let tmp = TempDir::new().unwrap();
+        let conn = catalog(tmp.path());
+        let zip = zip_with_two_lights(&conn, tmp.path(), "night.zip", 1);
+        conn.execute("DELETE FROM zip_archives", []).unwrap();
+        let zip_s = zip.to_string_lossy().into_owned();
+        assert!(is_known_zip(&conn, &zip_s).unwrap(), "frames marked with the zip make it known");
+        let new_s = tmp.path().join("renamed.zip").to_string_lossy().into_owned();
+        assert_eq!(rename_zip(&conn, &zip_s, &new_s).unwrap(), 0, "no zip_archives row to rename");
+        assert!(paths(&conn).iter().all(|(p, z)| p.starts_with(&new_s) && z.as_deref() == Some(new_s.as_str())));
+        assert!(!is_known_zip(&conn, &zip_s).unwrap());
+    }
+
+    #[test]
+    fn rename_prefix_collision_names_what_the_folder_rename_would_hit() {
+        let tmp = TempDir::new().unwrap();
+        let conn = catalog(tmp.path());
+        let sep = MAIN_SEPARATOR;
+        let old_dir = tmp.path().join("Old");
+        std::fs::create_dir(&old_dir).unwrap();
+        zip_with_two_lights(&conn, &old_dir, "night.zip", 1);
+        let (op, np) = (format!("{}{sep}", old_dir.to_string_lossy()), format!("{}{sep}", tmp.path().join("New").to_string_lossy()));
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), None);
+
+        // A stale frame row under the new name, at the path a frame of the zip would be renamed to.
+        let stale = format!("{np}night.zip{sep}Lights{sep}L_001.fits");
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'L_001.fits', 1, 't', 'FITS')",
+            [&stale],
+        )
+        .unwrap();
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), Some(stale));
+        conn.execute("DELETE FROM files WHERE archive_zip_path IS NULL", []).unwrap();
+
+        // A stale zip row at the new name.
+        let stale_zip = format!("{np}night.zip");
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES (?1, 1, 't', 1, 't')",
+            [&stale_zip],
+        )
+        .unwrap();
+        assert_eq!(rename_prefix_collision(&conn, &op, &np).unwrap(), Some(stale_zip));
     }
 
     #[test]
@@ -401,8 +578,19 @@ mod tests {
         let present = zip_with_two_lights(&conn, old_root.path(), "present.zip", 1);
         zip_with_two_lights(&conn, old_root.path(), "absent.zip", 10);
         std::fs::copy(&present, new_root.path().join("present.zip")).unwrap();
-        let moved = relink_zips(&conn, old_root.path().to_str().unwrap(), new_root.path().to_str().unwrap()).unwrap();
-        assert_eq!(moved, 1);
+        let (present_s, absent_s) = (
+            old_root.path().join("present.zip").to_string_lossy().into_owned(),
+            old_root.path().join("absent.zip").to_string_lossy().into_owned(),
+        );
+        insert_operation_file(&conn, &present_s);
+        insert_operation_file(&conn, &absent_s);
+        let found = relink_zips(&conn, old_root.path().to_str().unwrap(), new_root.path().to_str().unwrap()).unwrap();
+        assert_eq!(found, ZipRelink { present: 1, moved: 1, missing: 1 });
+        assert_eq!(
+            operation_zips(&conn),
+            vec![new_root.path().join("present.zip").to_string_lossy().into_owned(), absent_s],
+            "the operation that wrote the relinked zip finds it"
+        );
         let new_zip = new_root.path().join("present.zip").to_string_lossy().into_owned();
         let rows = paths(&conn);
         let sep = MAIN_SEPARATOR;

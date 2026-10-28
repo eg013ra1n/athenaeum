@@ -53,9 +53,11 @@ pub async fn unpack_zip_frames(
 pub async fn list_zip_entries(
     state: State<'_, AppState>,
     zip_path: String,
-    inner_dir: String,
+    inner_dir: Option<String>,
 ) -> Result<ZipDirListing, String> {
     let ctx = state.ctx.clone();
+    // Optional like the web route's `#[serde(default)]`: no folder means the top of the zip.
+    let inner_dir = inner_dir.unwrap_or_default();
     tokio::task::spawn_blocking(move || api::list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_path, &inner_dir))
         .await
         .map_err(|e| format!("Zip listing task panicked: {}", e))?
