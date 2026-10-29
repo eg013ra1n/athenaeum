@@ -26,12 +26,16 @@ import {
 import type { PlateSolveRecord } from '../../types/plate-solve';
 import type { PlateSolveCompleteEvent } from '../../types/helpers';
 import { formatTimestamp } from '../../utils/dateFormatting';
+import { ZipEntriesMetadata } from './ZipEntryView';
+import { zipEntryRows, type ZipLocation } from './zipView';
 
 interface Props {
   /** Listing of the FILE pane (the other side). */
   otherListing: DirectoryListing | null;
-  /** Selection of the FILE pane (paths). */
+  /** Selection of the FILE pane (paths, plus `zip-entry:` keys for frame entries of an open zip with no catalog row). */
   otherSelection: Set<string>;
+  /** Where the FILE pane is inside a zip, or `null`: what the `zip-entry:` keys of the selection resolve against. */
+  otherZip?: ZipLocation | null;
   /** Called after a successful save so the caller can refresh listings. */
   onSaved: () => void;
 }
@@ -134,7 +138,38 @@ function isLightLike(v: string | null | undefined): boolean {
 }
 
 
-export default function MetadataPane({ otherListing, otherSelection, onSaved }: Props) {
+/** Metadata of the other pane's selection. Cataloged files get the editor; frame entries of an open zip that
+ *  the catalog holds no row for are read from the zip (`get_zip_entry_header`) and shown read-only, alone or
+ *  below the editor when the selection mixes both. */
+export default function MetadataPane({ otherListing, otherSelection, otherZip = null, onSaved }: Props) {
+  const entries = useMemo(
+    () => (otherListing ? zipEntryRows(otherListing, otherZip).filter((r) => otherSelection.has(r.key)).map((r) => r.entry) : []),
+    [otherListing, otherZip, otherSelection],
+  );
+  if (!otherZip || entries.length === 0) {
+    return <FileMetadataEditor otherListing={otherListing} otherSelection={otherSelection} onSaved={onSaved} />;
+  }
+  const hasFiles = !!otherListing && otherListing.files.some((f) => otherSelection.has(f.file.path));
+  if (!hasFiles) {
+    return (
+      <div className="h-full overflow-y-auto">
+        <ZipEntriesMetadata zipPath={otherZip.path} entries={entries} />
+      </div>
+    );
+  }
+  return (
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <FileMetadataEditor otherListing={otherListing} otherSelection={otherSelection} onSaved={onSaved} />
+      </div>
+      <div className="max-h-[45%] flex-none overflow-y-auto border-t border-border">
+        <ZipEntriesMetadata zipPath={otherZip.path} entries={entries} />
+      </div>
+    </div>
+  );
+}
+
+function FileMetadataEditor({ otherListing, otherSelection, onSaved }: Omit<Props, 'otherZip'>) {
   // Resolve selected FileWithFrame entries.
   const selectedItems = useMemo(() => {
     if (!otherListing) return [];

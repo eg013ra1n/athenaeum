@@ -5,7 +5,7 @@
 // nothing inside is ever renamed, moved or deleted — only the whole zip can be.
 
 import type { ZipListItem } from '../../types/archive';
-import { getBasename } from './types';
+import { getBasename, type DirectoryListing } from './types';
 
 /** Where a pane is inside a zip. `innerDir` is `/`-separated with no leading or trailing `/` (`''` is the top). */
 export interface ZipLocation {
@@ -85,4 +85,43 @@ export function zipRemovalSummary(zips: ZipListItem[]): { frames: number; onlyCo
     frames: zips.reduce((sum, z) => sum + z.frameEntries, 0),
     onlyCopies: zips.filter((z) => z.createdByOperation != null).length,
   };
+}
+
+/** Row key of a frame entry the catalog holds no row for: `zip-entry:<entry path inside the zip>`. It lives in the
+ *  pane selection beside the path keys of cataloged rows, but it is not a path: no command that takes paths or
+ *  file ids may be handed one (see [`withoutZipEntryKeys`]). */
+export const ZIP_ENTRY_KEY_PREFIX = 'zip-entry:';
+
+export function zipEntryKey(entry: string): string {
+  return `${ZIP_ENTRY_KEY_PREFIX}${entry}`;
+}
+
+export function isZipEntryKey(key: string): boolean {
+  return key.startsWith(ZIP_ENTRY_KEY_PREFIX);
+}
+
+/** The keys that are real paths: a selection without its zip-entry rows. */
+export function withoutZipEntryKeys(keys: Iterable<string>): string[] {
+  return [...keys].filter((k) => !isZipEntryKey(k));
+}
+
+/** A readable entry of the open zip that has no catalog row: an ordinary, selectable row. */
+export interface ZipEntryRow {
+  name: string;
+  size: number;
+  /** The entry's path inside the zip. */
+  entry: string;
+  /** Its row/selection key. */
+  key: string;
+}
+
+/** The readable rowless entries of a zip listing, in listing order. Empty outside a zip. */
+export function zipEntryRows(listing: DirectoryListing, zip: ZipLocation | null | undefined): ZipEntryRow[] {
+  if (!zip) return [];
+  return (listing.otherEntries ?? [])
+    .filter((o) => o.readable)
+    .map((o) => {
+      const entry = zip.innerDir ? `${zip.innerDir}/${o.name}` : o.name;
+      return { name: o.name, size: o.size, entry, key: zipEntryKey(entry) };
+    });
 }
