@@ -449,6 +449,15 @@ pub fn delete_orphaned_files(conn: &Connection, file_ids: &[i64]) -> Result<usiz
                 return Err(e).with_context(|| format!("check whether file {file_id} is zip-resident"));
             }
         }
+        // A missing copy the user unpacked from a zip goes back to its zip: the row is kept, zip-resident.
+        match crate::zip_store::catalog::return_to_zip(conn, file_id) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(file_id, error = %format!("{e:#}"), "taking an unpacked row back into its zip failed; the row is kept");
+                continue;
+            }
+        }
         match crate::db::master_unregister::master_set_id_for_file(conn, file_id) {
             Ok(Some(master_set_id)) => {
                 match crate::db::master_unregister::unregister_master_set(conn, master_set_id) {

@@ -496,18 +496,24 @@ pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     // is gone forever. All catalog writes are one atomic unit so the
     // master-unregister sequence can't half-commit (audit C5/I3).
     let sp = crate::db::SavepointGuard::new(conn, "send_to_void")?;
-    unregister_master_if_any(conn, file_id)?;
-    conn.execute(
-        "DELETE FROM black_hole WHERE file_id = ?1",
-        params![file_id],
-    )?;
-    // files delete cascades to frames, frame_tags, etc.
-    conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    // A copy the user unpacked from a zip goes back to its zip instead of out of the catalog: the frame is
+    // still in the zip, so the row (its id, analysis, plate solve, set membership) stays and only the file
+    // on disk is deleted. Such a row is zip-resident afterwards, so no master unregister applies to it.
+    let back_in_zip = crate::zip_store::catalog::return_to_zip(conn, file_id)?;
+    if !back_in_zip {
+        unregister_master_if_any(conn, file_id)?;
+        conn.execute(
+            "DELETE FROM black_hole WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        // files delete cascades to frames, frame_tags, etc.
+        conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    }
     sp.commit()?;
 
     if std::path::Path::new(&path).exists() {
         if let Err(e) = std::fs::remove_file(&path) {
-            tracing::error!(file_id, path = %path, error = %e,
+            tracing::error!(file_id, path = %path, back_in_zip, error = %e,
                 "send_to_void: catalog rows removed but disk delete failed; file remains on disk");
             return Err(e.into());
         }
@@ -2071,6 +2077,61 @@ mod tests {
         assert_eq!(file_ids_in(&conn, &sibling), sibling_rows);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2);
+    }
+
+    /// Smoke fix r3: the Black Hole's bulk Void of unpacked copies returns every frame to its zip, and a Void of
+    /// the zip afterwards still removes every row of it, the returned ones included.
+    #[test]
+    fn bulk_void_of_unpacked_copies_returns_them_all_and_void_of_the_zip_removes_everything() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let zip = scanned_zip(&conn, tmp.path(), "night.zip", 1);
+        let ids = file_ids_in(&conn, &zip);
+        let out = TempDir::new().unwrap();
+        let outcome = crate::api::zip::unpack_file_ids(
+            &conn,
+            &ids,
+            out.path(),
+            &crate::events::NullEmitter,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(outcome.unpacked, 2);
+        for &id in &ids {
+            let path: String = conn.query_row("SELECT path FROM files WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+            add_to_black_hole(&conn, id, "files", &path).unwrap();
+        }
+        for &id in &ids {
+            send_to_void(&conn, id).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(out.path().join("Lights")).unwrap().count(), 0, "both copies are deleted from disk");
+        assert_eq!(file_ids_in(&conn, &zip), ids, "both frames are zip-resident again, same ids");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM black_hole"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2);
+
+        let bh = add_zip_to_black_hole(&conn, &zip, "files").unwrap();
+        assert_eq!(send_zip_to_void(&conn, bh).unwrap(), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_archives"), 0);
+        assert!(!std::path::Path::new(&zip).exists());
+    }
+
+    /// A disk row that owns no release is voided as before: row and file both go.
+    #[test]
+    fn a_plain_void_of_a_disk_row_that_owns_no_release_still_deletes_it() {
+        let tmp = TempDir::new().unwrap();
+        let conn = zip_catalog(tmp.path());
+        let file = tmp.path().join("plain.fits");
+        std::fs::write(&file, b"x").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (700, ?1, 'plain.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+        send_to_void(&conn, 700).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE id = 700"), 0);
+        assert!(!file.exists());
     }
 
     #[test]

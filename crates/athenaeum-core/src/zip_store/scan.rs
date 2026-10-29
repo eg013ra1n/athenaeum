@@ -268,10 +268,11 @@ pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path:
         params![zip_path, Utc::now().to_rfc3339(), operation],
     )?;
     conn.execute(
-        "INSERT INTO zip_released_entries (zip_id, entry_path, released_to)
-         SELECT id, ?1, ?3 FROM zip_archives WHERE path = ?2
-         ON CONFLICT(zip_id, entry_path) DO UPDATE SET released_to = excluded.released_to",
-        params![entry, zip_path, path.to_string_lossy()],
+        "INSERT INTO zip_released_entries (zip_id, entry_path, released_to, entry_crc32)
+         SELECT id, ?1, ?3, ?4 FROM zip_archives WHERE path = ?2
+         ON CONFLICT(zip_id, entry_path) DO UPDATE SET
+             released_to = excluded.released_to, entry_crc32 = COALESCE(excluded.entry_crc32, entry_crc32)",
+        params![entry, zip_path, path.to_string_lossy(), row_crc],
     )?;
     sp.commit()?;
     tracing::info!(file_id, path = %path.display(), zip_path = %zip_path, "archived frame unzipped by hand — the row is a disk row again");
@@ -657,8 +658,8 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     };
     conn.execute(
         &format!(
-            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to)
-         SELECT ?1, r.entry_path, r.released_to FROM zip_released_entries r WHERE r.zip_id = ?2 AND {OWNED_RELEASE}"
+            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to, entry_crc32)
+         SELECT ?1, r.entry_path, r.released_to, r.entry_crc32 FROM zip_released_entries r WHERE r.zip_id = ?2 AND {OWNED_RELEASE}"
         ),
         params![new_zip_id, old_id],
     )?;

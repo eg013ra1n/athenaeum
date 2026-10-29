@@ -2555,6 +2555,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_zip_released_to ON zip_released_entries(released_to) WHERE released_to IS NOT NULL",
         [],
     )?;
+    // The entry's CRC32 as the row had it when it left the zip (NULL for releases that predate the column).
+    // Deleting the copy puts the row back into the zip with this value (`zip_store::catalog::return_to_zip`).
+    if !column_exists(conn, "zip_released_entries", "entry_crc32")? {
+        conn.execute("ALTER TABLE zip_released_entries ADD COLUMN entry_crc32 INTEGER", [])?;
+    }
     // Any path change of the row (a rename, a folder rename's prefix swap, a move, a relink, the scanner's
     // moved-file rule) carries the release along, in the statement's own transaction, so the zip view's
     // Locate and the fall-back to the zip keep pointing at the copy.
@@ -5685,6 +5690,25 @@ mod zip_schema_tests {
             .query_row("SELECT released_to FROM zip_released_entries WHERE entry_path = 'a.fits'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(to, None);
+    }
+
+    #[test]
+    fn a_release_recorded_before_the_entry_crc_existed_keeps_a_null_crc() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE zip_released_entries DROP COLUMN entry_crc32;").unwrap();
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES ('/z.zip', 1, 'm', 1, 's')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (1, 'a.fits')", []).unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let crc: Option<i64> = conn
+            .query_row("SELECT entry_crc32 FROM zip_released_entries WHERE entry_path = 'a.fits'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(crc, None);
     }
 
     #[test]

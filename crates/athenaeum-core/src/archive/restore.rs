@@ -733,10 +733,16 @@ fn update_restored_row(
     released_to: &str,
 ) -> Result<()> {
     let sp = crate::db::SavepointGuard::new(conn, "restore_release_entry")?;
+    // The CRC the row held for the entry, read before the unmark clears it.
+    let mut entry_crc32: Option<i64> = None;
     if let Some((file_id, path_arg, new_mtime, new_size)) = row {
+        entry_crc32 = conn
+            .query_row("SELECT archive_entry_crc32 FROM files WHERE id = ?1", rusqlite::params![file_id], |r| r.get(0))
+            .optional()?
+            .flatten();
         adb::unmark_file_archived(conn, file_id, path_arg, Some(new_mtime), Some(new_size))?;
     }
-    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), Some(released_to))
+    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), Some(released_to), entry_crc32)
         .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
     sp.commit()?;
     Ok(())
@@ -1809,6 +1815,21 @@ pub(crate) mod tests {
             3,
             "recording is idempotent"
         );
+    }
+
+    #[test]
+    fn restore_records_the_entry_crc_the_row_held_for_a_kept_zip() {
+        let (_arch, scan, conn, op_id, _paths) = archived_lights(2);
+        let (entry, ) : (String,) = conn
+            .query_row("SELECT archive_path_in_zip FROM files WHERE id = 1000", [], |r| Ok((r.get(0)?,)))
+            .unwrap();
+        conn.execute("UPDATE files SET archive_entry_crc32 = 123456 WHERE id = 1000", []).unwrap();
+        let out = restore(&conn, op_id, scan.path(), false, true);
+        assert_eq!(out.extracted, 2);
+        let crc: Option<i64> = conn
+            .query_row("SELECT entry_crc32 FROM zip_released_entries WHERE entry_path = ?1", [&entry], |r| r.get(0))
+            .unwrap();
+        assert_eq!(crc, Some(123456), "the CRC the row had when it left the zip is kept with the release");
     }
 
     #[test]
