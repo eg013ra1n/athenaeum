@@ -6,6 +6,7 @@ import type { AutoGenerateResult, FramesSetWithCount } from '../types/helpers';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Chip } from '../components/ui';
 import { zipChipLabel } from '../utils/zipChips';
+import { FrameSetDuplicatesChip } from '../components/duplicates/FrameSetDuplicatesChip';
 import {
   ObjectsFilterPanel,
   ObjectsFilterState,
@@ -1095,7 +1096,7 @@ export default function Objects() {
         />
       ) : (
         <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
-          {filteredFrameSets.map(({ frames_set, member_count, zip_member_count }) => (
+          {filteredFrameSets.map(({ frames_set, member_count, zip_member_count, duplicate_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}
@@ -1228,6 +1229,11 @@ export default function Objects() {
                       {zipChipLabel(zip_member_count, member_count)}
                     </Chip>
                   )}
+                  <FrameSetDuplicatesChip
+                    count={duplicate_count}
+                    frameSetId={frames_set.id!}
+                    frameSetName={frames_set.name || 'Untitled'}
+                  />
                   {member_count} frame{member_count !== 1 ? 's' : ''}
                 </span>
               </div>

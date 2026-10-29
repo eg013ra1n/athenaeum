@@ -86,6 +86,8 @@ pub struct FramesSetWithCount {
     pub member_count: usize,
     /// Members (counted in `member_count`) whose file lives inside a zip.
     pub zip_member_count: usize,
+    /// Second copies of a frame the set already holds — not in `member_count`, never used.
+    pub duplicate_count: usize,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -261,11 +263,13 @@ pub async fn get_frames_sets(
     let project_id = args.project_id.unwrap_or(1);
     let sets = athenaeum_core::db::get_frames_sets_by_project(&conn, project_id).map_err(db_err)?;
     let zip_counts = athenaeum_core::db::get_frames_set_zip_member_counts(&conn).map_err(db_err)?;
+    let duplicate_counts = athenaeum_core::db::get_frames_set_duplicate_counts(&conn).map_err(db_err)?;
 
     Ok(Json(
         sets.into_iter()
             .map(|(frames_set, member_count)| FramesSetWithCount {
                 zip_member_count: frames_set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
+                duplicate_count: frames_set.id.and_then(|id| duplicate_counts.get(&id).copied()).unwrap_or(0),
                 frames_set,
                 member_count,
             })

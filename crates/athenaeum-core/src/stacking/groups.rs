@@ -296,7 +296,10 @@ pub fn set_slug(name: &str) -> String {
 /// frame set's stacking plan AND its run ([`frame_source`]), so the plan's
 /// counts and the frames the run reads cannot disagree. Restoring the file
 /// from the Black Hole brings the light back. (Transfer dedup still counts a
-/// blackholed file as present — a different question, not this one.)
+/// blackholed file as present — a different question, not this one.) The
+/// same raw frame held twice (two disk copies, or a disk copy and a zip entry)
+/// is stacked once, from the copy [`crate::db::frame_is_used_copy_sql`] picks;
+/// a set without duplicates loses no row.
 struct LightMember {
     frame_id: i64,
     file_id: i64,
@@ -328,8 +331,10 @@ fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<Light
          JOIN files fi ON fi.id = f.file_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
            AND {not_blackholed}
+           AND {used_copy}
          ORDER BY f.date_obs, f.id",
         not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = crate::db::frame_is_used_copy_sql("ino.frames_set_id"),
     ))?;
     let rows = stmt
         .query_map(params![frames_set_id], |r| {

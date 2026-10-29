@@ -151,6 +151,24 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
   apart) and the Stacking tab's frame list — the same `db::FRAME_NOT_IN_BLACK_HOLE_SQL` predicate stacking, export,
   the send and the readiness count use. Set 182 (164 lights, 25 blackholed) reads 139 everywhere. Restoring the
   file brings the light back.
+- **A frame held twice is one frame** (2026-10-29). The same raw frame in two files (two disk copies, or a disk copy
+  and a zip entry) is two catalog rows, and both are members. `db::frame_is_used_copy_sql(set_id)` keeps ONE copy per
+  identity among the SET's members, and every reader that counts or uses lights splices it in beside the Black Hole
+  fragment: the listing's count, hours and zip count, the export picker, the set header's totals and the lights
+  tree's per-group counts, the Stacking tab's list, the stacking plan and run, the export / send / project export (`collect_export_data`), the readiness count
+  and `analyze_frame_set`. The identity is the Duplicates page's header key (`DuplicateKey::Header`: fingerprint +
+  size + filename, a non-empty header, raw subs only). The used copy is the least `(in a zip, missing, files.id)`:
+  disk before zip, then present, then the lowest id; a copy in the Black Hole never displaces the other one. The
+  rule is per set: copies held by two sets are each used in their own set (the Duplicates page still pairs them).
+  The other copy stays listed with a "duplicate — not used" chip (`LightFrameWithCalibration.duplicate_not_used`)
+  and is left out of plate-solve selection and the SNR sums; `FramesSetWithCount.duplicate_count` and
+  `CalibrationHierarchyView.duplicate_frames` drive an "N duplicates" chip on the Objects card and table and on the
+  set header, which opens the Duplicates page filtered to the set's files (`FileManager`, location state
+  `duplicatesForSet`). Found on dev set 271 ("12 of 24 in zip, 24 frames" for 12 frames held twice; its stack
+  plan read 24 lights). Checked on a scratch catalog of the same files (83 lights on disk + the 12 of them in
+  `GAIA_smoke.zip`): the set reads 83 frames and 12 duplicates with no zip chip, the stacking plan and the export
+  readiness count 83 (95 before), and the 12 zip rows carry the chip. A set without duplicates loses no row, so
+  its stack is unchanged.
 
 ### Pointing: center and rotation (2026-10-26)
 

@@ -1286,7 +1286,9 @@ fn get_calibration_hierarchy_with_cache(
     // Step 1: Get all LIGHT frames in the frame set with metadata. A light in
     // the Black Hole stays in the tree (the page lists it apart) but is left
     // out of the header's totals: it is a rejected light, not stacked or
-    // exported (`super::FRAME_NOT_IN_BLACK_HOLE_SQL`, column `in_use`).
+    // exported (`super::FRAME_NOT_IN_BLACK_HOLE_SQL`, column `in_use`). So does
+    // a second copy of a frame the set already holds: listed with
+    // `duplicate_not_used`, never counted (`super::frame_is_used_copy_sql`).
     let mut stmt = conn.prepare(&format!(
         "SELECT
             f.id,
@@ -1319,7 +1321,8 @@ fn get_calibration_hierarchy_with_cache(
             {not_blackholed} AS in_use,
             fi.archive_zip_path,
             fi.archive_path_in_zip,
-            fi.archived_in_operation
+            fi.archived_in_operation,
+            {used_copy} AS used_copy
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          LEFT JOIN plate_solves ps ON ps.frame_id = f.id
@@ -1329,6 +1332,7 @@ fn get_calibration_hierarchy_with_cache(
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
          ORDER BY n.start_time DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs",
         not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = super::frame_is_used_copy_sql("n.frames_set_id"),
     ))?;
 
     // Collect raw frame data
@@ -1365,6 +1369,9 @@ fn get_calibration_hierarchy_with_cache(
         archive_zip_path: Option<String>,
         archive_path_in_zip: Option<String>,
         archived_in_operation: Option<i64>,
+        /// Outside the Black Hole, and a second copy of a frame the set
+        /// already holds: listed, not counted, never used.
+        duplicate_not_used: bool,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1401,11 +1408,16 @@ fn get_calibration_hierarchy_with_cache(
                 archive_zip_path: row.get(28)?,
                 archive_path_in_zip: row.get(29)?,
                 archived_in_operation: row.get(30)?,
+                duplicate_not_used: row.get::<_, bool>(27)? && !row.get::<_, bool>(31)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
 
-    let total_frames = frames.iter().filter(|f| f.in_use).count();
+    let total_frames = frames
+        .iter()
+        .filter(|f| f.in_use && !f.duplicate_not_used)
+        .count();
+    let duplicate_frames = frames.iter().filter(|f| f.duplicate_not_used).count();
 
     // Step 2: Build hierarchy using nested HashMaps
     // night -> camera -> filter -> frames
@@ -1550,8 +1562,8 @@ fn get_calibration_hierarchy_with_cache(
                         // Track if we have calibration
                         let has_any_calibration =
                             status.has_flats || status.has_darks || status.has_bias;
-                        if !raw_frame.in_use {
-                            // Blackholed: listed, not counted.
+                        if !raw_frame.in_use || raw_frame.duplicate_not_used {
+                            // Blackholed or a second copy: listed, not counted.
                         } else if has_any_calibration {
                             calibrated_frames += 1;
                         } else {
@@ -1610,6 +1622,7 @@ fn get_calibration_hierarchy_with_cache(
                             archive_zip_path: raw_frame.archive_zip_path.clone(),
                             archive_path_in_zip: raw_frame.archive_path_in_zip.clone(),
                             archived_in_operation: raw_frame.archived_in_operation,
+                            duplicate_not_used: raw_frame.duplicate_not_used,
                         });
                     }
 
@@ -1766,6 +1779,7 @@ fn get_calibration_hierarchy_with_cache(
     Ok(CalibrationHierarchyView {
         date_groups,
         total_frames,
+        duplicate_frames,
         calibrated_frames,
         uncalibrated_frames,
     })
@@ -2322,6 +2336,52 @@ mod night_grouping_tests {
             .map(|g| g.light_frames.len())
             .sum();
         assert_eq!(listed, 3, "the blackholed light is still listed");
+    }
+
+    /// A second copy of a frame the set already holds (same header, size and
+    /// filename) is listed with `duplicate_not_used` and left out of the
+    /// header's totals; the copy the set uses carries no flag.
+    #[test]
+    fn hierarchy_lists_a_second_copy_as_not_used_and_counts_the_frame_once() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'Horsehead')", [])
+            .unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[
+                (10, "2025-10-18T18:00:00Z"),
+                (11, "2025-10-18T18:05:00Z"),
+                (12, "2025-10-18T18:05:00Z"),
+            ],
+        );
+        conn.execute(
+            "UPDATE files SET filename = '11.fits', archive_zip_path = '/z/n.zip' WHERE id = 12",
+            [],
+        )
+        .unwrap();
+        for (id, fingerprint) in [(10, "fp10"), (11, "fp11"), (12, "fp11")] {
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'SIMPLE = T', ?2)",
+                params![id, fingerprint],
+            )
+            .unwrap();
+        }
+
+        let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
+        assert_eq!(view.total_frames, 2);
+        assert_eq!(view.duplicate_frames, 1);
+        assert_eq!(view.calibrated_frames + view.uncalibrated_frames, 2);
+        let flagged: Vec<i64> = view.date_groups[0].camera_groups[0]
+            .filter_groups
+            .iter()
+            .flat_map(|g| g.light_frames.iter())
+            .filter(|f| f.duplicate_not_used)
+            .map(|f| f.frame_id)
+            .collect();
+        assert_eq!(flagged, vec![12], "the zip copy is the one not used");
     }
 
     /// R3: the hierarchy view carries each light's size and each set's

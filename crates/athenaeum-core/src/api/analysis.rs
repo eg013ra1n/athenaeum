@@ -236,7 +236,10 @@ pub fn analyze_frame_set(
         let analysis_config = config::load_config(&conn);
         let config_hash = analysis_config.config_hash();
 
-        let mut stmt = conn.prepare(
+        // A second copy of a frame the set already holds is not measured: it
+        // is never stacked or exported (`db::frame_is_used_copy_sql`), and a
+        // zip copy would be extracted for nothing.
+        let mut stmt = conn.prepare(&format!(
             "SELECT f.id as frame_id, fi.id as file_id, fi.path
              FROM frames f
              INNER JOIN files fi ON fi.id = f.file_id
@@ -244,8 +247,10 @@ pub fn analyze_frame_set(
              INNER JOIN sessions s ON s.id = sm.session_id
              INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
              WHERE n.frames_set_id = ?1
-               AND f.imagetyp = 'Light'",
-        )?;
+               AND f.imagetyp = 'Light'
+               AND {used_copy}",
+            used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
+        ))?;
 
         let frame_rows: Vec<(i64, i64, String)> = stmt
             .query_map(rusqlite::params![frame_set_id], |row| {

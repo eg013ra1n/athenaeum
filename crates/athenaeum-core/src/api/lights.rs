@@ -309,6 +309,8 @@ pub fn pedestal_run_sentence(
 /// `files` join for the filename. A light whose file is in the Black Hole is
 /// not a member here ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`]): the
 /// readiness total counts what the export lands, and the export leaves it out.
+/// The same goes for a second copy of a frame the set already holds
+/// ([`crate::db::frame_is_used_copy_sql`]).
 fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String)>, ApiError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT sm.frame_id, fi.filename
@@ -319,8 +321,10 @@ fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String
          JOIN files fi ON fi.id = f.file_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
            AND {not_blackholed}
+           AND {used_copy}
          ORDER BY sm.frame_id",
         not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = crate::db::frame_is_used_copy_sql("ino.frames_set_id"),
     ))?;
     let rows = stmt
         .query_map(params![set_id], |r| Ok((r.get(0)?, r.get(1)?)))?

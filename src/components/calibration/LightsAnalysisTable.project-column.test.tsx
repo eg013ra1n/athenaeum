@@ -36,6 +36,7 @@ function frame(id: number): EnrichedLightFrame {
     archive_zip_path: null,
     archive_path_in_zip: null,
     archived_in_operation: null,
+    duplicate_not_used: false,
     calibration_status: {
       frame_id: id,
       has_flats: true,

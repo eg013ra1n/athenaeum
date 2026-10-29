@@ -71,7 +71,8 @@ export function buildCameraFilterTree(hierarchy: CalibrationHierarchyView): Came
         filters.push({
           key,
           label,
-          frameCount: enriched.length,
+          // A second copy of a frame the set already holds is listed, not counted.
+          frameCount: enriched.filter(f => !f.duplicate_not_used).length,
         });
 
         framesByKey.set(key, enriched);
@@ -148,7 +149,7 @@ export function buildMergedCameraFilterTree(hierarchy: CalibrationHierarchyView)
     const filters: MergedCameraFilterNode['filters'] = [];
 
     for (const [key, { label, frames }] of filterMap) {
-      filters.push({ key, label, frameCount: frames.length });
+      filters.push({ key, label, frameCount: frames.filter(f => !f.duplicate_not_used).length });
       framesByKey.set(key, frames);
     }
 

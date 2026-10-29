@@ -32,6 +32,7 @@ import { stackedFrameSnr } from '../components/analysis/stackedSnr';
 import { UnpackZipDialog } from '../components/zip/UnpackZipDialog';
 import { mainZip } from '../components/zip/unpackDialogModel';
 import { isForeignZipFile } from '../utils/zipChips';
+import { FrameSetDuplicatesChip } from '../components/duplicates/FrameSetDuplicatesChip';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
@@ -363,6 +364,18 @@ export default function FrameSetDetail() {
   }, [calibrationHierarchy]);
   const { blackholedFileIds } = useBlackholeEvents(allFileIds);
 
+  // Second copies of a frame the set already holds (`duplicate_not_used`): listed, never stacked.
+  const duplicateFrameIds = useMemo(() => {
+    const ids = new Set<number>();
+    if (!calibrationHierarchy) return ids;
+    for (const dg of calibrationHierarchy.date_groups)
+      for (const cg of dg.camera_groups)
+        for (const fg of cg.filter_groups)
+          for (const f of fg.light_frames)
+            if (f.duplicate_not_used) ids.add(f.frame_id);
+    return ids;
+  }, [calibrationHierarchy]);
+
   // Compute stacked SNR per filter group for calibration tab tree: sqrt(sum(frame_snr²)), a plain ratio (PC-11)
   const calibrationFilterSnrMap = useMemo(() => {
     if (!calibrationHierarchy || analysisData.size === 0) return undefined;
@@ -374,7 +387,7 @@ export default function FrameSetDetail() {
         if (map.has(key)) continue;
         const values: number[] = [];
         for (const f of frames) {
-          if (blackholedFileIds.has(f.file_id)) continue;
+          if (blackholedFileIds.has(f.file_id) || f.duplicate_not_used) continue;
           const a = analysisData.get(f.frame_id);
           if (a) values.push(a.frame_snr);
         }
@@ -391,7 +404,8 @@ export default function FrameSetDetail() {
   // second fetch. Same imagetyp+format filter `handleBlink` above already
   // uses (a stacking run only ever reads FITS/XISF light frames). A light in
   // the Black Hole is left out: it is a rejected light the plan and the run
-  // never use, so listing it as "Included" would contradict them.
+  // never use, so listing it as "Included" would contradict them. So is a
+  // second copy of a frame the set already holds (`duplicateFrameIds`).
   const stackingLightFrames = useMemo(() => {
     if (!detail) return [];
     const out: { frameId: number; filename: string }[] = [];
@@ -402,7 +416,8 @@ export default function FrameSetDetail() {
             fw.frame?.imagetyp === 'Light' &&
             fw.frame.id != null &&
             (fw.file.format === 'FITS' || fw.file.format === 'XISF') &&
-            !(fw.file.id != null && blackholedFileIds.has(fw.file.id))
+            !(fw.file.id != null && blackholedFileIds.has(fw.file.id)) &&
+            !duplicateFrameIds.has(fw.frame.id)
           ) {
             out.push({ frameId: fw.frame.id, filename: fw.file.filename });
           }
@@ -410,7 +425,7 @@ export default function FrameSetDetail() {
       }
     }
     return out;
-  }, [detail, blackholedFileIds]);
+  }, [detail, blackholedFileIds, duplicateFrameIds]);
 
   // Frame id → contributor state for the lights table's "Project" column
   // (spec §8.1–§8.2). Only the first link's frame list is used — a set is
@@ -990,6 +1005,11 @@ export default function FrameSetDetail() {
             </button>
             <div className="flex items-center gap-1.5 text-sm text-content-muted whitespace-nowrap">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
+              <FrameSetDuplicatesChip
+                count={calibrationHierarchy?.duplicate_frames ?? 0}
+                frameSetId={parseInt(id!)}
+                frameSetName={detail.frames_set?.name || 'Untitled'}
+              />
               <span>·</span>
               <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
               <span>·</span>

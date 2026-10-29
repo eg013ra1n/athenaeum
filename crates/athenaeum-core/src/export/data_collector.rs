@@ -793,9 +793,10 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
     //
     // A light whose file is in the Black Hole is rejected, so it is not
     // exported, sent, or counted ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`] —
-    // the stacking plan's own light source uses the same fragment). Ordered
-    // by capture time so the export's grouping, and the example file names the
-    // folder preview shows, come out the same on every load.
+    // the stacking plan's own light source uses the same fragment). A frame
+    // held twice lands once, from the copy `db::frame_is_used_copy_sql` picks.
+    // Ordered by capture time so the export's grouping, and the example file
+    // names the folder preview shows, come out the same on every load.
     let mut id_stmt = conn.prepare(&format!(
         "SELECT DISTINCT sm.frame_id, f.date_obs
          FROM session_members sm
@@ -804,8 +805,10 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
          JOIN frames f ON sm.frame_id = f.id
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
            AND {not_blackholed}
+           AND {used_copy}
          ORDER BY f.date_obs, sm.frame_id",
         not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
     ))?;
 
     let frame_ids: Vec<i64> = id_stmt
@@ -1870,8 +1873,9 @@ struct EquipmentInfo {
 
 /// Cameras, telescopes, the capture span and the night count of the lights
 /// the export lands — the frame set's light members minus the Black Hole
-/// ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`], the same rule as
-/// `get_light_frames_for_frame_set`). The night count is the catalog's own
+/// ([`crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL`]) and minus a second copy of a
+/// frame ([`crate::db::frame_is_used_copy_sql`]), the same rules as
+/// `get_light_frames_for_frame_set`. The night count is the catalog's own
 /// grouping unit: the DISTINCT `imaging_nights` rows those lights belong to,
 /// never the days between the first and last frame.
 fn collect_equipment_info(conn: &Connection, frame_set_id: i64) -> Result<EquipmentInfo> {
@@ -1882,8 +1886,10 @@ fn collect_equipment_info(conn: &Connection, frame_set_id: i64) -> Result<Equipm
          JOIN sessions s ON sm.session_id = s.id
          JOIN imaging_nights n ON s.imaging_night_id = n.id
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
-           AND {not_blackholed}",
+           AND {not_blackholed}
+           AND {used_copy}",
         not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
     );
 
     let distinct = |column: &str| -> Result<Vec<String>> {
@@ -3507,6 +3513,41 @@ mod export_mode_tests {
         assert_eq!(lights_by_id(&data).len(), 3, "a restored light is exported again");
         let readiness = crate::api::lights::compute_export_readiness(&conn, 1).unwrap();
         assert_eq!(readiness.total, 3);
+    }
+
+    /// The same raw frame held twice (here a disk copy and a zip entry) is
+    /// exported, sent and counted ready ONCE, from the disk copy
+    /// (`db::frame_is_used_copy_sql`) — not as two lights.
+    #[test]
+    fn a_frame_held_twice_is_exported_once_from_the_disk_copy() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        for f in [10, 11, 12] {
+            seed_light(&conn, f, session, Some("Ha"));
+        }
+        // Light 12 is a zip copy of light 11: same header, size and filename.
+        conn.execute(
+            "UPDATE files SET filename = 'light_11.fits', path = '/z/n.zip/light_11.fits',
+                    archive_zip_path = '/z/n.zip', archive_path_in_zip = 'light_11.fits'
+             WHERE id = ?1",
+            params![12 + 2_000_000],
+        )
+        .unwrap();
+        for (frame, fingerprint) in [(10, "fp10"), (11, "fp11"), (12, "fp11")] {
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'SIMPLE = T', ?2)",
+                params![frame + 2_000_000, fingerprint],
+            )
+            .unwrap();
+        }
+
+        let data = collect_export_data(&conn, 1).unwrap();
+        let lights = lights_by_id(&data);
+        assert_eq!(lights.len(), 2, "{:?}", lights.keys());
+        assert!(lights.contains_key(&11), "the disk copy is the one exported");
+        assert!(!lights.contains_key(&12));
+        let readiness = crate::api::lights::compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(readiness.total, 2, "the readiness total counts the frame once");
     }
 
     /// The "Sessions" line counts the catalog's nights — DISTINCT
