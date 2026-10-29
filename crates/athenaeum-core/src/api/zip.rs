@@ -747,10 +747,12 @@ mod tests {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
+    /// `entry_suffix` uses `/`; an unpacked row's `path` is native (`\` on Windows), so both spellings match.
     fn file_id(conn: &Connection, entry_suffix: &str) -> i64 {
+        let native = entry_suffix.replace('/', std::path::MAIN_SEPARATOR_STR);
         conn.query_row(
-            "SELECT id FROM files WHERE archive_path_in_zip = ?1 OR path LIKE ?2",
-            params![entry_suffix, format!("%{entry_suffix}")],
+            "SELECT id FROM files WHERE archive_path_in_zip = ?1 OR path LIKE ?2 OR path LIKE ?3",
+            params![entry_suffix, format!("%{entry_suffix}"), format!("%{native}")],
             |r| r.get(0),
         )
         .unwrap()
