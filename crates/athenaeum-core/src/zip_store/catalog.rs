@@ -16,7 +16,7 @@
 use std::path::{Path, MAIN_SEPARATOR};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::db::SavepointGuard;
@@ -280,124 +280,6 @@ pub fn released_copies_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(Strin
     )?;
     let rows = stmt.query_map([zip], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// A row whose file the user took out of its zip (Unpack, or Unarchive keeping the zip) and then deleted:
-/// the row goes back into the zip it came from, in the caller's transaction (a savepoint nests inside it).
-///
-/// The row at `files.path` must be a disk row that owns a release (`zip_released_entries.released_to` is its
-/// path). Then the release is dropped and the row becomes zip-resident again, exactly as Unpack found it: zip
-/// path, entry, the CRC the release recorded (NULL for a release recorded before the column), the virtual
-/// path `<zip>/<entry>` and the entry's file name. Size and mtime stay (the unpacked bytes were checked
-/// against the entry). The row keeps its id, analysis, plate solve and set membership. A Black Hole record
-/// of the row goes: the frame is no longer a file on disk.
-///
-/// This is the same row for a zip of ours (Move and ZIP): it takes the virtual path like a foreign one,
-/// because Unarchive has closed the operation (`archived_in_operation` stays clear, its frame set is active
-/// again) and reviving the marker would offer Unarchive for a frame set that is not archived.
-///
-/// `false` (nothing changed) when the row owns no release, is already zip-resident, or another row already
-/// holds the entry's virtual path or the entry itself. The caller then treats the row as it did before.
-pub fn return_to_zip(conn: &Connection, file_id: i64) -> Result<bool> {
-    let row: Option<(String, Option<String>)> = conn
-        .query_row("SELECT path, archive_zip_path FROM files WHERE id = ?1", params![file_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()?;
-    let Some((path, None)) = row else {
-        return Ok(false);
-    };
-    let release: Option<(i64, String, String, Option<i64>)> = conn
-        .query_row(
-            "SELECT r.id, z.path, r.entry_path, r.entry_crc32 FROM zip_released_entries r
-             INNER JOIN zip_archives z ON z.id = r.zip_id
-             WHERE r.released_to = ?1 ORDER BY r.id LIMIT 1",
-            params![path],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?;
-    let Some((release_id, zip, entry, crc)) = release else {
-        return Ok(false);
-    };
-    let vpath = crate::zip_store::scan::virtual_path(Path::new(&zip), &entry);
-    let taken: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE id != ?1 AND (path = ?2 OR (archive_zip_path = ?3 AND archive_path_in_zip = ?4)))",
-        params![file_id, vpath, zip, entry],
-        |r| r.get(0),
-    )?;
-    if taken {
-        tracing::warn!(file_id, zip_path = %zip, zip_entry = %entry, "another catalog row holds the zip entry — the unpacked row is not taken back into the zip");
-        return Ok(false);
-    }
-    let filename = entry.rsplit('/').next().unwrap_or(&entry).to_string();
-    let sp = SavepointGuard::new(conn, "zip_return_to_zip")?;
-    // The release goes first: the path change would otherwise carry it along (`zip_released_follows_path`).
-    conn.execute("DELETE FROM zip_released_entries WHERE id = ?1", params![release_id])?;
-    conn.execute(
-        "UPDATE files SET path = ?1, filename = ?2, archive_zip_path = ?3, archive_path_in_zip = ?4,
-                archive_entry_crc32 = ?5
-         WHERE id = ?6",
-        params![vpath, filename, zip, entry, crc, file_id],
-    )?;
-    conn.execute("DELETE FROM black_hole WHERE file_id = ?1", params![file_id])?;
-    conn.execute(
-        "UPDATE zip_archives SET frame_entries = (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1) WHERE path = ?1",
-        params![zip],
-    )?;
-    sp.commit()?;
-    tracing::info!(file_id, zip_path = %zip, zip_entry = %entry, old_path = %path, "unpacked copy deleted — the row is back in its zip");
-    Ok(true)
-}
-
-/// Of the rows in `file_ids` whose files are missing from disk, the ones that go back into their zip
-/// ([`return_to_zip`]): a row that owns a release, whose copy is gone, and whose scan root is online (a copy
-/// under an unmounted volume is not a deleted copy). The caller names only rows it found missing; the stat is
-/// repeated here for the rows that own a release. Returns the ids that went back.
-pub fn return_missing_copies_to_zip(conn: &Connection, file_ids: &[i64]) -> Result<Vec<i64>> {
-    if file_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let wanted: std::collections::HashSet<i64> = file_ids.iter().copied().collect();
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.path FROM zip_released_entries r INNER JOIN files f ON f.path = r.released_to
-         WHERE f.archive_zip_path IS NULL ORDER BY f.id",
-    )?;
-    let owners = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    let mut back = Vec::new();
-    for (id, path) in owners {
-        if !wanted.contains(&id) || Path::new(&path).exists() {
-            continue;
-        }
-        if let Some(root) = crate::scanner::path_under_unavailable_scan_root(conn, &path)? {
-            tracing::warn!(file_id = id, path = %path, offline_root = %root, "unpacked copy missing but its scan root is unavailable — the row stays");
-            continue;
-        }
-        if return_to_zip(conn, id)? {
-            back.push(id);
-        }
-    }
-    Ok(back)
-}
-
-/// For the missing-files check of a scan root: the ids of `missing` that went back into their zip
-/// ([`return_missing_copies_to_zip`]). A deleted unpacked copy is not a missing file, its frame is in the zip,
-/// so the caller leaves these out of its list. A failure is logged and nothing is left out.
-pub fn rows_back_in_their_zip(ctx: &crate::services::ServiceContext, missing: &[i64]) -> std::collections::HashSet<i64> {
-    if missing.is_empty() {
-        return Default::default();
-    }
-    let Some(database) = ctx.db.get() else {
-        tracing::error!("missing files: catalog not available to take unpacked rows back into their zip");
-        return Default::default();
-    };
-    match return_missing_copies_to_zip(&database.conn(), missing) {
-        Ok(back) => back.into_iter().collect(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "missing files: could not take unpacked rows back into their zip");
-            Default::default()
-        }
-    }
 }
 
 /// The cataloged rows that belong to `zip`: those marked with it (`archive_zip_path`, ours and foreign) and

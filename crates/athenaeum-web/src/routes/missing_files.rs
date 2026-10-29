@@ -156,9 +156,6 @@ pub async fn check_missing_files_in_scan_root(
         .filter(|(_, present)| !present)
         .map(|((f, _, _), _)| f)
         .collect();
-    let ids: Vec<i64> = missing_files.iter().map(|f| f.id).collect();
-    let back = athenaeum_core::zip_store::catalog::rows_back_in_their_zip(&state.ctx, &ids);
-    let missing_files: Vec<OrphanedFile> = missing_files.into_iter().filter(|f| !back.contains(&f.id)).collect();
 
     Ok(Json(missing_files))
 }

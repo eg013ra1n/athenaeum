@@ -1653,9 +1653,6 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
         .filter(|(_, present)| !present)
         .map(|((f, _, _), _)| f)
         .collect();
-    let ids: Vec<i64> = missing_files.iter().map(|f| f.id).collect();
-    let back = crate::zip_store::catalog::rows_back_in_their_zip(ctx, &ids);
-    let missing_files: Vec<OrphanedFile> = missing_files.into_iter().filter(|f| !back.contains(&f.id)).collect();
 
     // Emit final progress
     crate::scanner::emit_progress(
