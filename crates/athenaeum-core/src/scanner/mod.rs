@@ -647,7 +647,7 @@ fn process_file(
         // The shared lookup: a duplicate (old path still there) or an offline old root falls
         // through to the new-file handling below; a disk file never matches a zip-resident row.
         if let Some((file_id, old_path)) =
-            crate::zip_store::scan::find_moved_row(conn, &fingerprint, &current_path, false)?
+            crate::zip_store::scan::find_moved_row(conn, &fingerprint, &current_path, None)?
         {
             tracing::debug!(
                 root_id,
@@ -1667,6 +1667,10 @@ fn process_file_parallel(
 /// This function uses a two-phase approach:
 /// - Phase 1: Parallel file discovery and metadata extraction (CPU-bound)
 /// - Phase 2: Sequential database inserts in a single transaction (I/O-bound)
+///
+/// The zips of the root are read right after its frame files. A scan over several roots uses
+/// [`scan_files_parallel`] and [`finish_zip_pass`] instead, so that every root's files are in the catalog
+/// before any zip is read (see `run_registered_scans`).
 pub fn scan_directory_parallel<E: ProgressEmitter>(
     root_path: &Path,
     root_id: i64,
@@ -1675,6 +1679,56 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
 ) -> ScanResult {
+    match scan_files_parallel(root_path, root_id, conn, emitter, cancel_flag.clone(), unique_camera) {
+        ParallelScan::Done(result) => result,
+        ParallelScan::ZipsPending(pending) => finish_zip_pass(conn, emitter, cancel_flag, *pending),
+    }
+}
+
+/// How far [`scan_files_parallel`] got.
+pub(crate) enum ParallelScan {
+    /// The scan ended before the zip pass (cancelled, nothing to do, a collaboration root, a failure).
+    Done(ScanResult),
+    /// The frame files are in the catalog; the zips and what follows them are still to run.
+    ZipsPending(Box<PendingZips>),
+}
+
+/// What [`finish_zip_pass`] needs from the file pass of one root.
+pub(crate) struct PendingZips {
+    result: ScanResult,
+    zips: Vec<PathBuf>,
+    root_id: i64,
+    unique_camera: bool,
+    total_new: usize,
+    lights_count: usize,
+    flat_frame_ids: Vec<i64>,
+    dark_frame_ids: Vec<i64>,
+    bias_frame_ids: Vec<i64>,
+    darkflat_frame_ids: Vec<i64>,
+    master_dark_ids: Vec<i64>,
+    master_flat_ids: Vec<i64>,
+    master_bias_ids: Vec<i64>,
+    master_darkflat_ids: Vec<i64>,
+    new_file_ids: Vec<i64>,
+}
+
+impl PendingZips {
+    /// Whether the root holds any zip: a root without one gains nothing from waiting.
+    pub(crate) fn has_zips(&self) -> bool {
+        !self.zips.is_empty()
+    }
+}
+
+/// The file half of [`scan_directory_parallel`]: discovery, parsing and the inserts of the frame files, up to
+/// (not including) the zip pass.
+pub(crate) fn scan_files_parallel<E: ProgressEmitter>(
+    root_path: &Path,
+    root_id: i64,
+    conn: &Connection,
+    emitter: &E,
+    cancel_flag: Arc<AtomicBool>,
+    unique_camera: bool,
+) -> ParallelScan {
     let mut result = ScanResult {
         files_found: 0,
         files_processed: 0,
@@ -1734,7 +1788,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             result.cancelled = true;
             result.files_found = files.len();
             emit_scan_complete(emitter, root_id, &result);
-            return result;
+            return ParallelScan::Done(result);
         }
     }
 
@@ -1747,7 +1801,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     if cancel_flag.load(Ordering::SeqCst) {
         result.cancelled = true;
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // P26: the Collaboration root is reconciled against the project-frame
@@ -1769,14 +1823,14 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 !(idx % 10 == 0 && cancel_flag.load(Ordering::SeqCst))
             });
             emit_scan_complete(emitter, root_id, &result);
-            return result;
+            return ParallelScan::Done(result);
         }
         Ok(false) => {}
         Err(e) => {
             tracing::error!(root_id, error = %e, "read scan root kind failed; scan aborted");
             result.errors.push(format!("Failed to read the scan root kind: {e}"));
             emit_scan_complete(emitter, root_id, &result);
-            return result;
+            return ParallelScan::Done(result);
         }
     }
 
@@ -1786,7 +1840,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         emit_progress(emitter, root_id, 0, 0, None, "processing");
         std::thread::sleep(std::time::Duration::from_millis(100));
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // Build a map of existing file paths to their stored (id, size,
@@ -1893,7 +1947,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     if cancel_flag.load(Ordering::SeqCst) {
         result.cancelled = true;
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     if new_files.is_empty() && zips.is_empty() {
@@ -1910,7 +1964,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         // Small delay to ensure frontend has time to render progress modal
         std::thread::sleep(std::time::Duration::from_millis(100));
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // Phase 1b: Parallel processing - extract metadata from all files
@@ -1988,7 +2042,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // Phase 2: Sequential database inserts in a transaction
@@ -2013,7 +2067,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         tracing::error!(error = %e, stage = "inserting", "begin transaction failed");
         result.errors.push(format!("Failed to start DB transaction: {}", e));
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // Path -> file_id lookup for the write-loop's UPDATE-in-place branch.
@@ -2129,7 +2183,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 conn,
                 &fingerprint,
                 &file_result.file.path,
-                false,
+                None,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -2353,7 +2407,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         };
         result.errors.extend(phase1_errors);
         emit_scan_complete(emitter, root_id, &result);
-        return result;
+        return ParallelScan::Done(result);
     }
 
     // Commit transaction. If COMMIT fails, the transaction stays open on
@@ -2381,6 +2435,52 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
     result.errors.extend(phase1_errors);
+
+    ParallelScan::ZipsPending(Box::new(PendingZips {
+        result,
+        zips,
+        root_id,
+        unique_camera,
+        total_new,
+        lights_count,
+        flat_frame_ids,
+        dark_frame_ids,
+        bias_frame_ids,
+        darkflat_frame_ids,
+        master_dark_ids,
+        master_flat_ids,
+        master_bias_ids,
+        master_darkflat_ids,
+        new_file_ids,
+    }))
+}
+
+/// The zip pass of a scan whose frame files are done, and everything after it: calibration sets, the hash
+/// pass, the duplicate caches and the completion event. Runs right after the files for a scan of one root;
+/// an all-roots scan runs it for every root only after the files of ALL roots are in the catalog.
+pub(crate) fn finish_zip_pass<E: ProgressEmitter>(
+    conn: &Connection,
+    emitter: &E,
+    cancel_flag: Arc<AtomicBool>,
+    pending: PendingZips,
+) -> ScanResult {
+    let PendingZips {
+        mut result,
+        zips,
+        root_id,
+        unique_camera,
+        total_new,
+        mut lights_count,
+        mut flat_frame_ids,
+        mut dark_frame_ids,
+        mut bias_frame_ids,
+        mut darkflat_frame_ids,
+        mut master_dark_ids,
+        mut master_flat_ids,
+        mut master_bias_ids,
+        mut master_darkflat_ids,
+        new_file_ids,
+    } = pending;
 
     // Phase 2b: zips, one at a time after the parallel frame pass (their frames join the
     // calibration-set creation below). Zip-resident rows are NOT added to `new_file_ids`: they
@@ -2536,6 +2636,85 @@ pub struct RegisteredScanOutcome {
     pub reconcile: crate::db::ReconcileResult,
 }
 
+/// Removes the scan's handle from `ctx.active_scans` when dropped, on every exit path.
+struct ScanHandleGuard<'a> {
+    ctx: &'a crate::services::ServiceContext,
+    root_id: i64,
+}
+
+impl Drop for ScanHandleGuard<'_> {
+    fn drop(&mut self) {
+        let mut scans = self.ctx.active_scans.lock().unwrap();
+        scans.remove(&self.root_id);
+    }
+}
+
+/// A scan registered in `ctx.active_scans` (until this value drops), with the root's config and the
+/// reconciliation result.
+struct RegisteredScan<'a> {
+    ctx: &'a crate::services::ServiceContext,
+    root_id: i64,
+    root: crate::models::ScanRoot,
+    reconcile: crate::db::ReconcileResult,
+    cancel_flag: Arc<AtomicBool>,
+    _guard: ScanHandleGuard<'a>,
+}
+
+/// Atomically check-and-register the scan of `root_id` (two concurrent calls cannot both pass the "no scan in
+/// progress" check), reconcile `unique_camera` state and look up the root's config.
+fn begin_registered_scan(
+    ctx: &crate::services::ServiceContext,
+    root_id: i64,
+) -> Result<RegisteredScan<'_>, String> {
+    use crate::services::ScanHandle;
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut scans = ctx.active_scans.lock().unwrap();
+        if scans.contains_key(&root_id) {
+            return Err("Scan already in progress for this root".to_string());
+        }
+        scans.insert(root_id, ScanHandle { root_id, cancel_flag: cancel_flag.clone() });
+    }
+    // From here the handle is removed by the guard, whichever way this returns.
+    let guard = ScanHandleGuard { ctx, root_id };
+
+    let db = ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Reconcile unique_camera state before scanning.
+    let reconcile = crate::db::reconcile_unique_camera_instrume(&conn, root_id)
+        .map_err(|e| format!("Reconciliation failed: {}", e))?;
+
+    // Look up root config.
+    let roots = crate::db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
+    let root = roots
+        .into_iter()
+        .find(|r| r.id == Some(root_id))
+        .ok_or("Scan root not found")?;
+    Ok(RegisteredScan { ctx, root_id, root, reconcile, cancel_flag, _guard: guard })
+}
+
+/// Persist the `last_scan` timestamp and the scan errors, and build the outcome.
+fn finish_registered_scan(scan: RegisteredScan<'_>, result: ScanResult) -> Result<RegisteredScanOutcome, String> {
+    let db = scan.ctx.db.get().ok_or("Database not initialized")?;
+    let root_id = scan.root_id;
+    {
+        let conn = db.conn();
+
+        // Persist last_scan timestamp.
+        if let Err(e) = crate::db::update_scan_root_timestamp(&conn, root_id) {
+            tracing::error!(root_id, error = %e, "failed to update scan timestamp");
+        }
+
+        // Persist scan errors so they survive app restarts.
+        if let Err(e) = crate::db::update_scan_root_errors(&conn, root_id, &result.errors) {
+            tracing::error!(root_id, error = %e, "failed to persist scan errors");
+        }
+    }
+    Ok(RegisteredScanOutcome { result, reconcile: scan.reconcile })
+}
+
 /// Run a scan against a scan root with full lifecycle management:
 /// - Fails fast if a scan is already active for this root.
 /// - Registers a `ScanHandle` in `ctx.active_scans` (with cancel flag).
@@ -2553,74 +2732,100 @@ pub fn run_registered_scan<E: ProgressEmitter>(
     emitter: &E,
     root_id: i64,
 ) -> Result<RegisteredScanOutcome, String> {
-    use crate::services::ScanHandle;
-    use std::sync::atomic::AtomicBool;
-
     let span = tracing::info_span!("scan", root_id);
     let _g = span.enter();
 
-    // Atomically check-and-register so two concurrent calls cannot both
-    // pass the "no scan in progress" check and both insert (previously the
-    // mutex was released between contains_key and insert).
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut scans = ctx.active_scans.lock().unwrap();
-        if scans.contains_key(&root_id) {
-            return Err("Scan already in progress for this root".to_string());
-        }
-        scans.insert(
-            root_id,
-            ScanHandle { root_id, cancel_flag: cancel_flag.clone() },
-        );
-    }
-
-    // Ensure the handle is removed on every exit path via a drop guard.
-    struct ScanHandleGuard<'a> {
-        ctx: &'a crate::services::ServiceContext,
-        root_id: i64,
-    }
-    impl<'a> Drop for ScanHandleGuard<'a> {
-        fn drop(&mut self) {
-            let mut scans = self.ctx.active_scans.lock().unwrap();
-            scans.remove(&self.root_id);
-        }
-    }
-    let _guard = ScanHandleGuard { ctx, root_id };
-
+    let scan = begin_registered_scan(ctx, root_id)?;
     let db = ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
+    let result = {
+        let conn = db.conn();
+        scan_directory_parallel(
+            Path::new(&scan.root.path),
+            root_id,
+            &conn,
+            emitter,
+            scan.cancel_flag.clone(),
+            scan.root.unique_camera,
+        )
+    };
+    finish_registered_scan(scan, result)
+}
 
-    // Reconcile unique_camera state before scanning.
-    let reconcile = crate::db::reconcile_unique_camera_instrume(&conn, root_id)
-        .map_err(|e| format!("Reconciliation failed: {}", e))?;
+/// One scan over several roots, in the order given: the frame files of EVERY root are walked before any
+/// zip is read. A zip pass takes entries back into the zip for released copies that are gone from disk; run
+/// root by root, the zip of root A would take a copy the user moved into root B before root B's walker had
+/// seen it there, and the moved file would become a second row. Each root keeps its own scan handle (cancel
+/// works for it from its file pass to its last zip), its own progress and its own result; a root whose scan
+/// cannot start (already running, not found) gives its `Err` and the others carry on.
+///
+/// A root without a zip finishes at once, exactly as a single-root scan does.
+pub fn run_registered_scans<E: ProgressEmitter>(
+    ctx: &crate::services::ServiceContext,
+    emitter: &E,
+    root_ids: &[i64],
+) -> Vec<(i64, Result<RegisteredScanOutcome, String>)> {
+    let mut results: Vec<(i64, Result<RegisteredScanOutcome, String>)> = Vec::with_capacity(root_ids.len());
+    let mut waiting: Vec<(usize, RegisteredScan<'_>, PendingZips)> = Vec::new();
 
-    // Look up root config.
-    let roots = crate::db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
-    let root = roots
-        .into_iter()
-        .find(|r| r.id == Some(root_id))
-        .ok_or("Scan root not found")?;
-
-    let result = scan_directory_parallel(
-        Path::new(&root.path),
-        root_id,
-        &conn,
-        emitter,
-        cancel_flag,
-        root.unique_camera,
-    );
-
-    // Persist last_scan timestamp.
-    if let Err(e) = crate::db::update_scan_root_timestamp(&conn, root_id) {
-        tracing::error!(root_id, error = %e, "failed to update scan timestamp");
+    for &root_id in root_ids {
+        let span = tracing::info_span!("scan", root_id);
+        let _g = span.enter();
+        let scan = match begin_registered_scan(ctx, root_id) {
+            Ok(scan) => scan,
+            Err(e) => {
+                results.push((root_id, Err(e)));
+                continue;
+            }
+        };
+        let Some(db) = ctx.db.get() else {
+            results.push((root_id, Err("Database not initialized".to_string())));
+            continue;
+        };
+        let walked = {
+            let conn = db.conn();
+            scan_files_parallel(
+                Path::new(&scan.root.path),
+                root_id,
+                &conn,
+                emitter,
+                scan.cancel_flag.clone(),
+                scan.root.unique_camera,
+            )
+        };
+        match walked {
+            ParallelScan::Done(result) => results.push((root_id, finish_registered_scan(scan, result))),
+            ParallelScan::ZipsPending(pending) if !pending.has_zips() => {
+                let result = {
+                    let conn = db.conn();
+                    finish_zip_pass(&conn, emitter, scan.cancel_flag.clone(), *pending)
+                };
+                results.push((root_id, finish_registered_scan(scan, result)));
+            }
+            ParallelScan::ZipsPending(pending) => {
+                // The slot keeps the result at the root's place in the order given; it is always overwritten below.
+                results.push((root_id, Err("Scan did not finish".to_string())));
+                waiting.push((results.len() - 1, scan, *pending));
+            }
+        }
     }
 
-    // Persist scan errors so they survive app restarts.
-    if let Err(e) = crate::db::update_scan_root_errors(&conn, root_id, &result.errors) {
-        tracing::error!(root_id, error = %e, "failed to persist scan errors");
+    for (slot, scan, pending) in waiting {
+        let root_id = scan.root_id;
+        let span = tracing::info_span!("scan", root_id);
+        let _g = span.enter();
+        let outcome = match ctx.db.get() {
+            Some(db) => {
+                let result = {
+                    let conn = db.conn();
+                    finish_zip_pass(&conn, emitter, scan.cancel_flag.clone(), pending)
+                };
+                finish_registered_scan(scan, result)
+            }
+            None => Err("Database not initialized".to_string()),
+        };
+        results[slot] = (root_id, outcome);
     }
-
-    Ok(RegisteredScanOutcome { result, reconcile })
+    results
 }
 
 #[cfg(test)]

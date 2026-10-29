@@ -753,8 +753,9 @@ pub async fn find_new_frames_for_set(
             };
 
             let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
-            for root_id in roots {
-                if let Err(e) = crate::scanner::run_registered_scan(&state.ctx, &emitter, root_id) {
+            // One scan over all the roots: every root's frame files are walked before any zip is read.
+            for (root_id, outcome) in crate::scanner::run_registered_scans(&state.ctx, &emitter, &roots) {
+                if let Err(e) = outcome {
                     if !e.contains("already in progress") {
                         tracing::warn!(root_id, error = %e, "find_new_frames: scan of root failed");
                     }

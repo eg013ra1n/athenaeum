@@ -44,8 +44,9 @@ pub struct AutoMergeCompleteEvent {
 ///   into/out of the offline state so a persistently-offline root doesn't
 ///   fill stderr with one line per tick.
 /// - Skip if a scan is already active for this root (no queuing).
-/// - Otherwise, run `scanner::run_registered_scan` and emit a
-///   `monitor-detected` event if it processed any files.
+/// - Otherwise the root joins one `scanner::run_registered_scans` run (every
+///   root's frame files are walked before any zip is read) and a
+///   `monitor-detected` event is emitted if its scan processed any files.
 /// - If that scan ingested any new files AND a [`ScanCompletionHook`] is
 ///   installed, invoke it with those file ids (task M2) — this is what lets a
 ///   host react to UNATTENDED monitor scans and not just to human-clicked ones
@@ -81,6 +82,8 @@ pub fn run_cycle<E: ProgressEmitter>(
         }
     };
 
+    // Roots to scan this cycle, in id order: the offline and busy ones are filtered out here.
+    let mut due: Vec<(i64, String)> = Vec::new();
     for root in roots {
         let Some(root_id) = root.id else { continue };
         if !root.enabled || !root.monitor_enabled {
@@ -121,8 +124,16 @@ pub fn run_cycle<E: ProgressEmitter>(
                 continue;
             }
         }
+        due.push((root_id, root.path.clone()));
+    }
 
-        match scanner::run_registered_scan(ctx, emitter, root_id) {
+    // One scan over all the due roots: every root's frame files are walked before any zip is read (a copy
+    // unpacked from a zip and moved to another root is then found where it is, not taken back into the zip).
+    let root_ids: Vec<i64> = due.iter().map(|(id, _)| *id).collect();
+    let outcomes = scanner::run_registered_scans(ctx, emitter, &root_ids);
+    for ((root_id, root_path), (outcome_id, outcome)) in due.into_iter().zip(outcomes) {
+        debug_assert_eq!(root_id, outcome_id);
+        match outcome {
             Ok(outcome) => {
                 let result = outcome.result;
                 // Only emit a notification when the scan actually processed
@@ -131,7 +142,7 @@ pub fn run_cycle<E: ProgressEmitter>(
                     let payload = MonitorDetectedEvent {
                         cycle_id: cycle_id.clone(),
                         root_id,
-                        root_path: root.path.clone(),
+                        root_path: root_path.clone(),
                         new_files: result.files_processed,
                         errors: result.errors.clone(),
                         timestamp: Utc::now().to_rfc3339(),
@@ -451,5 +462,86 @@ mod tests {
             hash_after_scan.is_none(),
             "a scan must not compute content_hash — the content-index job is the only producer"
         );
+    }
+
+    /// An entry unpacked into root A and then moved to root B in the file manager: an all-roots cycle
+    /// walks the disk files of EVERY root before it reads any zip, so root B's walker finds the moved
+    /// copy while the release still points at it, and the row keeps its id (and everything attached to
+    /// it). Root A's zip pass would otherwise adopt the row back into the zip first and leave the moved
+    /// file as a fresh row.
+    #[test]
+    fn a_cycle_over_several_roots_walks_every_root_before_any_zip() {
+        use crate::archive::models::ArchiveCompression;
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        use crate::zip_store::scan::virtual_path;
+
+        let (tmp, ctx) = test_ctx();
+        let root_a = tmp.path().join("root-a");
+        let root_b = tmp.path().join("root-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let zip = make_zip(&root_a, "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            for root in [&root_a, &root_b] {
+                conn.execute(
+                    "INSERT INTO scan_roots (path, enabled, monitor_enabled) VALUES (?1, 1, 1)",
+                    rusqlite::params![root.to_str().unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+        run_cycle(&ctx, &NullEmitter, &offline_roots, None);
+
+        // What an unpack does: the row of L_001 becomes a disk row at the copy, the entry is released with a link.
+        let copy_a = root_a.join("L_001.fits");
+        let copy_b = root_b.join("L_001.fits");
+        let row_id: i64 = {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE path = ?1",
+                    rusqlite::params![virtual_path(&zip, "L_001.fits")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            std::fs::write(&copy_a, light(1)).unwrap();
+            conn.execute(
+                "UPDATE files SET path = ?1, archive_zip_path = NULL, archive_path_in_zip = NULL,
+                        archive_entry_crc32 = NULL WHERE id = ?2",
+                rusqlite::params![copy_a.to_str().unwrap(), id],
+            )
+            .unwrap();
+            crate::zip_store::place::record_released_entry(&conn, zip.to_str().unwrap(), "L_001.fits", None, Some(id))
+                .unwrap();
+            id
+        };
+        std::fs::rename(&copy_a, &copy_b).unwrap();
+
+        run_cycle(&ctx, &NullEmitter, &offline_roots, None);
+
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        let at_b: Option<i64> = conn
+            .query_row("SELECT id FROM files WHERE path = ?1", rusqlite::params![copy_b.to_str().unwrap()], |r| r.get(0))
+            .ok();
+        assert_eq!(at_b, Some(row_id), "the moved copy is the same row, not a new one");
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2, "L_001 (moved) and L_002 (in the zip): no duplicate row");
+        let entry_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                rusqlite::params![virtual_path(&zip, "L_001.fits")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_row, 0, "the zip entry stays released: no row of its own");
+        let linked: Option<i64> = conn
+            .query_row("SELECT file_id FROM zip_released_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(linked, Some(row_id), "the release still links to the moved row");
     }
 }

@@ -82,9 +82,27 @@ fn old_location_is_gone(conn: &Connection, file_id: i64, old_path: &str, old_loc
     Ok(true)
 }
 
+/// Whether `file_id` is the link of a release of a zip other than `zip_path` that is still there (on disk, or
+/// under a scan root that is offline).
+fn linked_to_release_of_another_zip(conn: &Connection, file_id: i64, zip_path: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT z.path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
+         WHERE r.file_id = ?1 AND z.path != ?2",
+    )?;
+    let owners = stmt
+        .query_map(params![file_id, zip_path], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for owner in owners {
+        if Path::new(&owner).exists() || path_under_unavailable_scan_root(conn, &owner)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The row a new file at `new_path` with this header fingerprint should take over, if any: the
-/// scanner's moved-file rule, shared by the disk walkers (`for_zip_entry = false`) and the zip pass
-/// (`true`).
+/// scanner's moved-file rule, shared by the disk walkers (`for_zip = None`) and the zip pass
+/// (`Some(path of the zip being scanned)`).
 ///
 /// A row with the fingerprint at another path. A disk file never matches a zip-resident row
 /// (`archive_zip_path IS NULL`), so a manually unzipped copy of an archived frame is a new row, not
@@ -95,16 +113,18 @@ fn old_location_is_gone(conn: &Connection, file_id: i64, old_path: &str, old_loc
 ///
 /// A zip entry looks at every row with the fingerprint, in id order, and takes the first one whose
 /// old location is gone: a backup copy that is still present must not hide the row of the zip that
-/// was just renamed.
+/// was just renamed. A row that is the link of a release of ANOTHER zip that still exists is left alone: that
+/// zip's own scan takes it back (same id), and a backup copy of the zip scanned first must not steal it. The
+/// release of a zip that is gone does not hold its row back: nothing will scan that zip again.
 ///
 /// Returns the row's id and its `files.path`.
 pub(crate) fn find_moved_row(
     conn: &Connection,
     fingerprint: &str,
     new_path: &str,
-    for_zip_entry: bool,
+    for_zip: Option<&str>,
 ) -> Result<Option<(i64, String)>> {
-    if for_zip_entry {
+    if let Some(zip_path) = for_zip {
         let mut stmt = conn.prepare(
             "SELECT f.id, f.path, f.archive_zip_path FROM files f
              INNER JOIN fits_header fh ON f.id = fh.file_id
@@ -117,6 +137,9 @@ pub(crate) fn find_moved_row(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (file_id, old_path, row_zip) in candidates {
+            if linked_to_release_of_another_zip(conn, file_id, zip_path)? {
+                continue;
+            }
             let old_location = row_zip.unwrap_or_else(|| old_path.clone());
             if old_location_is_gone(conn, file_id, &old_path, &old_location, new_path)? {
                 return Ok(Some((file_id, old_path)));
@@ -469,7 +492,7 @@ fn stage_entry(
     };
     let moved = match preferred {
         Some(row) => Some(row),
-        None => find_moved_row(conn, &fingerprint, &vpath, true)?,
+        None => find_moved_row(conn, &fingerprint, &vpath, Some(zip_str))?,
     };
     if let Some((file_id, old_path)) = moved {
         tracing::debug!(
@@ -1611,6 +1634,79 @@ mod scan_tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
         assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 2);
         assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged, "and the next scan is the cheap one");
+    }
+
+    /// A backup zip with the same entry, scanned before the zip the copy was unpacked from, must not take the
+    /// row linked to that other zip's release: the owning zip's own scan adopts it (same id, same analysis).
+    #[test]
+    fn a_new_zip_with_an_identical_entry_leaves_the_row_linked_to_another_zips_release() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let z1 = make_zip(tmp.path(), "z1.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        scan_zip(&conn, &z1, 1, false).unwrap();
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        let r = unpack_entry(&conn, &z1, "L_001.fits", &copy, Some(light(1)));
+        std::fs::remove_file(&copy).unwrap();
+
+        // The backup zip is new to the catalog and is scanned first.
+        let z2 = make_zip(tmp.path(), "z2.zip", &[("L_001.fits", light(1))], ArchiveCompression::Store);
+        let backup = scan_zip(&conn, &z2, 1, false).unwrap();
+        assert_eq!(backup.adopted, 0, "the row belongs to the release of z1");
+        assert_eq!(backup.inserted.len(), 1, "the backup entry gets a row of its own");
+        assert_ne!(id_of(&conn, &virtual_path(&z2, "L_001.fits")), r);
+
+        let owner = scan_zip(&conn, &z1, 1, false).unwrap();
+        assert_eq!(owner.adopted, 1, "z1 takes its own row back");
+        assert_eq!(id_of(&conn, &virtual_path(&z1, "L_001.fits")), r, "the same row");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+    }
+
+    /// The release of a zip that is gone (renamed) does not hold its row back: nothing will ever scan that zip.
+    #[test]
+    fn the_row_linked_to_a_vanished_zips_release_is_taken_by_the_renamed_zip() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let z1 = make_zip(tmp.path(), "z1.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        scan_zip(&conn, &z1, 1, false).unwrap();
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        let r = unpack_entry(&conn, &z1, "L_001.fits", &copy, Some(light(1)));
+        std::fs::remove_file(&copy).unwrap();
+
+        let renamed = tmp.path().join("renamed.zip");
+        std::fs::rename(&z1, &renamed).unwrap();
+        let out = scan_zip(&conn, &renamed, 1, false).unwrap();
+        assert_eq!(id_of(&conn, &virtual_path(&renamed, "L_001.fits")), r, "the linked row takes the entry in the renamed zip");
+        assert!(out.adopted >= 1, "{out:?}");
+    }
+
+    /// Entries the safety filter keeps out of the catalog (`:` and a trailing space in the name, as our own
+    /// Move and ZIP names carry) are still counted when a row already owns them. The names exist only inside
+    /// the zip: nothing is written to disk under them.
+    #[test]
+    fn a_known_entry_the_safety_filter_skips_is_counted_as_cataloged() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let odd = "Lights: M33 /L_001.fits";
+        let zip = make_zip(tmp.path(), "n.zip", &[(odd, light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let zip_s = zip.to_str().unwrap().to_string();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (700, ?1, 'L_001.fits', 10, '2026-01-01T00:00:00Z', 'FITS', 7, ?2, ?3)",
+            params![virtual_path(&zip, odd), zip_s, odd],
+        )
+        .unwrap();
+
+        let listing = list_entries(&zip).unwrap();
+        assert!(listing.skipped.iter().any(|(n, _)| n == odd), "the filter skips the odd name: {:?}", listing.skipped);
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.inserted.len(), 1, "only L_002 is new");
+        assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 2, "the known odd entry is counted");
+        // A zip with no row for the odd name counts only what it catalogs.
+        conn.execute("DELETE FROM files WHERE id = 700", []).unwrap();
+        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 1, "an unknown skipped entry is not counted");
     }
 
     #[test]

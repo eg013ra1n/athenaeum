@@ -735,8 +735,13 @@ fn update_restored_row(
     if let Some((file_id, path_arg, new_mtime, new_size)) = row {
         adb::unmark_file_archived(conn, file_id, path_arg, Some(new_mtime), Some(new_size))?;
     }
-    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), row.map(|r| r.0))
-        .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
+    // An entry with no row (a Copy entry, or one whose row is gone) is not released: a release without a link
+    // is dead on the next scan, which would read an unchanged zip for nothing. The zip's own operation already
+    // keeps such an entry out of the catalog (`entries_written_by_creating_operation`).
+    if let Some((file_id, ..)) = row {
+        record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), Some(file_id))
+            .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
+    }
     sp.commit()?;
     Ok(())
 }
@@ -1819,6 +1824,37 @@ pub(crate) mod tests {
             3,
             "recording is idempotent"
         );
+    }
+
+    /// An entry whose catalog row is gone (a Copy entry has none) is restored to disk but not released: it
+    /// has no row to link to, and a release with no link is dead on the next scan, which would read an
+    /// unchanged zip and warn that it changed.
+    #[test]
+    fn a_kept_zip_records_no_release_for_an_entry_that_has_no_row() {
+        let (_arch, scan, conn, op_id, _paths) = archived_lights(3);
+        conn.execute("DELETE FROM session_members WHERE frame_id = 10000", []).unwrap();
+        conn.execute("DELETE FROM frames WHERE file_id = 1000", []).unwrap();
+        conn.execute("DELETE FROM files WHERE id = 1000", []).unwrap();
+        conn.execute("UPDATE archive_operation_files SET file_id = NULL WHERE file_id = 1000", []).unwrap();
+        let zip: String = conn
+            .query_row("SELECT target_zip_path FROM archive_operation_files WHERE operation_id = ?1 LIMIT 1", [op_id], |r| r.get(0))
+            .unwrap();
+
+        let outcome = restore(&conn, op_id, scan.path(), false, true);
+        assert_eq!(outcome.extracted, 3, "the entry without a row is still restored to disk");
+
+        let releases: Vec<Option<i64>> = conn
+            .prepare("SELECT file_id FROM zip_released_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(releases.len(), 2, "only the entries that have a row are released");
+        assert!(releases.iter().all(Option::is_some), "and every release has its link: {releases:?}");
+
+        let scanned = crate::zip_store::scan::scan_zip(&conn, Path::new(&zip), 1, false).unwrap();
+        assert!(scanned.skipped_unchanged, "the unchanged zip is not read: nothing in it is dead");
     }
 
     #[test]

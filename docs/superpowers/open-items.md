@@ -325,6 +325,9 @@ passes, with the measurement moved into the references.
 **Not seen by a human (jsdom only):** the browser's zip rows and zip view, the Black Hole "Zip archives" group and its dialogs, the Settings cache row, the relink "zips not found" note, and the Task 15 screens: Unpack dialog end to end on a real foreign zip, Locate into one of our zips, the Objects chips ("zip" / "N of M in zip"), "From zip" lines in the batch dialogs.
 
 **Accepted, do not re-flag:** the cache can exceed its limit by one group during a stacking Prepare (the limit is a target); a project re-export of a zip frame always extracts again (a correct skip would need the entry CRC in the export record); unpack has no Cancel; a set whose foreign-zip frames are only calibration frames gets no "Unpack from zip" button (reads still work); `RawWithCalibrationSets` still places an imported master that sits in a Black Hole zip; rollback restores over a non-matching file at the original path; project stacking of zipped landed files is unreachable (`landed_unchanged`).
+**Accepted, do not re-flag (zip releases, review r1 2026-10-29):**
+- A different frame written over the unpacked path keeps the release alive (the disk walker re-parses the row in place, the link still names a file that exists), so the zip entry stays out of the catalog and "unpacked -> path" names another frame. Telling it apart needs a second fingerprint column or a `linked` marker; Locate names the row's current path, so nothing is hidden. Fix when a real report comes.
+- A zip view under an unmounted copy root shows the released entry as readable, without the "unpacked" chip: `released_entries_of_zip` keeps a release only when a candidate path exists, while the scan keeps it under an offline root (`present_or_offline`). Nothing is written, the chip returns with the mount; cosmetic.
 
 ### v0.7.0 pre-release fixes (2026-10-25)
 
