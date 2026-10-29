@@ -346,8 +346,12 @@ mod presence_tests {
 
         // A file appearing at the original path does not matter either way: the zip decides.
         std::fs::remove_file(&zip).unwrap();
-        std::fs::create_dir_all(Path::new(&original).parent().unwrap()).unwrap();
-        std::fs::write(&original, b"x").unwrap();
+        // ':' and a trailing space are not legal in a Windows path, so only unix can put a file there.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(Path::new(&original).parent().unwrap()).unwrap();
+            std::fs::write(&original, b"x").unwrap();
+        }
         let missing = check_missing_files_in_scan_root(&ctx, root_id, &crate::events::NullEmitter).unwrap();
         assert_eq!(missing.len(), 1, "the zip is gone, so the row is missing even though a file sits at its path");
         let db = ctx.db.get().unwrap();

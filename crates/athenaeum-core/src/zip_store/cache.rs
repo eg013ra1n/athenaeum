@@ -508,7 +508,17 @@ mod cache_tests {
 
     fn set_age(cache: &ZipCache, key: &str, secs_ago: u64) {
         let t = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
-        std::fs::File::open(cache.key_dir(key).unwrap()).unwrap().set_modified(t).unwrap();
+        let dir = cache.key_dir(key).unwrap();
+        // A directory's times are set through a handle opened for writing; Windows also needs
+        // FILE_FLAG_BACKUP_SEMANTICS to open a directory at all (same as `touch_dir`).
+        #[cfg(windows)]
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().write(true).custom_flags(0x0200_0000).open(&dir)
+        };
+        #[cfg(not(windows))]
+        let handle = std::fs::File::open(&dir);
+        handle.unwrap().set_modified(t).unwrap();
     }
 
     /// The id of a process that has already exited.
