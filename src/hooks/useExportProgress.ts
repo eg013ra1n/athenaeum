@@ -5,7 +5,7 @@ import type { ExportProgressEvent, ExportCompleteEvent, ExportResult, ExportMode
 import type { FlatNormMode, LightCalParams } from '../types/models';
 import type { CalibratedLightFormat } from '../components/export/lightCalPrefs';
 import { useNotifications } from '../contexts/NotificationContext';
-import { exportCountsText, limitWarnings } from '../utils/exportCounts';
+import { exportCountsText, limitWarnings, linkFallbackText } from '../utils/exportCounts';
 
 /** Generation options forwarded to `export_to_wbpp`. In `calibratedLights` mode
  *  the backend calibrates every light from its linked masters as it places it,
@@ -84,6 +84,7 @@ export function useExportProgress() {
                 rewritten: payload.rewritten,
                 failed: payload.failed,
                 zipCopied: payload.zipCopied ?? 0,
+                linkFallback: payload.linkFallback ?? { hardLinks: 0, copies: 0 },
               },
               progress: null,
             });
@@ -95,6 +96,7 @@ export function useExportProgress() {
         const exportFailed = !payload.success || !!payload.error;
         const countsText = payload.frameSetId === -1 ? exportCountsText(payload) : '';
         const isProject = payload.frameSetId === -1;
+        const fallbackText = linkFallbackText(payload.linkFallback);
         const lim = limitWarnings(payload.warnings ?? [], 3);
         const projectWarnings = lim.shown.length
           ? ` · ${lim.shown.join(' · ')}${lim.more ? ` · +${lim.more} more` : ''}`
@@ -105,7 +107,7 @@ export function useExportProgress() {
             : `Export complete — ${payload.filesOrganized} files`,
           detail: payload.error
             ? String(payload.error)
-            : `${payload.outputDir}${countsText ? ` · ${countsText}` : ''}${isProject ? projectWarnings : exportWarnings ? ` · ${exportWarnings} warning${exportWarnings === 1 ? '' : 's'}` : ''}`,
+            : `${payload.outputDir}${countsText ? ` · ${countsText}` : ''}${fallbackText ? ` · ${fallbackText}` : ''}${isProject ? projectWarnings : exportWarnings ? ` · ${exportWarnings} warning${exportWarnings === 1 ? '' : 's'}` : ''}`,
           kind: 'export',
           hasErrors: exportFailed,
           tone: exportFailed || exportWarnings > 0 ? 'warning' : 'success',

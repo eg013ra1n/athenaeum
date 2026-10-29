@@ -26,6 +26,8 @@ use crate::export::models::{
     calibrated_output_filename, sanitize_display_folder_name, sanitize_folder_name,
     CalibrationSetInfo, CalibrationSubgroup, ExportData, ExportProgressEvent, WbppExportConfig,
 };
+use crate::export::links::Linker;
+use crate::export::models::LinkFallbackCounts;
 use crate::services::ServiceContext;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -42,6 +44,8 @@ pub struct OrganizeResult {
     /// Zip-resident files that were COPIED although the run asked for links: a link into the zip cache
     /// would dangle after the cache evicts the entry. `0` in a copy run.
     pub zip_copied: usize,
+    /// Links Windows did not allow as symbolic links, made as hard links or copies (see [`Linker`]).
+    pub link_fallback: LinkFallbackCounts,
 }
 
 /// Count total files that will be organized (for progress tracking).
@@ -673,6 +677,7 @@ pub fn organize_files_wbpp(
     let mut files_organized = 0;
     let mut warnings = Vec::new();
     let mut zip_copied = 0usize;
+    let mut linker = Linker::default();
 
     // Create parent directory named after the frame set — the export layout's top
     // level (the send path omits this; the receiver supplies its own).
@@ -771,7 +776,7 @@ pub fn organize_files_wbpp(
                                 // alive) is removed first: `fs::copy` would write THROUGH it, into
                                 // whatever it points at, which can be a scan root.
                                 let copied = remove_link(&dest)
-                                    .and_then(|()| copy_or_link(&local.to_string_lossy(), &dest, false));
+                                    .and_then(|()| copy_or_link(&local.to_string_lossy(), &dest, None));
                                 if copied.is_ok() && use_symlinks {
                                     zip_copied += 1;
                                 }
@@ -792,7 +797,7 @@ pub fn organize_files_wbpp(
                             }
                         }
                     }
-                    _ => copy_or_link(&placement.file_path, &dest, use_symlinks && !in_zip),
+                    _ => copy_or_link(&placement.file_path, &dest, (use_symlinks && !in_zip).then_some(&mut linker)),
                 };
                 match placed {
                     Ok(_) => {
@@ -885,10 +890,19 @@ pub fn organize_files_wbpp(
         }
     }
 
+    if linker.counts != LinkFallbackCounts::default() {
+        tracing::info!(
+            frame_set_id,
+            hard_links = linker.counts.hard_links,
+            link_copies = linker.counts.copies,
+            "export: symbolic links replaced"
+        );
+    }
     Ok(OrganizeResult {
         files_organized,
         warnings,
         zip_copied,
+        link_fallback: linker.counts,
     })
 }
 
@@ -975,8 +989,8 @@ fn remove_link(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy file or create symlink
-fn copy_or_link(source: &str, dest: &PathBuf, use_symlinks: bool) -> Result<()> {
+/// Copy the file, or link it when `link` is given (a symbolic link, or Windows's fallback — see [`Linker`]).
+fn copy_or_link(source: &str, dest: &PathBuf, link: Option<&mut Linker>) -> Result<()> {
     // A dead link at the destination is not "an existing file" (`exists()` follows it): leave it and
     // `fs::copy` writes through it, `symlink` fails with EEXIST. A live link keeps the skip below.
     if is_link(dest) && !dest.exists() {
@@ -987,17 +1001,12 @@ fn copy_or_link(source: &str, dest: &PathBuf, use_symlinks: bool) -> Result<()> 
         return Ok(());
     }
 
-    if use_symlinks {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(source, dest)
-                .with_context(|| format!("Failed to symlink {} -> {:?}", source, dest))?;
-        }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_file(source, dest)
-                .with_context(|| format!("Failed to symlink {} -> {:?}", source, dest))?;
-        }
+    if let Some(linker) = link {
+        linker.link(Path::new(source), dest, || {
+            fs::copy(source, dest)
+                .map(|_| ())
+                .with_context(|| format!("Failed to copy {} -> {:?}", source, dest))
+        })?;
     } else {
         fs::copy(source, dest)
             .with_context(|| format!("Failed to copy {} -> {:?}", source, dest))?;
@@ -2207,5 +2216,52 @@ mod tests {
             "{:?}",
             result.warnings
         );
+    }
+
+    /// Link mode on Windows without the symbolic-link privilege (no Developer Mode, not elevated): every
+    /// disk frame still lands, as a hard link on the same volume, and the result counts them. A machine
+    /// that holds the privilege makes symbolic links and counts nothing.
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_mode_without_the_privilege_places_every_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let names = ["L_1.fits", "L_2.fits"];
+        let frames: Vec<ExportFrame> = names
+            .iter()
+            .zip(1..)
+            .map(|(name, id)| {
+                let p = src.join(name);
+                std::fs::write(&p, name.as_bytes()).unwrap();
+                let mut f = frame(id, name, "ASI");
+                f.file_path = p.to_string_lossy().into_owned();
+                f
+            })
+            .collect();
+        let data = export_data("Set", vec![subgroup(frames, None, None, None)]);
+        let privileged =
+            std::os::windows::fs::symlink_file(src.join(names[0]), tmp.path().join("probe_link")).is_ok();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let out = tmp.path().join("out");
+        let result = organize_files_wbpp(
+            &out, &data, true, &WbppExportConfig::default(), None, 1, &cancel, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let lights = out.join("Set/camera_asi/lights");
+        for name in names {
+            let dest = lights.join(name);
+            assert_eq!(std::fs::read(&dest).unwrap(), name.as_bytes());
+            assert_eq!(std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(), privileged);
+        }
+        let expected = if privileged {
+            LinkFallbackCounts::default()
+        } else {
+            LinkFallbackCounts { hard_links: 2, copies: 0 }
+        };
+        assert_eq!(result.link_fallback, expected);
     }
 }

@@ -1,5 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { exportCountsText, zipCopiedText } from './exportCounts';
+import { exportCountsText, linkFallbackText, zipCopiedText } from './exportCounts';
+
+describe('linkFallbackText', () => {
+  it('names the hard links and copies Windows made instead of symbolic links', () => {
+    expect(linkFallbackText({ hardLinks: 12, copies: 1 })).toBe(
+      'Windows did not allow symbolic links: 12 hard links, 1 copy (turn on Developer Mode for symbolic links)',
+    );
+    expect(linkFallbackText({ hardLinks: 1, copies: 0 })).toBe(
+      'Windows did not allow symbolic links: 1 hard link (turn on Developer Mode for symbolic links)',
+    );
+    expect(linkFallbackText({ hardLinks: 0, copies: 3 })).toBe(
+      'Windows did not allow symbolic links: 3 copies (turn on Developer Mode for symbolic links)',
+    );
+  });
+
+  it('says nothing when every link was a symbolic link', () => {
+    expect(linkFallbackText({ hardLinks: 0, copies: 0 })).toBeNull();
+    expect(linkFallbackText(undefined)).toBeNull();
+  });
+});
 
 describe('zipCopiedText', () => {
   it('says how many frames came out of zips, and nothing when none did', () => {

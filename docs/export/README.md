@@ -123,24 +123,35 @@ levels entirely — calibration is already applied, not linked, so only `lights/
 `export_to_wbpp` / `organize_files_wbpp` take a `use_symlinks: bool` supplied by
 the caller — there is no config default; the frontend decides it per platform:
 
-| Platform (in `ExportTab.tsx`) | Symlink toggle shown? | What actually happens |
+| Platform (in `ExportTab.tsx`, `ProjectExportDialog.tsx`) | Symlink toggle shown? | What actually happens |
 | ---- | ---- | ---- |
 | Tauri desktop, macOS/Linux | Yes | User's choice; unchecked = copy |
-| Tauri desktop, Windows | No (hidden) | Always copies — `useSymlinks` state stays `false`, there's no UI path to set it `true` |
+| Tauri desktop, Windows | Yes, with a one-line hint when checked | User's choice; link mode falls back as below without Developer Mode |
 | Web/Docker | No (hidden) | Always copies — output dir is also constrained to `ATHENAEUM_EXPORT_DIR` (`crates/athenaeum-web/src/main.rs`) |
 
-Source: `symlinksAvailable = isTauri && !isWindows` and the two
-`symlinkUnavailableReason` strings, `src/components/export/ExportTab.tsx`.
+Source: `symlinksAvailable = isTauri` and `symlinkUnavailableReason` in both
+dialogs; the Windows hint is `WINDOWS_LINKS_HINT` (`src/utils/exportCounts.ts`).
 
-**The Rust side does have a Windows symlink branch** — `copy_or_link`
-(`file_organizer.rs`) has both `#[cfg(unix)]` (`std::os::unix::fs::symlink`)
-and `#[cfg(windows)]` (`std::os::windows::fs::symlink_file`) arms. But because the
-frontend never surfaces the toggle on Windows, that branch is currently
-unreachable except by calling `export_to_wbpp` (Tauri) / `POST /api/export_to_wbpp`
-(web) directly with `use_symlinks: true`. If it were exercised, note the standard OS caveat: creating
-a file symlink on Windows requires either Developer Mode enabled or admin
-privileges (`SeCreateSymbolicLinkPrivilege`) — not an Athenaeum-specific
-restriction, just how `symlink_file` behaves.
+**Link mode on Windows (`export/links.rs`, 2026-10-29).** Windows refuses a file
+symbolic link with os error 1314 ("A required privilege is not held by the
+client") unless Developer Mode is on or the process is elevated. Both organizers
+place links through one `Linker` per run: it tries a symbolic link; on 1314 it
+remembers the refusal for the rest of the run and makes a hard link
+(`std::fs::hard_link`, no privilege needed on NTFS when the source and the export
+folder share a volume); when the hard link fails too (another volume, FAT/exFAT, a
+network share) it copies. Any other symbolic-link error is a per-file warning, as
+before. The replacements are counted in `LinkFallbackCounts { hardLinks, copies }`,
+carried as `linkFallback` on `ExportResult` and `ExportCompleteEvent` by both
+backends; the completion card, the project dialog and the notification show
+"Windows did not allow symbolic links: N hard links, M copies (turn on Developer
+Mode for symbolic links)" when either is non-zero (`linkFallbackText`). In the
+project export a hard link counts as `linked`, a fallback copy as `copied`.
+
+Nothing is written through a link at the destination: the WBPP organizer removes a
+dead link and skips a live one or an existing file (a hard link included), and the
+project organizer places every link, hard link or copy under a temp name renamed
+onto the destination. A hard link shares the source's bytes, so an export made of
+hard links must never be edited in place; WBPP only reads its inputs.
 
 **Known caveat with symlinked exports (documented, not yet solved):** because a
 symlinked export is a set of links back into the catalog's original file

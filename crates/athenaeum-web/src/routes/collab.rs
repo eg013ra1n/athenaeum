@@ -636,6 +636,7 @@ pub async fn export_collab_project(
                 rewritten: 0,
                 failed: 0,
                 zip_copied: 0,
+                link_fallback: Default::default(),
             }));
         }
     }

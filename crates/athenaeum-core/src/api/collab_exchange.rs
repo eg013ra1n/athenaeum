@@ -2118,6 +2118,7 @@ pub async fn export_project_for_wbpp(
             rewritten: c.rewritten,
             failed: c.failed,
             zip_copied: organized.zip_copied,
+            link_fallback: organized.link_fallback,
         })
     }
     .await;
@@ -2140,6 +2141,7 @@ pub async fn export_project_for_wbpp(
                 rewritten: r.rewritten,
                 failed: r.failed,
                 zip_copied: r.zip_copied,
+                link_fallback: r.link_fallback,
             },
             Err(err) => ExportCompleteEvent {
                 frame_set_id: SENTINEL,
@@ -2153,6 +2155,7 @@ pub async fn export_project_for_wbpp(
                 rewritten: 0,
                 failed: 0,
                 zip_copied: 0,
+                link_fallback: Default::default(),
             },
         };
         crate::events::emit_event(e, "export-complete", &complete);

@@ -384,6 +384,7 @@ pub async fn export_to_wbpp(
         rewritten: 0,
         failed: 0,
         zip_copied: 0,
+        link_fallback: Default::default(),
     };
 
     let result = match collected {
@@ -507,6 +508,7 @@ pub async fn export_to_wbpp(
                                 rewritten: 0,
                                 failed: 0,
                                 zip_copied: 0,
+                                link_fallback: Default::default(),
                             },
                             Ok(Ok(ExportRunOutcome::Organized(org_result))) => {
                                 let was_cancelled = cancel_flag.load(Ordering::Relaxed);
@@ -525,6 +527,7 @@ pub async fn export_to_wbpp(
                                         rewritten: 0,
                                         failed: 0,
                                         zip_copied: org_result.zip_copied,
+                                        link_fallback: org_result.link_fallback,
                                     }
                                 } else {
                                     ExportResult {
@@ -539,6 +542,7 @@ pub async fn export_to_wbpp(
                                         rewritten: 0,
                                         failed: 0,
                                         zip_copied: org_result.zip_copied,
+                                        link_fallback: org_result.link_fallback,
                                     }
                                 }
                             }
@@ -583,6 +587,7 @@ fn finish_export(
             rewritten: 0,
             failed: 0,
             zip_copied: result.zip_copied,
+            link_fallback: result.link_fallback,
         },
     );
 }

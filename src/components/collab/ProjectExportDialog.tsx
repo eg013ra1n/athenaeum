@@ -3,7 +3,13 @@ import { Folder, FolderOutput, Loader2 } from 'lucide-react';
 import { api, type UnlistenFn } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
-import { exportCountsText, limitWarnings, zipCopiedText } from '../../utils/exportCounts';
+import {
+  exportCountsText,
+  limitWarnings,
+  linkFallbackText,
+  WINDOWS_LINKS_HINT,
+  zipCopiedText,
+} from '../../utils/exportCounts';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { Button, DialogShell, TextInput } from '../ui';
 import { Checkbox } from '../settings/Checkbox';
@@ -145,14 +151,13 @@ export default function ProjectExportDialog({
     }
   }, []);
 
-  // Symlink toggle eligibility — Tauri on macOS / Linux only (mirror ExportTab).
+  // Symlink toggle eligibility — the desktop app only (mirror ExportTab). On Windows without Developer
+  // Mode the backend makes hard links (or copies) instead and the result says how many.
   const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows');
-  const symlinksAvailable = isTauri && !isWindows;
+  const symlinksAvailable = isTauri;
   const symlinkUnavailableReason = !isTauri
     ? 'Files will be copied (web mode always copies; symbolic links are not supported in the Docker build).'
-    : isWindows
-      ? 'Files will be copied (symbolic links are only available on macOS and Linux).'
-      : null;
+    : null;
 
   const canExport = outputDir !== '' && !busy;
   const barPercent = progress ? Math.min(100, Math.max(0, progress.percent)) : 0;
@@ -211,7 +216,7 @@ export default function ProjectExportDialog({
           </Button>
         </div>
 
-        {/* Symlinks toggle (macOS / Linux Tauri only) — hidden states explained. */}
+        {/* Symlinks toggle (desktop only) — the hidden state explained. */}
         <div className="mt-3">
           {symlinksAvailable ? (
             <Checkbox
@@ -224,6 +229,9 @@ export default function ProjectExportDialog({
           ) : symlinkUnavailableReason ? (
             <p className="text-[11.5px] text-content-faint">{symlinkUnavailableReason}</p>
           ) : null}
+          {useSymlinks && symlinksAvailable && isWindows && (
+            <p className="mt-1 text-[11.5px] text-content-faint">{WINDOWS_LINKS_HINT}</p>
+          )}
         </div>
 
         {/* Progress — dialog-local, one count across all publishers. */}
@@ -263,6 +271,9 @@ export default function ProjectExportDialog({
             )}
             {zipCopiedText(result.zipCopied) && (
               <p className="mt-0.5 text-[11.5px] text-content-faint">{zipCopiedText(result.zipCopied)}</p>
+            )}
+            {linkFallbackText(result.linkFallback) && (
+              <p className="mt-0.5 text-[11.5px] text-content-faint">{linkFallbackText(result.linkFallback)}</p>
             )}
             <p className="mt-0.5 break-all text-[11.5px] text-content-faint">{result.outputDir}</p>
             {result.warnings.length > 0 && (

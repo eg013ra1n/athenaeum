@@ -352,6 +352,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::export::models::CalibrationTreeNode,
             crate::export::models::CalibrationRouteSummary,
             crate::export::models::ExportResult,
+            crate::export::models::LinkFallbackCounts,
             crate::export::models::ExportSummary,
             crate::export::models::FilterGroupSummary,
             crate::export::models::ExposureGroup,

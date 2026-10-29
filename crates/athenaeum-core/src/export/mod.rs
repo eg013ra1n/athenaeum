@@ -9,6 +9,7 @@ pub mod data_collector;
 pub mod file_organizer;
 pub mod filter_header;
 pub mod frame_set_queries;
+pub mod links;
 pub mod models;
 pub mod project_collector;
 pub mod project_organizer;

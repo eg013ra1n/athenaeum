@@ -22,6 +22,7 @@ import { geometryOriginSentence, modeBlocker, modeBlockerReason } from './modeBl
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { ZIP_COPIED_NOT_LINKED } from '../../utils/zipChips';
+import { WINDOWS_LINKS_HINT } from '../../utils/exportCounts';
 import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import {
   readFlatNormPref,
@@ -443,16 +444,15 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // Sending needs no output folder — the payload is staged by the backend.
   const canSend = modeReady;
 
-  // Symlink toggle eligibility — Tauri on macOS / Linux only. On web mode
-  // (Docker always copies) and on Windows we hide the toggle but explain
-  // why so the user isn't left guessing.
+  // Symlink toggle eligibility — the desktop app only. In web mode (Docker
+  // always copies) we hide the toggle but explain why so the user isn't left
+  // guessing. On Windows without Developer Mode the backend makes hard links
+  // (or copies) instead and the result says how many.
   const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows');
-  const symlinksAvailable = isTauri && !isWindows;
+  const symlinksAvailable = isTauri;
   const symlinkUnavailableReason = !isTauri
     ? 'Files will be copied (web mode always copies; symbolic links are not supported in the Docker build).'
-    : isWindows
-      ? 'Files will be copied (symbolic links are only available on macOS and Linux).'
-      : null;
+    : null;
 
   return (
     <div className="h-full overflow-y-auto">
@@ -834,8 +834,8 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                 </div>
               </div>
 
-              {/* Symlinks toggle (macOS / Linux Tauri only) — hidden states
-                  explained inline so the absence isn't mysterious. */}
+              {/* Symlinks toggle (desktop only) — the hidden state explained
+                  inline so the absence isn't mysterious. */}
               {symlinksAvailable ? (
                 <div>
                   <label className="flex items-center gap-2 cursor-pointer">
@@ -855,6 +855,9 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               ) : null}
               {useSymlinks && symlinksAvailable && (
                 <p className="-mt-2 text-xs text-content-muted">{ZIP_COPIED_NOT_LINKED}</p>
+              )}
+              {useSymlinks && symlinksAvailable && isWindows && (
+                <p className="-mt-2 text-xs text-content-muted">{WINDOWS_LINKS_HINT}</p>
               )}
               <ZipExtractionLine scope={{ frameSetId, exportMode }} refreshKey={exporting ? 1 : 0} />
 

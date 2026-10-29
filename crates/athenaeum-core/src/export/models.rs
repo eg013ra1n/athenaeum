@@ -564,6 +564,9 @@ pub struct ExportCompleteEvent {
     /// See [`ExportResult::zip_copied`].
     #[serde(default)]
     pub zip_copied: usize,
+    /// See [`LinkFallbackCounts`].
+    #[serde(default)]
+    pub link_fallback: LinkFallbackCounts,
 }
 
 // ============================================================================
@@ -663,6 +666,19 @@ pub struct ExportResult {
     /// zip cache would dangle once the cache evicts the entry). `0` for an export with no such file.
     #[serde(default)]
     pub zip_copied: usize,
+    /// See [`LinkFallbackCounts`].
+    #[serde(default)]
+    pub link_fallback: LinkFallbackCounts,
+}
+
+/// Link-mode placements Windows did not allow as symbolic links (os error 1314: no Developer Mode, not
+/// elevated): made as hard links, or copied where a hard link is impossible too (another volume, FAT/exFAT,
+/// a network share). Both `0` when every link was a symbolic link, and in a copy run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkFallbackCounts {
+    pub hard_links: usize,
+    pub copies: usize,
 }
 
 // ============================================================================
