@@ -726,6 +726,133 @@ pub fn clear_zip_cache(ctx: &ServiceContext) -> Result<crate::zip_store::cache::
     cache.status().map_err(ApiError::from)
 }
 
+/// What [`rescan_after_void`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RescanAfterVoid {
+    /// Folders rescanned (a folder outside every available scan root is not counted).
+    pub directories: usize,
+    /// Zips read: those directly in a rescanned folder, and those elsewhere holding an unpacked entry whose
+    /// copy's catalog row is gone.
+    pub zips: usize,
+}
+
+/// The available, non-collaboration scan root that owns `path` (the longest match of nested roots), as
+/// `(root id, unique_camera)`. `None` when no root owns it, or the owning root is offline or a Collaboration
+/// root (never catalogued by a scan).
+fn owning_available_root(roots: &[crate::models::ScanRoot], path: &str) -> Option<(i64, bool)> {
+    let owner = roots
+        .iter()
+        .filter(|r| crate::scanner::path_has_root_prefix(path, &r.path))
+        .max_by_key(|r| r.path.trim_end_matches(['/', '\\']).len())?;
+    if owner.kind == "collaboration" || !Path::new(&owner.path).exists() {
+        return None;
+    }
+    Some((owner.id?, owner.unique_camera))
+}
+
+/// After Send to Void of unpacked copies: rescan the folders they were deleted from, so the zip entries
+/// they came from are cataloged again right away.
+///
+/// A folder under an available scan root is rescanned (its frame files and the zips directly in it, not its
+/// sub-folders) with that root's flags. Every zip that holds a released entry with no link left (the copy's
+/// row went with the Void) is scanned too, wherever it is, so a copy unpacked into another folder than its
+/// zip is covered. A folder outside every root, under an offline root, under a Collaboration root or
+/// outside the host's allowed paths is skipped with a log line, not an error. Nothing is ever deleted:
+/// rows of files that are missing stay.
+///
+/// Runs no progress events: it is a refresh behind another action, not a scan the user started.
+pub fn rescan_after_void(ctx: &ServiceContext, dirs: Vec<String>, policy: &PathPolicy) -> Result<RescanAfterVoid, ApiError> {
+    let database = db(ctx)?;
+    let conn = database.conn();
+    let roots = crate::db::get_scan_roots(&conn)?;
+    let emitter = crate::events::NullEmitter;
+    let mut out = RescanAfterVoid::default();
+
+    let mut scanned: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(dir);
+        if scanned.contains(&path) {
+            continue;
+        }
+        if let Err(e) = policy.check(&path) {
+            tracing::warn!(dir, error = %e, "rescan after void skipped a folder outside the allowed paths");
+            continue;
+        }
+        let Some((root_id, unique_camera)) = owning_available_root(&roots, dir) else {
+            tracing::info!(dir, "rescan after void skipped a folder: no available scan root owns it");
+            continue;
+        };
+        if !path.is_dir() {
+            tracing::info!(dir, root_id, "rescan after void skipped a folder that is not there");
+            continue;
+        }
+        let zips_here = std::fs::read_dir(&path)
+            .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| crate::scanner::is_zip_file(&e.path())).count())
+            .unwrap_or(0);
+        let result = crate::scanner::rescan_directory_shallow(&conn, &emitter, &path, root_id, unique_camera);
+        tracing::info!(
+            dir,
+            root_id,
+            found = result.files_found,
+            processed = result.files_processed,
+            errors = result.errors.len(),
+            "folder rescanned after void"
+        );
+        for e in &result.errors {
+            tracing::warn!(dir, error = %e, "rescan after void: scan error");
+        }
+        scanned.push(path);
+        out.directories += 1;
+        out.zips += zips_here;
+    }
+
+    // Zips elsewhere with an unpacked entry whose copy's row is gone: the scan takes the entry back.
+    let candidates: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT z.path FROM zip_released_entries r
+             INNER JOIN zip_archives z ON z.id = r.zip_id
+             WHERE r.file_id IS NULL ORDER BY z.path",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut by_root: BTreeMap<i64, (bool, Vec<PathBuf>)> = BTreeMap::new();
+    for zip in candidates {
+        let zip_path = PathBuf::from(&zip);
+        if zip_path.parent().is_some_and(|parent| scanned.iter().any(|d| d == parent)) {
+            continue;
+        }
+        if !zip_path.is_file() {
+            tracing::debug!(zip_path = %zip, "rescan after void: a zip with a dead link is not there");
+            continue;
+        }
+        if let Err(e) = policy.check(&zip_path) {
+            tracing::warn!(zip_path = %zip, error = %e, "rescan after void skipped a zip outside the allowed paths");
+            continue;
+        }
+        let Some((root_id, unique_camera)) = owning_available_root(&roots, &zip) else {
+            tracing::info!(zip_path = %zip, "rescan after void skipped a zip: no available scan root owns it");
+            continue;
+        };
+        by_root.entry(root_id).or_insert_with(|| (unique_camera, Vec::new())).1.push(zip_path);
+    }
+    for (root_id, (unique_camera, zips)) in by_root {
+        let count = zips.len();
+        let result = crate::scanner::rescan_zips(&conn, &emitter, zips, root_id, unique_camera);
+        tracing::info!(root_id, zips = count, processed = result.files_processed, errors = result.errors.len(), "zips rescanned after void");
+        for e in &result.errors {
+            tracing::warn!(root_id, error = %e, "rescan after void: zip scan error");
+        }
+        out.zips += count;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,5 +1847,139 @@ mod tests {
             list_zip_entries(&ctx, &PathPolicy::AllowAll, &missing.to_string_lossy(), ""),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    // ---- rescan_after_void ----
+
+    /// A catalog (owned by a context) with the scan root `astro` and a zip of the given entries scanned into it.
+    /// Every entry is unpacked into `dest` (relative to the root) and the unpacked rows are returned.
+    fn unpacked_fixture(entries: &[(&str, Vec<u8>)], dest: &str) -> (TempDir, ServiceContext, PathBuf, PathBuf, Vec<i64>) {
+        let (tmp, ctx, zip) = listing_fixture(entries);
+        let root = tmp.path().join("astro");
+        let out = root.join(dest);
+        let ids: Vec<i64> = {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM files ORDER BY path")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(unpack_file_ids(&conn, &ids, &out, &NullEmitter, &AtomicBool::new(false)).unwrap().unpacked, ids.len());
+            ids
+        };
+        (tmp, ctx, zip, out, ids)
+    }
+
+    fn void(ctx: &ServiceContext, id: i64) {
+        let database = ctx.db.get().unwrap();
+        crate::db::send_to_void(&database.conn(), id).unwrap();
+    }
+
+    fn counts(ctx: &ServiceContext) -> (i64, i64, i64) {
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        (
+            count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"),
+            count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NULL"),
+            count(&conn, "SELECT COUNT(*) FROM zip_released_entries"),
+        )
+    }
+
+    #[test]
+    fn rescan_after_void_catalogs_the_entry_of_a_voided_copy_in_the_zips_folder() {
+        let (tmp, ctx, zip, out, ids) = unpacked_fixture(&[("L_001.fits", light(1)), ("L_002.fits", light(2))], "");
+        let root = tmp.path().join("astro");
+        assert_eq!(out, root);
+        assert_eq!(counts(&ctx), (0, 2, 2));
+        void(&ctx, ids[0]);
+        assert_eq!(counts(&ctx), (0, 1, 2), "the Void took the copy's row; its release stays, with no link, until a scan");
+
+        let done = rescan_after_void(&ctx, vec![root.to_string_lossy().into_owned()], &PathPolicy::AllowAll).unwrap();
+        assert_eq!(done, RescanAfterVoid { directories: 1, zips: 1 });
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        let entry: String = conn
+            .query_row("SELECT archive_path_in_zip FROM files WHERE archive_zip_path = ?1", [zip.to_str().unwrap()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entry, "L_001.fits", "the voided copy's entry has a zip row again");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "the other copy is untouched");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
+    }
+
+    #[test]
+    fn rescan_after_void_recatalogs_a_copy_unpacked_into_another_folder_than_its_zip() {
+        let (tmp, ctx, zip, out, ids) = unpacked_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))], "out");
+        void(&ctx, ids[0]);
+        void(&ctx, ids[1]);
+        assert_eq!(counts(&ctx), (0, 0, 2));
+        // Both releases lost their link with their rows. Nothing in `out/Lights` is left to scan.
+        let dir = out.join("Lights");
+        assert!(!dir.join("L_001.fits").exists());
+        let done = rescan_after_void(&ctx, vec![dir.to_string_lossy().into_owned()], &PathPolicy::AllowAll).unwrap();
+        assert_eq!(done.directories, 1);
+        assert_eq!(done.zips, 1, "the zip in the root is read for its dead links");
+        assert_eq!(counts(&ctx).0, 2, "both entries are cataloged again");
+        let database = ctx.db.get().unwrap();
+        let conn = database.conn();
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM files WHERE archive_zip_path = '{}'", zip.to_str().unwrap())),
+            2
+        );
+        drop(conn);
+        drop(database);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn rescan_after_void_skips_a_folder_outside_every_root_and_under_an_offline_root() {
+        let (tmp, ctx, _zip, _out, ids) = unpacked_fixture(&[("L_001.fits", light(1))], "");
+        void(&ctx, ids[0]);
+        let elsewhere = TempDir::new().unwrap();
+        let unmounted = tmp.path().join("unmounted");
+        {
+            let database = ctx.db.get().unwrap();
+            database
+                .conn()
+                .execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", [unmounted.to_str().unwrap()])
+                .unwrap();
+        }
+        let before = counts(&ctx);
+        let dirs = vec![
+            elsewhere.path().to_string_lossy().into_owned(),
+            unmounted.join("night").to_string_lossy().into_owned(),
+            String::new(),
+        ];
+        let done = rescan_after_void(&ctx, dirs, &PathPolicy::AllowAll).unwrap();
+        assert_eq!(done.directories, 0);
+        assert_eq!(counts(&ctx).1, before.1, "nothing was written for a skipped folder");
+        // The zip with the dead link is still read on its own (it is under the available root).
+        assert_eq!(counts(&ctx).0, 1);
+    }
+
+    #[test]
+    fn rescan_after_void_skips_a_folder_outside_the_allowed_paths() {
+        let (tmp, ctx, _zip, _out, ids) = unpacked_fixture(&[("L_001.fits", light(1))], "");
+        void(&ctx, ids[0]);
+        let allowed = TempDir::new().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![crate::test_support::canonical_path(allowed.path())]);
+        let done = rescan_after_void(&ctx, vec![tmp.path().join("astro").to_string_lossy().into_owned()], &policy).unwrap();
+        assert_eq!(done, RescanAfterVoid::default());
+        assert_eq!(counts(&ctx).0, 0, "neither the folder nor the zip outside the allowed paths was read");
+    }
+
+    #[test]
+    fn rescan_after_void_leaves_a_release_whose_copy_is_still_there() {
+        let (tmp, ctx, _zip, _out, _ids) = unpacked_fixture(&[("L_001.fits", light(1)), ("L_002.fits", light(2))], "");
+        let before = counts(&ctx);
+        assert_eq!(before, (0, 2, 2));
+        let dir = tmp.path().join("astro").to_string_lossy().into_owned();
+        let done = rescan_after_void(&ctx, vec![dir], &PathPolicy::AllowAll).unwrap();
+        assert_eq!(done.directories, 1);
+        assert_eq!(counts(&ctx), before, "the links are alive: the entries stay released");
     }
 }

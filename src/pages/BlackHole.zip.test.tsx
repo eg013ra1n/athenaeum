@@ -148,4 +148,64 @@ describe('BlackHole — zip archives', () => {
     expect(calls('send_to_void')).toHaveLength(0);
     expect(screen.queryByText(/Query returned no rows/)).toBeNull();
   });
+  describe('rescan after Void', () => {
+    const LOOSE = (id: number, dir: string) => ({
+      ...ZIP_FRAME,
+      id,
+      file_id: id * 10,
+      filename: `L_${id}.fits`,
+      original_path: `${dir}/L_${id}.fits`,
+      archive_zip_path: null,
+    });
+
+    async function voidAllFiles() {
+      renderPage();
+      await screen.findByTestId('zip-group');
+      fireEvent.click(await screen.findByRole('button', { name: /Select All$/ }));
+      fireEvent.click(screen.getByRole('button', { name: 'Deselect all zips' }));
+      fireEvent.click(screen.getByRole('button', { name: /Send to Void/ }));
+      fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Confirm' }));
+    }
+
+    it('rescans once, with the distinct folders of the voided loose files', async () => {
+      frames = [LOOSE(1, '/astro/out'), LOOSE(2, '/astro/out'), LOOSE(3, '/astro/other')];
+      vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+        if (cmd === 'get_black_hole_files') return Promise.resolve(frames);
+        if (cmd === 'get_black_hole_zips') return Promise.resolve([ZIP]);
+        if (cmd === 'send_to_void') return Promise.resolve(null);
+        if (cmd === 'rescan_after_void') return Promise.resolve({ directories: 2, zips: 1 });
+        return Promise.resolve(null);
+      }) as never);
+      await voidAllFiles();
+      await waitFor(() => expect(calls('rescan_after_void')).toHaveLength(1));
+      const dirs = (calls('rescan_after_void')[0][1] as { dirs: string[] }).dirs;
+      expect([...dirs].sort()).toEqual(['/astro/other', '/astro/out']);
+      expect(notifyMock).not.toHaveBeenCalled();
+    });
+
+    it('does not rescan when every Void was refused', async () => {
+      frames = [ZIP_FRAME];
+      await voidAllFiles();
+      await waitFor(() => expect(calls('send_to_void')).toHaveLength(1));
+      expect(calls('rescan_after_void')).toHaveLength(0);
+    });
+
+    it('a failed rescan is logged and shows one warning, and the list still reloads', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      frames = [LOOSE(1, '/astro/out')];
+      vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+        if (cmd === 'get_black_hole_files') return Promise.resolve(frames);
+        if (cmd === 'get_black_hole_zips') return Promise.resolve([ZIP]);
+        if (cmd === 'send_to_void') return Promise.resolve(null);
+        if (cmd === 'rescan_after_void') return Promise.reject('scan failed');
+        return Promise.resolve(null);
+      }) as never);
+      await voidAllFiles();
+      await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
+      expect(notifyMock.mock.calls[0][0]).toMatchObject({ tone: 'warning' });
+      expect(errorSpy).toHaveBeenCalledWith('rescan_after_void failed:', 'scan failed');
+      await waitFor(() => expect(calls('get_black_hole_files').length).toBeGreaterThan(1));
+      errorSpy.mockRestore();
+    });
+  });
 });

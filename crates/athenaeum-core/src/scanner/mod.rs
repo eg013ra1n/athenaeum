@@ -1729,6 +1729,23 @@ pub(crate) fn scan_files_parallel<E: ProgressEmitter>(
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
 ) -> ParallelScan {
+    scan_files_parallel_to_depth(root_path, root_id, conn, emitter, cancel_flag, unique_camera, WALK_MAX_DEPTH)
+}
+
+/// Deepest level a scan walks below its root.
+const WALK_MAX_DEPTH: usize = 64;
+
+/// [`scan_files_parallel`] with the walk limited to `max_depth` levels below `root_path` (1 = the files
+/// directly in it). A full scan passes [`WALK_MAX_DEPTH`].
+pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
+    root_path: &Path,
+    root_id: i64,
+    conn: &Connection,
+    emitter: &E,
+    cancel_flag: Arc<AtomicBool>,
+    unique_camera: bool,
+    max_depth: usize,
+) -> ParallelScan {
     let mut result = ScanResult {
         files_found: 0,
         files_processed: 0,
@@ -1754,7 +1771,7 @@ pub(crate) fn scan_files_parallel<E: ProgressEmitter>(
 
     for entry in WalkDir::new(root_path)
         .follow_links(true)
-        .max_depth(64)
+        .max_depth(max_depth)
         .into_iter()
         .filter_entry(|e| !is_app_metadata_dir(e))
         .filter_map(|e| e.ok())
@@ -2713,6 +2730,70 @@ fn finish_registered_scan(scan: RegisteredScan<'_>, result: ScanResult) -> Resul
         }
     }
     Ok(RegisteredScanOutcome { result, reconcile: scan.reconcile })
+}
+
+/// Rescans one directory of a scan root: its frame files and the zips directly in it (not its sub-folders),
+/// with the root's flags, through the same file pass and zip pass a scan of the whole root runs. Nothing is
+/// registered in `active_scans` and no root timestamp is written: it is a refresh of what the catalog holds
+/// for that folder, used after a Void. The caller has checked that the root is available and not a
+/// Collaboration root.
+pub(crate) fn rescan_directory_shallow<E: ProgressEmitter>(
+    conn: &Connection,
+    emitter: &E,
+    dir: &Path,
+    root_id: i64,
+    unique_camera: bool,
+) -> ScanResult {
+    let cancel = Arc::new(AtomicBool::new(false));
+    match scan_files_parallel_to_depth(dir, root_id, conn, emitter, cancel.clone(), unique_camera, 1) {
+        ParallelScan::Done(result) => result,
+        ParallelScan::ZipsPending(pending) => finish_zip_pass(conn, emitter, cancel, *pending),
+    }
+}
+
+/// Scans the given zips of a root (no frame files), then runs what follows a zip pass: calibration sets,
+/// the hash pass and the duplicate caches for what the zips added. For a zip that is not in a rescanned
+/// folder. The caller has checked that the root is available and not a Collaboration root.
+pub(crate) fn rescan_zips<E: ProgressEmitter>(
+    conn: &Connection,
+    emitter: &E,
+    mut zips: Vec<PathBuf>,
+    root_id: i64,
+    unique_camera: bool,
+) -> ScanResult {
+    zips.sort();
+    zips.dedup();
+    let pending = PendingZips {
+        result: ScanResult {
+            files_found: 0,
+            files_processed: 0,
+            files_skipped: 0,
+            errors: Vec::new(),
+            lights_count: 0,
+            darks_count: 0,
+            flats_count: 0,
+            bias_count: 0,
+            darkflats_count: 0,
+            calibration_sets_created: 0,
+            cancelled: false,
+            new_file_ids: Vec::new(),
+        },
+        zips,
+        root_id,
+        unique_camera,
+        total_new: 0,
+        lights_count: 0,
+        flat_frame_ids: Vec::new(),
+        dark_frame_ids: Vec::new(),
+        bias_frame_ids: Vec::new(),
+        darkflat_frame_ids: Vec::new(),
+        master_dark_ids: Vec::new(),
+        master_flat_ids: Vec::new(),
+        master_bias_ids: Vec::new(),
+        master_darkflat_ids: Vec::new(),
+        new_file_ids: Vec::new(),
+    };
+    finish_zip_pass(conn, emitter, Arc::new(AtomicBool::new(false)), pending)
 }
 
 /// Run a scan against a scan root with full lifecycle management:

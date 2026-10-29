@@ -4,6 +4,7 @@ import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { format } from 'date-fns';
 import type { BlackHoleEntry, BlackHoleZipEntry } from '../types/models';
+import type { RescanAfterVoid } from '../types/archive';
 import type { BlackholeChangedEvent } from '../types/helpers';
 import { Chip } from '../components/ui';
 import { findZipInPath } from '../components/dualpane/zipView';
@@ -363,16 +364,35 @@ export default function BlackHole() {
           }
           setProgress({ current: ++done, total, action: 'void' });
         }
+        // Folders the loose files were deleted from: an unpacked copy that is Voided leaves its zip entry
+        // without a row, and the entry comes back only when that folder and its zips are scanned again.
+        const voidedDirs = new Set<string>();
         for (const fileId of idsArray) {
           try {
             await api.invoke('send_to_void', { fileId });
             successCount++;
+            const voided = entries.find((e) => e.file_id === fileId);
+            if (voided && voided.archive_zip_path == null) voidedDirs.add(getFolderPath(voided.original_path));
           } catch (err) {
             // A single frame inside a zip is refused here with the reason; it is shown below.
             console.error('send_to_void failed:', err);
             errors.push(String(err));
           }
           setProgress({ current: ++done, total, action: 'void' });
+        }
+
+        if (voidedDirs.size > 0) {
+          try {
+            await api.invoke<RescanAfterVoid>('rescan_after_void', { dirs: Array.from(voidedDirs) });
+          } catch (err) {
+            console.error('rescan_after_void failed:', err);
+            notify({
+              title: 'Rescan after delete failed',
+              detail: 'The deleted files are gone, but their folders were not rescanned. Rescan them to catalog the zip entries again.',
+              kind: 'files',
+              tone: 'warning',
+            });
+          }
         }
 
         setProgress(null);
@@ -384,7 +404,7 @@ export default function BlackHole() {
       },
       true
     );
-  }, [selectedIds, selectedZipIds, zips, entries]);
+  }, [selectedIds, selectedZipIds, zips, entries, notify]);
 
   // Keyboard shortcuts
   useEffect(() => {
