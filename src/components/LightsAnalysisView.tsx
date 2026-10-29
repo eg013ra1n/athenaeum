@@ -171,6 +171,11 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
     [allFramesRaw, blackholedFileIds]
   );
+  // Second copies of a frame the set already holds: listed with a chip, never plate solved.
+  const duplicateFrameIds = useMemo(
+    () => new Set(allFramesRaw.filter(f => f.duplicate_not_used).map(f => f.frame_id)),
+    [allFramesRaw]
+  );
 
   // Compute stacked SNR per filter group: sqrt(sum(frame_snr²)), a plain ratio (PC-11)
   const filterSnrMap = useMemo(() => {
@@ -180,7 +185,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     for (const [key, frames] of allKeys) {
       const values: number[] = [];
       for (const f of frames) {
-        if (blackholedFileIds.has(f.file_id)) continue;
+        if (blackholedFileIds.has(f.file_id) || f.duplicate_not_used) continue;
         const a = analysisData.get(f.frame_id);
         if (a) values.push(a.frame_snr);
       }
@@ -272,8 +277,12 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     }
   }, [currentAnalysis?.isComplete, loadAnalysisData]);
 
-  // The lights Analyze and Plate solve would read: what they would extract from zips first.
-  const zipScope = useMemo(() => ({ frameIds: allFrames.map((f) => f.frame_id) }), [allFrames]);
+  // The lights Analyze and Plate solve would read: what they would extract from zips first. A second copy of
+  // a frame is never measured or solved, so it extracts nothing.
+  const zipScope = useMemo(
+    () => ({ frameIds: allFrames.filter((f) => !f.duplicate_not_used).map((f) => f.frame_id) }),
+    [allFrames],
+  );
 
   // Plate scale from first frame with optics data (arcsec/pixel)
   const plateScale = useMemo(() => {
@@ -761,7 +770,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               <button
                 onClick={() => {
                   if (selectedFrameIds.size === 0) return;
-                  plateSolveRef.current?.start([...selectedFrameIds]);
+                  plateSolveRef.current?.start([...selectedFrameIds].filter(fid => !duplicateFrameIds.has(fid)));
                 }}
                 disabled={!hasSelection}
                 className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-accent hover:bg-accent-hover text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"

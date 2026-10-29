@@ -345,6 +345,53 @@ impl DuplicateKey {
     }
 }
 
+/// The one SQL test for "this frame is the copy of its raw frame that the
+/// frame set uses", for a query that aliases `frames` as `f`; `set_id_expr`
+/// names the frame set (`?1`, `n.frames_set_id`, `fs.id`).
+///
+/// The same raw frame held twice (two disk copies, or a disk copy and a zip
+/// entry) is two catalog rows, and both are members of the set. Every reader
+/// that decides what gets USED or COUNTED — the stacking plan and run, the
+/// export and send, the readiness count, the listing's count and hours, the
+/// frame-set page's totals, analysis — splices this fragment in beside
+/// [`super::FRAME_NOT_IN_BLACK_HOLE_SQL`], so one copy enters a stack, not two.
+///
+/// The identity is [`DuplicateKey::Header`] exactly: fingerprint + size +
+/// filename, a non-empty header, raw sub-frames only. A frame outside that
+/// identity is always its own used copy. Among the copies the set holds, the
+/// used one is the least `(in a zip, missing, files.id)`: a disk copy before a
+/// zip entry, then a present copy, then the lowest id. That order is total, so
+/// exactly one copy per identity survives. A copy in the Black Hole never
+/// displaces another one.
+///
+/// Per set, not catalog-wide: copies held by two different sets are each used
+/// in their own set (the Duplicates page still shows the pair). A set without
+/// duplicates loses no row, so its stack is byte-identical to before.
+pub fn frame_is_used_copy_sql(set_id_expr: &str) -> String {
+    let me_eligible = DuplicateKey::Header.eligibility().replace("fr.", "f.");
+    let other_eligible = DuplicateKey::Header.eligibility().replace("fr.", "ucf.");
+    let other_not_blackholed = super::file_not_in_black_hole_sql("uco.id");
+    format!(
+        "NOT EXISTS (SELECT 1 FROM files ucm \
+             JOIN fits_header ucmh ON ucmh.file_id = ucm.id \
+             JOIN fits_header ucoh ON ucoh.header_fingerprint = ucmh.header_fingerprint \
+                 AND ucoh.file_id <> ucm.id AND ucoh.header <> '' \
+             JOIN files uco ON uco.id = ucoh.file_id AND uco.size = ucm.size AND uco.filename = ucm.filename \
+             JOIN frames ucf ON ucf.file_id = uco.id \
+             JOIN session_members ucsm ON ucsm.frame_id = ucf.id \
+             JOIN sessions ucs ON ucs.id = ucsm.session_id \
+             JOIN imaging_nights ucn ON ucn.id = ucs.imaging_night_id \
+             WHERE ucm.id = f.file_id AND ucn.frames_set_id = {set_id_expr} \
+             AND ucmh.header_fingerprint IS NOT NULL AND ucmh.header_fingerprint <> '' AND ucmh.header <> '' \
+             {me_eligible} {other_eligible} \
+             AND {other_not_blackholed} \
+             AND (uco.archive_zip_path IS NOT NULL, \
+                  EXISTS (SELECT 1 FROM missing_files ucmo WHERE ucmo.file_id = uco.id), uco.id) \
+               < (ucm.archive_zip_path IS NOT NULL, \
+                  EXISTS (SELECT 1 FROM missing_files ucmm WHERE ucmm.file_id = ucm.id), ucm.id))"
+    )
+}
+
 /// Max bind parameters per statement for the `IN (…)` lists in this crate whose
 /// length comes from DATA rather than from a constant.
 ///
@@ -2677,7 +2724,9 @@ pub fn create_frames_set(
 ///
 /// A light in the Black Hole is a rejected light: it is neither counted nor
 /// summed here ([`super::FRAME_NOT_IN_BLACK_HOLE_SQL`]), so the hours agree
-/// with what stacking and export use. Restoring the file brings it back.
+/// with what stacking and export use. Restoring the file brings it back. A
+/// second copy of a frame the set already holds is summed once
+/// ([`frame_is_used_copy_sql`]).
 pub(crate) fn frame_set_member_exposure_sql() -> String {
     format!(
         "(SELECT SUM(f.exptime) FROM frames f
@@ -2685,14 +2734,17 @@ pub(crate) fn frame_set_member_exposure_sql() -> String {
                          JOIN sessions ms ON ms.id = msm.session_id
                          JOIN imaging_nights mn ON mn.id = ms.imaging_night_id
                          WHERE mn.frames_set_id = fs.id)
-            AND {not_blackholed})",
+            AND {not_blackholed}
+            AND {used_copy})",
         not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = frame_is_used_copy_sql("fs.id"),
     )
 }
 
 /// Get all frames sets with member counts. The count and `total_exp_time`
 /// cover the members outside the Black Hole only — the lights stacking and
-/// export use ([`super::FRAME_NOT_IN_BLACK_HOLE_SQL`]); the exposure is the
+/// export use ([`super::FRAME_NOT_IN_BLACK_HOLE_SQL`]) — and count a frame
+/// held twice once ([`frame_is_used_copy_sql`]); the exposure is the
 /// members' live sum ([`frame_set_member_exposure_sql`]), not the stored
 /// aggregate.
 pub fn get_frames_sets_by_project(
@@ -2707,11 +2759,12 @@ pub fn get_frames_sets_by_project(
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
          LEFT JOIN session_members sm ON s.id = sm.session_id
-         LEFT JOIN frames f ON f.id = sm.frame_id AND {not_blackholed}
+         LEFT JOIN frames f ON f.id = sm.frame_id AND {not_blackholed} AND {used_copy}
          GROUP BY fs.id
          ORDER BY fs.date_obs_start DESC, fs.name ASC",
         exposure = frame_set_member_exposure_sql(),
         not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = frame_is_used_copy_sql("fs.id"),
     ))?;
 
     let sets = stmt.query_map(params![], |row| {
@@ -2751,10 +2804,29 @@ pub fn get_frames_set_zip_member_counts(conn: &Connection) -> Result<std::collec
          FROM imaging_nights in_tbl
          JOIN sessions s ON in_tbl.id = s.imaging_night_id
          JOIN session_members sm ON s.id = sm.session_id
-         JOIN frames f ON f.id = sm.frame_id AND {not_blackholed}
+         JOIN frames f ON f.id = sm.frame_id AND {not_blackholed} AND {used_copy}
          JOIN files zf ON zf.id = f.file_id AND zf.archive_zip_path IS NOT NULL
          GROUP BY in_tbl.frames_set_id",
         not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = frame_is_used_copy_sql("in_tbl.frames_set_id"),
+    ))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)))?;
+    rows.collect()
+}
+
+/// Per frames set: how many members outside the Black Hole are a second copy of a frame the set already
+/// holds — the copies [`frame_is_used_copy_sql`] leaves out of every count and every use. Sets with none
+/// are absent from the map.
+pub fn get_frames_set_duplicate_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT in_tbl.frames_set_id, COUNT(DISTINCT f.id)
+         FROM imaging_nights in_tbl
+         JOIN sessions s ON in_tbl.id = s.imaging_night_id
+         JOIN session_members sm ON s.id = sm.session_id
+         JOIN frames f ON f.id = sm.frame_id AND {not_blackholed} AND NOT ({used_copy})
+         GROUP BY in_tbl.frames_set_id",
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+        used_copy = frame_is_used_copy_sql("in_tbl.frames_set_id"),
     ))?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)))?;
     rows.collect()
@@ -8867,5 +8939,171 @@ mod frames_set_listing_tests {
         assert_eq!(counts.get(&1), Some(&1), "a Black Hole frame is not counted");
         let sets = get_frames_sets_by_project(&conn, 1).unwrap();
         assert_eq!(sets[0].1, 2, "the member count agrees: one disk frame + one zip frame");
+    }
+}
+
+/// [`frame_is_used_copy_sql`]: one used copy per raw frame within a set.
+#[cfg(test)]
+mod used_copy_tests {
+    use super::*;
+    use crate::db::init_db;
+
+    /// A set with one night and one session; returns the session id.
+    fn set(conn: &Connection, id: i64) -> i64 {
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (?1, 'set')", [id]).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (?1, '2025-06-28T23:00:00Z', '2025-06-29T02:00:00Z')",
+            [id],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')", [night]).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A 180 s light (file id = frame id = `id`) in `session` with the given header identity.
+    fn light(conn: &Connection, session: i64, id: i64, filename: &str, fingerprint: &str, zip: bool) {
+        let zip_path = zip.then_some("/z/night.zip");
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (?1, ?2, ?3, 100, '2025-06-29T00:00:00Z', 'FITS', ?4, ?5)",
+            params![id, format!("/l/{id}/{filename}"), filename, zip_path, zip_path.map(|_| filename.to_string())],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, exptime) VALUES (?1, ?1, 'Light', 180.0)",
+            [id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'SIMPLE = T', ?2)",
+            params![id, fingerprint],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, id]).unwrap();
+    }
+
+    /// The set's members the fragment keeps, by frame id.
+    fn used(conn: &Connection, set_id: i64) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT DISTINCT f.id FROM frames f
+                 JOIN session_members sm ON sm.frame_id = f.id
+                 JOIN sessions s ON s.id = sm.session_id
+                 JOIN imaging_nights n ON n.id = s.imaging_night_id
+                 WHERE n.frames_set_id = ?1 AND {}
+                 ORDER BY f.id",
+                frame_is_used_copy_sql("n.frames_set_id")
+            ))
+            .unwrap();
+        stmt.query_map([set_id], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<i64>>>().unwrap()
+    }
+
+    fn mark_missing(conn: &Connection, file_id: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO scan_roots (id, path) VALUES (1, '/l')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at)
+             VALUES (?1, 1, '2025-07-01T00:00:00Z', '2025-07-01T00:00:00Z')",
+            [file_id],
+        )
+        .unwrap();
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Set 271 on the dev catalog: every frame once on disk and once in a zip. The set counts each
+    /// frame once, sums its hours once, reports the zip copies as duplicates and none as "in zip".
+    #[test]
+    fn a_disk_copy_and_a_zip_copy_count_once_and_the_disk_copy_is_used() {
+        let conn = db();
+        let s = set(&conn, 1);
+        light(&conn, s, 1, "a.fit", "fpa", false);
+        light(&conn, s, 2, "b.fit", "fpb", false);
+        light(&conn, s, 3, "a.fit", "fpa", true);
+        light(&conn, s, 4, "b.fit", "fpb", true);
+        assert_eq!(used(&conn, 1), vec![1, 2]);
+
+        let sets = get_frames_sets_by_project(&conn, 1).unwrap();
+        assert_eq!(sets[0].1, 2, "two frames, not four");
+        assert_eq!(sets[0].0.total_exp_time, Some(360.0), "hours summed once");
+        assert_eq!(get_frames_set_duplicate_counts(&conn).unwrap().get(&1), Some(&2));
+        assert_eq!(get_frames_set_zip_member_counts(&conn).unwrap().get(&1), None, "the used copies are on disk");
+    }
+
+    /// Disk before zip, then present before missing, then the lowest id.
+    #[test]
+    fn the_used_copy_is_disk_then_present_then_lowest_id() {
+        let conn = db();
+        let s = set(&conn, 1);
+        // Two disk copies: the lower id.
+        light(&conn, s, 10, "a.fit", "fpa", false);
+        light(&conn, s, 11, "a.fit", "fpa", false);
+        // Two disk copies, the lower id missing: the present one.
+        light(&conn, s, 20, "b.fit", "fpb", false);
+        light(&conn, s, 21, "b.fit", "fpb", false);
+        mark_missing(&conn, 20);
+        // A missing disk copy and a present zip copy: still the disk copy.
+        light(&conn, s, 30, "c.fit", "fpc", true);
+        light(&conn, s, 31, "c.fit", "fpc", false);
+        mark_missing(&conn, 31);
+        assert_eq!(used(&conn, 1), vec![10, 21, 31]);
+    }
+
+    /// A copy in the Black Hole never displaces the other copy; restoring it takes its place back.
+    #[test]
+    fn a_blackholed_copy_does_not_displace_the_other_one() {
+        let conn = db();
+        let s = set(&conn, 1);
+        light(&conn, s, 1, "a.fit", "fpa", false);
+        light(&conn, s, 2, "a.fit", "fpa", true);
+        crate::db::add_to_black_hole(&conn, 1, "light", "/l/1/a.fit").unwrap();
+        assert_eq!(used(&conn, 1), vec![1, 2], "the zip copy is used; the blackholed one is left to its own rule");
+        let sets = get_frames_sets_by_project(&conn, 1).unwrap();
+        assert_eq!(sets[0].1, 1);
+        assert_eq!(get_frames_set_duplicate_counts(&conn).unwrap().get(&1), None);
+        crate::db::remove_from_black_hole(&conn, 1).unwrap();
+        assert_eq!(used(&conn, 1), vec![1]);
+    }
+
+    /// Only the Duplicates page's header identity pairs two rows: another filename (a processed
+    /// derivative keeps its source's header), a master, or an empty header is a frame of its own.
+    #[test]
+    fn only_the_header_identity_pairs_two_rows() {
+        let conn = db();
+        let s = set(&conn, 1);
+        light(&conn, s, 1, "a.fit", "fpa", false);
+        light(&conn, s, 2, "a_processed.fit", "fpa", false);
+        light(&conn, s, 3, "m.fit", "fpm", false);
+        light(&conn, s, 4, "m.fit", "fpm", false);
+        conn.execute("UPDATE frames SET is_master = 1 WHERE id IN (3, 4)", []).unwrap();
+        light(&conn, s, 5, "e.fit", "fpe", false);
+        light(&conn, s, 6, "e.fit", "fpe", false);
+        conn.execute("UPDATE fits_header SET header = '' WHERE file_id IN (5, 6)", []).unwrap();
+        light(&conn, s, 7, "z.fit", "fpz", false);
+        light(&conn, s, 8, "z.fit", "fpz", false);
+        conn.execute("UPDATE files SET size = 200 WHERE id = 8", []).unwrap();
+        assert_eq!(used(&conn, 1), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// Copies held by two different sets are each used in their own set.
+    #[test]
+    fn copies_in_two_sets_are_each_used_in_their_own_set() {
+        let conn = db();
+        let s1 = set(&conn, 1);
+        let s2 = set(&conn, 2);
+        light(&conn, s1, 1, "a.fit", "fpa", false);
+        light(&conn, s2, 2, "a.fit", "fpa", true);
+        assert_eq!(used(&conn, 1), vec![1]);
+        assert_eq!(used(&conn, 2), vec![2]);
+        assert!(get_frames_set_duplicate_counts(&conn).unwrap().is_empty());
     }
 }

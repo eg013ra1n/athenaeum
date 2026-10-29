@@ -31,7 +31,8 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
     // (`db::frame_set_member_exposure_sql`), never the stored aggregate. The
     // count, the exposure and the filter list leave out a light in the Black
     // Hole (`db::FRAME_NOT_IN_BLACK_HOLE_SQL`): it is not exported, so the
-    // picker does not offer it.
+    // picker does not offer it. A frame held twice counts once
+    // (`db::frame_is_used_copy_sql`), the copy the export lands.
     let mut stmt = conn
         .prepare(&format!(
             "SELECT fs.id, fs.name, {exposure},
@@ -40,7 +41,7 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
                      JOIN frames f ON sm.frame_id = f.id
                      WHERE i.frames_set_id = fs.id AND f.imagetyp = 'Light'
-                       AND {not_blackholed}) as frame_count,
+                       AND {not_blackholed} AND {used_copy}) as frame_count,
                     (SELECT f.object FROM session_members sm
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
@@ -57,6 +58,7 @@ pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFram
              ORDER BY fs.id DESC",
             exposure = crate::db::frame_set_member_exposure_sql(),
             not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+            used_copy = crate::db::frame_is_used_copy_sql("fs.id"),
         ))?;
 
     let frame_sets = stmt

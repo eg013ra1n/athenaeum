@@ -39,11 +39,13 @@ pub async fn get_frames_sets(
 
     let sets = db::get_frames_sets_by_project(&conn, project_id).map_err(|e| e.to_string())?;
     let zip_counts = db::get_frames_set_zip_member_counts(&conn).map_err(|e| e.to_string())?;
+    let duplicate_counts = db::get_frames_set_duplicate_counts(&conn).map_err(|e| e.to_string())?;
 
     Ok(sets
         .into_iter()
         .map(|(set, count)| FramesSetWithCount {
             zip_member_count: set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
+            duplicate_count: set.id.and_then(|id| duplicate_counts.get(&id).copied()).unwrap_or(0),
             frames_set: set,
             member_count: count,
         })
@@ -671,6 +673,8 @@ pub struct FramesSetWithCount {
     pub member_count: usize,
     /// Members (counted in `member_count`) whose file lives inside a zip.
     pub zip_member_count: usize,
+    /// Second copies of a frame the set already holds — not in `member_count`, never used.
+    pub duplicate_count: usize,
 }
 
 /// Archive a frame set (move to Archive tab)

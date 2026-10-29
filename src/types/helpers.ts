@@ -148,6 +148,8 @@ export interface FramesSetWithCount {
   member_count: number;
   /** Members (counted in `member_count`) whose file lives inside a zip. */
   zip_member_count: number;
+  /** Second copies of a frame the set already holds — not in `member_count`, never used. */
+  duplicate_count: number;
 }
 
 // Missing file record with status from the database

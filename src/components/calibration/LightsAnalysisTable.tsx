@@ -6,6 +6,7 @@ import { SHORT } from '../collab/contributorState';
 import { rowVerdict } from '../analysis/unusable';
 import { Chip } from '../ui';
 import { isInZip, revealRequest } from '../../utils/zipChips';
+import { DuplicateNotUsedChip } from '../duplicates/FrameSetDuplicatesChip';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'verdict' | 'refused' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
@@ -426,6 +427,7 @@ export function LightsAnalysisTable({
                   {isInZip(frame) && (
                     <Chip tone="info" className="ml-1.5 align-middle font-sans" title={`Inside ${frame.archive_zip_path}`}>zip</Chip>
                   )}
+                  {frame.duplicate_not_used && <DuplicateNotUsedChip className="ml-1.5 align-middle font-sans" />}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
                   {frame.camera}

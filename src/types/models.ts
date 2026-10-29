@@ -383,7 +383,15 @@ temp_diff: number | null,
  */
 timing: FlatTiming, };
 
-export type CalibrationHierarchyView = { date_groups: Array<CalibrationDateGroup>, total_frames: number, calibrated_frames: number, uncalibrated_frames: number, };
+export type CalibrationHierarchyView = { date_groups: Array<CalibrationDateGroup>, 
+/**
+ * Lights the set uses: outside the Black Hole, one copy per frame.
+ */
+total_frames: number, 
+/**
+ * Second copies of a frame the set already holds (`db::frame_is_used_copy_sql`), outside the Black Hole.
+ */
+duplicate_frames: number, calibrated_frames: number, uncalibrated_frames: number, };
 
 export type CalibrationDateGroup = { date: string, date_display: string, camera_groups: Array<CalibrationCameraGroup>, frame_count: number, has_warnings: boolean, };
 
@@ -480,7 +488,12 @@ archive_path_in_zip: string | null,
 /**
  * Set for a file Move and ZIP archived itself (Unarchive restores it); `None` for a foreign zip's frame.
  */
-archived_in_operation: number | null, };
+archived_in_operation: number | null, 
+/**
+ * A second copy of a frame the set already holds (`db::frame_is_used_copy_sql`): listed, never counted,
+ * stacked, exported or measured.
+ */
+duplicate_not_used: boolean, };
 
 export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, 
 /**

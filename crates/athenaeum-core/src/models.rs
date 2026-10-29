@@ -618,7 +618,10 @@ impl Default for CalibrationTolerance {
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationHierarchyView {
     pub date_groups: Vec<CalibrationDateGroup>,
+    /// Lights the set uses: outside the Black Hole, one copy per frame.
     pub total_frames: usize,
+    /// Second copies of a frame the set already holds (`db::frame_is_used_copy_sql`), outside the Black Hole.
+    pub duplicate_frames: usize,
     pub calibrated_frames: usize,
     pub uncalibrated_frames: usize,
 }
@@ -825,6 +828,9 @@ pub struct LightFrameWithCalibration {
     pub archive_path_in_zip: Option<String>,
     /// Set for a file Move and ZIP archived itself (Unarchive restores it); `None` for a foreign zip's frame.
     pub archived_in_operation: Option<i64>,
+    /// A second copy of a frame the set already holds (`db::frame_is_used_copy_sql`): listed, never counted,
+    /// stacked, exported or measured.
+    pub duplicate_not_used: bool,
 }
 
 // ========== Calendar View Structures ==========

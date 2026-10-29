@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Folder, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, AlertCircle } from 'lucide-react';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
@@ -7,6 +7,10 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { MissingMetadataView } from '../components/missing-metadata/MissingMetadataView';
 import { DuplicatesView } from '../components/duplicates/DuplicatesView';
+import type { DuplicatesForSetRequest } from '../components/duplicates/FrameSetDuplicatesChip';
+import { Chip } from '../components/ui/Chip';
+import { api } from '../api';
+import type { FrameSetDetail } from '../types/models';
 import FoldersTab from '../components/folders/FoldersTab';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
@@ -74,6 +78,45 @@ export default function FileManager() {
   const handleFolderRootsChanged = useCallback(() => { void refreshScanRoots(); }, [refreshScanRoots]);
 
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
+
+  // The "N duplicates" chip of a frame set (Objects, the set page) opens the Duplicates tab filtered to the
+  // groups holding one of the set's files. The filter lives here, not in the location state, which is
+  // cleared at once so Back does not re-apply it.
+  // Clearing the state re-runs the first effect, so the load lives in its own effect keyed on the request.
+  const [setFilterRequest, setSetFilterRequest] = useState<DuplicatesForSetRequest['duplicatesForSet'] | null>(null);
+  const [setFilter, setSetFilter] = useState<{ id: number; name: string; fileIds: Set<number> } | null>(null);
+  useEffect(() => {
+    const request = (location.state as Partial<DuplicatesForSetRequest> | null)?.duplicatesForSet;
+    if (!request) return;
+    setActiveTab('duplicates');
+    setDuplicatesView('files');
+    setSetFilterRequest(request);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, navigate, setActiveTab]);
+  useEffect(() => {
+    const request = setFilterRequest;
+    if (!request) {
+      setSetFilter(null);
+      return;
+    }
+    let cancelled = false;
+    api.invoke<FrameSetDetail>('get_frame_set_detail', { framesSetId: request.id })
+      .then((detail) => {
+        if (cancelled) return;
+        const fileIds = new Set<number>();
+        for (const night of detail.nights)
+          for (const session of night.sessions)
+            for (const fw of session.frames)
+              if (fw.file.id != null) fileIds.add(fw.file.id);
+        setSetFilter({ id: request.id, name: request.name, fileIds });
+      })
+      .catch((err) => console.error('[FileManager] frame set for the duplicates filter failed to load:', err));
+    return () => { cancelled = true; };
+  }, [setFilterRequest]);
+  const shownDuplicates = useMemo(
+    () => (setFilter ? duplicates.filter((g) => g.file_ids.some((fid) => setFilter.fileIds.has(fid))) : duplicates),
+    [duplicates, setFilter],
+  );
   const [missingMetadataCount, setMissingMetadataCount] = useState<number | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
@@ -257,9 +300,24 @@ export default function FileManager() {
           </div>
 
           {/* File View */}
+          {duplicatesView === 'files' && setFilter && (
+            <div className="mb-2 flex items-center gap-2 text-sm text-content-secondary">
+              <Chip tone="info">Frame set: {setFilter.name}</Chip>
+              <span className="text-content-muted">
+                {shownDuplicates.length} group{shownDuplicates.length === 1 ? '' : 's'} holding its frames
+              </span>
+              <button
+                type="button"
+                onClick={() => setSetFilterRequest(null)}
+                className="text-accent hover:underline"
+              >
+                Show all duplicates
+              </button>
+            </div>
+          )}
           {duplicatesView === 'files' && (
             <DuplicatesView
-              duplicates={duplicates}
+              duplicates={shownDuplicates}
               loading={dupsLoading}
               error={dupsError ? String(dupsError) : null}
               refresh={refreshDuplicates}

@@ -3,6 +3,7 @@ import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, 
 import type { FramesSetWithCount } from '../types/helpers';
 import { Chip } from './ui';
 import { zipChipLabel } from '../utils/zipChips';
+import { FrameSetDuplicatesChip } from './duplicates/FrameSetDuplicatesChip';
 
 export type ObjectsTab = 'stage' | 'wip' | 'archive';
 
@@ -151,7 +152,7 @@ export function ObjectsTableView({
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
-          {sortedFrameSets.map(({ frames_set, member_count, zip_member_count }, index) => {
+          {sortedFrameSets.map(({ frames_set, member_count, zip_member_count, duplicate_count }, index) => {
             const isBeingDragged = isDragging && draggedSetId === frames_set.id;
             const isDropTarget = dropTargetId === frames_set.id;
 
@@ -236,6 +237,11 @@ export function ObjectsTableView({
                         {zipChipLabel(zip_member_count, member_count)}
                       </Chip>
                     )}
+                    <FrameSetDuplicatesChip
+                      count={duplicate_count}
+                      frameSetId={frames_set.id!}
+                      frameSetName={frames_set.name || 'Untitled'}
+                    />
                   </span>
                 </td>
 

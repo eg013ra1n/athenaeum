@@ -41,6 +41,8 @@ planned but never built. This rewrite documents only what `crates/athenaeum-core
      in capture order. **A light whose file is in the Black Hole is not exported**, sent, or counted by readiness:
      the query splices `db::FRAME_NOT_IN_BLACK_HOLE_SQL`, the same fragment as the stacking plan's light source
      (2026-10-25; set 182 exported its 25 rejected lights before).
+     **A frame held twice is exported once** (2026-10-29): the same query and `collect_equipment_info` splice
+     `db::frame_is_used_copy_sql`, which keeps one copy per raw frame (disk before zip; `docs/frame_sets/README.md`).
    - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs`).
      `camera_type` is `Osc` if `BAYERPAT` is a non-empty string, else `Mono`
      (`CameraType::from_bayerpat`, `models.rs`).
