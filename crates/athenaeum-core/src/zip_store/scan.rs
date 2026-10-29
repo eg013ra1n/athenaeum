@@ -583,12 +583,46 @@ fn entries_written_by_creating_operation(conn: &Connection, zip_path: &str) -> R
     Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
 }
 
+/// A release that has an owner: it names the path of its copy and the catalog has a row at that path.
+/// The scan keeps only these. A release without one (recorded before `released_to` existed, or whose row
+/// went away with a removed folder or a deleted file) keeps nothing out of the catalog: its entry is
+/// cataloged like any new one.
+const OWNED_RELEASE: &str = "r.released_to IS NOT NULL AND EXISTS (SELECT 1 FROM files f WHERE f.path = r.released_to)";
+
+/// The releases of the zip at `zip_path` that have an owner ([`OWNED_RELEASE`]).
 fn released_entries_of(conn: &Connection, zip_path: &str) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT r.entry_path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id WHERE z.path = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.entry_path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
+         WHERE z.path = ?1 AND {OWNED_RELEASE}"
+    ))?;
     let rows = stmt.query_map(params![zip_path], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+/// How many releases of the zip have no owner ([`OWNED_RELEASE`] is false for them).
+fn ownerless_releases(conn: &Connection, zip_path: &str) -> Result<usize> {
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
+             WHERE z.path = ?1 AND NOT ({OWNED_RELEASE})"
+        ),
+        params![zip_path],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// Drops the releases of the zip that have no owner, so their entries are cataloged as new rows.
+fn drop_ownerless_releases(conn: &Connection, zip_path: &str) -> Result<usize> {
+    let n = conn.execute(
+        &format!(
+            "DELETE FROM zip_released_entries WHERE id IN (
+                 SELECT r.id FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
+                 WHERE z.path = ?1 AND NOT ({OWNED_RELEASE}))"
+        ),
+        params![zip_path],
+    )?;
+    Ok(n)
 }
 
 /// The zip at `new_zip_id` took over rows from `gone`, a zip that no longer exists: move `gone`'s
@@ -622,8 +656,10 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
         return Ok(());
     };
     conn.execute(
-        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to)
-         SELECT ?1, entry_path, released_to FROM zip_released_entries WHERE zip_id = ?2",
+        &format!(
+            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to)
+         SELECT ?1, r.entry_path, r.released_to FROM zip_released_entries r WHERE r.zip_id = ?2 AND {OWNED_RELEASE}"
+        ),
         params![new_zip_id, old_id],
     )?;
     if let Some(op) = old_operation {
@@ -832,8 +868,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
+    // Releases without an owner are cataloged again, so such a zip is read even when its stat is unchanged
+    // (the release itself is dropped in the scan's transaction, below).
+    let ownerless = if known_zip.is_some() { ownerless_releases(conn, &zip_str)? } else { 0 };
     if let Some((zip_id, db_size, db_modified)) = &known_zip {
-        if *db_size == size && *db_modified == modified_str {
+        if *db_size == size && *db_modified == modified_str && ownerless == 0 {
             // Nothing to read in the zip itself, but an unpacked copy deleted since the last scan sends its
             // row back into the zip (the stat of each release's copy is the whole cost when none was).
             let back = readopt_released(conn, zip, &zip_str, zip_modified, None, root_id, unique_camera)?;
@@ -942,6 +981,10 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     };
 
     let outer = SavepointGuard::new(conn, "scan_zip")?;
+    if ownerless > 0 {
+        let dropped = drop_ownerless_releases(conn, &zip_str)?;
+        tracing::info!(root_id, zip_path = %zip.display(), count = dropped, "released entries with no copy in the catalog are cataloged again");
+    }
     // FOREIGN rows that predate the entry CRC learn it from the directory this scan already read, with no
     // further read of the zip. Rows of our own operations never do: their CRC comes only from finalize or
     // from a materialize that verified the extracted bytes against the expected hash, because a zip that
@@ -1560,7 +1603,15 @@ mod scan_tests {
             params![id1],
         )
         .unwrap();
-        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L_001.fits')", params![first.zip_id]).unwrap();
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, light(1)).unwrap();
+        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![copy.to_str().unwrap(), id1]).unwrap();
+        conn.execute(
+            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
+            params![first.zip_id, copy.to_str().unwrap()],
+        )
+        .unwrap();
 
         // The zip changes (a new entry) and is scanned again.
         let zip = make_zip(
@@ -1572,7 +1623,118 @@ mod scan_tests {
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
         assert_eq!(outcome.inserted.len(), 1, "only L_003 is new");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE path = '/unpacked/L_001.fits'"), 1);
+        assert_eq!(id_of(&conn, copy.to_str().unwrap()), id1);
+    }
+
+    /// Two zips entries (L_001, L_002); the row of L_001 is unpacked to `copy_name` under the root (the file is
+    /// written when `copy_on_disk`), and the release is recorded with `released_to`.
+    fn unpack_first_entry(conn: &Connection, zip: &Path, zip_id: i64, released_to: Option<&str>) -> i64 {
+        let id1 = id_of(conn, &virtual_path(zip, "L_001.fits"));
+        conn.execute(
+            "UPDATE files SET path = '/gone/place/L_001.fits', archive_zip_path = NULL, archive_path_in_zip = NULL,
+                    archive_entry_crc32 = NULL WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
+            params![zip_id, released_to],
+        )
+        .unwrap();
+        id1
+    }
+
+    #[test]
+    fn a_release_with_no_destination_and_no_row_is_cataloged_again_even_when_the_zip_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        // The pre-r1 release (released_to NULL) whose row went away with a removed folder.
+        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, None);
+        conn.execute("DELETE FROM frames WHERE file_id = ?1", params![id1]).unwrap();
+        conn.execute("DELETE FROM fits_header WHERE file_id = ?1", params![id1]).unwrap();
+        conn.execute("DELETE FROM files WHERE id = ?1", params![id1]).unwrap();
+
+        let again = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!again.skipped_unchanged, "the zip is read to take the entry back");
+        assert_eq!(again.inserted.len(), 1, "L_001 is cataloged again");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0, "the release is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+        assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 2);
+        // And the next scan is the cheap one again.
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
+    }
+
+    #[test]
+    fn a_release_whose_destination_has_no_row_is_cataloged_again() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, Some("/gone/place/L_001.fits"));
+        conn.execute("DELETE FROM frames WHERE file_id = ?1", params![id1]).unwrap();
+        conn.execute("DELETE FROM fits_header WHERE file_id = ?1", params![id1]).unwrap();
+        conn.execute("DELETE FROM files WHERE id = ?1", params![id1]).unwrap();
+
+        let again = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(again.inserted.len(), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+    }
+
+    #[test]
+    fn a_release_whose_destination_has_a_row_stays_released_when_the_zip_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        // The copy is on disk, under the root, with its row.
+        let copy = tmp.path().join("L_001.fits");
+        std::fs::write(&copy, light(1)).unwrap();
+        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, Some(copy.to_str().unwrap()));
+        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![copy.to_str().unwrap(), id1]).unwrap();
+
+        let again = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(again.skipped_unchanged);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+    }
+
+    #[test]
+    fn removing_the_folder_forgets_its_zips_and_a_re_added_folder_catalogs_every_entry() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(
+            tmp.path(),
+            "n.zip",
+            &[("L_001.fits", light(1)), ("L_002.fits", light(2)), ("L_003.fits", light(3))],
+            ArchiveCompression::Store,
+        );
+        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        // Two entries were unpacked into the folder (one release recorded before the column existed), then the
+        // user deleted the unpacked files and removed the folder from the catalog.
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        unpack_first_entry(&conn, &zip, first.zip_id, Some(copy.to_str().unwrap()));
+        conn.execute("UPDATE files SET path = ?1 WHERE path = '/gone/place/L_001.fits'", params![copy.to_str().unwrap()]).unwrap();
+        let id2 = id_of(&conn, &virtual_path(&zip, "L_002.fits"));
+        conn.execute(
+            "UPDATE files SET path = ?1, archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL WHERE id = ?2",
+            params![tmp.path().join("unpacked").join("L_002.fits").to_str().unwrap(), id2],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L_002.fits')", params![first.zip_id]).unwrap();
+
+        crate::db::delete_scan_root(&conn, 1).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
+        assert_eq!(zip_archive_count(&conn), 0, "the zip is forgotten with its folder");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [tmp.path().to_str().unwrap()]).unwrap();
+        let again = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!again.skipped_unchanged);
+        assert_eq!(again.inserted.len(), 3, "every entry is cataloged again");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 3);
     }
 
     #[test]
@@ -1767,7 +1929,11 @@ mod scan_tests {
             params![unpacked.to_str().unwrap(), id1],
         )
         .unwrap();
-        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L_001.fits')", params![first.zip_id]).unwrap();
+        conn.execute(
+            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
+            params![first.zip_id, unpacked.to_str().unwrap()],
+        )
+        .unwrap();
 
         let b = tmp.path().join("b.zip");
         std::fs::rename(&a, &b).unwrap();

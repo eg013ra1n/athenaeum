@@ -928,8 +928,11 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
     }
 
+    /// Smoke fix r2: a release with no recorded copy has no owner, so the scan drops it and the entries are
+    /// cataloged again through the normal pass: here the deleted copies' rows are still in the catalog, so
+    /// the moved-file rule takes them back into the zip (same ids), and an entry with no such row is a new row.
     #[test]
-    fn a_release_with_no_recorded_copy_keeps_todays_behaviour() {
+    fn a_release_with_no_recorded_copy_is_dropped_and_its_entries_are_cataloged_again() {
         let tmp = TempDir::new().unwrap();
         let (conn, zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
@@ -937,9 +940,11 @@ mod tests {
         conn.execute("UPDATE zip_released_entries SET released_to = NULL", []).unwrap();
         std::fs::remove_dir_all(out.path().join("Lights")).unwrap();
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
-        assert_eq!(outcome.adopted, 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+        assert_eq!(outcome.adopted, 2);
+        assert!(outcome.inserted.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
     }
 
     #[test]

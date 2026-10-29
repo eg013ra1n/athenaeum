@@ -1124,7 +1124,24 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         [],
     )?;
 
-    // 12. Delete the scan root
+    // 12. Forget the zips under the root, in the same transaction as their rows. A zip row is the catalog's
+    // memory of a file that lives in the root; left behind, a re-added root would skip the unchanged zip and
+    // its released entries, and the zip could never be cataloged again. The released entries and a Black Hole
+    // record of the zip go by cascade; files on disk are never touched, and archive operations stay as history.
+    {
+        let sep = native_separator_of(&path);
+        let prefix = format!("{}{}", path.trim_end_matches(sep), sep);
+        let path_hi = path_prefix_upper(&prefix);
+        let forgotten = conn.execute(
+            "DELETE FROM zip_archives WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)",
+            params![prefix, path_hi],
+        )?;
+        if forgotten > 0 {
+            tracing::info!(root_id = id, count = forgotten, "zips under the removed scan root forgotten");
+        }
+    }
+
+    // 13. Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
 
     // Commit transaction
@@ -5918,6 +5935,47 @@ mod path_prefix_range_tests {
             vec!["/data/M31_Ha/b.fits".to_string()],
             "sibling root sharing the name prefix must survive the cascade"
         );
+    }
+
+    #[test]
+    fn delete_scan_root_forgets_the_zips_under_it_and_only_those() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31')", []).unwrap();
+        let root_id: i64 = conn.query_row("SELECT id FROM scan_roots", [], |r| r.get(0)).unwrap();
+        for (id, path) in [(1, "/data/M31/a.zip"), (2, "/data/M31/sub/b.zip"), (3, "/data/M31_Ha/c.zip")] {
+            conn.execute(
+                "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+                 VALUES (?1, ?2, 10, 'x', 1, 'x')",
+                params![id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L.fits', NULL)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO black_hole_zips (zip_id, from_where, moved_at, original_path) VALUES (1, 'files', 'x', '/data/M31/a.zip')",
+            [],
+        )
+        .unwrap();
+
+        delete_scan_root(&conn, root_id).unwrap();
+
+        let zips: Vec<String> = conn
+            .prepare("SELECT path FROM zip_archives")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(zips, vec!["/data/M31_Ha/c.zip".to_string()], "the sibling root's zip survives");
+        let releases: i64 = conn.query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(releases, 1, "releases go with their zip");
+        let black: i64 = conn.query_row("SELECT COUNT(*) FROM black_hole_zips", [], |r| r.get(0)).unwrap();
+        assert_eq!(black, 0);
     }
 
     #[test]
