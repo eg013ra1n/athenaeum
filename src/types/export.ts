@@ -477,7 +477,13 @@ linked: number, copied: number, rewritten: number, failed: number,
  * Files that live inside a zip and were COPIED although the export was asked to link them (a link into the
  * zip cache would dangle once the cache evicts the entry). `0` for an export with no such file.
  */
-zipCopied: number, };
+zipCopied: number, 
+/**
+ * See [`LinkFallbackCounts`].
+ */
+linkFallback: LinkFallbackCounts, };
+
+export type LinkFallbackCounts = { hardLinks: number, copies: number, };
 
 export type ExportSummary = { 
 /**
@@ -800,7 +806,11 @@ linked: number, copied: number, rewritten: number, failed: number,
 /**
  * See [`ExportResult::zip_copied`].
  */
-zipCopied: number, };
+zipCopied: number, 
+/**
+ * See [`LinkFallbackCounts`].
+ */
+linkFallback: LinkFallbackCounts, };
 
 export type ExportMode = "lightsOnly" | "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
 

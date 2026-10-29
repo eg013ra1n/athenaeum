@@ -1,3 +1,9 @@
+import type { LinkFallbackCounts } from '../types/export';
+
+/** Under the link toggle on Windows: what link mode does there without Developer Mode. */
+export const WINDOWS_LINKS_HINT =
+  'Without Developer Mode, Windows makes hard links instead (or copies, across drives)';
+
 /** "1 linked · 2 with FILTER rewritten" — only the non-zero counts (plan P11). */
 export function exportCountsText(c: {
   linked: number;
@@ -27,4 +33,17 @@ export function limitWarnings(
  *  `null` when the export had none. */
 export function zipCopiedText(zipCopied: number | null | undefined): string | null {
   return zipCopied != null && zipCopied > 0 ? `From zip: ${zipCopied} copied` : null;
+}
+
+/** "Windows did not allow symbolic links: 3 hard links, 1 copy (…)" — link-mode files Windows would not
+ *  symlink (no Developer Mode), made as hard links or copies. `null` when every link was a symbolic link. */
+export function linkFallbackText(lf: LinkFallbackCounts | null | undefined): string | null {
+  if (!lf || lf.hardLinks + lf.copies === 0) return null;
+  const made = [
+    lf.hardLinks > 0 && `${lf.hardLinks} hard link${lf.hardLinks === 1 ? '' : 's'}`,
+    lf.copies > 0 && `${lf.copies} ${lf.copies === 1 ? 'copy' : 'copies'}`,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  return `Windows did not allow symbolic links: ${made} (turn on Developer Mode for symbolic links)`;
 }

@@ -20,8 +20,9 @@ use anyhow::{anyhow, Context, Result};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::file_organizer::DestClaims;
 use crate::export::filter_header::{needs_rewrite, read_file_filter, write_filter_copy};
+use crate::export::links::{LinkKind, Linker};
 use crate::export::models::{
-    sanitize_display_folder_name, sanitize_folder_name, ExportProgressEvent,
+    sanitize_display_folder_name, sanitize_folder_name, ExportProgressEvent, LinkFallbackCounts,
 };
 use crate::export::project_collector::ProjectExportFrame;
 use crate::fits_writer::header_patch::{commit_tmp, discard_tmp, sibling_tmp};
@@ -47,6 +48,9 @@ pub struct ProjectOrganizeResult {
     /// Frames inside a zip that were copied although the run asked for links (a link into the zip cache
     /// would dangle once the cache evicts the entry). Included in `counts.copied`.
     pub zip_copied: usize,
+    /// Links Windows did not allow as symbolic links: the hard links are included in `counts.linked`, the
+    /// copies in `counts.copied` (see [`Linker`]).
+    pub link_fallback: LinkFallbackCounts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,14 +183,15 @@ fn copy_atomic(src: &Path, dest: &Path) -> Result<()> {
     commit_tmp(&tmp, dest).with_context(|| format!("rename onto {}", dest.display()))
 }
 
-fn link_atomic(src: &Path, dest: &Path) -> Result<()> {
+/// A link made under a temp name and renamed onto `dest`; where Windows allows neither a symbolic nor a
+/// hard link, a copy made the way [`copy_atomic`] makes one.
+fn link_atomic(src: &Path, dest: &Path, linker: &mut Linker) -> Result<LinkKind> {
     let tmp = sibling_tmp(dest);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(src, &tmp).with_context(|| format!("symlink {}", src.display()))?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(src, &tmp)
-        .with_context(|| format!("symlink {}", src.display()))?;
-    commit_tmp(&tmp, dest).with_context(|| format!("rename onto {}", dest.display()))
+    let kind = linker.link(src, &tmp, || copy_atomic(src, dest))?;
+    if kind != LinkKind::Copy {
+        commit_tmp(&tmp, dest).with_context(|| format!("rename onto {}", dest.display()))?;
+    }
+    Ok(kind)
 }
 
 fn place_one(
@@ -194,7 +199,7 @@ fn place_one(
     dest: &Path,
     canonical: &str,
     byte_size: i64,
-    use_symlinks: bool,
+    link: Option<&mut Linker>,
     keep_ok: bool,
 ) -> Result<Placed> {
     refuse_dest_is_source(src, dest)?;
@@ -209,12 +214,14 @@ fn place_one(
     let src_mtime = fs::metadata(src).and_then(|m| m.modified()).ok();
     let (kind, actual) = read_file_filter(src)?;
     if !needs_rewrite(actual.as_deref(), canonical) {
-        if use_symlinks {
+        if let Some(linker) = link {
             if is_symlink(dest) && fs::read_link(dest).is_ok_and(|t| t == src) {
                 return Ok(Placed::Linked);
             }
-            link_atomic(src, dest)?;
-            return Ok(Placed::Linked);
+            if link_atomic(src, dest, linker)? != LinkKind::Copy {
+                return Ok(Placed::Linked);
+            }
+            return copied_whole(dest, len);
         }
         if keep_ok
             && !is_symlink(dest)
@@ -227,13 +234,7 @@ fn place_one(
                 .with_context(|| format!("remove the old link {}", dest.display()))?;
         }
         copy_atomic(src, dest)?;
-        let written = fs::metadata(dest)?.len();
-        if written != len {
-            return Err(anyhow!(
-                "changed during export (copied {written} of {len} bytes)"
-            ));
-        }
-        return Ok(Placed::Copied);
+        return copied_whole(dest, len);
     }
     if keep_ok && !is_symlink(dest) && dest.exists() {
         let fresh = fs::metadata(dest).is_ok_and(|m| not_older(&m, src_mtime));
@@ -250,6 +251,17 @@ fn place_one(
     }
     write_filter_copy(src, dest, kind, canonical, actual.as_deref())?;
     Ok(Placed::Rewritten)
+}
+
+/// A copy is whole only when it holds the `len` bytes its source had before the copy.
+fn copied_whole(dest: &Path, len: u64) -> Result<Placed> {
+    let written = fs::metadata(dest)?.len();
+    if written != len {
+        return Err(anyhow!(
+            "changed during export (copied {written} of {len} bytes)"
+        ));
+    }
+    Ok(Placed::Copied)
 }
 
 fn read_record(title_dir: &Path) -> (ExportRecord, Option<String>) {
@@ -338,6 +350,7 @@ pub fn organize_project_export(
     let total: usize = publishers.iter().map(|(_, f)| f.len()).sum();
     let mut counts = PlaceCounts::default();
     let mut zip_copied = 0usize;
+    let mut linker = Linker::default();
     let mut warnings = Vec::new();
     let mut placed: BTreeMap<String, RecordEntry> = BTreeMap::new();
     // Which landed files live inside a zip: one catalog read for the whole run.
@@ -407,7 +420,7 @@ pub fn organize_project_export(
                     &dest,
                     &f.filter,
                     f.byte_size,
-                    use_symlinks && !in_zip,
+                    (use_symlinks && !in_zip).then_some(&mut linker),
                     prev.frames.get(&f.frame_uuid).is_some_and(|e| {
                         e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
                     }),
@@ -505,6 +518,8 @@ pub fn organize_project_export(
         copied = counts.copied,
         rewritten = counts.rewritten,
         failed = counts.failed,
+        hard_links = linker.counts.hard_links,
+        link_copies = linker.counts.copies,
         cancelled,
         "project export organized"
     );
@@ -513,6 +528,7 @@ pub fn organize_project_export(
         warnings,
         cancelled,
         zip_copied,
+        link_fallback: linker.counts,
     })
 }
 
@@ -1070,5 +1086,32 @@ mod tests {
         let (rec, _) = read_record(&title);
         assert_eq!(rec.project_id, "p2");
         assert!(rec.frames.contains_key("ub") && !rec.frames.contains_key("ua"));
+    }
+
+    /// Link mode on Windows without the symbolic-link privilege: the frame lands as a hard link (counted
+    /// as linked and as a fallback), and a re-export replaces it without touching the landed file.
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_mode_without_the_privilege_places_a_hard_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, rs) = landed(tmp.path(), "r.fits", Some("R"));
+        let before = std::fs::read(&r).unwrap();
+        let privileged =
+            std::os::windows::fs::symlink_file(&r, tmp.path().join("probe_link")).is_ok();
+        let title = tmp.path().join("T");
+        let pubs = vec![("Alice".to_string(), vec![frame("u1", &r, rs, "R")])];
+        for _ in 0..2 {
+            let res = run(&title, &pubs, true);
+            assert_eq!(res.counts, PlaceCounts { linked: 1, copied: 0, rewritten: 0, failed: 0 }, "{:?}", res.warnings);
+            let expected = if privileged {
+                LinkFallbackCounts::default()
+            } else {
+                LinkFallbackCounts { hard_links: 1, copies: 0 }
+            };
+            assert_eq!(res.link_fallback, expected);
+        }
+        let dest = title.join("Alice/camera_cama/R/r.fits");
+        assert_eq!(std::fs::read(&dest).unwrap(), before);
+        assert_eq!(std::fs::read(&r).unwrap(), before, "the landed file is untouched");
     }
 }
