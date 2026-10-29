@@ -1226,7 +1226,13 @@ mod scan_tests {
         let old_crc: i64 = conn.query_row("SELECT archive_entry_crc32 FROM files WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
 
         let changed = fits_bytes(&["SEQNUM  =                    1".to_string(), "FILTER  = 'Ha      '".to_string()]);
-        let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", changed)], ArchiveCompression::Store);
+        // A note so the zip's size differs: a same-size rewrite within one file-time tick is skipped by stat.
+        let zip = make_zip(
+            tmp.path(),
+            "n.zip",
+            &[("L_001.fits", changed), ("notes.txt", vec![b'x'; 5000])],
+            ArchiveCompression::Store,
+        );
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
         assert_eq!(outcome.updated, 1, "an in-place re-parse is counted");
         assert!(outcome.inserted.is_empty(), "an in-place update inserts nothing");

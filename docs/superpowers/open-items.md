@@ -321,6 +321,7 @@ passes, with the measurement moved into the references.
 **Web build** (Docker, the NAS as a volume): the same checks as above, plus the cache location (`<data>/zip-cache` or `$ATHENAEUM_ZIP_CACHE`) and Settings -> General -> Archive (limit, status, Clear cache).
 
 **Windows** (the "Windows runner setup" session on obs-pc1; the branch reaches it through a GitLab branch push): `archive/planner.rs` `file_identity` Windows branch (never run); the `#[cfg(unix)]` odd-name tests' Windows behaviour; materialize's sanitized cache names; zip entry names with `:` / a trailing space / `Aux` extracted on NTFS; rename over a read-only target.
+The runner's 2026-10-29 run (`\\Universe\athenaeum-temp\zip-win-report.md`) also failed 5 `hips::pack` tests (`busy_then_ok`, `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak`, `a_busy_wait_reaches_the_ui_while_it_lasts`); the branch does not touch `hips/`, and they were not run on `main` to confirm they predate it.
 
 **Not seen by a human (jsdom only):** the browser's zip rows and zip view, the Black Hole "Zip archives" group and its dialogs, the Settings cache row, the relink "zips not found" note, and the Task 15 screens: Unpack dialog end to end on a real foreign zip, Locate into one of our zips, the Objects chips ("zip" / "N of M in zip"), "From zip" lines in the batch dialogs.
 

@@ -22,9 +22,9 @@ fn archive_then_restore_then_archive_again() {
     let scan = TempDir::new().unwrap();
 
     // Filesystem fixture
-    let l1 = scan.path().join("M31/L_001.fits");
-    let l2 = scan.path().join("M31/L_002.fits");
-    let d1 = scan.path().join("Cal/MasterDark.fits");
+    let l1 = scan.path().join("M31").join("L_001.fits");
+    let l2 = scan.path().join("M31").join("L_002.fits");
+    let d1 = scan.path().join("Cal").join("MasterDark.fits");
     for p in [&l1, &l2, &d1] {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     }
@@ -162,7 +162,7 @@ fn a_new_capture_at_an_archived_path_coexists_with_the_archived_frame_through_un
     for parallel in [false, true] {
         let arch = TempDir::new().unwrap();
         let scan = TempDir::new().unwrap();
-        let original = scan.path().join("M31/L_001.fits");
+        let original = scan.path().join("M31").join("L_001.fits");
         std::fs::create_dir_all(original.parent().unwrap()).unwrap();
         let first = light_fits(1);
         std::fs::write(&original, &first).unwrap();
@@ -249,7 +249,7 @@ fn unarchive_to_the_original_path_rewrites_a_repointed_row_path() {
 
     let arch = TempDir::new().unwrap();
     let scan = TempDir::new().unwrap();
-    let original = scan.path().join("M31/L_001.fits");
+    let original = scan.path().join("M31").join("L_001.fits");
     std::fs::create_dir_all(original.parent().unwrap()).unwrap();
     let first = light_fits(1);
     std::fs::write(&original, &first).unwrap();
@@ -385,10 +385,10 @@ fn a_zip_renamed_outside_the_app_stays_restorable_and_its_copied_entries_stay_ro
 
     let arch = TempDir::new().unwrap();
     let scan = TempDir::new().unwrap();
-    let light = scan.path().join("M31/L_001.fits");
-    let light2 = scan.path().join("M31/L_002.fits");
-    let raw_dark = scan.path().join("Cal/Dark_001.fits");
-    let master = scan.path().join("Cal/MasterDark.fits");
+    let light = scan.path().join("M31").join("L_001.fits");
+    let light2 = scan.path().join("M31").join("L_002.fits");
+    let raw_dark = scan.path().join("Cal").join("Dark_001.fits");
+    let master = scan.path().join("Cal").join("MasterDark.fits");
     for p in [&light, &raw_dark, &master] {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     }

@@ -1956,6 +1956,14 @@ mod tests {
         let zipped = src.join("L_zip.fits");
         std::fs::write(&disk, b"disk-bytes").unwrap();
         std::fs::write(&zipped, b"zip-bytes").unwrap();
+        // Windows without Developer Mode or an elevated token cannot create symlinks (os error 1314).
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_file(&disk, tmp.path().join("probe_link")) {
+            if e.raw_os_error() == Some(1314) {
+                eprintln!("skipped: creating a symlink needs Developer Mode here (os error 1314)");
+                return;
+            }
+        }
         let virtual_path = {
             let conn = ctx.db.get().unwrap().conn();
             add_file_row(&conn, 1, &disk);

@@ -1275,7 +1275,7 @@ pub(crate) mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let (op_id, _, file_id) = archive_two_roots(&conn, arch.path(), &scan, &other);
-        let dest = target.path().join("rootA/M31/L_001.fits");
+        let dest = target.path().join("rootA").join("M31").join("L_001.fits");
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(&dest, b"unrelated").unwrap();
 
@@ -1300,7 +1300,7 @@ pub(crate) mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let (op_id, _, _) = archive_two_roots(&conn, arch.path(), &scan, &other);
-        let dest = target.path().join("rootA/M31/L_001.fits");
+        let dest = target.path().join("rootA").join("M31").join("L_001.fits");
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(&dest, b"first-frame").unwrap();
 
@@ -1334,7 +1334,7 @@ pub(crate) mod tests {
         let (op_id, original, file_id) = archive_two_roots(&conn, arch.path(), &scan, &other);
         std::fs::create_dir_all(original.parent().unwrap()).unwrap();
         std::fs::write(&original, b"first-frame").unwrap();
-        let dest = target.path().join("rootA/M31/L_001.fits");
+        let dest = target.path().join("rootA").join("M31").join("L_001.fits");
         assert_ne!(dest, original);
 
         let outcome = run_restore(&conn, op_id, target.path(), false, false, &Arc::new(AtomicBool::new(false)), &NullEmitter).unwrap();
