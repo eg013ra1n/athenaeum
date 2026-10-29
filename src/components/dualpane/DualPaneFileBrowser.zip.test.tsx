@@ -55,9 +55,9 @@ beforeEach(() => {
                 subdirectories: ['Lights'],
                 files: [frameFile(`${ZIP}/top.fits`, 'top.fits')],
                 otherEntries: [
-                  { name: 'notes.txt', size: 5, releasedTo: null, releasedPresent: false },
-                  { name: 'L_007.fits', size: 9, releasedTo: '/astro/out/L_007.fits', releasedPresent: true },
-                  { name: 'L_008.fits', size: 9, releasedTo: '/astro/out/L_008.fits', releasedPresent: false },
+                  { name: 'notes.txt', size: 5, released: false, copyPath: null },
+                  { name: 'L_007.fits', size: 9, released: true, copyPath: '/astro/out/L_007.fits' },
+                  { name: 'L_008.fits', size: 9, released: true, copyPath: null },
                 ],
               },
         );
@@ -108,7 +108,7 @@ describe('DualPaneFileBrowser — zips', () => {
     const present = (await screen.findAllByText('L_007.fits'))[0].closest('div') as HTMLElement;
     expect(within(present).getByText('unpacked')).toBeInTheDocument();
     const missing = screen.getAllByText('L_008.fits')[0].closest('div') as HTMLElement;
-    expect(within(missing).getByText('unpacked copy missing')).toBeInTheDocument();
+    expect(within(missing).getByText('unpacked copy missing — rescan to restore')).toBeInTheDocument();
     expect(within(missing).queryByText('Locate')).toBeNull();
     // An entry that was never unpacked carries neither.
     const plain = screen.getAllByText('notes.txt')[0].closest('div') as HTMLElement;

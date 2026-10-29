@@ -407,7 +407,7 @@ fn repoint_row(conn: &Connection, row: &ZipRow, dest: &Path) -> anyhow::Result<b
     if changed == 0 {
         return Ok(false);
     }
-    record_released_entry(&tx, &row.zip, &row.entry, None, Some(&dest.to_string_lossy()))?;
+    record_released_entry(&tx, &row.zip, &row.entry, None, Some(row.id))?;
     tx.commit()?;
     Ok(true)
 }
@@ -433,16 +433,16 @@ pub struct ZipOtherEntry {
     /// The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
     pub name: String,
     pub size: i64,
-    /// Where this entry was unpacked or restored to (its release in the catalog), when the catalog knows.
-    pub released_to: Option<String>,
-    /// `released_to` exists on disk now. `false` for an entry that was not released. When the copy is gone
-    /// the next scan of the zip takes its catalog row back into the zip.
-    pub released_present: bool,
+    /// The entry was unpacked or restored: the catalog holds a release for it.
+    pub released: bool,
+    /// The unpacked copy: the path of a disk row with the release's fingerprint whose file exists. `None` for an
+    /// entry that was not released, and for a released one whose copy is gone (a rescan brings the frame back).
+    pub copy_path: Option<String>,
 }
 
 impl ZipOtherEntry {
     fn plain(name: String, size: i64) -> Self {
-        Self { name, size, released_to: None, released_present: false }
+        Self { name, size, released: false, copy_path: None }
     }
 }
 
@@ -488,16 +488,13 @@ pub fn list_zip_entries(
             ApiError::Internal(format!("Could not read the catalog rows of {zip_path}: {e}"))
         };
         let rows = crate::zip_store::catalog::rows_of_zip(&conn, zip_path).map_err(|e| fail(&format!("{e:#}")))?;
-        let released = crate::zip_store::catalog::released_copies_of_zip(&conn, zip_path).map_err(|e| fail(&format!("{e:#}")))?;
+        let released = crate::zip_store::catalog::released_entries_of_zip(&conn, zip_path).map_err(|e| fail(&format!("{e:#}")))?;
         (rows, released)
     };
     // The copies are looked at after the catalog lock is released: a stat on a share can be slow.
-    let released: std::collections::HashMap<String, (String, bool)> = released
+    let released: std::collections::HashMap<String, Option<String>> = released
         .into_iter()
-        .map(|(entry, to)| {
-            let present = Path::new(&to).exists();
-            (entry, (to, present))
-        })
+        .map(|(entry, candidates)| (entry, candidates.into_iter().find(|p| Path::new(p).exists())))
         .collect();
 
     // Entry path -> row.
@@ -542,9 +539,9 @@ pub fn list_zip_entries(
                 Some(row) => files.push(row),
                 None => {
                     let mut other = ZipOtherEntry::plain(rest.to_string(), to_i64(size));
-                    if let Some((to, present)) = released.get(&name) {
-                        other.released_to = Some(to.clone());
-                        other.released_present = *present;
+                    if let Some(copy) = released.get(&name) {
+                        other.released = true;
+                        other.copy_path = copy.clone();
                     }
                     other_entries.push(other);
                 }
@@ -816,28 +813,50 @@ mod tests {
         frame
     }
 
-    fn released_to(conn: &Connection, entry: &str) -> Option<String> {
-        conn.query_row("SELECT released_to FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+    fn release_fingerprint(conn: &Connection, entry: &str) -> Option<String> {
+        conn.query_row("SELECT header_fingerprint FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+    }
+
+    fn row_fingerprint(conn: &Connection, file_id: i64) -> Option<String> {
+        conn.query_row("SELECT header_fingerprint FROM fits_header WHERE file_id = ?1", [file_id], |r| r.get(0)).unwrap()
     }
 
     #[test]
-    fn unpack_records_where_the_copy_went() {
+    fn unpack_records_the_fingerprint_of_the_released_row() {
         let tmp = TempDir::new().unwrap();
         let (conn, _zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
         run(&conn, &ids, out.path());
-        assert_eq!(
-            released_to(&conn, "Lights/L_001.fits").as_deref(),
-            Some(out.path().join("Lights").join("L_001.fits").to_str().unwrap())
-        );
-        assert_eq!(
-            released_to(&conn, "Lights/L_002.fits").as_deref(),
-            Some(out.path().join("Lights").join("L_002.fits").to_str().unwrap())
-        );
+        let l1 = file_id(&conn, "Lights/L_001.fits");
+        let l2 = file_id(&conn, "Lights/L_002.fits");
+        assert!(row_fingerprint(&conn, l1).is_some());
+        assert_eq!(release_fingerprint(&conn, "Lights/L_001.fits"), row_fingerprint(&conn, l1));
+        assert_eq!(release_fingerprint(&conn, "Lights/L_002.fits"), row_fingerprint(&conn, l2));
+        assert_ne!(release_fingerprint(&conn, "Lights/L_001.fits"), release_fingerprint(&conn, "Lights/L_002.fits"));
+    }
+
+    /// A dump of the tables the listing could touch, to prove it writes nothing.
+    fn catalog_dump(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id || '|' || path || '|' || IFNULL(archive_zip_path, '-') || '|' || IFNULL(archive_path_in_zip, '-') FROM files ORDER BY id",
+            "SELECT zip_id || '|' || entry_path || '|' || IFNULL(header_fingerprint, '-') FROM zip_released_entries ORDER BY id",
+            "SELECT path || '|' || size || '|' || modified_at || '|' || frame_entries FROM zip_archives ORDER BY id",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            out.extend(rows);
+        }
+        out
     }
 
     #[test]
-    fn list_zip_entries_says_where_an_unpacked_entry_went_and_whether_the_copy_is_still_there() {
+    fn list_zip_entries_says_where_an_unpacked_entry_went_and_writes_nothing() {
         let (tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
         let zip_s = zip.to_string_lossy().into_owned();
         let out = tmp.path().join("out");
@@ -848,6 +867,8 @@ mod tests {
             assert_eq!(run(&conn, &ids, &out).unpacked, 1);
         }
         let copy = out.join("Lights").join("L_001.fits");
+        let dump = |ctx: &ServiceContext| catalog_dump(&ctx.db.get().unwrap().conn());
+        let before = dump(&ctx);
 
         let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
         let names: Vec<_> = lights.files.iter().map(|f| f.file.filename.as_str()).collect();
@@ -857,19 +878,23 @@ mod tests {
             vec![ZipOtherEntry {
                 name: "L_001.fits".into(),
                 size: light(1).len() as i64,
-                released_to: Some(copy.to_string_lossy().into_owned()),
-                released_present: true,
+                released: true,
+                copy_path: Some(copy.to_string_lossy().into_owned()),
             }]
         );
 
+        // The copy is deleted from disk: the listing says so and still changes nothing (a rescan restores it).
         std::fs::remove_file(&copy).unwrap();
         let again = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
-        assert_eq!(again.other_entries[0].released_to.as_deref(), Some(copy.to_str().unwrap()));
-        assert!(!again.other_entries[0].released_present, "a deleted copy is reported missing");
+        assert_eq!(
+            again.other_entries,
+            vec![ZipOtherEntry { name: "L_001.fits".into(), size: light(1).len() as i64, released: true, copy_path: None }]
+        );
+        assert_eq!(dump(&ctx), before, "listing a zip never writes to the catalog");
     }
 
     #[test]
-    fn a_deleted_copy_sends_its_row_back_into_the_unchanged_zip() {
+    fn a_copy_deleted_in_the_finder_returns_the_same_row_to_the_unchanged_zip() {
         let tmp = TempDir::new().unwrap();
         let (conn, zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
@@ -897,7 +922,7 @@ mod tests {
         assert_eq!(path, crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits"));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "no row was added or deleted");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1, "only the other release is left");
-        assert_eq!(released_to(&conn, "Lights/L_002.fits").map(|p| Path::new(&p).exists()), Some(true));
+        assert!(release_fingerprint(&conn, "Lights/L_002.fits").is_some());
         assert_eq!(
             count(&conn, &format!("SELECT COUNT(*) FROM plate_solves WHERE frame_id = {frame}")),
             1,
@@ -928,16 +953,16 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
     }
 
-    /// Smoke fix r2: a release with no recorded copy has no owner, so the scan drops it and the entries are
-    /// cataloged again through the normal pass: here the deleted copies' rows are still in the catalog, so
-    /// the moved-file rule takes them back into the zip (same ids), and an entry with no such row is a new row.
+    /// A release with no fingerprint has no owner, so the scan drops it and the entries are cataloged again
+    /// through the normal pass: here the deleted copies' rows are still in the catalog, so the moved-file rule
+    /// takes them back into the zip (same ids), and an entry with no such row is a new row.
     #[test]
-    fn a_release_with_no_recorded_copy_is_dropped_and_its_entries_are_cataloged_again() {
+    fn a_release_with_no_fingerprint_is_dropped_and_its_entries_are_cataloged_again() {
         let tmp = TempDir::new().unwrap();
         let (conn, zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
         run(&conn, &ids, out.path());
-        conn.execute("UPDATE zip_released_entries SET released_to = NULL", []).unwrap();
+        conn.execute("UPDATE zip_released_entries SET header_fingerprint = NULL", []).unwrap();
         std::fs::remove_dir_all(out.path().join("Lights")).unwrap();
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
         assert_eq!(outcome.adopted, 2);
@@ -992,29 +1017,53 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
     }
 
+    /// The scanner's moved-file rule changes the row's path when a copy is renamed or moved on disk; the
+    /// release finds the copy by the row's fingerprint, so nothing is added and nothing goes back into the zip.
     #[test]
-    fn a_folder_rename_carries_the_unpacked_copies_with_it() {
+    fn a_copy_moved_or_renamed_on_disk_stays_released_without_a_duplicate() {
         let tmp = TempDir::new().unwrap();
-        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let (conn, zip, ids) = two_light_zip(tmp.path());
         let out = tmp.path().join("unpacked");
         run(&conn, &ids, &out);
         let new = tmp.path().join("unpacked-renamed");
+        std::fs::rename(&out, &new).unwrap();
         let prefix_old = format!("{}{}", out.to_str().unwrap(), std::path::MAIN_SEPARATOR);
         let prefix_new = format!("{}{}", new.to_str().unwrap(), std::path::MAIN_SEPARATOR);
         crate::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new).unwrap();
-        assert_eq!(
-            released_to(&conn, "Lights/L_001.fits").as_deref(),
-            Some(new.join("Lights").join("L_001.fits").to_str().unwrap())
-        );
-        // A sibling folder that merely shares the name root is not touched.
-        let sibling = format!("{}-x{}", out.to_str().unwrap(), std::path::MAIN_SEPARATOR);
-        crate::db::rename_files_path_prefix(&conn, &sibling, "/elsewhere/").unwrap();
-        assert!(released_to(&conn, "Lights/L_002.fits").unwrap().starts_with(&prefix_new));
-        // One file renamed on its own follows too.
-        let l2_old = released_to(&conn, "Lights/L_002.fits").unwrap();
-        let l2_new = format!("{prefix_new}Lights{}L_002_renamed.fits", std::path::MAIN_SEPARATOR);
-        conn.execute("UPDATE files SET path = ?1 WHERE path = ?2", params![l2_new, l2_old]).unwrap();
-        assert_eq!(released_to(&conn, "Lights/L_002.fits").as_deref(), Some(l2_new.as_str()));
+        // One file renamed on its own as well.
+        let l2_old = new.join("Lights").join("L_002.fits");
+        let l2_new = new.join("Lights").join("L_002_renamed.fits");
+        std::fs::rename(&l2_old, &l2_new).unwrap();
+        conn.execute("UPDATE files SET path = ?1 WHERE path = ?2", params![l2_new.to_str().unwrap(), l2_old.to_str().unwrap()]).unwrap();
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.skipped_unchanged);
+        assert_eq!(outcome.adopted + outcome.inserted.len(), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "no duplicate");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+    }
+
+    /// Unpack, then Void the copies (row and file go, exactly as for any disk file): a plain rescan brings the
+    /// frames back as zip-resident rows.
+    #[test]
+    fn unpack_then_void_the_copies_then_rescan_puts_the_frames_back_in_the_zip() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        for id in &ids {
+            crate::db::send_to_void(&conn, *id).unwrap();
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
+        assert_eq!(std::fs::read_dir(out.path().join("Lights")).unwrap().count(), 0);
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!outcome.skipped_unchanged);
+        assert_eq!(outcome.inserted.len(), 2, "no row is left to adopt: new rows");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
     }
 
     #[test]

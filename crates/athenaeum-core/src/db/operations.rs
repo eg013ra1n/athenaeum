@@ -5951,7 +5951,7 @@ mod path_prefix_range_tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L.fits', NULL)",
+                "INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L.fits')",
                 params![id],
             )
             .unwrap();

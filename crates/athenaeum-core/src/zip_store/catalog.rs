@@ -270,16 +270,29 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     Ok(out)
 }
 
-/// The entries of `zip` that were unpacked or restored to a known place: entry path and where the copy went.
-/// Releases recorded without a place (before the column existed) are not listed.
-pub fn released_copies_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(String, String)>> {
+/// The entries of `zip` that were unpacked or restored (its releases), each with the paths of the disk rows
+/// that carry the release's header fingerprint: the candidates for the unpacked copy, empty when the release
+/// has no fingerprint or no such row. Read-only; whether a path exists on disk is for the caller to stat.
+pub fn released_entries_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(String, Vec<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT r.entry_path, r.released_to FROM zip_released_entries r
+        "SELECT r.entry_path, f.path FROM zip_released_entries r
          INNER JOIN zip_archives z ON z.id = r.zip_id
-         WHERE z.path = ?1 AND r.released_to IS NOT NULL",
+         LEFT JOIN fits_header fh ON fh.header_fingerprint = r.header_fingerprint
+         LEFT JOIN files f ON f.id = fh.file_id AND f.archive_zip_path IS NULL
+         WHERE z.path = ?1
+         ORDER BY r.id, f.id",
     )?;
-    let rows = stmt.query_map([zip], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let rows = stmt
+        .query_map([zip], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (entry, path) in rows {
+        match out.last_mut() {
+            Some((last, paths)) if *last == entry => paths.extend(path),
+            _ => out.push((entry, path.into_iter().collect())),
+        }
+    }
+    Ok(out)
 }
 
 /// The cataloged rows that belong to `zip`: those marked with it (`archive_zip_path`, ours and foreign) and

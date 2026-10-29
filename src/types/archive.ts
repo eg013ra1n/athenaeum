@@ -97,12 +97,12 @@ export type ZipOtherEntry = {
  */
 name: string, size: number, 
 /**
- * Where this entry was unpacked or restored to (its release in the catalog), when the catalog knows.
+ * The entry was unpacked or restored: the catalog holds a release for it.
  */
-releasedTo: string | null, 
+released: boolean, 
 /**
- * `released_to` exists on disk now. `false` for an entry that was not released. When the copy is gone
- * the next scan of the zip takes its catalog row back into the zip.
+ * The unpacked copy: the path of a disk row with the release's fingerprint whose file exists. `None` for an
+ * entry that was not released, and for a released one whose copy is gone (a rescan brings the frame back).
  */
-releasedPresent: boolean, };
+copyPath: string | null, };
 

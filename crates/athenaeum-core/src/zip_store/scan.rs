@@ -260,19 +260,9 @@ pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path:
                 archived_in_operation = NULL, size = ?1, modified_at = ?2 WHERE id = ?3",
         params![metadata.len() as i64, modified.to_rfc3339(), file_id],
     )?;
-    // The zip may have no row yet (Move and ZIP writes it only at its end): a placeholder keeps the
-    // release, with the stat left empty so the next scan reads the zip.
-    conn.execute(
-        "INSERT OR IGNORE INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
-         VALUES (?1, 0, '', (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1), ?2, ?3)",
-        params![zip_path, Utc::now().to_rfc3339(), operation],
-    )?;
-    conn.execute(
-        "INSERT INTO zip_released_entries (zip_id, entry_path, released_to)
-         SELECT id, ?1, ?3 FROM zip_archives WHERE path = ?2
-         ON CONFLICT(zip_id, entry_path) DO UPDATE SET released_to = excluded.released_to",
-        params![entry, zip_path, path.to_string_lossy()],
-    )?;
+    // The zip may have no row yet (Move and ZIP writes it only at its end): the release creates a placeholder
+    // with the stat left empty, so the next scan reads the zip.
+    crate::zip_store::place::record_released_entry(conn, &zip_path, &entry, Some(operation), Some(file_id))?;
     sp.commit()?;
     tracing::info!(file_id, path = %path.display(), zip_path = %zip_path, "archived frame unzipped by hand — the row is a disk row again");
     Ok(HandRestore::BecameDiskRow)
@@ -583,54 +573,78 @@ fn entries_written_by_creating_operation(conn: &Connection, zip_path: &str) -> R
     Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
 }
 
-/// A release that has an owner: it names the path of its copy and the catalog has a row at that path.
-/// The scan keeps only these. A release without one (recorded before `released_to` existed, or whose row
-/// went away with a removed folder or a deleted file) keeps nothing out of the catalog: its entry is
-/// cataloged like any new one.
-const OWNED_RELEASE: &str = "r.released_to IS NOT NULL AND EXISTS (SELECT 1 FROM files f WHERE f.path = r.released_to)";
-
-/// The releases of the zip at `zip_path` that have an owner ([`OWNED_RELEASE`]).
-fn released_entries_of(conn: &Connection, zip_path: &str) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT r.entry_path FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
-         WHERE z.path = ?1 AND {OWNED_RELEASE}"
-    ))?;
-    let rows = stmt.query_map(params![zip_path], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+/// A release of a zip: its row id, the entry and the fingerprint of the catalog row that was released.
+struct Release {
+    id: i64,
+    entry: String,
+    fingerprint: Option<String>,
 }
 
-/// How many releases of the zip have no owner ([`OWNED_RELEASE`] is false for them).
-fn ownerless_releases(conn: &Connection, zip_path: &str) -> Result<usize> {
-    let n: i64 = conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
-             WHERE z.path = ?1 AND NOT ({OWNED_RELEASE})"
-        ),
-        params![zip_path],
-        |r| r.get(0),
-    )?;
-    Ok(n as usize)
+/// The releases of one zip, split by the one rule: a release keeps its entry out of the catalog iff a disk
+/// row (`archive_zip_path IS NULL`) with the release's header fingerprint exists AND its file is on disk, or
+/// that row sits under a scan root that is offline (an unmounted volume says nothing about the file). Every
+/// other release (no such row, the file gone, no fingerprint recorded) is dead: the entry is cataloged like
+/// any new one, and a row of the frame whose copy is missing takes it over through [`find_moved_row`].
+#[derive(Default)]
+struct Releases {
+    kept: Vec<Release>,
+    dead: Vec<Release>,
 }
 
-/// Drops the releases of the zip that have no owner, so their entries are cataloged as new rows.
-fn drop_ownerless_releases(conn: &Connection, zip_path: &str) -> Result<usize> {
-    let n = conn.execute(
-        &format!(
-            "DELETE FROM zip_released_entries WHERE id IN (
-                 SELECT r.id FROM zip_released_entries r INNER JOIN zip_archives z ON z.id = r.zip_id
-                 WHERE z.path = ?1 AND NOT ({OWNED_RELEASE}))"
-        ),
-        params![zip_path],
+fn classify_releases(conn: &Connection, zip_path: &str) -> Result<Releases> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.entry_path, r.header_fingerprint FROM zip_released_entries r
+         INNER JOIN zip_archives z ON z.id = r.zip_id WHERE z.path = ?1 ORDER BY r.id",
     )?;
-    Ok(n)
+    let all = stmt
+        .query_map(params![zip_path], |r| Ok(Release { id: r.get(0)?, entry: r.get(1)?, fingerprint: r.get(2)? }))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut copies = conn.prepare(
+        "SELECT f.path FROM files f INNER JOIN fits_header fh ON fh.file_id = f.id
+         WHERE fh.header_fingerprint = ?1 AND f.archive_zip_path IS NULL",
+    )?;
+    let mut verdicts: HashMap<String, bool> = HashMap::new();
+    let mut out = Releases::default();
+    for release in all {
+        let alive = match &release.fingerprint {
+            None => false,
+            Some(fp) => match verdicts.get(fp) {
+                Some(v) => *v,
+                None => {
+                    let paths = copies
+                        .query_map(params![fp], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let mut alive = paths.iter().any(|p| Path::new(p).exists());
+                    if !alive {
+                        for p in &paths {
+                            if let Some(offline_root) = path_under_unavailable_scan_root(conn, p)? {
+                                tracing::debug!(path = %p, offline_root = %offline_root, "released copy missing only because its scan root is unavailable — the release stays");
+                                alive = true;
+                                break;
+                            }
+                        }
+                    }
+                    verdicts.insert(fp.clone(), alive);
+                    alive
+                }
+            },
+        };
+        if alive {
+            out.kept.push(release);
+        } else {
+            out.dead.push(release);
+        }
+    }
+    Ok(out)
 }
 
 /// The zip at `new_zip_id` took over rows from `gone`, a zip that no longer exists: move `gone`'s
-/// identity along. Its released entries are copied to the new zip, its `created_by_operation` is
+/// identity along. Its released entries that still have a copy (`kept`) are copied to the new zip, its `created_by_operation` is
 /// carried (unless the new row has its own), its black-hole record follows, and the old
 /// `zip_archives` row is deleted once no `files` row points at its path any more (rows of entries
 /// the new zip does not hold stay pointed at it, and stay missing).
-fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gone: &str) -> Result<()> {
+fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gone: &str, kept: &[Release]) -> Result<()> {
     if gone == new_zip_path {
         return Ok(());
     }
@@ -655,13 +669,12 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     let Some((old_id, old_operation)) = old else {
         return Ok(());
     };
-    conn.execute(
-        &format!(
-            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to)
-         SELECT ?1, r.entry_path, r.released_to FROM zip_released_entries r WHERE r.zip_id = ?2 AND {OWNED_RELEASE}"
-        ),
-        params![new_zip_id, old_id],
-    )?;
+    for r in kept {
+        conn.execute(
+            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, header_fingerprint) VALUES (?1, ?2, ?3)",
+            params![new_zip_id, r.entry, r.fingerprint],
+        )?;
+    }
     if let Some(op) = old_operation {
         conn.execute(
             "UPDATE zip_archives SET created_by_operation = ?1 WHERE id = ?2 AND created_by_operation IS NULL",
@@ -682,170 +695,10 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     Ok(())
 }
 
-/// What [`readopt_released`] did.
-#[derive(Debug, Default)]
-struct Readopted {
-    rows: usize,
-    bytes_read: u64,
-}
-
-/// A released entry whose copy is gone: the catalog row that was pointed at the copy goes back into the
-/// zip (finding B of the 2026-10-29 smoke: the user deleted the unpacked files, the zip still held the
-/// frames, and the entries stayed released, so the frames were lost to the catalog).
-///
-/// Mirrors the move-into-zip adoption: the row must be a disk row at `released_to`, that path must be gone
-/// from disk with its scan root online (the same offline-root guard as a moved file, so an unmounted volume
-/// never sends rows back into a zip), and the entry's header must carry the row's fingerprint. Then the
-/// release is dropped and the row is adopted exactly as a moved row is (same id, analysis, plate solve, set
-/// membership). A release with no `released_to` (recorded before the column) and a copy that is still on
-/// disk stay as they are. Never deletes a row, never writes into the zip.
-///
-/// Runs for an unchanged zip too: it costs one stat per release that has a `released_to`, and the zip is
-/// opened only when a copy is gone. `listing` is the directory when the caller already read it.
-fn readopt_released(
-    conn: &Connection,
-    zip: &Path,
-    zip_str: &str,
-    zip_modified: DateTime<Utc>,
-    listing: Option<&reader::ZipListing>,
-    root_id: i64,
-    unique_camera: bool,
-) -> Result<Readopted> {
-    struct Candidate {
-        release_id: i64,
-        entry: String,
-        released_to: String,
-        file_id: i64,
-        fingerprint: Option<String>,
-    }
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.entry_path, r.released_to, f.id, fh.header_fingerprint
-         FROM zip_released_entries r
-         INNER JOIN zip_archives z ON z.id = r.zip_id
-         INNER JOIN files f ON f.path = r.released_to
-         LEFT JOIN fits_header fh ON fh.file_id = f.id
-         WHERE z.path = ?1 AND r.released_to IS NOT NULL AND f.archive_zip_path IS NULL
-         ORDER BY r.id",
-    )?;
-    let released = stmt
-        .query_map(params![zip_str], |r| {
-            Ok(Candidate {
-                release_id: r.get(0)?,
-                entry: r.get(1)?,
-                released_to: r.get(2)?,
-                file_id: r.get(3)?,
-                fingerprint: r.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    let mut gone = Vec::new();
-    for c in released {
-        if Path::new(&c.released_to).exists() {
-            continue;
-        }
-        // The copy is not there: a deleted file, or a volume that is not mounted.
-        let vpath = virtual_path(zip, &c.entry);
-        if old_location_is_gone(conn, c.file_id, &c.released_to, &c.released_to, &vpath)? {
-            gone.push(c);
-        }
-    }
-    let mut out = Readopted::default();
-    if gone.is_empty() {
-        return Ok(out);
-    }
-
-    let own_listing;
-    let listing = match listing {
-        Some(l) => l,
-        None => {
-            own_listing = reader::list_entries(zip).with_context(|| format!("read the directory of {}", zip.display()))?;
-            out.bytes_read += own_listing.bytes_read;
-            &own_listing
-        }
-    };
-    let by_name: HashMap<&str, &ZipEntryInfo> = listing.entries.iter().filter(|e| e.is_frame).map(|e| (e.path.as_str(), e)).collect();
-    let present: Vec<&Candidate> = gone.iter().filter(|c| by_name.contains_key(c.entry.as_str())).collect();
-    for c in gone.iter().filter(|c| !by_name.contains_key(c.entry.as_str())) {
-        tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, path = %c.released_to, "unpacked copy is gone and the zip no longer holds the entry — the release stays");
-    }
-    if present.is_empty() {
-        return Ok(out);
-    }
-    let names: Vec<&str> = present.iter().map(|c| c.entry.as_str()).collect();
-    let (headers, header_bytes) =
-        reader::read_headers(zip, &names).with_context(|| format!("read entry headers of {}", zip.display()))?;
-    out.bytes_read += header_bytes;
-
-    for (c, (_, header)) in present.iter().zip(headers) {
-        let entry = by_name[c.entry.as_str()];
-        let vpath = virtual_path(zip, &c.entry);
-        let verdict: Result<bool> = (|| {
-            let bytes = header?;
-            let format = if c.entry.to_ascii_lowercase().ends_with(".xisf") { FileFormat::XISF } else { FileFormat::FITS };
-            let (_, parsed) = match format {
-                FileFormat::FITS => parse_fits_header_bytes(&bytes, 0, Path::new(&vpath)),
-                FileFormat::XISF => parse_xisf_header_bytes(&bytes, 0, Path::new(&vpath)),
-            }?;
-            Ok(c.fingerprint.as_deref() == Some(crate::fingerprint::compute_header_fingerprint(&parsed).as_str()))
-        })();
-        match verdict {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, path = %c.released_to, file_id = c.file_id, "unpacked copy is gone but the zip entry is not that frame — the release stays");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, error = %format!("{e:#}"), "could not read the zip entry to take an unpacked frame back — the release stays");
-                continue;
-            }
-        }
-        let modified = entry.modified.map(|n| n.and_utc()).unwrap_or(zip_modified);
-        let filename = c.entry.rsplit('/').next().unwrap_or(&c.entry);
-        let sp = SavepointGuard::new(conn, "scan_zip_readopt")?;
-        let done = (|| -> Result<()> {
-            // The release goes first: the path swap of the adoption would otherwise carry it along.
-            conn.execute("DELETE FROM zip_released_entries WHERE id = ?1", params![c.release_id])?;
-            adopt_into_zip(
-                conn,
-                &ZipAdoption {
-                    file_id: c.file_id,
-                    old_path: &c.released_to,
-                    vpath: &vpath,
-                    filename,
-                    size: entry.size as i64,
-                    modified: &modified,
-                    zip_str,
-                    entry_path: &c.entry,
-                    crc: i64::from(entry.crc32),
-                    root_id,
-                    unique_camera,
-                },
-            )?;
-            Ok(())
-        })();
-        match done {
-            Ok(()) => {
-                sp.commit()?;
-                out.rows += 1;
-                tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %c.entry, old_path = %c.released_to, file_id = c.file_id, "unpacked copy gone — the row is back in the zip");
-            }
-            Err(e) => {
-                drop(sp);
-                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, file_id = c.file_id, error = %format!("{e:#}"), "could not take an unpacked frame back into its zip — the release stays");
-            }
-        }
-    }
-    if out.rows > 0 {
-        tracing::info!(zip_path = %zip.display(), rows = out.rows, "unpacked frames whose copy is gone are back in their zip");
-    }
-    Ok(out)
-}
-
 /// Catalog the frames inside one zip. The zip's stat is compared first; an unchanged zip is not
 /// opened. Otherwise: read the directory; entries already owned by a row (`archive_zip_path` +
 /// `archive_path_in_zip`) are known, and re-parsed in place only when their CRC changed; entries
-/// in `zip_released_entries` are skipped; the rest go through one header pass and are adopted by a
+/// whose release still has a copy on disk ([`classify_releases`]) are skipped; the rest go through one header pass and are adopted by a
 /// moved row or inserted. All adoptions are decided before the first insert, because an adoption
 /// from a zip that is gone also brings that zip's released entries (frames the user unpacked), which
 /// must not come back as new rows. The whole zip is one transaction (one savepoint per entry inside it).
@@ -868,29 +721,18 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    // Releases without an owner are cataloged again, so such a zip is read even when its stat is unchanged
-    // (the release itself is dropped in the scan's transaction, below).
-    let ownerless = if known_zip.is_some() { ownerless_releases(conn, &zip_str)? } else { 0 };
-    if let Some((zip_id, db_size, db_modified)) = &known_zip {
-        if *db_size == size && *db_modified == modified_str && ownerless == 0 {
-            // Nothing to read in the zip itself, but an unpacked copy deleted since the last scan sends its
-            // row back into the zip (the stat of each release's copy is the whole cost when none was).
-            let back = readopt_released(conn, zip, &zip_str, zip_modified, None, root_id, unique_camera)?;
-            if back.rows > 0 {
-                conn.execute(
-                    "UPDATE zip_archives SET frame_entries = (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1) WHERE id = ?2",
-                    params![zip_str, zip_id],
-                )?;
-            }
-            return Ok(ZipScanOutcome {
-                zip_id: *zip_id,
-                skipped_unchanged: back.bytes_read == 0,
-                adopted: back.rows,
-                bytes_read: back.bytes_read,
-                ..Default::default()
-            });
+    // The one release rule (see [`classify_releases`]) runs on every scan, the zip's stat unchanged or not:
+    // a release whose copy is gone is dropped and its entry is cataloged again, so such a zip is read.
+    let releases = if known_zip.is_some() { classify_releases(conn, &zip_str)? } else { Releases::default() };
+    let unchanged = matches!(&known_zip, Some((_, db_size, db_modified)) if *db_size == size && *db_modified == modified_str);
+    if let (Some((zip_id, _, _)), true) = (&known_zip, unchanged) {
+        if releases.dead.is_empty() {
+            return Ok(ZipScanOutcome { zip_id: *zip_id, skipped_unchanged: true, ..Default::default() });
         }
     }
+    // An unchanged zip is read only for the entries whose release was dropped.
+    let only_entries: Option<HashSet<&str>> =
+        if unchanged { Some(releases.dead.iter().map(|r| r.entry.as_str()).collect()) } else { None };
 
     let listing = reader::list_entries(zip).with_context(|| format!("read the directory of {}", zip.display()))?;
     let mut tally = Tally {
@@ -899,12 +741,6 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         gone_zips: Vec::new(),
         entry_failed: false,
     };
-    // Released entries whose copy is gone come back first, so the passes below see them as the zip's own.
-    if known_zip.is_some() {
-        let back = readopt_released(conn, zip, &zip_str, zip_modified, Some(&listing), root_id, unique_camera)?;
-        tally.outcome.adopted += back.rows;
-        tally.outcome.bytes_read += back.bytes_read;
-    }
 
     // Entries a row already owns: row id and the CRC recorded for it (NULL for rows that predate it).
     let mut known: HashMap<String, (i64, Option<i64>)> = HashMap::new();
@@ -919,10 +755,7 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
             known.insert(entry, (id, crc));
         }
     }
-    let mut released: HashSet<String> = match &known_zip {
-        Some(_) => released_entries_of(conn, &zip_str)?,
-        None => HashSet::new(),
-    };
+    let mut released: HashSet<String> = releases.kept.iter().map(|r| r.entry.clone()).collect();
 
     // Entries the zip's own operation wrote into it. A Copy entry (a library master, copied darks) has no
     // row by design: it is the original on disk that is cataloged, so it must not become a foreign row.
@@ -944,6 +777,7 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
                 skipped_as_operation_entries += 1;
                 tally.cataloged += 1;
             }
+            None if only_entries.as_ref().is_some_and(|only| !only.contains(entry.path.as_str())) => {}
             None => to_read.push((entry, None)),
         }
     }
@@ -981,9 +815,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     };
 
     let outer = SavepointGuard::new(conn, "scan_zip")?;
-    if ownerless > 0 {
-        let dropped = drop_ownerless_releases(conn, &zip_str)?;
-        tracing::info!(root_id, zip_path = %zip.display(), count = dropped, "released entries with no copy in the catalog are cataloged again");
+    if !releases.dead.is_empty() {
+        for r in &releases.dead {
+            conn.execute("DELETE FROM zip_released_entries WHERE id = ?1", params![r.id])?;
+        }
+        tracing::info!(root_id, zip_path = %zip.display(), count = releases.dead.len(), "released entries with no copy on disk are cataloged again");
     }
     // FOREIGN rows that predate the entry CRC learn it from the directory this scan already read, with no
     // further read of the zip. Rows of our own operations never do: their CRC comes only from finalize or
@@ -1034,8 +870,11 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     // operation that built that zip copied into it (a library master, copied darks) have no row by design,
     // exactly as in a zip the catalog already knows: they are not new frames of the renamed zip.
     let mut written_by_gone_operation: HashSet<String> = HashSet::new();
+    let mut kept_of_gone: Vec<Releases> = Vec::new();
     for gone in &tally.gone_zips {
-        released.extend(released_entries_of(conn, gone)?);
+        let gone_releases = classify_releases(conn, gone)?;
+        released.extend(gone_releases.kept.iter().map(|r| r.entry.clone()));
+        kept_of_gone.push(gone_releases);
         written_by_gone_operation.extend(entries_written_by_creating_operation(conn, gone)?);
     }
 
@@ -1070,8 +909,8 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         params![zip_str, recorded_size, recorded_modified, tally.cataloged as i64, Utc::now().to_rfc3339()],
     )?;
     tally.outcome.zip_id = conn.query_row("SELECT id FROM zip_archives WHERE path = ?1", params![zip_str], |r| r.get(0))?;
-    for gone in &tally.gone_zips {
-        move_zip_identity(conn, tally.outcome.zip_id, &zip_str, gone)?;
+    for (gone, gone_releases) in tally.gone_zips.iter().zip(&kept_of_gone) {
+        move_zip_identity(conn, tally.outcome.zip_id, &zip_str, gone, &gone_releases.kept)?;
     }
     outer.commit()?;
 
@@ -1594,7 +1433,7 @@ mod scan_tests {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
-        let first = scan_zip(&conn, &zip, 1, false).unwrap();
+        scan_zip(&conn, &zip, 1, false).unwrap();
         // A permanent unpack moved L_001 to disk: markers cleared, entry released.
         let id1 = id_of(&conn, &virtual_path(&zip, "L_001.fits"));
         conn.execute(
@@ -1607,11 +1446,7 @@ mod scan_tests {
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
         std::fs::write(&copy, light(1)).unwrap();
         conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![copy.to_str().unwrap(), id1]).unwrap();
-        conn.execute(
-            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
-            params![first.zip_id, copy.to_str().unwrap()],
-        )
-        .unwrap();
+        crate::zip_store::place::record_released_entry(&conn, zip.to_str().unwrap(), "L_001.fits", None, Some(id1)).unwrap();
 
         // The zip changes (a new entry) and is scanned again.
         let zip = make_zip(
@@ -1626,35 +1461,40 @@ mod scan_tests {
         assert_eq!(id_of(&conn, copy.to_str().unwrap()), id1);
     }
 
-    /// Two zips entries (L_001, L_002); the row of L_001 is unpacked to `copy_name` under the root (the file is
-    /// written when `copy_on_disk`), and the release is recorded with `released_to`.
-    fn unpack_first_entry(conn: &Connection, zip: &Path, zip_id: i64, released_to: Option<&str>) -> i64 {
-        let id1 = id_of(conn, &virtual_path(zip, "L_001.fits"));
+    /// What an unpack does to the catalog: the row of `entry` becomes a disk row at `copy` (the file is written
+    /// when `bytes` is given) and the entry is released with the row's header fingerprint.
+    fn unpack_entry(conn: &Connection, zip: &Path, entry: &str, copy: &Path, bytes: Option<Vec<u8>>) -> i64 {
+        let id = id_of(conn, &virtual_path(zip, entry));
+        if let Some(bytes) = bytes {
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::write(copy, bytes).unwrap();
+        }
         conn.execute(
-            "UPDATE files SET path = '/gone/place/L_001.fits', archive_zip_path = NULL, archive_path_in_zip = NULL,
-                    archive_entry_crc32 = NULL WHERE id = ?1",
-            params![id1],
+            "UPDATE files SET path = ?1, archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL WHERE id = ?2",
+            params![copy.to_str().unwrap(), id],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
-            params![zip_id, released_to],
-        )
-        .unwrap();
-        id1
+        crate::zip_store::place::record_released_entry(conn, zip.to_str().unwrap(), entry, None, Some(id)).unwrap();
+        id
+    }
+
+    fn forget_row(conn: &Connection, id: i64) {
+        conn.execute("DELETE FROM frames WHERE file_id = ?1", params![id]).unwrap();
+        conn.execute("DELETE FROM fits_header WHERE file_id = ?1", params![id]).unwrap();
+        conn.execute("DELETE FROM files WHERE id = ?1", params![id]).unwrap();
     }
 
     #[test]
-    fn a_release_with_no_destination_and_no_row_is_cataloged_again_even_when_the_zip_is_unchanged() {
+    fn a_release_without_a_fingerprint_is_cataloged_again_even_when_the_zip_is_unchanged() {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
-        let first = scan_zip(&conn, &zip, 1, false).unwrap();
-        // The pre-r1 release (released_to NULL) whose row went away with a removed folder.
-        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, None);
-        conn.execute("DELETE FROM frames WHERE file_id = ?1", params![id1]).unwrap();
-        conn.execute("DELETE FROM fits_header WHERE file_id = ?1", params![id1]).unwrap();
-        conn.execute("DELETE FROM files WHERE id = ?1", params![id1]).unwrap();
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        // A release recorded before the fingerprint existed, whose row went away with a removed folder.
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        let id1 = unpack_entry(&conn, &zip, "L_001.fits", &copy, None);
+        conn.execute("UPDATE zip_released_entries SET header_fingerprint = NULL", []).unwrap();
+        forget_row(&conn, id1);
 
         let again = scan_zip(&conn, &zip, 1, false).unwrap();
         assert!(!again.skipped_unchanged, "the zip is read to take the entry back");
@@ -1667,38 +1507,56 @@ mod scan_tests {
     }
 
     #[test]
-    fn a_release_whose_destination_has_no_row_is_cataloged_again() {
+    fn a_release_with_a_fingerprint_is_dropped_too_when_no_row_carries_it() {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
-        let first = scan_zip(&conn, &zip, 1, false).unwrap();
-        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, Some("/gone/place/L_001.fits"));
-        conn.execute("DELETE FROM frames WHERE file_id = ?1", params![id1]).unwrap();
-        conn.execute("DELETE FROM fits_header WHERE file_id = ?1", params![id1]).unwrap();
-        conn.execute("DELETE FROM files WHERE id = ?1", params![id1]).unwrap();
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        let id1 = unpack_entry(&conn, &zip, "L_001.fits", &copy, Some(light(1)));
+        forget_row(&conn, id1);
 
         let again = scan_zip(&conn, &zip, 1, false).unwrap();
-        assert_eq!(again.inserted.len(), 1);
+        assert_eq!(again.inserted.len(), 1, "the copy on disk has no row: the entry is cataloged as new");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
     }
 
     #[test]
-    fn a_release_whose_destination_has_a_row_stays_released_when_the_zip_is_unchanged() {
+    fn a_release_whose_copy_has_a_row_and_a_file_stays_released_when_the_zip_is_unchanged() {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
-        let first = scan_zip(&conn, &zip, 1, false).unwrap();
-        // The copy is on disk, under the root, with its row.
+        scan_zip(&conn, &zip, 1, false).unwrap();
         let copy = tmp.path().join("L_001.fits");
-        std::fs::write(&copy, light(1)).unwrap();
-        let id1 = unpack_first_entry(&conn, &zip, first.zip_id, Some(copy.to_str().unwrap()));
-        conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![copy.to_str().unwrap(), id1]).unwrap();
+        unpack_entry(&conn, &zip, "L_001.fits", &copy, Some(light(1)));
 
         let again = scan_zip(&conn, &zip, 1, false).unwrap();
         assert!(again.skipped_unchanged);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+    }
+
+    #[test]
+    fn a_copy_deleted_from_disk_sends_its_row_back_into_the_unchanged_zip_through_the_normal_path() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        let copy = tmp.path().join("unpacked").join("L_001.fits");
+        let id1 = unpack_entry(&conn, &zip, "L_001.fits", &copy, Some(light(1)));
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
+
+        std::fs::remove_file(&copy).unwrap();
+        let again = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(!again.skipped_unchanged);
+        assert_eq!(again.adopted, 1, "the row with the fingerprint takes the entry over");
+        assert!(again.inserted.is_empty());
+        assert_eq!(id_of(&conn, &virtual_path(&zip, "L_001.fits")), id1, "the same row");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 0);
+        assert_eq!(count(&conn, "SELECT frame_entries FROM zip_archives"), 2);
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged, "and the next scan is the cheap one");
     }
 
     #[test]
@@ -1711,19 +1569,11 @@ mod scan_tests {
             &[("L_001.fits", light(1)), ("L_002.fits", light(2)), ("L_003.fits", light(3))],
             ArchiveCompression::Store,
         );
-        let first = scan_zip(&conn, &zip, 1, false).unwrap();
-        // Two entries were unpacked into the folder (one release recorded before the column existed), then the
-        // user deleted the unpacked files and removed the folder from the catalog.
-        let copy = tmp.path().join("unpacked").join("L_001.fits");
-        unpack_first_entry(&conn, &zip, first.zip_id, Some(copy.to_str().unwrap()));
-        conn.execute("UPDATE files SET path = ?1 WHERE path = '/gone/place/L_001.fits'", params![copy.to_str().unwrap()]).unwrap();
-        let id2 = id_of(&conn, &virtual_path(&zip, "L_002.fits"));
-        conn.execute(
-            "UPDATE files SET path = ?1, archive_zip_path = NULL, archive_path_in_zip = NULL, archive_entry_crc32 = NULL WHERE id = ?2",
-            params![tmp.path().join("unpacked").join("L_002.fits").to_str().unwrap(), id2],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L_002.fits')", params![first.zip_id]).unwrap();
+        scan_zip(&conn, &zip, 1, false).unwrap();
+        // Two entries were unpacked into the folder, then the user deleted the unpacked files and removed the
+        // folder from the catalog.
+        unpack_entry(&conn, &zip, "L_001.fits", &tmp.path().join("unpacked").join("L_001.fits"), None);
+        unpack_entry(&conn, &zip, "L_002.fits", &tmp.path().join("unpacked").join("L_002.fits"), None);
 
         crate::db::delete_scan_root(&conn, 1).unwrap();
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0);
@@ -1918,7 +1768,7 @@ mod scan_tests {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let a = make_zip(tmp.path(), "a.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
-        let first = scan_zip(&conn, &a, 1, false).unwrap();
+        scan_zip(&conn, &a, 1, false).unwrap();
         // The user unpacked L_001 to disk through the app: a disk row, a released entry.
         let unpacked = tmp.path().join("unpacked").join("L_001.fits");
         std::fs::create_dir_all(unpacked.parent().unwrap()).unwrap();
@@ -1929,11 +1779,7 @@ mod scan_tests {
             params![unpacked.to_str().unwrap(), id1],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (?1, 'L_001.fits', ?2)",
-            params![first.zip_id, unpacked.to_str().unwrap()],
-        )
-        .unwrap();
+        crate::zip_store::place::record_released_entry(&conn, a.to_str().unwrap(), "L_001.fits", None, Some(id1)).unwrap();
 
         let b = tmp.path().join("b.zip");
         std::fs::rename(&a, &b).unwrap();

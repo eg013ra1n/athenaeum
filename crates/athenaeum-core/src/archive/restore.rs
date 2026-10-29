@@ -530,9 +530,9 @@ fn run_restore_inner(
                 .optional()?;
             let path_changed = new_path.to_str() != Some(current_path.as_deref().unwrap_or(f.source_path.as_str()));
             let path_arg = if path_changed { new_path.to_str() } else { None };
-            update_restored_row(conn, operation_id, f, Some((file_id, path_arg, &new_mtime, new_size)), &new_path.to_string_lossy())?;
+            update_restored_row(conn, operation_id, f, Some((file_id, path_arg, &new_mtime, new_size)))?;
         } else {
-            update_restored_row(conn, operation_id, f, None, &new_path.to_string_lossy())?;
+            update_restored_row(conn, operation_id, f, None)?;
         }
         catalog_done += 1;
         emit(
@@ -730,13 +730,12 @@ fn update_restored_row(
     operation_id: i64,
     f: &ArchiveOperationFile,
     row: Option<(i64, Option<&str>, &str, i64)>,
-    released_to: &str,
 ) -> Result<()> {
     let sp = crate::db::SavepointGuard::new(conn, "restore_release_entry")?;
     if let Some((file_id, path_arg, new_mtime, new_size)) = row {
         adb::unmark_file_archived(conn, file_id, path_arg, Some(new_mtime), Some(new_size))?;
     }
-    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), Some(released_to))
+    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), row.map(|r| r.0))
         .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
     sp.commit()?;
     Ok(())
@@ -1774,6 +1773,7 @@ pub(crate) mod tests {
     #[test]
     fn restore_extracts_only_the_missing_entries_and_records_released_ones_for_a_kept_zip() {
         let (arch, scan, conn, op_id, paths) = archived_lights(3);
+        conn.execute("INSERT INTO fits_header (file_id, header, header_fingerprint) SELECT id, '', 'fp-' || id FROM files", []).unwrap();
         let first = restore(&conn, op_id, scan.path(), false, true);
         assert_eq!(first.extracted, 3);
         assert!(!arch.path().join(".athenaeum_restore_temp").exists(), "no temp tree is made");
@@ -1782,17 +1782,21 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(released, 3, "each restored entry is recorded for the kept zip");
-        let mut to: Vec<String> = conn
-            .prepare("SELECT released_to FROM zip_released_entries")
-            .unwrap()
-            .query_map([], |r| r.get::<_, Option<String>>(0))
-            .unwrap()
-            .map(|r| r.unwrap().expect("a restore records where the entry went"))
-            .collect();
-        to.sort();
-        let mut want: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        want.sort();
-        assert_eq!(to, want, "each release points at the restored file");
+        let fingerprints = |sql: &str| -> Vec<Option<String>> {
+            let mut v: Vec<Option<String>> = conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, Option<String>>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        let released_fp = fingerprints("SELECT header_fingerprint FROM zip_released_entries");
+        let row_fp = fingerprints("SELECT header_fingerprint FROM fits_header");
+        assert!(released_fp.iter().all(|f| f.is_some()), "a restore records the fingerprint of the restored row");
+        assert_eq!(released_fp, row_fp, "each release carries the fingerprint of its restored file");
 
         // Two files are deleted again; the next restore extracts exactly those two.
         std::fs::remove_file(&paths[0]).unwrap();
@@ -2030,7 +2034,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let err = update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5)), "/orig/L.fits").unwrap_err();
+        let err = update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap_err();
         assert!(format!("{err:#}").contains("injected"), "{err:#}");
         let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
             .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
@@ -2041,7 +2045,7 @@ pub(crate) mod tests {
         assert!(conn.is_autocommit(), "no transaction is left open");
 
         conn.execute_batch("DROP TRIGGER no_release").unwrap();
-        update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5)), "/orig/L.fits").unwrap();
+        update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap();
         let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
             .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))

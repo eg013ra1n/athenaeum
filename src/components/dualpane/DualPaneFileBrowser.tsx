@@ -2263,28 +2263,28 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
         <div
           key={`other:${o.name}`}
           aria-disabled="true"
-          title={o.releasedTo ? `Unpacked to ${o.releasedTo}` : 'Not a cataloged frame — nothing here opens it'}
-          className={`w-full flex items-center gap-2 px-2 py-1 text-content-muted cursor-default ${o.releasedTo != null ? '' : 'opacity-70'}`}
+          title={o.copyPath ? `Unpacked to ${o.copyPath}` : 'Not a cataloged frame — nothing here opens it'}
+          className={`w-full flex items-center gap-2 px-2 py-1 text-content-muted cursor-default ${o.released ? '' : 'opacity-70'}`}
         >
           <FileIcon size={14} className="text-content-muted" />
           <span className="truncate font-mono">{o.name}</span>
-          {o.releasedTo != null && (
-            o.releasedPresent ? (
-              <Chip tone="info" title={`Unpacked to ${o.releasedTo}`}>unpacked</Chip>
+          {o.released && (
+            o.copyPath != null ? (
+              <Chip tone="info" title={`Unpacked to ${o.copyPath}`}>unpacked</Chip>
             ) : (
               <Chip
                 tone="warn"
-                title={`The unpacked copy ${o.releasedTo} is gone from disk. The next scan of this zip takes its catalog row back into the zip.`}
+                title="The unpacked copy is gone from disk. Rescan this zip's folder and the frame returns to the zip."
               >
-                unpacked copy missing
+                unpacked copy missing — rescan to restore
               </Chip>
             )
           )}
-          {o.releasedTo != null && o.releasedPresent && (
+          {o.copyPath != null && (
             <button
               type="button"
-              onClick={(e) => { e.stopPropagation(); onLocate(o.releasedTo as string); }}
-              title={`Show ${o.releasedTo} in the browser`}
+              onClick={(e) => { e.stopPropagation(); onLocate(o.copyPath as string); }}
+              title={`Show ${o.copyPath} in the browser`}
               className="text-xs text-accent hover:underline"
             >
               Locate

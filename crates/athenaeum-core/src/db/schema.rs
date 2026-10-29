@@ -2546,27 +2546,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
-    // Where an unpacked or restored entry went (NULL for rows that predate the column or whose copy the
-    // catalog was never told about). The scan reads it to fall back to the zip when the copy is deleted.
-    if !column_exists(conn, "zip_released_entries", "released_to")? {
-        conn.execute("ALTER TABLE zip_released_entries ADD COLUMN released_to TEXT", [])?;
+    // The header fingerprint of the catalog row at the moment the entry was released. The zip scan keeps a
+    // release only while a disk row with this fingerprint has its file on disk (NULL = no owner).
+    if !column_exists(conn, "zip_released_entries", "header_fingerprint")? {
+        conn.execute("ALTER TABLE zip_released_entries ADD COLUMN header_fingerprint TEXT", [])?;
     }
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_zip_released_to ON zip_released_entries(released_to) WHERE released_to IS NOT NULL",
-        [],
-    )?;
-    // Any path change of the row (a rename, a folder rename's prefix swap, a move, a relink, the scanner's
-    // moved-file rule) carries the release along, in the statement's own transaction, so the zip view's
-    // Locate and the fall-back to the zip keep pointing at the copy.
-    conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS zip_released_follows_path
-         AFTER UPDATE OF path ON files
-         WHEN OLD.path IS NOT NEW.path
-         BEGIN
-             UPDATE zip_released_entries SET released_to = NEW.path WHERE released_to = OLD.path;
-         END",
-        [],
-    )?;
+    // Databases of the unshipped branch carry the columns and the trigger of the earlier release models
+    // (`released_to` and its path trigger/index, the entry CRC). A release keeps the fingerprint of the row
+    // at its old `released_to` before the column goes.
+    conn.execute("DROP TRIGGER IF EXISTS zip_released_follows_path", [])?;
+    conn.execute("DROP INDEX IF EXISTS idx_zip_released_to", [])?;
+    if column_exists(conn, "zip_released_entries", "released_to")? {
+        conn.execute(
+            "UPDATE zip_released_entries SET header_fingerprint = (
+                 SELECT fh.header_fingerprint FROM files f INNER JOIN fits_header fh ON fh.file_id = f.id
+                 WHERE f.path = zip_released_entries.released_to AND f.archive_zip_path IS NULL)
+             WHERE header_fingerprint IS NULL AND released_to IS NOT NULL",
+            [],
+        )?;
+        conn.execute("ALTER TABLE zip_released_entries DROP COLUMN released_to", [])?;
+    }
+    if column_exists(conn, "zip_released_entries", "entry_crc32")? {
+        conn.execute("ALTER TABLE zip_released_entries DROP COLUMN entry_crc32", [])?;
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS black_hole_zips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5664,13 +5666,17 @@ mod zip_schema_tests {
     use rusqlite::Connection;
 
     #[test]
-    fn a_release_recorded_before_released_to_existed_keeps_a_null_copy() {
+    fn a_database_with_the_earlier_release_columns_is_migrated_and_keeps_the_fingerprint() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // The table as an older build left it.
+        // The table as the earlier builds of this branch left it.
         conn.execute_batch(
-            "DROP TRIGGER zip_released_follows_path; DROP INDEX idx_zip_released_to;
-             ALTER TABLE zip_released_entries DROP COLUMN released_to;",
+            "ALTER TABLE zip_released_entries DROP COLUMN header_fingerprint;
+             ALTER TABLE zip_released_entries ADD COLUMN released_to TEXT;
+             ALTER TABLE zip_released_entries ADD COLUMN entry_crc32 INTEGER;
+             CREATE INDEX idx_zip_released_to ON zip_released_entries(released_to) WHERE released_to IS NOT NULL;
+             CREATE TRIGGER zip_released_follows_path AFTER UPDATE OF path ON files
+             BEGIN UPDATE zip_released_entries SET released_to = NEW.path WHERE released_to = OLD.path; END;",
         )
         .unwrap();
         conn.execute(
@@ -5678,13 +5684,27 @@ mod zip_schema_tests {
             [],
         )
         .unwrap();
-        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (1, 'a.fits')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (7, '/out/a.fits', 'a.fits', 1, 'm', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (7, '', 'fp-a')", []).unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (1, 'a.fits', '/out/a.fits')", []).unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path, released_to) VALUES (1, 'b.fits', NULL)", []).unwrap();
         init_db(&conn).unwrap();
         init_db(&conn).unwrap();
-        let to: Option<String> = conn
-            .query_row("SELECT released_to FROM zip_released_entries WHERE entry_path = 'a.fits'", [], |r| r.get(0))
+        assert!(!column_exists(&conn, "zip_released_entries", "released_to").unwrap());
+        assert!(!column_exists(&conn, "zip_released_entries", "entry_crc32").unwrap());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('zip_released_follows_path', 'idx_zip_released_to')", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(to, None);
+        assert_eq!(n, 0, "the trigger and the index are gone");
+        let fp = |entry: &str| -> Option<String> {
+            conn.query_row("SELECT header_fingerprint FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(fp("a.fits").as_deref(), Some("fp-a"));
+        assert_eq!(fp("b.fits"), None, "a release with no known copy has no owner");
     }
 
     #[test]
@@ -5703,7 +5723,8 @@ mod zip_schema_tests {
             assert_eq!(n, 1, "{t}");
         }
         assert!(column_exists(&conn, "files", "archive_entry_crc32").unwrap());
-        assert!(column_exists(&conn, "zip_released_entries", "released_to").unwrap());
+        assert!(column_exists(&conn, "zip_released_entries", "header_fingerprint").unwrap());
+        assert!(!column_exists(&conn, "zip_released_entries", "released_to").unwrap());
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_files_archive_zip_path'",
