@@ -16,7 +16,7 @@ use crate::routes::api_err;
 use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
+pub use athenaeum_core::api::zip::{RescanAfterVoid, UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
 pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
@@ -168,4 +168,77 @@ pub async fn estimate_zip_extraction(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip extraction estimate task panicked: {}", e)))?
     .map_err(api_err)?;
     Ok(Json(estimate))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescanAfterVoidArgs {
+    #[serde(default)]
+    pub dirs: Vec<String>,
+}
+
+/// POST /api/rescan_after_void
+///
+/// Folders outside the host's allowed roots are skipped by the shared handler; the scan runs under
+/// `spawn_blocking`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn rescan_after_void(
+    State(state): State<WebAppState>,
+    Json(args): Json<RescanAfterVoidArgs>,
+) -> Result<Json<RescanAfterVoid>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let done = tokio::task::spawn_blocking(move || api::rescan_after_void(&ctx, args.dirs, &policy))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Rescan after void task panicked: {}", e)))?
+        .map_err(api_err)?;
+    Ok(Json(done))
+}
+
+#[cfg(test)]
+mod rescan_after_void_tests {
+    use super::*;
+    use athenaeum_core::db::Database;
+    use tempfile::TempDir;
+
+    /// `routes::tests::test_state` leaves the database unset; this one gets a real catalog with one scan root.
+    fn state_with_root(tmp: &TempDir, root: &std::path::Path, allowed: Vec<PathBuf>) -> WebAppState {
+        let mut state = crate::routes::tests::test_state(None);
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        db.conn().execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+        let ctx = std::sync::Arc::get_mut(&mut state.ctx).expect("the test state owns its context");
+        ctx.db.set(db).ok().expect("the test state has no database yet");
+        state.allowed_paths = allowed;
+        state
+    }
+
+    #[tokio::test]
+    async fn the_route_rescans_a_folder_under_a_root_and_skips_one_outside_the_allowed_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.to_string_lossy().into_owned();
+
+        let open = state_with_root(&tmp, &root, Vec::new());
+        let Json(done) = rescan_after_void(State(open), Json(RescanAfterVoidArgs { dirs: vec![dir.clone()] }))
+            .await
+            .expect("rescan");
+        assert_eq!(done, RescanAfterVoid { directories: 1, zips: 0 });
+        let db_dir2 = TempDir::new().unwrap();
+        let Json(done) = rescan_after_void(
+            State(state_with_root(&db_dir2, &root, Vec::new())),
+            Json(RescanAfterVoidArgs { dirs: vec![tmp.path().join("elsewhere").to_string_lossy().into_owned()] }),
+        )
+        .await
+        .expect("rescan");
+        assert_eq!(done, RescanAfterVoid::default(), "a folder under no scan root is skipped, not an error");
+
+        let sandbox = TempDir::new().unwrap();
+        let db_dir3 = TempDir::new().unwrap();
+        let confined = state_with_root(&db_dir3, &root, vec![sandbox.path().to_path_buf()]);
+        let Json(done) = rescan_after_void(State(confined), Json(RescanAfterVoidArgs { dirs: vec![dir] }))
+            .await
+            .expect("rescan");
+        assert_eq!(done, RescanAfterVoid::default(), "a folder outside the allowed paths is skipped");
+    }
 }

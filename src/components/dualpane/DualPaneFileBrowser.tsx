@@ -67,7 +67,7 @@ import {
 } from '../export/lightCalPrefs';
 import CatalogSearch from './CatalogSearch';
 import { ZipBlackHoleDialog } from './ZipBlackHoleDialog';
-import { ZipEntryDialog, ZipEntrySummary } from './ZipEntryView';
+import { ZipEntryDialog } from './ZipEntryView';
 import MetadataPane from './MetadataPane';
 import {
   ZIP_DEST_NOTE,
@@ -79,6 +79,11 @@ import {
   zipCrumbs,
   zipFramesLabel,
   zipUpLabel,
+  ZIP_ENTRY_KEY_PREFIX,
+  zipEntryKey,
+  isZipEntryKey,
+  withoutZipEntryKeys,
+  zipEntryRows,
   type ZipLocation,
 } from './zipView';
 import {
@@ -188,12 +193,14 @@ interface Props {
 /** One step "up" from a pane: out of a zip, or to a parent folder. */
 type UpMove = { kind: 'leave' } | { kind: 'inner'; innerDir: string } | { kind: 'cwd'; cwd: string };
 
-/** Every selectable row of a listing in display order: folders, zips, then files. */
-function listingKeys(listing: DirectoryListing): string[] {
+/** Every selectable row of a listing in display order: folders, zips, files, then (inside a zip) the readable
+ *  entries the catalog holds no row for. */
+function listingKeys(listing: DirectoryListing, zip?: ZipLocation | null): string[] {
   return [
     ...listing.subdirectories,
     ...(listing.zips ?? []).map((z) => z.path),
     ...listing.files.map((f) => f.file.path),
+    ...zipEntryRows(listing, zip).map((r) => r.key),
   ];
 }
 
@@ -422,6 +429,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const [mkdirState, setMkdirState] = useState<{ destDir: string } | null>(null);
   const [renameState, setRenameState] = useState<{ oldPath: string; oldName: string } | null>(null);
   const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
+  /** The entry (a frame of a zip with no catalog row) whose preview and metadata dialog is open. */
+  const [viewZipEntry, setViewZipEntry] = useState<{ zipPath: string; entry: string } | null>(null);
   /** "Send to…" — resolves the active-pane selection (file/folder paths) to
    *  catalog frame ids, then opens the reusable SendToNodeDialog. `sendResolving`
    *  guards against a double-invoke while the async resolve is in flight. */
@@ -692,7 +701,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const enqueueMove = useCallback(async () => {
     const active = state.panes[state.activePane];
     const inactive = state.panes[state.activePane === 'left' ? 'right' : 'left'];
-    const sources = Array.from(active.selection);
+    // A zip-entry key is a row of the zip view, not a path: it never reaches a command.
+    const sources = withoutZipEntryKeys(active.selection);
     if (sources.length === 0) return;
     if (!inactive.cwd) return;
     // A zip is read-only: nothing inside it moves, and nothing can be moved into it.
@@ -862,10 +872,10 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     if (active.zip) {
       // Entries have no place on disk; show the zip file itself.
       target = active.zip.path;
-    } else if (active.anchor && active.anchor !== PARENT_ROW) {
+    } else if (active.anchor && active.anchor !== PARENT_ROW && !isZipEntryKey(active.anchor)) {
       target = active.anchor;
     } else if (active.selection.size >= 1) {
-      target = active.selection.values().next().value ?? null;
+      target = withoutZipEntryKeys(active.selection)[0] ?? null;
     }
     if (!target) target = active.cwd;
     if (!target) return;
@@ -877,7 +887,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   // Rename handler: F2.
   const openRename = useCallback(() => {
     const active = state.panes[state.activePane];
-    const sel = Array.from(active.selection);
+    const sel = withoutZipEntryKeys(active.selection);
     if (sel.length !== 1 || active.zip) return;
     const oldPath = sel[0];
     const sep = oldPath.includes('\\') ? '\\' : '/';
@@ -1021,7 +1031,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     if (!listing) return [];
     const order: string[] = [];
     if (upMove(pane) !== null) order.push(PARENT_ROW);
-    order.push(...listingKeys(listing));
+    order.push(...listingKeys(listing, state.panes[pane].zip));
     return order;
   }, [visibleListing, upMove]);
 
@@ -1052,7 +1062,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     // Frames inside a zip (an inner folder, or a zip row) are not sent: the sender reads files on disk.
     // Say so instead of "No cataloged frames"; a mixed selection sends its disk part.
     const zipRows = new Set((listings[state.activePane]?.zips ?? []).map((z) => z.path));
-    const paths = active.zip ? [] : [...active.selection].filter((p) => !zipRows.has(p));
+    const paths = active.zip ? [] : withoutZipEntryKeys(active.selection).filter((p) => !zipRows.has(p));
     if (paths.length === 0) {
       notify({ title: ZIP_SEND_TITLE, detail: ZIP_SEND_DETAIL, kind: 'sync', tone: 'info' });
       return;
@@ -1107,6 +1117,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       if (move) applyUp(state.activePane, move);
       return;
     }
+    if (isZipEntryKey(path)) {
+      // A rowless entry of the open zip: Enter reads it like a double-click does.
+      if (active.zip) setViewZipEntry({ zipPath: active.zip.path, entry: path.slice(ZIP_ENTRY_KEY_PREFIX.length) });
+      return;
+    }
     // Always check the raw listing for membership — even filtered-out folders
     // shouldn't be activatable, but selection clears on filter so this is a
     // belt-and-braces guard. visibleListing captures both filter + sort.
@@ -1126,7 +1141,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   // True when ANY confirm/prompt dialog is open. Pane shortcuts (F-keys,
   // Tab, Cmd+I, Cmd+A, Space, Enter, arrows) are suppressed in
   // that case so they can't accidentally fire underneath the dialog.
-  const isModalOpen = !!(confirmMove || confirmDelete || mkdirState || renameState || blinkFrames || sendOpen);
+  const isModalOpen = !!(confirmMove || confirmDelete || mkdirState || renameState || blinkFrames || sendOpen || viewZipEntry);
 
   // Modal-only key handler: ESC cancels any dialog; Y/Enter confirms simple
   // Move/Delete dialogs. Mkdir/Rename prompts handle their own Enter/Escape
@@ -1201,7 +1216,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         const listing = visibleListing(state.activePane);
         if (!listing) return;
         e.preventDefault();
-        const all = new Set<string>(listingKeys(listing));
+        const all = new Set<string>(listingKeys(listing, state.panes[state.activePane].zip));
         dispatch({ type: 'set_selection', pane: state.activePane, selection: all });
       } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && !e.altKey && !e.metaKey) {
         const order = keyboardOrder(state.activePane);
@@ -1278,8 +1293,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     for (const z of activePaneListing.zips ?? []) {
       if (activePaneSelection.has(z.path)) bytes += z.size;
     }
+    for (const r of zipEntryRows(activePaneListing, state.panes[state.activePane].zip)) {
+      if (activePaneSelection.has(r.key)) bytes += r.size;
+    }
     return { count: activePaneSelection.size, bytes };
-  }, [activePaneListing, activePaneSelection]);
+  }, [activePaneListing, activePaneSelection, state.panes, state.activePane]);
 
   return (
     // Fill the parent flex cell. FileManager's wrapper is `h-full flex flex-col
@@ -1323,7 +1341,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
                 const listing = visibleListing(state.activePane);
                 if (!listing) return;
                 const cur = state.panes[state.activePane].selection;
-                const all = listingKeys(listing);
+                const all = listingKeys(listing, state.panes[state.activePane].zip);
                 const inverted = new Set<string>();
                 for (const p of all) {
                   if (!cur.has(p)) inverted.add(p);
@@ -1464,6 +1482,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
             dispatch({ type: 'set_selection', pane: 'left', selection: new Set([path]), anchor: path });
             dispatch({ type: 'set_mode', pane: 'right', mode: 'metadata' });
           }}
+          onViewEntry={(entry) => { const z = state.panes.left.zip; if (z) setViewZipEntry({ zipPath: z.path, entry }); }}
+          otherZip={state.panes.right.zip}
           scanRoots={leftScanRoots}
         />
         <Pane
@@ -1502,6 +1522,8 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
             dispatch({ type: 'set_selection', pane: 'right', selection: new Set([path]), anchor: path });
             dispatch({ type: 'set_mode', pane: 'left', mode: 'metadata' });
           }}
+          onViewEntry={(entry) => { const z = state.panes.right.zip; if (z) setViewZipEntry({ zipPath: z.path, entry }); }}
+          otherZip={state.panes.left.zip}
           scanRoots={scanRoots}
         />
       </div>
@@ -1694,6 +1716,10 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         // so once per open, not once per render of this component.
         lightCalOptions={sendLightCalOptions}
       />
+
+      {viewZipEntry && (
+        <ZipEntryDialog zipPath={viewZipEntry.zipPath} entry={viewZipEntry.entry} onClose={() => setViewZipEntry(null)} />
+      )}
     </div>
   );
 }
@@ -1857,6 +1883,10 @@ interface PaneProps {
   /** Double-clicking an image file row in this pane opens the OTHER pane's
    *  metadata editor focused on that file. */
   onOpenMetadata: (path: string) => void;
+  /** Double-click on a frame entry of the open zip that has no catalog row: preview and metadata dialog. */
+  onViewEntry: (entry: string) => void;
+  /** Where the OTHER pane is inside a zip, so its rowless-entry selection can be read in the metadata pane. */
+  otherZip: ZipLocation | null;
   scanRoots: ScanRootWithAvailability[];
 }
 
@@ -1885,6 +1915,8 @@ function Pane({
   onLocate,
   onMetaSaved,
   onOpenMetadata,
+  onViewEntry,
+  otherZip,
   scanRoots,
 }: PaneProps) {
   // The pane is clamped to the scan root that contains its current cwd.
@@ -1985,8 +2017,8 @@ function Pane({
           )}
           {state.filterText && rawListing && listing && (
             <span className="text-content-muted whitespace-nowrap">
-              {listingKeys(listing).length}
-              /{listingKeys(rawListing).length}
+              {listingKeys(listing, state.zip).length}
+              /{listingKeys(rawListing, state.zip).length}
             </span>
           )}
           <button
@@ -2008,6 +2040,7 @@ function Pane({
           <MetadataPane
             otherListing={otherListing}
             otherSelection={otherSelection}
+            otherZip={otherZip}
             onSaved={onMetaSaved}
           />
         )}
@@ -2027,6 +2060,7 @@ function Pane({
               onToggleSelect={onToggleSelect}
               onSetSelection={onSetSelection}
               onOpenMetadata={onOpenMetadata}
+              onViewEntry={onViewEntry}
             />
           </div>
         )}
@@ -2057,6 +2091,8 @@ interface FileListProps {
   onSetSelection: (selection: Set<string>, anchor?: string | null) => void;
   /** Called when a double-click on an image file row (frame present) is detected. */
   onOpenMetadata: (path: string) => void;
+  /** Double-click on a rowless frame entry of the open zip. */
+  onViewEntry: (entry: string) => void;
 }
 
 /** Field labels for the missing-metadata tooltip on file rows. Order matches
@@ -2084,7 +2120,7 @@ function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
   return keys.filter((k) => flags[k]);
 }
 
-function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpenFolder, onOpenZip, onLocate, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
+function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpenFolder, onOpenZip, onLocate, onToggleSelect, onSetSelection, onOpenMetadata, onViewEntry }: FileListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the focused (anchor) row visible — fires when cursor crosses the
   // viewport edge from arrow-key navigation.
@@ -2098,7 +2134,7 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
   }, [anchor]);
   // Visual order of all rows — folders first, then files. Used by shift+click
   // to compute the inclusive range from the anchor to the clicked path.
-  const orderedPaths: string[] = listingKeys(listing);
+  const orderedPaths: string[] = listingKeys(listing, zip);
 
   const handleClick = (e: React.MouseEvent, path: string) => {
     if (e.shiftKey && anchor) {
@@ -2144,22 +2180,6 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
       fileClickRef.current = { path: f.file.path, at: now };
     }
     handleClick(e, f.file.path);
-  };
-
-  // Entries of the open zip the catalog holds no row for: one click picks (its header is read), a second
-  // within 400 ms opens the metadata and preview dialog.
-  const [pickedEntry, setPickedEntry] = useState<string | null>(null);
-  const [viewEntry, setViewEntry] = useState<string | null>(null);
-  const entryClickRef = useRef<{ entry: string; at: number }>({ entry: '', at: 0 });
-  const onEntryClick = (entry: string) => {
-    const now = Date.now();
-    if (entryClickRef.current.entry === entry && now - entryClickRef.current.at < 400) {
-      entryClickRef.current = { entry: '', at: 0 };
-      setViewEntry(entry);
-      return;
-    }
-    entryClickRef.current = { entry, at: now };
-    setPickedEntry(entry);
   };
 
   const parentClickRef = useRef<number>(0);
@@ -2279,23 +2299,24 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
       {zip && (listing.otherEntries ?? []).map((o) => {
         const entry = zip.innerDir ? `${zip.innerDir}/${o.name}` : o.name;
         if (o.readable) {
-          // A frame entry the catalog has no row for: it reads like a frame (metadata when picked, a preview
-          // on double-click) straight from the zip, and a scan catalogs it later.
-          const picked = pickedEntry === entry;
+          // A frame entry the catalog has no row for: an ordinary row of the pane selection. Its metadata is in
+          // the metadata pane (⌘I), its preview opens on double-click, and a scan catalogs it later.
+          const key = zipEntryKey(entry);
+          const isSel = selection.has(key);
           return (
-            <div key={`other:${o.name}`} data-row-key={`zip-entry:${entry}`}>
+            <div key={`other:${o.name}`} data-row-key={key}>
               <button
-                onClick={() => onEntryClick(entry)}
+                onClick={(e) => handleClick(e, key)}
+                onDoubleClick={() => onViewEntry(entry)}
                 title="Not in the catalog yet — double-click to read it from the zip"
                 className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
-                  picked ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
+                  isSel ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
                 }`}
               >
-                <FileIcon size={14} className={picked ? 'text-accent' : 'text-content-muted'} />
+                <FileIcon size={14} className={isSel ? 'text-accent' : 'text-content-muted'} />
                 <span className="truncate font-mono">{o.name}</span>
                 <span className="ml-auto text-xs text-content-muted">{formatBytes(o.size)}</span>
               </button>
-              {picked && <ZipEntrySummary zipPath={zip.path} entry={entry} />}
             </div>
           );
         }
@@ -2323,8 +2344,7 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
           </div>
         );
       })}
-      {zip && viewEntry && <ZipEntryDialog zipPath={zip.path} entry={viewEntry} onClose={() => setViewEntry(null)} />}
-      {listingKeys(listing).length === 0 && (listing.otherEntries ?? []).length === 0 && (
+      {listingKeys(listing, zip).length === 0 && (listing.otherEntries ?? []).length === 0 && (
         <div className="p-3 text-content-muted text-xs italic">{zip ? 'Nothing at this level of the zip.' : 'Empty directory.'}</div>
       )}
     </div>

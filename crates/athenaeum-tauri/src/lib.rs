@@ -428,6 +428,7 @@ pub fn run() {
             commands::get_zip_cache_status,
             commands::clear_zip_cache,
             commands::estimate_zip_extraction,
+            commands::rescan_after_void,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

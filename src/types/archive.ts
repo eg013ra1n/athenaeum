@@ -125,3 +125,14 @@ frame: Frame,
  */
 header: string, };
 
+export type RescanAfterVoid = { 
+/**
+ * Folders rescanned (a folder outside every available scan root is not counted).
+ */
+directories: number, 
+/**
+ * Zips read: those directly in a rescanned folder, and those elsewhere holding an unpacked entry whose
+ * copy's catalog row is gone.
+ */
+zips: number, };
+

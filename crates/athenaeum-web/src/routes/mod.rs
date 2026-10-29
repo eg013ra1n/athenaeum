@@ -322,6 +322,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_zip_cache_status", post(zip::get_zip_cache_status))
         .route("/api/clear_zip_cache", post(zip::clear_zip_cache))
         .route("/api/estimate_zip_extraction", post(zip::estimate_zip_extraction))
+        .route("/api/rescan_after_void", post(zip::rescan_after_void))
         // Personal sync (Stage I, task A7)
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))

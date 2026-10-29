@@ -42,26 +42,122 @@ function useZipEntryHeader(zipPath: string, entry: string): { header: ZipEntryHe
   return state;
 }
 
-function summaryParts(h: ZipEntryHeader): string[] {
-  const f = h.frame;
+type FrameRow = [label: string, value: string | number | null | undefined];
+
+/** The dialog's rows for one entry. */
+function dialogRows(f: ZipEntryHeader['frame']): FrameRow[] {
   return [
-    f.object,
-    f.filter,
-    f.imagetyp,
-    f.exptime != null ? `${f.exptime} s` : null,
-    f.date_obs ? f.date_obs.slice(0, 10) : null,
-  ].filter((p): p is string => !!p);
+    ['Object', f.object],
+    ['Type', f.imagetyp],
+    ['Filter', f.filter],
+    ['Exposure', f.exptime != null ? `${f.exptime} s` : null],
+    ['Date', f.date_obs],
+    ['Camera', f.instrume],
+    ['Telescope', f.telescop],
+    ['Gain / offset', f.gain != null || f.offset != null ? `${f.gain ?? '–'} / ${f.offset ?? '–'}` : null],
+    ['Size', f.naxis1 != null && f.naxis2 != null ? `${f.naxis1} × ${f.naxis2}` : null],
+  ];
 }
 
-/** One muted line under a selected entry row: what the header says. */
-export function ZipEntrySummary({ zipPath, entry }: { zipPath: string; entry: string }) {
-  const { header, error } = useZipEntryHeader(zipPath, entry);
-  if (error) return <div className="px-8 pb-1 text-xs text-error" role="alert">{error}</div>;
-  if (!header) return <div className="px-8 pb-1 text-xs text-content-muted">Reading the header…</div>;
-  const parts = summaryParts(header);
+/** Metadata-pane fields, labelled and ordered like the editor's: what the header gives, read-only. */
+const PANE_FIELDS: Array<[label: string, read: (f: ZipEntryHeader['frame']) => string | number | null | undefined]> = [
+  ['OBJECT', (f) => f.object],
+  ['FILTER', (f) => f.filter],
+  ['IMAGETYP', (f) => f.imagetyp],
+  ['CAMERA (INSTRUME)', (f) => f.instrume],
+  ['TELESCOP', (f) => f.telescop],
+  ['FOCALLEN (mm)', (f) => f.focallen],
+  ['GAIN', (f) => f.gain],
+  ['OFFSET', (f) => f.offset],
+  ['XPIXSZ (µm)', (f) => f.xpixsz],
+  ['BINNING', (f) => f.binning],
+  ['EXPTIME (s)', (f) => f.exptime],
+  ['CCD-TEMP (°C)', (f) => f.ccd_temp],
+  ['DATE-OBS (ISO)', (f) => f.date_obs],
+  ['RA', (f) => f.ra],
+  ['DEC', (f) => f.dec],
+  ['SIZE', (f) => (f.naxis1 != null && f.naxis2 != null ? `${f.naxis1} × ${f.naxis2}` : null)],
+];
+
+/** How many headers are read at once when a selection holds many entries. */
+const HEADER_READS_AT_ONCE = 4;
+
+type HeaderResult = { header: ZipEntryHeader } | { error: string };
+
+/** The headers of several zip entries, read a few at a time while they are shown; a new `entries` list drops
+ *  what was read. `results` fills as the reads finish. */
+function useZipEntryHeaders(zipPath: string, entries: string[]): Map<string, HeaderResult> {
+  const [results, setResults] = useState<Map<string, HeaderResult>>(new Map());
+  const entriesKey = entries.join('\n');
+  useEffect(() => {
+    let cancelled = false;
+    setResults(new Map());
+    const queue = entriesKey ? entriesKey.split('\n') : [];
+    const worker = async () => {
+      for (let entry = queue.shift(); entry !== undefined; entry = queue.shift()) {
+        let result: HeaderResult;
+        try {
+          result = { header: await api.invoke<ZipEntryHeader>('get_zip_entry_header', { zipPath, entry }) };
+        } catch (err) {
+          console.error('[ZipEntryView] get_zip_entry_header failed:', err);
+          result = { error: String(err) };
+        }
+        if (cancelled) return;
+        const done = entry;
+        setResults((prev) => new Map(prev).set(done, result));
+      }
+    };
+    for (let i = 0; i < HEADER_READS_AT_ONCE; i += 1) void worker();
+    return () => {
+      cancelled = true;
+    };
+  }, [zipPath, entriesKey]);
+  return results;
+}
+
+/** The metadata pane's view of frame entries of a zip that the catalog holds no row for: what their headers
+ *  say, in the editor's field order, read-only (there is no row to write to; a scan catalogs the entries). */
+export function ZipEntriesMetadata({ zipPath, entries }: { zipPath: string; entries: string[] }) {
+  const results = useZipEntryHeaders(zipPath, entries);
+  const loaded = entries.flatMap((e) => {
+    const r = results.get(e);
+    return r && 'header' in r ? [r.header] : [];
+  });
+  const failed = entries.flatMap((e) => {
+    const r = results.get(e);
+    return r && 'error' in r ? [r.error] : [];
+  });
+  const pending = entries.length - loaded.length - failed.length;
+  const rows = PANE_FIELDS.map(([label, read]) => {
+    const values = new Set(loaded.map((h) => {
+      const v = read(h.frame);
+      return v == null || v === '' ? '' : String(v);
+    }));
+    return [label, values.size > 1 ? '(varies)' : [...values][0] ?? ''] as [string, string];
+  }).filter(([, v]) => v !== '');
+  const single = entries.length === 1 ? loaded[0] : undefined;
+
   return (
-    <div className="px-8 pb-1 text-xs text-content-muted" data-testid="zip-entry-summary">
-      {parts.length > 0 ? parts.join(' · ') : 'The header names no object, filter or exposure.'}
+    <div className="space-y-2.5 p-4 text-sm" data-testid="zip-entries-metadata">
+      <div className="text-content-muted" title={entries.length === 1 ? `${zipPath}/${entries[0]}` : zipPath}>
+        {entries.length} {entries.length === 1 ? 'entry' : 'entries'} read from {getBasename(zipPath)}
+        <span className="ml-2 text-xs">not in the catalog yet; a scan adds {entries.length === 1 ? 'it' : 'them'}</span>
+      </div>
+      {pending > 0 && <div className="text-xs text-content-muted">Reading the header{entries.length === 1 ? '' : 's'}… {loaded.length + failed.length} of {entries.length}</div>}
+      {failed.length > 0 && (
+        <div className="text-xs text-error" role="alert">
+          {failed.length === 1 ? failed[0] : `${failed.length} headers could not be read: ${failed[0]}`}
+        </div>
+      )}
+      {loaded.length > 0 && (rows.length > 0
+        ? <KV items={rows} />
+        : <div className="text-xs text-content-muted">The header names no object, filter or exposure.</div>)}
+      {single && (
+        <details>
+          <summary className="cursor-pointer text-xs text-content-muted">Header</summary>
+          <pre className="mt-1.5 max-h-[220px] overflow-auto rounded bg-surface-elevated p-2 text-[11px]">{single.header}</pre>
+        </details>
+      )}
     </div>
   );
 }
@@ -95,20 +191,7 @@ export function ZipEntryDialog({ zipPath, entry, onClose }: { zipPath: string; e
     };
   }, [zipPath, entry]);
 
-  const f = header?.frame;
-  const rows: [string, string | number | null | undefined][] = f
-    ? [
-        ['Object', f.object],
-        ['Type', f.imagetyp],
-        ['Filter', f.filter],
-        ['Exposure', f.exptime != null ? `${f.exptime} s` : null],
-        ['Date', f.date_obs],
-        ['Camera', f.instrume],
-        ['Telescope', f.telescop],
-        ['Gain / offset', f.gain != null || f.offset != null ? `${f.gain ?? '–'} / ${f.offset ?? '–'}` : null],
-        ['Size', f.naxis1 != null && f.naxis2 != null ? `${f.naxis1} × ${f.naxis2}` : null],
-      ]
-    : [];
+  const rows = header ? dialogRows(header.frame) : [];
 
   return (
     <DialogShell

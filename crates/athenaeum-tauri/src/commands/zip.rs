@@ -15,7 +15,7 @@ use crate::tauri_events::TauriProgressEmitter;
 
 use super::AppState;
 
-pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
+pub use athenaeum_core::api::zip::{RescanAfterVoid, UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
 pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
@@ -126,4 +126,17 @@ pub async fn estimate_zip_extraction(
     .await
     .map_err(|e| format!("Zip extraction estimate task panicked: {}", e))?
     .map_err(|e| e.to_string())
+}
+
+/// After Send to Void: rescans the folders the voided files were deleted from, and every zip holding an
+/// unpacked entry whose copy is gone, so those entries are cataloged again right away. Reads and writes the
+/// catalog under `spawn_blocking`; never deletes a row.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn rescan_after_void(state: State<'_, AppState>, dirs: Vec<String>) -> Result<RescanAfterVoid, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::rescan_after_void(&ctx, dirs, &PathPolicy::AllowAll))
+        .await
+        .map_err(|e| format!("Rescan after void task panicked: {}", e))?
+        .map_err(|e| e.to_string())
 }

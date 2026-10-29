@@ -134,17 +134,18 @@ describe('DualPaneFileBrowser — zips', () => {
     for (const cmd of MUTATIONS) expect(calls(cmd)).toHaveLength(0);
   });
 
-  it('reads the metadata of an entry without a row when it is picked, and previews it on double-click', async () => {
+  it('shows an entry without a row as an ordinary row: no extra line, the preview on double-click', async () => {
     await openZip();
     const row = (await screen.findAllByText('L_008.fits'))[0];
-    expect(calls('get_zip_entry_header')).toHaveLength(0);
+    const button = row.closest('button') as HTMLElement;
     fireEvent.click(row);
-    await waitFor(() => expect(calls('get_zip_entry_header')).toHaveLength(1));
-    expect(calls('get_zip_entry_header')[0][1]).toEqual({ zipPath: ZIP, entry: 'L_008.fits' });
-    expect(await screen.findByTestId('zip-entry-summary')).toHaveTextContent('M31 · Ha · Light · 300 s · 2025-10-12');
+    expect(button).toHaveClass('bg-accent/30');
+    // Metadata is the metadata pane's job: a pick reads nothing and draws nothing under the row.
+    expect(screen.queryByTestId('zip-entry-summary')).toBeNull();
+    expect(calls('get_zip_entry_header')).toHaveLength(0);
     expect(calls('preview_zip_entry')).toHaveLength(0);
 
-    fireEvent.click(row);
+    fireEvent.doubleClick(row);
     await waitFor(() => expect(calls('preview_zip_entry')).toHaveLength(1));
     expect(calls('preview_zip_entry')[0][1]).toEqual({ zipPath: ZIP, entry: 'L_008.fits', resolution: 'preview' });
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
