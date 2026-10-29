@@ -16,7 +16,7 @@ use crate::routes::api_err;
 use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
+pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
 pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
@@ -80,6 +80,30 @@ pub async fn list_zip_entries(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip listing task panicked: {}", e)))?
             .map_err(api_err)?;
     Ok(Json(listing))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZipEntryArgs {
+    pub zip_path: String,
+    pub entry: String,
+}
+
+/// POST /api/get_zip_entry_header
+///
+/// The header and frame metadata of a frame entry the catalog holds no row for, read live from the zip
+/// (`spawn_blocking`); the zip path is checked against the host's allowed roots. Writes nothing.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_zip_entry_header(
+    State(state): State<WebAppState>,
+    Json(args): Json<ZipEntryArgs>,
+) -> Result<Json<ZipEntryHeader>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let header = tokio::task::spawn_blocking(move || api::get_zip_entry_header(&policy, &args.zip_path, &args.entry))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip entry header task panicked: {}", e)))?
+        .map_err(api_err)?;
+    Ok(Json(header))
 }
 
 /// POST /api/get_zip_cache_status

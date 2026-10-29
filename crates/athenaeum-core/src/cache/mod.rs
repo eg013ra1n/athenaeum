@@ -36,6 +36,15 @@ pub fn catalog_preview_cache_key(
     }
 }
 
+/// The preview-cache key of a frame entry of a zip that the catalog holds no row for: the virtual path plus
+/// the zip's and the entry's identity, so a hit needs no extraction. An unreachable zip or a missing entry
+/// fails like a deleted file (`NotFound`).
+pub fn zip_entry_preview_cache_key(zip_path: &str, entry: &str, resolution: &str) -> std::io::Result<String> {
+    let identity = crate::zip_store::materialize::zip_entry_preview_identity(zip_path, entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    Ok(format!("{}:{identity}:{resolution}", crate::zip_store::scan::virtual_path(Path::new(zip_path), entry)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

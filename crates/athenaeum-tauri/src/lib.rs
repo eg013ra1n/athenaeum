@@ -424,6 +424,7 @@ pub fn run() {
             // Zip commands
             commands::unpack_zip_frames,
             commands::list_zip_entries,
+            commands::get_zip_entry_header,
             commands::get_zip_cache_status,
             commands::clear_zip_cache,
             commands::estimate_zip_extraction,
@@ -444,6 +445,7 @@ pub fn run() {
             commands::get_index_status,
             commands::download_index_packs,
             commands_rustafits::read_fits_image_rustafits,
+            commands_rustafits::preview_zip_entry,
             // Archive commands
             commands::get_archive_settings,
             commands::set_archive_root_path,

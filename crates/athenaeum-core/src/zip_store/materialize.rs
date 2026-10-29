@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::cache::{Pinned, ZipCache};
-use super::reader::{entry_crc32_map, extract_entry};
+use super::reader::{entry_crc32_and_size, entry_crc32_map, extract_entry};
 use crate::events::{NullEmitter, ProgressEmitter};
 use crate::services::ServiceContext;
 
@@ -329,6 +329,9 @@ fn verify_extraction(ctx: &ServiceContext, job: &Job) -> std::result::Result<boo
 /// Banks the hashes a verified extraction vouches for, and writes back a CRC32 the row lacked. Failures are
 /// logged; the extraction itself succeeded.
 fn bank_after_extraction(ctx: &ServiceContext, job: &Job, strong_hash: &str, verified: bool) {
+    if job.row.id == NO_ROW {
+        return;
+    }
     let Some(db) = ctx.db.get() else { return };
     let conn = db.conn();
     // A row of ours without a plan row has nothing to verify against: the directory's CRC32 would only
@@ -501,6 +504,57 @@ pub fn materialize_one_cancellable(
     let done = materialize_paths(ctx, &paths, &NullEmitter, "", cancel)?;
     let local = done.local(catalog_path).to_path_buf();
     Ok((local, done.into_pin()))
+}
+
+/// The id a [`ZipRow`] built for an entry no catalog row holds carries. No row has it, so every write-back
+/// keyed on the row id (a learned CRC32, a banked hash) is skipped.
+const NO_ROW: i64 = 0;
+
+/// A frame entry of `zip_path` that the catalog holds no row for, as a [`ZipRow`] for the cache machinery:
+/// keyed like a row of the same zip and entry (zip, entry, the zip's size and mtime, the entry's CRC32).
+fn rowless_entry(zip_path: &str, entry: &str) -> Result<ZipRow> {
+    let zip_name = Path::new(zip_path).file_name().map_or_else(|| zip_path.to_string(), |n| n.to_string_lossy().into_owned());
+    let file_name = entry.rsplit('/').next().unwrap_or(entry);
+    let Some((crc, size)) = entry_crc32_and_size(Path::new(zip_path), entry)
+        .with_context(|| format!("{file_name} is inside {zip_name}, which is not reachable"))?
+    else {
+        bail!("{file_name} is not listed in {zip_name} any more");
+    };
+    Ok(ZipRow {
+        id: NO_ROW,
+        path: crate::zip_store::scan::virtual_path(Path::new(zip_path), entry),
+        zip: zip_path.to_string(),
+        entry: entry.to_string(),
+        crc: Some(crc),
+        size: i64::try_from(size).unwrap_or(i64::MAX),
+        strong_hash_missing: false,
+        content_hash_missing: false,
+        archived_in_operation: None,
+    })
+}
+
+/// [`materialize_one`] for a frame entry the catalog holds no row for (a released entry whose link is gone, a
+/// skipped one, a scan not yet run): the entry is extracted into the zip cache under the same key a row of
+/// that entry would have, and the returned pin keeps the cache file until dropped. Nothing is written to the
+/// catalog.
+pub fn materialize_zip_entry(ctx: &ServiceContext, zip_path: &str, entry: &str) -> Result<(PathBuf, Pinned)> {
+    let db = db_of(ctx)?;
+    refresh_limit(ctx, &db.conn());
+    let mut facts = ZipFacts::default();
+    let job = resolve(&mut facts, &ctx.zip_cache, rowless_entry(zip_path, entry)?)?;
+    let pin = ctx.zip_cache.pin(&job.key);
+    let dest = fetch(ctx, &job, &AtomicBool::new(false))?;
+    Ok((dest, pin))
+}
+
+/// What names the bytes of a rowless entry for a preview-cache key, without extracting: the same
+/// `zip:<zip size>:<zip mtime>:<entry size>:<crc32>` form [`preview_identity`] gives a row of that entry.
+pub fn zip_entry_preview_identity(zip_path: &str, entry: &str) -> Result<String> {
+    let row = rowless_entry(zip_path, entry)?;
+    let file_name = row.entry.rsplit('/').next().unwrap_or_default().to_string();
+    let zip_name = Path::new(&row.zip).file_name().map_or_else(|| row.zip.clone(), |n| n.to_string_lossy().into_owned());
+    let (zip_size, zip_mtime) = zip_identity(&mut ZipFacts::default(), &row, &file_name, &zip_name)?;
+    Ok(format!("zip:{zip_size}:{zip_mtime}:{}:{}", row.size, row.crc.unwrap_or(0)))
 }
 
 /// What names the bytes behind `catalog_path` for a preview-cache key, without extracting: `Ok(None)` for a

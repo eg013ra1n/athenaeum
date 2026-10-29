@@ -130,7 +130,8 @@ fn has_extension(name: &str, wanted: &[&str]) -> bool {
     }
 }
 
-fn is_frame_name(name: &str) -> bool {
+/// `true` for a name with a frame extension (FITS or XISF), whatever the zip holds under it.
+pub fn is_frame_name(name: &str) -> bool {
     has_extension(name, &FRAME_EXTENSIONS)
 }
 

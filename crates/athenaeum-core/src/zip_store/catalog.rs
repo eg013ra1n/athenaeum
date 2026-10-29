@@ -270,14 +270,19 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     Ok(out)
 }
 
-/// The entries of `zip` that were unpacked or restored (its releases), each with the paths of the disk rows
-/// that carry the release's header fingerprint: the candidates for the unpacked copy, empty when the release
-/// has no fingerprint or no such row. Read-only; whether a path exists on disk is for the caller to stat.
+/// The entries of `zip` that were unpacked or restored (its releases), each with the paths that can be its
+/// unpacked copy: the path of the row the release links to when that is a disk row, or, for a release with no
+/// link (a database from before the link), the paths of the disk rows with its fingerprint. Empty when the
+/// release has neither. Read-only; whether a path exists on disk is for the caller to stat (the link is alive
+/// iff one does, as in the scan).
 pub fn released_entries_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(String, Vec<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT r.entry_path, f.path FROM zip_released_entries r
+        "SELECT r.entry_path,
+                CASE WHEN r.file_id IS NOT NULL THEN lf.path ELSE f.path END
+         FROM zip_released_entries r
          INNER JOIN zip_archives z ON z.id = r.zip_id
-         LEFT JOIN fits_header fh ON fh.header_fingerprint = r.header_fingerprint
+         LEFT JOIN files lf ON lf.id = r.file_id AND lf.archive_zip_path IS NULL
+         LEFT JOIN fits_header fh ON r.file_id IS NULL AND fh.header_fingerprint = r.header_fingerprint
          LEFT JOIN files f ON f.id = fh.file_id AND f.archive_zip_path IS NULL
          WHERE z.path = ?1
          ORDER BY r.id, f.id",

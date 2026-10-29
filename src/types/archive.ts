@@ -1,7 +1,7 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-import type { FileWithFrame } from './models';
+import type { FileWithFrame, Frame } from './models';
 
 export type ArchiveDisposition = "move" | "copy" | "skip";
 
@@ -97,12 +97,31 @@ export type ZipOtherEntry = {
  */
 name: string, size: number, 
 /**
- * The entry was unpacked or restored: the catalog holds a release for it.
+ * The entry was unpacked or restored and the link is alive: the row the unpack moved is a disk row whose
+ * file exists (`copy_path`). An entry whose link is gone is not released here: it reads like any other.
  */
 released: boolean, 
 /**
- * The unpacked copy: the path of a disk row with the release's fingerprint whose file exists. `None` for an
- * entry that was not released, and for a released one whose copy is gone (a rescan brings the frame back).
+ * The unpacked copy: the path of the linked row. `None` for an entry that is not (or no longer) released.
  */
-copyPath: string | null, };
+copyPath: string | null, 
+/**
+ * A frame entry with no catalog row and no live link: its header and a preview can be read from the zip
+ * (`get_zip_entry_header`, `preview_zip_entry`) without any catalog write. A scan catalogs it later.
+ */
+readable: boolean, };
+
+export type ZipEntryHeader = { 
+/**
+ * The entry's stored name.
+ */
+entry: string, 
+/**
+ * The frame metadata the header gives, parsed exactly as a scan would (`file_id` is 0: there is no row).
+ */
+frame: Frame, 
+/**
+ * The header as text (`NAME = value` lines), the same text the catalog keeps for a file.
+ */
+header: string, };
 

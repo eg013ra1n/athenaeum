@@ -2542,12 +2542,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             zip_id INTEGER NOT NULL REFERENCES zip_archives(id) ON DELETE CASCADE,
             entry_path TEXT NOT NULL,
+            file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
             UNIQUE(zip_id, entry_path)
         )",
         [],
     )?;
-    // The header fingerprint of the catalog row at the moment the entry was released. The zip scan keeps a
-    // release only while a disk row with this fingerprint has its file on disk (NULL = no owner).
+    // `file_id` is the catalog row the unpack (or the keep-zip restore) moved: the link of the release. It is
+    // alive while that row is a disk row whose file exists; the row going away (Void) clears it.
+    // `header_fingerprint` is only the fallback of a release with no link (a database from before the link:
+    // the fingerprint of the row at the release, kept when more than one disk row carries it).
+    let had_link = column_exists(conn, "zip_released_entries", "file_id")?;
+    if !had_link {
+        conn.execute(
+            "ALTER TABLE zip_released_entries ADD COLUMN file_id INTEGER REFERENCES files(id) ON DELETE SET NULL",
+            [],
+        )?;
+    }
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_zip_released_file_id ON zip_released_entries(file_id)", [])?;
     if !column_exists(conn, "zip_released_entries", "header_fingerprint")? {
         conn.execute("ALTER TABLE zip_released_entries ADD COLUMN header_fingerprint TEXT", [])?;
     }
@@ -2568,6 +2579,22 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     }
     if column_exists(conn, "zip_released_entries", "entry_crc32")? {
         conn.execute("ALTER TABLE zip_released_entries DROP COLUMN entry_crc32", [])?;
+    }
+    if !had_link {
+        // Once, when the link column is added: a release whose fingerprint names exactly one disk row links
+        // to that row; with several (or none) it keeps the fingerprint as its fallback.
+        conn.execute(
+            "UPDATE zip_released_entries SET
+                 file_id = (SELECT f.id FROM files f INNER JOIN fits_header fh ON fh.file_id = f.id
+                            WHERE fh.header_fingerprint = zip_released_entries.header_fingerprint
+                              AND f.archive_zip_path IS NULL),
+                 header_fingerprint = NULL
+             WHERE file_id IS NULL AND header_fingerprint IS NOT NULL
+               AND (SELECT COUNT(DISTINCT f.id) FROM files f INNER JOIN fits_header fh ON fh.file_id = f.id
+                    WHERE fh.header_fingerprint = zip_released_entries.header_fingerprint
+                      AND f.archive_zip_path IS NULL) = 1",
+            [],
+        )?;
     }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS black_hole_zips (
@@ -5666,14 +5693,20 @@ mod zip_schema_tests {
     use rusqlite::Connection;
 
     #[test]
-    fn a_database_with_the_earlier_release_columns_is_migrated_and_keeps_the_fingerprint() {
+    fn a_database_with_the_earlier_release_columns_is_migrated_to_the_link() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         // The table as the earlier builds of this branch left it.
         conn.execute_batch(
-            "ALTER TABLE zip_released_entries DROP COLUMN header_fingerprint;
-             ALTER TABLE zip_released_entries ADD COLUMN released_to TEXT;
-             ALTER TABLE zip_released_entries ADD COLUMN entry_crc32 INTEGER;
+            "DROP TABLE zip_released_entries;
+             CREATE TABLE zip_released_entries (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 zip_id INTEGER NOT NULL REFERENCES zip_archives(id) ON DELETE CASCADE,
+                 entry_path TEXT NOT NULL,
+                 released_to TEXT,
+                 entry_crc32 INTEGER,
+                 UNIQUE(zip_id, entry_path)
+             );
              CREATE INDEX idx_zip_released_to ON zip_released_entries(released_to) WHERE released_to IS NOT NULL;
              CREATE TRIGGER zip_released_follows_path AFTER UPDATE OF path ON files
              BEGIN UPDATE zip_released_entries SET released_to = NEW.path WHERE released_to = OLD.path; END;",
@@ -5703,8 +5736,66 @@ mod zip_schema_tests {
         let fp = |entry: &str| -> Option<String> {
             conn.query_row("SELECT header_fingerprint FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
         };
-        assert_eq!(fp("a.fits").as_deref(), Some("fp-a"));
+        let link = |entry: &str| -> Option<i64> {
+            conn.query_row("SELECT file_id FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+        };
+        // The only disk row with the fingerprint becomes the link; the fingerprint is then not needed.
+        assert_eq!(fp("a.fits"), None);
+        assert_eq!(link("a.fits"), Some(7));
         assert_eq!(fp("b.fits"), None, "a release with no known copy has no owner");
+        assert_eq!(link("b.fits"), None);
+    }
+
+    #[test]
+    fn migration_links_a_release_only_to_the_one_disk_row_with_its_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE zip_released_entries;
+             CREATE TABLE zip_released_entries (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 zip_id INTEGER NOT NULL REFERENCES zip_archives(id) ON DELETE CASCADE,
+                 entry_path TEXT NOT NULL,
+                 header_fingerprint TEXT,
+                 UNIQUE(zip_id, entry_path)
+             );
+             INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES ('/z.zip', 1, 'm', 1, 's');",
+        )
+        .unwrap();
+        for (id, path, fp) in [(1, "/out/one.fits", "fp-one"), (2, "/out/two-a.fits", "fp-two"), (3, "/out/two-b.fits", "fp-two")] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, 'x.fits', 1, 'm', 'FITS')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, '', ?2)", rusqlite::params![id, fp]).unwrap();
+        }
+        // A zip-resident row with the same fingerprint is not a candidate for the link.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (4, '/z.zip/one.fits', 'one.fits', 1, 'm', 'FITS', '/z.zip', 'one.fits')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (4, '', 'fp-one')", []).unwrap();
+        for (entry, fp) in [("one.fits", "fp-one"), ("two.fits", "fp-two"), ("none.fits", "fp-none")] {
+            conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path, header_fingerprint) VALUES (1, ?1, ?2)", [entry, fp]).unwrap();
+        }
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let row = |entry: &str| -> (Option<i64>, Option<String>) {
+            conn.query_row("SELECT file_id, header_fingerprint FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(row("one.fits"), (Some(1), None), "one match: linked");
+        assert_eq!(row("two.fits"), (None, Some("fp-two".into())), "two matches: no link, the fingerprint stays as the fallback");
+        assert_eq!(row("none.fits"), (None, Some("fp-none".into())));
+        // The link goes away with its row.
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute("DELETE FROM files WHERE id = 1", []).unwrap();
+        assert_eq!(row("one.fits"), (None, None));
     }
 
     #[test]
@@ -5724,6 +5815,7 @@ mod zip_schema_tests {
         }
         assert!(column_exists(&conn, "files", "archive_entry_crc32").unwrap());
         assert!(column_exists(&conn, "zip_released_entries", "header_fingerprint").unwrap());
+        assert!(column_exists(&conn, "zip_released_entries", "file_id").unwrap());
         assert!(!column_exists(&conn, "zip_released_entries", "released_to").unwrap());
         let n: i64 = conn
             .query_row(

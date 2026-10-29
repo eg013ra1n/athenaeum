@@ -15,7 +15,7 @@ use crate::tauri_events::TauriProgressEmitter;
 
 use super::AppState;
 
-pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing};
+pub use athenaeum_core::api::zip::{UnpackOutcome, UnpackTarget, ZipDirListing, ZipEntryHeader};
 pub use athenaeum_core::zip_store::cache::ZipCacheStatus;
 pub use athenaeum_core::zip_store::materialize::ExtractionEstimate;
 
@@ -63,6 +63,17 @@ pub async fn list_zip_entries(
     tokio::task::spawn_blocking(move || api::list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_path, &inner_dir))
         .await
         .map_err(|e| format!("Zip listing task panicked: {}", e))?
+        .map_err(|e| e.to_string())
+}
+
+/// The header and frame metadata of a frame entry the catalog holds no row for, read live from the zip's
+/// first bytes (`spawn_blocking`). Writes nothing.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_zip_entry_header(zip_path: String, entry: String) -> Result<ZipEntryHeader, String> {
+    tokio::task::spawn_blocking(move || api::get_zip_entry_header(&PathPolicy::AllowAll, &zip_path, &entry))
+        .await
+        .map_err(|e| format!("Zip entry header task panicked: {}", e))?
         .map_err(|e| e.to_string())
 }
 

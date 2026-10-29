@@ -38,6 +38,8 @@ beforeEach(() => {
   createdByOperation = null;
   inBlackHole = false;
   localStorage.clear();
+  URL.createObjectURL = vi.fn(() => 'blob:preview');
+  URL.revokeObjectURL = vi.fn();
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { innerDir?: string }) => {
     switch (cmd) {
@@ -47,6 +49,14 @@ beforeEach(() => {
           files: [],
           zips: [{ path: ZIP, size: 1_000_000, frameEntries: 3, createdByOperation, inBlackHole }],
         });
+      case 'get_zip_entry_header':
+        return Promise.resolve({
+          entry: (args as { entry?: string } | undefined)?.entry,
+          frame: { object: 'M31', filter: 'Ha', imagetyp: 'Light', exptime: 300, date_obs: '2025-10-12T20:00:00' },
+          header: 'SIMPLE  = T\nOBJECT  = M31',
+        });
+      case 'preview_zip_entry':
+        return Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
       case 'list_zip_entries':
         return Promise.resolve(
           args?.innerDir === 'Lights'
@@ -55,9 +65,9 @@ beforeEach(() => {
                 subdirectories: ['Lights'],
                 files: [frameFile(`${ZIP}/top.fits`, 'top.fits')],
                 otherEntries: [
-                  { name: 'notes.txt', size: 5, released: false, copyPath: null },
-                  { name: 'L_007.fits', size: 9, released: true, copyPath: '/astro/out/L_007.fits' },
-                  { name: 'L_008.fits', size: 9, released: true, copyPath: null },
+                  { name: 'notes.txt', size: 5, released: false, copyPath: null, readable: false },
+                  { name: 'L_007.fits', size: 9, released: true, copyPath: '/astro/out/L_007.fits', readable: false },
+                  { name: 'L_008.fits', size: 9, released: false, copyPath: null, readable: true },
                 ],
               },
         );
@@ -103,13 +113,15 @@ describe('DualPaneFileBrowser — zips', () => {
     blocked.forEach((b) => expect(b).toBeDisabled());
   });
 
-  it('marks an unpacked entry, locates its disk copy, and says when the copy is missing', async () => {
+  it('marks an unpacked entry with a live copy and locates it; an entry without a link reads like a frame', async () => {
     await openZip();
     const present = (await screen.findAllByText('L_007.fits'))[0].closest('div') as HTMLElement;
     expect(within(present).getByText('unpacked')).toBeInTheDocument();
-    const missing = screen.getAllByText('L_008.fits')[0].closest('div') as HTMLElement;
-    expect(within(missing).getByText('unpacked copy missing — rescan to restore')).toBeInTheDocument();
-    expect(within(missing).queryByText('Locate')).toBeNull();
+    // No live link: a normal frame row, no chip, no Locate, and no "copy missing" warning any more.
+    const unlinked = screen.getAllByText('L_008.fits')[0].closest('div') as HTMLElement;
+    expect(within(unlinked).queryByText(/unpacked/)).toBeNull();
+    expect(within(unlinked).queryByText('Locate')).toBeNull();
+    expect(screen.queryByText(/rescan to restore/)).toBeNull();
     // An entry that was never unpacked carries neither.
     const plain = screen.getAllByText('notes.txt')[0].closest('div') as HTMLElement;
     expect(within(plain).queryByText(/unpacked/)).toBeNull();
@@ -119,6 +131,24 @@ describe('DualPaneFileBrowser — zips', () => {
     fireEvent.click(within(present).getByText('Locate'));
     await waitFor(() => expect(calls('get_directory_contents').length).toBeGreaterThan(before));
     expect(lastCall('get_directory_contents')[1]).toMatchObject({ directoryPath: '/astro/out' });
+    for (const cmd of MUTATIONS) expect(calls(cmd)).toHaveLength(0);
+  });
+
+  it('reads the metadata of an entry without a row when it is picked, and previews it on double-click', async () => {
+    await openZip();
+    const row = (await screen.findAllByText('L_008.fits'))[0];
+    expect(calls('get_zip_entry_header')).toHaveLength(0);
+    fireEvent.click(row);
+    await waitFor(() => expect(calls('get_zip_entry_header')).toHaveLength(1));
+    expect(calls('get_zip_entry_header')[0][1]).toEqual({ zipPath: ZIP, entry: 'L_008.fits' });
+    expect(await screen.findByTestId('zip-entry-summary')).toHaveTextContent('M31 · Ha · Light · 300 s · 2025-10-12');
+    expect(calls('preview_zip_entry')).toHaveLength(0);
+
+    fireEvent.click(row);
+    await waitFor(() => expect(calls('preview_zip_entry')).toHaveLength(1));
+    expect(calls('preview_zip_entry')[0][1]).toEqual({ zipPath: ZIP, entry: 'L_008.fits', resolution: 'preview' });
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    // Nothing was written to the catalog.
     for (const cmd of MUTATIONS) expect(calls(cmd)).toHaveLength(0);
   });
 

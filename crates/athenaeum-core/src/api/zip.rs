@@ -18,7 +18,7 @@ use crate::api::{db, ApiError, PathPolicy};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::services::ServiceContext;
 use crate::zip_store::place::{place_entry, record_released_entry, PlaceOutcome};
-use crate::zip_store::reader::{entry_crc32_map, is_safe_entry_name, list_raw_entries};
+use crate::zip_store::reader::{entry_crc32_map, is_frame_name, is_safe_entry_name, list_raw_entries};
 
 /// The set whose zip-resident frames are unpacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -433,16 +433,22 @@ pub struct ZipOtherEntry {
     /// The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
     pub name: String,
     pub size: i64,
-    /// The entry was unpacked or restored: the catalog holds a release for it.
+    /// The entry was unpacked or restored and the link is alive: the row the unpack moved is a disk row whose
+    /// file exists (`copy_path`). An entry whose link is gone is not released here: it reads like any other.
     pub released: bool,
-    /// The unpacked copy: the path of a disk row with the release's fingerprint whose file exists. `None` for an
-    /// entry that was not released, and for a released one whose copy is gone (a rescan brings the frame back).
+    /// The unpacked copy: the path of the linked row. `None` for an entry that is not (or no longer) released.
     pub copy_path: Option<String>,
+    /// A frame entry with no catalog row and no live link: its header and a preview can be read from the zip
+    /// (`get_zip_entry_header`, `preview_zip_entry`) without any catalog write. A scan catalogs it later.
+    pub readable: bool,
 }
 
 impl ZipOtherEntry {
-    fn plain(name: String, size: i64) -> Self {
-        Self { name, size, released: false, copy_path: None }
+    /// An entry the catalog does not hold. `name` is the stored name (what the zip reads it by), `shown`
+    /// the name at this level.
+    fn plain(stored: &str, shown: String, size: i64) -> Self {
+        let readable = is_safe_entry_name(stored) && is_frame_name(stored);
+        Self { name: shown, size, released: false, copy_path: None, readable }
     }
 }
 
@@ -521,7 +527,7 @@ pub fn list_zip_entries(
     for (name, size) in raw {
         if is_untreeable_name(&name) {
             if inner.is_empty() {
-                other_entries.push(ZipOtherEntry::plain(name, to_i64(size)));
+                other_entries.push(ZipOtherEntry::plain(&name, name.clone(), to_i64(size)));
             }
             continue;
         }
@@ -534,14 +540,19 @@ pub fn list_zip_entries(
                 subdirectories.insert(format!("{prefix}{first}"));
             }
             // "a//b": an empty folder name has no folder to open.
-            Some(_) => other_entries.push(ZipOtherEntry::plain(rest.to_string(), to_i64(size))),
+            Some(_) => {
+                let mut other = ZipOtherEntry::plain(&name, rest.to_string(), to_i64(size));
+                other.readable = false;
+                other_entries.push(other);
+            }
             None => match by_entry.remove(&name) {
                 Some(row) => files.push(row),
                 None => {
-                    let mut other = ZipOtherEntry::plain(rest.to_string(), to_i64(size));
-                    if let Some(copy) = released.get(&name) {
+                    let mut other = ZipOtherEntry::plain(&name, rest.to_string(), to_i64(size));
+                    if let Some(Some(copy)) = released.get(&name) {
                         other.released = true;
-                        other.copy_path = copy.clone();
+                        other.copy_path = Some(copy.clone());
+                        other.readable = false;
                     }
                     other_entries.push(other);
                 }
@@ -551,6 +562,57 @@ pub fn list_zip_entries(
     files.sort_by(|a, b| a.file.filename.cmp(&b.file.filename));
     other_entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(ZipDirListing { subdirectories: subdirectories.into_iter().collect(), files, other_entries })
+}
+
+/// The header of a frame entry the catalog holds no row for, read live from the zip.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ZipEntryHeader {
+    /// The entry's stored name.
+    pub entry: String,
+    /// The frame metadata the header gives, parsed exactly as a scan would (`file_id` is 0: there is no row).
+    pub frame: crate::models::Frame,
+    /// The header as text (`NAME = value` lines), the same text the catalog keeps for a file.
+    pub header: String,
+}
+
+/// Checks that `entry` of `zip_path` may be read for a header or a preview: the zip is inside the host's
+/// allowed roots and the entry is a safe frame name. The catalog is not consulted and nothing is written.
+pub fn check_zip_entry_readable(policy: &PathPolicy, zip_path: &str, entry: &str) -> Result<(), ApiError> {
+    let zip = Path::new(zip_path);
+    let candidate = zip.canonicalize().unwrap_or_else(|_| zip.to_path_buf());
+    policy.check(&candidate)?;
+    if !is_safe_entry_name(entry) || !is_frame_name(entry) || entry.split(['/', '\\']).any(str::is_empty) {
+        tracing::warn!(zip_path, zip_entry = entry, "zip entry refused: not a safe frame name");
+        return Err(ApiError::Invalid(format!("{entry} is not a frame entry that can be read")));
+    }
+    Ok(())
+}
+
+/// Reads the header of `entry` in `zip_path` and parses it like a scan does. Read-only: the catalog is not
+/// touched, so an entry the scan has not cataloged (yet) can be looked at. Only the entry's first bytes are read.
+pub fn get_zip_entry_header(policy: &PathPolicy, zip_path: &str, entry: &str) -> Result<ZipEntryHeader, ApiError> {
+    check_zip_entry_readable(policy, zip_path, entry)?;
+    let zip = Path::new(zip_path);
+    let (bytes, _) = crate::zip_store::reader::read_entry_header(zip, entry).map_err(|e| {
+        tracing::warn!(zip_path, zip_entry = entry, error = %format!("{e:#}"), "zip entry header not readable");
+        if zip.exists() {
+            ApiError::Internal(format!("Could not read the header of {entry} in {zip_path}: {e:#}"))
+        } else {
+            ApiError::NotFound(format!("{zip_path} is not reachable"))
+        }
+    })?;
+    let vpath = crate::zip_store::scan::virtual_path(zip, entry);
+    let parsed = if entry.to_ascii_lowercase().ends_with(".xisf") {
+        crate::fits_parser::parse_xisf_header_bytes(&bytes, 0, Path::new(&vpath))
+    } else {
+        crate::fits_parser::parse_fits_header_bytes(&bytes, 0, Path::new(&vpath))
+    };
+    let (frame, header) = parsed.map_err(|e| {
+        tracing::warn!(zip_path, zip_entry = entry, error = %format!("{e:#}"), "zip entry header not parseable");
+        ApiError::Internal(format!("The header of {entry} in {zip_path} could not be parsed: {e:#}"))
+    })?;
+    Ok(ZipEntryHeader { entry: entry.to_string(), frame, header })
 }
 
 /// The extraction cache bound to the catalog's directory (a host that did not bind it yet), with the
@@ -813,26 +875,44 @@ mod tests {
         frame
     }
 
-    fn release_fingerprint(conn: &Connection, entry: &str) -> Option<String> {
-        conn.query_row("SELECT header_fingerprint FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+    /// The row a release links to.
+    fn release_link(conn: &Connection, entry: &str) -> Option<i64> {
+        conn.query_row("SELECT file_id FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
     }
 
-    fn row_fingerprint(conn: &Connection, file_id: i64) -> Option<String> {
-        conn.query_row("SELECT header_fingerprint FROM fits_header WHERE file_id = ?1", [file_id], |r| r.get(0)).unwrap()
+    /// A second disk row with the same header fingerprint as `like` and its file on disk: the original of an
+    /// unpacked frame cataloged elsewhere. Its id is below every other, so any rule that picks "the first row
+    /// with the fingerprint" picks this one.
+    fn add_original_elsewhere(conn: &Connection, dir: &Path, like: i64, bytes: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("original.fits");
+        std::fs::write(&path, bytes).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (-1, ?1, 'original.fits', ?2, 'm', 'FITS')",
+            params![path.to_str().unwrap(), bytes.len() as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint)
+             SELECT -1, '', header_fingerprint FROM fits_header WHERE file_id = ?1",
+            [like],
+        )
+        .unwrap();
+        path
     }
 
     #[test]
-    fn unpack_records_the_fingerprint_of_the_released_row() {
+    fn unpack_links_each_release_to_the_row_it_moved() {
         let tmp = TempDir::new().unwrap();
         let (conn, _zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
         run(&conn, &ids, out.path());
         let l1 = file_id(&conn, "Lights/L_001.fits");
         let l2 = file_id(&conn, "Lights/L_002.fits");
-        assert!(row_fingerprint(&conn, l1).is_some());
-        assert_eq!(release_fingerprint(&conn, "Lights/L_001.fits"), row_fingerprint(&conn, l1));
-        assert_eq!(release_fingerprint(&conn, "Lights/L_002.fits"), row_fingerprint(&conn, l2));
-        assert_ne!(release_fingerprint(&conn, "Lights/L_001.fits"), release_fingerprint(&conn, "Lights/L_002.fits"));
+        assert_eq!(release_link(&conn, "Lights/L_001.fits"), Some(l1));
+        assert_eq!(release_link(&conn, "Lights/L_002.fits"), Some(l2));
+        let fingerprints: i64 = count(&conn, "SELECT COUNT(*) FROM zip_released_entries WHERE header_fingerprint IS NOT NULL");
+        assert_eq!(fingerprints, 0, "the link replaces the fingerprint");
     }
 
     /// A dump of the tables the listing could touch, to prove it writes nothing.
@@ -840,7 +920,7 @@ mod tests {
         let mut out = Vec::new();
         for sql in [
             "SELECT id || '|' || path || '|' || IFNULL(archive_zip_path, '-') || '|' || IFNULL(archive_path_in_zip, '-') FROM files ORDER BY id",
-            "SELECT zip_id || '|' || entry_path || '|' || IFNULL(header_fingerprint, '-') FROM zip_released_entries ORDER BY id",
+            "SELECT zip_id || '|' || entry_path || '|' || IFNULL(file_id, '-') || '|' || IFNULL(header_fingerprint, '-') FROM zip_released_entries ORDER BY id",
             "SELECT path || '|' || size || '|' || modified_at || '|' || frame_entries FROM zip_archives ORDER BY id",
         ] {
             let rows: Vec<String> = conn
@@ -853,6 +933,11 @@ mod tests {
             out.extend(rows);
         }
         out
+    }
+
+    fn released_entry(ctx: &ServiceContext, zip_s: &str) -> ZipOtherEntry {
+        let lights = list_zip_entries(ctx, &PathPolicy::AllowAll, zip_s, "Lights").unwrap();
+        lights.other_entries.into_iter().find(|o| o.name == "L_001.fits").expect("L_001 listed as an other entry")
     }
 
     #[test]
@@ -880,17 +965,132 @@ mod tests {
                 size: light(1).len() as i64,
                 released: true,
                 copy_path: Some(copy.to_string_lossy().into_owned()),
+                readable: false,
             }]
         );
 
-        // The copy is deleted from disk: the listing says so and still changes nothing (a rescan restores it).
+        // The copy is deleted from disk: the link is dead, the entry reads like any uncataloged frame entry,
+        // and the listing still changes nothing (a rescan restores the row).
         std::fs::remove_file(&copy).unwrap();
         let again = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
         assert_eq!(
             again.other_entries,
-            vec![ZipOtherEntry { name: "L_001.fits".into(), size: light(1).len() as i64, released: true, copy_path: None }]
+            vec![ZipOtherEntry { name: "L_001.fits".into(), size: light(1).len() as i64, released: false, copy_path: None, readable: true }]
         );
         assert_eq!(dump(&ctx), before, "listing a zip never writes to the catalog");
+    }
+
+    #[test]
+    fn an_entry_without_a_row_is_extracted_into_the_zip_cache_and_nothing_is_written() {
+        let (_tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        {
+            // The entry has no row: the catalog forgot it.
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            let id = file_id(&conn, "Lights/L_001.fits");
+            conn.execute("DELETE FROM frames WHERE file_id = ?1", [id]).unwrap();
+            conn.execute("DELETE FROM fits_header WHERE file_id = ?1", [id]).unwrap();
+            conn.execute("DELETE FROM files WHERE id = ?1", [id]).unwrap();
+        }
+        let before = catalog_dump(&ctx.db.get().unwrap().conn());
+        let (local, pin) = crate::zip_store::materialize::materialize_zip_entry(&ctx, &zip_s, "Lights/L_001.fits").unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), light(1));
+        assert!(local.starts_with(ctx.zip_cache.dir().unwrap()), "{}", local.display());
+        assert_eq!(catalog_dump(&ctx.db.get().unwrap().conn()), before, "no catalog write");
+        drop(pin);
+
+        // A second call is a cache hit with the same file, and the preview key is stable and per entry.
+        let extractions = ctx.zip_cache.extraction_count();
+        let (again, _pin) = crate::zip_store::materialize::materialize_zip_entry(&ctx, &zip_s, "Lights/L_001.fits").unwrap();
+        assert_eq!(again, local);
+        assert_eq!(ctx.zip_cache.extraction_count(), extractions, "served from the cache");
+        let k1 = crate::cache::zip_entry_preview_cache_key(&zip_s, "Lights/L_001.fits", "preview").unwrap();
+        let k2 = crate::cache::zip_entry_preview_cache_key(&zip_s, "Lights/L_002.fits", "preview").unwrap();
+        assert_ne!(k1, k2);
+        assert_eq!(k1, crate::cache::zip_entry_preview_cache_key(&zip_s, "Lights/L_001.fits", "preview").unwrap());
+        assert!(crate::cache::zip_entry_preview_cache_key(&zip_s, "Lights/missing.fits", "preview").is_err());
+        assert!(crate::zip_store::materialize::materialize_zip_entry(&ctx, &zip_s, "../x.fits").is_err());
+    }
+
+    #[test]
+    fn locate_points_at_the_unpacked_row_even_when_an_identical_original_exists_elsewhere() {
+        let (tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let out = tmp.path().join("out");
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            let id = file_id(&conn, "Lights/L_001.fits");
+            assert_eq!(run(&conn, &[id], &out).unpacked, 1);
+            add_original_elsewhere(&conn, &tmp.path().join("bigbase3"), id, &light(1));
+        }
+        let entry = released_entry(&ctx, &zip_s);
+        assert!(entry.released);
+        assert_eq!(entry.copy_path.as_deref(), out.join("Lights").join("L_001.fits").to_str());
+    }
+
+    #[test]
+    fn a_voided_copy_leaves_the_entry_readable_and_an_identical_original_does_not_revive_the_link() {
+        let (tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let out = tmp.path().join("out");
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            let id = file_id(&conn, "Lights/L_001.fits");
+            assert_eq!(run(&conn, &[id], &out).unpacked, 1);
+            add_original_elsewhere(&conn, &tmp.path().join("bigbase3"), id, &light(1));
+            crate::db::send_to_void(&conn, id).unwrap();
+        }
+        let before = catalog_dump(&ctx.db.get().unwrap().conn());
+        let entry = released_entry(&ctx, &zip_s);
+        assert!(!entry.released, "the original elsewhere is not the unpacked copy");
+        assert_eq!(entry.copy_path, None);
+        assert!(entry.readable);
+        assert_eq!(catalog_dump(&ctx.db.get().unwrap().conn()), before, "listing never writes");
+    }
+
+    #[test]
+    fn a_release_from_before_the_link_still_finds_its_copy_by_fingerprint() {
+        let (tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let out = tmp.path().join("out");
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            let id = file_id(&conn, "Lights/L_001.fits");
+            run(&conn, &[id], &out);
+            conn.execute(
+                "UPDATE zip_released_entries SET file_id = NULL,
+                        header_fingerprint = (SELECT header_fingerprint FROM fits_header WHERE file_id = ?1)",
+                [id],
+            )
+            .unwrap();
+        }
+        let entry = released_entry(&ctx, &zip_s);
+        assert_eq!(entry.copy_path.as_deref(), out.join("Lights").join("L_001.fits").to_str());
+    }
+
+    #[test]
+    fn zip_entry_header_is_read_live_without_a_catalog_row() {
+        let (_tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("notes.txt", b"hello".to_vec())]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let before = catalog_dump(&ctx.db.get().unwrap().conn());
+        let header = get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, "Lights/L_001.fits").unwrap();
+        assert_eq!(header.entry, "Lights/L_001.fits");
+        assert_eq!(header.frame.object.as_deref(), Some("M33"));
+        assert!(header.header.contains("OBJECT"), "{}", header.header);
+        assert_eq!(catalog_dump(&ctx.db.get().unwrap().conn()), before);
+
+        for bad in ["notes.txt", "../x.fits", "/abs.fits", "Lights//L_001.fits", ""] {
+            assert!(get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, "Lights/missing.fits").is_err());
+        let elsewhere = PathPolicy::AllowedRoots(vec![PathBuf::from("/nonexistent-root")]);
+        assert!(get_zip_entry_header(&elsewhere, &zip_s, "Lights/L_001.fits").is_err(), "a zip outside the allowed roots");
+        let top = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "").unwrap();
+        assert!(top.other_entries.iter().any(|o| o.name == "notes.txt" && !o.readable));
     }
 
     #[test]
@@ -922,7 +1122,7 @@ mod tests {
         assert_eq!(path, crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits"));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "no row was added or deleted");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1, "only the other release is left");
-        assert!(release_fingerprint(&conn, "Lights/L_002.fits").is_some());
+        assert!(release_link(&conn, "Lights/L_002.fits").is_some());
         assert_eq!(
             count(&conn, &format!("SELECT COUNT(*) FROM plate_solves WHERE frame_id = {frame}")),
             1,
@@ -940,6 +1140,85 @@ mod tests {
         assert_eq!(next.adopted, 0);
     }
 
+    /// The row the release links to takes the entry back, not the first row with the fingerprint.
+    #[test]
+    fn the_linked_row_takes_the_entry_back_before_an_identical_missing_row() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        let first = ids[0];
+        let frame = plate_solve(&conn, first);
+        run(&conn, &ids, out.path());
+        let original = add_original_elsewhere(&conn, &tmp.path().join("bigbase3"), first, &light(1));
+        std::fs::remove_file(&original).unwrap();
+        std::fs::remove_file(out.path().join("Lights").join("L_001.fits")).unwrap();
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert!(outcome.inserted.is_empty());
+        let zip_col: Option<String> = conn.query_row("SELECT archive_zip_path FROM files WHERE id = ?1", [first], |r| r.get(0)).unwrap();
+        assert_eq!(zip_col.as_deref(), zip.to_str(), "the linked row is zip-resident again");
+        let orig_zip: Option<String> = conn.query_row("SELECT archive_zip_path FROM files WHERE id = -1", [], |r| r.get(0)).unwrap();
+        assert_eq!(orig_zip, None, "the other row with the fingerprint is left alone");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM plate_solves WHERE frame_id = {frame}")), 1);
+    }
+
+    /// An identical original that is on disk elsewhere is not the unpacked copy: it does not keep the release alive.
+    #[test]
+    fn an_identical_original_elsewhere_does_not_keep_a_release_alive() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        let original = add_original_elsewhere(&conn, &tmp.path().join("bigbase3"), ids[0], &light(1));
+        std::fs::remove_file(out.path().join("Lights").join("L_001.fits")).unwrap();
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1, "the entry is back in the catalog's zip view");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 1);
+        assert!(original.is_file());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1, "the other release is untouched");
+    }
+
+    /// Void removes the copy's row: the release has no link, and the entry is cataloged as a new row even
+    /// though an identical original is on disk elsewhere.
+    #[test]
+    fn a_voided_copy_is_cataloged_again_with_an_identical_original_elsewhere() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        add_original_elsewhere(&conn, &tmp.path().join("bigbase3"), ids[0], &light(1));
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::db::send_to_void(&conn, ids[0]).unwrap();
+        assert_eq!(release_link(&conn, "Lights/L_001.fits"), None, "the link went with the row");
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.inserted.len(), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
+    }
+
+    /// A release from before the link (no `file_id`, a fingerprint) is kept while a disk row with it is present.
+    #[test]
+    fn a_release_from_before_the_link_is_kept_by_its_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        conn.execute(
+            "UPDATE zip_released_entries SET header_fingerprint =
+                 (SELECT fh.header_fingerprint FROM fits_header fh INNER JOIN files f ON f.id = fh.file_id
+                  WHERE f.id = zip_released_entries.file_id), file_id = NULL",
+            [],
+        )
+        .unwrap();
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
+        std::fs::remove_file(out.path().join("Lights").join("L_002.fits")).unwrap();
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1, "only the deleted copy returns");
+    }
+
     #[test]
     fn a_copy_that_is_still_there_stays_released() {
         let tmp = TempDir::new().unwrap();
@@ -953,16 +1232,16 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
     }
 
-    /// A release with no fingerprint has no owner, so the scan drops it and the entries are cataloged again
+    /// A release with no link and no fingerprint has no owner, so the scan drops it and the entries are cataloged again
     /// through the normal pass: here the deleted copies' rows are still in the catalog, so the moved-file rule
     /// takes them back into the zip (same ids), and an entry with no such row is a new row.
     #[test]
-    fn a_release_with_no_fingerprint_is_dropped_and_its_entries_are_cataloged_again() {
+    fn a_release_with_no_link_is_dropped_and_its_entries_are_cataloged_again() {
         let tmp = TempDir::new().unwrap();
         let (conn, zip, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
         run(&conn, &ids, out.path());
-        conn.execute("UPDATE zip_released_entries SET header_fingerprint = NULL", []).unwrap();
+        conn.execute("UPDATE zip_released_entries SET file_id = NULL, header_fingerprint = NULL", []).unwrap();
         std::fs::remove_dir_all(out.path().join("Lights")).unwrap();
         let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
         assert_eq!(outcome.adopted, 2);
@@ -1238,7 +1517,7 @@ mod tests {
         assert_eq!(top.subdirectories, vec!["Lights".to_string()]);
         let names: Vec<_> = top.files.iter().map(|f| f.file.filename.as_str()).collect();
         assert_eq!(names, vec!["top.fits"]);
-        assert_eq!(top.other_entries, vec![ZipOtherEntry::plain("notes.txt".into(), 5)]);
+        assert_eq!(top.other_entries, vec![ZipOtherEntry::plain("notes.txt", "notes.txt".into(), 5)]);
 
         let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
         assert_eq!(lights.subdirectories, vec!["Lights/Ha".to_string()]);

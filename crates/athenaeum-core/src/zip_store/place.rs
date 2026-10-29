@@ -130,9 +130,10 @@ pub fn place_entry(
 /// not catalog it again. The zip gets a placeholder `zip_archives` row when it has none (stat left empty,
 /// so the next scan reads the zip).
 ///
-/// `file_id` is the catalog row that was released (the copy on disk): its header fingerprint is what the
-/// scan later looks for to know the release still has a copy. A release recorded again with a row replaces the
-/// fingerprint recorded before; one recorded with `None` keeps it.
+/// `file_id` is the catalog row that was released (the row the unpack or the restore moved to disk): the
+/// release links to it, and the scan keeps the release for as long as that row is a disk row with its file
+/// present. A release recorded again with a row replaces the link recorded before; one recorded with `None`
+/// keeps it. A release with no row (a copied-in entry) has no link.
 pub(crate) fn record_released_entry(
     conn: &Connection,
     zip: &str,
@@ -146,11 +147,11 @@ pub(crate) fn record_released_entry(
         rusqlite::params![zip, chrono::Utc::now().to_rfc3339(), operation],
     )?;
     conn.execute(
-        "INSERT INTO zip_released_entries (zip_id, entry_path, header_fingerprint)
-         SELECT id, ?1, (SELECT header_fingerprint FROM fits_header WHERE file_id = ?3 ORDER BY id DESC LIMIT 1)
-         FROM zip_archives WHERE path = ?2
+        "INSERT INTO zip_released_entries (zip_id, entry_path, file_id)
+         SELECT id, ?1, ?3 FROM zip_archives WHERE path = ?2
          ON CONFLICT(zip_id, entry_path) DO UPDATE SET
-             header_fingerprint = COALESCE(excluded.header_fingerprint, header_fingerprint)",
+             file_id = COALESCE(excluded.file_id, file_id),
+             header_fingerprint = CASE WHEN excluded.file_id IS NULL THEN header_fingerprint ELSE NULL END",
         rusqlite::params![entry, zip, file_id],
     )?;
     Ok(())

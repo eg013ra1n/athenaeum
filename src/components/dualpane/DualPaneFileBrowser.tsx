@@ -67,6 +67,7 @@ import {
 } from '../export/lightCalPrefs';
 import CatalogSearch from './CatalogSearch';
 import { ZipBlackHoleDialog } from './ZipBlackHoleDialog';
+import { ZipEntryDialog, ZipEntrySummary } from './ZipEntryView';
 import MetadataPane from './MetadataPane';
 import {
   ZIP_DEST_NOTE,
@@ -2145,6 +2146,22 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
     handleClick(e, f.file.path);
   };
 
+  // Entries of the open zip the catalog holds no row for: one click picks (its header is read), a second
+  // within 400 ms opens the metadata and preview dialog.
+  const [pickedEntry, setPickedEntry] = useState<string | null>(null);
+  const [viewEntry, setViewEntry] = useState<string | null>(null);
+  const entryClickRef = useRef<{ entry: string; at: number }>({ entry: '', at: 0 });
+  const onEntryClick = (entry: string) => {
+    const now = Date.now();
+    if (entryClickRef.current.entry === entry && now - entryClickRef.current.at < 400) {
+      entryClickRef.current = { entry: '', at: 0 };
+      setViewEntry(entry);
+      return;
+    }
+    entryClickRef.current = { entry, at: now };
+    setPickedEntry(entry);
+  };
+
   const parentClickRef = useRef<number>(0);
   const onParentClick = () => {
     if (!upRow) return;
@@ -2259,40 +2276,54 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
           </button>
         );
       })}
-      {zip && (listing.otherEntries ?? []).map((o) => (
-        <div
-          key={`other:${o.name}`}
-          aria-disabled="true"
-          title={o.copyPath ? `Unpacked to ${o.copyPath}` : 'Not a cataloged frame — nothing here opens it'}
-          className={`w-full flex items-center gap-2 px-2 py-1 text-content-muted cursor-default ${o.released ? '' : 'opacity-70'}`}
-        >
-          <FileIcon size={14} className="text-content-muted" />
-          <span className="truncate font-mono">{o.name}</span>
-          {o.released && (
-            o.copyPath != null ? (
-              <Chip tone="info" title={`Unpacked to ${o.copyPath}`}>unpacked</Chip>
-            ) : (
-              <Chip
-                tone="warn"
-                title="The unpacked copy is gone from disk. Rescan this zip's folder and the frame returns to the zip."
+      {zip && (listing.otherEntries ?? []).map((o) => {
+        const entry = zip.innerDir ? `${zip.innerDir}/${o.name}` : o.name;
+        if (o.readable) {
+          // A frame entry the catalog has no row for: it reads like a frame (metadata when picked, a preview
+          // on double-click) straight from the zip, and a scan catalogs it later.
+          const picked = pickedEntry === entry;
+          return (
+            <div key={`other:${o.name}`} data-row-key={`zip-entry:${entry}`}>
+              <button
+                onClick={() => onEntryClick(entry)}
+                title="Not in the catalog yet — double-click to read it from the zip"
+                className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
+                  picked ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
+                }`}
               >
-                unpacked copy missing — rescan to restore
-              </Chip>
-            )
-          )}
-          {o.copyPath != null && (
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); onLocate(o.copyPath as string); }}
-              title={`Show ${o.copyPath} in the browser`}
-              className="text-xs text-accent hover:underline"
-            >
-              Locate
-            </button>
-          )}
-          <span className="ml-auto text-xs">{formatBytes(o.size)}</span>
-        </div>
-      ))}
+                <FileIcon size={14} className={picked ? 'text-accent' : 'text-content-muted'} />
+                <span className="truncate font-mono">{o.name}</span>
+                <span className="ml-auto text-xs text-content-muted">{formatBytes(o.size)}</span>
+              </button>
+              {picked && <ZipEntrySummary zipPath={zip.path} entry={entry} />}
+            </div>
+          );
+        }
+        return (
+          <div
+            key={`other:${o.name}`}
+            aria-disabled="true"
+            title={o.copyPath ? `Unpacked to ${o.copyPath}` : 'Not a cataloged frame — nothing here opens it'}
+            className={`w-full flex items-center gap-2 px-2 py-1 text-content-muted cursor-default ${o.released ? '' : 'opacity-70'}`}
+          >
+            <FileIcon size={14} className="text-content-muted" />
+            <span className="truncate font-mono">{o.name}</span>
+            {o.released && o.copyPath != null && <Chip tone="info" title={`Unpacked to ${o.copyPath}`}>unpacked</Chip>}
+            {o.copyPath != null && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onLocate(o.copyPath as string); }}
+                title={`Show ${o.copyPath} in the browser`}
+                className="text-xs text-accent hover:underline"
+              >
+                Locate
+              </button>
+            )}
+            <span className="ml-auto text-xs">{formatBytes(o.size)}</span>
+          </div>
+        );
+      })}
+      {zip && viewEntry && <ZipEntryDialog zipPath={zip.path} entry={viewEntry} onClose={() => setViewEntry(null)} />}
       {listingKeys(listing).length === 0 && (listing.otherEntries ?? []).length === 0 && (
         <div className="p-3 text-content-muted text-xs italic">{zip ? 'Nothing at this level of the zip.' : 'Empty directory.'}</div>
       )}

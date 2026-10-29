@@ -1782,21 +1782,27 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(released, 3, "each restored entry is recorded for the kept zip");
-        let fingerprints = |sql: &str| -> Vec<Option<String>> {
-            let mut v: Vec<Option<String>> = conn
-                .prepare(sql)
-                .unwrap()
-                .query_map([], |r| r.get::<_, Option<String>>(0))
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect();
-            v.sort();
-            v
-        };
-        let released_fp = fingerprints("SELECT header_fingerprint FROM zip_released_entries");
-        let row_fp = fingerprints("SELECT header_fingerprint FROM fits_header");
-        assert!(released_fp.iter().all(|f| f.is_some()), "a restore records the fingerprint of the restored row");
-        assert_eq!(released_fp, row_fp, "each release carries the fingerprint of its restored file");
+        let linked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zip_released_entries r INNER JOIN files f ON f.id = r.file_id WHERE f.archive_zip_path IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 3, "a restore links each release to the row it restored");
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT r.entry_path, r.file_id FROM zip_released_entries r ORDER BY r.id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for (entry, file_id) in rows {
+            let target: String = conn
+                .query_row("SELECT target_path_in_zip FROM archive_operation_files WHERE file_id = ?1", [file_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(entry, target, "each release points at the row of its own entry");
+        }
 
         // Two files are deleted again; the next restore extracts exactly those two.
         std::fs::remove_file(&paths[0]).unwrap();

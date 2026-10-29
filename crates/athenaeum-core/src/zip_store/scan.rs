@@ -402,6 +402,7 @@ fn stage_entry(
     zip_str: &str,
     entry: &ZipEntryInfo,
     known_id: Option<i64>,
+    preferred_row: Option<i64>,
     header_bytes: &[u8],
     zip_modified: DateTime<Utc>,
     root_id: i64,
@@ -452,7 +453,25 @@ fn stage_entry(
     let filename = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
 
     let fingerprint = crate::fingerprint::compute_header_fingerprint(&header);
-    if let Some((file_id, old_path)) = find_moved_row(conn, &fingerprint, &vpath, true)? {
+    // The row a dead release linked to (its file is gone) takes the entry over before any other row does,
+    // when it is still that frame (same header fingerprint).
+    let preferred: Option<(i64, String)> = match preferred_row {
+        Some(id) => conn
+            .query_row(
+                "SELECT f.id, f.path FROM files f
+                 WHERE f.id = ?1 AND f.archive_zip_path IS NULL
+                   AND EXISTS (SELECT 1 FROM fits_header fh WHERE fh.file_id = f.id AND fh.header_fingerprint = ?2)",
+                params![id, fingerprint],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+        None => None,
+    };
+    let moved = match preferred {
+        Some(row) => Some(row),
+        None => find_moved_row(conn, &fingerprint, &vpath, true)?,
+    };
+    if let Some((file_id, old_path)) = moved {
         tracing::debug!(
             root_id,
             old_path = %old_path,
@@ -573,31 +592,51 @@ fn entries_written_by_creating_operation(conn: &Connection, zip_path: &str) -> R
     Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
 }
 
-/// A release of a zip: its row id, the entry and the fingerprint of the catalog row that was released.
+/// A release of a zip: its row id, the entry, the catalog row it links to (`file_id`) and, for a release with
+/// no link, the fingerprint of the row that was released (a database from before the link).
 struct Release {
     id: i64,
     entry: String,
+    file_id: Option<i64>,
     fingerprint: Option<String>,
+    /// Set on a dead release whose linked row is still a disk row, its file gone: that row takes the entry
+    /// over before any other row is looked for (same id, analysis, plate solve, set memberships).
+    adopt: Option<i64>,
 }
 
-/// The releases of one zip, split by the one rule: a release keeps its entry out of the catalog iff a disk
-/// row (`archive_zip_path IS NULL`) with the release's header fingerprint exists AND its file is on disk, or
-/// that row sits under a scan root that is offline (an unmounted volume says nothing about the file). Every
-/// other release (no such row, the file gone, no fingerprint recorded) is dead: the entry is cataloged like
-/// any new one, and a row of the frame whose copy is missing takes it over through [`find_moved_row`].
+/// The releases of one zip, split by the one rule: a release keeps its entry out of the catalog iff its link
+/// is alive, that is `file_id` names a row with `archive_zip_path IS NULL` whose file exists on disk, or sits
+/// under a scan root that is offline (an unmounted volume says nothing about the file). A release with no
+/// link falls back to its fingerprint: alive iff some disk row with it has its file on disk (or offline).
+/// Every other release is dead: the entry is cataloged like any new one, taken over first by the row it was
+/// linked to (when that is still a disk row), then by [`find_moved_row`], else inserted.
 #[derive(Default)]
 struct Releases {
     kept: Vec<Release>,
     dead: Vec<Release>,
 }
 
+/// A disk path exists, or its scan root is offline (then the file is unknowable and counts as there).
+fn present_or_offline(conn: &Connection, path: &str) -> Result<bool> {
+    if Path::new(path).exists() {
+        return Ok(true);
+    }
+    if let Some(offline_root) = path_under_unavailable_scan_root(conn, path)? {
+        tracing::debug!(path = %path, offline_root = %offline_root, "released copy missing only because its scan root is unavailable — the release stays");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn classify_releases(conn: &Connection, zip_path: &str) -> Result<Releases> {
     let mut stmt = conn.prepare(
-        "SELECT r.id, r.entry_path, r.header_fingerprint FROM zip_released_entries r
+        "SELECT r.id, r.entry_path, r.file_id, r.header_fingerprint FROM zip_released_entries r
          INNER JOIN zip_archives z ON z.id = r.zip_id WHERE z.path = ?1 ORDER BY r.id",
     )?;
     let all = stmt
-        .query_map(params![zip_path], |r| Ok(Release { id: r.get(0)?, entry: r.get(1)?, fingerprint: r.get(2)? }))?
+        .query_map(params![zip_path], |r| {
+            Ok(Release { id: r.get(0)?, entry: r.get(1)?, file_id: r.get(2)?, fingerprint: r.get(3)?, adopt: None })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut copies = conn.prepare(
@@ -606,23 +645,36 @@ fn classify_releases(conn: &Connection, zip_path: &str) -> Result<Releases> {
     )?;
     let mut verdicts: HashMap<String, bool> = HashMap::new();
     let mut out = Releases::default();
-    for release in all {
-        let alive = match &release.fingerprint {
-            None => false,
-            Some(fp) => match verdicts.get(fp) {
+    for mut release in all {
+        let alive = match (&release.file_id, &release.fingerprint) {
+            (Some(id), _) => {
+                let row: Option<(String, Option<String>)> = conn
+                    .query_row("SELECT path, archive_zip_path FROM files WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                match row {
+                    Some((path, None)) => {
+                        let alive = present_or_offline(conn, &path)?;
+                        if !alive {
+                            release.adopt = Some(*id);
+                        }
+                        alive
+                    }
+                    // The row is zip-resident again (or gone): nothing on disk is this release's copy.
+                    _ => false,
+                }
+            }
+            (None, None) => false,
+            (None, Some(fp)) => match verdicts.get(fp) {
                 Some(v) => *v,
                 None => {
                     let paths = copies
                         .query_map(params![fp], |r| r.get::<_, String>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let mut alive = paths.iter().any(|p| Path::new(p).exists());
-                    if !alive {
-                        for p in &paths {
-                            if let Some(offline_root) = path_under_unavailable_scan_root(conn, p)? {
-                                tracing::debug!(path = %p, offline_root = %offline_root, "released copy missing only because its scan root is unavailable — the release stays");
-                                alive = true;
-                                break;
-                            }
+                    let mut alive = false;
+                    for p in &paths {
+                        if present_or_offline(conn, p)? {
+                            alive = true;
+                            break;
                         }
                     }
                     verdicts.insert(fp.clone(), alive);
@@ -671,8 +723,8 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     };
     for r in kept {
         conn.execute(
-            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, header_fingerprint) VALUES (?1, ?2, ?3)",
-            params![new_zip_id, r.entry, r.fingerprint],
+            "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, file_id, header_fingerprint) VALUES (?1, ?2, ?3, ?4)",
+            params![new_zip_id, r.entry, r.file_id, r.fingerprint],
         )?;
     }
     if let Some(op) = old_operation {
@@ -845,10 +897,12 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
     }
     // Pass 1: parse, update known entries, let moved rows adopt entries.
     let mut pending: Vec<(&ZipEntryInfo, Box<ParsedEntry>)> = Vec::new();
+    let linked_rows: HashMap<&str, i64> = releases.dead.iter().filter_map(|r| r.adopt.map(|id| (r.entry.as_str(), id))).collect();
     for ((entry, known_id), (_, header)) in to_read.iter().zip(headers) {
         let staged = match header {
             Ok(bytes) => {
-                stage_entry(conn, zip, &zip_str, entry, *known_id, &bytes, zip_modified, root_id, unique_camera)
+                let preferred = linked_rows.get(entry.path.as_str()).copied();
+                stage_entry(conn, zip, &zip_str, entry, *known_id, preferred, &bytes, zip_modified, root_id, unique_camera)
             }
             Err(e) => Err(e),
         };
@@ -1462,7 +1516,7 @@ mod scan_tests {
     }
 
     /// What an unpack does to the catalog: the row of `entry` becomes a disk row at `copy` (the file is written
-    /// when `bytes` is given) and the entry is released with the row's header fingerprint.
+    /// when `bytes` is given) and the entry is released with a link to that row.
     fn unpack_entry(conn: &Connection, zip: &Path, entry: &str, copy: &Path, bytes: Option<Vec<u8>>) -> i64 {
         let id = id_of(conn, &virtual_path(zip, entry));
         if let Some(bytes) = bytes {
@@ -1485,15 +1539,15 @@ mod scan_tests {
     }
 
     #[test]
-    fn a_release_without_a_fingerprint_is_cataloged_again_even_when_the_zip_is_unchanged() {
+    fn a_release_with_no_link_is_cataloged_again_even_when_the_zip_is_unchanged() {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
         scan_zip(&conn, &zip, 1, false).unwrap();
-        // A release recorded before the fingerprint existed, whose row went away with a removed folder.
+        // A release with no link (its row was voided, or it never had one), whose row is gone.
         let copy = tmp.path().join("unpacked").join("L_001.fits");
         let id1 = unpack_entry(&conn, &zip, "L_001.fits", &copy, None);
-        conn.execute("UPDATE zip_released_entries SET header_fingerprint = NULL", []).unwrap();
+        conn.execute("UPDATE zip_released_entries SET file_id = NULL, header_fingerprint = NULL", []).unwrap();
         forget_row(&conn, id1);
 
         let again = scan_zip(&conn, &zip, 1, false).unwrap();
@@ -1507,7 +1561,7 @@ mod scan_tests {
     }
 
     #[test]
-    fn a_release_with_a_fingerprint_is_dropped_too_when_no_row_carries_it() {
+    fn a_release_whose_linked_row_is_gone_is_dropped_even_when_a_file_is_still_on_disk() {
         let tmp = TempDir::new().unwrap();
         let conn = db(tmp.path());
         let zip = make_zip(tmp.path(), "n.zip", &[("L_001.fits", light(1)), ("L_002.fits", light(2))], ArchiveCompression::Store);
@@ -1550,7 +1604,7 @@ mod scan_tests {
         std::fs::remove_file(&copy).unwrap();
         let again = scan_zip(&conn, &zip, 1, false).unwrap();
         assert!(!again.skipped_unchanged);
-        assert_eq!(again.adopted, 1, "the row with the fingerprint takes the entry over");
+        assert_eq!(again.adopted, 1, "the linked row takes the entry over");
         assert!(again.inserted.is_empty());
         assert_eq!(id_of(&conn, &virtual_path(&zip, "L_001.fits")), id1, "the same row");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
@@ -1793,6 +1847,11 @@ mod scan_tests {
             "SELECT COUNT(*) FROM zip_released_entries r JOIN zip_archives z ON z.id = r.zip_id WHERE r.entry_path = 'L_001.fits'",
         );
         assert_eq!(released, 1, "the released entry belongs to the zip's new row");
+        assert_eq!(
+            count(&conn, "SELECT file_id FROM zip_released_entries WHERE entry_path = 'L_001.fits'"),
+            id1,
+            "and keeps its link to the unpacked row"
+        );
         // And it stays released on the next change of the zip.
         let b = make_zip(
             tmp.path(),

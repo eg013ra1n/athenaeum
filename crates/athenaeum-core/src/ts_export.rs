@@ -314,7 +314,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::updates::WhatsNew,
             crate::api::settings::SettingsDefaults,
         ]))),
-        ("archive.ts", js_safe_ints(format!("{HEADER}import type {{ FileWithFrame }} from './models';\n\n{}", decls![
+        ("archive.ts", js_safe_ints(format!("{HEADER}import type {{ FileWithFrame, Frame }} from './models';\n\n{}", decls![
             crate::archive::models::ArchiveDisposition,
             crate::archive::models::ArchiveCompression,
             crate::archive::models::ConflictResolution,
@@ -333,6 +333,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::zip_store::catalog::ZipListItem,
             crate::api::zip::ZipDirListing,
             crate::api::zip::ZipOtherEntry,
+            crate::api::zip::ZipEntryHeader,
         ]))),
         ("export.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::export::models::CameraType,
