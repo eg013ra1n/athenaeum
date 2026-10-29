@@ -322,12 +322,12 @@ mod presence_tests {
         let root_s = crate::test_support::canonical_path(&root).to_string_lossy().to_string();
         let root_id = add_scan_root(&ctx, root_s.clone(), &PathPolicy::AllowAll, None).unwrap().id.unwrap();
 
-        // Entry names as path_layout builds them: not sanitised, so ':' and a trailing space survive.
-        let odd = "Lights: M33 /L_001.fits";
+        // Test names use only letters, digits, '_' and '-' (owner rule): they exist on every file system.
+        let odd = "Lights_M33/L_001.fits";
         let zip = make_zip(Path::new(&root_s), "n.zip", &[odd]);
         let zip_s = zip.to_string_lossy().to_string();
         // The row keeps its ORIGINAL disk path (the file is gone from it) plus the operation and the zip.
-        let original = format!("{root_s}{}Lights: M33 {}L_001.fits", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        let original = format!("{root_s}{}Lights_M33{}L_001.fits", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
         {
             let db = ctx.db.get().unwrap();
             db.conn()
@@ -346,12 +346,8 @@ mod presence_tests {
 
         // A file appearing at the original path does not matter either way: the zip decides.
         std::fs::remove_file(&zip).unwrap();
-        // ':' and a trailing space are not legal in a Windows path, so only unix can put a file there.
-        #[cfg(unix)]
-        {
-            std::fs::create_dir_all(Path::new(&original).parent().unwrap()).unwrap();
-            std::fs::write(&original, b"x").unwrap();
-        }
+        std::fs::create_dir_all(Path::new(&original).parent().unwrap()).unwrap();
+        std::fs::write(&original, b"x").unwrap();
         let missing = check_missing_files_in_scan_root(&ctx, root_id, &crate::events::NullEmitter).unwrap();
         assert_eq!(missing.len(), 1, "the zip is gone, so the row is missing even though a file sits at its path");
         let db = ctx.db.get().unwrap();

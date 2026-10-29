@@ -1039,41 +1039,6 @@ mod tests {
         assert_eq!(after[0].4, Some(op_id));
     }
 
-    // Names with `:`, a trailing space or a device name cannot exist as directories on a Windows disk.
-    #[cfg(unix)]
-    #[test]
-    fn entries_with_colon_trailing_space_or_device_names_get_their_crc_and_a_rescan_inserts_nothing() {
-        let (conn, _arch, _scan, op_id) =
-            full_fixture_with(&["M:31/L_001.fits", "Aux/L_002.fits", "Obj /L_003.fits"]);
-        let cancel = Arc::new(AtomicBool::new(false));
-        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
-
-        let rows: Vec<(String, Option<i64>)> = {
-            let mut stmt = conn
-                .prepare("SELECT archive_path_in_zip, archive_entry_crc32 FROM files WHERE archived_in_operation = ?1")
-                .unwrap();
-            let r = stmt.query_map([op_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-            r
-        };
-        assert_eq!(rows.len(), 3);
-        for needle in ["M:31/", "Aux/", "Obj /"] {
-            let (entry, crc) = rows.iter().find(|(e, _)| e.contains(needle)).unwrap_or_else(|| panic!("{needle} in {rows:?}"));
-            assert!(crc.is_some(), "{entry} has its CRC32 from the built zip's directory");
-        }
-        let zips = zip_rows(&conn);
-        assert_eq!(zips[0].3, 3);
-        let files_before: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
-
-        conn.execute("UPDATE zip_archives SET size = 0, modified_at = ''", []).unwrap();
-        let outcome = crate::zip_store::scan::scan_zip(&conn, Path::new(&zips[0].0), 1, false).unwrap();
-        assert!(!outcome.skipped_unchanged);
-        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-        assert_eq!(outcome.files_inserted, 0);
-        let files_after: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
-        assert_eq!(files_after, files_before);
-        assert_eq!(zip_rows(&conn)[0].3, 3, "the scan counts the odd names as cataloged");
-    }
-
     #[test]
     fn recording_a_rebuilt_zip_clears_the_entries_an_earlier_unpack_released_there() {
         let (conn, _arch, _scan, op_id) = run_full_fixture();
