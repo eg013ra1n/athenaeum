@@ -251,6 +251,13 @@ pub(crate) struct FitsInfo { pub(crate) data_offset: u64, pub(crate) bitpix: i32
 /// should take the decode-and-spill fallback (never errors on odd files).
 pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let mut f = File::open(path).ok()?;
+    let info = fits_info_from_reader(&mut f)?;
+    Some((f, info))
+}
+
+/// [`probe_fits`]' header scan over any reader positioned at the start of a FITS primary header (a file,
+/// or the header bytes read out of a zip entry): the same cards, the same shape rules, the same `None`.
+pub(crate) fn fits_info_from_reader(f: &mut impl Read) -> Option<FitsInfo> {
     let mut info = FitsInfo { data_offset: 0, bitpix: 0, naxis: 0, w: 0, h: 0, naxis3: 1, bzero: 0.0, bscale: 1.0 };
     let mut block = [0u8; BLOCK as usize];
     let mut blocks = 0u64;
@@ -285,7 +292,7 @@ pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let ok_shape = (info.naxis == 2 && info.naxis3 == 1)
         || (info.naxis == 3 && (info.naxis3 == 1 || info.naxis3 == 3));
     if ok_shape && ok_bitpix && info.w > 0 && info.h > 0 {
-        Some((f, info))
+        Some(info)
     } else {
         None
     }
@@ -299,6 +306,12 @@ pub fn probe_bitpix(path: &Path) -> Option<i32> {
     // The 3-D shapes `probe_fits` accepts for `PlaneReader` are still spilled by
     // `BandSource`, and this probe answers for the banded reader's world.
     probe_fits(path).filter(|(_, i)| i.naxis == 2 && i.naxis3 == 1).map(|(_, i)| i.bitpix)
+}
+
+/// [`probe_bitpix`] over the header bytes of a zip entry (nothing is extracted): the same shape rule, the same
+/// `None` for anything the direct reader would not take (an XISF entry among them).
+pub fn probe_bitpix_from_header(header: &[u8]) -> Option<i32> {
+    fits_info_from_reader(&mut &header[..]).filter(|i| i.naxis == 2 && i.naxis3 == 1).map(|i| i.bitpix)
 }
 
 /// Test-only observation hook (fix round 1, I1 regression pin): records

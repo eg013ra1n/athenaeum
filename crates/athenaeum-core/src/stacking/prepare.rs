@@ -78,16 +78,66 @@ pub enum PrepareAction {
     Unsupported(String),
 }
 
-/// Classify a file from its header alone; never fails — an unreadable file
-/// is `Unsupported` with the reason.
-pub fn probe_file(path: &Path) -> FileShape {
-    let unsupported = |reason: String| FileShape {
+fn unsupported_shape(reason: String) -> FileShape {
+    FileShape {
         kind: FileKind::Unsupported(reason),
         width: 0,
         height: 0,
         planes: 0,
         cfa: None,
+    }
+}
+
+/// The XISF half of the classification, over the XML header text. `cfa` is asked only for a one-plane image.
+fn shape_from_xisf_xml(xml: &str, cfa: impl FnOnce() -> Option<CfaGeometry>) -> FileShape {
+    let distributed = ["path(", "url("].iter().any(|scheme| {
+        xml.contains(&format!("location=\"{scheme}"))
+            || xml.contains(&format!("location='{scheme}"))
+    });
+    if distributed {
+        return unsupported_shape("distributed XISF".to_string());
+    }
+    let Some((w, h, c)) = xisf_geometry(xml) else {
+        return unsupported_shape("XISF without an image geometry".to_string());
     };
+    if c != 1 && c != 3 {
+        return unsupported_shape(format!("XISF with {c} channels"));
+    }
+    FileShape {
+        kind: FileKind::Xisf,
+        width: w,
+        height: h,
+        planes: c,
+        cfa: if c == 1 { cfa() } else { None },
+    }
+}
+
+/// The FITS half of the classification, over the header scan of `probe_fits`.
+fn shape_from_fits_info(
+    info: &crate::integration::banded::FitsInfo,
+    cfa: impl FnOnce() -> Option<CfaGeometry>,
+) -> FileShape {
+    FileShape {
+        kind: if matches!(info.bitpix, -32 | -64) {
+            FileKind::FloatFits
+        } else {
+            FileKind::IntFits {
+                bitpix: info.bitpix,
+            }
+        },
+        width: info.w,
+        height: info.h,
+        planes: info.naxis3,
+        cfa: if info.naxis3 == 1 { cfa() } else { None },
+    }
+}
+
+/// Also a tile-compressed FITS or an extension image (primary NAXIS 0), BITPIX 64, or a 4-plane cube.
+const NOT_A_SUPPORTED_FITS: &str = "not a 1- or 3-plane 8/16/32-bit or float primary image";
+
+/// Classify a file from its header alone; never fails — an unreadable file
+/// is `Unsupported` with the reason.
+pub fn probe_file(path: &Path) -> FileShape {
     let cfa_of = |p: &Path| match cfa_geometry_of_file(p) {
         Ok(geometry) => geometry,
         Err(e) => {
@@ -98,51 +148,49 @@ pub fn probe_file(path: &Path) -> FileShape {
     // Review I10: a file that cannot be opened (offline, renamed, archived)
     // says so, instead of looking like an image no reader here decodes.
     if let Err(e) = std::fs::File::open(path) {
-        return unsupported(format!("cannot open the file: {e}"));
+        return unsupported_shape(format!("cannot open the file: {e}"));
     }
     if is_xisf(path) {
         let xml = match crate::fits_parser::read_xisf_header(path) {
             Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
-            Err(e) => return unsupported(format!("unreadable XISF header: {e:#}")),
+            Err(e) => return unsupported_shape(format!("unreadable XISF header: {e:#}")),
         };
-        let distributed = ["path(", "url("].iter().any(|scheme| {
-            xml.contains(&format!("location=\"{scheme}"))
-                || xml.contains(&format!("location='{scheme}"))
-        });
-        if distributed {
-            return unsupported("distributed XISF".to_string());
-        }
-        let Some((w, h, c)) = xisf_geometry(&xml) else {
-            return unsupported("XISF without an image geometry".to_string());
-        };
-        if c != 1 && c != 3 {
-            return unsupported(format!("XISF with {c} channels"));
-        }
-        return FileShape {
-            kind: FileKind::Xisf,
-            width: w,
-            height: h,
-            planes: c,
-            cfa: if c == 1 { cfa_of(path) } else { None },
-        };
+        return shape_from_xisf_xml(&xml, || cfa_of(path));
     }
     match crate::integration::banded::probe_fits(path) {
-        Some((_file, info)) => FileShape {
-            kind: if matches!(info.bitpix, -32 | -64) {
-                FileKind::FloatFits
-            } else {
-                FileKind::IntFits {
-                    bitpix: info.bitpix,
-                }
-            },
-            width: info.w,
-            height: info.h,
-            planes: info.naxis3,
-            cfa: if info.naxis3 == 1 { cfa_of(path) } else { None },
-        },
-        // Also a tile-compressed FITS or an extension image (primary NAXIS 0),
-        // BITPIX 64, or a 4-plane cube.
-        None => unsupported("not a 1- or 3-plane 8/16/32-bit or float primary image".to_string()),
+        Some((_file, info)) => shape_from_fits_info(&info, || cfa_of(path)),
+        None => unsupported_shape(NOT_A_SUPPORTED_FITS.to_string()),
+    }
+}
+
+/// [`probe_file`] for a zip-resident frame, from the header bytes of its entry alone — nothing is
+/// extracted, so a caller can classify (and decide freshness) before paying for the entry. `label` is the
+/// catalog path, for logs. `Err` when the entry's header cannot be read (the zip is unreachable or the
+/// entry is damaged): the caller then extracts and probes the file, whose error names the cause.
+pub fn probe_zip_entry(zip: &Path, entry: &str, label: &Path) -> anyhow::Result<FileShape> {
+    let (bytes, _) = crate::zip_store::reader::read_entry_header(zip, entry)?;
+    Ok(shape_from_header_bytes(&bytes, Path::new(entry), label))
+}
+
+fn shape_from_header_bytes(bytes: &[u8], entry: &Path, label: &Path) -> FileShape {
+    let xisf = is_xisf(entry);
+    let cfa_of = || match crate::stacking::origin::cfa_geometry_of_header_bytes(label, bytes, xisf) {
+        Ok(geometry) => geometry,
+        Err(e) => {
+            tracing::warn!(path = %label.display(), error = %format!("{e:#}"), "reading the file's cfa header failed; treated as no mosaic");
+            None
+        }
+    };
+    if xisf {
+        // The prelude is 16 bytes, the XML follows.
+        let Some(xml) = bytes.get(16..) else {
+            return unsupported_shape("unreadable XISF header: truncated".to_string());
+        };
+        return shape_from_xisf_xml(&String::from_utf8_lossy(xml), cfa_of);
+    }
+    match crate::integration::banded::fits_info_from_reader(&mut &bytes[..]) {
+        Some(info) => shape_from_fits_info(&info, cfa_of),
+        None => unsupported_shape(NOT_A_SUPPORTED_FITS.to_string()),
     }
 }
 
@@ -584,6 +632,52 @@ mod tests {
             prepared_bytes(&probe_file(&p("mono.fits")), &PrepareAction::InPlace),
             0
         );
+    }
+
+    /// The header-only classification of a zip entry equals `probe_file` on the same file on disk —
+    /// float, integer, three-plane, mosaic (with its CFA phase), XISF, an unsupported primary, and the
+    /// distributed XISF — so Prepare decides freshness from the entry exactly as it would from the file.
+    #[test]
+    fn probe_zip_entry_equals_probe_file_for_every_kind() {
+        use crate::archive::models::ArchiveCompression;
+        use crate::archive::zip_writer::{build_zip, ZipEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let phased = vec![
+            Card::new("BAYERPAT", CardValue::Str("GRBG".into())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("YBAYROFF", CardValue::Integer(0)).unwrap(),
+        ];
+        write_fits_f32(&p("mono.fits"), 12, 8, 1, &[0.1; 96], &[]).unwrap();
+        write_fits_f32(&p("rgb.fits"), 8, 8, 3, &[0.1; 192], &[]).unwrap();
+        write_fits_f32(&p("mosaic.fits"), 8, 8, 1, &[0.1; 64], &mosaic_cards()).unwrap();
+        write_fits_f32(&p("phased.fits"), 8, 8, 1, &[0.1; 64], &phased).unwrap();
+        crate::stacking::test_fixtures::write_fits_i16(&p("adu.fits"), 8, 8, &[100i16; 64], &[]);
+        write_xisf_f32(&p("x.xisf"), 8, 8, 1, &[0.1; 64], &[]).unwrap();
+        write_xisf_f32(&p("xmosaic.xisf"), 8, 8, 1, &[0.1; 64], &mosaic_cards()).unwrap();
+        write_xisf_f32(&p("xrgb.xisf"), 8, 8, 3, &[0.1; 192], &[]).unwrap();
+        write_empty_primary(&p("tile.fits"));
+        write_distributed_xisf(&p("dist.xisf"));
+        let names = [
+            "mono.fits", "rgb.fits", "mosaic.fits", "phased.fits", "adu.fits", "x.xisf", "xmosaic.xisf",
+            "xrgb.xisf", "tile.fits", "dist.xisf",
+        ];
+        let zip = p("all.zip");
+        let entries: Vec<ZipEntry> = names
+            .iter()
+            .map(|n| ZipEntry { source_path: p(n), path_in_zip: (*n).to_string() })
+            .collect();
+        build_zip(&zip, &entries, ArchiveCompression::Store).unwrap();
+        for name in names {
+            let label = p(name);
+            let from_entry = probe_zip_entry(&zip, name, &label).unwrap();
+            assert_eq!(from_entry, probe_file(&label), "{name}");
+        }
+        assert!(
+            probe_zip_entry(&zip, "absent.fits", &p("absent.fits")).is_err(),
+            "an entry the zip does not hold is an Err, not a verdict"
+        );
+        assert!(probe_zip_entry(&p("no.zip"), "mono.fits", &p("mono.fits")).is_err());
     }
 
     fn stamp_cards() -> Vec<Card> {

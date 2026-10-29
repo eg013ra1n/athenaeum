@@ -124,6 +124,13 @@ key is stable.
 Black Hole gets a zip target: a Black Hole item is either a `files` row (as today) or a `zip_archives` row. The exact
 schema shape (nullable `zip_archive_id` beside `file_id`, or a sibling table) is the builder's choice.
 
+A zip in the Black Hole behaves like files in the Black Hole (owner ruling A, 2026-10-28): present, not used. One
+SQL fragment (`db::FRAME_NOT_IN_BLACK_HOLE_SQL` / `file_not_in_black_hole_sql`) covers a file in the Black Hole itself
+or inside a zip that is, and the stacking, export, hour-total, duplicate-group and Sky Chart pointing readers all splice
+it in. A master inside such a zip stays registered (Restore keeps its provenance) but is not a matcher candidate
+(`calibration_set_in_black_hole_zip_sql`) and counts in readiness as a missing, never-rebuildable master. Collab keeps
+holding every zip-resident light back.
+
 Migrations backfill `zip_archives` rows for existing Move and ZIP zips from `archive_operation_files`. The CRC32 column
 is filled from each zip's directory lazily (a missing zip leaves it NULL; extraction then verifies by `expected_hash`
 for our rows).

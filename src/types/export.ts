@@ -472,7 +472,12 @@ error: string | null,
  * Project export only (plan P11): files symlinked / copied as is /
  * written as a FILTER-patched copy / failed. `0` for a frame-set export.
  */
-linked: number, copied: number, rewritten: number, failed: number, };
+linked: number, copied: number, rewritten: number, failed: number, 
+/**
+ * Files that live inside a zip and were COPIED although the export was asked to link them (a link into the
+ * zip cache would dangle once the cache evicts the entry). `0` for an export with no such file.
+ */
+zipCopied: number, };
 
 export type ExportSummary = { 
 /**
@@ -791,7 +796,11 @@ export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesO
  * Project export only (plan P11): files symlinked / copied as is /
  * written as a FILTER-patched copy / failed. `0` for a frame-set export.
  */
-linked: number, copied: number, rewritten: number, failed: number, };
+linked: number, copied: number, rewritten: number, failed: number, 
+/**
+ * See [`ExportResult::zip_copied`].
+ */
+zipCopied: number, };
 
 export type ExportMode = "lightsOnly" | "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
 

@@ -129,6 +129,23 @@ module's `ENV_LOCK` — see `logging/mod.rs::tests` for both patterns.
 - Never `println!`/`eprintln!` in production code (grep-gated); never log
   secrets or full header dumps.
 
+## Zip archive events
+
+Zip work logs under `athenaeum_core::zip_store` (scan, extraction, cache, catalog moves) and `athenaeum_core::archive`; turn the `scanner` and `archive` module levels up to `debug` to see per-entry decisions. Every event about one entry carries `zip_path` + `zip_entry`. The stable phrases to grep:
+
+| Phrase | Level | Fields | Use |
+| ---- | ---- | ---- | ---- |
+| `zip scanned` | info | `root_id`, `zip_path`, `count` (frames cataloged), `new`, `updated`, `bytes_read` | The metadata-scan budget check: `bytes_read` is at most 64 KiB per entry plus the directory and under 0.5% of the zip. A rescan of an unchanged zip logs nothing (one `stat`). |
+| `zip entry materialized` | debug | `zip_path`, `zip_entry`, `cache_hit`, `bytes_read` | One extraction request; `cache_hit = true` means no read from the zip. |
+| `zip entry extraction failed` / `extracted zip entry does not match the hash recorded when it was archived` | warn | `zip_path`, `zip_entry`, `error` / `expected_hash`, `actual_hash` | A frame that cannot be read ("inside X.zip, which is not reachable"). |
+| `zip cache evicted` / `zip cache cleared` | debug / info | `bytes`, `limit_bytes` | The cache shrinking back to its limit after an operation released its pins. |
+| `zip frames unpacked` | info | `unpacked`, `adopted`, `conflicts` | A permanent unpack. |
+| `frames already in zip files left out of the archive plan` | info | `frames_set_id`, `skipped`, `remaining` | Move and ZIP skipping zip-resident members. |
+| `rollback refused: ...` / `keeping the zip after restore: ...` | error / warn | `operation_id`, `lost`, `first` / `zip_path`, `count` | The archive safety refusals. |
+| `zip renamed in the catalog` / `zip sent to void` / `relink zips` | info | `src`, `dest`, `rows`, `virtual_paths` / `zip_path`, `rows` / `moved`, `present`, `missing` | Whole-zip rename, Void and relink. |
+
+The new field names (`zip_path`, `zip_entry`, `zip_id`, `zip_cache_key`, `cache_hit`, `bytes_read`, `limit_bytes`, `unpacked`, `adopted`, `conflicts`, `zips`, `moved`, `present`, `missing`, `virtual_paths`, `rows`, `cataloged_frames`, `frames_set_id`, `calibration_set_id`, `skipped`, `remaining`, `expected_hash`, `actual_hash`, `owner_file_id`, `stored_size`, `actual`, `lost`, `first`, `swept`, `old_path`, `offline_root`, `prefix`, `file_a`, `file_b`) are defined in the logging spec's "Dictionary extension (zip archives in the catalog)" paragraph; `bytes_read` keeps its integration meaning (band reads) elsewhere. Query with `athenaeum-logs` `query_logs(contains="zip_path")`, or `get_operation` on an `archive_op` id for a Move and ZIP / Unarchive.
+
 ## Memory diagnostics (stacking, dev only)
 
 Every stacking stage start logs a debug `memory relief` line (footprint before / after the allocator's free-page release) and the run logs debug `memory checkpoint` lines at named points. `ATH_VMMAP_DIAG=1` (macOS only, default off) additionally writes `vmmap --summary <own pid>` at each stage start to `<log dir>/vmmap/<run_id>-<stage>-<group>.txt`; a spawn failure logs a `warn!` and the stage carries on.

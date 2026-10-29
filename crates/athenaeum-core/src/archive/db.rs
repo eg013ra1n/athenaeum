@@ -322,6 +322,15 @@ pub fn mark_file_archived(
     Ok(())
 }
 
+/// Record the CRC32 the zip's directory holds for the entry a moved row now lives in.
+pub fn set_file_entry_crc32(conn: &Connection, file_id: i64, crc32: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET archive_entry_crc32 = ?1 WHERE id = ?2",
+        params![i64::from(crc32), file_id],
+    )?;
+    Ok(())
+}
+
 /// Clear archive markers from a file row. Optional inputs let callers also
 /// rewrite the path, refresh the on-disk modified_at, and refresh the size.
 /// All four columns move atomically in a single UPDATE so a partial commit
@@ -337,12 +346,13 @@ pub fn unmark_file_archived(
     new_modified_at: Option<&str>,
     new_size: Option<i64>,
 ) -> Result<()> {
-    // Build the SET clause dynamically. The four archive marker columns are
-    // always cleared; path/modified_at/size are conditional.
+    // Build the SET clause dynamically. The archive marker columns (the entry CRC
+    // included) are always cleared; path/modified_at/size are conditional.
     let mut sets: Vec<&str> = vec![
         "archived_in_operation = NULL",
         "archive_zip_path = NULL",
         "archive_path_in_zip = NULL",
+        "archive_entry_crc32 = NULL",
     ];
     if new_path.is_some() { sets.push("path = ?"); }
     if new_modified_at.is_some() { sets.push("modified_at = ?"); }
@@ -565,6 +575,30 @@ mod tests {
         assert_eq!(mtime, "2020-01-01T00:00:00+00:00"); // unchanged
         assert_eq!(size, 100); // unchanged
         assert!(archived_op.is_none()); // markers cleared
+    }
+
+    #[test]
+    fn unmark_file_archived_clears_the_entry_crc() {
+        let (conn, _) = setup();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (45, '/q.fits', 'q.fits', 100, '2020-01-01T00:00:00+00:00',
+                     'FITS', 7, '/arch/x.zip', 'Lights/q.fits')",
+            [],
+        ).unwrap();
+        set_file_entry_crc32(&conn, 45, 0xDEAD_BEEF).unwrap();
+        let crc: Option<i64> = conn
+            .query_row("SELECT archive_entry_crc32 FROM files WHERE id = 45", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(crc, Some(0xDEAD_BEEF));
+
+        unmark_file_archived(&conn, 45, None, None, None).unwrap();
+
+        let crc: Option<i64> = conn
+            .query_row("SELECT archive_entry_crc32 FROM files WHERE id = 45", [], |r| r.get(0))
+            .unwrap();
+        assert!(crc.is_none(), "a row that left its zip keeps no entry CRC");
     }
 
     /// Pins the SET-clause ↔ value-binding ordering. The dynamic builder appends

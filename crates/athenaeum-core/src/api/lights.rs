@@ -96,6 +96,11 @@ pub struct ExportReadiness {
     /// is not counted: its missing files fail per file in the run, as they
     /// always have.
     pub missing_raw_calibration_files: i64,
+    /// Master sets in the export tree whose file sits inside a zip in the Black Hole (owner ruling A:
+    /// present, not used). Gates the raw-with-masters mode, which places every master in the tree;
+    /// the calibrated mode reads the same masters through `missing_master_files`.
+    #[serde(default)]
+    pub black_hole_zip_masters: i64,
     pub file_counts: ExportFileCounts,
     /// Plan 5b Task 8 (owner requirement 2026-09-09 — "the pipeline builds
     /// its own masters"): the `raw_set_ids_without_master` subset the
@@ -325,6 +330,11 @@ fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String
 
 // ── Export readiness + the shared mode gate (spec 2026-08-28 §5) ─────────────
 
+/// The blocker sentence for master files that cannot be used (`modeBlocker.ts` and the collab gate match it).
+fn missing_master_files_sentence(n: i64) -> String {
+    format!("{n} master file(s) missing on disk — restore from archive first")
+}
+
 /// The ONE gate shared by `export_to_wbpp` and `enqueue_frame_set_send`. The
 /// returned sentence is what the Export tab shows under a disabled mode.
 pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), String> {
@@ -347,8 +357,7 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
             ),
         ),
         ExportMode::RawWithCalibrationSets => Ok(()),
-        ExportMode::RawWithMasters if r.raw_sets_without_master == 0 => Ok(()),
-        ExportMode::RawWithMasters => {
+        ExportMode::RawWithMasters if r.raw_sets_without_master > 0 => {
             let n = r.raw_sets_without_master;
             Err(format!(
                 "{n} calibration set{} {} no master — build masters first",
@@ -356,6 +365,12 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
                 if n == 1 { "has" } else { "have" }
             ))
         }
+        // Owner ruling A: the mode places every master in the tree, and a master inside a Black Hole zip
+        // is present but not used. Same sentence the calibrated mode gives for an unusable master file.
+        ExportMode::RawWithMasters if r.black_hole_zip_masters > 0 => {
+            Err(missing_master_files_sentence(r.black_hole_zip_masters))
+        }
+        ExportMode::RawWithMasters => Ok(()),
         // Masters-built strictness (v2 §4): the export generates the calibrated
         // files itself, so it needs INPUTS, not artifacts. Masters first — a
         // build is the step that can also change what a light resolves to, so
@@ -391,10 +406,7 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
         // one `open_generation` would otherwise only discover partway through
         // generating the batch.
         ExportMode::CalibratedLights if r.missing_master_files > 0 => {
-            let n = r.missing_master_files;
-            Err(format!(
-                "{n} master file(s) missing on disk — restore from archive first"
-            ))
+            Err(missing_master_files_sentence(r.missing_master_files))
         }
         ExportMode::CalibratedLights => Ok(()),
     }
@@ -557,10 +569,28 @@ pub(crate) fn readiness_from_data(
     // Owned (not borrowed from `master_paths`) because Plan 5b Task 8b's
     // transitive pass below adds entries the light-link pass above never
     // saw; `BTreeMap` keeps the same distinct-by-path dedup discipline.
+    //
+    // A master is missing only when its bytes are reachable nowhere: not on
+    // disk and, for a zip-resident row, not listed by its zip
+    // (`catalog_path_is_present`, the one presence rule). The blockers built
+    // from this list therefore never fire for a master a stack can extract.
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
     let mut missing_masters: BTreeMap<PathBuf, i64> = BTreeMap::new();
     for (path, &master_set_id) in &master_paths {
-        if std::fs::metadata(path).is_err() {
-            tracing::warn!(path = %path.display(), "master file missing on disk");
+        if !crate::zip_store::presence::catalog_path_is_present(
+            conn,
+            &mut presence,
+            &path.to_string_lossy(),
+        ) {
+            tracing::warn!(path = %path.display(), "master file missing on disk and in zip files");
+            missing_masters.insert(path.clone(), master_set_id);
+        } else if crate::db::calibration_set_in_black_hole_zip(conn, master_set_id)
+            .map_err(|e| ApiError::Internal(format!("black hole zip check {master_set_id}: {e:#}")))?
+        {
+            // Owner ruling A: a master inside a zip in the Black Hole is present but not used. It counts
+            // as missing here (never rebuildable, `classify_master_rebuildability`) so no export, send or
+            // stack consumes it until the zip is restored.
+            tracing::warn!(path = %path.display(), master_set_id, "master is inside a zip in the Black Hole");
             missing_masters.insert(path.clone(), master_set_id);
         }
     }
@@ -595,7 +625,7 @@ pub(crate) fn readiness_from_data(
         // call; the rebuildability loop right below already degrades this
         // way, so this pass must too. Degrade to a warning and move on — the
         // flat itself stays the only listed missing master.
-        match precal_master_for_missing_flat(conn, master_set_id) {
+        match precal_master_for_missing_flat(conn, &mut presence, master_set_id) {
             Ok(Some((precal_path, precal_set_id))) => {
                 if !missing_masters.contains_key(&precal_path) {
                     tracing::warn!(
@@ -670,6 +700,10 @@ pub(crate) fn readiness_from_data(
     let raw_set_ids_without_master =
         crate::export::data_collector::raw_sets_without_master(conn, &data)
             .map_err(|e| ApiError::Internal(format!("raw-set readiness: {e:#}")))?;
+    let black_hole_zip_masters =
+        crate::export::data_collector::black_hole_zip_master_set_ids(conn, &data)
+            .map_err(|e| ApiError::Internal(format!("black hole zip masters: {e:#}")))?
+            .len() as i64;
     let file_counts = crate::export::data_collector::export_file_counts(conn, &data)
         .map_err(|e| ApiError::Internal(format!("export file counts: {e:#}")))?;
     // The sets mode's own walk, on a copy: which raw originals it would swap
@@ -738,6 +772,7 @@ pub(crate) fn readiness_from_data(
         raw_set_ids_without_master,
         missing_master_files,
         missing_raw_calibration_files,
+        black_hole_zip_masters,
         file_counts,
         raw_sets_buildable,
         raw_sets_unbuildable,
@@ -1031,28 +1066,43 @@ fn classify_raw_set_buildability(
         )));
     }
 
+    // A member is present on disk or, as a zip-resident row, in its zip
+    // (`row_is_present`): a stack extracts those. The "archived — restore
+    // first" answer therefore means the bytes are reachable nowhere.
     let mut stmt = conn.prepare(
-        "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
+        "SELECT fi.path, fi.archived_in_operation, fi.archive_zip_path, fi.archive_path_in_zip
+         FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE csf.set_id = ?1",
     )?;
-    let rows: Vec<(String, Option<i64>)> = stmt
-        .query_map([raw_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    type Member = (String, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Member> = stmt
+        .query_map([raw_set_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let total = rows.len();
-    let missing: Vec<&(String, Option<i64>)> = rows
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    let missing: Vec<&Member> = rows
         .iter()
-        .filter(|(p, _)| !std::path::Path::new(p).exists())
+        .filter(|(p, _, zip, entry)| {
+            !crate::zip_store::presence::row_is_present(
+                &mut presence,
+                p,
+                zip.as_deref(),
+                entry.as_deref(),
+            )
+        })
         .collect();
     if missing.is_empty() {
         return Ok(None);
     }
-    if missing.iter().any(|(_, archived)| archived.is_some()) {
+    if missing.iter().any(|(_, archived, _, _)| archived.is_some()) {
         return Ok(Some("archived — restore first".to_string()));
     }
     Ok(Some(format!(
-        "{} of {total} raw frames missing on disk",
+        "{} of {total} raw frames missing on disk and in zip files",
         missing.len()
     )))
 }
@@ -1066,6 +1116,12 @@ fn classify_master_rebuildability(
     conn: &Connection,
     master_set_id: i64,
 ) -> Result<Option<String>, ApiError> {
+    // A master in a Black Hole zip is never rebuilt around its zip: restoring the zip is the only way back.
+    if crate::db::calibration_set_in_black_hole_zip(conn, master_set_id)
+        .map_err(|e| ApiError::Internal(format!("black hole zip check {master_set_id}: {e:#}")))?
+    {
+        return Ok(Some("master is inside a zip in the Black Hole - restore the zip first".to_string()));
+    }
     let Some(prov) = crate::db::master_provenance::get(conn, master_set_id).map_err(|e| {
         ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
     })?
@@ -1075,6 +1131,11 @@ fn classify_master_rebuildability(
     let Some(source_set_id) = prov.source_set_id else {
         return Ok(Some("no provenance".to_string()));
     };
+    // A master that lives in a zip is never rebuilt in place (its row path is not ours to write):
+    // missing here means its zip is unreachable, and the plan blocks on it.
+    if let Some(reason) = crate::api::masters::zip_resident_master_block(conn, master_set_id)? {
+        return Ok(Some(reason));
+    }
     match crate::api::masters::check_rebuild_source_ready(conn, source_set_id) {
         Ok(()) => Ok(None),
         Err(e) => Ok(Some(e.to_string())),
@@ -1097,6 +1158,7 @@ fn classify_master_rebuildability(
 /// caller's to degrade, never propagated further.
 fn precal_master_for_missing_flat(
     conn: &Connection,
+    presence: &mut crate::zip_store::presence::ZipPresence,
     master_set_id: i64,
 ) -> Result<Option<(PathBuf, i64)>, ApiError> {
     let imagetyp: String = conn.query_row(
@@ -1131,7 +1193,15 @@ fn precal_master_for_missing_flat(
         return Ok(None);
     };
     let precal_path = PathBuf::from(precal_path);
-    if std::fs::metadata(&precal_path).is_err() {
+    // Owner ruling A: a pre-calibration master inside a Black Hole zip is present but not used, so it
+    // counts as missing here (never rebuildable, `classify_master_rebuildability`).
+    let unusable = !crate::zip_store::presence::catalog_path_is_present(
+        conn,
+        presence,
+        &precal_path.to_string_lossy(),
+    ) || crate::db::calibration_set_in_black_hole_zip(conn, precal_set_id)
+        .map_err(|e| ApiError::Internal(format!("black hole zip check {precal_set_id}: {e:#}")))?;
+    if unusable {
         Ok(Some((precal_path, precal_set_id)))
     } else {
         Ok(None)
@@ -1982,6 +2052,7 @@ mod tests {
             raw_set_ids_without_master: vec![],
             missing_master_files: 0,
             missing_raw_calibration_files: 0,
+            black_hole_zip_masters: 0,
             file_counts: Default::default(),
             raw_sets_buildable: vec![],
             raw_sets_unbuildable: vec![],
@@ -2303,6 +2374,44 @@ mod tests {
         );
     }
 
+    /// A raw set whose members sit inside a zip is buildable while the zip lists them (a
+    /// build extracts them); once the zip is gone the same set is unbuildable, and the
+    /// reason names both places the frames were looked for.
+    #[test]
+    fn raw_set_buildability_counts_zip_resident_members_as_present() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
+        )
+        .unwrap();
+        let raw = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
+        add_link(&conn, 1, raw, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        let file_ids: Vec<i64> = (0..3).map(|i| 300 * 100 + i + 7_000_000).collect();
+        let zip = tmp.path().join("darks.zip");
+        zip_files(&conn, &file_ids, &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.raw_sets_buildable, vec![raw], "{:?}", r.raw_sets_unbuildable);
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(r.raw_sets_buildable.is_empty());
+        assert_eq!(
+            r.raw_sets_unbuildable,
+            vec![(raw, "3 of 3 raw frames missing on disk and in zip files".to_string())]
+        );
+    }
+
     /// M4b ruling R-T6-6: [`compute_export_readiness_for_frames`] derives
     /// `raw_set_ids_without_master` over the GIVEN light subset only — a
     /// raw set linked exclusively to a light outside that subset must not
@@ -2512,6 +2621,98 @@ mod tests {
         );
     }
 
+    /// A missing master that lives in a zip is never rebuildable, even with its raw sources on disk: a
+    /// rebuild would write at the row's path (`<zip>/<entry>`). It lands in `masters_unrebuildable`
+    /// naming the zip, and a master whose zip is present is simply not missing.
+    #[test]
+    fn a_master_in_a_missing_zip_is_unrebuildable_even_with_reachable_sources() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let master = 400;
+        let master_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master bytes").unwrap();
+        seed_master_with_file(&conn, master, "MasterDark", &master_path);
+        let source = seed_raw_set_real_files(&conn, tmp.path(), 401, "Dark", 3);
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: master,
+                source_set_id: Some(source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, master, "Dark");
+        let zip = tmp.path().join("masters.zip");
+        let paths = zip_files(&conn, &[master * 100 + 8_000_000], &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0, "its zip lists it");
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1);
+        assert!(r.masters_rebuildable.is_empty(), "{:?}", r.masters_rebuildable);
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(master, "master is inside masters.zip, which is not reachable".to_string())]
+        );
+        assert!(!zip.exists() && !std::path::Path::new(&paths[0]).exists());
+    }
+
+    /// Owner ruling A (2026-10-28): a master inside a zip that sits in the Black Hole is present but not
+    /// used. Readiness counts it as a missing master that is never rebuildable, so export, send and
+    /// stacking refuse it; restoring the zip makes it usable again.
+    #[test]
+    fn a_master_in_a_black_hole_zip_is_missing_and_unrebuildable_until_restored() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let master = 400;
+        let master_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master bytes").unwrap();
+        seed_master_with_file(&conn, master, "MasterDark", &master_path);
+        add_link(&conn, 1, master, "Dark");
+        let zip = tmp.path().join("masters.zip");
+        zip_files(&conn, &[master * 100 + 8_000_000], &zip, Shape::Foreign);
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+             VALUES (?1, 10, 'x', 1, 'x')",
+            [zip.to_string_lossy()],
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0, "its zip lists it");
+
+        let id = crate::db::add_zip_to_black_hole(&conn, &zip.to_string_lossy(), "files").unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "present, not used");
+        assert!(r.masters_rebuildable.is_empty(), "{:?}", r.masters_rebuildable);
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(master, "master is inside a zip in the Black Hole - restore the zip first".to_string())]
+        );
+        assert!(check_mode_ready(&r, ExportMode::CalibratedLights).is_err());
+        let registered: i64 = conn
+            .query_row("SELECT is_master_library FROM calibration_set WHERE id = ?1", [master], |r| r.get(0))
+            .unwrap();
+        assert_eq!(registered, 1, "never unregistered");
+
+        crate::db::restore_zip_from_black_hole(&conn, id).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0);
+        assert!(r.masters_unrebuildable.is_empty());
+    }
+
     /// Plan 5b Task 8b (found by the Task 7 acceptance run on the real LDN
     /// 1272 catalog): a missing MASTER FLAT (500) is rebuilt from its raw
     /// source set (501) via `select_flat_precal`'s DarkFlat -> Dark -> Bias
@@ -2582,6 +2783,131 @@ mod tests {
             "{:?}",
             r.masters_unrebuildable
         );
+    }
+
+    /// Owner ruling A: the pre-calibration master a missing master flat's rebuild would pick sits in a Black
+    /// Hole zip. Its file is on disk, yet it counts as missing and unrebuildable (the stacking plan blocks on
+    /// it and stage 0.5 never extracts it); Restore lifts it.
+    #[test]
+    fn a_precal_master_in_a_black_hole_zip_is_listed_missing_and_unrebuildable() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let flat_path = tmp.path().join("master_flat_500.fits");
+        seed_master_with_file(&conn, 500, "MasterFlat", &flat_path);
+        let flat_source = seed_raw_set_real_files(&conn, tmp.path(), 501, "Flat", 3);
+        conn.execute("UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1", [flat_source]).unwrap();
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(flat_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, 500, "Flat");
+
+        let dark_path = tmp.path().join("master_dark_502.fits");
+        std::fs::write(&dark_path, b"dark").unwrap();
+        seed_master_with_file(&conn, 502, "MasterDark", &dark_path);
+        conn.execute("UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1", [502]).unwrap();
+        add_set_link(&conn, flat_source, 502, "Dark");
+        let zip = tmp.path().join("precal.zip");
+        crate::zip_store::test_support::zip_files(
+            &conn,
+            &[502 * 100 + 8_000_000],
+            &zip,
+            crate::zip_store::test_support::Shape::Foreign,
+        );
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+             VALUES (?1, 10, 'x', 1, 'x')",
+            [zip.to_string_lossy()],
+        )
+        .unwrap();
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "only the flat master is missing: {r:?}");
+
+        let bh = crate::db::add_zip_to_black_hole(&conn, &zip.to_string_lossy(), "files").unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 2, "the precal master is present, not used: {r:?}");
+        assert!(
+            r.masters_unrebuildable.contains(&(
+                502,
+                "master is inside a zip in the Black Hole - restore the zip first".to_string()
+            )),
+            "{:?}",
+            r.masters_unrebuildable
+        );
+        assert!(!r.masters_rebuildable.contains(&502), "{:?}", r.masters_rebuildable);
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "restored: usable again");
+    }
+
+    /// Owner ruling A: the raw-with-masters mode places every master in the export tree, so a master inside a
+    /// Black Hole zip refuses the mode with the same sentence the calibrated mode gives for an unusable master
+    /// file. The data transform refuses it too, so nothing is placed even if a caller skipped the gate. The
+    /// other modes are unaffected (the sets mode does not place that file), and Restore lifts the refusal.
+    #[test]
+    fn raw_with_masters_refuses_a_master_in_a_black_hole_zip() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let master_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master bytes").unwrap();
+        seed_master_with_file(&conn, 400, "MasterDark", &master_path);
+        add_link(&conn, 1, 400, "Dark");
+        let transform = |conn: &Connection| {
+            let mut data = crate::export::collect_export_data(conn, 1).unwrap();
+            crate::export::data_collector::apply_export_mode(conn, &mut data, ExportMode::RawWithMasters, None)
+        };
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.black_hole_zip_masters, 0);
+        assert!(check_mode_ready(&r, ExportMode::RawWithMasters).is_ok());
+        transform(&conn).expect("a loose master is placed");
+
+        let zip = tmp.path().join("masters.zip");
+        crate::zip_store::test_support::zip_files(
+            &conn,
+            &[400 * 100 + 8_000_000],
+            &zip,
+            crate::zip_store::test_support::Shape::Foreign,
+        );
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at)
+             VALUES (?1, 10, 'x', 1, 'x')",
+            [zip.to_string_lossy()],
+        )
+        .unwrap();
+        let bh = crate::db::add_zip_to_black_hole(&conn, &zip.to_string_lossy(), "files").unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.black_hole_zip_masters, 1);
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::RawWithMasters).unwrap_err(),
+            "1 master file(s) missing on disk — restore from archive first"
+        );
+        for mode in [ExportMode::LightsOnly, ExportMode::RawWithCalibrationSets] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
+        let err = transform(&conn).unwrap_err().to_string();
+        assert!(err.contains("master file(s) missing on disk — restore from archive first"), "{err}");
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.black_hole_zip_masters, 0);
+        assert!(check_mode_ready(&r, ExportMode::RawWithMasters).is_ok());
+        transform(&conn).expect("restored: placed again");
     }
 
     /// Same shape, but the MasterFlat's own FILE exists on disk — its
@@ -2899,6 +3225,48 @@ mod tests {
             assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
         }
     }
+
+    /// The same shape as above, but the raw originals went into a zip: they are present while the zip lists
+    /// them, so the sets mode is ready (the export reads them through the zip cache). With the zip gone they
+    /// are missing again, with the same sentence.
+    #[test]
+    fn export_readiness_counts_zip_present_raw_calibration_as_available() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        let raw = seed_raw_set_with_frames(&conn, 200, "Dark", 2);
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 100 WHERE id = ?1",
+            [raw],
+        )
+        .unwrap();
+        add_link(&conn, 1, 100, "Dark");
+        // Real raw files, then into a zip.
+        let file_ids = [5_020_000i64, 5_020_001];
+        for (i, id) in file_ids.iter().enumerate() {
+            let path = tmp.path().join(format!("Dark_200_{i}.fits"));
+            std::fs::write(&path, vec![i as u8; 64]).unwrap();
+            conn.execute("UPDATE files SET path = ?1 WHERE id = ?2", params![path.to_string_lossy(), id])
+                .unwrap();
+        }
+        let zip = tmp.path().join("darks.zip");
+        zip_files(&conn, &file_ids, &zip, Shape::Foreign);
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_raw_calibration_files, 0, "the zip lists both originals");
+        assert!(check_mode_ready(&r, ExportMode::RawWithCalibrationSets).is_ok());
+
+        std::fs::remove_file(&zip).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_raw_calibration_files, 2, "an unreachable zip makes them missing, not deleted");
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::RawWithCalibrationSets).unwrap_err(),
+            "2 raw calibration file(s) missing on disk — restore from archive first"
+        );
+    }
 }
 
 // ── Real-data end-to-end (spec §11: repointed from the retired standalone
@@ -2986,6 +3354,7 @@ mod real_data_e2e {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         })
     }
 

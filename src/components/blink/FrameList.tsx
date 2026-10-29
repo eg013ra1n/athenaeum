@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import type { FrameListProps, SortField } from "./types";
+import { Chip } from "../ui";
+import { isInZip, revealRequest } from "../../utils/zipChips";
 
 function formatTime(dateStr: string | null | undefined): string {
   if (!dateStr) return "--/--/-- --:--:--";
@@ -53,6 +55,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   currentIndex,
   selectedFrames,
   blackholedFileIds,
+  zipBlackholedFileIds,
   loadingIndices,
   analysisMap,
   sortField,
@@ -176,7 +179,8 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
             const frame = frames[index];
             const isSelected = selectedFrames.has(index);
             const isCurrent = index === currentIndex;
-            const isBlackholed = frame.file.id ? blackholedFileIds.has(frame.file.id) : false;
+            const inBlackHoleZip = frame.file.id ? (zipBlackholedFileIds?.has(frame.file.id) ?? false) : false;
+            const isBlackholed = inBlackHoleZip || (frame.file.id ? blackholedFileIds.has(frame.file.id) : false);
             const analysis = frame.frame?.id ? analysisMap.get(frame.frame.id) : undefined;
 
             // Two independent visual channels so the three states never hide
@@ -207,7 +211,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                 data-frame-index={index}
                 onClick={(e) => onFrameClick(index, e)}
                 className={rowClasses}
-                title={frame.file.filename}
+                title={inBlackHoleZip ? `${frame.file.filename} — its zip is in the Black Hole` : frame.file.filename}
               >
                 <div className="flex items-center gap-1.5 min-h-[18px]">
                   {isBlackholed ? (
@@ -233,6 +237,9 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                       <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}</span>
                     </>
                   )}
+                  {isInZip(frame.file) && (
+                    <Chip tone="info" title={inBlackHoleZip ? `Inside ${frame.file.archive_zip_path}, which is in the Black Hole` : `Inside ${frame.file.archive_zip_path}`}>zip</Chip>
+                  )}
                   {frame.badge && (
                     <span className="flex-shrink-0 text-[10px] font-medium text-warning">{frame.badge}</span>
                   )}
@@ -244,11 +251,11 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                       onClick={(e) => {
                         e.stopPropagation();
                         navigate('/files', {
-                          state: { reveal: { path: frame.file.path, token: Date.now() } },
+                          state: { reveal: revealRequest(frame.file.path, frame.file) },
                         });
                       }}
                       className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
-                      title="Locate in file browser"
+                      title={isInZip(frame.file) ? "Locate in the zip" : "Locate in file browser"}
                     >
                       <FolderOpen size={12} />
                     </button>

@@ -253,6 +253,7 @@ pub async fn plate_solve_batch(
     let app_workers = app.clone();
     let cancel_worker = Arc::clone(&cancel_flag);
     let ps_config_arc = Arc::clone(&ps_config);
+    let ctx_workers = Arc::clone(&state.ctx);
 
     let results: Vec<WorkResult> = tokio::task::spawn_blocking(move || {
         let work = Mutex::new(work_items.into_iter());
@@ -307,7 +308,8 @@ pub async fn plate_solve_batch(
                             let index_refs: Vec<&solvemyastro::QuadIndex> =
                                 index_packs.iter().map(|a| a.as_ref()).collect();
                             let solve = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                service::solve_frame_with_hints(
+                                service::solve_catalog_frame_with_hints(
+                                    &ctx_workers,
                                     &frame,
                                     &file_path,
                                     &hints,

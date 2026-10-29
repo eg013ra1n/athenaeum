@@ -129,7 +129,30 @@ failed: Array<[number, string]>, };
 
 export type BulkMoveProgressEvent = { current: number, total: number, percent: number, currentFile: string | null, };
 
-export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, };
+export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, 
+/**
+ * The zip the file lives in (`files.archive_zip_path`, ours or foreign), `None` for a disk file. A
+ * frame of a zip can be restored but not voided on its own: only the whole zip can be deleted.
+ */
+archive_zip_path: string | null, };
+
+export type BlackHoleZipEntry = { 
+/**
+ * The `black_hole_zips` row id (what restore and Void take).
+ */
+id: number, 
+/**
+ * The zip's CURRENT path (`zip_archives.path`, which follows a rename).
+ */
+zipPath: string, size: number, 
+/**
+ * Frame entries the catalog holds for this zip.
+ */
+frameEntries: number, 
+/**
+ * The Move and ZIP operation that wrote this zip, when it is one of ours.
+ */
+archiveOperationId: number | null, fromWhere: string, movedAt: string, };
 
 export type FolderSimilarity = { folder_a: string, folder_b: string, similarity_percent: number, shared_files: number, shared_size: number, unique_a: number, unique_b: number, shared_file_ids: Array<number>, };
 
@@ -184,7 +207,12 @@ xorgsubf: number | null, yorgsubf: number | null, bayerpat: string | null, swcre
  */
 superseded_by_set_id: number | null, };
 
-export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, };
+export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, 
+/**
+ * Zips of the old root that are not at the new location (their frames stay at the old path and show as
+ * missing). Filled by the scan-root relink; zero for a files-only relink.
+ */
+zips_missing: number, };
 
 export type OrphanedFile = { id: number, path: string, filename: string, size: number, modified_at: string, has_frame: boolean, object: string | null, date_obs: string | null, };
 
@@ -440,7 +468,19 @@ naxis1: number | null, naxis2: number | null, ccd_temp: number | null, swcreate:
  * was computed by Athenaeum's plate solver (vs. read from the FITS
  * header). Drives the Original/Athenaeum WCS badge.
  */
-plate_solved: boolean, calibration_status: FrameCalibrationStatus, };
+plate_solved: boolean, calibration_status: FrameCalibrationStatus, 
+/**
+ * The zip this light's file lives in (`files.archive_zip_path`), ours or foreign.
+ */
+archive_zip_path: string | null, 
+/**
+ * The entry inside that zip (`files.archive_path_in_zip`).
+ */
+archive_path_in_zip: string | null, 
+/**
+ * Set for a file Move and ZIP archived itself (Unarchive restores it); `None` for a foreign zip's frame.
+ */
+archived_in_operation: number | null, };
 
 export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, 
 /**
@@ -776,7 +816,12 @@ archiveZipPath: string | null,
  * The UI uses this to hide the restore button and show an actionable
  * warning instead of letting the user kick off a restore doomed to fail.
  */
-archiveZipMissing: boolean, };
+archiveZipMissing: boolean, 
+/**
+ * Any source file lives in a zip Athenaeum did not write (a foreign zip's cataloged frame). Such
+ * originals are not "ours to archive": the UI hides "Archive originals to zip" for them.
+ */
+sourceFramesInForeignZip: boolean, };
 
 export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<BatchSkip>, };
 
@@ -846,7 +891,13 @@ missingMasterFiles: number,
  * is not counted: its missing files fail per file in the run, as they
  * always have.
  */
-missingRawCalibrationFiles: number, fileCounts: ExportFileCounts, 
+missingRawCalibrationFiles: number, 
+/**
+ * Master sets in the export tree whose file sits inside a zip in the Black Hole (owner ruling A:
+ * present, not used). Gates the raw-with-masters mode, which places every master in the tree;
+ * the calibrated mode reads the same masters through `missing_master_files`.
+ */
+blackHoleZipMasters: number, fileCounts: ExportFileCounts, 
 /**
  * Plan 5b Task 8 (owner requirement 2026-09-09 — "the pipeline builds
  * its own masters"): the `raw_set_ids_without_master` subset the

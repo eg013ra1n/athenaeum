@@ -294,10 +294,10 @@ fn frame_set_pointings(
 ) -> Result<std::collections::HashMap<i64, crate::frames_set_metadata::SetPointing>> {
     use crate::frames_set_metadata::{set_pointing, FramePointing};
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT DISTINCT ino.frames_set_id, fr.id, fr.ra, fr.dec, fr.rotation,
                     ps.id IS NOT NULL,
-                    EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = fr.file_id),
+                    NOT {not_black_holed},
                     ps.cd1_1, ps.cd1_2, ps.cd2_1, ps.cd2_2,
                     fr.naxis1, fr.naxis2, fr.xpixsz, fr.ypixsz, fr.focallen
              FROM frames fr
@@ -306,7 +306,8 @@ fn frame_set_pointings(
              JOIN imaging_nights ino ON ino.id = s.imaging_night_id
              LEFT JOIN plate_solves ps ON ps.frame_id = fr.id
              WHERE fr.ra IS NOT NULL AND fr.dec IS NOT NULL AND fr.imagetyp = 'Light'",
-        )
+            not_black_holed = crate::db::file_not_in_black_hole_sql("fr.file_id"),
+        ))
         .map_err(|e| anyhow!("Failed to prepare frame-set pointing query: {}", e))?;
     let mut by_set: std::collections::HashMap<i64, Vec<FramePointing>> = std::collections::HashMap::new();
     let rows = stmt.query_map([], |row| {
@@ -538,6 +539,53 @@ mod tests {
         assert_eq!(m.pointing_frames, 2);
         assert!((m.avg_rotation.unwrap() - 283.45).abs() < 1e-6);
         assert!((m.min_rotation.unwrap() - 283.4).abs() < 1e-9 && (m.max_rotation.unwrap() - 283.5).abs() < 1e-9);
+    }
+
+    /// Owner ruling A (2026-10-28): the lights of a zip in the Black Hole leave the set's pointing the
+    /// way single Black Hole lights do, and come back when the zip is restored.
+    #[test]
+    fn frame_set_location_ignores_the_lights_of_a_black_hole_zip() {
+        let conn = test_db();
+        insert_light(&conn, 1, "M31", "2026-03-05T22:10:00", 10.67, 41.10, 300.0);
+        insert_light(&conn, 2, "M31", "2026-03-05T22:20:00", 10.68, 41.11, 300.0);
+        insert_light(&conn, 4, "M31", "2026-03-05T22:40:00", 20.00, 30.00, 300.0);
+        for id in [1, 2, 4] {
+            conn.execute(
+                "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                     matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                     field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at)
+                 VALUES (?1, 0, 0, 0, 0, 1, 0, 0, 1, 10, 10, 0.1, 0.1, 1.0, 0, 1, 't', 't', '2026-03-06')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/nas/far.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_zip_path = '/nas/far.zip' WHERE id = 4", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (1, 1, 'a', 'b')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'TestCam')", []).unwrap();
+        for id in [1, 2, 4] {
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (1, ?1)", [id]).unwrap();
+        }
+        let dec_of = |conn: &Connection| {
+            get_imaging_locations(conn).unwrap().iter().find(|l| l.frame_set_id == Some(1)).unwrap().dec
+        };
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/nas/far.zip", "files").unwrap();
+        assert!((dec_of(&conn) - 41.105).abs() < 1e-3, "the far light is left out: {}", dec_of(&conn));
+        let m = crate::frames_set_metadata::calculate_metadata_for_frame_set(1, &conn).unwrap();
+        assert_eq!(m.pointing_frames, 2);
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert!((dec_of(&conn) - 41.105).abs() > 1.0, "restored: the far light counts again");
     }
 
     /// A solved set's box is as large as the solve says, whatever the header's

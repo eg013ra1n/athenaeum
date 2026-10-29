@@ -118,6 +118,27 @@ pub fn solve_frame_layered(
     solve_frame_with_hints(frame, file_path, &hints, &caches, &[], config, None)
 }
 
+/// [`solve_frame_with_hints`] for a catalog path: a zip-resident frame is extracted (or reused from the
+/// cache) first and its cache pin is held until the solve returns. A frame that cannot be extracted (its zip
+/// is not reachable) fails with the extraction error, which the batch reports as that frame's failure.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_catalog_frame_with_hints(
+    ctx: &crate::services::ServiceContext,
+    frame: &Frame,
+    catalog_path: &str,
+    hints: &SolveHints,
+    caches: &solvemyastro::Caches<'_>,
+    indexes: &[&solvemyastro::QuadIndex],
+    config: &PlateSolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<SolveResult> {
+    let (local, _pin) = crate::zip_store::materialize::materialize_one(ctx, catalog_path).map_err(|e| {
+        tracing::warn!(frame_id = frame.id.unwrap_or(-1), path = %catalog_path, error = %e, "plate solve: frame is not readable");
+        e
+    })?;
+    solve_frame_with_hints(frame, &local.to_string_lossy(), hints, caches, indexes, config, cancel)
+}
+
 /// Solve a single frame using pre-extracted hints and the `solvemyastro`
 /// star-cache backend. This is the hot-path function used by the batch
 /// worker pool — it is DB-free, fully `Send`, and shares read-only
@@ -682,6 +703,43 @@ pub(crate) fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zip-resident frame whose zip is gone fails with the extraction error (the batch reports it as that
+    /// frame's failure) before the solver is ever reached.
+    #[test]
+    fn a_catalog_frame_in_an_unreachable_zip_fails_with_the_extraction_error() {
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("astro")).unwrap();
+        let ctx = crate::services::ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let zip = make_zip(
+            &tmp.path().join("astro"),
+            "gone.zip",
+            &[("Lights/L_001.fits", light(1))],
+            crate::archive::models::ArchiveCompression::Deflate,
+        );
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [tmp.path().join("astro").to_str().unwrap()]).unwrap();
+            crate::zip_store::scan::scan_zip(&conn, &zip, 1, false).unwrap();
+        }
+        std::fs::remove_file(&zip).unwrap();
+        let catalog = crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits");
+        let caches = solvemyastro::Caches::layered(&[]);
+        let err = solve_catalog_frame_with_hints(
+            &ctx,
+            &Frame::default(),
+            &catalog,
+            &SolveHints::default(),
+            &caches,
+            &[],
+            &PlateSolveConfig::default(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gone.zip") && err.contains("not reachable"), "{err}");
+    }
 
     fn mk_result(matched: usize, expected: usize, ratio: f64, scale: f64, rms: f64) -> SolveResult {
         SolveResult {

@@ -90,12 +90,21 @@ fn member_attested(
     }
 }
 
-fn raw_path_of(conn: &Connection, fid: i64) -> Result<PathBuf, ApiError> {
-    let raw: String = conn
+/// The catalog path of the frame's raw file. For a zip-resident row that is its catalog path, not an
+/// extracted copy: the renderers (`read_fits_image_bytes`, `render_path_jpeg`) swap it for the cache file
+/// themselves and hold the pin while they read. Present = the file exists, or the zip lists the entry.
+///
+/// `presence` is shared by the caller: a blink of N frames from one zip reads that zip's central directory once.
+fn raw_path_of(
+    conn: &Connection,
+    presence: &mut crate::zip_store::presence::ZipPresence,
+    fid: i64,
+) -> Result<PathBuf, ApiError> {
+    let (raw, zip, entry): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT fi.path FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+            "SELECT fi.path, fi.archive_zip_path, fi.archive_path_in_zip FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
             [fid],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -103,14 +112,10 @@ fn raw_path_of(conn: &Connection, fid: i64) -> Result<PathBuf, ApiError> {
             }
             other => ApiError::Internal(format!("blink: raw path lookup failed: {other}")),
         })?;
-    let raw = PathBuf::from(raw);
-    if !raw.exists() {
-        return Err(ApiError::NotFound(format!(
-            "{} is not on this device",
-            raw.display()
-        )));
+    if !crate::zip_store::presence::row_is_present(presence, &raw, zip.as_deref(), entry.as_deref()) {
+        return Err(ApiError::NotFound(format!("{raw} is not on this device")));
     }
-    Ok(raw)
+    Ok(PathBuf::from(raw))
 }
 
 /// Spec §4.1 steps 2–3 for a frame with no own row: withheld, or its raw in
@@ -130,6 +135,7 @@ fn is_external(row: &LocalFrameRow) -> bool {
 
 fn resolve_with(
     conn: &Connection,
+    presence: &mut crate::zip_store::presence::ZipPresence,
     scope: &ProjectScope,
     project_id: &str,
     r: &CollabFrameRef,
@@ -181,7 +187,7 @@ fn resolve_with(
             }
         }
         return Ok(Resolved {
-            path: raw_path_of(conn, fid)?,
+            path: raw_path_of(conn, presence, fid)?,
             source: BlinkSource::Raw,
             row: None,
         });
@@ -200,7 +206,7 @@ fn resolve_with(
         // Spec §9.1: calibrated, or the original when attested.
         if is_external(&row) {
             let fid = row.source_frame_id.ok_or_else(not_here)?;
-            let path = raw_path_of(conn, fid)?;
+            let path = raw_path_of(conn, presence, fid)?;
             return Ok(Resolved {
                 path,
                 source: BlinkSource::Raw,
@@ -242,7 +248,8 @@ pub fn resolve_collab_frame_path(
     let scope = ProjectScope::new(ctx, project_id)?;
     let d = db(ctx)?;
     let conn = d.conn();
-    let res = resolve_with(&conn, &scope, project_id, r)?;
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
+    let res = resolve_with(&conn, &mut presence, &scope, project_id, r)?;
     Ok((res.path, res.source))
 }
 
@@ -292,8 +299,10 @@ pub fn get_collab_blink_frames(
     let conn = d.conn();
     let mut out = Vec::with_capacity(refs.len());
     let mut dropped = 0usize;
+    // One presence cache for the whole list: each zip's central directory is read once.
+    let mut presence = crate::zip_store::presence::ZipPresence::new();
     for r in refs {
-        let resolved = match resolve_with(&conn, &scope, project_id, r) {
+        let resolved = match resolve_with(&conn, &mut presence, &scope, project_id, r) {
             Ok(v) => v,
             // Only "not on this device" drops an entry; everything else
             // (Forbidden, Internal, Invalid) refuses the call.
@@ -345,9 +354,20 @@ pub fn get_collab_blink_frames(
                 imagetyp: Some(crate::models::ImageType::Light),
                 ..Default::default()
             };
+            // An own, external frame shows its raw: for a zip-resident one `path` is virtual (no file to stat),
+            // so the catalog row stands in, as in the frame-id branch above.
+            let catalog_file = match (source, row.source_frame_id) {
+                (BlinkSource::Raw, Some(fid)) => {
+                    crate::db::get_frames_with_files_by_ids(&conn, &[fid])?
+                        .into_iter()
+                        .next()
+                        .map(|(_, f, _)| f)
+                }
+                _ => None,
+            };
             (
                 frame,
-                synthetic_file(&path),
+                catalog_file.or_else(|| synthetic_file(&path)),
                 Some(row.publisher_display.clone()),
                 row.source_frame_id,
             )
@@ -704,5 +724,93 @@ mod tests {
         assert!(get_collab_blink_frames(&rig.ctx, &pid, &[r])
             .unwrap()
             .is_empty());
+    }
+
+    /// A zipped light cataloged through `scan_zip`: `(zip, frame id, catalog path)`.
+    fn zipped_frame(conn: &rusqlite::Connection, dir: &std::path::Path) -> (PathBuf, i64, String) {
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [dir.to_str().unwrap()]).unwrap();
+        let zip = make_zip(
+            dir,
+            "night.zip",
+            &[("Lights/L_001.fits", light(1))],
+            crate::archive::models::ArchiveCompression::Deflate,
+        );
+        crate::zip_store::scan::scan_zip(conn, &zip, 1, false).unwrap();
+        let catalog = crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits");
+        let frame: i64 = conn
+            .query_row(
+                "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [&catalog],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (zip, frame, catalog)
+    }
+
+    #[test]
+    fn blink_raw_path_of_resolves_a_zip_resident_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let (zip, frame, catalog) = zipped_frame(&conn, tmp.path());
+        // Present: the zip lists the entry. The catalog path comes back; the renderers extract it.
+        let mut presence = crate::zip_store::presence::ZipPresence::new();
+        assert_eq!(raw_path_of(&conn, &mut presence, frame).unwrap(), PathBuf::from(&catalog));
+        // The catalog path itself does not exist as a file.
+        assert!(!Path::new(&catalog).exists());
+        // Gone zip: "not on this device", and the row stays.
+        std::fs::remove_file(&zip).unwrap();
+        // A fresh presence: the old one remembers the zip it listed.
+        let mut presence = crate::zip_store::presence::ZipPresence::new();
+        match raw_path_of(&conn, &mut presence, frame) {
+            Err(ApiError::NotFound(m)) => assert!(m.contains("is not on this device"), "{m}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+    /// An own, externally calibrated frame is shown by uuid as its raw. When that raw sits inside a zip, the
+    /// catalog path is virtual and cannot be stat-ed: the entry must come from the catalog row, not vanish.
+    #[tokio::test]
+    async fn an_external_own_frame_in_a_zip_stays_in_the_blink_list_by_uuid() {
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        let fx = fixture(1).await;
+        mount_hub(&fx.server, "published").await;
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            conn.execute("UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1", [fx.set_id]).unwrap();
+        }
+        crate::api::collab::calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+        crate::api::collab::publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+        let zip = make_zip(
+            tmp.path(),
+            "night.zip",
+            &[("Lights/L_001.fits", light(1))],
+            crate::archive::models::ArchiveCompression::Deflate,
+        );
+        let catalog = crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits");
+        let uuid: String = {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE files SET path = ?1, filename = 'L_001.fits', size = 4321, archive_zip_path = ?2,
+                 archive_path_in_zip = 'Lights/L_001.fits'
+                 WHERE id = (SELECT file_id FROM frames WHERE id = ?3)",
+                rusqlite::params![catalog, zip.to_str().unwrap(), fx.frame_ids[0]],
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT frame_uuid FROM project_frames_local WHERE project_id = ?1 AND origin = 'own'",
+                [PID],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let by_uuid = CollabFrameRef { frame_id: None, frame_uuid: Some(uuid) };
+        let e = get_collab_blink_frames(&fx.ctx, PID, &[by_uuid]).unwrap();
+        assert_eq!(e.len(), 1, "the zip-resident frame is not dropped");
+        assert_eq!(e[0].source, BlinkSource::Raw);
+        assert_eq!(e[0].entry.file.path, catalog);
+        assert_eq!(e[0].entry.file.size, 4321, "size comes from the catalog row");
+        assert!(e[0].entry.file.id.is_some());
     }
 }

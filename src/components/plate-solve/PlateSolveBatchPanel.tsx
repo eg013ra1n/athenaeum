@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle, Loader2, ScanSearch, XCircle } from 'lucide-react';
 import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressContext';
+import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 
 export interface PlateSolveBatchPanelProps {
   /** All frame IDs shown in the current coordinates-missing list. Optional when the panel is driven imperatively. */
@@ -112,6 +113,11 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
 
   return (
     <div className="space-y-3">
+      {/* What the batch would extract from zips first: the selection if there is one, else the whole list. */}
+      {!hideTriggerButtons && !isActive && (
+        <ZipExtractionLine scope={{ frameIds: selectedFrameIds.length > 0 ? selectedFrameIds : frameIds }} />
+      )}
+
       {/* Action buttons row — hidden when driven by an outer toolbar */}
       {!hideTriggerButtons && (
         <div className="flex items-center gap-2 flex-wrap">

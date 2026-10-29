@@ -561,6 +561,9 @@ pub struct ExportCompleteEvent {
     pub rewritten: i32,
     #[serde(default)]
     pub failed: i32,
+    /// See [`ExportResult::zip_copied`].
+    #[serde(default)]
+    pub zip_copied: usize,
 }
 
 // ============================================================================
@@ -656,6 +659,10 @@ pub struct ExportResult {
     pub rewritten: i32,
     #[serde(default)]
     pub failed: i32,
+    /// Files that live inside a zip and were COPIED although the export was asked to link them (a link into the
+    /// zip cache would dangle once the cache evicts the entry). `0` for an export with no such file.
+    #[serde(default)]
+    pub zip_copied: usize,
 }
 
 // ============================================================================

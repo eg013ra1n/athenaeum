@@ -38,10 +38,49 @@ pub async fn read_fits_image_bytes(
     resolution: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<u8>, String> {
+    render_preview_bytes(PreviewSource::Catalog(path), resolution, state).await
+}
+
+/// Where a preview's bytes come from: a cataloged path, or a frame entry of a zip that the catalog holds no
+/// row for (read from the zip cache, never written to the catalog).
+pub enum PreviewSource {
+    Catalog(String),
+    ZipEntry { zip_path: String, entry: String },
+}
+
+/// Render a frame entry of a zip that the catalog holds no row for (a released entry whose link is gone, a
+/// skipped or not yet scanned one) and return the JPEG as raw bytes. Same cache, gates and semaphore as
+/// [`read_fits_image_rustafits`]. The zip path is checked by the caller.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn preview_zip_entry(
+    zip_path: String,
+    entry: String,
+    resolution: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    athenaeum_core::api::zip::check_zip_entry_readable(&athenaeum_core::api::PathPolicy::AllowAll, &zip_path, &entry)
+        .map_err(|e| e.to_string())?;
+    render_preview_bytes(PreviewSource::ZipEntry { zip_path, entry }, resolution, state)
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
+async fn render_preview_bytes(
+    source: PreviewSource,
+    resolution: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<u8>, String> {
     use std::time::Instant;
 
     let t_start = Instant::now();
-    let path_buf = PathBuf::from(&path);
+    let path = match &source {
+        PreviewSource::Catalog(p) => p.clone(),
+        PreviewSource::ZipEntry { zip_path, entry } => {
+            athenaeum_core::zip_store::scan::virtual_path(std::path::Path::new(zip_path), entry)
+        }
+    };
+    let catalog_path = PathBuf::from(&path);
 
     // ── Step 1: Read settings from DB ──
     let (resolution_str, quality) = {
@@ -90,10 +129,18 @@ pub async fn read_fits_image_bytes(
     // edit/restore invalidates naturally instead of serving a stale JPEG.
     // The stat doubles as the existence check (fail fast for deleted files —
     // including ones that still have a cached entry).
-    let cache_key = match crate::cache::preview_cache_key(&path_buf, &resolution_str) {
+    // A zip-resident frame is keyed by its catalog path plus the zip's and the entry's identity, so a hit
+    // needs no extraction and two zips holding the same entry path never share a key.
+    let key = match &source {
+        PreviewSource::Catalog(p) => athenaeum_core::cache::catalog_preview_cache_key(&state.ctx, p, &resolution_str),
+        PreviewSource::ZipEntry { zip_path, entry } => {
+            athenaeum_core::cache::zip_entry_preview_cache_key(zip_path, entry, &resolution_str)
+        }
+    };
+    let cache_key = match key {
         Ok(key) => key,
         Err(e) => {
-            return Err(format!("File not found: {} ({})", path_buf.display(), e));
+            return Err(format!("File not found: {} ({})", catalog_path.display(), e));
         }
     };
 
@@ -104,6 +151,20 @@ pub async fn read_fits_image_bytes(
             return Ok(cached.data.clone());
         }
     }
+
+    // Cache miss: a zip-resident frame is extracted (or reused from the zip cache) now; the pin keeps the
+    // cache file alive until the render below has read it. Any other path comes back untouched.
+    let (path_buf, _zip_pin) = tokio::task::block_in_place(|| match &source {
+        PreviewSource::Catalog(p) => athenaeum_core::zip_store::materialize::materialize_one(&state.ctx, p),
+        PreviewSource::ZipEntry { zip_path, entry } => {
+            athenaeum_core::zip_store::materialize::materialize_zip_entry(&state.ctx, zip_path, entry)
+                .map(|(local, pin)| (local, Some(pin)))
+        }
+    })
+    .map_err(|e| {
+        tracing::warn!(path = %path, error = %e, "preview: frame is not readable");
+        format!("Failed to read {}: {}", catalog_path.display(), e)
+    })?;
 
     // Gate BEFORE permit, never the reverse (see `VNG_GATE`'s doc): a
     // full-resolution colour render waits here holding nothing, so the image

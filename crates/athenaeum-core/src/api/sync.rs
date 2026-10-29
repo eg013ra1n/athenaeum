@@ -3446,12 +3446,44 @@ pub(crate) fn plan_selection_package(
         };
 
         let path = entry.source_path.as_path();
+        // A file inside a zip is not sent in v1 (the wire is frozen; materializing for a send is phase 2):
+        // its row has no file at `path`, which would otherwise read as "missing on disk".
+        if crate::zip_store::presence::markers_say_zip_resident(
+            file.archive_zip_path.as_deref(),
+            file.archive_path_in_zip.as_deref(),
+        ) {
+            ineligible.push(IneligibleFrame {
+                frame_id: entry.frame_id,
+                reason: crate::zip_store::presence::INSIDE_A_ZIP_REASON.to_string(),
+            });
+            continue;
+        }
         if !path.exists() {
             ineligible.push(IneligibleFrame {
                 frame_id: entry.frame_id,
                 reason: "file missing on disk".to_string(),
             });
             continue;
+        }
+        // A calibrated light generated at send time reads its masters; one inside a zip is not read by a
+        // send (v1). Say so now, naming the master, instead of failing the whole package at prepare.
+        // Generation needs the render pipeline, so a build without it has no calibrated light to hold.
+        #[cfg(feature = "render")]
+        if entry.generate {
+            match crate::calibration_library::light_resolve::zip_resident_inputs(conn, entry.frame_id) {
+                Ok(inside) if inside.is_empty() => {}
+                Ok(inside) => {
+                    ineligible.push(IneligibleFrame {
+                        frame_id: entry.frame_id,
+                        reason: crate::calibration_library::light_resolve::zip_inputs_sentence(&inside),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    // The prepare step reads the same thing again and reports the real problem.
+                    tracing::warn!(frame_id = entry.frame_id, error = %format!("{e:#}"), "sync selection: cannot read where this light's inputs live");
+                }
+            }
         }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
@@ -6060,6 +6092,7 @@ mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         };
         (tmp, ctx)
     }
@@ -10372,6 +10405,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(banked, 3);
+    }
+
+    /// A file inside a zip is not sent in v1 (the wire is frozen): its row has no file at the catalog path,
+    /// which used to read "file missing on disk". It is ineligible with the unpack reason, the disk file in the
+    /// same selection is planned as usual, and a genuinely missing file keeps its own reason.
+    #[test]
+    fn sync_selection_marks_zip_resident_files_ineligible_with_the_unpack_reason() {
+        use crate::package::PayloadKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+
+        let on_disk = tmp.path().join("L_disk.fits");
+        let zipped = tmp.path().join("L_zip.fits");
+        for p in [&on_disk, &zipped] {
+            std::fs::write(p, vec![7u8; 128]).unwrap();
+        }
+        for (file_id, frame_id, path) in [(1i64, 10i64, &on_disk), (2, 11, &zipped)] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 128, '2026-07-05T00:00:00Z', 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, uuid) VALUES (?1, ?2, 'Light', ?3)",
+                rusqlite::params![frame_id, file_id, format!("uuid-{frame_id}")],
+            )
+            .unwrap();
+        }
+        let virtual_path = zip_files(&conn, &[2], &tmp.path().join("night.zip"), Shape::Foreign).remove(0);
+        let entry = |frame_id: i64, source: std::path::PathBuf, rel: &str| PayloadEntry {
+            frame_id,
+            source_path: source,
+            rel_path: rel.into(),
+            kind: PayloadKind::RawFrame,
+            generate: false,
+        };
+        let input = SelectionInput {
+            entries: vec![
+                entry(10, on_disk.clone(), "lights/L_disk.fits"),
+                entry(11, std::path::PathBuf::from(&virtual_path), "lights/L_zip.fits"),
+            ],
+            ineligible: Vec::new(),
+            ancestor: None,
+            total: 2,
+        };
+        let planned = plan_selection_package(
+            &conn,
+            "ab".repeat(32).as_str(),
+            &tmp.path().join("packages"),
+            input,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(planned.eligible, vec![10]);
+        assert_eq!(planned.ineligible.len(), 1);
+        assert_eq!(planned.ineligible[0].frame_id, 11);
+        assert_eq!(planned.ineligible[0].reason, "inside a zip \u{2014} unpack it first");
+    }
+
+    /// A calibrated-lights send whose MASTER sits inside a zip is refused at plan time, naming the master,
+    /// instead of failing the whole package at prepare; the same light linked to a master on disk is planned.
+    #[test]
+    fn plan_marks_a_generate_entry_ineligible_when_its_master_is_in_a_zip() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::package::PayloadKind;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+
+        let light = tmp.path().join("L_10.fits");
+        let dark = tmp.path().join("master_dark.fits");
+        for p in [&light, &dark] {
+            write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
+        }
+        let insert = |file_id: i64, frame_id: i64, path: &std::path::Path, imagetyp: &str, master: i64| {
+            let meta = std::fs::metadata(path).unwrap();
+            let mtime: chrono::DateTime<chrono::Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy(), meta.len() as i64, mtime.to_rfc3339()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, uuid, is_master) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![frame_id, file_id, imagetyp, format!("uuid-{frame_id}"), master],
+            )
+            .unwrap();
+        };
+        insert(1, 10, &light, "Light", 0);
+        insert(2, 30, &dark, "MasterDark", 1);
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (100, 'MasterDark', '2026-07-05', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 30)", []).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (10, 'frame', 100, 'Dark', '2026-07-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let plan = |conn: &rusqlite::Connection| {
+            let input = SelectionInput {
+                entries: vec![PayloadEntry {
+                    frame_id: 10,
+                    source_path: light.clone(),
+                    rel_path: "camera_X/lights/c_L_10.fits".into(),
+                    kind: PayloadKind::CalibratedLight,
+                    generate: true,
+                }],
+                ineligible: Vec::new(),
+                ancestor: None,
+                total: 1,
+            };
+            plan_selection_package(
+                conn,
+                "ab".repeat(32).as_str(),
+                &tmp.path().join("packages"),
+                input,
+                None,
+                None,
+                Some(CalibratedLightOptions::default()),
+            )
+            .unwrap()
+        };
+
+        let on_disk = plan(&conn);
+        assert_eq!(on_disk.eligible, vec![10], "{:?}", on_disk.ineligible);
+
+        zip_files(&conn, &[2], &tmp.path().join("masters.zip"), Shape::Foreign);
+        let zipped = plan(&conn);
+        assert!(zipped.eligible.is_empty());
+        assert_eq!(zipped.ineligible.len(), 1);
+        assert_eq!(zipped.ineligible[0].frame_id, 10);
+        assert_eq!(zipped.ineligible[0].reason, "the dark master is inside a zip \u{2014} unpack it first");
     }
 
     /// An entry the composer marked `generate` is planned as work, not as a

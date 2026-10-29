@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use tauri::State;
-use rayon::prelude::*;
 
 use crate::commands::AppState;
 
@@ -144,40 +143,36 @@ pub async fn recheck_missing_files(
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Get all missing files for this root. Also pull `archived_in_operation`
-        // so we can drop rows for files that have since been moved into an
-        // archive zip — those aren't missing in any meaningful sense, just
-        // relocated to a known place.
+        // Get all missing files for this root. Also pull the zip columns: a row
+        // inside a zip is found when its zip lists the entry, otherwise when
+        // its file is on disk.
         let mut stmt = conn
             .prepare(
-                "SELECT mf.id, mf.file_id, f.path, f.archived_in_operation
+                "SELECT mf.id, mf.file_id, f.path, f.archive_zip_path, f.archive_path_in_zip
                  FROM missing_files mf
                  JOIN files f ON f.id = mf.file_id
                  WHERE mf.scan_root_id = ?1",
             )
             .map_err(|e| e.to_string())?;
 
-        let files: Vec<(i64, i64, String, Option<i64>)> = stmt
+        let files: Vec<(i64, i64, String, Option<String>, Option<String>)> = stmt
             .query_map([root_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // "Found" means: archived (catalog says it's in a zip) OR present on
-        // disk. Both cases delete the missing_files row. Filesystem checks
-        // are parallelised because they're I/O bound; the archive check is
-        // a cheap field read so we do it inline.
+        // The same presence rule the web host and the scan-root check use.
+        let present =
+            athenaeum_core::zip_store::presence::present_flags(&files, |(_, _, path, zip, entry)| {
+                (path.as_str(), zip.as_deref(), entry.as_deref())
+            });
         let found_file_ids: Vec<i64> = files
-            .par_iter()
-            .filter_map(|(mf_id, _file_id, path, archived_op)| {
-                if archived_op.is_some() || Path::new(path).exists() {
-                    Some(*mf_id)
-                } else {
-                    None
-                }
-            })
+            .iter()
+            .zip(present)
+            .filter(|(_, present)| *present)
+            .map(|((mf_id, ..), _)| *mf_id)
             .collect();
 
         // Remove files that now exist

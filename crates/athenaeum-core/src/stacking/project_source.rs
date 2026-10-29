@@ -99,6 +99,104 @@ pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)> {
     }
 }
 
+/// [`file_shape_quick`] for a catalog path that may be a zip-resident row: such a file has nothing on
+/// disk to open, so its shape comes from the entry's header bytes read out of the zip (no extraction).
+/// Any other path is [`file_shape_quick`].
+pub fn file_shape_quick_in(conn: &Connection, path: &Path) -> Option<(usize, usize, usize)> {
+    file_shape_with(conn, path, &ZipShapes::default())
+}
+
+/// The shapes of many zip-resident catalog paths, each zip's directory read ONCE for all of its entries.
+/// A grouping pass over N lights of one zip would otherwise parse that zip's whole central directory N
+/// times over the share. A path the table does not hold is read on its own (`file_shape_with`).
+#[derive(Default)]
+pub(crate) struct ZipShapes {
+    by_path: HashMap<String, Option<(usize, usize, usize)>>,
+}
+
+impl ZipShapes {
+    /// Reads the header of every zip-resident path in `paths`: one open of each distinct zip.
+    pub(crate) fn load<'a>(conn: &Connection, paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut by_zip: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
+        for path in paths {
+            if let Some((zip, entry)) = crate::zip_store::presence::zip_markers(conn, path) {
+                by_zip.entry(zip).or_default().push((path, entry));
+            }
+        }
+        let mut by_path = HashMap::new();
+        for (zip, items) in by_zip {
+            let entries: Vec<&str> = items.iter().map(|(_, entry)| entry.as_str()).collect();
+            match crate::zip_store::reader::read_headers(Path::new(&zip), &entries) {
+                Ok((headers, _)) => {
+                    for ((path, entry), (_, header)) in items.iter().zip(headers) {
+                        let shape = match header {
+                            Ok(bytes) => shape_of_header_bytes(&zip, entry, &bytes),
+                            Err(e) => {
+                                tracing::warn!(zip_path = %zip, zip_entry = %entry, error = %format!("{e:#}"), "zip entry header unreadable");
+                                None
+                            }
+                        };
+                        by_path.insert((*path).to_string(), shape);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(zip_path = %zip, error = %format!("{e:#}"), "zip unreadable; its entries have no shape");
+                    for (path, _) in &items {
+                        by_path.insert((*path).to_string(), None);
+                    }
+                }
+            }
+        }
+        Self { by_path }
+    }
+}
+
+/// [`file_shape_quick_in`] that takes a zip entry's shape from `shapes` when it holds the path.
+pub(crate) fn file_shape_with(
+    conn: &Connection,
+    path: &Path,
+    shapes: &ZipShapes,
+) -> Option<(usize, usize, usize)> {
+    if let Some(shape) = shapes.by_path.get(path.to_string_lossy().as_ref()) {
+        return *shape;
+    }
+    match crate::zip_store::presence::zip_markers(conn, &path.to_string_lossy()) {
+        Some((zip, entry)) => zip_entry_shape(&zip, &entry),
+        None => file_shape_quick(path),
+    }
+}
+
+/// `(width, height, planes)` from the header bytes of one zip entry.
+fn zip_entry_shape(zip: &str, entry: &str) -> Option<(usize, usize, usize)> {
+    match crate::zip_store::reader::read_entry_header(Path::new(zip), entry) {
+        Ok((bytes, _)) => shape_of_header_bytes(zip, entry, &bytes),
+        Err(e) => {
+            tracing::warn!(zip_path = %zip, zip_entry = %entry, error = %format!("{e:#}"), "zip entry header unreadable");
+            None
+        }
+    }
+}
+
+fn shape_of_header_bytes(zip: &str, entry: &str, bytes: &[u8]) -> Option<(usize, usize, usize)> {
+    if is_xisf(Path::new(entry)) {
+        // The prelude is 16 bytes, the XML follows.
+        return xisf_geometry(&String::from_utf8_lossy(bytes.get(16..)?));
+    }
+    let header = match crate::fits_parser::FitsHeader::from_bytes(bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(zip_path = %zip, zip_entry = %entry, error = %format!("{e:#}"), "zip entry FITS header unreadable");
+            return None;
+        }
+    };
+    let dim = |key: &str| header.get_i32(key).and_then(|v| usize::try_from(v).ok());
+    match header.get_i32("NAXIS")? {
+        2 => Some((dim("NAXIS1")?, dim("NAXIS2")?, 1)),
+        3 => Some((dim("NAXIS1")?, dim("NAXIS2")?, dim("NAXIS3")?)),
+        _ => None,
+    }
+}
+
 /// The colour token of a project group key (plan 6b-2 C13): `mono`; `osc`
 /// for a colour frame that is three-plane after Prepare; `cfa` for one
 /// that stays a one-plane mosaic (`debayerOsc` off and the file a mosaic).
@@ -107,6 +205,8 @@ pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)> {
 /// plane count decides (three planes are `osc`, anything else `mono`), so the
 /// file is always probed.
 fn color_token(
+    conn: &Connection,
+    shapes: &ZipShapes,
     project_id: &str,
     frame_uuid: &str,
     meta: &ProjectFrameMeta,
@@ -117,7 +217,7 @@ fn color_token(
         // No manifest bayerpat: the file's own plane count decides, as for an
         // attested frame set (`attested_color_token`). An externally
         // debayered replica is three-plane and must group as `osc`.
-        return match file_shape_quick(landed) {
+        return match file_shape_with(conn, landed, shapes) {
             Some((_, _, 3)) => "osc",
             Some(_) => "mono",
             None => {
@@ -126,7 +226,7 @@ fn color_token(
             }
         };
     }
-    match osc_or_cfa(landed, debayer_osc) {
+    match osc_or_cfa(conn, shapes, landed, debayer_osc) {
         Some(token) => token,
         None => {
             tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token assumed cfa");
@@ -139,11 +239,16 @@ fn color_token(
 /// frame sets: `osc` when the debayer is on or the file is already
 /// three-plane, `cfa` for a one-plane mosaic kept as a mosaic; `None` when
 /// the file's shape cannot be read (the caller warns and decides).
-fn osc_or_cfa(landed: &Path, debayer_osc: bool) -> Option<&'static str> {
+fn osc_or_cfa(
+    conn: &Connection,
+    shapes: &ZipShapes,
+    landed: &Path,
+    debayer_osc: bool,
+) -> Option<&'static str> {
     if debayer_osc {
         return Some("osc");
     }
-    match file_shape_quick(landed) {
+    match file_shape_with(conn, landed, shapes) {
         Some((_, _, 3)) => Some("osc"),
         Some(_) => Some("cfa"),
         None => None,
@@ -157,6 +262,8 @@ fn osc_or_cfa(landed: &Path, debayer_osc: bool) -> Option<&'static str> {
 /// shape unknown: `cfa` under a catalog BAYERPAT, `mono` without one. Prepare
 /// excludes the unreadable file anyway.
 pub(crate) fn attested_color_token(
+    conn: &Connection,
+    shapes: &ZipShapes,
     frames_set_id: i64,
     frame_id: i64,
     catalog_bayerpat: bool,
@@ -164,7 +271,7 @@ pub(crate) fn attested_color_token(
     debayer_osc: bool,
 ) -> &'static str {
     if catalog_bayerpat {
-        return osc_or_cfa(path, debayer_osc).unwrap_or_else(|| {
+        return osc_or_cfa(conn, shapes, path, debayer_osc).unwrap_or_else(|| {
             tracing::warn!(
                 set_id = frames_set_id,
                 frame_id,
@@ -174,7 +281,7 @@ pub(crate) fn attested_color_token(
             "cfa"
         });
     }
-    match file_shape_quick(path) {
+    match file_shape_with(conn, path, shapes) {
         Some((_, _, 3)) => "osc",
         Some(_) => "mono",
         None => {
@@ -261,6 +368,12 @@ pub fn project_frame_source(
         .collect();
     let handles = crate::db::stacking::project_frame_handles(conn, project_id, &uuids)?;
 
+    let zip_shapes = ZipShapes::load(
+        conn,
+        stackable
+            .iter()
+            .filter_map(|(_, row, _, _)| row.landed_path.as_deref()),
+    );
     let mut origins: HashMap<i64, FrameOrigin> = HashMap::with_capacity(stackable.len());
     let mut buckets: BTreeMap<(&'static str, String), Vec<Member>> = BTreeMap::new();
     for (idx, row, meta, stamp) in stackable {
@@ -279,7 +392,7 @@ pub fn project_frame_source(
         })?;
         let (width, height) = match (meta.naxis1, meta.naxis2) {
             (Some(w), Some(h)) => (w, h),
-            _ => match file_shape_quick(Path::new(&landed)) {
+            _ => match file_shape_with(conn, Path::new(&landed), &zip_shapes) {
                 Some((w, h, _)) => (w as i64, h as i64),
                 None => {
                     tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "file shape unreadable; dimensions recorded as 0x0");
@@ -288,6 +401,8 @@ pub fn project_frame_source(
             },
         };
         let token = color_token(
+            conn,
+            &zip_shapes,
             project_id,
             &row.frame_uuid,
             &meta,
@@ -640,6 +755,103 @@ mod tests {
         let src = project_frame_source(&conn, "p1", &StackingConfig::default()).unwrap();
         let row = src.frames.iter().find(|f| f.frame_uuid == "o3").unwrap();
         assert_eq!(row.color_mode, ColorMode::Osc);
+    }
+
+    /// A grouping pass over many lights of one zip reads that zip's directory ONCE (`ZipShapes`), and
+    /// each shape equals the single-path read.
+    #[test]
+    fn zip_shapes_read_each_zip_directory_once() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6usize {
+            let name = format!("L{i}.fits");
+            let path = dir.path().join(&name);
+            let c = if i % 2 == 0 { 1 } else { 3 };
+            write_fits_f32(&path, 10 + i, 8, c, &vec![0.5f32; (10 + i) * 8 * c], &[]).unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, '2026-01-01', 'FITS')",
+                rusqlite::params![
+                    path.to_string_lossy(),
+                    name,
+                    std::fs::metadata(&path).unwrap().len() as i64
+                ],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+        let zip = dir.path().join("lights.zip");
+        let zipped = zip_files(&conn, &ids, &zip, Shape::Foreign);
+        let before = crate::zip_store::reader::test_hooks::opens_of(&zip);
+        let shapes = ZipShapes::load(&conn, zipped.iter().map(String::as_str));
+        assert_eq!(
+            crate::zip_store::reader::test_hooks::opens_of(&zip) - before,
+            1,
+            "six entries, one open of the zip"
+        );
+        for (i, p) in zipped.iter().enumerate() {
+            let c = if i % 2 == 0 { 1 } else { 3 };
+            assert_eq!(file_shape_with(&conn, Path::new(p), &shapes), Some((10 + i, 8, c)), "{p}");
+        }
+        assert_eq!(
+            crate::zip_store::reader::test_hooks::opens_of(&zip) - before,
+            1,
+            "lookups from the table open nothing"
+        );
+    }
+
+    /// A zip-resident file's shape comes from its entry's header bytes, FITS and XISF alike,
+    /// and agrees with what the same file gives on disk; a disk path and an unknown path
+    /// take the plain probe.
+    #[test]
+    fn file_shape_quick_in_reads_a_zip_entry_header() {
+        use crate::fits_writer::{write_fits_f32, write_xisf_f32};
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let files: [(&str, usize, usize, usize); 3] = [
+            ("mono.fits", 12, 8, 1),
+            ("rgb.fits", 12, 8, 3),
+            ("mono.xisf", 12, 8, 1),
+        ];
+        let mut ids = Vec::new();
+        let mut on_disk = Vec::new();
+        for (name, w, h, c) in files {
+            let path = dir.path().join(name);
+            let data = vec![0.25f32; w * h * c];
+            if name.ends_with(".xisf") {
+                write_xisf_f32(&path, w, h, c, &data, &[]).unwrap();
+            } else {
+                write_fits_f32(&path, w, h, c, &data, &[]).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, '2026-01-01', 'FITS')",
+                rusqlite::params![
+                    path.to_string_lossy(),
+                    name,
+                    std::fs::metadata(&path).unwrap().len() as i64
+                ],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+            on_disk.push((path.clone(), file_shape_quick(&path)));
+        }
+        assert_eq!(on_disk[1].1, Some((12, 8, 3)));
+        let zipped = zip_files(&conn, &ids, &dir.path().join("f.zip"), Shape::Foreign);
+        for ((_, disk_shape), virtual_path) in on_disk.iter().zip(&zipped) {
+            assert_eq!(
+                file_shape_quick_in(&conn, Path::new(virtual_path)),
+                *disk_shape,
+                "{virtual_path}"
+            );
+            assert!(disk_shape.is_some());
+        }
+        // Not a catalog row: the plain probe, which finds nothing there.
+        assert_eq!(file_shape_quick_in(&conn, &dir.path().join("none.fits")), None);
     }
 
     #[test]

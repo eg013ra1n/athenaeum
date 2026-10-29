@@ -76,3 +76,12 @@ describe('transfers.collabStreams (L11)', () => {
     expect(receive.keywords).toEqual(expect.arrayContaining(['collab.max_receive_streams', 'set_collab_max_receive_streams']));
   });
 });
+
+describe('general.archive', () => {
+  it('lists zipCacheLimitGb and the cache status field', () => {
+    const ids = sectionById('general.archive').fields.map((f) => f.id);
+    expect(ids).toContain('zipCacheLimitGb');
+    expect(ids).toContain('zipCache');
+    expect(fieldMeta('general.archive', 'zipCacheLimitGb').keywords).toContain('archive.zip_cache_limit_gb');
+  });
+});

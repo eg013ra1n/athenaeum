@@ -9,6 +9,7 @@ import { RecheckButton } from './RecheckButton';
 import { basename, formatBytes } from './format';
 import type { ScanRootWithAvailability, ScanResult } from '../../types/helpers';
 import type { RelinkResult, ScanRootOverview } from '../../types/models';
+import { RelinkZipsNote } from './RelinkZipsNote';
 
 interface MonitoredInspectorProps {
   root: ScanRootWithAvailability;
@@ -131,6 +132,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
             <div><p className="text-content-muted text-xs">New files</p><p className="text-lg font-bold text-accent">{relinkResult.files_new}</p></div>
             <div><p className="text-content-muted text-xs">Orphaned</p><p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p></div>
           </div>
+          <RelinkZipsNote result={relinkResult} />
         </div>
       )}
 

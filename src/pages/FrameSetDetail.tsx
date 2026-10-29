@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, RefreshCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, RefreshCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack, PackageOpen } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary, FrameSetProjectStatus, FrameSetPointingUpdate } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -29,6 +29,9 @@ import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
 import type { ArchivedFrameSetSummary } from '../types/helpers';
 import { stackedFrameSnr } from '../components/analysis/stackedSnr';
+import { UnpackZipDialog } from '../components/zip/UnpackZipDialog';
+import { mainZip } from '../components/zip/unpackDialogModel';
+import { isForeignZipFile } from '../utils/zipChips';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
@@ -154,6 +157,7 @@ export default function FrameSetDetail() {
   const [movingToArchive, setMovingToArchive] = useState(false);
   const [activeArchiveOpId, setActiveArchiveOpId] = useState<number | null>(null);
   const [restoreItem, setRestoreItem] = useState<ArchivedFrameSetSummary | null>(null);
+  const [showUnpackDialog, setShowUnpackDialog] = useState(false);
 
   // Handle "Find new images" click: if the user has trusted auto-merge for
   // the button path, skip the preview dialog and merge directly; otherwise,
@@ -439,6 +443,20 @@ export default function FrameSetDetail() {
     }
     return ids.size;
   }, [calibrationHierarchy]);
+
+  // Frames of this set inside zips Athenaeum did not write: they can be unpacked onto disk. Frames Move and
+  // ZIP archived itself go through Unarchive, so they are not counted here.
+  const foreignZipFrames = useMemo(() => {
+    const zipPaths: string[] = [];
+    for (const night of detail?.nights ?? []) {
+      for (const session of night.sessions) {
+        for (const fw of session.frames) {
+          if (isForeignZipFile(fw.file)) zipPaths.push(fw.file.archive_zip_path as string);
+        }
+      }
+    }
+    return { count: zipPaths.length, zipCount: new Set(zipPaths).size, main: mainZip(zipPaths) };
+  }, [detail]);
 
   // Load data on mount and when navigating back. Before that, a cheap
   // idempotent nights/sessions check runs unconditionally — it only writes
@@ -951,6 +969,17 @@ export default function FrameSetDetail() {
                 </button>
               </>
             )}
+            {foreignZipFrames.count > 0 && !detail.frames_set?.archived_at && (
+              <button
+                type="button"
+                onClick={() => setShowUnpackDialog(true)}
+                title="Extract this set's frames out of their zip files into a folder. They stay in the catalog."
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110"
+              >
+                <PackageOpen size={14} />
+                Unpack from zip
+              </button>
+            )}
             <button
               onClick={() => void publishAsProject()}
               title="Publish this frame set as a collaboration project on the portal"
@@ -1293,6 +1322,17 @@ export default function FrameSetDetail() {
           defaultCompression={archiveCompression}
           onCancel={() => setShowArchiveDialog(false)}
           onStart={handleStartArchive}
+        />
+      )}
+
+      {showUnpackDialog && detail.frames_set?.id != null && (
+        <UnpackZipDialog
+          target={{ kind: 'frameSet', id: detail.frames_set.id }}
+          frameCount={foreignZipFrames.count}
+          zipCount={foreignZipFrames.zipCount}
+          defaultZipPath={foreignZipFrames.main}
+          onClose={() => setShowUnpackDialog(false)}
+          onDone={() => { void loadData(); }}
         />
       )}
 

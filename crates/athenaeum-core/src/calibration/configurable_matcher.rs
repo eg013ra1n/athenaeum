@@ -434,6 +434,11 @@ pub fn find_calibration_candidates(
     // its place. This is the ONE place both auto-link (OnlyCompatible) and
     // the manual modal (IncludeIncompatible) enumerate candidate sets, so
     // gating it here covers both call sites in api/calibration.rs.
+    // A MASTER set with a member inside a zip that sits in the Black Hole is not
+    // a candidate either (owner ruling A, 2026-10-28): present, not used. The
+    // set stays registered, so Restore brings the master back with its
+    // provenance. A raw set is untouched: a loose raw frame in the Black Hole
+    // changes nothing for its set today, and a raw set in a zip behaves alike.
     // Geometry (owner ruling 2026-10-20): a set's size is its members' agreed
     // NAXIS1 x NAXIS2, aggregated in this same statement so the loop issues
     // no per-set size query. The origin is read lazily below, only where it
@@ -445,6 +450,7 @@ pub fn find_calibration_candidates(
              FROM calibration_set
              WHERE imagetyp IN ('{}', '{}')
                AND superseded_by_set_id IS NULL
+               AND NOT (is_master_library = 1 AND {})
          ),
          geom AS (
              SELECT csf.set_id,
@@ -462,7 +468,9 @@ pub fn find_calibration_candidates(
          FROM cand
          LEFT JOIN geom ON geom.set_id = cand.id
          ORDER BY cand.date_start DESC",
-        imagetyp_str, master_imagetyp_str
+        imagetyp_str,
+        master_imagetyp_str,
+        crate::db::calibration_set_in_black_hole_zip_sql("calibration_set.id"),
     );
 
     let mut stmt = conn.prepare(&query)?;
@@ -2387,5 +2395,90 @@ mod tests {
         assert_eq!(warns, 0, "no warn per light x type call");
         assert_eq!(take_geometry_unknown_tally(), 3, "one unrecorded comparison per call");
         assert_eq!(take_geometry_unknown_tally(), 0, "taking resets the tally");
+    }
+
+    /// Owner ruling A (2026-10-28): a master inside a zip that sits in the Black Hole is present but not
+    /// used. It leaves the candidate list (auto-link and the manual list alike) without being
+    /// unregistered, and Restore puts it back.
+    #[test]
+    fn a_master_inside_a_black_hole_zip_is_not_a_candidate_until_restored() {
+        let conn = engine_test_db();
+        insert_dark_set(
+            &conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+            "2025-09-25T00:00:00+00:00", 1, "MasterDark",
+        );
+        // A loose master that matches too: it must stay a candidate throughout.
+        insert_dark_set(
+            &conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+            "2025-09-24T00:00:00+00:00", 1, "MasterDark",
+        );
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/nas/masters.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        for (set_id, file_id, path, zip) in [
+            (1_i64, 11_i64, "/nas/masters.zip/md.fits", Some("/nas/masters.zip")),
+            (2, 12, "/lib/md2.fits", None),
+        ] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path)
+                 VALUES (?1, ?2, 'md.fits', 0, 'x', 'FITS', ?3)",
+                params![file_id, path, zip],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'MasterDark', 1)",
+                params![file_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, file_id],
+            )
+            .unwrap();
+        }
+        // A RAW dark set with a member in the same Black Hole zip: it keeps matching, like a raw set
+        // with a loose frame in the Black Hole.
+        insert_dark_set(
+            &conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+            "2025-09-23T00:00:00+00:00", 0, "Dark",
+        );
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path)
+             VALUES (13, '/nas/masters.zip/raw.fits', 'raw.fits', 0, 'x', 'FITS', '/nas/masters.zip')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id, file_id, imagetyp) VALUES (13, 13, 'Dark')", []).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (3, 13)", []).unwrap();
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let ids = |mode| -> Vec<i64> {
+            let mut v: Vec<i64> = find_calibration_candidates(&conn, &frame, "lights", "dark", &config, mode)
+                .unwrap()
+                .iter()
+                .map(|c| c.set_id)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(CandidateMode::OnlyCompatible), vec![1, 2, 3]);
+
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/nas/masters.zip", "files").unwrap();
+        assert_eq!(
+            ids(CandidateMode::OnlyCompatible),
+            vec![2, 3],
+            "auto-link skips the master; the raw set in the same zip still matches"
+        );
+        assert_eq!(ids(CandidateMode::IncludeIncompatible), vec![2, 3], "the manual list skips it");
+        let still_registered: i64 = conn
+            .query_row("SELECT is_master_library FROM calibration_set WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_registered, 1, "never unregistered");
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert_eq!(ids(CandidateMode::OnlyCompatible), vec![1, 2, 3], "restored: matched again");
     }
 }

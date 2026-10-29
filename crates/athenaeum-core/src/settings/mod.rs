@@ -79,6 +79,8 @@ pub mod defaults {
 
     // Archive feature
     pub const ARCHIVE_COMPRESSION: &str = "store"; // "store" | "deflate"
+    // Size limit of the zip extraction cache, GB (see zip_store::cache).
+    pub const ARCHIVE_ZIP_CACHE_LIMIT_GB: &str = "32";
 
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "1";
@@ -203,6 +205,10 @@ pub mod defaults {
                 AUTO_MERGE_ON_MONITOR_DETECT,
             ),
             (super::keys::ARCHIVE_COMPRESSION, ARCHIVE_COMPRESSION),
+            (
+                super::keys::ARCHIVE_ZIP_CACHE_LIMIT_GB,
+                ARCHIVE_ZIP_CACHE_LIMIT_GB,
+            ),
             (
                 super::keys::CALIBRATION_MASTER_FORMAT,
                 CALIBRATION_MASTER_FORMAT,
@@ -332,6 +338,7 @@ pub mod keys {
     // Archive feature
     pub const ARCHIVE_ROOT_PATH: &str = "archive.root_path";
     pub const ARCHIVE_COMPRESSION: &str = "archive.compression";
+    pub const ARCHIVE_ZIP_CACHE_LIMIT_GB: &str = "archive.zip_cache_limit_gb";
 
     // Calibration library — master-frame write destination. Set when the
     // operator picks a folder INSIDE an existing monitored directory (no
@@ -648,6 +655,24 @@ impl SettingsManager {
         )
     }
 
+    /// Size limit of the zip extraction cache, in bytes. An unparsable stored value falls back to
+    /// the default (logged), so a bad row never turns the cache off.
+    pub fn get_archive_zip_cache_limit_bytes(&self, conn: &Connection) -> Result<u64> {
+        let raw = self.get_with_precedence(
+            conn,
+            keys::ARCHIVE_ZIP_CACHE_LIMIT_GB,
+            defaults::ARCHIVE_ZIP_CACHE_LIMIT_GB,
+        )?;
+        let gb = match raw.trim().parse::<u64>() {
+            Ok(gb) => gb,
+            Err(e) => {
+                tracing::warn!(value = %raw, error = %e, "archive.zip_cache_limit_gb is not a whole number; using the default");
+                defaults::ARCHIVE_ZIP_CACHE_LIMIT_GB.parse().unwrap_or(32)
+            }
+        };
+        Ok(gb.saturating_mul(1024 * 1024 * 1024))
+    }
+
     /// Get the configured concurrency ceiling for the global compute queue
     /// (heavy CPU jobs: analysis, master build, light calibration). Clamped
     /// to the same 1..=8 range `api::compute::set_compute_max_concurrent`
@@ -870,6 +895,7 @@ mod tests {
             keys::BLINK_THREADS,
             keys::MONITORING_INTERVAL_MINUTES,
             keys::ARCHIVE_COMPRESSION,
+            keys::ARCHIVE_ZIP_CACHE_LIMIT_GB,
             keys::CALIBRATION_MASTER_FORMAT,
             keys::COMPUTE_MAX_CONCURRENT,
             keys::INTEGRATION_BAND_BUDGET_MB,
@@ -1060,6 +1086,19 @@ mod tests {
             manager.get_archive_root_path(&conn).unwrap(),
             Some("/tmp/archive".to_string())
         );
+    }
+
+    #[test]
+    fn zip_cache_limit_defaults_to_32_gb_and_falls_back_on_garbage() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+        let gb = 1024u64 * 1024 * 1024;
+        assert_eq!(manager.get_archive_zip_cache_limit_bytes(&conn).unwrap(), 32 * gb);
+        manager.persist_setting(&conn, keys::ARCHIVE_ZIP_CACHE_LIMIT_GB, "8").unwrap();
+        assert_eq!(manager.get_archive_zip_cache_limit_bytes(&conn).unwrap(), 8 * gb);
+        manager.persist_setting(&conn, keys::ARCHIVE_ZIP_CACHE_LIMIT_GB, "lots").unwrap();
+        assert_eq!(manager.get_archive_zip_cache_limit_bytes(&conn).unwrap(), 32 * gb);
     }
 
     #[test]

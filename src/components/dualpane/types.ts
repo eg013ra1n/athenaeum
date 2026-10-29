@@ -1,6 +1,8 @@
 // Types for the Far-Manager-style dual-pane file browser.
 
 import type { FileWithFrame } from '../../types/models';
+import type { ZipListItem, ZipOtherEntry } from '../../types/archive';
+import type { ZipLocation } from './zipView';
 
 export type PaneId = 'left' | 'right';
 export type PaneMode = 'files' | 'metadata';
@@ -18,11 +20,19 @@ export interface PaneState {
   filterText: string;
   /** Sort direction for the file/folder list (sorts by basename). */
   sortDir: SortDir;
+  /** Set while the pane is inside a zip: `cwd` stays the folder holding the zip, the listing comes from
+   *  `list_zip_entries`, and the pane is read-only. Leaving the zip (or changing `cwd`) clears it. */
+  zip: ZipLocation | null;
 }
 
 export interface DirectoryListing {
+  /** Folder paths. Inside a zip these are INNER paths (`Lights/Ha`), not disk paths. */
   subdirectories: string[];
   files: FileWithFrame[];
+  /** Zips directly in the folder that hold cataloged frames (disk listings only). */
+  zips?: ZipListItem[];
+  /** Entries of the open zip that are not cataloged frames (zip listings only); shown, never opened. */
+  otherEntries?: ZipOtherEntry[];
 }
 
 /** Hit returned by `search_catalog`. */

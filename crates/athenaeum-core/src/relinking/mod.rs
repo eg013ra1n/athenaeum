@@ -13,13 +13,50 @@ use std::collections::HashMap;
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// A zip-resident row (both zip markers set) is not a file on disk: its fingerprint must never be matched
+/// to a file at the new location, and it is never an orphan of a root just because no file stands at its
+/// path. Its zip is relinked as a whole (`zip_store::catalog::relink_zips`).
+const NOT_ZIP_RESIDENT: &str = "NOT (f.archive_zip_path IS NOT NULL AND f.archive_path_in_zip IS NOT NULL)";
+
+/// The outcome of the read half of a relink: what the walk matched, and the path updates that apply it.
+/// Nothing in it has been written.
+#[derive(Debug)]
+pub struct RelinkPlan {
+    result: RelinkResult,
+    /// `(file_id, old_path, new_path, new_filename)` in walk order, so a fingerprint that occurs twice at the
+    /// new location still ends with the last file.
+    updates: Vec<(i64, String, String, String)>,
+}
+
+impl RelinkPlan {
+    /// The statistics the relink reports (matched, new, orphaned files).
+    pub fn result(&self) -> &RelinkResult {
+        &self.result
+    }
+
+    /// Record how many zips of the old root are not at the new location (the zip half of the relink).
+    pub fn set_zips_missing(&mut self, zips_missing: usize) {
+        self.result.zips_missing = zips_missing;
+    }
+
+    /// The statistics, once the plan has been applied.
+    pub fn into_result(self) -> RelinkResult {
+        self.result
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once when the walk of `plan_relink` has finished and before it returns, so a test can
+    /// commit from another connection exactly where a long walk leaves a window.
+    pub(crate) static AFTER_WALK_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Relink files from an old scan root path to a new location
 ///
-/// This function:
-/// 1. Builds a map of fingerprints -> (file_id, old_path) for files under old root
-/// 2. Scans the new directory to find FITS/XISF files
-/// 3. Matches files by their header fingerprints
-/// 4. Updates file paths in the database for matched files
+/// Reads, then writes: [`plan_relink`] (the fingerprint map and the walk, with no transaction needed) and
+/// [`apply_relink`] (the path updates). A caller that must write more in the same transaction (the scan-root
+/// relink) calls the two itself and opens its transaction between them.
 ///
 /// # Arguments
 ///
@@ -35,6 +72,24 @@ pub fn relink_files(
     old_root_path: &str,
     new_root_path: &str,
 ) -> Result<RelinkResult> {
+    let plan = plan_relink(conn, old_root_path, new_root_path)?;
+    apply_relink(conn, &plan)?;
+    Ok(plan.result)
+}
+
+/// The read half of a relink:
+/// 1. Builds a map of fingerprints -> (file_id, old_path) for files under old root
+/// 2. Scans the new directory to find FITS/XISF files
+/// 3. Matches files by their header fingerprints
+///
+/// It writes nothing, and it must be called with no transaction open: the walk reads every header under the
+/// new root (minutes on a large or NAS root), and a read snapshot held across it would make the first write
+/// afterwards fail with "database is locked" whenever another connection committed meanwhile.
+pub fn plan_relink(
+    conn: &Connection,
+    old_root_path: &str,
+    new_root_path: &str,
+) -> Result<RelinkPlan> {
     tracing::info!(src = %old_root_path, dest = %new_root_path, "starting relink");
 
     // Check if paths are the same - run verification mode instead
@@ -43,7 +98,10 @@ pub fn relink_files(
             path = %old_root_path,
             "src and dest identical, running verification instead of relink"
         );
-        return verify_files_at_location(conn, old_root_path);
+        return Ok(RelinkPlan {
+            result: verify_files_at_location(conn, old_root_path)?,
+            updates: Vec::new(),
+        });
     }
 
     // Step 1: Build fingerprint map for files under old root
@@ -60,7 +118,8 @@ pub fn relink_files(
         "SELECT f.id, f.path, f.filename, fh.header_fingerprint
          FROM files f
          INNER JOIN fits_header fh ON f.id = fh.file_id
-         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL"
+         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL
+           AND {NOT_ZIP_RESIDENT}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
@@ -92,6 +151,9 @@ pub fn relink_files(
     let mut files_matched = 0;
     let mut files_new = 0;
     let mut matched_file_ids = std::collections::HashSet::new();
+    // The walk reads headers and can take long; the matches are written afterwards by `apply_relink`, so the
+    // database is not held while the disk is read.
+    let mut path_updates: Vec<(i64, String, String, String)> = Vec::new();
 
     // max_depth caps recursion in case follow_links hits a pathological
     // symlink loop (walkdir's loop detection isn't bulletproof on every
@@ -154,19 +216,7 @@ pub fn relink_files(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| new_path_str.clone());
 
-            // Update the file path in database
-            conn.execute(
-                "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
-                params![new_path_str, new_filename, file_id],
-            )
-            .context("Failed to update file path")?;
-
-            tracing::debug!(
-                file_id = *file_id,
-                src = %old_path,
-                dest = %new_path_str,
-                "matched file to new location"
-            );
+            path_updates.push((*file_id, old_path.clone(), new_path_str, new_filename));
             files_matched += 1;
             matched_file_ids.insert(*file_id);
         } else {
@@ -191,12 +241,37 @@ pub fn relink_files(
         "relinking complete"
     );
 
-    Ok(RelinkResult {
-        files_matched,
-        files_new,
-        files_orphaned,
-        orphaned_file_ids,
+    #[cfg(test)]
+    AFTER_WALK_HOOK.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook();
+        }
+    });
+
+    Ok(RelinkPlan {
+        result: RelinkResult {
+            files_matched,
+            files_new,
+            files_orphaned,
+            orphaned_file_ids,
+            zips_missing: 0,
+        },
+        updates: path_updates,
     })
+}
+
+/// The write half of a relink: every matched file takes its new path and filename, in walk order. The caller
+/// owns the transaction (see `api::relink_scan_root`).
+pub fn apply_relink(conn: &Connection, plan: &RelinkPlan) -> Result<()> {
+    for (file_id, old_path, new_path_str, new_filename) in &plan.updates {
+        conn.execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
+            params![new_path_str, new_filename, file_id],
+        )
+        .context("Failed to update file path")?;
+        tracing::debug!(file_id = *file_id, src = %old_path, dest = %new_path_str, "matched file to new location");
+    }
+    Ok(())
 }
 
 /// Verify files at a location (used when relinking to same directory)
@@ -217,7 +292,8 @@ fn verify_files_at_location(conn: &Connection, root_path: &str) -> Result<Relink
         "SELECT f.id, f.path, f.filename, fh.header_fingerprint
          FROM files f
          INNER JOIN fits_header fh ON f.id = fh.file_id
-         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL"
+         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL
+           AND {NOT_ZIP_RESIDENT}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
@@ -262,6 +338,7 @@ fn verify_files_at_location(conn: &Connection, root_path: &str) -> Result<Relink
         files_new: 0, // No new files when verifying same location
         files_orphaned: files_missing,
         orphaned_file_ids: missing_file_ids,
+        zips_missing: 0,
     })
 }
 
@@ -290,8 +367,8 @@ pub fn get_orphaned_file_details(
                 (SELECT fr.object FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as object,
                 (SELECT fr.date_obs FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as date_obs
          FROM files f
-         WHERE f.id IN ({})",
-        placeholders
+         WHERE f.id IN ({}) AND {}",
+        placeholders, NOT_ZIP_RESIDENT
     );
 
     let mut stmt = conn.prepare(&query)?;
@@ -346,11 +423,32 @@ pub fn delete_orphaned_files(conn: &Connection, file_ids: &[i64]) -> Result<usiz
     // Per-file, and per-file-fallible: one file whose unregister fails is
     // dropped from the purge (its row survives, so the lineage is still
     // undoable) rather than aborting the whole batch or being stranded. A failed
-    // LOOKUP is logged and the file treated as ordinary — same stance as the
-    // Black Hole paths: refusing a purge because one SELECT failed is worse than
-    // the stranding this guards against.
+    // MASTER lookup is logged and the file treated as ordinary — same stance as
+    // the Black Hole paths: refusing a purge because one SELECT failed is worse
+    // than the stranding this guards against. A failed ZIP-RESIDENCY lookup is
+    // the opposite: the row may hold frames that live only in a zip, so the
+    // whole purge stops before it deletes anything (fail closed).
     let mut deletable: Vec<i64> = Vec::with_capacity(file_ids.len());
     for &file_id in file_ids {
+        // A zip-resident row is never an orphan: its bytes live in a zip, not at its path. Missing never
+        // deletes it.
+        match conn.query_row(
+            "SELECT archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL FROM files WHERE id = ?1",
+            [file_id],
+            |r| r.get::<_, bool>(0),
+        ) {
+            Ok(true) => {
+                tracing::warn!(file_id, "orphan purge skipped a zip-resident file");
+                continue;
+            }
+            Ok(false) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                // Fail closed: a row that may be zip-resident is never deleted on a lookup error, and the
+                // purge stops before it deletes anything.
+                tracing::error!(file_id, error = %e, "zip-residency lookup before orphan purge failed; purge aborted");
+                return Err(e).with_context(|| format!("check whether file {file_id} is zip-resident"));
+            }
+        }
         match crate::db::master_unregister::master_set_id_for_file(conn, file_id) {
             Ok(Some(master_set_id)) => {
                 match crate::db::master_unregister::unregister_master_set(conn, master_set_id) {
@@ -643,5 +741,107 @@ mod tests {
             filename, "renamed_on_disk.fits",
             "filename must follow the path"
         );
+    }
+
+    mod zip_resident {
+        use super::*;
+        use crate::archive::models::ArchiveCompression;
+        use crate::db::schema::init_db;
+        use crate::zip_store::scan::scan_zip;
+        use crate::zip_store::scan::test_support::{light, make_zip};
+        use tempfile::TempDir;
+
+        fn catalog(root: &Path) -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
+            conn
+        }
+
+        fn zip_with_lights(conn: &Connection, dir: &Path) -> std::path::PathBuf {
+            let zip = make_zip(
+                dir,
+                "night.zip",
+                &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))],
+                ArchiveCompression::Store,
+            );
+            scan_zip(conn, &zip, 1, false).unwrap();
+            zip
+        }
+
+        #[test]
+        fn relink_never_reports_zip_resident_rows_as_orphans() {
+            let old_root = TempDir::new().unwrap();
+            let new_root = TempDir::new().unwrap();
+            let conn = catalog(old_root.path());
+            zip_with_lights(&conn, old_root.path());
+            // The fixture rows have fingerprints (the header was parsed): they would be orphans of the
+            // new root if they went into the fingerprint map.
+            let with_fingerprint: i64 = conn
+                .query_row("SELECT COUNT(*) FROM fits_header WHERE header_fingerprint IS NOT NULL", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(with_fingerprint, 2);
+
+            let result = relink_files(&conn, old_root.path().to_str().unwrap(), new_root.path().to_str().unwrap()).unwrap();
+            assert_eq!(result.files_orphaned, 0);
+            assert!(result.orphaned_file_ids.is_empty());
+            assert_eq!(result.files_matched, 0);
+
+            // Verification of an unchanged root (the zip itself deleted): still no orphans.
+            std::fs::remove_file(old_root.path().join("night.zip")).unwrap();
+            let verified =
+                relink_files(&conn, old_root.path().to_str().unwrap(), old_root.path().to_str().unwrap()).unwrap();
+            assert_eq!(verified.files_orphaned, 0);
+            assert_eq!(verified.files_matched, 0);
+        }
+
+        #[test]
+        fn delete_orphaned_files_refuses_a_zip_resident_id() {
+            let root = TempDir::new().unwrap();
+            let conn = catalog(root.path());
+            zip_with_lights(&conn, root.path());
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES ('/gone/disk.fits', 'disk.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM files ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(ids.len(), 3);
+
+            let deleted = delete_orphaned_files(&conn, &ids).unwrap();
+            assert_eq!(deleted, 1, "only the disk row is purged");
+            let left: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL", [], |r| r.get(0)).unwrap();
+            assert_eq!(left, 2);
+            // And the detail lookup does not list a zip-resident id either.
+            assert!(get_orphaned_file_details(&conn, &ids).unwrap().is_empty());
+        }
+
+        #[test]
+        fn delete_orphaned_files_fails_closed_when_the_zip_residency_lookup_fails() {
+            let root = TempDir::new().unwrap();
+            let conn = catalog(root.path());
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (1, '/gone/a.fits', 'a.fits', 1, '2026-01-01T00:00:00Z', 'FITS'),
+                        (2, '/gone/b.fits', 'b.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            // `files` stays a real table (the final DELETE would succeed), but the residency lookup reads
+            // a column that is gone, so only that lookup fails.
+            conn.execute_batch("ALTER TABLE files DROP COLUMN archive_path_in_zip")
+                .unwrap_or_else(|e| panic!("fixture: {e}"));
+            let err = delete_orphaned_files(&conn, &[1, 2]).unwrap_err();
+            assert!(format!("{err:#}").contains("zip-resident"), "{err:#}");
+            let left: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+            assert_eq!(left, 2, "nothing was deleted");
+        }
     }
 }

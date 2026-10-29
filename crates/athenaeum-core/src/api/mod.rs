@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub mod calibration;
 pub mod files;
 pub mod scan_roots;
+// Zip commands that change the catalog (permanent unpack of foreign zip-resident frames). Ungated.
+pub mod zip;
 // Sky-map spatial queries (imaging locations, rectangular selection). Ungated:
 // db/models only.
 pub mod spatial;

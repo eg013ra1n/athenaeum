@@ -250,6 +250,25 @@ describe('BlinkViewer — existing callers', () => {
     expect(await screen.findByText(/Blackhole \(1\)/)).toBeInTheDocument();
   });
 
+  it('a frame whose zip is in the Black Hole shows as rejected and offers neither Blackhole nor Restore', async () => {
+    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_blink_threads_max') return 2;
+      if (cmd === 'get_setting') return '';
+      if (cmd === 'read_fits_image_rustafits') return new Uint8Array([0xff, 0xd8]);
+      if (cmd === 'get_blackholed_file_ids') return [];
+      if (cmd === 'get_zip_blackholed_file_ids') return [7];
+      return null;
+    });
+    const inZip = { id: 7, path: '/z/night.zip/L/a.fits', filename: 'a.fits', format: 'FITS', archive_zip_path: '/z/night.zip', archive_path_in_zip: 'L/a.fits', archived_in_operation: null } as unknown as CatalogFile;
+    renderBlink({ frames: [entry(1, { imageRef: undefined, key: undefined, file: inZip })] });
+    await waitFor(() => expect(invoked('get_zip_blackholed_file_ids')).toHaveLength(1));
+    // The row carries the Black Hole mark (the trash icon replaces the checkbox) and says why.
+    expect(await screen.findByTitle(/its zip is in the Black Hole/)).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 's' });
+    await waitFor(() => expect(screen.queryByText(/Blackhole \(\d+\)/)).toBeNull());
+    expect(screen.queryByText(/Restore \(\d+\)/)).toBeNull();
+  });
+
   it('a key pressed on the speed slider still drives Blink', async () => {
     renderBlink({ frames: [entry(1, { imageRef: undefined, key: undefined, file: { id: 7, path: '/r/a.fits', filename: 'a.fits', format: 'FITS' } as CatalogFile })] });
     const slider = screen.getByRole('slider');

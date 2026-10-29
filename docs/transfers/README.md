@@ -330,6 +330,15 @@ The stacking side is in `docs/stacking/README.md` (The project path on the grid,
 - A project run reads the replicas in place and writes nothing under the Collaboration root; no file it writes carries `ATH_PRJ`.
 - An acceptance catalog copy that stacks a project runs signed out (its `account.hub_url` points at an unreachable address), so the feed never replaces its local grid. `account_sign_out` is never called on a copy: the token store is shared with the real app.
 
+## Zip-resident files are not sent (zip plan, 2026-10-28, v1)
+
+A catalog row inside a zip (`files.archive_zip_path` set: a scanned foreign zip, or one of our Move and ZIP sets) is **ineligible** for transfers, personal sync and collab publish in v1: the wire is frozen and append-only, and materializing for a send is a later design. Instead of the old "file missing on disk" the reason is `zip_store::presence::INSIDE_A_ZIP_REASON`, **"inside a zip - unpack it first"**:
+
+- `plan_selection_package` marks a zip-resident file ineligible with that reason (the package planner every selection send goes through).
+- A calibrated-lights send, a collab publish or a collab Calibrate whose light or master sits in a zip is refused with the same reason by `light_resolve::zip_resident_inputs` (`open_generation`, the publish split and the generation phase). Collab keeps holding every zip-resident light back from publish.
+- The way out is a permanent unpack (`unpack_zip_frames`, `docs/catalog/README.md` -> Zips in the catalog; our Move and ZIP sets: Unarchive), after which the rows are ordinary disk rows. Dedup and presence are unchanged: transfer dedup still counts a Black Hole file as present (owner ruling of 2026-07-22), and a Black Hole zip is present too.
+- Retention stays Perseus-only; no transfer path reads or writes a zip. Export and the stacking project export DO read zip frames (they are local data work): `docs/export/README.md` -> Frames inside a zip.
+
 ## Detail moved from CLAUDE.md (2026-10-20) - Transfers rules
 
 ### Transfers / personal sync

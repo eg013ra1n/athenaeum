@@ -1975,7 +1975,7 @@ impl Drop for ExportSlot {
 /// Ungated: a pure catalog read plus file placement, so it compiles in the
 /// headless build.
 pub async fn export_project_for_wbpp(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     project_id: &str,
     output_dir: &str,
     use_symlinks: bool,
@@ -2085,6 +2085,7 @@ pub async fn export_project_for_wbpp(
             let em = emitter.clone();
             let pid = project_id.to_string();
             let dir = title_dir.clone();
+            let zip_ctx = Arc::clone(ctx);
             tokio::task::spawn_blocking(move || {
                 crate::export::project_organizer::organize_project_export(
                     &dir,
@@ -2093,6 +2094,7 @@ pub async fn export_project_for_wbpp(
                     use_symlinks,
                     em.as_deref(),
                     &flag,
+                    Some(&zip_ctx),
                 )
             })
             .await
@@ -2115,6 +2117,7 @@ pub async fn export_project_for_wbpp(
             copied: c.copied,
             rewritten: c.rewritten,
             failed: c.failed,
+            zip_copied: organized.zip_copied,
         })
     }
     .await;
@@ -2136,6 +2139,7 @@ pub async fn export_project_for_wbpp(
                 copied: r.copied,
                 rewritten: r.rewritten,
                 failed: r.failed,
+                zip_copied: r.zip_copied,
             },
             Err(err) => ExportCompleteEvent {
                 frame_set_id: SENTINEL,
@@ -2148,6 +2152,7 @@ pub async fn export_project_for_wbpp(
                 copied: 0,
                 rewritten: 0,
                 failed: 0,
+                zip_copied: 0,
             },
         };
         crate::events::emit_event(e, "export-complete", &complete);
@@ -2218,6 +2223,7 @@ pub(crate) mod test_support {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
         };
         (tmp, ctx)
     }
@@ -2347,7 +2353,7 @@ mod tests {
     #[tokio::test]
     async fn export_project_lays_canonical_filter_folders() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
         let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
         let before = seed_landed_frame(&ctx, &landed);
         let out = tmp.path().join("out");
@@ -2378,7 +2384,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_project_export_while_one_runs_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
         ctx.active_exports.lock().unwrap().insert(
             crate::export::project_organizer::PROJECT_EXPORT_SENTINEL,
             crate::services::ExportHandle {
@@ -2400,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_project_export_frees_the_slot() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
         let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
         seed_landed_frame(&ctx, &landed);
         let out = tmp.path().join("out");
@@ -2423,7 +2429,7 @@ mod tests {
     #[tokio::test]
     async fn project_export_refuses_an_output_dir_inside_a_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
         let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
         let before = seed_landed_frame(&ctx, &landed);
         {
@@ -2471,9 +2477,9 @@ mod tests {
 
     /// Shared rig for the title-folder guard tests: a seeded project titled
     /// "T", one landed replica, and `roots` registered as scan roots.
-    fn guard_rig(roots: &[&std::path::Path]) -> (tempfile::TempDir, ServiceContext, Vec<u8>) {
+    fn guard_rig(roots: &[&std::path::Path]) -> (tempfile::TempDir, Arc<ServiceContext>, Vec<u8>) {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
         let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
         let before = seed_landed_frame(&ctx, &landed);
         let _ = roots;
@@ -2487,7 +2493,7 @@ mod tests {
         crate::db::upsert_scan_root(&conn, &path.to_string_lossy(), "normal").unwrap();
     }
 
-    async fn assert_refused(ctx: &ServiceContext, out: &std::path::Path) {
+    async fn assert_refused(ctx: &Arc<ServiceContext>, out: &std::path::Path) {
         let err = export_project_for_wbpp(ctx, "p-1", &out.to_string_lossy(), false, None)
             .await
             .unwrap_err();

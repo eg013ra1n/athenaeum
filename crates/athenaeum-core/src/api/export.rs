@@ -16,7 +16,10 @@ use std::sync::Arc;
 
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
-use crate::export::file_organizer::{organize_files_wbpp, GenerationBatch, OrganizeResult};
+use crate::export::file_organizer::{
+    organize_files_wbpp, zip_masters_for_export, GenerationBatch, OrganizeResult,
+};
+use crate::export::ZipMasters;
 use crate::export::models::{CalibratedLightOptions, ExportData, ExportMode, WbppExportConfig};
 use crate::services::compute_queue::ComputeJobKind;
 use crate::services::ServiceContext;
@@ -88,6 +91,24 @@ pub fn run_export_organize(
         None
     };
 
+    // Masters inside a zip are extracted BEFORE the catalog borrow below: a connection is never held across
+    // an extraction. They stay pinned in the cache until the run ends (`zip_masters` drops last).
+    let zip_masters = if generates {
+        match zip_masters_for_export(ctx, data, emitter, frame_set_id, cancel_flag.as_ref()) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(frame_set_id, error = %format!("{e:#}"), "export: masters inside a zip could not be listed");
+                return Err(ApiError::Internal(format!("Failed to read the calibration masters: {e:#}")));
+            }
+        }
+    } else {
+        ZipMasters::none()
+    };
+    if generates && cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(frame_set_id, "export cancelled while extracting masters from zips");
+        return Ok(ExportRunOutcome::Cancelled);
+    }
+
     // Catalog phase: one borrow resolves every marked light's plan, and the
     // guard is dropped with this block — the pixel phase below holds no
     // database connection. Not free, and not purely a catalog cost: resolving a
@@ -103,6 +124,7 @@ pub fn run_export_organize(
             data,
             gen_opts.clone(),
             std::env::temp_dir(),
+            &zip_masters,
         ))
     } else {
         None
@@ -118,6 +140,7 @@ pub fn run_export_organize(
         cancel_flag.as_ref(),
         generation.as_mut(),
         Some(&ctx.image_pool),
+        Some(ctx),
     )
     .map_err(|e| ApiError::Internal(format!("Failed to organize files: {e:#}")))?;
     Ok(ExportRunOutcome::Organized(result))

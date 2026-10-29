@@ -323,7 +323,8 @@ pub async fn plate_solve_batch(
                                     let caches = solvemyastro::Caches::layered(&layer_refs);
                                     let index_refs: Vec<&solvemyastro::QuadIndex> =
                                         index_packs.iter().map(|a| a.as_ref()).collect();
-                                    match service::solve_frame_with_hints(
+                                    match service::solve_catalog_frame_with_hints(
+                                        &ctx,
                                         &frame,
                                         &file_path,
                                         &hints,
@@ -1061,6 +1062,7 @@ mod plate_solve_config_tests {
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

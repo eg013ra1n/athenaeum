@@ -26,6 +26,7 @@ use crate::export::models::{
     calibrated_output_filename, sanitize_display_folder_name, sanitize_folder_name,
     CalibrationSetInfo, CalibrationSubgroup, ExportData, ExportProgressEvent, WbppExportConfig,
 };
+use crate::services::ServiceContext;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -38,6 +39,9 @@ use std::time::Instant;
 pub struct OrganizeResult {
     pub files_organized: i32,
     pub warnings: Vec<String>,
+    /// Zip-resident files that were COPIED although the run asked for links: a link into the zip cache
+    /// would dangle after the cache evicts the entry. `0` in a copy run.
+    pub zip_copied: usize,
 }
 
 /// Count total files that will be organized (for progress tracking).
@@ -393,6 +397,44 @@ pub struct GenerationBatch {
         PathBuf,
         std::sync::Arc<crate::calibration_library::cosmetic::HotPixelMapOutcome>,
     >,
+    /// Catalog paths of the marked lights that live inside a zip. Each is extracted when its turn comes
+    /// (one frame at a time, so the cache holds one light, not the whole night).
+    zip_lights: HashSet<String>,
+}
+
+/// Extracts the zip-resident masters the lights marked for generation in `data` read, before the catalog
+/// phase (see [`crate::export::ZipMasters`]). Progress goes out as `export-progress` events with phase `"extracting"`.
+#[cfg(feature = "render")]
+pub fn zip_masters_for_export(
+    ctx: &ServiceContext,
+    data: &ExportData,
+    emitter: Option<&dyn ProgressEmitter>,
+    frame_set_id: i64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<crate::export::ZipMasters> {
+    let frame_ids: Vec<i64> = compute_wbpp_placements(data)
+        .into_iter()
+        .filter_map(|p| match p.source {
+            PlacementSource::CalibrateLight { frame_id, .. } => Some(frame_id),
+            PlacementSource::Copy => None,
+        })
+        .collect();
+    crate::export::ZipMasters::extract_for_frames(ctx, &frame_ids, cancel, &mut |current, total, name| {
+        if let Some(e) = emitter {
+            emit_event(
+                e,
+                "export-progress",
+                &ExportProgressEvent {
+                    frame_set_id,
+                    current,
+                    total,
+                    percent: if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 },
+                    current_file: Some(name.to_string()),
+                    phase: "extracting".to_string(),
+                },
+            );
+        }
+    })
 }
 
 /// A build with no pixel pipeline can never generate anything, so the batch is
@@ -434,6 +476,7 @@ impl GenerationBatch {
         data: &ExportData,
         opts: crate::export::CalibratedLightOptions,
         scratch_dir: PathBuf,
+        masters: &crate::export::ZipMasters,
     ) -> Self {
         let mut specs = std::collections::HashMap::new();
         let mut skipped = std::collections::HashMap::new();
@@ -442,16 +485,24 @@ impl GenerationBatch {
         // share one flat. See `export::DivisorCache` — it is valid only for the
         // single `opts` this batch resolves under, which is exactly its scope.
         let mut divisors = crate::export::DivisorCache::new();
-        for placement in compute_wbpp_placements(data) {
+        let placements = compute_wbpp_placements(data);
+        let light_paths: Vec<&str> = placements
+            .iter()
+            .filter(|p| matches!(p.source, PlacementSource::CalibrateLight { .. }))
+            .map(|p| p.file_path.as_str())
+            .collect();
+        let zip_lights = crate::zip_store::presence::zip_resident_paths(conn, &light_paths);
+        for placement in placements {
             let PlacementSource::CalibrateLight { frame_id, .. } = placement.source else {
                 continue;
             };
-            match crate::export::resolve_generation_cached(
+            match crate::export::resolve_generation_mapped(
                 conn,
                 frame_id,
                 &opts,
                 &scratch_dir,
                 &mut divisors,
+                masters,
             ) {
                 Ok(spec) => {
                     specs.insert(frame_id, spec);
@@ -479,6 +530,7 @@ impl GenerationBatch {
             opts,
             scratch_dir,
             hot_maps: std::collections::HashMap::new(),
+            zip_lights,
         }
     }
 }
@@ -500,6 +552,7 @@ fn generate_one(
     dest: &Path,
     cancel_flag: &std::sync::atomic::AtomicBool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    zip: Option<&ServiceContext>,
 ) -> Result<Vec<String>> {
     // Field-level destructuring: `specs` is read while `hot_maps` is written,
     // which a whole-struct borrow would not allow.
@@ -509,6 +562,7 @@ fn generate_one(
         opts,
         scratch_dir,
         hot_maps,
+        zip_lights,
     } = batch;
     let Some(spec) = specs.get(&frame_id) else {
         match skipped.get(&frame_id) {
@@ -527,6 +581,21 @@ fn generate_one(
             "debayer decision disagrees with the placed filename"
         );
     }
+    // A light inside a zip is extracted for this one frame and read from there; the pin keeps the cache
+    // file until the calibrated output is written. The masters were already mapped at resolve time.
+    let light_catalog_path = spec.inputs.light_path.to_string_lossy().into_owned();
+    let (zip_spec, _light_pin) = if zip_lights.contains(&light_catalog_path) {
+        let ctx = zip.ok_or_else(|| anyhow::anyhow!("this export was not prepared to read a frame inside a zip"))?;
+        let (local, pin) = crate::zip_store::materialize::materialize_one_cancellable(
+            ctx,
+            &light_catalog_path,
+            cancel_flag,
+        )?;
+        (Some(spec.with_light_path(local)), pin)
+    } else {
+        (None, None)
+    };
+    let spec = zip_spec.as_ref().unwrap_or(spec);
     // `None` mosaic: an export lands the calibrated light itself — the CFA
     // mosaic is a stacking-run artifact (M4d Task 1), not an export product.
     let generated = crate::export::execute_generation(
@@ -564,6 +633,7 @@ fn generate_one(
     _dest: &Path,
     _cancel_flag: &std::sync::atomic::AtomicBool,
     _pool: Option<&Arc<rayon::ThreadPool>>,
+    _zip: Option<&ServiceContext>,
 ) -> Result<Vec<String>> {
     match *batch {}
 }
@@ -580,6 +650,11 @@ fn generate_one(
 /// `None` — every other mode, and every caller that only copies — means a
 /// placement marked for calibration is reported as a warning instead of being
 /// silently copied raw under a `c_*` name.
+///
+/// `zip` is the context a file inside a zip is read through (`zip_store::materialize`): such a
+/// placement is extracted into the zip cache and COPIED from there, in link mode too (a link into
+/// the cache dangles once the entry is evicted), and counted in [`OrganizeResult::zip_copied`].
+/// `None` reads every path as a plain disk file.
 pub fn organize_files_wbpp(
     output_dir: &Path,
     data: &ExportData,
@@ -590,12 +665,14 @@ pub fn organize_files_wbpp(
     cancel_flag: &std::sync::atomic::AtomicBool,
     generation: Option<&mut GenerationBatch>,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    zip: Option<&ServiceContext>,
 ) -> Result<OrganizeResult> {
     let span = tracing::info_span!("export", frame_set_id);
     let _g = span.enter();
 
     let mut files_organized = 0;
     let mut warnings = Vec::new();
+    let mut zip_copied = 0usize;
 
     // Create parent directory named after the frame set — the export layout's top
     // level (the send path omits this; the receiver supplies its own).
@@ -644,6 +721,19 @@ pub fn organize_files_wbpp(
         }
     };
 
+    // Which copied placements live inside a zip: one catalog read for the whole run.
+    let zip_resident: HashSet<String> = match zip.and_then(|ctx| ctx.db.get()) {
+        Some(db) => {
+            let paths: Vec<&str> = placements
+                .iter()
+                .filter(|p| matches!(p.source, PlacementSource::Copy))
+                .map(|p| p.file_path.as_str())
+                .collect();
+            crate::zip_store::presence::zip_resident_paths(&db.conn(), &paths)
+        }
+        None => HashSet::new(),
+    };
+
     let mut generation = generation;
     // Read once, before any mutable borrow of `generation` below: the
     // container this run's calibrated lights are written in, so a stale
@@ -665,12 +755,51 @@ pub fn organize_files_wbpp(
         let dest = dest_dir.join(&filename);
         match placement.source {
             PlacementSource::Copy => {
-                match copy_or_link(&placement.file_path, &dest, use_symlinks) {
+                let in_zip = zip_resident.contains(&placement.file_path);
+                let placed = match zip {
+                    // A frame inside a zip is extracted (or reused from the cache) and copied from there.
+                    // The pin keeps the cache file until the copy is done.
+                    Some(ctx) if in_zip && (is_link(&dest) || !dest.exists()) => {
+                        emit_progress(files_organized as usize, Some(&filename), "extracting", true);
+                        match crate::zip_store::materialize::materialize_one_cancellable(
+                            ctx,
+                            &placement.file_path,
+                            cancel_flag,
+                        ) {
+                            Ok((local, _pin)) => {
+                                // A link left at the destination by an earlier link-mode export (dead or
+                                // alive) is removed first: `fs::copy` would write THROUGH it, into
+                                // whatever it points at, which can be a scan root.
+                                let copied = remove_link(&dest)
+                                    .and_then(|()| copy_or_link(&local.to_string_lossy(), &dest, false));
+                                if copied.is_ok() && use_symlinks {
+                                    zip_copied += 1;
+                                }
+                                copied
+                            }
+                            Err(e) => {
+                                // A cancel surfaces as the extraction's error; the loop ends on its next turn.
+                                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                                tracing::warn!(
+                                    frame_id = placement.frame_id,
+                                    path = %placement.file_path,
+                                    error = %format!("{e:#}"),
+                                    "export: a frame inside a zip could not be extracted"
+                                );
+                                Err(e)
+                            }
+                        }
+                    }
+                    _ => copy_or_link(&placement.file_path, &dest, use_symlinks && !in_zip),
+                };
+                match placed {
                     Ok(_) => {
                         files_organized += 1;
                         emit_progress(files_organized as usize, Some(&filename), "copying", false);
                     }
-                    Err(e) => warnings.push(format!("Failed to copy {}: {}", filename, e)),
+                    Err(e) => warnings.push(format!("Failed to copy {}: {:#}", filename, e)),
                 }
             }
             PlacementSource::CalibrateLight { frame_id, debayer } => {
@@ -685,7 +814,9 @@ pub fn organize_files_wbpp(
                     true,
                 );
                 let outcome = match generation.as_deref_mut() {
-                    Some(batch) => generate_one(batch, frame_id, debayer, &dest, cancel_flag, pool),
+                    Some(batch) => {
+                        generate_one(batch, frame_id, debayer, &dest, cancel_flag, pool, zip)
+                    }
                     None => Err(anyhow::anyhow!(
                         "this export was not prepared to calibrate lights"
                     )),
@@ -757,6 +888,7 @@ pub fn organize_files_wbpp(
     Ok(OrganizeResult {
         files_organized,
         warnings,
+        zip_copied,
     })
 }
 
@@ -829,8 +961,27 @@ fn remove_stale_sibling(
     }
 }
 
+/// True when `path` itself is a symbolic link, dead or alive (`exists()` follows links, this does not).
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Removes a symbolic link at `path`, dead or alive; a regular file or nothing is left alone.
+fn remove_link(path: &Path) -> Result<()> {
+    if is_link(path) {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove the old link {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Copy file or create symlink
 fn copy_or_link(source: &str, dest: &PathBuf, use_symlinks: bool) -> Result<()> {
+    // A dead link at the destination is not "an existing file" (`exists()` follows it): leave it and
+    // `fs::copy` writes through it, `symlink` fails with EEXIST. A live link keeps the skip below.
+    if is_link(dest) && !dest.exists() {
+        remove_link(dest)?;
+    }
     // Skip if destination already exists
     if dest.exists() {
         return Ok(());
@@ -1153,6 +1304,7 @@ mod tests {
             &cancel,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 3);
@@ -1211,6 +1363,21 @@ mod tests {
         lights: &[(i64, &str)],
         bayerpat: Option<&str>,
     ) -> (rusqlite::Connection, PathBuf) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let dark = seed_generation_into(&conn, src, lights, bayerpat);
+        (conn, dark)
+    }
+
+    /// [`seed_generation_fixture`] into an already-initialised catalog (a `ServiceContext`'s, for the zip
+    /// tests). Returns the master dark's path.
+    #[cfg(feature = "render")]
+    fn seed_generation_into(
+        conn: &rusqlite::Connection,
+        src: &Path,
+        lights: &[(i64, &str)],
+        bayerpat: Option<&str>,
+    ) -> PathBuf {
         use rusqlite::params;
 
         const W: usize = 8;
@@ -1225,8 +1392,6 @@ mod tests {
             crate::fits_writer::write_fits_f32(path, W, H, 1, &data, &[]).unwrap();
         };
 
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::schema::init_db(&conn).unwrap();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'My Set')", [])
             .unwrap();
         conn.execute(
@@ -1306,7 +1471,7 @@ mod tests {
             )
             .unwrap();
         }
-        (conn, dark_path)
+        dark_path
     }
 
     /// Collect + transform + resolve for the calibrated-lights mode, the three
@@ -1330,7 +1495,7 @@ mod tests {
             Some(&opts),
         )
         .unwrap();
-        let batch = GenerationBatch::resolve(conn, &data, opts, scratch.to_path_buf());
+        let batch = GenerationBatch::resolve(conn, &data, opts, scratch.to_path_buf(), &crate::export::ZipMasters::none());
         (data, batch)
     }
 
@@ -1377,6 +1542,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
             None,
         )
         .unwrap();
@@ -1460,6 +1626,7 @@ mod tests {
             &cancel,
             Some(&mut batch),
             None,
+            None,
         )
         .expect("one unusable frame must not fail the export");
 
@@ -1542,6 +1709,7 @@ mod tests {
             &cancel,
             Some(&mut batch),
             None,
+            None,
         )
         .expect("a cancel is not an export failure");
 
@@ -1591,6 +1759,7 @@ mod tests {
                 &cancel,
                 Some(&mut batch),
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
@@ -1635,6 +1804,7 @@ mod tests {
             &cancel,
             Some(&mut batch),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
@@ -1658,6 +1828,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
             None,
         )
         .unwrap();
@@ -1718,6 +1889,7 @@ mod tests {
             &cancel,
             Some(&mut batch),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
@@ -1749,5 +1921,291 @@ mod tests {
             }
         }
         out
+    }
+
+    // ── Frames inside a zip (zip plan Task 9) ──────────────────────────────
+
+    fn zip_ctx(dir: &Path) -> ServiceContext {
+        ServiceContext::new_for_tests(dir.join("catalog.db"))
+    }
+
+    fn add_file_row(conn: &rusqlite::Connection, id: i64, path: &Path) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            rusqlite::params![
+                id,
+                path.to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+    }
+
+    /// A frame inside a zip is extracted and COPIED even when the run asked for links (a link into the zip
+    /// cache dangles once the entry is evicted); the disk frame beside it is still linked, and only the
+    /// forced copy is counted.
+    #[test]
+    fn wbpp_export_copies_zip_resident_frames_even_in_symlink_mode() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = zip_ctx(tmp.path());
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let disk = src.join("L_disk.fits");
+        let zipped = src.join("L_zip.fits");
+        std::fs::write(&disk, b"disk-bytes").unwrap();
+        std::fs::write(&zipped, b"zip-bytes").unwrap();
+        let virtual_path = {
+            let conn = ctx.db.get().unwrap().conn();
+            add_file_row(&conn, 1, &disk);
+            add_file_row(&conn, 2, &zipped);
+            zip_files(&conn, &[2], &tmp.path().join("night.zip"), Shape::Foreign).remove(0)
+        };
+        assert!(!Path::new(&virtual_path).exists(), "the zip row has no file at its catalog path");
+
+        let mut a = frame(1, "L_disk.fits", "ASI");
+        a.file_path = disk.to_string_lossy().into_owned();
+        let mut b = frame(2, "L_zip.fits", "ASI");
+        b.file_path = virtual_path;
+        let data = export_data("Set", vec![subgroup(vec![a, b], None, None, None)]);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let out = tempfile::tempdir().unwrap();
+        let result = organize_files_wbpp(
+            out.path(), &data, true, &WbppExportConfig::default(), None, 1, &cancel, None, None, Some(&ctx),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.zip_copied, 1);
+        let lights = out.path().join("Set/camera_asi/lights");
+        assert!(std::fs::symlink_metadata(lights.join("L_disk.fits")).unwrap().file_type().is_symlink());
+        let copied = std::fs::symlink_metadata(lights.join("L_zip.fits")).unwrap();
+        assert!(!copied.file_type().is_symlink(), "a zip frame is a real file");
+        assert_eq!(std::fs::read(lights.join("L_zip.fits")).unwrap(), b"zip-bytes");
+
+        // A plain copy run copies both, and nothing was "forced".
+        let out2 = tempfile::tempdir().unwrap();
+        let result = organize_files_wbpp(
+            out2.path(), &data, false, &WbppExportConfig::default(), None, 1, &cancel, None, None, Some(&ctx),
+        )
+        .unwrap();
+        assert_eq!((result.files_organized, result.zip_copied), (2, 0));
+        assert_eq!(
+            std::fs::read(out2.path().join("Set/camera_asi/lights/L_zip.fits")).unwrap(),
+            b"zip-bytes"
+        );
+    }
+
+    /// An earlier link-mode export left dead links in the folder (the originals went into a zip). A
+    /// re-export, in either mode, replaces them with real files and writes nothing at the link targets.
+    #[cfg(unix)]
+    #[test]
+    fn re_export_never_writes_through_a_dead_link_at_the_destination() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        for use_symlinks in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = zip_ctx(tmp.path());
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let disk = src.join("L_disk.fits");
+            let zipped = src.join("L_zip.fits");
+            std::fs::write(&disk, b"disk-bytes").unwrap();
+            std::fs::write(&zipped, b"zip-bytes").unwrap();
+            let virtual_path = {
+                let conn = ctx.db.get().unwrap().conn();
+                add_file_row(&conn, 1, &disk);
+                add_file_row(&conn, 2, &zipped);
+                zip_files(&conn, &[2], &tmp.path().join("night.zip"), Shape::Foreign).remove(0)
+            };
+            let mut a = frame(1, "L_disk.fits", "ASI");
+            a.file_path = disk.to_string_lossy().into_owned();
+            let mut b = frame(2, "L_zip.fits", "ASI");
+            b.file_path = virtual_path;
+            let data = export_data("Set", vec![subgroup(vec![a, b], None, None, None)]);
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+
+            // The scan root's old spellings, where the dead links point.
+            let scan_root = tmp.path().join("scan_root");
+            std::fs::create_dir_all(&scan_root).unwrap();
+            let gone_zip = scan_root.join("L_zip.fits");
+            let gone_disk = scan_root.join("L_disk.fits");
+            let out = tempfile::tempdir().unwrap();
+            let lights = out.path().join("Set/camera_asi/lights");
+            std::fs::create_dir_all(&lights).unwrap();
+            std::os::unix::fs::symlink(&gone_zip, lights.join("L_zip.fits")).unwrap();
+            std::os::unix::fs::symlink(&gone_disk, lights.join("L_disk.fits")).unwrap();
+
+            let result = organize_files_wbpp(
+                out.path(), &data, use_symlinks, &WbppExportConfig::default(), None, 1, &cancel, None, None, Some(&ctx),
+            )
+            .unwrap();
+            assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(!gone_zip.exists(), "nothing is written at the zip link's target (symlinks={use_symlinks})");
+            assert!(!gone_disk.exists(), "nothing is written at the disk link's target (symlinks={use_symlinks})");
+            let landed = std::fs::symlink_metadata(lights.join("L_zip.fits")).unwrap();
+            assert!(!landed.file_type().is_symlink(), "a zip frame is a real file");
+            assert_eq!(std::fs::read(lights.join("L_zip.fits")).unwrap(), b"zip-bytes");
+            let disk_dest = std::fs::symlink_metadata(lights.join("L_disk.fits")).unwrap();
+            assert_eq!(disk_dest.file_type().is_symlink(), use_symlinks);
+            assert_eq!(std::fs::read(lights.join("L_disk.fits")).unwrap(), b"disk-bytes");
+        }
+    }
+
+    /// A zip whose share is gone costs the export that one frame (a warning naming it), never the run.
+    #[test]
+    fn an_unreachable_zip_frame_is_one_warning_and_the_rest_still_lands() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = zip_ctx(tmp.path());
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let disk = src.join("L_disk.fits");
+        let zipped = src.join("L_zip.fits");
+        std::fs::write(&disk, b"disk-bytes").unwrap();
+        std::fs::write(&zipped, b"zip-bytes").unwrap();
+        let zip = tmp.path().join("night.zip");
+        let virtual_path = {
+            let conn = ctx.db.get().unwrap().conn();
+            add_file_row(&conn, 1, &disk);
+            add_file_row(&conn, 2, &zipped);
+            zip_files(&conn, &[2], &zip, Shape::Foreign).remove(0)
+        };
+        std::fs::remove_file(&zip).unwrap();
+        let mut a = frame(1, "L_disk.fits", "ASI");
+        a.file_path = disk.to_string_lossy().into_owned();
+        let mut b = frame(2, "L_zip.fits", "ASI");
+        b.file_path = virtual_path;
+        let data = export_data("Set", vec![subgroup(vec![a, b], None, None, None)]);
+        let out = tempfile::tempdir().unwrap();
+        let result = organize_files_wbpp(
+            out.path(), &data, false, &WbppExportConfig::default(), None, 1,
+            &std::sync::atomic::AtomicBool::new(false), None, None, Some(&ctx),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 1);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(result.warnings[0].contains("L_zip.fits") && result.warnings[0].contains("night.zip"), "{:?}", result.warnings);
+    }
+
+    /// First row of a calibrated output's plane.
+    #[cfg(feature = "render")]
+    fn first_row(path: &Path, scratch: &Path) -> Vec<f32> {
+        let src = crate::integration::banded::BandSource::open(&[path.to_path_buf()], scratch, 1).unwrap();
+        let mut planes = crate::integration::banded::BandPlanes::new(&src);
+        src.read_band(0, 1, &mut planes, 1).unwrap();
+        let mut row = vec![0f32; src.width()];
+        planes.decode_frame_into(0, &mut row);
+        row
+    }
+
+    /// Calibrated lights from a light AND a master dark that both live inside zips: the output equals the one
+    /// from the same files on disk, the export reads them through the zip cache, and the cache file is not
+    /// what the export names.
+    #[cfg(feature = "render")]
+    #[test]
+    fn calibrated_lights_generate_from_a_zip_resident_light_and_master() {
+        use crate::api::export::{run_export_organize, ExportRunOutcome};
+        use crate::export::models::{CalibratedLightOptions, ExportMode};
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = zip_ctx(tmp.path());
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            seed_generation_into(&conn, &src, &[(10, "light_10.fits")], None);
+        }
+        let opts = CalibratedLightOptions { debayer_osc: false, ..CalibratedLightOptions::default() };
+        let run = |out: &Path| {
+            let mut data = {
+                let conn = ctx.db.get().unwrap().conn();
+                let mut data = crate::export::collect_export_data(&conn, 1).unwrap();
+                crate::export::apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, Some(&opts)).unwrap();
+                data
+            };
+            data.frame_set_name = "My Set".to_string();
+            let outcome = run_export_organize(
+                &ctx,
+                out, &data, false, &WbppExportConfig::default(), None, 1,
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ExportMode::CalibratedLights, &opts,
+            )
+            .unwrap();
+            match outcome {
+                ExportRunOutcome::Organized(r) => r,
+                ExportRunOutcome::Cancelled => panic!("cancelled"),
+            }
+        };
+        let on_disk = tempfile::tempdir().unwrap();
+        let disk_result = run(on_disk.path());
+        assert_eq!(disk_result.files_organized, 1, "{:?}", disk_result.warnings);
+
+        // Now the light and the master dark go into zips.
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            zip_files(&conn, &[1010], &tmp.path().join("lights.zip"), Shape::Foreign);
+            zip_files(&conn, &[2], &tmp.path().join("masters.zip"), Shape::Foreign);
+        }
+        assert!(!src.join("light_10.fits").exists() && !src.join("master_dark.fits").exists());
+        let before = ctx.zip_cache.extraction_count();
+        let from_zip = tempfile::tempdir().unwrap();
+        let zip_result = run(from_zip.path());
+        assert_eq!(zip_result.files_organized, 1, "{:?}", zip_result.warnings);
+        assert!(zip_result.warnings.is_empty(), "{:?}", zip_result.warnings);
+        assert_eq!(ctx.zip_cache.extraction_count() - before, 2, "the light and the master dark");
+
+        let rel = "My Set/camera_testcam/lights/c_light_10.fits";
+        let scratch = tempfile::tempdir().unwrap();
+        let expected = first_row(&on_disk.path().join(rel), scratch.path());
+        let got = first_row(&from_zip.path().join(rel), scratch.path());
+        assert_eq!(got, expected);
+        assert!((got[0] - 700.0).abs() < 1e-3 && (got[1] - 698.0).abs() < 1e-3, "{got:?}");
+        let header = crate::fits_parser::FitsHeader::from_path(&from_zip.path().join(rel)).unwrap();
+        assert_eq!(header.get_str("CALSTAT").as_deref(), Some("BD"));
+    }
+
+    /// A master dark whose zip is gone skips the lights that need it, each with the reason, and the export
+    /// still returns (the per-frame policy of every other generation failure).
+    #[cfg(feature = "render")]
+    #[test]
+    fn an_unreachable_zip_master_skips_its_lights_with_the_reason() {
+        use crate::api::export::{run_export_organize, ExportRunOutcome};
+        use crate::export::models::{CalibratedLightOptions, ExportMode};
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = zip_ctx(tmp.path());
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            seed_generation_into(&conn, &src, &[(10, "light_10.fits")], None);
+            zip_files(&conn, &[2], &tmp.path().join("masters.zip"), Shape::Foreign);
+        }
+        std::fs::remove_file(tmp.path().join("masters.zip")).unwrap();
+        let opts = CalibratedLightOptions { debayer_osc: false, ..CalibratedLightOptions::default() };
+        let mut data = {
+            let conn = ctx.db.get().unwrap().conn();
+            let mut data = crate::export::collect_export_data(&conn, 1).unwrap();
+            crate::export::apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, Some(&opts)).unwrap();
+            data
+        };
+        data.frame_set_name = "My Set".to_string();
+        let out = tempfile::tempdir().unwrap();
+        let outcome = run_export_organize(
+            &ctx, out.path(), &data, false, &WbppExportConfig::default(), None, 1,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)), ExportMode::CalibratedLights, &opts,
+        )
+        .unwrap();
+        let ExportRunOutcome::Organized(result) = outcome else { panic!("cancelled") };
+        assert_eq!(result.files_organized, 0);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("masters.zip") && result.warnings[0].contains("not reachable"),
+            "{:?}",
+            result.warnings
+        );
     }
 }

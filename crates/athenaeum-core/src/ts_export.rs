@@ -87,6 +87,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::BulkMoveResult,
             crate::db::BulkMoveProgressEvent,
             crate::models::BlackHoleEntry,
+            crate::db::BlackHoleZipEntry,
             crate::models::FolderSimilarity,
             crate::scanner::ScanProgressEvent,
             crate::scanner::ScanCompleteEvent,
@@ -313,7 +314,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::updates::WhatsNew,
             crate::api::settings::SettingsDefaults,
         ]))),
-        ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
+        ("archive.ts", js_safe_ints(format!("{HEADER}import type {{ FileWithFrame, Frame }} from './models';\n\n{}", decls![
             crate::archive::models::ArchiveDisposition,
             crate::archive::models::ArchiveCompression,
             crate::archive::models::ConflictResolution,
@@ -325,6 +326,14 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::archive::models::ZipFilenameConflict,
             crate::archive::models::ArchivePlan,
             crate::archive::models::ArchiveOperationSummary,
+            crate::zip_store::cache::ZipCacheStatus,
+            crate::zip_store::materialize::ExtractionEstimate,
+            crate::api::zip::UnpackTarget,
+            crate::api::zip::UnpackOutcome,
+            crate::zip_store::catalog::ZipListItem,
+            crate::api::zip::ZipDirListing,
+            crate::api::zip::ZipOtherEntry,
+            crate::api::zip::ZipEntryHeader,
         ]))),
         ("export.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::export::models::CameraType,

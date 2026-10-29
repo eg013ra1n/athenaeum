@@ -211,6 +211,21 @@ pub async fn get_blackholed_file_ids(
     Ok(Json(blackholed))
 }
 
+/// Of the given file IDs, the ones excluded only because their zip is in the Black Hole (no entry of their own).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_zip_blackholed_file_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetBlackholedFileIdsArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    let ids =
+        athenaeum_core::db::get_zip_blackholed_file_ids(&conn, &args.file_ids).map_err(db_err)?;
+
+    Ok(Json(ids))
+}
+
 /// Restore a file from the black hole (removes it from the `black_hole` table;
 /// does not move the file on disk).
 #[tracing::instrument(skip_all, err(Debug))]
@@ -248,6 +263,122 @@ pub async fn send_to_void(
 
     athenaeum_core::db::send_to_void(&conn, args.file_id).map_err(db_err)?;
     Ok(Json(()))
+}
+
+// ── Zips in the black hole ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveZipToBlackHoleArgs {
+    pub zip_path: String,
+    pub from_where: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdArgs {
+    pub id: i64,
+}
+
+/// Send a whole zip to the black hole (mirrors the Tauri `move_zip_to_black_hole`). The zip path is
+/// checked against the host's allowed roots; it must also be a zip the catalog knows.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn move_zip_to_black_hole(
+    State(state): State<WebAppState>,
+    Json(args): Json<MoveZipToBlackHoleArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let policy = crate::routes::scan_roots::allowed_roots_policy(&state.allowed_paths);
+    let zip = std::path::Path::new(&args.zip_path);
+    let candidate = zip.canonicalize().unwrap_or_else(|_| zip.to_path_buf());
+    policy.check(&candidate).map_err(crate::routes::api_err)?;
+
+    let ctx = state.ctx.clone();
+    let (id, zip_id) = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        let id = athenaeum_core::db::add_zip_to_black_hole(&conn, &args.zip_path, &args.from_where)
+            .map_err(db_err)?;
+        let zip_id = athenaeum_core::db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(db_err)?;
+        Ok::<_, (StatusCode, String)>((id, zip_id))
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    // `id` is the black_hole_zips row, `zip_id` the zip_archives row.
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "id": id, "zip_id": zip_id, "action": "zip-blackholed" }),
+    });
+    Ok(Json(id))
+}
+
+/// List the zips currently in the black hole.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_black_hole_zips(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<athenaeum_core::db::BlackHoleZipEntry>>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        athenaeum_core::db::get_black_hole_zips(&conn).map_err(db_err)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+    Ok(Json(entries))
+}
+
+/// Restore a zip from the black hole (removes only its black-hole row).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn restore_zip_from_black_hole(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let id = args.id;
+    let zip_id = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        // Read before the row goes: the event names the zip_archives row.
+        let zip_id = athenaeum_core::db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(db_err)?;
+        athenaeum_core::db::restore_zip_from_black_hole(&conn, id).map_err(db_err)?;
+        Ok::<_, (StatusCode, String)>(zip_id)
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "id": id, "zip_id": zip_id, "action": "zip-restored" }),
+    });
+    Ok(Json(()))
+}
+
+/// Permanently delete a zip in the black hole: every catalog row living in it, then the zip file.
+///
+/// WARNING: irreversible. Returns the number of catalog rows deleted.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn send_zip_to_void(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let id = args.id;
+    let (rows, zip_id) = tokio::task::spawn_blocking(move || {
+        let db = ctx.db.get().ok_or_else(no_db)?;
+        let conn = db.conn();
+        let zip_id = athenaeum_core::db::zip_archive_id_of_black_hole_zip(&conn, id).map_err(db_err)?;
+        let rows = athenaeum_core::db::send_zip_to_void(&conn, id).map_err(db_err)?;
+        Ok::<_, (StatusCode, String)>((rows, zip_id))
+    })
+    .await
+    .map_err(|e| db_err(format!("Black Hole task panicked: {}", e)))??;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "id": id, "zip_id": zip_id, "action": "zip-voided" }),
+    });
+    Ok(Json(rows))
 }
 
 // ── Scan root flags ──────────────────────────────────────────────────────────
@@ -312,7 +443,15 @@ pub async fn verify_duplicate_pair(
     State(state): State<WebAppState>,
     Json(args): Json<VerifyDuplicatePairArgs>,
 ) -> Result<Json<athenaeum_core::duplicates::VerifyPairResult>, (StatusCode, String)> {
-    athenaeum_core::api::files::verify_duplicate_pair(&state.ctx, args.file_a, args.file_b)
+    // Off the async worker: a zip-resident copy is extracted (a full entry decompress) before the compare.
+    let ctx = state.ctx.clone();
+    let (file_a, file_b) = (args.file_a, args.file_b);
+    tokio::task::spawn_blocking(move || athenaeum_core::api::files::verify_duplicate_pair(&ctx, file_a, file_b))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "duplicate verify task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Duplicate verify task panicked: {e}"))
+        })?
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }

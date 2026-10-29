@@ -62,6 +62,9 @@ pub enum ArchiveStage {
     Copy,
     VerifyCopy,
     ZipAdd,
+    /// Recorded the moment this operation's rename of a built zip onto its target path succeeded.
+    /// Rollback deletes a target zip only when this step exists for it.
+    ZipPublish,
     VerifyZip,
     DeleteSource,
     Finalize,
@@ -80,6 +83,7 @@ impl ArchiveStage {
             ArchiveStage::Copy => "copy",
             ArchiveStage::VerifyCopy => "verify_copy",
             ArchiveStage::ZipAdd => "zip_add",
+            ArchiveStage::ZipPublish => "zip_publish",
             ArchiveStage::VerifyZip => "verify_zip",
             ArchiveStage::DeleteSource => "delete_source",
             ArchiveStage::Finalize => "finalize",
@@ -367,6 +371,10 @@ pub struct RestoreConflict {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RestoreOutcome {
     pub conflicts: Vec<RestoreConflict>,
+    /// Entries this run extracted from their zips (targets that were missing); files already in place
+    /// are not counted.
+    #[serde(default)]
+    pub extracted: usize,
 }
 
 impl RestoreOutcome {
@@ -415,6 +423,7 @@ mod tests {
                 expected_hash: "aaaa".into(),
                 actual_hash: Some("bbbb".into()),
             }],
+            ..Default::default()
         };
         assert!(dirty.has_conflicts());
     }

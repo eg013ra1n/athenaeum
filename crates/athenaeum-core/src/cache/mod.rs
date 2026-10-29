@@ -20,6 +20,31 @@ pub fn preview_cache_key(path: &Path, resolution: &str) -> std::io::Result<Strin
     Ok(format!("{}:{}:{}", path.display(), mtime_nanos, resolution))
 }
 
+/// [`preview_cache_key`] for a catalog path. A zip-resident row is keyed by the catalog path plus the zip's
+/// and the entry's identity (`zip_store::materialize::preview_identity`), so a cache hit needs no extraction
+/// and two zips holding the same entry path never share a key; any other path is keyed as before. An
+/// unreachable zip fails like a deleted file does (`NotFound`).
+pub fn catalog_preview_cache_key(
+    ctx: &crate::services::ServiceContext,
+    catalog_path: &str,
+    resolution: &str,
+) -> std::io::Result<String> {
+    match crate::zip_store::materialize::preview_identity(ctx, catalog_path) {
+        Ok(Some(identity)) => Ok(format!("{catalog_path}:{identity}:{resolution}")),
+        Ok(None) => preview_cache_key(Path::new(catalog_path), resolution),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string())),
+    }
+}
+
+/// The preview-cache key of a frame entry of a zip that the catalog holds no row for: the virtual path plus
+/// the zip's and the entry's identity, so a hit needs no extraction. An unreachable zip or a missing entry
+/// fails like a deleted file (`NotFound`).
+pub fn zip_entry_preview_cache_key(zip_path: &str, entry: &str, resolution: &str) -> std::io::Result<String> {
+    let identity = crate::zip_store::materialize::zip_entry_preview_identity(zip_path, entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    Ok(format!("{}:{identity}:{resolution}", crate::zip_store::scan::virtual_path(Path::new(zip_path), entry)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

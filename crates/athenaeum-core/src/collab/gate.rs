@@ -905,6 +905,7 @@ mod tests {
             raw_set_ids_without_master: vec![],
             missing_master_files: 0,
             missing_raw_calibration_files: 0,
+            black_hole_zip_masters: 0,
             file_counts: Default::default(),
             raw_sets_buildable: vec![],
             raw_sets_unbuildable: vec![],

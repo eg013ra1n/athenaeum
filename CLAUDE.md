@@ -76,9 +76,9 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 ## Module Map
 
-`athenaeum-core` (`crates/athenaeum-core/src/`, canonical list in `lib.rs`): `models`, `coordinates`, `paths`, `disk`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `registration`, `catalog`, `services` (`ServiceContext` + `ProgressEmitter`), `events`, `logging`, `rustafits_processor`, `integration`, `star_measure`, `stacking`, `sync`, `sharing`, `collab`, `updates`, `ts_export`, `api/` (command-facing layer both hosts call), and more. `integration`, `star_measure` (`render`) and `stacking` (`render + solver`) are feature-gated: `cargo check --no-default-features` does not compile them.
+`athenaeum-core` (`crates/athenaeum-core/src/`, canonical list in `lib.rs`): `models`, `coordinates`, `paths`, `disk`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `registration`, `catalog`, `services` (`ServiceContext` + `ProgressEmitter`), `events`, `logging`, `rustafits_processor`, `integration`, `star_measure`, `stacking`, `sync`, `sharing`, `collab`, `updates`, `ts_export`, `zip_store`, `api/` (command-facing layer both hosts call), and more. `integration`, `star_measure` (`render`) and `stacking` (`render + solver`) are feature-gated: `cargo check --no-default-features` does not compile them.
 
-Tauri commands: 316 in 25 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
+Tauri commands: 327 in 26 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
 
 ## Adding a Tauri Command
 
@@ -128,6 +128,8 @@ useEffect(() => {
 **Plate solving** — `solvemyastro` is the sole solver; the input gate has a Settings section (Plate Solving → Input Gate), the acceptance gate has none. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
 **Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 7); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
+
+**Zip archives** — a `.zip` is a catalog file type: the scanner reads a zip's directory and entry headers only, zip-resident rows (`files.archive_zip_path`) are read through `zip_store::materialize`, never by `files.path`; no code writes into a zip, only an explicit Send to Void of the whole zip deletes one; a missing zip makes rows missing, never deleted; a zip in the Black Hole is present but not used. `docs/archive/README.md`, `docs/catalog/README.md`, `docs/file-browser/README.md`.
 
 **In-app updates** — core owns the check, `tauri-plugin-updater` owns install (Rust-side only); `install_update`'s `version_comparator` is the one place that normalizes the three version forms. `docs/updates/README.md`.
 

@@ -39,6 +39,7 @@ mod plate_solve;
 mod registration;
 mod archive;
 mod masters;
+mod zip;
 mod stacking;
 pub(crate) mod sync;
 mod account;
@@ -171,8 +172,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/bulk_move_to_black_hole", post(duplicates::bulk_move_to_black_hole))
         .route("/api/get_black_hole_files", post(duplicates::get_black_hole_files))
         .route("/api/get_blackholed_file_ids", post(duplicates::get_blackholed_file_ids))
+        .route("/api/get_zip_blackholed_file_ids", post(duplicates::get_zip_blackholed_file_ids))
         .route("/api/restore_from_black_hole", post(duplicates::restore_from_black_hole))
         .route("/api/send_to_void", post(duplicates::send_to_void))
+        .route("/api/move_zip_to_black_hole", post(duplicates::move_zip_to_black_hole))
+        .route("/api/get_black_hole_zips", post(duplicates::get_black_hole_zips))
+        .route("/api/restore_zip_from_black_hole", post(duplicates::restore_zip_from_black_hole))
+        .route("/api/send_zip_to_void", post(duplicates::send_zip_to_void))
         .route("/api/get_duplicate_folders", post(duplicates::get_duplicate_folders))
         .route("/api/set_scan_root_duplicates_flag", post(duplicates::set_scan_root_duplicates_flag))
         .route("/api/set_scan_root_unique_camera_flag", post(duplicates::set_scan_root_unique_camera_flag))
@@ -309,6 +315,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
         .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
+        .route("/api/unpack_zip_frames", post(zip::unpack_zip_frames))
+        .route("/api/list_zip_entries", post(zip::list_zip_entries))
+        .route("/api/get_zip_entry_header", post(zip::get_zip_entry_header))
+        .route("/api/preview_zip_entry", post(images::preview_zip_entry))
+        .route("/api/get_zip_cache_status", post(zip::get_zip_cache_status))
+        .route("/api/clear_zip_cache", post(zip::clear_zip_cache))
+        .route("/api/estimate_zip_extraction", post(zip::estimate_zip_extraction))
         // Personal sync (Stage I, task A7)
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
@@ -565,6 +578,7 @@ pub(crate) mod tests {
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

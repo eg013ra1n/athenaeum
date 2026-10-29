@@ -87,6 +87,8 @@ pub fn run() {
                     operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
                     compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
                     iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+                    // The app data dir is only known once the database is initialized (`initialize_database`).
+                    zip_cache: Arc::new(athenaeum_core::zip_store::cache::ZipCache::unbound()),
                 }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
@@ -323,8 +325,13 @@ pub fn run() {
             commands::bulk_move_to_black_hole,
             commands::get_black_hole_files,
             commands::get_blackholed_file_ids,
+            commands::get_zip_blackholed_file_ids,
             commands::restore_from_black_hole,
             commands::send_to_void,
+            commands::move_zip_to_black_hole,
+            commands::get_black_hole_zips,
+            commands::restore_zip_from_black_hole,
+            commands::send_zip_to_void,
             commands::get_duplicate_folders,
             commands::verify_files_byte_identical,
             commands::verify_duplicate_pair,
@@ -414,6 +421,13 @@ pub fn run() {
             commands::archive_calibration_originals,
             commands::restore_calibration_originals,
             commands::clear_stale_archive_markers,
+            // Zip commands
+            commands::unpack_zip_frames,
+            commands::list_zip_entries,
+            commands::get_zip_entry_header,
+            commands::get_zip_cache_status,
+            commands::clear_zip_cache,
+            commands::estimate_zip_extraction,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,
@@ -431,6 +445,7 @@ pub fn run() {
             commands::get_index_status,
             commands::download_index_packs,
             commands_rustafits::read_fits_image_rustafits,
+            commands_rustafits::preview_zip_entry,
             // Archive commands
             commands::get_archive_settings,
             commands::set_archive_root_path,

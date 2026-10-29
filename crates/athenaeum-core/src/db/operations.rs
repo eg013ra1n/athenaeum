@@ -1124,7 +1124,24 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         [],
     )?;
 
-    // 12. Delete the scan root
+    // 12. Forget the zips under the root, in the same transaction as their rows. A zip row is the catalog's
+    // memory of a file that lives in the root; left behind, a re-added root would skip the unchanged zip and
+    // its released entries, and the zip could never be cataloged again. The released entries and a Black Hole
+    // record of the zip go by cascade; files on disk are never touched, and archive operations stay as history.
+    {
+        let sep = native_separator_of(&path);
+        let prefix = format!("{}{}", path.trim_end_matches(sep), sep);
+        let path_hi = path_prefix_upper(&prefix);
+        let forgotten = conn.execute(
+            "DELETE FROM zip_archives WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)",
+            params![prefix, path_hi],
+        )?;
+        if forgotten > 0 {
+            tracing::info!(root_id = id, count = forgotten, "zips under the removed scan root forgotten");
+        }
+    }
+
+    // 13. Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
 
     // Commit transaction
@@ -2124,9 +2141,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
          FROM files f
          {joins}
          WHERE {usable}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})
          GROUP BY {hash}, f.size{group_extra}
@@ -2135,6 +2150,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
         hash = key.hash_expr("f"),
         joins = key.joins("f"),
         usable = key.hash_is_usable("f"),
+        not_black_holed = super::file_not_in_black_hole_sql("f.id"),
         eligibility = key.eligibility(),
         roots = root_predicate,
         extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
@@ -2382,9 +2398,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
          FROM files f
          {joins}
          WHERE {usable}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})
          GROUP BY {hash}, f.size{group_extra}
@@ -2392,6 +2406,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
         hash = key.hash_expr("f"),
         joins = key.joins("f"),
         usable = key.hash_is_usable("f"),
+        not_black_holed = super::file_not_in_black_hole_sql("f.id"),
         eligibility = key.eligibility(),
         roots = root_predicate,
         extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
@@ -2437,13 +2452,12 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
          FROM files
          {joins}
          WHERE {hash} = ? AND files.size = ?{extra_predicate}
-         AND NOT EXISTS (
-             SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id
-         )
+         AND {not_black_holed}
          {eligibility}
          AND ({roots})",
         hash = key.hash_expr("files"),
         joins = key.joins("files"),
+        not_black_holed = super::file_not_in_black_hole_sql("files.id"),
         eligibility = key.eligibility(),
         roots = files_root_predicate,
         extra_predicate = key
@@ -2527,14 +2541,15 @@ pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec
 
     for (group_id, hash, size, _file_count) in groups {
         // Get files for this group, excluding files in black_hole
-        let mut files_stmt = conn.prepare(
+        let mut files_stmt = conn.prepare(&format!(
             "SELECT f.id, f.path
              FROM duplicate_group_files dgf
              JOIN files f ON f.id = dgf.file_id
              WHERE dgf.group_id = ?1
-             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)
+             AND {not_black_holed}
              ORDER BY f.path",
-        )?;
+            not_black_holed = super::file_not_in_black_hole_sql("f.id"),
+        ))?;
 
         let files: Vec<(i64, String)> = files_stmt
             .query_map(params![group_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -2726,6 +2741,23 @@ pub fn get_frames_sets_by_project(
     })?;
 
     sets.collect()
+}
+
+/// Per frames set: how many of the members counted by [`get_frames_sets_by_project`] live inside a zip
+/// (`files.archive_zip_path` set, ours or foreign). Sets with none are absent from the map.
+pub fn get_frames_set_zip_member_counts(conn: &Connection) -> Result<std::collections::HashMap<i64, usize>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT in_tbl.frames_set_id, COUNT(DISTINCT f.id)
+         FROM imaging_nights in_tbl
+         JOIN sessions s ON in_tbl.id = s.imaging_night_id
+         JOIN session_members sm ON s.id = sm.session_id
+         JOIN frames f ON f.id = sm.frame_id AND {not_blackholed}
+         JOIN files zf ON zf.id = f.file_id AND zf.archive_zip_path IS NOT NULL
+         GROUP BY in_tbl.frames_set_id",
+        not_blackholed = super::FRAME_NOT_IN_BLACK_HOLE_SQL,
+    ))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)))?;
+    rows.collect()
 }
 
 /// Get all frame IDs that are already members of any frames_set
@@ -5906,6 +5938,47 @@ mod path_prefix_range_tests {
     }
 
     #[test]
+    fn delete_scan_root_forgets_the_zips_under_it_and_only_those() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31')", []).unwrap();
+        let root_id: i64 = conn.query_row("SELECT id FROM scan_roots", [], |r| r.get(0)).unwrap();
+        for (id, path) in [(1, "/data/M31/a.zip"), (2, "/data/M31/sub/b.zip"), (3, "/data/M31_Ha/c.zip")] {
+            conn.execute(
+                "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+                 VALUES (?1, ?2, 10, 'x', 1, 'x')",
+                params![id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (?1, 'L.fits')",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO black_hole_zips (zip_id, from_where, moved_at, original_path) VALUES (1, 'files', 'x', '/data/M31/a.zip')",
+            [],
+        )
+        .unwrap();
+
+        delete_scan_root(&conn, root_id).unwrap();
+
+        let zips: Vec<String> = conn
+            .prepare("SELECT path FROM zip_archives")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(zips, vec!["/data/M31_Ha/c.zip".to_string()], "the sibling root's zip survives");
+        let releases: i64 = conn.query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(releases, 1, "releases go with their zip");
+        let black: i64 = conn.query_row("SELECT COUNT(*) FROM black_hole_zips", [], |r| r.get(0)).unwrap();
+        assert_eq!(black, 0);
+    }
+
+    #[test]
     fn delete_scan_root_does_not_purge_name_prefix_sibling_root_windows() {
         // Windows arm: range for C:\Astro without separator is
         // ["C:\Astro", "C:\Astrp") — contains C:\Astro_backup. With the
@@ -8065,6 +8138,79 @@ mod tests {
         );
     }
 
+    /// Owner ruling A (2026-10-28): the files of a zip in the Black Hole are treated like Black Hole files
+    /// by every duplicate query, so the group dissolves and a surviving copy is never offered for
+    /// deletion against a copy that is only "present". Restoring the zip brings the group back.
+    #[test]
+    fn duplicate_groups_leave_out_the_files_of_a_black_hole_zip() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+        seed_dup_file(&conn, 1, "/vol/a/f.fits", "2024-01-01T00:00:00+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 2, "/vol/b/f.fits", "2024-01-01T00:00:01+00:00", "HDR-A", "Flat", 0);
+        assert_eq!(find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().len(), 1);
+
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/vol/b.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_zip_path = '/vol/b.zip' WHERE id = 2", []).unwrap();
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/vol/b.zip", "files").unwrap();
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().is_empty(),
+            "one usable copy is not a duplicate group"
+        );
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert_eq!(find_duplicate_groups(&conn, DuplicateKey::Header).unwrap().len(), 1);
+    }
+
+    /// The cache rebuild and the cached read use the same Black Hole fragment as the live query (r3 spliced
+    /// it into both): a rebuild never counts or lists a file of a Black Hole zip, and a cache built BEFORE
+    /// the zip was rejected stops serving that file at once, without a rebuild. Restore brings it back.
+    #[test]
+    fn duplicate_cache_leaves_out_the_files_of_a_black_hole_zip() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+        seed_dup_file(&conn, 1, "/vol/a/f.fits", "2024-01-01T00:00:00+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 2, "/vol/b/f.fits", "2024-01-01T00:00:01+00:00", "HDR-A", "Flat", 0);
+        seed_dup_file(&conn, 3, "/vol/c/f.fits", "2024-01-01T00:00:02+00:00", "HDR-A", "Flat", 0);
+        conn.execute(
+            "INSERT INTO zip_archives (id, path, size, modified_at, frame_entries, scanned_at)
+             VALUES (1, '/vol/c.zip', 10, 'x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE files SET archive_zip_path = '/vol/c.zip' WHERE id = 3", []).unwrap();
+        let key = DuplicateKey::Header;
+        let sizes = |conn: &Connection| -> Vec<usize> {
+            get_cached_duplicates(conn, key).unwrap().iter().map(|g| g.file_paths.len()).collect()
+        };
+
+        // Cache built while nothing is rejected: one group of three.
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![3]);
+
+        // The zip goes to the Black Hole: the stale cache stops serving its file straight away...
+        let bh = crate::db::add_zip_to_black_hole(&conn, "/vol/c.zip", "files").unwrap();
+        assert_eq!(sizes(&conn), vec![2], "the cached read leaves the zip's file out");
+        // ...and a rebuild under the same condition lists two, not three.
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![2], "the rebuild leaves it out too");
+
+        // Only one usable copy of a pair: no group at all, in the rebuild and in the read.
+        conn.execute("DELETE FROM files WHERE id = 2", []).unwrap();
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 0);
+        assert!(get_cached_duplicates(&conn, key).unwrap().is_empty());
+
+        crate::db::restore_zip_from_black_hole(&conn, bh).unwrap();
+        assert_eq!(rebuild_duplicate_groups_cache(&conn, key).unwrap(), 1);
+        assert_eq!(sizes(&conn), vec![2], "restored: both copies are listed again");
+    }
+
     /// `strong_hash` for one file — what `fill_master_strong_hashes` would have
     /// written after reading the bytes.
     fn set_strong_hash(conn: &Connection, id: i64, hash: &str) {
@@ -8674,5 +8820,52 @@ mod frames_set_listing_tests {
         let (live, live_count) = by_id(2);
         assert_eq!(*live_count, 2);
         assert_eq!(live.total_exp_time, Some(360.0), "the members' sum, not the stored 6120");
+    }
+
+    /// The zip chip of the Objects page: a member counts when its file row has a zip marker; a zip frame
+    /// the Black Hole excludes is not counted (the same rule as the member count beside it).
+    #[test]
+    fn zip_member_counts_cover_zip_resident_members_outside_the_black_hole() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'set')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (1, '2025-06-28T23:00:00Z', '2025-06-29T02:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')", [night]).unwrap();
+        let session = conn.last_insert_rowid();
+        // Three lights: one on disk, two in a zip; one of the zip lights is in the Black Hole.
+        let mut file_ids = Vec::new();
+        for i in 0..3 {
+            let zip = if i == 0 { None } else { Some("/z/night.zip") };
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+                 VALUES (?1, 'l.fits', 0, '2025-06-29T00:00:00Z', 'FITS', ?2, ?3)",
+                rusqlite::params![format!("/z/{i}.fits"), zip, zip.map(|_| format!("L/{i}.fits"))],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id, imagetyp, exptime) VALUES (?1, 'Light', 180.0)", [file_id])
+                .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, frame_id])
+                .unwrap();
+            file_ids.push(file_id);
+        }
+        let counts = get_frames_set_zip_member_counts(&conn).unwrap();
+        assert_eq!(counts.get(&1), Some(&2));
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path) VALUES (?1, 'test', '2025-06-30T00:00:00Z', '/z/2.fits')",
+            [file_ids[2]],
+        )
+        .unwrap();
+        let counts = get_frames_set_zip_member_counts(&conn).unwrap();
+        assert_eq!(counts.get(&1), Some(&1), "a Black Hole frame is not counted");
+        let sets = get_frames_sets_by_project(&conn, 1).unwrap();
+        assert_eq!(sets[0].1, 2, "the member count agrees: one disk frame + one zip frame");
     }
 }

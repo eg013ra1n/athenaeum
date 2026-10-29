@@ -1,6 +1,8 @@
 import { useState, useMemo } from 'react';
 import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive } from 'lucide-react';
 import type { FramesSetWithCount } from '../types/helpers';
+import { Chip } from './ui';
+import { zipChipLabel } from '../utils/zipChips';
 
 export type ObjectsTab = 'stage' | 'wip' | 'archive';
 
@@ -149,7 +151,7 @@ export function ObjectsTableView({
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
-          {sortedFrameSets.map(({ frames_set, member_count }, index) => {
+          {sortedFrameSets.map(({ frames_set, member_count, zip_member_count }, index) => {
             const isBeingDragged = isDragging && draggedSetId === frames_set.id;
             const isDropTarget = dropTargetId === frames_set.id;
 
@@ -227,7 +229,14 @@ export function ObjectsTableView({
 
                 {/* Frames */}
                 <td className="px-2 py-1.5 text-content-secondary text-sm">
-                  {member_count}
+                  <span className="inline-flex items-center gap-1.5">
+                    {member_count}
+                    {zipChipLabel(zip_member_count, member_count) && (
+                      <Chip tone="info" title="Frames of this object are inside zip files">
+                        {zipChipLabel(zip_member_count, member_count)}
+                      </Chip>
+                    )}
+                  </span>
                 </td>
 
                 {/* Exposure */}

@@ -301,6 +301,34 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 ## Unverified by hand
 
+### ZIP archives in the catalog (2026-10-28) — owed acceptance
+
+Branch `feature/zip-archives` (spec `specs/2026-10-27-zip-archives-in-catalog-design.md` §13, plan Task 16 Step 4; references `docs/archive/README.md`,
+`docs/catalog/README.md`, `docs/file-browser/README.md`). Code-complete with green core gates; no human has run it on real data. Delete each line when it
+passes, with the measurement moved into the references.
+
+**NAS acceptance** (dev build with the real dev DB, a zip of a full night on Universe; the owner approves the write before any file goes to the share):
+
+- **Metadata scan reads.** Network reads for the scan are at most 64 KiB per entry plus the directory and under 0.5% of the zip's size (`zip scanned` log line, `bytes_read`); a rescan of the unchanged zip logs no `zip scanned` line.
+- **The frame set** shows in Objects with the "zip" chip; its calibration matches; preview, plate solve, analysis, a stack and a WBPP export (copy and link) run; link mode produces copies and the export dialog's "From zip" line says so; the cache shrinks back to its limit afterwards.
+- **Unpack** of the foreign set (rows to disk, metadata intact, a rescan of the kept zip does not re-add them), and a Move and ZIP set stacked without Unarchive; Unarchive after deleting two restored files extracts exactly those two entries.
+- **Move and ZIP on a set with half its lights in a foreign zip** zips only the disk half; with none on disk it says "all frames are already in zip files".
+- **Share unmounted:** zip-resident rows show missing, nothing is deleted, operations fail per frame with "inside X.zip, which is not reachable"; remounting brings them back.
+- **Extraction speed** is at least half the share's sequential read rate (probe: 70-100%).
+- **Whole-zip actions:** the zip opens read-only in the file browser with frame metadata; rename/move keeps the frames present; Black Hole (restore) then Void after the count confirmation deletes the zip and its rows.
+- **Duplicates / adoption:** a frame present on disk and in the zip shows as a duplicate pair; an already cataloged night zipped outside the app with the originals deleted becomes zip-resident on rescan with analysis, plate solve and set count intact.
+
+**Web build** (Docker, the NAS as a volume): the same checks as above, plus the cache location (`<data>/zip-cache` or `$ATHENAEUM_ZIP_CACHE`) and Settings -> General -> Archive (limit, status, Clear cache).
+
+**Windows** (the "Windows runner setup" session on obs-pc1; the branch reaches it through a GitLab branch push): `archive/planner.rs` `file_identity` Windows branch (never run); the `#[cfg(unix)]` odd-name tests' Windows behaviour; materialize's sanitized cache names; zip entry names with `:` / a trailing space / `Aux` extracted on NTFS; rename over a read-only target.
+
+**Not seen by a human (jsdom only):** the browser's zip rows and zip view, the Black Hole "Zip archives" group and its dialogs, the Settings cache row, the relink "zips not found" note, and the Task 15 screens: Unpack dialog end to end on a real foreign zip, Locate into one of our zips, the Objects chips ("zip" / "N of M in zip"), "From zip" lines in the batch dialogs.
+
+**Accepted, do not re-flag:** the cache can exceed its limit by one group during a stacking Prepare (the limit is a target); a project re-export of a zip frame always extracts again (a correct skip would need the entry CRC in the export record); unpack has no Cancel; a set whose foreign-zip frames are only calibration frames gets no "Unpack from zip" button (reads still work); `RawWithCalibrationSets` still places an imported master that sits in a Black Hole zip; rollback restores over a non-matching file at the original path; project stacking of zipped landed files is unreachable (`landed_unchanged`).
+**Accepted, do not re-flag (zip releases, review r1 2026-10-29):**
+- A different frame written over the unpacked path keeps the release alive (the disk walker re-parses the row in place, the link still names a file that exists), so the zip entry stays out of the catalog and "unpacked -> path" names another frame. Telling it apart needs a second fingerprint column or a `linked` marker; Locate names the row's current path, so nothing is hidden. Fix when a real report comes.
+- A zip view under an unmounted copy root shows the released entry as readable, without the "unpacked" chip: `released_entries_of_zip` keeps a release only when a candidate path exists, while the scan keeps it under an offline root (`present_or_offline`). Nothing is written, the chip returns with the mount; cosmetic.
+
 ### v0.7.0 pre-release fixes (2026-10-25)
 
 Found while capturing the docs screenshots; ledger `.superpowers/sdd/2026-10-25-v070-ui-fixes/` (brief + five task

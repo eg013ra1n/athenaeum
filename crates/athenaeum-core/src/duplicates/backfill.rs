@@ -101,12 +101,16 @@ pub struct ContentIndexFinished {
 }
 
 /// Rows still missing a hash. Pure SQL — never touches the disk, so the status
-/// command is safe to call from the UI on every Settings mount.
+/// command is safe to call from the UI on every Settings mount. Zip-resident rows
+/// are not counted: reading them means extracting a whole entry from a zip, which
+/// banks its own hashes (`zip_store`), so the job never opens their virtual paths.
 pub fn count_pending(db: &Database) -> usize {
     let conn = db.conn();
-    conn.query_row("SELECT COUNT(*) FROM files WHERE content_hash IS NULL", [], |r| {
-        r.get::<_, i64>(0)
-    })
+    conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE content_hash IS NULL AND archive_zip_path IS NULL",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
     .map(|n| n as usize)
     .unwrap_or_else(|e| {
         tracing::error!(error = %e, "content index: failed to count pending rows");
@@ -149,7 +153,10 @@ pub fn run_content_index_yielding(
     let pending: Vec<(i64, String, i64, String)> = {
         let conn = db.conn();
         match conn
-            .prepare("SELECT id, path, size, modified_at FROM files WHERE content_hash IS NULL")
+            .prepare(
+                "SELECT id, path, size, modified_at FROM files
+                 WHERE content_hash IS NULL AND archive_zip_path IS NULL",
+            )
             .and_then(|mut stmt| {
                 stmt.query_map([], |r| {
                     Ok((
@@ -368,6 +375,7 @@ pub fn fill_master_strong_hashes(
                    JOIN fits_header fh ON fh.file_id = f.id
                    JOIN frames fr ON fr.file_id = f.id
                    WHERE (f.strong_hash IS NULL OR f.strong_hash = '')
+                     AND f.archive_zip_path IS NULL
                      AND fh.header_fingerprint IS NOT NULL
                      AND fh.header_fingerprint <> ''
                      AND (COALESCE(fr.is_master, 0) = 1
@@ -804,6 +812,77 @@ mod tests {
         let before = emitter.0.lock().unwrap().len();
         assert_eq!(fill_master_strong_hashes(&conn, &emitter, &never, 42), 0);
         assert_eq!(emitter.0.lock().unwrap().len(), before);
+    }
+
+    /// A zip-resident row (virtual path, `archive_zip_path` set) is never listed, counted or opened
+    /// by the content-index job, and never read by the master strong-hash pass; its disk twin is
+    /// still shortlisted and hashed.
+    #[test]
+    fn content_index_and_master_hash_pass_skip_zip_resident_rows() {
+        // Content index: one disk row, one zip-resident row, both NULL content_hash.
+        let (db, tmp) = test_db_with_pending_rows(1);
+        let virtual_path = format!("{}{}Lights{}z.fits", tmp.path().join("n.zip").display(), std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at,
+                                    archive_zip_path, archive_path_in_zip)
+                 VALUES (?1, 'z.fits', 10, '2026-07-11T00:00:00Z', 'FITS', '2026-07-11T00:00:00Z', ?2, 'Lights/z.fits')",
+                rusqlite::params![virtual_path, tmp.path().join("n.zip").to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+        assert_eq!(count_pending(&db), 1, "the zip-resident row is not pending");
+        let summary = run_content_index(&db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.skipped, 0, "the virtual path was never opened");
+        let zip_hash: Option<String> = db
+            .conn()
+            .query_row("SELECT content_hash FROM files WHERE filename = 'z.fits'", [], |r| r.get(0))
+            .unwrap();
+        assert!(zip_hash.is_none());
+
+        // Master pass: a disk master and a zip-resident master share header and size.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let disk = tmp.path().join("m.xisf");
+        std::fs::write(&disk, b"AAAA").unwrap();
+        let meta = std::fs::metadata(&disk).unwrap();
+        let modified = chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339();
+        for (id, path, zip) in [
+            (1i64, disk.to_string_lossy().to_string(), None),
+            (2, virtual_path.clone(), Some("n.zip")),
+        ] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+                 VALUES (?1, ?2, 'm.xisf', ?3, ?4, 'XISF', ?5, ?5)",
+                rusqlite::params![id, path, meta.len() as i64, modified, zip],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'MasterLight', 1)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'HDR', ?2)",
+                rusqlite::params![id, crate::fingerprint::compute_header_fingerprint("HDR")],
+            )
+            .unwrap();
+        }
+        let never = AtomicBool::new(false);
+        let n = fill_master_strong_hashes(&conn, &crate::events::NullEmitter, &never, 1);
+        assert_eq!(n, 1, "only the disk master is read");
+        let hashes: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT id, strong_hash FROM files ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(hashes[0].1.is_some());
+        assert!(hashes[1].1.is_none(), "the zip-resident master was never opened");
     }
 
     /// The pass parks while a scan is active and resumes when it ends —

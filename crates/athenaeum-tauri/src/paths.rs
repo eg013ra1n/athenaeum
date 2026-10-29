@@ -23,6 +23,19 @@ pub(crate) fn resolve_app_data_dir(app_handle: &tauri::AppHandle) -> Result<Path
     Ok(rename_leaf(platform_dir))
 }
 
+/// Where the zip extraction cache lives on the desktop: the OS cache directory of THIS build flavor
+/// (`~/Library/Caches/<identifier>[.dev]/zip-cache` on macOS, which Time Machine skips), so up to the
+/// configured limit of re-creatable frames never lands in the backed-up data tree.
+/// `ATHENAEUM_APP_DATA_DIR` (a deliberate redirect of the whole data tree) keeps the cache inside
+/// that tree, and `ATHENAEUM_ZIP_CACHE` still overrides both (handled by the cache itself).
+pub(crate) fn resolve_zip_cache_dir(app_handle: &tauri::AppHandle, app_data_dir: &std::path::Path) -> Result<PathBuf, String> {
+    if std::env::var_os("ATHENAEUM_APP_DATA_DIR").is_some_and(|d| !d.is_empty()) {
+        return Ok(app_data_dir.join("zip-cache"));
+    }
+    let platform_dir = app_handle.path().app_cache_dir().map_err(|e| e.to_string())?;
+    Ok(rename_leaf(platform_dir).join("zip-cache"))
+}
+
 /// Swap the final path component for the build-flavor identifier. Component
 /// replacement, never `set_extension` — the identifier is dotted, an
 /// extension API would truncate it.
