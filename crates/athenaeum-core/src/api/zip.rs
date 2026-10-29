@@ -407,7 +407,7 @@ fn repoint_row(conn: &Connection, row: &ZipRow, dest: &Path) -> anyhow::Result<b
     if changed == 0 {
         return Ok(false);
     }
-    record_released_entry(&tx, &row.zip, &row.entry, None)?;
+    record_released_entry(&tx, &row.zip, &row.entry, None, Some(&dest.to_string_lossy()))?;
     tx.commit()?;
     Ok(true)
 }
@@ -433,6 +433,17 @@ pub struct ZipOtherEntry {
     /// The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
     pub name: String,
     pub size: i64,
+    /// Where this entry was unpacked or restored to (its release in the catalog), when the catalog knows.
+    pub released_to: Option<String>,
+    /// `released_to` exists on disk now. `false` for an entry that was not released. When the copy is gone
+    /// the next scan of the zip takes its catalog row back into the zip.
+    pub released_present: bool,
+}
+
+impl ZipOtherEntry {
+    fn plain(name: String, size: i64) -> Self {
+        Self { name, size, released_to: None, released_present: false }
+    }
 }
 
 /// `true` for a stored name that cannot be placed in a tree: absolute, or with a `..` component.
@@ -469,14 +480,25 @@ pub fn list_zip_entries(
             return Err(ApiError::Internal(format!("Could not read {zip_path}: {e:#}")));
         }
     };
-    let rows = {
+    let (rows, released) = {
         let database = db(ctx)?;
         let conn = database.conn();
-        crate::zip_store::catalog::rows_of_zip(&conn, zip_path).map_err(|e| {
+        let fail = |e: &dyn std::fmt::Display| {
             tracing::error!(zip_path, error = %e, "zip listing: catalog read failed");
-            ApiError::Internal(format!("Could not read the catalog rows of {zip_path}: {e:#}"))
-        })?
+            ApiError::Internal(format!("Could not read the catalog rows of {zip_path}: {e}"))
+        };
+        let rows = crate::zip_store::catalog::rows_of_zip(&conn, zip_path).map_err(|e| fail(&format!("{e:#}")))?;
+        let released = crate::zip_store::catalog::released_copies_of_zip(&conn, zip_path).map_err(|e| fail(&format!("{e:#}")))?;
+        (rows, released)
     };
+    // The copies are looked at after the catalog lock is released: a stat on a share can be slow.
+    let released: std::collections::HashMap<String, (String, bool)> = released
+        .into_iter()
+        .map(|(entry, to)| {
+            let present = Path::new(&to).exists();
+            (entry, (to, present))
+        })
+        .collect();
 
     // Entry path -> row.
     let virtual_prefix = format!("{zip_path}{}", std::path::MAIN_SEPARATOR);
@@ -502,7 +524,7 @@ pub fn list_zip_entries(
     for (name, size) in raw {
         if is_untreeable_name(&name) {
             if inner.is_empty() {
-                other_entries.push(ZipOtherEntry { name, size: to_i64(size) });
+                other_entries.push(ZipOtherEntry::plain(name, to_i64(size)));
             }
             continue;
         }
@@ -515,10 +537,17 @@ pub fn list_zip_entries(
                 subdirectories.insert(format!("{prefix}{first}"));
             }
             // "a//b": an empty folder name has no folder to open.
-            Some(_) => other_entries.push(ZipOtherEntry { name: rest.to_string(), size: to_i64(size) }),
+            Some(_) => other_entries.push(ZipOtherEntry::plain(rest.to_string(), to_i64(size))),
             None => match by_entry.remove(&name) {
                 Some(row) => files.push(row),
-                None => other_entries.push(ZipOtherEntry { name: rest.to_string(), size: to_i64(size) }),
+                None => {
+                    let mut other = ZipOtherEntry::plain(rest.to_string(), to_i64(size));
+                    if let Some((to, present)) = released.get(&name) {
+                        other.released_to = Some(to.clone());
+                        other.released_present = *present;
+                    }
+                    other_entries.push(other);
+                }
             },
         }
     }
@@ -774,6 +803,215 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
     }
 
+    fn plate_solve(conn: &Connection, file_id: i64) -> i64 {
+        let frame: i64 = conn.query_row("SELECT id FROM frames WHERE file_id = ?1", [file_id], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2, matched_stars,
+                total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec, field_rotation_deg, solve_time_ms,
+                catalog_used, algorithm_used, solved_at)
+             VALUES (?1, 1, 1, 10, 20, 0.1, 0, 0, 0.1, 50, 60, 0.3, 0.5, 1.2, 0, 100, 'gaia', 'quad', '2025-10-12T00:00:00Z')",
+            [frame],
+        )
+        .unwrap();
+        frame
+    }
+
+    fn released_to(conn: &Connection, entry: &str) -> Option<String> {
+        conn.query_row("SELECT released_to FROM zip_released_entries WHERE entry_path = ?1", [entry], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn unpack_records_where_the_copy_went() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        assert_eq!(
+            released_to(&conn, "Lights/L_001.fits").as_deref(),
+            Some(out.path().join("Lights").join("L_001.fits").to_str().unwrap())
+        );
+        assert_eq!(
+            released_to(&conn, "Lights/L_002.fits").as_deref(),
+            Some(out.path().join("Lights").join("L_002.fits").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn list_zip_entries_says_where_an_unpacked_entry_went_and_whether_the_copy_is_still_there() {
+        let (tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2))]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let out = tmp.path().join("out");
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            let ids = vec![file_id(&conn, "Lights/L_001.fits")];
+            assert_eq!(run(&conn, &ids, &out).unpacked, 1);
+        }
+        let copy = out.join("Lights").join("L_001.fits");
+
+        let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
+        let names: Vec<_> = lights.files.iter().map(|f| f.file.filename.as_str()).collect();
+        assert_eq!(names, vec!["L_002.fits"], "the unpacked entry is no longer a zip-resident frame");
+        assert_eq!(
+            lights.other_entries,
+            vec![ZipOtherEntry {
+                name: "L_001.fits".into(),
+                size: light(1).len() as i64,
+                released_to: Some(copy.to_string_lossy().into_owned()),
+                released_present: true,
+            }]
+        );
+
+        std::fs::remove_file(&copy).unwrap();
+        let again = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
+        assert_eq!(again.other_entries[0].released_to.as_deref(), Some(copy.to_str().unwrap()));
+        assert!(!again.other_entries[0].released_present, "a deleted copy is reported missing");
+    }
+
+    #[test]
+    fn a_deleted_copy_sends_its_row_back_into_the_unchanged_zip() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        let first = ids[0];
+        let frame = plate_solve(&conn, first);
+        run(&conn, &ids, out.path());
+        // Stat the zip once so the next scan finds it unchanged.
+        assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
+
+        let copy = out.path().join("Lights").join("L_001.fits");
+        std::fs::remove_file(&copy).unwrap();
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1, "the row of the deleted copy is back in the zip");
+        assert!(outcome.inserted.is_empty(), "no new row");
+
+        let (zip_col, entry, path): (Option<String>, Option<String>, String) = conn
+            .query_row(
+                "SELECT archive_zip_path, archive_path_in_zip, path FROM files WHERE id = ?1",
+                [first],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(zip_col.as_deref(), zip.to_str());
+        assert_eq!(entry.as_deref(), Some("Lights/L_001.fits"));
+        assert_eq!(path, crate::zip_store::scan::virtual_path(&zip, "Lights/L_001.fits"));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "no row was added or deleted");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1, "only the other release is left");
+        assert_eq!(released_to(&conn, "Lights/L_002.fits").map(|p| Path::new(&p).exists()), Some(true));
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM plate_solves WHERE frame_id = {frame}")),
+            1,
+            "the plate solve stays on the same frame"
+        );
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM session_members WHERE frame_id = {frame}")), 1);
+        assert_eq!(
+            count(&conn, &format!("SELECT frame_entries FROM zip_archives WHERE path = '{}'", zip.to_str().unwrap())),
+            1,
+            "the zip counts the frame again"
+        );
+        // And it stays put on the next scan.
+        let next = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(next.skipped_unchanged);
+        assert_eq!(next.adopted, 0);
+    }
+
+    #[test]
+    fn a_copy_that_is_still_there_stays_released() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.skipped_unchanged);
+        assert_eq!(outcome.adopted, 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
+    }
+
+    #[test]
+    fn a_release_with_no_recorded_copy_keeps_todays_behaviour() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        conn.execute("UPDATE zip_released_entries SET released_to = NULL", []).unwrap();
+        std::fs::remove_dir_all(out.path().join("Lights")).unwrap();
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+    }
+
+    #[test]
+    fn nothing_goes_back_into_a_zip_while_the_root_holding_the_copy_is_offline() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = tmp.path().join("unmounted");
+        std::fs::create_dir_all(&out).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", [out.to_str().unwrap()]).unwrap();
+        run(&conn, &ids, &out);
+        std::fs::remove_dir_all(&out).unwrap();
+
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 0, "the copies are missing only because their root is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 0);
+
+        // The volume comes back with one file deleted: only that row returns to the zip.
+        std::fs::create_dir_all(out.join("Lights")).unwrap();
+        std::fs::write(out.join("Lights").join("L_002.fits"), light(2)).unwrap();
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 1);
+    }
+
+    #[test]
+    fn a_deleted_copy_comes_back_when_the_zip_changed_too() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let out = TempDir::new().unwrap();
+        run(&conn, &ids, out.path());
+        std::fs::remove_file(out.path().join("Lights").join("L_002.fits")).unwrap();
+        // A frame is added to the zip: it is read in full, and the deleted copy's row returns first.
+        let zip = make_zip(
+            tmp.path(),
+            "night.zip",
+            &[("Lights/L_001.fits", light(1)), ("Lights/L_002.fits", light(2)), ("Lights/L_003.fits", light(3))],
+            ArchiveCompression::Store,
+        );
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_eq!(outcome.inserted.len(), 1, "only L_003 is new");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM zip_released_entries"), 1);
+    }
+
+    #[test]
+    fn a_folder_rename_carries_the_unpacked_copies_with_it() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let out = tmp.path().join("unpacked");
+        run(&conn, &ids, &out);
+        let new = tmp.path().join("unpacked-renamed");
+        let prefix_old = format!("{}{}", out.to_str().unwrap(), std::path::MAIN_SEPARATOR);
+        let prefix_new = format!("{}{}", new.to_str().unwrap(), std::path::MAIN_SEPARATOR);
+        crate::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new).unwrap();
+        assert_eq!(
+            released_to(&conn, "Lights/L_001.fits").as_deref(),
+            Some(new.join("Lights").join("L_001.fits").to_str().unwrap())
+        );
+        // A sibling folder that merely shares the name root is not touched.
+        let sibling = format!("{}-x{}", out.to_str().unwrap(), std::path::MAIN_SEPARATOR);
+        crate::db::rename_files_path_prefix(&conn, &sibling, "/elsewhere/").unwrap();
+        assert!(released_to(&conn, "Lights/L_002.fits").unwrap().starts_with(&prefix_new));
+        // One file renamed on its own follows too.
+        let l2_old = released_to(&conn, "Lights/L_002.fits").unwrap();
+        let l2_new = format!("{prefix_new}Lights{}L_002_renamed.fits", std::path::MAIN_SEPARATOR);
+        conn.execute("UPDATE files SET path = ?1 WHERE path = ?2", params![l2_new, l2_old]).unwrap();
+        assert_eq!(released_to(&conn, "Lights/L_002.fits").as_deref(), Some(l2_new.as_str()));
+    }
+
     #[test]
     fn unpack_adopts_an_identical_existing_file_and_reports_a_different_one_as_conflict() {
         let tmp = TempDir::new().unwrap();
@@ -946,7 +1184,7 @@ mod tests {
         assert_eq!(top.subdirectories, vec!["Lights".to_string()]);
         let names: Vec<_> = top.files.iter().map(|f| f.file.filename.as_str()).collect();
         assert_eq!(names, vec!["top.fits"]);
-        assert_eq!(top.other_entries, vec![ZipOtherEntry { name: "notes.txt".into(), size: 5 }]);
+        assert_eq!(top.other_entries, vec![ZipOtherEntry::plain("notes.txt".into(), 5)]);
 
         let lights = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights").unwrap();
         assert_eq!(lights.subdirectories, vec!["Lights/Ha".to_string()]);

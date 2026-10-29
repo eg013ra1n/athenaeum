@@ -268,9 +268,10 @@ pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path:
         params![zip_path, Utc::now().to_rfc3339(), operation],
     )?;
     conn.execute(
-        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
-         SELECT id, ?1 FROM zip_archives WHERE path = ?2",
-        params![entry, zip_path],
+        "INSERT INTO zip_released_entries (zip_id, entry_path, released_to)
+         SELECT id, ?1, ?3 FROM zip_archives WHERE path = ?2
+         ON CONFLICT(zip_id, entry_path) DO UPDATE SET released_to = excluded.released_to",
+        params![entry, zip_path, path.to_string_lossy()],
     )?;
     sp.commit()?;
     tracing::info!(file_id, path = %path.display(), zip_path = %zip_path, "archived frame unzipped by hand — the row is a disk row again");
@@ -294,6 +295,84 @@ fn instrume_for_root(stored: Option<String>, unique_camera: bool, root_id: i64) 
     } else {
         base
     }
+}
+
+/// A catalog row that takes over a zip entry.
+#[derive(Clone, Copy)]
+struct ZipAdoption<'a> {
+    file_id: i64,
+    old_path: &'a str,
+    vpath: &'a str,
+    filename: &'a str,
+    size: i64,
+    modified: &'a DateTime<Utc>,
+    zip_str: &'a str,
+    entry_path: &'a str,
+    crc: i64,
+    root_id: i64,
+    unique_camera: bool,
+}
+
+/// The write of an adoption, shared by a moved row and by a released entry whose copy was deleted: the
+/// row becomes (or stays) a zip-resident row of `entry_path`, keeping its id and every junction row.
+/// Returns the zip the row was resident in before, if any. One savepoint.
+fn adopt_into_zip(conn: &Connection, a: &ZipAdoption) -> Result<Option<String>> {
+    let ZipAdoption { file_id, old_path, vpath, filename, size, modified, zip_str, entry_path, crc, root_id, unique_camera } = *a;
+    let sp = SavepointGuard::new(conn, "scan_zip_adopt")?;
+    // A row of Move and ZIP's own keeps its original `files.path` (the restore target) and
+    // its camera suffix: only its zip markers follow the zip. Any other row becomes a foreign
+    // zip-resident row.
+    let (from_zip, from_entry, current_path, ours): (Option<String>, Option<String>, String, bool) = conn.query_row(
+        "SELECT archive_zip_path, archive_path_in_zip, path, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
+        params![file_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    if ours {
+        // A row re-pointed at its zip entry (a new capture took its original path) names the
+        // old zip in `files.path`: the path follows the zip like the markers do.
+        if let (Some(fz), Some(fe)) = (&from_zip, &from_entry) {
+            if current_path == virtual_path(Path::new(fz), fe) {
+                let moved = conn.execute(
+                    "UPDATE files SET path = ?1 WHERE id = ?2
+                       AND NOT EXISTS (SELECT 1 FROM files WHERE path = ?1)",
+                    params![vpath, file_id],
+                )?;
+                if moved == 0 {
+                    tracing::warn!(
+                        file_id,
+                        path = %vpath,
+                        zip_path = %zip_str,
+                        "another catalog row owns the zip entry's path — the archived row keeps its old virtual path"
+                    );
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE files SET archive_zip_path = ?1, archive_path_in_zip = ?2, archive_entry_crc32 = ?3 WHERE id = ?4",
+            params![zip_str, entry_path, crc, file_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE files SET path = ?1, filename = ?2, size = ?3, modified_at = ?4,
+                    archive_zip_path = ?5, archive_path_in_zip = ?6, archive_entry_crc32 = ?7
+             WHERE id = ?8",
+            params![vpath, filename, size, modified.to_rfc3339(), zip_str, entry_path, crc, file_id],
+        )?;
+        let stored: Option<String> = conn
+            .query_row("SELECT instrume FROM frames WHERE file_id = ?1", params![file_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        conn.execute(
+            "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
+            params![instrume_for_root(stored, unique_camera, root_id), file_id],
+        )
+        .map_err(|e| {
+            tracing::error!(root_id, file_id, old_path = %old_path, path = %vpath, error = %e, "failed to update frame instrume after move");
+            e
+        })?;
+    }
+    sp.commit()?;
+    Ok(from_zip)
 }
 
 enum EntryOutcome {
@@ -391,60 +470,22 @@ fn stage_entry(
             file_id,
             "moved file detected (into a zip)"
         );
-        let sp = SavepointGuard::new(conn, "scan_zip_adopt")?;
-        // A row of Move and ZIP's own keeps its original `files.path` (the restore target) and
-        // its camera suffix: only its zip markers follow the zip. Any other row becomes a foreign
-        // zip-resident row.
-        let (from_zip, from_entry, current_path, ours): (Option<String>, Option<String>, String, bool) = conn.query_row(
-            "SELECT archive_zip_path, archive_path_in_zip, path, archived_in_operation IS NOT NULL FROM files WHERE id = ?1",
-            params![file_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        let from_zip = adopt_into_zip(
+            conn,
+            &ZipAdoption {
+                file_id,
+                old_path: &old_path,
+                vpath: &vpath,
+                filename: &filename,
+                size,
+                modified: &modified,
+                zip_str,
+                entry_path: &entry.path,
+                crc,
+                root_id,
+                unique_camera,
+            },
         )?;
-        if ours {
-            // A row re-pointed at its zip entry (a new capture took its original path) names the
-            // old zip in `files.path`: the path follows the zip like the markers do.
-            if let (Some(fz), Some(fe)) = (&from_zip, &from_entry) {
-                if current_path == virtual_path(Path::new(fz), fe) {
-                    let moved = conn.execute(
-                        "UPDATE files SET path = ?1 WHERE id = ?2
-                           AND NOT EXISTS (SELECT 1 FROM files WHERE path = ?1)",
-                        params![vpath, file_id],
-                    )?;
-                    if moved == 0 {
-                        tracing::warn!(
-                            file_id,
-                            path = %vpath,
-                            zip_path = %zip_str,
-                            "another catalog row owns the zip entry's path — the archived row keeps its old virtual path"
-                        );
-                    }
-                }
-            }
-            conn.execute(
-                "UPDATE files SET archive_zip_path = ?1, archive_path_in_zip = ?2, archive_entry_crc32 = ?3 WHERE id = ?4",
-                params![zip_str, entry.path, crc, file_id],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE files SET path = ?1, filename = ?2, size = ?3, modified_at = ?4,
-                        archive_zip_path = ?5, archive_path_in_zip = ?6, archive_entry_crc32 = ?7
-                 WHERE id = ?8",
-                params![vpath, filename, size, modified.to_rfc3339(), zip_str, entry.path, crc, file_id],
-            )?;
-            let stored: Option<String> = conn
-                .query_row("SELECT instrume FROM frames WHERE file_id = ?1", params![file_id], |r| r.get(0))
-                .optional()?
-                .flatten();
-            conn.execute(
-                "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
-                params![instrume_for_root(stored, unique_camera, root_id), file_id],
-            )
-            .map_err(|e| {
-                tracing::error!(root_id, file_id, old_path = %old_path, path = %vpath, error = %e, "failed to update frame instrume after move");
-                e
-            })?;
-        }
-        sp.commit()?;
         return Ok(Staged::Done(EntryOutcome::Adopted { from_zip }));
     }
 
@@ -581,8 +622,8 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
         return Ok(());
     };
     conn.execute(
-        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
-         SELECT ?1, entry_path FROM zip_released_entries WHERE zip_id = ?2",
+        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path, released_to)
+         SELECT ?1, entry_path, released_to FROM zip_released_entries WHERE zip_id = ?2",
         params![new_zip_id, old_id],
     )?;
     if let Some(op) = old_operation {
@@ -603,6 +644,166 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
     }
     tracing::debug!(zip_id = new_zip_id, old_path = %gone, path = %new_zip_path, "zip identity moved to the zip's new location");
     Ok(())
+}
+
+/// What [`readopt_released`] did.
+#[derive(Debug, Default)]
+struct Readopted {
+    rows: usize,
+    bytes_read: u64,
+}
+
+/// A released entry whose copy is gone: the catalog row that was pointed at the copy goes back into the
+/// zip (finding B of the 2026-10-29 smoke: the user deleted the unpacked files, the zip still held the
+/// frames, and the entries stayed released, so the frames were lost to the catalog).
+///
+/// Mirrors the move-into-zip adoption: the row must be a disk row at `released_to`, that path must be gone
+/// from disk with its scan root online (the same offline-root guard as a moved file, so an unmounted volume
+/// never sends rows back into a zip), and the entry's header must carry the row's fingerprint. Then the
+/// release is dropped and the row is adopted exactly as a moved row is (same id, analysis, plate solve, set
+/// membership). A release with no `released_to` (recorded before the column) and a copy that is still on
+/// disk stay as they are. Never deletes a row, never writes into the zip.
+///
+/// Runs for an unchanged zip too: it costs one stat per release that has a `released_to`, and the zip is
+/// opened only when a copy is gone. `listing` is the directory when the caller already read it.
+fn readopt_released(
+    conn: &Connection,
+    zip: &Path,
+    zip_str: &str,
+    zip_modified: DateTime<Utc>,
+    listing: Option<&reader::ZipListing>,
+    root_id: i64,
+    unique_camera: bool,
+) -> Result<Readopted> {
+    struct Candidate {
+        release_id: i64,
+        entry: String,
+        released_to: String,
+        file_id: i64,
+        fingerprint: Option<String>,
+    }
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.entry_path, r.released_to, f.id, fh.header_fingerprint
+         FROM zip_released_entries r
+         INNER JOIN zip_archives z ON z.id = r.zip_id
+         INNER JOIN files f ON f.path = r.released_to
+         LEFT JOIN fits_header fh ON fh.file_id = f.id
+         WHERE z.path = ?1 AND r.released_to IS NOT NULL AND f.archive_zip_path IS NULL
+         ORDER BY r.id",
+    )?;
+    let released = stmt
+        .query_map(params![zip_str], |r| {
+            Ok(Candidate {
+                release_id: r.get(0)?,
+                entry: r.get(1)?,
+                released_to: r.get(2)?,
+                file_id: r.get(3)?,
+                fingerprint: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut gone = Vec::new();
+    for c in released {
+        if Path::new(&c.released_to).exists() {
+            continue;
+        }
+        // The copy is not there: a deleted file, or a volume that is not mounted.
+        let vpath = virtual_path(zip, &c.entry);
+        if old_location_is_gone(conn, c.file_id, &c.released_to, &c.released_to, &vpath)? {
+            gone.push(c);
+        }
+    }
+    let mut out = Readopted::default();
+    if gone.is_empty() {
+        return Ok(out);
+    }
+
+    let own_listing;
+    let listing = match listing {
+        Some(l) => l,
+        None => {
+            own_listing = reader::list_entries(zip).with_context(|| format!("read the directory of {}", zip.display()))?;
+            out.bytes_read += own_listing.bytes_read;
+            &own_listing
+        }
+    };
+    let by_name: HashMap<&str, &ZipEntryInfo> = listing.entries.iter().filter(|e| e.is_frame).map(|e| (e.path.as_str(), e)).collect();
+    let present: Vec<&Candidate> = gone.iter().filter(|c| by_name.contains_key(c.entry.as_str())).collect();
+    for c in gone.iter().filter(|c| !by_name.contains_key(c.entry.as_str())) {
+        tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, path = %c.released_to, "unpacked copy is gone and the zip no longer holds the entry — the release stays");
+    }
+    if present.is_empty() {
+        return Ok(out);
+    }
+    let names: Vec<&str> = present.iter().map(|c| c.entry.as_str()).collect();
+    let (headers, header_bytes) =
+        reader::read_headers(zip, &names).with_context(|| format!("read entry headers of {}", zip.display()))?;
+    out.bytes_read += header_bytes;
+
+    for (c, (_, header)) in present.iter().zip(headers) {
+        let entry = by_name[c.entry.as_str()];
+        let vpath = virtual_path(zip, &c.entry);
+        let verdict: Result<bool> = (|| {
+            let bytes = header?;
+            let format = if c.entry.to_ascii_lowercase().ends_with(".xisf") { FileFormat::XISF } else { FileFormat::FITS };
+            let (_, parsed) = match format {
+                FileFormat::FITS => parse_fits_header_bytes(&bytes, 0, Path::new(&vpath)),
+                FileFormat::XISF => parse_xisf_header_bytes(&bytes, 0, Path::new(&vpath)),
+            }?;
+            Ok(c.fingerprint.as_deref() == Some(crate::fingerprint::compute_header_fingerprint(&parsed).as_str()))
+        })();
+        match verdict {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, path = %c.released_to, file_id = c.file_id, "unpacked copy is gone but the zip entry is not that frame — the release stays");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, error = %format!("{e:#}"), "could not read the zip entry to take an unpacked frame back — the release stays");
+                continue;
+            }
+        }
+        let modified = entry.modified.map(|n| n.and_utc()).unwrap_or(zip_modified);
+        let filename = c.entry.rsplit('/').next().unwrap_or(&c.entry);
+        let sp = SavepointGuard::new(conn, "scan_zip_readopt")?;
+        let done = (|| -> Result<()> {
+            // The release goes first: the path swap of the adoption would otherwise carry it along.
+            conn.execute("DELETE FROM zip_released_entries WHERE id = ?1", params![c.release_id])?;
+            adopt_into_zip(
+                conn,
+                &ZipAdoption {
+                    file_id: c.file_id,
+                    old_path: &c.released_to,
+                    vpath: &vpath,
+                    filename,
+                    size: entry.size as i64,
+                    modified: &modified,
+                    zip_str,
+                    entry_path: &c.entry,
+                    crc: i64::from(entry.crc32),
+                    root_id,
+                    unique_camera,
+                },
+            )?;
+            Ok(())
+        })();
+        match done {
+            Ok(()) => {
+                sp.commit()?;
+                out.rows += 1;
+                tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %c.entry, old_path = %c.released_to, file_id = c.file_id, "unpacked copy gone — the row is back in the zip");
+            }
+            Err(e) => {
+                drop(sp);
+                tracing::warn!(zip_path = %zip.display(), zip_entry = %c.entry, file_id = c.file_id, error = %format!("{e:#}"), "could not take an unpacked frame back into its zip — the release stays");
+            }
+        }
+    }
+    if out.rows > 0 {
+        tracing::info!(zip_path = %zip.display(), rows = out.rows, "unpacked frames whose copy is gone are back in their zip");
+    }
+    Ok(out)
 }
 
 /// Catalog the frames inside one zip. The zip's stat is compared first; an unchanged zip is not
@@ -633,7 +834,22 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         .optional()?;
     if let Some((zip_id, db_size, db_modified)) = &known_zip {
         if *db_size == size && *db_modified == modified_str {
-            return Ok(ZipScanOutcome { zip_id: *zip_id, skipped_unchanged: true, ..Default::default() });
+            // Nothing to read in the zip itself, but an unpacked copy deleted since the last scan sends its
+            // row back into the zip (the stat of each release's copy is the whole cost when none was).
+            let back = readopt_released(conn, zip, &zip_str, zip_modified, None, root_id, unique_camera)?;
+            if back.rows > 0 {
+                conn.execute(
+                    "UPDATE zip_archives SET frame_entries = (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1) WHERE id = ?2",
+                    params![zip_str, zip_id],
+                )?;
+            }
+            return Ok(ZipScanOutcome {
+                zip_id: *zip_id,
+                skipped_unchanged: back.bytes_read == 0,
+                adopted: back.rows,
+                bytes_read: back.bytes_read,
+                ..Default::default()
+            });
         }
     }
 
@@ -644,6 +860,12 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         gone_zips: Vec::new(),
         entry_failed: false,
     };
+    // Released entries whose copy is gone come back first, so the passes below see them as the zip's own.
+    if known_zip.is_some() {
+        let back = readopt_released(conn, zip, &zip_str, zip_modified, Some(&listing), root_id, unique_camera)?;
+        tally.outcome.adopted += back.rows;
+        tally.outcome.bytes_read += back.bytes_read;
+    }
 
     // Entries a row already owns: row id and the CRC recorded for it (NULL for rows that predate it).
     let mut known: HashMap<String, (i64, Option<i64>)> = HashMap::new();

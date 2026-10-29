@@ -54,7 +54,11 @@ beforeEach(() => {
             : {
                 subdirectories: ['Lights'],
                 files: [frameFile(`${ZIP}/top.fits`, 'top.fits')],
-                otherEntries: [{ name: 'notes.txt', size: 5 }],
+                otherEntries: [
+                  { name: 'notes.txt', size: 5, releasedTo: null, releasedPresent: false },
+                  { name: 'L_007.fits', size: 9, releasedTo: '/astro/out/L_007.fits', releasedPresent: true },
+                  { name: 'L_008.fits', size: 9, releasedTo: '/astro/out/L_008.fits', releasedPresent: false },
+                ],
               },
         );
       default:
@@ -97,6 +101,25 @@ describe('DualPaneFileBrowser — zips', () => {
     const blocked = screen.getAllByTitle(/Inside a zip/).filter((el) => el.tagName === 'BUTTON');
     expect(blocked).toHaveLength(4); // Rename, Move, Mkdir, Delete
     blocked.forEach((b) => expect(b).toBeDisabled());
+  });
+
+  it('marks an unpacked entry, locates its disk copy, and says when the copy is missing', async () => {
+    await openZip();
+    const present = (await screen.findAllByText('L_007.fits'))[0].closest('div') as HTMLElement;
+    expect(within(present).getByText('unpacked')).toBeInTheDocument();
+    const missing = screen.getAllByText('L_008.fits')[0].closest('div') as HTMLElement;
+    expect(within(missing).getByText('unpacked copy missing')).toBeInTheDocument();
+    expect(within(missing).queryByText('Locate')).toBeNull();
+    // An entry that was never unpacked carries neither.
+    const plain = screen.getAllByText('notes.txt')[0].closest('div') as HTMLElement;
+    expect(within(plain).queryByText(/unpacked/)).toBeNull();
+    expect(within(plain).queryByText('Locate')).toBeNull();
+
+    const before = calls('get_directory_contents').length;
+    fireEvent.click(within(present).getByText('Locate'));
+    await waitFor(() => expect(calls('get_directory_contents').length).toBeGreaterThan(before));
+    expect(lastCall('get_directory_contents')[1]).toMatchObject({ directoryPath: '/astro/out' });
+    for (const cmd of MUTATIONS) expect(calls(cmd)).toHaveLength(0);
   });
 
   it('opens inner folders and leaves the zip with up', async () => {

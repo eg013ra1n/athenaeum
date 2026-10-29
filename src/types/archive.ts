@@ -95,5 +95,14 @@ export type ZipOtherEntry = {
 /**
  * The name at this level (for an unsafe name that has no level, the whole stored name, at the top).
  */
-name: string, size: number, };
+name: string, size: number, 
+/**
+ * Where this entry was unpacked or restored to (its release in the catalog), when the catalog knows.
+ */
+releasedTo: string | null, 
+/**
+ * `released_to` exists on disk now. `false` for an entry that was not released. When the copy is gone
+ * the next scan of the zip takes its catalog row back into the zip.
+ */
+releasedPresent: boolean, };
 

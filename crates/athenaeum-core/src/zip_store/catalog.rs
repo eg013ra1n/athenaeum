@@ -270,6 +270,18 @@ pub fn zips_in_directory(conn: &Connection, directory: &str, instrume: Option<&s
     Ok(out)
 }
 
+/// The entries of `zip` that were unpacked or restored to a known place: entry path and where the copy went.
+/// Releases recorded without a place (before the column existed) are not listed.
+pub fn released_copies_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.entry_path, r.released_to FROM zip_released_entries r
+         INNER JOIN zip_archives z ON z.id = r.zip_id
+         WHERE z.path = ?1 AND r.released_to IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([zip], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// The cataloged rows that belong to `zip`: those marked with it (`archive_zip_path`, ours and foreign) and
 /// those whose `files.path` is a virtual path under it. Each with its frame, ordered by file name.
 pub fn rows_of_zip(conn: &Connection, zip: &str) -> Result<Vec<(File, Option<Frame>)>> {

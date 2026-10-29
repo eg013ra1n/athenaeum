@@ -129,16 +129,27 @@ pub fn place_entry(
 /// Records that `entry` of `zip` was taken out of the zip by the user, so a later scan of the zip does
 /// not catalog it again. The zip gets a placeholder `zip_archives` row when it has none (stat left empty,
 /// so the next scan reads the zip).
-pub(crate) fn record_released_entry(conn: &Connection, zip: &str, entry: &str, operation: Option<i64>) -> Result<()> {
+///
+/// `released_to` is where the copy went. The zip view points at it, and the scan falls back to the zip
+/// when the copy is deleted. A release recorded again with a path replaces the one recorded before; one
+/// recorded with `None` keeps the path it has.
+pub(crate) fn record_released_entry(
+    conn: &Connection,
+    zip: &str,
+    entry: &str,
+    operation: Option<i64>,
+    released_to: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO zip_archives (path, size, modified_at, frame_entries, scanned_at, created_by_operation)
          VALUES (?1, 0, '', (SELECT COUNT(*) FROM files WHERE archive_zip_path = ?1), ?2, ?3)",
         rusqlite::params![zip, chrono::Utc::now().to_rfc3339(), operation],
     )?;
     conn.execute(
-        "INSERT OR IGNORE INTO zip_released_entries (zip_id, entry_path)
-         SELECT id, ?1 FROM zip_archives WHERE path = ?2",
-        rusqlite::params![entry, zip],
+        "INSERT INTO zip_released_entries (zip_id, entry_path, released_to)
+         SELECT id, ?1, ?3 FROM zip_archives WHERE path = ?2
+         ON CONFLICT(zip_id, entry_path) DO UPDATE SET released_to = COALESCE(excluded.released_to, released_to)",
+        rusqlite::params![entry, zip, released_to],
     )?;
     Ok(())
 }

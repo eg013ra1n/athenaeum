@@ -1452,6 +1452,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           upRow={upRowOf('left')}
           onUp={() => { const m = upMove('left'); if (m) applyUp('left', m); }}
           onOpenZip={(path) => dispatch({ type: 'set_zip', pane: 'left', zip: { path, innerDir: '' } })}
+          onLocate={(path) => void revealPath('left', path)}
           onZipFolder={(innerDir) => {
             const z = state.panes.left.zip;
             if (z) dispatch({ type: 'set_zip', pane: 'left', zip: { path: z.path, innerDir } });
@@ -1489,6 +1490,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           upRow={upRowOf('right')}
           onUp={() => { const m = upMove('right'); if (m) applyUp('right', m); }}
           onOpenZip={(path) => dispatch({ type: 'set_zip', pane: 'right', zip: { path, innerDir: '' } })}
+          onLocate={(path) => void revealPath('right', path)}
           onZipFolder={(innerDir) => {
             const z = state.panes.right.zip;
             if (z) dispatch({ type: 'set_zip', pane: 'right', zip: { path: z.path, innerDir } });
@@ -1848,6 +1850,8 @@ interface PaneProps {
   onOpenZip: (zipPath: string) => void;
   /** Open an inner folder of the zip this pane is inside. */
   onZipFolder: (innerDir: string) => void;
+  /** Show a file (the disk copy of an unpacked zip entry) in this pane. */
+  onLocate: (path: string) => void;
   onMetaSaved: () => void;
   /** Double-clicking an image file row in this pane opens the OTHER pane's
    *  metadata editor focused on that file. */
@@ -1877,6 +1881,7 @@ function Pane({
   onUp,
   onOpenZip,
   onZipFolder,
+  onLocate,
   onMetaSaved,
   onOpenMetadata,
   scanRoots,
@@ -2017,6 +2022,7 @@ function Pane({
               onUp={onUp}
               onOpenFolder={state.zip ? onZipFolder : onCwd}
               onOpenZip={onOpenZip}
+              onLocate={onLocate}
               onToggleSelect={onToggleSelect}
               onSetSelection={onSetSelection}
               onOpenMetadata={onOpenMetadata}
@@ -2044,6 +2050,8 @@ interface FileListProps {
   /** Double-click on a folder row: a disk folder, or an inner folder of the open zip. */
   onOpenFolder: (path: string) => void;
   onOpenZip: (zipPath: string) => void;
+  /** Show the disk copy of an unpacked zip entry. */
+  onLocate: (path: string) => void;
   onToggleSelect: (path: string, multi: boolean) => void;
   onSetSelection: (selection: Set<string>, anchor?: string | null) => void;
   /** Called when a double-click on an image file row (frame present) is detected. */
@@ -2075,7 +2083,7 @@ function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
   return keys.filter((k) => flags[k]);
 }
 
-function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpenFolder, onOpenZip, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
+function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpenFolder, onOpenZip, onLocate, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the focused (anchor) row visible — fires when cursor crosses the
   // viewport edge from arrow-key navigation.
@@ -2255,11 +2263,33 @@ function FileList({ paneId, listing, selection, anchor, upRow, zip, onUp, onOpen
         <div
           key={`other:${o.name}`}
           aria-disabled="true"
-          title="Not a cataloged frame — nothing here opens it"
-          className="w-full flex items-center gap-2 px-2 py-1 text-content-muted opacity-70 cursor-default"
+          title={o.releasedTo ? `Unpacked to ${o.releasedTo}` : 'Not a cataloged frame — nothing here opens it'}
+          className={`w-full flex items-center gap-2 px-2 py-1 text-content-muted cursor-default ${o.releasedTo != null ? '' : 'opacity-70'}`}
         >
           <FileIcon size={14} className="text-content-muted" />
           <span className="truncate font-mono">{o.name}</span>
+          {o.releasedTo != null && (
+            o.releasedPresent ? (
+              <Chip tone="info" title={`Unpacked to ${o.releasedTo}`}>unpacked</Chip>
+            ) : (
+              <Chip
+                tone="warn"
+                title={`The unpacked copy ${o.releasedTo} is gone from disk. The next scan of this zip takes its catalog row back into the zip.`}
+              >
+                unpacked copy missing
+              </Chip>
+            )
+          )}
+          {o.releasedTo != null && o.releasedPresent && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onLocate(o.releasedTo as string); }}
+              title={`Show ${o.releasedTo} in the browser`}
+              className="text-xs text-accent hover:underline"
+            >
+              Locate
+            </button>
+          )}
           <span className="ml-auto text-xs">{formatBytes(o.size)}</span>
         </div>
       ))}

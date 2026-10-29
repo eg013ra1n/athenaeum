@@ -530,9 +530,9 @@ fn run_restore_inner(
                 .optional()?;
             let path_changed = new_path.to_str() != Some(current_path.as_deref().unwrap_or(f.source_path.as_str()));
             let path_arg = if path_changed { new_path.to_str() } else { None };
-            update_restored_row(conn, operation_id, f, Some((file_id, path_arg, &new_mtime, new_size)))?;
+            update_restored_row(conn, operation_id, f, Some((file_id, path_arg, &new_mtime, new_size)), &new_path.to_string_lossy())?;
         } else {
-            update_restored_row(conn, operation_id, f, None)?;
+            update_restored_row(conn, operation_id, f, None, &new_path.to_string_lossy())?;
         }
         catalog_done += 1;
         emit(
@@ -730,12 +730,13 @@ fn update_restored_row(
     operation_id: i64,
     f: &ArchiveOperationFile,
     row: Option<(i64, Option<&str>, &str, i64)>,
+    released_to: &str,
 ) -> Result<()> {
     let sp = crate::db::SavepointGuard::new(conn, "restore_release_entry")?;
     if let Some((file_id, path_arg, new_mtime, new_size)) = row {
         adb::unmark_file_archived(conn, file_id, path_arg, Some(new_mtime), Some(new_size))?;
     }
-    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id))
+    record_released_entry(conn, &f.target_zip_path, &f.target_path_in_zip, Some(operation_id), Some(released_to))
         .with_context(|| format!("record the released entry {} of {}", f.target_path_in_zip, f.target_zip_path))?;
     sp.commit()?;
     Ok(())
@@ -1781,6 +1782,17 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM zip_released_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(released, 3, "each restored entry is recorded for the kept zip");
+        let mut to: Vec<String> = conn
+            .prepare("SELECT released_to FROM zip_released_entries")
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(|r| r.unwrap().expect("a restore records where the entry went"))
+            .collect();
+        to.sort();
+        let mut want: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        want.sort();
+        assert_eq!(to, want, "each release points at the restored file");
 
         // Two files are deleted again; the next restore extracts exactly those two.
         std::fs::remove_file(&paths[0]).unwrap();
@@ -2018,7 +2030,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let err = update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap_err();
+        let err = update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5)), "/orig/L.fits").unwrap_err();
         assert!(format!("{err:#}").contains("injected"), "{err:#}");
         let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
             .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
@@ -2029,7 +2041,7 @@ pub(crate) mod tests {
         assert!(conn.is_autocommit(), "no transaction is left open");
 
         conn.execute_batch("DROP TRIGGER no_release").unwrap();
-        update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5))).unwrap();
+        update_restored_row(&conn, 3, &f, Some((7, None, "2025-02-02T00:00:00Z", 5)), "/orig/L.fits").unwrap();
         let (op, zip, size): (Option<i64>, Option<String>, i64) = conn
             .query_row("SELECT archived_in_operation, archive_zip_path, size FROM files WHERE id = 7", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))

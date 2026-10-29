@@ -2546,6 +2546,27 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    // Where an unpacked or restored entry went (NULL for rows that predate the column or whose copy the
+    // catalog was never told about). The scan reads it to fall back to the zip when the copy is deleted.
+    if !column_exists(conn, "zip_released_entries", "released_to")? {
+        conn.execute("ALTER TABLE zip_released_entries ADD COLUMN released_to TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_zip_released_to ON zip_released_entries(released_to) WHERE released_to IS NOT NULL",
+        [],
+    )?;
+    // Any path change of the row (a rename, a folder rename's prefix swap, a move, a relink, the scanner's
+    // moved-file rule) carries the release along, in the statement's own transaction, so the zip view's
+    // Locate and the fall-back to the zip keep pointing at the copy.
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS zip_released_follows_path
+         AFTER UPDATE OF path ON files
+         WHEN OLD.path IS NOT NEW.path
+         BEGIN
+             UPDATE zip_released_entries SET released_to = NEW.path WHERE released_to = OLD.path;
+         END",
+        [],
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS black_hole_zips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5643,6 +5664,30 @@ mod zip_schema_tests {
     use rusqlite::Connection;
 
     #[test]
+    fn a_release_recorded_before_released_to_existed_keeps_a_null_copy() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The table as an older build left it.
+        conn.execute_batch(
+            "DROP TRIGGER zip_released_follows_path; DROP INDEX idx_zip_released_to;
+             ALTER TABLE zip_released_entries DROP COLUMN released_to;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, frame_entries, scanned_at) VALUES ('/z.zip', 1, 'm', 1, 's')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zip_released_entries (zip_id, entry_path) VALUES (1, 'a.fits')", []).unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let to: Option<String> = conn
+            .query_row("SELECT released_to FROM zip_released_entries WHERE entry_path = 'a.fits'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(to, None);
+    }
+
+    #[test]
     fn init_db_creates_zip_tables_and_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -5658,6 +5703,7 @@ mod zip_schema_tests {
             assert_eq!(n, 1, "{t}");
         }
         assert!(column_exists(&conn, "files", "archive_entry_crc32").unwrap());
+        assert!(column_exists(&conn, "zip_released_entries", "released_to").unwrap());
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_files_archive_zip_path'",
