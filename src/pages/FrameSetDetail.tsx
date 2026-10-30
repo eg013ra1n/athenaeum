@@ -1,13 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, RefreshCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack, PackageOpen } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, RefreshCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack, PackageOpen, Copy } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary, FrameSetProjectStatus, FrameSetPointingUpdate } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
-import { LightsAnalysisView } from '../components/LightsAnalysisView';
+import { LightsAnalysisView, ToolButton } from '../components/LightsAnalysisView';
 import FrameSetProjectBlock from '../components/collab/FrameSetProjectBlock';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
@@ -32,7 +32,7 @@ import { stackedFrameSnr } from '../components/analysis/stackedSnr';
 import { UnpackZipDialog } from '../components/zip/UnpackZipDialog';
 import { mainZip } from '../components/zip/unpackDialogModel';
 import { isForeignZipFile } from '../utils/zipChips';
-import { FrameSetDuplicatesChip } from '../components/duplicates/FrameSetDuplicatesChip';
+import { duplicatesLabel, DUPLICATES_TAB_REQUEST } from '../components/duplicates/FrameSetDuplicatesChip';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
@@ -148,7 +148,6 @@ export default function FrameSetDetail() {
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
-  const [recalcNightsBusy, setRecalcNightsBusy] = useState(false);
   const [pointingBusy, setPointingBusy] = useState(false);
 
   // Archive state
@@ -214,60 +213,33 @@ export default function FrameSetDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  // Refresh the set's center and rotation from its lights: Black Hole lights
-  // left out, Athenaeum-solved lights preferred (a header's mount
-  // coordinates and another program's rotation sign no longer mix in).
-  const handleRecomputeCoordinates = useCallback(async () => {
+  // Refresh: what leaving the object and coming back does, run by hand and
+  // in full. Nights and sessions are re-derived from the member frames (the
+  // forced form of the open-time reconcile: repairs a night stored as two),
+  // then the center and rotation come from the lights by the one rule (Black
+  // Hole lights left out, Athenaeum-solved lights preferred), then the page
+  // reloads. A failed step is reported and the rest still runs.
+  const handleRefresh = useCallback(async () => {
     if (!id) return;
     setPointingBusy(true);
+    const framesSetId = parseInt(id);
     try {
-      await api.invoke<FrameSetPointingUpdate>('recompute_frame_set_coordinates', {
-        framesSetId: parseInt(id),
-      });
-      await loadData();
+      await api.invoke<FrameSetDetail>('recalculate_frame_set_nights', { framesSetId });
+    } catch (e) {
+      console.error('[FrameSetDetail] recalculate_frame_set_nights failed:', e);
+      notify({ title: 'Nights not recalculated', detail: String(e), kind: 'generic', tone: 'warning' });
+    }
+    try {
+      await api.invoke<FrameSetPointingUpdate>('recompute_frame_set_coordinates', { framesSetId });
     } catch (e) {
       console.error('[FrameSetDetail] recompute_frame_set_coordinates failed:', e);
-      notify({
-        title: 'Coordinates not refreshed',
-        detail: String(e),
-        kind: 'generic',
-        tone: 'warning',
-      });
-    } finally {
-      setPointingBusy(false);
+      notify({ title: 'Coordinates not refreshed', detail: String(e), kind: 'generic', tone: 'warning' });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
-
-  // "Recalculate nights": re-derive this set's nights and sessions from its
-  // member frames — repairs a set an older merge left with one night stored
-  // as two rows. The command returns the refreshed detail; the reload keeps
-  // every tab in step with it.
-  const handleRecalculateNights = useCallback(async () => {
-    if (!id) return;
-    setRecalcNightsBusy(true);
     try {
-      const updated = await api.invoke<FrameSetDetail>('recalculate_frame_set_nights', {
-        framesSetId: parseInt(id),
-      });
       await loadData();
       setHistoryRefreshKey((k) => k + 1);
-      const sessions = updated.nights.reduce((n, night) => n + night.sessions.length, 0);
-      setAlertDialog({
-        isOpen: true,
-        title: 'Nights recalculated',
-        message: `${updated.nights.length} night${updated.nights.length === 1 ? '' : 's'}, ${sessions} session${sessions === 1 ? '' : 's'}.`,
-        variant: 'info',
-      });
-    } catch (e) {
-      setAlertDialog({
-        isOpen: true,
-        title: 'Recalculate nights failed',
-        message: String(e),
-        variant: 'error',
-      });
     } finally {
-      setRecalcNightsBusy(false);
+      setPointingBusy(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -277,12 +249,12 @@ export default function FrameSetDetail() {
     setMovingToArchive(true);
     try {
       await api.invoke('archive_frame_set', { framesSetId: detail.frames_set.id });
-      // Reload so the toolbar contextual button switches from "Find new images +
-      // Move to Archive" to "Move and ZIP".
+      // Reload so the header's contextual button switches from "Find new images"
+      // to "Move and ZIP".
       await loadData();
     } catch (e) {
       console.error('move to archive failed', e);
-      alert(`Failed to move to archive: ${e}`);
+      showAlert('Move to Archive failed', String(e), 'error');
     } finally {
       setMovingToArchive(false);
     }
@@ -294,12 +266,12 @@ export default function FrameSetDetail() {
     try {
       const roots = await listArchiveRoots();
       if (roots.length === 0) {
-        alert('No archive folders configured yet. Add one in File Manager → Archive Folders, then come back.');
+        showAlert('No archive folders', 'No archive folders configured yet. Add one in File Manager → Archive Folders, then come back.', 'warning');
         return;
       }
     } catch (e) {
       console.error('Failed to list archive roots', e);
-      alert(`Failed to load archive folders: ${e}`);
+      showAlert('Archive folders not loaded', String(e), 'error');
       return;
     }
     // Pull compression default from settings.
@@ -332,7 +304,7 @@ export default function FrameSetDetail() {
       setActiveArchiveOpId(opId);
     } catch (e) {
       console.error('start archive failed', e);
-      alert(`Archive failed to start: ${e}`);
+      showAlert('Archive failed to start', String(e), 'error');
     } finally {
       setArchiving(false);
     }
@@ -829,6 +801,45 @@ export default function FrameSetDetail() {
     );
   }
 
+  // The set's own actions, at the end of the Lights toolbar after View.
+  const duplicateCount = calibrationHierarchy?.duplicate_frames ?? 0;
+  const canUnpack = foreignZipFrames.count > 0 && !detail.frames_set?.archived_at;
+  const canMoveToArchive = !detail.frames_set?.is_archived && !detail.frames_set?.archived_at;
+  const setTools = duplicateCount > 0 || canUnpack || canMoveToArchive ? (
+    <>
+      {duplicateCount > 0 && (
+        <ToolButton
+          label="Duplicates"
+          title={`${duplicatesLabel(duplicateCount)}: frames held twice (two disk copies, or a disk copy and a zip entry), one copy is used. Opens the Duplicates page.`}
+          className="text-warning"
+          onClick={() => navigate('/files', { state: DUPLICATES_TAB_REQUEST })}
+        >
+          <Copy size={12} />
+          {duplicateCount}
+        </ToolButton>
+      )}
+      {canUnpack && (
+        <ToolButton
+          label="Unpack"
+          title="Unpack from zip: extract this set's frames out of their zip files into a folder. They stay in the catalog."
+          onClick={() => setShowUnpackDialog(true)}
+        >
+          <PackageOpen size={12} />
+        </ToolButton>
+      )}
+      {canMoveToArchive && (
+        <ToolButton
+          label={movingToArchive ? 'Moving…' : 'Archive'}
+          title="Move to Archive: move this frame set to the Archive tab. You can then zip it from there."
+          onClick={() => void handleMoveToArchive()}
+          disabled={movingToArchive}
+        >
+          <ArchiveIcon size={12} />
+        </ToolButton>
+      )}
+    </>
+  ) : null;
+
   return (
     <div className="p-4 pt-3 h-full flex flex-col">
       {/* Frame Set Header */}
@@ -868,10 +879,10 @@ export default function FrameSetDetail() {
             )}
             <button
               type="button"
-              onClick={handleRecomputeCoordinates}
+              onClick={() => void handleRefresh()}
               disabled={pointingBusy}
-              title="Refresh the center and rotation from this set's lights: lights in the Black Hole are left out, and lights plate-solved by Athenaeum are preferred over header coordinates"
-              aria-label="Refresh coordinates"
+              title="Refresh this object: re-derive its nights and sessions from its frames, recompute the center and rotation from its lights (Black Hole lights left out, lights plate-solved by Athenaeum preferred), and reload the page"
+              aria-label="Refresh object"
               className="p-1 rounded text-content-muted hover:text-content hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <RefreshCw size={14} className={pointingBusy ? 'animate-spin' : ''} />
@@ -879,7 +890,7 @@ export default function FrameSetDetail() {
           </div>
           <div className="flex flex-wrap items-center gap-3 [&_button]:whitespace-nowrap">
             {/* Single contextual action button: depends on the frame set state.
-                stage / wip (is_archived=0) → Find new images
+                stage / wip (is_archived=0) → Find new images (Move to Archive is in the Lights toolbar)
                 in archive, not yet zipped → Move and ZIP
                 already zipped (archived_at set) → Unarchive */}
             {detail.frames_set?.archived_at ? (
@@ -893,10 +904,11 @@ export default function FrameSetDetail() {
                       if (match) {
                         setRestoreItem(match);
                       } else {
-                        alert('Could not find this frame set in the archive list. It may have been deleted.');
+                        showAlert('Archive not found', 'Could not find this frame set in the archive list. It may have been deleted.', 'warning');
                       }
                     } catch (e) {
-                      alert(`Failed to load archive details: ${e}`);
+                      console.error('[FrameSetDetail] listArchivedFrameSets failed:', e);
+                      showAlert('Archive details not loaded', String(e), 'error');
                     }
                   }}
                   title="Unarchive this frame set: extract files from the zip and bring it back to the active view"
@@ -911,19 +923,20 @@ export default function FrameSetDetail() {
                     onClick={async () => {
                       const opId = detail.frames_set?.archive_operation_id;
                       if (!opId) {
-                        alert('No archive operation linked to this frame set.');
+                        showAlert('No archive operation', 'No archive operation linked to this frame set.', 'warning');
                         return;
                       }
                       try {
                         const zips = await listArchiveZips(opId);
                         const target = zips.find(z => z.exists) ?? zips[0];
                         if (!target) {
-                          alert('No zip files recorded for this archive operation.');
+                          showAlert('No zip files', 'No zip files recorded for this archive operation.', 'warning');
                           return;
                         }
                         await revealItemInDir(target.path);
                       } catch (e) {
-                        alert(`Failed to open file manager: ${e}`);
+                        console.error('[FrameSetDetail] reveal archive zip failed:', e);
+                        showAlert('File manager not opened', String(e), 'error');
                       }
                     }}
                     title="Reveal the archive zip(s) in the system file manager"
@@ -945,54 +958,21 @@ export default function FrameSetDetail() {
                 {archiving ? 'Archiving…' : 'Move and ZIP'}
               </button>
             ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={handleFindNewClick}
-                  disabled={
-                    findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-                  }
-                  title={
-                    !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-                      ? 'No coordinates — nothing to match against'
-                      : 'Find new images for this object'
-                  }
-                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Search size={14} />
-                  {findNewBusy ? 'Merging…' : 'Find new images'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleRecalculateNights}
-                  disabled={recalcNightsBusy}
-                  title="Force a full re-derive of this set's nights and sessions from its frames (repairs a night stored as two); normally happens automatically on open"
-                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <RotateCw size={14} className={recalcNightsBusy ? 'animate-spin' : ''} />
-                  {recalcNightsBusy ? 'Recalculating…' : 'Recalculate nights'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleMoveToArchive}
-                  disabled={movingToArchive}
-                  title="Move this frame set to the Archive tab. You can then zip it from there."
-                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <ArchiveIcon size={14} />
-                  {movingToArchive ? 'Moving…' : 'Move to Archive'}
-                </button>
-              </>
-            )}
-            {foreignZipFrames.count > 0 && !detail.frames_set?.archived_at && (
               <button
                 type="button"
-                onClick={() => setShowUnpackDialog(true)}
-                title="Extract this set's frames out of their zip files into a folder. They stay in the catalog."
-                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110"
+                onClick={handleFindNewClick}
+                disabled={
+                  findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                }
+                title={
+                  !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                    ? 'No coordinates — nothing to match against'
+                    : 'Find new images for this object'
+                }
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <PackageOpen size={14} />
-                Unpack from zip
+                <Search size={14} />
+                {findNewBusy ? 'Merging…' : 'Find new images'}
               </button>
             )}
             <button
@@ -1005,11 +985,6 @@ export default function FrameSetDetail() {
             </button>
             <div className="flex items-center gap-1.5 text-sm text-content-muted whitespace-nowrap">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
-              <FrameSetDuplicatesChip
-                count={calibrationHierarchy?.duplicate_frames ?? 0}
-                frameSetId={parseInt(id!)}
-                frameSetName={detail.frames_set?.name || 'Untitled'}
-              />
               <span>·</span>
               <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
               <span>·</span>
@@ -1166,6 +1141,7 @@ export default function FrameSetDetail() {
               referenceFrameId={referenceFrameId ?? null}
               onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
               projectStates={projectStates}
+              setTools={setTools}
             />
           )
         ) : (

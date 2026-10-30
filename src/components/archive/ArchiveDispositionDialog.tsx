@@ -8,6 +8,7 @@ import type {
 } from '../../types/archive';
 import type { ArchiveRoot } from '../../types/helpers';
 import { listArchiveRoots, planArchiveOperation } from '../../api/archive';
+import { Button, DialogShell, Select } from '../ui';
 import { ArchiveConflictDialog } from './ArchiveConflictDialog';
 
 interface Props {
@@ -73,13 +74,13 @@ export function ArchiveDispositionDialog(props: Props) {
     const moveDisabled = sharedRoles.has(frameRole);
     const sharedCount = plan?.shared_calibrations.find(s => s.frame_role === frameRole)?.other_frames_set_ids.length ?? 0;
     return (
-      <div key={role} className="flex items-center gap-3 py-2 border-b border-border/30 last:border-0">
-        <span className="w-24 text-sm font-medium text-content">{label}</span>
+      <div key={role} className="flex items-center gap-4 py-1.5 border-b border-border/30 last:border-0">
+        <span className="w-20 font-medium text-content">{label}</span>
         {(['move', 'copy', 'skip'] as const).map(opt => (
           <label
             key={opt}
-            className={`flex items-center gap-1.5 text-sm cursor-pointer ${
-              moveDisabled && opt === 'move' ? 'opacity-40 cursor-not-allowed' : 'text-content'
+            className={`flex items-center gap-1.5 ${
+              moveDisabled && opt === 'move' ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer text-content-secondary'
             }`}
             title={moveDisabled && opt === 'move' ? `Used by ${sharedCount} other frame set(s) — only Copy is allowed.` : undefined}
           >
@@ -107,109 +108,108 @@ export function ArchiveDispositionDialog(props: Props) {
     props.onStart(dispositions, compression, 'overwrite', selectedRootPath);
   }
 
+  const canStart = !planning && !!plan && !!selectedRootPath && archiveRoots.length > 0;
+
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-      <div className="bg-surface-elevated border border-border rounded-lg shadow-2xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-        <h2 className="text-lg font-semibold mb-1 text-content">Archive Frame Set</h2>
-        <p className="text-sm text-content-muted mb-4">
-          Lights will always be moved. Choose what to do with calibration frames.
-        </p>
-
-        {archiveRoots.length === 0 ? (
-          <p className="text-sm text-warning mb-4">
-            No archive folders configured. Add one in File Manager → Archive Folders before archiving.
-          </p>
-        ) : archiveRoots.length === 1 ? (
-          <div className="mb-4 text-xs text-content-muted">
-            Destination: <span className="font-mono text-content" title={archiveRoots[0].path}>{archiveRoots[0].path}</span>
-          </div>
-        ) : (
+    <>
+      <DialogShell
+        title="Archive frame set"
+        size="md"
+        onClose={props.onCancel}
+        footer={
           <>
-            <h3 className="text-sm font-medium text-content mb-2">Destination archive folder</h3>
-            <select
-              value={selectedRootPath ?? ''}
-              onChange={(e) => setSelectedRootPath(e.target.value)}
-              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content mb-4 focus:outline-none focus:border-accent"
-            >
-              {archiveRoots.map((r) => (
-                <option key={r.id} value={r.path} title={r.path}>
-                  {r.path}{r.is_default ? '  (default)' : ''}
-                </option>
-              ))}
-            </select>
+            <Button onClick={props.onCancel}>Cancel</Button>
+            <Button variant="primary" onClick={handleStart} disabled={!canStart} data-autofocus>Start archiving</Button>
           </>
-        )}
+        }
+      >
+        <div className="space-y-3">
+          <p>Lights are always moved. Choose what to do with calibration frames.</p>
 
-        <h3 className="text-sm font-medium text-content mb-2">Calibrations</h3>
-        <div className="mb-4 rounded-lg border border-border bg-surface px-3">
-          {rowFor('flats', 'Flats', 'flat')}
-          {rowFor('darks', 'Darks', 'dark')}
-          {rowFor('bias', 'Bias', 'bias')}
-          {rowFor('darkflats', 'DarkFlats', 'darkflat')}
-        </div>
-
-        <h3 className="text-sm font-medium text-content mb-2">Compression</h3>
-        <select
-          value={compression}
-          onChange={e => setCompression(e.target.value as ArchiveCompression)}
-          className="bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content mb-4 focus:outline-none focus:border-accent"
-        >
-          <option value="store">Store (no compression — fastest)</option>
-          <option value="deflate">Deflate (smaller, slower)</option>
-        </select>
-
-        {planning && (
-          <p className="text-sm text-content-muted mb-4 flex items-center gap-2">
-            <span className="inline-block w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
-            Computing plan…
-          </p>
-        )}
-
-        {planError && (
-          <p className="text-sm text-error mb-4">{planError}</p>
-        )}
-
-        {plan && !planning && (
-          <div className="mb-4 text-sm bg-surface border border-border rounded-lg p-3 space-y-2">
-            <p className="text-content font-medium">Estimated archive</p>
-            <p className="text-content-muted">
-              Total size: {(plan.total_size_bytes / 1024 / 1024).toFixed(1)} MB
+          {archiveRoots.length === 0 ? (
+            <p className="text-warning">
+              No archive folders configured. Add one in File Manager → Archive Folders before archiving.
             </p>
-            {plan.zips.length > 0 && (
-              <ul className="list-disc ml-5 space-y-1 text-content-muted">
-                {plan.zips.map(z => (
-                  <li key={z.zip_filename}>
-                    <span className="font-mono text-xs">{z.zip_filename}</span>
-                    {' — '}{z.file_count} file{z.file_count !== 1 ? 's' : ''},{' '}
-                    {(z.total_size_bytes / 1024 / 1024).toFixed(1)} MB
-                  </li>
+          ) : archiveRoots.length === 1 ? (
+            <p>
+              Destination: <span className="font-mono text-content" title={archiveRoots[0].path}>{archiveRoots[0].path}</span>
+            </p>
+          ) : (
+            <div>
+              <label htmlFor="archive-dest" className="mb-1 block text-content-secondary">Destination archive folder</label>
+              <Select
+                id="archive-dest"
+                value={selectedRootPath ?? ''}
+                onChange={(e) => setSelectedRootPath(e.target.value)}
+                className="w-full"
+              >
+                {archiveRoots.map((r) => (
+                  <option key={r.id} value={r.path} title={r.path}>
+                    {r.path}{r.is_default ? '  (default)' : ''}
+                  </option>
                 ))}
-              </ul>
-            )}
-            {plan.conflicts.length > 0 && (
-              <p className="text-warning text-xs pt-1">
-                {plan.conflicts.length} of these zip name(s) already exist in the archive folder — you will be asked how to resolve before writing starts.
-              </p>
-            )}
-          </div>
-        )}
+              </Select>
+            </div>
+          )}
 
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={props.onCancel}
-            className="px-4 py-1.5 rounded-lg border border-border text-sm text-content hover:bg-surface-hover transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleStart}
-            disabled={planning || !plan || !selectedRootPath || archiveRoots.length === 0}
-            className="px-4 py-1.5 rounded-lg bg-accent text-white text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:brightness-110 transition-colors"
-          >
-            Start Archiving
-          </button>
+          <div>
+            <div className="mb-1 text-content-secondary">Calibrations</div>
+            <div className="rounded border border-border bg-surface px-2.5">
+              {rowFor('flats', 'Flats', 'flat')}
+              {rowFor('darks', 'Darks', 'dark')}
+              {rowFor('bias', 'Bias', 'bias')}
+              {rowFor('darkflats', 'DarkFlats', 'darkflat')}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="archive-compression" className="mb-1 block text-content-secondary">Compression</label>
+            <Select
+              id="archive-compression"
+              value={compression}
+              onChange={e => setCompression(e.target.value as ArchiveCompression)}
+            >
+              <option value="store">Store (no compression — fastest)</option>
+              <option value="deflate">Deflate (smaller, slower)</option>
+            </Select>
+          </div>
+
+          {planning && (
+            <p role="status" className="flex items-center gap-2">
+              <span className="inline-block w-3 h-3 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+              Computing plan…
+            </p>
+          )}
+
+          {planError && (
+            <p role="alert" className="break-words text-error">{planError}</p>
+          )}
+
+          {plan && !planning && (
+            <div className="space-y-1.5 rounded border border-border bg-surface p-2.5">
+              <p className="font-medium text-content">
+                Estimated archive · {(plan.total_size_bytes / 1024 / 1024).toFixed(1)} MB
+              </p>
+              {plan.zips.length > 0 && (
+                <ul className="max-h-40 space-y-1 overflow-y-auto">
+                  {plan.zips.map(z => (
+                    <li key={z.zip_filename} className="flex items-baseline gap-2">
+                      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-content-secondary" title={z.zip_filename}>{z.zip_filename}</span>
+                      <span className="whitespace-nowrap">{z.file_count} file{z.file_count !== 1 ? 's' : ''}</span>
+                      <span className="whitespace-nowrap">{(z.total_size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {plan.conflicts.length > 0 && (
+                <p className="text-warning">
+                  {plan.conflicts.length} of these zip name(s) already exist in the archive folder — you will be asked how to resolve before writing starts.
+                </p>
+              )}
+            </div>
+          )}
         </div>
-      </div>
+      </DialogShell>
 
       {showConflict && plan && selectedRootPath && (
         <ArchiveConflictDialog
@@ -221,6 +221,6 @@ export function ArchiveDispositionDialog(props: Props) {
           }}
         />
       )}
-    </div>
+    </>
   );
 }

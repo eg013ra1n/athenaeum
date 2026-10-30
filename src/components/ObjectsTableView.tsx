@@ -239,8 +239,6 @@ export function ObjectsTableView({
                     )}
                     <FrameSetDuplicatesChip
                       count={duplicate_count}
-                      frameSetId={frames_set.id!}
-                      frameSetName={frames_set.name || 'Untitled'}
                     />
                   </span>
                 </td>

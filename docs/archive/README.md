@@ -7,9 +7,9 @@ Moves a finished frame set's data into a `.zip` per frame type (Lights / Flats /
 
 **Three-state lifecycle for a frame set:**
 
-| State | DB columns | Toolbar button |
+| State | DB columns | Header button |
 | ----- | ---------- | -------------- |
-| Stage / WIP | `is_archived = 0` | **Find new images** + **Move to Archive** |
+| Stage / WIP | `is_archived = 0` | **Find new images** (**Archive**, the soft Move to Archive, is at the end of the Lights toolbar with **Unpack** and **Duplicates**) |
 | In Archive section, not zipped | `is_archived = 1`, `archived_at = NULL` | **Move and ZIP** |
 | Zipped | `archived_at IS NOT NULL` | **Unarchive** + reveal-in-file-manager |
 

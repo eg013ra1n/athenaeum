@@ -17,24 +17,24 @@ describe('FrameSetDuplicatesChip', () => {
   it('renders nothing for a set without duplicates', () => {
     const { container } = render(
       <MemoryRouter>
-        <FrameSetDuplicatesChip count={0} frameSetId={271} frameSetName="GAIA" />
+        <FrameSetDuplicatesChip count={0} />
       </MemoryRouter>,
     );
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('opens the Duplicates page filtered to the set', () => {
+  it('opens the Duplicates page', () => {
     render(
       <MemoryRouter initialEntries={['/objects']}>
         <Routes>
-          <Route path="/objects" element={<FrameSetDuplicatesChip count={12} frameSetId={271} frameSetName="GAIA" />} />
+          <Route path="/objects" element={<FrameSetDuplicatesChip count={12} />} />
           <Route path="/files" element={<FilesProbe />} />
         </Routes>
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByText('12 duplicates'));
     expect(JSON.parse(screen.getByTestId('files-state').textContent ?? 'null')).toEqual({
-      duplicatesForSet: { id: 271, name: 'GAIA' },
+      openDuplicates: true,
     });
   });
 });

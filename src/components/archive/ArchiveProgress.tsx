@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api';
 import { cancelArchiveOperation } from '../../api/archive';
+import { Button } from '../ui';
 import type { ArchiveProgressEvent } from '../../types/helpers';
 import { useNotifications } from '../../contexts/NotificationContext';
 
@@ -136,9 +137,9 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
     : 'bg-accent';
 
   return (
-    <div className="border border-border rounded-lg p-3 bg-surface-elevated shadow-lg">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-medium text-content">
+    <div className="rounded-lg border border-border bg-surface-elevated px-4 py-3.5 text-[12.5px] leading-[1.4] text-content-muted shadow-[0_8px_24px_rgba(0,0,0,0.35)]">
+      <div className="mb-2.5 flex items-center justify-between gap-2">
+        <span className="text-[13px] font-semibold text-content">
           {(() => {
             const isRestore =
               finished?.kind === 'restore' ||
@@ -150,7 +151,8 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
         {/* A rollback runs outside the cancellable-operation registry — there
             is nothing to cancel, so don't offer a button that can only fail. */}
         {!finished && !isRollbackRun && (
-          <button
+          <Button
+            size="sm"
             onClick={async () => {
               try {
                 await cancelArchiveOperation(operationId);
@@ -158,13 +160,12 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
                 console.error('cancel archive failed', e);
               }
             }}
-            className="text-xs px-2 py-1 border border-border rounded hover:bg-warning/10 text-content-muted hover:text-warning transition-colors"
           >
             Cancel
-          </button>
+          </Button>
         )}
       </div>
-      <div className="text-xs text-content-muted space-y-1">
+      <div className="space-y-1">
         <p className="truncate">{statusLabel}</p>
         <div className="w-full h-1.5 bg-surface rounded-full overflow-hidden">
           <div

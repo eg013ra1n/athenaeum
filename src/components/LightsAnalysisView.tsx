@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
 import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -43,9 +43,37 @@ interface LightsAnalysisViewProps {
   /** Frame id → this set's linked-project contributor state (spec §8.1–§8.2),
    *  threaded straight through to `LightsAnalysisTable`'s "Project" column. */
   projectStates?: Map<number, { state: string; reason: string | null }>;
+  /** Frame-set actions (Duplicates, Unpack, Archive) placed after the View group, behind a `|`. */
+  setTools?: ReactNode;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, projectStates }: LightsAnalysisViewProps) {
+/** One toolbar action: a 40×28 button with its label under it, the shape of every button in this toolbar. */
+export function ToolButton({ label, title, onClick, disabled, className = 'text-content-secondary', children }: {
+  label: string;
+  title: string;
+  onClick: () => void;
+  disabled?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        aria-label={label}
+        title={title}
+        className={`min-w-10 h-7 px-2 inline-flex items-center justify-center gap-1 text-xs font-medium bg-surface-hover hover:bg-surface-elevated rounded-lg border border-border transition-colors disabled:opacity-30 disabled:cursor-default ${className}`}
+      >
+        {children}
+      </button>
+      <span className="text-[10px] text-content-muted leading-tight">{label}</span>
+    </div>
+  );
+}
+
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, projectStates, setTools }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -839,6 +867,13 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </div>
               <span className="text-[10px] text-content-muted leading-tight">View</span>
             </div>
+
+            {setTools && (
+              <>
+                <span className="text-border h-7 flex items-center">|</span>
+                {setTools}
+              </>
+            )}
           </div>
 
           <PlateSolveBatchPanel

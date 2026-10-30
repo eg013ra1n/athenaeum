@@ -1231,8 +1231,6 @@ export default function Objects() {
                   )}
                   <FrameSetDuplicatesChip
                     count={duplicate_count}
-                    frameSetId={frames_set.id!}
-                    frameSetName={frames_set.name || 'Untitled'}
                   />
                   {member_count} frame{member_count !== 1 ? 's' : ''}
                 </span>

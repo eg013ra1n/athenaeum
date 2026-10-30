@@ -1,10 +1,11 @@
 import { useNavigate } from 'react-router-dom';
 import { Chip } from '../ui/Chip';
 
-/** What `navigate('/files', { state })` carries to open the Duplicates tab filtered to one frame set. */
-export interface DuplicatesForSetRequest {
-  duplicatesForSet: { id: number; name: string };
+/** What `navigate('/files', { state })` carries to open the Duplicates tab. */
+export interface DuplicatesTabRequest {
+  openDuplicates: true;
 }
+export const DUPLICATES_TAB_REQUEST: DuplicatesTabRequest = { openDuplicates: true };
 
 export function duplicatesLabel(count: number): string {
   return `${count} duplicate${count === 1 ? '' : 's'}`;
@@ -13,18 +14,17 @@ export function duplicatesLabel(count: number): string {
 /**
  * "N duplicates" on a frame set: second copies of frames the set already holds (two disk copies, or a disk
  * copy and a zip entry). They are not counted and never stacked, exported or measured; the click opens the
- * Duplicates page filtered to the set. Renders nothing when there are none.
+ * Duplicates page. Renders nothing when there are none.
  */
-export function FrameSetDuplicatesChip({ count, frameSetId, frameSetName }: { count: number; frameSetId: number; frameSetName: string }) {
+export function FrameSetDuplicatesChip({ count }: { count: number }) {
   const navigate = useNavigate();
   if (count <= 0) return null;
-  const state: DuplicatesForSetRequest = { duplicatesForSet: { id: frameSetId, name: frameSetName } };
   return (
     <button
       type="button"
       onClick={(e) => {
         e.stopPropagation();
-        navigate('/files', { state });
+        navigate('/files', { state: DUPLICATES_TAB_REQUEST });
       }}
       className="inline-flex"
     >

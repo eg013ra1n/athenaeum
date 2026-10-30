@@ -162,9 +162,9 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
   rule is per set: copies held by two sets are each used in their own set (the Duplicates page still pairs them).
   The other copy stays listed with a "duplicate — not used" chip (`LightFrameWithCalibration.duplicate_not_used`)
   and is left out of plate-solve selection and the SNR sums; `FramesSetWithCount.duplicate_count` and
-  `CalibrationHierarchyView.duplicate_frames` drive an "N duplicates" chip on the Objects card and table and on the
-  set header, which opens the Duplicates page filtered to the set's files (`FileManager`, location state
-  `duplicatesForSet`). Found on dev set 271 ("12 of 24 in zip, 24 frames" for 12 frames held twice; its stack
+  `CalibrationHierarchyView.duplicate_frames` drive an "N duplicates" chip on the Objects card and table and a
+  Duplicates button (the count beside a copy icon) at the end of the object page's Lights toolbar, which opens the Duplicates page (`FileManager`, location state
+  `openDuplicates`; no per-set filter, removed by the owner 2026-10-30). Found on dev set 271 ("12 of 24 in zip, 24 frames" for 12 frames held twice; its stack
   plan read 24 lights). Checked on a scratch catalog of the same files (83 lights on disk + the 12 of them in
   `GAIA_smoke.zip`): the set reads 83 frames and 12 duplicates with no zip chip, the stacking plan and the export
   readiness count 83 (95 before), and the 12 zip rows carry the chip. A set without duplicates loses no row, so
@@ -180,8 +180,8 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
 - **Why solved lights only.** An unsolved light carries the mount's or the target's header coordinates, and a rotation from another program, possibly in the other sign convention.
   - An M 31 set on the dev catalog showed `76.1° – 283.5°`: a header 76.1° beside the solve's 283.5° for the same framing. The two averaged to ≈ 0°, and the Sky Chart drew the box unrotated.
 - **Math.** The center is the spherical mean. The rotation is the circular mean; min / max are the extreme circular deviations from it, so 359° and 1° read `359° – 1°`, not `1° – 359°`. The UI tests the spread circularly too.
-- **Where it runs.** Set creation, merge, split and "Recalculate nights" store it.
-- **The refresh button beside the coordinates** on the object page (`recompute_frame_set_coordinates`, both hosts) re-applies it to the stored center and rotation only. It exists because a plate solve run does not touch the set's stored pointing. Nights, dates and hours are untouched; the info log is `"frame set coordinates recomputed"` with `frame_set_id`, `count` and `solved_only`.
+- **Where it runs.** Set creation, merge, split and the object page's refresh store it.
+- **The refresh button beside the coordinates** on the object page is the manual refresh of the object, what leaving and coming back does, in full: `recalculate_frame_set_nights` (the forced re-derive of nights and sessions), then `recompute_frame_set_coordinates` (both hosts; it re-applies the rule to the stored center and rotation only, because a plate solve run does not touch the set's stored pointing), then the page reloads. A failed step notifies and the next one still runs. The coordinates info log is `"frame set coordinates recomputed"` with `frame_set_id`, `count` and `solved_only`. There is no separate "Recalculate nights" button any more (2026-10-30).
 - **The Sky Chart** computes it live for every set, so the map is right before anyone presses refresh.
 - **Field of view (Sky Chart only, 2026-10-26).** The footprint's width and height are the **median over the same lights** (`set_pointing`), one per light from `api::spatial::frame_fov`:
   - solved light: from its CD matrix, `2·atan(NAXISn · |CD column n| / 2)` per axis;
