@@ -174,7 +174,7 @@ function LastRunLine({ last }: { last: NonNullable<PublishRunState['last']> }) {
       Last run ·{' '}
       <b className={`font-semibold ${TONE_CLASS[d.tone]}`}>{d.text}</b>
       {' · '}
-      {formatTimestamp(last.finishedAt, { seconds: true })} · {last.trigger}
+      {formatTimestamp(last.finishedAt)} · {last.trigger}
     </span>
   );
 }

@@ -31,9 +31,12 @@ impl PartialZip {
         &self.path
     }
 
-    /// Renames the zip onto `target`, replacing what is there in one step (on Windows too: std's rename
-    /// replaces an existing file). On error the partial is removed and `target` is untouched.
+    /// Renames the zip onto `target`, replacing what is there in one step. On Windows a target with the
+    /// read-only attribute is made writable first, since the rename cannot replace it otherwise and the
+    /// user asked for the replace. On error the partial is removed and `target` keeps its bytes.
     pub fn publish(mut self, target: &Path) -> Result<()> {
+        crate::zip_store::fs::clear_readonly_for_replace(target)
+            .with_context(|| format!("failed to clear the read-only attribute of {}", target.display()))?;
         std::fs::rename(&self.path, target)
             .with_context(|| format!("failed to move {} onto {}", self.path.display(), target.display()))?;
         self.armed = false;
@@ -315,5 +318,30 @@ pub(crate) mod tests {
         .unwrap();
         assert!(zip_path.exists());
         assert!(leftovers.iter().all(|p| p.exists()), "a leftover that is not ours to reuse is not touched");
+    }
+
+    /// Windows: publishing replaces a target with the read-only attribute (the rename alone would be refused).
+    #[cfg(windows)]
+    #[test]
+    fn publish_replaces_a_read_only_target_windows() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.fits");
+        std::fs::write(&src, b"file-a-content").unwrap();
+        let target = tmp.path().join("out.zip");
+        std::fs::write(&target, b"old zip bytes").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        let entries = vec![ZipEntry { source_path: src, path_in_zip: "Lights/a.fits".into() }];
+        build_zip(&target, &entries, ArchiveCompression::Store).unwrap();
+        let after = std::fs::read(&target).unwrap();
+        assert!(after.starts_with(b"PK"), "the new zip replaced the old bytes");
+        let partials: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".partial"))
+            .collect();
+        assert!(partials.is_empty(), "the partial is gone: {partials:?}");
     }
 }

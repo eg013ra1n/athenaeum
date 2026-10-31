@@ -177,7 +177,7 @@ export default function ExchangeTab({
                     const rate = spanSecs > 0 ? formatRate(s.bytes / spanSecs) : '—';
                     return (
                       <tr key={s.id}>
-                        <td className={`${TD} text-content-muted`}>{formatTimestamp(s.startedAt, { seconds: true })}</td>
+                        <td className={`${TD} text-content-muted`}>{formatTimestamp(s.startedAt)}</td>
                         <td className={TD}>
                           {s.sources.map((src, i) => {
                             const name = src.memberName ?? src.deviceName ?? src.device.slice(0, 8);

@@ -2269,12 +2269,14 @@ None open (2026-10-31).
   an ordinary user given by PUID/PGID (and UMASK); on Unraid the default is `99:100`. Nothing it writes on a share is
   owned by root. The link-mode export inside a container also needs a look: its symlinks name container paths
   (`/astro-files/...`).
-- **Windows: Overwrite onto a read-only zip clears the attribute and replaces the zip.** This covers `PartialZip::publish`
-  (`archive/zip_writer.rs`) and the restore rename in `archive/rollback.rs` (~299). Keep the four Windows twin tests in
-  the repo; their patch is `\\Universe\athenaeum-runner\handoffs\zip-windows-main-tests.patch`.
-- **A master outside the Calibration Library is copied into the zip, never moved**, the same as a library master.
-  `archive/planner.rs` forces Copy only for `is_master_library`; extend that to `frames.is_master`.
-- **Seconds by default in `formatTimestamp`** (`src/utils/dateFormatting.ts`, 34 call sites).
+- **A Windows run owed for the read-only Overwrite fix and the Windows twin tests** (done on the Mac 2026-10-31; the
+  tests are `#[cfg(windows)]`, so they have not run yet). The run needs:
+  - `publish_replaces_a_read_only_target_windows` and `restore_from_staging_replaces_a_read_only_target_windows`;
+  - the junction and case-spelling refusals in `archive/planner.rs` and `api/zip.rs`;
+  - the held-handle poisoned key in `zip_store/materialize.rs`.
+
+  The brief is `\\Universe\athenaeum-runner\handoffs\hips-test-fix-handoff.md`, which also covers the `hips::pack`
+  check. Delete this item when it passes.
 - **The master-hash pass ("Verifying master duplicates") moves off the scan into the background.** Not urgent.
 - **Perseus: files deleted by hand on the capture machine must be found again without a restart**, and a byte-identical
   re-copy must be noticed too. This needs a design first.

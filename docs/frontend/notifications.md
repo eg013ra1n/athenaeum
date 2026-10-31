@@ -59,7 +59,7 @@ notify({
   ```
 
 - Timestamps: `formatTimestamp` from `src/utils/dateFormatting.ts`
-  (`YYYY-MM-DD HH:MM`). Don't re-implement.
+  (`YYYY-MM-DD HH:MM:SS`, seconds always). Don't re-implement.
 
 ## Collab publishing and sync (2026-10-01)
 

@@ -143,7 +143,7 @@ describe('ProjectSettingsCard', () => {
       startedAt: '2026-10-02T10:03:20Z', finishedAt } } });
     const line = screen.getByText(/^Last run/);
     expect(line.textContent).toBe(
-      `Last run · This hub needs a newer Athenaeum — update to publish · ${formatTimestamp(finishedAt, { seconds: true })} · manual`,
+      `Last run · This hub needs a newer Athenaeum — update to publish · ${formatTimestamp(finishedAt)} · manual`,
     );
     expect(line.textContent).not.toContain('. ·');
   });

@@ -1547,6 +1547,33 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
     }
 
+    /// Windows twin of the symlink test: a directory junction needs no privilege.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_subfolder_pointing_outside_refuses_that_entry() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _zip, ids) = two_light_zip(tmp.path());
+        let base = TempDir::new().unwrap();
+        let out = base.path().join("target");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(out.join("Lights"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&made.stdout));
+
+        let outcome = run(&conn, &ids, &out);
+        assert_eq!(outcome.unpacked + outcome.adopted, 0);
+        assert_eq!(outcome.conflicts.len(), 2);
+        assert!(outcome.conflicts.iter().all(|c| c.contains("outside the destination")), "{:?}", outcome.conflicts);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing is written outside");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files WHERE archive_zip_path IS NOT NULL"), 2);
+    }
+
     #[test]
     fn our_own_rows_are_left_for_unarchive() {
         let tmp = TempDir::new().unwrap();

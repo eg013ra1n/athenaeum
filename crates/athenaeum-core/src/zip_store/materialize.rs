@@ -1119,6 +1119,34 @@ mod materialize_tests {
         assert!(job.cached(cache), "a fresh verified extraction is a hit again");
     }
 
+    /// Windows twin: an open handle with share_mode(0) makes the removal fail instead of chmod 555.
+    #[cfg(windows)]
+    #[test]
+    fn a_poisoned_key_is_never_a_hit_and_its_file_is_removed_once_possible_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = fixture();
+        let (_zip, paths) = f.catalog_zip("M31.zip", &[("L_001.fits", light(1))]);
+        let job = {
+            let conn = f.ctx.db.get().unwrap().conn();
+            let values = [rusqlite::types::Value::Text(paths[0].clone())];
+            let row = query_rows(&conn, "path", &values).unwrap().remove(0);
+            resolve(&mut ZipFacts::default(), &f.ctx.zip_cache, row).unwrap()
+        };
+        let cache = &f.ctx.zip_cache;
+        drop(mat(&f.ctx, &paths).unwrap());
+        assert!(job.cached(cache), "a good extraction is a hit");
+        cache.poison(&job.key);
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&job.dest).unwrap();
+        assert!(!job.cached(cache), "a poisoned key is not a hit while its file cannot be removed");
+        assert!(cache.is_poisoned(&job.key));
+        drop(held);
+        assert!(!job.cached(cache), "the retry removes the file and still reports a miss");
+        assert!(!job.dest.exists());
+        assert!(!cache.is_poisoned(&job.key), "once the file is gone the key is clean again");
+        drop(mat(&f.ctx, &paths).unwrap());
+        assert!(job.cached(cache), "a fresh verified extraction is a hit again");
+    }
+
     #[test]
     fn rows_without_a_crc_read_each_zips_directory_once() {
         let f = fixture();

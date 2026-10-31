@@ -114,11 +114,11 @@ pub fn build_plan(
             continue;
         }
         for (file_id, path, size, is_master) in collect_calibration_files(conn, frames_set_id, role)? {
-            // A library master is never moved out of the Calibration Library
-            // by a frame-set archive (2026-08-02 audit C4): the zip gets a
-            // copy, the library keeps the original — a Move would delete the
-            // file that every other frame set's links still point at, while
-            // files.path still claims the library location. Enforced here,
+            // A master is never moved by a frame-set archive (2026-08-02 audit
+            // C4 for the library; owner, 2026-10-31, for a master in an
+            // ordinary folder): the zip gets a copy and the original stays —
+            // a Move would delete the file that every other frame set's links
+            // still point at, while files.path still claims its location. Enforced here,
             // server-side, because the client-side shared-calibration guard
             // only sees a master with 2+ consumers. Skip stays Skip: a role
             // the user excluded must not come back as a copy.
@@ -785,12 +785,14 @@ pub(crate) fn collect_light_files(conn: &Connection, frames_set_id: i64) -> Resu
 /// Calibration files reachable from a frame set, for a given role:
 /// (file_id, path, size, is_master).
 ///
-/// `is_master` is `true` when the file belongs to at least one master library
+/// `is_master` is `true` when the file is a master: its frame says so
+/// (`frames.is_master = 1`, a master wherever it lies, the Calibration Library
+/// or an ordinary folder) or it belongs to at least one master library
 /// calibration set (`calibration_set.is_master_library = 1`) among the sets
 /// this role reaches it through — hence `MAX(...)` over the group rather than
 /// `SELECT DISTINCT`: the conservative answer wins if a file is reachable both
-/// as a library master and as a plain set member. `build_plan` uses it to
-/// refuse a Move (see the loop in `build_plan`).
+/// as a master and as a plain set member. `build_plan` uses it to refuse a
+/// Move (see the loop in `build_plan`).
 pub(crate) fn collect_calibration_files(
     conn: &Connection,
     frames_set_id: i64,
@@ -804,7 +806,8 @@ pub(crate) fn collect_calibration_files(
         FrameRole::Light => return Ok(vec![]),
     };
     let mut stmt = conn.prepare(
-        "SELECT fi.id, fi.path, fi.size, MAX(COALESCE(cs.is_master_library, 0))
+        "SELECT fi.id, fi.path, fi.size,
+                MAX(CASE WHEN COALESCE(cs.is_master_library, 0) <> 0 OR COALESCE(f.is_master, 0) <> 0 THEN 1 ELSE 0 END)
          FROM files fi
          JOIN frames f ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON csf.frame_id = f.id
@@ -1127,6 +1130,29 @@ mod tests {
             plan.files.iter().filter(|f| f.frame_role == "light").all(|f| f.disposition == "move"),
             "lights are always move",
         );
+    }
+
+    /// A master in an ordinary folder (`frames.is_master = 1`, its set not a
+    /// library set — one made by another program, say) is copied like a
+    /// library master, never moved (owner, 2026-10-31).
+    #[test]
+    fn build_plan_forces_copy_for_a_master_outside_the_library() {
+        let (conn, arch_dir, scan_dir) = fixture();
+        let (master_flat_id, raw_bias_id) = add_master_flat_and_raw_bias(&conn, &scan_dir);
+        conn.execute("UPDATE calibration_set SET is_master_library = 0 WHERE id = 600", []).unwrap();
+
+        let dispositions = Dispositions {
+            flats: Some(ArchiveDisposition::Move),
+            darks: None,
+            bias: Some(ArchiveDisposition::Move),
+            darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+
+        let flat = plan.files.iter().find(|f| f.file_id == Some(master_flat_id)).expect("master flat in the plan");
+        assert_eq!(flat.disposition, "copy", "a master outside the library must never be moved either");
+        let bias = plan.files.iter().find(|f| f.file_id == Some(raw_bias_id)).expect("raw bias in the plan");
+        assert_eq!(bias.disposition, "move", "a raw calibration file keeps the requested Move");
     }
 
     /// Skip stays Skip — forcing Copy must not resurrect a role the user
@@ -1577,6 +1603,60 @@ mod tests {
         let msg = format!("{:#}", commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap_err());
         assert!(msg.contains("cataloged"), "{msg}");
         assert_eq!(std::fs::read(&kept).unwrap(), b"kept zip bytes");
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let out = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        assert!(out.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[cfg(windows)]
+    fn overwrite_outcome_for_spelling(spell: impl FnOnce(&Path, &str) -> String) -> (bool, String, bool) {
+        let (conn, arch_dir, _scan_dir) = fixture();
+        let predicted = path_layout::zip_filename(
+            Some("M31"), Some("2025-10-12"), Some("2025-10-12"),
+            Some("RedCat 51"), Some("ASI2600MM"), FrameRole::Light,
+        );
+        let kept = arch_dir.path().join(&predicted);
+        std::fs::write(&kept, b"kept zip bytes").unwrap();
+        let spelling = spell(arch_dir.path(), &predicted);
+        make_zip_resident(&conn, 1001, &spelling, "L_002.fits");
+        let dispositions = Dispositions {
+            flats: None, darks: Some(ArchiveDisposition::Skip), bias: None, darkflats: None,
+        };
+        let plan = build_plan(&conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store).unwrap();
+        let result = commit_plan(&conn, &plan, ConflictResolution::Overwrite);
+        let untouched = std::fs::read(&kept).unwrap() == b"kept zip bytes";
+        match result {
+            Err(e) => (true, format!("{e:#}"), untouched),
+            Ok(_) => (false, String::new(), untouched),
+        }
+    }
+
+    /// Windows twin of the symlinked-parent test: a directory junction (no privilege needed) is the alias.
+    #[cfg(windows)]
+    #[test]
+    fn overwrite_refuses_a_zip_that_holds_cataloged_frames_under_a_junctioned_parent() {
+        let alias_holder = tempfile::tempdir().unwrap();
+        let (refused, msg, untouched) = overwrite_outcome_for_spelling(|arch, predicted| {
+            let alias = alias_holder.path().join("archive-link");
+            make_junction(&alias, arch);
+            alias.join(predicted).to_string_lossy().to_string()
+        });
+        assert!(refused && msg.contains("cataloged"), "not refused: {msg}");
+        assert!(untouched);
+    }
+
+    /// NTFS is case-insensitive: the same zip spelled in another case must be refused too.
+    #[cfg(windows)]
+    #[test]
+    fn overwrite_refuses_a_zip_that_holds_cataloged_frames_under_a_case_changed_spelling() {
+        let (refused, msg, untouched) = overwrite_outcome_for_spelling(|arch, predicted| {
+            arch.join(predicted).to_string_lossy().to_uppercase()
+        });
+        assert!(refused && msg.contains("cataloged"), "not refused: {msg}");
+        assert!(untouched);
     }
 
     /// A superseded dark set with two members; returns (conn, set id, the two file ids, dir).

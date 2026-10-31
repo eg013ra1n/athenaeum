@@ -296,7 +296,7 @@ fn restore_from_staging(staged: &Path, target: &Path) -> Result<()> {
         return Err(anyhow::Error::new(e)
             .context(format!("rollback: copy {} -> {}", staged.display(), target.display())));
     }
-    if let Err(e) = std::fs::rename(&temp, target) {
+    if let Err(e) = crate::zip_store::fs::clear_readonly_for_replace(target).and_then(|()| std::fs::rename(&temp, target)) {
         if let Err(re) = std::fs::remove_file(&temp) {
             tracing::warn!(path = %temp.display(), error = %re, "rollback: could not remove the temp copy");
         }
@@ -1087,5 +1087,28 @@ mod tests {
         assert!(Path::new(&zip).exists(), "the zip holds the only full copy and stays");
         assert_eq!(std::fs::read(scan.path().join("M31/L_002.fits")).unwrap().len(), 1000, "nothing was changed");
         assert_eq!(adb::get_operation(&conn, op_id).unwrap().status, "rolling_back");
+    }
+
+    /// Windows: a restore target with the read-only attribute is replaced (the rename alone would be refused).
+    #[cfg(windows)]
+    #[test]
+    fn restore_from_staging_replaces_a_read_only_target_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged.bin");
+        let target = dir.path().join("target.bin");
+        std::fs::write(&staged, b"new bytes").unwrap();
+        std::fs::write(&target, b"old bytes").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        restore_from_staging(&staged, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes");
+        let partials: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".partial"))
+            .collect();
+        assert!(partials.is_empty(), "the temp copy is gone: {partials:?}");
     }
 }

@@ -139,7 +139,7 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
     if (f.source === 'replica') {
       const who = v?.lib?.receivedFromMember ?? v?.publisher ?? 'a member';
       const at = v?.lib?.receivedAt;
-      parts.push(`received from ${who}${at ? ` · ${formatTimestamp(at, { seconds: true })}` : ''}`);
+      parts.push(`received from ${who}${at ? ` · ${formatTimestamp(at)}` : ''}`);
     } else if (v?.own?.segment === 'review') {
       parts.push('exactly the file that will be published');
     }
