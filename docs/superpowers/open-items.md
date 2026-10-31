@@ -2237,17 +2237,6 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 - **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
 
-### From the ZIP web and Windows acceptance (2026-10-31)
-
-- **The 5 `hips::pack` tests fail on Windows for a test-side reason.** The tests are `busy_then_ok`,
-  `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak` and
-  `a_busy_wait_reaches_the_ui_while_it_lasts`. The helper `url_path` (`hips/pack.rs` ~733) builds the expected request
-  path from `tile_rel_path(..).to_string_lossy()`, which is `/Norder3\Dir0\Npix0.jpg` on Windows, while the real request
-  is `/Norder3/Dir0/Npix0.jpg`. So the mock server counts zero hits. Production is not affected. They failed the same
-  way on 1139fa0c, before the zip work. **Fixed in b5abb9de** (the helper swaps the separator, as `fetch_tile_from` does;
-  48 of 48 `hips::` tests pass on the Mac). Still owed: a Windows run. The runner was offline on 2026-10-31; the brief is
-  `\\Universe\athenaeum-runner\handoffs\hips-test-fix-handoff.md`. Delete this item when it passes.
-
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 
 - **`reconcile_frame_set_nights` "database is locked" ERRORs during Analysis batches.** Two were logged in the C9 dev run, both while an Analysis batch persisted rows: a pre-existing
@@ -2269,14 +2258,6 @@ None open (2026-10-31).
   an ordinary user given by PUID/PGID (and UMASK); on Unraid the default is `99:100`. Nothing it writes on a share is
   owned by root. The link-mode export inside a container also needs a look: its symlinks name container paths
   (`/astro-files/...`).
-- **A Windows run owed for the read-only Overwrite fix and the Windows twin tests** (done on the Mac 2026-10-31; the
-  tests are `#[cfg(windows)]`, so they have not run yet). The run needs:
-  - `publish_replaces_a_read_only_target_windows` and `restore_from_staging_replaces_a_read_only_target_windows`;
-  - the junction and case-spelling refusals in `archive/planner.rs` and `api/zip.rs`;
-  - the held-handle poisoned key in `zip_store/materialize.rs`.
-
-  The brief is `\\Universe\athenaeum-runner\handoffs\hips-test-fix-handoff.md`, which also covers the `hips::pack`
-  check. Delete this item when it passes.
 - **The master-hash pass ("Verifying master duplicates") moves off the scan into the background.** Not urgent.
 - **Perseus: files deleted by hand on the capture machine must be found again without a restart**, and a byte-identical
   re-copy must be noticed too. This needs a design first.

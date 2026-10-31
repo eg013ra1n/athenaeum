@@ -78,8 +78,15 @@ is locked" line at startup.
   - A poisoned cache key is never a hit while another handle holds its file.
 - **The release web server on the UNC share.** It stores every path with `\`. The scan, duplicates, listing, preview and
   cache all match the Docker run. On a local copy, Unpack and Move and ZIP pass.
-- **One finding.** Publishing a zip over a target with the read-only attribute fails with "Access is denied"; the target is
-  left untouched. It is listed in open items.
+- **One finding.** Publishing a zip over a target with the read-only attribute failed with "Access is denied", leaving
+  the target untouched. Fixed in ee48bfad: the attribute is cleared and the zip replaced, by the owner's ruling. The
+  twins are in the repo.
+- **Re-run on ee48bfad (OBS-PC1, 2026-10-31; `\\Universe\athenaeum-runner\handoffs\hips-test-fix-report.md`).**
+  - The tests named `windows` passed 11 of 11. They include `publish_replaces_a_read_only_target_windows`,
+    `restore_from_staging_replaces_a_read_only_target_windows` and the held-handle poisoned key.
+  - The junction tests passed 2 of 2 and the case-spelling test 1 of 1.
+  - The full core suite: lib 4 595 passed, 0 failed. The integration tests had 0 failures. The `hips::pack` Windows
+    failures, a test-side path separator, are gone: `hips::` 48 of 48.
 
 **Accepted for zips, do not re-flag** (moved here from open items, 2026-10-31):
 - The cache can pass its limit by one group during a stacking Prepare; the limit is a target.
