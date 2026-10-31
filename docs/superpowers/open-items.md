@@ -2260,27 +2260,7 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 ## Awaiting a call from the owner
 
-- **D2: what a request does when every database connection is busy** (DB-layer audit M8,
-  `research/2026-08-03-db-layer-audit.md`). The owner asked on 2026-10-31 whether there is a queue or a wait.
-  - There are two waits. A request waits up to 30 s for a free connection from the pool of 8 (r2d2's checkout
-    timeout). A write that meets another write in progress waits up to 5 s (`busy_timeout`). WAL mode lets reads run
-    beside a write.
-  - D2 covers only what follows a 30 s wait with no connection freed, which means something holds connections and does
-    not let go (a bug). Today `Database::conn()` panics with "Failed to get DB connection from pool". The request
-    fails, and a worker survives through `catch_unwind`. The alternative is a typed error shown to the user, which
-    touches about 200 call sites.
-  - The deeper question the owner raised: every thread may write. Two writers meet the 5 s `busy_timeout`, and past it
-    the result is "database is locked". That is the class behind the `reconcile_frame_set_nights` errors during
-    Analysis batches. The usual SQLite design for an app is one writer (a queue every write goes through) beside a pool
-    of readers. With it, writes never compete and "database is locked" cannot happen. It is a cycle of its own: every
-    write path moves onto the queue.
-- **D3: archive and file operations hold one connection for the whole run** (audit I5). Move and ZIP, unarchive and
-  file moves take one database connection at the start and keep it through copy, hash, zip, verify, delete and finalize
-  (minutes to hours on a large set). Master builds and light calibration release theirs around the long compute. The
-  holding is not a lock, since WAL lets others read and write meanwhile, but it takes one of the 8 pool slots for the
-  whole run. One operation runs at a time, so at most one slot is held. The rework is to take a connection per stage and
-  return it between stages. Proposed: defer until a log shows pool pressure. The owner asked for this explanation on
-  2026-10-31; the call is still open.
+None open (2026-10-31).
 
 ## Owner rulings, 2026-10-31
 
@@ -2301,6 +2281,19 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 - **D1 follow-up: the web build works in several browser tabs at once, without locks.** By construction the tabs are
   clients of one server process: SSE events go to every tab and there is no per-tab lock. Two tabs have not been tried
   together yet.
+
+### Planned for later (big work; owner, 2026-10-31)
+- **One write queue for the database** (DB audit D2/M8). Today any thread may write. Two writers wait up to 5 s for each
+  other (`busy_timeout`), and past that the result is "database is locked"; the `reconcile_frame_set_nights` errors during
+  Analysis batches are this class. A request also waits up to 30 s for one of the 8 pool connections; past that,
+  `Database::conn()` panics. The plan is the usual SQLite design for an app: one writer queue that every write goes
+  through, beside a pool of readers. Writes then never compete. It also covers the web build in several tabs and on a
+  NAS. Every write path moves onto the queue, so it is a cycle of its own. Turning the pool-exhaustion panic into a
+  typed error belongs in the same cycle.
+- **Archive and file operations take a connection per stage** (DB audit D3/I5). Move and ZIP, unarchive and file moves
+  hold one pool connection from the first stage to the last: copy, hash, zip, verify, delete and finalize. That can be
+  hours on a large set. It is not a lock, but it keeps one of the 8 slots busy for the whole run. The rework takes a
+  connection per stage and returns it between stages, as master builds already do.
 
 ### Deferred
 - **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up, 2026-08-28, NOT started). The content
