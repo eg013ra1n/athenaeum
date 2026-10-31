@@ -32,7 +32,70 @@ The legacy `is_archived` boolean is the soft-hide flag (`archive_frame_set`, use
 
 Spec `docs/superpowers/specs/2026-10-27-zip-archives-in-catalog-design.md`, plan `docs/superpowers/plans/2026-10-27-zip-archives-in-catalog.md`. Scanner-side rules (foreign zips, virtual paths, presence, cache, hashes): `docs/catalog/README.md` -> Zips in the catalog. Black Hole and browser rules: `docs/file-browser/README.md`.
 
-**Acceptance (NAS, desktop, owner: works, 2026-10-31).** The owner ran zips on the NAS share in the desktop build on the real dev DB; what turned up was fixed on `main` (the zip-entry rows and the Send to Void rescan, merged in bc9535df). The web build (Docker) and Windows are still owed (`docs/superpowers/open-items.md`).
+**Acceptance (NAS, desktop, owner: works, 2026-10-31).** The owner ran zips on the NAS share in the desktop build on the real dev DB; what turned up was fixed on `main` (the zip-entry rows and the Send to Void rescan, merged in bc9535df).
+
+**Acceptance (web build, Docker on the Unraid NAS, 2026-10-31).** An amd64 image of `main` a5d5081c, its own container
+beside the owner's, the share's test folder bind-mounted at `/astro-files`, driven through the HTTP API with Settings seen
+in the browser. Test data: 10 IC 5146 B lights, 15 flats and 12 darks (QHY268M) as plain files, `GAIA_smoke.zip` (12
+lights), and 3 of its lights also as plain files.
+- **Scan.** It found 40 plain files plus 12 zip entries, with 0 errors. The GAIA set counts 12 frames: 9 from the zip and 3
+  duplicates, each counted once (180 s = 12 × 15 s). The listing shows the zip's 12 entries.
+- **Preview.** A zip frame previews (a 1 546 119-byte JPEG, the same size as the Windows run's). The cache lands in
+  `/data/zip-cache/<key>/<entry name>`.
+- **Settings → General → Archive.** The page shows the limit, the status ("49.8 MB in 1 unpacked frame") and Clear cache.
+  A changed limit shows at once in the status, and Clear cache empties it.
+- **`ATHENAEUM_ZIP_CACHE`.** The variable moves the cache to `/astro-files/zip-cache-alt/<key>/…`. The old cache is left
+  where it was, and the status no longer counts it.
+- **Plate solve from the zip.** It needed the Gaia catalog first (Settings download, 8 min 45 s). After that, 3 of 3
+  frames solved in 1.8 s, with 179–234 stars matched and rms 0.53–0.55″. The solved scale is 2.877″/px, against 2.883″/px
+  from the header.
+- **Analysis.** 12 of 12 frames analysed. For each duplicated frame it used the disk copy.
+- **Move and ZIP of IC 5146.** Lights and flats were moved in, darks skipped. It wrote two zips (522 MB and 783 MB), and the
+  set reads 10 of 10 frames from the zip. The master flat was built from the zipped flats. The stack ran from the zips in
+  40 s, and the master is clean (no dust rings, no vignetting).
+- **Export.** In copy mode, 37 files were placed; a zipped light is byte-identical to its original (md5). In link mode, the
+  25 zip frames were copied (`zipCopied` 25) and the 12 disk darks were linked.
+- **Unpack.** 2 GAIA frames were unpacked. Their entries show `released` with the copy path, and a rescan skips the
+  unchanged zip.
+- **Whole-zip actions.**
+  - Black Hole on the zip: the GAIA set drops to 5 frames, and export readiness to 5. Restoring the zip brings back 12
+    frames, 7 of them in the zip.
+  - Send to Void deletes the zip and its 10 remaining rows; the duplicates list becomes empty.
+- **An offline share.** With the scan root renamed away, a scan finds 0 files and deletes nothing, and a zip frame's
+  preview returns 404. With the root back, every row is intact and the preview works.
+
+The server logged only expected errors: 404 while the zip was away, 412 before the catalog download, and the r2d2 "database
+is locked" line at startup.
+
+**Acceptance (Windows, OBS-PC1, 2026-10-31).** The run used `main` 549e20a5; its report is
+`\\Universe\athenaeum-runner\handoffs\zip-windows-main-report.md`.
+- **Test suites.** The whole core suite passes except the 5 `hips::pack` tests, which fail for a test-side reason (open
+  items); `athenaeum-web` passes 57 of 57.
+- **Windows twins of the `#[cfg(unix)]` tests.** These ran in the runner's clone; the patch is beside the report. All of
+  them pass:
+  - Overwrite refuses a zip whose rows name it through a junction or in another letter case (`file_identity`).
+  - Unpack through a junction that points outside the destination refuses every entry and writes nothing.
+  - A poisoned cache key is never a hit while another handle holds its file.
+- **The release web server on the UNC share.** It stores every path with `\`. The scan, duplicates, listing, preview and
+  cache all match the Docker run. On a local copy, Unpack and Move and ZIP pass.
+- **One finding.** Publishing a zip over a target with the read-only attribute fails with "Access is denied"; the target is
+  left untouched. It is listed in open items.
+
+**Accepted for zips, do not re-flag** (moved here from open items, 2026-10-31):
+- The cache can pass its limit by one group during a stacking Prepare; the limit is a target.
+- A project re-export of a zip frame always extracts it again. A correct skip would need the entry CRC in the export record.
+- Unpack has no Cancel.
+- A set whose foreign-zip frames are all calibration frames gets no "Unpack from zip" button; reading them still works.
+- `RawWithCalibrationSets` still places an imported master that sits in a Black Hole zip.
+- Rollback restores over a non-matching file at the original path.
+- Project stacking of zipped landed files is unreachable (`landed_unchanged`).
+- **A different frame written over the unpacked path keeps the release alive** (review r1, 2026-10-29). The disk walker
+  re-parses the row in place and the link still names a file that exists, so the zip entry stays out of the catalog and
+  "unpacked -> path" names another frame. Telling them apart needs a second fingerprint column or a `linked` marker.
+  Locate names the row's current path, so nothing is hidden. Fix it when a real report comes.
+- **A zip view under an unmounted copy root shows the released entry as readable, without the "unpacked" chip** (review
+  r1). `released_entries_of_zip` keeps a release only when a candidate path exists, while the scan keeps it under an
+  offline root (`present_or_offline`). Nothing is written, and the chip comes back with the mount; cosmetic.
 
 **Rules that bite**
 

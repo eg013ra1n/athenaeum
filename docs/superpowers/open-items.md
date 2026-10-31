@@ -300,24 +300,6 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 ## Unverified by hand
 
-### ZIP archives in the catalog (2026-10-28) — web build and Windows owed
-
-Spec `specs/2026-10-27-zip-archives-in-catalog-design.md` §13; references `docs/archive/README.md`, `docs/catalog/README.md`,
-`docs/file-browser/README.md`. The NAS acceptance in the desktop build passed (owner, 2026-10-31; `docs/archive/README.md` → Acceptance). Delete each
-line when it passes, with the measurement moved into the references.
-
-**Web build** (Docker, the NAS as a volume): the desktop NAS flows (scan reads, a zip set's preview / solve / analysis / stack / export, Unpack, Move
-and ZIP, an unmounted share, whole-zip actions, duplicates) in the browser, plus the cache location (`<data>/zip-cache` or `$ATHENAEUM_ZIP_CACHE`) and
-Settings -> General -> Archive (limit, status, Clear cache).
-
-**Windows** (the "Windows runner setup" session on obs-pc1; the branch reaches it through a GitLab branch push): `archive/planner.rs` `file_identity` Windows branch (never run); the `#[cfg(unix)]` odd-name tests' Windows behaviour; materialize's sanitized cache names; zip entry names with `:` / a trailing space / `Aux` extracted on NTFS; rename over a read-only target.
-The runner's 2026-10-29 run (`\\Universe\athenaeum-temp\zip-win-report.md`) also failed 5 `hips::pack` tests (`busy_then_ok`, `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak`, `a_busy_wait_reaches_the_ui_while_it_lasts`); they fail the same on 1139fa0c, before the zip work (runner r2, `zip-win-report-r2.md`), so they predate it; not investigated.
-
-**Accepted, do not re-flag:** the cache can exceed its limit by one group during a stacking Prepare (the limit is a target); a project re-export of a zip frame always extracts again (a correct skip would need the entry CRC in the export record); unpack has no Cancel; a set whose foreign-zip frames are only calibration frames gets no "Unpack from zip" button (reads still work); `RawWithCalibrationSets` still places an imported master that sits in a Black Hole zip; rollback restores over a non-matching file at the original path; project stacking of zipped landed files is unreachable (`landed_unchanged`).
-**Accepted, do not re-flag (zip releases, review r1 2026-10-29):**
-- A different frame written over the unpacked path keeps the release alive (the disk walker re-parses the row in place, the link still names a file that exists), so the zip entry stays out of the catalog and "unpacked -> path" names another frame. Telling it apart needs a second fingerprint column or a `linked` marker; Locate names the row's current path, so nothing is hidden. Fix when a real report comes.
-- A zip view under an unmounted copy root shows the released entry as readable, without the "unpacked" chip: `released_entries_of_zip` keeps a release only when a candidate path exists, while the scan keeps it under an offline root (`present_or_offline`). Nothing is written, the chip returns with the mount; cosmetic.
-
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
@@ -2250,6 +2232,20 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 - **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
 
+### From the ZIP web and Windows acceptance (2026-10-31)
+
+- **The 5 `hips::pack` tests fail on Windows for a test-side reason.** The tests are `busy_then_ok`,
+  `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak` and
+  `a_busy_wait_reaches_the_ui_while_it_lasts`. The helper `url_path` (`hips/pack.rs` ~733) builds the expected request
+  path from `tile_rel_path(..).to_string_lossy()`, which is `/Norder3\Dir0\Npix0.jpg` on Windows, while the real request
+  is `/Norder3/Dir0/Npix0.jpg`. So the mock server counts zero hits. Fix: join the helper's components with `/`.
+  Production is not affected. They failed the same way on 1139fa0c, before the zip work.
+- **Settings → Archive shows "Zip extraction cache limit (GB) (GB)".** The registry label already ends in "(GB)", and
+  `ArchiveSection.tsx` also passes `unit="GB"`. Drop the `unit` prop, as the other "(MB)"/"(%)" labels do.
+- **A session counts both copies of a duplicated frame.** In the Windows run, a GAIA session listed 15 frames / 225 s,
+  while its frame set reads 12 / 180 s, so the duplicates were counted once there. Both copies are session members.
+  Whatever reads session totals may over-count a frame held twice; which screens do was not checked.
+
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 
 - **`reconcile_frame_set_nights` "database is locked" ERRORs during Analysis batches.** Two were logged in the C9 dev run, both while an Analysis batch persisted rows: a pre-existing
@@ -2269,6 +2265,21 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 - **Calibration geometry, review M-4:** an origin-misfit candidate is hidden by the picker's default "Only sets that fit" filter
   (reachable by unchecking it, as the plan's G-7 visibility rule says). Keep, or show it by default? (The screens themselves
   were accepted 2026-10-31.)
+- **The Docker container writes to the NAS as root** (ZIP web acceptance, 2026-10-31). The image has no `USER` and no
+  PUID/PGID. Every folder it creates on a bind-mounted share is `root:root 755`: stack work and output, masters, exports,
+  unpack targets, and an `ATHENAEUM_ZIP_CACHE` on the share. The SMB user can then neither delete those files nor write
+  beside them; the test run left 5.4 GB that only the host's root could remove. In the same build, link-mode export writes
+  symlinks to container paths (`/astro-files/...`), and those dangle on the host. Options:
+  - document `--user 99:100` in the Unraid template (the binary needs no root, but `/data` must be writable for that uid);
+  - add PUID/PGID/UMASK support to the image;
+  - leave it as is.
+- **Windows: Overwrite onto a read-only zip** (Windows acceptance, 2026-10-31). `PartialZip::publish`
+  (`archive/zip_writer.rs`) fails with "Access is denied" when the target has the read-only attribute. The partial is
+  removed and the old zip is untouched, so nothing is lost. The code comment there ("std's rename replaces an existing file
+  on Windows") is true only for a writable target. `archive/rollback.rs` ~299 renames onto a restore target the same way.
+  Clear the attribute before the rename, or keep the clean failure and name the attribute in the error? Also: should the
+  four Windows twin tests be kept in the repo (junction refusal, junction/case `file_identity`, held-handle poisoned key,
+  read-only publish)? The patch is `\\Universe\athenaeum-runner\handoffs\zip-windows-main-tests.patch`.
 - **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up,
   2026-08-28, NOT started). The content index exists only to give the RECEIVER a
   cheap "do I have this?" membership key — the sender computes its sampling hash
