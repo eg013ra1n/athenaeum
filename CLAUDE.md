@@ -29,6 +29,7 @@ Cargo workspace + git submodule:
 - **Design tokens, not raw colors.** Use `bg-surface`, `text-content-muted`, `bg-accent`, `text-error`, … so dark/light themes both work.
 - **Multi-file edits in complete passes.** Avoid many small partial edits to large files.
 - **`anyhow::Result`** inside core; convert with `.map_err(|e| e.to_string())` at the command boundary.
+- **Disk: every byte a job writes has a home, an owner and an end date.** Test runs, catalog copies, ERP folders and throwaway worktrees go under `~/.athenaeum-acc/` with a row in its `REGISTRY.tsv` — never `~/Pictures`, a scan root, `~/Documents/Projects` or the NAS as overflow; three cargo targets only (`target`, `target-agent`, `.superpowers/target-acc`); a merged worktree is removed. Rule, budgets and `disk-report`: the `lean-execution` skill, section 7.
 - **Keep this file a map.** Subsystem detail, rulings and acceptance history live in the per-subsystem reference under `docs/` (see **Docs map**); a cycle updates that reference and touches the summary here only when a rule, a command surface or a path changed.
 
 ## Commands
