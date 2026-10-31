@@ -295,6 +295,11 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **An unset `FILTER` is a frame state, not a camera property — there is no "OSC" filter convention.** | `collab::filters::match_filter`, `collab::gate`, the hub dictionary, any "map empty FILTER to an OSC canonical" proposal | Owner ruling 2026-09-28. OSC cameras shoot with or without a filter, and mono cameras without a wheel shoot without one too, so an empty `FILTER` cannot be inferred to mean anything from `BAYERPAT`. It is one more unmapped raw name for the spec §6.2 mapping flow (`filter_mappings (instrume, filter_raw) → canonical`, the normaliser, the publish-flow modal), where the PUBLISHER picks the canonical — `L`, `None`, whatever the project offers. A hub-side special case for `channel = "osc"` was proposed on 2026-09-28 and withdrawn the same day. |
 | **Injected OSC captured fraction ~2× is a scorecard artefact.** | Star-measurement scorecard Row 6 on inject frames, OSC families | Row 6 divides the measured flux (fitted FWTM flux × the plane's aperture correction `c`, taken from the frame's real stars) by an injected Moffat-β-4 star with no wing; on undersampled OSC planes `c` is 1.9–2.7, so injected stars read ×`c` (the c-free model / truth is 0.95–1.02). I.1 extended; `.superpowers/sdd/2026-10-07-one-star-path-plan-a/task-14-report-capfrac.md`. |
 | **Set 204 mono's OFFSET-200 dark on OFFSET-30 lights is the owner's deliberate link, not a product finding.** | The set 204 mono tree (`tierA-lnB-f1`, LDN1272, 180 s): its 208 dark links carry `is_manual_override = 1` (2026-08-28); any "warn on an OFFSET mismatch" proposal | Owner 2026-10-23: the offset was unlinked in the settings on purpose, there were no other lights. The lab consequence stays: about 170-206 ADU over-subtracted, so the lever gate is the six-source pooled free fit (R-PB2-8, `docs/stacking/README.md` R-OSP-16 B2); LN scale and `c` are local-sky-subtracted and stand; absolute-sky quantities of that tree (SNR, noise rows) carry the level error. |
+| **One catalog file, one app process** (DB audit D1). | `db::init_db`, any cross-process lock proposal | Owner, 2026-10-31. The desktop app or the web server opens a catalog file, never both at once. The web build's browser tabs are clients of its one server process, so they are not affected; they must work together without locks (see Owner rulings). |
+| **A same-volume rename interrupted by a crash is healed by the next scan** (DB audit D4). | `file_op` AtomicRename, startup-reconcile proposals | Owner, 2026-10-31. Moves happen between scan roots in practice, and the scanner's move detection repairs the row. |
+| **A calibration set with another sub-frame origin stays hidden behind "Only sets that fit"** (review M-4). | The calibration picker's default filter | Owner, 2026-10-31. Such a set cannot be applied correctly. Unchecking the filter shows it, and a manual link only warns. |
+| **No "manual block" for calibration auto-links.** | `unlink_calibration_for_frames`, Find Calibration | Owner, 2026-10-31: not needed. An unlinked auto link may come back on the next Find Calibration, while a manual choice sticks. |
+| **Perseus 0.5.1 Library behaviour.** | The Perseus Library | Owner, 2026-10-31. Ratified: selection across directories; the in-flight gate that blocks a divert while a sibling batch is Delivered or Waiting; the chip naming the original batch after a re-send. Not ratified: a file deleted by hand is found only on restart (see Owner rulings, To do). |
 
 ---
 
@@ -2255,55 +2260,62 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 ## Awaiting a call from the owner
 
-- **D1–D4 from the DB-layer audit.** Single process per catalog file (proposed: ratify); keep the pool-exhaustion panic (proposed: keep); executor per-stage connections (proposed: defer); same-volume rename reconcile (proposed: defer, since the scanner heals it in practice).
-- **The archive banner wedge.** Banner buttons are disabled for as long as the resume/rollback widget lives, so a lost terminal event — a narrow listen-registration race, or a worker panic — wedges the banner until reload. No data is lost. Accept it, or add a bounded escape that re-enables the controls on a timeout.
-- **Auto-link deselect semantics**, and whether a "manual block" concept is wanted.
-- **`frames.is_master` without `is_master_library`** — what shape that takes in the archive.
-- **Calibration geometry, review M-4:** an origin-misfit candidate is hidden by the picker's default "Only sets that fit" filter
-  (reachable by unchecking it, as the plan's G-7 visibility rule says). Keep, or show it by default? (The screens themselves
-  were accepted 2026-10-31.)
-- **The Docker container writes to the NAS as root** (ZIP web acceptance, 2026-10-31). The image has no `USER` and no
-  PUID/PGID. Every folder it creates on a bind-mounted share is `root:root 755`: stack work and output, masters, exports,
-  unpack targets, and an `ATHENAEUM_ZIP_CACHE` on the share. The SMB user can then neither delete those files nor write
-  beside them; the test run left 5.4 GB that only the host's root could remove. In the same build, link-mode export writes
-  symlinks to container paths (`/astro-files/...`), and those dangle on the host. Options:
-  - document `--user 99:100` in the Unraid template (the binary needs no root, but `/data` must be writable for that uid);
-  - add PUID/PGID/UMASK support to the image;
-  - leave it as is.
-- **Windows: Overwrite onto a read-only zip** (Windows acceptance, 2026-10-31). `PartialZip::publish`
-  (`archive/zip_writer.rs`) fails with "Access is denied" when the target has the read-only attribute. The partial is
-  removed and the old zip is untouched, so nothing is lost. The code comment there ("std's rename replaces an existing file
-  on Windows") is true only for a writable target. `archive/rollback.rs` ~299 renames onto a restore target the same way.
-  Clear the attribute before the rename, or keep the clean failure and name the attribute in the error? Also: should the
-  four Windows twin tests be kept in the repo (junction refusal, junction/case `file_identity`, held-handle poisoned key,
-  read-only publish)? The patch is `\\Universe\athenaeum-runner\handoffs\zip-windows-main-tests.patch`.
-- **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up,
-  2026-08-28, NOT started). The content index exists only to give the RECEIVER a
-  cheap "do I have this?" membership key — the sender computes its sampling hash
-  from the staged copy — and `fits_header.header_fingerprint` is already 100 %
-  populated there at zero I/O. Carrying the fingerprint in the Offer (a new
-  `Msg` variant; indices are frozen, append-only; Perseus already parses headers
-  through `athenaeum-core`) would retire `content_hash`, the index job and the
-  Settings card, with the full-hash confirm unchanged as the safety net. A
-  mismatch (WCS written into one copy, parser drift between versions) costs a
-  re-transfer, never a loss. A protocol cycle of its own; proposed: defer.
-- **One place to watch what the app is doing** (raised by the owner
-  2026-09-06). Progress today is scattered per feature:
-  the sidebar `ComputeQueueIndicator` lists `running`/`queued` only, no
-  stage/percent; a master build's stage and percent render nowhere but a 10px
-  table cell on the Coverage tab; Analysis, transfers, scan, export and
-  archive each own a separate widget. Owner's 2026-09-07 verdict: current
-  state acceptable for now, not blocking. Open: sidebar slide-over vs. a page;
-  whether `ComputeQueueEntry` growing a subject id (enough to join an existing
-  progress stream) is sufficient on its own; whether the per-feature widgets
-  fold into it or stay as they are.
+- **D2: what a request does when every database connection is busy** (DB-layer audit M8,
+  `research/2026-08-03-db-layer-audit.md`). The owner asked on 2026-10-31 whether there is a queue or a wait.
+  - There are two waits. A request waits up to 30 s for a free connection from the pool of 8 (r2d2's checkout
+    timeout). A write that meets another write in progress waits up to 5 s (`busy_timeout`). WAL mode lets reads run
+    beside a write.
+  - D2 covers only what follows a 30 s wait with no connection freed, which means something holds connections and does
+    not let go (a bug). Today `Database::conn()` panics with "Failed to get DB connection from pool". The request
+    fails, and a worker survives through `catch_unwind`. The alternative is a typed error shown to the user, which
+    touches about 200 call sites.
+  - The deeper question the owner raised: every thread may write. Two writers meet the 5 s `busy_timeout`, and past it
+    the result is "database is locked". That is the class behind the `reconcile_frame_set_nights` errors during
+    Analysis batches. The usual SQLite design for an app is one writer (a queue every write goes through) beside a pool
+    of readers. With it, writes never compete and "database is locked" cannot happen. It is a cycle of its own: every
+    write path moves onto the queue.
+- **D3: archive and file operations hold one connection for the whole run** (audit I5). Move and ZIP, unarchive and
+  file moves take one database connection at the start and keep it through copy, hash, zip, verify, delete and finalize
+  (minutes to hours on a large set). Master builds and light calibration release theirs around the long compute. The
+  holding is not a lock, since WAL lets others read and write meanwhile, but it takes one of the 8 pool slots for the
+  whole run. One operation runs at a time, so at most one slot is held. The rework is to take a connection per stage and
+  return it between stages. Proposed: defer until a log shows pool pressure. The owner asked for this explanation on
+  2026-10-31; the call is still open.
 
-- **Perseus 0.5.1 library — four decisions to ratify:** cross-directory Library selection; the in-flight gate that blocks a divert while a sibling is Delivered or Waiting; the chip naming the original batch after a re-send; out-of-band deletions are re-detected only on restart, and byte-identical mtime-preserving re-copies never. (carried from memory 2026-10-23; may already be done)
-- **`formatTimestamp` seconds** (wave 5.5 ruling R31): the helper is documented as HH:MM but the owner's date rule says always seconds; only the Exchange Received table opts into seconds. Make seconds the default, or keep the exception? (carried from memory 2026-10-23; may already be done)
-- **Master-hash pass off the scan thread:** the "Verifying master duplicates" pass still reads shortlisted masters on the scan thread; moving it off is the owner's call (2026-09-17 triage). (carried from memory 2026-10-23; may already be done)
+## Owner rulings, 2026-10-31
+
+### To do
+- **The Docker image follows the NAS standard.** The target is Synology, UGREEN, Unraid and the like. The image runs as
+  an ordinary user given by PUID/PGID (and UMASK); on Unraid the default is `99:100`. Nothing it writes on a share is
+  owned by root. The link-mode export inside a container also needs a look: its symlinks name container paths
+  (`/astro-files/...`).
+- **Windows: Overwrite onto a read-only zip clears the attribute and replaces the zip.** This covers `PartialZip::publish`
+  (`archive/zip_writer.rs`) and the restore rename in `archive/rollback.rs` (~299). Keep the four Windows twin tests in
+  the repo; their patch is `\\Universe\athenaeum-runner\handoffs\zip-windows-main-tests.patch`.
+- **A master outside the Calibration Library is copied into the zip, never moved**, the same as a library master.
+  `archive/planner.rs` forces Copy only for `is_master_library`; extend that to `frames.is_master`.
+- **Seconds by default in `formatTimestamp`** (`src/utils/dateFormatting.ts`, 34 call sites).
+- **The master-hash pass ("Verifying master duplicates") moves off the scan into the background.** Not urgent.
+- **Perseus: files deleted by hand on the capture machine must be found again without a restart**, and a byte-identical
+  re-copy must be noticed too. This needs a design first.
+- **D1 follow-up: the web build works in several browser tabs at once, without locks.** By construction the tabs are
+  clients of one server process: SSE events go to every tab and there is no per-tab lock. Two tabs have not been tried
+  together yet.
+
+### Deferred
+- **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up, 2026-08-28, NOT started). The content
+  index exists only to give the RECEIVER a cheap "do I have this?" key; the sender computes its sampling hash from the
+  staged copy. `fits_header.header_fingerprint` is already fully populated there at zero I/O.
+  - Carrying the fingerprint in the Offer would retire `content_hash`, the index job and the Settings card. It needs a
+    new `Msg` variant; the indices are frozen and append-only, and Perseus already parses headers through
+    `athenaeum-core`. The full-hash confirm stays as the safety net.
+  - A mismatch (WCS written into one copy, parser drift between versions) costs a re-transfer, never a loss.
+  - It is a protocol cycle of its own.
+- **One place to watch what the app is doing** (raised 2026-09-06). Progress stays per feature for now.
+- **The archive banner wedge.** The Resume/Rollback buttons stay disabled while the widget lives, so a lost terminal
+  event wedges the banner until a reload; no data is lost. Accepted until it is seen to happen.
 
 ---
-
 ### Collab publish review, waves 1 + 2 — owner smoke — 2026-10-01/02
 
 Owner smoke list (spec `2026-10-01-collab-publish-review-design.md` §12, "Real app") plus the wave-2 visual pass; delete each line when it passes:
