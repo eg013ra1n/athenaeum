@@ -21,14 +21,6 @@ and the reproduction passes on the owner's catalog.
 
 None open.
 
-## Sky Chart offline pack (HiPS phase 2, #18) — owed live acceptance
-
-Code, tests and reviews are done (plan `plans/2026-10-26-hips-offline-pack.md`, reference `docs/skychart/README.md` → Offline pack). Not yet run by hand, desktop, dev DB, live CDS — the only bulk fetch allowed, never from automation:
-- The estimate before start is within 30 % of what lands on disk. Measured 2026-10-27, owner ruling owed: order 4 + Messier + locations (dev app) estimated 685 MB from `properties`, 840 MB landed (+23 %); a whole-sky order 3 on an empty store (web) estimated 68.3 MB from `approx_tile_bytes`, 44.1 MB landed (−35 %, an over-estimate, so the disk check stays on the safe side).
-- Cancel at ≈ 30 %, quit, relaunch: Settings shows Resume with the same selection; Resume finishes with 0 failed.
-- Online off + network off: the chart shows the whole sky; zoomed on M 31 and on one of your frame sets the detail is sharp (order 5–6); outside the cones on a Retina window the coarse sky shows, not black; no new file under `<app_data>/hips/` afterwards (`hips tile fetched` is a debug line, not in the log file at the default level).
-- A busy wait: the "Survey busy, waiting N s" line clears once the wait ends (`Run::settle` has no test of its own). Needs a real 429/503 from CDS; cannot be provoked.
-
 ## Plan D — carried from Plans B and C
 
 Plan C took the Analysis switch only (owner, 2026-10-24); what it measured and did not fix is here. **Plan D starts by checking the first `c` item on the
@@ -68,6 +60,13 @@ leave the 16 GB dev Mac; gates reading bigbase2 / 3 stay on the dev Mac unless t
   sharpest frames (FWHM 5.6–6.5 px against 8) were demoted (69860 rank 72 → 35) because good seeing resolves the field's saturated giant, weights ρ 0.891, master
   noise +1.59 %. A pre-Plan-C fragility, not Blend's: any change to which bright stars a frame accepts moves its weight this way. Bar for a fix: R-PC-11 (b)'s
   ln-truth at master level on hc11 / runB / s204 (lab `star-lab/results/plan-c/c10-r1-v6/` is the failing case).
+  Seen again on set 109's mono group (2026-10-31, run 9 on a catalog copy): per-frame PSF SNR (tflux² / σ²) grows ≈ FWHM² across the 208 frames (median
+  24.5 below 2 px, 1686 above 4.5 px; tflux 17 311 → 133 242), and the top weight went to one of the widest frames (FWHM 4.88 px against the master's 2.96).
+  The weights themselves stay spread (top frame 1.2 % of the total, top five 5.3 %).
+- **The SNR gain inherits it.** `paired_snr_gain` compares the master with the best sub by weight, on PSF SNR, so a set with mixed seeing reads low: set 109
+  mono 7.08× for 208 frames (√N 14.42), OSC R / G / B 7.41 / 7.99 / 7.86× for 160 (√N 12.65). Scaled by the group's own FWHM² law (gain bias √((4.88 / 2.96)²) ≈ 1.65),
+  the mono figure lands near 11.7×. A fix of the tflux item fixes this; until then the figure is bounded by √N but not comparable across sets of
+  different seeing spread. Evidence: `docs/stacking/README.md` → the SNR gain bullet.
 - **Blend on the stack** (R-PC-10b): the stacking Measure, LN's refits and registration fit without the `Blend` refusal, so the stack keeps the blends' 0.1–0.4 %
   FWHM and crowded-field ecc bias. The seam is one bool (`fit::Correction::blend_refusal`); turning it on for stacking waits for the weight item above.
 
@@ -301,75 +300,26 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 ## Unverified by hand
 
-### ZIP archives in the catalog (2026-10-28) — owed acceptance
+### ZIP archives in the catalog (2026-10-28) — web build and Windows owed
 
-Branch `feature/zip-archives` (spec `specs/2026-10-27-zip-archives-in-catalog-design.md` §13, plan Task 16 Step 4; references `docs/archive/README.md`,
-`docs/catalog/README.md`, `docs/file-browser/README.md`). Code-complete with green core gates; no human has run it on real data. Delete each line when it
-passes, with the measurement moved into the references.
+Spec `specs/2026-10-27-zip-archives-in-catalog-design.md` §13; references `docs/archive/README.md`, `docs/catalog/README.md`,
+`docs/file-browser/README.md`. The NAS acceptance in the desktop build passed (owner, 2026-10-31; `docs/archive/README.md` → Acceptance). Delete each
+line when it passes, with the measurement moved into the references.
 
-**NAS acceptance** (dev build with the real dev DB, a zip of a full night on Universe; the owner approves the write before any file goes to the share):
-
-- **Metadata scan reads.** Network reads for the scan are at most 64 KiB per entry plus the directory and under 0.5% of the zip's size (`zip scanned` log line, `bytes_read`); a rescan of the unchanged zip logs no `zip scanned` line.
-- **The frame set** shows in Objects with the "zip" chip; its calibration matches; preview, plate solve, analysis, a stack and a WBPP export (copy and link) run; link mode produces copies and the export dialog's "From zip" line says so; the cache shrinks back to its limit afterwards.
-- **Unpack** of the foreign set (rows to disk, metadata intact, a rescan of the kept zip does not re-add them), and a Move and ZIP set stacked without Unarchive; Unarchive after deleting two restored files extracts exactly those two entries.
-- **Move and ZIP on a set with half its lights in a foreign zip** zips only the disk half; with none on disk it says "all frames are already in zip files".
-- **Share unmounted:** zip-resident rows show missing, nothing is deleted, operations fail per frame with "inside X.zip, which is not reachable"; remounting brings them back.
-- **Extraction speed** is at least half the share's sequential read rate (probe: 70-100%).
-- **Whole-zip actions:** the zip opens read-only in the file browser with frame metadata; rename/move keeps the frames present; Black Hole (restore) then Void after the count confirmation deletes the zip and its rows.
-- **Duplicates / adoption:** a frame present on disk and in the zip shows as a duplicate pair; an already cataloged night zipped outside the app with the originals deleted becomes zip-resident on rescan with analysis, plate solve and set count intact.
-
-**Web build** (Docker, the NAS as a volume): the same checks as above, plus the cache location (`<data>/zip-cache` or `$ATHENAEUM_ZIP_CACHE`) and Settings -> General -> Archive (limit, status, Clear cache).
+**Web build** (Docker, the NAS as a volume): the desktop NAS flows (scan reads, a zip set's preview / solve / analysis / stack / export, Unpack, Move
+and ZIP, an unmounted share, whole-zip actions, duplicates) in the browser, plus the cache location (`<data>/zip-cache` or `$ATHENAEUM_ZIP_CACHE`) and
+Settings -> General -> Archive (limit, status, Clear cache).
 
 **Windows** (the "Windows runner setup" session on obs-pc1; the branch reaches it through a GitLab branch push): `archive/planner.rs` `file_identity` Windows branch (never run); the `#[cfg(unix)]` odd-name tests' Windows behaviour; materialize's sanitized cache names; zip entry names with `:` / a trailing space / `Aux` extracted on NTFS; rename over a read-only target.
 The runner's 2026-10-29 run (`\\Universe\athenaeum-temp\zip-win-report.md`) also failed 5 `hips::pack` tests (`busy_then_ok`, `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak`, `a_busy_wait_reaches_the_ui_while_it_lasts`); they fail the same on 1139fa0c, before the zip work (runner r2, `zip-win-report-r2.md`), so they predate it; not investigated.
-
-**Not seen by a human (jsdom only):** the browser's zip rows and zip view, the Black Hole "Zip archives" group and its dialogs, the Settings cache row, the relink "zips not found" note, and the Task 15 screens: Unpack dialog end to end on a real foreign zip, Locate into one of our zips, the Objects chips ("zip" / "N of M in zip"), "From zip" lines in the batch dialogs.
 
 **Accepted, do not re-flag:** the cache can exceed its limit by one group during a stacking Prepare (the limit is a target); a project re-export of a zip frame always extracts again (a correct skip would need the entry CRC in the export record); unpack has no Cancel; a set whose foreign-zip frames are only calibration frames gets no "Unpack from zip" button (reads still work); `RawWithCalibrationSets` still places an imported master that sits in a Black Hole zip; rollback restores over a non-matching file at the original path; project stacking of zipped landed files is unreachable (`landed_unchanged`).
 **Accepted, do not re-flag (zip releases, review r1 2026-10-29):**
 - A different frame written over the unpacked path keeps the release alive (the disk walker re-parses the row in place, the link still names a file that exists), so the zip entry stays out of the catalog and "unpacked -> path" names another frame. Telling it apart needs a second fingerprint column or a `linked` marker; Locate names the row's current path, so nothing is hidden. Fix when a real report comes.
 - A zip view under an unmounted copy root shows the released entry as readable, without the "unpacked" chip: `released_entries_of_zip` keeps a release only when a candidate path exists, while the scan keeps it under an offline root (`present_or_offline`). Nothing is written, the chip returns with the mount; cosmetic.
 
-### v0.7.0 pre-release fixes (2026-10-25)
-
-Found while capturing the docs screenshots; ledger `.superpowers/sdd/2026-10-25-v070-ui-fixes/` (brief + five task
-reports). Full core suite 4261/0, vitest 979/979 after the last fix. Owed on the owner's catalog:
-
-- **Black Hole exclusion.** Stack and export a set with blackholed lights (Horsehead C11, 25 of 164): the plan, the
-  Objects card, the export picker and the export all read 139, nothing blackholed lands on disk. A frame-set selection
-  send with a blackholed light skips it and says so. (Before 8ac8a09a / f3ffa775 such lights were stacked and
-  exported.)
-- **SNR gain on real data.** The new √(paired PSF SNR ratio) is checked only on synthetic frames (8 equal frames →
-  2.49 vs √8 = 2.83). Re-stack LDN 1272 and read the figure (expected roughly 10–15× for 208 frames); runs stored
-  before v0.7.0 show "SNR gain —".
-- **Export night count** (set 109 → 3 nights) and the deterministic folder preview, in the desktop app.
-
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
-
-### Quad index packs (2026-10-25)
-
-The packs are published on `artfrom.space/catalogs/` (`index_manifest.json`, `index_base.zip`, `index_narrow.zip`). Checked 2026-10-25 without a
-human at the screen: the web build's Quad Index block downloaded both packs from the real host (files byte-identical to the build), and a blind solve
-through `plate_solve::service::solve_frame_with_hints` with the installed packs matched the solve without them (M82 0.4 s vs 3.2 s, an M42 frame 1.5 s
-vs 3.1 s). Owed: the desktop build seen by the owner. Reference: `docs/platesolving/README.md` → Quad index packs.
-
-- **Download both packs** from Settings → Plate Solving (`base`, then `narrow`): progress runs, a re-run is a no-op, the rows show installed.
-- **Blind-solve a frame with no coordinates** (strip RA/Dec and the focal length, or use a frame the catalog has no position for) and look for
-  `path = "index"` in the "solve succeeded" log line (`athenaeum-logs`).
-- Installing a pack changes the stacking solver identity: a project's cached SOLVED frames are solved again once (expected).
-
-### Calibration geometry — the screens (2026-10-25)
-
-The data path was accepted on the owner's catalog copy (`docs/catalog/README.md` → Calibration geometry). Not yet seen by a human
-(the desktop build started clean on the dev catalog; nobody looked at the screen):
-
-- **The Size column** in the calibration tables and the hierarchy, in compact mode too — is the table still readable at its width?
-- **The picker**: a set of another size is locked (the linked one stays clickable to deselect), another sub-frame origin is
-  selectable with a warning badge; after a hand-chosen origin misfit a warning notification names only the link written.
-- **The Export tab and the Calibrate panel** show the geometry blocker / origin warning lines.
-- **Owner question (review M-4):** an origin-misfit candidate is hidden by the default "Only sets that fit" filter (reachable by
-  unchecking it, as the plan's G-7 visibility rule says). Keep, or show it by default?
 
 ### Plan C — the Analysis tab on the one star path (2026-10-24)
 
@@ -2316,6 +2266,9 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 - **The archive banner wedge.** Banner buttons are disabled for as long as the resume/rollback widget lives, so a lost terminal event — a narrow listen-registration race, or a worker panic — wedges the banner until reload. No data is lost. Accept it, or add a bounded escape that re-enables the controls on a timeout.
 - **Auto-link deselect semantics**, and whether a "manual block" concept is wanted.
 - **`frames.is_master` without `is_master_library`** — what shape that takes in the archive.
+- **Calibration geometry, review M-4:** an origin-misfit candidate is hidden by the picker's default "Only sets that fit" filter
+  (reachable by unchecking it, as the plan's G-7 visibility rule says). Keep, or show it by default? (The screens themselves
+  were accepted 2026-10-31.)
 - **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up,
   2026-08-28, NOT started). The content index exists only to give the RECEIVER a
   cheap "do I have this?" membership key — the sender computes its sampling hash

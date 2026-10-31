@@ -40,7 +40,11 @@ planned but never built. This rewrite documents only what `crates/athenaeum-core
      `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs`),
      in capture order. **A light whose file is in the Black Hole is not exported**, sent, or counted by readiness:
      the query splices `db::FRAME_NOT_IN_BLACK_HOLE_SQL`, the same fragment as the stacking plan's light source
-     (2026-10-25; set 182 exported its 25 rejected lights before).
+     (2026-10-25; set 182 exported its 25 rejected lights before). Checked 2026-10-31 on a copy of the owner's
+     catalog through the release web build: set 182 (164 lights, 25 in the Black Hole) reads 139 in readiness,
+     the export summary's filter groups, the export picker and the folder tree's `lights` folders, and none of
+     the 25 file names is in the tree. Not run: an export written to disk (the tree is the same placement list by
+     construction) and a selection send (needs a peer; tests only).
      **A frame held twice is exported once** (2026-10-29): the same query and `collect_equipment_info` splice
      `db::frame_is_used_copy_sql`, which keeps one copy per raw frame (disk before zip; `docs/frame_sets/README.md`).
    - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs`).
@@ -85,7 +89,9 @@ lists nothing and has no label. Subgroups are walked in capture order (the first
 light of each), groups by name, so the tree and the export are identical on every
 load. (2026-10-25: the preview was rebuilt by hand from a hash-ordered camera
 map — folders reordered per load, a merged subgroup's files were dropped, and
-DARKS_1679 read "← 80 darks" over 80 darks and 30 flat darks.)
+DARKS_1679 read "← 80 darks" over 80 darks and 30 flat darks. Checked the same
+day on a copy of the owner's catalog: two loads give identical JSON, DARKS_1679
+reads "← 80 darks, 30 flat darks".)
 
 ```
 <output_dir>/
@@ -451,7 +457,8 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
   (`get_export_summary`): cameras/telescopes/date range and the night count
   (`nightCount`: DISTINCT `imaging_nights` of the exported lights, the catalog's
   night — never the days in the span; the "Sessions" line read "380 nights" for
-  a year-long set before 2026-10-25), per-filter-group
+  a year-long set before 2026-10-25; checked that day on a copy of the owner's
+  catalog: set 109 reads 3 nights, was 37, set 182 reads 6), per-filter-group
   breakdown (exposure groups from `build_exposure_groups`, `data_collector.rs`
   — an exact/rounded-to-0.1s tally for display, not a configurable clustering
   tolerance), calibration detail, and the folder-structure preview tree.

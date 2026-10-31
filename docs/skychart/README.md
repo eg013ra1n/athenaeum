@@ -173,6 +173,8 @@ Browsing can never store more than the whole sky to order 6.
 
 The desktop host was not compiled in this environment (no webkit2gtk); its three wrappers follow the existing byte-returning commands (`get_master_light_preview`).
 
+**Acceptance, phase 2 (offline pack; owner: works, 2026-10-31).** Estimate against what landed, measured 2026-10-27: order 4 + Messier + locations (dev app) estimated 685 MB from `properties`, 840 MB landed (+23 %, inside the 30 % bar); a whole-sky order 3 on an empty store (web) estimated 68.3 MB from `approx_tile_bytes`, 44.1 MB landed (−35 %, an over-estimate, so the disk check errs on the safe side). Not provoked live: a real 429 / 503 busy wait, so the "Survey busy, waiting N s" line clearing after the wait (`Run::settle`) is covered by neither a test nor a run.
+
 ## Acceptance (#19, 2026-10-26, web build + mock API, headless Chromium 1600 × 900)
 
 | Check | Before | After |

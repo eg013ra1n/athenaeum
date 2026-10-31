@@ -32,6 +32,8 @@ The legacy `is_archived` boolean is the soft-hide flag (`archive_frame_set`, use
 
 Spec `docs/superpowers/specs/2026-10-27-zip-archives-in-catalog-design.md`, plan `docs/superpowers/plans/2026-10-27-zip-archives-in-catalog.md`. Scanner-side rules (foreign zips, virtual paths, presence, cache, hashes): `docs/catalog/README.md` -> Zips in the catalog. Black Hole and browser rules: `docs/file-browser/README.md`.
 
+**Acceptance (NAS, desktop, owner: works, 2026-10-31).** The owner ran zips on the NAS share in the desktop build on the real dev DB; what turned up was fixed on `main` (the zip-entry rows and the Send to Void rescan, merged in bc9535df). The web build (Docker) and Windows are still owed (`docs/superpowers/open-items.md`).
+
 **Rules that bite**
 
 - **Zips are read-only.** No code writes into a zip. Only an explicit Send to Void of the WHOLE zip deletes one; Unarchive deletes a zip only if it is one of OUR zips, only on request, and only when no catalog row still lives in it.
