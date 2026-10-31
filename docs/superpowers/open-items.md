@@ -2240,11 +2240,6 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
   path from `tile_rel_path(..).to_string_lossy()`, which is `/Norder3\Dir0\Npix0.jpg` on Windows, while the real request
   is `/Norder3/Dir0/Npix0.jpg`. So the mock server counts zero hits. Fix: join the helper's components with `/`.
   Production is not affected. They failed the same way on 1139fa0c, before the zip work.
-- **Settings → Archive shows "Zip extraction cache limit (GB) (GB)".** The registry label already ends in "(GB)", and
-  `ArchiveSection.tsx` also passes `unit="GB"`. Drop the `unit` prop, as the other "(MB)"/"(%)" labels do.
-- **A session counts both copies of a duplicated frame.** In the Windows run, a GAIA session listed 15 frames / 225 s,
-  while its frame set reads 12 / 180 s, so the duplicates were counted once there. Both copies are session members.
-  Whatever reads session totals may over-count a frame held twice; which screens do was not checked.
 
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 

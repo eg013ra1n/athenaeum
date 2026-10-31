@@ -730,8 +730,9 @@ mod tests {
         status(0, "")
     }
 
+    /// The request path `fetch_tile_from` sends: `/` separators on every platform, as in the URL.
     fn url_path(order: u8, npix: u64) -> String {
-        format!("/{}", crate::hips::tile_rel_path(order, npix, TileFormat::Jpeg).to_string_lossy())
+        format!("/{}", crate::hips::tile_rel_path(order, npix, TileFormat::Jpeg).to_string_lossy().replace('\\', "/"))
     }
 
     /// A local HTTP server with a queue of responses per path. A queue pops

@@ -190,7 +190,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       },
       {
         id: 'zipCacheLimitGb',
-        label: 'Zip extraction cache limit (GB)',
+        label: 'Zip extraction cache limit',
         help: 'Frames inside a zip are unpacked to this cache when something reads them (preview, stacking, export). The oldest unused ones are dropped once the cache passes the limit. It can pass the limit briefly while one job runs.',
         keywords: ['archive.zip_cache_limit_gb', 'zip', 'cache', 'extraction', 'limit', 'size'],
       },
