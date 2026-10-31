@@ -30,8 +30,13 @@ calibrated path.** References: `docs/stacking/README.md` R-OSP-16 (Plan B) and R
 
 **Owner question (unanswered).** solvemyastro on rustafits with `default-features = false`: `clap` is still in the build. Is the branch on GitHub for the owner to merge?
 
-**Owner question (carried from Plan B).** Move the three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) to the runner so real-data runs
-leave the 16 GB dev Mac; gates reading bigbase2 / 3 stay on the dev Mac unless the runner gets those volumes. (Plan C's C10 ran on the dev Mac, R-PC-11.)
+**Scope (owner, 2026-10-31: «Только вес стека»).** Plan D is the stacking weight only: (0) the first `c` item below on the calibrated path, (1) the weight's
+hang on saturated stars' `tflux` and the FWHM trend set 109 showed (bar: R-PC-11 (b)'s ln-truth at master level on hc11 / runB / s204), (2) Blend on the stack after (1).
+The other `c` items, the Analysis items and the plate-solving signal wait for a later plan; the LN / ERP items stay recorded limits.
+
+**Real trees (owner, 2026-10-31).** The three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) are copied to the runner (M4 Max) through
+`/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines; Plan D's master-level runs go to the runner. Gates reading bigbase2 / 3 stay on the dev Mac
+unless the runner gets those volumes.
 
 **The Measure aperture correction `c` (Plan B B4, measured, not fixed).**
 - On raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of the bright stars from `c`'s sample frame-dependently and `c`

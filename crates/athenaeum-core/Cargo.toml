@@ -214,6 +214,10 @@ name = "weight_audit"
 required-features = ["render", "solver"]
 
 [[example]]
+name = "d0_weight_probe"
+required-features = ["render", "solver"]
+
+[[example]]
 name = "xisf_convert_probe"
 required-features = ["render"]
 
