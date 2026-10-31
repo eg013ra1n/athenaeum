@@ -2238,8 +2238,10 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
   `records_404_as_absent`, `a_success_resets_the_busy_streak`, `a_success_resets_the_error_streak` and
   `a_busy_wait_reaches_the_ui_while_it_lasts`. The helper `url_path` (`hips/pack.rs` ~733) builds the expected request
   path from `tile_rel_path(..).to_string_lossy()`, which is `/Norder3\Dir0\Npix0.jpg` on Windows, while the real request
-  is `/Norder3/Dir0/Npix0.jpg`. So the mock server counts zero hits. Fix: join the helper's components with `/`.
-  Production is not affected. They failed the same way on 1139fa0c, before the zip work.
+  is `/Norder3/Dir0/Npix0.jpg`. So the mock server counts zero hits. Production is not affected. They failed the same
+  way on 1139fa0c, before the zip work. **Fixed in b5abb9de** (the helper swaps the separator, as `fetch_tile_from` does;
+  48 of 48 `hips::` tests pass on the Mac). Still owed: a Windows run. The runner was offline on 2026-10-31; the brief is
+  `\\Universe\athenaeum-runner\handoffs\hips-test-fix-handoff.md`. Delete this item when it passes.
 
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 
