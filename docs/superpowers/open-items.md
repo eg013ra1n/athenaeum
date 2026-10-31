@@ -2367,6 +2367,39 @@ Known gap: republishing an `own_missing` frame that regenerates identical bytes 
 
 ## Release notes owed at the next tag
 
-Nothing owed: everything listed here up to v0.7.0 was paid in the v0.7.0 notes (2026-10-26). A cycle that
+Everything listed here up to v0.7.0 was paid in the v0.7.0 notes (2026-10-26). A cycle that
 lands adds its user-facing lines here, in engineering wording; the next release translates them for users.
+
+The cycles after the tag did not add theirs; the lines below were written on 2026-10-31 from `v0.7.0..0b89e4c4`.
+
+- **ZIP archives are part of the catalog.** A `.zip` on a scan root is scanned from its directory and entry headers only; its frames are ordinary
+  catalog rows ("zip" / "N of M in zip" chips in Objects), and preview, plate solve, Analysis, Blink, duplicate verify, stacking, master builds and
+  every export read them through an extraction cache (Settings → General → Archive: limit, status, Clear cache). Link-mode export copies zip frames.
+  Move and ZIP zips only the frames on disk; **Unpack from zip** writes a set's frames to disk for good; Unarchive extracts only the missing entries.
+  A zip opens read-only in the file browser, with each entry's header in the metadata pane; a whole zip can be renamed, moved, sent to the Black Hole
+  and voided, a single entry cannot. An unmounted share makes zip frames missing, never deleted.
+- **A frame held twice is counted and used once.** Two disk copies of one raw frame, or a disk copy and a zip entry, were two members of their set
+  (double counts in Objects, double weight in a stack, both copies in export and readiness). One copy is used now, disk before zip, and the other
+  reads "duplicate — not used".
+- **Black Hole: one delete button.** Empty Black Hole is gone (with a source filter on, it confirmed the filtered count and voided the hidden entries
+  too): select, then Send to Void. Send to Void rescans the folders it deleted from, so a voided unpacked copy returns its frame to the zip at once.
+- **Windows: link-mode export without Developer Mode.** Where Windows refuses a symbolic link (os error 1314) the export makes a hard link, and a
+  copy where a hard link is impossible (another volume, FAT/exFAT, a share); the completion card and the notification count each and point at
+  Developer Mode. Before, every disk frame ended as a "Failed to copy" warning.
+- **Sky Chart: a sky survey under the chart.** DSS colored tiles are fetched on demand and kept locally (Settings → General → Sky background; online
+  fetching can be turned off).
+- **Sky Chart offline pack.** The whole sky down to a chosen order (default 4) plus finer detail to order 6 around imaging locations, Messier
+  objects and, optionally, NGC/IC brighter than 10ᵐ, downloaded ahead for use without a network: an estimate before start, cancel and resume after a
+  restart, and a "Download for offline…" link in the chart's credit strip.
+- **The Sky Chart keeps its view** across page changes, window resizes and restarts, and no longer slows down over a long session (it was rebuilt on
+  every visit). Links frame the same area at any window width.
+- **Frame-set footprints are drawn right.** A set's center, rotation and box size come from its lights plate-solved by Athenaeum when it has any
+  (Black Hole lights left out, a circular mean for rotation, the box size from the solve), and the box turns the right way (it was mirrored: 27° off
+  on an M 31 set). The Sky Chart places sets by the new rule at once; the stored center and rotation on the object page and the Objects cards update
+  on the next metadata write or with the refresh button beside the coordinates.
+- **Object page:** Duplicates, Unpack and Move to Archive sit at the end of the Lights toolbar; the refresh beside the coordinates re-derives nights
+  and sessions and recomputes center and rotation, replacing the Recalculate nights button; the Duplicates page opens unfiltered.
+- **Plate-solve batch progress** counts frames finished out of the total and names the file being solved, instead of creeping on a timer and
+  running a frame ahead; a refused frame carries its file name into the failed list. In the web build the batch no longer closes at once and the
+  progress shows.
 
