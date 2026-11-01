@@ -154,9 +154,12 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     };
 
     let exptime = get("EXPTIME").and_then(|s| s.parse::<f64>().ok());
+    // Must match the scanner's `frames.ccd_temp` (`CCD-TEMP`, else `DET-TEMP`),
+    // or the metadata pane shows a phantom "original differs" diff.
     let ccd_temp = get("CCD-TEMP")
         .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| get("CCDTEMP").and_then(|s| s.parse::<f64>().ok()));
+        .or_else(|| get("CCDTEMP").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| get("DET-TEMP").and_then(|s| s.parse::<f64>().ok()));
     let date_obs = get("DATE-OBS").or_else(|| get("DATE_OBS"));
 
     // RA: prefer sexagesimal OBJCTRA (HH:MM:SS); fall back to numeric RA in
@@ -562,6 +565,47 @@ mod tests {
         assert_eq!(snap.binning.as_deref(), Some("2x2"));
         assert_eq!(snap.exptime, Some(60.0));
         assert_eq!(snap.ccd_temp, Some(-9.9));
+    }
+
+    /// The snapshot (metadata pane's "original" column) must agree with what
+    /// the scanner stored in `frames.ccd_temp`, or the pane shows a phantom
+    /// diff: `DET-TEMP` fills in when `CCD-TEMP` is absent or unparseable and
+    /// never outranks it.
+    #[test]
+    fn snapshot_ccd_temp_falls_back_to_det_temp() {
+        let snap_of = |pairs: &[(&str, &str)]| {
+            let keys: HashMap<String, String> =
+                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            snapshot_from_keys(1, &keys).ccd_temp
+        };
+        assert_eq!(snap_of(&[("DET-TEMP", "-5.5")]), Some(-5.5), "DET-TEMP alone");
+        assert_eq!(
+            snap_of(&[("CCD-TEMP", "-10.0"), ("DET-TEMP", "-5.5")]),
+            Some(-10.0),
+            "CCD-TEMP wins when both are present"
+        );
+        assert_eq!(
+            snap_of(&[("CCD-TEMP", "n/a"), ("DET-TEMP", "-5.5")]),
+            Some(-5.5),
+            "unparseable CCD-TEMP defers to DET-TEMP"
+        );
+        assert_eq!(snap_of(&[("EXPTIME", "60")]), None, "neither keyword → unset");
+    }
+
+    /// Same fallback through the real stored-header forms: 80-column FITS card
+    /// text and XISF XML.
+    #[test]
+    fn det_temp_reaches_the_snapshot_from_stored_header_text() {
+        let fits = format!("{:<80}\n{:<80}", "SIMPLE  =                    T", "DET-TEMP=                 -5.5 / sensor");
+        let keys = parse_stored_header_keys(FileFormat::FITS, &fits);
+        assert_eq!(snapshot_from_keys(1, &keys).ccd_temp, Some(-5.5));
+
+        let xisf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xisf>
+  <FITSKeyword name="DET-TEMP" value="-5.5" />
+</xisf>"#;
+        let keys = parse_stored_header_keys(FileFormat::XISF, xisf);
+        assert_eq!(snapshot_from_keys(1, &keys).ccd_temp, Some(-5.5));
     }
 
     #[test]
