@@ -15,6 +15,7 @@ import type {
   StackingRunGroupRow,
   StackingRunSummary,
   SummaryGroup,
+  WeightMode,
   WorkUsage,
 } from '../../types/stacking';
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
@@ -218,6 +219,7 @@ function MasterCard({
   groupReferenceFrameId,
   drizzleSummary,
   drizzleConfigEnabled,
+  weightMode,
 }: {
   group: StackingRunGroupRow;
   lnReferencePath: string | null;
@@ -236,9 +238,13 @@ function MasterCard({
    *  config had drizzle on, independent of the current draft config. Drives
    *  the "skipped" line when the run had it on but this group has no path. */
   drizzleConfigEnabled: boolean;
+  /** `runDetail.summary?.config.measurement.weightMode` — the run's own weight
+   *  mode (PD-19): a gain of 0 outside the PSF family names the mode as the
+   *  reason. `undefined` while the run's `summary` hasn't loaded. */
+  weightMode: WeightMode | undefined;
 }) {
   const stats = parseGroupStats(group.statsJson);
-  const snrGain = stats ? snrGainLabel(stats) : null;
+  const snrGain = stats ? snrGainLabel(stats, weightMode) : null;
   const dstats = drizzleSummary?.drizzle ?? null;
 
   // M4d final review, Important #1 part 3: fetch the master's own thumbnail
@@ -611,6 +617,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
                       sg ? { drizzlePath: sg.drizzlePath, weightMapPath: sg.weightMapPath, drizzle: sg.drizzle } : null
                     }
                     drizzleConfigEnabled={runDetail.summary?.config.drizzle.enabled ?? false}
+                    weightMode={runDetail.summary?.config.measurement.weightMode}
                   />
                 );
               })}

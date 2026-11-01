@@ -1377,7 +1377,7 @@ fn a_cancel_lands_between_the_members_of_one_groups_reweigh() {
 }
 
 /// D1b: `stage_output` hands `integrate_group` the set `reweigh_groups` recorded for the group, so the group's SNR gain
-/// is measured on it (version 2); the same group with its record dropped reads no gain, with the warn that names why.
+/// is measured on it (version 2); the same group with its record dropped reads no gain, with the debug line that names why.
 #[test]
 fn the_output_stage_measures_the_gain_on_the_recorded_common_set() {
     let mut gains = Vec::new();
@@ -1399,6 +1399,11 @@ fn the_output_stage_measures_the_gain_on_the_recorded_common_set() {
         assert_eq!(stats.snr_gain_version, 2);
         if !keep_set {
             assert!(log.contains("snr_gain not measured") && log.contains("no positions"), "{log}");
+            // Never reweighed is a configuration (D1b review M5): a debug line, not a warn per plane per group.
+            assert!(
+                !log.lines().any(|l| l.contains("WARN") && l.contains("snr_gain not measured")),
+                "{log}"
+            );
         }
         gains.push(stats.snr_gain.clone());
     }

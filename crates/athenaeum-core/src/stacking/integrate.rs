@@ -501,8 +501,9 @@ pub struct GroupInput<'a> {
     /// coordinates (`GroupInput::width` x `height`: the grid the registered frames and the master live on, which
     /// `stacking::run::reweigh_groups` reaches by each member's own registration map). `None` entry = the plane fell
     /// back (PD-6); the whole field is `None` when the group was never reweighed (a weight mode outside the PSF family,
-    /// a frame set, the LN reference builder, the probes). The master's PSF SNR and [`GroupStats::snr_gain`] read only
-    /// these stars (see [`common_psf_snr`], [`paired_snr_gain`]).
+    /// the LN reference builder, the probes; a frame set IS reweighed under the PSF modes). The master's PSF SNR and
+    /// [`GroupStats::snr_gain`] read only these stars (see [`common_psf_snr`], [`paired_snr_gain`]); how the integrate
+    /// side tells the two apart is [`log_no_positions`].
     pub common_stars: Option<&'a [Option<Vec<(f64, f64)>>]>,
 }
 
@@ -562,6 +563,13 @@ pub struct GroupStats {
     /// The master's PSF SNR per plane: over the group's frame-common star set when it has one (Plan D D1b, the stars the
     /// master matches), else over every star of the master. `best_sub_psf_snr` is the best sub's own `psf_snr` - the
     /// common-set value after the reweigh (D1w), else its Measure-time one.
+    ///
+    /// These two are NOT a ratio pair, and nothing divides them to get [`GroupStats::snr_gain`] (that is
+    /// [`paired_snr_gain`], on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
+    /// matched in its rectangle on a plane that has a set, and the whole-field figure (unmarked) on a plane that fell
+    /// back or matched under 20; `best_sub_psf_snr` is the frame's own `psf_snr`, whose flux after D1w is the paired
+    /// ratio `r_f` times the anchor's whole-set sum (the stars the frame lacks are extrapolated, not summed), or its
+    /// Measure-time figure on a fallback. They agree only where one set is whole in both images.
     pub master_psf_snr: Vec<f64>,
     pub best_sub_psf_snr: Vec<f64>,
     /// How many times the master's star SNR beats the best sub's, per
@@ -788,22 +796,22 @@ pub(crate) fn positions_in_crop(
 /// the image's `fits` ([`common_signals`]; `origin` as there, `field_fwhm` the image's own) - the channel's own
 /// `psf_snr` formula on the set's stars only, in native units (signals divided by `ADU_SCALE`, `noise_native` the
 /// channel's `noise`), so the master's figure and the best sub's `ChannelMeasurement::psf_snr` (the common-set value
-/// after D1w) are on one scale. Returns the figure and how many stars were matched; `None` under
-/// [`COMMON_MIN_STARS`].
+/// after D1w) are on one scale. Returns the figure and how many stars were matched; `Err(matched)` under
+/// [`COMMON_MIN_STARS`] of them.
 pub(crate) fn common_psf_snr(
     fits: &[StarFit],
     positions: &[(f64, f64)],
     origin: (usize, usize),
     noise_native: f64,
     field_fwhm: f64,
-) -> Option<(f64, usize)> {
+) -> Result<(f64, usize), usize> {
     let signals = common_signals(fits, positions, origin, field_fwhm, field_fwhm, noise_native);
     let n = signals.iter().flatten().count();
     if n < COMMON_MIN_STARS {
-        return None;
+        return Err(n);
     }
     let sum: f64 = signals.iter().flatten().sum();
-    Some((psf_signal::psf_snr(sum, noise_native), n))
+    Ok((psf_signal::psf_snr(sum, noise_native), n))
 }
 
 /// One plane's PSF SNRs on the stars matched and usable in BOTH crops (`rect` is the crop's place in the grid): the
@@ -888,7 +896,7 @@ fn paired_snr_gain(
     if (0..channels).all(|p| positions(p).is_none()) {
         // No plane has a set: nothing to pair, so neither the best sub nor the master is measured again.
         for p in 0..channels {
-            warn_no_positions(p, best.frame_id);
+            log_no_positions(input, p, best.frame_id);
         }
         return Ok(vec![0.0; channels]);
     }
@@ -974,7 +982,7 @@ fn paired_snr_gain(
         .enumerate()
         .map(|(p, (m, s))| {
             let Some(set) = positions(p) else {
-                warn_no_positions(p, best.frame_id);
+                log_no_positions(input, p, best.frame_id);
                 return 0.0;
             };
             let (master_snr, sub_snr, paired) =
@@ -1028,13 +1036,27 @@ fn common_positions<'a>(input: &GroupInput<'a>, p: usize) -> Option<&'a [(f64, f
         .filter(|set| !set.is_empty())
 }
 
-fn warn_no_positions(plane: usize, frame_id: i64) {
-    warn!(
-        plane,
-        frame_id,
-        reason = "no positions",
-        "snr_gain not measured: no frame-common star set for this plane; reporting 0.0"
-    );
+/// The "no positions" line of a plane without a frame-common star set. The integrate side tells the two causes apart
+/// by [`GroupInput::common_stars`] itself: `None` = the group was never reweighed (a weight mode outside the PSF family,
+/// the LN reference builder, the probes) - a configuration, not a fault, so a `debug!`; `Some` with the plane's entry
+/// `None` (or empty) = the plane fell back at the reweigh, which warned and put a run warning on it already - kept at
+/// `warn!` (the gain's absence is that fallback's consequence).
+fn log_no_positions(input: &GroupInput<'_>, plane: usize, frame_id: i64) {
+    if input.common_stars.is_none() {
+        debug!(
+            plane,
+            frame_id,
+            reason = "no positions",
+            "snr_gain not measured: no frame-common star set for this plane; reporting 0.0"
+        );
+    } else {
+        warn!(
+            plane,
+            frame_id,
+            reason = "no positions",
+            "snr_gain not measured: no frame-common star set for this plane; reporting 0.0"
+        );
+    }
 }
 
 /// How [`integrate_planes`] reads one frame: its materialized registered
@@ -1991,11 +2013,12 @@ pub fn integrate_group(
                 let inside = positions_in_crop(set, origin, (measure_w, measure_h));
                 let fits = &measured.measurement.fits;
                 match common_psf_snr(fits, &inside, origin, cm.noise, cm.fwhm_px) {
-                    Some((snr, _)) => snr,
-                    None => {
+                    Ok((snr, _)) => snr,
+                    Err(matched) => {
                         warn!(
                             plane = p,
                             common_stars = inside.len(),
+                            paired_stars = matched,
                             reason = "under 20 paired",
                             "master psf snr over every star: too few frame-common stars matched in the master"
                         );
@@ -3061,7 +3084,9 @@ mod tests {
         };
         let (extra, log_extra) = gain_run(&gain_frames(dir_b.path(), &spec), Some(&set));
         let (a, b) = (plain.stats.snr_gain[0], extra.stats.snr_gain[0]);
-        assert!(a > 1.0 && a.is_finite(), "gain {a}");
+        // The upper bound under unequal weights (1.0 for the best sub, 0.5 for the other seven): the SNR gain of an
+        // eight-frame stack cannot run past √8; the 25 % is slack for the estimators, not a fitted figure.
+        assert!(a > 1.0 && a < 1.25 * 8f64.sqrt(), "gain {a}");
         assert!(
             (b / a - 1.0).abs() < 0.01,
             "gain {a} without the extra star, {b} with it\n{}\n{}",
@@ -3078,6 +3103,15 @@ mod tests {
     /// A wider best sub with the same flux per star: the common stars' signals do not move, so the gain does not.
     /// The wide sub also carries six stars of its own (its "unclipped flux": +40 % of the set's), which the pre-D1b
     /// whole-field PSF SNR counted.
+    ///
+    /// Why the other seven frames weigh 0.9 and not the default 0.5: the gain still moves a little with the best
+    /// sub's share of the master, because the master is built from the wide sub too and so has a mixed PSF, which
+    /// Measure's model (times `c`) reads linearly in that share - +6.6 % at the best sub's 22 % share (weight 0.5:
+    /// 1 / (1 + 7 x 0.5)), +4.3 % at 13.7 % (weight 0.9), about +0.5 % at none. That is the measuring model, not the
+    /// pairing. At 0.9 the margin under the 5 % bar is 0.7 pp, so READ A FAILURE HERE AS THAT ARTEFACT FIRST: D3
+    /// moves Measure on both gain crops (PD-10), and a D3 change that shifts the gain a point is not a gain
+    /// regression. The pre-D1b whole-field figure moves -25 % on these frames, so the test still separates the
+    /// mechanism it names.
     #[test]
     fn snr_gain_does_not_grow_with_the_best_subs_width() {
         let set = vec![Some(gain_set())];
@@ -3117,17 +3151,24 @@ mod tests {
         let (none, log_none) = gain_run(&frames, None);
         let (fell, log_fell) = gain_run(&frames, Some(&fallen));
         let (under, log_under) = gain_run(&frames, Some(&few));
-        for (out, log, reason) in [
-            (&none, &log_none, "no positions"),
-            (&fell, &log_fell, "no positions"),
-            (&under, &log_under, "under 20 paired"),
+        // M5: a group never reweighed (no `common_stars` at all) is a configuration, so its "no positions" is a
+        // `debug!`; a plane that fell back (D1w warned already) and an "under 20 paired" stay `warn!`.
+        for (out, log, reason, level) in [
+            (&none, &log_none, "no positions", "DEBUG"),
+            (&fell, &log_fell, "no positions", "WARN"),
+            (&under, &log_under, "under 20 paired", "WARN"),
         ] {
             assert_eq!(out.stats.snr_gain, vec![0.0], "{reason}");
-            let warn = log
+            let line = log
                 .lines()
-                .find(|l| l.contains("WARN") && l.contains("snr_gain not measured"))
-                .unwrap_or_else(|| panic!("no warn for {reason}: {log}"));
-            assert!(warn.contains(reason), "{warn}");
+                .find(|l| l.contains("snr_gain not measured"))
+                .unwrap_or_else(|| panic!("no line for {reason}: {log}"));
+            assert!(line.contains(level) && line.contains(reason), "{level} / {reason}: {line}");
+            assert_eq!(
+                log.lines().any(|l| l.contains("WARN") && l.contains("snr_gain not measured")),
+                level == "WARN",
+                "{reason}: {log}"
+            );
             assert!(out.stats.master_psf_snr[0] > 0.0, "{reason}");
         }
         assert!(paired_of(&log_under) <= 12, "{log_under}");
@@ -3152,6 +3193,25 @@ mod tests {
         assert!(ratio > 0.55 && ratio < 0.85, "common / whole-field = {ratio}");
         assert_eq!(with.stats.snr_gain_version, SNR_GAIN_VERSION);
         assert_eq!(SNR_GAIN_VERSION, 2);
+    }
+
+    /// The master's fallback warn names how many of the set's stars the master matched (the count that fell under 20),
+    /// beside how many it asked for: 12 stars of the set plus six places without a star in any frame.
+    #[test]
+    fn the_masters_fallback_warn_names_the_matched_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames = gain_frames(dir.path(), &GainSpec::default());
+        let mut asked = gain_set()[..12].to_vec();
+        asked.extend(gain_off_set());
+        let (_, log) = gain_run(&frames, Some(&[Some(asked)]));
+        let line = log
+            .lines()
+            .find(|l| l.contains("master psf snr over every star"))
+            .unwrap_or_else(|| panic!("no master warn: {log}"));
+        assert!(line.contains("WARN") && line.contains("under 20 paired"), "{line}");
+        assert!(line.contains("common_stars=18"), "{line}");
+        let matched = paired_of(line);
+        assert!((1..=12).contains(&matched), "matched {matched}: {line}");
     }
 
     /// Units: over every fit of a measured plane, `common_psf_snr` is the channel's own `psf_snr` - signals divided
@@ -3221,7 +3281,10 @@ mod tests {
             .expect("30 stars at the crop's origin");
         assert_eq!(n, 30);
         // At the wrong origin the positions are 17 and 11 px off: no star is matched.
-        assert!(common_psf_snr(fits, &inside, (0, 0), ch.noise, ch.fwhm_px).is_none());
+        assert!(
+            matches!(common_psf_snr(fits, &inside, (0, 0), ch.noise, ch.fwhm_px), Err(n) if n < COMMON_MIN_STARS),
+            "no star is matched at the wrong origin"
+        );
         // A narrower crop leaves the stars outside it out of the request.
         let narrow = positions_in_crop(&gain_set(), (150, 0), (120, GAIN_H));
         assert!(narrow.len() < 30 && narrow.iter().all(|p| p.0 >= 150.0 && p.0 < 270.0));
@@ -3410,11 +3473,11 @@ mod tests {
             out.stats.master_noise[0]
         );
         // Plan D D1b: the gain is read over the frame-common star set, and this 12-star fixture (the 4x3 grid
-        // above) cannot hold `COMMON_MIN_STARS` of them: even handed all twelve as the set, fewer than 20 pair, so
-        // the gain is 0.0 with its warn (this group has no set at all here). The value itself, and its √N bound, are
-        // pinned on the 30-star fixture by `snr_gain_of_n_equal_frames_is_about_root_n`; before D1b this block
-        // asserted `1 < snr_gain < 2` (a 3-frame stack cannot run away past √3).
-        assert_eq!(out.stats.snr_gain, vec![0.0]);
+        // above) cannot hold `COMMON_MIN_STARS` of them. This group is handed no set (`common_stars: None`), so its
+        // gain is the "no positions" 0.0, which `without_a_common_set_the_gain_is_zero_with_a_warn` pins; the value
+        // itself, its √N bound and its bound under unequal weights are pinned on the 30-star fixture by
+        // `snr_gain_of_n_equal_frames_is_about_root_n` and `the_paired_gain_reads_only_the_common_stars`. Before D1b
+        // this block asserted `1 < snr_gain < 2`.
 
         // Frame 2 is genuinely twice the level (signal AND noise), so the
         // AdditiveWithScaling pair that maps it back onto the reference
