@@ -40,6 +40,9 @@ applied differently: Task 0 does not clone Plan D's d1 trees (see Task 0, "Proof
 
 ## Owner decisions (before Task 1; the controller's recommendation first, Fable concurs)
 
+**Ruled 2026-11-01 by the owner: OD-1a, OD-2a, OD-3 as recommended** («Согласен с твоими выводами», after the
+plain-language explanation of the three choices).
+
 - **OD-1 — the default.** (a) `local` for every new config, LN computed for rejection even when LN output is off
   (costs the Normalize stage: 34–37 s per ~90-frame mono group, 90–100 s per OSC group on LDN1272, about the
   integration's own time); default mono masters 0.67 → 0.90–0.91 of the inputs' star peak on LDN1272, default OSC
