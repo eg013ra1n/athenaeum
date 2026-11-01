@@ -84,7 +84,9 @@ export function snrGainLabel(
   }
   const missing = gains.flatMap((gain, i) => (isMeasured(gain) ? [] : [i]));
   if (missing.length === gains.length) return { text: 'SNR gain —', title: unmeasuredTitle(weightMode) };
-  const text = `SNR gain ${gains.map((gain) => (isMeasured(gain) ? gain.toFixed(2) : '—')).join(' / ')}×`;
+  // The × follows the last slot only when that slot is a figure: "7.41 / 7.99 / —", never "—×".
+  const slots = gains.map((gain) => (isMeasured(gain) ? gain.toFixed(2) : '—')).join(' / ');
+  const text = `SNR gain ${slots}${isMeasured(gains[gains.length - 1]) ? '×' : ''}`;
   if (missing.length === 0) return { text };
   const names = joinNames(missing.map((i) => planeName(i, gains.length)));
   return { text, title: `${names} ${SNR_GAIN_UNMEASURED_TOOLTIP}` };

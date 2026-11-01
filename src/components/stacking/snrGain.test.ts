@@ -102,17 +102,17 @@ describe('snrGainLabel', () => {
     });
     expect(snrGainLabel({ snrGain: [7.41, 0, 7.86], snrGainVersion: v }).title).toBe('G not measured for this group');
     expect(snrGainLabel({ snrGain: [7.41, 7.99, Number.NaN], snrGainVersion: v })).toEqual({
-      text: 'SNR gain 7.41 / 7.99 / —×',
+      text: 'SNR gain 7.41 / 7.99 / —',
       title: 'B not measured for this group',
     });
     // several planes are named together
     expect(snrGainLabel({ snrGain: [0, 7.99, 0], snrGainVersion: v })).toEqual({
-      text: 'SNR gain — / 7.99 / —×',
+      text: 'SNR gain — / 7.99 / —',
       title: 'R and B not measured for this group',
     });
     // any other plane count: "plane N", counted from 1
     expect(snrGainLabel({ snrGain: [5, 0], snrGainVersion: v })).toEqual({
-      text: 'SNR gain 5.00 / —×',
+      text: 'SNR gain 5.00 / —',
       title: 'plane 2 not measured for this group',
     });
     expect(snrGainLabel({ snrGain: [0, 5, 0, 6], snrGainVersion: v }).title).toBe(
