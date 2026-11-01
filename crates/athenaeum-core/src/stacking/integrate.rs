@@ -34,8 +34,8 @@ use crate::stacking::common_set::{self, COMMON_MIN_STARS};
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::{LnFrameGrids, LnGrid};
 use crate::stacking::measure::{
-    measure_planes_diagnosed, measure_planes_with_width_hints, FrameMeasurement, MeasureOptions,
-    PlaneMeasurement, SeedOverride,
+    measure_planes_diagnosed, measure_planes_with_width_hints, ChannelMeasurement, FrameMeasurement,
+    MeasureOptions, PlaneMeasurement, SeedOverride,
 };
 use crate::stacking::psf_signal;
 use crate::star_measure::StarFit;
@@ -746,6 +746,7 @@ fn common_signals(
     own_fwhm: f64,
     other_fwhm: f64,
     noise_native: f64,
+    c_stand_in: f64,
 ) -> Vec<Option<f64>> {
     let Some(map) = PixelMap::linear(Linear::identity()) else {
         tracing::error!("common set: the identity map has no inverse; no star matched");
@@ -769,7 +770,7 @@ fn common_signals(
             map: &map,
             fwhm_px: own_fwhm,
             noise: noise_native,
-            c_stand_in: 1.0,
+            c_stand_in,
         },
     )
     .into_iter()
@@ -806,7 +807,7 @@ pub(crate) fn common_psf_snr(
     noise_native: f64,
     field_fwhm: f64,
 ) -> Result<(f64, usize), usize> {
-    let signals = common_signals(fits, positions, origin, field_fwhm, field_fwhm, noise_native);
+    let signals = common_signals(fits, positions, origin, field_fwhm, field_fwhm, noise_native, 1.0);
     let n = signals.iter().flatten().count();
     if n < COMMON_MIN_STARS {
         return Err(n);
@@ -815,21 +816,59 @@ pub(crate) fn common_psf_snr(
     Ok((psf_signal::psf_snr(sum, noise_native), n))
 }
 
+/// The `c_stand_in` each side of the paired gain reads its signals with, `(master, sub)` (Plan D D1 r4, review r3 I1).
+/// A fit's `signal` carries its plane's aperture correction `c` when one was measured and none at floor (i)
+/// ([`ChannelMeasurement::at_floor`]: `c = 1` was applied). The two images of the pair must stand on ONE `c`, or the
+/// gain reads the ratio of two different ones: a best sub at floor (i) beside a master that kept `c_m` gave a gain
+/// high by `c_m` (hc11 G after the width rescue, x1.138 in the fixture). So a side at floor (i) takes the OTHER side's
+/// measured `c` ("measured alike", the paired gain's rule) - the other side's, not the group's Measure-time one: the
+/// master's `c` is read on resampled pixels with the re-read's own options. Warned, once per plane. With both sides
+/// measured, or both at floor, the stand-ins are 1 and the gain is what it was before r4; a pair cannot be made
+/// `c`-free (every healthy gain would move by `c_s / c_m`). A side with no fit at all is not at floor (i) and pairs
+/// nothing anyway.
+fn paired_c_stand_ins(
+    master: &ChannelMeasurement,
+    sub: &ChannelMeasurement,
+    plane: usize,
+    frame_id: i64,
+) -> (f64, f64) {
+    let take = |reason: &str, other_c: Option<f64>| -> f64 {
+        let Some(c) = other_c else { return 1.0 };
+        warn!(
+            plane,
+            frame_id,
+            c_stand_in = c,
+            reason,
+            "snr gain: a side of the pair has no aperture correction; it takes the other side's, so both stand on one c"
+        );
+        c
+    };
+    match (master.at_floor(), sub.at_floor()) {
+        (false, true) => (1.0, take("best sub at floor (i)", master.aperture_correction)),
+        (true, false) => (take("master at floor (i)", sub.aperture_correction), 1.0),
+        _ => (1.0, 1.0),
+    }
+}
+
 /// One plane's PSF SNRs on the stars matched and usable in BOTH crops (`rect` is the crop's place in the grid): the
 /// master's, the best sub's, and how many stars paired. `Err(paired)` under [`COMMON_MIN_STARS`] of them. The match
 /// radius reads the larger of the two crops' field FWHMs for both, as `match_member` reads the larger of the anchor's
-/// and the member's.
+/// and the member's. Both are on one aperture correction ([`paired_c_stand_ins`]); `plane` and `frame_id` (the best
+/// sub) name the pair in that warn.
 fn paired_common_snr(
     positions: &[(f64, f64)],
     rect: crate::stacking::crop::CropRect,
     master: &PlaneMeasurement,
     sub: &PlaneMeasurement,
+    plane: usize,
+    frame_id: i64,
 ) -> Result<(f64, f64, usize), usize> {
     let origin = (rect.x0, rect.y0);
     let inside = positions_in_crop(positions, origin, (rect.width, rect.height));
     let (mc, sc) = (&master.channel, &sub.channel);
-    let in_master = common_signals(&master.fits, &inside, origin, mc.fwhm_px, sc.fwhm_px, mc.noise);
-    let in_sub = common_signals(&sub.fits, &inside, origin, sc.fwhm_px, mc.fwhm_px, sc.noise);
+    let (master_c, sub_c) = paired_c_stand_ins(mc, sc, plane, frame_id);
+    let in_master = common_signals(&master.fits, &inside, origin, mc.fwhm_px, sc.fwhm_px, mc.noise, master_c);
+    let in_sub = common_signals(&sub.fits, &inside, origin, sc.fwhm_px, mc.fwhm_px, sc.noise, sub_c);
     let (mut master_sum, mut sub_sum, mut paired) = (0.0, 0.0, 0usize);
     for (m, s) in in_master.iter().zip(&in_sub) {
         if let (Some(m), Some(s)) = (m, s) {
@@ -1047,7 +1086,9 @@ fn paired_snr_gain(
             )
         })
     };
-    // The master keeps its own width estimate (no hint); the best sub is told the width it had at Measure.
+    // The master keeps its own width estimate (no hint). The best sub is handed the width it had at Measure as a RESCUE
+    // only (r3): its detection takes it when its own pass-1 width read fails (nothing read, the clamp floor, or under
+    // the hint's envelope floor) and otherwise reads its own, bit for bit as without a hint.
     let master_m = measure_pair(
         &|p| crop_plane(&master[p * plane_len..(p + 1) * plane_len], w, r),
         &[],
@@ -1064,7 +1105,7 @@ fn paired_snr_gain(
                 return 0.0;
             };
             let (master_snr, sub_snr, paired) =
-                match paired_common_snr(set, r, &m.measurement, &s.measurement) {
+                match paired_common_snr(set, r, &m.measurement, &s.measurement, p, best.frame_id) {
                     Ok(pair) => pair,
                     Err(paired) => {
                         warn!(
@@ -3210,16 +3251,10 @@ mod tests {
             .expect("a count")
     }
 
-    /// The best sub as the gain's re-read sees it (Plan D D1 r3): registered into the delivered grid and cropped by
-    /// [`registered_sub_crop`] - the very function `paired_snr_gain` uses, on `master` (a `gain_run` of the same
-    /// frames) - and measured Mixed with `hints` (empty = none). This is how a test reads the MEASURED OUTCOME of the
-    /// sub's pass-1 width: the detection's own log events come from the rayon pool's workers, and `capture_logs` /
-    /// `captured_logs` are thread-local, so they never reach a test's capture.
-    fn read_best_sub(
-        frames: &[StackFrame],
-        master: &GroupOutput,
-        hints: &[Option<f64>],
-    ) -> crate::stacking::measure::MeasuredPlane {
+    /// The two crops the gain's re-read measures (Plan D D1 r3): the best sub registered into the delivered grid and
+    /// cropped by [`registered_sub_crop`] - the very function `paired_snr_gain` uses, on `master` (a `gain_run` of the
+    /// same frames) - and the rectangle both share.
+    fn gain_crops(frames: &[StackFrame], master: &GroupOutput) -> (crate::stacking::crop::CropRect, Vec<Vec<f32>>) {
         let integration = IntegrationConfig::default();
         let normalization = NormalizationConfig::default();
         let input = GroupInput {
@@ -3240,7 +3275,7 @@ mod tests {
             common_stars: None,
         };
         let pool = pool();
-        let (rect, planes) = registered_sub_crop(
+        registered_sub_crop(
             &input,
             &frames[GAIN_BEST],
             &master.data,
@@ -3249,13 +3284,21 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap()
-        .expect("the sub and the master share a rectangle");
-        // As `integrate_group` hands `paired_snr_gain` its options (the master is always measured at All).
+        .expect("the sub and the master share a rectangle")
+    }
+
+    /// One crop of the gain's re-read measured Mixed with `hints` (empty = none), as `integrate_group` hands
+    /// `paired_snr_gain` its options (the master is always measured at All).
+    fn measure_gain_crop(
+        rect: crate::stacking::crop::CropRect,
+        plane: &[f32],
+        hints: &[Option<f64>],
+    ) -> crate::stacking::measure::MeasuredPlane {
         let measure = MeasureOptions {
             fit_stars: None,
             ..MeasureOptions::default()
         };
-        let mut read = pool.install(|| {
+        let mut read = pool().install(|| {
             measure_planes_with_width_hints(
                 1,
                 rect.width,
@@ -3267,11 +3310,32 @@ mod tests {
                 crate::star_measure::PixelNoise::Mixed,
                 None,
                 hints,
-                |p| Ok::<_, IntegrationError>(Cow::Owned(planes[p].clone())),
+                |_| Ok::<_, IntegrationError>(Cow::Borrowed(plane)),
             )
             .unwrap()
         });
         read.remove(0)
+    }
+
+    /// The best sub as the gain's re-read sees it (Plan D D1 r3): [`gain_crops`]' sub crop measured with `hints`. This
+    /// is how a test reads the MEASURED OUTCOME of the sub's pass-1 width: the detection's own log events come from the
+    /// rayon pool's workers, and `capture_logs` / `captured_logs` are thread-local, so they never reach a test's
+    /// capture.
+    fn read_best_sub(
+        frames: &[StackFrame],
+        master: &GroupOutput,
+        hints: &[Option<f64>],
+    ) -> crate::stacking::measure::MeasuredPlane {
+        let (rect, planes) = gain_crops(frames, master);
+        measure_gain_crop(rect, &planes[0], hints)
+    }
+
+    /// The master as the gain's re-read sees it (Plan D D1 r4): [`gain_crops`]' rectangle cut out of `master`, measured
+    /// with no hint - what `paired_snr_gain` reads, so a test reads the master's own aperture correction.
+    fn read_master_crop(frames: &[StackFrame], master: &GroupOutput) -> crate::stacking::measure::MeasuredPlane {
+        let (rect, _) = gain_crops(frames, master);
+        let crop = crate::stacking::crop::crop_plane(&master.data[..GAIN_W * GAIN_H], GAIN_W, rect);
+        measure_gain_crop(rect, &crop, &[])
     }
 
     /// The gain of `frames` with the best sub's Measure-time width set to `fwhm_px` (0.0 = a plane with no width: no
@@ -3406,23 +3470,39 @@ mod tests {
         assert!(measured_lines(&log).contains("width_hint_px="), "{log}");
         let (gain, clean) = (out.stats.snr_gain[0], clean_out.stats.snr_gain[0]);
 
-        // m2 (review r2): what the defects do to the gain beside the rescue, and how much. Expected: UP, by the
-        // aperture correction c the clean sub's fits carry and the defect sub's do not. The rescued read fits the 100
-        // defect blobs as stars beside the 30 real ones (130 fitted), the correction - a median over isolated point
-        // sources - then has fewer than 5 qualifying ratios (observed, not derived) and applies c = 1, so every
-        // star's signal is c = 1.13 short of the clean sub's. The sub's PSF SNR is (Σ signal / noise)^2, so it falls by
-        // c^2 and the gain, the square root of master / sub, rises by c. The noise estimate is not what moves (the
-        // two subs' noise agree within 0.1 %); the paired sets differ by a star (29 against 28), hence the band.
+        // m2 (review r2), I1 (review r3), r4: what the defects do to the gain beside the rescue. The rescued read fits
+        // the 100 defect blobs as stars beside the 30 real ones (130 fitted); the aperture correction - a median over
+        // isolated point sources - then has fewer than 5 qualifying ratios (observed, not derived), is None (floor
+        // (i)) and applies c = 1, so every star's signal is c short of the clean sub's. At r3 that read the sub's PSF
+        // SNR c^2 low and the gain c HIGH (x1.138): the two sides stood on different c. Since r4 the side at floor (i)
+        // takes the OTHER side's c (here the master's), so the gain differs from the clean one by the ratio of the
+        // clean sub's own c to that stand-in: c_s / c_m. The noise estimate is not what moves (the two subs' noise
+        // agree within 0.1 %).
         let c_clean = clean_told.measurement.channel.aperture_correction.expect("the clean sub has a correction");
         assert!(c_clean > 1.05 && c_clean < 1.25, "c {c_clean}");
         assert!(told.measurement.channel.stars_fitted > 100, "{} fitted", told.measurement.channel.stars_fitted);
         assert!(told.measurement.channel.aperture_correction.is_none(), "{:?}", told.measurement.channel.aperture_correction);
         let (noise_d, noise_c) = (told.measurement.channel.noise, clean_told.measurement.channel.noise);
         assert!((noise_d / noise_c - 1.0).abs() < 0.01, "noise {noise_d} vs {noise_c}");
+        // The master's own c, read on the crop as the gain reads it: the stand-in the floored sub takes (1 when the
+        // master is at floor too: both sides then read bare, and the clean sub's c is the whole difference).
+        let master_ch = read_master_crop(&frames, &out).measurement.channel;
+        let c_master = master_ch.aperture_correction;
+        assert!(!master_ch.at_floor(), "the premise: the master carries a correction, {master_ch:?}");
+        let c_m = c_master.unwrap_or(1.0);
+        assert!(told.measurement.channel.at_floor(), "the sub is at floor (i)");
+        assert!(
+            log.lines().any(|l| l.contains("WARN") && l.contains("best sub at floor (i)") && l.contains(&format!("c_stand_in={c_m}"))),
+            "the substitution is named: {log}"
+        );
+        // Tolerance +-5 %: the paired sets differ by a star between the two runs (29 against 28 of the 30), the c's are
+        // medians over up to 64 ratios with standard errors near 1 %, and the two masters' crops are not bit-equal.
+        // The r3 bias was x1.138 on a ratio expected at about 1: far outside it.
+        let expected = c_clean / c_m;
         let ratio = gain / clean;
         assert!(
-            ratio > 0.95 * c_clean && ratio < 1.05 * c_clean,
-            "gain {gain} against the clean {clean}: x{ratio}, c {c_clean}\n{}",
+            ratio > 0.95 * expected && ratio < 1.05 * expected,
+            "gain {gain} against the clean {clean}: x{ratio}, expected c_s {c_clean} / c_m {c_m} = {expected}\n{}",
             measured_lines(&log)
         );
     }
@@ -3712,6 +3792,90 @@ mod tests {
         // A narrower crop leaves the stars outside it out of the request.
         let narrow = positions_in_crop(&gain_set(), (150, 0), (120, GAIN_H));
         assert!(narrow.len() < 30 && narrow.iter().all(|p| p.0 >= 150.0 && p.0 < 270.0));
+    }
+
+    /// Plan D D1 r4 (review r3, I1): the paired gain reads both sides on ONE aperture correction. A fit's `signal`
+    /// carries its plane's `c` when one was measured and none at floor (i); a side at floor (i) takes the OTHER side's
+    /// measured `c` (the master's `c_m` for a floored sub, the sub's for a floored master), so `c` cancels in the ratio.
+    /// The four cases of (master, sub) x (measured, floor (i)), on one measured field read twice (the fits are the
+    /// same on both sides, so the figures differ by the stand-in alone): both measured and both at floor read bare,
+    /// bit for bit what `common_psf_snr` gives; one at floor reads (stand-in)^2 high.
+    #[test]
+    fn the_paired_common_snr_puts_both_sides_on_one_c() {
+        let stars: Vec<(f64, f64, f64)> = gain_set().iter().map(|&(x, y)| (x, y, 0.25)).collect();
+        let mut data = gaussian_field(GAIN_W, GAIN_H, &stars, 1.8, 0.08);
+        add_noise(&mut data, 0.01, 4244);
+        let base = measure_planes_diagnosed(
+            1,
+            GAIN_W,
+            GAIN_H,
+            &MeasureOptions::default(),
+            None,
+            SeedOverride::Fast,
+            false,
+            crate::star_measure::PixelNoise::Mixed,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(data.as_slice())),
+        )
+        .unwrap()
+        .remove(0)
+        .measurement;
+        assert!(base.channel.aperture_correction.is_some() && base.channel.stars_fitted >= 25);
+        let (own, n) = common_psf_snr(&base.fits, &gain_set(), (0, 0), base.channel.noise, base.channel.fwhm_px)
+            .expect("30 stars");
+        assert!(n >= 25);
+        let rect = crate::stacking::crop::CropRect::full(GAIN_W, GAIN_H);
+        // The same fits and noise, whatever `c` the channel is stamped with: the signals carry the module's own.
+        let side = |c: Option<f64>| {
+            let mut plane = base.clone();
+            plane.channel.aperture_correction = c;
+            plane
+        };
+        let read = |master_c: Option<f64>, sub_c: Option<f64>| {
+            let (read, log) = crate::stacking::telemetry::capture_logs(|| {
+                paired_common_snr(&gain_set(), rect, &side(master_c), &side(sub_c), 0, 7)
+            });
+            let (master, sub, paired) = read.expect("the stars pair");
+            assert_eq!(paired, n);
+            (master, sub, log)
+        };
+        let (c_m, c_s) = (1.2, 1.1);
+
+        // Both measured: each side's signals already carry its own c; nothing is substituted.
+        let (m, s, log) = read(Some(c_m), Some(c_s));
+        assert_eq!((m.to_bits(), s.to_bits()), (own.to_bits(), own.to_bits()));
+        assert!(!log.contains("c_stand_in"), "{log}");
+        // Both at floor (i): both read bare.
+        let (m, s, log) = read(None, None);
+        assert_eq!((m.to_bits(), s.to_bits()), (own.to_bits(), own.to_bits()));
+        assert!(!log.contains("c_stand_in"), "{log}");
+
+        // The sub at floor (i), the master measured at 1.2: the sub's signals are scaled by 1.2, so its PSF SNR by 1.44.
+        let (m, s, log) = read(Some(c_m), None);
+        assert_eq!(m.to_bits(), own.to_bits());
+        assert!((s / own - c_m * c_m).abs() < 1e-9, "sub {s} against {own}");
+        let warn = log
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("c_stand_in"))
+            .unwrap_or_else(|| panic!("no substitution warn: {log}"));
+        for want in ["plane=0", "frame_id=7", "c_stand_in=1.2", "best sub at floor (i)"] {
+            assert!(warn.contains(want), "{want}: {warn}");
+        }
+        // The master at floor (i), the sub measured at 1.1: the master's signals are scaled by 1.1.
+        let (m, s, log) = read(None, Some(c_s));
+        assert_eq!(s.to_bits(), own.to_bits());
+        assert!((m / own - c_s * c_s).abs() < 1e-9, "master {m} against {own}");
+        let warn = log
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("c_stand_in"))
+            .unwrap_or_else(|| panic!("no substitution warn: {log}"));
+        for want in ["plane=0", "frame_id=7", "c_stand_in=1.1", "master at floor (i)"] {
+            assert!(warn.contains(want), "{want}: {warn}");
+        }
+        // The gain: the same fits on both sides stood at 1 before r4 (no substitution). Now the floored sub's signals
+        // are lifted by the master's 1.2 - what a real floored sub (its fits c short) needs - so the gain is 1 / 1.2.
+        let (m, s, _) = read(Some(c_m), None);
+        assert!(((m / s).sqrt() - 1.0 / c_m).abs() < 1e-9);
     }
 
     const SHIFTED_EXPOSURES: [f64; 3] = [60.0, 90.0, 120.0];

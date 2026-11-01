@@ -1390,9 +1390,12 @@ fn detect_on(
                     (pool_field, pool_mode_px, None)
                 }
                 Some(reason) => {
+                    // A pool that read nothing has no width to report: its 3 px is the first pass's default (review
+                    // r3, n2), so the field is absent, as `mode_px` is.
+                    let pool_read_px = (pool_field.from_stars > 0).then_some(pool_field.fwhm_px);
                     debug!(
                         fwhm_px = hint_fwhm,
-                        pool_fwhm_px = pool_field.fwhm_px,
+                        pool_fwhm_px = pool_read_px,
                         from_stars = pool_field.from_stars,
                         width_hint_px = hint,
                         reason,
@@ -1400,7 +1403,7 @@ fn detect_on(
                     );
                     warn!(
                         fwhm_px = hint_fwhm,
-                        pool_fwhm_px = pool_field.fwhm_px,
+                        pool_fwhm_px = pool_read_px,
                         mode_px = pool_mode_px,
                         from_stars = pool_field.from_stars,
                         width_hint_px = hint,
@@ -3074,6 +3077,17 @@ mod tests {
         let (out, logs) = detect_hinted_logged(&scaled, (w, h), Some(4.0));
         assert_eq!((out.1.fwhm_px, out.1.from_stars), (4.0, 0));
         assert!(logs.contains("reason=\"no_read\""), "{logs}");
+        // Review r3, n2: the pool's 3 px is the first pass's default, not a read, so the lines do not report it as one.
+        for line in logs.lines().filter(|l| l.contains("reason=\"no_read\"")) {
+            assert!(!line.contains("pool_fwhm_px="), "{line}");
+        }
+        assert_eq!(
+            logs.lines()
+                .filter(|l| l.contains("reason=\"no_read\""))
+                .count(),
+            2,
+            "{logs}"
+        );
     }
 
     /// Plan D D1 r3 (review r2, m3): a hint that is no star width is refused with a `warn!` that names it and the plane's
