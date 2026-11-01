@@ -917,9 +917,10 @@ fn the_floor_drops_registered_frames_and_an_auto_reference_under_it() {
     let log = h.to_register();
     assert_eq!(h.rc.reference_frame_id, Some(h.ids[5]), "the reference does not move");
     let w = h.weights();
-    // After the reweigh: 1.0, 0.53, 0.50, ~0.85, 0.46, 0.14 (the soft sub, the reference). The cut at 0.6 has a clear
-    // gap on both sides.
-    let (kept, dropped) = (0.6 + 0.1, 0.6 - 0.05);
+    // After the reweigh: 1.0, 0.53, 0.50, ~0.85, 0.46, 0.14 (the soft sub, the reference). The property is the cut
+    // itself: a kept frame is clear of 0.6, a dropped one is under it (and says so in its reason below), whatever the
+    // model's small drift does to the margin.
+    let (kept, cut) = (0.6 + 0.1, 0.6);
     for i in [0, 3] {
         assert!(h.entry(h.ids[i]).included, "sub {i}: {w:?}");
         assert!(w[i].unwrap() > kept, "sub {i}: {w:?}");
@@ -927,7 +928,7 @@ fn the_floor_drops_registered_frames_and_an_auto_reference_under_it() {
     for i in [1, 2, 4, 5] {
         let e = h.entry(h.ids[i]);
         assert!(!e.included, "sub {i}: {w:?}");
-        assert!(w[i].unwrap() < dropped, "sub {i}: {w:?}");
+        assert!(w[i].unwrap() < cut, "sub {i}: {w:?}");
         let reason = e.reason.clone().unwrap();
         assert!(reason.contains("below 0.60 of the group maximum"), "{reason}");
         assert!(matches!(
@@ -1244,6 +1245,106 @@ fn frames_under_the_measure_time_floor_do_not_move_the_two_pass_reference() {
         let e = h.entry(id);
         assert!(matches!(e.registration, Some(RegisteredFrameOutcome::Aligned { .. })), "{id}");
         assert!(e.measure_floored, "{id}");
+    }
+}
+
+/// D1w r2 m1, single group: a colour group can have EVERY included frame under the Measure-time floor (each plane is
+/// normalized on its own maximum, which sits on a different frame, so no frame is near 1 on all planes and a
+/// `min_weight_fraction` over 1/planes floors them all). The group is viable but offers no reference pick: stage 4 says
+/// that, not "no included frame". The flag is set by hand here (the state stage 3 leaves), because a fixture that floors
+/// every frame of a group on real per-plane maxima is a field study of its own.
+#[test]
+fn a_group_with_every_frame_under_the_measure_time_floor_names_its_stop() {
+    let mut h = harness_with(
+        StackingConfig::default(),
+        &field(32, 600.0),
+        &MAIN_SUBS[..3],
+        Some("RGGB"),
+    );
+    h.to_measure();
+    let key = h.key();
+    assert_eq!(h.rc.measured[&key].len(), 3);
+    for e in h.rc.measured.get_mut(&key).unwrap() {
+        assert!(e.included, "premise: stage 3 included it");
+        e.measure_floored = true;
+    }
+    let err = stage_reference(&mut h.rc).unwrap_err();
+    let RunError::Other(msg) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        msg.contains("no group has a frame above the weight floor to pick a reference from"),
+        "{msg}"
+    );
+    assert!(!msg.contains("any included frame"), "{msg}");
+
+    // The true no-included case keeps its wording.
+    for e in h.rc.measured.get_mut(&key).unwrap() {
+        e.included = false;
+        e.measure_floored = false;
+    }
+    let err = stage_reference(&mut h.rc).unwrap_err();
+    assert!(
+        matches!(&err, RunError::Other(m) if m == "no group has any included frame"),
+        "{err:?}"
+    );
+}
+
+/// D1w r2 m1, native geometry on a frame set: group B holds three frames and every one is under the Measure-time floor,
+/// so no pick can see it. It takes the run geometry (group A's reference) like a project group with no WCS candidate,
+/// registers onto it, and has nothing to switch to: no two-pass dry pass runs for it, so the "no alignment for the
+/// reference itself" warn (a dry pass on a reference the group does not hold) never fires.
+#[test]
+fn a_native_group_with_every_frame_under_the_floor_borrows_the_run_geometry_without_a_dry_pass() {
+    let sound = Placed::new(Sub { fwhm: 2.4, t: 1.0 });
+    let subs = [
+        sound.through("A"),
+        sound.through("A"),
+        sound.through("A"),
+        sound.through("A"),
+        sound.through("B"),
+        sound.through("B"),
+        sound.through("B"),
+    ];
+    let mut cfg = StackingConfig::default();
+    cfg.registration.geometry = RegistrationGeometry::Native;
+    assert!(cfg.reference.two_pass, "the default must be on");
+    let mut h = harness_placed(cfg, &field(32, 1500.0), &subs, None);
+    assert_eq!(h.rc.plan_groups.len(), 2);
+    h.to_measure();
+    let key_of = |h: &Harness, id: i64| {
+        h.rc.plan_groups
+            .iter()
+            .find(|g| g.frames.iter().any(|f| f.frame_id == id))
+            .unwrap()
+            .key
+            .clone()
+    };
+    let (key_a, key_b) = (key_of(&h, h.ids[0]), key_of(&h, h.ids[4]));
+    for e in h.rc.measured.get_mut(&key_b).unwrap() {
+        assert!(e.included, "premise: stage 3 included it");
+        e.measure_floored = true;
+    }
+
+    let (_, log) = capture_logs(|| finish_register(&mut h.rc));
+    let reference = h.rc.reference_frame_id.expect("a reference");
+    assert!(
+        h.rc.measured[&key_a].iter().any(|e| e.frame.frame_id == reference),
+        "the reference is in group A: the only group the pick can see"
+    );
+    assert_eq!(
+        h.rc.geometry_of(&key_b).reference_frame_id,
+        reference,
+        "group B borrows the run geometry"
+    );
+    assert!(!log.contains("produced no alignment for the reference itself"), "{log}");
+    assert!(h.rc.warnings.iter().all(|w| !w.contains("two-pass")), "{:?}", h.rc.warnings);
+    assert!(group_can_switch(&h.rc, &key_a, reference));
+    assert!(!group_can_switch(&h.rc, &key_b, reference));
+    for &id in &h.ids[4..] {
+        let e = h.entry(id);
+        assert!(e.included, "{id}");
+        assert!(matches!(e.registration, Some(RegisteredFrameOutcome::Aligned { .. })), "{id}");
     }
 }
 

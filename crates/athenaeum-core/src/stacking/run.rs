@@ -7009,9 +7009,14 @@ fn measured_geometry(rc: &RunContext, frame_id: i64) -> (usize, usize) {
 /// reference this stage just resolved — which is exactly M1–M4a's
 /// behaviour written down; `native` gives each group its own: the manual
 /// reference for ITS OWN group (a pin applies nowhere else), the group's
-/// best-weighted included member everywhere else. A group with no included
-/// member at all (it never registers or integrates) falls back to the
-/// run-wide entry so [`RunContext::geometry_of`] stays total.
+/// best-weighted included member everywhere else. A group the pick cannot
+/// see a frame in falls back to the run-wide entry, so
+/// [`RunContext::geometry_of`] stays total: with no included member at all it
+/// never registers or integrates; with included members that are ALL under
+/// the Measure-time floor the PSF modes defer (PD-18; an OSC group, whose
+/// planes peak on different frames) it is still viable, so it registers onto
+/// the run reference in the run's geometry, as a project group with no WCS
+/// candidate does, and runs no two-pass dry pass ([`group_can_switch`]).
 ///
 /// Width/height here are the reference's MEASURED geometry; stage 5
 /// refreshes them from that reference's own `reference_stars` read, which
@@ -7239,6 +7244,9 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
         ReferenceMode::Auto => {
             let mut best_group: Option<&IntegrationGroup> = None;
             let mut best_included = 0usize;
+            // Whether any group holds an included frame at all: with none the stop is "nothing included", with some it
+            // is "nothing the pick may see" (every included frame under the deferred Measure-time floor, PD-18).
+            let mut any_included = false;
             // A project's reference comes from a group that will be
             // integrated (>= 3 included) when one holds a candidate, else
             // from any group that does (plan 6b-2 C15). A frame set has one
@@ -7263,6 +7271,7 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                             )
                         })
                         .unwrap_or((0, 0));
+                    any_included |= included > 0;
                     if pickable == 0 || (integrated_only && included < 3) {
                         continue;
                     }
@@ -7300,7 +7309,12 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                 }
                 None => {
                     return Err(RunError::Other(
-                        "no group has any included frame".to_string(),
+                        if any_included {
+                            "no group has a frame above the weight floor to pick a reference from"
+                        } else {
+                            "no group has any included frame"
+                        }
+                        .to_string(),
                     ))
                 }
             };
@@ -9090,22 +9104,24 @@ fn group_two_pass_wanted(
 }
 
 /// Whether a group's two-pass re-pick can move anything (plan 6b-2 C15).
-/// Without a WCS rule (a frame set) it always can, as before. On a project
-/// run only a WCS candidate may win, so a group that holds no included
-/// candidate other than its current reference has nothing to switch to, and
-/// a dry pass (on a borrowed foreign reference, for a group with no
-/// candidate) would only cost time and log a false warning. A candidate under
-/// the Measure-time floor is not one (PD-18); the group's viability (>= 3
-/// included) is the caller's, on `included`.
+/// The re-pick can only land on a frame the pick may see
+/// ([`MeasuredFrame::in_reference_pick`], PD-18) other than the current
+/// reference, and on a project run only a WCS candidate may win. A group
+/// holding no such frame has nothing to switch to, and a dry pass would only
+/// cost time: for a group that borrows a foreign reference (a project group
+/// with no candidate, a frame-set group whose every included frame is under
+/// the Measure-time floor) it would also log a false "no alignment for the
+/// reference itself" warning. The group's viability (>= 3 included) is the
+/// caller's, on `included`.
 fn group_can_switch(rc: &RunContext, key: &str, reference_frame_id: i64) -> bool {
-    let Some(rule) = &rc.wcs_rule else {
-        return true;
-    };
     rc.measured.get(key).is_some_and(|v| {
         v.iter().any(|e| {
             e.in_reference_pick()
                 && e.frame.frame_id != reference_frame_id
-                && rule.candidates.contains(&e.frame.frame_id)
+                && rc
+                    .wcs_rule
+                    .as_ref()
+                    .is_none_or(|rule| rule.candidates.contains(&e.frame.frame_id))
         })
     })
 }
