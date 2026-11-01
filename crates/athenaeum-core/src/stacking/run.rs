@@ -11593,6 +11593,8 @@ fn process_group_output(
         second_pass_bitmaps: false,
         coverage_map: false,
         stats_on_covered: false,
+        // Plan D D1b: this `input` only reaches the LN pass, which reads no statistics - the real one below carries the set.
+        common_stars: None,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -11856,6 +11858,8 @@ fn process_group_output(
         }
     }
 
+    // Plan D D1b: the set is cloned out of `rc` (a few KB) so `input` holds no borrow of it.
+    let common_stars = rc.common_stars.get(&group.key).cloned();
     // `input` borrowed the STACK_FRAMES built above; when the LN pass
     // narrowed `members` (and rebuilt `stack_frames`), that borrow must be
     // dropped and rebuilt before anything below reads it — always rebuilding
@@ -11886,6 +11890,8 @@ fn process_group_output(
         second_pass_bitmaps: bitmaps_for_drizzle,
         coverage_map: rc.config.output.coverage_map || rc.config.output.crop_to_coverage > 0,
         stats_on_covered: rc.grid.is_some(),
+        // Plan D D1b: the master PSF SNR and the SNR gain read the group's frame-common star set (`reweigh_groups`).
+        common_stars: common_stars.as_deref(),
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
@@ -27653,7 +27659,43 @@ mod tests {
         let on_rect =
             crate::stacking::measure::measure_plane(&sub, rect.width, rect.height, &opts, None);
         assert_eq!(stats.master_noise[0].to_bits(), on_rect.noise.to_bits());
-        assert_eq!(stats.master_psf_snr[0].to_bits(), on_rect.psf_snr.to_bits());
+        // Plan D D1b: the stored PSF SNR is read over the group's frame-common stars (the set `reweigh_groups`
+        // recorded) matched in that crop, at the crop's own origin - not over every star of the crop, as it was.
+        let set = rc.common_stars.get(&group.key).and_then(|s| s[0].as_deref());
+        let set = set.expect("the reweigh recorded the group's frame-common set");
+        let measured = crate::stacking::measure::measure_planes_diagnosed(
+            1,
+            rect.width,
+            rect.height,
+            &opts,
+            None,
+            crate::stacking::measure::SeedOverride::Fast,
+            false,
+            crate::star_measure::PixelNoise::Mixed,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(std::borrow::Cow::Borrowed(sub.as_slice())),
+        )
+        .unwrap();
+        let (ch, fits) = (&measured[0].measurement.channel, &measured[0].measurement.fits);
+        assert_eq!(ch.noise.to_bits(), on_rect.noise.to_bits());
+        let origin = (rect.x0, rect.y0);
+        let inside =
+            crate::stacking::integrate::positions_in_crop(set, origin, (rect.width, rect.height));
+        let (on_set, paired) = crate::stacking::integrate::common_psf_snr(
+            fits,
+            &inside,
+            origin,
+            ch.noise,
+            ch.fwhm_px,
+        )
+        .expect("the set pairs in the crop");
+        assert!(paired >= 20, "{paired}");
+        assert_eq!(stats.master_psf_snr[0].to_bits(), on_set.to_bits());
+        assert_ne!(
+            on_set.to_bits(),
+            on_rect.psf_snr.to_bits(),
+            "the set is a part of the crop's stars"
+        );
         let whole = crate::stacking::measure::measure_plane(&plane, w, h, &opts, None);
         assert!(
             whole.noise.to_bits() != on_rect.noise.to_bits()

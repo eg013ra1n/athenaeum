@@ -1274,3 +1274,33 @@ fn a_cancel_lands_between_the_members_of_one_groups_reweigh() {
     let err = plane_outcome(&h.rc, &key, entries, &members, 0, 0).err().expect("a cancelled run");
     assert!(matches!(err, RunError::Cancelled), "{err:?}");
 }
+
+/// D1b: `stage_output` hands `integrate_group` the set `reweigh_groups` recorded for the group, so the group's SNR gain
+/// is measured on it (version 2); the same group with its record dropped reads no gain, with the warn that names why.
+#[test]
+fn the_output_stage_measures_the_gain_on_the_recorded_common_set() {
+    let mut gains = Vec::new();
+    for keep_set in [true, false] {
+        let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS[..5]);
+        h.to_measure();
+        h.to_register();
+        let key = h.key();
+        let set = h.rc.common_stars.get(&key).expect("the reweigh recorded the group's set");
+        assert_eq!(set.len(), 1);
+        assert!(set[0].as_ref().is_some_and(|s| s.len() >= 20), "{set:?}");
+        if !keep_set {
+            h.rc.common_stars.clear();
+        }
+        let (res, log) = capture_logs(|| stage_output(&mut h.rc));
+        res.unwrap();
+        let group = h.rc.summary.groups.iter().find(|g| g.key == key).expect("the group's summary");
+        let stats = group.stats.as_ref().expect("the group's stats");
+        assert_eq!(stats.snr_gain_version, 2);
+        if !keep_set {
+            assert!(log.contains("snr_gain not measured") && log.contains("no positions"), "{log}");
+        }
+        gains.push(stats.snr_gain.clone());
+    }
+    assert!(gains[0].len() == 1 && gains[0][0] > 1.0 && gains[0][0].is_finite(), "{gains:?}");
+    assert_eq!(gains[1], vec![0.0]);
+}

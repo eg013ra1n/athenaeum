@@ -691,7 +691,13 @@ masterNoise: Array<number>, masterLocation: Array<number>, masterScale: Array<nu
 /**
  * Per plane, of the included frame with the highest `weight.normalized_mean`.
  */
-bestSubNoise: Array<number>, masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>, 
+bestSubNoise: Array<number>, 
+/**
+ * The master's PSF SNR per plane: over the group's frame-common star set when it has one (Plan D D1b, the stars the
+ * master matches), else over every star of the master. `best_sub_psf_snr` is the best sub's own `psf_snr` - the
+ * common-set value after the reweigh (D1w), else its Measure-time one.
+ */
+masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>, 
 /**
  * How many times the master's star SNR beats the best sub's, per
  * plane — an SNR (amplitude) factor, `√(PSF SNR master / PSF SNR best
@@ -702,17 +708,24 @@ bestSubNoise: Array<number>, masterPsfSnr: Array<number>, bestSubPsfSnr: Array<n
  * interpolation lowers a warped image's noise, so a raw sub against
  * the master over-states the gain (2026-10-25: set 109 read 751.98×
  * and 777.33× for 208 and 160 frames; the ratio was a power ratio of a
- * warped master over a raw sub). They are not `master_psf_snr` /
- * `best_sub_psf_snr` above, which stay each image's own measurement.
- * `0.0` (with a warn) when the pair cannot be measured.
+ * warped master over a raw sub). Since v2 (Plan D D1b) TFlux is summed
+ * over the group's frame-common star set only, and only the stars matched
+ * and usable in BOTH images: a bright clipped star, or a wider PSF's
+ * extra flux, no longer moves the figure. They are not
+ * `master_psf_snr` / `best_sub_psf_snr` above, which stay each image's
+ * own measurement. `0.0` (with a warn naming its reason) when the pair
+ * cannot be measured: no frame-common star set for the plane, or fewer
+ * than [`COMMON_MIN_STARS`] stars paired.
  */
 snrGain: Array<number>, 
 /**
  * Which formula [`Self::snr_gain`] was measured with:
- * [`SNR_GAIN_VERSION`] for the paired SNR factor above. A stats document
- * stored before v0.7.0 has no such key and reads `0`: its `snr_gain` is
- * the old unpaired power ratio (set 109's 751.98×), so the Results panel
- * shows "—" for it instead of passing it off as the same metric.
+ * [`SNR_GAIN_VERSION`] for the paired SNR factor above (`1` = over every
+ * star of the two images, v0.7.0; `2` = over the frame-common star set).
+ * A stats document stored before v0.7.0 has no such key and reads `0`: its
+ * `snr_gain` is the old unpaired power ratio (set 109's 751.98×), so the
+ * Results panel shows "—" for it instead of passing it off as the same
+ * metric; a `1` shows "—" too, "measured with an older formula".
  */
 snrGainVersion: number, masterFwhmPx: Array<number>, masterEccentricity: Array<number>, 
 /**
