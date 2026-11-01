@@ -8552,13 +8552,14 @@ mod tests {
         // 2026-10-23 Plan B B4 (PB-14): MEASURE_VERSION 5 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-24 Plan C R-PC-10 (the Blend refusal): MEASURE_VERSION 6 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-10-25 Plan C R-PC-10b (the Blend refusal on the Analysis path only): MEASURE_VERSION 7 (6 is burnt) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
+        // 2026-11-01 pcores Task 1 (OD-1a, OD-3): `normalization.rejection` defaults to `local`, fastPreview pins `scaleZeroOffset` - ln_ref, ln and ln_cal move on default, maximumQuality and custom (the normalization subtree folds the whole block); calib, meas and reg do NOT move on any line, and the fastPreview line is UNCHANGED.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=93c65ea07388f9ec ln_ref=aff429c43dcfed70 ln=affdd0e2d03f312e ln_cal=dc6eb80c40566822",
+                "default: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=93c65ea07388f9ec ln_ref=b21a437fe852d9e8 ln=eabd47b2de3f9b5f ln_cal=c235ad1f6d43337f",
                 "fastPreview: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=529c0fc0ef53468e ln_ref=aff429c43dcfed70 ln=681b1c1ce68acb23 ln_cal=dc6eb80c40566822",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=40a78afaaecb67fb ln_ref=f4bc014c4d50642f ln=204d6c10b503fdde ln_cal=9d19e1d00d1d1701",
-                "custom: calib=2b725e5e99c87f49 meas=eede4c78d0df187b reg=d218f72dbbd4563a ln_ref=f4bc014c4d50642f ln=903548a039a9babd ln_cal=9d19e1d00d1d1701",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=40a78afaaecb67fb ln_ref=63f6592190cf4f11 ln=5f8fadd0aa9891b5 ln_cal=8bf7d47256f4c779",
+                "custom: calib=2b725e5e99c87f49 meas=eede4c78d0df187b reg=d218f72dbbd4563a ln_ref=63f6592190cf4f11 ln=d54197b46be41801 ln_cal=8bf7d47256f4c779",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8629,7 +8630,8 @@ mod tests {
         let (meas, reg, ln) = line(&at_max);
         assert_eq!(meas, "daf887f63aba01de");
         assert_eq!(reg, "93c65ea07388f9ec");
-        assert_eq!(ln, "affdd0e2d03f312e");
+        // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
+        assert_eq!(ln, "eabd47b2de3f9b5f");
     }
 
     #[test]

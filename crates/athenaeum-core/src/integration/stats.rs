@@ -244,13 +244,26 @@ pub enum OutputNormalization {
 
 /// Rejection normalization modes (math reference §3.3); `Local` carries
 /// per-frame grids instead of a pair (M2).
+///
+/// **The default is `Local`** (owner ruling 2026-11-01, OD-1a). `ScaleZeroOffset`
+/// scales each frame by its background dispersion, a per-frame scale error of
+/// 10-20 % against the frame's star flux; where seeing varies from frame to
+/// frame the Linear fit clip then cuts the sharpest frames' star cores (-29 %
+/// star peak measured on the LDN1272 project master, hc11 G 0.975 of its
+/// inputs' peak). `Local` normalizes by the star flux pair instead, and costs
+/// the Normalize stage even when local *output* normalization is off. The
+/// stored documents that still carry the old default are rewritten once by
+/// `db::schema::migrate_rejection_normalization_local`; the Fast preview pins
+/// `ScaleZeroOffset` (no Normalize stage, a preview's promise is speed).
+/// Diagnosis: `docs/superpowers/research/2026-11-01-project-master-star-cores.md`;
+/// the plan: `docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum RejectionNormalization {
     None,
-    #[default]
     ScaleZeroOffset,
     EqualizeFluxes,
+    #[default]
     Local,
 }
 
@@ -603,9 +616,10 @@ mod tests {
             OutputNormalization::default(),
             OutputNormalization::AdditiveWithScaling
         );
+        // Owner ruling 2026-11-01 (OD-1a): the shipped default is `local`.
         assert_eq!(
             RejectionNormalization::default(),
-            RejectionNormalization::ScaleZeroOffset
+            RejectionNormalization::Local
         );
     }
 }
