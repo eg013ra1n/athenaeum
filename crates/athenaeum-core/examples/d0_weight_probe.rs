@@ -7,6 +7,11 @@
 //!       [--threads N] [--tag <name>] <file>...
 //!
 //! Writes `<out-dir>/frames.jsonl` (appends one line per plane) and `<out-dir>/stars/<stem>.p<k>.tsv`.
+//!
+//!   d0_weight_probe common --dumps <D0 probe dir> --clone <C10 clone dir> [--out-dir <dir>]
+//!
+//! (Plan D D1a) judges the product's frame-common star set against D0's offline set (b) on those dumps; see the `common`
+//! module below.
 //! Energies are the module's ADU units (x 65535 of the [0, 1] domain), as `StarFit` holds them.
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::stacking::config::StackingConfig;
@@ -74,7 +79,11 @@ fn fixed_aperture(data: &[f32], w: usize, h: usize, f: &StarFit, r: f64) -> f64 
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("common") {
+        return common::run(&argv[1..]);
+    }
+    let mut args = argv.into_iter();
     let (mut config, mut betas, mut out_dir, mut ap_r, mut threads, mut tag) =
         (None::<PathBuf>, Vec::<f64>::new(), None::<PathBuf>, 0.0f64, 4usize, String::new());
     let mut files: Vec<PathBuf> = Vec::new();
@@ -255,5 +264,870 @@ fn main() {
             o.flush().unwrap_or_else(|e| die(format!("write: {e}")));
         }
         eprintln!("d0_weight_probe: {} {} ms", stem, t0.elapsed().as_millis());
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// The `common` arm (Plan D, D1a): the product's frame-common star set (`stacking::common_set`) against D0's offline set
+// (b), on D0's per-star dumps and the C10 clones' stored registration.
+//
+//   d0_weight_probe common --dumps <D0 probe dir> --clone <C10 clone dir> [--out-dir <dir>] [--proxy-floor <snr>]
+//
+// `--proxy-floor` (default 20, the module's CORRECTION_MIN_SNR) post-filters the candidates to those whose proxy SNR reaches
+// it: the what-if for "a higher proxy floor", never the gate. Reads (read only): `<dumps>/frames.jsonl` + `<dumps>/stars/<stem>.p<k>.tsv` (D0's rows: x, y, signal, area, snr, flags,
+// apFixed) and `<clone>/athenaeum.db` through `immutable=1` (the last run's frames, calibrated artifacts, registration).
+// Prints, per group-plane and group, the `D1A` lines `star-lab/bin/pland_bars.py d1a` judges, then free-form lines
+// (`plane-info`, `frame`, `replay`) that no judge reads. A dump measured at another beta than the clone's group beta (the
+// beta 3.07 subset) is judged by its `beta307` line only: the clone's stored numbers are not its numbers.
+//
+// Members are the clone run's included frames that carry a registration map and a dump row for every plane. Ranks are over
+// those members only, 1 = top weight, ties averaged; the sharpest decile is round(0.1 n) frames (at least 1, ties to even as
+// D0's Python rounded: 105 frames give 10) by mean FWHM. D0's (b) is recomputed here on the same members (reference anchor, dump SNR >= 20, isolation 2 R of the
+// dump's aperture radius, extended flag ignored, ratios over every matched star), not read from D0's tables.
+mod common {
+    use athenaeum_core::geometry::{KdTree2, PixelMap};
+    use athenaeum_core::stacking::common_set::{self, Candidate, CommonOutcome, MemberPlane};
+    use athenaeum_core::stacking::measure::ADU_SCALE;
+    use athenaeum_core::stacking::psf_signal::psf_signal_weight;
+    use athenaeum_core::star_measure::{StarFit, StarFlags};
+    use rusqlite::{Connection, OpenFlags};
+    use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+
+    const ADU: f64 = ADU_SCALE as f64;
+    const SAT: u8 = 1;
+    /// D0's SNR floor of (b), the dump's own SNR column.
+    const B_MIN_SNR: f64 = 20.0;
+    /// hc11 L's eight C10 r1 frames and the tflux ratio C10 r1 gave each (lab `c10-r1-v6` weights.txt), as D0's replay.
+    const C10_TARGET: [(i64, f64); 8] = [
+        (69705, 0.7511),
+        (69859, 0.7718),
+        (69860, 0.6857),
+        (69865, 0.6947),
+        (69947, 0.6909),
+        (69949, 0.7225),
+        (69976, 0.6861),
+        (70072, 0.7623),
+    ];
+    const C10_DS: &str = "hc11";
+    const C10_GROUP: &str = "mono__L__bin1__180s";
+
+    fn die(msg: impl std::fmt::Display) -> ! {
+        eprintln!("d0_weight_probe common: {msg}");
+        std::process::exit(1)
+    }
+
+    // ---------------------------------------------------------------------------------------------- the dump
+
+    /// One (frame, plane) of D0's dump: the channel numbers the weight reads and the plane's fits.
+    struct DumpPlane {
+        base: String,
+        beta: f64,
+        ap_radius: f64,
+        fwhm: f64,
+        noise: f64,
+        m_star: f64,
+        unsaturated: usize,
+        psf_signal_weight: f64,
+        fits: Vec<StarFit>,
+        ap_fixed: Vec<f64>,
+    }
+
+    /// `(ds, group)` -> plane -> file path -> the plane.
+    type Dump = BTreeMap<(String, String), BTreeMap<usize, BTreeMap<String, DumpPlane>>>;
+
+    fn num(v: &Value, key: &str) -> f64 {
+        v.get(key).and_then(Value::as_f64).unwrap_or(f64::NAN)
+    }
+
+    fn read_stars(path: &Path) -> (Vec<StarFit>, Vec<f64>) {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+        let mut lines = text.lines();
+        let header: Vec<&str> = lines.next().unwrap_or_else(|| die(format!("{}: empty", path.display()))).split('\t').collect();
+        let col = |name: &str| header.iter().position(|h| *h == name).unwrap_or_else(|| die(format!("{}: no column {name}", path.display())));
+        let (cx, cy, cs, ca, cn, cf, cap) = (col("x"), col("y"), col("signal"), col("area"), col("snr"), col("flags"), col("apFixed"));
+        let mut fits = Vec::new();
+        let mut ap = Vec::new();
+        for (n, line) in lines.enumerate() {
+            let f: Vec<&str> = line.split('\t').collect();
+            let get = |c: usize| -> f64 { f.get(c).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN) };
+            if f.len() <= cap {
+                die(format!("{}: line {} has {} columns", path.display(), n + 2, f.len()));
+            }
+            let flags = f[cf].parse::<u8>().unwrap_or_else(|_| die(format!("{}: line {}: flags {:?}", path.display(), n + 2, f[cf])));
+            fits.push(StarFit {
+                x: get(cx),
+                y: get(cy),
+                background: 0.0,
+                amplitude: f64::NAN,
+                fwhm_x: f64::NAN,
+                fwhm_y: f64::NAN,
+                fwtm_x: f64::NAN,
+                fwtm_y: f64::NAN,
+                theta: 0.0,
+                beta: f64::NAN,
+                residual: f64::NAN,
+                signal: get(cs) * ADU,
+                area: get(ca),
+                peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
+                snr: get(cn),
+                hfr: f64::NAN,
+                flags: StarFlags(flags),
+            });
+            ap.push(get(cap));
+        }
+        (fits, ap)
+    }
+
+    fn load_dump(dir: &Path) -> Dump {
+        let text = std::fs::read_to_string(dir.join("frames.jsonl")).unwrap_or_else(|e| die(format!("{}/frames.jsonl: {e}", dir.display())));
+        let mut dump = Dump::new();
+        for (n, line) in text.lines().enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap_or_else(|e| die(format!("frames.jsonl line {}: {e}", n + 1)));
+            let tag = v["tag"].as_str().unwrap_or_else(|| die(format!("frames.jsonl line {}: no tag", n + 1)));
+            let (ds, group) = tag.split_once(':').unwrap_or_else(|| die(format!("frames.jsonl line {}: tag {tag:?} is not ds:group", n + 1)));
+            let plane = v["plane"].as_u64().unwrap_or_else(|| die("frames.jsonl: no plane")) as usize;
+            let file = v["file"].as_str().unwrap_or_else(|| die("frames.jsonl: no file")).to_string();
+            let stem = v["stem"].as_str().unwrap_or_else(|| die("frames.jsonl: no stem"));
+            let ch = &v["channel"];
+            let (fits, ap_fixed) = read_stars(&dir.join("stars").join(format!("{stem}.p{plane}.tsv")));
+            let base = Path::new(&file).file_name().and_then(|s| s.to_str()).unwrap_or(&file).to_string();
+            let p = DumpPlane {
+                base,
+                beta: num(&v, "beta"),
+                ap_radius: num(&v, "apRadius"),
+                fwhm: num(ch, "fwhmPx"),
+                noise: num(ch, "noise"),
+                m_star: num(ch, "mStar"),
+                unsaturated: ch.get("starsUnsaturated").and_then(Value::as_u64).unwrap_or(0) as usize,
+                psf_signal_weight: num(ch, "psfSignalWeight"),
+                fits,
+                ap_fixed,
+            };
+            dump.entry((ds.to_string(), group.to_string())).or_default().entry(plane).or_default().insert(file, p);
+        }
+        dump
+    }
+
+    // ---------------------------------------------------------------------------------------------- the clone
+
+    struct CloneFrame {
+        key: i64,
+        included: bool,
+        c_group: Vec<Option<f64>>,
+        group_beta: Option<f64>,
+    }
+
+    struct Reg {
+        reference: Option<i64>,
+        map: Option<PixelMap>,
+    }
+
+    struct CloneDb {
+        /// `(group key, calibrated file name)` -> index into `frames`.
+        by_file: HashMap<(String, String), usize>,
+        frames: Vec<CloneFrame>,
+        regs: HashMap<i64, Reg>,
+    }
+
+    fn load_clone(dir: &Path) -> CloneDb {
+        let db = dir.join("athenaeum.db");
+        let uri = format!("file:{}?immutable=1", db.display());
+        let con = Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
+            .unwrap_or_else(|e| die(format!("{}: {e}", db.display())));
+        let (run, set, project): (i64, Option<i64>, Option<String>) = con
+            .query_row("select id, frames_set_id, project_id from stacking_runs order by id desc limit 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap_or_else(|e| die(format!("{}: no stacking run: {e}", db.display())));
+        let key = if project.is_some() { "project_frame" } else { "frame_id" };
+        eprintln!("d0_weight_probe common: clone {} run {run} ({})", dir.display(), if project.is_some() { "project" } else { "set" });
+        let mut frames = Vec::new();
+        let mut index: HashMap<(i64, String), usize> = HashMap::new();
+        {
+            let sql = format!(
+                "select rf.{key}, g.group_key, rf.included, rf.metrics_json, g.beta from stacking_run_frames rf \
+                 join stacking_run_groups g on g.id = rf.group_id where rf.run_id = ?1"
+            );
+            let mut st = con.prepare(&sql).unwrap_or_else(|e| die(format!("prepare frames: {e}")));
+            let rows = st
+                .query_map([run], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<f64>>(4)?))
+                })
+                .unwrap_or_else(|e| die(format!("query frames: {e}")));
+            for row in rows {
+                let (k, group, included, metrics, beta) = row.unwrap_or_else(|e| die(format!("frames row: {e}")));
+                let c_group = metrics
+                    .and_then(|m| serde_json::from_str::<Value>(&m).ok())
+                    .and_then(|m| m.get("channels").and_then(Value::as_array).cloned())
+                    .map(|chs| chs.iter().map(|c| c.get("apertureCorrectionGroup").and_then(Value::as_f64)).collect())
+                    .unwrap_or_default();
+                index.insert((k, group), frames.len());
+                frames.push(CloneFrame { key: k, included: included != 0, c_group, group_beta: beta });
+            }
+        }
+        let mut by_file = HashMap::new();
+        {
+            let sql = format!("select {key}, group_key, path from stacking_artifacts where kind = 'calibrated'");
+            let mut st = con.prepare(&sql).unwrap_or_else(|e| die(format!("prepare artifacts: {e}")));
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))
+                .unwrap_or_else(|e| die(format!("query artifacts: {e}")));
+            for row in rows {
+                let (k, group, path) = row.unwrap_or_else(|e| die(format!("artifacts row: {e}")));
+                let Some(path) = path else { continue };
+                let base = Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).to_string();
+                if let Some(&i) = index.get(&(k, group.clone())) {
+                    by_file.insert((group, base), i);
+                }
+            }
+        }
+        let mut regs: HashMap<i64, Reg> = HashMap::new();
+        let mut parse = |k: i64, reference: Option<i64>, json: Option<String>| {
+            let map = json.and_then(|j| match PixelMap::from_json(&j) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("d0_weight_probe common: frame {k}: unreadable registration map: {e}");
+                    None
+                }
+            });
+            regs.insert(k, Reg { reference, map });
+        };
+        if project.is_some() {
+            let mut st = con
+                .prepare("select project_frame, payload_json from stacking_artifacts where kind = 'registration'")
+                .unwrap_or_else(|e| die(format!("prepare registration: {e}")));
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+                .unwrap_or_else(|e| die(format!("query registration: {e}")));
+            for row in rows {
+                let (k, payload) = row.unwrap_or_else(|e| die(format!("registration row: {e}")));
+                let v: Value = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
+                parse(
+                    k,
+                    v.get("referenceFrameId").and_then(Value::as_i64),
+                    v.get("transformJson").and_then(Value::as_str).map(str::to_string),
+                );
+            }
+        } else {
+            let mut st = con
+                .prepare("select frame_id, reference_frame_id, transform_json from registration_results where frames_set_id = ?1")
+                .unwrap_or_else(|e| die(format!("prepare registration: {e}")));
+            let rows = st
+                .query_map([set.unwrap_or(-1)], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<String>>(2)?)))
+                .unwrap_or_else(|e| die(format!("query registration: {e}")));
+            for row in rows {
+                let (k, reference, json) = row.unwrap_or_else(|e| die(format!("registration row: {e}")));
+                parse(k, reference, json);
+            }
+        }
+        CloneDb { by_file, frames, regs }
+    }
+
+    // ---------------------------------------------------------------------------------------------- statistics
+
+    /// Ranks of `w`, 1 = the largest, ties averaged; a non-finite weight ranks as 0.
+    fn rank_desc(w: &[f64]) -> Vec<f64> {
+        let v: Vec<f64> = w.iter().map(|x| if x.is_finite() { *x } else { 0.0 }).collect();
+        let mut order: Vec<usize> = (0..v.len()).collect();
+        order.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+        let mut r = vec![0.0; v.len()];
+        let mut i = 0;
+        while i < order.len() {
+            let mut j = i;
+            while j + 1 < order.len() && v[order[j + 1]] == v[order[i]] {
+                j += 1;
+            }
+            let avg = (i + j) as f64 / 2.0 + 1.0;
+            for &o in &order[i..=j] {
+                r[o] = avg;
+            }
+            i = j + 1;
+        }
+        r
+    }
+
+    /// Spearman rho of two weight vectors.
+    fn spearman(a: &[f64], b: &[f64]) -> f64 {
+        let (ra, rb) = (rank_desc(a), rank_desc(b));
+        let n = ra.len() as f64;
+        let (ma, mb) = (ra.iter().sum::<f64>() / n, rb.iter().sum::<f64>() / n);
+        let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
+        for (x, y) in ra.iter().zip(&rb) {
+            sab += (x - ma) * (y - mb);
+            saa += (x - ma).powi(2);
+            sbb += (y - mb).powi(2);
+        }
+        if saa <= 0.0 || sbb <= 0.0 {
+            f64::NAN
+        } else {
+            sab / (saa * sbb).sqrt()
+        }
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.retain(|x| x.is_finite());
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
+    }
+
+    /// The sharpest decile's ranks, ascending: the `round(0.1 n)` (at least 1) members of the lowest mean FWHM, rounded as D0's
+    /// `analyse.py` did (ties to even: 105 frames give 10).
+    fn decile_ranks(fwhm: &[f64], rank: &[f64]) -> Vec<f64> {
+        let n = fwhm.len();
+        let k = ((0.1 * n as f64).round_ties_even() as usize).max(1);
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| fwhm[a].total_cmp(&fwhm[b]).then(a.cmp(&b)));
+        let mut r: Vec<f64> = order[..k.min(n)].iter().map(|&i| rank[i]).collect();
+        r.sort_by(f64::total_cmp);
+        r
+    }
+
+    fn worst(v: &[f64]) -> f64 {
+        v.iter().cloned().fold(f64::NAN, f64::max)
+    }
+
+    fn join(v: &[f64]) -> String {
+        v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",")
+    }
+
+    // ---------------------------------------------------------------------------------------------- the product
+
+    #[derive(Clone)]
+    struct Member {
+        key: i64,
+        reference: Option<i64>,
+        map: PixelMap,
+        /// Mean of the planes' FWHM.
+        fwhm: f64,
+        unsaturated: usize,
+        planes: Vec<DumpPlaneRef>,
+    }
+
+    /// A plane of a member: the dump's numbers, the fits as the member currently holds them (the C10 replay trims them).
+    #[derive(Clone)]
+    struct DumpPlaneRef {
+        fits: Vec<StarFit>,
+        ap_fixed: Vec<f64>,
+        ap_radius: f64,
+        fwhm: f64,
+        noise: f64,
+        m_star: f64,
+        psf_signal_weight: f64,
+        c_stand_in: f64,
+    }
+
+    impl Member {
+        fn plane(&self, p: usize) -> MemberPlane<'_> {
+            let d = &self.planes[p];
+            MemberPlane { fits: &d.fits, map: &self.map, fwhm_px: d.fwhm, noise: d.noise, c_stand_in: d.c_stand_in }
+        }
+    }
+
+    /// What the product made of one plane.
+    struct PlaneResult {
+        /// Per member, in member order; the dump's Measure-time weight where the plane has no common set.
+        weights: Vec<f64>,
+        cands: Vec<Candidate>,
+        /// The set's stars in group coordinates (empty without a set).
+        positions: Vec<(f64, f64)>,
+        too_few: Option<usize>,
+        paired: Vec<usize>,
+    }
+
+    struct Product {
+        anchor: usize,
+        planes: Vec<PlaneResult>,
+    }
+
+    /// The product pipeline over a group's members; `None` when no anchor can be picked. `proxy_floor` above the module's
+    /// own 20 keeps only the candidates whose proxy SNR reaches it (the lab's what-if for "a higher proxy floor"; the module's
+    /// floor is not a parameter).
+    fn product(members: &[Member], planes: usize, proxy_floor: f64) -> Option<Product> {
+        let fwhm: Vec<f64> = members.iter().map(|m| m.fwhm).collect();
+        let unsat: Vec<usize> = members.iter().map(|m| m.unsaturated).collect();
+        let ids: Vec<i64> = members.iter().map(|m| m.key).collect();
+        let anchor = common_set::pick_anchor(&fwhm, &unsat, &ids)?;
+        let mut out = Vec::new();
+        for p in 0..planes {
+            let mut cands = common_set::candidates(&members[anchor].plane(p));
+            if proxy_floor > 20.0 {
+                let a = &members[anchor];
+                let d = &a.planes[p];
+                let proxy: HashMap<(u64, u64), f64> = d
+                    .fits
+                    .iter()
+                    .map(|f| {
+                        let (gx, gy) = a.map.forward_exact(f.x, f.y);
+                        ((gx.to_bits(), gy.to_bits()), f.signal / ADU / (d.noise * f.area.sqrt()))
+                    })
+                    .collect();
+                cands.retain(|c| proxy.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&v| v >= proxy_floor));
+            }
+            let usable: Vec<_> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p))).collect();
+            let (weights, positions, too_few, paired) = match common_set::common_flux(&cands, &usable, anchor) {
+                CommonOutcome::Measured { positions, per_member } => (
+                    members
+                        .iter()
+                        .zip(&per_member)
+                        .map(|(m, c)| psf_signal_weight(c.tflux, c.tmean_flux, m.planes[p].noise, m.planes[p].m_star))
+                        .collect(),
+                    positions,
+                    None,
+                    per_member.iter().map(|c| c.paired).collect(),
+                ),
+                CommonOutcome::TooFewStars { stars } => {
+                    eprintln!("d0_weight_probe common: plane {p}: {stars} common stars, the Measure-time weights stand");
+                    (members.iter().map(|m| m.planes[p].psf_signal_weight).collect(), Vec::new(), Some(stars), vec![0; members.len()])
+                }
+            };
+            out.push(PlaneResult { weights, cands, positions, too_few, paired });
+        }
+        Some(Product { anchor, planes: out })
+    }
+
+    /// The frame weight: a mono plane's weight; a colour image's planes each over their maximum, averaged (the run's rule).
+    fn frame_weights(per_plane: &[Vec<f64>]) -> Vec<f64> {
+        if per_plane.len() == 1 {
+            return per_plane[0].clone();
+        }
+        let n = per_plane[0].len();
+        let maxes: Vec<f64> = per_plane.iter().map(|w| w.iter().cloned().filter(|x| x.is_finite()).fold(0.0, f64::max)).collect();
+        (0..n)
+            .map(|i| per_plane.iter().zip(&maxes).map(|(w, m)| if *m > 0.0 { w[i] / m } else { 0.0 }).sum::<f64>() / per_plane.len() as f64)
+            .collect()
+    }
+
+    // ---------------------------------------------------------------------------------------------- D0's (b)
+
+    struct BResult {
+        weights: Vec<f64>,
+        weights_ap: Vec<f64>,
+        /// The set in the reference grid.
+        positions: Vec<(f64, f64)>,
+        reference: usize,
+    }
+
+    /// D0's offline set (b) and (b-ap) on `plane`, as `analyse.py` builds them, over `members`.
+    fn d0_b(members: &[Member], plane: usize) -> BResult {
+        let n = members.len();
+        let mut votes: HashMap<i64, usize> = HashMap::new();
+        for m in members {
+            if let Some(r) = m.reference {
+                *votes.entry(r).or_default() += 1;
+            }
+        }
+        let ref_key = votes.iter().max_by_key(|(k, v)| (**v, -**k)).map(|(k, _)| *k);
+        let reference = ref_key
+            .and_then(|k| members.iter().position(|m| m.key == k))
+            .unwrap_or_else(|| (0..n).max_by_key(|&i| members[i].planes[plane].fits.len()).unwrap_or(0));
+        let r = &members[reference].planes[plane];
+        let rmap = &members[reference].map;
+        let rpos: Vec<(f64, f64)> = r.fits.iter().map(|f| rmap.forward_exact(f.x, f.y)).collect();
+        let pix: Vec<(f64, f64)> = r.fits.iter().map(|f| (f.x, f.y)).collect();
+        let tree_pix = KdTree2::build(&pix);
+        let iso: Vec<bool> = pix.iter().map(|&(x, y)| tree_pix.within(x, y, 2.0 * r.ap_radius).len() == 1).collect();
+        let cand: Vec<usize> = (0..r.fits.len())
+            .filter(|&i| r.fits[i].flags.bits() & SAT == 0 && r.fits[i].snr >= B_MIN_SNR && iso[i] && r.ap_fixed[i].is_finite())
+            .collect();
+        let tol = 1.5f64.max(0.5 * median(members.iter().map(|m| m.planes[plane].fwhm).collect()));
+        // matched[k][c] = member k's fit nearest to candidate c within tol (any flag).
+        let mut matched: Vec<Vec<Option<usize>>> = Vec::with_capacity(n);
+        for m in members {
+            let d = &m.planes[plane];
+            let mut idx = Vec::new();
+            let mut pts = Vec::new();
+            for (i, f) in d.fits.iter().enumerate() {
+                let (gx, gy) = m.map.forward_exact(f.x, f.y);
+                if gx.is_finite() && gy.is_finite() {
+                    idx.push(i);
+                    pts.push((gx, gy));
+                }
+            }
+            let tree = KdTree2::build(&pts);
+            matched.push(cand.iter().map(|&i| tree.nearest_within(rpos[i].0, rpos[i].1, tol).map(|(j, _)| idx[j])).collect());
+        }
+        let common: Vec<usize> = (0..cand.len())
+            .filter(|&c| {
+                let present = (0..n)
+                    .filter(|&k| matched[k][c].map_or(false, |j| members[k].planes[plane].fits[j].flags.bits() & SAT == 0 && members[k].planes[plane].ap_fixed[j].is_finite()))
+                    .count();
+                present as f64 / n as f64 >= 0.9
+            })
+            .collect();
+        let sig = |f: &StarFit| f.signal / ADU;
+        let mean = |f: &StarFit| f.signal / f.area / ADU;
+        let com_ref_sig: f64 = common.iter().map(|&c| sig(&r.fits[cand[c]])).filter(|x| x.is_finite()).sum();
+        let com_ref_mean: f64 = common.iter().map(|&c| mean(&r.fits[cand[c]])).filter(|x| x.is_finite()).sum();
+        let (mut w, mut wap) = (Vec::new(), Vec::new());
+        for (k, m) in members.iter().enumerate() {
+            let d = &m.planes[plane];
+            // Ratios are over the stars matched in this member with both values finite.
+            let pair = |col: usize| -> f64 {
+                let (mut num, mut den) = (0.0, 0.0);
+                for &c in &common {
+                    let Some(j) = matched[k][c] else { continue };
+                    let rf = &r.fits[cand[c]];
+                    let (vf, vr) = match col {
+                        0 => (sig(&d.fits[j]), sig(rf)),
+                        1 => (mean(&d.fits[j]), mean(rf)),
+                        _ => (d.ap_fixed[j], r.ap_fixed[cand[c]]),
+                    };
+                    if vf.is_finite() && vr.is_finite() {
+                        num += vf;
+                        den += vr;
+                    }
+                }
+                if den > 0.0 {
+                    num / den
+                } else {
+                    f64::NAN
+                }
+            };
+            let (r_sig, r_mean, r_ap) = (pair(0), pair(1), pair(2));
+            w.push(psf_signal_weight(r_sig * com_ref_sig, r_mean * com_ref_mean, d.noise, d.m_star));
+            wap.push(psf_signal_weight(r_ap * com_ref_sig, r_mean * r_ap / r_sig * com_ref_mean, d.noise, d.m_star));
+        }
+        BResult { weights: w, weights_ap: wap, positions: common.iter().map(|&c| rpos[cand[c]]).collect(), reference }
+    }
+
+    // ---------------------------------------------------------------------------------------------- the C10 r1 replay
+
+    /// D0's replay of the C10 r1 Blend refusals on one frame: the brightest saturated fits go until the removed signal is
+    /// `1 - ratio` of the frame's total.
+    fn trim_c10(fits: &[StarFit], ratio: f64) -> Vec<StarFit> {
+        let total: f64 = fits.iter().map(|f| f.signal).filter(|x| x.is_finite()).sum();
+        let goal = (1.0 - ratio) * total;
+        let mut order: Vec<usize> = (0..fits.len()).filter(|&i| fits[i].flags.bits() & SAT != 0).collect();
+        order.sort_by(|&a, &b| fits[b].signal.total_cmp(&fits[a].signal));
+        let mut drop = vec![false; fits.len()];
+        let mut removed = 0.0;
+        for i in order {
+            if removed >= goal {
+                break;
+            }
+            removed += fits[i].signal;
+            drop[i] = true;
+        }
+        fits.iter().zip(&drop).filter(|(_, d)| !**d).map(|(f, _)| *f).collect()
+    }
+
+    /// Why the product's set lacks the stars of (b)'s: the first reason that fits, in the order the product decides them
+    /// (a star near no anchor fit; a clipped, an extended, a crowded (another anchor fit within 6 F) or a faint (proxy SNR
+    /// below 20) anchor fit; a candidate the presence rule dropped).
+    fn lost_breakdown(members: &[Member], anchor: &Member, plane: usize, pr: &PlaneResult, b_positions: &[(f64, f64)], tol: f64) -> String {
+        // Per member: a tree over its mapped fit positions, its FWHM and its fits (index-aligned with the tree).
+        let member_trees: Vec<(KdTree2, f64, Vec<StarFit>)> = members
+            .iter()
+            .map(|m| {
+                let d = &m.planes[plane];
+                let mut fits = Vec::new();
+                let mut pts = Vec::new();
+                for f in &d.fits {
+                    let (gx, gy) = m.map.forward_exact(f.x, f.y);
+                    if gx.is_finite() && gy.is_finite() {
+                        pts.push((gx, gy));
+                        fits.push(*f);
+                    }
+                }
+                (KdTree2::build(&pts), d.fwhm, fits)
+            })
+            .collect();
+        let d = &anchor.planes[plane];
+        let apos: Vec<(f64, f64)> = d.fits.iter().map(|f| anchor.map.forward_exact(f.x, f.y)).collect();
+        let atree = KdTree2::build(&apos);
+        let set_tree = KdTree2::build(&pr.positions);
+        let cand_tree = KdTree2::build(&pr.cands.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>());
+        let pix: Vec<(f64, f64)> = d.fits.iter().map(|f| (f.x, f.y)).collect();
+        let pix_tree = KdTree2::build(&pix);
+        let (mut kept, mut presence, mut no_fit, mut clipped, mut extended, mut crowded, mut faint) = (0, 0, 0, 0, 0, 0, 0);
+        // For the stars the presence rule dropped: why each member could not use them (member-star pairs).
+        let (mut none, mut ambiguous, mut sat, mut ext) = (0usize, 0usize, 0usize, 0usize);
+        for q in b_positions {
+            if set_tree.nearest_within(q.0, q.1, tol).is_some() {
+                kept += 1;
+            } else if let Some((ci, _)) = cand_tree.nearest_within(q.0, q.1, tol) {
+                presence += 1;
+                let c = &pr.cands[ci];
+                for t in &member_trees {
+                    let radius = 1.5f64.max(0.5 * c.anchor_fwhm_px.max(t.1));
+                    let hits = t.0.within(c.x, c.y, radius);
+                    match hits.len() {
+                        0 => none += 1,
+                        1 => {
+                            let f = &t.2[hits[0].0];
+                            if f.flags.saturated() {
+                                sat += 1;
+                            } else if f.flags.extended() {
+                                ext += 1;
+                            }
+                        }
+                        _ => ambiguous += 1,
+                    }
+                }
+            } else if let Some((i, _)) = atree.nearest_within(q.0, q.1, tol) {
+                let f = &d.fits[i];
+                if f.flags.saturated() {
+                    clipped += 1;
+                } else if f.flags.extended() {
+                    extended += 1;
+                } else if pix_tree.within(f.x, f.y, 6.0 * d.fwhm).len() != 1 {
+                    crowded += 1;
+                } else {
+                    faint += 1;
+                }
+            } else {
+                no_fit += 1;
+            }
+        }
+        format!("kept {kept} | dropped by the 90 % presence rule {presence} (member-star pairs unusable: no fit {none}, ambiguous {ambiguous}, clipped {sat}, extended {ext}) | no anchor fit {no_fit} | clipped in the anchor {clipped} | extended in the anchor {extended} | crowded {crowded} | faint {faint}")
+    }
+
+    // ---------------------------------------------------------------------------------------------- one group
+
+    fn build_members(ds: &str, group: &str, planes: &BTreeMap<usize, BTreeMap<String, DumpPlane>>, clone: &CloneDb) -> (Vec<Member>, usize) {
+        let n_planes = planes.keys().max().map_or(0, |m| m + 1);
+        if n_planes == 0 || (0..n_planes).any(|p| !planes.contains_key(&p)) {
+            die(format!("{ds} {group}: planes {:?} are not contiguous from 0", planes.keys().collect::<Vec<_>>()));
+        }
+        let mut skipped = (0usize, 0usize, 0usize); // not in the clone, not included, no map
+        let mut members = Vec::new();
+        for (file, p0) in &planes[&0] {
+            let Some(&ci) = clone.by_file.get(&(group.to_string(), p0.base.clone())) else {
+                skipped.0 += 1;
+                continue;
+            };
+            let cf = &clone.frames[ci];
+            if !cf.included {
+                skipped.1 += 1;
+                continue;
+            }
+            let reg = clone.regs.get(&cf.key);
+            let Some(map) = reg.and_then(|r| r.map.clone()) else {
+                skipped.2 += 1;
+                continue;
+            };
+            let Some(all): Option<Vec<&DumpPlane>> = (0..n_planes).map(|p| planes[&p].get(file)).collect() else {
+                skipped.0 += 1;
+                continue;
+            };
+            let refs: Vec<DumpPlaneRef> = all
+                .iter()
+                .enumerate()
+                .map(|(p, d)| DumpPlaneRef {
+                    fits: d.fits.clone(),
+                    ap_fixed: d.ap_fixed.clone(),
+                    ap_radius: d.ap_radius,
+                    fwhm: d.fwhm,
+                    noise: d.noise,
+                    m_star: d.m_star,
+                    psf_signal_weight: d.psf_signal_weight,
+                    c_stand_in: cf.c_group.get(p).copied().flatten().filter(|c| c.is_finite() && *c > 0.0).unwrap_or(1.0),
+                })
+                .collect();
+            let fwhm = refs.iter().map(|d| d.fwhm).sum::<f64>() / refs.len() as f64;
+            let unsaturated = all.iter().map(|d| d.unsaturated).sum();
+            members.push(Member { key: cf.key, reference: reg.and_then(|r| r.reference), map, fwhm, unsaturated, planes: refs });
+        }
+        eprintln!(
+            "d0_weight_probe common: {ds} {group}: {} members ({} dump rows not in the clone run or a plane short, {} not included, {} without a map)",
+            members.len(),
+            skipped.0,
+            skipped.1,
+            skipped.2
+        );
+        members.sort_by_key(|m| m.key);
+        (members, n_planes)
+    }
+
+    fn analyse_group(ds: &str, group: &str, planes: &BTreeMap<usize, BTreeMap<String, DumpPlane>>, clone: &CloneDb, out_dir: Option<&Path>, proxy_floor: f64) {
+        let (members, n_planes) = build_members(ds, group, planes, clone);
+        if members.is_empty() {
+            die(format!("{ds} {group}: no member (included, mapped, every plane in the dump)"));
+        }
+        let dump_beta = planes[&0].values().next().map_or(f64::NAN, |p| p.beta);
+        let clone_beta = planes[&0]
+            .values()
+            .find_map(|p| clone.by_file.get(&(group.to_string(), p.base.clone())).and_then(|&i| clone.frames[i].group_beta));
+        let override_beta = clone_beta.map_or(false, |b| (b - dump_beta).abs() > 1e-6 * b.abs().max(1.0));
+        let Some(prod) = product(&members, n_planes, proxy_floor) else {
+            die(format!("{ds} {group}: no anchor (no member with a finite FWHM at or above the median star count)"))
+        };
+        let anchor_key = members[prod.anchor].key;
+        let frame_fwhm: Vec<f64> = members.iter().map(|m| m.fwhm).collect();
+        let w_prod = frame_weights(&prod.planes.iter().map(|p| p.weights.clone()).collect::<Vec<_>>());
+        let rank_prod = rank_desc(&w_prod);
+        if override_beta {
+            println!(
+                "plane-info {ds} {group} beta override: dump beta {dump_beta:.5} vs the clone's group beta {:.5}; judged by the beta307 line only",
+                clone_beta.unwrap_or(f64::NAN)
+            );
+            println!("D1A beta307 {ds} {group} n={} dec_ranks={}", members.len(), join(&decile_ranks(&frame_fwhm, &rank_prod)));
+            for (p, pr) in prod.planes.iter().enumerate() {
+                println!("plane-info {ds} {group} p{p} anchor={anchor_key} candidates={} set={} too_few={:?}", pr.cands.len(), pr.positions.len(), pr.too_few);
+            }
+            return;
+        }
+        // D0's (b) side by side, plane by plane.
+        let bs: Vec<BResult> = (0..n_planes).map(|p| d0_b(&members, p)).collect();
+        let w_b = frame_weights(&bs.iter().map(|b| b.weights.clone()).collect::<Vec<_>>());
+        let w_bap = frame_weights(&bs.iter().map(|b| b.weights_ap.clone()).collect::<Vec<_>>());
+        let (rank_b, rank_bap) = (rank_desc(&w_b), rank_desc(&w_bap));
+        let rho = spearman(&w_prod, &w_b);
+        let (dp, db, dap) = (decile_ranks(&frame_fwhm, &rank_prod), decile_ranks(&frame_fwhm, &rank_b), decile_ranks(&frame_fwhm, &rank_bap));
+        // The C10 r1 replay (hc11 L only): trim the eight frames' fits as D0 did, run the product again.
+        let mut replay = None;
+        if ds == C10_DS && group == C10_GROUP && C10_TARGET.iter().all(|(k, _)| members.iter().any(|m| m.key == *k)) {
+            let mut trimmed: Vec<Member> = members.clone();
+            for (k, ratio) in C10_TARGET {
+                if let Some(m) = trimmed.iter_mut().find(|m| m.key == k) {
+                    for d in &mut m.planes {
+                        d.fits = trim_c10(&d.fits, ratio);
+                    }
+                }
+            }
+            if let Some(after) = product(&trimmed, n_planes, proxy_floor) {
+                let w_after = frame_weights(&after.planes.iter().map(|p| p.weights.clone()).collect::<Vec<_>>());
+                let rank_after = rank_desc(&w_after);
+                let moved: Vec<String> = members
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| rank_after[*i] != rank_prod[*i])
+                    .map(|(i, m)| format!("{}:{}->{}", m.key, rank_prod[i], rank_after[i]))
+                    .collect();
+                println!(
+                    "replay {ds} {group} C10 r1: anchor {} -> {}; rho(before, after) {:.6}; frames whose rank moved {} [{}]; the eight: {}",
+                    anchor_key,
+                    trimmed[after.anchor].key,
+                    spearman(&w_prod, &w_after),
+                    moved.len(),
+                    moved.join(" "),
+                    C10_TARGET
+                        .iter()
+                        .map(|(k, _)| {
+                            let i = members.iter().position(|m| m.key == *k).unwrap_or(0);
+                            format!("{k}:{}->{}", rank_prod[i], rank_after[i])
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                replay = Some(moved.len());
+            }
+        }
+        let mut line = format!(
+            "D1A group {ds} {group} n={} rho={rho:.4} dec_med={} dec_worst={} b_dec_med={} b_dec_worst={} bap_dec_worst={}",
+            members.len(),
+            median(dp.clone()),
+            worst(&dp),
+            median(db.clone()),
+            worst(&db),
+            worst(&dap)
+        );
+        if let Some(m) = replay {
+            line.push_str(&format!(" replay_moves={m}"));
+        }
+        println!("{line}");
+        // Per plane: the set against (b)'s.
+        let amap = &members[prod.anchor].map;
+        for (p, pr) in prod.planes.iter().enumerate() {
+            let b = &bs[p];
+            let tol = 1.5f64.max(0.5 * median(members.iter().map(|m| m.planes[p].fwhm).collect()));
+            let tree = KdTree2::build(&pr.positions);
+            let recovered = if b.positions.is_empty() {
+                f64::NAN
+            } else {
+                b.positions.iter().filter(|q| tree.nearest_within(q.0, q.1, tol).is_some()).count() as f64 / b.positions.len() as f64
+            };
+            let by_pos: HashMap<(u64, u64), usize> = members[prod.anchor].planes[p]
+                .fits
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let (gx, gy) = amap.forward_exact(f.x, f.y);
+                    ((gx.to_bits(), gy.to_bits()), i)
+                })
+                .collect();
+            let proxy_only = pr
+                .cands
+                .iter()
+                .filter(|c| by_pos.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&i| !(members[prod.anchor].planes[p].fits[i].snr >= B_MIN_SNR)))
+                .count();
+            let share = if pr.cands.is_empty() { f64::NAN } else { proxy_only as f64 / pr.cands.len() as f64 };
+            println!("D1A plane {ds} {group} p{p} set={} recovered={recovered:.4} proxy_only={share:.4}", pr.positions.len());
+            println!(
+                "plane-info {ds} {group} p{p} anchor={anchor_key} reference={} candidates={} set={} b_set={} proxy_only_stars={proxy_only} too_few={:?}",
+                members[b.reference].key,
+                pr.cands.len(),
+                pr.positions.len(),
+                b.positions.len(),
+                pr.too_few
+            );
+            println!(
+                "plane-info {ds} {group} p{p} (b)'s stars the product's set lacks, by the first reason that fits: {}",
+                lost_breakdown(&members, &members[prod.anchor], p, pr, &b.positions, tol)
+            );
+        }
+        // Per frame.
+        let mut table = String::from("key\tfwhm\tw_product\tw_b\tw_bap\trank_product\trank_b\trank_bap\tpaired\n");
+        for (i, m) in members.iter().enumerate() {
+            let paired: Vec<String> = prod.planes.iter().map(|p| p.paired[i].to_string()).collect();
+            table.push_str(&format!(
+                "{}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}\t{}\t{}\n",
+                m.key,
+                m.fwhm,
+                w_prod[i],
+                w_b[i],
+                w_bap[i],
+                rank_prod[i],
+                rank_b[i],
+                rank_bap[i],
+                paired.join("/")
+            ));
+        }
+        for row in table.lines().skip(1) {
+            println!("frame {ds} {group} {row}");
+        }
+        if let Some(dir) = out_dir {
+            let path = dir.join(format!("{ds}.{group}.frames.tsv"));
+            std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+            std::fs::write(&path, table).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+        }
+    }
+
+    pub fn run(args: &[String]) {
+        let (mut dumps, mut clone, mut out_dir, mut proxy_floor) = (None::<PathBuf>, None::<PathBuf>, None::<PathBuf>, 20.0f64);
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let mut v = || it.next().unwrap_or_else(|| die(format!("{a} needs a value"))).clone();
+            match a.as_str() {
+                "--dumps" => dumps = Some(PathBuf::from(v())),
+                "--clone" => clone = Some(PathBuf::from(v())),
+                "--out-dir" => out_dir = Some(PathBuf::from(v())),
+                "--proxy-floor" => proxy_floor = v().parse().unwrap_or_else(|_| die("--proxy-floor")),
+                o => die(format!("unknown argument {o}")),
+            }
+        }
+        let dumps = dumps.unwrap_or_else(|| die("--dumps is required"));
+        let clone_dir = clone.unwrap_or_else(|| die("--clone is required"));
+        let dump = load_dump(&dumps);
+        let clone = load_clone(&clone_dir);
+        if dump.is_empty() {
+            die(format!("{}: no frames in frames.jsonl", dumps.display()));
+        }
+        for ((ds, group), planes) in &dump {
+            analyse_group(ds, group, planes, &clone, out_dir.as_deref(), proxy_floor);
+        }
     }
 }
