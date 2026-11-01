@@ -241,6 +241,23 @@ pub struct ChannelMeasurement {
     /// run), so `None` and never serialized wherever the fold did not substitute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction_group: Option<f64>,
+    /// Plan D D1w (PD-3): this member's flux over the (group, plane)'s frame-common star set - the paired ratio to the
+    /// group's anchor times the anchor's sums over the whole set ([`crate::stacking::common_set::CommonFlux`]), native
+    /// units, the plane's stand-in `c` already applied. `psf_signal_weight` / `psf_snr` are recomputed from it (and
+    /// `common_tmean_flux`) at the end of stage 5, so these three fields tell where the weight came from. `Some` only
+    /// on a plane that was reweighed; `None` (and never serialized) at Measure time, in the `metrics` artifact, on a
+    /// plane that fell back (PD-6), and for the weight modes outside the PSF family. In memory and in
+    /// `stacking_run_frames.metrics_json` only: the `metrics` artifact payload stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_tflux: Option<f64>,
+    /// The mean-flux twin of [`Self::common_tflux`] (`common_tmean_flux`, PD-3); `Some` exactly when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_tmean_flux: Option<f64>,
+    /// How many stars the (group, plane)'s frame-common set holds: the same number for every member of the plane,
+    /// `Some` exactly when [`Self::common_tflux`] is. How many of them THIS member has is the debug line
+    /// `"frame reweighed"`'s `paired_stars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_stars: Option<usize>,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -1296,6 +1313,9 @@ fn adapter_tail(
         aperture_se: m.aperture_correction.and(m.aperture_se),
         aperture_stars: m.aperture_correction.map(|_| m.aperture_stars),
         aperture_correction_group: None,
+        common_tflux: None,
+        common_tmean_flux: None,
+        common_stars: None,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -3031,6 +3051,45 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan D D1w (a pin, not RED): the frame-common fields ride `stacking_run_frames.metrics_json` under camelCase names,
+    /// a channel without them serializes to the very bytes it did before D1w (so the `metrics` artifact payload and
+    /// every cache comparison stay as they were), and a payload written before them decodes with all three `None`.
+    #[test]
+    fn common_set_fields_round_trip_and_stay_out_of_an_unreweighed_payload() {
+        let plain = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            fwhm_px: 2.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        for key in ["commonTflux", "commonTmeanFlux", "commonStars"] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+        assert_eq!(
+            json,
+            "{\"starsDetected\":5,\"starsFitted\":3,\"starsRefused\":0,\"refusedByReason\":{},\"starsUnsaturated\":0,\"beta\":0.0,\"fwhmPx\":2.5,\"eccentricity\":0.0,\"tflux\":0.0,\"tmeanFlux\":0.0,\"meanFluxRejected\":0,\"mStar\":0.0,\"nStar\":0.0,\"noise\":0.0,\"noiseSource\":\"mrs\",\"median\":0.0,\"mad\":0.0,\"medianMeanDev\":0.0,\"snrWeight\":0.0,\"noiseScaleLow\":0.0,\"noiseScaleHigh\":0.0,\"location\":0.0,\"scale\":0.0,\"psfSignalWeight\":0.0,\"psfSnr\":0.0}"
+        );
+        let reweighed = ChannelMeasurement {
+            common_tflux: Some(12.5),
+            common_tmean_flux: Some(0.25),
+            common_stars: Some(321),
+            ..plain.clone()
+        };
+        let value = serde_json::to_value(&reweighed).unwrap();
+        assert_eq!(value["commonTflux"], serde_json::json!(12.5));
+        assert_eq!(value["commonTmeanFlux"], serde_json::json!(0.25));
+        assert_eq!(value["commonStars"], serde_json::json!(321));
+        let back: ChannelMeasurement = serde_json::from_value(value).unwrap();
+        assert_eq!(back, reweighed);
+        let old: ChannelMeasurement =
+            serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
+        assert_eq!(
+            (old.common_tflux, old.common_tmean_flux, old.common_stars),
+            (None, None, None)
+        );
+    }
+
     /// Plan B B0 (PB-1): the channel build copies the plane's reported `c`, its standard error and its qualifying-star
     /// count; a plane at floor (i) (fewer than 5 ratios, `c = None`) keeps none of the three, though the module still
     /// reports the ratios it did find.
@@ -3390,7 +3449,7 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, common_tflux: None, common_tmean_flux: None, common_stars: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3498,7 +3557,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, common_tflux: None, common_tmean_flux: None, common_stars: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \

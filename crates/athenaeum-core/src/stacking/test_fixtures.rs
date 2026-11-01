@@ -165,6 +165,37 @@ pub(crate) fn add_light_with_field(
     add_light_with_field_and_bands(f, spec, stars, background, noise_sigma, noise_seed, &[])
 }
 
+/// As [`add_light_with_field`], but the stars are rendered at the CALLER's `fwhm` (px) instead of the fixed σ 1.6, converted
+/// the way [`synthetic_star_field`] converts it (σ = FWHM / [`GAUSSIAN_FWHM_FACTOR`]). `stars` carry the amplitude to
+/// render (peak ADU above the background): a caller that wants the same star at another width keeps its flux by scaling
+/// the amplitude with (reference FWHM / FWHM)². Plan D D1w needs per-frame widths: the frame-common weight is about
+/// frames that differ in width and in which bright stars clip at the 16-bit ceiling.
+pub(crate) fn add_light_with_field_fwhm(
+    f: &Fixture,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    fwhm: f64,
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+) -> (i64, PathBuf) {
+    let filename = format!("{}.fits", spec.stem);
+    let path = f.dir.path().join(&filename);
+    write_light_fits_field_sigma(
+        &path,
+        spec,
+        stars,
+        fwhm / GAUSSIAN_FWHM_FACTOR,
+        background,
+        noise_sigma,
+        noise_seed,
+        &[],
+    );
+    let (size, modified_at) = file_identity(&path);
+    let frame_id = insert_light_row(f, spec, &path, &filename, size, &modified_at);
+    (frame_id, path)
+}
+
 /// As [`add_light_with_field`], plus full-width horizontal BANDS — each
 /// `(y_start, y_end, excess_adu)` adds `excess_adu` to every pixel of rows
 /// `[y_start, y_end)` before the noise goes on top. A flat-topped trail,
@@ -621,8 +652,31 @@ fn write_light_fits_field(
     noise_seed: u64,
     bands: &[(usize, usize, f32)],
 ) {
+    write_light_fits_field_sigma(
+        path,
+        spec,
+        stars,
+        1.6,
+        background,
+        noise_sigma,
+        noise_seed,
+        bands,
+    );
+}
+
+/// [`write_light_fits_field`] at a caller-chosen star σ (px).
+fn write_light_fits_field_sigma(
+    path: &Path,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    sigma: f64,
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+    bands: &[(usize, usize, f32)],
+) {
     let (w, h) = (spec.width, spec.height);
-    let mut plane = gaussian_field(w, h, stars, 1.6, background);
+    let mut plane = gaussian_field(w, h, stars, sigma, background);
     for &(y0, y1, excess) in bands {
         for y in y0..y1.min(h) {
             for x in 0..w {
