@@ -4113,6 +4113,45 @@ mod tests {
             );
         }
 
+        /// Plan D D2b (PD-26): every accepted fit keeps the aperture sum `S` of the very `star_snr` call that gave its SNR
+        /// (no second pass), and carries NaN exactly where that call's SNR is NaN.
+        #[test]
+        fn a_fits_aperture_sum_is_the_snr_calls_s_and_nan_where_the_snr_is() {
+            let (data, seeds) = one_star_plane();
+            let fit_with = |mask: Option<Vec<bool>>| {
+                let out = fit_stars_at(
+                    &data,
+                    64,
+                    64,
+                    &seeds,
+                    4.0,
+                    &FitStarsOptions {
+                        mask: mask.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert_eq!(out.fits.len(), 1, "{:?}", out.refused);
+                let f = out.fits[0];
+                let (snr, terms) = star_snr(&data, 64, 64, &f, None, mask.as_deref(), &ApertureNoise::WHITE);
+                (f, snr, terms)
+            };
+            let (f, snr, terms) = fit_with(None);
+            assert!(snr.is_finite() && terms.s > 0.0, "{snr} {}", terms.s);
+            assert_eq!(f.ap_sum.to_bits(), terms.s.to_bits(), "the fit keeps the call's S exactly");
+            assert_eq!(f.snr.to_bits(), snr.to_bits(), "and its SNR is that call's");
+            // No ring: every pixel past 20 px of the star is masked, and the ring (10 F to 12 F, F = 2.6) is past 20 px.
+            let mask: Vec<bool> = (0..64 * 64)
+                .map(|i| {
+                    let (x, y) = ((i % 64) as f64 - 32.0, (i / 64) as f64 - 32.0);
+                    x * x + y * y < 20.0 * 20.0
+                })
+                .collect();
+            let (f, snr, _) = fit_with(Some(mask));
+            assert!(snr.is_nan(), "no ring pixel: no SNR, got {snr}");
+            assert!(f.snr.is_nan() && f.ap_sum.is_nan(), "snr {} ap_sum {}", f.snr, f.ap_sum);
+        }
+
         /// A sky the caller measured is the plane's sky as handed in, not re-sampled.
         #[test]
         fn a_handed_in_sky_is_used_as_is() {

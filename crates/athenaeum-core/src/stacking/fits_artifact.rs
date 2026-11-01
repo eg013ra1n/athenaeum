@@ -4,9 +4,10 @@
 //! re-detecting the same stars a second time.
 //!
 //! One [`StarFit`] per record, every field narrowed from the in-memory
-//! `f64` to a little-endian `f32` (13 × 4 bytes) plus one flags byte
-//! ([`StarFlags`], Plan A Task 4: the byte was reserved and written 0 before)
-//! — 53 bytes per fit, ≈ 200–400 KB per plane on a typical field. The
+//! `f64` to a little-endian `f32` (14 × 4 bytes: the 13 fit numbers and the
+//! aperture sum `S`, Plan D D2b) plus one flags byte ([`StarFlags`], Plan A
+//! Task 4: the byte was reserved and written 0 before) — 57 bytes per fit
+//! (53 in version 1), ≈ 200–400 KB per plane on a typical field. The
 //! narrowing is deliberate (spec §2.2.1): the values downstream feed a
 //! RATIO (Normalize's relative flux scale) or a star LIST (Register's
 //! reused detections), and the audit measured the systematic loss the
@@ -32,17 +33,21 @@ const MAGIC: [u8; 4] = *b"ATHF";
 
 /// Bumped whenever the record layout changes; [`read_fits`] refuses any
 /// other value rather than guess at a shape it was not built to read.
-pub const FITS_ARTIFACT_VERSION: u16 = 1;
+/// Version 2 (Plan D D2b, PD-26) adds the aperture sum `S` after `area`; a
+/// version-1 file is refused like any other version (the measurement hash
+/// moved with `MEASURE_VERSION` 8, so no fresh row points at one).
+pub const FITS_ARTIFACT_VERSION: u16 = 2;
 
 /// `x, y, background, amplitude, fwhm_x, fwhm_y, fwtm_x, fwtm_y, theta,
-/// beta, residual, signal, area` — [`StarFit`]'s 13 persisted numbers, in
-/// declaration order, each a little-endian `f32` — plus the flags byte
+/// beta, residual, signal, area, ap_sum` — [`StarFit`]'s 14 persisted
+/// numbers, in declaration order, each a little-endian `f32` (`ap_sum`: NaN
+/// where the fit has no aperture sum) — plus the flags byte
 /// ([`StarFit::flags`], bit 0 saturated, bit 1 β at its cap). The byte held
 /// `0` in every file written before Plan A Task 4, so such a file reads as
-/// no flags and the layout and [`FITS_ARTIFACT_VERSION`] are unchanged.
+/// no flags.
 /// Fields are written/read individually (never a `#[repr(C)]` cast), so
 /// struct alignment/padding never enters the on-disk shape.
-const FIELDS_PER_RECORD: usize = 13;
+const FIELDS_PER_RECORD: usize = 14;
 const RECORD_LEN: usize = FIELDS_PER_RECORD * 4 + 1;
 const HEADER_LEN: usize = 4 + 2 + 4; // magic + version + count
 
@@ -104,6 +109,7 @@ fn encode_fit(fit: &StarFit, out: &mut Vec<u8>) {
         fit.residual,
         fit.signal,
         fit.area,
+        fit.ap_sum,
     ] {
         out.extend_from_slice(&(v as f32).to_le_bytes());
     }
@@ -131,6 +137,7 @@ fn decode_fit(record: &[u8]) -> StarFit {
         residual: field(10),
         signal: field(11),
         area: field(12),
+        ap_sum: field(13),
         // Not persisted (spec 2026-10-04 L-12).
         peak5: f64::NAN,
         // Not persisted either (Plan A Task 10b: the ring sky B_i, σ_i and n_i are re-read on every measure).
@@ -265,6 +272,7 @@ mod tests {
             sky_ring: f64::NAN,
             sky_ring_sigma: f64::NAN,
             sky_ring_n: 0,
+            ap_sum: signed(rng, 1e6),
             snr: f64::NAN,
             hfr: f64::NAN,
             flags: StarFlags::default(),
@@ -291,6 +299,7 @@ mod tests {
                 s.residual,
                 s.signal,
                 s.area,
+                s.ap_sum,
             ]
         };
         for (x, y) in fields(a).iter().zip(fields(b).iter()) {
@@ -410,6 +419,64 @@ mod tests {
         bytes[last] = 0;
         std::fs::write(&p, &bytes).unwrap();
         assert_eq!(read_fits(&p).unwrap()[0].flags, StarFlags::default());
+    }
+
+    /// Plan D D2b (PD-26): the aperture sum is the 14th number of a version-2 record, NaN included (a fit with no ring).
+    #[test]
+    fn the_aperture_sum_round_trips_and_a_missing_one_stays_nan() {
+        assert_eq!(FITS_ARTIFACT_VERSION, 2);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.athf");
+        let mut with = StarFit::test_at(10.0, 20.0, 1000.0);
+        with.ap_sum = 12345.678;
+        let mut without = StarFit::test_at(30.0, 40.0, 1000.0);
+        without.ap_sum = f64::NAN;
+        write_fits(&p, &[with, without]).unwrap();
+        let back = read_fits(&p).unwrap();
+        assert_eq!(
+            (back[0].ap_sum as f32).to_bits(),
+            (12345.678f64 as f32).to_bits()
+        );
+        assert_eq!(back[0].ap_sum, 12345.678f64 as f32 as f64);
+        assert!(back[1].ap_sum.is_nan());
+        // The reserved flags byte is still the last byte of the record.
+        assert_eq!(back[0].flags, StarFlags::default());
+    }
+
+    /// The record is 14 little-endian `f32` and the flags byte: 57 bytes (53 in version 1), the header 10.
+    #[test]
+    fn a_record_is_57_bytes() {
+        assert_eq!(RECORD_LEN, 57);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("len.athf");
+        let fits: Vec<StarFit> = (0..3)
+            .map(|i| StarFit::test_at(i as f64, 1.0, 10.0))
+            .collect();
+        write_fits(&p, &fits).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len() as usize,
+            HEADER_LEN + 3 * 57
+        );
+    }
+
+    /// A version-1 file (13 numbers and a flags byte per record) is refused as any other version is: a stale file is a
+    /// cache miss for its caller, never a record read at the wrong width.
+    #[test]
+    fn a_version_1_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v1.athf");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 13 * 4 + 1]);
+        std::fs::write(&p, &buf).unwrap();
+        match read_fits(&p) {
+            Err(FitsArtifactError::BadVersion { expected, found }) => {
+                assert_eq!((expected, found), (FITS_ARTIFACT_VERSION, 1));
+            }
+            other => panic!("expected BadVersion, got {other:?}"),
+        }
     }
 
     #[test]

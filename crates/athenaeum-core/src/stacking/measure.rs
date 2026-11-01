@@ -242,12 +242,13 @@ pub struct ChannelMeasurement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction_group: Option<f64>,
     /// Plan D D1w (PD-3): this member's flux over the (group, plane)'s frame-common star set - the paired ratio to the
-    /// group's anchor times the anchor's sums over the whole set ([`crate::stacking::common_set::CommonFlux`]), native
-    /// units, the plane's stand-in `c` already applied. `psf_signal_weight` / `psf_snr` are recomputed from it (and
-    /// `common_tmean_flux`) at the end of stage 5, so these three fields tell where the weight came from. `Some` only
-    /// on a plane that was reweighed; `None` (and never serialized) at Measure time, in the `metrics` artifact, on a
-    /// plane that fell back (PD-6), and for the weight modes outside the PSF family. In memory and in
-    /// `stacking_run_frames.metrics_json` only: the `metrics` artifact payload stays byte-identical.
+    /// group's anchor (of the fits' aperture sums, Plan D D2b / PD-26) times the anchor's sums over the whole set (model
+    /// flux times the plane's `c`; [`crate::stacking::common_set::CommonFlux`]), native units. `psf_signal_weight` /
+    /// `psf_snr` are recomputed from it (and `common_tmean_flux`) at the end of stage 5, so these three fields tell
+    /// where the weight came from. `Some` only on a plane that was reweighed; `None` (and never serialized) at
+    /// Measure time, in the `metrics` artifact, on a plane that fell back (PD-6), and for the weight modes outside the
+    /// PSF family. In memory and in `stacking_run_frames.metrics_json` only: the `metrics` artifact payload stays
+    /// byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub common_tflux: Option<f64>,
     /// The mean-flux twin of [`Self::common_tflux`] (`common_tmean_flux`, PD-3); `Some` exactly when it is.

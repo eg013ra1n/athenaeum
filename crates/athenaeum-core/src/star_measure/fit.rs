@@ -279,6 +279,14 @@ pub struct StarFit {
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
     pub snr: f64,
+    /// The star's aperture sum (Plan D D2b, PD-26): `S = sum (v - B_i)` in the SNR's own aperture (`max(SNR_APERTURE_PER_FWHM
+    /// * fwhm, SNR_APERTURE_MIN_PX)` px about the fitted centre, the star's ring sky), in the fit's units. It is
+    /// [`super::photometry::SnrTerms::s`] of the very call that gives `snr`, stored by the same `snr_pass` closure (no second
+    /// pass, no pixel read of its own); NaN where that call's SNR is NaN (no ring, no present aperture pixel, no positive
+    /// variance). It carries neither `signal`'s model nor `c`: the common-set weight reads it
+    /// ([`crate::stacking::common_set`]); every other reader keeps `signal`. Persisted in the `fits` artifact (version 2).
+    #[serde(skip, default = "not_measured")]
+    pub ap_sum: f64,
     /// The star's half-flux radius, px (F-6, Task 11, [`super::photometry::hfr`]): NaN without a ring, or when the `5F`
     /// circle holds less than half of `signal`. Not persisted.
     #[serde(skip, default = "not_measured")]
@@ -1701,6 +1709,7 @@ fn accept(
         sky_ring: f64::NAN,
         sky_ring_sigma: f64::NAN,
         sky_ring_n: 0,
+        ap_sum: f64::NAN,
         snr: f64::NAN,
         hfr: f64::NAN,
         flags: StarFlags::default(),
@@ -2501,7 +2510,8 @@ fn ring_and_correction(
 /// Every kept fit's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]) from its stored ring sky and noise
 /// and the pixels about its fitted centre: it reads neither `signal` nor `c`, so it is read BEFORE the aperture
 /// correction (Plan B B4, PB-13': the `c` sample's floor reads it). `correction` carries the plane's gain and noise
-/// correlation (default: no gain, white). Nothing the fit measured moves. `pool` as the fit's.
+/// correlation (default: no gain, white). Each fit also keeps the call's aperture sum `S` ([`StarFit::ap_sum`], Plan D
+/// D2b). Nothing the fit measured moves. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
 fn snr_pass(
     data: &[f32],
@@ -2516,7 +2526,7 @@ fn snr_pass(
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
-            f.snr = super::photometry::star_snr(
+            let (snr, terms) = super::photometry::star_snr(
                 data,
                 w,
                 h,
@@ -2524,8 +2534,11 @@ fn snr_pass(
                 correction.gain,
                 mask,
                 &correction.noise,
-            )
-            .0;
+            );
+            f.snr = snr;
+            // Plan D D2b (PD-26): the aperture sum of this very call, kept (NaN where its SNR is: no ring, no present
+            // aperture pixel, no positive variance). A store, not a computation: `star_snr` built `terms` anyway.
+            f.ap_sum = if snr.is_nan() { f64::NAN } else { terms.s };
         })
     };
     super::install_in_span(pool, body);

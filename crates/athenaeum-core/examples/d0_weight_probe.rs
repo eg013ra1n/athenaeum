@@ -18,7 +18,9 @@
 //!   d0_weight_probe common --dumps <D0 probe dir> --clone <C10 clone dir> [--out-dir <dir>]
 //!
 //! (Plan D D1a) judges the product's frame-common star set against D0's offline set (b) on those dumps; see the `common`
-//! module below.
+//! module below. Plan D D2b (PD-26): the star dump carries each fit's aperture sum `S` (`apSum`, the `star_snr` sum the
+//! common-set weight reads) beside `signal` and `apFixed`; a dump measured before D2b has no such column and the `common`
+//! arm refuses it.
 //! Energies are the module's ADU units (x 65535 of the [0, 1] domain), as `StarFit` holds them.
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::stacking::config::StackingConfig;
@@ -286,13 +288,13 @@ fn main() {
             let file = std::fs::File::create(&tsv).unwrap_or_else(|e| die(format!("{}: {e}", tsv.display())));
             let mut o = std::io::BufWriter::new(file);
             let s = ADU_SCALE as f64;
-            writeln!(o, "x\ty\tsignal\tmodel\tarea\tsnr\tflags\tfwhm\tecc\tamplitude\tpeak5\tskyRing\tresidual\tapFixed")
+            writeln!(o, "x\ty\tsignal\tmodel\tarea\tsnr\tflags\tfwhm\tecc\tamplitude\tpeak5\tskyRing\tresidual\tapFixed\tapSum")
                 .unwrap_or_else(|e| die(format!("write: {e}")));
             for f in pf {
                 let ap = fixed_aperture(&data, w, h, f, ap_r);
                 writeln!(
                     o,
-                    "{:.3}\t{:.3}\t{:.6e}\t{:.6e}\t{:.4}\t{:.3}\t{}\t{:.4}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.5e}\t{:.6e}",
+                    "{:.3}\t{:.3}\t{:.6e}\t{:.6e}\t{:.4}\t{:.3}\t{}\t{:.4}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.5e}\t{:.6e}\t{:.6e}",
                     f.x,
                     f.y,
                     f.signal / s,
@@ -306,7 +308,8 @@ fn main() {
                     f.peak5 / s,
                     f.sky_ring / s,
                     f.residual,
-                    ap / s
+                    ap / s,
+                    f.ap_sum / s
                 )
                 .unwrap_or_else(|e| die(format!("write: {e}")));
             }
@@ -349,6 +352,15 @@ fn main() {
 //   `recovered` and `proxy_only` stay on the plane line as notes.
 // The pairs come from `MemberIndex::at`, the ONE re-match of `common_set::match_member`'s search (built on the module's constants), shared
 // by S2 and `lost_breakdown`; it must agree with the module's own table or the probe stops.
+//
+// Plan D D2b (PD-26): the module's paired ratios read each fit's aperture sum `S` (the dump's `apSum` column, `star_snr`'s sum at
+// max(1.5 F, 3) px about the fit, ring sky) and no longer the model flux times `c`; the anchor's whole-set sums, hence the weight's
+// absolute scale, stay model x `c`. So `w_product`, the ranks and every D1A line are the S-based weight; `rf_noise_*` reads
+// sigma_i = S_i / snr_i (`star_snr`'s own noise). Beside them, per frame and plane, the S-based ratios and the model x `c` ones D1w
+// had (`rf_s`/`rf_model`, `qf_s`/`qf_model`, new columns after `rf_noise`), the weight the model ratios give (`w_model`, `rank_model`),
+// and the free-form line `model-weight` (its Spearman against the S-based weight). The model ratios are taken over every pair whose
+// model flux is usable; the S ratios over the pairs whose `S` is too, so the two differ by exactly the stars the module drops for
+// a missing `S`. A dump without the `apSum` column predates D2b and is refused.
 mod common {
     use athenaeum_core::geometry::{KdTree2, PixelMap};
     use athenaeum_core::stacking::common_set::{self, Candidate, CommonOutcome, MemberPlane, Usable};
@@ -419,12 +431,17 @@ mod common {
         let header: Vec<&str> = lines.next().unwrap_or_else(|| die(format!("{}: empty", path.display()))).split('\t').collect();
         let col = |name: &str| header.iter().position(|h| *h == name).unwrap_or_else(|| die(format!("{}: no column {name}", path.display())));
         let (cx, cy, cs, ca, cn, cf, cap) = (col("x"), col("y"), col("signal"), col("area"), col("snr"), col("flags"), col("apFixed"));
+        // Plan D D2b: the aperture sum the weight reads. A dump from before D2b has none, and the weight would be empty on it.
+        let csum = header
+            .iter()
+            .position(|h| *h == "apSum")
+            .unwrap_or_else(|| die(format!("{}: no column apSum: the dump predates Plan D D2b; measure it again with the main arm", path.display())));
         let mut fits = Vec::new();
         let mut ap = Vec::new();
         for (n, line) in lines.enumerate() {
             let f: Vec<&str> = line.split('\t').collect();
             let get = |c: usize| -> f64 { f.get(c).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN) };
-            if f.len() <= cap {
+            if f.len() <= cap.max(csum) {
                 die(format!("{}: line {} has {} columns", path.display(), n + 2, f.len()));
             }
             let flags = f[cf].parse::<u8>().unwrap_or_else(|_| die(format!("{}: line {}: flags {:?}", path.display(), n + 2, f[cf])));
@@ -446,6 +463,7 @@ mod common {
                 sky_ring: f64::NAN,
                 sky_ring_sigma: f64::NAN,
                 sky_ring_n: 0,
+                ap_sum: get(csum) * ADU,
                 snr: get(cn),
                 hfr: f64::NAN,
                 flags: StarFlags(flags),
@@ -913,16 +931,22 @@ mod common {
             .collect()
     }
 
-    /// S2 (PD-16): per member, the relative noise of its paired flux ratio r_f from the dump's per-star SNR (sigma_i = signal_i / snr_i):
-    /// sqrt(sum sigma_i^2) / sum s_i over the set stars the member pairs, plus the anchor's same term over the same stars, in quadrature.
+    /// S2 (PD-16): per member, the relative noise of its paired flux ratio r_f from the dump's per-star SNR (sigma_i = flux_i / snr_i):
+    /// sqrt(sum sigma_i^2) / sum flux_i over the set stars the member pairs, plus the anchor's same term over the same stars, in quadrature.
     /// NaN for a member with no pair (and for every member of a plane without a set). The pairs are the module's own (`pr.usable`), and the
     /// fits come from `MemberIndex`: a disagreement between the two is a bug of this probe and stops it.
-    fn rf_noise(idx: &[MemberIndex<'_>], anchor: usize, pr: &PlaneResult) -> Vec<f64> {
+    ///
+    /// Plan D D2b: `s_based` reads the aperture sum `S` as the flux (then `snr` is `S / sigma_S` by construction: `star_snr`'s own noise) and
+    /// pairs the stars whose `S` is usable, the pairs the S-based ratio is taken over; otherwise the model flux `signal` and every
+    /// signal-usable pair (D1w's r_f, whose noise the D1a bars first judged).
+    fn rf_noise(idx: &[MemberIndex<'_>], anchor: usize, pr: &PlaneResult, s_based: bool) -> Vec<f64> {
+        let flux = |f: &StarFit| if s_based { f.ap_sum } else { f.signal };
         (0..idx.len())
             .map(|k| {
                 let (mut sf, mut vf, mut sa, mut va, mut pairs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
                 for &j in &pr.set_idx {
-                    if pr.usable[k][j].is_none() {
+                    let Some(u) = pr.usable[k][j] else { continue };
+                    if s_based && !(u.ap_sum.is_finite() && u.ap_sum > 0.0) {
                         continue;
                     }
                     pairs += 1;
@@ -934,12 +958,12 @@ mod common {
                     if !(good(f.snr) && good(g.snr)) {
                         continue;
                     }
-                    sf += f.signal;
-                    vf += (f.signal / f.snr).powi(2);
-                    sa += g.signal;
-                    va += (g.signal / g.snr).powi(2);
+                    sf += flux(f);
+                    vf += (flux(f) / f.snr).powi(2);
+                    sa += flux(g);
+                    va += (flux(g) / g.snr).powi(2);
                 }
-                if pairs != pr.paired[k] {
+                if s_based && pairs != pr.paired[k] {
                     die(format!("member {k}: {pairs} pairs in the re-match, {} in the module", pr.paired[k]));
                 }
                 if sf > 0.0 && sa > 0.0 {
@@ -947,6 +971,63 @@ mod common {
                 } else {
                     f64::NAN
                 }
+            })
+            .collect()
+    }
+
+    /// Plan D D2b: per member, `[r_s, r_model, q_s, q_model]` - the member's flux over the anchor's on the set stars it pairs: the aperture
+    /// sums `S` (flux and mean flux `S / area`, the pairs whose `S` is usable: the module's weight) and the model flux times `c` (D1w's
+    /// ratios, every pair whose model flux is usable). NaN for a member with no such pair and for every member of a plane without a set.
+    fn paired_ratios(pr: &PlaneResult) -> Vec<[f64; 4]> {
+        let ratio = |n: f64, d: f64| if d > 0.0 && n.is_finite() { n / d } else { f64::NAN };
+        pr.usable
+            .iter()
+            .map(|u| {
+                if pr.set_idx.is_empty() {
+                    return [f64::NAN; 4];
+                }
+                let (mut s, mut sa, mut qs, mut qsa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                let (mut m, mut ma, mut qm, mut qma) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for &j in &pr.set_idx {
+                    let Some(f) = u[j] else { continue };
+                    let c = &pr.cands[j];
+                    m += f.signal;
+                    ma += c.signal;
+                    qm += f.mean;
+                    qma += c.mean;
+                    if f.ap_sum.is_finite() && f.ap_sum > 0.0 {
+                        s += f.ap_sum;
+                        sa += c.ap_sum;
+                        qs += f.ap_mean;
+                        qsa += c.ap_mean;
+                    }
+                }
+                [ratio(s, sa), ratio(m, ma), ratio(qs, qsa), ratio(qm, qma)]
+            })
+            .collect()
+    }
+
+    /// The plane's weights under D1w's model x `c` ratios (the weight before D2b): the anchor's whole-set sums times each member's model
+    /// ratios, through the same `psf_signal_weight`; a member with no pair reads 0 flux as the module's does. Without a set, the product's
+    /// own (Measure-time) weights.
+    fn model_weights(members: &[Member], p: usize, pr: &PlaneResult, anchor: usize, ratios: &[[f64; 4]]) -> Vec<f64> {
+        if pr.set_idx.is_empty() {
+            return pr.weights.clone();
+        }
+        let asig: f64 = pr.set_idx.iter().map(|&j| pr.cands[j].signal).sum();
+        let amean: f64 = pr.set_idx.iter().map(|&j| pr.cands[j].mean).sum();
+        members
+            .iter()
+            .enumerate()
+            .map(|(k, m)| {
+                let (t, q) = if k == anchor {
+                    (asig, amean)
+                } else if ratios[k][1].is_finite() && ratios[k][3].is_finite() {
+                    (ratios[k][1] * asig, ratios[k][3] * amean)
+                } else {
+                    (0.0, 0.0)
+                };
+                psf_signal_weight(t, q, m.planes[p].noise, m.planes[p].m_star)
             })
             .collect()
     }
@@ -1209,7 +1290,14 @@ mod common {
         }
         // Every member's fits as a match index, per plane: S2's pairs and `lost_breakdown` read the same one.
         let indices: Vec<Vec<MemberIndex<'_>>> = (0..n_planes).map(|p| members.iter().map(|m| MemberIndex::new(m, p)).collect()).collect();
-        let noise: Vec<Vec<f64>> = prod.planes.iter().enumerate().map(|(p, pr)| rf_noise(&indices[p], prod.anchor, pr)).collect();
+        let noise: Vec<Vec<f64>> = prod.planes.iter().enumerate().map(|(p, pr)| rf_noise(&indices[p], prod.anchor, pr, true)).collect();
+        let noise_model: Vec<Vec<f64>> = prod.planes.iter().enumerate().map(|(p, pr)| rf_noise(&indices[p], prod.anchor, pr, false)).collect();
+        // Plan D D2b: the S-based ratios beside D1w's model x c ones, and the weight those give.
+        let ratios: Vec<Vec<[f64; 4]>> = prod.planes.iter().map(paired_ratios).collect();
+        let w_model = frame_weights(
+            &prod.planes.iter().enumerate().map(|(p, pr)| model_weights(&members, p, pr, prod.anchor, &ratios[p])).collect::<Vec<_>>(),
+        );
+        let rank_model = rank_desc(&w_model);
         // D0's (b) side by side, plane by plane.
         let bs: Vec<BResult> = (0..n_planes).map(|p| d0_b(&members, p)).collect();
         let w_b = frame_weights(&bs.iter().map(|b| b.weights.clone()).collect::<Vec<_>>());
@@ -1279,6 +1367,12 @@ mod common {
         println!("{line}");
         let (slope, se) = drift(&frame_fwhm, &w_prod, &w_b);
         println!("D1A drift {ds} {group} slope_pct_per_px={slope:.3} se={se:.3}");
+        let (slope_m, se_m) = drift(&frame_fwhm, &w_model, &w_b);
+        println!(
+            "model-weight {ds} {group} rho(w_product, w_model)={:.6} rho(w_model, w_b)={:.4} drift_model_vs_b_slope_pct_per_px={slope_m:.3} se={se_m:.3}",
+            spearman(&w_prod, &w_model),
+            spearman(&w_model, &w_b)
+        );
         // Per plane: the set against (b)'s.
         let amap = &members[prod.anchor].map;
         for (p, pr) in prod.planes.iter().enumerate() {
@@ -1313,6 +1407,11 @@ mod common {
                 max_finite(&noise[p])
             );
             println!(
+                "plane-info {ds} {group} p{p} rf_noise_model_med={:.6} rf_noise_model_p90={:.6} (D1w's r_f on the model flux, beside the S-based rf_noise_* of the D1A line)",
+                quantile(&noise_model[p], 0.5),
+                quantile(&noise_model[p], 0.9)
+            );
+            println!(
                 "plane-info {ds} {group} p{p} anchor={anchor_key} reference={} candidates={} set={} b_set={} proxy_only_stars={proxy_only} too_few={:?}",
                 members[b.reference].key,
                 pr.cands.len(),
@@ -1326,12 +1425,16 @@ mod common {
             );
         }
         // Per frame.
-        let mut table = String::from("key\tfwhm\tw_product\tw_b\tw_bap\trank_product\trank_b\trank_bap\tpaired\trf_noise\n");
+        // The columns after `rf_noise` are Plan D D2b's: per plane (joined by "/") the S-based and the model x c ratios, then the model weight.
+        let mut table = String::from(
+            "key\tfwhm\tw_product\tw_b\tw_bap\trank_product\trank_b\trank_bap\tpaired\trf_noise\trf_s\trf_model\tqf_s\tqf_model\tw_model\trank_model\n",
+        );
         for (i, m) in members.iter().enumerate() {
             let paired: Vec<String> = prod.planes.iter().map(|p| p.paired[i].to_string()).collect();
             let rf: Vec<String> = noise.iter().map(|n| format!("{:.6}", n[i])).collect();
+            let col = |c: usize| ratios.iter().map(|r| format!("{:.6}", r[i][c])).collect::<Vec<_>>().join("/");
             table.push_str(&format!(
-                "{}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6e}\t{}\n",
                 m.key,
                 m.fwhm,
                 w_prod[i],
@@ -1341,7 +1444,13 @@ mod common {
                 rank_b[i],
                 rank_bap[i],
                 paired.join("/"),
-                rf.join("/")
+                rf.join("/"),
+                col(0),
+                col(1),
+                col(2),
+                col(3),
+                w_model[i],
+                rank_model[i]
             ));
         }
         for row in table.lines().skip(1) {

@@ -760,6 +760,8 @@ fn common_signals(
             y: y - oy,
             signal: 0.0,
             mean: 0.0,
+            ap_sum: 0.0,
+            ap_mean: 0.0,
             anchor_fwhm_px: other_fwhm,
         })
         .collect();
