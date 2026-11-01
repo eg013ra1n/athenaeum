@@ -633,7 +633,7 @@ pub const POINT_SOURCE_MATCH_PER_FIELD_FWHM: f64 = 0.5;
 /// The point-source screen's radius (R-PB4-2): `max(`[`POINT_SOURCE_MATCH_PX`]`, `[`POINT_SOURCE_MATCH_PER_FIELD_FWHM`]
 /// ` * field_fwhm)`, the floor alone where the field FWHM is not a positive number. The colour sample's taking-back of an
 /// extended candidate (Plan D D2, PD-9) reads the same radius.
-fn point_source_match_px(field_fwhm: f64) -> f64 {
+pub fn point_source_match_px(field_fwhm: f64) -> f64 {
     if field_fwhm.is_finite() && field_fwhm > 0.0 {
         POINT_SOURCE_MATCH_PX.max(POINT_SOURCE_MATCH_PER_FIELD_FWHM * field_fwhm)
     } else {
@@ -643,7 +643,7 @@ fn point_source_match_px(field_fwhm: f64) -> f64 {
 
 /// Positions by `radius`-wide cell: whether any lies within `radius` of a point (Euclidean, inclusive), looking at the
 /// 3 x 3 cells about it.
-struct NearIndex {
+pub struct NearIndex {
     radius: f64,
     by_cell: HashMap<(i64, i64), Vec<(f64, f64)>>,
 }
@@ -657,7 +657,7 @@ impl NearIndex {
     }
 
     /// `radius` must be a positive finite number ([`point_source_match_px`] is).
-    fn new(points: impl Iterator<Item = (f64, f64)>, radius: f64) -> NearIndex {
+    pub fn new(points: impl Iterator<Item = (f64, f64)>, radius: f64) -> NearIndex {
         let mut index = NearIndex {
             radius,
             by_cell: HashMap::new(),
@@ -669,7 +669,7 @@ impl NearIndex {
         index
     }
 
-    fn any_within(&self, x: f64, y: f64) -> bool {
+    pub fn any_within(&self, x: f64, y: f64) -> bool {
         let (cx, cy) = self.cell(x, y);
         (cx - 1..=cx + 1).any(|gx| {
             (cy - 1..=cy + 1).any(|gy| {

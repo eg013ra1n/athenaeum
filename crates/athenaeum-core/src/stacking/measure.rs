@@ -494,6 +494,9 @@ pub struct PlaneMeasurement {
     /// The `c` candidates under SNR 20 (or with none), after the point-source screen (PB-13'; the probe's
     /// `apertureBelowSnr`). Reported, not persisted.
     pub aperture_below_snr: usize,
+    /// The extended `c` candidates the colour sample took back into `c`'s list (Plan D D2, PD-9; the lab probe's
+    /// `rescuedCore`); 0 on any image of other than three planes. Reported, not persisted.
+    pub aperture_rescued: usize,
     /// The growth / model ratios `c` is the median over, brightest first (the probe's `--dump-ratios`). Reported, not
     /// persisted.
     pub aperture_ratios: Vec<sm::ApertureRatio>,
@@ -903,6 +906,14 @@ impl PlanesPass1 {
     pub fn planes(&self) -> usize {
         self.beta_own.len()
     }
+
+    /// Plan D D2 (PD-9): each plane's entry of [`sm::point_like_sibling_seeds`], read through the options each plane is
+    /// finished with (the ONE extended slice its fits use). The one gather [`measure_planes_pass2`] makes; the lab
+    /// probe reads it to follow the colour sample's taking-back without a copy of the rule.
+    pub fn point_like_siblings(&self) -> Vec<Option<Vec<Seed>>> {
+        let opts: Vec<&sm::MeasureOptions> = self.heads.iter().map(|h| &h.module_opts).collect();
+        sm::point_like_sibling_seeds(&self.preps, &opts)
+    }
 }
 
 /// [`measure_planes_diagnosed`]'s first half for the group measure (Task 11b): the same heads and verdict passes with
@@ -998,6 +1009,9 @@ pub fn measure_planes_pass2<'a, E>(
     pool: Option<&Arc<rayon::ThreadPool>>,
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
+    // Plan D D2 (PD-9): the colour sample's point-like sibling seeds, gathered before the destructure below consumes the
+    // preps; `psf_model` is the only option the loop changes.
+    let point_siblings = pass1.point_like_siblings();
     let PlanesPass1 {
         w,
         h,
@@ -1015,11 +1029,6 @@ pub fn measure_planes_pass2<'a, E>(
     // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered from the preps (cross-plane flags applied in the first
     // pass; the seeds do not move) before the loop below consumes them.
     let siblings = sm::sibling_seeds(&preps);
-    // Plan D D2 (PD-9): as the first pass's twin above; `psf_model` is the only option the loop below changes.
-    let point_siblings = {
-        let opts: Vec<&sm::MeasureOptions> = heads.iter().map(|h| &h.module_opts).collect();
-        sm::point_like_sibling_seeds(&preps, &opts)
-    };
     let mut out = Vec::with_capacity(heads.len());
     for (p, (mut head, prep)) in heads.into_iter().zip(preps).enumerate() {
         let t = Instant::now();
@@ -1453,6 +1462,7 @@ fn adapter_tail(
             aperture_se: m.aperture_se,
             point_source_screened: m.point_source_screened,
             aperture_below_snr: m.aperture_below_snr,
+            aperture_rescued: m.aperture_rescued,
             aperture_ratios: m.aperture_ratios,
             population: m.population,
             ring_sky_missing: m.ring_sky_missing,

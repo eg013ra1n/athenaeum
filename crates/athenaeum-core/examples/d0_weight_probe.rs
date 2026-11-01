@@ -1,7 +1,14 @@
 //! Plan D task D0 probe (research): replays the stacking Measure stage on a list of frames exactly as
-//! a run does (`measure_frame_pass1`, then `measure_frame_pass2` at the group β per plane) and writes, per plane, the
+//! a run does (`measure_planes_pass1`, then `measure_planes_pass2` at the group β per plane, the two passes the frame
+//! entry points wrap) and writes, per plane, the
 //! channel measurement, candidate weight totals (`signal_totals` over subsets of the accepted fits), the `c`-sample
 //! classifier counts, and one compact TSV row per accepted fit (for the frame-common star set, built offline).
+//!
+//! Plan D D2 (PD-9): the `q1` record also reads the colour sample's taking-back. `depth64Rescue` / `medModelKept64Rescue`
+//! are `depth64` / `medModelKept64` with a rescued extended candidate kept (D0's fields keep their old meaning);
+//! `rescued` is the probe's count at `aperture_correction`'s entry filter, built from the core's own
+//! `point_like_sibling_seeds` (through `PlanesPass1::point_like_siblings`), radius and index, and `rescuedCore` the
+//! Measure's own (`PlaneMeasurement::aperture_rescued`). The two must agree on every plane or the probe stops.
 //!
 //!   d0_weight_probe --config <stacking config json> --betas b0[,b1,b2] --out-dir <dir> --ap-radius <px>
 //!       [--threads N] [--tag <name>] <file>...
@@ -16,16 +23,14 @@
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::measure::{
-    gain_from_header, measure_frame_pass1, measure_frame_pass2, measure_planes_pass1, measure_planes_pass2,
-    ChannelMeasurement, SeedOverride, ADU_SCALE,
+    gain_from_header, measure_planes_pass1, measure_planes_pass2, MeasuredPlane, SeedOverride, ADU_SCALE,
 };
+use athenaeum_core::star_measure::photometry::{point_source_match_px, NearIndex};
 use athenaeum_core::star_measure::{model_flux_in_fwtm, signal_totals, PixelNoise, StarFit};
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -129,7 +134,6 @@ fn main() {
         .append(true)
         .open(out_dir.join("frames.jsonl"))
         .unwrap_or_else(|e| die(format!("frames.jsonl: {e}")));
-    let cancel = AtomicBool::new(false);
     for path in &files {
         let t0 = std::time::Instant::now();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("frame").to_string();
@@ -150,60 +154,101 @@ fn main() {
                 })
                 .collect()
         });
-        let (channels, fits): (Vec<ChannelMeasurement>, Vec<Vec<StarFit>>) = if let Some(planes) = &raw_planes {
-            let read = |p: usize| Ok::<_, Infallible>(Cow::Borrowed(planes[p].as_slice()));
-            let noise = if n == 1 { PixelNoise::White } else { PixelNoise::Mixed };
-            let pass1 = measure_planes_pass1(n, w, h, &opts, Some(&pool), SeedOverride::Fast, false, noise, gain_from_header(path), read)
-                .unwrap_or_else(|never| match never {});
-            let mp = measure_planes_pass2(pass1, &b, Some(&pool), read).unwrap_or_else(|never| match never {});
-            mp.into_iter().map(|m| (m.measurement.channel, m.measurement.fits)).unzip()
-        } else {
-            let pass1 = match measure_frame_pass1(path, &opts, Some(&pool), &cancel) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("d0_weight_probe: {}: pass 1: {e}", path.display());
-                    continue;
-                }
-            };
-            match measure_frame_pass2(path, pass1, &b, &opts, Some(&pool), &cancel) {
-                Ok((fm, fits)) => (fm.channels, fits),
-                Err(e) => {
-                    eprintln!("d0_weight_probe: {}: pass 2: {e}", path.display());
-                    continue;
-                }
+        // Both frame kinds go through the group measure's two passes on the planes' own reads (the run only ever sees
+        // calibrated [0, 1] frames; `--adu` hands the raw light divided by 65535). The probe holds the passes apart so
+        // it can read the colour sample's point-like sibling seeds off the first pass (Plan D D2, PD-9).
+        let read = |p: usize| -> Result<Cow<'_, [f32]>, String> {
+            match &raw_planes {
+                Some(planes) => Ok(Cow::Borrowed(planes[p].as_slice())),
+                None => reader
+                    .read_plane(p)
+                    .map(Cow::Owned)
+                    .map_err(|e| format!("{}: plane {p}: {e}", path.display())),
             }
         };
-        for (p, (ch, pf)) in channels.iter().zip(&fits).enumerate() {
+        let noise = match n {
+            1 => PixelNoise::White,
+            3 => PixelNoise::Mixed,
+            _ => PixelNoise::Unknown,
+        };
+        let pass1 = match measure_planes_pass1(n, w, h, &opts, Some(&pool), SeedOverride::Fast, false, noise, gain_from_header(path), read) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("d0_weight_probe: {}: pass 1: {e}", path.display());
+                continue;
+            }
+        };
+        let point_siblings = pass1.point_like_siblings();
+        let measured: Vec<MeasuredPlane> = match measure_planes_pass2(pass1, &b, Some(&pool), read) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("d0_weight_probe: {}: pass 2: {e}", path.display());
+                continue;
+            }
+        };
+        for (p, mp) in measured.iter().enumerate() {
+            let (ch, pf) = (&mp.measurement.channel, &mp.measurement.fits);
             let data = match &raw_planes {
                 Some(planes) => planes[p].clone(),
                 None => reader.read_plane(p).unwrap_or_else(|e| die(format!("{}: plane {p}: {e}", path.display()))),
             };
+            // Plan D D2 (PD-9): the colour sample's taking-back, read off the core's own pieces. `near` is the index
+            // `aperture_correction` builds (the plane's entry of `point_like_sibling_seeds`, at the PB-12' radius of
+            // the field FWHM the fit ran on, which is `field_width` when the caller gave it, as the measure path
+            // does); an extended fit is rescued when it holds a point-like seed of another plane within that radius.
+            let field_fwhm = mp.measurement.field_width.fwhm_px;
+            let near = point_siblings[p]
+                .as_ref()
+                .map(|seeds| NearIndex::new(seeds.iter().map(|s| (s.x, s.y)), point_source_match_px(field_fwhm)));
+            let rescue = |f: &StarFit| f.flags.extended() && near.as_ref().is_some_and(|nr| nr.any_within(f.x, f.y));
+            // The core's entry filter (photometry.rs, `aperture_correction`): not saturated, and not extended unless
+            // rescued, a finite positive model flux; its `rescued` counts the extended ones left in the list. The
+            // self-check: the probe's count and the Measure's own (`aperture_rescued`) must agree on every plane.
+            let rescued = pf
+                .iter()
+                .filter(|f| !f.flags.saturated() && rescue(f))
+                .map(model_flux_in_fwtm)
+                .filter(|m| m.is_finite() && *m > 0.0)
+                .count();
+            let rescued_core = mp.measurement.aperture_rescued;
+            if rescued != rescued_core {
+                die(format!(
+                    "SELF-CHECK MISMATCH {} plane {p} ({n} planes): the probe counts {rescued} rescued, the Measure {rescued_core}",
+                    path.display()
+                ));
+            }
             // `c`'s candidate pool before the `extended` gate: accepted, unsaturated, finite model flux, SNR >= 20,
-            // by model flux (the order `aperture_correction` sorts in).
-            let mut pool0: Vec<(f64, bool)> = pf
+            // by model flux (the order `aperture_correction` sorts in); each with its extended flag (D0's meaning)
+            // and whether the colour sample takes it back.
+            let mut pool0: Vec<(f64, bool, bool)> = pf
                 .iter()
                 .filter(|f| !f.flags.saturated())
-                .map(|f| (model_flux_in_fwtm(f), f.flags.extended(), f.snr))
-                .filter(|&(m, _, snr)| m.is_finite() && m > 0.0 && snr >= 20.0)
-                .map(|(m, e, _)| (m, e))
+                .map(|f| (model_flux_in_fwtm(f), f.flags.extended(), rescue(f), f.snr))
+                .filter(|&(m, _, _, snr)| m.is_finite() && m > 0.0 && snr >= 20.0)
+                .map(|(m, e, r, _)| (m, e, r))
                 .collect();
             pool0.sort_by(|a, b| b.0.total_cmp(&a.0));
             let ext_in = |k: usize| pool0.iter().take(k).filter(|x| x.1).count();
             // How deep the 64 non-extended candidates reach into the pool (1-based rank of the 64th), and their
-            // median model flux against the top 64's.
-            let mut kept = 0usize;
-            let mut depth = 0usize;
-            let mut kept_m: Vec<f64> = Vec::new();
-            for (i, (m, e)) in pool0.iter().enumerate() {
-                if !e {
-                    kept += 1;
-                    kept_m.push(*m);
-                    if kept == 64 {
-                        depth = i + 1;
-                        break;
+            // median model flux against the top 64's; and the same with a rescued extended candidate kept as well.
+            let kept_64 = |keep: &dyn Fn(&(f64, bool, bool)) -> bool| -> (usize, Vec<f64>) {
+                let mut kept = 0usize;
+                let mut depth = 0usize;
+                let mut kept_m: Vec<f64> = Vec::new();
+                for (i, x) in pool0.iter().enumerate() {
+                    if keep(x) {
+                        kept += 1;
+                        kept_m.push(x.0);
+                        if kept == 64 {
+                            depth = i + 1;
+                            break;
+                        }
                     }
                 }
-            }
+                (depth, kept_m)
+            };
+            let (depth, mut kept_m) = kept_64(&|x| !x.1);
+            let (depth_r, mut kept_m_r) = kept_64(&|x| !x.1 || x.2);
             let med = |v: &mut Vec<f64>| {
                 if v.is_empty() {
                     f64::NAN
@@ -220,6 +265,10 @@ fn main() {
                 "depth64": depth,
                 "medModelKept64": nn(med(&mut kept_m) / ADU_SCALE as f64),
                 "medModelTop64": nn(med(&mut top_m) / ADU_SCALE as f64),
+                "depth64Rescue": depth_r,
+                "medModelKept64Rescue": nn(med(&mut kept_m_r) / ADU_SCALE as f64),
+                "rescued": rescued,
+                "rescuedCore": rescued_core,
                 "extAccepted": pf.iter().filter(|f| f.flags.extended()).count(),
                 "satAccepted": pf.iter().filter(|f| f.flags.saturated()).count(),
             });
