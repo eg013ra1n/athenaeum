@@ -1090,6 +1090,7 @@ pub fn detect(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1097,6 +1098,14 @@ pub fn detect(
 /// ruling Q4: [`domain::background_mesh`] over the same present pixels, with its noise map; moved in, so its
 /// background map is freed once the plane is background-subtracted) and with the plane's saturation inputs (the knot
 /// tests' near-clip exemption); `None` = the mesh computed here, no exemption.
+///
+/// `width_hint` (Plan D D1 r2): a field width (FWHM, px) the caller already knows for this plane's stars. It stands in
+/// for the width pass 1's readable candidates give - pass 1 still seeds and its reads still set the knot bounds' star-width
+/// envelope, but the knot tests, pass 2 and the report's [`FieldWidth`] run at the hint (clamped to the module's range).
+/// For a plane whose pass-1 pool is mostly not stars: an image read through a resampling warp has no 3×3 median
+/// (route E is for a plane stated White), and where its single-pixel defects outnumber its readable stars the pool's
+/// mode lands on them, at the clamp floor, and every real star is flagged extended. `None` = the pool's own mode, the
+/// rule everywhere else. A hint that is not a positive number is refused loudly and the pool's own mode is used.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_with(
     plane: &[f32],
@@ -1111,6 +1120,7 @@ pub(crate) fn detect_with(
     mesh: Option<BackgroundMesh>,
     saturation: Option<&SaturationPlane>,
     sub: Option<&SubSteps>,
+    width_hint: Option<f64>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
     if plane.len() != w * h || mask.is_some_and(|m| m.len() != w * h) || w < 3 || h < 3 {
         warn!(
@@ -1149,6 +1159,17 @@ pub(crate) fn detect_with(
             DetectionReport::none(),
         );
     }
+    let width_hint = match width_hint {
+        Some(hint) if hint.is_finite() && hint > 0.0 => Some(hint),
+        Some(bad) => {
+            warn!(
+                width_hint_px = bad,
+                "matched filter: the field-width hint is not a positive number; the plane's own width is read"
+            );
+            None
+        }
+        None => None,
+    };
     let run = || {
         let mesh = mesh.unwrap_or_else(|| domain::background_mesh(plane, w, h, mask, true));
         detect_on(
@@ -1163,6 +1184,7 @@ pub(crate) fn detect_with(
             mesh,
             saturation,
             sub,
+            width_hint,
         )
     };
     super::install_in_span(pool, run)
@@ -1181,6 +1203,7 @@ fn detect_on(
     mesh: BackgroundMesh,
     saturation: Option<&SaturationPlane>,
     sub: Option<&SubSteps>,
+    width_hint: Option<f64>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
     let prep_span = substeps::span(sub, Step::DetectPrep);
     let present_at = |i: usize| plane[i].is_finite() && mask.map_or(true, |m| m[i]);
@@ -1321,7 +1344,17 @@ fn detect_on(
     let reads = readable_widths(plane, w, h, &at, mask);
     drop(at);
     let mut widths: Vec<f64> = reads.iter().map(|&(width, _)| width).collect();
-    let (field, mode_px) = field_width_of_reads(&mut widths);
+    // A caller's hint replaces the pool's mode (D1 r2); the reads still count for `from_stars` and set the envelope.
+    let (field, mode_px) = match width_hint {
+        Some(hint) => (
+            FieldWidth {
+                fwhm_px: hint.clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX),
+                from_stars: widths.len(),
+            },
+            None,
+        ),
+        None => field_width_of_reads(&mut widths),
+    };
     drop(widths);
     // Never silent (Q4): a width at the clamp floor is recorded, once per detected plane, before pass 2 so no early
     // return skips it.
@@ -1376,7 +1409,7 @@ fn detect_on(
         };
         let s = sort_and_merge(std::mem::take(&mut p.seeds));
         (p, s)
-    } else if field.from_stars == 0 && !median_on {
+    } else if field.from_stars == 0 && !median_on && width_hint.is_none() {
         // No width was read: the field width is the first pass's own, so its candidates stand.
         (
             PassOutcome {
@@ -1469,6 +1502,7 @@ fn detect_on(
         spikes = second.spikes,
         stars_detected = kept.len(),
         count = found,
+        width_hint_px = width_hint,
         "matched filter seeds detected"
     );
     (kept, field, report)
@@ -2719,6 +2753,7 @@ mod tests {
             mesh,
             None,
             None,
+            None,
         )
     }
 
@@ -2795,6 +2830,44 @@ mod tests {
             (fw.fwhm_px / f_twin - 1.0).abs() <= 0.1,
             "events {fw:?} vs the event-free twin {f_twin}"
         );
+    }
+
+    /// Plan D D1 r2: a caller's width hint stands in for the pool's mode - the report's width is the hint (clamped to the
+    /// module's range) over the same pool of reads - and one that is not a positive number is refused, the pool's own
+    /// mode read as without it.
+    #[test]
+    fn a_width_hint_replaces_the_pools_mode_and_a_bad_one_is_refused() {
+        use crate::test_support::add_noise;
+        let (w, h) = (2048usize, 2048usize);
+        let (mut data, _, sigma) = broad_star_field();
+        add_noise(&mut data, sigma as f32, 302);
+        let scaled = working(&data);
+        let (noise, _) = domain::noise_model(&scaled, w, h, None);
+        let run = |hint: Option<f64>| {
+            detect_with(
+                &scaled,
+                w,
+                h,
+                &noise,
+                DEFAULT_THRESHOLD,
+                24576,
+                None,
+                None,
+                PixelNoise::White,
+                None,
+                None,
+                None,
+                hint,
+            )
+        };
+        let (_, own, _) = run(None);
+        assert!((own.fwhm_px / 5.0 - 1.0).abs() <= 0.1 && own.from_stars >= 100, "{own:?}");
+        let (seeds, hinted, _) = run(Some(7.0));
+        assert!(!seeds.is_empty());
+        assert_eq!(hinted.fwhm_px, 7.0);
+        assert_eq!(hinted.from_stars, own.from_stars, "the same pool of reads");
+        assert_eq!(run(Some(100.0)).1.fwhm_px, FIELD_WIDTH_MAX_PX);
+        assert_eq!(run(Some(f64::NAN)).1, own, "a hint that is not a number is refused");
     }
 
     /// The reference median of `d`'s window at `(x, y)` over its present pixels, by a full sort.

@@ -34,7 +34,8 @@ use crate::stacking::common_set::{self, COMMON_MIN_STARS};
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::{LnFrameGrids, LnGrid};
 use crate::stacking::measure::{
-    measure_planes_diagnosed, FrameMeasurement, MeasureOptions, PlaneMeasurement, SeedOverride,
+    measure_planes_diagnosed, measure_planes_with_width_hints, FrameMeasurement, MeasureOptions,
+    PlaneMeasurement, SeedOverride,
 };
 use crate::stacking::psf_signal;
 use crate::star_measure::StarFit;
@@ -847,6 +848,39 @@ fn paired_common_snr(
     ))
 }
 
+/// The field width (FWHM, px) the gain's re-read of the best sub is told, per plane (Plan D D1 r2): the sub's Measure-time
+/// `ChannelMeasurement::fwhm_px`, which is in the sub's own pixels, times the registration map's scale (`√|det|` of its
+/// linear part: 1 on one optical train, and the factor a resampled sub's stars are widened by when it is not) because the
+/// warped image lives in the delivered grid's pixels. `None` for a plane Measure left no finite positive width for (no
+/// star fitted): its own read stands. A scale far from 1 is logged, and a map with no usable scale gives no hint at all.
+fn best_sub_width_hints(best: &StackFrame, channels: usize) -> Vec<Option<f64>> {
+    let scale = best.map.linear.scale();
+    if !(scale.is_finite() && scale > 0.0) {
+        warn!(
+            frame_id = best.frame_id,
+            map_scale = scale,
+            "snr gain: the best sub's registration map has no usable scale; its field width is read from the warped image"
+        );
+        return vec![None; channels];
+    }
+    if (scale - 1.0).abs() > 0.05 {
+        debug!(
+            frame_id = best.frame_id,
+            map_scale = scale,
+            "snr gain: the best sub's registration map scale differs from 1; its Measure-time width is scaled by it"
+        );
+    }
+    (0..channels)
+        .map(|p| {
+            best.measurement
+                .channels
+                .get(p)
+                .map(|c| c.fwhm_px * scale)
+                .filter(|w| w.is_finite() && *w > 0.0)
+        })
+        .collect()
+}
+
 /// [`GroupStats::snr_gain`], per plane: `√(PSF SNR master / PSF SNR best
 /// sub)` from a paired measurement.
 ///
@@ -870,6 +904,12 @@ fn paired_common_snr(
 /// ([`paired_common_snr`]), the gain is `√` of the ratio of the two powers. A
 /// clipped star, a blend or a wider PSF's extra flux outside the set cannot move
 /// it, and it does not grow with the best sub's width.
+///
+/// The best sub is read warped and so measured as `Mixed` (no 3x3 detection median, which a resampled plane's noise
+/// does not allow), and a sub with more single-pixel defects than stars - an un-darked 120 s narrowband light - would
+/// then read its field width off the warped defects (the clamp floor) and flag every star extended: nothing pairs, the
+/// gain is `0.0` (hc11 G, Plan D D1 r2). So its detection is told the width Measure read on the same sub
+/// ([`best_sub_width_hints`]); the master keeps its own estimate, where rejection has removed the defects.
 ///
 /// One frame plane resident at a time (plus its crop). `0.0` for every
 /// plane, with a warn, when the common rectangle is under
@@ -949,9 +989,10 @@ fn paired_snr_gain(
     drop(src);
     let r = rect.expect("channels >= 1");
 
-    let measure_pair = |planes: &(dyn Fn(usize) -> Vec<f32> + Sync)| {
+    let hints = best_sub_width_hints(best, channels);
+    let measure_pair = |planes: &(dyn Fn(usize) -> Vec<f32> + Sync), hints: &[Option<f64>]| {
         pool.install(|| {
-            measure_planes_diagnosed(
+            measure_planes_with_width_hints(
                 channels,
                 r.width,
                 r.height,
@@ -962,6 +1003,7 @@ fn paired_snr_gain(
                 // Both images are resampled: mixed pixels (ruling C-10).
                 crate::star_measure::PixelNoise::Mixed,
                 None,
+                hints,
                 |p| {
                     if cancel.load(Ordering::Relaxed) {
                         warn!(plane = p, "group integration cancelled");
@@ -972,9 +1014,12 @@ fn paired_snr_gain(
             )
         })
     };
-    let master_m =
-        measure_pair(&|p| crop_plane(&master[p * plane_len..(p + 1) * plane_len], w, r))?;
-    let sub_m = measure_pair(&|p| sub_planes[p].clone())?;
+    // The master keeps its own width estimate (no hint); the best sub is told the width it had at Measure.
+    let master_m = measure_pair(
+        &|p| crop_plane(&master[p * plane_len..(p + 1) * plane_len], w, r),
+        &[],
+    )?;
+    let sub_m = measure_pair(&|p| sub_planes[p].clone(), &hints)?;
 
     Ok(master_m
         .iter()
@@ -1010,6 +1055,7 @@ fn paired_snr_gain(
                 crop_y0 = r.y0,
                 crop_width = r.width,
                 crop_height = r.height,
+                width_hint_px = hints.get(p).copied().flatten(),
                 snr_gain = gain,
                 "snr gain measured"
             );
@@ -2940,6 +2986,9 @@ mod tests {
         best_ceiling: Option<f32>,
         /// The other frames' weight (the best sub's is 1.0): how much of the master the best sub is.
         rest_weight: f64,
+        /// Single-pixel defects of the best sub alone ([`gain_hot_pixels`]): the other seven frames have none at those
+        /// pixels, so the master rejects them and the sub's registered read keeps them.
+        best_hot_pixels: usize,
     }
 
     impl Default for GainSpec {
@@ -2950,8 +2999,35 @@ mod tests {
                 best_only: Vec::new(),
                 best_ceiling: None,
                 rest_weight: 0.5,
+                best_hot_pixels: 0,
             }
         }
+    }
+
+    /// A hot pixel's excess over the sky (native units): a strong defect, as an un-darked 120 s sub has. At 0.3 the
+    /// warped blobs sit under the stars' own readable reads and the fixture does not reproduce the failure.
+    const HOT_PIXEL_ADU: f32 = 0.8;
+
+    /// `n` single-pixel defects for the best sub, as `(x, y)` in its own pixels: a deterministic walk that keeps 8 px
+    /// clear of the set's stars (as the sub sees them, shifted by `shift`), 6 px clear of the border and 4 px clear of
+    /// each other.
+    fn gain_hot_pixels(n: usize, shift: (f64, f64)) -> Vec<(usize, usize)> {
+        let stars: Vec<(f64, f64)> = gain_set().iter().map(|&(x, y)| (x + shift.0, y + shift.1)).collect();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(n);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |span: usize| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            6 + (state >> 33) as usize % (span - 12)
+        };
+        while out.len() < n {
+            let (x, y) = (next(GAIN_W), next(GAIN_H));
+            let on_a_star = stars.iter().any(|&(sx, sy)| (sx - x as f64).hypot(sy - y as f64) < 8.0);
+            let near_one = out.iter().any(|&(ox, oy)| ox.abs_diff(x) < 4 && oy.abs_diff(y) < 4);
+            if !on_a_star && !near_one {
+                out.push((x, y));
+            }
+        }
+        out
     }
 
     /// Eight dithered frames of the 30-star field, written to `dir`; the frame at `GAIN_BEST` weighs 1.0, the rest
@@ -2974,6 +3050,11 @@ mod tests {
                     stars.extend(spec.best_only.iter().map(|&(x, y, a)| (x + dx, y + dy, a * k)));
                 }
                 let mut data = gaussian_field(GAIN_W, GAIN_H, &stars, 1.8 * width, 0.08);
+                if best {
+                    for (x, y) in gain_hot_pixels(spec.best_hot_pixels, (dx, dy)) {
+                        data[y * GAIN_W + x] += HOT_PIXEL_ADU;
+                    }
+                }
                 if let (true, Some(ceiling)) = (best, spec.best_ceiling) {
                     for v in data.iter_mut() {
                         *v = v.min(ceiling);
@@ -3140,12 +3221,88 @@ mod tests {
         assert!((25..=30).contains(&paired_of(&log)), "{log}");
     }
 
-    /// No set, a plane that fell back, or fewer than `COMMON_MIN_STARS` stars paired: the gain is 0.0 with a warn
-    /// that names its reason, and the master's PSF SNR keeps its whole-field value.
+    /// Plan D D1 r2: the best sub's registered read keeps its Measure-time field width. The sub carries four times
+    /// as many single-pixel defects as stars, at pixels the other seven frames do not share (the master rejects them).
+    /// Measure read the sub as a White plane, whose 3x3 detection median drops them; the gain's re-read is Mixed (the
+    /// warp mixes the pixels, ruling C-10), takes no median, and the warped defects - a ~1.5 px blob each - outnumber
+    /// the stars, so pass 1's width mode landed on them (the clamp floor) and every real star was flagged extended:
+    /// 0 paired, gain 0.0. hc11 G, 2026-11-01. The sub's own Measure-time width stands in for the unreadable one.
     #[test]
-    fn without_a_common_set_the_gain_is_zero_with_a_warn() {
+    fn the_gain_reads_a_best_sub_whose_defects_outnumber_its_stars() {
+        let set = vec![Some(gain_set())];
+        let dir = tempfile::tempdir().unwrap();
+        let spec = GainSpec {
+            best_hot_pixels: 4 * gain_set().len(),
+            ..GainSpec::default()
+        };
+        let frames = gain_frames(dir.path(), &spec);
+        // The premise: Measure read the sub properly (White plane, median on): its stars fitted, no floor flag.
+        let best = &frames[GAIN_BEST].measurement.channels[0];
+        assert!(best.stars_fitted >= 25 && !best.field_width_at_floor, "Measure: {best:?}");
+        let (out, log) = gain_run(&frames, Some(&set));
+        let gain = out.stats.snr_gain[0];
+        assert!(
+            gain > 1.0 && gain < 1.25 * 8f64.sqrt(),
+            "gain {gain}\n{}",
+            log.lines().filter(|l| l.contains("snr_gain") || l.contains("clamp floor")).collect::<Vec<_>>().join("\n")
+        );
+        assert!(paired_of(&log) >= 20, "{log}");
+        // The line names the width the sub's detection was told.
+        assert!(measured_lines(&log).contains("width_hint_px="), "{log}");
+    }
+
+    /// Plan D D1 r2: the hint is the best sub's Measure-time width in the DELIVERED grid's pixels (its own times the
+    /// registration map's scale), per plane; a plane Measure left no width for has none.
+    #[test]
+    fn the_hint_is_the_best_subs_measure_time_width_in_the_grids_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = gain_frames(dir.path(), &GainSpec::default());
+        let best = &mut frames[GAIN_BEST];
+        let own = best.measurement.channels[0].fwhm_px;
+        assert!(own > 3.5 && own < 5.0, "the fixture's stars are 1.8 px sigma: {own}");
+        // A shift: scale 1.
+        assert_eq!(best_sub_width_hints(best, 1), vec![Some(own)]);
+        // A sub at half the grid's pixel scale (grid px = 2 x sub px): its stars are twice as wide there.
+        best.map = PixelMap::linear(Linear {
+            kind: LinearKind::Similarity,
+            m: [[2.0, 0.0, 5.0], [0.0, 2.0, 7.0], [0.0, 0.0, 1.0]],
+        })
+        .unwrap();
+        let hints = best_sub_width_hints(best, 1);
+        assert!((hints[0].unwrap() / own - 2.0).abs() < 1e-12, "{hints:?}");
+        // A plane the measurement has no channel for, one with no fitted star, one with no number: its own read.
+        assert_eq!(best_sub_width_hints(best, 2)[1], None);
+        for bad in [0.0, f64::NAN, -1.0] {
+            best.measurement.channels[0].fwhm_px = bad;
+            assert_eq!(best_sub_width_hints(best, 1), vec![None], "{bad}");
+        }
+    }
+
+    /// Plan D D1 r2: a clean best sub's gain does not move with the hint. Recorded at 62d7017d (before the hint), same
+    /// frames, same seeds.
+    #[test]
+    fn the_hint_leaves_a_clean_best_subs_gain_where_it_was() {
+        const GAIN_AT_62D7017D: f64 = 2.5241172057203327;
+        let set = vec![Some(gain_set())];
+        let dir = tempfile::tempdir().unwrap();
+        let (out, log) = gain_run(&gain_frames(dir.path(), &GainSpec::default()), Some(&set));
+        let gain = out.stats.snr_gain[0];
+        assert!(
+            (gain - GAIN_AT_62D7017D).abs() < 1e-9,
+            "gain {gain:.12}, was {GAIN_AT_62D7017D:.12}\n{}",
+            measured_lines(&log)
+        );
+    }
+
+    /// No set, a plane that fell back, or fewer than `COMMON_MIN_STARS` stars paired: the gain is 0.0, the master's PSF
+    /// SNR keeps its whole-field value, and the log line names the reason at the level of its cause - `debug!` for a
+    /// group never reweighed, `warn!` for a fallback and for an "under 20 paired".
+    #[test]
+    fn a_plane_without_a_paired_set_has_a_zero_gain_and_a_log_line_that_names_its_cause() {
         let dir = tempfile::tempdir().unwrap();
         let frames = gain_frames(dir.path(), &GainSpec::default());
+        // A mono group whose one plane fell back: what `stacking::run::reweigh_groups` records for it since D1b r2
+        // (`Some([None])`; `a_group_that_fell_back_reaches_the_output_stage_as_a_fallback` pins the run's side).
         let fallen: Vec<Option<Vec<(f64, f64)>>> = vec![None];
         let few = vec![Some(gain_set()[..12].to_vec())];
         let (none, log_none) = gain_run(&frames, None);
@@ -3474,7 +3631,8 @@ mod tests {
         );
         // Plan D D1b: the gain is read over the frame-common star set, and this 12-star fixture (the 4x3 grid
         // above) cannot hold `COMMON_MIN_STARS` of them. This group is handed no set (`common_stars: None`), so its
-        // gain is the "no positions" 0.0, which `without_a_common_set_the_gain_is_zero_with_a_warn` pins; the value
+        // gain is the "no positions" 0.0, which
+        // `a_plane_without_a_paired_set_has_a_zero_gain_and_a_log_line_that_names_its_cause` pins; the value
         // itself, its √N bound and its bound under unequal weights are pinned on the 30-star fixture by
         // `snr_gain_of_n_equal_frames_is_about_root_n` and `the_paired_gain_reads_only_the_common_stars`. Before D1b
         // this block asserted `1 < snr_gain < 2`.

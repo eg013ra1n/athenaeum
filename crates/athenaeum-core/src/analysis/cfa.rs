@@ -110,6 +110,8 @@ pub fn measure_green_sites(
         diagnostics: base.diagnostics,
         mask: Some(green_mask(w, h, pattern)),
         field_width: Some(field_width),
+        // Given seeds: nothing is detected, so there is no detection width to tell.
+        detect_width_hint: None,
         colour: false,
         pixel_noise: PixelNoise::White,
         cfa_site_share: None,

@@ -389,8 +389,9 @@ pub(crate) struct RunContext {
     pub(crate) group_ln_reference_c: HashMap<String, Vec<Option<f64>>>,
     /// Plan D D1w: each reweighed group's frame-common star set, per plane, in group coordinates
     /// ([`crate::stacking::common_set::CommonOutcome::Measured::positions`]), recorded by [`reweigh_groups`] at the end of
-    /// stage 5 for D1b's SNR gain. A plane that fell back (PD-6) holds `None`; a group never reweighed (a weight mode
-    /// outside the PSF family, or no aligned member) is absent.
+    /// stage 5 for D1b's SNR gain. A plane that fell back (PD-6) holds `None`, and a group whose every plane fell back
+    /// still holds its record (`[None, ...]`); a group never reweighed (a weight mode outside the PSF family, or no
+    /// aligned member) is absent.
     pub(crate) common_stars: HashMap<String, Vec<Option<Vec<(f64, f64)>>>>,
     /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
     /// P-14); a run whose own resolution differs warns once.
@@ -10077,11 +10078,9 @@ fn reweigh_group(
             }
         }
     }
-    if any_measured {
-        rc.common_stars.insert(group.key.clone(), sets);
-    } else {
-        rc.common_stars.remove(&group.key);
-    }
+    // The record stays whenever this phase ran (D1b re-review m1): a group whose every plane fell back reaches integrate
+    // as `Some([None, ...])`, a fallback that warns, so `None` there means "never reweighed" and nothing else.
+    rc.common_stars.insert(group.key.clone(), sets);
 
     // Phase 3: the weights over the members, and the floor that stage 3 deferred. A group whose every plane fell back
     // keeps the weights stage 3 gave it, on stage 3's one scale (PD-6); the floor runs on them. Otherwise the members'

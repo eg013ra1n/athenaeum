@@ -658,7 +658,40 @@ pub fn measure_plane_diagnosed(
     gain_e_per_unit: Option<f64>,
     cfa_site_share: Option<f64>,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
-    let head = adapter_head(
+    measure_plane_hinted(
+        data,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        diagnostics,
+        colour,
+        pixel_noise,
+        gain_e_per_unit,
+        cfa_site_share,
+        None,
+    )
+}
+
+/// [`measure_plane_diagnosed`] with the matched filter's field-width hint ([`sm::MeasureOptions::detect_width_hint`]);
+/// `None` is exactly [`measure_plane_diagnosed`].
+#[allow(clippy::too_many_arguments)]
+fn measure_plane_hinted(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    colour: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    cfa_site_share: Option<f64>,
+    detect_width_hint: Option<f64>,
+) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
+    let mut head = adapter_head(
         data,
         w,
         h,
@@ -671,6 +704,7 @@ pub fn measure_plane_diagnosed(
         gain_e_per_unit,
         cfa_site_share,
     );
+    head.module_opts.detect_width_hint = detect_width_hint;
     let m = sm::measure_plane(data, w, h, &head.module_opts, pool);
     adapter_tail(head, m)
 }
@@ -702,13 +736,48 @@ pub fn measure_planes_diagnosed<'a, E>(
     diagnostics: bool,
     pixel_noise: sm::PixelNoise,
     gain_e_per_unit: Option<f64>,
+    plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
+) -> Result<Vec<MeasuredPlane>, E> {
+    measure_planes_with_width_hints(
+        n_planes,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        diagnostics,
+        pixel_noise,
+        gain_e_per_unit,
+        &[],
+        plane,
+    )
+}
+
+/// [`measure_planes_diagnosed`] with a field-width hint per plane for the matched filter ([`sm::MeasureOptions::detect_width_hint`]):
+/// `detect_width_hints[p]` is plane `p`'s, in this image's pixels; a plane past the slice's end, a `None`, and an
+/// empty slice (exactly [`measure_planes_diagnosed`]) read the plane's own width. Plan D D1 r2: the gain's re-read of
+/// the best sub, a resampled image the detection median does not suit, passes the sub's Measure-time width. Not a
+/// field of [`MeasureOptions`], which is a serialized config.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_planes_with_width_hints<'a, E>(
+    n_planes: usize,
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    detect_width_hints: &[Option<f64>],
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
+    let hint = |p: usize| detect_width_hints.get(p).copied().flatten();
     if n_planes == 1 {
         let t = Instant::now();
         let data = plane(0)?;
         let _span = tracing::debug_span!("measure_plane", plane = 0).entered();
-        let (measurement, seeds, diagnostics) = measure_plane_diagnosed(
+        let (measurement, seeds, diagnostics) = measure_plane_hinted(
             &data,
             w,
             h,
@@ -720,6 +789,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             pixel_noise,
             gain_e_per_unit,
             None,
+            hint(0),
         );
         return Ok(vec![MeasuredPlane {
             measurement,
@@ -738,7 +808,7 @@ pub fn measure_planes_diagnosed<'a, E>(
         let t = Instant::now();
         let data = plane(p)?;
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
-        let head = adapter_head(
+        let mut head = adapter_head(
             &data,
             w,
             h,
@@ -752,6 +822,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             // A debayered RGGB colour image's planes 0 / 1 / 2 are R / G / B: the share of their own colour's sites.
             (colour && n_planes == 3).then(|| [0.25, 0.5, 0.25][p]),
         );
+        head.module_opts.detect_width_hint = hint(p);
         preps.push(sm::prepare_plane(&data, w, h, &head.module_opts, pool));
         heads.push(head);
         if p + 1 == n_planes {
@@ -1034,6 +1105,7 @@ fn module_options(
         diagnostics,
         mask: None,
         field_width: None,
+        detect_width_hint: None,
         colour,
         pixel_noise,
         cfa_site_share,
@@ -2547,6 +2619,56 @@ pub(crate) mod tests {
             .and_then(|d| d.verdict)
             .expect("an accepted star has a verdict");
         (fits[star], verdict)
+    }
+
+    /// Plan D D1 r2: the per-plane width hints reach each plane's matched filter - a plane with a hint reports it as its
+    /// field width, a plane without one (a `None`, or past the slice) reads its own, and no hints at all is
+    /// `measure_planes_diagnosed` exactly.
+    #[test]
+    fn width_hints_reach_their_own_planes_only() {
+        let (planes, w, h) = cross_plane_fixture();
+        let opts = MeasureOptions::default();
+        let run = |n: usize, hints: &[Option<f64>]| {
+            measure_planes_with_width_hints(
+                n,
+                w,
+                h,
+                &opts,
+                None,
+                SeedOverride::Fast,
+                false,
+                sm::PixelNoise::Mixed,
+                None,
+                hints,
+                |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+            )
+            .unwrap()
+        };
+        let plain = measure_planes_diagnosed(
+            3,
+            w,
+            h,
+            &opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::Mixed,
+            None,
+            |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+        )
+        .unwrap();
+        let width = |m: &[MeasuredPlane], p: usize| m[p].measurement.field_width;
+        let none = run(3, &[]);
+        let hinted = run(3, &[Some(6.0), None, Some(8.0)]);
+        for p in 0..3 {
+            assert_eq!(width(&none, p), width(&plain, p), "plane {p}: no hints is the plain entry");
+        }
+        assert_eq!(width(&hinted, 0).fwhm_px, 6.0);
+        assert_eq!(width(&hinted, 2).fwhm_px, 8.0);
+        assert_eq!(width(&hinted, 1), width(&plain, 1), "the plane without a hint reads its own");
+        // One plane goes through the single-plane branch.
+        assert_eq!(run(1, &[Some(7.0)])[0].measurement.field_width.fwhm_px, 7.0);
+        assert_eq!(run(1, &[None])[0].measurement.field_width, width(&plain, 0));
     }
 
     /// Plan A Task 8 fix wave, owner ruling 2026-10-09: on a multi-plane image a star flagged on any plane is flagged on

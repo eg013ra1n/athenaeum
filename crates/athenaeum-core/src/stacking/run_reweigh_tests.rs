@@ -534,11 +534,12 @@ fn a_group_without_a_common_set_keeps_its_measure_time_weights_and_warns() {
     let reason = e.reason.clone().unwrap();
     assert!(reason.contains("below 0.05 of the group maximum"), "{reason}");
     assert!(h.ids[..6].iter().all(|&id| h.entry(id).included));
-    // No sample was reweighed: the rows carry no common-set fields and the run holds no set.
+    // No sample was reweighed: the rows carry no common-set fields and the run holds no set - but it holds the
+    // fallback itself (D1b re-review m1): the reweigh ran, so the group is not "never reweighed".
     for (_, row) in h.rows() {
         assert!(row_plane0(&row).get("commonTflux").is_none());
     }
-    assert!(h.rc.common_stars.is_empty());
+    assert_eq!(h.rc.common_stars.get(&h.key()), Some(&vec![None]));
 }
 
 #[test]
@@ -571,7 +572,38 @@ fn a_member_without_a_fresh_fits_artifact_sends_the_plane_back_to_its_measure_ti
             .count(),
         1
     );
-    assert!(h.rc.common_stars.is_empty());
+    assert_eq!(h.rc.common_stars.get(&key), Some(&vec![None]));
+}
+
+/// D1b re-review m1: a mono group whose only plane fell back reaches the output stage as `Some([None])` - a fallback,
+/// whose "no positions" is a `warn!` - and not as `None`, which means "never reweighed" and logs a `debug!`.
+#[test]
+fn a_group_that_fell_back_reaches_the_output_stage_as_a_fallback() {
+    let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS[..5]);
+    h.to_measure();
+    let key = h.key();
+    let row = crate::db::stacking::find_artifact(
+        &h.fixture.conn,
+        &StackSubject::FrameSet(h.fixture.set_id),
+        &key,
+        "fits.0",
+        Some(h.ids[2]),
+    )
+    .unwrap()
+    .expect("the fits artifact");
+    std::fs::remove_file(row.path.unwrap()).unwrap();
+    h.to_register();
+    assert_eq!(h.rc.common_stars.get(&key), Some(&vec![None]));
+
+    let (res, log) = capture_logs(|| stage_output(&mut h.rc));
+    res.unwrap();
+    let group = h.rc.summary.groups.iter().find(|g| g.key == key).expect("the group's summary");
+    assert_eq!(group.stats.as_ref().expect("the group's stats").snr_gain, vec![0.0]);
+    let line = log
+        .lines()
+        .find(|l| l.contains("snr_gain not measured") && l.contains("no positions"))
+        .unwrap_or_else(|| panic!("no line for the fallen plane: {log}"));
+    assert!(line.contains("WARN"), "a fallen plane is a warn, not a debug: {line}");
 }
 
 #[test]

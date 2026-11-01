@@ -217,6 +217,12 @@ pub struct MeasureOptions {
     /// [`seeds::field_width_of`] the given seeds. Given, it is the width the fit reads and
     /// [`PlaneMeasurement::field_width`] reports; the matched filter's own second pass still runs at its own.
     pub field_width: Option<FieldWidth>,
+    /// The field width (FWHM, px) the caller already knows for the plane's stars, handed to [`SeedSpec::MatchedFilter`]
+    /// in place of the width its first pass reads (Plan D D1 r2; [`seeds::detect_with`]'s `width_hint`): the knot
+    /// tests, the second pass and the reported [`PlaneMeasurement::field_width`] run at it. For an image whose
+    /// pass-1 pool is mostly single-pixel defects (a resampled one has no detection median). `None` = the pool's own
+    /// mode; read by the matched filter only.
+    pub detect_width_hint: Option<f64>,
     /// The plane is one of a debayered colour image's (F-3, Task 8, Q3): the saturation test's plateau needs all 8 of
     /// pixel0's neighbours, else 3. The stacking adapter sets it for a debayered OSC group's planes, the probe for a
     /// 3-plane input; an undebayered CFA plane (Plan C's green sites) keeps the mono rule.
@@ -322,6 +328,7 @@ impl Default for MeasureOptions {
             diagnostics: false,
             mask: None,
             field_width: None,
+            detect_width_hint: None,
             colour: false,
             pixel_noise: PixelNoise::Unknown,
             cfa_site_share: None,
@@ -1310,6 +1317,7 @@ fn prepare_head(
                 mesh.take(),
                 Some(&saturation),
                 Some(&sub),
+                opts.detect_width_hint,
             );
             timings.detect_ms =
                 t.elapsed().as_millis() as u64 + if opts.noise.is_some() { mesh_ms } else { 0 };
