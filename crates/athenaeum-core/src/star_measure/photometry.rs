@@ -630,6 +630,58 @@ pub const POINT_SOURCE_MATCH_PX: f64 = 1.5;
 /// the real stars of the red or blue plane.
 pub const POINT_SOURCE_MATCH_PER_FIELD_FWHM: f64 = 0.5;
 
+/// The point-source screen's radius (R-PB4-2): `max(`[`POINT_SOURCE_MATCH_PX`]`, `[`POINT_SOURCE_MATCH_PER_FIELD_FWHM`]
+/// ` * field_fwhm)`, the floor alone where the field FWHM is not a positive number. The colour sample's taking-back of an
+/// extended candidate (Plan D D2, PD-9) reads the same radius.
+fn point_source_match_px(field_fwhm: f64) -> f64 {
+    if field_fwhm.is_finite() && field_fwhm > 0.0 {
+        POINT_SOURCE_MATCH_PX.max(POINT_SOURCE_MATCH_PER_FIELD_FWHM * field_fwhm)
+    } else {
+        POINT_SOURCE_MATCH_PX
+    }
+}
+
+/// Positions by `radius`-wide cell: whether any lies within `radius` of a point (Euclidean, inclusive), looking at the
+/// 3 x 3 cells about it.
+struct NearIndex {
+    radius: f64,
+    by_cell: HashMap<(i64, i64), Vec<(f64, f64)>>,
+}
+
+impl NearIndex {
+    fn cell(&self, x: f64, y: f64) -> (i64, i64) {
+        (
+            (x / self.radius).floor() as i64,
+            (y / self.radius).floor() as i64,
+        )
+    }
+
+    /// `radius` must be a positive finite number ([`point_source_match_px`] is).
+    fn new(points: impl Iterator<Item = (f64, f64)>, radius: f64) -> NearIndex {
+        let mut index = NearIndex {
+            radius,
+            by_cell: HashMap::new(),
+        };
+        for (x, y) in points {
+            let at = index.cell(x, y);
+            index.by_cell.entry(at).or_default().push((x, y));
+        }
+        index
+    }
+
+    fn any_within(&self, x: f64, y: f64) -> bool {
+        let (cx, cy) = self.cell(x, y);
+        (cx - 1..=cx + 1).any(|gx| {
+            (cy - 1..=cy + 1).any(|gy| {
+                self.by_cell.get(&(gx, gy)).is_some_and(|at| {
+                    at.iter()
+                        .any(|&(sx, sy)| (sx - x).hypot(sy - y) <= self.radius)
+                })
+            })
+        })
+    }
+}
+
 /// One growth / model ratio of the aperture correction's sample: the candidate's [`model_flux_in_fwtm`] (the sort key)
 /// and its [`growth_curve`] flux over it. Reported (the probe's `--dump-ratios`), never read.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -641,12 +693,14 @@ pub struct ApertureRatio {
 /// What [`aperture_correction`] left out of its candidates and the ratios it took the median over, brightest first
 /// (Plan B B4, PB-12' / PB-13'). `point_source` counts the clip-screened candidates with no seed of another plane within
 /// [`POINT_SOURCE_MATCH_PX`] (0 where no screen runs: one plane, LN's refits), `below_snr` those of the rest under
-/// [`CORRECTION_MIN_SNR`]. The ratios are those of floor (i) too (1 to 4 of them); empty where no ratio was read.
-/// Reported, not persisted.
+/// [`CORRECTION_MIN_SNR`]. `rescued` (Plan D D2, PD-9) counts the extended candidates the colour sample took back into the
+/// list (0 where it takes none back). The ratios are those of floor (i) too (1 to 4 of them); empty where no ratio was
+/// read. Reported, not persisted.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApertureScreens {
     pub point_source: usize,
     pub below_snr: usize,
+    pub rescued: usize,
     pub ratios: Vec<ApertureRatio>,
 }
 
@@ -1007,8 +1061,8 @@ pub(crate) fn unverdicted_clip_range(
 /// the fit's stored B_i ([`StarFit::sky_ring`], [`ring_skies`]), `F` = `ring_fwhm`, the ring width the B_i were read at
 /// (the plane's frame FWHM over the fits neither saturated nor extended, or the caller's
 /// [`super::FitStarsOptions::ring_fwhm`]). A qualifying fit is accepted (`fits` = the kept fits after the duplicate
-/// drop, with their seed indices), not flagged saturated (own or cross-plane) nor extended (Task 10b, P3), has a
-/// finite positive model flux, passes the clip screen (its fitted amplitude not above the range, F-3's amplitude
+/// drop, with their seed indices), not flagged saturated (own or cross-plane) nor extended (Task 10b, P3; unless taken
+/// back, below), has a finite positive model flux, passes the clip screen (its fitted amplitude not above the range, F-3's amplitude
 /// clause: `saturation`'s [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the
 /// caller's `full_scale`), has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm`
 /// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
@@ -1030,6 +1084,16 @@ pub(crate) fn unverdicted_clip_range(
 /// refits: `None`, no screen. (2) The SNR floor: a candidate whose [`StarFit::snr`] is under [`CORRECTION_MIN_SNR`], or
 /// NaN, leaves the list (`below_snr`); the caller computes every fit's SNR before this call (it reads the ring sky, never
 /// `c`). `c` is then the median of the 64 brightest of the rest.
+///
+/// Plan D D2 (PD-9), `c`'s colour sample: on the same 3-plane image `point_siblings` is `siblings` less the seeds their
+/// own plane flags extended. A candidate this plane flags extended (the knot test took a star that a colour image's
+/// other planes see as a point) re-enters the list when a `point_siblings` seed lies within the same radius of its
+/// fitted centre; the clip screen, the point-source screen, the isolation test and the SNR floor then treat it as any
+/// candidate, and `rescued` counts the re-entries. Only `c`'s list changes: the fit keeps its `EXTENDED` flag, so the
+/// frame statistic, the ring width `F` and the beta sample leave it out. `None` (one or two planes, LN's refits) takes
+/// nothing back. Where `population` is `Some` (probes) the population's (a) leaves extended seeds out by eligibility, so
+/// nothing is taken back there; the stacking Measure runs without a population ([`super::Mode::All`] and
+/// [`super::Mode::Brightest`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -1046,6 +1110,7 @@ pub(crate) fn aperture_correction(
     footprint: Option<&[bool]>,
     population: Option<super::population::PopulationView<'_>>,
     siblings: Option<&[Seed]>,
+    point_siblings: Option<&[Seed]>,
 ) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
@@ -1085,15 +1150,32 @@ pub(crate) fn aperture_correction(
                     })
                 })
             };
-            // Neither saturated (F-3) nor extended (F-10, P3): a knot is not a star whose growth curve `c` reads.
+            let match_px = point_source_match_px(field_fwhm);
+            // Plan D D2 (PD-9): the seeds of the other planes that are point-like on their own plane.
+            let point_like = point_siblings
+                .map(|seeds| NearIndex::new(seeds.iter().map(|s| (s.x, s.y)), match_px));
+            // Not saturated (F-3), and not extended (F-10, P3) unless taken back (PD-9): an extended fit with a
+            // point-like seed of another plane at its position is a star the knot flag took, not a knot, so it
+            // re-enters this list alone; `StarFlags::in_statistic()`, the frame statistic and the beta sample still
+            // leave it out.
             let mut candidates: Vec<(usize, &StarFit, f64)> = fits
                 .iter()
                 .filter(|(i, f)| {
-                    f.flags.in_statistic() && population.map_or(true, |p| p.statistic[*i])
+                    !f.flags.saturated()
+                        && (!f.flags.extended()
+                            || point_like
+                                .as_ref()
+                                .is_some_and(|near| near.any_within(f.x, f.y)))
+                        && population.map_or(true, |p| p.statistic[*i])
                 })
                 .map(|(i, f)| (*i, f, model_flux_in_fwtm(f)))
                 .filter(|&(_, _, m)| m.is_finite() && m > 0.0)
                 .collect();
+            // Counted at entry: only a taken-back fit is extended in the list.
+            screens.rescued = candidates
+                .iter()
+                .filter(|&&(_, f, _)| f.flags.extended())
+                .count();
             // The clip screen (R6 / C6): a candidate whose fitted amplitude tops the plane's range is clipped.
             candidates.retain(|&(_, f, _)| {
                 let clipped = f.amplitude > clip_range;
@@ -1102,25 +1184,9 @@ pub(crate) fn aperture_correction(
             });
             // PB-12': a candidate with no seed of another plane at its position is one plane's defect, not a star.
             if let Some(siblings) = siblings {
-                let m = if field_fwhm.is_finite() && field_fwhm > 0.0 {
-                    POINT_SOURCE_MATCH_PX.max(POINT_SOURCE_MATCH_PER_FIELD_FWHM * field_fwhm)
-                } else {
-                    POINT_SOURCE_MATCH_PX
-                };
-                let cell = |x: f64, y: f64| ((x / m).floor() as i64, (y / m).floor() as i64);
-                let mut by_cell: HashMap<(i64, i64), Vec<(f64, f64)>> = HashMap::new();
-                for s in siblings {
-                    by_cell.entry(cell(s.x, s.y)).or_default().push((s.x, s.y));
-                }
+                let counterparts = NearIndex::new(siblings.iter().map(|s| (s.x, s.y)), match_px);
                 candidates.retain(|&(_, f, _)| {
-                    let (cx, cy) = cell(f.x, f.y);
-                    let has_counterpart = (cx - 1..=cx + 1).any(|gx| {
-                        (cy - 1..=cy + 1).any(|gy| {
-                            by_cell.get(&(gx, gy)).is_some_and(|at| {
-                                at.iter().any(|&(sx, sy)| (sx - f.x).hypot(sy - f.y) <= m)
-                            })
-                        })
-                    });
+                    let has_counterpart = counterparts.any_within(f.x, f.y);
                     screens.point_source += usize::from(!has_counterpart);
                     has_counterpart
                 });
@@ -1169,6 +1235,7 @@ pub(crate) fn aperture_correction(
             skipped = screened,
             point_source = screens.point_source,
             below_snr = screens.below_snr,
+            rescued = screens.rescued,
             fwhm_px = ring_fwhm,
             "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
         );
@@ -1185,6 +1252,7 @@ pub(crate) fn aperture_correction(
         skipped = screened,
         point_source = screens.point_source,
         below_snr = screens.below_snr,
+        rescued = screens.rescued,
         aperture_correction = c,
         aperture_se = se,
         fwhm_px = ring_fwhm,
@@ -3153,8 +3221,8 @@ mod b4_tests {
     use super::*;
     use crate::star_measure::tests::seeds_of;
     use crate::star_measure::{
-        cross_plane_flags, finish_plane, measure_plane, prepare_plane, sibling_seeds,
-        MeasureOptions, PlaneMeasurement, PsfModel, SeedSpec,
+        cross_plane_flags, finish_plane, measure_plane, point_like_sibling_seeds, prepare_plane,
+        sibling_seeds, BetaSource, MeasureOptions, PlaneMeasurement, PsfModel, SeedSpec,
     };
     use crate::test_support::{add_noise, moffat_field, MoffatStar};
 
@@ -3281,7 +3349,7 @@ mod b4_tests {
     }
 
     /// One image of three planes through the stacking halves, as the adapter runs them: every plane prepared, the
-    /// cross-plane rule, each plane's siblings' seeds, every plane finished.
+    /// cross-plane rule, each plane's siblings' seeds, every plane finished. No seed is flagged extended.
     fn measure_three(
         w: usize,
         h: usize,
@@ -3289,19 +3357,34 @@ mod b4_tests {
         seeds: &[Vec<Seed>],
     ) -> Vec<PlaneMeasurement> {
         let o: Vec<MeasureOptions> = seeds.iter().map(|s| opts(s.clone(), true)).collect();
+        measure_three_opts(w, h, planes, &o)
+    }
+
+    /// [`measure_three`] on options the caller built (the knot flags, the PSF model); each plane's list of point-like
+    /// siblings is gathered beside the other, as the adapter gathers them.
+    fn measure_three_opts(
+        w: usize,
+        h: usize,
+        planes: &[Vec<f32>],
+        o: &[MeasureOptions],
+    ) -> Vec<PlaneMeasurement> {
         let mut preps: Vec<_> = planes
             .iter()
-            .zip(&o)
+            .zip(o)
             .map(|(p, o)| prepare_plane(p, w, h, o, None))
             .collect();
         cross_plane_flags(&mut preps);
         let siblings = sibling_seeds(&preps);
+        let refs: Vec<&MeasureOptions> = o.iter().collect();
+        let point_like = point_like_sibling_seeds(&preps, &refs);
         planes
             .iter()
-            .zip(&o)
+            .zip(o)
             .zip(preps)
-            .zip(&siblings)
-            .map(|(((p, o), prep), sib)| finish_plane(p, w, h, o, prep, sib.as_deref(), None))
+            .zip(siblings.iter().zip(&point_like))
+            .map(|(((p, o), prep), (sib, point))| {
+                finish_plane(p, w, h, o, prep, sib.as_deref(), point.as_deref(), None)
+            })
             .collect()
     }
 
@@ -3441,7 +3524,7 @@ mod b4_tests {
         let mut preps = vec![prepare_plane(&planes[0], w, h, &o, None)];
         cross_plane_flags(&mut preps);
         assert_eq!(sibling_seeds(&preps), vec![None]);
-        let again = finish_plane(&planes[0], w, h, &o, preps.remove(0), None, None);
+        let again = finish_plane(&planes[0], w, h, &o, preps.remove(0), None, None, None);
         assert_eq!(
             (again.point_source_screened, again.aperture_stars),
             (0, m.aperture_stars)
@@ -3591,5 +3674,364 @@ mod b4_tests {
         let mut ratios: Vec<f64> = m.aperture_ratios.iter().map(|r| r.ratio).collect();
         let median = crate::star_measure::robust::median_f64(&mut ratios);
         assert_eq!(m.aperture_correction, Some(median));
+    }
+
+    // ---- Plan D D2 (PD-9): `c`'s colour sample takes back the point-like stars the knot flag took ----
+
+    /// The 40-node colour image of the D2 tests (the PB-12' fixtures' lattice, every star Moffat alpha 5 and amplitude
+    /// 0.3 unless stated). Plane `p` neither renders nor seeds the nodes `absent[p]`; the nodes `faint` are faint (0.01,
+    /// SNR about 10) on every plane; plane 0's nodes `wide` are wide (alpha 8); `extended[p]` are the nodes plane `p`
+    /// flags extended (`given_extended`, in seed order); `stray` are seeds without a star, on plane 0 alone.
+    #[derive(Default)]
+    struct Case<'a> {
+        absent: [&'a [usize]; 3],
+        extended: [&'a [usize]; 3],
+        faint: &'a [usize],
+        wide: &'a [usize],
+        stray: &'a [Seed],
+        auto_beta: bool,
+    }
+
+    fn measure_case(case: &Case) -> Vec<PlaneMeasurement> {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let (mut planes, mut o) = (Vec::new(), Vec::new());
+        for p in 0..3 {
+            let kept: Vec<usize> = (0..40).filter(|k| !case.absent[p].contains(k)).collect();
+            let stars: Vec<MoffatStar> = kept
+                .iter()
+                .map(|&k| {
+                    let amp = if case.faint.contains(&k) { 0.01 } else { 0.3 };
+                    let alpha = if p == 0 && case.wide.contains(&k) {
+                        8.0
+                    } else {
+                        5.0
+                    };
+                    MoffatStar {
+                        alpha_x: alpha,
+                        alpha_y: alpha,
+                        ..star(nodes[k].0, nodes[k].1, amp)
+                    }
+                })
+                .collect();
+            planes.push(render(w, h, &stars, range_at, 11 + p as u64));
+            let mut seeds = seeds_of(&stars);
+            let mut flags: Vec<bool> = kept.iter().map(|k| case.extended[p].contains(k)).collect();
+            if p == 0 {
+                seeds.extend_from_slice(case.stray);
+                flags.extend(case.stray.iter().map(|_| false));
+            }
+            o.push(MeasureOptions {
+                given_extended: flags,
+                psf_model: if case.auto_beta {
+                    PsfModel::Auto
+                } else {
+                    PsfModel::Fixed(4.0)
+                },
+                ..opts(seeds, true)
+            });
+        }
+        measure_three_opts(w, h, &planes, &o)
+    }
+
+    /// `(aperture_stars, aperture_rescued, point_source_screened, aperture_below_snr)` of a plane.
+    fn counts(m: &PlaneMeasurement) -> (usize, usize, usize, usize) {
+        (
+            m.aperture_stars,
+            m.aperture_rescued,
+            m.point_source_screened,
+            m.aperture_below_snr,
+        )
+    }
+
+    const KNOTS: [usize; 8] = [3, 8, 12, 17, 21, 26, 30, 35];
+
+    #[test]
+    fn an_extended_candidate_with_a_point_like_sibling_seed_joins_c() {
+        // Plane 0 flags eight stars extended; planes 1 and 2 hold the same stars point-like.
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &[], &[]],
+            ..Default::default()
+        });
+        assert_eq!(
+            m[0].extended_seeds,
+            KNOTS.len(),
+            "premise: the flags reach the fit"
+        );
+        assert_eq!(
+            counts(&m[0]),
+            (40, KNOTS.len(), 0, 0),
+            "the 8 knots rejoin the 32 point-like stars; none was screened"
+        );
+        assert_eq!(m[0].aperture_ratios.len(), 40);
+        assert_eq!(counts(&m[1]), (40, 0, 0, 0), "planes 1 and 2 flag nothing");
+        assert_eq!(counts(&m[2]), (40, 0, 0, 0));
+        // One point-like sibling is enough: planes 0 and 1 flag the knots, plane 2 does not.
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &KNOTS, &[]],
+            ..Default::default()
+        });
+        assert_eq!(counts(&m[0]), (40, KNOTS.len(), 0, 0));
+        assert_eq!(counts(&m[1]), (40, KNOTS.len(), 0, 0));
+        assert_eq!(counts(&m[2]), (40, 0, 0, 0));
+    }
+
+    #[test]
+    fn an_extended_candidate_whose_siblings_are_extended_too_stays_out() {
+        // The knots are extended on planes 0 and 1 and plane 2 holds no star there: the only sibling seeds within the
+        // radius are extended on their own plane.
+        let m = measure_case(&Case {
+            absent: [&[], &[], &KNOTS],
+            extended: [&KNOTS, &KNOTS, &[]],
+            ..Default::default()
+        });
+        assert_eq!(
+            m[0].extended_seeds,
+            KNOTS.len(),
+            "premise: the flags reach the fit"
+        );
+        assert_eq!(counts(&m[0]), (32, 0, 0, 0), "nothing is taken back");
+        assert_eq!(counts(&m[1]), (32, 0, 0, 0));
+        assert_eq!(
+            counts(&m[2]),
+            (32, 0, 0, 0),
+            "plane 2's 32 stars all have counterparts"
+        );
+        // All three planes flag them: the same.
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &KNOTS, &KNOTS],
+            ..Default::default()
+        });
+        assert_eq!(counts(&m[0]), (32, 0, 0, 0));
+        assert_eq!(counts(&m[1]), (32, 0, 0, 0));
+        assert_eq!(counts(&m[2]), (32, 0, 0, 0));
+    }
+
+    #[test]
+    fn an_extended_candidate_with_no_sibling_at_all_stays_out() {
+        // A knot of plane 0 with no seed of the other planes within the radius is a defect of one plane.
+        let m = measure_case(&Case {
+            absent: [&[], &KNOTS, &KNOTS],
+            extended: [&KNOTS, &[], &[]],
+            ..Default::default()
+        });
+        assert_eq!(
+            counts(&m[0]),
+            (32, 0, 0, 0),
+            "the knots are neither taken back nor screened"
+        );
+    }
+
+    #[test]
+    fn a_rescued_candidate_still_meets_isolation() {
+        // A seed without a star 20 px from node 12 (inside 6 field FWHM) on plane 0: the knot is taken back and then
+        // refused by the isolation test, as a point-like star there is.
+        let (x, y) = node(4, 1);
+        let stray = hot_seeds(&[(x + 20.0, y)], 0.001);
+        let control = measure_case(&Case {
+            stray: &stray,
+            ..Default::default()
+        });
+        assert_eq!(
+            control[0].aperture_stars, 39,
+            "premise: the stray defeats node 12's isolation"
+        );
+        let m = measure_case(&Case {
+            extended: [&[12], &[], &[]],
+            stray: &stray,
+            ..Default::default()
+        });
+        assert_eq!(m[0].aperture_rescued, 1, "the knot re-entered the list");
+        assert_eq!(m[0].aperture_stars, 39, "and left it at the isolation test");
+    }
+
+    #[test]
+    fn a_rescued_candidate_still_meets_the_snr_floor() {
+        // Node 7 is faint (SNR about 10) on every plane and plane 0 flags it extended.
+        let m = measure_case(&Case {
+            faint: &[7],
+            extended: [&[7], &[], &[]],
+            ..Default::default()
+        });
+        assert_eq!(
+            m[1].aperture_below_snr, 1,
+            "premise: the faint star is under the floor"
+        );
+        assert_eq!(
+            counts(&m[0]),
+            (39, 1, 0, 1),
+            "taken back, then refused by the floor with the point-like faint stars of planes 1 and 2"
+        );
+        assert!(m[0].aperture_ratios.len() == 39);
+    }
+
+    #[test]
+    fn a_mono_plane_keeps_extended_candidates_out_of_c() {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let stars: Vec<MoffatStar> = nodes.iter().map(|&(x, y)| star(x, y, 0.3)).collect();
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let data = render(w, h, &stars, range_at, 11);
+        let flags: Vec<bool> = (0..40).map(|k| KNOTS.contains(&k)).collect();
+        let o = MeasureOptions {
+            given_extended: flags,
+            ..opts(seeds_of(&stars), false)
+        };
+        let m = measure_plane(&data, w, h, &o, None);
+        assert_eq!(
+            m.extended_seeds,
+            KNOTS.len(),
+            "premise: the flags reach the fit"
+        );
+        assert_eq!(
+            counts(&m),
+            (32, 0, 0, 0),
+            "one plane: no sibling, the knots stay out"
+        );
+        // The stacking halves of one plane hand no list of either kind.
+        let mut preps = vec![prepare_plane(&data, w, h, &o, None)];
+        cross_plane_flags(&mut preps);
+        assert_eq!(point_like_sibling_seeds(&preps, &[&o]), vec![None]);
+        let again = finish_plane(&data, w, h, &o, preps.remove(0), None, None, None);
+        assert_eq!(counts(&again), (32, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_two_plane_image_keeps_extended_candidates_out_of_c() {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let stars: Vec<MoffatStar> = nodes.iter().map(|&(x, y)| star(x, y, 0.3)).collect();
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let flags: Vec<bool> = (0..40).map(|k| KNOTS.contains(&k)).collect();
+        let o: Vec<MeasureOptions> = (0..2)
+            .map(|_| MeasureOptions {
+                given_extended: flags.clone(),
+                ..opts(seeds_of(&stars), true)
+            })
+            .collect();
+        let planes: Vec<Vec<f32>> = (0..2)
+            .map(|p| render(w, h, &stars, range_at, 11 + p))
+            .collect();
+        let mut preps: Vec<_> = planes
+            .iter()
+            .zip(&o)
+            .map(|(p, o)| prepare_plane(p, w, h, o, None))
+            .collect();
+        cross_plane_flags(&mut preps);
+        assert_eq!(
+            point_like_sibling_seeds(&preps, &[&o[0], &o[1]]),
+            vec![None, None]
+        );
+        let m: Vec<PlaneMeasurement> = planes
+            .iter()
+            .zip(&o)
+            .zip(preps)
+            .map(|((p, o), prep)| finish_plane(p, w, h, o, prep, None, None, None))
+            .collect();
+        assert_eq!(counts(&m[0]), (32, 0, 0, 0));
+        assert_eq!(counts(&m[1]), (32, 0, 0, 0));
+    }
+
+    #[test]
+    fn the_point_like_lists_hold_each_planes_unflagged_seeds_in_plane_order() {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let o: Vec<MeasureOptions> = (0..3)
+            .map(|p| {
+                let stars: Vec<MoffatStar> = nodes[p * 4..p * 4 + 4]
+                    .iter()
+                    .map(|&(x, y)| star(x, y, 0.3))
+                    .collect();
+                MeasureOptions {
+                    // Plane p flags its own seed p.
+                    given_extended: (0..4).map(|k| k == p).collect(),
+                    ..opts(seeds_of(&stars), true)
+                }
+            })
+            .collect();
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let planes: Vec<Vec<f32>> = (0..3usize)
+            .map(|p| {
+                let stars: Vec<MoffatStar> = nodes[p * 4..p * 4 + 4]
+                    .iter()
+                    .map(|&(x, y)| star(x, y, 0.3))
+                    .collect();
+                render(w, h, &stars, range_at, 11 + p as u64)
+            })
+            .collect();
+        let preps: Vec<_> = planes
+            .iter()
+            .zip(&o)
+            .map(|(p, o)| prepare_plane(p, w, h, o, None))
+            .collect();
+        let refs: Vec<&MeasureOptions> = o.iter().collect();
+        let point_like = point_like_sibling_seeds(&preps, &refs);
+        let all = sibling_seeds(&preps);
+        let nodes = &nodes;
+        for q in 0..3 {
+            let all_q = all[q].as_ref().expect("a three-plane list");
+            let point_q = point_like[q].as_ref().expect("a three-plane list");
+            assert_eq!(all_q.len(), 8);
+            assert_eq!(
+                point_q.len(),
+                6,
+                "each of the two siblings drops its one flagged seed"
+            );
+            let expected: Vec<Seed> = (0..3)
+                .filter(|&p| p != q)
+                .flat_map(|p| {
+                    (0..4).filter(move |&k| k != p).map(move |k| Seed {
+                        x: nodes[p * 4 + k].0,
+                        y: nodes[p * 4 + k].1,
+                        peak: 0.3,
+                        flux: 1.0,
+                    })
+                })
+                .collect();
+            assert_eq!(point_q, &expected);
+        }
+    }
+
+    #[test]
+    fn the_frame_statistic_and_the_beta_sample_still_leave_extended_fits_out() {
+        // 24 of plane 0's 40 stars are wide (alpha 8) and flagged extended: a majority, so they would set the median
+        // FWHM and fill the beta sample if they were read. They are taken back into `c` and nowhere else.
+        let wide: Vec<usize> = (0..24).map(|k| k + 8).collect();
+        let m = measure_case(&Case {
+            wide: &wide,
+            extended: [&wide, &[], &[]],
+            auto_beta: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            (m[0].aperture_stars, m[0].aperture_rescued),
+            (40, wide.len()),
+            "premise: the lever fires on plane 0"
+        );
+        let extended = m[0].stars.iter().filter(|s| s.flags.extended()).count();
+        assert_eq!(
+            extended,
+            wide.len(),
+            "the knots are fitted and keep their flag"
+        );
+        let (f0, f1) = (
+            m[0].frame.fwhm_px.expect("plane 0"),
+            m[1].frame.fwhm_px.expect("plane 1"),
+        );
+        assert!(
+            (f0 / f1 - 1.0).abs() < 0.015,
+            "the frame FWHM of the 16 point-like stars ({f0}) is the all-point-like plane's ({f1})"
+        );
+        let sample = |m: &PlaneMeasurement| match m.beta_source {
+            BetaSource::Fitted { sample } => sample,
+            other => panic!("beta source {other:?}"),
+        };
+        assert!(
+            sample(&m[0]) <= 16,
+            "the beta sample holds no knot: {}",
+            sample(&m[0])
+        );
+        assert!(sample(&m[1]) > 16, "premise: plane 1 samples all its stars");
     }
 }

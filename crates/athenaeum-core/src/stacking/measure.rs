@@ -833,6 +833,12 @@ pub fn measure_planes_with_width_hints<'a, E>(
     sm::cross_plane_flags(&mut preps);
     // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered before the loop below consumes the preps.
     let siblings = sm::sibling_seeds(&preps);
+    // Plan D D2 (PD-9): the same lists less each plane's own extended seeds, read through the options each plane is
+    // finished with (the ONE extended slice its fits use).
+    let point_siblings = {
+        let opts: Vec<&sm::MeasureOptions> = heads.iter().map(|h| &h.module_opts).collect();
+        sm::point_like_sibling_seeds(&preps, &opts)
+    };
     let mut out: Vec<Option<MeasuredPlane>> = (0..n_planes).map(|_| None).collect();
     for p in (0..n_planes).rev() {
         let t = Instant::now();
@@ -853,6 +859,7 @@ pub fn measure_planes_with_width_hints<'a, E>(
             &head.module_opts,
             prep,
             siblings[p].as_deref(),
+            point_siblings[p].as_deref(),
             pool,
         );
         drop(data);
@@ -1008,6 +1015,11 @@ pub fn measure_planes_pass2<'a, E>(
     // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered from the preps (cross-plane flags applied in the first
     // pass; the seeds do not move) before the loop below consumes them.
     let siblings = sm::sibling_seeds(&preps);
+    // Plan D D2 (PD-9): as the first pass's twin above; `psf_model` is the only option the loop below changes.
+    let point_siblings = {
+        let opts: Vec<&sm::MeasureOptions> = heads.iter().map(|h| &h.module_opts).collect();
+        sm::point_like_sibling_seeds(&preps, &opts)
+    };
     let mut out = Vec::with_capacity(heads.len());
     for (p, (mut head, prep)) in heads.into_iter().zip(preps).enumerate() {
         let t = Instant::now();
@@ -1022,6 +1034,7 @@ pub fn measure_planes_pass2<'a, E>(
             &head.module_opts,
             prep,
             siblings[p].as_deref(),
+            point_siblings[p].as_deref(),
             pool,
         );
         drop(data);

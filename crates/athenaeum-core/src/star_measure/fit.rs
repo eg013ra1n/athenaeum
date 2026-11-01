@@ -1911,6 +1911,10 @@ pub(super) struct Correction<'a> {
     /// them within `max(`[`super::photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of its fitted centre (R-PB4-2) is screened out. `None` = no screen
     /// (one plane, LN's refits, every caller but the stacking halves).
     pub(super) siblings: Option<&'a [Seed]>,
+    /// The seeds of [`Correction::siblings`] that their own plane does not flag extended (Plan D D2, PD-9;
+    /// [`super::point_like_sibling_seeds`]): an extended `c` candidate with one of them within the same radius re-enters
+    /// `c`'s list. `None` = nothing is taken back (one or two planes, LN's refits, every caller but the stacking halves).
+    pub(super) point_siblings: Option<&'a [Seed]>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
@@ -2487,6 +2491,7 @@ fn ring_and_correction(
                 correction.footprint,
                 correction.population,
                 correction.siblings,
+                correction.point_siblings,
             )
         }
     };

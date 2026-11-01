@@ -179,11 +179,17 @@ impl SnrNoise {
 /// [`Mode::Budget`]; the stacking Measure, LN's refits and registration fit as
 /// at 5): what the Analysis path accepts moves, so every Analysis row and every
 /// stage hash that reads a fit recomputes.
+/// 8 = Plan D D2 (`c`'s colour sample, PD-9): on a 3-plane image an extended `c`
+/// candidate re-enters `c`'s list when a seed of another plane that is not
+/// extended on its own plane lies within the point-source screen's radius, so
+/// `c` and every flux, weight and LN scale built on it moves on colour planes;
+/// mono and 2-plane images are untouched. D3's Blend refusal on the stacking
+/// Measure ships under this same number (one bump per plan).
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
-/// measures, never one per task; Plan C = 7 (6 is burnt, never released).
-/// `AnalysisConfig::config_hash` is Plan C's.
-pub const MEASURE_VERSION: u32 = 7;
+/// measures, never one per task; Plan C = 7 (6 is burnt, never released),
+/// Plan D = 8. `AnalysisConfig::config_hash` is Plan D's.
+pub const MEASURE_VERSION: u32 = 8;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -429,6 +435,7 @@ impl FitStarsOptions<'_> {
             neighbours: None,
             population: None,
             siblings: None,
+            point_siblings: None,
             timers: None,
             // R-PC-10b: LN's refits and every other `fit_stars_at` caller fit as at `MEASURE_VERSION` 5.
             blend_refusal: false,
@@ -511,6 +518,11 @@ pub struct PlaneMeasurement {
     /// The `c` candidates under [`photometry::CORRECTION_MIN_SNR`] (or with no SNR; PB-13'), after the point-source
     /// screen. Reported, not persisted.
     pub aperture_below_snr: usize,
+    /// The extended `c` candidates the colour sample took back (Plan D D2, PD-9): flagged extended on this plane, with a
+    /// point-like seed of another plane (not extended on its own) within the point-source screen's radius, so they
+    /// re-entered `c`'s candidate list before the clip screen. 0 on one or two planes and wherever no sibling list
+    /// runs. Reported, not persisted.
+    pub aperture_rescued: usize,
     /// The growth / model ratios `aperture_correction` is the median over, brightest by model flux first (the probe's
     /// `--dump-ratios`); the 1 to 4 of a plane at floor (i) too. Reported, never read.
     pub aperture_ratios: Vec<ApertureRatio>,
@@ -597,7 +609,7 @@ pub fn measure_plane(
     match opts.mode {
         Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
-            finish_working(&working, w, h, opts, prep, None, pool)
+            finish_working(&working, w, h, opts, prep, None, None, pool)
         }
         Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
     }
@@ -889,7 +901,10 @@ pub fn prepare_plane(
 /// aggregates, on a fresh working-unit copy of the same `plane` (the same bytes the first half read). `siblings` (Plan B
 /// B4, PB-12'): on an image of more than one plane the plane's entry of [`sibling_seeds`] (every OTHER plane's seeds,
 /// gathered after [`cross_plane_flags`]), which the aperture correction's point-source screen reads; `None` = no screen
-/// (one plane).
+/// (one plane). `point_siblings` (Plan D D2, PD-9): the plane's entry of [`point_like_sibling_seeds`], the same seeds
+/// less those their own plane flags extended; the aperture correction's colour sample reads it to take back an extended
+/// candidate of this plane. `None` = nothing is taken back (one or two planes, LN's refits).
+#[allow(clippy::too_many_arguments)]
 pub fn finish_plane(
     plane: &[f32],
     w: usize,
@@ -897,6 +912,7 @@ pub fn finish_plane(
     opts: &MeasureOptions,
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
+    point_siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let unmasked;
@@ -914,7 +930,7 @@ pub fn finish_plane(
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
     };
-    finish_working(&working, w, h, opts, prep, siblings, pool)
+    finish_working(&working, w, h, opts, prep, siblings, point_siblings, pool)
 }
 
 /// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
@@ -1067,6 +1083,58 @@ pub fn sibling_seeds(planes: &[PlanePrep]) -> Vec<Option<Vec<Seed>>> {
                     .enumerate()
                     .filter(|&(p, _)| p != q)
                     .flat_map(|(_, prep)| prep.seeds.iter().copied())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// [`sibling_seeds`]' twin for the colour sample of `c` (Plan D D2, PD-9): entry `q` is the seeds of every plane but `q`
+/// that their own plane does NOT flag extended, in plane order. The flags are the ONE slice that plane's fits use
+/// ([`extended_flags`]: the matched filter's, else [`MeasureOptions::given_extended`]) and `opts[p]` must be the options
+/// `planes[p]` is then finished with, so a given-seed run agrees with its own fits (a `given_extended` that does not
+/// match the seeds warns here as it does at the fit, and reads every seed point-like). `None` for every plane unless
+/// the image has exactly three; gather the lists where [`sibling_seeds`] is gathered. A seed whose flag the slice does
+/// not hold is point-like.
+///
+/// The colour sample reads it only where `c` has no population (a): [`Mode::All`] and [`Mode::Brightest`], the stacking
+/// Measure's. Population (a) leaves extended seeds out by eligibility ([`population`]), so on a [`Mode::Population`]
+/// caller (the lab's probes) a taken-back candidate is still not in `c`'s sample.
+pub fn point_like_sibling_seeds(
+    planes: &[PlanePrep],
+    opts: &[&MeasureOptions],
+) -> Vec<Option<Vec<Seed>>> {
+    if planes.len() != 3 {
+        return planes.iter().map(|_| None).collect();
+    }
+    if opts.len() != planes.len() {
+        tracing::error!(
+            count = opts.len(),
+            "measure: the point-like sibling seeds need one options per plane; no extended candidate is taken back"
+        );
+        return planes.iter().map(|_| None).collect();
+    }
+    let point_like: Vec<Vec<Seed>> = planes
+        .iter()
+        .zip(opts)
+        .map(|(prep, o)| {
+            let flags = extended_flags(prep.detection.as_ref(), o, prep.seeds.len());
+            prep.seeds
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !flags.get(i).copied().unwrap_or(false))
+                .map(|(_, s)| *s)
+                .collect()
+        })
+        .collect();
+    (0..planes.len())
+        .map(|q| {
+            Some(
+                point_like
+                    .iter()
+                    .enumerate()
+                    .filter(|&(p, _)| p != q)
+                    .flat_map(|(_, seeds)| seeds.iter().copied())
                     .collect(),
             )
         })
@@ -1453,6 +1521,7 @@ fn prepare_passes(
 }
 
 /// [`finish_plane`] on a working copy the caller holds.
+#[allow(clippy::too_many_arguments)]
 fn finish_working(
     working: &[f32],
     w: usize,
@@ -1460,6 +1529,7 @@ fn finish_working(
     opts: &MeasureOptions,
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
+    point_siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let PlanePrep {
@@ -1540,6 +1610,7 @@ fn finish_working(
                     statistic: &in_statistic,
                 }),
                 siblings,
+                point_siblings,
                 timers: Some(&sub),
                 ..Default::default()
             },
@@ -1643,6 +1714,7 @@ fn finish_working(
         aperture_se: outcome.aperture_se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_rescued: outcome.aperture_screens.rescued,
         aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing: outcome.ring_sky_missing,
         clip_floor: saturation
@@ -1882,6 +1954,7 @@ fn measure_budget(
         aperture_se: outcome.aperture_se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_rescued: outcome.aperture_screens.rescued,
         aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing,
         clip_floor: saturation
@@ -3970,7 +4043,7 @@ mod tests {
             assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
             let mut pm = None;
             let logs = crate::stacking::solve::tests::captured_logs(|| {
-                pm = Some(finish_plane(&data, 64, 64, &mo, prep, None, None));
+                pm = Some(finish_plane(&data, 64, 64, &mo, prep, None, None, None));
             });
             assert!(pm.unwrap().stars.is_empty());
             assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
@@ -5052,10 +5125,10 @@ mod tests {
             assert_eq!(beta.0.to_bits(), beta_all.0.to_bits(), "list {list}");
             assert_eq!(beta.1, beta_all.1, "list {list}");
         }
-        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None, None);
+        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None, None, None);
         let opts = population_opts(300, 100_000);
         let prep = prepare_plane(&data, 1024, 1024, &opts, None);
-        let m = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
+        let m = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
         assert_eq!(m.refused.not_selected, 0);
         assert_eq!(m.stars.len(), m_all.stars.len());
         for (a, b) in m.stars.iter().zip(&m_all.stars) {
@@ -5129,7 +5202,7 @@ mod tests {
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
         assert!(back.population.is_none(), "the selection is not stored");
         for (p, prep) in planes.iter().zip(preps) {
-            let m = finish_plane(p, 1024, 1024, &opts, prep, None, None);
+            let m = finish_plane(p, 1024, 1024, &opts, prep, None, None, None);
             let r = m.population.unwrap();
             assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
         }
@@ -5162,7 +5235,7 @@ mod tests {
             assert_eq!(format!("{b:?}"), format!("{a:?}"), "measure_plane, k {k}");
             let prep = prepare_plane(&data, 1024, 1024, &opts, None);
             assert_eq!(prep.passes.len(), prep.seeds.len(), "k {k}: a full prefix");
-            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
+            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
             c.timings = a.timings;
             assert_eq!(format!("{c:?}"), format!("{a:?}"), "halves, k {k}");
         }
@@ -5223,8 +5296,8 @@ mod tests {
         assert_eq!(prep.seeds.len(), all.seeds);
         let bytes = postcard::to_stdvec(&prep).unwrap();
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
-        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
-        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None, None);
+        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
+        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None, None, None);
         stored.timings = direct.timings;
         direct.timings = stored.timings;
         assert_eq!(format!("{stored:?}"), format!("{direct:?}"));

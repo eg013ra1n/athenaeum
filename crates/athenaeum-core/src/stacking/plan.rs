@@ -8552,13 +8552,14 @@ mod tests {
         // 2026-10-23 Plan B B4 (PB-14): MEASURE_VERSION 5 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-24 Plan C R-PC-10 (the Blend refusal): MEASURE_VERSION 6 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-10-25 Plan C R-PC-10b (the Blend refusal on the Analysis path only): MEASURE_VERSION 7 (6 is burnt) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
+        // 2026-11-01 Plan D D2 (`c`'s colour sample, PD-9): MEASURE_VERSION 8 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=93c65ea07388f9ec ln_ref=aff429c43dcfed70 ln=affdd0e2d03f312e ln_cal=dc6eb80c40566822",
-                "fastPreview: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=529c0fc0ef53468e ln_ref=aff429c43dcfed70 ln=681b1c1ce68acb23 ln_cal=dc6eb80c40566822",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=40a78afaaecb67fb ln_ref=f4bc014c4d50642f ln=204d6c10b503fdde ln_cal=9d19e1d00d1d1701",
-                "custom: calib=2b725e5e99c87f49 meas=eede4c78d0df187b reg=d218f72dbbd4563a ln_ref=f4bc014c4d50642f ln=903548a039a9babd ln_cal=9d19e1d00d1d1701",
+                "default: calib=f3cf4be2b2178358 meas=326ee3f03ffce101 reg=b3cd306e952f9103 ln_ref=500204de9b22c23d ln=3648e1d4488ee634 ln_cal=1ed2edc9d7ff5dcb",
+                "fastPreview: calib=f3cf4be2b2178358 meas=326ee3f03ffce101 reg=273f9fa77a3bb884 ln_ref=500204de9b22c23d ln=c637bb1f207e0b51 ln_cal=1ed2edc9d7ff5dcb",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=326ee3f03ffce101 reg=e9b33b6a32744319 ln_ref=02d5bf6ffe33d1c8 ln=65ced8b61811fb2e ln_cal=027f32901875b9f3",
+                "custom: calib=2b725e5e99c87f49 meas=747b03ac63505ca2 reg=c5e5355f10e3ffeb ln_ref=02d5bf6ffe33d1c8 ln=2f56fd5c9caa0811 ln_cal=027f32901875b9f3",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8627,9 +8628,9 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "daf887f63aba01de");
-        assert_eq!(reg, "93c65ea07388f9ec");
-        assert_eq!(ln, "affdd0e2d03f312e");
+        assert_eq!(meas, "326ee3f03ffce101");
+        assert_eq!(reg, "b3cd306e952f9103");
+        assert_eq!(ln, "3648e1d4488ee634");
     }
 
     #[test]
@@ -8700,8 +8701,8 @@ mod tests {
             pass1_hash_for(&cfg, calib),
             "a pure function of its inputs"
         );
-        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f).
-        assert_eq!(key, "5020355fd05d9c71");
+        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f); re-recorded 2026-11-01, Plan D D2 (MEASURE_VERSION 8; was 5020355fd05d9c71).
+        assert_eq!(key, "d1feba185a3e9a76");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over
