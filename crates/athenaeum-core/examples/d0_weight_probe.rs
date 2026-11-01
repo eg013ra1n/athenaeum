@@ -284,11 +284,30 @@ fn main() {
 // those members only, 1 = top weight, ties averaged; the sharpest decile is round(0.1 n) frames (at least 1, ties to even as
 // D0's Python rounded: 105 frames give 10) by mean FWHM. D0's (b) is recomputed here on the same members (reference anchor, dump SNR >= 20, isolation 2 R of the
 // dump's aperture radius, extended flag ignored, ratios over every matched star), not read from D0's tables.
+//
+// Where this (b) differs from D0's `analyse.py`: it maps every fit through `PixelMap::forward_exact` (the stored registration with its
+// distortion layer, as the product maps) where `analyse.py` applied the linear homography alone, so a star far from the centre of a
+// distorted field can sit a fraction of a pixel elsewhere; and its members are this clone run's included frames with a map (hc11 L: 73,
+// D0 counted 76). The (b) decile cells equal D0's printed ones on all five groups; the weights differ from D0's tables by 2e-7 (s204 OSC).
+//
+// PD-16 (D1a's set bars are a drift and a noise, fable 2026-11-01), the numbers of fable's `t1_drift.py` / `t2_set.py`:
+//   `D1A drift <ds> <group> slope_pct_per_px=<s> se=<se>`: the OLS fit of ln(w_product / w_b) on the frame's mean FWHM over the members
+//       with both weights finite and > 0; s = 100 (e^b - 1) and se = 100 SE(b), %/px.
+//   `rf_noise_med / rf_noise_p90 / rf_noise_max` on the `D1A plane` line: per member sqrt(sum (s_i / snr_i)^2) / sum s_i over the set stars
+//       it pairs, plus the anchor's same term over the same stars, in quadrature (s_i the fit's signal, snr_i the dump's per-star SNR; a
+//       pair whose either SNR is not finite and positive is left out of both legs); fractions of r_f; the median, the 90th percentile
+//       (linear interpolation) and the maximum over the members. The anchor's own entry takes the same formula (both legs are its fits).
+//   `recovered` and `proxy_only` stay on the plane line as notes.
+// The pairs come from `MemberIndex::at`, the ONE re-match of `common_set::match_member`'s search (built on the module's constants), shared
+// by S2 and `lost_breakdown`; it must agree with the module's own table or the probe stops.
 mod common {
     use athenaeum_core::geometry::{KdTree2, PixelMap};
-    use athenaeum_core::stacking::common_set::{self, Candidate, CommonOutcome, MemberPlane};
+    use athenaeum_core::stacking::common_set::{self, Candidate, CommonOutcome, MemberPlane, Usable};
     use athenaeum_core::stacking::measure::ADU_SCALE;
     use athenaeum_core::stacking::psf_signal::psf_signal_weight;
+    use athenaeum_core::star_measure::photometry::{
+        CORRECTION_ISOLATION_PER_FIELD_FWHM, CORRECTION_MIN_SNR, POINT_SOURCE_MATCH_PER_FIELD_FWHM, POINT_SOURCE_MATCH_PX,
+    };
     use athenaeum_core::star_measure::{StarFit, StarFlags};
     use rusqlite::{Connection, OpenFlags};
     use serde_json::Value;
@@ -299,6 +318,10 @@ mod common {
     const SAT: u8 = 1;
     /// D0's SNR floor of (b), the dump's own SNR column.
     const B_MIN_SNR: f64 = 20.0;
+    /// D0's (b) match tolerance (`analyse.py`): max(`B_MATCH_PX`, `B_MATCH_PER_FWHM` x the median field FWHM). The module's rule has
+    /// the same two numbers by value (`POINT_SOURCE_MATCH_*`) and a different shape (the wider of two fields); (b)'s are D0's own.
+    const B_MATCH_PX: f64 = 1.5;
+    const B_MATCH_PER_FWHM: f64 = 0.5;
     /// hc11 L's eight C10 r1 frames and the tflux ratio C10 r1 gave each (lab `c10-r1-v6` weights.txt), as D0's replay.
     const C10_TARGET: [(i64, f64); 8] = [
         (69705, 0.7511),
@@ -462,7 +485,13 @@ mod common {
             for row in rows {
                 let (k, group, included, metrics, beta) = row.unwrap_or_else(|e| die(format!("frames row: {e}")));
                 let c_group = metrics
-                    .and_then(|m| serde_json::from_str::<Value>(&m).ok())
+                    .and_then(|m| match serde_json::from_str::<Value>(&m) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            eprintln!("d0_weight_probe common: frame {k} ({group}): unreadable metrics_json, its stand-in c reads 1: {e}");
+                            None
+                        }
+                    })
                     .and_then(|m| m.get("channels").and_then(Value::as_array).cloned())
                     .map(|chs| chs.iter().map(|c| c.get("apertureCorrectionGroup").and_then(Value::as_f64)).collect())
                     .unwrap_or_default();
@@ -506,7 +535,13 @@ mod common {
                 .unwrap_or_else(|e| die(format!("query registration: {e}")));
             for row in rows {
                 let (k, payload) = row.unwrap_or_else(|e| die(format!("registration row: {e}")));
-                let v: Value = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
+                let v: Value = match payload {
+                    Some(p) => serde_json::from_str(&p).unwrap_or_else(|e| {
+                        eprintln!("d0_weight_probe common: frame {k}: unreadable registration payload, the frame has no map: {e}");
+                        Value::Null
+                    }),
+                    None => Value::Null,
+                };
                 parse(
                     k,
                     v.get("referenceFrameId").and_then(Value::as_i64),
@@ -603,6 +638,52 @@ mod common {
         v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",")
     }
 
+    /// The `q`-quantile (0..=1) of the finite values by linear interpolation between order statistics (numpy's default); NaN when
+    /// none is finite.
+    fn quantile(v: &[f64], q: f64) -> f64 {
+        let mut s: Vec<f64> = v.iter().cloned().filter(|x| x.is_finite()).collect();
+        if s.is_empty() {
+            return f64::NAN;
+        }
+        s.sort_by(f64::total_cmp);
+        let pos = q * (s.len() - 1) as f64;
+        let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+        s[lo] + (s[hi] - s[lo]) * (pos - lo as f64)
+    }
+
+    /// The largest finite value, NaN when none is finite.
+    fn max_finite(v: &[f64]) -> f64 {
+        v.iter().cloned().filter(|x| x.is_finite()).fold(f64::NAN, f64::max)
+    }
+
+    /// Ordinary least squares y = a + b x: `(b, SE of b)`; NaN without three points or without any spread in x.
+    fn ols(x: &[f64], y: &[f64]) -> (f64, f64) {
+        let n = x.len();
+        if n < 3 || n != y.len() {
+            return (f64::NAN, f64::NAN);
+        }
+        let (mx, my) = (x.iter().sum::<f64>() / n as f64, y.iter().sum::<f64>() / n as f64);
+        let sxx: f64 = x.iter().map(|v| (v - mx).powi(2)).sum();
+        if !(sxx > 0.0) {
+            return (f64::NAN, f64::NAN);
+        }
+        let b = x.iter().zip(y).map(|(vx, vy)| (vx - mx) * (vy - my)).sum::<f64>() / sxx;
+        let rss: f64 = x.iter().zip(y).map(|(vx, vy)| (vy - (my + b * (vx - mx))).powi(2)).sum();
+        (b, (rss / (n - 2) as f64 / sxx).sqrt())
+    }
+
+    /// S1 (PD-16): the drift of the product's frame weight against D0's (b) with seeing, `(slope, SE)` in %/px: the OLS fit of
+    /// ln(w_product / w_b) on the frame FWHM over the members with both weights finite and positive, as 100 (e^b - 1) and
+    /// 100 SE(b) (`fable-d1a/t1_drift.py`).
+    fn drift(fwhm: &[f64], w_prod: &[f64], w_b: &[f64]) -> (f64, f64) {
+        let ok = |i: usize| fwhm[i].is_finite() && w_prod[i].is_finite() && w_prod[i] > 0.0 && w_b[i].is_finite() && w_b[i] > 0.0;
+        let keep: Vec<usize> = (0..fwhm.len()).filter(|&i| ok(i)).collect();
+        let x: Vec<f64> = keep.iter().map(|&i| fwhm[i]).collect();
+        let y: Vec<f64> = keep.iter().map(|&i| (w_prod[i] / w_b[i]).ln()).collect();
+        let (b, se) = ols(&x, &y);
+        (100.0 * (b.exp() - 1.0), 100.0 * se)
+    }
+
     // ---------------------------------------------------------------------------------------------- the product
 
     #[derive(Clone)]
@@ -636,13 +717,70 @@ mod common {
         }
     }
 
+    /// What a member holds at one of the anchor's candidates under the module's match rule.
+    enum Match<'a> {
+        /// No fit within the radius.
+        None,
+        /// Two or more fits within the radius: the candidate is unmatched in this member.
+        Ambiguous,
+        /// Exactly one fit, whatever its flags (`common_set::match_member` then also asks it to be usable).
+        One(&'a StarFit),
+    }
+
+    /// One member's plane as a tree over its fits' positions in group coordinates: the ONE place the probe redoes
+    /// `common_set::match_member`'s search, on the module's own constants, for what `Usable` does not say: WHICH fit paired (S2 reads
+    /// its signal and SNR) and why a candidate went unmatched (`lost_breakdown`).
+    struct MemberIndex<'a> {
+        tree: KdTree2,
+        /// Tree point -> index into `fits`.
+        fit_of_point: Vec<usize>,
+        fits: &'a [StarFit],
+        fwhm: f64,
+    }
+
+    impl<'a> MemberIndex<'a> {
+        /// The module's own point list: a fit with a finite position whose mapped position is finite too.
+        fn new(m: &'a Member, plane: usize) -> Self {
+            let d = &m.planes[plane];
+            let mut fit_of_point = Vec::with_capacity(d.fits.len());
+            let mut pts = Vec::with_capacity(d.fits.len());
+            for (i, f) in d.fits.iter().enumerate() {
+                if !(f.x.is_finite() && f.y.is_finite()) {
+                    continue;
+                }
+                let (gx, gy) = m.map.forward_exact(f.x, f.y);
+                if gx.is_finite() && gy.is_finite() {
+                    fit_of_point.push(i);
+                    pts.push((gx, gy));
+                }
+            }
+            MemberIndex { tree: KdTree2::build(&pts), fit_of_point, fits: &d.fits, fwhm: d.fwhm }
+        }
+
+        /// The fits within max(`POINT_SOURCE_MATCH_PX`, `POINT_SOURCE_MATCH_PER_FIELD_FWHM` x max(F_anchor, F_member)) of `c`.
+        fn at(&self, c: &Candidate) -> Match<'a> {
+            let radius = POINT_SOURCE_MATCH_PX.max(POINT_SOURCE_MATCH_PER_FIELD_FWHM * c.anchor_fwhm_px.max(self.fwhm));
+            let hits = self.tree.within(c.x, c.y, radius);
+            match hits.len() {
+                0 => Match::None,
+                1 => Match::One(&self.fits[self.fit_of_point[hits[0].0]]),
+                _ => Match::Ambiguous,
+            }
+        }
+    }
+
     /// What the product made of one plane.
     struct PlaneResult {
-        /// Per member, in member order; the dump's Measure-time weight where the plane has no common set.
+        /// Per member, in member order; the dump's Measure-time weight (times the stand-in `c` squared, as `take_group_c`) where the
+        /// plane has no common set.
         weights: Vec<f64>,
         cands: Vec<Candidate>,
         /// The set's stars in group coordinates (empty without a set).
         positions: Vec<(f64, f64)>,
+        /// The set's stars as indices into `cands` (empty without a set).
+        set_idx: Vec<usize>,
+        /// The module's own match table: `usable[k][j]` is member k's fit at candidate j when the module may read its flux.
+        usable: Vec<Vec<Option<Usable>>>,
         too_few: Option<usize>,
         paired: Vec<usize>,
     }
@@ -663,7 +801,7 @@ mod common {
         let mut out = Vec::new();
         for p in 0..planes {
             let mut cands = common_set::candidates(&members[anchor].plane(p));
-            if proxy_floor > 20.0 {
+            if proxy_floor > CORRECTION_MIN_SNR {
                 let a = &members[anchor];
                 let d = &a.planes[p];
                 let proxy: HashMap<(u64, u64), f64> = d
@@ -676,7 +814,7 @@ mod common {
                     .collect();
                 cands.retain(|c| proxy.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&v| v >= proxy_floor));
             }
-            let usable: Vec<_> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p))).collect();
+            let usable: Vec<Vec<Option<Usable>>> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p))).collect();
             let (weights, positions, too_few, paired) = match common_set::common_flux(&cands, &usable, anchor) {
                 CommonOutcome::Measured { positions, per_member } => (
                     members
@@ -690,10 +828,26 @@ mod common {
                 ),
                 CommonOutcome::TooFewStars { stars } => {
                     eprintln!("d0_weight_probe common: plane {p}: {stars} common stars, the Measure-time weights stand");
-                    (members.iter().map(|m| m.planes[p].psf_signal_weight).collect(), Vec::new(), Some(stars), vec![0; members.len()])
+                    // A plane at floor (i) carries no `c` in the dump; the run's `take_group_c` scales its weight by c^2.
+                    (
+                        members.iter().map(|m| m.planes[p].psf_signal_weight * m.planes[p].c_stand_in.powi(2)).collect(),
+                        Vec::new(),
+                        Some(stars),
+                        vec![0; members.len()],
+                    )
                 }
+                CommonOutcome::MalformedTable => die(format!("plane {p}: the module reports a malformed match table (a bug of this probe)")),
             };
-            out.push(PlaneResult { weights, cands, positions, too_few, paired });
+            let cand_of: HashMap<(u64, u64), usize> = cands.iter().enumerate().map(|(j, c)| ((c.x.to_bits(), c.y.to_bits()), j)).collect();
+            let set_idx: Vec<usize> = positions
+                .iter()
+                .map(|q| {
+                    *cand_of
+                        .get(&(q.0.to_bits(), q.1.to_bits()))
+                        .unwrap_or_else(|| die(format!("plane {p}: a set star at ({}, {}) is not one of the candidates", q.0, q.1)))
+                })
+                .collect();
+            out.push(PlaneResult { weights, cands, positions, set_idx, usable, too_few, paired });
         }
         Some(Product { anchor, planes: out })
     }
@@ -710,6 +864,44 @@ mod common {
             .collect()
     }
 
+    /// S2 (PD-16): per member, the relative noise of its paired flux ratio r_f from the dump's per-star SNR (sigma_i = signal_i / snr_i):
+    /// sqrt(sum sigma_i^2) / sum s_i over the set stars the member pairs, plus the anchor's same term over the same stars, in quadrature.
+    /// NaN for a member with no pair (and for every member of a plane without a set). The pairs are the module's own (`pr.usable`), and the
+    /// fits come from `MemberIndex`: a disagreement between the two is a bug of this probe and stops it.
+    fn rf_noise(idx: &[MemberIndex<'_>], anchor: usize, pr: &PlaneResult) -> Vec<f64> {
+        (0..idx.len())
+            .map(|k| {
+                let (mut sf, mut vf, mut sa, mut va, mut pairs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
+                for &j in &pr.set_idx {
+                    if pr.usable[k][j].is_none() {
+                        continue;
+                    }
+                    pairs += 1;
+                    let cand = &pr.cands[j];
+                    let (Match::One(f), Match::One(g)) = (idx[k].at(cand), idx[anchor].at(cand)) else {
+                        die(format!("member {k}, candidate {j}: the module pairs a fit that the probe's re-match does not find"));
+                    };
+                    let good = |snr: f64| snr.is_finite() && snr > 0.0;
+                    if !(good(f.snr) && good(g.snr)) {
+                        continue;
+                    }
+                    sf += f.signal;
+                    vf += (f.signal / f.snr).powi(2);
+                    sa += g.signal;
+                    va += (g.signal / g.snr).powi(2);
+                }
+                if pairs != pr.paired[k] {
+                    die(format!("member {k}: {pairs} pairs in the re-match, {} in the module", pr.paired[k]));
+                }
+                if sf > 0.0 && sa > 0.0 {
+                    (vf / (sf * sf) + va / (sa * sa)).sqrt()
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    }
+
     // ---------------------------------------------------------------------------------------------- D0's (b)
 
     struct BResult {
@@ -718,6 +910,11 @@ mod common {
         /// The set in the reference grid.
         positions: Vec<(f64, f64)>,
         reference: usize,
+    }
+
+    /// D0's (b) match tolerance on `plane`: max(`B_MATCH_PX`, `B_MATCH_PER_FWHM` x the median field FWHM of the members).
+    fn b_tolerance(members: &[Member], plane: usize) -> f64 {
+        B_MATCH_PX.max(B_MATCH_PER_FWHM * median(members.iter().map(|m| m.planes[plane].fwhm).collect()))
     }
 
     /// D0's offline set (b) and (b-ap) on `plane`, as `analyse.py` builds them, over `members`.
@@ -742,7 +939,7 @@ mod common {
         let cand: Vec<usize> = (0..r.fits.len())
             .filter(|&i| r.fits[i].flags.bits() & SAT == 0 && r.fits[i].snr >= B_MIN_SNR && iso[i] && r.ap_fixed[i].is_finite())
             .collect();
-        let tol = 1.5f64.max(0.5 * median(members.iter().map(|m| m.planes[plane].fwhm).collect()));
+        let tol = b_tolerance(members, plane);
         // matched[k][c] = member k's fit nearest to candidate c within tol (any flag).
         let mut matched: Vec<Vec<Option<usize>>> = Vec::with_capacity(n);
         for m in members {
@@ -825,26 +1022,10 @@ mod common {
     }
 
     /// Why the product's set lacks the stars of (b)'s: the first reason that fits, in the order the product decides them
-    /// (a star near no anchor fit; a clipped, an extended, a crowded (another anchor fit within 6 F) or a faint (proxy SNR
-    /// below 20) anchor fit; a candidate the presence rule dropped).
-    fn lost_breakdown(members: &[Member], anchor: &Member, plane: usize, pr: &PlaneResult, b_positions: &[(f64, f64)], tol: f64) -> String {
-        // Per member: a tree over its mapped fit positions, its FWHM and its fits (index-aligned with the tree).
-        let member_trees: Vec<(KdTree2, f64, Vec<StarFit>)> = members
-            .iter()
-            .map(|m| {
-                let d = &m.planes[plane];
-                let mut fits = Vec::new();
-                let mut pts = Vec::new();
-                for f in &d.fits {
-                    let (gx, gy) = m.map.forward_exact(f.x, f.y);
-                    if gx.is_finite() && gy.is_finite() {
-                        pts.push((gx, gy));
-                        fits.push(*f);
-                    }
-                }
-                (KdTree2::build(&pts), d.fwhm, fits)
-            })
-            .collect();
+    /// (a star near no anchor fit; a clipped, an extended, a crowded (another anchor fit within `CORRECTION_ISOLATION_PER_FIELD_FWHM`
+    /// F) or a faint (proxy SNR below `CORRECTION_MIN_SNR`) anchor fit; a candidate the presence rule dropped). `idx` is every member's
+    /// `MemberIndex` on `plane`, in member order.
+    fn lost_breakdown(idx: &[MemberIndex<'_>], anchor: &Member, plane: usize, pr: &PlaneResult, b_positions: &[(f64, f64)], tol: f64) -> String {
         let d = &anchor.planes[plane];
         let apos: Vec<(f64, f64)> = d.fits.iter().map(|f| anchor.map.forward_exact(f.x, f.y)).collect();
         let atree = KdTree2::build(&apos);
@@ -861,20 +1042,17 @@ mod common {
             } else if let Some((ci, _)) = cand_tree.nearest_within(q.0, q.1, tol) {
                 presence += 1;
                 let c = &pr.cands[ci];
-                for t in &member_trees {
-                    let radius = 1.5f64.max(0.5 * c.anchor_fwhm_px.max(t.1));
-                    let hits = t.0.within(c.x, c.y, radius);
-                    match hits.len() {
-                        0 => none += 1,
-                        1 => {
-                            let f = &t.2[hits[0].0];
+                for t in idx {
+                    match t.at(c) {
+                        Match::None => none += 1,
+                        Match::One(f) => {
                             if f.flags.saturated() {
                                 sat += 1;
                             } else if f.flags.extended() {
                                 ext += 1;
                             }
                         }
-                        _ => ambiguous += 1,
+                        Match::Ambiguous => ambiguous += 1,
                     }
                 }
             } else if let Some((i, _)) = atree.nearest_within(q.0, q.1, tol) {
@@ -883,7 +1061,7 @@ mod common {
                     clipped += 1;
                 } else if f.flags.extended() {
                     extended += 1;
-                } else if pix_tree.within(f.x, f.y, 6.0 * d.fwhm).len() != 1 {
+                } else if pix_tree.within(f.x, f.y, CORRECTION_ISOLATION_PER_FIELD_FWHM * d.fwhm).len() != 1 {
                     crowded += 1;
                 } else {
                     faint += 1;
@@ -980,6 +1158,9 @@ mod common {
             }
             return;
         }
+        // Every member's fits as a match index, per plane: S2's pairs and `lost_breakdown` read the same one.
+        let indices: Vec<Vec<MemberIndex<'_>>> = (0..n_planes).map(|p| members.iter().map(|m| MemberIndex::new(m, p)).collect()).collect();
+        let noise: Vec<Vec<f64>> = prod.planes.iter().enumerate().map(|(p, pr)| rf_noise(&indices[p], prod.anchor, pr)).collect();
         // D0's (b) side by side, plane by plane.
         let bs: Vec<BResult> = (0..n_planes).map(|p| d0_b(&members, p)).collect();
         let w_b = frame_weights(&bs.iter().map(|b| b.weights.clone()).collect::<Vec<_>>());
@@ -987,9 +1168,14 @@ mod common {
         let (rank_b, rank_bap) = (rank_desc(&w_b), rank_desc(&w_bap));
         let rho = spearman(&w_prod, &w_b);
         let (dp, db, dap) = (decile_ranks(&frame_fwhm, &rank_prod), decile_ranks(&frame_fwhm, &rank_b), decile_ranks(&frame_fwhm, &rank_bap));
-        // The C10 r1 replay (hc11 L only): trim the eight frames' fits as D0 did, run the product again.
-        let mut replay = None;
-        if ds == C10_DS && group == C10_GROUP && C10_TARGET.iter().all(|(k, _)| members.iter().any(|m| m.key == *k)) {
+        // The C10 r1 replay (hc11 L only): trim the eight frames' fits as D0 did, run the product again. `replay_moves=NA` says it
+        // could not run (a C10 frame is not a member, or the trimmed group has no anchor): the judge reads NA as a MISS.
+        let mut replay: Option<String> = None;
+        let c10_missing: Vec<i64> = C10_TARGET.iter().map(|(k, _)| *k).filter(|k| !members.iter().any(|m| m.key == *k)).collect();
+        if ds == C10_DS && group == C10_GROUP && !c10_missing.is_empty() {
+            eprintln!("d0_weight_probe common: {ds} {group}: the C10 r1 replay cannot run, frames {c10_missing:?} are not members");
+            replay = Some("NA".to_string());
+        } else if ds == C10_DS && group == C10_GROUP {
             let mut trimmed: Vec<Member> = members.clone();
             for (k, ratio) in C10_TARGET {
                 if let Some(m) = trimmed.iter_mut().find(|m| m.key == k) {
@@ -1023,7 +1209,10 @@ mod common {
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
-                replay = Some(moved.len());
+                replay = Some(moved.len().to_string());
+            } else {
+                eprintln!("d0_weight_probe common: {ds} {group}: the C10 r1 replay cannot run, the trimmed group has no anchor");
+                replay = Some("NA".to_string());
             }
         }
         let mut line = format!(
@@ -1039,11 +1228,13 @@ mod common {
             line.push_str(&format!(" replay_moves={m}"));
         }
         println!("{line}");
+        let (slope, se) = drift(&frame_fwhm, &w_prod, &w_b);
+        println!("D1A drift {ds} {group} slope_pct_per_px={slope:.3} se={se:.3}");
         // Per plane: the set against (b)'s.
         let amap = &members[prod.anchor].map;
         for (p, pr) in prod.planes.iter().enumerate() {
             let b = &bs[p];
-            let tol = 1.5f64.max(0.5 * median(members.iter().map(|m| m.planes[p].fwhm).collect()));
+            let tol = b_tolerance(&members, p);
             let tree = KdTree2::build(&pr.positions);
             let recovered = if b.positions.is_empty() {
                 f64::NAN
@@ -1065,7 +1256,13 @@ mod common {
                 .filter(|c| by_pos.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&i| !(members[prod.anchor].planes[p].fits[i].snr >= B_MIN_SNR)))
                 .count();
             let share = if pr.cands.is_empty() { f64::NAN } else { proxy_only as f64 / pr.cands.len() as f64 };
-            println!("D1A plane {ds} {group} p{p} set={} recovered={recovered:.4} proxy_only={share:.4}", pr.positions.len());
+            println!(
+                "D1A plane {ds} {group} p{p} set={} recovered={recovered:.4} proxy_only={share:.4} rf_noise_med={:.6} rf_noise_p90={:.6} rf_noise_max={:.6}",
+                pr.positions.len(),
+                quantile(&noise[p], 0.5),
+                quantile(&noise[p], 0.9),
+                max_finite(&noise[p])
+            );
             println!(
                 "plane-info {ds} {group} p{p} anchor={anchor_key} reference={} candidates={} set={} b_set={} proxy_only_stars={proxy_only} too_few={:?}",
                 members[b.reference].key,
@@ -1076,15 +1273,16 @@ mod common {
             );
             println!(
                 "plane-info {ds} {group} p{p} (b)'s stars the product's set lacks, by the first reason that fits: {}",
-                lost_breakdown(&members, &members[prod.anchor], p, pr, &b.positions, tol)
+                lost_breakdown(&indices[p], &members[prod.anchor], p, pr, &b.positions, tol)
             );
         }
         // Per frame.
-        let mut table = String::from("key\tfwhm\tw_product\tw_b\tw_bap\trank_product\trank_b\trank_bap\tpaired\n");
+        let mut table = String::from("key\tfwhm\tw_product\tw_b\tw_bap\trank_product\trank_b\trank_bap\tpaired\trf_noise\n");
         for (i, m) in members.iter().enumerate() {
             let paired: Vec<String> = prod.planes.iter().map(|p| p.paired[i].to_string()).collect();
+            let rf: Vec<String> = noise.iter().map(|n| format!("{:.6}", n[i])).collect();
             table.push_str(&format!(
-                "{}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}\t{}\t{}\n",
+                "{}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}\t{}\t{}\t{}\n",
                 m.key,
                 m.fwhm,
                 w_prod[i],
@@ -1093,7 +1291,8 @@ mod common {
                 rank_prod[i],
                 rank_b[i],
                 rank_bap[i],
-                paired.join("/")
+                paired.join("/"),
+                rf.join("/")
             ));
         }
         for row in table.lines().skip(1) {
@@ -1107,7 +1306,7 @@ mod common {
     }
 
     pub fn run(args: &[String]) {
-        let (mut dumps, mut clone, mut out_dir, mut proxy_floor) = (None::<PathBuf>, None::<PathBuf>, None::<PathBuf>, 20.0f64);
+        let (mut dumps, mut clone, mut out_dir, mut proxy_floor) = (None::<PathBuf>, None::<PathBuf>, None::<PathBuf>, CORRECTION_MIN_SNR);
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut v = || it.next().unwrap_or_else(|| die(format!("{a} needs a value"))).clone();
