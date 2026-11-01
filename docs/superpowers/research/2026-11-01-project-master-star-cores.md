@@ -13,7 +13,7 @@ its star **flux**. The set's stored config uses `local` (the LN pair, a flux sca
 loses star light: the same frames through the set path with the project's setting lose the same amount, and the project
 with `local` keeps what the set keeps. The shipped default (LN off) is worse still on this data: 0.67.
 
-Reviewed by Fable before the owner (2026-11-01, `~/.athenaeum-acc/pcores/review/fable-r1.md`): every cell recomputed,
+Reviewed by Fable before the owner (2026-11-01, athenaeum-lab `star-lab/results/pcores/review/fable-r1.md`): every cell recomputed,
 two independent 60-star replays, the stage confirmed.
 
 ## Method
@@ -44,8 +44,9 @@ column reads 0.002–0.003 below the master's own (the annulus comes from the no
 frame is finite (the thin partial-coverage edge is unsampled); groups under 20 frames (the Auto ladder's other rungs)
 are not measured.
 
-Scripts (job folder, registered; the fix plan moves the replay into athenaeum-lab):
-`~/.athenaeum-acc/pcores/scripts/{frames,replay,summ2,regpair,crops}.py`; outputs `~/.athenaeum-acc/pcores/out/`.
+Scripts and outputs (athenaeum-lab): the replay is `star-lab/bin/core_replay.py` (`extract`, `replay`, `summary`,
+`regpair`; it reproduces this document's tables byte for byte), the diagnosis replays and the figure script are in
+`star-lab/results/pcores/d0/`.
 
 ## The stars through each stage
 
@@ -168,4 +169,6 @@ RCR / Winsorized on OSC red). Recorded here, not part of the fix.
    reach of s204), hc11 L as the no-change control and hc11 G as a measured gain, background noise and rejected
    fraction beside, the set's satellite trail still rejected.
 
-Plan: `docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`.
+Plan: `docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`. Outcome: ruling R-SC-1 in
+`docs/stacking/README.md` ("Rejection normalization by star flux"), accepted at master level on runB, set 204 and hc11
+(athenaeum-lab `star-lab/results/pcores/acc/verdict.txt`).

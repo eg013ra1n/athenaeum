@@ -1845,6 +1845,61 @@ the new model through the normal cache invalidation (below).
   `src/types`, tsc and vitest (acceptance §8). The final full core run
   (`cargo test -p athenaeum-core --all-targets`) is owed before any push.
 
+**Rejection normalization by star flux (2026-11-01)** (diagnosis
+`docs/superpowers/research/2026-11-01-project-master-star-cores.md`, plan
+`docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`;
+owner rulings OD-1a / OD-2a / OD-3). **Ruling R-SC-1: the default rejection
+normalization is `local`** (`RejectionNormalization`'s `#[default]`, so
+`StackingConfig::default()`, `preset(Default)` and `MaximumQuality` carry it).
+- **Why.** `scaleZeroOffset` scales a frame by `s_ref / s_i`, `s` = its bwmv
+  dispersion — a background-noise measure, off the frame's star-flux ratio by
+  ±10–20 % per frame. Where seeing varies, Linear fit clip then cuts the
+  sharpest frames' cores: the LDN1272 project master (stored config LN on,
+  rejection global) kept 0.71 of its inputs' star peak, the frame set (stored
+  `local`) 0.91; the shipped default (LN off) 0.67. The project path itself
+  was cleared (resampling, LN and frames measured equal). The sign of the
+  global pair's effect depends on the night: on the LDN1272 OSC planes it
+  happened to keep 0.9–1.9 points more than `local`. `local` is neutral.
+- **LN for rejection only.** With LN output off, `local` rejection runs the
+  Normalize stage for rejection (the composite mode M2 built): ~35 s per
+  ~90-frame mono group, ~90 s per OSC group (set 204: run +137 s). A frame or
+  group whose LN cannot be computed keeps the global pair, with a run warning
+  that names the rejection normalization (never an exclusion). Drizzle uses LN
+  as its OUTPUT normalization only when `local.enabled` (`run.rs`, the drizzle
+  input's `use_local_normalization`): LN computed for rejection never reaches
+  the drizzled master.
+- **Fast preview keeps `scaleZeroOffset`** (OD-3: no Normalize stage).
+- **The migration** (`db::schema::migrate_rejection_normalization_local`, last
+  in `init_db`, `render` + `solver` builds only): once, behind the settings
+  marker `stacking.migration.rejection_local`, every stored
+  `"rejection":"scaleZeroOffset"` in `stacking.defaults`, `stacking.presets`
+  (`$[i].config…`), `stacking_set_config` and `stacking_project_config` becomes
+  `"local"`, `updated_at` untouched, one `BEGIN IMMEDIATE` transaction; a
+  document equal to `preset(FastPreview)` (paths aside) is kept; a document a
+  user sets back to `scaleZeroOffset` later is never touched again. The next
+  run of each migrated set or project re-runs Normalize + Integrate only.
+- **The Normalize row** counts the seeds calibration and the per-frame
+  fan-out against one total (members + K); it never resets.
+- **Acceptance at master level** (`b1863146`, athenaeum-lab
+  `star-lab/results/pcores/acc/verdict.txt`, full groups, references pinned as
+  Plan D's base runs; the reader `star-lab/bin/core_replay.py` reproduces every
+  master pixel to ≤ 1e-6 and every `.rej` decision): core-peak ratio (master ÷
+  its inputs' no-rejection stack, median of 300 stars) — runB project mono
+  0.961 (was 0.71; PSF SNR ×1.197 at noise ×0.9997), OSC 0.968 / 0.987 / 0.980;
+  set 204 control bit-identical (already `local`); hc11 G 1.000 (was 0.975), L
+  unchanged; set 204 with LN output off mono 0.899 (szo 0.707; PSF SNR ×1.193),
+  OSC 0.979 / 0.994 / 0.983 (szo 0.985 / 1.000 / 0.991). Rejected fraction
+  +0.04…+0.17 pp; the satellite trail of `_0085` stays rejected (98.9 % of its
+  line, master residue −0.014 σ). Rulings R-T3-1…4 (one build + Plan D's base
+  runs as "before"; B-P one-sided — a project above its set is recorded, not a
+  loss; the reader's global pair against the run's reference frame; the trail
+  read on the `.rej` bitmap) are in the job ledger and the lab results.
+- **What remains:** with `local`, Linear fit clip still cuts 4–10 % of the
+  peak on the LDN1272 mono groups and 0.6–3.8 % on its OSC planes — the clip
+  meeting a real PSF spread (a block of sharp frames kept or cut per star; the
+  median is a knife-edge there, so read the mean beside it). Open-items
+  carries it with the star-protecting rejection item.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,

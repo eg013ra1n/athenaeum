@@ -14110,8 +14110,10 @@ fn build_and_write_ln_reference(
     let (build_run_id, build_group_key) = (rc.run_id, group.key.clone());
     let (build_set_id, build_project_id) = wire_subject(&rc.subject);
     // The stage's own total (every included member of the group), not the
-    // top-`n` slice — the row's count must be the same number the per-frame
-    // ticks that follow climb towards.
+    // top-`n` slice. When the seeds calibration runs in this call, the ticks
+    // that follow climb to members + K instead (one total for the calibration
+    // and the fan-out); these build ticks stay at 0 %, so the row's percentage
+    // never drops, only its denominator grows once.
     let build_total = input.frames.len();
     let build_n = n.min(included.len());
     let on_build_progress = |plane: usize, planes: usize| {

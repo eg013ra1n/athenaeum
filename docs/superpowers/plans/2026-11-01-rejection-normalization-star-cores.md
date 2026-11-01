@@ -15,7 +15,7 @@ per plane, e.g. runB R 0.978 → 0.962, G 1.000 → 0.981): `local` is neutral, 
 the cause is `scaleZeroOffset`'s dispersion scale, a per-frame scale error of ±10–20 % against the flux scale; the
 project path itself (resampling, LN, frames) is cleared; hc11 L shows no loss under any setting.
 
-**Review:** Fable r1 (2026-11-01, `~/.athenaeum-acc/pcores/review/fable-r1.md`): APPROVE WITH CHANGES, six required —
+**Review:** Fable r1 (2026-11-01, athenaeum-lab `star-lab/results/pcores/review/fable-r1.md`): APPROVE WITH CHANGES, six required —
 all applied here (hc11 G a measured arm; Task 1's files, sweep cap and commit order; Task 3 runs from Measure with a disk
 budget; Task 0's proof target; OSC bars, the drizzle control, the PSF SNR column, n < 20 unmeasured; user wording). One
 applied differently: Task 0 does not clone Plan D's d1 trees (see Task 0, "Proof").
@@ -37,6 +37,11 @@ applied differently: Task 0 does not clone Plan D's d1 trees (see Task 0, "Proof
   `harness/acceptance/pcores.sh`; results under `star-lab/results/pcores/`.
 
 **Tech stack:** Rust (athenaeum-core), React/TS + vitest, Python 3.14 + numpy (lab).
+
+**Outcome (2026-11-01): DONE.** Tasks 0–4 complete; code `aaae6787`, `57536fb3`, `a88ef857`, `65568926`, `b1863146`
+(review r1 fixes: drizzle LN only with LN output, Fast-preview documents kept, one Normalize total) on branch
+`claude/project-star-cores-98f198`; acceptance A1–A4 PASS at `b1863146` (lab `5f1385a` … `adb04bd`, rulings R-T3-1…4);
+the record is ruling R-SC-1 in `docs/stacking/README.md`.
 
 ## Owner decisions (before Task 1; the controller's recommendation first, Fable concurs)
 
