@@ -397,14 +397,15 @@ pub struct DrizzleConfig {
     pub kernel: DrizzleKernel,
     pub use_rejection: bool,
     pub use_weights: bool,
-    /// B8 (M3 final fix wave, M5 ruling): a no-op whenever local
-    /// normalization is off for the run (`normalization.local.enabled ==
-    /// false` and `normalization.rejection != "local"`) — the drizzle
-    /// driver already falls back to each included frame's own global
-    /// output-normalization pair per frame in that case, exactly as
-    /// [`super::integrate`]'s own engine does; this toggle only has an
-    /// effect when local normalization is actually driving output
-    /// normalization for the group.
+    /// B8 (M3 final fix wave, M5 ruling): the drizzle follows the plain
+    /// master's OUTPUT normalization, so this toggle only has an effect when
+    /// local normalization drives output normalization
+    /// (`normalization.local.enabled == true`). With it off, the drizzle
+    /// falls back to each included frame's own global output-normalization
+    /// pair, exactly as [`super::integrate`]'s own engine does for the plain
+    /// master - including when LN was computed for rejection alone
+    /// (`normalization.rejection == "local"`, the default): those grids never
+    /// drive the drizzle's output (pcores review r1, I1).
     pub use_local_normalization: bool,
     pub write_weight_map: bool,
     /// M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
