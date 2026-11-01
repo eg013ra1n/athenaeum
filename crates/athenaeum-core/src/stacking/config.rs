@@ -13,6 +13,7 @@ use tracing::warn;
 
 use crate::integration::stats::ScaleEstimator;
 use crate::resample::Interpolation;
+use crate::stacking::fits_artifact::FITS_ARTIFACT_VERSION;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
@@ -994,7 +995,22 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 /// cannot express "the fitter itself now accepts different stars", which is
 /// what M4a Task 2 did to every stored measurement (ruling R-M4a-15).
 pub fn measurement_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    measurement_subtree_with_measure_version(cfg, MEASURE_VERSION)
+    measurement_subtree_with_fits_artifact_version(cfg, FITS_ARTIFACT_VERSION)
+}
+
+/// [`measurement_subtree`] with the `.athf` format version supplied (Plan D D2c r1): the version the Measure stage's
+/// `fits.<plane>` files are written at is folded beside [`MEASURE_VERSION`] (`fitsArtifactVersion`), so a row measured at
+/// another format version is keyed on another hash and misses by key. The plan gate then needs no read of the file: a
+/// fresh row is its hash and its stat (`plan::is_fresh`). Nothing else should call this with anything but
+/// [`FITS_ARTIFACT_VERSION`]; the pins of earlier versions go through
+/// [`measurement_subtree_with_measure_version`], which keeps the shape from before the fold.
+pub(crate) fn measurement_subtree_with_fits_artifact_version(
+    cfg: &StackingConfig,
+    fits_artifact_version: u16,
+) -> serde_json::Value {
+    let mut subtree = measurement_subtree_with_measure_version(cfg, MEASURE_VERSION);
+    subtree["fitsArtifactVersion"] = serde_json::json!(fits_artifact_version);
+    subtree
 }
 
 /// [`measurement_subtree`] with the measure version supplied, so a test can
@@ -1808,10 +1824,11 @@ mod tests {
         assert_eq!(
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
             stage_hash(
-                &measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                &measurement_subtree_with_fits_artifact_version(&cfg, FITS_ARTIFACT_VERSION),
                 &[],
                 &[]
-            )
+            ),
+            "the shipped measurement helper is the fits-versioned one at the current constant"
         );
         assert_eq!(
             stage_hash(&registration_subtree(&cfg), &[], &[]),
@@ -2016,7 +2033,9 @@ mod tests {
     /// Plan D D2 (`c`'s colour sample, PD-9; ruling F28): the one bump of Plan D (D3's Blend refusal on the stacking
     /// Measure ships under it). `MEASURE_VERSION` is 8, the three fit-reading stage hashes of the default config are
     /// the values below and are none of the version-5, burnt version-6 or version-7 ones, and the calibration subtree
-    /// hashes as it did before the bump (a bump must not recalibrate).
+    /// hashes as it did before the bump (a bump must not recalibrate). The measurement literal was re-recorded 2026-11-02
+    /// (Plan D D2c r1: `FITS_ARTIFACT_VERSION` 3 folded into that subtree, `the_measurement_hash_follows_the_fits_artifact_version`;
+    /// was `972c028e1512fdd0`); the registration and normalization ones stand.
     #[test]
     fn measure_version_eight_moves_the_three_fit_reading_subtrees_only() {
         let cfg = StackingConfig::default();
@@ -2030,7 +2049,7 @@ mod tests {
             ),
             (
                 8,
-                "972c028e1512fdd0".to_string(),
+                "ef32610c8173c47f".to_string(),
                 "e6c1ddfad3f06299".to_string(),
                 "f37aa67a46c48a56".to_string(),
                 "9653a478603091dc".to_string(),
@@ -2069,6 +2088,55 @@ mod tests {
     #[test]
     fn measure_version_is_eight_after_plan_d() {
         assert_eq!(MEASURE_VERSION, 8, "Plan D's one bump (D2)");
+    }
+
+    /// Plan D D2c r1 (review M1 of D2b, the owner's speed condition): the `.athf` format version rides in the measurement
+    /// stage hash, so a `fits.<plane>` row written at another format version is keyed on another hash and the plan gate
+    /// needs no read of the file. Only the measurement subtree carries it: the later stages take it through their upstream
+    /// measurement hash, and the calibration subtree does not move (a format bump must not recalibrate).
+    #[test]
+    fn the_measurement_hash_follows_the_fits_artifact_version() {
+        let cfg = StackingConfig::default();
+        let at = |v: u16| {
+            stage_hash(
+                &measurement_subtree_with_fits_artifact_version(&cfg, v),
+                &[],
+                &[],
+            )
+        };
+        assert_ne!(
+            at(FITS_ARTIFACT_VERSION),
+            at(FITS_ARTIFACT_VERSION - 1),
+            "a row measured at the previous format version is another hash"
+        );
+        assert_eq!(
+            at(FITS_ARTIFACT_VERSION),
+            at(FITS_ARTIFACT_VERSION),
+            "and the same version is the same hash"
+        );
+        let shipped = measurement_subtree(&cfg);
+        assert_eq!(
+            shipped.get("fitsArtifactVersion"),
+            Some(&serde_json::json!(FITS_ARTIFACT_VERSION)),
+            "the key, once, in the shipped subtree"
+        );
+        assert!(
+            shipped.get("measureVersion").is_some(),
+            "beside the measure version"
+        );
+        for (name, subtree) in [
+            ("registration", registration_subtree(&cfg)),
+            ("normalization", normalization_subtree(&cfg)),
+            ("calibration", calibration_subtree(&cfg)),
+            ("prepare", prepare_subtree(&cfg)),
+        ] {
+            assert!(subtree.get("fitsArtifactVersion").is_none(), "{name}");
+        }
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            "9653a478603091dc",
+            "the calibration hash is as before the fold"
+        );
     }
 
     /// M4c Task 3: the large-scale filter's two integers are clamped to the

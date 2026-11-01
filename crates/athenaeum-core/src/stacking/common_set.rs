@@ -101,9 +101,9 @@ pub enum CommonOutcome {
     },
     /// Fewer than [`COMMON_MIN_STARS`] stars are common: no common flux for this (group, plane).
     TooFewStars { stars: usize },
-    /// The set holds [`COMMON_MIN_STARS`] stars or more but the anchor's aperture sums over it add to zero or less (Plan D D2c,
-    /// PD-30: an `S` at or under the sky is noise and is summed, not dropped): there is no flux for the members' ratios to
-    /// scale, so no common flux for this (group, plane), like [`CommonOutcome::TooFewStars`].
+    /// The set holds [`COMMON_MIN_STARS`] stars or more but the anchor's aperture sums `S` over it, or its `S / area` over it,
+    /// add to zero or less (Plan D D2c, PD-30: an `S` at or under the sky is noise and is summed, not dropped): there is no
+    /// flux for the members' ratios to scale, so no common flux for this (group, plane), like [`CommonOutcome::TooFewStars`].
     NoAnchorFlux { stars: usize },
     /// The match table does not fit the candidates or the anchor: a wiring bug of the caller, never a property of the
     /// sky. A caller must not read it as "under 20 stars" (PD-6's fallback reason).
@@ -237,8 +237,9 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
 }
 
 /// For each candidate, the member's fit if there is exactly one within the match radius in group coordinates (two
-/// within the radius leave the candidate unmatched in this member) and it is `in_statistic()` with a finite positive
-/// `signal` and `area`. The radius is `max(POINT_SOURCE_MATCH_PX, POINT_SOURCE_MATCH_PER_FIELD_FWHM x max(F_anchor,
+/// within the radius leave the candidate unmatched in this member) and it is a `flux_fit`: `in_common_set()` (not saturated,
+/// and not extended unless `SIBLING_POINT` rescued it; `in_statistic()` is the narrower rule the frame statistic reads) with
+/// a finite positive `signal` and `area`. The radius is `max(POINT_SOURCE_MATCH_PX, POINT_SOURCE_MATCH_PER_FIELD_FWHM x max(F_anchor,
 /// F_member))`. Every member fit with a position counts for the uniqueness, clipped or extended ones too.
 ///
 /// The fit's aperture sum rides along (`ap_sum`, `ap_mean`; NaN where it has none, [`Usable`]): D1b's paired gain reads
@@ -290,8 +291,8 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
 ///
 /// A candidate joins the set when it is usable in at least [`COMMON_MIN_PRESENCE`] of the members, usable meaning a
 /// matched fit with a finite aperture sum ([`Usable::ap_sum`]); fewer than [`COMMON_MIN_STARS`] such stars leave no
-/// common flux ([`CommonOutcome::TooFewStars`]), and so does a set whose anchor sums `S` add to zero or less
-/// ([`CommonOutcome::NoAnchorFlux`]). Member f's flux is the paired ratio to the anchor over the set stars f has (`r_f` for
+/// common flux ([`CommonOutcome::TooFewStars`]), and so does a set whose anchor sums `S` or `S / area` add to zero or
+/// less ([`CommonOutcome::NoAnchorFlux`]). Member f's flux is the paired ratio to the anchor over the set stars f has (`r_f` for
 /// the flux, `q_f` for the mean flux), taken on the aperture sums `S` and `S / area` (Plan D D2b, PD-26), times the anchor's
 /// sums over the whole set (the model flux times `c`: the scale the master's PSF SNR is read on), so a frame that lost a
 /// third of its stars to cloud still weighs by its transparency, not by the stars it lost. A fit of f without a finite `S`
@@ -336,9 +337,12 @@ pub fn common_flux(
     if set.len() < COMMON_MIN_STARS {
         return CommonOutcome::TooFewStars { stars: set.len() };
     }
-    // The ratios scale the anchor's sums over the set; a set the anchor sees at or under the sky has none (PD-30).
+    // The ratios scale the anchor's sums over the set, S and S / area; a set the anchor sees at or under the sky has none
+    // (PD-30). Both must be positive: a positive S with a non-positive S / area would read every fully paired member as
+    // (0, 0) below and cut all of them but the anchor (review m3 of D2c).
     let anchor_ap: f64 = set.iter().map(|&j| cands[j].ap_sum).sum();
-    if !(anchor_ap > 0.0) {
+    let anchor_ap_mean: f64 = set.iter().map(|&j| cands[j].ap_mean).sum();
+    if !(anchor_ap > 0.0 && anchor_ap_mean > 0.0) {
         return CommonOutcome::NoAnchorFlux { stars: set.len() };
     }
     let anchor_signal: f64 = set.iter().map(|&j| cands[j].signal).sum();
@@ -1433,6 +1437,45 @@ mod tests {
         let (cands, _u, out) = run(&members, 0);
         assert_eq!(cands.len(), 60, "a negative S is a candidate");
         assert_eq!(out, CommonOutcome::NoAnchorFlux { stars: 60 });
+    }
+
+    #[test]
+    fn a_set_whose_anchor_mean_sum_is_not_positive_has_no_common_flux_either() {
+        // Plan D D2c r1 (review m3): the ratios scale the anchor's sums S AND S / area. A set whose sums S add to a positive
+        // number but whose S / area add to zero or less (a big positive S on a wide aperture against a handful of negative
+        // ones on narrow ones) would read every fully paired member as (0, 0) and cut all of them but the anchor: the plane
+        // falls back instead, with the set's size named. The other way round, S <= 0 with S / area > 0, falls back too.
+        let world = sky(60, 43);
+        let anchor_with = |first: (f64, f64), rest: f64| {
+            let mut members: Vec<_> = (0..4)
+                .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+                .collect();
+            for m in &mut members {
+                let area = m.0[1].area;
+                for (i, f) in m.0.iter_mut().enumerate() {
+                    if i == 0 {
+                        // `first.0` is the area as a multiple of the others', `first.1` the sum S.
+                        f.area = area * first.0;
+                        f.ap_sum = first.1 * ADU;
+                    } else {
+                        f.ap_sum = rest * ADU;
+                    }
+                }
+            }
+            run(&members, 0)
+        };
+        // S: 100 - 59 = +41; S / area: 100 / (4 A) - 59 / A < 0.
+        let (cands, _u, out) = anchor_with((4.0, 100.0), -1.0);
+        assert_eq!(cands.len(), 60, "every star is a candidate");
+        assert_eq!(out, CommonOutcome::NoAnchorFlux { stars: 60 });
+        // S: 40 - 59 = -19; S / area: 40 / (A / 4) - 59 / A > 0.
+        let (cands, _u, out) = anchor_with((0.25, 40.0), -1.0);
+        assert_eq!(cands.len(), 60, "every star is a candidate");
+        assert_eq!(out, CommonOutcome::NoAnchorFlux { stars: 60 });
+        // And both sums positive is a measured set.
+        let (cands, _u, out) = anchor_with((1.0, 1.0), 1.0);
+        assert_eq!(cands.len(), 60);
+        assert!(matches!(out, CommonOutcome::Measured { .. }), "{out:?}");
     }
 
     #[test]

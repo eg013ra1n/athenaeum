@@ -37,11 +37,10 @@ const MAGIC: [u8; 4] = *b"ATHF";
 /// not built to read. Version 2 (Plan D D2b, PD-26) added the aperture sum `S`
 /// after `area`; version 3 (Plan D D2c, PD-30) keeps the layout and moves the
 /// sum to 3 x the frame's ring FWHM (version 2's was the SNR aperture's), so a
-/// version-2 file is refused. The measurement hash does not move with this
-/// number (a catalog measured at an earlier head keeps its hash and its rows),
-/// so a fresh `fits.<plane>` row CAN point at a file of another version: the
-/// plan's freshness gate reads the header ([`header_version`]) and a row
-/// whose file is not of this version measures again.
+/// version-2 file is refused. The measurement hash moves with this
+/// number (`config::measurement_subtree`, `fitsArtifactVersion`), so a row
+/// measured at another version is keyed on another hash and measures again by
+/// key; the plan's freshness gate stays hash + stat and opens no file.
 pub const FITS_ARTIFACT_VERSION: u16 = 3;
 
 /// `x, y, background, amplitude, fwhm_x, fwhm_y, fwtm_x, fwtm_y, theta,
@@ -238,27 +237,6 @@ pub fn read_fits(path: &Path) -> Result<Vec<StarFit>, FitsArtifactError> {
         )));
     }
     Ok(rest.chunks_exact(RECORD_LEN).map(decode_fit).collect())
-}
-
-/// The version a `fits` artifact's header carries, without reading its records: the freshness gate's question (Plan D D2c,
-/// review M1 of D2b). The same typed errors as [`read_fits`] for a file that is not an `.athf` at all (a short header, a
-/// foreign magic); the version itself is returned whatever it is, so the caller can say which one it found.
-pub fn header_version(path: &Path) -> Result<u16, FitsArtifactError> {
-    let mut file = std::fs::File::open(path)?;
-    let mut header = [0u8; 6];
-    file.read_exact(&mut header)
-        .map_err(|e| FitsArtifactError::Truncated(format!("header: {e}")))?;
-    let mut magic = [0u8; 4];
-    magic.copy_from_slice(&header[0..4]);
-    if magic != MAGIC {
-        return Err(FitsArtifactError::BadMagic {
-            expected: MAGIC,
-            found: magic,
-        });
-    }
-    Ok(u16::from_le_bytes(
-        header[4..6].try_into().expect("2-byte slice"),
-    ))
 }
 
 /// The `stacking_artifacts.kind` for one plane's fits file — `"fits.<plane>"`
@@ -538,34 +516,6 @@ mod tests {
         );
         assert_eq!(back[0].ap_sum, 777.5);
         assert_eq!(std::fs::read(&p).unwrap()[4..6], 3u16.to_le_bytes());
-    }
-
-    /// Plan D D2c, review M1: the header's version is readable on its own, whatever it is, and a file that is no `.athf`
-    /// is a typed error.
-    #[test]
-    fn the_header_version_is_read_without_the_records() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("now.athf");
-        write_fits(&p, &[]).unwrap();
-        assert_eq!(header_version(&p).unwrap(), FITS_ARTIFACT_VERSION);
-        let mut bytes = std::fs::read(&p).unwrap();
-        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
-        std::fs::write(&p, &bytes).unwrap();
-        assert_eq!(header_version(&p).unwrap(), 2);
-        std::fs::write(&p, b"AT").unwrap();
-        assert!(matches!(
-            header_version(&p),
-            Err(FitsArtifactError::Truncated(_))
-        ));
-        std::fs::write(&p, b"NOPE\x01\x00\x00\x00\x00\x00").unwrap();
-        assert!(matches!(
-            header_version(&p),
-            Err(FitsArtifactError::BadMagic { .. })
-        ));
-        assert!(matches!(
-            header_version(&d.path().join("absent.athf")),
-            Err(FitsArtifactError::Io(_))
-        ));
     }
 
     #[test]

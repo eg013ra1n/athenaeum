@@ -4395,43 +4395,56 @@ mod b4_tests {
             m.stars.iter().filter(|f| f.flags.extended()).count(),
             KNOTS.len()
         );
-        // Two planes: the knots are extended on both, and neither plane has a point-like list.
+        // Two planes: the knots are extended on plane 0 alone, so plane 1 sees a point-like star at each of them and WOULD
+        // rescue them if a two-plane image had point-like lists. It has none (they exist for exactly three planes), so
+        // nothing is flagged: the gate in `point_like_sibling_seeds` is what this checks (review m2 of D2c).
         let o: Vec<MeasureOptions> = (0..2)
-            .map(|_| MeasureOptions {
-                given_extended: flags.clone(),
+            .map(|p| MeasureOptions {
+                given_extended: if p == 0 {
+                    flags.clone()
+                } else {
+                    vec![false; flags.len()]
+                },
                 ..opts(seeds_of(&stars), true)
             })
             .collect();
         let planes: Vec<Vec<f32>> = (0..2)
             .map(|p| render(w, h, &stars, range_at, 11 + p))
             .collect();
-        let mut preps: Vec<_> = planes
-            .iter()
-            .zip(&o)
-            .map(|(p, o)| prepare_plane(p, w, h, o, None))
-            .collect();
-        cross_plane_flags(&mut preps);
-        let m: Vec<PlaneMeasurement> = planes
-            .iter()
-            .zip(&o)
-            .zip(preps)
-            .map(|((p, o), prep)| finish_plane(p, w, h, o, prep, None, None, None))
-            .collect();
+        let m = measure_three_opts(w, h, &planes, &o);
+        assert_eq!(
+            m[0].extended_seeds,
+            KNOTS.len(),
+            "premise: the knots reach plane 0"
+        );
+        assert_eq!(m[1].extended_seeds, 0, "premise: plane 1 flags none");
         for plane in &m {
             assert!(plane.stars.iter().all(|f| !f.flags.sibling_point()));
         }
+        assert_eq!(
+            m[0].stars.iter().filter(|f| f.flags.extended()).count(),
+            KNOTS.len(),
+            "the knots keep their flag"
+        );
     }
 
     #[test]
     fn a_two_plane_image_keeps_extended_candidates_out_of_c() {
+        // The knots are extended on plane 0 alone: plane 1 holds a point-like seed at each, so a two-plane image with
+        // point-like lists would take them back into `c` (review m2 of D2c). It has none, and the lists are what
+        // `finish_plane` is fed with here, as the adapter feeds them.
         let (w, h) = size(8, 5);
         let nodes = lattice(8, 40);
         let stars: Vec<MoffatStar> = nodes.iter().map(|&(x, y)| star(x, y, 0.3)).collect();
         let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
         let flags: Vec<bool> = (0..40).map(|k| KNOTS.contains(&k)).collect();
         let o: Vec<MeasureOptions> = (0..2)
-            .map(|_| MeasureOptions {
-                given_extended: flags.clone(),
+            .map(|p| MeasureOptions {
+                given_extended: if p == 0 {
+                    flags.clone()
+                } else {
+                    vec![false; flags.len()]
+                },
                 ..opts(seeds_of(&stars), true)
             })
             .collect();
@@ -4448,14 +4461,13 @@ mod b4_tests {
             point_like_sibling_seeds(&preps, &[&o[0], &o[1]]),
             vec![None, None]
         );
-        let m: Vec<PlaneMeasurement> = planes
-            .iter()
-            .zip(&o)
-            .zip(preps)
-            .map(|((p, o), prep)| finish_plane(p, w, h, o, prep, None, None, None))
-            .collect();
-        assert_eq!(counts(&m[0]), (32, 0, 0, 0));
-        assert_eq!(counts(&m[1]), (32, 0, 0, 0));
+        let m = measure_three_opts(w, h, &planes, &o);
+        assert_eq!(
+            counts(&m[0]),
+            (32, 0, 0, 0),
+            "the 32 point-like stars, no rescue"
+        );
+        assert_eq!(counts(&m[1]), (40, 0, 0, 0));
     }
 
     #[test]

@@ -734,11 +734,14 @@ pub(crate) struct CoverageOptions {
 
 /// One image's signals over the group's frame-common star set (Plan D D1b, PD-3): for each position (the delivered
 /// grid's coordinates; `origin` is the image's own origin in that grid, `(0, 0)` unless the image is a crop), the
-/// native-unit signal of the one fit within the match radius when it is usable (`in_statistic()`, finite positive
-/// `signal` and `area`), else `None`. This IS [`common_set::match_member`] through an identity map - the set's own
+/// native-unit signal of the one fit within the match radius when it is usable (the set's `flux_fit` rule: not saturated,
+/// and not extended unless `SIBLING_POINT` rescued it, as `StarFlags::in_common_set` reads it - not `in_statistic()`; finite
+/// positive `signal` and `area`), else `None`. This IS [`common_set::match_member`] through an identity map - the set's own
 /// matching rule, radius (`POINT_SOURCE_MATCH_PX`, `POINT_SOURCE_MATCH_PER_FIELD_FWHM` x the larger of the two images'
 /// field FWHMs, in the grid's pixels) and uniqueness (two fits within the radius leave the star unmatched), signals
-/// divided by `ADU_SCALE` - so the set a frame was weighed on is the set the gain is read on.
+/// divided by `ADU_SCALE` - so the set a frame was weighed on is the set the gain is read on. That holds for the paired
+/// gain and the master's common PSF SNR as well: both follow the set as PD-30 widened it (D2c review m1), the rescued
+/// stars included, never D2b's narrower one.
 fn common_signals(
     fits: &[StarFit],
     positions: &[(f64, f64)],
