@@ -4351,9 +4351,16 @@ mod tests {
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 1);
+        // Normalize is stale on a fresh set too: rejection normalization
+        // defaults to `local` since OD-1a, which runs the stage.
         assert_eq!(
             plan.stale_stages,
-            vec![Stage::Calibrate, Stage::Measure, Stage::Register]
+            vec![
+                Stage::Calibrate,
+                Stage::Measure,
+                Stage::Register,
+                Stage::Normalize
+            ]
         );
         assert!(plan.estimate_bytes > 0);
     }
@@ -6632,6 +6639,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
+        // The M1 global path: the default rejection is `local` since OD-1a, which would leave Normalize stale here.
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
         set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
 
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();

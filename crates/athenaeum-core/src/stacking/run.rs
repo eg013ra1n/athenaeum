@@ -22148,6 +22148,10 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
+        // The M1 global path (this test follows one Normalize-less run's
+        // progress): the default rejection normalization is `local` since OD-1a.
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
         let recorder = Arc::new(Recording::new());
         let started = start_stacking(
             ctx.clone(),
@@ -22155,7 +22159,7 @@ mod tests {
             &PathPolicy::AllowAll,
             "test".to_string(),
             StackSubject::FrameSet(fixture.set_id),
-            None,
+            Some(cfg),
             None,
         )
         .expect("start should succeed");
@@ -24116,8 +24120,10 @@ mod tests {
         );
 
         // `StackingConfig::default()`'s `normalization.local.enabled` is
-        // `false` — no override needed to exercise the disabled path.
-        let cfg = StackingConfig::default();
+        // `false`; the disabled path needs the rejection normalization global
+        // too (the default is `local` since OD-1a, which runs LN for rejection).
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
@@ -24505,12 +24511,11 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
-        let cfg = StackingConfig::default();
+        let mut cfg = StackingConfig::default();
         assert!(!cfg.normalization.local.enabled);
-        assert_eq!(
-            cfg.normalization.rejection,
-            RejectionNormalization::ScaleZeroOffset
-        );
+        // The M1 shape is global rejection too: the default is `local` since
+        // OD-1a, which runs the Normalize stage for rejection.
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -32782,8 +32787,11 @@ mod tests {
         }
         // 4 registered frames, the master, its coverage map (the project seed
         // turns `coverageMap` on), the drizzled master, its weight map, and
-        // drizzle's own coverage (plan 6b-3 D9: the 9th file).
-        assert_eq!(fits.len(), 9, "{fits:?}");
+        // drizzle's own coverage (plan 6b-3 D9: the 9th file), plus the two
+        // files of the LN reference (`reference.fits` and
+        // `reference-saturation.fits`): rejection normalization defaults to
+        // `local` since OD-1a, so a default project run builds one.
+        assert_eq!(fits.len(), 11, "{fits:?}");
         let out = tmp.path().join("out").join("p1");
         for name in [
             "p1_Lum_mono_300s_4x.fits",
