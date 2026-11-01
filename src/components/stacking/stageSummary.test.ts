@@ -19,3 +19,29 @@ describe('stageSummary normalize', () => {
       'Local · scale auto (÷4) · ref 20 · common aperture 2×FWHM + growth',
     ));
 });
+
+describe('stageSummary integrate LN rejection', () => {
+  const integrate = (rejection: StackingConfig['normalization']['rejection'], lnEnabled: boolean) =>
+    ({
+      normalization: { ...withLocal({ enabled: lnEnabled }).normalization, rejection },
+      integration: {
+        combination: 'average',
+        rejection: { method: 'sigmaClip', sigmaLow: 3, sigmaHigh: 3 },
+        minWeight: 0.005,
+        largeScale: { enabled: false, protectedLayers: 3, growth: 1 },
+      },
+    }) as unknown as StackingConfig;
+
+  it('says LN rejection for local rejection with LN output on', () =>
+    expect(stageSummary('integrate', integrate('local', true))).toBe(
+      'Average · sigma clip 3/3 · min weight 0.005 · LN rejection',
+    ));
+  it('says LN rejection for local rejection with LN output off', () =>
+    expect(stageSummary('integrate', integrate('local', false))).toBe(
+      'Average · sigma clip 3/3 · min weight 0.005 · LN rejection',
+    ));
+  it('says nothing for a non-local rejection normalization', () =>
+    expect(stageSummary('integrate', integrate('scaleZeroOffset', true))).toBe(
+      'Average · sigma clip 3/3 · min weight 0.005',
+    ));
+});
