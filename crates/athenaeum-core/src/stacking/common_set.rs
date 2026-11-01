@@ -82,6 +82,9 @@ pub enum CommonOutcome {
     },
     /// Fewer than [`COMMON_MIN_STARS`] stars are common: no common flux for this (group, plane).
     TooFewStars { stars: usize },
+    /// The match table does not fit the candidates or the anchor: a wiring bug of the caller, never a property of the
+    /// sky. A caller must not read it as "under 20 stars" (PD-6's fallback reason).
+    MalformedTable,
 }
 
 /// The group's anchor: among the members whose summed unsaturated-star count is at least the group median, the one
@@ -241,6 +244,9 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
 /// set stars f has (`r_f` for the flux, `q_f` for the mean flux) times the anchor's sums over the whole set, so a
 /// frame that lost a third of its stars to cloud still weighs by its transparency, not by the stars it lost. A member
 /// with no paired star reads 0. The anchor's own entry is the anchor's sums, exactly.
+///
+/// A table that does not fit (`usable` rows not as long as `cands`, or `anchor` past the table) is a wiring bug of the
+/// caller: an `error!`, a `debug_assert!`, and [`CommonOutcome::MalformedTable`] in a release build.
 pub fn common_flux(
     cands: &[Candidate],
     usable: &[Vec<Option<Usable>>],
@@ -253,7 +259,11 @@ pub fn common_flux(
             anchor,
             "common set: the match table does not fit the candidates or the anchor"
         );
-        return CommonOutcome::TooFewStars { stars: 0 };
+        debug_assert!(
+            false,
+            "common set: the match table does not fit the candidates or the anchor"
+        );
+        return CommonOutcome::MalformedTable;
     }
     let members = usable.len() as f64;
     let set: Vec<usize> = (0..cands.len())
@@ -776,7 +786,7 @@ mod tests {
         let (_c, _u, out) = run(&members, 0);
         let (positions, per) = measured(&out);
         assert!(
-            positions.is_empty() == false,
+            !positions.is_empty(),
             "nine of ten members still carry the set"
         );
         assert_eq!(
@@ -990,6 +1000,98 @@ mod tests {
             assert!(rel(rb, ra) < 1e-12, "member {k}: r_f {ra} vs {rb}");
             assert!(rel(qb, qa) < 1e-12, "member {k}: q_f {qa} vs {qb}");
             assert_eq!(fa[k].paired, fb[k].paired);
+        }
+    }
+
+    #[test]
+    fn the_presence_rule_counts_the_set_not_the_candidates() {
+        // 25 candidates; stars 0..6 are clipped in two of the ten members (8 of 10 present: out), so the SET is 19 while
+        // the candidates are 25. A check on the candidates would let this through.
+        let world = sky(25, 22);
+        let build = |clipped_stars: usize| {
+            let mut members: Vec<_> = (0..10)
+                .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+                .collect();
+            for j in 0..clipped_stars {
+                members[2].0[j].flags = StarFlags::SATURATED;
+                members[7].0[j].flags = StarFlags::SATURATED;
+            }
+            members
+        };
+        let (cands, _usable, out) = run(&build(6), 0);
+        assert_eq!(cands.len(), 25);
+        assert_eq!(out, CommonOutcome::TooFewStars { stars: 19 });
+        // Five clipped in the two members: the set is 20, the boundary, and measured.
+        let (cands, _usable, out) = run(&build(5), 0);
+        assert_eq!(cands.len(), 25);
+        assert_eq!(measured(&out).0.len(), 20);
+    }
+
+    #[test]
+    fn a_clipped_second_fit_still_makes_a_match_ambiguous() {
+        // Uniqueness reads every member fit with a position, whatever its flags: a clipped neighbour inside the radius
+        // contaminates the candidate's wings, so the candidate is unmatched in that member.
+        let world = sky(40, 23);
+        let anchor = fits_of(&world, &Shot::new(1.0, 3.0));
+        let mut member = fits_of(&world, &Shot::new(1.0, 3.0));
+        let f = member[11];
+        member.push(StarFit {
+            x: f.x + 0.8,
+            flags: StarFlags::SATURATED,
+            ..f
+        });
+        let map = identity();
+        let cands = candidates(&plane(&anchor, &map, 3.0));
+        assert_eq!(cands.len(), 40);
+        let got = match_member(&cands, &plane(&member, &map, 3.0));
+        assert!(
+            got[11].is_none(),
+            "a saturated second fit 0.8 px away: unmatched"
+        );
+        assert_eq!(got.iter().filter(|g| g.is_some()).count(), 39);
+    }
+
+    #[test]
+    fn the_match_radius_reads_the_anchors_fwhm_too() {
+        // Anchor F 6, member F 3: the radius is max(1.5, 0.5 x max(6, 3)) = 3 px, so a fit 2.4 px off pairs. The radius
+        // reads the WIDER of the two fields, whichever side it is on.
+        let world = sky(40, 24);
+        let anchor = fits_of(&world, &Shot::new(1.0, 6.0));
+        let map = identity();
+        let cands = candidates(&plane(&anchor, &map, 6.0));
+        assert_eq!(cands.len(), 40);
+        assert!(cands.iter().all(|c| c.anchor_fwhm_px == 6.0));
+        let mut member = fits_of(&world, &Shot::new(1.0, 3.0));
+        member[3].x += 2.4;
+        let got = match_member(&cands, &plane(&member, &map, 3.0));
+        assert!(got[3].is_some(), "2.4 px off, anchor F 6: paired");
+        // The same fit against an anchor of F 3 and a member of F 3 is outside max(1.5, 1.5).
+        let narrow = candidates(&plane(&fits_of(&world, &Shot::new(1.0, 3.0)), &map, 3.0));
+        assert!(match_member(&narrow, &plane(&member, &map, 3.0))[3].is_none());
+    }
+
+    #[test]
+    fn a_malformed_match_table_is_its_own_outcome() {
+        let world = sky(60, 25);
+        let members: Vec<_> = (0..4)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        let (cands, usable, _) = run(&members, 0);
+        // A member row of the wrong length, and an anchor index past the table.
+        let mut short = usable.clone();
+        short[2].pop();
+        let cases = [(short, 0usize), (usable.clone(), usable.len())];
+        for (table, anchor) in cases {
+            let got = std::panic::catch_unwind(|| common_flux(&cands, &table, anchor));
+            if cfg!(debug_assertions) {
+                // A debug build stops at the wiring bug.
+                assert!(got.is_err(), "debug_assert on a malformed table");
+            } else {
+                assert_eq!(
+                    got.expect("no panic in release"),
+                    CommonOutcome::MalformedTable
+                );
+            }
         }
     }
 }
