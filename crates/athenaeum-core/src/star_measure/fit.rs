@@ -150,8 +150,8 @@ impl Default for FitParams {
 
 /// Per-accepted-fit flags (spec 2026-10-07 §3 F-0), persisted as the `.athf` record's flags byte
 /// (`stacking::fits_artifact`). `SATURATED` is set from Task 8 (the measure path's saturation verdict), `BETA_AT_CAP`
-/// from Task 9, `EXTENDED` from Task 10b (the matched filter's knot test). A bit this build does not name is kept as it
-/// is (a newer writer's flag survives a round trip).
+/// from Task 9, `EXTENDED` from Task 10b (the matched filter's knot test), `SIBLING_POINT` from Plan D D2c (PD-30). A bit
+/// this build does not name is kept as it is (a newer writer's flag survives a round trip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StarFlags(pub u8);
@@ -165,6 +165,12 @@ impl StarFlags {
     /// The star's seed is not a point source (F-10, Task 10b ruling A3: the knot test's zero-sum ratio): it is fitted
     /// and kept, but leaves the β sample, `c`'s qualifiers and the frame statistic, as a saturated star does (P3).
     pub const EXTENDED: StarFlags = StarFlags(4);
+    /// Set on an [`StarFlags::EXTENDED`] fit of a three-plane image that has a point-like seed of another plane within the
+    /// point-source screen's radius (Plan D D2c, PD-30; PD-9's test, run on every extended kept fit): the knot flag took a
+    /// star the colour image's other planes see as a point. `c`'s sample takes such a fit back (PD-9) and the frame-common
+    /// star set may read it ([`StarFlags::in_common_set`]); the frame statistic, the β sample and [`StarFlags::in_statistic`]
+    /// still leave it out. Never set without `EXTENDED`.
+    pub const SIBLING_POINT: StarFlags = StarFlags(8);
 
     pub const fn bits(self) -> u8 {
         self.0
@@ -194,18 +200,31 @@ impl StarFlags {
         self.contains(StarFlags::EXTENDED)
     }
 
+    /// [`StarFlags::SIBLING_POINT`] is set (Plan D D2c, PD-30): the fit is extended on its own plane and a point-like seed
+    /// of another plane lies at its position.
+    pub const fn sibling_point(self) -> bool {
+        self.contains(StarFlags::SIBLING_POINT)
+    }
+
     /// The star is one the frame statistic and `c`'s qualifiers read: neither saturated (F-3) nor extended (F-10, P3).
     pub const fn in_statistic(self) -> bool {
         !self.saturated() && !self.extended()
     }
 
+    /// The star is one the frame-common star set may read (Plan D D2c, PD-30): not saturated, and not extended unless a
+    /// point-like seed of another plane rescues it ([`StarFlags::SIBLING_POINT`]). `in_statistic()` is unchanged.
+    pub const fn in_common_set(self) -> bool {
+        !self.saturated() && (!self.extended() || self.sibling_point())
+    }
+
     /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`,
-    /// `"extended"`).
+    /// `"extended"`, `"siblingPoint"`).
     pub fn names(self) -> Vec<&'static str> {
         [
             (StarFlags::SATURATED, "saturated"),
             (StarFlags::BETA_AT_CAP, "betaAtCap"),
             (StarFlags::EXTENDED, "extended"),
+            (StarFlags::SIBLING_POINT, "siblingPoint"),
         ]
         .into_iter()
         .filter(|(f, _)| self.contains(*f))
@@ -279,12 +298,13 @@ pub struct StarFit {
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
     pub snr: f64,
-    /// The star's aperture sum (Plan D D2b, PD-26): `S = sum (v - B_i)` in the SNR's own aperture (`max(SNR_APERTURE_PER_FWHM
-    /// * fwhm, SNR_APERTURE_MIN_PX)` px about the fitted centre, the star's ring sky), in the fit's units. It is
-    /// [`super::photometry::SnrTerms::s`] of the very call that gives `snr`, stored by the same `snr_pass` closure (no second
-    /// pass, no pixel read of its own); NaN where that call's SNR is NaN (no ring, no present aperture pixel, no positive
-    /// variance). It carries neither `signal`'s model nor `c`: the common-set weight reads it
-    /// ([`crate::stacking::common_set`]); every other reader keeps `signal`. Persisted in the `fits` artifact (version 2).
+    /// The star's aperture sum (Plan D D2c, PD-30): `S = sum (v - B_i)` over the present pixels whose centres lie within
+    /// `3 * ring_fwhm` of the fitted centre (the frame's ring width: one radius for every fit of the plane, no fit width
+    /// in it), the star's ring sky, in the fit's units. It is read in [`hfr_pass`]'s walk
+    /// ([`super::photometry::hfr_scan`]); NaN where the 3 F disc leaves the plane or holds a non-finite or masked pixel, and
+    /// without a ring sky. It carries neither `signal`'s model nor `c`: the common-set weight reads it
+    /// ([`crate::stacking::common_set`]); every other reader keeps `signal`. The SNR stays at 1.5 F. Persisted in the `fits`
+    /// artifact (version 3).
     #[serde(skip, default = "not_measured")]
     pub ap_sum: f64,
     /// The star's half-flux radius, px (F-6, Task 11, [`super::photometry::hfr`]): NaN without a ring, or when the `5F`
@@ -2475,6 +2495,22 @@ fn ring_and_correction(
         }
         super::FluxCorrection::FromPlane => None,
     };
+    // Plan D D2c (PD-30): PD-9's test run once for the plane, on EVERY extended kept fit (not only the ones `c`'s list takes
+    // back): an extended fit with a point-like seed of another plane within the point-source screen's radius carries
+    // SIBLING_POINT, which the frame-common star set reads. One index per plane, one query per extended fit; the colour
+    // sample's taking-back (`aperture_correction`) reads the mark instead of asking again. Only a three-plane image has
+    // `point_siblings`.
+    if let Some(seeds) = correction.point_siblings {
+        let near = super::photometry::NearIndex::new(
+            seeds.iter().map(|s| (s.x, s.y)),
+            super::photometry::point_source_match_px(field_fwhm),
+        );
+        for (_, f) in kept.iter_mut() {
+            if f.flags.extended() && near.any_within(f.x, f.y) {
+                f.flags |= StarFlags::SIBLING_POINT;
+            }
+        }
+    }
     snr_pass(data, mask, w, h, kept, correction, pool);
     let (c, stars, se, screens) = match given {
         Some(c) => (
@@ -2500,7 +2536,7 @@ fn ring_and_correction(
                 correction.footprint,
                 correction.population,
                 correction.siblings,
-                correction.point_siblings,
+                correction.point_siblings.is_some(),
             )
         }
     };
@@ -2510,8 +2546,7 @@ fn ring_and_correction(
 /// Every kept fit's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]) from its stored ring sky and noise
 /// and the pixels about its fitted centre: it reads neither `signal` nor `c`, so it is read BEFORE the aperture
 /// correction (Plan B B4, PB-13': the `c` sample's floor reads it). `correction` carries the plane's gain and noise
-/// correlation (default: no gain, white). Each fit also keeps the call's aperture sum `S` ([`StarFit::ap_sum`], Plan D
-/// D2b). Nothing the fit measured moves. `pool` as the fit's.
+/// correlation (default: no gain, white). Nothing the fit measured moves. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
 fn snr_pass(
     data: &[f32],
@@ -2526,7 +2561,7 @@ fn snr_pass(
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
-            let (snr, terms) = super::photometry::star_snr(
+            f.snr = super::photometry::star_snr(
                 data,
                 w,
                 h,
@@ -2534,11 +2569,8 @@ fn snr_pass(
                 correction.gain,
                 mask,
                 &correction.noise,
-            );
-            f.snr = snr;
-            // Plan D D2b (PD-26): the aperture sum of this very call, kept (NaN where its SNR is: no ring, no present
-            // aperture pixel, no positive variance). A store, not a computation: `star_snr` built `terms` anyway.
-            f.ap_sum = if snr.is_nan() { f64::NAN } else { terms.s };
+            )
+            .0;
         })
     };
     super::install_in_span(pool, body);
@@ -2546,8 +2578,9 @@ fn snr_pass(
 
 /// Every kept fit's half-flux radius (F-6, Task 11, [`super::photometry::hfr`]) from its stored ring sky and its
 /// (aperture-corrected) `signal`, at the ring width `ring_fwhm` the rings were read at (`None` = no ring anywhere:
-/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. `pool` as the
-/// fit's.
+/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. The same pixel
+/// walk gives each fit's aperture sum at 3 `ring_fwhm` ([`StarFit::ap_sum`], Plan D D2c, PD-30; it reads no `signal`).
+/// `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
 fn hfr_pass(
     data: &[f32],
@@ -2563,7 +2596,9 @@ fn hfr_pass(
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
-            f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
+            let scan = ring_fwhm.map(|r| super::photometry::hfr_scan(data, w, h, f, r, mask));
+            f.hfr = scan.map_or(f64::NAN, |s| s.hfr);
+            f.ap_sum = scan.map_or(f64::NAN, |s| s.ap_sum);
         })
     };
     super::install_in_span(pool, body);

@@ -4113,11 +4113,15 @@ mod tests {
             );
         }
 
-        /// Plan D D2b (PD-26): every accepted fit keeps the aperture sum `S` of the very `star_snr` call that gave its SNR
-        /// (no second pass), and carries NaN exactly where that call's SNR is NaN.
+        /// Plan D D2c (PD-30): every accepted fit keeps the sum of `v - B_i` over the present pixels within `3 * ring_fwhm` of
+        /// its centre (the frame's ring width, one radius for the plane), read in the HFR scan: not the SNR call's sum at
+        /// `1.5 * fwhm` (D2b), which the SNR keeps for itself. NaN with no ring sky and where an absent pixel lies in the disc.
         #[test]
-        fn a_fits_aperture_sum_is_the_snr_calls_s_and_nan_where_the_snr_is() {
+        fn a_fits_aperture_sum_is_its_3f_disc_sum_and_nan_where_the_disc_is_not_whole() {
             let (data, seeds) = one_star_plane();
+            let snr_of = |data: &[f32], f: &StarFit, mask: Option<&[bool]>| {
+                star_snr(data, 64, 64, f, None, mask, &ApertureNoise::WHITE)
+            };
             let fit_with = |mask: Option<Vec<bool>>| {
                 let out = fit_stars_at(
                     &data,
@@ -4132,24 +4136,74 @@ mod tests {
                     None,
                 );
                 assert_eq!(out.fits.len(), 1, "{:?}", out.refused);
-                let f = out.fits[0];
-                let (snr, terms) = star_snr(&data, 64, 64, &f, None, mask.as_deref(), &ApertureNoise::WHITE);
-                (f, snr, terms)
+                let ring = out.ring_fwhm;
+                (
+                    out.fits[0],
+                    ring,
+                    snr_of(&data, &out.fits[0], mask.as_deref()),
+                )
             };
-            let (f, snr, terms) = fit_with(None);
-            assert!(snr.is_finite() && terms.s > 0.0, "{snr} {}", terms.s);
-            assert_eq!(f.ap_sum.to_bits(), terms.s.to_bits(), "the fit keeps the call's S exactly");
-            assert_eq!(f.snr.to_bits(), snr.to_bits(), "and its SNR is that call's");
-            // No ring: every pixel past 20 px of the star is masked, and the ring (10 F to 12 F, F = 2.6) is past 20 px.
+            // The disc, brute force: lattice points within 3 ring FWHM, `v - B_i`, row-major.
+            let disc = |f: &StarFit, ring: f64, mask: Option<&[bool]>| -> f64 {
+                let r = 3.0 * ring;
+                let mut sum = 0.0f64;
+                for py in 0..64usize {
+                    for px in 0..64usize {
+                        let d2 = (px as f64 - f.x).powi(2) + (py as f64 - f.y).powi(2);
+                        let i = py * 64 + px;
+                        if d2 <= r * r {
+                            assert!(data[i].is_finite() && mask.map_or(true, |m| m[i]));
+                            sum += data[i] as f64 - f.sky_ring;
+                        }
+                    }
+                }
+                sum
+            };
+            let (f, ring, (snr, terms)) = fit_with(None);
+            let ring = ring.expect("a ring width");
+            assert!(snr.is_finite() && f.sky_ring.is_finite());
+            let want = disc(&f, ring, None);
+            assert!(want > 0.0 && f.ap_sum.is_finite(), "{want} {}", f.ap_sum);
+            assert!(
+                (f.ap_sum / want - 1.0).abs() < 1e-12,
+                "{} vs {want}",
+                f.ap_sum
+            );
+            // It is not the SNR call's 1.5 F sum, and the SNR is that call's.
+            assert!(
+                f.ap_sum > terms.s && terms.s > 0.0,
+                "3 F holds more than 1.5 F: {} vs {}",
+                f.ap_sum,
+                terms.s
+            );
+            assert_eq!(f.snr.to_bits(), snr.to_bits(), "snr stays at 1.5 F");
+            // An absent pixel inside the 3 F disc (4 px from the star, F is 2.6): the sum is NaN, the star is still fitted.
+            let mut inside = vec![true; 64 * 64];
+            inside[32 * 64 + 36] = false;
+            let (g, _, _) = fit_with(Some(inside));
+            assert!(g.ap_sum.is_nan(), "{}", g.ap_sum);
+            // ... one outside it (3 F is about 8 px; 14 px away) leaves it whole.
+            let mut outside = vec![true; 64 * 64];
+            outside[32 * 64 + 46] = false;
+            let (g, ring_g, _) = fit_with(Some(outside.clone()));
+            let ring_g = ring_g.expect("a ring width");
+            assert!(g.ap_sum.is_finite(), "{}", g.ap_sum);
+            assert!((g.ap_sum / disc(&g, ring_g, Some(&outside)) - 1.0).abs() < 1e-12);
+            // No ring: every pixel past 20 px of the star is masked, and the ring is past 20 px.
             let mask: Vec<bool> = (0..64 * 64)
                 .map(|i| {
                     let (x, y) = ((i % 64) as f64 - 32.0, (i / 64) as f64 - 32.0);
                     x * x + y * y < 20.0 * 20.0
                 })
                 .collect();
-            let (f, snr, _) = fit_with(Some(mask));
+            let (g, _, (snr, _)) = fit_with(Some(mask));
             assert!(snr.is_nan(), "no ring pixel: no SNR, got {snr}");
-            assert!(f.snr.is_nan() && f.ap_sum.is_nan(), "snr {} ap_sum {}", f.snr, f.ap_sum);
+            assert!(
+                g.snr.is_nan() && g.ap_sum.is_nan(),
+                "snr {} ap_sum {}",
+                g.snr,
+                g.ap_sum
+            );
         }
 
         /// A sky the caller measured is the plane's sky as handed in, not re-sampled.

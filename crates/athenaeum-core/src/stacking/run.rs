@@ -9719,6 +9719,9 @@ enum Fallback {
     MissingFits(i64),
     /// No member at or above the median star count has a usable FWHM, so there is no anchor.
     NoAnchor,
+    /// The set is big enough, but the anchor's aperture sums over it add to zero or less (PD-30), so the members' ratios
+    /// have nothing to scale.
+    AnchorFluxNotPositive(usize),
     /// The match table did not fit the candidates: a wiring bug of this module, not a property of the sky. It is
     /// reported as an `error!` where it is found and falls back like the others, never as "under 20 common stars".
     MalformedTable,
@@ -9731,6 +9734,7 @@ impl Fallback {
             Fallback::TooFewStars(_) => "under 20 common stars",
             Fallback::MissingFits(_) => "member without a fresh .athf",
             Fallback::NoAnchor => "no anchor",
+            Fallback::AnchorFluxNotPositive(_) => "anchor flux not positive",
             Fallback::MalformedTable => "match table malformed",
         }
     }
@@ -9738,7 +9742,7 @@ impl Fallback {
     /// The dictionary's `common_stars` of the fallback warn: the set size when one was counted, else 0.
     fn common_stars(&self) -> usize {
         match self {
-            Fallback::TooFewStars(n) => *n,
+            Fallback::TooFewStars(n) | Fallback::AnchorFluxNotPositive(n) => *n,
             _ => 0,
         }
     }
@@ -9872,6 +9876,9 @@ fn plane_outcome(
         },
         common_set::CommonOutcome::TooFewStars { stars } => {
             PlaneOutcome::Fallback(Fallback::TooFewStars(stars))
+        }
+        common_set::CommonOutcome::NoAnchorFlux { stars } => {
+            PlaneOutcome::Fallback(Fallback::AnchorFluxNotPositive(stars))
         }
         common_set::CommonOutcome::MalformedTable => {
             tracing::error!(

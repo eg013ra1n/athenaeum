@@ -290,7 +290,14 @@ mod tests {
         // the accepted fits are identical bit for bit.
         assert_eq!(ma.seeds, mb.seeds);
         assert_eq!(ma.field_width, mb.field_width);
-        assert_eq!(ma.stars, mb.stars);
+        // The 3 F aperture sum (Plan D D2c, PD-30) is NaN on a mosaic by design: its disc holds the absent R / B sites. A NaN
+        // is not equal to itself, so it is checked on both sides and left out of the comparison of the rest.
+        assert!(ma.stars.iter().chain(&mb.stars).all(|f| f.ap_sum.is_nan()));
+        use crate::star_measure::StarFit;
+        let without_sum = |s: &[StarFit]| -> Vec<StarFit> {
+            s.iter().map(|f| StarFit { ap_sum: 0.0, ..*f }).collect()
+        };
+        assert_eq!(without_sum(&ma.stars), without_sum(&mb.stars));
     }
 
     #[test]

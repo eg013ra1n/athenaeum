@@ -1027,12 +1027,49 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     for plane in 0..planes {
         let kind = fits_artifact::artifact_kind(plane);
         let plane_fresh = find_artifact(conn, subject, group_key, &kind, Some(frame_id))?
-            .is_some_and(|row| is_fresh(&row, expected_hash));
+            .is_some_and(|row| {
+                is_fresh(&row, expected_hash) && fits_artifact_is_current(&row, frame_id, plane)
+            });
         if !plane_fresh {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Whether the `.athf` a fresh `fits.<plane>` row points at is of the format version this build writes (Plan D D2c, review
+/// M1 of D2b). The hash and the stat cannot tell: a catalog measured at an earlier head keeps its measurement hash while the
+/// record layout or the meaning of a field moved, and every reader (`read_fits`) refuses the other version, so reusing the
+/// row would send reweigh, LN and Register to their fallbacks on every run. Not current (or a header that cannot be read) is
+/// not fresh: Measure runs again and writes the file anew. Reads the 6 header bytes, no record.
+fn fits_artifact_is_current(row: &StackingArtifactRow, frame_id: i64, plane: usize) -> bool {
+    let Some(path) = row.path.as_deref() else {
+        return false;
+    };
+    match fits_artifact::header_version(Path::new(path)) {
+        Ok(version) if version == fits_artifact::FITS_ARTIFACT_VERSION => true,
+        Ok(version) => {
+            tracing::info!(
+                frame_id,
+                plane,
+                path,
+                version,
+                expected = fits_artifact::FITS_ARTIFACT_VERSION,
+                "plan: fits artifact of another version; measure again"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                frame_id,
+                plane,
+                path,
+                %error,
+                "plan: fits artifact header unreadable; measure again"
+            );
+            false
+        }
+    }
 }
 
 /// Whether this group's stage 1 also keeps the calibrated CFA mosaic beside
@@ -6592,6 +6629,38 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// Plan D D2c, review M1 of D2b: a `fits.<plane>` row whose hash and size are current still reads STALE when the `.athf`
+    /// it points at carries another format version (a catalog measured at an earlier head keeps its measurement hash while
+    /// the file layout moved). Measure then runs again instead of reusing a file `read_fits` refuses. Every plane is checked.
+    #[test]
+    fn an_athf_of_another_version_is_not_fresh() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (frame_id, _path) =
+            test_fixtures::add_light(&f, &light_spec_written("f0", THREE_TIMES[0]));
+        let (group_key, hash) = ("osc__None__180s", "measurement-hash");
+        for plane in 0..3 {
+            seed_fits_artifact(&f, group_key, frame_id, plane, hash);
+        }
+        let fresh = |planes: usize| {
+            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, planes, hash)
+                .unwrap()
+        };
+        assert!(fresh(3), "premise: three current-version files with current hashes are fresh");
+        // Plane 1's file is a version-2 file of the same size (the hash and the stat still agree).
+        let path = f.dir.path().join(format!("f{frame_id}.p1.athf"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..6].copy_from_slice(&(fits_artifact::FITS_ARTIFACT_VERSION - 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(fresh(1), "plane 0 alone is still fresh");
+        assert!(!fresh(2), "plane 1 is stale");
+        assert!(!fresh(3), "and so is the frame");
+        // A file that is no `.athf` at all (the same size by construction is not needed: the size check passed for the
+        // real file, so overwrite with garbage of that size) reads stale too, never as an error.
+        std::fs::write(&path, vec![0u8; bytes.len()]).unwrap();
+        assert!(!fresh(3));
     }
 
     /// The fresh path, end to end: every frame gets a matching `calibrated`

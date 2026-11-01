@@ -1085,13 +1085,15 @@ pub(crate) fn unverdicted_clip_range(
 /// NaN, leaves the list (`below_snr`); the caller computes every fit's SNR before this call (it reads the ring sky, never
 /// `c`). `c` is then the median of the 64 brightest of the rest.
 ///
-/// Plan D D2 (PD-9), `c`'s colour sample: on the same 3-plane image `point_siblings` is `siblings` less the seeds their
-/// own plane flags extended. A candidate this plane flags extended (the knot test took a star that a colour image's
-/// other planes see as a point) re-enters the list when a `point_siblings` seed lies within the same radius of its
-/// fitted centre; the clip screen, the point-source screen, the isolation test and the SNR floor then treat it as any
-/// candidate, and `rescued` counts the re-entries. Only `c`'s list changes: the fit keeps its `EXTENDED` flag, so the
-/// frame statistic, the ring width `F` and the beta sample leave it out. `None` (one or two planes, LN's refits) takes
-/// nothing back. Where `population` is `Some` (probes) the population's (a) leaves extended seeds out by eligibility, so
+/// Plan D D2 (PD-9), `c`'s colour sample: on the same 3-plane image the point-like sibling seeds are `siblings` less the
+/// seeds their own plane flags extended. A candidate this plane flags extended (the knot test took a star that a colour
+/// image's other planes see as a point) re-enters the list when one of those seeds lies within the point-source screen's
+/// radius of its fitted centre; the clip screen, the point-source screen, the isolation test and the SNR floor then treat it
+/// as any candidate, and `rescued` counts the re-entries. Only `c`'s list changes: the fit keeps its `EXTENDED` flag, so the
+/// frame statistic, the ring width `F` and the beta sample leave it out. Plan D D2c (PD-30): the caller has run that test
+/// once for the plane on every extended fit and marked the ones it takes [`super::StarFlags::SIBLING_POINT`]; with
+/// `rescue_extended` this function reads the mark instead of asking again. `rescue_extended` false (one or two planes, LN's
+/// refits) takes nothing back. Where `population` is `Some` (probes) the population's (a) leaves extended seeds out by eligibility, so
 /// nothing is taken back there; the stacking Measure runs without a population ([`super::Mode::All`] and
 /// [`super::Mode::Brightest`]).
 #[allow(clippy::too_many_arguments)]
@@ -1110,7 +1112,7 @@ pub(crate) fn aperture_correction(
     footprint: Option<&[bool]>,
     population: Option<super::population::PopulationView<'_>>,
     siblings: Option<&[Seed]>,
-    point_siblings: Option<&[Seed]>,
+    rescue_extended: bool,
 ) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
@@ -1151,9 +1153,6 @@ pub(crate) fn aperture_correction(
                 })
             };
             let match_px = point_source_match_px(field_fwhm);
-            // Plan D D2 (PD-9): the seeds of the other planes that are point-like on their own plane.
-            let point_like = point_siblings
-                .map(|seeds| NearIndex::new(seeds.iter().map(|s| (s.x, s.y)), match_px));
             // Not saturated (F-3), and not extended (F-10, P3) unless taken back (PD-9): an extended fit with a
             // point-like seed of another plane at its position is a star the knot flag took, not a knot, so it
             // re-enters this list alone; `StarFlags::in_statistic()`, the frame statistic and the beta sample still
@@ -1162,10 +1161,7 @@ pub(crate) fn aperture_correction(
                 .iter()
                 .filter(|(i, f)| {
                     !f.flags.saturated()
-                        && (!f.flags.extended()
-                            || point_like
-                                .as_ref()
-                                .is_some_and(|near| near.any_within(f.x, f.y)))
+                        && (!f.flags.extended() || (rescue_extended && f.flags.sibling_point()))
                         && population.map_or(true, |p| p.statistic[*i])
                 })
                 .map(|(i, f)| (*i, f, model_flux_in_fwtm(f)))
@@ -1463,6 +1459,8 @@ pub fn star_snr(
 /// circle holding less than half of the signal. By construction the value is at most `5 * ring_fwhm`. A saturated
 /// star's pixels are clipped while its `signal` is the unclipped model's, so its HFR reads wide; an extended one's
 /// reads what its pixels hold (R11-5: reported on every accepted fit, the frame median leaves both out).
+///
+/// This is [`hfr_scan`]'s `hfr`; the scan also returns the 3 F aperture sum the same pixel walk gives.
 pub fn hfr(
     data: &[f32],
     w: usize,
@@ -1471,6 +1469,59 @@ pub fn hfr(
     ring_fwhm: f64,
     mask: Option<&[bool]>,
 ) -> f64 {
+    hfr_scan(data, w, h, f, ring_fwhm, mask).hfr
+}
+
+/// The aperture sum's radius per ring FWHM (Plan D D2c, PD-30): `3 F`, the frame's ring width, one radius for every fit of
+/// the frame (the fit's own width is not in it).
+pub const AP_SUM_RADIUS_PER_FWHM: f64 = 3.0;
+
+/// What [`hfr_scan`] reads off one star's pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HfrScan {
+    /// The half-flux radius, px ([`hfr`]).
+    pub hfr: f64,
+    /// The aperture sum (Plan D D2c, PD-30): `sum (v - B_i)` over the present pixels whose centres lie within `3 * ring_fwhm`
+    /// ([`AP_SUM_RADIUS_PER_FWHM`]) of the fitted centre, `B_i` the star's stored ring sky, in the pixels' units, summed in
+    /// row-major order. It is the sum of the very pixels the HFR walk already collects (the walk reaches `5 * ring_fwhm`),
+    /// added in the one pass over them the HFR's ordering makes: the image is read once, and neither `signal` nor `c` is in
+    /// it. NaN where the 3 F disc is not whole: a pixel centre of it
+    /// outside the plane, or a non-finite or masked pixel in it (review M3 of D2b: a partial sum is not a flux), no ring
+    /// sky, no ring width, or no pixel.
+    pub ap_sum: f64,
+}
+
+impl HfrScan {
+    const NAN: HfrScan = HfrScan {
+        hfr: f64::NAN,
+        ap_sum: f64::NAN,
+    };
+}
+
+/// Whether every lattice point (pixel centre) within `r` of `(x, y)` is a pixel of a `w` x `h` plane. The nearest point
+/// outside on each side is in the first column or row past that side, on the row or column nearest the centre, so four
+/// distances decide it; no pixel is read.
+fn disc_inside_plane(x: f64, y: f64, r: f64, w: usize, h: usize) -> bool {
+    if !(x >= 0.0 && y >= 0.0 && x <= (w - 1) as f64 && y <= (h - 1) as f64) {
+        return false;
+    }
+    let (r2, fx, fy) = (r * r, x - x.round(), y - y.round());
+    (x + 1.0).powi(2) + fy * fy > r2
+        && (w as f64 - x).powi(2) + fy * fy > r2
+        && (y + 1.0).powi(2) + fx * fx > r2
+        && (h as f64 - y).powi(2) + fx * fx > r2
+}
+
+/// [`hfr`] and the 3 F aperture sum ([`HfrScan::ap_sum`]) from one walk over the star's pixels (Plan D D2c, PD-30). The HFR is
+/// bit-equal to the full stable sort's (`hfr_is_bit_equal_to_the_full_sort`).
+pub fn hfr_scan(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    f: &StarFit,
+    ring_fwhm: f64,
+    mask: Option<&[bool]>,
+) -> HfrScan {
     let r = GROWTH_RADIUS_PER_FWHM * ring_fwhm;
     let target = 0.5 * f.signal;
     if !(f.sky_ring.is_finite()
@@ -1478,14 +1529,14 @@ pub fn hfr(
         && f.y.is_finite()
         && r.is_finite()
         && r > 0.0
-        && target.is_finite()
-        && target > 0.0
         && w > 0
         && h > 0)
     {
-        return f64::NAN;
+        return HfrScan::NAN;
     }
     let r2 = r * r;
+    let r_sum = AP_SUM_RADIUS_PER_FWHM * ring_fwhm;
+    let r_sum2 = r_sum * r_sum;
     let (y0, y1) = (
         (f.y - r).ceil().max(0.0),
         (f.y + r).floor().min((h - 1) as f64),
@@ -1495,7 +1546,7 @@ pub fn hfr(
         (f.x + r).floor().min((w - 1) as f64),
     );
     if y1 < y0 || x1 < x0 {
-        return f64::NAN;
+        return HfrScan::NAN;
     }
     // The pixels in order of distance, ties in row-major order — the order of a stable sort by `d²`. The scan stops at
     // the pixel where the cumulative sum reaches half the signal (typically a small share of the circle), so the order
@@ -1504,26 +1555,76 @@ pub fn hfr(
     HFR_SCRATCH.with(|cell| {
         let mut px = cell.borrow_mut();
         px.clear();
+        // One absent (non-finite or masked) pixel within `r_sum` makes the 3 F disc not whole (PD-30); the walk notes it where
+        // it meets one (the rare branch), the sum itself is taken below.
+        let mut whole = true;
         for py in y0 as usize..=y1 as usize {
             let dy2 = (py as f64 - f.y).powi(2);
             for pxl in x0 as usize..=x1 as usize {
                 let d2 = (pxl as f64 - f.x).powi(2) + dy2;
+                if d2 > r2 {
+                    continue;
+                }
                 let i = py * w + pxl;
-                if d2 <= r2 && data[i].is_finite() && mask.map_or(true, |m| m[i]) {
+                if data[i].is_finite() && mask.map_or(true, |m| m[i]) {
                     let seq = px.len() as u32;
                     px.push((d2, seq, data[i] as f64 - f.sky_ring));
+                } else if d2 <= r_sum2 {
+                    whole = false;
                 }
             }
         }
+        let len = px.len();
         let by_distance =
             |a: &(f64, u32, f64), b: &(f64, u32, f64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-        let len = px.len();
+        let want_hfr = target.is_finite() && target > 0.0;
+        // The 3 F sum (PD-30) rides the one pass over the collected pixels the order below needs anyway: the pixels are visited
+        // in the walk's row-major order, the present ones within `r_sum` added as `v - B_i`. That pass also moves the near
+        // pixels (`d2 <= HFR_NEAR_D2`) to the front: the first round of the ordering takes the smallest `HFR_FIRST_CHUNK` keys, and
+        // when at least that many pixels are near, every one of them is near (a far pixel's `d2` is larger than any near
+        // one's), so the round selects among the near ones alone. The same keys come out in the same order; only the selection
+        // is over fewer pixels.
+        let (mut ap, mut n_ap, mut near) = (0.0f64, 0usize, len);
+        if want_hfr && len > HFR_FIRST_CHUNK {
+            let mut m = 0usize;
+            for k in 0..len {
+                let (d2, _, v) = px[k];
+                let inside = d2 <= r_sum2;
+                ap += v * f64::from(inside);
+                n_ap += usize::from(inside);
+                if d2 <= HFR_NEAR_D2 {
+                    px.swap(m, k);
+                    m += 1;
+                }
+            }
+            if m >= HFR_FIRST_CHUNK {
+                near = m;
+            }
+        } else {
+            for &(d2, _, v) in px.iter() {
+                let inside = d2 <= r_sum2;
+                ap += v * f64::from(inside);
+                n_ap += usize::from(inside);
+            }
+        }
+        let ap_sum = if whole && n_ap > 0 && disc_inside_plane(f.x, f.y, r_sum, w, h) {
+            ap
+        } else {
+            f64::NAN
+        };
+        if !want_hfr {
+            return HfrScan {
+                hfr: f64::NAN,
+                ap_sum,
+            };
+        }
         let (mut cum, mut prev_d2) = (0.0f64, f64::NAN);
-        let (mut start, mut chunk) = (0usize, 48usize);
+        let (mut start, mut chunk) = (0usize, HFR_FIRST_CHUNK);
         while start < len {
             let end = len.min(start + chunk);
             if end < len {
-                px[start..].select_nth_unstable_by(end - start - 1, by_distance);
+                let hi = if start == 0 && near >= end { near } else { len };
+                px[start..hi].select_nth_unstable_by(end - start - 1, by_distance);
             }
             px[start..end].sort_unstable_by(by_distance);
             for k in start..end {
@@ -1531,21 +1632,32 @@ pub fn hfr(
                 let before = cum;
                 cum += v;
                 if cum >= target {
-                    if k == 0 {
-                        return d2.sqrt();
-                    }
-                    let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
-                    let d_prev = prev_d2.sqrt();
-                    return d_prev + frac * (d2.sqrt() - d_prev);
+                    let hfr = if k == 0 {
+                        d2.sqrt()
+                    } else {
+                        let frac = if v != 0.0 { (target - before) / v } else { 0.0 };
+                        let d_prev = prev_d2.sqrt();
+                        d_prev + frac * (d2.sqrt() - d_prev)
+                    };
+                    return HfrScan { hfr, ap_sum };
                 }
                 prev_d2 = d2;
             }
             start = end;
             chunk *= 2;
         }
-        f64::NAN
+        HfrScan {
+            hfr: f64::NAN,
+            ap_sum,
+        }
     })
 }
+
+/// [`hfr_scan`]'s first ordering round takes this many smallest keys (the following rounds double it).
+const HFR_FIRST_CHUNK: usize = 48;
+/// The near pixels of [`hfr_scan`]'s first round: `d²` at most 4.5² px², a disc of about 64 pixel centres (more than the
+/// first round's 48 wherever the disc is whole and present; where it is not, the round selects among all, as before).
+const HFR_NEAR_D2: f64 = 20.25;
 
 thread_local! {
     /// [`hfr`]'s pixel scratch, one per thread: cleared at every call, so no value crosses calls.
@@ -3049,6 +3161,53 @@ mod snr_hfr_tests {
         assert!(checked > 500);
     }
 
+    /// Plan D D2c: the first ordering round selects among the pixels within 4.5 px of the star when they hold a round's worth
+    /// (48), and among all otherwise; both are the full sort's value to the bit. A mask that removes every other pixel of that
+    /// disc (about 32 left) forces the second kind on whole discs of plenty pixels; a mask that removes only a sixth leaves the
+    /// first.
+    #[test]
+    fn hfr_is_bit_equal_to_the_full_sort_whichever_pixels_the_first_round_selects_among() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        let (w, h) = (240usize, 330usize);
+        let near_sparse = |f: &StarFit| -> Vec<bool> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f64, (i / w) as f64);
+                    let d2 = (x - f.x).powi(2) + (y - f.y).powi(2);
+                    !(d2 <= 20.25 && (i % w + i / w) % 2 == 1)
+                })
+                .collect()
+        };
+        let near_thin = |f: &StarFit| -> Vec<bool> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f64, (i / w) as f64);
+                    let d2 = (x - f.x).powi(2) + (y - f.y).powi(2);
+                    !(d2 <= 20.25 && (i % w + i / w) % 6 == 1)
+                })
+                .collect()
+        };
+        let mut checked = 0;
+        for f in &out.fits {
+            for mask in [near_sparse(f), near_thin(f)] {
+                for scale in [0.002, 0.05, 0.3, 0.6, 1.0, 1.4, 2.2, 6.0] {
+                    let mut g = *f;
+                    g.signal = f.signal * scale;
+                    for r in [0.4 * ring, ring, 1.7 * ring] {
+                        let (a, b) = (
+                            hfr(&data, w, h, &g, r, Some(&mask)),
+                            hfr_reference(&data, w, h, &g, r, Some(&mask)),
+                        );
+                        assert_eq!(a.to_bits(), b.to_bits(), "scale {scale} r {r}: {a} vs {b}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 250);
+    }
+
     #[test]
     fn hfr_is_nan_when_the_5f_circle_holds_less_than_half_the_signal() {
         let (data, out) = gaussian_stars();
@@ -3064,6 +3223,205 @@ mod snr_hfr_tests {
             hfr(&data, 240, 330, &out.fits[0], f64::NAN, None).is_nan(),
             "no ring width"
         );
+    }
+
+    /// Plan D D2c (PD-30): the 3 F aperture sum, independently: every lattice point within `3 * ring_fwhm` of the fit's
+    /// centre, tested over a box that reaches past the plane (no clipping, no bounding-box shortcut), summed row-major as
+    /// `v - B_i`. NaN where a point of the disc lies outside the plane or holds an absent pixel, where there is no ring
+    /// sky or no pixel.
+    fn ap_sum_reference(
+        data: &[f32],
+        w: usize,
+        h: usize,
+        f: &StarFit,
+        ring_fwhm: f64,
+        mask: Option<&[bool]>,
+    ) -> f64 {
+        let r = 3.0 * ring_fwhm;
+        if !(f.sky_ring.is_finite()
+            && f.x.is_finite()
+            && f.y.is_finite()
+            && r.is_finite()
+            && r > 0.0)
+        {
+            return f64::NAN;
+        }
+        let (mut sum, mut n) = (0.0f64, 0usize);
+        for py in (f.y - r).floor() as i64 - 1..=(f.y + r).ceil() as i64 + 1 {
+            for px in (f.x - r).floor() as i64 - 1..=(f.x + r).ceil() as i64 + 1 {
+                let d2 = (px as f64 - f.x).powi(2) + (py as f64 - f.y).powi(2);
+                if d2 > r * r {
+                    continue;
+                }
+                if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
+                    return f64::NAN;
+                }
+                let i = py as usize * w + px as usize;
+                if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
+                    return f64::NAN;
+                }
+                sum += data[i] as f64 - f.sky_ring;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            f64::NAN
+        } else {
+            sum
+        }
+    }
+
+    /// Plan D D2c (PD-30): the scan's `ap_sum` is the 3 F disc sum of the star's ring sky, to the bit, and its `hfr` is
+    /// `hfr()`'s, across the conditions of `hfr_is_bit_equal_to_the_full_sort` (edge stars, a masked plane, a NaN-holed
+    /// plane, rings of 0.4 / 1 / 1.7 times the plane's): finite where the disc is whole and present, NaN where it leaves
+    /// the plane or holds an absent pixel. The sum reads neither `signal` (its scale) nor the ring width but through the radius.
+    #[test]
+    fn the_scan_returns_the_3f_disc_sum_to_the_bit() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        let (w, h) = (240usize, 330usize);
+        let mask: Vec<bool> = (0..w * h).map(|i| i % 7 != 3).collect();
+        let mut holed = data.clone();
+        for i in (0..w * h).step_by(11) {
+            holed[i] = f32::NAN;
+        }
+        // One absent pixel 5 px from each star: inside 3 F (about 14 px), nowhere else.
+        let one: Vec<bool> = {
+            let mut m = vec![true; w * h];
+            for f in &out.fits {
+                m[(f.y.round() as usize) * w + f.x.round() as usize + 5] = false;
+            }
+            m
+        };
+        let (mut finite, mut nan) = (0usize, 0usize);
+        for base in &out.fits {
+            for (dx, dy) in [
+                (0.0, 0.0),
+                (-base.x + 3.0, 0.0),
+                (0.0, -base.y + 2.5),
+                (w as f64 - base.x - 4.0, 0.0),
+                (0.0, h as f64 - base.y - 1.2),
+            ] {
+                let mut f = *base;
+                f.x += dx;
+                f.y += dy;
+                for scale in [0.05, 1.0, 6.0] {
+                    f.signal = base.signal * scale;
+                    for r in [ring, 0.4 * ring, 1.7 * ring] {
+                        for (d, m) in [
+                            (&data, None),
+                            (&data, Some(&mask[..])),
+                            (&holed, None),
+                            (&data, Some(&one[..])),
+                        ] {
+                            let got = hfr_scan(d, w, h, &f, r, m);
+                            let want = ap_sum_reference(d, w, h, &f, r, m);
+                            assert_eq!(
+                                got.ap_sum.to_bits(),
+                                want.to_bits(),
+                                "dx {dx} dy {dy} scale {scale} r {r}: {} vs {want}",
+                                got.ap_sum
+                            );
+                            assert_eq!(got.hfr.to_bits(), hfr(d, w, h, &f, r, m).to_bits());
+                            if want.is_finite() {
+                                finite += 1;
+                            } else {
+                                nan += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(finite > 40 && nan > 100, "finite {finite}, nan {nan}");
+    }
+
+    /// Plan D D2c (PD-30): a noiseless Gaussian star (sigma 2, 7 sigma inside 3 F) carries its whole flux in the 3 F disc:
+    /// the sum is `signal` (c measured on six stars), and it does not move when `signal` does (the scan reads the pixels).
+    #[test]
+    fn the_3f_sum_of_a_synthetic_star_is_its_flux_and_does_not_read_signal() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        assert_eq!(out.fits.len(), 6);
+        for f in &out.fits {
+            let s = hfr_scan(&data, 240, 330, f, ring, None);
+            assert!(s.ap_sum.is_finite(), "{s:?}");
+            assert!(
+                (s.ap_sum / f.signal - 1.0).abs() < 0.02,
+                "S {} vs signal {}",
+                s.ap_sum,
+                f.signal
+            );
+            let mut g = *f;
+            g.signal *= 3.0;
+            assert_eq!(
+                hfr_scan(&data, 240, 330, &g, ring, None).ap_sum.to_bits(),
+                s.ap_sum.to_bits()
+            );
+        }
+    }
+
+    /// Plan D D2c (PD-30): the sum is whole or it is NaN. A star within 3 F of the edge, a masked pixel and a NaN pixel inside
+    /// the 3 F disc each give NaN; an absent pixel between 3 F and 5 F, where the HFR scan still reads, does not; no ring
+    /// sky gives NaN; a non-positive signal leaves the HFR NaN and the sum alone.
+    #[test]
+    fn the_3f_sum_is_nan_unless_the_whole_disc_is_there() {
+        let (data, out) = gaussian_stars();
+        let ring = out.ring_fwhm.expect("a ring width");
+        let (w, h) = (240usize, 330usize);
+        let f = out.fits[0];
+        let whole = hfr_scan(&data, w, h, &f, ring, None).ap_sum;
+        assert!(whole.is_finite());
+        // The disc leaves the plane: 3 F is about 14 px, the star is moved to 9 px from the left edge, and to 9 from the top.
+        for (dx, dy) in [(9.0 - f.x, 0.0), (0.0, 9.0 - f.y)] {
+            let g = StarFit {
+                x: f.x + dx,
+                y: f.y + dy,
+                ..f
+            };
+            assert!(
+                hfr_scan(&data, w, h, &g, ring, None).ap_sum.is_nan(),
+                "{dx} {dy}"
+            );
+        }
+        // ... and 2 px beyond 3 F of the edge it does not.
+        let g = StarFit {
+            x: 3.0 * ring + 2.0,
+            ..f
+        };
+        assert!(hfr_scan(&data, w, h, &g, ring, None).ap_sum.is_finite());
+        // One masked pixel inside 3 F, one outside it (4 F): only the first takes the sum.
+        let at = |dx: i64| (f.y.round() as usize) * w + (f.x.round() as i64 + dx) as usize;
+        let mut mask = vec![true; w * h];
+        mask[at((3.8 * ring) as i64)] = false;
+        let outside = hfr_scan(&data, w, h, &f, ring, Some(&mask));
+        assert_eq!(
+            outside.ap_sum.to_bits(),
+            whole.to_bits(),
+            "an absent pixel past 3 F is not in the sum"
+        );
+        assert_eq!(
+            outside.hfr.to_bits(),
+            hfr(&data, w, h, &f, ring, None).to_bits()
+        );
+        mask[at(5)] = false;
+        assert!(hfr_scan(&data, w, h, &f, ring, Some(&mask)).ap_sum.is_nan());
+        let mut holed = data.clone();
+        holed[at(-4)] = f32::NAN;
+        assert!(hfr_scan(&holed, w, h, &f, ring, None).ap_sum.is_nan());
+        // No ring sky: NaN. A signal that is not positive: no HFR, the sum stands.
+        let g = StarFit {
+            sky_ring: f64::NAN,
+            ..f
+        };
+        let s = hfr_scan(&data, w, h, &g, ring, None);
+        assert!(s.ap_sum.is_nan() && s.hfr.is_nan());
+        let g = StarFit { signal: -1.0, ..f };
+        let s = hfr_scan(&data, w, h, &g, ring, None);
+        assert!(s.hfr.is_nan());
+        assert_eq!(s.ap_sum.to_bits(), whole.to_bits());
+        // No ring width: nothing.
+        assert!(hfr_scan(&data, w, h, &f, f64::NAN, None).ap_sum.is_nan());
     }
 
     /// 512 x 512 white noise smoothed by the separable [1, 2, 1] / 4 (a correlated plane: lag-1 rho 2/3 per axis, lag-2
@@ -3896,6 +4254,172 @@ mod b4_tests {
         assert_eq!(point_like_sibling_seeds(&preps, &[&o]), vec![None]);
         let again = finish_plane(&data, w, h, &o, preps.remove(0), None, None, None);
         assert_eq!(counts(&again), (32, 0, 0, 0));
+    }
+
+    /// The lattice nodes (of the 8-wide, 40-node image of `measure_case`) whose fitted star in `m` has a flag `pick` accepts:
+    /// a star belongs to the node within 3 px of it.
+    fn nodes_with(
+        m: &PlaneMeasurement,
+        pick: impl Fn(crate::star_measure::StarFlags) -> bool,
+    ) -> Vec<usize> {
+        let nodes = lattice(8, 40);
+        (0..40)
+            .filter(|&k| {
+                m.stars
+                    .iter()
+                    .any(|f| (f.x - nodes[k].0).hypot(f.y - nodes[k].1) < 3.0 && pick(f.flags))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_extended_fit_with_a_point_like_sibling_seed_is_flagged_sibling_point() {
+        // Plan D D2c (PD-30): plane 0 flags eight stars extended; planes 1 and 2 hold the same stars point-like. Exactly
+        // those eight fits carry SIBLING_POINT beside EXTENDED; the statistic still leaves them out, the common set takes them.
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &[], &[]],
+            ..Default::default()
+        });
+        assert_eq!(nodes_with(&m[0], |f| f.extended()), KNOTS.to_vec());
+        assert_eq!(nodes_with(&m[0], |f| f.sibling_point()), KNOTS.to_vec());
+        assert_eq!(nodes_with(&m[0], |f| !f.in_statistic()), KNOTS.to_vec());
+        assert_eq!(
+            nodes_with(&m[0], |f| !f.in_common_set()),
+            Vec::<usize>::new()
+        );
+        for p in [1, 2] {
+            assert!(
+                m[p].stars.iter().all(|f| f.flags.is_empty()),
+                "plane {p} flags nothing"
+            );
+        }
+        // One point-like sibling is enough: planes 0 and 1 flag the knots, plane 2 does not. Both flagging planes are rescued.
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &KNOTS, &[]],
+            ..Default::default()
+        });
+        for p in [0, 1] {
+            assert_eq!(
+                nodes_with(&m[p], |f| f.sibling_point()),
+                KNOTS.to_vec(),
+                "plane {p}"
+            );
+        }
+        assert!(m[2].stars.iter().all(|f| f.flags.is_empty()));
+    }
+
+    #[test]
+    fn sibling_point_is_set_on_every_extended_fit_not_only_on_cs_candidates() {
+        // Node 12 loses c's list at the isolation test (a stray seed 20 px away) and node 7 at the SNR floor (faint on every
+        // plane); the knot test took both on plane 0. Both carry SIBLING_POINT all the same.
+        let (x, y) = node(4, 1);
+        let stray = hot_seeds(&[(x + 20.0, y)], 0.001);
+        let m = measure_case(&Case {
+            faint: &[7],
+            extended: [&[7, 12], &[], &[]],
+            stray: &stray,
+            ..Default::default()
+        });
+        assert_eq!(
+            m[0].aperture_rescued, 2,
+            "premise: both were taken back into c's list"
+        );
+        assert_eq!(m[0].aperture_stars, 38, "premise: and both left it again");
+        assert_eq!(nodes_with(&m[0], |f| f.sibling_point()), vec![7, 12]);
+    }
+
+    #[test]
+    fn an_extended_fit_whose_siblings_are_extended_too_is_not_flagged_sibling_point() {
+        // The knots are extended on planes 0 and 1 and plane 2 holds no star there: the only sibling seeds within the radius
+        // are extended on their own plane. Then all three planes flag them.
+        let m = measure_case(&Case {
+            absent: [&[], &[], &KNOTS],
+            extended: [&KNOTS, &KNOTS, &[]],
+            ..Default::default()
+        });
+        for p in 0..2 {
+            assert_eq!(
+                nodes_with(&m[p], |f| f.extended()),
+                KNOTS.to_vec(),
+                "premise: plane {p}"
+            );
+            assert!(
+                nodes_with(&m[p], |f| f.sibling_point()).is_empty(),
+                "plane {p}"
+            );
+        }
+        let m = measure_case(&Case {
+            extended: [&KNOTS, &KNOTS, &KNOTS],
+            ..Default::default()
+        });
+        for p in 0..3 {
+            assert!(
+                nodes_with(&m[p], |f| f.sibling_point()).is_empty(),
+                "plane {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extended_fit_with_no_sibling_seed_at_all_is_not_flagged_sibling_point() {
+        let m = measure_case(&Case {
+            absent: [&[], &KNOTS, &KNOTS],
+            extended: [&KNOTS, &[], &[]],
+            ..Default::default()
+        });
+        assert_eq!(
+            m[0].extended_seeds,
+            KNOTS.len(),
+            "premise: the flags reach the fit"
+        );
+        assert!(nodes_with(&m[0], |f| f.sibling_point()).is_empty());
+    }
+
+    #[test]
+    fn a_plane_of_a_one_or_two_plane_image_sets_no_sibling_point() {
+        let (w, h) = size(8, 5);
+        let nodes = lattice(8, 40);
+        let stars: Vec<MoffatStar> = nodes.iter().map(|&(x, y)| star(x, y, 0.3)).collect();
+        let range_at = (node(0, 0).0 + 50.0, node(0, 0).1 + 50.0);
+        let flags: Vec<bool> = (0..40).map(|k| KNOTS.contains(&k)).collect();
+        // One plane.
+        let data = render(w, h, &stars, range_at, 11);
+        let o = MeasureOptions {
+            given_extended: flags.clone(),
+            ..opts(seeds_of(&stars), false)
+        };
+        let m = measure_plane(&data, w, h, &o, None);
+        assert_eq!(m.extended_seeds, KNOTS.len(), "premise");
+        assert!(m.stars.iter().all(|f| !f.flags.sibling_point()));
+        assert_eq!(
+            m.stars.iter().filter(|f| f.flags.extended()).count(),
+            KNOTS.len()
+        );
+        // Two planes: the knots are extended on both, and neither plane has a point-like list.
+        let o: Vec<MeasureOptions> = (0..2)
+            .map(|_| MeasureOptions {
+                given_extended: flags.clone(),
+                ..opts(seeds_of(&stars), true)
+            })
+            .collect();
+        let planes: Vec<Vec<f32>> = (0..2)
+            .map(|p| render(w, h, &stars, range_at, 11 + p))
+            .collect();
+        let mut preps: Vec<_> = planes
+            .iter()
+            .zip(&o)
+            .map(|(p, o)| prepare_plane(p, w, h, o, None))
+            .collect();
+        cross_plane_flags(&mut preps);
+        let m: Vec<PlaneMeasurement> = planes
+            .iter()
+            .zip(&o)
+            .zip(preps)
+            .map(|((p, o), prep)| finish_plane(p, w, h, o, prep, None, None, None))
+            .collect();
+        for plane in &m {
+            assert!(plane.stars.iter().all(|f| !f.flags.sibling_point()));
+        }
     }
 
     #[test]

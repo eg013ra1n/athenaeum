@@ -8,11 +8,14 @@
 //!
 //! Pure logic, no I/O and no weights. The caller (`run.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
 //! time and hands the module their [`MemberPlane`]. The flux the paired ratios read is each fit's aperture sum `S`
-//! (`StarFit::ap_sum`, Plan D D2b, PD-26): Measure's own R11 quantity, computed for every fit and persisted, never a second
-//! estimate. It is the pixels' sum, so it carries neither the model's bias nor `c` (the model flux times `c` ran
-//! +6-7 %/px of FWHM against the grey truth on the beta-floor R plane). The anchor's whole-set sums, which the ratios scale,
+//! (`StarFit::ap_sum`, Plan D D2b, PD-26; its aperture Plan D D2c, PD-30): the sum of `v - B_i` over the pixels within
+//! 3 x the frame's ring FWHM of the star, one radius for the frame and none from the fit, read in Measure's HFR walk and
+//! persisted, never a second estimate. It is the pixels' sum, so it carries neither the model's bias nor `c` (the model
+//! flux times `c` ran +6-7 %/px of FWHM against the grey truth on the beta-floor R plane), and its aperture does not follow
+//! the frame's profile (S at 1.5 x the fit's FWHM did, +5-13 %/px). The anchor's whole-set sums, which the ratios scale,
 //! and everything else Measure reads stay the model flux times `c` (`StarFit::signal`): the weight's absolute scale is
-//! the one the master's PSF SNR is read on.
+//! the one the master's PSF SNR is read on. A fit is eligible when it is not clipped and not extended, an extended one
+//! only where a point-like seed of another plane sits at it (`StarFlags::in_common_set`, PD-30).
 //!
 //! Steps, in order:
 //! 1. [`pick_anchor`]: one member per group, picked without any weight (PD-1).
@@ -98,6 +101,10 @@ pub enum CommonOutcome {
     },
     /// Fewer than [`COMMON_MIN_STARS`] stars are common: no common flux for this (group, plane).
     TooFewStars { stars: usize },
+    /// The set holds [`COMMON_MIN_STARS`] stars or more but the anchor's aperture sums over it add to zero or less (Plan D D2c,
+    /// PD-30: an `S` at or under the sky is noise and is summed, not dropped): there is no flux for the members' ratios to
+    /// scale, so no common flux for this (group, plane), like [`CommonOutcome::TooFewStars`].
+    NoAnchorFlux { stars: usize },
     /// The match table does not fit the candidates or the anchor: a wiring bug of the caller, never a property of the
     /// sky. A caller must not read it as "under 20 stars" (PD-6's fallback reason).
     MalformedTable,
@@ -148,33 +155,35 @@ fn c_factor(c: f64) -> f64 {
     }
 }
 
-/// A fit the set may read the flux of: `in_statistic()` (neither clipped nor extended), finite positive `signal` and
-/// `area`.
+/// A fit the set may read the flux of: `in_common_set()` (not clipped, and not extended unless PD-9's sibling test rescued
+/// it: `SIBLING_POINT`), finite positive `signal` and `area`.
 fn flux_fit(f: &StarFit) -> bool {
-    f.flags.in_statistic()
+    f.flags.in_common_set()
         && f.signal.is_finite()
         && f.signal > 0.0
         && f.area.is_finite()
         && f.area > 0.0
 }
 
-/// A fit's aperture sum `S` in native units, `None` unless it is finite and positive (Plan D D2b): a fit with no ring, no
-/// present aperture pixel, or a sum at or under the sky has none and is not usable for the weight.
+/// A fit's aperture sum `S` in native units, `None` unless it is finite (Plan D D2b, PD-30): a fit with no ring sky, or a
+/// disc that leaves the plane or holds an absent pixel, has none and is not usable for the weight. A sum at or under the sky
+/// is noise, not a missing value: it is usable and enters the sums as it is.
 fn aperture_sum(f: &StarFit) -> Option<f64> {
     let s = f.ap_sum / ADU_SCALE as f64;
-    (s.is_finite() && s > 0.0).then_some(s)
+    s.is_finite().then_some(s)
 }
 
 /// A usable aperture sum as the ratios read it (the `Candidate` / `Usable` fields).
 fn usable_ap(s: f64) -> bool {
-    s.is_finite() && s > 0.0
+    s.is_finite()
 }
 
-/// The anchor's candidate stars in group coordinates: `in_statistic()`, finite positive `signal` and `area`, no other
-/// anchor fit (of any flag) within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, and the
-/// background-limited aperture SNR `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no
-/// SNR; the screen stays on the model flux, as before D2b), and, since the ratios divide by it, a usable aperture sum
-/// ([`aperture_sum`]). Candidates keep the anchor's fit order.
+/// The anchor's candidate stars in group coordinates: `in_common_set()` (not clipped, not extended unless rescued by a
+/// point-like sibling seed), finite positive `signal` and `area`, no other anchor fit (of any flag) within
+/// [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, and the background-limited aperture SNR
+/// `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no SNR; the screen stays on the
+/// model flux, as before D2b), and, since the ratios divide by it, a finite aperture sum ([`aperture_sum`]: one at or under
+/// the sky is a candidate too). Candidates keep the anchor's fit order.
 pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
     let f = anchor.fwhm_px;
     if !(f.is_finite() && f > 0.0) || !(anchor.noise.is_finite() && anchor.noise > 0.0) {
@@ -280,13 +289,16 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
 /// included, in member order), `anchor` the anchor's index in that order.
 ///
 /// A candidate joins the set when it is usable in at least [`COMMON_MIN_PRESENCE`] of the members, usable meaning a
-/// matched fit with a usable aperture sum ([`Usable::ap_sum`]); fewer than [`COMMON_MIN_STARS`] such stars leave no
-/// common flux. Member f's flux is the paired ratio to the anchor over the set stars f has (`r_f` for the flux, `q_f` for
-/// the mean flux), taken on the aperture sums `S` and `S / area` (Plan D D2b, PD-26), times the anchor's sums over the
-/// whole set (the model flux times `c`: the scale the master's PSF SNR is read on), so a frame that lost a third of its
-/// stars to cloud still weighs by its transparency, not by the stars it lost. A fit of f without a usable `S` is not
-/// usable for f: it leaves f's own pair, both sides of f's ratio, and counts against the star's presence. A member with
-/// no paired star reads 0. The anchor's own entry is the anchor's sums, exactly.
+/// matched fit with a finite aperture sum ([`Usable::ap_sum`]); fewer than [`COMMON_MIN_STARS`] such stars leave no
+/// common flux ([`CommonOutcome::TooFewStars`]), and so does a set whose anchor sums `S` add to zero or less
+/// ([`CommonOutcome::NoAnchorFlux`]). Member f's flux is the paired ratio to the anchor over the set stars f has (`r_f` for
+/// the flux, `q_f` for the mean flux), taken on the aperture sums `S` and `S / area` (Plan D D2b, PD-26), times the anchor's
+/// sums over the whole set (the model flux times `c`: the scale the master's PSF SNR is read on), so a frame that lost a
+/// third of its stars to cloud still weighs by its transparency, not by the stars it lost. A fit of f without a finite `S`
+/// is not usable for f: it leaves f's own pair, both sides of f's ratio, and counts against the star's presence; an `S` at
+/// or under the sky is noise (PD-30) and is summed as it is. A member with no paired star, or whose paired sums are not
+/// positive (a ratio of two negative sums must not read as a positive weight), reads 0. The anchor's own entry is the
+/// anchor's sums, exactly.
 ///
 /// A table that does not fit (`usable` rows not as long as `cands`, or `anchor` past the table) is a wiring bug of the
 /// caller: an `error!`, a `debug_assert!`, and [`CommonOutcome::MalformedTable`] in a release build.
@@ -324,6 +336,11 @@ pub fn common_flux(
     if set.len() < COMMON_MIN_STARS {
         return CommonOutcome::TooFewStars { stars: set.len() };
     }
+    // The ratios scale the anchor's sums over the set; a set the anchor sees at or under the sky has none (PD-30).
+    let anchor_ap: f64 = set.iter().map(|&j| cands[j].ap_sum).sum();
+    if !(anchor_ap > 0.0) {
+        return CommonOutcome::NoAnchorFlux { stars: set.len() };
+    }
     let anchor_signal: f64 = set.iter().map(|&j| cands[j].signal).sum();
     let anchor_mean: f64 = set.iter().map(|&j| cands[j].mean).sum();
     let per_member = usable
@@ -348,11 +365,19 @@ pub fn common_flux(
                     paired += 1;
                 }
             }
-            if paired == 0 || !(sig_a > 0.0 && mean_a > 0.0) {
+            if paired == 0 {
                 return CommonFlux {
                     tflux: 0.0,
                     tmean_flux: 0.0,
                     paired: 0,
+                };
+            }
+            // Pairs, but no positive flux to read a ratio of (the paired sums are noise): zero, not a negative flux.
+            if !(sig_a > 0.0 && mean_a > 0.0 && sig > 0.0 && mean > 0.0) {
+                return CommonFlux {
+                    tflux: 0.0,
+                    tmean_flux: 0.0,
+                    paired,
                 };
             }
             CommonFlux {
@@ -1224,51 +1249,60 @@ mod tests {
     }
 
     #[test]
-    fn a_fit_without_an_aperture_sum_leaves_only_its_own_pair() {
-        // Member 4's fit of star 7 has no ring (S NaN) and member 6's of star 9 a sum that is not positive: each is unusable
-        // for that member and leaves its own pair, both sides of that member's ratio (identical exposures: the ratio is
-        // exactly 1 only when the anchor's star 7 leaves member 4's denominator too). 9 of 10 present: the star stays.
+    fn a_fit_without_an_aperture_sum_leaves_only_its_own_pair_and_a_negative_one_stays() {
+        // Member 4's fit of star 7 has no ring (S NaN): unusable for that member, it leaves its own pair, both sides of that
+        // member's ratio (identical exposures: the ratio is exactly 1 only when the anchor's star 7 leaves member 4's
+        // denominator too). Member 6's fit of star 9 has S = -0.1 (PD-30: a sum at or under the sky is noise and is summed,
+        // not dropped): it stays paired and enters the sums as it is. 9 of 10 present: both stars stay in the set.
         let world = sky(100, 33);
         let mut members: Vec<_> = (0..10)
             .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
             .collect();
         members[4].0[7].ap_sum = f64::NAN;
-        members[6].0[9].ap_sum = -1.0;
+        members[6].0[9].ap_sum = -0.1 * ADU;
         let (_cands, usable, out) = run(&members, 0);
         // D1b reads the model flux: the fits are still there for it, with no aperture sum on them.
         let lone = usable[4][7].expect("the model flux is usable");
         assert!(lone.signal > 0.0 && lone.ap_sum.is_nan() && lone.ap_mean.is_nan());
-        assert!(usable[6][9].expect("usable").ap_sum.is_nan());
+        let kept = usable[6][9].expect("usable");
+        assert!(rel(kept.ap_sum, -0.1) < 1e-12, "{}", kept.ap_sum);
         let (positions, per) = measured(&out);
         assert_eq!(positions.len(), 100);
         assert_eq!(per[4].paired, 99);
-        assert_eq!(per[6].paired, 99);
+        assert_eq!(per[6].paired, 100, "S = -0.1 stays paired");
         for k in [0, 1, 2, 3, 5, 7, 8, 9] {
             assert_eq!(per[k].paired, 100, "member {k}");
         }
-        for k in [4, 6] {
-            assert!(
-                rel(per[k].tflux / per[0].tflux, 1.0) < 1e-12,
-                "member {k}: {}",
-                per[k].tflux / per[0].tflux
-            );
-            assert!(
-                rel(per[k].tmean_flux / per[0].tmean_flux, 1.0) < 1e-12,
-                "member {k}"
-            );
-        }
+        assert!(
+            rel(per[4].tflux / per[0].tflux, 1.0) < 1e-12,
+            "member 4: {}",
+            per[4].tflux / per[0].tflux
+        );
+        assert!(rel(per[4].tmean_flux / per[0].tmean_flux, 1.0) < 1e-12);
+        // Member 6 reads the sum with -0.1 in star 9's place: (T - f9 - 0.1) / T.
+        let total: f64 = world.iter().map(|s| s.flux).sum();
+        let want = (total - world[9].flux - 0.1) / total;
+        assert!(
+            rel(per[6].tflux / per[0].tflux, want) < 1e-12,
+            "{} vs {want}",
+            per[6].tflux / per[0].tflux
+        );
     }
 
     #[test]
     fn an_unusable_aperture_sum_counts_against_the_presence_rule() {
-        // As `a_star_unusable_in_more_than_a_tenth_of_the_members_leaves_the_set`, with the aperture sum as the missing piece.
+        // As `a_star_unusable_in_more_than_a_tenth_of_the_members_leaves_the_set`, with the aperture sum as the missing piece:
+        // a NaN S is missing; an S of 0 or under (noise, PD-30) is present.
         let world = sky(300, 35);
         let mut members: Vec<_> = (0..10)
             .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
             .collect();
         members[2].0[5].ap_sum = f64::NAN;
-        members[7].0[5].ap_sum = 0.0;
+        members[7].0[5].ap_sum = f64::NAN;
         members[4].0[6].ap_sum = f64::NAN;
+        members[3].0[8].ap_sum = 0.0;
+        members[8].0[8].ap_sum = -0.5 * ADU;
+        members[1].0[8].ap_sum = -0.5 * ADU;
         let (cands, _usable, out) = run(&members, 0);
         assert_eq!(cands.len(), 300);
         let (positions, per) = measured(&out);
@@ -1279,31 +1313,141 @@ mod tests {
         };
         assert!(!has(5), "star 5 has a usable S in 8 of 10 members: out");
         assert!(has(6), "star 6 has a usable S in 9 of 10 members: in");
+        assert!(
+            has(8),
+            "star 8 has a finite S in all 10 members, three of them at or under zero: in"
+        );
         assert_eq!(positions.len(), 299);
         assert_eq!(per[4].paired, 298);
         assert_eq!(per[2].paired, 299);
+        assert_eq!(per[3].paired, 299);
+        assert_eq!(per[8].paired, 299);
     }
 
     #[test]
-    fn an_anchor_fit_without_an_aperture_sum_is_not_a_candidate() {
-        // The ratio's denominator is the anchor's S: a fit with none cannot start a pair. The SNR screen is still the
-        // `signal`-based one, so this is the only new way out.
+    fn an_anchor_fit_needs_a_finite_aperture_sum_to_be_a_candidate() {
+        // The ratio's denominator is the anchor's S: a fit with none cannot start a pair; one at or under the sky (PD-30:
+        // noise, summed) can. The SNR screen is still the `signal`-based one.
         let world = sky(40, 36);
         let mut anchor = fits_of(&world, &Shot::new(1.0, 3.0));
         anchor[3].ap_sum = f64::NAN;
-        anchor[8].ap_sum = -2.0;
+        anchor[8].ap_sum = -2.0 * ADU;
         let map = identity();
         let cands = candidates(&plane(&anchor, &map, 3.0));
-        assert_eq!(cands.len(), 38);
-        assert!(cands.iter().all(|c| c.x != world[3].x && c.x != world[8].x));
+        assert_eq!(cands.len(), 39);
+        assert!(cands.iter().all(|c| c.x != world[3].x));
+        let c8 = cands
+            .iter()
+            .find(|c| c.x == world[8].x)
+            .expect("S = -2 is a candidate");
+        assert!(rel(c8.ap_sum, -2.0) < 1e-12 && c8.ap_mean < 0.0);
         assert!(cands
             .iter()
-            .all(|c| c.ap_sum.is_finite() && c.ap_sum > 0.0 && c.ap_mean > 0.0));
+            .all(|c| c.ap_sum.is_finite() && c.ap_mean.is_finite()));
         // The same fit as a member (D1b's reader): the model flux is usable, the aperture sum is not.
         let full = candidates(&plane(&fits_of(&world, &Shot::new(1.0, 3.0)), &map, 3.0));
         let got = match_member(&full, &plane(&anchor, &map, 3.0));
         assert!(got.iter().all(|g| g.is_some()));
         assert!(got[3].unwrap().ap_sum.is_nan());
+        assert!(rel(got[8].unwrap().ap_sum, -2.0) < 1e-12);
+    }
+
+    #[test]
+    fn a_rescued_extended_anchor_fit_is_a_candidate_and_a_plain_extended_one_is_not() {
+        // Plan D D2c (PD-30): `flux_fit` reads `!SATURATED && (!EXTENDED || SIBLING_POINT)`. Of three extended anchor fits, the
+        // one carrying SIBLING_POINT is a candidate; the plain extended one and the saturated one with it are not.
+        let f = 3.0;
+        let area = AREA_PER_FWHM2 * f * f;
+        let bright = 500.0 * NOISE * area.sqrt();
+        let fit = |x: f64, flags: StarFlags| fit_at(x, 100.0, bright, area, f, flags);
+        let fits = vec![
+            fit(100.0, StarFlags::default()),
+            fit(300.0, StarFlags::EXTENDED),
+            fit(500.0, StarFlags::EXTENDED | StarFlags::SIBLING_POINT),
+            fit(
+                700.0,
+                StarFlags::SATURATED | StarFlags::EXTENDED | StarFlags::SIBLING_POINT,
+            ),
+        ];
+        let map = identity();
+        let xs: Vec<f64> = candidates(&plane(&fits, &map, f))
+            .iter()
+            .map(|c| c.x)
+            .collect();
+        assert_eq!(xs, vec![100.0, 500.0]);
+        // The member side reads the same predicate: the rescued fit pairs, the plain extended one does not.
+        let member = |flags: StarFlags| {
+            let anchor = [fit(500.0, StarFlags::default())];
+            let cand = candidates(&plane(&anchor, &map, f));
+            let theirs = [fit(500.0, flags)];
+            match_member(&cand, &plane(&theirs, &map, f))[0]
+        };
+        assert!(member(StarFlags::default()).is_some());
+        assert!(
+            member(StarFlags::EXTENDED).is_none(),
+            "a plain extended fit does not pair"
+        );
+        assert!(member(StarFlags::EXTENDED | StarFlags::SIBLING_POINT).is_some());
+        assert!(
+            member(StarFlags::SATURATED | StarFlags::SIBLING_POINT | StarFlags::EXTENDED).is_none()
+        );
+        // And the statistic is not widened.
+        assert!(!(StarFlags::EXTENDED | StarFlags::SIBLING_POINT).in_statistic());
+    }
+
+    #[test]
+    fn a_rescued_star_joins_the_set_where_the_members_flag_it_too() {
+        // Star 0 is extended with SIBLING_POINT in every member (a knot flag on a star the other planes see as a point): it
+        // is a candidate, present everywhere, and in the set. Star 1 is plain extended in the anchor only: not a candidate.
+        let world = sky(60, 41);
+        let mut members: Vec<_> = (0..4)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        for m in &mut members {
+            m.0[0].flags = StarFlags::EXTENDED | StarFlags::SIBLING_POINT;
+        }
+        members[0].0[1].flags = StarFlags::EXTENDED;
+        let (cands, _u, out) = run(&members, 0);
+        assert_eq!(cands.len(), 59);
+        let (positions, _per) = measured(&out);
+        assert_eq!(positions.len(), 59);
+        let has = |j: usize| {
+            positions
+                .iter()
+                .any(|&(x, y)| x == world[j].x && y == world[j].y)
+        };
+        assert!(has(0) && !has(1));
+    }
+
+    #[test]
+    fn a_set_whose_anchor_sum_is_not_positive_has_no_common_flux() {
+        // PD-30: the anchor's aperture sums over the set add to zero or less (every S is an S at or under the sky): the
+        // members' ratios have nothing to scale, so the plane falls back (PD-6) with the set's size named.
+        let world = sky(60, 42);
+        let mut members: Vec<_> = (0..4)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        for m in &mut members {
+            m.0.iter_mut().for_each(|f| f.ap_sum = -f.ap_sum);
+        }
+        let (cands, _u, out) = run(&members, 0);
+        assert_eq!(cands.len(), 60, "a negative S is a candidate");
+        assert_eq!(out, CommonOutcome::NoAnchorFlux { stars: 60 });
+    }
+
+    #[test]
+    fn a_member_whose_paired_sums_are_not_positive_reads_no_flux() {
+        // A member (here, member 2) whose every S is under the sky: the ratio is negative, and psf_signal_weight multiplies
+        // two such fluxes into a positive number. Its common flux is zero, never negative.
+        let world = sky(60, 43);
+        let mut members: Vec<_> = (0..4)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        members[2].0.iter_mut().for_each(|f| f.ap_sum = -f.ap_sum);
+        let (_c, _u, out) = run(&members, 0);
+        let (_p, per) = measured(&out);
+        assert_eq!((per[2].tflux, per[2].tmean_flux), (0.0, 0.0));
+        assert!(per[1].tflux > 0.0);
     }
 
     #[test]

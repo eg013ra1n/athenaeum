@@ -18,9 +18,10 @@
 //!   d0_weight_probe common --dumps <D0 probe dir> --clone <C10 clone dir> [--out-dir <dir>]
 //!
 //! (Plan D D1a) judges the product's frame-common star set against D0's offline set (b) on those dumps; see the `common`
-//! module below. Plan D D2b (PD-26): the star dump carries each fit's aperture sum `S` (`apSum`, the `star_snr` sum the
-//! common-set weight reads) beside `signal` and `apFixed`; a dump measured before D2b has no such column and the `common`
-//! arm refuses it.
+//! module below. Plan D D2b (PD-26), D2c (PD-30): the star dump carries each fit's aperture sum `S` (`apSum`: the sum of
+//! `v - B_i` within 3 x the frame's ring FWHM, read in Measure's HFR walk; the common-set weight reads it) beside `signal`
+//! and `apFixed`, the noise of that sum (`apNoise`) and the fit's flags with `SIBLING_POINT` (bit value 8, PD-9's rescue of an
+//! extended fit) in `flags`; a dump measured before D2c has no `apNoise` column and the `common` arm refuses it.
 //! Energies are the module's ADU units (x 65535 of the [0, 1] domain), as `StarFit` holds them.
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::stacking::config::StackingConfig;
@@ -219,6 +220,21 @@ fn main() {
                     path.display()
                 ));
             }
+            // Plan D D2c (PD-30): the Measure's SIBLING_POINT is this same test on every extended fit, not only `c`'s candidates.
+            // The self-check: the flag is set on exactly the extended fits the probe's own index rescues, saturated ones included,
+            // and on no other.
+            for f in pf.iter() {
+                if f.flags.sibling_point() != rescue(f) {
+                    die(format!(
+                        "SELF-CHECK MISMATCH {} plane {p} ({n} planes): fit at ({:.2}, {:.2}) flags {} but the probe's sibling test says {}",
+                        path.display(),
+                        f.x,
+                        f.y,
+                        f.flags.bits(),
+                        rescue(f)
+                    ));
+                }
+            }
             // `c`'s candidate pool before the `extended` gate: accepted, unsaturated, finite model flux, SNR >= 20,
             // by model flux (the order `aperture_correction` sorts in); each with its extended flag (D0's meaning)
             // and whether the colour sample takes it back.
@@ -288,13 +304,23 @@ fn main() {
             let file = std::fs::File::create(&tsv).unwrap_or_else(|e| die(format!("{}: {e}", tsv.display())));
             let mut o = std::io::BufWriter::new(file);
             let s = ADU_SCALE as f64;
-            writeln!(o, "x\ty\tsignal\tmodel\tarea\tsnr\tflags\tfwhm\tecc\tamplitude\tpeak5\tskyRing\tresidual\tapFixed\tapSum")
+            writeln!(o, "x\ty\tsignal\tmodel\tarea\tsnr\tflags\tfwhm\tecc\tamplitude\tpeak5\tskyRing\tresidual\tapFixed\tapSum\tapNoise")
                 .unwrap_or_else(|e| die(format!("write: {e}")));
+            let ring_fwhm = ch.fwhm_px;
             for f in pf {
                 let ap = fixed_aperture(&data, w, h, f, ap_r);
+                // The 3 F sum's noise (PD-30): `star_snr`'s sigma of the sum at max(1.5 F, 3) px, `S_1.5 / snr`, scaled by the root of
+                // the aperture areas, (3 ring F)^2 / max(1.5 F, 3)^2 in pixels^2 (the field FWHM of the plane stands for the ring width).
+                let r15 = (1.5 * f.fwhm()).max(3.0);
+                let s15 = fixed_aperture(&data, w, h, f, r15);
+                let ap_noise = if f.snr.is_finite() && f.snr > 0.0 && s15.is_finite() {
+                    (s15 / f.snr).abs() * (3.0 * ring_fwhm / r15)
+                } else {
+                    f64::NAN
+                };
                 writeln!(
                     o,
-                    "{:.3}\t{:.3}\t{:.6e}\t{:.6e}\t{:.4}\t{:.3}\t{}\t{:.4}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.5e}\t{:.6e}\t{:.6e}",
+                    "{:.3}\t{:.3}\t{:.6e}\t{:.6e}\t{:.4}\t{:.3}\t{}\t{:.4}\t{:.4}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.5e}\t{:.6e}\t{:.6e}\t{:.6e}",
                     f.x,
                     f.y,
                     f.signal / s,
@@ -309,7 +335,8 @@ fn main() {
                     f.sky_ring / s,
                     f.residual,
                     ap / s,
-                    f.ap_sum / s
+                    f.ap_sum / s,
+                    ap_noise / s
                 )
                 .unwrap_or_else(|e| die(format!("write: {e}")));
             }
@@ -324,9 +351,11 @@ fn main() {
 // (b), on D0's per-star dumps and the C10 clones' stored registration.
 //
 //   d0_weight_probe common --dumps <D0 probe dir> --clone <C10 clone dir> [--out-dir <dir>] [--proxy-floor <snr>]
+//       [--set-rescue off|on]
 //
 // `--proxy-floor` (default 20, the module's CORRECTION_MIN_SNR) post-filters the candidates to those whose proxy SNR reaches
-// it: the what-if for "a higher proxy floor", never the gate. Reads (read only): `<dumps>/frames.jsonl` + `<dumps>/stars/<stem>.p<k>.tsv` (D0's rows: x, y, signal, area, snr, flags,
+// it: the what-if for "a higher proxy floor", never the gate. `--set-rescue` (default `on`, the product) clears the dump's
+// SIBLING_POINT bit before the module reads the fits when `off`: the set then admits no extended fit (PD-30's gate runs both). Reads (read only): `<dumps>/frames.jsonl` + `<dumps>/stars/<stem>.p<k>.tsv` (D0's rows: x, y, signal, area, snr, flags,
 // apFixed) and `<clone>/athenaeum.db` through `immutable=1` (the last run's frames, calibrated artifacts, registration).
 // Prints, per group-plane and group, the `D1A` lines `star-lab/bin/pland_bars.py d1a` judges, then free-form lines
 // (`plane-info`, `frame`, `replay`) that no judge reads. A dump measured at another beta than the clone's group beta (the
@@ -425,26 +454,35 @@ mod common {
         v.get(key).and_then(Value::as_f64).unwrap_or(f64::NAN)
     }
 
-    fn read_stars(path: &Path) -> (Vec<StarFit>, Vec<f64>) {
+    /// `rescue` off clears the dump's SIBLING_POINT bit on every fit (`--set-rescue off`): the set then reads what D2b's did,
+    /// no extended fit. The dump's `apNoise` (the noise of the 3 F sum, PD-30) rides in the fit's `hfr` slot, which a dump has
+    /// no HFR for and the probe reads nowhere else.
+    fn read_stars(path: &Path, rescue: bool) -> (Vec<StarFit>, Vec<f64>) {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
         let mut lines = text.lines();
         let header: Vec<&str> = lines.next().unwrap_or_else(|| die(format!("{}: empty", path.display()))).split('\t').collect();
         let col = |name: &str| header.iter().position(|h| *h == name).unwrap_or_else(|| die(format!("{}: no column {name}", path.display())));
         let (cx, cy, cs, ca, cn, cf, cap) = (col("x"), col("y"), col("signal"), col("area"), col("snr"), col("flags"), col("apFixed"));
-        // Plan D D2b: the aperture sum the weight reads. A dump from before D2b has none, and the weight would be empty on it.
+        // Plan D D2b / D2c: the aperture sum the weight reads and its noise. A dump from before D2c has no `apNoise` (and one from
+        // before D2b no `apSum`; a D2b dump's `apSum` is the sum at 1.5 F, not this module's): measure it again with the main arm.
         let csum = header
             .iter()
             .position(|h| *h == "apSum")
             .unwrap_or_else(|| die(format!("{}: no column apSum: the dump predates Plan D D2b; measure it again with the main arm", path.display())));
+        let cnoise = header
+            .iter()
+            .position(|h| *h == "apNoise")
+            .unwrap_or_else(|| die(format!("{}: no column apNoise: the dump predates Plan D D2c (its apSum is not the 3 F sum); measure it again with the main arm", path.display())));
         let mut fits = Vec::new();
         let mut ap = Vec::new();
         for (n, line) in lines.enumerate() {
             let f: Vec<&str> = line.split('\t').collect();
             let get = |c: usize| -> f64 { f.get(c).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN) };
-            if f.len() <= cap.max(csum) {
+            if f.len() <= cap.max(csum).max(cnoise) {
                 die(format!("{}: line {} has {} columns", path.display(), n + 2, f.len()));
             }
             let flags = f[cf].parse::<u8>().unwrap_or_else(|_| die(format!("{}: line {}: flags {:?}", path.display(), n + 2, f[cf])));
+            let flags = if rescue { flags } else { flags & !StarFlags::SIBLING_POINT.bits() };
             fits.push(StarFit {
                 x: get(cx),
                 y: get(cy),
@@ -465,7 +503,7 @@ mod common {
                 sky_ring_n: 0,
                 ap_sum: get(csum) * ADU,
                 snr: get(cn),
-                hfr: f64::NAN,
+                hfr: get(cnoise) * ADU,
                 flags: StarFlags(flags),
             });
             ap.push(get(cap));
@@ -473,7 +511,7 @@ mod common {
         (fits, ap)
     }
 
-    fn load_dump(dir: &Path) -> Dump {
+    fn load_dump(dir: &Path, rescue: bool) -> Dump {
         let text = std::fs::read_to_string(dir.join("frames.jsonl")).unwrap_or_else(|e| die(format!("{}/frames.jsonl: {e}", dir.display())));
         let mut dump = Dump::new();
         for (n, line) in text.lines().enumerate() {
@@ -484,7 +522,7 @@ mod common {
             let file = v["file"].as_str().unwrap_or_else(|| die("frames.jsonl: no file")).to_string();
             let stem = v["stem"].as_str().unwrap_or_else(|| die("frames.jsonl: no stem"));
             let ch = &v["channel"];
-            let (fits, ap_fixed) = read_stars(&dir.join("stars").join(format!("{stem}.p{plane}.tsv")));
+            let (fits, ap_fixed) = read_stars(&dir.join("stars").join(format!("{stem}.p{plane}.tsv")), rescue);
             let base = Path::new(&file).file_name().and_then(|s| s.to_str()).unwrap_or(&file).to_string();
             let p = DumpPlane {
                 base,
@@ -893,8 +931,8 @@ mod common {
                     None,
                     per_member.iter().map(|c| c.paired).collect(),
                 ),
-                CommonOutcome::TooFewStars { stars } => {
-                    eprintln!("d0_weight_probe common: plane {p}: {stars} common stars, the Measure-time weights stand");
+                CommonOutcome::TooFewStars { stars } | CommonOutcome::NoAnchorFlux { stars } => {
+                    eprintln!("d0_weight_probe common: plane {p}: {stars} common stars (too few, or the anchor's flux over them not positive), the Measure-time weights stand");
                     // A plane at floor (i) carries no `c` in the dump; the run's `take_group_c` scales its weight by c^2.
                     (
                         members.iter().map(|m| m.planes[p].psf_signal_weight * m.planes[p].c_stand_in.powi(2)).collect(),
@@ -941,12 +979,15 @@ mod common {
     /// signal-usable pair (D1w's r_f, whose noise the D1a bars first judged).
     fn rf_noise(idx: &[MemberIndex<'_>], anchor: usize, pr: &PlaneResult, s_based: bool) -> Vec<f64> {
         let flux = |f: &StarFit| if s_based { f.ap_sum } else { f.signal };
+        // Plan D D2c (PD-30): the S-based sigma_i is the dump's `apNoise` (the fit's `hfr` slot here): `star_snr`'s sigma of the 1.5 F sum,
+        // S_1.5 / snr, scaled by sqrt(n_3F / n_1.5F) = 3 ring F / max(1.5 F, 3) for the 3 F sum. The model-flux variant keeps signal / snr.
+        let sigma = |f: &StarFit| if s_based { f.hfr } else { f.signal / f.snr };
         (0..idx.len())
             .map(|k| {
                 let (mut sf, mut vf, mut sa, mut va, mut pairs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
                 for &j in &pr.set_idx {
                     let Some(u) = pr.usable[k][j] else { continue };
-                    if s_based && !(u.ap_sum.is_finite() && u.ap_sum > 0.0) {
+                    if s_based && !u.ap_sum.is_finite() {
                         continue;
                     }
                     pairs += 1;
@@ -955,13 +996,13 @@ mod common {
                         die(format!("member {k}, candidate {j}: the module pairs a fit that the probe's re-match does not find"));
                     };
                     let good = |snr: f64| snr.is_finite() && snr > 0.0;
-                    if !(good(f.snr) && good(g.snr)) {
+                    if !(good(f.snr) && good(g.snr)) || !(sigma(f).is_finite() && sigma(g).is_finite()) {
                         continue;
                     }
                     sf += flux(f);
-                    vf += (flux(f) / f.snr).powi(2);
+                    vf += sigma(f).powi(2);
                     sa += flux(g);
-                    va += (flux(g) / g.snr).powi(2);
+                    va += sigma(g).powi(2);
                 }
                 if s_based && pairs != pr.paired[k] {
                     die(format!("member {k}: {pairs} pairs in the re-match, {} in the module", pr.paired[k]));
@@ -995,7 +1036,7 @@ mod common {
                     ma += c.signal;
                     qm += f.mean;
                     qma += c.mean;
-                    if f.ap_sum.is_finite() && f.ap_sum > 0.0 {
+                    if f.ap_sum.is_finite() {
                         s += f.ap_sum;
                         sa += c.ap_sum;
                         qs += f.ap_mean;
@@ -1178,7 +1219,7 @@ mod common {
                         Match::One(f) => {
                             if f.flags.saturated() {
                                 sat += 1;
-                            } else if f.flags.extended() {
+                            } else if !f.flags.in_common_set() {
                                 ext += 1;
                             }
                         }
@@ -1189,7 +1230,7 @@ mod common {
                 let f = &d.fits[i];
                 if f.flags.saturated() {
                     clipped += 1;
-                } else if f.flags.extended() {
+                } else if !f.flags.in_common_set() {
                     extended += 1;
                 } else if pix_tree.within(f.x, f.y, CORRECTION_ISOLATION_PER_FIELD_FWHM * d.fwhm).len() != 1 {
                     crowded += 1;
@@ -1411,8 +1452,25 @@ mod common {
                 quantile(&noise_model[p], 0.5),
                 quantile(&noise_model[p], 0.9)
             );
+            // Plan D D2c (PD-30): of the set's member-star pairs (the module's own, a finite S) the share whose S is at or under the sky
+            // (noise, summed), and how many set stars are rescued extended fits in the anchor (SIBLING_POINT).
+            let (mut pairs, mut le0) = (0usize, 0usize);
+            for u in &pr.usable {
+                for &j in &pr.set_idx {
+                    if let Some(f) = u[j].filter(|f| f.ap_sum.is_finite()) {
+                        pairs += 1;
+                        le0 += usize::from(f.ap_sum <= 0.0);
+                    }
+                }
+            }
+            let s_le0 = if pairs == 0 { f64::NAN } else { le0 as f64 / pairs as f64 };
+            let set_rescued = pr
+                .set_idx
+                .iter()
+                .filter(|&&j| matches!(indices[p][prod.anchor].at(&pr.cands[j]), Match::One(f) if f.flags.extended()))
+                .count();
             println!(
-                "plane-info {ds} {group} p{p} anchor={anchor_key} reference={} candidates={} set={} b_set={} proxy_only_stars={proxy_only} too_few={:?}",
+                "plane-info {ds} {group} p{p} anchor={anchor_key} reference={} candidates={} set={} b_set={} proxy_only_stars={proxy_only} too_few={:?} set_rescued={set_rescued} pairs={pairs} s_le0_share={s_le0:.5}",
                 members[b.reference].key,
                 pr.cands.len(),
                 pr.positions.len(),
@@ -1465,6 +1523,7 @@ mod common {
 
     pub fn run(args: &[String]) {
         let (mut dumps, mut clone, mut out_dir, mut proxy_floor) = (None::<PathBuf>, None::<PathBuf>, None::<PathBuf>, CORRECTION_MIN_SNR);
+        let mut rescue = true;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut v = || it.next().unwrap_or_else(|| die(format!("{a} needs a value"))).clone();
@@ -1473,12 +1532,20 @@ mod common {
                 "--clone" => clone = Some(PathBuf::from(v())),
                 "--out-dir" => out_dir = Some(PathBuf::from(v())),
                 "--proxy-floor" => proxy_floor = v().parse().unwrap_or_else(|_| die("--proxy-floor")),
+                "--set-rescue" => {
+                    rescue = match v().as_str() {
+                        "on" => true,
+                        "off" => false,
+                        o => die(format!("--set-rescue takes on or off, not {o}")),
+                    }
+                }
                 o => die(format!("unknown argument {o}")),
             }
         }
         let dumps = dumps.unwrap_or_else(|| die("--dumps is required"));
         let clone_dir = clone.unwrap_or_else(|| die("--clone is required"));
-        let dump = load_dump(&dumps);
+        println!("set-rescue {}", if rescue { "on" } else { "off" });
+        let dump = load_dump(&dumps, rescue);
         let clone = load_clone(&clone_dir);
         if dump.is_empty() {
             die(format!("{}: no frames in frames.jsonl", dumps.display()));

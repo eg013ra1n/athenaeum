@@ -7,7 +7,8 @@
 //! `f64` to a little-endian `f32` (14 × 4 bytes: the 13 fit numbers and the
 //! aperture sum `S`, Plan D D2b) plus one flags byte ([`StarFlags`], Plan A
 //! Task 4: the byte was reserved and written 0 before) — 57 bytes per fit
-//! (53 in version 1), ≈ 200–400 KB per plane on a typical field. The
+//! (53 in version 1), ≈ 0.6–0.8 MB per plane on a runB-sized field (12 000
+//! fits). The
 //! narrowing is deliberate (spec §2.2.1): the values downstream feed a
 //! RATIO (Normalize's relative flux scale) or a star LIST (Register's
 //! reused detections), and the audit measured the systematic loss the
@@ -31,20 +32,25 @@ use crate::star_measure::StarFlags;
 /// File magic — four ASCII bytes.
 const MAGIC: [u8; 4] = *b"ATHF";
 
-/// Bumped whenever the record layout changes; [`read_fits`] refuses any
-/// other value rather than guess at a shape it was not built to read.
-/// Version 2 (Plan D D2b, PD-26) adds the aperture sum `S` after `area`; a
-/// version-1 file is refused like any other version (the measurement hash
-/// moved with `MEASURE_VERSION` 8, so no fresh row points at one).
-pub const FITS_ARTIFACT_VERSION: u16 = 2;
+/// Bumped whenever the record layout or the meaning of a field changes;
+/// [`read_fits`] refuses any other value rather than guess at a shape it was
+/// not built to read. Version 2 (Plan D D2b, PD-26) added the aperture sum `S`
+/// after `area`; version 3 (Plan D D2c, PD-30) keeps the layout and moves the
+/// sum to 3 x the frame's ring FWHM (version 2's was the SNR aperture's), so a
+/// version-2 file is refused. The measurement hash does not move with this
+/// number (a catalog measured at an earlier head keeps its hash and its rows),
+/// so a fresh `fits.<plane>` row CAN point at a file of another version: the
+/// plan's freshness gate reads the header ([`header_version`]) and a row
+/// whose file is not of this version measures again.
+pub const FITS_ARTIFACT_VERSION: u16 = 3;
 
 /// `x, y, background, amplitude, fwhm_x, fwhm_y, fwtm_x, fwtm_y, theta,
 /// beta, residual, signal, area, ap_sum` — [`StarFit`]'s 14 persisted
 /// numbers, in declaration order, each a little-endian `f32` (`ap_sum`: NaN
 /// where the fit has no aperture sum) — plus the flags byte
-/// ([`StarFit::flags`], bit 0 saturated, bit 1 β at its cap). The byte held
-/// `0` in every file written before Plan A Task 4, so such a file reads as
-/// no flags.
+/// ([`StarFit::flags`], bit 0 saturated, bit 1 β at its cap, bit 2 extended,
+/// bit 3 sibling point). The byte held `0` in every file written before Plan
+/// A Task 4, so such a file reads as no flags.
 /// Fields are written/read individually (never a `#[repr(C)]` cast), so
 /// struct alignment/padding never enters the on-disk shape.
 const FIELDS_PER_RECORD: usize = 14;
@@ -234,6 +240,27 @@ pub fn read_fits(path: &Path) -> Result<Vec<StarFit>, FitsArtifactError> {
     Ok(rest.chunks_exact(RECORD_LEN).map(decode_fit).collect())
 }
 
+/// The version a `fits` artifact's header carries, without reading its records: the freshness gate's question (Plan D D2c,
+/// review M1 of D2b). The same typed errors as [`read_fits`] for a file that is not an `.athf` at all (a short header, a
+/// foreign magic); the version itself is returned whatever it is, so the caller can say which one it found.
+pub fn header_version(path: &Path) -> Result<u16, FitsArtifactError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0u8; 6];
+    file.read_exact(&mut header)
+        .map_err(|e| FitsArtifactError::Truncated(format!("header: {e}")))?;
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&header[0..4]);
+    if magic != MAGIC {
+        return Err(FitsArtifactError::BadMagic {
+            expected: MAGIC,
+            found: magic,
+        });
+    }
+    Ok(u16::from_le_bytes(
+        header[4..6].try_into().expect("2-byte slice"),
+    ))
+}
+
 /// The `stacking_artifacts.kind` for one plane's fits file — `"fits.<plane>"`
 /// (`plane` 0-based, the same index [`crate::integration::plane_reader::PlaneReader`]
 /// uses): one row per (frame, plane), since each plane owns its own `.athf`
@@ -421,10 +448,9 @@ mod tests {
         assert_eq!(read_fits(&p).unwrap()[0].flags, StarFlags::default());
     }
 
-    /// Plan D D2b (PD-26): the aperture sum is the 14th number of a version-2 record, NaN included (a fit with no ring).
+    /// Plan D D2b (PD-26): the aperture sum is the 14th number of a record (versions 2 and 3), NaN included (a fit with no ring).
     #[test]
     fn the_aperture_sum_round_trips_and_a_missing_one_stays_nan() {
-        assert_eq!(FITS_ARTIFACT_VERSION, 2);
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("s.athf");
         let mut with = StarFit::test_at(10.0, 20.0, 1000.0);
@@ -443,7 +469,7 @@ mod tests {
         assert_eq!(back[0].flags, StarFlags::default());
     }
 
-    /// The record is 14 little-endian `f32` and the flags byte: 57 bytes (53 in version 1), the header 10.
+    /// The record is 14 little-endian `f32` and the flags byte: 57 bytes (53 in version 1; the same in versions 2 and 3), the header 10.
     #[test]
     fn a_record_is_57_bytes() {
         assert_eq!(RECORD_LEN, 57);
@@ -477,6 +503,69 @@ mod tests {
             }
             other => panic!("expected BadVersion, got {other:?}"),
         }
+    }
+
+    /// Plan D D2c (PD-30): version 3 keeps the 57-byte record of version 2 and changes what its 14th number is (the sum at
+    /// 3 F of the frame's ring width, no longer the SNR aperture's), so a version-2 file is refused like any other version:
+    /// read at v3 its sums would be the wrong aperture's.
+    #[test]
+    fn a_version_2_file_is_refused_and_a_version_3_one_round_trips() {
+        assert_eq!(FITS_ARTIFACT_VERSION, 3);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v2.athf");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; RECORD_LEN]);
+        std::fs::write(&p, &buf).unwrap();
+        match read_fits(&p) {
+            Err(FitsArtifactError::BadVersion { expected, found }) => {
+                assert_eq!((expected, found), (FITS_ARTIFACT_VERSION, 2));
+            }
+            other => panic!("expected BadVersion, got {other:?}"),
+        }
+        // The sibling-point flag byte survives the round trip with the rest.
+        let mut fit = StarFit::test_at(10.0, 20.0, 1000.0);
+        fit.ap_sum = 777.5;
+        fit.flags = StarFlags::EXTENDED | StarFlags::SIBLING_POINT;
+        let p = d.path().join("v3.athf");
+        write_fits(&p, &[fit]).unwrap();
+        let back = read_fits(&p).unwrap();
+        assert_eq!(
+            back[0].flags,
+            StarFlags::EXTENDED | StarFlags::SIBLING_POINT
+        );
+        assert_eq!(back[0].ap_sum, 777.5);
+        assert_eq!(std::fs::read(&p).unwrap()[4..6], 3u16.to_le_bytes());
+    }
+
+    /// Plan D D2c, review M1: the header's version is readable on its own, whatever it is, and a file that is no `.athf`
+    /// is a typed error.
+    #[test]
+    fn the_header_version_is_read_without_the_records() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("now.athf");
+        write_fits(&p, &[]).unwrap();
+        assert_eq!(header_version(&p).unwrap(), FITS_ARTIFACT_VERSION);
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(header_version(&p).unwrap(), 2);
+        std::fs::write(&p, b"AT").unwrap();
+        assert!(matches!(
+            header_version(&p),
+            Err(FitsArtifactError::Truncated(_))
+        ));
+        std::fs::write(&p, b"NOPE\x01\x00\x00\x00\x00\x00").unwrap();
+        assert!(matches!(
+            header_version(&p),
+            Err(FitsArtifactError::BadMagic { .. })
+        ));
+        assert!(matches!(
+            header_version(&d.path().join("absent.athf")),
+            Err(FitsArtifactError::Io(_))
+        ));
     }
 
     #[test]
