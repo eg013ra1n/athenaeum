@@ -59,6 +59,7 @@
 
 pub use crate::db::stacking::StackSubject;
 
+pub mod common_set;
 pub mod config;
 pub mod crop;
 pub mod drizzle;
