@@ -3787,6 +3787,20 @@ pub(crate) struct MeasuredFrame {
     ln_growth_factor: Option<f64>,
     ln_growth_pairs: Option<usize>,
     ln_aperture_correction: Option<f64>,
+    /// Plan D D1w (PD-18): under a mode that defers the weight floor ([`defers_weight_gate`]), stage 3 sets this when the
+    /// frame's Measure-time weight fails [`weight_gate`] - the frame stays included, is registered and is reweighed, but
+    /// no reference pick reads it (stage 4's group choice and candidates, the two-pass candidates, `group_can_switch`;
+    /// see [`MeasuredFrame::in_reference_pick`]). A stored flag, because the reweigh later overwrites `weight`. Never
+    /// set under any other weight mode.
+    measure_floored: bool,
+}
+
+impl MeasuredFrame {
+    /// Whether a reference pick may see this frame: included, and not under the Measure-time floor that the PSF-family
+    /// modes defer (PD-18). The viability counts (3 frames to register or to integrate) read `included` alone.
+    fn in_reference_pick(&self) -> bool {
+        self.included && !self.measure_floored
+    }
 }
 
 /// Stage 3's per-group summary beyond the per-frame [`MeasuredFrame`] list
@@ -5363,6 +5377,7 @@ fn measure_group_prepare(
                 ln_growth_factor: None,
                 ln_growth_pairs: None,
                 ln_aperture_correction: None,
+                measure_floored: false,
             });
             continue;
         }
@@ -5383,6 +5398,7 @@ fn measure_group_prepare(
                 ln_growth_factor: None,
                 ln_growth_pairs: None,
                 ln_aperture_correction: None,
+                measure_floored: false,
             });
             continue;
         }
@@ -5418,6 +5434,7 @@ fn measure_group_prepare(
                 ln_growth_factor: None,
                 ln_growth_pairs: None,
                 ln_aperture_correction: None,
+                measure_floored: false,
             });
             continue;
         };
@@ -5443,6 +5460,7 @@ fn measure_group_prepare(
                 ln_growth_factor: None,
                 ln_growth_pairs: None,
                 ln_aperture_correction: None,
+                measure_floored: false,
             });
             continue;
         }
@@ -5477,6 +5495,7 @@ fn measure_group_prepare(
                     ln_growth_factor: None,
                     ln_growth_pairs: None,
                     ln_aperture_correction: None,
+                    measure_floored: false,
                 });
                 continue;
             }
@@ -5503,6 +5522,7 @@ fn measure_group_prepare(
                     ln_growth_factor: None,
                     ln_growth_pairs: None,
                     ln_aperture_correction: None,
+                    measure_floored: false,
                 });
                 continue;
             }
@@ -5529,6 +5549,7 @@ fn measure_group_prepare(
             ln_growth_factor: None,
             ln_growth_pairs: None,
             ln_aperture_correction: None,
+            measure_floored: false,
         });
         to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
     }
@@ -5895,6 +5916,11 @@ fn measure_group_finish(
                 }
                 None => {
                     entries[idx].included = true;
+                    // Plan D D1w (PD-18): a frame the deferred floor will judge after Register is registered and
+                    // reweighed, but the reference pick must not see it. Stored here, because the reweigh overwrites
+                    // `weight`.
+                    entries[idx].measure_floored = defers_weight_gate(cfg.measurement.weight_mode)
+                        && weight_gate(&weights[i], &cfg.selection).is_some();
                 }
             }
             tracing::debug!(
@@ -6858,7 +6884,9 @@ fn persist_measurement(
 /// (ruling R-M4b-4), and the two must not be two different rules.
 ///
 /// `keep` narrows the pick (plan 6b-2 C15: a project's WCS candidates). It
-/// is applied on top of `included`: an entry that is not included never wins.
+/// is applied on top of `included`: an entry that is not included never wins,
+/// nor does one under the Measure-time floor that the PSF modes defer
+/// ([`MeasuredFrame::in_reference_pick`], PD-18).
 fn best_included_idx_where(
     entries: &[MeasuredFrame],
     keep: impl Fn(&MeasuredFrame) -> bool,
@@ -6875,7 +6903,10 @@ fn best_included_idx_where(
             })
         })
         .collect();
-    let included: Vec<bool> = entries.iter().map(|e| e.included && keep(e)).collect();
+    let included: Vec<bool> = entries
+        .iter()
+        .map(|e| e.in_reference_pick() && keep(e))
+        .collect();
     let star_counts: Vec<usize> = entries
         .iter()
         .map(|e| e.measurement.as_ref().map(|m| m.min_stars()).unwrap_or(0))
@@ -6935,7 +6966,8 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
         None
     };
     let manifest_included = rc.measured.values().flatten().any(|e| {
-        (e.included || pinned == Some(e.frame.frame_id)) && manifest.contains(&e.frame.frame_id)
+        (e.in_reference_pick() || pinned == Some(e.frame.frame_id))
+            && manifest.contains(&e.frame.frame_id)
     });
     let with_wcs: HashSet<i64> = manifest.union(&local).copied().collect();
     let candidates = if manifest_included { manifest } else { local };
@@ -7218,18 +7250,27 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
             };
             for &integrated_only in passes {
                 for g in &rc.plan_groups {
-                    let included = rc
+                    // Plan D D1w (PD-18): the group choice counts the frames the pick can see; a frame under the
+                    // Measure-time floor that the PSF modes defer is registered, but is not counted. Whether a group
+                    // will be integrated (>= 3) stays on `included`: the reweigh may rescue such a frame.
+                    let (included, pickable) = rc
                         .measured
                         .get(&g.key)
-                        .map(|v| v.iter().filter(|e| e.included).count())
-                        .unwrap_or(0);
-                    if included == 0 || (integrated_only && included < 3) {
+                        .map(|v| {
+                            (
+                                v.iter().filter(|e| e.included).count(),
+                                v.iter().filter(|e| e.in_reference_pick()).count(),
+                            )
+                        })
+                        .unwrap_or((0, 0));
+                    if pickable == 0 || (integrated_only && included < 3) {
                         continue;
                     }
                     if let Some(rule) = &rc.wcs_rule {
                         let holds_candidate = rc.measured.get(&g.key).is_some_and(|v| {
-                            v.iter()
-                                .any(|e| e.included && rule.candidates.contains(&e.frame.frame_id))
+                            v.iter().any(|e| {
+                                e.in_reference_pick() && rule.candidates.contains(&e.frame.frame_id)
+                            })
                         });
                         if !holds_candidate {
                             continue;
@@ -7238,14 +7279,14 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                     let take = match best_group {
                         None => true,
                         Some(b) => {
-                            included > best_included
-                                || (included == best_included
+                            pickable > best_included
+                                || (pickable == best_included
                                     && g.total_exposure_s > b.total_exposure_s)
                         }
                     };
                     if take {
                         best_group = Some(g);
-                        best_included = included;
+                        best_included = pickable;
                     }
                 }
                 if best_group.is_some() {
@@ -8707,6 +8748,41 @@ struct TwoPassSwitch {
     hash: String,
 }
 
+/// The two-pass pick's candidates from one dry pass: every frame that aligned, with its Measure-time weight, except a
+/// frame under the Measure-time floor that the PSF modes defer (PD-18): it shifts neither the median nor the top-N. The
+/// current reference stays whatever its flag, because the pick reads every deviation against it.
+fn two_pass_candidates(
+    entries: Option<&[MeasuredFrame]>,
+    pass: &[PassResult],
+    reference_frame_id: i64,
+) -> Vec<TwoPassCandidate> {
+    pass.iter()
+        .filter(|r| {
+            r.frame_id == reference_frame_id
+                || !entries
+                    .and_then(|v| v.get(r.idx))
+                    .is_some_and(|e| e.measure_floored)
+        })
+        .filter_map(|r| {
+            let (rotation_deg, translation) = r.outcome.as_ref().ok()?;
+            // A frame whose weight never computed ranks last rather
+            // than dropping out — it is still a legitimate geometry
+            // candidate, just never a top-N one.
+            let weight = entries
+                .and_then(|v| v.get(r.idx))
+                .and_then(|e| e.weight.as_ref())
+                .map(|w| w.normalized_mean)
+                .unwrap_or(0.0);
+            Some(TwoPassCandidate {
+                idx: r.idx,
+                weight,
+                rotation_deg: *rotation_deg,
+                translation: *translation,
+            })
+        })
+        .collect()
+}
+
 /// ONE group's two-pass dry pass and re-pick (M4a ruling R-M4a-5, factored
 /// out of `stage_register` by M4b Task 3 so both geometry modes run the
 /// SAME pick: co-registered runs it once, over the run reference's own
@@ -8752,28 +8828,11 @@ fn two_pass_refine(
         solves,
     )?;
 
-    let candidates: Vec<TwoPassCandidate> = {
-        let entries = rc.measured.get(&group.key);
-        pass.iter()
-            .filter_map(|r| {
-                let (rotation_deg, translation) = r.outcome.as_ref().ok()?;
-                // A frame whose weight never computed ranks last rather
-                // than dropping out — it is still a legitimate geometry
-                // candidate, just never a top-N one.
-                let weight = entries
-                    .and_then(|v| v.get(r.idx))
-                    .and_then(|e| e.weight.as_ref())
-                    .map(|w| w.normalized_mean)
-                    .unwrap_or(0.0);
-                Some(TwoPassCandidate {
-                    idx: r.idx,
-                    weight,
-                    rotation_deg: *rotation_deg,
-                    translation: *translation,
-                })
-            })
-            .collect()
-    };
+    let candidates = two_pass_candidates(
+        rc.measured.get(&group.key).map(Vec::as_slice),
+        &pass,
+        reference_frame_id,
+    );
 
     let reference_idx = pass
         .iter()
@@ -9035,14 +9094,16 @@ fn group_two_pass_wanted(
 /// run only a WCS candidate may win, so a group that holds no included
 /// candidate other than its current reference has nothing to switch to, and
 /// a dry pass (on a borrowed foreign reference, for a group with no
-/// candidate) would only cost time and log a false warning.
+/// candidate) would only cost time and log a false warning. A candidate under
+/// the Measure-time floor is not one (PD-18); the group's viability (>= 3
+/// included) is the caller's, on `included`.
 fn group_can_switch(rc: &RunContext, key: &str, reference_frame_id: i64) -> bool {
     let Some(rule) = &rc.wcs_rule else {
         return true;
     };
     rc.measured.get(key).is_some_and(|v| {
         v.iter().any(|e| {
-            e.included
+            e.in_reference_pick()
                 && e.frame.frame_id != reference_frame_id
                 && rule.candidates.contains(&e.frame.frame_id)
         })
@@ -9614,9 +9675,6 @@ fn registered_file_name(stem: &str, debayered: bool) -> String {
     }
 }
 
-/// One `stacking_run_frames` row per frame of every group, included or not
-/// — the frame's whole stage 3-5 outcome as `rc.measured` now holds it.
-/// Called once, at the very end of stage 5 (decision 8).
 // ── Plan D D1w: the reweigh (end of stage 5) ────────────────────────────────
 
 /// `reason` of a fallback names "under 20 common stars"; the count it names is the module's.
@@ -9767,6 +9825,9 @@ fn plane_outcome(
     };
     let mut usable = Vec::with_capacity(members.len());
     for k in 0..members.len() {
+        // Between members, as `stage_prepare`'s per-frame loop and `solve_project_frames`' per-job loop do: a group's
+        // planes x members `.athf` reads are the longest stretch of the reweigh.
+        rc.check_cancel()?;
         let Some((ch, map)) = plane_of(k) else {
             return Ok(missing(k));
         };
@@ -9802,7 +9863,7 @@ fn plane_outcome(
                 plane,
                 candidates = cands.len(),
                 members = usable.len(),
-                "weights: the common set's match table is malformed; the plane keeps its Measure-time weights"
+                "weights: common-set match table malformed"
             );
             PlaneOutcome::Fallback(Fallback::MalformedTable)
         }
@@ -9825,9 +9886,10 @@ fn plane_outcome(
 /// whose every plane fell back keeps stage 3's weights as they are. Either way the floor ([`weight_gate`]) runs on the
 /// members' weights.
 ///
-/// Never re-admits an excluded frame. The registration reference (the Measure-time pick, PD-11) and every group's own
-/// reference stay in the stack: a frame the user pinned, or the grid's origin, is not dropped by a floor that did not
-/// exist when it was picked.
+/// Never re-admits an excluded frame. The registration reference stays the Measure-time pick (PD-11), and an Auto
+/// reference under the floor is excluded like any frame (PD-17): the grid's origin is geometry, not pixels, and no later
+/// stage needs it in the stack. A MANUAL pin stays, with a warn and a run warning: stage 4 forces a pin in despite the
+/// selection.
 fn reweigh_groups(rc: &mut RunContext) -> Result<(), RunError> {
     let cfg = rc.config.clone();
     if !defers_weight_gate(cfg.measurement.weight_mode) {
@@ -10041,12 +10103,11 @@ fn reweigh_group(
             })
             .collect(),
     };
-    let references: HashSet<i64> = rc
-        .group_geometry
-        .values()
-        .map(|g| g.reference_frame_id)
-        .chain(rc.reference_frame_id)
-        .collect();
+    // PD-17: only a MANUAL pin stays under the floor (stage 4 forces a pin in despite the selection); an Auto reference is
+    // the grid's origin and nothing more, and is excluded like any frame.
+    let manual_pin: Option<i64> = (cfg.reference.mode == ReferenceMode::Manual)
+        .then_some(rc.reference_frame_id)
+        .flatten();
     for (k, w) in weights.into_iter().enumerate() {
         let (idx, frame_id) = (members[k].idx, members[k].frame_id);
         for (plane, paired) in paired_by_plane.iter().enumerate() {
@@ -10070,16 +10131,16 @@ fn reweigh_group(
             .expect("the group's entries")[idx];
         entry.weight = Some(w);
         if let Some(reason) = gate {
-            if references.contains(&frame_id) {
+            if Some(frame_id) == manual_pin {
                 tracing::warn!(
                     run_id = rc.run_id,
                     group_key = %group.key,
                     frame_id,
                     reason = %reason,
-                    "weights: reference kept despite the weight floor"
+                    "weights: manual reference kept despite the weight floor"
                 );
                 rc.warnings.push(format!(
-                    "reference frame {frame_id} kept despite its weight: {reason}"
+                    "manual reference frame {frame_id} kept despite its weight: {reason}"
                 ));
             } else {
                 entry.included = false;
@@ -10114,6 +10175,9 @@ fn reweigh_group(
     Ok(())
 }
 
+/// One `stacking_run_frames` row per frame of every group, included or not
+/// — the frame's whole stage 3-5 outcome as `rc.measured` now holds it.
+/// Called once, at the very end of stage 5 (decision 8).
 fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
     let conn = db(&rc.ctx)?.conn();
     for group in &rc.plan_groups {
@@ -15616,6 +15680,7 @@ mod tests {
             ln_growth_factor: None,
             ln_growth_pairs: None,
             ln_aperture_correction: None,
+            measure_floored: false,
         };
         let frame = |flags: &[bool]| FrameMeasurement {
             width: 64,
@@ -15638,7 +15703,7 @@ mod tests {
     }
 
     /// A frame nothing has measured yet, for the summary-row tests of Plan B B0.
-    fn bare_measured_frame(frame_id: i64) -> MeasuredFrame {
+    pub(super) fn bare_measured_frame(frame_id: i64) -> MeasuredFrame {
         use crate::stacking::groups::GroupFrame;
         MeasuredFrame {
             frame: GroupFrame {
@@ -15669,6 +15734,7 @@ mod tests {
             ln_growth_factor: None,
             ln_growth_pairs: None,
             ln_aperture_correction: None,
+            measure_floored: false,
         }
     }
 
@@ -30642,6 +30708,7 @@ mod tests {
                 ln_growth_factor: None,
                 ln_growth_pairs: None,
                 ln_aperture_correction: None,
+                measure_floored: false,
             })
             .collect();
         rc.measured.insert(group.key.clone(), entries);
@@ -30761,6 +30828,7 @@ mod tests {
                         ln_growth_factor: None,
                         ln_growth_pairs: None,
                         ln_aperture_correction: None,
+                        measure_floored: false,
                     }
                 })
                 .collect();

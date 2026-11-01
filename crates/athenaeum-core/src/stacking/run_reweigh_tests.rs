@@ -13,6 +13,7 @@ use crate::events::NullEmitter;
 use crate::stacking::groups::{group_frames, set_slug};
 use crate::stacking::telemetry::capture_logs;
 use crate::stacking::test_fixtures::{self, LightSpec};
+use crate::stacking::weights::FormulaWeights;
 
 const W: usize = 384;
 const H: usize = 288;
@@ -100,7 +101,46 @@ struct Sub {
     t: f64,
 }
 
-fn render(field: &[Star], sub: Sub, index: usize) -> Vec<(f64, f64, f64)> {
+/// One sub of a harness: the filter it is shot through (a filter is a group), its look, where the field sits on the
+/// canvas (a dither, px) and the sensor noise (ADU).
+#[derive(Clone, Copy)]
+struct Placed {
+    filter: Option<&'static str>,
+    sub: Sub,
+    shift: (f64, f64),
+    noise: f32,
+}
+
+impl Placed {
+    fn new(sub: Sub) -> Placed {
+        Placed {
+            filter: None,
+            sub,
+            shift: (0.0, 0.0),
+            noise: 5.0,
+        }
+    }
+
+    fn through(self, filter: &'static str) -> Placed {
+        Placed {
+            filter: Some(filter),
+            ..self
+        }
+    }
+
+    fn shifted(self, dx: f64, dy: f64) -> Placed {
+        Placed {
+            shift: (dx, dy),
+            ..self
+        }
+    }
+
+    fn noisy(self, noise: f32) -> Placed {
+        Placed { noise, ..self }
+    }
+}
+
+fn render(field: &[Star], sub: Sub, index: usize, shift: (f64, f64)) -> Vec<(f64, f64, f64)> {
     field
         .iter()
         .filter(|s| match s.present {
@@ -108,7 +148,13 @@ fn render(field: &[Star], sub: Sub, index: usize) -> Vec<(f64, f64, f64)> {
             In::Only(i) => i == index,
             In::Except(i) => i != index,
         })
-        .map(|s| (s.x, s.y, s.amp * sub.t * (REF_FWHM / sub.fwhm).powi(2)))
+        .map(|s| {
+            (
+                s.x + shift.0,
+                s.y + shift.1,
+                s.amp * sub.t * (REF_FWHM / sub.fwhm).powi(2),
+            )
+        })
         .collect()
 }
 
@@ -150,19 +196,32 @@ fn harness_with(
     subs: &[Sub],
     bayerpat: Option<&str>,
 ) -> Harness {
+    let placed: Vec<Placed> = subs.iter().map(|&s| Placed::new(s)).collect();
+    let h = harness_placed(cfg, field, &placed, bayerpat);
+    assert_eq!(h.rc.plan_groups.len(), 1, "{:?}", h.rc.plan_groups);
+    h
+}
+
+/// A harness over subs that differ in filter (one group per filter), dither and noise.
+fn harness_placed(
+    cfg: StackingConfig,
+    field: &[Star],
+    subs: &[Placed],
+    bayerpat: Option<&str>,
+) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("catalog.db");
     let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
     let conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
     let fixture = test_fixtures::frame_set_with_conn(conn, SET_NAME);
     let mut ids = Vec::new();
-    for (i, sub) in subs.iter().enumerate() {
+    for (i, p) in subs.iter().enumerate() {
         let stem = format!("f{i}");
         let date_obs = date_obs_at(i);
         let spec = LightSpec {
             stem: &stem,
             instrume: "cam",
-            filter: None,
+            filter: p.filter,
             binning: 1,
             width: W,
             height: H,
@@ -174,10 +233,10 @@ fn harness_with(
         let (id, _) = test_fixtures::add_light_with_field_fwhm(
             &fixture,
             &spec,
-            &render(field, *sub, i),
-            sub.fwhm,
+            &render(field, p.sub, i, p.shift),
+            p.sub.fwhm,
             600.0,
-            5.0,
+            p.noise,
             100 + i as u64,
         );
         ids.push(id);
@@ -196,7 +255,22 @@ fn harness_with(
         output.path().to_str().unwrap(),
     )
     .unwrap();
-    test_fixtures::add_master_dark_and_flat(&fixture, &ids, W, H);
+    // One master dark and flat per filter.
+    let mut filters: Vec<Option<&'static str>> = Vec::new();
+    for p in subs {
+        if !filters.contains(&p.filter) {
+            filters.push(p.filter);
+        }
+    }
+    for f in filters {
+        let of_filter: Vec<i64> = subs
+            .iter()
+            .zip(&ids)
+            .filter(|(p, _)| p.filter == f)
+            .map(|(_, &id)| id)
+            .collect();
+        test_fixtures::add_master_dark_and_flat(&fixture, &of_filter, W, H);
+    }
     let rc = new_context(&ctx, &cfg, &fixture, &working, &output);
     Harness {
         _tmp: tmp,
@@ -220,7 +294,6 @@ fn new_context(
 ) -> RunContext {
     let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
     let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-    assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
     let (run_id, group_ids) = seed_run_and_groups(
         &fixture.conn,
         fixture.set_id,
@@ -254,8 +327,10 @@ impl Harness {
     }
 
     fn entry(&self, id: i64) -> &MeasuredFrame {
-        self.rc.measured[&self.key()]
-            .iter()
+        self.rc
+            .measured
+            .values()
+            .flatten()
             .find(|e| e.frame.frame_id == id)
             .unwrap()
     }
@@ -525,12 +600,45 @@ fn a_group_without_an_anchor_falls_back_with_its_own_reason() {
 
 #[test]
 fn non_psf_weight_modes_are_untouched_by_the_reweigh() {
-    for mode in [WeightMode::Noise, WeightMode::Exposure] {
+    // Each mode with whether its sixth sub is under the 5 % floor at Measure time. The sixth sub has ten times the noise: its
+    // SNR is the group's lowest, so a formula that reads the SNR alone gives it no credit at all (weight 0); the Noise
+    // weight is a ratio of two noise estimates, which the noise level does not move, and under Exposure the six are equal.
+    let snr_only = FormulaWeights {
+        fwhm: 0.0,
+        eccentricity: 0.0,
+        snr: 20.0,
+        stars: 0.0,
+        pedestal: 0.0,
+    };
+    for (mode, floored_at_measure) in [
+        (WeightMode::Noise, false),
+        (WeightMode::Exposure, false),
+        (WeightMode::Formula, true),
+    ] {
         let mut cfg = StackingConfig::default();
         cfg.measurement.weight_mode = mode;
-        // The sharp subs of a plain field: the soft sub's bright extras would skew the Noise weights alone.
-        let mut h = harness(cfg, &field(32, 600.0), &MAIN_SUBS[..5]);
+        cfg.measurement.formula = snr_only;
+        // The sharp subs of a plain field (the soft sub's bright extras would skew the weights alone), and the noisy one.
+        let mut subs: Vec<Placed> = MAIN_SUBS[..5].iter().map(|&s| Placed::new(s)).collect();
+        subs.push(Placed::new(Sub { fwhm: 2.4, t: 1.0 }).noisy(50.0));
+        let mut h = harness_placed(cfg, &field(32, 600.0), &subs, None);
         h.to_measure();
+        // Stage 3 as it always was: the floor runs at Measure, with the fraction text, and a frame under it is never
+        // registered nor flagged.
+        let noisy = h.entry(h.ids[5]);
+        if floored_at_measure {
+            assert!(!noisy.included, "{mode:?}: {:?}", noisy.weight);
+            assert!(
+                noisy.reason.clone().unwrap().contains("below 0.05 of the group maximum"),
+                "{mode:?}: {:?}",
+                noisy.reason
+            );
+        } else {
+            assert!(noisy.included, "{mode:?}: {:?}", noisy.reason);
+        }
+        for &id in &h.ids {
+            assert!(!h.entry(id).measure_floored, "{mode:?}: only the deferring modes flag");
+        }
         let weights: Vec<_> = h
             .ids
             .iter()
@@ -543,6 +651,12 @@ fn non_psf_weight_modes_are_untouched_by_the_reweigh() {
         for (i, &id) in h.ids.iter().enumerate() {
             assert_eq!(h.entry(id).weight, weights[i], "{mode:?} sub {i}");
             assert_eq!(h.entry(id).included, included[i], "{mode:?} sub {i}");
+            assert!(!h.entry(id).measure_floored, "{mode:?} sub {i}");
+        }
+        if floored_at_measure {
+            let noisy = h.entry(h.ids[5]);
+            assert!(noisy.registration.is_none(), "{mode:?}: a frame out at Measure is not registered");
+            assert!(!noisy.included);
         }
         assert_eq!(h.metrics_payloads(), payloads, "{mode:?}");
         assert!(h.rc.common_stars.is_empty(), "{mode:?}");
@@ -778,27 +892,42 @@ fn a_map_scale_off_one_is_logged_per_member() {
     assert!(lines[0].contains("map_scale=1.2"), "{}", lines[0]);
 }
 
-/// PD-5: the floor `min_weight_fraction` runs on the common-set weight after Register, on frames that registered, with
-/// the stage-3 text. The registration reference (here the soft sub, the Measure-time pick) is not dropped by a floor
-/// that did not exist when it was picked: a pinned frame, or the grid's origin, stays in the stack.
+/// [`MAIN_SUBS`] with sub 3 brighter (t = 1.1), so that the floor test's cut separates two subs that differ by more than
+/// the noise of their renders: sub 1 (2.4 px, t = 1.0) and sub 3 are no longer the same picture.
+const FLOOR_SUBS: [Sub; 6] = [
+    Sub { fwhm: 2.2, t: 1.25 },
+    Sub { fwhm: 2.4, t: 1.0 },
+    Sub { fwhm: 2.5, t: 1.0 },
+    Sub { fwhm: 2.4, t: 1.1 },
+    Sub { fwhm: 2.6, t: 1.0 },
+    Sub { fwhm: 4.8, t: 1.0 },
+];
+
+/// PD-5 and PD-17: the floor `min_weight_fraction` runs on the common-set weight after Register, on frames that
+/// registered, with the stage-3 text. An Auto registration reference (here the soft sub, the Measure-time pick) is
+/// excluded like any other frame: it is the grid's origin, not pixels, and nothing after Register needs it in the stack.
 #[test]
-fn the_floor_drops_registered_frames_but_keeps_the_registration_reference() {
+fn the_floor_drops_registered_frames_and_an_auto_reference_under_it() {
     let mut cfg = StackingConfig::default();
     cfg.selection.min_weight_fraction = 0.6;
-    let mut h = harness(cfg, &main_field(), &MAIN_SUBS);
+    let mut h = harness(cfg, &main_field(), &FLOOR_SUBS);
     h.to_measure();
     assert!(h.ids.iter().all(|&id| h.entry(id).included), "nothing is floored at Measure");
 
     let log = h.to_register();
-    assert_eq!(h.rc.reference_frame_id, Some(h.ids[5]));
+    assert_eq!(h.rc.reference_frame_id, Some(h.ids[5]), "the reference does not move");
     let w = h.weights();
-    // After the reweigh: 1.0, 0.53, 0.50, 0.70, 0.46, 0.14 (the soft sub, the reference).
+    // After the reweigh: 1.0, 0.53, 0.50, ~0.85, 0.46, 0.14 (the soft sub, the reference). The cut at 0.6 has a clear
+    // gap on both sides.
+    let (kept, dropped) = (0.6 + 0.1, 0.6 - 0.05);
     for i in [0, 3] {
         assert!(h.entry(h.ids[i]).included, "sub {i}: {w:?}");
+        assert!(w[i].unwrap() > kept, "sub {i}: {w:?}");
     }
-    for i in [1, 2, 4] {
+    for i in [1, 2, 4, 5] {
         let e = h.entry(h.ids[i]);
         assert!(!e.included, "sub {i}: {w:?}");
+        assert!(w[i].unwrap() < dropped, "sub {i}: {w:?}");
         let reason = e.reason.clone().unwrap();
         assert!(reason.contains("below 0.60 of the group maximum"), "{reason}");
         assert!(matches!(
@@ -807,23 +936,78 @@ fn the_floor_drops_registered_frames_but_keeps_the_registration_reference() {
         ));
         assert!(e.weight.is_some(), "a floored frame keeps the weight it was floored on");
     }
-    let reference = h.entry(h.ids[5]);
-    assert!(reference.included, "{:?}", reference.reason);
-    assert!(reference.weight.as_ref().unwrap().normalized_mean < 0.6);
-    assert!(log.contains("weights: reference kept despite the weight floor"), "{log}");
+    assert!(!log.contains("kept despite the weight floor"), "{log}");
     assert_eq!(
         log.matches("frame excluded").count(),
-        3,
-        "three frames floored, the reference not: {log}"
+        4,
+        "four frames floored, the reference among them: {log}"
     );
+    assert!(h.rc.warnings.iter().all(|m| !m.contains("kept despite")), "{:?}", h.rc.warnings);
+    let rows = h.rows();
+    assert!(!rows[&h.ids[2]].included);
+    assert!(!rows[&h.ids[5]].included);
+    assert!(
+        rows[&h.ids[5]]
+            .exclusion_reason
+            .as_deref()
+            .unwrap()
+            .contains("below 0.60 of the group maximum")
+    );
+}
+
+/// PD-17: a MANUAL pin is stage 4's own rule (a pinned frame is forced in despite the selection), so the floor does not
+/// drop it; it is kept with a warn and a run warning. The other frames are floored as in the Auto twin.
+#[test]
+fn the_floor_keeps_a_manual_reference_under_it() {
+    let mut cfg = StackingConfig::default();
+    cfg.selection.min_weight_fraction = 0.6;
+    cfg.reference.mode = ReferenceMode::Manual;
+    let mut h = harness(cfg, &main_field(), &FLOOR_SUBS);
+    crate::registration::db::set_frame_set_reference(&h.fixture.conn, h.fixture.set_id, h.ids[5]).unwrap();
+    h.to_measure();
+    let log = h.to_register();
+    assert_eq!(h.rc.reference_frame_id, Some(h.ids[5]));
+    let w = h.weights();
+    for i in [0, 3] {
+        assert!(h.entry(h.ids[i]).included, "sub {i}: {w:?}");
+    }
+    for i in [1, 2, 4] {
+        assert!(!h.entry(h.ids[i]).included, "sub {i}: {w:?}");
+    }
+    let pin = h.entry(h.ids[5]);
+    assert!(pin.included, "{:?}", pin.reason);
+    assert!(pin.weight.as_ref().unwrap().normalized_mean < 0.6, "{w:?}");
+    assert!(log.contains("weights: manual reference kept despite the weight floor"), "{log}");
+    assert_eq!(log.matches("frame excluded").count(), 3, "{log}");
     assert!(h
         .rc
         .warnings
         .iter()
-        .any(|m| m.contains("reference frame") && m.contains("kept despite")));
-    let rows = h.rows();
-    assert!(!rows[&h.ids[2]].included);
-    assert!(rows[&h.ids[5]].included);
+        .any(|m| m.contains("manual reference frame") && m.contains("kept despite")));
+    assert!(h.rows()[&h.ids[5]].included);
+}
+
+/// PD-17, downstream: with the Auto reference excluded by the floor, the group still stacks - the output members are the
+/// included aligned frames, and the normalization anchor is its own pick - and the group's master says which frame was the
+/// grid's origin.
+#[test]
+fn a_group_stacks_without_its_excluded_auto_reference() {
+    let mut cfg = StackingConfig::default();
+    cfg.selection.min_weight_fraction = 0.2;
+    let mut h = harness(cfg, &main_field(), &FLOOR_SUBS);
+    h.to_measure();
+    h.to_register();
+    let reference = h.ids[5];
+    assert_eq!(h.rc.reference_frame_id, Some(reference));
+    assert!(!h.entry(reference).included, "its weight 0.14 is under the 0.20 floor");
+    assert!(h.ids[..5].iter().all(|&id| h.entry(id).included));
+
+    stage_output(&mut h.rc).unwrap();
+    let key = h.key();
+    let group = h.rc.summary.groups.iter().find(|g| g.key == key).expect("the group's summary");
+    let master = group.master_path.clone().expect("a master was written");
+    assert!(Path::new(&master).exists(), "{master}");
+    assert_eq!(group.reference_frame_id, Some(reference));
 }
 
 /// D1 review: the wiring bug (`MalformedTable`) is never worded as the sky's "under 20 common stars".
@@ -893,4 +1077,200 @@ fn a_plane_that_falls_back_leaves_its_siblings_reweighed() {
         assert!((w.normalized_mean - mean).abs() < 1e-12, "sub {i}");
         assert!(w.channels[0] != measure_time[i][0], "sub {i} plane 0 was reweighed");
     }
+}
+
+// ── PD-18: the reference pick sees the Measure-time floor ───────────────────────────────────────────────────────────
+
+/// A sub at a tenth of the flux of the sound ones: about 1 % of the group's PSF weight at Measure time, under the 5 % floor
+/// that the PSF modes defer.
+const FAINT: Sub = Sub { fwhm: 2.4, t: 0.1 };
+
+/// `weight_gate` on the frame's current weight: the premise of a "floored at Measure time" fixture, read before Register
+/// (and so before the reweigh overwrites the weight).
+fn fails_the_floor(h: &Harness, id: i64) -> bool {
+    weight_gate(h.entry(id).weight.as_ref().unwrap(), &h.cfg.selection).is_some()
+}
+
+fn pick_entry(id: i64, weight: f64, floored: bool) -> MeasuredFrame {
+    let mut e = super::tests::bare_measured_frame(id);
+    e.weight = Some(FrameWeight {
+        channels: vec![weight],
+        normalized: vec![weight],
+        mean: weight,
+        normalized_mean: weight,
+        missing: None,
+    });
+    e.measure_floored = floored;
+    e
+}
+
+/// The frame pick and the two-pass candidate list skip a frame under the Measure-time floor, and nothing else changes
+/// without the flag.
+#[test]
+fn a_frame_under_the_measure_time_floor_is_in_no_reference_pick() {
+    // A project whose only WCS candidates are under the floor holds no candidate; unflagged, the better one wins.
+    let entries = |floored: bool| {
+        vec![
+            pick_entry(1, 1.0, false),
+            pick_entry(2, 0.04, floored),
+            pick_entry(3, 0.03, floored),
+        ]
+    };
+    let rule = WcsRule {
+        candidates: [2, 3].into_iter().collect(),
+        with_wcs: [2, 3].into_iter().collect(),
+    };
+    assert_eq!(best_candidate_idx(&entries(false), Some(&rule)), Some(1));
+    assert_eq!(best_candidate_idx(&entries(true), Some(&rule)), None);
+    assert_eq!(best_candidate_idx(&entries(true), None), Some(0));
+    assert!(entries(false)[1].in_reference_pick());
+    assert!(!entries(true)[1].in_reference_pick());
+
+    // The two-pass candidates: neither the median nor the top-N sees the flagged frames, but the reference stays.
+    let pass = |idx: usize, frame_id: i64, dx: f64| PassResult {
+        idx,
+        frame_id,
+        outcome: Ok((0.0, (dx, 0.0))),
+    };
+    let passes = [pass(0, 10, 0.0), pass(1, 11, 1.0), pass(2, 12, 12.0), pass(3, 13, 12.0)];
+    let idxs = |c: Vec<TwoPassCandidate>| c.iter().map(|c| c.idx).collect::<Vec<_>>();
+    let measured = vec![
+        pick_entry(10, 1.0, false),
+        pick_entry(11, 0.9, false),
+        pick_entry(12, 0.03, true),
+        pick_entry(13, 0.02, true),
+    ];
+    assert_eq!(idxs(two_pass_candidates(Some(&measured), &passes, 10)), vec![0, 1]);
+    let unflagged: Vec<_> = measured.iter().map(|e| pick_entry(e.frame.frame_id, 0.5, false)).collect();
+    assert_eq!(idxs(two_pass_candidates(Some(&unflagged), &passes, 10)), vec![0, 1, 2, 3]);
+    let flagged_reference = vec![
+        pick_entry(10, 0.03, true),
+        pick_entry(11, 0.9, false),
+        pick_entry(12, 0.03, true),
+        pick_entry(13, 0.02, true),
+    ];
+    assert_eq!(
+        idxs(two_pass_candidates(Some(&flagged_reference), &passes, 10)),
+        vec![0, 1],
+        "the current reference is the identity every deviation is read against"
+    );
+}
+
+/// PD-18, door (a): group A is the larger only by its three faint subs. They are registered and reweighed, but the Auto
+/// pick counts A's three sound subs against B's five, so the reference stays in B, as it did when stage 3 floored them.
+#[test]
+fn the_reference_group_is_chosen_without_the_frames_under_the_measure_time_floor() {
+    let sound = Placed::new(Sub { fwhm: 2.4, t: 1.0 });
+    let subs = [
+        // Group A: three sound subs and three faint ones (six included at Measure time).
+        sound.through("A"),
+        sound.through("A"),
+        sound.through("A"),
+        Placed::new(FAINT).through("A"),
+        Placed::new(FAINT).through("A"),
+        Placed::new(FAINT).through("A"),
+        // Group B: five sound subs, the sharpest first.
+        Placed::new(Sub { fwhm: 2.2, t: 1.25 }).through("B"),
+        sound.through("B"),
+        sound.through("B"),
+        sound.through("B"),
+        sound.through("B"),
+    ];
+    let mut h = harness_placed(StackingConfig::default(), &field(32, 1500.0), &subs, None);
+    assert_eq!(h.rc.plan_groups.len(), 2);
+    h.to_measure();
+    let (a, b) = (h.ids[..6].to_vec(), h.ids[6..].to_vec());
+    for &id in &a[3..] {
+        assert!(fails_the_floor(&h, id), "premise: {id} is under the floor at Measure time");
+        assert!(h.entry(id).included, "stage 3 defers the floor");
+        assert!(h.entry(id).measure_floored);
+    }
+    for &id in a[..3].iter().chain(&b) {
+        assert!(!fails_the_floor(&h, id), "premise: {id} clears the floor");
+        assert!(!h.entry(id).measure_floored);
+    }
+    // What the Measure-time pick picks in B: its best weight.
+    let best_in_b = *b
+        .iter()
+        .max_by(|&&x, &&y| {
+            let w = |id: i64| h.entry(id).weight.as_ref().unwrap().normalized_mean;
+            w(x).total_cmp(&w(y))
+        })
+        .unwrap();
+
+    h.to_register();
+    assert_eq!(
+        h.rc.reference_frame_id,
+        Some(best_in_b),
+        "the reference is B's best, not A's (A has 6 included, B 5)"
+    );
+    assert_eq!(h.rc.summary.reference.switched_from, None);
+    // The faint subs are registered and reweighed all the same (PD-5).
+    for &id in &a[3..] {
+        let e = h.entry(id);
+        assert!(matches!(e.registration, Some(RegisteredFrameOutcome::Aligned { .. })), "{id}");
+        assert!(e.weight.is_some(), "{id}");
+        assert!(e.measurement.as_ref().unwrap().channels[0].common_tflux.is_some(), "{id}");
+    }
+}
+
+/// PD-18, doors (b) and (c): in a reference group under ten frames, five faint subs framed 12 px away from the three sound
+/// ones would take the two-pass median to their framing and enter the top-ten cut, and one of them would become the
+/// reference. Seen by the pick they are not: the reference is the Measure-time best and nothing switched.
+#[test]
+fn frames_under_the_measure_time_floor_do_not_move_the_two_pass_reference() {
+    let mut subs = vec![
+        Placed::new(Sub { fwhm: 2.2, t: 1.25 }),
+        Placed::new(Sub { fwhm: 2.4, t: 1.0 }).shifted(1.0, 0.0),
+        Placed::new(Sub { fwhm: 2.5, t: 1.0 }).shifted(0.0, 1.0),
+    ];
+    subs.extend((0..5).map(|_| Placed::new(FAINT).shifted(12.0, 0.0)));
+    let mut cfg = StackingConfig::default();
+    assert!(cfg.reference.two_pass, "the default must be on");
+    cfg.reference.mode = ReferenceMode::Auto;
+    let mut h = harness_placed(cfg, &field(32, 1500.0), &subs, None);
+    h.to_measure();
+    for &id in &h.ids[3..] {
+        assert!(fails_the_floor(&h, id), "premise: {id} is under the floor at Measure time");
+    }
+    let best = argmax(&h.weights());
+    assert_eq!(best, 0, "premise: the sharp, transparent sub is the Measure-time best: {:?}", h.weights());
+
+    h.to_register();
+    assert_eq!(h.rc.reference_frame_id, Some(h.ids[0]));
+    assert_eq!(h.rc.summary.reference.switched_from, None, "{:?}", h.rc.warnings);
+    assert!(h.rc.warnings.iter().all(|w| !w.contains("two-pass")), "{:?}", h.rc.warnings);
+    for &id in &h.ids[3..] {
+        let e = h.entry(id);
+        assert!(matches!(e.registration, Some(RegisteredFrameOutcome::Aligned { .. })), "{id}");
+        assert!(e.measure_floored, "{id}");
+    }
+}
+
+/// m5: a cancel lands between the members of one group's reweigh, not only between groups.
+#[test]
+fn a_cancel_lands_between_the_members_of_one_groups_reweigh() {
+    let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS);
+    h.to_measure();
+    h.to_register();
+    let key = h.key();
+    let cfg = h.cfg.clone();
+    let mut members = Vec::new();
+    for (idx, e) in h.rc.measured[&key].iter().enumerate() {
+        let frame = e.frame.clone();
+        let calib_hash = {
+            let conn = db(&h.rc.ctx).unwrap().conn();
+            h.rc.memo.calibration_hash_checked(&conn, &cfg, &frame).unwrap()
+        };
+        members.push(ReweighMember {
+            idx,
+            frame_id: frame.frame_id,
+            hash: group_measurement_hash(&h.rc, &cfg, &key, &calib_hash),
+        });
+    }
+    let entries = h.rc.measured[&key].as_slice();
+    assert!(plane_outcome(&h.rc, &key, entries, &members, 0, 0).is_ok());
+    h.rc.cancel.store(true, Ordering::SeqCst);
+    let err = plane_outcome(&h.rc, &key, entries, &members, 0, 0).err().expect("a cancelled run");
+    assert!(matches!(err, RunError::Cancelled), "{err:?}");
 }
