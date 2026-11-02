@@ -18,9 +18,15 @@
 //!       Every `align` object carries `regularity` (the reference grid) and `coverage` / `coverageCells` (the core
 //!       `coverage` over the restated final refit; null when a hint leads, and when the restated stages fail).
 //!   regfrag_probe mapgrid <in.jsonl> <out.jsonl>
-//!       in line:  {"key", "transformJson", "w", "h"}   (transformJson: a string or an object)
+//!       in line:  {"key", "transformJson" | "m", "w", "h"}
 //!       out line: {"key", "grid": [[x, y, fx, fy], ...]} on the 33 x 23 grid over (0..w, 0..h), rows first,
 //!       through `PixelMap::from_json` + `forward_exact`.
+//!   regfrag_probe mappoints <in.jsonl> <out.jsonl>
+//!       in line:  {"key", "transformJson" | "m", "points": [[x, y], ...]}
+//!       out line: {"key", "points": [[x, y, fx, fy], ...]}, the same evaluator at the given points.
+//!       Both arms take the map either as `transformJson` (a stored `PixelMap`, a string or an object: its linear
+//!       part, its inverse and its distortion, a TPS included) or as `m`, a bare 9-number row-major projective
+//!       matrix (an `align` result's `m`), for which the map is built here: `PixelMap::linear`, no distortion.
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -308,32 +314,65 @@ fn restated_record(res: &Result<Final, AlignError>, gate: (f64, f64)) -> serde_j
            "coverage": fin.coverage.0, "coverageCells": fin.coverage.1})
 }
 
-/// `mapgrid`: each line `{"key", "transformJson", "w", "h"}` -> `{"key", "grid": [[x, y, fx, fy], ...]}` on the
-/// 33 x 23 grid over (0..w, 0..h), rows first.
-fn mapgrid(input: &str, output: &str) {
+/// The map of one `mapgrid` / `mappoints` line (`n` is its 1-based line number): `transformJson` through
+/// `PixelMap::from_json`, or a bare 9-number `m` as a distortion-free projective `PixelMap::linear` (the inverse is
+/// built here, never read from the line).
+fn line_map(v: &serde_json::Value, n: usize) -> PixelMap {
+    if let Some(m) = v.get("m").filter(|m| !m.is_null()) {
+        let f: Vec<f64> = m
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+            .unwrap_or_default();
+        if f.len() != 9 || m.as_array().map(|a| a.len()) != Some(9) {
+            die(format!("line {n}: m needs nine numbers"));
+        }
+        let lin = Linear::from_flat(
+            LinearKind::Homography,
+            [f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]],
+        );
+        return PixelMap::linear(lin).unwrap_or_else(|| die(format!("line {n}: m is singular")));
+    }
+    let tj = match v.get("transformJson") {
+        Some(serde_json::Value::String(t)) => t.clone(),
+        Some(o) if !o.is_null() => o.to_string(),
+        _ => die(format!("line {n}: no transformJson and no m")),
+    };
+    PixelMap::from_json(&tj).unwrap_or_else(|e| die(format!("line {n}: transformJson: {e}")))
+}
+
+/// Runs `each` over the non-empty lines of `input` (parsed, with the line's number), writing what it returns as one
+/// JSON line to `output`.
+fn each_line(
+    input: &str,
+    output: &str,
+    mut each: impl FnMut(&serde_json::Value, usize) -> serde_json::Value,
+) {
     let f = std::fs::File::open(input).unwrap_or_else(|e| die(format!("{input}: {e}")));
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(output).unwrap_or_else(|e| die(format!("{output}: {e}"))),
     );
-    for (n, line) in std::io::BufReader::new(f).lines().enumerate() {
+    for (i, line) in std::io::BufReader::new(f).lines().enumerate() {
         let line = line.unwrap_or_else(|e| die(e));
         if line.trim().is_empty() {
             continue;
         }
         let v: serde_json::Value =
-            serde_json::from_str(&line).unwrap_or_else(|e| die(format!("line {}: {e}", n + 1)));
+            serde_json::from_str(&line).unwrap_or_else(|e| die(format!("line {}: {e}", i + 1)));
+        writeln!(out, "{}", each(&v, i + 1)).unwrap();
+    }
+    out.flush().unwrap();
+}
+
+/// `mapgrid`: each line `{"key", "transformJson" | "m", "w", "h"}` -> `{"key", "grid": [[x, y, fx, fy], ...]}` on
+/// the 33 x 23 grid over (0..w, 0..h), rows first.
+fn mapgrid(input: &str, output: &str) {
+    each_line(input, output, |v, n| {
         let key = v.get("key").cloned().unwrap_or(serde_json::Value::Null);
-        let tj = match v.get("transformJson") {
-            Some(serde_json::Value::String(t)) => t.clone(),
-            Some(o) if !o.is_null() => o.to_string(),
-            _ => die(format!("line {}: no transformJson", n + 1)),
-        };
-        let map = PixelMap::from_json(&tj)
-            .unwrap_or_else(|e| die(format!("line {}: transformJson: {e}", n + 1)));
+        let map = line_map(v, n);
         let dim = |k: &str| {
             v.get(k)
                 .and_then(|x| x.as_f64())
-                .unwrap_or_else(|| die(format!("line {}: no {k}", n + 1)))
+                .unwrap_or_else(|| die(format!("line {n}: no {k}")))
         };
         let (w, h) = (dim("w"), dim("h"));
         let mut grid = Vec::with_capacity(33 * 23);
@@ -344,9 +383,32 @@ fn mapgrid(input: &str, output: &str) {
                 grid.push([x, y, fx, fy]);
             }
         }
-        writeln!(out, "{}", json!({"key": key, "grid": grid})).unwrap();
-    }
-    out.flush().unwrap();
+        json!({"key": key, "grid": grid})
+    });
+}
+
+/// `mappoints`: each line `{"key", "transformJson" | "m", "points": [[x, y], ...]}` -> `{"key", "points":
+/// [[x, y, fx, fy], ...]}`, the map's `forward_exact` at each point.
+fn mappoints(input: &str, output: &str) {
+    each_line(input, output, |v, n| {
+        let key = v.get("key").cloned().unwrap_or(serde_json::Value::Null);
+        let map = line_map(v, n);
+        let pts = v
+            .get("points")
+            .and_then(|p| p.as_array())
+            .unwrap_or_else(|| die(format!("line {n}: no points")));
+        let mut out = Vec::with_capacity(pts.len());
+        for (k, p) in pts.iter().enumerate() {
+            let xy = p
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .and_then(|a| Some((a[0].as_f64()?, a[1].as_f64()?)))
+                .unwrap_or_else(|| die(format!("line {n}: point {k} is not [x, y]")));
+            let (fx, fy) = map.forward_exact(xy.0, xy.1);
+            out.push([xy.0, xy.1, fx, fy]);
+        }
+        json!({"key": key, "points": out})
+    });
 }
 
 fn main() {
@@ -551,6 +613,9 @@ fn main() {
             }
         }
         Some("mapgrid") => mapgrid(&a[1], &a[2]),
-        _ => die("usage: detect|fits|fitsall|measure|batch [--seed plain|robust]|mapgrid …"),
+        Some("mappoints") => mappoints(&a[1], &a[2]),
+        _ => die(
+            "usage: detect|fits|fitsall|measure|batch [--seed plain|robust]|mapgrid|mappoints …",
+        ),
     }
 }
