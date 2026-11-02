@@ -816,9 +816,12 @@ mod common {
     }
 
     impl Member {
-        fn plane(&self, p: usize) -> MemberPlane<'_> {
+        /// Plane `p` of the member as the module reads it. `planes` is the GROUP's plane count (`run.rs`'s `nch`: the weight's
+        /// rule and the candidates' flux fit follow it, PD-32), not this member's: a member that lacks a plane is the dump's
+        /// gap, and the module is told the count the run would tell it (D2d review m2).
+        fn plane(&self, p: usize, planes: usize) -> MemberPlane<'_> {
             let d = &self.planes[p];
-            MemberPlane { fits: &d.fits, map: &self.map, fwhm_px: d.fwhm, noise: d.noise, c_stand_in: d.c_stand_in, planes: self.planes.len() }
+            MemberPlane { fits: &d.fits, map: &self.map, fwhm_px: d.fwhm, noise: d.noise, c_stand_in: d.c_stand_in, planes }
         }
     }
 
@@ -905,7 +908,7 @@ mod common {
         let anchor = common_set::pick_anchor(&fwhm, &unsat, &ids)?;
         let mut out = Vec::new();
         for p in 0..planes {
-            let mut cands = common_set::candidates(&members[anchor].plane(p));
+            let mut cands = common_set::candidates(&members[anchor].plane(p, planes));
             if proxy_floor > CORRECTION_MIN_SNR {
                 let a = &members[anchor];
                 let d = &a.planes[p];
@@ -919,7 +922,7 @@ mod common {
                     .collect();
                 cands.retain(|c| proxy.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&v| v >= proxy_floor));
             }
-            let usable: Vec<Vec<Option<Usable>>> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p))).collect();
+            let usable: Vec<Vec<Option<Usable>>> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p, planes))).collect();
             let (weights, positions, too_few, paired) = match common_set::common_flux(&cands, &usable, anchor, planes) {
                 CommonOutcome::Measured { positions, per_member } => (
                     members
@@ -1050,7 +1053,8 @@ mod common {
 
     /// The plane's weights under D1w's model x `c` ratios (the weight before D2b): the anchor's whole-set sums times each member's model
     /// ratios, through the same `psf_signal_weight`; a member with no pair reads 0 flux as the module's does. Without a set, the product's
-    /// own (Measure-time) weights.
+    /// own (Measure-time) weights. The ratios are taken on the product's set, which the aperture sum's own conditions filter (D2b), so
+    /// this equals D2's weight only where that set did not change (D2b review n1).
     fn model_weights(members: &[Member], p: usize, pr: &PlaneResult, anchor: usize, ratios: &[[f64; 4]]) -> Vec<f64> {
         if pr.set_idx.is_empty() {
             return pr.weights.clone();

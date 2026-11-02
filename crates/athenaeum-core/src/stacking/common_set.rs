@@ -2121,6 +2121,329 @@ mod tests {
         }
     }
 
+    /// [`run_planes`] with a registration map per member: group pixel = `maps[k]` of member k's pixel.
+    fn run_planes_mapped(
+        members: &[(Vec<StarFit>, f64, f64)],
+        maps: &[PixelMap],
+        anchor: usize,
+        image_planes: usize,
+    ) -> (Vec<Candidate>, Vec<Vec<Option<Usable>>>, CommonOutcome) {
+        let planes: Vec<MemberPlane<'_>> = members
+            .iter()
+            .zip(maps)
+            .map(|((fits, fwhm, c), map)| MemberPlane {
+                c_stand_in: *c,
+                planes: image_planes,
+                ..plane(fits, map, *fwhm)
+            })
+            .collect();
+        let cands = candidates(&planes[anchor]);
+        let usable: Vec<_> = planes.iter().map(|p| match_member(&cands, p)).collect();
+        let out = common_flux(&cands, &usable, anchor, image_planes);
+        (cands, usable, out)
+    }
+
+    /// [`run_d2`] with a registration map per member.
+    fn run_d2_mapped(
+        members: &[(Vec<StarFit>, f64, f64)],
+        maps: &[PixelMap],
+        anchor: usize,
+    ) -> (
+        Vec<d2::Candidate>,
+        Vec<Vec<Option<d2::Usable>>>,
+        d2::Outcome,
+    ) {
+        let planes: Vec<MemberPlane<'_>> = members
+            .iter()
+            .zip(maps)
+            .map(|((fits, fwhm, c), map)| MemberPlane {
+                c_stand_in: *c,
+                ..plane(fits, map, *fwhm)
+            })
+            .collect();
+        let cands = d2::candidates(&planes[anchor]);
+        let usable: Vec<_> = planes.iter().map(|p| d2::match_member(&cands, p)).collect();
+        let out = d2::common_flux(&cands, &usable, anchor);
+        (cands, usable, out)
+    }
+
+    /// The current pipeline's candidates, match table and outcome against d2's, bit for bit; the outcome is a set on both
+    /// sides or "too few" on both with the same count.
+    fn assert_reads_d2(
+        label: &str,
+        got: &(Vec<Candidate>, Vec<Vec<Option<Usable>>>, CommonOutcome),
+        old: &(
+            Vec<d2::Candidate>,
+            Vec<Vec<Option<d2::Usable>>>,
+            d2::Outcome,
+        ),
+    ) {
+        let (cands, usable, out) = got;
+        let (old_cands, old_usable, old_out) = old;
+        assert_eq!(cands.len(), old_cands.len(), "{label}: candidates");
+        for (c, o) in cands.iter().zip(old_cands) {
+            assert_eq!(
+                [c.x, c.y, c.signal, c.mean, c.anchor_fwhm_px].map(f64::to_bits),
+                [o.x, o.y, o.signal, o.mean, o.anchor_fwhm_px].map(f64::to_bits),
+                "{label}: a candidate"
+            );
+        }
+        assert_eq!(usable.len(), old_usable.len(), "{label}: members");
+        for (k, (row, old_row)) in usable.iter().zip(old_usable).enumerate() {
+            assert_eq!(row.len(), old_row.len(), "{label}: member {k}");
+            for (j, (u, o)) in row.iter().zip(old_row).enumerate() {
+                let pair = |a: Option<(f64, f64)>| a.map(|(s, m)| (s.to_bits(), m.to_bits()));
+                assert_eq!(
+                    pair(u.map(|u| (u.signal, u.mean))),
+                    pair(o.map(|o| (o.signal, o.mean))),
+                    "{label}: member {k}, candidate {j}"
+                );
+            }
+        }
+        match (out, old_out) {
+            (
+                CommonOutcome::Measured {
+                    positions,
+                    per_member,
+                },
+                d2::Outcome::Measured {
+                    positions: old_positions,
+                    per_member: old_per,
+                },
+            ) => {
+                assert_eq!(positions.len(), old_positions.len(), "{label}: the set");
+                for (p, o) in positions.iter().zip(old_positions) {
+                    assert_eq!(
+                        (p.0.to_bits(), p.1.to_bits()),
+                        (o.0.to_bits(), o.1.to_bits()),
+                        "{label}: a set star"
+                    );
+                }
+                assert_eq!(per_member.len(), old_per.len(), "{label}: flux rows");
+                for (k, (p, o)) in per_member.iter().zip(old_per).enumerate() {
+                    assert_eq!(
+                        (p.tflux.to_bits(), p.tmean_flux.to_bits(), p.paired),
+                        (o.tflux.to_bits(), o.tmean_flux.to_bits(), o.paired),
+                        "{label}: member {k}"
+                    );
+                }
+            }
+            (
+                CommonOutcome::TooFewStars { stars },
+                d2::Outcome::TooFewStars { stars: old_stars },
+            ) => {
+                assert_eq!(stars, old_stars, "{label}: too few");
+            }
+            other => panic!("{label}: the outcomes differ: {other:?}"),
+        }
+    }
+
+    /// A similarity (rotation by `theta`, then translation) as a registration map.
+    fn similarity(theta: f64, tx: f64, ty: f64) -> PixelMap {
+        let (s, c) = theta.sin_cos();
+        PixelMap::linear(Linear {
+            kind: LinearKind::Similarity,
+            m: [[c, -s, tx], [s, c, ty], [0.0, 0.0, 1.0]],
+        })
+        .expect("a similarity has an inverse")
+    }
+
+    /// Member `k`'s registration map: none of them the identity, each its own.
+    fn member_map(k: usize) -> PixelMap {
+        similarity(
+            0.0005 * k as f64 - 0.004,
+            12.5 - 3.0 * (k % 5) as f64,
+            -7.25 + 2.5 * (k % 3) as f64,
+        )
+    }
+
+    /// `fits` (placed in group pixels, as [`fits_of`] places them) as the member holds them in its own pixels, behind `map`.
+    fn in_own_pixels(mut fits: Vec<StarFit>, map: &PixelMap) -> Vec<StarFit> {
+        for f in &mut fits {
+            let (x, y) = map.inverse_exact(f.x, f.y);
+            f.x = x;
+            f.y = y;
+        }
+        fits
+    }
+
+    /// Where the group of [`partial_pair_group`] puts its two stars the anchor has a close companion for, in group pixels.
+    const ISOLATION_STARS: [usize; 2] = [40, 41];
+
+    /// 21 members of a 150-star sky, every one behind its own non-identity map and the anchor too, with what the all-pairs
+    /// fixture of `s_unlike_the_model_group` never reaches (D2d review m1). 21 members, so that the 0.9 presence rule
+    /// lets TWO of them lack a star (19 / 21), where eight members needed every one:
+    /// - member 5 lost the fits of stars 20..28 (a cloud): its pairs are partial and its ratio reads `sig_a` over its own
+    ///   stars, not over the set;
+    /// - member 9 has every star clipped: it is usable at no candidate, `paired == 0`;
+    /// - the anchor has a fit 5 px from each of [`ISOLATION_STARS`], inside 6 F: those two stars are no candidate;
+    /// - stars clip by seeing (`clip` 20), so the sharp members lose their bright ones, and members stand on their own `c`.
+    fn partial_pair_group(seed: u64) -> (Vec<(Vec<StarFit>, f64, f64)>, Vec<PixelMap>) {
+        let world = sky(150, seed);
+        let maps: Vec<PixelMap> = (0..21).map(member_map).collect();
+        let members = (0..21)
+            .map(|k| {
+                let f = 2.0 + 0.05 * k as f64;
+                let shot = Shot {
+                    clip: 20.0,
+                    jitter: 0.2,
+                    seed: seed + k as u64,
+                    ..Shot::new(1.0 - 0.02 * k as f64, f)
+                };
+                let mut fits = fits_of(&world, &shot);
+                match k {
+                    0 => {
+                        for &i in &ISOLATION_STARS {
+                            let s = world[i];
+                            fits.push(fit_at(
+                                s.x + 5.0,
+                                s.y,
+                                shot.t * s.flux,
+                                shot.area(),
+                                f,
+                                StarFlags::default(),
+                            ));
+                        }
+                    }
+                    5 => {
+                        let mut i = 0;
+                        fits.retain(|_| {
+                            i += 1;
+                            !(21..=28).contains(&i)
+                        });
+                    }
+                    9 => fits.iter_mut().for_each(|x| x.flags = StarFlags::SATURATED),
+                    _ => {}
+                }
+                let c = match k {
+                    3 => 1.15,
+                    7 => 0.9,
+                    _ => 1.0,
+                };
+                (in_own_pixels(fits, &maps[k]), f, c)
+            })
+            .collect();
+        (members, maps)
+    }
+
+    /// d2d review m1, a pin (not a RED: the code is d2's verbatim for these plane counts, so it passes on the current code):
+    /// the partial-pair ratio, a member with no usable star (`paired == 0`), the isolation rejects and non-identity maps,
+    /// none of which the all-pairs, identity-map group of `a_group_that_is_not_three_planes_reads_what_d2_read_bit_for_bit`
+    /// reaches, read exactly what 971606c8 read on one, two and four planes.
+    #[test]
+    fn partial_pairs_an_unusable_member_isolation_and_maps_read_what_d2_read() {
+        for seed in [61, 62, 63] {
+            let (members, maps) = partial_pair_group(seed);
+            let old = run_d2_mapped(&members, &maps, 0);
+            for planes in [1, 2, 4] {
+                let got = run_planes_mapped(&members, &maps, 0, planes);
+                assert_reads_d2(&format!("seed {seed}, {planes} planes"), &got, &old);
+            }
+
+            // The fixture reaches what it is for.
+            let (cands, _usable, out) = run_planes_mapped(&members, &maps, 0, 1);
+            let (positions, per) = measured(&out);
+            assert!(
+                positions.len() > 60,
+                "seed {seed}: a set of {}",
+                positions.len()
+            );
+            assert_eq!(
+                (
+                    per[9].paired,
+                    per[9].tflux.to_bits(),
+                    per[9].tmean_flux.to_bits()
+                ),
+                (0, 0f64.to_bits(), 0f64.to_bits()),
+                "seed {seed}: the clipped member pairs nothing and reads 0"
+            );
+            assert!(
+                per[5].paired > 0 && per[5].paired < positions.len(),
+                "seed {seed}: the cloud member pairs {} of {}",
+                per[5].paired,
+                positions.len()
+            );
+            assert!(positions.len() - per[5].paired <= 8, "seed {seed}");
+            assert!(
+                per.iter()
+                    .enumerate()
+                    .all(|(k, p)| k == 5 || k == 9 || p.paired == positions.len()),
+                "seed {seed}: every other member pairs the whole set"
+            );
+            // The isolation: with the companions the two stars are no candidate, without them both are.
+            let world = sky(150, seed);
+            let near = |cands: &[Candidate], i: usize| {
+                cands
+                    .iter()
+                    .any(|c| (c.x - world[i].x).hypot(c.y - world[i].y) < 3.0)
+            };
+            let mut bare = members.clone();
+            bare[0].0.truncate(150);
+            let (bare_cands, _, _) = run_planes_mapped(&bare, &maps, 0, 1);
+            for &i in &ISOLATION_STARS {
+                assert!(
+                    !near(&cands, i),
+                    "seed {seed}: star {i} has a companion within 6 F"
+                );
+                assert!(
+                    near(&bare_cands, i),
+                    "seed {seed}: premise: star {i} is a candidate without it"
+                );
+            }
+        }
+    }
+
+    /// 8 members of a 30-star sky behind non-identity maps, member 4 without the fits of stars 0..12: those twelve are in
+    /// 7 of 8 members (0.875, under the 0.9 presence rule), so the set is 18 stars.
+    fn too_few_group(seed: u64) -> (Vec<(Vec<StarFit>, f64, f64)>, Vec<PixelMap>) {
+        let world = sky(30, seed);
+        let maps: Vec<PixelMap> = (0..8).map(member_map).collect();
+        let members = (0..8)
+            .map(|k| {
+                let f = 2.0 + 0.2 * k as f64;
+                let shot = Shot {
+                    jitter: 0.2,
+                    seed: seed + k as u64,
+                    ..Shot::new(1.0 - 0.05 * k as f64, f)
+                };
+                let mut fits = fits_of(&world, &shot);
+                if k == 4 {
+                    let mut i = 0;
+                    fits.retain(|_| {
+                        i += 1;
+                        i > 12
+                    });
+                }
+                (in_own_pixels(fits, &maps[k]), f, 1.0)
+            })
+            .collect();
+        (members, maps)
+    }
+
+    /// d2d review m1, a pin: `TooFewStars` and its count read what d2 read on one, two and four planes, and on three the same
+    /// count (the fixture's `S` is the model flux, so the set rules agree).
+    #[test]
+    fn a_set_under_twenty_stars_reads_what_d2_read() {
+        for seed in [64, 65] {
+            let (members, maps) = too_few_group(seed);
+            let old = run_d2_mapped(&members, &maps, 0);
+            assert!(
+                matches!(old.2, d2::Outcome::TooFewStars { stars: 18 }),
+                "seed {seed}: premise {:?}",
+                old.2
+            );
+            for planes in [1, 2, 4] {
+                let got = run_planes_mapped(&members, &maps, 0, planes);
+                assert_reads_d2(&format!("seed {seed}, {planes} planes"), &got, &old);
+            }
+            let (_c, _u, three) = run_planes_mapped(&members, &maps, 0, 3);
+            assert!(
+                matches!(three, CommonOutcome::TooFewStars { stars: 18 }),
+                "seed {seed}: {three:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_mono_group_keeps_the_fits_the_aperture_sum_would_drop() {
         // d2's usable rule is a finite positive `signal` and `area`: a fit with no S (no ring sky) is a candidate and a
