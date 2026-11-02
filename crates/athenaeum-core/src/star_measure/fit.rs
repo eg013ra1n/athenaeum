@@ -1760,11 +1760,12 @@ pub const BLEND_SEED_GUARD: f64 = 0.5;
 /// [`RefusalReason::Blend`] when another seed of the plane's detection lies inside its half-maximum ellipse (centre
 /// `(x, y)`, semi-axes `fwhm_x / 2`, `fwhm_y / 2` turned by `theta`, [`inside_half_max`]) and at least
 /// [`BLEND_SEED_GUARD`]` · field_fwhm` from the fit's own seed. The plane's seeds are `neighbours.seeds` when the fit
-/// call was handed a subset of them (the budget's candidates, the only caller that sets the flag since R-PC-10b: every
+/// call was handed a subset of them (the budget's candidates, a `Brightest` prefix, a population's fitted seeds: every
 /// detected seed, fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
 /// fit's own seed (`of_fit[i]`, else `i`) never counts. A refused fit leaves `accepted` (the order of the rest is
 /// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set. Runs only when
-/// the call's [`Correction::blend_refusal`] is set (the Analysis budget path, R-PC-10b).
+/// the call's [`Correction::blend_refusal`] is set: every `measure_plane` path (the Analysis budget path since Plan C
+/// R-PC-10b, the stacking Measure's since Plan D D3, PD-10); never LN's refits.
 fn refuse_blends(
     accepted: &mut Vec<(usize, StarFit)>,
     outcomes: &mut [Outcome],
@@ -1947,8 +1948,9 @@ pub(super) struct Correction<'a> {
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
-    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b): `true` only on the Analysis budget path
-    /// ([`super::Mode::Budget`]); the stacking Measure, LN's refits and registration leave it `false` and fit as at
+    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b, Plan D D3): `true` on every `measure_plane` path (the
+    /// Analysis budget path, and the stacking Measure's `Mode::All` / `Brightest` / `Population`: the subs, the master and
+    /// the SNR-gain crops); `false` for LN's refits and every [`super::fit_stars_at`] caller, which fit as at
     /// `MEASURE_VERSION` 5.
     pub(super) blend_refusal: bool,
 }
@@ -2317,9 +2319,10 @@ fn fit_at_width(
             traces.push(trace);
         }
     }
-    // Plan C R-PC-10 / R-PC-10b: on the Analysis path (`correction.blend_refusal`), a fit with another seed of the
-    // plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit the plane
-    // verdicts refused never reaches it). The stacking, LN and registration fits do not run the rule.
+    // Plan C R-PC-10 / R-PC-10b, Plan D D3: on a `measure_plane` path (`correction.blend_refusal`), a fit with another
+    // seed of the plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit
+    // the plane verdicts refused never reaches it). LN's refits do not run the rule; registration reads Measure's
+    // kept fits, so it inherits it.
     refuse_blends(
         &mut accepted,
         &mut outcomes,
@@ -4603,7 +4606,8 @@ mod tests {
             assert_eq!(on.trail_share, off.trail_share);
         }
 
-        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule. The
+        /// R-PC-10b: the default `Correction` (LN's refits and every `fit_stars_at` caller; the `measure_plane` paths set
+        /// the flag themselves since Plan D D3) never runs the rule. The
         /// plane is the second arm of `a_faint_companion_inside_the_contour_refuses_the_bright_star_blend`'s kind: a
         /// faint companion (0.2 of the bright amplitude) 1.0 F out, whose seed lies inside the bright fit's contour.
         /// The default keeps both fits; the same call with the flag set refuses the companion's `Blend`.

@@ -3760,6 +3760,53 @@ mod tests {
         );
     }
 
+    /// Plan D D3 (PD-10): the master's own measurement refuses a resolved blend. The master is measured as
+    /// [`integrate_group`] builds it (`fit_stars: None`, the module's `Mode::All`, `PixelNoise::Mixed`): thirty set
+    /// stars and a pair 1.7 F apart (amplitudes 0.25 and 0.15), both seeded by the detector. One fit of the pair is
+    /// refused `Blend`, the other is kept, and every set star is still fitted.
+    #[test]
+    fn the_master_measurement_refuses_a_resolved_blend() {
+        let sigma = 1.8;
+        let sep = 1.7 * sigma * 2.0 * (2.0f64 * std::f64::consts::LN_2).sqrt();
+        let mut stars: Vec<(f64, f64, f64)> = gain_set().iter().map(|&(x, y)| (x, y, 0.25)).collect();
+        stars.push((72.0, 122.0, 0.25));
+        stars.push((72.0 + sep, 122.0, 0.15));
+        let mut data = gaussian_field(GAIN_W, GAIN_H, &stars, sigma, 0.08);
+        add_noise(&mut data, 0.01, 4244);
+        let measure = MeasureOptions {
+            fit_stars: Some(5),
+            ..MeasureOptions::default()
+        };
+        // The master's options, as `integrate_group` builds them.
+        let master_measure = MeasureOptions {
+            fit_stars: None,
+            ..measure.clone()
+        };
+        let m = measure_planes_diagnosed(
+            1,
+            GAIN_W,
+            GAIN_H,
+            &master_measure,
+            None,
+            SeedOverride::Fast,
+            false,
+            crate::star_measure::PixelNoise::Mixed,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(data.as_slice())),
+        )
+        .unwrap();
+        let (ch, fits) = (&m[0].measurement.channel, &m[0].measurement.fits);
+        assert_eq!(ch.stars_detected, 32, "premise: the detector seeds both stars of the pair");
+        assert_eq!(ch.refused_by_reason.get("blend"), Some(&1), "{:?}", ch.refused_by_reason);
+        assert_eq!(fits.len(), 31, "one star of the pair is kept: {:?}", ch.refused_by_reason);
+        for (x, y) in gain_set() {
+            assert!(
+                fits.iter().any(|f| (f.x - x).abs() < 1.0 && (f.y - y).abs() < 1.0),
+                "set star ({x}, {y}) is fitted"
+            );
+        }
+    }
+
     /// Plan D D2d (PD-32): the paired gain and the master's common PSF SNR read the set the weight was taken on. A fit carrying
     /// `SIBLING_POINT` (extended, rescued by a point-like seed of another plane) is in the set of a three-plane image and not
     /// in a one- or two-plane image's, the rule the module had before D2c; `common_psf_snr` hands the image's plane count down.

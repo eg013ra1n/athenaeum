@@ -352,8 +352,9 @@ mod tests {
 
     /// R-PC-10b: the green-site Analysis path (`Mode::Budget`, through `measure_plane`) keeps the Blend refusal. A
     /// resolved pair (1.75 F apart, both seeded on the green sum) has a fit refused `Blend` on every layout, and
-    /// neither star of it is an accepted fit; the same mosaic under `Mode::All` (the stacking Measure's mode) refuses
-    /// none as `Blend`. (The pair's other fit is refused `RegionTooSmall`: the merged blob outgrows the region.)
+    /// neither star of it is an accepted fit. Plan D D3 (PD-10): the same mosaic under `Mode::All` (the stacking
+    /// Measure's mode) is refused the same way; before D3 it refused none as `Blend`. (The pair's other fit is refused
+    /// `RegionTooSmall`: the merged blob outgrows the region.)
     #[test]
     fn the_green_site_analysis_path_still_refuses_a_resolved_pair_blend() {
         use crate::star_measure::RefusalReason;
@@ -395,7 +396,8 @@ mod tests {
                 },
                 None,
             );
-            assert_eq!(blends(&all), 0, "{p:?}: {:?}", all.refused);
+            assert!(blends(&all) >= 1, "{p:?}: {:?}", all.refused);
+            assert_eq!(near_pair(&all), 0, "{p:?}: {:?}", all.stars);
         }
     }
 

@@ -54,9 +54,10 @@ pub enum RefusalReason {
     /// Another seed of the plane's detection (any seed the detector produced or the caller gave, fitted or not, other
     /// than the fit's own) lies inside the fit's half-maximum ellipse and at least [`super::fit::BLEND_SEED_GUARD`]
     /// `· F_field` from the fit's own seed: the fit is two stars (Plan C R-PC-10). Both fits of a merged pair are
-    /// refused. Not a containment refusal, so not in the trailed share. Analysis path only (`Mode::Budget`, R-PC-10b): the
-    /// stacking Measure, LN's refits and registration never produce it. Declared last so every earlier reason keeps its
-    /// `Ord` position.
+    /// refused. Not a containment refusal, so not in the trailed share. Every `measure_plane` path produces it (the Analysis
+    /// path's `Mode::Budget` since Plan C R-PC-10b, the stacking Measure's `Mode::All` / `Brightest` / `Population` since
+    /// Plan D D3, PD-10); LN's refits never do, and registration reads Measure's kept fits. Declared last so every earlier
+    /// reason keeps its `Ord` position.
     Blend,
 }
 
