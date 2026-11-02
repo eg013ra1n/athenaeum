@@ -3,8 +3,10 @@
 //!
 //! Why: a frame's PSF-family weight reads its total starlight (`TFlux`, `TMeanFlux`). That total follows the seeing:
 //! clipped stars carry most of it and are extrapolated from their wings, and stars stop clipping as the seeing
-//! softens. The flux of the SAME unclipped stars in every frame follows the sky's transparency only, and no refusal of
-//! a clipped or blended star can move it.
+//! softens. The flux of the SAME unclipped stars in every frame follows the sky's transparency only. No refusal of a
+//! clipped star can move it. A blended star's refusal (Plan D D3) leaves the `.athf`, so it would also leave the anchor's
+//! isolation test; Measure marks the kept fits within that test's radius of it (`StarFlags::BLEND_NEIGHBOUR`, PD-36) and
+//! [`candidates`] reads the mark as "not isolated", so the set is the one the unrefused fits gave.
 //!
 //! Pure logic, no I/O and no weights. The caller (`run.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
 //! time and hands the module their [`MemberPlane`]. On a THREE-plane image (PD-32: [`APERTURE_SUM_PLANES`], the gate of the
@@ -201,7 +203,9 @@ fn usable_ap(s: f64) -> bool {
 
 /// The anchor's candidate stars in group coordinates: a [`flux_fit`] (on a three-plane image `in_common_set()`: not clipped,
 /// not extended unless rescued by a point-like sibling seed; on any other count `in_statistic()`), finite positive `signal`
-/// and `area`, no other anchor fit (of any flag) within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, and the
+/// and `area`, no other anchor fit (of any flag) within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, no
+/// [`crate::star_measure::StarFlags::BLEND_NEIGHBOUR`] mark (on every plane count: a fit the blend refusal removed from the
+/// list lay within that same radius, and Measure set the mark from the same width, PD-36), and the
 /// background-limited aperture SNR `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no SNR;
 /// the screen stays on the model flux, as before D2b), and, on a three-plane image only, since its ratios divide by it, a
 /// finite aperture sum ([`aperture_sum`]: one at or under the sky is a candidate too). On any other count the candidate carries
@@ -240,8 +244,9 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
         if by_aperture && ap.is_none() {
             continue;
         }
-        // The fit itself is always within the radius: isolated means it is the only one.
-        if tree.within(pts[k].0, pts[k].1, isolation).len() != 1 {
+        // The fit itself is always within the radius: isolated means it is the only one. A fit the blend refusal removed
+        // from the list (so from this tree) counts as another one: Measure marked its neighbours (Plan D D3, PD-36).
+        if tree.within(pts[k].0, pts[k].1, isolation).len() != 1 || fit.flags.blend_neighbour() {
             continue;
         }
         let (x, y) = anchor.map.forward_exact(fit.x, fit.y);
@@ -1153,6 +1158,114 @@ mod tests {
             ..plane(&fits, &map, f)
         })
         .is_empty());
+    }
+
+    /// Plan D D3 (PD-36): a candidate-worthy anchor fit that carries `BLEND_NEIGHBOUR` is not a candidate, on every plane
+    /// count (the bit is read by the one test in the isolation loop, not by `flux_fit`), and the same fit without it is.
+    #[test]
+    fn a_blend_neighbour_is_not_a_candidate_on_any_plane_count() {
+        let f = 3.0;
+        let area = AREA_PER_FWHM2 * f * f;
+        let bright = 500.0 * NOISE * area.sqrt();
+        let map = identity();
+        let fits_with = |bit: StarFlags| {
+            vec![
+                fit_at(100.0, 100.0, bright, area, f, StarFlags::default()),
+                fit_at(300.0, 100.0, bright, area, f, bit), // the one under test, alone in 6 F
+                fit_at(500.0, 100.0, bright, area, f, StarFlags::default()),
+            ]
+        };
+        for planes in [1usize, 2, 3, 4] {
+            let at_planes = |fits: &[StarFit]| {
+                candidates(&MemberPlane {
+                    planes,
+                    ..plane(fits, &map, f)
+                })
+                .iter()
+                .map(|c| c.x)
+                .collect::<Vec<f64>>()
+            };
+            assert_eq!(
+                at_planes(&fits_with(StarFlags::default())),
+                vec![100.0, 300.0, 500.0],
+                "{planes} planes"
+            );
+            assert_eq!(
+                at_planes(&fits_with(StarFlags::BLEND_NEIGHBOUR)),
+                vec![100.0, 500.0],
+                "{planes} planes, marked"
+            );
+            // The sibling-point rescue does not undo the mark: marked, extended and rescued is out on a three-plane image too.
+            let both = fits_with(
+                StarFlags::BLEND_NEIGHBOUR | StarFlags::EXTENDED | StarFlags::SIBLING_POINT,
+            );
+            assert_eq!(
+                at_planes(&both),
+                vec![100.0, 500.0],
+                "{planes} planes, marked and extended"
+            );
+        }
+    }
+
+    /// Plan D D3 (PD-36), the equivalence: the candidates of a D3 fit list (the Blend-refused fit absent, its neighbours
+    /// marked by Measure's `mark_blend_neighbours` at 6 x the plane's `fwhm_px`) are the candidates of the same list with the
+    /// refused fit put back and no bit (d2d's isolation, where it was a kept fit). Each refused fit has a kept partner in its
+    /// contour (the Blend's definition), so it is no candidate in d2d either. Neighbours at 5.9 F of a refused fit drop out
+    /// in both; those at 6.1 F stay in both. On one, two, three and four planes.
+    #[test]
+    fn candidates_of_a_d3_list_are_those_of_the_list_with_the_refused_fits_put_back() {
+        let f = 3.0;
+        let area = AREA_PER_FWHM2 * f * f;
+        let bright = 500.0 * NOISE * area.sqrt();
+        let ok = StarFlags::default();
+        let (mut d2d, mut d3): (Vec<StarFit>, Vec<StarFit>) = (Vec::new(), Vec::new());
+        let mut refused: Vec<(f64, f64)> = Vec::new();
+        for i in 0..4 {
+            let (x, y) = (100.0 + 400.0 * i as f64, 100.0);
+            let r = fit_at(x, y, bright, area, f, ok);
+            d2d.push(r);
+            refused.push((x, y));
+            for kept in [
+                fit_at(x + 4.0 * f, y, bright, area, f, ok), // its partner: in the contour
+                fit_at(x - 5.9 * f, y, bright, area, f, ok), // just inside the isolation radius
+                fit_at(x, y + 6.1 * f, bright, area, f, ok), // just outside
+            ] {
+                d2d.push(kept);
+                d3.push(kept);
+            }
+        }
+        // Three stars nothing refused is near: candidates in both.
+        for j in 0..3 {
+            let g = fit_at(100.0 + 300.0 * j as f64, 800.0, bright, area, f, ok);
+            d2d.push(g);
+            d3.push(g);
+        }
+        crate::star_measure::fit::mark_blend_neighbours(
+            &mut d3,
+            &refused,
+            CORRECTION_ISOLATION_PER_FIELD_FWHM * f,
+        );
+        assert_eq!(
+            d3.iter().filter(|g| g.flags.blend_neighbour()).count(),
+            8,
+            "the partner and the 5.9 F star of each"
+        );
+        let map = identity();
+        for planes in [1usize, 2, 3, 4] {
+            let run = |fits: &[StarFit]| {
+                candidates(&MemberPlane {
+                    planes,
+                    ..plane(fits, &map, f)
+                })
+            };
+            let (want, got) = (run(&d2d), run(&d3));
+            assert_eq!(
+                want.len(),
+                4 + 3,
+                "{planes} planes: the 6.1 F stars and the free three"
+            );
+            assert_eq!(got, want, "{planes} planes");
+        }
     }
 
     #[test]

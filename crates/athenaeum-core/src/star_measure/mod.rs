@@ -187,7 +187,9 @@ impl SnrNoise {
 /// refusal runs on every [`measure_plane`] path (the stacking Measure's subs,
 /// the master and both SNR-gain crops under `Mode::All` / `Brightest` /
 /// `Population`, as `Mode::Budget` has since 7); LN's refits and every
-/// [`fit_stars_at`] caller still fit without it. What the stacking Measure
+/// [`fit_stars_at`] caller still fit without it. A kept fit within the common
+/// set's isolation radius of a refused one carries `StarFlags::BLEND_NEIGHBOUR`
+/// (PD-36: the `.athf` flags byte, no format change). What the stacking Measure
 /// accepts moves, so every stage hash that reads a fit recomputes under this
 /// same number (one bump per plan).
 ///
@@ -1619,7 +1621,7 @@ fn finish_working(
                 point_siblings,
                 timers: Some(&sub),
                 // Plan D D3 (PD-10), reversing R-PC-10b: the Blend refusal runs on every `measure_plane` path, the
-                // stacking Measure's subs, the master and the SNR-gain crops among them. `MeasureOptions::correction()`
+                // stacking Measure's subs, the master and the SNR-gain crops among them. `FitStarsOptions::correction()`
                 // (LN's refits, every `fit_stars_at` caller) still leaves it off.
                 blend_refusal: true,
                 ..Default::default()
@@ -1668,6 +1670,18 @@ fn finish_working(
             FrameAggregates::of_population(&outcome.fits, &in_a, Some(&sub))
         }
     };
+    // Plan D D3 (PD-36): a refused fit is not in the kept list, and the frame-common star set isolates against the kept list
+    // (`stacking::common_set::candidates`, 6 x the plane's persisted `fwhm_px`). Mark every kept fit within that radius of a
+    // refused one, so a neighbour of a refused blend is no more isolated than it was before D3 (the refused fit was a kept
+    // fit then). The radius is the stacking adapter's `ChannelMeasurement::fwhm_px` itself - `frame.fwhm_px`, the statistic
+    // just computed (`unwrap_or(0.0)` as the adapter reads it, and the set returns no candidate for a width that is not a
+    // positive number, so none is marked). The bit enters neither the statistic nor any sum: `frame` is already taken.
+    let blend_refused = std::mem::take(&mut outcome.blend_refused);
+    fit::mark_blend_neighbours(
+        &mut outcome.fits,
+        &blend_refused,
+        photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * frame.fwhm_px.unwrap_or(0.0),
+    );
     let population_report = population.as_ref().map(|p| {
         let (mut accepted, mut merged) = (0usize, 0usize);
         for (f, &k) in outcome.fits.iter().zip(&outcome.fit_seeds) {
@@ -4668,6 +4682,16 @@ mod tests {
     /// (115, 65): a bright star (amplitude 1.0) and a companion `sep_f` F to its right (amplitude `companion`), both
     /// seeded, the pair last (seeds 30 and 31).
     fn blend_pair_field(sep_f: f64, companion: f64) -> (Vec<MoffatStar>, Vec<f32>) {
+        blend_pair_field_plus(sep_f, companion, &[])
+    }
+
+    /// [`blend_pair_field`] with more stars of the field's own shape at `extra` `(x, y)` (amplitude 0.3, seeds 32…, after
+    /// the pair). No extra star: the very field [`blend_pair_field`] is.
+    fn blend_pair_field_plus(
+        sep_f: f64,
+        companion: f64,
+        extra: &[(f64, f64)],
+    ) -> (Vec<MoffatStar>, Vec<f32>) {
         let alpha = 4.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
         let star = |x: f64, y: f64, amp: f64| MoffatStar {
             x,
@@ -4682,6 +4706,7 @@ mod tests {
             .collect();
         stars.push(star(115.0, 65.0, 1.0));
         stars.push(star(115.0 + 4.0 * sep_f, 65.0, companion));
+        stars.extend(extra.iter().map(|&(x, y)| star(x, y, 0.3)));
         let mut data = moffat_field(340, 300, &stars, 4.0, 0.05);
         crate::test_support::add_noise(&mut data, 0.002, 9);
         (stars, data)
@@ -4705,74 +4730,181 @@ mod tests {
         measure_plane(data, 340, 300, &opts, None)
     }
 
+    /// The fits of `m` within `half_x` px of `cx` and 4 px of the pair's row (y = 65).
+    fn fits_in_window(m: &PlaneMeasurement, cx: f64, half_x: f64) -> Vec<&StarFit> {
+        m.stars
+            .iter()
+            .filter(|f| (f.x - cx).abs() < half_x && (f.y - 65.0).abs() < 4.0)
+            .collect()
+    }
+
+    /// The pair keeps exactly one fit, and it sits ON one of the pair's two stars (within `tol` px of `x` in `stars`, 1 px of
+    /// the row), not between them: a merged fit would pass a bare count. Returns the kept fit's x.
+    fn assert_one_of_the_pair_is_kept(
+        m: &PlaneMeasurement,
+        window: (f64, f64),
+        stars: &[f64],
+        tol: f64,
+        what: &str,
+    ) -> f64 {
+        let kept = fits_in_window(m, window.0, window.1);
+        assert_eq!(kept.len(), 1, "{what}: {:?}", m.refused);
+        let near = stars.iter().map(|s| (kept[0].x - s).abs()).fold(f64::MAX, f64::min);
+        assert!(
+            near < tol && (kept[0].y - 65.0).abs() < 1.0,
+            "{what}: the kept fit is at ({}, {}), not on a star of the pair {stars:?}",
+            kept[0].x,
+            kept[0].y
+        );
+        kept[0].x
+    }
+
     /// Plan D D3 (PD-10), reversing R-PC-10b: the Blend refusal is every path's, the stacking Measure's included. One
     /// plane with a close pair (a bright star and a companion of a fifth of its amplitude 1.0 F out, both seeded):
     /// `Mode::All` (the stacking Measure's mode) and `Mode::Budget` (the Analysis path's) each refuse the companion as
-    /// `Blend` and keep the bright star.
+    /// `Blend` and keep the bright star (its fit within 1 px of (115, 65), not a merged fit between the two).
     #[test]
     fn mode_all_and_mode_budget_both_refuse_the_resolved_pair() {
         let (stars, data) = blend_pair_field(1.0, 0.2);
-        let near_pair = |m: &PlaneMeasurement| {
-            m.stars
-                .iter()
-                .filter(|f| (f.x - 117.0).abs() < 4.5 && (f.y - 65.0).abs() < 2.0)
-                .count()
-        };
         let all = measure_pair_field(&stars, &data, Mode::All);
         assert_eq!(blends(&all), 1, "{:?}", all.refused);
-        assert_eq!((all.stars.len(), near_pair(&all)), (31, 1), "the companion is refused");
+        assert_eq!(all.stars.len(), 31, "the companion is refused");
+        let kept = assert_one_of_the_pair_is_kept(&all, (117.0, 4.5), &[115.0], 1.0, "Mode::All");
+        assert!(kept < 116.0, "the bright star's, not the companion's: {kept}");
         let budget = measure_pair_field(&stars, &data, Mode::Budget { budget: 500 });
         assert_eq!(blends(&budget), 1, "{:?}", budget.refused);
-        assert_eq!((budget.stars.len(), near_pair(&budget)), (31, 1), "the companion is refused");
+        assert_eq!(budget.stars.len(), 31, "the companion is refused");
+        assert_one_of_the_pair_is_kept(&budget, (117.0, 4.5), &[115.0], 1.0, "Mode::Budget");
     }
 
     /// Plan D D3 (PD-10): the stacking Measure refuses a resolved pair. A bright star and a companion of 0.7 its amplitude
-    /// 1.5 F out (the nearest pair this fixture resolves without the fit region giving out: 1.7 F and beyond leave two
-    /// accepted fits or two `RegionTooSmall`), both seeded, on `Mode::All`: one fit is refused `Blend`, the other of the
-    /// pair is kept, the thirty field stars are untouched, and the F-0 identity holds. The Analysis path refuses the same.
+    /// 1.5 F out (the widest pair this fixture resolves that the rule still refuses: 1.7 F and beyond leave two accepted
+    /// fits or two `RegionTooSmall`), both seeded, on `Mode::All`: one fit is refused `Blend`, the other of the pair is kept,
+    /// sitting on one of the two stars (within 1.5 px of (115, 65) or (121, 65), not between them), the thirty field stars
+    /// are untouched, and the F-0 identity holds. The Analysis path refuses the same. Which of the two survives follows
+    /// the fits' contours, not the amplitudes: here the companion's fit (x about 120) does, the bright star's wide fit
+    /// holding the companion's seed.
     #[test]
     fn the_stacking_measure_refuses_a_resolved_blend() {
         let (stars, data) = blend_pair_field(1.5, 0.7);
-        let near_pair = |m: &PlaneMeasurement| {
-            m.stars
-                .iter()
-                .filter(|f| (f.x - 118.0).abs() < 8.0 && (f.y - 65.0).abs() < 4.0)
-                .count()
-        };
         let budget = measure_pair_field(&stars, &data, Mode::Budget { budget: 500 });
         assert_eq!(blends(&budget), 1, "premise, the Analysis path: {:?}", budget.refused);
         let all = measure_pair_field(&stars, &data, Mode::All);
         assert_eq!(blends(&all), 1, "{:?}", all.refused);
-        assert_eq!((all.stars.len(), near_pair(&all)), (31, 1), "{:?}", all.refused);
+        assert_eq!(all.stars.len(), 31, "{:?}", all.refused);
+        assert_one_of_the_pair_is_kept(&all, (118.0, 8.0), &[115.0, 121.0], 1.5, "Mode::All");
         assert_eq!(all.refused.accounted(all.stars.len()), all.seeds);
     }
 
     /// Plan D D3 (PD-10): LN's refits and every `fit_stars_at` caller fit as before. The same pair, handed to the refit
-    /// entry point as seeds: no fit is refused `Blend`.
+    /// entry point as seeds: no fit is refused `Blend`. The arm that makes it discriminate: the very same call with only
+    /// `Correction::blend_refusal` set refuses one (`fit_stars_at` runs no verdict pass of its own, so this shows the
+    /// fixture fires under that entry point's inputs).
     #[test]
     fn ln_refits_still_fit_without_the_blend_refusal() {
         let (stars, data) = blend_pair_field(1.5, 0.7);
         let working: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
-        let out = fit_stars_at(
+        let seeds = seeds_of(&stars);
+        let opts = FitStarsOptions {
+            field_width: Some(4.0),
+            ..Default::default()
+        };
+        let out = fit_stars_at(&working, 340, 300, &seeds, 4.0, &opts, None);
+        let blended = |o: &FitOutcome| {
+            o.refused
+                .by_reason
+                .get(&RefusalReason::Blend)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(blended(&out), 0, "{:?}", out.refused);
+        assert_eq!(out.fits.len(), 32, "both stars of the pair are fitted: {:?}", out.refused);
+        assert!(out.blend_refused.is_empty(), "{:?}", out.blend_refused);
+        let on = fit::fit_stars_with_beta_diagnosed(
             &working,
             340,
             300,
-            &seeds_of(&stars),
+            &seeds,
             4.0,
-            &FitStarsOptions {
-                field_width: Some(4.0),
-                ..Default::default()
-            },
+            &opts.fit,
             None,
+            opts.field_width,
+            None,
+            opts.diagnostics,
+            opts.defocus_verdict,
+            opts.trail_verdict,
+            fit::Correction {
+                blend_refusal: true,
+                ..opts.correction()
+            },
         );
-        let blended = out
-            .refused
-            .by_reason
-            .get(&RefusalReason::Blend)
-            .copied()
-            .unwrap_or(0);
-        assert_eq!(blended, 0, "{:?}", out.refused);
-        assert_eq!(out.fits.len(), 32, "both stars of the pair are fitted: {:?}", out.refused);
+        assert_eq!(blended(&on), 1, "the same seeds, rule on: {:?}", on.refused);
+        assert_eq!(on.fits.len(), 31, "{:?}", on.refused);
+        assert_eq!(on.blend_refused.len(), 1, "{:?}", on.blend_refused);
+    }
+
+    /// Plan D D3 (PD-36): a kept fit within the common set's isolation radius of a Blend-refused fit carries
+    /// `StarFlags::BLEND_NEIGHBOUR`, one beyond it does not, and nothing else does. The radius is 6 x the plane's
+    /// `frame.fwhm_px` (the stacking adapter's persisted `fwhm_px`, `stacking::common_set::candidates`' own). The pair
+    /// (115, 65) / (121, 65) refuses one fit and keeps the other; two more field stars sit straight above the pair's middle
+    /// (118, y), one 10 % inside the radius and one 10 % outside it (the radius read off the same field without them),
+    /// both seeded.
+    #[test]
+    fn a_kept_fit_near_a_blend_refused_one_carries_blend_neighbour() {
+        let (stars0, data0) = blend_pair_field(1.5, 0.7);
+        let base = measure_pair_field(&stars0, &data0, Mode::All);
+        let r0 = photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * base.frame.fwhm_px.expect("a frame FWHM");
+        let carriers0: Vec<&StarFit> = base.stars.iter().filter(|f| f.flags.blend_neighbour()).collect();
+        assert_eq!(carriers0.len(), 1, "the pair's kept fit alone");
+        assert!((carriers0[0].x - 118.0).abs() < 8.0 && (carriers0[0].y - 65.0).abs() < 1.0);
+        let (inside, outside) = ((118.0, 65.0 + 0.9 * r0), (118.0, 65.0 - 1.1 * r0));
+        let (stars, data) = blend_pair_field_plus(1.5, 0.7, &[inside, outside]);
+        let m = measure_pair_field(&stars, &data, Mode::All);
+        assert_eq!(blends(&m), 1, "{:?}", m.refused);
+        let radius = photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * m.frame.fwhm_px.expect("a frame FWHM");
+        // The premise: the refused fit lies on the pair row between the two stars' x (113..123), and the extra stars sit
+        // clear of the radius on either side whichever x that is.
+        for refused_x in [113.0, 118.0, 123.0] {
+            let d = |(x, y): (f64, f64)| (x - refused_x).hypot(y - 65.0);
+            assert!(d(inside) < radius - 1.5 && d(outside) > radius + 1.5, "radius {radius}, refused at {refused_x}");
+        }
+        let at = |(x, y): (f64, f64)| {
+            m.stars
+                .iter()
+                .find(|f| (f.x - x).abs() < 1.0 && (f.y - y).abs() < 1.0)
+                .unwrap_or_else(|| panic!("no kept fit at ({x}, {y})"))
+        };
+        assert!(at(inside).flags.blend_neighbour(), "inside the radius");
+        assert!(!at(outside).flags.blend_neighbour(), "beyond the radius");
+        // The pair's kept fit is a neighbour of the refused one (a few px away), as it was a kept neighbour before D3.
+        let pair = fits_in_window(&m, 118.0, 8.0);
+        assert_eq!(pair.len(), 1);
+        assert!(pair[0].flags.blend_neighbour());
+        let carriers = m.stars.iter().filter(|f| f.flags.blend_neighbour()).count();
+        assert_eq!(carriers, 2, "the pair's kept fit and the inside star, no other");
+        // The bit is the only flag these ordinary point sources carry.
+        for f in m.stars.iter().filter(|f| f.flags.blend_neighbour()) {
+            assert_eq!(f.flags, StarFlags::BLEND_NEIGHBOUR);
+        }
+    }
+
+    /// Plan D D3 (PD-36): a plane with no Blend carries no `BLEND_NEIGHBOUR`, so its flags are what they were before the
+    /// bit existed. Thirty isolated stars, `Mode::All`.
+    #[test]
+    fn a_plane_with_no_blend_carries_no_blend_neighbour() {
+        let alpha = 4.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+        let grid = grid30(alpha);
+        let mut data = moffat_field(480, 400, &grid, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, 8);
+        let opts = MeasureOptions {
+            mode: Mode::All,
+            seeds: SeedSpec::Given(seeds_of(&grid)),
+            ..Default::default()
+        };
+        let m = measure_plane(&data, 480, 400, &opts, None);
+        assert_eq!(blends(&m), 0, "{:?}", m.refused);
+        assert!(m.stars.len() >= 25, "premise: {} stars", m.stars.len());
+        assert!(m.stars.iter().all(|f| f.flags.bits() & StarFlags::BLEND_NEIGHBOUR.bits() == 0));
     }
 
     fn budget_opts(budget: usize) -> MeasureOptions {
