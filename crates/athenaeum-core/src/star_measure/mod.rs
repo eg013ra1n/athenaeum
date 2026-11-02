@@ -266,11 +266,24 @@ pub struct MeasureOptions {
 }
 
 /// The ONE `extended` slice of a plane (Plan C C3 r3): the matched filter's flags, else the given seeds' own
-/// ([`MeasureOptions::given_extended`]), else empty (= all false).
+/// ([`MeasureOptions::given_extended`]), else empty (= all false). A `given_extended` that does not match the seeds
+/// warns and reads every seed point-like.
 fn extended_flags<'a>(
     detection: Option<&'a DetectionReport>,
     opts: &'a MeasureOptions,
     seeds: usize,
+) -> &'a [bool] {
+    extended_flags_warning(detection, opts, seeds, true)
+}
+
+/// [`extended_flags`] with the mismatch warn optional: a plane's slice is read at its fit and, on three planes, once more
+/// where [`point_like_sibling_seeds`] gathers its lists, and the mismatch is one defect of one plane (Plan D D2 review
+/// nit, DF-b), so the second read is silent.
+fn extended_flags_warning<'a>(
+    detection: Option<&'a DetectionReport>,
+    opts: &'a MeasureOptions,
+    seeds: usize,
+    warn: bool,
 ) -> &'a [bool] {
     if let Some(d) = detection {
         return d.extended.as_slice();
@@ -279,11 +292,13 @@ fn extended_flags<'a>(
         return &[];
     }
     if opts.given_extended.len() != seeds {
-        tracing::warn!(
-            count = seeds,
-            given_flags = opts.given_extended.len(),
-            "measure: given_extended does not match the given seeds; every seed is read as point-like"
-        );
+        if warn {
+            tracing::warn!(
+                count = seeds,
+                given_flags = opts.given_extended.len(),
+                "measure: given_extended does not match the given seeds; every seed is read as point-like"
+            );
+        }
         return &[];
     }
     opts.given_extended.as_slice()
@@ -1101,7 +1116,7 @@ pub fn sibling_seeds(planes: &[PlanePrep]) -> Vec<Option<Vec<Seed>>> {
 /// that their own plane does NOT flag extended, in plane order. The flags are the ONE slice that plane's fits use
 /// ([`extended_flags`]: the matched filter's, else [`MeasureOptions::given_extended`]) and `opts[p]` must be the options
 /// `planes[p]` is then finished with, so a given-seed run agrees with its own fits (a `given_extended` that does not
-/// match the seeds warns here as it does at the fit, and reads every seed point-like). `None` for every plane unless
+/// match the seeds reads every seed point-like here as at the fit, and warns at the fit only: once per plane). `None` for every plane unless
 /// the image has exactly three; gather the lists where [`sibling_seeds`] is gathered. A seed whose flag the slice does
 /// not hold is point-like.
 ///
@@ -1126,7 +1141,8 @@ pub fn point_like_sibling_seeds(
         .iter()
         .zip(opts)
         .map(|(prep, o)| {
-            let flags = extended_flags(prep.detection.as_ref(), o, prep.seeds.len());
+            let flags =
+                extended_flags_warning(prep.detection.as_ref(), o, prep.seeds.len(), false);
             prep.seeds
                 .iter()
                 .enumerate()
@@ -2766,6 +2782,55 @@ mod tests {
             .find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0)
             .expect("the blob is fitted");
         assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
+    }
+
+    /// Plan D D2 review nit (DF-b): on three planes a `given_extended` of the wrong length warned twice per plane, once where
+    /// `point_like_sibling_seeds` gathers its lists and once at the fit. It warns once per plane, at the fit; the lists read
+    /// the plane as all point-like either way.
+    #[test]
+    fn a_mismatched_given_extended_warns_once_per_plane_on_three_planes() {
+        use crate::test_support::add_noise;
+        let stars = grid30(5.0);
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 35);
+        let seeds = seeds_of(&stars);
+        let o = MeasureOptions {
+            seeds: SeedSpec::Given(seeds.clone()),
+            given_extended: vec![true; 3],
+            psf_model: PsfModel::Fixed(4.0),
+            ..Default::default()
+        };
+        let planes = [&data, &data, &data];
+        let (finished, log) = warn_log(|| {
+            let mut preps: Vec<_> = planes
+                .iter()
+                .map(|p| prepare_plane(p, 480, 400, &o, None))
+                .collect();
+            cross_plane_flags(&mut preps);
+            let siblings = sibling_seeds(&preps);
+            let point_like = point_like_sibling_seeds(&preps, &[&o, &o, &o]);
+            planes
+                .iter()
+                .zip(preps)
+                .zip(siblings.iter().zip(&point_like))
+                .map(|((p, prep), (sib, point))| {
+                    finish_plane(p, 480, 400, &o, prep, sib.as_deref(), point.as_deref(), None)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mismatch: Vec<_> = log
+            .iter()
+            .filter(|fields| fields.iter().any(|(n, v)| n == "given_flags" && v == "3"))
+            .collect();
+        assert_eq!(mismatch.len(), 3, "one mismatch warn per plane, not two: {log:?}");
+        for fields in mismatch {
+            let field = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            assert_eq!(field("count"), Some(seeds.len().to_string()));
+        }
+        assert!(
+            finished.iter().all(|m| m.extended_seeds == 0),
+            "every seed is read as point-like"
+        );
     }
 
     /// Ruling Q4 (Task 10b step 1b, a pin): the plane's ONE background mesh changes no bit. Its background map is the

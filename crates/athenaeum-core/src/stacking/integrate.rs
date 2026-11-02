@@ -509,8 +509,10 @@ pub struct GroupInput<'a> {
 }
 
 /// [`GroupStats::snr_gain_version`] of a gain measured now: `2` = the paired SNR factor `√(PSF SNR master / PSF SNR
-/// best sub)` read over the group's frame-common star set only (Plan D D1b, PD-3, PD-7). `1` = the same paired factor
-/// over every star of the two images (v0.7.0). Absent (`0`) = the pre-v0.7.0 unpaired power ratio. Bump it when the
+/// best sub)` read over the group's frame-common star set only (Plan D D1b, PD-3, PD-7), both sides on one aperture
+/// correction `c`: a side at floor (i), which carries no `c`, reads with the other side's ([`paired_c_stand_ins`]; Plan D
+/// D1 fix r4 joined v2 before v2 shipped, so it did not bump). `1` = the same paired factor over every star of the two
+/// images (v0.7.0), each side on its own `c`. Absent (`0`) = the pre-v0.7.0 unpaired power ratio. Bump it when the
 /// formula changes again, and teach `src/components/stacking/snrGain.ts` the new value.
 pub const SNR_GAIN_VERSION: u32 = 2;
 
@@ -585,7 +587,10 @@ pub struct GroupStats {
     /// warped master over a raw sub). Since v2 (Plan D D1b) TFlux is summed
     /// over the group's frame-common star set only, and only the stars matched
     /// and usable in BOTH images: a bright clipped star, or a wider PSF's
-    /// extra flux, no longer moves the figure. They are not
+    /// extra flux, no longer moves the figure. Both sides also read on ONE
+    /// aperture correction `c` (v2, Plan D D1 fix r4): a side at floor (i), which
+    /// has none, reads with the other side's ([`paired_c_stand_ins`]), warned.
+    /// They are not
     /// `master_psf_snr` / `best_sub_psf_snr` above, which stay each image's
     /// own measurement. `0.0` (with a warn naming its reason) when the pair
     /// cannot be measured: no frame-common star set for the plane, or fewer
@@ -742,6 +747,10 @@ pub(crate) struct CoverageOptions {
 /// divided by `ADU_SCALE` - so the set a frame was weighed on is the set the gain is read on. That holds for the paired
 /// gain and the master's common PSF SNR as well: both follow the set as PD-30 widened it (D2c review m1), the rescued
 /// stars included, never D2b's narrower one.
+///
+/// `c_stand_in` is `match_member`'s: a fit's `signal` is multiplied by it (a plane at floor (i) carries no `c` in its fits).
+/// [`common_psf_snr`] hands 1.0 (the master's own figure, each fit as stored); the paired gain hands each side the stand-in
+/// [`paired_c_stand_ins`] chose, so that both sides stand on one `c`.
 fn common_signals(
     fits: &[StarFit],
     positions: &[(f64, f64)],
@@ -3491,25 +3500,27 @@ mod tests {
         assert!(told.measurement.channel.aperture_correction.is_none(), "{:?}", told.measurement.channel.aperture_correction);
         let (noise_d, noise_c) = (told.measurement.channel.noise, clean_told.measurement.channel.noise);
         assert!((noise_d / noise_c - 1.0).abs() < 0.01, "noise {noise_d} vs {noise_c}");
-        // The master's own c, read on the crop as the gain reads it: the stand-in the floored sub takes (1 when the
-        // master is at floor too: both sides then read bare, and the clean sub's c is the whole difference).
+        // The master's own c, read on the crop as the gain reads it: the stand-in the floored sub takes.
         let master_ch = read_master_crop(&frames, &out).measurement.channel;
-        let c_master = master_ch.aperture_correction;
         assert!(!master_ch.at_floor(), "the premise: the master carries a correction, {master_ch:?}");
-        let c_m = c_master.unwrap_or(1.0);
+        let c_m = master_ch.aperture_correction.expect("a master that is not at floor has a c");
         assert!(told.measurement.channel.at_floor(), "the sub is at floor (i)");
         assert!(
             log.lines().any(|l| l.contains("WARN") && l.contains("best sub at floor (i)") && l.contains(&format!("c_stand_in={c_m}"))),
             "the substitution is named: {log}"
         );
-        // Tolerance +-5 %: the paired sets differ by a star between the two runs (29 against 28 of the 30), the c's are
-        // medians over up to 64 ratios with standard errors near 1 %, and the two masters' crops are not bit-equal.
-        // The r3 bias was x1.138 on a ratio expected at about 1: far outside it.
-        let expected = c_clean / c_m;
+        // The CLEAN gain stands on the clean run's master c, not on this run's (the two masters' crops are not bit-equal,
+        // and the c's are medians over up to 64 ratios with standard errors near 1 %): the gain with the sub floored,
+        // sum(m c_m) / sum(s c_m), differs from the clean sum(m c_m') / sum(s c_s) by c_s / c_m', exactly that.
+        let clean_master_ch = read_master_crop(&clean_frames, &clean_out).measurement.channel;
+        let c_m_clean = clean_master_ch.aperture_correction.expect("the clean master has a correction");
+        // Tolerance +-5 %: what is left is the paired sets, which differ by a star between the two runs (29 against 28 of
+        // the 30). The r3 bias was x1.138 on a ratio expected at about 1: far outside it.
+        let expected = c_clean / c_m_clean;
         let ratio = gain / clean;
         assert!(
             ratio > 0.95 * expected && ratio < 1.05 * expected,
-            "gain {gain} against the clean {clean}: x{ratio}, expected c_s {c_clean} / c_m {c_m} = {expected}\n{}",
+            "gain {gain} against the clean {clean}: x{ratio}, expected c_s {c_clean} / clean c_m {c_m_clean} = {expected}\n{}",
             measured_lines(&log)
         );
     }

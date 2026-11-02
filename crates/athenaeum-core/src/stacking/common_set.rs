@@ -1220,9 +1220,12 @@ mod tests {
 
     /// Plan D D3 (PD-36), the equivalence: the candidates of a D3 fit list (the Blend-refused fit absent, its neighbours
     /// marked by Measure's `mark_blend_neighbours` at 6 x the plane's `fwhm_px`) are the candidates of the same list with the
-    /// refused fit put back and no bit (d2d's isolation, where it was a kept fit). Each refused fit has a kept partner in its
-    /// contour (the Blend's definition), so it is no candidate in d2d either. Neighbours at 5.9 F of a refused fit drop out
-    /// in both; those at 6.1 F stay in both. On one, two, three and four planes.
+    /// refused fit put back and no bit (d2d's isolation, where it was a kept fit). What holds is PD-36's: the bit isolates
+    /// the refused fit's neighbours, so a kept fit within 6 F of one is no candidate in either list, and one at 6.1 F is in
+    /// both. It does not hold that every refused fit has a kept partner, so none is a candidate in d2d: the Blend's partner
+    /// is another seed, and on runB 0124 62 / 38 / 21 refused fits WERE candidates at fdafa818 (D3 removes them by design,
+    /// PD-10). The fixture gives each refused fit a kept partner 4 F away, so here it is no candidate in d2d either. On
+    /// one, two, three and four planes.
     #[test]
     fn candidates_of_a_d3_list_are_those_of_the_list_with_the_refused_fits_put_back() {
         let f = 3.0;

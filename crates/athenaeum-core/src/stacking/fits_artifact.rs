@@ -48,8 +48,10 @@ pub const FITS_ARTIFACT_VERSION: u16 = 3;
 /// numbers, in declaration order, each a little-endian `f32` (`ap_sum`: NaN
 /// where the fit has no aperture sum) — plus the flags byte
 /// ([`StarFit::flags`], bit 0 saturated, bit 1 β at its cap, bit 2 extended,
-/// bit 3 sibling point). The byte held `0` in every file written before Plan
-/// A Task 4, so such a file reads as no flags.
+/// bit 3 sibling point, bit 4 blend neighbour: `StarFlags` values 1, 2, 4, 8
+/// and 16, the five the build names; Plan D D3, PD-36, added the last). The
+/// byte held `0` in every file written before Plan A Task 4, so such a file
+/// reads as no flags.
 /// Fields are written/read individually (never a `#[repr(C)]` cast), so
 /// struct alignment/padding never enters the on-disk shape.
 const FIELDS_PER_RECORD: usize = 14;

@@ -1834,6 +1834,11 @@ fn refuse_blends(
 /// `stacking::common_set::candidates` isolates with) of one of the `refused` centres (Plan D D3, PD-36). A fit's own
 /// refusal is not a neighbour of itself: the refused fits are not in `fits`. Nothing else about a fit moves, and nothing is
 /// done for no refused centre or a `radius` that is not a positive finite number (the set reads no candidate then).
+///
+/// The distance here is taken between f64 centres. The `.athf` stores `x` and `y` as `f32`, so `candidates` (which reads the
+/// persisted fits) measures distances between f32-rounded centres: the two can disagree on a pair that lies within about
+/// 3e-4 px of the radius (the rounding of two coordinates near 5 000 px), a pair the set's isolation cannot tell apart
+/// from one on the radius (review n-1 of D3 r2).
 pub(crate) fn mark_blend_neighbours(fits: &mut [StarFit], refused: &[(f64, f64)], radius: f64) {
     if refused.is_empty() || fits.is_empty() || !(radius.is_finite() && radius > 0.0) {
         return;
