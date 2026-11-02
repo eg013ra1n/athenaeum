@@ -218,6 +218,10 @@ name = "d0_weight_probe"
 required-features = ["render", "solver"]
 
 [[example]]
+name = "regfrag_probe"
+required-features = ["render", "solver"]
+
+[[example]]
 name = "xisf_convert_probe"
 required-features = ["render"]
 
