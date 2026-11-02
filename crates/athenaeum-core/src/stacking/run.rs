@@ -9753,6 +9753,9 @@ enum PlaneOutcome {
     Measured {
         positions: Vec<(f64, f64)>,
         per_member: Vec<common_set::CommonFlux>,
+        /// The anchor's candidate stars the set was drawn from (`common_set::candidates`): the denominator of the
+        /// anchor-map warn (PD-39).
+        candidates: usize,
     },
     Fallback(Fallback),
 }
@@ -9876,6 +9879,7 @@ fn plane_outcome(
         } => PlaneOutcome::Measured {
             positions,
             per_member,
+            candidates: cands.len(),
         },
         common_set::CommonOutcome::TooFewStars { stars } => {
             PlaneOutcome::Fallback(Fallback::TooFewStars(stars))
@@ -10025,6 +10029,7 @@ fn reweigh_group(
             PlaneOutcome::Measured {
                 positions,
                 per_member,
+                candidates,
             } => {
                 let stars = positions.len();
                 let entries = rc
@@ -10055,6 +10060,20 @@ fn reweigh_group(
                     count = members.len(),
                     "weights: frame-common star set"
                 );
+                // PD-39: candidates enter group coordinates through the anchor's one registration map, so an error of
+                // that map larger than the match radius takes a star out of every member at once. Nothing moves; the
+                // line is where a wrong map shows.
+                if common_set::set_is_small_against_candidates(stars, candidates) {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        group_key = %group.key,
+                        plane,
+                        anchor_frame_id = anchor_frame_id.unwrap_or_default(),
+                        common_stars = stars,
+                        candidates,
+                        "weights: common set far under the anchor's candidates; the anchor's registration map may be wrong"
+                    );
+                }
                 sets.push(Some(positions));
             }
             PlaneOutcome::Fallback(f) => {

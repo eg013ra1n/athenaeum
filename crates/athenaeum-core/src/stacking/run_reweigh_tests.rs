@@ -630,6 +630,74 @@ fn a_group_without_an_anchor_falls_back_with_its_own_reason() {
     assert_eq!(h.weights(), after_first);
 }
 
+/// PD-39 (the D3 growth diagnosis): candidates enter group coordinates through the anchor's one registration map, so a map
+/// that is off by more than the match radius over part of the frame takes those stars out of every member at once and the
+/// set comes out far under the candidates. The set is still a set (24 of 32 stars, over the 20 that make a fallback), so
+/// the only trace is the `warn!`; no number moves.
+///
+/// The anchor's map here stretches y by 1.04 %: the error is `0.0104 y`, 1.32 px at the lattice's third row (under the
+/// 1.5 px match radius) and 1.68 px at its fourth (over it, in every member but the soft one, whose radius is 2.4 px
+/// and which alone cannot make the 90 % presence).
+#[test]
+fn a_set_far_under_the_anchors_candidates_warns_of_the_anchor_map() {
+    use crate::geometry::{Linear, LinearKind, PixelMap};
+    let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS);
+    h.to_measure();
+    let log = h.to_register();
+    let key = h.key();
+    let set = |h: &Harness| h.rc.common_stars[&key][0].as_ref().expect("a set").len();
+    assert_eq!(set(&h), 32, "premise: every candidate is in the set on the registered maps");
+    assert!(
+        !log.contains("registration map may be wrong"),
+        "a set of all its candidates is silent: {log}"
+    );
+
+    let stretched = PixelMap::linear(Linear {
+        kind: LinearKind::Affine,
+        m: [[1.0, 0.0, 0.0], [0.0, 1.0104, 0.0], [0.0, 0.0, 1.0]],
+    })
+    .unwrap();
+    let idx = h.rc.measured[&key]
+        .iter()
+        .position(|e| e.frame.frame_id == h.ids[0])
+        .unwrap();
+    if let Some(RegisteredFrameOutcome::Aligned { map, .. }) =
+        &mut h.rc.measured.get_mut(&key).unwrap()[idx].registration
+    {
+        *map = stretched;
+    } else {
+        panic!("sub 0, the anchor, is aligned");
+    }
+    let (res, log) = capture_logs(|| reweigh_groups(&mut h.rc));
+    res.unwrap();
+    assert_eq!(set(&h), 24, "the fourth row (8 stars) leaves every member: {log}");
+    assert!(!log.contains("no frame-common star set"), "still a set, not a fallback: {log}");
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("registration map may be wrong"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one warn for the one plane: {log}");
+    let line = lines[0];
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&format!("anchor_frame_id={}", h.ids[0])), "{line}");
+    assert!(line.contains("common_stars=24"), "{line}");
+    assert!(line.contains("candidates=32"), "{line}");
+    assert!(line.contains("plane=0"), "{line}");
+    assert!(line.contains(&format!("group_key={key}")), "{line}");
+}
+
+/// The warn's rule: a set under 0.8 of the candidates. No candidate, nothing to judge.
+#[test]
+fn the_anchor_map_warn_is_a_share_of_the_candidates_under_four_fifths() {
+    use common_set::set_is_small_against_candidates as small;
+    assert!(!small(20, 20));
+    assert!(!small(24, 30), "exactly 0.8 is not under it");
+    assert!(small(23, 30));
+    assert!(small(5830, 10_800), "d2d's runB mono L: 0.54");
+    assert!(!small(10_429, 10_800), "d3's: 0.96");
+    assert!(!small(0, 0));
+}
+
 #[test]
 fn non_psf_weight_modes_are_untouched_by_the_reweigh() {
     // Each mode with whether its sixth sub is under the 5 % floor at Measure time. The sixth sub has ten times the noise: its

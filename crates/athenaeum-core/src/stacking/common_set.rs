@@ -42,6 +42,17 @@ use crate::star_measure::StarFit;
 pub const COMMON_MIN_STARS: usize = 20;
 /// A star joins the set when it is usable in at least this share of the included, aligned members (PD-3).
 pub const COMMON_MIN_PRESENCE: f64 = 0.9;
+/// A set under this share of the anchor's candidates is logged (PD-39): candidates enter group coordinates through the
+/// anchor's one registration map ([`candidates`]), so a map that is off by more than the match radius over part of the
+/// frame removes those stars from every member at once. runB mono L read 0.54 on a wrong anchor map and 0.96 on the
+/// repaired one.
+pub const COMMON_WARN_SHARE: f64 = 0.8;
+
+/// Whether a set of `stars` out of `candidates` is under [`COMMON_WARN_SHARE`] of them (PD-39). A caller with no
+/// candidate has no set to judge.
+pub fn set_is_small_against_candidates(stars: usize, candidates: usize) -> bool {
+    candidates > 0 && (stars as f64) < COMMON_WARN_SHARE * candidates as f64
+}
 
 /// One member's plane, as the module reads it. Nothing is owned: the caller keeps one member's fits resident at a time.
 #[derive(Debug, Clone, Copy)]
