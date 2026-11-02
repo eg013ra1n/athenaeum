@@ -759,13 +759,128 @@ fn non_psf_weight_modes_are_untouched_by_the_reweigh() {
             assert!(!noisy.included);
         }
         assert_eq!(h.metrics_payloads(), payloads, "{mode:?}");
-        assert!(h.rc.common_stars.is_empty(), "{mode:?}");
-        assert!(!log.contains("frame-common star set"), "{mode:?}: {log}");
+        // PD-19 (b): the set is built in every mode, for the SNR gain; the weights above did not move for it.
+        assert!(h.rc.common_stars.contains_key(&h.key()), "{mode:?}");
+        assert!(log.contains("frame-common star set"), "{mode:?}: {log}");
+        assert!(!log.contains("frame reweighed"), "{mode:?}: no member is reweighed outside the PSF family: {log}");
         let rows = h.rows();
         for &id in &h.ids {
             assert!(row_plane0(&rows[&id]).get("commonTflux").is_none(), "{mode:?}");
             assert_eq!(rows[&id].weight, h.entry(id).weight.as_ref().map(|w| w.normalized_mean));
         }
+    }
+}
+
+/// One plane-0 snapshot of a frame as stage 3 left it: the weight, the serialized measurement (every `f64` as the
+/// shortest round-trip text, so equal text is equal bits) and the two channel figures the reweigh rewrites under the PSF
+/// family.
+fn stage_3_snapshot(h: &Harness) -> Vec<(Option<FrameWeight>, String, u64, u64)> {
+    h.ids
+        .iter()
+        .map(|&id| {
+            let e = h.entry(id);
+            let m = e.measurement.as_ref().expect("a measured frame");
+            (
+                e.weight.clone(),
+                serde_json::to_string(m).unwrap(),
+                m.channels[0].psf_snr.to_bits(),
+                m.channels[0].psf_signal_weight.to_bits(),
+            )
+        })
+        .collect()
+}
+
+/// PD-19 (b): the frame-common star set is a property of the group's frames, not of the weights. Every weight mode
+/// builds it (so the SNR gain is measured under each), and a mode outside the PSF family keeps stage 3's `psf_snr`,
+/// `psf_signal_weight` and weights bit for bit (PD-5).
+#[test]
+fn the_common_set_and_the_snr_gain_are_built_in_every_weight_mode() {
+    // The PSF family's own run: the set and the gain the other modes are compared with.
+    let mut psf = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS[..5]);
+    psf.to_measure();
+    psf.to_register();
+    let key = psf.key();
+    let psf_set = psf.rc.common_stars[&key][0].clone().expect("the PSF run's set");
+    assert!(psf_set.len() >= 20, "{}", psf_set.len());
+    stage_output(&mut psf.rc).unwrap();
+    let psf_gain = psf.rc.summary.groups.iter().find(|g| g.key == key).unwrap().stats.as_ref().unwrap().snr_gain.clone();
+    assert!(psf_gain.len() == 1 && psf_gain[0] > 1.0, "{psf_gain:?}");
+
+    for mode in [WeightMode::Noise, WeightMode::Exposure, WeightMode::None] {
+        let mut cfg = StackingConfig::default();
+        cfg.measurement.weight_mode = mode;
+        let mut h = harness(cfg, &main_field(), &MAIN_SUBS[..5]);
+        h.to_measure();
+        let stage_3 = stage_3_snapshot(&h);
+        assert!(h.rc.common_stars.is_empty(), "{mode:?}: nothing before the reweigh");
+
+        let log = h.to_register();
+        // The set: as many stars as the PSF run's. Not the same coordinates: they are in the group's grid, whose origin
+        // is the registration reference, and the Auto reference is picked by weight.
+        let key = h.key();
+        let sets = h.rc.common_stars.get(&key).unwrap_or_else(|| panic!("{mode:?}: no set recorded: {log}"));
+        assert_eq!(sets.len(), 1, "{mode:?}");
+        assert_eq!(sets[0].as_ref().map(Vec::len), Some(psf_set.len()), "{mode:?}");
+        assert!(log.contains("weights: frame-common star set"), "{mode:?}: {log}");
+        assert!(!log.contains("no frame-common star set"), "{mode:?}: {log}");
+        assert!(h.rc.warnings.iter().all(|w| !w.contains("frame-common")), "{mode:?}: {:?}", h.rc.warnings);
+
+        // Stage 3 as it was: the weights, `psf_snr`, `psf_signal_weight` and the whole measurement, bit for bit; the
+        // `common_*` record is the PSF family's alone.
+        assert_eq!(stage_3_snapshot(&h), stage_3, "{mode:?}");
+        for i in 0..5 {
+            let c = h.channel(i);
+            assert!(c.common_tflux.is_none() && c.common_tmean_flux.is_none() && c.common_stars.is_none(), "{mode:?} sub {i}");
+        }
+        let rows = h.rows();
+        for (i, &id) in h.ids.iter().enumerate() {
+            assert_eq!(rows[&id].metrics_json.as_deref(), Some(stage_3[i].1.as_str()), "{mode:?} sub {i}");
+            assert_eq!(rows[&id].weight, h.entry(id).weight.as_ref().map(|w| w.normalized_mean), "{mode:?} sub {i}");
+        }
+
+        // The gain: measured where the PSF run measures one.
+        stage_output(&mut h.rc).unwrap();
+        let stats = h.rc.summary.groups.iter().find(|g| g.key == key).unwrap().stats.as_ref().unwrap();
+        assert_eq!(stats.snr_gain_version, 2, "{mode:?}");
+        assert!(stats.snr_gain.len() == 1 && stats.snr_gain[0] > 1.0 && stats.snr_gain[0].is_finite(), "{mode:?}: {:?}", stats.snr_gain);
+    }
+}
+
+/// PD-19 (b): outside the PSF family a plane that fell back has no weights to keep - the run warning says what the
+/// plane lost, its SNR gain, and the weights stay stage 3's.
+#[test]
+fn a_fallback_outside_the_psf_family_warns_of_the_gain_not_the_weights() {
+    for mode in [WeightMode::Noise, WeightMode::PsfSnr] {
+        let mut cfg = StackingConfig::default();
+        cfg.measurement.weight_mode = mode;
+        let mut h = harness(cfg, &main_field(), &MAIN_SUBS[..5]);
+        h.to_measure();
+        let before = h.weights();
+        let key = h.key();
+        let row = crate::db::stacking::find_artifact(
+            &h.fixture.conn,
+            &StackSubject::FrameSet(h.fixture.set_id),
+            &key,
+            "fits.0",
+            Some(h.ids[2]),
+        )
+        .unwrap()
+        .expect("the fits artifact");
+        std::fs::remove_file(row.path.unwrap()).unwrap();
+        h.to_register();
+        assert_eq!(h.weights(), before, "{mode:?}: the plane keeps its Measure-time weights");
+        let warnings: Vec<&String> = h.rc.warnings.iter().filter(|w| w.contains("frame-common star set")).collect();
+        assert_eq!(warnings.len(), 1, "{mode:?}: {:?}", h.rc.warnings);
+        let w = warnings[0];
+        assert!(w.starts_with(&format!("group {key}: no frame-common star set on plane 0 (")), "{mode:?}: {w}");
+        if mode == WeightMode::Noise {
+            assert!(w.ends_with("; its SNR gain is not measured"), "{w}");
+            assert!(!w.contains("Measure-time"), "{w}");
+        } else {
+            assert!(w.ends_with("; its weights keep the Measure-time values"), "{w}");
+        }
+        // The group holds its fallback either way, so the gain's absence warns at the output stage.
+        assert_eq!(h.rc.common_stars.get(&key), Some(&vec![None]), "{mode:?}");
     }
 }
 

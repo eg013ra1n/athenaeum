@@ -390,7 +390,8 @@ fn deferred_weight_gate(w: &FrameWeight, _cfg: &SelectionConfig) -> Option<Strin
 }
 
 /// Whether `mode`'s weight gate is deferred to the end of Register (Plan D D1w, PD-5): the PSF family, whose weights
-/// are recomputed on the frame-common star set. Every other mode is selected as before and never reweighed.
+/// are recomputed on the frame-common star set. Every other mode is selected as before and its weights are never
+/// recomputed; its groups still get the set, for the SNR gain (Plan D DF-c, PD-19 b).
 pub fn defers_weight_gate(mode: WeightMode) -> bool {
     matches!(mode, WeightMode::PsfSignalWeight | WeightMode::PsfSnr)
 }

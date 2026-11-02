@@ -390,8 +390,8 @@ pub(crate) struct RunContext {
     /// Plan D D1w: each reweighed group's frame-common star set, per plane, in group coordinates
     /// ([`crate::stacking::common_set::CommonOutcome::Measured::positions`]), recorded by [`reweigh_groups`] at the end of
     /// stage 5 for D1b's SNR gain. A plane that fell back (PD-6) holds `None`, and a group whose every plane fell back
-    /// still holds its record (`[None, ...]`); a group never reweighed (a weight mode outside the PSF family, or no
-    /// aligned member) is absent.
+    /// still holds its record (`[None, ...]`); a group never reweighed (no aligned member) is absent. Recorded in every
+    /// weight mode (PD-19 b): the set is a property of the group's frames, not of the weights.
     pub(crate) common_stars: HashMap<String, Vec<Option<Vec<(f64, f64)>>>>,
     /// Per group, the LN scale the start plan reported (spec 2026-10-04 §2.3,
     /// P-14); a run whose own resolution differs warns once.
@@ -9907,9 +9907,15 @@ fn plane_outcome(
 ///
 /// Per group, over the included members that registered ([`RegisteredFrameOutcome::Aligned`]): the anchor
 /// ([`common_set::pick_anchor`]), then per plane each member's `.athf` fits (the LN lookup) matched through its own
-/// stored map ([`plane_outcome`]; no pixel is read). On a set, the plane's `common_*` fields are recorded and
-/// `psf_signal_weight` / `psf_snr` are recomputed from them (the `take_group_c` precedent: in memory, the `metrics`
-/// artifact is untouched); on a fallback the plane keeps its Measure-time inputs, with a `warn!` and a run warning.
+/// stored map ([`plane_outcome`]; no pixel is read). On a set, the plane's set is recorded in `rc.common_stars` (the
+/// SNR gain's stars); under the PSF family the plane's `common_*` fields too, and `psf_signal_weight` / `psf_snr` are
+/// recomputed from them (the `take_group_c` precedent: in memory, the `metrics` artifact is untouched); on a fallback
+/// the plane keeps its Measure-time inputs, with a `warn!` and a run warning.
+///
+/// Plan D DF-c (PD-19 b): that first phase runs in EVERY weight mode - the set is a property of the group's frames and
+/// the SNR gain is read on it, as v0.7.0 showed it in every mode. Outside the PSF family ([`defers_weight_gate`] false)
+/// nothing else changes: the channel writes and the weights below are the PSF family's alone, so the frames table's
+/// `psfSnr`, `psf_signal_weight` and weights stay stage 3's bit for bit (PD-5).
 ///
 /// Then the group's weights: with at least one plane on a set they are recomputed over the members (planes at their new
 /// or their Measure-time inputs), and a frame of the group that was not weighed (out at Measure, or at Register) loses
@@ -9923,9 +9929,6 @@ fn plane_outcome(
 /// selection.
 fn reweigh_groups(rc: &mut RunContext) -> Result<(), RunError> {
     let cfg = rc.config.clone();
-    if !defers_weight_gate(cfg.measurement.weight_mode) {
-        return Ok(());
-    }
     let groups = rc.plan_groups.clone();
     for group in &groups {
         rc.check_cancel()?;
@@ -9970,6 +9973,10 @@ fn reweigh_group(
             hash: group_measurement_hash(rc, cfg, &group.key, &calib_hash),
         });
     }
+
+    // PD-19 b: the set is built in every mode; the channel writes and the weights (phases 2 and 3 below) are the PSF
+    // family's.
+    let psf_family = defers_weight_gate(cfg.measurement.weight_mode);
 
     // Phase 1, on shared borrows: the anchor and each plane's outcome.
     let (anchor, outcomes) = {
@@ -10032,23 +10039,25 @@ fn reweigh_group(
                 candidates,
             } => {
                 let stars = positions.len();
-                let entries = rc
-                    .measured
-                    .get_mut(&group.key)
-                    .expect("the group's entries");
-                for (m, cf) in members.iter().zip(&per_member) {
-                    let ch = &mut entries[m.idx]
-                        .measurement
-                        .as_mut()
-                        .expect("a member is measured")
-                        .channels[plane];
-                    ch.common_tflux = Some(cf.tflux);
-                    ch.common_tmean_flux = Some(cf.tmean_flux);
-                    ch.common_stars = Some(stars);
-                    // All native units: the scale-invariant estimators read the channel's own noise and M*.
-                    ch.psf_signal_weight =
-                        psf_signal::psf_signal_weight(cf.tflux, cf.tmean_flux, ch.noise, ch.m_star);
-                    ch.psf_snr = psf_signal::psf_snr(cf.tflux, ch.noise);
+                if psf_family {
+                    let entries = rc
+                        .measured
+                        .get_mut(&group.key)
+                        .expect("the group's entries");
+                    for (m, cf) in members.iter().zip(&per_member) {
+                        let ch = &mut entries[m.idx]
+                            .measurement
+                            .as_mut()
+                            .expect("a member is measured")
+                            .channels[plane];
+                        ch.common_tflux = Some(cf.tflux);
+                        ch.common_tmean_flux = Some(cf.tmean_flux);
+                        ch.common_stars = Some(stars);
+                        // All native units: the scale-invariant estimators read the channel's own noise and M*.
+                        ch.psf_signal_weight =
+                            psf_signal::psf_signal_weight(cf.tflux, cf.tmean_flux, ch.noise, ch.m_star);
+                        ch.psf_snr = psf_signal::psf_snr(cf.tflux, ch.noise);
+                    }
                 }
                 paired_by_plane[plane] = Some(per_member.iter().map(|cf| cf.paired).collect());
                 tracing::info!(
@@ -10098,8 +10107,15 @@ fn reweigh_group(
                         "weights: no frame-common star set"
                     ),
                 }
+                // Outside the PSF family the plane has no weights to keep (they are stage 3's either way): what it
+                // loses is the SNR gain.
+                let consequence = if psf_family {
+                    "its weights keep the Measure-time values"
+                } else {
+                    "its SNR gain is not measured"
+                };
                 rc.warnings.push(format!(
-                    "group {}: no frame-common star set on plane {plane} ({}); its weights keep the Measure-time values",
+                    "group {}: no frame-common star set on plane {plane} ({}); {consequence}",
                     group.key,
                     f.reason()
                 ));
@@ -10110,6 +10126,10 @@ fn reweigh_group(
     // The record stays whenever this phase ran (D1b re-review m1): a group whose every plane fell back reaches integrate
     // as `Some([None, ...])`, a fallback that warns, so `None` there means "never reweighed" and nothing else.
     rc.common_stars.insert(group.key.clone(), sets);
+    if !psf_family {
+        // PD-19 b: stage 3's weights and its floor stand as they are (PD-5).
+        return Ok(());
+    }
 
     // Phase 3: the weights over the members, and the floor that stage 3 deferred. A group whose every plane fell back
     // keeps the weights stage 3 gave it, on stage 3's one scale (PD-6); the floor runs on them. Otherwise the members'

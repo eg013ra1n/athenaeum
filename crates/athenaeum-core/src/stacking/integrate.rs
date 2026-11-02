@@ -501,8 +501,8 @@ pub struct GroupInput<'a> {
     /// Plan D D1b (PD-3): the group's frame-common star set, one entry per plane, in the DELIVERED grid's pixel
     /// coordinates (`GroupInput::width` x `height`: the grid the registered frames and the master live on, which
     /// `stacking::run::reweigh_groups` reaches by each member's own registration map). `None` entry = the plane fell
-    /// back (PD-6); the whole field is `None` when the group was never reweighed (a weight mode outside the PSF family,
-    /// the LN reference builder, the probes; a frame set IS reweighed under the PSF modes). The master's PSF SNR and
+    /// back (PD-6); the whole field is `None` when the group was never reweighed (no aligned member, the LN reference
+    /// builder, the probes; every weight mode builds the set, PD-19 b). The master's PSF SNR and
     /// [`GroupStats::snr_gain`] read only these stars (see [`common_psf_snr`], [`paired_snr_gain`]); how the integrate
     /// side tells the two apart is [`log_no_positions`].
     pub common_stars: Option<&'a [Option<Vec<(f64, f64)>>]>,
@@ -1051,8 +1051,8 @@ fn registered_sub_crop(
 /// One frame plane resident at a time (plus its crop). `0.0` for every
 /// plane, with a warn, when the common rectangle is under
 /// [`MIN_STATS_RECT_PX`]; `0.0` for a plane without a common set (`reason`
-/// "no positions": the weight mode is outside the PSF family, or the plane fell
-/// back) or with fewer than [`COMMON_MIN_STARS`] stars paired (`reason` "under 20
+/// "no positions": the plane fell back at the reweigh, or the group was never
+/// reweighed) or with fewer than [`COMMON_MIN_STARS`] stars paired (`reason` "under 20
 /// paired"); `0.0` for a plane whose pair has no usable PSF SNR.
 fn paired_snr_gain(
     input: &GroupInput<'_>,
@@ -1175,8 +1175,8 @@ fn common_positions<'a>(input: &GroupInput<'a>, p: usize) -> Option<&'a [(f64, f
 }
 
 /// The "no positions" line of a plane without a frame-common star set. The integrate side tells the two causes apart
-/// by [`GroupInput::common_stars`] itself: `None` = the group was never reweighed (a weight mode outside the PSF family,
-/// the LN reference builder, the probes) - a configuration, not a fault, so a `debug!`; `Some` with the plane's entry
+/// by [`GroupInput::common_stars`] itself: `None` = the group was never reweighed (no aligned member, the LN reference
+/// builder, the probes) - a configuration, not a fault, so a `debug!`; `Some` with the plane's entry
 /// `None` (or empty) = the plane fell back at the reweigh, which warned and put a run warning on it already - kept at
 /// `warn!` (the gain's absence is that fallback's consequence).
 fn log_no_positions(input: &GroupInput<'_>, plane: usize, frame_id: i64) {
