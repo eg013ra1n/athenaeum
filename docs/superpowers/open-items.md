@@ -35,8 +35,9 @@ hang on saturated stars' `tflux` and the FWHM trend set 109 showed (bar: R-PC-11
 The other `c` items, the Analysis items and the plate-solving signal wait for a later plan; the LN / ERP items stay recorded limits.
 
 **Real trees (owner, 2026-10-31).** The three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) are copied to the runner (M4 Max) through
-`/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines; Plan D's master-level runs go to the runner. Gates reading bigbase2 / 3 stay on the dev Mac
-unless the runner gets those volumes.
+`/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines. They are not self-contained: their sources sit on the dev Mac's volumes by absolute path
+(~60 GB on bigbase2 / bigbase3 / BigMac), so Plan D's master-level runs stay on the dev Mac and the runner runs the lab cycles (owner, 2026-11-01; PD-12 in the Plan D
+rulings).
 
 **The Measure aperture correction `c` (Plan B B4, measured, not fixed).**
 - On raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of the bright stars from `c`'s sample frame-dependently and `c`
