@@ -448,6 +448,11 @@ fn psf_weights_are_read_on_the_frame_common_set_after_register() {
     assert!(log.contains("weights: frame-common star set"), "{log}");
     assert!(log.contains(&format!("anchor_frame_id={}", h.ids[0])), "{log}");
     assert!(log.contains("common_stars=32"), "{log}");
+    // PD-44: the info line carries the anchor's candidate count, the warn's denominator (the clipped star and the soft
+    // sub's ten are not the anchor's candidates).
+    let info = log_lines(&log, "weights: frame-common star set");
+    assert_eq!(info.len(), 1, "one set for the one plane: {log}");
+    assert!(info[0].contains("candidates=32"), "{}", info[0]);
     assert!(log.contains("count=6"), "{log}");
     assert_eq!(log.matches("frame reweighed").count(), 6, "{log}");
     assert!(log.contains("paired_stars=32"), "{log}");
@@ -630,33 +635,22 @@ fn a_group_without_an_anchor_falls_back_with_its_own_reason() {
     assert_eq!(h.weights(), after_first);
 }
 
-/// PD-39 (the D3 growth diagnosis): candidates enter group coordinates through the anchor's one registration map, so a map
-/// that is off by more than the match radius over part of the frame takes those stars out of every member at once and the
-/// set comes out far under the candidates. The set is still a set (24 of 32 stars, over the 20 that make a fallback), so
-/// the only trace is the `warn!`; no number moves.
-///
-/// The anchor's map here stretches y by 1.04 %: the error is `0.0104 y`, 1.32 px at the lattice's third row (under the
-/// 1.5 px match radius) and 1.68 px at its fourth (over it, in every member but the soft one, whose radius is 2.4 px
-/// and which alone cannot make the 90 % presence).
-#[test]
-fn a_set_far_under_the_anchors_candidates_warns_of_the_anchor_map() {
-    use crate::geometry::{Linear, LinearKind, PixelMap};
-    let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS);
-    h.to_measure();
-    let log = h.to_register();
-    let key = h.key();
-    let set = |h: &Harness| h.rc.common_stars[&key][0].as_ref().expect("a set").len();
-    assert_eq!(set(&h), 32, "premise: every candidate is in the set on the registered maps");
-    assert!(
-        !log.contains("registration map may be wrong"),
-        "a set of all its candidates is silent: {log}"
-    );
+/// The lines of `log` for the message `msg`.
+fn log_lines<'a>(log: &'a str, msg: &str) -> Vec<&'a str> {
+    log.lines().filter(|l| l.contains(msg)).collect()
+}
 
+/// Stretches the anchor's registration map in y by 1.04 %: the error is `0.0104 y`, 1.32 px at most on the lattice's third
+/// row (under the 1.5 px match radius) and 1.68 px at least on its fourth (over it, in every member but the soft one, whose
+/// radius is 2.4 px and which alone cannot make the 90 % presence). Rows 4 and beyond are further out still.
+fn stretch_the_anchor_map(h: &mut Harness) {
+    use crate::geometry::{Linear, LinearKind, PixelMap};
     let stretched = PixelMap::linear(Linear {
         kind: LinearKind::Affine,
         m: [[1.0, 0.0, 0.0], [0.0, 1.0104, 0.0], [0.0, 0.0, 1.0]],
     })
     .unwrap();
+    let key = h.key();
     let idx = h.rc.measured[&key]
         .iter()
         .position(|e| e.frame.frame_id == h.ids[0])
@@ -668,33 +662,82 @@ fn a_set_far_under_the_anchors_candidates_warns_of_the_anchor_map() {
     } else {
         panic!("sub 0, the anchor, is aligned");
     }
+}
+
+/// PD-39 (the D3 growth diagnosis), PD-44: candidates enter group coordinates through the anchor's one registration map, so
+/// a map that is off by more than the match radius over part of the frame takes those stars out of every member at once and
+/// the set comes out far under the candidates. The set is still a set (24 of 47 stars, over the 20 that make a fallback), so
+/// the only trace is the `warn!`; no number moves. The field is the main one's lattice grown to rows 0 to 5 (47 stars; the
+/// clipped one is the 48th cell), so that a set of at least 20 can still be under 0.6 of the candidates.
+#[test]
+fn a_set_far_under_the_anchors_candidates_warns_of_the_anchor_map() {
+    let field = with_clipped_star(lattice(47, 600.0, 0x9E37_79B9_7F4A_7C15, 48.0, 24.0, 8));
+    let mut h = harness(StackingConfig::default(), &field, &MAIN_SUBS);
+    h.to_measure();
+    let log = h.to_register();
+    let key = h.key();
+    let set = |h: &Harness| h.rc.common_stars[&key][0].as_ref().expect("a set").len();
+    assert_eq!(set(&h), 47, "premise: every candidate is in the set on the registered maps");
+    assert!(
+        !log.contains("registration map may be wrong"),
+        "a set of all its candidates is silent: {log}"
+    );
+
+    stretch_the_anchor_map(&mut h);
     let (res, log) = capture_logs(|| reweigh_groups(&mut h.rc));
     res.unwrap();
-    assert_eq!(set(&h), 24, "the fourth row (8 stars) leaves every member: {log}");
+    assert_eq!(set(&h), 24, "rows 3 to 5 (23 stars) leave every member: {log}");
     assert!(!log.contains("no frame-common star set"), "still a set, not a fallback: {log}");
-    let lines: Vec<_> = log
-        .lines()
-        .filter(|l| l.contains("registration map may be wrong"))
-        .collect();
+    let lines = log_lines(&log, "registration map may be wrong");
     assert_eq!(lines.len(), 1, "one warn for the one plane: {log}");
     let line = lines[0];
     assert!(line.contains("WARN"), "{line}");
     assert!(line.contains(&format!("anchor_frame_id={}", h.ids[0])), "{line}");
     assert!(line.contains("common_stars=24"), "{line}");
-    assert!(line.contains("candidates=32"), "{line}");
+    assert!(line.contains("candidates=47"), "{line}");
     assert!(line.contains("plane=0"), "{line}");
     assert!(line.contains(&format!("group_key={key}")), "{line}");
+    // The set's info line carries the same denominator (PD-44), so the share is readable without the warn.
+    let info = log_lines(&log, "weights: frame-common star set");
+    assert_eq!(info.len(), 1, "one set for the one plane: {log}");
+    assert!(info[0].contains("common_stars=24"), "{}", info[0]);
+    assert!(info[0].contains("candidates=47"), "{}", info[0]);
 }
 
-/// The warn's rule: a set under 0.8 of the candidates. No candidate, nothing to judge.
+/// PD-44: the same map error over the main field's 32 candidates removes the fourth row, 8 stars, and leaves 24 of 32 = 0.75,
+/// over the 0.6 share. A map error that removes under 40 % of the candidates is silent (the cost the ruling accepts, until
+/// the registration inlier warn lands); the set's info line is where its share still shows.
 #[test]
-fn the_anchor_map_warn_is_a_share_of_the_candidates_under_four_fifths() {
+fn a_set_over_three_fifths_of_the_candidates_is_silent_on_a_stretched_anchor_map() {
+    let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS);
+    h.to_measure();
+    h.to_register();
+    let key = h.key();
+    stretch_the_anchor_map(&mut h);
+    let (res, log) = capture_logs(|| reweigh_groups(&mut h.rc));
+    res.unwrap();
+    assert_eq!(h.rc.common_stars[&key][0].as_ref().expect("a set").len(), 24, "{log}");
+    assert!(!log.contains("registration map may be wrong"), "24 of 32 is 0.75: {log}");
+    let info = log_lines(&log, "weights: frame-common star set");
+    assert_eq!(info.len(), 1, "{log}");
+    assert!(info[0].contains("common_stars=24"), "{}", info[0]);
+    assert!(info[0].contains("candidates=32"), "{}", info[0]);
+}
+
+/// The warn's rule: a set under 0.6 of the candidates (PD-44). No candidate, nothing to judge. The shares are the measured
+/// ones: a wrong half-frame map reads 0.54 (runB mono L, 0.96 once repaired) and the correct maps read 0.669 (hc11 L), 0.784
+/// (runB OSC p0) and 0.775 (s204 OSC p0).
+#[test]
+fn the_anchor_map_warn_is_a_share_of_the_candidates_under_three_fifths() {
     use common_set::set_is_small_against_candidates as small;
     assert!(!small(20, 20));
-    assert!(!small(24, 30), "exactly 0.8 is not under it");
-    assert!(small(23, 30));
-    assert!(small(5830, 10_800), "d2d's runB mono L: 0.54");
+    assert!(!small(18, 30), "exactly 0.6 is not under it");
+    assert!(small(17, 30));
+    assert!(small(5830, 10_800), "d2d's runB mono L on the wrong map: 0.54 (fired at 0.8 too)");
     assert!(!small(10_429, 10_800), "d3's: 0.96");
+    assert!(!small(669, 1000), "hc11 L, a correct map: 0.669 (fired at 0.8, PD-44)");
+    assert!(!small(784, 1000), "runB OSC p0, a correct map: 0.784 (fired at 0.8, PD-44)");
+    assert!(!small(775, 1000), "s204 OSC p0, a correct map: 0.775 (fired at 0.8, PD-44)");
     assert!(!small(0, 0));
 }
 

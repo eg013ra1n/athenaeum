@@ -42,11 +42,14 @@ use crate::star_measure::StarFit;
 pub const COMMON_MIN_STARS: usize = 20;
 /// A star joins the set when it is usable in at least this share of the included, aligned members (PD-3).
 pub const COMMON_MIN_PRESENCE: f64 = 0.9;
-/// A set under this share of the anchor's candidates is logged (PD-39): candidates enter group coordinates through the
-/// anchor's one registration map ([`candidates`]), so a map that is off by more than the match radius over part of the
-/// frame removes those stars from every member at once. runB mono L read 0.54 on a wrong anchor map and 0.96 on the
-/// repaired one.
-pub const COMMON_WARN_SHARE: f64 = 0.8;
+/// A set under this share of the anchor's candidates is logged (PD-39, PD-44): candidates enter group coordinates through
+/// the anchor's one registration map ([`candidates`]), so a map that is off by more than the match radius over part of the
+/// frame removes those stars from every member at once. A wrong half-frame map halves whatever the group reads: runB mono L
+/// read 0.54 on a wrong anchor map and 0.96 on the repaired one. The correct maps read 0.669 (hc11 L: five nights, FWHM
+/// 5.6 to 9.2 px), 0.784 (runB OSC p0) and 0.775 (s204 OSC p0; the beta-floor plane's faint set), all from DF's ln-truth
+/// final (2026-11-02). So 0.8 was a seeing-spread detector (it fired on 3 of 10 correct group-planes) and 0.6 sits between
+/// the two readings. A map error that removes under 40 % of the candidates is silent here.
+pub const COMMON_WARN_SHARE: f64 = 0.6;
 
 /// Whether a set of `stars` out of `candidates` is under [`COMMON_WARN_SHARE`] of them (PD-39). A caller with no
 /// candidate has no set to judge.

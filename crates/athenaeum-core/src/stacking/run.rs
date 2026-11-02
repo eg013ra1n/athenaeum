@@ -10066,6 +10066,7 @@ fn reweigh_group(
                     plane,
                     anchor_frame_id = anchor_frame_id.unwrap_or_default(),
                     common_stars = stars,
+                    candidates,
                     count = members.len(),
                     "weights: frame-common star set"
                 );
