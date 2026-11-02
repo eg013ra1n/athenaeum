@@ -719,7 +719,10 @@ masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>,
  * warped master over a raw sub). Since v2 (Plan D D1b) TFlux is summed
  * over the group's frame-common star set only, and only the stars matched
  * and usable in BOTH images: a bright clipped star, or a wider PSF's
- * extra flux, no longer moves the figure. They are not
+ * extra flux, no longer moves the figure. Both sides also read on ONE
+ * aperture correction `c` (v2, Plan D D1 fix r4): a side at floor (i), which
+ * has none, reads with the other side's ([`paired_c_stand_ins`]), warned.
+ * They are not
  * `master_psf_snr` / `best_sub_psf_snr` above, which stay each image's
  * own measurement. `0.0` (with a warn naming its reason) when the pair
  * cannot be measured: no frame-common star set for the plane, or fewer
