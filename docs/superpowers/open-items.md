@@ -23,8 +23,7 @@ None open.
 
 ## Plan D — closed with its merge; what it left and what it carried (2026-11-02)
 
-**Plan D (the stacking weight only; owner 2026-10-31, «Только вес стека») is CLOSED by the merge commit of `plan-d` into local `main`.** The final whole-branch review comes before that
-commit and the controller adds its sha here; push on the owner's word. What it did: `docs/stacking/README.md` R-OSP-18 (PD-1 … PD-49, every run line, the DF acceptance rule) and the after note
+**Plan D (the stacking weight only; owner 2026-10-31, «Только вес стека») is CLOSED: `plan-d` merged into local `main` as 91df3ff0 on 2026-11-02 after the final whole-branch review (fable, APPROVE); push on the owner's word.** What it did: `docs/stacking/README.md` R-OSP-18 (PD-1 … PD-49, every run line, the DF acceptance rule) and the after note
 `docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`. Plan C took the Analysis switch only (owner, 2026-10-24) and left Plan D its weight items, which are paid (below); the rest is
 carried unchanged. Other references: `docs/stacking/README.md` R-OSP-16 (Plan B) and R-OSP-17 (Plan C), the after-Plan-B report `docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` §6,
 and the Plan C after note `docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md` §9.

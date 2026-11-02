@@ -4582,9 +4582,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   *Suites (controller, dev Mac, single runs, at 584f6b35).* Core `--all-targets` 4807 passed / 1 failed / 17 ignored (the one failure `ts_contract`: DF-b's doc paragraph not yet regenerated into
   `src/types/stacking.ts`; regenerated in 174eea6f, `ts_contract` PASS); web 57 / 0; `--no-default-features` check Finished; vitest 120 files / 1146 tests; `npm run build` exit 0.
   *Reviews.* An opus review per code task (D1, D1w, D1b, D2, D2c, D2d, D3), each ending at an APPROVE (some after fix rounds and re-reviews); the DF code review over 32ab3c4b..f899a691 APPROVE (C0 / I0 / m2 / n3: m1 and the three
-  nits are in the DF docs round, m2 became PD-44); the final whole-branch review (fable, Step 5) and the merge (Step 6) come after this entry.
+  nits are in the DF docs round, m2 became PD-44); the final whole-branch review (fable, Step 5, `task-DF-final-review-r1.md`): APPROVE, C0 / I0 / m1 / n4 (m1, the anchor on a dead plane, and n3 in open-items; n1 folded into the PD-3 line and the Stacking rule).
   *After note:* `docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`.
-  - **R-OSP-18 closes with the merge of `plan-d` into local `main` (the merge commit is the close; the controller adds its sha); push on the owner's word.**
+  - **R-OSP-18 CLOSED (2026-11-02): Plan D complete; `plan-d` merged into local `main` as 91df3ff0 (code head ddf2073f); core suite on the merged tree in the next line; push on the owner's word.**
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
