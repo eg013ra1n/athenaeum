@@ -7,7 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use solvemyastro::quad::{build_quads, fit_affine, group_size_for, match_quads};
+use solvemyastro::quad::{build_quads, fit_affine, group_size_for, match_quads, Affine, Quad};
 use super::detect::Star;
 use super::wcs_seed::seed_radius_px;
 use super::local_loop;
@@ -16,6 +16,7 @@ use super::{DistortionChoice, ModelChoice, RegistrationConfig, SCALE_TOLERANCE};
 // round 1, minor 10); `DOMAIN_MARGIN` is the one item that lives only in
 // its own module.
 use crate::geometry::polynomial::DOMAIN_MARGIN;
+use crate::geometry::ransac::{degenerate, SplitMix64};
 use crate::geometry::{
     ransac_fit, refit_weighted, select_nodes, Distortion, DistortionModel, KdTree2, Linear,
     LinearKind, Pair, PixelMap, RansacConfig, RansacResult, RefitResult, ThinPlateSpline,
@@ -313,6 +314,270 @@ fn min_pairs_for(order: u8) -> usize {
     (o + 1) * (o + 2)
 }
 
+/// A quad match whose quad centres lie within this many pixels of a fit's
+/// image counts as that fit's consensus (RQ-1). Absolute, not scaled by the
+/// field: the true matches of a sharp frame sit within 0.3 px of the truth.
+pub const SEED_TOL_PX: f64 = 5.0;
+/// The consensus loop re-admits matches within this multiple of the kept
+/// set's median residual, never below [`SEED_TOL_PX`] (RQ-1 (c)).
+pub const SEED_LO_MEDIAN_FACTOR: f64 = 5.0;
+/// At most this many least-squares fits behind a consensus seed.
+pub const SEED_LO_MAX_FITS: usize = 5;
+/// The seed's RANSAC draws at most this many samples (the registration
+/// RANSAC's own bound).
+pub const SEED_RANSAC_MAX_ITERATIONS: usize = 2000;
+/// The seed's `SplitMix64` start (the registration RANSAC's own).
+pub const SEED_RANSAC_SEED: u64 = 0x5EED_5EED;
+
+/// Which route produced a [`QuadSeed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedRoute {
+    /// Today's single `fit_affine` over every match: fewer than
+    /// [`MIN_INLIERS`] matches, or RANSAC found no consensus of that size.
+    Single,
+    /// The plain fit was clean (every residual within [`SEED_TOL_PX`]) and
+    /// is returned bit for bit.
+    Clean,
+    /// RANSAC over the matches, then least squares over the consensus until
+    /// it repeats.
+    Consensus,
+}
+
+/// The initial subject → reference estimate from the quad matches, with
+/// what was kept to arrive at it.
+#[derive(Debug, Clone)]
+pub struct QuadSeed {
+    pub affine: Affine,
+    /// Per match, in `matches` order: true = in the returned fit.
+    pub kept: Vec<bool>,
+    pub route: SeedRoute,
+    /// RANSAC samples drawn (0 off the [`SeedRoute::Consensus`] route).
+    pub hypotheses: usize,
+    /// `fit_affine` calls over at least [`MIN_INLIERS`] matches behind the
+    /// returned fit.
+    pub fits: usize,
+}
+
+impl QuadSeed {
+    /// Matches left out of the returned fit.
+    pub fn dropped(&self) -> usize {
+        self.kept.iter().filter(|k| !**k).count()
+    }
+}
+
+/// Distance, per match, between `a`'s image of the image-quad centre and the
+/// catalog-quad centre.
+fn quad_residuals(
+    a: &Affine,
+    matches: &[(usize, usize)],
+    image_quads: &[Quad],
+    catalog_quads: &[Quad],
+) -> Vec<f64> {
+    matches
+        .iter()
+        .map(|&(i, c)| {
+            let (ix, iy) = image_quads[i].center;
+            let (cx, cy) = catalog_quads[c].center;
+            let (fx, fy) = a.apply(ix, iy);
+            (fx - cx).hypot(fy - cy)
+        })
+        .collect()
+}
+
+/// The numpy median (the mean of the two middle values for an even count).
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    match v.len() {
+        0 => 0.0,
+        n if n % 2 == 1 => v[n / 2],
+        n => (v[n / 2 - 1] + v[n / 2]) / 2.0,
+    }
+}
+
+/// `fit_affine` over the matches flagged in `keep`, in their original order.
+fn fit_kept(
+    keep: &[bool],
+    matches: &[(usize, usize)],
+    image_quads: &[Quad],
+    catalog_quads: &[Quad],
+) -> Option<Affine> {
+    let subset: Vec<(usize, usize)> = matches
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| **k)
+        .map(|(m, _)| *m)
+        .collect();
+    fit_affine(&subset, image_quads, catalog_quads)
+}
+
+/// The quad seed that survives a share of false matches (RQ-1, RQ-2).
+///
+/// The plain fit over every match is today's call; a false quad match (a
+/// star pattern that recurs elsewhere in the reference) drags it 40-50 px
+/// off the field. The residual of a match under a fit is the distance
+/// between the fit's image of its image-quad centre and its catalog-quad
+/// centre.
+///
+/// 1. Fewer than [`MIN_INLIERS`] matches, or a plain fit whose every
+///    residual is within [`SEED_TOL_PX`]: the plain fit, bit for bit
+///    ([`SeedRoute::Single`], [`SeedRoute::Clean`]).
+/// 2. Otherwise a deterministic RANSAC over the matches: 3-match samples
+///    from a `SplitMix64` at [`SEED_RANSAC_SEED`], degenerate samples
+///    skipped, a hypothesis is `fit_affine` over its three matches (its
+///    xy-scale gate included), its consensus is every match within
+///    [`SEED_TOL_PX`], a strictly larger consensus replaces the best. The
+///    bound `N = ln(1 - 0.9999) / ln(1 - w^3)` shrinks with the best share
+///    `w`, with an early exit above `w = 0.98` and at most
+///    [`SEED_RANSAC_MAX_ITERATIONS`] samples.
+/// 3. Least squares over the best consensus, then again over every match
+///    within `max(SEED_TOL_PX, SEED_LO_MEDIAN_FACTOR x the kept set's
+///    median)` of the fit, until that set repeats, at most
+///    [`SEED_LO_MAX_FITS`] fits.
+///
+/// Why RANSAC and not a clipped fit: a clip rests on the median residual,
+/// and false matches inflate it; past a small false share the clip removes
+/// nothing and keeps the dragged fit. On the research's 1 054 match sets the
+/// kept set equals the clipped estimator's 1 054 times out of 1 054; on
+/// frame 162's 486 true matches under 30-85 % random false matches the seed
+/// lands 0.0 px off the true one (clipped: 15.8-3 321 px). A RANSAC that
+/// finds fewer than [`MIN_INLIERS`] consensus matches gives the plain fit
+/// back, so no outcome is worse than today's; a plain fit that is `None`
+/// with 8 matches or more still gets its RANSAC (it recovers 190 of 200 such
+/// seeds of a 75 % random false set).
+///
+/// The bit-identity condition: a set whose plain fit is clean keeps it bit
+/// for bit; a set whose consensus converges to every match gets
+/// `fit_affine(all)` in the original order, the same bits. True matches lost
+/// to a strongly non-uniform distortion (10 px or more at the corners
+/// against the affine) give a narrower seed, not a wrong one.
+///
+/// `None` only when the plain fit is `None` and no consensus replaces it.
+pub fn robust_quad_seed(
+    matches: &[(usize, usize)],
+    image_quads: &[Quad],
+    catalog_quads: &[Quad],
+) -> Option<QuadSeed> {
+    let n = matches.len();
+    let plain = fit_affine(matches, image_quads, catalog_quads);
+    // Today's outcome, `None` included.
+    let single = |plain: Option<Affine>| {
+        plain.map(|affine| QuadSeed {
+            affine,
+            kept: vec![true; n],
+            route: SeedRoute::Single,
+            hypotheses: 0,
+            fits: usize::from(n >= MIN_INLIERS),
+        })
+    };
+    if n < MIN_INLIERS {
+        return single(plain);
+    }
+    if let Some(affine) = &plain {
+        let clean = quad_residuals(affine, matches, image_quads, catalog_quads)
+            .iter()
+            .all(|r| *r <= SEED_TOL_PX);
+        if clean {
+            return Some(QuadSeed {
+                affine: affine.clone(),
+                kept: vec![true; n],
+                route: SeedRoute::Clean,
+                hypotheses: 0,
+                fits: 1,
+            });
+        }
+    }
+
+    // RANSAC over the quad-centre pairs; the draw is `ransac_fit`'s.
+    let centres: Vec<Pair> = matches
+        .iter()
+        .map(|&(i, c)| (image_quads[i].center, catalog_quads[c].center))
+        .collect();
+    let mut rng = SplitMix64(SEED_RANSAC_SEED);
+    let mut best: Vec<bool> = Vec::new();
+    let mut best_n = 0usize;
+    let mut needed = SEED_RANSAC_MAX_ITERATIONS;
+    let mut hypotheses = 0usize;
+    while hypotheses < needed.min(SEED_RANSAC_MAX_ITERATIONS) {
+        hypotheses += 1;
+        let mut picks = [0usize; 3];
+        let mut drawn = 0;
+        while drawn < 3 {
+            let p = rng.below(n);
+            if !picks[..drawn].contains(&p) {
+                picks[drawn] = p;
+                drawn += 1;
+            }
+        }
+        let sample = [centres[picks[0]], centres[picks[1]], centres[picks[2]]];
+        if degenerate(&sample) {
+            continue;
+        }
+        let three = [matches[picks[0]], matches[picks[1]], matches[picks[2]]];
+        let Some(hypothesis) = fit_affine(&three, image_quads, catalog_quads) else {
+            continue;
+        };
+        // A non-finite residual compares false: out of the consensus.
+        let consensus: Vec<bool> = quad_residuals(&hypothesis, matches, image_quads, catalog_quads)
+            .iter()
+            .map(|r| *r <= SEED_TOL_PX)
+            .collect();
+        let count = consensus.iter().filter(|c| **c).count();
+        if count > best_n {
+            best = consensus;
+            best_n = count;
+            let w = count as f64 / n as f64;
+            if w > 0.98 {
+                break;
+            }
+            let denom = (1.0 - w.powi(3)).ln();
+            if denom < 0.0 {
+                needed = ((1.0f64 - 0.9999).ln() / denom).ceil().max(1.0) as usize;
+            }
+        }
+    }
+    if best_n < MIN_INLIERS {
+        return single(plain);
+    }
+
+    // Least squares over the consensus, re-admitting until the set repeats.
+    let mut keep = best;
+    let Some(mut fit) = fit_kept(&keep, matches, image_quads, catalog_quads) else {
+        return single(plain);
+    };
+    let mut fits = 1;
+    loop {
+        let r = quad_residuals(&fit, matches, image_quads, catalog_quads);
+        let kept_r: Vec<f64> = r
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(r, _)| *r)
+            .collect();
+        let tau = SEED_TOL_PX.max(SEED_LO_MEDIAN_FACTOR * median(&kept_r));
+        let next: Vec<bool> = r.iter().map(|r| *r <= tau).collect();
+        if next == keep
+            || fits == SEED_LO_MAX_FITS
+            || next.iter().filter(|k| **k).count() < MIN_INLIERS
+        {
+            break;
+        }
+        let Some(refit) = fit_kept(&next, matches, image_quads, catalog_quads) else {
+            break;
+        };
+        fit = refit;
+        keep = next;
+        fits += 1;
+    }
+    Some(QuadSeed {
+        affine: fit,
+        kept: keep,
+        route: SeedRoute::Consensus,
+        hypotheses,
+        fits,
+    })
+}
+
 /// Seed subject → reference from quad matching (subject plays "image",
 /// reference plays "catalog"; the fitted affine maps image → catalog).
 ///
@@ -328,10 +593,12 @@ fn seed_affine(
     let sub_q = build_quads(sub, sub.len(), group_size_for(sub.len()));
     let ref_q = build_quads(refp, refp.len(), group_size_for(refp.len()));
     let matches = match_quads(&sub_q, &ref_q, QUAD_TOLERANCE);
-    let a = fit_affine(&matches, &sub_q, &ref_q).ok_or(AlignError::NoSeed {
-        matches: matches.len(),
-        after_wcs,
-    })?;
+    let a = robust_quad_seed(&matches, &sub_q, &ref_q)
+        .ok_or(AlignError::NoSeed {
+            matches: matches.len(),
+            after_wcs,
+        })?
+        .affine;
     Ok((
         Linear::from_flat(
             LinearKind::Affine,
@@ -339,6 +606,110 @@ fn seed_affine(
         ),
         matches.len(),
     ))
+}
+
+/// The coverage index's grid over the overlap (RQ-10 (b)): 4 x 4 cells.
+pub const COVERAGE_GRID: usize = 4;
+/// The grid over the reference that decides which subject stars can be
+/// judged at all (RQ-10 (a)): 16 x 16 cells.
+pub const REFERENCE_OCCUPANCY_GRID: usize = 16;
+
+/// How much of the overlap a map's inliers cover (RQ-10 (a)-(c)), in subject
+/// pixels. Returns `(coverage, cells)`: the share of the 4 x 4 grid's cells
+/// holding an eligible star that also hold an inlier, and the number of
+/// cells holding an eligible star.
+///
+/// - A subject star is *eligible* when `map` lands it inside the reference
+///   frame (no clamping into edge cells) in a 16 x 16 reference cell that
+///   holds a reference star. A reference that is empty in part of the frame
+///   (clouds, a dense nebula, a vignetted corner) therefore never refuses a
+///   subject for stars that have nowhere to land.
+/// - The 4 x 4 grid is laid over the bounding box of the eligible stars, so
+///   it always spans the overlap: the whole frame for a full overlap, a
+///   corner for a small one. A zero-width side of the box is one column or
+///   row.
+/// - `inlier_subject_pts` are the subject sides of the refit's inlier pairs
+///   (the pairing carries coordinates, not star indices). One outside the
+///   box, or in a cell without an eligible star, counts for nothing.
+///
+/// `(0.0, 0)` when no star is eligible. `reference_geometry` is the
+/// reference frame's `(width, height)`.
+pub fn coverage(
+    subject: &[(f64, f64)],
+    reference: &[(f64, f64)],
+    inlier_subject_pts: &[(f64, f64)],
+    map: &Linear,
+    reference_geometry: (usize, usize),
+) -> (f64, usize) {
+    let (w, h) = (reference_geometry.0 as f64, reference_geometry.1 as f64);
+    if !(w > 0.0 && h > 0.0) {
+        return (0.0, 0);
+    }
+    let occupancy = REFERENCE_OCCUPANCY_GRID;
+    let cell_of = |x: f64, y: f64| -> usize {
+        let last = (occupancy - 1) as f64;
+        let cx = ((x / w) * occupancy as f64).floor().clamp(0.0, last) as usize;
+        let cy = ((y / h) * occupancy as f64).floor().clamp(0.0, last) as usize;
+        cy * occupancy + cx
+    };
+    // Reference centroids are in the frame by construction; the clamp only
+    // keeps one that rounds onto the far edge in the last cell.
+    let mut occupied = vec![false; occupancy * occupancy];
+    for &(x, y) in reference {
+        if x.is_finite() && y.is_finite() {
+            occupied[cell_of(x, y)] = true;
+        }
+    }
+    let eligible: Vec<(f64, f64)> = subject
+        .iter()
+        .copied()
+        .filter(|&(x, y)| {
+            let (u, v) = map.apply(x, y);
+            u.is_finite()
+                && v.is_finite()
+                && (0.0..w).contains(&u)
+                && (0.0..h).contains(&v)
+                && occupied[cell_of(u, v)]
+        })
+        .collect();
+    if eligible.is_empty() {
+        return (0.0, 0);
+    }
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(x, y) in &eligible {
+        x0 = x0.min(x);
+        x1 = x1.max(x);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    let g = COVERAGE_GRID;
+    let axis = |v: f64, lo: f64, hi: f64| -> usize {
+        if hi > lo {
+            (((v - lo) / (hi - lo)) * g as f64)
+                .floor()
+                .clamp(0.0, (g - 1) as f64) as usize
+        } else {
+            0
+        }
+    };
+    let cell = |x: f64, y: f64| axis(y, y0, y1) * g + axis(x, x0, x1);
+    let mut holds_eligible = vec![false; g * g];
+    for &(x, y) in &eligible {
+        holds_eligible[cell(x, y)] = true;
+    }
+    let mut holds_inlier = vec![false; g * g];
+    for &(x, y) in inlier_subject_pts {
+        if (x0..=x1).contains(&x) && (y0..=y1).contains(&y) {
+            holds_inlier[cell(x, y)] = true;
+        }
+    }
+    let cells = holds_eligible.iter().filter(|c| **c).count();
+    let covered = holds_eligible
+        .iter()
+        .zip(&holds_inlier)
+        .filter(|(e, i)| **e && **i)
+        .count();
+    (covered as f64 / cells as f64, cells)
 }
 
 /// RMS, residual σ and peak |Δx|/|Δy| of `pairs` through `map`.
@@ -2584,5 +2955,702 @@ mod tests {
             let gate = super::super::scale_gate_for(Some(ratio), Some(1.0));
             assert!((gate_center(gate) - ratio).abs() < 1e-12, "{ratio}");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // The robust quad seed (RQ-1, RQ-2, PD-39) and the coverage index
+    // (RQ-10). The quad-level tests hand `robust_quad_seed` synthetic
+    // `Quad`s with only their centres filled in: the seed reads nothing
+    // else of a quad.
+    // ---------------------------------------------------------------
+
+    /// runB's two cameras (research (c)): a 6224 x 4168 subject frame onto a
+    /// 6248 x 4176 reference.
+    const SEED_SUBJECT: (f64, f64) = (6224.0, 4168.0);
+    const SEED_REFERENCE: (f64, f64) = (6248.0, 4176.0);
+
+    /// Scale 0.99227, turned 180 degrees, the subject frame centred on the
+    /// reference frame.
+    fn seed_truth() -> Linear {
+        let (ax, ay) =
+            similarity(0.99227, 180.0, 0.0, 0.0).apply(SEED_SUBJECT.0 / 2.0, SEED_SUBJECT.1 / 2.0);
+        similarity(
+            0.99227,
+            180.0,
+            SEED_REFERENCE.0 / 2.0 - ax,
+            SEED_REFERENCE.1 / 2.0 - ay,
+        )
+    }
+
+    /// One match as its two quad centres: (image, catalog).
+    type CentrePair = ((f64, f64), (f64, f64));
+
+    fn centre_quad(center: (f64, f64)) -> Quad {
+        Quad {
+            star_idx: [0, 1, 2, 3],
+            ratios: [0.0; 5],
+            longest: 1.0,
+            center,
+        }
+    }
+
+    /// The two quad lists and `matches[i] = (i, i)` of a list of centre pairs.
+    fn quad_level(pairs: &[CentrePair]) -> (Vec<Quad>, Vec<Quad>, Vec<(usize, usize)>) {
+        (
+            pairs.iter().map(|p| centre_quad(p.0)).collect(),
+            pairs.iter().map(|p| centre_quad(p.1)).collect(),
+            (0..pairs.len()).map(|i| (i, i)).collect(),
+        )
+    }
+
+    /// The image centre `p` with its catalog centre: the truth's image of
+    /// `p`, moved by `shift`, jittered by up to 0.10 px per axis.
+    fn jittered_match(
+        truth: &Linear,
+        p: (f64, f64),
+        shift: (f64, f64),
+        rng: &mut SplitMix64,
+    ) -> CentrePair {
+        let (x, y) = truth.apply(p.0, p.1);
+        let jx = (rng.next_f64() - 0.5) * 0.2;
+        let jy = (rng.next_f64() - 0.5) * 0.2;
+        (p, (x + shift.0 + jx, y + shift.1 + jy))
+    }
+
+    /// `n` true matches: image centres uniform over the subject frame.
+    fn true_matches(seed: u64, n: usize) -> Vec<CentrePair> {
+        let truth = seed_truth();
+        let mut rng = SplitMix64(seed);
+        (0..n)
+            .map(|_| {
+                let p = (
+                    rng.next_f64() * SEED_SUBJECT.0,
+                    rng.next_f64() * SEED_SUBJECT.1,
+                );
+                jittered_match(&truth, p, (0.0, 0.0), &mut rng)
+            })
+            .collect()
+    }
+
+    /// Fisher-Yates over `(pair, is_true)`, then split.
+    fn shuffled_with_flags(
+        mut all: Vec<(CentrePair, bool)>,
+        rng: &mut SplitMix64,
+    ) -> (Vec<CentrePair>, Vec<bool>) {
+        for i in (1..all.len()).rev() {
+            let j = rng.below(i + 1);
+            all.swap(i, j);
+        }
+        all.into_iter().unzip()
+    }
+
+    /// Largest distance, over a 33 x 23 grid on the subject frame, between
+    /// a seed's image of a point and the truth's.
+    fn grid_error(a: &Affine, truth: &Linear) -> f64 {
+        let mut worst = 0.0f64;
+        for j in 0..23 {
+            for i in 0..33 {
+                let x = SEED_SUBJECT.0 * i as f64 / 32.0;
+                let y = SEED_SUBJECT.1 * j as f64 / 22.0;
+                let (fx, fy) = a.apply(x, y);
+                let (tx, ty) = truth.apply(x, y);
+                worst = worst.max((fx - tx).hypot(fy - ty));
+            }
+        }
+        worst
+    }
+
+    fn bits(a: &Affine) -> [u64; 6] {
+        [a.a1, a.b1, a.c1, a.a2, a.b2, a.c2].map(f64::to_bits)
+    }
+
+    /// The numpy median of a copy of `values`.
+    fn median_of(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
+    }
+
+    #[test]
+    fn a_clean_quad_match_set_keeps_the_single_fit_bit_for_bit() {
+        let mut pairs = true_matches(1, 486);
+        pairs[100].1 .0 += 4.9;
+        let (image, catalog, matches) = quad_level(&pairs);
+        let seed = robust_quad_seed(&matches, &image, &catalog).expect("a clean set seeds");
+        assert_eq!(seed.route, SeedRoute::Clean);
+        assert_eq!(seed.dropped(), 0);
+        assert_eq!(seed.hypotheses, 0);
+        let plain = fit_affine(&matches, &image, &catalog).unwrap();
+        assert_eq!(bits(&seed.affine), bits(&plain));
+    }
+
+    /// A smooth radial term makes the plain fit's largest residual exceed the
+    /// 5 px tolerance, so the set takes the RANSAC route, yet no match is
+    /// dropped: the consensus fit's median residual equals the plain
+    /// median's, so the consensus loop's threshold (5 x the median) re-admits
+    /// the corners, and the seed is `fit_affine(all)` bit for bit. Review
+    /// r2 measured radial terms of 15 / 20 / 30 px at the corners: Consensus,
+    /// dropped 0 on 15 / 15 scenes. Here the term is `k * rho^2` along the
+    /// radius (`rho` 1 at the corners) and the affine absorbs 70 % of it, so
+    /// the guard (plain worst residual above 5 px and within 5 x the
+    /// median) sizes k at 20 / 30 / 40 (k = 15 leaves the plain fit clean).
+    /// This is the only test of the converge-to-every-match branch: no
+    /// research set took it (0 of 1 005).
+    #[test]
+    fn a_distorted_clean_set_converges_to_every_match_bit_for_bit() {
+        let centre = (SEED_REFERENCE.0 / 2.0, SEED_REFERENCE.1 / 2.0);
+        let corner = centre.0.hypot(centre.1);
+        for corner_px in [20.0, 30.0, 40.0] {
+            for s in 0..5u64 {
+                let pairs: Vec<CentrePair> = true_matches(s, 486)
+                    .into_iter()
+                    .map(|(p, (x, y))| {
+                        let (dx, dy) = (x - centre.0, y - centre.1);
+                        let r = dx.hypot(dy);
+                        let k = corner_px * (r / corner).powi(2) / r;
+                        (p, (x + k * dx, y + k * dy))
+                    })
+                    .collect();
+                let (image, catalog, matches) = quad_level(&pairs);
+                let plain = fit_affine(&matches, &image, &catalog).unwrap();
+                let r = quad_residuals(&plain, &matches, &image, &catalog);
+                let worst = r.iter().cloned().fold(0.0, f64::max);
+                assert!(
+                    worst > SEED_TOL_PX && worst <= SEED_LO_MEDIAN_FACTOR * median_of(&r),
+                    "guard: corner {corner_px} px seed {s}: plain worst {worst}, median {}",
+                    median_of(&r)
+                );
+                let seed = robust_quad_seed(&matches, &image, &catalog).unwrap();
+                assert_eq!(
+                    seed.route,
+                    SeedRoute::Consensus,
+                    "corner {corner_px} seed {s}"
+                );
+                assert_eq!(seed.dropped(), 0, "corner {corner_px} seed {s}");
+                assert_eq!(
+                    bits(&seed.affine),
+                    bits(&plain),
+                    "corner {corner_px} seed {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_far_false_quad_matches_are_dropped_and_the_seed_is_the_true_fit() {
+        let truth = seed_truth();
+        let mut rng = SplitMix64(77);
+        let mut pairs = true_matches(2, 486);
+        pairs.push(jittered_match(
+            &truth,
+            (600.0, 600.0),
+            (-2405.0, 0.0),
+            &mut rng,
+        ));
+        pairs.push(jittered_match(
+            &truth,
+            (900.0, 3500.0),
+            (-4298.0, 0.0),
+            &mut rng,
+        ));
+        let (image, catalog, matches) = quad_level(&pairs);
+
+        let pulled = fit_affine(&matches, &image, &catalog).expect("the plain fit exists");
+        assert!(
+            grid_error(&pulled, &truth) >= 10.0,
+            "guard: the plain fit over all 488 is {} px off",
+            grid_error(&pulled, &truth)
+        );
+
+        let seed = robust_quad_seed(&matches, &image, &catalog).unwrap();
+        assert_eq!(seed.route, SeedRoute::Consensus);
+        assert_eq!(seed.dropped(), 2);
+        assert!(seed.kept[..486].iter().all(|k| *k));
+        assert!(!seed.kept[486] && !seed.kept[487]);
+        let true_fit = fit_affine(&matches[..486], &image, &catalog).unwrap();
+        assert_eq!(bits(&seed.affine), bits(&true_fit));
+        assert!(grid_error(&seed.affine, &truth) <= 0.5);
+
+        // Only the 2 405 px match.
+        let (image, catalog, matches) = quad_level(&pairs[..487]);
+        let seed = robust_quad_seed(&matches, &image, &catalog).unwrap();
+        assert_eq!(seed.route, SeedRoute::Consensus);
+        assert_eq!(seed.dropped(), 1);
+        assert!(!seed.kept[486]);
+        let true_fit = fit_affine(&matches[..486], &image, &catalog).unwrap();
+        assert_eq!(bits(&seed.affine), bits(&true_fit));
+        assert!(grid_error(&seed.affine, &truth) <= 0.5);
+    }
+
+    #[test]
+    fn a_small_match_set_keeps_the_single_fit() {
+        let truth = seed_truth();
+        let mut rng = SplitMix64(5);
+        let mut pairs = true_matches(3, 6);
+        // The false match sits at the centroid of the true ones: it has no
+        // leverage on the slopes, so the fit stays inside the xy-scale gate
+        // and the plain fit exists to compare with.
+        let centroid = (
+            pairs.iter().map(|p| p.0 .0).sum::<f64>() / 6.0,
+            pairs.iter().map(|p| p.0 .1).sum::<f64>() / 6.0,
+        );
+        pairs.push(jittered_match(&truth, centroid, (-2405.0, 0.0), &mut rng));
+        let (image, catalog, matches) = quad_level(&pairs);
+        let plain = fit_affine(&matches, &image, &catalog).expect("guard: the plain fit exists");
+        let seed = robust_quad_seed(&matches, &image, &catalog).unwrap();
+        assert_eq!(seed.route, SeedRoute::Single);
+        assert_eq!(seed.dropped(), 0);
+        assert_eq!(seed.hypotheses, 0);
+        assert_eq!(bits(&seed.affine), bits(&plain));
+    }
+
+    #[test]
+    fn a_random_false_majority_is_recovered() {
+        let truth = seed_truth();
+        let mut plain_none = 0;
+        for share in [0.3, 0.5, 0.7, 0.85] {
+            let false_n = (486.0 * share / (1.0 - share)) as usize;
+            for s in 0..10u64 {
+                let mut rng = SplitMix64(1000 + s);
+                let mut all: Vec<(CentrePair, bool)> = true_matches(s, 486)
+                    .into_iter()
+                    .map(|p| (p, true))
+                    .collect();
+                for _ in 0..false_n {
+                    let image = (
+                        rng.next_f64() * SEED_SUBJECT.0,
+                        rng.next_f64() * SEED_SUBJECT.1,
+                    );
+                    let catalog = (
+                        rng.next_f64() * SEED_REFERENCE.0,
+                        rng.next_f64() * SEED_REFERENCE.1,
+                    );
+                    all.push(((image, catalog), false));
+                }
+                let (pairs, is_true) = shuffled_with_flags(all, &mut rng);
+                let (image, catalog, matches) = quad_level(&pairs);
+                if fit_affine(&matches, &image, &catalog).is_none() {
+                    plain_none += 1;
+                }
+                let seed = robust_quad_seed(&matches, &image, &catalog)
+                    .unwrap_or_else(|| panic!("share {share} seed {s}: no seed"));
+                assert_eq!(seed.route, SeedRoute::Consensus, "share {share} seed {s}");
+                assert!(
+                    grid_error(&seed.affine, &truth) <= 0.5,
+                    "share {share} seed {s}: {} px off",
+                    grid_error(&seed.affine, &truth)
+                );
+                for (i, t) in is_true.iter().enumerate() {
+                    assert!(
+                        !*t || seed.kept[i],
+                        "share {share} seed {s}: true match {i} lost"
+                    );
+                }
+            }
+        }
+        assert!(
+            plain_none > 0,
+            "guard: the scenes must include sets whose plain fit is None (RQ-2)"
+        );
+    }
+
+    #[test]
+    fn a_consistent_false_minority_is_recovered() {
+        let truth = seed_truth();
+        for share in [0.1, 0.3] {
+            let false_n = (486.0 * share / (1.0 - share)) as usize;
+            for s in 0..5u64 {
+                let mut rng = SplitMix64(2000 + s);
+                let mut all: Vec<(CentrePair, bool)> = true_matches(s, 486)
+                    .into_iter()
+                    .map(|p| (p, true))
+                    .collect();
+                for _ in 0..false_n {
+                    let p = (
+                        rng.next_f64() * SEED_SUBJECT.0,
+                        rng.next_f64() * SEED_SUBJECT.1,
+                    );
+                    all.push((jittered_match(&truth, p, (-2405.0, 0.0), &mut rng), false));
+                }
+                let (pairs, _) = shuffled_with_flags(all, &mut rng);
+                let (image, catalog, matches) = quad_level(&pairs);
+                let seed = robust_quad_seed(&matches, &image, &catalog)
+                    .unwrap_or_else(|| panic!("share {share} seed {s}: no seed"));
+                assert!(
+                    grid_error(&seed.affine, &truth) <= 0.5,
+                    "share {share} seed {s}: {} px off",
+                    grid_error(&seed.affine, &truth)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_robust_seed_is_deterministic() {
+        let mut rng = SplitMix64(4242);
+        let mut all: Vec<(CentrePair, bool)> = true_matches(9, 486)
+            .into_iter()
+            .map(|p| (p, true))
+            .collect();
+        for _ in 0..486 {
+            let image = (
+                rng.next_f64() * SEED_SUBJECT.0,
+                rng.next_f64() * SEED_SUBJECT.1,
+            );
+            let catalog = (
+                rng.next_f64() * SEED_REFERENCE.0,
+                rng.next_f64() * SEED_REFERENCE.1,
+            );
+            all.push(((image, catalog), false));
+        }
+        let (pairs, _) = shuffled_with_flags(all, &mut rng);
+        let (image, catalog, matches) = quad_level(&pairs);
+        let a = robust_quad_seed(&matches, &image, &catalog).unwrap();
+        let b = robust_quad_seed(&matches, &image, &catalog).unwrap();
+        assert_eq!(a.kept, b.kept);
+        assert_eq!(a.hypotheses, b.hypotheses);
+        assert_eq!(a.fits, b.fits);
+        assert_eq!(bits(&a.affine), bits(&b.affine));
+    }
+
+    /// RQ-10 (a)-(c) on hand-built lists, reference 1600 x 1600 (16 x 16
+    /// occupancy cells of 100 px) and the identity map unless said.
+    #[test]
+    fn coverage_counts_only_stars_that_land_where_the_reference_has_stars() {
+        let geo = (1600usize, 1600usize);
+        let lattice: Vec<(f64, f64)> = (0..16)
+            .flat_map(|j| (0..16).map(move |i| (50.0 + 100.0 * i as f64, 50.0 + 100.0 * j as f64)))
+            .collect();
+        let identity = similarity(1.0, 0.0, 0.0, 0.0);
+
+        // No eligible star: no cells.
+        assert_eq!(coverage(&[], &lattice, &[], &identity, geo), (0.0, 0));
+
+        // A full overlap, every star an inlier: 16 of 16 cells.
+        assert_eq!(
+            coverage(&lattice, &lattice, &lattice, &identity, geo),
+            (1.0, 16)
+        );
+
+        // Inliers in 2 of 16 cells (the corner cells): 0.125.
+        let two = [lattice[0], lattice[255]];
+        assert_eq!(
+            coverage(&lattice, &lattice, &two, &identity, geo),
+            (0.125, 16)
+        );
+
+        // A cell with an eligible star and no inlier counts against: no
+        // inlier in the grid's first cell (x, y < 425).
+        let all_but_one_cell: Vec<(f64, f64)> = lattice
+            .iter()
+            .copied()
+            .filter(|&(x, y)| !(x < 425.0 && y < 425.0))
+            .collect();
+        assert_eq!(
+            coverage(&lattice, &lattice, &all_but_one_cell, &identity, geo),
+            (15.0 / 16.0, 16)
+        );
+
+        // A corner overlap: the map sends only the subject's far quadrant
+        // into the reference (64 stars); the 4 x 4 grid spans THOSE stars,
+        // so it still has 16 cells. Inliers outside the box are ignored.
+        let shift = similarity(1.0, 0.0, -800.0, -800.0);
+        assert_eq!(
+            coverage(&lattice, &lattice, &lattice, &shift, geo),
+            (1.0, 16)
+        );
+
+        // A zero-width box is one column: five stars on x = 850.
+        let column: Vec<(f64, f64)> = (0..5).map(|k| (850.0, 150.0 + 200.0 * k as f64)).collect();
+        assert_eq!(
+            coverage(&column, &lattice, &column, &identity, geo),
+            (1.0, 4)
+        );
+        assert_eq!(
+            coverage(&column, &lattice, &column[..2], &identity, geo),
+            (0.5, 4)
+        );
+
+        // Not eligible: a star imaged outside the reference frame, and a
+        // star imaged into a reference cell with no reference star. The
+        // reference holds three corner stars and one at (50, 850).
+        let reference = [(50.0, 50.0), (1550.0, 50.0), (50.0, 1550.0), (50.0, 850.0)];
+        let corners = [(50.0, 50.0), (1550.0, 50.0), (50.0, 1550.0)];
+        let mut subject = corners.to_vec();
+        subject.push((-300.0, 850.0)); // outside the frame (clamped, its cell holds a star)
+        subject.push((1550.0, 1550.0)); // inside, but its cell holds no reference star
+        assert_eq!(
+            coverage(&subject, &reference, &corners, &identity, geo),
+            (1.0, 3)
+        );
+        // With a reference star in that cell the fourth corner is eligible
+        // and has no inlier among `corners`.
+        let mut reference4 = reference.to_vec();
+        reference4.push((1550.0, 1550.0));
+        assert_eq!(
+            coverage(&subject, &reference4, &corners, &identity, geo),
+            (0.75, 4)
+        );
+    }
+
+    /// The `recovers_a_similarity_with_outliers_and_jitter` scene with no
+    /// outliers: its matches are all true, so `seed_affine` is the plain fit.
+    #[test]
+    fn seed_affine_is_bit_identical_to_the_plain_fit_on_a_clean_scene() {
+        let subject = field(1, 300, W, H);
+        let truth = similarity(1.002, 3.0, 12.3, -7.7);
+        let (sub, refs) = scene(&subject, &truth, 0.05, 0, W, H, 7);
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let sub_q = build_quads(&sub_pts, sub_pts.len(), group_size_for(sub_pts.len()));
+        let ref_q = build_quads(&ref_pts, ref_pts.len(), group_size_for(ref_pts.len()));
+        let matches = match_quads(&sub_q, &ref_q, QUAD_TOLERANCE);
+        let robust = robust_quad_seed(&matches, &sub_q, &ref_q).expect("the scene seeds");
+        assert_eq!(
+            robust.dropped(),
+            0,
+            "guard: the scene carries no false quad match"
+        );
+        let plain = fit_affine(&matches, &sub_q, &ref_q).expect("the plain fit exists");
+
+        let (seed, n) = seed_affine(&sub_pts, &ref_pts, false).unwrap();
+        assert_eq!(n, matches.len());
+        let m = seed.m;
+        let got = Affine {
+            a1: m[0][0],
+            b1: m[0][1],
+            c1: m[0][2],
+            a2: m[1][0],
+            b2: m[1][1],
+            c2: m[1][2],
+        };
+        assert_eq!(bits(&got), bits(&plain));
+    }
+
+    // ---- The decoy scene: two asterisms whose translated copies pull a plain quad fit ----
+
+    /// Stars in the subject field (start N; tuned until the true quad
+    /// matches land in the measured 400-600 window).
+    const DECOY_STARS: usize = 2200;
+    const DECOY_SITES: [(f64, f64); 2] = [(600.0, 600.0), (900.0, 3500.0)];
+    const DECOY_SHIFTS: [f64; 2] = [-2405.0, -4298.0];
+    /// Four stars inside 20 px, a different shape per site.
+    const DECOY_OFFSETS: [[(f64, f64); 4]; 2] = [
+        [(-9.0, -6.0), (7.5, -8.0), (9.0, 5.0), (-4.0, 9.0)],
+        [(-8.0, 7.0), (6.0, 9.5), (9.0, -3.0), (-2.0, -9.0)],
+    ];
+
+    /// N subject stars on 6224 x 4168; the reference is their images
+    /// (+-0.05 px) with a random 18 % removed and as many reference-only
+    /// stars added (overlap 0.82); both lists shuffled. Two subject
+    /// asterisms (4 stars inside 20 px) have their true images in the
+    /// reference and translated copies of those images at (-2 405, 0) and
+    /// (-4 298, 0) px; no other star within 80 px of any of the six
+    /// asterisms in either list.
+    fn decoy_scene(seed: u64) -> (Vec<Star>, Vec<Star>, Linear) {
+        let truth = seed_truth();
+        let mut rng = SplitMix64(seed ^ 0xDEC0);
+        let near = |a: (f64, f64), b: (f64, f64), r: f64| (a.0 - b.0).hypot(a.1 - b.1) < r;
+        let true_sites: Vec<(f64, f64)> = DECOY_SITES
+            .iter()
+            .map(|&(x, y)| truth.apply(x, y))
+            .collect();
+        let copy_sites: Vec<(f64, f64)> = true_sites
+            .iter()
+            .zip(DECOY_SHIFTS)
+            .map(|(&(x, y), d)| (x + d, y))
+            .collect();
+        let reference_sites: Vec<(f64, f64)> =
+            true_sites.iter().chain(&copy_sites).copied().collect();
+
+        // The subject field, carved around the asterisms.
+        let mut subject: Vec<Star> = field(seed, DECOY_STARS, SEED_SUBJECT.0, SEED_SUBJECT.1)
+            .into_iter()
+            .filter(|s| DECOY_SITES.iter().all(|&c| !near((s.x, s.y), c, 82.0)))
+            .collect();
+        let jitter = |rng: &mut SplitMix64| (rng.next_f64() - 0.5) * 0.1;
+        let mut reference = Vec::new();
+        let mut removed = 0usize;
+        for s in &subject {
+            let (x, y) = truth.apply(s.x, s.y);
+            let (jx, jy) = (jitter(&mut rng), jitter(&mut rng));
+            if rng.next_f64() < 0.18 {
+                removed += 1;
+            } else if reference_sites.iter().all(|&c| !near((x, y), c, 80.0)) {
+                reference.push(Star {
+                    x: x + jx,
+                    y: y + jy,
+                    flux: s.flux,
+                    sigma: s.sigma,
+                });
+            }
+        }
+        // As many reference-only stars as were removed.
+        reference.extend(
+            field(seed + 1, removed, SEED_REFERENCE.0, SEED_REFERENCE.1)
+                .into_iter()
+                .filter(|s| reference_sites.iter().all(|&c| !near((s.x, s.y), c, 80.0))),
+        );
+        // The asterisms: subject stars, their true images and the copies.
+        for (n, offsets) in DECOY_OFFSETS.iter().enumerate() {
+            let (site, shift) = (DECOY_SITES[n], DECOY_SHIFTS[n]);
+            for (k, &(ox, oy)) in offsets.iter().enumerate() {
+                let star = Star {
+                    x: site.0 + ox,
+                    y: site.1 + oy,
+                    flux: 500.0,
+                    sigma: Some((0.05, 0.05)),
+                };
+                let (x, y) = truth.apply(star.x, star.y);
+                for dx in [0.0, shift] {
+                    reference.push(Star {
+                        x: x + dx + jitter(&mut rng),
+                        y: y + jitter(&mut rng),
+                        flux: 500.0 - k as f64,
+                        sigma: star.sigma,
+                    });
+                }
+                subject.push(star);
+            }
+        }
+        for v in [&mut subject, &mut reference] {
+            for i in (1..v.len()).rev() {
+                let j = rng.below(i + 1);
+                v.swap(i, j);
+            }
+        }
+        (subject, reference, truth)
+    }
+
+    /// The guards of the decoy scene, asserted before any test reads it: the
+    /// true quad matches, the far false ones, and a plain fit that the false
+    /// ones pull off the field.
+    fn assert_decoy_guards(subject: &[Star], reference: &[Star], truth: &Linear) {
+        let sub_pts: Vec<(f64, f64)> = subject.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = reference.iter().map(|s| (s.x, s.y)).collect();
+        let sub_q = build_quads(&sub_pts, sub_pts.len(), group_size_for(sub_pts.len()));
+        let ref_q = build_quads(&ref_pts, ref_pts.len(), group_size_for(ref_pts.len()));
+        let matches = match_quads(&sub_q, &ref_q, QUAD_TOLERANCE);
+        let off_truth: Vec<f64> = matches
+            .iter()
+            .map(|&(i, c)| {
+                let (x, y) = truth.apply(sub_q[i].center.0, sub_q[i].center.1);
+                (x - ref_q[c].center.0).hypot(y - ref_q[c].center.1)
+            })
+            .collect();
+        let true_n = off_truth.iter().filter(|d| **d <= 3.0).count();
+        let far_n = off_truth.iter().filter(|d| **d > 2000.0).count();
+        assert!(
+            (400..=600).contains(&true_n),
+            "guard: {true_n} true quad matches (tune DECOY_STARS)"
+        );
+        assert!(far_n >= 2, "guard: {far_n} matches beyond 2 000 px");
+        let plain = fit_affine(&matches, &sub_q, &ref_q).expect("guard: the plain fit exists");
+        assert!(
+            grid_error(&plain, truth) >= 10.0,
+            "guard: the plain fit is {} px off",
+            grid_error(&plain, truth)
+        );
+    }
+
+    fn decoy_geometry() -> ((usize, usize), (usize, usize)) {
+        (
+            (SEED_REFERENCE.0 as usize, SEED_REFERENCE.1 as usize),
+            (SEED_SUBJECT.0 as usize, SEED_SUBJECT.1 as usize),
+        )
+    }
+
+    /// Largest distance, over the 33 x 23 grid on the subject frame, between
+    /// an alignment's map and the truth's.
+    fn map_error(a: &Alignment, truth: &Linear) -> f64 {
+        let mut worst = 0.0f64;
+        for j in 0..23 {
+            for i in 0..33 {
+                let x = SEED_SUBJECT.0 * i as f64 / 32.0;
+                let y = SEED_SUBJECT.1 * j as f64 / 22.0;
+                let (fx, fy) = a.map.forward(x, y);
+                let (tx, ty) = truth.apply(x, y);
+                worst = worst.max((fx - tx).hypot(fy - ty));
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn two_decoy_asterisms_no_longer_pull_the_seed_off_the_field() {
+        let (sub, refs, truth) = decoy_scene(1);
+        assert_decoy_guards(&sub, &refs, &truth);
+        let (ref_geo, sub_geo) = decoy_geometry();
+        let a = align_default(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+        )
+        .expect("the field aligns");
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert!(
+            map_error(&a, &truth) <= 0.1,
+            "map {} px off",
+            map_error(&a, &truth)
+        );
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        let at_truth = pair_through(&truth, &sub, &refs, &tree, 3.8).pairs.len();
+        assert!(
+            a.inliers as f64 >= 0.95 * at_truth as f64,
+            "inliers {} of {at_truth} at the truth",
+            a.inliers
+        );
+        assert!(
+            a.repaired * 100 <= a.pairs,
+            "the seed pairs the field: repaired {} of {}",
+            a.repaired,
+            a.pairs
+        );
+    }
+
+    /// Research: frame 162 registered right on 4 of 200 single-star
+    /// deletions with the plain seed, 200 of 200 with the robust one.
+    #[test]
+    fn deleting_one_registration_star_never_flips_the_map() {
+        let (sub, refs, truth) = decoy_scene(1);
+        assert_decoy_guards(&sub, &refs, &truth);
+        let (ref_geo, sub_geo) = decoy_geometry();
+        let cfg = RegistrationConfig::default();
+        let mut run = 0;
+        for k in (0..sub.len()).step_by(25) {
+            // Never an asterism star.
+            if DECOY_SITES
+                .iter()
+                .any(|&c| (sub[k].x - c.0).hypot(sub[k].y - c.1) < 40.0)
+            {
+                continue;
+            }
+            let mut fewer = sub.clone();
+            fewer.remove(k);
+            let a = align_default(&fewer, &refs, ref_geo, sub_geo, &cfg)
+                .unwrap_or_else(|e| panic!("deleting star {k}: {e}"));
+            assert_eq!(a.seed, SeedKind::Quads, "deleting star {k}");
+            assert!(
+                map_error(&a, &truth) <= 0.2,
+                "deleting star {k}: map {} px off",
+                map_error(&a, &truth)
+            );
+            assert!(
+                a.repaired * 100 <= a.pairs,
+                "deleting star {k}: repaired {} of {}",
+                a.repaired,
+                a.pairs
+            );
+            run += 1;
+        }
+        assert!(run >= 20, "only {run} deletions ran");
     }
 }
