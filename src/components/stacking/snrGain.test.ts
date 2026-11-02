@@ -4,7 +4,6 @@ import {
   SNR_GAIN_STALE_TOOLTIP,
   SNR_GAIN_UNMEASURED_TOOLTIP,
   SNR_GAIN_VERSION,
-  SNR_GAIN_WEIGHT_MODE_TOOLTIP,
   snrGainLabel,
 } from './snrGain';
 
@@ -51,41 +50,29 @@ describe('snrGainLabel', () => {
     expect(snrGainLabel({ snrGain: [], snrGainVersion: SNR_GAIN_VERSION })).toEqual({ text: 'SNR gain —' });
   });
 
-  it('names the weight mode when a gain of 0 comes from a mode outside the PSF family (PD-19)', () => {
-    const reason =
-      'not measured under this weight mode — the frame-common star set it needs is built by the PSF weight modes only';
-    expect(SNR_GAIN_WEIGHT_MODE_TOOLTIP).toBe(reason);
-    for (const mode of ['noise', 'formula', 'exposure', 'keyword', 'none'] as const) {
-      expect(snrGainLabel({ snrGain: [0], snrGainVersion: SNR_GAIN_VERSION }, mode)).toEqual({
-        text: 'SNR gain —',
-        title: reason,
-      });
-    }
-    // a colour group, every plane 0: the same text
-    expect(snrGainLabel({ snrGain: [0, 0, 0], snrGainVersion: SNR_GAIN_VERSION }, 'noise')).toEqual({
+  it('reads a gain of 0 the same under every weight mode (PD-19 b)', () => {
+    // The frame-common star set is built in every weight mode, so the label takes the stats alone (the type has no mode): a 0 is "not measured
+    // for this group" under Noise / Formula / Exposure / Keyword / None as under the PSF modes.
+    expect(snrGainLabel({ snrGain: [0], snrGainVersion: SNR_GAIN_VERSION })).toEqual({
       text: 'SNR gain —',
-      title: reason,
+      title: 'not measured for this group',
     });
-  });
-
-  it('keeps "not measured for this group" for a gain of 0 under the PSF weight modes, or when the mode is unknown', () => {
-    for (const mode of ['psfSignalWeight', 'psfSnr', undefined] as const) {
-      expect(snrGainLabel({ snrGain: [0], snrGainVersion: SNR_GAIN_VERSION }, mode)).toEqual({
-        text: 'SNR gain —',
-        title: 'not measured for this group',
-      });
-    }
-    // a measured gain is shown whatever the mode says
-    expect(snrGainLabel({ snrGain: [7.08], snrGainVersion: SNR_GAIN_VERSION }, 'noise')).toEqual({
+    // a colour group, every plane 0: the same text
+    expect(snrGainLabel({ snrGain: [0, 0, 0], snrGainVersion: SNR_GAIN_VERSION })).toEqual({
+      text: 'SNR gain —',
+      title: 'not measured for this group',
+    });
+    // a measured gain is shown as it is
+    expect(snrGainLabel({ snrGain: [7.08], snrGainVersion: SNR_GAIN_VERSION })).toEqual({
       text: 'SNR gain 7.08×',
     });
-    // the v0 / v1 branches ignore the mode
-    expect(snrGainLabel({ snrGain: [0], snrGainVersion: 1 }, 'noise').title).toBe(SNR_GAIN_OLDER_FORMULA_TOOLTIP);
-    expect(snrGainLabel({ snrGain: [0] }, 'noise').title).toBe(SNR_GAIN_STALE_TOOLTIP);
+    // the v0 / v1 branches stay as they were
+    expect(snrGainLabel({ snrGain: [0], snrGainVersion: 1 }).title).toBe(SNR_GAIN_OLDER_FORMULA_TOOLTIP);
+    expect(snrGainLabel({ snrGain: [0] }).title).toBe(SNR_GAIN_STALE_TOOLTIP);
   });
 
   it('shows every plane of a colour group, two decimals, " / " between them (PD-20)', () => {
-    expect(snrGainLabel({ snrGain: [7.41, 7.99, 7.86], snrGainVersion: SNR_GAIN_VERSION }, 'psfSnr')).toEqual({
+    expect(snrGainLabel({ snrGain: [7.41, 7.99, 7.86], snrGainVersion: SNR_GAIN_VERSION })).toEqual({
       text: 'SNR gain 7.41 / 7.99 / 7.86×',
     });
     expect(snrGainLabel({ snrGain: [7.4149, 8, 7.855], snrGainVersion: SNR_GAIN_VERSION }).text).toBe(
@@ -96,7 +83,7 @@ describe('snrGainLabel', () => {
 
   it('puts "—" in the slot of a plane that was not measured and names it in the tooltip (PD-20)', () => {
     const v = SNR_GAIN_VERSION;
-    expect(snrGainLabel({ snrGain: [0, 7.99, 7.86], snrGainVersion: v }, 'psfSnr')).toEqual({
+    expect(snrGainLabel({ snrGain: [0, 7.99, 7.86], snrGainVersion: v })).toEqual({
       text: 'SNR gain — / 7.99 / 7.86×',
       title: 'R not measured for this group',
     });
@@ -124,7 +111,7 @@ describe('snrGainLabel', () => {
   });
 
   it('shows "SNR gain —" when every plane of a colour group is 0, with the group-level tooltip (PD-20)', () => {
-    expect(snrGainLabel({ snrGain: [0, 0, 0], snrGainVersion: SNR_GAIN_VERSION }, 'psfSnr')).toEqual({
+    expect(snrGainLabel({ snrGain: [0, 0, 0], snrGainVersion: SNR_GAIN_VERSION })).toEqual({
       text: 'SNR gain —',
       title: 'not measured for this group',
     });
