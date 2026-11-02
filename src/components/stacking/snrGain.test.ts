@@ -50,7 +50,7 @@ describe('snrGainLabel', () => {
     expect(snrGainLabel({ snrGain: [], snrGainVersion: SNR_GAIN_VERSION })).toEqual({ text: 'SNR gain —' });
   });
 
-  it('reads a gain of 0 the same under every weight mode (PD-19 b)', () => {
+  it('reads the stats alone, whatever the weight mode: a 0 is not measured, a gain is shown (PD-19 b)', () => {
     // The frame-common star set is built in every weight mode, so the label takes the stats alone (the type has no mode): a 0 is "not measured
     // for this group" under Noise / Formula / Exposure / Keyword / None as under the PSF modes.
     expect(snrGainLabel({ snrGain: [0], snrGainVersion: SNR_GAIN_VERSION })).toEqual({

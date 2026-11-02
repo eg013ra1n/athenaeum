@@ -695,15 +695,18 @@ masterNoise: Array<number>, masterLocation: Array<number>, masterScale: Array<nu
 bestSubNoise: Array<number>, 
 /**
  * The master's PSF SNR per plane: over the group's frame-common star set when it has one (Plan D D1b, the stars the
- * master matches), else over every star of the master. `best_sub_psf_snr` is the best sub's own `psf_snr` - the
- * common-set value after the reweigh (D1w), else its Measure-time one.
+ * master matches), else over every star of the master. `best_sub_psf_snr` is the best sub's own `psf_snr` - under the
+ * PSF weight family the common-set value after the reweigh (D1w), else its Measure-time one; outside the family
+ * (Noise / Formula / Exposure / Keyword / None) always the Measure-time whole-field figure, because no frame is weighed
+ * on the set there (PD-19 b).
  *
  * These two are NOT a ratio pair, and nothing divides them to get [`GroupStats::snr_gain`] (that is
  * [`paired_snr_gain`], on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
  * matched in its rectangle on a plane that has a set, and the whole-field figure (unmarked) on a plane that fell
- * back or matched under 20; `best_sub_psf_snr` is the frame's own `psf_snr`, whose flux after D1w is the paired
- * ratio `r_f` times the anchor's whole-set sum (the stars the frame lacks are extrapolated, not summed), or its
- * Measure-time figure on a fallback. They agree only where one set is whole in both images.
+ * back or matched under 20; `best_sub_psf_snr` is the frame's own `psf_snr`, whose flux under the PSF family after D1w
+ * is the paired ratio `r_f` times the anchor's whole-set sum (the stars the frame lacks are extrapolated, not summed),
+ * or its Measure-time figure on a fallback. Under the PSF family they agree only where one set is whole in both images; outside
+ * the family they never agree (the best sub is Measure-time there, the master reads the set).
  */
 masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>, 
 /**

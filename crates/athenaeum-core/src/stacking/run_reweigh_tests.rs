@@ -802,9 +802,12 @@ fn non_psf_weight_modes_are_untouched_by_the_reweigh() {
             assert!(!noisy.included);
         }
         assert_eq!(h.metrics_payloads(), payloads, "{mode:?}");
-        // PD-19 (b): the set is built in every mode, for the SNR gain; the weights above did not move for it.
-        assert!(h.rc.common_stars.contains_key(&h.key()), "{mode:?}");
-        assert!(log.contains("frame-common star set"), "{mode:?}: {log}");
+        // PD-19 (b): the set is built in every mode, for the SNR gain; the weights above did not move for it. A SET, not a
+        // fallback: a fallback is also recorded (`Some([None])`) and its warn also contains "frame-common star set".
+        let sets = h.rc.common_stars.get(&h.key()).unwrap_or_else(|| panic!("{mode:?}: no set recorded: {log}"));
+        assert!(sets.len() == 1 && sets[0].is_some(), "{mode:?}: a set, not a fallback: {log}");
+        assert!(log.contains("weights: frame-common star set"), "{mode:?}: {log}");
+        assert!(!log.contains("no frame-common star set"), "{mode:?}: {log}");
         assert!(!log.contains("frame reweighed"), "{mode:?}: no member is reweighed outside the PSF family: {log}");
         let rows = h.rows();
         for &id in &h.ids {
