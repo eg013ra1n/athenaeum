@@ -29,6 +29,13 @@ commit and the controller adds its sha here; push on the owner's word. What it d
 carried unchanged. Other references: `docs/stacking/README.md` R-OSP-16 (Plan B) and R-OSP-17 (Plan C), the after-Plan-B report `docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` §6,
 and the Plan C after note `docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md` §9.
 
+**Plan D final review r1 (fable, 2026-11-02), minor m1 — the anchor on a 3-plane image with a dead plane.** `pick_anchor` reads
+`mean_fwhm_px()` (`stacking/run.rs` ~9992, `stacking/measure.rs` ~414–420 / ~1414), which averages a plane without an in-statistic fit as 0,
+so a frame with one dead plane but a top-half unsaturated count can win the anchor; that plane then falls back whole (under 20 common stars)
+and the live planes anchor on a non-sharpest frame. Rare and graceful (a fallback, warned). Fix: rank by the mean over live planes, members
+with fewer live planes after those with more, plus one test; it moves an anchor only where a member has a dead plane. Also n3: the
+`MissingFits` fallback reason also covers a member whose plane does not exist (see the `nch` note).
+
 **Owner question (unanswered).** solvemyastro on rustafits with `default-features = false`: `clap` is still in the build. Is the branch on GitHub for the owner to merge?
 
 **Scope as it ended (owner, 2026-10-31: «Только вес стека»).** (0) the first `c` item on the calibrated path: fixed by D2 (PD-9); (1) the weight's hang on saturated stars' `tflux` and the FWHM trend
