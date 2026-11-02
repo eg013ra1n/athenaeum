@@ -141,7 +141,7 @@ Binding beside them:
 ## Rulings fixed by this plan
 
 Recorded in `.superpowers/sdd/2026-11-02-regfrag/rulings.md` at R0, and in `docs/stacking/README.md` at R9. RQ-5,
-RQ-6, RQ-7 and RQ-9 are proposals until the owner answers (**Owner questions (open)** below).
+RQ-6, RQ-7 and RQ-9 were proposals until the owner answered; the owner accepted all four on 2026-11-02 (**Owner questions (answered)** below).
 
 | id | ruling |
 | ---- | ---- |
@@ -155,9 +155,9 @@ RQ-6, RQ-7 and RQ-9 are proposals until the owner answers (**Owner questions (op
 | RQ-8 | **Truth and the bar rule.** Truth is a direct 8-parameter homography of the frame's unsaturated fits against 20 trusted members' fits mapped through their maps (iterated at 6 / 4 / 1.5 / 1.0 px, unique matches; `truthmaps.py`). Trusted = rows bit-identical between base and fix, and inliers ≥ 0.75 × the group median, taken evenly across the group; the frame itself is never its own member. A truth with < 10 000 pairs or rms > 0.5 px is flagged weak and reported. Truth is computed for moved frames, bad-in-base frames and 10 controls per mono group (controls must read ≤ 0.10 px max, else STOP). Maps are evaluated through `regfrag_probe mapgrid` (`PixelMap::from_json` + `forward_exact`), never re-implemented in Python. |
 | RQ-9 | **The base.** If Plan D's `pland-<ds>-final` clones exist with their comparator kit and `git diff --quiet <final sha> <main> -- crates solvemyastro rustafits` holds, the base is `final`. Otherwise R0 runs `rbase` at `main`. The `final` runs post `local` on hc11, runB and s204 (PD-40), and the `rqs` runs post the same; R4's `PLAND_BASE_RESULTS` reads the base's results where they are (`results/plan-d/final/`). |
 
-## Owner questions (open)
+## Owner questions (answered)
 
-Fable's recommendation (review r1) beside each. The owner's answer goes into `rulings.md` at R0.
+Fable's recommendation (review r1) beside each. **The owner accepted all four on 2026-11-02 («Да, все четыре»)**; R0 copies them into `rulings.md`.
 
 | question | fable's recommendation |
 | ---- | ---- |
