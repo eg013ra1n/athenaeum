@@ -9816,6 +9816,7 @@ fn plane_outcome(
     entries: &[MeasuredFrame],
     members: &[ReweighMember],
     plane: usize,
+    planes: usize,
     anchor: usize,
 ) -> Result<PlaneOutcome, RunError> {
     // The member's plane and map, `None` for a member the plane does not exist on.
@@ -9842,6 +9843,7 @@ fn plane_outcome(
             fwhm_px: ch.fwhm_px,
             noise: ch.noise,
             c_stand_in: ch.aperture_correction_group.unwrap_or(1.0),
+            planes,
         })
     };
     let mut usable = Vec::with_capacity(members.len());
@@ -9863,10 +9865,11 @@ fn plane_outcome(
                 fwhm_px: ch.fwhm_px,
                 noise: ch.noise,
                 c_stand_in: ch.aperture_correction_group.unwrap_or(1.0),
+                planes,
             },
         ));
     }
-    Ok(match common_set::common_flux(&cands, &usable, anchor) {
+    Ok(match common_set::common_flux(&cands, &usable, anchor, planes) {
         common_set::CommonOutcome::Measured {
             positions,
             per_member,
@@ -10003,7 +10006,7 @@ fn reweigh_group(
         for plane in 0..nch {
             outcomes.push(match anchor {
                 None => PlaneOutcome::Fallback(Fallback::NoAnchor),
-                Some(a) => plane_outcome(rc, &group.key, entries, &members, plane, a)?,
+                Some(a) => plane_outcome(rc, &group.key, entries, &members, plane, nch, a)?,
             });
         }
         (anchor, outcomes)
@@ -27710,6 +27713,7 @@ mod tests {
             origin,
             ch.noise,
             ch.fwhm_px,
+            1,
         )
         .expect("the set pairs in the crop");
         assert!(paired >= 20, "{paired}");

@@ -1112,6 +1112,91 @@ fn a_plane_that_falls_back_leaves_its_siblings_reweighed() {
     }
 }
 
+/// Halves every aperture sum `S` of sub `i`'s plane-`plane` `.athf` in place: the model flux, the area and every other field
+/// of the artifact stay, so only a reader of `S` can tell.
+fn halve_s(h: &Harness, i: usize, plane: usize) {
+    let row = crate::db::stacking::find_artifact(
+        &h.fixture.conn,
+        &StackSubject::FrameSet(h.fixture.set_id),
+        &h.key(),
+        &crate::stacking::fits_artifact::artifact_kind(plane),
+        Some(h.ids[i]),
+    )
+    .unwrap()
+    .expect("the fits artifact");
+    let path = std::path::PathBuf::from(row.path.unwrap());
+    let mut fits = crate::stacking::fits_artifact::read_fits(&path).unwrap();
+    fits.iter_mut().for_each(|f| f.ap_sum *= 0.5);
+    crate::stacking::fits_artifact::write_fits(&path, &fits).unwrap();
+}
+
+/// Plan D D2d (PD-32): a one-plane group's common flux is the model flux times `c`, the aperture sum is not read - halving
+/// a member's every `S` in its `.athf` moves no member's recorded `common_tflux` / `common_tmean_flux`, bit for bit; the
+/// plane count `reweigh_group` hands the set is the group's.
+#[test]
+fn a_mono_groups_common_flux_does_not_read_the_aperture_sum() {
+    let read = |halve: bool| {
+        let mut h = harness(StackingConfig::default(), &main_field(), &MAIN_SUBS);
+        h.to_measure();
+        if halve {
+            halve_s(&h, 3, 0);
+        }
+        h.to_register();
+        (0..MAIN_SUBS.len())
+            .map(|i| {
+                let c = h.channel(i);
+                (
+                    c.common_tflux.unwrap().to_bits(),
+                    c.common_tmean_flux.unwrap().to_bits(),
+                    c.common_stars,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read(false), read(true));
+}
+
+/// The three-plane side of the same: halving sub 3's `S` on every plane halves its common flux on each (the weight reads `S`).
+#[test]
+fn a_three_plane_groups_common_flux_reads_the_aperture_sum() {
+    let read = |halve: bool| {
+        let mut h = harness_with(
+            StackingConfig::default(),
+            &field(32, 600.0),
+            &MAIN_SUBS[..5],
+            Some("RGGB"),
+        );
+        h.to_measure();
+        if halve {
+            for plane in 0..3 {
+                halve_s(&h, 3, plane);
+            }
+        }
+        h.to_register();
+        h.ids
+            .iter()
+            .map(|&id| {
+                h.entry(id)
+                    .measurement
+                    .as_ref()
+                    .unwrap()
+                    .channels
+                    .iter()
+                    .map(|c| c.common_tflux.unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let (before, after) = (read(false), read(true));
+    for plane in 0..3 {
+        for i in 0..before.len() {
+            let want = if i == 3 { 0.5 } else { 1.0 };
+            let got = after[i][plane] / before[i][plane];
+            assert!((got - want).abs() < 1e-9, "sub {i} plane {plane}: {got}");
+        }
+    }
+}
+
 // ── PD-18: the reference pick sees the Measure-time floor ───────────────────────────────────────────────────────────
 
 /// A sub at a tenth of the flux of the sound ones: about 1 % of the group's PSF weight at Measure time, under the 5 % floor
@@ -1402,9 +1487,9 @@ fn a_cancel_lands_between_the_members_of_one_groups_reweigh() {
         });
     }
     let entries = h.rc.measured[&key].as_slice();
-    assert!(plane_outcome(&h.rc, &key, entries, &members, 0, 0).is_ok());
+    assert!(plane_outcome(&h.rc, &key, entries, &members, 0, 1, 0).is_ok());
     h.rc.cancel.store(true, Ordering::SeqCst);
-    let err = plane_outcome(&h.rc, &key, entries, &members, 0, 0).err().expect("a cancelled run");
+    let err = plane_outcome(&h.rc, &key, entries, &members, 0, 1, 0).err().expect("a cancelled run");
     assert!(matches!(err, RunError::Cancelled), "{err:?}");
 }
 

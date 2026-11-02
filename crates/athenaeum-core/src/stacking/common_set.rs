@@ -7,7 +7,8 @@
 //! a clipped or blended star can move it.
 //!
 //! Pure logic, no I/O and no weights. The caller (`run.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
-//! time and hands the module their [`MemberPlane`]. The flux the paired ratios read is each fit's aperture sum `S`
+//! time and hands the module their [`MemberPlane`]. On a THREE-plane image (PD-32: [`APERTURE_SUM_PLANES`], the gate of the
+//! sibling rescue) the flux the paired ratios read is each fit's aperture sum `S`
 //! (`StarFit::ap_sum`, Plan D D2b, PD-26; its aperture Plan D D2c, PD-30): the sum of `v - B_i` over the pixels within
 //! 3 x the frame's ring FWHM of the star, one radius for the frame and none from the fit, read in Measure's HFR walk and
 //! persisted, never a second estimate. It is the pixels' sum, so it carries neither the model's bias nor `c` (the model
@@ -15,7 +16,10 @@
 //! the frame's profile (S at 1.5 x the fit's FWHM did, +5-13 %/px). The anchor's whole-set sums, which the ratios scale,
 //! and everything else Measure reads stay the model flux times `c` (`StarFit::signal`): the weight's absolute scale is
 //! the one the master's PSF SNR is read on. A fit is eligible when it is not clipped and not extended, an extended one
-//! only where a point-like seed of another plane sits at it (`StarFlags::in_common_set`, PD-30).
+//! only where a point-like seed of another plane sits at it (`StarFlags::in_common_set`, PD-30). Any other plane count
+//! reads what the module read before D2b (971606c8): the model flux times `c` (`signal`, `signal / area`), `in_statistic()` as
+//! the flag rule, no condition on `S` ([`common_flux_model`]); `S` fixes the beta-floor plane of a colour image and was
+//! measured there only (PD-26, PD-30).
 //!
 //! Steps, in order:
 //! 1. [`pick_anchor`]: one member per group, picked without any weight (PD-1).
@@ -51,6 +55,10 @@ pub struct MemberPlane<'a> {
     /// `aperture_correction_group` of a plane at floor (i), else 1: the fits' `signal` of such a plane carries no `c`,
     /// and `take_group_c` scales the plane's totals by this (PD-3).
     pub c_stand_in: f64,
+    /// The image's plane count (`run.rs::reweigh_group`'s `nch`; the master's and the best sub's `GroupInput::channels`): three
+    /// planes weigh by the aperture sum, any other count by the model flux times `c` (PD-32). Every member of one call
+    /// chain ([`candidates`], [`match_member`], [`common_flux`]) carries the same count.
+    pub planes: usize,
 }
 
 /// One of the anchor's candidate stars: group coordinates, native flux units. `signal` and `mean` are the model flux
@@ -62,8 +70,8 @@ pub struct Candidate {
     pub y: f64,
     pub signal: f64,
     pub mean: f64,
-    /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); finite and positive on every
-    /// candidate [`candidates`] returns.
+    /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); finite on every candidate of a
+    /// three-plane image, NaN where the fit has none on any other (PD-32: nothing reads it there).
     pub ap_sum: f64,
     pub ap_mean: f64,
     /// The anchor plane's field FWHM, px: the match radius of every member reads it ([`match_member`]).
@@ -145,6 +153,17 @@ pub fn pick_anchor(mean_fwhm: &[f64], unsaturated: &[usize], frame_ids: &[i64]) 
         })
 }
 
+/// The plane count at which the weight's flux term is the aperture sum `S` (Plan D D2c, PD-32): the same "exactly three planes"
+/// as `star_measure::point_like_sibling_seeds`' gate. `S` fixes the beta-floor plane of a colour image (PD-26, measured there
+/// only) and the sibling rescue (PD-30) exists there only; any other count reads the model flux times `c`, as the module did
+/// before D2b (971606c8).
+pub const APERTURE_SUM_PLANES: usize = 3;
+
+/// Whether an image of `planes` planes weighs by the aperture sum (PD-32); otherwise by the model flux times `c`.
+fn weighs_by_aperture_sum(planes: usize) -> bool {
+    planes == APERTURE_SUM_PLANES
+}
+
 /// `c_stand_in` as a factor: a non-finite or non-positive value (never produced by `aperture_correction_group`) reads as 1.
 fn c_factor(c: f64) -> f64 {
     if c.is_finite() && c > 0.0 {
@@ -155,14 +174,16 @@ fn c_factor(c: f64) -> f64 {
     }
 }
 
-/// A fit the set may read the flux of: `in_common_set()` (not clipped, and not extended unless PD-9's sibling test rescued
-/// it: `SIBLING_POINT`), finite positive `signal` and `area`.
-fn flux_fit(f: &StarFit) -> bool {
-    f.flags.in_common_set()
-        && f.signal.is_finite()
-        && f.signal > 0.0
-        && f.area.is_finite()
-        && f.area > 0.0
+/// A fit the set may read the flux of, finite positive `signal` and `area` and, by the flags: on a three-plane image
+/// `in_common_set()` (not clipped, and not extended unless PD-9's sibling test rescued it: `SIBLING_POINT`), on any other
+/// `in_statistic()` (neither clipped nor extended), the rule the module had before D2c (971606c8, PD-32).
+fn flux_fit(f: &StarFit, planes: usize) -> bool {
+    let flagged_in = if weighs_by_aperture_sum(planes) {
+        f.flags.in_common_set()
+    } else {
+        f.flags.in_statistic()
+    };
+    flagged_in && f.signal.is_finite() && f.signal > 0.0 && f.area.is_finite() && f.area > 0.0
 }
 
 /// A fit's aperture sum `S` in native units, `None` unless it is finite (Plan D D2b, PD-30): a fit with no ring sky, or a
@@ -178,18 +199,21 @@ fn usable_ap(s: f64) -> bool {
     s.is_finite()
 }
 
-/// The anchor's candidate stars in group coordinates: `in_common_set()` (not clipped, not extended unless rescued by a
-/// point-like sibling seed), finite positive `signal` and `area`, no other anchor fit (of any flag) within
-/// [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, and the background-limited aperture SNR
-/// `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no SNR; the screen stays on the
-/// model flux, as before D2b), and, since the ratios divide by it, a finite aperture sum ([`aperture_sum`]: one at or under
-/// the sky is a candidate too). Candidates keep the anchor's fit order.
+/// The anchor's candidate stars in group coordinates: a [`flux_fit`] (on a three-plane image `in_common_set()`: not clipped,
+/// not extended unless rescued by a point-like sibling seed; on any other count `in_statistic()`), finite positive `signal`
+/// and `area`, no other anchor fit (of any flag) within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, and the
+/// background-limited aperture SNR `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no SNR;
+/// the screen stays on the model flux, as before D2b), and, on a three-plane image only, since its ratios divide by it, a
+/// finite aperture sum ([`aperture_sum`]: one at or under the sky is a candidate too). On any other count the candidate carries
+/// the fit's `S` when it has one and NaN when it has none, and nothing reads it ([`common_flux`]). Candidates keep the anchor's
+/// fit order.
 pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
     let f = anchor.fwhm_px;
     if !(f.is_finite() && f > 0.0) || !(anchor.noise.is_finite() && anchor.noise > 0.0) {
         return Vec::new();
     }
     let c = c_factor(anchor.c_stand_in);
+    let by_aperture = weighs_by_aperture_sum(anchor.planes);
     // Isolation reads every fit with a position, flagged or not: a clipped neighbour contaminates a star's wings.
     let mut at: Vec<usize> = Vec::with_capacity(anchor.fits.len());
     let mut pts: Vec<(f64, f64)> = Vec::with_capacity(anchor.fits.len());
@@ -205,16 +229,17 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (k, &i) in at.iter().enumerate() {
         let fit = &anchor.fits[i];
-        if !flux_fit(fit) {
+        if !flux_fit(fit, anchor.planes) {
             continue;
         }
         let signal = fit.signal / adu;
         if signal / (anchor.noise * fit.area.sqrt()) < CORRECTION_MIN_SNR {
             continue;
         }
-        let Some(ap) = aperture_sum(fit) else {
+        let ap = aperture_sum(fit);
+        if by_aperture && ap.is_none() {
             continue;
-        };
+        }
         // The fit itself is always within the radius: isolated means it is the only one.
         if tree.within(pts[k].0, pts[k].1, isolation).len() != 1 {
             continue;
@@ -228,8 +253,8 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
             y,
             signal: signal * c,
             mean: signal / fit.area * c,
-            ap_sum: ap,
-            ap_mean: ap / fit.area,
+            ap_sum: ap.unwrap_or(f64::NAN),
+            ap_mean: ap.map_or(f64::NAN, |s| s / fit.area),
             anchor_fwhm_px: f,
         });
     }
@@ -237,10 +262,11 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
 }
 
 /// For each candidate, the member's fit if there is exactly one within the match radius in group coordinates (two
-/// within the radius leave the candidate unmatched in this member) and it is a `flux_fit`: `in_common_set()` (not saturated,
-/// and not extended unless `SIBLING_POINT` rescued it; `in_statistic()` is the narrower rule the frame statistic reads) with
-/// a finite positive `signal` and `area`. The radius is `max(POINT_SOURCE_MATCH_PX, POINT_SOURCE_MATCH_PER_FIELD_FWHM x max(F_anchor,
-/// F_member))`. Every member fit with a position counts for the uniqueness, clipped or extended ones too.
+/// within the radius leave the candidate unmatched in this member) and it is a [`flux_fit`]: on a three-plane image
+/// `in_common_set()` (not saturated, and not extended unless `SIBLING_POINT` rescued it; `in_statistic()` is the narrower rule
+/// the frame statistic reads), on any other count `in_statistic()`, with a finite positive `signal` and `area`. The radius is
+/// `max(POINT_SOURCE_MATCH_PX, POINT_SOURCE_MATCH_PER_FIELD_FWHM x max(F_anchor, F_member))`. Every member fit with a position
+/// counts for the uniqueness, clipped or extended ones too.
 ///
 /// The fit's aperture sum rides along (`ap_sum`, `ap_mean`; NaN where it has none, [`Usable`]): D1b's paired gain reads
 /// the model flux of the same match, and the weight ([`common_flux`]) leaves a fit without a sum out of its own pair.
@@ -272,7 +298,7 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
             continue;
         }
         let fit = &member.fits[at[hits[0].0]];
-        if flux_fit(fit) {
+        if flux_fit(fit, member.planes) {
             let signal = fit.signal / adu;
             let ap = aperture_sum(fit);
             *slot = Some(Usable {
@@ -303,10 +329,16 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
 ///
 /// A table that does not fit (`usable` rows not as long as `cands`, or `anchor` past the table) is a wiring bug of the
 /// caller: an `error!`, a `debug_assert!`, and [`CommonOutcome::MalformedTable`] in a release build.
+///
+/// All of the above is a three-plane image (`planes`, PD-32). Any other count reads the model flux times `c` as the module
+/// did at 971606c8 ([`common_flux_model`]): present means a matched fit, the ratios are of `signal` and `signal / area`, a
+/// member whose paired sums are not positive reads 0 with no star paired, and the anchor's sums are never tested
+/// ([`CommonOutcome::NoAnchorFlux`] is a three-plane outcome).
 pub fn common_flux(
     cands: &[Candidate],
     usable: &[Vec<Option<Usable>>],
     anchor: usize,
+    planes: usize,
 ) -> CommonOutcome {
     if anchor >= usable.len() || usable.iter().any(|u| u.len() != cands.len()) {
         tracing::error!(
@@ -320,6 +352,9 @@ pub fn common_flux(
             "common set: the match table does not fit the candidates or the anchor"
         );
         return CommonOutcome::MalformedTable;
+    }
+    if !weighs_by_aperture_sum(planes) {
+        return common_flux_model(cands, usable, anchor);
     }
     let members = usable.len() as f64;
     let set: Vec<usize> = (0..cands.len())
@@ -397,6 +432,70 @@ pub fn common_flux(
     }
 }
 
+/// [`common_flux`] for an image that is not three planes (PD-32): `common_set.rs` at 971606c8 verbatim, the table already
+/// checked. A candidate joins the set when a matched fit is there in at least [`COMMON_MIN_PRESENCE`] of the members; member f's
+/// flux is the paired ratio to the anchor of the model flux times `c` (`signal`, and `signal / area` for the mean) times the
+/// anchor's sums over the whole set; a member with no paired star, or whose paired anchor sums are not positive, reads 0 with
+/// `paired` 0. No condition on `S`: a fit without one is a star like any other here.
+fn common_flux_model(
+    cands: &[Candidate],
+    usable: &[Vec<Option<Usable>>],
+    anchor: usize,
+) -> CommonOutcome {
+    let members = usable.len() as f64;
+    let set: Vec<usize> = (0..cands.len())
+        .filter(|&j| {
+            let present = usable.iter().filter(|u| u[j].is_some()).count();
+            present as f64 / members >= COMMON_MIN_PRESENCE
+        })
+        .collect();
+    if set.len() < COMMON_MIN_STARS {
+        return CommonOutcome::TooFewStars { stars: set.len() };
+    }
+    let anchor_signal: f64 = set.iter().map(|&j| cands[j].signal).sum();
+    let anchor_mean: f64 = set.iter().map(|&j| cands[j].mean).sum();
+    let per_member = usable
+        .iter()
+        .enumerate()
+        .map(|(k, u)| {
+            if k == anchor {
+                return CommonFlux {
+                    tflux: anchor_signal,
+                    tmean_flux: anchor_mean,
+                    paired: set.len(),
+                };
+            }
+            let (mut sig, mut sig_a, mut mean, mut mean_a, mut paired) =
+                (0.0, 0.0, 0.0, 0.0, 0usize);
+            for &j in &set {
+                if let Some(f) = u[j] {
+                    sig += f.signal;
+                    sig_a += cands[j].signal;
+                    mean += f.mean;
+                    mean_a += cands[j].mean;
+                    paired += 1;
+                }
+            }
+            if paired == 0 || !(sig_a > 0.0 && mean_a > 0.0) {
+                return CommonFlux {
+                    tflux: 0.0,
+                    tmean_flux: 0.0,
+                    paired: 0,
+                };
+            }
+            CommonFlux {
+                tflux: sig / sig_a * anchor_signal,
+                tmean_flux: mean / mean_a * anchor_mean,
+                paired,
+            }
+        })
+        .collect();
+    CommonOutcome::Measured {
+        positions: set.iter().map(|&j| (cands[j].x, cands[j].y)).collect(),
+        per_member,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +508,8 @@ mod tests {
     /// `area = AREA_PER_FWHM2 · FWHM²`.
     const AREA_PER_FWHM2: f64 = 7.0;
     const ADU: f64 = ADU_SCALE as f64;
+    /// The plane count of the colour images the aperture-sum weight is for (PD-32); every fixture is one unless it says so.
+    const OSC_PLANES: usize = 3;
 
     struct SplitMix(u64);
 
@@ -542,6 +643,7 @@ mod tests {
             fwhm_px: fwhm,
             noise: NOISE,
             c_stand_in: 1.0,
+            planes: OSC_PLANES,
         }
     }
 
@@ -549,22 +651,33 @@ mod tests {
         PixelMap::linear(Linear::identity()).expect("identity map")
     }
 
-    /// The whole pipeline over identity-mapped members: candidates of `anchor`, every member's match, the outcome.
+    /// The whole pipeline over identity-mapped members of a 3-plane image: candidates of `anchor`, every member's match, the
+    /// outcome.
     fn run(
         members: &[(Vec<StarFit>, f64, f64)],
         anchor: usize,
+    ) -> (Vec<Candidate>, Vec<Vec<Option<Usable>>>, CommonOutcome) {
+        run_planes(members, anchor, OSC_PLANES)
+    }
+
+    /// [`run`] on an image of `image_planes` planes.
+    fn run_planes(
+        members: &[(Vec<StarFit>, f64, f64)],
+        anchor: usize,
+        image_planes: usize,
     ) -> (Vec<Candidate>, Vec<Vec<Option<Usable>>>, CommonOutcome) {
         let map = identity();
         let planes: Vec<MemberPlane<'_>> = members
             .iter()
             .map(|(fits, fwhm, c)| MemberPlane {
                 c_stand_in: *c,
+                planes: image_planes,
                 ..plane(fits, &map, *fwhm)
             })
             .collect();
         let cands = candidates(&planes[anchor]);
         let usable: Vec<_> = planes.iter().map(|p| match_member(&cands, p)).collect();
-        let out = common_flux(&cands, &usable, anchor);
+        let out = common_flux(&cands, &usable, anchor, image_planes);
         (cands, usable, out)
     }
 
@@ -1079,7 +1192,7 @@ mod tests {
                 .collect();
             let cands = candidates(&planes[0]);
             let usable: Vec<_> = planes.iter().map(|p| match_member(&cands, p)).collect();
-            common_flux(&cands, &usable, 0)
+            common_flux(&cands, &usable, 0, OSC_PLANES)
         };
         let (a, b) = (run_at(1.0), run_at(65535.0));
         let (pa, fa) = measured(&a);
@@ -1533,10 +1646,454 @@ mod tests {
         short[2].pop();
         let cases = [(short, 0usize), (usable.clone(), usable.len())];
         for (table, anchor) in cases {
-            let got = std::panic::catch_unwind(|| common_flux(&cands, &table, anchor));
+            let got = std::panic::catch_unwind(|| common_flux(&cands, &table, anchor, OSC_PLANES));
             if cfg!(debug_assertions) {
                 // A debug build stops at the wiring bug.
                 assert!(got.is_err(), "debug_assert on a malformed table");
+            } else {
+                assert_eq!(
+                    got.expect("no panic in release"),
+                    CommonOutcome::MalformedTable
+                );
+            }
+        }
+    }
+
+    /// `common_set.rs` as it read at 971606c8 (the d2 head), the flux term the weight read before the aperture sum: the model
+    /// flux times `c`, `signal` and `signal / area`, with `in_statistic()` as the flux fit's flag rule and no condition on `S`.
+    /// A private copy, only so the tests below can say that a group that is not three planes reads exactly this (PD-32); it
+    /// is not a second implementation to keep, and nothing else reads it.
+    mod d2 {
+        use super::*;
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Candidate {
+            pub x: f64,
+            pub y: f64,
+            pub signal: f64,
+            pub mean: f64,
+            pub anchor_fwhm_px: f64,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Usable {
+            pub signal: f64,
+            pub mean: f64,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Flux {
+            pub tflux: f64,
+            pub tmean_flux: f64,
+            pub paired: usize,
+        }
+
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Outcome {
+            Measured {
+                positions: Vec<(f64, f64)>,
+                per_member: Vec<Flux>,
+            },
+            TooFewStars {
+                stars: usize,
+            },
+        }
+
+        fn flux_fit(f: &StarFit) -> bool {
+            f.flags.in_statistic()
+                && f.signal.is_finite()
+                && f.signal > 0.0
+                && f.area.is_finite()
+                && f.area > 0.0
+        }
+
+        pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
+            let f = anchor.fwhm_px;
+            if !(f.is_finite() && f > 0.0) || !(anchor.noise.is_finite() && anchor.noise > 0.0) {
+                return Vec::new();
+            }
+            let c = c_factor(anchor.c_stand_in);
+            let mut at: Vec<usize> = Vec::with_capacity(anchor.fits.len());
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(anchor.fits.len());
+            for (i, fit) in anchor.fits.iter().enumerate() {
+                if fit.x.is_finite() && fit.y.is_finite() {
+                    at.push(i);
+                    pts.push((fit.x, fit.y));
+                }
+            }
+            let tree = KdTree2::build(&pts);
+            let isolation = CORRECTION_ISOLATION_PER_FIELD_FWHM * f;
+            let adu = ADU_SCALE as f64;
+            let mut out = Vec::new();
+            for (k, &i) in at.iter().enumerate() {
+                let fit = &anchor.fits[i];
+                if !flux_fit(fit) {
+                    continue;
+                }
+                let signal = fit.signal / adu;
+                if signal / (anchor.noise * fit.area.sqrt()) < CORRECTION_MIN_SNR {
+                    continue;
+                }
+                if tree.within(pts[k].0, pts[k].1, isolation).len() != 1 {
+                    continue;
+                }
+                let (x, y) = anchor.map.forward_exact(fit.x, fit.y);
+                if !(x.is_finite() && y.is_finite()) {
+                    continue;
+                }
+                out.push(Candidate {
+                    x,
+                    y,
+                    signal: signal * c,
+                    mean: signal / fit.area * c,
+                    anchor_fwhm_px: f,
+                });
+            }
+            out
+        }
+
+        pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option<Usable>> {
+            let mut out = vec![None; cands.len()];
+            if cands.is_empty() {
+                return out;
+            }
+            let c = c_factor(member.c_stand_in);
+            let adu = ADU_SCALE as f64;
+            let mut at: Vec<usize> = Vec::with_capacity(member.fits.len());
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(member.fits.len());
+            for (i, fit) in member.fits.iter().enumerate() {
+                if !(fit.x.is_finite() && fit.y.is_finite()) {
+                    continue;
+                }
+                let (gx, gy) = member.map.forward_exact(fit.x, fit.y);
+                if gx.is_finite() && gy.is_finite() {
+                    at.push(i);
+                    pts.push((gx, gy));
+                }
+            }
+            let tree = KdTree2::build(&pts);
+            for (slot, cand) in out.iter_mut().zip(cands) {
+                let radius = POINT_SOURCE_MATCH_PX.max(
+                    POINT_SOURCE_MATCH_PER_FIELD_FWHM * cand.anchor_fwhm_px.max(member.fwhm_px),
+                );
+                let hits = tree.within(cand.x, cand.y, radius);
+                if hits.len() != 1 {
+                    continue;
+                }
+                let fit = &member.fits[at[hits[0].0]];
+                if flux_fit(fit) {
+                    let signal = fit.signal / adu;
+                    *slot = Some(Usable {
+                        signal: signal * c,
+                        mean: signal / fit.area * c,
+                    });
+                }
+            }
+            out
+        }
+
+        pub fn common_flux(
+            cands: &[Candidate],
+            usable: &[Vec<Option<Usable>>],
+            anchor: usize,
+        ) -> Outcome {
+            let members = usable.len() as f64;
+            let set: Vec<usize> = (0..cands.len())
+                .filter(|&j| {
+                    let present = usable.iter().filter(|u| u[j].is_some()).count();
+                    present as f64 / members >= COMMON_MIN_PRESENCE
+                })
+                .collect();
+            if set.len() < COMMON_MIN_STARS {
+                return Outcome::TooFewStars { stars: set.len() };
+            }
+            let anchor_signal: f64 = set.iter().map(|&j| cands[j].signal).sum();
+            let anchor_mean: f64 = set.iter().map(|&j| cands[j].mean).sum();
+            let per_member = usable
+                .iter()
+                .enumerate()
+                .map(|(k, u)| {
+                    if k == anchor {
+                        return Flux {
+                            tflux: anchor_signal,
+                            tmean_flux: anchor_mean,
+                            paired: set.len(),
+                        };
+                    }
+                    let (mut sig, mut sig_a, mut mean, mut mean_a, mut paired) =
+                        (0.0, 0.0, 0.0, 0.0, 0usize);
+                    for &j in &set {
+                        if let Some(f) = u[j] {
+                            sig += f.signal;
+                            sig_a += cands[j].signal;
+                            mean += f.mean;
+                            mean_a += cands[j].mean;
+                            paired += 1;
+                        }
+                    }
+                    if paired == 0 || !(sig_a > 0.0 && mean_a > 0.0) {
+                        return Flux {
+                            tflux: 0.0,
+                            tmean_flux: 0.0,
+                            paired: 0,
+                        };
+                    }
+                    Flux {
+                        tflux: sig / sig_a * anchor_signal,
+                        tmean_flux: mean / mean_a * anchor_mean,
+                        paired,
+                    }
+                })
+                .collect();
+            Outcome::Measured {
+                positions: set.iter().map(|&j| (cands[j].x, cands[j].y)).collect(),
+                per_member,
+            }
+        }
+    }
+
+    /// A group whose aperture sums are NOT the model flux, with every case where the two flux terms' rules part: each fit's
+    /// `S` is the model's flux times a factor in 0.6..1.4, one anchor fit and one member fit have no `S`, one member fit a
+    /// negative one, an extended fit carries `SIBLING_POINT` (in the anchor and in one member), a member fit has no signal,
+    /// stars clip by seeing, and members stand on their own `c` (two of them at a stand-in).
+    fn s_unlike_the_model_group(seed: u64) -> Vec<(Vec<StarFit>, f64, f64)> {
+        let world = sky(150, seed);
+        let t = [1.0, 0.9, 0.8, 0.95, 0.7, 1.0, 0.85, 0.9];
+        let mut members: Vec<_> = t
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                let f = 2.0 + 0.3 * k as f64;
+                let shot = Shot {
+                    clip: 20.0,
+                    jitter: 0.3,
+                    seed: seed + k as u64,
+                    ..Shot::new(t, f)
+                };
+                let mut rng = SplitMix(seed * 977 + k as u64);
+                let mut fits = fits_of(&world, &shot);
+                fits.iter_mut()
+                    .for_each(|x| x.ap_sum *= 0.6 + 0.8 * rng.unit());
+                let c = match k {
+                    3 => 1.15,
+                    5 => 0.9,
+                    _ => 1.0,
+                };
+                (fits, f, c)
+            })
+            .collect();
+        members[0].0[11].ap_sum = f64::NAN;
+        members[2].0[7].ap_sum = f64::NAN;
+        members[4].0[9].ap_sum = -0.1 * ADU;
+        members[0].0[13].flags = StarFlags::EXTENDED | StarFlags::SIBLING_POINT;
+        members[1].0[13].flags = StarFlags::EXTENDED | StarFlags::SIBLING_POINT;
+        members[6].0[15].signal = f64::NAN;
+        members
+    }
+
+    /// The d2 pipeline over the same members, identity maps.
+    fn run_d2(
+        members: &[(Vec<StarFit>, f64, f64)],
+        anchor: usize,
+    ) -> (
+        Vec<d2::Candidate>,
+        Vec<Vec<Option<d2::Usable>>>,
+        d2::Outcome,
+    ) {
+        let map = identity();
+        let planes: Vec<MemberPlane<'_>> = members
+            .iter()
+            .map(|(fits, fwhm, c)| MemberPlane {
+                c_stand_in: *c,
+                ..plane(fits, &map, *fwhm)
+            })
+            .collect();
+        let cands = d2::candidates(&planes[anchor]);
+        let usable: Vec<_> = planes.iter().map(|p| d2::match_member(&cands, p)).collect();
+        let out = d2::common_flux(&cands, &usable, anchor);
+        (cands, usable, out)
+    }
+
+    #[test]
+    fn the_weight_reads_the_aperture_sum_on_three_planes_only() {
+        assert!(weighs_by_aperture_sum(3));
+        for planes in [0, 1, 2, 4, 5] {
+            assert!(!weighs_by_aperture_sum(planes), "{planes} planes");
+        }
+    }
+
+    #[test]
+    fn a_group_that_is_not_three_planes_reads_what_d2_read_bit_for_bit() {
+        // PD-32: a mono (and a two-plane) group's candidates, matches, set and weights are the model flux times c, as at
+        // 971606c8, whatever its fits' S say.
+        for seed in [51, 52, 53] {
+            let members = s_unlike_the_model_group(seed);
+            let (old_cands, old_usable, old_out) = run_d2(&members, 0);
+            for planes in [1, 2, 4] {
+                let (cands, usable, out) = run_planes(&members, 0, planes);
+                assert_eq!(cands.len(), old_cands.len(), "seed {seed}, {planes} planes");
+                assert!(cands.len() > 100);
+                for (c, o) in cands.iter().zip(&old_cands) {
+                    let bits = |c: &Candidate| {
+                        [c.x, c.y, c.signal, c.mean, c.anchor_fwhm_px].map(f64::to_bits)
+                    };
+                    let old = [o.x, o.y, o.signal, o.mean, o.anchor_fwhm_px].map(f64::to_bits);
+                    assert_eq!(bits(c), old, "seed {seed}, {planes} planes: a candidate");
+                }
+                for (k, (row, old_row)) in usable.iter().zip(&old_usable).enumerate() {
+                    assert_eq!(row.len(), old_row.len());
+                    for (j, (u, o)) in row.iter().zip(old_row).enumerate() {
+                        let pair =
+                            |a: Option<(f64, f64)>| a.map(|(s, m)| (s.to_bits(), m.to_bits()));
+                        assert_eq!(
+                            pair(u.map(|u| (u.signal, u.mean))),
+                            pair(o.map(|o| (o.signal, o.mean))),
+                            "seed {seed}, {planes} planes: member {k}, candidate {j}"
+                        );
+                    }
+                }
+                let (positions, per) = measured(&out);
+                let d2::Outcome::Measured {
+                    positions: old_positions,
+                    per_member: old_per,
+                } = &old_out
+                else {
+                    panic!("d2 measured a set: {old_out:?}");
+                };
+                assert_eq!(positions.len(), old_positions.len());
+                assert!(positions.len() >= 100);
+                for (p, o) in positions.iter().zip(old_positions) {
+                    assert_eq!(
+                        (p.0.to_bits(), p.1.to_bits()),
+                        (o.0.to_bits(), o.1.to_bits())
+                    );
+                }
+                assert_eq!(per.len(), old_per.len());
+                for (k, (p, o)) in per.iter().zip(old_per).enumerate() {
+                    assert_eq!(
+                        (p.tflux.to_bits(), p.tmean_flux.to_bits(), p.paired),
+                        (o.tflux.to_bits(), o.tmean_flux.to_bits(), o.paired),
+                        "seed {seed}, {planes} planes: member {k}"
+                    );
+                }
+            }
+            // The same group on three planes is NOT that: the fixture's S is not the model flux, so a member's weight moves
+            // (the test above would hold for a pipeline that never read S at all).
+            let (_c, _u, three) = run_planes(&members, 0, 3);
+            let (_p, per3) = measured(&three);
+            let d2::Outcome::Measured { per_member, .. } = &old_out else {
+                unreachable!()
+            };
+            assert!(
+                per3.iter()
+                    .zip(per_member)
+                    .skip(1)
+                    .any(|(a, b)| a.tflux.to_bits() != b.tflux.to_bits()),
+                "seed {seed}: three planes read S"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mono_group_keeps_the_fits_the_aperture_sum_would_drop() {
+        // d2's usable rule is a finite positive `signal` and `area`: a fit with no S (no ring sky) is a candidate and a
+        // match on one plane, not on three (PD-32; the three-plane side is `an_anchor_fit_needs_a_finite_aperture_sum...`).
+        let f = 3.0;
+        let area = AREA_PER_FWHM2 * f * f;
+        let bright = 500.0 * NOISE * area.sqrt();
+        let mut fit = fit_at(100.0, 100.0, bright, area, f, StarFlags::default());
+        fit.ap_sum = f64::NAN;
+        let fits = vec![fit];
+        let map = identity();
+        for planes in [1, 2] {
+            let on = MemberPlane {
+                planes,
+                ..plane(&fits, &map, f)
+            };
+            let cands = candidates(&on);
+            assert_eq!(cands.len(), 1, "{planes} planes");
+            let got = match_member(&cands, &on)[0].expect("paired");
+            assert!(rel(got.signal, bright) < 1e-12, "{planes} planes");
+        }
+        assert!(candidates(&plane(&fits, &map, f)).is_empty());
+    }
+
+    #[test]
+    fn a_mono_group_whose_every_s_is_under_the_sky_still_has_its_model_flux_set() {
+        // A three-plane group whose anchor sums S to zero or less has no flux for the ratios to scale (NoAnchorFlux); a mono
+        // one reads the model flux, which is positive by construction, and measures a set (PD-32).
+        let world = sky(60, 54);
+        let mut members: Vec<_> = (0..4)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        for m in &mut members {
+            m.0.iter_mut().for_each(|f| f.ap_sum = -1.0);
+        }
+        let (_c, _u, three) = run_planes(&members, 0, 3);
+        assert!(
+            matches!(three, CommonOutcome::NoAnchorFlux { stars: 60 }),
+            "{three:?}"
+        );
+        let (_c, _u, one) = run_planes(&members, 0, 1);
+        let (positions, per) = measured(&one);
+        assert_eq!(positions.len(), 60);
+        for p in per {
+            assert_eq!(p.tflux.to_bits(), per[0].tflux.to_bits());
+            assert!(p.tflux > 0.0 && p.paired == 60);
+        }
+    }
+
+    #[test]
+    fn a_rescued_extended_fit_is_a_flux_fit_on_three_planes_only() {
+        // `SIBLING_POINT` is set only where another plane's seed can rescue a fit (three planes by construction); a group of
+        // any other count keeps `in_statistic()` as d2 did, the flag or not, on both the anchor's and the member's side.
+        let f = 3.0;
+        let area = AREA_PER_FWHM2 * f * f;
+        let bright = 500.0 * NOISE * area.sqrt();
+        let rescued = StarFlags::EXTENDED | StarFlags::SIBLING_POINT;
+        let anchor = [fit_at(500.0, 100.0, bright, area, f, rescued)];
+        let map = identity();
+        let on = |planes: usize| MemberPlane {
+            planes,
+            ..plane(&anchor, &map, f)
+        };
+        assert_eq!(candidates(&on(3)).len(), 1);
+        for planes in [1, 2] {
+            assert!(candidates(&on(planes)).is_empty(), "{planes} planes");
+        }
+        let plain = [fit_at(500.0, 100.0, bright, area, f, StarFlags::default())];
+        let cand = candidates(&plane(&plain, &map, f));
+        let theirs = [fit_at(500.0, 100.0, bright, area, f, rescued)];
+        let member = |planes: usize| {
+            match_member(
+                &cand,
+                &MemberPlane {
+                    planes,
+                    ..plane(&theirs, &map, f)
+                },
+            )[0]
+        };
+        assert!(member(3).is_some());
+        assert!(member(1).is_none() && member(2).is_none());
+    }
+
+    #[test]
+    fn a_malformed_table_is_malformed_on_any_plane_count() {
+        // The wiring check runs before the flux term is chosen.
+        let world = sky(60, 26);
+        let members: Vec<_> = (0..3)
+            .map(|_| (fits_of(&world, &Shot::new(1.0, 3.0)), 3.0, 1.0))
+            .collect();
+        for planes in [1, 3] {
+            let (cands, usable, _) = run_planes(&members, 0, planes);
+            let mut short = usable.clone();
+            short[1].pop();
+            let got = std::panic::catch_unwind(|| common_flux(&cands, &short, 0, planes));
+            if cfg!(debug_assertions) {
+                assert!(
+                    got.is_err(),
+                    "{planes} planes: debug_assert on a malformed table"
+                );
             } else {
                 assert_eq!(
                     got.expect("no panic in release"),

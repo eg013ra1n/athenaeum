@@ -750,6 +750,7 @@ fn common_signals(
     other_fwhm: f64,
     noise_native: f64,
     c_stand_in: f64,
+    planes: usize,
 ) -> Vec<Option<f64>> {
     let Some(map) = PixelMap::linear(Linear::identity()) else {
         tracing::error!("common set: the identity map has no inverse; no star matched");
@@ -776,6 +777,7 @@ fn common_signals(
             fwhm_px: own_fwhm,
             noise: noise_native,
             c_stand_in,
+            planes,
         },
     )
     .into_iter()
@@ -811,8 +813,9 @@ pub(crate) fn common_psf_snr(
     origin: (usize, usize),
     noise_native: f64,
     field_fwhm: f64,
+    planes: usize,
 ) -> Result<(f64, usize), usize> {
-    let signals = common_signals(fits, positions, origin, field_fwhm, field_fwhm, noise_native, 1.0);
+    let signals = common_signals(fits, positions, origin, field_fwhm, field_fwhm, noise_native, 1.0, planes);
     let n = signals.iter().flatten().count();
     if n < COMMON_MIN_STARS {
         return Err(n);
@@ -867,13 +870,14 @@ fn paired_common_snr(
     sub: &PlaneMeasurement,
     plane: usize,
     frame_id: i64,
+    planes: usize,
 ) -> Result<(f64, f64, usize), usize> {
     let origin = (rect.x0, rect.y0);
     let inside = positions_in_crop(positions, origin, (rect.width, rect.height));
     let (mc, sc) = (&master.channel, &sub.channel);
     let (master_c, sub_c) = paired_c_stand_ins(mc, sc, plane, frame_id);
-    let in_master = common_signals(&master.fits, &inside, origin, mc.fwhm_px, sc.fwhm_px, mc.noise, master_c);
-    let in_sub = common_signals(&sub.fits, &inside, origin, sc.fwhm_px, mc.fwhm_px, sc.noise, sub_c);
+    let in_master = common_signals(&master.fits, &inside, origin, mc.fwhm_px, sc.fwhm_px, mc.noise, master_c, planes);
+    let in_sub = common_signals(&sub.fits, &inside, origin, sc.fwhm_px, mc.fwhm_px, sc.noise, sub_c, planes);
     let (mut master_sum, mut sub_sum, mut paired) = (0.0, 0.0, 0usize);
     for (m, s) in in_master.iter().zip(&in_sub) {
         if let (Some(m), Some(s)) = (m, s) {
@@ -1110,7 +1114,7 @@ fn paired_snr_gain(
                 return 0.0;
             };
             let (master_snr, sub_snr, paired) =
-                match paired_common_snr(set, r, &m.measurement, &s.measurement, p, best.frame_id) {
+                match paired_common_snr(set, r, &m.measurement, &s.measurement, p, best.frame_id, channels) {
                     Ok(pair) => pair,
                     Err(paired) => {
                         warn!(
@@ -2137,7 +2141,7 @@ pub fn integrate_group(
                 let origin = crop.map_or((0, 0), |r| (r.x0, r.y0));
                 let inside = positions_in_crop(set, origin, (measure_w, measure_h));
                 let fits = &measured.measurement.fits;
-                match common_psf_snr(fits, &inside, origin, cm.noise, cm.fwhm_px) {
+                match common_psf_snr(fits, &inside, origin, cm.noise, cm.fwhm_px, input.channels) {
                     Ok((snr, _)) => snr,
                     Err(matched) => {
                         warn!(
@@ -3746,7 +3750,7 @@ mod tests {
         let (ch, fits) = (&m[0].measurement.channel, &m[0].measurement.fits);
         assert_eq!(fits.len(), 30);
         assert!(fits.iter().all(|f| f.flags.in_statistic()));
-        let (snr, n) = common_psf_snr(fits, &gain_set(), (0, 0), ch.noise, ch.fwhm_px).expect("30 stars");
+        let (snr, n) = common_psf_snr(fits, &gain_set(), (0, 0), ch.noise, ch.fwhm_px, 1).expect("30 stars");
         assert_eq!(n, 30);
         assert!(ch.psf_snr > 0.0 && ch.noise < 0.1, "noise {}", ch.noise);
         assert!(
@@ -3754,6 +3758,42 @@ mod tests {
             "common {snr}, channel {}",
             ch.psf_snr
         );
+    }
+
+    /// Plan D D2d (PD-32): the paired gain and the master's common PSF SNR read the set the weight was taken on. A fit carrying
+    /// `SIBLING_POINT` (extended, rescued by a point-like seed of another plane) is in the set of a three-plane image and not
+    /// in a one- or two-plane image's, the rule the module had before D2c; `common_psf_snr` hands the image's plane count down.
+    #[test]
+    fn the_paired_set_takes_the_rescued_fits_on_three_planes_only() {
+        let stars: Vec<(f64, f64, f64)> = gain_set().iter().map(|&(x, y)| (x, y, 0.25)).collect();
+        let mut data = gaussian_field(GAIN_W, GAIN_H, &stars, 1.8, 0.08);
+        add_noise(&mut data, 0.01, 4243);
+        let m = measure_planes_diagnosed(
+            1,
+            GAIN_W,
+            GAIN_H,
+            &MeasureOptions::default(),
+            None,
+            SeedOverride::Fast,
+            false,
+            crate::star_measure::PixelNoise::Mixed,
+            None,
+            |_| Ok::<_, std::convert::Infallible>(Cow::Borrowed(data.as_slice())),
+        )
+        .unwrap();
+        let (ch, fits) = (&m[0].measurement.channel, &m[0].measurement.fits);
+        assert_eq!(fits.len(), 30);
+        let mut fits = fits.clone();
+        for f in fits.iter_mut().take(4) {
+            f.flags = crate::star_measure::StarFlags::EXTENDED | crate::star_measure::StarFlags::SIBLING_POINT;
+        }
+        let matched = |planes: usize| {
+            common_psf_snr(&fits, &gain_set(), (0, 0), ch.noise, ch.fwhm_px, planes)
+                .expect("26 stars at least")
+                .1
+        };
+        assert_eq!(matched(3), 30);
+        assert_eq!((matched(1), matched(2)), (26, 26));
     }
 
     /// A cropped master (`measure_rect`): the group's positions are matched in the crop at its own origin, and only
@@ -3786,12 +3826,12 @@ mod tests {
         let (ch, fits) = (&m[0].measurement.channel, &m[0].measurement.fits);
         let inside = positions_in_crop(&gain_set(), (rect.x0, rect.y0), (rect.width, rect.height));
         assert_eq!(inside.len(), 30);
-        let (_, n) = common_psf_snr(fits, &inside, (rect.x0, rect.y0), ch.noise, ch.fwhm_px)
+        let (_, n) = common_psf_snr(fits, &inside, (rect.x0, rect.y0), ch.noise, ch.fwhm_px, 1)
             .expect("30 stars at the crop's origin");
         assert_eq!(n, 30);
         // At the wrong origin the positions are 17 and 11 px off: no star is matched.
         assert!(
-            matches!(common_psf_snr(fits, &inside, (0, 0), ch.noise, ch.fwhm_px), Err(n) if n < COMMON_MIN_STARS),
+            matches!(common_psf_snr(fits, &inside, (0, 0), ch.noise, ch.fwhm_px, 1), Err(n) if n < COMMON_MIN_STARS),
             "no star is matched at the wrong origin"
         );
         // A narrower crop leaves the stars outside it out of the request.
@@ -3826,7 +3866,7 @@ mod tests {
         .remove(0)
         .measurement;
         assert!(base.channel.aperture_correction.is_some() && base.channel.stars_fitted >= 25);
-        let (own, n) = common_psf_snr(&base.fits, &gain_set(), (0, 0), base.channel.noise, base.channel.fwhm_px)
+        let (own, n) = common_psf_snr(&base.fits, &gain_set(), (0, 0), base.channel.noise, base.channel.fwhm_px, 1)
             .expect("30 stars");
         assert!(n >= 25);
         let rect = crate::stacking::crop::CropRect::full(GAIN_W, GAIN_H);
@@ -3838,7 +3878,7 @@ mod tests {
         };
         let read = |master_c: Option<f64>, sub_c: Option<f64>| {
             let (read, log) = crate::stacking::telemetry::capture_logs(|| {
-                paired_common_snr(&gain_set(), rect, &side(master_c), &side(sub_c), 0, 7)
+                paired_common_snr(&gain_set(), rect, &side(master_c), &side(sub_c), 0, 7, 1)
             });
             let (master, sub, paired) = read.expect("the stars pair");
             assert_eq!(paired, n);

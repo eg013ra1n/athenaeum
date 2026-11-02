@@ -818,7 +818,7 @@ mod common {
     impl Member {
         fn plane(&self, p: usize) -> MemberPlane<'_> {
             let d = &self.planes[p];
-            MemberPlane { fits: &d.fits, map: &self.map, fwhm_px: d.fwhm, noise: d.noise, c_stand_in: d.c_stand_in }
+            MemberPlane { fits: &d.fits, map: &self.map, fwhm_px: d.fwhm, noise: d.noise, c_stand_in: d.c_stand_in, planes: self.planes.len() }
         }
     }
 
@@ -920,7 +920,7 @@ mod common {
                 cands.retain(|c| proxy.get(&(c.x.to_bits(), c.y.to_bits())).map_or(false, |&v| v >= proxy_floor));
             }
             let usable: Vec<Vec<Option<Usable>>> = members.iter().map(|m| common_set::match_member(&cands, &m.plane(p))).collect();
-            let (weights, positions, too_few, paired) = match common_set::common_flux(&cands, &usable, anchor) {
+            let (weights, positions, too_few, paired) = match common_set::common_flux(&cands, &usable, anchor, planes) {
                 CommonOutcome::Measured { positions, per_member } => (
                     members
                         .iter()
