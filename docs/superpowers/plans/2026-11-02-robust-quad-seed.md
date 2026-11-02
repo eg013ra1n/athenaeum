@@ -119,8 +119,10 @@ Binding beside them:
   existing data, is the ruling, and the owner is informed. A lab agent never re-tunes a threshold. Push, release and
   spending stay the owner's.
 - **Branch and commits:**
-  - Branch `robust-seed` from local `main` after Plan D's merge, in the main checkout. Never touch another session's
-    worktree.
+  - Branch `robust-seed` from local `main` after Plan D's merge, in the worktree `.claude/worktrees/robust-seed`
+    (R0-3: the main checkout is shared by other sessions and the owner's interactive build). Agent builds use
+    `CARGO_TARGET_DIR=<worktree>/target-agent`; `.superpowers/` stays in the main checkout. Never touch another
+    session's worktree.
   - Pushed to GitLab for the runner, never `main`. Merged into local `main` after a clean final review; `main` is pushed
     only on the owner's word.
   - Lab work is committed and pushed in athenaeum-lab `main` after each lab step.
@@ -544,8 +546,11 @@ Budget ≤ 120 calls.
     row). Release `athenaeum-web` at <base-sha>, one run (`tier1-run.sh`), `athenaeum.db` snapshotted to `base.db`. Then
     the web build at <sha>, one run on the same copy, then `reg` (G, D, V, U, K4).
   - `xscale <base-sha> <sha>` (dev Mac): a `prepare-catalog.sh` copy of the dev catalog under
-    `~/.athenaeum-acc/regfrag/xscale` (REGISTRY row; estimate ~60 GB of stacking data) holding the three sets R0 named
-    with their M4b subsets. Per set, one co-registered run at <base-sha> (Auto reference, as M4b runs 15 / 17 / 20),
+    `~/.athenaeum-acc/regfrag/xscale` (REGISTRY row; estimate ~60 GB of stacking data) holding sets 258, 108 and 195
+    (R0-2). The dev catalog keeps neither M4b's subsets nor any plate solve of these sets, so on the copy only: 30
+    lights per group under test, evenly by DATE-OBS (258: OSC 2600MC Duo, 6200MM L bin 1 at 1960 mm, 294MM L bin 2;
+    108: L bin 1, L bin 2; 195: H and O at 352 and 448 mm), the rest in the set's exclusion list; the kept lights are
+    plate-solved through the app's own batch command (as M4b did) before the base run. Per set, one co-registered run at <base-sha> (Auto reference, as M4b runs 15 / 17 / 20),
     `base.db` snapshot, one run at <sha> on the same copy; then the no-hint replay of every cross-scale frame and of set
     195's H 448 mm frames through `regfrag_probe batch` at <sha>, each manifest line carrying its group's plan ratio in
     the scale-gate column, and `regfrag_bars.py xscale`.
