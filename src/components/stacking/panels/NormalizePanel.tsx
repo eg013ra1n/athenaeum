@@ -1,15 +1,15 @@
 // Stage 6 (Normalize) inspector panel: global output/rejection
 // normalization + scale estimator, and the local-normalization (LN) block
 // (M2 Task 8 — live). The rejection-normalization select's `local` option is
-// enabled only while LN itself (`normalization.local.enabled`) is on — a
-// local-rejection choice with no LN reference to rejection-normalize
-// against isn't a coherent config. `localScale` (the local SCALE model, as
+// always selectable, whether or not LN output (`normalization.local.enabled`)
+// is on: with LN output off, local rejection runs LN for rejection only, so
+// the clip still matches frames by star flux and keeps the cores of the
+// sharpest frames. `localScale` (the local SCALE model, as
 // opposed to local BACKGROUND normalization) went live in M4c (ruling
 // R-M4c-8) and sits with the other LN parameters, inside the same
 // `enabled` block: a scale surface with no LN pass to carry it would mean
 // nothing.
 
-import { useEffect, useRef, useState } from 'react';
 import { NumericField } from '../NumericField';
 import { LN_SCALES, apertureLabel, effectiveScaleMode, fluxEstimatorLabel, resolvedScaleLines } from './lnScale';
 import { Checkbox } from '../../settings/Checkbox';
@@ -32,11 +32,6 @@ const APERTURES: LnAperture[] = ['fwhm2', 'fwhm3', 'growthCurve'];
 const SELECT_CLASS =
   'w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50';
 
-/** Msec the "rejection reset" notice stays up after the user turns LN off
- *  while rejection normalization was set to `'local'` — long enough to read,
- *  short enough not to linger once the inspector moves on. */
-const RESET_NOTICE_MS = 5000;
-
 export interface NormalizePanelProps {
   config: StackingConfig;
   onChange: (next: StackingConfig) => void;
@@ -49,36 +44,12 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
   const n = config.normalization;
   const scaleMode = effectiveScaleMode(n.local);
 
-  const [resetNotice, setResetNotice] = useState(false);
-  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
-  }, []);
-
   const patch = (p: Partial<StackingConfig['normalization']>) => {
     onChange({ ...config, normalization: { ...n, ...p } });
   };
   const resolvedLines = resolvedScaleLines(plan);
   const patchLocal = (p: Partial<StackingConfig['normalization']['local']>) => {
     patch({ local: { ...n.local, ...p } });
-  };
-
-  /** Turning LN off while rejection normalization is `'local'` would leave
-   *  the config pointing at a rejection method that just became unselectable
-   *  — reset it to the M1 default and say so inline (Task 8 brief) rather
-   *  than silently stranding the stored value. */
-  const handleLocalEnabledChange = (checked: boolean) => {
-    if (!checked && n.rejection === 'local') {
-      onChange({
-        ...config,
-        normalization: { ...n, local: { ...n.local, enabled: false }, rejection: 'scaleZeroOffset' },
-      });
-      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
-      setResetNotice(true);
-      noticeTimerRef.current = setTimeout(() => setResetNotice(false), RESET_NOTICE_MS);
-      return;
-    }
-    patchLocal({ enabled: checked });
   };
 
   return (
@@ -107,15 +78,18 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
           className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
         >
           {REJECTION_NORMS.map((v) => (
-            <option key={v} value={v} disabled={v === 'local' && !n.local.enabled}>
-              {rejectionNormLabel(v)}
+            <option key={v} value={v}>
+              {v === 'local' ? 'Local (recommended)' : rejectionNormLabel(v)}
             </option>
           ))}
         </select>
         <p className="mt-1 text-[11px] text-content-muted">
-          default {rejectionNormLabel(defaults.normalization.rejection)}
-          {!n.local.enabled && ' — "local" needs local normalization enabled below'}
+          default {rejectionNormLabel(defaults.normalization.rejection)} — Keeps the cores of your sharpest frames
+          when seeing varies.
         </p>
+        {n.rejection === 'local' && !n.local.enabled && (
+          <p className="mt-1 text-[11px] text-content-muted">Local normalization runs for rejection only</p>
+        )}
       </div>
 
       <div>
@@ -141,17 +115,10 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
 
         <Checkbox
           checked={n.local.enabled}
-          onChange={handleLocalEnabledChange}
+          onChange={(checked) => patchLocal({ enabled: checked })}
           disabled={disabled}
           label="Enable local normalization"
         />
-
-        {resetNotice && (
-          <p className="text-xs text-warning">
-            Rejection normalization reset to {rejectionNormLabel('scaleZeroOffset')} — "local" needs local
-            normalization enabled.
-          </p>
-        )}
 
         {n.local.enabled && (
           <div className="space-y-3 pt-1">

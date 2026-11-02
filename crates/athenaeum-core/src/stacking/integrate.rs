@@ -2515,10 +2515,8 @@ mod tests {
             serde_json::to_value(&n).unwrap()["output"],
             "additiveWithScaling"
         );
-        assert_eq!(
-            serde_json::to_value(&n).unwrap()["rejection"],
-            "scaleZeroOffset"
-        );
+        // Local by default since 2026-11-01 (the star-core ruling, OD-1a).
+        assert_eq!(serde_json::to_value(&n).unwrap()["rejection"], "local");
         assert_eq!(serde_json::to_value(&n).unwrap()["scaleEstimator"], "bwmv");
         assert_eq!(n.local, LocalNormalizationConfig::default());
         let nv = serde_json::to_value(&n).unwrap();

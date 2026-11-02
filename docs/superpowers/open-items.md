@@ -35,8 +35,9 @@ hang on saturated stars' `tflux` and the FWHM trend set 109 showed (bar: R-PC-11
 The other `c` items, the Analysis items and the plate-solving signal wait for a later plan; the LN / ERP items stay recorded limits.
 
 **Real trees (owner, 2026-10-31).** The three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) are copied to the runner (M4 Max) through
-`/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines; Plan D's master-level runs go to the runner. Gates reading bigbase2 / 3 stay on the dev Mac
-unless the runner gets those volumes.
+`/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines. They are not self-contained: their sources sit on the dev Mac's volumes by absolute path
+(~60 GB on bigbase2 / bigbase3 / BigMac), so Plan D's master-level runs stay on the dev Mac and the runner runs the lab cycles (owner, 2026-11-01; PD-12 in the Plan D
+rulings).
 
 **The Measure aperture correction `c` (Plan B B4, measured, not fixed).**
 - On raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of the bright stars from `c`'s sample frame-dependently and `c`
@@ -97,6 +98,31 @@ relative sizes are safe and the exact seconds are not). The verdict gate saves o
 
 The three M101 frames are one night (2023-06-18, ASI6200 at 1960 mm, ~1300–1500 detections, `stars_refused` 317–524) and look point-like by the numbers. No (ecc, R²) pair
 separates them from the solvable frames (`ldn621` decides the corner), so no rule is proposed; Plan D needs a new signal.
+
+---
+
+## Rejection normalization by star flux — what it leaves (2026-11-01)
+
+Ruling R-SC-1 in `docs/stacking/README.md` (the default rejection normalization is `local`); diagnosis
+`docs/superpowers/research/2026-11-01-project-master-star-cores.md`; acceptance athenaeum-lab
+`star-lab/results/pcores/acc/verdict.txt`.
+
+- **The clip still meets the PSF spread.** With `local`, Linear fit clip cuts 4–10 % of the star peak on the LDN1272
+  mono groups (the sharpest frames' cores; a 14-frame block is either cut or kept per star, so the median is a
+  knife-edge — read the mean and the share of stars below 0.92 beside it) and 0.6–3.8 % on its OSC planes. It joins the
+  owed star-protecting rejection item (the M4c Task 7 note on RCR / Winsorized under "Unverified by hand"); not a
+  normalization error.
+- **A cheaper default lever, if the LN stage's cost on default runs is ever judged too high:** the global pair scaled by
+  Measure's common star flux (Plan D's `commonTflux`), no Normalize stage. A new mode; it waits for Plan D.
+- **Plan D's runB mono record** (PD-21, PSF SNR 0.962, "cause in integration"): the cause was the project's stored
+  `scaleZeroOffset`; at R-SC-1's acceptance the same project mono master reads PSF SNR ×1.197 against Plan D's base
+  run. Plan D's next runB read carries the new default.
+- **Run-warning texts still naming LN on rejection-only runs** (`stacking/run.rs`, "local normalization scale resolved
+  to …" and "the LN reference's member list …"): reword when that file is next open.
+- **The Normalize row's denominator grows once** when the seeds calibration runs (the reference build ticks at
+  0 of members, then the calibration and fan-out count members + K, e.g. 12 / 97); the percentage never drops.
+- **Lab:** `harness/acceptance/pcores.sh` has no `--fw` / `--weights2` (hc11 needs `--fw 6`: call
+  `star-lab/bin/core_replay.py replay` directly).
 
 ---
 
@@ -312,6 +338,14 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Rejection normalization by star flux (2026-11-01)
+
+Branch `claude/project-star-cores-98f198` (ruling R-SC-1). Masters were judged at master level on three datasets; the
+desktop panel was not opened by hand. Owed: in `npm run tauri dev` on the dev catalog, Stacking → Normalize with local
+normalization OFF shows rejection "Local (recommended)" selected and the muted line "Local normalization runs for
+rejection only"; turning LN on and off leaves rejection at Local; Settings → Stacking shows the same; a frame set that
+was saved as Fast preview still reads "Fast preview" after the first start of the new build (the migration keeps it).
 
 ### Plan C — the Analysis tab on the one star path (2026-10-24)
 

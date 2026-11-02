@@ -11781,9 +11781,10 @@ fn process_group_output(
                     error = %msg,
                     "local normalization failed for this group; continuing with global normalization"
                 );
-                rc.warnings.push(format!(
-                    "group {}: local normalization failed: {msg}",
-                    group.key
+                rc.warnings.push(ln_fallback_warning(
+                    &group.key,
+                    !normalization_cfg.local.enabled,
+                    &LnFallback::GroupFailed { msg: &msg },
                 ));
             }
         }
@@ -12729,7 +12730,14 @@ fn process_group_output(
                         kernel: drizzle_cfg.kernel,
                         use_weights: drizzle_cfg.use_weights,
                         use_rejection: drizzle_cfg.use_rejection && rej_set.is_some(),
-                        use_local_normalization: drizzle_cfg.use_local_normalization,
+                        // The drizzle follows the plain master's OUTPUT
+                        // normalization: LN grids computed for rejection
+                        // alone (`rejection = Local`, `local.enabled =
+                        // false` - the shipped default) never normalize
+                        // the drizzled master, or it would be locally
+                        // normalized while the master it sits beside is not.
+                        use_local_normalization: drizzle_cfg.use_local_normalization
+                            && rc.config.normalization.local.enabled,
                         write_weight_map: drizzle_cfg.write_weight_map,
                         write_coverage: rc.config.output.coverage_map,
                         // Plan 6b-3 ruling (b): a grid drizzle's statistics ride
@@ -13218,6 +13226,68 @@ fn apply_ln_summary(
     entry.ln_aperture_correction = target_c;
 }
 
+/// The LN fallback paths of a run, as the user reads them in the run
+/// warnings (the `tracing` events of the same paths keep their stable
+/// phrases).
+enum LnFallback<'a> {
+    /// The whole group's LN pass failed (`Err(RunError::Other)`).
+    GroupFailed { msg: &'a str },
+    /// One frame's own normalization failed and the frame stays on the
+    /// global normalization.
+    FrameFailed { frame_id: i64, msg: &'a str },
+    /// `referenceFrames` under 3: no LN reference for the group.
+    ReferenceFramesBelowThree { reference_frames: u32 },
+    /// The LN reference's background model was refused.
+    BackgroundRefused { reason: &'a str },
+    /// Frames with too little overlap with the LN reference stay global.
+    LittleOverlap { count: usize, percent: f64 },
+}
+
+/// The run-warning sentence of one LN fallback path.
+///
+/// `rejection_only` is true when LN runs for REJECTION alone: the run's
+/// output normalization is global (`normalization.local.enabled == false`)
+/// and `rejection == Local`, which is the shipped default. The user never
+/// turned local normalization on, so a warning that says "local normalization
+/// failed" names something they did not ask for (owner ruling 2026-11-01,
+/// OD-1a); it names the rejection normalization they got instead and what
+/// the fallback costs.
+fn ln_fallback_warning(group_key: &str, rejection_only: bool, what: &LnFallback<'_>) -> String {
+    const TAIL: &str =
+        "rejection used the global normalization, which can clip star cores where seeing varies";
+    match (rejection_only, what) {
+        (false, LnFallback::GroupFailed { msg }) => {
+            format!("group {group_key}: local normalization failed: {msg}")
+        }
+        (true, LnFallback::GroupFailed { msg }) => format!(
+            "group {group_key}: local rejection normalization could not be computed ({msg}); {TAIL}"
+        ),
+        (false, LnFallback::FrameFailed { frame_id, msg }) => {
+            format!("frame {frame_id}: local normalization failed: {msg}")
+        }
+        (true, LnFallback::FrameFailed { frame_id, msg }) => format!(
+            "frame {frame_id}: local rejection normalization could not be computed ({msg}); this frame's rejection used the global normalization"
+        ),
+        (false, LnFallback::ReferenceFramesBelowThree { reference_frames }) => format!(
+            "group {group_key}: local normalization off — referenceFrames ({reference_frames}) < 3; using global normalization"
+        ),
+        (true, LnFallback::ReferenceFramesBelowThree { reference_frames }) => format!(
+            "group {group_key}: local rejection normalization could not be computed — referenceFrames ({reference_frames}) < 3; {TAIL}"
+        ),
+        (false, LnFallback::BackgroundRefused { reason }) => format!(
+            "group {group_key}: local normalization off — the LN reference's background model is refused ({reason}); using global normalization"
+        ),
+        (true, LnFallback::BackgroundRefused { reason }) => format!(
+            "group {group_key}: local rejection normalization could not be computed — the reference frame's background model is refused ({reason}); {TAIL}"
+        ),
+        (false, LnFallback::LittleOverlap { count, percent }) => format!(
+            "group {group_key}: local normalization kept {count} frame(s) on global normalization — under {percent:.0} % overlap with the LN reference"
+        ),
+        (true, LnFallback::LittleOverlap { count, percent }) => format!(
+            "group {group_key}: {count} frame(s) used the global normalization for rejection — under {percent:.0} % overlap with the reference frame"
+        ),
+    }
+}
 /// Stage 6 proper (spec §5.2, M2 Task 5): resolves/caches `group`'s LN
 /// reference (best `referenceFrames` of `members` by weight, linear-fit
 /// rejection, global normalization — [`build_ln_reference`]), models its
@@ -13343,9 +13413,12 @@ fn run_group_normalization(
             reference_frames = ln_cfg.reference_frames,
             "local normalization off for this group: referenceFrames < 3"
         );
-        rc.warnings.push(format!(
-            "group {}: local normalization off — referenceFrames ({}) < 3; using global normalization",
-            group.key, ln_cfg.reference_frames
+        rc.warnings.push(ln_fallback_warning(
+            &group.key,
+            !ln_drives_output,
+            &LnFallback::ReferenceFramesBelowThree {
+                reference_frames: ln_cfg.reference_frames,
+            },
         ));
         return Ok(LnGroupOutcome {
             reference_path: None,
@@ -13571,9 +13644,12 @@ fn run_group_normalization(
                     error = %r,
                     "local normalization off for this group: the LN reference's background model is refused"
                 );
-                rc.warnings.push(format!(
-                    "group {}: local normalization off — the LN reference's background model is refused ({r}); using global normalization",
-                    group.key
+                rc.warnings.push(ln_fallback_warning(
+                    &group.key,
+                    !ln_drives_output,
+                    &LnFallback::BackgroundRefused {
+                        reason: &r.to_string(),
+                    },
                 ));
                 return Ok(LnGroupOutcome {
                     reference_path: None,
@@ -13819,10 +13895,17 @@ fn run_group_normalization(
                     .as_ref()
                     .is_some_and(|row| row.config_hash == per_member_hash[i]))
         });
+    // The Normalize row is ONE count: when the measurement runs, its frames
+    // are the first `calibration_units` units of the stage total and the
+    // per-frame fan-out below continues from there, so the bar never goes
+    // back (pcores review r1, I3).
+    let mut calibration_units = 0usize;
     if anything_stale && stored_calibration.is_none() {
+        calibration_units = calibration_indices.len();
         seeds_calibration = measure_ln_seeds_calibration(
             rc,
             group,
+            members.len(),
             &calibration_indices,
             &fits_paths,
             input.frames,
@@ -13997,11 +14080,15 @@ fn run_group_normalization(
     }
 
     let total = members.len();
+    // Members plus the seeds-calibration frames counted above: the units the
+    // Normalize row climbs through, in order, without a reset.
+    let stage_total = total + calibration_units;
+    let stage_done = calibration_units + total - needs_normalize.len();
     rc.progress(
         Stage::Normalize,
         Some(group.key.clone()),
-        total - needs_normalize.len(),
-        total,
+        stage_done,
+        stage_total,
         0,
         0,
         None,
@@ -14052,8 +14139,8 @@ fn run_group_normalization(
         rc,
         Stage::Normalize,
         Some(group.key.clone()),
-        total - needs_normalize.len(),
-        total,
+        stage_done,
+        stage_total,
         0,
         0,
     );
@@ -14171,8 +14258,14 @@ fn run_group_normalization(
                 reason = %msg,
                 "local normalization failed; frame keeps global normalization"
             );
-            rc.warnings.push(format!(
-                "frame {frame_id}: local normalization failed: {msg}"
+            // Only reached when LN does not drive output: rejection-only.
+            rc.warnings.push(ln_fallback_warning(
+                &group.key,
+                true,
+                &LnFallback::FrameFailed {
+                    frame_id,
+                    msg: &msg,
+                },
             ));
         }
         Ok(())
@@ -14333,10 +14426,13 @@ fn run_group_normalization(
             count = low_overlap,
             "local normalization kept frames with little overlap on global normalization"
         );
-        rc.warnings.push(format!(
-            "group {}: local normalization kept {low_overlap} frame(s) on global normalization — under {:.0} % overlap with the LN reference",
-            group.key,
-            ln::LN_MIN_OVERLAP * 100.0
+        rc.warnings.push(ln_fallback_warning(
+            &group.key,
+            !ln_drives_output,
+            &LnFallback::LittleOverlap {
+                count: low_overlap,
+                percent: ln::LN_MIN_OVERLAP * 100.0,
+            },
         ));
     }
 
@@ -14353,8 +14449,8 @@ fn run_group_normalization(
     rc.progress(
         Stage::Normalize,
         Some(group.key.clone()),
-        total,
-        total,
+        stage_total,
+        stage_total,
         0,
         0,
         None,
@@ -14382,6 +14478,10 @@ fn run_group_normalization(
 /// member list) and comes from `ln::select_calibration_frames`, so the
 /// caller can hash the sample BEFORE deciding whether the measurement is
 /// needed at all.
+/// The stage events it emits are the FIRST `indices.len()` units of the
+/// Normalize row's count, whose total is `members + indices.len()`
+/// (`members_total` is the group's member count): the per-frame fan-out
+/// continues from where this stops, so the row never goes backwards.
 /// `None` means no calibration was measured — a cancel (silent, the
 /// review's M3) or a scratch directory that could not be created; the
 /// caller then records nothing and the group runs uncalibrated.
@@ -14389,6 +14489,7 @@ fn run_group_normalization(
 fn measure_ln_seeds_calibration(
     rc: &RunContext,
     group: &IntegrationGroup,
+    members_total: usize,
     indices: &[usize],
     fits_paths: &[Vec<Option<PathBuf>>],
     stack_frames: &[StackFrame],
@@ -14433,17 +14534,27 @@ fn measure_ln_seeds_calibration(
     let emitter = rc.emitter.clone();
     let (run_id, group_key) = (rc.run_id, group.key.clone());
     let (set_id, project_id) = wire_subject(&rc.subject);
-    // C-17: the row counts the CALIBRATION's own frames while it runs —
-    // `current`/`total`/`percent` over the sample, not the group. Reporting
-    // `0 / 0 %` against the member count (what the first cut did) made a
-    // minute of real work read as a stalled Normalize row, which is the one
-    // thing the message was added to prevent.
-    let on_progress = |done: usize, total: usize, frame_id: i64| {
+    // C-17: the row counts the CALIBRATION's own frames while it runs, so a
+    // minute of real work never reads as a stalled Normalize row. They are
+    // the first `indices.len()` units of the stage's one count (members plus
+    // these), and the per-frame fan-out continues from there: the percent of
+    // the row only ever climbs (pcores review r1, I3).
+    let stage_total = members_total + indices.len();
+    // Workers finish in any order: the guard is held across the emit (the
+    // `FanOutTicker` lesson) so a late worker cannot deliver a smaller count
+    // after a larger one.
+    let last_current = Mutex::new(0usize);
+    let on_progress = |done: usize, _total: usize, frame_id: i64| {
         let current = done + 1;
-        let percent = if total == 0 {
+        let mut last = last_current.lock().unwrap_or_else(|e| e.into_inner());
+        if current <= *last {
+            return;
+        }
+        *last = current;
+        let percent = if stage_total == 0 {
             100.0
         } else {
-            100.0 * current as f64 / total as f64
+            100.0 * current as f64 / stage_total as f64
         };
         emit_event(
             emitter.as_ref(),
@@ -14455,13 +14566,14 @@ fn measure_ln_seeds_calibration(
                 stage: Stage::Normalize,
                 group_key: Some(group_key.clone()),
                 current,
-                total,
+                total: stage_total,
                 percent,
                 bytes_done: 0,
                 bytes_total: 0,
                 frame_id: Some(frame_id),
                 message: Some(format!(
-                    "calibrating the seeds path · frame {current}/{total}"
+                    "calibrating the seeds path · frame {current}/{}",
+                    indices.len()
                 )),
             },
         );
@@ -14606,8 +14718,10 @@ fn build_and_write_ln_reference(
     let (build_run_id, build_group_key) = (rc.run_id, group.key.clone());
     let (build_set_id, build_project_id) = wire_subject(&rc.subject);
     // The stage's own total (every included member of the group), not the
-    // top-`n` slice — the row's count must be the same number the per-frame
-    // ticks that follow climb towards.
+    // top-`n` slice. When the seeds calibration runs in this call, the ticks
+    // that follow climb to members + K instead (one total for the calibration
+    // and the fan-out); these build ticks stay at 0 %, so the row's percentage
+    // never drops, only its denominator grows once.
     let build_total = input.frames.len();
     let build_n = n.min(included.len());
     let on_build_progress = |plane: usize, planes: usize| {
@@ -22682,6 +22796,10 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
+        // The default config on purpose: rejection normalization is `local`
+        // since OD-1a, so this run takes the Normalize stage's seeds
+        // calibration and per-frame fan-out, and `stage_sequence_and_monotonic`
+        // below covers the default path's progress (pcores review r1, I3).
         let recorder = Arc::new(Recording::new());
         let started = start_stacking(
             ctx.clone(),
@@ -22784,6 +22902,34 @@ mod tests {
         let events = recorder.events(STACKING_PROGRESS_EVENT);
         let order = stage_sequence_and_monotonic(&events);
         assert_eq!(order, CANONICAL_STAGE_ORDER, "{order:?}");
+
+        // I3 (pcores review r1): the Normalize row of the default path is ONE
+        // count - the seeds calibration's frames, then the per-frame fan-out
+        // continuing from there, to a last tick on the same total. The
+        // calibration message must be among the events, or the monotonic
+        // check above says nothing about it.
+        let normalize: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["stage"].as_str() == Some("normalize"))
+            .collect();
+        assert!(
+            normalize.iter().any(|e| e["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("calibrating the seeds path"))),
+            "the default run takes the seeds calibration: {normalize:?}"
+        );
+        let climbing_totals: std::collections::BTreeSet<u64> = normalize
+            .iter()
+            .filter(|e| e["percent"].as_f64().unwrap_or(0.0) > 0.0)
+            .map(|e| e["total"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            climbing_totals.len(),
+            1,
+            "one count from the first tick to the last: {normalize:?}"
+        );
+        let last = normalize.last().unwrap();
+        assert_eq!(last["current"], last["total"], "{last:?}");
 
         let completes = recorder.events(STACKING_COMPLETE_EVENT);
         assert_eq!(completes.len(), 1, "{completes:?}");
@@ -24650,8 +24796,10 @@ mod tests {
         );
 
         // `StackingConfig::default()`'s `normalization.local.enabled` is
-        // `false` — no override needed to exercise the disabled path.
-        let cfg = StackingConfig::default();
+        // `false`; the disabled path needs the rejection normalization global
+        // too (the default is `local` since OD-1a, which runs LN for rejection).
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
@@ -25039,12 +25187,11 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
-        let cfg = StackingConfig::default();
+        let mut cfg = StackingConfig::default();
         assert!(!cfg.normalization.local.enabled);
-        assert_eq!(
-            cfg.normalization.rejection,
-            RejectionNormalization::ScaleZeroOffset
-        );
+        // The M1 shape is global rejection too: the default is `local` since
+        // OD-1a, which runs the Normalize stage for rejection.
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -25351,12 +25498,22 @@ mod tests {
             blocked_summary.included,
             "rejection-only LN never excludes a frame it could not normalize: {blocked_summary:?}"
         );
+        // LN runs for rejection only here: the warning names the rejection
+        // normalization the user got, not a "local normalization" they never
+        // turned on (OD-1a).
         assert!(
-            rc_a.warnings
-                .iter()
-                .any(|w| w.contains(&blocked_frame_id.to_string())
-                    && w.contains("local normalization")),
+            rc_a.warnings.iter().any(|w| w.starts_with(&format!(
+                "frame {blocked_frame_id}: local rejection normalization could not be computed"
+            ))),
             "the per-frame failure must warn: {:?}",
+            rc_a.warnings
+        );
+        assert!(
+            !rc_a
+                .warnings
+                .iter()
+                .any(|w| w.contains("local normalization failed")),
+            "{:?}",
             rc_a.warnings
         );
         let master_a = group_summary_a
@@ -25433,6 +25590,297 @@ mod tests {
                     "plane {p} pixel {i}: rejection-only fallback {a} vs global-normalization {b}"
                 );
             }
+        }
+    }
+
+    /// The rejection-only twin of the group-level fallback test above: LN
+    /// runs for rejection alone (`local.enabled = false`, the shipped
+    /// default), its `ln/<group>` directory cannot be created, and the run
+    /// warning says what the user chose - local REJECTION normalization -
+    /// and what they got instead, not "local normalization failed".
+    #[test]
+    fn local_normalization_rejection_only_group_failure_names_the_rejection_normalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.rejection = RejectionNormalization::Local;
+        cfg.normalization.local.enabled = false;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        // A plain FILE where the group's `ln/` directory must be created.
+        let blocked_ln_dir = layout.ln_dir(&group_key);
+        std::fs::create_dir_all(blocked_ln_dir.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_ln_dir, b"not a directory").unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        assert!(
+            rc.warnings.iter().any(|w| w.starts_with(&format!(
+                "group {group_key}: local rejection normalization could not be computed ("
+            )) && w.ends_with("star cores where seeing varies")),
+            "{:?}",
+            rc.warnings
+        );
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("local normalization failed")),
+            "the user never turned local normalization on: {:?}",
+            rc.warnings
+        );
+        let summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        assert!(summary.master_path.is_some(), "the group still stacks");
+    }
+
+    /// `referenceFrames < 3` with LN for rejection only: no LN reference, the
+    /// group rejects on the global pair, and the warning says so in the
+    /// rejection normalization's own words.
+    #[test]
+    fn local_normalization_rejection_only_reference_frames_below_three_names_the_rejection_normalization(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.rejection = RejectionNormalization::Local;
+        cfg.normalization.local.enabled = false;
+        cfg.normalization.local.reference_frames = 2;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        assert!(
+            rc.warnings.iter().any(|w| w.starts_with(&format!(
+                "group {group_key}: local rejection normalization could not be computed — referenceFrames (2) < 3;"
+            ))),
+            "{:?}",
+            rc.warnings
+        );
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("local normalization off")),
+            "{:?}",
+            rc.warnings
+        );
+    }
+
+    /// One full run on the LN star fixture with drizzle on and `rejection =
+    /// local` (the default): returns the group's `GroupStats` and the
+    /// drizzle's own `DrizzleStats`. `local_output` is `normalization.local.
+    /// enabled` - LN as the OUTPUT normalization, not only for rejection.
+    fn drizzle_run_with_ln(
+        local_output: bool,
+    ) -> (GroupStats, crate::stacking::drizzle::DrizzleStats) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        assert_eq!(
+            cfg.normalization.rejection,
+            RejectionNormalization::Local,
+            "the shipped default"
+        );
+        cfg.normalization.local.enabled = local_output;
+        // The subject is what the drizzle does with the grids, not the star
+        // selection (synthetic stars, none saturated; see `ln_base_stars`).
+        cfg.normalization.local.flux_estimator =
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        assert!(cfg.drizzle.use_local_normalization, "the drizzle default");
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::FrameSet(fixture.set_id),
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(summary.groups.len(), 1, "{:?}", summary.groups);
+        let group = &summary.groups[0];
+        let stats = group.stats.clone().expect("group stats recorded");
+        let drizzle = group.drizzle.clone().expect("drizzle stats recorded");
+        (stats, drizzle)
+    }
+
+    /// The drizzle follows the plain master's OUTPUT normalization (pcores
+    /// review r1, I1): with LN computed for rejection alone the grids exist
+    /// (`GroupStats.ln_frames`) and rejected against them, but the drizzled
+    /// master is globally normalized like the plain one - none of its frames
+    /// carries a grid into the drizzle (`DrizzleStats.ln_frames == 0`).
+    #[test]
+    fn drizzle_does_not_use_ln_grids_computed_for_rejection_only() {
+        let (stats, drizzle) = drizzle_run_with_ln(false);
+        assert_eq!(stats.included, 4, "{stats:?}");
+        assert_eq!(
+            stats.ln_frames, stats.included,
+            "LN ran for rejection, every frame has a grid: {stats:?}"
+        );
+        assert_eq!(drizzle.frames, stats.included, "{drizzle:?}");
+        assert_eq!(
+            drizzle.ln_frames, 0,
+            "LN output is off: the drizzle must stay on the global pair: {drizzle:?}"
+        );
+    }
+
+    /// The other half: with LN as the OUTPUT normalization the drizzle still
+    /// applies the grids (the toggle's only effect).
+    #[test]
+    fn drizzle_uses_ln_grids_when_ln_drives_the_output() {
+        let (stats, drizzle) = drizzle_run_with_ln(true);
+        assert_eq!(stats.included, 4, "{stats:?}");
+        assert_eq!(
+            drizzle.ln_frames, drizzle.frames,
+            "every drizzled frame carries its grid: {drizzle:?}"
+        );
+        assert!(drizzle.ln_frames > 0, "{drizzle:?}");
+    }
+
+    /// Every LN fallback sentence, in both modes: with local normalization
+    /// ON (output) the wording is the one the user has always read; with LN
+    /// for rejection only it names the rejection normalization, says the
+    /// global pair was used, and never claims "local normalization" failed or
+    /// is off. The background-model refusal has no cheap end-to-end fixture,
+    /// so its sentence is pinned here.
+    #[test]
+    fn ln_fallback_warnings_name_what_the_user_chose() {
+        let cases = [
+            LnFallback::GroupFailed { msg: "boom" },
+            LnFallback::FrameFailed {
+                frame_id: 7,
+                msg: "boom",
+            },
+            LnFallback::ReferenceFramesBelowThree {
+                reference_frames: 2,
+            },
+            LnFallback::BackgroundRefused {
+                reason: "no background sample",
+            },
+            LnFallback::LittleOverlap {
+                count: 2,
+                percent: 25.0,
+            },
+        ];
+        let expected_on = [
+            "group g: local normalization failed: boom",
+            "frame 7: local normalization failed: boom",
+            "group g: local normalization off — referenceFrames (2) < 3; using global normalization",
+            "group g: local normalization off — the LN reference's background model is refused (no background sample); using global normalization",
+            "group g: local normalization kept 2 frame(s) on global normalization — under 25 % overlap with the LN reference",
+        ];
+        let expected_rejection_only = [
+            "group g: local rejection normalization could not be computed (boom); rejection used the global normalization, which can clip star cores where seeing varies",
+            "frame 7: local rejection normalization could not be computed (boom); this frame's rejection used the global normalization",
+            "group g: local rejection normalization could not be computed — referenceFrames (2) < 3; rejection used the global normalization, which can clip star cores where seeing varies",
+            "group g: local rejection normalization could not be computed — the reference frame's background model is refused (no background sample); rejection used the global normalization, which can clip star cores where seeing varies",
+            "group g: 2 frame(s) used the global normalization for rejection — under 25 % overlap with the reference frame",
+        ];
+        for (i, what) in cases.iter().enumerate() {
+            assert_eq!(
+                ln_fallback_warning("g", false, what),
+                expected_on[i],
+                "on {i}"
+            );
+            let only = ln_fallback_warning("g", true, what);
+            assert_eq!(only, expected_rejection_only[i], "rejection only {i}");
+            assert!(
+                !only.contains("local normalization"),
+                "rejection-only wording must not name a feature the user did not turn on: {only}"
+            );
         }
     }
 
@@ -33150,8 +33598,11 @@ mod tests {
         }
         // 4 registered frames, the master, its coverage map (the project seed
         // turns `coverageMap` on), the drizzled master, its weight map, and
-        // drizzle's own coverage (plan 6b-3 D9: the 9th file).
-        assert_eq!(fits.len(), 9, "{fits:?}");
+        // drizzle's own coverage (plan 6b-3 D9: the 9th file), plus the two
+        // files of the LN reference (`reference.fits` and
+        // `reference-saturation.fits`): rejection normalization defaults to
+        // `local` since OD-1a, so a default project run builds one.
+        assert_eq!(fits.len(), 11, "{fits:?}");
         let out = tmp.path().join("out").join("p1");
         for name in [
             "p1_Lum_mono_300s_4x.fits",
@@ -33461,6 +33912,90 @@ mod tests {
             plan.stale_stages.contains(&Stage::Normalize),
             "{:?}",
             plan.stale_stages
+        );
+    }
+
+    /// The rejection-only twin of the test above: the same two-field project
+    /// with local normalization OFF for the output and `rejection = local`
+    /// (the shipped default). The two east frames fall back to the global
+    /// normalization for rejection, and the one run warning says so without
+    /// naming a "local normalization" the user never turned on.
+    #[test]
+    fn a_member_under_a_quarter_overlap_rejection_only_warns_in_rejection_words() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_two_field_project(&conn, &tmp.path().join("collab"));
+        for (key, dir) in [
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.path().join("work"),
+            ),
+            (
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                tmp.path().join("out"),
+            ),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let mut cfg = sky_config(&conn);
+        cfg.normalization.rejection = RejectionNormalization::Local;
+        cfg.normalization.local.enabled = false;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        run_pipeline(&mut rc).unwrap();
+
+        let group = rc.plan_groups[0].key.clone();
+        for e in rc.measured[&group]
+            .iter()
+            .filter(|e| e.frame.filename.starts_with("c_b"))
+        {
+            let marker = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group,
+                LN_GLOBAL_ARTIFACT_KIND,
+                Some(e.frame.frame_id),
+            )
+            .unwrap();
+            assert!(marker.is_some(), "{} falls back", e.frame.filename);
+        }
+        let overlap: Vec<&String> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("2 frame(s)") && w.contains("global normalization"))
+            .collect();
+        assert_eq!(overlap.len(), 1, "{:?}", rc.warnings);
+        assert!(
+            overlap[0].starts_with(&format!(
+                "group {group}: 2 frame(s) used the global normalization for rejection"
+            )),
+            "{overlap:?}"
+        );
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("local normalization kept")),
+            "{:?}",
+            rc.warnings
         );
     }
 

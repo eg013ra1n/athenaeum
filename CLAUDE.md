@@ -128,7 +128,7 @@ useEffect(() => {
 
 **Plate solving** — `solvemyastro` is the sole solver; the input gate has a Settings section (Plate Solving → Input Gate), the acceptance gate has none. `docs/platesolving/README.md`, `docs/platesolving/input-and-acceptance-gates.md`.
 
-**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 7); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
+**Stacking** — read `docs/stacking/README.md` before touching `stacking/`; the plan gate reuses the calibrated-export readiness gate; config precedence is whole-config; the default rejection normalization is `local`, by star flux (R-SC-1: the global pair cuts the sharpest frames' cores), and LN computed for rejection only never drives drizzle output; a numeric change is judged on the whole group at master level; Measure keeps `c` per plane (`MEASURE_VERSION` 7); measured-out ideas are not re-proposed; lab tools live in `athenaeum-lab`, never here.
 
 **Zip archives** — a `.zip` is a catalog file type: the scanner reads a zip's directory and entry headers only, zip-resident rows (`files.archive_zip_path`) are read through `zip_store::materialize`, never by `files.path`; no code writes into a zip, only an explicit Send to Void of the whole zip deletes one; a missing zip makes rows missing, never deleted; a zip in the Black Hole is present but not used. `docs/archive/README.md`, `docs/catalog/README.md`, `docs/file-browser/README.md`.
 

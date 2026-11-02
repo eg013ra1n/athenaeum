@@ -1,3 +1,5 @@
+#[cfg(all(feature = "render", feature = "solver"))]
+use crate::stacking::config::{preset, PathsConfig, StackingConfig, StackingPreset};
 use rusqlite::{Connection, OptionalExtension, Result};
 
 pub const UUID_TABLES: [&str; 7] = [
@@ -3420,7 +3422,780 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         tracing::error!(error = ?e, "cfa back-fill repair failed");
     }
 
+    // The stacking tables exist by now. A rewrite that fails is rolled back
+    // whole and retried at the next start; the old default it would have
+    // replaced still works, so it never blocks catalog init either.
+    if let Err(e) = migrate_rejection_normalization_local(conn) {
+        tracing::error!(
+            error = ?e,
+            "rejection normalization migration failed; retried at the next start"
+        );
+    }
+
     Ok(())
+}
+
+/// `settings` row that records the one-time [`migrate_rejection_normalization_local`]
+/// rewrite. Written in the same transaction as the rewrite: absent means the
+/// rewrite has not happened, present (any value) means it must never run again
+/// — a user who sets `scaleZeroOffset` afterwards keeps it.
+#[cfg(all(feature = "render", feature = "solver"))]
+const REJECTION_LOCAL_MARKER: &str = "stacking.migration.rejection_local";
+
+/// The JSON path of the rejection normalization inside a stored
+/// `StackingConfig` document.
+#[cfg(all(feature = "render", feature = "solver"))]
+const REJECTION_PATH: &str = "$.normalization.rejection";
+
+/// One-time rewrite of every stored stacking document that carries the old
+/// default rejection normalization (`"scaleZeroOffset"`) to `"local"`.
+///
+/// Why: `scaleZeroOffset` scales each frame by its background dispersion, and
+/// where seeing varies from frame to frame the Linear fit clip then cuts the
+/// sharpest frames' star cores (-29 % peak measured on the LDN1272 project
+/// master). The owner ruled `local` the default everywhere (2026-11-01,
+/// OD-1a) and the stored documents that still hold the old default rewritten
+/// once (OD-2a): the old value was the default nobody picked, not a choice.
+///
+/// Stores, all device-local (the hub never carries them): the global defaults
+/// row `stacking.defaults` (a whole `StackingConfig`), every element of the
+/// `stacking.presets` array (`[{name, config}]`), `stacking_set_config` and
+/// `stacking_project_config`. `none`, `equalizeFluxes` and `local` are left
+/// alone; `updated_at` is untouched (a migration is not an edit); a document
+/// that is not valid JSON is logged and skipped, never repaired. The
+/// documents are edited with SQLite's `json_set`, so nothing but the one
+/// token changes.
+///
+/// A document saved as Fast preview is left alone too: `preset(FastPreview)`
+/// pins `scaleZeroOffset` on purpose (OD-3, a preview pays no Normalize
+/// stage), so a stored copy of it holds a choice, not the old default
+/// ([`is_fast_preview`]).
+///
+/// Runs inside `BEGIN IMMEDIATE` (`init_db` is outside any transaction) and
+/// rolls back on error - a failed `COMMIT` included - leaving the marker
+/// unwritten so the next start retries.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn migrate_rejection_normalization_local(conn: &Connection) -> Result<()> {
+    fn marked(conn: &Connection) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key = ?1",
+                [REJECTION_LOCAL_MARKER],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+    if marked(conn)? {
+        return Ok(());
+    }
+    // The `rebuild_stacking_tables_for_subjects` pattern: every exit that does
+    // not reach `commit()` - an error in the body or a refused COMMIT - drops
+    // the transaction, and its Drop rolls back.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have migrated between the probe and the write lock.
+    if marked(&tx)? {
+        return Ok(());
+    }
+    let counts = [
+        ("stacking.defaults", rewrite_defaults_row(&tx)?),
+        ("stacking.presets", rewrite_presets_row(&tx)?),
+        (
+            "stacking_set_config",
+            rewrite_config_table(&tx, "stacking_set_config", "frames_set_id")?,
+        ),
+        (
+            "stacking_project_config",
+            rewrite_config_table(&tx, "stacking_project_config", "project_id")?,
+        ),
+    ];
+    tx.execute(
+        "INSERT OR REPLACE INTO settings (key, value, updated_at)
+         VALUES (?1, 'done', datetime('now'))",
+        [REJECTION_LOCAL_MARKER],
+    )?;
+    tx.commit()?;
+    for (store, c) in counts {
+        if c.rewritten > 0 || c.kept_fast_preview > 0 {
+            tracing::info!(
+                store,
+                documents_rewritten = c.rewritten,
+                documents_kept_fast_preview = c.kept_fast_preview,
+                "stored stacking settings: rejection normalization rewritten to local"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Headless builds (`--no-default-features`) carry no `stacking` module, so
+/// there is no Fast preview to compare a stored document with and nothing
+/// that reads one: the rewrite waits, marker unwritten, for the first full
+/// build that opens the catalog.
+#[cfg(not(all(feature = "render", feature = "solver")))]
+fn migrate_rejection_normalization_local(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+/// What one store's pass did, for the migration's `info!`.
+#[cfg(all(feature = "render", feature = "solver"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreRewrite {
+    /// Documents whose `normalization.rejection` went `scaleZeroOffset` -> `local`.
+    rewritten: usize,
+    /// Documents with `scaleZeroOffset` that are a Fast preview and stay.
+    kept_fast_preview: usize,
+}
+
+/// Whether a stored document is the Fast preview: decoded as a
+/// `StackingConfig` (read-only, for this comparison alone) and equal to
+/// `preset(FastPreview)` apart from its `paths`, which a user sets per set or
+/// project without leaving the preset. A document that does not decode is not
+/// one, and follows the normal rule.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn is_fast_preview(decoded: serde_json::Result<StackingConfig>) -> bool {
+    let Ok(mut config) = decoded else {
+        return false;
+    };
+    config.paths = PathsConfig::default();
+    config == preset(StackingPreset::FastPreview)
+}
+
+/// `stacking.defaults`: one whole-config document, or no row.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn rewrite_defaults_row(conn: &Connection) -> Result<StoreRewrite> {
+    const STORE: &str = "stacking.defaults";
+    let mut out = StoreRewrite::default();
+    let Some(raw) = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [STORE], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten()
+    else {
+        return Ok(out);
+    };
+    if raw.trim().is_empty() {
+        return Ok(out);
+    }
+    let doc = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(
+                store = STORE,
+                error = %e,
+                "stored stacking document is not valid JSON; left unchanged"
+            );
+            return Ok(out);
+        }
+    };
+    if doc
+        .pointer("/normalization/rejection")
+        .and_then(|v| v.as_str())
+        != Some("scaleZeroOffset")
+    {
+        return Ok(out);
+    }
+    if is_fast_preview(serde_json::from_value::<StackingConfig>(doc)) {
+        out.kept_fast_preview = 1;
+        return Ok(out);
+    }
+    out.rewritten = conn.execute(
+        "UPDATE settings SET value = json_set(value, ?2, 'local') WHERE key = ?1",
+        rusqlite::params![STORE, REJECTION_PATH],
+    )?;
+    Ok(out)
+}
+
+/// `stacking.presets`: a JSON array of `{name, config}`. Elements are read as
+/// plain JSON values - never through `NamedPreset` - so an entry that does not
+/// decode as a preset is carried over untouched; a Fast preview entry
+/// (`config` equal to the preset) is left as it is.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn rewrite_presets_row(conn: &Connection) -> Result<StoreRewrite> {
+    const STORE: &str = "stacking.presets";
+    let mut out = StoreRewrite::default();
+    let Some(raw) = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [STORE], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten()
+    else {
+        return Ok(out);
+    };
+    if raw.trim().is_empty() {
+        return Ok(out);
+    }
+    let entries = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Array(entries)) => entries,
+        Ok(_) => {
+            tracing::warn!(
+                store = STORE,
+                "stored stacking presets are not a valid JSON array; left unchanged"
+            );
+            return Ok(out);
+        }
+        Err(e) => {
+            tracing::warn!(
+                store = STORE,
+                error = %e,
+                "stored stacking presets are not a valid JSON array; left unchanged"
+            );
+            return Ok(out);
+        }
+    };
+    let mut hits: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(config) = entry.get("config") else {
+            continue;
+        };
+        if config
+            .pointer("/normalization/rejection")
+            .and_then(|v| v.as_str())
+            != Some("scaleZeroOffset")
+        {
+            continue;
+        }
+        if is_fast_preview(serde_json::from_value::<StackingConfig>(config.clone())) {
+            out.kept_fast_preview += 1;
+        } else {
+            hits.push(i);
+        }
+    }
+    if hits.is_empty() {
+        return Ok(out);
+    }
+    // One `json_set(value, path1, 'local', path2, 'local', ...)`; the indices
+    // are integers this function computed, never user text.
+    let mut sql = String::from("UPDATE settings SET value = json_set(value");
+    for i in &hits {
+        sql.push_str(&format!(
+            ", '$[{i}].config.normalization.rejection', 'local'"
+        ));
+    }
+    sql.push_str(") WHERE key = ?1");
+    conn.execute(&sql, [STORE])?;
+    out.rewritten = hits.len();
+    Ok(out)
+}
+
+/// `stacking_set_config` / `stacking_project_config`: one `config_json`
+/// document per row. `key_col` only names the row in the warn for a document
+/// that is not valid JSON (`frames_set_id` or `project_id`). `table` and
+/// `key_col` are literals of this file.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn rewrite_config_table(
+    conn: &Connection,
+    table: &'static str,
+    key_col: &'static str,
+) -> Result<StoreRewrite> {
+    let invalid: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT CAST({key_col} AS TEXT), config_json FROM {table} WHERE NOT json_valid(config_json)"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    for (row, raw) in &invalid {
+        // SQLite refused it; serde names why (a document serde reads after
+        // all still gets a reason, SQLite's).
+        let error = serde_json::from_str::<serde_json::Value>(raw)
+            .err()
+            .map_or_else(
+                || "rejected by SQLite's JSON check".to_string(),
+                |e| e.to_string(),
+            );
+        if table == "stacking_set_config" {
+            tracing::warn!(
+                store = table,
+                frame_set_id = %row,
+                error = %error,
+                "stored stacking document is not valid JSON; left unchanged"
+            );
+        } else {
+            tracing::warn!(
+                store = table,
+                project_id = %row,
+                error = %error,
+                "stored stacking document is not valid JSON; left unchanged"
+            );
+        }
+    }
+    // `CASE` keeps `json_extract` away from the rows `json_valid` refused.
+    let candidates: Vec<(i64, String)> = conn
+        .prepare(&format!(
+            "SELECT rowid, config_json FROM {table}
+              WHERE CASE WHEN json_valid(config_json)
+                         THEN json_extract(config_json, ?1) END = 'scaleZeroOffset'"
+        ))?
+        .query_map([REJECTION_PATH], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let mut out = StoreRewrite::default();
+    for (rowid, raw) in candidates {
+        if is_fast_preview(serde_json::from_str::<StackingConfig>(&raw)) {
+            out.kept_fast_preview += 1;
+            continue;
+        }
+        out.rewritten += conn.execute(
+            &format!(
+                "UPDATE {table} SET config_json = json_set(config_json, ?1, 'local') WHERE rowid = ?2"
+            ),
+            rusqlite::params![REJECTION_PATH, rowid],
+        )?;
+    }
+    Ok(out)
+}
+
+#[cfg(all(feature = "render", feature = "solver"))]
+#[cfg(test)]
+mod rejection_local_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// A stored `StackingConfig` reduced to the fields the migration reads or
+    /// must leave alone (the real document is the same shape, only longer).
+    fn doc(rejection: &str) -> String {
+        format!(
+            r#"{{"version":1,"normalization":{{"output":"additiveWithScaling","rejection":"{rejection}","scaleEstimator":"bwmv","local":{{"enabled":false,"gridSize":4,"referenceFrames":20}}}},"integration":{{"rejection":{{"method":"auto"}},"rangeLow":0.0}}}}"#
+        )
+    }
+
+    const STAMP: &str = "2026-01-01T00:00:00Z";
+
+    /// A catalog as an upgrading user has it: `init_db` has run once (so every
+    /// table exists), then the marker is removed — the state before the
+    /// migration ever ran. Foreign keys are off so child rows can be inserted
+    /// without their parents.
+    fn pre_migration() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [REJECTION_LOCAL_MARKER],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn put_setting(conn: &Connection, key: &str, value: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![key, value, STAMP],
+        )
+        .unwrap();
+    }
+
+    fn setting(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .unwrap()
+    }
+
+    fn put_set_config(conn: &Connection, set_id: i64, json: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO stacking_set_config (frames_set_id, config_json, updated_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![set_id, json, STAMP],
+        )
+        .unwrap();
+    }
+
+    fn set_config(conn: &Connection, set_id: i64) -> String {
+        conn.query_row(
+            "SELECT config_json FROM stacking_set_config WHERE frames_set_id = ?1",
+            [set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn put_project_config(conn: &Connection, project_id: &str, json: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO stacking_project_config (project_id, config_json, updated_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![project_id, json, STAMP],
+        )
+        .unwrap();
+    }
+
+    fn project_config(conn: &Connection, project_id: &str) -> String {
+        conn.query_row(
+            "SELECT config_json FROM stacking_project_config WHERE project_id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn presets(entries: &[(&str, String)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(name, config)| format!(r#"{{"name":"{name}","config":{config}}}"#))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    fn updated_at(conn: &Connection, sql: &str) -> String {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// All four stores carry the old default: every one is rewritten, and
+    /// nothing but the one token changes (the rest of each document is
+    /// byte-identical, `updated_at` included).
+    #[test]
+    fn rewrites_the_four_stores() {
+        let conn = pre_migration();
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+        put_setting(
+            &conn,
+            "stacking.presets",
+            &presets(&[
+                ("old a", doc("scaleZeroOffset")),
+                ("keeps", doc("equalizeFluxes")),
+                ("old b", doc("scaleZeroOffset")),
+            ]),
+        );
+        put_set_config(&conn, 1, &doc("scaleZeroOffset"));
+        put_set_config(&conn, 2, &doc("scaleZeroOffset"));
+        put_project_config(&conn, "proj-1", &doc("scaleZeroOffset"));
+
+        migrate_rejection_normalization_local(&conn).unwrap();
+
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("local"),
+            "defaults row"
+        );
+        assert_eq!(
+            setting(&conn, "stacking.presets").unwrap(),
+            presets(&[
+                ("old a", doc("local")),
+                ("keeps", doc("equalizeFluxes")),
+                ("old b", doc("local")),
+            ]),
+            "presets: elements 0 and 2 rewritten, 1 untouched"
+        );
+        assert_eq!(set_config(&conn, 1), doc("local"), "set 1");
+        assert_eq!(set_config(&conn, 2), doc("local"), "set 2");
+        assert_eq!(project_config(&conn, "proj-1"), doc("local"), "project");
+        assert_eq!(
+            updated_at(
+                &conn,
+                "SELECT updated_at FROM settings WHERE key = 'stacking.defaults'"
+            ),
+            STAMP
+        );
+        assert_eq!(
+            updated_at(
+                &conn,
+                "SELECT updated_at FROM stacking_set_config WHERE frames_set_id = 1"
+            ),
+            STAMP
+        );
+        assert_eq!(
+            updated_at(
+                &conn,
+                "SELECT updated_at FROM stacking_project_config WHERE project_id = 'proj-1'"
+            ),
+            STAMP
+        );
+        assert!(
+            setting(&conn, REJECTION_LOCAL_MARKER).is_some(),
+            "the marker is written with the rewrite"
+        );
+    }
+
+    /// `none`, `equalizeFluxes` and `local` are choices (or already the new
+    /// default): no store changes them. A preset entry that is not a preset
+    /// at all is carried over as it is.
+    #[test]
+    fn other_values_and_odd_entries_are_untouched() {
+        let conn = pre_migration();
+        let odd_presets = format!(
+            r#"[{{"name":"no config"}},42,{{"name":"no normalization","config":{{}}}},{{"name":"fixed","config":{}}},{{"name":"none","config":{}}}]"#,
+            doc("scaleZeroOffset"),
+            doc("none")
+        );
+        for (i, rejection) in ["none", "equalizeFluxes", "local"].iter().enumerate() {
+            put_set_config(&conn, i as i64 + 1, &doc(rejection));
+        }
+        put_setting(&conn, "stacking.defaults", &doc("equalizeFluxes"));
+        put_project_config(&conn, "p", &doc("none"));
+        put_setting(&conn, "stacking.presets", &odd_presets);
+
+        migrate_rejection_normalization_local(&conn).unwrap();
+
+        for (i, rejection) in ["none", "equalizeFluxes", "local"].iter().enumerate() {
+            assert_eq!(
+                set_config(&conn, i as i64 + 1),
+                doc(rejection),
+                "{rejection}"
+            );
+        }
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("equalizeFluxes")
+        );
+        assert_eq!(project_config(&conn, "p"), doc("none"));
+        assert_eq!(
+            setting(&conn, "stacking.presets").unwrap(),
+            odd_presets.replacen("scaleZeroOffset", "local", 1),
+            "only the one preset that carried the old default changed"
+        );
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_some());
+    }
+
+    /// A catalog with no stacking documents at all (a new install) just gets
+    /// the marker.
+    #[test]
+    fn an_empty_catalog_only_gets_the_marker() {
+        let conn = pre_migration();
+        migrate_rejection_normalization_local(&conn).unwrap();
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_some());
+        assert!(setting(&conn, "stacking.defaults").is_none());
+        assert!(setting(&conn, "stacking.presets").is_none());
+    }
+
+    /// A second `init_db` after the migration changes nothing — not the
+    /// documents, not the marker.
+    #[test]
+    fn a_second_init_db_changes_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        // The first `init_db` above already migrated (and marked) the empty
+        // catalog; documents stored after it are the post-migration world.
+        let marker = setting(&conn, REJECTION_LOCAL_MARKER).expect("marked by the first init_db");
+        let updated_before = updated_at(
+            &conn,
+            "SELECT updated_at FROM settings WHERE key = 'stacking.migration.rejection_local'",
+        );
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+        put_set_config(&conn, 7, &doc("scaleZeroOffset"));
+
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("scaleZeroOffset")
+        );
+        assert_eq!(set_config(&conn, 7), doc("scaleZeroOffset"));
+        assert_eq!(setting(&conn, REJECTION_LOCAL_MARKER).unwrap(), marker);
+        assert_eq!(
+            updated_at(
+                &conn,
+                "SELECT updated_at FROM settings WHERE key = 'stacking.migration.rejection_local'"
+            ),
+            updated_before,
+            "the marker row is not rewritten"
+        );
+    }
+
+    /// A user who chooses `scaleZeroOffset` AFTER the migration keeps it
+    /// through every later start, in all four stores.
+    #[test]
+    fn a_choice_made_after_the_migration_is_kept() {
+        let conn = pre_migration();
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+        migrate_rejection_normalization_local(&conn).unwrap();
+        assert_eq!(setting(&conn, "stacking.defaults").unwrap(), doc("local"));
+
+        // The owner picks the old behaviour on purpose, everywhere.
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+        put_setting(
+            &conn,
+            "stacking.presets",
+            &presets(&[("mine", doc("scaleZeroOffset"))]),
+        );
+        put_set_config(&conn, 3, &doc("scaleZeroOffset"));
+        put_project_config(&conn, "p", &doc("scaleZeroOffset"));
+
+        migrate_rejection_normalization_local(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("scaleZeroOffset")
+        );
+        assert_eq!(
+            setting(&conn, "stacking.presets").unwrap(),
+            presets(&[("mine", doc("scaleZeroOffset"))])
+        );
+        assert_eq!(set_config(&conn, 3), doc("scaleZeroOffset"));
+        assert_eq!(project_config(&conn, "p"), doc("scaleZeroOffset"));
+    }
+
+    /// A stored value that is not valid JSON is left exactly as it is and
+    /// does not stop the valid documents beside it from being rewritten;
+    /// `init_db` still succeeds.
+    #[test]
+    fn an_invalid_json_row_is_left_as_is() {
+        let conn = pre_migration();
+        put_setting(&conn, "stacking.defaults", "{ not json");
+        put_setting(&conn, "stacking.presets", "[{\"name\":");
+        put_set_config(&conn, 1, "{ not json");
+        put_set_config(&conn, 2, &doc("scaleZeroOffset"));
+        put_project_config(&conn, "bad", "[1,2");
+        put_project_config(&conn, "good", &doc("scaleZeroOffset"));
+
+        migrate_rejection_normalization_local(&conn).unwrap();
+
+        assert_eq!(setting(&conn, "stacking.defaults").unwrap(), "{ not json");
+        assert_eq!(setting(&conn, "stacking.presets").unwrap(), "[{\"name\":");
+        assert_eq!(set_config(&conn, 1), "{ not json");
+        assert_eq!(set_config(&conn, 2), doc("local"));
+        assert_eq!(project_config(&conn, "bad"), "[1,2");
+        assert_eq!(project_config(&conn, "good"), doc("local"));
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_some());
+    }
+
+    fn fast_preview_json() -> String {
+        serde_json::to_string(&preset(StackingPreset::FastPreview)).unwrap()
+    }
+
+    /// A Fast preview with one setting changed: no longer the preset, so the
+    /// old default it carries is rewritten like any other document's.
+    fn edited_fast_preview_json() -> String {
+        let mut c = preset(StackingPreset::FastPreview);
+        c.reference.two_pass = true;
+        serde_json::to_string(&c).unwrap()
+    }
+
+    fn rejection_of(json: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(json)
+            .unwrap()
+            .pointer("/normalization/rejection")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    /// A document saved as Fast preview holds `scaleZeroOffset` on purpose
+    /// (OD-3): all four stores leave it alone, byte for byte, even with the
+    /// paths a user set on it; one other field changed and it is the old
+    /// default again, rewritten.
+    #[test]
+    fn a_saved_fast_preview_keeps_its_global_rejection() {
+        let conn = pre_migration();
+        let fast = fast_preview_json();
+        assert_eq!(rejection_of(&fast), "scaleZeroOffset");
+        let edited = edited_fast_preview_json();
+        assert_eq!(rejection_of(&edited), "scaleZeroOffset");
+        let mut with_paths = preset(StackingPreset::FastPreview);
+        with_paths.paths.output_dir = Some("/data/out".into());
+        let with_paths = serde_json::to_string(&with_paths).unwrap();
+
+        put_setting(&conn, "stacking.defaults", &fast);
+        put_setting(
+            &conn,
+            "stacking.presets",
+            &presets(&[
+                ("preview", fast.clone()),
+                ("edited preview", edited.clone()),
+                ("old default", doc("scaleZeroOffset")),
+            ]),
+        );
+        put_set_config(&conn, 1, &with_paths);
+        put_set_config(&conn, 2, &edited);
+        put_project_config(&conn, "kept", &fast);
+        put_project_config(&conn, "rewritten", &edited);
+
+        migrate_rejection_normalization_local(&conn).unwrap();
+
+        assert_eq!(setting(&conn, "stacking.defaults").unwrap(), fast);
+        let stored_presets = setting(&conn, "stacking.presets").unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&stored_presets).unwrap();
+        let rejection = |i: usize| {
+            entries[i]
+                .pointer("/config/normalization/rejection")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(rejection(0), "scaleZeroOffset", "the Fast preview entry");
+        assert_eq!(rejection(1), "local", "the edited Fast preview entry");
+        assert_eq!(rejection(2), "local", "the old default entry");
+        assert_eq!(
+            entries[0]["config"],
+            serde_json::from_str::<serde_json::Value>(&fast).unwrap()
+        );
+        assert_eq!(set_config(&conn, 1), with_paths, "paths do not matter");
+        assert_eq!(rejection_of(&set_config(&conn, 2)), "local");
+        assert_eq!(project_config(&conn, "kept"), fast);
+        assert_eq!(rejection_of(&project_config(&conn, "rewritten")), "local");
+        // The rewritten edited preview differs from the stored one in that
+        // one token alone.
+        let mut expected = preset(StackingPreset::FastPreview);
+        expected.reference.two_pass = true;
+        expected.normalization.rejection =
+            crate::integration::stats::RejectionNormalization::Local;
+        assert_eq!(
+            serde_json::from_str::<StackingConfig>(&set_config(&conn, 2)).unwrap(),
+            expected
+        );
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_some());
+    }
+
+    /// A refused `COMMIT` leaves no open transaction behind (it used to sit
+    /// outside the guarded path): the whole rewrite is undone, the marker is
+    /// unwritten, the connection is back in autocommit. The commit is made to
+    /// fail by a deferred foreign key the marker's own insert violates.
+    #[test]
+    fn a_failed_commit_leaves_no_open_transaction() {
+        let conn = pre_migration();
+        conn.execute_batch(
+            "CREATE TABLE t_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE t_child (
+                 pid INTEGER REFERENCES t_parent(id) DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TRIGGER t_marker AFTER INSERT ON settings
+             WHEN NEW.key = 'stacking.migration.rejection_local'
+             BEGIN INSERT INTO t_child (pid) VALUES (999); END;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+
+        let err = migrate_rejection_normalization_local(&conn).unwrap_err();
+
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "the COMMIT is what failed: {err}"
+        );
+        assert!(conn.is_autocommit(), "no transaction left open");
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("scaleZeroOffset")
+        );
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_none());
+    }
+
+    /// An error part-way rolls the whole rewrite back and leaves the marker
+    /// unwritten, so the next start retries — never a half-migrated catalog.
+    #[test]
+    fn a_failure_rolls_everything_back() {
+        let conn = pre_migration();
+        put_setting(&conn, "stacking.defaults", &doc("scaleZeroOffset"));
+        put_set_config(&conn, 1, &doc("scaleZeroOffset"));
+        // The last store goes missing: its statement fails after the first
+        // three stores have been rewritten inside the transaction.
+        conn.execute_batch("DROP TABLE stacking_project_config")
+            .unwrap();
+
+        assert!(migrate_rejection_normalization_local(&conn).is_err());
+
+        assert!(conn.is_autocommit(), "the transaction was closed");
+        assert_eq!(
+            setting(&conn, "stacking.defaults").unwrap(),
+            doc("scaleZeroOffset")
+        );
+        assert_eq!(set_config(&conn, 1), doc("scaleZeroOffset"));
+        assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_none());
+    }
 }
 
 #[cfg(test)]

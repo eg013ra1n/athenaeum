@@ -4351,9 +4351,16 @@ mod tests {
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 1);
+        // Normalize is stale on a fresh set too: rejection normalization
+        // defaults to `local` since OD-1a, which runs the stage.
         assert_eq!(
             plan.stale_stages,
-            vec![Stage::Calibrate, Stage::Measure, Stage::Register]
+            vec![
+                Stage::Calibrate,
+                Stage::Measure,
+                Stage::Register,
+                Stage::Normalize
+            ]
         );
         assert!(plan.estimate_bytes > 0);
     }
@@ -6710,6 +6717,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
+        // The M1 global path: the default rejection is `local` since OD-1a, which would leave Normalize stale here.
+        cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
         set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
 
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
@@ -8631,14 +8640,16 @@ mod tests {
         // 2026-10-24 Plan C R-PC-10 (the Blend refusal): MEASURE_VERSION 6 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-10-25 Plan C R-PC-10b (the Blend refusal on the Analysis path only): MEASURE_VERSION 7 (6 is burnt) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-11-01 Plan D D2 (`c`'s colour sample, PD-9): MEASURE_VERSION 8 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
+        // 2026-11-01 pcores Task 1 (OD-1a, OD-3): `normalization.rejection` defaults to `local`, fastPreview pins `scaleZeroOffset` - ln_ref, ln and ln_cal move on default, maximumQuality and custom (the normalization subtree folds the whole block); calib, meas and reg do NOT move on any line, and the fastPreview line is UNCHANGED.
         // 2026-11-02 Plan D D2c r1 (review M1 of D2b): FITS_ARTIFACT_VERSION 3 folded into meas (the measurement subtree, beside MEASURE_VERSION) - meas, reg and ln move on every line (was meas=326ee3f03ffce101 on the default line); calib is UNCHANGED, and ln_ref and ln_cal too (this golden feeds them no measurement hash).
+        // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 / FITS_ARTIFACT_VERSION 3 AND the `local` rejection default); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=efe8758fbdc4bbbd ln_ref=500204de9b22c23d ln=f6fe01073ccedcca ln_cal=1ed2edc9d7ff5dcb",
+                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=efe8758fbdc4bbbd ln_ref=782cf447acae6ace ln=532bfea1cac2d7b4 ln_cal=23f55e28c19f3459",
                 "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=a038dcae26c2392a ln_ref=500204de9b22c23d ln=4110659e2116091d ln_cal=1ed2edc9d7ff5dcb",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=bc4925cc6681db3a ln_ref=02d5bf6ffe33d1c8 ln=40da194093ebe65c ln_cal=027f32901875b9f3",
-                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=916582f203cecefc ln_ref=02d5bf6ffe33d1c8 ln=a1ca2671c66faa22 ln_cal=027f32901875b9f3",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=bc4925cc6681db3a ln_ref=364ed4c8ffba6878 ln=b88fd0bd410fb46c ln_cal=86f453747dcafe8b",
+                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=916582f203cecefc ln_ref=364ed4c8ffba6878 ln=88cef42f95ee4e58 ln_cal=86f453747dcafe8b",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8709,7 +8720,9 @@ mod tests {
         let (meas, reg, ln) = line(&at_max);
         assert_eq!(meas, "cc923a65f1b367d7");
         assert_eq!(reg, "efe8758fbdc4bbbd");
-        assert_eq!(ln, "f6fe01073ccedcca");
+        // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
+        // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
+        assert_eq!(ln, "532bfea1cac2d7b4");
     }
 
     #[test]

@@ -398,14 +398,15 @@ pub struct DrizzleConfig {
     pub kernel: DrizzleKernel,
     pub use_rejection: bool,
     pub use_weights: bool,
-    /// B8 (M3 final fix wave, M5 ruling): a no-op whenever local
-    /// normalization is off for the run (`normalization.local.enabled ==
-    /// false` and `normalization.rejection != "local"`) — the drizzle
-    /// driver already falls back to each included frame's own global
-    /// output-normalization pair per frame in that case, exactly as
-    /// [`super::integrate`]'s own engine does; this toggle only has an
-    /// effect when local normalization is actually driving output
-    /// normalization for the group.
+    /// B8 (M3 final fix wave, M5 ruling): the drizzle follows the plain
+    /// master's OUTPUT normalization, so this toggle only has an effect when
+    /// local normalization drives output normalization
+    /// (`normalization.local.enabled == true`). With it off, the drizzle
+    /// falls back to each included frame's own global output-normalization
+    /// pair, exactly as [`super::integrate`]'s own engine does for the plain
+    /// master - including when LN was computed for rejection alone
+    /// (`normalization.rejection == "local"`, the default): those grids never
+    /// drive the drizzle's output (pcores review r1, I1).
     pub use_local_normalization: bool,
     pub write_weight_map: bool,
     /// M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
@@ -515,7 +516,11 @@ pub enum StackingPreset {
 /// `FastPreview` (M4a Task 4, ruling R-M4a-18) turns the two-pass reference
 /// pick OFF: the dry pass is a whole extra registration of the reference's
 /// group, and a preset whose entire promise is "fast" must not pay for a
-/// refinement a preview does not need.
+/// refinement a preview does not need. For the same reason it pins the
+/// rejection normalization to `ScaleZeroOffset` (owner ruling 2026-11-01,
+/// OD-3): the shipped default is `Local` now, whose Normalize stage costs
+/// about as much as the integration itself, and a preview has no use for it.
+/// `Default` and `MaximumQuality` inherit `Local`.
 pub fn preset(p: StackingPreset) -> StackingConfig {
     match p {
         StackingPreset::Default => StackingConfig::default(),
@@ -527,6 +532,9 @@ pub fn preset(p: StackingPreset) -> StackingConfig {
                 sigma_low: 4.0,
                 sigma_high: 3.0,
             };
+            // OD-3: a preview's promise is speed - no Normalize stage.
+            c.normalization.rejection =
+                crate::integration::stats::RejectionNormalization::ScaleZeroOffset;
             c.output.cleanup = CleanupPolicy::DeleteIntermediates;
             c
         }
@@ -1127,6 +1135,7 @@ pub fn project_seed_config(global: StackingConfig) -> StackingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration::stats::RejectionNormalization;
 
     #[test]
     fn a_legacy_document_reads_scale_1024_as_auto_and_any_other_as_fixed() {
@@ -1553,7 +1562,8 @@ mod tests {
             "\"interpolation\":\"bicubicBSpline\"",
             "\"clampingThreshold\":0.3",
             "\"output\":\"additiveWithScaling\"",
-            "\"rejection\":\"scaleZeroOffset\"",
+            // Owner ruling 2026-11-01 (OD-1a): `local` is the shipped default.
+            "\"rejection\":\"local\"",
             "\"scaleEstimator\":\"bwmv\"",
             "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75},\"fluxEstimator\":\"commonAperture\",\"aperture\":\"growthCurve\"}",
             "\"rejection\":{\"method\":\"auto\"}",
@@ -1588,6 +1598,11 @@ mod tests {
         // M4a Task 4, ruling R-M4a-18: a "fast" preset does not pay for the
         // two-pass reference's dry registration pass.
         assert!(!f.reference.two_pass);
+        // OD-3: Fast preview keeps the global pair (no Normalize stage).
+        assert_eq!(
+            f.normalization.rejection,
+            RejectionNormalization::ScaleZeroOffset
+        );
         let m = preset(StackingPreset::MaximumQuality);
         assert_eq!(m.registration.distortion, DistortionChoice::Polynomial3);
         assert!(m.integration.write_rejection_maps);
@@ -1602,6 +1617,31 @@ mod tests {
         assert!(m.reference.two_pass);
         assert_eq!(preset(StackingPreset::Default), StackingConfig::default());
         assert!(preset(StackingPreset::Default).reference.two_pass);
+    }
+
+    /// Owner ruling 2026-11-01 (OD-1a, OD-3): the rejection normalization of
+    /// Default / Maximum quality / Fast preview resolves to Local / Local /
+    /// ScaleZeroOffset, and the shipped default is the Default preset.
+    #[test]
+    fn the_three_presets_resolve_their_rejection_normalization() {
+        assert_eq!(
+            preset(StackingPreset::Default).normalization.rejection,
+            RejectionNormalization::Local
+        );
+        assert_eq!(
+            preset(StackingPreset::MaximumQuality)
+                .normalization
+                .rejection,
+            RejectionNormalization::Local
+        );
+        assert_eq!(
+            preset(StackingPreset::FastPreview).normalization.rejection,
+            RejectionNormalization::ScaleZeroOffset
+        );
+        assert_eq!(
+            StackingConfig::default().normalization.rejection,
+            RejectionNormalization::Local
+        );
     }
 
     #[test]
@@ -1880,7 +1920,10 @@ mod tests {
                 &[],
                 &[]
             ),
-            "209f262fd5e90fec",
+            // 2026-11-01 pcores Task 1 (OD-1a): the default rejection normalization is `local` and the normalization
+            // subtree folds the whole block, so this literal moved (was "209f262fd5e90fec"); measurement and
+            // registration did not.
+            "eee085e20921f75c",
             "normalization"
         );
     }
@@ -1902,7 +1945,8 @@ mod tests {
             (
                 "0d5c198c7abb7132".to_string(),
                 "71627dbef71e5f50".to_string(),
-                "d1f5adda37fa2f11".to_string(),
+                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "d1f5adda37fa2f11".
+                "75a4d889a865b845".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -1949,7 +1993,8 @@ mod tests {
             (
                 "92ce74a473b23d1e".to_string(),
                 "40084109c5bdfb9a".to_string(),
-                "babef50774a4c396".to_string(),
+                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "babef50774a4c396".
+                "32d84d26ce058018".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "measurement, registration, normalization, calibration"
@@ -1998,7 +2043,8 @@ mod tests {
                 7,
                 "458fe47fbbf6cf96".to_string(),
                 "58b254a7ba5d0808".to_string(),
-                "6f83ebdc535ec8a1".to_string(),
+                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "6f83ebdc535ec8a1".
+                "08ccc8d4872ab886".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -2035,7 +2081,8 @@ mod tests {
     /// the values below and are none of the version-5, burnt version-6 or version-7 ones, and the calibration subtree
     /// hashes as it did before the bump (a bump must not recalibrate). The measurement literal was re-recorded 2026-11-02
     /// (Plan D D2c r1: `FITS_ARTIFACT_VERSION` 3 folded into that subtree, `the_measurement_hash_follows_the_fits_artifact_version`;
-    /// was `972c028e1512fdd0`); the registration and normalization ones stand.
+    /// was `972c028e1512fdd0`); the registration one stands, and the normalization one was re-recorded 2026-11-02 at the
+    /// merge of `main` (the `local` rejection default).
     #[test]
     fn measure_version_eight_moves_the_three_fit_reading_subtrees_only() {
         let cfg = StackingConfig::default();
@@ -2051,7 +2098,8 @@ mod tests {
                 8,
                 "ef32610c8173c47f".to_string(),
                 "e6c1ddfad3f06299".to_string(),
-                "f37aa67a46c48a56".to_string(),
+                // 2026-11-02 Plan D DF-a (main merged into plan-d): rejection defaults to `local` (pcores Task 1, OD-1a), which the normalization subtree folds; was "f37aa67a46c48a56". The measurement, registration and calibration literals stand.
+                "48ebdb2f76923cba".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -2581,7 +2629,10 @@ mod tests {
         // And here (2026-10-08 one star-measurement path Plan A Task 7, R-OSP-2): `measurement` gains `seedSource`
         // (default matchedFilter) and `seedThreshold` (default `seeds::DEFAULT_THRESHOLD`) in the serialized config,
         // and `seedDetector` now mirrors the source. Was "03af478211b610de".
-        assert_eq!(default_hash, "1de1a3136b8dc4ac");
+        //
+        // And here (2026-11-01 pcores Task 1, OD-1a): `normalization.rejection` defaults to `local`. Was
+        // "1de1a3136b8dc4ac".
+        assert_eq!(default_hash, "8bb369a197d1a3f4");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
