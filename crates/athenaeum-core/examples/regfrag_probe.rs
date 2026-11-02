@@ -59,7 +59,9 @@ fn write_stars(path: &str, stars: &[Star]) {
         let (sx, sy) = s.sigma.unwrap_or((0.0, 0.0));
         writeln!(
             o,
-            "{:.6}\t{:.6}\t{:.9e}\t{:.6}\t{:.6}",
+            // Shortest round-trip form: a replay must see the run's exact coordinates and centroid sigmas (the sigmas
+            // weight the refit, so a rounded sigma moves a map at 1e-3 px).
+            "{:?}\t{:?}\t{:?}\t{:?}\t{:?}",
             s.x, s.y, s.flux, sx, sy
         )
         .unwrap();
