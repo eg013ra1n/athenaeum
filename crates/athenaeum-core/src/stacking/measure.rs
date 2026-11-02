@@ -241,6 +241,24 @@ pub struct ChannelMeasurement {
     /// run), so `None` and never serialized wherever the fold did not substitute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction_group: Option<f64>,
+    /// Plan D D1w (PD-3): this member's flux over the (group, plane)'s frame-common star set - the paired ratio to the
+    /// group's anchor (of the fits' aperture sums, Plan D D2b / PD-26) times the anchor's sums over the whole set (model
+    /// flux times the plane's `c`; [`crate::stacking::common_set::CommonFlux`]), native units. `psf_signal_weight` /
+    /// `psf_snr` are recomputed from it (and `common_tmean_flux`) at the end of stage 5, so these three fields tell
+    /// where the weight came from. `Some` only on a plane that was reweighed; `None` (and never serialized) at
+    /// Measure time, in the `metrics` artifact, on a plane that fell back (PD-6), and for the weight modes outside the
+    /// PSF family. In memory and in `stacking_run_frames.metrics_json` only: the `metrics` artifact payload stays
+    /// byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_tflux: Option<f64>,
+    /// The mean-flux twin of [`Self::common_tflux`] (`common_tmean_flux`, PD-3); `Some` exactly when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_tmean_flux: Option<f64>,
+    /// How many stars the (group, plane)'s frame-common set holds: the same number for every member of the plane,
+    /// `Some` exactly when [`Self::common_tflux`] is. How many of them THIS member has is the debug line
+    /// `"frame reweighed"`'s `paired_stars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_stars: Option<usize>,
     pub fwhm_px: f64,
     pub eccentricity: f64,
     pub tflux: f64,
@@ -477,6 +495,9 @@ pub struct PlaneMeasurement {
     /// The `c` candidates under SNR 20 (or with none), after the point-source screen (PB-13'; the probe's
     /// `apertureBelowSnr`). Reported, not persisted.
     pub aperture_below_snr: usize,
+    /// The extended `c` candidates the colour sample took back into `c`'s list (Plan D D2, PD-9; the lab probe's
+    /// `rescuedCore`); 0 on any image of other than three planes. Reported, not persisted.
+    pub aperture_rescued: usize,
     /// The growth / model ratios `c` is the median over, brightest first (the probe's `--dump-ratios`). Reported, not
     /// persisted.
     pub aperture_ratios: Vec<sm::ApertureRatio>,
@@ -641,7 +662,40 @@ pub fn measure_plane_diagnosed(
     gain_e_per_unit: Option<f64>,
     cfa_site_share: Option<f64>,
 ) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
-    let head = adapter_head(
+    measure_plane_hinted(
+        data,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        diagnostics,
+        colour,
+        pixel_noise,
+        gain_e_per_unit,
+        cfa_site_share,
+        None,
+    )
+}
+
+/// [`measure_plane_diagnosed`] with the matched filter's field-width hint ([`sm::MeasureOptions::detect_width_hint`]);
+/// `None` is exactly [`measure_plane_diagnosed`].
+#[allow(clippy::too_many_arguments)]
+fn measure_plane_hinted(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    colour: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    cfa_site_share: Option<f64>,
+    detect_width_hint: Option<f64>,
+) -> (PlaneMeasurement, Vec<Seed>, Vec<sm::FitDiagnostics>) {
+    let mut head = adapter_head(
         data,
         w,
         h,
@@ -654,6 +708,7 @@ pub fn measure_plane_diagnosed(
         gain_e_per_unit,
         cfa_site_share,
     );
+    head.module_opts.detect_width_hint = detect_width_hint;
     let m = sm::measure_plane(data, w, h, &head.module_opts, pool);
     adapter_tail(head, m)
 }
@@ -685,13 +740,48 @@ pub fn measure_planes_diagnosed<'a, E>(
     diagnostics: bool,
     pixel_noise: sm::PixelNoise,
     gain_e_per_unit: Option<f64>,
+    plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
+) -> Result<Vec<MeasuredPlane>, E> {
+    measure_planes_with_width_hints(
+        n_planes,
+        w,
+        h,
+        opts,
+        pool,
+        seed_source,
+        diagnostics,
+        pixel_noise,
+        gain_e_per_unit,
+        &[],
+        plane,
+    )
+}
+
+/// [`measure_planes_diagnosed`] with a field-width hint per plane for the matched filter ([`sm::MeasureOptions::detect_width_hint`]):
+/// `detect_width_hints[p]` is plane `p`'s, in this image's pixels; a plane past the slice's end, a `None`, and an
+/// empty slice (exactly [`measure_planes_diagnosed`]) read the plane's own width. Plan D D1 r2: the gain's re-read of
+/// the best sub, a resampled image the detection median does not suit, passes the sub's Measure-time width. Not a
+/// field of [`MeasureOptions`], which is a serialized config.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_planes_with_width_hints<'a, E>(
+    n_planes: usize,
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedOverride,
+    diagnostics: bool,
+    pixel_noise: sm::PixelNoise,
+    gain_e_per_unit: Option<f64>,
+    detect_width_hints: &[Option<f64>],
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
+    let hint = |p: usize| detect_width_hints.get(p).copied().flatten();
     if n_planes == 1 {
         let t = Instant::now();
         let data = plane(0)?;
         let _span = tracing::debug_span!("measure_plane", plane = 0).entered();
-        let (measurement, seeds, diagnostics) = measure_plane_diagnosed(
+        let (measurement, seeds, diagnostics) = measure_plane_hinted(
             &data,
             w,
             h,
@@ -703,6 +793,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             pixel_noise,
             gain_e_per_unit,
             None,
+            hint(0),
         );
         return Ok(vec![MeasuredPlane {
             measurement,
@@ -721,7 +812,7 @@ pub fn measure_planes_diagnosed<'a, E>(
         let t = Instant::now();
         let data = plane(p)?;
         let _span = tracing::debug_span!("measure_plane", plane = p).entered();
-        let head = adapter_head(
+        let mut head = adapter_head(
             &data,
             w,
             h,
@@ -735,6 +826,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             // A debayered RGGB colour image's planes 0 / 1 / 2 are R / G / B: the share of their own colour's sites.
             (colour && n_planes == 3).then(|| [0.25, 0.5, 0.25][p]),
         );
+        head.module_opts.detect_width_hint = hint(p);
         preps.push(sm::prepare_plane(&data, w, h, &head.module_opts, pool));
         heads.push(head);
         if p + 1 == n_planes {
@@ -745,6 +837,12 @@ pub fn measure_planes_diagnosed<'a, E>(
     sm::cross_plane_flags(&mut preps);
     // Plan B B4 (PB-12'): each plane's siblings' seeds, gathered before the loop below consumes the preps.
     let siblings = sm::sibling_seeds(&preps);
+    // Plan D D2 (PD-9): the same lists less each plane's own extended seeds, read through the options each plane is
+    // finished with (the ONE extended slice its fits use).
+    let point_siblings = {
+        let opts: Vec<&sm::MeasureOptions> = heads.iter().map(|h| &h.module_opts).collect();
+        sm::point_like_sibling_seeds(&preps, &opts)
+    };
     let mut out: Vec<Option<MeasuredPlane>> = (0..n_planes).map(|_| None).collect();
     for p in (0..n_planes).rev() {
         let t = Instant::now();
@@ -765,6 +863,7 @@ pub fn measure_planes_diagnosed<'a, E>(
             &head.module_opts,
             prep,
             siblings[p].as_deref(),
+            point_siblings[p].as_deref(),
             pool,
         );
         drop(data);
@@ -807,6 +906,14 @@ impl PlanesPass1 {
     /// The image's plane count.
     pub fn planes(&self) -> usize {
         self.beta_own.len()
+    }
+
+    /// Plan D D2 (PD-9): each plane's entry of [`sm::point_like_sibling_seeds`], read through the options each plane is
+    /// finished with (the ONE extended slice its fits use). The one gather [`measure_planes_pass2`] makes; the lab
+    /// probe reads it to follow the colour sample's taking-back without a copy of the rule.
+    pub fn point_like_siblings(&self) -> Vec<Option<Vec<Seed>>> {
+        let opts: Vec<&sm::MeasureOptions> = self.heads.iter().map(|h| &h.module_opts).collect();
+        sm::point_like_sibling_seeds(&self.preps, &opts)
     }
 }
 
@@ -903,6 +1010,9 @@ pub fn measure_planes_pass2<'a, E>(
     pool: Option<&Arc<rayon::ThreadPool>>,
     mut plane: impl FnMut(usize) -> Result<Cow<'a, [f32]>, E>,
 ) -> Result<Vec<MeasuredPlane>, E> {
+    // Plan D D2 (PD-9): the colour sample's point-like sibling seeds, gathered before the destructure below consumes the
+    // preps; `psf_model` is the only option the loop changes.
+    let point_siblings = pass1.point_like_siblings();
     let PlanesPass1 {
         w,
         h,
@@ -934,6 +1044,7 @@ pub fn measure_planes_pass2<'a, E>(
             &head.module_opts,
             prep,
             siblings[p].as_deref(),
+            point_siblings[p].as_deref(),
             pool,
         );
         drop(data);
@@ -1017,6 +1128,7 @@ fn module_options(
         diagnostics,
         mask: None,
         field_width: None,
+        detect_width_hint: None,
         colour,
         pixel_noise,
         cfa_site_share,
@@ -1296,6 +1408,9 @@ fn adapter_tail(
         aperture_se: m.aperture_correction.and(m.aperture_se),
         aperture_stars: m.aperture_correction.map(|_| m.aperture_stars),
         aperture_correction_group: None,
+        common_tflux: None,
+        common_tmean_flux: None,
+        common_stars: None,
         fwhm_px: m.frame.fwhm_px.unwrap_or(0.0),
         eccentricity: m.frame.eccentricity.unwrap_or(0.0),
         tflux: m.frame.tflux / s,
@@ -1348,6 +1463,7 @@ fn adapter_tail(
             aperture_se: m.aperture_se,
             point_source_screened: m.point_source_screened,
             aperture_below_snr: m.aperture_below_snr,
+            aperture_rescued: m.aperture_rescued,
             aperture_ratios: m.aperture_ratios,
             population: m.population,
             ring_sky_missing: m.ring_sky_missing,
@@ -2529,6 +2645,56 @@ pub(crate) mod tests {
         (fits[star], verdict)
     }
 
+    /// Plan D D1 r2: the per-plane width hints reach each plane's matched filter - a plane with a hint reports it as its
+    /// field width, a plane without one (a `None`, or past the slice) reads its own, and no hints at all is
+    /// `measure_planes_diagnosed` exactly.
+    #[test]
+    fn width_hints_reach_their_own_planes_only() {
+        let (planes, w, h) = cross_plane_fixture();
+        let opts = MeasureOptions::default();
+        let run = |n: usize, hints: &[Option<f64>]| {
+            measure_planes_with_width_hints(
+                n,
+                w,
+                h,
+                &opts,
+                None,
+                SeedOverride::Fast,
+                false,
+                sm::PixelNoise::Mixed,
+                None,
+                hints,
+                |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+            )
+            .unwrap()
+        };
+        let plain = measure_planes_diagnosed(
+            3,
+            w,
+            h,
+            &opts,
+            None,
+            SeedOverride::Fast,
+            false,
+            sm::PixelNoise::Mixed,
+            None,
+            |p| Ok::<_, std::convert::Infallible>(Cow::Borrowed(planes[p].as_slice())),
+        )
+        .unwrap();
+        let width = |m: &[MeasuredPlane], p: usize| m[p].measurement.field_width;
+        let none = run(3, &[]);
+        let hinted = run(3, &[Some(6.0), None, Some(8.0)]);
+        for p in 0..3 {
+            assert_eq!(width(&none, p), width(&plain, p), "plane {p}: no hints is the plain entry");
+        }
+        assert_eq!(width(&hinted, 0).fwhm_px, 6.0);
+        assert_eq!(width(&hinted, 2).fwhm_px, 8.0);
+        assert_eq!(width(&hinted, 1), width(&plain, 1), "the plane without a hint reads its own");
+        // One plane goes through the single-plane branch.
+        assert_eq!(run(1, &[Some(7.0)])[0].measurement.field_width.fwhm_px, 7.0);
+        assert_eq!(run(1, &[None])[0].measurement.field_width, width(&plain, 0));
+    }
+
     /// Plan A Task 8 fix wave, owner ruling 2026-10-09: on a multi-plane image a star flagged on any plane is flagged on
     /// every plane at that position, before any plane's statistics; the frame adapter goes through the same entry.
     #[test]
@@ -3031,6 +3197,45 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan D D1w (a pin, not RED): the frame-common fields ride `stacking_run_frames.metrics_json` under camelCase names,
+    /// a channel without them serializes to the very bytes it did before D1w (so the `metrics` artifact payload and
+    /// every cache comparison stay as they were), and a payload written before them decodes with all three `None`.
+    #[test]
+    fn common_set_fields_round_trip_and_stay_out_of_an_unreweighed_payload() {
+        let plain = ChannelMeasurement {
+            stars_detected: 5,
+            stars_fitted: 3,
+            fwhm_px: 2.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        for key in ["commonTflux", "commonTmeanFlux", "commonStars"] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+        assert_eq!(
+            json,
+            "{\"starsDetected\":5,\"starsFitted\":3,\"starsRefused\":0,\"refusedByReason\":{},\"starsUnsaturated\":0,\"beta\":0.0,\"fwhmPx\":2.5,\"eccentricity\":0.0,\"tflux\":0.0,\"tmeanFlux\":0.0,\"meanFluxRejected\":0,\"mStar\":0.0,\"nStar\":0.0,\"noise\":0.0,\"noiseSource\":\"mrs\",\"median\":0.0,\"mad\":0.0,\"medianMeanDev\":0.0,\"snrWeight\":0.0,\"noiseScaleLow\":0.0,\"noiseScaleHigh\":0.0,\"location\":0.0,\"scale\":0.0,\"psfSignalWeight\":0.0,\"psfSnr\":0.0}"
+        );
+        let reweighed = ChannelMeasurement {
+            common_tflux: Some(12.5),
+            common_tmean_flux: Some(0.25),
+            common_stars: Some(321),
+            ..plain.clone()
+        };
+        let value = serde_json::to_value(&reweighed).unwrap();
+        assert_eq!(value["commonTflux"], serde_json::json!(12.5));
+        assert_eq!(value["commonTmeanFlux"], serde_json::json!(0.25));
+        assert_eq!(value["commonStars"], serde_json::json!(321));
+        let back: ChannelMeasurement = serde_json::from_value(value).unwrap();
+        assert_eq!(back, reweighed);
+        let old: ChannelMeasurement =
+            serde_json::from_str("{\"starsDetected\":5,\"starsFitted\":3}").unwrap();
+        assert_eq!(
+            (old.common_tflux, old.common_tmean_flux, old.common_stars),
+            (None, None, None)
+        );
+    }
+
     /// Plan B B0 (PB-1): the channel build copies the plane's reported `c`, its standard error and its qualifying-star
     /// count; a plane at floor (i) (fewer than 5 ratios, `c = None`) keeps none of the three, though the module still
     /// reports the ratios it did find.
@@ -3390,7 +3595,7 @@ pub(crate) mod tests {
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
+beta: 99.4856642147905, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, common_tflux: None, common_tmean_flux: None, common_stars: None, fwhm_px: 4.229131188127607, eccentricity: 0.11052052723225843, \
 tflux: 626.6860972269468, tmean_flux: 13.321799809042265, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
@@ -3498,7 +3703,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
 stars_refused: 0, refused_by_reason: {}, stars_unsaturated: 149, \
-beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
+beta: 99.54328083263997, beta_own: None, beta_own_at_cap: false, field_width_at_floor: false, aperture_correction: None, aperture_se: None, aperture_stars: None, aperture_correction_group: None, common_tflux: None, common_tmean_flux: None, common_stars: None, fwhm_px: 4.229139285746762, eccentricity: 0.11144172228478302, \
 tflux: 626.2222105791396, tmean_flux: 13.311944378987553, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \

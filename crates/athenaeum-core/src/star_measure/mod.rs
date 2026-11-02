@@ -179,11 +179,24 @@ impl SnrNoise {
 /// [`Mode::Budget`]; the stacking Measure, LN's refits and registration fit as
 /// at 5): what the Analysis path accepts moves, so every Analysis row and every
 /// stage hash that reads a fit recomputes.
+/// 8 = Plan D D2 (`c`'s colour sample, PD-9): on a 3-plane image an extended `c`
+/// candidate re-enters `c`'s list when a seed of another plane that is not
+/// extended on its own plane lies within the point-source screen's radius, so
+/// `c` and every flux, weight and LN scale built on it moves on colour planes;
+/// mono and 2-plane images are untouched. Plan D D3 (PD-10): the `Blend`
+/// refusal runs on every [`measure_plane`] path (the stacking Measure's subs,
+/// the master and both SNR-gain crops under `Mode::All` / `Brightest` /
+/// `Population`, as `Mode::Budget` has since 7); LN's refits and every
+/// [`fit_stars_at`] caller still fit without it. A kept fit within the common
+/// set's isolation radius of a refused one carries `StarFlags::BLEND_NEIGHBOUR`
+/// (PD-36: the `.athf` flags byte, no format change). What the stacking Measure
+/// accepts moves, so every stage hash that reads a fit recomputes under this
+/// same number (one bump per plan).
 ///
 /// Policy: ONE bump per merged plan that changes what a fit accepts or
-/// measures, never one per task; Plan C = 7 (6 is burnt, never released).
-/// `AnalysisConfig::config_hash` is Plan C's.
-pub const MEASURE_VERSION: u32 = 7;
+/// measures, never one per task; Plan C = 7 (6 is burnt, never released),
+/// Plan D = 8. `AnalysisConfig::config_hash` is Plan D's.
+pub const MEASURE_VERSION: u32 = 8;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -217,6 +230,13 @@ pub struct MeasureOptions {
     /// [`seeds::field_width_of`] the given seeds. Given, it is the width the fit reads and
     /// [`PlaneMeasurement::field_width`] reports; the matched filter's own second pass still runs at its own.
     pub field_width: Option<FieldWidth>,
+    /// The field width (FWHM, px) the caller already knows for the plane's stars, handed to [`SeedSpec::MatchedFilter`]
+    /// as a RESCUE for the width its first pass reads (Plan D D1 r2, r3; [`seeds::detect_with`]'s `width_hint`): the
+    /// pool's own width stands unless it is at the clamp floor, under 0.715 of the hint, or read nothing; only then do
+    /// the knot tests, the second pass and the reported [`PlaneMeasurement::field_width`] run at the hint. For an image
+    /// whose pass-1 pool is mostly single-pixel defects (a resampled one has no detection median). `None` = the
+    /// pool's own mode; read by the matched filter only.
+    pub detect_width_hint: Option<f64>,
     /// The plane is one of a debayered colour image's (F-3, Task 8, Q3): the saturation test's plateau needs all 8 of
     /// pixel0's neighbours, else 3. The stacking adapter sets it for a debayered OSC group's planes, the probe for a
     /// 3-plane input; an undebayered CFA plane (Plan C's green sites) keeps the mono rule.
@@ -246,11 +266,24 @@ pub struct MeasureOptions {
 }
 
 /// The ONE `extended` slice of a plane (Plan C C3 r3): the matched filter's flags, else the given seeds' own
-/// ([`MeasureOptions::given_extended`]), else empty (= all false).
+/// ([`MeasureOptions::given_extended`]), else empty (= all false). A `given_extended` that does not match the seeds
+/// warns and reads every seed point-like.
 fn extended_flags<'a>(
     detection: Option<&'a DetectionReport>,
     opts: &'a MeasureOptions,
     seeds: usize,
+) -> &'a [bool] {
+    extended_flags_warning(detection, opts, seeds, true)
+}
+
+/// [`extended_flags`] with the mismatch warn optional: a plane's slice is read at its fit and, on three planes, once more
+/// where [`point_like_sibling_seeds`] gathers its lists, and the mismatch is one defect of one plane (Plan D D2 review
+/// nit, DF-b), so the second read is silent.
+fn extended_flags_warning<'a>(
+    detection: Option<&'a DetectionReport>,
+    opts: &'a MeasureOptions,
+    seeds: usize,
+    warn: bool,
 ) -> &'a [bool] {
     if let Some(d) = detection {
         return d.extended.as_slice();
@@ -259,11 +292,13 @@ fn extended_flags<'a>(
         return &[];
     }
     if opts.given_extended.len() != seeds {
-        tracing::warn!(
-            count = seeds,
-            given_flags = opts.given_extended.len(),
-            "measure: given_extended does not match the given seeds; every seed is read as point-like"
-        );
+        if warn {
+            tracing::warn!(
+                count = seeds,
+                given_flags = opts.given_extended.len(),
+                "measure: given_extended does not match the given seeds; every seed is read as point-like"
+            );
+        }
         return &[];
     }
     opts.given_extended.as_slice()
@@ -322,6 +357,7 @@ impl Default for MeasureOptions {
             diagnostics: false,
             mask: None,
             field_width: None,
+            detect_width_hint: None,
             colour: false,
             pixel_noise: PixelNoise::Unknown,
             cfa_site_share: None,
@@ -421,8 +457,10 @@ impl FitStarsOptions<'_> {
             neighbours: None,
             population: None,
             siblings: None,
+            point_siblings: None,
             timers: None,
-            // R-PC-10b: LN's refits and every other `fit_stars_at` caller fit as at `MEASURE_VERSION` 5.
+            // R-PC-10b / Plan D D3: LN's refits and every other `fit_stars_at` caller fit without the Blend refusal (as at
+            // `MEASURE_VERSION` 5); the `measure_plane` paths set it themselves ([`finish_working`], [`measure_budget`]).
             blend_refusal: false,
         }
     }
@@ -503,6 +541,11 @@ pub struct PlaneMeasurement {
     /// The `c` candidates under [`photometry::CORRECTION_MIN_SNR`] (or with no SNR; PB-13'), after the point-source
     /// screen. Reported, not persisted.
     pub aperture_below_snr: usize,
+    /// The extended `c` candidates the colour sample took back (Plan D D2, PD-9): flagged extended on this plane, with a
+    /// point-like seed of another plane (not extended on its own) within the point-source screen's radius, so they
+    /// re-entered `c`'s candidate list before the clip screen. 0 on one or two planes and wherever no sibling list
+    /// runs. Reported, not persisted.
+    pub aperture_rescued: usize,
     /// The growth / model ratios `aperture_correction` is the median over, brightest by model flux first (the probe's
     /// `--dump-ratios`); the 1 to 4 of a plane at floor (i) too. Reported, never read.
     pub aperture_ratios: Vec<ApertureRatio>,
@@ -589,7 +632,7 @@ pub fn measure_plane(
     match opts.mode {
         Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
-            finish_working(&working, w, h, opts, prep, None, pool)
+            finish_working(&working, w, h, opts, prep, None, None, pool)
         }
         Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
     }
@@ -881,7 +924,10 @@ pub fn prepare_plane(
 /// aggregates, on a fresh working-unit copy of the same `plane` (the same bytes the first half read). `siblings` (Plan B
 /// B4, PB-12'): on an image of more than one plane the plane's entry of [`sibling_seeds`] (every OTHER plane's seeds,
 /// gathered after [`cross_plane_flags`]), which the aperture correction's point-source screen reads; `None` = no screen
-/// (one plane).
+/// (one plane). `point_siblings` (Plan D D2, PD-9): the plane's entry of [`point_like_sibling_seeds`], the same seeds
+/// less those their own plane flags extended; the aperture correction's colour sample reads it to take back an extended
+/// candidate of this plane. `None` = nothing is taken back (one or two planes, LN's refits).
+#[allow(clippy::too_many_arguments)]
 pub fn finish_plane(
     plane: &[f32],
     w: usize,
@@ -889,6 +935,7 @@ pub fn finish_plane(
     opts: &MeasureOptions,
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
+    point_siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let unmasked;
@@ -906,7 +953,7 @@ pub fn finish_plane(
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
     };
-    finish_working(&working, w, h, opts, prep, siblings, pool)
+    finish_working(&working, w, h, opts, prep, siblings, point_siblings, pool)
 }
 
 /// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
@@ -1059,6 +1106,59 @@ pub fn sibling_seeds(planes: &[PlanePrep]) -> Vec<Option<Vec<Seed>>> {
                     .enumerate()
                     .filter(|&(p, _)| p != q)
                     .flat_map(|(_, prep)| prep.seeds.iter().copied())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// [`sibling_seeds`]' twin for the colour sample of `c` (Plan D D2, PD-9): entry `q` is the seeds of every plane but `q`
+/// that their own plane does NOT flag extended, in plane order. The flags are the ONE slice that plane's fits use
+/// ([`extended_flags`]: the matched filter's, else [`MeasureOptions::given_extended`]) and `opts[p]` must be the options
+/// `planes[p]` is then finished with, so a given-seed run agrees with its own fits (a `given_extended` that does not
+/// match the seeds reads every seed point-like here as at the fit, and warns at the fit only: once per plane). `None` for every plane unless
+/// the image has exactly three; gather the lists where [`sibling_seeds`] is gathered. A seed whose flag the slice does
+/// not hold is point-like.
+///
+/// The colour sample reads it only where `c` has no population (a): [`Mode::All`] and [`Mode::Brightest`], the stacking
+/// Measure's. Population (a) leaves extended seeds out by eligibility ([`population`]), so on a [`Mode::Population`]
+/// caller (the lab's probes) a taken-back candidate is still not in `c`'s sample.
+pub fn point_like_sibling_seeds(
+    planes: &[PlanePrep],
+    opts: &[&MeasureOptions],
+) -> Vec<Option<Vec<Seed>>> {
+    if planes.len() != 3 {
+        return planes.iter().map(|_| None).collect();
+    }
+    if opts.len() != planes.len() {
+        tracing::error!(
+            count = opts.len(),
+            "measure: the point-like sibling seeds need one options per plane; no extended candidate is taken back"
+        );
+        return planes.iter().map(|_| None).collect();
+    }
+    let point_like: Vec<Vec<Seed>> = planes
+        .iter()
+        .zip(opts)
+        .map(|(prep, o)| {
+            let flags =
+                extended_flags_warning(prep.detection.as_ref(), o, prep.seeds.len(), false);
+            prep.seeds
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !flags.get(i).copied().unwrap_or(false))
+                .map(|(_, s)| *s)
+                .collect()
+        })
+        .collect();
+    (0..planes.len())
+        .map(|q| {
+            Some(
+                point_like
+                    .iter()
+                    .enumerate()
+                    .filter(|&(p, _)| p != q)
+                    .flat_map(|(_, seeds)| seeds.iter().copied())
                     .collect(),
             )
         })
@@ -1310,6 +1410,7 @@ fn prepare_head(
                 mesh.take(),
                 Some(&saturation),
                 Some(&sub),
+                opts.detect_width_hint,
             );
             timings.detect_ms =
                 t.elapsed().as_millis() as u64 + if opts.noise.is_some() { mesh_ms } else { 0 };
@@ -1444,6 +1545,7 @@ fn prepare_passes(
 }
 
 /// [`finish_plane`] on a working copy the caller holds.
+#[allow(clippy::too_many_arguments)]
 fn finish_working(
     working: &[f32],
     w: usize,
@@ -1451,6 +1553,7 @@ fn finish_working(
     opts: &MeasureOptions,
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
+    point_siblings: Option<&[Seed]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let PlanePrep {
@@ -1531,7 +1634,12 @@ fn finish_working(
                     statistic: &in_statistic,
                 }),
                 siblings,
+                point_siblings,
                 timers: Some(&sub),
+                // Plan D D3 (PD-10), reversing R-PC-10b: the Blend refusal runs on every `measure_plane` path, the
+                // stacking Measure's subs, the master and the SNR-gain crops among them. `FitStarsOptions::correction()`
+                // (LN's refits, every `fit_stars_at` caller) still leaves it off.
+                blend_refusal: true,
                 ..Default::default()
             },
             None,
@@ -1578,6 +1686,18 @@ fn finish_working(
             FrameAggregates::of_population(&outcome.fits, &in_a, Some(&sub))
         }
     };
+    // Plan D D3 (PD-36): a refused fit is not in the kept list, and the frame-common star set isolates against the kept list
+    // (`stacking::common_set::candidates`, 6 x the plane's persisted `fwhm_px`). Mark every kept fit within that radius of a
+    // refused one, so a neighbour of a refused blend is no more isolated than it was before D3 (the refused fit was a kept
+    // fit then). The radius is the stacking adapter's `ChannelMeasurement::fwhm_px` itself - `frame.fwhm_px`, the statistic
+    // just computed (`unwrap_or(0.0)` as the adapter reads it, and the set returns no candidate for a width that is not a
+    // positive number, so none is marked). The bit enters neither the statistic nor any sum: `frame` is already taken.
+    let blend_refused = std::mem::take(&mut outcome.blend_refused);
+    fit::mark_blend_neighbours(
+        &mut outcome.fits,
+        &blend_refused,
+        photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * frame.fwhm_px.unwrap_or(0.0),
+    );
     let population_report = population.as_ref().map(|p| {
         let (mut accepted, mut merged) = (0usize, 0usize);
         for (f, &k) in outcome.fits.iter().zip(&outcome.fit_seeds) {
@@ -1634,6 +1754,7 @@ fn finish_working(
         aperture_se: outcome.aperture_se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_rescued: outcome.aperture_screens.rescued,
         aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing: outcome.ring_sky_missing,
         clip_floor: saturation
@@ -1755,7 +1876,7 @@ fn measure_budget(
                     of_fit: &candidates,
                 }),
                 timers: Some(&steps),
-                // R-PC-10b: the Blend refusal is the Analysis path's alone.
+                // R-PC-10: the Blend refusal (the Analysis path's since 7; `finish_working` sets it too since Plan D D3).
                 blend_refusal: true,
                 ..Default::default()
             },
@@ -1873,6 +1994,7 @@ fn measure_budget(
         aperture_se: outcome.aperture_se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
+        aperture_rescued: outcome.aperture_screens.rescued,
         aperture_ratios: outcome.aperture_screens.ratios,
         ring_sky_missing,
         clip_floor: saturation
@@ -2660,6 +2782,55 @@ mod tests {
             .find(|s| (s.x - 95.3).abs() < 2.0 && (s.y - 94.8).abs() < 2.0)
             .expect("the blob is fitted");
         assert!(blob.flags.contains(StarFlags::EXTENDED), "{:?}", blob.flags);
+    }
+
+    /// Plan D D2 review nit (DF-b): on three planes a `given_extended` of the wrong length warned twice per plane, once where
+    /// `point_like_sibling_seeds` gathers its lists and once at the fit. It warns once per plane, at the fit; the lists read
+    /// the plane as all point-like either way.
+    #[test]
+    fn a_mismatched_given_extended_warns_once_per_plane_on_three_planes() {
+        use crate::test_support::add_noise;
+        let stars = grid30(5.0);
+        let mut data = moffat_field(480, 400, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.002, 35);
+        let seeds = seeds_of(&stars);
+        let o = MeasureOptions {
+            seeds: SeedSpec::Given(seeds.clone()),
+            given_extended: vec![true; 3],
+            psf_model: PsfModel::Fixed(4.0),
+            ..Default::default()
+        };
+        let planes = [&data, &data, &data];
+        let (finished, log) = warn_log(|| {
+            let mut preps: Vec<_> = planes
+                .iter()
+                .map(|p| prepare_plane(p, 480, 400, &o, None))
+                .collect();
+            cross_plane_flags(&mut preps);
+            let siblings = sibling_seeds(&preps);
+            let point_like = point_like_sibling_seeds(&preps, &[&o, &o, &o]);
+            planes
+                .iter()
+                .zip(preps)
+                .zip(siblings.iter().zip(&point_like))
+                .map(|((p, prep), (sib, point))| {
+                    finish_plane(p, 480, 400, &o, prep, sib.as_deref(), point.as_deref(), None)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mismatch: Vec<_> = log
+            .iter()
+            .filter(|fields| fields.iter().any(|(n, v)| n == "given_flags" && v == "3"))
+            .collect();
+        assert_eq!(mismatch.len(), 3, "one mismatch warn per plane, not two: {log:?}");
+        for fields in mismatch {
+            let field = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            assert_eq!(field("count"), Some(seeds.len().to_string()));
+        }
+        assert!(
+            finished.iter().all(|m| m.extended_seeds == 0),
+            "every seed is read as point-like"
+        );
     }
 
     /// Ruling Q4 (Task 10b step 1b, a pin): the plane's ONE background mesh changes no bit. Its background map is the
@@ -3961,7 +4132,7 @@ mod tests {
             assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
             let mut pm = None;
             let logs = crate::stacking::solve::tests::captured_logs(|| {
-                pm = Some(finish_plane(&data, 64, 64, &mo, prep, None, None));
+                pm = Some(finish_plane(&data, 64, 64, &mo, prep, None, None, None));
             });
             assert!(pm.unwrap().stars.is_empty());
             assert_eq!(logs.matches("the pixel mask does not match").count(), 1, "{logs}");
@@ -4028,6 +4199,99 @@ mod tests {
             assert!(
                 ((snr_open - snr_clean) / snr_clean).abs() > 0.01,
                 "{snr_open} vs {snr_clean}"
+            );
+        }
+
+        /// Plan D D2c (PD-30): every accepted fit keeps the sum of `v - B_i` over the present pixels within `3 * ring_fwhm` of
+        /// its centre (the frame's ring width, one radius for the plane), read in the HFR scan: not the SNR call's sum at
+        /// `1.5 * fwhm` (D2b), which the SNR keeps for itself. NaN with no ring sky and where an absent pixel lies in the disc.
+        #[test]
+        fn a_fits_aperture_sum_is_its_3f_disc_sum_and_nan_where_the_disc_is_not_whole() {
+            let (data, seeds) = one_star_plane();
+            let snr_of = |data: &[f32], f: &StarFit, mask: Option<&[bool]>| {
+                star_snr(data, 64, 64, f, None, mask, &ApertureNoise::WHITE)
+            };
+            let fit_with = |mask: Option<Vec<bool>>| {
+                let out = fit_stars_at(
+                    &data,
+                    64,
+                    64,
+                    &seeds,
+                    4.0,
+                    &FitStarsOptions {
+                        mask: mask.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert_eq!(out.fits.len(), 1, "{:?}", out.refused);
+                let ring = out.ring_fwhm;
+                (
+                    out.fits[0],
+                    ring,
+                    snr_of(&data, &out.fits[0], mask.as_deref()),
+                )
+            };
+            // The disc, brute force: lattice points within 3 ring FWHM, `v - B_i`, row-major.
+            let disc = |f: &StarFit, ring: f64, mask: Option<&[bool]>| -> f64 {
+                let r = 3.0 * ring;
+                let mut sum = 0.0f64;
+                for py in 0..64usize {
+                    for px in 0..64usize {
+                        let d2 = (px as f64 - f.x).powi(2) + (py as f64 - f.y).powi(2);
+                        let i = py * 64 + px;
+                        if d2 <= r * r {
+                            assert!(data[i].is_finite() && mask.map_or(true, |m| m[i]));
+                            sum += data[i] as f64 - f.sky_ring;
+                        }
+                    }
+                }
+                sum
+            };
+            let (f, ring, (snr, terms)) = fit_with(None);
+            let ring = ring.expect("a ring width");
+            assert!(snr.is_finite() && f.sky_ring.is_finite());
+            let want = disc(&f, ring, None);
+            assert!(want > 0.0 && f.ap_sum.is_finite(), "{want} {}", f.ap_sum);
+            assert!(
+                (f.ap_sum / want - 1.0).abs() < 1e-12,
+                "{} vs {want}",
+                f.ap_sum
+            );
+            // It is not the SNR call's 1.5 F sum, and the SNR is that call's.
+            assert!(
+                f.ap_sum > terms.s && terms.s > 0.0,
+                "3 F holds more than 1.5 F: {} vs {}",
+                f.ap_sum,
+                terms.s
+            );
+            assert_eq!(f.snr.to_bits(), snr.to_bits(), "snr stays at 1.5 F");
+            // An absent pixel inside the 3 F disc (4 px from the star, F is 2.6): the sum is NaN, the star is still fitted.
+            let mut inside = vec![true; 64 * 64];
+            inside[32 * 64 + 36] = false;
+            let (g, _, _) = fit_with(Some(inside));
+            assert!(g.ap_sum.is_nan(), "{}", g.ap_sum);
+            // ... one outside it (3 F is about 8 px; 14 px away) leaves it whole.
+            let mut outside = vec![true; 64 * 64];
+            outside[32 * 64 + 46] = false;
+            let (g, ring_g, _) = fit_with(Some(outside.clone()));
+            let ring_g = ring_g.expect("a ring width");
+            assert!(g.ap_sum.is_finite(), "{}", g.ap_sum);
+            assert!((g.ap_sum / disc(&g, ring_g, Some(&outside)) - 1.0).abs() < 1e-12);
+            // No ring: every pixel past 20 px of the star is masked, and the ring is past 20 px.
+            let mask: Vec<bool> = (0..64 * 64)
+                .map(|i| {
+                    let (x, y) = ((i % 64) as f64 - 32.0, (i / 64) as f64 - 32.0);
+                    x * x + y * y < 20.0 * 20.0
+                })
+                .collect();
+            let (g, _, (snr, _)) = fit_with(Some(mask));
+            assert!(snr.is_nan(), "no ring pixel: no SNR, got {snr}");
+            assert!(
+                g.snr.is_nan() && g.ap_sum.is_nan(),
+                "snr {} ap_sum {}",
+                g.snr,
+                g.ap_sum
             );
         }
 
@@ -4479,58 +4743,233 @@ mod tests {
         data
     }
 
-    /// R-PC-10b: the Blend refusal is the Analysis path's alone. One plane with a close pair (a bright star and a
-    /// companion of a fifth of its amplitude 1.0 F out, both seeded): the stacking Measure's `Mode::All` fits both
-    /// stars and refuses none as `Blend`; `Mode::Budget` refuses the companion.
-    #[test]
-    fn mode_all_never_refuses_blend_mode_budget_does() {
+    /// The Blend fixtures' field: thirty background stars on a grid (FWHM 4 px, the field width F) and a pair near
+    /// (115, 65): a bright star (amplitude 1.0) and a companion `sep_f` F to its right (amplitude `companion`), both
+    /// seeded, the pair last (seeds 30 and 31).
+    fn blend_pair_field(sep_f: f64, companion: f64) -> (Vec<MoffatStar>, Vec<f32>) {
+        blend_pair_field_plus(sep_f, companion, &[])
+    }
+
+    /// [`blend_pair_field`] with more stars of the field's own shape at `extra` `(x, y)` (amplitude 0.3, seeds 32…, after
+    /// the pair). No extra star: the very field [`blend_pair_field`] is.
+    fn blend_pair_field_plus(
+        sep_f: f64,
+        companion: f64,
+        extra: &[(f64, f64)],
+    ) -> (Vec<MoffatStar>, Vec<f32>) {
         let alpha = 4.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
-        let star = |x: f64, y: f64| MoffatStar {
+        let star = |x: f64, y: f64, amp: f64| MoffatStar {
             x,
             y,
-            amp: 0.3,
+            amp,
             alpha_x: alpha,
             alpha_y: alpha,
             theta: 0.0,
         };
         let mut stars: Vec<MoffatStar> = (0..30)
-            .map(|i| star(40.0 + 50.0 * (i % 6) as f64, 40.0 + 50.0 * (i / 6) as f64))
+            .map(|i| star(40.0 + 50.0 * (i % 6) as f64, 40.0 + 50.0 * (i / 6) as f64, 0.3))
             .collect();
-        let bright = |x: f64, y: f64, amp: f64| MoffatStar {
-            amp,
-            ..star(x, y)
-        };
-        stars.push(bright(115.0, 65.0, 1.0));
-        stars.push(bright(115.0 + 4.0, 65.0, 0.2));
+        stars.push(star(115.0, 65.0, 1.0));
+        stars.push(star(115.0 + 4.0 * sep_f, 65.0, companion));
+        stars.extend(extra.iter().map(|&(x, y)| star(x, y, 0.3)));
         let mut data = moffat_field(340, 300, &stars, 4.0, 0.05);
         crate::test_support::add_noise(&mut data, 0.002, 9);
-        let run = |mode: Mode| {
-            let opts = MeasureOptions {
-                mode,
-                seeds: SeedSpec::Given(seeds_of(&stars)),
-                ..Default::default()
-            };
-            measure_plane(&data, 340, 300, &opts, None)
+        (stars, data)
+    }
+
+    fn blends(m: &PlaneMeasurement) -> usize {
+        m.refused
+            .by_reason
+            .get(&RefusalReason::Blend)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `Mode::All` / `Mode::Budget` on `data` with the field's own seeds given.
+    fn measure_pair_field(stars: &[MoffatStar], data: &[f32], mode: Mode) -> PlaneMeasurement {
+        let opts = MeasureOptions {
+            mode,
+            seeds: SeedSpec::Given(seeds_of(stars)),
+            ..Default::default()
         };
-        let blends = |m: &PlaneMeasurement| {
-            m.refused
+        measure_plane(data, 340, 300, &opts, None)
+    }
+
+    /// The fits of `m` within `half_x` px of `cx` and 4 px of the pair's row (y = 65).
+    fn fits_in_window(m: &PlaneMeasurement, cx: f64, half_x: f64) -> Vec<&StarFit> {
+        m.stars
+            .iter()
+            .filter(|f| (f.x - cx).abs() < half_x && (f.y - 65.0).abs() < 4.0)
+            .collect()
+    }
+
+    /// The pair keeps exactly one fit, and it sits ON one of the pair's two stars (within `tol` px of `x` in `stars`, 1 px of
+    /// the row), not between them: a merged fit would pass a bare count. Returns the kept fit's x.
+    fn assert_one_of_the_pair_is_kept(
+        m: &PlaneMeasurement,
+        window: (f64, f64),
+        stars: &[f64],
+        tol: f64,
+        what: &str,
+    ) -> f64 {
+        let kept = fits_in_window(m, window.0, window.1);
+        assert_eq!(kept.len(), 1, "{what}: {:?}", m.refused);
+        let near = stars.iter().map(|s| (kept[0].x - s).abs()).fold(f64::MAX, f64::min);
+        assert!(
+            near < tol && (kept[0].y - 65.0).abs() < 1.0,
+            "{what}: the kept fit is at ({}, {}), not on a star of the pair {stars:?}",
+            kept[0].x,
+            kept[0].y
+        );
+        kept[0].x
+    }
+
+    /// Plan D D3 (PD-10), reversing R-PC-10b: the Blend refusal is every path's, the stacking Measure's included. One
+    /// plane with a close pair (a bright star and a companion of a fifth of its amplitude 1.0 F out, both seeded):
+    /// `Mode::All` (the stacking Measure's mode) and `Mode::Budget` (the Analysis path's) each refuse the companion as
+    /// `Blend` and keep the bright star (its fit within 1 px of (115, 65), not a merged fit between the two).
+    #[test]
+    fn mode_all_and_mode_budget_both_refuse_the_resolved_pair() {
+        let (stars, data) = blend_pair_field(1.0, 0.2);
+        let all = measure_pair_field(&stars, &data, Mode::All);
+        assert_eq!(blends(&all), 1, "{:?}", all.refused);
+        assert_eq!(all.stars.len(), 31, "the companion is refused");
+        let kept = assert_one_of_the_pair_is_kept(&all, (117.0, 4.5), &[115.0], 1.0, "Mode::All");
+        assert!(kept < 116.0, "the bright star's, not the companion's: {kept}");
+        let budget = measure_pair_field(&stars, &data, Mode::Budget { budget: 500 });
+        assert_eq!(blends(&budget), 1, "{:?}", budget.refused);
+        assert_eq!(budget.stars.len(), 31, "the companion is refused");
+        assert_one_of_the_pair_is_kept(&budget, (117.0, 4.5), &[115.0], 1.0, "Mode::Budget");
+    }
+
+    /// Plan D D3 (PD-10): the stacking Measure refuses a resolved pair. A bright star and a companion of 0.7 its amplitude
+    /// 1.5 F out (the widest pair this fixture resolves that the rule still refuses: 1.7 F and beyond leave two accepted
+    /// fits or two `RegionTooSmall`), both seeded, on `Mode::All`: one fit is refused `Blend`, the other of the pair is kept,
+    /// sitting on one of the two stars (within 1.5 px of (115, 65) or (121, 65), not between them), the thirty field stars
+    /// are untouched, and the F-0 identity holds. The Analysis path refuses the same. Which of the two survives follows
+    /// the fits' contours, not the amplitudes: here the companion's fit (x about 120) does, the bright star's wide fit
+    /// holding the companion's seed.
+    #[test]
+    fn the_stacking_measure_refuses_a_resolved_blend() {
+        let (stars, data) = blend_pair_field(1.5, 0.7);
+        let budget = measure_pair_field(&stars, &data, Mode::Budget { budget: 500 });
+        assert_eq!(blends(&budget), 1, "premise, the Analysis path: {:?}", budget.refused);
+        let all = measure_pair_field(&stars, &data, Mode::All);
+        assert_eq!(blends(&all), 1, "{:?}", all.refused);
+        assert_eq!(all.stars.len(), 31, "{:?}", all.refused);
+        assert_one_of_the_pair_is_kept(&all, (118.0, 8.0), &[115.0, 121.0], 1.5, "Mode::All");
+        assert_eq!(all.refused.accounted(all.stars.len()), all.seeds);
+    }
+
+    /// Plan D D3 (PD-10): LN's refits and every `fit_stars_at` caller fit as before. The same pair, handed to the refit
+    /// entry point as seeds: no fit is refused `Blend`. The arm that makes it discriminate: the very same call with only
+    /// `Correction::blend_refusal` set refuses one (`fit_stars_at` runs no verdict pass of its own, so this shows the
+    /// fixture fires under that entry point's inputs).
+    #[test]
+    fn ln_refits_still_fit_without_the_blend_refusal() {
+        let (stars, data) = blend_pair_field(1.5, 0.7);
+        let working: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
+        let seeds = seeds_of(&stars);
+        let opts = FitStarsOptions {
+            field_width: Some(4.0),
+            ..Default::default()
+        };
+        let out = fit_stars_at(&working, 340, 300, &seeds, 4.0, &opts, None);
+        let blended = |o: &FitOutcome| {
+            o.refused
                 .by_reason
                 .get(&RefusalReason::Blend)
                 .copied()
                 .unwrap_or(0)
         };
-        let near_pair = |m: &PlaneMeasurement| {
+        assert_eq!(blended(&out), 0, "{:?}", out.refused);
+        assert_eq!(out.fits.len(), 32, "both stars of the pair are fitted: {:?}", out.refused);
+        assert!(out.blend_refused.is_empty(), "{:?}", out.blend_refused);
+        let on = fit::fit_stars_with_beta_diagnosed(
+            &working,
+            340,
+            300,
+            &seeds,
+            4.0,
+            &opts.fit,
+            None,
+            opts.field_width,
+            None,
+            opts.diagnostics,
+            opts.defocus_verdict,
+            opts.trail_verdict,
+            fit::Correction {
+                blend_refusal: true,
+                ..opts.correction()
+            },
+        );
+        assert_eq!(blended(&on), 1, "the same seeds, rule on: {:?}", on.refused);
+        assert_eq!(on.fits.len(), 31, "{:?}", on.refused);
+        assert_eq!(on.blend_refused.len(), 1, "{:?}", on.blend_refused);
+    }
+
+    /// Plan D D3 (PD-36): a kept fit within the common set's isolation radius of a Blend-refused fit carries
+    /// `StarFlags::BLEND_NEIGHBOUR`, one beyond it does not, and nothing else does. The radius is 6 x the plane's
+    /// `frame.fwhm_px` (the stacking adapter's persisted `fwhm_px`, `stacking::common_set::candidates`' own). The pair
+    /// (115, 65) / (121, 65) refuses one fit and keeps the other; two more field stars sit straight above the pair's middle
+    /// (118, y), one 10 % inside the radius and one 10 % outside it (the radius read off the same field without them),
+    /// both seeded.
+    #[test]
+    fn a_kept_fit_near_a_blend_refused_one_carries_blend_neighbour() {
+        let (stars0, data0) = blend_pair_field(1.5, 0.7);
+        let base = measure_pair_field(&stars0, &data0, Mode::All);
+        let r0 = photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * base.frame.fwhm_px.expect("a frame FWHM");
+        let carriers0: Vec<&StarFit> = base.stars.iter().filter(|f| f.flags.blend_neighbour()).collect();
+        assert_eq!(carriers0.len(), 1, "the pair's kept fit alone");
+        assert!((carriers0[0].x - 118.0).abs() < 8.0 && (carriers0[0].y - 65.0).abs() < 1.0);
+        let (inside, outside) = ((118.0, 65.0 + 0.9 * r0), (118.0, 65.0 - 1.1 * r0));
+        let (stars, data) = blend_pair_field_plus(1.5, 0.7, &[inside, outside]);
+        let m = measure_pair_field(&stars, &data, Mode::All);
+        assert_eq!(blends(&m), 1, "{:?}", m.refused);
+        let radius = photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM * m.frame.fwhm_px.expect("a frame FWHM");
+        // The premise: the refused fit lies on the pair row between the two stars' x (113..123), and the extra stars sit
+        // clear of the radius on either side whichever x that is.
+        for refused_x in [113.0, 118.0, 123.0] {
+            let d = |(x, y): (f64, f64)| (x - refused_x).hypot(y - 65.0);
+            assert!(d(inside) < radius - 1.5 && d(outside) > radius + 1.5, "radius {radius}, refused at {refused_x}");
+        }
+        let at = |(x, y): (f64, f64)| {
             m.stars
                 .iter()
-                .filter(|f| (f.x - 117.0).abs() < 4.5 && (f.y - 65.0).abs() < 2.0)
-                .count()
+                .find(|f| (f.x - x).abs() < 1.0 && (f.y - y).abs() < 1.0)
+                .unwrap_or_else(|| panic!("no kept fit at ({x}, {y})"))
         };
-        let all = run(Mode::All);
-        assert_eq!(blends(&all), 0, "{:?}", all.refused);
-        assert_eq!((all.stars.len(), near_pair(&all)), (32, 2), "both stars of the pair are fitted");
-        let budget = run(Mode::Budget { budget: 500 });
-        assert_eq!(blends(&budget), 1, "{:?}", budget.refused);
-        assert_eq!((budget.stars.len(), near_pair(&budget)), (31, 1), "the companion is refused");
+        assert!(at(inside).flags.blend_neighbour(), "inside the radius");
+        assert!(!at(outside).flags.blend_neighbour(), "beyond the radius");
+        // The pair's kept fit is a neighbour of the refused one (a few px away), as it was a kept neighbour before D3.
+        let pair = fits_in_window(&m, 118.0, 8.0);
+        assert_eq!(pair.len(), 1);
+        assert!(pair[0].flags.blend_neighbour());
+        let carriers = m.stars.iter().filter(|f| f.flags.blend_neighbour()).count();
+        assert_eq!(carriers, 2, "the pair's kept fit and the inside star, no other");
+        // The bit is the only flag these ordinary point sources carry.
+        for f in m.stars.iter().filter(|f| f.flags.blend_neighbour()) {
+            assert_eq!(f.flags, StarFlags::BLEND_NEIGHBOUR);
+        }
+    }
+
+    /// Plan D D3 (PD-36): a plane with no Blend carries no `BLEND_NEIGHBOUR`, so its flags are what they were before the
+    /// bit existed. Thirty isolated stars, `Mode::All`.
+    #[test]
+    fn a_plane_with_no_blend_carries_no_blend_neighbour() {
+        let alpha = 4.0 / (2.0 * (2f64.powf(0.25) - 1.0).sqrt());
+        let grid = grid30(alpha);
+        let mut data = moffat_field(480, 400, &grid, 4.0, 0.05);
+        crate::test_support::add_noise(&mut data, 0.002, 8);
+        let opts = MeasureOptions {
+            mode: Mode::All,
+            seeds: SeedSpec::Given(seeds_of(&grid)),
+            ..Default::default()
+        };
+        let m = measure_plane(&data, 480, 400, &opts, None);
+        assert_eq!(blends(&m), 0, "{:?}", m.refused);
+        assert!(m.stars.len() >= 25, "premise: {} stars", m.stars.len());
+        assert!(m.stars.iter().all(|f| f.flags.bits() & StarFlags::BLEND_NEIGHBOUR.bits() == 0));
     }
 
     fn budget_opts(budget: usize) -> MeasureOptions {
@@ -4699,7 +5138,7 @@ mod tests {
     /// R12-2 / R12-3: a budget no smaller than the seed count selects every seed and trims nothing. The measurement is then
     /// `Mode::All`'s bit for bit (Debug text, so NaN fields compare; the wall-clock timings set equal), on given and
     /// matched-filter seeds, under both PSF models. The fields hold no close pair (the stars of the random one are kept
-    /// 24 px apart): `Mode::Budget` alone refuses `Blend` (R-PC-10b), so a pair is the one place the two differ.
+    /// 24 px apart), so `Blend` refuses nothing in either mode.
     #[test]
     fn a_budget_at_or_above_the_seed_count_is_mode_all_bit_for_bit() {
         let (fixture, fw, fh) = crate::test_support::fixture_field(7, 1.0, 0.002);
@@ -5043,10 +5482,10 @@ mod tests {
             assert_eq!(beta.0.to_bits(), beta_all.0.to_bits(), "list {list}");
             assert_eq!(beta.1, beta_all.1, "list {list}");
         }
-        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None, None);
+        let m_all = finish_plane(&data, 1024, 1024, &all, prep_all, None, None, None);
         let opts = population_opts(300, 100_000);
         let prep = prepare_plane(&data, 1024, 1024, &opts, None);
-        let m = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
+        let m = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
         assert_eq!(m.refused.not_selected, 0);
         assert_eq!(m.stars.len(), m_all.stars.len());
         for (a, b) in m.stars.iter().zip(&m_all.stars) {
@@ -5120,7 +5559,7 @@ mod tests {
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
         assert!(back.population.is_none(), "the selection is not stored");
         for (p, prep) in planes.iter().zip(preps) {
-            let m = finish_plane(p, 1024, 1024, &opts, prep, None, None);
+            let m = finish_plane(p, 1024, 1024, &opts, prep, None, None, None);
             let r = m.population.unwrap();
             assert_eq!(m.refused.not_selected, m.seeds - r.fitted);
         }
@@ -5153,7 +5592,7 @@ mod tests {
             assert_eq!(format!("{b:?}"), format!("{a:?}"), "measure_plane, k {k}");
             let prep = prepare_plane(&data, 1024, 1024, &opts, None);
             assert_eq!(prep.passes.len(), prep.seeds.len(), "k {k}: a full prefix");
-            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
+            let mut c = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
             c.timings = a.timings;
             assert_eq!(format!("{c:?}"), format!("{a:?}"), "halves, k {k}");
         }
@@ -5214,8 +5653,8 @@ mod tests {
         assert_eq!(prep.seeds.len(), all.seeds);
         let bytes = postcard::to_stdvec(&prep).unwrap();
         let back: PlanePrep = postcard::from_bytes(&bytes).unwrap();
-        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None, None);
-        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None, None);
+        let mut direct = finish_plane(&data, 1024, 1024, &opts, prep, None, None, None);
+        let mut stored = finish_plane(&data, 1024, 1024, &opts, back, None, None, None);
         stored.timings = direct.timings;
         direct.timings = stored.timings;
         assert_eq!(format!("{stored:?}"), format!("{direct:?}"));

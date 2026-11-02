@@ -308,6 +308,29 @@ pub fn select_frames(
     manual_excluded: &[bool],
     cfg: &SelectionConfig,
 ) -> Vec<Option<String>> {
+    select_with(inputs, weights, manual_excluded, cfg, weight_gate)
+}
+
+/// [`select_frames`] with the weight gate deferred (Plan D D1w, ruling PD-5): the PSF-family weights are recomputed on the
+/// frame-common star set at the end of Register, and the 5 % floor ([`weight_gate`]) is applied to THAT weight, so this
+/// early pass refuses a weight of zero only, with its own reason ("weight 0: no PSF signal"). Every other check and
+/// reason is [`select_frames`]'s.
+pub fn select_frames_deferring_weight_gate(
+    inputs: &[WeightInput],
+    weights: &[FrameWeight],
+    manual_excluded: &[bool],
+    cfg: &SelectionConfig,
+) -> Vec<Option<String>> {
+    select_with(inputs, weights, manual_excluded, cfg, deferred_weight_gate)
+}
+
+fn select_with(
+    inputs: &[WeightInput],
+    weights: &[FrameWeight],
+    manual_excluded: &[bool],
+    cfg: &SelectionConfig,
+    gate: fn(&FrameWeight, &SelectionConfig) -> Option<String>,
+) -> Vec<Option<String>> {
     inputs
         .iter()
         .enumerate()
@@ -321,11 +344,8 @@ pub fn select_frames(
             if let Some(m) = &w.missing {
                 return Some(m.clone());
             }
-            if w.normalized_mean < cfg.min_weight_fraction {
-                return Some(format!(
-                    "weight {:.3} below {:.2} of the group maximum",
-                    w.normalized_mean, cfg.min_weight_fraction
-                ));
+            if let Some(reason) = gate(w, cfg) {
+                return Some(reason);
             }
             let m = inp.measurement;
             if let Some(max) = cfg.max_fwhm_px {
@@ -349,6 +369,31 @@ pub fn select_frames(
             None
         })
         .collect()
+}
+
+/// The weight floor of [`select_frames`] (spec §4.2): why a frame's normalized weight is below
+/// `SelectionConfig::min_weight_fraction` of the group maximum, `None` when it clears the floor. Factored out so the run
+/// can apply the same floor, with the same text, to the frame-common weight after Register (Plan D D1w, PD-5).
+pub fn weight_gate(w: &FrameWeight, cfg: &SelectionConfig) -> Option<String> {
+    (w.normalized_mean < cfg.min_weight_fraction).then(|| {
+        format!(
+            "weight {:.3} below {:.2} of the group maximum",
+            w.normalized_mean, cfg.min_weight_fraction
+        )
+    })
+}
+
+/// The early gate of [`select_frames_deferring_weight_gate`]: a frame with no weight at all is refused (nothing to
+/// reweigh), a frame with a low one is not.
+fn deferred_weight_gate(w: &FrameWeight, _cfg: &SelectionConfig) -> Option<String> {
+    (w.normalized_mean <= 0.0).then(|| "weight 0: no PSF signal".to_string())
+}
+
+/// Whether `mode`'s weight gate is deferred to the end of Register (Plan D D1w, PD-5): the PSF family, whose weights
+/// are recomputed on the frame-common star set. Every other mode is selected as before and its weights are never
+/// recomputed; its groups still get the set, for the SNR gain (Plan D DF-c, PD-19 b).
+pub fn defers_weight_gate(mode: WeightMode) -> bool {
+    matches!(mode, WeightMode::PsfSignalWeight | WeightMode::PsfSnr)
 }
 
 /// The included frame with the highest normalized mean weight, ties broken
@@ -866,6 +911,9 @@ mod tests {
                     aperture_se: None,
                     aperture_stars: None,
                     aperture_correction_group: None,
+                    common_tflux: None,
+                    common_tmean_flux: None,
+                    common_stars: None,
                     fwhm_px: fwhm,
                     eccentricity: ecc,
                     tflux: 1.0,
@@ -1086,6 +1134,79 @@ mod tests {
         let r = select_frames(&inputs, &w, &manual, &SelectionConfig::default());
         assert_eq!(r[2], None);
         assert_eq!(r[4], None);
+    }
+
+    /// Plan D D1w, PD-5: under a PSF-family mode stage 3 defers the 5 % floor to the frame-common weight and refuses only a
+    /// weight of zero, with its own reason (the fraction text would be wrong: nothing here was compared to a maximum
+    /// that means anything yet). Every other filter and the other reasons are as in [`select_frames`].
+    #[test]
+    fn the_deferred_selection_keeps_a_low_weight_frame_but_refuses_a_zero_one() {
+        let ms = [
+            meas(&[1.0], 3.0, 0.1, 100, 5.0),
+            meas(&[0.01], 3.0, 0.1, 100, 5.0),
+            meas(&[0.0], 3.0, 0.1, 100, 5.0),
+            meas(&[0.9], 5.0, 0.1, 100, 5.0),
+            meas(&[0.9], 3.0, 0.1, 100, 5.0),
+        ];
+        let inputs: Vec<_> = ms.iter().map(input).collect();
+        let manual = [false, false, false, false, true];
+        let w = compute_weights(
+            &inputs,
+            WeightMode::PsfSignalWeight,
+            &FormulaWeights::default(),
+            &manual,
+        );
+        let cfg = SelectionConfig {
+            max_fwhm_px: Some(4.0),
+            ..Default::default()
+        };
+        let r = select_frames_deferring_weight_gate(&inputs, &w, &manual, &cfg);
+        assert_eq!(r[0], None);
+        assert_eq!(r[1], None, "0.01 of the maximum is below the 5 % floor and is kept");
+        assert_eq!(r[2].as_deref(), Some("weight 0: no PSF signal"));
+        assert_eq!(r[3].as_deref(), Some("FWHM 5.00 px above 4.00"));
+        assert_eq!(r[4].as_deref(), Some("excluded manually"));
+        // The non-deferring selection still refuses the 0.01 frame, with the fraction text.
+        let plain = select_frames(&inputs, &w, &manual, &cfg);
+        assert_eq!(
+            plain[1].as_deref(),
+            Some("weight 0.010 below 0.05 of the group maximum")
+        );
+    }
+
+    /// Plan D D1w (a pin, not RED): the gate factored out of [`select_frames`] keeps its reason text to the digit.
+    #[test]
+    fn weight_gate_keeps_its_reason_text() {
+        let w = |normalized_mean: f64| FrameWeight {
+            channels: vec![],
+            normalized: vec![],
+            mean: 0.0,
+            normalized_mean,
+            missing: None,
+        };
+        let cfg = SelectionConfig::default();
+        assert_eq!(
+            weight_gate(&w(0.02), &cfg).as_deref(),
+            Some("weight 0.020 below 0.05 of the group maximum")
+        );
+        assert_eq!(weight_gate(&w(0.05), &cfg), None);
+        assert_eq!(weight_gate(&w(1.0), &cfg), None);
+    }
+
+    /// Plan D D1w, PD-5: the deferral is for the PSF family only.
+    #[test]
+    fn only_the_psf_modes_defer_the_weight_gate() {
+        assert!(defers_weight_gate(WeightMode::PsfSignalWeight));
+        assert!(defers_weight_gate(WeightMode::PsfSnr));
+        for m in [
+            WeightMode::Noise,
+            WeightMode::Formula,
+            WeightMode::Exposure,
+            WeightMode::Keyword,
+            WeightMode::None,
+        ] {
+            assert!(!defers_weight_gate(m), "{m:?}");
+        }
     }
 
     #[test]

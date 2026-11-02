@@ -957,6 +957,7 @@ fn main() {
         second_pass_bitmaps: false,
         coverage_map: false,
         stats_on_covered: false,
+        common_stars: None,
     };
 
     let band_throttle = Throttle::new(Duration::from_secs(2));

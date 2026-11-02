@@ -706,6 +706,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -761,6 +762,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -814,6 +816,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -977,6 +980,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -1198,6 +1202,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let maps =
             build_reference_saturation(&input, &[0, 1, 2, 3], &pool(), &AtomicBool::new(false))
@@ -1280,6 +1285,7 @@ mod tests {
             second_pass_bitmaps: false,
             coverage_map: false,
             stats_on_covered: false,
+            common_stars: None,
         };
         let used = [3usize, 1, 2];
         let maps =

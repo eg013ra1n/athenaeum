@@ -319,6 +319,7 @@ mod tests {
             sky_ring: 0.0,
             sky_ring_sigma: 1.0,
             sky_ring_n: 10,
+            ap_sum: f64::NAN,
             snr,
             hfr: 1.0,
             flags,

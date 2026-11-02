@@ -6601,6 +6601,84 @@ mod tests {
         .unwrap();
     }
 
+    /// Plan D D2c r1 (review M1 of D2b, the owner's speed condition): a `fits.<plane>` row measured at another `.athf` format
+    /// version is stale BY ITS KEY - the format version is folded into the measurement hash, so the row's hash is not the
+    /// plan's. A catalog measured at an earlier head measures again; the gate opens no file to find that out. Every plane is
+    /// checked.
+    #[test]
+    fn a_row_measured_at_another_athf_version_is_stale_by_its_hash() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (frame_id, _path) =
+            test_fixtures::add_light(&f, &light_spec_written("f0", THREE_TIMES[0]));
+        let group_key = "osc__None__180s";
+        // `Moffat4` folds no group beta, so the previous-version hash is the plan's one with the format version moved.
+        let mut cfg = StackingConfig::default();
+        cfg.measurement.psf_model = PsfModel::Moffat4;
+        let calibrated = "calibrated-hash";
+        let current = measurement_hash_for(&cfg, calibrated, None);
+        let earlier = stage_hash(
+            &crate::stacking::config::measurement_subtree_with_fits_artifact_version(
+                &cfg,
+                fits_artifact::FITS_ARTIFACT_VERSION - 1,
+            ),
+            &[calibrated],
+            &[],
+        );
+        assert_ne!(current, earlier, "premise: the two versions key apart");
+        let fresh = |planes: usize| {
+            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, planes, &current)
+                .unwrap()
+        };
+        for plane in 0..3 {
+            seed_fits_artifact(&f, group_key, frame_id, plane, &current);
+        }
+        assert!(fresh(3), "premise: three rows of the current hash are fresh");
+        // Plane 1 was measured at the previous format version: same file, same size, another key.
+        seed_fits_artifact(&f, group_key, frame_id, 1, &earlier);
+        assert!(fresh(1), "plane 0 alone is still fresh");
+        assert!(!fresh(2), "plane 1 is stale");
+        assert!(!fresh(3), "and so is the frame");
+    }
+
+    /// Plan D D2c r1: the freshness gate answers from the row's hash and the file's stat, and opens nothing. A file whose
+    /// size is the recorded one reads fresh whatever it holds - garbage, or (on unix) a mode that forbids reading it.
+    #[test]
+    fn the_athf_freshness_gate_opens_no_file() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (frame_id, _path) =
+            test_fixtures::add_light(&f, &light_spec_written("f0", THREE_TIMES[0]));
+        let (group_key, hash) = ("osc__None__180s", "measurement-hash");
+        for plane in 0..3 {
+            seed_fits_artifact(&f, group_key, frame_id, plane, hash);
+        }
+        let fresh = || {
+            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, 3, hash)
+                .unwrap()
+        };
+        assert!(fresh(), "premise");
+        // Plane 1's file is no `.athf` at all, of the recorded size.
+        let path = f.dir.path().join(format!("f{frame_id}.p1.athf"));
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+        assert!(fresh(), "the content is not read");
+        // Plane 2's file cannot be opened.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = f.dir.path().join(format!("f{frame_id}.p2.athf"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = std::fs::File::open(&path).is_err();
+            let answer = fresh();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // Run as root the open succeeds and the file proves nothing; asserted only where the mode holds.
+            if unreadable {
+                assert!(answer, "a file that cannot be opened still stats");
+            }
+        }
+    }
+
     /// The fresh path, end to end: every frame gets a matching `calibrated`
     /// artifact (real file, recorded size), a matching `metrics` artifact,
     /// a previous run whose `stacking_run_frames` rows include all three
@@ -8561,14 +8639,17 @@ mod tests {
         // 2026-10-23 Plan B B4 (PB-14): MEASURE_VERSION 5 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED (the calibration subtree carries no measure version).
         // 2026-10-24 Plan C R-PC-10 (the Blend refusal): MEASURE_VERSION 6 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-10-25 Plan C R-PC-10b (the Blend refusal on the Analysis path only): MEASURE_VERSION 7 (6 is burnt) - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
+        // 2026-11-01 Plan D D2 (`c`'s colour sample, PD-9): MEASURE_VERSION 8 - meas, reg, ln_ref, ln and ln_cal move on every line; calib is UNCHANGED.
         // 2026-11-01 pcores Task 1 (OD-1a, OD-3): `normalization.rejection` defaults to `local`, fastPreview pins `scaleZeroOffset` - ln_ref, ln and ln_cal move on default, maximumQuality and custom (the normalization subtree folds the whole block); calib, meas and reg do NOT move on any line, and the fastPreview line is UNCHANGED.
+        // 2026-11-02 Plan D D2c r1 (review M1 of D2b): FITS_ARTIFACT_VERSION 3 folded into meas (the measurement subtree, beside MEASURE_VERSION) - meas, reg and ln move on every line (was meas=326ee3f03ffce101 on the default line); calib is UNCHANGED, and ln_ref and ln_cal too (this golden feeds them no measurement hash).
+        // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 AND the `local` rejection default move ln_ref, ln and ln_cal; FITS_ARTIFACT_VERSION 3 moves meas, reg and ln only, as the D2c r1 line above says); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=93c65ea07388f9ec ln_ref=b21a437fe852d9e8 ln=eabd47b2de3f9b5f ln_cal=c235ad1f6d43337f",
-                "fastPreview: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=529c0fc0ef53468e ln_ref=aff429c43dcfed70 ln=681b1c1ce68acb23 ln_cal=dc6eb80c40566822",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=daf887f63aba01de reg=40a78afaaecb67fb ln_ref=63f6592190cf4f11 ln=5f8fadd0aa9891b5 ln_cal=8bf7d47256f4c779",
-                "custom: calib=2b725e5e99c87f49 meas=eede4c78d0df187b reg=d218f72dbbd4563a ln_ref=63f6592190cf4f11 ln=d54197b46be41801 ln_cal=8bf7d47256f4c779",
+                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=efe8758fbdc4bbbd ln_ref=782cf447acae6ace ln=532bfea1cac2d7b4 ln_cal=23f55e28c19f3459",
+                "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=a038dcae26c2392a ln_ref=500204de9b22c23d ln=4110659e2116091d ln_cal=1ed2edc9d7ff5dcb",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=bc4925cc6681db3a ln_ref=364ed4c8ffba6878 ln=b88fd0bd410fb46c ln_cal=86f453747dcafe8b",
+                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=916582f203cecefc ln_ref=364ed4c8ffba6878 ln=88cef42f95ee4e58 ln_cal=86f453747dcafe8b",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8637,10 +8718,11 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "daf887f63aba01de");
-        assert_eq!(reg, "93c65ea07388f9ec");
+        assert_eq!(meas, "cc923a65f1b367d7");
+        assert_eq!(reg, "efe8758fbdc4bbbd");
         // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
-        assert_eq!(ln, "eabd47b2de3f9b5f");
+        // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
+        assert_eq!(ln, "532bfea1cac2d7b4");
     }
 
     #[test]
@@ -8711,8 +8793,8 @@ mod tests {
             pass1_hash_for(&cfg, calib),
             "a pure function of its inputs"
         );
-        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f).
-        assert_eq!(key, "5020355fd05d9c71");
+        // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f); re-recorded 2026-11-01, Plan D D2 (MEASURE_VERSION 8; was 5020355fd05d9c71). re-recorded 2026-11-02, Plan D D2c r1 (FITS_ARTIFACT_VERSION 3 folded into the measurement subtree; was d1feba185a3e9a76).
+        assert_eq!(key, "66145a91b19774d5");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over

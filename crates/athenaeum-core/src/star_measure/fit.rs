@@ -150,8 +150,9 @@ impl Default for FitParams {
 
 /// Per-accepted-fit flags (spec 2026-10-07 §3 F-0), persisted as the `.athf` record's flags byte
 /// (`stacking::fits_artifact`). `SATURATED` is set from Task 8 (the measure path's saturation verdict), `BETA_AT_CAP`
-/// from Task 9, `EXTENDED` from Task 10b (the matched filter's knot test). A bit this build does not name is kept as it
-/// is (a newer writer's flag survives a round trip).
+/// from Task 9, `EXTENDED` from Task 10b (the matched filter's knot test), `SIBLING_POINT` from Plan D D2c (PD-30),
+/// `BLEND_NEIGHBOUR` from Plan D D3 (PD-36). A bit this build does not name is kept as it is (a newer writer's flag
+/// survives a round trip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StarFlags(pub u8);
@@ -165,6 +166,21 @@ impl StarFlags {
     /// The star's seed is not a point source (F-10, Task 10b ruling A3: the knot test's zero-sum ratio): it is fitted
     /// and kept, but leaves the β sample, `c`'s qualifiers and the frame statistic, as a saturated star does (P3).
     pub const EXTENDED: StarFlags = StarFlags(4);
+    /// Set on an [`StarFlags::EXTENDED`] fit of a three-plane image that has a point-like seed of another plane within the
+    /// point-source screen's radius (Plan D D2c, PD-30; PD-9's test, run on every extended kept fit): the knot flag took a
+    /// star the colour image's other planes see as a point. `c`'s sample takes such a fit back (PD-9) and the frame-common
+    /// star set may read it ([`StarFlags::in_common_set`]); the frame statistic, the β sample and [`StarFlags::in_statistic`]
+    /// still leave it out. Never set without `EXTENDED`.
+    pub const SIBLING_POINT: StarFlags = StarFlags(8);
+    /// A fit the blend refusal (`refuse_blends`) refused lies within the frame-common star set's isolation radius of this
+    /// kept fit (Plan D D3, PD-36): [`CORRECTION_ISOLATION_PER_FIELD_FWHM`](super::photometry::CORRECTION_ISOLATION_PER_FIELD_FWHM)
+    /// x the plane's frame FWHM, the very radius `stacking::common_set::candidates` isolates with, read off the persisted
+    /// `fwhm_px` (`finish_working` sets the bit after the frame statistic, `mark_blend_neighbours`). A refused fit leaves
+    /// the `.athf`, so without the bit the set would see its kept neighbour as isolated, which it was not before D3 (the refused
+    /// fit was a kept neighbour then); the set reads the bit as "not isolated". It changes nothing else:
+    /// [`StarFlags::in_statistic`], [`StarFlags::in_common_set`] and every sum leave it out. Set only by the stacking Measure
+    /// (`finish_working`), never by the Analysis budget path, never by LN's refits.
+    pub const BLEND_NEIGHBOUR: StarFlags = StarFlags(16);
 
     pub const fn bits(self) -> u8 {
         self.0
@@ -194,18 +210,38 @@ impl StarFlags {
         self.contains(StarFlags::EXTENDED)
     }
 
+    /// [`StarFlags::SIBLING_POINT`] is set (Plan D D2c, PD-30): the fit is extended on its own plane and a point-like seed
+    /// of another plane lies at its position.
+    pub const fn sibling_point(self) -> bool {
+        self.contains(StarFlags::SIBLING_POINT)
+    }
+
+    /// [`StarFlags::BLEND_NEIGHBOUR`] is set (Plan D D3, PD-36): a Blend-refused fit lay within the set's isolation radius of
+    /// the fit.
+    pub const fn blend_neighbour(self) -> bool {
+        self.contains(StarFlags::BLEND_NEIGHBOUR)
+    }
+
     /// The star is one the frame statistic and `c`'s qualifiers read: neither saturated (F-3) nor extended (F-10, P3).
     pub const fn in_statistic(self) -> bool {
         !self.saturated() && !self.extended()
     }
 
+    /// The star is one the frame-common star set may read (Plan D D2c, PD-30): not saturated, and not extended unless a
+    /// point-like seed of another plane rescues it ([`StarFlags::SIBLING_POINT`]). `in_statistic()` is unchanged.
+    pub const fn in_common_set(self) -> bool {
+        !self.saturated() && (!self.extended() || self.sibling_point())
+    }
+
     /// The named flags set, in bit order, as the probe's star lines write them (`"saturated"`, `"betaAtCap"`,
-    /// `"extended"`).
+    /// `"extended"`, `"siblingPoint"`, `"blendNeighbour"`).
     pub fn names(self) -> Vec<&'static str> {
         [
             (StarFlags::SATURATED, "saturated"),
             (StarFlags::BETA_AT_CAP, "betaAtCap"),
             (StarFlags::EXTENDED, "extended"),
+            (StarFlags::SIBLING_POINT, "siblingPoint"),
+            (StarFlags::BLEND_NEIGHBOUR, "blendNeighbour"),
         ]
         .into_iter()
         .filter(|(f, _)| self.contains(*f))
@@ -279,6 +315,15 @@ pub struct StarFit {
     /// without a ring. Not persisted (NaN on a decoded fit), like `peak5`.
     #[serde(skip, default = "not_measured")]
     pub snr: f64,
+    /// The star's aperture sum (Plan D D2c, PD-30): `S = sum (v - B_i)` over the present pixels whose centres lie within
+    /// `3 * ring_fwhm` of the fitted centre (the frame's ring width: one radius for every fit of the plane, no fit width
+    /// in it), the star's ring sky, in the fit's units. It is read in [`hfr_pass`]'s walk
+    /// ([`super::photometry::hfr_scan`]); NaN where the 3 F disc leaves the plane or holds a non-finite or masked pixel, and
+    /// without a ring sky. It carries neither `signal`'s model nor `c`: the common-set weight reads it
+    /// ([`crate::stacking::common_set`]); every other reader keeps `signal`. The SNR stays at 1.5 F. Persisted in the `fits`
+    /// artifact (version 3).
+    #[serde(skip, default = "not_measured")]
+    pub ap_sum: f64,
     /// The star's half-flux radius, px (F-6, Task 11, [`super::photometry::hfr`]): NaN without a ring, or when the `5F`
     /// circle holds less than half of `signal`. Not persisted.
     #[serde(skip, default = "not_measured")]
@@ -372,6 +417,10 @@ pub struct FitOutcome {
     /// `ring_fwhm`, else the plane's frame FWHM over the kept fits neither saturated nor extended); `None` when no ring
     /// width existed (no fit in the statistic). The one owner of that width: LN's pair-common arm reads it here.
     pub ring_fwhm: Option<f64>,
+    /// The fitted centre of every fit the blend refusal refused ([`refuse_blends`]), in the order it refused them; empty where
+    /// the rule is off. The kept fits do not name them (a refused fit is not kept): `finish_working` marks the kept fits near
+    /// one with [`StarFlags::BLEND_NEIGHBOUR`] once the frame FWHM the radius reads is known (Plan D D3, PD-36).
+    pub blend_refused: Vec<(f64, f64)>,
 }
 
 /// A plane with this many readable seeds refused `Donut`, and at least [`DEFOCUSED_DONUT_FRACTION`] of its readable
@@ -1701,6 +1750,7 @@ fn accept(
         sky_ring: f64::NAN,
         sky_ring_sigma: f64::NAN,
         sky_ring_n: 0,
+        ap_sum: f64::NAN,
         snr: f64::NAN,
         hfr: f64::NAN,
         flags: StarFlags::default(),
@@ -1731,11 +1781,14 @@ pub const BLEND_SEED_GUARD: f64 = 0.5;
 /// [`RefusalReason::Blend`] when another seed of the plane's detection lies inside its half-maximum ellipse (centre
 /// `(x, y)`, semi-axes `fwhm_x / 2`, `fwhm_y / 2` turned by `theta`, [`inside_half_max`]) and at least
 /// [`BLEND_SEED_GUARD`]` · field_fwhm` from the fit's own seed. The plane's seeds are `neighbours.seeds` when the fit
-/// call was handed a subset of them (the budget's candidates, the only caller that sets the flag since R-PC-10b: every
+/// call was handed a subset of them (the budget's candidates, a `Brightest` prefix, a population's fitted seeds: every
 /// detected seed, fitted or not, counts), else the call's own `seeds` (every seed the detector produced or the caller gave). The
 /// fit's own seed (`of_fit[i]`, else `i`) never counts. A refused fit leaves `accepted` (the order of the rest is
 /// kept, so a plane without a pair reaches the duplicate drop exactly as before) and its outcome is set. Runs only when
-/// the call's [`Correction::blend_refusal`] is set (the Analysis budget path, R-PC-10b).
+/// the call's [`Correction::blend_refusal`] is set: every `measure_plane` path (the Analysis budget path since Plan C
+/// R-PC-10b, the stacking Measure's since Plan D D3, PD-10); never LN's refits. Returns the fitted centre of every fit it
+/// refused, in `accepted` order (empty when it is off or refused none): a refused fit leaves the kept list, and the frame-common star
+/// set still needs to know where it was (Plan D D3, PD-36: [`mark_blend_neighbours`]).
 fn refuse_blends(
     accepted: &mut Vec<(usize, StarFit)>,
     outcomes: &mut [Outcome],
@@ -1743,9 +1796,10 @@ fn refuse_blends(
     neighbours: Option<Neighbours<'_>>,
     field_fwhm: f64,
     enabled: bool,
-) {
+) -> Vec<(f64, f64)> {
+    let mut refused_at: Vec<(f64, f64)> = Vec::new();
     if !enabled || accepted.is_empty() {
-        return;
+        return refused_at;
     }
     let (plane, of_fit): (&[Seed], Option<&[usize]>) = match neighbours {
         Some(n) => (n.seeds, Some(n.of_fit)),
@@ -1769,9 +1823,32 @@ fn refuse_blends(
             });
         if blend {
             outcomes[*i] = Outcome::Refused(RefusalReason::Blend);
+            refused_at.push((f.x, f.y));
         }
         !blend
     });
+    refused_at
+}
+
+/// Set [`StarFlags::BLEND_NEIGHBOUR`] on every fit of `fits` within `radius` (inclusive, the kd-tree's own test, the one
+/// `stacking::common_set::candidates` isolates with) of one of the `refused` centres (Plan D D3, PD-36). A fit's own
+/// refusal is not a neighbour of itself: the refused fits are not in `fits`. Nothing else about a fit moves, and nothing is
+/// done for no refused centre or a `radius` that is not a positive finite number (the set reads no candidate then).
+///
+/// The distance here is taken between f64 centres. The `.athf` stores `x` and `y` as `f32`, so `candidates` (which reads the
+/// persisted fits) measures distances between f32-rounded centres: the two can disagree on a pair that lies within about
+/// 3e-4 px of the radius (the rounding of two coordinates near 5 000 px), a pair the set's isolation cannot tell apart
+/// from one on the radius (review n-1 of D3 r2).
+pub(crate) fn mark_blend_neighbours(fits: &mut [StarFit], refused: &[(f64, f64)], radius: f64) {
+    if refused.is_empty() || fits.is_empty() || !(radius.is_finite() && radius > 0.0) {
+        return;
+    }
+    let tree = crate::geometry::kdtree::KdTree2::build(refused);
+    for f in fits.iter_mut() {
+        if f.x.is_finite() && f.y.is_finite() && !tree.within(f.x, f.y, radius).is_empty() {
+            f.flags |= StarFlags::BLEND_NEIGHBOUR;
+        }
+    }
 }
 
 /// Drop every fit that has a brighter accepted fit within ±1 px. Each fit
@@ -1911,11 +1988,16 @@ pub(super) struct Correction<'a> {
     /// them within `max(`[`super::photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of its fitted centre (R-PB4-2) is screened out. `None` = no screen
     /// (one plane, LN's refits, every caller but the stacking halves).
     pub(super) siblings: Option<&'a [Seed]>,
+    /// The seeds of [`Correction::siblings`] that their own plane does not flag extended (Plan D D2, PD-9;
+    /// [`super::point_like_sibling_seeds`]): an extended `c` candidate with one of them within the same radius re-enters
+    /// `c`'s list. `None` = nothing is taken back (one or two planes, LN's refits, every caller but the stacking halves).
+    pub(super) point_siblings: Option<&'a [Seed]>,
     /// The plane's sub-step timers (Plan A Task 13b, 13-P): the ring sky, `c` and the SNR / HFR pass report into it.
     /// Timers only; `None` for every caller but the measure path.
     pub(super) timers: Option<&'a super::SubSteps>,
-    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b): `true` only on the Analysis budget path
-    /// ([`super::Mode::Budget`]); the stacking Measure, LN's refits and registration leave it `false` and fit as at
+    /// Run the blend refusal ([`refuse_blends`], Plan C R-PC-10b, Plan D D3): `true` on every `measure_plane` path (the
+    /// Analysis budget path, and the stacking Measure's `Mode::All` / `Brightest` / `Population`: the subs, the master and
+    /// the SNR-gain crops); `false` for LN's refits and every [`super::fit_stars_at`] caller, which fit as at
     /// `MEASURE_VERSION` 5.
     pub(super) blend_refusal: bool,
 }
@@ -2284,10 +2366,11 @@ fn fit_at_width(
             traces.push(trace);
         }
     }
-    // Plan C R-PC-10 / R-PC-10b: on the Analysis path (`correction.blend_refusal`), a fit with another seed of the
-    // plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit the plane
-    // verdicts refused never reaches it). The stacking, LN and registration fits do not run the rule.
-    refuse_blends(
+    // Plan C R-PC-10 / R-PC-10b, Plan D D3: on a `measure_plane` path (`correction.blend_refusal`), a fit with another
+    // seed of the plane inside its half-maximum contour is two stars, refused `Blend` before the duplicate drop (a fit
+    // the plane verdicts refused never reaches it). LN's refits do not run the rule; a mono frame's registration reads
+    // Measure's kept fits, so it inherits it (an OSC frame re-detects).
+    let blend_refused = refuse_blends(
         &mut accepted,
         &mut outcomes,
         seeds,
@@ -2400,6 +2483,7 @@ fn fit_at_width(
         ring_sky_missing,
         fit_seeds,
         ring_fwhm,
+        blend_refused,
     }
 }
 
@@ -2462,6 +2546,22 @@ fn ring_and_correction(
         }
         super::FluxCorrection::FromPlane => None,
     };
+    // Plan D D2c (PD-30): PD-9's test run once for the plane, on EVERY extended kept fit (not only the ones `c`'s list takes
+    // back): an extended fit with a point-like seed of another plane within the point-source screen's radius carries
+    // SIBLING_POINT, which the frame-common star set reads. One index per plane, one query per extended fit; the colour
+    // sample's taking-back (`aperture_correction`) reads the mark instead of asking again. Only a three-plane image has
+    // `point_siblings`.
+    if let Some(seeds) = correction.point_siblings {
+        let near = super::photometry::NearIndex::new(
+            seeds.iter().map(|s| (s.x, s.y)),
+            super::photometry::point_source_match_px(field_fwhm),
+        );
+        for (_, f) in kept.iter_mut() {
+            if f.flags.extended() && near.any_within(f.x, f.y) {
+                f.flags |= StarFlags::SIBLING_POINT;
+            }
+        }
+    }
     snr_pass(data, mask, w, h, kept, correction, pool);
     let (c, stars, se, screens) = match given {
         Some(c) => (
@@ -2487,6 +2587,7 @@ fn ring_and_correction(
                 correction.footprint,
                 correction.population,
                 correction.siblings,
+                correction.point_siblings.is_some(),
             )
         }
     };
@@ -2528,8 +2629,9 @@ fn snr_pass(
 
 /// Every kept fit's half-flux radius (F-6, Task 11, [`super::photometry::hfr`]) from its stored ring sky and its
 /// (aperture-corrected) `signal`, at the ring width `ring_fwhm` the rings were read at (`None` = no ring anywhere:
-/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. `pool` as the
-/// fit's.
+/// every fit reads NaN). Read AFTER the aperture correction: the half-flux target is half of `signal`. The same pixel
+/// walk gives each fit's aperture sum at 3 `ring_fwhm` ([`StarFit::ap_sum`], Plan D D2c, PD-30; it reads no `signal`).
+/// `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
 fn hfr_pass(
     data: &[f32],
@@ -2545,7 +2647,9 @@ fn hfr_pass(
         let _s = super::substeps::span(correction.timers, super::Step::SnrHfr);
         kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(correction.timers, super::Step::SnrHfr);
-            f.hfr = ring_fwhm.map_or(f64::NAN, |r| super::photometry::hfr(data, w, h, f, r, mask));
+            let scan = ring_fwhm.map(|r| super::photometry::hfr_scan(data, w, h, f, r, mask));
+            f.hfr = scan.map_or(f64::NAN, |s| s.hfr);
+            f.ap_sum = scan.map_or(f64::NAN, |s| s.ap_sum);
         })
     };
     super::install_in_span(pool, body);
@@ -4536,6 +4640,121 @@ mod tests {
             assert_eq!(on.aperture_correction, off.aperture_correction);
         }
 
+        /// Plan D D3 (PD-36): the outcome names the fitted centre of every fit the rule refused (both of a merged pair), none
+        /// with the rule off and none on a plane without a pair.
+        #[test]
+        fn the_outcome_names_the_centre_of_every_blend_refused_fit() {
+            let stars = [star(60.0, 60.0, 0.5), star(60.0 + 1.2 * F, 60.0, 0.5)];
+            let data = plane(120, 120, &stars, 3);
+            let seeds = seeds_from(&stars, 4.0);
+            let on = fit_blend(&data, 120, 120, &seeds, true, false);
+            assert_eq!(blends(&on.refused), 2, "{:?}", on.refused);
+            assert_eq!(on.blend_refused.len(), 2, "{:?}", on.blend_refused);
+            // Two equal stars 1.2 F apart fit as one merged ellipse: both refused fits sit at the pair's middle.
+            let middle = 60.0 + 0.6 * F;
+            for &(x, y) in &on.blend_refused {
+                assert!(
+                    (x - middle).abs() < 1.5 && (y - 60.0).abs() < 1.0,
+                    "refused centre ({x}, {y}) vs the pair's middle ({middle}, 60)"
+                );
+            }
+            let off = fit_blend(&data, 120, 120, &seeds, false, false);
+            assert!(off.blend_refused.is_empty());
+            let lone = [star(60.0, 60.0, 0.5)];
+            let alone = fit_blend(
+                &plane(120, 120, &lone, 4),
+                120,
+                120,
+                &seeds_from(&lone, 4.0),
+                true,
+                false,
+            );
+            assert_eq!((alone.fits.len(), alone.blend_refused.len()), (1, 0));
+        }
+
+        /// Plan D D3 (PD-36): `mark_blend_neighbours` sets the one bit on a fit within the radius of a refused centre, the
+        /// radius inclusive (the kd-tree's own test, `candidates`'), and moves nothing else; no refused centre, an empty list
+        /// or a radius that is not a positive number marks nothing.
+        #[test]
+        fn mark_blend_neighbours_marks_inside_the_radius_inclusive_and_only_the_bit() {
+            let fit = |x: f64, y: f64, flags: StarFlags| StarFit {
+                x,
+                y,
+                background: 0.0,
+                amplitude: 1.0,
+                fwhm_x: F,
+                fwhm_y: F,
+                fwtm_x: 1.8 * F,
+                fwtm_y: 1.8 * F,
+                theta: 0.0,
+                beta: 4.0,
+                residual: 0.01,
+                signal: 1.0,
+                area: 50.0,
+                peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
+                ap_sum: 1.0,
+                snr: f64::NAN,
+                hfr: f64::NAN,
+                flags,
+            };
+            // One refused centre at (100, 100); radius 24 px (6 x a field FWHM of 4).
+            let refused = [(100.0, 100.0)];
+            let radius = 6.0 * F;
+            let mut fits = vec![
+                fit(100.0 + radius, 100.0, StarFlags::default()), // exactly on the radius: marked
+                fit(100.0 + radius + 0.01, 100.0, StarFlags::default()), // a hair beyond: not
+                fit(100.0, 100.0 - radius + 0.5, StarFlags::EXTENDED), // inside: marked, EXTENDED kept
+                fit(
+                    100.0 + 3.0,
+                    100.0 + 4.0,
+                    StarFlags::SATURATED | StarFlags::BETA_AT_CAP,
+                ), // 5 px: marked, the rest kept
+                fit(400.0, 400.0, StarFlags::SIBLING_POINT),           // far: untouched
+            ];
+            let before = fits.clone();
+            mark_blend_neighbours(&mut fits, &refused, radius);
+            let marked: Vec<bool> = fits.iter().map(|f| f.flags.blend_neighbour()).collect();
+            assert_eq!(marked, vec![true, false, true, true, false]);
+            for (a, b) in fits.iter().zip(&before) {
+                assert_eq!(
+                    a.flags.bits() & !StarFlags::BLEND_NEIGHBOUR.bits(),
+                    b.flags.bits(),
+                    "no other flag moves"
+                );
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        StarFit {
+                            flags: b.flags,
+                            ..*a
+                        }
+                    ),
+                    format!("{b:?}"),
+                    "no other field moves"
+                );
+            }
+            for (list, centres, r) in [
+                (&before, &[][..], radius),
+                (&before, &refused[..], 0.0),
+                (&before, &refused[..], f64::NAN),
+                (&before, &refused[..], -1.0),
+            ] {
+                let mut untouched = list.clone();
+                mark_blend_neighbours(&mut untouched, centres, r);
+                assert_eq!(
+                    format!("{untouched:?}"),
+                    format!("{list:?}"),
+                    "centres {centres:?}, radius {r}"
+                );
+            }
+            let mut empty: Vec<StarFit> = Vec::new();
+            mark_blend_neighbours(&mut empty, &refused, radius);
+            assert!(empty.is_empty());
+        }
+
         /// A trailed plane keeps its verdict: every fit it would accept is refused `Trailed`, none `Blend`, exactly as
         /// with the rule off.
         #[test]
@@ -4550,7 +4769,8 @@ mod tests {
             assert_eq!(on.trail_share, off.trail_share);
         }
 
-        /// R-PC-10b: the default `Correction` (the stacking Measure, LN's refits, registration) never runs the rule. The
+        /// R-PC-10b: the default `Correction` (LN's refits and every `fit_stars_at` caller; the `measure_plane` paths set
+        /// the flag themselves since Plan D D3) never runs the rule. The
         /// plane is the second arm of `a_faint_companion_inside_the_contour_refuses_the_bright_star_blend`'s kind: a
         /// faint companion (0.2 of the bright amplitude) 1.0 F out, whose seed lies inside the bright fit's contour.
         /// The default keeps both fits; the same call with the flag set refuses the companion's `Blend`.

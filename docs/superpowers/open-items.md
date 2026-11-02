@@ -21,18 +21,26 @@ and the reproduction passes on the owner's catalog.
 
 None open.
 
-## Plan D — carried from Plans B and C
+## Plan D — closed with its merge; what it left and what it carried (2026-11-02)
 
-Plan C took the Analysis switch only (owner, 2026-10-24); what it measured and did not fix is here. **Plan D starts by checking the first `c` item on the
-calibrated path.** References: `docs/stacking/README.md` R-OSP-16 (Plan B) and R-OSP-17 (Plan C), the after-Plan-B report
-`docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` §6, and the Plan C after note
-`docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md` §9.
+**Plan D (the stacking weight only; owner 2026-10-31, «Только вес стека») is CLOSED by the merge commit of `plan-d` into local `main`.** The final whole-branch review comes before that
+commit and the controller adds its sha here; push on the owner's word. What it did: `docs/stacking/README.md` R-OSP-18 (PD-1 … PD-49, every run line, the DF acceptance rule) and the after note
+`docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`. Plan C took the Analysis switch only (owner, 2026-10-24) and left Plan D its weight items, which are paid (below); the rest is
+carried unchanged. Other references: `docs/stacking/README.md` R-OSP-16 (Plan B) and R-OSP-17 (Plan C), the after-Plan-B report `docs/superpowers/research/2026-10-24-star-measurement-after-plan-b.md` §6,
+and the Plan C after note `docs/superpowers/research/2026-10-25-star-measurement-after-plan-c.md` §9.
+
+**Plan D final review r1 (fable, 2026-11-02), minor m1 — the anchor on a 3-plane image with a dead plane.** `pick_anchor` reads
+`mean_fwhm_px()` (`stacking/run.rs` ~9992, `stacking/measure.rs` ~414–420 / ~1414), which averages a plane without an in-statistic fit as 0,
+so a frame with one dead plane but a top-half unsaturated count can win the anchor; that plane then falls back whole (under 20 common stars)
+and the live planes anchor on a non-sharpest frame. Rare and graceful (a fallback, warned). Fix: rank by the mean over live planes, members
+with fewer live planes after those with more, plus one test; it moves an anchor only where a member has a dead plane. Also n3: the
+`MissingFits` fallback reason also covers a member whose plane does not exist (see the `nch` note).
 
 **Owner question (unanswered).** solvemyastro on rustafits with `default-features = false`: `clap` is still in the build. Is the branch on GitHub for the owner to merge?
 
-**Scope (owner, 2026-10-31: «Только вес стека»).** Plan D is the stacking weight only: (0) the first `c` item below on the calibrated path, (1) the weight's
-hang on saturated stars' `tflux` and the FWHM trend set 109 showed (bar: R-PC-11 (b)'s ln-truth at master level on hc11 / runB / s204), (2) Blend on the stack after (1).
-The other `c` items, the Analysis items and the plate-solving signal wait for a later plan; the LN / ERP items stay recorded limits.
+**Scope as it ended (owner, 2026-10-31: «Только вес стека»).** (0) the first `c` item on the calibrated path: fixed by D2 (PD-9); (1) the weight's hang on saturated stars' `tflux` and the FWHM trend
+set 109 showed: fixed by the frame-common star set; (2) Blend on the stack: D3. The other `c` items, the Analysis items and the plate-solving signal wait for a later plan; the LN / ERP items stay
+recorded limits.
 
 **Real trees (owner, 2026-10-31).** The three real trees (hc11B-f1 52 GB, lnB-runB-f1 69 GB, tierA-lnB-f1 95 GB) are copied to the runner (M4 Max) through
 `/Volumes/Universe/athenaeum-runner/trees/` and kept on both machines. They are not self-contained: their sources sit on the dev Mac's volumes by absolute path
@@ -40,8 +48,8 @@ The other `c` items, the Analysis items and the plate-solving signal wait for a 
 rulings).
 
 **The Measure aperture correction `c` (Plan B B4, measured, not fixed).**
-- On raw debayered planes with β at the 1.5 floor the `extended` classifier removes 50–95 % of the bright stars from `c`'s sample frame-dependently and `c`
-  follows by ±20 % (R-PB4-4; the group-β path not shown to share it). The first Plan D check.
+- RESOLVED by Plan D D2 (PD-9, `MEASURE_VERSION` 8; R-OSP-18): on a 3-plane image an `extended` `c` candidate re-enters `c`'s list when another plane holds a point source at its seed. R's `c` sample depth
+  p50 is 65 (D0: 219 / 222), kept / top 0.996, `c` p50 1.815 → 1.231. hc11 L's 2024-09-08 night (8 frames, `c` +7 %) stays a recorded limit with its owner-given cause (collimation off, wind).
 - The crowded-field `c` bias, +0.8 % on density/d5 (R-PB4-7).
 - A seeing-conditioned stand-in for floor (i), nearest peers by `fwhm_px` (R-PB4-5's concern: the stand-in's R error is seeing-sized, p90 22 %).
 - OSC R / B `c` +4–7 % above truth on 44 / 48 lab rows whatever the sample (PB-13').
@@ -59,22 +67,25 @@ rulings).
 - The ERP's real-set gap and mono / OSC sign flip (B1 open item 2; median gap s204-mono −2.96, runB-mono −2.13, s204-osc +4.44, runB-osc +3.54 %): not investigated; to be
   explained only if the comparison is wanted (the ERP is a column, never the referee). The ERP has never run Task 14b's 15 new units: refresh before an ERP column is read on them.
 
-**The stacking weight (Plan C C10, measured, not fixed; `task-C10F-verdict-r1.md` in the Plan C ledger folder, R-PC-10b).**
-- **The weight hangs on saturated stars' `tflux`.** `tflux` sums `signal` over every accepted fit, saturated included (`star_measure/frame.rs`), and the weight is
-  ∝ tflux · tmean_flux / (σ · m_star) (`stacking/psf_signal.rs`); saturated stars hold 53–64 % of a frame's accepted signal (C10F probe, s204 clone). Refusing a
-  few of them re-ranks the weights against seeing: at C10 r1 (Blend on the stacking path) 4–7 refusals among hc11 L's 500 brightest took 25–31 % of `tflux`, the
-  sharpest frames (FWHM 5.6–6.5 px against 8) were demoted (69860 rank 72 → 35) because good seeing resolves the field's saturated giant, weights ρ 0.891, master
-  noise +1.59 %. A pre-Plan-C fragility, not Blend's: any change to which bright stars a frame accepts moves its weight this way. Bar for a fix: R-PC-11 (b)'s
-  ln-truth at master level on hc11 / runB / s204 (lab `star-lab/results/plan-c/c10-r1-v6/` is the failing case).
-  Seen again on set 109's mono group (2026-10-31, run 9 on a catalog copy): per-frame PSF SNR (tflux² / σ²) grows ≈ FWHM² across the 208 frames (median
-  24.5 below 2 px, 1686 above 4.5 px; tflux 17 311 → 133 242), and the top weight went to one of the widest frames (FWHM 4.88 px against the master's 2.96).
-  The weights themselves stay spread (top frame 1.2 % of the total, top five 5.3 %).
-- **The SNR gain inherits it.** `paired_snr_gain` compares the master with the best sub by weight, on PSF SNR, so a set with mixed seeing reads low: set 109
-  mono 7.08× for 208 frames (√N 14.42), OSC R / G / B 7.41 / 7.99 / 7.86× for 160 (√N 12.65). Scaled by the group's own FWHM² law (gain bias √((4.88 / 2.96)²) ≈ 1.65),
-  the mono figure lands near 11.7×. A fix of the tflux item fixes this; until then the figure is bounded by √N but not comparable across sets of
-  different seeing spread. Evidence: `docs/stacking/README.md` → the SNR gain bullet.
-- **Blend on the stack** (R-PC-10b): the stacking Measure, LN's refits and registration fit without the `Blend` refusal, so the stack keeps the blends' 0.1–0.4 %
-  FWHM and crowded-field ecc bias. The seam is one bool (`fit::Correction::blend_refusal`); turning it on for stacking waits for the weight item above.
+**The stacking weight (Plan C C10): RESOLVED by Plan D** (R-OSP-18, after note). The weight's flux term is summed over a frame-common star set that every included frame holds unclipped, so it no longer
+hangs on the saturated stars' `tflux`; set 109's top-weight frame is a sharp one (FWHM 1.65 px against a group median 2.61) and its SNR gain reads 8.05 (mono; run 9: 7.08) and 10.66 / 13.45 / 10.76
+(OSC; run 9: 7.41 / 7.99 / 7.86), a figure bounded by the run's own weighted-mean prediction (PD-48), not by √N. The stacking Measure refuses Blend since D3 (`MEASURE_VERSION` 8). What Plan D left:
+- **PD-42, an owner item (outside Plan D).** On the OSC R plane the master realizes none of the sharper weighting's star-peak gain: runB p0 PSF SNR 0.9831 and s204 p0 0.9882 / drizzle 0.9883 against dbase,
+  runB p2 FWHM 1.0103 (the weights predict +0.2 %; the shortfall is resampling and core rejection of 2-px stars, R-SC-1's family). Measure it with `star-lab/bin/core_replay.py`'s core-peak ratio per
+  plane on the final clones (`~/.athenaeum-acc/pland-{hc11,runB,s204}-final`, kept stripped as the robust-seed plan's RQ-9 base; the measurement needs their masters and `.rej` decisions, so strip them only
+  after it).
+- **PD-47's probe.** On a 3-plane image's 1-in-4 CFA planes (R, B) below ≈ 1.9 px FWHM the 3 F aperture sum's ratio to the anchor falls with FWHM (set 109's moonlit night: B -20.3 %/px). Owed: D0's (b-ap) disc
+  per plane on ten 2025-09-13 B frames of the set109 copy (the lab's D0 tool, no build). The copy `~/.athenaeum-acc/plan-d/set109` (141 GB) is kept to **2026-12-07** (REGISTRY row) for it; `pland.sh clean
+  set109` after.
+- **The web server checkpoints nothing on shutdown (PD-49, a nicety).** The set 109 run left 16.7 MB of WAL un-checkpointed; the lab driver now checkpoints a clone before any immutable read and the reader
+  stops on a live WAL. A server-side `wal_checkpoint(TRUNCATE)` on shutdown would make a stopped server's database file self-contained.
+- **Measure reads `fwhm_px` 0 on point-sampled Gaussian fixtures under 2.5 px** (D1 review m1; unverified, likely the fixture). Settle with a real undersampled frame and a Moffat β 4 fit at 2.0-2.4 px.
+- **Reweigh's `nch` = the maximum plane count over the group's members, integrate's reference `channels` = the reference's, so in a mixed group the two can differ** (d2d review m3, pre-existing; no
+  reproduction on a real set).
+- **The PD-39 anchor-map warn is log-only at 0.6** (`COMMON_WARN_SHARE`, PD-44) until the robust-seed plan's RQ-6 inlier warn lands (`docs/superpowers/plans/2026-11-02-robust-quad-seed.md`; it lands after
+  Plan D and moves runB / s204 mono registration rows; PD-39's fragility is its subject). A map error that removes under 40 % of the common set's candidates is silent until then.
+- **Recorded limits Plan D added** (R-OSP-18, after note §8): PD-22 / PD-43 (LN's OSC and s204 B-plane scale against the flux truth), PD-34 (s204 OSC B-S on its bar), PD-24 (LDN1272 mono under D1 gains
+  +1…+1.6 % PSF SNR at the centre and loses about 2 % in the outer fifth: the favoured frames are sharper at the centre than at the corners), PD-11 (the registration reference stays on the Measure-time weight).
 
 **Analysis measurement (Plan C, recorded limits).**
 - **Close unresolved pairs** (R-PC-10a): the `Blend` refusal catches resolved pairs (both seeded, ~1.7 F); a close pair whose companion is no seed (95 of 132 on
@@ -113,10 +124,10 @@ Ruling R-SC-1 in `docs/stacking/README.md` (the default rejection normalization 
   owed star-protecting rejection item (the M4c Task 7 note on RCR / Winsorized under "Unverified by hand"); not a
   normalization error.
 - **A cheaper default lever, if the LN stage's cost on default runs is ever judged too high:** the global pair scaled by
-  Measure's common star flux (Plan D's `commonTflux`), no Normalize stage. A new mode; it waits for Plan D.
+  Measure's common star flux (Plan D's `commonTflux`), no Normalize stage. A new mode; Plan D has landed `commonTflux` (R-OSP-18), the mode itself is not built.
 - **Plan D's runB mono record** (PD-21, PSF SNR 0.962, "cause in integration"): the cause was the project's stored
   `scaleZeroOffset`; at R-SC-1's acceptance the same project mono master reads PSF SNR ×1.197 against Plan D's base
-  run. Plan D's next runB read carries the new default.
+  run. Confirmed by Plan D's final run (PD-40: it posts the migrated `local`): runB mono L PSF SNR 1.2718 against dbase and 1.2808 against d3 (R-OSP-18).
 - **Run-warning texts still naming LN on rejection-only runs** (`stacking/run.rs`, "local normalization scale resolved
   to …" and "the LN reference's member list …"): reword when that file is next open.
 - **The Normalize row's denominator grows once** when the seeds calibration runs (the reference build ticks at
@@ -338,6 +349,19 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Plan D — the stacking weight (2026-11-02)
+
+Branch `plan-d` (reference `docs/stacking/README.md` R-OSP-18; after note `docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`). The weight was judged at master level on three real trees and on a
+copy of set 109 through the release web build; no app window was opened by hand. Owed, in `npm run tauri dev` on the dev catalog:
+
+- **Results card, SNR gain.** After one stack of a colour frame set the card shows every plane's gain ("SNR gain 7.41 / 7.99 / 7.86×": two decimals, " / " between planes); an older run of the same set shows
+  "SNR gain —" with the tooltip "measured with an older formula — re-run to get the SNR gain"; a run under the Noise weight mode shows a gain too, not "—".
+- **Frames table.** A PSF-weight run shows one weight scale per group; a frame that fell out after Register shows no weight (no Measure-time value beside the common-set ones).
+- **The first stack after the update** re-measures, re-registers and re-normalizes every set once (Calibrate stays cached); the second stack of the same set does not. Time the first one on the production catalog.
+- **Analysis rows measured before the update are stale at version 8**, as at Plan C's bump: the plate-solve input gate refuses nothing from them until the frame is re-analysed. After re-analysing a set with a
+  trailed frame, check that the gate refuses it before solving, with the "Stars are trails" line.
+- **The run log** (athenaeum-logs, one stack): a "weights: frame-common star set" info per plane with `common_stars` and `candidates`; no "registration map may be wrong" warn on a correctly registered set.
 
 ### Rejection normalization by star flux (2026-11-01)
 
@@ -2391,3 +2415,14 @@ The cycles after the tag did not add theirs; the lines below were written on 202
   running a frame ahead; a refused frame carries its file name into the failed list. In the web build the batch no longer closes at once and the
   progress shows.
 
+Plan D (the stacking weight, 2026-11-02), in plain words for the translation; the exact versions are in the brackets:
+
+- **A frame's stacking weight follows how clear and how sharp the frame is, not its clipped stars.** The weight is now measured on the stars every frame of the group shows unclipped, so a soft frame no longer wins
+  weight from blur, and good-seeing frames on a clear sky count most. (The frame-common star set; `docs/stacking/README.md` R-OSP-18.)
+- **The per-frame star SNR in a stack run reads fewer stars, so its numbers are smaller than before.** Compare frames within one run, not with numbers from older runs.
+- **The SNR gain on the stack result was re-measured on the same shared stars.** Runs stored by earlier versions show "SNR gain —" until they are run again; a colour set shows the gain of each of its three
+  planes. (`SNR_GAIN_VERSION` 2.)
+- **The first stack after the update takes longer: every frame set re-measures its stars once.** Calibration is not redone, and the Analysis tab's star numbers refresh when a frame is re-analysed.
+  (`MEASURE_VERSION` 8, the Analysis rows too; the per-frame star files are version 3; a stackwork built at the unreleased 002cc8ea counts fresh.)
+- **Colour cameras: the brightness of stars on the red plane is read more accurately** (more of its bright stars are kept in the sample that sets the correction). (`c` on OSC, PD-9.)
+- **Two stars too close to separate are no longer measured as one wide star when stacking** (the Blend refusal, 0.7-1.2 % of the fits). (PD-10.)

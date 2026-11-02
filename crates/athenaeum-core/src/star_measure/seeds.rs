@@ -1090,6 +1090,7 @@ pub fn detect(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1097,6 +1098,21 @@ pub fn detect(
 /// ruling Q4: [`domain::background_mesh`] over the same present pixels, with its noise map; moved in, so its
 /// background map is freed once the plane is background-subtracted) and with the plane's saturation inputs (the knot
 /// tests' near-clip exemption); `None` = the mesh computed here, no exemption.
+///
+/// `width_hint` (Plan D D1 r2, a RESCUE since r3): a field width (FWHM, px) the caller already knows for this plane's
+/// stars, for a plane whose pass-1 pool is mostly not stars: an image read through a resampling warp has no 3×3 median
+/// (route E is for a plane stated White), and where its single-pixel defects outnumber its readable stars the pool's
+/// mode lands on them, at the clamp floor, and every real star is flagged extended. The pool's own width is read
+/// first and STANDS - the detection is then bit for bit the one without a hint - unless it failed: it is at the clamp
+/// floor ([`FieldWidth::at_floor`]), it is under the hint's envelope floor (`envelope_floor_factor` × the hint, 0.715:
+/// the width below which a read is no star of the hint's width, the factor of the knot bounds' own envelope), or the
+/// pool read nothing. Then the hint stands in for it: pass 1 still seeds and its reads still set the knot bounds'
+/// star-width envelope, but the knot tests, pass 2 and the report's [`FieldWidth`] run at the hint (clamped to the
+/// module's range), and a `warn!` says so. Why not always: the hint is a fit's width read before the resampler and the
+/// pool's a half-maximum mode read after it, which widens the stars it moves (on undersampled data the pool reads about
+/// a quarter wider), so replacing a healthy read by the hint moved every read of such an image. `None` = the pool's own
+/// mode, the rule everywhere else. A hint that is not a positive number, or is under the narrowest star a half-maximum
+/// read gives (1.607 px), is refused with a `warn!` that names it and the pool's own width is read.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_with(
     plane: &[f32],
@@ -1111,6 +1127,7 @@ pub(crate) fn detect_with(
     mesh: Option<BackgroundMesh>,
     saturation: Option<&SaturationPlane>,
     sub: Option<&SubSteps>,
+    width_hint: Option<f64>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
     if plane.len() != w * h || mask.is_some_and(|m| m.len() != w * h) || w < 3 || h < 3 {
         warn!(
@@ -1149,6 +1166,26 @@ pub(crate) fn detect_with(
             DetectionReport::none(),
         );
     }
+    let width_hint = match width_hint {
+        Some(hint) if hint.is_finite() && hint >= FIELD_WIDTH_FLOOR_READ_PX => Some(hint),
+        // Under the narrowest read, a hint would report "at the floor" with no word (Q4): refused by name.
+        Some(narrow) if narrow.is_finite() && narrow > 0.0 => {
+            warn!(
+                width_hint_px = narrow,
+                floor_px = FIELD_WIDTH_FLOOR_READ_PX,
+                "matched filter: the field-width hint is under the narrowest star a half-maximum read gives; the plane's own width is read"
+            );
+            None
+        }
+        Some(bad) => {
+            warn!(
+                width_hint_px = bad,
+                "matched filter: the field-width hint is not a positive number; the plane's own width is read"
+            );
+            None
+        }
+        None => None,
+    };
     let run = || {
         let mesh = mesh.unwrap_or_else(|| domain::background_mesh(plane, w, h, mask, true));
         detect_on(
@@ -1163,6 +1200,7 @@ pub(crate) fn detect_with(
             mesh,
             saturation,
             sub,
+            width_hint,
         )
     };
     super::install_in_span(pool, run)
@@ -1181,6 +1219,7 @@ fn detect_on(
     mesh: BackgroundMesh,
     saturation: Option<&SaturationPlane>,
     sub: Option<&SubSteps>,
+    width_hint: Option<f64>,
 ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
     let prep_span = substeps::span(sub, Step::DetectPrep);
     let present_at = |i: usize| plane[i].is_finite() && mask.map_or(true, |m| m[i]);
@@ -1321,8 +1360,68 @@ fn detect_on(
     let reads = readable_widths(plane, w, h, &at, mask);
     drop(at);
     let mut widths: Vec<f64> = reads.iter().map(|&(width, _)| width).collect();
-    let (field, mode_px) = field_width_of_reads(&mut widths);
+    let (pool_field, pool_mode_px) = field_width_of_reads(&mut widths);
     drop(widths);
+    // A caller's hint is a rescue (D1 r3): the pool's own width stands unless it failed. The reads still count for
+    // `from_stars` and set the envelope either way.
+    let (field, mode_px, hint_used) = match width_hint {
+        None => (pool_field, pool_mode_px, None),
+        Some(hint) => {
+            let hint_fwhm = hint.clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX);
+            let failed = if pool_field.from_stars == 0 {
+                Some("no_read")
+            } else if pool_field.at_floor() {
+                Some("at_floor")
+            } else if pool_field.fwhm_px < envelope_floor_factor() * hint_fwhm {
+                Some("below_envelope_floor")
+            } else {
+                None
+            };
+            match failed {
+                None => {
+                    debug!(
+                        fwhm_px = pool_field.fwhm_px,
+                        pool_fwhm_px = pool_field.fwhm_px,
+                        from_stars = pool_field.from_stars,
+                        width_hint_px = hint,
+                        reason = "healthy",
+                        "matched filter: field width chosen"
+                    );
+                    (pool_field, pool_mode_px, None)
+                }
+                Some(reason) => {
+                    // A pool that read nothing has no width to report: its 3 px is the first pass's default (review
+                    // r3, n2), so the field is absent, as `mode_px` is.
+                    let pool_read_px = (pool_field.from_stars > 0).then_some(pool_field.fwhm_px);
+                    debug!(
+                        fwhm_px = hint_fwhm,
+                        pool_fwhm_px = pool_read_px,
+                        from_stars = pool_field.from_stars,
+                        width_hint_px = hint,
+                        reason,
+                        "matched filter: field width chosen"
+                    );
+                    warn!(
+                        fwhm_px = hint_fwhm,
+                        pool_fwhm_px = pool_read_px,
+                        mode_px = pool_mode_px,
+                        from_stars = pool_field.from_stars,
+                        width_hint_px = hint,
+                        reason,
+                        "matched filter: the pool's field width failed; the caller's hint is used"
+                    );
+                    (
+                        FieldWidth {
+                            fwhm_px: hint_fwhm,
+                            from_stars: pool_field.from_stars,
+                        },
+                        None,
+                        Some(hint),
+                    )
+                }
+            }
+        }
+    };
     // Never silent (Q4): a width at the clamp floor is recorded, once per detected plane, before pass 2 so no early
     // return skips it.
     if let (true, Some(mode_px)) = (field.at_floor(), mode_px) {
@@ -1376,7 +1475,7 @@ fn detect_on(
         };
         let s = sort_and_merge(std::mem::take(&mut p.seeds));
         (p, s)
-    } else if field.from_stars == 0 && !median_on {
+    } else if field.from_stars == 0 && !median_on && hint_used.is_none() {
         // No width was read: the field width is the first pass's own, so its candidates stand.
         (
             PassOutcome {
@@ -1469,6 +1568,7 @@ fn detect_on(
         spikes = second.spikes,
         stars_detected = kept.len(),
         count = found,
+        width_hint_px = hint_used,
         "matched filter seeds detected"
     );
     (kept, field, report)
@@ -2132,6 +2232,14 @@ fn read_error(nu: f64) -> f64 {
     (READ_ERROR_KAPPA / nu).hypot(READ_ERROR_FLOOR)
 }
 
+/// The factor `1 - KNOT_Z·e(ν₁₀)` = 0.715 of the field width below which a read is no star of that width: a star at least
+/// F wide reads, at the knot tests' [`KNOT_Z`] σ, no narrower than `F·(1 - KNOT_Z·e(ν))`, and e is largest at the
+/// readability gate ν = `WIDTH_START_MIN_PEAK_SNR` ([`read_error`]). The envelope's floor ([`WidthEnvelope`]) and the
+/// width hint's rescue test ([`detect_with`], Plan D D1 r3) are this one number times a width.
+pub(crate) fn envelope_floor_factor() -> f64 {
+    1.0 - KNOT_Z * read_error(WIDTH_START_MIN_PEAK_SNR)
+}
+
 /// The field's star-width envelope (Task 10b A2b; rulings A2-1, A2-2): the FWHM the knot bounds' β 1.5 star is drawn
 /// at, F_env = F_field + [`KNOT_Z`]·s. F_field is the MODE of the stars' widths (A2), so half the real stars are broader
 /// than it, and a bound at F_field flags them extended; the bound sits at the widths' upper envelope at the knot tests'
@@ -2173,7 +2281,7 @@ impl WidthEnvelope {
     /// The envelope of the readable reads `reads` (width px, peak SNR; any order) about the field width `field` (see
     /// [`WidthEnvelope`]); one `warn!` when no read lies between the floor and the field width.
     fn of(reads: &[(f64, f64)], field: f64) -> WidthEnvelope {
-        let floor = field * (1.0 - KNOT_Z * read_error(WIDTH_START_MIN_PEAK_SNR));
+        let floor = field * envelope_floor_factor();
         let mut below: Vec<f64> = Vec::new();
         let mut noise_var = 0.0f64;
         for &(width, snr) in reads {
@@ -2719,6 +2827,7 @@ mod tests {
             mesh,
             None,
             None,
+            None,
         )
     }
 
@@ -2795,6 +2904,226 @@ mod tests {
             (fw.fwhm_px / f_twin - 1.0).abs() <= 0.1,
             "events {fw:?} vs the event-free twin {f_twin}"
         );
+    }
+
+    /// `detect_with` as a caller with a field-width hint calls it (Plan D D1 r3): on the calling thread (no pool, so a
+    /// log capture sees its events), a White plane at the default threshold, the pool's width and `hint` the caller's.
+    fn detect_hinted(
+        scaled: &[f32],
+        (w, h): (usize, usize),
+        hint: Option<f64>,
+    ) -> (Vec<Seed>, FieldWidth, DetectionReport) {
+        let (noise, _) = domain::noise_model(scaled, w, h, None);
+        detect_with(
+            scaled,
+            w,
+            h,
+            &noise,
+            DEFAULT_THRESHOLD,
+            24576,
+            None,
+            None,
+            PixelNoise::White,
+            None,
+            None,
+            None,
+            hint,
+        )
+    }
+
+    /// [`detect_hinted`] and everything it logged.
+    fn detect_hinted_logged(
+        scaled: &[f32],
+        size: (usize, usize),
+        hint: Option<f64>,
+    ) -> ((Vec<Seed>, FieldWidth, DetectionReport), String) {
+        let mut out = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            out = Some(detect_hinted(scaled, size, hint));
+        });
+        (out.unwrap(), logs)
+    }
+
+    /// 300 Moffat stars of FWHM 5 px with noise, scaled: the pool reads about 5 px and is healthy.
+    fn healthy_pool_field() -> Vec<f32> {
+        let (mut data, _, sigma) = broad_star_field();
+        add_noise(&mut data, sigma as f32, 302);
+        working(&data)
+    }
+
+    const BROAD: (usize, usize) = (2048, 2048);
+    const WIDTH_CHOSEN: &str = "matched filter: field width chosen";
+    const WIDTH_RESCUED: &str =
+        "matched filter: the pool's field width failed; the caller's hint is used";
+
+    /// Plan D D1 r3 (review r2, I1): a width hint is a rescue, not a replacement. A pool whose width is not under the
+    /// hint's envelope floor (the factor the knot bounds' own envelope uses, `1 - KNOT_Z * e(10)` = 0.715) stands: the
+    /// detection is bit for bit the one without a hint, whatever the hint (wider, narrower, equal), and the choice is
+    /// a `debug!` that says why.
+    #[test]
+    fn a_width_hint_leaves_a_healthy_pools_width_alone() {
+        let scaled = healthy_pool_field();
+        let plain = detect_hinted(&scaled, BROAD, None);
+        let own = plain.1;
+        assert!(
+            (own.fwhm_px / 5.0 - 1.0).abs() <= 0.1 && own.from_stars >= 100 && !own.at_floor(),
+            "{own:?}"
+        );
+        let want = detect_digest(&plain);
+        // The widest hint the pool's width still stands against: own = factor * hint.
+        let edge = own.fwhm_px / envelope_floor_factor();
+        for hint in [
+            0.5 * own.fwhm_px,
+            own.fwhm_px,
+            1.2 * own.fwhm_px,
+            0.97 * edge,
+        ] {
+            let (out, logs) = detect_hinted_logged(&scaled, BROAD, Some(hint));
+            assert_eq!(
+                detect_digest(&out),
+                want,
+                "hint {hint}: {:?} vs {own:?}",
+                out.1
+            );
+            assert_eq!(out.1, own, "hint {hint}");
+            assert_eq!(
+                logs.matches(WIDTH_CHOSEN).count(),
+                1,
+                "hint {hint}:\n{logs}"
+            );
+            assert!(logs.contains("reason=\"healthy\""), "hint {hint}:\n{logs}");
+            assert!(!logs.contains(WIDTH_RESCUED), "hint {hint}:\n{logs}");
+        }
+    }
+
+    /// Plan D D1 r3: the pool's width under the hint's envelope floor is what the rescue answers - the report's width
+    /// is then the hint (clamped to the module's range) over the same pool of reads, the seeds are the hinted pass 2's,
+    /// and the rescue is a `warn!` that names the hint, the pool's width and the reason.
+    #[test]
+    fn a_pool_width_under_the_hints_envelope_floor_takes_the_hint() {
+        let scaled = healthy_pool_field();
+        let own = detect_hinted(&scaled, BROAD, None).1;
+        let edge = own.fwhm_px / envelope_floor_factor();
+        for hint in [1.03 * edge, 2.0 * own.fwhm_px, 100.0] {
+            let (out, logs) = detect_hinted_logged(&scaled, BROAD, Some(hint));
+            assert!(!out.0.is_empty(), "hint {hint}");
+            assert_eq!(
+                out.1.fwhm_px,
+                hint.clamp(FIELD_WIDTH_MIN_PX, FIELD_WIDTH_MAX_PX),
+                "hint {hint}"
+            );
+            assert_eq!(
+                out.1.from_stars, own.from_stars,
+                "hint {hint}: the same pool of reads"
+            );
+            assert_eq!(
+                logs.matches(WIDTH_RESCUED).count(),
+                1,
+                "hint {hint}:\n{logs}"
+            );
+            let line = logs.lines().find(|l| l.contains(WIDTH_RESCUED)).unwrap();
+            assert!(
+                line.contains("WARN") && line.contains("reason=\"below_envelope_floor\""),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("width_hint_px={hint}")) && line.contains("pool_fwhm_px="),
+                "{line}"
+            );
+        }
+    }
+
+    /// Plan D D1 r3: a pool whose width is at the clamp floor (the single-pixel defects of a plane with no detection
+    /// median, hc11 G) is rescued by a hint that is NOT over the envelope floor by itself - the at-floor condition
+    /// answers on its own.
+    #[test]
+    fn a_pool_at_the_clamp_floor_takes_the_hint() {
+        let size = (1024usize, 1024usize);
+        let sharp = working(&gaussian_stars_field(1.2, 311));
+        let plain = detect_hinted(&sharp, size, None);
+        assert!(
+            plain.1.from_stars >= 20 && plain.1.at_floor(),
+            "{:?}",
+            plain.1
+        );
+        // 1.7 px: over the narrowest read (1.607), and the pool's 1.5 is NOT under 0.715 * 1.7.
+        let hint = 1.7;
+        assert!(plain.1.fwhm_px >= envelope_floor_factor() * hint);
+        let (out, logs) = detect_hinted_logged(&sharp, size, Some(hint));
+        assert_eq!(out.1.fwhm_px, hint);
+        assert_eq!(out.1.from_stars, plain.1.from_stars);
+        assert!(!out.1.at_floor(), "{:?}", out.1);
+        let line = logs
+            .lines()
+            .find(|l| l.contains(WIDTH_RESCUED))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert!(
+            line.contains("reason=\"at_floor\"") && line.contains("mode_px="),
+            "{line}"
+        );
+    }
+
+    /// Plan D D1 r3: a pool that read nothing has no width to keep; the hint stands (the r2 behaviour, there being
+    /// nothing a hint could replace).
+    #[test]
+    fn a_pool_that_reads_nothing_takes_the_hint() {
+        let (data, w, h) = fixture_field(7, 0.05, 0.002);
+        let scaled = working(&data);
+        let plain = detect_hinted(&scaled, (w, h), None);
+        assert_eq!(
+            (plain.1.from_stars, plain.1.fwhm_px),
+            (0, FIRST_PASS_FWHM_PX)
+        );
+        let (out, logs) = detect_hinted_logged(&scaled, (w, h), Some(4.0));
+        assert_eq!((out.1.fwhm_px, out.1.from_stars), (4.0, 0));
+        assert!(logs.contains("reason=\"no_read\""), "{logs}");
+        // Review r3, n2: the pool's 3 px is the first pass's default, not a read, so the lines do not report it as one.
+        for line in logs.lines().filter(|l| l.contains("reason=\"no_read\"")) {
+            assert!(!line.contains("pool_fwhm_px="), "{line}");
+        }
+        assert_eq!(
+            logs.lines()
+                .filter(|l| l.contains("reason=\"no_read\""))
+                .count(),
+            2,
+            "{logs}"
+        );
+    }
+
+    /// Plan D D1 r3 (review r2, m3): a hint that is no star width is refused with a `warn!` that names it and the plane's
+    /// own width is read, as without a hint, bit for bit - not a number, not positive, or under the narrowest star a
+    /// half-maximum read gives (1.607 px; the rest of the module calls a width below it "at the floor", and a hint there
+    /// would report that without a word).
+    #[test]
+    fn a_hint_that_is_no_star_width_is_refused_by_name() {
+        let scaled = healthy_pool_field();
+        let want = detect_digest(&detect_hinted(&scaled, BROAD, None));
+        for (hint, message) in [
+            (f64::NAN, "is not a positive number"),
+            (f64::INFINITY, "is not a positive number"),
+            (0.0, "is not a positive number"),
+            (-3.0, "is not a positive number"),
+            (1.2, "is under the narrowest star"),
+            (1.6, "is under the narrowest star"),
+        ] {
+            let (out, logs) = detect_hinted_logged(&scaled, BROAD, Some(hint));
+            assert_eq!(detect_digest(&out), want, "hint {hint}");
+            let line = logs
+                .lines()
+                .find(|l| l.contains(message))
+                .unwrap_or_else(|| panic!("hint {hint}: no '{message}' in\n{logs}"));
+            assert!(
+                line.contains("WARN") && line.contains(&format!("width_hint_px={hint}")),
+                "{line}"
+            );
+            assert!(
+                !logs.contains(WIDTH_CHOSEN) && !logs.contains(WIDTH_RESCUED),
+                "hint {hint}:\n{logs}"
+            );
+        }
+        // The narrowest read itself is a star width: it is taken (and stands or rescues like any other).
+        let (_, logs) = detect_hinted_logged(&scaled, BROAD, Some(FIELD_WIDTH_FLOOR_READ_PX));
+        assert!(!logs.contains("is under the narrowest star"), "{logs}");
     }
 
     /// The reference median of `d`'s window at `(x, y)` over its present pixels, by a full sort.
