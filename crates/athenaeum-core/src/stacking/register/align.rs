@@ -13,8 +13,8 @@ use super::wcs_seed::seed_radius_px;
 use super::local_loop;
 use super::{DistortionChoice, ModelChoice, RegistrationConfig, SCALE_TOLERANCE};
 // One import path for everything `geometry` re-exports at its root (fix
-// round 1, minor 10); `DOMAIN_MARGIN` is the one item that lives only in
-// its own module.
+// round 1, minor 10); `DOMAIN_MARGIN`, `degenerate` and `SplitMix64` are
+// the items that live only in their own modules.
 use crate::geometry::polynomial::DOMAIN_MARGIN;
 use crate::geometry::ransac::{degenerate, SplitMix64};
 use crate::geometry::{
@@ -112,6 +112,10 @@ pub enum AlignError {
     /// against rather than a constant that may not have been used.
     ScaleOutOfRange { scale: f64, expected: f64 },
     RmsTooHigh { rms_px: f64, max_rms_px: f64 },
+    /// RQ-10: the map's inliers cover `coverage` of the 4 x 4 grid over the
+    /// overlap, which holds `cells` cells with an eligible star (see
+    /// [`coverage`]), under [`MIN_COVERAGE`].
+    LowCoverage { coverage: f64, cells: usize },
 }
 
 impl fmt::Display for AlignError {
@@ -149,6 +153,10 @@ impl fmt::Display for AlignError {
             AlignError::RmsTooHigh { rms_px, max_rms_px } => {
                 write!(f, "RMS {rms_px:.2} px above {max_rms_px:.2}")
             }
+            AlignError::LowCoverage { coverage, .. } => write!(
+                f,
+                "registration inliers cover {coverage:.2} of the overlap (min {MIN_COVERAGE:.2})"
+            ),
         }
     }
 }
@@ -220,6 +228,9 @@ pub struct Alignment {
     pub quality_score: f64,
     pub overlap: f64,
     pub regularity: f64,
+    /// How much of the overlap the refit inliers cover (RQ-10, [`coverage`]):
+    /// at least [`MIN_COVERAGE`] for any frame that registered.
+    pub coverage: f64,
     pub ransac_iterations: usize,
     pub refit_rounds: usize,
     /// Rounds of the local distortion loop whose corrector was actually
@@ -613,6 +624,9 @@ pub const COVERAGE_GRID: usize = 4;
 /// The grid over the reference that decides which subject stars can be
 /// judged at all (RQ-10 (a)): 16 x 16 cells.
 pub const REFERENCE_OCCUPANCY_GRID: usize = 16;
+/// A map whose inliers cover less of the overlap than this is refused
+/// (RQ-10): 12 of 16 cells on a dense overlap.
+pub const MIN_COVERAGE: f64 = 0.75;
 
 /// How much of the overlap a map's inliers cover (RQ-10 (a)-(c)), in subject
 /// pixels. Returns `(coverage, cells)`: the share of the 4 x 4 grid's cells
@@ -813,6 +827,9 @@ fn quad_failure_reason(e: &AlignError) -> String {
         AlignError::NoSeed { matches, .. } => format!("{matches} quad matches"),
         AlignError::TooFewMatches { matches } => format!("{matches} correspondences"),
         AlignError::TooFewInliers { inliers } => format!("{inliers} inliers"),
+        AlignError::LowCoverage { coverage, .. } => {
+            format!("map covers {coverage:.2} of the overlap")
+        }
         other => other.to_string(),
     }
 }
@@ -881,6 +898,96 @@ fn ransac_and_refit(
         });
     }
     Ok((ransac, refit, kind))
+}
+
+/// What a seed that survived [`fit_from_seed`] leaves: the RANSAC and refit
+/// of the final pairing, the linear kind, how many pairs the step-4b
+/// re-pairing added, and the coverage the gate measured.
+type SeedFit = (RansacResult, RefitResult, LinearKind, usize, f64);
+
+/// Steps 2-4b for one seed, and the coverage gate last (RQ-10): the pairing
+/// and fit of [`pair_and_fit`], one re-pairing through the refit model (the
+/// seed is an affine fitted on the matched quads and its accuracy falls off
+/// with distance from them, so a rotated or rescaled subject pairs only
+/// near them; one pass through the refit model recovers the rest of the
+/// field), then [`coverage`] of the refit's inliers over the overlap. A map
+/// whose inliers cover less of it than [`MIN_COVERAGE`] is refused with
+/// [`AlignError::LowCoverage`], whichever seed produced it.
+///
+/// The [`Pairing`] comes back either way, so a caller that falls back to the
+/// other seed (M4b) can say how far this one got. The warnings are this
+/// attempt's own (the 4b re-pairing's); a caller that discards the attempt
+/// discards them.
+#[allow(clippy::too_many_arguments)]
+fn fit_from_seed(
+    seed: &Linear,
+    subject: &[Star],
+    reference: &[Star],
+    sub_pts: &[(f64, f64)],
+    ref_pts: &[(f64, f64)],
+    tree: &KdTree2,
+    radius: f64,
+    cfg: &RegistrationConfig,
+    reference_geometry: (usize, usize),
+) -> (Pairing, Result<SeedFit, AlignError>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let (mut pairing, fitted) = pair_and_fit(
+        seed,
+        subject,
+        reference,
+        tree,
+        radius,
+        cfg,
+        reference_geometry,
+    );
+    let (mut ransac, mut refit, mut kind) = match fitted {
+        Ok(f) => f,
+        Err(e) => return (pairing, Err(e), warnings),
+    };
+
+    // 4b. Re-pair through the refit model.
+    let mut repaired = 0usize;
+    let again = pair_through(&refit.linear, subject, reference, tree, radius);
+    if again.pairs.len() > pairing.pairs.len() {
+        match ransac_and_refit(&again, cfg, reference_geometry) {
+            Ok((r2, f2, k2)) => {
+                repaired = again.pairs.len() - pairing.pairs.len();
+                pairing = again;
+                ransac = r2;
+                refit = f2;
+                kind = k2;
+            }
+            Err(e) => warnings.push(format!(
+                "re-pairing through the refit model failed ({e}); seed pairs kept"
+            )),
+        }
+    }
+
+    // The gate: the refit's inliers (the subject side of their pairs)
+    // against the overlap the refit's own map defines.
+    let inlier_pts: Vec<(f64, f64)> = refit.inliers.iter().map(|&i| pairing.pairs[i].0).collect();
+    let (covered, cells) = coverage(
+        sub_pts,
+        ref_pts,
+        &inlier_pts,
+        &refit.linear,
+        reference_geometry,
+    );
+    if covered < MIN_COVERAGE {
+        return (
+            pairing,
+            Err(AlignError::LowCoverage {
+                coverage: covered,
+                cells,
+            }),
+            warnings,
+        );
+    }
+    (
+        pairing,
+        Ok((ransac, refit, kind, repaired, covered)),
+        warnings,
+    )
 }
 
 /// Fit the distortion jointly with the linear part's affine correction
@@ -1249,6 +1356,12 @@ pub(super) fn build_map(
 /// and a warning records the switch. A frame with no hint takes exactly
 /// the M1 path, quad seed and error messages alike.
 ///
+/// A seed also fails when its map is not carried by the overlap (RQ-10):
+/// the last check of [`fit_from_seed`] is [`coverage`] against
+/// [`MIN_COVERAGE`], and a refusal takes the same one turn each way. A
+/// frame refused both ways fails with [`AlignError::LowCoverage`]; one that
+/// passes keeps the map, warnings and error texts it had before the gate.
+///
 /// `scale_gate` is the window the refitted linear scale must land in —
 /// [`super::scale_gate_for`] centres it on the frame's own expected ratio
 /// to the reference, so a genuinely binned frame is judged against 2.0
@@ -1347,35 +1460,45 @@ pub fn align(
         }
     };
 
-    // 2–4. Correspondences through the seed (nearest reference star within
-    // 2·tol), then RANSAC and the σ-weighted refit — with one turn for
-    // whichever seed did not lead. Either way the error a frame that fails
-    // BOTH ways reports is the quad path's, which is the one every M1-era
-    // message named.
-    let (mut pairing, mut fitted) = pair_and_fit(
+    // 2–4b. Correspondences through the seed (nearest reference star within
+    // 2·tol), then RANSAC, the σ-weighted refit, the re-pairing and the
+    // coverage gate — with one turn for whichever seed did not lead. Either
+    // way the error a frame that fails BOTH ways reports is the quad path's,
+    // which is the one every M1-era message named. A discarded attempt's
+    // warnings go with it.
+    let (mut pairing, mut fitted, mut fit_warnings) = fit_from_seed(
         &seed,
         subject,
         reference,
+        &sub_pts,
+        &ref_pts,
         &tree,
         radius,
         cfg,
         reference_geometry,
     );
-    if fitted.is_err() {
+    if let Err(lead_err) = &fitted {
         match fallback {
             Fallback::None => {}
             Fallback::ToQuads => {
+                // A refused map says how much of the overlap it covered; any
+                // other failure, how many stars it paired.
+                let reason = match lead_err {
+                    AlignError::LowCoverage { .. } => quad_failure_reason(lead_err),
+                    _ => format!("{} pairs", pairing.pairs.len()),
+                };
                 warnings.push(format!(
-                    "wcs seed pairing failed ({} pairs); quad seed used",
-                    pairing.pairs.len()
+                    "wcs seed pairing failed ({reason}); quad seed used"
                 ));
                 let (quad, matches) = seed_affine(&sub_pts, &ref_pts, true)?;
                 seed_matches = matches;
                 seed_kind = SeedKind::Quads;
-                let retry = pair_and_fit(
+                let retry = fit_from_seed(
                     &quad,
                     subject,
                     reference,
+                    &sub_pts,
+                    &ref_pts,
                     &tree,
                     radius,
                     cfg,
@@ -1383,22 +1506,22 @@ pub fn align(
                 );
                 pairing = retry.0;
                 fitted = retry.1;
+                fit_warnings = retry.2;
             }
             Fallback::ToWcs => {
-                // Ruling R-T6-9. The quad seed paired or fitted too little;
-                // the hint gets the same pairing/RANSAC/refit treatment.
-                // A retry that also fails leaves the quad path's verdict
-                // standing rather than replacing it with the seed's.
-                let quad_reason = fitted
-                    .as_ref()
-                    .err()
-                    .map(quad_failure_reason)
-                    .unwrap_or_default();
+                // Ruling R-T6-9. The quad seed paired or fitted too little,
+                // or its map covers too little of the overlap; the hint gets
+                // the same pairing/RANSAC/refit/gate treatment. A retry that
+                // also fails leaves the quad path's verdict standing rather
+                // than replacing it with the seed's.
+                let quad_reason = quad_failure_reason(lead_err);
                 if let Ok(h) = confirm_hint() {
-                    let retry = pair_and_fit(
+                    let retry = fit_from_seed(
                         &h,
                         subject,
                         reference,
+                        &sub_pts,
+                        &ref_pts,
                         &tree,
                         radius,
                         cfg,
@@ -1412,34 +1535,14 @@ pub fn align(
                         seed_kind = SeedKind::Wcs;
                         pairing = retry.0;
                         fitted = retry.1;
+                        fit_warnings = retry.2;
                     }
                 }
             }
         }
     }
-    let (mut ransac, mut refit, mut kind) = fitted?;
-
-    // 4b. Re-pair through the refit model: the seed is an affine fitted on
-    // the matched quads and its accuracy falls off with distance from them
-    // (a 1e-3 relative error is 6 px at the far edge, beyond the pairing
-    // radius), so a rotated or rescaled subject pairs only near them. One
-    // pass through the refit model recovers the rest of the field.
-    let mut repaired = 0usize;
-    let again = pair_through(&refit.linear, subject, reference, &tree, radius);
-    if again.pairs.len() > pairing.pairs.len() {
-        match ransac_and_refit(&again, cfg, reference_geometry) {
-            Ok((r2, f2, k2)) => {
-                repaired = again.pairs.len() - pairing.pairs.len();
-                pairing = again;
-                ransac = r2;
-                refit = f2;
-                kind = k2;
-            }
-            Err(e) => warnings.push(format!(
-                "re-pairing through the refit model failed ({e}); seed pairs kept"
-            )),
-        }
-    }
+    let (ransac, refit, kind, repaired, coverage) = fitted?;
+    warnings.extend(fit_warnings);
     let pairs = &pairing.pairs;
     let sigmas = &pairing.sigmas;
     let all_sigmas = pairing.all_sigmas;
@@ -1557,6 +1660,7 @@ pub fn align(
         quality_score: ransac.quality.score,
         overlap: ransac.quality.overlap,
         regularity: ransac.quality.regularity,
+        coverage,
         ransac_iterations: ransac.iterations,
         refit_rounds: refit.rounds,
         local_rounds,
@@ -2844,13 +2948,22 @@ mod tests {
     /// LOCAL group of four is common to both and the quad matcher has
     /// nothing to seed from; an exact transform pairs all ten at once.
     fn disjoint_population_scene() -> (Vec<Star>, Vec<Star>, Linear) {
+        let sites: Vec<(f64, f64)> = (0..5)
+            .flat_map(|i| (0..2).map(move |j| (i, j)))
+            .map(|(i, j)| (300.0 + i as f64 * 340.0, 400.0 + j as f64 * 600.0))
+            .collect();
+        disjoint_scene_at(&sites)
+    }
+
+    /// [`disjoint_population_scene`] with the shared stars at `sites`.
+    fn disjoint_scene_at(sites: &[(f64, f64)]) -> (Vec<Star>, Vec<Star>, Linear) {
         let truth = similarity(1.0, 2.0, 9.0, -6.0);
         let mut rng = SplitMix64(71);
-        let shared: Vec<Star> = (0..5)
-            .flat_map(|i| (0..2).map(move |j| (i, j)))
-            .map(|(i, j)| Star {
-                x: 300.0 + i as f64 * 340.0,
-                y: 400.0 + j as f64 * 600.0,
+        let shared: Vec<Star> = sites
+            .iter()
+            .map(|&(x, y)| Star {
+                x,
+                y,
                 flux: 500.0 + rng.next_f64() * 500.0,
                 sigma: Some((0.05, 0.05)),
             })
@@ -2889,9 +3002,18 @@ mod tests {
     /// (a) Ruling R-T6-9: under `QuadFirst` — every same-scale frame — a
     /// quad seed that cannot carry the frame is not the end of it. The
     /// plate-solve seed gets one turn and says so.
+    ///
+    /// RG2: the shared stars here are sixteen, one in each cell of the grid
+    /// over the overlap. With ten of them in half of the cells the coverage
+    /// gate refuses the plate-solve map (see
+    /// `a_plate_solve_map_resting_on_ten_shared_stars_is_refused`).
     #[test]
     fn the_plate_solve_seed_is_the_quad_seeds_fallback() {
-        let (sub, refs, truth) = disjoint_population_scene();
+        let sites: Vec<(f64, f64)> = (0..4)
+            .flat_map(|i| (0..4).map(move |j| (i, j)))
+            .map(|(i, j)| (265.0 + i as f64 * 490.0, 203.0 + j as f64 * 365.0))
+            .collect();
+        let (sub, refs, truth) = disjoint_scene_at(&sites);
         let (ref_geo, sub_geo) = disjoint_geometry();
         let cfg = RegistrationConfig::default();
 
@@ -3131,6 +3253,11 @@ mod tests {
                     SeedRoute::Consensus,
                     "corner {corner_px} seed {s}"
                 );
+                assert!(
+                    seed.fits >= 2,
+                    "corner {corner_px} seed {s}: the loop ran {} fit(s), so it re-admitted nothing",
+                    seed.fits
+                );
                 assert_eq!(seed.dropped(), 0, "corner {corner_px} seed {s}");
                 assert_eq!(
                     bits(&seed.affine),
@@ -3363,6 +3490,19 @@ mod tests {
         assert_eq!(
             coverage(&lattice, &lattice, &lattice, &shift, geo),
             (1.0, 16)
+        );
+
+        // An inlier outside the eligible box counts for nothing: the lattice
+        // stars with x < 800 or y < 800 are outside the box of the 64 stars
+        // the shift images into the frame.
+        let outside: Vec<(f64, f64)> = lattice
+            .iter()
+            .copied()
+            .filter(|&(x, y)| x < 800.0 || y < 800.0)
+            .collect();
+        assert_eq!(
+            coverage(&lattice, &lattice, &outside, &shift, geo),
+            (0.0, 16)
         );
 
         // A zero-width box is one column: five stars on x = 850.
@@ -3652,5 +3792,703 @@ mod tests {
             run += 1;
         }
         assert!(run >= 20, "only {run} deletions ran");
+    }
+
+    // ---------------------------------------------------------------
+    // The coverage gate (RQ-10, RG2).
+    // ---------------------------------------------------------------
+
+    /// Largest distance between an alignment's map and the truth's over a
+    /// 33 x 23 grid on `frame`, counting only the points whose truth image
+    /// satisfies `keep`. Panics when too few points qualify, so a region
+    /// that came out empty cannot pass for exact.
+    fn map_error_in(
+        a: &Alignment,
+        truth: &Linear,
+        frame: (f64, f64),
+        keep: &dyn Fn(f64, f64) -> bool,
+    ) -> f64 {
+        let mut worst = 0.0f64;
+        let mut counted = 0usize;
+        for j in 0..23 {
+            for i in 0..33 {
+                let x = frame.0 * i as f64 / 32.0;
+                let y = frame.1 * j as f64 / 22.0;
+                let (tx, ty) = truth.apply(x, y);
+                if !keep(tx, ty) {
+                    continue;
+                }
+                let (fx, fy) = a.map.forward(x, y);
+                worst = worst.max((fx - tx).hypot(fy - ty));
+                counted += 1;
+            }
+        }
+        assert!(counted >= 20, "only {counted} grid points in the region");
+        worst
+    }
+
+    /// `fit_from_seed` at the default configuration, the way `align` calls it.
+    fn gate_run(
+        sub: &[Star],
+        refs: &[Star],
+        seed: &Linear,
+        geo: (usize, usize),
+    ) -> (Pairing, Result<SeedFit, AlignError>, Vec<String>) {
+        let cfg = RegistrationConfig::default();
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        fit_from_seed(
+            seed,
+            sub,
+            refs,
+            &sub_pts,
+            &ref_pts,
+            &tree,
+            2.0 * cfg.ransac_tolerance_px,
+            &cfg,
+            geo,
+        )
+    }
+
+    /// `truth` after a scale error `(ex, ey)` about the subject-frame point
+    /// `c`: right where `ex * |x - c.0|` and `ey * |y - c.1|` stay inside the
+    /// pairing radius, wrong everywhere else.
+    fn band_seed(truth: &Linear, c: (f64, f64), e: (f64, f64)) -> Linear {
+        let error = Linear::from_flat(
+            LinearKind::Affine,
+            [1.0 + e.0, 0.0, -e.0 * c.0, 0.0, 1.0 + e.1, -e.1 * c.1, 0.0, 0.0, 1.0],
+        );
+        compose(truth, &error)
+    }
+
+    /// The decoy scene's band seed: a scale error about the subject frame's
+    /// first corner, so the 3.8 px pairing holds only near it. At 1e-2 it
+    /// pairs 17 of the 1 793 stars the truth pairs, those within about
+    /// 380 px of the corner, and the fit on them covers 0.19 of the overlap
+    /// after the 4b re-pairing (refused from 5e-3 to 1.2e-2 but for 7e-3,
+    /// which recovers). The plan's first value, 2e-3, pairs 237 stars over
+    /// a quarter disc of about 1 900 px: the fit on them extrapolates to
+    /// 0.01 px, the 4b re-pairing recovers the whole field and the gate has
+    /// nothing to refuse.
+    const BAND_EPS: (f64, f64) = (1e-2, 1e-2);
+
+    #[test]
+    fn a_band_supported_map_is_refused_for_low_coverage() {
+        let (sub, refs, truth) = decoy_scene(1);
+        assert_decoy_guards(&sub, &refs, &truth);
+        let (ref_geo, _) = decoy_geometry();
+        let seed = band_seed(&truth, (0.0, 0.0), BAND_EPS);
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        let at_seed = pair_through(&seed, &sub, &refs, &tree, 3.8).pairs.len();
+        let at_truth = pair_through(&truth, &sub, &refs, &tree, 3.8).pairs.len();
+        assert!(
+            at_seed >= MIN_INLIERS && at_seed * 5 <= at_truth,
+            "guard: the seed pairs {at_seed} of the {at_truth} stars the truth pairs"
+        );
+        match gate_run(&sub, &refs, &seed, ref_geo).1 {
+            Err(AlignError::LowCoverage { coverage, cells }) => {
+                assert!(coverage < MIN_COVERAGE, "coverage {coverage}");
+                assert!(cells > 0);
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok((_, refit, _, _, covered)) => panic!(
+                "accepted: coverage {covered:.2}, {} inliers",
+                refit.inliers.len()
+            ),
+        }
+    }
+
+    /// A reference with a cloud over its right half: the subject stars that
+    /// land there have nowhere to pair, and the gate does not count them.
+    #[test]
+    fn a_reference_with_a_starless_half_refuses_no_subject() {
+        let (sub, mut refs, truth) = decoy_scene(1);
+        let half = SEED_REFERENCE.0 / 2.0;
+        let starred: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        refs.retain(|s| s.x < half);
+        let into_cloud = sub
+            .iter()
+            .filter(|s| truth.apply(s.x, s.y).0 >= half)
+            .count();
+        assert!(
+            into_cloud * 10 >= sub.len() * 4,
+            "guard: {into_cloud} of {} subject stars land under the cloud",
+            sub.len()
+        );
+        let (ref_geo, sub_geo) = decoy_geometry();
+        // The mechanism: the same inliers (every star imaged into the left
+        // half) cover half the overlap when the whole reference is starred
+        // and all of it when only the left half is.
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let left_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let imaged_left: Vec<(f64, f64)> = sub_pts
+            .iter()
+            .copied()
+            .filter(|&(x, y)| truth.apply(x, y).0 < half)
+            .collect();
+        let (starred_cover, _) = coverage(&sub_pts, &starred, &imaged_left, &truth, ref_geo);
+        let (cloud_cover, _) = coverage(&sub_pts, &left_pts, &imaged_left, &truth, ref_geo);
+        assert!(
+            starred_cover < MIN_COVERAGE && cloud_cover >= MIN_COVERAGE,
+            "guard: {starred_cover} with every cell starred, {cloud_cover} under the cloud"
+        );
+        let a = align_default(&sub, &refs, ref_geo, sub_geo, &RegistrationConfig::default())
+            .expect("the left half aligns");
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        let left = map_error_in(&a, &truth, SEED_SUBJECT, &|x, _| x < half);
+        assert!(left <= 0.1, "{left} px off truth over the left half");
+    }
+
+    #[test]
+    fn a_low_coverage_wcs_map_falls_back_to_the_quad_seed() {
+        let (sub, refs, truth) = decoy_scene(1);
+        assert_decoy_guards(&sub, &refs, &truth);
+        let (ref_geo, sub_geo) = decoy_geometry();
+        let band = band_seed(&truth, (0.0, 0.0), BAND_EPS);
+        let a = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&band),
+            SeedPolicy::WcsFirst,
+            SCALE_RANGE,
+        )
+        .expect("the quad seed carries the frame");
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert!(a.seed_matches > 0, "the quad seed's own match count");
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        assert!(
+            map_error(&a, &truth) <= 0.1,
+            "map {} px off",
+            map_error(&a, &truth)
+        );
+        assert_eq!(a.warnings.len(), 1, "{:?}", a.warnings);
+        let covered: f64 = a.warnings[0]
+            .strip_prefix("wcs seed pairing failed (map covers ")
+            .and_then(|w| w.strip_suffix(" of the overlap); quad seed used"))
+            .unwrap_or_else(|| panic!("not the switch warning's shape: {:?}", a.warnings))
+            .parse()
+            .expect("the coverage prints as a number");
+        assert!(covered < MIN_COVERAGE, "{covered}");
+    }
+
+    /// Stars of a dense cluster in one subject cell of the 4 x 4 grid.
+    const COMPACT_STARS: usize = 3000;
+    const COMPACT_BOX: ((f64, f64), (f64, f64)) = ((1700.0, 200.0), (2900.0, 1000.0));
+
+    /// The decoy scene plus a dense cluster of subject stars whose images
+    /// the reference holds twice: at their true place with the scene's usual
+    /// 18 % loss, and as complete copies at (-2 405, 0) px. Its copies'
+    /// quads match the cluster's quads whole, so the false quad matches at
+    /// that one offset outnumber the true ones.
+    fn compact_decoy_scene(seed: u64, stars: usize) -> (Vec<Star>, Vec<Star>, Linear) {
+        let (mut subject, mut reference, truth) = decoy_scene(seed);
+        let mut rng = SplitMix64(seed ^ 0xC1A5);
+        let (lo, hi) = COMPACT_BOX;
+        let jitter = |rng: &mut SplitMix64| (rng.next_f64() - 0.5) * 0.1;
+        for _ in 0..stars {
+            let star = Star {
+                x: lo.0 + rng.next_f64() * (hi.0 - lo.0),
+                y: lo.1 + rng.next_f64() * (hi.1 - lo.1),
+                flux: 200.0 + rng.next_f64() * 600.0,
+                sigma: Some((0.05, 0.05)),
+            };
+            let (x, y) = truth.apply(star.x, star.y);
+            if rng.next_f64() >= 0.18 {
+                reference.push(Star {
+                    x: x + jitter(&mut rng),
+                    y: y + jitter(&mut rng),
+                    ..star.clone()
+                });
+            }
+            reference.push(Star {
+                x: x - 2405.0 + jitter(&mut rng),
+                y: y + jitter(&mut rng),
+                ..star.clone()
+            });
+            subject.push(star);
+        }
+        for v in [&mut subject, &mut reference] {
+            for i in (1..v.len()).rev() {
+                let j = rng.below(i + 1);
+                v.swap(i, j);
+            }
+        }
+        (subject, reference, truth)
+    }
+
+    /// Review r2 I3. A dense cluster of subject stars inside one of the 16
+    /// cells, present in the reference at one false offset, makes the false
+    /// quad matches the larger consistent group: any estimator takes it, and
+    /// the map it fits pairs the cluster and nothing else. The gate sees
+    /// that the inliers cover a sliver of the overlap and refuses; the frame
+    /// has no other seed and fails, never `Ok` on a wrong map.
+    ///
+    /// The other half of RQ-10, by design: a copy spread over the WHOLE
+    /// field has inliers in every cell, and no estimator and no gate can tell
+    /// it from the field.
+    #[test]
+    fn a_compact_decoy_majority_is_refused() {
+        let (sub, refs, truth) = compact_decoy_scene(1, COMPACT_STARS);
+        let (ref_geo, sub_geo) = decoy_geometry();
+        // Guards: the cluster sits in at most 2 of the 16 subject cells, and
+        // its false matches outnumber the true ones.
+        let cells: std::collections::BTreeSet<(usize, usize)> = sub
+            .iter()
+            .filter(|s| {
+                let (lo, hi) = COMPACT_BOX;
+                (lo.0..=hi.0).contains(&s.x) && (lo.1..=hi.1).contains(&s.y)
+            })
+            .map(|s| {
+                (
+                    (s.x / (SEED_SUBJECT.0 / 4.0)) as usize,
+                    (s.y / (SEED_SUBJECT.1 / 4.0)) as usize,
+                )
+            })
+            .collect();
+        assert!(cells.len() <= 2, "guard: the cluster spans {cells:?}");
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let sub_q = build_quads(&sub_pts, sub_pts.len(), group_size_for(sub_pts.len()));
+        let ref_q = build_quads(&ref_pts, ref_pts.len(), group_size_for(ref_pts.len()));
+        let matches = match_quads(&sub_q, &ref_q, QUAD_TOLERANCE);
+        let (mut true_n, mut false_n) = (0usize, 0usize);
+        for &(i, c) in &matches {
+            let (x, y) = truth.apply(sub_q[i].center.0, sub_q[i].center.1);
+            let (dx, dy) = (ref_q[c].center.0 - x, ref_q[c].center.1 - y);
+            if dx.hypot(dy) <= 3.0 {
+                true_n += 1;
+            } else if (dx + 2405.0).hypot(dy) <= 3.0 {
+                false_n += 1;
+            }
+        }
+        assert!(
+            false_n > true_n && true_n >= 300,
+            "guard: {false_n} false quad matches against {true_n} true"
+        );
+
+        match align_default(&sub, &refs, ref_geo, sub_geo, &RegistrationConfig::default()) {
+            Err(AlignError::LowCoverage { coverage, .. }) => {
+                assert!(coverage < MIN_COVERAGE, "coverage {coverage}")
+            }
+            Err(AlignError::TooFewInliers { .. }) => {}
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(a) => assert!(
+                map_error(&a, &truth) <= 1.0,
+                "accepted a map {} px off truth (coverage {:.2}, {} inliers)",
+                map_error(&a, &truth),
+                a.coverage,
+                a.inliers
+            ),
+        }
+    }
+
+    /// A mosaic step: the reference shows the subject's right 40 % at its
+    /// own left 40 %. The cells of the grid over the overlap, not over the
+    /// frame, are what the inliers have to cover.
+    #[test]
+    fn a_partial_overlap_passes_the_gate() {
+        let subject = field(51, 700, W, H);
+        let truth = similarity(1.0, 0.3, -600.0, 4.0);
+        let (sub, refs) = scene(&subject, &truth, 0.05, 100, W, H, 52);
+        let in_overlap = refs.len() - 100;
+        assert!(
+            (200..=300).contains(&in_overlap),
+            "guard: {in_overlap} subject stars image into the reference"
+        );
+        let g = (W as usize, H as usize);
+        let a = align_default(&sub, &refs, g, g, &RegistrationConfig::default())
+            .expect("the overlap aligns");
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        let err = map_error_in(&a, &truth, (W, H), &|x, y| {
+            (0.0..W).contains(&x) && (0.0..H).contains(&y)
+        });
+        assert!(err <= 0.1, "{err} px off truth over the overlap");
+    }
+
+    /// The reference's footprint of a subject at x0.207: a few reference
+    /// cells of the 16 x 16 grid, every one of them starred.
+    #[test]
+    fn a_cross_scale_subject_passes_the_gate() {
+        let subject = field(61, 600, SUB_W, SUB_H);
+        let truth = centred_similarity(
+            0.207,
+            4.0,
+            (SUB_W / 2.0, SUB_H / 2.0),
+            (REF_W / 2.0, REF_H / 2.0),
+        );
+        let (sub, mut refs) = scene(&subject, &truth, 0.05, 0, REF_W, REF_H, 62);
+        assert_eq!((sub.len(), refs.len()), (600, 600), "guard: no star is lost");
+        refs.extend(field(63, 150, REF_W, REF_H));
+        let (ref_geo, sub_geo) = binned_geometry();
+        let gate = super::super::scale_gate_for(Some(0.207), Some(1.0));
+        let a = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::WcsFirst,
+            gate,
+        )
+        .expect("the confirmed hint carries the frame");
+        assert_eq!(a.seed, SeedKind::Wcs);
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        assert!(a.inliers >= 540, "inliers {}", a.inliers);
+    }
+
+    /// Review r2 M4. A subject at x4.8 whose frame is about five times the
+    /// reference's: the reference sees one subject cell of the 16. A floor on
+    /// the subject cells would refuse it; the grid over the overlap gives it
+    /// its own 16.
+    #[test]
+    fn a_wide_subject_on_a_narrow_reference_passes_the_gate() {
+        let (ref_w, ref_h) = (2400.0, 1800.0);
+        let subject = field(71, 2400, SUB_W, SUB_H);
+        let truth = centred_similarity(
+            4.8,
+            2.0,
+            (SUB_W / 2.0, SUB_H / 2.0),
+            (ref_w / 2.0, ref_h / 2.0),
+        );
+        let (sub, refs) = scene(&subject, &truth, 0.05, 0, ref_w, ref_h, 72);
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let geo = (ref_w as usize, ref_h as usize);
+        let (all_in, cells) = coverage(&sub_pts, &ref_pts, &sub_pts, &truth, geo);
+        assert!(
+            (100..=250).contains(&refs.len()) && cells == 16 && all_in == 1.0,
+            "guard: {} stars in the overlap, {cells} cells",
+            refs.len()
+        );
+        let gate = super::super::scale_gate_for(Some(4.8), Some(1.0));
+        let a = align(
+            &sub,
+            &refs,
+            geo,
+            (SUB_W as usize, SUB_H as usize),
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::WcsFirst,
+            gate,
+        )
+        .expect("the confirmed hint carries the frame");
+        assert_eq!(a.seed, SeedKind::Wcs);
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        assert!(a.inliers as f64 >= 0.9 * refs.len() as f64, "inliers {}", a.inliers);
+    }
+
+    /// Stars in 5 of the 16 cells only, every one paired: the index counts
+    /// the cells that can hold an inlier, so it is 1, not 5 / 16.
+    #[test]
+    fn a_sparse_field_passes_the_gate() {
+        let sites = [
+            (100.0, 100.0),
+            (900.0, 100.0),
+            (100.0, 700.0),
+            (900.0, 700.0),
+            (400.0, 300.0),
+        ];
+        let mut rng = SplitMix64(81);
+        let subject: Vec<Star> = sites
+            .iter()
+            .flat_map(|&(cx, cy)| (0..8).map(move |k| (cx, cy, k)))
+            .map(|(cx, cy, _)| Star {
+                x: cx + (rng.next_f64() - 0.5) * 50.0,
+                y: cy + (rng.next_f64() - 0.5) * 50.0,
+                flux: 100.0 + rng.next_f64() * 900.0,
+                sigma: Some((0.05, 0.05)),
+            })
+            .collect();
+        let truth = similarity(1.0, 1.0, 8.0, -5.0);
+        let (sub, refs) = scene(&subject, &truth, 0.05, 0, W, H, 82);
+        assert_eq!((sub.len(), refs.len()), (40, 40), "guard: no star is lost");
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let g = (W as usize, H as usize);
+        assert_eq!(
+            coverage(&sub_pts, &ref_pts, &sub_pts, &truth, g).1,
+            5,
+            "guard: the stars hold 5 cells"
+        );
+        let a = align_default(&sub, &refs, g, g, &RegistrationConfig::default())
+            .expect("the clusters align");
+        assert_eq!(a.inliers, 40);
+        assert_eq!(a.coverage, 1.0);
+    }
+
+    /// The `align` scenes that ended `Ok` before the gate, re-run: the same
+    /// map bits, pairing, seed and warnings as at the R1 head (recorded then),
+    /// and a coverage over the minimum. The disjoint-population scene is not
+    /// here: the gate refuses it by design (see
+    /// `a_plate_solve_map_resting_on_ten_shared_stars_is_refused`).
+    #[test]
+    fn every_existing_scene_keeps_its_map_bit_for_bit() {
+        struct Pinned {
+            name: &'static str,
+            hash: u64,
+            inliers: usize,
+            pairs: usize,
+            repaired: usize,
+            seed: SeedKind,
+            seed_matches: usize,
+            warnings: &'static [&'static str],
+        }
+        let binned = |name, seed, seed_matches, warnings| Pinned {
+            name,
+            hash: 0x0679c24c918f668f,
+            inliers: 300,
+            pairs: 300,
+            repaired: 0,
+            seed,
+            seed_matches,
+            warnings,
+        };
+        let pinned = [
+            Pinned {
+                name: "jitter",
+                hash: 0x5d1fb80bd7d6be12,
+                inliers: 297,
+                pairs: 299,
+                repaired: 0,
+                seed: SeedKind::Quads,
+                seed_matches: 44,
+                warnings: &[],
+            },
+            Pinned {
+                name: "mirrored",
+                hash: 0x0c501c163664e11a,
+                inliers: 250,
+                pairs: 250,
+                repaired: 0,
+                seed: SeedKind::Quads,
+                seed_matches: 61,
+                warnings: &[],
+            },
+            Pinned {
+                name: "decoy",
+                hash: 0x146c7bc43d667978,
+                inliers: 1793,
+                pairs: 1793,
+                repaired: 0,
+                seed: SeedKind::Quads,
+                seed_matches: 439,
+                warnings: &[],
+            },
+            binned("binned_quads", SeedKind::Quads, 216, &[]),
+            binned("binned_hint", SeedKind::Wcs, 0, &[]),
+            binned(
+                "binned_unconfirmed",
+                SeedKind::Quads,
+                216,
+                &["wcs seed rejected (1 pairs); quad seed used"],
+            ),
+            binned(
+                "binned_stale",
+                SeedKind::Quads,
+                216,
+                &["wcs seed pairing failed (0 pairs); quad seed used"],
+            ),
+        ];
+
+        let cfg = RegistrationConfig::default();
+        let mut got: Vec<(&str, Alignment, (f64, f64))> = Vec::new();
+        {
+            let subject = field(1, 300, W, H);
+            let truth = similarity(1.002, 3.0, 12.3, -7.7);
+            let (sub, refs) = scene(&subject, &truth, 0.05, 90, W, H, 7);
+            let g = (W as usize, H as usize);
+            let a = align_default(&sub, &refs, g, g, &cfg).unwrap();
+            got.push(("jitter", a, (W, H)));
+        }
+        {
+            let subject = field(2, 250, W, H);
+            let truth = Linear::from_flat(
+                LinearKind::Affine,
+                [-1.0, 0.0, W - 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            );
+            let (sub, refs) = scene(&subject, &truth, 0.05, 60, W, H, 8);
+            let g = (W as usize, H as usize);
+            let a = align_default(&sub, &refs, g, g, &cfg).unwrap();
+            got.push(("mirrored", a, (W, H)));
+        }
+        {
+            let (sub, refs, _) = decoy_scene(1);
+            let (rg, sg) = decoy_geometry();
+            let a = align_default(&sub, &refs, rg, sg, &cfg).unwrap();
+            got.push(("decoy", a, SEED_SUBJECT));
+        }
+        {
+            let (sub, refs, truth) = binned_scene();
+            let (rg, sg) = binned_geometry();
+            let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
+            let frame = (SUB_W, SUB_H);
+            let mut wrong = truth;
+            wrong.m[0][2] += 30.0;
+            let mut stale = truth;
+            stale.m[0][2] += 5.0;
+            for (name, hint, policy) in [
+                ("binned_quads", None, SeedPolicy::QuadFirst),
+                ("binned_hint", Some(&truth), SeedPolicy::WcsFirst),
+                ("binned_unconfirmed", Some(&wrong), SeedPolicy::WcsFirst),
+                ("binned_stale", Some(&stale), SeedPolicy::WcsFirst),
+            ] {
+                let a = align(&sub, &refs, rg, sg, &cfg, hint, policy, gate).unwrap();
+                got.push((name, a, frame));
+            }
+        }
+
+        assert_eq!(got.len(), pinned.len());
+        for (p, (name, a, frame)) in pinned.iter().zip(&got) {
+            assert_eq!(p.name, *name);
+            assert_eq!(
+                (a.inliers, a.pairs, a.repaired, a.seed, a.seed_matches),
+                (p.inliers, p.pairs, p.repaired, p.seed, p.seed_matches),
+                "{name}"
+            );
+            assert_eq!(a.warnings, p.warnings, "{name}");
+            assert_eq!(map_fingerprint(a, *frame), p.hash, "{name}: the map moved");
+            assert!(a.coverage >= MIN_COVERAGE, "{name}: coverage {}", a.coverage);
+        }
+    }
+
+    /// FNV-1a over the bits of the alignment's image of a 17 x 13 grid on
+    /// the subject frame: equal only when the map is the same to the bit.
+    fn map_fingerprint(a: &Alignment, frame: (f64, f64)) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for j in 0..13 {
+            for i in 0..17 {
+                let (x, y) = (frame.0 * i as f64 / 16.0, frame.1 * j as f64 / 12.0);
+                let (fx, fy) = a.map.forward(x, y);
+                for v in [fx, fy] {
+                    for byte in v.to_bits().to_le_bytes() {
+                        h ^= byte as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+        }
+        h
+    }
+
+    /// The ten shared stars of the disjoint-population scene hold 8 of the
+    /// 16 cells of the overlap: a plate-solve map that rests on them covers
+    /// half of it, and the gate refuses it (RQ-10) where the plate-solve seed
+    /// used to carry the frame. `the_plate_solve_seed_is_the_quad_seeds_fallback`
+    /// runs the same scene with the shared stars spread over every cell.
+    #[test]
+    fn a_plate_solve_map_resting_on_ten_shared_stars_is_refused() {
+        let (sub, refs, truth) = disjoint_population_scene();
+        let (ref_geo, sub_geo) = disjoint_geometry();
+        let err = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
+        )
+        .expect_err("ten stars in half of the cells do not cover the overlap");
+        match err {
+            AlignError::LowCoverage { coverage, cells } => {
+                assert!(coverage < MIN_COVERAGE, "coverage {coverage}");
+                assert_eq!(cells, 16);
+            }
+            other => panic!("refused for another reason: {other}"),
+        }
+    }
+
+    /// The tie rule of the seed's RANSAC: two disjoint consistent groups of
+    /// equal size (243 true matches, 243 at (-2 405, 0) px) reach the same
+    /// consensus, and the strict `>` keeps the first hypothesis that got
+    /// there. Replays `SplitMix64(SEED_RANSAC_SEED)`'s draws to name that
+    /// group, and guards that on some scene the last group to reach the
+    /// maximum is the other one (a `>=` would have flipped it).
+    #[test]
+    fn the_first_of_two_equal_consistent_groups_wins_the_tie() {
+        let truth = seed_truth();
+        let mut flipped_by_ge = 0;
+        for s in 0..8u64 {
+            let mut rng = SplitMix64(3000 + s);
+            let mut all: Vec<(CentrePair, bool)> = true_matches(s, 243)
+                .into_iter()
+                .map(|p| (p, true))
+                .collect();
+            for _ in 0..243 {
+                let p = (
+                    rng.next_f64() * SEED_SUBJECT.0,
+                    rng.next_f64() * SEED_SUBJECT.1,
+                );
+                all.push((jittered_match(&truth, p, (-2405.0, 0.0), &mut rng), false));
+            }
+            let (pairs, is_true) = shuffled_with_flags(all, &mut rng);
+            let (image, catalog, matches) = quad_level(&pairs);
+            let seed = robust_quad_seed(&matches, &image, &catalog).unwrap();
+            assert_eq!(seed.route, SeedRoute::Consensus, "scene {s}");
+
+            // Replay the draws; record the group and consensus of every
+            // pure sample that gave a hypothesis.
+            let n = matches.len();
+            let centres: Vec<Pair> = pairs.iter().map(|p| (p.0, p.1)).collect();
+            let mut draws = SplitMix64(SEED_RANSAC_SEED);
+            let mut hypotheses: Vec<(bool, usize)> = Vec::new();
+            for _ in 0..seed.hypotheses {
+                let mut picks = [0usize; 3];
+                let mut drawn = 0;
+                while drawn < 3 {
+                    let p = draws.below(n);
+                    if !picks[..drawn].contains(&p) {
+                        picks[drawn] = p;
+                        drawn += 1;
+                    }
+                }
+                let sample = [centres[picks[0]], centres[picks[1]], centres[picks[2]]];
+                if degenerate(&sample) {
+                    continue;
+                }
+                let three = [matches[picks[0]], matches[picks[1]], matches[picks[2]]];
+                let Some(h) = fit_affine(&three, &image, &catalog) else {
+                    continue;
+                };
+                let group = is_true[picks[0]];
+                if is_true[picks[1]] != group || is_true[picks[2]] != group {
+                    continue;
+                }
+                let count = quad_residuals(&h, &matches, &image, &catalog)
+                    .iter()
+                    .filter(|r| **r <= SEED_TOL_PX)
+                    .count();
+                hypotheses.push((group, count));
+            }
+            let top = hypotheses.iter().map(|h| h.1).max().unwrap();
+            let at_top: Vec<bool> = hypotheses
+                .iter()
+                .filter(|h| h.1 == top)
+                .map(|h| h.0)
+                .collect();
+            let first = at_top[0];
+            for (i, t) in is_true.iter().enumerate() {
+                assert_eq!(
+                    seed.kept[i],
+                    *t == first,
+                    "scene {s}: match {i} (the first group to reach {top} is {})",
+                    if first { "the true one" } else { "the false one" }
+                );
+            }
+            if at_top.iter().any(|g| *g != first) {
+                flipped_by_ge += 1;
+            }
+        }
+        assert!(
+            flipped_by_ge >= 1,
+            "guard: no scene had both groups at the top consensus"
+        );
     }
 }
