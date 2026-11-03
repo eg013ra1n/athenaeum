@@ -654,13 +654,17 @@ pub const MIN_COVERAGE: f64 = 0.75;
 ///   that is right in one corner is read over the whole overlap.
 /// - An eligible star is *paired* when it is one of `pair_subject_pts`: the
 ///   subject sides of the final pairing's pairs (a reference star within the
-///   pairing radius of its image through the refit's map, after the 4b
-///   re-pair). A cell none of whose eligible stars the pairing paired is
-///   overlap the reference cannot vouch for (a shallow reference under a
-///   deep subject holds few stars to pair), and it counts for nothing,
-///   neither as covered nor as uncovered (R4-34). A wrong map does not
-///   hide behind it: its chance pairs in the cells it is wrong over are
-///   paired and hold the denominator.
+///   pairing radius of its image through the map the pairing was made with:
+///   the pairing the refit was fitted on, the 4b re-pairing when taken). A
+///   cell none of whose eligible stars the pairing paired is overlap the
+///   reference cannot vouch for (a shallow reference under a deep subject
+///   holds few stars to pair), and it counts for nothing, neither as covered
+///   nor as uncovered (R4-34). On a dense field a wrong map does not hide
+///   behind it: its chance pairs in the cells it is wrong over are paired and
+///   hold the denominator. On a sparse field with no chance pair outside the
+///   part it is right over, a half-wrong map scores 1.0: the cost R4-34
+///   accepts (`MIN_INLIERS`, the robust seed and RANSAC stand before this
+///   gate).
 /// - `inlier_subject_pts` are the subject sides of the refit's inlier pairs
 ///   (the pairing carries coordinates, not star indices). One outside the
 ///   box, or in a cell without a paired eligible star, counts for nothing.
@@ -3125,11 +3129,14 @@ pub(super) mod tests {
     /// the 3.8 px pairing radius and at the edge of the RANSAC tolerance
     /// (1.9 px): a map that keeps the sixteen shared stars within it moves
     /// the right cells by at most 1.9 px, and that absorbs a 3.7 px offset
-    /// in one direction only. The exact map pairs them all and its inliers
-    /// are the shared stars: it is right over half the paired cells and
-    /// wrong over the other half, so the gate refuses it. The lone stars
-    /// share no group of four with anything, so the quad matcher still has
-    /// nothing to match.
+    /// in one direction only. (The margin to the pairing radius is 0.1 px:
+    /// `cells == 16` in the tests that read this scene rests on the final
+    /// pairing being the exact map's; an offset of 3.5 px, still 1.8 times
+    /// the RANSAC tolerance, would widen it.) The exact map pairs them all
+    /// and its inliers are the shared stars: it is right over half the
+    /// paired cells and wrong over the other half, so the gate refuses it.
+    /// The lone stars share no group of four with anything, so the quad
+    /// matcher still has nothing to match.
     pub(crate) fn disjoint_chance_pairs_scene() -> (Vec<Star>, Vec<Star>, Linear) {
         let rows = [200.0, 570.0, 930.0, 1300.0];
         let sites: Vec<(f64, f64)> = rows
