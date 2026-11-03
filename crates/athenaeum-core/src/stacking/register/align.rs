@@ -3132,17 +3132,17 @@ pub(super) mod tests {
     /// ([`disjoint_population_scene`] and the exact map) the ruling turned
     /// into an accepted one: sixteen shared stars over the left eight cells
     /// of the grid over the overlap, and eight chance pairs over the right
-    /// eight, one in each: a lone subject star and a reference star 3.7 px
+    /// eight, one in each: a lone subject star and a reference star 3.5 px
     /// from its image, each in another of eight directions. They are inside
-    /// the 3.8 px pairing radius and at the edge of the RANSAC tolerance
-    /// (1.9 px): a map that keeps the sixteen shared stars within it moves
-    /// the right cells by at most 1.9 px, and that absorbs a 3.7 px offset
-    /// in one direction only. (The margin to the pairing radius is 0.1 px:
-    /// `cells == 16` in the tests that read this scene rests on the judged
-    /// map's pairing being the exact map's; an offset of 3.5 px, still 1.8
-    /// times the RANSAC tolerance, would widen it.) The exact map pairs them all
-    /// and its inliers are the shared stars: it is right over half the
-    /// paired cells and wrong over the other half, so the gate refuses it.
+    /// the 3.8 px pairing radius and 1.8 times the RANSAC tolerance (1.9 px)
+    /// out: a map that keeps the sixteen shared stars within it moves the
+    /// right cells by at most 1.9 px, and that absorbs a 3.5 px offset in
+    /// one direction only. (The 0.3 px margin to the pairing radius keeps
+    /// `cells == 16` in the tests that read this scene from resting on the
+    /// judged map being the exact map to the last digit.) The exact map
+    /// pairs them all and its inliers are the shared stars: it is right over
+    /// half the paired cells and wrong over the other half, so the gate
+    /// refuses it.
     /// The lone stars share no group of four with anything, so the quad
     /// matcher still has nothing to match.
     pub(crate) fn disjoint_chance_pairs_scene() -> (Vec<Star>, Vec<Star>, Linear) {
@@ -3164,8 +3164,8 @@ pub(super) mod tests {
                 let (u, v) = truth.apply(lone.x, lone.y);
                 let (sin, cos) = (k as f64 * std::f64::consts::FRAC_PI_4).sin_cos();
                 reference.push(Star {
-                    x: u + 3.7 * cos,
-                    y: v + 3.7 * sin,
+                    x: u + 3.5 * cos,
+                    y: v + 3.5 * sin,
                     ..lone.clone()
                 });
                 subject.push(lone);
