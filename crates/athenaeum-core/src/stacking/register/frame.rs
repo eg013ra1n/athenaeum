@@ -705,8 +705,8 @@ mod tests {
     /// interleave, and a refusal without its file is a number without a
     /// frame. The disjoint-population scene with its chance pairs is the
     /// dropped case: the map is refused for coverage (R4-34 / K1 r1: over the
-    /// cells the judged map pairs, the chance pairs among them), then the quad seed
-    /// has nothing to match, and `NoSeed` is all the verdict says.
+    /// cells the judged map pairs, the chance pairs among them), then the
+    /// quad seed has nothing to match, and `NoSeed` is all the verdict says.
     #[test]
     fn a_refused_plate_solve_seed_is_logged_with_its_path_before_the_verdict() {
         use super::super::align::tests::{disjoint_chance_pairs_scene, disjoint_geometry};

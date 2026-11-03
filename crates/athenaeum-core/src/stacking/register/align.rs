@@ -5145,9 +5145,16 @@ pub(super) mod tests {
     /// final refit on those is within the radius of truth everywhere, a
     /// little off (the truth is not linear), and its inliers sit in the
     /// cells the first refit reached. Read over the cells that pairing
-    /// reached the map covers 0.91 of them ((c′), the control below: accepted);
-    /// read over the cells the judged map pairs, all 16 (it is within the
-    /// radius of every star), 0.625. Refused.
+    /// reached the map covers 0.91 of them ((c′), the control below:
+    /// accepted); read over the cells the judged map pairs, all 16 (it is
+    /// within the radius of every star), 0.625. Refused.
+    ///
+    /// The scene is tuned: a sweep (removed) over the bend's shape and
+    /// amplitude, the jitter, the seed's error and the field seed found the
+    /// pocket at seed pairs 13-21, the first fit ~9 px off over ~60 % of the
+    /// grid, a scale error of 2.2e-2 about (0.1 w, 0.1 h) and a 3 px bend;
+    /// 7 of 98 runs met every guard, across four field seeds. A change to
+    /// RANSAC, the model ladder or `field` needs a re-sweep from there.
     #[test]
     fn a_map_fitted_on_the_reach_of_a_wrong_first_fit_is_refused() {
         let (sub, refs, shared) = bent_scene();

@@ -619,8 +619,9 @@ pub const MIN_COVERAGE: f64 = 0.75;
 AlignError::LowCoverage { coverage: f64, cells: usize }
 ```
 `fit_from_seed(seed, …) -> (Pairing, Result<(RansacResult, RefitResult, LinearKind, usize /*repaired*/), AlignError>,
-Vec<String> /*warnings*/)` is steps 2–4b exactly as today, plus the gate last: `coverage(sub_pts, ref_pts, the
-refit's inlier pairs' subject points, the subject points of a pairing made through `&refit.linear` (K1 r1), &refit.linear, reference_geometry)`. `align()` calls it for the leading seed and,
+Vec<String> /*warnings*/)` is steps 2–4b exactly as today, plus the gate last: `coverage(sub_pts, ref_pts, <the
+refit's inlier pairs' subject points>, <the subject points of a pairing made through refit.linear (K1 r1)>,
+&refit.linear, reference_geometry)`. `align()` calls it for the leading seed and,
 on any `Err`, for the fallback seed as today. A discarded attempt's warnings are dropped. The switch warnings keep
 today's shapes with the coverage as the reason (RQ-10, review r2 M7): "quad seed failed (map covers 0.13 of the
 overlap); plate-solve seed used" and "wcs seed pairing failed (map covers 0.13 of the overlap); quad seed used".
@@ -654,9 +655,9 @@ overlap); plate-solve seed used" and "wcs seed pairing failed (map covers 0.13 o
   Review Focus 4's pins pass unedited; `cargo check -p athenaeum-core --no-default-features`; `cargo check -p
   athenaeum-core --examples --features render,solver`.
 - [ ] **Step 5:** dictionary entry: "**Dictionary extension (registration coverage, `stacking::register::frame`, RQ-10,
-  2026-11-xx):** `coverage` (f64; the share of a 4 × 4 grid over the subject frame whose cells holding an eligible star the judged map pairs hold a refit
-  inlier; RQ-10 (c″), K1 r1) on the debug event `"frame registered"`." Commit `feat(stacking): a registration map must cover the overlap
-  (RQ-10)`.
+  2026-11-xx):** `coverage` (f64; the share of a 4 × 4 grid over the subject frame whose cells holding an eligible star
+  the judged map pairs hold a refit inlier; RQ-10 (c″), K1 r1) on the debug event `"frame registered"`." Commit
+  `feat(stacking): a registration map must cover the overlap (RQ-10)`.
 
 **Acceptance:** tests green; the existing-scene pin holds; the opus review is clean. Budget ≤ 100 calls.
 
