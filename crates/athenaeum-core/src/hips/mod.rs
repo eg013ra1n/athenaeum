@@ -13,6 +13,7 @@
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod pack;
 pub mod balance;
+pub mod cache;
 pub mod mirrors;
 
 use std::collections::BTreeMap;
@@ -308,6 +309,87 @@ impl HipsStore {
         write_atomic(&self.absent_path(order, npix), b"")
     }
 
+    /// Marks a stored tile as used now: its mtime is the browsing cache's LRU
+    /// clock ([`cache::trim`]). A failure only makes the tile go sooner.
+    pub fn touch(&self, order: u8, npix: u64) {
+        let path = self.tile_path(order, npix);
+        let result = fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        if let Err(e) = result {
+            tracing::debug!(path = %path.display(), error = %e, "hips tile use not recorded");
+        }
+    }
+
+    /// The tiles of this survey's last offline pack (`pack-tiles.txt`, one
+    /// `order/npix` per line), kept whatever the browsing cache limit.
+    pub fn read_pack_tiles(&self) -> Result<std::collections::HashSet<(u8, u64)>> {
+        let path = self.root.join("pack-tiles.txt");
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        Ok(text
+            .lines()
+            .filter_map(|l| {
+                let (o, n) = l.trim().split_once('/')?;
+                Some((o.parse().ok()?, n.parse().ok()?))
+            })
+            .collect())
+    }
+
+    /// Replaces the pack list: a new pack of a survey supersedes its last one.
+    pub fn write_pack_tiles(&self, tiles: &[(u8, u64)]) -> Result<()> {
+        let mut text = String::with_capacity(tiles.len() * 10);
+        for (o, n) in tiles {
+            text.push_str(&format!("{o}/{n}\n"));
+        }
+        write_atomic(&self.root.join("pack-tiles.txt"), text.as_bytes())
+    }
+
+    /// Every stored tile image: its address, size and last use (mtime).
+    pub fn tiles(&self) -> Result<Vec<StoredTile>> {
+        let mut out = Vec::new();
+        let ext = self.format.ext();
+        let order_dirs = match fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e).with_context(|| format!("list {}", self.root.display())),
+        };
+        for od in order_dirs.flatten() {
+            let Some(order) = od.file_name().to_str().and_then(|n| n.strip_prefix("Norder")).and_then(|o| o.parse::<u8>().ok()) else {
+                continue;
+            };
+            let Ok(dirs) = fs::read_dir(od.path()) else { continue };
+            for d in dirs.flatten() {
+                let Ok(files) = fs::read_dir(d.path()) else { continue };
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    let Some(npix) = name
+                        .to_str()
+                        .and_then(|n| n.strip_prefix("Npix"))
+                        .and_then(|n| n.strip_suffix(ext))
+                        .and_then(|n| n.strip_suffix('.'))
+                        .and_then(|n| n.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(meta) = f.metadata() else { continue };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    out.push(StoredTile {
+                        order,
+                        npix,
+                        path: f.path(),
+                        bytes: meta.len(),
+                        used: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// True when the store holds this tile as an image or as an `.absent`
     /// marker. Checks the files exist; reads no bytes.
     pub fn has(&self, order: u8, npix: u64) -> bool {
@@ -425,6 +507,17 @@ impl HipsStore {
             Err(e) => Err(e).with_context(|| format!("remove {}", self.root.display())),
         }
     }
+}
+
+/// One stored tile image, as [`HipsStore::tiles`] lists it.
+#[derive(Debug, Clone)]
+pub struct StoredTile {
+    pub order: u8,
+    pub npix: u64,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Last use: the file's mtime, set on every read.
+    pub used: std::time::SystemTime,
 }
 
 /// The pid embedded in a `.{file}.{pid}.{n}.part` name, if it is one.

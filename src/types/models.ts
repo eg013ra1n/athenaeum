@@ -241,6 +241,11 @@ license: string,
  */
 online: boolean, cachedTiles: number, cachedBytes: number, 
 /**
+ * The part of `cached_bytes` that the survey's last offline pack holds:
+ * kept whatever the browsing cache limit.
+ */
+packBytes: number, 
+/**
  * Hosts the tiles come from: the master, then the verified mirrors.
  */
 servers: Array<string>, 

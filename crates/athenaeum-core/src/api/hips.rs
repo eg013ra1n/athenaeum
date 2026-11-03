@@ -43,6 +43,9 @@ pub struct HipsSurveyInfo {
     pub online: bool,
     pub cached_tiles: u64,
     pub cached_bytes: u64,
+    /// The part of `cached_bytes` that the survey's last offline pack holds:
+    /// kept whatever the browsing cache limit.
+    pub pack_bytes: u64,
     /// Hosts the tiles come from: the master, then the verified mirrors.
     pub servers: Vec<String>,
     /// Licensed for non-commercial use only: never offered in a paid surface.
@@ -69,6 +72,13 @@ fn online(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let conn = db.conn();
     let v = ctx.settings.get_with_precedence(&conn, keys::SKYCHART_HIPS_ONLINE, defaults::SKYCHART_HIPS_ONLINE)?;
     Ok(v != "false")
+}
+
+/// The browsing cache limit (`skychart.hips_cache_limit_gb`), in bytes.
+fn cache_limit(ctx: &ServiceContext) -> Result<u64, ApiError> {
+    let db = ctx.db.get().ok_or_else(|| ApiError::Internal("Database not initialized".into()))?;
+    let conn = db.conn();
+    Ok(ctx.settings.get_hips_cache_limit_bytes(&conn)?)
 }
 
 fn find_survey(id: &str) -> Result<&'static HipsSurvey, ApiError> {
@@ -120,12 +130,20 @@ fn ensure_properties(app_data: &std::path::Path, store: &HipsStore, survey: &'st
 pub fn get_hips_surveys(ctx: &ServiceContext) -> Result<Vec<HipsSurveyInfo>, ApiError> {
     let app_data = app_data_dir(ctx)?;
     let online = online(ctx)?;
+    // A lowered limit applies without waiting for the next tile.
+    hips::cache::note_listed(&app_data, cache_limit(ctx)?);
     hips::SURVEYS
         .iter()
         .map(|s| {
             let store = HipsStore::new(&app_data, s);
             let props = store.read_properties()?.unwrap_or_default();
             let (cached_tiles, cached_bytes) = store.usage()?;
+            let pack = store.read_pack_tiles()?;
+            let pack_bytes = if pack.is_empty() {
+                0
+            } else {
+                store.tiles()?.iter().filter(|t| pack.contains(&(t.order, t.npix))).map(|t| t.bytes).sum()
+            };
             Ok(HipsSurveyInfo {
                 id: s.id.to_string(),
                 label: s.label.to_string(),
@@ -138,6 +156,7 @@ pub fn get_hips_surveys(ctx: &ServiceContext) -> Result<Vec<HipsSurveyInfo>, Api
                 online,
                 cached_tiles,
                 cached_bytes,
+                pack_bytes,
                 servers: hips::balance::endpoints(&app_data, s).iter().map(|u| hips::mirrors::host_of(u).to_string()).collect(),
                 non_commercial: s.non_commercial,
             })
@@ -156,7 +175,10 @@ pub fn get_hips_tile(ctx: &ServiceContext, survey_id: &str, order: u8, npix: u64
     let mime = survey.format.mime();
 
     match store.read(order, npix)? {
-        CachedTile::Image(bytes) => return Ok(HipsTile::Image { bytes, mime }),
+        CachedTile::Image(bytes) => {
+            store.touch(order, npix);
+            return Ok(HipsTile::Image { bytes, mime });
+        }
         CachedTile::Absent => return Ok(HipsTile::Absent),
         CachedTile::Missing => {}
     }
@@ -170,6 +192,7 @@ pub fn get_hips_tile(ctx: &ServiceContext, survey_id: &str, order: u8, npix: u64
         Ok((FetchedTile::Image(bytes), endpoint)) => {
             tracing::debug!(survey_id = survey.id, hips_order = order, npix, bytes = bytes.len(), endpoint = %endpoint, "hips tile fetched");
             store.write(order, npix, &bytes)?;
+            hips::cache::note_written(&app_data, bytes.len() as u64, cache_limit(ctx)?);
             Ok(HipsTile::Image { bytes, mime })
         }
         Ok((FetchedTile::Absent, endpoint)) => {
@@ -552,6 +575,13 @@ mod offline_pack {
             }
         }
 
+        // The pack's tiles are kept whatever the browsing cache limit; this
+        // pack's list replaces the survey's last one.
+        if let Err(e) = store.write_pack_tiles(&tiles) {
+            release_claim();
+            tracing::error!(survey_id = survey.id, error = %format!("{e:#}"), "hips pack tile list not saved");
+            return Err(e.into());
+        }
         let thread_initial = initial.clone();
         let thread_cancel = cancel.clone();
         let spawned = std::thread::Builder::new().name("hips-pack".into()).spawn(move || {

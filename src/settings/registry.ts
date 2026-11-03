@@ -216,10 +216,22 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         keywords: ['skychart.hips_online', 'hips', 'dss', 'survey', 'offline', 'network', 'sky chart'],
       },
       {
+        id: 'cacheLimitGb',
+        label: 'Sky tile cache limit',
+        help: 'Space the tiles fetched while browsing may take, all surveys together. The longest unused ones are deleted once it passes the limit; tiles of each survey\'s last offline pack are kept whatever it is. It can pass the limit briefly while you browse.',
+        keywords: ['skychart.hips_cache_limit_gb', 'hips', 'cache', 'limit', 'size', 'disk space', 'tiles', 'nsns', 'dss'],
+      },
+      {
+        id: 'cacheTotal',
+        label: 'Sky tiles on this computer',
+        help: 'Space all surveys take together. Clear all deletes every stored tile, offline packs included.',
+        keywords: ['hips', 'cache', 'clear', 'clear all', 'disk space', 'tiles', 'used'],
+      },
+      {
         id: 'surveys',
         label: 'Surveys on this computer',
-        help: 'Credit, license and the space the stored tiles take. Clear deletes a survey\'s tiles.',
-        keywords: ['hips', 'dss colored', 'cache', 'tiles', 'clear', 'attribution', 'license'],
+        help: 'Credit, license, the servers tiles come from and the space the stored tiles take. Clear deletes a survey\'s tiles.',
+        keywords: ['hips', 'dss colored', 'nsns', 'narrowband', 'cache', 'tiles', 'clear', 'attribution', 'license', 'mirror', 'server'],
       },
       {
         id: 'pack',
