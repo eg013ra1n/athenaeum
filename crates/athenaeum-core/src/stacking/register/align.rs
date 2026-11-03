@@ -122,8 +122,8 @@ pub enum AlignError {
     ScaleOutOfRange { scale: f64, expected: f64 },
     RmsTooHigh { rms_px: f64, max_rms_px: f64 },
     /// RQ-10: the map's inliers cover `coverage` of the cells of the 4 x 4
-    /// grid over the overlap that hold an eligible star the final pairing
-    /// paired, `cells` of them (see [`coverage`]), under [`MIN_COVERAGE`].
+    /// grid over the overlap that hold an eligible star the judged map
+    /// pairs, `cells` of them (see [`coverage`]), under [`MIN_COVERAGE`].
     LowCoverage { coverage: f64, cells: usize },
 }
 
@@ -637,7 +637,7 @@ pub const REFERENCE_OCCUPANCY_GRID: usize = 16;
 /// (RQ-10): 12 of 16 cells on a dense, fully paired overlap.
 pub const MIN_COVERAGE: f64 = 0.75;
 
-/// How much of the overlap a map's inliers cover (RQ-10 (a), (b), (c')), in
+/// How much of the overlap a map's inliers cover (RQ-10 (a), (b), (c″)), in
 /// subject pixels. Returns `(coverage, cells)`: the share of the 4 x 4 grid's
 /// cells holding a *paired* eligible star that also hold an inlier, and the
 /// number of cells holding a paired eligible star.
@@ -653,18 +653,22 @@ pub const MIN_COVERAGE: f64 = 0.75;
 ///   row. The eligible stars alone set the extent, paired or not, so a map
 ///   that is right in one corner is read over the whole overlap.
 /// - An eligible star is *paired* when it is one of `pair_subject_pts`: the
-///   subject sides of the final pairing's pairs (a reference star within the
-///   pairing radius of its image through the map the pairing was made with:
-///   the pairing the refit was fitted on, the 4b re-pairing when taken). A
-///   cell none of whose eligible stars the pairing paired is overlap the
-///   reference cannot vouch for (a shallow reference under a deep subject
-///   holds few stars to pair), and it counts for nothing, neither as covered
-///   nor as uncovered (R4-34). On a dense field a wrong map does not hide
-///   behind it: its chance pairs in the cells it is wrong over are paired and
-///   hold the denominator. On a sparse field with no chance pair outside the
-///   part it is right over, a half-wrong map scores 1.0: the cost R4-34
-///   accepts (`MIN_INLIERS`, the robust seed and RANSAC stand before this
-///   gate).
+///   subject sides of a pairing made through `map` itself (a reference star
+///   within the pairing radius of its image through `map`;
+///   `pair_through(&refit.linear, …)` in `fit_from_seed`), never of the
+///   pairing the refit was fitted on. That one was made through the previous
+///   fit (the seed's, or the first refit's under 4b) and reaches only as far
+///   as that fit was within the radius, so a map fitted on it would be read
+///   over its own footprint and nothing else (K1 r1). A cell none of whose
+///   eligible stars pairs through `map` is overlap the reference cannot
+///   vouch for (a shallow reference under a deep subject holds few stars to
+///   pair), and it counts for nothing, neither as covered nor as uncovered
+///   (R4-34). On a dense field a map off by less than the radius pairs the
+///   real stars where it is wrong and a map off by more pairs chance stars
+///   there: either way those cells hold the denominator and no inlier. On a
+///   sparse field with no star to pair outside the part a map is right over
+///   it, a half-wrong map scores 1.0: the cost R4-34 accepts
+///   (`MIN_INLIERS`, the robust seed and RANSAC stand before this gate).
 /// - `inlier_subject_pts` are the subject sides of the refit's inlier pairs
 ///   (the pairing carries coordinates, not star indices). One outside the
 ///   box, or in a cell without a paired eligible star, counts for nothing.
@@ -947,9 +951,9 @@ type SeedFit = (RansacResult, RefitResult, LinearKind, usize, f64);
 /// with distance from them, so a rotated or rescaled subject pairs only
 /// near them; one pass through the refit model recovers the rest of the
 /// field), then [`coverage`] of the refit's inliers over the cells of the
-/// overlap the final pairing paired. A map whose inliers cover less of them
-/// than [`MIN_COVERAGE`] is refused with [`AlignError::LowCoverage`],
-/// whichever seed produced it.
+/// overlap that the refit's own map pairs (one more `pair_through`, for the
+/// gate only). A map whose inliers cover less of them than [`MIN_COVERAGE`]
+/// is refused with [`AlignError::LowCoverage`], whichever seed produced it.
 ///
 /// The [`Pairing`] comes back either way, so a caller that falls back to the
 /// other seed (M4b) can say how far this one got. The warnings are this
@@ -1002,9 +1006,13 @@ fn fit_from_seed(
 
     // The gate: the refit's inliers (the subject side of their pairs)
     // against the cells of the overlap the refit's own map defines that the
-    // final pairing paired (RQ-10 (c'), R4-34).
+    // JUDGED map pairs (RQ-10 (c″), K1 r1): a pairing the gate makes for
+    // itself through `refit.linear`, never `pairing`, which was made through
+    // the previous fit and reaches only as far as that fit was within the
+    // radius.
     let inlier_pts: Vec<(f64, f64)> = refit.inliers.iter().map(|&i| pairing.pairs[i].0).collect();
-    let pair_pts: Vec<(f64, f64)> = pairing.pairs.iter().map(|p| p.0).collect();
+    let judged = pair_through(&refit.linear, subject, reference, tree, radius);
+    let pair_pts: Vec<(f64, f64)> = judged.pairs.iter().map(|p| p.0).collect();
     let (covered, cells) = coverage(
         sub_pts,
         ref_pts,
@@ -3130,9 +3138,9 @@ pub(super) mod tests {
     /// (1.9 px): a map that keeps the sixteen shared stars within it moves
     /// the right cells by at most 1.9 px, and that absorbs a 3.7 px offset
     /// in one direction only. (The margin to the pairing radius is 0.1 px:
-    /// `cells == 16` in the tests that read this scene rests on the final
-    /// pairing being the exact map's; an offset of 3.5 px, still 1.8 times
-    /// the RANSAC tolerance, would widen it.) The exact map pairs them all
+    /// `cells == 16` in the tests that read this scene rests on the judged
+    /// map's pairing being the exact map's; an offset of 3.5 px, still 1.8
+    /// times the RANSAC tolerance, would widen it.) The exact map pairs them all
     /// and its inliers are the shared stars: it is right over half the
     /// paired cells and wrong over the other half, so the gate refuses it.
     /// The lone stars share no group of four with anything, so the quad
@@ -3186,7 +3194,7 @@ pub(super) mod tests {
     /// RG2: the shared stars here are sixteen, one in each cell of the grid
     /// over the overlap. With ten of them in half of the cells the gate once
     /// refused the plate-solve map; since R4-34 it counts the cells the
-    /// pairing paired and accepts it (see
+    /// judged map pairs and accepts it (see
     /// `a_plate_solve_map_resting_on_ten_shared_stars_covers_the_cells_it_paired`).
     #[test]
     fn the_plate_solve_seed_is_the_quad_seeds_fallback() {
@@ -3719,11 +3727,11 @@ pub(super) mod tests {
         );
     }
 
-    /// RQ-10 (c') on the same lattice: a cell counts only when an eligible
-    /// star in it is one of the final pairing's pairs, and the eligible
-    /// stars alone set the grid.
+    /// RQ-10 (c″) on the same lattice: a cell counts only when an eligible
+    /// star in it is one the judged map pairs (`pair_subject_pts`), and the
+    /// eligible stars alone set the grid.
     #[test]
-    fn coverage_counts_only_the_cells_the_final_pairing_paired() {
+    fn coverage_counts_only_the_cells_the_judged_map_pairs() {
         let geo = (1600usize, 1600usize);
         let lattice: Vec<(f64, f64)> = (0..16)
             .flat_map(|j| (0..16).map(move |i| (50.0 + 100.0 * i as f64, 50.0 + 100.0 * j as f64)))
@@ -3768,9 +3776,19 @@ pub(super) mod tests {
             let pairs: Vec<(f64, f64)> = left.iter().chain(&chance[..k]).copied().collect();
             coverage(&lattice, &lattice, &left, &pairs, &identity, geo)
         };
+        assert_eq!(with(1), (8.0 / 9.0, 9));
         assert_eq!(with(2), (0.8, 10));
         assert_eq!(with(3), (8.0 / 11.0, 11));
         assert!(with(3).0 < MIN_COVERAGE && with(2).0 >= MIN_COVERAGE);
+
+        // K1 r1: the same inliers over the pairs of a map that pairs the
+        // whole lattice (every star, the right half included) are 8 / 16,
+        // where a pairing that reached only the left half and one chance
+        // pair reads 8 / 9. The denominator is what the judged map pairs.
+        assert_eq!(
+            coverage(&lattice, &lattice, &left, &lattice, &identity, geo),
+            (0.5, 16)
+        );
 
         // A paired star the map does not make eligible (imaged outside the
         // frame) opens no cell, and sets no extent.
@@ -4299,7 +4317,7 @@ pub(super) mod tests {
     /// turn fails too, `NoSeed` is all the frame reports, and the refusal's
     /// coverage and cells would be nowhere. Here: the shared stars hold 8 of
     /// the 16 paired cells of the overlap, eight chance pairs the other 8
-    /// (R4-34: the cells a pairing did not pair are not counted, so the
+    /// (R4-34: the cells the judged map does not pair are not counted, so the
     /// refusal needs pairs the inliers do not cover), the plate-solve map is
     /// refused, and the quad matcher has nothing to match.
     #[test]
@@ -4902,10 +4920,10 @@ pub(super) mod tests {
         h
     }
 
-    /// R4-18 inverted by R4-34 (RQ-10 (c')). The ten shared stars of the
+    /// R4-18 inverted by R4-34 (RQ-10 (c″)). The ten shared stars of the
     /// disjoint-population scene hold 8 of the 16 cells of the overlap, and
     /// the reference holds no other star to pair: the plate-solve map that
-    /// rests on them is exact, the cells it paired are covered by its
+    /// rests on them is exact, the cells it pairs are covered by its
     /// inliers, and the gate accepts it. Counted over the 16 cells of the
     /// grid it was refused (R4-18); a deep subject on a shallow reference
     /// lost every precise plate-solve map that way.
@@ -4934,7 +4952,7 @@ pub(super) mod tests {
             SeedPolicy::QuadFirst,
             SCALE_RANGE,
         )
-        .expect("the cells the pairing paired are covered");
+        .expect("the cells the judged map pairs are covered");
         assert_eq!(a.seed, SeedKind::Wcs);
         assert!(a.inliers >= 10, "inliers {}", a.inliers);
         // Eight cells, or nine when a field star's chance pair opens one more.
@@ -4950,7 +4968,7 @@ pub(super) mod tests {
     /// shared stars and almost nothing else. The reference cells its
     /// other stars occupy make subject stars in the other seven cells of the
     /// 4 x 4 grid eligible, and counting those cells the thirty cover 9 of
-    /// 16. The cells the pairing paired are the nine, all covered: accepted.
+    /// 16. The cells the judged map pairs are the nine, all covered: accepted.
     #[test]
     fn a_subject_ten_times_denser_than_its_reference_is_accepted_on_the_stars_they_share() {
         let truth = similarity(1.0, 1.5, 11.0, -7.0);
@@ -5049,6 +5067,180 @@ pub(super) mod tests {
                 "accepted: coverage {covered:.2}, {} inliers",
                 refit.inliers.len()
             ),
+        }
+    }
+
+    /// The truth of the wrong-first-fit scenes: [`bent_linear`] plus a smooth
+    /// quadratic bend that grows from the frame's first corner, 3 px at the
+    /// far one. No linear map is exact on it (the best one is about a pixel
+    /// off over the frame), and a linear fit on part of the frame leaves it
+    /// further off beyond the part.
+    fn bent_truth(x: f64, y: f64) -> (f64, f64) {
+        let (u, v) = bent_linear().apply(x, y);
+        let b = ((x / SEED_SUBJECT.0).powi(2) + (y / SEED_SUBJECT.1).powi(2)) / 2.0;
+        (u + 0.8 * 3.0 * b, v + 0.6 * 3.0 * b)
+    }
+
+    fn bent_linear() -> Linear {
+        similarity(1.0, 0.5, 6.0, -4.0)
+    }
+
+    /// 2 400 subject stars on the 6 224 x 4 168 frame (the density of the
+    /// research frames: about 8.5e-5 per px^2, so ~8 chance pairs at the
+    /// pairing radius) and their images through [`bent_truth`] with +-0.3 px
+    /// of jitter; both lists shuffled. Also the number of stars they share.
+    fn bent_scene() -> (Vec<Star>, Vec<Star>, usize) {
+        let (w, h) = SEED_SUBJECT;
+        let subject = field(311, 2400, w, h);
+        let mut rng = SplitMix64(312);
+        let mut refs: Vec<Star> = subject
+            .iter()
+            .filter_map(|s| {
+                let (x, y) = bent_truth(s.x, s.y);
+                let (jx, jy) = ((rng.next_f64() - 0.5) * 0.6, (rng.next_f64() - 0.5) * 0.6);
+                (x >= 0.0 && y >= 0.0 && x < w && y < h).then_some(Star {
+                    x: x + jx,
+                    y: y + jy,
+                    flux: s.flux,
+                    sigma: s.sigma,
+                })
+            })
+            .collect();
+        let shared = refs.len();
+        let mut sub = subject;
+        for v in [&mut refs, &mut sub] {
+            for i in (1..v.len()).rev() {
+                let j = rng.below(i + 1);
+                v.swap(i, j);
+            }
+        }
+        (sub, refs, shared)
+    }
+
+    /// Largest distance between `map` and [`bent_truth`] over the 33 x 23
+    /// grid on the subject frame, and the share of the grid points where it
+    /// exceeds the pairing radius.
+    fn bent_error(map: &Linear) -> (f64, f64) {
+        let (mut worst, mut beyond) = (0.0f64, 0usize);
+        for j in 0..23 {
+            for i in 0..33 {
+                let x = SEED_SUBJECT.0 * i as f64 / 32.0;
+                let y = SEED_SUBJECT.1 * j as f64 / 22.0;
+                let (fx, fy) = map.apply(x, y);
+                let (tx, ty) = bent_truth(x, y);
+                let d = (fx - tx).hypot(fy - ty);
+                worst = worst.max(d);
+                beyond += usize::from(d > 3.8);
+            }
+        }
+        (worst, beyond as f64 / (33.0 * 23.0))
+    }
+
+    /// RQ-10 (c″), K1 r1: the 365 research maps in miniature. The seed is
+    /// right to within the pairing radius over a patch of the frame and
+    /// wrong everywhere else (a scale error about a point near the first
+    /// corner), so it pairs a dozen stars; the first refit rests on them and
+    /// is more than the radius off truth over most of the frame; the 4b
+    /// re-pairing through it reaches about 45 % of the shared stars; the
+    /// final refit on those is within the radius of truth everywhere, a
+    /// little off (the truth is not linear), and its inliers sit in the
+    /// cells the first refit reached. Read over the cells that pairing
+    /// reached the map covers 0.91 of them ((c′), the control below: accepted);
+    /// read over the cells the judged map pairs, all 16 (it is within the
+    /// radius of every star), 0.625. Refused.
+    #[test]
+    fn a_map_fitted_on_the_reach_of_a_wrong_first_fit_is_refused() {
+        let (sub, refs, shared) = bent_scene();
+        let geo = (SEED_SUBJECT.0 as usize, SEED_SUBJECT.1 as usize);
+        let cfg = RegistrationConfig::default();
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        let seed = band_seed(
+            &bent_linear(),
+            (0.1 * SEED_SUBJECT.0, 0.1 * SEED_SUBJECT.1),
+            (2.2e-2, 2.2e-2),
+        );
+
+        // The guards that this is the 365's case.
+        let first = pair_through(&seed, &sub, &refs, &tree, 3.8);
+        assert!(
+            (MIN_INLIERS..60).contains(&first.pairs.len()),
+            "guard: the seed pairs {} stars",
+            first.pairs.len()
+        );
+        let (_, first_refit, _) =
+            ransac_and_refit(&first, &cfg, geo).expect("guard: the seed fits");
+        let (first_off, first_beyond) = bent_error(&first_refit.linear);
+        assert!(
+            first_beyond >= 0.5,
+            "guard: the first refit is {first_off} px off, beyond the radius over {first_beyond} of the grid"
+        );
+        let (pairing, judged, _) = gate_run(&sub, &refs, &seed, geo);
+        assert!(
+            pairing.pairs.len() > first.pairs.len() && pairing.pairs.len() * 10 < shared * 6,
+            "guard: 4b taken, the pairing holds {} of the {shared} shared stars",
+            pairing.pairs.len()
+        );
+        let (_, refit, _) = ransac_and_refit(&pairing, &cfg, geo).expect("guard: the pairing fits");
+        let (off, _) = bent_error(&refit.linear);
+        assert!(
+            off > 0.15 && off <= 3.8,
+            "guard: the final map is {off} px off truth at the grid max"
+        );
+        let inlier_pts: Vec<(f64, f64)> =
+            refit.inliers.iter().map(|&i| pairing.pairs[i].0).collect();
+        let reach_pts: Vec<(f64, f64)> = pairing.pairs.iter().map(|p| p.0).collect();
+        let (control, _) = coverage(
+            &sub_pts,
+            &ref_pts,
+            &inlier_pts,
+            &reach_pts,
+            &refit.linear,
+            geo,
+        );
+        assert!(
+            control >= MIN_COVERAGE,
+            "guard: over the cells the pairing reached the map covers {control}"
+        );
+
+        match judged {
+            Err(AlignError::LowCoverage { coverage, cells }) => {
+                assert!(coverage < MIN_COVERAGE, "coverage {coverage}");
+                assert_eq!(cells, 16, "the judged map pairs every cell");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok((_, _, _, _, covered)) => panic!("accepted: coverage {covered:.3}"),
+        }
+    }
+
+    /// The twin of the scene above, seeded by the truth's linear part: right
+    /// to within the radius over the whole frame, so the seed pairs the field,
+    /// the fit rests on all of it and its inliers are in every cell. Accepted,
+    /// at 1.0: the wrong first fit, not the nonlinear truth, is what the gate
+    /// refuses.
+    #[test]
+    fn a_map_fitted_on_the_same_scene_seeded_by_the_truth_is_accepted() {
+        let (sub, refs, shared) = bent_scene();
+        let geo = (SEED_SUBJECT.0 as usize, SEED_SUBJECT.1 as usize);
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        let seed = bent_linear();
+        let at_seed = pair_through(&seed, &sub, &refs, &tree, 3.8).pairs.len();
+        assert!(
+            at_seed * 10 >= shared * 9,
+            "guard: the seed pairs {at_seed} of the {shared} shared stars"
+        );
+        match gate_run(&sub, &refs, &seed, geo).1 {
+            Ok((_, refit, _, _, covered)) => {
+                assert_eq!(covered, 1.0, "coverage {covered}");
+                let (off, _) = bent_error(&refit.linear);
+                assert!(
+                    off > 0.15 && off <= 3.8,
+                    "{off} px off truth at the grid max"
+                );
+            }
+            Err(e) => panic!("refused: {e}"),
         }
     }
 
