@@ -239,6 +239,15 @@ export default function About() {
           <ExtLink href="https://github.com/n0-computer">GitHub (n0-computer)</ExtLink>
         </div>
 
+        <p className="text-content-secondary leading-relaxed pt-2">
+          The narrowband sky behind the Sky Chart is the{' '}
+          <ExtLink href="https://www.simg.de/nebulae3">Northern Sky Narrowband Survey</ExtLink> by
+          Stefan Ziegenbalg, shown with his permission. Thanks to him for the survey and for
+          allowing its use, caching and offline download in Athenaeum, and to the{' '}
+          <ExtLink href="https://dc.g-vo.org">GAVO Data Center</ExtLink> (German Astrophysical
+          Virtual Observatory, Heidelberg) for mirroring it.
+        </p>
+
         <div className="pt-4 space-y-2">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-content-muted">Standards &amp; Data</h3>
           <ul className="space-y-1.5 text-content-secondary text-sm">
@@ -259,6 +268,27 @@ export default function About() {
               <ExtLink href="https://healpix.sourceforge.io/">HEALPix</ExtLink>
               {' '}— Hierarchical Equal Area isoLatitude Pixelation (Górski et al., 2005); used via{' '}
               <ExtLink href="https://github.com/cds-astro/cds-healpix-rust">cdshealpix</ExtLink> for spatial indexing.
+            </li>
+            <li>
+              <ExtLink href="https://www.ivoa.net/documents/HiPS/">HiPS</ExtLink>
+              {' '}— Hierarchical Progressive Surveys (IVOA Recommendation, Fernique et al., 2017); the
+              Sky Chart's survey background. Mirrors are found through the CDS HiPS lists and the VO
+              registry (RegTAP).
+            </li>
+            <li>
+              <ExtLink href="http://archive.stsci.edu/dss/copyright.html">DSS colored</ExtLink>
+              {' '}— Digitized Sky Survey, STScI/NASA, coloured and HiPS-tiled by{' '}
+              <ExtLink href="https://cds.unistra.fr">CDS, Strasbourg</ExtLink> (ODbL-1.0). The Digitized Sky
+              Surveys were produced at the Space Telescope Science Institute under U.S. Government grant
+              NAG W-2166, from photographic data of the Oschin Schmidt Telescope on Palomar Mountain and
+              the UK Schmidt Telescope.
+            </li>
+            <li>
+              <ExtLink href="https://www.simg.de/nebulae3">Northern Sky Narrowband Survey</ExtLink>
+              {' '}— Stefan Ziegenbalg (CC BY-NC-SA 4.0): H-alpha, [OIII], [SII] and continuum north of
+              Dec −16°; mirrored by the GAVO Data Center. Background correction and intensity calibration
+              use data of the Wisconsin H-alpha Mapper (WHAM), funded primarily by the National Science
+              Foundation.
             </li>
           </ul>
         </div>
