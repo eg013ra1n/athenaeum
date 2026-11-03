@@ -819,9 +819,10 @@ enum Fallback {
     ToWcs,
 }
 
-/// The short reason a quad-seeded attempt failed, for the R-T6-9
-/// fallback's warning — each error's own wording minus the prefix the
-/// warning already supplies.
+/// The short reason a lead attempt failed, for the R-T6-9 fallback's
+/// warning — each error's own wording minus the prefix the warning already
+/// supplies. The lead is a quad-seeded attempt, or a plate-solve one whose
+/// map the coverage gate refused (`LowCoverage`).
 fn quad_failure_reason(e: &AlignError) -> String {
     match e {
         AlignError::NoSeed { matches, .. } => format!("{matches} quad matches"),
@@ -3037,7 +3038,7 @@ mod tests {
             "{:?}",
             a.warnings
         );
-        // The linear kind is whatever the ten inliers resolve to; what this
+        // The linear kind is whatever the sixteen inliers resolve to; what this
         // pins is the suffix — the row must name the seed that shipped it.
         assert!(
             model_name(a.model, a.distortion, a.seed).ends_with("+wcs"),
@@ -4482,13 +4483,15 @@ mod tests {
                     if first { "the true one" } else { "the false one" }
                 );
             }
-            if at_top.iter().any(|g| *g != first) {
+            // A `>=` keeps the LAST hypothesis to reach the maximum, so the
+            // scene discriminates only when that one is the other group.
+            if *at_top.last().unwrap() != first {
                 flipped_by_ge += 1;
             }
         }
         assert!(
             flipped_by_ge >= 1,
-            "guard: no scene had both groups at the top consensus"
+            "guard: no scene ended with the other group last at the top consensus"
         );
     }
 }
