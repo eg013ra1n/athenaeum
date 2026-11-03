@@ -81,8 +81,8 @@ hangs on the saturated stars' `tflux`; set 109's top-weight frame is a sharp one
 - **Measure reads `fwhm_px` 0 on point-sampled Gaussian fixtures under 2.5 px** (D1 review m1; unverified, likely the fixture). Settle with a real undersampled frame and a Moffat β 4 fit at 2.0-2.4 px.
 - **Reweigh's `nch` = the maximum plane count over the group's members, integrate's reference `channels` = the reference's, so in a mixed group the two can differ** (d2d review m3, pre-existing; no
   reproduction on a real set).
-- **The PD-39 anchor-map warn is log-only at 0.6** (`COMMON_WARN_SHARE`, PD-44) until the robust-seed plan's RQ-6 inlier warn lands (`docs/superpowers/plans/2026-11-02-robust-quad-seed.md`; it lands after
-  Plan D and moves runB / s204 mono registration rows; PD-39's fragility is its subject). A map error that removes under 40 % of the common set's candidates is silent until then.
+- **The PD-39 anchor-map warn is log-only at 0.6** (`COMMON_WARN_SHARE`, PD-44): a map error that removes under 40 % of the common set's candidates is silent there. The registration-side detector is
+  the low-inlier warn (RQ-6, `docs/stacking/README.md` "Robust quad seed and the coverage gate").
 - **Recorded limits Plan D added** (R-OSP-18, after note §8): PD-22 / PD-43 (LN's OSC and s204 B-plane scale against the flux truth), PD-34 (s204 OSC B-S on its bar), PD-24 (LDN1272 mono under D1 gains
   +1…+1.6 % PSF SNR at the centre and loses about 2 % in the outer fifth: the favoured frames are sharper at the centre than at the corners), PD-11 (the registration reference stays on the Measure-time weight).
 
@@ -110,6 +110,15 @@ The three M101 frames are one night (2023-06-18, ASI6200 at 1960 mm, ~1300–150
 separates them from the solvable frames (`ldn621` decides the corner), so no rule is proposed; Plan D needs a new signal.
 
 ---
+
+## The robust quad seed — what it leaves (2026-11-03)
+
+Reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"; plan `docs/superpowers/plans/2026-11-02-robust-quad-seed.md`.
+
+- **The star-measurement program's comparator kit (`pland-<ds>-rqs`, stripped) is owed.** The clones were deleted whole after R6 r2 (R4-40). Regenerate at the merged head with one `accept` / `ln-truth rqs`
+  run (~1 h on the dev Mac, ~220 GB until stripped); R6 r2's committed tables (lab 327177d) are the proof any regeneration must reproduce.
+- **Set 258's ×0.2 L bin 1 group registers at today's quality.** On fable's trial four of its frames take affine maps on 24–27 inliers that read 0.35–0.37 px median / 1.4–1.8 px max off the reference
+  group's consensus; the gate passes them, as the base stacked them. A better partial-overlap registration at ×0.2 is R-T6-9's item, not the gate's (fable X r2 §1; R7b r5 reads the real maps).
 
 ## Rejection normalization by star flux — what it leaves (2026-11-01)
 
@@ -348,6 +357,13 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### The robust quad seed and the coverage gate (2026-11-03)
+
+Branch `robust-seed` (reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"). Owed, on the owner's catalog after the update:
+
+- **Re-stack runB / LDN1272 and set 204.** Every mono frame registers with at least half its group's median inliers, and no frame is refused for coverage (no "registration inliers cover … of the overlap"
+  failure in the run log; no "registration kept under half its group's median inliers" warn on a mono group). The first stack after the update re-registers every set once.
 
 ### Plan D — the stacking weight (2026-11-02)
 
@@ -2425,3 +2441,9 @@ Plan D (the stacking weight, 2026-11-02), in plain words for the translation; th
   (`MEASURE_VERSION` 8, the Analysis rows too; the per-frame star files are version 3; a stackwork built at the unreleased 002cc8ea counts fresh.)
 - **Colour cameras: the brightness of stars on the red plane is read more accurately** (more of its bright stars are kept in the sample that sets the correction). (`c` on OSC, PD-9.)
 - **Two stars too close to separate are no longer measured as one wide star when stacking** (the Blend refusal, 0.7-1.2 % of the fits). (PD-10.)
+
+The robust quad seed (registration, 2026-11-03), in plain words for the translation:
+
+- **Very sharp frames registered onto a reference from another camera no longer land a few pixels off.** (`robust_quad_seed`, RQ-1.)
+- **A frame whose registration rests on a small patch of stars is now refused, or registered from its plate solve when it has one, instead of being stacked slightly misaligned.** (The coverage gate, RQ-10.)
+- **The first stack after the update re-registers every set once.** (`ALIGN_VERSION` 1; once for both this and Plan D's re-measure when they ship in one release.)

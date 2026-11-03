@@ -1900,6 +1900,60 @@ normalization is `local`** (`RejectionNormalization`'s `#[default]`, so
   median is a knife-edge there, so read the mean beside it). Open-items
   carries it with the star-protecting rejection item.
 
+**Robust quad seed and the coverage gate (2026-11)** (plan
+`docs/superpowers/plans/2026-11-02-robust-quad-seed.md`, rulings RQ-1 … RQ-11; research
+`docs/superpowers/research/2026-11-02-sharp-frame-registration-fragility.md`; PD-39, owner decision
+2026-11-02). Registration used to seed from one least-squares fit over every quad match, so a few false
+matches dragged the seed: the sharpest mono frames registered onto an OSC reference with 87–355 inliers
+and landed up to 6.4 px off. Detail, rulings and the bars live in the plan.
+- **The seed (RQ-1 … RQ-4).** `align.rs::seed_affine` calls `robust_quad_seed`. A plain fit whose residuals
+  are all within `SEED_TOL_PX` (5 px) is returned unchanged, today's bits (the clean route). Otherwise a
+  deterministic RANSAC (`SplitMix64` with a fixed seed, 3-match samples, 5 px consensus, adaptive bound, at
+  most 2 000 iterations), then least squares over the consensus until the kept set repeats (at most 5
+  fits). Fewer than 8 matches, or a best consensus under 8, fall back to today's single fit; a consensus
+  fit that returns `None` leaves the last fit standing (RQ-2).
+  `seed_matches` still counts every quad match. The pairing radius, the 4b re-pair, `MIN_INLIERS`,
+  `maxStars` and the plate-solve fallback (R-T6-9) are unchanged.
+- **The gate (RQ-10).** Last in `fit_from_seed`, after the 4b re-pair, on every seed kind: a map is
+  accepted only when its inliers cover the overlap. (a) Occupancy: a subject star is eligible when its
+  image lands in a cell of the 16 × 16 reference grid that holds a reference star. (b) Box: a 4 × 4 grid
+  over the bounding box of the eligible stars. (c″) Coverage = cells holding a refit inlier / cells
+  holding an eligible star that the judged map itself pairs within the pairing radius. `MIN_COVERAGE`
+  0.75. A refused quad map falls back to the plate-solve seed when the frame has one, and a refused plate-solve
+  map to the quad seed; refused both ways, the frame fails with `AlignError::LowCoverage`. The `"frame registered"` event
+  carries `coverage`; a refused plate-solve seed is logged (`docs/logging/README.md`).
+- **The hash and the diagnostic (RQ-5, RQ-6).** `ALIGN_VERSION` 1 is folded into the registration hash as
+  `alignVersion`, so cached registration rows never hide the fix: the first stack after the update
+  re-registers every set once. A frame registered under half its group's median inliers gets one `warn!`
+  (log only, field `median_inliers`; no row, no UI).
+- **Probe and bars (RQ-7 … RQ-9, RQ-11).** `examples/regfrag_probe.rs` is the committed probe. The bars
+  and the truth maps (RQ-8, a homography over the map under judgment from other frames' register lists)
+  live in athenaeum-lab (`star-lab/bin/regfrag_bars.py`, `harness/acceptance/regfrag.sh`). The cross-scale
+  control (X) is part of the acceptance, since the M4b sets carry the only real cross-scale registrations.
+- **Why (c″) and not (c′).** RG1 r4 (7171dce0) missed K1: under (c′), whose denominator was the cells the
+  refit's own pairing had paired, 365 imprecise plain maps (0.2–1.6 px off truth) scored 0.78–1.0,
+  because that pairing was made through the previous fit and reaches only as far as that fit was within the
+  radius; (c″) pairs through the judged map itself (fable K1 r1, R4-39). (c′) had itself replaced the
+  first form, which refused 13 frames of a ×0.2 mono group on a shallow reference list, ten of them with
+  precise maps (set 258 bin1, R4-34).
+- **Acceptance** (athenaeum-lab results; every run at 037a925d unless named):
+  - R5 offline seed gate, 29acc176, lab c027bfc: O1 238 frames identical, O2 13 / 13 (d2d 162 / 31 / 49 /
+    39 at 1 616 / 1 583 / 1 614 / 1 612 inliers), O4 800 / 800, O5 83 frames with dropped == false.
+  - RG1 r5, lab 0848c06 (K1 / K2): K1 plain 451 precise above 0.75, 585 imprecise below, none across;
+    robust 1 049 / 1 049 precise; K2 minimum 1.000 on every group, none under 0.875.
+  - R6 r2, lab 327177d: runB, s204 and hc11 at master level, every number as in r1 (4e86e512) in every
+    judge file; nothing refused, nothing re-seeded (K4 0).
+  - R7 r3, lab 1eecc3b: set 109, base run then fix run on one copy; minimum inliers 1 437 (≥ 1 414),
+    Calibrate and Measure 0 recomputed, 367 / 367 replayed rows reproduced; the counts of r2.
+  - R8, lab e64cd3c: the noreg cycle on the runner, moved 0, cumulative moved 0, inject 109 / 109.
+  - R7b: RESULT-PENDING
+- **What moved.** runB mono L: 162 (159 → 1 616 inliers, 1.404 → 0.047 px max off truth), 49 (214 →
+  1 614, 0.749 → 0.045) and 39 (355 → 1 612, 0.679 → 0.039); s204 mono: 28986 (88 → 1 609, 4.103 →
+  0.030) and 28994 (99 → 1 609, 2.446 → 0.031); all back on good maps. s204 28903 is a moved good frame
+  (R4-13: its 3 false quad matches dropped, +57 true pairs, the map moved 0.009 / 0.079 px, still good).
+  The runB mono common set 10 429 → 10 453 (0.962 of its candidates). hc11 moved nothing; its three
+  frames under half the median (70062, 69954, 69865) stay and the diagnostic names them.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,
@@ -1917,7 +1971,7 @@ integrate,master_cards}.rs`,
 `preview_step`, M4d Task 3), `crates/athenaeum-core/src/db/stacking.rs`
 (`master_lights` rows, M4d Task 3), `crates/athenaeum-core/src/
 fits_writer/{wcs,xisf_writer}.rs`; dev probes
-`examples/{measure,register,integrate,ln}_probe.rs` and the weight-audit
+`examples/{measure,register,integrate,ln}_probe.rs`, `examples/regfrag_probe.rs` and the weight-audit
 harness `examples/weight_audit.rs` (+ athenaeum-lab `harness/
 weight_audit_compare.py`).
 Frontend: `src/components/stacking/` (above),
