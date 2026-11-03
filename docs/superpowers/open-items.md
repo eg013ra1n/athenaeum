@@ -71,8 +71,9 @@ hangs on the saturated stars' `tflux`; set 109's top-weight frame is a sharp one
 (OSC; run 9: 7.41 / 7.99 / 7.86), a figure bounded by the run's own weighted-mean prediction (PD-48), not by √N. The stacking Measure refuses Blend since D3 (`MEASURE_VERSION` 8). What Plan D left:
 - **PD-42, an owner item (outside Plan D).** On the OSC R plane the master realizes none of the sharper weighting's star-peak gain: runB p0 PSF SNR 0.9831 and s204 p0 0.9882 / drizzle 0.9883 against dbase,
   runB p2 FWHM 1.0103 (the weights predict +0.2 %; the shortfall is resampling and core rejection of 2-px stars, R-SC-1's family). Measure it with `star-lab/bin/core_replay.py`'s core-peak ratio per
-  plane on the final clones (`~/.athenaeum-acc/pland-{hc11,runB,s204}-final`, kept stripped as the robust-seed plan's RQ-9 base; the measurement needs their masters and `.rej` decisions, so strip them only
-  after it).
+  plane on the final clones (`~/.athenaeum-acc/pland-{hc11,runB,s204}-final`; the measurement needs their masters and `.rej` decisions. They were deleted on
+  2026-11-03 under the disk rule once the robust-seed plan's comparisons were committed, so the measurement first regenerates them at
+  f899a691 from the pinned before trees, ~3 h, as the robust-seed plan's RF step did).
 - **PD-47's probe.** On a 3-plane image's 1-in-4 CFA planes (R, B) below ≈ 1.9 px FWHM the 3 F aperture sum's ratio to the anchor falls with FWHM (set 109's moonlit night: B -20.3 %/px). Owed: D0's (b-ap) disc
   per plane on ten 2025-09-13 B frames of the set109 copy (the lab's D0 tool, no build). The copy `~/.athenaeum-acc/plan-d/set109` (141 GB) is kept to **2026-12-07** (REGISTRY row) for it; `pland.sh clean
   set109` after.
@@ -81,8 +82,8 @@ hangs on the saturated stars' `tflux`; set 109's top-weight frame is a sharp one
 - **Measure reads `fwhm_px` 0 on point-sampled Gaussian fixtures under 2.5 px** (D1 review m1; unverified, likely the fixture). Settle with a real undersampled frame and a Moffat β 4 fit at 2.0-2.4 px.
 - **Reweigh's `nch` = the maximum plane count over the group's members, integrate's reference `channels` = the reference's, so in a mixed group the two can differ** (d2d review m3, pre-existing; no
   reproduction on a real set).
-- **The PD-39 anchor-map warn is log-only at 0.6** (`COMMON_WARN_SHARE`, PD-44) until the robust-seed plan's RQ-6 inlier warn lands (`docs/superpowers/plans/2026-11-02-robust-quad-seed.md`; it lands after
-  Plan D and moves runB / s204 mono registration rows; PD-39's fragility is its subject). A map error that removes under 40 % of the common set's candidates is silent until then.
+- **The PD-39 anchor-map warn is log-only at 0.6** (`COMMON_WARN_SHARE`, PD-44): a map error that removes under 40 % of the common set's candidates is silent there. The registration-side detector is
+  the low-inlier warn (RQ-6, `docs/stacking/README.md` "Robust quad seed and the coverage gate").
 - **Recorded limits Plan D added** (R-OSP-18, after note §8): PD-22 / PD-43 (LN's OSC and s204 B-plane scale against the flux truth), PD-34 (s204 OSC B-S on its bar), PD-24 (LDN1272 mono under D1 gains
   +1…+1.6 % PSF SNR at the centre and loses about 2 % in the outer fifth: the favoured frames are sharper at the centre than at the corners), PD-11 (the registration reference stays on the Measure-time weight).
 
@@ -110,6 +111,28 @@ The three M101 frames are one night (2023-06-18, ASI6200 at 1960 mm, ~1300–150
 separates them from the solvable frames (`ldn621` decides the corner), so no rule is proposed; Plan D needs a new signal.
 
 ---
+
+## The robust quad seed — what it leaves (2026-11-03)
+
+Reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"; plan `docs/superpowers/plans/2026-11-02-robust-quad-seed.md`.
+
+- **The star-measurement program's comparator kit (`pland-<ds>-rqs`, stripped) is owed.** The clones were deleted whole after R6 r2 (R4-40). Regenerate at the merged head with one `accept` / `ln-truth rqs`
+  run (~1 h on the dev Mac, ~220 GB until stripped); R6 r2's committed tables (lab 327177d) are the proof any regeneration must reproduce.
+- **Set 258's ×0.2 L bin 1 group registers at today's quality.** On fable's trial four of its frames take affine maps on 24–27 inliers that read 0.35–0.37 px median / 1.4–1.8 px max off the reference
+  group's consensus; the gate passes them, as the base stacked them. R7b r5 (lab 5056d8f) kept all 15 aligned frames with maps bitwise the base's; 12 of
+  their truths are weak (< 1 000 pairs on the reference group's members), so their class is not read there. A better partial-overlap registration at ×0.2 is
+  R-T6-9's item, not the gate's (fable X r2 §1).
+- **The final review's minors ride the next cycle** (fable final r1, MERGE, 0 C / 0 I; none moves a map, a row, a hash or a verdict).
+  m1: `stacking/run.rs` `low_inlier_rows` keeps a member that `exclude_changed_members` excluded at the persisting pass (its pass-1
+  `Aligned` outcome stays), so it enters the median or draws a warn line on that changed-file edge — filter `e.included` as
+  `reweigh_groups` does (log only). m2: `examples/regfrag_probe.rs` writes the restated no-hint quad path's `coverage` on a hint-led
+  frame's `align` object — emit `Alignment.coverage` beside it before any bar reads `coverage` off a `+wcs` frame. Nits: `seed_matches`'
+  doc names the dropped matches; `SeedRoute::Single`'s doc names the `None` first fit; `fit_from_seed` reuses the un-taken 4b pairing
+  for the judged one; the probe's `ransac_refit` mirrors core's `MIN_INLIERS` check; a hint that fails `confirm_hint()` at the
+  `ToWcs` retry logs a `debug!` with `path`.
+- **The refusal's coverage text is not yet read against a real log.** R4-28's spot-check (the lab's `refused_coverage` vs the
+  `"plate-solve seed refused; quad seed tried"` line's `coverage`) is owed to the first run whose gate refuses a map for coverage: none
+  of R6 r2 / R7 r3 / R7b r5 did.
 
 ## Rejection normalization by star flux — what it leaves (2026-11-01)
 
@@ -348,6 +371,13 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### The robust quad seed and the coverage gate (2026-11-03)
+
+Branch `robust-seed` (reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"). Owed, on the owner's catalog after the update:
+
+- **Re-stack runB / LDN1272 and set 204.** Every mono frame registers with at least half its group's median inliers, and no frame is refused for coverage (no "registration inliers cover … of the overlap"
+  failure in the run log; no "registration kept under half its group's median inliers" warn on a mono group). The first stack after the update re-registers every set once.
 
 ### Plan D — the stacking weight (2026-11-02)
 
@@ -2425,3 +2455,9 @@ Plan D (the stacking weight, 2026-11-02), in plain words for the translation; th
   (`MEASURE_VERSION` 8, the Analysis rows too; the per-frame star files are version 3; a stackwork built at the unreleased 002cc8ea counts fresh.)
 - **Colour cameras: the brightness of stars on the red plane is read more accurately** (more of its bright stars are kept in the sample that sets the correction). (`c` on OSC, PD-9.)
 - **Two stars too close to separate are no longer measured as one wide star when stacking** (the Blend refusal, 0.7-1.2 % of the fits). (PD-10.)
+
+The robust quad seed (registration, 2026-11-03), in plain words for the translation:
+
+- **Very sharp frames registered onto a reference from another camera no longer land a few pixels off.** (`robust_quad_seed`, RQ-1.)
+- **A frame whose registration rests on a small patch of stars is now refused, or registered from its plate solve when it has one, instead of being stacked slightly misaligned.** (The coverage gate, RQ-10.)
+- **The first stack after the update re-registers every set once.** (`ALIGN_VERSION` 1; once for both this and Plan D's re-measure when they ship in one release.)

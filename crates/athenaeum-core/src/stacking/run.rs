@@ -122,7 +122,9 @@ use crate::stacking::register::wcs_seed::{ratio_wants_seed, seed_from_solves};
 use crate::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
 };
-use crate::stacking::register::{scale_gate_for, scale_ratio_for, RegistrationGeometry};
+use crate::stacking::register::{
+    low_inlier_frames, scale_gate_for, scale_ratio_for, RegistrationGeometry,
+};
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
     best_by_weight, compute_weights, defers_weight_gate, reference_coverage, select_frames,
@@ -7825,6 +7827,62 @@ fn resolve_reference_fits(
     resolve_register_fits(rc, &group_key, frame_id, planes, calibrated_hash)
 }
 
+/// The rows the low-inlier diagnostic reads (robust quad seed RQ-6): `(frame_id, inliers, model)` of a group's
+/// aligned non-reference frames, cached rows included. A failed frame, a frame with no outcome and the reference
+/// are not part of the group's median.
+fn low_inlier_rows(entries: &[MeasuredFrame]) -> Vec<(i64, usize, String)> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.registration {
+            Some(RegisteredFrameOutcome::Aligned { record, .. }) if !record.is_reference => Some((
+                e.frame.frame_id,
+                record.matched_stars.max(0) as usize,
+                record.model.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Robust quad seed RQ-6: one `warn!` per frame whose registration kept under half its group's median inliers,
+/// whatever seed carried it (`model` names it). The defect this counts stood through three catalog stages because
+/// nothing counted it (R-T6-9's precedent: a distinct event makes the pattern countable). A log line only: no run
+/// warning, no row, no UI.
+fn warn_low_inlier_frames(run_id: i64, group_key: &str, rows: &[(i64, usize, String)]) {
+    let counts: Vec<(i64, usize)> = rows.iter().map(|(id, n, _)| (*id, *n)).collect();
+    let Some((median_inliers, flagged)) = low_inlier_frames(&counts) else {
+        return;
+    };
+    for (frame_id, inliers) in flagged {
+        let model = rows
+            .iter()
+            .find(|r| r.0 == frame_id)
+            .map(|r| r.2.as_str())
+            .unwrap_or_default();
+        tracing::warn!(
+            run_id,
+            group_key = %group_key,
+            frame_id,
+            inliers,
+            median_inliers,
+            model = %model,
+            "registration kept under half its group's median inliers"
+        );
+    }
+}
+
+/// Robust quad seed RQ-6, review r1 I1: the low-inlier diagnostic of a PERSISTING pass, read from the outcomes
+/// already on the group's entries — every exit of [`register_group_pass`] that follows the cache walk calls it, so a
+/// group whose every frame was a cache hit (nothing re-registered, an early return) is counted all the same.
+fn note_low_inlier_frames(rc: &RunContext, group: &IntegrationGroup) {
+    let rows = rc
+        .measured
+        .get(&group.key)
+        .map(|entries| low_inlier_rows(entries))
+        .unwrap_or_default();
+    warn_low_inlier_frames(rc.run_id, &group.key, &rows);
+}
+
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
 /// body [`stage_register`]'s per-group loop used to inline).
 ///
@@ -8132,6 +8190,9 @@ fn register_group_pass(
     }
 
     if to_register.is_empty() && needs_artifact_rewrite.is_empty() {
+        if persist {
+            note_low_inlier_frames(rc, group);
+        }
         return Ok(pass);
     }
 
@@ -8305,6 +8366,9 @@ fn register_group_pass(
 
     if to_register.is_empty() {
         write_failures.flush(rc, group);
+        if persist {
+            note_low_inlier_frames(rc, group);
+        }
         return Ok(pass);
     }
 
@@ -8727,6 +8791,12 @@ fn register_group_pass(
                 }
             }
         }
+    }
+    // Robust quad seed RQ-6: with every outcome of the persisting pass in
+    // (cached rows included), name the frames that kept under half the
+    // group's median inliers. The two early exits above call it too.
+    if persist {
+        note_low_inlier_frames(rc, group);
     }
     // One settled tick after the bookkeeping, so the last throttled
     // in-flight tick is never the stage's final word.
@@ -15921,6 +15991,138 @@ mod tests {
             ln_aperture_correction: None,
             measure_floored: false,
         }
+    }
+
+    /// Robust quad seed RQ-6: one `warn!` per frame under half its group's median inliers, carrying the median and
+    /// the seed's model; a group with every frame at or over half logs nothing.
+    #[test]
+    fn a_low_inlier_frame_is_warned_once_with_its_group_median() {
+        let counts = [(1, 1_600), (2, 1_750), (3, 1_900), (4, 87), (5, 1_650), (6, 1_700)];
+        let rows: Vec<(i64, usize, String)> = counts
+            .into_iter()
+            .map(|(id, inliers)| {
+                let model = if id == 4 { "homography+wcs" } else { "homography" };
+                (id, inliers, model.to_string())
+            })
+            .collect();
+        let ((), text) =
+            crate::stacking::telemetry::capture_logs(|| warn_low_inlier_frames(41, "g-low", &rows));
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("registration kept under half its group's median inliers"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        for field in [
+            "WARN",
+            "run_id=41",
+            "group_key=g-low",
+            "frame_id=4",
+            "inliers=87",
+            "median_inliers=1675",
+            "model=homography+wcs",
+        ] {
+            assert!(lines[0].contains(field), "{field} missing in {}", lines[0]);
+        }
+
+        let fine: Vec<(i64, usize, String)> = rows
+            .iter()
+            .map(|(id, _, m)| (*id, 1_700, m.clone()))
+            .collect();
+        let ((), quiet) =
+            crate::stacking::telemetry::capture_logs(|| warn_low_inlier_frames(41, "g-low", &fine));
+        assert!(!quiet.contains("registration kept under half"), "{quiet}");
+    }
+
+    /// The rows the diagnostic reads (RQ-6): aligned, non-reference frames, cached rows included; a failed frame, a
+    /// frame with no outcome and the reference are not part of the median.
+    #[test]
+    fn the_low_inlier_rows_are_the_aligned_non_reference_frames() {
+        let aligned = |id: i64,
+                       inliers: i64,
+                       is_reference: bool,
+                       cached: bool,
+                       model: Option<&str>| {
+            let mut e = bare_measured_frame(id);
+            e.registration = Some(RegisteredFrameOutcome::Aligned {
+                map: PixelMap::linear(Linear::identity()).expect("identity map"),
+                record: RegistrationRecord {
+                    frame_id: id,
+                    is_reference,
+                    matched_stars: inliers,
+                    model: model.map(str::to_string),
+                    ..Default::default()
+                },
+                cached,
+                registered_hash: String::new(),
+            });
+            e
+        };
+        let mut failed = bare_measured_frame(5);
+        failed.registration = Some(RegisteredFrameOutcome::Failed("registration failed".into()));
+        let entries = vec![
+            aligned(1, 0, true, false, None),
+            aligned(2, 1_700, false, true, Some("affine")),
+            aligned(3, 87, false, false, Some("homography+wcs")),
+            failed,
+            bare_measured_frame(6),
+            aligned(7, 1_650, false, false, None),
+        ];
+        assert_eq!(
+            low_inlier_rows(&entries),
+            vec![
+                (2, 1_700, "affine".to_string()),
+                (3, 87, "homography+wcs".to_string()),
+                (7, 1_650, String::new()),
+            ]
+        );
+    }
+
+    /// Robust quad seed RQ-6, review r1 I1: "after the persisting registration pass, cached rows included". A group
+    /// whose every included frame is a cache hit registers nothing and returns early, yet its low-inlier frame is
+    /// still named: the second stage over unchanged rows warns for the frame whose stored row kept 20 inliers.
+    #[test]
+    fn a_fully_cached_group_still_warns_for_its_low_inlier_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = StackingConfig::default();
+        cfg.reference.two_pass = false;
+        let (_ctx, fixture, _light_ids, mut rc, _working, _output) = two_pass_context(&tmp, cfg);
+
+        stage_register(&mut rc).unwrap();
+
+        // The stored rows stay fresh (same hash, same reference): only the inlier counts move.
+        let mut rows = get_registration_for_frame_set(&fixture.conn, fixture.set_id).unwrap();
+        rows.retain(|r| !r.is_reference);
+        assert!(rows.len() >= 3, "premise: a median needs three frames: {rows:?}");
+        let low_frame = rows[0].frame_id;
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.matched_stars = if i == 0 { 20 } else { 1_000 };
+            crate::registration::db::upsert_registration(&fixture.conn, row).unwrap();
+        }
+
+        let ((), text) = crate::stacking::telemetry::capture_logs(|| stage_register(&mut rc).unwrap());
+
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("registration kept under half its group's median inliers"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        for field in [
+            "WARN".to_string(),
+            format!("run_id={}", rc.run_id),
+            format!("frame_id={low_frame}"),
+            "inliers=20".to_string(),
+            "median_inliers=1000".to_string(),
+        ] {
+            assert!(lines[0].contains(&field), "{field} missing in {}", lines[0]);
+        }
+        // The premise: the second stage found every frame in the cache, so it registered nothing and returned early.
+        assert!(
+            rc.measured.values().flatten().filter(|e| e.included).all(|e| matches!(
+                &e.registration,
+                Some(RegisteredFrameOutcome::Aligned { cached: true, .. })
+            )),
+            "every included frame must be a cache hit"
+        );
     }
 
     /// Plan B B0 (PB-2): the run summary keeps LN's growth factor, its pair count and the target side's `c`. A frame LN

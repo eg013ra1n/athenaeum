@@ -119,8 +119,10 @@ Binding beside them:
   existing data, is the ruling, and the owner is informed. A lab agent never re-tunes a threshold. Push, release and
   spending stay the owner's.
 - **Branch and commits:**
-  - Branch `robust-seed` from local `main` after Plan D's merge, in the main checkout. Never touch another session's
-    worktree.
+  - Branch `robust-seed` from local `main` after Plan D's merge, in the worktree `.claude/worktrees/robust-seed`
+    (R0-3: the main checkout is shared by other sessions and the owner's interactive build). Agent builds use
+    `CARGO_TARGET_DIR=<worktree>/target-agent`; `.superpowers/` stays in the main checkout. Never touch another
+    session's worktree.
   - Pushed to GitLab for the runner, never `main`. Merged into local `main` after a clean final review; `main` is pushed
     only on the owner's word.
   - Lab work is committed and pushed in athenaeum-lab `main` after each lab step.
@@ -143,20 +145,20 @@ Binding beside them:
 | O4 deletions | 162 / 49 / 39 / 74 × the 200 single-star deletions of `q1/drop.py` (every 10th of 2 000): 800 / 800 within 0.2 px of truth, none failed | emulation: 200 / 200 each; base 162: 4 / 200 |
 | O5 mechanism | On `lists_d2d`, every frame's dropped quad matches are exactly its false matches: catalog centre > 3 px from truth's image of the image centre. Truth is `q1/truth.json` for the 9 suspects it holds and the frame's base map (`v_base`) elsewhere, never the fix head's own map (circular; review r1 M2) | 61 frames carry 1–3 false; review r1: the dropped set == the false set on 83 / 83 in each list set |
 | K1 gate vs truth (a pin) | At the R1 head, `--seed plain` (today's path) and `--seed robust` over the research lists and the 800 deletions, through the shipped `coverage`: every map ≤ 0.15 px max off truth has coverage ≥ `MIN_COVERAGE` (0.75), every map > 0.15 px off has coverage < 0.75. On these full-overlap lists the index is expected to track the reference-grid `regularity`, so K1 pins the transfer (reported: the maps where the two differ by more than one cell); it does not test what RQ-10 adds (eligibility, the overlap grid) — K2, RG2's scenes and X do | review r2: the subject-frame-grid form == `regularity` on 1 759 / 1 759 maps; ≤ 0.15 px → 1.0 (n 1 029); 0.15–1 px → 0.4375–0.5625 (n 386); > 1 px → 0.125–0.625 (n 196) |
-| K2 gate vs good frames (carries the threshold) | At the R1 head, every non-reference frame of every group of `pland-{runB,s204,hc11}-final` (OSC groups included), replayed from the clone's `.athf` lists: each frame good in base has coverage ≥ 0.75. Reported: the minimum per group and every frame under 0.875. hc11 is reported per frame (coverage, eligible cells, inliers, registration stars), its below-½ frames included. Every frame under 0.75 gets a truth map (RQ-8, base members as trusted); one whose map is ≤ 0.15 px off truth is a STOP (the gate would refuse a precise map) | research: every good frame 1.0; hc11 70062 is the one real few-star case (44 registration stars, 37 inliers). Risk on record: `AUTO_DISTORTION_MIN_REGULARITY`'s note saw whole-frame `regularity` 0.69 on a well-covered OSC subject; RQ-10's eligible cells and overlap grid exist for that case |
+| K2 gate vs good frames (carries the threshold) | At the R1 head, every non-reference frame of every group of `pland-{runB,s204,hc11}-final` (OSC groups included), replayed from the clone's `.athf` lists: each frame good in base has coverage ≥ 0.75. Reported: the minimum per group and every frame under 0.875. hc11 is reported per frame (coverage, paired cells, inliers, registration stars), its below-½ frames included. Every frame under 0.75 gets a truth map (RQ-8, base members as trusted); one whose map is ≤ 0.15 px off truth is a STOP (the gate would refuse a precise map) | research: every good frame 1.0; hc11 70062 is the one real few-star case (44 registration stars, 37 inliers). Risk on record: `AUTO_DISTORTION_MIN_REGULARITY`'s note saw whole-frame `regularity` 0.69 on a well-covered OSC subject; RQ-10's eligible cells and overlap grid exist for that case |
 | K4 gate at master level | Per dataset at the fix: the gate refuses (`LowCoverage`) or sends to the plate-solve seed no frame good in base. Every frame it refuses or re-seeds is named with its base map's truth error; a refused frame whose base map is ≤ 0.15 px off truth is a STOP | RQ-10 |
 | E | B-E EQUAL: the fix moves no Measure number (`pland.sh --measure equal`) | — |
-| G | Every frame **good in base** has bit-identical registration rows at the fix. Good in base = aligned, quad-seeded (no `+wcs` under quad-first), inliers ≥ ½ its group's median. Rows compared: `registration_results` transform_json, matched_stars, rms_residual_px, inlier_ratio, peak_error_px, scale, rotation_deg, flipped, status, model, affine_*; `stacking_run_frames` reg_status, reg_model, reg_inliers, reg_rms_px. Not compared: config_hash, registered_at, compute_time_ms. `inlier_ratio` is inliers / pairs, the one pairs-derived column, and the pairs move with the seed while map and inliers stay (lists_f1 frames 26 / 153: pairs 1 753 → 1 754, 1 732 → 1 734; review r1 I1): it is compared bitwise only for frames with `droppedQuads == 0` (from P2's replay) and reported for the others. Every other column is compared bitwise on every good frame. Applies to every group of every dataset | O1's measured identity |
+| G | Every frame **good in base** (aligned, quad-seeded with no `+wcs` under quad-first, inliers ≥ ½ its group's median) is judged at the fix by P2's `droppedQuads` (R4-13, fable). (a) `droppedQuads == 0` (its seed is today's bits): every compared column bitwise equal, `inlier_ratio` included — a difference is a FAIL. (b) `droppedQuads > 0`: `inlier_ratio` reported, never compared; every other compared column bitwise equal → PASS. Otherwise the frame is a **moved good frame** and PASSES only with all four, on its own RQ-8 truth (a weak truth is a STOP to fable): (1) every dropped quad match is false (catalog centre > 3 px from the truth's image of its image centre, O5's test) and no kept match is; (2) still good at the fix — aligned, seed `Quads`, coverage ≥ 0.75, inliers ≥ base inliers − 2; (3) over the 33 × 23 grid, `fix_med ≤ base_med + 0.01 px` and `fix_max ≤ base_max + 0.05 px`; (4) the move (fix vs base) ≤ 0.10 px max — a larger move on a good frame is a STOP to fable. (1)–(3) missed → FAIL. The judge names every moved good frame (dropped count, inliers base → fix, move median / max, base and fix off truth median / max). A moved good frame is a moved row: its group is a moved group for U (judged by M); it is never S's frame. Rows compared: `registration_results` transform_json, matched_stars, rms_residual_px, inlier_ratio, peak_error_px, scale, rotation_deg, flipped, status, model, affine_*; `stacking_run_frames` reg_status, reg_model, reg_inliers, reg_rms_px; not compared: config_hash, registered_at, compute_time_ms. Applies to every group of every dataset | O1's measured identity; s204 28903 (R4-13): 3 false quads dropped, +57 pairs, move 0.009 / 0.079 px, base 0.036 / 0.189 vs fix 0.029 / 0.221 px off truth |
 | F | runB mono L and s204 mono: every frame bad in base is aligned at the fix, inliers ≥ ½ the group median, ≤ 0.15 px max and ≤ 0.05 px median off truth over the 33 × 23 grid; seed kind reported | emulation 0.06–0.08 max; good frames 0.03 median |
 | H | hc11 L / G and every OSC group: a frame bad in base either registers within F's precision at the fix, or fails (its old reason or `LowCoverage`), or keeps inliers ≥ base with max off truth ≤ base + 0.05 px. A frame aligned at the fix with max off truth > 0.15 px and coverage ≥ 0.75 is a STOP (the gate passed a wrong map). Predicted bad: 70062 (31), 69954 (205), 69865 (211), 1 L and 2 G failed outright | research Q2: blunt frames, a different path |
 | U | Every group with no moved registration row and no refused frame: master HDU pixel data byte-identical to base (headers carry run cards and hashes), and its per-member LN gaps in the b3 compare equal | integration determinism (Plan A Step 5a; pcores control) |
 | M | `pland_bars.py` against the base: B-M (noise ratio ≤ 1.02, FWHM ratio ≤ 1.01), B-LN GROUPS WORSE 0 (PD-8's rule), B-W ρ ≥ 0.9 (expected ≥ 0.99 on the moved groups, 1.0 elsewhere), B-S | Plan D bars |
-| S | **Star check under `local` (R-SC-1)**, per moved mono group, on its moved frame with the largest weight (runB: 162). The header names the rejection mode base and fix posted, per dataset (`<stage>/<ds>/config.json` `normalization.rejection`; `local` on both by PD-40). A base / fix mismatch is a STOP for U, M and S, never a judged bar (review r1 C1). S1: its rejected fraction (`stats_json.rejected_fraction_per_frame`) at the fix ≤ base + 0.1 pp, and ≤ the max over the group's other F ≤ 2.5 px frames at the fix + 0.25 pp. S2: bright stars (≥ 40 σ) binned by \|e\| = \|base map − truth\| at the star (0–0.5, 0.5–1.0, ≥ 1.0 px; at the `final` base, 162's base map is the 159-inlier one). Each bin is judged against the 0–0.5 bin, so the rule reads "no trend with \|e\|": its master FWHM (fix / base − 1) minus the 0–0.5 bin's ≤ +0.4 %, and its ellipticity Δ minus the 0–0.5 bin's ≤ +0.002. The 0–0.5 bin's own change is reported; a flat LN or weight shift is bar M's, and it cannot fail every bin here (review r1 M3). Core-peak ratio (`core_replay.py`'s) reported. A bin with no stars is reported as vacuous | Q3: floor ±0.4 % FWHM, ±0.002 e; 162 at 4.33 % (d2d) / 2.71 % (d3) vs 2.29–2.36 % (global) |
+| S | **Star check under `local` (R-SC-1)**, per moved mono group, on its bad-in-base moved frame with the largest weight (runB: 162; s204: 28994; R4-13: a moved good frame is never S's frame, and a moved group with no bad-in-base moved frame reports S vacuous). The header names the rejection mode base and fix posted, per dataset (`<stage>/<ds>/config.json` `normalization.rejection`; `local` on both by PD-40). A base / fix mismatch is a STOP for U, M and S, never a judged bar (review r1 C1). S1: its rejected fraction (`stats_json.rejected_fraction_per_frame`) at the fix ≤ base + 0.1 pp, and ≤ the max over the group's other F ≤ 2.5 px frames at the fix + 0.25 pp. S2: bright stars (≥ 40 σ) binned by \|e\| = \|base map − truth\| at the star (0–0.5, 0.5–1.0, ≥ 1.0 px; at the `final` base, 162's base map is the 159-inlier one). Each bin is judged against the 0–0.5 bin, so the rule reads "no trend with \|e\|": its master FWHM (fix / base − 1) minus the 0–0.5 bin's ≤ +0.4 %, and its ellipticity Δ minus the 0–0.5 bin's ≤ +0.002. The 0–0.5 bin's own change is reported; a flat LN or weight shift is bar M's, and it cannot fail every bin here (review r1 M3). Core-peak ratio (`core_replay.py`'s) reported. A bin with no stars is reported as vacuous | Q3: floor ±0.4 % FWHM, ±0.002 e; 162 at 4.33 % (d2d) / 2.71 % (d3) vs 2.29–2.36 % (global) |
 | D | `"registration kept under half its group's median inliers"` at the fix: runB 0, s204 0, hc11 = its bad-in-base frames that stay aligned under ½ (predicted among 70062, 69954, 69865), set 109 0 | Q2 |
 | C | Plan D's runB mono common set / candidates ≥ 0.9 at the fix (d3: 0.96, d2d: 0.54); DF-b's "far under the anchor's candidates" warn 0 times; set sizes vs base reported | PD-39 |
 | P | P1: `register_check.py` base vs fix on s204's sharp + broad mono frames: share ≥ 0.98 (expected 1.000). P2: the fix clone's own `.athf` lists, replayed through `regfrag_probe batch` at the fix head, reproduce every quad-seeded frame's row (inliers and transform equal) in every group of runB, s204 and hc11. The replay's per-frame `droppedQuads` is G's `inlier_ratio` input | Plan A Task 14b registration bar; research exactness checks |
 | V | Set 109: base run, then a fix run on the same copy. Calibrate and Measure are reused (0 recomputed) and Register recomputes every frame (the `alignVersion` fold). G on every frame; min inliers ≥ 1 414; D = 0; the gate refuses 0; masters byte-identical | research Q2 (set 109) |
-| X | **Cross-scale control** (R7b) on the M4b acceptance sets: the set holding frames 74884 / 76261 / 63926 (M4b's set 166: ×0.207 and ×1.457 onto the OSC reference; its id moved since), set 108 (×0.502, bin 1 onto bin 2) and set 195 (×1.286 inside one narrowband group). X1: base and fix run on the same copy; G on every good-in-base frame of any seed kind, and K4. X2: every cross-scale group registers at its plan ratio within ±1 % (M4b: 0.2071, 1.4574, 0.5018, 1.2851). X3: the cross-scale frames replayed with no hint (`--seed robust`, the quad path forced) through the run's own per-frame scale gate (the probe's gate column = `scale_gate_for` at the group's plan ratio; review r2 C1: under the fixed `SCALE_RANGE` every cross-scale replay would fail and X3 could not fail). Three outcomes, each counted: registered within 0.5 reference px of its run's `+wcs` map (max over the 33 × 23 grid points of the subject frame that map inside the reference); failed, by reason; a quad-path map > 0.5 px off with coverage ≥ 0.75 is a STOP. The `ScaleOutOfRange` count must be 0. X4 (reported): set 195's H 448 mm frames against the O reference with no hint, quad-path successes at base and fix (M4b run 16: 14 of 30 failed with "0 inliers") | M4b acceptance run, `docs/superpowers/research/2026-09-11-m4b-acceptance-run.md` |
+| X | **Cross-scale control** (R7b) on the M4b acceptance sets: the set holding frames 74884 / 76261 / 63926 (M4b's set 166: ×0.207 and ×1.457 onto the OSC reference; its id moved since), set 108 (×0.502, bin 1 onto bin 2) and set 195 (×1.286 inside one narrowband group). X1: base and fix run on the same copy; G on every good-in-base frame of any seed kind, and K4. X2: every cross-scale group registers at its plan ratio within ±1 % (M4b: 0.2071, 1.4574, 0.5018, 1.2851). X3: the cross-scale frames replayed with no hint (`--seed robust`, the quad path forced) through the run's own per-frame scale gate (the probe's gate column = `scale_gate_for` at the group's plan ratio; review r2 C1: under the fixed `SCALE_RANGE` every cross-scale replay would fail and X3 could not fail). Three outcomes, each counted (fable X r1 §2, R4-33 (2): the `+wcs` map is the wrong referee, since between two optical trains its own floor is 0.5–1.4 px at the edges): **registered** — the no-hint map's error against the frame's own R4-14 truth map (the run row's truth, the same members; error = \|R(p) − T(p)\| over the 33 × 23 subject grid points that map inside the reference) has median ≤ 0.5 px and max ≤ 3 px (O5's false-match line); **failed**, by reason; **STOP** — a quad-path map with coverage ≥ 0.75 whose median > 0.5 px or max > 3 px off truth (the gate passed a false map). Beside every registered frame: its (median, max) next to the `+wcs` map's own off the same truth, inliers R vs `+wcs`, coverage. A weak truth is reported, not judged (printed «X3 weak truth N (reported, not judged): no-hint median worst a / max worst b px, M beyond the bars» with the two worst rows, fable X r2 §2). The `ScaleOutOfRange` count must be 0. X4 (reported): set 195's H 448 mm frames against the O reference with no hint, quad-path successes at base and fix (M4b run 16: 14 of 30 failed with "0 inliers") | M4b acceptance run, `docs/superpowers/research/2026-09-11-m4b-acceptance-run.md` |
 | N | Noreg lab cycle at the fix head vs the last Plan D cycle step: moved 0; cumulative vs t01c moved 0; inject 109 / 109 | `star_probe`'s `register` path is the star list, not `align` |
 
 ## Review Focus
@@ -211,9 +213,9 @@ Recorded in `.superpowers/sdd/2026-11-02-regfrag/rulings.md` at R0, and in `docs
 | RQ-5 | **`ALIGN_VERSION` 1, folded into `registration_subtree` as `"alignVersion"`** (LN_MODEL_VERSION's precedent, R-M4a-15's reasoning: no config field moves when `align` changes). Policy: one bump per merged plan that changes what `align` returns for an unchanged star list; this plan's seed and gate share version 1. Cost: every set re-registers (and re-normalizes, re-integrates) once; zero extra when it ships in the same release as Plan D's `MEASURE_VERSION` 8. Cost if wrong: one extra re-registration per set. |
 | RQ-6 | **The diagnostic is a log line only.** It covers both seed kinds. The median runs over the group's aligned non-reference frames after the persisting pass, cached rows included. A frame with inliers < ½ that median gets one `warn!`, with `model` naming its seed. There is no run warning, no row and no UI. Reason: the defect stood through three catalog stages because nothing counts it; R-T6-9's precedent ("a distinct event makes the pattern countable"). |
 | RQ-7 | **The probe goes into core `examples/`** as `regfrag_probe.rs`. Reasons: the offline gate (R5), the coverage gate (RG1) and parity P2 need it at the fix head; probes stay in core and lab tools in athenaeum-lab (memory); about 300 lines, built only with `--example`. |
-| RQ-8 | **Truth and the bar rule.** Truth is a direct 8-parameter homography of the frame's unsaturated fits against 20 trusted members' fits mapped through their maps (iterated at 6 / 4 / 1.5 / 1.0 px, unique matches; `truthmaps.py`). Trusted = rows bit-identical between base and fix, and inliers ≥ 0.75 × the group median, taken evenly across the group; the frame itself is never its own member. A truth with < 10 000 pairs or rms > 0.5 px is flagged weak and reported. Truth is computed for moved frames, bad-in-base frames, refused frames and 10 controls per mono group (controls must read ≤ 0.10 px max, else STOP). Maps are evaluated through `regfrag_probe mapgrid` (`PixelMap::from_json` + `forward_exact`), never re-implemented in Python. |
+| RQ-8 | **Truth and the bar rule** (as amended by R4-14, then R4-33 (4b), R4-34 and R4-35, fable). Truth is an 8-parameter homography correction C over the map under judgment, on the registration's own stars: the subject's register list (the list `regfrag_probe fits` / `detect` gives, as the P2 parity lists; never the unsaturated `fitsall` population) mapped through that map by `regfrag_probe mappoints` (its spline included) is paired uniquely with 20 trusted members' register lists mapped through their stored maps, iterated at 6 / 4 / 1.5 / 1.0 px with C refit after each radius; truth = C ∘ map, and the map's error at a grid point q (its `mapgrid` image) is \|C(q) − q\|. For a homography map this equals the direct truth to 0.001 px; for a TPS map it judges the map the run shipped. Trusted = rows bit-identical between base and fix, and inliers ≥ 0.75 × the group median, taken evenly across the group; every trusted member when 20 give < 10 000 pairs; the frame itself is never its own member. **Own-ratio members** (fable X r1 §4b, R4-35): the trusted members and the controls of a mixed-ratio group are taken among the frames whose own ratio to the reference is within `XCROSS_EPS` of 1 (the same-ratio frames); "typical" (≥ 0.75 × the median inliers) is read against that cluster; under 5 such trusted frames (`TRUSTED_MIN_CLUSTER`) → all trusted. **A truth needs ≥ 2 members** (fable X r2 §3): with 1 it is weak ("1 member"), whatever its pairs. A cross-scale subject whose own group holds fewer than `TRUSTED_MIN_CLUSTER` trusted same-ratio frames takes its members from the REFERENCE's group (R4-35: every cross-scale group with no ratio-1 frame, so set 258 bin1 / bin2 and both set 108 groups): its trusted frames (aligned, non-reference, bit-identical base / fix, inliers ≥ 0.75 × that group's median), 20 evenly, all when 20 give < 10 000 pairs; members and lists are group-qualified `(group, key)`; controls stay in the subject's group. **Weak** = pairs < 1 000 or rms > 0.5 px (fable X r1 §4b), with two classes judged and printed: 1 000 ≤ pairs < 5 000 with rms ≤ 0.5 px is **few pairs** (8 parameters at 1 000 pairs and 0.2 px rms put the formal edge error at ≤ 0.05 px, a third of the bar); and a cross-scale subject (own ratio off 1 by more than `XCROSS_EPS`, read on same-ratio members) whose truth reads rms > 0.5 px is weak only under 10 000 pairs (`MEMBERS_ALL_PAIRS`) — at ≥ 10 000 pairs it is judged and printed "cross-train rms R" (fable X r2 §2: the floor of a homography between two optical trains, not weakness). Controls keep the 0.5 px line. Every reading is the pair (hull median, hull max) over the 33 × 23 grid points inside the convex hull of the frame's own paired register stars (subject px); the full-grid max and the hull's point count are reported beside, never judged. The precision bars (F, H, K2, K4, G) read their max / median as hull max / hull median. Truth is computed for moved frames, bad-in-base frames, refused frames and 10 controls per mono group. A control is a good-in-base, unmoved, aligned frame taken evenly across the group; it passes when its truth is not weak and its hull median is ≤ 0.10 px; a control over that, a weak control, or a control whose hull max exceeds 0.30 px is a STOP to fable with its full row — a wrong truth tool, never a map verdict. A frame whose truth is weak is reported to fable and never fires K2 / K4 by itself. Maps are evaluated through `regfrag_probe mapgrid` / `mappoints` (`PixelMap::from_json` + `forward_exact`), never re-implemented in Python. |
 | RQ-9 | **The base.** If Plan D's `pland-<ds>-final` clones exist with their comparator kit and `git diff --quiet <final sha> <main> -- crates solvemyastro rustafits` holds, the base is `final`. Otherwise R0 runs `rbase` at `main`. The `final` runs post `local` on hc11, runB and s204 (PD-40), and the `rqs` runs post the same; R4's `PLAND_BASE_RESULTS` reads the base's results where they are (`results/plan-d/final/`). |
-| RQ-10 | **The coverage gate.** A map is accepted only if its inliers cover the overlap. The index is `coverage`, in subject pixels. (a) A subject registration star is *eligible* when its image through the refit's linear map lands inside the reference frame (no clamping into edge cells, unlike `regularity`; review r2 M3) in a cell of a `REFERENCE_OCCUPANCY_GRID` 16 × 16 grid over the reference that holds a reference registration star. The occupancy test keeps a reference whose list is empty in part of the frame (clouds, a dense nebula, a vignetted corner) from refusing every subject. (b) A `COVERAGE_GRID` 4 × 4 grid is laid over the bounding box of the eligible stars, so it always spans the overlap: the whole frame for a full overlap, a corner for a small one. (c) coverage = the grid cells holding a refit inlier ÷ the cells holding an eligible star (a zero-width side of the box is one column or row). `MIN_COVERAGE` = 0.75 (12 of 16 on a dense overlap). **No floor on the cell count (review r2 M4):** a flat floor (≥ 4 of 16 subject cells) would refuse a wide subject on a narrow reference — ×4.8, an overlap of about one subject cell in 16 — which registers today through its plate solve; the grid over the overlap gives that frame its full 16 cells instead, and a map resting on one corner of a large overlap still scores 1 / 16. **Accepted by design:** a consistent false copy spread over the whole field (no estimator can tell it from the field; review r2 I3). It is checked last in `fit_from_seed`, after the 4b re-pair, on every seed kind. A refused quad map falls back to the plate-solve seed when both frames are solved, and a refused plate-solve map to the quad seed (R-T6-9's two fallbacks). A frame refused both ways fails with `AlignError::LowCoverage { coverage, cells }`, "registration inliers cover {coverage:.2} of the overlap (min 0.75)". The switch warnings keep today's two shapes, with the coverage as the reason (review r2 M7): "quad seed failed (map covers 0.13 of the overlap); plate-solve seed used" through `quad_failure_reason`, and "wcs seed pairing failed (map covers 0.13 of the overlap); quad seed used". **Measured reasons:** the reference-grid `regularity` separates the research's maps with a gap — ≤ 0.15 px off truth → 1.0, 0.15–1 px → ≤ 0.5625, > 1 px → ≤ 0.625 — and review r2 measured the subject-frame-grid form of `coverage` equal to it cell for cell on all 1 759 research maps (full overlaps, eligible cells 16 / 16); 0.75 sits in the gap. The overlap-grid form (b) differs from it only by the margin between the outermost eligible stars and the frame edge, so K1 re-pins the shipped form on the same maps. The overlap grid and the eligible stars make the rule hold where the reference grid cannot: a cross-scale subject's footprint covers 1–2 reference cells at ×0.207, a partial overlap leaves reference cells empty by geometry, and a starless part of the reference leaves cells empty by the sky. K2 carries the threshold on real frames before RG2 writes code; RG2's scenes and X cover what the research data cannot; a constant, not a config field. |
+| RQ-10 | **The coverage gate.** A map is accepted only if its inliers cover the overlap. The index is `coverage`, in subject pixels. (a) A subject registration star is *eligible* when its image through the refit's linear map lands inside the reference frame (no clamping into edge cells, unlike `regularity`; review r2 M3) in a cell of a `REFERENCE_OCCUPANCY_GRID` 16 × 16 grid over the reference that holds a reference registration star. The occupancy test keeps a reference whose list is empty in part of the frame (clouds, a dense nebula, a vignetted corner) from refusing every subject. (b) A `COVERAGE_GRID` 4 × 4 grid is laid over the bounding box of the eligible stars, so it always spans the overlap: the whole frame for a full overlap, a corner for a small one (a zero-width side of the box is one column or row). (c″) (fable K1 r1, amends (c′) / R4-34) coverage = the grid cells holding a refit inlier ÷ the cells holding an eligible star that the JUDGED map pairs: a subject star with a reference star within the pairing radius (2 × `ransac_tolerance_px`, 3.8 px) of its image through the refit's own linear map, a pairing the gate makes for itself (`pair_through(&refit.linear, …)`) and refits nothing on — never the pairing the refit was fitted on: that one was made through the previous fit (the seed's, or the first refit's under 4b) and reaches only as far as THAT fit was within the radius, so a map fitted on it is read over its own footprint and nothing else (K1 r1: 365 research maps 0.2-1.6 px off truth scored 0.78-1.0 over the 9-12 cells their first fit reached). A cell none of whose eligible stars the judged map pairs is overlap the reference cannot vouch for and counts for nothing; the eligible stars still set the grid's extent. On a dense field a map off by less than the radius pairs the real stars where it is wrong and a map off by more pairs chance stars there: either way those cells hold the denominator and no inlier. On a sparse field with no star to pair outside the part a map is right over it scores 1.0 — R4-34's accepted cost, unchanged. `coverage(subject, reference, inlier_subject_pts, pair_subject_pts, map, geometry)` keeps its signature; `fit_from_seed` and the probe's restated stages pass the fresh pairing's subject sides. `MIN_COVERAGE` = 0.75 (12 of 16 on a dense overlap). **No floor on the cell count (review r2 M4):** a flat floor (≥ 4 of 16 subject cells) would refuse a wide subject on a narrow reference — ×4.8, an overlap of about one subject cell in 16 — which registers today through its plate solve; the grid over the overlap gives that frame its full 16 cells instead, and a map resting on one corner of a large overlap still scores 1 / 16. **Accepted by design:** a consistent false copy spread over the whole field (no estimator can tell it from the field; review r2 I3). It is checked last in `fit_from_seed`, after the 4b re-pair, on every seed kind. A refused quad map falls back to the plate-solve seed when both frames are solved, and a refused plate-solve map to the quad seed (R-T6-9's two fallbacks). A frame refused both ways fails with `AlignError::LowCoverage { coverage, cells }`, "registration inliers cover {coverage:.2} of the overlap (min 0.75)". The switch warnings keep today's two shapes, with the coverage as the reason (review r2 M7): "quad seed failed (map covers 0.13 of the overlap); plate-solve seed used" through `quad_failure_reason`, and "wcs seed pairing failed (map covers 0.13 of the overlap); quad seed used". **Measured reasons:** the reference-grid `regularity` separates the research's maps with a gap — ≤ 0.15 px off truth → 1.0, 0.15–1 px → ≤ 0.5625, > 1 px → ≤ 0.625 — and review r2 measured the subject-frame-grid form of `coverage` equal to it cell for cell on all 1 759 research maps (full overlaps, eligible cells 16 / 16); 0.75 sits in the gap. The overlap-grid form (b) differs from it only by the margin between the outermost eligible stars and the frame edge, so K1 re-pins the shipped form on the same maps. The overlap grid and the eligible stars make the rule hold where the reference grid cannot: a cross-scale subject's footprint covers 1–2 reference cells at ×0.207, a partial overlap leaves reference cells empty by geometry, and a starless part of the reference leaves cells empty by the sky. K2 carries the threshold on real frames before RG2 writes code; RG2's scenes and X cover what the research data cannot; a constant, not a config field. |
 | RQ-11 | **The cross-scale control is part of the acceptance** (bar X, R7b): the M4b sets carry the only real cross-scale registrations, and every one of them took the plate-solve seed there, so the quad path at scale is proven only by replay with no hint (X3). |
 
 ## Owner decisions (answered)
@@ -245,8 +247,8 @@ landing after Plan D's merge, on `robust-seed` from local `main` (Global Constra
   move. s204 mono's LN moves if a moved frame is among its top-5.
 - **Plan D's common set.** It hangs on the anchor's map (162 on runB mono): the set size moves (d2d 5 830 → d3 10 429),
   and so do runB mono's weights (B-W).
-- **The star-measurement program's comparators (`pland-*` clones).** `pland-<ds>-rqs` becomes the comparator of every
-  later plan (re-baseline in R9). `final` / `rbase` are deleted once R6's results are committed.
+- **The star-measurement program's comparators (`pland-*` clones).** `pland-<ds>-rqs` was to become the comparator of
+  every later plan; the clones were deleted after R6 r2 and the kit is owed to the next plan (R4-40, R9). `final` / `rbase` are deleted once R6's results are committed.
 - **Users.** The first stack after the update re-registers every set once (RQ-5). The owner's runB / s204 masters change
   only where frames were bad. A frame whose registration rests on a patch of stars is now refused (or registered from
   its plate solve) instead of being stacked slightly off.
@@ -310,7 +312,7 @@ clean.
 
 ### Task R1: The robust quad seed (core) and the probe
 
-**Coupling checklist:** owns the quad seed (RQ-1, RQ-2) and the coverage index (RQ-10 (a)–(c); review r2 I1: one
+**Coupling checklist:** owns the quad seed (RQ-1, RQ-2) and the coverage index (RQ-10 (a), (b), (c″); review r2 I1: one
 computation, built once, read by the probe now and by RG2's gate later). Reads the quad matcher's output
 (`build_quads`, `match_quads`, unchanged). Re-verifies: pairing, RANSAC / refit, 4b, the plate-solve fallback, all
 unchanged; `coverage` is not called by `align()` yet.
@@ -345,11 +347,11 @@ pub fn robust_quad_seed(matches: &[(usize, usize)], image_quads: &[Quad], catalo
 
 pub const COVERAGE_GRID: usize = 4;
 pub const REFERENCE_OCCUPANCY_GRID: usize = 16;
-/// RQ-10 (a)–(c): (coverage, cells holding an eligible star). `inlier_subject_pts` are the
-/// subject sides of the refit's inlier pairs (the pairing carries coordinates, not star
-/// indices; review r2 I4).
+/// RQ-10 (a), (b), (c″): (coverage, cells holding an eligible star the judged map pairs).
+/// `inlier_subject_pts` / `pair_subject_pts` are the subject sides of the refit's inlier pairs /
+/// the pairs the judged map makes (the pairing carries coordinates, not star indices; review r2 I4).
 pub fn coverage(subject: &[(f64, f64)], reference: &[(f64, f64)], inlier_subject_pts: &[(f64, f64)],
-                map: &Linear, reference_geometry: (usize, usize)) -> (f64, usize);
+                pair_subject_pts: &[(f64, f64)], map: &Linear, reference_geometry: (usize, usize)) -> (f64, usize);
 ```
 `seed_affine` keeps its signature and return (`(Linear, matches.len())`, RQ-4). It calls `robust_quad_seed` and maps
 `None` to `NoSeed { matches, after_wcs }` as today.
@@ -406,7 +408,7 @@ loop:
   - `a_consistent_false_minority_is_recovered`: 486 true plus false matches whose catalog centres all sit at truth +
     (−2 405, 0), at 10 % and 30 % of the set → ≤ 0.5 px max off truth.
   - `the_robust_seed_is_deterministic`: the 50 % random set twice → identical `kept`, `hypotheses` and coefficient bits.
-  - `coverage_counts_only_stars_that_land_where_the_reference_has_stars` (RQ-10 (a)–(c), hand-built lists): a star
+  - `coverage_counts_only_stars_that_land_where_the_reference_has_stars` (RQ-10 (a), (b), (c″), hand-built lists, every star paired): a star
     mapped outside the reference frame, or into a 16 × 16 reference cell with no reference star, is not eligible; the
     4 × 4 grid spans the eligible stars' bounding box (a corner overlap gets 16 cells); a cell with an eligible star and
     no inlier counts against; a zero-width box is one column; a full overlap with inliers in 2 of 16 cells → 0.125.
@@ -502,10 +504,10 @@ Budget ≤ 120 calls.
     PASS, with the false set read against `truth.json` / the base map, never the fix map);
   - `test_coverage_bars` (K1 / K2 / K4): a precise map under 0.75 → K1 FAIL; a 0.3 px map at 0.80 → K1 FAIL; a good
     frame at 0.70 → K2 FAIL with the frame named; a refused frame whose base map is 0.08 px off truth → K4 STOP;
-  - `test_cross_scale_bars` (X): a ratio 1.5 % off its plan ratio → X2 FAIL; a no-hint quad map 0.7 px off its `+wcs`
-    map at coverage 0.9 → X3 STOP; a no-hint frame failed with `TooFewInliers` → X3 PASS, counted under its reason; a
-    no-hint frame failed with `ScaleOutOfRange` → X3 FAIL (the replay used the wrong gate); the 0.5 px is taken only
-    over grid points that map inside the reference;
+  - `test_cross_scale_bars` (X): a ratio 1.5 % off its plan ratio → X2 FAIL; a no-hint quad map 0.3 px median / 1.8 px max off
+    its own truth → registered, 2.1 / 17 px at coverage 0.9 → X3 STOP (fable X r1 §2); a no-hint frame failed with
+    `TooFewInliers` → X3 PASS, counted under its reason; a no-hint frame failed with `ScaleOutOfRange` → X3 FAIL (the
+    replay used the wrong gate); the 0.5 / 3 px are taken only over grid points that map inside the reference;
   - `test_numpy_median_convention`;
   - `test_ln_truth_reads_the_base_truth_under_pland_base_results` (`test_pland_sh.py`, its stub pattern; I3): the base's
     `<ds>-truth.csv` only under `$PLAND_BASE_RESULTS/final/<ds>/` → no `stop sources`; `PLAND_BASE_RESULTS` unset → the
@@ -544,8 +546,11 @@ Budget ≤ 120 calls.
     row). Release `athenaeum-web` at <base-sha>, one run (`tier1-run.sh`), `athenaeum.db` snapshotted to `base.db`. Then
     the web build at <sha>, one run on the same copy, then `reg` (G, D, V, U, K4).
   - `xscale <base-sha> <sha>` (dev Mac): a `prepare-catalog.sh` copy of the dev catalog under
-    `~/.athenaeum-acc/regfrag/xscale` (REGISTRY row; estimate ~60 GB of stacking data) holding the three sets R0 named
-    with their M4b subsets. Per set, one co-registered run at <base-sha> (Auto reference, as M4b runs 15 / 17 / 20),
+    `~/.athenaeum-acc/regfrag/xscale` (REGISTRY row; estimate ~60 GB of stacking data) holding sets 258, 108 and 195
+    (R0-2). The dev catalog keeps neither M4b's subsets nor any plate solve of these sets, so on the copy only: 30
+    lights per group under test, evenly by DATE-OBS (258: OSC 2600MC Duo, 6200MM L bin 1 at 1960 mm, 294MM L bin 2;
+    108: L bin 1, L bin 2; 195: H and O at 352 and 448 mm), the rest in the set's exclusion list; the kept lights are
+    plate-solved through the app's own batch command (as M4b did) before the base run. Per set, one co-registered run at <base-sha> (Auto reference, as M4b runs 15 / 17 / 20),
     `base.db` snapshot, one run at <sha> on the same copy; then the no-hint replay of every cross-scale frame and of set
     195's H 448 mm frames through `regfrag_probe batch` at <sha>, each manifest line carrying its group's plan ratio in
     the scale-gate column, and `regfrag_bars.py xscale`.
@@ -582,7 +587,7 @@ calibration). Budget ≤ 140 calls.
   - K1, a pin: the four counts (precise / imprecise × above / below 0.75) under both `--seed` values, and the maps
     where `coverage` and the reference-grid `regularity` differ by more than one cell.
   - K2, which carries the threshold: per dataset and group, frames, the minimum coverage and the frames under 0.875.
-  - hc11 per frame: coverage, eligible cells, inliers, registration stars, the below-½ frames included.
+  - hc11 per frame: coverage, paired cells, inliers, registration stars, the below-½ frames included.
   - The frames the gate would refuse, each with its truth error.
   - Commit results to lab.
 
@@ -614,8 +619,9 @@ pub const MIN_COVERAGE: f64 = 0.75;
 AlignError::LowCoverage { coverage: f64, cells: usize }
 ```
 `fit_from_seed(seed, …) -> (Pairing, Result<(RansacResult, RefitResult, LinearKind, usize /*repaired*/), AlignError>,
-Vec<String> /*warnings*/)` is steps 2–4b exactly as today, plus the gate last: `coverage(sub_pts, ref_pts, the
-refit's inlier pairs' subject points, &refit.linear, reference_geometry)`. `align()` calls it for the leading seed and,
+Vec<String> /*warnings*/)` is steps 2–4b exactly as today, plus the gate last: `coverage(sub_pts, ref_pts, <the
+refit's inlier pairs' subject points>, <the subject points of a pairing made through refit.linear (K1 r1)>,
+&refit.linear, reference_geometry)`. `align()` calls it for the leading seed and,
 on any `Err`, for the fallback seed as today. A discarded attempt's warnings are dropped. The switch warnings keep
 today's shapes with the coverage as the reason (RQ-10, review r2 M7): "quad seed failed (map covers 0.13 of the
 overlap); plate-solve seed used" and "wcs seed pairing failed (map covers 0.13 of the overlap); quad seed used".
@@ -649,9 +655,9 @@ overlap); plate-solve seed used" and "wcs seed pairing failed (map covers 0.13 o
   Review Focus 4's pins pass unedited; `cargo check -p athenaeum-core --no-default-features`; `cargo check -p
   athenaeum-core --examples --features render,solver`.
 - [ ] **Step 5:** dictionary entry: "**Dictionary extension (registration coverage, `stacking::register::frame`, RQ-10,
-  2026-11-xx):** `coverage` (f64; the share of a 4 × 4 grid over the subject frame whose eligible cells hold a refit
-  inlier) on the debug event `"frame registered"`." Commit `feat(stacking): a registration map must cover the overlap
-  (RQ-10)`.
+  2026-11-xx):** `coverage` (f64; the share of a 4 × 4 grid over the subject frame whose cells holding an eligible star
+  the judged map pairs hold a refit inlier; RQ-10 (c″), K1 r1) on the debug event `"frame registered"`." Commit
+  `feat(stacking): a registration map must cover the overlap (RQ-10)`.
 
 **Acceptance:** tests green; the existing-scene pin holds; the opus review is clean. Budget ≤ 100 calls.
 
@@ -742,7 +748,7 @@ loop and before the final progress tick), the logging dictionary.
   - Commit the results to lab.
 
 **Acceptance:** every bar PASS. A moved good-in-base frame (G), a refused frame with a precise base map (K4), a wrong
-map the gate passed (H), a control truth > 0.10 px, a base / fix rejection-mode mismatch, or any input unread is a STOP
+map the gate passed (H), a control over RQ-8's control bar (R4-14), a base / fix rejection-mode mismatch, or any input unread is a STOP
 to fable with the frame's probe stage row and both maps. Budget ≤ 150 calls.
 
 ---
@@ -762,8 +768,8 @@ to fable with the frame's probe stage row and both maps. Budget ≤ 150 calls.
 - [ ] **Step 1:** `disk-report`; `df` ≥ 60 GB + 150 GB; no compile running. `zsh regfrag.sh xscale <main sha at R0>
   <R3 head>`.
 - [ ] **Step 2:** report X1–X4 per set and group: aligned counts base / fix, seed kinds, scales against the plan ratio,
-  coverage minimum, the no-hint quad-path outcome per cross-scale frame (registered within 0.5 px of its `+wcs` map /
-  failed / STOP), and set 195's H 448 mm quad-path successes base → fix. Commit the results.
+  coverage minimum, the no-hint quad-path outcome per cross-scale frame (registered: median ≤ 0.5 px and max ≤ 3 px off its own
+  truth map, the `+wcs` map's reading beside / failed / STOP), and set 195's H 448 mm quad-path successes base → fix. Commit the results.
 
 **Acceptance:** X1–X3 PASS; X4 reported. A STOP goes to fable with the frame's stage row and both maps; no re-run with
 other flags. Budget ≤ 80 calls.
@@ -791,12 +797,14 @@ other flags. Budget ≤ 80 calls.
   quad matches, and a map must cover the overlap (`ALIGN_VERSION`, RQ-1 / RQ-10)".
 - **open-items:** delete any PD-39 fragility entry and the PD-39 anchor-map warn's "until RQ-6 lands" note; add the
   owed smoke "re-stack runB / LDN1272 and set 204 on the owner's catalog after the update: every mono frame ≥ ½ its
-  group's median inliers, no frame refused for coverage".
+  group's median inliers, no frame refused for coverage"; the star-measurement program's comparator kit
+  (`pland-<ds>-rqs`, stripped) is owed: regenerate it at the merged head (R4-40).
 
 - [ ] **Step 1: re-baseline.**
-  - Strip `pland-<ds>-rqs` with `pland.sh clean rqs`: the comparator kit stays.
-  - Re-label their REGISTRY rows as the star-measurement program's comparator. The expiry is the next plan's, set by the
-    controller.
+  - The `pland-<ds>-rqs` clones were deleted whole after R6 r2 (R4-40, a controller error on record), so there is
+    nothing to strip or re-label. The star-measurement program's comparator kit is owed to the next plan (open-items):
+    one `accept` / `ln-truth rqs` run at the merged head, with R6 r2's committed tables (lab 327177d) as the proof any
+    regeneration must reproduce.
   - Delete `final` / `rbase` clones and rows (superseded). `git worktree remove` the `acc-base-regfrag-*` worktree, delete
     `.superpowers/target-acc/tmp-regfrag`, and delete both rows.
   - Delete the set 109 and cross-scale copies once their results are committed, with their rows.
@@ -808,7 +816,7 @@ other flags. Budget ≤ 80 calls.
   - `cargo check -p athenaeum-core --no-default-features`, `cargo check -p athenaeum-tauri`;
   - `cargo check -p athenaeum-core --examples --features render,solver`.
   - The controller re-runs them.
-- [ ] **Step 3:** docs as above. Release-notes line owed: "Very sharp frames registered onto a reference from another
+- [x] **Step 3:** docs as above. Release-notes line owed: "Very sharp frames registered onto a reference from another
   camera no longer land a few pixels off. A frame whose registration rests on a small patch of stars is now refused, or
   registered from its plate solve when it has one, instead of being stacked slightly misaligned. The first stack after
   the update re-registers every set once."
@@ -817,7 +825,7 @@ other flags. Budget ≤ 80 calls.
   - the guards (< 8 matches, no consensus, a `None` fit);
   - `seed_matches` meaning;
   - `fit_from_seed`: a frame that passes the gate keeps today's map and warnings; the fallback on a refusal;
-  - the gate's eligible cells (partial overlap, cross-scale, a grossly wrong map);
+  - the gate's paired cells (partial overlap, cross-scale, a grossly wrong map);
   - the hash fold's reach (calib / meas untouched);
   - the diagnostic's reference filter and cached rows.
 - [ ] **Step 5:** merge `robust-seed` into local `main`; core suite on the merged tree; push only on the owner's word.
@@ -830,11 +838,11 @@ other flags. Budget ≤ 80 calls.
 | quantity | owner | consumers | bar | after value |
 | ---- | ---- | ---- | ---- | ---- |
 | the quad seed (RANSAC + consensus LS) | R1 (RQ-1, RQ-2) | pairing, RANSAC, every registration row | O1–O5, G, F, X3 | R9 |
-| the coverage index | R1 (RQ-10 (a)–(c)), the one computation | the probe, RG1, the gate | K1, K2 | R9 |
+| the coverage index | R1 (RQ-10 (a), (b), (c″)), the one computation | the probe, RG1, the gate | K1, K2 | R9 |
 | the coverage gate | RG2 (RQ-10), its threshold carried by RG1's K2 | `align`'s acceptance and fallback; the `"frame registered"` log | K4, H, X | R9 |
 | the registration hash's `alignVersion` | R2 (RQ-5) | every downstream stage hash | V, goldens | R9 |
 | the low-inlier diagnostic (`median_inliers`) | R3 (RQ-6) | logs only | D | R9 |
-| truth maps of a group's frames | R4 `regfrag_bars.py truth` (RQ-8), the one truth reader | F, H, S, K4 | controls ≤ 0.10 px | R6 |
+| truth maps of a group's frames | R4 `regfrag_bars.py truth` (RQ-8), the one truth reader | F, H, S, K4 | controls: hull median ≤ 0.10 px, hull max ≤ 0.30 px, truth not weak (R4-14) | R6 |
 | the registration list (`stars_from_fits`, the saturation cut) | Measure / `detect.rs`, unchanged | the seed | P1, E | — |
 | masters, LN, Plan D's common set and weights | downstream, re-measured only | the program's comparators | M, U, S, C | R6 |
 

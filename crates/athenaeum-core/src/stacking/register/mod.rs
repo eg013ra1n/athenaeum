@@ -64,6 +64,33 @@ pub fn scale_ratio_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -
     }
 }
 
+/// A registration that kept fewer refit inliers than this share of its
+/// group's median is flagged by [`low_inlier_frames`] (robust quad seed RQ-6).
+const LOW_INLIER_SHARE: f64 = 0.5;
+
+/// A group needs this many aligned non-reference frames before its median
+/// means anything.
+const LOW_INLIER_MIN_FRAMES: usize = 3;
+
+/// The frames of one group whose registration kept under half the group's
+/// median refit inliers (robust quad seed RQ-6). `rows` is `(frame_id,
+/// inliers)` of the group's aligned non-reference frames. Returns `None` under
+/// [`LOW_INLIER_MIN_FRAMES`] rows, else `(median, flagged)`: the numpy median
+/// and the rows with `inliers < 0.5 * median`, in input order.
+pub(crate) fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)>)> {
+    if rows.len() < LOW_INLIER_MIN_FRAMES {
+        return None;
+    }
+    let mut counts: Vec<f64> = rows.iter().map(|r| r.1 as f64).collect();
+    let median = crate::stacking::groups::median_f64(&mut counts);
+    let flagged = rows
+        .iter()
+        .copied()
+        .filter(|r| (r.1 as f64) < LOW_INLIER_SHARE * median)
+        .collect();
+    Some((median, flagged))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelChoice {
@@ -459,5 +486,34 @@ mod tests {
         );
         assert_eq!(DistortionChoice::Polynomial2.order(), Some(2));
         assert_eq!(DistortionChoice::Auto.order(), None);
+    }
+
+    /// Robust quad seed RQ-6: a frame whose registration kept under half its group's median inliers is the defect
+    /// that stood through three catalog stages (162: 159 of ~1 600). The median is numpy's, over the group's aligned
+    /// non-reference frames; the flagged frames come back in input order.
+    #[test]
+    fn low_inlier_frames_flags_frames_under_half_the_median() {
+        let rows = [
+            (1, 1_700),
+            (2, 1_745),
+            (3, 1_800),
+            (4, 87),
+            (5, 214),
+            (6, 900),
+        ];
+        let (median, flagged) = low_inlier_frames(&rows).expect("six frames");
+        assert_eq!(median, 1_300.0);
+        assert_eq!(flagged, vec![(4, 87), (5, 214)]);
+        // Exactly half the median is not under it.
+        let (median, flagged) = low_inlier_frames(&[(1, 100), (2, 200), (3, 300)]).unwrap();
+        assert_eq!(median, 200.0);
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    /// Two frames carry no median worth judging against.
+    #[test]
+    fn low_inlier_frames_needs_three_frames() {
+        assert_eq!(low_inlier_frames(&[(1, 1_700), (2, 5)]), None);
+        assert_eq!(low_inlier_frames(&[]), None);
     }
 }

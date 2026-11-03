@@ -151,7 +151,7 @@ fn quality(pairs: &[Pair], inliers: &[usize], rms_px: f64, cfg: &RansacConfig) -
 
 /// A sample is degenerate when two subject points nearly coincide or (for
 /// 3+ points) three of them are nearly collinear.
-fn degenerate(sample: &[Pair]) -> bool {
+pub(crate) fn degenerate(sample: &[Pair]) -> bool {
     for i in 0..sample.len() {
         for j in (i + 1)..sample.len() {
             let (a, b) = (sample[i].0, sample[j].0);
