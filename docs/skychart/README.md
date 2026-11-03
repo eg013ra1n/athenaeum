@@ -76,13 +76,14 @@ A box with only some corners beyond the hemisphere is drawn; the globe clip path
 
 ## HiPS sky background (#18)
 
-A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on demand and kept locally. Phase 2: the offline pack, below. Phase 3 (NSNS DR0.2, gated on Stefan Ziegenbalg's written agreement) is in #18.
+A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on demand and kept locally. Phase 2: the offline pack, below. Phase 3 (NSNS DR0.2): Stefan Ziegenbalg's written permission is in [`nsns-permission.md`](nsns-permission.md) (2026-11-03); the design is on #18.
 
 **Rights (ruling).**
 - Tiles are never redistributed: not in the installer, the Docker image, the repo, artfrom.space, the hub or Perseus.
 - Every install fetches its own tiles from the survey's master URL into a private store.
 - The survey's `obs_copyright` and license are shown on the chart whenever it is drawn, and in Settings → General → Sky background.
 - DSS colored is `hips_status = public master clonableOnce`: a copy only from the master, never from a mirror.
+- NSNS (phase 3) is CC BY-NC-SA 4.0: free Sky Chart only, credit "Northern Sky Narrowband Survey" with https://www.simg.de/nebulae3, URLs from HiPS servers' `hipslist` files and load balanced over every mirror, cache and offline pack allowed ([`nsns-permission.md`](nsns-permission.md)).
 
 **Core (`athenaeum-core/src/hips/`, `api/hips.rs`).**
 - **Presets.** `SURVEYS` is the only source of survey URLs; there is no arbitrary-URL setting.
