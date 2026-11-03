@@ -122,6 +122,17 @@ Reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"; pl
   group's consensus; the gate passes them, as the base stacked them. R7b r5 (lab 5056d8f) kept all 15 aligned frames with maps bitwise the base's; 12 of
   their truths are weak (< 1 000 pairs on the reference group's members), so their class is not read there. A better partial-overlap registration at ×0.2 is
   R-T6-9's item, not the gate's (fable X r2 §1).
+- **The final review's minors ride the next cycle** (fable final r1, MERGE, 0 C / 0 I; none moves a map, a row, a hash or a verdict).
+  m1: `stacking/run.rs` `low_inlier_rows` keeps a member that `exclude_changed_members` excluded at the persisting pass (its pass-1
+  `Aligned` outcome stays), so it enters the median or draws a warn line on that changed-file edge — filter `e.included` as
+  `reweigh_groups` does (log only). m2: `examples/regfrag_probe.rs` writes the restated no-hint quad path's `coverage` on a hint-led
+  frame's `align` object — emit `Alignment.coverage` beside it before any bar reads `coverage` off a `+wcs` frame. Nits: `seed_matches`'
+  doc names the dropped matches; `SeedRoute::Single`'s doc names the `None` first fit; `fit_from_seed` reuses the un-taken 4b pairing
+  for the judged one; the probe's `ransac_refit` mirrors core's `MIN_INLIERS` check; a hint that fails `confirm_hint()` at the
+  `ToWcs` retry logs a `debug!` with `path`.
+- **The refusal's coverage text is not yet read against a real log.** R4-28's spot-check (the lab's `refused_coverage` vs the
+  `"plate-solve seed refused; quad seed tried"` line's `coverage`) is owed to the first run whose gate refuses a map for coverage: none
+  of R6 r2 / R7 r3 / R7b r5 did.
 
 ## Rejection normalization by star flux — what it leaves (2026-11-01)
 
