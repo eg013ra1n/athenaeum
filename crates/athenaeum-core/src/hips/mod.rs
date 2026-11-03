@@ -78,6 +78,9 @@ pub struct HipsSurvey {
     /// Typical size of one tile in bytes; used for estimates when the
     /// survey's own `properties` have not been stored yet.
     pub approx_tile_bytes: u64,
+    /// Share of the sky the survey covers (`moc_sky_fraction`), likewise
+    /// until its `properties` are stored.
+    pub approx_sky_fraction: f64,
     /// Shown until the survey's own `properties` have been read.
     pub fallback_attribution: &'static str,
     pub fallback_license: &'static str,
@@ -103,6 +106,7 @@ pub const DSS_COLOR: HipsSurvey = HipsSurvey {
     format: TileFormat::Jpeg,
     max_order: 9,
     approx_tile_bytes: 67_000,
+    approx_sky_fraction: 1.0,
     fallback_attribution: "Digitized Sky Survey - STScI/NASA, Colored & Healpixed by CDS",
     fallback_license: "ODbL-1.0",
     creator_did: "ivo://CDS/P/DSS2/color",
@@ -128,6 +132,7 @@ const fn nsns(id: &'static str, label: &'static str, base_url: &'static str, cre
         format: TileFormat::Png,
         max_order,
         approx_tile_bytes,
+        approx_sky_fraction: 0.65,
         fallback_attribution: "Northern Sky Narrowband Survey, Stefan Ziegenbalg",
         fallback_license: "CC BY-NC-SA 4.0",
         creator_did,

@@ -427,15 +427,16 @@ mod offline_pack {
     }
 
     /// Share of the sky the survey covers (`moc_sky_fraction`, ≈ 0.65 for
-    /// NSNS), else 1: tiles outside it are 404 markers and weigh nothing.
-    fn sky_fraction(store: &HipsStore) -> Result<f64, ApiError> {
+    /// NSNS), else the preset's: tiles outside it are 404 markers and weigh
+    /// nothing.
+    fn sky_fraction(store: &HipsStore, survey: &HipsSurvey) -> Result<f64, ApiError> {
         let props = store.read_properties()?;
         Ok(props
             .as_ref()
             .and_then(|p| p.get("moc_sky_fraction"))
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|f| *f > 0.0 && *f <= 1.0)
-            .unwrap_or(1.0))
+            .unwrap_or(survey.approx_sky_fraction))
     }
 
     fn estimate_for(
@@ -448,7 +449,7 @@ mod offline_pack {
         let present = tiles.iter().filter(|&&(o, n)| store.has(o, n)).count() as u64;
         let missing = total - present;
         let bytes_per_tile = bytes_per_tile(store, survey)?;
-        let estimated_bytes = (missing.saturating_mul(bytes_per_tile) as f64 * sky_fraction(store)?) as u64;
+        let estimated_bytes = (missing.saturating_mul(bytes_per_tile) as f64 * sky_fraction(store, survey)?) as u64;
         let free_bytes = crate::disk::free_bytes(app_data);
         let fits = fits_disk(estimated_bytes, free_bytes);
         Ok(HipsPackEstimate { total, present, missing, bytes_per_tile, estimated_bytes, free_bytes, fits })
@@ -681,6 +682,21 @@ mod offline_pack {
             let msg = disk_refusal(&est(2, 150_000, Some(100 * MIB))).unwrap();
             assert_eq!(msg, "Needs about 0.1 MB plus a 512 MB reserve; 100.0 MB free");
             assert_eq!(disk_refusal(&est(2, 150_000, Some(2048 * MIB))), None);
+        }
+
+        #[test]
+        fn estimate_scales_by_sky_coverage() {
+            let (dir, ctx) = test_ctx();
+            let sel = PackSelection { survey_id: "nsns-halpha8".into(), ..sky_only(0) };
+            // No properties yet: the preset's 0.65.
+            let e = estimate_hips_pack(&ctx, &sel).unwrap();
+            assert_eq!(e.estimated_bytes, (12.0 * 134_000.0 * 0.65) as u64);
+            // The survey's own fraction wins once stored.
+            HipsStore::new(dir.path(), &crate::hips::NSNS_HALPHA8)
+                .write_properties("hips_estsize = 100\nhips_nb_tiles = 10\nmoc_sky_fraction = 0.5\n")
+                .unwrap();
+            let e = estimate_hips_pack(&ctx, &sel).unwrap();
+            assert_eq!(e.estimated_bytes, 12 * 10_240 / 2);
         }
 
         #[test]

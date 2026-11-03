@@ -161,7 +161,7 @@ Browsing can never store more than the whole sky to order 6.
   - k is selectable 0–5 (default **4**, 26″/px). At the chart's narrowest view (11.72°) `chooseOrder` asks for order 4 up to 1 635 device px of window width, order 5 from 1 636 and order 6 from 3 271 (any Retina window from 818 CSS px wants order 5). Outside the detail cones such a view draws the stored order-k ancestor, scaled up; inside them it is sharp. A whole-sky order 6 is never a pack (3.6–4.5 GB); browsing still caches it.
   - Regions (checkboxes): **imaging locations** (default on; every location the chart draws, radius = half the FOV diagonal + 1°, or 2° without a FOV), **Messier** (on; 108 objects, 3°), **NGC/IC brighter than 10ᵐ** (off; 491 objects, 3°, ≈ 0.6 GB at order 6). Every catalog object was ruled out: the chart's 15 809 DSOs at 2–3° cover 88–98 % of the sky.
   - Cone coverage goes through `catalog::healpix::cone_pixels_at`, the one wrapper around cdshealpix's knife-edge panic near |Dec| ≈ 41.8° (M 31 sits there).
-- **Estimate** (`estimate_hips_pack`, never touches the network): tiles total / already stored (images and `.absent` markers) / missing; size per tile from the stored `properties` (`hips_estsize` KB × 1024 / `hips_nb_tiles`), else the preset's `approx_tile_bytes` (67 000 for DSS, see **Presets** for NSNS), times `moc_sky_fraction` from the same `properties` when present (tiles outside the coverage are 404 markers and weigh nothing; NSNS ≈ 0.65); free space from `disk::free_bytes`. A start whose missing tiles plus a 512 MiB reserve do not fit is refused; nothing missing skips the check.
+- **Estimate** (`estimate_hips_pack`, never touches the network): tiles total / already stored (images and `.absent` markers) / missing; size per tile from the stored `properties` (`hips_estsize` KB × 1024 / `hips_nb_tiles`), else the preset's `approx_tile_bytes` (67 000 for DSS, see **Presets** for NSNS), times `moc_sky_fraction` from the same `properties`, else the preset's `approx_sky_fraction` (tiles outside the coverage are 404 markers and weigh nothing; DSS 1, NSNS 0.65); free space from `disk::free_bytes`. A start whose missing tiles plus a 512 MiB reserve do not fit is refused; nothing missing skips the check.
 - **Runner** (`run_pack`): 4 workers over one deduplicated tile list; tiles already stored are counted `present` without network. An explicit pack runs with `skychart.hips_online` off (the toggle governs browsing only), and fetches and validates `properties` first.
   - **Busy survey** (429 / 503, `hips::ServerBusy`): wait `Retry-After` seconds clamped to [5 s, 300 s] (the clamp is applied before any arithmetic: a header of `u64::MAX` seconds is real input), else back off 5 s → 300 s; a tile still busy after 6 waits is `failed`. 4 such tiles in a row (≈ 5 min of solid 429/503) stop the run as `failed` ("survey busy"); a fetched tile or a 404 resets the streak.
   - **Network down**: 20 consecutive plain errors (connection, HTTP 5xx other than 503, a non-image body, a write error) stop the run as `failed`, finished tiles kept.
@@ -191,6 +191,19 @@ Browsing can never store more than the whole sky to order 6.
 The desktop host was not compiled in this environment (no webkit2gtk); its three wrappers follow the existing byte-returning commands (`get_master_light_preview`).
 
 **Acceptance, phase 2 (offline pack; owner: works, 2026-10-31).** Estimate against what landed, measured 2026-10-27: order 4 + Messier + locations (dev app) estimated 685 MB from `properties`, 840 MB landed (+23 %, inside the 30 % bar); a whole-sky order 3 on an empty store (web) estimated 68.3 MB from `approx_tile_bytes`, 44.1 MB landed (−35 %, an over-estimate, so the disk check errs on the safe side). Not provoked live: a real 429 / 503 busy wait, so the "Survey busy, waiting N s" line clearing after the wait (`Run::settle`) is covered by neither a test nor a run.
+
+**Acceptance, phase 3 (2026-11-03, live servers through the session's proxy, `athenaeum-web` serving the built frontend, headless Chromium 1600 × 900, empty `mirrors.json`).**
+
+| Check | Result |
+| ---- | ---- |
+| Background select | None, DSS colored and the six NSNS presets |
+| First tile request with no mirror list | tiles served from the master at once; the background search found the six GAVO mirrors, `rgb8` at `/nsns/cont/rgb8/hips` (the registry's URL, not the record's 404), while CDS timed out (asked once) |
+| NSNS Hα at the North America Nebula (12°) | drawn; credit "NSNS Hα: Northern Sky Narrowband Survey, Stefan Ziegenbalg · CC BY-NC-SA 4.0", a link to the project page |
+| NSNS RGB at Dec −14°, 30° (Seagull Nebula, Sirius), mirrors known | 36 tiles from www.simg.de and 10 from dc.g-vo.org; 20 tiles south of the coverage absent on the master's word; the coverage edge drawn black |
+| Settings → Sky background | the seven surveys, "Servers: www.simg.de, dc.g-vo.org" for each NSNS, a pack estimate each |
+| DSS colored while CDS is down | its tiles fail (500 to the chart, retried after 30 s); no mirror can stand in until the CDS list says which host may |
+
+Not provoked live: an endpoint going down mid-run and the failover to the other (covered by `hips::balance` tests), a 429 from either server.
 
 ## Acceptance (#19, 2026-10-26, web build + mock API, headless Chromium 1600 × 900)
 
