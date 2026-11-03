@@ -2461,3 +2461,19 @@ The robust quad seed (registration, 2026-11-03), in plain words for the translat
 - **Very sharp frames registered onto a reference from another camera no longer land a few pixels off.** (`robust_quad_seed`, RQ-1.)
 - **A frame whose registration rests on a small patch of stars is now refused, or registered from its plate solve when it has one, instead of being stacked slightly misaligned.** (The coverage gate, RQ-10.)
 - **The first stack after the update re-registers every set once.** (`ALIGN_VERSION` 1; once for both this and Plan D's re-measure when they ship in one release.)
+
+Ready user wording for the robust quad seed (owner-approved 2026-11-03); its third line replaces Plan D's "first stack takes longer" line
+when both ship in one release:
+
+```
+### Stacking: frame alignment
+
+- **Sharper stars where the sharpest frames used to miss.** A few very sharp frames — most often when a set
+  is aligned to a reference frame from another camera — could land a few pixels off and soften the stars in
+  the stack. They now line up exactly. Frames that already aligned well are aligned exactly as before.
+- **A frame that can't be aligned reliably no longer blurs your stack.** If a frame's alignment rests on only
+  a small patch of stars, Athenaeum tries again from the frame's plate solution when it has one; if that does
+  not hold either, the frame is left out of the stack.
+- **The first stack after the update takes longer.** Each frame set re-measures its stars and re-aligns its
+  frames once; calibration is kept. Later stacks run at normal speed.
+```
