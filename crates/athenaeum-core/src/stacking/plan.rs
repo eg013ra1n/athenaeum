@@ -8643,13 +8643,14 @@ mod tests {
         // 2026-11-01 pcores Task 1 (OD-1a, OD-3): `normalization.rejection` defaults to `local`, fastPreview pins `scaleZeroOffset` - ln_ref, ln and ln_cal move on default, maximumQuality and custom (the normalization subtree folds the whole block); calib, meas and reg do NOT move on any line, and the fastPreview line is UNCHANGED.
         // 2026-11-02 Plan D D2c r1 (review M1 of D2b): FITS_ARTIFACT_VERSION 3 folded into meas (the measurement subtree, beside MEASURE_VERSION) - meas, reg and ln move on every line (was meas=326ee3f03ffce101 on the default line); calib is UNCHANGED, and ln_ref and ln_cal too (this golden feeds them no measurement hash).
         // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 AND the `local` rejection default move ln_ref, ln and ln_cal; FITS_ARTIFACT_VERSION 3 moves meas, reg and ln only, as the D2c r1 line above says); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
+        // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1 joins the registration subtree): reg and ln move on every line, the fastPreview line included (was default reg=efe8758fbdc4bbbd ln=532bfea1cac2d7b4; fastPreview reg=a038dcae26c2392a ln=4110659e2116091d; maximumQuality reg=bc4925cc6681db3a ln=b88fd0bd410fb46c; custom reg=916582f203cecefc ln=88cef42f95ee4e58); calib, meas, ln_ref and ln_cal are UNCHANGED (ln_ref's call passes the literals "r1,r2" / "m1,m2" and ln_cal folds ln_ref, so neither reads reg).
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=efe8758fbdc4bbbd ln_ref=782cf447acae6ace ln=532bfea1cac2d7b4 ln_cal=23f55e28c19f3459",
-                "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=a038dcae26c2392a ln_ref=500204de9b22c23d ln=4110659e2116091d ln_cal=1ed2edc9d7ff5dcb",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=bc4925cc6681db3a ln_ref=364ed4c8ffba6878 ln=b88fd0bd410fb46c ln_cal=86f453747dcafe8b",
-                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=916582f203cecefc ln_ref=364ed4c8ffba6878 ln=88cef42f95ee4e58 ln_cal=86f453747dcafe8b",
+                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459",
+                "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b",
+                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln_ref=364ed4c8ffba6878 ln=d182aadf14a27b04 ln_cal=86f453747dcafe8b",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8719,10 +8720,12 @@ mod tests {
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
         assert_eq!(meas, "cc923a65f1b367d7");
-        assert_eq!(reg, "efe8758fbdc4bbbd");
+        // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "efe8758fbdc4bbbd"); meas did not move.
+        assert_eq!(reg, "511225ffae14780f");
         // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
         // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
-        assert_eq!(ln, "532bfea1cac2d7b4");
+        // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "532bfea1cac2d7b4"): `ln` is computed from `reg`.
+        assert_eq!(ln, "eda6a3f8d83f669c");
     }
 
     #[test]

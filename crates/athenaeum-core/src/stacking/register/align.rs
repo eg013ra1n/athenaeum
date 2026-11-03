@@ -23,6 +23,15 @@ use crate::geometry::{
     TPS_MAX_NODES, TPS_MIN_NODES,
 };
 
+/// The version of what [`align`] returns for an unchanged star list, folded
+/// into the registration stage hash (`alignVersion`,
+/// `stacking::config::registration_subtree`; robust quad seed RQ-5) because
+/// no config field moves when the seed or the acceptance gate does. Policy:
+/// one bump per merged plan that changes what `align` returns for the same
+/// star lists, whatever the number of changes in it — the robust quad seed
+/// and the coverage gate share version 1. A bump re-registers every set once
+/// and re-normalizes and re-integrates what reads it.
+pub const ALIGN_VERSION: u32 = 1;
 /// Quad-ratio tolerance of the seed matcher (the plate solver's default).
 pub const QUAD_TOLERANCE: f64 = 0.007;
 /// RANSAC and the QA gates need at least this many inliers.

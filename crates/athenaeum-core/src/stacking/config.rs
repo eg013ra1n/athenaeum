@@ -18,6 +18,7 @@ use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
 use crate::stacking::psf_signal::PsfModel;
+use crate::stacking::register::align::ALIGN_VERSION;
 use crate::stacking::register::DistortionChoice;
 use crate::stacking::structure::SeedDetector;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
@@ -1047,12 +1048,33 @@ fn measurement_subtree_with_measure_version(
 /// on purpose, rewriting every `registered` artifact
 /// (perf tier A Task 6a) and re-running every downstream stage that reads
 /// it (Normalize, Integrate).
+///
+/// It also carries [`crate::stacking::register::align::ALIGN_VERSION`]
+/// (`alignVersion`, robust quad seed RQ-5): what `align` returns for an
+/// unchanged star list (the seed, the coverage gate) is no config field
+/// either, so a change in it moves this hash the way a fitter change does —
+/// every set re-registers once, and Calibrate and Measure stay cached.
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    registration_subtree_with_measure_version(cfg, MEASURE_VERSION)
+    registration_subtree_with_versions(cfg, MEASURE_VERSION, ALIGN_VERSION)
 }
 
-/// [`registration_subtree`] with the measure version supplied — see
-/// [`measurement_subtree_with_measure_version`].
+/// [`registration_subtree`] with both versions supplied, so a test can prove
+/// the hash follows each (nothing else should call this with anything but
+/// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The pins of earlier measure
+/// versions go through [`registration_subtree_with_measure_version`], which
+/// keeps the shape from before the fold.
+fn registration_subtree_with_versions(
+    cfg: &StackingConfig,
+    measure_version: u32,
+    align_version: u32,
+) -> serde_json::Value {
+    let mut subtree = registration_subtree_with_measure_version(cfg, measure_version);
+    subtree["alignVersion"] = serde_json::json!(align_version);
+    subtree
+}
+
+/// [`registration_subtree`] with the measure version supplied and no
+/// `alignVersion` — see [`measurement_subtree_with_measure_version`].
 fn registration_subtree_with_measure_version(
     cfg: &StackingConfig,
     measure_version: u32,
@@ -1211,6 +1233,57 @@ mod tests {
         for other in [measurement_subtree(&cfg), registration_subtree(&cfg)] {
             assert!(other.get("lnModelVersion").is_none(), "{other}");
         }
+    }
+
+    /// Robust quad seed RQ-5: what `align` returns for an unchanged star list is not expressible in the config, so
+    /// [`ALIGN_VERSION`] rides the registration subtree beside `measureVersion` (LN_MODEL_VERSION's precedent) and no
+    /// other stage's own subtree.
+    #[test]
+    fn the_align_version_rides_the_registration_subtree_only() {
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            registration_subtree(&cfg)["alignVersion"],
+            serde_json::json!(ALIGN_VERSION)
+        );
+        for other in [measurement_subtree(&cfg), normalization_subtree(&cfg)] {
+            assert!(other.get("alignVersion").is_none(), "{other}");
+        }
+    }
+
+    /// Robust quad seed RQ-5: another `align` version is another registration hash (so a cached row misses by key and
+    /// the set re-registers once) and it moves no measurement hash (Calibrate and Measure are not recomputed).
+    #[test]
+    fn a_new_align_version_moves_the_registration_hash_and_not_the_measurement_hash() {
+        let cfg = StackingConfig::default();
+        let shipped = stage_hash(&registration_subtree(&cfg), &[], &[]);
+        assert_eq!(
+            shipped,
+            stage_hash(
+                &registration_subtree_with_versions(&cfg, MEASURE_VERSION, ALIGN_VERSION),
+                &[],
+                &[]
+            ),
+            "the shipped helper is the versioned one at the current constants"
+        );
+        assert_ne!(
+            stage_hash(
+                &registration_subtree_with_versions(&cfg, MEASURE_VERSION, 0),
+                &[],
+                &[]
+            ),
+            shipped,
+            "another align version is another registration hash"
+        );
+        // The measurement subtree takes no align version: the same default
+        // config hashes the same whatever `align` is at.
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(
+                &measurement_subtree_with_fits_artifact_version(&cfg, FITS_ARTIFACT_VERSION),
+                &[],
+                &[]
+            ),
+        );
     }
 
     /// Plan 6b-2 C2: the four modes' wire names are the spec's.
@@ -1844,8 +1917,8 @@ mod tests {
             ),
             (
                 "registration",
-                registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
-                registration_subtree_with_measure_version(&cfg, MEASURE_VERSION + 1),
+                registration_subtree_with_versions(&cfg, MEASURE_VERSION, ALIGN_VERSION),
+                registration_subtree_with_versions(&cfg, MEASURE_VERSION + 1, ALIGN_VERSION),
             ),
             (
                 "normalization",
@@ -1873,7 +1946,7 @@ mod tests {
         assert_eq!(
             stage_hash(&registration_subtree(&cfg), &[], &[]),
             stage_hash(
-                &registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                &registration_subtree_with_versions(&cfg, MEASURE_VERSION, ALIGN_VERSION),
                 &[],
                 &[]
             )
@@ -2082,7 +2155,9 @@ mod tests {
     /// hashes as it did before the bump (a bump must not recalibrate). The measurement literal was re-recorded 2026-11-02
     /// (Plan D D2c r1: `FITS_ARTIFACT_VERSION` 3 folded into that subtree, `the_measurement_hash_follows_the_fits_artifact_version`;
     /// was `972c028e1512fdd0`); the registration one stands, and the normalization one was re-recorded 2026-11-02 at the
-    /// merge of `main` (the `local` rejection default).
+    /// merge of `main` (the `local` rejection default). The registration one is read at the shape from before
+    /// `alignVersion` joined that subtree (robust quad seed RQ-5): the literal pins MEASURE_VERSION 8's contribution, and
+    /// the shipped registration hash (with `alignVersion`) is pinned by `plan.rs`'s stage-hash goldens.
     #[test]
     fn measure_version_eight_moves_the_three_fit_reading_subtrees_only() {
         let cfg = StackingConfig::default();
@@ -2090,7 +2165,11 @@ mod tests {
             (
                 MEASURE_VERSION,
                 stage_hash(&measurement_subtree(&cfg), &[], &[]),
-                stage_hash(&registration_subtree(&cfg), &[], &[]),
+                stage_hash(
+                    &registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+                    &[],
+                    &[]
+                ),
                 stage_hash(&normalization_subtree(&cfg), &[], &[]),
                 stage_hash(&calibration_subtree(&cfg), &[], &[]),
             ),
