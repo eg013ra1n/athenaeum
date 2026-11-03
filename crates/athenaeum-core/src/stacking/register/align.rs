@@ -121,9 +121,9 @@ pub enum AlignError {
     /// against rather than a constant that may not have been used.
     ScaleOutOfRange { scale: f64, expected: f64 },
     RmsTooHigh { rms_px: f64, max_rms_px: f64 },
-    /// RQ-10: the map's inliers cover `coverage` of the 4 x 4 grid over the
-    /// overlap, which holds `cells` cells with an eligible star (see
-    /// [`coverage`]), under [`MIN_COVERAGE`].
+    /// RQ-10: the map's inliers cover `coverage` of the cells of the 4 x 4
+    /// grid over the overlap that hold an eligible star the final pairing
+    /// paired, `cells` of them (see [`coverage`]), under [`MIN_COVERAGE`].
     LowCoverage { coverage: f64, cells: usize },
 }
 
@@ -237,8 +237,8 @@ pub struct Alignment {
     pub quality_score: f64,
     pub overlap: f64,
     pub regularity: f64,
-    /// How much of the overlap the refit inliers cover (RQ-10, [`coverage`]):
-    /// at least [`MIN_COVERAGE`] for any frame that registered.
+    /// How much of the paired overlap the refit inliers cover (RQ-10,
+    /// [`coverage`]): at least [`MIN_COVERAGE`] for any frame that registered.
     pub coverage: f64,
     pub ransac_iterations: usize,
     pub refit_rounds: usize,
@@ -634,13 +634,13 @@ pub const COVERAGE_GRID: usize = 4;
 /// judged at all (RQ-10 (a)): 16 x 16 cells.
 pub const REFERENCE_OCCUPANCY_GRID: usize = 16;
 /// A map whose inliers cover less of the overlap than this is refused
-/// (RQ-10): 12 of 16 cells on a dense overlap.
+/// (RQ-10): 12 of 16 cells on a dense, fully paired overlap.
 pub const MIN_COVERAGE: f64 = 0.75;
 
-/// How much of the overlap a map's inliers cover (RQ-10 (a)-(c)), in subject
-/// pixels. Returns `(coverage, cells)`: the share of the 4 x 4 grid's cells
-/// holding an eligible star that also hold an inlier, and the number of
-/// cells holding an eligible star.
+/// How much of the overlap a map's inliers cover (RQ-10 (a), (b), (c')), in
+/// subject pixels. Returns `(coverage, cells)`: the share of the 4 x 4 grid's
+/// cells holding a *paired* eligible star that also hold an inlier, and the
+/// number of cells holding a paired eligible star.
 ///
 /// - A subject star is *eligible* when `map` lands it inside the reference
 ///   frame (no clamping into edge cells) in a 16 x 16 reference cell that
@@ -650,17 +650,28 @@ pub const MIN_COVERAGE: f64 = 0.75;
 /// - The 4 x 4 grid is laid over the bounding box of the eligible stars, so
 ///   it always spans the overlap: the whole frame for a full overlap, a
 ///   corner for a small one. A zero-width side of the box is one column or
-///   row.
+///   row. The eligible stars alone set the extent, paired or not, so a map
+///   that is right in one corner is read over the whole overlap.
+/// - An eligible star is *paired* when it is one of `pair_subject_pts`: the
+///   subject sides of the final pairing's pairs (a reference star within the
+///   pairing radius of its image through the refit's map, after the 4b
+///   re-pair). A cell none of whose eligible stars the pairing paired is
+///   overlap the reference cannot vouch for (a shallow reference under a
+///   deep subject holds few stars to pair), and it counts for nothing,
+///   neither as covered nor as uncovered (R4-34). A wrong map does not
+///   hide behind it: its chance pairs in the cells it is wrong over are
+///   paired and hold the denominator.
 /// - `inlier_subject_pts` are the subject sides of the refit's inlier pairs
 ///   (the pairing carries coordinates, not star indices). One outside the
-///   box, or in a cell without an eligible star, counts for nothing.
+///   box, or in a cell without a paired eligible star, counts for nothing.
 ///
-/// `(0.0, 0)` when no star is eligible. `reference_geometry` is the
+/// `(0.0, 0)` when no eligible star is paired. `reference_geometry` is the
 /// reference frame's `(width, height)`.
 pub fn coverage(
     subject: &[(f64, f64)],
     reference: &[(f64, f64)],
     inlier_subject_pts: &[(f64, f64)],
+    pair_subject_pts: &[(f64, f64)],
     map: &Linear,
     reference_geometry: (usize, usize),
 ) -> (f64, usize) {
@@ -716,9 +727,21 @@ pub fn coverage(
         }
     };
     let cell = |x: f64, y: f64| axis(y, y0, y1) * g + axis(x, x0, x1);
-    let mut holds_eligible = vec![false; g * g];
+    // The pairing carries coordinates copied from the subject list, so a
+    // paired star is found again by the bits of its two coordinates.
+    let paired: std::collections::HashSet<(u64, u64)> = pair_subject_pts
+        .iter()
+        .map(|&(x, y)| (x.to_bits(), y.to_bits()))
+        .collect();
+    let mut holds_paired = vec![false; g * g];
     for &(x, y) in &eligible {
-        holds_eligible[cell(x, y)] = true;
+        if paired.contains(&(x.to_bits(), y.to_bits())) {
+            holds_paired[cell(x, y)] = true;
+        }
+    }
+    let cells = holds_paired.iter().filter(|c| **c).count();
+    if cells == 0 {
+        return (0.0, 0);
     }
     let mut holds_inlier = vec![false; g * g];
     for &(x, y) in inlier_subject_pts {
@@ -726,11 +749,10 @@ pub fn coverage(
             holds_inlier[cell(x, y)] = true;
         }
     }
-    let cells = holds_eligible.iter().filter(|c| **c).count();
-    let covered = holds_eligible
+    let covered = holds_paired
         .iter()
         .zip(&holds_inlier)
-        .filter(|(e, i)| **e && **i)
+        .filter(|(p, i)| **p && **i)
         .count();
     (covered as f64 / cells as f64, cells)
 }
@@ -920,9 +942,10 @@ type SeedFit = (RansacResult, RefitResult, LinearKind, usize, f64);
 /// seed is an affine fitted on the matched quads and its accuracy falls off
 /// with distance from them, so a rotated or rescaled subject pairs only
 /// near them; one pass through the refit model recovers the rest of the
-/// field), then [`coverage`] of the refit's inliers over the overlap. A map
-/// whose inliers cover less of it than [`MIN_COVERAGE`] is refused with
-/// [`AlignError::LowCoverage`], whichever seed produced it.
+/// field), then [`coverage`] of the refit's inliers over the cells of the
+/// overlap the final pairing paired. A map whose inliers cover less of them
+/// than [`MIN_COVERAGE`] is refused with [`AlignError::LowCoverage`],
+/// whichever seed produced it.
 ///
 /// The [`Pairing`] comes back either way, so a caller that falls back to the
 /// other seed (M4b) can say how far this one got. The warnings are this
@@ -974,12 +997,15 @@ fn fit_from_seed(
     }
 
     // The gate: the refit's inliers (the subject side of their pairs)
-    // against the overlap the refit's own map defines.
+    // against the cells of the overlap the refit's own map defines that the
+    // final pairing paired (RQ-10 (c'), R4-34).
     let inlier_pts: Vec<(f64, f64)> = refit.inliers.iter().map(|&i| pairing.pairs[i].0).collect();
+    let pair_pts: Vec<(f64, f64)> = pairing.pairs.iter().map(|p| p.0).collect();
     let (covered, cells) = coverage(
         sub_pts,
         ref_pts,
         &inlier_pts,
+        &pair_pts,
         &refit.linear,
         reference_geometry,
     );
@@ -3090,14 +3116,71 @@ pub(super) mod tests {
         (g, g)
     }
 
+    /// R4-34. The refusal scene of Task RL's tests, whose scene
+    /// ([`disjoint_population_scene`] and the exact map) the ruling turned
+    /// into an accepted one: sixteen shared stars over the left eight cells
+    /// of the grid over the overlap, and eight chance pairs over the right
+    /// eight, one in each: a lone subject star and a reference star 3.7 px
+    /// from its image, each in another of eight directions. They are inside
+    /// the 3.8 px pairing radius and at the edge of the RANSAC tolerance
+    /// (1.9 px): a map that keeps the sixteen shared stars within it moves
+    /// the right cells by at most 1.9 px, and that absorbs a 3.7 px offset
+    /// in one direction only. The exact map pairs them all and its inliers
+    /// are the shared stars: it is right over half the paired cells and
+    /// wrong over the other half, so the gate refuses it. The lone stars
+    /// share no group of four with anything, so the quad matcher still has
+    /// nothing to match.
+    pub(crate) fn disjoint_chance_pairs_scene() -> (Vec<Star>, Vec<Star>, Linear) {
+        let rows = [200.0, 570.0, 930.0, 1300.0];
+        let sites: Vec<(f64, f64)> = rows
+            .iter()
+            .flat_map(|&y| [125.0, 375.0, 625.0, 875.0].map(|x| (x, y)))
+            .collect();
+        let (mut subject, mut reference, truth) = disjoint_scene_at(&sites);
+        let mut k = 0usize;
+        for &y in &rows {
+            for x in [1245.0, 1735.0] {
+                let lone = Star {
+                    x,
+                    y,
+                    flux: 300.0 + k as f64,
+                    sigma: Some((0.05, 0.05)),
+                };
+                let (u, v) = truth.apply(lone.x, lone.y);
+                let (sin, cos) = (k as f64 * std::f64::consts::FRAC_PI_4).sin_cos();
+                reference.push(Star {
+                    x: u + 3.7 * cos,
+                    y: v + 3.7 * sin,
+                    ..lone.clone()
+                });
+                subject.push(lone);
+                k += 1;
+            }
+        }
+        (subject, reference, truth)
+    }
+
+    /// The subject points whose image through `truth` has a reference star
+    /// within 0.01 px: the exact pairs of a scene built without jitter.
+    fn exact_pairs(sub: &[Star], refs: &[Star], truth: &Linear) -> Vec<(f64, f64)> {
+        sub.iter()
+            .filter(|s| {
+                let (u, v) = truth.apply(s.x, s.y);
+                refs.iter().any(|r| (r.x - u).hypot(r.y - v) < 0.01)
+            })
+            .map(|s| (s.x, s.y))
+            .collect()
+    }
+
     /// (a) Ruling R-T6-9: under `QuadFirst` — every same-scale frame — a
     /// quad seed that cannot carry the frame is not the end of it. The
     /// plate-solve seed gets one turn and says so.
     ///
     /// RG2: the shared stars here are sixteen, one in each cell of the grid
-    /// over the overlap. With ten of them in half of the cells the coverage
-    /// gate refuses the plate-solve map (see
-    /// `a_plate_solve_map_resting_on_ten_shared_stars_is_refused`).
+    /// over the overlap. With ten of them in half of the cells the gate once
+    /// refused the plate-solve map; since R4-34 it counts the cells the
+    /// pairing paired and accepts it (see
+    /// `a_plate_solve_map_resting_on_ten_shared_stars_covers_the_cells_it_paired`).
     #[test]
     fn the_plate_solve_seed_is_the_quad_seeds_fallback() {
         let sites: Vec<(f64, f64)> = (0..4)
@@ -3547,18 +3630,18 @@ pub(super) mod tests {
         let identity = similarity(1.0, 0.0, 0.0, 0.0);
 
         // No eligible star: no cells.
-        assert_eq!(coverage(&[], &lattice, &[], &identity, geo), (0.0, 0));
+        assert_eq!(coverage(&[], &lattice, &[], &[], &identity, geo), (0.0, 0));
 
         // A full overlap, every star an inlier: 16 of 16 cells.
         assert_eq!(
-            coverage(&lattice, &lattice, &lattice, &identity, geo),
+            coverage(&lattice, &lattice, &lattice, &lattice, &identity, geo),
             (1.0, 16)
         );
 
         // Inliers in 2 of 16 cells (the corner cells): 0.125.
         let two = [lattice[0], lattice[255]];
         assert_eq!(
-            coverage(&lattice, &lattice, &two, &identity, geo),
+            coverage(&lattice, &lattice, &two, &lattice, &identity, geo),
             (0.125, 16)
         );
 
@@ -3570,7 +3653,7 @@ pub(super) mod tests {
             .filter(|&(x, y)| !(x < 425.0 && y < 425.0))
             .collect();
         assert_eq!(
-            coverage(&lattice, &lattice, &all_but_one_cell, &identity, geo),
+            coverage(&lattice, &lattice, &all_but_one_cell, &lattice, &identity, geo),
             (15.0 / 16.0, 16)
         );
 
@@ -3579,7 +3662,7 @@ pub(super) mod tests {
         // so it still has 16 cells. Inliers outside the box are ignored.
         let shift = similarity(1.0, 0.0, -800.0, -800.0);
         assert_eq!(
-            coverage(&lattice, &lattice, &lattice, &shift, geo),
+            coverage(&lattice, &lattice, &lattice, &lattice, &shift, geo),
             (1.0, 16)
         );
 
@@ -3592,18 +3675,18 @@ pub(super) mod tests {
             .filter(|&(x, y)| x < 800.0 || y < 800.0)
             .collect();
         assert_eq!(
-            coverage(&lattice, &lattice, &outside, &shift, geo),
+            coverage(&lattice, &lattice, &outside, &lattice, &shift, geo),
             (0.0, 16)
         );
 
         // A zero-width box is one column: five stars on x = 850.
         let column: Vec<(f64, f64)> = (0..5).map(|k| (850.0, 150.0 + 200.0 * k as f64)).collect();
         assert_eq!(
-            coverage(&column, &lattice, &column, &identity, geo),
+            coverage(&column, &lattice, &column, &column, &identity, geo),
             (1.0, 4)
         );
         assert_eq!(
-            coverage(&column, &lattice, &column[..2], &identity, geo),
+            coverage(&column, &lattice, &column[..2], &column, &identity, geo),
             (0.5, 4)
         );
 
@@ -3616,7 +3699,7 @@ pub(super) mod tests {
         subject.push((-300.0, 850.0)); // outside the frame (clamped, its cell holds a star)
         subject.push((1550.0, 1550.0)); // inside, but its cell holds no reference star
         assert_eq!(
-            coverage(&subject, &reference, &corners, &identity, geo),
+            coverage(&subject, &reference, &corners, &subject, &identity, geo),
             (1.0, 3)
         );
         // With a reference star in that cell the fourth corner is eligible
@@ -3624,8 +3707,73 @@ pub(super) mod tests {
         let mut reference4 = reference.to_vec();
         reference4.push((1550.0, 1550.0));
         assert_eq!(
-            coverage(&subject, &reference4, &corners, &identity, geo),
+            coverage(&subject, &reference4, &corners, &subject, &identity, geo),
             (0.75, 4)
+        );
+    }
+
+    /// RQ-10 (c') on the same lattice: a cell counts only when an eligible
+    /// star in it is one of the final pairing's pairs, and the eligible
+    /// stars alone set the grid.
+    #[test]
+    fn coverage_counts_only_the_cells_the_final_pairing_paired() {
+        let geo = (1600usize, 1600usize);
+        let lattice: Vec<(f64, f64)> = (0..16)
+            .flat_map(|j| (0..16).map(move |i| (50.0 + 100.0 * i as f64, 50.0 + 100.0 * j as f64)))
+            .collect();
+        let identity = similarity(1.0, 0.0, 0.0, 0.0);
+        // The left half of the lattice: the grid's two left columns.
+        let left: Vec<(f64, f64)> = lattice.iter().copied().filter(|&(x, _)| x < 800.0).collect();
+
+        // Paired and covered on the left half only: 8 cells, all covered, though
+        // the grid spans the whole lattice (the eligible stars set it).
+        assert_eq!(
+            coverage(&lattice, &lattice, &left, &left, &identity, geo),
+            (1.0, 8)
+        );
+        // No pair, no cell: nothing is vouched for.
+        assert_eq!(
+            coverage(&lattice, &lattice, &left, &[], &identity, geo),
+            (0.0, 0)
+        );
+        // An inlier in a cell whose eligible stars are not paired counts for
+        // nothing: the inliers are all stars, the pairs the left half.
+        assert_eq!(
+            coverage(&lattice, &lattice, &lattice, &left, &identity, geo),
+            (1.0, 8)
+        );
+        // A cell with no inlier among the paired ones counts against: no
+        // inlier in the grid's first cell (x, y < 425).
+        let all_but_one: Vec<(f64, f64)> = left
+            .iter()
+            .copied()
+            .filter(|&(x, y)| !(x < 425.0 && y < 425.0))
+            .collect();
+        assert_eq!(
+            coverage(&lattice, &lattice, &all_but_one, &left, &identity, geo),
+            (7.0 / 8.0, 8)
+        );
+
+        // Chance pairs hold the denominator: one non-inlier pair in each of
+        // 3 right-hand cells makes 8 / 11, two make 8 / 10.
+        let chance = [(1050.0, 150.0), (1250.0, 550.0), (1450.0, 950.0)];
+        let with = |k: usize| -> (f64, usize) {
+            let pairs: Vec<(f64, f64)> = left.iter().chain(&chance[..k]).copied().collect();
+            coverage(&lattice, &lattice, &left, &pairs, &identity, geo)
+        };
+        assert_eq!(with(2), (0.8, 10));
+        assert_eq!(with(3), (8.0 / 11.0, 11));
+        assert!(with(3).0 < MIN_COVERAGE && with(2).0 >= MIN_COVERAGE);
+
+        // A paired star the map does not make eligible (imaged outside the
+        // frame) opens no cell, and sets no extent.
+        let mut subject = lattice.clone();
+        subject.push((-300.0, 850.0));
+        let mut pairs = left.clone();
+        pairs.push((-300.0, 850.0));
+        assert_eq!(
+            coverage(&subject, &lattice, &left, &pairs, &identity, geo),
+            (1.0, 8)
         );
     }
 
@@ -4019,8 +4167,8 @@ pub(super) mod tests {
             .copied()
             .filter(|&(x, y)| truth.apply(x, y).0 < half)
             .collect();
-        let (starred_cover, _) = coverage(&sub_pts, &starred, &imaged_left, &truth, ref_geo);
-        let (cloud_cover, _) = coverage(&sub_pts, &left_pts, &imaged_left, &truth, ref_geo);
+        let (starred_cover, _) = coverage(&sub_pts, &starred, &imaged_left, &sub_pts, &truth, ref_geo);
+        let (cloud_cover, _) = coverage(&sub_pts, &left_pts, &imaged_left, &sub_pts, &truth, ref_geo);
         assert!(
             starred_cover < MIN_COVERAGE && cloud_cover >= MIN_COVERAGE,
             "guard: {starred_cover} with every cell starred, {cloud_cover} under the cloud"
@@ -4142,12 +4290,14 @@ pub(super) mod tests {
 
     /// The case the trail exists for (set 195's refused frames): the quad
     /// turn fails too, `NoSeed` is all the frame reports, and the refusal's
-    /// coverage and cells would be nowhere. Here: ten shared stars hold 8 of
-    /// the overlap's 16 cells, the plate-solve map is refused, and the quad
-    /// matcher has nothing to match.
+    /// coverage and cells would be nowhere. Here: the shared stars hold 8 of
+    /// the 16 paired cells of the overlap, eight chance pairs the other 8
+    /// (R4-34: the cells a pairing did not pair are not counted, so the
+    /// refusal needs pairs the inliers do not cover), the plate-solve map is
+    /// refused, and the quad matcher has nothing to match.
     #[test]
     fn a_refusal_followed_by_a_quad_failure_is_still_in_the_trail() {
-        let (sub, refs, truth) = disjoint_population_scene();
+        let (sub, refs, truth) = disjoint_chance_pairs_scene();
         let (ref_geo, sub_geo) = disjoint_geometry();
         let (err, trail) = traced(
             &sub,
@@ -4174,9 +4324,8 @@ pub(super) mod tests {
         let (coverage, cells) = refused.low_coverage.expect("refused for coverage");
         assert!(coverage < MIN_COVERAGE, "{coverage}");
         assert_eq!(cells, 16);
-        // The ten shared stars, and whatever field star the pairing radius
-        // adds to them.
-        assert!((10..=14).contains(&refused.pairs), "{}", refused.pairs);
+        // The sixteen shared stars and the eight chance pairs.
+        assert!((24..=26).contains(&refused.pairs), "{}", refused.pairs);
     }
 
     /// A refusal that is not for coverage says how many stars the seed
@@ -4280,7 +4429,7 @@ pub(super) mod tests {
     /// capture, leave no line behind. The caller that knows the file logs.
     #[test]
     fn align_itself_logs_nothing_about_a_refusal() {
-        let (sub, refs, truth) = disjoint_population_scene();
+        let (sub, refs, truth) = disjoint_chance_pairs_scene();
         let (ref_geo, sub_geo) = disjoint_geometry();
         let (out, logs) = crate::stacking::telemetry::capture_logs(|| {
             // Callsites first hit by a test with no subscriber cache "never".
@@ -4530,7 +4679,7 @@ pub(super) mod tests {
         let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
         let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
         let geo = (ref_w as usize, ref_h as usize);
-        let (all_in, cells) = coverage(&sub_pts, &ref_pts, &sub_pts, &truth, geo);
+        let (all_in, cells) = coverage(&sub_pts, &ref_pts, &sub_pts, &sub_pts, &truth, geo);
         assert!(
             (100..=250).contains(&refs.len()) && cells == 16 && all_in == 1.0,
             "guard: {} stars in the overlap, {cells} cells",
@@ -4582,7 +4731,7 @@ pub(super) mod tests {
         let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
         let g = (W as usize, H as usize);
         assert_eq!(
-            coverage(&sub_pts, &ref_pts, &sub_pts, &truth, g).1,
+            coverage(&sub_pts, &ref_pts, &sub_pts, &sub_pts, &truth, g).1,
             5,
             "guard: the stars hold 5 cells"
         );
@@ -4595,8 +4744,8 @@ pub(super) mod tests {
     /// The `align` scenes that ended `Ok` before the gate, re-run: the same
     /// map bits, pairing, seed and warnings as at the R1 head (recorded then),
     /// and a coverage over the minimum. The disjoint-population scene is not
-    /// here: the gate refuses it by design (see
-    /// `a_plate_solve_map_resting_on_ten_shared_stars_is_refused`).
+    /// here: it has its own test (see
+    /// `a_plate_solve_map_resting_on_ten_shared_stars_covers_the_cells_it_paired`).
     #[test]
     fn every_existing_scene_keeps_its_map_bit_for_bit() {
         struct Pinned {
@@ -4746,16 +4895,29 @@ pub(super) mod tests {
         h
     }
 
-    /// The ten shared stars of the disjoint-population scene hold 8 of the
-    /// 16 cells of the overlap: a plate-solve map that rests on them covers
-    /// half of it, and the gate refuses it (RQ-10) where the plate-solve seed
-    /// used to carry the frame. `the_plate_solve_seed_is_the_quad_seeds_fallback`
-    /// runs the same scene with the shared stars spread over every cell.
+    /// R4-18 inverted by R4-34 (RQ-10 (c')). The ten shared stars of the
+    /// disjoint-population scene hold 8 of the 16 cells of the overlap, and
+    /// the reference holds no other star to pair: the plate-solve map that
+    /// rests on them is exact, the cells it paired are covered by its
+    /// inliers, and the gate accepts it. Counted over the 16 cells of the
+    /// grid it was refused (R4-18); a deep subject on a shallow reference
+    /// lost every precise plate-solve map that way.
     #[test]
-    fn a_plate_solve_map_resting_on_ten_shared_stars_is_refused() {
+    fn a_plate_solve_map_resting_on_ten_shared_stars_covers_the_cells_it_paired() {
         let (sub, refs, truth) = disjoint_population_scene();
         let (ref_geo, sub_geo) = disjoint_geometry();
-        let err = align(
+        let sub_pts: Vec<(f64, f64)> = sub.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let shared = exact_pairs(&sub, &refs, &truth);
+        assert_eq!(shared.len(), 10, "guard: the ten shared stars");
+        // The guard that this is R4-18's scene: with every eligible star's
+        // cell counted, the ten stars cover half of the overlap.
+        let (all_cells, cells) = coverage(&sub_pts, &ref_pts, &shared, &sub_pts, &truth, ref_geo);
+        assert!(
+            all_cells < MIN_COVERAGE && cells == 16,
+            "guard: {all_cells} of {cells} cells counting every eligible star"
+        );
+        let a = align(
             &sub,
             &refs,
             ref_geo,
@@ -4765,13 +4927,121 @@ pub(super) mod tests {
             SeedPolicy::QuadFirst,
             SCALE_RANGE,
         )
-        .expect_err("ten stars in half of the cells do not cover the overlap");
-        match err {
-            AlignError::LowCoverage { coverage, cells } => {
-                assert!(coverage < MIN_COVERAGE, "coverage {coverage}");
-                assert_eq!(cells, 16);
+        .expect("the cells the pairing paired are covered");
+        assert_eq!(a.seed, SeedKind::Wcs);
+        assert!(a.inliers >= 10, "inliers {}", a.inliers);
+        // Eight cells, or nine when a field star's chance pair opens one more.
+        assert!(a.coverage >= 8.0 / 9.0, "coverage {}", a.coverage);
+        let frame = (DISJOINT_W, DISJOINT_H);
+        let off = map_error_in(&a, &truth, frame, &|_, _| true);
+        assert!(off <= 0.1, "{off} px off truth");
+    }
+
+    /// R4-34. A subject list ten times the reference's density (600 stars
+    /// against 60), thirty stars shared over nine cells of the overlap and
+    /// the reference's other thirty in the rest: the exact map pairs the
+    /// shared stars and almost nothing else. The reference cells its
+    /// other stars occupy make subject stars in the other seven cells of the
+    /// 4 x 4 grid eligible, and counting those cells the thirty cover 9 of
+    /// 16. The cells the pairing paired are the nine, all covered: accepted.
+    #[test]
+    fn a_subject_ten_times_denser_than_its_reference_is_accepted_on_the_stars_they_share() {
+        let truth = similarity(1.0, 1.5, 11.0, -7.0);
+        let (w, h) = (DISJOINT_W, DISJOINT_H);
+        let mut rng = SplitMix64(91);
+        let shared: Vec<Star> = (0..30)
+            .map(|_| Star {
+                x: 40.0 + rng.next_f64() * 1360.0,
+                y: 40.0 + rng.next_f64() * 1010.0,
+                flux: 500.0 + rng.next_f64() * 500.0,
+                sigma: Some((0.05, 0.05)),
+            })
+            .collect();
+        let mut subject = shared.clone();
+        subject.extend(field(92, 570, w, h));
+        let mut reference: Vec<Star> = shared
+            .iter()
+            .map(|s| {
+                let (x, y) = truth.apply(s.x, s.y);
+                Star { x, y, ..s.clone() }
+            })
+            .collect();
+        // The reference's own stars, in the rest of the frame only.
+        reference.extend(
+            field(93, 600, w, h)
+                .into_iter()
+                .filter(|s| s.x > 1560.0 || s.y > 1200.0)
+                .take(30),
+        );
+        assert_eq!((subject.len(), reference.len()), (600, 60), "guard: 10 x");
+        for v in [&mut subject, &mut reference] {
+            for i in (1..v.len()).rev() {
+                let j = rng.below(i + 1);
+                v.swap(i, j);
             }
-            other => panic!("refused for another reason: {other}"),
+        }
+        let g = (w as usize, h as usize);
+        let sub_pts: Vec<(f64, f64)> = subject.iter().map(|s| (s.x, s.y)).collect();
+        let ref_pts: Vec<(f64, f64)> = reference.iter().map(|s| (s.x, s.y)).collect();
+        let exact = exact_pairs(&subject, &reference, &truth);
+        assert_eq!(exact.len(), 30, "guard: the thirty shared stars");
+        let (all_cells, cells) = coverage(&sub_pts, &ref_pts, &exact, &sub_pts, &truth, g);
+        assert!(
+            all_cells < MIN_COVERAGE && cells >= 15,
+            "guard: {all_cells} of {cells} cells counting every eligible star"
+        );
+        let a = align(
+            &subject,
+            &reference,
+            g,
+            g,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::WcsFirst,
+            SCALE_RANGE,
+        )
+        .expect("the exact map covers the cells it paired");
+        assert_eq!(a.seed, SeedKind::Wcs);
+        assert!(a.inliers >= 30, "inliers {}", a.inliers);
+        assert!(a.coverage >= MIN_COVERAGE, "coverage {}", a.coverage);
+        let off = map_error_in(&a, &truth, (w, h), &|_, _| true);
+        assert!(off <= 0.1, "{off} px off truth");
+    }
+
+    /// R4-34. A dense field whose map is right over its left 45 % and more
+    /// than the pairing radius (3.8 px) off over the rest: the reference
+    /// stars imaged from subject x >= 900 are displaced 6 px. The gate still
+    /// reads the map over the whole overlap, and the dense field gives the
+    /// displaced part chance pairs in every cell: they hold cells no inlier
+    /// covers, 8 of the 16. Refused.
+    #[test]
+    fn a_dense_field_with_the_map_right_over_one_part_only_is_refused() {
+        let (w, h) = (DISJOINT_W, DISJOINT_H);
+        let truth = similarity(1.0, 0.5, 6.0, -4.0);
+        let back = truth.inverse().expect("a similarity inverts");
+        let subject = field(95, 2000, w, h);
+        let (sub, mut refs) = scene(&subject, &truth, 0.05, 0, w, h, 96);
+        let mut moved = 0usize;
+        for r in refs.iter_mut().filter(|r| back.apply(r.x, r.y).0 >= 900.0) {
+            r.x += 6.0;
+            moved += 1;
+        }
+        assert!(
+            moved * 10 >= refs.len() * 5,
+            "guard: {moved} of {} reference stars moved",
+            refs.len()
+        );
+        let g = (w as usize, h as usize);
+        match gate_run(&sub, &refs, &truth, g).1 {
+            Err(AlignError::LowCoverage { coverage, cells }) => {
+                assert!(coverage < MIN_COVERAGE, "coverage {coverage}");
+                assert!(cells >= 12, "{cells} paired cells");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok((_, refit, _, _, covered)) => panic!(
+                "accepted: coverage {covered:.2}, {} inliers",
+                refit.inliers.len()
+            ),
         }
     }
 

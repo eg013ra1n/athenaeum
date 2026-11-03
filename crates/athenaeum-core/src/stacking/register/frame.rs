@@ -703,13 +703,14 @@ mod tests {
     /// from here, with the frame's `path`, and before the verdict line it
     /// explains: under the Register fan-out the lines of different frames
     /// interleave, and a refusal without its file is a number without a
-    /// frame. The disjoint-population scene is the dropped case: the map
-    /// is refused for coverage, then the quad seed has nothing to match, and
-    /// `NoSeed` is all the verdict says.
+    /// frame. The disjoint-population scene with its chance pairs is the
+    /// dropped case: the map is refused for coverage (R4-34: over the cells
+    /// the pairing paired, the chance pairs among them), then the quad seed
+    /// has nothing to match, and `NoSeed` is all the verdict says.
     #[test]
     fn a_refused_plate_solve_seed_is_logged_with_its_path_before_the_verdict() {
-        use super::super::align::tests::{disjoint_geometry, disjoint_population_scene};
-        let (sub, refs, truth) = disjoint_population_scene();
+        use super::super::align::tests::{disjoint_chance_pairs_scene, disjoint_geometry};
+        let (sub, refs, truth) = disjoint_chance_pairs_scene();
         let (ref_geo, sub_geo) = disjoint_geometry();
         let reference = ReferenceStars {
             stars: refs,
@@ -765,10 +766,14 @@ mod tests {
         let line = lines[refusal];
         assert!(line.contains("WARN"), "{line}");
         assert!(line.contains("seed=\"wcs\""), "{line}");
-        assert!(
-            line.contains("coverage=") && line.contains("cells=16"),
-            "{line}"
-        );
+        assert!(line.contains("coverage="), "{line}");
+        let cells: usize = line
+            .split("cells=")
+            .nth(1)
+            .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no cells field: {line}"));
+        assert_eq!(cells, 16, "{line}");
         assert!(
             line.contains("pairs=") && line.contains("reason="),
             "{line}"

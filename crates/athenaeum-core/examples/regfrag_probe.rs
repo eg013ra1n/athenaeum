@@ -16,7 +16,8 @@
 //!       seed -> pairing -> `ransac_fit` / `refit_weighted` -> the one re-pair), with `align`'s scale gate. A line
 //!       with a hint takes the real `align()` in either mode (the hint path is not restated; `replay` says which).
 //!       Every `align` object carries `regularity` (the reference grid) and `coverage` / `coverageCells` (the core
-//!       `coverage` over the restated final refit; null when a hint leads, and when the restated stages fail).
+//!       `coverage` over the restated final refit and the final pairing (RQ-10 (c'), R4-34: the cells holding a paired
+//!       eligible star); null when a hint leads, and when the restated stages fail).
 //!   regfrag_probe mapgrid <in.jsonl> <out.jsonl>
 //!       in line:  {"key", "transformJson" | "m", "w", "h"}
 //!       out line: {"key", "grid": [[x, y, fx, fy], ...]} on the 33 x 23 grid over (0..w, 0..h), rows first,
@@ -183,7 +184,8 @@ struct Final {
     seed_matches: usize,
     ransac: RansacResult,
     refit: RefitResult,
-    /// The core `coverage` over the refit's inliers: (coverage, cells).
+    /// The core `coverage` over the refit's inliers and the final pairing: (coverage, cells holding a paired
+    /// eligible star).
     coverage: (f64, usize),
 }
 
@@ -277,7 +279,8 @@ fn stages(
         }
     }
     let inlier_pts: Vec<(f64, f64)> = refit.inliers.iter().map(|&i| pairs[i].0).collect();
-    let cov = coverage(&sp, &rp, &inlier_pts, &refit.linear, geo);
+    let pair_pts: Vec<(f64, f64)> = pairs.iter().map(|p| p.0).collect();
+    let cov = coverage(&sp, &rp, &inlier_pts, &pair_pts, &refit.linear, geo);
     let repaired = pairs.len() - first_pairs;
     (
         out,
