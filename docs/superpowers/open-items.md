@@ -119,7 +119,9 @@ Reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"; pl
 - **The star-measurement program's comparator kit (`pland-<ds>-rqs`, stripped) is owed.** The clones were deleted whole after R6 r2 (R4-40). Regenerate at the merged head with one `accept` / `ln-truth rqs`
   run (~1 h on the dev Mac, ~220 GB until stripped); R6 r2's committed tables (lab 327177d) are the proof any regeneration must reproduce.
 - **Set 258's ×0.2 L bin 1 group registers at today's quality.** On fable's trial four of its frames take affine maps on 24–27 inliers that read 0.35–0.37 px median / 1.4–1.8 px max off the reference
-  group's consensus; the gate passes them, as the base stacked them. A better partial-overlap registration at ×0.2 is R-T6-9's item, not the gate's (fable X r2 §1; R7b r5 reads the real maps).
+  group's consensus; the gate passes them, as the base stacked them. R7b r5 (lab 5056d8f) kept all 15 aligned frames with maps bitwise the base's; 12 of
+  their truths are weak (< 1 000 pairs on the reference group's members), so their class is not read there. A better partial-overlap registration at ×0.2 is
+  R-T6-9's item, not the gate's (fable X r2 §1).
 
 ## Rejection normalization by star flux — what it leaves (2026-11-01)
 

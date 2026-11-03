@@ -1947,7 +1947,10 @@ and landed up to 6.4 px off. Detail, rulings and the bars live in the plan.
   - R7 r3, lab 1eecc3b: set 109, base run then fix run on one copy; minimum inliers 1 437 (≥ 1 414),
     Calibrate and Measure 0 recomputed, 367 / 367 replayed rows reproduced; the counts of r2.
   - R8, lab e64cd3c: the noreg cycle on the runner, moved 0, cumulative moved 0, inject 109 / 109.
-  - R7b: RESULT-PENDING
+  - R7b r5, lab 5056d8f: the cross-scale sets 258 / 108 / 195 against main 07f627cc on one copy; aligned 74 → 74,
+    58 → 58, 115 → 115, the gate refused nothing (K4 0), every kept map bitwise the base's (G), each cross-scale group
+    within ± 1 % of its plan ratio (258 L bin 1 on 15 of 17 frames), the no-hint replay 114 registered and 0 off
+    its truth (worst 0.287 / 1.507 px against 0.5 / 3 px). r3's 13 refused 258 L bin 1 maps came back with (c″).
 - **What moved.** runB mono L: 162 (159 → 1 616 inliers, 1.404 → 0.047 px max off truth), 49 (214 →
   1 614, 0.749 → 0.045) and 39 (355 → 1 612, 0.679 → 0.039); s204 mono: 28986 (88 → 1 609, 4.103 →
   0.030) and 28994 (99 → 1 609, 2.446 → 0.031); all back on good maps. s204 28903 is a moved good frame
