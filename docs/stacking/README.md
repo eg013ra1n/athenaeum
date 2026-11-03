@@ -1941,8 +1941,9 @@ and landed up to 6.4 px off. Detail, rulings and the bars live in the plan.
     39 at 1 616 / 1 583 / 1 614 / 1 612 inliers), O4 800 / 800, O5 83 frames with dropped == false.
   - RG1 r5, lab 0848c06 (K1 / K2): K1 plain 451 precise above 0.75, 585 imprecise below, none across;
     robust 1 049 / 1 049 precise; K2 minimum 1.000 on every group, none under 0.875.
-  - R6 r2, lab 327177d: runB, s204 and hc11 at master level, every number as in r1 (4e86e512) in every
-    judge file; nothing refused, nothing re-seeded (K4 0).
+  - R6 r2, lab 327177d: runB, s204 and hc11 at master level, every judge file byte-equal to r1 (4e86e512);
+    one judge rule changed between them (hc11 70062 is read as "few pairs", judged, no longer a weak truth);
+    nothing refused, nothing re-seeded (K4 0).
   - R7 r3, lab 1eecc3b: set 109, base run then fix run on one copy; minimum inliers 1 437 (≥ 1 414),
     Calibrate and Measure 0 recomputed, 367 / 367 replayed rows reproduced; the counts of r2.
   - R8, lab e64cd3c: the noreg cycle on the runner, moved 0, cumulative moved 0, inject 109 / 109.
@@ -4629,7 +4630,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   one factor on four planes. √N presumes the top-weight frame is a top-SNR frame; here the sharpest frame (28754) sits under the Moon (rank by psfSnr 106 / 121 / 111 of 160), so G's 13.45
   is correct, and over the max-SNR sub the same master reads 8.40 / 9.17 / 9.29. The PD-39 shares on the run's four group-planes were 0.788 / 0.641 / 0.764 / 0.715, all above the 0.6 that fires now.
   *Owner item, outside Plan D (PD-42).* On the OSC R plane the master realizes none of the sharper weighting's star-peak gain (resampling and core rejection of 2-px stars). Measurable with R-SC-1's
-  `star-lab/bin/core_replay.py` core-peak ratio per plane on the final clones (`pland-<ds>-final`, kept stripped as the robust-seed plan's RQ-9 base); recorded in `docs/superpowers/open-items.md`.
+  `star-lab/bin/core_replay.py` core-peak ratio per plane on the final clones (`pland-<ds>-final`; deleted 2026-11-03 under the disk rule once the robust-seed plan's comparisons were committed, so the measurement first regenerates them at f899a691 from the pinned before trees, ~3 h); recorded in `docs/superpowers/open-items.md`.
   *Open at close (all in `open-items.md`).* PD-42's owner item; PD-47's probe (D0's (b-ap) disc on ten 2025-09-13 B frames of the set109 copy); the server's checkpoint-on-shutdown; Measure reads `fwhm_px` 0 on
   point-sampled Gaussian fixtures under 2.5 px (unverified); reweigh's `nch` (max) against integrate's reference `channels` in a mixed group (pre-existing); the PD-39 warn is log-only at 0.6 until the robust-seed
   plan's RQ-6 inlier warn lands; the owed smokes and the release notes.

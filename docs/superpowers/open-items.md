@@ -71,8 +71,9 @@ hangs on the saturated stars' `tflux`; set 109's top-weight frame is a sharp one
 (OSC; run 9: 7.41 / 7.99 / 7.86), a figure bounded by the run's own weighted-mean prediction (PD-48), not by √N. The stacking Measure refuses Blend since D3 (`MEASURE_VERSION` 8). What Plan D left:
 - **PD-42, an owner item (outside Plan D).** On the OSC R plane the master realizes none of the sharper weighting's star-peak gain: runB p0 PSF SNR 0.9831 and s204 p0 0.9882 / drizzle 0.9883 against dbase,
   runB p2 FWHM 1.0103 (the weights predict +0.2 %; the shortfall is resampling and core rejection of 2-px stars, R-SC-1's family). Measure it with `star-lab/bin/core_replay.py`'s core-peak ratio per
-  plane on the final clones (`~/.athenaeum-acc/pland-{hc11,runB,s204}-final`, kept stripped as the robust-seed plan's RQ-9 base; the measurement needs their masters and `.rej` decisions, so strip them only
-  after it).
+  plane on the final clones (`~/.athenaeum-acc/pland-{hc11,runB,s204}-final`; the measurement needs their masters and `.rej` decisions. They were deleted on
+  2026-11-03 under the disk rule once the robust-seed plan's comparisons were committed, so the measurement first regenerates them at
+  f899a691 from the pinned before trees, ~3 h, as the robust-seed plan's RF step did).
 - **PD-47's probe.** On a 3-plane image's 1-in-4 CFA planes (R, B) below ≈ 1.9 px FWHM the 3 F aperture sum's ratio to the anchor falls with FWHM (set 109's moonlit night: B -20.3 %/px). Owed: D0's (b-ap) disc
   per plane on ten 2025-09-13 B frames of the set109 copy (the lab's D0 tool, no build). The copy `~/.athenaeum-acc/plan-d/set109` (141 GB) is kept to **2026-12-07** (REGISTRY row) for it; `pland.sh clean
   set109` after.
