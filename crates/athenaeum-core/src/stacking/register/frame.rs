@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::align::{align, model_name, AlignError, Alignment, DistortionFit, SeedKind, SeedPolicy};
+use super::align::{
+    align_traced, model_name, AlignError, Alignment, DistortionFit, SeedKind, SeedPolicy, SeedTrail,
+};
 use super::detect::{detect_stars, luminance, stars_from_fits, Star};
 use super::RegistrationConfig;
 use crate::geometry::{Linear, LinearKind, PixelMap};
@@ -266,7 +268,7 @@ pub fn detect_frame_stars(
 
 /// Align one frame's already-detected stars onto the reference — the
 /// pixel-CPU half of [`register_frame`] (perf tier 1 Task 9): no I/O, no
-/// star detection, just [`align`]. `read_ms`/`detect_ms` on its own
+/// star detection, just [`super::align::align`]. `read_ms`/`detect_ms` on its own
 /// `"frame registered"`/`"frame registration failed"` event are therefore
 /// UNCONDITIONALLY `0` — this function never reads or detects, whether
 /// `detected` was produced moments ago (a fresh [`register_frame`] call)
@@ -279,7 +281,7 @@ pub fn detect_frame_stars(
 /// frame's cost.
 ///
 /// `hint`, `policy` and `scale_gate` are M4b's three per-frame inputs,
-/// passed straight through to [`align`]: an optional plate-solve seed,
+/// passed straight through to [`super::align::align`]: an optional plate-solve seed,
 /// which seed leads (ruling R-T6-9), and the scale window this particular
 /// frame is judged against.
 ///
@@ -289,7 +291,8 @@ pub fn detect_frame_stars(
 /// parameter of its own, so without it these events, fired from inside
 /// the Register fan-out's scoped worker threads (no span context), would
 /// carry no identifying field at all. The logging spec's registration
-/// entry has always said these events "reuse `path`".
+/// entry has always said these events "reuse `path`". Task RL: the plate-solve
+/// seed's two refusal events (`log_seed_trail`) carry it for the same reason.
 pub fn register_detected(
     reference: &ReferenceStars,
     detected: &DetectedStars,
@@ -299,7 +302,8 @@ pub fn register_detected(
     scale_gate: (f64, f64),
 ) -> FrameRegistration {
     let start = Instant::now();
-    let outcome = align(
+    let mut trail = SeedTrail::default();
+    let outcome = align_traced(
         &detected.stars,
         &reference.stars,
         (reference.width, reference.height),
@@ -308,9 +312,13 @@ pub fn register_detected(
         hint,
         policy,
         scale_gate,
+        &mut trail,
     );
     let align_ms = start.elapsed().as_millis() as u64;
     let duration_ms = align_ms;
+    // The plate-solve seed's refusal, with the frame's path, before the
+    // verdict line it explains (Task RL, R4-33 (3)).
+    log_seed_trail(&detected.path, &trail);
     match &outcome {
         Ok(a) => {
             debug!(
@@ -354,6 +362,40 @@ pub fn register_detected(
         detections: detected.stars.len(),
         outcome,
         duration_ms,
+    }
+}
+
+/// Log what [`align_traced`] left of the plate-solve seed (Task RL, R4-33
+/// (3)): the refusal that `align` folds into a returned warning or loses
+/// behind a quad verdict, and a hint retry that failed. `align` itself logs
+/// nothing and does not know the file, so `path` is added here.
+fn log_seed_trail(path: &Path, trail: &SeedTrail) {
+    if let Some(refused) = &trail.refused {
+        match refused.low_coverage {
+            Some((coverage, cells)) => warn!(
+                path = %path.display(),
+                seed = "wcs",
+                coverage,
+                cells,
+                pairs = refused.pairs,
+                reason = %refused.reason,
+                "plate-solve seed refused; quad seed tried"
+            ),
+            None => warn!(
+                path = %path.display(),
+                seed = "wcs",
+                pairs = refused.pairs,
+                reason = %refused.reason,
+                "plate-solve seed refused; quad seed tried"
+            ),
+        }
+    }
+    if let Some(error) = &trail.retry_failed {
+        warn!(
+            path = %path.display(),
+            error = %error,
+            "plate-solve seed retry failed; quad verdict stands"
+        );
     }
 }
 
@@ -655,6 +697,124 @@ mod tests {
         assert_eq!(direct.detections, split.detections);
         assert_eq!(direct.width, split.width);
         assert_eq!(direct.height, split.height);
+    }
+
+    /// Review r1 I1 (Task RL). The plate-solve seed's refusal reaches the log
+    /// from here, with the frame's `path`, and before the verdict line it
+    /// explains: under the Register fan-out the lines of different frames
+    /// interleave, and a refusal without its file is a number without a
+    /// frame. The disjoint-population scene is the dropped case: the map
+    /// is refused for coverage, then the quad seed has nothing to match, and
+    /// `NoSeed` is all the verdict says.
+    #[test]
+    fn a_refused_plate_solve_seed_is_logged_with_its_path_before_the_verdict() {
+        use super::super::align::tests::{disjoint_geometry, disjoint_population_scene};
+        let (sub, refs, truth) = disjoint_population_scene();
+        let (ref_geo, sub_geo) = disjoint_geometry();
+        let reference = ReferenceStars {
+            stars: refs,
+            width: ref_geo.0,
+            height: ref_geo.1,
+        };
+        let detected = DetectedStars {
+            stars: sub,
+            width: sub_geo.0,
+            height: sub_geo.1,
+            read_ms: 0,
+            detect_ms: 0,
+            path: PathBuf::from("/data/lights/frame-0042.fits"),
+        };
+        let cfg = RegistrationConfig::default();
+        let (reg, logs) = crate::stacking::telemetry::capture_logs(|| {
+            // Callsites first hit by a test with no subscriber cache "never".
+            tracing::callsite::rebuild_interest_cache();
+            register_detected(
+                &reference,
+                &detected,
+                &cfg,
+                Some(&truth),
+                SeedPolicy::WcsFirst,
+                SCALE_RANGE,
+            )
+        });
+        assert!(
+            matches!(
+                reg.outcome,
+                Err(AlignError::NoSeed {
+                    after_wcs: true,
+                    ..
+                })
+            ),
+            "{:?}",
+            reg.outcome
+        );
+        let lines: Vec<&str> = logs.lines().collect();
+        let at = |phrase: &str| {
+            let hits: Vec<usize> = (0..lines.len())
+                .filter(|&i| lines[i].contains(phrase))
+                .collect();
+            assert_eq!(hits.len(), 1, "{phrase}: {logs}");
+            hits[0]
+        };
+        let refusal = at("plate-solve seed refused; quad seed tried");
+        let verdict = at("frame registration failed");
+        assert!(refusal < verdict, "{logs}");
+        for line in [lines[refusal], lines[verdict]] {
+            assert!(line.contains("path=/data/lights/frame-0042.fits"), "{line}");
+        }
+        let line = lines[refusal];
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("seed=\"wcs\""), "{line}");
+        assert!(
+            line.contains("coverage=") && line.contains("cells=16"),
+            "{line}"
+        );
+        assert!(
+            line.contains("pairs=") && line.contains("reason="),
+            "{line}"
+        );
+        // `path` leads the fields, as on the verdict line.
+        assert!(
+            line.find("path=") < line.find("seed="),
+            "path is the first field: {line}"
+        );
+    }
+
+    /// The negative control: the same frame with no hint tried no
+    /// plate-solve seed, so there is no refusal to log — only the verdict.
+    #[test]
+    fn a_frame_with_no_plate_solve_seed_logs_no_refusal() {
+        use super::super::align::tests::{disjoint_geometry, disjoint_population_scene};
+        let (sub, refs, _) = disjoint_population_scene();
+        let (ref_geo, sub_geo) = disjoint_geometry();
+        let reference = ReferenceStars {
+            stars: refs,
+            width: ref_geo.0,
+            height: ref_geo.1,
+        };
+        let detected = DetectedStars {
+            stars: sub,
+            width: sub_geo.0,
+            height: sub_geo.1,
+            read_ms: 0,
+            detect_ms: 0,
+            path: PathBuf::from("/data/lights/frame-0043.fits"),
+        };
+        let cfg = RegistrationConfig::default();
+        let (reg, logs) = crate::stacking::telemetry::capture_logs(|| {
+            tracing::callsite::rebuild_interest_cache();
+            register_detected(
+                &reference,
+                &detected,
+                &cfg,
+                None,
+                SeedPolicy::QuadFirst,
+                SCALE_RANGE,
+            )
+        });
+        assert!(reg.outcome.is_err());
+        assert!(logs.contains("frame registration failed"), "{logs}");
+        assert!(!logs.contains("plate-solve seed"), "{logs}");
     }
 
     #[test]

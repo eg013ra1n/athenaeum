@@ -1357,6 +1357,35 @@ pub(super) fn build_map(
     }
 }
 
+/// What [`align_traced`] saw of the plate-solve seed that [`align`] folds
+/// into a returned warning or a quad verdict (Task RL, R4-33 (3)): the
+/// aligner logs nothing, so the caller that knows the frame's file reads
+/// this and logs it with that file's `path`.
+#[derive(Debug, Default)]
+pub(crate) struct SeedTrail {
+    /// The plate-solve seed led and was refused; the quad seed was tried.
+    /// Set before the quad turn can fail, so a frame that ends in
+    /// [`AlignError::NoSeed`] still has the refusal's numbers.
+    pub refused: Option<SeedRefusal>,
+    /// The quad seed led and was refused, the hint was confirmed, and the
+    /// hint's own turn failed too: its error, which the quad verdict that
+    /// stands would otherwise drop.
+    pub retry_failed: Option<AlignError>,
+}
+
+/// One refused plate-solve seed.
+#[derive(Debug)]
+pub(crate) struct SeedRefusal {
+    /// `(coverage, cells)` when the map was refused for covering too little
+    /// of the overlap; `None` for any other refusal.
+    pub low_coverage: Option<(f64, usize)>,
+    /// Stars the seed paired: at the pairing radius, or at the confirmation
+    /// radius when the hint was rejected before it was fitted.
+    pub pairs: usize,
+    /// The same reason text the returned warning carries.
+    pub reason: String,
+}
+
 /// `hint` (M4b) is an optional subject → reference transform the caller
 /// already believes — today the [`super::wcs_seed`] affine built from both
 /// frames' plate solves. It is only ever used once it has paired at least
@@ -1386,6 +1415,33 @@ pub fn align(
     hint: Option<&Linear>,
     policy: SeedPolicy,
     scale_gate: (f64, f64),
+) -> Result<Alignment, AlignError> {
+    align_traced(
+        subject,
+        reference,
+        reference_geometry,
+        subject_geometry,
+        cfg,
+        hint,
+        policy,
+        scale_gate,
+        &mut SeedTrail::default(),
+    )
+}
+
+/// [`align`] with the plate-solve seed's refusals left in `trail` (Task RL).
+/// Same inputs, same result, same warnings; `trail` is written and never read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn align_traced(
+    subject: &[Star],
+    reference: &[Star],
+    reference_geometry: (usize, usize),
+    subject_geometry: (usize, usize),
+    cfg: &RegistrationConfig,
+    hint: Option<&Linear>,
+    policy: SeedPolicy,
+    scale_gate: (f64, f64),
+    trail: &mut SeedTrail,
 ) -> Result<Alignment, AlignError> {
     if subject.len() < MIN_INLIERS || reference.len() < MIN_INLIERS {
         return Err(AlignError::TooFewStars {
@@ -1440,6 +1496,14 @@ pub fn align(
             Ok(h) => (h, 0, SeedKind::Wcs, Fallback::ToQuads),
             Err(n) => {
                 warnings.push(format!("wcs seed rejected ({n} pairs); quad seed used"));
+                // The quad turn can fail below and then `NoSeed` is all the
+                // frame reports; keep the stale hint's pair count (at the
+                // confirmation radius) for the caller to log.
+                trail.refused = Some(SeedRefusal {
+                    low_coverage: None,
+                    pairs: n,
+                    reason: format!("{n} pairs"),
+                });
                 let (s, m) = seed_affine(&sub_pts, &ref_pts, true)?;
                 (s, m, SeedKind::Quads, Fallback::None)
             }
@@ -1502,24 +1566,17 @@ pub fn align(
                 ));
                 // The warning above travels with a returned `Ok`; when the
                 // quad turn also fails the verdict is the quad path's and the
-                // refusal's numbers would be gone. Log them here, before the
-                // `?` below can drop them (never swallow errors).
-                match lead_err {
-                    AlignError::LowCoverage { coverage, cells } => tracing::warn!(
-                        seed = "wcs",
-                        coverage = *coverage,
-                        cells = *cells,
-                        pairs = pairing.pairs.len(),
-                        reason = %reason,
-                        "plate-solve seed refused; quad seed tried"
-                    ),
-                    _ => tracing::warn!(
-                        seed = "wcs",
-                        pairs = pairing.pairs.len(),
-                        reason = %reason,
-                        "plate-solve seed refused; quad seed tried"
-                    ),
-                }
+                // refusal's numbers would be gone. Keep them in the trail,
+                // before the `?` below can drop them (never swallow errors);
+                // the caller logs them with the frame's path.
+                trail.refused = Some(SeedRefusal {
+                    low_coverage: match lead_err {
+                        AlignError::LowCoverage { coverage, cells } => Some((*coverage, *cells)),
+                        _ => None,
+                    },
+                    pairs: pairing.pairs.len(),
+                    reason,
+                });
                 let (quad, matches) = seed_affine(&sub_pts, &ref_pts, true)?;
                 seed_matches = matches;
                 seed_kind = SeedKind::Quads;
@@ -1568,11 +1625,8 @@ pub fn align(
                         fit_warnings = retry.2;
                     } else if let Err(retry_err) = &retry.1 {
                         // The quad verdict stands and the retry's own error
-                        // is dropped with `retry`; say what it was.
-                        tracing::warn!(
-                            error = %retry_err,
-                            "plate-solve seed retry failed; quad verdict stands"
-                        );
+                        // is dropped with `retry`; keep it for the caller.
+                        trail.retry_failed = Some(retry_err.clone());
                     }
                 }
             }
@@ -1706,7 +1760,7 @@ pub fn align(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
     use crate::stacking::register::local_loop::{compose, LOCAL_DISTORTION_ROUNDS};
@@ -2984,7 +3038,7 @@ mod tests {
     /// each surrounded by neighbours the other frame does not have, so no
     /// LOCAL group of four is common to both and the quad matcher has
     /// nothing to seed from; an exact transform pairs all ten at once.
-    fn disjoint_population_scene() -> (Vec<Star>, Vec<Star>, Linear) {
+    pub(crate) fn disjoint_population_scene() -> (Vec<Star>, Vec<Star>, Linear) {
         let sites: Vec<(f64, f64)> = (0..5)
             .flat_map(|i| (0..2).map(move |j| (i, j)))
             .map(|(i, j)| (300.0 + i as f64 * 340.0, 400.0 + j as f64 * 600.0))
@@ -3031,7 +3085,7 @@ mod tests {
         (subject, reference, truth)
     }
 
-    fn disjoint_geometry() -> ((usize, usize), (usize, usize)) {
+    pub(crate) fn disjoint_geometry() -> ((usize, usize), (usize, usize)) {
         let g = (DISJOINT_W as usize, DISJOINT_H as usize);
         (g, g)
     }
@@ -4014,181 +4068,223 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Task RL (R4-33 (3)): the plate-solve seed's refusal is logged, not
-    // dropped with the quad verdict. The logs are read through the crate's
-    // scoped capture (`stacking::telemetry::capture_logs`).
+    // Task RL (R4-33 (3)): the plate-solve seed's refusal is kept in the
+    // `SeedTrail`, not dropped with the quad verdict; `frame.rs` logs it
+    // with the frame's path (its own test). `align` logs nothing.
     // ---------------------------------------------------------------
 
-    const SEED_REFUSED: &str = "plate-solve seed refused; quad seed tried";
-    const SEED_RETRY_FAILED: &str = "plate-solve seed retry failed; quad verdict stands";
-
-    /// Run `f` under the log capture and return its result with the lines
-    /// that carry `phrase`.
-    fn lines_logged<R>(phrase: &str, f: impl FnOnce() -> R) -> (R, Vec<String>) {
-        let (out, logs) = crate::stacking::telemetry::capture_logs(|| {
-            // Callsites first hit by a test with no subscriber cache "never".
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        let lines = logs
-            .lines()
-            .filter(|l| l.contains(phrase))
-            .map(str::to_owned)
-            .collect();
-        (out, lines)
+    /// [`align_traced`] with the trail returned beside the result.
+    #[allow(clippy::too_many_arguments)]
+    fn traced(
+        subject: &[Star],
+        reference: &[Star],
+        reference_geometry: (usize, usize),
+        subject_geometry: (usize, usize),
+        cfg: &RegistrationConfig,
+        hint: Option<&Linear>,
+        policy: SeedPolicy,
+        scale_gate: (f64, f64),
+    ) -> (Result<Alignment, AlignError>, SeedTrail) {
+        let mut trail = SeedTrail::default();
+        let out = align_traced(
+            subject,
+            reference,
+            reference_geometry,
+            subject_geometry,
+            cfg,
+            hint,
+            policy,
+            scale_gate,
+            &mut trail,
+        );
+        (out, trail)
     }
 
-    /// The value after `key=` on one formatted log line, up to the next
-    /// field (`seed="wcs"`, `coverage=0.19`, `reason=map covers 0.19 of the
-    /// overlap` all read back whole).
-    fn log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let at = line.find(&format!("{key}="))? + key.len() + 1;
-        let rest = &line[at..];
-        let end = [" seed=", " coverage=", " cells=", " pairs=", " reason=", " error="]
-            .iter()
-            .filter_map(|k| rest.find(k))
-            .min()
-            .unwrap_or(rest.len());
-        Some(rest[..end].trim())
-    }
-
-    /// A refusal the quad seed then carries: the line gives what the
+    /// A refusal the quad seed then carries: the trail gives what the
     /// returned warning only gives to two decimals, and `cells` and `pairs`
     /// beside it.
     #[test]
-    fn a_refused_plate_solve_seed_logs_its_coverage_cells_and_pairs() {
+    fn a_refused_plate_solve_seed_leaves_its_coverage_cells_and_pairs() {
         let (sub, refs, truth) = decoy_scene(1);
         assert_decoy_guards(&sub, &refs, &truth);
         let (ref_geo, sub_geo) = decoy_geometry();
         let band = band_seed(&truth, (0.0, 0.0), BAND_EPS);
-        let (a, lines) = lines_logged(SEED_REFUSED, || {
-            align(
-                &sub,
-                &refs,
-                ref_geo,
-                sub_geo,
-                &RegistrationConfig::default(),
-                Some(&band),
-                SeedPolicy::WcsFirst,
-                SCALE_RANGE,
-            )
-        });
+        let (a, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&band),
+            SeedPolicy::WcsFirst,
+            SCALE_RANGE,
+        );
         let a = a.expect("the quad seed carries the frame");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        assert!(line.contains("WARN"), "{line}");
-        assert_eq!(log_field(line, "seed"), Some("\"wcs\""), "{line}");
-        let coverage: f64 = log_field(line, "coverage")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no coverage on {line}"));
-        assert!(coverage < MIN_COVERAGE, "{line}");
-        let cells: usize = log_field(line, "cells")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no cells on {line}"));
-        assert!((1..=16).contains(&cells), "{line}");
-        let pairs: usize = log_field(line, "pairs")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no pairs on {line}"));
-        assert!(pairs >= MIN_INLIERS, "{line}");
+        let refused = trail.refused.expect("the refusal is in the trail");
+        let (coverage, cells) = refused.low_coverage.expect("refused for coverage");
+        assert!(coverage < MIN_COVERAGE, "{coverage}");
+        assert!((1..=16).contains(&cells), "{cells}");
+        assert!(refused.pairs >= MIN_INLIERS, "{}", refused.pairs);
         // The warning the frame returns names the same refusal, rounded.
         assert_eq!(
-            log_field(line, "reason"),
-            Some(format!("map covers {coverage:.2} of the overlap").as_str()),
-            "{line}"
+            refused.reason,
+            format!("map covers {coverage:.2} of the overlap")
         );
         assert_eq!(
             a.warnings[0],
-            format!("wcs seed pairing failed (map covers {coverage:.2} of the overlap); quad seed used")
+            format!(
+                "wcs seed pairing failed ({}); quad seed used",
+                refused.reason
+            )
         );
+        assert!(trail.retry_failed.is_none(), "{:?}", trail.retry_failed);
     }
 
-    /// The case the line exists for (set 195's refused frames): the quad
+    /// The case the trail exists for (set 195's refused frames): the quad
     /// turn fails too, `NoSeed` is all the frame reports, and the refusal's
     /// coverage and cells would be nowhere. Here: ten shared stars hold 8 of
     /// the overlap's 16 cells, the plate-solve map is refused, and the quad
     /// matcher has nothing to match.
     #[test]
-    fn a_refusal_followed_by_a_quad_failure_still_logs_the_refusal() {
+    fn a_refusal_followed_by_a_quad_failure_is_still_in_the_trail() {
         let (sub, refs, truth) = disjoint_population_scene();
         let (ref_geo, sub_geo) = disjoint_geometry();
-        let (err, lines) = lines_logged(SEED_REFUSED, || {
-            align(
-                &sub,
-                &refs,
-                ref_geo,
-                sub_geo,
-                &RegistrationConfig::default(),
-                Some(&truth),
-                SeedPolicy::WcsFirst,
-                SCALE_RANGE,
-            )
-        });
+        let (err, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::WcsFirst,
+            SCALE_RANGE,
+        );
         let err = err.expect_err("the quad matcher has nothing to match either");
         assert!(
-            matches!(err, AlignError::NoSeed { after_wcs: true, .. }),
+            matches!(
+                err,
+                AlignError::NoSeed {
+                    after_wcs: true,
+                    ..
+                }
+            ),
             "the frame's verdict is unchanged: {err}"
         );
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        let coverage: f64 = log_field(line, "coverage")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no coverage on {line}"));
-        assert!(coverage < MIN_COVERAGE, "{line}");
-        assert_eq!(log_field(line, "cells"), Some("16"), "{line}");
+        let refused = trail.refused.expect("the refusal is in the trail");
+        let (coverage, cells) = refused.low_coverage.expect("refused for coverage");
+        assert!(coverage < MIN_COVERAGE, "{coverage}");
+        assert_eq!(cells, 16);
         // The ten shared stars, and whatever field star the pairing radius
         // adds to them.
-        let pairs: usize = log_field(line, "pairs")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no pairs on {line}"));
-        assert!((10..=14).contains(&pairs), "{line}");
+        assert!((10..=14).contains(&refused.pairs), "{}", refused.pairs);
     }
 
     /// A refusal that is not for coverage says how many stars the seed
     /// paired, and carries no coverage or cells.
     #[test]
-    fn a_plate_solve_seed_that_pairs_too_little_logs_its_pairs() {
+    fn a_plate_solve_seed_that_pairs_too_little_leaves_its_pairs() {
         let (sub, refs, truth) = binned_scene();
         let (ref_geo, sub_geo) = binned_geometry();
         let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
         let mut stale = truth;
         stale.m[0][2] += 5.0;
-        let (a, lines) = lines_logged(SEED_REFUSED, || {
-            align(
-                &sub,
-                &refs,
-                ref_geo,
-                sub_geo,
-                &RegistrationConfig::default(),
-                Some(&stale),
-                SeedPolicy::WcsFirst,
-                gate,
-            )
-        });
+        let (a, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&stale),
+            SeedPolicy::WcsFirst,
+            gate,
+        );
         a.expect("the quad seed carries the frame");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        let pairs: usize = log_field(line, "pairs")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("no pairs on {line}"));
-        assert!(pairs < MIN_INLIERS, "{line}");
-        assert_eq!(
-            log_field(line, "reason"),
-            Some(format!("{pairs} pairs").as_str()),
-            "{line}"
-        );
-        assert!(
-            !line.contains("coverage=") && !line.contains("cells="),
-            "{line}"
-        );
+        let refused = trail.refused.expect("the refusal is in the trail");
+        assert!(refused.pairs < MIN_INLIERS, "{}", refused.pairs);
+        assert_eq!(refused.reason, format!("{} pairs", refused.pairs));
+        assert_eq!(refused.low_coverage, None);
     }
 
-    /// A frame the plate-solve seed carries logs no refusal.
+    /// Review r1 M1. A hint that does not even confirm (it pairs under
+    /// `MIN_INLIERS` at the wide confirmation radius) is rejected before it
+    /// is fitted; the quad seed then finds nothing and `NoSeed` is all the
+    /// frame reports. The rejection's pair count is in the trail, counted at
+    /// the confirmation radius.
     #[test]
-    fn a_carried_frame_logs_no_refusal() {
+    fn a_hint_rejected_before_its_fit_is_in_the_trail_when_the_quad_seed_fails() {
+        let (sub, refs, truth) = disjoint_population_scene();
+        let (ref_geo, sub_geo) = disjoint_geometry();
+        let cfg = RegistrationConfig::default();
+        let mut stale = truth;
+        stale.m[0][2] += 300.0;
+        let (err, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &cfg,
+            Some(&stale),
+            SeedPolicy::WcsFirst,
+            SCALE_RANGE,
+        );
+        let err = err.expect_err("the quad matcher has nothing to match");
+        assert!(
+            matches!(
+                err,
+                AlignError::NoSeed {
+                    after_wcs: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let refused = trail.refused.expect("the rejection is in the trail");
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let at_confirmation = pair_through(
+            &stale,
+            &sub,
+            &refs,
+            &KdTree2::build(&ref_pts),
+            seed_radius_px(cfg.ransac_tolerance_px),
+        )
+        .pairs
+        .len();
+        assert!(at_confirmation < MIN_INLIERS, "{at_confirmation}");
+        assert_eq!(refused.pairs, at_confirmation);
+        assert_eq!(refused.reason, format!("{at_confirmation} pairs"));
+        assert_eq!(refused.low_coverage, None);
+    }
+
+    /// A frame the plate-solve seed carries leaves an empty trail.
+    #[test]
+    fn a_carried_frame_leaves_an_empty_trail() {
         let (sub, refs, truth) = binned_scene();
         let (ref_geo, sub_geo) = binned_geometry();
         let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
-        let ((), lines) = lines_logged(SEED_REFUSED, || {
+        let (a, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            SeedPolicy::WcsFirst,
+            gate,
+        );
+        a.expect("the confirmed hint carries the frame");
+        assert!(trail.refused.is_none(), "{:?}", trail.refused);
+        assert!(trail.retry_failed.is_none(), "{:?}", trail.retry_failed);
+    }
+
+    /// `align` is pure geometry (RQ-10): the same refusals, under a log
+    /// capture, leave no line behind. The caller that knows the file logs.
+    #[test]
+    fn align_itself_logs_nothing_about_a_refusal() {
+        let (sub, refs, truth) = disjoint_population_scene();
+        let (ref_geo, sub_geo) = disjoint_geometry();
+        let (out, logs) = crate::stacking::telemetry::capture_logs(|| {
+            // Callsites first hit by a test with no subscriber cache "never".
+            tracing::callsite::rebuild_interest_cache();
             align(
                 &sub,
                 &refs,
@@ -4197,45 +4293,57 @@ mod tests {
                 &RegistrationConfig::default(),
                 Some(&truth),
                 SeedPolicy::WcsFirst,
-                gate,
+                SCALE_RANGE,
             )
-            .expect("the confirmed hint carries the frame");
         });
-        assert!(lines.is_empty(), "{lines:?}");
+        out.expect_err("the refusal then the quad failure");
+        assert!(!logs.contains("plate-solve seed"), "{logs}");
     }
 
     /// The quad seed leads and is refused; the hint is confirmed but its
     /// map is refused too. The quad path's verdict stands, as it always
-    /// did, and the retry's own error is on the log.
+    /// did, and the retry's own error is in the trail. The hint here is 5 px
+    /// off the truth: it confirms at the 8 px confirmation radius, and the
+    /// chance pairs the dense cluster gives it inside the 3.8 px pairing
+    /// radius fit a map that covers 0.31 of the overlap, where the quad
+    /// verdict says 0.25 — two different texts, so the trail can only have
+    /// come from the hint's own turn.
     #[test]
-    fn a_failed_plate_solve_retry_is_logged_and_the_quad_verdict_stands() {
+    fn a_failed_plate_solve_retry_is_in_the_trail_and_the_quad_verdict_stands() {
         let (sub, refs, truth) = compact_decoy_scene(1, COMPACT_STARS);
         let (ref_geo, sub_geo) = decoy_geometry();
-        let band = band_seed(&truth, (0.0, 0.0), BAND_EPS);
+        let mut stale = truth;
+        stale.m[0][2] += 5.0;
         let cfg = RegistrationConfig::default();
         let without = align_default(&sub, &refs, ref_geo, sub_geo, &cfg)
             .expect_err("the compact decoy is refused without a hint");
-        let (with, lines) = lines_logged(SEED_RETRY_FAILED, || {
-            align(
-                &sub,
-                &refs,
-                ref_geo,
-                sub_geo,
-                &cfg,
-                Some(&band),
-                SeedPolicy::QuadFirst,
-                SCALE_RANGE,
-            )
-        });
-        let with = with.expect_err("neither seed carries the frame");
-        assert_eq!(format!("{with}"), format!("{without}"), "the quad verdict stands");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        assert!(line.contains("WARN"), "{line}");
-        assert!(
-            log_field(line, "error").is_some_and(|e| !e.is_empty()),
-            "{line}"
+        let (with, trail) = traced(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &cfg,
+            Some(&stale),
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
         );
+        let with = with.expect_err("neither seed carries the frame");
+        assert_eq!(
+            format!("{with}"),
+            format!("{without}"),
+            "the quad verdict stands"
+        );
+        let retry = trail
+            .retry_failed
+            .expect("the retry's error is in the trail");
+        // The hint's own turn, not the quad verdict again.
+        assert_ne!(format!("{retry}"), format!("{without}"));
+        assert!(
+            matches!(retry, AlignError::LowCoverage { .. })
+                && format!("{retry}").starts_with("registration inliers cover"),
+            "{retry}"
+        );
+        assert!(trail.refused.is_none(), "{:?}", trail.refused);
     }
 
     /// Stars of a dense cluster in one subject cell of the 4 x 4 grid.
