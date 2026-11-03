@@ -1275,14 +1275,10 @@ mod tests {
             "another align version is another registration hash"
         );
         // The measurement subtree takes no align version: the same default
-        // config hashes the same whatever `align` is at.
+        // config hashes the same as at the unmoved version-8 literal.
         assert_eq!(
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
-            stage_hash(
-                &measurement_subtree_with_fits_artifact_version(&cfg, FITS_ARTIFACT_VERSION),
-                &[],
-                &[]
-            ),
+            "ef32610c8173c47f"
         );
     }
 
@@ -2193,7 +2189,9 @@ mod tests {
                 (
                     "registration",
                     registration_subtree_with_measure_version(&cfg, earlier),
-                    registration_subtree(&cfg),
+                    // Like shapes: the registration row of this literal is read without `alignVersion`, so the
+                    // pair differs by the measure version alone.
+                    registration_subtree_with_measure_version(&cfg, MEASURE_VERSION),
                 ),
                 (
                     "normalization",
