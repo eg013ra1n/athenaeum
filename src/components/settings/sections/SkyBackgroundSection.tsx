@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { api } from '../../../api';
+import { openUrl } from '../../../api/desktop';
 import type { HipsSurveyInfo } from '../../../types/models';
 import { useHipsPack } from '../../../hooks/useHipsPack';
 import { useNotifications } from '../../../contexts/NotificationContext';
@@ -180,18 +181,22 @@ export function SkyBackgroundSection() {
                   <div className="min-w-0">
                     <p className="text-sm text-content">{s.label}</p>
                     <p className="text-xs text-content-muted">
-                      {s.attribution}
-                      {s.attributionUrl && (
-                        <>
-                          {' · '}
-                          <a href={s.attributionUrl} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-                            terms
-                          </a>
-                        </>
-                      )}
+                      {s.attributionUrl ? (
+                        <button
+                          onClick={() => void openUrl(s.attributionUrl!).catch((err) => console.error('[Settings] opening the survey credit link failed:', err))}
+                          className="text-accent hover:underline text-left"
+                        >
+                          {s.attribution}
+                        </button>
+                      ) : s.attribution}
                       {' · '}
                       {s.license}
                     </p>
+                    {s.servers.length > 0 && (
+                      <p className="text-xs text-content-muted">
+                        {s.servers.length === 1 ? 'Server: ' : 'Servers: '}{s.servers.join(', ')}
+                      </p>
+                    )}
                     <p className="text-xs text-content-secondary mt-0.5">
                       {s.cachedTiles === 0
                         ? 'No tiles stored.'

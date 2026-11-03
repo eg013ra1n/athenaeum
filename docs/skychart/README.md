@@ -76,24 +76,39 @@ A box with only some corners beyond the hemisphere is drawn; the globe clip path
 
 ## HiPS sky background (#18)
 
-A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on demand and kept locally. Phase 2: the offline pack, below. Phase 3 (NSNS DR0.2): Stefan Ziegenbalg's written permission is in [`nsns-permission.md`](nsns-permission.md) (2026-11-03); the design is on #18.
+A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on demand and kept locally. Phase 2: the offline pack, below. Phase 3: six NSNS DR0.2 surveys, served from every verified mirror (below). Stefan Ziegenbalg's written permission is in [`nsns-permission.md`](nsns-permission.md) (2026-11-03); the design is on #18.
 
 **Rights (ruling).**
 - Tiles are never redistributed: not in the installer, the Docker image, the repo, artfrom.space, the hub or Perseus.
-- Every install fetches its own tiles from the survey's master URL into a private store.
-- The survey's `obs_copyright` and license are shown on the chart whenever it is drawn, and in Settings → General → Sky background.
-- DSS colored is `hips_status = public master clonableOnce`: a copy only from the master, never from a mirror.
+- Every install fetches its own tiles into a private store, from the survey's master or a mirror whose own `hips_status` allows a copy.
+- The survey's credit and license are shown on the chart whenever it is drawn, and in Settings → General → Sky background: the preset's `credit` / `credit_url` when it has one (NSNS), else `obs_copyright` / `obs_copyright_url`. The credit is a link (`openUrl`).
+- **Copy rule per endpoint** (`mirrors::allows_copy`), from the endpoint's own record, HiPS 1.0 defaults `master` and `clonableOnce`: a `master` that is `clonable` or `clonableOnce`, or a `mirror` / `partial` that is `clonable`. Never `private`, never `unclonable`. A clone of a `clonableOnce` master is `unclonable`, so copying from it would be a clone of a clone. DSS colored (`public master clonableOnce`) is therefore served from its master and from any host that publishes the master record itself; NSNS (`public master clonable`, the GAVO copy `public mirror clonable`) from both.
 - NSNS (phase 3) is CC BY-NC-SA 4.0: free Sky Chart only, credit "Northern Sky Narrowband Survey" with https://www.simg.de/nebulae3, URLs from HiPS servers' `hipslist` files and load balanced over every mirror, cache and offline pack allowed ([`nsns-permission.md`](nsns-permission.md)).
 
 **Core (`athenaeum-core/src/hips/`, `api/hips.rs`).**
-- **Presets.** `SURVEYS` is the only source of survey URLs; there is no arbitrary-URL setting.
+- **Presets.** `SURVEYS` is the only source of surveys and of their master URLs; there is no arbitrary-URL setting. A preset also carries its `creator_did`, the VO registry resources that may hold a copy (`registry_ivoids`), its `credit` / `credit_url` and `non_commercial`.
+
+  | Id | Survey | Max order | Format | Typical tile |
+  | ---- | ---- | ---- | ---- | ---- |
+  | `dss-color` | DSS colored (CDS) | 9 (drawn to 6) | JPEG | 67 KB |
+  | `nsns-rgb8` | NSNS RGB continuum | **5** | PNG | 620 KB |
+  | `nsns-ohs8` | NSNS [OIII], Hα and [SII] | 6 | PNG | 610 KB |
+  | `nsns-hbr8` | NSNS Hα and continuum | 6 | PNG | 690 KB |
+  | `nsns-halpha8` | NSNS Hα | 6 | PNG | 134 KB |
+  | `nsns-oiii8` | NSNS [OIII] | 6 | PNG | 128 KB |
+  | `nsns-sii8` | NSNS [SII] | 6 | PNG | 138 KB |
+
+  NSNS covers ≈ 65 % of the sky (north of Dec −16°); its other DR0.2 HiPS are 32-bit FITS (≈ 11–44 GB each) or variance maps, and DR0.1 is superseded, so they are not presets. `non_commercial` is true for NSNS (CC BY-NC-SA): it is never to be offered in a paid surface.
+- **Mirrors** (`hips/mirrors.rs`). Candidates come from the CDS aggregate of HiPS lists (MocServer, `ID` = the `creator_did` without `ivo://`), the author's `https://www.simg.de/hipslist`, and one RegTAP query (`https://dc.g-vo.org/tap/sync`) for the HiPS capabilities of the presets' `registry_ivoids`: GAVO publishes no `hipslist`, only registry records. Every candidate's own `properties`, fetched from the candidate URL, must name the preset's `creator_did`, pass the preset's checks, allow a copy, and carry the release date of the store's `properties` (else the master's). The address is the URL the `properties` came from, never the record's `hips_service_url`: GAVO's `rgb8` record names `/nsns/q/rgb8/hips`, a 404; the registry has `/nsns/cont/rgb8/hips`. URLs are moved to `https`. The result is `<app_data>/hips/mirrors.json`, refreshed at most once a day: in the background on the first tile fetch while online, on the pack's own thread before a pack runs. The first failed CDS query ends the CDS part of that search (the others would wait out the same timeout). A search where every source failed keeps the stored list and is not repeated within the hour; with no list, the master alone serves.
+  - Checked live 2026-11-03: GAVO mirrors all six NSNS products (same `creator_did`, release dates and sizes, tiles byte-identical, the same 404s south of the coverage). CDS was unreachable that day from both the cloud container and the owner's machine, so whether it holds NSNS copies, and the status of DSS colored's second CDS host, is still to be read.
+- **Balancing** (`hips/balance.rs`), one pool per survey, master first. A request goes to the endpoint that is up with the fewest requests in flight, then the lower latency (EWMA, an unmeasured endpoint counts as fastest). A request error takes the endpoint down 30 s, doubling to 10 min, and the tile goes to the next one; a 429 / 503 takes it down for `Retry-After` ([5 s, 300 s], else 30 s). The caller sees `ServerBusy` only when every endpoint is busy, so the pack's busy wait runs then. A mirror's 404 sends the tile to the master; only the master's 404, or every mirror's while the master is down, is absent (a busy master is waited for instead). `get_hips_surveys` lists the hosts as `servers`.
 - **Store.** `<app_data>/hips/<survey-id>/` holds the standard layout `Norder{k}/Dir{(npix/10000)*10000}/Npix{n}.{jpg|png}` and the survey's original `properties`.
-  - A 404 from the master leaves a zero-byte `Npix{n}.absent` marker, so that tile is never asked for again.
+  - An absent tile (see **Balancing**) leaves a zero-byte `Npix{n}.absent` marker, so that tile is never asked for again.
   - Writes are atomic (`.part` + rename).
   - A cached file without the format's signature is deleted and fetched again.
 - **Fetch.**
   - `get_hips_tile` serves the store first.
-  - A missing tile is fetched only when `skychart.hips_online` (default `true`) is on, after the survey's `properties` were read and validated: equatorial frame, 512 px tiles, the preset's format, order ≥ 6.
+  - A missing tile is fetched only when `skychart.hips_online` (default `true`) is on, after the survey's `properties` were read (from the master, else a mirror) and validated: equatorial frame, 512 px tiles, the preset's format, the preset's `creator_did`, an order at least the drawn one (`min(max_order, 6)`).
   - The HTTP client identifies as `Athenaeum/<version> (+https://artfrom.space)`, with a 10 s connect and 20 s total timeout and a 4 MB cap per tile.
   - A failed fetch is an error and is not remembered; the chart retries after 30 s.
 - **Commands.** `get_hips_surveys`, `get_hips_tile` (bytes as `tauri::ipc::Response` / an `image/*` POST body; an empty payload means no coverage) and `clear_hips_cache` exist on both hosts.
@@ -127,6 +142,7 @@ A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on deman
   - Cached ancestors are drawn under tiles still loading. A tile the store refuses (offline and not stored) asks for its nearest ancestor not known to fail, one order per failure, at the back of the queue; an ancestor drawn as a stand-in is kept from eviction and refreshed in the LRU, so the offline pack's order-k sky shows under finer views instead of black.
   - A survey change disposes everything and drops late responses.
 - **Opacity.** The opacity slider draws a black veil of `1 − opacity` over opaque tiles: blending each grown triangle at partial alpha would light up the seams between them.
+- **PNG alpha** (NSNS is transparent outside its coverage). Bitmaps are decoded premultiplied (`createImageBitmap(…, { premultiplyAlpha: 'premultiply' })`) and uploaded with `UNPACK_PREMULTIPLY_ALPHA_WEBGL`, so a transparent texel is black over the black sky on WebGL; the 2D path composites over the black clear on its own.
 - **Settings.** `skychart.background` (`none` | survey id) and `skychart.background_opacity` are written by the chart's controls; `skychart.hips_online` is a KV setting with its default in `defaults::all()`.
 
 **Sizes (DSS colored, live `hips_estsize` / tiles, ≈ 67 KB per tile).**
@@ -141,11 +157,11 @@ A sky survey image drawn under the chart. Phase 1: DSS colored, fetched on deman
 Browsing can never store more than the whole sky to order 6.
 
 **Offline pack (phase 2, owner ruling 2026-10-26 on #18).** A user can download the sky ahead of time in Settings → General → Sky background, so the chart works in the field without internet. The chart only links there ("Download for offline…" in its credit strip).
-- **What a pack covers** (`hips/pack.rs::pack_tiles`): the whole sky at orders `0..=k`, plus, around each chosen region, the cone coverage at orders `k+1..=6`. The renderer falls back to ancestors only, so a detail region needs every order above k, not order 6 alone.
+- **What a pack covers** (`hips/pack.rs::pack_tiles`): the whole sky at orders `0..=k`, plus, around each chosen region, the cone coverage at orders `k+1..=` the survey's drawn maximum (6, or 5 for `nsns-rgb8`; k is clamped to it too). The renderer falls back to ancestors only, so a detail region needs every order above k, not order 6 alone.
   - k is selectable 0–5 (default **4**, 26″/px). At the chart's narrowest view (11.72°) `chooseOrder` asks for order 4 up to 1 635 device px of window width, order 5 from 1 636 and order 6 from 3 271 (any Retina window from 818 CSS px wants order 5). Outside the detail cones such a view draws the stored order-k ancestor, scaled up; inside them it is sharp. A whole-sky order 6 is never a pack (3.6–4.5 GB); browsing still caches it.
   - Regions (checkboxes): **imaging locations** (default on; every location the chart draws, radius = half the FOV diagonal + 1°, or 2° without a FOV), **Messier** (on; 108 objects, 3°), **NGC/IC brighter than 10ᵐ** (off; 491 objects, 3°, ≈ 0.6 GB at order 6). Every catalog object was ruled out: the chart's 15 809 DSOs at 2–3° cover 88–98 % of the sky.
   - Cone coverage goes through `catalog::healpix::cone_pixels_at`, the one wrapper around cdshealpix's knife-edge panic near |Dec| ≈ 41.8° (M 31 sits there).
-- **Estimate** (`estimate_hips_pack`, never touches the network): tiles total / already stored (images and `.absent` markers) / missing; size per tile from the stored `properties` (`hips_estsize` KB × 1024 / `hips_nb_tiles`), else the preset's `approx_tile_bytes` (67 000); free space from `disk::free_bytes`. A start whose missing tiles plus a 512 MiB reserve do not fit is refused; nothing missing skips the check.
+- **Estimate** (`estimate_hips_pack`, never touches the network): tiles total / already stored (images and `.absent` markers) / missing; size per tile from the stored `properties` (`hips_estsize` KB × 1024 / `hips_nb_tiles`), else the preset's `approx_tile_bytes` (67 000 for DSS, see **Presets** for NSNS), times `moc_sky_fraction` from the same `properties` when present (tiles outside the coverage are 404 markers and weigh nothing; NSNS ≈ 0.65); free space from `disk::free_bytes`. A start whose missing tiles plus a 512 MiB reserve do not fit is refused; nothing missing skips the check.
 - **Runner** (`run_pack`): 4 workers over one deduplicated tile list; tiles already stored are counted `present` without network. An explicit pack runs with `skychart.hips_online` off (the toggle governs browsing only), and fetches and validates `properties` first.
   - **Busy survey** (429 / 503, `hips::ServerBusy`): wait `Retry-After` seconds clamped to [5 s, 300 s] (the clamp is applied before any arithmetic: a header of `u64::MAX` seconds is real input), else back off 5 s → 300 s; a tile still busy after 6 waits is `failed`. 4 such tiles in a row (≈ 5 min of solid 429/503) stop the run as `failed` ("survey busy"); a fetched tile or a 404 resets the streak.
   - **Network down**: 20 consecutive plain errors (connection, HTTP 5xx other than 503, a non-image body, a write error) stop the run as `failed`, finished tiles kept.

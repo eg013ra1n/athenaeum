@@ -4,8 +4,9 @@
 //! [`HipsStore`] on worker threads.
 //!
 //! The renderer falls back to *ancestors only*, so a detail region covers
-//! every order from `k + 1` up to [`super::DISPLAY_MAX_ORDER`]: a gap between
-//! k and the deepest order would show the coarse sky.
+//! every order from `k + 1` up to the survey's deepest drawn order
+//! ([`super::request_max_order`], at most [`super::DISPLAY_MAX_ORDER`]): a gap
+//! between k and the deepest order would show the coarse sky.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{FetchedTile, HipsStore, ServerBusy, TileFormat, DISPLAY_MAX_ORDER};
+use super::{FetchedTile, HipsStore, ServerBusy, DISPLAY_MAX_ORDER};
 use crate::models::ImagingLocation;
 use crate::plate_solve::dso_lookup::DsoCatalog;
 
@@ -114,16 +115,19 @@ pub fn catalog_regions(cat: &DsoCatalog, messier: bool, ngc_ic: bool) -> Vec<Pac
 
 /// The tiles of a pack as `(order, npix)`, sorted ascending and deduplicated:
 /// every tile of orders `0..=sky_order`, then for each region the cone
-/// coverage at orders `sky_order + 1..=6`.
-pub fn pack_tiles(sky_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)>> {
-    let sky_order = checked_sky_order(sky_order)?;
+/// coverage at orders `sky_order + 1..=max_order` (the survey's deepest drawn
+/// order, at most 6: `nsns-rgb8` stops at 5, and order-6 tiles it lacks are
+/// never asked for).
+pub fn pack_tiles(sky_order: u8, max_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)>> {
+    let sky_order = checked_sky_order(sky_order)?.min(max_order);
+    let max_order = max_order.min(DISPLAY_MAX_ORDER);
     let mut tiles: Vec<(u8, u64)> = Vec::new();
     for order in 0..=sky_order {
         let n = 12u64 << (2 * u32::from(order));
         tiles.extend((0..n).map(|npix| (order, npix)));
     }
     for region in regions {
-        for order in sky_order + 1..=DISPLAY_MAX_ORDER {
+        for order in sky_order + 1..=max_order {
             tiles.extend(
                 crate::catalog::healpix::cone_pixels_at(
                     order,
@@ -299,10 +303,13 @@ struct Shared {
     wait_s: u32,
 }
 
+/// How a pack fetches one tile: the survey's endpoints through
+/// `hips::balance`, or a test server.
+pub type TileFetch<'a> = dyn Fn(u8, u64) -> Result<FetchedTile> + Sync + 'a;
+
 struct Run<'a> {
     store: &'a HipsStore,
-    base_url: &'a str,
-    format: TileFormat,
+    fetch: &'a TileFetch<'a>,
     todo: &'a [(u8, u64)],
     cfg: &'a PackRunConfig,
     cancel: &'a AtomicBool,
@@ -382,7 +389,7 @@ impl Run<'_> {
     fn process(&self, order: u8, npix: u64) -> Outcome {
         let mut waits = 0u32;
         let fetched = loop {
-            match super::fetch_tile_from(self.base_url, self.format, order, npix) {
+            match (self.fetch)(order, npix) {
                 Ok(t) => break t,
                 Err(e) => {
                     let Some(busy) = e.downcast_ref::<ServerBusy>().copied() else {
@@ -499,8 +506,7 @@ impl Run<'_> {
 /// afterwards.
 pub fn run_pack(
     store: &HipsStore,
-    base_url: &str,
-    format: TileFormat,
+    fetch: &TileFetch<'_>,
     tiles: &[(u8, u64)],
     initial: PackProgress,
     cfg: &PackRunConfig,
@@ -523,8 +529,7 @@ pub fn run_pack(
 
     let run = Run {
         store,
-        base_url,
-        format,
+        fetch,
         todo: &todo,
         cfg,
         cancel,
@@ -584,6 +589,22 @@ fn write_pack_file(store: &HipsStore, progress: &PackProgress) {
 mod tests {
     use super::*;
 
+    /// A survey drawn to order 6 (DSS colored).
+    fn pack_tiles_t(sky_order: u8, regions: &[PackRegion]) -> Result<Vec<(u8, u64)>> {
+        pack_tiles(sky_order, DISPLAY_MAX_ORDER, regions)
+    }
+
+    #[test]
+    fn detail_stops_at_the_surveys_deepest_order() {
+        // nsns-rgb8 is drawn to order 5: its detail regions have no order 6.
+        let five = pack_tiles(4, 5, &[m31()]).unwrap();
+        assert!(five.iter().all(|(o, _)| *o <= 5));
+        assert!(five.iter().any(|(o, _)| *o == 5));
+        assert_eq!(pack_tiles(4, 5, &[]).unwrap(), pack_tiles_t(4, &[]).unwrap());
+        // A whole-sky order above the survey's is clamped to it.
+        assert_eq!(pack_tiles(5, 3, &[m31()]).unwrap(), pack_tiles_t(3, &[]).unwrap());
+    }
+
     fn m31() -> PackRegion {
         PackRegion {
             ra_deg: 10.6847,
@@ -615,22 +636,22 @@ mod tests {
 
     #[test]
     fn whole_sky_counts() {
-        assert_eq!(pack_tiles(3, &[]).unwrap().len(), 1020);
-        assert_eq!(pack_tiles(4, &[]).unwrap().len(), 4092);
+        assert_eq!(pack_tiles_t(3, &[]).unwrap().len(), 1020);
+        assert_eq!(pack_tiles_t(4, &[]).unwrap().len(), 4092);
     }
 
     #[test]
     fn whole_sky_order_6_refused() {
         assert!(checked_sky_order(6).is_err());
-        assert!(pack_tiles(6, &[]).is_err());
+        assert!(pack_tiles_t(6, &[]).is_err());
         assert_eq!(checked_sky_order(5).unwrap(), 5);
         assert_eq!(checked_sky_order(0).unwrap(), 0);
     }
 
     #[test]
     fn region_adds_orders_above_sky_only() {
-        let base = pack_tiles(4, &[]).unwrap();
-        let with = pack_tiles(4, &[m31()]).unwrap();
+        let base = pack_tiles_t(4, &[]).unwrap();
+        let with = pack_tiles_t(4, &[m31()]).unwrap();
         let added: Vec<_> = with.iter().filter(|t| !base.contains(t)).collect();
         assert!(added.iter().all(|(o, _)| *o == 5 || *o == 6), "{added:?}");
         // The whole-sky part is untouched.
@@ -645,16 +666,16 @@ mod tests {
     #[test]
     fn overlapping_regions_dedup() {
         assert_eq!(
-            pack_tiles(4, &[m31(), m31()]).unwrap(),
-            pack_tiles(4, &[m31()]).unwrap()
+            pack_tiles_t(4, &[m31(), m31()]).unwrap(),
+            pack_tiles_t(4, &[m31()]).unwrap()
         );
     }
 
     #[test]
     fn no_regions_is_whole_sky_only() {
         assert_eq!(
-            pack_tiles(4, &location_regions(&[])).unwrap(),
-            pack_tiles(4, &[]).unwrap()
+            pack_tiles_t(4, &location_regions(&[])).unwrap(),
+            pack_tiles_t(4, &[]).unwrap()
         );
     }
 
@@ -682,7 +703,7 @@ mod tests {
             dec_deg: 0.0,
             radius_deg: 3.0,
         };
-        assert_eq!(pack_tiles(4, &[bad]).unwrap(), pack_tiles(4, &[]).unwrap());
+        assert_eq!(pack_tiles_t(4, &[bad]).unwrap(), pack_tiles_t(4, &[]).unwrap());
     }
 
     /// The base-cell boundary at +/-41.81 degrees must not take the pack down.
@@ -694,14 +715,14 @@ mod tests {
                 dec_deg: dec,
                 radius_deg: 3.0,
             };
-            let t = pack_tiles(4, &[r]).unwrap();
-            assert!(t.len() > pack_tiles(4, &[]).unwrap().len(), "dec {dec}");
+            let t = pack_tiles_t(4, &[r]).unwrap();
+            assert!(t.len() > pack_tiles_t(4, &[]).unwrap().len(), "dec {dec}");
         }
     }
 
     // ---- runner -----------------------------------------------------------
 
-    use crate::hips::DSS_COLOR;
+    use crate::hips::{TileFormat, DSS_COLOR};
     use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -709,6 +730,11 @@ mod tests {
     use std::sync::Arc;
 
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+
+    /// Fetches from one test server, as the balancer does from one endpoint.
+    fn via(base: &str) -> impl Fn(u8, u64) -> Result<FetchedTile> + Sync + '_ {
+        move |order, npix| crate::hips::fetch_tile_from(base, TileFormat::Jpeg, order, npix)
+    }
 
     #[derive(Clone)]
     struct Resp {
@@ -842,7 +868,7 @@ mod tests {
         cancel: &AtomicBool,
     ) -> PackProgress {
         let initial = PackProgress::new(PackSelection::default(), tiles.len() as u64);
-        run_pack(store, base, TileFormat::Jpeg, tiles, initial, cfg, cancel, &|_| {})
+        run_pack(store, &via(base), tiles, initial, cfg, cancel, &|_| {})
     }
 
     fn new_store() -> (tempfile::TempDir, HipsStore) {
@@ -1014,8 +1040,7 @@ mod tests {
         let initial = PackProgress::new(PackSelection::default(), 1);
         let p = run_pack(
             &store,
-            &server.base,
-            TileFormat::Jpeg,
+            &via(&server.base),
             &tiles_of(1),
             initial,
             &cfg,
@@ -1131,8 +1156,7 @@ mod tests {
         let initial = PackProgress::new(PackSelection::default(), 5);
         let p = run_pack(
             &store,
-            &server.base,
-            TileFormat::Jpeg,
+            &via(&server.base),
             &tiles_of(5),
             initial,
             &quick_cfg(),
@@ -1157,8 +1181,7 @@ mod tests {
         let t = Instant::now();
         run_pack(
             &store,
-            &server.base,
-            TileFormat::Jpeg,
+            &via(&server.base),
             &tiles_of(60),
             initial,
             &quick_cfg(),
