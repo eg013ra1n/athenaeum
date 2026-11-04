@@ -4643,6 +4643,24 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   nits are in the DF docs round, m2 became PD-44); the final whole-branch review (fable, Step 5, `task-DF-final-review-r1.md`): APPROVE, C0 / I0 / m1 / n4 (m1, the anchor on a dead plane, and n3 in open-items; n1 folded into the PD-3 line and the Stacking rule).
   *After note:* `docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`.
   - **R-OSP-18 CLOSED (2026-11-02): Plan D complete; `plan-d` merged into local `main` as 91df3ff0 (code head ddf2073f); core suite on the merged tree in the next line; push on the owner's word.**
+- **R-OSP-19 - `star_measure` lives in rustafits (owner 2026-11-03 / 04; rustafits port plan
+  `docs/superpowers/plans/2026-11-03-star-measure-port.md` in that repository, decisions D-1…D-10; this is its phase 3).**
+  The module and `integration::stats`' primitives (now `astroimage::stats`) moved verbatim at 0b6fb183: rustafits copied them
+  with paths, serde gates and visibility changed and nothing else (its 288 module tests matched this repository's run name for
+  name, and a digest of every entry point was byte-identical between the two copies on one machine). Athenaeum re-exports them
+  (`lib.rs`: `pub use astroimage::star_measure`; `integration::stats` re-exports the primitives), so every
+  `crate::star_measure::…` path is unchanged and no number moves: `MEASURE_VERSION` stays 8 and no stage hash moves.
+  - *Rules.* A change to the module is a rustafits PR under its `MEASURE_VERSION` policy (unchanged: one bump per merged plan
+    that changes what a fit accepts or measures); Athenaeum bumps the submodule. Until the port reaches rustafits `main`, the
+    submodule points at its integration branch `star-measure-port` and this repository's `main` does not take the bump (D-10).
+  - *TypeScript.* `PsfModel` and `ScaleEstimator` are rustafits types: their TS faces are `stacking::psf_signal::PsfModelTs`
+    and `integration::stats::ScaleEstimatorTs`, and the config fields holding them carry `#[ts(as = …)]`; `src/types` is
+    unchanged.
+  - *Tests.* The three that hold Athenaeum's code to the module stay here, in `stacking/star_measure_identity.rs`: the two
+    adapter-identity tests and `robust`'s agreement with `integration::combine`. The module's fixtures `StarFit::test_at` and
+    `PlanePrep::for_pin` come from rustafits' `test-support` feature (a dev-dependency).
+  - *Logs.* The module's events carry the target `astroimage::star_measure::…`.
+  - *Gates before merge.* The core suites (cloud, x86_64), then the lab scorecard 0 moved and the aarch64 pins on the dev Mac.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
