@@ -28,7 +28,9 @@ semver = "1"
 # more — rustafits's JPEG encoder moved to pure-Rust libjpeg-turbo-rs — so the
 # gate is now about compile time, binary size and unused subsystems, not about
 # cmake/nasm.
-rustafits = { path = "../../rustafits", default-features = false, features = ["debug-pipeline"], optional = true }
+# `serde`: the `star_measure` / `stats` types Athenaeum stores (stacking config, pass-1 artifacts) — the module lives
+# in rustafits since its port plan phase 3 (`docs/superpowers/plans/2026-11-03-star-measure-port.md` there).
+rustafits = { path = "../../rustafits", default-features = false, features = ["serde"], optional = true }
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro", optional = true }
@@ -230,6 +232,8 @@ name = "drizzle_probe"
 required-features = ["render", "solver"]
 
 [dev-dependencies]
+# `test-support`: `StarFit::test_at` and `PlanePrep::for_pin`, the fixtures the tests build fits and pins with.
+rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 imageproc = { version = "0.27", default-features = false }

@@ -87,6 +87,8 @@ pub mod rej;
 pub use crate::star_measure::robust;
 pub mod run;
 pub mod solve;
+#[cfg(test)]
+mod star_measure_identity;
 pub mod structure;
 pub(crate) mod telemetry;
 #[cfg(test)]

@@ -5864,10 +5864,15 @@ dependencies = [
  "libjpeg-turbo-rs",
  "lz4_flex",
  "nalgebra",
+ "postcard",
  "quick-xml",
  "rayon",
  "ruzstd",
+ "serde",
+ "serde_json",
  "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]

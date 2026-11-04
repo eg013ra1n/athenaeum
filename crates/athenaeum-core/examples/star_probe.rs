@@ -992,8 +992,8 @@ fn cmd_measure(a: MeasureArgs) -> Result<(), String> {
 /// pixels and the solves by window size (≤ 32, 64, 128, 256, 512, 1024, 2048 px, more).
 #[cfg(feature = "lm-counters")]
 fn lm_counters_line() -> Value {
-    let c = astroimage::analysis::fitting::lm_counters::lm_counters();
-    let one = |k: &astroimage::analysis::fitting::lm_counters::LmSolveCounters| {
+    let c = astroimage::lm_counters::lm_counters();
+    let one = |k: &astroimage::lm_counters::LmSolveCounters| {
         json!({"solves": k.solves, "iterations": k.iterations, "acceptedSteps": k.accepted_steps,
                "refusedGuard": k.refused_guard, "refusedCost": k.refused_cost, "jacobianPasses": k.jacobian_passes,
                "jacobianReused": k.jacobian_reused, "costPasses": k.cost_passes, "pixels": k.pixels,
