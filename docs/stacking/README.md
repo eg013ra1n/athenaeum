@@ -4651,8 +4651,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   (`lib.rs`: `pub use astroimage::star_measure`; `integration::stats` re-exports the primitives), so every
   `crate::star_measure::…` path is unchanged and no number moves: `MEASURE_VERSION` stays 8 and no stage hash moves.
   - *Rules.* A change to the module is a rustafits PR under its `MEASURE_VERSION` policy (unchanged: one bump per merged plan
-    that changes what a fit accepts or measures); Athenaeum bumps the submodule. Until the port reaches rustafits `main`, the
-    submodule points at its integration branch `star-measure-port` and this repository's `main` does not take the bump (D-10).
+    that changes what a fit accepts or measures); Athenaeum bumps the submodule, and only to a commit on rustafits `main`
+    (D-10). The switch pins ee40ca6, rustafits `main`'s merge of `star-measure-port` (rustafits #12). Its tree is 0025614's,
+    the commit the gates ran at, plus the plan and the gate script.
   - *TypeScript.* `PsfModel` and `ScaleEstimator` are rustafits types: their TS faces are `stacking::psf_signal::PsfModelTs`
     and `integration::stats::ScaleEstimatorTs`, and the config fields holding them carry `#[ts(as = …)]`; `src/types` is
     unchanged.
@@ -4660,7 +4661,17 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     adapter-identity tests and `robust`'s agreement with `integration::combine`. The module's fixtures `StarFit::test_at` and
     `PlanePrep::for_pin` come from rustafits' `test-support` feature (a dev-dependency).
   - *Logs.* The module's events carry the target `astroimage::star_measure::…`.
-  - *Gates before merge.* The core suites (cloud, x86_64), then the lab scorecard 0 moved and the aarch64 pins on the dev Mac.
+  - *Gates, all passed.*
+    - Cloud (x86_64): `cargo test -p athenaeum-core --lib` with every test's outcome unchanged against 0b6fb183;
+      `ts_contract`; the headless and web builds; the port digest through the re-export, byte-identical to this
+      repository's own copy.
+    - Dev Mac (aarch64, 2026-11-04), rustafits' `scripts/star_measure_port/mac_check.sh`: the digest is byte-identical,
+      `main` against the branch; rustafits `--features serde` 513 / 0 / 2; core all targets 4575 / 0 / 16 with no pin
+      edited (`main`'s 4870, minus the module's 290 and the 8 `stats` tests, plus the 3 moved).
+    - Dev Mac, athenaeum-lab `harness/acceptance/smport.sh`: `star_probe` on the whole star-test corpus (152 images) in
+      the stacking Measure and Analysis-mode arms. All 304 image-arms are byte-identical once the run-time keys are
+      dropped, which is stricter than the scorecard's 0 moved (lab 4f7043f, `star-lab/results/star-measure-port/`).
+  - **R-OSP-19 CLOSED (2026-11-04): the port's phase 3 merged with the submodule at ee40ca6.**
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
