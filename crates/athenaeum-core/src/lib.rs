@@ -41,9 +41,11 @@ pub mod analysis;
 pub mod flat_analysis;
 // One star-measurement path (spec 2026-10-07): the stacking Measure stage's
 // fit, β, frame aggregates, noise and sky statistic, `render`-gated like
-// `analysis` so the Analysis tab can consume it without `stacking`.
+// `analysis` so the Analysis tab can consume it without `stacking`. It lives in
+// rustafits (`astroimage::star_measure`, moved verbatim at 0b6fb183 by its port
+// plan); every `crate::star_measure::…` path resolves through this re-export.
 #[cfg(feature = "render")]
-pub mod star_measure;
+pub use astroimage::star_measure;
 pub mod orientation;
 // catalog/gaia builds on both astroimage (proper-motion) and solvemyastro (cache).
 #[cfg(all(feature = "render", feature = "solver"))]

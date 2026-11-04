@@ -155,6 +155,7 @@ impl Default for GroupingConfig {
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementConfig {
     pub weight_mode: WeightMode,
+    #[ts(as = "crate::stacking::psf_signal::PsfModelTs")]
     pub psf_model: PsfModel,
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,

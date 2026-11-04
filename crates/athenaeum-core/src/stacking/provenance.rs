@@ -82,6 +82,7 @@ pub struct SummaryReference {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryMeasurement {
     pub seed_source: String,
+    #[ts(as = "crate::integration::stats::ScaleEstimatorTs")]
     pub scale_estimator: ScaleEstimator,
 }
 

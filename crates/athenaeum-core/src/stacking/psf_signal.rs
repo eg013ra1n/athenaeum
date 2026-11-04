@@ -19,6 +19,17 @@ pub use crate::star_measure::{
     AUTO_SAMPLE, RCR_LIMIT,
 };
 
+// The TypeScript face of `PsfModel` (a rustafits type since the star_measure port, which cannot derive `ts_rs::TS`
+// here): the wire's two names (`Fixed` is internal, never on the wire), exported as `PsfModel`; the config fields that
+// hold one point their `#[ts(as = …)]` at it. No `///` doc on purpose — ts-rs would copy it into `src/types`, which
+// must stay unchanged.
+#[derive(ts_rs::TS)]
+#[ts(rename = "PsfModel", rename_all = "camelCase")]
+pub enum PsfModelTs {
+    Auto,
+    Moffat4,
+}
+
 /// [`crate::star_measure::fit::fit_stars`] (Plan A Task 2: the fit moved;
 /// this wrapper keeps every LN and probe call site unchanged).
 pub fn fit_stars(

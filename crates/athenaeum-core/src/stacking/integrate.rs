@@ -136,6 +136,7 @@ pub struct NormalizationConfig {
     /// Informational at this layer: the estimator that produced the
     /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
     /// orchestrator (Plan 5) keeps the two equal.
+    #[ts(as = "crate::integration::stats::ScaleEstimatorTs")]
     pub scale_estimator: ScaleEstimator,
     /// Local (small-scale) normalization settings (spec §5.2, M2).
     #[serde(default)]
@@ -257,6 +258,7 @@ pub struct LocalNormalizationConfig {
     // Auto scale = the short side of the LN geometry / gridSize, snapped (2-8).
     pub grid_size: u32,
     pub reference_frames: u32,
+    #[ts(as = "crate::stacking::psf_signal::PsfModelTs")]
     pub psf_model: crate::stacking::psf_signal::PsfModel,
     pub local_scale: bool,
     // Which matched stars set the scale (spec §3).
