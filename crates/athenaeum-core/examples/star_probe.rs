@@ -155,7 +155,7 @@ use astroimage::processing::vng::vng_debayer_f32;
 use astroimage::BayerPattern;
 use athenaeum_core::analysis::analyzer::{map_measurement, measure_raw_frame_with};
 use athenaeum_core::analysis::config::{AnalysisConfig, AnalysisPsfModel};
-use athenaeum_core::analysis::input::{read_raw_frame, RawPlanes};
+use athenaeum_core::star_measure::raw::{read_raw_frame, RawPlanes};
 use athenaeum_core::models::{FrameAnalysis, StarMetric};
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::geometry::{Linear, LinearKind};
