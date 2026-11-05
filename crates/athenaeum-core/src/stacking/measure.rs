@@ -1273,6 +1273,8 @@ fn adapter_head(
                 }
             }
         }
+        // D-6: the legacy analyzer is removed at rustafits 2.0, with `SeedOverride::Full` and the lab's `legacy-analysis` arm.
+        #[allow(deprecated)]
         Detector::Full => {
             // `measure_cap` defaults to 500 and truncates AFTER measurement
             // (unlike `with_max_stars`, which caps detection) — left at the
