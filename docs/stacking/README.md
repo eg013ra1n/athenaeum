@@ -4378,13 +4378,15 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     at seed level), fit on the native mosaic with the green-site mask, sky and noise from one green phase, `c` = 1 (Analysis star fluxes on
     OSC are uncorrected, a recorded limit). Detection source amended by R-PC-3. Evidence: `task-C3-report-r1.md`, `task-C3-review-r1.md`.
   - PC-5 a debayered 3-plane file is measured on its G plane (`colour: true`, `PixelNoise::Mixed`, `cfa_site_share: Some(0.5)`); R-OSP-15's
-    silent limit 1 (no field-width median on a debayered plane) stays recorded. Evidence: `analysis/analyzer.rs`.
+    silent limit 1 (no field-width median on a debayered plane) stays recorded. Evidence: `star_measure::analysis_mode` (rustafits; was
+    `analysis/analyzer.rs` until port phase 4, R-OSP-19).
   - PC-6 a frame the module judges trailed or defocused has no measured star; `possibly_trailed` = the trailed verdict; trail R² = the Rayleigh
     R² over the measured stars' canonical θ, stored for compatibility. Evidence: `task-C4-report-r1.md`.
   - PC-7 a frame with no fit in its statistic writes 0.0 for `median_fwhm` / `median_eccentricity` / `median_snr` / `median_hfr`. Evidence:
     `analysis::analyzer::map_measurement`.
   - PC-8 `star_metrics.snr` / `hfr` are nullable; a NaN is stored NULL (`Option<f64>`). Evidence: `task-C6-report-r1.md`.
-  - PC-9 `median_beta` is NULL under Moffat 4 and the fitted β under Auto when its source is `Fitted`. Evidence: `analysis/analyzer.rs`.
+  - PC-9 `median_beta` is NULL under Moffat 4 and the fitted β under Auto when its source is `Fitted`. Evidence: `star_measure::analysis_mode`
+    (rustafits; was `analysis/analyzer.rs` until port phase 4, R-OSP-19).
   - PC-10 Settings → Analysis keeps `detection_threshold` (σ, default 6.0, range 2-20), `psf_model` (`moffat4` default, `auto`), `max_stars`
     (default 500; `measure_cap` folds in) and `batch_concurrency`; the detection sigma, star-area, saturation fraction, MRS layers, PSF-fit knobs
     and Trail Threshold settings are removed. Evidence: `task-C5-report-r1.md` (the config), `task-C8-report-r1.md` (the panel).
@@ -4672,7 +4674,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       the stacking Measure and Analysis-mode arms. All 304 image-arms are byte-identical once the run-time keys are
       dropped, which is stricter than the scorecard's 0 moved (lab 4f7043f, `star-lab/results/star-measure-port/`).
   - **R-OSP-19 CLOSED (2026-11-04): the port's phase 3 merged with the submodule at ee40ca6.**
-  - **R-OSP-19, phase 4 - the Analysis-mode entry lives in rustafits (owner 2026-11-04, «Да, начинай фазу 4»; items 4.1-4.5 of the port plan, detailed in rustafits `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`; Athenaeum branch `star-measure-port-phase-4`). OPEN: the gate results below are owed (controller) and the merge waits for the owner.**
+  - **R-OSP-19, phase 4 - the Analysis-mode entry lives in rustafits (owner 2026-11-04, «Да, начинай фазу 4»; items 4.1-4.5 of the port plan, detailed in rustafits `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`; Athenaeum branch `star-measure-port-phase-4`). OPEN: gated, every fixed-bar gate passes (below); the app smoke G-1h is OWED and the merge waits for the owner.**
     - *What moved.* `analysis/input.rs`, `analysis/cfa.rs`, `analysis/trail.rs` and the measurement and frame arithmetic of `analysis/analyzer.rs`
       are rustafits' `star_measure::{raw, green, trail, analysis_mode}`, copied at e6344ddd (the four files are unchanged since the G-2 freeze
       0b6fb183), float code verbatim, only paths and visibility changed. `raw` and `analysis_mode` are the semver-covered entry; `green` and
@@ -4705,25 +4707,31 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     - *Numbers and logs.* `MEASURE_VERSION` stays 8 and `config_hash` is unchanged, so no stored analysis is re-run. The moved events keep their
       fields and carry the targets `astroimage::star_measure::{raw, green}` (`docs/logging/README.md`). No rustafits release (D-8: the additions
       ride with 1.8.0 in phase 5).
-    - *Pin.* T6 (`fbfd1d99`) pins rustafits `e4e3328`, the phase-4 tip after fix round 1. A second fix round and the squash-merge re-pin move it
-      (R-P4-7: `git diff --stat <old> <new>` empty each time). Final pin: **OWED** (controller).
-    - *Gates* (controller, dev Mac aarch64; bars from plan section 4). Done so far, by T6's implementer: `cargo test -p athenaeum-core
-      --all-targets` 4549 passed / 0 failed / 15 ignored (= 4575 at e6344ddd - 12 - 10 - 5 + 1), `analysis::` 18 passed, `ts_contract` passed with
-      `src/types` unchanged, `--no-default-features` check clean, `athenaeum-web` builds, `grep 'analysis::\(input\|cfa\|trail\)\|fold_bayer_offsets' crates`
-      empty. Everything else is owed:
-      - G-1a suites, exact aarch64 pins (`mac_check.sh`, `MAC_CHECK_MAIN=e6344ddd`): the digest byte-identical `main` against the branch; rustafits
-        `--features serde` (556 / 0 / 3 at T5, 580 / 0 / 3 after fix 1; final **OWED**); core all targets 4549 / 0 / 15, no pin edited. Result: **OWED**.
-      - G-1b corpus, analysis-mode arm, 152 images (`smport.sh`, tag `phase-4`): `SMPORT: PASS`, identical 152, moved 0. Result: **OWED**.
-      - G-1c positive control of the one fold (three patched copies of `singles/test.xisf`, X 1 / Y 1 / X 1 and Y 1): PASS with 3 identical; the X-only
-        and Y-only copies differ from the unpatched file, the X-and-Y copy equals it; `rustafits info --json` RGGB before, GRBG / GBRG / BGGR after.
-        Result: **OWED**.
-      - G-1d rustafits renders unchanged (`tests/mono.fits`, `osc.fits`, `test.xisf`: JPEG, `info --json`, `analyze --json` byte-identical). Result: **OWED**.
-      - G-1e `MEASURE_VERSION` 8 (`rustafits/src/star_measure/mod.rs`) and the `config_hash` pin test. Result: **OWED**.
-      - G-1f `ts_contract`, headless and web builds on the final commit. Result: **OWED**.
-      - G-1g release binary size (`cargo build --release -p rustafits`, both worktrees); the change goes to the port plan. Result: **OWED**.
-      - G-3 rustafits: default, `--features serde`, `--features debug-pipeline`, `--no-default-features` build, clippy with no new warning in
-        `src/{star_measure,formats}/`. Result: **OWED**.
-      - Results folders in athenaeum-lab: `star-lab/results/star-measure-port/phase-4/` and `phase-4-fold/`. Lab commit: **OWED**.
+    - *Pin.* T6 (`fbfd1d99`) pinned rustafits `e4e3328`, the phase-4 tip after fix round 1; fix round 2 moved the tip to `9c5e75d`, pinned by
+      `484361ac`, the commit the gates below ran on. The squash-merge re-pin is still to come (R-P4-7: `git diff --stat <old> <new>` empty each
+      time). Final pin: **OWED** (controller, after the merges).
+    - *Gates* (controller, dev Mac aarch64; bars from plan section 4; before = `main` e6344ddd, after = `484361ac`, rustafits `9c5e75d`). **Every
+      fixed-bar gate passes; G-1h is OWED.** Round 1 stopped at G-1b: a shared cargo target made the after side reuse the before side's rustafits,
+      so `smport.sh` now builds one target per side (lab 469cc89); round 2 re-ran from G-1b on with one target per side.
+      - G-1a suites, exact aarch64 pins (`mac_check.sh`, `MAC_CHECK_MAIN=e6344ddd`, `MAC_CHECK_BRANCH=star-measure-port-phase-4`): the digest is
+        byte-identical, `a07688d0…`, the same as in phase 3; rustafits `--features serde` 581 / 0 / 3; core all targets 4549 / 0 / 15
+        (= 4575 at e6344ddd - 12 - 10 - 5 + 1), no pin edited. PASS (lab 9264396).
+      - G-1b corpus, analysis-mode arm, 152 images (`smport.sh`, tag `phase-4`): `SMPORT: PASS`, 152 image-arms identical, 0 moved, 1 481 994 JSONL lines
+        compared (lab 9977f31). PASS. What the corpus reaches: EGAIN is on 59 of the 152 files and DATAMAX on none, so the `DATAMAX` rule rests on
+        the unit parity tests and `raw_seam.rs`, not on the corpus.
+      - G-1c positive control of the one fold (three patched copies of `singles/test.xisf`, X 1 / Y 1 / X 1 and Y 1): the fold control passes with 3 identical
+        before / after; against the unpatched file the X-only and Y-only copies differ and the X-and-Y copy is equal; `rustafits info --json` reads RGGB
+        before and GRBG / GBRG / BGGR after (lab 9977f31, `phase-4-fold/`). PASS.
+      - G-1d rustafits renders unchanged (`tests/mono.fits`, `osc.fits`, `test.xisf`: JPEG, `info --json`, `analyze --json`): the 9 outputs are
+        byte-identical before / after; the fold copies' JPEGs differ, as they should. PASS.
+      - G-1e `MEASURE_VERSION` 8 (`rustafits/src/star_measure/mod.rs`) and the `config_hash` test. PASS (lab 9264396).
+      - G-1f `ts_contract` passes and `src/types` is unchanged; the `--no-default-features` check and the `athenaeum-web` build are clean; the
+        `analysis::(input|cfa|trail)` / `fold_bayer_offsets` grep over `crates` is empty. PASS.
+      - G-1g release `rustafits` binary: 3 082 944 B before, 3 035 792 B after (-47 152 B; the cause was not investigated). PASS (it does not grow);
+        the change is in the port plan.
+      - G-3 rustafits: default 573 / 0 / 3, `--features serde` 581 / 0 / 3, `--features debug-pipeline` 573 / 0 / 5, the `--no-default-features`
+        build finishes, and clippy prints the same 11 lines as `main` in `src/{star_measure,formats}/` (no new warning). PASS.
+      - Results folders in athenaeum-lab: `star-lab/results/star-measure-port/phase-4/` and `phase-4-fold/`; lab commits 9264396 and 9977f31, pushed.
     - *App smoke G-1h (the wiring, which no number above exercises).* About 5 minutes of `npm run tauri dev` on the real dev DB, on the phase-4
       branch: the Analysis tab on one FITS and one XISF frame (the row appears, the figures are `main`'s), Blink's star overlay on one frame, and the
       new error text of an unreadable header on a truncated copy of one FITS. Result: **OWED**; it is also listed in `open-items.md`.
