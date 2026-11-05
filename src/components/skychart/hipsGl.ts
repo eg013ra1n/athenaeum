@@ -39,6 +39,8 @@ precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_opacity;
 varying vec2 v_uv;
+// Texels are premultiplied, so a transparent one (a PNG survey outside its
+// coverage) is black over the black sky.
 void main() {
   gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb * u_opacity, 1.0);
 }`;
@@ -168,6 +170,9 @@ export function createGlRenderer(canvas: HTMLCanvasElement, onRestored: () => vo
     t = ctx.createTexture();
     if (!t) return null;
     ctx.bindTexture(ctx.TEXTURE_2D, t);
+    // The bitmap is created premultiplied; ask for premultiplied texels too,
+    // so the upload never un-premultiplies them (PNG alpha, see FRAGMENT).
+    ctx.pixelStorei(ctx.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
     ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.RGBA, ctx.RGBA, ctx.UNSIGNED_BYTE, bmp);
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR);
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.LINEAR);

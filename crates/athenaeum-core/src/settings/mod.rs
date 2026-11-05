@@ -109,6 +109,9 @@ pub mod defaults {
     // Sky Chart background (HiPS, issue #18): fetch missing tiles from the
     // survey's master while browsing. "false" shows cached tiles only.
     pub const SKYCHART_HIPS_ONLINE: &str = "true";
+    // Size limit of the sky tiles fetched while browsing, all surveys
+    // together, GB (see hips::cache). Offline-pack tiles are kept whatever it is.
+    pub const SKYCHART_HIPS_CACHE_LIMIT_GB: &str = "10";
 
     // Full-app capture-node auto mode (task M2). When enabled on a signed-in
     // `capture` device, files newly ingested by a scan are enqueued to the
@@ -180,6 +183,10 @@ pub mod defaults {
                 BLINK_MEMORY_CACHE_SIZE,
             ),
             (super::keys::SKYCHART_HIPS_ONLINE, SKYCHART_HIPS_ONLINE),
+            (
+                super::keys::SKYCHART_HIPS_CACHE_LIMIT_GB,
+                SKYCHART_HIPS_CACHE_LIMIT_GB,
+            ),
             (
                 super::keys::BLINK_MEMORY_CACHE_MAX_MB,
                 BLINK_MEMORY_CACHE_MAX_MB,
@@ -373,6 +380,8 @@ pub mod keys {
     /// Sky Chart background (HiPS): `"true"` fetches missing tiles from the
     /// survey's master while browsing; `"false"` draws cached tiles only.
     pub const SKYCHART_HIPS_ONLINE: &str = "skychart.hips_online";
+    /// Sky Chart background: size limit of the browsing tile cache, GB.
+    pub const SKYCHART_HIPS_CACHE_LIMIT_GB: &str = "skychart.hips_cache_limit_gb";
 
     /// Full-app capture-node auto mode (task M2). `"true"` → a signed-in
     /// `capture` device enqueues freshly-scanned files to its paired primary
@@ -673,6 +682,25 @@ impl SettingsManager {
         Ok(gb.saturating_mul(1024 * 1024 * 1024))
     }
 
+    /// Size limit of the Sky Chart's browsing tile cache, in bytes. An
+    /// unparsable or zero stored value falls back to the default (logged), so
+    /// a bad row never lets the cache grow unbounded or empties it.
+    pub fn get_hips_cache_limit_bytes(&self, conn: &Connection) -> Result<u64> {
+        let raw = self.get_with_precedence(
+            conn,
+            keys::SKYCHART_HIPS_CACHE_LIMIT_GB,
+            defaults::SKYCHART_HIPS_CACHE_LIMIT_GB,
+        )?;
+        let gb = match raw.trim().parse::<u64>() {
+            Ok(gb) if gb > 0 => gb,
+            _ => {
+                tracing::warn!(value = %raw, "skychart.hips_cache_limit_gb is not a positive whole number; using the default");
+                defaults::SKYCHART_HIPS_CACHE_LIMIT_GB.parse().unwrap_or(10)
+            }
+        };
+        Ok(gb.saturating_mul(1024 * 1024 * 1024))
+    }
+
     /// Get the configured concurrency ceiling for the global compute queue
     /// (heavy CPU jobs: analysis, master build, light calibration). Clamped
     /// to the same 1..=8 range `api::compute::set_compute_max_concurrent`
@@ -907,6 +935,7 @@ mod tests {
             keys::COLLAB_MAX_UPLOAD_STREAMS,
             keys::COLLAB_MAX_RECEIVE_STREAMS,
             keys::SKYCHART_HIPS_ONLINE,
+            keys::SKYCHART_HIPS_CACHE_LIMIT_GB,
         ] {
             assert!(
                 listed.contains(key),
@@ -1086,6 +1115,21 @@ mod tests {
             manager.get_archive_root_path(&conn).unwrap(),
             Some("/tmp/archive".to_string())
         );
+    }
+
+    #[test]
+    fn hips_cache_limit_defaults_to_10_gb_and_falls_back_on_garbage() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+        let gb = 1024u64 * 1024 * 1024;
+        assert_eq!(manager.get_hips_cache_limit_bytes(&conn).unwrap(), 10 * gb);
+        manager.persist_setting(&conn, keys::SKYCHART_HIPS_CACHE_LIMIT_GB, "3").unwrap();
+        assert_eq!(manager.get_hips_cache_limit_bytes(&conn).unwrap(), 3 * gb);
+        for bad in ["0", "lots", "-2"] {
+            manager.persist_setting(&conn, keys::SKYCHART_HIPS_CACHE_LIMIT_GB, bad).unwrap();
+            assert_eq!(manager.get_hips_cache_limit_bytes(&conn).unwrap(), 10 * gb, "{bad}");
+        }
     }
 
     #[test]

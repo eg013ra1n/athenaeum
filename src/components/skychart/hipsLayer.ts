@@ -432,7 +432,9 @@ async function loadTile(s: HipsSurveyRef, order: number, npix: number): Promise<
   const payload = await api.invoke<ArrayBuffer | Uint8Array>('get_hips_tile', { surveyId: s.id, order, npix });
   const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
   if (bytes.byteLength === 0) return null;
-  return createImageBitmap(new Blob([bytes as BlobPart], { type: s.mime }));
+  // Premultiplied: a PNG survey (NSNS) is transparent outside its coverage,
+  // and both renderers composite tiles over the black sky.
+  return createImageBitmap(new Blob([bytes as BlobPart], { type: s.mime }), { premultiplyAlpha: 'premultiply' });
 }
 
 type TileProjector = (lon: number, lat: number) => [number, number] | null;

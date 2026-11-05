@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { api } from '../api';
+import { openUrl } from '../api/desktop';
 import { HistoryNav } from '../components/HistoryNav';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
@@ -484,7 +485,16 @@ export default function SkyChart() {
         {sky.survey && (
           <div className="absolute bottom-1 left-2 right-2 z-10 flex items-end justify-between gap-4 pointer-events-none text-[10px] leading-tight text-content-muted">
             <span className="bg-surface/70 px-1.5 py-0.5 rounded pointer-events-auto">
-              {sky.survey.label}: {sky.survey.attribution} · {sky.survey.license}
+              {sky.survey.label}:{' '}
+              {sky.survey.attributionUrl ? (
+                <button
+                  onClick={() => void openUrl(sky.survey!.attributionUrl!).catch((err) => console.error('[SkyChart] opening the survey credit link failed:', err))}
+                  className="hover:text-accent hover:underline"
+                >
+                  {sky.survey.attribution}
+                </button>
+              ) : sky.survey.attribution}
+              {' · '}{sky.survey.license}
             </span>
             <span className="bg-surface/70 px-1.5 py-0.5 rounded pointer-events-auto">
               {skyStatusText}

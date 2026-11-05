@@ -2,8 +2,10 @@
 //! one tile by address, and clearing a survey's private tile store.
 //!
 //! A tile is served from the store; a missing one is fetched from the
-//! survey's master only when `skychart.hips_online` is on. Nothing here
-//! downloads anything a user did not scroll to.
+//! survey's master or a verified mirror (`hips::balance`) only when
+//! `skychart.hips_online` is on. Nothing here downloads anything a user did
+//! not scroll to; the mirror list is refreshed at most daily, in the
+//! background.
 //!
 //! Phase 2 adds the offline pack: estimate, start, cancel and status of one
 //! background download per process. An explicit pack works with
@@ -31,7 +33,8 @@ pub struct HipsSurveyInfo {
     /// Deepest order the chart may request (the survey's, capped at 6).
     pub max_order: u8,
     pub tile_width: u32,
-    /// The survey's `obs_copyright`, or the preset's until `properties` were read.
+    /// The credit the author asked for (NSNS), else the survey's
+    /// `obs_copyright`, else the preset's until `properties` were read.
     pub attribution: String,
     pub attribution_url: Option<String>,
     /// `hips_license`, or the preset's.
@@ -40,6 +43,13 @@ pub struct HipsSurveyInfo {
     pub online: bool,
     pub cached_tiles: u64,
     pub cached_bytes: u64,
+    /// The part of `cached_bytes` that the survey's last offline pack holds:
+    /// kept whatever the browsing cache limit.
+    pub pack_bytes: u64,
+    /// Hosts the tiles come from: the master, then the verified mirrors.
+    pub servers: Vec<String>,
+    /// Licensed for non-commercial use only: never offered in a paid surface.
+    pub non_commercial: bool,
 }
 
 /// A tile as served to the chart.
@@ -64,6 +74,13 @@ fn online(ctx: &ServiceContext) -> Result<bool, ApiError> {
     Ok(v != "false")
 }
 
+/// The browsing cache limit (`skychart.hips_cache_limit_gb`), in bytes.
+fn cache_limit(ctx: &ServiceContext) -> Result<u64, ApiError> {
+    let db = ctx.db.get().ok_or_else(|| ApiError::Internal("Database not initialized".into()))?;
+    let conn = db.conn();
+    Ok(ctx.settings.get_hips_cache_limit_bytes(&conn)?)
+}
+
 fn find_survey(id: &str) -> Result<&'static HipsSurvey, ApiError> {
     hips::survey(id).ok_or_else(|| ApiError::NotFound(format!("Unknown sky survey: {id}")))
 }
@@ -75,15 +92,15 @@ fn validated() -> &'static Mutex<HashSet<&'static str>> {
 }
 
 /// Makes sure the survey's `properties` are on disk and drawable; fetches
-/// them from the master on first use when online.
-fn ensure_properties(store: &HipsStore, survey: &'static HipsSurvey, online: bool) -> Result<(), ApiError> {
+/// them on first use when online, from the master or else a mirror.
+fn ensure_properties(app_data: &std::path::Path, store: &HipsStore, survey: &'static HipsSurvey, online: bool) -> Result<(), ApiError> {
     if validated().lock().unwrap().contains(survey.id) {
         return Ok(());
     }
     let props = match store.read_properties()? {
         Some(p) => p,
         None if online => {
-            let text = hips::fetch_properties(survey).map_err(|e| {
+            let text = hips::balance::fetch_properties(app_data, survey).map_err(|e| {
                 tracing::warn!(survey_id = survey.id, error = %format!("{e:#}"), "hips properties fetch failed");
                 ApiError::Internal(format!("Could not reach {} to read its survey description: {e:#}", survey.label))
             })?;
@@ -113,40 +130,55 @@ fn ensure_properties(store: &HipsStore, survey: &'static HipsSurvey, online: boo
 pub fn get_hips_surveys(ctx: &ServiceContext) -> Result<Vec<HipsSurveyInfo>, ApiError> {
     let app_data = app_data_dir(ctx)?;
     let online = online(ctx)?;
+    // A lowered limit applies without waiting for the next tile.
+    hips::cache::note_listed(&app_data, cache_limit(ctx)?);
     hips::SURVEYS
         .iter()
         .map(|s| {
             let store = HipsStore::new(&app_data, s);
             let props = store.read_properties()?.unwrap_or_default();
             let (cached_tiles, cached_bytes) = store.usage()?;
+            let pack = store.read_pack_tiles()?;
+            let pack_bytes = if pack.is_empty() {
+                0
+            } else {
+                store.tiles()?.iter().filter(|t| pack.contains(&(t.order, t.npix))).map(|t| t.bytes).sum()
+            };
             Ok(HipsSurveyInfo {
                 id: s.id.to_string(),
                 label: s.label.to_string(),
                 mime: s.format.mime().to_string(),
                 max_order: hips::request_max_order(s),
                 tile_width: hips::TILE_WIDTH,
-                attribution: props.get("obs_copyright").unwrap_or(s.fallback_attribution).to_string(),
-                attribution_url: props.get("obs_copyright_url").map(str::to_string),
+                attribution: s.credit.or(props.get("obs_copyright")).unwrap_or(s.fallback_attribution).to_string(),
+                attribution_url: s.credit_url.or(props.get("obs_copyright_url")).map(str::to_string),
                 license: props.get("hips_license").unwrap_or(s.fallback_license).to_string(),
                 online,
                 cached_tiles,
                 cached_bytes,
+                pack_bytes,
+                servers: hips::balance::endpoints(&app_data, s).iter().map(|u| hips::mirrors::host_of(u).to_string()).collect(),
+                non_commercial: s.non_commercial,
             })
         })
         .collect()
 }
 
-/// One tile: from the store, else (online) from the survey's master, which
-/// is then stored. Offline and not stored is `NotFound`; a fetch failure is
+/// One tile: from the store, else (online) from the survey's master or a
+/// mirror, which is then stored. Offline and not stored is `NotFound`; a fetch failure is
 /// `Internal` and is not remembered, so a later request tries again.
 pub fn get_hips_tile(ctx: &ServiceContext, survey_id: &str, order: u8, npix: u64) -> Result<HipsTile, ApiError> {
     let survey = find_survey(survey_id)?;
     hips::validate_address(survey, order, npix).map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
-    let store = HipsStore::new(&app_data_dir(ctx)?, survey);
+    let app_data = app_data_dir(ctx)?;
+    let store = HipsStore::new(&app_data, survey);
     let mime = survey.format.mime();
 
     match store.read(order, npix)? {
-        CachedTile::Image(bytes) => return Ok(HipsTile::Image { bytes, mime }),
+        CachedTile::Image(bytes) => {
+            store.touch(order, npix);
+            return Ok(HipsTile::Image { bytes, mime });
+        }
         CachedTile::Absent => return Ok(HipsTile::Absent),
         CachedTile::Missing => {}
     }
@@ -154,15 +186,17 @@ pub fn get_hips_tile(ctx: &ServiceContext, survey_id: &str, order: u8, npix: u64
     if !online {
         return Err(ApiError::NotFound(format!("Tile {order}/{npix} is not cached and online fetching is off")));
     }
-    ensure_properties(&store, survey, online)?;
-    match hips::fetch_tile(survey, order, npix) {
-        Ok(FetchedTile::Image(bytes)) => {
-            tracing::debug!(survey_id = survey.id, hips_order = order, npix, bytes = bytes.len(), "hips tile fetched");
+    hips::balance::refresh_if_stale(&app_data, false);
+    ensure_properties(&app_data, &store, survey, online)?;
+    match hips::balance::fetch_tile(&app_data, survey, order, npix) {
+        Ok((FetchedTile::Image(bytes), endpoint)) => {
+            tracing::debug!(survey_id = survey.id, hips_order = order, npix, bytes = bytes.len(), endpoint = %endpoint, "hips tile fetched");
             store.write(order, npix, &bytes)?;
+            hips::cache::note_written(&app_data, bytes.len() as u64, cache_limit(ctx)?);
             Ok(HipsTile::Image { bytes, mime })
         }
-        Ok(FetchedTile::Absent) => {
-            tracing::debug!(survey_id = survey.id, hips_order = order, npix, "hips tile absent");
+        Ok((FetchedTile::Absent, endpoint)) => {
+            tracing::debug!(survey_id = survey.id, hips_order = order, npix, endpoint = %endpoint, "hips tile absent");
             store.mark_absent(order, npix)?;
             Ok(HipsTile::Absent)
         }
@@ -376,7 +410,8 @@ mod offline_pack {
                 .ok_or_else(|| ApiError::Internal("The deep-sky catalog could not be loaded".into()))?;
             regions.extend(pack::catalog_regions(&catalog, selection.around_messier, selection.around_ngc_ic));
         }
-        let tiles = pack::pack_tiles(selection.sky_order, &regions).map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
+        let tiles = pack::pack_tiles(selection.sky_order, hips::request_max_order(survey), &regions)
+            .map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
         Ok((survey, tiles))
     }
 
@@ -414,6 +449,19 @@ mod offline_pack {
         ))
     }
 
+    /// Share of the sky the survey covers (`moc_sky_fraction`, ≈ 0.65 for
+    /// NSNS), else the preset's: tiles outside it are 404 markers and weigh
+    /// nothing.
+    fn sky_fraction(store: &HipsStore, survey: &HipsSurvey) -> Result<f64, ApiError> {
+        let props = store.read_properties()?;
+        Ok(props
+            .as_ref()
+            .and_then(|p| p.get("moc_sky_fraction"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .unwrap_or(survey.approx_sky_fraction))
+    }
+
     fn estimate_for(
         app_data: &std::path::Path,
         store: &HipsStore,
@@ -424,7 +472,7 @@ mod offline_pack {
         let present = tiles.iter().filter(|&&(o, n)| store.has(o, n)).count() as u64;
         let missing = total - present;
         let bytes_per_tile = bytes_per_tile(store, survey)?;
-        let estimated_bytes = missing.saturating_mul(bytes_per_tile);
+        let estimated_bytes = (missing.saturating_mul(bytes_per_tile) as f64 * sky_fraction(store, survey)?) as u64;
         let free_bytes = crate::disk::free_bytes(app_data);
         let fits = fits_disk(estimated_bytes, free_bytes);
         Ok(HipsPackEstimate { total, present, missing, bytes_per_tile, estimated_bytes, free_bytes, fits })
@@ -483,7 +531,7 @@ mod offline_pack {
         let store = HipsStore::new(&app_data, survey);
         // An explicit pack fetches the survey's `properties` even with online
         // fetching off: the toggle is the on-demand switch only.
-        ensure_properties(&store, survey, true)?;
+        ensure_properties(&app_data, &store, survey, true)?;
         let estimate = estimate_for(&app_data, &store, survey, &tiles)?;
         if let Some(msg) = disk_refusal(&estimate) {
             tracing::warn!(survey_id = survey.id, estimated_bytes = estimate.estimated_bytes, "hips pack refused: disk");
@@ -516,7 +564,7 @@ mod offline_pack {
             Ok(Some(_)) => {}
             Ok(None) => {
                 validated().lock().unwrap().remove(survey.id);
-                if let Err(e) = ensure_properties(&store, survey, true) {
+                if let Err(e) = ensure_properties(&app_data, &store, survey, true) {
                     release_claim();
                     return Err(e);
                 }
@@ -527,6 +575,13 @@ mod offline_pack {
             }
         }
 
+        // The pack's tiles are kept whatever the browsing cache limit; this
+        // pack's list replaces the survey's last one.
+        if let Err(e) = store.write_pack_tiles(&tiles) {
+            release_claim();
+            tracing::error!(survey_id = survey.id, error = %format!("{e:#}"), "hips pack tile list not saved");
+            return Err(e.into());
+        }
         let thread_initial = initial.clone();
         let thread_cancel = cancel.clone();
         let spawned = std::thread::Builder::new().name("hips-pack".into()).spawn(move || {
@@ -537,10 +592,12 @@ mod offline_pack {
             };
             let store = HipsStore::new(&app_data, survey);
             run_catching_panic(survey.id, &store, &latest, &on_progress, || {
+                // A pack is the moment to know every mirror: search now if the list is old.
+                hips::balance::refresh_if_stale(&app_data, true);
+                let fetch = |order: u8, npix: u64| hips::balance::fetch_tile(&app_data, survey, order, npix).map(|(t, _)| t);
                 pack::run_pack(
                     &store,
-                    survey.base_url,
-                    survey.format,
+                    &fetch,
                     &tiles,
                     thread_initial,
                     &PackRunConfig::default(),
@@ -655,6 +712,21 @@ mod offline_pack {
             let msg = disk_refusal(&est(2, 150_000, Some(100 * MIB))).unwrap();
             assert_eq!(msg, "Needs about 0.1 MB plus a 512 MB reserve; 100.0 MB free");
             assert_eq!(disk_refusal(&est(2, 150_000, Some(2048 * MIB))), None);
+        }
+
+        #[test]
+        fn estimate_scales_by_sky_coverage() {
+            let (dir, ctx) = test_ctx();
+            let sel = PackSelection { survey_id: "nsns-halpha8".into(), ..sky_only(0) };
+            // No properties yet: the preset's 0.65.
+            let e = estimate_hips_pack(&ctx, &sel).unwrap();
+            assert_eq!(e.estimated_bytes, (12.0 * 134_000.0 * 0.65) as u64);
+            // The survey's own fraction wins once stored.
+            HipsStore::new(dir.path(), &crate::hips::NSNS_HALPHA8)
+                .write_properties("hips_estsize = 100\nhips_nb_tiles = 10\nmoc_sky_fraction = 0.5\n")
+                .unwrap();
+            let e = estimate_hips_pack(&ctx, &sel).unwrap();
+            assert_eq!(e.estimated_bytes, 12 * 10_240 / 2);
         }
 
         #[test]

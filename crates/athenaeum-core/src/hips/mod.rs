@@ -2,15 +2,19 @@
 //! Chart background (issue #18).
 //!
 //! A survey is a fixed preset: no arbitrary URL reaches this module. Tiles
-//! are fetched from the survey's master on demand and kept in a private
-//! per-install store under `<app_data>/hips/<survey-id>/`, in the standard
-//! HiPS layout. Tiles are never redistributed (docs/skychart/README.md,
+//! are fetched on demand from the survey's master or a verified mirror
+//! ([`mirrors`] finds them, [`balance`] spreads the requests) and kept in a
+//! private per-install store under `<app_data>/hips/<survey-id>/`, in the
+//! standard HiPS layout. Tiles are never redistributed (docs/skychart/README.md,
 //! "HiPS"). A tile is addressed only by validated numbers (survey id,
 //! order, npix), so no frontend path ever reaches the filesystem.
 
 // The pack needs the DSO catalog and the HEALPix cones (solver + render).
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod pack;
+pub mod balance;
+pub mod cache;
+pub mod mirrors;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -75,9 +79,23 @@ pub struct HipsSurvey {
     /// Typical size of one tile in bytes; used for estimates when the
     /// survey's own `properties` have not been stored yet.
     pub approx_tile_bytes: u64,
+    /// Share of the sky the survey covers (`moc_sky_fraction`), likewise
+    /// until its `properties` are stored.
+    pub approx_sky_fraction: f64,
     /// Shown until the survey's own `properties` have been read.
     pub fallback_attribution: &'static str,
     pub fallback_license: &'static str,
+    /// The survey's IVOA id (`creator_did`); mirrors are matched on it.
+    pub creator_did: &'static str,
+    /// VO registry resources (`ivoid`) whose HiPS capabilities may serve a
+    /// copy of this survey; searched through RegTAP ([`mirrors`]).
+    pub registry_ivoids: &'static [&'static str],
+    /// The credit the author asked for, shown instead of `obs_copyright`.
+    pub credit: Option<&'static str>,
+    /// The link that goes with the credit, instead of `obs_copyright_url`.
+    pub credit_url: Option<&'static str>,
+    /// Licensed for non-commercial use only: never offered in a paid surface.
+    pub non_commercial: bool,
 }
 
 /// DSS colored, CDS. Live `properties` checked 2026-10-26: equatorial,
@@ -89,11 +107,51 @@ pub const DSS_COLOR: HipsSurvey = HipsSurvey {
     format: TileFormat::Jpeg,
     max_order: 9,
     approx_tile_bytes: 67_000,
+    approx_sky_fraction: 1.0,
     fallback_attribution: "Digitized Sky Survey - STScI/NASA, Colored & Healpixed by CDS",
     fallback_license: "ODbL-1.0",
+    creator_did: "ivo://CDS/P/DSS2/color",
+    registry_ivoids: &[],
+    credit: None,
+    credit_url: None,
+    non_commercial: false,
 };
 
-pub const SURVEYS: &[HipsSurvey] = &[DSS_COLOR];
+/// The VO registry resources of the GAVO copy of NSNS DR0.2 (checked
+/// 2026-11-03: same `creator_did` and release dates, `public mirror clonable`).
+const NSNS_REGISTRY: &[&str] = &["ivo://org.gavo.dc/nsns/q", "ivo://org.gavo.dc/nsns/cont"];
+
+/// One NSNS DR0.2 8-bit product (docs/skychart/nsns-permission.md). Live
+/// `properties` checked 2026-11-03: equatorial, 512 px PNG, order 5 (`rgb8`)
+/// or 6, `hips_status = public master clonable`, ≈ 65 % of the sky (north of
+/// Dec −16°). Tiles are ≈ 600 KB in colour and ≈ 135 KB in one line.
+const fn nsns(id: &'static str, label: &'static str, base_url: &'static str, creator_did: &'static str, max_order: u8, approx_tile_bytes: u64) -> HipsSurvey {
+    HipsSurvey {
+        id,
+        label,
+        base_url,
+        format: TileFormat::Png,
+        max_order,
+        approx_tile_bytes,
+        approx_sky_fraction: 0.65,
+        fallback_attribution: "Northern Sky Narrowband Survey, Stefan Ziegenbalg",
+        fallback_license: "CC BY-NC-SA 4.0",
+        creator_did,
+        registry_ivoids: NSNS_REGISTRY,
+        credit: Some("Northern Sky Narrowband Survey, Stefan Ziegenbalg"),
+        credit_url: Some("https://www.simg.de/nebulae3"),
+        non_commercial: true,
+    }
+}
+
+pub const NSNS_RGB8: HipsSurvey = nsns("nsns-rgb8", "NSNS RGB continuum", "https://www.simg.de/nebulae3/dr0_2/rgb8", "ivo://simg.de/P/NSNS/DR0_2/rgb8", 5, 620_000);
+pub const NSNS_OHS8: HipsSurvey = nsns("nsns-ohs8", "NSNS [OIII], Hα and [SII]", "https://www.simg.de/nebulae3/dr0_2/ohs8", "ivo://simg.de/P/NSNS/DR0_2/ohs8", 6, 610_000);
+pub const NSNS_HBR8: HipsSurvey = nsns("nsns-hbr8", "NSNS Hα and continuum", "https://www.simg.de/nebulae3/dr0_2/hbr8", "ivo://simg.de/P/NSNS/DR0_2/hbr8", 6, 690_000);
+pub const NSNS_HALPHA8: HipsSurvey = nsns("nsns-halpha8", "NSNS Hα", "https://www.simg.de/nebulae3/dr0_2/halpha8", "ivo://simg.de/P/NSNS/DR0_2/halpha8", 6, 134_000);
+pub const NSNS_OIII8: HipsSurvey = nsns("nsns-oiii8", "NSNS [OIII]", "https://www.simg.de/nebulae3/dr0_2/oiii8", "ivo://simg.de/P/NSNS/DR0_2/oiii8", 6, 128_000);
+pub const NSNS_SII8: HipsSurvey = nsns("nsns-sii8", "NSNS [SII]", "https://www.simg.de/nebulae3/dr0_2/sii8", "ivo://simg.de/P/NSNS/DR0_2/sii8", 6, 138_000);
+
+pub const SURVEYS: &[HipsSurvey] = &[DSS_COLOR, NSNS_RGB8, NSNS_OHS8, NSNS_HBR8, NSNS_HALPHA8, NSNS_OIII8, NSNS_SII8];
 
 /// Every survey is 512 px tiles; a survey whose `properties` say otherwise is refused.
 pub const TILE_WIDTH: u32 = 512;
@@ -170,6 +228,11 @@ impl Properties {
         if !formats.split_whitespace().any(|f| f == survey.format.properties_word()) {
             bail!("{}: hips_tile_format \"{formats}\" has no {}", survey.id, survey.format.properties_word());
         }
+        if let Some(did) = self.get("creator_did") {
+            if did != survey.creator_did {
+                bail!("{}: creator_did is {did}, expected {}", survey.id, survey.creator_did);
+            }
+        }
         if let Some(order) = self.get("hips_order") {
             match order.parse::<u8>() {
                 Ok(o) if o >= request_max_order(survey) => {}
@@ -244,6 +307,87 @@ impl HipsStore {
 
     pub fn mark_absent(&self, order: u8, npix: u64) -> Result<()> {
         write_atomic(&self.absent_path(order, npix), b"")
+    }
+
+    /// Marks a stored tile as used now: its mtime is the browsing cache's LRU
+    /// clock ([`cache::trim`]). A failure only makes the tile go sooner.
+    pub fn touch(&self, order: u8, npix: u64) {
+        let path = self.tile_path(order, npix);
+        let result = fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        if let Err(e) = result {
+            tracing::debug!(path = %path.display(), error = %e, "hips tile use not recorded");
+        }
+    }
+
+    /// The tiles of this survey's last offline pack (`pack-tiles.txt`, one
+    /// `order/npix` per line), kept whatever the browsing cache limit.
+    pub fn read_pack_tiles(&self) -> Result<std::collections::HashSet<(u8, u64)>> {
+        let path = self.root.join("pack-tiles.txt");
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        Ok(text
+            .lines()
+            .filter_map(|l| {
+                let (o, n) = l.trim().split_once('/')?;
+                Some((o.parse().ok()?, n.parse().ok()?))
+            })
+            .collect())
+    }
+
+    /// Replaces the pack list: a new pack of a survey supersedes its last one.
+    pub fn write_pack_tiles(&self, tiles: &[(u8, u64)]) -> Result<()> {
+        let mut text = String::with_capacity(tiles.len() * 10);
+        for (o, n) in tiles {
+            text.push_str(&format!("{o}/{n}\n"));
+        }
+        write_atomic(&self.root.join("pack-tiles.txt"), text.as_bytes())
+    }
+
+    /// Every stored tile image: its address, size and last use (mtime).
+    pub fn tiles(&self) -> Result<Vec<StoredTile>> {
+        let mut out = Vec::new();
+        let ext = self.format.ext();
+        let order_dirs = match fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e).with_context(|| format!("list {}", self.root.display())),
+        };
+        for od in order_dirs.flatten() {
+            let Some(order) = od.file_name().to_str().and_then(|n| n.strip_prefix("Norder")).and_then(|o| o.parse::<u8>().ok()) else {
+                continue;
+            };
+            let Ok(dirs) = fs::read_dir(od.path()) else { continue };
+            for d in dirs.flatten() {
+                let Ok(files) = fs::read_dir(d.path()) else { continue };
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    let Some(npix) = name
+                        .to_str()
+                        .and_then(|n| n.strip_prefix("Npix"))
+                        .and_then(|n| n.strip_suffix(ext))
+                        .and_then(|n| n.strip_suffix('.'))
+                        .and_then(|n| n.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(meta) = f.metadata() else { continue };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    out.push(StoredTile {
+                        order,
+                        npix,
+                        path: f.path(),
+                        bytes: meta.len(),
+                        used: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// True when the store holds this tile as an image or as an `.absent`
@@ -365,6 +509,17 @@ impl HipsStore {
     }
 }
 
+/// One stored tile image, as [`HipsStore::tiles`] lists it.
+#[derive(Debug, Clone)]
+pub struct StoredTile {
+    pub order: u8,
+    pub npix: u64,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Last use: the file's mtime, set on every read.
+    pub used: std::time::SystemTime,
+}
+
 /// The pid embedded in a `.{file}.{pid}.{n}.part` name, if it is one.
 fn part_file_pid(name: &str) -> Option<u32> {
     let rest = name.strip_prefix('.')?.strip_suffix(".part")?;
@@ -374,7 +529,7 @@ fn part_file_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("tile path has no parent")?;
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let n = PART_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -392,8 +547,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// What the survey's master answered for a tile.
-#[derive(Debug, PartialEq, Eq)]
+/// What a survey endpoint answered for a tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchedTile {
     Image(Vec<u8>),
     Absent,
@@ -433,7 +588,7 @@ impl std::fmt::Display for ServerBusy {
 
 impl std::error::Error for ServerBusy {}
 
-fn get_bounded(url: &str, cap: u64) -> Result<Option<Vec<u8>>> {
+pub(crate) fn get_bounded(url: &str, cap: u64) -> Result<Option<Vec<u8>>> {
     let resp = client()?.get(url).send().with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -459,21 +614,14 @@ fn get_bounded(url: &str, cap: u64) -> Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-/// Fetches the survey's `properties` text from its master.
-pub fn fetch_properties(survey: &HipsSurvey) -> Result<String> {
-    fetch_properties_from(survey.base_url, survey.id)
-}
+pub(crate) const PROPERTIES_CAP: u64 = MAX_PROPERTIES_BYTES;
 
-fn fetch_properties_from(base_url: &str, id: &str) -> Result<String> {
+/// Fetches a survey's `properties` text from one endpoint.
+pub(crate) fn fetch_properties_from(base_url: &str, id: &str) -> Result<String> {
     let url = format!("{base_url}/properties");
     let body = get_bounded(&url, MAX_PROPERTIES_BYTES)?
         .with_context(|| format!("{id}: no properties file at {url}"))?;
     String::from_utf8(body).with_context(|| format!("{id}: properties is not UTF-8"))
-}
-
-/// Fetches one tile from the survey's master.
-pub fn fetch_tile(survey: &HipsSurvey, order: u8, npix: u64) -> Result<FetchedTile> {
-    fetch_tile_from(survey.base_url, survey.format, order, npix)
 }
 
 pub(crate) fn fetch_tile_from(base_url: &str, format: TileFormat, order: u8, npix: u64) -> Result<FetchedTile> {

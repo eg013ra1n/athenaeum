@@ -1,9 +1,13 @@
 // General tab, "Sky background" (issue #18): the online switch for the Sky
-// Chart's HiPS background, and per survey its credit, license, the space its
-// stored tiles take, and Clear. Clear is an action, not a setting.
+// Chart's HiPS background, the browsing cache limit (KV
+// `skychart.hips_cache_limit_gb`, enforced by `hips::cache` in the core), the
+// space all surveys take with Clear all, and per survey its credit, license,
+// servers, the space its stored tiles take, and Clear. Clear is an action, not
+// a setting.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { api } from '../../../api';
+import { openUrl } from '../../../api/desktop';
 import type { HipsSurveyInfo } from '../../../types/models';
 import { useHipsPack } from '../../../hooks/useHipsPack';
 import { useNotifications } from '../../../contexts/NotificationContext';
@@ -12,6 +16,8 @@ import { ConfirmDialog } from '../../ConfirmDialog';
 import { Checkbox } from '../Checkbox';
 import { SettingsSection } from '../SettingsSection';
 import { SettingToggle } from '../SettingToggle';
+import { SettingNumber } from '../SettingNumber';
+import { intCodec } from '../../../settings/codecs';
 
 function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
@@ -135,6 +141,8 @@ export function SkyBackgroundSection() {
   const { notify } = useNotifications();
   const [surveys, setSurveys] = useState<HipsSurveyInfo[] | null>(null);
   const [clearing, setClearing] = useState<HipsSurveyInfo | null>(null);
+  const [clearingAll, setClearingAll] = useState(false);
+  /** The survey last cleared (`'*'`: all of them), so its pack row reads its status again. */
   const [cleared, setCleared] = useState<{ id: string; n: number } | null>(null);
 
   const load = useCallback(() => {
@@ -160,12 +168,65 @@ export function SkyBackgroundSection() {
     setCleared((c) => ({ id: s.id, n: (c?.n ?? 0) + 1 }));
   };
 
+  const clearAll = async () => {
+    setClearingAll(false);
+    const failed: string[] = [];
+    for (const s of surveys ?? []) {
+      if (s.cachedTiles === 0) continue;
+      try {
+        await api.invoke<number>('clear_hips_cache', { surveyId: s.id });
+      } catch (err) {
+        console.error(`[Settings] clear_hips_cache ${s.id} failed:`, err);
+        failed.push(`${s.label}: ${err}`);
+      }
+    }
+    if (failed.length) {
+      notify({ kind: 'generic', tone: 'warning', title: 'Some sky tiles not cleared', detail: failed.join('\n') });
+    }
+    load();
+    setCleared((c) => ({ id: '*', n: (c?.n ?? 0) + 1 }));
+  };
+
   const meta = fieldMeta('general.skyBackground', 'surveys');
+  const totalMeta = fieldMeta('general.skyBackground', 'cacheTotal');
+  const totalBytes = (surveys ?? []).reduce((a, s) => a + s.cachedBytes, 0);
+  const totalTiles = (surveys ?? []).reduce((a, s) => a + s.cachedTiles, 0);
+  const packBytes = (surveys ?? []).reduce((a, s) => a + s.packBytes, 0);
 
   return (
     <SettingsSection id="general.skyBackground">
       <div className="space-y-4">
         <SettingToggle section="general.skyBackground" field="online" settingKey="skychart.hips_online" />
+        <SettingNumber
+          section="general.skyBackground"
+          field="cacheLimitGb"
+          settingKey="skychart.hips_cache_limit_gb"
+          codec={intCodec(1, 4096)}
+          unit="GB"
+        />
+
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-sm text-content">{totalMeta.label}</p>
+            <p className="text-xs text-content-muted">{totalMeta.help}</p>
+            <p className="mt-0.5 text-xs text-content-secondary" data-testid="hips-cache-total">
+              {surveys === null
+                ? 'Loading…'
+                : totalTiles === 0
+                  ? 'No tiles stored.'
+                  : `${formatBytes(totalBytes)} in ${totalTiles.toLocaleString()} tiles`
+                    + (packBytes > 0 ? `, of which ${formatBytes(packBytes)} from offline packs.` : '.')}
+            </p>
+          </div>
+          <button
+            onClick={() => setClearingAll(true)}
+            disabled={surveys === null || totalTiles === 0}
+            className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-surface-hover text-content-secondary hover:text-error disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            Clear all
+          </button>
+        </div>
 
         <div>
           <p className="text-sm text-content">{meta.label}</p>
@@ -180,22 +241,27 @@ export function SkyBackgroundSection() {
                   <div className="min-w-0">
                     <p className="text-sm text-content">{s.label}</p>
                     <p className="text-xs text-content-muted">
-                      {s.attribution}
-                      {s.attributionUrl && (
-                        <>
-                          {' · '}
-                          <a href={s.attributionUrl} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-                            terms
-                          </a>
-                        </>
-                      )}
+                      {s.attributionUrl ? (
+                        <button
+                          onClick={() => void openUrl(s.attributionUrl!).catch((err) => console.error('[Settings] opening the survey credit link failed:', err))}
+                          className="text-accent hover:underline text-left"
+                        >
+                          {s.attribution}
+                        </button>
+                      ) : s.attribution}
                       {' · '}
                       {s.license}
                     </p>
+                    {s.servers.length > 0 && (
+                      <p className="text-xs text-content-muted">
+                        {s.servers.length === 1 ? 'Server: ' : 'Servers: '}{s.servers.join(', ')}
+                      </p>
+                    )}
                     <p className="text-xs text-content-secondary mt-0.5">
                       {s.cachedTiles === 0
                         ? 'No tiles stored.'
-                        : `${s.cachedTiles.toLocaleString()} tiles stored, ${formatBytes(s.cachedBytes)}.`}
+                        : `${s.cachedTiles.toLocaleString()} tiles stored, ${formatBytes(s.cachedBytes)}`
+                          + (s.packBytes > 0 ? ` (${formatBytes(s.packBytes)} from the offline pack, kept).` : '.')}
                     </p>
                   </div>
                   <button
@@ -207,7 +273,7 @@ export function SkyBackgroundSection() {
                     Clear
                   </button>
                   </div>
-                  <PackControls survey={s} onFinished={load} refreshToken={cleared?.id === s.id ? cleared.n : 0} />
+                  <PackControls survey={s} onFinished={load} refreshToken={cleared && (cleared.id === s.id || cleared.id === '*') ? cleared.n : 0} />
                 </li>
               ))}
             </ul>
@@ -215,6 +281,15 @@ export function SkyBackgroundSection() {
         </div>
       </div>
 
+      <ConfirmDialog
+        isOpen={clearingAll}
+        title="Clear the tiles of every survey?"
+        message="Deletes every sky tile stored on this computer, offline packs included. The Sky Chart fetches them again as you browse while fetching is on."
+        confirmText="Clear all"
+        confirmDanger
+        onConfirm={() => void clearAll()}
+        onCancel={() => setClearingAll(false)}
+      />
       <ConfirmDialog
         isOpen={clearing !== null}
         title={`Clear ${clearing?.label ?? ''} tiles?`}

@@ -228,7 +228,8 @@ mime: string,
  */
 maxOrder: number, tileWidth: number, 
 /**
- * The survey's `obs_copyright`, or the preset's until `properties` were read.
+ * The credit the author asked for (NSNS), else the survey's
+ * `obs_copyright`, else the preset's until `properties` were read.
  */
 attribution: string, attributionUrl: string | null, 
 /**
@@ -238,7 +239,20 @@ license: string,
 /**
  * Online fetching is on (`skychart.hips_online`).
  */
-online: boolean, cachedTiles: number, cachedBytes: number, };
+online: boolean, cachedTiles: number, cachedBytes: number, 
+/**
+ * The part of `cached_bytes` that the survey's last offline pack holds:
+ * kept whatever the browsing cache limit.
+ */
+packBytes: number, 
+/**
+ * Hosts the tiles come from: the master, then the verified mirrors.
+ */
+servers: Array<string>, 
+/**
+ * Licensed for non-commercial use only: never offered in a paid surface.
+ */
+nonCommercial: boolean, };
 
 export type HipsPackEstimate = { total: number, 
 /**
