@@ -4378,13 +4378,15 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     at seed level), fit on the native mosaic with the green-site mask, sky and noise from one green phase, `c` = 1 (Analysis star fluxes on
     OSC are uncorrected, a recorded limit). Detection source amended by R-PC-3. Evidence: `task-C3-report-r1.md`, `task-C3-review-r1.md`.
   - PC-5 a debayered 3-plane file is measured on its G plane (`colour: true`, `PixelNoise::Mixed`, `cfa_site_share: Some(0.5)`); R-OSP-15's
-    silent limit 1 (no field-width median on a debayered plane) stays recorded. Evidence: `analysis/analyzer.rs`.
+    silent limit 1 (no field-width median on a debayered plane) stays recorded. Evidence: `star_measure::analysis_mode` (rustafits; was
+    `analysis/analyzer.rs` until port phase 4, R-OSP-19).
   - PC-6 a frame the module judges trailed or defocused has no measured star; `possibly_trailed` = the trailed verdict; trail R² = the Rayleigh
     R² over the measured stars' canonical θ, stored for compatibility. Evidence: `task-C4-report-r1.md`.
   - PC-7 a frame with no fit in its statistic writes 0.0 for `median_fwhm` / `median_eccentricity` / `median_snr` / `median_hfr`. Evidence:
     `analysis::analyzer::map_measurement`.
   - PC-8 `star_metrics.snr` / `hfr` are nullable; a NaN is stored NULL (`Option<f64>`). Evidence: `task-C6-report-r1.md`.
-  - PC-9 `median_beta` is NULL under Moffat 4 and the fitted β under Auto when its source is `Fitted`. Evidence: `analysis/analyzer.rs`.
+  - PC-9 `median_beta` is NULL under Moffat 4 and the fitted β under Auto when its source is `Fitted`. Evidence: `star_measure::analysis_mode`
+    (rustafits; was `analysis/analyzer.rs` until port phase 4, R-OSP-19).
   - PC-10 Settings → Analysis keeps `detection_threshold` (σ, default 6.0, range 2-20), `psf_model` (`moffat4` default, `auto`), `max_stars`
     (default 500; `measure_cap` folds in) and `batch_concurrency`; the detection sigma, star-area, saturation fraction, MRS layers, PSF-fit knobs
     and Trail Threshold settings are removed. Evidence: `task-C5-report-r1.md` (the config), `task-C8-report-r1.md` (the panel).
@@ -4412,7 +4414,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     R + G + G + B; offset 0.5 and the ×2 map stay; the SNR cost (6-22 %) sits at the faint end the 500-star budget never reaches. Evidence:
     `task-C3-review-r1.md` Q3.
   - R-PC-4: `RawPlanes::Cfa`'s pattern carries the file's XBAYROFF / YBAYROFF folded in (mod 2). Evidence: `task-C3-review-r1.md` (I3); the
-    reader's own fold since rustafits #7 (47c33f73: the FITS fold lives in `processing::cfa`, `analysis/input.rs` folds XISF only).
+    reader's own fold since rustafits #7 (47c33f73: the FITS fold lives in `processing::cfa`, `analysis/input.rs` folded XISF only). Phase 4 (R-OSP-19): the XISF fold is the rustafits XISF reader's, `star_measure::raw` folds nothing.
   - R-PC-5 / R-PC-8: `stars_detected` = the matched filter's point-like seeds (not flagged `extended`), one rule for every layout (3-9× the
     legacy counts, a release note); on a mosaic the extended-flagged seeds are HANDED to the fit flagged, fitted and kept out of the frame
     statistic, the mono path's P3 treatment. Evidence: `task-C5-review-r1.md` Q2, truth check 2.
@@ -4461,7 +4463,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   | stacking Measure, every detected plane (`seeds::detect` via `detect_on`) | the matched filter's own half-sample mode | one per plane | `channel.fieldWidthAtFloor` |
   | Analysis mono plane (`measure_plane`, `SeedSpec::MatchedFilter`, White) | the same detection path | one per plane | none read |
   | Analysis debayered G plane (Mixed noise) | the same path, no median (silent limit 1, PC-5) | only when the pool itself lands under the floor | none read |
-  | Analysis CFA path (`analysis/cfa.rs`, `seeds::detect` on the G1 + G2 sum) | the detection, in SUPER-PIXEL units | yes, in super-pixel units | no: the native fit is handed `2 × fwhm_px`, which cannot read under 1.607, so the handed width carries no flag (C3-review Q2 / M1; mapping the floor to native units would shrink the fit box, a flag field would move the stored `PlanePrep` bytes) |
+  | Analysis CFA path (rustafits' `star_measure::green`, `analysis/cfa.rs` until port phase 4; `seeds::detect` on the G1 + G2 sum) | the detection, in SUPER-PIXEL units | yes, in super-pixel units | no: the native fit is handed `2 × fwhm_px`, which cannot read under 1.607, so the handed width carries no flag (C3-review Q2 / M1; mapping the floor to native units would shrink the fit box, a flag field would move the stored `PlanePrep` bytes) |
   | given seeds without a width (`measure_plane` `SeedSpec::Given` / `None` through `seeds::field_width_of`; LN refits via `fit_stars_at`; Peak / Structure seeds) | `field_width_of`, the same rule on the given seeds | no (the warn lives only in the detection path) | carried by a caller that reads it, without a warn |
 
   *C3-review notes (`task-C3-review-r1.md`), all recorded, none a code change.* **M2** the ×2 width of the CFA path reads wide because of the
@@ -4672,6 +4674,75 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       the stacking Measure and Analysis-mode arms. All 304 image-arms are byte-identical once the run-time keys are
       dropped, which is stricter than the scorecard's 0 moved (lab 4f7043f, `star-lab/results/star-measure-port/`).
   - **R-OSP-19 CLOSED (2026-11-04): the port's phase 3 merged with the submodule at ee40ca6.**
+  - **R-OSP-19, phase 4 - the Analysis-mode entry lives in rustafits (owner 2026-11-04, «Да, начинай фазу 4»; items 4.1-4.5 of the port plan, detailed in rustafits `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`; Athenaeum branch `star-measure-port-phase-4`). OPEN: gated, every fixed-bar gate passes (below); the app smoke G-1h is OWED and the merge waits for the owner.**
+    - *What moved.* `analysis/input.rs`, `analysis/cfa.rs`, `analysis/trail.rs` and the measurement and frame arithmetic of `analysis/analyzer.rs`
+      are rustafits' `star_measure::{raw, green, trail, analysis_mode}`, copied at e6344ddd (the four files are unchanged since the G-2 freeze
+      0b6fb183), float code verbatim, only paths and visibility changed. `raw` and `analysis_mode` are the semver-covered entry; `green` and
+      `trail` are public at the module's own status. `input.rs`, `cfa.rs` and `trail.rs` are deleted here. The evidence lines of PC-5 / PC-9 that
+      say `analysis/analyzer.rs` for the measure call or the frame arithmetic now read `star_measure::analysis_mode`; the row mapping is still
+      `analyzer.rs`.
+    - *What stays in Athenaeum.* `analysis/config.rs` whole (`AnalysisConfig`, `config_hash`); in `analyzer.rs` the thin wrappers
+      `measure_raw_frame` / `measure_raw_frame_with(&AnalysisConfig)` (through `frame_options`), `map_measurement` (the `StarMetric` rows, the
+      ids, `analyzed_at`, the quality score and the other row facts), `From<Verdict> for FrameVerdict`, `analyze_raw_frame`, `analyze_frame`; and
+      `analysis/raw_seam.rs`, test-only: the two XISF tests that hold Athenaeum's writer to rustafits' reader and the
+      `AnalysisConfig` -> `FrameOptions` parity test. The two backends are untouched (no command or route signature changed).
+    - *`FrameSummary`.* What `map_measurement` computed per frame (`stars_detected`, the four medians, `frame_snr`, `snr_weight`, `psf_signal`,
+      background and noise, trail R², `median_beta`, `stars_refused`, the verdict) is `FrameSummary::from_measurement(pm, &FrameOptions)`,
+      statement for statement. `FrameOptions` (6.0 sigma, Moffat 4, 500 stars: the Analysis defaults) is built by `frame_options(&AnalysisConfig)`,
+      and `the_default_analysis_config_measures_with_the_default_frame_options` (with a non-default case) holds the two together. Both structs are
+      `#[non_exhaustive]`, with no serde derive and no TS mirror; `ts_contract` and `src/types` are unchanged.
+    - *The XISF fold, in the reader (4.1; owner 2026-11-04, «Сдвигать всегда»).* The rustafits XISF reader folds `XBAYROFF` / `YBAYROFF` into the
+      Bayer pattern, as its FITS reader does since 1.7.0, and `star_measure::raw` folds nothing: exactly one fold on every path (Athenaeum's
+      `fold_bayer_offsets` is gone). The fold is unconditional, onto whatever pattern the file declares (`BAYERPAT` or `<ColorFilterArray>`), which
+      is what the Analysis tab always did (R-PC-4), so its numbers keep their meaning. The render side changes on purpose and the owner accepted
+      the consequence: an odd-offset XISF mosaic now previews with the right phase (Athenaeum's previews and Blink, `rustafits info`, solvemyastro's
+      detection); a writer that already shifted `<ColorFilterArray>` for a ROI and kept the camera's offsets previewed right before and previews
+      wrong after, its Analysis row unchanged (R-P4-4 / R-P4-5). No file of the star-test corpus has an odd offset; the owed smokes are in
+      `docs/superpowers/open-items.md`.
+    - *Header facts (R-P4-C1, controller 2026-11-05).* `raw` reads BITPIX / BZERO / BSCALE / DATAMAX / EGAIN of a FITS and DATAMAX / EGAIN of an
+      XISF by Athenaeum's own header-value rules, ported verbatim into rustafits as the crate-private `formats::stored_keys` (a new path mirrors the
+      proven path), not by `ImageConverter::read_header`'s parsing. Review T1+T2 found inputs on which a numeric-only port could move a number;
+      with the port none is known. What still differs is an error becoming a success (an XISF header without `<?xml` / `</xisf>` or of 64-100 MB,
+      XISF bytes under another name) and the error text of an unreadable header, which reaches the Analysis tab as `"{path}: {error}"`.
+    - *Numbers and logs.* `MEASURE_VERSION` stays 8 and `config_hash` is unchanged, so no stored analysis is re-run. The moved events keep their
+      fields and carry the targets `astroimage::star_measure::{raw, green}` (`docs/logging/README.md`). No rustafits release (D-8: the additions
+      ride with 1.8.0 in phase 5).
+    - *Pin.* T6 (`fbfd1d99`) pinned rustafits `e4e3328`, the phase-4 tip after fix round 1; fix round 2 moved the tip to `9c5e75d`, pinned by
+      `484361ac`, the commit the gates below ran on. The squash-merge re-pin is still to come (R-P4-7: `git diff --stat <old> <new>` empty each
+      time). Final pin: **OWED** (controller, after the merges).
+    - *Gates* (controller, dev Mac aarch64; bars from plan section 4; before = `main` e6344ddd, after = `484361ac`, rustafits `9c5e75d`). **Every
+      fixed-bar gate passes; G-1h passes headless (the on-screen look is owed).** Round 1 stopped at G-1b: a shared cargo target made the after side reuse the before side's rustafits,
+      so `smport.sh` now builds one target per side (lab 469cc89); round 2 re-ran from G-1b on with one target per side.
+      - G-1a suites, exact aarch64 pins (`mac_check.sh`, `MAC_CHECK_MAIN=e6344ddd`, `MAC_CHECK_BRANCH=star-measure-port-phase-4`): the digest is
+        byte-identical, `a07688d0…`, the same as in phase 3; rustafits `--features serde` 581 / 0 / 3; core all targets 4549 / 0 / 15
+        (= 4575 at e6344ddd - 12 - 10 - 5 + 1), no pin edited. PASS (lab 9264396).
+      - G-1b corpus, analysis-mode arm, 152 images (`smport.sh`, tag `phase-4`): `SMPORT: PASS`, 152 image-arms identical, 0 moved, 1 481 994 JSONL lines
+        compared (lab 9977f31). PASS. What the corpus reaches: EGAIN is on 59 of the 152 files and DATAMAX on none, so the `DATAMAX` rule rests on
+        the unit parity tests and `raw_seam.rs`, not on the corpus.
+      - G-1c positive control of the one fold (three patched copies of `singles/test.xisf`, X 1 / Y 1 / X 1 and Y 1): the fold control passes with 3 identical
+        before / after; against the unpatched file the X-only and Y-only copies differ and the X-and-Y copy is equal; `rustafits info --json` reads RGGB
+        before and GRBG / GBRG / BGGR after (lab 9977f31, `phase-4-fold/`). PASS.
+      - G-1d rustafits renders unchanged (`tests/mono.fits`, `osc.fits`, `test.xisf`: JPEG, `info --json`, `analyze --json`): the 9 outputs are
+        byte-identical before / after; the fold copies' JPEGs differ, as they should. PASS.
+      - G-1e `MEASURE_VERSION` 8 (`rustafits/src/star_measure/mod.rs`) and the `config_hash` test. PASS (lab 9264396).
+      - G-1f `ts_contract` passes and `src/types` is unchanged; the `--no-default-features` check and the `athenaeum-web` build are clean; the
+        `analysis::(input|cfa|trail)` / `fold_bayer_offsets` grep over `crates` is empty. PASS.
+      - G-1g release `rustafits` binary: 3 082 944 B before, 3 035 792 B after (-47 152 B; the cause was not investigated). PASS (it does not grow);
+        the change is in the port plan.
+      - G-3 rustafits: default 573 / 0 / 3, `--features serde` 581 / 0 / 3, `--features debug-pipeline` 573 / 0 / 5, the `--no-default-features`
+        build finishes, and clippy prints the same 11 lines as `main` in `src/{star_measure,formats}/` (no new warning). PASS.
+      - Results folders in athenaeum-lab: `star-lab/results/star-measure-port/phase-4/` and `phase-4-fold/`; lab commits 9264396 and 9977f31, pushed.
+    - *App smoke G-1h (the wiring, which no number above exercises).* About 5 minutes of `npm run tauri dev` on the real dev DB, on the phase-4
+      branch: the Analysis tab on one FITS and one XISF frame (the row appears, the figures are `main`'s), Blink's star overlay on one frame, and the
+      new error text of an unreadable header on a truncated copy of one FITS. Result (2026-11-05, owner: «Смоук без экрана»): **PASS headless.**
+      The real `athenaeum-web` (release, f5d62554, rustafits cc8c88f) on a sandbox catalog of copies: the scan filed 5 lights (the
+      XISF singles without `IMAGETYP` are not lights, so only `test.xisf` reached `analyze_frame_set`); `analyze_frame_set` gave one row
+      per good frame (3 m42 + `test.xisf`, `measure_version` 8) and an error for the truncated copy (`… Failed to read image: Failed to read
+      FITS data: failed to fill whole buffer`; log `raw frame read failed` with `path`); `get_frame_star_metrics` (Blink's overlay) returned
+      500 stars for an m42 frame and for `test.xisf`. The rows equal `star_probe --paths analysis-mode` on the same copies bit for bit
+      (star count, median FWHM, eccentricity, frame SNR, verdict, refused; every star's x, y, fwhm, ecc, snr, hfr). An unreadable header gets
+      no catalog row, so its "Failed to read header" text shows only through `star_probe`. The on-screen look (the tab, the overlay) stays
+      in `open-items.md`.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 

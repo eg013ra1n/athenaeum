@@ -1,32 +1,56 @@
 //! The Analysis tab's measurement: a raw frame measured through the one star path (Plan C, Task C5).
 //!
-//! [`measure_raw_frame`] runs `star_measure` on the frame (mono, a Bayer mosaic's green sites, or a debayered file's G
-//! plane); [`map_measurement`] writes the result into the `FrameAnalysis` / `StarMetric` rows. Positions stay in FILE
-//! row order (unflipped); [`analyze_frame`] returns `flip_vertical` for the overlay.
+//! The file read, the measurement and the frame arithmetic live in rustafits (`star_measure::raw::read_raw_frame`,
+//! `star_measure::analysis_mode::{measure_raw_frame, FrameSummary}`, port plan phase 4); this module keeps what is the
+//! app's: [`frame_options`] builds the measurement's options from the Analysis config, and [`map_measurement`] writes a
+//! [`FrameSummary`] and the measured stars into the `FrameAnalysis` / `StarMetric` rows (ids, `config_hash`,
+//! `analyzed_at`, the detection threshold, the frame's size). Positions stay in FILE row order (unflipped);
+//! [`analyze_frame`] returns `flip_vertical` for the overlay.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::cfa;
 use super::config::{AnalysisConfig, AnalysisPsfModel};
-use super::input::{read_raw_frame, RawFrame, RawPlanes};
-use super::trail::trail_r_squared;
 use crate::models::{FrameAnalysis, FrameVerdict, StarMetric};
-use crate::star_measure::{
-    self, frame::finite_median, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, SeedSpec,
-    StarFit, MEASURE_VERSION,
-};
+use crate::star_measure::analysis_mode::{self, FrameOptions, FrameSummary, Verdict};
+use crate::star_measure::raw::read_raw_frame;
+pub use crate::star_measure::raw::{RawFrame, RawPlanes};
+use crate::star_measure::{PlaneMeasurement, PsfModel, MEASURE_VERSION};
 
-/// Measure a raw frame (PC-4, PC-5): mono -> `measure_plane`; a Bayer mosaic -> [`cfa::measure_green_sites`]; a
-/// debayered file -> `measure_plane` on its G plane (`colour`, mixed pixel noise, green share 0.5).
+/// The measurement's options for an Analysis config: the three knobs that reach the measurement (`FrameOptions` is
+/// `#[non_exhaustive]`, so it is built from its default and the fields assigned).
+pub fn frame_options(config: &AnalysisConfig) -> FrameOptions {
+    let mut opts = FrameOptions::default();
+    opts.detection_threshold = config.detection_threshold;
+    opts.psf_model = match config.psf_model {
+        AnalysisPsfModel::Moffat4 => PsfModel::Moffat4,
+        AnalysisPsfModel::Auto => PsfModel::Auto,
+    };
+    opts.max_stars = config.max_stars as usize;
+    opts
+}
+
+impl From<Verdict> for FrameVerdict {
+    fn from(v: Verdict) -> Self {
+        match v {
+            Verdict::Trailed => FrameVerdict::Trailed,
+            Verdict::Defocused => FrameVerdict::Defocused,
+            Verdict::NoStars => FrameVerdict::NoStars,
+        }
+    }
+}
+
+/// Measure a raw frame (PC-4, PC-5): mono -> `measure_plane`; a Bayer mosaic -> the green sites; a debayered file ->
+/// `measure_plane` on its G plane (`colour`, mixed pixel noise, green share 0.5). The work is rustafits'
+/// `analysis_mode::measure_raw_frame`.
 pub fn measure_raw_frame(
     frame: &RawFrame,
     config: &AnalysisConfig,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
-    measure_raw_frame_with(frame, config, pool, false)
+    analysis_mode::measure_raw_frame(frame, &frame_options(config), pool)
 }
 
 /// [`measure_raw_frame`] with the module's per-seed diagnostics (`diagnostics`) for the probe's refusal lines; the
@@ -37,67 +61,16 @@ pub fn measure_raw_frame_with(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
 ) -> PlaneMeasurement {
-    let psf_model = match config.psf_model {
-        AnalysisPsfModel::Moffat4 => PsfModel::Moffat4,
-        AnalysisPsfModel::Auto => PsfModel::Auto,
-    };
-    let base = MeasureOptions {
-        domain: frame.domain,
-        psf_model,
-        seeds: SeedSpec::MatchedFilter {
-            threshold: config.detection_threshold,
-        },
-        mode: Mode::Budget {
-            budget: config.max_stars as usize,
-        },
-        diagnostics,
-        ..Default::default()
-    };
-    match &frame.planes {
-        RawPlanes::Mono(plane) => {
-            let opts = MeasureOptions {
-                pixel_noise: PixelNoise::White,
-                ..base
-            };
-            star_measure::measure_plane(plane, frame.w, frame.h, &opts, pool)
-        }
-        RawPlanes::Cfa { mosaic, pattern } => {
-            cfa::measure_green_sites(mosaic, frame.w, frame.h, *pattern, &base, pool)
-        }
-        RawPlanes::Rgb(planes) => {
-            let opts = MeasureOptions {
-                colour: true,
-                pixel_noise: PixelNoise::Mixed,
-                cfa_site_share: Some(0.5),
-                ..base
-            };
-            star_measure::measure_plane(&planes[1], frame.w, frame.h, &opts, pool)
-        }
-    }
-}
-
-/// A non-finite number written as 0.0, so no column of a row is NaN.
-fn finite_or_zero(x: f64) -> f64 {
-    if x.is_finite() {
-        x
-    } else {
-        0.0
-    }
-}
-
-/// `stars_detected` (R-PC-5 / R-PC-8), one rule for every layout: the matched filter's seeds not flagged `extended`.
-/// `seeds` is the detection's seed count on the module's own sources and the handed count on the CFA path.
-fn point_like_seeds(pm: &PlaneMeasurement) -> i64 {
-    pm.seeds.saturating_sub(pm.extended_seeds) as i64
+    analysis_mode::measure_raw_frame_with(frame, &frame_options(config), pool, diagnostics)
 }
 
 /// Write a measurement into the Analysis rows (spec 4.2 with PC-6..PC-9).
 ///
-/// Medians come from the module's frame aggregates and read 0.0 when the frame has no fit in its statistic (PC-7);
-/// `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's fitted beta under
-/// `Auto` and NULL otherwise (PC-9). A star's non-finite `snr` / `hfr` is `None` (PC-8). The row carries the
-/// measurement version, the refusal count and the frame verdict (PC-13): trailed / defocused as the module judged, else
-/// no_stars when no fit stands in the frame statistic, else none.
+/// The frame figures are [`FrameSummary::from_measurement`]'s: medians read 0.0 when the frame has no fit in its
+/// statistic (PC-7); `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's
+/// fitted beta under `Auto` and NULL otherwise (PC-9). A star's non-finite `snr` / `hfr` is `None` (PC-8). The row
+/// carries the measurement version, the refusal count and the frame verdict (PC-13): trailed / defocused as the
+/// module judged, else no_stars when no fit stands in the frame statistic, else none.
 pub fn map_measurement(
     pm: &PlaneMeasurement,
     frame: &RawFrame,
@@ -127,66 +100,35 @@ pub fn map_measurement(
         })
         .collect();
 
-    let stat: Vec<&StarFit> = pm.stars.iter().filter(|f| f.flags.in_statistic()).collect();
-    let background = finite_or_zero(pm.sky.median);
-    let noise = finite_or_zero(pm.noise.sigma);
-    let frame_snr = if noise > 0.0 { background / noise } else { 0.0 };
-    let (snr_weight, psf_signal) = if noise > 0.0 && !stat.is_empty() {
-        let flux = finite_median(stat.iter().map(|f| f.signal)).unwrap_or(0.0);
-        let amp = finite_median(stat.iter().map(|f| f.amplitude)).unwrap_or(0.0);
-        let w = if background > 0.0 {
-            flux * flux / (noise * noise * background)
-        } else {
-            0.0
-        };
-        (finite_or_zero(w), finite_or_zero(amp / noise))
-    } else {
-        (0.0, 0.0)
-    };
-    let median_fwhm = pm.frame.fwhm_px.unwrap_or(0.0);
-    let thetas: Vec<f64> = stat.iter().map(|f| f.theta).collect();
-    let median_beta = match (config.psf_model, pm.beta_source) {
-        (AnalysisPsfModel::Auto, BetaSource::Fitted { .. }) => Some(pm.beta),
-        _ => None,
-    };
-
-    let frame_verdict = if pm.trailed {
-        Some(FrameVerdict::Trailed)
-    } else if pm.defocused {
-        Some(FrameVerdict::Defocused)
-    } else if stat.is_empty() {
-        Some(FrameVerdict::NoStars)
-    } else {
-        None
-    };
+    let s = FrameSummary::from_measurement(pm, &frame_options(config));
 
     let analysis = FrameAnalysis {
         id: None,
         frame_id: 0,
         file_id: 0,
-        stars_detected: point_like_seeds(pm),
-        median_fwhm: finite_or_zero(median_fwhm),
-        median_eccentricity: finite_or_zero(pm.frame.eccentricity.unwrap_or(0.0)),
-        median_snr: finite_or_zero(pm.frame.snr_median.unwrap_or(0.0)),
-        median_hfr: finite_or_zero(pm.frame.hfr_median.unwrap_or(0.0)),
-        frame_snr,
-        snr_weight,
-        psf_signal,
-        background,
-        noise,
+        stars_detected: s.stars_detected as i64,
+        median_fwhm: s.median_fwhm,
+        median_eccentricity: s.median_eccentricity,
+        median_snr: s.median_snr,
+        median_hfr: s.median_hfr,
+        frame_snr: s.frame_snr,
+        snr_weight: s.snr_weight,
+        psf_signal: s.psf_signal,
+        background: s.background,
+        noise: s.noise,
         detection_threshold: config.detection_threshold,
         width: frame.w as i64,
         height: frame.h as i64,
         source_channels: frame.channels as i64,
-        trail_r_squared: finite_or_zero(trail_r_squared(&thetas, median_fwhm)),
+        trail_r_squared: s.trail_r_squared,
         possibly_trailed: pm.trailed,
-        median_beta,
+        median_beta: s.median_beta,
         quality_score: None,
         config_hash: Some(config_hash.to_string()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),
         measure_version: Some(MEASURE_VERSION),
-        stars_refused: Some(pm.refused.total() as i64),
-        frame_verdict,
+        stars_refused: Some(s.stars_refused as i64),
+        frame_verdict: s.verdict.map(FrameVerdict::from),
     };
     (analysis, stars)
 }
