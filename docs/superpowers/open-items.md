@@ -372,6 +372,23 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Sky Chart phase 3 — NSNS surveys, mirrors and the tile cache limit (2026-11-05)
+
+PR #22 (#18 phase 3, merged as f21775c4; reference `docs/skychart/README.md`, "Acceptance, phase 3"). The core, web and frontend suites passed on the merged tree; the cycle's live run was the
+web build in headless Chromium. Owed by a human:
+
+- **App smoke on the desktop build** (`npm run tauri dev`, the real dev DB, about 10 minutes). The desktop host was never built in the cycle (its cloud container has no webkit). Pick each NSNS
+  preset under the chart at the North America Nebula: the tiles draw, and the credit's link opens the project page in the system browser. Settings → General → Sky background shows the cache limit,
+  the total with Clear all, and per survey its servers and pack share; About → Acknowledgements shows the survey credits. Delete this line when it passes.
+- **The cache limit on a real cache.** Set the limit below what a browsed cache already holds (e.g. 1 GB over a few GB of DSS and NSNS tiles): the trim runs in the background, brings the total to
+  about 90 % of the limit, removes the longest-unused tiles first and keeps each survey's last offline pack (`pack-tiles.txt`); the Settings total follows. Only the `hips::cache` tests cover it.
+  Delete this line when it passes.
+- **Failover and the busy wait, live.** Block one NSNS server (www.simg.de or dc.g-vo.org) while browsing and while a pack runs: the tiles keep coming from the other, and the blocked one is used
+  again after its back-off. A real 429 / 503 from a server: the pack waits its `Retry-After` only when every endpoint is busy, and the "Survey busy, waiting N s" line clears after the wait (owed
+  since phase 2). Only the `hips::balance` tests cover both. Delete this line when it passes.
+- **CDS, once it answers.** It was unreachable on 2026-11-03 from the cloud and from the owner's machine. Read whether its aggregate lists NSNS copies, and the status of DSS colored's second CDS
+  host; the resolver adds what qualifies on its next search (`hips/mirrors.json`). Record the answer in `docs/skychart/README.md` (Presets) and delete this line.
+
 ### star_measure port, phase 4 - the Analysis-mode entry (2026-11-05)
 
 Branch `star-measure-port-phase-4` (reference `docs/stacking/README.md` R-OSP-19, phase 4; plan `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md` in the rustafits submodule). The suites, the
@@ -2493,3 +2510,16 @@ when both ship in one release:
 - **The first stack after the update takes longer.** Each frame set re-measures its stars and re-aligns its
   frames once; calibration is kept. Later stacks run at normal speed.
 ```
+
+Sky Chart phase 3 (NSNS surveys and the tile cache limit, PR #22, 2026-11-05), in plain words for the translation; the exact names are in the brackets:
+
+- **Six narrowband sky surveys under the Sky Chart.** The Northern Sky Narrowband Survey by Stefan Ziegenbalg (RGB, [OIII]/Hα/[SII], Hα + continuum, Hα, [OIII] and [SII]) beside DSS colored,
+  for the northern ≈ 65 % of the sky (north of Dec −16°, black beyond it). Credited on the chart, in Settings and on the About page; free use only (CC BY-NC-SA 4.0). (The six NSNS DR0.2 8-bit
+  presets, `non_commercial`.)
+- **Survey tiles come from every verified copy of a survey, spread over the servers, so the chart keeps drawing when one server is down or busy.** (`hips::mirrors`, `hips::balance`; copies found
+  from the HiPS lists and the VO registry, kept in `hips/mirrors.json`.)
+- **An offline pack of a narrowband survey downloads only the detail the survey has, and its estimate counts only the sky it covers.** (Depth capped at the survey's deepest order, 5 for
+  `nsns-rgb8`; the estimate scaled by `moc_sky_fraction`.)
+- **The sky tiles kept while browsing have a size limit, 10 GB by default for all surveys together.** Past it, the tiles unused longest are deleted; an offline pack's tiles are kept. Settings →
+  General → Sky background shows the space the surveys take, with Clear all, and each survey's servers and offline-pack share. (`skychart.hips_cache_limit_gb`, `hips::cache`.)
+- **About → Acknowledgements credits the sky surveys:** HiPS, DSS colored, the Northern Sky Narrowband Survey and its GAVO mirror.
