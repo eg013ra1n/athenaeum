@@ -93,7 +93,7 @@
   - `project_plan_prepare_with_debayer_off`: the same fixture with `debayer_osc = false` → `in_place: 2, debayered: 0, converted: 2, unsupported: 1`.
   - `project_plan_prepare_skips_excluded_frames`: exclude the integer FITS by uuid → `converted: 1`.
   - `attested_set_plan_counts_prepare_actions`: an attested catalog set of two float lights (the fixture at `test_fixtures.rs:~359`) and one `write_fits_i16` light → `Some` with `in_place: 2, converted: 1`.
-  - `attested_set_plan_drops_an_unreadable_light` (D8): an attested set of four lights, one an empty-primary FITS (`write_empty_primary_fits`) → `unsupported: 1`, the frame is in no group, `includedCount` is 3, and the plan carries the project path's "cannot be read" warning.
+  - `attested_set_plan_drops_an_unreadable_light` (D8): an attested set of four lights, one an empty-primary FITS (`write_empty_primary_fits`) → `unsupported: 1`, `(frameCount, includedCount) = (4, 3)` as the project arm pins (3, 2), and the plan carries the project path's "cannot be read" warning.
   - `calibrated_set_plan_has_no_prepare`: an ordinary set → `prepare == None`, and its groups and warnings equal the plan before the change (no probe ran).
   - Fixtures: `ProjectFile::{Mono32, Rgb32, Mosaic32, Mono16, Xisf32}` (`test_fixtures.rs:~1000`); the unsupported proxy is `write_empty_primary_fits` (`prepare.rs` tests).
 - [ ] **Step 2: Run them, expect FAIL** — `cargo test -p athenaeum-core --lib stacking::plan::tests::project_plan_counts_prepare_actions` → compile error (`prepare` missing).
