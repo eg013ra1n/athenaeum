@@ -132,6 +132,11 @@ fn shape_from_fits_info(
     }
 }
 
+/// The start of the reason [`probe_file`] gives a file that cannot be opened (offline, renamed, archived:
+/// review I10). A plan tells such a file apart from one no reader decodes by it, so the producer and the
+/// classifier share this one spelling.
+pub const CANNOT_OPEN: &str = "cannot open the file: ";
+
 /// Also a tile-compressed FITS or an extension image (primary NAXIS 0), BITPIX 64, or a 4-plane cube.
 const NOT_A_SUPPORTED_FITS: &str = "not a 1- or 3-plane 8/16/32-bit or float primary image";
 
@@ -148,7 +153,7 @@ pub fn probe_file(path: &Path) -> FileShape {
     // Review I10: a file that cannot be opened (offline, renamed, archived)
     // says so, instead of looking like an image no reader here decodes.
     if let Err(e) = std::fs::File::open(path) {
-        return unsupported_shape(format!("cannot open the file: {e}"));
+        return unsupported_shape(format!("{CANNOT_OPEN}{e}"));
     }
     if is_xisf(path) {
         let xml = match crate::fits_parser::read_xisf_header(path) {

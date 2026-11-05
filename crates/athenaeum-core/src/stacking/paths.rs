@@ -774,6 +774,13 @@ pub fn estimate_project_bytes(
     estimate_bytes_with(i, Some(grid), Some(prepared_bytes))
 }
 
+/// [`estimate_bytes`] for an attested frame set (plan 6c D8, review M2): its lights are prepared as a
+/// project's frames are, so the calibrated term is what Prepare writes (`prepared_bytes`) in place of one
+/// calibrated copy per light. A set has no grid: the frames keep their own geometry.
+pub fn estimate_prepared_bytes(i: &EstimateInputs<'_>, prepared_bytes: u64) -> u64 {
+    estimate_bytes_with(i, None, Some(prepared_bytes))
+}
+
 fn estimate_bytes_with(
     i: &EstimateInputs<'_>,
     geometry: Option<(u64, u64)>,

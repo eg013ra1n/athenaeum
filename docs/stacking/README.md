@@ -1266,10 +1266,17 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     is one.
   - Warnings (spec §7): frames not on this device, other reasons a frame is left
     out, frames to be solved locally or that could not be, frames outside the
-    grid, unsupported files, and unknown exposure equivalence.
+    grid, unsupported files, files that cannot be opened, and unknown exposure
+    equivalence.
   - Unsupported files also leave every group's included count and the ≥ 3
     rule, so a group Prepare would leave short is blocked by `frames` at plan
-    time; they are not manual exclusions.
+    time; they are not manual exclusions. A file that cannot be opened
+    (`prepare::CANNOT_OPEN`: offline, moved or renamed) is left out the same way
+    and counted in `prepare.unsupported`, but its warning says so ("cannot be
+    opened (offline, moved or renamed)") instead of "(unsupported file)". An
+    attested set's plan does the same (plan 6c D8), and its space estimate counts
+    what Prepare writes in place of a calibrated copy per light. One warn per
+    plan build carries the counts; the per-file lines are debug.
   - It carries `grid` (state, current, proposal, framesInside, canEdit) and
     `projectFrames`.
   - It does not yet know the WCS reference rule (below): a manual pin without

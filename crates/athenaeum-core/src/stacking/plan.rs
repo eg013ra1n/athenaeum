@@ -2155,6 +2155,9 @@ struct SubjectInputs {
     warnings: Vec<String>,
     /// What Prepare will do: `Some` for a project and for an attested set (plan 6c Task 1).
     prepare: Option<PlanPrepare>,
+    /// What Prepare writes (conversions and debayers): `Some` for a project and for an attested set, whose
+    /// estimate counts it in place of a calibrated copy (review M2); `None` for a calibrated set.
+    prepared_bytes: Option<u64>,
     /// The handles of the frames Prepare cannot read (review I1, plan 6c D8): they leave the plan's included
     /// counts and the ≥ 3 rule, not `excluded_frame_ids`. Empty for a calibrated set.
     unsupported_ids: HashSet<i64>,
@@ -2171,8 +2174,6 @@ struct ProjectInputs {
     /// The size of the grid in use — the space estimate's registered and
     /// master geometry. `None` when there is neither grid nor proposal.
     grid_dims: Option<(u64, u64)>,
-    /// What Prepare writes (conversions and debayers).
-    prepared_bytes: u64,
 }
 
 /// What the Prepare probe found over the included frames of a project or an attested set.
@@ -2180,10 +2181,23 @@ struct PrepareProbe {
     counts: PlanPrepare,
     /// What Prepare writes (conversions and debayers).
     prepared_bytes: u64,
-    /// The file names of the frames Prepare cannot read, for the plan's warning.
+    /// The file names of the frames that open but that Prepare cannot read, for the plan's warning.
     unsupported_names: Vec<String>,
+    /// The file names of the frames whose file cannot be opened (review I1): offline, moved or renamed,
+    /// not an unsupported format. They are in `unsupported_ids` too, for Prepare leaves them out the same way.
+    absent_names: Vec<String>,
     unsupported_ids: HashSet<i64>,
     unsupported_why: HashMap<i64, String>,
+}
+
+impl PrepareProbe {
+    /// The plan's warnings for the files left out: the unreadable ones, then the absent ones.
+    fn warnings(&self) -> Vec<String> {
+        unsupported_files_warning(&self.unsupported_names)
+            .into_iter()
+            .chain(absent_files_warning(&self.absent_names))
+            .collect()
+    }
 }
 
 /// Spec §5.1 / §13 / plan 6c Task 1: what Prepare will do with each included frame (not manually excluded),
@@ -2204,6 +2218,7 @@ fn probe_prepare(
         counts: PlanPrepare::default(),
         prepared_bytes: 0,
         unsupported_names: Vec::new(),
+        absent_names: Vec::new(),
         unsupported_ids: HashSet::new(),
         unsupported_why: HashMap::new(),
     };
@@ -2232,16 +2247,22 @@ fn probe_prepare(
             let action = prepare_action(&shape, cfg.calibration.debayer_osc);
             match &action {
                 PrepareAction::Unsupported(why) => {
+                    // Per file at debug: a plan is rebuilt on every edit, so the one warn per build is
+                    // below the loop (review M3).
                     match subject.project_id() {
                         Some(project_id) => {
-                            tracing::warn!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, error = %why, "project frame unsupported; left out of the plan")
+                            tracing::debug!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, error = %why, "project frame unsupported; left out of the plan")
                         }
                         None => {
-                            tracing::warn!(set_id = subject.frame_set_id(), frame_id = f.frame_id, path = %f.path, error = %why, "attested light unsupported; left out of the plan")
+                            tracing::debug!(set_id = subject.frame_set_id(), frame_id = f.frame_id, path = %f.path, error = %why, "attested light unsupported; left out of the plan")
                         }
                     }
                     probe.counts.unsupported += 1;
-                    probe.unsupported_names.push(f.filename.clone());
+                    if why.starts_with(crate::stacking::prepare::CANNOT_OPEN) {
+                        probe.absent_names.push(f.filename.clone());
+                    } else {
+                        probe.unsupported_names.push(f.filename.clone());
+                    }
                     probe.unsupported_ids.insert(f.frame_id);
                     probe.unsupported_why.insert(f.frame_id, why.clone());
                 }
@@ -2256,14 +2277,27 @@ fn probe_prepare(
             probe.prepared_bytes += prepared_bytes(&shape, &action);
         }
     }
+    if !probe.unsupported_ids.is_empty() {
+        let (count, missing) = (probe.unsupported_names.len(), probe.absent_names.len());
+        match subject.project_id() {
+            Some(project_id) => {
+                tracing::warn!(project_id = %project_id, count, missing, "project frames left out of the plan")
+            }
+            None => {
+                tracing::warn!(
+                    set_id = subject.frame_set_id(),
+                    count,
+                    missing,
+                    "attested lights left out of the plan"
+                )
+            }
+        }
+    }
     probe
 }
 
-/// Spec §5.1 / §7: the plan's warning for the files Prepare cannot read; `None` when there is none.
-fn unsupported_files_warning(names: &[String]) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
+/// The names a plan warning lists: the first five, then "and N more".
+fn listed_names(names: &[String]) -> String {
     const NAME_CAP: usize = 5;
     let shown = names
         .iter()
@@ -2272,16 +2306,39 @@ fn unsupported_files_warning(names: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     let more = names.len().saturating_sub(NAME_CAP);
-    let suffix = if more > 0 {
-        format!(" and {more} more")
+    if more > 0 {
+        format!("{shown} and {more} more")
     } else {
-        String::new()
-    };
+        shown
+    }
+}
+
+/// Spec §5.1 / §7: the plan's warning for the files Prepare cannot read; `None` when there is none.
+fn unsupported_files_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
     let n = names.len();
     Some(format!(
-        "{n} file{} cannot be read and {} left out (unsupported file): {shown}{suffix}",
+        "{n} file{} cannot be read and {} left out (unsupported file): {}",
         if n == 1 { "" } else { "s" },
         if n == 1 { "is" } else { "are" },
+        listed_names(names),
+    ))
+}
+
+/// Review I1: the plan's warning for the files that cannot be opened, which is not an unsupported format;
+/// `None` when there is none.
+fn absent_files_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let n = names.len();
+    Some(format!(
+        "{n} file{} cannot be opened (offline, moved or renamed) and {} left out: {}",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" },
+        listed_names(names),
     ))
 }
 
@@ -2416,12 +2473,16 @@ fn frame_set_inputs(
     // Plan 6c D8: an attested set is prepared like a project, so its plan probes the included lights' headers
     // and drops a light no reader decodes (out of the included counts and the ≥ 3 rule, with a warning) the
     // way a project's plan does. A calibrated set has no Prepare stage and runs no probe.
-    let (prepare, unsupported_ids) = if readiness.attested {
+    let (prepare, prepared_bytes, unsupported_ids) = if readiness.attested {
         let probe = probe_prepare(conn, &cfg, subject, &groups, &excluded_set);
-        warnings.extend(unsupported_files_warning(&probe.unsupported_names));
-        (Some(probe.counts), probe.unsupported_ids)
+        warnings.extend(probe.warnings());
+        (
+            Some(probe.counts),
+            Some(probe.prepared_bytes),
+            probe.unsupported_ids,
+        )
     } else {
-        (None, HashSet::new())
+        (None, None, HashSet::new())
     };
     Ok(SubjectInputs {
         cfg,
@@ -2434,6 +2495,7 @@ fn frame_set_inputs(
         blockers,
         warnings,
         prepare,
+        prepared_bytes,
         unsupported_ids,
         project: None,
     })
@@ -2684,7 +2746,7 @@ fn project_inputs(
         }
     }
     // Spec §5.1 / §7: the files Prepare cannot read.
-    warnings.extend(unsupported_files_warning(&probe.unsupported_names));
+    warnings.extend(probe.warnings());
 
     let frames: Vec<PlanProjectFrame> = source
         .frames
@@ -2718,6 +2780,7 @@ fn project_inputs(
         blockers,
         warnings,
         prepare: Some(probe.counts),
+        prepared_bytes: Some(probe.prepared_bytes),
         unsupported_ids: probe.unsupported_ids,
         project: Some(ProjectInputs {
             grid: PlanGrid {
@@ -2730,7 +2793,6 @@ fn project_inputs(
             frames,
             grid_scale: in_use.map(|g| g.scale_arcsec),
             grid_dims: in_use.map(|g| (g.width_px as u64, g.height_px as u64)),
-            prepared_bytes: probe.prepared_bytes,
         }),
     })
 }
@@ -2837,6 +2899,7 @@ pub fn build_plan(
         blockers: arm_blockers,
         warnings: arm_warnings,
         prepare,
+        prepared_bytes,
         unsupported_ids,
         project,
     } = match subject {
@@ -3122,12 +3185,14 @@ pub fn build_plan(
         drizzle_bayer: cfg.drizzle.bayer && cfg.calibration.debayer_osc,
         crop_scratch: cfg.output.crop_to_coverage > 0,
     };
-    let estimate_bytes = match project
-        .as_ref()
-        .and_then(|p| p.grid_dims.map(|d| (d, p.prepared_bytes)))
-    {
-        Some((grid, prepared)) => paths::estimate_project_bytes(&estimate_inputs, grid, prepared),
-        None => paths::estimate_bytes(&estimate_inputs),
+    let estimate_bytes = match (project.as_ref().map(|p| p.grid_dims), prepared_bytes) {
+        // A project with a grid in use (or proposed): the grid's geometry.
+        (Some(Some(grid)), Some(prepared)) => {
+            paths::estimate_project_bytes(&estimate_inputs, grid, prepared)
+        }
+        // An attested set (review M2): what Prepare writes, at the frames' own geometry.
+        (None, Some(prepared)) => paths::estimate_prepared_bytes(&estimate_inputs, prepared),
+        _ => paths::estimate_bytes(&estimate_inputs),
     };
 
     // Gate 4: space.
@@ -9972,6 +10037,184 @@ mod tests {
             plan.warnings.iter().all(|w| !w.contains("cannot be read")),
             "{:?}",
             plan.warnings
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review I1): a light whose file cannot be opened (offline drive, moved, renamed) is
+    /// left out like an unreadable one, but the plan says it is absent, not that it is an unsupported file.
+    #[test]
+    fn attested_set_plan_names_a_missing_light_as_absent() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        // `light_spec` seeds the catalog rows and writes no file.
+        test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "1 file cannot be opened (offline, moved or renamed) and is left out: l3.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("(unsupported file)")),
+            "an absent file is not an unsupported file: {:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(1));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (4, 3));
+        assert!(plan.excluded_frame_ids.is_empty());
+    }
+
+    /// The two reasons stay apart when a set has both: each gets its own sentence, with its own names and
+    /// pluralization, and both count as `unsupported` (Prepare leaves all three out).
+    #[test]
+    fn attested_set_plan_tells_absent_files_from_unsupported_ones() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        test_fixtures::write_empty_primary_fits(&bad);
+        test_fixtures::add_light(&f, &light_spec("l4", "2025-01-01T00:20:00"));
+        test_fixtures::add_light(&f, &light_spec("l5", "2025-01-01T00:25:00"));
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(3));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (6, 3));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "1 file cannot be read and is left out (unsupported file): l3.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "2 files cannot be opened (offline, moved or renamed) and are left out: l4.fits, l5.fits"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review I1), project arm: a landed file deleted after it was recorded still reaches
+    /// the probe (the frame source reads the catalog row, not the disk), and reads as absent.
+    #[test]
+    fn project_plan_names_a_missing_landed_file_as_absent() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        let mut paths = Vec::new();
+        for uuid in ["a", "b", "c", "d"] {
+            paths.push(add_project_frame(
+                &f.conn,
+                &landed,
+                "p1",
+                &project_frame_spec(uuid),
+            ));
+        }
+        std::fs::remove_file(&paths[3]).unwrap();
+        let plan = project_plan_of(&f, None);
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "1 file cannot be opened (offline, moved or renamed) and is left out: c_d.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("(unsupported file)")),
+            "{:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(1));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (4, 3));
+        assert!(plan.excluded_frame_ids.is_empty());
+    }
+
+    /// Three 64×48 mono lights for an estimate comparison: the third is an integer FITS when `integer`, else a
+    /// float file like the other two. Returns the plan's `estimate_bytes`.
+    fn three_light_estimate(integer: bool, attested: bool) -> u64 {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        if integer {
+            test_fixtures::add_light(&f, &light_spec_written("l2", THREE_TIMES[2]));
+        } else {
+            add_float_light(&f, "l2", THREE_TIMES[2]);
+        }
+        if attested {
+            attest(&f);
+        }
+        set_plan_of(&f).estimate_bytes
+    }
+
+    /// Plan 6c Task 1 r2 (review M2): an attested set's estimate counts what Prepare writes, as a project's
+    /// does: a float file used in place costs nothing, an integer file costs its converted copy. A calibrated
+    /// set's estimate is untouched.
+    #[test]
+    fn attested_set_estimate_counts_prepared_bytes() {
+        let plane = 64 * 48 * 4;
+        // The calibrated set's estimate, computed on the commit before this round.
+        let calibrated = three_light_estimate(false, false);
+        assert_eq!(calibrated, 1_136_016, "pinned on the r1 commit");
+        assert_eq!(
+            three_light_estimate(true, false),
+            calibrated,
+            "a calibrated set's estimate never reads the files"
+        );
+        let float_attested = three_light_estimate(false, true);
+        let integer_attested = three_light_estimate(true, true);
+        assert_eq!(
+            integer_attested - float_attested,
+            plane,
+            "the integer light adds its converted plane"
+        );
+        assert_eq!(
+            calibrated - float_attested,
+            3 * plane,
+            "three lights used in place cost no calibrated copy"
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review M3): a plan build logs one warning for the files it leaves out, with the
+    /// counts; the per-file lines are debug.
+    #[test]
+    fn a_plan_build_logs_one_warning_for_the_files_it_leaves_out() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        test_fixtures::write_empty_primary_fits(&bad);
+        test_fixtures::add_light(&f, &light_spec("l4", "2025-01-01T00:20:00"));
+        test_fixtures::add_light(&f, &light_spec("l5", "2025-01-01T00:25:00"));
+        attest(&f);
+        let (_, log) = crate::stacking::telemetry::capture_logs(|| set_plan_of(&f));
+        let left_out: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("left out of the plan"))
+            .collect();
+        let warns: Vec<&&str> = left_out.iter().filter(|l| l.contains(" WARN ")).collect();
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(
+            warns[0].contains("count=1") && warns[0].contains("missing=2"),
+            "{}",
+            warns[0]
+        );
+        assert_eq!(
+            left_out.iter().filter(|l| l.contains(" DEBUG ")).count(),
+            3,
+            "one debug line per file: {log}"
         );
     }
 
