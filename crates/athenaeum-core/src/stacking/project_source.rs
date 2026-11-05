@@ -32,6 +32,8 @@ pub struct SourceFrame {
     pub handle: Option<i64>,
     pub frame_uuid: String,
     pub file_name: String,
+    /// The publisher's account id (the plan's grid outlines name a frame's publisher by it).
+    pub publisher_account_id: String,
     pub publisher: String,
     pub filter_canonical: String,
     pub exptime_sec: f64,
@@ -350,6 +352,7 @@ pub fn project_frame_source(
             handle: None,
             frame_uuid: row.frame_uuid.clone(),
             file_name: row.file_name.clone(),
+            publisher_account_id: row.publisher_account_id.clone(),
             publisher: row.publisher_display.clone(),
             filter_canonical: row.filter_canonical.clone(),
             exptime_sec: meta.as_ref().map_or(0.0, |m| m.exptime_sec),

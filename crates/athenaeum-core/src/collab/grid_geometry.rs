@@ -22,6 +22,21 @@ pub struct FrameFootprint {
     pub height: f64,
 }
 
+impl FrameFootprint {
+    /// The frame's outline on the sky: RA/Dec in degrees of [`boundary_points`] (the pixel edges, eight
+    /// points per edge so SIP curvature shows) through the frame's WCS, SIP included — the outline the
+    /// proposal measures its box on.
+    pub fn outline_sky(&self) -> Vec<[f64; 2]> {
+        boundary_points(self.width, self.height)
+            .into_iter()
+            .map(|(x, y)| {
+                let (ra, dec) = self.wcs.pixel_to_sky(x, y);
+                [ra, dec]
+            })
+            .collect()
+    }
+}
+
 /// One accepted frame as the proposal sees it.
 pub struct GridInput {
     pub pixel_scale_arcsec: Option<f64>,
@@ -71,7 +86,7 @@ pub fn grid_wcs(grid: &CanonicalGrid) -> WcsSolution {
 
 /// A frame's outline: corners plus eight points per edge (SIP and the
 /// TAN-to-TAN mapping curve the edges slightly), at the pixel extents.
-fn boundary_points(w: f64, h: f64) -> Vec<(f64, f64)> {
+pub(crate) fn boundary_points(w: f64, h: f64) -> Vec<(f64, f64)> {
     const STEPS: usize = 8;
     let (x0, x1, y0, y1) = (-0.5, w - 0.5, -0.5, h - 0.5);
     let mut pts = Vec::with_capacity(4 * STEPS);
@@ -394,5 +409,127 @@ mod tests {
             0.0
         );
         assert_eq!(count_inside(&[anti], &grid), 0);
+    }
+
+    /// A footprint's outline is the pixel-edge boundary through its WCS: 32 points, the first at the
+    /// top-left pixel corner, and every point inverts back to its pixel edge point.
+    #[test]
+    fn an_outline_inverts_to_the_pixel_edge_points() {
+        let input = grid_input_of(&meta(10.5, 41.25, 100, 80, Some(2.0)));
+        let fp = input.footprint.as_ref().unwrap();
+        let outline = fp.outline_sky();
+        let edge = boundary_points(100.0, 80.0);
+        assert_eq!(outline.len(), 32);
+        assert_eq!(outline.len(), edge.len());
+        assert_eq!(edge[0], (-0.5, -0.5));
+        for (sky, (x, y)) in outline.iter().zip(&edge) {
+            let (px, py) = fp.wcs.sky_to_pixel(sky[0], sky[1]);
+            assert!((px - x).abs() < 1e-6 && (py - y).abs() < 1e-6, "{sky:?}");
+        }
+    }
+
+    /// The projection every grid-drawing client repeats (plan 6c Task 7's TS asserts these numbers to
+    /// 1e-6 px): four sky points in front of the tangent plane (the grid centre, 0.5 deg east, 0.5 deg
+    /// north, one near the south-east pixel corner) projected to 0-based grid pixels with [`grid_wcs`], for a
+    /// grid at rotation 0 and one at 30 degrees.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GoldenPoint {
+        ra_deg: f64,
+        dec_deg: f64,
+        x: f64,
+        y: f64,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct GoldenGrid {
+        grid: CanonicalGrid,
+        points: Vec<GoldenPoint>,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Golden {
+        grids: Vec<GoldenGrid>,
+    }
+
+    fn golden() -> Golden {
+        // Nine decimals: far below the 1e-6 px the clients assert, and a text the file keeps short.
+        let round = |v: f64| (v * 1e9).round() / 1e9;
+        let grids = [0.0, 30.0]
+            .into_iter()
+            .map(|rotation_deg| {
+                let grid = CanonicalGrid {
+                    scale_arcsec: 2.0,
+                    width_px: 4096,
+                    height_px: 3072,
+                    crval1: 83.8,
+                    crval2: -5.4,
+                    rotation_deg,
+                };
+                let tan = grid_wcs(&grid);
+                let cos_dec = grid.crval2.to_radians().cos();
+                let points = [
+                    (grid.crval1, grid.crval2),
+                    (grid.crval1 + 0.5 / cos_dec, grid.crval2),
+                    (grid.crval1, grid.crval2 + 0.5),
+                    (grid.crval1 + 1.0 / cos_dec, grid.crval2 - 0.7),
+                ]
+                .into_iter()
+                .map(|(ra, dec)| {
+                    let (ra_deg, dec_deg) = (round(ra), round(dec));
+                    let (x, y) = tan.sky_to_pixel(ra_deg, dec_deg);
+                    GoldenPoint {
+                        ra_deg,
+                        dec_deg,
+                        x: round(x),
+                        y: round(y),
+                    }
+                })
+                .collect();
+                GoldenGrid { grid, points }
+            })
+            .collect();
+        Golden { grids }
+    }
+
+    /// The golden file is what the Rust projection computes (the `ts_contract` pattern): regenerate with
+    /// `GOLDEN_WRITE=1 cargo test -p athenaeum-core --lib grid_projection_golden`. The check compares
+    /// numbers, not text: the last bits of a trig result may differ between platforms.
+    #[test]
+    fn grid_projection_golden_file_is_current() {
+        let computed = golden();
+        let centre = &computed.grids[0].points[0];
+        assert!(
+            (centre.x - 2047.5).abs() < 1e-6 && (centre.y - 1535.5).abs() < 1e-6,
+            "the grid centre projects to the centre pixel: {centre:?}"
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src/components/stacking/gridProjection.golden.json");
+        if std::env::var("GOLDEN_WRITE").is_ok() {
+            let mut text = serde_json::to_string_pretty(&computed).unwrap();
+            text.push('\n');
+            std::fs::write(&path, text).unwrap();
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("{}: {e}\nRegenerate: GOLDEN_WRITE=1 cargo test -p athenaeum-core --lib grid_projection_golden", path.display())
+        });
+        let on_disk: Golden = serde_json::from_str(&text).expect("the golden file parses");
+        let stale = "stale golden file; regenerate: GOLDEN_WRITE=1 cargo test -p athenaeum-core --lib grid_projection_golden";
+        assert_eq!(on_disk.grids.len(), computed.grids.len(), "{stale}");
+        for (a, b) in on_disk.grids.iter().zip(&computed.grids) {
+            assert_eq!(a.grid, b.grid, "{stale}");
+            assert_eq!(a.points.len(), b.points.len(), "{stale}");
+            for (p, q) in a.points.iter().zip(&b.points) {
+                let close = |u: f64, v: f64| (u - v).abs() < 1e-7;
+                assert!(
+                    close(p.ra_deg, q.ra_deg)
+                        && close(p.dec_deg, q.dec_deg)
+                        && close(p.x, q.x)
+                        && close(p.y, q.y),
+                    "{stale}: {p:?} vs {q:?}"
+                );
+            }
+        }
     }
 }

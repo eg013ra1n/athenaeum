@@ -243,6 +243,29 @@ pub enum GridState {
     Confirmed,
 }
 
+/// The project's target circle (the project row's `targetRaDeg`, `targetDecDeg`, `targetRadiusDeg`), in
+/// degrees: what the grid schematic centres on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGridTarget {
+    pub ra_deg: f64,
+    pub dec_deg: f64,
+    pub radius_deg: f64,
+}
+
+/// One frame's outline for the grid schematic (plan 6c): the frame's pixel-edge boundary on the sky.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGridFootprint {
+    pub frame_uuid: String,
+    pub publisher_account_id: String,
+    pub publisher: String,
+    pub filter_canonical: String,
+    // `[raDeg, decDeg]` of the frame's pixel edges (eight points per edge, corners included) through its
+    // manifest WCS, SIP included.
+    pub outline: Vec<[f64; 2]>,
+}
+
 /// A project plan's grid (spec §6, §7).
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +277,14 @@ pub struct PlanGrid {
     // (the confirmed one, else the proposal).
     pub frames_inside: usize,
     pub can_edit: bool,
+    // The project's target circle.
+    pub target: PlanGridTarget,
+    // The outline of every published, accepted frame of the project that has a manifest WCS and a pixel
+    // size, on this device or not, so every member sees the same picture.
+    pub footprints: Vec<PlanGridFootprint>,
+    // The published, accepted frames with no outline: no manifest WCS, no pixel size, or unreadable
+    // metadata.
+    pub frames_not_drawn: u32,
 }
 
 /// What the run's Prepare stage will do with the included frames of a project or an attested frame set (spec
@@ -2501,6 +2532,36 @@ fn frame_set_inputs(
     })
 }
 
+/// The grid schematic's outlines (plan 6c): one per published, accepted frame of the project that has a
+/// manifest WCS and a pixel size — on this device or not, in the frame source's order — and how many of the
+/// frames have none (no manifest WCS, no pixel size, unreadable metadata, or a WCS whose edges do not
+/// project to finite sky points).
+fn grid_footprints(
+    frames: &[crate::stacking::project_source::SourceFrame],
+) -> (Vec<PlanGridFootprint>, u32) {
+    let mut footprints = Vec::new();
+    let mut not_drawn = 0u32;
+    for f in frames {
+        let outline = f
+            .meta
+            .as_ref()
+            .and_then(|m| crate::collab::grid_geometry::grid_input_of(m).footprint)
+            .map(|fp| fp.outline_sky())
+            .filter(|o| o.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
+        match outline {
+            Some(outline) => footprints.push(PlanGridFootprint {
+                frame_uuid: f.frame_uuid.clone(),
+                publisher_account_id: f.publisher_account_id.clone(),
+                publisher: f.publisher.clone(),
+                filter_canonical: f.filter_canonical.clone(),
+                outline,
+            }),
+            None => not_drawn += 1,
+        }
+    }
+    (footprints, not_drawn)
+}
+
 /// The project arm of [`build_plan`] (spec §7, plan 6b-2 C10). It WRITES —
 /// a documented exception to "the plan reads only": the config seed
 /// (`resolve_project_config_and_exclusions`) and the handle mint (the
@@ -2564,6 +2625,7 @@ fn project_inputs(
         radius_deg: project.target_radius_deg,
     };
     let proposal = propose_grid(&all_inputs, &target);
+    let (footprints, frames_not_drawn) = grid_footprints(&source.frames);
     let state = match (&current, &proposal) {
         (Some(_), _) => GridState::Confirmed,
         (None, Some(_)) => GridState::Proposed,
@@ -2760,11 +2822,20 @@ fn project_inputs(
             exptime_sec: f.exptime_sec,
             color_mode: f.color_mode,
             has_wcs: f.meta.as_ref().is_some_and(|m| m.wcs.is_some()),
+            // The record's flag (landed on this device per the catalog), not a disk check: a landed file
+            // gone since reads `true` here and names itself in `reason`.
             on_disk: f.not_stackable.is_none(),
             reason: f.not_stackable.clone().or_else(|| {
                 f.handle
                     .and_then(|h| probe.unsupported_why.get(&h))
-                    .map(|w| format!("unsupported file: {w}"))
+                    .map(|w| {
+                        // The plan's warning sentence for a file that cannot be opened (carry-in R2-M1).
+                        if w.starts_with(crate::stacking::prepare::CANNOT_OPEN) {
+                            "cannot be opened (offline, moved or renamed)".to_string()
+                        } else {
+                            format!("unsupported file: {w}")
+                        }
+                    })
             }),
         })
         .collect();
@@ -2789,6 +2860,13 @@ fn project_inputs(
                 proposal,
                 frames_inside,
                 can_edit,
+                target: PlanGridTarget {
+                    ra_deg: target.ra_deg,
+                    dec_deg: target.dec_deg,
+                    radius_deg: target.radius_deg,
+                },
+                footprints,
+                frames_not_drawn,
             },
             frames,
             grid_scale: in_use.map(|g| g.scale_arcsec),
@@ -10139,6 +10217,148 @@ mod tests {
         let g = &plan.groups[0];
         assert_eq!((g.frame_count, g.included_count), (4, 3));
         assert!(plan.excluded_frame_ids.is_empty());
+    }
+
+    /// Plan 6c Task 1b (carry-in R2-M1): the Frames row of a landed file that is gone reads as the plan's
+    /// warning does ("cannot be opened ..."), with no prefix and no OS error text, and keeps `onDisk` (the
+    /// record's flag, not a disk check); a file no reader decodes keeps its "unsupported file: ..." reason.
+    #[test]
+    fn project_plan_frame_row_names_a_missing_file_as_absent() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        let mut paths = Vec::new();
+        for uuid in ["a", "b", "c", "d"] {
+            paths.push(add_project_frame(
+                &f.conn,
+                &landed,
+                "p1",
+                &project_frame_spec(uuid),
+            ));
+        }
+        let mut empty = project_frame_spec("e");
+        empty.file = ProjectFile::EmptyPrimary;
+        add_project_frame(&f.conn, &landed, "p1", &empty);
+        std::fs::remove_file(&paths[3]).unwrap();
+        let plan = project_plan_of(&f, None);
+        let row = |uuid: &str| {
+            plan.project_frames
+                .iter()
+                .find(|r| r.frame_uuid == uuid)
+                .unwrap_or_else(|| panic!("no row for {uuid}"))
+        };
+        let gone = row("d");
+        assert_eq!(
+            gone.reason.as_deref(),
+            Some("cannot be opened (offline, moved or renamed)")
+        );
+        assert!(
+            gone.on_disk,
+            "onDisk is the record's flag, not a disk check"
+        );
+        let unsupported = row("e");
+        assert_eq!(
+            unsupported.reason.as_deref(),
+            Some("unsupported file: not a 1- or 3-plane 8/16/32-bit or float primary image")
+        );
+        assert!(unsupported.on_disk);
+        assert_eq!(row("a").reason, None);
+    }
+
+    /// Plan 6c Task 1b: the plan's grid carries the outline of every published, accepted frame with a
+    /// manifest WCS, on this device or not (one picture for every member), the target of the project row,
+    /// and the number of frames it cannot draw.
+    #[test]
+    fn project_plan_grid_carries_footprints() {
+        use crate::collab::frame_meta::parse_project_frame_meta;
+        use crate::collab::grid_geometry::{boundary_points, grid_input_of};
+        use crate::stacking::test_fixtures::{
+            add_project_frame, manifest_wcs_json, project_frame_spec, ProjectFile,
+        };
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        // `a`: ann's, a WCS; `b`: bob's, a WCS, never landed (not on this device); `c`: ann's, no WCS;
+        // `x`: a WCS, not accepted (no part of the project).
+        let mut a = project_frame_spec("a");
+        a.wcs = Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &a);
+        let mut b = project_frame_spec("b");
+        b.publisher = "bob";
+        b.filter = "R";
+        b.file = ProjectFile::Missing;
+        b.wcs = Some(manifest_wcs_json(64, 48, 83.9, -5.3, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &b);
+        add_project_frame(&f.conn, &landed, "p1", &project_frame_spec("c"));
+        let mut x = project_frame_spec("x");
+        x.accepted = false;
+        x.wcs = Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &x);
+        // The display name is not the account id.
+        f.conn
+            .execute(
+                "UPDATE project_frames_local SET publisher_display = 'Ann Lovelace'
+                 WHERE frame_uuid IN ('a', 'c')",
+                [],
+            )
+            .unwrap();
+
+        let plan = project_plan_of(&f, None);
+        let grid = plan.grid.as_ref().expect("a project plan has a grid");
+        assert_eq!(grid.frames_not_drawn, 1, "only `c` has no WCS");
+        let uuids: Vec<&str> = grid
+            .footprints
+            .iter()
+            .map(|p| p.frame_uuid.as_str())
+            .collect();
+        assert_eq!(
+            uuids,
+            ["a", "b"],
+            "every accepted frame with a WCS, landed here or not"
+        );
+        let (fa, fb) = (&grid.footprints[0], &grid.footprints[1]);
+        assert_eq!(
+            (
+                fa.publisher_account_id.as_str(),
+                fa.publisher.as_str(),
+                fa.filter_canonical.as_str()
+            ),
+            ("ann", "Ann Lovelace", "L")
+        );
+        assert_eq!(
+            (
+                fb.publisher_account_id.as_str(),
+                fb.publisher.as_str(),
+                fb.filter_canonical.as_str()
+            ),
+            ("bob", "bob", "R")
+        );
+        // `insert_test_project` seeds the target of M42.
+        assert_eq!(
+            (
+                grid.target.ra_deg,
+                grid.target.dec_deg,
+                grid.target.radius_deg
+            ),
+            (83.8, -5.4, 1.0)
+        );
+        // The outline is the pixel-edge boundary through the frame's own WCS: each point inverts back
+        // to its edge point.
+        let row = crate::db::collab_frames::list_for_project(&f.conn, "p1")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.frame_uuid == "a")
+            .unwrap();
+        let meta = parse_project_frame_meta(&row.manifest_json).unwrap();
+        let input = grid_input_of(&meta);
+        let wcs = &input.footprint.as_ref().unwrap().wcs;
+        let edge = boundary_points(64.0, 48.0);
+        assert_eq!(fa.outline.len(), edge.len());
+        for (sky, (x, y)) in fa.outline.iter().zip(&edge) {
+            let (px, py) = wcs.sky_to_pixel(sky[0], sky[1]);
+            assert!((px - x).abs() < 1e-6 && (py - y).abs() < 1e-6, "{sky:?}");
+        }
     }
 
     /// Three 64×48 mono lights for an estimate comparison: the third is an integer FITS when `integer`, else a

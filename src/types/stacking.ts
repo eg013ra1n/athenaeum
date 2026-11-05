@@ -396,7 +396,11 @@ export type PlanReference = { mode: ReferenceMode, frameId: number | null, filen
 
 export type GridState = "unset" | "proposed" | "confirmed";
 
-export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, };
+export type PlanGridTarget = { raDeg: number, decDeg: number, radiusDeg: number, };
+
+export type PlanGridFootprint = { frameUuid: string, publisherAccountId: string, publisher: string, filterCanonical: string, outline: Array<[number, number]>, };
+
+export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, target: PlanGridTarget, footprints: Array<PlanGridFootprint>, framesNotDrawn: number, };
 
 export type PlanPrepare = { inPlace: number, debayered: number, converted: number, unsupported: number, atRun: number, };
 
