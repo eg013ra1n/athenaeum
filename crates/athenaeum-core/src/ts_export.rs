@@ -450,6 +450,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::plan::PlanReference,
             crate::stacking::plan::GridState,
             crate::stacking::plan::PlanGrid,
+            crate::stacking::plan::PlanPrepare,
             crate::stacking::plan::PlanProjectFrame,
             crate::stacking::plan::StackingPlan,
             crate::db::stacking::StackingRunRow,
