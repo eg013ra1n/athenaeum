@@ -500,7 +500,7 @@ export default function SkyChart() {
               {skyStatusText}
               {skyStatusText && ' · '}
               <button
-                onClick={() => navigate('/settings?tab=general&section=general.skyBackground')}
+                onClick={() => navigate('/settings?tab=sky_chart&section=skyChart.background')}
                 className="text-accent hover:underline"
               >
                 Download for offline…

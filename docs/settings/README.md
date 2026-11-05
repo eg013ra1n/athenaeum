@@ -51,7 +51,7 @@ value, a default or render code. Two consumers read it: the search index
   each id so it mounts once.
 
 **Tabs, in order** (`SETTINGS_TABS`): `general` · `blink` · `analysis` ·
-`plate_solving` · `calibration` · `stacking` · `transfers`.
+`plate_solving` · `calibration` · `stacking` · `sky_chart` · `transfers`.
 
 | Tab | Section ids (`SETTINGS_SECTIONS`) |
 | ---- | ---- |
@@ -61,6 +61,7 @@ value, a default or render code. Two consumers read it: the search index
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
 | Calibration | `calibration.matching` `calibration.memory` `calibration.masterFormat` |
 | Stacking | `stacking.pipeline` `stacking.folders` `stacking.compute` |
+| Sky Chart | `skyChart.background` (moved out of General as `general.skyBackground`, 2026-11-05) |
 | Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.collabStreams` `transfers.storage` |
 
 `analysis.*` (Plan C, PC-10 / PC-15) carries `AnalysisConfig`'s four fields only: `detection_threshold` (σ of the

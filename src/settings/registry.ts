@@ -20,6 +20,7 @@ import {
   ScanSearch,
   Crosshair,
   SquareStack,
+  Focus,
   ArrowLeftRight,
 } from 'lucide-react';
 
@@ -30,6 +31,7 @@ export type SettingsTabId =
   | 'plate_solving'
   | 'calibration'
   | 'stacking'
+  | 'sky_chart'
   | 'transfers';
 
 export interface SettingsFieldMeta {
@@ -59,6 +61,7 @@ export const SETTINGS_TABS: { id: SettingsTabId; label: string; icon: LucideIcon
   { id: 'plate_solving', label: 'Plate Solving', icon: ScanSearch },
   { id: 'calibration', label: 'Calibration', icon: Crosshair },
   { id: 'stacking', label: 'Stacking', icon: SquareStack },
+  { id: 'sky_chart', label: 'Sky Chart', icon: Focus },
   { id: 'transfers', label: 'Transfers', icon: ArrowLeftRight },
 ];
 
@@ -199,45 +202,6 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         label: 'Zip extraction cache on this computer',
         help: 'Space the unpacked zip frames take. Clear cache deletes the ones nothing is using; they are unpacked again when needed. Zips themselves are never changed.',
         keywords: ['zip', 'cache', 'clear', 'extraction', 'disk space'],
-      },
-    ],
-  },
-  {
-    id: 'general.skyBackground',
-    tab: 'general',
-    title: 'Sky background',
-    description:
-      'Sky survey images drawn under the Sky Chart. Tiles are fetched from the survey as you browse and kept on this computer; they are never shared.',
-    fields: [
-      {
-        id: 'online',
-        label: 'Fetch sky tiles while browsing',
-        help: 'Off: the Sky Chart draws only tiles already on this computer and never contacts the survey.',
-        keywords: ['skychart.hips_online', 'hips', 'dss', 'survey', 'offline', 'network', 'sky chart'],
-      },
-      {
-        id: 'cacheLimitGb',
-        label: 'Sky tile cache limit',
-        help: 'Space the tiles fetched while browsing may take, all surveys together. The longest unused ones are deleted once it passes the limit; tiles of each survey\'s last offline pack are kept whatever it is. It can pass the limit briefly while you browse.',
-        keywords: ['skychart.hips_cache_limit_gb', 'hips', 'cache', 'limit', 'size', 'disk space', 'tiles', 'nsns', 'dss'],
-      },
-      {
-        id: 'cacheTotal',
-        label: 'Sky tiles on this computer',
-        help: 'Space all surveys take together. Clear all deletes every stored tile, offline packs included.',
-        keywords: ['hips', 'cache', 'clear', 'clear all', 'disk space', 'tiles', 'used'],
-      },
-      {
-        id: 'surveys',
-        label: 'Surveys on this computer',
-        help: 'Credit, license, the servers tiles come from and the space the stored tiles take. Clear deletes a survey\'s tiles.',
-        keywords: ['hips', 'dss colored', 'nsns', 'narrowband', 'cache', 'tiles', 'clear', 'attribution', 'license', 'mirror', 'server'],
-      },
-      {
-        id: 'pack',
-        label: 'Offline pack',
-        help: 'Download the sky ahead of time for use without internet. Tiles stay on this computer.',
-        keywords: ['offline', 'download', 'pack', 'hips', 'messier', 'ngc', 'field'],
       },
     ],
   },
@@ -727,6 +691,46 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     ],
   },
 
+  // ── Sky Chart ────────────────────────────────────────────────────────────
+  {
+    id: 'skyChart.background',
+    tab: 'sky_chart',
+    title: 'Sky background',
+    description:
+      'Sky survey images drawn under the Sky Chart. Tiles are fetched from the survey as you browse and kept on this computer; they are never shared.',
+    fields: [
+      {
+        id: 'online',
+        label: 'Fetch sky tiles while browsing',
+        help: 'Off: the Sky Chart draws only tiles already on this computer and never contacts the survey.',
+        keywords: ['skychart.hips_online', 'hips', 'dss', 'survey', 'offline', 'network', 'sky chart'],
+      },
+      {
+        id: 'cacheLimitGb',
+        label: 'Sky tile cache limit',
+        help: 'Space the tiles fetched while browsing may take, all surveys together. The longest unused ones are deleted once it passes the limit; tiles of each survey\'s last offline pack are kept whatever it is. It can pass the limit briefly while you browse.',
+        keywords: ['skychart.hips_cache_limit_gb', 'hips', 'cache', 'limit', 'size', 'disk space', 'tiles', 'nsns', 'dss'],
+      },
+      {
+        id: 'cacheTotal',
+        label: 'Sky tiles on this computer',
+        help: 'Space all surveys take together. Clear all deletes every stored tile, offline packs included.',
+        keywords: ['hips', 'cache', 'clear', 'clear all', 'disk space', 'tiles', 'used'],
+      },
+      {
+        id: 'surveys',
+        label: 'Surveys on this computer',
+        help: 'Credit, license, the servers tiles come from and the space the stored tiles take. Clear deletes a survey\'s tiles.',
+        keywords: ['hips', 'dss colored', 'nsns', 'narrowband', 'cache', 'tiles', 'clear', 'attribution', 'license', 'mirror', 'server'],
+      },
+      {
+        id: 'pack',
+        label: 'Offline pack',
+        help: 'Download the sky ahead of time for use without internet. Tiles stay on this computer.',
+        keywords: ['offline', 'download', 'pack', 'hips', 'messier', 'ngc', 'field'],
+      },
+    ],
+  },
   // ── Transfers ────────────────────────────────────────────────────────────
   {
     id: 'transfers.account',

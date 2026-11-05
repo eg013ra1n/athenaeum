@@ -31,6 +31,7 @@ import { AnalysisTab } from './AnalysisTab';
 import { PlateSolvingTab } from './PlateSolvingTab';
 import { CalibrationTab } from './CalibrationTab';
 import { StackingTab } from './StackingTab';
+import { SkyChartTab } from './SkyChartTab';
 import { TransfersTab } from './TransfersTab';
 
 vi.mock('../../../api', () => ({
@@ -153,6 +154,7 @@ function renderAllTabs() {
       <PlateSolvingTab />
       <CalibrationTab />
       <StackingTab />
+      <SkyChartTab />
       <TransfersTab />
     </SettingsDefaultsProvider>,
   );

@@ -12,6 +12,7 @@ import { ANALYSIS_SECTIONS } from './AnalysisTab';
 import { PLATE_SOLVING_SECTIONS } from './PlateSolvingTab';
 import { CALIBRATION_SECTIONS } from './CalibrationTab';
 import { STACKING_SECTIONS } from './StackingTab';
+import { SKY_CHART_SECTIONS } from './SkyChartTab';
 import { TRANSFERS_SECTIONS } from './TransfersTab';
 import type { TabSectionEntry } from './tabSectionEntry';
 
@@ -24,6 +25,7 @@ const ALL_SECTION_ENTRIES: TabSectionEntry[] = [
   ...PLATE_SOLVING_SECTIONS,
   ...CALIBRATION_SECTIONS,
   ...STACKING_SECTIONS,
+  ...SKY_CHART_SECTIONS,
   ...TRANSFERS_SECTIONS,
 ];
 
@@ -47,4 +49,5 @@ export { AnalysisTab } from './AnalysisTab';
 export { PlateSolvingTab } from './PlateSolvingTab';
 export { CalibrationTab } from './CalibrationTab';
 export { StackingTab } from './StackingTab';
+export { SkyChartTab } from './SkyChartTab';
 export { TransfersTab } from './TransfersTab';

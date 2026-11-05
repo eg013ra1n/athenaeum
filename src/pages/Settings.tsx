@@ -1,6 +1,6 @@
 // Settings redesign (spec 2026-09-18): the page shell only — tab bar,
 // search field and the tab switch. Every setting lives in a registered
-// `SettingsSection` inside one of the seven tab files
+// `SettingsSection` inside one of the eight tab files
 // (`src/components/settings/tabs/`); see `docs/settings/README.md` (Task F1)
 // for how a new one is added.
 import { useEffect, useState } from 'react';
@@ -17,6 +17,7 @@ import {
   PlateSolvingTab,
   CalibrationTab,
   StackingTab,
+  SkyChartTab,
   TransfersTab,
 } from '../components/settings/tabs';
 
@@ -175,6 +176,7 @@ function SettingsContent() {
           {activeTab === 'plate_solving' && <PlateSolvingTab />}
           {activeTab === 'calibration' && <CalibrationTab />}
           {activeTab === 'stacking' && <StackingTab />}
+          {activeTab === 'sky_chart' && <SkyChartTab />}
           {activeTab === 'transfers' && <TransfersTab />}
         </>
       )}

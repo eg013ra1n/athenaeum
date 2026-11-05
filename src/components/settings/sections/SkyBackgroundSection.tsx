@@ -1,4 +1,4 @@
-// General tab, "Sky background" (issue #18): the online switch for the Sky
+// Sky Chart tab, "Sky background" (issue #18): the online switch for the Sky
 // Chart's HiPS background, the browsing cache limit (KV
 // `skychart.hips_cache_limit_gb`, enforced by `hips::cache` in the core), the
 // space all surveys take with Clear all, and per survey its credit, license,
@@ -41,7 +41,7 @@ function PackControls({ survey, onFinished, refreshToken }: {
   useEffect(() => {
     if (refreshToken > 0) void refreshRef.current();
   }, [refreshToken]);
-  const meta = fieldMeta('general.skyBackground', 'pack');
+  const meta = fieldMeta('skyChart.background', 'pack');
   const state = progress?.state ?? 'idle';
   const active = state === 'running' || state === 'cancelling';
   const resumable = state === 'interrupted' || state === 'cancelled' || state === 'failed';
@@ -187,18 +187,18 @@ export function SkyBackgroundSection() {
     setCleared((c) => ({ id: '*', n: (c?.n ?? 0) + 1 }));
   };
 
-  const meta = fieldMeta('general.skyBackground', 'surveys');
-  const totalMeta = fieldMeta('general.skyBackground', 'cacheTotal');
+  const meta = fieldMeta('skyChart.background', 'surveys');
+  const totalMeta = fieldMeta('skyChart.background', 'cacheTotal');
   const totalBytes = (surveys ?? []).reduce((a, s) => a + s.cachedBytes, 0);
   const totalTiles = (surveys ?? []).reduce((a, s) => a + s.cachedTiles, 0);
   const packBytes = (surveys ?? []).reduce((a, s) => a + s.packBytes, 0);
 
   return (
-    <SettingsSection id="general.skyBackground">
+    <SettingsSection id="skyChart.background">
       <div className="space-y-4">
-        <SettingToggle section="general.skyBackground" field="online" settingKey="skychart.hips_online" />
+        <SettingToggle section="skyChart.background" field="online" settingKey="skychart.hips_online" />
         <SettingNumber
-          section="general.skyBackground"
+          section="skyChart.background"
           field="cacheLimitGb"
           settingKey="skychart.hips_cache_limit_gb"
           codec={intCodec(1, 4096)}
