@@ -4760,7 +4760,11 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       comment naming D-6: the `Detector::Full` arm of `stacking/measure.rs` (`SeedOverride::Full`), `examples/star_probe.rs` (`legacy_analyze`) and
       `examples/integrate_probe.rs` (`full_seed_positions`). `cargo build --all-targets` of `athenaeum-core`, `athenaeum-tauri` and `athenaeum-web`
       prints no `use of deprecated`. No other code changed.
-    - *Gates.* G5-d / G5-e: OWED (controller).
+    - *Gates.* G5-d: `athenaeum-core --all-targets` 4549 / 0 / 15 with no pin edited, `ts_contract` green and `src/types` unchanged, the
+      `--no-default-features` and `athenaeum-web` builds clean, `MEASURE_VERSION` 8. G5-e: athenaeum-lab `smport.sh`, analysis-mode arm, at
+      d03a6950 (rustafits v1.8.0) against b3cbeb85: `SMPORT: PASS`, 152 image-arms identical, 0 moved (lab 656e914). In rustafits: renders and
+      `info` byte-identical to 8b25b85, port digest a07688d0 identical, `rustafits analyze` equal to `measure_raw_frame` + `FrameSummary` on four
+      real frames, the `convert -a` overlay checked by the owner.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
