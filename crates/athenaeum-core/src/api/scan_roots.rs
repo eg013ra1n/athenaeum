@@ -771,6 +771,18 @@ fn resolve_special_root_dir(
         .map(|r| r.path))
 }
 
+/// The Collaboration folder's stored path, read through `conn` (plan 6c D10:
+/// the plan's `folders` gate holds a connection, not a `ServiceContext`).
+/// `None` when no folder is designated. The path is the canonicalized one
+/// `add_scan_root` stored, not re-resolved here. Its one caller is in
+/// `stacking`, which a headless build leaves out.
+#[cfg_attr(not(all(feature = "render", feature = "solver")), allow(dead_code))]
+pub(crate) fn collaboration_dir(
+    conn: &rusqlite::Connection,
+) -> Result<Option<std::path::PathBuf>, ApiError> {
+    Ok(resolve_special_root_dir(conn, "collaboration")?.map(std::path::PathBuf::from))
+}
+
 fn get_special_root_dir(ctx: &ServiceContext, kind: &str) -> Result<Option<String>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();

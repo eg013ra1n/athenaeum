@@ -3208,6 +3208,17 @@ pub fn build_plan(
                                 message,
                             });
                         }
+                        // Plan 6c D10: its masters folder (what the run
+                        // writes into) may not lie inside the Collaboration
+                        // folder; an ordinary scan root only warns, at save.
+                        let masters =
+                            paths::subject_output_dir(&validated.output, subject, &set_name);
+                        if let Some(message) = paths::project_output_overlap(conn, &masters)? {
+                            blockers.push(PlanBlocker {
+                                code: "folders".to_string(),
+                                message,
+                            });
+                        }
                     }
                 }
                 Err(error) => {
@@ -9739,6 +9750,68 @@ mod tests {
         assert!(plan.blockers[1]
             .message
             .contains("overlaps a monitored folder"));
+    }
+
+    /// Plan 6c D10: a project's masters folder (`<output>/<title>`) inside the
+    /// Collaboration folder, or the output folder equal to it, is a `folders`
+    /// blocker. An output folder outside it, no Collaboration folder at all,
+    /// and an ordinary scan root (a frame set's rule: the Save-time warning)
+    /// block nothing.
+    #[test]
+    fn project_plan_blocks_a_masters_folder_inside_the_collaboration_folder() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let base = crate::test_support::canonical_path(f.dir.path());
+        let (collab, ordinary) = (base.join("collab-root"), base.join("ordinary"));
+        for dir in [&collab, &ordinary] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = |output: &std::path::Path| -> Vec<String> {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                Some(with_folders(&working, output)),
+            )
+            .unwrap()
+            .blockers
+            .into_iter()
+            .filter(|b| b.code == "folders")
+            .map(|b| b.message)
+            .collect()
+        };
+        let sentence = |masters: &std::path::Path| {
+            format!(
+                "The project's masters folder {} is inside the Collaboration folder; choose an output folder outside it",
+                masters.display()
+            )
+        };
+
+        // No Collaboration folder: the output may sit anywhere.
+        assert_eq!(folders(&collab.join("masters")), Vec::<String>::new());
+
+        for (path, kind) in [(&collab, "collaboration"), (&ordinary, "normal")] {
+            f.conn
+                .execute(
+                    "INSERT INTO scan_roots (path, kind) VALUES (?1, ?2)",
+                    rusqlite::params![path.to_str().unwrap(), kind],
+                )
+                .unwrap();
+        }
+        // `insert_test_project` titles the project `p1`: its masters land in
+        // `<output>/p1`.
+        assert_eq!(
+            folders(&collab.join("masters")),
+            vec![sentence(&collab.join("masters").join("p1"))]
+        );
+        assert_eq!(folders(&collab), vec![sentence(&collab.join("p1"))]);
+        assert_eq!(folders(&output), Vec::<String>::new());
+        assert_eq!(
+            folders(&ordinary.join("masters")),
+            Vec::<String>::new(),
+            "an ordinary scan root keeps the frame-set rule"
+        );
     }
 
     /// Plan 6b-2 C10: a project's blockers come in a fixed order.

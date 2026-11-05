@@ -17,7 +17,7 @@ use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
-use crate::stacking::config::OutputFormat;
+use crate::stacking::config::{ExposureMode, OutputFormat};
 use crate::stacking::crop::{crop_file, CropRect};
 use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
 use crate::stacking::groups::ColorMode;
@@ -431,6 +431,47 @@ fn blank(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// What a master's name says about its exposure (plan 6c D9): one value —
+/// the group's own label, or `None` for the group of frames with no
+/// `EXPTIME` — or, for a group whose included frames carry more than one
+/// exposure, the range they span. [`exposure_label`] decides which.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExposureLabel {
+    Single(Option<f64>),
+    Range { min: f64, max: f64 },
+}
+
+/// The [`ExposureLabel`] of a group's master (plan 6c D9). `included` holds
+/// the exposure of every frame the master integrated. A `Range` only when
+/// `mode` lets one class hold several exposures (`stops`, `equivalent`,
+/// `none`) and `included` carries two that print differently — a frame with
+/// no, or a non-finite, exposure never counts. Otherwise the group's own
+/// label, `Single(group_exposure_s)`: in `seconds` mode that is the
+/// cluster's label, so a frame set's names in the default mode do not change.
+pub fn exposure_label(
+    mode: ExposureMode,
+    group_exposure_s: Option<f64>,
+    included: impl IntoIterator<Item = Option<f64>>,
+) -> ExposureLabel {
+    if mode == ExposureMode::Seconds {
+        return ExposureLabel::Single(group_exposure_s);
+    }
+    let known: Vec<f64> = included
+        .into_iter()
+        .flatten()
+        .filter(|e| e.is_finite())
+        .collect();
+    let min = known.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = known.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // Compared as printed: two exposures `fmt_num` writes the same are one
+    // exposure, never a `120-120s`.
+    if !known.is_empty() && fmt_num(min) != fmt_num(max) {
+        ExposureLabel::Range { min, max }
+    } else {
+        ExposureLabel::Single(group_exposure_s)
+    }
+}
+
 /// §9.5 (owner decision 2026-09-10 — groups are camera-agnostic, so the
 /// camera token is gone; fix round 1, ruling — the colour-mode token stays
 /// ALWAYS in the name: with camera gone, a mono and an OSC group of the
@@ -441,11 +482,13 @@ fn blank(s: Option<&str>) -> Option<&str> {
 /// — the SAME sub-second-exposure formatter the calibration library's own
 /// naming and `plan.rs`'s calibration-set label already use (`180s`,
 /// `0.39s`), so a calibration-set label, a group key and a master filename
-/// never format an exposure three different ways. There is no "equal vs
-/// mixed exposure" branch any more: the grouping rule itself already
-/// clustered every frame in `n` to within the group's own exposure
-/// tolerance, so one exposure value (the cluster's label) is always the
-/// honest answer.
+/// never format an exposure three different ways. The grouping rule
+/// clusters every frame in `n` to within the group's own exposure tolerance
+/// in `seconds` mode, so one value (the cluster's label) is the honest
+/// answer there; a `stops`/`equivalent`/`none` class can span several
+/// exposures, and plan 6c D9 has its master say so: an
+/// [`ExposureLabel::Range`] prints `<min>-<max>s`, both ends through
+/// [`fmt_num`] (`120-180s`).
 /// M11 (final fix wave, ruling): `binning` gains a `bin<n>` token ONLY when
 /// `>= 2` — bin-1 names are unchanged (existing masters, including the
 /// acceptance run's, keep their names). Without this token, a bin-1 and a
@@ -458,7 +501,7 @@ pub fn master_file_name(
     filter: Option<&str>,
     color_mode: ColorMode,
     binning: i64,
-    exposure_s: Option<f64>,
+    exposure: ExposureLabel,
     n: usize,
 ) -> String {
     let mut slug = sanitize_for_filename(set_name);
@@ -470,9 +513,10 @@ pub fn master_file_name(
         ColorMode::Mono => "mono",
         ColorMode::Osc => "osc",
     };
-    let exp = match exposure_s {
-        Some(e) => format!("{}s", fmt_num(e)),
-        None => "unknown".to_string(),
+    let exp = match exposure {
+        ExposureLabel::Single(Some(e)) => format!("{}s", fmt_num(e)),
+        ExposureLabel::Single(None) => "unknown".to_string(),
+        ExposureLabel::Range { min, max } => format!("{}-{}s", fmt_num(min), fmt_num(max)),
     };
     if binning >= 2 {
         format!("{slug}_{filter}_{color_tok}_bin{binning}_{exp}_{n}x.fits")
@@ -1307,33 +1351,68 @@ mod tests {
                 Some("NoFilter"),
                 ColorMode::Mono,
                 1,
-                Some(180.0),
+                ExposureLabel::Single(Some(180.0)),
                 208
             ),
             "LDN_1272_NoFilter_mono_180s_208x.fits"
         );
         assert_eq!(
-            master_file_name("M 31", Some("Ha"), ColorMode::Mono, 1, Some(300.0), 3),
+            master_file_name(
+                "M 31",
+                Some("Ha"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(Some(300.0)),
+                3
+            ),
             "M_31_Ha_mono_300s_3x.fits"
         );
         // Sub-second exposure, `fmt_num`'s trimmed-decimal form.
         assert_eq!(
-            master_file_name("a/b:c", Some("L"), ColorMode::Mono, 1, Some(0.5), 2),
+            master_file_name(
+                "a/b:c",
+                Some("L"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(Some(0.5)),
+                2
+            ),
             "a_b_c_L_mono_0.5s_2x.fits"
         );
         // Blank filter falls back to NoFilter; an empty/whitespace set name
         // falls back to "set".
         assert_eq!(
-            master_file_name("M 31", Some("  "), ColorMode::Mono, 1, Some(60.0), 2),
+            master_file_name(
+                "M 31",
+                Some("  "),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(Some(60.0)),
+                2
+            ),
             "M_31_NoFilter_mono_60s_2x.fits"
         );
         assert_eq!(
-            master_file_name("...", Some("L"), ColorMode::Mono, 1, Some(60.0), 1),
+            master_file_name(
+                "...",
+                Some("L"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(Some(60.0)),
+                1
+            ),
             "set_L_mono_60s_1x.fits"
         );
         // No EXPTIME anywhere in the cluster — the "unknown" token.
         assert_eq!(
-            master_file_name("M 31", None, ColorMode::Mono, 1, None, 3),
+            master_file_name(
+                "M 31",
+                None,
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(None),
+                3
+            ),
             "M_31_NoFilter_mono_unknown_3x.fits"
         );
     }
@@ -1343,19 +1422,47 @@ mod tests {
     #[test]
     fn master_name_carries_a_bin_token_only_at_bin_two_and_above() {
         assert_eq!(
-            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 2, Some(180.0), 40),
+            master_file_name(
+                "LDN 1272",
+                Some("Ha"),
+                ColorMode::Mono,
+                2,
+                ExposureLabel::Single(Some(180.0)),
+                40
+            ),
             "LDN_1272_Ha_mono_bin2_180s_40x.fits"
         );
         assert_eq!(
-            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 3, Some(180.0), 40),
+            master_file_name(
+                "LDN 1272",
+                Some("Ha"),
+                ColorMode::Mono,
+                3,
+                ExposureLabel::Single(Some(180.0)),
+                40
+            ),
             "LDN_1272_Ha_mono_bin3_180s_40x.fits"
         );
         assert_eq!(
-            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 1, Some(180.0), 40),
+            master_file_name(
+                "LDN 1272",
+                Some("Ha"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Single(Some(180.0)),
+                40
+            ),
             "LDN_1272_Ha_mono_180s_40x.fits"
         );
         assert_eq!(
-            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 0, Some(180.0), 40),
+            master_file_name(
+                "LDN 1272",
+                Some("Ha"),
+                ColorMode::Mono,
+                0,
+                ExposureLabel::Single(Some(180.0)),
+                40
+            ),
             "LDN_1272_Ha_mono_180s_40x.fits"
         );
     }
@@ -1367,11 +1474,159 @@ mod tests {
     /// names honestly distinct.
     #[test]
     fn mono_and_osc_names_never_collide_on_the_same_filter_and_exposure() {
-        let mono = master_file_name("LDN 1272", None, ColorMode::Mono, 1, Some(180.0), 208);
-        let osc = master_file_name("LDN 1272", None, ColorMode::Osc, 1, Some(180.0), 160);
+        let mono = master_file_name(
+            "LDN 1272",
+            None,
+            ColorMode::Mono,
+            1,
+            ExposureLabel::Single(Some(180.0)),
+            208,
+        );
+        let osc = master_file_name(
+            "LDN 1272",
+            None,
+            ColorMode::Osc,
+            1,
+            ExposureLabel::Single(Some(180.0)),
+            160,
+        );
         assert_eq!(mono, "LDN_1272_NoFilter_mono_180s_208x.fits");
         assert_eq!(osc, "LDN_1272_NoFilter_osc_180s_160x.fits");
         assert_ne!(mono, osc);
+    }
+
+    /// Plan 6c D9: a master built from frames of more than one exposure
+    /// names the range, both numbers through the formatter a single value
+    /// uses.
+    #[test]
+    fn master_name_carries_an_exposure_range() {
+        assert_eq!(
+            master_file_name(
+                "LDN 1272",
+                Some("L"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Range {
+                    min: 120.0,
+                    max: 180.0
+                },
+                57
+            ),
+            "LDN_1272_L_mono_120-180s_57x.fits"
+        );
+        assert_eq!(
+            master_file_name(
+                "LDN 1272",
+                Some("L"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Range { min: 0.5, max: 2.0 },
+                9
+            ),
+            format!("LDN_1272_L_mono_{}-{}s_9x.fits", fmt_num(0.5), fmt_num(2.0))
+        );
+        assert_eq!(
+            master_file_name(
+                "LDN 1272",
+                Some("L"),
+                ColorMode::Mono,
+                1,
+                ExposureLabel::Range { min: 0.5, max: 2.0 },
+                9
+            ),
+            "LDN_1272_L_mono_0.5-2s_9x.fits"
+        );
+        // The bin token still sits before the exposure.
+        assert_eq!(
+            master_file_name(
+                "LDN 1272",
+                Some("L"),
+                ColorMode::Osc,
+                2,
+                ExposureLabel::Range {
+                    min: 60.0,
+                    max: 120.0
+                },
+                4
+            ),
+            "LDN_1272_L_osc_bin2_60-120s_4x.fits"
+        );
+    }
+
+    /// Plan 6c D9: the label is a range only when the mode lets one class
+    /// hold several exposures (`stops`, `equivalent`, `none`) AND the
+    /// included frames really carry more than one of them; `seconds` mode
+    /// keeps the cluster's own label, so a frame set's names do not change.
+    #[test]
+    fn the_exposure_label_is_a_range_only_for_a_mixed_group_outside_seconds_mode() {
+        use crate::stacking::config::ExposureMode;
+        let label = |mode, group: Option<f64>, included: &[Option<f64>]| {
+            exposure_label(mode, group, included.iter().copied())
+        };
+        let mixed = [Some(180.0), Some(120.0), Some(180.0), Some(150.0)];
+        for mode in [
+            ExposureMode::Stops,
+            ExposureMode::Equivalent,
+            ExposureMode::NoSplit,
+        ] {
+            assert_eq!(
+                label(mode, Some(120.0), &mixed),
+                ExposureLabel::Range {
+                    min: 120.0,
+                    max: 180.0
+                },
+                "{mode:?}"
+            );
+            // One exposure among the included frames: the cluster's label.
+            assert_eq!(
+                label(mode, Some(120.0), &[Some(180.0), Some(180.0)]),
+                ExposureLabel::Single(Some(120.0)),
+                "{mode:?}"
+            );
+        }
+        // `seconds` mode never ranges, even over frames a tolerance joined.
+        assert_eq!(
+            label(
+                ExposureMode::Seconds,
+                Some(120.0),
+                &[Some(120.0), Some(121.5)]
+            ),
+            ExposureLabel::Single(Some(120.0))
+        );
+        // Two values that print the same are one exposure.
+        assert_eq!(
+            label(
+                ExposureMode::Stops,
+                Some(120.0),
+                &[Some(120.0), Some(120.004)]
+            ),
+            ExposureLabel::Single(Some(120.0))
+        );
+        // Frames with no exposure (or a non-finite one) never make a range.
+        assert_eq!(
+            label(ExposureMode::NoSplit, None, &[None, None]),
+            ExposureLabel::Single(None)
+        );
+        assert_eq!(
+            label(
+                ExposureMode::Stops,
+                Some(120.0),
+                &[Some(120.0), None, Some(f64::NAN)]
+            ),
+            ExposureLabel::Single(Some(120.0))
+        );
+        assert_eq!(
+            label(
+                ExposureMode::Stops,
+                Some(0.5),
+                &[Some(2.0), None, Some(0.5)]
+            ),
+            ExposureLabel::Range { min: 0.5, max: 2.0 }
+        );
+        assert_eq!(
+            label(ExposureMode::Stops, Some(120.0), &[]),
+            ExposureLabel::Single(Some(120.0))
+        );
     }
 
     #[test]

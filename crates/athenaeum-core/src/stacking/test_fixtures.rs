@@ -1271,9 +1271,11 @@ pub(crate) struct SkyFrame<'a> {
     pub manifest_wcs: bool,
     pub noise_seed: u64,
     pub accepted: bool,
+    /// The file's `EXPTIME` card and the manifest's exposure, in seconds.
+    pub exptime_sec: f64,
 }
 
-/// A mono `L` frame, 384 × 288 at 1.5″/px, with a manifest WCS.
+/// A mono `L` frame, 384 × 288 at 1.5″/px, 300 s, with a manifest WCS.
 pub(crate) fn sky_frame(uuid: &str, centre: (f64, f64)) -> SkyFrame<'_> {
     SkyFrame {
         uuid,
@@ -1288,6 +1290,7 @@ pub(crate) fn sky_frame(uuid: &str, centre: (f64, f64)) -> SkyFrame<'_> {
         manifest_wcs: true,
         noise_seed: uuid.bytes().map(u64::from).sum(),
         accepted: true,
+        exptime_sec: 300.0,
     }
 }
 
@@ -1395,7 +1398,7 @@ pub(crate) fn render_sky_frame(
     let cards = vec![
         Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
         Card::new("FILTER", CardValue::Str(f.filter.to_string())).unwrap(),
-        Card::new("EXPTIME", CardValue::Real(300.0)).unwrap(),
+        Card::new("EXPTIME", CardValue::Real(f.exptime_sec)).unwrap(),
         Card::new("DATE-OBS", CardValue::Str("2026-01-10T21:00:00".into())).unwrap(),
         Card::new("INSTRUME", CardValue::Str("cam".into())).unwrap(),
         Card::new("ROWORDER", CardValue::Str(FIXTURE_ROW_ORDER.into())).unwrap(),
@@ -1458,7 +1461,7 @@ pub(crate) fn add_project_sky_frame(
             uuid: f.uuid,
             publisher: f.publisher,
             filter: f.filter,
-            exptime_sec: 300.0,
+            exptime_sec: f.exptime_sec,
             date_obs: "2026-01-10T21:00:00",
             file_name: &r.file_name,
             meta: r.meta.clone(),

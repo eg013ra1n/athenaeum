@@ -53,7 +53,7 @@ use athenaeum_core::stacking::integrate::{
     RejectionChoice, StackFrame,
 };
 use athenaeum_core::stacking::master_cards::{
-    build_master_light_cards, master_file_name, write_master_light, MasterCardInputs,
+    build_master_light_cards, master_file_name, write_master_light, ExposureLabel, MasterCardInputs,
 };
 use athenaeum_core::stacking::measure::{
     measure_frame_with_seeds, measure_plane, measure_plane_with_seeds, MeasureOptions, NoiseSource,
@@ -1067,7 +1067,7 @@ fn main() {
         // M11 (final fix wave): this probe has no real binning input of its
         // own — 1 keeps the pre-M11 filename shape (no `bin<n>` token).
         1,
-        included_exposures.first().copied(),
+        ExposureLabel::Single(included_exposures.first().copied()),
         stats.included,
     );
 
