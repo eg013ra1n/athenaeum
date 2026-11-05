@@ -62,13 +62,15 @@ The `projectionRatio` half of P1 and P2 predate #19; #19 added the pixel-ratio r
 
 One routine, `projectFootprint`, used for every redraw:
 
-| Hidden | When | Hint for the selected target |
-| ---- | ---- | ---- |
-| `clip` | every corner beyond the visible hemisphere, or a corner does not project | pan toward it |
-| `span` | the box is wider or taller than half the canvas | zoom out |
-| `distortion` | projected aspect off by more than 3× from the true one | pan toward it |
+| Hidden | When |
+| ---- | ---- |
+| `clip` | every corner beyond the visible hemisphere, or a corner does not project |
+| `span` | the box is wider or taller than half the canvas |
+| `distortion` | projected aspect off by more than 3× from the true one |
 
 A box with only some corners beyond the hemisphere is drawn; the globe clip path trims it.
+
+**No hint for a hidden box (owner ruling 2026-11-05).** The chart used to show a line under the toolbar saying why the box of the target chosen in Jump to was not drawn. It was removed: Jump to always frames the box at 4× its size, so the line only appeared after the user zoomed in or moved away, and after a move it blamed `span` on a box that was simply off screen (the visible hemisphere is not the screen, and the stereographic projection enlarges a box up to 2× toward its edge). A hidden box now just is not drawn.
 
 **Rotation convention (fixed 2026-10-26).** `frames.rotation` is CROTA2, or the plate solve's `field_rotation_deg` = atan2(−CD1_2, CD2_2). In that convention the image's +Y axis points at position angle **−rotation** (north through east), because the +Y column of the CD matrix is (CD1_2, CD2_2) in (east, north). Until this fix the box applied +rotation, a mirrored tilt: wrong by 2 × (rotation mod 90°), e.g. 27° for M 31 at 283.5°. It became visible once the DSS background showed the real sky under the box. Mirroring (det CD > 0) does not change a rectangle, only the +Y direction matters. Pinned by `footprint.test.ts`.
 

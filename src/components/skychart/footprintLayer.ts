@@ -17,8 +17,6 @@ import {
 export interface FootprintHandlers {
   /** Double-click on a footprint that belongs to a frame set. */
   openFrameSet: (frameSetId: number) => void;
-  /** The selected target's visibility after a redraw (null = drawn). */
-  onSelectedHidden: (hidden: FootprintHidden) => void;
 }
 
 interface FootprintDatum {
@@ -43,19 +41,10 @@ const LABEL_PAD_Y = 3;
 const LABEL_OFFSET_Y = 4; // gap above the FOV box
 
 let handlers: FootprintHandlers | null = null;
-let selectedId: number | null = null;
-let lastSelectedHidden: FootprintHidden | undefined;
 let unsubscribe: (() => void) | null = null;
 
 export function setFootprintHandlers(h: FootprintHandlers | null): void {
   handlers = h;
-  lastSelectedHidden = undefined;
-}
-
-export function setSelectedFootprint(id: number | null): void {
-  selectedId = id;
-  lastSelectedHidden = undefined;
-  redrawFootprints();
 }
 
 function markerColor(loc: ImagingLocation): string {
@@ -266,7 +255,6 @@ export function setFootprints(locations: ImagingLocation[]): void {
       g.append('title').text(tooltip(d.loc, !!d.corners));
     });
 
-  lastSelectedHidden = undefined;
   redrawFootprints();
 }
 
@@ -290,7 +278,6 @@ export function redrawFootprints(): void {
   const canvas = chartSize();
   const project = (p: LonLat) => projection(p) as Point | null;
   const isVisible = (p: LonLat) => !!C.clip(p);
-  let selectedHidden: FootprintHidden | undefined;
 
   const boxes = svg.selectAll('.fov-box');
   boxes.each(function (this: SVGGElement, d: FootprintDatum) {
@@ -310,16 +297,7 @@ export function redrawFootprints(): void {
       if (!d.hidden) this.querySelector('.imaging-marker')?.setAttribute('transform', `translate(${p![0]},${p![1]})`);
     }
     show(this, d, d.hidden === null);
-    if (selectedId != null && d.loc.id === selectedId) {
-      // Several footprints can share an id across location types; any drawn one counts.
-      selectedHidden = selectedHidden === null ? null : d.hidden;
-    }
   });
-
-  if (selectedId != null && selectedHidden !== undefined && selectedHidden !== lastSelectedHidden) {
-    lastSelectedHidden = selectedHidden;
-    handlers?.onSelectedHidden(selectedHidden);
-  }
 
   placeLabels(boxes);
 }

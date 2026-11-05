@@ -16,22 +16,13 @@ import {
   STAR_LIMIT_SETTING_KEY, applyView, attachChart, celestialAvailable, currentStarLimit,
   detachChart, displayChart, isChartDisplayed, loadChartPrefs, resizeChart, setStarLimit as setChartStarLimit,
 } from '../components/skychart/celestialHost';
-import {
-  setFootprintHandlers, setFootprints, setSelectedFootprint,
-} from '../components/skychart/footprintLayer';
-import { FootprintHidden } from '../components/skychart/footprint';
+import { setFootprintHandlers, setFootprints } from '../components/skychart/footprintLayer';
 import { defaultView, parseSkyView, parseViewParams } from '../components/skychart/skyView';
 import '../styles/celestial-overrides.css';
 
 /** Jump to target frames the footprint's larger side this many times over. */
 const JUMP_FOV_FACTOR = 4;
 const VIEW_PARAMS = ['ra', 'dec', 'fov'];
-
-const HIDDEN_HINT: Record<Exclude<FootprintHidden, null>, string> = {
-  span: 'FOV overlay hidden at this zoom — zoom out to see it.',
-  distortion: 'FOV overlay hidden near the chart edge — pan toward it to see it.',
-  clip: 'FOV overlay is on the far side of the sky — pan toward it to see it.',
-};
 
 export default function SkyChart() {
   // The slot the persistent chart host is attached to; the chart itself
@@ -43,7 +34,6 @@ export default function SkyChart() {
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [selectedTarget, setSelectedTarget] = useState<string>('');
-  const [selectedHidden, setSelectedHidden] = useState<FootprintHidden>(null);
 
   // Selection state
   const [drawingMode, setDrawingMode] = useState<DrawingMode>('none');
@@ -154,12 +144,8 @@ export default function SkyChart() {
   useEffect(() => {
     setFootprintHandlers({
       openFrameSet: (id) => navigate(`/objects/${id}`),
-      onSelectedHidden: setSelectedHidden,
     });
-    return () => {
-      setFootprintHandlers(null);
-      setSelectedFootprint(null);
-    };
+    return () => setFootprintHandlers(null);
   }, [navigate]);
 
   useEffect(() => () => window.clearTimeout(emptySelectionTimerRef.current), []);
@@ -214,11 +200,6 @@ export default function SkyChart() {
       setSelectedTarget('');
     }
   }, [locations, selectedTarget]);
-
-  useEffect(() => {
-    setSelectedHidden(null);
-    if (mapReady) setSelectedFootprint(selectedTarget ? Number(selectedTarget) : null);
-  }, [selectedTarget, mapReady]);
 
   // Center on a target; with a field of view, frame it the same way at any window width.
   const handleTargetCenter = useCallback((targetId: string) => {
@@ -460,13 +441,6 @@ export default function SkyChart() {
             </div>
           </div>
         )}
-        {/* Why the selected target's FOV box is not drawn. */}
-        {selectedTarget && selectedHidden && (
-          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 bg-warning-muted border border-warning/50 text-warning text-xs px-3 py-1.5 rounded shadow">
-            {HIDDEN_HINT[selectedHidden]}
-          </div>
-        )}
-
         {/* Spinner while the backend query for a rectangle selection is in flight. */}
         {isQueryingSelection && (
           <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 bg-surface-elevated border border-border text-content-secondary text-xs px-3 py-1.5 rounded shadow flex items-center gap-2">
