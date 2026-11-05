@@ -85,17 +85,27 @@ pub fn grid_wcs(grid: &CanonicalGrid) -> WcsSolution {
 }
 
 /// A frame's outline: corners plus eight points per edge (SIP and the
-/// TAN-to-TAN mapping curve the edges slightly), at the pixel extents.
+/// TAN-to-TAN mapping curve the edges slightly), at the pixel extents, in
+/// perimeter order, clockwise in pixel space (y down): the top edge from the
+/// top-left corner, then the right, bottom and left edges, each edge starting
+/// at its own first corner, so a polygon through the points in list order
+/// follows the frame's border.
 pub(crate) fn boundary_points(w: f64, h: f64) -> Vec<(f64, f64)> {
     const STEPS: usize = 8;
     let (x0, x1, y0, y1) = (-0.5, w - 0.5, -0.5, h - 0.5);
+    let t = |k: usize| k as f64 / STEPS as f64;
     let mut pts = Vec::with_capacity(4 * STEPS);
     for k in 0..STEPS {
-        let t = k as f64 / STEPS as f64;
-        pts.push((x0 + t * (x1 - x0), y0));
-        pts.push((x1, y0 + t * (y1 - y0)));
-        pts.push((x1 - t * (x1 - x0), y1));
-        pts.push((x0, y1 - t * (y1 - y0)));
+        pts.push((x0 + t(k) * (x1 - x0), y0));
+    }
+    for k in 0..STEPS {
+        pts.push((x1, y0 + t(k) * (y1 - y0)));
+    }
+    for k in 0..STEPS {
+        pts.push((x1 - t(k) * (x1 - x0), y1));
+    }
+    for k in 0..STEPS {
+        pts.push((x0, y1 - t(k) * (y1 - y0)));
     }
     pts
 }
@@ -428,12 +438,36 @@ mod tests {
         }
     }
 
+    /// The outline is a closed walk along the frame's border (a client draws it as a polygon in list order):
+    /// it starts at the top-left corner, runs the top edge first, and every step, the last one back to the
+    /// start included, moves along one axis by one eighth of that axis.
+    #[test]
+    fn boundary_points_run_along_the_perimeter() {
+        let (w, h) = (100.0, 80.0);
+        let pts = boundary_points(w, h);
+        assert_eq!(pts.len(), 32);
+        assert_eq!(pts[0], (-0.5, -0.5));
+        assert!((pts[1].0 - (-0.5 + w / 8.0)).abs() < 1e-12 && pts[1].1 == -0.5);
+        assert!((pts[8].0 - (w - 0.5)).abs() < 1e-12 && pts[8].1 == -0.5);
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
+            let along_x = dy < 1e-12 && (dx - w / 8.0).abs() < 1e-12;
+            let along_y = dx < 1e-12 && (dy - h / 8.0).abs() < 1e-12;
+            assert!(
+                along_x || along_y,
+                "step {i} -> {} jumps: {a:?} -> {b:?}",
+                (i + 1) % pts.len()
+            );
+        }
+    }
+
     /// The projection every grid-drawing client repeats (plan 6c Task 7's TS asserts these numbers to
     /// 1e-6 px): four sky points in front of the tangent plane (the grid centre, 0.5 deg east, 0.5 deg
     /// north, one near the south-east pixel corner) projected to 0-based grid pixels with [`grid_wcs`], for a
     /// grid at rotation 0 and one at 30 degrees.
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct GoldenPoint {
         ra_deg: f64,
         dec_deg: f64,
@@ -442,12 +476,14 @@ mod tests {
     }
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct GoldenGrid {
         grid: CanonicalGrid,
         points: Vec<GoldenPoint>,
     }
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Golden {
         grids: Vec<GoldenGrid>,
     }

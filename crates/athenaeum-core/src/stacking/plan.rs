@@ -248,8 +248,11 @@ pub enum GridState {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanGridTarget {
+    // Right ascension of the target centre, degrees.
     pub ra_deg: f64,
+    // Declination of the target centre, degrees.
     pub dec_deg: f64,
+    // Radius of the target circle, degrees.
     pub radius_deg: f64,
 }
 
@@ -257,12 +260,17 @@ pub struct PlanGridTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanGridFootprint {
+    // The frame's uuid in the project's manifest.
     pub frame_uuid: String,
+    // The publisher's account id: the key a client colours the outline by.
     pub publisher_account_id: String,
+    // The publisher's display name, for a label; never a colour key.
     pub publisher: String,
+    // The frame's canonical filter name.
     pub filter_canonical: String,
     // `[raDeg, decDeg]` of the frame's pixel edges (eight points per edge, corners included) through its
-    // manifest WCS, SIP included.
+    // manifest WCS, SIP included: RA/Dec degrees, RA in 0-360, perimeter order; project each point, never
+    // interpolate in RA (an outline can straddle RA 0/360).
     pub outline: Vec<[f64; 2]>,
 }
 
@@ -282,8 +290,8 @@ pub struct PlanGrid {
     // The outline of every published, accepted frame of the project that has a manifest WCS and a pixel
     // size, on this device or not, so every member sees the same picture.
     pub footprints: Vec<PlanGridFootprint>,
-    // The published, accepted frames with no outline: no manifest WCS, no pixel size, or unreadable
-    // metadata.
+    // The published, accepted frames with no outline: no manifest WCS, no pixel size, unreadable
+    // metadata, or a WCS whose edges do not project to finite sky points.
     pub frames_not_drawn: u32,
 }
 
@@ -10304,6 +10312,16 @@ mod tests {
             )
             .unwrap();
 
+        // `insert_test_project` seeds the target of M42, which is frame `a`'s centre: move it away from
+        // every frame's centre so the test tells the target from a frame.
+        f.conn
+            .execute(
+                "UPDATE collab_projects SET target_ra_deg = 84.6, target_dec_deg = -4.9,
+                   target_radius_deg = 0.75 WHERE project_id = 'p1'",
+                [],
+            )
+            .unwrap();
+
         let plan = project_plan_of(&f, None);
         let grid = plan.grid.as_ref().expect("a project plan has a grid");
         assert_eq!(grid.frames_not_drawn, 1, "only `c` has no WCS");
@@ -10334,14 +10352,14 @@ mod tests {
             ),
             ("bob", "bob", "R")
         );
-        // `insert_test_project` seeds the target of M42.
+        // The target is the project row's circle, not a frame centre.
         assert_eq!(
             (
                 grid.target.ra_deg,
                 grid.target.dec_deg,
                 grid.target.radius_deg
             ),
-            (83.8, -5.4, 1.0)
+            (84.6, -4.9, 0.75)
         );
         // The outline is the pixel-edge boundary through the frame's own WCS: each point inverts back
         // to its edge point.
