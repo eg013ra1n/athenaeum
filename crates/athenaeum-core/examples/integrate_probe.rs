@@ -396,6 +396,8 @@ fn full_seed_positions(
         .with_max_stars(opts.max_stars)
         .with_measure_cap(0)
         .with_thread_pool(Arc::clone(pool));
+    // D-6: the legacy analyzer is removed at rustafits 2.0, with `SeedOverride::Full` and the lab's `legacy-analysis` arm.
+    #[allow(deprecated)]
     let (seeds, detected, measured) = match analyzer.analyze_data(scaled, w, h, 1) {
         Ok(r) => (
             r.stars

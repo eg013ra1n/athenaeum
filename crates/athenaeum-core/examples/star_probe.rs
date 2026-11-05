@@ -1035,6 +1035,8 @@ fn legacy_analyze(path: &str) -> Result<(FrameAnalysis, Vec<StarMetric>, bool), 
         .with_fit_max_rejects(5usize);
     let (meta, pixels) = ImageConverter::read_raw(path).map_err(|e| format!("{e:#}"))?;
     let flip_vertical = meta.flip_vertical;
+    // D-6: the legacy analyzer is removed at rustafits 2.0, with `SeedOverride::Full` and the lab's `legacy-analysis` arm.
+    #[allow(deprecated)]
     let result = analyzer
         .analyze_raw(&meta, &pixels)
         .map_err(|e| format!("{e:#}"))?;

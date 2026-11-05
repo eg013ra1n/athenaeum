@@ -2345,15 +2345,6 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 
 - **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
 
-### The FITS reader ignores a quoted `XBAYROFF= '1'` (phase-4 review, 2026-11-05; for phase 5)
-
-- **rustafits' FITS reader reads an integer written as a quoted FITS string as 0.** Its `parse_int_keyword` (`src/formats/fits.rs`) takes the integer prefix of the value text, so `XBAYROFF= '1'` folds as 0;
-  Athenaeum's catalog parser reads the same card as 1 (`fits_parser/mod.rs`, `quoted_int_bayer_offsets_are_parsed`, "the riskiest cross-software variant"), and so does the XISF reader since phase 4 (it
-  reads Athenaeum's header-value rules, R-P4-C1). The FITS reader also keeps the last card of a repeated keyword and matches the name case-sensitively, where the XISF rule takes the first non-empty value
-  and ignores case. Found by the review of phase-4 tasks T1+T2; pre-existing, not introduced by phase 4, and the Analysis tab is unchanged by it (before phase 4 the same reader folded FITS). Cost if ignored:
-  a FITS mosaic whose writer quotes its offsets renders (and is detected by solvemyastro) with the unfolded pattern while the catalog says the folded one. Fix is its own cycle in phase 5: decide whether the
-  FITS reader adopts the ported rule; it moves renders and Analysis rows of such files, so it needs its own gates and the owner's word.
-
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 
 - **`reconcile_frame_set_nights` "database is locked" ERRORs during Analysis batches.** Two were logged in the C9 dev run, both while an Analysis batch persisted rows: a pre-existing

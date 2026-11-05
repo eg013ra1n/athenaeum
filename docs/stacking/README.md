@@ -4743,6 +4743,24 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       (star count, median FWHM, eccentricity, frame SNR, verdict, refused; every star's x, y, fwhm, ecc, snr, hfr). An unreadable header gets
       no catalog row, so its "Failed to read header" text shows only through `star_probe`. The on-screen look (the tab, the overlay) stays
       in `open-items.md`.
+  - **R-OSP-19, phase 5 - rustafits 1.8.0: the CLI on the Analysis path, the overlay API, the FITS offset rule, the deprecation (owner 2026-11-05; items 5.1-5.4 of the port plan, detailed in rustafits `docs/superpowers/plans/2026-11-05-star-measure-port-phase-5.md`; Athenaeum branch `star-measure-port-phase-5`).**
+    - *What changed for Athenaeum.* Nothing it measures: `MEASURE_VERSION` stays 8, `config_hash` is unchanged, and the port digest is
+      identical (`a07688d0…`). The changes are in rustafits 1.8.0 and reach this repository only through the pin (the tag `v1.8.0`, a commit on
+      rustafits `main`, D-10).
+    - *The overlay API.* rustafits 1.8.0 draws star ellipses from a `StarOverlay` (position and shape of each star, plus the frame's median FWHM),
+      which `rustafits analyze` and `convert --annotate` now fill from the Analysis-mode measurement. Athenaeum does not use it: Blink draws its own
+      ellipses on a canvas from the Analysis star rows.
+    - *The FITS offset rule.* The rustafits FITS reader now reads `XBAYROFF` / `YBAYROFF` by the catalog's rule (`stored_keys::FitsHeader::get_i32`:
+      the first value of a repeated card, any letter case, a quoted `'1'` as 1). Before, it took the integer prefix of the value text, so a quoted
+      `XBAYROFF= '1'` folded as 0 and the file rendered, was plate-solved and was measured on a different Bayer cell than the one the catalog
+      records. Now all of them use the catalog's cell. Only such a file moves, and a stored Analysis row of it stays until it is re-analyzed. The
+      star-test corpus has no such file (header scan of its 147 FITS), so no corpus number moves.
+    - *The deprecation.* `ImageAnalyzer::analyze*` is deprecated in rustafits 1.8.0 and goes in 2.0, together with `SeedOverride::Full` and the
+      lab's `legacy-analysis` arm (D-6). Athenaeum has three callers, each now under an item- or statement-level `#[allow(deprecated)]` with a
+      comment naming D-6: the `Detector::Full` arm of `stacking/measure.rs` (`SeedOverride::Full`), `examples/star_probe.rs` (`legacy_analyze`) and
+      `examples/integrate_probe.rs` (`full_seed_positions`). `cargo build --all-targets` of `athenaeum-core`, `athenaeum-tauri` and `athenaeum-web`
+      prints no `use of deprecated`. No other code changed.
+    - *Gates.* G5-d / G5-e: OWED (controller).
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
