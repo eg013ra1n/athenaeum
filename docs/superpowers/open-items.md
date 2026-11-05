@@ -384,9 +384,9 @@ corpus arm and the positive control of the fold are the controller's gates and a
   (always fold, 2026-11-04: R-P4-4 / R-P4-5), while its Analysis row is unchanged. Record what such a writer produces: its `BAYERPAT` / `XBAYROFF` / `YBAYROFF` keywords, the `<ColorFilterArray>` pattern, the
   preview before and after. If a real writer turns up that does this, that record is the evidence for the phase-5 idea (the `<ColorFilterArray>` element taking precedence over the `BAYERPAT` keyword, which
   would move the Analysis rows and renders of such files and so needs its own gates and the owner's word). Delete this line once the record is in the cycle's doc.
-- **App smoke, G-1h** (`npm run tauri dev`, the real dev DB, about 5 minutes): the Analysis tab on one FITS and one XISF frame (the row appears; its figures are those of `main`), Blink's star overlay on one
-  frame, and the new error text of an unreadable header on a truncated copy of one FITS (`ImageConverter::read_header`'s `Failed to read header` context now comes before the cause in the tab's
-  `"{path}: {error}"`). The controller notes the result in R-OSP-19 and deletes this line.
+- **App smoke, G-1h, the screen half** (`npm run tauri dev`, the real dev DB, about 5 minutes): the Analysis tab on one FITS and one XISF frame shows its row, and Blink draws its star
+  overlay. The headless half passed on 2026-11-05 (R-OSP-19, phase 4: the commands' rows and the overlay's 500 stars equal `star_probe` bit for bit, a truncated frame gives an error, not
+  zeros). Delete this line once someone has looked.
 
 ### The robust quad seed and the coverage gate (2026-11-03)
 

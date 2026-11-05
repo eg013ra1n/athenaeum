@@ -4711,7 +4711,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       `484361ac`, the commit the gates below ran on. The squash-merge re-pin is still to come (R-P4-7: `git diff --stat <old> <new>` empty each
       time). Final pin: **OWED** (controller, after the merges).
     - *Gates* (controller, dev Mac aarch64; bars from plan section 4; before = `main` e6344ddd, after = `484361ac`, rustafits `9c5e75d`). **Every
-      fixed-bar gate passes; G-1h is OWED.** Round 1 stopped at G-1b: a shared cargo target made the after side reuse the before side's rustafits,
+      fixed-bar gate passes; G-1h passes headless (the on-screen look is owed).** Round 1 stopped at G-1b: a shared cargo target made the after side reuse the before side's rustafits,
       so `smport.sh` now builds one target per side (lab 469cc89); round 2 re-ran from G-1b on with one target per side.
       - G-1a suites, exact aarch64 pins (`mac_check.sh`, `MAC_CHECK_MAIN=e6344ddd`, `MAC_CHECK_BRANCH=star-measure-port-phase-4`): the digest is
         byte-identical, `a07688d0…`, the same as in phase 3; rustafits `--features serde` 581 / 0 / 3; core all targets 4549 / 0 / 15
@@ -4734,7 +4734,15 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       - Results folders in athenaeum-lab: `star-lab/results/star-measure-port/phase-4/` and `phase-4-fold/`; lab commits 9264396 and 9977f31, pushed.
     - *App smoke G-1h (the wiring, which no number above exercises).* About 5 minutes of `npm run tauri dev` on the real dev DB, on the phase-4
       branch: the Analysis tab on one FITS and one XISF frame (the row appears, the figures are `main`'s), Blink's star overlay on one frame, and the
-      new error text of an unreadable header on a truncated copy of one FITS. Result: **OWED**; it is also listed in `open-items.md`.
+      new error text of an unreadable header on a truncated copy of one FITS. Result (2026-11-05, owner: «Смоук без экрана»): **PASS headless.**
+      The real `athenaeum-web` (release, f5d62554, rustafits cc8c88f) on a sandbox catalog of copies: the scan filed 5 lights (the
+      XISF singles without `IMAGETYP` are not lights, so only `test.xisf` reached `analyze_frame_set`); `analyze_frame_set` gave one row
+      per good frame (3 m42 + `test.xisf`, `measure_version` 8) and an error for the truncated copy (`… Failed to read image: Failed to read
+      FITS data: failed to fill whole buffer`; log `raw frame read failed` with `path`); `get_frame_star_metrics` (Blink's overlay) returned
+      500 stars for an m42 frame and for `test.xisf`. The rows equal `star_probe --paths analysis-mode` on the same copies bit for bit
+      (star count, median FWHM, eccentricity, frame SNR, verdict, refused; every star's x, y, fwhm, ecc, snr, hfr). An unreadable header gets
+      no catalog row, so its "Failed to read header" text shows only through `star_probe`. The on-screen look (the tab, the overlay) stays
+      in `open-items.md`.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
