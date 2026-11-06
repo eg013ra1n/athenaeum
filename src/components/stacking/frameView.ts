@@ -1,4 +1,5 @@
 import { autoOutlierLimit } from '../analysis/outlierLimit';
+import type { PlanGroup } from '../../types/stacking';
 import type { FrameRow, OutcomeKind } from './frameRows';
 
 /** How the Frames table groups its rows (spec §6.6). */
@@ -94,6 +95,17 @@ export function formatNightLabel(startIso: string, endIso: string): string {
   if (a.y === b.y && a.m === b.m && a.d === b.d) return `${day(a)}, ${a.y}`;
   if (a.y === b.y && a.m === b.m) return `${day(a)}–${b.d}, ${a.y}`;
   return `${day(a)} – ${day(b)}, ${b.y}`;
+}
+
+/** A plan group's title: filter, exposure class and colour mode (`L · 180s · mono`), plus the binning when it is not
+ *  1 (it is part of the key); the raw key when the plan does not list the group. One spelling for the reference
+ *  strip, the group headers and Blink. */
+export function planGroupTitle(planGroups: PlanGroup[], key: string): string {
+  const group = planGroups.find((g) => g.key === key);
+  if (!group) return key;
+  const parts = [group.filter ?? 'No filter', group.exposureClass, group.colorMode];
+  if (group.binning !== 1) parts.push(`bin${group.binning}`);
+  return parts.join(' · ');
 }
 
 /** Whether an outcome counts as part of the stack: the run's reference is integrated like any included frame. */
@@ -234,7 +246,7 @@ function headerInfo(rows: FrameRow[]): GroupHeaderInfo {
       if (reason != null) reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
     }
   }
-  // The first reason to reach the highest count wins a tie: Map keeps first-appearance order and `>` is strict.
+  // On a tie the reason that appears first in `all` wins: the Map keeps first-appearance order and `>` is strict.
   let topReason: string | null = null;
   let topCount = 0;
   for (const [reason, count] of reasons) {

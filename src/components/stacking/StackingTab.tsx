@@ -61,6 +61,10 @@ interface PendingWrite {
 const NO_LIGHT_FRAMES: LightFrameRef[] = [];
 const NO_FRAME_IDS: number[] = [];
 const NO_PROJECT_FRAMES: PlanProjectFrame[] = [];
+// Until the plan names each group's members (Task 9) no frame without a run row has a planned group.
+const NO_PLAN_GROUPS = new Map<number, string>();
+// The Frames table's Blink opens nothing until `StackingBlink` is wired (Task 7).
+const NO_BLINK = () => {};
 
 /** D7: the live feed's events for a project re-plan it at most this often. */
 const PLAN_FEED_REFRESH_MS = 1000;
@@ -215,8 +219,8 @@ export function StackingTab({ subject }: StackingTabProps) {
   /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's
    *  frame-level write (the pin below is the other). The load effect calls
    *  `setExcluded` directly (bypassing this), so opening a subject never
-   *  marks the draft dirty on its own; only the Frames table's include
-   *  checkbox, through `handleToggleExcludeFrame` below, goes through here. */
+   *  marks the draft dirty on its own; only the Frames table's Exclude and
+   *  Include, through `handleSetExcluded` below, go through here. */
   const setUserExcluded = useCallback<typeof setExcluded>((value) => {
     dirtyRef.current = true;
     storedRowDirtyRef.current = true;
@@ -233,9 +237,12 @@ export function StackingTab({ subject }: StackingTabProps) {
 
   // The Frames table speaks exclusion keys: `String(frameId)` for a set, the
   // frame uuid for a project — the same strings `SubjectConfig.excluded`
-  // holds, so one toggle serves both.
-  const handleToggleExcludeFrame = useCallback((key: string) => {
-    setUserExcluded((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  // holds, so one write serves both. Exclude adds the keys the list lacks,
+  // Include removes them.
+  const handleSetExcluded = useCallback((keys: string[], exclude: boolean) => {
+    setUserExcluded((prev) =>
+      exclude ? [...prev, ...keys.filter((k) => !prev.includes(k))] : prev.filter((k) => !keys.includes(k)),
+    );
   }, [setUserExcluded]);
   const excludedFrameIds = useMemo(
     () => (subject.kind === 'frameSet' ? excluded.map(Number) : NO_FRAME_IDS),
@@ -1277,10 +1284,15 @@ export function StackingTab({ subject }: StackingTabProps) {
         lightFrames={lightFrames}
         projectFrames={subject.kind === 'project' ? plan.projectFrames : NO_PROJECT_FRAMES}
         runDetail={selectedRunDetail}
+        planGroups={plan.groups}
+        planReference={plan.reference}
         excludedKeys={excluded}
         referenceFrameUuid={pinnedReference}
-        onToggleExclude={handleToggleExcludeFrame}
+        pinnedFrameId={null}
+        planGroupByFrameId={NO_PLAN_GROUPS}
+        onSetExcluded={handleSetExcluded}
         onPin={handlePinReference}
+        onBlink={NO_BLINK}
         collapsed={framesCollapsed}
         onToggleCollapsed={handleToggleFramesCollapsed}
         disabled={running}

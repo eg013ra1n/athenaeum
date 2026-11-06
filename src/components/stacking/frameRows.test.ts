@@ -8,61 +8,14 @@ import {
   type FrameRow,
   type LightFrameRef,
   type RowContext,
-  type RunFrameData,
 } from './frameRows';
-import type {
-  PlanProjectFrame,
-  RunSummary,
-  StackingRunDetail,
-  StackingRunFrameRow,
-  SummaryFrame,
-} from '../../types/stacking';
-
-const CANNOT_OPEN = 'cannot be opened (offline, moved or renamed)';
+import type { PlanProjectFrame } from '../../types/stacking';
+import { CANNOT_OPEN, PLAN_FRAMES, detailOf, pf, runRow, summaryFrame } from './testFixtures';
 
 const ctxOf = (over: Partial<RowContext> = {}): RowContext => ({
   planGroupByFrameId: new Map(),
   pinnedFrameId: null,
   ...over,
-});
-
-const pf = (over: Partial<PlanProjectFrame> = {}): PlanProjectFrame => ({
-  handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300,
-  colorMode: 'mono', hasWcs: true, onDisk: true, reason: null, ...over,
-});
-
-/** Five plan rows: usable with a WCS (u1), not on this device (u2), unsupported (u3), usable without a WCS (u4), and
- *  landed but not openable (u5: `onDisk` true AND a reason). */
-const PLAN_FRAMES: PlanProjectFrame[] = [
-  pf({ handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice' }),
-  pf({ handle: null, frameUuid: 'u2', fileName: 'b.fits', publisher: 'Bob', onDisk: false, reason: 'not on this device' }),
-  pf({ handle: 3, frameUuid: 'u3', fileName: 'c.fits', publisher: 'Alice', reason: 'unsupported file: 8-bit JPEG' }),
-  pf({ handle: 4, frameUuid: 'u4', fileName: 'd.fits', publisher: 'Cleo', hasWcs: false }),
-  pf({ handle: 5, frameUuid: 'u5', fileName: 'e.fits', publisher: 'Bob', reason: CANNOT_OPEN }),
-];
-
-const runRow = (over: Partial<StackingRunFrameRow>): StackingRunFrameRow => ({
-  id: 1, runId: 5, groupId: 10, frameId: 7, included: true, exclusionReason: null, weight: 0.8,
-  weightChannelsJson: null, metricsJson: null, regStatus: 'ok', regModel: 'homography', regRmsPx: 0.2, regInliers: 90,
-  regInlierRatio: 0.9, regFlipped: false, rejectedFraction: null, frameUuid: null, ...over,
-});
-
-const summaryFrame = (over: Partial<SummaryFrame>): SummaryFrame =>
-  ({
-    frameId: 7, filename: 'from-summary.fits', included: true, exclusionReason: null, weight: 0.75, weightChannels: [],
-    fwhmPx: 2.5, eccentricity: 0.2, stars: 120, regStatus: 'ok', regModel: 'homography', regRmsPx: 0.3, regInliers: 88,
-    lnScale: null, ...over,
-  }) as unknown as SummaryFrame;
-
-const detailOf = (
-  frames: StackingRunFrameRow[],
-  summaryFrames: SummaryFrame[] | null,
-  run: RunFrameData['run'] = { id: 5, referenceMode: 'auto' },
-) => ({
-  run,
-  groups: [{ id: 10, groupKey: 'L-mono' }] as unknown as StackingRunDetail['groups'],
-  frames,
-  summary: summaryFrames && ({ groups: [{ frames: summaryFrames }] } as unknown as RunSummary),
 });
 
 const build = (

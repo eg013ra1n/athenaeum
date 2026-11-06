@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import type { FrameRow, Outcome, OutcomeKind } from './frameRows';
+import type { PlanGroup } from '../../types/stacking';
 import {
   computeOutliers,
   filterRows,
   formatNightLabel,
   groupRows,
   matchesStatus,
+  planGroupTitle,
   statusCounts,
   type FilterState,
   type GroupContext,
@@ -388,5 +390,21 @@ describe('groupRows', () => {
     const r1 = row('included', { groupKey: 'L', filename: 'b' });
     const r2 = row('included', { groupKey: 'L', filename: 'a' });
     expect(groupRows([r2, r1], [r1, r2], 'group', CTX)[0]!.rows).toEqual([r2, r1]);
+  });
+});
+
+describe('planGroupTitle', () => {
+  const group = (over: Partial<PlanGroup>): PlanGroup =>
+    ({ key: 'mono__L__bin1__180s', filter: 'L', exposureClass: '180s', colorMode: 'mono', binning: 1, ...over }) as PlanGroup;
+
+  it('plan_group_title_names_filter_exposure_and_colour', () => {
+    expect(planGroupTitle([group({})], 'mono__L__bin1__180s')).toBe('L · 180s · mono');
+    expect(planGroupTitle([group({ key: 'k', filter: null, binning: 2, colorMode: 'osc' })], 'k')).toBe(
+      'No filter · 180s · osc · bin2',
+    );
+  });
+
+  it('plan_group_title_falls_back_to_the_key', () => {
+    expect(planGroupTitle([group({})], 'mono__Ha__bin1__300s')).toBe('mono__Ha__bin1__300s');
   });
 });

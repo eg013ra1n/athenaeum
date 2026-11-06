@@ -63,7 +63,8 @@ const plan = (over: Record<string, unknown> = {}): StackingPlan =>
     setId: 7, projectId: null, setName: 'M31', config: CONFIG, groups: [], blockers: [], warnings: [],
     staleStages: [], activeRunId: null, freeBytes: 5e9, estimateBytes: 1e9, workingDir: '/work', outputDir: '/out',
     readiness: { rawSetsWithoutMaster: 0, rawSetIdsWithoutMaster: [] }, frameCount: 2, includedCount: 2,
-    excludedFrameIds: [], projectFrames: [], ...over,
+    excludedFrameIds: [], projectFrames: [], reference: { mode: 'auto', frameId: null, filename: null, onDisk: true },
+    ...over,
   }) as unknown as StackingPlan;
 
 const USAGE = {
@@ -175,6 +176,16 @@ async function mount(tab: ReactElement) {
 const argsOf = (command: string) =>
   vi.mocked(api.invoke).mock.calls.filter(([c]) => c === command).map(([, args]) => args);
 
+/** The Frames table's row of `file`, found by its selection checkbox. */
+const frameRowOf = (file: string) =>
+  screen.getByRole('checkbox', { name: `Select ${file}` }).closest('tr') as HTMLElement;
+
+/** Selects the Frames table's row of `file` and presses Exclude or Include, the table's frame-level write. */
+function setExcludedVia(file: string, action: 'Exclude' | 'Include') {
+  fireEvent.click(screen.getByRole('checkbox', { name: `Select ${file}` }));
+  fireEvent.click(screen.getByRole('button', { name: action }));
+}
+
 describe('StackingTab for a frame set', () => {
   it('loads the stored config, then the presets, then the plan built from that config', async () => {
     await mount(frameSetTab(7));
@@ -189,12 +200,12 @@ describe('StackingTab for a frame set', () => {
     expect(screen.getByRole('button', { name: /Run stacking/ })).toBeEnabled();
   });
 
-  it('toggling a frame writes the exclusion after the debounce, then re-plans', async () => {
+  it('excluding a frame writes the exclusion after the debounce, then re-plans', async () => {
     await mount(frameSetTab(7));
     await advance(PAST_THE_DEBOUNCE_MS); // the 300 ms plan refresh the first draft schedules
     const plansBefore = argsOf('get_stacking_plan').length;
 
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Include b.fit in the next run' }));
+    setExcludedVia('b.fit', 'Exclude');
     await advance(400);
     expect(argsOf('set_stacking_config')).toEqual([]);
 
@@ -483,7 +494,7 @@ describe('StackingTab for a project', () => {
 
   it('a pending write of a set is not sent to the project that takes the tab over', async () => {
     const view = await mount(frameSetTab(7));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fit in the next run' }));
+    setExcludedVia('a.fit', 'Exclude');
     await advance(100);
 
     view.rerender(tree(projectTab('p1')));
@@ -509,7 +520,7 @@ describe('StackingTab for a project', () => {
     }) as never);
     const view = await mount(frameSetTab(7));
     await advance(PAST_THE_DEBOUNCE_MS); // the 300 ms plan refresh the first draft schedules
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fit in the next run' }));
+    setExcludedVia('a.fit', 'Exclude');
     await advance(100);
 
     view.rerender(tree(projectTab('p1')));
@@ -543,7 +554,7 @@ describe('StackingTab for a project', () => {
     expect(argsOf('set_stacking_config')).toEqual([]);
   });
 
-  it('a project run row whose frame left the plan renders from the run, with no toggle and no pin', async () => {
+  it('a project run row whose frame left the plan renders from the run, with no pin', async () => {
     projectWith({
       runFrames: [{
         id: 1, runId: 5, groupId: 1, frameId: 41, included: true, exclusionReason: null, weight: 1,
@@ -552,12 +563,11 @@ describe('StackingTab for a project', () => {
     });
     await mount(projectTab('p1'));
 
-    // The plan's frames have both controls; the run's own row has neither, and is named by its handle.
+    // The plan's frames have the reference star; the run's own row has none, and is named by its handle.
     const orphan = screen.getByText('frame 41').closest('tr');
     expect(orphan).not.toBeNull();
-    expect(within(orphan as HTMLElement).queryByRole('checkbox')).toBeNull();
     expect(within(orphan as HTMLElement).queryByRole('button')).toBeNull();
-    expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Use a.fits as the reference frame' })).toBeEnabled();
     await advance(PAST_THE_DEBOUNCE_MS);
     expect(argsOf('set_project_stacking_config')).toEqual([]);
   });
@@ -572,20 +582,20 @@ describe('StackingTab for a project', () => {
 
       expect(screen.getByRole('button', { name: /^Frames \(3\)/ })).toBeInTheDocument();
       expect(screen.getByText('Alice')).toBeInTheDocument();
-      expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeChecked();
-      expect(screen.getByRole('checkbox', { name: 'Include b.fits in the next run' })).not.toBeChecked();
+      expect(within(frameRowOf('a.fits')).queryByText('Out of next run')).toBeNull();
+      expect(within(frameRowOf('b.fits')).getByText('Out of next run')).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Clear the reference frame a.fits' })).toHaveAttribute('aria-pressed', 'true');
       expect(screen.getByRole('button', { name: 'Use b.fits as the reference frame' })).toBeEnabled();
       expect(screen.getByRole('button', { name: 'Use c.fits as the reference frame' })).toBeDisabled();
     });
 
-    it('unchecking a frame writes its uuid with the pin kept, then re-plans', async () => {
+    it('excluding a frame writes its uuid with the pin kept, then re-plans', async () => {
       projectWith({ excluded: ['u2'], reference: 'u1' });
       await mount(projectTab('p1'));
       await advance(PAST_THE_DEBOUNCE_MS);
       const plansBefore = argsOf('get_project_stacking_plan').length;
 
-      fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' }));
+      setExcludedVia('a.fits', 'Exclude');
       await advance(PAST_THE_DEBOUNCE_MS);
 
       expect(argsOf('set_project_stacking_config')).toEqual([
@@ -695,17 +705,18 @@ describe('StackingTab for a project', () => {
       ]);
     });
 
-    it('disables the checkboxes and the pins while a run is active', async () => {
+    it('disables Exclude and the pins while a run is active', async () => {
       projectWith({ activeRunId: 9 });
       await mount(projectTab('p1'));
-      expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeDisabled();
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fits' }));
+      expect(screen.getByRole('button', { name: 'Exclude' })).toBeDisabled();
       expect(screen.getByRole('button', { name: 'Use a.fits as the reference frame' })).toBeDisabled();
     });
 
-    it('a frame set\u2019s table has no publisher and no pin', async () => {
+    it('a frame set\u2019s table has no publisher, and a reference star on each frame', async () => {
       await mount(frameSetTab(7));
       expect(screen.queryByRole('button', { name: 'Publisher' })).toBeNull();
-      expect(screen.queryByRole('columnheader', { name: 'Reference' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'Use a.fit as the reference frame' })).toBeInTheDocument();
     });
   });
 
@@ -833,9 +844,8 @@ describe('StackingTab for a project', () => {
       expect(screen.queryByTestId('board')).toBeNull();
       expect(screen.getByTestId('groups')).toBeInTheDocument();
 
-      const include = screen.getByRole('checkbox', { name: 'Include a.fits in the next run' });
-      expect(include).not.toBeChecked();
-      fireEvent.click(include);
+      expect(within(frameRowOf('a.fits')).getByText('Out of next run')).toBeInTheDocument();
+      setExcludedVia('a.fits', 'Include');
       await advance(PAST_THE_DEBOUNCE_MS);
       expect(argsOf('set_project_stacking_config')).toEqual([
         { projectId: 'p1', config: { ...CONFIG, reference: { mode: 'manual', twoPass: false } }, excludedFrameUuids: ['u2'], referenceFrameUuid: 'u2' },
