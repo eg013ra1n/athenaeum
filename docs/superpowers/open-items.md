@@ -332,6 +332,9 @@ contain forward slashes.
   Mac (2026-10-02, during plan 6b-1 Task 3) and passed alone. Not
   investigated; it exercises a shared dial under parallel load, so look at
   timing against the other tests' load before the pool logic.
+- `FilterMappingDialog › focuses the first select once the sheet has loaded`
+  (vitest) failed once in a whole run under load (2026-11-05, plan 6c Task 7)
+  and passed alone; see "Collab wave 6c" below.
 
 ## Standing decisions — do not re-flag these
 
@@ -371,6 +374,24 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Collab wave 6c — the project's Stacking tab (2026-11-06)
+
+Branch `collab-v3-wave6c` (plan `docs/superpowers/plans/2026-11-05-collab-v3-wave6c-project-stacking-ui-plan.md`, rulings D1–D11). Reference: `docs/stacking/README.md` (The project's Stacking tab, wave 6c) and `docs/transfers/README.md` (Collab wave 6c — the grid card). Code-complete with every task reviewed; the frontend was checked in the UI harness (`HARNESS_SCENARIO=stacking`) and never in the real window. Owed by a human, on real data, not done by an agent:
+
+- **Run-B re-check on the branch head: pending (Task 10 Step 2).**
+- **The grid schematic on a real project.** Open the Stacking tab of a real project: every member's frames sit where the sky chart puts them, north up and east left. Edit the scale in the dialog and watch the outlines move. Delete this line when it passes.
+- **The coverage thumbnail after a run.** A deep centre, thin edges, the overhanging frames visible; a `stops` master named `…_<min>-<max>s_…`. Delete this line when it passes.
+- **Confirm a grid as the coordinator with `Use proposal`.** A second member's tab leaves "Waiting for the coordinator to confirm the grid" without reopening the page. Delete this line when it passes.
+- **Stack the project from the tab.** The progress shows on the project page only (never on a frame set's page or another project's), and the completion notification opens `?tab=stacking`. Delete this line when it passes.
+- **The first grid master against a sky chart.** The grid is sky-standard (det CD < 0) and every solve in the owner's catalog has det CD > 0, so the master is the mirror image of a raw frame (the 6b-3 item "The grid's orientation": delete both when it passes).
+- **The reference pin and an exclusion.** Pin a reference in the Frames table, run, and see the run's reference is that frame; exclude a frame and see it out of the run. Delete this line when it passes.
+- **Change the grid after a run.** The rewrite warning shows in the dialog; the next run rewrites the registered frames and does not re-match stars (the log shows the cached star map). Delete this line when it passes.
+- **An attested frame set.** Masters reads "not needed", Prepare shows its counts, a run goes through without masters; the Groups table shows no tolerance hint in `seconds` mode (the hint belongs to a set that calibrates). Delete this line when it passes.
+- **A real-window look (Tauri / WebKit).** Open the project's Stacking tab against the harness: the Prepare panel, the grid card and the Groups card. The viewer's own outlines share the accent colour with the grid rectangle (drawn thicker): say if they read apart. Delete this line when it passes.
+- **A grid move that emits no event.** A move picked up first by `refresh_projects` or the device-replace refresh emits no `collab-grid-changed`, and the tab does not read the card's `canonicalGrid`, so an open tab shows it at its next refetch (a config edit, a finished run, a frames event, reopening the page). A display lag only; wiring the card refresh to the tab is a small follow-up if the owner sees it.
+- **Owner decision: the attested set's colour-token warning.** Grouping an attested set still warns `file shape unreadable; colour token falls back to the catalog (mono)` (or `… assumed cfa`) once per unreadable light (`attested_color_token` in `stacking/project_source.rs`, called from `groups.rs`): an offline 500-light set logs about 500 warnings per plan rebuild. A project's `color_token` warns per frame the same way. A frame set's log lines must stay identical, so it waits for a ruling. Options: (a) keep one warning per light; (b) one warning per plan build carrying the count and the per-light line at debug, as the plan's unsupported-file lines already do. Recommended: (b); it changes only the log lines of an attested set (and a project) whose files cannot be read, never a calibrated set's.
+- **A vitest flake candidate under full-suite load: `FilterMappingDialog › focuses the first select once the sheet has loaded`.** It failed once in a whole `npx vitest run` during Task 7 (`toHaveFocus`; the task touched no collab file) and passed three times alone and in the next whole run; it did not recur in the five whole runs of Tasks 8 and 9. Not investigated: look at what the focus waits for (the sheet's load) against the suite's CPU load before the dialog. Delete this line when it fails again and is fixed, or after a month of green runs.
 
 ### Sky Chart phase 3 — NSNS surveys, mirrors and the tile cache limit (2026-11-05)
 
@@ -504,7 +525,7 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
 
 ### Collab wave 6b-3 — project stacking on the grid (2026-10-03)
 
-Code-complete with green gates: the composed map, both caches, LN on the overlap with the 25 % fallback, the coverage maps, crop, grid output, the seven commands on both hosts, `start_stacking` for a project, and the fake-hub e2e. Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5.5–§5.9, §9, §15; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b3-project-grid-stacking-plan.md`. Reference: `docs/stacking/README.md` (The project path on the grid, wave 6b-3). There is no project UI before 6c. Owed:
+Code-complete with green gates: the composed map, both caches, LN on the overlap with the 25 % fallback, the coverage maps, crop, grid output, the seven commands on both hosts, `start_stacking` for a project, and the fake-hub e2e. Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5.5–§5.9, §9, §15; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b3-project-grid-stacking-plan.md`. Reference: `docs/stacking/README.md` (The project path on the grid, wave 6b-3). Owed:
 
 - **Collab-live timing tests and this branch's test load.** A full-suite run on `main` 20c7c1ef (2026-10-04) passed 3540/0 in 168 s, both timing tests included. On this branch the suite takes about 250 s and `clean_exit_kill_and_restart` (3.0 s against 2 s) and `a_stop_is_observed_while_starting_and_while_the_stream_opens` (1.89 s against 1 s) failed in most full runs, each passing solo. The collab-live code is untouched; the heavier 6b-3 stacking tests (the fake-hub e2e, the project runs) load the CPU while the wall-clock tests measure. Owed before the push: keep the two wall-clock tests off a saturated CPU (a shared test lock with the heavy project-run tests, or capped test thread pools) — never a wider bound.
 - **Real-data acceptance (done 2026-10-04, recorded here for the history).** LDN1272-test on copies of the `.dev` catalog, branch head 9f9624ce.
