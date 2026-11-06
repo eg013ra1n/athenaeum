@@ -159,7 +159,7 @@ describe('GridSchematic', () => {
 
   it('says how many frames are not drawn, and nothing when all are', () => {
     const { unmount } = draw({ framesNotDrawn: 4 });
-    expect(screen.getByText('4 frames are not drawn: no WCS in the manifest')).toBeInTheDocument();
+    expect(screen.getByText('4 frames are not drawn: no usable WCS in the manifest')).toBeInTheDocument();
     unmount();
     draw({ framesNotDrawn: 0 });
     expect(screen.queryByText(/not drawn/)).toBeNull();
@@ -167,7 +167,7 @@ describe('GridSchematic', () => {
 
   it('says it in the singular for one frame', () => {
     draw({ framesNotDrawn: 1 });
-    expect(screen.getByText('1 frame is not drawn: no WCS in the manifest')).toBeInTheDocument();
+    expect(screen.getByText('1 frame is not drawn: no usable WCS in the manifest')).toBeInTheDocument();
   });
 
   it('tilts the N arrow by the rotation of the grid', () => {
@@ -394,8 +394,8 @@ describe('GridCard', () => {
     ...render(withMembers(<GridCard projectId="p1" grid={grid} onSaved={onSaved} />)),
   });
 
-  const PROPOSAL_VALUES = '1.5″/px · 3200 × 2560 px (1.33° × 1.07°) · centre RA 83.82° Dec -5.39° · rotation 0°';
-  const GRID_VALUES = '2″/px · 4096 × 3072 px (2.28° × 1.71°) · centre RA 83.8° Dec -5.4° · rotation 0°';
+  const PROPOSAL_VALUES = '1.50″/px · 3200 × 2560 px (1.33° × 1.07°) · centre RA 83.8200° Dec -5.3900° · rotation 0°';
+  const GRID_VALUES = '2.00″/px · 4096 × 3072 px (2.28° × 1.71°) · centre RA 83.8000° Dec -5.4000° · rotation 0°';
 
   it('proposes the grid to an editor when none is confirmed', () => {
     card(planGrid('proposed'));

@@ -2,7 +2,7 @@
 // (Task 1b's golden file), and the grid-up schematic orientation built on it.
 import { describe, expect, it } from 'vitest';
 import golden from './gridProjection.golden.json';
-import { northArrowAngleDeg, skyToGridPixel, toSchematic } from './gridProjection';
+import { fixed, gridValuesLine, northArrowAngleDeg, skyToGridPixel, toSchematic } from './gridProjection';
 import type { CanonicalGrid } from '../../types/models';
 
 const GRID: CanonicalGrid = { scaleArcsec: 2, widthPx: 4096, heightPx: 3072, crval1: 83.8, crval2: -5.4, rotationDeg: 0 };
@@ -72,5 +72,24 @@ describe('northArrowAngleDeg', () => {
   });
   it('still answers at a declination near the pole', () => {
     expect(Number.isFinite(northArrowAngleDeg({ ...GRID, crval2: 90 }))).toBe(true);
+  });
+});
+
+// D6: the scale reads 2 decimals and the centre 4, always; the size, the field of view and the rotation drop their zeros.
+describe('gridValuesLine', () => {
+  it('reads the scale with 2 decimals and the centre RA and Dec with 4, zeros kept', () => {
+    expect(gridValuesLine(GRID)).toBe(
+      '2.00\u2033/px \u00b7 4096 \u00d7 3072 px (2.28\u00b0 \u00d7 1.71\u00b0) \u00b7 centre RA 83.8000\u00b0 Dec -5.4000\u00b0 \u00b7 rotation 0\u00b0',
+    );
+  });
+  it('rounds to those decimals and keeps the rotation trimmed', () => {
+    const line = gridValuesLine({ ...GRID, scaleArcsec: 1.4999, crval1: 83.123456, crval2: -5.000049, rotationDeg: 12.5 });
+    expect(line).toContain('1.50\u2033/px');
+    expect(line).toContain('centre RA 83.1235\u00b0 Dec -5.0000\u00b0');
+    expect(line).toContain('rotation 12.5\u00b0');
+  });
+  it('never signs a centre that rounds to zero, and shows a dash for a non-finite value', () => {
+    expect(fixed(-0.00001, 4)).toBe('0.0000');
+    expect(fixed(Number.NaN, 4)).toBe('\u2014');
   });
 });

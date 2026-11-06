@@ -85,17 +85,26 @@ export function trimmed(n: number, digits: number): string {
   return Number.isFinite(n) ? String(Number(n.toFixed(digits))) : '—';
 }
 
+/** `n` with exactly `digits` decimals (`2.00` stays `2.00`), `—` for a non-finite one; a value that rounds to zero
+ *  carries no sign (`-0.0000` reads `0.0000`). */
+export function fixed(n: number, digits: number): string {
+  if (!Number.isFinite(n)) return '—';
+  const text = n.toFixed(digits);
+  return /^-0(\.0+)?$/.test(text) ? text.slice(1) : text;
+}
+
 /** The grid's field of view as `<w>° × <h>°` (`widthPx · scale / 3600` and the same for the height). */
 export function fieldOfView(grid: CanonicalGrid): string {
   const deg = (px: number) => trimmed((px * grid.scaleArcsec) / 3600, 2);
   return `${deg(grid.widthPx)}° × ${deg(grid.heightPx)}°`;
 }
 
-/** The grid's values on one line: scale, size and field of view, centre, rotation. */
+/** The grid's values on one line: scale, size and field of view, centre, rotation. The scale reads 2 decimals and the
+ *  centre RA and Dec 4 (D6); the size, the field of view and the rotation drop their trailing zeros. */
 export function gridValuesLine(grid: CanonicalGrid): string {
   return (
-    `${trimmed(grid.scaleArcsec, 2)}″/px · ${trimmed(grid.widthPx, 0)} × ${trimmed(grid.heightPx, 0)} px ` +
-    `(${fieldOfView(grid)}) · centre RA ${trimmed(grid.crval1, 4)}° Dec ${trimmed(grid.crval2, 4)}° · ` +
+    `${fixed(grid.scaleArcsec, 2)}″/px · ${trimmed(grid.widthPx, 0)} × ${trimmed(grid.heightPx, 0)} px ` +
+    `(${fieldOfView(grid)}) · centre RA ${fixed(grid.crval1, 4)}° Dec ${fixed(grid.crval2, 4)}° · ` +
     `rotation ${trimmed(grid.rotationDeg, 2)}°`
   );
 }

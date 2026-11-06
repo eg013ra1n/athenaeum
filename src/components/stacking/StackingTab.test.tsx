@@ -614,6 +614,25 @@ describe('StackingTab for a project', () => {
       expect(screen.getByRole('button', { name: 'Clear the reference frame b.fits' })).toHaveAttribute('aria-pressed', 'true');
     });
 
+    it('a pin costs one plan build, after the write, carrying the manual reference', async () => {
+      projectWith({ mode: 'auto' });
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const plansBefore = argsOf('get_project_stacking_plan').length;
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use b.fits as the reference frame' }));
+      // Past the 300 ms draft debounce, short of the 500 ms write: the draft re-plan would build against the stored
+      // row, which still holds the old pin, so it does not run.
+      await advance(400);
+      expect(argsOf('get_project_stacking_plan')).toHaveLength(plansBefore);
+      expect(argsOf('set_project_stacking_config')).toEqual([]);
+      // Past the write: the one build the post-write refetch makes, from the manual config.
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toHaveLength(1);
+      expect(argsOf('get_project_stacking_plan').slice(plansBefore)).toEqual([{ projectId: 'p1', config: MANUAL }]);
+    });
+
     it('pinning the pinned frame clears the stored pin and returns to Auto', async () => {
       projectWith({ reference: 'u1' });
       await mount(projectTab('p1'));
@@ -715,7 +734,7 @@ describe('StackingTab for a project', () => {
     const ELSEWHERE = PROJECT_FRAMES.map((f) => ({ ...f, handle: null, onDisk: false, reason: 'not on this device' }));
     /** On this device, but the reader refuses them. */
     const UNSUPPORTED = PROJECT_FRAMES.map((f) => ({
-      ...f, handle: null, onDisk: true, reason: 'unsupported file: tile-compressed FITS',
+      ...f, onDisk: true, reason: 'unsupported file: tile-compressed FITS',
     }));
 
     it.each([

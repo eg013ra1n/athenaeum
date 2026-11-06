@@ -1602,7 +1602,9 @@ unchanged.
     is one frame's pixel edges, eight points per edge, through its manifest WCS with SIP: the same points `framesInside`
     counts with, so an outline agrees with the count. The set is every published, accepted frame of the manifest, on this
     device or not, so every member sees the same picture. A frame with no manifest WCS, no pixel size, unreadable
-    meta or edges that do not project to finite sky points is counted in `framesNotDrawn` and not drawn.
+    meta or edges that do not project to finite sky points is counted in `framesNotDrawn` and not drawn. The note under the
+    picture reads `<n> frames are not drawn: no usable WCS in the manifest` (`1 frame is not drawn: …` for one): it names
+    no single cause, because the four above are not told apart.
   - `gridProjection.ts::skyToGridPixel` is the gnomonic projection of `grid_wcs`. The Rust test
     `grid_projection_golden_file_is_current` writes (`GOLDEN_WRITE=1`) and checks
     `src/components/stacking/gridProjection.golden.json`, and the TS test asserts the same numbers to 1e-6 px. A point 90°
@@ -1640,9 +1642,9 @@ unchanged.
     because the reference rule (§5.4) admits a locally solved frame and `hasWcs` is the manifest's WCS only. An unusable
     row shows its reason and cannot be pinned; a pinned row that became unusable can still be cleared.
 - **The project Frames table, by uuid.** Rows come from `plan.projectFrames`, with a Publisher column. A run row joins
-  its plan row by `frameUuid` only; a summary frame joins through the run row's own `frameId` and never through the plan's
-  current handle (a later plan can hand a handle to another frame). A run row whose frame left the plan renders from the
-  run (the summary's file name, or `frame <handle>`) with no toggle and no pin. An unusable plan row keeps its include
+  its plan row by `frameUuid` only. A summary frame carries the run's handle and no uuid, so it is joined through the
+  run row (its own `frameId`), never through the plan's current handle. A run row whose frame left the plan renders from
+  the run (the summary's file name, or `frame <handle>`) with no toggle and no pin. An unusable plan row keeps its include
   checkbox: it stores a uuid, so an exclusion survives the file landing later.
 - **The exposure grouping control (D1).** In the Groups table header, for both subjects: `Exposure grouping`, Seconds /
   Stops / Equivalent t/N² / None, and the mode's threshold. `seconds` takes `Tolerance (s)` (`exposureToleranceSec`,

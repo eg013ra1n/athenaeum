@@ -15,7 +15,7 @@ export interface GridSchematicProps {
   grid: CanonicalGrid | null;
   target: PlanGridTarget;
   footprints: PlanGridFootprint[];
-  /** Accepted frames the plan could not outline (no WCS in the manifest). */
+  /** Accepted frames the plan could not outline (no usable WCS in the manifest, whichever of its four causes). */
   framesNotDrawn: number;
 }
 
@@ -169,7 +169,7 @@ export function GridSchematic({ grid, target, footprints, framesNotDrawn }: Grid
       </div>
       {framesNotDrawn > 0 && (
         <p className="mt-1 text-[11px] text-content-faint">
-          {framesNotDrawn === 1 ? '1 frame is' : `${framesNotDrawn} frames are`} not drawn: no WCS in the manifest
+          {framesNotDrawn === 1 ? '1 frame is' : `${framesNotDrawn} frames are`} not drawn: no usable WCS in the manifest
         </p>
       )}
     </div>

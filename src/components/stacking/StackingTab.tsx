@@ -389,7 +389,10 @@ export function StackingTab({ subject }: StackingTabProps) {
   }, [feedProjectId]);
 
   // Re-plan (debounced) whenever the draft config changes — skip the very
-  // first assignment, which is the mount effect's own initial fetch.
+  // first assignment, which is the mount effect's own initial fetch. A project's pin changes the draft AND the
+  // stored row: `build_plan` reads the pin from the stored row, so a re-plan before the write lands builds against the
+  // old pin (a flashed `reference` blocker). While that write is pending (`storedRowDirtyRef`, read when the timer
+  // fires) the draft re-plan stands down: the post-write refetch carries the same config, one build per pin.
   const skipFirstDraftEffect = useRef(true);
   useEffect(() => {
     if (skipFirstDraftEffect.current) {
@@ -397,9 +400,12 @@ export function StackingTab({ subject }: StackingTabProps) {
       return;
     }
     if (!draftConfig) return;
-    const t = setTimeout(() => { void refetchPlan(draftConfig); }, 300);
+    const t = setTimeout(() => {
+      if (subject.kind === 'project' && storedRowDirtyRef.current) return;
+      void refetchPlan(draftConfig);
+    }, 300);
     return () => clearTimeout(t);
-  }, [draftConfig, refetchPlan]);
+  }, [draftConfig, refetchPlan, subject.kind]);
 
   // A run just finished (success or otherwise) — the plan's stale-stage /
   // cached-artifact state is now out of date.
