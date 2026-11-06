@@ -6,12 +6,14 @@ import { NotificationProvider } from '../contexts/NotificationContext';
 import { SessionStateProvider, useSessionState } from '../contexts/SessionStateContext';
 import { NavHistoryProvider } from '../contexts/NavHistoryContext';
 import { CollabExchangeProvider } from '../contexts/CollabExchangeContext';
+import { StackingProvider } from '../contexts/StackingContext';
 import { ToastStack } from '../components/Toast';
 import ProjectDetail, { resolveSelfAccount } from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
 import { usePublishing } from '../components/collab/project/usePublishing';
 import { projectCard } from '../components/collab/project/testFixtures';
+import { memberColor } from '../components/collab/project/memberColors';
 import type {
   AccountStatus,
   MemberSummary,
@@ -23,10 +25,19 @@ import type {
   CollabPublishFinished,
   CollabPublishProgress,
 } from '../types/models';
+import type { PlanGrid, StackingConfig } from '../types/stacking';
 
 vi.mock('../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
 }));
+
+// The Stacking tab's own children are pinned in `components/stacking/*.test.tsx`; here the tab's place on the page,
+// its deep link and the member colours of the grid card's schematic are. The grid card and the toolbar stay real.
+vi.mock('../components/stacking/PipelineBoard', () => ({ PipelineBoard: () => null }));
+vi.mock('../components/stacking/StageInspector', () => ({ StageInspector: () => null }));
+vi.mock('../components/stacking/GroupsTable', () => ({ GroupsTable: () => null }));
+vi.mock('../components/stacking/FramesTable', () => ({ FramesTable: () => null }));
+vi.mock('../components/stacking/ResultsPanel', () => ({ ResultsPanel: () => null }));
 
 /** The Overview's Project settings card. */
 const settingsCard = () => within(screen.getByRole('region', { name: 'Project settings' }));
@@ -228,6 +239,31 @@ function mockCommands(
   }) as never);
 }
 
+/** What the Stacking tab asks the backend for, answered: a project plan with nothing blocked and the given grid. */
+function stackingCommands(grid: PlanGrid | null = null): Record<string, (args?: unknown) => Promise<unknown>> {
+  const config = {
+    version: 1,
+    paths: { working: null, output: null },
+    grouping: { exposureToleranceSec: 2, exposureMode: 'stops', stopsWidth: 1 },
+    reference: { mode: 'auto', twoPass: true },
+    drizzle: { enabled: false },
+    normalization: { local: { enabled: false }, rejection: 'local' },
+  } as unknown as StackingConfig;
+  return {
+    get_project_stacking_config: () =>
+      Promise.resolve({ config, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: true, updatedAt: null }),
+    get_stacking_presets: () => Promise.resolve({ default: config, fastPreview: config, maximumQuality: config }),
+    list_stacking_presets: () => Promise.resolve([]),
+    get_project_stacking_plan: (args) =>
+      Promise.resolve({
+        setId: null, projectId: (args as { projectId: string }).projectId, setName: 'M42 Mosaic', config, groups: [],
+        blockers: [], warnings: [], readiness: { attested: false, rawSetsWithoutMaster: 0, rawSetIdsWithoutMaster: [] },
+        mastersToBuild: [], frameCount: 0, includedCount: 0, excludedFrameIds: [], estimateBytes: 0, freeBytes: null,
+        workingDir: '/work', outputDir: '/out', staleStages: [], activeRunId: null, grid, projectFrames: [], prepare: null,
+      }),
+  };
+}
+
 beforeEach(() => {
   for (const k of Object.keys(listeners)) delete listeners[k];
   localStorage.clear();
@@ -293,22 +329,24 @@ function renderProjectDetail(entry = '/projects/proj-1', seed?: string) {
         <SessionStateProvider>
           <NotificationProvider>
             <CollabExchangeProvider>
-              <CollabNotificationsHarness />
-              <Routes>
-                <Route
-                  path="/projects/:id"
-                  element={
-                    <>
-                      <ProjectDetail />
-                      <LocationDisplay />
-                      <SegmentProbe />
-                    </>
-                  }
-                />
-                <Route path="/objects/:id" element={<LocationDisplay />} />
-                <Route path="/seed" element={<SeedLegacyTab value={seed ?? 'overview'} />} />
-              </Routes>
-              <ToastStack />
+              <StackingProvider>
+                <CollabNotificationsHarness />
+                <Routes>
+                  <Route
+                    path="/projects/:id"
+                    element={
+                      <>
+                        <ProjectDetail />
+                        <LocationDisplay />
+                        <SegmentProbe />
+                      </>
+                    }
+                  />
+                  <Route path="/objects/:id" element={<LocationDisplay />} />
+                  <Route path="/seed" element={<SeedLegacyTab value={seed ?? 'overview'} />} />
+                </Routes>
+                <ToastStack />
+              </StackingProvider>
             </CollabExchangeProvider>
           </NotificationProvider>
         </SessionStateProvider>
@@ -1132,12 +1170,14 @@ describe('ProjectDetail tabs', () => {
     return screen.getAllByRole('tab').map((t) => t.textContent ?? '');
   }
 
-  it('opens on Overview by default, with the six tabs in order for a coordinator of an approval project', async () => {
+  it('opens on Overview by default, with the seven tabs in order for a coordinator of an approval project', async () => {
     mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: true }));
     renderProjectDetail();
     const overview = await screen.findByRole('tab', { name: 'Overview' });
     expect(overview).toHaveAttribute('aria-selected', 'true');
-    expect(tabNames()).toEqual(['Overview', 'My frames 2 ready · 2 to review', 'Library', 'Members', 'Exchange', 'Moderation']);
+    expect(tabNames()).toEqual([
+      'Overview', 'My frames 2 ready · 2 to review', 'Library', 'Stacking', 'Members', 'Exchange', 'Moderation',
+    ]);
   });
 
   it('a contributor (send only, not coordinator) sees no Library tab', async () => {
@@ -1146,6 +1186,41 @@ describe('ProjectDetail tabs', () => {
     await screen.findByRole('tab', { name: 'Overview' });
     expect(screen.queryByRole('tab', { name: /^Library/ })).not.toBeInTheDocument();
     expect(screen.getByRole('tab', { name: /^My frames/ })).toBeInTheDocument();
+  });
+
+  // Wave 6c Task 9: Stacking is visible to every member, right after Library, or after My frames without Library.
+  it('the Stacking tab follows Library for a send_receive member without any capability', async () => {
+    mockCommands(projectCard({ dataRole: 'send_receive', coordinator: false, canModerate: false, canRemap: false }));
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(tabNames()).toEqual([
+      'Overview', 'My frames 2 ready · 2 to review', 'Library', 'Stacking', 'Members', 'Exchange',
+    ]);
+  });
+
+  it('the Stacking tab follows My frames for a send-only contributor', async () => {
+    mockCommands(projectCard({ dataRole: 'send', coordinator: false }));
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(tabNames()).toEqual(['Overview', 'My frames 2 ready · 2 to review', 'Stacking', 'Members', 'Exchange']);
+  });
+
+  it('?tab=stacking opens the Stacking tab on this project, and is removed from the URL', async () => {
+    mockCommands(projectCard(), stackingCommands());
+    renderProjectDetail('/projects/proj-1?tab=stacking');
+    const stacking = await screen.findByRole('tab', { name: 'Stacking' });
+    await waitFor(() => expect(stacking).toHaveAttribute('aria-selected', 'true'));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects/proj-1'));
+    expect(await screen.findByRole('button', { name: /Run stacking/ })).toBeInTheDocument();
+    expect(api.invoke).toHaveBeenCalledWith('get_project_stacking_plan', expect.objectContaining({ projectId: 'proj-1' }));
+  });
+
+  it('a send-only contributor opens Stacking by its deep link too', async () => {
+    mockCommands(projectCard({ dataRole: 'send', coordinator: false }), stackingCommands());
+    renderProjectDetail('/projects/proj-1?tab=stacking');
+    const stacking = await screen.findByRole('tab', { name: 'Stacking' });
+    await waitFor(() => expect(stacking).toHaveAttribute('aria-selected', 'true'));
+    expect(await screen.findByRole('button', { name: /Run stacking/ })).toBeInTheDocument();
   });
 
   it('a non-coordinator with canModerate: true sees the Moderation tab, the Exclude action in Library, and Restore in the drawer', async () => {
@@ -1836,6 +1911,46 @@ function memberSummary(o: Partial<MemberSummary> & { accountId: string; displayN
     ...o,
   };
 }
+
+describe('ProjectDetail Stacking tab (wave 6c)', () => {
+  /** A small square around a sky position, RA/Dec degrees in perimeter order. */
+  const square = (ra: number, dec: number): [number, number][] => [
+    [ra - 0.2, dec + 0.2], [ra + 0.2, dec + 0.2], [ra + 0.2, dec - 0.2], [ra - 0.2, dec - 0.2],
+  ];
+  const footprint = (frameUuid: string, publisherAccountId: string, ra: number) => ({
+    frameUuid, publisherAccountId, publisher: publisherAccountId, filterCanonical: 'L', outline: square(ra, -5.4),
+  });
+  const grid: PlanGrid = {
+    state: 'proposed', current: null, framesInside: 2, canEdit: false,
+    proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.8, crval2: -5.4, rotationDeg: 0 },
+    target: { raDeg: 83.8, decDeg: -5.4, radiusDeg: 1.5 },
+    footprints: [footprint('f-known', 'acc-a', 83.7), footprint('f-stranger', 'acc-gone', 83.9)],
+    framesNotDrawn: 0,
+  };
+  const members = [
+    memberSummary({ accountId: 'acc-me', displayName: 'Me', devices: [{ device: 'dev-me', name: 'Laptop', online: true }] }),
+    memberSummary({ accountId: 'acc-a', displayName: 'Alice', devices: [{ device: 'dev-a', name: 'alice-pc', online: true }] }),
+  ];
+
+  // The schematic reads `useMemberColor`, which answers only inside the page's `MemberColorsProvider`: the tab body
+  // is mounted inside it, so a footprint takes its publisher's colour, never the neutral outline of an unknown one.
+  it('colours a footprint outline with its publisher’s member colour, and leaves an unknown publisher neutral', async () => {
+    mockCommands(projectCard(), {
+      ...stackingCommands(grid),
+      get_collab_member_summary: () => Promise.resolve(members),
+    });
+    renderProjectDetail('/projects/proj-1?tab=stacking');
+    const outline = async (uuid: string) =>
+      (await screen.findAllByTestId('grid-outline')).find((o) => o.getAttribute('data-frame-uuid') === uuid)!;
+
+    // This account is acc-me (its device is dev-me), so Alice takes the next palette slot, not the accent.
+    const alice = memberColor('acc-a', members, 'acc-me');
+    await waitFor(async () => expect(await outline('f-known')).toHaveAttribute('stroke', alice));
+    const stranger = await outline('f-stranger');
+    expect(stranger).toHaveAttribute('stroke', 'currentColor');
+    expect(stranger.getAttribute('class')).toContain('text-content-muted');
+  });
+});
 
 describe('resolveSelfAccount', () => {
   const members = [

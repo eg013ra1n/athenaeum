@@ -25,6 +25,167 @@ const LAST_SEEN = { now: NOW, '3 days ago': '2026-09-26T10:00:00Z', '5 h ago': '
 // The mockup's reason codes → the gate's real failure kinds (`BLOCKER_ORDER`).
 const KIND = { solve: 'solve', analyze: 'analyze', map: 'mapFilter', flat: 'linkCalibration', fwhm: 'threshold', ecc: 'threshold', stars: 'threshold' };
 
+// `stacking`: the project's Stacking tab. Every value is shaped from `src/types/stacking.ts` (`StackingPlan`,
+// `StackingConfig`, `WorkUsage`, `StackingPaths`) and `src/types/models.ts` (`CanonicalGrid`).
+const RAD = Math.PI / 180;
+
+// A tangent-plane point (offsets in degrees: xi east, eta north) about (ra0, dec0), back to RA/Dec in degrees.
+function tanToSky(xiDeg, etaDeg, ra0, dec0) {
+  const xi = xiDeg * RAD;
+  const eta = etaDeg * RAD;
+  const rho = Math.hypot(xi, eta);
+  if (rho === 0) return [ra0, dec0];
+  const c = Math.atan(rho);
+  const d0 = dec0 * RAD;
+  const dec = Math.asin(Math.cos(c) * Math.sin(d0) + (eta * Math.sin(c) * Math.cos(d0)) / rho);
+  const ra = ra0 * RAD + Math.atan2(xi * Math.sin(c), rho * Math.cos(d0) * Math.cos(c) - eta * Math.sin(d0) * Math.sin(c));
+  return [(((ra / RAD) % 360) + 360) % 360, dec / RAD];
+}
+
+// One frame's outline: a w × h degree sensor centred at (cx, cy) on the tangent plane, turned by `rot` degrees.
+function sensorOutline(cx, cy, rot, ra0, dec0, w = 1.1, h = 0.74) {
+  const c = Math.cos(rot * RAD);
+  const s = Math.sin(rot * RAD);
+  return [[-w / 2, h / 2], [w / 2, h / 2], [w / 2, -h / 2], [-w / 2, -h / 2]].map(([x, y]) => tanToSky(cx + x * c - y * s, cy + x * s + y * c, ra0, dec0));
+}
+
+// The project seed document (`project_seed_config`): the global default with `exposureMode = stops` and the coverage
+// map on. The three presets are the built-ins; the seed differs from all of them, so the tab reads "Custom".
+const STACKING_DEFAULT = {
+  version: 1,
+  grouping: { exposureToleranceSec: 2, exposureMode: 'seconds', stopsWidth: 1 },
+  calibration: {
+    flatNorm: true, flatNormMode: 'centralThird',
+    params: { trimFraction: 0.05, pedestalDn: 0, biasFallback: 'subtractBias', cfaFlatScaling: true },
+    hotPixelCorrection: true, debayerOsc: true, format: 'fits',
+  },
+  measurement: {
+    weightMode: 'psfSignalWeight', psfModel: 'auto', maxStars: 24576,
+    formula: { fwhm: 15, eccentricity: 15, snr: 20, stars: 0, pedestal: 50 }, keyword: 'SSWEIGHT',
+    detectionSigma: 20, seedPrefilter: 'none', seedDetector: 'peak', seedSource: 'matchedFilter', seedThreshold: 6,
+  },
+  selection: { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null, minStars: null, excludeOnRegistrationFailure: true },
+  reference: { mode: 'auto', twoPass: true },
+  registration: {
+    geometry: 'coRegistered', model: 'auto', distortion: 'off', tpsSmoothing: 0.5, localDistortion: false,
+    interpolation: 'bicubicBSpline', clampingThreshold: 0.3, maxStars: 2000, ransacTolerancePx: 1.9,
+    ransacMaxIterations: 2000, maxRmsPx: 2, failOnMaxRms: false, detection: { minSnr: 10, maxEccentricity: 0.8 },
+    writeRegisteredFrames: false,
+  },
+  normalization: {
+    output: 'additiveWithScaling', rejection: 'local', scaleEstimator: 'bwmv',
+    local: {
+      enabled: false, scale: 1024, scaleMode: 'auto', gridSize: 4, referenceFrames: 20, psfModel: 'auto', localScale: false,
+      starSelection: { minPeakSnr: 40, maxStars: 500, saturation: 0.75 }, fluxEstimator: 'commonAperture', aperture: 'growthCurve',
+    },
+  },
+  integration: {
+    combination: 'average', rejection: { method: 'auto' }, minWeight: 0.005, rangeLow: 0, rangeHigh: null,
+    writeRejectionMaps: false, largeScale: { enabled: false, protectedLayers: 2, growth: 2 },
+  },
+  drizzle: {
+    enabled: false, scale: 2, dropShrink: 0.9, kernel: 'square', useRejection: true, useWeights: true,
+    useLocalNormalization: true, writeWeightMap: false, bayer: false,
+  },
+  output: { format: 'fits', cleanup: 'keepAll', coverageMap: false, cropToCoverage: 0 },
+  paths: { workingDir: null, outputDir: null },
+};
+
+function stackingHandlers({ projectId, card, nameOf, acc }) {
+  const seed = { ...STACKING_DEFAULT, grouping: { ...STACKING_DEFAULT.grouping, exposureMode: 'stops' }, output: { ...STACKING_DEFAULT.output, coverageMap: true } };
+  const presets = {
+    default: STACKING_DEFAULT,
+    fastPreview: { ...STACKING_DEFAULT, reference: { mode: 'auto', twoPass: false }, normalization: { ...STACKING_DEFAULT.normalization, rejection: 'scaleZeroOffset' } },
+    maximumQuality: { ...STACKING_DEFAULT, registration: { ...STACKING_DEFAULT.registration, distortion: 'auto' }, drizzle: { ...STACKING_DEFAULT.drizzle, enabled: true } },
+  };
+  const { targetRaDeg: ra0, targetDecDeg: dec0, targetRadiusDeg } = card;
+  // The proposal: 4800 × 3600 px at 1.5″/px = 2.0° × 1.5° about the target, north up.
+  const proposal = { scaleArcsec: 1.5, widthPx: 4800, heightPx: 3600, crval1: ra0, crval2: dec0, rotationDeg: 0 };
+
+  // Twelve accepted frames of three publishers. Rows 0-9 carry a WCS in the manifest (their outlines are drawn; rows 4
+  // and 7 reach past the proposal); rows 10-11 do not (`framesNotDrawn: 2`). Row 6 is an unsupported file, row 8 is
+  // not on this device. The usable ten form the three groups: L 5, Ha 3, OSC 2.
+  const FILTER = { L: ['mono', 120], Ha: ['mono', 300], None: ['osc', 180] };
+  const ROWS = [
+    // [publisher, filter, rotation, centre on the tangent plane (deg) | null without a WCS, flags]
+    ['you', 'L', 0, [0, 0]], ['you', 'L', 0, [0.12, -0.08]], ['you', 'L', 0, [-0.10, 0.10]], ['you', 'Ha', 0, [0.05, 0.15]],
+    ['kostya', 'L', 3.5, [-0.05, -0.52]], ['kostya', 'Ha', 3.5, [0.18, 0.12]], ['kostya', 'Ha', 3.5, [-0.20, 0.05], 'unsupported'],
+    ['masha', 'None', -2, [0.62, 0.10]], ['masha', 'L', -2, [-0.15, 0.20], 'offDevice'], ['masha', 'None', -2, [0.25, -0.20]],
+    ['you', 'L', 0, null], ['kostya', 'Ha', 3.5, null],
+  ];
+  const frames = ROWS.map(([publisherId, filter, rot, centre, flag], i) => {
+    const [colorMode, exp] = FILTER[filter];
+    const n = String(i + 1).padStart(4, '0');
+    return {
+      i, filter, colorMode, exp, rot, centre, flag, uuid: `s-${n}`, publisher: nameOf(publisherId), accountId: acc(publisherId),
+      fileName: `Light_M31_${filter === 'None' ? 'OSC' : filter}_${exp}s_${n}.fits`,
+    };
+  });
+  const usable = frames.filter((f) => !f.flag);
+  const footprints = frames.filter((f) => f.centre).map((f) => ({
+    frameUuid: f.uuid, publisherAccountId: f.accountId, publisher: f.publisher, filterCanonical: f.filter,
+    outline: sensorOutline(f.centre[0], f.centre[1], f.rot, ra0, dec0),
+  }));
+  const projectFrames = frames.map((f) => ({
+    handle: f.flag ? null : 100 + f.i, frameUuid: f.uuid, fileName: f.fileName, publisher: f.publisher, filterCanonical: f.filter,
+    exptimeSec: f.exp, colorMode: f.colorMode, hasWcs: f.centre !== null, onDisk: f.flag !== 'offDevice',
+    reason: f.flag === 'offDevice' ? 'not on this device' : f.flag === 'unsupported' ? 'unsupported file: tile-compressed FITS' : null,
+  }));
+  const group = (filter, cameras, anchor, scale, source) => {
+    const [colorMode, exp] = FILTER[filter];
+    const members = usable.filter((f) => f.filter === filter);
+    return {
+      key: `${colorMode}__${filter}__bin1__st${exp}`, instrume: null, colorMode, filter: filter === 'None' ? null : filter, binning: 1, cameras,
+      exposureS: exp, exposureClass: `st${exp}`, frameCount: members.length, includedCount: members.length,
+      totalExposureS: members.length * exp, calibratedCached: 0, metricsCached: 0, fitsCached: 0, lnCached: 0,
+      lnScalePx: null, lnScaleEstimated: false, lnWidth: null, lnHeight: null, anchorWidth: anchor[0], anchorHeight: anchor[1],
+      pixelScaleArcsec: scale, scaleRatioToReference: null, scaleSource: source,
+    };
+  };
+  const groups = [
+    group('L', ['ASI2600MM Pro'], [6248, 4176], 1.52, 'solve'),
+    group('Ha', ['ASI2600MM Pro'], [6248, 4176], 1.52, 'solve'),
+    group('None', ['ASI294MC Pro'], [4144, 2822], 1.51, 'header'),
+  ];
+  const plan = {
+    setId: null, projectId, setName: card.title, config: seed, configHash: 'harness-stacking', groups,
+    blockers: [{ code: 'grid', message: "Confirm the project's grid in the Stacking tab" }],
+    warnings: ['1 frame of the project is not on this device and is left out (L: 1)'],
+    readiness: {
+      total: 12, unlinkedLights: 0, rawSetsWithoutMaster: 0, rawSetIdsWithoutMaster: [], missingMasterFiles: 0,
+      missingRawCalibrationFiles: 0, blackHoleZipMasters: 0,
+      fileCounts: { lightsOnly: 12, rawWithCalibrationSets: 0, rawWithMasters: 0, calibratedLights: 12 },
+      rawSetsBuildable: [], rawSetsUnbuildable: [], mastersRebuildable: [], mastersUnrebuildable: [], attested: false,
+      calibrationWarnings: [], geometryMismatches: [], geometryWarnings: [],
+    },
+    mastersToBuild: [], reference: { mode: 'auto', frameId: null, filename: null, onDisk: false },
+    frameCount: frames.length, includedCount: usable.length, excludedFrameIds: [], estimateBytes: 38e9, freeBytes: 412e9,
+    workingDir: '/Volumes/Astro/Stacking/work', outputDir: '/Volumes/Astro/Stacking/out',
+    staleStages: ['calibrate', 'measure', 'register'], activeRunId: null,
+    grid: {
+      state: 'proposed', current: null, proposal, framesInside: footprints.length, canEdit: true,
+      target: { raDeg: ra0, decDeg: dec0, radiusDeg: targetRadiusDeg }, footprints, framesNotDrawn: frames.length - footprints.length,
+    },
+    projectFrames, prepare: { inPlace: 9, debayered: 0, converted: 1, unsupported: 1, atRun: 0 },
+  };
+  const projectConfig = { config: seed, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: true, updatedAt: null };
+  const path = (dir) => ({ configured: null, effective: dir, default: dir, restartRequired: false });
+  return {
+    get_project_stacking_plan: () => plan,
+    get_project_stacking_config: () => projectConfig,
+    get_project_stacking_runs: () => [],
+    get_project_stacking_work_usage: () => ({
+      calibratedBytes: 0, registeredBytes: 0, lnBytes: 0, fitsBytes: 0, measuredBytes: 0, runsBytes: 0, rejBytes: 0, previewsBytes: 0, totalBytes: 0,
+    }),
+    get_stacking_presets: () => presets,
+    list_stacking_presets: () => [],
+    get_stacking_paths: () => ({ working: path('/Volumes/Astro/Stacking/work'), output: path('/Volumes/Astro/Stacking/out') }),
+    // The writes a click on the tab can reach: answered with what was sent, so nothing logs an unknown command.
+    set_project_stacking_config: (args) => ({ ...projectConfig, config: args.config, excludedFrameUuids: args.excludedFrameUuids, referenceFrameUuid: args.referenceFrameUuid, isDefault: false }),
+    set_collab_project_grid: (args) => args.grid,
+  };
+}
+
 export function buildFixtures(scenario = 'default') {
   const { MEMBERS, FRAMES: ALL, GOALS } = mockupData();
   let FRAMES = ALL;
@@ -173,6 +334,7 @@ export function buildFixtures(scenario = 'default') {
     { id: 3, projectId: PID, projectTitle: card.title, startedAt: '2026-09-28T22:48:00Z', finishedAt: '2026-09-28T22:54:56Z', frames: 90, bytes: 7.9e9, failed: 0, sources: [{ device: devId('masha', 0), memberName: 'Masha', deviceName: 'Masha MacBook', bytes: 4.1e9 }, { device: devId('olga', 0), memberName: 'Olga', deviceName: 'olga-home', bytes: 3.8e9 }] },
     { id: 2, projectId: PID, projectTitle: card.title, startedAt: '2026-09-28T10:54:00Z', finishedAt: '2026-09-28T10:56:13Z', frames: 68, bytes: 4.1e9, failed: 2, sources: [{ device: devId('masha', 0), memberName: 'Masha', deviceName: 'Masha MacBook', bytes: 4.1e9 }] },
   ];
+  if (scenario === 'stacking') card.canEditGrid = true;
   const zeroPublishResult = { announced: 0, updated: 0, state: null, heldBack: [], unchanged: 0, calibrated: 0, stale: 0 };
   const handlers = {
     list_collab_projects: () => [card],
@@ -209,6 +371,7 @@ export function buildFixtures(scenario = 'default') {
     get_collab_frame_image: () => null,
     get_setting: (args) => args.defaultValue ?? null,
   };
+  if (scenario === 'stacking') Object.assign(handlers, stackingHandlers({ projectId: PID, card, nameOf: (id) => MBY[id].name, acc }));
   return { handlers, counts: { frames: FRAMES.length, members: MEMBERS.length } };
 }
 

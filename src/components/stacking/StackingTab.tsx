@@ -6,6 +6,7 @@ import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { subjectKey, type StackSubject, type SubjectKey } from './subject';
 import { useStackingSubjectApi, type StackingSubjectApi, type SubjectConfig } from './useStackingSubjectApi';
+import type { CollabFramesChange, CollabGridChanged } from '../../types/models';
 import type {
   GroupingConfig,
   NamedPreset,
@@ -22,6 +23,7 @@ import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
+import { EmptyState } from '../ui/EmptyState';
 import { ResultsPanel } from './ResultsPanel';
 import { GridCard } from './GridCard';
 import { boardMode, stableStringify, stageLabel, withoutPaths, type BoardStage } from './stageSummary';
@@ -58,6 +60,12 @@ interface PendingWrite {
 const NO_LIGHT_FRAMES: LightFrameRef[] = [];
 const NO_FRAME_IDS: number[] = [];
 const NO_PROJECT_FRAMES: PlanProjectFrame[] = [];
+
+/** D7: the live feed's events for a project re-plan it at most this often. */
+const PLAN_FEED_REFRESH_MS = 1000;
+
+/** The two live-feed events that change a project's plan: its grid moved, or frames landed or were remapped. */
+const PLAN_FEED_EVENTS = ['collab-grid-changed', 'collab-frames-changed'] as const;
 
 const PRESET_LABEL: Record<StackingPreset, string> = {
   default: 'Default',
@@ -342,6 +350,43 @@ export function StackingTab({ subject }: StackingTabProps) {
     window.addEventListener('library-updated', handler);
     return () => window.removeEventListener('library-updated', handler);
   }, [refetchPlan]);
+
+  // D7: a project's plan follows the live feed — frames landing, remaps arriving and a grid someone confirmed all
+  // change what a run would do while the tab is open. The events of OTHER projects are ignored. Schedule-if-none-
+  // pending, the shape `ProjectDetail`'s `collab-peers-changed` throttle uses: the first event starts a trailing
+  // timer and the rest are absorbed, so a burst is one refetch and a feed that never goes quiet (frames landing for
+  // minutes) still re-plans every second instead of waiting on a debounce that keeps restarting. A frame set has
+  // no feed. StrictMode-safe (CLAUDE.md): a registration that resolves after the cleanup released itself.
+  const feedProjectId = subject.kind === 'project' ? subject.projectId : null;
+  const refetchPlanRef = useRef(refetchPlan);
+  useEffect(() => { refetchPlanRef.current = refetchPlan; }, [refetchPlan]);
+  useEffect(() => {
+    if (feedProjectId === null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unlisteners: (() => void)[] = [];
+    const onFeed = (change: CollabGridChanged | CollabFramesChange) => {
+      if (cancelled || change.projectId !== feedProjectId || timer !== undefined) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        void refetchPlanRef.current(draftConfigRef.current ?? undefined);
+      }, PLAN_FEED_REFRESH_MS);
+    };
+    for (const event of PLAN_FEED_EVENTS) {
+      api
+        .listen<CollabGridChanged | CollabFramesChange>(event, onFeed)
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch((err) => console.error(`[StackingTab] ${event} listen failed:`, err));
+    }
+    return () => {
+      cancelled = true;
+      for (const unlisten of unlisteners) unlisten();
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [feedProjectId]);
 
   // Re-plan (debounced) whenever the draft config changes — skip the very
   // first assignment, which is the mount effect's own initial fetch.
@@ -816,6 +861,10 @@ export function StackingTab({ subject }: StackingTabProps) {
   // The pin in effect: a uuid stored under Auto is kept for the next Manual but is not the reference.
   const pinnedReference =
     subject.kind === 'project' && draftConfig.reference.mode === 'manual' ? referenceFrameUuid : null;
+  // A project with nothing a run could stack here: the board of rows that cannot run gives way to the reason. A
+  // frame set keeps its board whatever its blockers say.
+  const nothingToStack = subject.kind === 'project' && plan.blockers.some((b) => b.code === 'frames');
+  const nothingUsable = !plan.projectFrames.some((f) => f.onDisk);
 
   return (
     // Plan 5b final fix wave, review finding B7 (supersedes click-through
@@ -1124,7 +1173,9 @@ export function StackingTab({ subject }: StackingTabProps) {
         </div>
       )}
 
-      {/* Board (62%) / Inspector (38%) */}
+      {/* Board (62%) / Inspector (38%). A project with nothing to stack keeps the grid card and shows the reason
+          where the board was, in the same column; the inspector reads the stages of a run that cannot start, so it
+          is not shown. */}
       <div className="flex flex-col lg:flex-row gap-4">
         <div className="lg:w-[62%] min-w-0 space-y-3">
           {/* A project's canonical grid is the registration target of every run: it sits above the board whose
@@ -1132,57 +1183,74 @@ export function StackingTab({ subject }: StackingTabProps) {
           {subject.kind === 'project' && plan.grid && (
             <GridCard projectId={subject.projectId} grid={plan.grid} onSaved={handleGridSaved} />
           )}
-          <PipelineBoard
-            plan={plan}
-            config={draftConfig}
-            progress={runProgress}
-            outcome={runOutcome}
-            finishedStages={boardFinishedStages}
-            selectedStage={selectedStage}
-            onSelectStage={handleSelectStage}
-            onToggleDrizzle={handleToggleDrizzle}
-          />
-          <div className="bg-surface-elevated rounded-lg p-3">
-            <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
-            <GroupsTable
-              groups={plan.groups}
-              grouping={draftConfig.grouping}
-              disabled={running || starting}
-              toleranceInCalibrationHash={mode === 'calibrate'}
-              onPatchGrouping={handlePatchGrouping}
-            />
-          </div>
+          {nothingToStack ? (
+            <div className="bg-surface-elevated rounded-lg px-4 py-2">
+              <EmptyState>
+                <span className="block text-content">Nothing to stack on this device</span>
+                <span className="block text-content-muted">
+                  {nothingUsable
+                    ? 'No frame of this project is usable on this device.'
+                    : 'Every usable frame is excluded.'}
+                </span>
+              </EmptyState>
+            </div>
+          ) : (
+            <>
+              <PipelineBoard
+                plan={plan}
+                config={draftConfig}
+                progress={runProgress}
+                outcome={runOutcome}
+                finishedStages={boardFinishedStages}
+                selectedStage={selectedStage}
+                onSelectStage={handleSelectStage}
+                onToggleDrizzle={handleToggleDrizzle}
+              />
+              <div className="bg-surface-elevated rounded-lg p-3">
+                <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
+                <GroupsTable
+                  groups={plan.groups}
+                  grouping={draftConfig.grouping}
+                  disabled={running || starting}
+                  toleranceInCalibrationHash={mode === 'calibrate'}
+                  onPatchGrouping={handlePatchGrouping}
+                />
+              </div>
+            </>
+          )}
         </div>
 
-        <div className="lg:w-[38%] min-w-0 space-y-2">
-          {/* Below `lg` only: a summary button naming the selected stage,
-           *  toggling the panel below it — `lg` and up hides this button
-           *  entirely and the panel is always shown (Task 2/3's original
-           *  side-by-side shape, unchanged). One `StageInspector` mount
-           *  either way, so a panel with its own fetch on mount (Output's
-           *  `get_stacking_paths`) never runs twice. */}
-          <button
-            type="button"
-            onClick={handleToggleInspectorCollapsed}
-            aria-expanded={!inspectorCollapsed}
-            className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
-          >
-            {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-            {stageLabel(selectedStage, mode)}
-          </button>
-          <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
-            <StageInspector
-              stage={selectedStage}
-              config={draftConfig}
-              onChange={handleConfigChange}
-              plan={plan}
-              disabled={running || starting}
-              presetDefault={presets.default}
-              onRemeasure={handleRemeasure}
-              remeasureDisabled={remeasureDisabled}
-            />
+        {!nothingToStack && (
+          <div className="lg:w-[38%] min-w-0 space-y-2">
+            {/* Below `lg` only: a summary button naming the selected stage,
+             *  toggling the panel below it — `lg` and up hides this button
+             *  entirely and the panel is always shown (Task 2/3's original
+             *  side-by-side shape, unchanged). One `StageInspector` mount
+             *  either way, so a panel with its own fetch on mount (Output's
+             *  `get_stacking_paths`) never runs twice. */}
+            <button
+              type="button"
+              onClick={handleToggleInspectorCollapsed}
+              aria-expanded={!inspectorCollapsed}
+              className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
+            >
+              {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+              {stageLabel(selectedStage, mode)}
+            </button>
+            <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
+              <StageInspector
+                stage={selectedStage}
+                config={draftConfig}
+                onChange={handleConfigChange}
+                plan={plan}
+                disabled={running || starting}
+                presetDefault={presets.default}
+                onRemeasure={handleRemeasure}
+                remeasureDisabled={remeasureDisabled}
+              />
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* Frames + Results — full width, below the board/inspector split

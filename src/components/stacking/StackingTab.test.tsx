@@ -7,7 +7,7 @@
 // clock is advanced explicitly (`src/test/fakeClock`) instead of racing a real-timer `waitFor`.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import type { ReactElement } from 'react';
+import { StrictMode, type ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
 import { StackingProvider } from '../../contexts/StackingContext';
@@ -368,6 +368,10 @@ function projectWith(o: {
   activeRunId?: number | null;
   /** `PlanGrid` of the plan (absent: the plan carries none). */
   grid?: unknown;
+  /** The plan's blockers (absent: none). */
+  blockers?: { code: string; message: string }[];
+  /** The plan's `projectFrames` (absent: `PROJECT_FRAMES`). */
+  projectFrames?: unknown[];
 }) {
   vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
     switch (command) {
@@ -381,7 +385,8 @@ function projectWith(o: {
       case 'get_project_stacking_plan':
         return Promise.resolve(
           plan({
-            setId: null, projectId: args?.projectId, projectFrames: PROJECT_FRAMES, activeRunId: o.activeRunId ?? null,
+            setId: null, projectId: args?.projectId, projectFrames: o.projectFrames ?? PROJECT_FRAMES,
+            blockers: o.blockers ?? [], activeRunId: o.activeRunId ?? null,
             ...(o.grid === undefined ? {} : { grid: o.grid }),
           }),
         );
@@ -697,6 +702,220 @@ describe('StackingTab for a project', () => {
 
       expect(argsOf('set_collab_project_grid')).toEqual([{ projectId: 'p1', grid: GRID_PLAN.proposal }]);
       expect(argsOf('get_project_stacking_plan')).toHaveLength(plansBefore + 1);
+    });
+  });
+
+  // Wave 6c Task 9: a project with nothing to stack on this device shows why, instead of a board of rows that
+  // cannot run. The toolbar, the blocker line, the grid card and the Frames table stay.
+  describe('the empty state', () => {
+    const NO_FRAMES = { code: 'frames', message: 'No frame of this project is on this device yet' };
+    const TOO_FEW = { code: 'frames', message: 'At least 3 included frames in one group' };
+    /** The same three frames, none of them stackable here. */
+    const ELSEWHERE = PROJECT_FRAMES.map((f) => ({ ...f, handle: null, onDisk: false, reason: 'not on this device' }));
+
+    it.each([
+      ['the plan lists no frame at all', [] as unknown[]],
+      ['no listed frame is on this device', ELSEWHERE],
+    ])('says no frame is usable here when %s', async (_case, projectFrames) => {
+      projectWith({ blockers: [NO_FRAMES], projectFrames });
+      await mount(projectTab('p1'));
+
+      expect(screen.getByText('Nothing to stack on this device')).toHaveClass('text-content');
+      expect(screen.getByText('No frame of this project is usable on this device.')).toBeInTheDocument();
+      expect(screen.queryByText('Every usable frame is excluded.')).toBeNull();
+      // The board and the groups give way to it; the blocker line stays, and Run stays refused.
+      expect(screen.queryByTestId('board')).toBeNull();
+      expect(screen.queryByTestId('groups')).toBeNull();
+      expect(screen.getByText(NO_FRAMES.message)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Run stacking/ })).toBeDisabled();
+    });
+
+    it('keeps the Frames table under it when the plan lists frames', async () => {
+      projectWith({ blockers: [NO_FRAMES], projectFrames: ELSEWHERE });
+      await mount(projectTab('p1'));
+
+      expect(screen.getByRole('button', { name: /^Frames \(3\)/ })).toBeInTheDocument();
+      expect(screen.getByText('a.fits')).toBeInTheDocument();
+      expect(screen.getAllByText('not on this device')).toHaveLength(3);
+    });
+
+    it('says every usable frame is excluded when frames are on this device, and an exclusion can be undone', async () => {
+      projectWith({ blockers: [TOO_FEW], excluded: ['u1', 'u2'], reference: 'u2' });
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(screen.getByText('Nothing to stack on this device')).toBeInTheDocument();
+      expect(screen.getByText('Every usable frame is excluded.')).toBeInTheDocument();
+      expect(screen.queryByText('No frame of this project is usable on this device.')).toBeNull();
+      expect(screen.queryByTestId('board')).toBeNull();
+
+      const include = screen.getByRole('checkbox', { name: 'Include a.fits in the next run' });
+      expect(include).not.toBeChecked();
+      fireEvent.click(include);
+      await advance(PAST_THE_DEBOUNCE_MS);
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: { ...CONFIG, reference: { mode: 'manual', twoPass: false } }, excludedFrameUuids: ['u2'], referenceFrameUuid: 'u2' },
+      ]);
+    });
+
+    it('keeps the grid card above it', async () => {
+      projectWith({
+        blockers: [NO_FRAMES], projectFrames: ELSEWHERE,
+        grid: {
+          state: 'proposed', current: null, framesInside: 12, canEdit: true,
+          proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.82, crval2: -5.39, rotationDeg: 0 },
+          target: { raDeg: 83.82, decDeg: -5.39, radiusDeg: 1 }, footprints: [], framesNotDrawn: 0,
+        },
+      });
+      await mount(projectTab('p1'));
+      expect(screen.getByRole('heading', { name: 'Canonical grid \u2014 not confirmed' })).toBeInTheDocument();
+      expect(screen.getByText('Nothing to stack on this device')).toBeInTheDocument();
+    });
+
+    it('is not shown while the plan has no frames blocker', async () => {
+      projectWith({ blockers: [{ code: 'grid', message: 'The project has no confirmed grid' }] });
+      await mount(projectTab('p1'));
+
+      expect(screen.queryByText('Nothing to stack on this device')).toBeNull();
+      expect(screen.getByTestId('board')).toBeInTheDocument();
+      expect(screen.getByTestId('groups')).toBeInTheDocument();
+    });
+
+    it('is never shown for a frame set: its board stays whatever its blockers', async () => {
+      vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+        command === 'get_stacking_plan'
+          ? Promise.resolve(plan({ setId: args?.setId, blockers: [TOO_FEW] }))
+          : answer(command, args)) as never);
+      await mount(frameSetTab(7));
+
+      expect(screen.queryByText('Nothing to stack on this device')).toBeNull();
+      expect(screen.getByTestId('board')).toBeInTheDocument();
+      expect(screen.getByText(TOO_FEW.message)).toBeInTheDocument();
+    });
+  });
+
+  // D7: a project's plan follows the live feed: `collab-grid-changed` and `collab-frames-changed` for this project,
+  // coalesced to one refetch per second.
+  describe('the live feed', () => {
+    /** Replaces the `listen` mock with one that knows which registrations are still subscribed. */
+    function trackListeners() {
+      const live = new Map<string, Set<(payload: unknown) => void>>();
+      const registered: string[] = [];
+      const released: string[] = [];
+      vi.mocked(api.listen).mockImplementation(((event: string, cb: (payload: unknown) => void) => {
+        handlers[event] = cb;
+        if (!live.has(event)) live.set(event, new Set());
+        live.get(event)!.add(cb);
+        registered.push(event);
+        return Promise.resolve(() => {
+          live.get(event)!.delete(cb);
+          released.push(event);
+        });
+      }) as never);
+      const count = (event: string, list: string[]) => list.filter((e) => e === event).length;
+      return {
+        subscribed: (event: string) => live.get(event)?.size ?? 0,
+        registered: (event: string) => count(event, registered),
+        released: (event: string) => count(event, released),
+        /** Delivers the payload to every callback still subscribed to the event. */
+        fire: (event: string, payload: unknown) => act(() => {
+          for (const cb of [...(live.get(event) ?? [])]) cb(payload);
+        }),
+      };
+    }
+    const plans = () => argsOf('get_project_stacking_plan').length;
+
+    it('a collab-grid-changed for this project refetches the plan once, with the draft config', async () => {
+      const feed = trackListeners();
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const before = plans();
+
+      feed.fire('collab-grid-changed', { projectId: 'p1' });
+      await advance(900);
+      expect(plans()).toBe(before); // coalescing: nothing yet, the timer is trailing
+      await advance(200);
+      expect(plans()).toBe(before + 1);
+      expect(argsOf('get_project_stacking_plan')[before]).toEqual({ projectId: 'p1', config: CONFIG });
+
+      // The next one refetches again: the first did not leave the tab waiting for ever.
+      feed.fire('collab-grid-changed', { projectId: 'p1' });
+      await advance(1100);
+      expect(plans()).toBe(before + 2);
+    });
+
+    it('a collab-frames-changed for another project does not refetch', async () => {
+      const feed = trackListeners();
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const before = plans();
+
+      feed.fire('collab-frames-changed', { projectId: 'p2', kind: 'newFrames', count: 3 });
+      feed.fire('collab-grid-changed', { projectId: 'p2' });
+      await advance(PAST_THE_DEBOUNCE_MS);
+      expect(plans()).toBe(before);
+
+      // The same event for this project does (the check above is not vacuous).
+      feed.fire('collab-frames-changed', { projectId: 'p1', kind: 'newFrames', count: 3 });
+      await advance(1100);
+      expect(plans()).toBe(before + 1);
+    });
+
+    it('three events for this project inside one second cause one plan call', async () => {
+      const feed = trackListeners();
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const before = plans();
+
+      feed.fire('collab-frames-changed', { projectId: 'p1', kind: 'newFrames', count: 1 });
+      await advance(300);
+      feed.fire('collab-grid-changed', { projectId: 'p1' });
+      await advance(300);
+      feed.fire('collab-frames-changed', { projectId: 'p1', kind: 'remapped', count: 2 });
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(plans()).toBe(before + 1);
+    });
+
+    it('an event still waiting when the tab unmounts refetches nothing', async () => {
+      const feed = trackListeners();
+      const view = await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const before = plans();
+
+      feed.fire('collab-grid-changed', { projectId: 'p1' });
+      await advance(300);
+      view.unmount();
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(plans()).toBe(before);
+    });
+
+    it('a frame set tab listens to neither event', async () => {
+      const feed = trackListeners();
+      await mount(frameSetTab(7));
+      expect(feed.registered('collab-grid-changed')).toBe(0);
+      expect(feed.registered('collab-frames-changed')).toBe(0);
+    });
+
+    // Review Focus 5: StrictMode mounts the tab twice; exactly one listener per event remains, and unmounting
+    // releases every registration.
+    it('after a StrictMode double mount one listener per event remains, and unmount releases them all', async () => {
+      const feed = trackListeners();
+      const view = render(<StrictMode>{tree(projectTab('p1'))}</StrictMode>);
+      for (let i = 0; i < 4; i++) await advance(0);
+
+      for (const event of ['collab-grid-changed', 'collab-frames-changed']) {
+        expect(feed.registered(event), event).toBe(2);
+        expect(feed.subscribed(event), event).toBe(1);
+      }
+
+      view.unmount();
+      await advance(0);
+      for (const event of ['collab-grid-changed', 'collab-frames-changed']) {
+        expect(feed.subscribed(event), event).toBe(0);
+        expect(feed.released(event), event).toBe(feed.registered(event));
+      }
     });
   });
 });
