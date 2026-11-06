@@ -5,10 +5,12 @@
 //! the M1 stacking pipeline (`commands/stacking.rs`) replaces that flow.
 //! `set_frame_set_reference` / `get_frame_set_reference` stay: the Analysis
 //! tab's "Set as reference" star writes here, and the stacking run reads it.
+//! `clear_frame_set_reference` lets the Stacking tab's reference star unset it.
 
 use tauri::State;
 
 use athenaeum_core::registration::{
+    clear_frame_set_reference as core_clear_frame_set_reference,
     get_frame_set_reference as core_get_frame_set_reference,
     set_frame_set_reference as core_set_frame_set_reference, FrameSetReference,
 };
@@ -42,4 +44,16 @@ pub async fn get_frame_set_reference(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     core_get_frame_set_reference(&conn, frames_set_id).map_err(|e| e.to_string())
+}
+
+/// Remove the persisted user-chosen reference frame for a frame set (if any).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn clear_frame_set_reference(
+    state: State<'_, AppState>,
+    frames_set_id: i64,
+) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    core_clear_frame_set_reference(&conn, frames_set_id).map_err(|e| e.to_string())
 }

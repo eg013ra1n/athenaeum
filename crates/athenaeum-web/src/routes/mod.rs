@@ -253,6 +253,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Registration (persisted reference frame)
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
+        .route("/api/clear_frame_set_reference", post(registration::clear_frame_set_reference))
 
         .route("/api/get_stacking_plan", post(stacking::get_stacking_plan))
         .route("/api/start_stacking", post(stacking::start_stacking))

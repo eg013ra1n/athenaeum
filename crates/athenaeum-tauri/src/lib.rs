@@ -469,6 +469,7 @@ pub fn run() {
             // Registration (persisted reference frame)
             commands::set_frame_set_reference,
             commands::get_frame_set_reference,
+            commands::clear_frame_set_reference,
             // Stacking (M1 Plan 5a)
             commands::get_stacking_plan,
             commands::start_stacking,
