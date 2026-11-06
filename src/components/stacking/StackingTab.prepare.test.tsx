@@ -251,6 +251,16 @@ describe('StackingTab Re-run menu', () => {
     ).toBeInTheDocument();
   });
 
+  it('titles a frame set\'s Calibrate entry as a redo of Calibrate when nothing is stale', async () => {
+    plans.frameSet = plan({ setId: 7, blockers: [], staleStages: [] });
+    await mount(frameSetTab);
+    const menu = openRerunMenu();
+    expect(within(menu).getByRole('button', { name: 'Calibrate' })).toHaveAttribute(
+      'title',
+      'Redo Calibrate and everything after it; reuse the stages before',
+    );
+  });
+
   it('lists Calibrate first for a frame set, no Prepare, and words its run start with Calibrate', async () => {
     plans.frameSet = plan({ setId: 7, blockers: [], staleStages: ['calibrate'] });
     await mount(frameSetTab);
