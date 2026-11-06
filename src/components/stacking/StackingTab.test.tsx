@@ -6,7 +6,7 @@
 // Fake timers: the write lands after the tab's 500 ms debounce and the plan refresh after its 300 ms one, so the
 // clock is advanced explicitly (`src/test/fakeClock`) instead of racing a real-timer `waitFor`.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
@@ -40,6 +40,7 @@ vi.mock('./GroupsTable', () => ({ GroupsTable: () => null }));
 const CONFIG = {
   version: 1,
   paths: { working: null, output: null },
+  reference: { mode: 'manual', twoPass: false },
   drizzle: { enabled: false },
   normalization: { local: { enabled: false }, rejection: 'scaleZeroOffset' },
 } as unknown as StackingConfig;
@@ -49,7 +50,7 @@ const plan = (over: Record<string, unknown> = {}): StackingPlan =>
     setId: 7, projectId: null, setName: 'M31', config: CONFIG, groups: [], blockers: [], warnings: [],
     staleStages: [], activeRunId: null, freeBytes: 5e9, estimateBytes: 1e9, workingDir: '/work', outputDir: '/out',
     readiness: { rawSetsWithoutMaster: 0, rawSetIdsWithoutMaster: [] }, frameCount: 2, includedCount: 2,
-    excludedFrameIds: [], ...over,
+    excludedFrameIds: [], projectFrames: [], ...over,
   }) as unknown as StackingPlan;
 
 const USAGE = {
@@ -286,6 +287,55 @@ const SET_COMMANDS = [
   'set_stacking_config', 'start_stacking', 'cleanup_stacking_work', 'estimate_zip_extraction',
 ];
 
+/** A project's plan rows: usable with a WCS, usable without one, and not on this device. */
+const PROJECT_FRAMES = [
+  {
+    handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300,
+    colorMode: 'mono', hasWcs: true, onDisk: true, reason: null,
+  },
+  {
+    handle: 2, frameUuid: 'u2', fileName: 'b.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300,
+    colorMode: 'mono', hasWcs: false, onDisk: true, reason: null,
+  },
+  {
+    handle: null, frameUuid: 'u3', fileName: 'c.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300,
+    colorMode: 'mono', hasWcs: true, onDisk: false, reason: 'not on this device',
+  },
+];
+
+/** Answers a project's stored document, plan and selected run as given: the exclusion keys and the pin it holds, the
+ *  reference mode of its config, the frames of the selected run and the active run of its plan. Install it before
+ *  `mount`. */
+function projectWith(o: {
+  excluded?: string[];
+  reference?: string | null;
+  mode?: 'auto' | 'manual';
+  runFrames?: unknown[];
+  activeRunId?: number | null;
+}) {
+  vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
+    switch (command) {
+      case 'get_project_stacking_config':
+        return Promise.resolve({
+          ...PROJECT_CONFIG,
+          config: { ...CONFIG, reference: { mode: o.mode ?? 'manual', twoPass: false } },
+          excludedFrameUuids: o.excluded ?? [],
+          referenceFrameUuid: o.reference ?? null,
+        });
+      case 'get_project_stacking_plan':
+        return Promise.resolve(
+          plan({
+            setId: null, projectId: args?.projectId, projectFrames: PROJECT_FRAMES, activeRunId: o.activeRunId ?? null,
+          }),
+        );
+      case 'get_stacking_run':
+        return Promise.resolve({ run: RUN.run, groups: [], summary: null, frames: o.runFrames ?? [] });
+      default:
+        return answer(command, args);
+    }
+  }) as never);
+}
+
 describe('StackingTab for a project', () => {
   it('a project subject reads and writes through the project commands', async () => {
     await mount(projectTab('p1'));
@@ -416,22 +466,126 @@ describe('StackingTab for a project', () => {
     expect(argsOf('get_stacking_plan')).toHaveLength(plansForSet);
   });
 
-  it('a project run row cannot be toggled as a frame id', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
-      command === 'get_stacking_run'
-        ? Promise.resolve({
-            run: RUN.run, groups: [], summary: null,
-            frames: [{
-              id: 1, runId: 5, groupId: 1, frameId: 41, included: true, exclusionReason: null, weight: 1,
-              regStatus: null, regModel: null, regRmsPx: null, regInliers: null, frameUuid: 'u41',
-            }],
-          })
-        : answer(command, args)) as never);
+  it('a project run row whose frame left the plan renders from the run, with no toggle and no pin', async () => {
+    projectWith({
+      runFrames: [{
+        id: 1, runId: 5, groupId: 1, frameId: 41, included: true, exclusionReason: null, weight: 1,
+        regStatus: null, regModel: null, regRmsPx: null, regInliers: null, frameUuid: 'u41',
+      }],
+    });
     await mount(projectTab('p1'));
 
-    // The table still speaks the set's numeric frame ids: its checkbox is inert for a project.
-    expect(screen.getByRole('checkbox', { name: 'Include frame 41 in the next run' })).toBeDisabled();
+    // The plan's frames have both controls; the run's own row has neither, and is named by its handle.
+    const orphan = screen.getByText('frame 41').closest('tr');
+    expect(orphan).not.toBeNull();
+    expect(within(orphan as HTMLElement).queryByRole('checkbox')).toBeNull();
+    expect(within(orphan as HTMLElement).queryByRole('button')).toBeNull();
+    expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeEnabled();
     await advance(PAST_THE_DEBOUNCE_MS);
     expect(argsOf('set_project_stacking_config')).toEqual([]);
+  });
+
+  describe('the Frames table', () => {
+    const MANUAL = { ...CONFIG, reference: { mode: 'manual', twoPass: false } };
+    const AUTO = { ...CONFIG, reference: { mode: 'auto', twoPass: false } };
+
+    it('lists the plan\u2019s frames by publisher, with the exclusion and the pin the project loaded with', async () => {
+      projectWith({ excluded: ['u2'], reference: 'u1' });
+      await mount(projectTab('p1'));
+
+      expect(screen.getByRole('button', { name: /^Frames \(3\)/ })).toBeInTheDocument();
+      expect(screen.getByText('Alice')).toBeInTheDocument();
+      expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'Include b.fits in the next run' })).not.toBeChecked();
+      expect(screen.getByRole('button', { name: 'Clear the reference frame a.fits' })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('button', { name: 'Use b.fits as the reference frame' })).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Use c.fits as the reference frame' })).toBeDisabled();
+    });
+
+    it('unchecking a frame writes its uuid with the pin kept, then re-plans', async () => {
+      projectWith({ excluded: ['u2'], reference: 'u1' });
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const plansBefore = argsOf('get_project_stacking_plan').length;
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' }));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: MANUAL, excludedFrameUuids: ['u2', 'u1'], referenceFrameUuid: 'u1' },
+      ]);
+      expect(argsOf('get_project_stacking_plan')).toHaveLength(plansBefore + 1);
+      // A frame set's key is its frame id; none of that reaches a project.
+      expect(argsOf('set_stacking_config')).toEqual([]);
+    });
+
+    it('pinning a frame writes Manual and its uuid, then re-plans so the plan reads the stored pin', async () => {
+      projectWith({ mode: 'auto' });
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use b.fits as the reference frame' }));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: MANUAL, excludedFrameUuids: [], referenceFrameUuid: 'u2' },
+      ]);
+      const commands = vi.mocked(api.invoke).mock.calls.map(([c]) => c);
+      expect(commands.lastIndexOf('get_project_stacking_plan')).toBeGreaterThan(
+        commands.indexOf('set_project_stacking_config'),
+      );
+      expect(screen.getByRole('button', { name: 'Clear the reference frame b.fits' })).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    it('pinning the pinned frame clears the stored pin and returns to Auto', async () => {
+      projectWith({ reference: 'u1' });
+      await mount(projectTab('p1'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Clear the reference frame a.fits' }));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: AUTO, excludedFrameUuids: [], referenceFrameUuid: null },
+      ]);
+      expect(screen.getByRole('button', { name: 'Use a.fits as the reference frame' })).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('moves the pin to another frame in one write', async () => {
+      projectWith({ reference: 'u1' });
+      await mount(projectTab('p1'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use b.fits as the reference frame' }));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: MANUAL, excludedFrameUuids: [], referenceFrameUuid: 'u2' },
+      ]);
+    });
+
+    it('does not show a uuid left stored under Auto as pinned, and the click pins it', async () => {
+      projectWith({ mode: 'auto', reference: 'u1' });
+      await mount(projectTab('p1'));
+      expect(screen.getByRole('button', { name: 'Use a.fits as the reference frame' })).toHaveAttribute('aria-pressed', 'false');
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use a.fits as the reference frame' }));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      expect(argsOf('set_project_stacking_config')).toEqual([
+        { projectId: 'p1', config: MANUAL, excludedFrameUuids: [], referenceFrameUuid: 'u1' },
+      ]);
+    });
+
+    it('disables the checkboxes and the pins while a run is active', async () => {
+      projectWith({ activeRunId: 9 });
+      await mount(projectTab('p1'));
+      expect(screen.getByRole('checkbox', { name: 'Include a.fits in the next run' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Use a.fits as the reference frame' })).toBeDisabled();
+    });
+
+    it('a frame set\u2019s table has no publisher and no pin', async () => {
+      await mount(frameSetTab(7));
+      expect(screen.queryByRole('button', { name: 'Publisher' })).toBeNull();
+      expect(screen.queryByRole('columnheader', { name: 'Reference' })).toBeNull();
+    });
   });
 });

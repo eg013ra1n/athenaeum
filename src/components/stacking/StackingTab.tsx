@@ -8,6 +8,7 @@ import { subjectKey, type StackSubject, type SubjectKey } from './subject';
 import { useStackingSubjectApi, type StackingSubjectApi, type SubjectConfig } from './useStackingSubjectApi';
 import type {
   NamedPreset,
+  PlanProjectFrame,
   Stage,
   StackingConfig,
   StackingPlan,
@@ -49,11 +50,12 @@ interface PendingWrite {
   value: SubjectConfig;
 }
 
-// Stable empty lists for a project subject (no light-frame list, no numeric
-// exclusions): a fresh `[]` per render would re-run every memo and effect
-// keyed on them.
+// Stable empty lists for the kind of subject that has none (a project has no
+// light-frame list and no numeric exclusions; a set has no project frames): a
+// fresh `[]` per render would re-run every memo and effect keyed on them.
 const NO_LIGHT_FRAMES: LightFrameRef[] = [];
 const NO_FRAME_IDS: number[] = [];
+const NO_PROJECT_FRAMES: PlanProjectFrame[] = [];
 
 const PRESET_LABEL: Record<StackingPreset, string> = {
   default: 'Default',
@@ -176,17 +178,19 @@ export function StackingTab({ subject }: StackingTabProps) {
   const dirtyRef = useRef(false);
   const draftForKeyRef = useRef<SubjectKey | null>(null);
 
-  // Fix round 1, Minor #4: whether the currently-pending write includes an
-  // EXCLUSION change — set only by `setUserExcludedFrameIds`, cleared only
-  // once the write carrying it is actually dispatched (same "clear at send
-  // time, not schedule time" discipline as `dirtyRef` itself). `build_plan`
-  // reads `excluded_frame_ids` from the STORED row, never a client override
+  // Fix round 1, Minor #4: whether the currently-pending write includes a
+  // change `build_plan` reads from the STORED row — the EXCLUSION list or a
+  // project's pinned reference — set only by `setUserExcluded` and
+  // `setUserReference`, cleared only once the write carrying it is actually
+  // dispatched (same "clear at send time, not schedule time" discipline as
+  // `dirtyRef` itself). `build_plan` reads `excluded_frame_ids` and the
+  // reference frame from the STORED row, never a client override
   // (`crates/athenaeum-core/src/stacking/plan.rs`), so only a write that
-  // changed the excluded-id list needs the post-write `refetchPlan` below —
-  // a pure config edit is already re-planned by the 300 ms draft-change
-  // effect using a client override, and re-planning it again after the
-  // persist lands would just be a redundant round trip.
-  const exclusionDirtyRef = useRef(false);
+  // changed one of them needs the post-write `refetchPlan` below — a pure
+  // config edit is already re-planned by the 300 ms draft-change effect using
+  // a client override, and re-planning it again after the persist lands would
+  // just be a redundant round trip.
+  const storedRowDirtyRef = useRef(false);
 
   /** The only way `draftConfig` should change as a result of a USER action.
    *  The load effect calls `setDraftConfig` directly (bypassing this) so it
@@ -197,25 +201,31 @@ export function StackingTab({ subject }: StackingTabProps) {
     setDraftConfig(value);
   }, []);
 
-  /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's ONE
-   *  frame-level write. The load effect calls `setExcluded` directly
-   *  (bypassing this), so opening a subject never marks the draft dirty on
-   *  its own; only the Frames table's include checkbox, through
-   *  `handleToggleExcludeFrame` below, goes through here. */
+  /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's
+   *  frame-level write (the pin below is the other). The load effect calls
+   *  `setExcluded` directly (bypassing this), so opening a subject never
+   *  marks the draft dirty on its own; only the Frames table's include
+   *  checkbox, through `handleToggleExcludeFrame` below, goes through here. */
   const setUserExcluded = useCallback<typeof setExcluded>((value) => {
     dirtyRef.current = true;
-    exclusionDirtyRef.current = true;
+    storedRowDirtyRef.current = true;
     setExcluded(value);
   }, []);
 
-  // The Frames table still speaks a set's numeric frame ids; a project's
-  // table is keyed by frame uuid, so it toggles nothing here (its checkbox is
-  // disabled below as well).
-  const handleToggleExcludeFrame = useCallback((frameId: number) => {
-    if (subject.kind !== 'frameSet') return;
-    const key = String(frameId);
+  /** The pinned-reference analogue of `setUserExcluded`: only the Frames
+   *  table's pin, through `handlePinReference` below, goes through here. */
+  const setUserReference = useCallback<typeof setReferenceFrameUuid>((value) => {
+    dirtyRef.current = true;
+    storedRowDirtyRef.current = true;
+    setReferenceFrameUuid(value);
+  }, []);
+
+  // The Frames table speaks exclusion keys: `String(frameId)` for a set, the
+  // frame uuid for a project — the same strings `SubjectConfig.excluded`
+  // holds, so one toggle serves both.
+  const handleToggleExcludeFrame = useCallback((key: string) => {
     setUserExcluded((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
-  }, [subject.kind, setUserExcluded]);
+  }, [setUserExcluded]);
   const excludedFrameIds = useMemo(
     () => (subject.kind === 'frameSet' ? excluded.map(Number) : NO_FRAME_IDS),
     [excluded, subject.kind],
@@ -371,8 +381,8 @@ export function StackingTab({ subject }: StackingTabProps) {
     const payload = pendingWriteRef.current;
     if (!payload) return;
     dirtyRef.current = false;
-    const shouldRefetchPlan = exclusionDirtyRef.current;
-    exclusionDirtyRef.current = false;
+    const shouldRefetchPlan = storedRowDirtyRef.current;
+    storedRowDirtyRef.current = false;
     pendingWriteRef.current = null;
     payload.api.setConfig(payload.value)
       .then(() => {
@@ -458,6 +468,20 @@ export function StackingTab({ subject }: StackingTabProps) {
   const handleConfigChange = useCallback((next: StackingConfig) => {
     setUserConfig(next);
   }, [setUserConfig]);
+
+  // D2: a project's manual reference is a pin in its Frames table. Pinning a
+  // frame sets `reference.mode = 'manual'` and the stored uuid in one render,
+  // so one write carries both; pinning the pinned frame clears the uuid and
+  // returns to Auto. A uuid still stored under Auto is not "the pinned frame":
+  // the click pins it.
+  const handlePinReference = useCallback((uuid: string) => {
+    if (subject.kind !== 'project') return;
+    const clearing = referenceFrameUuid === uuid && draftConfig?.reference.mode === 'manual';
+    setUserReference(clearing ? null : uuid);
+    setUserConfig((prev) =>
+      prev ? { ...prev, reference: { ...prev.reference, mode: clearing ? 'auto' : 'manual' } } : prev,
+    );
+  }, [subject.kind, referenceFrameUuid, draftConfig, setUserReference, setUserConfig]);
 
   const handleToggleDrizzle = useCallback((checked: boolean) => {
     setUserConfig((prev) =>
@@ -773,6 +797,9 @@ export function StackingTab({ subject }: StackingTabProps) {
   const runDisabled = plan.blockers.length > 0 || running || starting;
   const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : runStartsAt;
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
+  // The pin in effect: a uuid stored under Auto is kept for the next Manual but is not the reference.
+  const pinnedReference =
+    subject.kind === 'project' && draftConfig.reference.mode === 'manual' ? referenceFrameUuid : null;
 
   return (
     // Plan 5b final fix wave, review finding B7 (supersedes click-through
@@ -1135,13 +1162,17 @@ export function StackingTab({ subject }: StackingTabProps) {
        *  (the Frames table's nine columns need the room; the Results
        *  panel's master cards read better at full width too). */}
       <FramesTable
+        subjectKind={subject.kind}
         lightFrames={lightFrames}
+        projectFrames={subject.kind === 'project' ? plan.projectFrames : NO_PROJECT_FRAMES}
         runDetail={selectedRunDetail}
-        excludedFrameIds={excludedFrameIds}
+        excludedKeys={excluded}
+        referenceFrameUuid={pinnedReference}
         onToggleExclude={handleToggleExcludeFrame}
+        onPin={handlePinReference}
         collapsed={framesCollapsed}
         onToggleCollapsed={handleToggleFramesCollapsed}
-        disabled={running || subject.kind !== 'frameSet'}
+        disabled={running}
       />
 
       <ResultsPanel

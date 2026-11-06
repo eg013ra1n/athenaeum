@@ -49,7 +49,7 @@ const plan = (over: Record<string, unknown> = {}): StackingPlan =>
     staleStages: [], activeRunId: null, freeBytes: 5e9, estimateBytes: 1e9, workingDir: '/work', outputDir: '/out',
     readiness: READINESS,
     reference: { mode: 'manual', frameId: null, filename: 'ref.fits', onDisk: true },
-    mastersToBuild: [], frameCount: 2, includedCount: 2, excludedFrameIds: [], prepare: null, ...over,
+    mastersToBuild: [], frameCount: 2, includedCount: 2, excludedFrameIds: [], projectFrames: [], prepare: null, ...over,
   }) as unknown as StackingPlan;
 
 const USAGE = {
