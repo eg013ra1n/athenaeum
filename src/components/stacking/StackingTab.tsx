@@ -560,6 +560,12 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
   // draft, whose re-plan builds against the new reference. One write at a time: a second click while the first is on
   // its way would race it for the stored row.
   const referenceWriteRef = useRef(false);
+  // Set in the effect body, not at the declaration, so StrictMode's mount-unmount-mount ends on `true`.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   const pinFrameSetReference = useCallback(async (framesSetId: number, frameId: number, clearing: boolean) => {
     if (referenceWriteRef.current) return;
     referenceWriteRef.current = true;
@@ -580,8 +586,8 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
     } finally {
       referenceWriteRef.current = false;
     }
-    // The tab may show another subject by now; the mode belongs to the subject the write was made for.
-    if (forKey !== subjectKeyRef.current) return;
+    // The tab may be gone, or show another subject, by now; the mode belongs to the subject the write was made for.
+    if (!mountedRef.current || forKey !== subjectKeyRef.current) return;
     setUserConfig((prev) =>
       prev ? { ...prev, reference: { ...prev.reference, mode: clearing ? 'auto' : 'manual' } } : prev,
     );

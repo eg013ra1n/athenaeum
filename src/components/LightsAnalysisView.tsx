@@ -49,9 +49,6 @@ interface LightsAnalysisViewProps {
   setTools?: ReactNode;
 }
 
-// The toolbar pieces live in the shared module; `ToolButton` stays importable from here.
-export { ToolButton } from './toolbar/LabeledToolbar';
-
 export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, projectStates, setTools }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');

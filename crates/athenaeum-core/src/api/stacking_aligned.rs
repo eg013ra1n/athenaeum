@@ -198,7 +198,16 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
             ));
             continue;
         }
-        let path = find_artifact(conn, &subject, &row.group_key, "registered", Some(frame_id))?
+        let artifact = find_artifact(conn, &subject, &row.group_key, "registered", Some(frame_id))?;
+        if artifact.as_ref().is_some_and(|a| a.path.is_none()) {
+            tracing::warn!(
+                run_id,
+                frame_id,
+                group_key = %row.group_key,
+                "registered artifact row has no path"
+            );
+        }
+        let path = artifact
             .and_then(|artifact| artifact.path)
             .map(PathBuf::from)
             .filter(|p| file_exists(p, run_id, frame_id));

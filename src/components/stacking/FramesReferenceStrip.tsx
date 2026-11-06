@@ -1,7 +1,7 @@
 // The two-line reference strip above the Frames table (spec §6.5). Line 1 names the frame the selected run registered
 // onto; line 2 names the reference the next run will use. Both come from data the caller already holds, so the strip
 // needs no request of its own.
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { Star, XCircle } from 'lucide-react';
 import type { PlanReference, StackingRunDetail } from '../../types/stacking';
 
@@ -18,13 +18,17 @@ export interface FramesReferenceStripProps {
 
 const SEP = ' · ';
 const OFF_DISK_TITLE = 'The reference file is not on this device';
+const NO_FRAME_TITLE = 'No reference frame is chosen';
+/** A run that will not change any more: its summary, if it has none, is never coming. */
+const TERMINAL_STATUSES = ['done', 'failed', 'cancelled'];
 
-/** Whether the run registered every group onto its own reference. A run whose summary is not written yet carries the
- *  geometry in its stored config; an unreadable config reads as co-registered, with a warning. */
-function isNativeGeometry(runDetail: StackingRunDetail): boolean {
-  if (runDetail.summary !== null) return runDetail.summary.config.registration.geometry === 'native';
+/** Whether a run registered every group onto its own reference, from the geometry its summary records or, for a run
+ *  whose summary is not written yet, from its stored config; an unreadable config reads as co-registered, with a
+ *  warning. */
+function isNativeGeometry(summaryGeometry: string | null, configJson: string): boolean {
+  if (summaryGeometry !== null) return summaryGeometry === 'native';
   try {
-    const config = JSON.parse(runDetail.run.configJson) as { registration?: { geometry?: string } };
+    const config = JSON.parse(configJson) as { registration?: { geometry?: string } };
     return config.registration?.geometry === 'native';
   } catch (err) {
     console.warn('[FramesReferenceStrip] run config unreadable:', err);
@@ -32,15 +36,16 @@ function isNativeGeometry(runDetail: StackingRunDetail): boolean {
   }
 }
 
-const File = ({ name }: { name: string }) => <span className="font-mono">{name}</span>;
+const FileName = ({ name }: { name: string }) => <span className="font-mono">{name}</span>;
 
 /** The parts of line 1 after the run id, in order; `null` for a run with no reference to name. */
 function runLineParts(
   runDetail: StackingRunDetail,
+  nativeGeometry: boolean,
   groupLabel: (groupKey: string) => string,
   filenameOf: (runFrameId: number) => string | null,
 ): ReactNode[] {
-  if (isNativeGeometry(runDetail)) return ['per group'];
+  if (nativeGeometry) return ['per group'];
 
   const { summary, groups, frames, run } = runDetail;
   const reference = summary?.reference ?? null;
@@ -56,9 +61,9 @@ function runLineParts(
     reference?.filename ?? (frameId === null ? null : (filenameOf(frameId) ?? `#${frameId}`));
   const groupKey = refRow ? groups.find((g) => g.id === refRow.groupId)?.groupKey : undefined;
 
-  const parts: ReactNode[] = [
-    fileName === null ? (reference === null ? 'not picked yet' : 'not recorded') : <File key="file" name={fileName} />,
-  ];
+  // No reference named: a run still going has not picked one yet; a run that has ended never will.
+  const notNamed = reference === null && !TERMINAL_STATUSES.includes(run.status) ? 'not picked yet' : 'not recorded';
+  const parts: ReactNode[] = [fileName === null ? notNamed : <FileName key="file" name={fileName} />];
   if (groupKey !== undefined) parts.push(groupLabel(groupKey));
   if (reference?.weight != null) parts.push(`weight ${reference.weight.toFixed(3)}`);
   parts.push(reference?.mode ?? run.referenceMode);
@@ -66,7 +71,7 @@ function runLineParts(
     const previous = filenameOf(reference.switchedFrom);
     parts.push(
       <span key="switched">
-        two-pass moved it from {previous === null ? `#${reference.switchedFrom}` : <File name={previous} />}
+        two-pass moved it from {previous === null ? `#${reference.switchedFrom}` : <FileName name={previous} />}
       </span>,
     );
   }
@@ -77,9 +82,23 @@ const joined = (parts: ReactNode[]): ReactNode[] =>
   parts.flatMap((part, i) => (i === 0 ? [part] : [SEP, part]));
 
 export function FramesReferenceStrip({ runDetail, planReference, groupLabel, filenameOf }: FramesReferenceStripProps) {
-  const nextFile =
-    planReference !== null && planReference.mode === 'manual'
-      ? (planReference.filename ?? (planReference.frameId === null ? null : `#${planReference.frameId}`))
+  const summaryGeometry = runDetail?.summary?.config.registration.geometry ?? null;
+  const configJson = runDetail?.run.configJson ?? null;
+  const nativeGeometry = useMemo(
+    () => (configJson === null ? false : isNativeGeometry(summaryGeometry, configJson)),
+    [summaryGeometry, configJson],
+  );
+
+  const nextManual = planReference !== null && planReference.mode === 'manual';
+  const nextFile = nextManual
+    ? (planReference.filename ?? (planReference.frameId === null ? null : `#${planReference.frameId}`))
+    : null;
+  const nextWithoutFrame = nextManual && nextFile === null;
+  // The error mark beside line 2: a manual reference that cannot be used.
+  const markLabel = nextWithoutFrame
+    ? NO_FRAME_TITLE
+    : nextFile !== null && planReference !== null && !planReference.onDisk
+      ? OFF_DISK_TITLE
       : null;
 
   return (
@@ -89,24 +108,26 @@ export function FramesReferenceStrip({ runDetail, planReference, groupLabel, fil
           <Star size={12} className="shrink-0 text-accent" aria-hidden="true" />
           <span className="min-w-0 break-words">
             Registration reference, run #{runDetail.run.id}:{' '}
-            {joined(runLineParts(runDetail, groupLabel, filenameOf))}
+            {joined(runLineParts(runDetail, nativeGeometry, groupLabel, filenameOf))}
           </span>
         </div>
       )}
       <div data-testid="reference-line-next" className="flex items-center gap-1.5 text-content-muted">
         {runDetail !== null && <span className="w-3 shrink-0" aria-hidden="true" />}
         <span className="min-w-0 break-words">
-          {nextFile === null ? (
+          {nextWithoutFrame ? (
+            'Next run: manual, no frame chosen'
+          ) : nextFile === null ? (
             'Next run: auto, picked at run time'
           ) : (
             <>
-              Next run: <File name={nextFile} />
+              Next run: <FileName name={nextFile} />
               {SEP}manual
             </>
           )}
         </span>
-        {nextFile !== null && planReference !== null && !planReference.onDisk && (
-          <span title={OFF_DISK_TITLE} className="shrink-0 text-error">
+        {markLabel !== null && (
+          <span title={markLabel} role="img" aria-label={markLabel} className="shrink-0 text-error">
             <XCircle size={12} aria-hidden="true" />
           </span>
         )}

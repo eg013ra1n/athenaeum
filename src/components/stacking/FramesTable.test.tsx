@@ -161,10 +161,11 @@ describe('FramesTable for a frame set', () => {
       ...SET,
       lightFrames: lights,
       runDetail: null,
-      planGroups: [planGroup('L', 1.2), planGroup('R', 1.2)],
+      // R before L, against the alphabet and against the order of the frames: only the plan can put R first.
+      planGroups: [planGroup('R', 1.2), planGroup('L', 1.2)],
       planGroupByFrameId: new Map(lights.map((f) => groupOf(f.frameId))),
     });
-    expect(headers().map((h) => h.textContent?.slice(0, 1))).toEqual(['L', 'R']);
+    expect(headers().map((h) => h.textContent?.slice(0, 1))).toEqual(['R', 'L']);
     expect(screen.queryByText(/Not grouped yet/)).toBeNull();
     expect(headerOf(/^L/)).toHaveTextContent('0 / 4 included');
     expect(headerOf(/^R/)).toHaveTextContent('0 / 4 included');
@@ -327,6 +328,20 @@ describe('FramesTable for a project', () => {
     renderTable();
     fireEvent.click(within(screen.getByRole('columnheader', { name: 'Publisher' })).getByRole('button'));
     expect(fileColumn()).toEqual(['a.fits', 'c.fits', 'b.fits', 'e.fits', 'd.fits']);
+  });
+
+  it('the sorted column header says its direction and the others say none', () => {
+    renderTable();
+    const sortOf = (name: string) => screen.getByRole('columnheader', { name }).getAttribute('aria-sort');
+    expect(sortOf('File')).toBe('ascending');
+    expect(sortOf('Publisher')).toBe('none');
+
+    fireEvent.click(within(screen.getByRole('columnheader', { name: 'Publisher' })).getByRole('button'));
+    expect(sortOf('Publisher')).toBe('ascending');
+    expect(sortOf('File')).toBe('none');
+
+    fireEvent.click(within(screen.getByRole('columnheader', { name: 'Publisher' })).getByRole('button'));
+    expect(sortOf('Publisher')).toBe('descending');
   });
 
   it('shift_click_selects_range', () => {

@@ -580,6 +580,28 @@ describe('StackingTab Frames table writes for a frame set', () => {
     expect(star('a.fit', false)).toHaveAttribute('aria-pressed', 'false');
   });
 
+  it('a star write that lands after the tab is gone tells nobody', async () => {
+    referenceBackend('auto');
+    const base = vi.mocked(api.invoke).getMockImplementation() as (command: string, args?: unknown) => Promise<unknown>;
+    let landWrite!: () => void;
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: unknown) =>
+      command === 'set_frame_set_reference'
+        ? new Promise<void>((resolve) => { landWrite = resolve; })
+        : base(command, args)) as never);
+    const onReferenceChanged = vi.fn();
+    const view = await mount(frameSetTab(7, { onReferenceChanged }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    fireEvent.click(star('a.fit', false));
+    expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 101 }]);
+    view.unmount();
+    landWrite();
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(onReferenceChanged).not.toHaveBeenCalled();
+    expect(argsOf('set_stacking_config')).toEqual([]);
+  });
+
   it('a failed clear keeps the pin and the Manual mode', async () => {
     referenceBackend('manual', 101, ['clear_frame_set_reference']);
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});

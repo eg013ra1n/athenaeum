@@ -371,6 +371,16 @@ describe('BlinkViewer — aligned frames of a stacking run', () => {
     expect(invoked('read_fits_image_rustafits')).toHaveLength(0);
   });
 
+  it('the switch is a toggle button named by its title', async () => {
+    renderBlink({ actions: [], frames: [available(1)] });
+    const showingAligned = await screen.findByRole('button', { name: SWITCH_TO_ORIGINAL });
+    expect(showingAligned).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(showingAligned);
+
+    expect(screen.getByRole('button', { name: SWITCH_TO_ALIGNED })).toHaveAttribute('aria-pressed', 'false');
+  });
+
   it('toggle_reloads_original', async () => {
     renderBlink({ actions: [], frames: [available(1), available(2)] });
     await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(2));

@@ -39,11 +39,12 @@ const summaryOf = (over: SummaryOver = {}): RunSummary =>
 
 const detailOf = (
   summary: RunSummary | null,
-  over: { frames?: StackingRunFrameRow[]; configJson?: string; referenceMode?: string } = {},
+  over: { frames?: StackingRunFrameRow[]; configJson?: string; referenceMode?: string; status?: string } = {},
 ): StackingRunDetail =>
   ({
     run: {
       id: 8,
+      status: over.status ?? 'running',
       referenceMode: over.referenceMode ?? 'auto',
       configJson: over.configJson ?? JSON.stringify({ registration: { geometry: 'coRegistered' } }),
     },
@@ -126,6 +127,13 @@ describe('FramesReferenceStrip', () => {
     );
   });
 
+  it.each(['done', 'failed', 'cancelled'])('strip_ended_%s_run_without_a_reference_reads_not_recorded', (status) => {
+    show({ runDetail: detailOf(null, { status, frames: [row({ frameId: 3, regStatus: null })] }) });
+    expect(screen.getByTestId('reference-line-run').textContent).toBe(
+      'Registration reference, run #8: not recorded · auto',
+    );
+  });
+
   it('strip_in_flight_native_per_group', () => {
     const configJson = JSON.stringify({ registration: { geometry: 'native' } });
     show({ runDetail: detailOf(null, { configJson, frames: [row({ frameId: 7, regStatus: 'reference' })] }) });
@@ -155,6 +163,14 @@ describe('FramesReferenceStrip', () => {
     show({ planReference: { mode: 'manual', frameId: 7, filename: 'L_0037.fits', onDisk: false } });
     expect(screen.getByTestId('reference-line-next').textContent).toBe('Next run: L_0037.fits · manual');
     expect(screen.getByTitle('The reference file is not on this device')).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'The reference file is not on this device' })).toBeTruthy();
+  });
+
+  it('strip_next_run_manual_without_a_frame', () => {
+    show({ planReference: { mode: 'manual', frameId: null, filename: null, onDisk: false } });
+    expect(screen.getByTestId('reference-line-next').textContent).toBe('Next run: manual, no frame chosen');
+    expect(screen.getByRole('img', { name: 'No reference frame is chosen' })).toBeTruthy();
+    expect(screen.queryByRole('img', { name: 'The reference file is not on this device' })).toBeNull();
   });
 
   it('strip_next_run_without_a_plan_reads_auto', () => {

@@ -312,7 +312,12 @@ export function FramesTable({
                         />
                       </th>
                       {columns.map((c) => (
-                        <th key={c.id} className="py-1.5 px-2 font-medium" title={c.title}>
+                        <th
+                          key={c.id}
+                          className="py-1.5 px-2 font-medium"
+                          title={c.title}
+                          aria-sort={sortKey !== c.sortKey ? 'none' : sortDir === 'asc' ? 'ascending' : 'descending'}
+                        >
                           <button
                             type="button"
                             onClick={() => handleSort(c.sortKey)}

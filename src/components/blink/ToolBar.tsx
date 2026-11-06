@@ -58,6 +58,11 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   onClose,
 }) {
   const alignedOn = imageVariant?.aligned === true;
+  const variantTitle = imageVariant
+    ? imageVariant.aligned
+      ? "Show original frames"
+      : `Show aligned frames (run #${imageVariant.runId})`
+    : undefined;
   return (
     <div className="flex items-center justify-between px-4 py-2 bg-surface border-b border-border">
       {/* Left: Playback controls */}
@@ -173,7 +178,9 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
                 ? "bg-accent text-surface"
                 : "bg-surface-elevated text-content hover:bg-surface-hover"
             }`}
-            title={imageVariant.aligned ? "Show original frames" : `Show aligned frames (run #${imageVariant.runId})`}
+            title={variantTitle}
+            aria-label={variantTitle}
+            aria-pressed={imageVariant.aligned}
           >
             <Layers size={20} />
           </button>

@@ -41,9 +41,8 @@ interface Resolved {
   entry: BlinkFrame;
 }
 
-/** What loading found: how many rows could be asked for, and the entries in the rows' order. */
+/** What loading found: the entries, in the rows' order. */
 interface Loaded {
-  asked: number;
   resolved: Resolved[];
 }
 
@@ -58,7 +57,7 @@ async function loadSetEntries(rows: FrameRow[]): Promise<Loaded> {
     const fw = row.frameId === null ? undefined : byFrameId.get(row.frameId);
     return fw ? [{ row, entry: { ...fw, key: row.key } }] : [];
   });
-  return { asked: frameIds.length, resolved };
+  return { resolved };
 }
 
 /** A project's entries, by frame uuid: a row keyed `h:<handle>` has no uuid (its frame left the project) and is not
@@ -88,7 +87,7 @@ async function loadProjectEntries(projectId: string, rows: FrameRow[]): Promise<
     };
     return [{ row, entry }];
   });
-  return { asked: askable.length, resolved };
+  return { resolved };
 }
 
 /** What the context strip says when an entry shows its original although the run was asked for its aligned frame. */
