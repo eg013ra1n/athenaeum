@@ -306,13 +306,13 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
   - `set_collab_project_grid` writes the local copy only after the hub's 2xx.
 - **Feed and event.** `ChangeKind::Grid` now triggers the project refresh. Each of the six live-feed refresh sites emits `collab-grid-changed { projectId }` for every project whose grid moved (`FeedApplier::emit_grid_moves`).
   - `set_collab_project_grid` emits the event itself after a successful save (on every successful save; a re-plan is idempotent). The saving device gets it from the command, and every other device from the feed: the saving device's own cache write makes its feed refresh a no-op.
-  - A grid move picked up first by the hosts' `refresh_projects` command or the device-replace refresh emits no event; the cards carry `canonicalGrid`. 6c re-reads on a card refresh too.
+  - A grid move picked up first by the hosts' `refresh_projects` command or the device-replace refresh emits no event; the cards carry `canonicalGrid`. The 6c Stacking tab re-plans on the event only and does not read the card, so such a move shows at its next refetch.
 - **Proposal** (`collab::grid_geometry::propose_grid`). It is deterministic for a manifest version.
   - Scale: the median `pixelScaleArcsec` of the accepted frames, rounded to 0.01″. Centre: the project target. Rotation: 0.
   - Size: the bounding box, in the proposed TAN, of the WCS frames' footprints (SIP applied), clipped to the target circle, rounded up to a multiple of 64 and clamped to [64, 65536]. With no WCS frame, a square of 2 × the target radius.
   - `framesInside` counts the frames at least half inside (a 16 × 16 sample).
   - With no accepted frame carrying a scale there is no proposal, and none either when the median scale rounds outside the hub's (0, 100].
-  - Two counts, labelled distinctly in 6c: `get_collab_grid_proposal.framesInside` counts against the PROPOSAL (spec §6.2); the plan's `PlanGrid.framesInside` counts against the current grid, or the proposal when none is set.
+  - Two counts: `get_collab_grid_proposal.framesInside` counts against the PROPOSAL (spec §6.2); the plan's `PlanGrid.framesInside` counts against the current grid, or the proposal when none is set. The 6c card shows only the plan's, and only under an unconfirmed grid (so it counts against the proposal); the card never calls `get_collab_grid_proposal`, because `PlanGrid` already carries `current`, `proposal` and `canEdit`.
 - **Two commands, on both hosts** (strict count 297 → 299):
   - `get_collab_grid_proposal { projectId } -> { current, proposal, framesInside, canEdit }`, DB-only.
   - `set_collab_project_grid { projectId, grid } -> grid`. It validates and normalizes the grid, and refuses a caller without `project.edit` with "This account cannot edit the project's grid (it needs project.edit and membership)." It then PUTs, writes the cache, emits `collab-grid-changed` and echoes its own normalized grid. A hub 400 is `Invalid`, carrying the hub client's wrapped message (`hub returned 400 Bad Request (put project grid): …`); local validation mirrors the hub's text, so that wrapper shows only when the two disagree.
@@ -329,6 +329,26 @@ The stacking side is in `docs/stacking/README.md` (The project path on the grid,
 - `cleanup_project_stacking_work`, once no project run is active, sweeps the stacking artifact rows of every handle whose `(project, uuid)` left `project_frames_local`: rows only, never a file. A coordinator-excluded frame is still local, so its cache survives a restore. Every refusal (an active run, an invalid stored config, a layout that overlaps a scan root) comes before any write.
 - A project run reads the replicas in place and writes nothing under the Collaboration root; no file it writes carries `ATH_PRJ`.
 - An acceptance catalog copy that stacks a project runs signed out (its `account.hub_url` points at an unreachable address), so the feed never replaces its local grid. `account_sign_out` is never called on a copy: the token store is shared with the real app.
+
+## Collab wave 6c — the grid card (2026-11-06)
+
+The Stacking tab as a whole is in `docs/stacking/README.md` (The project's Stacking tab, wave 6c); plan `docs/superpowers/plans/2026-11-05-collab-v3-wave6c-project-stacking-ui-plan.md` (D11, Task 7). No new command and no new route: the card reads `get_project_stacking_plan`'s `grid` and writes through `set_collab_project_grid`.
+
+- **The card is the coordinator's confirm path.** Before 6c no screen called `set_collab_project_grid`. `GridCard` (project page, Stacking tab, above the board) shows the project's canonical grid and, for a caller who may edit it (`PlanGrid.canEdit`: `project.edit` and membership), is where it is confirmed or changed. Every run registers onto this grid, so while it is unconfirmed the plan carries the `grid` blocker and the Register row reads blocked.
+- **What each viewer sees.**
+
+  | Grid | Viewer | Card |
+  | ---- | ---- | ---- |
+  | not confirmed | editor | `Canonical grid — not confirmed`, the proposal's values, `<n> accepted frames lie at least half inside`, and `Use proposal` (saves the proposal as it is) and `Edit…` (the dialog, prefilled with the proposal). With no proposal: `No proposal yet.` and only `Edit…`, prefilled from the project target, 1″/px, 4096 × 4096, rotation 0 |
+  | not confirmed | any other member | `Waiting for the coordinator to confirm the grid` (the blocker's own text) and the proposal's values, read-only |
+  | confirmed | editor | `Canonical grid`, the values, and `Change…` |
+  | confirmed | any other member | `Canonical grid` and the values, no button |
+
+  The values line reads `<scale>″/px · <w> × <h> px (<w·scale/3600>° × <h·scale/3600>°) · centre RA <crval1>° Dec <crval2>° · rotation <rotationDeg>°`. The scale reads two decimals and the centre four (`2.00″/px`, `83.8000°`); the size, the field of view and the rotation drop trailing zeros.
+- **The rewrite warning.** The dialog opened from `Change…` says, above Save, `Changing the grid makes every processor's next run rewrite its registered frames. Star matching is kept.` (a registered frame's hash holds the grid hash and the star map's does not: stacking README, D2 of 6b-3). A dialog opened from `Edit…` shows it too if the grid was confirmed by someone else in the meantime.
+- **Save.** The dialog's six fields are checked as the hub checks them (`validateGrid` mirrors `CanonicalGrid::validate`: scale in (0, 100], sides whole numbers in [64, 65536], RA in [0, 360), Dec in [−90, 90], a finite rotation); Save stays disabled while a field is out of bounds. A refused save — a 403 because the capability went, a 400 for the hub's bounds, or another member got there first — keeps the dialog open with the backend's message under the fields, logs `[GridDialog] set_collab_project_grid failed:` and notifies once (`Grid not saved`); a refused `Use proposal` does the same from the card. A save that goes through closes the dialog and re-plans the tab at once.
+- **Members follow without reopening the page.** `set_collab_project_grid` emits `collab-grid-changed`, and every other device gets it from the feed. The Stacking tab of that project re-plans on it (and on `collab-frames-changed`), coalesced to one refetch per second, so a member's `Waiting for the coordinator to confirm the grid` turns into the confirmed grid and the Register row unblocks.
+- **The schematic** under the values draws the grid shown (the confirmed one, else the proposal), the project's target circle and the outline of every accepted frame with a manifest WCS in its publisher's colour, so the grid can be judged against the frames' spread; the dialog redraws it from the draft. Details: stacking README.
 
 ## Zip-resident files are not sent (zip plan, 2026-10-28, v1)
 

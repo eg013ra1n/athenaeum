@@ -122,7 +122,10 @@ export function StageRow({ index, stage, label, state, summary, progress, select
         <span className="w-5 shrink-0 text-xs text-content-muted tabular-nums">{index}</span>
         <span className="w-40 shrink-0 text-sm font-medium text-content truncate">{label}</span>
 
-        <span className="flex-1 min-w-0 text-xs text-content-muted truncate">
+        <span
+          className="flex-1 min-w-0 text-xs text-content-muted truncate"
+          title={state === 'running' && progress ? undefined : summary}
+        >
           {state === 'running' && progress ? (
             <span className="flex items-center gap-2">
               <span className="flex-1 h-1.5 rounded-full bg-surface overflow-hidden max-w-[120px]">

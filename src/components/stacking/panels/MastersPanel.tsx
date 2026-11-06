@@ -1,8 +1,10 @@
 // Stage 0.5 (Masters) inspector panel: info only — like `DebayerPanel`, this
 // stage has no config of its own (owner requirement 2026-09-09: the run
 // builds/rebuilds its own missing calibration masters before calibrating).
-// Lists exactly what `plan.mastersToBuild` says the run would do.
+// Lists exactly what `plan.mastersToBuild` says the run would do. A project
+// and an attested set need no masters (wave 6c), and the panel says so.
 
+import { mastersNotNeeded } from '../stageSummary';
 import type { StackingPlan } from '../../../types/stacking';
 
 export interface MastersPanelProps {
@@ -10,6 +12,11 @@ export interface MastersPanelProps {
 }
 
 export function MastersPanel({ plan }: MastersPanelProps) {
+  const notNeeded = mastersNotNeeded(plan);
+  if (notNeeded !== null) {
+    return <p className="text-sm text-content-secondary">{notNeeded}</p>;
+  }
+
   const items = plan?.mastersToBuild ?? [];
 
   return (

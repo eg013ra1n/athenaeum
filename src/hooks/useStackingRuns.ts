@@ -10,10 +10,16 @@ import type {
   StartedStacking,
 } from '../types/stacking';
 import { useNotifications } from '../contexts/NotificationContext';
+import {
+  eventSubjectKey,
+  subjectLink,
+  type StackSubject,
+  type SubjectKey,
+} from '../components/stacking/subject';
 
 export interface RunProgress {
   runId: number;
-  setId: number;
+  subjectKey: SubjectKey;
   stage: Stage;
   groupKey: string | null;
   current: number;
@@ -29,7 +35,7 @@ export interface RunProgress {
 
 export interface RunOutcome {
   runId: number;
-  setId: number;
+  subjectKey: SubjectKey;
   success: boolean;
   cancelled: boolean;
   error: string | null;
@@ -45,22 +51,34 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** The Stacking-tab link for an event's subject. An event carries only the
+ *  ids (no title, no frame list), so the subject is rebuilt from them; it is
+ *  called after `eventSubjectKey` has accepted the event, so exactly one id
+ *  is set. */
+function eventLink(e: { setId: number | null; projectId: string | null }): string {
+  return e.setId != null
+    ? subjectLink({ kind: 'frameSet', framesSetId: e.setId, lightFrames: [] })
+    : subjectLink({ kind: 'project', projectId: e.projectId ?? '', title: '' });
+}
+
 /**
- * Tracks in-flight stacking runs by frame-set id. The backend (ComputeQueue,
- * Plan 5a) owns admission and progress — this hook holds no frontend FIFO,
- * mirroring `useMasterBuilds`'s listener discipline exactly: fire-and-forget
+ * Tracks in-flight stacking runs by subject (a frame set or a project, see
+ * `subject.ts`). The backend (ComputeQueue, Plan 5a) owns admission and
+ * progress — this hook holds no frontend FIFO, mirroring
+ * `useMasterBuilds`'s listener discipline exactly: fire-and-forget
  * `startRun`/`cancelRun`, all state transitions arrive via
  * `stacking-progress` / `stacking-complete` events.
  *
- * `progress` holds the LAST progress event per set and is cleared the
- * instant that set's run finishes (success, cancel, or failure) — so
- * `isRunning(setId)` (`progress.has(setId)`) and `stageSummary.ts`'s
+ * `progress` holds the LAST progress event per subject and is cleared the
+ * instant that subject's run finishes (success, cancel, or failure) — so
+ * `isRunning(key)` (`progress.has(key)`) and `stageSummary.ts`'s
  * `rowState` both read "an entry in `progress`" as "a run is active right
- * now" and fall back to `lastOutcome` once it is gone.
+ * now" and fall back to `lastOutcome` once it is gone. A project's run and a
+ * frame set's run never share an entry: each tab reads only its own key.
  */
 export function useStackingRuns() {
-  const [progress, setProgress] = useState<Map<number, RunProgress>>(new Map());
-  const [lastOutcome, setLastOutcome] = useState<Map<number, RunOutcome>>(new Map());
+  const [progress, setProgress] = useState<Map<SubjectKey, RunProgress>>(new Map());
+  const [lastOutcome, setLastOutcome] = useState<Map<SubjectKey, RunOutcome>>(new Map());
   const { notify } = useNotifications();
 
   useEffect(() => {
@@ -71,18 +89,16 @@ export function useStackingRuns() {
     api
       .listen<StackingProgressEvent>('stacking-progress', (payload) => {
         if (cancelled) return;
-        // A project run (no set id) is keyed and shown by the project's
-        // Stacking tab — wave 6c. Until then this hook tracks frame sets only.
-        const setId = payload.setId;
-        if (setId == null) return;
+        const key = eventSubjectKey(payload);
+        if (key == null) return;
         setProgress((prev) => {
           const next = new Map(prev);
-          const existing = prev.get(setId);
+          const existing = prev.get(key);
           const startedAt =
             existing && existing.runId === payload.runId ? existing.startedAt : Date.now();
-          next.set(setId, {
+          next.set(key, {
             runId: payload.runId,
-            setId,
+            subjectKey: key,
             stage: payload.stage,
             groupKey: payload.groupKey,
             current: payload.current,
@@ -103,15 +119,15 @@ export function useStackingRuns() {
     api
       .listen<StackingCompleteEvent>('stacking-complete', (payload) => {
         if (cancelled) return;
-        const setId = payload.setId;
-        if (setId == null) return;
+        const key = eventSubjectKey(payload);
+        if (key == null) return;
         const finishedAt = Date.now();
 
         setLastOutcome((prev) => {
           const next = new Map(prev);
-          next.set(setId, {
+          next.set(key, {
             runId: payload.runId,
-            setId,
+            subjectKey: key,
             success: payload.success,
             cancelled: payload.cancelled,
             error: payload.error,
@@ -126,10 +142,10 @@ export function useStackingRuns() {
         // — a stale/duplicate event for a superseded run must not erase a
         // newer run's live progress.
         setProgress((prev) => {
-          const existing = prev.get(setId);
+          const existing = prev.get(key);
           if (!existing || existing.runId !== payload.runId) return prev;
           const next = new Map(prev);
-          next.delete(setId);
+          next.delete(key);
           return next;
         });
 
@@ -148,7 +164,7 @@ export function useStackingRuns() {
           hasErrors: !payload.success && !payload.cancelled,
           tone: payload.success ? 'success' : payload.cancelled ? 'info' : 'warning',
           dedupeKey: `stack-${payload.runId}`,
-          link: `/objects/${setId}?tab=stacking`,
+          link: eventLink(payload),
         });
 
         if (payload.success) {
@@ -174,16 +190,18 @@ export function useStackingRuns() {
   // cleanup, e.g. clearing an optimistic "starting" flag) but must not
   // ALSO notify — that would double the toast.
   const startRun = useCallback(
-    async (setId: number, config?: StackingConfig, rerunFrom?: Stage): Promise<number> => {
+    async (subject: StackSubject, config?: StackingConfig, rerunFrom?: Stage): Promise<number> => {
+      const command = subject.kind === 'frameSet' ? 'start_stacking' : 'start_project_stacking';
       try {
-        const result = await api.invoke<StartedStacking>('start_stacking', {
-          setId,
-          config,
-          rerunFrom,
-        });
+        const result = await api.invoke<StartedStacking>(
+          command,
+          subject.kind === 'frameSet'
+            ? { setId: subject.framesSetId, config, rerunFrom }
+            : { projectId: subject.projectId, config, rerunFrom },
+        );
         return result.runId;
       } catch (err) {
-        console.error('[useStackingRuns] start_stacking failed:', err);
+        console.error(`[useStackingRuns] ${command} failed:`, err);
         notify({
           title: 'Failed to start stacking',
           detail: String(err),
@@ -213,7 +231,7 @@ export function useStackingRuns() {
     }
   }, [notify]);
 
-  const isRunning = useCallback((setId: number): boolean => progress.has(setId), [progress]);
+  const isRunning = useCallback((key: SubjectKey): boolean => progress.has(key), [progress]);
 
   return { progress, lastOutcome, startRun, cancelRun, isRunning };
 }

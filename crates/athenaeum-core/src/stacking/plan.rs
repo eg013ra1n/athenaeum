@@ -243,6 +243,37 @@ pub enum GridState {
     Confirmed,
 }
 
+/// The project's target circle (the project row's `targetRaDeg`, `targetDecDeg`, `targetRadiusDeg`), in
+/// degrees: what the grid schematic centres on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGridTarget {
+    // Right ascension of the target centre, degrees.
+    pub ra_deg: f64,
+    // Declination of the target centre, degrees.
+    pub dec_deg: f64,
+    // Radius of the target circle, degrees.
+    pub radius_deg: f64,
+}
+
+/// One frame's outline for the grid schematic (plan 6c): the frame's pixel-edge boundary on the sky.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGridFootprint {
+    // The frame's uuid in the project's manifest.
+    pub frame_uuid: String,
+    // The publisher's account id: the key a client colours the outline by.
+    pub publisher_account_id: String,
+    // The publisher's display name, for a label; never a colour key.
+    pub publisher: String,
+    // The frame's canonical filter name.
+    pub filter_canonical: String,
+    // `[raDeg, decDeg]` of the frame's pixel edges (eight points per edge, corners included) through its
+    // manifest WCS, SIP included: RA/Dec degrees, RA in 0-360, perimeter order; project each point, never
+    // interpolate in RA (an outline can straddle RA 0/360).
+    pub outline: Vec<[f64; 2]>,
+}
+
 /// A project plan's grid (spec §6, §7).
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +285,32 @@ pub struct PlanGrid {
     // (the confirmed one, else the proposal).
     pub frames_inside: usize,
     pub can_edit: bool,
+    // The project's target circle.
+    pub target: PlanGridTarget,
+    // The outline of every published, accepted frame of the project that has a manifest WCS and a pixel
+    // size, on this device or not, so every member sees the same picture.
+    pub footprints: Vec<PlanGridFootprint>,
+    // The published, accepted frames with no outline: no manifest WCS, no pixel size, unreadable
+    // metadata, or a WCS whose edges do not project to finite sky points.
+    pub frames_not_drawn: u32,
+}
+
+/// What the run's Prepare stage will do with the included frames of a project or an attested frame set (spec
+/// §5.1, §13): one count per action, from the same header probe the run reads. A manually excluded frame is
+/// not counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPrepare {
+    // Float files used where they lie.
+    pub in_place: u32,
+    // CFA mosaics debayered into a new three-plane copy.
+    pub debayered: u32,
+    // Integer FITS and XISF files converted into a float32 copy (debayered too when the file is a mosaic).
+    pub converted: u32,
+    // Files no reader here decodes: they leave the plan.
+    pub unsupported: u32,
+    // Files inside a zip: the run probes them after extracting them.
+    pub at_run: u32,
 }
 
 /// One row of a project plan's Frames table (spec §7): every published,
@@ -319,6 +376,9 @@ pub struct StackingPlan {
     pub grid: Option<PlanGrid>,
     // A project plan's Frames rows (spec §7); empty for a frame set.
     pub project_frames: Vec<PlanProjectFrame>,
+    // What Prepare will do with the included frames (spec §5.1, §13): `Some` for a project and for an
+    // attested frame set, `None` for every other frame set.
+    pub prepare: Option<PlanPrepare>,
 }
 
 // ── config-hash helpers (spec §9.3) ─────────────────────────────────────────
@@ -2129,8 +2189,17 @@ struct SubjectInputs {
     /// Blockers ahead of every shared gate: a frame set's gate 1
     /// (masters / links / masterFiles), a project's `grid`.
     blockers: Vec<PlanBlocker>,
-    /// A project's own warnings (spec §7); empty for a frame set.
+    /// A project's own warnings (spec §7); an attested set's unreadable-file warning; empty for any other
+    /// frame set.
     warnings: Vec<String>,
+    /// What Prepare will do: `Some` for a project and for an attested set (plan 6c Task 1).
+    prepare: Option<PlanPrepare>,
+    /// What Prepare writes (conversions and debayers): `Some` for a project and for an attested set, whose
+    /// estimate counts it in place of a calibrated copy (review M2); `None` for a calibrated set.
+    prepared_bytes: Option<u64>,
+    /// The handles of the frames Prepare cannot read (review I1, plan 6c D8): they leave the plan's included
+    /// counts and the ≥ 3 rule, not `excluded_frame_ids`. Empty for a calibrated set.
+    unsupported_ids: HashSet<i64>,
     project: Option<ProjectInputs>,
 }
 
@@ -2144,11 +2213,172 @@ struct ProjectInputs {
     /// The size of the grid in use — the space estimate's registered and
     /// master geometry. `None` when there is neither grid nor proposal.
     grid_dims: Option<(u64, u64)>,
+}
+
+/// What the Prepare probe found over the included frames of a project or an attested set.
+struct PrepareProbe {
+    counts: PlanPrepare,
     /// What Prepare writes (conversions and debayers).
     prepared_bytes: u64,
-    /// The handles of the frames Prepare cannot read (review I1): they leave
-    /// the plan's included counts and the ≥ 3 rule, not `excluded_frame_ids`.
+    /// The file names of the frames that open but that Prepare cannot read, for the plan's warning.
+    unsupported_names: Vec<String>,
+    /// The file names of the frames whose file cannot be opened (review I1): offline, moved or renamed,
+    /// not an unsupported format. They are in `unsupported_ids` too, for Prepare leaves them out the same way.
+    absent_names: Vec<String>,
     unsupported_ids: HashSet<i64>,
+    unsupported_why: HashMap<i64, String>,
+}
+
+impl PrepareProbe {
+    /// The plan's warnings for the files left out: the unreadable ones, then the absent ones.
+    fn warnings(&self) -> Vec<String> {
+        unsupported_files_warning(&self.unsupported_names)
+            .into_iter()
+            .chain(absent_files_warning(&self.absent_names))
+            .collect()
+    }
+}
+
+/// Spec §5.1 / §13 / plan 6c Task 1: what Prepare will do with each included frame (not manually excluded),
+/// from a header probe alone: nothing is extracted or written. A project's plan and an attested set's plan
+/// (plan 6c D8) share it, so the two count and drop an unreadable file the same way. The frame-set arm is
+/// reached only for an attested set, whose lights are the frames Prepare reads.
+fn probe_prepare(
+    conn: &Connection,
+    cfg: &StackingConfig,
+    subject: &StackSubject,
+    groups: &[IntegrationGroup],
+    excluded_set: &HashSet<i64>,
+) -> PrepareProbe {
+    use crate::stacking::prepare::{
+        prepare_action, prepared_bytes, probe_file, PrepareAction, PrepareRead,
+    };
+    let mut probe = PrepareProbe {
+        counts: PlanPrepare::default(),
+        prepared_bytes: 0,
+        unsupported_names: Vec::new(),
+        absent_names: Vec::new(),
+        unsupported_ids: HashSet::new(),
+        unsupported_why: HashMap::new(),
+    };
+    for g in groups {
+        for f in g
+            .frames
+            .iter()
+            .filter(|f| !excluded_set.contains(&f.frame_id))
+        {
+            // The gate reads headers and extracts nothing: a zip-resident landed file
+            // (an own frame kept in a zip) is probed by the run after it is extracted,
+            // where an unreadable one is excluded "unsupported file" like any other.
+            if crate::zip_store::presence::is_zip_resident_path(conn, &f.path) {
+                match subject.project_id() {
+                    Some(project_id) => {
+                        tracing::debug!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, "project frame is inside a zip; probed by the run")
+                    }
+                    None => {
+                        tracing::debug!(set_id = subject.frame_set_id(), frame_id = f.frame_id, path = %f.path, "attested light is inside a zip; probed by the run")
+                    }
+                }
+                probe.counts.at_run += 1;
+                continue;
+            }
+            let shape = probe_file(Path::new(&f.path));
+            let action = prepare_action(&shape, cfg.calibration.debayer_osc);
+            match &action {
+                PrepareAction::Unsupported(why) => {
+                    // Per file at debug: a plan is rebuilt on every edit, so the one warn per build is
+                    // below the loop (review M3).
+                    match subject.project_id() {
+                        Some(project_id) => {
+                            tracing::debug!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, error = %why, "project frame unsupported; left out of the plan")
+                        }
+                        None => {
+                            tracing::debug!(set_id = subject.frame_set_id(), frame_id = f.frame_id, path = %f.path, error = %why, "attested light unsupported; left out of the plan")
+                        }
+                    }
+                    probe.counts.unsupported += 1;
+                    if why.starts_with(crate::stacking::prepare::CANNOT_OPEN) {
+                        probe.absent_names.push(f.filename.clone());
+                    } else {
+                        probe.unsupported_names.push(f.filename.clone());
+                    }
+                    probe.unsupported_ids.insert(f.frame_id);
+                    probe.unsupported_why.insert(f.frame_id, why.clone());
+                }
+                PrepareAction::InPlace => probe.counts.in_place += 1,
+                // A float file is only ever written to be debayered.
+                PrepareAction::Write {
+                    read: PrepareRead::InPlaceFits,
+                    ..
+                } => probe.counts.debayered += 1,
+                PrepareAction::Write { .. } => probe.counts.converted += 1,
+            }
+            probe.prepared_bytes += prepared_bytes(&shape, &action);
+        }
+    }
+    if !probe.unsupported_ids.is_empty() {
+        let (count, missing) = (probe.unsupported_names.len(), probe.absent_names.len());
+        match subject.project_id() {
+            Some(project_id) => {
+                tracing::warn!(project_id = %project_id, count, missing, "project frames left out of the plan")
+            }
+            None => {
+                tracing::warn!(
+                    set_id = subject.frame_set_id(),
+                    count,
+                    missing,
+                    "attested lights left out of the plan"
+                )
+            }
+        }
+    }
+    probe
+}
+
+/// The names a plan warning lists: the first five, then "and N more".
+fn listed_names(names: &[String]) -> String {
+    const NAME_CAP: usize = 5;
+    let shown = names
+        .iter()
+        .take(NAME_CAP)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = names.len().saturating_sub(NAME_CAP);
+    if more > 0 {
+        format!("{shown} and {more} more")
+    } else {
+        shown
+    }
+}
+
+/// Spec §5.1 / §7: the plan's warning for the files Prepare cannot read; `None` when there is none.
+fn unsupported_files_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let n = names.len();
+    Some(format!(
+        "{n} file{} cannot be read and {} left out (unsupported file): {}",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" },
+        listed_names(names),
+    ))
+}
+
+/// Review I1: the plan's warning for the files that cannot be opened, which is not an unsupported format;
+/// `None` when there is none.
+fn absent_files_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let n = names.len();
+    Some(format!(
+        "{n} file{} cannot be opened (offline, moved or renamed) and {} left out: {}",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" },
+        listed_names(names),
+    ))
 }
 
 /// The frame-set arm of [`build_plan`] — today's code, moved: the stored or
@@ -2272,12 +2502,26 @@ fn frame_set_inputs(
     };
     // G-7: links at another recorded sub-frame origin (a manual choice) are
     // a WARNING on the plan, never a blocker. Empty for an attested set.
-    let warnings = if readiness.geometry_warnings.is_empty() {
+    let mut warnings = if readiness.geometry_warnings.is_empty() {
         Vec::new()
     } else {
         vec![crate::calibration::geometry::origin_sentence(
             &readiness.geometry_warnings,
         )]
+    };
+    // Plan 6c D8: an attested set is prepared like a project, so its plan probes the included lights' headers
+    // and drops a light no reader decodes (out of the included counts and the ≥ 3 rule, with a warning) the
+    // way a project's plan does. A calibrated set has no Prepare stage and runs no probe.
+    let (prepare, prepared_bytes, unsupported_ids) = if readiness.attested {
+        let probe = probe_prepare(conn, &cfg, subject, &groups, &excluded_set);
+        warnings.extend(probe.warnings());
+        (
+            Some(probe.counts),
+            Some(probe.prepared_bytes),
+            probe.unsupported_ids,
+        )
+    } else {
+        (None, None, HashSet::new())
     };
     Ok(SubjectInputs {
         cfg,
@@ -2289,8 +2533,41 @@ fn frame_set_inputs(
         masters_to_build,
         blockers,
         warnings,
+        prepare,
+        prepared_bytes,
+        unsupported_ids,
         project: None,
     })
+}
+
+/// The grid schematic's outlines (plan 6c): one per published, accepted frame of the project that has a
+/// manifest WCS and a pixel size — on this device or not, in the frame source's order — and how many of the
+/// frames have none (no manifest WCS, no pixel size, unreadable metadata, or a WCS whose edges do not
+/// project to finite sky points).
+fn grid_footprints(
+    frames: &[crate::stacking::project_source::SourceFrame],
+) -> (Vec<PlanGridFootprint>, u32) {
+    let mut footprints = Vec::new();
+    let mut not_drawn = 0u32;
+    for f in frames {
+        let outline = f
+            .meta
+            .as_ref()
+            .and_then(|m| crate::collab::grid_geometry::grid_input_of(m).footprint)
+            .map(|fp| fp.outline_sky())
+            .filter(|o| o.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
+        match outline {
+            Some(outline) => footprints.push(PlanGridFootprint {
+                frame_uuid: f.frame_uuid.clone(),
+                publisher_account_id: f.publisher_account_id.clone(),
+                publisher: f.publisher.clone(),
+                filter_canonical: f.filter_canonical.clone(),
+                outline,
+            }),
+            None => not_drawn += 1,
+        }
+    }
+    (footprints, not_drawn)
 }
 
 /// The project arm of [`build_plan`] (spec §7, plan 6b-2 C10). It WRITES —
@@ -2310,7 +2587,6 @@ fn project_inputs(
         count_inside, fraction_inside, grid_input_of, propose_grid, GridInput, GridTarget,
     };
     use crate::db::collab_frames::NotStackable;
-    use crate::stacking::prepare::{prepare_action, prepared_bytes, probe_file, PrepareAction};
 
     // A project this device left fails readably here, before the config
     // seed: no stray seed row is written for a project this device left.
@@ -2332,38 +2608,10 @@ fn project_inputs(
     // Spec §5.1 / §7: what Prepare will write, and the files it cannot read.
     // Probed before anything is counted: an unsupported frame is out of the
     // plan (review I1), so it must leave every count below too.
-    let mut prepared = 0u64;
-    let mut unsupported: Vec<&str> = Vec::new();
-    let mut unsupported_ids: HashSet<i64> = HashSet::new();
-    let mut unsupported_why: HashMap<i64, String> = HashMap::new();
-    for g in &source.groups {
-        for f in g
-            .frames
-            .iter()
-            .filter(|f| !excluded_set.contains(&f.frame_id))
-        {
-            // The gate reads headers and extracts nothing: a zip-resident landed file
-            // (an own frame kept in a zip) is probed by the run after it is extracted,
-            // where an unreadable one is excluded "unsupported file" like any other.
-            if crate::zip_store::presence::is_zip_resident_path(conn, &f.path) {
-                tracing::debug!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, "project frame is inside a zip; probed by the run");
-                continue;
-            }
-            let shape = probe_file(Path::new(&f.path));
-            match prepare_action(&shape, cfg.calibration.debayer_osc) {
-                PrepareAction::Unsupported(why) => {
-                    tracing::warn!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, error = %why, "project frame unsupported; left out of the plan");
-                    unsupported.push(f.filename.as_str());
-                    unsupported_ids.insert(f.frame_id);
-                    unsupported_why.insert(f.frame_id, why);
-                }
-                action => prepared += prepared_bytes(&shape, &action),
-            }
-        }
-    }
+    let probe = probe_prepare(conn, &cfg, subject, &source.groups, &excluded_set);
     let in_scope = |f: &&crate::stacking::project_source::SourceFrame| {
         f.handle
-            .is_some_and(|h| !excluded_set.contains(&h) && !unsupported_ids.contains(&h))
+            .is_some_and(|h| !excluded_set.contains(&h) && !probe.unsupported_ids.contains(&h))
     };
 
     // The grid (spec §6.2, §6.3).
@@ -2385,6 +2633,7 @@ fn project_inputs(
         radius_deg: project.target_radius_deg,
     };
     let proposal = propose_grid(&all_inputs, &target);
+    let (footprints, frames_not_drawn) = grid_footprints(&source.frames);
     let state = match (&current, &proposal) {
         (Some(_), _) => GridState::Confirmed,
         (None, Some(_)) => GridState::Proposed,
@@ -2567,27 +2816,7 @@ fn project_inputs(
         }
     }
     // Spec §5.1 / §7: the files Prepare cannot read.
-    if !unsupported.is_empty() {
-        const NAME_CAP: usize = 5;
-        let shown = unsupported
-            .iter()
-            .take(NAME_CAP)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let more = unsupported.len().saturating_sub(NAME_CAP);
-        let suffix = if more > 0 {
-            format!(" and {more} more")
-        } else {
-            String::new()
-        };
-        let n = unsupported.len();
-        warnings.push(format!(
-            "{n} file{} cannot be read and {} left out (unsupported file): {shown}{suffix}",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "is" } else { "are" },
-        ));
-    }
+    warnings.extend(probe.warnings());
 
     let frames: Vec<PlanProjectFrame> = source
         .frames
@@ -2601,11 +2830,20 @@ fn project_inputs(
             exptime_sec: f.exptime_sec,
             color_mode: f.color_mode,
             has_wcs: f.meta.as_ref().is_some_and(|m| m.wcs.is_some()),
+            // The record's flag (landed on this device per the catalog), not a disk check: a landed file
+            // gone since reads `true` here and names itself in `reason`.
             on_disk: f.not_stackable.is_none(),
             reason: f.not_stackable.clone().or_else(|| {
                 f.handle
-                    .and_then(|h| unsupported_why.get(&h))
-                    .map(|w| format!("unsupported file: {w}"))
+                    .and_then(|h| probe.unsupported_why.get(&h))
+                    .map(|w| {
+                        // The plan's warning sentence for a file that cannot be opened (carry-in R2-M1).
+                        if w.starts_with(crate::stacking::prepare::CANNOT_OPEN) {
+                            "cannot be opened (offline, moved or renamed)".to_string()
+                        } else {
+                            format!("unsupported file: {w}")
+                        }
+                    })
             }),
         })
         .collect();
@@ -2620,6 +2858,9 @@ fn project_inputs(
         masters_to_build: Vec::new(),
         blockers,
         warnings,
+        prepare: Some(probe.counts),
+        prepared_bytes: Some(probe.prepared_bytes),
+        unsupported_ids: probe.unsupported_ids,
         project: Some(ProjectInputs {
             grid: PlanGrid {
                 state,
@@ -2627,12 +2868,17 @@ fn project_inputs(
                 proposal,
                 frames_inside,
                 can_edit,
+                target: PlanGridTarget {
+                    ra_deg: target.ra_deg,
+                    dec_deg: target.dec_deg,
+                    radius_deg: target.radius_deg,
+                },
+                footprints,
+                frames_not_drawn,
             },
             frames,
             grid_scale: in_use.map(|g| g.scale_arcsec),
             grid_dims: in_use.map(|g| (g.width_px as u64, g.height_px as u64)),
-            prepared_bytes: prepared,
-            unsupported_ids,
         }),
     })
 }
@@ -2738,6 +2984,9 @@ pub fn build_plan(
         masters_to_build,
         blockers: arm_blockers,
         warnings: arm_warnings,
+        prepare,
+        prepared_bytes,
+        unsupported_ids,
         project,
     } = match subject {
         StackSubject::FrameSet(frames_set_id) => {
@@ -2749,17 +2998,14 @@ pub fn build_plan(
     };
     let project_grid: Option<crate::collab::grid::CanonicalGrid> =
         project.as_ref().and_then(|p| p.grid.current);
-    // Review I1: a project's unsupported files leave the included counts
-    // and the ≥ 3 rule (Prepare would exclude them), but not
-    // `excluded_frame_ids`, which stays the user's manual list.
+    // Review I1, plan 6c D8: the unsupported files of a project or an
+    // attested set leave the included counts and the ≥ 3 rule (Prepare would
+    // exclude them), but not `excluded_frame_ids`, which stays the user's
+    // manual list.
     let excluded_set: HashSet<i64> = excluded_frame_ids
         .iter()
         .copied()
-        .chain(
-            project
-                .iter()
-                .flat_map(|p| p.unsupported_ids.iter().copied()),
-        )
+        .chain(unsupported_ids.iter().copied())
         .collect();
     let mut blockers: Vec<PlanBlocker> = arm_blockers;
     let mut warnings: Vec<String> = Vec::new();
@@ -2962,6 +3208,17 @@ pub fn build_plan(
                                 message,
                             });
                         }
+                        // Plan 6c D10: its masters folder (what the run
+                        // writes into) may not lie inside the Collaboration
+                        // folder; an ordinary scan root only warns, at save.
+                        let masters =
+                            paths::subject_output_dir(&validated.output, subject, &set_name);
+                        if let Some(message) = paths::project_output_overlap(conn, &masters)? {
+                            blockers.push(PlanBlocker {
+                                code: "folders".to_string(),
+                                message,
+                            });
+                        }
                     }
                 }
                 Err(error) => {
@@ -3025,12 +3282,14 @@ pub fn build_plan(
         drizzle_bayer: cfg.drizzle.bayer && cfg.calibration.debayer_osc,
         crop_scratch: cfg.output.crop_to_coverage > 0,
     };
-    let estimate_bytes = match project
-        .as_ref()
-        .and_then(|p| p.grid_dims.map(|d| (d, p.prepared_bytes)))
-    {
-        Some((grid, prepared)) => paths::estimate_project_bytes(&estimate_inputs, grid, prepared),
-        None => paths::estimate_bytes(&estimate_inputs),
+    let estimate_bytes = match (project.as_ref().map(|p| p.grid_dims), prepared_bytes) {
+        // A project with a grid in use (or proposed): the grid's geometry.
+        (Some(Some(grid)), Some(prepared)) => {
+            paths::estimate_project_bytes(&estimate_inputs, grid, prepared)
+        }
+        // An attested set (review M2): what Prepare writes, at the frames' own geometry.
+        (None, Some(prepared)) => paths::estimate_prepared_bytes(&estimate_inputs, prepared),
+        _ => paths::estimate_bytes(&estimate_inputs),
     };
 
     // Gate 4: space.
@@ -3663,6 +3922,7 @@ pub fn build_plan(
         active_run_id,
         grid: project.as_ref().map(|p| p.grid.clone()),
         project_frames: project.map(|p| p.frames).unwrap_or_default(),
+        prepare,
     })
 }
 
@@ -9492,6 +9752,68 @@ mod tests {
             .contains("overlaps a monitored folder"));
     }
 
+    /// Plan 6c D10: a project's masters folder (`<output>/<title>`) inside the
+    /// Collaboration folder, or the output folder equal to it, is a `folders`
+    /// blocker. An output folder outside it, no Collaboration folder at all,
+    /// and an ordinary scan root (a frame set's rule: the Save-time warning)
+    /// block nothing.
+    #[test]
+    fn project_plan_blocks_a_masters_folder_inside_the_collaboration_folder() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let base = crate::test_support::canonical_path(f.dir.path());
+        let (collab, ordinary) = (base.join("collab-root"), base.join("ordinary"));
+        for dir in [&collab, &ordinary] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = |output: &std::path::Path| -> Vec<String> {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                Some(with_folders(&working, output)),
+            )
+            .unwrap()
+            .blockers
+            .into_iter()
+            .filter(|b| b.code == "folders")
+            .map(|b| b.message)
+            .collect()
+        };
+        let sentence = |masters: &std::path::Path| {
+            format!(
+                "The project's masters folder {} is inside the Collaboration folder; choose an output folder outside it",
+                masters.display()
+            )
+        };
+
+        // No Collaboration folder: the output may sit anywhere.
+        assert_eq!(folders(&collab.join("masters")), Vec::<String>::new());
+
+        for (path, kind) in [(&collab, "collaboration"), (&ordinary, "normal")] {
+            f.conn
+                .execute(
+                    "INSERT INTO scan_roots (path, kind) VALUES (?1, ?2)",
+                    rusqlite::params![path.to_str().unwrap(), kind],
+                )
+                .unwrap();
+        }
+        // `insert_test_project` titles the project `p1`: its masters land in
+        // `<output>/p1`.
+        assert_eq!(
+            folders(&collab.join("masters")),
+            vec![sentence(&collab.join("masters").join("p1"))]
+        );
+        assert_eq!(folders(&collab), vec![sentence(&collab.join("p1"))]);
+        assert_eq!(folders(&output), Vec::<String>::new());
+        assert_eq!(
+            folders(&ordinary.join("masters")),
+            Vec::<String>::new(),
+            "an ordinary scan root keeps the frame-set rule"
+        );
+    }
+
     /// Plan 6b-2 C10: a project's blockers come in a fixed order.
     #[test]
     fn a_projects_blocker_order_is_stable() {
@@ -9585,6 +9907,625 @@ mod tests {
                 .any(|w| w.ends_with("(unsupported file): c_t.fits")),
             "{:?}",
             plan.warnings
+        );
+    }
+
+    /// Plan 6c Task 1: project `p1` holds one landed file of each kind Prepare tells apart: a float mono
+    /// file (`mono`), a float CFA mosaic (`mosaic`), an integer FITS (`int16`), an XISF (`xisf`) and a file no
+    /// reader decodes (`tile`, an empty primary HDU, the stand-in for a tile-compressed FITS).
+    fn seed_prepare_kinds(f: &test_fixtures::Fixture) {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        for (uuid, file) in [
+            ("mono", ProjectFile::Mono32),
+            ("mosaic", ProjectFile::Mosaic32),
+            ("int16", ProjectFile::Mono16),
+            ("xisf", ProjectFile::Xisf32),
+            ("tile", ProjectFile::EmptyPrimary),
+        ] {
+            let mut spec = project_frame_spec(uuid);
+            spec.file = file;
+            if file == ProjectFile::Mosaic32 {
+                spec.bayerpat = Some("RGGB");
+            }
+            add_project_frame(&f.conn, &landed, "p1", &spec);
+        }
+    }
+
+    fn project_plan_of(f: &test_fixtures::Fixture, cfg: Option<StackingConfig>) -> StackingPlan {
+        build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            cfg,
+        )
+        .unwrap()
+    }
+
+    /// Plan 6c Task 1: the plan counts what Prepare will do, per included frame: a float file used where it
+    /// lies, a mosaic debayered, an integer FITS and an XISF converted, a file no reader decodes left out.
+    #[test]
+    fn project_plan_counts_prepare_actions() {
+        let f = test_fixtures::frame_set("unused");
+        seed_prepare_kinds(&f);
+        let plan = project_plan_of(&f, None);
+        assert!(plan.config.calibration.debayer_osc);
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 1,
+                debayered: 1,
+                converted: 2,
+                unsupported: 1,
+                at_run: 0
+            })
+        );
+    }
+
+    /// With the debayer off a mosaic is a float file like any other: used in place.
+    #[test]
+    fn project_plan_prepare_with_debayer_off() {
+        let f = test_fixtures::frame_set("unused");
+        seed_prepare_kinds(&f);
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.debayer_osc = false;
+        let plan = project_plan_of(&f, Some(cfg));
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 2,
+                debayered: 0,
+                converted: 2,
+                unsupported: 1,
+                at_run: 0
+            })
+        );
+    }
+
+    /// A manually excluded frame is not counted: Prepare never touches it.
+    #[test]
+    fn project_plan_prepare_skips_excluded_frames() {
+        let f = test_fixtures::frame_set("unused");
+        seed_prepare_kinds(&f);
+        let first = project_plan_of(&f, None);
+        let stored = crate::db::stacking::get_project_config(&f.conn, "p1")
+            .unwrap()
+            .unwrap();
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            &stored.config_json,
+            &["int16".to_string()],
+            None,
+        )
+        .unwrap();
+        let plan = project_plan_of(&f, None);
+        assert_eq!(plan.excluded_frame_ids.len(), 1);
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 1,
+                debayered: 1,
+                converted: 1,
+                unsupported: 1,
+                at_run: 0
+            })
+        );
+        assert_eq!(
+            first.prepare.as_ref().map(|p| p.converted),
+            Some(2),
+            "before the exclusion the integer file was counted"
+        );
+    }
+
+    /// A float32 light for an attested set: `add_light` seeds the catalog rows (no file), then the file is
+    /// written as BITPIX −32, the way a calibrated light from another program lands.
+    fn add_float_light(
+        f: &test_fixtures::Fixture,
+        stem: &str,
+        date_obs: &str,
+    ) -> (i64, std::path::PathBuf) {
+        let spec = light_spec(stem, date_obs);
+        let (frame_id, path) = test_fixtures::add_light(f, &spec);
+        let plane = vec![0.25f32; spec.width * spec.height];
+        crate::fits_writer::write_fits_f32(&path, spec.width, spec.height, 1, &plane, &[]).unwrap();
+        (frame_id, path)
+    }
+
+    fn attest(f: &test_fixtures::Fixture) {
+        f.conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [f.set_id],
+            )
+            .unwrap();
+    }
+
+    fn set_plan_of(f: &test_fixtures::Fixture) -> StackingPlan {
+        build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Plan 6c Task 1: an attested set is prepared like a project, so its plan counts the same way.
+    #[test]
+    fn attested_set_plan_counts_prepare_actions() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        test_fixtures::add_light(&f, &light_spec_written("l2", THREE_TIMES[2]));
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 2,
+                debayered: 0,
+                converted: 1,
+                unsupported: 0,
+                at_run: 0
+            })
+        );
+        assert_eq!(plan.included_count, 3);
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("cannot be read")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Plan 6c D8: an attested set's plan drops a light no reader decodes as a project's plan does: counted
+    /// as unsupported, out of the included counts, warned about by name, and not a manual exclusion.
+    #[test]
+    fn attested_set_plan_drops_an_unreadable_light() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        test_fixtures::write_empty_primary_fits(&bad);
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 3,
+                debayered: 0,
+                converted: 0,
+                unsupported: 1,
+                at_run: 0
+            })
+        );
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        let g = &plan.groups[0];
+        assert_eq!(
+            (g.frame_count, g.included_count),
+            (4, 3),
+            "the file stays in the group's frame count, as in a project's plan, and leaves its included count"
+        );
+        assert_eq!(plan.included_count, 3);
+        assert!(
+            plan.excluded_frame_ids.is_empty(),
+            "an unreadable light is not a manual exclusion"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "1 file cannot be read and is left out (unsupported file): l3.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.blockers.iter().all(|b| b.code != "frames"),
+            "three readable lights satisfy the rule: {:?}",
+            plan.blockers
+        );
+    }
+
+    /// Plan 6c D8: the unreadable light does not count toward the three-frame rule.
+    #[test]
+    fn attested_set_plan_unreadable_light_leaves_the_three_frame_rule() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l2", THREE_TIMES[2]));
+        test_fixtures::write_empty_primary_fits(&bad);
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(plan.included_count, 2);
+        assert!(
+            plan.blockers.iter().any(|b| b.code == "frames"),
+            "{:?}",
+            plan.blockers
+        );
+    }
+
+    /// Plan 6c Task 1: a light inside a zip is not probed by the plan (nothing is extracted): it is counted
+    /// as left to the run, and never as unsupported.
+    #[test]
+    fn attested_set_plan_leaves_a_zip_resident_light_to_the_run() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        let (_, zipped) = test_fixtures::add_light(&f, &light_spec("l2", THREE_TIMES[2]));
+        f.conn
+            .execute(
+                "UPDATE files SET archive_zip_path = ?1, archive_path_in_zip = 'l2.fits' WHERE path = ?2",
+                rusqlite::params!["/gone/lights.zip", zipped.to_string_lossy()],
+            )
+            .unwrap();
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(
+            plan.prepare,
+            Some(PlanPrepare {
+                in_place: 2,
+                debayered: 0,
+                converted: 0,
+                unsupported: 0,
+                at_run: 1
+            })
+        );
+        assert_eq!(plan.included_count, 3);
+    }
+
+    /// Plan 6c Task 1: an ordinary (calibrated) set has no Prepare stage and no probe runs: a light whose
+    /// file no reader decodes changes neither its groups nor its warnings.
+    #[test]
+    fn calibrated_set_plan_has_no_prepare() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l2", THREE_TIMES[2]));
+        test_fixtures::write_empty_primary_fits(&bad);
+        let plan = set_plan_of(&f);
+        assert_eq!(plan.prepare, None);
+        assert!(!plan.readiness.attested);
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (3, 3));
+        assert_eq!(plan.included_count, 3);
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("cannot be read")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review I1): a light whose file cannot be opened (offline drive, moved, renamed) is
+    /// left out like an unreadable one, but the plan says it is absent, not that it is an unsupported file.
+    #[test]
+    fn attested_set_plan_names_a_missing_light_as_absent() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        // `light_spec` seeds the catalog rows and writes no file.
+        test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "1 file cannot be opened (offline, moved or renamed) and is left out: l3.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("(unsupported file)")),
+            "an absent file is not an unsupported file: {:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(1));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (4, 3));
+        assert!(plan.excluded_frame_ids.is_empty());
+    }
+
+    /// The two reasons stay apart when a set has both: each gets its own sentence, with its own names and
+    /// pluralization, and both count as `unsupported` (Prepare leaves all three out).
+    #[test]
+    fn attested_set_plan_tells_absent_files_from_unsupported_ones() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        test_fixtures::write_empty_primary_fits(&bad);
+        test_fixtures::add_light(&f, &light_spec("l4", "2025-01-01T00:20:00"));
+        test_fixtures::add_light(&f, &light_spec("l5", "2025-01-01T00:25:00"));
+        attest(&f);
+        let plan = set_plan_of(&f);
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(3));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (6, 3));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "1 file cannot be read and is left out (unsupported file): l3.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "2 files cannot be opened (offline, moved or renamed) and are left out: l4.fits, l5.fits"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review I1), project arm: a landed file deleted after it was recorded still reaches
+    /// the probe (the frame source reads the catalog row, not the disk), and reads as absent.
+    #[test]
+    fn project_plan_names_a_missing_landed_file_as_absent() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        let mut paths = Vec::new();
+        for uuid in ["a", "b", "c", "d"] {
+            paths.push(add_project_frame(
+                &f.conn,
+                &landed,
+                "p1",
+                &project_frame_spec(uuid),
+            ));
+        }
+        std::fs::remove_file(&paths[3]).unwrap();
+        let plan = project_plan_of(&f, None);
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "1 file cannot be opened (offline, moved or renamed) and is left out: c_d.fits"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("(unsupported file)")),
+            "{:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.prepare.as_ref().map(|p| p.unsupported), Some(1));
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (4, 3));
+        assert!(plan.excluded_frame_ids.is_empty());
+    }
+
+    /// Plan 6c Task 1b (carry-in R2-M1): the Frames row of a landed file that is gone reads as the plan's
+    /// warning does ("cannot be opened ..."), with no prefix and no OS error text, and keeps `onDisk` (the
+    /// record's flag, not a disk check); a file no reader decodes keeps its "unsupported file: ..." reason.
+    #[test]
+    fn project_plan_frame_row_names_a_missing_file_as_absent() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        let mut paths = Vec::new();
+        for uuid in ["a", "b", "c", "d"] {
+            paths.push(add_project_frame(
+                &f.conn,
+                &landed,
+                "p1",
+                &project_frame_spec(uuid),
+            ));
+        }
+        let mut empty = project_frame_spec("e");
+        empty.file = ProjectFile::EmptyPrimary;
+        add_project_frame(&f.conn, &landed, "p1", &empty);
+        std::fs::remove_file(&paths[3]).unwrap();
+        let plan = project_plan_of(&f, None);
+        let row = |uuid: &str| {
+            plan.project_frames
+                .iter()
+                .find(|r| r.frame_uuid == uuid)
+                .unwrap_or_else(|| panic!("no row for {uuid}"))
+        };
+        let gone = row("d");
+        assert_eq!(
+            gone.reason.as_deref(),
+            Some("cannot be opened (offline, moved or renamed)")
+        );
+        assert!(
+            gone.on_disk,
+            "onDisk is the record's flag, not a disk check"
+        );
+        let unsupported = row("e");
+        assert_eq!(
+            unsupported.reason.as_deref(),
+            Some("unsupported file: not a 1- or 3-plane 8/16/32-bit or float primary image")
+        );
+        assert!(unsupported.on_disk);
+        assert_eq!(row("a").reason, None);
+    }
+
+    /// Plan 6c Task 1b: the plan's grid carries the outline of every published, accepted frame with a
+    /// manifest WCS, on this device or not (one picture for every member), the target of the project row,
+    /// and the number of frames it cannot draw.
+    #[test]
+    fn project_plan_grid_carries_footprints() {
+        use crate::collab::frame_meta::parse_project_frame_meta;
+        use crate::collab::grid_geometry::{boundary_points, grid_input_of};
+        use crate::stacking::test_fixtures::{
+            add_project_frame, manifest_wcs_json, project_frame_spec, ProjectFile,
+        };
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        // `a`: ann's, a WCS; `b`: bob's, a WCS, never landed (not on this device); `c`: ann's, no WCS;
+        // `x`: a WCS, not accepted (no part of the project).
+        let mut a = project_frame_spec("a");
+        a.wcs = Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &a);
+        let mut b = project_frame_spec("b");
+        b.publisher = "bob";
+        b.filter = "R";
+        b.file = ProjectFile::Missing;
+        b.wcs = Some(manifest_wcs_json(64, 48, 83.9, -5.3, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &b);
+        add_project_frame(&f.conn, &landed, "p1", &project_frame_spec("c"));
+        let mut x = project_frame_spec("x");
+        x.accepted = false;
+        x.wcs = Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &x);
+        // The display name is not the account id.
+        f.conn
+            .execute(
+                "UPDATE project_frames_local SET publisher_display = 'Ann Lovelace'
+                 WHERE frame_uuid IN ('a', 'c')",
+                [],
+            )
+            .unwrap();
+
+        // `insert_test_project` seeds the target of M42, which is frame `a`'s centre: move it away from
+        // every frame's centre so the test tells the target from a frame.
+        f.conn
+            .execute(
+                "UPDATE collab_projects SET target_ra_deg = 84.6, target_dec_deg = -4.9,
+                   target_radius_deg = 0.75 WHERE project_id = 'p1'",
+                [],
+            )
+            .unwrap();
+
+        let plan = project_plan_of(&f, None);
+        let grid = plan.grid.as_ref().expect("a project plan has a grid");
+        assert_eq!(grid.frames_not_drawn, 1, "only `c` has no WCS");
+        let uuids: Vec<&str> = grid
+            .footprints
+            .iter()
+            .map(|p| p.frame_uuid.as_str())
+            .collect();
+        assert_eq!(
+            uuids,
+            ["a", "b"],
+            "every accepted frame with a WCS, landed here or not"
+        );
+        let (fa, fb) = (&grid.footprints[0], &grid.footprints[1]);
+        assert_eq!(
+            (
+                fa.publisher_account_id.as_str(),
+                fa.publisher.as_str(),
+                fa.filter_canonical.as_str()
+            ),
+            ("ann", "Ann Lovelace", "L")
+        );
+        assert_eq!(
+            (
+                fb.publisher_account_id.as_str(),
+                fb.publisher.as_str(),
+                fb.filter_canonical.as_str()
+            ),
+            ("bob", "bob", "R")
+        );
+        // The target is the project row's circle, not a frame centre.
+        assert_eq!(
+            (
+                grid.target.ra_deg,
+                grid.target.dec_deg,
+                grid.target.radius_deg
+            ),
+            (84.6, -4.9, 0.75)
+        );
+        // The outline is the pixel-edge boundary through the frame's own WCS: each point inverts back
+        // to its edge point.
+        let row = crate::db::collab_frames::list_for_project(&f.conn, "p1")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.frame_uuid == "a")
+            .unwrap();
+        let meta = parse_project_frame_meta(&row.manifest_json).unwrap();
+        let input = grid_input_of(&meta);
+        let wcs = &input.footprint.as_ref().unwrap().wcs;
+        let edge = boundary_points(64.0, 48.0);
+        assert_eq!(fa.outline.len(), edge.len());
+        for (sky, (x, y)) in fa.outline.iter().zip(&edge) {
+            let (px, py) = wcs.sky_to_pixel(sky[0], sky[1]);
+            assert!((px - x).abs() < 1e-6 && (py - y).abs() < 1e-6, "{sky:?}");
+        }
+    }
+
+    /// Three 64×48 mono lights for an estimate comparison: the third is an integer FITS when `integer`, else a
+    /// float file like the other two. Returns the plan's `estimate_bytes`.
+    fn three_light_estimate(integer: bool, attested: bool) -> u64 {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", THREE_TIMES[0]);
+        add_float_light(&f, "l1", THREE_TIMES[1]);
+        if integer {
+            test_fixtures::add_light(&f, &light_spec_written("l2", THREE_TIMES[2]));
+        } else {
+            add_float_light(&f, "l2", THREE_TIMES[2]);
+        }
+        if attested {
+            attest(&f);
+        }
+        set_plan_of(&f).estimate_bytes
+    }
+
+    /// Plan 6c Task 1 r2 (review M2): an attested set's estimate counts what Prepare writes, as a project's
+    /// does: a float file used in place costs nothing, an integer file costs its converted copy. A calibrated
+    /// set's estimate is untouched.
+    #[test]
+    fn attested_set_estimate_counts_prepared_bytes() {
+        let plane = 64 * 48 * 4;
+        // The calibrated set's estimate, computed on the commit before this round.
+        let calibrated = three_light_estimate(false, false);
+        assert_eq!(calibrated, 1_136_016, "pinned on the r1 commit");
+        assert_eq!(
+            three_light_estimate(true, false),
+            calibrated,
+            "a calibrated set's estimate never reads the files"
+        );
+        let float_attested = three_light_estimate(false, true);
+        let integer_attested = three_light_estimate(true, true);
+        assert_eq!(
+            integer_attested - float_attested,
+            plane,
+            "the integer light adds its converted plane"
+        );
+        assert_eq!(
+            calibrated - float_attested,
+            3 * plane,
+            "three lights used in place cost no calibrated copy"
+        );
+    }
+
+    /// Plan 6c Task 1 r2 (review M3): a plan build logs one warning for the files it leaves out, with the
+    /// counts; the per-file lines are debug.
+    #[test]
+    fn a_plan_build_logs_one_warning_for_the_files_it_leaves_out() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        add_float_light(&f, "l0", "2025-01-01T00:00:00");
+        add_float_light(&f, "l1", "2025-01-01T00:05:00");
+        add_float_light(&f, "l2", "2025-01-01T00:10:00");
+        let (_, bad) = test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+        test_fixtures::write_empty_primary_fits(&bad);
+        test_fixtures::add_light(&f, &light_spec("l4", "2025-01-01T00:20:00"));
+        test_fixtures::add_light(&f, &light_spec("l5", "2025-01-01T00:25:00"));
+        attest(&f);
+        let (_, log) = crate::stacking::telemetry::capture_logs(|| set_plan_of(&f));
+        let left_out: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("left out of the plan"))
+            .collect();
+        let warns: Vec<&&str> = left_out.iter().filter(|l| l.contains(" WARN ")).collect();
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(
+            warns[0].contains("count=1") && warns[0].contains("missing=2"),
+            "{}",
+            warns[0]
+        );
+        assert_eq!(
+            left_out.iter().filter(|l| l.contains(" DEBUG ")).count(),
+            3,
+            "one debug line per file: {log}"
         );
     }
 

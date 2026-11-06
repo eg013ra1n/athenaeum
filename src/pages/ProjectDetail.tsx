@@ -24,6 +24,7 @@ import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab
 import MembersTab from '../components/collab/project/MembersTab';
 import ExchangeTab from '../components/collab/project/ExchangeTab';
 import ModerationTab from '../components/collab/project/ModerationTab';
+import { StackingTab } from '../components/stacking/StackingTab';
 import FramePanel from '../components/collab/project/FramePanel';
 import PublishConfirmDialog from '../components/collab/project/PublishConfirmDialog';
 import RepublishGuardDialog from '../components/collab/project/RepublishGuardDialog';
@@ -40,12 +41,13 @@ import type {
   CollabPublishFinished,
 } from '../types/models';
 
-type Tab = 'overview' | 'mine' | 'library' | 'members' | 'exchange' | 'moderation';
+type Tab = 'overview' | 'mine' | 'library' | 'stacking' | 'members' | 'exchange' | 'moderation';
 
 const TAB_LABEL: Record<Tab, string> = {
   overview: 'Overview',
   mine: 'My frames',
   library: 'Library',
+  stacking: 'Stacking',
   members: 'Members',
   exchange: 'Exchange',
   moderation: 'Moderation',
@@ -60,6 +62,7 @@ const TAB_ALIASES = new Map<string, Tab>([
   ['overview', 'overview'],
   ['mine', 'mine'],
   ['library', 'library'],
+  ['stacking', 'stacking'],
   ['members', 'members'],
   ['exchange', 'exchange'],
   ['moderation', 'moderation'],
@@ -101,8 +104,8 @@ export function resolveSelfAccount(
 /**
  * A collab project (spec 2026-09-30 §8): the header on the app's page pattern
  * (back/forward, title, target subtitle, role chip, the live pill that also
- * runs Sync, the portal link) and six tabs — Overview, My
- * frames, Library, Members, Exchange, Moderation. The project's local settings
+ * runs Sync, the portal link) and seven tabs — Overview, My
+ * frames, Library, Stacking, Members, Exchange, Moderation. The project's local settings
  * (publishing device, mode, auto-replicate) are the Overview's settings card. The shell owns the loads
  * shared by several tabs, the tab/segment state and deep links, the frame
  * panel (docked beside the frame tables, `PanelLayout`), the member colours
@@ -404,6 +407,14 @@ function ProjectPage({ id }: { id: string | undefined }) {
     };
   }, [id]);
 
+  // The Stacking tab's subject, memoised: a fresh object per render would give every `StackingTab` callback built
+  // on it a new identity each time. Its commands and its run state key on the project id alone (`subjectKey`).
+  const stackingTitle = detail?.card.title ?? '';
+  const stackingSubject = useMemo(
+    () => ({ kind: 'project' as const, projectId: id ?? '', title: stackingTitle }),
+    [id, stackingTitle],
+  );
+
   const run = useCollabPublishRun(id);
   const publishing = usePublishing(id, {
     reloadDetail: loadDetail,
@@ -494,6 +505,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
     'overview',
     'mine',
     ...(canReceive ? (['library'] as const) : []),
+    // Every member sees it (spec §12): a member without Library has the same plan, grid and runs to look at.
+    'stacking',
     'members',
     'exchange',
     ...(canModerate || c.canRemap ? (['moderation'] as const) : []),
@@ -781,6 +794,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
               />
             </PanelLayout>
           )}
+
+          {activeTab === 'stacking' && <StackingTab key={id} subject={stackingSubject} />}
 
           {activeTab === 'members' && (
             <MembersTab members={members} error={membersError} goals={detail.goals} />

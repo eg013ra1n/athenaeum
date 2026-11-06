@@ -12,7 +12,7 @@
 // user is actively typing) without leaving a preset's numbers stale on
 // screen until the user happens to blur that particular field.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Checkbox } from '../settings/Checkbox';
 
 function clampNumber(n: number, min?: number, max?: number): number {
@@ -60,6 +60,7 @@ export interface NumericFieldProps {
 export function NumericField({ label, value, onCommit, min, max, step, help, disabled }: NumericFieldProps) {
   const [draft, setDraft] = useState(() => String(value));
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputId = useId();
 
   useEffect(() => {
     if (document.activeElement !== inputRef.current) {
@@ -80,9 +81,10 @@ export function NumericField({ label, value, onCommit, min, max, step, help, dis
   return (
     <div>
       {label && (
-        <label className="block text-xs text-content-secondary mb-1">{label}</label>
+        <label htmlFor={inputId} className="block text-xs text-content-secondary mb-1">{label}</label>
       )}
       <input
+        id={inputId}
         ref={inputRef}
         type="number"
         min={min}

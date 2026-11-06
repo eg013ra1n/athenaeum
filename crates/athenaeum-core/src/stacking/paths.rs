@@ -94,9 +94,38 @@ pub fn project_root_overlap(
     }
 }
 
+/// Plan 6c D10: a project's masters folder (`<output>/<title>`, what
+/// [`subject_output_dir`] returns) may not be, or lie inside, the
+/// Collaboration folder — a master there would be a stray among the landed
+/// replicas. `Some(sentence)` is the plan's `folders` blocker; `None` when no
+/// Collaboration folder is designated. Only that one root: an ordinary scan
+/// root keeps a frame set's rule (the Save-time overlap warning), so this
+/// never goes through `check_scan_root_overlap`, which flags every root.
+/// Reads the filesystem to canonicalize both folders (the output through its
+/// nearest existing ancestor: it usually does not exist yet).
+pub fn project_output_overlap(
+    conn: &Connection,
+    output_dir: &Path,
+) -> Result<Option<String>, ApiError> {
+    let Some(collaboration) = crate::api::scan_roots::collaboration_dir(conn)? else {
+        return Ok(None);
+    };
+    let resolved =
+        |path: &Path| crate::api::scan_roots::normalize_path(&canonical_or_nearest(path));
+    let (root, output) = (resolved(&collaboration), resolved(output_dir));
+    if !output.starts_with(&root) {
+        return Ok(None);
+    }
+    tracing::debug!(path = %output.display(), "project masters folder is inside the Collaboration folder");
+    Ok(Some(format!(
+        "The project's masters folder {} is inside the Collaboration folder; choose an output folder outside it",
+        output.display()
+    )))
+}
+
 /// `path` with its nearest existing ancestor canonicalized and the missing
-/// tail re-appended — a project root usually does not exist yet, while the
-/// scan roots it is compared against are canonicalized (`/var` vs
+/// tail re-appended — a project's folder usually does not exist yet, while
+/// the scan roots it is compared against are canonicalized (`/var` vs
 /// `/private/var` on macOS would otherwise never match).
 fn canonical_or_nearest(path: &Path) -> PathBuf {
     let mut existing = path;
@@ -106,7 +135,7 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
             Ok(true) => break,
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(path = %existing.display(), error = %e, "project working folder not inspectable; treating it as missing");
+                tracing::warn!(path = %existing.display(), error = %e, "folder not inspectable; treating it as missing");
             }
         }
         match (existing.parent(), existing.file_name()) {
@@ -120,7 +149,7 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
     let mut out = match existing.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(path = %existing.display(), error = %e, "project working folder not resolvable; comparing by its stated path");
+            tracing::warn!(path = %existing.display(), error = %e, "folder not resolvable; comparing by its stated path");
             existing.to_path_buf()
         }
     };
@@ -772,6 +801,13 @@ pub fn estimate_project_bytes(
     prepared_bytes: u64,
 ) -> u64 {
     estimate_bytes_with(i, Some(grid), Some(prepared_bytes))
+}
+
+/// [`estimate_bytes`] for an attested frame set (plan 6c D8, review M2): its lights are prepared as a
+/// project's frames are, so the calibrated term is what Prepare writes (`prepared_bytes`) in place of one
+/// calibrated copy per light. A set has no grid: the frames keep their own geometry.
+pub fn estimate_prepared_bytes(i: &EstimateInputs<'_>, prepared_bytes: u64) -> u64 {
+    estimate_bytes_with(i, None, Some(prepared_bytes))
 }
 
 fn estimate_bytes_with(
@@ -2445,6 +2481,90 @@ mod tests {
         );
         let apart = tmp.path().join("elsewhere").join(PROJECTS_DIR).join("m31");
         assert_eq!(project_root_overlap(&c, &apart).unwrap(), None);
+    }
+
+    /// Plan 6c D10: a project's masters folder may not be, or lie inside, the
+    /// Collaboration folder, and only that one: an ordinary scan root keeps a
+    /// frame set's rule (the Save-time warning), and a sibling that merely
+    /// shares the folder name's prefix is outside.
+    #[test]
+    fn a_masters_folder_overlaps_only_the_collaboration_folder() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::test_support::canonical_path(tmp.path());
+        let (collab, ordinary, sibling) = (
+            base.join("collab"),
+            base.join("ordinary"),
+            base.join("collab-2"),
+        );
+        for dir in [&collab, &ordinary, &sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let sentence = |path: &Path| {
+            format!(
+                "The project's masters folder {} is inside the Collaboration folder; choose an output folder outside it",
+                path.display()
+            )
+        };
+        let nested = collab.join("masters").join("m31");
+
+        // No Collaboration folder: nothing overlaps.
+        assert_eq!(project_output_overlap(&c, &nested).unwrap(), None);
+
+        for (path, kind) in [(&collab, "collaboration"), (&ordinary, "normal")] {
+            c.execute(
+                "INSERT INTO scan_roots (path, kind) VALUES (?1, ?2)",
+                rusqlite::params![path.to_str().unwrap(), kind],
+            )
+            .unwrap();
+        }
+        // Inside it (the folders need not exist), and the folder itself.
+        assert_eq!(
+            project_output_overlap(&c, &nested).unwrap(),
+            Some(sentence(&nested))
+        );
+        assert_eq!(
+            project_output_overlap(&c, &collab).unwrap(),
+            Some(sentence(&collab))
+        );
+        // Outside it: an ordinary scan root, a name-prefix sibling, elsewhere.
+        for apart in [
+            ordinary.join("masters"),
+            sibling.join("masters"),
+            base.join("elsewhere"),
+        ] {
+            assert_eq!(
+                project_output_overlap(&c, &apart).unwrap(),
+                None,
+                "{}",
+                apart.display()
+            );
+        }
+    }
+
+    /// Plan 6c D10: a spelling through a symlink names the same folder, and
+    /// is read as that folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_masters_folder_behind_a_symlink_is_read_as_its_target() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::test_support::canonical_path(tmp.path());
+        let collab = base.join("collab");
+        std::fs::create_dir_all(&collab).unwrap();
+        std::os::unix::fs::symlink(&collab, base.join("link")).unwrap();
+        c.execute(
+            "INSERT INTO scan_roots (path, kind) VALUES (?1, 'collaboration')",
+            [collab.to_str().unwrap()],
+        )
+        .unwrap();
+        let sentence = project_output_overlap(&c, &base.join("link").join("masters"))
+            .unwrap()
+            .expect("a symlink into the Collaboration folder overlaps it");
+        assert!(
+            sentence.contains(collab.join("masters").to_str().unwrap()),
+            "{sentence}"
+        );
     }
 
     /// Plan 6b-2 C10: a project's estimate puts every registered artifact,

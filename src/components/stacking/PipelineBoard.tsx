@@ -1,19 +1,19 @@
 import { StageRow, type StageRowToggle } from './StageRow';
-import { rowState, stageSummary, type BoardStage } from './stageSummary';
+import { boardMode, rowState, stageLabel, stageSummary, type BoardStage } from './stageSummary';
 import type { Stage, StackingConfig, StackingPlan } from '../../types/stacking';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
-const ROWS: { stage: BoardStage; index: number; label: string }[] = [
-  { stage: 'masters', index: 0, label: 'Masters' },
-  { stage: 'calibrate', index: 1, label: 'Calibrate' },
-  { stage: 'debayer', index: 2, label: 'Debayer' },
-  { stage: 'measure', index: 3, label: 'Measure & select' },
-  { stage: 'reference', index: 4, label: 'Reference' },
-  { stage: 'register', index: 5, label: 'Register' },
-  { stage: 'normalize', index: 6, label: 'Local normalization' },
-  { stage: 'integrate', index: 7, label: 'Integrate' },
-  { stage: 'drizzle', index: 8, label: 'Drizzle' },
-  { stage: 'output', index: 9, label: 'Output' },
+const ROWS: { stage: BoardStage; index: number }[] = [
+  { stage: 'masters', index: 0 },
+  { stage: 'calibrate', index: 1 },
+  { stage: 'debayer', index: 2 },
+  { stage: 'measure', index: 3 },
+  { stage: 'reference', index: 4 },
+  { stage: 'register', index: 5 },
+  { stage: 'normalize', index: 6 },
+  { stage: 'integrate', index: 7 },
+  { stage: 'drizzle', index: 8 },
+  { stage: 'output', index: 9 },
 ];
 
 export interface PipelineBoardProps {
@@ -41,9 +41,11 @@ export interface PipelineBoardProps {
   onToggleDrizzle: (checked: boolean) => void;
 }
 
-/** The nine-row pipeline board (spec §11.1). Every row's state and summary
- *  text come from the pure functions in `stageSummary.ts` — this component
- *  only lays them out and wires the one live toggle (on/off on Drizzle). */
+/** The nine-row pipeline board (spec §11.1). Every row's state, name and
+ *  summary text come from the pure functions in `stageSummary.ts` — this
+ *  component only lays them out and wires the one live toggle (on/off on
+ *  Drizzle). For a project or an attested set the plan makes row 1 Prepare
+ *  and the Masters row off (wave 6c). */
 export function PipelineBoard({
   plan,
   config,
@@ -54,9 +56,10 @@ export function PipelineBoard({
   onSelectStage,
   onToggleDrizzle,
 }: PipelineBoardProps) {
+  const mode = boardMode(plan);
   return (
     <div className="bg-surface-elevated rounded-lg p-2 space-y-0.5">
-      {ROWS.map(({ stage, index, label }) => {
+      {ROWS.map(({ stage, index }) => {
         let toggle: StageRowToggle | undefined;
         if (stage === 'drizzle') {
           toggle = {
@@ -77,7 +80,7 @@ export function PipelineBoard({
             key={stage}
             index={index}
             stage={stage}
-            label={label}
+            label={stageLabel(stage, mode)}
             state={rowState(stage, plan, progress, outcome, config, finishedStages)}
             summary={stageSummary(stage, config, plan)}
             progress={progress?.stage === stage ? progress : undefined}

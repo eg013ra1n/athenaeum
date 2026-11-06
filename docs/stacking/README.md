@@ -115,8 +115,9 @@ preset. In the tab, a run disables APPLY only: the menu still opens and
 Save-as / delete stay live, because a run is exactly when a user wants to
 save the settings they just launched with).
 
-**The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
-the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →
+**The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` and,
+since wave 6c, from the project page as the **Stacking** tab — see "The
+project's Stacking tab, wave 6c"): `StackingTab` (toolbar, run/cancel) →
 `PipelineBoard`/`StageRow` (the board is TEN rows, `0 · Masters` … `9 ·
 Output` — nine backend stages plus the display-only Debayer row;
 `stageSummary.ts` — a pure function shared with `StageInspector`, never reads
@@ -1183,7 +1184,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
 - **The wire is subject-aware.** The two events, `RunSummary`, `StackingRunRow`
   and `StackingPlan` carry `setId | projectId`, exactly one set
   (`run::wire_subject`). `RunSummary.projectId` is `#[serde(default)]`.
-  `useStackingRuns` drops an event without a `setId` until 6c.
+  `useStackingRuns` keys every event by subject since 6c (before, it dropped an event without a `setId`).
 - **Four config fields.**
   - `grouping.exposureMode` (`seconds | stops | equivalent | none`, default `seconds`).
   - `grouping.stopsWidth` (default 1, clamped to `MIN_STOPS_WIDTH` = 0.1).
@@ -1212,8 +1213,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     four significant digits, so two anchors (at least ×1.07 apart at the
     `stopsWidth` floor) never print alike.
   - `stacking_run_groups.exposure_class` holds the token; `exposure` stays seconds.
-  - In the equivalent and none modes two classes may share the shortest member's
-    seconds, so their masters differ only by a `_2` suffix (`resolve_collision`).
+  - In the equivalent and none modes two classes may print the same exposure in
+    their master names, so their masters differ only by a `_2` suffix (`resolve_collision`).
 - **`FrameOrigin`** is `Catalog { file_id, attested }` or `Project { project_id,
   frame_uuid, publisher, landed_path, blake3, byte_size, size_mtime, meta }`.
   `meta` is the manifest's `collab::frame_meta::ProjectFrameMeta`, parsed once;
@@ -1266,10 +1267,17 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     is one.
   - Warnings (spec §7): frames not on this device, other reasons a frame is left
     out, frames to be solved locally or that could not be, frames outside the
-    grid, unsupported files, and unknown exposure equivalence.
+    grid, unsupported files, files that cannot be opened, and unknown exposure
+    equivalence.
   - Unsupported files also leave every group's included count and the ≥ 3
     rule, so a group Prepare would leave short is blocked by `frames` at plan
-    time; they are not manual exclusions.
+    time; they are not manual exclusions. A file that cannot be opened
+    (`prepare::CANNOT_OPEN`: offline, moved or renamed) is left out the same way
+    and counted in `prepare.unsupported`, but its warning says so ("cannot be
+    opened (offline, moved or renamed)") instead of "(unsupported file)". An
+    attested set's plan does the same (plan 6c D8), and its space estimate counts
+    what Prepare writes in place of a calibrated copy per light. One warn per
+    plan build carries the counts; the per-file lines are debug.
   - It carries `grid` (state, current, proposal, framesInside, canEdit) and
     `projectFrames`.
   - It does not yet know the WCS reference rule (below): a manual pin without
@@ -1516,8 +1524,8 @@ group onto the coordinator-confirmed grid and writes grid masters.
   `<output>/<sanitized title>/`. A project's output folder follows the
   frame-set rule: the Save-time overlap warning only, and `resolve_collision`
   means a master never overwrites a file. The plan's `folders` blocker covers
-  the working root, not the output folder, so a master may land inside the
-  Collaboration folder (a blocker can be added in 6c).
+  the working root and, since 6c (D10), refuses an output folder inside the
+  Collaboration folder (see "The project's Stacking tab, wave 6c").
 - **Starting (D13, D14, D16, D17).** `start_stacking` takes a project. The
   run's grid is the plan's confirmed one, recorded in `RunSummary.grid`.
   - The plan blocks a run certain to fail at Reference — a manual pin, or
@@ -1559,10 +1567,133 @@ group onto the coordinator-confirmed grid and writes grid masters.
   publishers, two canonical filters, a coordinator exclusion, a frame the run
   solves, a pair under 25 % overlap — twice. Every project run test holds
   `grid_counters::exclusive()`.
-- **Open for 6c:** the project page's Stacking tab (the wire types are final),
-  `/projects/<id>?tab=stacking` for the completion notification. The 25 %
-  threshold stays synthetic until a real partial-overlap project exists
-  (open-items).
+- **6c landed:** the project page's Stacking tab and
+  `/projects/<id>?tab=stacking` for the completion notification (below, "The
+  project's Stacking tab, wave 6c"). The 25 % threshold stays synthetic until a
+  real partial-overlap project exists (open-items).
+
+**The project's Stacking tab, wave 6c (2026-11-05 … 2026-11-06)** (plan
+`docs/superpowers/plans/2026-11-05-collab-v3-wave6c-project-stacking-ui-plan.md`, rulings D1–D11; spec
+`2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §12, §4.3, §5.0–§5.1, §5.4, §6.3, §7, §8, §9.1–§9.2, §13,
+§18 (6c)). A processor stacks a collaboration project from the project page, `/projects/<id>?tab=stacking`. No new
+command and no new route (the count stays 328): the backend changes are two fields on the plan (`prepare`, the grid's
+outlines) and two changes to a project's masters (the name, one blocker). Everything else the tab reads is the 6b-3 wire,
+unchanged.
+
+- **One tab, two subjects.** `StackingTab` takes a `StackSubject` (`frameSet | project`,
+  `components/stacking/subject.ts`), not a frame-set id.
+  - `useStackingSubjectApi` is the one adapter: plan, config, runs, work usage and cleanup go to the set's command or to
+    the project's twin (`*_project_stacking_*`). The run-id commands (`cancel_stacking`, `get_stacking_run`,
+    `get_master_light_preview`) serve both. A pending config write is captured with its subject when it is scheduled,
+    so a write made on a project never reaches a set, and a project's write always re-sends its `referenceFrameUuid`
+    (leaving it out would clear the pin).
+  - Runs are keyed by subject: `set:<id>` or `project:<projectId>`. `useStackingRuns` keeps `progress` and
+    `lastOutcome` per key, so a run's progress shows on its own subject's page only. An event with neither or both ids
+    is logged and dropped. A frame set's selected-run key keeps its old spelling (`<prefix><setId>`); a project's is
+    `<prefix>project:<projectId>`. The completion notification opens the subject's own Stacking tab.
+  - The exclusion key is `String(frameId)` for a set and the frame uuid for a project.
+  - Frame sets behave as before: their tests changed in prop shape only.
+  - The project page shows the tab to every member, after Library (after My frames when Library is hidden), and
+    `?tab=stacking` is a deep link.
+- **The grid card and the schematic (D11).** `GridCard` sits above the board for a project. The coordinator's confirm
+  path (states, buttons and the rewrite warning) is in `docs/transfers/README.md` (wave 6c). The `grid` blocker also
+  makes the Register row read `blocked` (`BLOCKER_STAGE.grid = 'register'`), because registration lands on the grid.
+  - The plan's `grid` now carries `target` (the project's target circle), `footprints` and `framesNotDrawn`. A footprint
+    is one frame's pixel edges, eight points per edge, through its manifest WCS with SIP: the same points `framesInside`
+    counts with, so an outline agrees with the count. The set is every published, accepted frame of the manifest, on this
+    device or not, so every member sees the same picture. A frame with no manifest WCS, no pixel size, unreadable
+    meta or edges that do not project to finite sky points is counted in `framesNotDrawn` and not drawn. The note under the
+    picture reads `<n> frames are not drawn: no usable WCS in the manifest` (`1 frame is not drawn: …` for one): it names
+    no single cause, because the four above are not told apart.
+  - `gridProjection.ts::skyToGridPixel` is the gnomonic projection of `grid_wcs`. The Rust test
+    `grid_projection_golden_file_is_current` writes (`GOLDEN_WRITE=1`) and checks
+    `src/components/stacking/gridProjection.golden.json`, and the TS test asserts the same numbers to 1e-6 px. A point 90°
+    or more from the grid centre does not project (Rust returns finite, mirrored values there), and an outline with one
+    such point is not drawn.
+  - The picture is grid-up, as the master will look: SVG y = height − y, because the grid is `BOTTOM-UP`, and east is
+    left. The `N` arrow follows the projection of a point 0.1° north, so it tilts with the rotation. The view box is the
+    grid rectangle and every outline, plus 5 %, so frames reaching past the grid show. The grid rectangle is the accent
+    colour; each outline is in its publisher's member colour (`useMemberColor`), neutral for a publisher with none. The
+    viewer's own outlines share the accent colour with the rectangle, which is drawn thicker (an owner glance, open-items).
+    With no grid at all it draws the target circle and the outlines on a tangent plane at the target. In the dialog it is
+    redrawn from the draft as the numbers change.
+- **Prepare panel and board mode (D3, D5).** `boardMode(plan)` is `prepare` when the plan is a project's or its
+  `readiness.attested` is true, `calibrate` otherwise. Every board change below reads the plan, never the config.
+  - **Plan counts.** `StackingPlan.prepare` is `Some(PlanPrepare)` for a project and for an attested set, `None` for
+    every other set. It predicts, per included frame (manually excluded ones do not count), from the `probe_file` +
+    `prepare_action` the plan already runs: `inPlace`, `debayered`, `converted`, `unsupported` (a file that cannot be
+    opened counts here too) and `atRun` (a zip-resident file, which the plan does not probe). What a run actually did
+    stays in its exclusions and warnings. An attested set's plan drops an unreadable light as a project's does (D8).
+  - **Board.** Masters reads `Not needed — project frames are calibrated by their publishers` (project) or `Not needed —
+    the lights are calibrated externally` (attested set), never `blocked`. Row 1 is labelled Prepare, with the summary
+    `<n> in place · <n> debayered · <n> converted` (zero terms omitted, `+ <n> checked at run` when `atRun` is above
+    zero). The Re-run menu lists Prepare, not Calibrate.
+  - **Panels.** `PreparePanel` lists the five counts and the one option, the same `calibration.debayerOsc` checkbox the
+    Calibrate panel edits, and says `Other calibration settings do not apply: these frames are already calibrated.` The
+    Debayer panel points to the Prepare panel. A project's Reference panel reads `Pin a frame in the Frames table
+    below.` and has no `Choose in Analysis` (an attested set keeps it: it is a frame set with an Analysis tab). The
+    `→ Coverage` link is not rendered for a project.
+- **The reference pin (D2).** A project has no Analysis tab, so its manual reference is a Reference column in the
+  project Frames table.
+  - Every usable row (`onDisk` and no `reason`) is pinnable. Pinning writes `reference.mode = 'manual'` and the frame's
+    uuid in one `set_project_stacking_config`; pinning the pinned row clears the uuid and returns to `auto`. A pin counts
+    only in manual mode: a uuid left under Auto is kept for the next Manual and is not the reference.
+  - A row with no manifest WCS is pinnable too, with the tooltip `No WCS in the manifest — plate-solved locally first`,
+    because the reference rule (§5.4) admits a locally solved frame and `hasWcs` is the manifest's WCS only. An unusable
+    row shows its reason and cannot be pinned; a pinned row that became unusable can still be cleared.
+- **The project Frames table, by uuid.** Rows come from `plan.projectFrames`, with a Publisher column. A run row joins
+  its plan row by `frameUuid` only. A summary frame carries the run's handle and no uuid, so it is joined through the
+  run row (its own `frameId`), never through the plan's current handle. A run row whose frame left the plan renders from
+  the run (the summary's file name, or `frame <handle>`) with no toggle and no pin. An unusable plan row keeps its include
+  checkbox: it stores a uuid, so an exclusion survives the file landing later.
+- **The exposure grouping control (D1).** In the Groups table header, for both subjects: `Exposure grouping`, Seconds /
+  Stops / Equivalent t/N² / None, and the mode's threshold. `seconds` takes `Tolerance (s)` (`exposureToleranceSec`,
+  min 0.01); `stops` and `equivalent` take `Width (stops)` (`stopsWidth`, min 0.1); `none` takes none. The `Exp` column
+  shows the plan's `exposureClass` token (`180s`, `st120`, `eq0.24`, `all`, `unknown`). A change patches `grouping` and
+  the plan refetches as for any config edit. A frame set's default stays `seconds`; a project's stored config is seeded
+  `stops` 1.0. The measured zero point of `equivalent` is sub-wave 6.5, not built.
+  - **The tolerance hint** (`The tolerance is part of the calibration hash: changing it re-calibrates this set's lights
+    on the next run.`) shows only where the board calibrates and the mode is `seconds`
+    (`toleranceInCalibrationHash = boardMode(plan) === 'calibrate'`: an ordinary set). An attested set's and a project's
+    Prepare hash holds no grouping, so the hint would be false there. `equivalent` carries its own hint (classes by
+    t / N²; frames without both numbers are grouped by seconds, and the plan names how many).
+- **Output and the coverage thumbnail (D4).** The Output panel has `Write a coverage map (frames per pixel) beside each
+  master` and `Crop to coverage of at least … frames (0 = no crop)`: the config fields `output.coverageMap` and
+  `output.cropToCoverage`, for both subjects and in Settings → Stacking too. The Output board line adds `coverage map`
+  and `crop ≥ K` when on. In the Results panel a group with a `coveragePath` shows a coverage thumbnail beside its
+  master's (`Coverage map — frames per pixel`, with its path line; `get_master_light_preview` already serves the
+  `coverage` kind). Previews are requested one at a time: the coverage one after the master's, and after the drizzle's
+  when the group has one. A drizzle coverage map gets a path line only.
+- **Refresh triggers (D7).** A project's plan refetches on every trigger a frame set has (mount, `library-updated`, a
+  config edit after a 300 ms debounce, a finished run, an exclusion or pin write) and on a grid saved from the card.
+  New: `collab-grid-changed` and `collab-frames-changed` for this project, other projects ignored, coalesced to ONE
+  refetch per second (a trailing timer started by the first event, so a feed that never goes quiet still re-plans every
+  second; cleared on unmount; StrictMode-safe). A frame set has no feed. The tab does not read the project card's
+  `canonicalGrid`, so a grid move that emitted no event (see `docs/transfers/README.md`, wave 6b-2) shows at the next
+  refetch.
+- **The empty state.** The board gives way to `Nothing to stack on this device`, with `No frame of this project is usable
+  on this device.` or `Every usable frame is excluded.`, only when the plan carries a `frames` blocker and no included
+  frame is usable (`onDisk` and no `reason`). The grid card, the Groups card, the inspector and the Frames table stay (the
+  table so an exclusion can be undone). A project with a few usable, included frames under the blocker (groups under
+  three) keeps its board, so the exposure grouping that can clear it is in reach. A frame set never shows it.
+- **A master's name states its exposure range (D9).** The name is
+  `<set or project name>_<filter>_<mono|osc>_<exposure>s_<n>x.fits` (each part sanitized), and the exposure part follows the frames the master
+  integrated (`master_cards::exposure_label`, `ExposureLabel::{Single, Range}`). In `seconds` mode it is the cluster's own
+  label, so a frame set's names in the default mode never moved. In `stops`, `equivalent` and `none`, over the INCLUDED
+  frames only (a manually excluded frame does not count): exposures that print differently give `<min>-<max>s`
+  (`…_L_mono_120-180s_57x.fits`), one printed exposure gives that exposure (never the class's shortest member, which an
+  excluded frame may have set), and none known gives the group's label. Exposures are compared as printed, so a name is
+  never `120-120s`. Nothing parses the token.
+- **A project's masters never land in the Collaboration folder (D10).** This replaces 6b-3's "a blocker can be added in
+  6c". The plan's `folders` blocker now also checks `<output>/<project title>/` against the Collaboration root
+  (`stacking::paths::project_output_overlap`: both sides through `canonical_or_nearest`, `starts_with`, equality
+  included): `The project's masters folder <path> is inside the Collaboration folder; choose an output folder outside it`,
+  with `<path>` the canonicalized folder. No Collaboration folder set, no blocker. Inside any other scan root the
+  frame-set rule stands (the Save-time overlap warning only), and the working-root check is unchanged.
+- **Harness.** `HARNESS_SCENARIO=stacking npm run ui:harness`, `/projects/p-m31?tab=stacking` (`scripts/ui-harness/README.md`).
+- **Not in 6c.** The grid and the outlines over the sky-chart survey background (a follow-up, possibly with the portal's
+  grid editor, wave 7), and the `equivalent` zero point (sub-wave 6.5). Owed checks, the owner decisions and the
+  acceptance re-check on current `main`: `docs/superpowers/open-items.md`, "Collab wave 6c".
 
 **LN model fixes (2026-10-04 … 2026-10-06)** (spec
 `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md`, plan

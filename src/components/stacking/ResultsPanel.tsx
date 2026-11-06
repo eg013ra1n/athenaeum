@@ -10,7 +10,6 @@ import { ConfirmDialog } from '../ConfirmDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   GroupStats,
-  MasterLightKind,
   StackingRunDetail,
   StackingRunGroupRow,
   StackingRunSummary,
@@ -18,6 +17,8 @@ import type {
   WorkUsage,
 } from '../../types/stacking';
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
+import { subjectKey, type StackSubject } from './subject';
+import { useStackingSubjectApi } from './useStackingSubjectApi';
 import { ProvenanceModal } from './ProvenanceModal';
 import { formatBytes } from './formatBytes';
 import { snrGainLabel } from './snrGain';
@@ -149,8 +150,14 @@ function RevealOrPath({ path }: { path: string | null }) {
  *  coverage) live only on `SummaryGroup`, written once at Output. The gate
  *  for whether drizzle ran at all is `group.drizzlePath` (the DB row,
  *  present even before/without a loaded summary), not this slice's own
- *  `drizzlePath` — see the render below. */
-type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 'drizzle'>;
+ *  `drizzlePath` — see the render below. Wave 6c Task 8 (D4): the two
+ *  coverage maps' paths come the same way. */
+type GroupSummary = Pick<
+  SummaryGroup,
+  'drizzlePath' | 'weightMapPath' | 'drizzle' | 'coveragePath' | 'drizzleCoveragePath'
+>;
+
+const COVERAGE_CAPTION = 'Coverage map — frames per pixel';
 
 /** The actual preview render for one written master light (M4d Task 3,
  *  ruling R-M4d-5) — 160 px tall, `object-contain` so a wide master is
@@ -162,12 +169,10 @@ type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 
  *  one line, the full text still reachable via `title`.
  *
  *  Pure/presentational — no fetch of its own — so `MasterCard` can call
- *  [`useMasterPreview`] directly for the master thumbnail (it needs that
- *  state to sequence the drizzle one below) while [`MasterThumbnail`]
- *  keeps owning the fetch for every other caller. `loading="lazy"` was
- *  dropped (M4d final review nit): the `src` is always a same-page blob
- *  URL the hook already fetched eagerly, so the attribute deferred
- *  nothing. */
+ *  [`useMasterPreview`] directly for each thumbnail (it needs every one's
+ *  state to sequence the next). `loading="lazy"` was dropped (M4d final
+ *  review nit): the `src` is always a same-page blob URL the hook already
+ *  fetched eagerly, so the attribute deferred nothing. */
 function ThumbnailBox({ url, error, label }: { url: string | null; error: string | null; label: string }) {
   if (error) {
     return (
@@ -184,29 +189,6 @@ function ThumbnailBox({ url, error, label }: { url: string | null; error: string
   );
 }
 
-/** Fetches and renders one written master light's thumbnail via
- *  [`useMasterPreview`] + [`ThumbnailBox`]. `enabled` (M4d final review,
- *  Important #1 part 3) gates the fetch itself — `MasterCard` uses it to
- *  hold the drizzle thumbnail's request until the master's own has
- *  resolved, so the two panels-per-group no longer fan out two full-master
- *  reads into the backend at once. */
-function MasterThumbnail({
-  runId,
-  groupKey,
-  kind,
-  label,
-  enabled = true,
-}: {
-  runId: number;
-  groupKey: string;
-  kind: MasterLightKind;
-  label: string;
-  enabled?: boolean;
-}) {
-  const { url, error } = useMasterPreview(runId, groupKey, kind, undefined, enabled);
-  return <ThumbnailBox url={url} error={error} label={label} />;
-}
-
 /** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
  *  on the `StackingRunGroupRow` this card is built from (that row updates
  *  progressively while the run is still in flight; the LN reference path is
@@ -216,7 +198,7 @@ function MasterCard({
   group,
   lnReferencePath,
   groupReferenceFrameId,
-  drizzleSummary,
+  groupSummary,
   drizzleConfigEnabled,
 }: {
   group: StackingRunGroupRow;
@@ -228,10 +210,10 @@ function MasterCard({
    *  summary hasn't loaded, or a pre-M4b summary. */
   groupReferenceFrameId: number | null;
   /** `null` when the run's `summary` hasn't loaded yet (or this group has
-   *  none in it) — the drizzle stats/weight-map path below are simply
-   *  omitted in that case; `group.drizzlePath` alone still drives whether
-   *  the "Drizzle" line renders at all. */
-  drizzleSummary: DrizzleGroupSummary | null;
+   *  none in it) — the drizzle stats, the weight-map path and the coverage
+   *  maps below are simply omitted in that case; `group.drizzlePath` alone
+   *  still drives whether the "Drizzle" line renders at all. */
+  groupSummary: GroupSummary | null;
   /** `runDetail.summary?.config.drizzle.enabled` — whether THIS run's own
    *  config had drizzle on, independent of the current draft config. Drives
    *  the "skipped" line when the run had it on but this group has no path. */
@@ -239,24 +221,42 @@ function MasterCard({
 }) {
   const stats = parseGroupStats(group.statsJson);
   const snrGain = stats ? snrGainLabel(stats) : null;
-  const dstats = drizzleSummary?.drizzle ?? null;
+  const dstats = groupSummary?.drizzle ?? null;
+  const coveragePath = groupSummary?.coveragePath ?? null;
 
   // M4d final review, Important #1 part 3: fetch the master's own thumbnail
   // first, and hold the drizzle one back until it resolves — a group with
   // both previews used to fire two renders into the backend at once, each
   // reading the master light's full float buffer before downscaling.
-  // `useMasterPreview` is called directly here (not through
-  // `MasterThumbnail`) because this card needs the master's `url`/`error`
-  // to know when it has settled; passing `null` args when there is no
-  // master path is the hook's own "nothing to fetch" case, so
-  // `masterResolved` starts (and stays) `true` and the drizzle fetch is
-  // never blocked on an output this group never wrote.
+  // `useMasterPreview` is called directly here because this card needs each
+  // thumbnail's `url`/`error` to know when it has settled; passing `null`
+  // args when there is no path is the hook's own "nothing to fetch" case,
+  // so a `*Resolved` flag starts (and stays) `true` and the next fetch is
+  // never blocked on an output this group never wrote. Wave 6c Task 8 (D4):
+  // the coverage map's thumbnail is the third in the chain — after the
+  // drizzle one when the group has it, else after the master's — so there
+  // is still one render at a time.
   const master = useMasterPreview(
     group.masterPath ? group.runId : null,
     group.masterPath ? group.groupKey : null,
     'master',
   );
   const masterResolved = !group.masterPath || master.url !== null || master.error !== null;
+  const drizzle = useMasterPreview(
+    group.drizzlePath ? group.runId : null,
+    group.drizzlePath ? group.groupKey : null,
+    'drizzle',
+    512,
+    masterResolved,
+  );
+  const drizzleResolved = !group.drizzlePath || drizzle.url !== null || drizzle.error !== null;
+  const coverage = useMasterPreview(
+    coveragePath ? group.runId : null,
+    coveragePath ? group.groupKey : null,
+    'coverage',
+    512,
+    masterResolved && drizzleResolved,
+  );
 
   return (
     <div className="bg-surface rounded-lg border border-border p-3 space-y-2 min-w-0">
@@ -273,17 +273,23 @@ function MasterCard({
        *  drizzled master's when the group has one. Gated on the PATH the
        *  group row records, so a group that never wrote the output asks for
        *  no preview at all (rather than fetching a guaranteed 404). */}
-      {group.masterPath && (
-        <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
+      {coveragePath != null ? (
+        // D4: the coverage map's thumbnail sits beside the master's, labelled, its path line under it.
+        <div data-testid="master-previews" className="grid grid-cols-2 gap-2 items-start">
+          {group.masterPath && (
+            <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
+          )}
+          <figure className="min-w-0 space-y-1">
+            <ThumbnailBox url={coverage.url} error={coverage.error} label={basename(coveragePath)} />
+            <figcaption className="text-[11px] text-content-muted">{COVERAGE_CAPTION}</figcaption>
+            <RevealOrPath path={coveragePath} />
+          </figure>
+        </div>
+      ) : (
+        group.masterPath && <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
       )}
       {group.drizzlePath && (
-        <MasterThumbnail
-          runId={group.runId}
-          groupKey={group.groupKey}
-          kind="drizzle"
-          label={basename(group.drizzlePath)}
-          enabled={masterResolved}
-        />
+        <ThumbnailBox url={drizzle.url} error={drizzle.error} label={basename(group.drizzlePath)} />
       )}
 
       <p className="text-xs text-content-secondary tabular-nums">
@@ -352,10 +358,17 @@ function MasterCard({
               coverage {dstats.coverage.map((c) => `${(c * 100).toFixed(1)}%`).join(' / ')}
             </p>
           )}
-          {drizzleSummary?.weightMapPath != null && (
+          {groupSummary?.weightMapPath != null && (
             <div className="flex items-center gap-1.5 text-xs text-content-muted">
               <span>Weight map:</span>
-              <RevealOrPath path={drizzleSummary.weightMapPath} />
+              <RevealOrPath path={groupSummary.weightMapPath} />
+            </div>
+          )}
+          {/* D4: a path line only — the drizzled map is not rendered. */}
+          {groupSummary?.drizzleCoveragePath != null && (
+            <div className="flex items-center gap-1.5 text-xs text-content-muted">
+              <span>Drizzle coverage map:</span>
+              <RevealOrPath path={groupSummary.drizzleCoveragePath} />
             </div>
           )}
         </div>
@@ -376,10 +389,26 @@ function MasterCard({
   );
 }
 
+/** The command names a failure line reports, per subject kind (the adapter in
+ *  `useStackingSubjectApi.ts` picks the command; these are only for the log). */
+const COMMAND_NAMES = {
+  frameSet: {
+    runs: 'get_stacking_runs',
+    usage: 'get_stacking_work_usage',
+    cleanup: 'cleanup_stacking_work',
+  },
+  project: {
+    runs: 'get_project_stacking_runs',
+    usage: 'get_project_stacking_work_usage',
+    cleanup: 'cleanup_project_stacking_work',
+  },
+} as const;
+
 export interface ResultsPanelProps {
-  setId: number;
-  /** True while a run is active for this set (`StackingTab`'s own
-   *  `isRunning(setId) || plan?.activeRunId != null`, threaded through
+  /** What the panel lists runs for: a frame set or a project. */
+  subject: StackSubject;
+  /** True while a run is active for this subject (`StackingTab`'s own
+   *  `isRunning(key) || plan?.activeRunId != null`, threaded through
    *  rather than recomputed here so the two never disagree on what
    *  "running" means). Gates the cleanup button. */
   running: boolean;
@@ -393,9 +422,12 @@ export interface ResultsPanelProps {
  *  group, Provenance, and the working-folder usage/cleanup line. Owns its
  *  own runs/detail/usage fetching — the same self-contained-fetch pattern
  *  Task 3's `OutputPanel` used for `get_stacking_paths`. */
-export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: ResultsPanelProps) {
+export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: ResultsPanelProps) {
   const { notify } = useNotifications();
   const { lastOutcome } = useStackingContext();
+  const subjectApi = useStackingSubjectApi(subject);
+  const commandNames = COMMAND_NAMES[subject.kind];
+  const noun = subject.kind === 'frameSet' ? 'set' : 'project';
 
   const [runs, setRuns] = useState<StackingRunSummary[] | null>(null);
   const [runsError, setRunsError] = useState<string | null>(null);
@@ -407,29 +439,30 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
   const [cleaning, setCleaning] = useState(false);
 
-  const lastOutcomeRunId = lastOutcome.get(setId)?.runId;
+  const stackKey = subjectKey(subject);
+  const lastOutcomeRunId = lastOutcome.get(stackKey)?.runId;
 
   const runsSeqRef = useRef(0);
   const fetchRuns = useCallback(async () => {
     const seq = ++runsSeqRef.current;
     try {
-      const list = await api.invoke<StackingRunSummary[]>('get_stacking_runs', { setId, limit: 20 });
+      const list = await subjectApi.getRuns(20);
       if (seq !== runsSeqRef.current) return; // superseded by a later call
       setRuns(list);
       setRunsError(null);
       setSelectedRunId((prev) => {
         if (prev != null && list.some((r) => r.run.id === prev)) return prev;
-        const remembered = readSelectedRunId(setId);
+        const remembered = readSelectedRunId(stackKey);
         if (remembered != null && list.some((r) => r.run.id === remembered)) return remembered;
         return list.length > 0 ? list[0].run.id : null; // newest first
       });
     } catch (err) {
-      console.error('[ResultsPanel] get_stacking_runs failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.runs} failed:`, err);
       if (seq === runsSeqRef.current) setRunsError(String(err));
     }
-  }, [setId]);
+  }, [subjectApi, stackKey, commandNames]);
 
-  // Mount / set change, every completion of a run for this set, and any
+  // Mount / subject change, every completion of a run for this subject, and any
   // catalog change a completed run (or something else) might have caused.
   useEffect(() => { void fetchRuns(); }, [fetchRuns, lastOutcomeRunId]);
   useEffect(() => {
@@ -439,7 +472,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   }, [fetchRuns]);
 
   // The selected run's detail — re-fetched on selection AND whenever this
-  // set gets a fresh outcome (the previously-selected run might be the one
+  // subject gets a fresh outcome (the previously-selected run might be the one
   // that just finished, its `summary` now populated for the first time).
   const detailSeqRef = useRef(0);
   useEffect(() => {
@@ -447,7 +480,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       setRunDetail(null);
       return;
     }
-    writeSelectedRunId(setId, selectedRunId);
+    writeSelectedRunId(stackKey, selectedRunId);
     let cancelled = false;
     const seq = ++detailSeqRef.current;
     (async () => {
@@ -461,7 +494,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedRunId, setId, lastOutcomeRunId]);
+  }, [selectedRunId, stackKey, lastOutcomeRunId]);
 
   useEffect(() => {
     onSelectedRunDetailChange(runDetail);
@@ -469,23 +502,23 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
 
   const fetchUsage = useCallback(async () => {
     try {
-      const u = await api.invoke<WorkUsage>('get_stacking_work_usage', { setId });
+      const u = await subjectApi.getWorkUsage();
       setUsage(u);
       setUsageError(null);
     } catch (err) {
-      console.error('[ResultsPanel] get_stacking_work_usage failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.usage} failed:`, err);
       // Fix round 1, Minor #6: a fetch failure must not leave the line
       // reading "loading…" forever — that's indistinguishable from a slow
       // request still in flight.
       setUsageError(String(err));
     }
-  }, [setId]);
+  }, [subjectApi, commandNames]);
   useEffect(() => { void fetchUsage(); }, [fetchUsage, lastOutcomeRunId]);
 
   const handleCleanup = useCallback(async () => {
     setCleaning(true);
     try {
-      const freed = await api.invoke<number>('cleanup_stacking_work', { setId, what: 'intermediates' });
+      const freed = await subjectApi.cleanup('intermediates');
       notify({
         title: 'Stacking intermediates deleted',
         detail: `Freed ${formatBytes(freed)}`,
@@ -502,7 +535,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       window.dispatchEvent(new Event('library-updated'));
       await fetchUsage();
     } catch (err) {
-      console.error('[ResultsPanel] cleanup_stacking_work failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.cleanup} failed:`, err);
       notify({
         title: 'Could not delete intermediates',
         detail: String(err),
@@ -514,10 +547,10 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       setCleaning(false);
       setConfirmCleanupOpen(false);
     }
-  }, [setId, notify, fetchUsage]);
+  }, [subjectApi, commandNames, notify, fetchUsage]);
 
   const selectedRun = runs?.find((r) => r.run.id === selectedRunId) ?? null;
-  // Brief's literal gate: disabled only while a run is active for this set
+  // Brief's literal gate: disabled only while a run is active for this subject
   // (the backend's own `Conflict` refusal is the same condition, checked
   // again server-side — see the catch below).
   const cleanupDisabled = running || cleaning;
@@ -607,8 +640,16 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
                         ? (sg?.referenceFrameId ?? null)
                         : null
                     }
-                    drizzleSummary={
-                      sg ? { drizzlePath: sg.drizzlePath, weightMapPath: sg.weightMapPath, drizzle: sg.drizzle } : null
+                    groupSummary={
+                      sg
+                        ? {
+                            drizzlePath: sg.drizzlePath,
+                            weightMapPath: sg.weightMapPath,
+                            drizzle: sg.drizzle,
+                            coveragePath: sg.coveragePath,
+                            drizzleCoveragePath: sg.drizzleCoveragePath,
+                          }
+                        : null
                     }
                     drizzleConfigEnabled={runDetail.summary?.config.drizzle.enabled ?? false}
                   />
@@ -634,7 +675,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
           type="button"
           onClick={() => setConfirmCleanupOpen(true)}
           disabled={cleanupDisabled}
-          title={running ? 'A run is active for this set' : undefined}
+          title={running ? `A run is active for this ${noun}` : undefined}
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-colors ${
             cleanupDisabled
               ? 'border-border text-content-muted cursor-not-allowed'
@@ -653,7 +694,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       <ConfirmDialog
         isOpen={confirmCleanupOpen}
         title="Delete stacking intermediates?"
-        message="Removes this set's registered, calibrated and local-normalization working files — the reproducible stage output. Run manifests and master lights are kept. This cannot be undone."
+        message={`Removes this ${noun}'s registered, calibrated and local-normalization working files — the reproducible stage output. Run manifests and master lights are kept. This cannot be undone.`}
         confirmText={cleaning ? 'Deleting…' : 'Delete intermediates'}
         confirmDanger
         onConfirm={() => { if (!cleaning) void handleCleanup(); }}

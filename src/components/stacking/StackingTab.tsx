@@ -4,23 +4,29 @@ import { Play, Square, ChevronDown, ChevronRight, FolderOpen, AlertTriangle, Loa
 import { api } from '../../api';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
+import { subjectKey, type StackSubject, type SubjectKey } from './subject';
+import { useStackingSubjectApi, type StackingSubjectApi, type SubjectConfig } from './useStackingSubjectApi';
+import type { CollabFramesChange, CollabGridChanged } from '../../types/models';
 import type {
+  GroupingConfig,
   NamedPreset,
+  PlanProjectFrame,
   Stage,
   StackingConfig,
   StackingPlan,
   StackingPreset,
   StackingPresets,
   StackingRunDetail,
-  StackingSetConfig,
 } from '../../types/stacking';
 import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
+import { EmptyState } from '../ui/EmptyState';
 import { ResultsPanel } from './ResultsPanel';
-import { stableStringify, withoutPaths, type BoardStage } from './stageSummary';
+import { GridCard } from './GridCard';
+import { boardMode, stableStringify, stageLabel, withoutPaths, type BoardStage } from './stageSummary';
 import {
   readSelectedStage,
   writeSelectedStage,
@@ -31,28 +37,35 @@ import {
 } from './stackingPrefs';
 
 export interface StackingTabProps {
-  framesSetId: number;
-  frameSetName?: string;
-  /** The set's LIGHT frames (Task 4, Decisions item 3) — `FrameSetDetail.tsx`
-   *  derives this from its own `detail.nights` tree, the same source every
-   *  other tab on this page reads. Used by the Frames table both before any
-   *  run exists (the only frame list available) and after one, as the
-   *  filename fallback for a row a run's summary hasn't reached yet. */
-  lightFrames: LightFrameRef[];
+  /** What the tab stacks: a frame set (carrying the set's LIGHT frames) or a
+   *  collaboration project. Every command, the run state and the pending
+   *  config write are keyed by `subjectKey(subject)`. */
+  subject: StackSubject;
 }
 
-const STAGE_LABEL: Record<BoardStage, string> = {
-  masters: 'Masters',
-  calibrate: 'Calibrate',
-  debayer: 'Debayer',
-  measure: 'Measure & select',
-  reference: 'Reference',
-  register: 'Register',
-  normalize: 'Local normalization',
-  integrate: 'Integrate',
-  drizzle: 'Drizzle',
-  output: 'Output',
-};
+/** What a write still waiting for its debounce (or its flush) is about: the
+ *  adapter and key of the subject it was made for, captured when it was
+ *  scheduled — never looked up again at send time, so it cannot land on the
+ *  subject the tab shows by then. */
+interface PendingWrite {
+  api: StackingSubjectApi;
+  kind: StackSubject['kind'];
+  key: SubjectKey;
+  value: SubjectConfig;
+}
+
+// Stable empty lists for the kind of subject that has none (a project has no
+// light-frame list and no numeric exclusions; a set has no project frames): a
+// fresh `[]` per render would re-run every memo and effect keyed on them.
+const NO_LIGHT_FRAMES: LightFrameRef[] = [];
+const NO_FRAME_IDS: number[] = [];
+const NO_PROJECT_FRAMES: PlanProjectFrame[] = [];
+
+/** D7: the live feed's events for a project re-plan it at most this often. */
+const PLAN_FEED_REFRESH_MS = 1000;
+
+/** The two live-feed events that change a project's plan: its grid moved, or frames landed or were remapped. */
+const PLAN_FEED_EVENTS = ['collab-grid-changed', 'collab-frames-changed'] as const;
 
 const PRESET_LABEL: Record<StackingPreset, string> = {
   default: 'Default',
@@ -72,25 +85,36 @@ function formatGB(bytes: number): string {
 
 /**
  * The Stacking tab (spec §11) — plans, configures, runs and watches an M1
- * stacking run for one frame set. Owns the plan fetch, the (unsaved) config
- * draft used to preview the plan, the run state from `useStackingContext`,
- * and the board/inspector layout. Task 3 fills the inspector; Task 4 adds
- * the Frames table and Results panel.
+ * stacking run for one subject: a frame set or a collaboration project. Owns
+ * the plan fetch, the (unsaved) config draft used to preview the plan, the
+ * run state from `useStackingContext`, and the board/inspector layout. Task 3
+ * fills the inspector; Task 4 adds the Frames table and Results panel. The
+ * root carries no `title` (fix round 1 item 6): on a page-sized `div` it pops
+ * a native tooltip over the ENTIRE tab on any hover, not just the header.
  */
-// `frameSetName` is part of the props contract FrameSetDetail.tsx passes
-// (matching every sibling tab's signature) but, fix round 1 item 6, is not
-// rendered as a `title` on the tab's root — a `title` on a page-sized `div`
-// pops a native tooltip over the ENTIRE tab on any hover, not just the
-// header. Nothing else in this tab needs the set name (FrameSetDetail's own
-// header above the tab bar already shows it), so it is simply not
-// destructured here.
-export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
+export function StackingTab({ subject }: StackingTabProps) {
   const navigate = useNavigate();
   const { notify } = useNotifications();
   const { progress, lastOutcome, startRun, cancelRun, isRunning } = useStackingContext();
+  // Every stacking command of this subject with its id bound; stable per key.
+  const subjectApi = useStackingSubjectApi(subject);
+  const stackKey = subjectKey(subject);
+  // The set's LIGHT frames (Task 4, Decisions item 3) — `FrameSetDetail.tsx`
+  // derives them from its own `detail.nights` tree, the same source every
+  // other tab on this page reads. Used by the Frames table both before any
+  // run exists (the only frame list available) and after one, as the
+  // filename fallback for a row a run's summary hasn't reached yet. A
+  // project has none: its table is keyed by frame uuid, not by these ids.
+  const lightFrames = subject.kind === 'frameSet' ? subject.lightFrames : NO_LIGHT_FRAMES;
 
   const [draftConfig, setDraftConfig] = useState<StackingConfig | null>(null);
-  const [excludedFrameIds, setExcludedFrameIds] = useState<number[]>([]);
+  // The subject's exclusion keys (`SubjectConfig.excluded`): `String(frameId)`
+  // for a set, the frame uuid for a project.
+  const [excluded, setExcluded] = useState<string[]>([]);
+  // A project's manually pinned reference frame, loaded with its config and
+  // sent back with every write (the command stores whatever it is given, so a
+  // write that left it out would clear the pin). Always `null` for a set.
+  const [referenceFrameUuid, setReferenceFrameUuid] = useState<string | null>(null);
   const [presets, setPresets] = useState<StackingPresets | null>(null);
   // M4d Task 4 (ruling R-M4d-6): the user's OWN presets, a second list
   // beside the three built-ins above. Kept as component state rather than
@@ -124,9 +148,9 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // the other directly.
   const [selectedRunDetail, setSelectedRunDetail] = useState<StackingRunDetail | null>(null);
 
-  const runProgress = progress.get(framesSetId);
-  const runOutcome = lastOutcome.get(framesSetId);
-  const running = isRunning(framesSetId) || plan?.activeRunId != null;
+  const runProgress = progress.get(stackKey);
+  const runOutcome = lastOutcome.get(stackKey);
+  const running = isRunning(stackKey) || plan?.activeRunId != null;
 
   // The board's per-row cancelled/failed derivation (A5) needs the SAME
   // run's finished-stage list `outcome` describes — `selectedRunDetail`
@@ -143,17 +167,17 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // `library-updated` listener, the 300 ms debounce, and the outcome effect
   // all go through this one function) — an older response can resolve
   // after a newer one already landed, and after navigating to a different
-  // frame set (`StackingTab` carries no `key` tied to `framesSetId`, so a
-  // reused instance is possible) a stale response for the PREVIOUS set can
-  // still be in flight. `planSeqRef` drops a response that is no longer the
-  // latest call; `framesSetIdRef` (always current, unlike the `framesSetId`
-  // this closure captured at creation) drops one whose set has since
-  // changed (fix round 1, Important #2).
+  // subject (the tab may be reused for it, no `key` is promised) a stale
+  // response for the PREVIOUS subject can still be in flight. `planSeqRef`
+  // drops a response that is no longer the latest call; `subjectKeyRef`
+  // (always current, unlike the `stackKey` this closure captured at
+  // creation) drops one whose subject has since changed (fix round 1,
+  // Important #2).
   const planSeqRef = useRef(0);
-  const framesSetIdRef = useRef(framesSetId);
-  useEffect(() => { framesSetIdRef.current = framesSetId; }, [framesSetId]);
+  const subjectKeyRef = useRef(stackKey);
+  useEffect(() => { subjectKeyRef.current = stackKey; }, [stackKey]);
 
-  // Fix round 1 (Critical #1/#2, Important #3): which set `draftConfig`
+  // Fix round 1 (Critical #1/#2, Important #3): which subject `draftConfig`
   // belongs to, and whether its most recent change was USER-originated
   // (an inspector edit / preset apply / toggle) as opposed to the load
   // effect's own seed/reset. `dirtyRef` is set ONLY by `setUserConfig`
@@ -162,45 +186,60 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // effect on a set switch/unmount), not merely scheduled, so a pending
   // edit survives long enough to be flushed instead of silently lost.
   const dirtyRef = useRef(false);
-  const draftForSetRef = useRef<number | null>(null);
+  const draftForKeyRef = useRef<SubjectKey | null>(null);
 
-  // Fix round 1, Minor #4: whether the currently-pending write includes an
-  // EXCLUSION change — set only by `setUserExcludedFrameIds`, cleared only
-  // once the write carrying it is actually dispatched (same "clear at send
-  // time, not schedule time" discipline as `dirtyRef` itself). `build_plan`
-  // reads `excluded_frame_ids` from the STORED row, never a client override
+  // Fix round 1, Minor #4: whether the currently-pending write includes a
+  // change `build_plan` reads from the STORED row — the EXCLUSION list or a
+  // project's pinned reference — set only by `setUserExcluded` and
+  // `setUserReference`, cleared only once the write carrying it is actually
+  // dispatched (same "clear at send time, not schedule time" discipline as
+  // `dirtyRef` itself). `build_plan` reads `excluded_frame_ids` and the
+  // reference frame from the STORED row, never a client override
   // (`crates/athenaeum-core/src/stacking/plan.rs`), so only a write that
-  // changed the excluded-id list needs the post-write `refetchPlan` below —
-  // a pure config edit is already re-planned by the 300 ms draft-change
-  // effect using a client override, and re-planning it again after the
-  // persist lands would just be a redundant round trip.
-  const exclusionDirtyRef = useRef(false);
+  // changed one of them needs the post-write `refetchPlan` below — a pure
+  // config edit is already re-planned by the 300 ms draft-change effect using
+  // a client override, and re-planning it again after the persist lands would
+  // just be a redundant round trip.
+  const storedRowDirtyRef = useRef(false);
 
   /** The only way `draftConfig` should change as a result of a USER action.
    *  The load effect calls `setDraftConfig` directly (bypassing this) so it
-   *  can never mark the draft dirty — visiting a set with no stored
+   *  can never mark the draft dirty — visiting a subject with no stored
    *  override must never materialize one (Critical #1). */
   const setUserConfig = useCallback<typeof setDraftConfig>((value) => {
     dirtyRef.current = true;
     setDraftConfig(value);
   }, []);
 
-  /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's ONE
-   *  frame-level write. The load effect calls `setExcludedFrameIds`
-   *  directly (bypassing this), so opening a set never marks the draft
-   *  dirty on its own; only the Frames table's include checkbox, through
-   *  `handleToggleExcludeFrame` below, goes through here. */
-  const setUserExcludedFrameIds = useCallback<typeof setExcludedFrameIds>((value) => {
+  /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's
+   *  frame-level write (the pin below is the other). The load effect calls
+   *  `setExcluded` directly (bypassing this), so opening a subject never
+   *  marks the draft dirty on its own; only the Frames table's include
+   *  checkbox, through `handleToggleExcludeFrame` below, goes through here. */
+  const setUserExcluded = useCallback<typeof setExcluded>((value) => {
     dirtyRef.current = true;
-    exclusionDirtyRef.current = true;
-    setExcludedFrameIds(value);
+    storedRowDirtyRef.current = true;
+    setExcluded(value);
   }, []);
 
-  const handleToggleExcludeFrame = useCallback((frameId: number) => {
-    setUserExcludedFrameIds((prev) =>
-      prev.includes(frameId) ? prev.filter((id) => id !== frameId) : [...prev, frameId],
-    );
-  }, [setUserExcludedFrameIds]);
+  /** The pinned-reference analogue of `setUserExcluded`: only the Frames
+   *  table's pin, through `handlePinReference` below, goes through here. */
+  const setUserReference = useCallback<typeof setReferenceFrameUuid>((value) => {
+    dirtyRef.current = true;
+    storedRowDirtyRef.current = true;
+    setReferenceFrameUuid(value);
+  }, []);
+
+  // The Frames table speaks exclusion keys: `String(frameId)` for a set, the
+  // frame uuid for a project — the same strings `SubjectConfig.excluded`
+  // holds, so one toggle serves both.
+  const handleToggleExcludeFrame = useCallback((key: string) => {
+    setUserExcluded((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  }, [setUserExcluded]);
+  const excludedFrameIds = useMemo(
+    () => (subject.kind === 'frameSet' ? excluded.map(Number) : NO_FRAME_IDS),
+    [excluded, subject.kind],
+  );
 
   const handleToggleFramesCollapsed = useCallback(() => {
     setFramesCollapsed((prev) => {
@@ -220,14 +259,11 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
 
   const refetchPlan = useCallback(async (configOverride?: StackingConfig) => {
     const seq = ++planSeqRef.current;
-    const forSetId = framesSetId;
+    const forKey = stackKey;
     try {
-      const p = await api.invoke<StackingPlan>('get_stacking_plan', {
-        setId: forSetId,
-        config: configOverride,
-      });
-      if (seq !== planSeqRef.current || forSetId !== framesSetIdRef.current) {
-        return null; // superseded by a later call, or the set changed
+      const p = await subjectApi.getPlan(configOverride);
+      if (seq !== planSeqRef.current || forKey !== subjectKeyRef.current) {
+        return null; // superseded by a later call, or the subject changed
       }
       setPlan(p);
       return p;
@@ -235,31 +271,33 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       console.error('[StackingTab] failed to refresh the stacking plan:', err);
       return null;
     }
-  }, [framesSetId]);
+  }, [subjectApi, stackKey]);
 
-  // Mount / frame-set-change: load the set's config, then the plan built
-  // from it. Fix round 1, Critical #2: `draftConfig`/`excludedFrameIds` are
+  // Mount / subject-change: load the subject's config, then the plan built
+  // from it. Fix round 1, Critical #2: `draftConfig`/`excluded` are
   // reset to null/[] FIRST (synchronously, before the async fetch even
   // starts) so nothing on screen — and nothing the persist effect could act
-  // on — still points at the PREVIOUS set while this fetch is in flight;
-  // `draftForSetRef` is set only once the config response actually lands,
+  // on — still points at the PREVIOUS subject while this fetch is in flight;
+  // `draftForKeyRef` is set only once the config response actually lands,
   // guarded by this effect's own `cancelled` flag (a fresh effect run for a
-  // newer `framesSetId` already flips the older run's `cancelled` to `true`
+  // newer subject already flips the older run's `cancelled` to `true`
   // before its `await` can resume — the standard React guard, sufficient
-  // here since only this one effect ever calls `get_stacking_config`).
+  // here since only this one effect ever loads the stored config).
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
     setDraftConfig(null);
-    setExcludedFrameIds([]);
+    setExcluded([]);
+    setReferenceFrameUuid(null);
     (async () => {
       try {
-        const cfg = await api.invoke<StackingSetConfig>('get_stacking_config', { setId: framesSetId });
+        const cfg = await subjectApi.getConfig();
         if (cancelled) return;
         setDraftConfig(cfg.config);
-        setExcludedFrameIds(cfg.excludedFrameIds);
-        draftForSetRef.current = framesSetId;
+        setExcluded(cfg.excluded);
+        setReferenceFrameUuid(cfg.referenceFrameUuid);
+        draftForKeyRef.current = stackKey;
         const presetsResult = await api.invoke<StackingPresets>('get_stacking_presets', {});
         if (cancelled) return;
         setPresets(presetsResult);
@@ -277,18 +315,15 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         }
         // This plan fetch is one of four call sites that can write `plan`
         // (the other three go through `refetchPlan`) — guarded by the same
-        // `planSeqRef`/`framesSetIdRef` those share, so whichever response
+        // `planSeqRef`/`subjectKeyRef` those share, so whichever response
         // is actually the most recent wins regardless of which code path
         // issued it (a `library-updated` event or the outcome effect can
         // race against this very fetch).
         const seq = ++planSeqRef.current;
-        const forSetId = framesSetId;
-        const p = await api.invoke<StackingPlan>('get_stacking_plan', {
-          setId: forSetId,
-          config: cfg.config,
-        });
+        const forKey = stackKey;
+        const p = await subjectApi.getPlan(cfg.config);
         if (cancelled) return;
-        if (seq !== planSeqRef.current || forSetId !== framesSetIdRef.current) {
+        if (seq !== planSeqRef.current || forKey !== subjectKeyRef.current) {
           return; // superseded by a later refetchPlan/mount call
         }
         setPlan(p);
@@ -300,7 +335,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       }
     })();
     return () => { cancelled = true; };
-  }, [framesSetId]);
+  }, [subjectApi, stackKey]);
 
   // Always-current mirror of `draftConfig` for effects that must react to
   // something ELSE (a DOM event, a finished run) without themselves
@@ -316,8 +351,48 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     return () => window.removeEventListener('library-updated', handler);
   }, [refetchPlan]);
 
+  // D7: a project's plan follows the live feed — frames landing, remaps arriving and a grid someone confirmed all
+  // change what a run would do while the tab is open. The events of OTHER projects are ignored. Schedule-if-none-
+  // pending, the shape `ProjectDetail`'s `collab-peers-changed` throttle uses: the first event starts a trailing
+  // timer and the rest are absorbed, so a burst is one refetch and a feed that never goes quiet (frames landing for
+  // minutes) still re-plans every second instead of waiting on a debounce that keeps restarting. A frame set has
+  // no feed. StrictMode-safe (CLAUDE.md): a registration that resolves after the cleanup released itself.
+  const feedProjectId = subject.kind === 'project' ? subject.projectId : null;
+  const refetchPlanRef = useRef(refetchPlan);
+  useEffect(() => { refetchPlanRef.current = refetchPlan; }, [refetchPlan]);
+  useEffect(() => {
+    if (feedProjectId === null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unlisteners: (() => void)[] = [];
+    const onFeed = (change: CollabGridChanged | CollabFramesChange) => {
+      if (cancelled || change.projectId !== feedProjectId || timer !== undefined) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        void refetchPlanRef.current(draftConfigRef.current ?? undefined);
+      }, PLAN_FEED_REFRESH_MS);
+    };
+    for (const event of PLAN_FEED_EVENTS) {
+      api
+        .listen<CollabGridChanged | CollabFramesChange>(event, onFeed)
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch((err) => console.error(`[StackingTab] ${event} listen failed:`, err));
+    }
+    return () => {
+      cancelled = true;
+      for (const unlisten of unlisteners) unlisten();
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [feedProjectId]);
+
   // Re-plan (debounced) whenever the draft config changes — skip the very
-  // first assignment, which is the mount effect's own initial fetch.
+  // first assignment, which is the mount effect's own initial fetch. A project's pin changes the draft AND the
+  // stored row: `build_plan` reads the pin from the stored row, so a re-plan before the write lands builds against the
+  // old pin (a flashed `reference` blocker). While that write is pending (`storedRowDirtyRef`, read when the timer
+  // fires) the draft re-plan stands down: the post-write refetch carries the same config, one build per pin.
   const skipFirstDraftEffect = useRef(true);
   useEffect(() => {
     if (skipFirstDraftEffect.current) {
@@ -325,9 +400,12 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       return;
     }
     if (!draftConfig) return;
-    const t = setTimeout(() => { void refetchPlan(draftConfig); }, 300);
+    const t = setTimeout(() => {
+      if (subject.kind === 'project' && storedRowDirtyRef.current) return;
+      void refetchPlan(draftConfig);
+    }, 300);
     return () => clearTimeout(t);
-  }, [draftConfig, refetchPlan]);
+  }, [draftConfig, refetchPlan, subject.kind]);
 
   // A run just finished (success or otherwise) — the plan's stale-stage /
   // cached-artifact state is now out of date.
@@ -338,43 +416,52 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   }, [lastOutcomeRunId, refetchPlan]);
 
   // The lights the plan includes, and the masters their calibration reads: what a run would extract from
-  // zips before it can read them.
+  // zips before it can read them. A frame set only: a project's zip-resident own frames are counted by the
+  // plan's `prepare.atRun`.
   const zipScope = useMemo(() => {
-    const excluded = new Set(excludedFrameIds);
-    return { frameIds: lightFrames.map((f) => f.frameId).filter((id) => !excluded.has(id)), withLinkedMasters: true };
-  }, [lightFrames, excludedFrameIds]);
+    if (subject.kind !== 'frameSet') return null;
+    const excludedSet = new Set(excludedFrameIds);
+    return { frameIds: lightFrames.map((f) => f.frameId).filter((id) => !excludedSet.has(id)), withLinkedMasters: true };
+  }, [subject.kind, lightFrames, excludedFrameIds]);
 
   // The most recent user-originated write still waiting to go out — set by
   // the persist effect below when it schedules the 500 ms timer, read by
   // both that timer and the flush effect (Important #3), cleared by
   // whichever of them actually sends it.
-  const pendingWriteRef = useRef<{ setId: number; config: StackingConfig; excludedFrameIds: number[] } | null>(null);
+  const pendingWriteRef = useRef<PendingWrite | null>(null);
 
   const sendPendingWrite = useCallback((notifyOnFailure: boolean) => {
     const payload = pendingWriteRef.current;
     if (!payload) return;
     dirtyRef.current = false;
-    const shouldRefetchPlan = exclusionDirtyRef.current;
-    exclusionDirtyRef.current = false;
+    const shouldRefetchPlan = storedRowDirtyRef.current;
+    storedRowDirtyRef.current = false;
     pendingWriteRef.current = null;
-    api.invoke('set_stacking_config', payload)
+    payload.api.setConfig(payload.value)
       .then(() => {
         // `build_plan` computes `includedCount` (and everything else the
         // excluded-frame list affects) from the STORED row, never a client
         // override (`crates/athenaeum-core/src/stacking/plan.rs`) — a
         // config edit alone already re-plans via the 300 ms draft-change
         // effect using a client override, but the Frames table's include
-        // checkbox only ever changes `excludedFrameIds`, which that effect
+        // checkbox only ever changes the exclusion list, which that effect
         // does not watch. Re-plan only when THIS write actually changed the
         // excluded-id list (fix round 1, Minor #4) — a pure config write
         // skips this, since the draft effect already covers it and a
-        // second refetch here would just be a redundant round trip.
-        if (shouldRefetchPlan) {
-          void refetchPlan(payload.config);
+        // second refetch here would just be a redundant round trip. And
+        // only while the tab still shows the subject the write was made
+        // for: a slow write of the subject just left must not re-plan it
+        // (that would bump `planSeqRef` and drop the new subject's own
+        // plan fetch still on its way).
+        if (shouldRefetchPlan && payload.key === subjectKeyRef.current) {
+          void refetchPlan(payload.value.config);
         }
       })
       .catch((err) => {
-        console.error('[StackingTab] set_stacking_config failed:', err);
+        console.error(
+          `[StackingTab] ${payload.kind === 'frameSet' ? 'set_stacking_config' : 'set_project_stacking_config'} failed:`,
+          err,
+        );
         if (notifyOnFailure) {
           notify({
             tone: 'warning',
@@ -384,6 +471,12 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             detail: String(err),
           });
         }
+        // A project's draft re-plan stood down for this write (`storedRowDirtyRef`, above), and the post-write
+        // refetch runs on success only: a failed write would leave the plan behind the draft. Re-plan with the
+        // latest draft, for the subject the tab still shows. Frame sets never stood down; they are unchanged.
+        if (shouldRefetchPlan && payload.kind === 'project' && payload.key === subjectKeyRef.current) {
+          void refetchPlan(draftConfigRef.current ?? undefined);
+        }
       });
   }, [notify, refetchPlan]);
 
@@ -391,25 +484,35 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // changes. Fix round 1, Critical #1: writes only when `dirtyRef.current`
   // is true — the load effect's own seed/reset never sets it, so opening
   // the tab on a set with no stored override can never materialize one.
-  // Critical #2: also skipped when `draftForSetRef` still names a
-  // DIFFERENT set than the current `framesSetId` — the one-commit window
-  // between a set switch and the new set's load effect resetting the
-  // draft, where this effect would otherwise still see the OLD set's
-  // draftConfig alongside the NEW framesSetId and write the wrong set.
+  // Critical #2: also skipped when `draftForKeyRef` still names a
+  // DIFFERENT subject than the current `stackKey` — the one-commit window
+  // between a subject switch and the new subject's load effect resetting
+  // the draft, where this effect would otherwise still see the OLD
+  // subject's draftConfig alongside the NEW key and write the wrong one.
+  // The scheduled write carries the adapter and key it was made under
+  // (`PendingWrite`), so the flush below reaches the old subject even
+  // though the tab already shows the next one.
   // Submit state, never a re-read (spec §11.2): a failed write logs and
-  // warns but never rolls the draft back or re-fetches.
+  // warns but never rolls the draft back or re-fetches. The adapter takes
+  // the whole document; `isDefault`/`updatedAt` are placeholders, neither
+  // command sends them.
   useEffect(() => {
     if (!draftConfig) return;
     if (!dirtyRef.current) return;
-    if (draftForSetRef.current !== framesSetId) return;
-    pendingWriteRef.current = { setId: framesSetId, config: draftConfig, excludedFrameIds };
+    if (draftForKeyRef.current !== stackKey) return;
+    pendingWriteRef.current = {
+      api: subjectApi,
+      kind: subject.kind,
+      key: stackKey,
+      value: { config: draftConfig, excluded, referenceFrameUuid, isDefault: false, updatedAt: null },
+    };
     const t = setTimeout(() => sendPendingWrite(true), 500);
     return () => clearTimeout(t);
-  }, [draftConfig, excludedFrameIds, framesSetId, sendPendingWrite]);
+  }, [draftConfig, excluded, referenceFrameUuid, stackKey, subject.kind, subjectApi, sendPendingWrite]);
 
-  // Flush instead of cancel (Important #3): a set switch or unmount must
+  // Flush instead of cancel (Important #3): a subject switch or unmount must
   // not silently drop an edit the 500 ms timer above hadn't reached yet.
-  // This effect's own cleanup — which fires exactly when `framesSetId` is
+  // This effect's own cleanup — which fires exactly when `stackKey` is
   // about to change, or on true unmount — sends whatever the persist
   // effect last scheduled, fire-and-forget (no `notify`; the tab the user
   // is leaving isn't the place to toast a failure).
@@ -419,17 +522,45 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         sendPendingWrite(false);
       }
     };
-  }, [framesSetId, sendPendingWrite]);
+  }, [stackKey, sendPendingWrite]);
 
   const handleConfigChange = useCallback((next: StackingConfig) => {
     setUserConfig(next);
   }, [setUserConfig]);
+
+  // D2: a project's manual reference is a pin in its Frames table. Pinning a
+  // frame sets `reference.mode = 'manual'` and the stored uuid in one render,
+  // so one write carries both; pinning the pinned frame clears the uuid and
+  // returns to Auto. A uuid still stored under Auto is not "the pinned frame":
+  // the click pins it.
+  const handlePinReference = useCallback((uuid: string) => {
+    if (subject.kind !== 'project') return;
+    const clearing = referenceFrameUuid === uuid && draftConfig?.reference.mode === 'manual';
+    setUserReference(clearing ? null : uuid);
+    setUserConfig((prev) =>
+      prev ? { ...prev, reference: { ...prev.reference, mode: clearing ? 'auto' : 'manual' } } : prev,
+    );
+  }, [subject.kind, referenceFrameUuid, draftConfig, setUserReference, setUserConfig]);
 
   const handleToggleDrizzle = useCallback((checked: boolean) => {
     setUserConfig((prev) =>
       prev ? { ...prev, drizzle: { ...prev.drizzle, enabled: checked } } : prev,
     );
   }, [setUserConfig]);
+
+  // D1: the Groups table's exposure grouping control patches `grouping` like any other config edit: the draft is
+  // written after the debounce and the plan is built again from it.
+  const handlePatchGrouping = useCallback((patch: Partial<GroupingConfig>) => {
+    setUserConfig((prev) =>
+      prev ? { ...prev, grouping: { ...prev.grouping, ...patch } } : prev,
+    );
+  }, [setUserConfig]);
+
+  // A grid the card saved: re-plan now (the grid blocker lifts, the Register row unblocks). The live feed's
+  // `collab-grid-changed` re-plans again later, harmlessly.
+  const handleGridSaved = useCallback(() => {
+    void refetchPlan(draftConfigRef.current ?? undefined);
+  }, [refetchPlan]);
 
   const handleSelectStage = useCallback((stage: BoardStage) => {
     setSelectedStage(stage);
@@ -616,8 +747,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
 
   const handleRun = useCallback(() => {
     if (!plan || plan.blockers.length > 0 || running || starting) return;
-    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined));
-  }, [plan, running, starting, beginStarting, startRun, framesSetId, draftConfig]);
+    void beginStarting(() => startRun(subject, draftConfig ?? undefined));
+  }, [plan, running, starting, beginStarting, startRun, subject, draftConfig]);
 
   const handleCancel = useCallback(async () => {
     const runId = runProgress?.runId ?? plan?.activeRunId ?? null;
@@ -632,8 +763,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const handleRerunFrom = useCallback((stage: Stage) => {
     setRerunMenuOpen(false);
     if (running || starting) return;
-    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined, stage));
-  }, [running, starting, beginStarting, startRun, framesSetId, draftConfig]);
+    void beginStarting(() => startRun(subject, draftConfig ?? undefined, stage));
+  }, [running, starting, beginStarting, startRun, subject, draftConfig]);
 
   // Measure panel's own "Re-measure" button (spec: rerunFrom: 'measure').
   // Gates on the plan's blockers and on a live run, the same way the
@@ -707,14 +838,18 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // refuses a blocked plan, so an open menu would only offer failures.
   const rerunDisabled = running || starting || plan.blockers.length > 0;
   const measureCached = !plan.staleStages.includes('measure');
+  // Wave 6c: a project or an attested set shows Prepare where a frame set shows Calibrate; every name and
+  // sentence here follows the board.
+  const mode = boardMode(plan);
+  const firstStage = stageLabel('calibrate', mode);
   const runStartsAt =
     firstStale === undefined
       ? 'Every cached stage is reused — the run re-integrates from the cached registered frames'
       : firstStale === 'calibrate'
         ? measureCached
-          ? 'No calibrated or registered frames are cached — the run starts from Calibrate; the measurements are reused'
-          : 'Nothing is cached — the run starts from Calibrate'
-        : `Starts from ${STAGE_LABEL[firstStale]} — the stages before it are reused from cache`;
+          ? `No ${mode === 'prepare' ? 'prepared' : 'calibrated'} or registered frames are cached — the run starts from ${firstStage}; the measurements are reused`
+          : `Nothing is cached — the run starts from ${firstStage}`
+        : `Starts from ${stageLabel(firstStale, mode)} — the stages before it are reused from cache`;
   // Fix round 1, Minor #8: APPLYING a preset edits the config the same way
   // every inspector panel does, so it is disabled while a run is active for
   // the same reason those panels are (`StageInspector`'s own `disabled`
@@ -735,6 +870,21 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const runDisabled = plan.blockers.length > 0 || running || starting;
   const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : runStartsAt;
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
+  // The pin in effect: a uuid stored under Auto is kept for the next Manual but is not the reference.
+  const pinnedReference =
+    subject.kind === 'project' && draftConfig.reference.mode === 'manual' ? referenceFrameUuid : null;
+  // A project with nothing a run could stack here: the board of rows that cannot run gives way to the reason. The
+  // `frames` blocker also stands while usable, included frames are too few for one group (the first frames of a
+  // project still replicating, groups of two), and then the board, the exposure grouping that can clear it and the
+  // blocker line are what the member needs: the empty state shows only when no frame is usable here or every usable
+  // one is excluded. A frame set keeps its board whatever its blockers say.
+  const usableFrameUuids = plan.projectFrames.filter((f) => f.onDisk && f.reason == null).map((f) => f.frameUuid);
+  const nothingUsable = usableFrameUuids.length === 0;
+  const everyUsableExcluded = !nothingUsable && usableFrameUuids.every((uuid) => excluded.includes(uuid));
+  const nothingToStack =
+    subject.kind === 'project' &&
+    plan.blockers.some((b) => b.code === 'frames') &&
+    (nothingUsable || everyUsableExcluded);
 
   return (
     // Plan 5b final fix wave, review finding B7 (supersedes click-through
@@ -988,7 +1138,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
                         ? 'Not cached — every run redoes this stage already'
                         : stage === 'integrate'
                           ? 'Reuse every cached stage and integrate again'
-                          : `Redo ${STAGE_LABEL[stage]} and everything after it; reuse the stages before`
+                          : `Redo ${stageLabel(stage, mode)} and everything after it; reuse the stages before`
                     }
                     className={`w-full text-left px-3 py-1.5 text-sm ${
                       stale
@@ -997,7 +1147,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
                     }`}
                   >
                     <span className="flex items-center justify-between gap-2">
-                      <span>{STAGE_LABEL[stage]}</span>
+                      <span>{stageLabel(stage, mode)}</span>
                       {stale && <span className="text-xs">stale</span>}
                     </span>
                   </button>
@@ -1018,15 +1168,17 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             <div key={`${b.code}-${i}`} className="flex items-center gap-2 text-sm text-error">
               <AlertTriangle size={14} className="shrink-0" />
               <span>{b.message}</span>
-              {(b.code === 'masters' || b.code === 'links' || b.code === 'masterFiles') && (
-                <button
-                  type="button"
-                  className="underline hover:no-underline text-content-secondary"
-                  onClick={handleCoverageClick}
-                >
-                  → Coverage
-                </button>
-              )}
+              {/* A project has no Calibration tab to go to: its frames come calibrated. */}
+              {subject.kind !== 'project' &&
+                (b.code === 'masters' || b.code === 'links' || b.code === 'masterFiles') && (
+                  <button
+                    type="button"
+                    className="underline hover:no-underline text-content-secondary"
+                    onClick={handleCoverageClick}
+                  >
+                    → Coverage
+                  </button>
+                )}
             </div>
           ))}
         </div>
@@ -1041,22 +1193,47 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         </div>
       )}
 
-      {/* Board (62%) / Inspector (38%) */}
+      {/* Board (62%) / Inspector (38%). A project with nothing to stack keeps the grid card, the Groups card and the
+          inspector in their places and shows the reason where the board was. */}
       <div className="flex flex-col lg:flex-row gap-4">
         <div className="lg:w-[62%] min-w-0 space-y-3">
-          <PipelineBoard
-            plan={plan}
-            config={draftConfig}
-            progress={runProgress}
-            outcome={runOutcome}
-            finishedStages={boardFinishedStages}
-            selectedStage={selectedStage}
-            onSelectStage={handleSelectStage}
-            onToggleDrizzle={handleToggleDrizzle}
-          />
+          {/* A project's canonical grid is the registration target of every run: it sits above the board whose
+              Register row it unblocks. A frame set has none. */}
+          {subject.kind === 'project' && plan.grid && (
+            <GridCard projectId={subject.projectId} grid={plan.grid} onSaved={handleGridSaved} />
+          )}
+          {nothingToStack ? (
+            <div className="bg-surface-elevated rounded-lg px-4 py-2">
+              <EmptyState>
+                <span className="block text-content">Nothing to stack on this device</span>
+                <span className="block text-content-muted">
+                  {nothingUsable
+                    ? 'No frame of this project is usable on this device.'
+                    : 'Every usable frame is excluded.'}
+                </span>
+              </EmptyState>
+            </div>
+          ) : (
+            <PipelineBoard
+              plan={plan}
+              config={draftConfig}
+              progress={runProgress}
+              outcome={runOutcome}
+              finishedStages={boardFinishedStages}
+              selectedStage={selectedStage}
+              onSelectStage={handleSelectStage}
+              onToggleDrizzle={handleToggleDrizzle}
+            />
+          )}
           <div className="bg-surface-elevated rounded-lg p-3">
             <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
-            <GroupsTable groups={plan.groups} />
+            <GroupsTable
+              groups={plan.groups}
+              grouping={draftConfig.grouping}
+              disabled={running || starting}
+              toleranceInCalibrationHash={mode === 'calibrate'}
+              onPatchGrouping={handlePatchGrouping}
+            />
           </div>
         </div>
 
@@ -1074,7 +1251,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
           >
             {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-            {STAGE_LABEL[selectedStage]}
+            {stageLabel(selectedStage, mode)}
           </button>
           <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
             <StageInspector
@@ -1095,17 +1272,21 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
        *  (the Frames table's nine columns need the room; the Results
        *  panel's master cards read better at full width too). */}
       <FramesTable
+        subjectKind={subject.kind}
         lightFrames={lightFrames}
+        projectFrames={subject.kind === 'project' ? plan.projectFrames : NO_PROJECT_FRAMES}
         runDetail={selectedRunDetail}
-        excludedFrameIds={excludedFrameIds}
+        excludedKeys={excluded}
+        referenceFrameUuid={pinnedReference}
         onToggleExclude={handleToggleExcludeFrame}
+        onPin={handlePinReference}
         collapsed={framesCollapsed}
         onToggleCollapsed={handleToggleFramesCollapsed}
         disabled={running}
       />
 
       <ResultsPanel
-        setId={framesSetId}
+        subject={subject}
         running={running}
         onSelectedRunDetailChange={setSelectedRunDetail}
       />

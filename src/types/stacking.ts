@@ -396,7 +396,13 @@ export type PlanReference = { mode: ReferenceMode, frameId: number | null, filen
 
 export type GridState = "unset" | "proposed" | "confirmed";
 
-export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, };
+export type PlanGridTarget = { raDeg: number, decDeg: number, radiusDeg: number, };
+
+export type PlanGridFootprint = { frameUuid: string, publisherAccountId: string, publisher: string, filterCanonical: string, outline: Array<[number, number]>, };
+
+export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, target: PlanGridTarget, footprints: Array<PlanGridFootprint>, framesNotDrawn: number, };
+
+export type PlanPrepare = { inPlace: number, debayered: number, converted: number, unsupported: number, atRun: number, };
 
 export type PlanProjectFrame = { handle: number | null, frameUuid: string, fileName: string, publisher: string, filterCanonical: string, exptimeSec: number, colorMode: ColorMode, hasWcs: boolean, onDisk: boolean, reason: string | null, };
 
@@ -409,7 +415,7 @@ export type StackingPlan = { setId: number | null, projectId: string | null, set
  * `start_master_builds_batch` submits a manual batch in, so a flat
  * built by stage 0.5 sees its own precal master already on disk.
  */
-mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, grid: PlanGrid | null, projectFrames: Array<PlanProjectFrame>, };
+mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, grid: PlanGrid | null, projectFrames: Array<PlanProjectFrame>, prepare: PlanPrepare | null, };
 
 export type StackingRunRow = { id: number, framesSetId: number | null, projectId: string | null, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
 

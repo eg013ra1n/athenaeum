@@ -84,10 +84,10 @@ use crate::stacking::ln::{
     SaturationMask, TileTable, CLEANING,
 };
 use crate::stacking::master_cards::{
-    build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
-    remove_partial_outputs, stamp_grid_cards, write_cropped_drizzle, write_cropped_master,
-    write_drizzled_master, write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle,
-    WrittenMaster,
+    build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, exposure_label,
+    master_file_name, remove_partial_outputs, stamp_grid_cards, write_cropped_drizzle,
+    write_cropped_master, write_drizzled_master, write_master_light, GridStamp, MasterCardInputs,
+    WrittenDrizzle, WrittenMaster,
 };
 use crate::stacking::measure::{
     channel_c_inputs, channel_c_summary, substitute_group_c, ChannelMeasurement, check_pass1_head, measure_frame_pass1, measure_frame_pass2,
@@ -12436,12 +12436,19 @@ fn process_group_output(
         }
     }
 
+    // Plan 6c D9: the exposures of the frames the master integrated
+    // (`output.included` indexes `members`), not the group's label alone.
+    let exposure = exposure_label(
+        rc.config.grouping.exposure_mode,
+        group.exposure_s,
+        output.included.iter().map(|&i| members[i].exposure_s),
+    );
     let name = master_file_name(
         &rc.set_name,
         group.filter.as_deref(),
         group.color_mode,
         group.binning,
-        group.exposure_s,
+        exposure,
         output.stats.included,
     );
 
@@ -32797,10 +32804,19 @@ mod tests {
         landed: &Path,
         n: usize,
     ) -> crate::collab::grid::CanonicalGrid {
+        seed_sky_project_exposures(conn, landed, &vec![300.0; n])
+    }
+
+    /// [`seed_sky_project`] with one frame per entry of `exposures` (seconds).
+    fn seed_sky_project_exposures(
+        conn: &rusqlite::Connection,
+        landed: &Path,
+        exposures: &[f64],
+    ) -> crate::collab::grid::CanonicalGrid {
         crate::db::stacking::insert_test_project(conn, "p1");
         let target = (83.8, -5.4);
         let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
-        let uuids: Vec<String> = (0..n).map(|i| format!("l{i}")).collect();
+        let uuids: Vec<String> = (0..exposures.len()).map(|i| format!("l{i}")).collect();
         for (i, uuid) in uuids.iter().enumerate() {
             // Dithers of ±3.6 / ±1.2 px (RA) and 1.2 px (Dec): the LN field's
             // frame-unit lattice (D8, review I6) resolves a dither, and the
@@ -32809,6 +32825,7 @@ mod tests {
             let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
             let mut f = test_fixtures::sky_frame(uuid, (target.0 + dither.0, target.1 + dither.1));
             f.noise_seed = 100 + i as u64;
+            f.exptime_sec = exposures[i];
             test_fixtures::add_project_sky_frame(conn, landed, "p1", &f, &stars);
         }
         crate::collab::grid::CanonicalGrid {
@@ -33173,10 +33190,44 @@ mod tests {
         RunContext,
         crate::collab::grid::CanonicalGrid,
     ) {
+        run_sky_project_exposures(tmp, canonical, &[300.0; 4], tweak)
+    }
+
+    /// [`run_sky_project_filter`] over one frame per entry of `exposures`.
+    fn run_sky_project_exposures(
+        tmp: &Path,
+        canonical: &str,
+        exposures: &[f64],
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        RunContext,
+        crate::collab::grid::CanonicalGrid,
+    ) {
+        run_sky_project_excluding(tmp, canonical, exposures, &[], tweak)
+    }
+
+    /// [`run_sky_project_exposures`] with the frames at the indices in
+    /// `excluded` on the project's manual exclusion list: stored as the plan
+    /// reads them, and on the run as the plan hands them over (`rc.excluded`).
+    fn run_sky_project_excluding(
+        tmp: &Path,
+        canonical: &str,
+        exposures: &[f64],
+        excluded: &[usize],
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        RunContext,
+        crate::collab::grid::CanonicalGrid,
+    ) {
         let db_path = tmp.join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let conn = project_conn(&db_path);
-        let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
+        let grid = seed_sky_project_exposures(&conn, &tmp.join("collab"), exposures);
+        let excluded_uuids: Vec<String> = excluded.iter().map(|i| format!("l{i}")).collect();
         conn.execute(
             "UPDATE project_frames_local SET filter_canonical = ?1 WHERE project_id = 'p1'",
             [canonical],
@@ -33188,11 +33239,25 @@ mod tests {
             &conn,
             "p1",
             &serde_json::to_string(&cfg).unwrap(),
-            &[],
+            &excluded_uuids,
             None,
         )
         .unwrap();
+        let handles: Vec<i64> =
+            crate::stacking::project_source::project_frame_source(&conn, "p1", &cfg)
+                .unwrap()
+                .frames
+                .iter()
+                .filter(|f| excluded_uuids.contains(&f.frame_uuid))
+                .filter_map(|f| f.handle)
+                .collect();
+        assert_eq!(
+            handles.len(),
+            excluded_uuids.len(),
+            "every excluded frame has a handle"
+        );
         let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.join("work"), &tmp.join("out"));
+        rc.excluded = handles;
         rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
         run_pipeline(&mut rc).unwrap();
         (ctx, conn, rc, grid)
@@ -33787,6 +33852,102 @@ mod tests {
             "a grid master always has a WCS: {:?}",
             rc.warnings
         );
+    }
+
+    /// The file name of the one master a sky-project run wrote.
+    fn written_master_name(conn: &rusqlite::Connection, run_id: i64) -> String {
+        let masters = crate::db::stacking::list_master_lights(conn, run_id).unwrap();
+        let master = masters
+            .iter()
+            .find(|m| m.kind == "master")
+            .expect("a master");
+        Path::new(&master.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Plan 6c D9: a `stops` group of 120 s and 180 s frames is one group, and
+    /// its master names the range of the frames it integrated (the group's own
+    /// label would read `120s`).
+    #[test]
+    fn a_stops_group_of_mixed_exposures_names_its_master_with_the_range() {
+        use crate::stacking::config::ExposureMode;
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, conn, rc, _grid) =
+            run_sky_project_exposures(tmp.path(), "Lum", &[120.0, 180.0, 120.0, 180.0], |cfg| {
+                cfg.grouping.exposure_mode = ExposureMode::Stops
+            });
+        assert_eq!(rc.plan_groups.len(), 1, "one group over both exposures");
+        assert_eq!(rc.plan_groups[0].exposure_s, Some(120.0));
+        assert_eq!(
+            written_master_name(&conn, rc.run_id),
+            "p1_Lum_mono_120-180s_4x.fits"
+        );
+    }
+
+    /// Plan 6c D9, r2: the name is over the frames the master integrated, not
+    /// over the class. A `stops` class of 60 s x 2 and 120 s x 3 is `60s` by
+    /// its shortest member; with both 60 s frames excluded the master holds
+    /// three 120 s frames and says `120s`, and with one excluded it holds a
+    /// 60 s and three 120 s frames and says the range.
+    #[test]
+    fn stops_master_name_follows_the_included_frames() {
+        use crate::stacking::config::ExposureMode;
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let exposures = [60.0, 60.0, 120.0, 120.0, 120.0];
+        for (excluded, expected) in [
+            (&[0usize, 1][..], "p1_Lum_mono_120s_3x.fits"),
+            (&[0usize][..], "p1_Lum_mono_60-120s_4x.fits"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_ctx, conn, rc, _grid) =
+                run_sky_project_excluding(tmp.path(), "Lum", &exposures, excluded, |cfg| {
+                    cfg.grouping.exposure_mode = ExposureMode::Stops
+                });
+            assert_eq!(
+                rc.plan_groups.len(),
+                1,
+                "{excluded:?}: one group over both exposures"
+            );
+            assert_eq!(
+                rc.plan_groups[0].exposure_s,
+                Some(60.0),
+                "{excluded:?}: the class's label is its shortest member, excluded or not"
+            );
+            assert_eq!(
+                written_master_name(&conn, rc.run_id),
+                expected,
+                "{excluded:?}"
+            );
+        }
+    }
+
+    /// Plan 6c D9: a `seconds` group keeps the cluster's own label, whatever
+    /// its frames' exposures within the tolerance, so today's names hold; a
+    /// `stops` group whose frames share one exposure keeps it too.
+    #[test]
+    fn a_seconds_group_and_a_uniform_stops_group_keep_the_single_exposure_name() {
+        use crate::stacking::config::ExposureMode;
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        for (mode, exposures) in [
+            (ExposureMode::Seconds, [120.0, 120.0, 121.0, 121.0]),
+            (ExposureMode::Stops, [120.0; 4]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_ctx, conn, rc, _grid) =
+                run_sky_project_exposures(tmp.path(), "Lum", &exposures, |cfg| {
+                    cfg.grouping.exposure_mode = mode
+                });
+            assert_eq!(rc.plan_groups.len(), 1, "{mode:?}");
+            assert_eq!(
+                written_master_name(&conn, rc.run_id),
+                "p1_Lum_mono_120s_4x.fits",
+                "{mode:?}"
+            );
+        }
     }
 
     /// Spec §5.1, §5.9 (review I3): no file a project run writes carries

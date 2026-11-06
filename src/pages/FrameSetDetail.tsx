@@ -399,6 +399,13 @@ export default function FrameSetDetail() {
     return out;
   }, [detail, blackholedFileIds, duplicateFrameIds]);
 
+  // The tab's subject, memoised: a fresh object per parent render would give
+  // every `StackingTab` callback built on it a new identity each time.
+  const stackingSubject = useMemo(
+    () => ({ kind: 'frameSet' as const, framesSetId: parseInt(id!), lightFrames: stackingLightFrames }),
+    [id, stackingLightFrames],
+  );
+
   // Frame id → contributor state for the lights table's "Project" column
   // (spec §8.1–§8.2). Only the first link's frame list is used — a set is
   // expected to be linked to at most one project at a time in practice, and
@@ -1083,17 +1090,12 @@ export default function FrameSetDetail() {
             stackingLightFrames.length > 0 ? (
               // Fix round 1 (Task 3, Critical #2), belt-and-braces: `StackingTab`
               // guards its own draft/persist state against a set switch
-              // internally (`draftForSetRef`), but a fresh mount per set is the
+              // internally (`draftForKeyRef`), but a fresh mount per set is the
               // simplest guarantee that a stale draft can never even momentarily
               // exist under the new id. `ExportTab` below is NOT similarly keyed
               // — verified, not matched here on purpose, since only `StackingTab`
               // materializes a per-set override row a stale write could corrupt.
-              <StackingTab
-                key={id}
-                framesSetId={parseInt(id!)}
-                frameSetName={detail?.frames_set?.name ?? undefined}
-                lightFrames={stackingLightFrames}
-              />
+              <StackingTab key={id} subject={stackingSubject} />
             ) : (
               <div className="text-center py-12 text-content-muted">
                 This set has no light frames yet.

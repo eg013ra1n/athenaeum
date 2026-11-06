@@ -1,7 +1,9 @@
 // Stage 4 (Reference) inspector panel: Auto/Manual mode radio, plus the
 // two-pass pick (M4a Task 4, ruling R-M4a-5) under Auto. Manual mode has no
 // in-tab picker yet (the frame is chosen on the Analysis tab) — this panel
-// only reflects the plan's resolved reference and links there.
+// only reflects the plan's resolved reference and links there. A project has
+// no Analysis tab: its reference is pinned in the Frames table below the
+// board, so the link becomes a line saying where.
 
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle2, XCircle } from 'lucide-react';
@@ -89,13 +91,17 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
           ) : (
             <p className="text-xs text-content-muted">No reference frame chosen yet.</p>
           )}
-          <button
-            type="button"
-            onClick={() => navigate('?tab=analysis', { replace: true })}
-            className="text-xs underline text-content-secondary hover:no-underline"
-          >
-            Choose in Analysis
-          </button>
+          {plan?.projectId != null ? (
+            <p className="text-xs text-content-muted">Pin a frame in the Frames table below.</p>
+          ) : (
+            <button
+              type="button"
+              onClick={() => navigate('?tab=analysis', { replace: true })}
+              className="text-xs underline text-content-secondary hover:no-underline"
+            >
+              Choose in Analysis
+            </button>
+          )}
         </div>
       )}
     </div>

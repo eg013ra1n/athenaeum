@@ -1,6 +1,13 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, ArrowUp, ArrowDown } from 'lucide-react';
-import type { StackingRunDetail, StackingRunFrameRow, RunSummary, SummaryFrame } from '../../types/stacking';
+import { ChevronDown, ChevronRight, ArrowUp, ArrowDown, Pin } from 'lucide-react';
+import type {
+  PlanProjectFrame,
+  StackingRunDetail,
+  StackingRunFrameRow,
+  RunSummary,
+  SummaryFrame,
+} from '../../types/stacking';
+import type { StackSubject } from './subject';
 
 /** The set's LIGHT frames, as `FrameSetDetail.tsx` derives them from its own
  *  `detail.nights` tree — plan 5b Task 4, Decisions item 3. This is the row
@@ -26,8 +33,18 @@ export type RunFrameData = Pick<StackingRunDetail, 'groups' | 'frames'>;
 type StatusTone = 'success' | 'warning' | 'error';
 
 export interface FrameRow {
-  frameId: number;
+  /** The row's exclusion key and React key: `String(frameId)` for a frame
+   *  set, the frame uuid for a project. A project run row that carries no
+   *  uuid is keyed `h:<handle>`, which no uuid can spell. */
+  key: string;
+  /** The frame id in the run's namespace (a catalog id for a set, a
+   *  project-frame handle for a project); `null` only for a project frame
+   *  that has no handle yet and no run row. */
+  frameId: number | null;
   filename: string;
+  /** Project table only: who published the frame; `null` for a set row and
+   *  for a run row that left the plan (the run does not record it). */
+  publisher: string | null;
   group: string;
   weight: number | null;
   fwhmPx: number | null;
@@ -51,10 +68,29 @@ export interface FrameRow {
   regModel: string | null;
   statusLabel: string;
   statusTone: StatusTone;
+  /** False only for a project run row whose frame left the plan (excluded by
+   *  the coordinator, remapped, no longer landed): it renders from the run's
+   *  own data and carries neither the include checkbox nor the pin. */
+  editable: boolean;
+  /** The plan's `reason` the frame cannot be stacked on this device
+   *  (`PlanProjectFrame.reason`), whatever `onDisk` says: a landed file can be
+   *  unsupported or unopenable and has `onDisk` true AND a reason. `null` for
+   *  a set row and a usable frame. */
+  unavailable: string | null;
+  /** Usable on this device (`onDisk` and no reason): the pin is enabled. A
+   *  frame without a manifest WCS is pinnable too (D2): it is plate-solved
+   *  locally first. */
+  pinnable: boolean;
+  /** This frame is the project's manual reference in effect. */
+  pinned: boolean;
+  /** What the pin's tooltip says beyond its default: the reason a frame
+   *  cannot be pinned, or the note on a frame without a manifest WCS. */
+  pinNote: string | null;
 }
 
 type SortKey =
   | 'filename'
+  | 'publisher'
   | 'group'
   | 'weight'
   | 'fwhmPx'
@@ -79,6 +115,13 @@ const COLUMNS: { key: SortKey; label: string; numeric?: boolean; title?: string 
   { key: 'regModel', label: 'Model', title: 'Registration alignment model' },
   { key: 'statusLabel', label: 'Status' },
 ];
+
+/** Project table only: the Publisher column follows Filename. */
+const PUBLISHER_COLUMN: (typeof COLUMNS)[number] = { key: 'publisher', label: 'Publisher' };
+const PROJECT_COLUMNS = COLUMNS.flatMap((c) => (c.key === 'filename' ? [c, PUBLISHER_COLUMN] : [c]));
+
+/** D2: a frame without a manifest WCS is pinnable; the run plate-solves it. */
+const NO_WCS_NOTE = 'No WCS in the manifest — plate-solved locally first';
 
 const STATUS_CHIP: Record<StatusTone, string> = {
   success: 'bg-success-muted text-success',
@@ -168,12 +211,7 @@ export function buildFrameRows(
   const runRowByFrameId = new Map<number, StackingRunFrameRow>(
     (detail?.frames ?? []).map((r) => [r.frameId, r]),
   );
-  const summaryByFrameId = new Map<number, SummaryFrame>();
-  if (summary) {
-    for (const g of summary.groups) {
-      for (const f of g.frames) summaryByFrameId.set(f.frameId, f);
-    }
-  }
+  const summaryByFrameId = summaryFramesByFrameId(summary);
 
   // Union of frame ids, lightFrames first (their own order) then any
   // run-row frame id lightFrames doesn't have (e.g. a frame removed from
@@ -199,60 +237,180 @@ export function buildFrameRows(
     const s = summaryByFrameId.get(frameId);
     const manuallyExcluded = excludedSet.has(frameId);
 
-    if (!runRow) {
-      // No run row for this frame at all (a light added after the selected
-      // run, or one that's never survived to stage 1 in any run) — the
-      // same "no run data yet" shape a row had before any run existed:
-      // status comes from the manual-exclusion list alone.
-      //
-      // `group` is deliberately display-only here (Plan 5b final fix wave,
-      // click-through item A6): the plan's own groups know a frame's group
-      // only in aggregate (`PlanGroup.frameCount`, no per-frame membership),
-      // and `LightFrameRef` carries no instrument/filter/binning fields to
-      // derive it from client-side — the table's own tooltip on this cell
-      // ("assigned by the next run") is the fix, not a new backend call.
-      const filename = filenameByFrameId.get(frameId) ?? `frame ${frameId}`;
-      return {
-        frameId,
-        filename,
-        group: '—',
-        weight: null,
-        fwhmPx: null,
-        eccentricity: null,
-        stars: null,
-        regRmsPx: null,
-        lnScale: null,
-        regInliers: null,
-        regModel: null,
-        statusLabel: manuallyExcluded ? 'Excluded (manual)' : 'Included',
-        statusTone: manuallyExcluded ? 'warning' : 'success',
-      };
-    }
-
-    const filename = s?.filename ?? filenameByFrameId.get(frameId) ?? `frame ${frameId}`;
-    const { statusLabel, statusTone } = rowStatus(
-      runRow.included,
-      runRow.exclusionReason,
-      runRow.regStatus,
-      manuallyExcluded,
-    );
+    // No run row for this frame at all (a light added after the selected
+    // run, or one that's never survived to stage 1 in any run) — the
+    // same "no run data yet" shape a row had before any run existed:
+    // status comes from the manual-exclusion list alone.
+    //
+    // `group` is deliberately display-only here (Plan 5b final fix wave,
+    // click-through item A6): the plan's own groups know a frame's group
+    // only in aggregate (`PlanGroup.frameCount`, no per-frame membership),
+    // and `LightFrameRef` carries no instrument/filter/binning fields to
+    // derive it from client-side — the table's own tooltip on this cell
+    // ("assigned by the next run") is the fix, not a new backend call.
+    const status = runRow
+      ? rowStatus(runRow.included, runRow.exclusionReason, runRow.regStatus, manuallyExcluded)
+      : {
+          statusLabel: manuallyExcluded ? 'Excluded (manual)' : 'Included',
+          statusTone: manuallyExcluded ? ('warning' as const) : ('success' as const),
+        };
 
     return {
+      key: String(frameId),
       frameId,
-      filename,
-      group: groupKeyById.get(runRow.groupId) ?? '—',
-      weight: s?.weight ?? runRow.weight,
-      fwhmPx: s?.fwhmPx ?? null,
-      eccentricity: s?.eccentricity ?? null,
-      stars: s?.stars ?? null,
-      regRmsPx: s?.regRmsPx ?? runRow.regRmsPx,
-      lnScale: s?.lnScale ?? null,
-      regInliers: s?.regInliers ?? runRow.regInliers,
-      regModel: s?.regModel ?? runRow.regModel,
-      statusLabel,
-      statusTone,
+      filename: (runRow ? s?.filename : undefined) ?? filenameByFrameId.get(frameId) ?? `frame ${frameId}`,
+      publisher: null,
+      ...runMetrics(runRow, s, groupKeyById),
+      ...status,
+      editable: true,
+      unavailable: null,
+      pinnable: false,
+      pinned: false,
+      pinNote: null,
     };
   });
+}
+
+/** A project run row's key: its frame uuid, or `h:<handle>` when the run row
+ *  carries none (its project-frame row is gone). `h:` cannot collide with a
+ *  uuid, and such a row is never joined to a plan row. */
+function runRowKey(r: StackingRunFrameRow): string {
+  return r.frameUuid ?? `h:${r.frameId}`;
+}
+
+/** The project Frames table's row source (spec §12): every frame of the
+ *  plan (`PlanProjectFrame`, stackable on this device or not), then the
+ *  selected run's own rows for frames the plan no longer lists.
+ *
+ *  Rows are keyed by frame uuid, never by handle: a run row joins its plan
+ *  row on `StackingRunFrameRow.frameUuid` (the documented join key) and its
+ *  summary frame on the run row's own `frameId` (the run's handle namespace;
+ *  a `SummaryFrame` carries the handle and no uuid).
+ *
+ *  A run row whose uuid has no plan row (the frame was excluded by the
+ *  coordinator, remapped, or is no longer on disk) keeps the uuid as its key
+ *  and renders from the run alone — the summary's file name, or `frame
+ *  <handle>` — without the checkbox and the pin (`editable: false`): it
+ *  never takes another row's uuid, and no write is possible for a frame the
+ *  project no longer has. `excluded` holds the exclusion keys (uuids);
+ *  `referenceFrameUuid` is the manual reference in effect, `null` for none.
+ *  Pure, like `buildFrameRows`. */
+export function buildProjectFrameRows(
+  projectFrames: PlanProjectFrame[],
+  detail: RunFrameData | null,
+  summary: RunSummary | null,
+  excluded: Set<string>,
+  referenceFrameUuid: string | null,
+): FrameRow[] {
+  const groupKeyById = new Map((detail?.groups ?? []).map((g) => [g.id, g.groupKey]));
+  const runRowByKey = new Map<string, StackingRunFrameRow>(
+    (detail?.frames ?? []).map((r) => [runRowKey(r), r]),
+  );
+  const summaryByHandle = summaryFramesByFrameId(summary);
+  const planKeys = new Set<string>();
+
+  const planRows = projectFrames.map((p): FrameRow => {
+    planKeys.add(p.frameUuid);
+    const runRow = runRowByKey.get(p.frameUuid);
+    const s = runRow ? summaryByHandle.get(runRow.frameId) : undefined;
+    const manuallyExcluded = excluded.has(p.frameUuid);
+    const pinnable = p.onDisk && p.reason == null;
+    // The run's outcome is the record of that run; a frame that cannot be
+    // stacked now still says so beside its name (`unavailable`). With no run
+    // row there is no outcome, and the status says what the next run does.
+    const status = runRow
+      ? rowStatus(runRow.included, runRow.exclusionReason, runRow.regStatus, manuallyExcluded)
+      : manuallyExcluded
+        ? { statusLabel: 'Excluded (manual)', statusTone: 'warning' as const }
+        : !pinnable
+          ? { statusLabel: 'Not stackable here', statusTone: 'warning' as const }
+          : { statusLabel: 'Included', statusTone: 'success' as const };
+    return {
+      key: p.frameUuid,
+      frameId: runRow?.frameId ?? p.handle,
+      filename: p.fileName,
+      publisher: p.publisher,
+      ...runMetrics(runRow, s, groupKeyById),
+      ...status,
+      editable: true,
+      unavailable: p.reason,
+      pinnable,
+      pinned: referenceFrameUuid === p.frameUuid,
+      pinNote: !pinnable ? p.reason : p.hasWcs ? null : NO_WCS_NOTE,
+    };
+  });
+
+  const runOnlyRows = [...runRowByKey.entries()]
+    .filter(([key]) => !planKeys.has(key))
+    .map(([key, runRow]): FrameRow => {
+      const s = summaryByHandle.get(runRow.frameId);
+      return {
+        key,
+        frameId: runRow.frameId,
+        filename: s?.filename ?? `frame ${runRow.frameId}`,
+        publisher: null,
+        ...runMetrics(runRow, s, groupKeyById),
+        ...rowStatus(runRow.included, runRow.exclusionReason, runRow.regStatus, excluded.has(key)),
+        editable: false,
+        unavailable: null,
+        pinnable: false,
+        pinned: false,
+        pinNote: null,
+      };
+    });
+
+  return [...planRows, ...runOnlyRows];
+}
+
+/** The summary's per-frame records by the frame id they carry (the run's
+ *  namespace: a catalog id for a set, a project-frame handle for a project). */
+function summaryFramesByFrameId(summary: RunSummary | null): Map<number, SummaryFrame> {
+  const byFrameId = new Map<number, SummaryFrame>();
+  if (summary) {
+    for (const g of summary.groups) {
+      for (const f of g.frames) byFrameId.set(f.frameId, f);
+    }
+  }
+  return byFrameId;
+}
+
+type RunMetrics = Pick<
+  FrameRow,
+  'group' | 'weight' | 'fwhmPx' | 'eccentricity' | 'stars' | 'regRmsPx' | 'lnScale' | 'regInliers' | 'regModel'
+>;
+
+/** The measurement/registration columns of a row: the summary's value where it
+ *  has one, else the run row's own, `—` (null) before the run reached the
+ *  frame. Without a run row every column is empty, summary or not. */
+function runMetrics(
+  runRow: StackingRunFrameRow | undefined,
+  s: SummaryFrame | undefined,
+  groupKeyById: Map<number, string>,
+): RunMetrics {
+  if (!runRow) {
+    return {
+      group: '—',
+      weight: null,
+      fwhmPx: null,
+      eccentricity: null,
+      stars: null,
+      regRmsPx: null,
+      lnScale: null,
+      regInliers: null,
+      regModel: null,
+    };
+  }
+  return {
+    group: groupKeyById.get(runRow.groupId) ?? '—',
+    weight: s?.weight ?? runRow.weight,
+    fwhmPx: s?.fwhmPx ?? null,
+    eccentricity: s?.eccentricity ?? null,
+    stars: s?.stars ?? null,
+    regRmsPx: s?.regRmsPx ?? runRow.regRmsPx,
+    lnScale: s?.lnScale ?? null,
+    regInliers: s?.regInliers ?? runRow.regInliers,
+    regModel: s?.regModel ?? runRow.regModel,
+  };
 }
 
 /** Client-side sort, any column, numeric-aware, nulls always last regardless
@@ -280,56 +438,74 @@ export function sortRows(rows: FrameRow[], column: SortKey, dir: 'asc' | 'desc')
 }
 
 export interface FramesTableProps {
-  /** The set's LIGHT frames (id + filename), independent of any run. */
+  /** Which rows the table shows: a frame set's light frames, or a project's
+   *  plan frames. A project adds the Publisher and Reference columns. */
+  subjectKind: StackSubject['kind'];
+  /** The set's LIGHT frames (id + filename), independent of any run. Empty
+   *  for a project. */
   lightFrames: LightFrameRef[];
+  /** The project plan's frames (`StackingPlan.projectFrames`). Empty for a
+   *  set. */
+  projectFrames: PlanProjectFrame[];
   /** The results panel's currently-selected run, or `null` before any run
    *  has been picked / recorded — the table then falls back to
-   *  `lightFrames` alone. */
+   *  `lightFrames` / `projectFrames` alone. */
   runDetail: StackingRunDetail | null;
-  excludedFrameIds: number[];
-  /** Ruling 7 — the ONLY frame-level write this tab makes. Toggles
-   *  `frameId`'s membership in `excludedFrameIds`; the caller (`StackingTab`)
-   *  is responsible for routing the resulting list through the existing
-   *  gated persist path. */
-  onToggleExclude: (frameId: number) => void;
+  /** The subject's exclusion keys: `String(frameId)` for a set, the frame
+   *  uuid for a project (`SubjectConfig.excluded`). */
+  excludedKeys: string[];
+  /** A project's manual reference frame in effect (its uuid), else `null`. */
+  referenceFrameUuid: string | null;
+  /** Ruling 7 — the include checkbox, a frame-level write of the exclusion
+   *  list. Toggles `key`'s membership in `excludedKeys`; the caller
+   *  (`StackingTab`) is responsible for routing the resulting list through
+   *  the existing gated persist path. */
+  onToggleExclude: (key: string) => void;
+  /** The project's reference pin (D2): pins the frame `key`, or clears the
+   *  pin when it is the pinned one. Every usable row has one. */
+  onPin: (key: string) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  /** True while a run is active for this set — disables the include
-   *  checkbox the same way the rest of the tab's controls are disabled
-   *  during a run (fix round 1, Important #8). */
+  /** True while a run is active for this subject — disables the include
+   *  checkbox and the pin the same way the rest of the tab's controls are
+   *  disabled during a run (fix round 1, Important #8). */
   disabled?: boolean;
 }
 
-/** The Frames table (spec §11.2) — every LIGHT frame in the set, with the
- *  manual-inclusion checkbox and, once a run has produced rows, its
- *  per-frame measurement/registration outcome. Read-only besides the
- *  checkbox (Ruling 7). */
+/** The Frames table (spec §11.2, §12) — every LIGHT frame of a set or every
+ *  frame of a project, with the manual-inclusion checkbox and, once a run has
+ *  produced rows, its per-frame measurement/registration outcome. A
+ *  project's table adds the publisher and the reference pin. Read-only
+ *  besides the checkbox (Ruling 7) and the pin. */
 export function FramesTable({
+  subjectKind,
   lightFrames,
+  projectFrames,
   runDetail,
-  excludedFrameIds,
+  excludedKeys,
+  referenceFrameUuid,
   onToggleExclude,
+  onPin,
   collapsed,
   onToggleCollapsed,
   disabled = false,
 }: FramesTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('filename');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const isProject = subjectKind === 'project';
+  const columns = isProject ? PROJECT_COLUMNS : COLUMNS;
 
-  // Only for the checkbox's own `checked` state below — `buildFrameRows`
-  // builds and consumes its own `Set` internally for the status chip.
-  const excludedSet = useMemo(() => new Set(excludedFrameIds), [excludedFrameIds]);
+  // For the checkbox's own `checked` state below — the row builders build
+  // and consume their own sets for the status chip.
+  const excludedSet = useMemo(() => new Set(excludedKeys), [excludedKeys]);
 
-  const rows = useMemo<FrameRow[]>(
-    () =>
-      buildFrameRows(
-        lightFrames,
-        runDetail ? { groups: runDetail.groups, frames: runDetail.frames } : null,
-        runDetail?.summary ?? null,
-        excludedFrameIds,
-      ),
-    [lightFrames, runDetail, excludedFrameIds],
-  );
+  const rows = useMemo<FrameRow[]>(() => {
+    const runData = runDetail ? { groups: runDetail.groups, frames: runDetail.frames } : null;
+    const summary = runDetail?.summary ?? null;
+    return isProject
+      ? buildProjectFrameRows(projectFrames, runData, summary, excludedSet, referenceFrameUuid)
+      : buildFrameRows(lightFrames, runData, summary, excludedKeys.map(Number));
+  }, [isProject, lightFrames, projectFrames, runDetail, excludedKeys, excludedSet, referenceFrameUuid]);
 
   const sortedRows = useMemo(() => sortRows(rows, sortKey, sortDir), [rows, sortKey, sortDir]);
 
@@ -357,12 +533,14 @@ export function FramesTable({
       {!collapsed && (
         <div className="mt-2 overflow-x-auto">
           {rows.length === 0 ? (
-            <p className="text-sm text-content-muted px-1">No light frames in this set.</p>
+            <p className="text-sm text-content-muted px-1">
+              {isProject ? 'No frames in this project.' : 'No light frames in this set.'}
+            </p>
           ) : (
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-content-muted text-left border-b border-border">
-                  {COLUMNS.map((c) => (
+                  {columns.map((c) => (
                     <th key={c.key} className="py-1.5 px-2 font-medium" title={c.title}>
                       <button
                         type="button"
@@ -378,14 +556,25 @@ export function FramesTable({
                     </th>
                   ))}
                   <th className="py-1.5 px-2 font-medium text-center">Include</th>
+                  {isProject && <th className="py-1.5 px-2 font-medium text-center">Reference</th>}
                 </tr>
               </thead>
               <tbody>
                 {sortedRows.map((r) => (
-                  <tr key={r.frameId} className="border-b border-border/50 last:border-0">
+                  <tr key={r.key} className="border-b border-border/50 last:border-0">
                     <td className="py-1.5 px-2 text-content font-mono truncate max-w-[220px]" title={r.filename}>
                       {r.filename}
+                      {r.unavailable && (
+                        <div className="text-[10px] text-warning truncate" title={r.unavailable}>
+                          {r.unavailable}
+                        </div>
+                      )}
                     </td>
+                    {isProject && (
+                      <td className="py-1.5 px-2 text-content-secondary truncate max-w-[140px]" title={r.publisher ?? undefined}>
+                        {r.publisher ?? '—'}
+                      </td>
+                    )}
                     <td
                       className="py-1.5 px-2 text-content-secondary font-mono"
                       title={r.group === '—' ? 'assigned by the next run' : undefined}
@@ -426,15 +615,48 @@ export function FramesTable({
                       </span>
                     </td>
                     <td className="py-1.5 px-2 text-center">
-                      <input
-                        type="checkbox"
-                        checked={!excludedSet.has(r.frameId)}
-                        onChange={() => onToggleExclude(r.frameId)}
-                        disabled={disabled}
-                        aria-label={`Include ${r.filename} in the next run`}
-                        className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-                      />
+                      {r.editable && (
+                        <input
+                          type="checkbox"
+                          checked={!excludedSet.has(r.key)}
+                          onChange={() => onToggleExclude(r.key)}
+                          disabled={disabled}
+                          aria-label={`Include ${r.filename} in the next run`}
+                          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+                        />
+                      )}
                     </td>
+                    {isProject && (
+                      <td className="py-1.5 px-2 text-center">
+                        {r.editable && (
+                          // A pinned frame can always be unpinned, even one that has become unusable since.
+                          <button
+                            type="button"
+                            onClick={() => onPin(r.key)}
+                            disabled={disabled || (!r.pinnable && !r.pinned)}
+                            aria-pressed={r.pinned}
+                            aria-label={
+                              r.pinned
+                                ? `Clear the reference frame ${r.filename}`
+                                : `Use ${r.filename} as the reference frame`
+                            }
+                            title={
+                              r.pinned
+                                ? // A pinned frame that is no longer usable says why, in brackets after the clear hint.
+                                  !r.pinnable && r.pinNote
+                                  ? `The reference frame — click to clear (${r.pinNote})`
+                                  : 'The reference frame — click to clear'
+                                : (r.pinNote ?? 'Use as the reference frame')
+                            }
+                            className={`p-1 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                              r.pinned ? 'text-accent' : 'text-content-muted hover:text-content'
+                            }`}
+                          >
+                            <Pin size={14} fill={r.pinned ? 'currentColor' : 'none'} />
+                          </button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
