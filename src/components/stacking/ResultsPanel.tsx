@@ -10,7 +10,6 @@ import { ConfirmDialog } from '../ConfirmDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   GroupStats,
-  MasterLightKind,
   StackingRunDetail,
   StackingRunGroupRow,
   StackingRunSummary,
@@ -151,8 +150,14 @@ function RevealOrPath({ path }: { path: string | null }) {
  *  coverage) live only on `SummaryGroup`, written once at Output. The gate
  *  for whether drizzle ran at all is `group.drizzlePath` (the DB row,
  *  present even before/without a loaded summary), not this slice's own
- *  `drizzlePath` — see the render below. */
-type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 'drizzle'>;
+ *  `drizzlePath` — see the render below. Wave 6c Task 8 (D4): the two
+ *  coverage maps' paths come the same way. */
+type GroupSummary = Pick<
+  SummaryGroup,
+  'drizzlePath' | 'weightMapPath' | 'drizzle' | 'coveragePath' | 'drizzleCoveragePath'
+>;
+
+const COVERAGE_CAPTION = 'Coverage map — frames per pixel';
 
 /** The actual preview render for one written master light (M4d Task 3,
  *  ruling R-M4d-5) — 160 px tall, `object-contain` so a wide master is
@@ -164,12 +169,10 @@ type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 
  *  one line, the full text still reachable via `title`.
  *
  *  Pure/presentational — no fetch of its own — so `MasterCard` can call
- *  [`useMasterPreview`] directly for the master thumbnail (it needs that
- *  state to sequence the drizzle one below) while [`MasterThumbnail`]
- *  keeps owning the fetch for every other caller. `loading="lazy"` was
- *  dropped (M4d final review nit): the `src` is always a same-page blob
- *  URL the hook already fetched eagerly, so the attribute deferred
- *  nothing. */
+ *  [`useMasterPreview`] directly for each thumbnail (it needs every one's
+ *  state to sequence the next). `loading="lazy"` was dropped (M4d final
+ *  review nit): the `src` is always a same-page blob URL the hook already
+ *  fetched eagerly, so the attribute deferred nothing. */
 function ThumbnailBox({ url, error, label }: { url: string | null; error: string | null; label: string }) {
   if (error) {
     return (
@@ -186,29 +189,6 @@ function ThumbnailBox({ url, error, label }: { url: string | null; error: string
   );
 }
 
-/** Fetches and renders one written master light's thumbnail via
- *  [`useMasterPreview`] + [`ThumbnailBox`]. `enabled` (M4d final review,
- *  Important #1 part 3) gates the fetch itself — `MasterCard` uses it to
- *  hold the drizzle thumbnail's request until the master's own has
- *  resolved, so the two panels-per-group no longer fan out two full-master
- *  reads into the backend at once. */
-function MasterThumbnail({
-  runId,
-  groupKey,
-  kind,
-  label,
-  enabled = true,
-}: {
-  runId: number;
-  groupKey: string;
-  kind: MasterLightKind;
-  label: string;
-  enabled?: boolean;
-}) {
-  const { url, error } = useMasterPreview(runId, groupKey, kind, undefined, enabled);
-  return <ThumbnailBox url={url} error={error} label={label} />;
-}
-
 /** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
  *  on the `StackingRunGroupRow` this card is built from (that row updates
  *  progressively while the run is still in flight; the LN reference path is
@@ -218,7 +198,7 @@ function MasterCard({
   group,
   lnReferencePath,
   groupReferenceFrameId,
-  drizzleSummary,
+  groupSummary,
   drizzleConfigEnabled,
 }: {
   group: StackingRunGroupRow;
@@ -230,10 +210,10 @@ function MasterCard({
    *  summary hasn't loaded, or a pre-M4b summary. */
   groupReferenceFrameId: number | null;
   /** `null` when the run's `summary` hasn't loaded yet (or this group has
-   *  none in it) — the drizzle stats/weight-map path below are simply
-   *  omitted in that case; `group.drizzlePath` alone still drives whether
-   *  the "Drizzle" line renders at all. */
-  drizzleSummary: DrizzleGroupSummary | null;
+   *  none in it) — the drizzle stats, the weight-map path and the coverage
+   *  maps below are simply omitted in that case; `group.drizzlePath` alone
+   *  still drives whether the "Drizzle" line renders at all. */
+  groupSummary: GroupSummary | null;
   /** `runDetail.summary?.config.drizzle.enabled` — whether THIS run's own
    *  config had drizzle on, independent of the current draft config. Drives
    *  the "skipped" line when the run had it on but this group has no path. */
@@ -241,24 +221,42 @@ function MasterCard({
 }) {
   const stats = parseGroupStats(group.statsJson);
   const snrGain = stats ? snrGainLabel(stats) : null;
-  const dstats = drizzleSummary?.drizzle ?? null;
+  const dstats = groupSummary?.drizzle ?? null;
+  const coveragePath = groupSummary?.coveragePath ?? null;
 
   // M4d final review, Important #1 part 3: fetch the master's own thumbnail
   // first, and hold the drizzle one back until it resolves — a group with
   // both previews used to fire two renders into the backend at once, each
   // reading the master light's full float buffer before downscaling.
-  // `useMasterPreview` is called directly here (not through
-  // `MasterThumbnail`) because this card needs the master's `url`/`error`
-  // to know when it has settled; passing `null` args when there is no
-  // master path is the hook's own "nothing to fetch" case, so
-  // `masterResolved` starts (and stays) `true` and the drizzle fetch is
-  // never blocked on an output this group never wrote.
+  // `useMasterPreview` is called directly here because this card needs each
+  // thumbnail's `url`/`error` to know when it has settled; passing `null`
+  // args when there is no path is the hook's own "nothing to fetch" case,
+  // so a `*Resolved` flag starts (and stays) `true` and the next fetch is
+  // never blocked on an output this group never wrote. Wave 6c Task 8 (D4):
+  // the coverage map's thumbnail is the third in the chain — after the
+  // drizzle one when the group has it, else after the master's — so there
+  // is still one render at a time.
   const master = useMasterPreview(
     group.masterPath ? group.runId : null,
     group.masterPath ? group.groupKey : null,
     'master',
   );
   const masterResolved = !group.masterPath || master.url !== null || master.error !== null;
+  const drizzle = useMasterPreview(
+    group.drizzlePath ? group.runId : null,
+    group.drizzlePath ? group.groupKey : null,
+    'drizzle',
+    512,
+    masterResolved,
+  );
+  const drizzleResolved = !group.drizzlePath || drizzle.url !== null || drizzle.error !== null;
+  const coverage = useMasterPreview(
+    coveragePath ? group.runId : null,
+    coveragePath ? group.groupKey : null,
+    'coverage',
+    512,
+    masterResolved && drizzleResolved,
+  );
 
   return (
     <div className="bg-surface rounded-lg border border-border p-3 space-y-2 min-w-0">
@@ -275,17 +273,23 @@ function MasterCard({
        *  drizzled master's when the group has one. Gated on the PATH the
        *  group row records, so a group that never wrote the output asks for
        *  no preview at all (rather than fetching a guaranteed 404). */}
-      {group.masterPath && (
-        <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
+      {coveragePath != null ? (
+        // D4: the coverage map's thumbnail sits beside the master's, labelled, its path line under it.
+        <div data-testid="master-previews" className="grid grid-cols-2 gap-2 items-start">
+          {group.masterPath && (
+            <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
+          )}
+          <figure className="min-w-0 space-y-1">
+            <ThumbnailBox url={coverage.url} error={coverage.error} label={basename(coveragePath)} />
+            <figcaption className="text-[11px] text-content-muted">{COVERAGE_CAPTION}</figcaption>
+            <RevealOrPath path={coveragePath} />
+          </figure>
+        </div>
+      ) : (
+        group.masterPath && <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
       )}
       {group.drizzlePath && (
-        <MasterThumbnail
-          runId={group.runId}
-          groupKey={group.groupKey}
-          kind="drizzle"
-          label={basename(group.drizzlePath)}
-          enabled={masterResolved}
-        />
+        <ThumbnailBox url={drizzle.url} error={drizzle.error} label={basename(group.drizzlePath)} />
       )}
 
       <p className="text-xs text-content-secondary tabular-nums">
@@ -354,10 +358,17 @@ function MasterCard({
               coverage {dstats.coverage.map((c) => `${(c * 100).toFixed(1)}%`).join(' / ')}
             </p>
           )}
-          {drizzleSummary?.weightMapPath != null && (
+          {groupSummary?.weightMapPath != null && (
             <div className="flex items-center gap-1.5 text-xs text-content-muted">
               <span>Weight map:</span>
-              <RevealOrPath path={drizzleSummary.weightMapPath} />
+              <RevealOrPath path={groupSummary.weightMapPath} />
+            </div>
+          )}
+          {/* D4: a path line only — the drizzled map is not rendered. */}
+          {groupSummary?.drizzleCoveragePath != null && (
+            <div className="flex items-center gap-1.5 text-xs text-content-muted">
+              <span>Drizzle coverage map:</span>
+              <RevealOrPath path={groupSummary.drizzleCoveragePath} />
             </div>
           )}
         </div>
@@ -629,8 +640,16 @@ export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: Re
                         ? (sg?.referenceFrameId ?? null)
                         : null
                     }
-                    drizzleSummary={
-                      sg ? { drizzlePath: sg.drizzlePath, weightMapPath: sg.weightMapPath, drizzle: sg.drizzle } : null
+                    groupSummary={
+                      sg
+                        ? {
+                            drizzlePath: sg.drizzlePath,
+                            weightMapPath: sg.weightMapPath,
+                            drizzle: sg.drizzle,
+                            coveragePath: sg.coveragePath,
+                            drizzleCoveragePath: sg.drizzleCoveragePath,
+                          }
+                        : null
                     }
                     drizzleConfigEnabled={runDetail.summary?.config.drizzle.enabled ?? false}
                   />

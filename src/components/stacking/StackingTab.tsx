@@ -7,6 +7,7 @@ import { useNotifications } from '../../contexts/NotificationContext';
 import { subjectKey, type StackSubject, type SubjectKey } from './subject';
 import { useStackingSubjectApi, type StackingSubjectApi, type SubjectConfig } from './useStackingSubjectApi';
 import type {
+  GroupingConfig,
   NamedPreset,
   PlanProjectFrame,
   Stage,
@@ -487,6 +488,14 @@ export function StackingTab({ subject }: StackingTabProps) {
   const handleToggleDrizzle = useCallback((checked: boolean) => {
     setUserConfig((prev) =>
       prev ? { ...prev, drizzle: { ...prev.drizzle, enabled: checked } } : prev,
+    );
+  }, [setUserConfig]);
+
+  // D1: the Groups table's exposure grouping control patches `grouping` like any other config edit: the draft is
+  // written after the debounce and the plan is built again from it.
+  const handlePatchGrouping = useCallback((patch: Partial<GroupingConfig>) => {
+    setUserConfig((prev) =>
+      prev ? { ...prev, grouping: { ...prev.grouping, ...patch } } : prev,
     );
   }, [setUserConfig]);
 
@@ -1135,7 +1144,13 @@ export function StackingTab({ subject }: StackingTabProps) {
           />
           <div className="bg-surface-elevated rounded-lg p-3">
             <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
-            <GroupsTable groups={plan.groups} />
+            <GroupsTable
+              groups={plan.groups}
+              grouping={draftConfig?.grouping ?? plan.config.grouping}
+              disabled={running || starting}
+              subjectKind={subject.kind}
+              onPatchGrouping={handlePatchGrouping}
+            />
           </div>
         </div>
 

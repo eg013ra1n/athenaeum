@@ -35,11 +35,24 @@ vi.mock('./PipelineBoard', () => ({
   ),
 }));
 vi.mock('./StageInspector', () => ({ StageInspector: () => null }));
-vi.mock('./GroupsTable', () => ({ GroupsTable: () => null }));
+// The Groups table is a stub that shows what the tab hands it and patches the grouping when asked.
+vi.mock('./GroupsTable', () => ({
+  GroupsTable: (p: {
+    grouping: { exposureMode: string };
+    disabled?: boolean;
+    subjectKind: string;
+    onPatchGrouping: (patch: { exposureMode: string }) => void;
+  }) => (
+    <div data-testid="groups" data-kind={p.subjectKind} data-mode={p.grouping.exposureMode} data-disabled={String(!!p.disabled)}>
+      <button type="button" onClick={() => p.onPatchGrouping({ exposureMode: 'stops' })}>group by stops</button>
+    </div>
+  ),
+}));
 
 const CONFIG = {
   version: 1,
   paths: { working: null, output: null },
+  grouping: { exposureToleranceSec: 2, exposureMode: 'seconds', stopsWidth: 1 },
   reference: { mode: 'manual', twoPass: false },
   drizzle: { enabled: false },
   normalization: { local: { enabled: false }, rejection: 'scaleZeroOffset' },
@@ -205,6 +218,25 @@ describe('StackingTab for a frame set', () => {
     expect(argsOf('set_stacking_config')).toEqual([
       { setId: 7, config: { ...CONFIG, drizzle: { enabled: true } }, excludedFrameIds: [101] },
     ]);
+  });
+
+  it('a grouping change in the Groups table is written whole and the plan is built again with it', async () => {
+    await mount(frameSetTab(7));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    const groups = screen.getByTestId('groups');
+    expect(groups).toHaveAttribute('data-kind', 'frameSet');
+    expect(groups).toHaveAttribute('data-mode', 'seconds');
+    const plansBefore = argsOf('get_stacking_plan').length;
+
+    fireEvent.click(screen.getByText('group by stops'));
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-mode', 'stops');
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    const edited = { ...CONFIG, grouping: { exposureToleranceSec: 2, exposureMode: 'stops', stopsWidth: 1 } };
+    expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: edited, excludedFrameIds: [] }]);
+    const plans = argsOf('get_stacking_plan');
+    expect(plans.length).toBeGreaterThan(plansBefore);
+    expect(plans[plans.length - 1]).toEqual({ setId: 7, config: edited });
   });
 
   it('opening a set writes nothing', async () => {
@@ -467,6 +499,21 @@ describe('StackingTab for a project', () => {
 
     expect(screen.getByText('/work-p1')).toBeInTheDocument();
     expect(argsOf('get_stacking_plan')).toHaveLength(plansForSet);
+  });
+
+  it('the Groups table of a project patches the project\u2019s own config', async () => {
+    await mount(projectTab('p1'));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-kind', 'project');
+
+    fireEvent.click(screen.getByText('group by stops'));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    const edited = { ...CONFIG, grouping: { exposureToleranceSec: 2, exposureMode: 'stops', stopsWidth: 1 } };
+    expect(argsOf('set_project_stacking_config')).toEqual([
+      { projectId: 'p1', config: edited, excludedFrameUuids: ['u-ex'], referenceFrameUuid: 'u-ref' },
+    ]);
+    expect(argsOf('set_stacking_config')).toEqual([]);
   });
 
   it('a project run row whose frame left the plan renders from the run, with no toggle and no pin', async () => {

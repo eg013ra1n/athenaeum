@@ -396,8 +396,12 @@ export function stageSummary(
       const bayer = config.drizzle.bayer ? ' · Bayer' : '';
       return `${config.drizzle.scale}× · ${kernelLabel(config.drizzle.kernel)} kernel · drop ${config.drizzle.dropShrink.toFixed(2)}${bayer}`;
     }
-    case 'output':
-      return `${config.output.format.toUpperCase()} · ${cleanupLabel(config.output.cleanup)}`;
+    case 'output': {
+      // Wave 6c Task 8: the coverage map and the crop say so only when they are on.
+      const coverage = config.output.coverageMap ? ' · coverage map' : '';
+      const crop = config.output.cropToCoverage > 0 ? ` · crop ≥ ${config.output.cropToCoverage}` : '';
+      return `${config.output.format.toUpperCase()} · ${cleanupLabel(config.output.cleanup)}${coverage}${crop}`;
+    }
   }
 }
 

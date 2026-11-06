@@ -1,5 +1,6 @@
 // Stage 9 (Output) inspector panel: the two per-set folder overrides
-// (`config.paths.workingDir`/`outputDir`), cleanup policy, format. The
+// (`config.paths.workingDir`/`outputDir`), cleanup policy, format, and the
+// coverage map and crop (wave 6c Task 8, for a frame set and a project). The
 // folder picker reuses the Transfers picker verbatim (plan Ruling 6):
 // desktop opens the native dialog via `pickDirectory`, web opens
 // `FolderBrowserModal` with `scope="stacking"`.
@@ -9,7 +10,9 @@ import { api } from '../../../api';
 import { pickDirectory } from '../../../api/desktop';
 import { isTauri } from '../../../utils/platform';
 import { FolderBrowserModal } from '../../FolderBrowserModal';
+import { Checkbox } from '../../settings/Checkbox';
 import { FolderCard } from '../FolderCard';
+import { NumericField } from '../NumericField';
 import { cleanupLabel } from '../stageSummary';
 import type { PathSetting } from '../../../types/models';
 import type { CleanupPolicy, OutputFormat, StackingConfig, StackingPaths, StackingPlan } from '../../../types/stacking';
@@ -38,6 +41,12 @@ export interface OutputPanelProps {
   mode?: 'perSet' | 'global';
 }
 
+/** `cropToCoverage` is a `u32` on the wire — a fraction would fail to deserialize, and `NumericField` commits
+ *  whatever parses. Round it (the field's `min` already holds it at 0 or above). */
+function wholeFrames(n: number): number {
+  return Math.max(0, Math.round(n));
+}
+
 export function OutputPanel({ config, onChange, plan, disabled, mode = 'perSet' }: OutputPanelProps) {
   const [globalPaths, setGlobalPaths] = useState<StackingPaths | null>(null);
   const [browsing, setBrowsing] = useState<'working' | 'output' | null>(null);
@@ -58,6 +67,10 @@ export function OutputPanel({ config, onChange, plan, disabled, mode = 'perSet' 
 
   const setPath = (which: 'workingDir' | 'outputDir', value: string | null) => {
     onChange({ ...config, paths: { ...config.paths, [which]: value } });
+  };
+
+  const patchOutput = (patch: Partial<StackingConfig['output']>) => {
+    onChange({ ...config, output: { ...config.output, ...patch } });
   };
 
   const choose = async (which: 'working' | 'output') => {
@@ -153,6 +166,26 @@ export function OutputPanel({ config, onChange, plan, disabled, mode = 'perSet' 
           Applies to the master, the drizzled master and the drizzle weight map. The rejection
           maps stay FITS.
         </p>
+      </div>
+
+      {/* Wave 6c Task 8 (spec §5.7, §5.9): both are config fields (they enter no stage hash). The stored config
+       *  decides what they start at: a project on / 0, a frame set off / 0. */}
+      <div className="pt-3 border-t border-border/60 space-y-3">
+        <Checkbox
+          checked={config.output.coverageMap}
+          onChange={(checked) => patchOutput({ coverageMap: checked })}
+          disabled={disabled}
+          label="Write a coverage map (frames per pixel) beside each master"
+        />
+        <NumericField
+          label="Crop to coverage of at least"
+          value={config.output.cropToCoverage}
+          onCommit={(n) => patchOutput({ cropToCoverage: wholeFrames(n) })}
+          min={0}
+          step={1}
+          help="frames (0 = no crop)"
+          disabled={disabled}
+        />
       </div>
 
       <FolderBrowserModal

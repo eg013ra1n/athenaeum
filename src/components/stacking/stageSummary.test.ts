@@ -176,3 +176,24 @@ describe('rowState register for a project whose grid is not confirmed', () => {
     expect(rowState('register', planOf({ projectId: 'p1', blockers: [gridBlocker] }), progress, undefined, CONFIG)).toBe('running');
   });
 });
+
+// Wave 6c Task 8: the Output row names the coverage map and the crop when they are on.
+describe('stageSummary output coverage', () => {
+  const out = (o: Partial<StackingConfig['output']> = {}) =>
+    ({ output: { format: 'fits', cleanup: 'keepAll', coverageMap: false, cropToCoverage: 0, ...o } }) as unknown as StackingConfig;
+
+  it('says only the format and the cleanup with both off', () =>
+    expect(stageSummary('output', out())).toBe('FITS · keep all'));
+  it('mentions the coverage map when it is on', () =>
+    expect(stageSummary('output', out({ coverageMap: true }))).toBe('FITS · keep all · coverage map'));
+  it('mentions the crop when it is above 0', () =>
+    expect(stageSummary('output', out({ cropToCoverage: 3 }))).toBe('FITS · keep all · crop ≥ 3'));
+  it('names the map first, then the crop', () =>
+    expect(stageSummary('output', out({ format: 'xisf', cleanup: 'deleteIntermediates', coverageMap: true, cropToCoverage: 5 }))).toBe(
+      'XISF · delete intermediates · coverage map · crop ≥ 5',
+    ));
+  it('keeps the line of a config stored before the two fields existed', () =>
+    expect(stageSummary('output', { output: { format: 'fits', cleanup: 'keepAll' } } as unknown as StackingConfig)).toBe(
+      'FITS · keep all',
+    ));
+});
